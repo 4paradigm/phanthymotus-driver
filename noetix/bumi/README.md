@@ -27,6 +27,33 @@ sudo systemctl enable noetix-video-capture.service
 sudo systemctl start noetix-video-capture.service
 ```
 
+## `camera` / `depth` 声明自己的镜头参数（`motus.camera/1`）
+
+两张卡片的 `info()` 各带一份 `camera_info`。消费者按**自己绑的那个话题**去查，
+不是按位置、也不是按上游卡片名。
+
+为什么需要它：深度图里没有任何几何信息 —— 640×480 个数字，每个是一段距离，没有
+一处说明镜头有多宽。而据此做的决策是米制的（"我 0.4 m 宽的肩膀过不过得去"），所以
+某处必须把像素列换算成横向偏移，那一步用的就是水平半视场角。这个数填错**不会报错**：
+它让机器人拒绝过门，而深度图同时报告前方通畅 —— r1_sz 上这个症状被当成跟踪问题查过
+两次。
+
+**参数优先取运行时内参。** 相机子进程在 `pipeline.start()` 之后从 RealSense 拿到
+真实的 `fx/ppx/畸变系数`，打印一行 `[camera_subprocess] INTRINSICS {...}`，父进程
+那个本来就有的 stdout 转发线程认这个前缀并存下来（这一行也照常留在 `docker logs`
+里）。声明里于是带 `K`，`source` 是 `derived-from-K`。
+
+**手册数只是兜底，而且彩色那路不能直接用手册的数。** D435i 的 RGB 传感器是 16:9，
+驱动开的是 640×480（4:3）—— 这一档保垂直裁水平，所以真实水平视场比手册上的 69.4°
+窄三成左右。`camera_specs.py` 因此按宽高比换算过一次，并把 `source` 写成 `manual`
+而不是 `vendor-spec`：那是一个在 Intel 写下的数之外多走了一步算术的值。深度那路不需要
+这个修正，它原生就是 4:3，87° 对应的就是我们发出去的那张图。
+
+相机没起来时走兜底 —— 声明必须在不串流时也答得出来，这是消费者能在 `start` 时就
+降级（而不是一帧一帧地发现问题）的前提。
+
+镜头换了必须重来一遍：`phanthymotus/actucore/tools/measure_fov.py`。
+
 ## `vision_capture` card
 
 Persistent RGB photo/video capture, with the card/action names and file layout
@@ -95,6 +122,80 @@ documented fault list and remain available only in each joint's raw `error`
 field for device-side verification.
 
 Every published state identifies `Noetix HighController/CycloneDDS` as its source and includes a freshness flag. It deliberately excludes battery data, which belongs to the existing `battery` card. The SDK does not expose world-frame position or translational velocity, so the card reports only documented IMU and joint measurements and does not invent odometry.
+
+The same card also publishes the IMU's angular velocity as **`motus.odom/1`** on
+`/<namespace>/state/odom` (format `state/odom`), at **10 Hz** — its own loop, not
+the 2 Hz joint poll. 2 Hz would land exactly on navi's 500 ms observation window,
+so half the samples would read as stale and a consumer would alternate between
+using odometry and not. `info()` carries the `odom_interface` declaration; the
+shape lives in `odom_spec.py`, outside `device.py`, so it can be asserted without
+rclpy (`tests/test_bumi_odom.py`).
+
+**`vx`, `vy` and `vz` are `null` in every sample, and are not in `provides`.**
+There is no body-frame speed anywhere in `HighController`. Reporting `0.0` would
+be a different claim — that the robot measured itself standing still — and it is
+the claim that makes a consumer's stuck detector ("commanded 0.3 m/s, measured
+nothing, therefore we have hit something") fire on every step. So:
+
+- anything that needs a measured translational speed **cannot work on Bumi**,
+  and that is the robot's limitation, not a fault to go looking for;
+- a navigation policy falls back to predicting its own motion from the commands
+  it sent, with the process noise widened accordingly;
+- `wz` — the axis such a policy leans on hardest, because self-rotation is the
+  main reason a target moves across the image — **is** measured.
+
+`pose` is `null` and `pose_drift` is `none` for the same reason: there is no
+position to report, which is a different statement from a position that drifts.
+
+### `loco_servo` — 底盘的流式速度控制
+
+订阅一路 `motus.control/1` 的 **twist**（6 维 `[vx, vy, vz, wx, wy, wz]`，机体系，
+m/s 与 rad/s）驱动底盘。给 actucore 的 `navi` 这类策略用 —— 它们一秒发十个速度，
+并且不等每一个的回答，而 `loco` 是调用形态：一次 `tools/call` 一个动作，对人和 LLM
+是对的，对策略是错的。
+
+`vz` / `wx` / `wy` 在 descriptor 里钉成 `lower == upper == 0`。一个以为自己在指挥
+垂直运动的策略会被**响亮拒掉**，而不是三分之一的输出凭空消失。
+
+**和 R1 的同名卡片有两处结构性不同**，都在 `loco_servo.py` 的文件注释里：
+
+1. Bumi 的 `publish_cmd` 收的是归一化的 `[-1, 1]`，不是 m/s，所以这张卡片自己做
+   换算 —— 见下面的标定；
+2. Bumi 的指令**不驻留**（R1 的 `Move(..., True)` 会一直走到 `StopMove`），所以
+   卡片带一个 50 Hz 重发线程，而"保持"意味着**持续发零**，不是停止发送。
+
+**仲裁**：`loco`、`stand_up_lie_prone`、`semantic_action`、`action_recording` 里
+任何一个动作都会先把这张卡片暂停 —— 后三个还会把 `workmode` 从正在跑的流底下换掉。
+反过来，`loco` 有动作在飞时这张卡片拒绝启动。人和 LLM 的显式指令优先于正在跑的
+策略，这个方向不能反。
+
+姿态门槛是 `workmode == 2`（walking），**按每条指令检查**而不是在 `start` 时：
+启动是接线事件，机器人那一刻常常是趴着的，拒绝启动会连累整张画布。
+
+`dry_run` / `rotate_only` / `require_standing` 三个开关在卡片上就能改（`configSchema`），
+**并且立即生效**，不用重新部署。
+
+#### 标定 `loco_servo`
+
+`config.yaml` 里 `loco_servo` 下那七个数描述的是**这台底盘的速度空间**，
+**一个都没有在 Bumi 上量过**，所以 `calibration_source: estimate`、`dry_run: true`
+是出厂状态。navi 会把这一栏显示在它的 `degraded` 里。量一次大约二十分钟：
+
+| 量什么 | 怎么量 | 填到哪 |
+|---|---|---|
+| 满舵前进速度 | 关掉 `dry_run`，用 `loco` 的 `move` 发 `vx=1.0, duration=3`，卷尺量走了多远，除以实际走动秒数 | `full_scale_vx_mps` |
+| 满舵横移速度 | 同上，`vy=1.0` | `full_scale_vy_mps` |
+| 满舵转向角速度 | `vyaw=1.0, duration=4`，数转过几圈，`圈数 × 2π ÷ 秒数` | `full_scale_wz_rads` |
+| 前进死区 | 从 `vx=0.05` 起每次加 0.05，第一个真的让机器人挪动的值 | `min_vx_mps`（乘上面量到的满舵值换算成 m/s） |
+| 横移死区 / 偏航死区 | 同上，`vy` / `vyaw` | `min_vy_mps` / `min_wz_rads` |
+| 行进中的偏航死区 | 一边 `vx` 走一边加小 `vyaw`，第一个看得出转向的值。R1 上这个数比站立时小 **20 倍** | `min_wz_moving_rads` |
+| 机身宽度 | 卷尺量手臂自然下垂时的最大宽度，取一半 | `loco_servo.py` 的 `FOOTPRINT_HALF_WIDTH`，并把 `footprint.source` 改成 `measured` |
+
+量完把 `calibration_source` 改成 `measured`。**这些数错了不会报错**：满舵值偏小
+机器人就走得比策略要的慢，死区填零则策略的小幅修正会被接收、计数、然后什么都不发生。
+
+`footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
+门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
 
 ## Direct action cards
 

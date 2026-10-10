@@ -6,6 +6,40 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
+  # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
+  # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——
+  # loco / stand_up_lie_prone / semantic_action / action_recording 里任何一个动作
+  # 都会先把这张卡片暂停，人和 LLM 的显式指令优先于正在跑的策略。
+  loco_servo:
+    enabled: true
+    # **默认只打日志，不驱动底盘。** 下面那组标定数一个都没在 Bumi 上量过，
+    # 所以第一次一定是连上去看它想发什么。卡片上就能改（configSchema），
+    # 不用重新部署 —— 真机验过符号和量级之后再关，并同时把
+    # calibration_source 改成 measured。
+    dry_run: true
+    expected_hz: 10
+    # 要求 workmode=2（walking）。只有在没接腿的台架上才需要关。
+    require_standing: true
+
+    # ── 速度标定 ─────────────────────────────────────────────────────────
+    # Bumi 的 publish_cmd 收的是归一化的 [-1, 1]（厂商示例直接塞手柄 axes），
+    # 而协议要求 m/s / rad/s，所以这几个数是两者之间的换算。
+    # **都没量过**，测量步骤见 README.md §「标定 loco_servo」，约二十分钟。
+    # 量完把 calibration_source 改成 measured —— navi 会在 degraded 里显示
+    # 这一栏，操作员据此判断机器人会不会照着策略要的速度走。
+    calibration_source: estimate
+    full_scale_vx_mps: 0.5      # 命令 x=1.0 时的前进速度
+    full_scale_vy_mps: 0.3      # 命令 y=1.0 时的横移速度
+    full_scale_wz_rads: 1.0     # 命令 z=1.0 时的转向角速度
+    # 死区：低于这个值腿式机器人根本不动（要凑齐一个步态周期）。
+    # 零不是"没有门槛"，而是"这台机器人能任意慢地挪"，那是个错误的声明。
+    min_vx_mps: 0.15
+    min_vy_mps: 0.15
+    min_wz_rads: 0.3
+    # 已经在走的时候的偏航死区。R1 上这个数比站立时小 20 倍；Bumi 没量过，
+    # 所以先和站立值相同 —— 凭空填一个更小的是同一个错误的反方向。
+    min_wz_moving_rads: 0.3
   mic:
     enabled: true
   speaker:
