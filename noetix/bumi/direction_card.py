@@ -32,6 +32,7 @@ _QOS = QoSProfile(
     depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
+_READY_LINE = "__BUMI_DIRECTION_READY__"
 
 
 def load_calibration() -> dict:
@@ -111,6 +112,8 @@ def _direction_subprocess(namespace: str) -> None:
     parameters = load_parameters()
     gate = SoundActivityGate(**{key: parameters[key] for key in (
         "onset_level", "onset_ratio", "burst_level", "burst_ratio")})
+    # SDK 和 ROS 发布器都就绪后，才允许控制卡报告配置成功。
+    print(_READY_LINE, flush=True)
     next_check = 0.0
     last_result_at = None
     next_error_log = 0.0
@@ -233,11 +236,11 @@ class SoundDirectionPlugin:
             },
         }
 
-    def start(self) -> None:
+    def start(self, wait_ready: bool = False) -> bool:
         import sys
         with self._process_lock:
             if self._proc is not None and self._proc.poll() is None:
-                return
+                return True
             self._last_direction = None
             self._last_direction_time = 0.0
             proc = subprocess.Popen(
@@ -249,10 +252,23 @@ class SoundDirectionPlugin:
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
             self._proc = proc
+            ready_event = threading.Event()
+            ready = [False]
             def forward():
                 for line in proc.stdout:
-                    print(line.decode(errors="replace").rstrip(), flush=True)
+                    message = line.decode(errors="replace").rstrip()
+                    if message == _READY_LINE:
+                        ready[0] = True
+                        ready_event.set()
+                    else:
+                        print(message, flush=True)
+                ready_event.set()
             threading.Thread(target=forward, daemon=True).start()
+            if wait_ready and (not ready_event.wait(timeout=8) or not ready[0]
+                               or proc.poll() is not None):
+                self.stop()
+                return False
+            return True
 
     def stop(self) -> None:
         with self._process_lock:
@@ -349,9 +365,8 @@ class SoundDirectionPlugin:
                 write_error = exc
             if running:
                 try:
-                    self.start()
-                    if self._proc is None or self._proc.poll() is not None:
-                        return {"state": "error", "message": "direction restart exited immediately",
+                    if not self.start(wait_ready=True):
+                        return {"state": "error", "message": "direction restart failed to initialize",
                                 "parameters": load_parameters()}
                 except Exception as exc:
                     return {"state": "error", "message": f"direction restart failed: {exc}",

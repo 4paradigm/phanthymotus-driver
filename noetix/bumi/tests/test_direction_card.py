@@ -349,7 +349,7 @@ def test_control_settings_restart_reader_with_new_values(monkeypatch, tmp_path):
     events = []
 
     class Process:
-        stdout = ()
+        stdout = (b"__BUMI_DIRECTION_READY__\n",)
 
         def poll(self):
             return None
@@ -401,6 +401,35 @@ def test_control_reports_immediately_exited_reader(monkeypatch, tmp_path):
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process(1))
     result = card.dispatch("set_parameters", {
         "_tool_name": "sound_direction_control", "onset_ratio": 2.6})
+    assert result["state"] == "error"
+    assert "restart" in result["message"]
+
+
+def test_control_rejects_reader_that_exits_during_initialization(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, "SETTINGS_PATH", tmp_path / "settings.json")
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+
+    class Process:
+        stdout = ()
+
+        def __init__(self):
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls <= 2 else 1
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 1
+
+    card._proc = Process()
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = card.dispatch("set_parameters", {"onset_ratio": 2.6})
     assert result["state"] == "error"
     assert "restart" in result["message"]
 
