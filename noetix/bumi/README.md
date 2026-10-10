@@ -7,7 +7,8 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 `mic` publishes mono PCM on `/<namespace>/mic/audio`. The separate
 `sound_direction` control card reads the SDK's eight-channel microphone capture
 directly, uses the first four channels for direction estimation, and publishes
-JSON on `/<namespace>/sound_direction`. Both cards start with the bundle.
+JSON on `/<namespace>/sound_direction`. The bundle starts `mic` automatically;
+select `start` on the `sound_direction` control card and execute it when needed.
 `mic` is a passive sensor in the canvas; the control card provides
 `start`/`stop`/`info`, `check_direction`, `calibrate_front`, and `calibrate_right`.
 The previous `/<namespace>/mic/sound_direction` stream and mic calibration
@@ -21,8 +22,9 @@ front, and `audio_window_start_us`/`audio_window_end_us` for the SDK capture
 frames used in the estimate. `timestamp_ms` is publication time.
 `check_direction` keeps the last observation for ten seconds, then reports
 `stale`. The stream publishes one `no_event` after one second without a new
-direction so the monitor clears an old angle. Mono audio chunks still use
-their first capture frame's timestamp in `AudioChunk.header.stamp`.
+direction so the monitor clears an old angle. The restored upstream `mic`
+implementation does not set `AudioChunk.header.stamp`; match direction to audio
+by capture time only after timestamp support is added to `mic` separately.
 
 Use `set_parameters` on the `sound_direction` card to change one or more
 thresholds, then use `info` to see the active values. Leave unwanted fields

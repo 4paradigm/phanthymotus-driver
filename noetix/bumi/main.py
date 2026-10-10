@@ -169,6 +169,8 @@ class BumiDeviceBundle:
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
+            if not getattr(p, "AUTO_START", True):
+                continue
             try:
                 p.start()
             except Exception as e:

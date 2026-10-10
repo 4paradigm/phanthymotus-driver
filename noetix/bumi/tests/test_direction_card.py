@@ -92,6 +92,11 @@ def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch):
     bundle = bundle_module.BumiDeviceBundle(
         cfg, "robot", types.SimpleNamespace(add_node=lambda node: None), None, object())
     assert {tool["name"] for tool in bundle.get_all_tools()} == {"mic", "sound_direction"}
+    started = []
+    for plugin in bundle._plugins:
+        plugin.start = lambda name=plugin.get_tool()["name"]: started.append(name)
+    bundle.start_all()
+    assert started == ["mic"]
     manifest = yaml.safe_load((path.parent / "driver.yaml").read_text(encoding="utf-8"))
     categories = {card["name"]: card["type"] for card in manifest["cards"]}
     assert categories["sound_direction"] == "actuator"

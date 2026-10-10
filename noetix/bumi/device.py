@@ -963,7 +963,6 @@ def _mic_subprocess(namespace: str):
     frame_count = 0
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
-    buffer_start_us = None
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
 
     while True:
@@ -975,9 +974,6 @@ def _mic_subprocess(namespace: str):
 
             # Downmix 8ch → mono (channel 0) using numpy for speed
             samples = _np.array(audio.audio_data, dtype=_np.int16)
-            capture_us = getattr(audio, "timestamp_us", 0)
-            if type(capture_us) is not int or capture_us <= 0:
-                capture_us = int(_time.time() * 1_000_000)
             mono = samples[::audio.channels]
 
             # SDK returns low-amplitude signal (~8-bit dynamic range in 16-bit container)
@@ -985,20 +981,14 @@ def _mic_subprocess(namespace: str):
             mono = _np.clip(mono.astype(_np.int32) * 50, -32768, 32767).astype(_np.int16)
 
             # Accumulate until we have enough for a proper chunk
-            if buffer_start_us is None:
-                buffer_start_us = capture_us
             buffer = _np.concatenate([buffer, mono])
 
             if len(buffer) >= MIN_CHUNK_SAMPLES:
                 msg = _AudioChunk()
-                # 与方向计算窗口使用同一原始音频时间轴，供 Agent 关联。
-                msg.header.stamp.sec = buffer_start_us // 1_000_000
-                msg.header.stamp.nanosec = (buffer_start_us % 1_000_000) * 1000
                 msg.format = "pcm_16k_16bit_mono"
                 msg.data = buffer.tobytes()
                 pub.publish(msg)
                 buffer = _np.array([], dtype=_np.int16)
-                buffer_start_us = None
 
                 frame_count += 1
                 if frame_count % 200 == 0:
@@ -1016,63 +1006,45 @@ class MicPlugin:
         self._namespace = namespace
         self._topic = f"/{namespace}/mic/audio"
         self._proc: subprocess.Popen | None = None
-        self._process_lock = threading.RLock()
+
     def get_tool(self) -> dict:
         return {
-            "name": "mic", "type": "sensor", "multiInstance": False,
-            "description": "Bumi microphone audio",
+            "name": "mic",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"Bumi microphone — 8ch array, outputs mono PCM 16kHz 16bit. Publishes to {self._topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
         }
 
     def start(self) -> None:
         import sys
-        with self._process_lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return
-            proc = subprocess.Popen(
-                [sys.executable, "-c",
-                 # Protect import-time output as well as the child entry point.
-                 "import sys; sys.path.insert(0, '/work'); "
-                 "from common import logsafe; logsafe.install(check_fd=False); "
-                 f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
-            self._proc = proc
-            # Forward subprocess stdout in background
-            def _fwd():
-                for line in proc.stdout:
-                    print(line.decode(errors='replace').rstrip(), flush=True)
-            threading.Thread(target=_fwd, daemon=True).start()
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c",
+             # Protect import-time output as well as the child entry point.
+             "import sys; sys.path.insert(0, '/work'); "
+             "from common import logsafe; logsafe.install(check_fd=False); "
+             f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        # Forward subprocess stdout in background
+        def _fwd():
+            for line in self._proc.stdout:
+                print(line.decode(errors='replace').rstrip(), flush=True)
+        threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
-        with self._process_lock:
-            if self._proc:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-                    try:
-                        self._proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired as exc:
-                        # 子进程未退出时保留句柄，阻止 start 启动第二个采集进程。
-                        raise RuntimeError("mic subprocess did not exit after kill") from exc
-                self._proc = None
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            self.start()
-            return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
         if action == "stop":
-            try:
-                self.stop()
-            except RuntimeError as exc:
-                return {"state": "error", "message": str(exc)}
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running" if self._proc and self._proc.poll() is None else "idle",
-                    "topic_out": self.get_tool()["topic_out"]}
+            return {"state": "running" if self._proc and self._proc.poll() is None else "idle"}
         return None
 
 

@@ -1,5 +1,4 @@
 import importlib.util
-import subprocess
 import sys
 import types
 from pathlib import Path
@@ -53,65 +52,7 @@ def _load_device(monkeypatch):
     return module, String
 
 
-def test_mic_stop_reaps_subprocess_before_restart(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-    executor = types.SimpleNamespace(add_node=lambda node: None)
-    media = types.SimpleNamespace(get_wakeup_words=lambda: "小范小范")
-    card = module.MicPlugin({}, "robot", executor, media)
-    events = []
-
-    class Process:
-        stdout = ()
-
-        def poll(self):
-            return None if "reaped" not in events else 0
-
-        def terminate(self):
-            events.append("terminate")
-
-        def wait(self, timeout=None):
-            events.append("wait")
-            if "kill" not in events:
-                raise subprocess.TimeoutExpired("mic", timeout)
-            events.append("reaped")
-
-        def kill(self):
-            events.append("kill")
-
-    card._proc = Process()
-    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: (
-        events.append("spawn") or types.SimpleNamespace(stdout=(), poll=lambda: None)))
-
-    assert card.dispatch("stop", {}) == {"state": "idle"}
-    assert events == ["terminate", "wait", "kill", "wait", "reaped"]
-    card.dispatch("start", {})
-    assert events[-1] == "spawn"
-
-def test_mic_stop_does_not_claim_idle_if_killed_process_is_still_running(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-    card = module.MicPlugin({}, "robot", types.SimpleNamespace(add_node=lambda node: None),
-                            object())
-
-    class Process:
-        def poll(self):
-            return None
-
-        def terminate(self):
-            pass
-
-        def kill(self):
-            pass
-
-        def wait(self, timeout=None):
-            raise subprocess.TimeoutExpired("mic", timeout)
-
-    process = Process()
-    card._proc = process
-    assert card.dispatch("stop", {}) == {
-        "state": "error", "message": "mic subprocess did not exit after kill"}
-    assert card._proc is process
-
-def test_audio_chunk_timestamp_uses_first_buffered_frame(monkeypatch):
+def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch):
     module, String = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     published = {}
@@ -155,5 +96,5 @@ def test_audio_chunk_timestamp_uses_first_buffered_frame(monkeypatch):
 
     audio = published["/robot/mic/audio"]
     assert len(audio) == 1
-    stamp = audio[0].header.stamp
-    assert stamp.sec * 1_000_000 + stamp.nanosec // 1000 == 1_700_000_000_000_000
+    assert audio[0].format == "pcm_16k_16bit_mono"
+    assert audio[0].data == (500).to_bytes(2, "little", signed=True) * 640

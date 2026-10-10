@@ -157,6 +157,7 @@ def _direction_subprocess(namespace: str) -> None:
 
 class SoundDirectionPlugin:
     PREFIX = "sound_direction"
+    AUTO_START = False
 
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl=None):
         self._namespace = namespace
