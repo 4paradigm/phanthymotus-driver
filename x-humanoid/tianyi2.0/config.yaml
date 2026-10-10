@@ -2,6 +2,22 @@ mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
 name: "X-humanoid Tianyi 2.0 Pro Bundle"
 
+# Optional legacy three-card teleoperation. Existing installations are not enabled.
+# The calibration file is local to this Driver and must match teleop execution.
+motion_control:
+  enabled: false
+  calibration_path: ""
+
+# Two-card teleoperation: registration is available; start is output-free.
+teleop_control:
+  enabled: true
+  mode: shadow
+  calibration_path: ""
+  position_scale: 0.5
+  joint_velocity_rad_s: 1.0
+  trajectory_smoothing: false
+  joint_acceleration_rad_s2: 2.0
+
 # Forward all topics from domain 0 (body controller) to domain 42 (agent-core)
 # via socket bridge. This enables proper DDS isolation.
 domain_bridge:
