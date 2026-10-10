@@ -21,6 +21,7 @@ RUN . /opt/ros/humble/setup.sh && \
     colcon build --packages-select xbot_common_interfaces audio_msgs
 
 FROM ${ROS_BASE_IMAGE}
+ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 
 ENV ROS_DOMAIN_ID=211
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -46,10 +47,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-action-msgs \
     && rm -rf /var/lib/apt/lists/*
 
-# ArUco is part of OpenCV contrib; the headless wheel needs no display stack.
-RUN pip3 install --no-cache-dir --only-binary=:all: \
-    numpy==1.23.5 opencv-contrib-python-headless==4.11.0.86 \
-    && python3 -c "import cv2; assert hasattr(cv2, 'aruco')"
+# Ubuntu already supplies NumPy for Q5. Install only the OpenCV contrib wheel
+# so a second large NumPy download cannot stall the PR image build.
+RUN pip3 install --no-cache-dir --only-binary=:all: --no-deps \
+    --timeout 30 --retries 2 -i ${PYPI_MIRROR} \
+    opencv-contrib-python-headless==4.11.0.86 \
+    && python3 -c "import numpy, cv2; assert hasattr(cv2, 'aruco')"
 
 WORKDIR /work
 COPY --from=interface-builder /q5_ws/install /q5_ws/install
