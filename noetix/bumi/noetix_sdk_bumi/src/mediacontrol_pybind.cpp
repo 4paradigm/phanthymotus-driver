@@ -150,8 +150,6 @@ PYBIND11_MODULE(mediacontrol_py, m) {
                  &MediaController::set_sleep_response_words,
                  py::arg("words"))
             .def("get_wakeup_words", &MediaController::get_wakeup_words)
-            .def("add_wakeup_words", &MediaController::add_wakeup_words,
-                 py::arg("words"))
 
             // Audio Stream
             .def("get_audio_capture_data",
