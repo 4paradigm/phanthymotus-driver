@@ -528,7 +528,7 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
             self.assertEqual(len(nodes.robot.subscriptions), 2)
-            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 2)
+            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 1)
             self.assertEqual(initialized_domains[0][1], 2)
             self.assertIn("/sys/device/audio_in/raw",
                           [sub[1] for sub in nodes.audio_device.subscriptions])

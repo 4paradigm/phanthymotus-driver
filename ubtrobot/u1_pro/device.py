@@ -504,8 +504,6 @@ class U1Nodes:
         self._mic_stream_open = False
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
-        self._mic_asr_subscription = self.audio_device.create_subscription(
-            AudioInData, ASR_AUDIO_TOPIC, self._mic_topic_callback, self._audio_qos)
         self._playback_listeners = []
         self._robot_subscriptions = []
         for name, topic in EVENT_TOPICS.items():
@@ -961,9 +959,6 @@ class U1Nodes:
         if self._mic_subscription is not None:
             self.audio_device.destroy_subscription(self._mic_subscription)
             self._mic_subscription = None
-        if self._mic_asr_subscription is not None:
-            self.audio_device.destroy_subscription(self._mic_asr_subscription)
-            self._mic_asr_subscription = None
         if self._video_users:
             try:
                 self.trigger_call("video_close")
