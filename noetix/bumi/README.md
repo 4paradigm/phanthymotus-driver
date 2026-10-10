@@ -7,9 +7,9 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 `mic` publishes mono PCM on `/<namespace>/mic/audio`. The separate
 `sound_direction` control card reads the SDK's eight-channel microphone capture
 directly, uses the first four channels for direction estimation, and publishes
-JSON on `/<namespace>/sound_direction`. Both cards start with the bundle and
-have independent `start`/`stop`/`info` actions. The direction card also
-provides `check_direction`, `calibrate_front`, and `calibrate_right`.
+JSON on `/<namespace>/sound_direction`. Both cards start with the bundle.
+`mic` is a passive sensor in the canvas; the control card provides
+`start`/`stop`/`info`, `check_direction`, `calibrate_front`, and `calibrate_right`.
 The previous `/<namespace>/mic/sound_direction` stream and mic calibration
 actions are no longer produced by `mic`; update any canvas connections.
 

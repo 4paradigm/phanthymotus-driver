@@ -74,8 +74,7 @@ def test_mic_card_only_advertises_audio_after_migration(monkeypatch):
     card = module.MicPlugin({}, "robot", types.SimpleNamespace(add_node=lambda node: None), object())
     assert card.get_tool()["topic_out"] == [
         {"topic": "/robot/mic/audio", "format": "audio/pcm-16k"}]
-    assert card.get_tool()["inputSchema"]["properties"]["action"]["enum"] == [
-        "start", "stop", "info"]
+    assert card.get_tool()["inputSchema"] == {"type": "object", "properties": {}}
 
 
 def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch):

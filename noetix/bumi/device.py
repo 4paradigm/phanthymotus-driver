@@ -1021,16 +1021,7 @@ class MicPlugin:
         return {
             "name": "mic", "type": "sensor", "multiInstance": False,
             "description": "Bumi microphone audio",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"]}},
-                "required": ["action"],
-                "x-action-params": {
-                    "start": {"params": [], "description": "启动麦克风音频采集。"},
-                    "stop": {"params": [], "description": "停止麦克风音频采集。"},
-                    "info": {"params": [], "description": "查看麦克风音频采集状态。"},
-                },
-            },
+            "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
         }
 
