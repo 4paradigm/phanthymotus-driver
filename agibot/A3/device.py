@@ -267,7 +267,10 @@ def _skeleton_joint_indices() -> dict[str, int]:
     return {
         joint.get("name"): index
         for index, joint in enumerate(root.findall("joint"))
-        if joint.get("name") and joint.get("type") in {"revolute", "continuous", "prismatic"}
+        if joint.get("name") and (
+            joint.get("type") in {"revolute", "continuous", "prismatic"}
+            or "_hand_joint" in (joint.get("name") or "")
+        )
     }
 
 
@@ -645,6 +648,7 @@ class A3Nodes:
         mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
         mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
         mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json")
+        mirror("leg_state", JointState, "/motion/control/leg_joint_state", "data/json")
         mirror("lidar_cloud", PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", "sensor/pointcloud")
         mirror("imu_pelvis", Imu, "/ros2/body_drive/pelvis_imu/data", "data/json")
         mirror("imu_torso", Imu, "/ros2/body_drive/torso_imu/data", "data/json")
@@ -701,12 +705,15 @@ class A3Nodes:
         self.audio_topics = {}
         self.speaker_subscription = None
         if AudioCapture is not None and AudioPlayback is not None and AudioChunk is not None:
-            # The v3.2 internal capture topic is affected by the vendor mic
-            # bug. Expose the external HAL stream as the canonical `mic` card;
-            # retain the raw internal topic only as an explicitly named
-            # diagnostic card.
-            for key, topic in (("mic", "/agent/audio/data/external"),
-                               ("ext_mic", "/audiohal/audio/capture")):
+            # Keep the two physical/logical routes as separate cards. On the
+            # deployed A3, /audiohal/audio/capture is the only topic with a
+            # live writer; /agent/audio/data/external is a downstream route.
+            # On the A3 actually deployed on the robot, the only live writer is
+            # aimrt_hal_audio_node on /audiohal/audio/capture.  The agent
+            # external topic is a consumer-facing route and currently has no
+            # writer, so it must remain the explicitly named ext_mic card.
+            for key, topic in (("mic", "/audiohal/audio/capture"),
+                               ("ext_mic", "/agent/audio/data/external")):
                 core_topic = _core_topic(namespace, f"{key}/audio")
                 pub = self.core.create_publisher(AudioChunk, core_topic, 5)
                 try:
@@ -1128,10 +1135,10 @@ class A3Nodes:
 
     def _publish_joint_streams(self):
         groups = {key: self._joint_cache.get(key, {})
-                  for key in ("arm_state", "hand_state", "neck_state")}
+                  for key in ("arm_state", "hand_state", "neck_state", "leg_state")}
         raw = {}
         for prefix, group in (("arm", groups["arm_state"]), ("hand", groups["hand_state"]),
-                              ("neck", groups["neck_state"])):
+                              ("neck", groups["neck_state"]), ("leg", groups["leg_state"])):
             _flatten_joint_group(group, prefix, raw)
         output = self._String()
         output.data = json.dumps(raw, ensure_ascii=False)
@@ -1142,6 +1149,12 @@ class A3Nodes:
         group_aliases = {
             "arm_state": [*ARM_JOINTS["left"], *ARM_JOINTS["right"]],
             "neck_state": list(NECK_JOINTS),
+            "leg_state": [
+                "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+                "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+                "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+                "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+            ],
         }
         for group_key, group in groups.items():
             names = group.get("name", []) if isinstance(group, dict) else []
@@ -1944,7 +1957,11 @@ def _mc_current_state(rpc):
     command.action — '' means "could not tell", callers stay permissive then.
     """
     response = rpc.get_action()
-    for container in (response, response.get("data") or {}):
+    # AimDK 3.2 returns the live state under `info.current_action`; older
+    # firmware used `data.state`/`action`. Search all known envelopes so the
+    # safety gate never treats PASSIVE as an unknown permissive state.
+    containers = [response, response.get("info") or {}, response.get("data") or {}]
+    for container in containers:
         if isinstance(container, dict):
             for key in ("action", "state", "current_action"):
                 value = container.get(key)
@@ -3187,16 +3204,6 @@ class MicPlugin:
                 return {"state": "idle"}
         if action == "stop":
             return {"state": "idle", **stream}
-        if action == "start" and self.key == "mic":
-            # A3 v3.2's internal source is known-broken. Selecting the
-            # external HAL source when the canonical mic card is started makes
-            # the card produce the real capture stream without changing the
-            # robot's motion/control state.
-            try:
-                source = self.nodes.rpc.set_mic_source(MIC_SOURCES["external"])
-            except Exception as exc:
-                return {"state": "degraded", "reason": f"external mic selection failed: {exc}", **stream}
-            return {"state": "running", "source": "external", "source_result": jsonable(source), **stream}
         return {"state": "running", **stream}
 
 

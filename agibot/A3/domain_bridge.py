@@ -92,7 +92,7 @@ class CoreBridge:
                 lane = "state_joint_state"
             elif topic.endswith("/state/imu"):
                 lane = "state_imu"
-            elif topic.endswith(("/arm_state", "/hand_state", "/neck_state")):
+            elif topic.endswith(("/arm_state", "/hand_state", "/neck_state", "/leg_state")):
                 lane = "state_motor"
             elif topic.endswith("/battery"):
                 lane = "state_battery"
