@@ -235,7 +235,6 @@ class VideoSharedMemoryReader:
             self._error = "U1 shared-memory stream configuration is incomplete"
             self._ready.set()
             return
-        slot_size = self._HEADER.size + payload_size
         try:
             deadline = time.monotonic() + SERVICE_TIMEOUT
             handle = None
@@ -252,11 +251,21 @@ class VideoSharedMemoryReader:
                 raise FileNotFoundError(path)
             with handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as shared:
                 data_offset = self._RING_HEADER.size
-                if len(shared) < data_offset + slot_size * max_frames:
+                data_bytes = len(shared) - data_offset
+                if data_bytes < (self._HEADER.size + payload_size) * max_frames:
                     raise ValueError("shared-memory ring is smaller than the stream configuration")
                 ring = self._RING_HEADER.unpack_from(shared, 0)
                 if ring[1] != max_frames or ring[2] != payload_size:
                     raise ValueError("shared-memory ring header does not match stream configuration")
+                # U1 aligns each slot to a 64-byte boundary.  The metadata
+                # reports payload size only, so deriving the stride from the
+                # mapped file is required; using header + payload reads the
+                # first slot correctly and then walks into padding/data.
+                if data_bytes % max_frames:
+                    raise ValueError("shared-memory ring has an invalid slot stride")
+                slot_size = data_bytes // max_frames
+                if slot_size < self._HEADER.size + payload_size:
+                    raise ValueError("shared-memory ring slot is smaller than its payload")
                 self._ready.set()
                 while not self._stop.is_set():
                     newest = None

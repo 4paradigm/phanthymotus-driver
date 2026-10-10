@@ -366,6 +366,34 @@ class U1CardContractTests(unittest.TestCase):
             reader.stop()
             self.assertEqual(received, [(b"LEFT", {"width": 1}, 1234)])
 
+    def test_sdk_ring_reader_honors_aligned_slot_stride(self):
+        import device
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audio.stream"
+            payload_size = 8
+            max_frames = 2
+            header = struct.pack("<8Q", 2, max_frames, payload_size, 0, 0, 0, 0, 0)
+            first = (struct.pack("<4Q", 1, 1234, 4, 0) + b"PCM1"
+                     + bytes(payload_size - 4) + bytes(64 - 32 - payload_size))
+            second = (struct.pack("<4Q", 2, 5678, 4, 0) + b"RACE"
+                      + bytes(payload_size - 4) + bytes(64 - 32 - payload_size))
+            path.write_bytes(header + first + second)
+            received = []
+            ready = threading.Event()
+
+            def on_frame(payload, metadata, timestamp):
+                received.append((payload, metadata, timestamp))
+                ready.set()
+
+            reader = device.VideoSharedMemoryReader({
+                "path": str(path), "frame_payload_size": payload_size, "max_frames": max_frames,
+            }, lambda: {}, on_frame)
+            reader.start()
+            self.assertTrue(ready.wait(1.0))
+            reader.stop()
+            self.assertEqual(received, [(b"PCM1", {}, 1234)])
+
     def test_event_bridge_keeps_sdk_string_payloads(self):
         import device
 
