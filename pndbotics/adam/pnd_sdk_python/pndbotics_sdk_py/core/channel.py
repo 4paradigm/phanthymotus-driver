@@ -46,13 +46,13 @@ class Channel:
                 self.__reader = DataReader(participant, topic, qos)
             else:
                 self.__handler = handler
+                self.__reader = DataReader(participant, topic, qos, Listener(on_data_available=self.__OnDataAvailable))
                 if queueLen > 0:
                     self.__queueEnable = True
                     self.__queue = BQueue(queueLen)
                     self.__threadEvent = Event()
                     self.__threadReader = Thread(target=self.__ChannelReaderThreadFunc, name="ch_reader", daemon=True)
                     self.__threadReader.start()
-                self.__reader = DataReader(participant, topic, qos, Listener(on_data_available=self.__OnDataAvailable))
 
         def Read(self, timeout: float = None):
             sample = None
