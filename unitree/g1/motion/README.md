@@ -4,26 +4,26 @@
 
 ## 普通镜像构建
 
-将当前 bundle 的 `motion/` 和公共 `common/motion/` 一并放进镜像。构建阶段使用项目既有受固定版本控制的 micromamba，直接安装本目录的显式 ARM64 包清单：
+主 Driver、`servo_eef` 和 IK 子进程共用 `/usr/local/bin/python3` 及同一套依赖。子进程使用 `sys.executable`，不再选择专用解释器；超时终止和重启机制不变。
+
+Dockerfile 在构建阶段使用固定版本 micromamba 安装 `requirements.numeric-linux-aarch64.lock`，将共享运行时复制到 `/usr/local`。最终镜像不保留 micromamba 或 `/opt/motion` 环境，也不再额外安装 pip `pin`。ROS 基础镜像的系统 Python 由系统包保留，Driver 不使用它。
+
+共享依赖固定为 NumPy 1.26.4、Pinocchio 3.1.0、CasADi 3.6.7。OpenCV 固定到兼容 NumPy 1.x 的 4.11.0.86，避免 pip 升级 NumPy。`LD_LIBRARY_PATH` 包含 `/usr/local/lib`，使 ROS 和数值模块使用同一套兼容的 C++ 运行库。
+
+包清单固定下载 URL 和 MD5。开发环境也需要支持 `pinocchio.casadi` 的依赖；缺失时明确报错，不退化为未求解结果。镜像构建会检查版本并下载、验证模型资产：
 
 ```sh
-micromamba create --yes --prefix /opt/motion --file /work/motion/requirements.numeric-linux-aarch64.lock
-/opt/motion/bin/python -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"'
-python3 /work/motion/fetch_assets.py
+python3 -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"'
 python3 /work/motion/fetch_assets.py --check
 ```
 
-清单来自既有 G1 CPU 版本，固定包URL和包MD5；复用文件SHA256为 `20ce04ace4936c26281be963cc71fd163ee6966d2c5f996f11f235abef909d7d`。新镜像仍需在目标 Linux ARM64 构建验证，不把历史镜像结果当本轮构建通过。`worker.py` 自动优先 `/opt/motion/bin/python`；开发机器不存在该路径时使用当前解释器，缺少 CasADi-enabled Pinocchio 会报错，不退化为无碰撞或未求解结果。
-
 七个碰撞网格只在构建时下载并逐文件核验 SHA256。网格不进入Git；许可证和清单随源码，运行时再次验证哈希。`calibration.example.json` 仍是未实物标定样例，不能填写假验收或直接作为Live配置。
 
-主进程最终指令的 RNEA 不依赖 CasADi；arm 应使用其独立模型和Data，并验证模型hash、关节顺序与数值进程一致。允许主进程使用正常 Pinocchio ABI，须用同一模型和q做数值对照；不得复用 IK 队列、等待重计算或在失败时填零力矩。
-
-本轮用同一 G1_23 URDF、同一固定关节值、零位及100组确定随机姿态，对比本地 Pinocchio 3.1.0 与 3.7.0 的最终位置重力补偿：101组的最大绝对差为0 N·m。该结果只验证本机两套ABI的模型计算一致，不证明目标机器的SDK下发或力矩效果。
+主进程与数值进程使用同一 Pinocchio 版本，但各自创建模型和 Data。执行器校验模型哈希和关节顺序，不能跨进程共享可变求解状态。当前遥操不增加重力补偿。
 
 ## 离线验证
 
-本地已验证的三个数值用例：真实 G1_23模型和已核验网格的完整关节解、独立数值子进程的 EEF14→joint10 和双末端反馈，以及空配置执行器接受新标定、无效候选保留前一配置。使用 macOS ARM64、Pinocchio3.1.0/CasADi3.6.7/NumPy1.26.4；不是Linux ARM64构建或机器人验收。
+真实数值用例覆盖 G1_23 模型和已核验网格的完整关节解、独立数值子进程的 EEF14→joint10 和双末端反馈，以及空配置执行器接受新标定、无效候选保留前一配置。统一运行时已在 ARM64 镜像和上海 G1 的隔离构建环境中验证：Pinocchio 3.1.0、CasADi 3.6.7、NumPy 1.26.4，G1 与 servo_eef 回归共 196 项通过、无跳过。机上验证使用已构建候选的文件系统，不访问设备，不代表业务部署或物理动作验收。
 
 ```sh
 python -m pytest -q unitree/g1/tests/test_motion_control_numeric.py

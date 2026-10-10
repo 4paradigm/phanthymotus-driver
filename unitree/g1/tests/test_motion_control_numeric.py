@@ -49,6 +49,8 @@ def test_real_g1_process_has_only_ten_joint_result_and_two_eef(tmp_path):
     path=profile(tmp_path);reference=IK(path)
     worker=NumericalWorker(path,1.)
     try:
+        assert worker.python_executable == sys.executable
+        assert worker._process.args[0] == sys.executable
         q=[0.]*10;worker.self_test(q)
         now=time.monotonic_ns()
         body={'boot_id':'test','session_id':'test','seq':1,'source_seq':1,'mapping_epoch':1,
