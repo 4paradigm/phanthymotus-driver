@@ -26,8 +26,9 @@ ENV ROS_DOMAIN_ID=211
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV PYTHONUNBUFFERED=1
 
-# Runtime-only dependencies. Interface build dependencies stay in the stage
-# above and are absent from the final image.
+# 运行时只显式安装检测器；apriltag_msgs 与 tf2_ros 是 apriltag_ros 的依赖，
+# 由 apt 一并安装。检测节点发布消息和 TF，测量卡片按时间戳读取。
+# 接口编译工具只留在上一阶段，不进入真机镜像。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
     python3-pil \
@@ -43,6 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-std-srvs \
     ros-humble-diagnostic-msgs \
     ros-humble-action-msgs \
+    ros-humble-apriltag-ros \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
@@ -82,6 +84,8 @@ COPY audio.py /work/audio.py
 COPY camera_rgb.py /work/camera_rgb.py
 COPY camera_depth.py /work/camera_depth.py
 COPY camera_pointcloud.py /work/camera_pointcloud.py
+COPY visual_ee_repeatability.py /work/visual_ee_repeatability.py
+COPY apriltag_q5.yaml /work/apriltag_q5.yaml
 COPY vision_capture.py /work/vision_capture.py
 COPY legacy_device.py /work/legacy_device.py
 COPY legacy_direct_control.py /work/legacy_direct_control.py
