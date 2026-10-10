@@ -971,7 +971,13 @@ def _load_calibration() -> dict:
             and all(type(value) in (int, float) for value in signature)}
 
 
-def _mic_direction_payload(signature, calibration, timestamp_ms) -> str:
+def _mic_capture_timestamp_us(audio, now_us: int) -> int:
+    """Use the SDK capture time when present, otherwise the local receive time."""
+    timestamp_us = getattr(audio, "timestamp_us", 0)
+    return timestamp_us if type(timestamp_us) is int and timestamp_us > 0 else now_us
+
+
+def _mic_direction_payload(signature, calibration, timestamp_ms, audio_window=None) -> str:
     """Build the sound_direction JSON published on each vendor wake event."""
     from sound_direction import estimate_angle
     angle = None
@@ -981,13 +987,16 @@ def _mic_direction_payload(signature, calibration, timestamp_ms) -> str:
         "uncalibrated" if len(calibration) < 2 else "ambiguous")
     direction = {"state": state, "trigger": "vendor_audio_wakeup",
                  "timestamp_ms": int(timestamp_ms)}
+    if audio_window is not None:
+        direction.update({"audio_window_start_us": audio_window[0],
+                          "audio_window_end_us": audio_window[1]})
     if angle is not None:
         direction.update({"angle": angle, "unit": "deg",
                           "reference": "robot_front_clockwise"})
     return json.dumps(direction, ensure_ascii=False)
 
 
-def _mic_activity_payload(audio, calibration, timestamp_ms) -> str | None:
+def _mic_activity_payload(audio, calibration, timestamp_ms, audio_window=None) -> str | None:
     """Report a coherent sound source without requiring a vendor wake event."""
     from sound_direction import estimate_angle, estimate_signature
     if not {"front", "right"} <= calibration.keys():
@@ -998,10 +1007,13 @@ def _mic_activity_payload(audio, calibration, timestamp_ms) -> str | None:
     angle = estimate_angle(signature, calibration["front"], calibration["right"])
     if angle is None:
         return None
-    return json.dumps({"state": "fresh", "trigger": "sound_activity",
-                       "timestamp_ms": int(timestamp_ms), "angle": angle,
-                       "unit": "deg", "reference": "robot_front_clockwise"},
-                      ensure_ascii=False)
+    direction = {"state": "fresh", "trigger": "sound_activity",
+                 "timestamp_ms": int(timestamp_ms), "angle": angle,
+                 "unit": "deg", "reference": "robot_front_clockwise"}
+    if audio_window is not None:
+        direction.update({"audio_window_start_us": audio_window[0],
+                          "audio_window_end_us": audio_window[1]})
+    return json.dumps(direction, ensure_ascii=False)
 
 
 def _mic_subprocess(namespace: str):
@@ -1051,6 +1063,7 @@ def _mic_subprocess(namespace: str):
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
     recent_audio = _deque(maxlen=100)  # 约 1 秒原始 8 通道音频，供唤醒时定位。
+    recent_capture_us = _deque(maxlen=100)
     next_status_poll = 0.0
     next_activity_check = 0.0
     next_direction_error_log = 0.0
@@ -1067,7 +1080,9 @@ def _mic_subprocess(namespace: str):
                         _np.concatenate(recent_audio) if recent_audio else [], 8, 16000)
                     direction_msg = String()
                     direction_msg.data = _mic_direction_payload(
-                        signature, _load_calibration(), _time.time() * 1000)
+                        signature, _load_calibration(), _time.time() * 1000,
+                        (recent_capture_us[0], recent_capture_us[-1])
+                        if recent_capture_us else None)
                     direction_pub.publish(direction_msg)
                 except Exception as exc:
                     # 单次方向发布失败只丢这条事件，不阻塞音频采集。
@@ -1082,15 +1097,18 @@ def _mic_subprocess(namespace: str):
 
             # Downmix 8ch → mono (channel 0) using numpy for speed
             samples = _np.array(audio.audio_data, dtype=_np.int16)
+            capture_us = _mic_capture_timestamp_us(audio, int(_time.time() * 1_000_000))
             if audio.channels == 8 and audio.sample_rate == 16000:
                 recent_audio.append(samples)
+                recent_capture_us.append(capture_us)
                 if len(recent_audio) >= 8 and _time.monotonic() >= next_activity_check:
                     next_activity_check = _time.monotonic() + 0.1
                     try:
                         # 使用现有四路采集估计近期的主声源；无可靠角度时不发布。
                         activity = _mic_activity_payload(
                             _np.concatenate(list(recent_audio)[-8:]),
-                            _load_calibration(), _time.time() * 1000)
+                            _load_calibration(), _time.time() * 1000,
+                            (recent_capture_us[-8], recent_capture_us[-1]))
                         if activity is not None:
                             direction_msg = String()
                             direction_msg.data = activity
@@ -1110,6 +1128,9 @@ def _mic_subprocess(namespace: str):
 
             if len(buffer) >= MIN_CHUNK_SAMPLES:
                 msg = _AudioChunk()
+                # 与方向计算窗口使用同一原始音频时间轴，供 Agent 关联。
+                msg.header.stamp.sec = capture_us // 1_000_000
+                msg.header.stamp.nanosec = (capture_us % 1_000_000) * 1000
                 msg.format = "pcm_16k_16bit_mono"
                 msg.data = buffer.tobytes()
                 pub.publish(msg)

@@ -40,7 +40,12 @@ def _load_device(monkeypatch):
     }
     modules["rclpy.node"].Node = Node
     modules["std_msgs.msg"].String = String
-    modules["audio_msgs.msg"].AudioChunk = type("AudioChunk", (), {})
+    class AudioChunk:
+        def __init__(self):
+            self.header = types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0))
+
+    modules["audio_msgs.msg"].AudioChunk = AudioChunk
     modules["sensor_msgs.msg"].CompressedImage = type("CompressedImage", (), {})
     modules["sensor_msgs.msg"].Image = type("Image", (), {})
     for name, module in modules.items():
@@ -352,6 +357,24 @@ def test_direction_contract_from_estimator_to_subscription(monkeypatch):
     assert card.dispatch("info", {})["sound_direction"] == {"state": "no_event"}
 
 
+def test_mic_capture_time_falls_back_when_sdk_timestamp_is_missing(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    assert module._mic_capture_timestamp_us(types.SimpleNamespace(timestamp_us=123), 456) == 123
+    assert module._mic_capture_timestamp_us(types.SimpleNamespace(timestamp_us=0), 456) == 456
+    assert module._mic_capture_timestamp_us(types.SimpleNamespace(), 456) == 456
+
+
+def test_vendor_wake_direction_carries_audio_window(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setitem(sys.modules, "sound_direction", types.SimpleNamespace(
+        estimate_angle=lambda signature, front, right: 45))
+    payload = json.loads(module._mic_direction_payload(
+        (1, 2, 3), {"front": [1, 0, 0], "right": [0, 1, 0]},
+        1000, (500, 800)))
+    assert payload["audio_window_start_us"] == 500
+    assert payload["audio_window_end_us"] == 800
+
+
 def test_sound_activity_reports_coherent_source_without_wake_status(monkeypatch):
     module, String = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
@@ -416,6 +439,7 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
     audio = np.stack(channels, axis=1)
     frames = iter(audio.reshape(16, 640, 8))
     clock = [0.0]
+    capture_times = iter(1_700_000_000_000_000 + n * 40_000 for n in range(16))
 
     def capture():
         try:
@@ -423,7 +447,8 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         except StopIteration:
             raise Done()
         clock[0] += 0.04  # 每帧 40 毫秒，模拟持续输入。
-        return types.SimpleNamespace(channels=8, sample_rate=16000,
+        return types.SimpleNamespace(timestamp_us=next(capture_times),
+                                     channels=8, sample_rate=16000,
                                      audio_data=frame.reshape(-1).tolist())
 
     media = types.SimpleNamespace(
@@ -447,6 +472,14 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
     assert len(messages) >= 3  # 100 毫秒检查一次，16 帧内应多次发布。
     assert json.loads(messages[0].data)["angle"] == 0
     assert json.loads(messages[0].data)["trigger"] == "sound_activity"
+    audio_stamps = [msg.header.stamp.sec * 1_000_000
+                    + msg.header.stamp.nanosec // 1000
+                    for msg in published["/robot/mic/audio"]]
+    for message in messages:
+        direction = json.loads(message.data)
+        assert direction["audio_window_start_us"] <= direction["audio_window_end_us"]
+        assert any(direction["audio_window_start_us"] <= stamp <=
+                   direction["audio_window_end_us"] for stamp in audio_stamps)
 
 
 def test_mic_direction_rejects_unexpected_shapes(monkeypatch):
