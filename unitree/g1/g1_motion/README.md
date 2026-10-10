@@ -72,6 +72,19 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 
 感谢 **@jsmy-CTH** 在 [PR #322：提供实际下发状态用于轨迹衔接](https://github.com/4paradigm/phanthymotus-driver/pull/322) 中的贡献。本实现参考其“以实际成功下发的关节参考作为后续轨迹衔接起点”的做法，避免反复以存在滞后的实测位置作为推进起点。请将 #322 作为这部分设计来源保留。120ms一阶指数平滑及本卡1rad/s、dt最大50ms的组合是本次G1适配追加的实现，不冒称为#322原有全部算法，也不将参考部分描述为本PR独立首创。
 
-## 回归入口
+## ROS 生命周期验证
 
-常规测试位于 `unitree/g1/tests/`。`scripts/compare_g1_teleop_baseline.py` 使用明确 Git 基线、同一 profile 及已有录制，分别比较相对映射和固定时钟执行输出；它使用 SDK 替身，不是完整 IK 回放或真机验收。旧四卡专用、依赖外部 mapper 的 `validate_g1_offline.py` 已移除。真实模型 profile 对照见 `test_motion_control_numeric.py`。
+[手动验证脚本](../tests/validate_ros_lifecycle.py) 使用真实 ROS 节点和接收线程，检查订阅切换、线程归属、InvalidHandle 恢复及错误状态。控制对象使用替身，不导入硬件 SDK，不验证机器人动作。脚本不由默认 pytest 收集。
+
+在 Linux ARM64 测试机的仓库根目录执行。将 `G1_TEST_IMAGE` 设置为已有的 G1 Driver 镜像；容器使用隔离网络、只读文件系统和只读源码，不挂载设备：
+
+```sh
+docker run --rm --network none --read-only --tmpfs /tmp \
+  -v "$PWD:/src:ro" -w /src \
+  -e G1_TELEOP_ISOLATED_TEST=1 -e PYTHONDONTWRITEBYTECODE=1 \
+  -e PYTHONPATH=/src -e ROS_LOG_DIR=/tmp/ros-log \
+  --entrypoint /bin/bash "$G1_TEST_IMAGE" -lc \
+  'source /opt/ros/humble/setup.bash && python3 unitree/g1/tests/validate_ros_lifecycle.py'
+```
+
+成功时输出 `ROS ISOLATED PASS`。环境变量仅确认操作者已选择隔离环境，不会自动检查容器网络或设备挂载。真实模型验证仍使用 `test_motion_control_numeric.py`。

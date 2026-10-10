@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 if os.environ.get('G1_TELEOP_ISOLATED_TEST') != '1':
     raise SystemExit('Use --network none --read-only, then set G1_TELEOP_ISOLATED_TEST=1')
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'unitree/g1'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
