@@ -235,6 +235,85 @@ def test_card_stop_cancels_worker_and_stops_robot(tmp_path, monkeypatch):
     assert not card._worker.is_alive()
 
 
+def test_starting_follow_cancels_running_loco_timed_move(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    main = importlib.import_module("unitree.go1.main")
+    client = Client()
+    model = tmp_path / "shoes.onnx"
+    model.write_bytes(b"model")
+    bundle = main.Go1Bundle({"plugins": {"loco": {"enabled": True},
+                                        "person_follow": {"enabled": True,
+                                                          "model_path": str(model)}}},
+                            "test_go1", None, client)
+    follow = next(p for p in bundle._plugins if p.get_tool()["name"] == "person_follow")
+    loco = next(p for p in bundle._plugins if p.get_tool()["name"] == "loco")
+    entered = threading.Event()
+
+    def run():
+        entered.set()
+        while not follow._cancel.wait(.01):
+            pass
+
+    monkeypatch.setattr(follow, "_run", run)
+    try:
+        # 反向交接：loco 定时 move 线程运行期间启动 follow，该线程必须被取消，
+        # 否则会以 100ms 周期继续覆盖跟随卡的保守命令。
+        assert bundle.dispatch("loco", {"action": "move", "vx": .3, "duration": 60})["ok"]
+        time.sleep(.3)
+        moves_before = len(client.moves)
+        assert moves_before >= 1
+        assert bundle.dispatch("person_follow", {"action": "follow", "confirm": True})["ok"]
+        assert entered.wait(1)
+        time.sleep(.3)
+        assert len(client.moves) == moves_before
+        assert client.stops >= 1
+        assert loco._thread is None
+    finally:
+        follow.stop()
+
+
+def test_starting_follow_interrupts_running_gesture():
+    from unitree.go1.controllers import GesturePlugin
+
+    client = Client()
+    card = GesturePlugin({}, "test_go1", None, client)
+    assert card.dispatch("greet", {"times": 2})["ok"]
+    assert card._lock.locked()
+    card.preempt_motion()
+    assert not card._lock.locked()
+    thread = card._thread
+    assert thread is None or not thread.is_alive()
+
+
+def test_cleanup_releases_camera_when_stop_move_fails(tmp_path, monkeypatch):
+    from unitree.go1 import camera
+
+    class BoomClient(Client):
+        def stop_move(self):
+            raise RuntimeError("sdk proxy gone")
+
+    model = tmp_path / "shoes.onnx"
+    model.write_bytes(b"model")
+    card = PersonFollowPlugin({"model_path": str(model)}, client=BoomClient())
+
+    def run():
+        raise RuntimeError("camera failed")
+
+    monkeypatch.setattr(card, "_run", run)
+    try:
+        assert card.dispatch("follow", {"confirm": True})["ok"]
+        card._worker.join(1)
+        assert not card._worker.is_alive()
+        with camera._CAMERA_LOCK:
+            assert "front" not in camera._SNAPSHOT_POSITIONS
+        info = card.dispatch("info", {})
+        assert info["state"] == "error"
+        assert "camera failed" in info["reason"]
+    finally:
+        with camera._CAMERA_LOCK:
+            camera._SNAPSHOT_POSITIONS.discard("front")
+
+
 def test_cancelled_follow_cleanup_does_not_stop_new_owner(tmp_path, monkeypatch):
     client = Client()
     model = tmp_path / "shoes.onnx"

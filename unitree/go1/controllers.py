@@ -79,6 +79,11 @@ class LocoPlugin:
         except Exception:
             pass
 
+    def preempt_motion(self):
+        # follow 接管运动前由 bundle 调用：撤销定时 move 线程并立即停车，
+        # 否则残留线程会以 100ms 周期继续覆盖跟随卡的保守命令。
+        self.stop()
+
     def _cancel_timed(self):
         with self._tlock:
             th = self._thread
@@ -498,6 +503,16 @@ class GesturePlugin:
             self._client.set_posture(_FORCE_STAND_G)
         except Exception:
             pass
+
+    def preempt_motion(self):
+        # follow 接管运动前由 bundle 调用：打断进行中的异步动作并等它退出，
+        # 避免动作线程与跟随线程并发写运动命令。
+        if not self._lock.locked():
+            return
+        self.stop()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     def _glide(self, pitch=0.0, roll=0.0, yaw=0.0, h=0.0, dur=0.5, hz=50) -> bool:
         tgt = {"roll": _clamp_g(roll, _ATT_MAX_G), "pitch": _clamp_g(pitch, _ATT_MAX_G),

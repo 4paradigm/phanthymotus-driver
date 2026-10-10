@@ -263,6 +263,12 @@ class Go1Bundle:
                     if (tool_name in ("loco", "body_pose", "switch_gait", "gesture", "special_motion")
                             and action not in ("start", "info") and hasattr(self, "_follow_plugin")):
                         self._follow_plugin.preempt()
+                    # 中文说明：反向交接——follow 启动前先取消其他卡仍在后台写的运动线程
+                    # （如 loco 定时 move），否则两个线程会交替覆盖同一 SDK 运动目标。
+                    if tool_name == "person_follow" and action == "follow":
+                        for other in self._plugins:
+                            if other is not p and hasattr(other, "preempt_motion"):
+                                other.preempt_motion()
                     return p.dispatch(action, args)
         return None
 

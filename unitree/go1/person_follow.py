@@ -326,7 +326,11 @@ class PersonFollowPlugin:
             self._cancel.set()
             with self._motion_lock:
                 if self._owns_motion:
-                    self._client.stop_move()
+                    # 中文说明：停车失败不能跳过后面的相机释放与状态更新。
+                    try:
+                        self._client.stop_move()
+                    except Exception:
+                        pass
                     self._owns_motion = False
             with camera._CAMERA_LOCK:
                 camera._SNAPSHOT_POSITIONS.discard("front")
