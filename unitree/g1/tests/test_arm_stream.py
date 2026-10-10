@@ -30,7 +30,7 @@ class Channel:
 
 def calibration(tmp_path):
     data=json.loads((DRIVER/'motion/calibration.example.json').read_text())
-    data['urdf_path']=str(DRIVER/'motion/models/g1_body23.urdf')
+    data['urdf_path']=str(DRIVER/'motion/models/body23.urdf')
     data['locked_joints']=dict.fromkeys(data['locked_joints'],0.)
     path=tmp_path/'synthetic.json';path.write_text(json.dumps(data));return path
 

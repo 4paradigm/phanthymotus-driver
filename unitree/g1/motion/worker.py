@@ -5,7 +5,7 @@ from common.motion.worker import NumericalWorker as _Worker
 
 class NumericalWorker(_Worker):
     def __init__(self, path, velocity=None):
-        python = Path('/opt/g1-motion/bin/python')
+        python = Path('/opt/motion/bin/python')
         super().__init__(path, velocity, python_executable=python if python.is_file() else None, driver_dir=Path(__file__).resolve().parents[1],
-            solver_module='motion.kinematics', solver_class='G1IK',
+            solver_module='motion.kinematics', solver_class='IK',
             visualization_module='motion.visualization')

@@ -11,8 +11,8 @@ import json
 from pathlib import Path
 import time
 import numpy as np
-from .g1_ik import G123PinocchioIk, ARM_JOINT_NAMES
-from .g1_collision import G1Collision
+from .ik import PinocchioIk, ARM_JOINT_NAMES
+from .collision import Collision
 from .workspace import ArmWorkspace
 
 PROFILE_ID = 'unitree_g1_23_dual_arm_relative_v1'
@@ -36,7 +36,7 @@ def transform(pose):
     return result
 
 
-class G1IK(ArmWorkspace):
+class IK(ArmWorkspace):
     def __init__(self, path, *, pr152_objective=True, collision_checks=False):
         self.collision_checks_enabled = bool(collision_checks)
         raw = Path(path).read_bytes()
@@ -52,7 +52,7 @@ class G1IK(ArmWorkspace):
         if not model_path.is_absolute(): model_path = Path(path).parent / model_path
         if hashlib.sha256(model_path.read_bytes()).hexdigest() != p['urdf_sha256']:
             raise ValueError('calibration_model_changed')
-        self.ik = G123PinocchioIk(model_path, palm_frames=p['palm_frames'], locked_joints=p['locked_joints'], pr152_objective=pr152_objective)
+        self.ik = PinocchioIk(model_path, palm_frames=p['palm_frames'], locked_joints=p['locked_joints'], pr152_objective=pr152_objective)
         self.pin, self.model = self.ik._pin, self.ik._model
         self.data = self.model.createData()
         self.indices = np.arange(10)
@@ -84,7 +84,7 @@ class G1IK(ArmWorkspace):
                     'to':ee,'radius_m':radius,'group':side})
             self.transition_refinement_depth = 10
             self.configure_workspace()
-            self.body_collision = G1Collision(self.pin,self.model,model_path)
+            self.body_collision = Collision(self.pin,self.model,model_path)
         self.last_collision_rejection = None
         self._collision_context = None
         self.last_ms = None

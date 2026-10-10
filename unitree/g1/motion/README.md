@@ -7,13 +7,13 @@
 将当前 bundle 的 `motion/` 和公共 `common/motion/` 一并放进镜像。构建阶段使用项目既有受固定版本控制的 micromamba，直接安装本目录的显式 ARM64 包清单：
 
 ```sh
-micromamba create --yes --prefix /opt/g1-motion --file /work/motion/requirements.numeric-linux-aarch64.lock
-/opt/g1-motion/bin/python -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"'
+micromamba create --yes --prefix /opt/motion --file /work/motion/requirements.numeric-linux-aarch64.lock
+/opt/motion/bin/python -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"'
 python3 /work/motion/fetch_assets.py
 python3 /work/motion/fetch_assets.py --check
 ```
 
-清单来自既有 G1 CPU 版本，固定包URL和包MD5；复用文件SHA256为 `20ce04ace4936c26281be963cc71fd163ee6966d2c5f996f11f235abef909d7d`。新镜像仍需在目标 Linux ARM64 构建验证，不把历史镜像结果当本轮构建通过。`worker.py` 自动优先 `/opt/g1-motion/bin/python`；开发机器不存在该路径时使用当前解释器，缺少 CasADi-enabled Pinocchio 会报错，不退化为无碰撞或未求解结果。
+清单来自既有 G1 CPU 版本，固定包URL和包MD5；复用文件SHA256为 `20ce04ace4936c26281be963cc71fd163ee6966d2c5f996f11f235abef909d7d`。新镜像仍需在目标 Linux ARM64 构建验证，不把历史镜像结果当本轮构建通过。`worker.py` 自动优先 `/opt/motion/bin/python`；开发机器不存在该路径时使用当前解释器，缺少 CasADi-enabled Pinocchio 会报错，不退化为无碰撞或未求解结果。
 
 七个碰撞网格只在构建时下载并逐文件核验 SHA256。网格不进入Git；许可证和清单随源码，运行时再次验证哈希。`calibration.example.json` 仍是未实物标定样例，不能填写假验收或直接作为Live配置。
 
@@ -46,7 +46,7 @@ python -m pytest -q unitree/g1/tests/test_motion_control_threads.py
 
 ## 机型 profile 与每轮基准
 
-`motion/g1_23_fixed_hand.json` 固定关节映射、URDF SHA、双掌 TCP（腕轴前方 0.2 m）和手柄局部变换，沿用本轮 r11b 已实测的原厂固定手配置。该文件不包含某次现场腰腿角度，也不填写 acceptance 通过标记。每次初始化映射时，从同一份新鲜 LowState 采集双臂和 13 个腰腿关节，为数值工作进程生成本轮临时 profile；工作进程重启沿用同一份基准，新的遥操会话重新采样。缺失、过期或非有限实测值会明确报告，不用零值猜测机器人姿态。松握重握不重新标定。
+`motion/body23_fixed_hand.json` 固定关节映射、URDF SHA、双掌 TCP（腕轴前方 0.2 m）和手柄局部变换，沿用本轮 r11b 已实测的原厂固定手配置。该文件不包含某次现场腰腿角度，也不填写 acceptance 通过标记。每次初始化映射时，从同一份新鲜 LowState 采集双臂和 13 个腰腿关节，为数值工作进程生成本轮临时 profile；工作进程重启沿用同一份基准，新的遥操会话重新采样。缺失、过期或非有限实测值会明确报告，不用零值猜测机器人姿态。松握重握不重新标定。
 
 适用范围是原厂 G1_23 固定假手；不宣称自动适配 G1_29、灵巧手或改装 TCP。附加碰撞检查仍关闭，旧现场预览空间盒未纳入默认 profile，不能将其当作碰撞验收结果。模型及上述 TCP 有本轮现场使用依据，但没有补造独立尺寸或长时机械验收记录。
 

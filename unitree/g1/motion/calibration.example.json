@@ -14,7 +14,7 @@
     "right_elbow_joint",
     "right_wrist_roll_joint"
   ],
-  "urdf_path": "models/g1_body23.urdf",
+  "urdf_path": "models/body23.urdf",
   "urdf_sha256": "b1af86fb023c0b6f8e52723d224be6cad70916eaff2778e7dbe09e6f91faa9b9",
   "locked_joints": {
     "left_hip_pitch_joint": null,

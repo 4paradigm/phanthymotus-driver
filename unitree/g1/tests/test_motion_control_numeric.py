@@ -14,14 +14,14 @@ import pytest
 pytest.importorskip('pinocchio.casadi', reason='G1 requires CasADi-enabled Pinocchio 3.1 ABI')
 DRIVER=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(DRIVER))
-from motion.kinematics import G1IK
+from motion.kinematics import IK
 from motion.worker import NumericalWorker
 
 
 def profile(tmp_path):
     root=DRIVER/'motion'
     p=json.loads((root/'calibration.example.json').read_text())
-    p['urdf_path']=str(root/'models/g1_body23.urdf')
+    p['urdf_path']=str(root/'models/body23.urdf')
     assert hashlib.sha256(Path(p['urdf_path']).read_bytes()).hexdigest()==p['urdf_sha256']
     p['version']='SYNTHETIC-NOT-ACCEPTED'
     p['locked_joints']=dict.fromkeys(p['locked_joints'],0.)
@@ -35,7 +35,7 @@ def profile(tmp_path):
 
 
 def test_real_solver_retains_five_dof_objective_and_complete_q(tmp_path):
-    solver=G1IK(profile(tmp_path))
+    solver=IK(profile(tmp_path))
     assert solver.model.nq==10 and not solver.ik._strict_position
     q=np.zeros(10);solver.self_test(q)
     desired=q.copy();desired[3]=.2
@@ -46,7 +46,7 @@ def test_real_solver_retains_five_dof_objective_and_complete_q(tmp_path):
 
 def test_real_g1_process_has_only_ten_joint_result_and_two_eef(tmp_path):
     from scipy.spatial.transform import Rotation
-    path=profile(tmp_path);reference=G1IK(path)
+    path=profile(tmp_path);reference=IK(path)
     worker=NumericalWorker(path,1.)
     try:
         q=[0.]*10;worker.self_test(q)
@@ -97,7 +97,7 @@ def test_card_configures_empty_arm_and_keeps_previous_on_invalid_candidate(tmp_p
 
 
 def test_rejected_collision_cannot_contaminate_return_to_valid_target(tmp_path):
-    solver=G1IK(profile(tmp_path), collision_checks=True)
+    solver=IK(profile(tmp_path), collision_checks=True)
     q=np.array([.2037558,.28927523,.05398893,1.03511345,-.07312774,
                 .22553113,-.3246167,.02247042,.80643052,.08557935])
     good=solver.palms(q)
@@ -113,7 +113,7 @@ def test_rejected_collision_cannot_contaminate_return_to_valid_target(tmp_path):
 
 
 def test_default_collision_policy_does_not_block_inward_targets(tmp_path):
-    solver=G1IK(profile(tmp_path))
+    solver=IK(profile(tmp_path))
     assert solver.collision_checks_enabled is False
     q=np.array([.2037558,.28927523,.05398893,1.03511345,-.07312774,
                 .22553113,-.3246167,.02247042,.80643052,.08557935])
@@ -127,12 +127,12 @@ def test_default_collision_policy_does_not_block_inward_targets(tmp_path):
 
 def test_packaged_geometry_matches_existing_solver_with_same_measured_posture(tmp_path):
     from motion.profile import session_profile
-    path, directory = session_profile(DRIVER/'motion/g1_23_fixed_hand.json',
+    path, directory = session_profile(DRIVER/'motion/body23_fixed_hand.json',
         {'arm_ns': 1_000_000_000, 'locked_joints': dict.fromkeys(
-            json.loads((DRIVER/'motion/g1_23_fixed_hand.json').read_text())['locked_joint_names'], 0.)},
+            json.loads((DRIVER/'motion/body23_fixed_hand.json').read_text())['locked_joint_names'], 0.)},
         1_000_000_000)
     try:
-        current, previous = G1IK(path), G1IK(profile(tmp_path))
+        current, previous = IK(path), IK(profile(tmp_path))
         q = np.zeros(10)
         current.self_test(q); previous.self_test(q)
         for joint, offset in ((0,.1),(1,.1),(3,.2),(6,-.1),(8,.2)):
@@ -149,7 +149,7 @@ def test_default_profile_real_worker_lifetime_and_no_hardware(tmp_path):
     from types import SimpleNamespace
     from arm_stream import ArmStreamExecutor, LOCKED_NAMES
     from motion_control import MotionControl
-    config = {'calibration_path': str(DRIVER/'motion/g1_23_fixed_hand.json'),
+    config = {'calibration_path': str(DRIVER/'motion/body23_fixed_hand.json'),
               'servo_position': True, 'joint_velocity_rad_s': 1.}
     baseline = {'waist': .01}
     def feedback():

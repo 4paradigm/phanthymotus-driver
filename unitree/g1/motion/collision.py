@@ -9,12 +9,12 @@ import numpy as np
 from .workspace import WorkspaceViolation
 
 
-class G1Collision:
+class Collision:
     def __init__(self, pin, model, urdf_path):
         self.pin, self.model = pin, model
         self.last_rejection = None
         root = ET.parse(urdf_path).getroot()
-        assets = Path(__file__).parent/'models/g1_collision'
+        assets = Path(__file__).parent/'models/collision'
         hashes = json.loads((assets/'sha256.json').read_text())
         selected = {'torso_link'} | {s+'_'+part for s in ('left','right') for part in
             ('shoulder_pitch_link','shoulder_roll_link','shoulder_yaw_link','elbow_link','wrist_roll_rubber_hand')}

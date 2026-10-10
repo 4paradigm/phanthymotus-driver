@@ -66,7 +66,7 @@ def fetch(manifest_dir, destination, check_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest-dir", type=Path, default=Path(__file__).resolve().parent / "models/g1_collision")
+    parser.add_argument("--manifest-dir", type=Path, default=Path(__file__).resolve().parent / "models/collision")
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--check", action="store_true", help="verify existing files without network or writes")
     args = parser.parse_args()

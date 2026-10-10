@@ -44,7 +44,7 @@ LOCKED_JOINT_NAMES = (
 )
 
 
-class G123PinocchioIk:
+class PinocchioIk:
     """Ten-joint dual-arm IK with adapted PR152 pose cost and torque model."""
 
     def __init__(self, urdf_path: str | Path, *, palm_frames=None, locked_joints=None, pr152_objective=False):
@@ -354,4 +354,4 @@ class G123PinocchioIk:
         return result
 
 
-__all__ = ["ARM_JOINT_NAMES", "G123PinocchioIk", "LOCKED_JOINT_NAMES"]
+__all__ = ["ARM_JOINT_NAMES", "PinocchioIk", "LOCKED_JOINT_NAMES"]

@@ -63,9 +63,9 @@ COPY arm_sdk.py /work/arm_sdk.py
 COPY arm_stream.py motion_control.py motion_bus.py teleop_control.py teleop_bus.py ros_spin.py /work/
 COPY motion/ /work/motion/
 COPY --from=motion-numeric-installer /bin/micromamba /usr/local/bin/micromamba
-RUN micromamba create --yes --prefix /opt/g1-motion --file /work/motion/requirements.numeric-linux-aarch64.lock && \
+RUN micromamba create --yes --prefix /opt/motion --file /work/motion/requirements.numeric-linux-aarch64.lock && \
     micromamba clean --all --yes && \
-    /opt/g1-motion/bin/python -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"' && \
+    /opt/motion/bin/python -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"' && \
     python3 /work/motion/fetch_assets.py && python3 /work/motion/fetch_assets.py --check
 COPY servo_eef.py /work/servo_eef.py
 COPY test_slam_rpc.py /work/test_slam_rpc.py
