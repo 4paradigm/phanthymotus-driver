@@ -1020,6 +1020,27 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(publisher.messages[0].header.stamp.sec, 1)
         self.assertEqual(publisher.messages[0].header.stamp.nanosec, 2)
 
+    def test_mic_sources_are_mutually_exclusive(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_source="sdk",
+            _mic_source_lock=threading.Lock(),
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+            _audio_header=lambda: types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
+        )
+        message = types.SimpleNamespace(data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE")
+        device.U1Nodes._mic_topic_callback(nodes, message)
+        self.assertEqual(publisher.messages, [])
+        device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02", {}, 1)
+        self.assertEqual(len(publisher.messages), 1)
+
     def test_expression_and_head_call_deployed_sdk_motion_service(self):
         import device
 

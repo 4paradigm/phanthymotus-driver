@@ -502,6 +502,8 @@ class U1Nodes:
         self._mic_reader = None
         self._mic_stream = {}
         self._mic_stream_open = False
+        self._mic_source = None
+        self._mic_source_lock = threading.Lock()
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
         self._playback_listeners = []
@@ -659,6 +661,9 @@ class U1Nodes:
         return future.result()
 
     def set_mic_enabled(self, enabled: bool) -> dict:
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
         if not enabled:
             self.stop_mic_reader()
             close_error = None
@@ -707,10 +712,17 @@ class U1Nodes:
             self._mic_reader.skip_backlog = True
             try:
                 self._mic_reader.start(timeout=2.0)
+                # The SDK ring and the raw topic carry the same microphone
+                # stream. Once the ring is usable, do not forward the topic
+                # copy as well or ASR receives every utterance twice.
+                with self._mic_source_lock:
+                    self._mic_source = "sdk"
             except Exception:
                 # Some firmware opens the SDK stream but only publishes the
                 # domain-2 AudioInData topic. Keep that topic fallback alive.
                 self._mic_reader = None
+                with self._mic_source_lock:
+                    self._mic_source = "topic"
         except Exception as exc:
             self.stop_mic_reader()
             try:
@@ -725,6 +737,12 @@ class U1Nodes:
     def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
         if not self._mic_forwarding:
             return
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
+        with self._mic_source_lock:
+            if self._mic_source not in (None, "sdk"):
+                return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -739,6 +757,12 @@ class U1Nodes:
         """Accept the device-domain raw topic when the SDK ring is unavailable."""
         if not self._mic_forwarding:
             return
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
+        with self._mic_source_lock:
+            if self._mic_source == "sdk":
+                return
         data = getattr(getattr(message, "data", None), "data", None)
         if data is None:
             data = getattr(message, "data", None)
@@ -747,6 +771,11 @@ class U1Nodes:
         payload = _normalize_pcm16k(message, data)
         if not payload:
             return
+        with self._mic_source_lock:
+            if self._mic_source is None:
+                self._mic_source = "topic"
+            if self._mic_source != "topic":
+                return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -770,6 +799,10 @@ class U1Nodes:
             self._mic_reader.stop()
             self._mic_reader = None
         self._mic_stream = {}
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+        with self._mic_source_lock:
+            self._mic_source = None
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
