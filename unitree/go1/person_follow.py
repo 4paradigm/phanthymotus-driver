@@ -73,14 +73,16 @@ class TargetTracker:
                 return None
             self.target = candidates[0]
             return self.target
-        matches = [d for d in candidates
-                   if abs(d.center_x - self.target.center_x) <= .25
-                   and abs(d.y2 - self.target.y2) <= .25]
-        if len(matches) != 1:
+        # 中文说明：锁定后只接受位置连续的目标；旁人接近时按位移比较，难以区分就停车。
+        matches = sorted(((abs(d.center_x - self.target.center_x) +
+                           abs(d.y2 - self.target.y2), d) for d in candidates
+                          if abs(d.center_x - self.target.center_x) <= .15
+                          and abs(d.y2 - self.target.y2) <= .15), key=lambda item: item[0])
+        if not matches or (len(matches) > 1 and matches[1][0] - matches[0][0] < .08):
             self.target = None
             self.lost = True
             return None
-        self.target = matches[0]
+        self.target = matches[0][1]
         return self.target
 
 

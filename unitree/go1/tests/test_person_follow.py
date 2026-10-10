@@ -60,6 +60,32 @@ def test_lost_target_never_switches_to_another_person():
     assert tracker.update([box("shoe", .7, .7, .8, .9)]) is None
 
 
+def test_keeps_original_person_when_another_enters_matching_area():
+    tracker = TargetTracker()
+    original = box("person", .40, .2, .60, .70)
+    assert tracker.update([original]) == original
+    moved_original = box("person", .42, .2, .62, .71)
+    newcomer = box("person", .65, .2, .85, .73)
+    assert tracker.update([newcomer, moved_original]) == moved_original
+    assert not tracker.lost
+    assert tracker.update([box("person", .44, .2, .64, .72), newcomer]).x1 == .44
+
+
+def test_stops_if_two_people_are_equally_likely_to_be_locked_target():
+    tracker = TargetTracker()
+    tracker.update([box("person", .40, .2, .60, .70)])
+    assert tracker.update([box("person", .36, .2, .56, .71),
+                           box("person", .44, .2, .64, .71)]) is None
+    assert tracker.lost
+
+
+def test_does_not_accept_a_distant_replacement_inside_old_matching_radius():
+    tracker = TargetTracker()
+    tracker.update([box("person", .40, .2, .60, .70)])
+    assert tracker.update([box("person", .60, .2, .80, .72)]) is None
+    assert tracker.lost
+
+
 def test_follow_command_stops_for_missing_far_or_close_target():
     assert follow_command(None) == (0.0, 0.0)
     assert follow_command(box("shoe", .4, .8, .6, .92)) == (0.0, 0.0)
