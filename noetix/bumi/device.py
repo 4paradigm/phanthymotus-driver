@@ -1142,13 +1142,14 @@ class MicPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {"action": {"type": "string", "enum": [
-                    "start", "stop", "info", "add_wakeup_word",
+                    "start", "stop", "info", "check_direction", "add_wakeup_word",
                     "calibrate_front", "calibrate_right"]}},
                 "required": ["action"],
                 "x-action-params": {
                     "start": {"params": [], "description": "启动麦克风采集与方向输出。"},
                     "stop": {"params": [], "description": "停止麦克风采集与方向输出。"},
                     "info": {"params": [], "description": "查看采集状态、最近方向观测与标定进度。"},
+                    "check_direction": {"params": [], "description": "查看最近一次唤醒方向与标定状态。"},
                     "add_wakeup_word": {"params": [], "description": "向 Bumi 语音模块添加‘小范小范’"},
                     "calibrate_front": {"params": [], "description": "一人在机器人正前方持续说‘测试测试’约 2 秒时调用"},
                     "calibrate_right": {"params": [], "description": "一人在机器人正右方持续说‘测试测试’约 2 秒时调用"},
@@ -1266,7 +1267,7 @@ class MicPlugin:
         if action == "stop":
             self.stop()
             return {"state": "idle"}
-        if action == "info":
+        if action in ("info", "check_direction"):
             calibration = _load_calibration()
             with self._direction_lock:
                 direction = self._last_direction

@@ -19,7 +19,9 @@ One-time setup on Bumi EDU:
 2. Have one person stand directly in front of the robot and speak “测试测试”
    continuously while calling `action=calibrate_front`.
 3. Repeat at the robot's right side with `action=calibrate_right`.
-4. Say “小范小范” and inspect the direction output and `mic.info`.
+4. Say “小范小范” and choose `check_direction` on the `mic` card within
+   10 seconds. Read `sound_direction` in the action result (`fresh`, `no_event`,
+   or `stale`). The canvas's generic “查看数据流” button opens the audio stream.
 
 Each calibration temporarily pauses the mic audio stream, collects fresh
 eight-channel audio for two seconds, then resumes the stream. If too few new
