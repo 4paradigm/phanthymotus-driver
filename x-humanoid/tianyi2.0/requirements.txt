@@ -1,4 +1,4 @@
 pyyaml
-numpy
-opencv-python-headless
+numpy==1.23.5
+opencv-contrib-python-headless==4.11.0.86
 phonemizer

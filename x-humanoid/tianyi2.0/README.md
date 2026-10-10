@@ -11,6 +11,8 @@ camera. On the canvas, start `camera_head`, add `aruco_zones`, and connect
 the camera's `image/jpeg` output to it. The processor subscribes to the same
 raw Orbbec stream inside the driver, then publishes an annotated JPEG and a
 zone result JSON on domain 42. It never calls the arm, hand, or base controls.
+Only `camera_head` is accepted as an input: the card deliberately uses the
+Tianyi head camera's raw ROS topic rather than a general JPEG input subscriber.
 
 Configure `waiting_rect`, `sorting_1_rect`, and `sorting_2_rect` as
 `x1,y1,x2,y2` in normalized image coordinates (top-left `0,0`, bottom-right

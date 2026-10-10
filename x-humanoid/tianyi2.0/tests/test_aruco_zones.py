@@ -2,7 +2,10 @@
 
 import importlib.util
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "aruco_zones.py"
@@ -48,9 +51,67 @@ class ArucoZonesTests(unittest.TestCase):
         self.assertEqual(tool["type"], "processor")
         self.assertEqual(tool["topic_in"][0]["format"], "image/jpeg")
         self.assertEqual(tool["topic_out"][0]["topic"], "/tianyi/aruco_zones/overlay")
+        self.assertEqual(tool["topic_out"][1]["format"], "data/json")
         result = plugin.dispatch("config", {"sorting_1_color": "green",
                                             "_tool_name": "aruco_zones"})
         self.assertEqual(result["config"]["sorting_1_color"], "green")
+
+    def test_process_image_honors_stride_and_rgb_encoding(self):
+        import numpy as np
+
+        captured = []
+
+        class Detector:
+            def __init__(self, dictionary):
+                self.dictionary = dictionary
+
+            def detectMarkers(self, gray):
+                return [], None, []
+
+        def cvt_color(image, conversion):
+            if conversion == 1:
+                return image[:, :, ::-1].copy()
+            return np.zeros(image.shape[:2], dtype=np.uint8)
+
+        def encode(extension, frame, options):
+            captured.append(frame.copy())
+            return True, np.array([1, 2, 3], dtype=np.uint8)
+
+        fake_cv2 = SimpleNamespace(
+            COLOR_RGB2BGR=1,
+            COLOR_BGR2GRAY=2,
+            IMWRITE_JPEG_QUALITY=3,
+            cvtColor=cvt_color,
+            imencode=encode,
+            aruco=SimpleNamespace(
+                DICT_4X4_50=4,
+                getPredefinedDictionary=lambda marker_id: marker_id,
+                ArucoDetector=Detector,
+            ),
+        )
+        config, rects = aruco.validate_config({})
+        rgb = SimpleNamespace(width=2, height=1, step=8, encoding="rgb8",
+                              data=bytes([10, 20, 30, 40, 50, 60, 99, 99]))
+        bgr = SimpleNamespace(width=2, height=1, step=8, encoding="bgr8",
+                              data=bytes([30, 20, 10, 60, 50, 40, 99, 99]))
+        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}):
+            first, jpeg = aruco.process_image(rgb, config, rects)
+            second, _ = aruco.process_image(bgr, config, rects)
+
+        self.assertEqual(jpeg, b"\x01\x02\x03")
+        self.assertEqual(first["image_width"], 2)
+        self.assertEqual(first["image_height"], 1)
+        self.assertFalse(first["ready"])
+        self.assertFalse(second["motion_enabled"])
+        self.assertEqual(captured[0].tolist(), [[[30, 20, 10], [60, 50, 40]]])
+        self.assertEqual(captured[1].tolist(), captured[0].tolist())
+
+    def test_process_image_rejects_incomplete_buffer(self):
+        with mock.patch.dict(sys.modules, {"cv2": SimpleNamespace()}):
+            msg = SimpleNamespace(width=2, height=1, step=8, encoding="rgb8",
+                                  data=bytes([10, 20, 30]))
+            with self.assertRaisesRegex(ValueError, "数据不完整"):
+                aruco.process_image(msg, *aruco.validate_config({}))
 
 
 if __name__ == "__main__":
