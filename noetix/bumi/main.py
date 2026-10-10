@@ -137,6 +137,12 @@ class BumiDeviceBundle:
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))
             print("[bundle] MicPlugin loaded")
 
+        if plugins_cfg.get("sound_direction", {}).get("enabled", False) and media_ctrl is not None:
+            from direction_card import SoundDirectionPlugin
+            self._plugins.append(SoundDirectionPlugin(
+                plugins_cfg["sound_direction"], namespace, executor, media_ctrl))
+            print("[bundle] SoundDirectionPlugin loaded")
+
         if plugins_cfg.get("speaker", {}).get("enabled", False) and media_ctrl is not None:
             from device import SpeakerPlugin
             self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))

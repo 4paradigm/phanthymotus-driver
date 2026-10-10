@@ -9,10 +9,15 @@ import numpy as np
 class SoundActivityGate:
     """Accept sounds clearly louder than the recent microphone background."""
 
-    def __init__(self):
+    def __init__(self, onset_level=10.0, onset_ratio=1.8,
+                 burst_level=15.0, burst_ratio=3.0):
         self._levels = deque(maxlen=50)
         self._rising_frames = 0
         self._hold_samples = 0
+        self._onset_level = onset_level
+        self._onset_ratio = onset_ratio
+        self._burst_level = burst_level
+        self._burst_ratio = burst_ratio
 
     def accepts(self, audio) -> bool:
         samples = np.asarray(audio, dtype=np.float32)
@@ -27,9 +32,10 @@ class SoundActivityGate:
         if background is None:
             return False
         # 去直流后用连续两帧识别较轻的说话声；短暂停顿只保留状态，不输出底噪角度。
-        rising = level >= max(10.0, background * 1.8)
+        rising = level >= max(self._onset_level, background * self._onset_ratio)
         self._rising_frames = self._rising_frames + 1 if rising else 0
-        if self._rising_frames >= 2 or level >= max(15.0, background * 3.0):
+        if self._rising_frames >= 2 or level >= max(
+                self._burst_level, background * self._burst_ratio):
             self._hold_samples = 9600  # 允许约 0.6 秒语音停顿。
             return True
         if self._hold_samples > 0 and level >= max(10.0, background * 1.5):

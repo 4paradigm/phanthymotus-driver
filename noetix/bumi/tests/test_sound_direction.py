@@ -40,6 +40,22 @@ def test_activity_gate_does_not_extend_voice_on_modest_continuous_noise():
     assert not gate.accepts(frame(60))  # 保持期已经结束。
 
 
+def test_activity_gate_uses_user_thresholds_without_changing_defaults():
+    def frame(level):
+        wave = np.tile([level, -level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    default = SoundActivityGate()
+    strict = SoundActivityGate(onset_ratio=2.5, burst_ratio=4.0)
+    for _ in range(8):
+        assert not default.accepts(frame(40))
+        assert not strict.accepts(frame(40))
+    assert not default.accepts(frame(85))
+    assert default.accepts(frame(85))
+    assert not strict.accepts(frame(85))
+    assert not strict.accepts(frame(85))
+
+
 def test_estimator_rejects_bad_inputs_and_off_basis_direction():
     front, right = (2.0, -1.0, 0.0), (0.0, 1.0, -2.0)
     assert estimate_signature(np.zeros(8 * 100, dtype=np.int16), 8, 16000) is None
