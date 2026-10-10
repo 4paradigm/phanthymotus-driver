@@ -60,10 +60,14 @@ def test_lost_target_never_switches_to_another_person():
     assert tracker.update([box("shoe", .7, .7, .8, .9)]) is None
 
 
-def test_follow_command_stops_for_missing_or_close_target():
+def test_follow_command_stops_for_missing_far_or_close_target():
     assert follow_command(None) == (0.0, 0.0)
     assert follow_command(box("shoe", .4, .8, .6, .92)) == (0.0, 0.0)
-    vx, yaw = follow_command(box("shoe", .6, .4, .8, .55))
+    assert follow_command(box("shoe", .6, .6, .8, .74)) == (0.0, 0.0)
+    # 远景样本 9–12 的脚点约在画面高度 0.53–0.56，不应触发转向或前进。
+    assert follow_command(box("person", .1, .2, .3, .53)) == (0.0, 0.0)
+    assert follow_command(box("shoe", .6, .4, .8, .55)) == (0.0, 0.0)
+    vx, yaw = follow_command(box("shoe", .6, .4, .8, .60))
     assert 0 < vx <= .15
     assert yaw < 0
 
@@ -231,7 +235,7 @@ def test_runtime_stops_when_locked_shoe_disappears(tmp_path, monkeypatch):
             pass
 
         def detect(self, jpeg):
-            return ([box("shoe", .4, .4, .6, .55)] if jpeg == b"a" else
+            return ([box("shoe", .4, .4, .6, .62)] if jpeg == b"a" else
                     [box("shoe", .8, .4, .95, .6)])
 
     client = Client()

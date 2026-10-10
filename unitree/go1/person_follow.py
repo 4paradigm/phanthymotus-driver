@@ -86,7 +86,8 @@ class TargetTracker:
 
 def follow_command(target):
     """Return (forward m/s, yaw rad/s); image geometry is only a distance proxy."""
-    if target is None or target.y2 >= .82:
+    # 远景样本的脚点在 0.53–0.56；过远或过近都保持停车，且不原地追转。
+    if target is None or target.y2 < .58 or target.y2 >= .68:
         return 0.0, 0.0
     vx = min(.15, max(0.0, (.68 - target.y2) * .6))
     error_x = target.center_x - .5
