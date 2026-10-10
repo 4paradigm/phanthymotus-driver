@@ -4,6 +4,29 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## ArUco zone card
+
+The read-only `aruco_zones` processor uses the existing Orbbec head RGB
+camera. On the canvas, start `camera_head`, add `aruco_zones`, and connect
+the camera's `image/jpeg` output to it. The processor subscribes to the same
+raw Orbbec stream inside the driver, then publishes an annotated JPEG and a
+zone result JSON on domain 42. It never calls the arm, hand, or base controls.
+Only `camera_head` is accepted as an input: the card deliberately uses the
+Tianyi head camera's raw ROS topic rather than a general JPEG input subscriber.
+
+Configure `waiting_rect`, `sorting_1_rect`, and `sorting_2_rect` as
+`x1,y1,x2,y2` in normalized image coordinates (top-left `0,0`, bottom-right
+`1,1`). For three columns, use `0,0,0.3,1`, `0.35,0,0.65,1`, and
+`0.7,0,1,1`. Set the dictionary to match the printed markers; the default
+is `DICT_4X4_50`. The color fields are labels for later sorting, not object
+color recognition. `ready` becomes true only when each configured region
+contains exactly one marker and all three IDs differ. Keep the head still
+while testing because these are image coordinates, not robot coordinates.
+
+The image build replaces `opencv-python-headless` with the contrib wheel
+because the existing wheel does not provide `cv2.aruco`. This may increase
+the image size; the card source and manifest entry are negligible by comparison.
+
 ## Head camera snapshot card
 
 The `vision_capture` card subscribes to `/ob_camera_head/color/image_raw` and

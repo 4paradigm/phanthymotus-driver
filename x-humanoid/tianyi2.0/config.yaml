@@ -29,6 +29,8 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  aruco_zones:
+    enabled: true
   camera_snapshot:
     enabled: true
     output_dir: "/opt/phanthy-motus/data/images"
