@@ -140,6 +140,11 @@ class G1DeviceBundle:
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
             print("[bundle] ArmActionPlugin loaded")
 
+        if plugins_cfg.get("timer", {}).get("enabled", False):
+            from common.timer import TimerPlugin
+            self._plugins.append(TimerPlugin(plugins_cfg["timer"], namespace, executor))
+            print("[bundle] TimerPlugin loaded")
+
         # servo 默认**关闭**，和 arm 不同。arm 放的是厂商预设手势，经过内置控制器；
         # servo 直接往 rt/arm_sdk 写关节指令，是这个驱动第一次驱动电机本身。
         # 一个默认开启的执行器卡片，等于容器一重启就可以被 start —— 开关留给人。
