@@ -157,7 +157,6 @@ def _direction_subprocess(namespace: str) -> None:
 
 class SoundDirectionPlugin:
     PREFIX = "sound_direction"
-    AUTO_START = False
 
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl=None):
         self._namespace = namespace
@@ -191,7 +190,7 @@ class SoundDirectionPlugin:
 
     def get_tool(self) -> dict:
         return {
-            "name": "sound_direction", "type": "actuator", "multiInstance": False,
+            "name": "sound_direction", "type": "sensor", "multiInstance": False,
             "description": "Bumi calibrated sound direction from the microphone array",
             "inputSchema": {
                 "type": "object",

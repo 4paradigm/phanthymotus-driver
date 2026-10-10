@@ -36,7 +36,7 @@ def test_direction_card_reuses_existing_calibration_and_reports_its_own_topic(
     card = module.SoundDirectionPlugin({}, "robot", executor)
 
     assert card.get_tool()["name"] == "sound_direction"
-    assert card.get_tool()["type"] == "actuator"
+    assert card.get_tool()["type"] == "sensor"
     assert card.get_tool()["topic_out"] == [
         {"topic": "/robot/sound_direction", "format": "data/json"}]
     info = card.dispatch("info", {})
@@ -96,10 +96,10 @@ def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch):
     for plugin in bundle._plugins:
         plugin.start = lambda name=plugin.get_tool()["name"]: started.append(name)
     bundle.start_all()
-    assert started == ["mic"]
+    assert started == ["mic", "sound_direction"]
     manifest = yaml.safe_load((path.parent / "driver.yaml").read_text(encoding="utf-8"))
     categories = {card["name"]: card["type"] for card in manifest["cards"]}
-    assert categories["sound_direction"] == "actuator"
+    assert categories["sound_direction"] == "sensor"
 
 
 def test_direction_card_validates_observations(monkeypatch):
