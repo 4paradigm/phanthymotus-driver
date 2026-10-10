@@ -2,10 +2,16 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG UBUNTU_MIRROR=http://ports.ubuntu.com/ubuntu-ports
 
 WORKDIR /work
 
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+# The shared ROS base image points apt at Tencent's private mirror, which is
+# unavailable on ordinary networks and on the Bumi host. Replace it before the
+# first apt invocation so this image remains buildable outside Tencent VPC.
+RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_MIRROR}|g" {} + && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-dev \
@@ -68,6 +74,12 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+# Siblings of device.py. Both are deliberately outside it so they can be tested
+# without rclpy, and both fail late if missing: the chassis card would not
+# register at all, and every camera `info()` would raise on its first call.
+COPY loco_servo.py /work/loco_servo.py
+COPY camera_specs.py /work/camera_specs.py
+COPY odom_spec.py /work/odom_spec.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

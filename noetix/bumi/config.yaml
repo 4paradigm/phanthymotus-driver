@@ -6,6 +6,36 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
+  # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
+  # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——
+  # loco / stand_up_lie_prone / semantic_action / action_recording 里任何一个动作
+  # 都会先把这张卡片暂停，人和 LLM 的显式指令优先于正在跑的策略。
+  loco_servo:
+    enabled: true
+    # **默认只打日志，不驱动底盘。** 速度参数已经完成真机标定；首次接入完整
+    # navi 流水线时仍先核对它想发什么。确认视觉控制方向后可在卡片上关闭
+    # dry_run（configSchema 立即生效，不用重新部署）。
+    dry_run: true
+    expected_hz: 10
+    # 要求 workmode=2（walking）。只有在没接腿的台架上才需要关。
+    require_standing: true
+
+    # ── 速度标定 ─────────────────────────────────────────────────────────
+    # Bumi 的 publish_cmd 收的是归一化的 [-1, 1]（厂商示例直接塞手柄 axes），
+    # 而协议要求 m/s / rad/s，所以这几个数是两者之间的换算。
+    # 七个参数已于 2026-10-09 在真机完成测量，步骤和原始结果见 README。
+    calibration_source: measured
+    full_scale_vx_mps: 0.55     # x=1.0，前进 165 cm / 3 s（两次一致）
+    full_scale_vy_mps: 0.20     # |y|=1.0，可靠三次均值约 59.5 cm / 3 s
+    full_scale_wz_rads: 0.83    # |z|=1.0，取较慢方向的 190.5 deg / 4 s
+    # 死区：低于这个值腿式机器人根本不动（要凑齐一个步态周期）。
+    # 零不是"没有门槛"，而是"这台机器人能任意慢地挪"，那是个错误的声明。
+    min_vx_mps: 0.25            # 归一化边界 0.45 × 0.55
+    min_vy_mps: 0.12            # 归一化边界 0.60 × 0.20
+    min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
+    # 已经在走的时候的偏航死区。
+    min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
   mic:
     enabled: true
   speaker:
