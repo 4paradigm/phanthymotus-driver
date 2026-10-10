@@ -14,6 +14,9 @@ present only when calibration and audio quality permit an estimate. It is in
 degrees clockwise from the robot's front. `check_direction` keeps the latest
 observation for 10 seconds, then reports `stale` without an angle. The monitor's
 JSON “最新” view updates automatically when a new observation is published.
+After one second without a new sound direction, the stream publishes `no_event`
+once so the monitor does not keep showing an old angle. The card's ten-second
+`check_direction` window is unchanged.
 Each audio chunk carries its capture time in `AudioChunk.header.stamp`. Direction
 JSON includes `audio_window_start_us` and `audio_window_end_us` for the captured
 frames used in that estimate; consumers can match chunks whose stamp falls in

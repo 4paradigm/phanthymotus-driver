@@ -1066,6 +1066,7 @@ def _mic_subprocess(namespace: str):
     recent_capture_us = _deque(maxlen=100)
     next_status_poll = 0.0
     next_activity_check = 0.0
+    last_sound_direction_at = None
     activity_gate = SoundActivityGate()
     next_direction_error_log = 0.0
     last_wake_key = _initial_wake_key(media_ctrl)
@@ -1116,9 +1117,22 @@ def _mic_subprocess(namespace: str):
                             direction_msg = String()
                             direction_msg.data = activity
                             direction_pub.publish(direction_msg)
+                            last_sound_direction_at = _time.monotonic()
                     except Exception as exc:
                         if _time.monotonic() >= next_direction_error_log:
                             print(f"[mic_subprocess] activity direction skipped: {exc}", flush=True)
+                            next_direction_error_log = _time.monotonic() + 0.5
+                if (last_sound_direction_at is not None
+                        and _time.monotonic() - last_sound_direction_at >= 1.0):
+                    try:
+                        # 监控流清除旧角度；卡片仍按原约定保留 10 秒查询窗口。
+                        direction_msg = String()
+                        direction_msg.data = json.dumps({"state": "no_event"})
+                        direction_pub.publish(direction_msg)
+                        last_sound_direction_at = None
+                    except Exception as exc:
+                        if _time.monotonic() >= next_direction_error_log:
+                            print(f"[mic_subprocess] direction clear skipped: {exc}", flush=True)
                             next_direction_error_log = _time.monotonic() + 0.5
             mono = samples[::audio.channels]
 

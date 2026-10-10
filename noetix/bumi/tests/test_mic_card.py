@@ -108,6 +108,8 @@ def test_mic_card_reports_direction_only_while_fresh_and_clears_on_stop(
     assert info["sound_direction"]["angle"] == 90
     assert info["topic_out"] == card.get_tool()["topic_out"]
     assert card.dispatch("check_direction", {})["sound_direction"]["angle"] == 90
+    card._on_direction(String(json.dumps({"state": "no_event"})))
+    assert card.dispatch("check_direction", {})["sound_direction"]["angle"] == 90
     card._last_direction_time -= 11
     assert card.dispatch("info", {})["sound_direction"] == {"state": "stale"}
     assert card.dispatch("check_direction", {})["sound_direction"] == {"state": "stale"}
@@ -433,15 +435,16 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         pass
 
     rng = np.random.default_rng(73)
-    source = rng.normal(0, 2000, 20480).astype(np.int16)
+    source = rng.normal(0, 2000, 62 * 640).astype(np.int16)
     channels = [np.roll(source, shift) for shift in (0, 2, -3, 1)]
     channels.extend([np.zeros_like(source) for _ in range(4)])
     audio = np.stack(channels, axis=1)
     # 前 16 帧是同方向的低音量背景声，随后才出现明显发声。
     audio[:10240] //= 50
-    frames = iter(enumerate(audio.reshape(32, 640, 8)))
+    audio[32 * 640:] //= 50
+    frames = iter(enumerate(audio.reshape(62, 640, 8)))
     clock = [0.0]
-    capture_times = iter(1_700_000_000_000_000 + n * 40_000 for n in range(32))
+    capture_times = iter(1_700_000_000_000_000 + n * 40_000 for n in range(62))
     quiet_direction_counts = []
 
     def capture():
@@ -474,16 +477,20 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         pass
 
     messages = published["/robot/mic/sound_direction"]
+    fresh_messages = [message for message in messages
+                      if json.loads(message.data)["state"] == "fresh"]
     assert quiet_direction_counts == [0]
-    assert len(messages) >= 3  # 100 毫秒检查一次，发声后应多次发布。
-    assert json.loads(messages[0].data)["angle"] == 0
-    assert json.loads(messages[0].data)["trigger"] == "sound_activity"
-    assert (json.loads(messages[0].data)["audio_window_end_us"]
+    assert len(fresh_messages) >= 3  # 100 毫秒检查一次，发声后应多次发布。
+    assert json.loads(fresh_messages[0].data)["angle"] == 0
+    assert json.loads(fresh_messages[0].data)["trigger"] == "sound_activity"
+    assert (json.loads(fresh_messages[0].data)["audio_window_end_us"]
             <= 1_700_000_000_000_000 + 16 * 40_000 + 300_000)
+    assert [json.loads(message.data)["state"] for message in messages].count("no_event") == 1
+    assert json.loads(messages[-1].data)["state"] == "no_event"
     audio_stamps = [msg.header.stamp.sec * 1_000_000
                     + msg.header.stamp.nanosec // 1000
                     for msg in published["/robot/mic/audio"]]
-    for message in messages:
+    for message in fresh_messages:
         direction = json.loads(message.data)
         assert direction["audio_window_start_us"] <= direction["audio_window_end_us"]
         assert any(direction["audio_window_start_us"] <= stamp <=
