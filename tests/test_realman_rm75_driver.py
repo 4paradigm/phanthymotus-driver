@@ -54,7 +54,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("||", dockerfile)
         self.assertIn("pyrealsense2==2.56.5.9235", dockerfile)
         self.assertIn("numpy==1.23.5", dockerfile)
-        self.assertIn("opencv-contrib-python-headless==4.11.0.86", dockerfile)
+        self.assertIn("opencv-python-headless==4.11.0.86", dockerfile)
         self.assertIn("--only-binary=:all:", dockerfile)
         self.assertIn("COPY main.py device.py hardware.py servo.py camera.py realsense.py", dockerfile)
         camera = (DRIVER / "camera.py").read_text()
@@ -173,7 +173,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn(f"output_dir: {directory}", (DRIVER / "config.yaml").read_text())
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("ros-humble-rmw-fastrtps-cpp ffmpeg", dockerfile)
-        self.assertIn("realsense.py vision_capture.py aruco_canvas.py config.yaml", dockerfile)
+        self.assertIn("realsense.py vision_capture.py config.yaml", dockerfile)
 
     def test_pick_place_needs_no_storage_configuration_or_mount(self):
         service = (DRIVER / "deploy/service.yml").read_text()

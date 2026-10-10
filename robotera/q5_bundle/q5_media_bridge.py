@@ -47,8 +47,6 @@ class BridgeWorker:
             "rgb": self._ctx.Queue(maxsize=2),
             "depth_jpeg": self._ctx.Queue(maxsize=2),
             "pointcloud": self._ctx.Queue(maxsize=2),
-            "aruco_overlay": self._ctx.Queue(maxsize=2),
-            "aruco_regions": self._ctx.Queue(maxsize=2),
         }
         self._media_lock = threading.Lock()
         self._audio_q = self._ctx.Queue(maxsize=100)
@@ -204,8 +202,6 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     pub_hand = _pub(f"{prefix}/hand_sensor")
     pub_odom = _pub(f"{prefix}/odom")
     pub_rgb = node.create_publisher(CompressedImage, f"{prefix}/camera/rgb", QOS_MEDIA)
-    pub_aruco_overlay = node.create_publisher(CompressedImage, f"{prefix}/aruco_zones/overlay", QOS_MEDIA)
-    pub_aruco_regions = node.create_publisher(String, f"{prefix}/aruco_zones/regions", QOS_MEDIA)
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
     pub_pointcloud = node.create_publisher(UInt8MultiArray, f"{prefix}/camera/pointcloud", QOS_MEDIA)
@@ -335,16 +331,6 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
             out.format = "jpeg"
             out.data = media["data"]
             pub_rgb.publish(out)
-        elif kind == "aruco_overlay":
-            out = CompressedImage()
-            out.header.stamp = node.get_clock().now().to_msg()
-            out.format = "jpeg"
-            out.data = media["data"]
-            pub_aruco_overlay.publish(out)
-        elif kind == "aruco_regions":
-            out = String()
-            out.data = media["data"]
-            pub_aruco_regions.publish(out)
         elif kind == "depth_jpeg":
             out = CompressedImage()
             out.header.stamp = node.get_clock().now().to_msg()

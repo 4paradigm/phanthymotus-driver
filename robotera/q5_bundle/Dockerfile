@@ -21,7 +21,6 @@ RUN . /opt/ros/humble/setup.sh && \
     colcon build --packages-select xbot_common_interfaces audio_msgs
 
 FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 
 ENV ROS_DOMAIN_ID=211
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -31,7 +30,6 @@ ENV PYTHONUNBUFFERED=1
 # above and are absent from the final image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
-    python3-pip \
     python3-pil \
     ffmpeg \
     openssh-client \
@@ -46,13 +44,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-diagnostic-msgs \
     ros-humble-action-msgs \
     && rm -rf /var/lib/apt/lists/*
-
-# Ubuntu already supplies NumPy for Q5. Install only the OpenCV contrib wheel
-# so a second large NumPy download cannot stall the PR image build.
-RUN pip3 install --no-cache-dir --only-binary=:all: --no-deps \
-    --timeout 30 --retries 2 -i ${PYPI_MIRROR} \
-    opencv-contrib-python-headless==4.11.0.86 \
-    && python3 -c "import numpy, cv2; assert hasattr(cv2, 'aruco')"
 
 WORKDIR /work
 COPY --from=interface-builder /q5_ws/install /q5_ws/install
@@ -89,7 +80,6 @@ COPY mic.py /work/mic.py
 COPY speaker.py /work/speaker.py
 COPY audio.py /work/audio.py
 COPY camera_rgb.py /work/camera_rgb.py
-COPY aruco_zones.py /work/aruco_zones.py
 COPY camera_depth.py /work/camera_depth.py
 COPY camera_pointcloud.py /work/camera_pointcloud.py
 COPY vision_capture.py /work/vision_capture.py

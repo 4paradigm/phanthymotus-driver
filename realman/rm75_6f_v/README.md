@@ -105,25 +105,6 @@ The observed target hardware is an Intel RealSense D435 (USB ID `8086:0b07`).
 On USB 3, the shared pipeline uses RGB 1280x720 and depth/infrared 640x480 at
 15 fps. A USB 2 connection falls back to 640x480 at 6 fps for all streams.
 
-### Standalone camera check
-
-Run `test_camera.py` on the upper computer with Python packages `pyrealsense2`,
-`numpy`, and `opencv-python-headless`. Stop active `ext_camera` cards (or the
-Driver container) first so this check can open the RealSense USB device.
-It does not connect to or move the arm.
-
-```bash
-python3 realman/rm75_6f_v/test_camera.py --list
-python3 realman/rm75_6f_v/test_camera.py --serial YOUR_CAMERA_SERIAL --frames 30 --output ./camera_test_output
-```
-
-The second command reports received frames, observed frame rate, valid-depth
-percentage and center depth. It saves `color.jpg`, `depth_mm.png` (16-bit,
-millimetres; zero means invalid), and `depth_preview.png` (display only).
-RGB and depth images are not pixel-aligned. If the camera is already running in
-the Driver, check the `ext_camera` card's `info` response instead: `fresh` should
-be true and `frames_published` should increase.
-
 For a supervised hardware check, create separate RGB, depth and infrared card
 instances, start them, then confirm that `frames_published` increases and the
 three topics render independently. USB disconnect becomes an explicit error until the same camera reconnects.

@@ -23,7 +23,6 @@ cards:
   - { name: speaker,           type: actuator }
   - { name: audio,             type: actuator }
   - { name: camera_rgb,        type: sensor }
-  - { name: aruco_zones,       type: processor }
   - { name: camera_depth,      type: sensor }
   - { name: camera_pointcloud, type: sensor }
   - { name: arm_control,       type: actuator }

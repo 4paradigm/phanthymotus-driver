@@ -71,8 +71,6 @@ plugins:
       port: 2222
       depth_profile: "848x480x30"
       color_profile: "848x480x30"
-  aruco_zones:
-    enabled: true
   vision_capture:
     enabled: true
     # This is mounted from the Q5 host (/opt/phanthy-motus/data), so files

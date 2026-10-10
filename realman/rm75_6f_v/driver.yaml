@@ -21,7 +21,6 @@ cards:
   - { name: servo,            type: actuator }
   - { name: gripper,          type: actuator }
   - { name: ext_camera,       type: sensor }
-  - { name: aruco_zones,      type: processor }
   - { name: abs_move,         type: actuator }
   - { name: vision_capture, type: actuator }
   - { name: vision_pick_and_drop,       type: actuator }
