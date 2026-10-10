@@ -39,6 +39,15 @@
 | 卡片（= 文件） | 能力 | 关键动作 |
 |---|---|---|
 | `loco` | 基础运动 | `move`（三维速度）/ `stop_move` / `balance_stand` / `stand_up` / `stand_down` / `damp` / `recovery_stand` |
+| `person_follow` | 前向相机低速跟随 | `follow(confirm=true)` / `stop` / `info`；锁定画面估计最近的人或鞋，目标不明确时停车 |
+
+`person_follow` 是待真机标定的原型。它需要将 **416×416、原始 YOLOX 输出、类别顺序为
+`person, shoe`** 的两类 ONNX 权重放在
+`/opt/phanthy-motus/data/person_follow/person_shoe_yolox_nano.onnx`；仓库不附带未经 Go1
+画面验证的鞋子权重。缺少权重时，`follow` 返回 `MODEL_UNAVAILABLE`，不会发运动命令。
+跟随独占 `front` RGB 相机，`start` 只准备卡片，只有 `follow(confirm=true)` 才可能运动。
+画面中的鞋子位置仅用于估计远近，不提供米制距离或障碍物避让；推理超过 400 ms、失帧、
+目标混淆或 SDK 反馈失效时停车。上线前须用实拍画面和真机验证识别、耗时及安全距离。
 | `body_pose` | 机身姿态与高度 | `set_attitude`（roll/pitch/yaw）/ `set_body_height` / `set_foot_raise_height` / `reset` |
 | `switch_gait` | 步态切换 | `idle` / `trot` / `trot_run` / `climb_stair` / `trot_obstacle`（高风险步态须 `confirm=true`） |
 | `special_motion` | 特殊动作 | `jump_yaw_left` / `straight_hand`（同步阻塞执行，须 `confirm=true`） |

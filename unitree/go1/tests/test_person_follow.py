@@ -1,0 +1,245 @@
+"""Go1 person-follow decisions; no robot or model is needed for these tests."""
+
+import math
+import importlib
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from unitree.go1.person_follow import (Detection, TargetTracker, PersonFollowPlugin,
+                                      YoloXOnnxDetector, decode_yolox,
+                                      extract_latest_frame, follow_command)
+
+
+def box(kind, x1, y1, x2, y2, score=0.9):
+    return Detection(kind, x1, y1, x2, y2, score)
+
+
+def test_selects_nearest_visible_person_then_keeps_lock():
+    tracker = TargetTracker()
+    far = box("person", .1, .2, .3, .55)
+    near = box("person", .6, .2, .9, .8)
+    assert tracker.update([far, near]) == near
+    assert tracker.update([box("person", .12, .2, .35, .9),
+                           box("person", .62, .25, .91, .82)]).x1 == .62
+
+
+def test_shoes_can_acquire_when_no_body_is_visible():
+    tracker = TargetTracker()
+    left = box("shoe", .42, .7, .49, .8)
+    right = box("shoe", .52, .71, .59, .81)
+    target = tracker.update([left, right])
+    assert target.kind == "shoe"
+    assert .49 < target.center_x < .52
+    assert target.y2 == .81
+
+
+def test_shoe_pair_does_not_depend_on_detector_output_order():
+    tracker = TargetTracker()
+    right = box("shoe", .52, .71, .59, .81)
+    left = box("shoe", .42, .7, .49, .8)
+    target = tracker.update([right, left])
+    assert target is not None
+    assert .49 < target.center_x < .52
+
+
+def test_ambiguous_people_do_not_start_motion():
+    tracker = TargetTracker()
+    assert tracker.update([box("person", .1, .2, .3, .8),
+                           box("person", .6, .2, .8, .81)]) is None
+
+
+def test_lost_target_never_switches_to_another_person():
+    tracker = TargetTracker()
+    assert tracker.update([box("shoe", .1, .7, .2, .8)]) is not None
+    assert tracker.update([box("shoe", .7, .7, .8, .9)]) is None
+    assert tracker.update([box("shoe", .7, .7, .8, .9)]) is None
+
+
+def test_follow_command_stops_for_missing_or_close_target():
+    assert follow_command(None) == (0.0, 0.0)
+    assert follow_command(box("shoe", .4, .8, .6, .92)) == (0.0, 0.0)
+    vx, yaw = follow_command(box("shoe", .6, .4, .8, .55))
+    assert 0 < vx <= .15
+    assert yaw < 0
+
+
+def test_crossing_targets_are_ambiguous_and_end_lock():
+    tracker = TargetTracker()
+    tracker.update([box("person", .2, .3, .4, .7)])
+    assert tracker.update([box("person", .22, .3, .42, .71),
+                           box("person", .25, .3, .45, .72)]) is None
+    assert tracker.lost
+
+
+class Client:
+    available = True
+
+    def __init__(self):
+        self.moves = []
+        self.stops = 0
+
+    def diagnostics(self):
+        return {"accessible": True, "recv_count": self.stops + len(self.moves) + 1}
+
+    def move(self, vx, vy, yaw, gait=1):
+        self.moves.append((vx, vy, yaw))
+        return {"vx": vx, "vy": vy, "yaw": yaw}
+
+    def stop_move(self):
+        self.stops += 1
+
+
+def test_card_requires_model_before_following():
+    client = Client()
+    card = PersonFollowPlugin({"model_path": ""}, client=client)
+    assert card.dispatch("follow", {"confirm": True})["code"] == "MODEL_UNAVAILABLE"
+    assert not client.moves
+
+
+def test_card_stop_cancels_worker_and_stops_robot(tmp_path, monkeypatch):
+    client = Client()
+    model = tmp_path / "shoes.onnx"
+    model.write_bytes(b"model")
+    card = PersonFollowPlugin({"model_path": str(model)}, client=client)
+    entered = threading.Event()
+
+    def run():
+        entered.set()
+        while not card._cancel.wait(.01):
+            pass
+
+    monkeypatch.setattr(card, "_run", run)
+    assert card.dispatch("follow", {"confirm": True})["ok"]
+    assert entered.wait(1)
+    assert card.dispatch("stop", {})["ok"]
+    assert client.stops >= 1
+    assert not card._worker.is_alive()
+
+
+def test_yolox_decoder_maps_person_and_shoe_boxes():
+    raw = np.zeros((1, 3549, 7), dtype=np.float32)
+    raw[0, 10 * 52 + 10] = [0, 0, math.log(2), math.log(2), .9, .9, .1]
+    raw[0, 10 * 52 + 11] = [0, 0, math.log(2), math.log(2), .9, .1, .9]
+    found = decode_yolox(raw, 416, 416, 1.0)
+    assert {item.kind for item in found} == {"person", "shoe"}
+    person = next(item for item in found if item.kind == "person")
+    assert abs(person.center_x - 80 / 416) < .001
+    assert abs(person.y2 - 88 / 416) < .001
+
+
+def test_yolox_decoder_rejects_unexpected_model_shape():
+    try:
+        decode_yolox(np.zeros((1, 3549, 85), dtype=np.float32), 416, 416, 1.0)
+    except ValueError as exc:
+        assert "two classes" in str(exc)
+    else:
+        raise AssertionError("COCO model must not be interpreted as a shoe model")
+
+
+def test_bundle_registers_follow_card_without_starting_motion(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    main = importlib.import_module("unitree.go1.main")
+    client = Client()
+    bundle = main.Go1Bundle({"plugins": {"person_follow": {"enabled": True}}},
+                            "test_go1", None, client)
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["person_follow"]
+    assert bundle.dispatch("person_follow", {"action": "start"}) == {"state": "ready"}
+    assert not client.moves
+
+
+def test_follow_refuses_busy_front_camera(tmp_path):
+    from unitree.go1 import camera
+
+    model = tmp_path / "shoes.onnx"
+    model.write_bytes(b"model")
+    card = PersonFollowPlugin({"model_path": str(model)}, client=Client())
+    with camera._CAMERA_LOCK:
+        camera._SNAPSHOT_POSITIONS.add("front")
+    try:
+        assert card.dispatch("follow", {"confirm": True})["code"] == "RESOURCE_BUSY"
+    finally:
+        with camera._CAMERA_LOCK:
+            camera._SNAPSHOT_POSITIONS.discard("front")
+
+
+def test_receiver_discards_complete_old_frames_but_keeps_partial_tail():
+    from struct import pack
+
+    pending = bytearray(pack(">I", 3) + b"old" + pack(">I", 3) + b"new" +
+                        pack(">I", 4) + b"pa")
+    assert extract_latest_frame(pending) == b"new"
+    assert pending == bytearray(pack(">I", 4) + b"pa")
+    pending.extend(b"rt")
+    assert extract_latest_frame(pending) == b"part"
+
+
+def test_detector_accepts_jpeg_and_two_class_onnx_output(monkeypatch):
+    from io import BytesIO
+    from PIL import Image
+
+    raw = np.zeros((1, 3549, 7), dtype=np.float32)
+    raw[0, 10 * 52 + 10] = [0, 0, math.log(2), math.log(2), .9, .1, .9]
+
+    class Session:
+        def get_inputs(self):
+            return [SimpleNamespace(name="images", shape=[1, 3, 416, 416])]
+
+        def run(self, unused, inputs):
+            assert inputs["images"].shape == (1, 3, 416, 416)
+            return [raw]
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", SimpleNamespace(
+        SessionOptions=lambda: SimpleNamespace(),
+        InferenceSession=lambda *args, **kwargs: Session()))
+    encoded = BytesIO()
+    Image.new("RGB", (416, 416), "white").save(encoded, format="JPEG")
+    found = YoloXOnnxDetector("unused.onnx").detect(encoded.getvalue())
+    assert len(found) == 1 and found[0].kind == "shoe"
+
+
+def test_runtime_stops_when_locked_shoe_disappears(tmp_path, monkeypatch):
+    from struct import pack
+    from unitree.go1 import person_follow
+
+    class Connection:
+        def __init__(self):
+            self.chunks = [pack(">I", 1) + b"a", None,
+                           pack(">I", 1) + b"b", None]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def setblocking(self, value):
+            pass
+
+        def recv(self, size):
+            value = self.chunks.pop(0)
+            if value is None:
+                raise BlockingIOError()
+            return value
+
+    class Detector:
+        def __init__(self, path):
+            pass
+
+        def detect(self, jpeg):
+            return ([box("shoe", .4, .4, .6, .55)] if jpeg == b"a" else
+                    [box("shoe", .8, .4, .95, .6)])
+
+    client = Client()
+    card = PersonFollowPlugin({"model_path": str(tmp_path / "model.onnx")}, client=client)
+    monkeypatch.setattr(person_follow, "YoloXOnnxDetector", Detector)
+    monkeypatch.setattr(person_follow.socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(person_follow.select, "select", lambda connections, *args: (connections, [], []))
+    with pytest.raises(RuntimeError, match="target lost"):
+        card._run()
+    assert client.moves and client.moves[0][0] > 0
+    assert client.stops >= 1

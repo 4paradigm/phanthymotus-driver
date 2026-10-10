@@ -201,6 +201,15 @@ class Go1Bundle:
                 capture_config, namespace, executor, client))
             print("[bundle] vision_capture loaded")
 
+        if pc.get("person_follow", {}).get("enabled", False):
+            import person_follow
+            # 中文说明：跟随与 RGB 推流共用前向机位配置，实际运动只由 follow 动作启动。
+            follow_config = dict(pc["person_follow"])
+            follow_config["positions"] = pc.get("camera_rgb", {}).get("positions", {})
+            self._plugins.append(person_follow.make_person_follow(
+                follow_config, namespace, executor, client))
+            print("[bundle] person_follow loaded")
+
         if pc.get("camera_depth", {}).get("enabled", False):
             import camera
             self._plugins.append(camera.make_camera_depth(pc["camera_depth"], namespace, executor, client))

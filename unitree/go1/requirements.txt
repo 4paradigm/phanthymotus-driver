@@ -3,4 +3,7 @@
 # robot_interface 由 unitree_legged_sdk 源码在镜像内构建（-DPYTHON_BUILD=ON），不通过 pip。
 pyyaml
 paho-mqtt          # face_light / system_health 经狗自带 MQTT broker(灯带、bms/state)
-# numpy 基础镜像已自带(1.21.5)，本 bundle 也不直接用。
+numpy>=1.21.6,<2   # person_follow 的 YOLOX 输出解码；保持 ROS 所用 NumPy 1.x
+Pillow>=9,<11      # person_follow JPEG 解码与缩放
+onnxruntime==1.17.1 # person_follow ARM64 CPU 推理；不用完整训练框架
+# numpy 基础镜像虽已自带，跟随卡仍需满足上面的版本下限。
