@@ -198,10 +198,11 @@ class VideoSharedMemoryReader:
     _RING_HEADER = struct.Struct("<8Q")
     _HEADER = struct.Struct("<4Q")
 
-    def __init__(self, config: dict, metadata_getter, frame_callback):
+    def __init__(self, config: dict, metadata_getter, frame_callback, *, latest_only=True):
         self.config = dict(config)
         self.metadata_getter = metadata_getter
         self.frame_callback = frame_callback
+        self.latest_only = latest_only
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread = None
@@ -257,9 +258,16 @@ class VideoSharedMemoryReader:
                 ring = self._RING_HEADER.unpack_from(shared, 0)
                 if ring[1] != max_frames or ring[2] != payload_size:
                     raise ValueError("shared-memory ring header does not match stream configuration")
+                # A live audio stream must not start by draining old samples.
+                # The next sequence is the first sample produced after the
+                # reader became active; video keeps the low-latency latest-frame
+                # behavior below.
+                if not self.latest_only:
+                    write_index = self._RING_HEADER.unpack_from(shared, 0)[0]
+                    self._last_sequence = max(self._last_sequence, write_index - 1)
                 self._ready.set()
                 while not self._stop.is_set():
-                    newest = None
+                    selected = None
                     write_index, ring_frames, ring_payload = self._RING_HEADER.unpack_from(shared, 0)[:3]
                     if ring_frames != max_frames or ring_payload != payload_size:
                         raise ValueError("shared-memory ring header changed unexpectedly")
@@ -269,19 +277,21 @@ class VideoSharedMemoryReader:
                         if (sequence <= self._last_sequence or sequence >= write_index
                                 or not 0 < size <= payload_size):
                             continue
-                        if newest is None or sequence > newest[0]:
+                        if selected is None or (
+                                self.latest_only and sequence > selected[0]) or (
+                                not self.latest_only and sequence < selected[0]):
                             start = offset + self._HEADER.size
                             payload = bytes(shared[start:start + size])
                             after = self._HEADER.unpack_from(shared, offset)[:3]
                             latest_write_index = self._RING_HEADER.unpack_from(shared, 0)[0]
                             if after != (sequence, timestamp_ns, size) or sequence >= latest_write_index:
                                 continue
-                            newest = (sequence, timestamp_ns, payload)
-                    if newest is None:
+                            selected = (sequence, timestamp_ns, payload)
+                    if selected is None:
                         self._stop.wait(0.005)
                     else:
-                        self._last_sequence = newest[0]
-                        self.frame_callback(newest[2], self.metadata_getter(), newest[1])
+                        self._last_sequence = selected[0]
+                        self.frame_callback(selected[2], self.metadata_getter(), selected[1])
         except FileNotFoundError:
             self._error = f"U1 shared-memory path is unavailable: {path}"
             self._ready.set()
@@ -484,6 +494,8 @@ class U1Nodes:
         self._mic_reader = None
         self._mic_stream = {}
         self._mic_stream_open = False
+        self._mic_source = None
+        self._mic_source_lock = threading.Lock()
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
         self._mic_asr_subscription = self.audio_device.create_subscription(
@@ -687,6 +699,7 @@ class U1Nodes:
             # is already publishing on the device topic, so it is optional.
             self._mic_reader = VideoSharedMemoryReader(
                 stream, lambda: {}, self._publish_mic_frame)
+            self._mic_reader.latest_only = False
             try:
                 self._mic_reader.start(timeout=2.0)
             except Exception:
@@ -707,6 +720,11 @@ class U1Nodes:
     def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
         if not self._mic_forwarding:
             return
+        source_lock = getattr(self, "_mic_source_lock", None)
+        if source_lock is None:
+            source_lock = self._mic_source_lock = threading.Lock()
+        with source_lock:
+            self._mic_source = "sdk"
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -721,6 +739,12 @@ class U1Nodes:
         """Accept the device-domain raw topic when the SDK ring is unavailable."""
         if not self._mic_forwarding:
             return
+        source_lock = getattr(self, "_mic_source_lock", None)
+        if source_lock is None:
+            source_lock = self._mic_source_lock = threading.Lock()
+        with source_lock:
+            if self._mic_source == "sdk":
+                return
         data = getattr(getattr(message, "data", None), "data", None)
         if data is None:
             data = getattr(message, "data", None)
@@ -729,6 +753,10 @@ class U1Nodes:
         payload = _normalize_pcm16k(message, data)
         if not payload:
             return
+        with source_lock:
+            if self._mic_source == "sdk":
+                return
+            self._mic_source = "topic"
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -752,6 +780,11 @@ class U1Nodes:
             self._mic_reader.stop()
             self._mic_reader = None
         self._mic_stream = {}
+        source_lock = getattr(self, "_mic_source_lock", None)
+        if source_lock is None:
+            source_lock = self._mic_source_lock = threading.Lock()
+        with source_lock:
+            self._mic_source = None
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
