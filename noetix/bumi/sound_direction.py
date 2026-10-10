@@ -32,7 +32,7 @@ class SoundActivityGate:
         if self._rising_frames >= 2 or level >= max(15.0, background * 3.0):
             self._hold_samples = 9600  # 允许约 0.6 秒语音停顿。
             return True
-        if self._hold_samples > 0 and level >= max(10.0, background * 1.25):
+        if self._hold_samples > 0 and level >= max(10.0, background * 1.5):
             self._hold_samples = 9600
             return True
         self._hold_samples = max(0, self._hold_samples - len(head))

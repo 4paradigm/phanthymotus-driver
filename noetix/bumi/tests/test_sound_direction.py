@@ -23,6 +23,21 @@ def test_activity_gate_detects_normal_speech_with_dc_offset_and_short_pause():
     assert not gate.accepts(np.zeros(8 * 640 + 1, dtype=np.int16))
 
 
+def test_activity_gate_does_not_extend_voice_on_modest_continuous_noise():
+    gate = SoundActivityGate()
+
+    def frame(level):
+        wave = np.tile([level, -level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    assert not gate.accepts(frame(85))
+    assert gate.accepts(frame(85))
+    # 短暂发声之后，风扇声约为背景的 1.33 倍，不应持续刷新方向。
+    assert not any(gate.accepts(frame(53)) for _ in range(16))
+    assert not gate.accepts(frame(60))  # 保持期已经结束。
+
+
 def test_estimator_rejects_bad_inputs_and_off_basis_direction():
     front, right = (2.0, -1.0, 0.0), (0.0, 1.0, -2.0)
     assert estimate_signature(np.zeros(8 * 100, dtype=np.int16), 8, 16000) is None
