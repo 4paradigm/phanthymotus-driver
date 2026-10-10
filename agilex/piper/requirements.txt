@@ -1,4 +1,6 @@
-piper-sdk==1.0.0
+# This source release is not published as piper-sdk==1.0.0 on PyPI.
+# Pin the official source revision; its V2 interface matches the tested controller.
+piper-sdk @ https://github.com/agilexrobotics/piper_sdk/archive/8d4dc29bd6e753066dedee235c008e90ecb2ab4a.zip
 python-can==4.6.1
 numpy==1.26.4
 opencv-python-headless==4.11.0.86
