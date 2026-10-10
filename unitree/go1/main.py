@@ -265,10 +265,14 @@ class Go1Bundle:
                         self._follow_plugin.preempt()
                     # 中文说明：反向交接——follow 启动前先取消其他卡仍在后台写的运动线程
                     # （如 loco 定时 move），否则两个线程会交替覆盖同一 SDK 运动目标。
+                    # 特殊动作等不可让路的序列运行时则拒绝 follow，等它自行完成。
                     if tool_name == "person_follow" and action == "follow":
                         for other in self._plugins:
                             if other is not p and hasattr(other, "preempt_motion"):
-                                other.preempt_motion()
+                                if not other.preempt_motion():
+                                    return {"ok": False, "code": "RESOURCE_BUSY",
+                                            "message": "%s is running; follow refused until it finishes"
+                                                       % other.get_tool()["name"]}
                     return p.dispatch(action, args)
         return None
 

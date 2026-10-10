@@ -285,6 +285,59 @@ def test_starting_follow_interrupts_running_gesture():
     assert thread is None or not thread.is_alive()
 
 
+def test_follow_refuses_while_special_motion_is_running(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    main = importlib.import_module("unitree.go1.main")
+
+    class StandingClient(Client):
+        def snapshot(self):
+            return {"fresh": True, "mode": 1, "observed_monotonic": time.monotonic()}
+
+    client = StandingClient()
+    model = tmp_path / "shoes.onnx"
+    model.write_bytes(b"model")
+    bundle = main.Go1Bundle(
+        {"plugins": {"special_motion": {"enabled": True,
+                                        "jump_yaw_left_duration_s": .5,
+                                        "stabilize_timeout_s": .2,
+                                        "stabilize_settle_s": .01},
+                     "person_follow": {"enabled": True, "model_path": str(model)}}},
+        "test_go1", None, client)
+    follow = next(p for p in bundle._plugins if p.get_tool()["name"] == "person_follow")
+    special = next(p for p in bundle._plugins if p.get_tool()["name"] == "special_motion")
+    monkeypatch.setattr(follow, "_run", lambda: follow._cancel.wait(10))
+    seq_result = {}
+
+    def run_sequence():
+        seq_result["r"] = special.dispatch("jump_yaw_left", {"confirm": True})
+
+    try:
+        sequence = threading.Thread(target=run_sequence, daemon=True)
+        sequence.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with special._lock:
+                if special._running_seq is not None:
+                    break
+            time.sleep(.01)
+        with special._lock:
+            assert special._running_seq is not None, "special motion sequence did not start"
+        # 序列运行期间 follow 必须被拒绝，且不能启动 worker。
+        result = bundle.dispatch("person_follow", {"action": "follow", "confirm": True})
+        assert result["code"] == "RESOURCE_BUSY"
+        assert "special_motion" in result["message"]
+        assert follow._worker is None or not follow._worker.is_alive()
+        assert not client.moves
+        sequence.join(5)
+        assert not sequence.is_alive()
+        assert seq_result["r"]["ok"], seq_result["r"]
+        # 序列完成后 follow 可以正常启动。
+        assert bundle.dispatch("person_follow", {"action": "follow", "confirm": True})["ok"]
+        assert follow._worker.is_alive()
+    finally:
+        follow.stop()
+
+
 def test_cleanup_releases_camera_when_stop_move_fails(tmp_path, monkeypatch):
     from unitree.go1 import camera
 
