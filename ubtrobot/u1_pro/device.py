@@ -198,10 +198,12 @@ class VideoSharedMemoryReader:
     _RING_HEADER = struct.Struct("<8Q")
     _HEADER = struct.Struct("<4Q")
 
-    def __init__(self, config: dict, metadata_getter, frame_callback):
+    def __init__(self, config: dict, metadata_getter, frame_callback, *, latest_only=True):
         self.config = dict(config)
         self.metadata_getter = metadata_getter
         self.frame_callback = frame_callback
+        self.latest_only = latest_only
+        self.skip_backlog = False
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread = None
@@ -267,8 +269,9 @@ class VideoSharedMemoryReader:
                 if slot_size < self._HEADER.size + payload_size:
                     raise ValueError("shared-memory ring slot is smaller than its payload")
                 self._ready.set()
+                read_latest = self.latest_only or self.skip_backlog
                 while not self._stop.is_set():
-                    newest = None
+                    selected = None
                     write_index, ring_frames, ring_payload = self._RING_HEADER.unpack_from(shared, 0)[:3]
                     if ring_frames != max_frames or ring_payload != payload_size:
                         raise ValueError("shared-memory ring header changed unexpectedly")
@@ -278,19 +281,25 @@ class VideoSharedMemoryReader:
                         if (sequence <= self._last_sequence or sequence >= write_index
                                 or not 0 < size <= payload_size):
                             continue
-                        if newest is None or sequence > newest[0]:
+                        if selected is None or (
+                                read_latest and sequence > selected[0]) or (
+                                not read_latest and sequence < selected[0]):
                             start = offset + self._HEADER.size
                             payload = bytes(shared[start:start + size])
                             after = self._HEADER.unpack_from(shared, offset)[:3]
                             latest_write_index = self._RING_HEADER.unpack_from(shared, 0)[0]
                             if after != (sequence, timestamp_ns, size) or sequence >= latest_write_index:
                                 continue
-                            newest = (sequence, timestamp_ns, payload)
-                    if newest is None:
+                            selected = (sequence, timestamp_ns, payload)
+                    if selected is None:
                         self._stop.wait(0.005)
                     else:
-                        self._last_sequence = newest[0]
-                        self.frame_callback(newest[2], self.metadata_getter(), newest[1])
+                        self._last_sequence = selected[0]
+                        self.frame_callback(selected[2], self.metadata_getter(), selected[1])
+                        if not self.latest_only and read_latest:
+                            # Discard the pre-existing backlog once, then
+                            # consume subsequent audio frames in sequence.
+                            read_latest = False
         except FileNotFoundError:
             self._error = f"U1 shared-memory path is unavailable: {path}"
             self._ready.set()
@@ -696,6 +705,8 @@ class U1Nodes:
             # is already publishing on the device topic, so it is optional.
             self._mic_reader = VideoSharedMemoryReader(
                 stream, lambda: {}, self._publish_mic_frame)
+            self._mic_reader.latest_only = False
+            self._mic_reader.skip_backlog = True
             try:
                 self._mic_reader.start(timeout=2.0)
             except Exception:
