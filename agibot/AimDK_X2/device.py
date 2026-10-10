@@ -315,7 +315,17 @@ class JointStatePlugin:
         request = GetAllJointState.Request()
         request.request = self.nodes.request_header()
         result = call_service(self.nodes.get_all_joint_state, request)
+        status = int(result.reponse.status.value)
+        if status != 1:  # CommonState.SUCCESS
+            return {
+                "state": "unavailable",
+                "service": "GetAllJointState",
+                "status": status,
+                "message": result.reponse.message,
+            }
         return {
+            "state": "ok",
+            "service": "GetAllJointState",
             "leg": jsonable(result.leg_joints),
             "waist": jsonable(result.waist_joints),
             "arm": jsonable(result.arm_joints),
