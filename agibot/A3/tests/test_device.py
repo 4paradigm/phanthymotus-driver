@@ -216,6 +216,8 @@ class RecordingTransport:
         for prefix, response in self.responses.items():
             if service.startswith(prefix):
                 return response
+        if service.startswith("MotionControlActionService/GetAction"):
+            return {"info": {"current_action": "MotionControlAction_MOTION"}}
         return {"header": {"code": "0"}}
 
     def calls_to(self, service, method):
@@ -720,13 +722,15 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertIn("get_up", result["suggestion"])
         self.assertEqual(self.nodes.locomotion_pub.published, [])
 
-    def test_loco_walk_unparseable_state_is_permissive(self):
-        # State unknown → the gate must not block; walking starts as usual.
+    def test_loco_walk_unparseable_state_is_rejected(self):
+        # Unknown state must fail closed; never claim motion was published.
         self.transport.responses["MotionControlActionService/GetAction"] = {"header": {"code": "0"}}
         loco = find_plugin(self.plugins, "loco")
         result = loco.dispatch("walk", {"forward": 0.5})
-        self.assertEqual(result["state"], "walking")
-        loco.dispatch("stop", {})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "UNKNOWN")
+        self.assertIn("mc_mode get_up", result["suggestion"])
+        self.assertEqual(self.nodes.locomotion_pub.published, [])
 
     def test_arm_send_rejected_outside_motion_state(self):
         self.transport.responses["MotionControlActionService/GetAction"] = {
@@ -743,11 +747,23 @@ class RpcDispatchTests(unittest.TestCase):
         result = arm.dispatch("compliance_check", {})
         self.assertNotEqual(result.get("state"), "rejected")
 
-    def test_arm_send_unparseable_state_is_permissive(self):
+    def test_arm_send_unparseable_state_is_rejected(self):
         self.transport.responses["MotionControlActionService/GetAction"] = {"header": {"code": "0"}}
         arm = find_plugin(self.plugins, "arm_control")
         result = arm.dispatch("send", {"left": [0.0] * 7, "duration_ms": 0})
-        self.assertEqual(result["state"], "published")
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "UNKNOWN")
+        self.assertEqual(self.nodes.arm_command_pub.published, [])
+
+    def test_motion_gate_reads_aimdk_info_current_action(self):
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "info": {"current_action": "MotionControlAction_PASSIVE"}}
+        hand = find_plugin(self.plugins, "hand_control")
+        result = hand.dispatch("send", {"left": [0]})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "PASSIVE")
+        self.assertIn("mc_mode get_up", result["suggestion"])
+        self.assertEqual(self.nodes.hand_command_pub.published, [])
 
     # -- loco / waist / face (RosMsgWrapper publishers, robot domain) --
 
@@ -1686,15 +1702,16 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
-    def test_motion_play_play_unparseable_state_is_permissive(self):
-        # Same permissive-on-unparseable policy as the loco/arm gates: an
-        # unrecognised GetAction body must not lock the operator out.
+    def test_motion_play_play_unparseable_state_is_rejected(self):
+        # Unknown controller state must fail closed for motion commands.
         self.transport.responses["MotionControlActionService/GetAction"] = {"header": {"code": "0"}}
         motion = find_plugin(self.plugins, "motion_play")
         result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
                                           "duration_ms": 100})
-        self.assertEqual(result["state"], "playing")
-        motion.dispatch("stop_play", {})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "UNKNOWN")
+        self.assertIn("mc_mode get_up", result["suggestion"])
+        self.assertEqual(self.transport.calls_to("MotionCommandService", "SendMotionCommand"), [])
 
     def test_motion_play_stop_play_settles_pending_waiter(self):
         # stop_play (and reset) must invalidate the duration-based completion
@@ -1782,6 +1799,21 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(body["pose"]["position"], {"x": 1.5, "y": -2.0})
         self.assertEqual(body["pose"]["angle"], 0.3)
         self.assertEqual(spatial.last_task_id, 7)
+
+    def test_controlled_spatial_motion_actions_rejected_outside_motion(self):
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "info": {"current_action": "MotionControlAction_PASSIVE"}}
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        result = spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.5, "y": -2.0,
+                                                    "angle": 0.3})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "PASSIVE")
+        self.assertIn("mc_mode get_up", result["suggestion"])
+        self.assertEqual(self.transport.calls_to("PncService", "PlanningNaviToPose2D"), [])
+
+        result = spatial.dispatch("resume", {})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(self.transport.calls_to("PncService", "ActionResume"), [])
 
     def test_controlled_spatial_control_reuses_last_task_id(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
@@ -1890,6 +1922,8 @@ class RpcDispatchTests(unittest.TestCase):
                               {"task_id": 12, "data": {"state": "running"}}])
             self.transport.handler = lambda url, service: (
                 next(responses) if service.startswith("PncService/MoveForward")
+                else {"info": {"current_action": "MotionControlAction_MOTION"}}
+                if service.startswith("MotionControlActionService/GetAction")
                 else {"header": {"code": "0"}})
             first = spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
             second = spatial.dispatch("move_forward", {"map_id": 1, "distance": 1.0})
@@ -1928,6 +1962,8 @@ class RpcDispatchTests(unittest.TestCase):
             self.transport.handler = lambda url, service: (
                 {"task_id": next(task_ids), "data": {"state": "running"}}
                 if service.startswith("PncService/MoveForward")
+                else {"info": {"current_action": "MotionControlAction_MOTION"}}
+                if service.startswith("MotionControlActionService/GetAction")
                 else {"header": {"code": "0"}})
             first, second = run_concurrently(
                 lambda: spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5}),
@@ -2004,6 +2040,19 @@ class RpcDispatchTests(unittest.TestCase):
         (url, body), = self.transport.calls_to("SkillPilotService", "AutoCharging")
         self.assertEqual(body["command"], "AutoChargingCommand_START")
         self.assertEqual(body["trigger"], "AutoChargingTrigger_AGENT")
+
+    def test_auto_charging_start_rejected_outside_motion_but_stop_remains_available(self):
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "info": {"current_action": "MotionControlAction_LIE_DOWN"}}
+        charging = find_plugin(self.plugins, "auto_charging")
+        result = charging.dispatch("charge_start", {})
+        self.assertEqual(result["state"], "rejected")
+        self.assertIn("mc_mode get_up", result["suggestion"])
+        self.assertEqual(self.transport.calls_to("SkillPilotService", "AutoCharging"), [])
+
+        charging.dispatch("charge_stop", {})
+        (url, body), = self.transport.calls_to("SkillPilotService", "AutoCharging")
+        self.assertEqual(body["command"], "AutoChargingCommand_STOP")
 
     def test_skill_play_start_returns_session(self):
         skill = find_plugin(self.plugins, "skill_play")
@@ -2117,6 +2166,8 @@ class RpcDispatchTests(unittest.TestCase):
             responses = iter([{"data": {"session_id": "s-1"}},
                               {"data": {"session_id": "s-2"}}])
             def skill_handler(url, service):
+                if service.startswith("MotionControlActionService/GetAction"):
+                    return {"info": {"current_action": "MotionControlAction_MOTION"}}
                 if not service.startswith("SkillPilotService/SkillPackage"):
                     return {"header": {"code": "0"}}
                 body = next(c for u, c in reversed(self.transport.calls)
@@ -2165,6 +2216,8 @@ class RpcDispatchTests(unittest.TestCase):
             skill.nodes.values["skill_status"] = {"state": "running"}
             sessions = iter(["s-a", "s-b"])
             def skill_handler(url, service):
+                if service.startswith("MotionControlActionService/GetAction"):
+                    return {"info": {"current_action": "MotionControlAction_MOTION"}}
                 if not service.startswith("SkillPilotService/SkillPackage"):
                     return {"header": {"code": "0"}}
                 body = next(c for u, c in reversed(self.transport.calls)

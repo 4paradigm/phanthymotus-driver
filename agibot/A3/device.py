@@ -1928,7 +1928,8 @@ MC_STATE_TRANSITIONS = {
     "DAMPING": ("get_up",),
     "PASSIVE": ("get_up",),
     "LIE_DOWN": ("get_up",),
-    # IDLE/UNKNOWN and any unmapped state: allow all four, the runtime check decides
+    # IDLE/UNKNOWN and any unmapped state: mc_mode still consults the runtime list;
+    # actuator cards use _motion_gate below and fail closed when state is unknown.
 }
 MC_TRANSITION_SUGGESTIONS = {
     "damping": "damping 用于关节卸力/跌倒保护，切换前确保机器人周围有足够空间；如当前未站立请先 get_up",
@@ -1954,7 +1955,8 @@ def _mc_current_state(rpc):
     Shared by McModePlugin and the MOTION-gate on loco/arm commands (5th PR
     review): the exact response field name is not in the dev guide, so probe
     action/state/current_action at the top level and under "data", plus
-    command.action — '' means "could not tell", callers stay permissive then.
+    command.action. Actuator callers treat an empty result as UNKNOWN and fail
+    closed; mc_mode itself can still query the runtime action list to recover.
     """
     response = rpc.get_action()
     # AimDK 3.2 returns the live state under `info.current_action`; older
@@ -1990,10 +1992,10 @@ def _motion_gate(rpc, card: str):
     try:
         current = _mc_current_state(rpc)
     except Exception:
-        current = ""
-    if current and current != "MOTION":
-        return {"state": "rejected", "current": current,
-                "suggestion": f"{card} 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up"}
+        current = "UNKNOWN"
+    if current != "MOTION":
+        return {"state": "rejected", "current": current or "UNKNOWN",
+                "suggestion": f"{card} 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up，确认状态变为 MOTION 后重试"}
     return None
 
 
@@ -2191,12 +2193,9 @@ class LocoPlugin:
             raise ValueError(f"loco: duration must be in (0, {self.MAX_DURATION_S:g}] or -1 for continuous")
         if forward == 0.0 and lateral == 0.0 and angular == 0.0:
             raise ValueError("loco: all velocities are zero — use stop to halt")
-        # MOTION-state gate (dev guide §7.3: locomotion only takes effect in MOTION).
-        # Unparseable state → permissive, matching mc_mode's UNKNOWN handling.
-        current = _mc_current_state(self.nodes.rpc)
-        if current and current != "MOTION":
-            return {"state": "rejected", "current": current,
-                    "suggestion": "loco 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up 恢复站立"}
+        rejected = _motion_gate(self.nodes.rpc, "loco")
+        if rejected:
+            return rejected
         # 新指令顶替旧指令：先结算旧的等待线程（发零速 + cancelled 回报），再武装新的。
         # 整个转移（结算 → 武装）在同一把锁内完成：两个并发 walk 不会都观察到
         # “无活动动作”而向机器人下发重叠指令（10th PR review）。
@@ -2367,14 +2366,9 @@ class ArmControlPlugin:
             return jsonable(self.nodes.rpc.arm_compliance(action.replace("compliance_", "")))
         if action not in ("set_position", "send"):
             raise ValueError(f"arm_control: unknown action {action!r}")
-        # MOTION-state gate (dev guide §7.3: arm control only takes effect in MOTION;
-        # the docs also require stopping motion_player first). Unparseable state →
-        # permissive, matching mc_mode's UNKNOWN handling.
-        current = _mc_current_state(self.nodes.rpc)
-        if current and current != "MOTION":
-            return {"state": "rejected", "current": current,
-                    "suggestion": "arm_control 仅在 MOTION 站立状态生效（且需先停止 motion_player）；"
-                                  "请先执行 mc_mode get_up 恢复站立"}
+        rejected = _motion_gate(self.nodes.rpc, "arm_control")
+        if rejected:
+            return rejected
         positions = {}
         if action == "set_position":
             positions.update({name: float(args[name]) for names in ARM_JOINTS.values()
@@ -2468,16 +2462,9 @@ class HandControlPlugin:
                 name = f"{side}_hand_joint_{i}"
                 positions[name] = _clamp(float(value), 0.0, max_value, f"{side} 手指 {i}")
         _require(positions, "至少提供 left 或 right 张合等级")
-        # AimDK accepts hand joint commands only while the motion controller is
-        # in its active standing mode. Do the read-only check here so a command
-        # is not reported as published while the controller silently ignores it.
-        try:
-            current = _mc_current_state(self.nodes.rpc)
-        except Exception:
-            current = ""
-        if current and current != "MOTION":
-            return {"state": "rejected", "current": current,
-                    "suggestion": "hand_control 仅在 MOTION 状态生效；请先执行 mc_mode get_up"}
+        rejected = _motion_gate(self.nodes.rpc, "hand_control")
+        if rejected:
+            return rejected
         duration_ms = int(args.get("duration_ms", 500))
         _require(100 <= duration_ms <= 5000, "duration_ms 必须在 100~5000 毫秒之间")
         self.nodes.publish_joint_command("hand_command_pub", positions,
@@ -2766,13 +2753,10 @@ class MotionPlayPlugin:
                      f"释放全身资源屏障）")
             # MOTION-state gate (dev guide §7.1: motion_player is a MOTION-mode
             # application; full-body motion while DAMPING/PASSIVE/LIE_DOWN would
-            # command joints that are unpowered). Unparseable state → permissive,
-            # matching the loco/arm gates.
-            current = _mc_current_state(self.nodes.rpc)
-            if current and current != "MOTION":
-                return {"state": "rejected", "current": current,
-                        "suggestion": "motion_play 仅在 MOTION 站立状态生效；"
-                                      "请先执行 mc_mode get_up 恢复站立"}
+            # command joints that are unpowered). Unknown state fails closed.
+            rejected = _motion_gate(self.nodes.rpc, "motion_play")
+            if rejected:
+                return rejected
             # Atomic settle-then-arm: a second concurrent play must cancel the
             # first (cmd_end + immediate ACP cancelled) instead of silently
             # orphaning its barrier — the superseded worker would otherwise
@@ -3873,30 +3857,48 @@ class ControlledSpatialPlugin:
         # -- 导航（长时间动作：_nav_dispatch 发 RPC 后返回 action_id 并武装
         # ACP 完成等待线程，轮询 ActionGetState 判定到点） --
         if action == "navi_to_goal":
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
             return self._nav_dispatch(action, "PlanningNaviToGoal", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "target_id": int(args.get("target_id", 0)), "guide_line_id": 0,
                 "ackerman_mode": False})
         if action == "navi_to_pose":
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
             return self._nav_dispatch(action, "PlanningNaviToPose2D", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
                          "angle": float(args.get("angle", 0))},
                 "ackerman_mode": False})
         if action == "linear_to_goal":
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
             return self._nav_dispatch(action, "LinearNaviToGoal", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "target_id": int(args.get("target_id", 0))})
         if action == "linear_to_pose":
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
             return self._nav_dispatch(action, "LinearNaviToPose2D", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
                          "angle": float(args.get("angle", 0))}})
         if action == "move_forward":
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
             return self._nav_dispatch(action, "MoveForward", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "angle": 0, "distance": float(args.get("distance", 0))})
         if action == "spin_turn":
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
             return self._nav_dispatch(action, "SpinTurn", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "angle": float(args.get("angle", 0))})
@@ -3910,6 +3912,9 @@ class ControlledSpatialPlugin:
         if action == "pause":
             return jsonable(self.nodes.rpc.navi("ActionPause", {"task_id": self._task_id(args)}))
         if action == "resume":
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
             return jsonable(self.nodes.rpc.navi("ActionResume", {"task_id": self._task_id(args)}))
         if action == "nav_state":
             return jsonable(self.nodes.rpc.navi_state(self._task_id(args)))
@@ -3982,6 +3987,10 @@ class AutoChargingPlugin:
         if action == "info":
             return {"state": "ready"}
         if action in self.TRIGGERS:
+            if action == "charge_start":
+                rejected = _motion_gate(self.nodes.rpc, "auto_charging")
+                if rejected:
+                    return rejected
             return jsonable(self.nodes.rpc.auto_charging(self.TRIGGERS[action], "AutoChargingTrigger_AGENT"))
         if action == "state":
             return self.nodes.snapshot("skill_status") or {"state": "unknown"}
