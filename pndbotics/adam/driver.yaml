@@ -23,6 +23,7 @@ cards:
   - { name: imu,                type: sensor }
   - { name: battery,            type: sensor }
   - { name: estop,              type: sensor }
+  - { name: loco_state,         type: sensor }
   - { name: loco,               type: actuator }
   - { name: motion,             type: actuator }
   - { name: arm_control,        type: actuator }
