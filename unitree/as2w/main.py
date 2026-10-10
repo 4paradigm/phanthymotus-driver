@@ -5,7 +5,7 @@ try:
 except ImportError:
     pass
 
-import json, os, re, signal, socket, sys, threading, time, uuid
+import ipaddress, json, os, re, signal, socket, struct, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -24,18 +24,116 @@ class _UnavailableProxy:
 def load_config():
     return yaml.safe_load(open(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml"))))
 
+
+_UNITREE_NETWORK = ipaddress.ip_network("192.168.123.0/24")
+_VIRTUAL_INTERFACE_PREFIXES = (
+    "br-", "cni", "docker", "flannel", "podman", "veth", "virbr",
+)
+
+
+def _network_interfaces():
+    """Inspect Linux interfaces without route guessing or external commands."""
+    import fcntl
+
+    interfaces = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _, name in socket.if_nameindex():
+            request = struct.pack("256s", name[:15].encode("ascii", "ignore"))
+            try:
+                flags_data = fcntl.ioctl(sock.fileno(), 0x8913, request)  # SIOCGIFFLAGS
+                address_data = fcntl.ioctl(sock.fileno(), 0x8915, request)  # SIOCGIFADDR
+            except OSError:
+                continue
+            sysfs = Path("/sys/class/net") / name
+            try:
+                virtual = "/virtual/net/" in str(sysfs.resolve())
+            except OSError:
+                virtual = False
+            interfaces.append({
+                "name": name,
+                "ipv4": socket.inet_ntoa(address_data[20:24]),
+                "up": bool(struct.unpack_from("H", flags_data, 16)[0] & 0x1),
+                "wireless": (sysfs / "wireless").exists() or name.lower().startswith(("wl", "wlan")),
+                "virtual": virtual or (sysfs / "bridge").exists(),
+            })
+    finally:
+        sock.close()
+    return interfaces
+
+
+def _configured_interface(cfg):
+    """Return the highest-priority setting; None means safe auto-detection."""
+    positional = str(sys.argv[1]).strip() if len(sys.argv) > 1 else ""
+    if positional:
+        value = positional
+    elif "NETWORK_INTERFACE" in os.environ:
+        value = os.environ["NETWORK_INTERFACE"]
+    else:
+        value = cfg.get("robot_interface", "auto")
+    value = str(value or "").strip()
+    return None if not value or value.lower() == "auto" else value
+
+
+def resolve_robot_interface(cfg):
+    """Resolve an explicit interface or uniquely identify Unitree's wired LAN."""
+    configured = _configured_interface(cfg)
+    if configured:
+        return configured
+
+    try:
+        interfaces = _network_interfaces()
+    except Exception as exc:
+        print(f"[as2w] Failed to inspect network interfaces: {exc}", flush=True)
+        interfaces = []
+
+    candidates = []
+    for interface in interfaces:
+        name = interface["name"]
+        lowered = name.lower()
+        if (not interface["up"] or lowered == "lo" or interface["wireless"]
+                or interface["virtual"]
+                or lowered.startswith(_VIRTUAL_INTERFACE_PREFIXES)):
+            continue
+        try:
+            address = ipaddress.ip_address(interface["ipv4"])
+        except ValueError:
+            continue
+        if address in _UNITREE_NETWORK:
+            candidates.append((name, str(address)))
+
+    if len(candidates) == 1:
+        name, address = candidates[0]
+        print(f"[as2w] Auto-detected Unitree interface: {name} ({address})", flush=True)
+        return name
+    if not candidates:
+        print("[as2w] No Unitree robot interface found on 192.168.123.0/24", flush=True)
+        print("[as2w] Set NETWORK_INTERFACE explicitly if the robot uses another subnet", flush=True)
+        return None
+    choices = ", ".join(f"{name} ({address})" for name, address in candidates)
+    print(f"[as2w] Multiple Unitree network candidates found: {choices}", flush=True)
+    print("[as2w] Set NETWORK_INTERFACE explicitly", flush=True)
+    return None
+
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
-        from device import StatePlugin, LocoPlugin, SpecialActionPlugin
+        from device import LedPlugin, StatePlugin, LocoPlugin, SpecialMotionPlugin
+        from multimedia import CameraPlugin, MicPlugin, SpeakerPlugin
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
+        from slam_mapping import SlamMappingPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
-        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
+        if p.get("special_motion", {}).get("enabled", True): self.plugins.append(SpecialMotionPlugin(p.get("special_motion", {}), namespace, executor, proxy))
+        if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
+        if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
+        if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
+        if dds_ready and p.get("camera", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera", {}), namespace, executor, interface))
+        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
@@ -66,9 +164,12 @@ def handler(bundle):
             print(f"[mcp] {self.address_string()} {safe}", flush=True)
         def _send_json(self, status, payload):
             body = json.dumps(payload).encode()
-            self.send_response(status); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers(); self.wfile.write(body)
+            try:
+                self.send_response(status); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers(); self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
         def _send_sse(self, event, data):
             try:
                 self.wfile.write(f"event: {event}\\ndata: {data}\\n\\n".encode())
@@ -155,17 +256,18 @@ def _start_registration(mcp_port, name, category):
 
 def main():
     cfg = load_config()
-    interface = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE") or cfg.get("robot_interface", "eth0")
+    interface = resolve_robot_interface(cfg)
     profile = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "")
     if os.environ.get("ROS_DOMAIN_ID") != "42" or os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
         print("[as2w] WARNING: ROS2 is not configured for agent-core Domain 42/FastDDS", flush=True)
     elif not profile or not os.path.isfile(profile):
         print(f"[as2w] WARNING: FastDDS profile is missing: {profile or '(unset)'}", flush=True)
     else:
-        print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(auto)'}", flush=True)
+        print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(unavailable)'}", flush=True)
     dds_ready = False
     # A body DDS participant must never silently bind to the office Wi-Fi.
-    # Configure NETWORK_INTERFACE explicitly for non-eth0 robot adapters.
+    # The resolver returns only an explicit setting or a unique wired adapter
+    # on Unitree's 192.168.123.0/24 network.
     candidates = [interface] if interface else []
     for candidate in candidates:
         try:
