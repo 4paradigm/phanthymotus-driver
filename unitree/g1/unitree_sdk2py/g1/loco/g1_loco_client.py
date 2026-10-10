@@ -1,4 +1,5 @@
 import json
+import threading
 
 from ...rpc.client import Client
 from .g1_loco_api import *
@@ -9,6 +10,7 @@ from .g1_loco_api import *
 class LocoClient(Client):
     def __init__(self):
         super().__init__(LOCO_SERVICE_NAME, False)
+        self._velocity_send_lock = threading.Lock()
         self.first_shake_hand_stage_ = -1
 
     def Init(self):
@@ -55,15 +57,27 @@ class LocoClient(Client):
         return code
 
     # 7105
+    def BeginVelocity(self, vx: float, vy: float, omega: float, duration: float = 1.0):
+        # Serialize writes on one DDS writer, never the response wait. Thus a
+        # stop can be sent after a move even while its response is outstanding.
+        parameter = json.dumps({"velocity": [vx, vy, omega], "duration": duration})
+        with self._velocity_send_lock:
+            wait = self._BeginCall(ROBOT_API_ID_LOCO_SET_VELOCITY, parameter)
+        def response():
+            return wait()[0]
+        response.request_id = getattr(wait, "request_id", None)
+        return response
+
     def SetVelocity(self, vx: float, vy: float, omega: float, duration: float = 1.0):
-        p = {}
-        velocity = [vx,vy,omega]
-        p["velocity"] = velocity
-        p["duration"] = duration
-        parameter = json.dumps(p)
-        code, data = self._Call(ROBOT_API_ID_LOCO_SET_VELOCITY, parameter)
-        return code
-    
+        return self.BeginVelocity(vx, vy, omega, duration)()
+
+    def BeginMove(self, vx: float, vy: float, vyaw: float, continous_move: bool = False):
+        duration = 864000.0 if continous_move else 1.0
+        return self.BeginVelocity(vx, vy, vyaw, duration)
+
+    def BeginStopMove(self):
+        return self.BeginVelocity(0., 0., 0.)
+
     # 7106
     def SetTaskId(self, task_id: float):
         p = {}
@@ -106,7 +120,7 @@ class LocoClient(Client):
 
     def Move(self, vx: float, vy: float, vyaw: float, continous_move: bool = False):
         duration = 864000.0 if continous_move else 1
-        self.SetVelocity(vx, vy, vyaw, duration)
+        return self.SetVelocity(vx, vy, vyaw, duration)
 
     def BalanceStand(self, balance_mode: int):
         self.SetBalanceMode(balance_mode)

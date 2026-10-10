@@ -9,6 +9,7 @@ from ..idl.unitree_api.msg.dds_ import Response_ as Response
 
 from ..core.channel import ChannelFactory
 from ..core.channel_name import ChannelType, GetClientChannelName
+from ..utils.rpc_trace import trace_event
 from .request_future import RequestFuture, RequestFutureQueue
 
 _log = logging.getLogger(__name__)
@@ -71,8 +72,14 @@ class ClientStub:
     def __ResponseHandler(self, response: Response):
         id = response.header.identity.id
         apiId = response.header.identity.api_id
+        if apiId == 7105:
+            trace_event("response_handler_enter", request_id=id, api_id=apiId)
         future = self.__futureQueue.Get(id)
+        if apiId == 7105:
+            trace_event("response_matched", request_id=id, matched=future is not None)
         if future is None:
             pass  # expected for fire-and-forget sport commands
         elif not future.Ready(response):
             _log.warning("[ClientStub] set future ready error.")
+        if apiId == 7105:
+            trace_event("response_handler_exit", request_id=id)
