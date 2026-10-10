@@ -11,8 +11,8 @@ import time
 
 from common.motion.envelope import IDENTITY, MotionEnvelope
 from common.motion.protocol import SCHEMA, envelope, validate, validate_descriptor, vector
-from g1_motion.worker import NumericalWorker
-from g1_motion.profile import session_profile
+from motion.worker import NumericalWorker
+from motion.profile import session_profile
 
 JOINT_NAMES = tuple(f'{side}_{joint}_joint' for side in ('left', 'right') for joint in
                     ('shoulder_pitch', 'shoulder_roll', 'shoulder_yaw', 'elbow', 'wrist_roll'))

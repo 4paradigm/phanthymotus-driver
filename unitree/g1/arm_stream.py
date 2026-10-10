@@ -1,7 +1,7 @@
 """G1_23 arm execution: no IK, FK or collision search in the actuator loop.
 
 The reduced gravity model follows the frozen Unitree G1_23 implementation;
-see g1_motion/NOTICE.md for Apache-2.0 source provenance. SDK and Pinocchio
+see motion/NOTICE.md for Apache-2.0 source provenance. SDK and Pinocchio
 imports are lazy. Construction and offline tests do not connect to a robot.
 """
 from collections import OrderedDict

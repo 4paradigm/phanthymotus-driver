@@ -14,12 +14,12 @@ import pytest
 pytest.importorskip('pinocchio.casadi', reason='G1 requires CasADi-enabled Pinocchio 3.1 ABI')
 DRIVER=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(DRIVER))
-from g1_motion.kinematics import G1IK
-from g1_motion.worker import NumericalWorker
+from motion.kinematics import G1IK
+from motion.worker import NumericalWorker
 
 
 def profile(tmp_path):
-    root=DRIVER/'g1_motion'
+    root=DRIVER/'motion'
     p=json.loads((root/'calibration.example.json').read_text())
     p['urdf_path']=str(root/'models/g1_body23.urdf')
     assert hashlib.sha256(Path(p['urdf_path']).read_bytes()).hexdigest()==p['urdf_sha256']
@@ -126,10 +126,10 @@ def test_default_collision_policy_does_not_block_inward_targets(tmp_path):
 
 
 def test_packaged_geometry_matches_existing_solver_with_same_measured_posture(tmp_path):
-    from g1_motion.profile import session_profile
-    path, directory = session_profile(DRIVER/'g1_motion/g1_23_fixed_hand.json',
+    from motion.profile import session_profile
+    path, directory = session_profile(DRIVER/'motion/g1_23_fixed_hand.json',
         {'arm_ns': 1_000_000_000, 'locked_joints': dict.fromkeys(
-            json.loads((DRIVER/'g1_motion/g1_23_fixed_hand.json').read_text())['locked_joint_names'], 0.)},
+            json.loads((DRIVER/'motion/g1_23_fixed_hand.json').read_text())['locked_joint_names'], 0.)},
         1_000_000_000)
     try:
         current, previous = G1IK(path), G1IK(profile(tmp_path))
@@ -149,7 +149,7 @@ def test_default_profile_real_worker_lifetime_and_no_hardware(tmp_path):
     from types import SimpleNamespace
     from arm_stream import ArmStreamExecutor, LOCKED_NAMES
     from motion_control import MotionControl
-    config = {'calibration_path': str(DRIVER/'g1_motion/g1_23_fixed_hand.json'),
+    config = {'calibration_path': str(DRIVER/'motion/g1_23_fixed_hand.json'),
               'servo_position': True, 'joint_velocity_rad_s': 1.}
     baseline = {'waist': .01}
     def feedback():

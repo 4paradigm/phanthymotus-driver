@@ -11,9 +11,9 @@ import yaml
 DRIVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DRIVER))
 from arm_stream import ArmStreamExecutor, LOCKED_NAMES
-from g1_motion.profile import session_profile
+from motion.profile import session_profile
 
-PROFILE = DRIVER / 'g1_motion/g1_23_fixed_hand.json'
+PROFILE = DRIVER / 'motion/g1_23_fixed_hand.json'
 
 
 def sample(now=1_000_000_000):
@@ -24,7 +24,7 @@ def sample(now=1_000_000_000):
 def test_default_registration_and_packaged_geometry_are_complete():
     config = yaml.safe_load((DRIVER/'config.yaml').read_text())
     assert config['teleop_control']['enabled'] is True
-    assert config['teleop_control']['calibration_path'] == '/work/g1_motion/g1_23_fixed_hand.json'
+    assert config['teleop_control']['calibration_path'] == '/work/motion/g1_23_fixed_hand.json'
     market = yaml.safe_load((DRIVER/'driver.yaml').read_text())
     assert {'name': 'teleop_control', 'type': 'actuator'} in market['cards']
     profile = json.loads(PROFILE.read_text())
