@@ -7,7 +7,7 @@ image_name: go1
 port: 15715
 mcp_url: "http://localhost:15715/mcp"
 
-description: "Unitree Go1 — 状态感知 + 运动控制 + 步态/姿态 + 表演动作 + 五机位 RGB/深度/点云视觉 + 蜂鸣/扬声器 + face_light 静态/逐灯/定时灯效"
+description: "Unitree Go1 — 状态感知 + 运动控制 + 步态/姿态 + 表演动作 + 五机位 RGB/深度/点云视觉 + 实验性人跟随 + 蜂鸣/扬声器 + face_light 静态/逐灯/定时灯效"
 
 build_context_extras:
   - ../../common
@@ -28,6 +28,7 @@ cards:
   - { name: system_health,      type: actuator }
   - { name: camera_rgb,         type: sensor }
   - { name: vision_capture,     type: actuator }
+  - { name: person_follow,      type: actuator }
   - { name: camera_depth,       type: sensor }
   - { name: camera_pointcloud,  type: sensor }
   - { name: imu,                type: sensor }

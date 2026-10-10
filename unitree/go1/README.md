@@ -2,7 +2,7 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 当前发布 **24 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
+> 本 bundle 当前发布 **25 张卡**：11 张传感卡（sensor）+ 10 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
 > **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
@@ -39,6 +39,7 @@
 | 卡片（= 文件） | 能力 | 关键动作 |
 |---|---|---|
 | `loco` | 基础运动 | `move`（三维速度）/ `stop_move` / `balance_stand` / `stand_up` / `stand_down` / `damp` / `recovery_stand` |
+| `person_follow` | 前向相机低速跟随 | `follow(confirm=true)` / `stop` / `info`；锁定画面估计最近的人或鞋，目标不明确时停车 |
 | `body_pose` | 机身姿态与高度 | `set_attitude`（roll/pitch/yaw）/ `set_body_height` / `set_foot_raise_height` / `reset` |
 | `switch_gait` | 步态切换 | `idle` / `trot` / `trot_run` / `climb_stair` / `trot_obstacle`（高风险步态须 `confirm=true`） |
 | `special_motion` | 特殊动作 | `jump_yaw_left` / `straight_hand`（同步阻塞执行，须 `confirm=true`） |
@@ -47,6 +48,25 @@
 | `speaker` | 头部扬声器播放 | Nano `speaker_adapter.py`（:18083 /v1/speaker/actions）→ 播放远端音频流 |
 | `face_light` | 面部灯带颜色 | `set_color` / `preset` / `off` + 逐灯接口和内部定时灯效 |
 | `system_health` | 整体健康检查 | `robot_info`：CPU/内存/磁盘/电池/MQTT 体检 |
+
+`person_follow` 是待真机标定的原型。它需要将 **416×416、原始 YOLOX 输出、类别顺序为
+`person, shoe`** 的两类 ONNX 权重放在
+`/opt/phanthy-motus/data/person_follow/person_shoe_yolox_nano.onnx`；仓库不附带权重。
+默认配置关闭此卡；只有完成现场相机、推理延迟、停车距离和障碍物监督验证后，才在部署配置中显式启用。
+缺少权重时，`follow` 返回 `MODEL_UNAVAILABLE`，不会发运动命令。
+跟随独占 `front` RGB 相机，`start` 只准备卡片，只有 `follow(confirm=true)` 才可能运动。
+`follow` 只启动持续控制状态，使用 `stop` 结束、`info` 查询终态；它不声明 ACP `x-completion`，
+因为未结束的异步屏障会拦住普通运动卡的停车指令。其他运动卡接管时先取消跟随，旧线程不能再下发运动。
+锁定后用位置连续性和目标框的低分辨率颜色摘要排除明显不同的人；交叉、遮挡或外观相近导致无法确认时停车并结束本次锁定，不自动选择旁人。
+鞋和小腿同框可作为近距离锁定画面。目标脚点的纵坐标小于画面高度的 0.58（远处），
+或不小于 0.68（近处）时不发运动命令；这只是画面距离估计，不提供米制距离或障碍物避让。
+推理超过 400 ms、失帧、目标混淆或 SDK 反馈失效时停车。运动前要求 400 ms 内成功解析的
+HighState；发令 500 ms 后若步行模式、前向速度或里程位置没有对应变化，也会停车。
+SDK 不提供此动作的硬件确认号，这些反馈检查不能替代现场障碍物监护。上线前须用实拍画面和真机验证
+识别、耗时及安全距离。
+镜像为此增加 Pillow JPEG 解码和 CPU 版 ONNX Runtime；后者的 Python 3.10 ARM64 wheel
+约 5.9 MB，并要求 NumPy ≥1.21.6，因此会升级基础镜像的 1.21.5。实际镜像增量及板载耗时
+仍需在目标设备测量。
 
 ### 资源卡（resource）
 

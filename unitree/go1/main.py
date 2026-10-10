@@ -201,6 +201,16 @@ class Go1Bundle:
                 capture_config, namespace, executor, client))
             print("[bundle] vision_capture loaded")
 
+        if pc.get("person_follow", {}).get("enabled", False):
+            import person_follow
+            # 中文说明：跟随与 RGB 推流共用前向机位配置，实际运动只由 follow 动作启动。
+            follow_config = dict(pc["person_follow"])
+            follow_config["positions"] = pc.get("camera_rgb", {}).get("positions", {})
+            self._follow_plugin = person_follow.make_person_follow(
+                follow_config, namespace, executor, client)
+            self._plugins.append(self._follow_plugin)
+            print("[bundle] person_follow loaded")
+
         if pc.get("camera_depth", {}).get("enabled", False):
             import camera
             self._plugins.append(camera.make_camera_depth(pc["camera_depth"], namespace, executor, client))
@@ -249,6 +259,20 @@ class Go1Bundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args["_tool_name"] = tool_name
+                    # 中文说明：其他运动卡接管前撤销跟随，普通 loco.stop 不能被下一帧覆盖。
+                    if (tool_name in ("loco", "body_pose", "switch_gait", "gesture", "special_motion")
+                            and action not in ("start", "info") and hasattr(self, "_follow_plugin")):
+                        self._follow_plugin.preempt()
+                    # 中文说明：反向交接——follow 启动前先取消其他卡仍在后台写的运动线程
+                    # （如 loco 定时 move），否则两个线程会交替覆盖同一 SDK 运动目标。
+                    # 特殊动作等不可让路的序列运行时则拒绝 follow，等它自行完成。
+                    if tool_name == "person_follow" and action == "follow":
+                        for other in self._plugins:
+                            if other is not p and hasattr(other, "preempt_motion"):
+                                if not other.preempt_motion():
+                                    return {"ok": False, "code": "RESOURCE_BUSY",
+                                            "message": "%s is running; follow refused until it finishes"
+                                                       % other.get_tool()["name"]}
                     return p.dispatch(action, args)
         return None
 
