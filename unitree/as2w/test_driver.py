@@ -731,8 +731,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("error", state)
         self.assertEqual("error", plugin._node.state)
         self.assertEqual(
-            "收到静音数据。请同时按下 L1+L2，将语音状态切换为唤醒模式，"
-            "然后重新开启智能控制。",
+            "收到静音数据，请稍等后重新开启智能控制；"
+            "若仍为静音，请同时按下 L1+L2 切换为唤醒模式后再试。",
             message,
         )
 
@@ -757,9 +757,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("error", state)
         self.assertEqual("error", plugin._node.state)
         self.assertEqual(
-            "未收到麦克风组播数据。请同时按下 L1+L2，"
-            "将语音状态切换为唤醒模式，"
-            "然后重新开启智能控制。",
+            "暂未收到麦克风数据，请稍等后重新开启智能控制；"
+            "若仍无数据，请同时按下 L1+L2 切换为唤醒模式后再试。",
             message,
         )
 
@@ -871,7 +870,7 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("unitree_sdk2py.go2.video.video_client", source)
         self.assertNotIn("unitree_sdk2py.b2.front_video.front_video_client", source)
 
-    def test_camera_worker_publishes_only_valid_jpeg(self):
+    def test_camera_capture_writes_valid_jpeg_to_shared_latest_frame(self):
         channel = sys.modules["unitree_sdk2py.core.channel"]
         channel.ChannelFactoryInitialize = lambda *_: None
         video_pkg = types.ModuleType("unitree_sdk2py.go2.video")
@@ -885,31 +884,46 @@ class TestDriverContracts(unittest.TestCase):
         video_client.VideoClient = FakeVideoClient
         sys.modules["unitree_sdk2py.go2.video"] = video_pkg
         sys.modules["unitree_sdk2py.go2.video.video_client"] = video_client
-        frames, statuses = __import__("queue").Queue(2), __import__("queue").Queue(4)
-        stopped = __import__("threading").Event()
+        multiprocessing = __import__("multiprocessing")
+        context = multiprocessing.get_context("spawn")
+        max_frame_bytes = 1024
+        shared_frames = context.RawArray("B", max_frame_bytes * 2)
+        frame_lock = context.Lock()
+        sequence = context.Value("Q", 0)
+        active_slot = context.Value("i", 0)
+        slot_lengths = context.Array("Q", [0, 0])
+        frame_event = context.Event()
+        stopped = context.Event()
+        statuses = context.Queue(4)
+        metrics = {
+            name: context.Value("d", 0.0)
+            for name in (
+                "capture_frames", "captured_bytes", "rpc_total_ms",
+                "rpc_max_ms", "convert_total_ms", "convert_max_ms",
+            )
+        }
         thread = __import__("threading").Thread(
-            target=self.multimedia._camera_worker,
-            args=(frames, statuses, stopped, "eth0", 10, 1, .1), daemon=True)
+            target=self.multimedia._camera_capture_process,
+            args=(
+                shared_frames, max_frame_bytes, frame_lock, sequence,
+                active_slot, slot_lengths, frame_event, stopped, statuses,
+                metrics, "eth0", 10, 1, .1,
+            ),
+            daemon=True,
+        )
         thread.start()
-        self.assertEqual(b"\xff\xd8frame\xff\xd9", frames.get(timeout=1))
+        self.assertTrue(frame_event.wait(1))
+        _sequence, frame = self.multimedia._shared_camera_read(
+            shared_frames, max_frame_bytes, frame_lock, sequence,
+            active_slot, slot_lengths,
+        )
+        self.assertEqual(b"\xff\xd8frame\xff\xd9", frame)
+        self.assertGreaterEqual(metrics["capture_frames"].value, 1)
         stopped.set()
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
 
-    def test_camera_process_builds_and_publishes_frames_locally(self):
-        channel = sys.modules["unitree_sdk2py.core.channel"]
-        channel.ChannelFactoryInitialize = lambda *_: None
-        video_pkg = types.ModuleType("unitree_sdk2py.go2.video")
-        video_client = types.ModuleType("unitree_sdk2py.go2.video.video_client")
-
-        class FakeVideoClient:
-            def SetTimeout(self, _timeout): pass
-            def Init(self): pass
-            def GetImageSample(self): return 0, list(b"\xff\xd8frame\xff\xd9")
-
-        video_client.VideoClient = FakeVideoClient
-        sys.modules["unitree_sdk2py.go2.video"] = video_pkg
-        sys.modules["unitree_sdk2py.go2.video.video_client"] = video_client
+    def test_camera_publish_process_builds_and_publishes_shared_frame(self):
         published = []
 
         class FakeMessage:
@@ -921,43 +935,96 @@ class TestDriverContracts(unittest.TestCase):
         class FakeNode:
             def __init__(self, _name): pass
             def create_publisher(self, *_args):
-                return types.SimpleNamespace(publish=published.append)
+                def publish(message):
+                    published.append(message)
+                    stopped.set()
+                return types.SimpleNamespace(publish=publish)
             def get_clock(self):
                 stamp = types.SimpleNamespace(to_msg=lambda: "stamp")
                 return types.SimpleNamespace(now=lambda: stamp)
             def destroy_node(self): pass
 
-        q = __import__("queue")
-        control, results = q.Queue(), q.Queue()
+        multiprocessing = __import__("multiprocessing")
+        context = multiprocessing.get_context("spawn")
+        max_frame_bytes = 1024
+        shared_frames = context.RawArray("B", max_frame_bytes * 2)
+        frame_lock = context.Lock()
+        sequence = context.Value("Q", 0)
+        active_slot = context.Value("i", 0)
+        slot_lengths = context.Array("Q", [0, 0])
+        frame_event = context.Event()
+        stopped = context.Event()
+        statuses = context.Queue(4)
+        metrics = {
+            name: context.Value("d", 0.0)
+            for name in (
+                "frames", "queue_drops", "last_frame_ts",
+                "build_total_ms", "build_max_ms", "publish_total_ms",
+                "publish_max_ms",
+            )
+        }
+        self.multimedia._shared_camera_write(
+            shared_frames, max_frame_bytes, frame_lock, sequence,
+            active_slot, slot_lengths, b"\xff\xd8frame\xff\xd9",
+        )
+        frame_event.set()
         rclpy = sys.modules["rclpy"]
         with patch.object(self.multimedia, "Node", FakeNode), \
                 patch.object(self.multimedia, "CompressedImage", FakeMessage), \
                 patch.object(rclpy, "init", create=True), \
                 patch.object(rclpy, "shutdown", create=True):
             thread = __import__("threading").Thread(
-                target=self.multimedia._camera_process,
-                args=(control, results, "/test/camera", "eth0", 10, 1, .1),
+                target=self.multimedia._camera_publish_process,
+                args=(
+                    shared_frames, max_frame_bytes, frame_lock, sequence,
+                    active_slot, slot_lengths, frame_event, stopped, statuses,
+                    metrics, "/test/camera",
+                ),
                 daemon=True,
             )
             thread.start()
-            self.assertTrue(results.get(timeout=1)["ok"])
-            control.put(("start", "start", None))
-            self.assertTrue(results.get(timeout=1)["ok"])
-            status = None
-            for _ in range(100):
-                control.put(("status", "status", None))
-                status = results.get(timeout=1)
-                if status["frames"]:
-                    break
-                __import__("time").sleep(.01)
-            self.assertGreaterEqual(status["frames"], 1)
-            self.assertEqual("running", status["state"])
-            self.assertEqual("jpeg", published[0].format)
-            self.assertEqual(b"\xff\xd8frame\xff\xd9", bytes(published[0].data))
-            control.put(("close", "close", None))
-            self.assertTrue(results.get(timeout=1)["ok"])
             thread.join(timeout=1)
             self.assertFalse(thread.is_alive())
+            self.assertEqual(1, int(metrics["frames"].value))
+            self.assertEqual("jpeg", published[0].format)
+            self.assertEqual(b"\xff\xd8frame\xff\xd9", bytes(published[0].data))
+
+    def test_camera_shared_buffer_rejects_oversized_jpeg(self):
+        multiprocessing = __import__("multiprocessing")
+        context = multiprocessing.get_context("spawn")
+        shared_frames = context.RawArray("B", 16)
+        with self.assertRaisesRegex(RuntimeError, "max_frame_bytes"):
+            self.multimedia._shared_camera_write(
+                shared_frames, 8, context.Lock(), context.Value("Q", 0),
+                context.Value("i", 0), context.Array("Q", [0, 0]),
+                b"123456789",
+            )
+
+    def test_camera_shared_buffer_exposes_only_newest_frame(self):
+        multiprocessing = __import__("multiprocessing")
+        context = multiprocessing.get_context("spawn")
+        max_frame_bytes = 32
+        shared_frames = context.RawArray("B", max_frame_bytes * 2)
+        frame_lock = context.Lock()
+        sequence = context.Value("Q", 0)
+        active_slot = context.Value("i", 0)
+        slot_lengths = context.Array("Q", [0, 0])
+
+        self.multimedia._shared_camera_write(
+            shared_frames, max_frame_bytes, frame_lock, sequence,
+            active_slot, slot_lengths, b"old",
+        )
+        self.multimedia._shared_camera_write(
+            shared_frames, max_frame_bytes, frame_lock, sequence,
+            active_slot, slot_lengths, b"newest",
+        )
+        current_sequence, frame = self.multimedia._shared_camera_read(
+            shared_frames, max_frame_bytes, frame_lock, sequence,
+            active_slot, slot_lengths,
+        )
+
+        self.assertEqual(2, current_sequence)
+        self.assertEqual(b"newest", frame)
 
     def test_speaker_worker_uses_a2_voice_service(self):
         channel = sys.modules["unitree_sdk2py.core.channel"]
@@ -1194,14 +1261,20 @@ class TestDriverContracts(unittest.TestCase):
 
         speaker_process = inspect.getsource(self.multimedia._speaker_process)
         speaker_backend = inspect.getsource(self.multimedia._SpeakerBackend)
-        camera_process = inspect.getsource(self.multimedia._camera_process)
+        camera_capture = inspect.getsource(self.multimedia._camera_capture_process)
+        camera_publish = inspect.getsource(self.multimedia._camera_publish_process)
+        camera_backend = inspect.getsource(self.multimedia._CameraBackend)
 
         self.assertIn("create_subscription", speaker_process)
         self.assertIn("_put_speaker_pcm", speaker_process)
         self.assertNotIn("self._pcm", speaker_backend)
-        self.assertIn("queue.Queue(maxsize=1)", camera_process)
-        self.assertIn('array("B", frame)', camera_process)
-        self.assertIn("publisher.publish(message)", camera_process)
+        self.assertIn("GetImageSample", camera_capture)
+        self.assertNotIn("create_publisher", camera_capture)
+        self.assertIn('array("B", frame)', camera_publish)
+        self.assertIn("publisher.publish(message)", camera_publish)
+        self.assertIn('RawArray("B", max_frame_bytes * 2)', camera_backend)
+        self.assertIn("as2w_camera_capture", camera_backend)
+        self.assertIn("as2w_camera_publish", camera_backend)
 
     def test_camera_plugin_does_not_register_with_main_executor(self):
         added = []
@@ -1213,7 +1286,7 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual([], added)
         self.assertEqual("/test/camera/front", plugin._topic)
 
-    def test_mic_waiting_state_explains_voice_assistant_precondition(self):
+    def test_mic_waiting_state_explains_retry_and_wakeup_mode(self):
         node = self.multimedia._MicNode.__new__(self.multimedia._MicNode)
         node.state = "waiting"
         node._started_at = self.multimedia.time.monotonic() - 10
@@ -1223,7 +1296,11 @@ class TestDriverContracts(unittest.TestCase):
         node.last_packet_ts = 0
         result = node.status()
         self.assertEqual("waiting", result["state"])
-        self.assertIn("voice assistant", result["message"])
+        self.assertEqual(
+            "暂未收到麦克风数据，请稍等后重新开启智能控制；"
+            "若仍无数据，请同时按下 L1+L2 切换为唤醒模式后再试。",
+            result["message"],
+        )
 
     def test_navigation_declares_completion(self):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)

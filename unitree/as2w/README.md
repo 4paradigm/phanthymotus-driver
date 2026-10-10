@@ -96,16 +96,21 @@ markers produced by split TTS text preserve the current playback timeline. Its
 `info` response reports first-input-to-play latency, recovery wait, input gaps,
 queue drops, partial flushes, underflows, `PlayStream` failures, and RPC latency.
 
-Camera capture and ROS publication likewise run together in a spawned process.
-JPEG frames stay in a one-frame, latest-only thread queue and are assigned to
-`CompressedImage.data` through a buffer-compatible byte array, avoiding both a
-roughly 300 KB multiprocessing copy and slow per-byte ROS conversion. Camera
+Camera capture and ROS publication run in two spawned processes, following the
+same isolation principle as Q5's capture/bridge split. A fixed double-buffer in
+shared memory connects them, so only the newest JPEG is retained and the
+roughly 300 KB frames are not pickled through a multiprocessing queue. The ROS
+publisher assigns `CompressedImage.data` through a buffer-compatible byte array,
+avoiding slow per-byte conversion. A busy FastDDS publisher therefore cannot
+hold the videohub client's Python GIL, while a slow publisher drops stale frame
+sequences instead of increasing end-to-end latency. Camera
 `info` reports separate capture/publish rates, videohub RPC time, message-build
-and publish-call time, average frame size, and dropped stale frames. Like G1
+and publish-call time, average frame size, dropped stale frames, and both child
+process states/PIDs. Like G1
 `camera_rgb`, it is an always-on state source: canvas lifecycle `stop` detaches
-intelligent control but does not stop publication. The spawned process is
-physically closed only when the driver bundle shuts down; repeated canvas
-starts reuse the live stream without resetting frame counters.
+intelligent control but does not stop publication. The child processes are
+physically closed only when the driver bundle shuts down; repeated canvas starts
+reuse the live stream without resetting frame counters.
 The component vendors the three-field `audio_msgs/AudioChunk` interface used by
 the perception audio bus and builds it in a dedicated Docker stage. The runtime
 image receives only the generated `/as2w_ws/install` overlay and validates an

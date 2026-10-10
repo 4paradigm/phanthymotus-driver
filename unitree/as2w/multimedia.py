@@ -38,9 +38,13 @@ _IMAGE_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
-_MIC_WAKEUP_INSTRUCTION = (
-    "请同时按下 L1+L2，将语音状态切换为唤醒模式，"
-    "然后重新开启智能控制。"
+_MIC_NO_DATA_MESSAGE = (
+    "暂未收到麦克风数据，请稍等后重新开启智能控制；"
+    "若仍无数据，请同时按下 L1+L2 切换为唤醒模式后再试。"
+)
+_MIC_SILENT_MESSAGE = (
+    "收到静音数据，请稍等后重新开启智能控制；"
+    "若仍为静音，请同时按下 L1+L2 切换为唤醒模式后再试。"
 )
 
 
@@ -179,10 +183,7 @@ class _MicNode(Node):
                 "streams would corrupt downstream ASR."
             )
         elif self.state == "waiting" and now - self._started_at >= self.startup_grace_s:
-            message = (
-                "No microphone multicast packets received; enable the Unitree "
-                "voice assistant / wake-up conversation mode."
-            )
+            message = _MIC_NO_DATA_MESSAGE
         else:
             message = self.last_error
         return {
@@ -238,9 +239,7 @@ class MicPlugin:
                 time.sleep(0.1)
         if self._node.packet_count == 0:
             self._node.state = "error"
-            self._node.last_error = (
-                "未收到麦克风组播数据。" + _MIC_WAKEUP_INSTRUCTION
-            )
+            self._node.last_error = _MIC_NO_DATA_MESSAGE
             return "error", self._node.last_error
 
         # The robot can keep sending flat PCM while voice wake-up mode is off.
@@ -255,9 +254,7 @@ class MicPlugin:
 
         if self._node.varying_chunk_count == varying_before:
             self._node.state = "error"
-            self._node.last_error = (
-                "收到静音数据。" + _MIC_WAKEUP_INSTRUCTION
-            )
+            self._node.last_error = _MIC_SILENT_MESSAGE
             return "error", self._node.last_error
 
         self._node.state = "running"
@@ -1056,10 +1053,59 @@ def _put_latest(target_queue, item):
     return True
 
 
-def _camera_worker(
-        frame_queue, status_queue, stop_event, interface, fps, timeout_s,
-        retry_s, metrics=None, metrics_lock=None):
+def _metric_add(metric, value):
+    with metric.get_lock():
+        metric.value += value
+
+
+def _metric_max(metric, value):
+    with metric.get_lock():
+        metric.value = max(metric.value, value)
+
+
+def _shared_camera_write(
+        shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
+        slot_lengths, frame):
+    """Atomically replace the inactive slot and expose it as the newest JPEG."""
+    frame_size = len(frame)
+    if frame_size > max_frame_bytes:
+        raise RuntimeError(
+            "camera JPEG is {} bytes; max_frame_bytes is {}".format(
+                frame_size, max_frame_bytes))
+    with frame_lock:
+        slot = 1 - active_slot.value
+        start = slot * max_frame_bytes
+        memoryview(shared_frames).cast("B")[start:start + frame_size] = frame
+        slot_lengths[slot] = frame_size
+        active_slot.value = slot
+        sequence.value += 1
+        return sequence.value
+
+
+def _shared_camera_read(
+        shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
+        slot_lengths):
+    """Copy one coherent snapshot of the latest slot for ROS publication."""
+    with frame_lock:
+        current_sequence = sequence.value
+        slot = active_slot.value
+        frame_size = slot_lengths[slot]
+        start = slot * max_frame_bytes
+        frame = bytes(
+            memoryview(shared_frames).cast("B")[start:start + frame_size])
+    return current_sequence, frame
+
+
+def _camera_capture_process(
+        shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
+        slot_lengths, frame_event, stop_event, event_queue, metrics,
+        interface, fps, timeout_s, retry_s):
+    """Fetch videohub JPEGs without sharing a GIL with ROS serialization."""
     _install_logsafe()
+
+    def report(state, error=""):
+        _put_latest(event_queue, ("capture", state, error))
+
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         from unitree_sdk2py.go2.video.video_client import VideoClient
@@ -1067,14 +1113,15 @@ def _camera_worker(
         client = VideoClient()
         client.SetTimeout(timeout_s)
         client.Init()
-        _put_latest(status_queue, ("ready", ""))
+        report("ready")
     except Exception as exc:
-        _put_latest(status_queue, ("error", str(exc)))
+        report("error", str(exc))
         return
 
     period = 1.0 / max(1.0, fps)
     deadline = time.monotonic()
     failures = 0
+    reported_state = "ready"
     while not stop_event.is_set():
         try:
             rpc_started = time.monotonic()
@@ -1087,27 +1134,30 @@ def _camera_worker(
                 raise RuntimeError("videohub returned {}".format(code))
             if not (frame.startswith(b"\xff\xd8") and frame.endswith(b"\xff\xd9")):
                 raise RuntimeError("videohub returned an invalid JPEG")
+
+            _shared_camera_write(
+                shared_frames, max_frame_bytes, frame_lock, sequence,
+                active_slot, slot_lengths, frame)
+            frame_event.set()
             failures = 0
-            if metrics is not None and metrics_lock is not None:
-                with metrics_lock:
-                    metrics["capture_frames"] += 1
-                    metrics["captured_bytes"] += len(frame)
-                    metrics["rpc_total_ms"] += rpc_ms
-                    metrics["rpc_max_ms"] = max(metrics["rpc_max_ms"], rpc_ms)
-                    metrics["convert_total_ms"] += convert_ms
-                    metrics["convert_max_ms"] = max(
-                        metrics["convert_max_ms"], convert_ms)
-            dropped = _put_latest(frame_queue, frame)
-            if dropped and metrics is not None and metrics_lock is not None:
-                with metrics_lock:
-                    metrics["queue_drops"] += 1
-            _put_latest(status_queue, ("running", ""))
+            _metric_add(metrics["capture_frames"], 1)
+            _metric_add(metrics["captured_bytes"], len(frame))
+            _metric_add(metrics["rpc_total_ms"], rpc_ms)
+            _metric_max(metrics["rpc_max_ms"], rpc_ms)
+            _metric_add(metrics["convert_total_ms"], convert_ms)
+            _metric_max(metrics["convert_max_ms"], convert_ms)
+            if reported_state != "running":
+                report("running")
+                reported_state = "running"
         except Exception as exc:
             failures += 1
-            _put_latest(status_queue, ("reconnecting", str(exc)))
+            if reported_state != "reconnecting":
+                report("reconnecting", str(exc))
+                reported_state = "reconnecting"
             if failures >= 3:
                 stop_event.wait(retry_s)
                 failures = 0
+
         deadline += period
         wait = deadline - time.monotonic()
         if wait > 0:
@@ -1116,215 +1166,71 @@ def _camera_worker(
             deadline = time.monotonic()
 
 
-def _camera_process(
-        control_queue, result_queue, topic, interface, fps, timeout_s, retry_s):
-    """Own videohub capture and ROS publication in one child process."""
+def _camera_publish_process(
+        shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
+        slot_lengths, frame_event, stop_event, event_queue, metrics, topic):
+    """Publish the newest shared JPEG from a dedicated FastDDS process."""
     _install_logsafe()
     node = None
-    publisher = None
     rclpy_started = False
-    capture_thread = None
-    publish_thread = None
-    capture_stop = None
-    frame_queue = None
-    status_queue = None
-    metrics_lock = threading.Lock()
-    metrics = {
-        "state": "idle",
-        "frames": 0,
-        "capture_frames": 0,
-        "captured_bytes": 0,
-        "queue_drops": 0,
-        "last_frame_ts": 0.0,
-        "last_error": "",
-        "capture_started_ts": 0.0,
-        "publish_started_ts": 0.0,
-        "rpc_total_ms": 0.0,
-        "rpc_max_ms": 0.0,
-        "convert_total_ms": 0.0,
-        "convert_max_ms": 0.0,
-        "build_total_ms": 0.0,
-        "build_max_ms": 0.0,
-        "publish_total_ms": 0.0,
-        "publish_max_ms": 0.0,
-    }
 
-    def respond(request_id, **payload):
-        payload["id"] = request_id
-        result_queue.put(payload)
-
-    def camera_status():
-        with metrics_lock:
-            now = time.monotonic()
-            captures = metrics["capture_frames"]
-            published = metrics["frames"]
-            capture_elapsed = (
-                now - metrics["capture_started_ts"]
-                if metrics["capture_started_ts"] else 0.0)
-            publish_elapsed = (
-                now - metrics["publish_started_ts"]
-                if metrics["publish_started_ts"] else 0.0)
-            return {
-                "ok": metrics["state"] != "error",
-                "state": metrics["state"],
-                "frames": published,
-                "capture_frames": captures,
-                "capture_fps": captures / capture_elapsed if capture_elapsed else 0.0,
-                "publish_fps": published / publish_elapsed if publish_elapsed else 0.0,
-                "last_frame_ago_ms": (
-                    int((now - metrics["last_frame_ts"]) * 1000)
-                    if metrics["last_frame_ts"] else -1),
-                "last_error": metrics["last_error"],
-                "queue_drops": metrics["queue_drops"],
-                "frame_bytes_avg": (
-                    metrics["captured_bytes"] / captures if captures else 0.0),
-                "rpc_avg_ms": (
-                    metrics["rpc_total_ms"] / captures if captures else 0.0),
-                "rpc_max_ms": metrics["rpc_max_ms"],
-                "bytes_convert_avg_ms": (
-                    metrics["convert_total_ms"] / captures if captures else 0.0),
-                "bytes_convert_max_ms": metrics["convert_max_ms"],
-                "message_build_avg_ms": (
-                    metrics["build_total_ms"] / published if published else 0.0),
-                "message_build_max_ms": metrics["build_max_ms"],
-                "publish_call_avg_ms": (
-                    metrics["publish_total_ms"] / published if published else 0.0),
-                "publish_call_max_ms": metrics["publish_max_ms"],
-            }
-
-    def publish_loop():
-        while capture_stop is not None and not capture_stop.is_set():
-            try:
-                while True:
-                    camera_state, error = status_queue.get_nowait()
-                    with metrics_lock:
-                        if camera_state == "error":
-                            metrics["state"] = "error"
-                        elif camera_state == "reconnecting":
-                            metrics["state"] = "reconnecting"
-                        elif metrics["frames"] == 0:
-                            metrics["state"] = "starting"
-                        metrics["last_error"] = error
-            except queue.Empty:
-                pass
-            try:
-                frame = frame_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            # If publication falls behind, publish the newest frame instead of
-            # increasing end-to-end latency with stale queued images.
-            while True:
-                try:
-                    frame = frame_queue.get_nowait()
-                    with metrics_lock:
-                        metrics["queue_drops"] += 1
-                except queue.Empty:
-                    break
-
-            build_started = time.monotonic()
-            message = CompressedImage()
-            message.header.stamp = node.get_clock().now().to_msg()
-            message.format = "jpeg"
-            # rosidl's bytes-to-uint8[] path converts element by element.  The
-            # buffer-compatible array assignment is about three orders faster
-            # for the approximately 300 KB frames returned by videohub.
-            message.data = array("B", frame)
-            build_ms = (time.monotonic() - build_started) * 1000.0
-            publish_started = time.monotonic()
-            publisher.publish(message)
-            publish_ms = (time.monotonic() - publish_started) * 1000.0
-            finished_at = time.monotonic()
-            with metrics_lock:
-                metrics["frames"] += 1
-                if not metrics["publish_started_ts"]:
-                    metrics["publish_started_ts"] = finished_at
-                metrics["last_frame_ts"] = finished_at
-                metrics["state"] = "running"
-                metrics["last_error"] = ""
-                metrics["build_total_ms"] += build_ms
-                metrics["build_max_ms"] = max(metrics["build_max_ms"], build_ms)
-                metrics["publish_total_ms"] += publish_ms
-                metrics["publish_max_ms"] = max(
-                    metrics["publish_max_ms"], publish_ms)
-
-    def stop_threads():
-        nonlocal capture_thread, publish_thread, capture_stop
-        if capture_stop is not None:
-            capture_stop.set()
-        for worker in (capture_thread, publish_thread):
-            if worker is not None and worker.is_alive():
-                worker.join(timeout=max(3.0, timeout_s + 1.0))
-        capture_thread = None
-        publish_thread = None
-        capture_stop = None
-        with metrics_lock:
-            metrics["state"] = "idle"
+    def report(state, error=""):
+        _put_latest(event_queue, ("publish", state, error))
 
     try:
         import rclpy
-
         rclpy.init(args=None)
         rclpy_started = True
         node = Node("as2w_camera")
         publisher = node.create_publisher(CompressedImage, topic, _IMAGE_QOS)
-        result_queue.put({"id": "ready", "ok": True})
-        running = True
-        while running:
-            try:
-                request_id, operation, _value = control_queue.get(timeout=0.1)
-            except queue.Empty:
+        report("ready")
+        last_sequence = 0
+        publish_healthy = False
+
+        while not stop_event.is_set():
+            if not frame_event.wait(0.1):
                 continue
+            frame_event.clear()
+            current_sequence, frame = _shared_camera_read(
+                shared_frames, max_frame_bytes, frame_lock, sequence,
+                active_slot, slot_lengths)
+            if not frame or current_sequence == last_sequence:
+                continue
+            _metric_add(
+                metrics["queue_drops"],
+                max(0, current_sequence - last_sequence - 1),
+            )
+            last_sequence = current_sequence
+
             try:
-                if operation == "start":
-                    stop_threads()
-                    frame_queue = queue.Queue(maxsize=1)
-                    status_queue = queue.Queue(maxsize=4)
-                    capture_stop = threading.Event()
-                    with metrics_lock:
-                        for key in metrics:
-                            metrics[key] = "" if key == "last_error" else 0.0
-                        metrics["state"] = "starting"
-                        metrics["frames"] = 0
-                        metrics["capture_frames"] = 0
-                        metrics["queue_drops"] = 0
-                        metrics["capture_started_ts"] = time.monotonic()
-                        metrics["publish_started_ts"] = metrics["capture_started_ts"]
-                    publish_thread = threading.Thread(
-                        target=publish_loop,
-                        name="as2w-camera-publish",
-                        daemon=True,
-                    )
-                    capture_thread = threading.Thread(
-                        target=_camera_worker,
-                        args=(frame_queue, status_queue, capture_stop, interface,
-                              fps, timeout_s, retry_s, metrics, metrics_lock),
-                        name="as2w-camera-capture",
-                        daemon=True,
-                    )
-                    publish_thread.start()
-                    capture_thread.start()
-                    respond(request_id, ok=True, state="starting")
-                elif operation == "stop":
-                    stop_threads()
-                    respond(request_id, **camera_status())
-                elif operation == "status":
-                    respond(request_id, **camera_status())
-                elif operation == "close":
-                    stop_threads()
-                    respond(request_id, ok=True, state="idle")
-                    running = False
-                else:
-                    respond(request_id, ok=False, error="unsupported operation")
+                build_started = time.monotonic()
+                message = CompressedImage()
+                message.header.stamp = node.get_clock().now().to_msg()
+                message.format = "jpeg"
+                # Buffer assignment avoids rosidl's slow per-byte conversion.
+                message.data = array("B", frame)
+                build_ms = (time.monotonic() - build_started) * 1000.0
+                publish_started = time.monotonic()
+                publisher.publish(message)
+                publish_ms = (time.monotonic() - publish_started) * 1000.0
+                finished_at = time.monotonic()
+                _metric_add(metrics["frames"], 1)
+                metrics["last_frame_ts"].value = finished_at
+                _metric_add(metrics["build_total_ms"], build_ms)
+                _metric_max(metrics["build_max_ms"], build_ms)
+                _metric_add(metrics["publish_total_ms"], publish_ms)
+                _metric_max(metrics["publish_max_ms"], publish_ms)
+                if not publish_healthy:
+                    report("running")
+                    publish_healthy = True
             except Exception as exc:
-                with metrics_lock:
-                    metrics["state"] = "error"
-                    metrics["last_error"] = str(exc)
-                respond(request_id, ok=False, error=str(exc))
+                # A single malformed frame or transient DDS failure must not
+                # permanently kill an always-on state stream.
+                report("frame_error", str(exc))
+                publish_healthy = False
     except Exception as exc:
-        result_queue.put({"id": "ready", "ok": False, "error": str(exc)})
+        report("error", str(exc))
     finally:
-        stop_threads()
         if node is not None:
             try:
                 node.destroy_node()
@@ -1338,68 +1244,214 @@ def _camera_process(
 
 
 class _CameraBackend:
-    def __init__(self, topic, interface, fps, timeout_s, retry_s):
+    def __init__(
+            self, topic, interface, fps, timeout_s, retry_s,
+            max_frame_bytes=4 * 1024 * 1024):
         context = multiprocessing.get_context("spawn")
-        self._control = context.Queue()
-        self._results = context.Queue()
-        self._lock = threading.Lock()
-        self._process = context.Process(
-            target=_camera_process,
-            args=(self._control, self._results, topic, interface, fps,
-                  timeout_s, retry_s),
-            name="as2w_camera",
+        self._max_frame_bytes = max_frame_bytes
+        self._shared_frames = context.RawArray("B", max_frame_bytes * 2)
+        self._frame_lock = context.Lock()
+        self._sequence = context.Value("Q", 0)
+        self._active_slot = context.Value("i", 0)
+        self._slot_lengths = context.Array("Q", [0, 0])
+        self._frame_event = context.Event()
+        self._stop_event = context.Event()
+        self._events = context.Queue(maxsize=16)
+        self._metrics = {
+            name: context.Value("d", 0.0)
+            for name in (
+                "frames", "capture_frames", "captured_bytes", "queue_drops",
+                "last_frame_ts", "rpc_total_ms", "rpc_max_ms",
+                "convert_total_ms", "convert_max_ms", "build_total_ms",
+                "build_max_ms", "publish_total_ms", "publish_max_ms",
+            )
+        }
+        now = time.monotonic()
+        self._capture_started_ts = now
+        self._publish_started_ts = now
+        self._capture_state = "starting"
+        self._publish_state = "starting"
+        self._capture_error = ""
+        self._publish_error = ""
+        self._event_lock = threading.Lock()
+        self._closed = False
+        common_args = (
+            self._shared_frames, max_frame_bytes, self._frame_lock,
+            self._sequence, self._active_slot, self._slot_lengths,
+            self._frame_event, self._stop_event, self._events, self._metrics,
+        )
+        self._capture_process = context.Process(
+            target=_camera_capture_process,
+            args=common_args + (interface, fps, timeout_s, retry_s),
+            name="as2w_camera_capture",
             daemon=True,
         )
-        self._process.start()
-        try:
-            ready = self._results.get(timeout=8.0)
-        except queue.Empty:
-            ready = {"ok": False, "error": "camera process startup timed out"}
-        self.error = "" if ready.get("ok") else ready.get("error", "camera unavailable")
+        self._publish_process = context.Process(
+            target=_camera_publish_process,
+            args=common_args + (topic,),
+            name="as2w_camera_publish",
+            daemon=True,
+        )
+        self._publish_process.start()
+        self._capture_process.start()
+
+        # Wait only for process initialization, never for the first frame.
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            self._drain_events(wait=0.05)
+            if self._publish_state in ("ready", "running", "error") and \
+                    self._capture_state in (
+                        "ready", "running", "reconnecting", "error"):
+                break
+            if not self._children_alive():
+                break
+        self.error = self._startup_error()
+
+    def _children_alive(self):
+        return (self._capture_process.is_alive()
+                and self._publish_process.is_alive())
+
+    def _drain_events(self, wait=0.0):
+        with self._event_lock:
+            first = True
+            while True:
+                try:
+                    source, state, error = self._events.get(
+                        timeout=wait if first and wait else 0)
+                except queue.Empty:
+                    return
+                first = False
+                if source == "capture":
+                    self._capture_state = state
+                    self._capture_error = error
+                else:
+                    if state == "frame_error":
+                        self._publish_error = error
+                    else:
+                        self._publish_state = state
+                        self._publish_error = error
+
+    def _startup_error(self):
+        if self._capture_state == "error":
+            return self._capture_error or "camera capture process failed"
+        if self._publish_state == "error":
+            return self._publish_error or "camera publish process failed"
+        if not self._publish_process.is_alive():
+            return "camera publish process is not running"
+        if not self._capture_process.is_alive():
+            return "camera capture process is not running"
+        if self._publish_state == "starting":
+            return "camera publish process startup timed out"
+        if self._capture_state == "starting":
+            return "camera capture process startup timed out"
+        return ""
 
     def is_available(self):
-        return not self.error and self._process.is_alive()
+        self._drain_events()
+        return not self._closed and not self.error and self._children_alive()
 
     def call(self, operation, timeout=6.0):
-        if self.error:
-            return {"ok": False, "state": "error", "error": self.error}
-        if not self._process.is_alive():
-            return {"ok": False, "state": "error", "error": "camera process is not running"}
-        with self._lock:
-            request_id = uuid4().hex
-            self._control.put((request_id, operation, None))
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                try:
-                    result = self._results.get(
-                        timeout=max(0.01, deadline - time.monotonic()))
-                except queue.Empty:
-                    break
-                if result.get("id") == request_id:
-                    return result
-            return {"ok": False, "state": "error", "error": "camera operation timed out"}
+        del timeout
+        if operation in ("start", "status"):
+            return self.status()
+        if operation in ("stop", "close"):
+            self.close()
+            return {"ok": True, "state": "idle"}
+        return {"ok": False, "state": "error", "error": "unsupported operation"}
 
     def status(self):
-        result = self.call("status", timeout=2.0)
-        result.pop("id", None)
-        return result
+        self._drain_events()
+        now = time.monotonic()
+        captures = int(self._metrics["capture_frames"].value)
+        published = int(self._metrics["frames"].value)
+        capture_alive = self._capture_process.is_alive()
+        publish_alive = self._publish_process.is_alive()
+        fatal_error = self.error
+        if not self._closed and not fatal_error:
+            if not capture_alive:
+                fatal_error = "camera capture process is not running"
+            elif not publish_alive:
+                fatal_error = "camera publish process is not running"
+
+        if self._closed:
+            state = "idle"
+        elif fatal_error or self._capture_state == "error" or \
+                self._publish_state == "error":
+            state = "error"
+        elif self._capture_state == "reconnecting":
+            state = "reconnecting"
+        elif published:
+            state = "running"
+        else:
+            state = "starting"
+        last_error = fatal_error or self._capture_error or self._publish_error
+        last_frame_ts = self._metrics["last_frame_ts"].value
+        return {
+            "ok": state != "error",
+            "state": state,
+            "frames": published,
+            "capture_frames": captures,
+            "capture_fps": (
+                captures / (now - self._capture_started_ts)
+                if captures else 0.0),
+            "publish_fps": (
+                published / (now - self._publish_started_ts)
+                if published else 0.0),
+            "last_frame_ago_ms": (
+                int((now - last_frame_ts) * 1000) if last_frame_ts else -1),
+            "last_error": last_error,
+            "queue_drops": int(self._metrics["queue_drops"].value),
+            "frame_bytes_avg": (
+                self._metrics["captured_bytes"].value / captures
+                if captures else 0.0),
+            "rpc_avg_ms": (
+                self._metrics["rpc_total_ms"].value / captures
+                if captures else 0.0),
+            "rpc_max_ms": self._metrics["rpc_max_ms"].value,
+            "bytes_convert_avg_ms": (
+                self._metrics["convert_total_ms"].value / captures
+                if captures else 0.0),
+            "bytes_convert_max_ms": self._metrics["convert_max_ms"].value,
+            "message_build_avg_ms": (
+                self._metrics["build_total_ms"].value / published
+                if published else 0.0),
+            "message_build_max_ms": self._metrics["build_max_ms"].value,
+            "publish_call_avg_ms": (
+                self._metrics["publish_total_ms"].value / published
+                if published else 0.0),
+            "publish_call_max_ms": self._metrics["publish_max_ms"].value,
+            "capture_process_alive": capture_alive,
+            "publish_process_alive": publish_alive,
+            "capture_process_state": self._capture_state,
+            "publish_process_state": self._publish_state,
+            "capture_pid": self._capture_process.pid,
+            "publish_pid": self._publish_process.pid,
+            "shared_frame_capacity_bytes": self._max_frame_bytes,
+        }
 
     def close(self):
-        if self._process.is_alive():
-            self.call("close", timeout=3.0)
-        self._process.join(timeout=3.0)
-        if self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=1.0)
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_event.set()
+        self._frame_event.set()
+        for process in (self._capture_process, self._publish_process):
+            process.join(timeout=3.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
 
 
 class _CameraNode:
-    def __init__(self, topic, interface, fps, timeout_s, retry_s):
+    def __init__(
+            self, topic, interface, fps, timeout_s, retry_s,
+            max_frame_bytes=4 * 1024 * 1024):
         self.topic = topic
         self.interface = interface
         self.fps = fps
         self.timeout_s = timeout_s
         self.retry_s = retry_s
+        self.max_frame_bytes = max_frame_bytes
         self.state = "idle"
         self.frames = 0
         self.last_error = ""
@@ -1413,12 +1465,13 @@ class _CameraNode:
         self.stop_capture()
         self._backend = _CameraBackend(
             self.topic, self.interface, self.fps, self.timeout_s, self.retry_s,
+            self.max_frame_bytes,
         )
         if self._backend.error:
             self.state = "error"
             self.last_error = self._backend.error
             return {"ok": False, "state": "error", "error": self.last_error}
-        result = self._backend.call("start")
+        result = self._backend.status()
         self.state = result.get("state", "starting") if result.get("ok") else "error"
         self.last_error = result.get("error", "")
         return result
@@ -1430,23 +1483,12 @@ class _CameraNode:
         self.state = "idle"
 
     def status(self):
-        if self._backend is not None and self._backend.is_available():
+        if self._backend is not None:
             result = self._backend.status()
             self.state = result.get("state", self.state)
             self.frames = result.get("frames", self.frames)
             self.last_error = result.get("last_error", result.get("error", ""))
             return result
-        if self._backend is not None:
-            self.state = "error"
-            self.last_error = (
-                self._backend.error or "camera process is not running")
-            return {
-                "ok": False,
-                "state": "error",
-                "frames": self.frames,
-                "last_frame_ago_ms": -1,
-                "last_error": self.last_error,
-            }
         return {
             "state": self.state,
             "frames": self.frames,
@@ -1469,6 +1511,11 @@ class CameraPlugin:
             max(1.0, min(20.0, float(config.get("fps", 10)))),
             max(0.2, float(config.get("rpc_timeout", 1.0))),
             max(0.2, float(config.get("retry_interval", 2.0))),
+            max(
+                512 * 1024,
+                min(16 * 1024 * 1024,
+                    int(config.get("max_frame_bytes", 4 * 1024 * 1024))),
+            ),
         )
 
     def get_tool(self):

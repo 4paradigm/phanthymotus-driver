@@ -21,6 +21,8 @@ plugins:
     enabled: true
     backend: videohub
     fps: 10
+    # Two latest-frame shared-memory slots; increase only if videohub JPEGs exceed 4 MiB.
+    max_frame_bytes: 4194304
     rpc_timeout: 1.0
     retry_interval: 2.0
   state: {enabled: true}
