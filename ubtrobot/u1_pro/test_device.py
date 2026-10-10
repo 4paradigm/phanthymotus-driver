@@ -366,6 +366,34 @@ class U1CardContractTests(unittest.TestCase):
             reader.stop()
             self.assertEqual(received, [(b"LEFT", {"width": 1}, 1234)])
 
+    def test_sdk_ring_reader_honors_aligned_slot_stride(self):
+        import device
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audio.stream"
+            payload_size = 8
+            max_frames = 2
+            header = struct.pack("<8Q", 2, max_frames, payload_size, 0, 0, 0, 0, 0)
+            first = (struct.pack("<4Q", 1, 1234, 4, 0) + b"PCM1"
+                     + bytes(payload_size - 4) + bytes(64 - 32 - payload_size))
+            second = (struct.pack("<4Q", 2, 5678, 4, 0) + b"RACE"
+                      + bytes(payload_size - 4) + bytes(64 - 32 - payload_size))
+            path.write_bytes(header + first + second)
+            received = []
+            ready = threading.Event()
+
+            def on_frame(payload, metadata, timestamp):
+                received.append((payload, metadata, timestamp))
+                ready.set()
+
+            reader = device.VideoSharedMemoryReader({
+                "path": str(path), "frame_payload_size": payload_size, "max_frames": max_frames,
+            }, lambda: {}, on_frame)
+            reader.start()
+            self.assertTrue(ready.wait(1.0))
+            reader.stop()
+            self.assertEqual(received, [(b"PCM1", {}, 1234)])
+
     def test_event_bridge_keeps_sdk_string_payloads(self):
         import device
 
@@ -500,7 +528,7 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
             self.assertEqual(len(nodes.robot.subscriptions), 2)
-            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 2)
+            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 1)
             self.assertEqual(initialized_domains[0][1], 2)
             self.assertIn("/sys/device/audio_in/raw",
                           [sub[1] for sub in nodes.audio_device.subscriptions])
@@ -991,6 +1019,27 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(publisher.messages[0].data, [1, 2, 3, 4])
         self.assertEqual(publisher.messages[0].header.stamp.sec, 1)
         self.assertEqual(publisher.messages[0].header.stamp.nanosec, 2)
+
+    def test_mic_sources_are_mutually_exclusive(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_source="sdk",
+            _mic_source_lock=threading.Lock(),
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+            _audio_header=lambda: types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
+        )
+        message = types.SimpleNamespace(data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE")
+        device.U1Nodes._mic_topic_callback(nodes, message)
+        self.assertEqual(publisher.messages, [])
+        device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02", {}, 1)
+        self.assertEqual(len(publisher.messages), 1)
 
     def test_expression_and_head_call_deployed_sdk_motion_service(self):
         import device

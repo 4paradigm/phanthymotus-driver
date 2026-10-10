@@ -198,10 +198,12 @@ class VideoSharedMemoryReader:
     _RING_HEADER = struct.Struct("<8Q")
     _HEADER = struct.Struct("<4Q")
 
-    def __init__(self, config: dict, metadata_getter, frame_callback):
+    def __init__(self, config: dict, metadata_getter, frame_callback, *, latest_only=True):
         self.config = dict(config)
         self.metadata_getter = metadata_getter
         self.frame_callback = frame_callback
+        self.latest_only = latest_only
+        self.skip_backlog = False
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread = None
@@ -235,7 +237,6 @@ class VideoSharedMemoryReader:
             self._error = "U1 shared-memory stream configuration is incomplete"
             self._ready.set()
             return
-        slot_size = self._HEADER.size + payload_size
         try:
             deadline = time.monotonic() + SERVICE_TIMEOUT
             handle = None
@@ -252,14 +253,25 @@ class VideoSharedMemoryReader:
                 raise FileNotFoundError(path)
             with handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as shared:
                 data_offset = self._RING_HEADER.size
-                if len(shared) < data_offset + slot_size * max_frames:
+                data_bytes = len(shared) - data_offset
+                if data_bytes < (self._HEADER.size + payload_size) * max_frames:
                     raise ValueError("shared-memory ring is smaller than the stream configuration")
                 ring = self._RING_HEADER.unpack_from(shared, 0)
                 if ring[1] != max_frames or ring[2] != payload_size:
                     raise ValueError("shared-memory ring header does not match stream configuration")
+                # U1 aligns each slot to a 64-byte boundary.  The metadata
+                # reports payload size only, so deriving the stride from the
+                # mapped file is required; using header + payload reads the
+                # first slot correctly and then walks into padding/data.
+                if data_bytes % max_frames:
+                    raise ValueError("shared-memory ring has an invalid slot stride")
+                slot_size = data_bytes // max_frames
+                if slot_size < self._HEADER.size + payload_size:
+                    raise ValueError("shared-memory ring slot is smaller than its payload")
                 self._ready.set()
+                read_latest = self.latest_only or self.skip_backlog
                 while not self._stop.is_set():
-                    newest = None
+                    selected = None
                     write_index, ring_frames, ring_payload = self._RING_HEADER.unpack_from(shared, 0)[:3]
                     if ring_frames != max_frames or ring_payload != payload_size:
                         raise ValueError("shared-memory ring header changed unexpectedly")
@@ -269,19 +281,25 @@ class VideoSharedMemoryReader:
                         if (sequence <= self._last_sequence or sequence >= write_index
                                 or not 0 < size <= payload_size):
                             continue
-                        if newest is None or sequence > newest[0]:
+                        if selected is None or (
+                                read_latest and sequence > selected[0]) or (
+                                not read_latest and sequence < selected[0]):
                             start = offset + self._HEADER.size
                             payload = bytes(shared[start:start + size])
                             after = self._HEADER.unpack_from(shared, offset)[:3]
                             latest_write_index = self._RING_HEADER.unpack_from(shared, 0)[0]
                             if after != (sequence, timestamp_ns, size) or sequence >= latest_write_index:
                                 continue
-                            newest = (sequence, timestamp_ns, payload)
-                    if newest is None:
+                            selected = (sequence, timestamp_ns, payload)
+                    if selected is None:
                         self._stop.wait(0.005)
                     else:
-                        self._last_sequence = newest[0]
-                        self.frame_callback(newest[2], self.metadata_getter(), newest[1])
+                        self._last_sequence = selected[0]
+                        self.frame_callback(selected[2], self.metadata_getter(), selected[1])
+                        if not self.latest_only and read_latest:
+                            # Discard the pre-existing backlog once, then
+                            # consume subsequent audio frames in sequence.
+                            read_latest = False
         except FileNotFoundError:
             self._error = f"U1 shared-memory path is unavailable: {path}"
             self._ready.set()
@@ -484,10 +502,10 @@ class U1Nodes:
         self._mic_reader = None
         self._mic_stream = {}
         self._mic_stream_open = False
+        self._mic_source = None
+        self._mic_source_lock = threading.Lock()
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
-        self._mic_asr_subscription = self.audio_device.create_subscription(
-            AudioInData, ASR_AUDIO_TOPIC, self._mic_topic_callback, self._audio_qos)
         self._playback_listeners = []
         self._robot_subscriptions = []
         for name, topic in EVENT_TOPICS.items():
@@ -643,6 +661,9 @@ class U1Nodes:
         return future.result()
 
     def set_mic_enabled(self, enabled: bool) -> dict:
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
         if not enabled:
             self.stop_mic_reader()
             close_error = None
@@ -687,12 +708,21 @@ class U1Nodes:
             # is already publishing on the device topic, so it is optional.
             self._mic_reader = VideoSharedMemoryReader(
                 stream, lambda: {}, self._publish_mic_frame)
+            self._mic_reader.latest_only = False
+            self._mic_reader.skip_backlog = True
             try:
                 self._mic_reader.start(timeout=2.0)
+                # The SDK ring and the raw topic carry the same microphone
+                # stream. Once the ring is usable, do not forward the topic
+                # copy as well or ASR receives every utterance twice.
+                with self._mic_source_lock:
+                    self._mic_source = "sdk"
             except Exception:
                 # Some firmware opens the SDK stream but only publishes the
                 # domain-2 AudioInData topic. Keep that topic fallback alive.
                 self._mic_reader = None
+                with self._mic_source_lock:
+                    self._mic_source = "topic"
         except Exception as exc:
             self.stop_mic_reader()
             try:
@@ -707,6 +737,12 @@ class U1Nodes:
     def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
         if not self._mic_forwarding:
             return
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
+        with self._mic_source_lock:
+            if self._mic_source not in (None, "sdk"):
+                return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -721,6 +757,12 @@ class U1Nodes:
         """Accept the device-domain raw topic when the SDK ring is unavailable."""
         if not self._mic_forwarding:
             return
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
+        with self._mic_source_lock:
+            if self._mic_source == "sdk":
+                return
         data = getattr(getattr(message, "data", None), "data", None)
         if data is None:
             data = getattr(message, "data", None)
@@ -729,6 +771,11 @@ class U1Nodes:
         payload = _normalize_pcm16k(message, data)
         if not payload:
             return
+        with self._mic_source_lock:
+            if self._mic_source is None:
+                self._mic_source = "topic"
+            if self._mic_source != "topic":
+                return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -752,6 +799,10 @@ class U1Nodes:
             self._mic_reader.stop()
             self._mic_reader = None
         self._mic_stream = {}
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+        with self._mic_source_lock:
+            self._mic_source = None
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
@@ -941,9 +992,6 @@ class U1Nodes:
         if self._mic_subscription is not None:
             self.audio_device.destroy_subscription(self._mic_subscription)
             self._mic_subscription = None
-        if self._mic_asr_subscription is not None:
-            self.audio_device.destroy_subscription(self._mic_asr_subscription)
-            self._mic_asr_subscription = None
         if self._video_users:
             try:
                 self.trigger_call("video_close")
