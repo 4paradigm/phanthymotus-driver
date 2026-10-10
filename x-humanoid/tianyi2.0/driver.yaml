@@ -21,6 +21,7 @@ cards:
   - { name: force_sensor,       type: sensor }
   - { name: model,              type: resource }
   - { name: camera_head,        type: sensor }
+  - { name: aruco_zones,        type: processor }
   - { name: imu,                type: sensor }
   - { name: camera_depth,       type: sensor }
   - { name: camera_pointcloud,  type: sensor }

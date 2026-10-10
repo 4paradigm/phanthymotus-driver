@@ -445,6 +445,11 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("aruco_zones", {}).get("enabled", False):
+            from aruco_zones import ArucoZonesPlugin
+            self._plugins.append(ArucoZonesPlugin(plugins_cfg["aruco_zones"], namespace, ros2))
+            print("[bundle] ArucoZonesPlugin loaded")
+
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
             from device import CameraSnapshotPlugin
             self._plugins.append(CameraSnapshotPlugin(
