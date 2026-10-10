@@ -166,6 +166,23 @@ def test_direction_card_validates_observations(monkeypatch):
     assert card.dispatch("info", {})["sound_direction"] == {"state": "stale"}
 
 
+def test_exited_direction_worker_cannot_report_or_receive_fresh_angle(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+    exit_code = [None]
+    card._proc = types.SimpleNamespace(poll=lambda: exit_code[0])
+    card._on_direction(module.String('{"state":"fresh","angle":90}'))
+    assert card.dispatch("check_direction", {})["sound_direction"]["state"] == "fresh"
+
+    exit_code[0] = 1
+    card._on_direction(module.String('{"state":"fresh","angle":180}'))
+    for action in ("info", "check_direction"):
+        result = card.dispatch(action, {"_tool_name": "sound_direction_control"})
+        assert result["state"] == "idle"
+        assert result["sound_direction"] == {"state": "no_event"}
+
+
 def test_direction_card_preserves_front_right_calibration(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     path = tmp_path / "sound_direction_calibration.json"

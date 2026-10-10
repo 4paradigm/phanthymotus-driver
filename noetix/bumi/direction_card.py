@@ -183,7 +183,7 @@ class SoundDirectionPlugin:
                for value in result.values()):
             return
         with self._process_lock:
-            if self._proc is None:
+            if self._proc is None or self._proc.poll() is not None:
                 return
             self._last_direction = result
             self._last_direction_time = time.monotonic()
@@ -380,12 +380,16 @@ class SoundDirectionPlugin:
             return {"state": "idle"}
         if action in ("info", "check_direction"):
             with self._process_lock:
+                running = self._proc is not None and self._proc.poll() is None
+                if not running:
+                    self._last_direction = None
+                    self._last_direction_time = 0.0
                 direction = self._last_direction
                 age = time.monotonic() - self._last_direction_time
             observation = ({"state": "no_event"} if direction is None else
                            {"state": "stale"} if age > 10 else
                            {**direction, "age_ms": round(age * 1000)})
-            result = {"state": "running" if self._proc and self._proc.poll() is None else "idle",
+            result = {"state": "running" if running else "idle",
                       "sound_direction": observation,
                       "parameters": load_parameters(),
                       "calibrated_directions": [key for key in ("front", "right")
