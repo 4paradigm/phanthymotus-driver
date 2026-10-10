@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from test_g1_loco_timing import ROOT, World, extract_class
-from unitree.g1.timed_motion import TimedMotion
+from unitree.g1.timed_motion import TimedMotion, trace_event
 
 
 class FakeThread:
@@ -134,7 +134,7 @@ class TestSDKSplitCall(unittest.TestCase):
                 return SimpleNamespace(GetResult=get_result)
             def RemoveFuture(self, request_id):
                 removed.append(request_id)
-        namespace = dict(time=time, json=json, threading=threading, _log=logging.getLogger('g1-test'),
+        namespace = dict(trace_event=trace_event, time=time, json=json, threading=threading, _log=logging.getLogger('g1-test'),
                          ClientStub=Stub, Request=request, RPC_DEBUG=False,
                          RequestIdentity=lambda ident, api: SimpleNamespace(id=ident, api_id=api),
                          RequestLease=lambda ident: ident, RequestPolicy=lambda *args: args,
@@ -160,6 +160,19 @@ class TestSDKSplitCall(unittest.TestCase):
         self.assertEqual(stop(), 0)  # responses may be received/waited out of order
         self.assertEqual(move(), 0)
         self.assertEqual(waits, [sent[1].header.identity.id, sent[0].header.identity.id])
+
+    def test_trace_correlates_send_and_response_by_request_id(self):
+        loco, sent, _, _ = self.sdk()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            wait = loco.BeginMove(0, 0, 1, True)
+            self.assertEqual(wait.request_id, sent[0].header.identity.id)
+            self.assertEqual(wait(), 0)
+        rows = [json.loads(line[len('[LocoTrace] '):])
+                for line in output.getvalue().splitlines() if line.startswith('[LocoTrace] ')]
+        self.assertEqual([row['stage'] for row in rows], ['sdk_sent', 'sdk_wait_return'])
+        self.assertTrue(all(row['request_id'] == wait.request_id for row in rows))
+        self.assertLessEqual(rows[0]['mono_s'], rows[1]['mono_s'])
 
     def test_move_and_stop_preserve_server_failure_code(self):
         loco, _, _, _ = self.sdk(response_code=3104)
@@ -252,6 +265,7 @@ class TestSafetyHarnessIntegration(unittest.TestCase):
         idle = SimpleNamespace(value='idle')
         moving = SimpleNamespace(value='moving')
         namespace = dict(
+            trace_event=trace_event,
             math=math, time=SimpleNamespace(monotonic=lambda: w.now),
             MotionState=SimpleNamespace(IDLE=idle, MOVING=moving, NAVIGATING=object(), NAV_PAUSED=object()),
             SpeedZone=SimpleNamespace(NORMAL='normal', DECELERATED='decelerated', STOPPED='stopped'),

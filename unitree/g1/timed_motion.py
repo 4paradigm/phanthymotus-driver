@@ -1,10 +1,20 @@
 """Ordered locomotion writes with deadlines independent of RPC response waits."""
+import os
 import math
 import json
 import threading
 import time
 from collections import OrderedDict
 from uuid import uuid4
+
+
+def trace_event(stage, **data):
+    try:
+        record = {"stage": stage, "mono_s": time.monotonic(),
+                  "pid": os.getpid(), "thread": threading.current_thread().name, **data}
+        print(f"[LocoTrace] {json.dumps(record)}", flush=True)
+    except Exception:
+        pass
 
 
 class TimedMotion:
@@ -66,14 +76,18 @@ class TimedMotion:
             self._log("rpc_exception", method=method, timing_id=action_id,
                       exception=repr(exc), elapsed_s=self.clock() - started)
             raise
+        request_id = getattr(wait, "request_id", None)
         sent = self.clock()
         self._send_log(method, action_id, started, sent)
+        trace_event("rpc_bound", action_id=action_id, method=method, request_id=request_id)
         self._log("rpc_sent", method=method, timing_id=action_id,
                   send_elapsed_s=sent - started)
 
         def response():
             try:
                 ret = wait()
+                trace_event("motion_wait_return", action_id=action_id, method=method,
+                            request_id=request_id, ret=ret)
             except Exception as exc:
                 self._log("rpc_exception", method=method, timing_id=action_id,
                           exception=repr(exc), elapsed_s=self.clock() - started)
@@ -105,6 +119,7 @@ class TimedMotion:
         else:
             action["status"] = "completed" if action["reason"] == "duration_expired" else "cancelled"
         action["outcome"] = self._outcome(action)
+        trace_event("outcome_ready", action_id=action["id"], status=action["status"])
 
     def _stopped(self, action):
         if self.on_stop and self.active is action:

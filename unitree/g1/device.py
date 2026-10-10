@@ -1312,6 +1312,7 @@ def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loc
     """POST ACP completion callback to Agent Core."""
     import urllib.request as _urllib
     import ssl as _ssl
+    from timed_motion import trace_event
 
     ctx = _ssl.create_default_context()
     ctx.check_hostname = False
@@ -1327,8 +1328,11 @@ def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loc
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        trace_event("acp_send_start", action_id=action_id, status=status)
         _urllib.urlopen(req, timeout=5, context=ctx)
+        trace_event("acp_send_return", action_id=action_id, status=status)
     except Exception as e:
+        trace_event("acp_send_error", action_id=action_id, error=str(e))
         print(f"[Loco] ACP notify failed: {e}")
 
 

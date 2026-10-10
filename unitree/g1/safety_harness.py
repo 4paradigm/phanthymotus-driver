@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from timed_motion import TimedMotion
+from timed_motion import TimedMotion, trace_event
 
 
 # The robot has arrived when it is this close to the target. There is no other
@@ -151,8 +151,13 @@ class SmartMotionProxy:
         with self._dispatch_lock:
             self._pending[req_id] = result_q
         try:
+            if method == "motion_result":
+                trace_event("query_enqueue", action_id=kwargs.get("action_id"), query_id=req_id)
             self._cmd_queue.put({"method": method, "_req_id": req_id, **kwargs})
             result = result_q.get(timeout=timeout)
+            if method == "motion_result":
+                trace_event("query_received", action_id=kwargs.get("action_id"),
+                            query_id=req_id, status=result.get("status"))
             return result
         except queue.Empty:
             return {"error": f"SmartMotion subprocess timeout ({method})"}
@@ -955,7 +960,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             if method == "move":
                 result = handle_move(cmd["vx"], cmd["vy"], cmd["vyaw"], cmd["duration"], cmd.get("action_id"))
             elif method == "motion_result":
+                trace_event("query_processing", action_id=cmd["action_id"], query_id=cmd.get("_req_id"))
                 result = motion.get_result(cmd["action_id"])
+                trace_event("query_processed", action_id=cmd["action_id"],
+                            query_id=cmd.get("_req_id"), status=result.get("status"))
             elif method == "stop":
                 result = do_stop(cmd.get("reason", "command"))
             elif method == "navigate_to":

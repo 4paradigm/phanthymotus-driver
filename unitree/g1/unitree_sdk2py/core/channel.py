@@ -20,6 +20,7 @@ from .channel_config import ChannelConfigAutoDetermine, ChannelConfigHasInterfac
 # for singleton
 from ..utils.singleton import Singleton
 from ..utils.bqueue import BQueue
+from ..utils.rpc_trace import trace_event
 
 
 """
@@ -106,6 +107,11 @@ class Channel:
             sample = samples[0]
             if isinstance(sample, InvalidSample):
                 return
+
+            identity = getattr(getattr(sample, "header", None), "identity", None)
+            if getattr(identity, "api_id", None) == 7105:
+                trace_event("dds_sample_taken", request_id=identity.id,
+                            sample_type=type(sample).__name__)
 
             # do sample
             if self.__queueEnable:

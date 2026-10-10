@@ -9,6 +9,7 @@ from ..idl.unitree_api.msg.dds_ import RequestIdentity_ as RequestIdentity
 from ..idl.unitree_api.msg.dds_ import RequestPolicy_ as RequestPolicy
 
 from ..utils.future import FutureResult
+from ..utils.rpc_trace import trace_event
 
 from .client_stub import ClientStub
 from .internal import *
@@ -52,6 +53,8 @@ class ClientBase:
         timeout = self.__timeout
         t0 = time.monotonic()
         future = self.__stub.SendRequest(request, self.__timeout)
+        if apiId == 7105:
+            trace_event("sdk_sent", request_id=req_id, api_id=apiId, timeout_s=timeout, send_ok=future is not None)
         if future is None:
             self.__fail_warns += 1
             if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
@@ -64,6 +67,9 @@ class ClientBase:
                 _log.debug("[CallBase] sent ok, waiting for response...")
             result = future.GetResult(timeout)
             elapsed = time.monotonic() - t0
+            if apiId == 7105:
+                trace_event("sdk_wait_return", request_id=req_id, api_id=apiId,
+                            future_code=result.code, elapsed_s=elapsed)
 
             if result.code != FutureResult.FUTURE_SUCC:
                 self.__stub.RemoveFuture(request.header.identity.id)
@@ -89,6 +95,7 @@ class ClientBase:
                 return response.header.status.code, response.data
 
 
+        wait_response.request_id = req_id
         return wait_response
 
     def _CallNoReplyBase(self, apiId: int, parameter: str, proirity: int, leaseId: int):

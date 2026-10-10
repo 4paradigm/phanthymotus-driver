@@ -63,7 +63,10 @@ class LocoClient(Client):
         parameter = json.dumps({"velocity": [vx, vy, omega], "duration": duration})
         with self._velocity_send_lock:
             wait = self._BeginCall(ROBOT_API_ID_LOCO_SET_VELOCITY, parameter)
-        return lambda: wait()[0]
+        def response():
+            return wait()[0]
+        response.request_id = getattr(wait, "request_id", None)
+        return response
 
     def SetVelocity(self, vx: float, vy: float, omega: float, duration: float = 1.0):
         return self.BeginVelocity(vx, vy, omega, duration)()

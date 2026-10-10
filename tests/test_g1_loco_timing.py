@@ -368,7 +368,7 @@ class TestTimingLogs(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             w.start()
         rows = [json.loads(line.removeprefix('[LocoSend] '))
-                for line in output.getvalue().splitlines()]
+                for line in output.getvalue().splitlines() if line.startswith("[LocoSend] ")]
         self.assertEqual([r['method'] for r in rows], ['Move', 'StopMove'])
         stop = rows[1]
         self.assertAlmostEqual(stop['write_gap_lower_s'], 1.1)
@@ -391,7 +391,7 @@ class TestTimingLogs(unittest.TestCase):
             w.start()
             w.timers[0].fire()
         rows = [json.loads(line.removeprefix('[LocoSend] '))
-                for line in output.getvalue().splitlines()]
+                for line in output.getvalue().splitlines() if line.startswith("[LocoSend] ")]
         self.assertAlmostEqual(rows[0]['send_call_elapsed_s'], .2)
         self.assertAlmostEqual(rows[1]['send_call_elapsed_s'], .1)
         self.assertAlmostEqual(rows[1]['write_gap_lower_s'], .8)
