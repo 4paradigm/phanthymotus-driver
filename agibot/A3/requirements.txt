@@ -1,0 +1,5 @@
+PyYAML==6.0.2
+requests==2.32.3
+numpy==2.0.2
+opencv-python-headless==4.10.0.84
+protobuf>=3.31.12,<6

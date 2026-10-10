@@ -1,0 +1,55 @@
+id: agibot-a3-driver
+name: AgiBot A3 (AimDK) Driver
+category: driver
+hardware_provider: agibot
+hardware_model: "a3-ultra"
+image_name: agibot-a3
+port: 15719
+mcp_url: "http://localhost:15719/mcp"
+description: "AgiBot A3 humanoid (AimDK v3.2, HTTP JSON RPC + ROS 2 Jazzy) — fixed-FSM motion mode/arm+compliance/waist/head/hand control, legged locomotion (loco), TTS+media/audio/volume, mic & interaction mode, camera(RGB+depth)/lidar_cloud/IMU/battery/estop sensing, alerts, face play, motion & skill package playback (teach-replay style), mapping/navigation via controlled_spatial + spatial_map visualization"
+build_context_extras:
+  - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's plugin enabled flags — controlled_spatial/
+# spatial_map/auto_charging cards only appear when the corresponding plugin is enabled.
+cards:
+  # --- sensors (names aligned with tianyi2.0/q5_bundle/g1) ---
+  - { name: joints,        type: sensor }
+  - { name: joint_state,   type: sensor }
+  - { name: imu,           type: sensor }
+  - { name: camera_head_left,  type: sensor }
+  - { name: camera_head_right, type: sensor }
+  - { name: camera_head_rear,  type: sensor }
+  - { name: camera_head_stereo_left, type: sensor }
+  - { name: camera_head_stereo_right, type: sensor }
+  - { name: camera_armpit_right, type: sensor }
+  - { name: camera_chest_rgb,  type: sensor }
+  - { name: camera_chest_depth, type: sensor }
+  - { name: camera_waist_rgb, type: sensor }
+  - { name: camera_waist_depth, type: sensor }
+  - { name: lidar_cloud,   type: sensor }
+  - { name: battery,       type: sensor }
+  - { name: estop,         type: sensor }
+  - { name: alerts,        type: sensor }
+  - { name: spatial_map,   type: sensor }
+  - { name: mic,           type: sensor }
+  - { name: ext_mic,       type: sensor }
+  # --- resources / catalogs ---
+  - { name: model,         type: resource }
+  # --- actuators ---
+  - { name: mc_mode,         type: actuator }
+  - { name: loco,           type: actuator }
+  - { name: arm_control,     type: actuator }
+  - { name: hand_control,    type: actuator }
+  - { name: head_control,    type: actuator }
+  - { name: waist_control,   type: actuator }
+  - { name: motion_play,     type: actuator }
+  - { name: tts,             type: actuator }
+  - { name: audio,           type: actuator }
+  - { name: speaker,         type: actuator }
+  - { name: interaction,     type: actuator }
+  - { name: face_play,       type: actuator }
+  - { name: skill_play,      type: actuator }
+  # --- config-gated advanced modules (mirrors X2's slam gating) ---
+  - { name: controlled_spatial, type: actuator }
+  - { name: auto_charging,      type: actuator }

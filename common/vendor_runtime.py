@@ -16,6 +16,7 @@ import re
 import signal
 import socket
 import threading
+from collections.abc import Mapping
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -164,7 +165,11 @@ def tool(
 
 class DriverBundle:
     def __init__(self, plugins: Iterable[Any]):
-        self.plugins = list(plugins)
+        # Most drivers return a list, while config-gated drivers may retain a
+        # name -> plugin mapping for tests and lookup.  Iterating a mapping
+        # yields its string keys, which later produces misleading errors such
+        # as "str has no attribute get_tool" and "str has no attribute start".
+        self.plugins = list(plugins.values()) if isinstance(plugins, Mapping) else list(plugins)
 
     def start_all(self) -> None:
         for plugin in self.plugins:
@@ -204,7 +209,11 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
         def log_message(self, fmt, *args):
             msg = fmt % args
             if '"POST /mcp' not in msg or "200" not in msg:
-                print(f"[mcp] {self.address_string()} {msg}")
+                # The request line is attacker-controlled: keep it ASCII-safe
+                # (no control chars / homoglyph noise via escapes) and capped,
+                # so a hostile client cannot forge or bloat log records.
+                safe = msg.encode("unicode_escape").decode("ascii")[:200]
+                print(f"[mcp] {self.address_string()} {safe}")
 
         def send_json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode()
@@ -331,6 +340,12 @@ def run_driver(
     ros_cfg = config.get("ros", {})
     port = int(config["mcp_port"])
     robot_domain = int(ros_cfg.get("robot_domain_id", 0))
+    # Zenoh carries the vendor DDS domain through an isolated bridge.  The
+    # driver must subscribe/publish on the bridge-side domain, not keep a
+    # second direct participant on the robot domain (which reintroduces the
+    # Humble/Jazzy large-sample deserialization path).
+    if os.environ.get("A3_ZENOH_BRIDGE") == "1":
+        robot_domain = int(os.environ.get("A3_ZENOH_CORE_DOMAIN", 42))
     core_domain = int(ros_cfg.get("core_domain_id", 42))
     print(f"[bundle] {driver_id} namespace={namespace} domains={robot_domain}->{core_domain} interface={interface} port={port}")
 

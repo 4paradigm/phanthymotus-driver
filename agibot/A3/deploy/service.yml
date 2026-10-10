@@ -1,0 +1,51 @@
+agibot-a3:
+  image: __IMAGE__
+  container_name: embodied-agibot-a3
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # AimDK 开发包 (dev kit): provides prebuilt/a3_aimdk wheel + ros2_plugin_proto.
+    # Per dev guide §5.2 the wheel is pip-installed at container start and the
+    # ros2_plugin_proto environment is sourced from here by the image CMD. Absent
+    # on a non-robot host -- device.py then falls back to its no-wheel code paths.
+    - /agibot/software/v0/entry:/agibot-devkit:ro
+    # Runtime ROS interfaces installed by AimDK on the ADU/HDU image.
+    - /opt/agibot:/opt/agibot:ro
+    # The main A3 process uses its robot profile for domain 232; its isolated
+    # child publishers read the loopback profile for Agent Core domain 42.
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    # No FASTRTPS_DEFAULT_PROFILES_FILE and no ROS_DOMAIN_ID here, unlike most
+    # drivers — same reason as x-humanoid/tianyi2.0. This process runs two FastDDS
+    # contexts (DualDomainROS2): robot domain 232 must reach the HDU/ADU/MDU at
+    # 10.42.10.10-12 over eth0, which the fleet's loopback-only profile would
+    # silently cut (FastDDS caches profiles process-wide, so per-context selection
+    # is impossible). main.py therefore generates its own profile whitelisting
+    # {robot-subnet IP, 127.0.0.1} before any participant is created — see
+    # main.py _select_profile. Domain 42 is set in code by DualDomainROS2 too;
+    # a container-wide ROS_DOMAIN_ID would only govern stray processes.
+    # The Jazzy relay is started in the host mount namespace by the container
+    # and publishes converted media back to robot domain 232. The A3 process
+    # then forwards those small samples to domain 42 through its child bridge.
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - A3_JAZZY_RELAY=1
+    # Camera relay is fully demand-driven. A card start writes its stream key
+    # to the shared control file; stopping/removing the card removes it. Keep
+    # this explicitly empty so a restart never revives stale camera streams.
+    - A3_RELAY_STREAMS=head_left_fisheye,head_right_fisheye,head_rear_fisheye,head_stereo_left_fisheye,head_stereo_right_fisheye,armpit_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth,waist_front_d415_rgb,waist_front_d415_depth
+    - A3_RELAY_ACTIVE_STREAMS=
+    - A3_RELAY_CONTROL_FILE=/opt/phanthy-motus/data/a3-relay/active_streams
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  # always, not unless-stopped: after a host reboot the robot must come back
+  # on its own (same reasoning as agibot-x2 / unitree-g1 -- a robot that stays
+  # down after a power cycle is indistinguishable from a broken deployment).
+  restart: always

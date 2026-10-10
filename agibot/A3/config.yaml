@@ -1,0 +1,136 @@
+mcp_port: 15719
+# Explicit, not blank: a blank value falls back to socket.gethostname(), which under Docker
+# is the container's random hex short ID -- ROS topic names cannot start with a digit, so
+# roughly 5/8 of container (re)starts crashed on the very first create_publisher() call
+# (same flaky-deploy root cause documented on agibot/AimDK_X2).
+ros_namespace: "agibot_a3"
+
+# A3 splits its software across three compute units reached over fixed internal IPs
+# (AimDK v3.2 dev guide §7): HDU (interaction/audio/resources), ADU (mapping/navigation),
+# MDU (motion control/HDS alerts). The driver must run on a third-party compute unit
+# (NOT on the MDU), so all control goes through these HTTP JSON RPC endpoints.
+rpc:
+  hdu: "10.42.10.10"   # :59301 TTS/AgentControl, :56666 HalAudio, :51049 Resource
+  adu: "10.42.10.11"   # :50807 Mapping/Localization, :53176 Pnc navi, :50583 SLAM relocalization
+  mdu: "10.42.10.12"   # :56322 MotionControlAction/Motion, :56444 MotionCommand, :50587 HDS alerts
+  timeout: 5.0
+
+ros:
+  # Dev guide §3.2: third-party compute unit must join ROS_DOMAIN_ID 232 and copy
+  # ros_dds_configuration.xml from the HDU. core_domain stays on the phanthy fleet default.
+  robot_domain_id: 232
+  core_domain_id: 42
+  robot_interface: "eth0"
+  # Publish core-domain streams from an isolated child process so Agent Core's
+  # loopback-only FastDDS profile can discover them.
+  core_bridge: true
+
+plugins:
+  # --- sensors ---
+  joints:
+    enabled: true
+    # Which joint groups the card exposes: arm (14-dof arms), hand, neck.
+  joint_state:
+    enabled: true
+  imu:
+    enabled: true
+  camera:
+    enabled: false
+    # Which camera streams to mirror; keys of the CAMERA_TOPICS table in device.py.
+    # RGB is re-encoded to JPEG and depth to zlib-compressed uint16 on the fly
+    # (default includes chest D457 depth, image/depth-zlib).
+    # Wrist D405 topics exist on the robot, but the deployed hal_depth_camera_node
+    # currently publishes no samples. Keep them out of the live card inventory
+    # until the vendor node is repaired; see README.md.
+    # Keep the default live set small. The host relay still has the other
+    # topic mappings for explicit opt-in, but encoding ten raw cameras at once
+    # starves state/command traffic on the ADU CPU.
+    # All non-wrist cards are advertised. Raw camera subscriptions are opened
+    # only when the corresponding canvas card is started and closed on stop.
+    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth"]
+  camera_head_left:
+    enabled: true
+  camera_head_right:
+    enabled: true
+  camera_chest_rgb:
+    enabled: true
+  camera_chest_depth:
+    enabled: true
+  camera_head_rear:
+    enabled: true
+  camera_head_stereo_left:
+    enabled: true
+  camera_head_stereo_right:
+    enabled: true
+  camera_armpit_right:
+    enabled: true
+  camera_waist_rgb:
+    enabled: true
+  camera_waist_depth:
+    enabled: true
+  camera_wrist_left:
+    enabled: true
+  camera_wrist_right:
+    enabled: true
+  lidar_cloud:
+    enabled: true
+  battery:
+    enabled: true
+  estop:
+    enabled: true
+  alerts:
+    enabled: true
+    # Dev guide hard limit: alert polling must stay <= 0.2 Hz (one call / 5s).
+    poll_interval: 5.0
+  # --- actuators ---
+  mc_mode:
+    enabled: true
+    # Fixed FSM: non-standing states (DAMPING/PASSIVE/LIE_DOWN/IDLE) only accept get_up;
+    # MOTION accepts damping/lie_down/passive. Illegal transitions are rejected with a
+    # suggestion (cross-checked against runtime GetAvailableActions).
+  loco:
+    enabled: true
+    # 腿式行走：forward/lateral ∈ [-1,1] 速度比例，angular 为 deg/s（限速 ±57.3），
+    # duration ∈ (0,60] 秒后自动停止（ACP 回报），-1 持续运动直到 stop。
+  arm_control:
+    enabled: true
+    # Also carries arm compliance enable/disable/check (former arm_compliance card).
+  hand_control:
+    enabled: true
+  head_control:
+    enabled: true
+  waist_control:
+    enabled: true
+  motion_play:
+    enabled: true
+  tts:
+    enabled: true
+  audio:
+    enabled: true
+    # Dev guide: volume above 70 risks hardware damage -- hard-clamped in device.py too.
+    max_volume: 70
+  mic:
+    enabled: true
+  ext_mic:
+    enabled: true
+  speaker:
+    enabled: true
+  interaction:
+    enabled: true
+    # Full takeover: disable the robot's built-in voice interaction at startup.
+    full_takeover: true
+  resources:
+    enabled: true
+  face_play:
+    enabled: true
+  skill_play:
+    enabled: true
+  # --- advanced modules, opt-in like X2's slam ---
+  controlled_spatial:
+    enabled: true
+  spatial_map:
+    enabled: true
+    # Which saved map to visualize; 0 = current active map.
+    map_id: 0
+  auto_charging:
+    enabled: true
