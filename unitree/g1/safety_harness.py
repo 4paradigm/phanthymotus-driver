@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from timed_motion import TimedMotion
+
 
 # The robot has arrived when it is this close to the target. There is no other
 # arrival signal: the G1 SLAM service does not publish `ctrl_info`, so
@@ -36,6 +38,24 @@ from typing import Optional
 # "arrives" at a different distance depending on which process is watching is a
 # bug that gets blamed on the map.
 NAV_ARRIVAL_RADIUS_M = 0.3
+
+
+class _LocoTiming:
+    """Optional diagnostics only; RPC results and exceptions pass through unchanged."""
+
+    def __init__(self):
+        self.enabled = os.environ.get("G1_LOCO_TIMING") == "1"
+
+    def emit(self, stage, **data):
+        if not self.enabled:
+            return
+        try:
+            record = {"stage": stage, "mono_s": time.monotonic(),
+                      "pid": os.getpid(), "thread": threading.get_ident(), **data}
+            print(f"[LocoTiming] {json.dumps(record, default=str)}", flush=True)
+        except Exception:
+            # A diagnostic output failure must not prevent movement or stopping.
+            pass
 
 
 # ── Enums & Data Classes (shared between processes) ──────────────────────────
@@ -67,13 +87,13 @@ class SpeedZone(enum.Enum):
 @dataclass
 class SpeedLimits:
     vx_normal: float = 1.0
-    vx_max: float = 5.0
+    vx_max: float = 1.0
     vx_decel: float = 0.5
     vy_normal: float = 0.2
-    vy_max: float = 5.0
+    vy_max: float = 1.0
     vy_decel: float = 0.1
     vyaw_normal: float = 0.4
-    vyaw_max: float = 5.0
+    vyaw_max: float = 2.0
     vyaw_decel: float = 0.2
 
 
@@ -112,15 +132,13 @@ class SmartMotionProxy:
             try:
                 item = self._result_queue.get(timeout=1.0)
                 req_id = item.pop("_req_id", None) if isinstance(item, dict) else None
-                if req_id and req_id in self._pending:
-                    self._pending[req_id].put(item)
-                else:
-                    # Fallback: shouldn't happen, but don't lose the result
-                    # Put it in any waiting queue (legacy behavior)
-                    with self._dispatch_lock:
-                        for q in self._pending.values():
-                            q.put(item)
-                            break
+                with self._dispatch_lock:
+                    target = self._pending.get(req_id)
+                if target is not None:
+                    try:
+                        target.put_nowait(item)
+                    except queue.Full:
+                        pass
             except queue.Empty:
                 continue
             except Exception:
@@ -142,8 +160,11 @@ class SmartMotionProxy:
             with self._dispatch_lock:
                 self._pending.pop(req_id, None)
 
-    def move(self, vx: float, vy: float, vyaw: float, duration: float = -1.0) -> dict:
-        return self._call("move", vx=vx, vy=vy, vyaw=vyaw, duration=duration)
+    def move(self, vx: float, vy: float, vyaw: float, duration: float = -1.0, action_id=None) -> dict:
+        return self._call("move", vx=vx, vy=vy, vyaw=vyaw, duration=duration, action_id=action_id)
+
+    def get_motion_result(self, action_id):
+        return self._call("motion_result", action_id=action_id)
 
     def stop(self, reason: str = "command") -> dict:
         return self._call("stop", reason=reason)
@@ -269,7 +290,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     current_cmd = None  # dict: {vx, vy, vyaw, duration, start_time, end_time}
     nav_cmd = None      # dict: {target_name, target_pose, start_time}
     speed_zone = SpeedZone.NORMAL
-    move_timer = None   # threading.Timer
+    loco_timing = _LocoTiming()
+    motion = None
 
     # Obstacle state (written by LiDAR callback, read by main loop)
     obstacle_lock = threading.Lock()
@@ -301,25 +323,31 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         event_node.publish(event)
         print(f"[SmartMotion] event: {event_type} | {json.dumps(data)}", flush=True)
 
-    def do_stop(reason_str):
-        nonlocal state, current_cmd, speed_zone, move_timer, stop_repeat_count
-        if move_timer:
-            move_timer.cancel()
-            move_timer = None
-        loco_client.StopMove()
-        was_moving = state == MotionState.MOVING
+    def on_motion_stop(result):
+        nonlocal state, current_cmd, speed_zone, stop_repeat_count, stop_repeat_action_id
+        if not current_cmd or current_cmd.get("action_id") != result["action_id"]:
+            return
+        event_data = {"action_id": result["action_id"], "reason": result["reason"],
+                      "ret": result["ret"]}
+        if result["ret"] != 0:
+            speed_zone = SpeedZone.STOPPED
+            publish_event("motion_stop_failed", event_data)
+            return
         state = MotionState.IDLE
         current_cmd = None
         speed_zone = SpeedZone.NORMAL
-        stop_repeat_count = 3  # repeat StopMove to ensure controller stops
-        if was_moving:
-            event_data = {"reason": reason_str}
-            if reason_str == "obstacle":
-                with obstacle_lock:
-                    event_data["obstacle_distance"] = round(obstacle_dist, 2)
-                    event_data["obstacle_angle_deg"] = round(math.degrees(obstacle_angle), 1)
-            publish_event("motion_stop", event_data)
-        return {"ret": 0, "state": "idle", "reason": reason_str}
+        stop_repeat_count = 3
+        stop_repeat_action_id = result["action_id"]
+        if result["reason"] == "obstacle":
+            with obstacle_lock:
+                event_data["obstacle_distance"] = round(obstacle_dist, 2)
+                event_data["obstacle_angle_deg"] = round(math.degrees(obstacle_angle), 1)
+        publish_event("motion_stop", event_data)
+
+    def do_stop(reason_str):
+        # State changes only after this action's stop response, inside the
+        # controller's send lock, so a late old response cannot reset a new move.
+        return motion.stop(reason_str)
 
     def do_stop_nav():
         nonlocal state, nav_cmd, speed_zone
@@ -335,11 +363,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             publish_event("nav_stopped", {"reason": "command"})
         return {"status": "stopped"}
 
-    def duration_expired():
-        nonlocal state, current_cmd, speed_zone, move_timer
-        move_timer = None
-        if state == MotionState.MOVING:
-            do_stop("duration_expired")
+    motion = TimedMotion(loco_client, timing=loco_timing, on_stop=on_motion_stop)
 
     # ── LiDAR DDS Subscription ──
     def on_cloud(msg):
@@ -457,35 +481,35 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     foot_force_seen_nonzero = False  # only enable airborne detection after seeing real force
     max_motor_temp = 0.0
     last_temp_check = 0.0
-    stop_repeat_count = 0  # counter for repeated StopMove after emergency
+    stop_repeat_count = 0
+    stop_repeat_action_id = None  # repeats belong to one stopped action
 
     def emergency_stop(reason_str, extra=None):
         """Emergency stop with optional damp mode for tilt."""
-        nonlocal state, current_cmd, speed_zone, move_timer, stop_repeat_count
-        if move_timer:
-            move_timer.cancel()
-            move_timer = None
-        loco_client.StopMove()
+        nonlocal state, current_cmd, speed_zone
+        was_active = state in (MotionState.MOVING, MotionState.NAVIGATING, MotionState.NAV_PAUSED)
+        stop_result = do_stop(reason_str)
         if reason_str == "tilt":
             try:
                 loco_client.SetFsmId(1)  # damp mode
             except Exception:
                 pass
-        was_active = state in (MotionState.MOVING, MotionState.NAVIGATING, MotionState.NAV_PAUSED)
         if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
             try:
                 slam_client.PauseNav()
             except Exception:
                 pass
-        state = MotionState.IDLE
-        current_cmd = None
-        speed_zone = SpeedZone.NORMAL
-        stop_repeat_count = 3  # repeat StopMove in main loop to ensure it takes effect
+        with motion.lock:
+            if stop_result.get("ret") == 0 and (not current_cmd or
+                    current_cmd.get("action_id") == stop_result.get("action_id")):
+                state = MotionState.IDLE
+                current_cmd = None
+                speed_zone = SpeedZone.NORMAL
         if was_active:
-            event_data = {"reason": reason_str}
+            event_data = {"reason": reason_str, "ret": stop_result.get("ret")}
             if extra:
                 event_data.update(extra)
-            publish_event("safety_stop", event_data)
+            publish_event("safety_stop" if stop_result.get("ret") == 0 else "safety_stop_failed", event_data)
             print(f"[SmartMotion] emergency_stop({reason_str}): StopMove sent", flush=True)
 
     # ── LowState DDS Subscription (IMU tilt + joint temp) ──
@@ -628,48 +652,38 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         print(f"[SmartMotion:pid={os.getpid()}] WARNING: rt/slam_info subscribe failed: {e}")
 
     # ── Command handlers ──
-    def handle_move(vx, vy, vyaw, duration):
-        nonlocal state, current_cmd, speed_zone, move_timer
-
+    def handle_move(vx, vy, vyaw, duration, action_id=None):
+        nonlocal state, current_cmd, speed_zone
+        from uuid import uuid4
+        if not all(math.isfinite(v) for v in (vx, vy, vyaw, duration)):
+            return {"error": "Motion parameters must be finite"}
         if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
             do_stop_nav()
-        if move_timer:
-            move_timer.cancel()
-            move_timer = None
-
+        action_id = action_id or f"g1_move_{uuid4().hex[:8]}"
         previous = None
-        if state == MotionState.MOVING and current_cmd:
-            previous = {"vx": current_cmd["vx"], "vy": current_cmd["vy"], "vyaw": current_cmd["vyaw"]}
-
         clamped_vx, clamped_vy, clamped_vyaw = clamp(vx, vy, vyaw, SpeedZone.NORMAL)
-
-        now = time.time()
-        current_cmd = {
-            "vx": vx, "vy": vy, "vyaw": vyaw,
-            "duration": duration, "start_time": now,
-            "end_time": (now + duration) if duration > 0 else None,
-        }
-        state = MotionState.MOVING
-        speed_zone = SpeedZone.NORMAL
-
-        ret = loco_client.Move(clamped_vx, clamped_vy, clamped_vyaw, True)
-
-        if duration > 0:
-            move_timer = threading.Timer(duration, duration_expired)
-            move_timer.start()
-
-        if previous:
-            publish_event("new_command", {
-                "previous": previous,
-                "new": {"vx": clamped_vx, "vy": clamped_vy, "vyaw": clamped_vyaw},
-            })
-        else:
-            publish_event("motion_start", {
-                "params": {"vx": clamped_vx, "vy": clamped_vy, "vyaw": clamped_vyaw, "duration": duration},
-            })
-
-        return {"ret": ret, "vx": clamped_vx, "vy": clamped_vy, "vyaw": clamped_vyaw,
-                "duration": duration, "state": state.value}
+        with motion.lock:
+            if action_id in motion.actions:
+                return {"error": "Duplicate motion action_id", "action_id": action_id}
+            if state == MotionState.MOVING and current_cmd:
+                previous = {k: current_cmd[k] for k in ("vx", "vy", "vyaw")}
+            now = time.monotonic()
+            current_cmd = {"action_id": action_id, "vx": vx, "vy": vy, "vyaw": vyaw,
+                           "duration": duration, "start_time": now,
+                           "end_time": now + duration if duration > 0 else None}
+            state = MotionState.MOVING
+            speed_zone = SpeedZone.NORMAL
+        result = motion.start(clamped_vx, clamped_vy, clamped_vyaw, duration, action_id)
+        with motion.lock:
+            if result.get("ret") == 0 and current_cmd and current_cmd["action_id"] == action_id:
+                if previous:
+                    publish_event("new_command", {"action_id": action_id, "previous": previous,
+                                                  "new": {"vx": clamped_vx, "vy": clamped_vy, "vyaw": clamped_vyaw}})
+                else:
+                    publish_event("motion_start", {"action_id": action_id,
+                        "params": {"vx": clamped_vx, "vy": clamped_vy,
+                                   "vyaw": clamped_vyaw, "duration": duration}})
+        return result
 
     def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60):
         nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error
@@ -788,7 +802,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             # Run safety checks and ROS2 spin during wait
             process_safety_checks()
             if stop_repeat_count > 0 and state == MotionState.IDLE:
-                loco_client.StopMove()
+                motion.stop("stop_repeat", expected_id=stop_repeat_action_id, retry=True)
                 stop_repeat_count -= 1
             executor.spin_once(timeout_sec=0)
 
@@ -852,9 +866,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             elif temp > motor_temp_decel:
                 if speed_zone != SpeedZone.DECELERATED:
                     speed_zone = SpeedZone.DECELERATED
-                    if current_cmd:
-                        dvx, dvy, dvyaw = clamp(current_cmd["vx"], current_cmd["vy"], current_cmd["vyaw"], SpeedZone.DECELERATED)
-                        loco_client.Move(dvx, dvy, dvyaw, True)
+                    cmd = current_cmd
+                    if cmd:
+                        dvx, dvy, dvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.DECELERATED)
+                        motion.update(cmd["action_id"], dvx, dvy, dvyaw)
                         publish_event("joint_overheat", {
                             "max_temp": round(temp, 1),
                             "action": "decelerate",
@@ -880,7 +895,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     print(f"[SmartMotion:obstacle] DECEL — dist={dist:.2f}m angle={math.degrees(obstacle_angle):.1f}° lateral={lateral}", flush=True)
                     if cmd:
                         dvx, dvy, dvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.DECELERATED)
-                        loco_client.Move(dvx, dvy, dvyaw, True)
+                        motion.update(cmd["action_id"], dvx, dvy, dvyaw)
                         with obstacle_lock:
                             od = obstacle_dist
                             oa = obstacle_angle
@@ -895,7 +910,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     speed_zone = SpeedZone.NORMAL
                     if cmd:
                         cvx, cvy, cvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.NORMAL)
-                        loco_client.Move(cvx, cvy, cvyaw, True)
+                        motion.update(cmd["action_id"], cvx, cvy, cvyaw)
                         publish_event("motion_resume", {"speed": {"vx": cvx, "vy": cvy, "vyaw": cvyaw}})
 
         elif state == MotionState.NAVIGATING:
@@ -931,7 +946,9 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             result = None
 
             if method == "move":
-                result = handle_move(cmd["vx"], cmd["vy"], cmd["vyaw"], cmd["duration"])
+                result = handle_move(cmd["vx"], cmd["vy"], cmd["vyaw"], cmd["duration"], cmd.get("action_id"))
+            elif method == "motion_result":
+                result = motion.get_result(cmd["action_id"])
             elif method == "stop":
                 result = do_stop(cmd.get("reason", "command"))
             elif method == "navigate_to":
@@ -971,7 +988,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 result = {"code": code, "response": resp}
             elif method == "shutdown":
                 if state == MotionState.MOVING:
-                    loco_client.StopMove()
+                    do_stop("shutdown")
                 elif state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
                     try:
                         slam_client.PauseNav()
@@ -994,7 +1011,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
             # Repeat StopMove after emergency_stop to ensure controller receives it
             if stop_repeat_count > 0 and state == MotionState.IDLE:
-                loco_client.StopMove()
+                motion.stop("stop_repeat", expected_id=stop_repeat_action_id, retry=True)
                 stop_repeat_count -= 1
 
         # Periodic health log: verify slam_info subscription is working
@@ -1007,8 +1024,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         executor.spin_once(timeout_sec=0)
 
     # Cleanup
-    if move_timer:
-        move_timer.cancel()
+    motion.stop("shutdown")
     executor.shutdown()
     rclpy.shutdown()
     print(f"[SmartMotion:pid={os.getpid()}] shutdown complete")

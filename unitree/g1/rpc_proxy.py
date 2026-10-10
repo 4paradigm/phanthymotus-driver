@@ -25,15 +25,21 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+    from timed_motion import TimedMotion
+    from safety_harness import _LocoTiming
 
     ChannelFactoryInitialize(0, network_iface)
 
     loco = LocoClient()
     loco.SetTimeout(10.0)
     loco.Init()
+    motion = TimedMotion(loco, timing=_LocoTiming())
 
     time.sleep(0.5)
     print("[G1 RpcWorker] ready", flush=True)
+
+    def respond(cmd, **payload):
+        result_queue.put({"_req_id": cmd.get("_req_id"), **payload})
 
     while True:
         try:
@@ -41,6 +47,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
         except Exception:
             break
         if cmd is None:
+            motion.stop("shutdown")
             break
 
         method = cmd.get("method")
@@ -63,9 +70,9 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                     fn = getattr(loco, method_name)
                     ret = fn()
                     if ret != 0:
-                        result_queue.put({"result": {
+                        respond(cmd, result={
                             "error": f"Step '{step_name}' failed: code={ret}",
-                            "step": step_name, "completed": completed}})
+                            "step": step_name, "completed": completed})
                         break  # abort sequence on failure
                     # Poll FSM until one of the target states is reached or timeout
                     elapsed = 0.0
@@ -79,10 +86,10 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                             break
                     if not ok:
                         _, current = loco.GetFsmId()
-                        result_queue.put({"result": {
+                        respond(cmd, result={
                             "error": f"Timeout '{step_name}' after {this_timeout:.0f}s "
                                      f"(expected={sorted(targets)}, got={current})",
-                            "step": step_name, "fsm_id": current, "completed": completed}})
+                            "step": step_name, "fsm_id": current, "completed": completed})
                         break  # abort sequence on timeout
                     completed.append(step_name)
                     # Wait for physical motion to settle before next step
@@ -90,15 +97,26 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                 else:
                     # Only reached if loop completed without break (all steps succeeded)
                     _, final = loco.GetFsmId()
-                    result_queue.put({"result": {"ret": 0, "steps": completed,
-                                                 "fsm_id": final}})
+                    respond(cmd, result={"ret": 0, "steps": completed,
+                                                 "fsm_id": final})
                 continue  # next cmd
 
-            fn = getattr(loco, method)
-            result = fn(*args, **kwargs)
-            result_queue.put({"result": result})
+            if method == "TimedMove":
+                result = motion.start(*args, **kwargs)
+            elif method == "GetMotionResult":
+                result = motion.get_result(*args, **kwargs)
+            elif method == "StopMove":
+                result = motion.stop()["ret"]
+            elif method == "Move":
+                vx, vy, vyaw = args[:3]
+                continuous = args[3] if len(args) > 3 else False
+                result = motion.start(vx, vy, vyaw, 0 if continuous else 1)["ret"]
+            else:
+                fn = getattr(loco, method)
+                result = fn(*args, **kwargs)
+            respond(cmd, result=result)
         except Exception as e:
-            result_queue.put({"error": str(e)})
+            respond(cmd, error=str(e))
 
 
 class RpcProxy:
@@ -115,12 +133,22 @@ class RpcProxy:
         )
         self._proc.start()
         self._lock = threading.Lock()
+        self._req_counter = 0
 
     def _call(self, method: str, *args, timeout: float = 15.0, **kwargs):
         with self._lock:
-            self._cmd_q.put({"method": method, "args": args, "kwargs": kwargs})
+            self._req_counter += 1
+            req_id = self._req_counter
+            self._cmd_q.put({"method": method, "args": args, "kwargs": kwargs, "_req_id": req_id})
             try:
-                r = self._result_q.get(timeout=timeout)
+                deadline = time.monotonic() + timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    r = self._result_q.get(timeout=remaining)
+                    if r.get("_req_id") == req_id:
+                        break
             except Exception:
                 return None
             if "error" in r:
@@ -220,6 +248,16 @@ class RpcProxy:
 
     def StopMove(self):
         return self._call_code("StopMove")
+
+    def TimedMove(self, vx, vy, vyaw, duration, action_id):
+        result = self._call("TimedMove", vx, vy, vyaw, duration, action_id)
+        return result if isinstance(result, dict) else {"error": "Motion RPC response unavailable",
+                                                       "action_id": action_id}
+
+    def GetMotionResult(self, action_id):
+        result = self._call("GetMotionResult", action_id)
+        return result if isinstance(result, dict) else {"error": "Motion result unavailable",
+                                                       "action_id": action_id}
 
     def Move(self, vx: float, vy: float, vyaw: float, continous_move: bool = False):
         return self._call_code("Move", vx, vy, vyaw, continous_move)
