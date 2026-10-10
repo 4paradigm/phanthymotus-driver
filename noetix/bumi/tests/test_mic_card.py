@@ -352,6 +352,100 @@ def test_direction_contract_from_estimator_to_subscription(monkeypatch):
     assert card.dispatch("info", {})["sound_direction"] == {"state": "no_event"}
 
 
+def test_sound_activity_reports_coherent_source_without_wake_status(monkeypatch):
+    module, String = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    sys.modules.pop("sound_direction", None)
+    rng = np.random.default_rng(71)
+    source = rng.normal(0, 2000, 4096).astype(np.int16)
+    channels = [np.roll(source, shift) for shift in (0, 2, -3, 1)]
+    channels.extend([np.zeros_like(source) for _ in range(4)])
+    audio = np.stack(channels, axis=1).reshape(-1)
+    calibration = {"front": [2, -3, 1], "right": [0, 1, -2]}
+
+    payload = json.loads(module._mic_activity_payload(audio, calibration, 1234))
+    assert payload["trigger"] == "sound_activity"
+    assert payload["state"] == "fresh"
+    assert payload["angle"] == 0
+    right_channels = [np.roll(source, shift) for shift in (0, 0, 1, -2)]
+    right_channels.extend([np.zeros_like(source) for _ in range(4)])
+    right_audio = np.stack(right_channels, axis=1).reshape(-1)
+    assert json.loads(module._mic_activity_payload(
+        right_audio, calibration, 1235))["angle"] == 90
+    assert module._mic_activity_payload(np.zeros_like(audio), calibration, 1234) is None
+    unrelated = rng.normal(0, 2000, (4096, 8)).astype(np.int16).reshape(-1)
+    assert module._mic_activity_payload(unrelated, calibration, 1234) is None
+    assert module._mic_activity_payload(audio, {}, 1234) is None
+
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, object())
+    card._proc = types.SimpleNamespace(poll=lambda: None)
+    card._on_direction(String(json.dumps(payload)))
+    assert card.dispatch("check_direction", {})["sound_direction"]["angle"] == 0
+
+
+def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_path):
+    module, String = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    sys.modules.pop("sound_direction", None)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps({"front": [2, -3, 1], "right": [0, 1, -2]}))
+    monkeypatch.setattr(module, "_MIC_DIRECTION_CALIBRATION", path)
+    published = {}
+
+    class Node:
+        def __init__(self, name):
+            pass
+
+        def create_publisher(self, message_type, topic, qos):
+            published[topic] = []
+            return types.SimpleNamespace(publish=published[topic].append)
+
+    monkeypatch.setattr(sys.modules["rclpy"], "init", lambda: None, raising=False)
+    monkeypatch.setattr(sys.modules["rclpy.node"], "Node", Node)
+    monkeypatch.setitem(sys.modules, "common", types.SimpleNamespace(
+        logsafe=types.SimpleNamespace(install=lambda **kwargs: None)))
+
+    class Done(BaseException):
+        pass
+
+    rng = np.random.default_rng(73)
+    source = rng.normal(0, 2000, 5120).astype(np.int16)
+    channels = [np.roll(source, shift) for shift in (0, 2, -3, 1)]
+    channels.extend([np.zeros_like(source) for _ in range(4)])
+    audio = np.stack(channels, axis=1)
+    frames = iter(audio.reshape(8, 640, 8))
+
+    def capture():
+        try:
+            frame = next(frames)
+        except StopIteration:
+            raise Done()
+        return types.SimpleNamespace(channels=8, sample_rate=16000,
+                                     audio_data=frame.reshape(-1).tolist())
+
+    media = types.SimpleNamespace(
+        init=lambda: True,
+        get_system_status=lambda: types.SimpleNamespace(
+            reason=types.SimpleNamespace(name="CMD_SLEEPED"),
+            header=types.SimpleNamespace(message_id=0, timestamp_us=0)),
+        get_audio_capture_data=capture)
+    monkeypatch.setitem(sys.modules, "mediacontrol_py", types.SimpleNamespace(
+        MediaController=types.SimpleNamespace(instance=lambda: media)))
+    monkeypatch.setattr(sys.modules["std_msgs.msg"], "String", String)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    try:
+        module._mic_subprocess("robot")
+    except Done:
+        pass
+
+    messages = published["/robot/mic/sound_direction"]
+    assert len(messages) == 1
+    assert json.loads(messages[0].data)["angle"] == 0
+    assert json.loads(messages[0].data)["trigger"] == "sound_activity"
+
+
 def test_mic_direction_rejects_unexpected_shapes(monkeypatch):
     module, String = _load_device(monkeypatch)
     executor = types.SimpleNamespace(add_node=lambda node: None)

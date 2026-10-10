@@ -5,11 +5,14 @@ The bundle exposes the original Bumi sensor, locomotion, audio and camera cards 
 ## `mic` wake-up direction
 
 The existing `mic` card still publishes mono PCM on `/<namespace>/mic/audio`.
-It also publishes a JSON wake-up observation on
-`/<namespace>/mic/sound_direction`. The `angle` field is present only when
-calibration and audio quality permit an estimate. It is in degrees clockwise
-from the robot's front. `info.sound_direction` keeps the latest observation for
-10 seconds, then reports `stale` without an angle.
+It also publishes JSON observations on `/<namespace>/mic/sound_direction`.
+It estimates the direction of a coherent sound source about four times per
+second without waiting for a wake word (`trigger=sound_activity`); vendor wake
+events remain supported (`trigger=vendor_audio_wakeup`). The `angle` field is
+present only when calibration and audio quality permit an estimate. It is in
+degrees clockwise from the robot's front. `check_direction` keeps the latest
+observation for 10 seconds, then reports `stale` without an angle. The monitor's
+JSON “最新” view updates automatically when a new observation is published.
 
 One-time setup on Bumi EDU:
 
@@ -19,9 +22,10 @@ One-time setup on Bumi EDU:
 2. Have one person stand directly in front of the robot and speak “测试测试”
    continuously while calling `action=calibrate_front`.
 3. Repeat at the robot's right side with `action=calibrate_right`.
-4. Say “小范小范” and choose `check_direction` on the `mic` card within
-   10 seconds. Read `sound_direction` in the action result (`fresh`, `no_event`,
-   or `stale`). The canvas's generic “查看数据流” button opens the audio stream.
+4. Make a sound from a known position and watch the `sound_direction` stream,
+   or choose `check_direction` on the `mic` card within 10 seconds. Read
+   `sound_direction` in the action result (`fresh`, `no_event`, or `stale`). The
+   canvas's generic “查看数据流” button opens the audio stream.
 
 Each calibration temporarily pauses the mic audio stream, collects fresh
 eight-channel audio for two seconds, then resumes the stream. If too few new
@@ -37,10 +41,10 @@ two known speaking positions to map them to the robot's front/right axes.
 No angle is published when the channels do not show a coherent source.
 
 The vendor wake status reports that an acoustic wake-up happened but does not
-identify which wake word caused it. Thus an event cannot truthfully claim that
-“小范小范” was the recognized word, and simultaneous speakers may cause an
-ambiguous or wrong direction. Confirm the phrase, angle convention, and
-performance on the actual robot before using the angle for motion.
+identify which wake word caused it. Sound-activity observations likewise do
+not identify a speaker or recognize speech. Simultaneous speakers and ambient
+noise may cause an ambiguous or wrong direction. Confirm the angle convention
+and performance on the actual robot before using the angle for motion.
 The bundled SDK exposes only current-status polling. The driver checks as
 often as the capture loop permits, but a wake status that appears and disappears
 between checks can still be missed.

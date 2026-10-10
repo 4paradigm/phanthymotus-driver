@@ -987,6 +987,23 @@ def _mic_direction_payload(signature, calibration, timestamp_ms) -> str:
     return json.dumps(direction, ensure_ascii=False)
 
 
+def _mic_activity_payload(audio, calibration, timestamp_ms) -> str | None:
+    """Report a coherent sound source without requiring a vendor wake event."""
+    from sound_direction import estimate_angle, estimate_signature
+    if not {"front", "right"} <= calibration.keys():
+        return None
+    signature = estimate_signature(audio, 8, 16000)
+    if signature is None:
+        return None
+    angle = estimate_angle(signature, calibration["front"], calibration["right"])
+    if angle is None:
+        return None
+    return json.dumps({"state": "fresh", "trigger": "sound_activity",
+                       "timestamp_ms": int(timestamp_ms), "angle": angle,
+                       "unit": "deg", "reference": "robot_front_clockwise"},
+                      ensure_ascii=False)
+
+
 def _mic_subprocess(namespace: str):
     """Mic capture subprocess — polls MediaController, publishes AudioChunk."""
     # A fresh interpreter does not inherit the parent's atomic log writer.
@@ -1035,6 +1052,7 @@ def _mic_subprocess(namespace: str):
     buffer = _np.array([], dtype=_np.int16)
     recent_audio = _deque(maxlen=100)  # 约 1 秒原始 8 通道音频，供唤醒时定位。
     next_status_poll = 0.0
+    next_activity_check = 0.0
     next_direction_error_log = 0.0
     last_wake_key = _initial_wake_key(media_ctrl)
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
@@ -1066,6 +1084,21 @@ def _mic_subprocess(namespace: str):
             samples = _np.array(audio.audio_data, dtype=_np.int16)
             if audio.channels == 8 and audio.sample_rate == 16000:
                 recent_audio.append(samples)
+                if len(recent_audio) >= 8 and _time.monotonic() >= next_activity_check:
+                    next_activity_check = _time.monotonic() + 0.25
+                    try:
+                        # 使用现有四路采集估计近期的主声源；无可靠角度时不发布。
+                        activity = _mic_activity_payload(
+                            _np.concatenate(list(recent_audio)[-8:]),
+                            _load_calibration(), _time.time() * 1000)
+                        if activity is not None:
+                            direction_msg = String()
+                            direction_msg.data = activity
+                            direction_pub.publish(direction_msg)
+                    except Exception as exc:
+                        if _time.monotonic() >= next_direction_error_log:
+                            print(f"[mic_subprocess] activity direction skipped: {exc}", flush=True)
+                            next_direction_error_log = _time.monotonic() + 0.5
             mono = samples[::audio.channels]
 
             # SDK returns low-amplitude signal (~8-bit dynamic range in 16-bit container)
