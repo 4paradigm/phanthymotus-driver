@@ -274,8 +274,13 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
+        for name in ("mc_state", "joint_state", "joints", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_joints_exposes_skeleton_stream(self):
+        plugins = build_bundle_plugins()
+        definition = next(d for d in tool_definitions(plugins) if d["name"] == "joints")
+        self.assertEqual(definition["topic_out"], [{"topic": "/test_ns/agibot_x2/joints", "format": "sensor/skeleton"}])
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()
@@ -300,6 +305,43 @@ class ModelPluginTests(unittest.TestCase):
         model_plugin = find_plugin(plugins, "model")
         with self.assertRaises(ValueError):
             model_plugin.dispatch("model", {"variant": "nonexistent"})
+
+
+class JointsPluginTests(unittest.TestCase):
+    def test_normalize_flattens_groups_in_canonical_order(self):
+        def joint(name, position, velocity, effort, error_code):
+            state = FakeMsg()
+            state.name = name
+            state.position = position
+            state.velocity = velocity
+            state.effort = effort
+            state.error_code = error_code
+            return state
+
+        result = FakeMsg()
+        result.leg_joints = [joint("leg", 1.0, 2.0, 3.0, 4)]
+        result.waist_joints = [joint("waist", 5.0, 6.0, 7.0, 8)]
+        result.arm_joints = [joint("arm", 9.0, 10.0, 11.0, 12)]
+        result.head_joints = [joint("head", 13.0, 14.0, 15.0, 16)]
+
+        self.assertEqual(device.JointsPlugin.normalize(result), [
+            {"idx": 0, "name": "leg", "q": 1.0, "dq": 2.0, "tau": 3.0, "error_code": 4},
+            {"idx": 1, "name": "waist", "q": 5.0, "dq": 6.0, "tau": 7.0, "error_code": 8},
+            {"idx": 2, "name": "arm", "q": 9.0, "dq": 10.0, "tau": 11.0, "error_code": 12},
+            {"idx": 3, "name": "head", "q": 13.0, "dq": 14.0, "tau": 15.0, "error_code": 16},
+        ])
+
+    def test_normalize_accepts_empty_groups(self):
+        result = FakeMsg()
+        result.leg_joints = []
+        result.waist_joints = []
+        result.arm_joints = []
+        result.head_joints = []
+        self.assertEqual(device.JointsPlugin.normalize(result), [])
+
+    def test_invalid_poll_interval_rejected(self):
+        with self.assertRaisesRegex(ValueError, "poll_interval_sec"):
+            build_bundle_plugins({"end_effector": "hand", "plugins": {"joints": {"poll_interval_sec": 0}}})
 
 
 class DispatchSmokeTests(unittest.TestCase):
