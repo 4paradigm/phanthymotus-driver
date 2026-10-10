@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import ssl
 import subprocess
 import threading
 import time
+import urllib.request
 from collections import deque
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import rclpy
@@ -33,6 +37,21 @@ _QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 _READY_LINE = "__BUMI_DIRECTION_READY__"
+
+
+def _direction_acp_notify(action_id: str, status: str, result: dict, tool: str) -> None:
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({"action_id": action_id, "status": status,
+                          "result": result, "tool": tool, "ts": time.time()}).encode()
+    request = urllib.request.Request(
+        f"{url}/api/acp/complete", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    try:
+        with urllib.request.urlopen(request, timeout=5, context=context) as response:
+            response.read()
+    except Exception as exc:
+        print(f"[direction ACP] callback failed for {action_id}: {exc}", flush=True)
 
 
 def load_calibration() -> dict:
@@ -233,6 +252,8 @@ class SoundDirectionPlugin:
                         "update_interval_ms"], "description": "只填写需要调整的参数；保存后重启方向采集。"},
                     "reset_parameters": {"params": [], "description": "恢复当前版本的默认参数。"},
                 },
+                "x-completion": {"actions": ["calibrate_front", "calibrate_right"],
+                                 "timeout": 30},
             },
         }
 
@@ -339,6 +360,14 @@ class SoundDirectionPlugin:
                         return {"state": "error", "message": f"direction restart failed: {exc}",
                                 "direction": direction, "calibration_saved": calibration_saved}
 
+    def _calibrate_async(self, direction: str, action_id: str) -> None:
+        try:
+            result = self._calibrate(direction)
+        except Exception as exc:
+            result = {"state": "error", "direction": direction, "message": str(exc)}
+        status = "completed" if result.get("state") == "calibrated" else "error"
+        _direction_acp_notify(action_id, status, result, "sound_direction_control")
+
     def _set_parameters(self, changes: dict | None) -> dict:
         with self._process_lock:
             if changes is not None:
@@ -426,5 +455,10 @@ class SoundDirectionPlugin:
         if action == "reset_parameters":
             return self._set_parameters(None)
         if action in ("calibrate_front", "calibrate_right"):
-            return self._calibrate(action.removeprefix("calibrate_"))
+            direction = action.removeprefix("calibrate_")
+            action_id = f"sound_direction_calibrate_{direction}_{uuid4().hex}"
+            # 标定和采集进程重启在后台完成，结果通过 ACP 回报。
+            threading.Thread(target=self._calibrate_async, args=(direction, action_id),
+                             daemon=True).start()
+            return {"state": "queued", "action_id": action_id, "direction": direction}
         return None

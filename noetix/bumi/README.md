@@ -57,7 +57,9 @@ stand at the corresponding known position and speak continuously for about
 two seconds while calling `calibrate_front` or `calibrate_right` on the control
 card. Calibration pauses only the direction capture process; the mic
 card continues publishing audio. Too few new frames or an invalid voice
-spectrum returns `no_voice` without saving.
+spectrum returns `no_voice` without saving. Calibration returns `queued` with an
+`action_id` immediately; the final `calibrated`, `no_voice`, or restart error
+is reported to Agent Core through ACP after capture and worker restart finish.
 
 Both cards now use independent SDK capture readers. The SDK exposes the
 getter but does not document concurrent-reader semantics; verify on the robot

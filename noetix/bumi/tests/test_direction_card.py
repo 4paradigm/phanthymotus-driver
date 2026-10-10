@@ -169,6 +169,25 @@ def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch, tmp_p
         "parameters"]["onset_level"] == 20
 
 
+def test_bundle_logs_direction_worker_start_failure(monkeypatch):
+    _load_device(monkeypatch)
+    monkeypatch.setitem(sys.modules, "rclpy.executors", types.ModuleType("rclpy.executors"))
+    path = Path(__file__).resolve().parents[1] / "main.py"
+    spec = importlib.util.spec_from_file_location("bumi_direction_start_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    bundle = module.BumiDeviceBundle(
+        {"plugins": {}}, "robot", types.SimpleNamespace(add_node=lambda node: None), None, None)
+    bundle._plugins = [types.SimpleNamespace(start=lambda: False)]
+    messages = []
+    monkeypatch.setattr(module, "print", lambda message, **kwargs: messages.append(message), raising=False)
+
+    bundle.start_all()
+
+    assert any("start() FAILED" in message for message in messages)
+    assert not any("All 1 plugins started" in message for message in messages)
+
+
 def test_control_lifecycle_does_not_stop_direction_sensor(monkeypatch):
     module = _load_card(monkeypatch)
     card = module.SoundDirectionPlugin(
@@ -194,6 +213,89 @@ def test_control_lifecycle_does_not_stop_direction_sensor(monkeypatch):
     assert card.dispatch("stop", {"_tool_name": "sound_direction"}) == {
         "state": "idle"}
     assert stopped == [True]
+
+
+def test_calibration_dispatch_reports_async_completion(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+    schema = card.get_control_tool()["inputSchema"]
+    assert set(schema["x-completion"]["actions"]) == {
+        "calibrate_front", "calibrate_right"}
+    release = threading.Event()
+    finished = threading.Event()
+    callbacks = []
+
+    def calibrate(direction):
+        release.wait(timeout=1)
+        return {"state": "calibrated", "direction": direction, "remaining": []}
+
+    def notify(action_id, status, result, tool):
+        callbacks.append((action_id, status, result, tool))
+        finished.set()
+
+    monkeypatch.setattr(card, "_calibrate", calibrate)
+    monkeypatch.setattr(module, "_direction_acp_notify", notify, raising=False)
+    result = card.dispatch("calibrate_front", {"_tool_name": "sound_direction_control"})
+    assert result["state"] == "queued"
+    assert result["action_id"]
+    assert not finished.is_set()
+    release.set()
+    assert finished.wait(timeout=1)
+    assert callbacks == [(result["action_id"], "completed",
+                          {"state": "calibrated", "direction": "front", "remaining": []},
+                          "sound_direction_control")]
+
+
+def test_calibration_failure_reports_error_completion(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+    finished = threading.Event()
+    callbacks = []
+    monkeypatch.setattr(card, "_calibrate", lambda direction: {
+        "state": "no_voice", "direction": direction})
+
+    def notify(*args):
+        callbacks.append(args)
+        finished.set()
+
+    monkeypatch.setattr(module, "_direction_acp_notify", notify)
+    first = card.dispatch("calibrate_front", {})
+    second = card.dispatch("calibrate_right", {})
+    assert first["action_id"] != second["action_id"]
+    assert finished.wait(timeout=1)
+    assert callbacks[0][1] == "error"
+    assert callbacks[0][2]["state"] == "no_voice"
+
+
+def test_calibration_completion_posts_to_agent_core(monkeypatch):
+    module = _load_card(monkeypatch)
+    monkeypatch.setenv("AGENT_CORE_URL", "http://127.0.0.1:15678")
+    sent = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return b"ok"
+
+    def urlopen(request, **kwargs):
+        sent.append(request)
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    module._direction_acp_notify(
+        "calibration-1", "completed", {"state": "calibrated"}, "sound_direction_control")
+    assert sent[0].full_url == "http://127.0.0.1:15678/api/acp/complete"
+    assert sent[0].get_method() == "POST"
+    assert {key: value for key, value in json.loads(sent[0].data).items() if key != "ts"} == {
+        "action_id": "calibration-1", "status": "completed",
+        "result": {"state": "calibrated"}, "tool": "sound_direction_control"}
 
 
 def test_direction_card_validates_observations(monkeypatch):
@@ -254,7 +356,7 @@ def test_direction_card_preserves_front_right_calibration(monkeypatch, tmp_path)
     card = module.SoundDirectionPlugin(
         {}, "robot", types.SimpleNamespace(add_node=lambda node: None),
         types.SimpleNamespace(get_audio_capture_data=capture))
-    result = card.dispatch("calibrate_right", {})
+    result = card._calibrate("right")
     assert result == {"state": "calibrated", "direction": "right", "remaining": []}
     assert json.loads(path.read_text()) == {
         "version": 2, "front": [1.0, 0.0, 0.0], "right": [0.0, 1.0, 0.0]}
@@ -299,7 +401,7 @@ def test_calibration_reports_restart_failure_but_preserves_saved_signature(monke
     card._proc = RunningProcess()
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: (
         _ for _ in ()).throw(OSError("spawn failed")))
-    result = card.dispatch("calibrate_front", {})
+    result = card._calibrate("front")
     assert result["state"] == "error"
     assert result["calibration_saved"] is True
     assert result["direction"] == "front"
@@ -313,7 +415,7 @@ def test_calibration_reports_restart_failure_but_preserves_saved_signature(monke
 
     card._proc = RunningProcess()
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: ExitedProcess())
-    result = card.dispatch("calibrate_front", {})
+    result = card._calibrate("front")
     assert result["state"] == "error"
     assert result["calibration_saved"] is True
     assert card._proc is None
@@ -345,8 +447,7 @@ def test_concurrent_direction_calibrations_keep_both_signatures(monkeypatch, tmp
         {}, "robot", types.SimpleNamespace(add_node=lambda node: None),
         types.SimpleNamespace(get_audio_capture_data=capture))
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda direction: card.dispatch(
-            f"calibrate_{direction}", {}), ("front", "right")))
+        results = list(pool.map(card._calibrate, ("front", "right")))
     assert all(result["state"] == "calibrated" for result in results)
     assert set(json.loads(path.read_text())) == {"front", "right"}
 
@@ -368,7 +469,7 @@ def test_direction_calibration_rejects_repeated_frames(monkeypatch, tmp_path):
     card = module.SoundDirectionPlugin(
         {}, "robot", types.SimpleNamespace(add_node=lambda node: None),
         types.SimpleNamespace(get_audio_capture_data=lambda: frame))
-    assert card.dispatch("calibrate_front", {})["state"] == "no_voice"
+    assert card._calibrate("front")["state"] == "no_voice"
     assert not path.exists()
 
 
