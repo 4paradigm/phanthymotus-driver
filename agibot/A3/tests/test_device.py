@@ -2434,6 +2434,22 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertEqual(result["pelvis"]["linear_acceleration"]["x"], 0.01)
         self.assertEqual(result["torso"]["linear_acceleration"]["x"], 0.01)
 
+    def test_skeleton_includes_live_pelvis_imu_quaternion(self):
+        imu = types.SimpleNamespace(orientation=types.SimpleNamespace(
+            w=0.0, x=0.7071068, y=0.0, z=0.7071068))
+        self._callback("/ros2/body_drive/pelvis_imu/data")(imu)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        self.assertEqual(payload["imu_quat"], [0.0, 0.7071068, 0.0, 0.7071068])
+
+    def test_audio_normalization_reads_audio_capture_info_metadata(self):
+        msg = types.SimpleNamespace(info=types.SimpleNamespace(
+            sample_rate=16000, channels=2, sample_format="S16LE", coding_format="PCM"))
+        payload = struct.pack("<4h", 1000, -1000, 2000, 0)
+        self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload),
+                         struct.pack("<2h", 0, 1000))
+        msg.info.coding_format = "AAC"
+        self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload), b"")
+
     def test_imu_info_lists_both_topic_out_streams(self):
         # 6th PR review: Agent Core treats info() as authoritative for topic
         # inference — the imu card must advertise both mirrored streams.

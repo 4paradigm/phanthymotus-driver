@@ -15,7 +15,7 @@
     leg  : hip_pitch -168°~154°, hip_roll -60°~100°, hip_yaw ±158°,
            knee -10°~148°, ankle_pitch -52°~30°, ankle_roll ±20°
     head : pitch 15° down / 25° up, yaw ±90°
-    hand : AgiHand/O10Hand finger abstract values 0~2000 (not modelled here)
+    hand : AgiHand values 0~2000; O10Hand feedback channels 0~4096
 
   The /motion/control/arm_joint_command limits actually enforced by the driver
   (docs §7.1.4) are stricter than §1.3 for some joints; those live in
@@ -202,8 +202,7 @@
     <limit lower="-1.623156" upper="1.623156" effort="0" velocity="4" />
   </joint>
 
-  <!-- ============ hands (end effectors; finger values are abstract 0~2000,
-       not modelled as revolute joints) ============ -->
+  <!-- ============ hands (O10Hand feedback channels, 0~4096) ============ -->
   <link name="left_hand_link" />
   <joint name="left_hand_joint" type="fixed">
     <parent link="left_wrist_yaw_link" />
@@ -216,24 +215,30 @@
     <child link="right_hand_link" />
   </joint>
 
-  <!-- The hand feedback topic exposes indexed finger channels. Keep matching
-       joints in the model so the skeleton renderer does not silently discard
-       right_hand_joint_N / left_hand_joint_N samples. They are abstract
-       channels rather than measured mechanical links. -->
-  <link name="left_hand_channel_0" /><link name="left_hand_channel_1" /><link name="left_hand_channel_2" />
-  <link name="left_hand_channel_3" /><link name="left_hand_channel_4" />
-  <joint name="left_hand_joint_0" type="fixed"><parent link="left_hand_link" /><child link="left_hand_channel_0" /></joint>
-  <joint name="left_hand_joint_1" type="fixed"><parent link="left_hand_link" /><child link="left_hand_channel_1" /></joint>
-  <joint name="left_hand_joint_2" type="fixed"><parent link="left_hand_link" /><child link="left_hand_channel_2" /></joint>
-  <joint name="left_hand_joint_3" type="fixed"><parent link="left_hand_link" /><child link="left_hand_channel_3" /></joint>
-  <joint name="left_hand_joint_4" type="fixed"><parent link="left_hand_link" /><child link="left_hand_channel_4" /></joint>
-  <link name="right_hand_channel_0" /><link name="right_hand_channel_1" /><link name="right_hand_channel_2" />
-  <link name="right_hand_channel_3" /><link name="right_hand_channel_4" />
-  <joint name="right_hand_joint_0" type="fixed"><parent link="right_hand_link" /><child link="right_hand_channel_0" /></joint>
-  <joint name="right_hand_joint_1" type="fixed"><parent link="right_hand_link" /><child link="right_hand_channel_1" /></joint>
-  <joint name="right_hand_joint_2" type="fixed"><parent link="right_hand_link" /><child link="right_hand_channel_2" /></joint>
-  <joint name="right_hand_joint_3" type="fixed"><parent link="right_hand_link" /><child link="right_hand_channel_3" /></joint>
-  <joint name="right_hand_joint_4" type="fixed"><parent link="right_hand_link" /><child link="right_hand_channel_4" /></joint>
+  <!-- These are abstract feedback axes: the SDK exposes channel values rather
+       than hand meshes, but exact names are required by the skeleton renderer. -->
+  <link name="left_hand_channel_0" /><link name="left_hand_channel_1" /><link name="left_hand_channel_2" /><link name="left_hand_channel_3" /><link name="left_hand_channel_4" /><link name="left_hand_channel_5" /><link name="left_hand_channel_6" /><link name="left_hand_channel_7" /><link name="left_hand_channel_8" /><link name="left_hand_channel_9" />
+  <link name="right_hand_channel_0" /><link name="right_hand_channel_1" /><link name="right_hand_channel_2" /><link name="right_hand_channel_3" /><link name="right_hand_channel_4" /><link name="right_hand_channel_5" /><link name="right_hand_channel_6" /><link name="right_hand_channel_7" /><link name="right_hand_channel_8" /><link name="right_hand_channel_9" />
+  <joint name="left_thumb_roration_0" type="revolute"><parent link="left_hand_link" /><child link="left_hand_channel_0" /><axis xyz="1 0 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_thumb_wiggles_1" type="revolute"><parent link="left_hand_channel_0" /><child link="left_hand_channel_1" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_thumb_bent_2" type="revolute"><parent link="left_hand_channel_1" /><child link="left_hand_channel_2" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_index_wiggles_0" type="revolute"><parent link="left_hand_link" /><child link="left_hand_channel_3" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_index_bent_1" type="revolute"><parent link="left_hand_channel_3" /><child link="left_hand_channel_4" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_middle_bent" type="revolute"><parent link="left_hand_link" /><child link="left_hand_channel_5" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_ring_wiggles_0" type="revolute"><parent link="left_hand_link" /><child link="left_hand_channel_6" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_ring_bent_1" type="revolute"><parent link="left_hand_channel_6" /><child link="left_hand_channel_7" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_pinky_wiggles_0" type="revolute"><parent link="left_hand_link" /><child link="left_hand_channel_8" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="left_pinky_bent_1" type="revolute"><parent link="left_hand_channel_8" /><child link="left_hand_channel_9" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_thumb_rotation_0" type="revolute"><parent link="right_hand_link" /><child link="right_hand_channel_0" /><axis xyz="1 0 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_thumb_wiggles_1" type="revolute"><parent link="right_hand_channel_0" /><child link="right_hand_channel_1" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_thumb_bent_2" type="revolute"><parent link="right_hand_channel_1" /><child link="right_hand_channel_2" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_index_wiggles_0" type="revolute"><parent link="right_hand_link" /><child link="right_hand_channel_3" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_index_bent_1" type="revolute"><parent link="right_hand_channel_3" /><child link="right_hand_channel_4" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_middle_bent" type="revolute"><parent link="right_hand_link" /><child link="right_hand_channel_5" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_ring_wiggles_0" type="revolute"><parent link="right_hand_link" /><child link="right_hand_channel_6" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_ring_bent_1" type="revolute"><parent link="right_hand_channel_6" /><child link="right_hand_channel_7" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_pinky_wiggles_0" type="revolute"><parent link="right_hand_link" /><child link="right_hand_channel_8" /><axis xyz="0 1 0" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
+  <joint name="right_pinky_bent_1" type="revolute"><parent link="right_hand_channel_8" /><child link="right_hand_channel_9" /><axis xyz="0 0 1" /><limit lower="0" upper="4096" effort="0" velocity="0" /></joint>
 
   <!-- ============ legs (12 joints, 6 per side, §1.3; exact joint naming is
        internal to the MC firmware and not exposed over the dev interfaces,

@@ -31,6 +31,7 @@ import os
 import struct
 import threading
 import time
+import queue
 from concurrent.futures import ThreadPoolExecutor
 import zlib
 import atexit
@@ -182,7 +183,7 @@ NECK_JOINTS = ("head_yaw_joint", "head_pitch_joint")
 
 # Hand (docs §7.1.5): command position 0 (open) .. 2000 (closed); state 0..4096.
 HAND_COMMAND_MAX = 2000
-HAND_O10_MAX = 2000
+HAND_O10_MAX = 4096
 HAND_TYPES = {"AgiHand": "agi_hand", "O10Hand": "o10_hand"}
 
 # Mic source (docs §7.3.5): 0=internal (v3.2 has a known hardware BUG — avoid),
@@ -519,6 +520,10 @@ class A3Nodes:
         self._audio_buffers = {"mic": bytearray(), "ext_mic": bytearray()}
         self._audio_lock = threading.Lock()
         self._audio_received = {"mic": 0, "ext_mic": 0}
+        self._audio_queues = {"mic": queue.Queue(maxsize=8),
+                              "ext_mic": queue.Queue(maxsize=8)}
+        self._audio_threads = {}
+        self._audio_thread_lock = threading.Lock()
 
         # A3 HAL media publishers use ROS' sensor-data profile.  Keep this
         # exact profile: a RELIABLE subscriber is incompatible with the
@@ -537,9 +542,8 @@ class A3Nodes:
             String, _core_topic(namespace, "state/joints"), 5)
         self._joint_state_pub = self.core.create_publisher(
             String, _core_topic(namespace, "state/joint_state"), 5)
-        # Publish a neutral skeleton immediately and keep it alive even when a
-        # firmware build emits joint feedback only on change.  The dashboard
-        # otherwise sees no first sample and never loads/updates the model.
+        # Publish an explicit unavailable skeleton until real feedback arrives.
+        # Filling missing joints with zero would fabricate a standing pose.
         self._publish_joint_streams()
         self._joint_timer = None
         if hasattr(self.robot, "create_timer"):
@@ -584,11 +588,16 @@ class A3Nodes:
                     self._media_received[key] = count
                     if count == 1 or count % 1000 == 0:
                         print(f"[media] received={count} key={key} topic={robot_topic}", flush=True)
-                if key in ("arm_state", "hand_state", "neck_state"):
+                if key in ("arm_state", "hand_state", "neck_state", "leg_state"):
                     self._joint_cache[key] = jsonable(msg)
                     self._publish_joint_streams()
                 elif key in ("imu_pelvis", "imu_torso"):
                     self._publish_imu_streams(key, jsonable(msg))
+                    # The IMU quaternion is the root orientation in the
+                    # skeleton contract. Re-emit the aggregate pose whenever
+                    # IMU data changes, otherwise the model stays at the
+                    # orientation captured when the last joint packet arrived.
+                    self._publish_joint_streams()
                 if key == "lidar_cloud":
                     if self._jazzy_relay:
                         pub.publish(msg)
@@ -765,15 +774,10 @@ class A3Nodes:
         # resolves audio/pcm-16k to that AudioChunk type, which includes a
         # std_msgs/Header; omitting it gives the bridge a different ROS type
         # hash even though the publisher appears in logs.
-        try:
-            stamp = getattr(msg, "stamps", None) or getattr(msg, "stamp", None)
-            if stamp is not None:
-                out.header.stamp = stamp
-            elif getattr(msg, "header", None) is not None:
-                out.header = msg.header
-        except (AttributeError, TypeError):
-            pass
-        out.format = "audio/pcm-16k"
+        # AudioCapture timestamps describe capture time and can arrive in
+        # bursts after a relay backlog.  Reusing them makes the frontend
+        # treat freshly published chunks as stale/future audio.  The paced
+        # publisher stamps each chunk at publication time instead.
         payload = getattr(msg, "data", None)
         if hasattr(payload, "data"):
             payload = payload.data
@@ -785,14 +789,48 @@ class A3Nodes:
             payload = bytes(payload or b"")
         except (TypeError, ValueError):
             payload = b""
-        # AudioChunk is signed 16-bit PCM. Never split a sample at a chunk
-        # boundary, even if a HAL implementation reports an odd byte count.
-        payload = payload[:len(payload) - (len(payload) % 2)]
+        payload = self._normalize_audio_payload(msg, payload)
+        out.format = "audio/pcm-16k"
         out.data = list(payload)
         return out
 
+    @staticmethod
+    def _normalize_audio_payload(msg, payload):
+        """Convert common HAL PCM formats to the Core mono 16 kHz contract."""
+        # AudioCapture.msg defines AudioInfo info and AudioData data; the
+        # metadata belongs to info while data contains only the byte sequence.
+        info = getattr(msg, "info", None)
+        rate = int(getattr(info, "sample_rate", 16000) or 16000)
+        channels = int(getattr(info, "channels", 0) or 1)
+        sample_format = str(getattr(info, "sample_format", "") or "").upper()
+        coding_format = str(getattr(info, "coding_format", "") or "").upper()
+        if sample_format not in {"", "S16LE", "PCM_S16LE", "SIGNED_16"}:
+            return b""
+        if coding_format not in {"", "PCM", "PCM_S16LE", "S16LE"}:
+            return b""
+        if not payload:
+            return b""
+        channels = max(1, channels)
+        frame_bytes = channels * 2
+        payload = payload[:len(payload) - (len(payload) % frame_bytes)]
+        if channels > 1:
+            import struct
+            samples = struct.unpack("<%dh" % (len(payload) // 2), payload)
+            mono = [sum(samples[i:i + channels]) // channels
+                    for i in range(0, len(samples), channels)]
+            payload = struct.pack("<%dh" % len(mono), *mono)
+        if rate != 16000 and rate > 0:
+            import struct
+            samples = struct.unpack("<%dh" % (len(payload) // 2), payload)
+            target_count = max(1, round(len(samples) * 16000 / rate))
+            resampled = [samples[min(len(samples) - 1,
+                                     int(i * rate / 16000))]
+                         for i in range(target_count)]
+            payload = struct.pack("<%dh" % len(resampled), *resampled)
+        return payload
+
     def _publish_audio(self, publisher, key, msg):
-        """Publish complete 512-sample PCM frames, never tiny capture periods."""
+        """Queue PCM and publish 32 ms frames at real-time speed."""
         chunk = self._audio_chunk(msg)
         payload = bytes(getattr(chunk, "data", ()))
         if not payload:
@@ -803,23 +841,57 @@ class A3Nodes:
         with self._audio_lock:
             buffer = self._audio_buffers.setdefault(key, bytearray())
             buffer.extend(payload)
-            # The dashboard must see live audio, not a growing recording. If
-            # capture briefly outruns the bridge, retain only the newest audio.
+            # Bound latency to roughly 128 ms; old audio is less useful than
+            # dropping it when the consumer is behind.
             if len(buffer) > 4096:
-                del buffer[:-2048]
+                del buffer[:-4096]
             frames = []
             while len(buffer) >= 1024:
                 frames.append(bytes(buffer[:1024]))
                 del buffer[:1024]
-        for data in frames:
+        q = self._audio_queues[key]
+        for frame in frames:
+            try:
+                q.put_nowait((publisher, frame, getattr(chunk, "header", None)))
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    continue
+                try:
+                    q.put_nowait((publisher, frame, None))
+                except queue.Full:
+                    pass
+        with self._audio_thread_lock:
+            if key not in self._audio_threads:
+                self._audio_threads[key] = threading.Thread(
+                    target=self._audio_pump, args=(key,), daemon=True,
+                    name=f"a3-{key}-pacer")
+                self._audio_threads[key].start()
+
+    def _audio_pump(self, key):
+        q = self._audio_queues[key]
+        next_deadline = time.monotonic()
+        while True:
+            publisher, data, header = q.get()
+            delay = next_deadline - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
             output = self._AudioChunk()
             try:
-                output.header = chunk.header
-            except AttributeError:
-                pass
+                # Use the local clock after pacing, not the source capture
+                # timestamp, so downstream buffering tracks this stream.
+                output.header.stamp = self.clock.now().to_msg()
+            except (AttributeError, TypeError):
+                if header is not None:
+                    try:
+                        output.header = header
+                    except AttributeError:
+                        pass
             output.format = "audio/pcm-16k"
             output.data = list(data)
             publisher.publish(output)
+            next_deadline = max(next_deadline + 0.032, time.monotonic())
 
     def hand_command_layout(self, hand_type):
         """Use the real channel names reported by the installed hand."""
@@ -1174,22 +1246,34 @@ class A3Nodes:
                 # available in joint_state's raw JSON stream.
                 if canonical not in model_indices:
                     continue
+                position = positions[index] if index < len(positions) else 0.0
+                # O10Hand reports scalar counts (0..4096), while the
+                # skeleton renderer applies q as a revolute angle. Keep the
+                # abstract hand axes within a useful visual range instead of
+                # rotating thousands of radians.
+                if group_key == "hand":
+                    position = float(position) / HAND_O10_MAX * (math.pi / 2)
                 joints.append({"idx": model_indices[canonical], "name": canonical,
-                               "q": positions[index] if index < len(positions) else 0.0,
+                               "q": position,
                                "dq": velocities[index] if index < len(velocities) else 0.0,
                                "tau": efforts[index] if index < len(efforts) else 0.0})
                 seen.add(canonical)
-        # The A3 feedback topics expose arms/neck only. The dashboard still
-        # needs a complete model pose; fill unreported body joints at neutral
-        # rather than publishing an empty skeleton that the renderer discards.
-        for canonical, index in model_indices.items():
-            if canonical not in seen:
-                joints.append({"idx": index, "name": canonical,
-                               "q": 0.0, "dq": 0.0, "tau": 0.0})
         output = self._String()
+        imu_quat = None
+        imu = self.values.get("imu_pelvis") or {}
+        orientation = imu.get("orientation") if isinstance(imu, dict) else None
+        if isinstance(orientation, dict):
+            try:
+                candidate = [float(orientation[key]) for key in ("w", "x", "y", "z")]
+                if all(math.isfinite(value) for value in candidate):
+                    imu_quat = candidate
+            except (KeyError, TypeError, ValueError):
+                pass
         output.data = json.dumps({"format": "sensor/skeleton", "available": bool(joints),
-                                  "fresh": bool(joints), "joint_count": len(joints),
+                                  "fresh": bool(joints), "complete": len(seen) == len(model_indices),
+                                  "coverage": len(seen), "joint_count": len(joints),
                                   "timestamp_ms": int(time.time() * 1000),
+                                  **({"imu_quat": imu_quat} if imu_quat is not None else {}),
                                   "joints": joints}, ensure_ascii=False)
         self._joint_skeleton_pub.publish(output)
 
@@ -1994,8 +2078,14 @@ def _motion_gate(rpc, card: str):
     except Exception:
         current = "UNKNOWN"
     if current != "MOTION":
+        if current in {"GET_UP", "LIE_DOWN", "DAMPING"}:
+            suggestion = (f"{card} 当前处于 {current} 过渡状态；请先执行 mc_mode get_up，"
+                          "再等待 mc_mode get_state 返回 MOTION（机器人站稳）后重试")
+        else:
+            suggestion = (f"{card} 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up，"
+                          "并等待状态变为 MOTION 后重试")
         return {"state": "rejected", "current": current or "UNKNOWN",
-                "suggestion": f"{card} 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up，确认状态变为 MOTION 后重试"}
+                "suggestion": suggestion}
     return None
 
 
@@ -2411,8 +2501,8 @@ class HandControlPlugin:
                          "description": "选择左手、右手或双手"},
                 "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000,
                                  "default": 500, "description": "持续下发时长；设备要求关节指令连续发布"},
-                "left": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "左手各指张合等级，按真机关节顺序"},
-                "right": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "右手各指张合等级，按真机关节顺序"},
+                "left": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_O10_MAX}, "description": "左手各指张合等级；O10Hand 为 0~4096，AgiHand 为 0~2000"},
+                "right": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_O10_MAX}, "description": "右手各指张合等级；O10Hand 为 0~4096，AgiHand 为 0~2000"},
                 "hand_type": {"type": "string", "enum": ["AgiHand", "O10Hand"], "default": "AgiHand"},
             },
         )
@@ -2456,10 +2546,12 @@ class HandControlPlugin:
             if values is None:
                 continue
             for i, value in enumerate(values):
-                # Command protocol uses indexed JointState names; feedback
-                # channel labels (O10Hand's thumb/index spellings) are not
-                # accepted as command joint names by MotionControl.
-                name = f"{side}_hand_joint_{i}"
+                live_names = live_left if side == "left" else live_right
+                # Prefer the names reported by the active O10Hand/AgiHand.
+                # Some firmware accepts only these channel labels; indexed
+                # names remain the documented fallback when no feedback has
+                # arrived yet.
+                name = live_names[i] if i < len(live_names) else f"{side}_hand_joint_{i}"
                 positions[name] = _clamp(float(value), 0.0, max_value, f"{side} 手指 {i}")
         _require(positions, "至少提供 left 或 right 张合等级")
         rejected = _motion_gate(self.nodes.rpc, "hand_control")
