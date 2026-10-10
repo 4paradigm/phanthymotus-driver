@@ -1,0 +1,20 @@
+name: LimX TRON 2 EDU
+mcp_port: 15740
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+tron2:
+  enabled: false
+  endpoint: ""
+  accid: ""
+  # fixed_arms | mobile_arms | biped | wheeled_biped
+  # Select the installed configuration; never hot-swap a running driver.
+  profile: fixed_arms
+  motion_enabled: false
+  # Biped: normalized ratios; wheeled biped: native x/z command units.
+  speed_limit: 0.2
+  # Read-only sampling; a single worker prevents query backlogs.
+  telemetry_hz: 5
+  gripper_state_enabled: false
+  # Only applies to mobile_arms with the corresponding modules installed.
+  mobile_state_enabled: false

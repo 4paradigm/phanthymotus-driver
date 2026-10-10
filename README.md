@@ -22,6 +22,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
+| `limx/tron2_edu` | LimX TRON 2 EDU | 15740 | Configuration-aware telemetry and leased leg/wheel velocity; arm execution awaits vendor interrupt contract |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 
 ## Quick Start
