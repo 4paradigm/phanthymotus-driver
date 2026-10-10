@@ -22,7 +22,10 @@ start)
   # instead, then enter the host root (without -m) so the host Jazzy install and
   # /tmp path are visible.  PID/network namespaces are still entered for DDS.
   cp "$SOURCE" "$HOST_SOURCE"
-  nsenter -t 1 -r -u -n -p -- /usr/bin/bash -lc \
+  # Do not let nsenter inherit a removed container cwd.  Also avoid a login
+  # shell: host profiles can re-source the container's Humble environment.
+  cd /tmp
+  nsenter -t 1 -r -u -n -p -- /usr/bin/bash --noprofile --norc -c \
     'set -e
      cd /tmp
      # The launcher inherits the Humble process environment.  Jazzy setup
@@ -31,6 +34,9 @@ start)
      unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION AMENT_PREFIX_PATH
      unset COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
      unset AMENT_TRACE_SETUP_FILES AMENT_TRACE_SETUP
+     export ROS_HOME=/opt/phanthy-motus/data/a3-relay/ros-home
+     export ROS_LOG_DIR=/opt/phanthy-motus/data/a3-relay/ros-log
+     mkdir -p "$ROS_HOME" "$ROS_LOG_DIR"
      if [ -f /opt/ros/jazzy/setup.sh ]; then
        . /opt/ros/jazzy/setup.sh
      elif [ -f /opt/ros/jazzy/setup.bash ]; then
