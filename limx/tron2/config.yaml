@@ -1,0 +1,8 @@
+mcp_port: 15791
+robot:
+  url: ws://10.192.1.2:5000
+  # Set TRON2_SERIAL in the deployment environment, or set the actual serial here.
+  serial: ""
+plugins:
+  reset_pose:
+    enabled: true

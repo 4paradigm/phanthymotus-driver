@@ -1,0 +1,6 @@
+home.json
+commissioning.json
+unconfirmed-motion.json
+.env
+*.pem
+__pycache__/

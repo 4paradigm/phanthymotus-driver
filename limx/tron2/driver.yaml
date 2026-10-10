@@ -1,0 +1,13 @@
+id: limx-tron2-driver
+name: LimX TRON2 Arms Reset
+category: driver
+hardware_provider: limx
+hardware_model: tron2
+image_name: limx-tron2
+port: 15791
+mcp_url: "http://localhost:15791/mcp"
+description: "TRON2 双臂固定姿态复位：只读状态/预览、平台 start/stop 启用调用、单次 MoveJ 与连续反馈到位验收；不控制头部和夹爪"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: reset_pose, type: actuator }
