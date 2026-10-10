@@ -1946,6 +1946,10 @@ def build_plugins(config, namespace, ros2):
             camera_config, namespace, ros2.executor_core
         )
         plugins.append(ext_camera_plugin)
+    if config.get("aruco_zones", {}).get("enabled", False):
+        from aruco_canvas import ArucoZonesPlugin
+
+        plugins.append(ArucoZonesPlugin(config["aruco_zones"], namespace, ros2.executor_core))
     vision_config = config.get("vision_capture", {})
     # Vision capture is an explicit capability; an enabled RGB camera alone
     # must not implicitly add an undeclared recording card.

@@ -6,6 +6,8 @@ arm_ip: ""
 tcp_port: 8080
 ext_camera:
   enabled: true
+aruco_zones:
+  enabled: true
 vision_capture:
   enabled: true
   camera: external
