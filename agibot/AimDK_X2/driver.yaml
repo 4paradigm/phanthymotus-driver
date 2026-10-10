@@ -14,6 +14,7 @@ build_context_extras:
 cards:
   - { name: mc_state,           type: sensor }
   - { name: joint_state,        type: sensor }
+  - { name: joints,             type: sensor }
   - { name: hand_state,         type: sensor }
   - { name: imu,                type: sensor }
   - { name: camera_rgb,         type: sensor }

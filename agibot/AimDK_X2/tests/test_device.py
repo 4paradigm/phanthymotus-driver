@@ -8,6 +8,7 @@ verification" note in CLAUDE.md.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 import unittest
@@ -76,13 +77,18 @@ class FakeClient:
         self.srv_name = name
         self.response = None
         self.last_request = None
+        self.available = True
+        self.future_exception = None
 
     def wait_for_service(self, timeout_sec=None):
-        return True
+        return self.available
 
     def call_async(self, request):
         self.last_request = request
-        return FakeFuture(result=self.response if self.response is not None else FakeMsg())
+        return FakeFuture(
+            result=self.response if self.response is not None else FakeMsg(),
+            exc=self.future_exception,
+        )
 
 
 class FakeClock:
@@ -100,6 +106,7 @@ class FakeNode:
         self.publishers = {}
         self.subscriptions = []
         self.clients = {}
+        self.timers = []
 
     def create_publisher(self, msg_type, topic, qos):
         pub = FakePublisher(msg_type, topic, qos)
@@ -114,6 +121,11 @@ class FakeNode:
         client = FakeClient(srv_type, name)
         self.clients[name] = client
         return client
+
+    def create_timer(self, period, callback):
+        timer = types.SimpleNamespace(period=period, callback=callback)
+        self.timers.append(timer)
+        return timer
 
     def get_clock(self):
         return FakeClock()
@@ -145,9 +157,7 @@ class FakeExecutor:
 class FakeROS2:
     def __init__(self):
         self.ctx_robot = object()
-        self.ctx_core = object()
         self.executor_robot = FakeExecutor()
-        self.executor_core = FakeExecutor()
 
 
 def _install_ros_stubs():
@@ -190,10 +200,11 @@ def _install_ros_stubs():
         HandStateArray=FakeMsg,
         JointCommand=FakeMsg,
         JointCommandArray=FakeMsg,
+        JointStateArray=FakeMsg,
         McLocomotionVelocity=FakeMsg,
     )
     srv_names = [
-        "ExecuteActionResource", "GetAllJointState", "GetCurrentInputSource", "GetHandType",
+        "ExecuteActionResource", "GetCurrentInputSource", "GetHandType",
         "GetMcAction", "GetMicSourceRequest", "GetRobotResources", "GetStoredMapByName",
         "GetSystemState", "PlayEmoji", "PlayTts", "SetMcAction", "SetMcInputSource",
         "SetMcPresetMotion", "SetMicSourceRequest", "SetPmuLed",
@@ -202,6 +213,15 @@ def _install_ros_stubs():
 
 
 _install_ros_stubs()
+
+# Production routes Agent Core output through a Unix socket.  Unit tests keep
+# those publications in memory so payload assertions do not require ROS
+# serialization or a running bridge process.
+bridge_stub = types.ModuleType("x2_bridged_publisher")
+bridge_stub.create_bridged_publisher = lambda msg_type, topic, qos: FakePublisher(
+    msg_type, topic, qos
+)
+sys.modules["x2_bridged_publisher"] = bridge_stub
 
 import yaml  # noqa: E402
 
@@ -235,6 +255,35 @@ def find_plugin(plugins, tool_name):
 
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_main_installs_logsafe_before_driver_imports(self):
+        main = (DEVICE_DIR / "main.py").read_text(encoding="utf-8")
+        self.assertLess(main.index("logsafe.install()"), main.index("from common.vendor_runtime"))
+
+    def test_container_disables_native_ros_colorized_logs(self):
+        dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
+
+    def test_x2_keeps_domain_42_in_the_loopback_only_bridge_process(self):
+        """The robot-profile process must never create an Agent Core DDS participant."""
+        config = (DEVICE_DIR / "config.yaml").read_text(encoding="utf-8")
+        source = (DEVICE_DIR / "device.py").read_text(encoding="utf-8")
+        entrypoint = (DEVICE_DIR / "x2_bundle_entrypoint.sh").read_text(encoding="utf-8")
+
+        self.assertIn("core_domain_id: null", config)
+        self.assertNotIn("ctx_core", source)
+        self.assertNotIn("agibot_x2_driver_core", source)
+        self.assertIn('exec python3 /work/agibot/AimDK_X2/main.py', entrypoint)
+        self.assertIn('FASTRTPS_DEFAULT_PROFILES_FILE="$robot_profile"', entrypoint)
+        self.assertIn('ROS_DOMAIN_ID="${CORE_ROS_DOMAIN_ID:-42}"', entrypoint)
+        self.assertIn('/opt/phanthy-motus/dds-local.xml', entrypoint)
+        self.assertIn('exec python3 /work/agibot/AimDK_X2/x2_socket_bridge.py', entrypoint)
+
+    def test_model_resource_documentation_returns_a_plain_dict(self):
+        readme = (REPO_ROOT / "README_dev.md").read_text(encoding="utf-8")
+        self.assertIn('return {"urdf": urdf_path.read_text(encoding="utf-8")}', readme)
+        model_example = readme[readme.index('**1. `model` tool'):readme.index('**2. `joints` tool')]
+        self.assertNotIn('return [{"type": "text"', model_example)
+
     def test_tool_names_and_types_match_driver_yaml(self):
         plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
         definitions = tool_definitions(plugins)
@@ -274,8 +323,24 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
+        for name in ("mc_state", "joint_state", "joints", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_joint_stream_tools_have_distinct_topics_and_formats(self):
+        plugins = build_bundle_plugins()
+        by_name = {definition["name"]: definition for definition in tool_definitions(plugins)}
+        joint_state_topic = [{
+            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
+        }]
+        joints_topic = [{
+            "topic": "/test_ns/state/joints", "format": "sensor/skeleton",
+        }]
+
+        self.assertEqual(by_name["joint_state"]["topic_out"], joint_state_topic)
+        self.assertEqual(by_name["joints"]["topic_out"], joints_topic)
+        self.assertNotEqual(by_name["joint_state"]["topic_out"], by_name["joints"]["topic_out"])
+        self.assertEqual(find_plugin(plugins, "joint_state").dispatch("info", {})["topic_out"], joint_state_topic)
+        self.assertEqual(find_plugin(plugins, "joints").dispatch("info", {})["topic_out"], joints_topic)
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()
@@ -300,6 +365,91 @@ class ModelPluginTests(unittest.TestCase):
         model_plugin = find_plugin(plugins, "model")
         with self.assertRaises(ValueError):
             model_plugin.dispatch("model", {"variant": "nonexistent"})
+
+
+class JointsPluginTests(unittest.TestCase):
+    @staticmethod
+    def _joint(name, position, velocity=0.0, effort=0.0, error_code=0):
+        return types.SimpleNamespace(
+            name=name, position=position, velocity=velocity,
+            effort=effort, error_code=error_code,
+        )
+
+    def test_direct_joint_topic_publishes_raw_and_skeleton_streams(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        nodes = plugins[0].nodes
+        callbacks = dict(nodes.robot.subscriptions)
+        leg_name = nodes.skeleton_joints["leg"][0]
+
+        callbacks["/aima/hal/joint/leg/state"](types.SimpleNamespace(joints=[
+            self._joint(leg_name, 0.25, velocity=0.5, effort=0.75),
+        ]))
+
+        raw = json.loads(nodes.joint_state_pub.published[-1].data)
+        skeleton = json.loads(nodes.joints_pub.published[-1].data)
+        self.assertEqual(raw["state"], "running")
+        self.assertEqual(raw["received_areas"], ["leg"])
+        self.assertEqual(raw["joint_counts"], {"leg": 1, "waist": 0, "arm": 0, "head": 0})
+        self.assertEqual(raw["leg"][0]["name"], leg_name)
+        self.assertEqual(skeleton["joints"], [{
+            "idx": nodes.skeleton_joint_indices[leg_name],
+            "name": leg_name, "q": 0.25, "dq": 0.5, "tau": 0.75,
+        }])
+
+    def test_all_urdf_variants_map_every_skeleton_joint_exactly_once(self):
+        for variant in ("fist", "hand", "ultra"):
+            groups, indices = device.skeleton_layout(variant)
+            names = [name for group in groups.values() for name in group]
+            self.assertEqual(len(names), len(set(names)), variant)
+            self.assertTrue(names, variant)
+            self.assertTrue(all(name in indices for name in names), variant)
+
+    def test_fastdds_template_uses_runtime_interface_ipv4(self):
+        template = (DEVICE_DIR / "resource" / "fastdds_develop0.xml").read_text(encoding="utf-8")
+        entrypoint = (DEVICE_DIR / "x2_bundle_entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn("__ROBOT_INTERFACE_IPV4__", template)
+        self.assertIn("ip -4 -o addr show dev", entrypoint)
+        self.assertIn("ROBOT_INTERFACE_IPV4", entrypoint)
+
+    def test_unknown_joint_name_is_diagnostic_not_fabricated_skeleton_data(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        nodes = plugins[0].nodes
+        callbacks = dict(nodes.robot.subscriptions)
+
+        callbacks["/aima/hal/joint/arm/state"](types.SimpleNamespace(joints=[
+            self._joint("vendor_joint_not_in_urdf", 1.0),
+        ]))
+
+        skeleton = json.loads(nodes.joints_pub.published[-1].data)
+        self.assertEqual(skeleton["joints"], [])
+        self.assertEqual(
+            skeleton["diagnostics"]["unknown_joint_names"],
+            ["vendor_joint_not_in_urdf"],
+        )
+
+    def test_streams_wait_without_inventing_zero_joint_values(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        joint_state = find_plugin(plugins, "joint_state").dispatch("info", {})
+        joints = find_plugin(plugins, "joints").dispatch("info", {})
+
+        self.assertEqual(joint_state["state"], "waiting")
+        self.assertFalse(joint_state["available"])
+        self.assertEqual(joint_state["joint_counts"], {"leg": 0, "waist": 0, "arm": 0, "head": 0})
+        self.assertEqual(joints["state"], "waiting")
+        self.assertFalse(joints["available"])
+        self.assertEqual(joints["joints"], [])
+
+    def test_lifecycle_reports_canvas_state_without_stopping_subscriptions(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        for name in ("joint_state", "joints"):
+            plugin = find_plugin(plugins, name)
+            self.assertEqual(plugin.dispatch("start", {})["state"], "running")
+            self.assertEqual(plugin.dispatch("stop", {})["state"], "idle")
+
+        nodes = plugins[0].nodes
+        subscribed_topics = {topic for topic, _ in nodes.robot.subscriptions}
+        for area in device.JOINT_AREAS:
+            self.assertIn(f"/aima/hal/joint/{area}/state", subscribed_topics)
 
 
 class DispatchSmokeTests(unittest.TestCase):
@@ -333,7 +483,6 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
-
 
 class StartStopLifecycleTests(unittest.TestCase):
     """README_dev.md's 'start/stop in dispatch (Required)' rule: the canvas UI calls every
