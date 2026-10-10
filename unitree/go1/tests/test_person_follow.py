@@ -4,11 +4,13 @@ import math
 import importlib
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 
 from unitree.go1.person_follow import (Detection, TargetTracker, PersonFollowPlugin,
                                       YoloXOnnxDetector, decode_yolox,
@@ -112,6 +114,7 @@ def test_follow_command_stops_for_missing_far_or_close_target():
     # 远景样本 9–12 的脚点约在画面高度 0.53–0.56，不应触发转向或前进。
     assert follow_command(box("person", .1, .2, .3, .53)) == (0.0, 0.0)
     assert follow_command(box("shoe", .6, .4, .8, .55)) == (0.0, 0.0)
+    assert follow_command(box("shoe", .4, .4, .6, .66)) == (0.0, 0.0)
     vx, yaw = follow_command(box("shoe", .6, .4, .8, .60))
     assert 0 < vx <= .15
     assert yaw < 0
@@ -135,6 +138,10 @@ class Client:
     def diagnostics(self):
         return {"accessible": True, "recv_count": self.stops + len(self.moves) + 1}
 
+    def snapshot(self):
+        return {"fresh": True, "observed_monotonic": time.monotonic(),
+                "mode": 2, "velocity": [.1, 0, 0]}
+
     def move(self, vx, vy, yaw, gait=1):
         self.moves.append((vx, vy, yaw))
         return {"vx": vx, "vy": vy, "yaw": yaw}
@@ -156,6 +163,22 @@ def test_card_requires_model_before_following():
 def test_follow_advertises_physical_motion_as_dangerous():
     schema = PersonFollowPlugin({"model_path": ""}, client=Client()).get_tool()["inputSchema"]
     assert schema["x-is-dangerous"] is True
+
+
+def test_default_config_keeps_experimental_follow_disabled():
+    config = Path(__file__).resolve().parents[1] / "config.yaml"
+    assert yaml.safe_load(config.read_text(encoding="utf-8"))["plugins"]["person_follow"]["enabled"] is False
+
+
+def test_sdk_snapshot_records_successful_parse_time():
+    from unitree.go1.go1_sdk_client import Go1HighSdkClient
+
+    client = object.__new__(Go1HighSdkClient)
+    client._lock = threading.Lock()
+    client._snapshot = {}
+    before = time.monotonic()
+    client._parse_state(SimpleNamespace())
+    assert before <= client.snapshot()["observed_monotonic"] <= time.monotonic()
 
 
 @pytest.mark.parametrize("action,args", [
@@ -399,3 +422,100 @@ def test_cancel_during_diagnostics_prevents_late_follow_move(tmp_path, monkeypat
     monkeypatch.setattr(person_follow.select, "select", lambda connections, *args: (connections, [], []))
     card._run()
     assert client.moves == []
+
+
+def test_rising_packet_count_cannot_override_stale_robot_feedback(tmp_path, monkeypatch):
+    from struct import pack
+    from unitree.go1 import person_follow
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def setblocking(self, value):
+            pass
+
+        def recv(self, size):
+            if not hasattr(self, "sent"):
+                self.sent = True
+                return pack(">I", 1) + b"a"
+            raise BlockingIOError()
+
+    class Detector:
+        def __init__(self, path):
+            pass
+
+        def detect(self, jpeg):
+            return [box("shoe", .4, .4, .6, .62)]
+
+    client = Client()
+    client.snapshot = lambda: {"fresh": True, "observed_monotonic": time.monotonic() - 2,
+                               "mode": 2, "velocity": [.1, 0, 0]}
+    client.move = lambda *args, **kwargs: pytest.fail("stale feedback must prevent motion")
+    card = PersonFollowPlugin({"model_path": str(tmp_path / "model.onnx")}, client=client)
+    card._owns_motion = True
+    monkeypatch.setattr(person_follow, "YoloXOnnxDetector", Detector)
+    monkeypatch.setattr(person_follow.socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(person_follow.select, "select", lambda connections, *args: (connections, [], []))
+    with pytest.raises(RuntimeError, match="feedback"):
+        card._run()
+    assert client.moves == []
+    assert client.stops >= 1
+
+
+@pytest.mark.parametrize("mode,velocity", [(1, [0, 0, 0]), (2, [.1, 0, 0])])
+def test_follow_stops_when_robot_reports_no_motion_after_command(tmp_path, monkeypatch,
+                                                                mode, velocity):
+    from struct import pack
+    from unitree.go1 import person_follow
+
+    class Connection:
+        ready = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def setblocking(self, value):
+            pass
+
+        def recv(self, size):
+            if self.ready:
+                self.ready = False
+                return pack(">I", 1) + b"a"
+            self.ready = True
+            raise BlockingIOError()
+
+    class Detector:
+        def __init__(self, path):
+            pass
+
+        def detect(self, jpeg):
+            return [box("shoe", .4, .4, .6, .62)]
+
+    client = Client()
+    client.snapshot = lambda: {"fresh": True, "observed_monotonic": time.monotonic(),
+                               "mode": mode, "velocity": velocity, "position": [0, 0, 0]}
+    card = PersonFollowPlugin({"model_path": str(tmp_path / "model.onnx")}, client=client)
+    card._owns_motion = True
+    monkeypatch.setattr(person_follow, "YoloXOnnxDetector", Detector)
+    monkeypatch.setattr(person_follow.socket, "create_connection", lambda *args, **kwargs: Connection())
+
+    deadline = time.monotonic() + 1.2
+
+    def select(connections, *args):
+        if time.monotonic() > deadline:
+            raise TimeoutError("test stopped an unbounded follow loop")
+        time.sleep(.06)
+        return connections, [], []
+
+    monkeypatch.setattr(person_follow.select, "select", select)
+    with pytest.raises(RuntimeError, match="motion feedback"):
+        card._run()
+    assert client.moves
+    assert client.stops >= 1

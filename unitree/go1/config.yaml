@@ -31,7 +31,7 @@ plugins:
     enabled: true
     output_dir: "/opt/phanthy-motus/data/vision_capture"
   person_follow:
-    enabled: true
+    enabled: false             # 实验跟随须在监督测试前显式开启
     # 先训练并验证 person/shoe 两类模型，再将权重放到挂载的数据目录。
     model_path: "/opt/phanthy-motus/data/person_follow/person_shoe_yolox_nano.onnx"
   camera_depth:

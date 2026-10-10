@@ -104,6 +104,8 @@ def follow_command(target):
     if target is None or target.y2 < .58 or target.y2 >= .68:
         return 0.0, 0.0
     vx = min(.15, max(0.0, (.68 - target.y2) * .6))
+    if vx < .03:
+        return 0.0, 0.0
     error_x = target.center_x - .5
     yaw = 0.0 if abs(error_x) <= .08 else max(-.3, min(.3, -error_x * .8))
     return vx, yaw
@@ -346,6 +348,8 @@ class PersonFollowPlugin:
             last_frame = time.monotonic()
             first_frame = False
             previous_recv = None
+            motion_started = None
+            motion_origin = None
             with self._lock:
                 self._state = "following"
             while not self._cancel.is_set():
@@ -388,14 +392,36 @@ class PersonFollowPlugin:
                 vx, yaw = follow_command(target)
                 if vx == 0 and yaw == 0:
                     self._stop_owned_motion()
+                    motion_started = None
+                    motion_origin = None
                     continue
                 diag = self._client.diagnostics()
                 recv = diag.get("recv_count", 0)
+                feedback = self._client.snapshot()
+                observed = feedback.get("observed_monotonic")
+                feedback_age = (time.monotonic() - observed if isinstance(observed, (int, float))
+                                else float("inf"))
                 if (not diag.get("accessible") or
                         (previous_recv is not None and recv <= previous_recv) or
+                        not feedback.get("fresh") or not 0 <= feedback_age <= .4 or
                         time.monotonic() - last_frame > .4):
                     self._stop_owned_motion()
                     raise RuntimeError("Go1 feedback or camera frame is stale")
+                # 中文说明：收包增加不代表运动被执行；超过启动宽限期仍未看到步行反馈就停车。
+                if motion_started is not None and time.monotonic() - motion_started > .5:
+                    velocity = feedback.get("velocity")
+                    position = feedback.get("position")
+                    moved = (isinstance(position, (list, tuple)) and len(position) >= 2 and
+                             isinstance(motion_origin, (list, tuple)) and len(motion_origin) >= 2 and
+                             all(isinstance(value, (int, float)) for value in
+                                 (*position[:2], *motion_origin[:2])) and
+                             (position[0] - motion_origin[0]) ** 2 +
+                             (position[1] - motion_origin[1]) ** 2 >= .005 ** 2)
+                    if (feedback.get("mode") != 2 or not isinstance(velocity, (list, tuple)) or
+                            not velocity or not isinstance(velocity[0], (int, float)) or
+                            velocity[0] < max(.01, vx * .2) or not moved):
+                        self._stop_owned_motion()
+                        raise RuntimeError("Go1 motion feedback does not match follow command")
                 previous_recv = recv
                 with self._motion_lock:
                     if self._cancel.is_set() or not self._owns_motion:
@@ -403,6 +429,9 @@ class PersonFollowPlugin:
                     result = self._client.move(vx, 0.0, yaw, gait=1)
                 if result is None:
                     raise RuntimeError("Go1 rejected the follow command")
+                if motion_started is None:
+                    motion_started = time.monotonic()
+                    motion_origin = feedback.get("position")
 
     def _stop_owned_motion(self):
         with self._motion_lock:
