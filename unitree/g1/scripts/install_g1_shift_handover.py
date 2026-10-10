@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Install the G1 shift handover skill into an offline database. No work is done on import."""
+from contextlib import closing
+import argparse
+import copy
+import datetime
+import json
+import sqlite3
+import uuid
+from pathlib import Path
+
+new_skill = {'slug': 'g1-shift-handover', 'name': 'G1 交接班助手', 'description': '读取姿态与模式，整理用户陈述，确认后生成可复制的交接记录。不依赖相机，不执行运动。', 'oneLiner': '设备状态与人工说明分开记录，确认后完成交接', 'instruction': '交接记录只存在当前会话；禁止调用 update_memory、任何 memory/task 写入工具。每份新交接先查询设备一次，用户陈述重新询问；不从长期记忆补填。不声称已保存或已提交到系统。\nG1 交接班助手。只做交接；旧站岗任务已取消。设备保持当前姿态。\n1. 准备交接：只查询 posture {} 和 switch_mode 的 get_current_mode 一次；若提供拆分工具 switch_mode__get_current_mode，则调用它，参数 {}。只记录返回的姿态和模式；不输出时间、关节参数或 loaded 字段，避免无关信息和时间换算错误。失败写未知，不无限重试。不换模式，不运动，不调相机或灯。\n2. 用已绑定的 tts(action=speak,text=...) 逐字询问“本班做了什么？遇到什么问题？下一班要做什么？”；收到用户回答前，绝不替用户回答这三个问题。已回答不重复问。语音失败则把完整问题显示在 assistant content，说明播报失败。不得伪称现场听到。\n3. 用户回答后，在 assistant content 展示完整“交接草稿（待确认）”，再用 tts 简短询问是否确认或修改，不要全文播报。\n4. 草稿固定包含：【设备读取】姿态、模式、工具来源；【用户陈述】工作、问题、待办；【待核实】传感器新鲜度未独立验证，以及用户描述但未核实的问题。相机断流只能记为用户报告，原因未知；不可写已检测或已修复。缺失信息写未提供，禁止编造日期、姓名、编号或把当前时间当采样时间。不根据姿态或模式扩展成设备正常或可以运动的结论。\n5. 修改时更新完整草稿并重新请求确认。只有用户明确确认最新草稿，才展示完整“交接记录（用户已确认）”，用 tts 简短确认并提醒复制保存。不创建文件、不上传、不发送给其他人。不用 Bash/Write/Read/PythonExec/子代理或网络工具处理表单。\n6. 取消分支：当用户明确要求取消、结束、不提交或放弃本次交接（如“取消交接”“结束本次交接”“不提交”“放弃这次交接”）时，立即进入取消分支，不得先反问、澄清或询问意图。直接输出“本次交接已取消，未提交”，用 tts 播报同一句话且只播报一次，然后结束，不自动重新开始，不改动已确认的历史记录。跳过的字段写未提供。区分：只说“换新一份”“再来一份”“重新开始”“准备新一份交接”表示新开一次交接，不属于取消，按第 1-2 步对新一份重新读取姿态与模式并重新逐字询问三个问题，不得只询问变化的部分。若同一句里既要求结束/取消本次交接、又说要新开一份，按取消分支处理（取消优先），新一份等用户下一条消息再开始，不得在同一轮里边取消边开展新交接。\n7. 所有提问、草稿、修改、最终记录、取消反馈都在 assistant content 完整显示，便于画布 Activity/历史记录复制；tts 仅作为平台的面向用户输出。每轮输出后 finish，等待下一条用户输入。不持续轮询。', 'category': 'robot', 'version': '1.1.3', 'author': 'MuMu', 'active': False, 'requiredTools': ['posture', 'switch_mode', 'tts'], 'configSchema': {}, 'icon': '📋'}
+
+
+def install(db_path, *, backup=True):
+    path = Path(db_path).resolve(strict=True)
+    conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=10)
+    backup_path = None
+    try:
+        conn.execute("SELECT value FROM config WHERE key='skills'").fetchone()
+        if backup:
+            backup_path = path.with_name(path.name + '.g1-shift-handover-' + uuid.uuid4().hex[:12] + '.bak')
+            with closing(sqlite3.connect(backup_path)) as target:
+                conn.backup(target)
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute("SELECT value FROM config WHERE key='skills'").fetchone()
+        cfg = json.loads(row[0]) if row else {"installed": []}
+        if not isinstance(cfg, dict) or not isinstance(cfg.get('installed'), list):
+            raise ValueError('Malformed skills config; refusing to overwrite')
+        if not all(isinstance(s, dict) and isinstance(s.get('slug'), str) for s in cfg['installed']):
+            raise ValueError('Malformed installed entry; refusing to overwrite')
+        previous = next((s for s in cfg['installed'] if s['slug'] == new_skill['slug']), {})
+        skill = {**previous, **copy.deepcopy(new_skill)}
+        skill['active'] = previous.get('active') is True
+        skill['installedAt'] = previous.get('installedAt') or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cfg['installed'] = [s for s in cfg['installed'] if s['slug'] != skill['slug']] + [skill]
+        value = json.dumps(cfg, ensure_ascii=False, allow_nan=False)
+        if row:
+            conn.execute("UPDATE config SET value=? WHERE key='skills'", (value,))
+        else:
+            conn.execute("INSERT INTO config(key,value) VALUES('skills',?)", (value,))
+        conn.commit()
+        if json.loads(conn.execute("SELECT value FROM config WHERE key='skills'").fetchone()[0]) != cfg:
+            raise RuntimeError('Read-back verification failed')
+        return {'slug': skill['slug'], 'version': skill['version'], 'active': skill['active'],
+                'backup': str(backup_path) if backup_path else None}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--db', default='/opt/phanthy-motus/data/data.db')
+    args = parser.parse_args()
+    print(json.dumps(install(args.db), ensure_ascii=False))
+    print('Installed disabled by default. Restart agent-core after offline installation, then verify in canvas.')
+
+if __name__ == '__main__':
+    main()
