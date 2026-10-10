@@ -37,6 +37,7 @@ cards:
   - { name: obstacle_range,     type: sensor }
   - { name: udp_diagnostics,    type: sensor }
   - { name: joints,             type: sensor }
+  - { name: motor_health,       type: sensor }
   - { name: remote_controller,  type: sensor }
   - { name: model,              type: resource }
   - { name: activity_monitor,   type: actuator }
