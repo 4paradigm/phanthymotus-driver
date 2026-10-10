@@ -85,11 +85,7 @@ def test_mic_card_reports_direction_only_while_fresh_and_clears_on_stop(
 
     monkeypatch.setattr(module.subprocess, "Popen", popen)
     executor = types.SimpleNamespace(add_node=lambda node: None)
-    added_words = []
-    media = types.SimpleNamespace(
-        get_wakeup_words=lambda: "",
-        add_wakeup_words=lambda words: added_words.append(words) or True,
-    )
+    media = object()
     card = module.MicPlugin({}, "robot", executor, media)
     assert "check_direction" in card.get_tool()["inputSchema"]["properties"]["action"]["enum"]
     assert "check_direction" in card.get_tool()["inputSchema"]["x-action-params"]
@@ -97,9 +93,7 @@ def test_mic_card_reports_direction_only_while_fresh_and_clears_on_stop(
     assert card.dispatch("start", {})["state"] == "running"
     assert card.dispatch("check_direction", {})["sound_direction"] == {"state": "no_event"}
     assert card.dispatch("start", {})["state"] == "running"
-    assert added_words == [module._MIC_WAKEUP_WORD]
-    assert card.dispatch("add_wakeup_word", {})["state"] == "configured"
-    assert len(added_words) == 1
+    assert "add_wakeup_word" not in card.get_tool()["inputSchema"]["properties"]["action"]["enum"]
     assert len(processes) == 1
     assert len(card.get_tool()["topic_out"]) == 2
 
@@ -116,7 +110,6 @@ def test_mic_card_reports_direction_only_while_fresh_and_clears_on_stop(
 
     assert card.dispatch("stop", {}) == {"state": "idle"}
     assert card.dispatch("start", {})["state"] == "running"
-    assert len(added_words) == 1
     assert card.dispatch("stop", {}) == {"state": "idle"}
     assert card.dispatch("info", {})["sound_direction"] == {"state": "no_event"}
     card._on_direction(String(json.dumps({"state": "fresh", "angle": 180})))
@@ -324,33 +317,8 @@ def test_calibration_does_not_save_coherent_noise(monkeypatch, tmp_path):
     assert not path.exists()
 
 
-def test_wake_status_sampling_catches_short_separate_updates(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-
-    def status(reason, message_id):
-        return types.SimpleNamespace(
-            reason=types.SimpleNamespace(name=reason),
-            header=types.SimpleNamespace(message_id=message_id,
-                                         timestamp_us=message_id * 1000))
-
-    statuses = iter((status("CMD_SLEEPED", 1), status("AUDIO_WAKEUPED", 2),
-                     status("CMD_SLEEPED", 3), status("AUDIO_WAKEUPED", 4),
-                     status("AUDIO_WAKEUPED", 4)))
-    media = types.SimpleNamespace(get_system_status=lambda: next(statuses))
-    next_poll = 0.0
-    last_key = None
-    detected = []
-    for now in (0.0, 0.01, 0.02, 0.03, 0.04):
-        next_poll, last_key, event = module._poll_mic_wake_status(
-            media, now, next_poll, last_key)
-        if event is not None:
-            detected.append(event)
-
-    assert detected == [(2, 2000), (4, 4000)]
-
-
 def test_direction_contract_from_estimator_to_subscription(monkeypatch):
-    """发布端 _mic_direction_payload → JSON → _on_direction 的契约，钉住角度类型与字段。"""
+    """发布端 _mic_activity_payload → JSON → _on_direction 的契约。"""
     module, String = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     sys.modules.pop("sound_direction", None)
@@ -360,20 +328,17 @@ def test_direction_contract_from_estimator_to_subscription(monkeypatch):
     card._proc = types.SimpleNamespace(poll=lambda: None)
 
     calibration = {"front": [2.0, -1.0, 0.0], "right": [0.0, 1.0, -2.0]}
-    raw = module._mic_direction_payload((2.0, -1.0, 0.0), calibration, 1)
+    rng = np.random.default_rng(73)
+    source = rng.normal(0, 2000, 4096).astype(np.int16)
+    channels = [np.roll(source, shift) for shift in (0, 2, -3, 1)]
+    channels.extend([np.zeros_like(source) for _ in range(4)])
+    raw = module._mic_activity_payload(
+        np.stack(channels, axis=1).reshape(-1), calibration, 1)
     payload = json.loads(raw)
     assert payload["state"] == "fresh"
     assert type(payload["angle"]) is int
     card._on_direction(String(raw))
     assert card.dispatch("info", {})["sound_direction"]["angle"] == payload["angle"]
-
-    # 未标定与签名无法定位时，发布端不得携带 angle。
-    uncalibrated = json.loads(module._mic_direction_payload(None, {}, 1))
-    assert uncalibrated["state"] == "uncalibrated"
-    assert "angle" not in uncalibrated
-    ambiguous = json.loads(module._mic_direction_payload(None, calibration, 1))
-    assert ambiguous["state"] == "ambiguous"
-    assert "angle" not in ambiguous
 
     # 发布端若把角度序列化成 float，订阅端必须拒收整条消息。
     with card._direction_lock:
@@ -389,17 +354,6 @@ def test_mic_capture_time_falls_back_when_sdk_timestamp_is_missing(monkeypatch):
     assert module._mic_capture_timestamp_us(types.SimpleNamespace(timestamp_us=123), 456) == 123
     assert module._mic_capture_timestamp_us(types.SimpleNamespace(timestamp_us=0), 456) == 456
     assert module._mic_capture_timestamp_us(types.SimpleNamespace(), 456) == 456
-
-
-def test_vendor_wake_direction_carries_audio_window(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-    monkeypatch.setitem(sys.modules, "sound_direction", types.SimpleNamespace(
-        estimate_angle=lambda signature, front, right: 45))
-    payload = json.loads(module._mic_direction_payload(
-        (1, 2, 3), {"front": [1, 0, 0], "right": [0, 1, 0]},
-        1000, (500, 800)))
-    assert payload["audio_window_start_us"] == 500
-    assert payload["audio_window_end_us"] == 800
 
 
 def test_sound_activity_reports_coherent_source_without_wake_status(monkeypatch):
@@ -434,7 +388,7 @@ def test_sound_activity_reports_coherent_source_without_wake_status(monkeypatch)
     assert card.dispatch("check_direction", {})["sound_direction"]["angle"] == 0
 
 
-def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_path, capsys):
+def test_mic_capture_ignores_vendor_wake_status(monkeypatch, tmp_path, capsys):
     module, String = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     sys.modules.pop("sound_direction", None)
@@ -487,11 +441,18 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
                                      channels=8, sample_rate=16000,
                                      audio_data=data)
 
+    status_calls = [0]
+
+    def wake_status():
+        status_calls[0] += 1
+        return types.SimpleNamespace(
+            reason=types.SimpleNamespace(name="AUDIO_WAKEUPED"),
+            header=types.SimpleNamespace(message_id=status_calls[0],
+                                         timestamp_us=status_calls[0] * 1000))
+
     media = types.SimpleNamespace(
         init=lambda: True,
-        get_system_status=lambda: types.SimpleNamespace(
-            reason=types.SimpleNamespace(name="CMD_SLEEPED"),
-            header=types.SimpleNamespace(message_id=0, timestamp_us=0)),
+        get_system_status=wake_status,
         get_audio_capture_data=capture)
     monkeypatch.setitem(sys.modules, "mediacontrol_py", types.SimpleNamespace(
         MediaController=types.SimpleNamespace(instance=lambda: media)))
@@ -512,6 +473,9 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
     assert len(fresh_messages) <= 7  # 16 帧 × 40 ms；删除限流后会超出该上界。
     assert json.loads(fresh_messages[0].data)["angle"] == 0
     assert json.loads(fresh_messages[0].data)["trigger"] == "sound_activity"
+    assert all(json.loads(message.data).get("trigger") != "vendor_audio_wakeup"
+               for message in messages)
+    assert status_calls[0] == 0
     assert (json.loads(fresh_messages[0].data)["audio_window_end_us"]
             <= 1_700_000_000_000_000 + 16 * 40_000 + 300_000)
     assert [json.loads(message.data)["state"] for message in messages].count("no_event") == 1
@@ -526,76 +490,6 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         assert direction["audio_window_end_us"] - direction["audio_window_start_us"] <= 1_000_000
         assert any(direction["audio_window_start_us"] <= stamp <=
                    direction["audio_window_end_us"] for stamp in audio_stamps)
-
-
-def test_vendor_wake_uses_recent_audio_and_clears_after_audio_stops(monkeypatch):
-    module, String = _load_device(monkeypatch)
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
-    published = {}
-
-    class Node:
-        def __init__(self, name):
-            pass
-
-        def create_publisher(self, message_type, topic, qos):
-            published[topic] = []
-            return types.SimpleNamespace(publish=published[topic].append)
-
-    class Done(BaseException):
-        pass
-
-    clock = [0.0]
-    captures = [0]
-    windows = []
-
-    def capture():
-        captures[0] += 1
-        if captures[0] <= 60:
-            clock[0] += 0.04
-            return types.SimpleNamespace(
-                timestamp_us=1_700_000_000_000_000 + captures[0] * 40_000,
-                channels=8, sample_rate=16000, audio_data=[0] * (640 * 8))
-        clock[0] += 0.4
-        if captures[0] > 64:
-            raise Done()
-        return types.SimpleNamespace(channels=0, audio_data=[])
-
-    wakes = [False]
-
-    def poll(*args):
-        if captures[0] == 60 and not wakes[0]:
-            wakes[0] = True
-            return 0, None, (1, 1)
-        return 0, None, None
-
-    def wake_payload(signature, calibration, timestamp_ms, window):
-        windows.append(window)
-        return json.dumps({"state": "fresh", "angle": 90,
-                           "trigger": "vendor_audio_wakeup"})
-
-    monkeypatch.setattr(sys.modules["rclpy"], "init", lambda: None, raising=False)
-    monkeypatch.setattr(sys.modules["rclpy.node"], "Node", Node)
-    monkeypatch.setitem(sys.modules, "common", types.SimpleNamespace(
-        logsafe=types.SimpleNamespace(install=lambda **kwargs: None)))
-    monkeypatch.setitem(sys.modules, "mediacontrol_py", types.SimpleNamespace(
-        MediaController=types.SimpleNamespace(instance=lambda: types.SimpleNamespace(
-            init=lambda: None, get_audio_capture_data=capture))))
-    monkeypatch.setattr(sys.modules["std_msgs.msg"], "String", String)
-    monkeypatch.setattr(module, "_initial_wake_key", lambda media: None)
-    monkeypatch.setattr(module, "_poll_mic_wake_status", poll)
-    monkeypatch.setattr(module, "_mic_direction_payload", wake_payload)
-    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-
-    try:
-        module._mic_subprocess("robot")
-    except Done:
-        pass
-
-    assert [json.loads(msg.data)["state"] for msg in
-            published["/robot/mic/sound_direction"]] == ["fresh", "no_event"]
-    assert len(windows) == 1
-    assert 0 < windows[0][1] - windows[0][0] <= 1_000_000
 
 
 def test_calibration_rejects_nonfinite_values(monkeypatch, tmp_path):
@@ -641,8 +535,6 @@ def test_audio_chunk_timestamp_uses_first_buffered_frame(monkeypatch):
         MediaController=types.SimpleNamespace(instance=lambda: types.SimpleNamespace(
             init=lambda: None, get_audio_capture_data=capture))))
     monkeypatch.setattr(sys.modules["std_msgs.msg"], "String", String)
-    monkeypatch.setattr(module, "_initial_wake_key", lambda media: None)
-    monkeypatch.setattr(module, "_poll_mic_wake_status", lambda *args: (0, None, None))
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
 
     try:
@@ -654,21 +546,6 @@ def test_audio_chunk_timestamp_uses_first_buffered_frame(monkeypatch):
     assert len(audio) == 1
     stamp = audio[0].header.stamp
     assert stamp.sec * 1_000_000 + stamp.nanosec // 1000 == 1_700_000_000_000_000
-
-
-def test_add_wakeup_word_retries_after_rejection(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-    added = []
-    media = types.SimpleNamespace(get_wakeup_words=lambda: "",
-                                  add_wakeup_words=lambda word: added.append(word) or False)
-    card = module.MicPlugin({}, "robot", types.SimpleNamespace(add_node=lambda node: None), media)
-    clock = [1.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-    assert card.dispatch("add_wakeup_word", {})["state"] == "rejected"
-    assert card.dispatch("add_wakeup_word", {})["state"] == "retry_later"
-    clock[0] = 1.6
-    assert card.dispatch("add_wakeup_word", {})["state"] == "rejected"
-    assert added == [module._MIC_WAKEUP_WORD] * 2
 
 
 def test_mic_direction_rejects_unexpected_shapes(monkeypatch):
@@ -714,28 +591,6 @@ def test_info_survives_corrupt_calibration_files(monkeypatch, tmp_path):
     # 非 front/right 键即使形状像签名也不得进入标定视图。
     path.write_text(json.dumps({"front": [2, -1, 0], "back": [1, 2, 3]}))
     assert set(module._load_calibration()) == {"front"}
-
-
-def test_start_survives_wakeup_sdk_failure(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("voice module down")
-
-    media = types.SimpleNamespace(get_wakeup_words=boom, add_wakeup_words=boom)
-    executor = types.SimpleNamespace(add_node=lambda node: None)
-    card = module.MicPlugin({}, "robot", executor, media)
-    spawned = []
-
-    def popen(*args, **kwargs):
-        spawned.append(True)
-        return types.SimpleNamespace(stdout=(), poll=lambda: None)
-
-    monkeypatch.setattr(module.subprocess, "Popen", popen)
-
-    assert card.dispatch("start", {})["state"] == "running"
-    assert spawned == [True]
-    assert card._proc is not None
 
 
 def test_calibration_result_survives_restart_failure(monkeypatch, tmp_path):
@@ -788,45 +643,3 @@ def test_calibration_result_survives_restart_failure(monkeypatch, tmp_path):
     assert saved["version"] == 2
     assert isinstance(saved["front"], list)
     assert card._proc is None
-
-
-def test_wake_status_poll_survives_sdk_failure(monkeypatch, capsys):
-    module, _ = _load_device(monkeypatch)
-    calls = []
-
-    def boom():
-        calls.append(1)
-        raise RuntimeError("status down")
-
-    media = types.SimpleNamespace(get_system_status=boom)
-
-    next_poll, last_key, event = module._poll_mic_wake_status(
-        media, 10.0, 0.0, ("id", 5))
-    assert (next_poll, last_key, event) == (10.5, ("id", 5), None)
-    # 故障必须留痕；退避窗口内不再触碰 SDK，避免每次轮询都抛异常刷日志。
-    assert "wake status poll failed" in capsys.readouterr().out
-    next_poll, last_key, event = module._poll_mic_wake_status(
-        media, 10.2, next_poll, last_key)
-    assert (next_poll, last_key, event) == (10.5, ("id", 5), None)
-    assert "wake status poll failed" not in capsys.readouterr().out
-    assert len(calls) == 1
-
-
-def test_initial_wake_key_seeding_is_exception_safe(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-
-    def status(reason, message_id):
-        return types.SimpleNamespace(
-            reason=types.SimpleNamespace(name=reason),
-            header=types.SimpleNamespace(message_id=message_id,
-                                         timestamp_us=message_id * 1000))
-
-    def dead():
-        raise RuntimeError("down")
-
-    assert module._initial_wake_key(
-        types.SimpleNamespace(get_system_status=dead)) is None
-    assert module._initial_wake_key(types.SimpleNamespace(
-        get_system_status=lambda: status("CMD_SLEEPED", 8))) is None
-    assert module._initial_wake_key(types.SimpleNamespace(
-        get_system_status=lambda: status("AUDIO_WAKEUPED", 7))) == (7, 7000)

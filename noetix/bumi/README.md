@@ -2,14 +2,14 @@
 
 The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
 
-## `mic` wake-up direction
+## `mic` sound direction
 
 The existing `mic` card still publishes mono PCM on `/<namespace>/mic/audio`.
 It also publishes JSON observations on `/<namespace>/mic/sound_direction`.
 It checks for a coherent sound source at most ten times per
-second when sound rises above the recent background without waiting for a wake
-word (`trigger=sound_activity`); vendor wake
-events remain supported (`trigger=vendor_audio_wakeup`). The `angle` field is
+second when sound rises above the recent background (`trigger=sound_activity`).
+It does not recognize wake words; a future ASR consumer can match recognized
+speech to these time-stamped observations. The `angle` field is
 present only when calibration and audio quality permit an estimate. It is in
 degrees clockwise from the robot's front. `check_direction` keeps the latest
 observation for 10 seconds, then reports `stale` without an angle. The monitor's
@@ -25,16 +25,12 @@ driver uses the local receive time. `timestamp_ms` remains the publication time.
 
 One-time setup on Bumi EDU:
 
-1. Starting `mic` automatically appends “小范小范” to the vendor voice module's
-   wake words. The factory wake words remain available. The explicit
-   `action=add_wakeup_word` remains available to retry a rejected setup.
-2. Have one person stand directly in front of the robot and speak “测试测试”
+1. Have one person stand directly in front of the robot and speak “测试测试”
    continuously while calling `action=calibrate_front`.
-3. Repeat at the robot's right side with `action=calibrate_right`.
-4. Make a sound from a known position and watch the `sound_direction` stream,
+2. Repeat at the robot's right side with `action=calibrate_right`.
+3. Make a sound from a known position and watch the `sound_direction` stream,
    or choose `check_direction` on the `mic` card within 10 seconds. Read
-   `sound_direction` in the action result (`fresh`, `no_event`, `stale`,
-   `uncalibrated`, or `ambiguous`). The
+   `sound_direction` in the action result (`fresh`, `no_event`, or `stale`). The
    canvas's generic “查看数据流” button opens the audio stream.
 
 Each calibration temporarily pauses the mic audio stream, collects fresh
@@ -50,14 +46,10 @@ driver derives relative arrival delays from those four channels and uses the
 two known speaking positions to map them to the robot's front/right axes.
 No angle is published when the channels do not show a coherent source.
 
-The vendor wake status reports that an acoustic wake-up happened but does not
-identify which wake word caused it. Sound-activity observations likewise do
-not identify a speaker or recognize speech. Simultaneous speakers and ambient
-noise may cause an ambiguous or wrong direction. Confirm the angle convention
+Sound-activity observations do not identify a speaker or recognize speech.
+Simultaneous speakers and ambient noise may cause an ambiguous or wrong direction.
+Confirm the angle convention
 and performance on the actual robot before using the angle for motion.
-The bundled SDK exposes only current-status polling. The driver checks as
-often as the capture loop permits, but a wake status that appears and disappears
-between checks can still be missed.
 
 Run the estimator and mic card tests from the repository root with
 `python -m pytest noetix/bumi/tests -q`. A bare `pytest noetix/bumi` stops on

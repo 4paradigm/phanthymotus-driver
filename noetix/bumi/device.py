@@ -65,8 +65,6 @@ _AUDIO_AGENT_POLL_INTERVAL_S = 0.1
 _AUDIO_RESET_RECOVERED_STATUSES = frozenset(("READY", "SLEEPED"))
 _MIC_DIRECTION_CALIBRATION = Path(
     "/opt/phanthy-motus/data/bumi/sound_direction_calibration.json")
-# 厂商格式为逐字声母、韵母及声调，@ 后是显示名称。
-_MIC_WAKEUP_WORD = "x iǎo f àn x iǎo f àn @小范小范"
 
 # ── Joint Mapping ─────────────────────────────────────────────────────────────
 # SDK motor_id order → URDF joint names (must match URDF exactly for skeleton renderer)
@@ -925,37 +923,6 @@ class LocoPlugin:
 
 # ── MicPlugin (sensor, subprocess) ────────────────────────────────────────────
 
-def _poll_mic_wake_status(media_ctrl, now, next_poll, last_key):
-    if now < next_poll:
-        return next_poll, last_key, None
-    try:
-        status = media_ctrl.get_system_status()
-        reason = getattr(status.reason, "name", str(status.reason).rsplit(".", 1)[-1])
-        key = (status.header.message_id, status.header.timestamp_us)
-    except Exception as exc:
-        # 状态读失败只跳过本轮并退避；采集循环不得被状态读错误拖停。
-        # 退避同时把错误日志限流到至多每 0.5s 一条，状态源故障时不留诊断盲区。
-        print(f"[mic_subprocess] wake status poll failed: {exc}", flush=True)
-        return now + 0.5, last_key, None
-    event = key if reason == "AUDIO_WAKEUPED" and key != last_key else None
-    return now + 0.005, event or last_key, event
-
-
-def _initial_wake_key(media_ctrl):
-    """Seed wake dedup from the startup status; never raise into the capture loop."""
-    try:
-        status = media_ctrl.get_system_status()
-        reason = getattr(status.reason, "name", str(status.reason).rsplit(".", 1)[-1])
-    except Exception as exc:
-        print(f"[mic_subprocess] initial wake status unavailable: {exc}", flush=True)
-        return None
-    if reason != "AUDIO_WAKEUPED":
-        return None
-    # 启动/标定重启后的 init 窗口内出现的唤醒会被播种去重吞掉，留下痕迹。
-    print("[mic_subprocess] wake status at startup ignored (init window)", flush=True)
-    return (status.header.message_id, status.header.timestamp_us)
-
-
 def _load_calibration() -> dict:
     """Read the calibration file, keeping only well-formed front/right signatures."""
     try:
@@ -978,27 +945,8 @@ def _mic_capture_timestamp_us(audio, now_us: int) -> int:
     return timestamp_us if type(timestamp_us) is int and timestamp_us > 0 else now_us
 
 
-def _mic_direction_payload(signature, calibration, timestamp_ms, audio_window=None) -> str:
-    """Build the sound_direction JSON published on each vendor wake event."""
-    from sound_direction import estimate_angle
-    angle = None
-    if signature is not None and {"front", "right"} <= calibration.keys():
-        angle = estimate_angle(signature, calibration["front"], calibration["right"])
-    state = "fresh" if angle is not None else (
-        "uncalibrated" if len(calibration) < 2 else "ambiguous")
-    direction = {"state": state, "trigger": "vendor_audio_wakeup",
-                 "timestamp_ms": int(timestamp_ms)}
-    if audio_window is not None:
-        direction.update({"audio_window_start_us": audio_window[0],
-                          "audio_window_end_us": audio_window[1]})
-    if angle is not None:
-        direction.update({"angle": angle, "unit": "deg",
-                          "reference": "robot_front_clockwise"})
-    return json.dumps(direction, ensure_ascii=False)
-
-
 def _mic_activity_payload(audio, calibration, timestamp_ms, audio_window=None) -> str | None:
-    """Report a coherent sound source without requiring a vendor wake event."""
+    """Report a coherent sound source from microphone activity."""
     from sound_direction import estimate_angle, estimate_signature
     if not {"front", "right"} <= calibration.keys():
         return None
@@ -1032,7 +980,7 @@ def _mic_subprocess(namespace: str):
     import struct as _struct
     import numpy as _np
     from collections import deque as _deque
-    from sound_direction import SoundActivityGate, estimate_signature
+    from sound_direction import SoundActivityGate
 
     import rclpy as _rclpy
     from rclpy.node import Node as _Node
@@ -1064,43 +1012,16 @@ def _mic_subprocess(namespace: str):
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
     buffer_start_us = None
-    recent_audio = _deque(maxlen=100)  # 按接收时间裁剪到最近 1 秒。
-    recent_capture_us = _deque(maxlen=100)
-    recent_received_at = _deque(maxlen=100)
-    next_status_poll = 0.0
+    recent_audio = _deque(maxlen=8)
+    recent_capture_us = _deque(maxlen=8)
     next_activity_check = 0.0
     last_sound_direction_at = None
     activity_gate = SoundActivityGate()
     next_direction_error_log = 0.0
-    last_wake_key = _initial_wake_key(media_ctrl)
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
 
     while True:
         try:
-            now = _time.monotonic()
-            while recent_received_at and now - recent_received_at[0] > 1.0:
-                recent_received_at.popleft()
-                recent_audio.popleft()
-                recent_capture_us.popleft()
-            next_status_poll, last_wake_key, wake_key = _poll_mic_wake_status(
-                media_ctrl, now, next_status_poll, last_wake_key)
-            if wake_key is not None:
-                try:
-                    signature = estimate_signature(
-                        _np.concatenate(recent_audio) if recent_audio else [], 8, 16000)
-                    direction_msg = String()
-                    direction_msg.data = _mic_direction_payload(
-                        signature, _load_calibration(), _time.time() * 1000,
-                        (recent_capture_us[0], recent_capture_us[-1])
-                        if recent_capture_us else None)
-                    direction_pub.publish(direction_msg)
-                    last_sound_direction_at = _time.monotonic()
-                except Exception as exc:
-                    # 单次方向发布失败只丢这条事件，不阻塞音频采集。
-                    # 日志按 0.5s 限流，连续失败时不按事件频率刷屏。
-                    if _time.monotonic() >= next_direction_error_log:
-                        print(f"[mic_subprocess] direction publish skipped: {exc}", flush=True)
-                        next_direction_error_log = _time.monotonic() + 0.5
             if (last_sound_direction_at is not None
                     and _time.monotonic() - last_sound_direction_at >= 1.0):
                 try:
@@ -1125,7 +1046,6 @@ def _mic_subprocess(namespace: str):
                     and samples.size % 8 == 0):
                 recent_audio.append(samples)
                 recent_capture_us.append(capture_us)
-                recent_received_at.append(_time.monotonic())
                 is_activity = activity_gate.accepts(samples)
                 if (is_activity and len(recent_audio) >= 8
                         and _time.monotonic() >= next_activity_check):
@@ -1184,8 +1104,6 @@ class MicPlugin:
         self._topic = f"/{namespace}/mic/audio"
         self._direction_topic = f"/{namespace}/mic/sound_direction"
         self._media_ctrl = media_ctrl
-        self._wakeup_word_added = False
-        self._last_wakeup_config_time = 0.0
         self._proc: subprocess.Popen | None = None
         self._process_lock = threading.RLock()
         self._calibration_lock = threading.Lock()
@@ -1223,19 +1141,18 @@ class MicPlugin:
             "name": "mic",
             "type": "sensor",
             "multiInstance": False,
-            "description": "Bumi microphone audio and calibrated wake-up sound direction",
+            "description": "Bumi microphone audio and calibrated sound direction",
             "inputSchema": {
                 "type": "object",
                 "properties": {"action": {"type": "string", "enum": [
-                    "start", "stop", "info", "check_direction", "add_wakeup_word",
+                    "start", "stop", "info", "check_direction",
                     "calibrate_front", "calibrate_right"]}},
                 "required": ["action"],
                 "x-action-params": {
                     "start": {"params": [], "description": "启动麦克风采集与方向输出。"},
                     "stop": {"params": [], "description": "停止麦克风采集与方向输出。"},
                     "info": {"params": [], "description": "查看采集状态、最近方向观测与标定进度。"},
-                    "check_direction": {"params": [], "description": "查看最近一次声音或唤醒方向与标定状态。"},
-                    "add_wakeup_word": {"params": [], "description": "向 Bumi 语音模块添加‘小范小范’"},
+                    "check_direction": {"params": [], "description": "查看最近一次声音方向与标定状态。"},
                     "calibrate_front": {"params": [], "description": "一人在机器人正前方持续说‘测试测试’约 2 秒时调用"},
                     "calibrate_right": {"params": [], "description": "一人在机器人正右方持续说‘测试测试’约 2 秒时调用"},
                 },
@@ -1305,14 +1222,6 @@ class MicPlugin:
         with self._process_lock:
             if self._proc is not None and self._proc.poll() is None:
                 return
-            # 启动麦克风时自动追加默认唤醒词，保留厂商原有词表。
-            # 唤醒词配置是尽力而为的旁路，任何失败都不得阻断采集子进程启动。
-            try:
-                wakeup = self.dispatch("add_wakeup_word", {})
-                if wakeup["state"] != "configured":
-                    print(f"[mic] wake-up word setup: {wakeup['state']}", flush=True)
-            except Exception as exc:
-                print(f"[mic] wake-up word setup failed: {exc}", flush=True)
             with self._direction_lock:
                 self._last_direction = None
                 self._last_direction_time = 0.0
@@ -1375,17 +1284,6 @@ class MicPlugin:
                     "sound_direction": observation,
                     "calibrated_directions": [name for name in ("front", "right")
                                               if name in calibration]}
-        if action == "add_wakeup_word":
-            with self._process_lock:
-                if self._wakeup_word_added or "小范小范" in self._media_ctrl.get_wakeup_words():
-                    return {"state": "configured", "word": "小范小范"}
-                if time.monotonic() - self._last_wakeup_config_time < 0.5:
-                    return {"state": "retry_later", "message": "语音模块配置调用需间隔至少 500 毫秒"}
-                self._last_wakeup_config_time = time.monotonic()
-                accepted = self._media_ctrl.add_wakeup_words(_MIC_WAKEUP_WORD)
-                self._wakeup_word_added = accepted
-                return {"state": "configured" if accepted else "rejected",
-                        "word": "小范小范"}
         if action in ("calibrate_front", "calibrate_right"):
             return self._calibrate(action.removeprefix("calibrate_"))
         return None
