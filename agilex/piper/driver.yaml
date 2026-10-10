@@ -1,0 +1,15 @@
+id: agilex-piper-driver
+name: AgileX PiPER Driver
+category: driver
+hardware_provider: agilex
+hardware_model: piper
+image_name: agilex-piper
+port: 15741
+mcp_url: "http://localhost:15741/mcp"
+description: "Single PiPER arm: fresh feedback, guarded J1 movement and local parking return, D435 RGB snapshot at the current pose. Motion opt-in; draft platform integration."
+build_context_extras:
+  - ../../common
+cards:
+  - { name: piper_status, type: resource }
+  - { name: piper_arm, type: actuator }
+  - { name: piper_photo, type: actuator }

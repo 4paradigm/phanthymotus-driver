@@ -1,0 +1,5 @@
+piper-sdk==1.0.0
+python-can==4.6.1
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+PyYAML==6.0.2

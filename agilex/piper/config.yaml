@@ -1,0 +1,15 @@
+mcp_port: 15741
+name: "PiPER 单臂与 D435"
+ros_namespace: ""
+can_interface: can0
+data_dir: /opt/phanthy-motus/data/piper
+camera:
+  # Empty: auto-select only when exactly one RealSense video-index0 exists.
+  # For multiple cameras choose the COLOR V4L2 by-id path on the host.
+  device: ""
+  warmup_seconds: 3
+  min_contrast: 8
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: lo
