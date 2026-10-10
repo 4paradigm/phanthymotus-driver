@@ -59,7 +59,7 @@ def test_direction_card_does_not_require_mic_process(monkeypatch):
     started = []
 
     class Process:
-        stdout = ()
+        stdout = (b"__BUMI_DIRECTION_READY__\n",)
 
         def poll(self):
             return None
@@ -75,6 +75,51 @@ def test_direction_card_does_not_require_mic_process(monkeypatch):
     assert started == ["started"]
     assert card.dispatch("stop", {}) == {"state": "idle"}
     assert started == ["started", "stopped"]
+
+
+def test_direction_sensor_start_reports_worker_initialization_failure(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+
+    class ExitedProcess:
+        stdout = ()
+
+        def poll(self):
+            return 1
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: ExitedProcess())
+    result = card.dispatch("start", {"_tool_name": "sound_direction"})
+    assert result["state"] == "error"
+    assert card._proc is None
+
+
+def test_direction_auto_start_reports_worker_initialization_failure(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+
+    class ExitedProcess:
+        stdout = ()
+
+        def poll(self):
+            return 1
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: ExitedProcess())
+    assert card.start() is False
+    assert card._proc is None
 
 
 def test_mic_card_only_advertises_audio_after_migration(monkeypatch):

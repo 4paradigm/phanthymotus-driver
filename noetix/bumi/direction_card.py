@@ -236,7 +236,7 @@ class SoundDirectionPlugin:
             },
         }
 
-    def start(self, wait_ready: bool = False) -> bool:
+    def start(self) -> bool:
         import sys
         with self._process_lock:
             if self._proc is not None and self._proc.poll() is None:
@@ -264,8 +264,8 @@ class SoundDirectionPlugin:
                         print(message, flush=True)
                 ready_event.set()
             threading.Thread(target=forward, daemon=True).start()
-            if wait_ready and (not ready_event.wait(timeout=8) or not ready[0]
-                               or proc.poll() is not None):
+            if (not ready_event.wait(timeout=8) or not ready[0]
+                    or proc.poll() is not None):
                 self.stop()
                 return False
             return True
@@ -332,7 +332,7 @@ class SoundDirectionPlugin:
             finally:
                 if running:
                     try:
-                        if not self.start(wait_ready=True):
+                        if not self.start():
                             return {"state": "error", "message": "direction restart failed to initialize",
                                     "direction": direction, "calibration_saved": calibration_saved}
                     except Exception as exc:
@@ -370,7 +370,7 @@ class SoundDirectionPlugin:
                 write_error = exc
             if running:
                 try:
-                    if not self.start(wait_ready=True):
+                    if not self.start():
                         return {"state": "error", "message": "direction restart failed to initialize",
                                 "parameters": load_parameters()}
                 except Exception as exc:
@@ -390,7 +390,11 @@ class SoundDirectionPlugin:
         if tool_name == "sound_direction" and action not in ("start", "stop", "info"):
             return None
         if action == "start":
-            self.start()
+            try:
+                if not self.start():
+                    return {"state": "error", "message": "direction worker failed to initialize"}
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return {"state": "error", "message": f"direction worker failed to start: {exc}"}
             return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
         if action == "stop":
             try:
