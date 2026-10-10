@@ -410,17 +410,19 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         pass
 
     rng = np.random.default_rng(73)
-    source = rng.normal(0, 2000, 5120).astype(np.int16)
+    source = rng.normal(0, 2000, 10240).astype(np.int16)
     channels = [np.roll(source, shift) for shift in (0, 2, -3, 1)]
     channels.extend([np.zeros_like(source) for _ in range(4)])
     audio = np.stack(channels, axis=1)
-    frames = iter(audio.reshape(8, 640, 8))
+    frames = iter(audio.reshape(16, 640, 8))
+    clock = [0.0]
 
     def capture():
         try:
             frame = next(frames)
         except StopIteration:
             raise Done()
+        clock[0] += 0.04  # 每帧 40 毫秒，模拟持续输入。
         return types.SimpleNamespace(channels=8, sample_rate=16000,
                                      audio_data=frame.reshape(-1).tolist())
 
@@ -434,6 +436,7 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         MediaController=types.SimpleNamespace(instance=lambda: media)))
     monkeypatch.setattr(sys.modules["std_msgs.msg"], "String", String)
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
 
     try:
         module._mic_subprocess("robot")
@@ -441,7 +444,7 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         pass
 
     messages = published["/robot/mic/sound_direction"]
-    assert len(messages) == 1
+    assert len(messages) >= 3  # 100 毫秒检查一次，16 帧内应多次发布。
     assert json.loads(messages[0].data)["angle"] == 0
     assert json.loads(messages[0].data)["trigger"] == "sound_activity"
 

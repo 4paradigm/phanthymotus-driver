@@ -1085,7 +1085,7 @@ def _mic_subprocess(namespace: str):
             if audio.channels == 8 and audio.sample_rate == 16000:
                 recent_audio.append(samples)
                 if len(recent_audio) >= 8 and _time.monotonic() >= next_activity_check:
-                    next_activity_check = _time.monotonic() + 0.25
+                    next_activity_check = _time.monotonic() + 0.1
                     try:
                         # 使用现有四路采集估计近期的主声源；无可靠角度时不发布。
                         activity = _mic_activity_payload(
