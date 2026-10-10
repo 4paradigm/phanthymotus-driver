@@ -9,3 +9,9 @@ ros:
   # The Adapter's vendor graph uses localhost; device streams use domain 2.
   robot_interface: "lo"
   cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><MaxAutoParticipantIndex>200</MaxAutoParticipantIndex></Discovery><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+
+plugins:
+  qr_scan:
+    scan_hz: 2
+    stale_after_s: 3
+    rearm_after_s: 3
