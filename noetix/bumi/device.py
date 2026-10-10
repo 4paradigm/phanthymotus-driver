@@ -1031,7 +1031,7 @@ def _mic_subprocess(namespace: str):
     import struct as _struct
     import numpy as _np
     from collections import deque as _deque
-    from sound_direction import estimate_signature
+    from sound_direction import SoundActivityGate, estimate_signature
 
     import rclpy as _rclpy
     from rclpy.node import Node as _Node
@@ -1066,6 +1066,7 @@ def _mic_subprocess(namespace: str):
     recent_capture_us = _deque(maxlen=100)
     next_status_poll = 0.0
     next_activity_check = 0.0
+    activity_gate = SoundActivityGate()
     next_direction_error_log = 0.0
     last_wake_key = _initial_wake_key(media_ctrl)
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
@@ -1101,7 +1102,9 @@ def _mic_subprocess(namespace: str):
             if audio.channels == 8 and audio.sample_rate == 16000:
                 recent_audio.append(samples)
                 recent_capture_us.append(capture_us)
-                if len(recent_audio) >= 8 and _time.monotonic() >= next_activity_check:
+                is_activity = activity_gate.accepts(samples)
+                if (is_activity and len(recent_audio) >= 8
+                        and _time.monotonic() >= next_activity_check):
                     next_activity_check = _time.monotonic() + 0.1
                     try:
                         # 使用现有四路采集估计近期的主声源；无可靠角度时不发布。

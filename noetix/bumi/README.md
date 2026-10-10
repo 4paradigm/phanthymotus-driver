@@ -7,7 +7,8 @@ The bundle exposes the original Bumi sensor, locomotion, audio and camera cards 
 The existing `mic` card still publishes mono PCM on `/<namespace>/mic/audio`.
 It also publishes JSON observations on `/<namespace>/mic/sound_direction`.
 It checks for a coherent sound source at most ten times per
-second without waiting for a wake word (`trigger=sound_activity`); vendor wake
+second when sound rises above the recent background without waiting for a wake
+word (`trigger=sound_activity`); vendor wake
 events remain supported (`trigger=vendor_audio_wakeup`). The `angle` field is
 present only when calibration and audio quality permit an estimate. It is in
 degrees clockwise from the robot's front. `check_direction` keeps the latest

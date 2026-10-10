@@ -1,8 +1,25 @@
 """Bumi head microphone delay estimation and two-position direction calibration."""
 
 import math
+from collections import deque
 
 import numpy as np
+
+
+class SoundActivityGate:
+    """Accept sounds clearly louder than the recent microphone background."""
+
+    def __init__(self):
+        self._levels = deque(maxlen=50)
+
+    def accepts(self, audio) -> bool:
+        head = np.asarray(audio, dtype=np.float32).reshape(-1, 8)[:, :4]
+        level = float(np.median(np.sqrt(np.mean(head * head, axis=0))))
+        background = (float(np.percentile(self._levels, 20))
+                      if len(self._levels) >= 6 else None)
+        self._levels.append(level)
+        # 对比近期背景声，避免安静时稳定的底噪反复触发方向计算。
+        return background is not None and level >= max(10.0, background * 2.5)
 
 
 def is_voiced_audio(audio, channels: int, sample_rate: int) -> bool:

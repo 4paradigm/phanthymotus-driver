@@ -433,19 +433,24 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         pass
 
     rng = np.random.default_rng(73)
-    source = rng.normal(0, 2000, 10240).astype(np.int16)
+    source = rng.normal(0, 2000, 20480).astype(np.int16)
     channels = [np.roll(source, shift) for shift in (0, 2, -3, 1)]
     channels.extend([np.zeros_like(source) for _ in range(4)])
     audio = np.stack(channels, axis=1)
-    frames = iter(audio.reshape(16, 640, 8))
+    # 前 16 帧是同方向的低音量背景声，随后才出现明显发声。
+    audio[:10240] //= 50
+    frames = iter(enumerate(audio.reshape(32, 640, 8)))
     clock = [0.0]
-    capture_times = iter(1_700_000_000_000_000 + n * 40_000 for n in range(16))
+    capture_times = iter(1_700_000_000_000_000 + n * 40_000 for n in range(32))
+    quiet_direction_counts = []
 
     def capture():
         try:
-            frame = next(frames)
+            frame_index, frame = next(frames)
         except StopIteration:
             raise Done()
+        if frame_index == 16:
+            quiet_direction_counts.append(len(published["/robot/mic/sound_direction"]))
         clock[0] += 0.04  # 每帧 40 毫秒，模拟持续输入。
         return types.SimpleNamespace(timestamp_us=next(capture_times),
                                      channels=8, sample_rate=16000,
@@ -469,9 +474,12 @@ def test_mic_capture_publishes_direction_without_vendor_wake(monkeypatch, tmp_pa
         pass
 
     messages = published["/robot/mic/sound_direction"]
-    assert len(messages) >= 3  # 100 毫秒检查一次，16 帧内应多次发布。
+    assert quiet_direction_counts == [0]
+    assert len(messages) >= 3  # 100 毫秒检查一次，发声后应多次发布。
     assert json.loads(messages[0].data)["angle"] == 0
     assert json.loads(messages[0].data)["trigger"] == "sound_activity"
+    assert (json.loads(messages[0].data)["audio_window_end_us"]
+            <= 1_700_000_000_000_000 + 16 * 40_000 + 300_000)
     audio_stamps = [msg.header.stamp.sec * 1_000_000
                     + msg.header.stamp.nanosec // 1000
                     for msg in published["/robot/mic/audio"]]
