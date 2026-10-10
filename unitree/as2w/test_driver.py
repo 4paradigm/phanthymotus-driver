@@ -138,7 +138,7 @@ class TestDriverContracts(unittest.TestCase):
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
         plugin._namespace = "test"
-        for name in ("imu", "joints", "joint_state", "battery", "loco_state"):
+        for name in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
@@ -185,6 +185,11 @@ class TestDriverContracts(unittest.TestCase):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node.odom = types.SimpleNamespace(publish=lambda message: None)
+        node._odom_burst = []
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 0.0
         node._on_sport(types.SimpleNamespace(mode=2, velocity=[1, 2, 3], position=[4, 5, 6], body_height=0.2,
                                               imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
         self.assertNotIn("imu_rpy_0", __import__("json").loads(published[0]))
@@ -275,6 +280,68 @@ class TestDriverContracts(unittest.TestCase):
         self.assertAlmostEqual(0.9945, x, places=3)
         self.assertAlmostEqual(-0.1045, y, places=3)
         self.assertAlmostEqual(0.0, z, places=3)
+
+
+class TestMediaCards(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        rclpy = types.ModuleType("rclpy")
+        rclpy.init = lambda *args, **kwargs: None
+        rclpy.shutdown = lambda *args, **kwargs: None
+        node_mod = types.ModuleType("rclpy.node")
+        node_mod.Node = type("Node", (), {"__init__": lambda self, *a, **k: None})
+        sys.modules["rclpy"] = rclpy
+        sys.modules["rclpy.node"] = node_mod
+        qos = types.ModuleType("rclpy.qos")
+        qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
+        qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
+        qos.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT=1)
+        qos.QoSProfile = lambda **kwargs: kwargs
+        sys.modules["rclpy.qos"] = qos
+        audio_msgs = types.ModuleType("audio_msgs")
+        audio_msg = types.ModuleType("audio_msgs.msg")
+        audio_msg.AudioChunk = type("AudioChunk", (), {})
+        sys.modules["audio_msgs"] = audio_msgs
+        sys.modules["audio_msgs.msg"] = audio_msg
+        cls.media = _load("as2w_media_under_test", ROOT / "media.py")
+
+    def test_topics_match_the_life_vision_skill(self):
+        mic = self.media.MicPlugin({}, "nvidia_desktop", None, "eno1")
+        camera = self.media.CameraRgbPlugin({}, "nvidia_desktop", "eno1")
+        self.assertEqual(mic.get_tool()["name"], "mic")
+        self.assertEqual(mic.get_tool()["topic_out"], [{"topic": "/nvidia_desktop/mic/audio", "format": "audio/pcm-16k"}])
+        self.assertEqual(camera.get_tool()["name"], "camera_rgb")
+        self.assertEqual(camera.get_tool()["topic_out"], [{"topic": "/nvidia_desktop/camera/front", "format": "image/jpeg"}])
+
+    def test_speaker_waits_for_an_input_topic(self):
+        speaker = self.media.SpeakerPlugin({}, "nvidia_desktop", None, object())
+        self.assertEqual(speaker.dispatch("info", {})["state"], "idle")
+        self.assertIn("error", speaker.dispatch("start", {}))
+
+    def test_led_clamps_and_calls_voice_service(self):
+        class _LedProxy:
+            def __init__(self):
+                self.colors = []
+
+            def LedControl(self, r, g, b):
+                self.colors.append((r, g, b))
+                return 0
+
+        proxy = _LedProxy()
+        led = self.media.LedPlugin({}, "nvidia_desktop", None, proxy)
+        result = led.dispatch("set_color", {"r": 300, "g": -1, "b": 12})
+        self.assertEqual(proxy.colors, [(255, 0, 12)])
+        self.assertEqual(result["ret"], 0)
+
+    def test_driver_yaml_and_image_register_the_media_cards(self):
+        driver = (ROOT / "driver.yaml").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        main = (ROOT / "main.py").read_text()
+        for name in ("mic", "camera_rgb", "speaker", "led"):
+            self.assertIn(f"name: {name}", driver)
+            self.assertIn(name, main)
+        self.assertIn("media.py", dockerfile)
+        self.assertIn("gstreamer1.0-tools", dockerfile)
 
 
 if __name__ == "__main__":

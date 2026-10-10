@@ -51,5 +51,17 @@ on the robot or extension host; the driver does not start that service.
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card.
 
+`mic`, `camera_rgb`, `speaker`, and `led` register even when Unitree DDS is
+down, so the canvas can wire them. The microphone publishes PCM 16 kHz on
+`/{namespace}/mic/audio`. The front camera decodes the body H.264 multicast
+with GStreamer and publishes JPEG on `/{namespace}/camera/front` (the topic
+perception suffixes with `/objects` and `/visual_depth_summary`). Both default
+to the Unitree body multicast addresses used by Go2; confirm them on the robot
+NIC and override `plugins.mic` / `plugins.camera_rgb` if they differ. The
+speaker subscribes to the canvas `input_topic` (normally `/perception/tts`) and
+plays it with the vendored A2 voice service `PlayStream`. The LED uses
+`LedControl`. Audio initialization is isolated from `SportClient`: if the voice
+service is absent, locomotion still starts.
+
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.

@@ -6,7 +6,7 @@ hardware_model: "as2w"
 image_name: as2w
 port: 15709
 mcp_url: "http://localhost:15709/mcp"
-description: "Unitree As2W — 轮足运动、特技、SLAM 空间动作、状态感知与雷达"
+description: "Unitree As2W — 轮足运动、特技、SLAM、状态、雷达、麦克风、前相机、扬声器与灯"
 build_context_extras:
   - ../../common
 cards:
@@ -19,4 +19,9 @@ cards:
   - { name: joint_state, type: sensor }
   - { name: battery, type: sensor }
   - { name: loco_state, type: sensor }
+  - { name: odometry, type: sensor }
   - { name: lidar_cloud, type: sensor }
+  - { name: mic, type: sensor }
+  - { name: camera_rgb, type: sensor }
+  - { name: speaker, type: actuator }
+  - { name: led, type: actuator }
