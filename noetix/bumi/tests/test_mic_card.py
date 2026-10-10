@@ -388,7 +388,7 @@ def test_sound_activity_reports_coherent_source_without_wake_status(monkeypatch)
     assert card.dispatch("check_direction", {})["sound_direction"]["angle"] == 0
 
 
-def test_mic_capture_ignores_vendor_wake_status(monkeypatch, tmp_path, capsys):
+def test_mic_capture_ignores_vendor_wake_and_paused_fan_noise(monkeypatch, tmp_path, capsys):
     module, String = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     sys.modules.pop("sound_direction", None)
@@ -420,7 +420,11 @@ def test_mic_capture_ignores_vendor_wake_status(monkeypatch, tmp_path, capsys):
     audio = np.stack(channels, axis=1)
     # 前 16 帧是同方向的低音量背景声，随后才出现明显发声。
     audio[:10240] //= 50
-    audio[32 * 640:] //= 50
+    # 说话结束后，后方风扇略高于初始背景，但不应刷新说话者的角度。
+    rear_channels = [np.roll(source, shift) for shift in (0, -2, 3, -1)]
+    rear_channels.extend([np.zeros_like(source) for _ in range(4)])
+    rear_audio = np.stack(rear_channels, axis=1)
+    audio[32 * 640:] = rear_audio[32 * 640:] // 30
     frames = iter(enumerate(audio.reshape(62, 640, 8)))
     clock = [0.0]
     capture_times = iter(1_700_000_000_000_000 + n * 40_000 for n in range(62))
@@ -472,6 +476,9 @@ def test_mic_capture_ignores_vendor_wake_status(monkeypatch, tmp_path, capsys):
     assert len(fresh_messages) >= 3  # 100 毫秒检查一次，发声后应多次发布。
     assert len(fresh_messages) <= 7  # 16 帧 × 40 ms；删除限流后会超出该上界。
     assert json.loads(fresh_messages[0].data)["angle"] == 0
+    speech_end_us = 1_700_000_000_000_000 + 32 * 40_000
+    assert all(json.loads(message.data)["audio_window_start_us"] < speech_end_us
+               for message in fresh_messages)
     assert json.loads(fresh_messages[0].data)["trigger"] == "sound_activity"
     assert all(json.loads(message.data).get("trigger") != "vendor_audio_wakeup"
                for message in messages)

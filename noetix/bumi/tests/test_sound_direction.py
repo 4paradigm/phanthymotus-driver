@@ -19,7 +19,9 @@ def test_activity_gate_detects_normal_speech_with_dc_offset_and_short_pause():
     assert not gate.accepts(frame(85))  # 单帧升高不等于持续说话。
     assert gate.accepts(frame(85))
     assert not any(gate.accepts(frame(40)) for _ in range(6))
-    assert gate.accepts(frame(60))  # 语音短暂停顿后较弱的音节仍可定位。
+    assert not gate.accepts(frame(60))  # 停顿期不以较低门限刷新声源方向。
+    assert not gate.accepts(frame(85))
+    assert gate.accepts(frame(85))  # 下一次明显发声后继续定位。
     assert not gate.accepts(np.zeros(8 * 640 + 1, dtype=np.int16))
 
 

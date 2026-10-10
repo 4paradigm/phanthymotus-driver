@@ -34,7 +34,7 @@ class SoundActivityGate:
             return True
         if self._hold_samples > 0 and level >= max(10.0, background * 1.5):
             self._hold_samples = 9600
-            return True
+            return False  # 只维持语音状态，停顿时的风扇声不能刷新角度。
         self._hold_samples = max(0, self._hold_samples - len(head))
         return False
 

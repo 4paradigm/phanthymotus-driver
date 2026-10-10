@@ -1044,10 +1044,15 @@ def _mic_subprocess(namespace: str):
             capture_us = _mic_capture_timestamp_us(audio, int(_time.time() * 1_000_000))
             if (audio.channels == 8 and audio.sample_rate == 16000
                     and samples.size % 8 == 0):
-                recent_audio.append(samples)
-                recent_capture_us.append(capture_us)
                 is_activity = activity_gate.accepts(samples)
-                if (is_activity and len(recent_audio) >= 8
+                if is_activity:
+                    recent_audio.append(samples)
+                    recent_capture_us.append(capture_us)
+                else:
+                    # 停顿帧不进入下一次定位窗口，避免后方风扇压过人声。
+                    recent_audio.clear()
+                    recent_capture_us.clear()
+                if (is_activity and sum(frame.size for frame in recent_audio) >= 8 * 1024
                         and _time.monotonic() >= next_activity_check):
                     next_activity_check = _time.monotonic() + 0.1
                     try:
@@ -1055,7 +1060,7 @@ def _mic_subprocess(namespace: str):
                         activity = _mic_activity_payload(
                             _np.concatenate(list(recent_audio)[-8:]),
                             _load_calibration(), _time.time() * 1000,
-                            (recent_capture_us[-8], recent_capture_us[-1]))
+                            (recent_capture_us[0], recent_capture_us[-1]))
                         if activity is not None:
                             direction_msg = String()
                             direction_msg.data = activity
