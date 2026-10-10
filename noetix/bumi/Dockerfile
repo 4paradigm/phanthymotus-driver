@@ -76,8 +76,11 @@ COPY deploy/     /deploy/
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
 ENV PYTHONUNBUFFERED=1
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# Use SDK's DDS config for peer discovery (unicast to motion control board 192.168.55.102)
+# Vendor HighController/MediaController use CycloneDDS to discover the motion
+# board (192.168.55.102). This driver's ROS 2 bridge to Agent Core uses
+# rmw_fastrtps_cpp and the mounted FASTRTPS_DEFAULT_PROFILES_FILE instead.
 ENV CYCLONEDDS_URI='file:///work/noetix_sdk_bumi/config/dds.xml'
 
 EXPOSE 15704
