@@ -215,6 +215,65 @@ def test_direction_card_preserves_front_right_calibration(monkeypatch, tmp_path)
         "version": 2, "front": [1.0, 0.0, 0.0], "right": [0.0, 1.0, 0.0]}
 
 
+def test_calibration_reports_restart_failure_but_preserves_saved_signature(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    path = tmp_path / "calibration.json"
+    monkeypatch.setattr(module, "CALIBRATION_PATH", path)
+    ticks = [0.0]
+
+    def monotonic():
+        ticks[0] += 0.01
+        return ticks[0]
+
+    monkeypatch.setattr(module.time, "monotonic", monotonic)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(module, "is_voiced_audio", lambda *args: True)
+    monkeypatch.setattr(module, "estimate_signature", lambda *args: [1.0, 2.0, 3.0])
+    count = [0]
+
+    def capture():
+        count[0] += 1
+        return types.SimpleNamespace(
+            channels=8, sample_rate=16000,
+            audio_data=[count[0]] * (8 * 16000))
+
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None),
+        types.SimpleNamespace(get_audio_capture_data=capture))
+
+    class RunningProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    card._proc = RunningProcess()
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: (
+        _ for _ in ()).throw(OSError("spawn failed")))
+    result = card.dispatch("calibrate_front", {})
+    assert result["state"] == "error"
+    assert result["calibration_saved"] is True
+    assert result["direction"] == "front"
+    assert json.loads(path.read_text()) == {"front": [1.0, 2.0, 3.0]}
+
+    class ExitedProcess(RunningProcess):
+        stdout = ()
+
+        def poll(self):
+            return 1
+
+    card._proc = RunningProcess()
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: ExitedProcess())
+    result = card.dispatch("calibrate_front", {})
+    assert result["state"] == "error"
+    assert result["calibration_saved"] is True
+    assert card._proc is None
+
+
 def test_concurrent_direction_calibrations_keep_both_signatures(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     path = tmp_path / "calibration.json"

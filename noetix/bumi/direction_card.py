@@ -289,6 +289,7 @@ class SoundDirectionPlugin:
             running = self._proc is not None and self._proc.poll() is None
             if running:
                 self.stop()
+            calibration_saved = False
             try:
                 frames = []
                 seen = set()
@@ -325,14 +326,18 @@ class SoundDirectionPlugin:
                 temporary = CALIBRATION_PATH.with_suffix(".tmp")
                 temporary.write_text(json.dumps({**extras, **calibration}))
                 temporary.replace(CALIBRATION_PATH)
+                calibration_saved = True
                 return {"state": "calibrated", "direction": direction,
                         "remaining": [key for key in ("front", "right") if key not in calibration]}
             finally:
                 if running:
                     try:
-                        self.start()
+                        if not self.start(wait_ready=True):
+                            return {"state": "error", "message": "direction restart failed to initialize",
+                                    "direction": direction, "calibration_saved": calibration_saved}
                     except Exception as exc:
-                        print(f"[direction] restart after calibration failed: {exc}", flush=True)
+                        return {"state": "error", "message": f"direction restart failed: {exc}",
+                                "direction": direction, "calibration_saved": calibration_saved}
 
     def _set_parameters(self, changes: dict | None) -> dict:
         with self._process_lock:
