@@ -1,0 +1,23 @@
+# Optional CPU simulation environment; install in a dedicated Python 3.10–3.12 venv.
+# Direct dependency pins tested with the fixed Teleopit 0.5.0 source on Python 3.11.
+# Python 3.10's last compatible SciPy line is selected explicitly, not by a latest resolver.
+numpy==1.26.4
+torch==2.2.2
+mujoco==3.2.7
+mink==0.0.13
+qpsolvers[proxqp]==4.13.0
+proxsuite==0.7.3
+daqp==0.9.1
+scipy==1.17.1; python_version >= "3.11"
+scipy==1.15.3; python_version < "3.11"
+onnxruntime==1.23.2
+hydra-core==1.3.6
+omegaconf==2.3.1
+h5py==3.16.0
+pyzmq==27.2.0
+msgpack==1.2.2
+rich==15.0.0
+loop-rate-limiters==1.2.0
+imageio==2.37.4
+huggingface_hub==1.30.0
+Pillow==12.3.0

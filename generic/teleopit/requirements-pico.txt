@@ -1,0 +1,7 @@
+# Optional pico-bridge only: no Teleopit sim2real extra, g1_bridge or Unitree SDK.
+# The release wheel was downloaded and verified when this integration was added.
+pico-bridge @ https://github.com/BotRunner64/pico-bridge/releases/download/v0.2.1/pico_bridge-0.2.1-py3-none-any.whl#sha256=7cf0fee07c76541fd06e2ee6bdeec3d11fec578cd4ef6b45179dec4af31b369f
+# Compatible with NumPy 1.26 and Python 3.10–3.12; video/device validation is separate.
+av==13.1.0
+aiortc==1.10.1
+rerun-sdk==0.18.2
