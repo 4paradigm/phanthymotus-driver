@@ -11,15 +11,32 @@ class SoundActivityGate:
 
     def __init__(self):
         self._levels = deque(maxlen=50)
+        self._rising_frames = 0
+        self._hold_samples = 0
 
     def accepts(self, audio) -> bool:
-        head = np.asarray(audio, dtype=np.float32).reshape(-1, 8)[:, :4]
+        samples = np.asarray(audio, dtype=np.float32)
+        if samples.size == 0 or samples.size % 8:
+            return False
+        head = samples.reshape(-1, 8)[:, :4]
+        head = head - head.mean(axis=0)
         level = float(np.median(np.sqrt(np.mean(head * head, axis=0))))
         background = (float(np.percentile(self._levels, 20))
                       if len(self._levels) >= 6 else None)
         self._levels.append(level)
-        # 对比近期背景声，避免安静时稳定的底噪反复触发方向计算。
-        return background is not None and level >= max(10.0, background * 2.5)
+        if background is None:
+            return False
+        # 去直流后用连续两帧识别较轻的说话声；短暂停顿只保留状态，不输出底噪角度。
+        rising = level >= max(10.0, background * 1.8)
+        self._rising_frames = self._rising_frames + 1 if rising else 0
+        if self._rising_frames >= 2 or level >= max(15.0, background * 3.0):
+            self._hold_samples = 9600  # 允许约 0.6 秒语音停顿。
+            return True
+        if self._hold_samples > 0 and level >= max(10.0, background * 1.25):
+            self._hold_samples = 9600
+            return True
+        self._hold_samples = max(0, self._hold_samples - len(head))
+        return False
 
 
 def is_voiced_audio(audio, channels: int, sample_rate: int) -> bool:
@@ -78,6 +95,8 @@ def estimate_angle(signature, front, right):
     basis = np.column_stack((front, right)).astype(np.float64)
     measured = np.asarray(signature, dtype=np.float64)
     if basis.shape != (3, 2) or measured.shape != (3,):
+        return None
+    if not np.all(np.isfinite(basis)) or not np.all(np.isfinite(measured)):
         return None
     if np.linalg.cond(basis) > 20 or np.linalg.norm(measured) < 0.5:
         return None

@@ -5,7 +5,33 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sound_direction import estimate_angle, estimate_signature, is_voiced_audio
+from sound_direction import SoundActivityGate, estimate_angle, estimate_signature, is_voiced_audio
+
+
+def test_activity_gate_detects_normal_speech_with_dc_offset_and_short_pause():
+    gate = SoundActivityGate()
+
+    def frame(level, dc=100):
+        wave = np.tile([dc + level, dc - level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    assert not gate.accepts(frame(85))  # 单帧升高不等于持续说话。
+    assert gate.accepts(frame(85))
+    assert not any(gate.accepts(frame(40)) for _ in range(6))
+    assert gate.accepts(frame(60))  # 语音短暂停顿后较弱的音节仍可定位。
+    assert not gate.accepts(np.zeros(8 * 640 + 1, dtype=np.int16))
+
+
+def test_estimator_rejects_bad_inputs_and_off_basis_direction():
+    front, right = (2.0, -1.0, 0.0), (0.0, 1.0, -2.0)
+    assert estimate_signature(np.zeros(8 * 100, dtype=np.int16), 8, 16000) is None
+    assert estimate_signature(np.zeros(8 * 2048 + 1, dtype=np.int16), 8, 16000) is None
+    assert estimate_signature(np.zeros(8 * 2048, dtype=np.int16), 4, 16000) is None
+    assert estimate_angle(tuple(a + b for a, b in zip(front, right)), front, right) == 45
+    assert estimate_angle((1, 1, 10), front, right) is None
+    assert estimate_angle((float("nan"), 1, 0), front, right) is None
+    assert estimate_angle(front, (float("inf"), 0, 0), right) is None
 
 
 def test_estimate_signature_uses_interleaved_head_microphones():

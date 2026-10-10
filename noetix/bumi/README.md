@@ -17,7 +17,7 @@ JSON “最新” view updates automatically when a new observation is published
 After one second without a new sound direction, the stream publishes `no_event`
 once so the monitor does not keep showing an old angle. The card's ten-second
 `check_direction` window is unchanged.
-Each audio chunk carries its capture time in `AudioChunk.header.stamp`. Direction
+Each audio chunk carries its first capture frame's timestamp in `AudioChunk.header.stamp`. Direction
 JSON includes `audio_window_start_us` and `audio_window_end_us` for the captured
 frames used in that estimate; consumers can match chunks whose stamp falls in
 that interval. The SDK capture timestamp is used when available, otherwise the
@@ -33,7 +33,8 @@ One-time setup on Bumi EDU:
 3. Repeat at the robot's right side with `action=calibrate_right`.
 4. Make a sound from a known position and watch the `sound_direction` stream,
    or choose `check_direction` on the `mic` card within 10 seconds. Read
-   `sound_direction` in the action result (`fresh`, `no_event`, or `stale`). The
+   `sound_direction` in the action result (`fresh`, `no_event`, `stale`,
+   `uncalibrated`, or `ambiguous`). The
    canvas's generic “查看数据流” button opens the audio stream.
 
 Each calibration temporarily pauses the mic audio stream, collects fresh

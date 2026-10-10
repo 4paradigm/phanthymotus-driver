@@ -968,7 +968,8 @@ def _load_calibration() -> dict:
     return {name: signature for name, signature in data.items()
             if name in ("front", "right")
             and isinstance(signature, list) and len(signature) == 3
-            and all(type(value) in (int, float) for value in signature)}
+            and all(type(value) in (int, float) and abs(value) <= 24
+                    for value in signature)}
 
 
 def _mic_capture_timestamp_us(audio, now_us: int) -> int:
@@ -1062,8 +1063,10 @@ def _mic_subprocess(namespace: str):
     frame_count = 0
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
-    recent_audio = _deque(maxlen=100)  # 约 1 秒原始 8 通道音频，供唤醒时定位。
+    buffer_start_us = None
+    recent_audio = _deque(maxlen=100)  # 按接收时间裁剪到最近 1 秒。
     recent_capture_us = _deque(maxlen=100)
+    recent_received_at = _deque(maxlen=100)
     next_status_poll = 0.0
     next_activity_check = 0.0
     last_sound_direction_at = None
@@ -1074,8 +1077,13 @@ def _mic_subprocess(namespace: str):
 
     while True:
         try:
+            now = _time.monotonic()
+            while recent_received_at and now - recent_received_at[0] > 1.0:
+                recent_received_at.popleft()
+                recent_audio.popleft()
+                recent_capture_us.popleft()
             next_status_poll, last_wake_key, wake_key = _poll_mic_wake_status(
-                media_ctrl, _time.monotonic(), next_status_poll, last_wake_key)
+                media_ctrl, now, next_status_poll, last_wake_key)
             if wake_key is not None:
                 try:
                     signature = estimate_signature(
@@ -1086,11 +1094,24 @@ def _mic_subprocess(namespace: str):
                         (recent_capture_us[0], recent_capture_us[-1])
                         if recent_capture_us else None)
                     direction_pub.publish(direction_msg)
+                    last_sound_direction_at = _time.monotonic()
                 except Exception as exc:
                     # 单次方向发布失败只丢这条事件，不阻塞音频采集。
                     # 日志按 0.5s 限流，连续失败时不按事件频率刷屏。
                     if _time.monotonic() >= next_direction_error_log:
                         print(f"[mic_subprocess] direction publish skipped: {exc}", flush=True)
+                        next_direction_error_log = _time.monotonic() + 0.5
+            if (last_sound_direction_at is not None
+                    and _time.monotonic() - last_sound_direction_at >= 1.0):
+                try:
+                    # 监控流清除旧角度；卡片仍按原约定保留 10 秒查询窗口。
+                    direction_msg = String()
+                    direction_msg.data = json.dumps({"state": "no_event"})
+                    direction_pub.publish(direction_msg)
+                    last_sound_direction_at = None
+                except Exception as exc:
+                    if _time.monotonic() >= next_direction_error_log:
+                        print(f"[mic_subprocess] direction clear skipped: {exc}", flush=True)
                         next_direction_error_log = _time.monotonic() + 0.5
             audio = media_ctrl.get_audio_capture_data()
             if audio.channels == 0 or len(audio.audio_data) == 0:
@@ -1100,9 +1121,11 @@ def _mic_subprocess(namespace: str):
             # Downmix 8ch → mono (channel 0) using numpy for speed
             samples = _np.array(audio.audio_data, dtype=_np.int16)
             capture_us = _mic_capture_timestamp_us(audio, int(_time.time() * 1_000_000))
-            if audio.channels == 8 and audio.sample_rate == 16000:
+            if (audio.channels == 8 and audio.sample_rate == 16000
+                    and samples.size % 8 == 0):
                 recent_audio.append(samples)
                 recent_capture_us.append(capture_us)
+                recent_received_at.append(_time.monotonic())
                 is_activity = activity_gate.accepts(samples)
                 if (is_activity and len(recent_audio) >= 8
                         and _time.monotonic() >= next_activity_check):
@@ -1122,18 +1145,6 @@ def _mic_subprocess(namespace: str):
                         if _time.monotonic() >= next_direction_error_log:
                             print(f"[mic_subprocess] activity direction skipped: {exc}", flush=True)
                             next_direction_error_log = _time.monotonic() + 0.5
-                if (last_sound_direction_at is not None
-                        and _time.monotonic() - last_sound_direction_at >= 1.0):
-                    try:
-                        # 监控流清除旧角度；卡片仍按原约定保留 10 秒查询窗口。
-                        direction_msg = String()
-                        direction_msg.data = json.dumps({"state": "no_event"})
-                        direction_pub.publish(direction_msg)
-                        last_sound_direction_at = None
-                    except Exception as exc:
-                        if _time.monotonic() >= next_direction_error_log:
-                            print(f"[mic_subprocess] direction clear skipped: {exc}", flush=True)
-                            next_direction_error_log = _time.monotonic() + 0.5
             mono = samples[::audio.channels]
 
             # SDK returns low-amplitude signal (~8-bit dynamic range in 16-bit container)
@@ -1141,17 +1152,20 @@ def _mic_subprocess(namespace: str):
             mono = _np.clip(mono.astype(_np.int32) * 50, -32768, 32767).astype(_np.int16)
 
             # Accumulate until we have enough for a proper chunk
+            if buffer_start_us is None:
+                buffer_start_us = capture_us
             buffer = _np.concatenate([buffer, mono])
 
             if len(buffer) >= MIN_CHUNK_SAMPLES:
                 msg = _AudioChunk()
                 # 与方向计算窗口使用同一原始音频时间轴，供 Agent 关联。
-                msg.header.stamp.sec = capture_us // 1_000_000
-                msg.header.stamp.nanosec = (capture_us % 1_000_000) * 1000
+                msg.header.stamp.sec = buffer_start_us // 1_000_000
+                msg.header.stamp.nanosec = (buffer_start_us % 1_000_000) * 1000
                 msg.format = "pcm_16k_16bit_mono"
                 msg.data = buffer.tobytes()
                 pub.publish(msg)
                 buffer = _np.array([], dtype=_np.int16)
+                buffer_start_us = None
 
                 frame_count += 1
                 if frame_count % 200 == 0:
@@ -1220,7 +1234,7 @@ class MicPlugin:
                     "start": {"params": [], "description": "启动麦克风采集与方向输出。"},
                     "stop": {"params": [], "description": "停止麦克风采集与方向输出。"},
                     "info": {"params": [], "description": "查看采集状态、最近方向观测与标定进度。"},
-                    "check_direction": {"params": [], "description": "查看最近一次唤醒方向与标定状态。"},
+                    "check_direction": {"params": [], "description": "查看最近一次声音或唤醒方向与标定状态。"},
                     "add_wakeup_word": {"params": [], "description": "向 Bumi 语音模块添加‘小范小范’"},
                     "calibrate_front": {"params": [], "description": "一人在机器人正前方持续说‘测试测试’约 2 秒时调用"},
                     "calibrate_right": {"params": [], "description": "一人在机器人正右方持续说‘测试测试’约 2 秒时调用"},
@@ -1325,7 +1339,11 @@ class MicPlugin:
                     self._proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     self._proc.kill()
-                    self._proc.wait(timeout=2)
+                    try:
+                        self._proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired as exc:
+                        # 子进程未退出时保留句柄，阻止 start 启动第二个采集进程。
+                        raise RuntimeError("mic subprocess did not exit after kill") from exc
                 self._proc = None
             with self._direction_lock:
                 self._last_direction = None
@@ -1336,7 +1354,10 @@ class MicPlugin:
             self.start()
             return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
         if action == "stop":
-            self.stop()
+            try:
+                self.stop()
+            except RuntimeError as exc:
+                return {"state": "error", "message": str(exc)}
             return {"state": "idle"}
         if action in ("info", "check_direction"):
             calibration = _load_calibration()
@@ -1355,15 +1376,16 @@ class MicPlugin:
                     "calibrated_directions": [name for name in ("front", "right")
                                               if name in calibration]}
         if action == "add_wakeup_word":
-            if self._wakeup_word_added or "小范小范" in self._media_ctrl.get_wakeup_words():
-                return {"state": "configured", "word": "小范小范"}
-            if time.monotonic() - self._last_wakeup_config_time < 0.5:
-                return {"state": "retry_later", "message": "语音模块配置调用需间隔至少 500 毫秒"}
-            self._last_wakeup_config_time = time.monotonic()
-            accepted = self._media_ctrl.add_wakeup_words(_MIC_WAKEUP_WORD)
-            self._wakeup_word_added = accepted
-            return {"state": "configured" if accepted else "rejected",
-                    "word": "小范小范"}
+            with self._process_lock:
+                if self._wakeup_word_added or "小范小范" in self._media_ctrl.get_wakeup_words():
+                    return {"state": "configured", "word": "小范小范"}
+                if time.monotonic() - self._last_wakeup_config_time < 0.5:
+                    return {"state": "retry_later", "message": "语音模块配置调用需间隔至少 500 毫秒"}
+                self._last_wakeup_config_time = time.monotonic()
+                accepted = self._media_ctrl.add_wakeup_words(_MIC_WAKEUP_WORD)
+                self._wakeup_word_added = accepted
+                return {"state": "configured" if accepted else "rejected",
+                        "word": "小范小范"}
         if action in ("calibrate_front", "calibrate_right"):
             return self._calibrate(action.removeprefix("calibrate_"))
         return None
