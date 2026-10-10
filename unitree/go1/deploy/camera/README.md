@@ -17,6 +17,133 @@ camera, opens it only after the Pi connects, and exits on disconnect so systemd
 returns it to idle. A physical camera can therefore serve only one of RGB,
 depth, and point cloud at a time.
 
+`vision_capture` connects directly to the selected RGB port; `camera_rgb` does
+not need to be started. Use `{"action":"capture_photo","position":"front"}`
+for one JPEG or `{"action":"record_video","position":"front","duration_s":5}`
+for an MP4 video (1–30 seconds, default 5).
+
+`capture_photo` waits for the JPEG to be saved and returns its final file paths,
+MIME type, size, capture time, `state: captured`, and `file_ready: true` in the
+same MCP result. Failure returns an error directly. Photos do not return an
+ACP `action_id` or send ACP callbacks. `start`, `stop`, `list`, `delete`, and
+`info` also return directly without their own ACP callbacks; stopping an active
+video still causes that video's terminal cancellation callback.
+
+Only `record_video` is asynchronous. Its initial MCP result returns promptly
+with an `action_id`, a planned `file_path` and `channel_reply_path`, and
+`state: recording`. `ok: true` means accepted and `file_ready: false` does not
+confirm a saved file. The tool declares `inputSchema.x-completion` only for
+`record_video`, with a 120-second completion timeout. The background worker
+reports one terminal outcome (`completed`, `error`, or `cancelled`) to the
+existing local Agent Core `/api/acp/complete` endpoint. Successful completion
+contains final file paths, MIME type, size and recording timing; failure or
+cancellation contains an error code and message. Use this completion result to
+determine video availability, rather than the initial MCP result.
+`info.last_capture` keeps the latest `{status, result}`;
+`info.last_recording` keeps `{action_id, status, result}` for inspection.
+
+ACP delivery uses `AGENT_CORE_URL` (default `https://localhost:15678`), no bearer
+token, and at most three attempts with a 3-second request timeout and 0.5/1-second
+backoff. Retries reuse the same action ID and terminal payload; an ambiguous
+network failure may deliver the same payload again, so this is one logical
+terminal outcome, not guaranteed exactly-once network delivery. Exhaustion is
+logged; there is no durable retry queue across outages or process restarts.
+The card does not send `/api/event` or require `ACCESS_TOKEN`. ACP completion
+updates orchestration status; it does not implement a separate “录像已保存”
+canvas message or keep the execute button busy until video completion. The
+current manual canvas call displays the initial MCP result; final video paths
+are carried by ACP and remain available through `list` and `info`.
+
+`stop` reports lifecycle state `idle` and a separate `capture_active` flag;
+an active photo continues while an active video is cancelled. Cancellation
+and MP4 publication share a lock: cancellation before publication prevents a
+successful MP4; once the file is published the recording is already complete.
+
+As on Tianyi, `capture_photo` accepts an optional `image_name` and `record_video`
+accepts an optional `video_name`. Use a filename stem without an extension;
+otherwise the card generates one. `list` returns saved files with their full
+container `path`, `channel_reply_path`, MIME type and size; `delete` accepts the
+complete `.jpg` or `.mp4` filename. A file currently being written cannot be
+deleted, and an existing name is never accepted for a new capture.
+
+For `record_video`, the recording clock starts at the first valid camera frame.
+The planned MP4 path becomes ready only after successful ACP completion.
+Lifecycle `stop` cancels an active recording instead of saving it, including
+when the encoder is being created or is finishing. Driver shutdown rejects new
+captures, cancels active video, and waits for in-flight photos and all accepted
+video workers including their bounded ACP delivery attempts, even after camera
+occupancy is released.
+The service gives this drain up to 60 seconds before forced container exit.
+
+Recording first writes the selected JPEGs into a temporary MJPEG stream, then
+encodes that stream to MP4 with `ffmpeg`'s `ultrafast` H.264 preset. This keeps
+slow encoding from blocking Nano frame reception and repeating the last image
+for the rest of the requested duration. Unpublished temporary files are hidden from `list` and removed after
+success, failure, or cancellation; allow disk space for the temporary stream
+and final MP4 while encoding finishes.
+
+Each recording has fixed storage limits: the temporary MJPEG spool is at most
+128 MiB and the published MP4 must be below 64 MiB. Before connecting and before
+every received or filler frame is written, the worker checks free space,
+reserving 64 MiB for the encoded MP4 plus 64 MiB for the host. ffmpeg also receives
+`-fs 67108864`; reaching the output limit fails the action instead of publishing
+a shortened video. ffmpeg can exceed its `-fs` target slightly during packet/index
+finalization, so the output size is checked again before publication. Final free
+space is checked as well. Quota exhaustion and filesystem `ENOSPC` / `EFBIG`
+produce one terminal `error` with code `STORAGE_ERROR`, and temporary media are
+removed. These are per-recording limits, not a total archive quota; existing
+saved files require explicit deletion. Free-space checks cannot reserve disk
+against concurrent writes by other services.
+
+The completion result distinguishes
+`recording_started_at` (first valid camera frame), `recording_ended_at` (capture
+finished), and `file_ready_at` (MP4 published). Playback duration follows the
+capture interval; file availability can be later because encoding runs after it.
+
+`config.yaml` sets `vision_capture.output_dir` to
+`/opt/phanthy-motus/data/vision_capture`. Photos go to `photos/*.jpg`, videos
+to `videos/*.mp4`. `deploy/service.yml` bind-mounts `/opt/phanthy-motus/data`
+at the same path on the host, so these files persist after container restart.
+The `channel_reply_path` for a saved file starts with
+`/work/resource/vision_capture` by default; it is intended for a channel that
+mounts the same host data directory there. Set `PHANTHY_CHANNEL_OUTPUT_DIR` if
+that channel uses a different mount, and verify the mount before sending a file.
+The previous `camera_snapshot` card name is replaced by `vision_capture`; update
+existing canvas calls. Previous JPEGs remain in
+`/opt/phanthy-motus/data/camera_snapshot` and are not moved automatically.
+
+**Deployment prerequisite:** run only one Go1 driver process/container per set
+of five Nano cameras. The in-process position registry is not shared across
+driver instances, and the Nano services do not provide a shared lease. Before
+enabling the snapshot card or a second deployment, stop any other Go1 driver
+instance targeting the same Nano IPs and ports. Duplicate deployments can
+interrupt an active stream or make a capture fail.
+
+Within one driver process, capture admission and stream startup share a lock:
+an active RGB/depth/pointcloud receiver or another capture on the same position
+returns `RESOURCE_BUSY` without an `action_id` or another TCP connection. A
+stream cannot start or switch onto a position occupied by a capture or another
+stream. Rejected hot switches preserve the old receiver. Stopping a stream
+retains its occupancy until the receiving thread exits. Other positions remain
+available.
+
+Capture endpoints use `camera.py`'s five default RGB endpoints. The bundle
+merges `positions` field by field, in increasing precedence:
+`camera_pointcloud` → `camera_depth` → `camera_rgb` → `vision_capture`.
+Configuration is inherited even if a stream card is disabled. Normally configure
+`camera_rgb.positions` once; `vision_capture.positions` is only an explicit
+override for deployments that need it. For example, overriding just
+`camera_rgb.positions.left.board_ip` changes both RGB streaming and captures;
+the existing `image_port` is retained. Keep depth/pointcloud mappings consistent
+for the same physical position.
+
+The Dockerfile installs `ffmpeg` for MP4 encoding, so the image will grow by
+that package and its dependencies; no model/data artefacts or Python image
+decoder are added. JPEG validation remains the frame-size limit and SOI/EOI
+markers, not a full decode. `driver.yaml` is metadata only. The ARM64 base does not include ffmpeg. See [image size evidence](image-size.md)
+for measured registry layer sizes and the distinction between total driver
+growth and ffmpeg dependency footprint.
+
 ## RGB path
 
 `rgb_stream.cc` reads calibration from the camera, applies CMei undistortion,

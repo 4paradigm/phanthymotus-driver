@@ -80,6 +80,8 @@ Want to add support for new hardware? See the **[Driver Development Guide](READM
 - MCP protocol implementation (JSON-RPC 2.0 methods)
 - Tool definition spec (`inputSchema`, `configSchema`, `multiInstance`, `x-action-params`)
 - Instance management (`multiInstance` flag, `scope` for config fields)
+- Config field formats — masked secrets (`format: "password"`, `x-sensitive`) and a QR code
+  for "install the app on your phone" / "point your phone at this robot" (`format: "qr"`)
 - Plugin lifecycle (`__init__`, `get_tool`, `start`, `stop`, `dispatch`)
 - `driver.yaml` and `config.yaml` metadata format
 - Registration and heartbeat with Agent Core
@@ -132,6 +134,7 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `data/json` | Text / KV panel | JSON key-value display |
 | `text/*` | Text | Plain text display |
 | `sensor/skeleton` | 3D Skeleton | URDF-based 3D skeleton with joint rotation |
+| `sensor/pose2d` | 2D human skeleton | COCO-17 human keypoints overlaid on the frame, with a per-person posture and activity label |
 | `sensor/lidar*` | Lidar scan | 2D/3D lidar point visualization |
 | `sensor/pointcloud` | Point cloud | 3D point cloud renderer |
 | `sensor/mapping` | 2D Map | Occupancy grid / SLAM map |

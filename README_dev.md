@@ -146,6 +146,62 @@ Two formats are cleared automatically and need no marking, because their values
 only mean something on the machine they were set on: `channel-select` (a local
 channel id) and `audio-input-device` (a local sound-card device).
 
+#### Showing a QR code (`"format": "qr"`)
+
+When a plugin needs the user to do something with a phone — install a companion
+app, point an app at this robot to pair it — declare a `qr` field. The dashboard
+renders a row of options and a QR code for the selected one, inside this tool's
+own config form (the sidebar gear for `shared` scope, the card gear for
+`instance` scope).
+
+```python
+"configSchema": {
+    "type": "object",
+    "properties": {
+        "install": {
+            "type": "string",
+            "format": "qr",
+            "description": "扫码安装手机 App",
+            "x-qr-options": [
+                {"label": "iOS",     "url": "https://apps.apple.com/app/id123"},
+                {"label": "Android", "url": "{origin}/downloads/motus.apk"},
+                {"label": "配网",    "url": "motus://setup?h={host}&p={port}"},
+            ],
+        },
+    },
+}
+```
+
+**The field is display-only.** It collects nothing, never appears in the saved
+config, and does not count towards "configured" — a tool whose only field is a
+QR will not show the unconfigured warning. Do not put it in `required`.
+
+Four placeholders are substituted, and nothing else (an unrecognised `{name}` is
+left alone rather than silently emptied):
+
+| Placeholder | Becomes |
+|-------------|---------|
+| `{host}`   | This machine's LAN address, from `GET /api/network/reachable` |
+| `{port}`   | The port the dashboard is served on |
+| `{scheme}` | `http` or `https` |
+| `{origin}` | `{scheme}://{host}:{port}` |
+
+`{host}` is a **network-interface address, not `location.host`**. A browser open
+on the robot itself sees `localhost`, and over an SSH tunnel `127.0.0.1`; either
+one baked into a QR gives the phone a link it cannot dial, with no error to
+explain why. On a multi-homed robot the user gets a pill row to pick the
+interface — shown only for options that actually reference `{host}`/`{origin}`.
+
+**`{token}` is refused.** A template containing it renders an error in place of
+the code instead of the code. The access token drives motors, and `configSchema`
+is written by the driver author — it does not get to decide who receives that
+key. The one QR that carries it is the built-in 我的 → 手机接入 card, which is
+covered by default and auto-hides.
+
+Hosting the file is the driver image's own business: agent-core serves its whole
+`./web` directory at `/` with no auth, so a file the image drops there is
+reachable at `{origin}/…` with no work on the agent-core side.
+
 ---
 
 ## x-action-params Specification
@@ -556,6 +612,7 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `data/json` | Text / KV panel | `hint === 'data/json'` |
 | `text/*` | Text display | `hint.startsWith('text/')` |
 | `sensor/skeleton` | 3D Skeleton (URDF) | `hint === 'sensor/skeleton'` |
+| `sensor/pose2d` | 2D human skeleton | `hint === 'sensor/pose2d'` |
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
@@ -598,6 +655,48 @@ topic_out:
   - topic: /{namespace}/camera/depth
     format: image/depth-zlib
 ```
+
+### 2D Human Pose Rendering (`sensor/pose2d`) — Full Spec
+
+Note this is a different thing from `sensor/skeleton` above, and the names are
+close enough to pick the wrong one. `sensor/skeleton` is **the robot's own
+body**: a URDF plus joint angles, drawn in 3D. `sensor/pose2d` is **people the
+robot is looking at**: COCO-17 image-space keypoints, drawn flat over the frame.
+A quadruped publishing its legs wants `sensor/skeleton`; a camera plugin
+detecting a person wants `sensor/pose2d`.
+
+The payload is one JSON object per frame. `persons` is the only required key —
+a message without it is dropped, and an empty list is the correct way to say
+"nobody in frame" (which clears the overlay):
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `persons` | **yes** | one entry per detected person, see below |
+| `image_size` | no | `[width, height]` of the source frame. Without it the renderer infers an extent from the keypoints, which drifts as people move — send it |
+| `count` | no | defaults to `persons.length` |
+| `keypoint_names` | no | names in keypoint order; defaults to COCO-17 |
+| `skeleton` | no | bone list as index pairs; defaults to the COCO-17 skeleton |
+
+Each entry in `persons`:
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `keypoints` | **yes** | `[[x, y, v], ...]` in **pixels**, in `keypoint_names` order. `v` is visibility/confidence; `[x, y]` is accepted and counts as fully visible |
+| `id` | no | track id — keeps one person's colour stable across frames. Defaults to `0`, so omitting it on a multi-person stream makes everyone the same colour |
+| `posture` | no | the shape the body is in (`standing`, `sitting`, `lying`, ...). Everybody has one |
+| `activity` | no | what they are doing (`hand waving`, `falling down`, ...). Legitimately absent — not every frame supports a verdict |
+| `posture_confidence` | no | 0..1, shown beside the label when present |
+| `bbox` | no | `[x1, y1, x2, y2]` in pixels |
+
+Two channels rather than one label, because they answer different questions and
+degrade independently: a posture is geometric and always available, an activity
+needs a time window and may abstain. The renderer draws the activity when there
+is one and falls back to the posture, so a driver that can only do postures
+still renders correctly. `falling down` and `lying` are drawn in the alert
+colour.
+
+Do **not** clip keypoints to the frame: an off-image wrist is real information,
+and the renderer handles out-of-bounds points.
 
 ### Skeleton Rendering (`sensor/skeleton`) — Full Spec
 
@@ -1490,6 +1589,131 @@ commanding vertical motion.
 First implementation: `unitree/r1/loco_servo.py`. Measured motion comes back on
 `motus.odom/1`, whose axes are these axes — see that section.
 
+### `limits.min_magnitude` — declare the speed below which your robot does nothing
+
+A legged base has to assemble a whole gait cycle, so unlike a wheeled one it has
+no creep regime: below some speed it does not move **at all**. R1 needs 0.4 m/s
+and 1.0 rad/s. Under that the SDK accepts the command, returns 0, and the robot
+stands still — 159 commands applied, no errors at any layer, no motion.
+
+That is a property of the robot, so the robot declares it and the thing driving
+it reads it. Per axis, in that axis' own units; `0` means no threshold.
+
+```python
+"min_magnitude": [0.4, 0.4, 0.0, 0.0, 0.0, 1.0],
+```
+
+Two consequences, and each one was a real robot standing still while every log
+said it was moving:
+
+**The step clamp must never be finer than the deadband on the same axis.** The
+clamp is applied to the command, so a 0.30 rad/s acceleration cap against a
+1.0 rad/s floor ramps 0.30 → 0.60 → 0.90 → 1.0 and the robot executes none of
+the first three: three ticks of silence, then the turn arrives at full speed.
+The ramp *down* crosses the floor on its first step, so it stops instantly —
+slow to start, instant to stop, which is what a lurch is made of. Take
+`max(accel, min_magnitude)` per axis (`loco_servo._step_limit`). Above the floor
+the cap is then coarser than you wanted; below it, shaping acceleration is the
+gait controller's job and never was yours.
+
+**A consumer's own ceiling must sit above the floor.** Not your problem to
+enforce, but say it in your card's docs: a policy whose `wz_max` is 0.8 against
+a 1.0 floor has an entire output range the robot cannot execute, so every
+command snaps to 0 or ±1.0 and the robot turns in a square wave. The navi card
+reads `min_magnitude` at negotiation and raises its own ceilings off it
+(`plugins/navi/policy.py::adopt_limits`) — that is the pattern to copy, not a
+number to hard-code.
+
+### `footprint` — declare the space your robot occupies
+
+Optional, and additive to `motus.control/1`: an existing consumer that has never
+heard of it keeps working. Declare it on any chassis a navigation policy will
+drive.
+
+```python
+"footprint": {
+    "shape": "box",
+    "half_width": 0.179,        # m, half the widest lateral span
+    "front": 0.095,             # m, ahead of the rotation centre
+    "rear": 0.095,
+    "height": 1.23,
+    "source": "vendor-spec",    # "measured" | "estimate" | "vendor-spec"
+    "arms": "at-rest",
+},
+```
+
+Same reasoning as `min_magnitude`: it is a fact about the robot, and a policy
+that hard-codes it is wrong on the next chassis. The consumer is a navigation
+card, and what it is otherwise reduced to is testing a fixed angular slice of
+its camera — which covers **a different width of the world at every distance**.
+With a 63° lens the centre third spans `0.204 × distance` either side of the
+axis, so at 0.8 m it is ±0.16 m: narrower than R1's shoulders, at precisely the
+distance where stopping is decided. A doorframe 0.25 m off the axis is filed
+under "left", the left third has never stopped forward motion, and the shoulder
+goes into it while the depth map reports the way ahead as clear.
+
+Three things about the fields:
+
+* **`source` is part of the contract.** A datasheet box and one taken off this
+  robot with a tape measure deserve different margins, and a consumer that
+  cannot tell them apart will pick one number for both.
+* **Declare the static envelope, not a clearance.** A swinging arm and a leg
+  mid-stride both leave the torso box. The consumer adds its own margin —
+  `navi` does, via `clearance_margin_m` — and a driver that pre-inflates its
+  declaration makes that margin unknowable.
+* **A missing declaration must be safe by default.** `navi` falls back to a
+  half-width wider than any humanoid here and says so in `info().degraded`,
+  because every failure mode of this number is one-sided: too wide costs some
+  unnecessary slowing, too narrow puts a shoulder into a doorframe.
+
+Not yet declared: where the **camera** is. A depth consumer also needs
+`{fx, fy, cx, cy}` and the sensor's pose in the body frame to know which pixels
+are floor and which are shoulder-height, and nothing in this project publishes
+either — consumers currently work from a configured half-FOV, which is a guess
+with no provenance at all. That is the same declaration in the perception layer,
+and it is the next one to add.
+
+### Bring the robot's DDS up with `common/dds_link`, not with one attempt
+
+A bundle that calls `ChannelFactoryInitialize` once at start and carries on is
+betting that its network interface already exists. On r1_sz that bet lost by
+three seconds:
+
+```
+09:12:40  [bundle] namespace=ubuntu mcp_port=15702
+09:12:43  [bundle] DDS init failed on 'eth10': channel factory init error.
+          python3: eth10: does not match an available interface.
+```
+
+eth10 came up a moment later and stayed up all day. Nothing retried, so every
+state topic on that robot — odometry, IMU, joints, battery, mainboard — was
+empty from boot, while the cards publishing them sat on the canvas looking
+healthy and declaring 10 Hz in `topic_out`. The robot itself was publishing
+`rt/odommodestate` at 495 Hz the whole time.
+
+```python
+from common import dds_link
+
+link = dds_link.install(network_iface)   # starts retrying in the background
+link.wait(5.0)                           # optional: the common case looks synchronous
+...
+link.on_ready(self._subscribe)           # runs now if up, later if not
+```
+
+Three rules come out of that failure, and each is a separate way to stay broken:
+
+* **Recompute the interface list on every attempt.** The fallback scan for an
+  address on `192.168.123.x` ran at the same instant as the failure and found
+  nothing either. The thing being waited for is an interface that does not
+  exist yet, so a list captured at start cannot contain it.
+* **Subscribe from `on_ready`, not from a constructor.** A constructor runs
+  once, at the worst possible moment, and its `except` clause is where the
+  failure goes to be forgotten.
+* **Put the link state in `info()`.** `topic_out` promises a rate
+  unconditionally; `info()` is the only place a reader can find out whether
+  anything is coming out. And report *received* as well as *subscribed* —
+  those are different facts and only the second one means the topic has data.
+
 ### Use `common/control.ControlSink` — do not write the checks yourself
 
 There are fourteen bundles here. A safety chain copied fourteen times diverges
@@ -1743,13 +1967,286 @@ alongside whatever the driver already sends. The old shape has consumers you
 cannot see from inside the bundle, and a 10 Hz duplicate is far cheaper than a
 migration across fourteen of them.
 
+### Downsampling: average, do not pick
+
+Every vendor publishes state far faster than 10 Hz — R1 sends `rt/odommodestate`
+at about 495 Hz — so a card publishing at 10 Hz discards roughly 49 readings out
+of every 50. **Where the throttle sits decides whether they are averaged or
+aliased.** Returning early from the callback and publishing the one reading that
+survived is an unfiltered decimation: the noise averaging would have removed is
+folded into the output instead, and the consumer this format was shaped around is
+a stuck-detector reading a threshold crossing, which a noisy sample crosses when
+it should not.
+
+So read every message and publish the mean:
+
+```python
+from common.odom import mean_twist
+
+def _on_state(self, msg):
+    self._burst.append([vel[0], vel[1], None, None, None, msg.yaw_speed])
+    if time.monotonic() - self._last < 0.1:
+        return                                  # throttle the publish, not the read
+    self._last = time.monotonic()
+    burst, self._burst = self._burst, []
+    sample = build_sample(stamp_ms=…, twist=mean_twist(burst), …)
+```
+
+`mean_twist` keeps the null rule through the average: an axis is averaged over the
+readings that carry a number and stays `None` when none of them do. `sum() / len()`
+is the obvious thing to write here and it turns an unmeasured axis into a measured
+one. An empty window gives all-`None` — nothing arrived, which is not the same
+fact as a robot standing still, so report how many readings the average came from
+(R1 puts it in `vendor.samples`).
+
+Do **not** average the vendor block. A gait enum has no mean; take it from
+whichever message is current at publish time. The twist and the vendor fields then
+describe slightly different instants, which is correct for what each one is: a
+measurement to be filtered, and a label to be reported.
+
+### `stamp_ms` has two jobs, and a robot's own clock may only do one
+
+The checklist below asks for when the reading was *taken*, and a vendor message
+normally carries that. But `stamp_ms` is also what `is_fresh` subtracts from the
+**consumer's** clock. A robot whose clock is not synchronised with the host
+satisfies the first job and destroys the second: every sample reads as minutes old
+or as arriving from the future, and a consumer that trusts it stops the robot for
+blindness it does not have. Neither symptom mentions a clock.
+
+`common.odom.resolve_stamp_ms` picks between the two and records which it used:
+
+```python
+stamp_ms, provenance = resolve_stamp_ms(
+    vendor_ms=_timespec_ms(msg.stamp),        # None if the SDK has no stamp
+    received_ms=int(time.time() * 1000),
+)
+sample = build_sample(stamp_ms=stamp_ms, twist=…, vendor={**provenance, …})
+```
+
+A vendor stamp is quoted only when it is plausible as a wall clock *and* within
+`MAX_CLOCK_SKEW_MS` of ours; otherwise the arrival time is published, which is at
+least comparable. Either way `vendor.stamp_source` says which one arrived, so a
+consumer never has to guess and the fallback is not a silent approximation. It is
+deliberately **not** offset-corrected: subtracting a measured offset would let a
+skewed clock be quoted, and on a clock that drifts rather than merely sits offset
+that decays into a wrong answer which still looks principled. `stamp_skew_ms` is
+reported so the skew can be measured first.
+
+### Verifying `frame`, and why the robot cannot be its own witness
+
+`frame` is the one field a consumer cannot sanity-check — `common/odom.py` takes it
+as given and so does actucore's reader, which only checks that a sample *says*
+body. Get it wrong and `vx`/`vy` swap at any non-zero heading: plausible numbers,
+no error, nothing anywhere to notice. So it has to be measured, and measuring it on
+R1 took four walks and produced two lessons worth more than the answer.
+
+**Do not verify it against the robot's own position.** The obvious test differences
+`position` against the integral of `velocity`, with and without the heading
+rotation, and takes whichever fits. That presumes `position` is trustworthy. On
+r1_sz it is not: over a **tape-measured 3 m straight walk** `position` reported
+**0.81 m** — 73% short — with a path 2.3x its own net displacement, so it loses the
+*shape* of the trajectory and not merely the origin. Three runs came back "neither
+hypothesis explains the path", which was true and said nothing about frames.
+
+**Separate scale from rotation and the frame question survives a broken reference.**
+Fit one *complex* gain per hypothesis: the magnitude is how far the two sources
+disagree about distance, the phase is the rotation the hypothesis still needs. Only
+the phase answers the frame question, and it does not care about scale. On r1_sz the
+body hypothesis needed **+0.2°** and the world one **−144°**, decided from the same
+run whose magnitudes disagreed fourfold. Report the magnitude separately, as its own
+finding rather than as a failure.
+
+**Fix the ground truth before the robot moves.** Nothing inside the robot can say
+which of two disagreeing sources is right. Three segments, each 30 seconds, each
+isolating one quantity, all read out per-source by
+`scripts/probe_r1_odom_frame.py` (read-only — it publishes nothing):
+
+| segment | what you fix beforehand | what it settles |
+|---|---|---|
+| straight line, tape-measured | distance, and zero turn | the **scale** of `velocity` and of `position`, independently |
+| one full turn in place | 360°, and zero displacement | the scale of `wz` — needs no measuring tool |
+| closed loop back to a taped mark | net displacement is zero | the frame, and whether the integration closes |
+
+Run the straight line first; it alone tells you which source is wrong and by how
+much. Measured on r1_sz:
+
+| segment | truth | `velocity` | `position` |
+|---|---|---|---|
+| straight line | 3 m | 3.62 m (**+21%**), straightness 1.03 | 0.81 m (**−73%**), straightness 2.30 |
+| turn in place ×2 | 360° each | `wz` 362.9° / 349.1° (**±3%**) | — |
+
+**Report each manoeuvre separately, and split on the pause between them.** The
+readout first summed everything between the first and last moving sample, so
+segment B — one full turn, 35 seconds of standing still, then another full turn —
+came out as a single **−731°** against a commanded 360. That reads as an
+instrument off by a factor of two, which is exactly the kind of wrong answer this
+protocol exists to prevent; split on the pause and each turn is within 3%. Any
+protocol worth running is several manoeuvres with pauses between them, so
+aggregating across them cannot be the default.
+
+**Record the measurement where the next person will find it**, not only in a commit
+message — R1 keeps it in `health()` under `odom_measured` and `position_unusable`.
+And do not correct a 20% overread with a scalar: one measurement against an
+approximate distance is not a calibration, and a magic number makes a wrong figure
+look authoritative. State it, and check it is inside the margin that matters — 20%
+cannot push a stalled robot over navi's "below 20% of commanded" stuck threshold.
+
 ### Checklist for a new driver
 
 - [ ] `provides` lists only axes genuinely measured — not the ones the SDK has a
       field for
 - [ ] every unmeasured axis is `None` in `twist`, and no `or 0.0` anywhere near it
-- [ ] `frame` is right; if it is `world`, say so rather than relabelling it body
-- [ ] `stamp_ms` is when the reading was *taken*, not when it was published
+- [ ] `frame` is right; if it is `world`, say so rather than relabelling it body.
+      **Check it against a trajectory you know in advance** — see below
+- [ ] `stamp_ms` comes from `resolve_stamp_ms`, and its provenance is in `vendor`
+- [ ] the 10 Hz publish averages the window with `mean_twist` rather than
+      publishing one reading out of every N
 - [ ] vendor-specific fields are under `vendor`, not at the top level
 - [ ] `pose_drift` is honest; `unbounded` unless there is a correction source
 - [ ] a unit test calls `parse_interface()` on your declaration
+
+## Camera Parameters (`camera_info`)
+
+The third of the three declarations a driver makes about itself.
+`motus.control/1` says what a robot can be *told*; `motus.odom/1` says what it
+*reports*; this one says what a camera *sees* — and unlike the other two it does
+not stop at the driver. It travels along the canvas connections, and each
+processor it passes through rewrites the parts its own processing changed.
+
+Implementation: `common/camera_info.py`. Tests: `tests/test_camera_info.py`.
+Reference declaration: `unitree/r1/camera_specs.py`.
+
+### Why a camera has to say this itself
+
+Nothing in an image carries geometry. A depth map is 640x480 numbers, each a
+distance, and nothing in it says how wide the lens was. But the decisions made
+from it are metric — "is there room for my 0.36 m shoulders" — so somewhere a
+pixel column has to become a lateral offset in metres, and that conversion needs
+the field of view.
+
+Until this existed, that number lived in the *navigation policy's* config file,
+typed in by hand. On r1_sz it read 0.55 rad (~63 deg full, an ordinary lens)
+against a lens that measures 0.888 (~102 deg, ultra-wide). The avoidance corridor
+is metric — half-width 0.329 m — so every frame it converted that width back into
+a column range, and with the field of view understated the slice came out too
+wide: at 1 m it sampled 84% of the picture's half-width, which really spans
+±0.93 m. **The corridor was 1.86 m wide, wider than any door.** Every doorframe
+counted as dead ahead, the clearance reading was the distance to the door plane
+rather than through the opening, and the robot turned away 0.6 m short of a gap
+it fitted through.
+
+The value had been measured on that robot the day before. It went into a report
+and not into a config file, and nothing anywhere noticed.
+
+**Note how it failed.** A wrong deadband makes a robot stutter and you see it in
+the first second. A wrong field of view makes a robot refuse doorways *while the
+depth map reports clear ahead* — the only evidence is the behaviour. That is why
+this is a declaration and not a setting: the camera knows, and had no way to say
+so.
+
+Same rule as `limits.min_magnitude` and `footprint`, which the chassis declares
+and `navi` adopts at start. Camera parameters were the last exception.
+
+### The four rules
+
+**1. A quantity that is not known is `null`, never a guess.** A plausible number
+makes the consumer believe it knows. The consumer must be able to tell "nobody
+told me" from "I was told", so it can fall back conservatively *and report that
+it did*. R1 declares `half_fov_rad` for `camera_main` and `null` for the other
+three, because only one has been measured.
+
+**2. Meaning and units are fixed by this document.** `half_fov_rad` is the
+**horizontal half** field of view, in radians. The vertical angle is a separate
+field and **cannot be derived from the aspect ratio** — a processor that resizes
+1280x720 into 640x480 stretches the picture, so the pixels are no longer square
+and the two angles are no longer related by the frame's shape.
+
+**3. `source` is required.** `measured` / `vendor-spec` / `derived-from-K` /
+`inherited` / `manual` / `unknown`. Whether a number can be trusted is mostly a
+question of where it came from, and `unknown` is a legitimate answer that has to
+be *stated* rather than left out.
+
+**4. `id` survives the chain, `width`/`height` are rewritten at each stop,
+`pipeline` records who touched it.** Downstream cards look up their own tables by
+`id` (a depth calibration is a property of camera × model, so it lives with the
+model and is *keyed* by the camera). `width`/`height` describe the image **this
+port publishes**, not the original. `pipeline` is what makes a wrong number
+traceable to the stage that changed it.
+
+### Shape: ROS first, convenience second
+
+The core is `sensor_msgs/CameraInfo`'s — `width`, `height`, `distortion_model`,
+`D`, `K` — so anything with a real calibration fills it mechanically. A fisheye's
+distortion is a thing only `D` can express: `tan(theta)` overstates the lateral
+offset towards the edges of a wide lens, so the pinhole model consumers use today
+is an approximation that holds near the centre.
+
+`half_fov_rad` sits alongside as a derived convenience, because an angle is what
+consumers actually need and because a tape measure produces one directly while
+producing no `K` at all. **When both are present `K` wins** (`resolve_half_fov()`):
+a calibration matrix is solved from many observations, the angle beside it is
+usually a tape measure and some trigonometry.
+
+```json
+"camera_info": [
+  {"schema": "motus.camera/1",
+   "topic": "/ubuntu/camera/main",
+   "format": "image/jpeg",
+   "id": "unitree/r1/camera_main",
+   "width": 1280, "height": 720,
+   "distortion_model": "unknown",
+   "D": null, "K": null,
+   "half_fov_rad": 0.888,
+   "half_fov_v_rad": null,
+   "source": "measured",
+   "measured_on": "r1_sz, 2026-09-23",
+   "pipeline": ["unitree/r1/camera_main"],
+   "vendor": {"note": "约 102 度全视场（超广角）"}}
+]
+```
+
+It is a **list**, one entry per output port, each naming its own `topic`. A card
+may publish several ports and a consumer may have several inputs, so neither side
+can join on list position — and joining on the upstream *card's name* would undo
+the reason cards dispatch inputs by what they carry.
+
+### How it reaches a consumer
+
+Returned from the camera tool's `info()`. agent-core already calls `info()` on
+every card right after it starts (`api/config.py` `_resolve_and_register`), and at
+project start a card's sources are always started first — so the declaration is
+already in hand with no extra round trip. agent-core collects the declarations on
+a card's **inbound connections**, keys them by topic, and passes them as
+`camera_info` on that card's `start`.
+
+This mirrors `control_interface`, which travels the other way (a command producer
+is handed its *consumer's* action space). Two consequences worth knowing:
+
+- **An upstream that declares nothing is not an error.** Most cards have never
+  heard of this format. The consumer degrades and says so.
+- **Starting a single card from the canvas does not carry it**, same as
+  `control_interface` today. The consumer must tolerate its absence.
+
+### Implementing this for another driver
+
+1. For each camera output port, call `common.camera_info.build()` once and return
+   the list under `camera_info` from that tool's `info()`. It is a declaration,
+   not runtime state, so answer it whether or not the camera is streaming.
+2. Put the numbers in a module that does **not** import `rclpy`
+   (`unitree/r1/camera_specs.py` is the model), so a unit test can assert them on
+   a laptop. These are exactly the numbers that must not reach a robot unchecked.
+3. `id` is `"<vendor>/<model>/<port>"`, stable across reboots and across every
+   unit of that model.
+4. To measure a lens: `phanthymotus/actucore/tools/measure_fov.py` — a plane of
+   known width at a tape-measured distance. **Re-measure after any lens change.**
+
+Checklist before you call it done:
+
+- [ ] every camera tool's `info()` carries a `camera_info` entry for its topic
+- [ ] unmeasured lenses report `half_fov_rad: null` with `source: "unknown"`
+- [ ] `half_fov_rad` is the **half** angle (`build()` refuses a full one, but
+      only when it exceeds 90 deg — below that nothing can catch the mistake)
+- [ ] `width`/`height` describe what that port publishes
+- [ ] the spec module is listed in the bundle's Dockerfile `COPY` lines
+      (`tests/test_dockerfile_copies.py` checks this)
+- [ ] a unit test calls `parse()` on every declaration the driver can emit

@@ -50,11 +50,11 @@ _CARD_BY_TYPE = {"rgb": "camera_rgb", "depth": "camera_depth", "pointcloud": "ca
 # ── 机位 + 端口配置 ────────────────────────────────
 
 _DEFAULT_POSITIONS = {
-    "front": {"board_ip": "192.168.123.13"},
-    "chin":  {"board_ip": "192.168.123.13"},
-    "left":  {"board_ip": "192.168.123.14"},
-    "right": {"board_ip": "192.168.123.14"},
-    "belly": {"board_ip": "192.168.123.15"},
+    "front": {"board_ip": "192.168.123.13", "image_port": 9201},
+    "chin":  {"board_ip": "192.168.123.13", "image_port": 9202},
+    "left":  {"board_ip": "192.168.123.14", "image_port": 9203},
+    "right": {"board_ip": "192.168.123.14", "image_port": 9204},
+    "belly": {"board_ip": "192.168.123.15", "image_port": 9205},
 }
 _POS_TITLE = {"front": "Front (头部前)", "chin": "Chin (头部下)",
               "left": "Left (侧左)", "right": "Right (侧右)", "belly": "Belly (腹部)"}
@@ -114,6 +114,40 @@ def _resolve_positions_raw(plugin_config: dict | None) -> dict:
             positions[pos].update(ov)
     return positions
 
+
+# 中文说明：抓拍与推流在同一把锁下检查/登记，避免同时 start 时检查后被抢占。
+_CAMERA_LOCK = threading.RLock()
+_SNAPSHOT_POSITIONS = set()
+_ACTIVE_STREAMS = set()
+
+
+def running_stream(position: str):
+    """Return any RGB/depth/pointcloud receiver still occupying this position."""
+    with _CAMERA_LOCK:
+        return next((stream for stream, _, pos in _ACTIVE_STREAMS if pos == position), None)
+
+
+def _start_stream_thread(stream, gen, position, host, port):
+    entry = (stream, gen, position)
+
+    def receive():
+        try:
+            stream._loop(gen, position, host, port)
+        finally:
+            # stop 只发退出信号；TCP 接收线程真正退出后才释放占用。
+            with _CAMERA_LOCK:
+                _ACTIVE_STREAMS.discard(entry)
+
+    with _CAMERA_LOCK:
+        _ACTIVE_STREAMS.add(entry)
+        stream._thread = threading.Thread(target=receive, daemon=True)
+        try:
+            stream._thread.start()
+        except Exception:
+            _ACTIVE_STREAMS.discard(entry)
+            stream._run = False
+            raise
+
 # ── TCP 流接收器 ─────────────────────────────────
 
 class _BaseStream:
@@ -134,7 +168,7 @@ class _BaseStream:
         gen = self._gen
         self.position = position
         self.connected = False
-        threading.Thread(target=self._loop, args=(gen, position, host, port), daemon=True).start()
+        _start_stream_thread(self, gen, position, host, port)
 
     def stop(self):
         self._run = False
@@ -168,7 +202,7 @@ class _RgbStream:
         gen = self._gen
         self.position = position
         self.connected = False
-        threading.Thread(target=self._loop, args=(gen, position, host, port), daemon=True).start()
+        _start_stream_thread(self, gen, position, host, port)
 
     def stop(self):
         self._run = False
@@ -595,12 +629,13 @@ class Plugin:
             pos = self._resolve_pos(iid, args)
             if pos not in self._positions:
                 return _err("INVALID_ARGUMENT", f"unknown position {pos!r}; valid: {_VALID_POSITIONS}")
-            self._cfg[iid] = {"position": pos}
-
             # 如果实例正在运行，重启它
             st = self._streams.get(iid)
             if st is not None and st._run and st.position != pos:
-                self._start_instance(iid, pos)
+                result = self._start_instance(iid, pos)
+                if not result.get("ok"):
+                    return result
+            self._cfg[iid] = {"position": pos}
 
             return {"ok": True, "card": self._card, "type": self._type, "position": pos}
 
@@ -647,13 +682,20 @@ class Plugin:
         if self._node is None:
             return _err("COMMUNICATION_ERROR", "no rclpy/executor")
         p = self._positions[position]
-        # 清理旧实例
-        if iid in self._streams:
-            self._streams.pop(iid, None).stop()
-        # 创建新实例
-        st = self._stream_cls(self._node, self._topic(iid))
-        self._streams[iid] = st
-        st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)))
+        with _CAMERA_LOCK:
+            if position in _SNAPSHOT_POSITIONS:
+                return _err("RESOURCE_BUSY", f"camera position {position!r} is capturing a photo")
+            current = self._streams.get(iid)
+            occupied = running_stream(position)
+            if occupied is not None and (occupied is not current or not current._run):
+                return _err("RESOURCE_BUSY", f"camera position {position!r} is already streaming")
+            if current is None or occupied is not current:
+                # 中文说明：先检查目标机位，再停止旧流；拒绝热切换时保留原连接。
+                if current is not None:
+                    self._streams.pop(iid, None).stop()
+                st = self._stream_cls(self._node, self._topic(iid))
+                self._streams[iid] = st
+                st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)))
         topic_out = [{"topic": self._topic(iid), "format": self._fmt}]
         return {"ok": True, "card": self._card, "action": "start", "timestamp_ms": _now_ms(),
                 "state": "running", "position": position, "type": self._type,

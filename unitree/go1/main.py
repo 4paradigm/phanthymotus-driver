@@ -188,6 +188,19 @@ class Go1Bundle:
             self._plugins.append(camera.make_camera_rgb(pc["camera_rgb"], namespace, executor, client))
             print("[bundle] camera_rgb loaded")
 
+        if pc.get("vision_capture", {}).get("enabled", False):
+            import vision_capture
+            # 共用机位配置（即使推流卡停用）；RGB 优先，拍照/录像卡仅显式覆盖所需字段。
+            capture_config = dict(pc["vision_capture"])
+            positions = {}
+            for name in ("camera_pointcloud", "camera_depth", "camera_rgb", "vision_capture"):
+                for position, endpoint in (pc.get(name, {}).get("positions") or {}).items():
+                    positions.setdefault(position, {}).update(endpoint)
+            capture_config["positions"] = positions
+            self._plugins.append(vision_capture.make_vision_capture(
+                capture_config, namespace, executor, client))
+            print("[bundle] vision_capture loaded")
+
         if pc.get("camera_depth", {}).get("enabled", False):
             import camera
             self._plugins.append(camera.make_camera_depth(pc["camera_depth"], namespace, executor, client))
@@ -213,7 +226,7 @@ class Go1Bundle:
     def stop_all(self):
         for p in self._plugins:
             try:
-                p.stop()
+                getattr(p, "shutdown", p.stop)()
             except Exception:
                 pass
         print("[bundle] All plugins stopped")

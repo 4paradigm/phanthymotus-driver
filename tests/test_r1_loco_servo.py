@@ -129,7 +129,8 @@ def test_max_velocity_is_not_declared():
     acceleration cap and is the field that does the work here."""
     limits = loco_servo.build_descriptor()["limits"]
     assert "max_velocity" not in limits
-    assert limits["max_delta_per_step"][0] == loco_servo.VX_ACCEL
+    assert limits["max_delta_per_step"][0] == loco_servo._step_limit(
+        loco_servo.VX_ACCEL, loco_servo.MIN_VX)
 
 
 def test_unactuatable_axes_are_pinned_to_zero():
@@ -207,11 +208,109 @@ def test_dry_run_reaches_neither_move_nor_stop():
     assert card._applied == 1          # it still counted, so info() is truthful
 
 
-def test_dry_run_is_the_default():
-    """A newly wired card must not drive a chassis the first time it is
-    connected. Off is a decision someone makes after watching the logs."""
+def test_dry_run_is_not_the_default():
+    """This test used to assert the opposite, on the argument that a newly
+    wired card must not drive a chassis the first time it is connected.
+
+    The argument does not hold for this card. `start()` is inert; it acts only
+    on a command stream somebody wired up, started a policy on, and gave a
+    target to — three deliberate acts, each with its own gate. What the old
+    default bought instead was a silently dead chassis on every freshly
+    deployed robot, reporting `applied: 33, refused: 0, sdk_errors: 0` while
+    standing still. That is indistinguishable from broken, and it cost an
+    afternoon on r1_sz immediately after a deploy."""
     card = loco_servo.LocoServoPlugin({}, "r1", None, FakeClient())
+    assert card._dry_run is False
+
+
+# ── the operator's switches, settable at runtime ─────────────────────────────
+#
+# These lived only in config.yaml, so changing one meant editing a file inside a
+# container and restarting the bundle. `dry_run` in particular is reached for in
+# the second before a new policy is tried on a real robot, not after a redeploy.
+
+def test_the_three_toggles_are_declared_in_the_config_schema():
+    """Declared, or the frontend renders no form and they stay unreachable."""
+    schema = _card().get_tool()["configSchema"]["properties"]
+    assert set(schema) == {"dry_run", "rotate_only", "require_standing"}
+    assert all(field["type"] == "boolean" for field in schema.values())
+
+
+def test_the_declared_defaults_leave_the_robot_movable():
+    """A default that cannot move is the failure `dry_run` already caused once.
+
+    The schema's defaults are also what a form sends for a field nobody touched,
+    so a `dry_run: true` default here would silently kill every freshly wired
+    chassis — exactly what the old constructor default did.
+    """
+    schema = _card().get_tool()["configSchema"]["properties"]
+    assert schema["dry_run"]["default"] is False
+    assert schema["rotate_only"]["default"] is False
+    assert schema["require_standing"]["default"] is True
+
+
+def test_config_takes_effect_while_the_card_is_streaming():
+    """A toggle that reports success and changes nothing until a restart is the
+    shape of failure this bundle keeps hitting — a setting that looks applied."""
+    client = FakeClient()
+    card = _card(client)
+    card.dispatch("config", {"dry_run": True})
+    _sink(card).submit(_command([0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert client.moves == []
     assert card._dry_run is True
+
+
+def test_clearing_dry_run_hands_a_live_stream_to_the_motors():
+    """The direction to be careful about, and it is honoured deliberately.
+
+    Nothing else stands between this flag and the chassis once a stream is
+    already subscribed, so the operator's act is the authorisation. It is logged
+    for the same reason — a robot that starts moving with nothing in the log
+    saying why is the worse outcome.
+    """
+    client = FakeClient()
+    card = _card(client, dry_run=True)
+    card.dispatch("config", {"dry_run": False})
+    _sink(card).submit(_command([0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert len(client.moves) == 1
+
+
+def test_config_only_touches_keys_that_were_sent():
+    """A form rendering an unchecked box for a field nobody set would otherwise
+    send `require_standing: false` and silently drop a posture check."""
+    card = _card(None, require_standing=True, rotate_only=True)
+    card.dispatch("config", {"dry_run": True})
+    assert card._require_standing is True
+    assert card._rotate_only is True
+
+
+def test_config_ignores_keys_that_are_not_toggles():
+    """`config` and `start` share an argument dict on this card, so an
+    unfiltered assignment would turn a stray `input_topic` into an attribute."""
+    card = _card()
+    card.dispatch("config", {"input_topic": "/x", "action": "config",
+                             "_tool_name": "loco_servo", "dry_run": True})
+    assert card._dry_run is True
+    assert not hasattr(card, "_input_topic_") and card._input_topic == ""
+
+
+def test_config_reports_what_is_now_in_force():
+    card = _card()
+    out = card.dispatch("config", {"rotate_only": True})
+    assert out["ok"] is True
+    assert out["rotate_only"] is True
+    assert out["dry_run"] is False
+    assert out["require_standing"] is True
+
+
+def test_info_reports_all_three_so_the_card_is_readable():
+    """What this card is enforcing right now must not have to be inferred from
+    a config file that may no longer be what is in force."""
+    card = _card()
+    card.dispatch("config", {"require_standing": False})
+    info = card.dispatch("info", {})
+    assert info["require_standing"] is False
+    assert "dry_run" in info and "rotate_only" in info
 
 
 # ── arbitration with the call-shaped card ────────────────────────────────────
@@ -392,3 +491,125 @@ def test_the_descriptor_declares_the_robots_deadband():
 
 def test_the_deadband_does_not_break_descriptor_parsing():
     parse_descriptor(loco_servo.build_descriptor())
+
+
+def test_the_step_clamp_is_never_finer_than_the_deadband():
+    """An acceleration cap below the floor is dead time, not a cap.
+
+    The sink clamps the command the policy sends, so a 0.30 rad/s cap against a
+    1.0 rad/s floor ramps 0.30 → 0.60 → 0.90 → 1.0 and the robot executes none of
+    the first three. Three ticks of silence and then full speed, while every
+    layer reports success — that is the lurch.
+    """
+    limits = loco_servo.build_descriptor()["limits"]
+    for index, floor in enumerate(limits["min_magnitude"]):
+        assert limits["max_delta_per_step"][index] >= floor, (
+            f"axis {index} can be commanded in steps the robot cannot execute")
+
+
+def test_a_ramp_from_rest_reaches_an_executable_speed_on_its_first_step():
+    """The property the test above is really about, as the sink actually runs it."""
+    from common.control.sink import ControlSink
+
+    descriptor = loco_servo.build_descriptor()
+    floor = descriptor["limits"]["min_magnitude"][5]
+    applied = []
+    sink = ControlSink(parse_descriptor(descriptor),
+                       lambda values, _g=None: applied.append(values[5]))
+    for seq in range(1, 4):
+        sink.submit(_command([0.0, 0.0, 0.0, 0.0, 0.0, 1.5], seq=seq))
+    assert abs(applied[0]) >= floor, (
+        f"first step was {applied[0]:.2f} rad/s, under the {floor} floor — "
+        "the robot would stand still for it")
+
+
+# ── the footprint ────────────────────────────────────────────────────────────
+
+def test_the_footprint_is_declared_in_metres_and_names_its_provenance():
+    """A navigation card cannot build a corridor out of an angular camera slice:
+    a fixed slice covers a different width at every distance, and at R1's
+    numbers it is narrower than the robot below ~1.1 m — which is exactly where
+    stopping matters. So the chassis declares its own envelope, same reasoning
+    as `min_magnitude`.
+
+    `source` is part of the contract, not decoration. A datasheet box and a
+    measured one deserve different margins, and a consumer that cannot tell
+    them apart will pick one number for both.
+    """
+    footprint = loco_servo.build_descriptor()["footprint"]
+    assert footprint["shape"] == "box"
+    assert footprint["source"] in ("vendor-spec", "measured", "estimate")
+    for field in ("half_width", "front", "rear", "height"):
+        assert footprint[field] > 0, field
+    # 357 mm across, per Unitree's spec sheet.
+    assert footprint["half_width"] == pytest.approx(0.1785, abs=0.002)
+
+
+def test_the_footprint_does_not_pretend_to_cover_the_arms():
+    """The problem that prompted this is a shoulder clipping a doorframe, and a
+    raised arm leaves the torso box entirely. Declaring the box as if it were a
+    clearance would hand the consumer a number that is wrong in the one
+    direction that hurts."""
+    assert loco_servo.build_descriptor()["footprint"]["arms"] == "at-rest"
+
+
+def test_the_descriptor_still_parses_with_the_footprint_on_it():
+    """It is an addition to `motus.control/1`, so every existing consumer has to
+    keep working without knowing about it."""
+    parse_descriptor(loco_servo.build_descriptor())
+
+
+def test_the_yaw_deadband_is_declared_twice_because_it_is_not_one_number():
+    """Standing, R1 does nothing under 1.0 rad/s. Walking, 0.05 rad/s is
+    visible — twenty times smaller, because a gait cycle that is already
+    running can be steered a little per step and one that has to be started
+    cannot.
+
+    A consumer that treats the standing figure as a constant overshoots every
+    small correction mid-approach by that factor, reverses, and overshoots
+    again. On r1_sz that looked like the robot weaving left and right on its
+    way to a target it was already facing.
+    """
+    limits = loco_servo.build_descriptor()["limits"]
+    standing = limits["min_magnitude"]
+    moving = limits["min_magnitude_moving"]
+    assert moving[5] < standing[5] / 10, "the whole point is that it collapses"
+    assert moving[:2] == standing[:2], (
+        "nothing has measured whether the translation floors move; inventing a "
+        "smaller one would be the same mistake in the other direction")
+
+
+def test_the_moving_floors_are_an_addition_the_sink_still_accepts():
+    parse_descriptor(loco_servo.build_descriptor())
+
+
+def test_a_deployed_chassis_can_move():
+    """`dry_run` used to default on, so every freshly deployed robot had a
+    silently dead chassis: commands arrive, pass every check, report APPLIED,
+    and nothing moves — `applied: 33, refused: 0, sdk_errors: 0` while the robot
+    stands there. Indistinguishable from broken, and it cost an afternoon on
+    r1_sz right after a deploy.
+
+    The argument for the old default does not hold for this card: `start()` is
+    inert, and it acts only on a command stream somebody wired up, started a
+    policy on, and gave a target to."""
+    card = _card()
+    assert card._dry_run is False
+    assert card._rotate_only is False
+
+
+def test_dry_run_is_still_available_and_still_announced():
+    card = _card(dry_run=True)
+    assert card._dry_run is True
+    assert card._info()["dry_run"] is True
+
+
+def test_a_swallowed_command_stream_is_visible_to_the_card_upstream():
+    """A policy whose commands are being dropped looks exactly like one that is
+    working. The descriptor is the only channel back, so it carries the fact."""
+    plain = _card()._info()["control_interface"]
+    assert "dry_run" not in plain and "rotate_only" not in plain
+
+    muted = _card(dry_run=True, rotate_only=True)._info()["control_interface"]
+    assert muted["dry_run"] is True and muted["rotate_only"] is True
+    assert muted["mode"] == "twist", "still a valid descriptor"

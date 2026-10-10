@@ -97,7 +97,15 @@ class CaptureHarness(unittest.TestCase):
             format=fmt, data=data,
             header=types.SimpleNamespace(stamp=types.SimpleNamespace(
                 sec=int(timestamp), nanosec=int((timestamp % 1) * 1e9))))
-        callback = self.plugin._node.callbacks.get(topic)
+        # `publish` leaves a producer thread running, and unittest runs
+        # tearDown *before* addCleanup handlers — so the thread keeps calling
+        # this for a moment after `plugin.stop()` has dropped the node. Not a
+        # failure, but an unhandled AttributeError in a thread, which pytest
+        # reports as a warning on an otherwise green run.
+        node = self.plugin._node
+        if node is None:
+            return
+        callback = node.callbacks.get(topic)
         if callback:
             callback(msg)
 
