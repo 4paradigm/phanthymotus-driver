@@ -22,6 +22,7 @@ cards:
   - { name: action_recording,  type: actuator }
   - { name: mic,               type: sensor }
   - { name: sound_direction,   type: sensor }
+  - { name: sound_direction_control, type: actuator }
   - { name: speaker,           type: actuator }
   - { name: camera,            type: sensor }
   - { name: depth,             type: sensor }

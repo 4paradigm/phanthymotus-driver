@@ -2,14 +2,16 @@
 
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
-## `mic` and `sound_direction`
+## `mic`, `sound_direction`, and `sound_direction_control`
 
 `mic` publishes mono PCM on `/<namespace>/mic/audio`. The separate
 `sound_direction` sensor card reads the SDK's eight-channel microphone capture
 directly, uses the first four channels for direction estimation, and publishes
-JSON on `/<namespace>/sound_direction`. The bundle starts both cards automatically.
-`mic` is a passive sensor in the canvas; the direction card provides
-`start`/`stop`/`info`, `check_direction`, `calibrate_front`, and `calibrate_right`.
+JSON on `/<namespace>/sound_direction`. The bundle starts both sensors automatically.
+`mic` and `sound_direction` are passive sensor cards in the canvas. The
+`sound_direction_control` actuator card provides `info`, `check_direction`,
+`calibrate_front`, `calibrate_right`, `set_parameters`, and `reset_parameters`.
+Both direction cards share one capture worker and the same saved calibration.
 The previous `/<namespace>/mic/sound_direction` stream and mic calibration
 actions are no longer produced by `mic`; update any canvas connections.
 
@@ -25,7 +27,7 @@ direction so the monitor clears an old angle. The restored upstream `mic`
 implementation does not set `AudioChunk.header.stamp`; match direction to audio
 by capture time only after timestamp support is added to `mic` separately.
 
-Use `set_parameters` on the `sound_direction` card to change one or more
+Use `set_parameters` on the `sound_direction_control` card to change one or more
 thresholds, then use `info` to see the active values. Leave unwanted fields
 empty. `reset_parameters` restores the defaults. Changes restart only the
 direction capture process and are saved in
@@ -49,8 +51,8 @@ Existing calibration is reused from
 mounted from the robot host and survives image replacement. It contains the
 front and right microphone-delay signatures. If either direction is missing,
 stand at the corresponding known position and speak continuously for about
-two seconds while calling `calibrate_front` or `calibrate_right` on the new
-card. Calibration pauses only the direction card's capture process; the mic
+two seconds while calling `calibrate_front` or `calibrate_right` on the control
+card. Calibration pauses only the direction capture process; the mic
 card continues publishing audio. Too few new frames or an invalid voice
 spectrum returns `no_voice` without saving.
 

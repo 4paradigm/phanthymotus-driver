@@ -37,8 +37,16 @@ def test_direction_card_reuses_existing_calibration_and_reports_its_own_topic(
 
     assert card.get_tool()["name"] == "sound_direction"
     assert card.get_tool()["type"] == "sensor"
+    assert card.get_tool()["inputSchema"] == {"type": "object", "properties": {}}
     assert card.get_tool()["topic_out"] == [
         {"topic": "/robot/sound_direction", "format": "data/json"}]
+    control = card.get_tools()[1]
+    assert control["name"] == "sound_direction_control"
+    assert control["type"] == "actuator"
+    assert "topic_out" not in control
+    assert control["inputSchema"]["x-action-params"]["set_parameters"]["params"] == [
+        "onset_level", "onset_ratio", "burst_level", "burst_ratio",
+        "update_interval_ms"]
     info = card.dispatch("info", {})
     assert info["calibrated_directions"] == ["front", "right"]
     assert info["sound_direction"] == {"state": "no_event"}
@@ -77,7 +85,7 @@ def test_mic_card_only_advertises_audio_after_migration(monkeypatch):
     assert card.get_tool()["inputSchema"] == {"type": "object", "properties": {}}
 
 
-def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch):
+def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch, tmp_path):
     device, _ = _load_device(monkeypatch)
     direction = _load_card(monkeypatch)
     monkeypatch.setitem(sys.modules, "device", device)
@@ -91,7 +99,8 @@ def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch):
                        "sound_direction": {"enabled": True}}}
     bundle = bundle_module.BumiDeviceBundle(
         cfg, "robot", types.SimpleNamespace(add_node=lambda node: None), None, object())
-    assert {tool["name"] for tool in bundle.get_all_tools()} == {"mic", "sound_direction"}
+    assert {tool["name"] for tool in bundle.get_all_tools()} == {
+        "mic", "sound_direction", "sound_direction_control"}
     started = []
     for plugin in bundle._plugins:
         plugin.start = lambda name=plugin.get_tool()["name"]: started.append(name)
@@ -100,6 +109,46 @@ def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch):
     manifest = yaml.safe_load((path.parent / "driver.yaml").read_text(encoding="utf-8"))
     categories = {card["name"]: card["type"] for card in manifest["cards"]}
     assert categories["sound_direction"] == "sensor"
+    assert categories["sound_direction_control"] == "actuator"
+    control_info = bundle.dispatch("sound_direction_control", {"action": "check_direction"})
+    assert control_info["sound_direction"] == {"state": "no_event"}
+    assert "topic_out" not in control_info
+    assert bundle.dispatch("sound_direction", {"action": "info"})["topic_out"] == [
+        {"topic": "/robot/sound_direction", "format": "data/json"}]
+    assert bundle.dispatch("sound_direction", {"action": "set_parameters",
+                                               "onset_level": 20}) is None
+    monkeypatch.setattr(direction, "SETTINGS_PATH", tmp_path / "settings.json")
+    assert bundle.dispatch("sound_direction_control", {"action": "set_parameters",
+                                                       "onset_level": 20})["state"] == "configured"
+    assert bundle.dispatch("sound_direction_control", {"action": "info"})[
+        "parameters"]["onset_level"] == 20
+
+
+def test_control_lifecycle_does_not_stop_direction_sensor(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+    stopped = []
+
+    class Process:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            stopped.append(True)
+
+        def wait(self, timeout=None):
+            return 0
+
+    card._proc = Process()
+    assert card.dispatch("start", {"_tool_name": "sound_direction_control"}) == {
+        "state": "ready"}
+    assert card.dispatch("stop", {"_tool_name": "sound_direction_control"}) == {
+        "state": "idle"}
+    assert stopped == []
+    assert card.dispatch("stop", {"_tool_name": "sound_direction"}) == {
+        "state": "idle"}
+    assert stopped == [True]
 
 
 def test_direction_card_validates_observations(monkeypatch):

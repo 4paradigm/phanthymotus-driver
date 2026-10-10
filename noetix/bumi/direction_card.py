@@ -192,10 +192,21 @@ class SoundDirectionPlugin:
         return {
             "name": "sound_direction", "type": "sensor", "multiInstance": False,
             "description": "Bumi calibrated sound direction from the microphone array",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def get_tools(self) -> list:
+        return [self.get_tool(), self.get_control_tool()]
+
+    def get_control_tool(self) -> dict:
+        return {
+            "name": "sound_direction_control", "type": "actuator", "multiInstance": False,
+            "description": "Calibrate and configure Bumi sound direction",
             "inputSchema": {
                 "type": "object",
                 "properties": {"action": {"type": "string", "enum": [
-                    "start", "stop", "info", "check_direction",
+                    "info", "check_direction",
                     "calibrate_front", "calibrate_right",
                     "set_parameters", "reset_parameters"]},
                     "onset_level": {"type": "number", "minimum": 1, "maximum": 1000,
@@ -210,8 +221,6 @@ class SoundDirectionPlugin:
                                            "description": "方向更新最短间隔，毫秒；默认 100"}},
                 "required": ["action"],
                 "x-action-params": {
-                    "start": {"params": [], "description": "启动独立声源方向采集。"},
-                    "stop": {"params": [], "description": "停止声源方向采集。"},
                     "info": {"params": [], "description": "查看状态、最近方向及标定进度。"},
                     "check_direction": {"params": [], "description": "查看最近一次声音方向。"},
                     "calibrate_front": {"params": [], "description": "正前方持续说话约 2 秒。"},
@@ -222,7 +231,6 @@ class SoundDirectionPlugin:
                     "reset_parameters": {"params": [], "description": "恢复当前版本的默认参数。"},
                 },
             },
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
     def start(self) -> None:
@@ -351,6 +359,13 @@ class SoundDirectionPlugin:
             return {"state": "configured", "parameters": parameters}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        tool_name = args.get("_tool_name")
+        if tool_name == "sound_direction_control" and action == "start":
+            return {"state": "ready"}
+        if tool_name == "sound_direction_control" and action == "stop":
+            return {"state": "idle"}
+        if tool_name == "sound_direction" and action not in ("start", "stop", "info"):
+            return None
         if action == "start":
             self.start()
             return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
@@ -367,12 +382,14 @@ class SoundDirectionPlugin:
             observation = ({"state": "no_event"} if direction is None else
                            {"state": "stale"} if age > 10 else
                            {**direction, "age_ms": round(age * 1000)})
-            return {"state": "running" if self._proc and self._proc.poll() is None else "idle",
-                    "topic_out": self.get_tool()["topic_out"],
-                    "sound_direction": observation,
-                    "parameters": load_parameters(),
-                    "calibrated_directions": [key for key in ("front", "right")
-                                              if key in load_calibration()]}
+            result = {"state": "running" if self._proc and self._proc.poll() is None else "idle",
+                      "sound_direction": observation,
+                      "parameters": load_parameters(),
+                      "calibrated_directions": [key for key in ("front", "right")
+                                                if key in load_calibration()]}
+            if tool_name != "sound_direction_control":
+                result["topic_out"] = self.get_tool()["topic_out"]
+            return result
         if action == "set_parameters":
             return self._set_parameters(args)
         if action == "reset_parameters":
