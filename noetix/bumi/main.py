@@ -137,6 +137,12 @@ class BumiDeviceBundle:
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))
             print("[bundle] MicPlugin loaded")
 
+        if plugins_cfg.get("sound_direction", {}).get("enabled", False) and media_ctrl is not None:
+            from direction_card import SoundDirectionPlugin
+            self._plugins.append(SoundDirectionPlugin(
+                plugins_cfg["sound_direction"], namespace, executor, media_ctrl))
+            print("[bundle] SoundDirectionPlugin loaded")
+
         if plugins_cfg.get("speaker", {}).get("enabled", False) and media_ctrl is not None:
             from device import SpeakerPlugin
             self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))
@@ -162,14 +168,21 @@ class BumiDeviceBundle:
             print("[bundle] VisionCapturePlugin loaded")
 
     def start_all(self) -> None:
+        failed = 0
         for i, p in enumerate(self._plugins):
             try:
-                p.start()
+                if p.start() is False:
+                    failed += 1
+                    print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: returned False", flush=True)
             except Exception as e:
+                failed += 1
                 print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
-        print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
+        if failed:
+            print(f"[bundle] {len(self._plugins) - failed}/{len(self._plugins)} plugins started", flush=True)
+        else:
+            print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
         # Stop media consumers before tearing down the camera producer.

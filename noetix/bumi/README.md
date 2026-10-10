@@ -1,6 +1,74 @@
 # Noetix Bumi driver
 
-The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+
+## `mic`, `sound_direction`, and `sound_direction_control`
+
+`mic` publishes mono PCM on `/<namespace>/mic/audio`. The separate
+`sound_direction` sensor card reads the SDK's eight-channel microphone capture
+directly, uses the first four channels for direction estimation, and publishes
+JSON on `/<namespace>/sound_direction`. The bundle starts both sensors automatically.
+`mic` and `sound_direction` are passive sensor cards in the canvas. The
+`sound_direction_control` actuator card provides `info`, `check_direction`,
+`calibrate_front`, `calibrate_right`, `set_parameters`, and `reset_parameters`.
+Both direction cards share one capture worker and the same saved calibration.
+The previous `/<namespace>/mic/sound_direction` stream and mic calibration
+actions are no longer produced by `mic`; update any canvas connections.
+
+The direction card checks for a coherent sound source at most ten times per
+second when sound rises above the recent background. It does not recognize
+wake words or identify a speaker. A valid observation contains
+`trigger=sound_activity`, an angle in degrees clockwise from the robot's
+front, and `audio_window_start_us`/`audio_window_end_us` for the SDK capture
+frames used in the estimate. `timestamp_ms` is publication time.
+`check_direction` keeps the last observation for ten seconds, then reports
+`stale`. The stream publishes one `no_event` after one second without a new
+direction so the monitor clears an old angle. The restored upstream `mic`
+implementation does not set `AudioChunk.header.stamp`; match direction to audio
+by capture time only after timestamp support is added to `mic` separately.
+
+Use `set_parameters` on the `sound_direction_control` card to change one or more
+thresholds, then use `info` to see the active values. Leave unwanted fields
+empty. `reset_parameters` restores the defaults. Changes restart only the
+direction capture process and are saved in
+`/opt/phanthy-motus/data/bumi/sound_direction_settings.json`.
+The restarted worker loads these values before processing audio. If it exits
+immediately, the action returns `error`; if the sensor is idle, saved values
+take effect on its next start.
+
+| Parameter | Default | Effect |
+| --- | ---: | --- |
+| `onset_level` | 10 | Minimum level for sustained speech detection |
+| `onset_ratio` | 1.8 | Sustained speech level relative to recent background |
+| `burst_level` | 15 | Minimum level for one strong sound frame |
+| `burst_ratio` | 3.0 | Strong sound level relative to recent background |
+| `update_interval_ms` | 100 | Minimum time between direction updates |
+
+Increasing a level or ratio suppresses more background sound but can miss
+quieter speech. The level values use the SDK's raw sample scale, not decibels.
+The direction card accepts levels from 1 to 1000, ratios from 1.05 to 10,
+and update intervals from 50 to 1000 milliseconds.
+
+Existing calibration is reused from
+`/opt/phanthy-motus/data/bumi/sound_direction_calibration.json`, which is
+mounted from the robot host and survives image replacement. It contains the
+front and right microphone-delay signatures. If either direction is missing,
+stand at the corresponding known position and speak continuously for about
+two seconds while calling `calibrate_front` or `calibrate_right` on the control
+card. Calibration pauses only the direction capture process; the mic
+card continues publishing audio. Too few new frames or an invalid voice
+spectrum returns `no_voice` without saving. Calibration returns `queued` with an
+`action_id` immediately; the final `calibrated`, `no_voice`, or restart error
+is reported to Agent Core through ACP after capture and worker restart finish.
+
+Both cards now use independent SDK capture readers. The SDK exposes the
+getter but does not document concurrent-reader semantics; verify on the robot
+that audio and direction continue at normal rates while both cards run.
+Simultaneous speakers and ambient noise may cause a wrong angle. Confirm
+performance on the actual robot before using direction to command motion.
+
+Run the local estimator and card tests from the repository root with
+`python -m pytest noetix/bumi/tests -q`.
 
 ## App 图传与 Phanthy Camera Card
 

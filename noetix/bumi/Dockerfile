@@ -62,12 +62,13 @@ RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
 # ROS2 domain isolation
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY sound_direction.py /work/sound_direction.py
+COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
@@ -75,8 +76,11 @@ COPY deploy/     /deploy/
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
 ENV PYTHONUNBUFFERED=1
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# Use SDK's DDS config for peer discovery (unicast to motion control board 192.168.55.102)
+# Vendor HighController/MediaController use CycloneDDS to discover the motion
+# board (192.168.55.102). This driver's ROS 2 bridge to Agent Core uses
+# rmw_fastrtps_cpp and the mounted FASTRTPS_DEFAULT_PROFILES_FILE instead.
 ENV CYCLONEDDS_URI='file:///work/noetix_sdk_bumi/config/dds.xml'
 
 EXPOSE 15704
