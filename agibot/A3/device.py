@@ -1531,17 +1531,17 @@ def _set_relay_stream(stream_name, enabled):
 def _ensure_relay_defaults():
     """Seed the shared relay state once per deployment.
 
-    An empty file can be left by a previous canvas session's last stop. A
-    restarted driver should still provide its documented four preview streams;
-    an existing non-empty file remains authoritative for an active session.
+    The relay is demand-driven: a restarted driver must not resurrect raw
+    camera subscriptions left behind by a previous canvas session.  An
+    explicitly configured value (including an empty value) therefore resets
+    the file on startup; the implicit fallback is only used by standalone
+    callers that do not configure the variable.
     """
     path = os.environ.get("A3_RELAY_CONTROL_FILE", "/opt/phanthy-motus/data/a3-relay/active_streams")
-    defaults = os.environ.get(
-        "A3_RELAY_ACTIVE_STREAMS",
-        "head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth",
-    )
+    configured = os.environ.get("A3_RELAY_ACTIVE_STREAMS")
+    defaults = configured if configured is not None else ""
     try:
-        if os.path.exists(path) and os.path.getsize(path) > 0:
+        if configured is None and os.path.exists(path) and os.path.getsize(path) > 0:
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         temporary = f"{path}.tmp.{os.getpid()}"

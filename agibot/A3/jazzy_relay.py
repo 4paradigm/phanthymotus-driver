@@ -44,7 +44,7 @@ _control_file = os.environ.get(
 )
 _default_active = {item.strip() for item in os.environ.get(
     "A3_RELAY_ACTIVE_STREAMS",
-    "head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth",
+    "",
 ).split(",") if item.strip()}
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import array
 import json
 import math
+import os
 import struct
 import sys
 import tempfile
@@ -618,16 +619,46 @@ class StartStopLifecycleTests(unittest.TestCase):
             self._assert_inert(plugin, name, nodes)
         self.assertEqual(transport.calls, [], "start/stop must not issue any RPC")
 
-        # spatial_map's card lifecycle deliberately drives its polling thread
-        # (tianyi pattern) — the thread is stopped now, so verify it can be
-        # restarted without any RPC leaking out (first poll happens after
-        # publish_interval, not synchronously).
         spatial_map = find_plugin(plugins, "spatial_map")
         result = spatial_map.dispatch("start", {"_tool_name": "spatial_map"})
         self.assertEqual(result["state"], "running")
         self.assertEqual(transport.calls, [], "card start must not issue any RPC")
         spatial_map.stop()
 
+    def test_camera_activation_is_demand_driven_and_clears_stale_streams(self):
+        from agibot.A3 import device
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            control_file = Path(temp_dir) / "active_streams"
+            control_file.write_text("head_left_fisheye\nchest_front_d457_rgb\n", encoding="utf-8")
+            previous_control = os.environ.get("A3_RELAY_CONTROL_FILE")
+            previous_active = os.environ.get("A3_RELAY_ACTIVE_STREAMS")
+            os.environ["A3_RELAY_CONTROL_FILE"] = str(control_file)
+            os.environ["A3_RELAY_ACTIVE_STREAMS"] = ""
+            try:
+                device._ensure_relay_defaults()
+                self.assertEqual(control_file.read_text(encoding="utf-8"), "")
+
+                device._set_relay_stream("head_left_fisheye", True)
+                device._set_relay_stream("chest_front_d457_rgb", True)
+                self.assertEqual(
+                    set(control_file.read_text(encoding="utf-8").splitlines()),
+                    {"head_left_fisheye", "chest_front_d457_rgb"},
+                )
+                device._set_relay_stream("head_left_fisheye", False)
+                self.assertEqual(
+                    control_file.read_text(encoding="utf-8").splitlines(),
+                    ["chest_front_d457_rgb"],
+                )
+            finally:
+                if previous_control is None:
+                    os.environ.pop("A3_RELAY_CONTROL_FILE", None)
+                else:
+                    os.environ["A3_RELAY_CONTROL_FILE"] = previous_control
+                if previous_active is None:
+                    os.environ.pop("A3_RELAY_ACTIVE_STREAMS", None)
+                else:
+                    os.environ["A3_RELAY_ACTIVE_STREAMS"] = previous_active
 
 # ---------------------------------------------------------------------------
 # RPC payload / publisher dispatch tests
