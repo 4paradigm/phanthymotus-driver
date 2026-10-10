@@ -60,6 +60,17 @@ hal/srv/SetPmuLed.srv:         req: CommonRequest request; string trace_id;
                                 resp: ResponseHeader header; uint16 status_code
 ```
 
+## Sensors
+
+```
+hal/msg/TouchState.msg: uint8 event_type; uint32[8] data; uint32[8] threshold; bool[8] is_touched
+hal/msg/PmuState.msg: string pmu_software_version; string pmu_hardware_version;
+                     uint32 pmu_bool_status; float64 battery_voltage; float64 output_48v_voltage;
+                     float64 output_12v_voltage; float64 pmu_temperature; float64 fan_speed;
+                     uint8 fan_pecentage; ...
+sensor_msgs/msg/CameraInfo: standard ROS 2 camera calibration and projection parameters
+```
+
 ## Motion control (`mc`)
 
 ```
@@ -73,6 +84,12 @@ mc/action/McActionCommand.msg: McAction action; string action_desc
 mc/action/McActionInfo.msg:    McAction current_action; string action_desc; McActionStatus status
 mc/action/srv/SetMcAction.srv: req: RequestHeader header; string source; McActionCommand command
                                 resp: CommonResponse response
+                                Note: the enum is a build-time superset, not a promise that the
+                                deployed firmware implements every action. On the verified X2,
+                                SetMcAction rejected STAND_UP_DEFAULT and ZERO_TORQUE_DEFAULT
+                                as unknown actions. PASSIVE_DEFAULT and STAND_DEFAULT only
+                                acknowledged the request; DAMPING_DEFAULT is the sole observed
+                                end-to-end working mode on this unit.
 mc/action/srv/GetMcAction.srv: req: CommonRequest request
                                 resp: ResponseHeader header; McActionInfo info
 mc/motion/msg/McControlArea.msg: int32 value; NONE=0 LEFT_HAND=1 RIGHT_HAND=2 HEAD=4 WAIST=8
