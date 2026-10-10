@@ -190,7 +190,7 @@ class SoundDirectionPlugin:
 
     def get_tool(self) -> dict:
         return {
-            "name": "sound_direction", "type": "sensor", "multiInstance": False,
+            "name": "sound_direction", "type": "actuator", "multiInstance": False,
             "description": "Bumi calibrated sound direction from the microphone array",
             "inputSchema": {
                 "type": "object",

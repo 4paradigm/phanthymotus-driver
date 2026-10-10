@@ -5,7 +5,7 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 ## `mic` and `sound_direction`
 
 `mic` publishes mono PCM on `/<namespace>/mic/audio`. The separate
-`sound_direction` sensor card reads the SDK's eight-channel microphone capture
+`sound_direction` control card reads the SDK's eight-channel microphone capture
 directly, uses the first four channels for direction estimation, and publishes
 JSON on `/<namespace>/sound_direction`. Both cards start with the bundle and
 have independent `start`/`stop`/`info` actions. The direction card also

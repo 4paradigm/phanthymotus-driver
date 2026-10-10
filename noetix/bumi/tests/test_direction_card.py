@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 from test_mic_card import _load_device
 
@@ -35,6 +36,7 @@ def test_direction_card_reuses_existing_calibration_and_reports_its_own_topic(
     card = module.SoundDirectionPlugin({}, "robot", executor)
 
     assert card.get_tool()["name"] == "sound_direction"
+    assert card.get_tool()["type"] == "actuator"
     assert card.get_tool()["topic_out"] == [
         {"topic": "/robot/sound_direction", "format": "data/json"}]
     info = card.dispatch("info", {})
@@ -91,6 +93,9 @@ def test_bundle_exposes_audio_and_direction_as_separate_cards(monkeypatch):
     bundle = bundle_module.BumiDeviceBundle(
         cfg, "robot", types.SimpleNamespace(add_node=lambda node: None), None, object())
     assert {tool["name"] for tool in bundle.get_all_tools()} == {"mic", "sound_direction"}
+    manifest = yaml.safe_load((path.parent / "driver.yaml").read_text(encoding="utf-8"))
+    categories = {card["name"]: card["type"] for card in manifest["cards"]}
+    assert categories["sound_direction"] == "actuator"
 
 
 def test_direction_card_validates_observations(monkeypatch):
