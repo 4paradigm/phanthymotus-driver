@@ -88,12 +88,29 @@ def _configure_cyclonedds(config: dict) -> str:
         raise ValueError(
             f"robot network interface {interface!r} does not exist; available interfaces: {names}"
         )
-    os.environ.setdefault(
-        "CYCLONEDDS_URI",
-        "<CycloneDDS><Domain><General><Interfaces>"
-        f"<NetworkInterface name='{interface}'/>"
-        "</Interfaces></General></Domain></CycloneDDS>",
-    )
+    tracing = "<Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing>"
+    robot_domain = int(config["ros"].get("robot_domain_id", 69))
+    core_domain = int(config["ros"].get("core_domain_id", 42))
+    teleop_enabled = config.get("plugins", {}).get("teleop_control", {}).get("enabled", False)
+    if teleop_enabled:
+        if core_domain != 42 or robot_domain == core_domain:
+            raise ValueError("teleop requires local core domain 42 and a separate robot domain")
+        # PICO/Core use loopback-only FastDDS. Restrict the Cyclone participant
+        # in domain 42 to the same host; domain 69 still reaches the robot NIC.
+        # Cyclone 0.10's schema permits one Domain per document. Its URI setting
+        # accepts a comma-separated list of XML documents, selected by Domain Id.
+        profile = (f"<CycloneDDS><Domain Id='{robot_domain}'><General><Interfaces>"
+            f"<NetworkInterface name='{interface}'/></Interfaces></General>{tracing}</Domain></CycloneDDS>,"
+            f"<CycloneDDS><Domain Id='{core_domain}'><General><Interfaces>"
+            "<NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast>"
+            "</General><Discovery><ParticipantIndex>auto</ParticipantIndex>"
+            "<MaxAutoParticipantIndex>119</MaxAutoParticipantIndex>"
+            "<Peers><Peer Address='127.0.0.1'/></Peers></Discovery>"
+            f"{tracing}</Domain></CycloneDDS>")
+    else:
+        profile = ("<CycloneDDS><Domain><General><Interfaces>"
+            f"<NetworkInterface name='{interface}'/></Interfaces></General>{tracing}</Domain></CycloneDDS>")
+    os.environ.setdefault("CYCLONEDDS_URI", profile)
     return interface
 
 
@@ -137,7 +154,7 @@ class T800DeviceBundle:
     _MOTION_OUTPUT_TOOLS = frozenset({
         "loco", "safe_motion_mode", "dance", "joint_plan", "gesture",
         "joint_override", "joint_bridge", "virtual_gamepad", "gait",
-        "motion_recorder", "head", "speaker",
+        "motion_recorder", "head", "speaker", "teleop_control",
     })
     _SAFE_WHILE_MOTION_SETTLING = frozenset({
         "start", "stop", "info", "status", "list", "stop_move",
@@ -183,6 +200,9 @@ class T800DeviceBundle:
         self._active_plugins: list = []
         self._startup_errors: dict[str, str] = {}
         self._started = False
+        self._motion_admission_lock = threading.RLock()
+        self._motion_inflight = 0
+        self._teleop = None
         self._acp_status = _t800_acp_status
         acp_status = _t800_acp_preflight()
         if acp_status["state"] == "error":
@@ -308,6 +328,15 @@ class T800DeviceBundle:
             instances["virtual_gamepad"] = instance
             self._plugins.append(instance)
 
+        if plugins.get("teleop_control", {}).get("enabled", False):
+            from teleop import TeleopControlPlugin
+            instance = TeleopControlPlugin(config, namespace, ros2, state)
+            instances["teleop_control"] = instance
+            self._teleop = instance
+            self._plugins.append(instance)
+            motion_interrupt_group.register("teleop_control", instance.halt, instance.motion_active)
+        self._motion_instances = instances
+
         controlled_spatial_config = plugins.get("controlled_spatial", {})
         if controlled_spatial_config.get("enabled", False):
             try:
@@ -333,7 +362,7 @@ class T800DeviceBundle:
                     for key in (
                         "locomotion", "joint_override", "joint_bridge",
                         "virtual_gamepad", "gesture", "motion_recorder", "head",
-                        "speaker",
+                        "speaker", "teleop_control",
                     )
                     if key in instances
                 ]
@@ -430,7 +459,66 @@ class T800DeviceBundle:
             "registration": registration_status,
         }
 
+    def _teleop_blockers(self) -> list[str]:
+        blockers = [name for name in self._motion_interrupt_group.blocking_outputs()
+                    if name != "teleop_control"]
+        # Raw streams/planner commands are not in the gesture interrupt group.
+        for name in ("joint_override", "joint_bridge", "virtual_gamepad"):
+            plugin = self._motion_instances.get(name)
+            if plugin is not None:
+                stream = plugin._stream.snapshot()
+                if stream.active or getattr(stream, "error", None):
+                    blockers.append(name)
+        planner = self._motion_instances.get("joint_plan")
+        if planner is not None:
+            status = planner.dispatch("status", {})
+            request = status.get("last_request", {})
+            if (status.get("status") != 1 or
+                    request.get("request_id", 0) > status.get("request_id", -1)):
+                blockers.append("joint_plan")
+        return blockers
+
     def dispatch(self, tool_name: str, arguments: dict) -> dict | None:
+        teleop = getattr(self, "_teleop", None)
+        if teleop is None:
+            return self._dispatch(tool_name, arguments)
+        action = arguments.get("action", tool_name)
+        protected = self._MOTION_OUTPUT_TOOLS | {"native_sdk", "native_node_control", "motor_power", "safety"}
+        if tool_name not in protected or action in {"info", "status", "list"}:
+            return self._dispatch(tool_name, arguments)
+        # Reserve atomically, but do not hold this lock while legacy actions
+        # wait for robot feedback: emergency stop must remain concurrent.
+        with self._motion_admission_lock:
+            if tool_name == "teleop_control":
+                if action == "start" and not teleop.motion_active():
+                    blockers = self._teleop_blockers()
+                    if blockers or self._motion_inflight:
+                        return {"state": "error", "error": "motion_output_busy",
+                                "blocking_outputs": blockers, "inflight": self._motion_inflight}
+                return self._dispatch(tool_name, arguments)
+            if tool_name == "safety" and action not in {"start", "info", "status"}:
+                teleop.halt()
+                # An independent emergency stop must still run if this
+                # controller's release publish failed.
+            elif teleop.motion_active():
+                if action in {"stop", "stop_move", "stop_dance", "stop_gesture",
+                              "stop_playback", "cancel", "release", "stop_command"}:
+                    result = teleop.halt()
+                    if result.get("override_release_pending"):
+                        return {"state": "error", "error": "override_release_pending"}
+                elif action == "start" and tool_name != "native_sdk":
+                    pass  # Other Canvas lifecycle starts do not emit motion.
+                else:
+                    return {"state": "error", "error": "teleop_control_owns_motion",
+                            "blocking_outputs": ["teleop_control"]}
+            self._motion_inflight += 1
+        try:
+            return self._dispatch(tool_name, arguments)
+        finally:
+            with self._motion_admission_lock:
+                self._motion_inflight -= 1
+
+    def _dispatch(self, tool_name: str, arguments: dict) -> dict | None:
         for plugin in self._active_plugins:
             tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
             for definition in tools:

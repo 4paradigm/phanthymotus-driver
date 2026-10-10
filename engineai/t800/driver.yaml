@@ -45,6 +45,7 @@ cards:
   - { name: gesture,                 type: actuator }
   - { name: head,                    type: actuator }
   - { name: joint_override,          type: actuator }
+  - { name: teleop_control,          type: actuator }
   - { name: joint_bridge,            type: actuator }
   - { name: led,                     type: actuator }
   - { name: tts,                     type: actuator }
