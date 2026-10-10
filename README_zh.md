@@ -17,6 +17,7 @@
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
+
 ## 快速开始
 
 ### 环境要求
