@@ -310,3 +310,199 @@ def test_wake_status_sampling_catches_short_separate_updates(monkeypatch):
             detected.append(event)
 
     assert detected == [(2, 2000), (4, 4000)]
+
+
+def test_direction_contract_from_estimator_to_subscription(monkeypatch):
+    """发布端 _mic_direction_payload → JSON → _on_direction 的契约，钉住角度类型与字段。"""
+    module, String = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    sys.modules.pop("sound_direction", None)
+
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, object())
+    card._proc = types.SimpleNamespace(poll=lambda: None)
+
+    calibration = {"front": [2.0, -1.0, 0.0], "right": [0.0, 1.0, -2.0]}
+    raw = module._mic_direction_payload((2.0, -1.0, 0.0), calibration, 1)
+    payload = json.loads(raw)
+    assert payload["state"] == "fresh"
+    assert type(payload["angle"]) is int
+    card._on_direction(String(raw))
+    assert card.dispatch("info", {})["sound_direction"]["angle"] == payload["angle"]
+
+    # 未标定与签名无法定位时，发布端不得携带 angle。
+    uncalibrated = json.loads(module._mic_direction_payload(None, {}, 1))
+    assert uncalibrated["state"] == "uncalibrated"
+    assert "angle" not in uncalibrated
+    ambiguous = json.loads(module._mic_direction_payload(None, calibration, 1))
+    assert ambiguous["state"] == "ambiguous"
+    assert "angle" not in ambiguous
+
+    # 发布端若把角度序列化成 float，订阅端必须拒收整条消息。
+    with card._direction_lock:
+        card._last_direction = None
+        card._last_direction_time = 0.0
+    card._on_direction(String(
+        json.dumps({**payload, "angle": float(payload["angle"]) + 0.5})))
+    assert card.dispatch("info", {})["sound_direction"] == {"state": "no_event"}
+
+
+def test_mic_direction_rejects_unexpected_shapes(monkeypatch):
+    module, String = _load_device(monkeypatch)
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, object())
+    card._proc = types.SimpleNamespace(poll=lambda: None)
+
+    for payload in (
+        '{"state":"unknown","angle":90}',
+        '{"state":"fresh","angle":360}',
+        '{"state":"fresh","angle":-1}',
+        '{"state":"fresh"}',
+        '{"state":"ambiguous","angle":true}',
+        '{"state":"ambiguous","angle":90,"extra":{"nested":1}}',
+    ):
+        card._on_direction(String(payload))
+        assert card.dispatch("info", {})["sound_direction"] == {"state": "no_event"}
+
+    card._on_direction(String('{"state":"ambiguous","angle":90}'))
+    assert card.dispatch("info", {})["sound_direction"]["angle"] == 90
+
+
+def test_info_survives_corrupt_calibration_files(monkeypatch, tmp_path):
+    module, _ = _load_device(monkeypatch)
+    path = tmp_path / "calibration.json"
+    monkeypatch.setattr(module, "_MIC_DIRECTION_CALIBRATION", path)
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, object())
+
+    for content in ("not json", "5", "null", '"str"',
+                    '{"front":"x"}', '{"front":[1,"2",3]}',
+                    '{"front":[1,2]}', '{"front":[true,1,2]}',
+                    "[" * 3000 + "]" * 3000):
+        path.write_text(content)
+        info = card.dispatch("info", {})
+        assert info["calibrated_directions"] == []
+        assert info["sound_direction"] == {"state": "no_event"}
+
+    path.write_text(json.dumps({"front": [2, -1, 0], "right": [0, 1, -2.5]}))
+    assert card.dispatch("info", {})["calibrated_directions"] == ["front", "right"]
+
+    # 非 front/right 键即使形状像签名也不得进入标定视图。
+    path.write_text(json.dumps({"front": [2, -1, 0], "back": [1, 2, 3]}))
+    assert set(module._load_calibration()) == {"front"}
+
+
+def test_start_survives_wakeup_sdk_failure(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("voice module down")
+
+    media = types.SimpleNamespace(get_wakeup_words=boom, add_wakeup_words=boom)
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, media)
+    spawned = []
+
+    def popen(*args, **kwargs):
+        spawned.append(True)
+        return types.SimpleNamespace(stdout=(), poll=lambda: None)
+
+    monkeypatch.setattr(module.subprocess, "Popen", popen)
+
+    assert card.dispatch("start", {})["state"] == "running"
+    assert spawned == [True]
+    assert card._proc is not None
+
+
+def test_calibration_result_survives_restart_failure(monkeypatch, tmp_path):
+    module, _ = _load_device(monkeypatch)
+    path = tmp_path / "calibration.json"
+    monkeypatch.setattr(module, "_MIC_DIRECTION_CALIBRATION", path)
+    monkeypatch.setitem(sys.modules, "sound_direction", types.SimpleNamespace(
+        estimate_signature=lambda audio, channels, rate: (1.0, 2.0, 3.0),
+        is_voiced_audio=lambda audio, channels, rate: True))
+    ticks = [0.0]
+
+    def monotonic():
+        ticks[0] += 0.01
+        return ticks[0]
+
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(
+        monotonic=monotonic, sleep=lambda seconds: None))
+    media = types.SimpleNamespace(
+        get_audio_capture_data=lambda: types.SimpleNamespace(
+            channels=8, sample_rate=16000, audio_data=[100] * (16000 * 8)),
+        get_wakeup_words=lambda: "小范小范")
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, media)
+
+    class Process:
+        stdout = ()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    card._proc = Process()
+
+    def fail_start():
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(card, "start", fail_start)
+    # 标定文件里预先存在的手工顶层键不得在写回时丢失。
+    path.write_text(json.dumps({"version": 2}))
+
+    result = card.dispatch("calibrate_front", {})
+    assert result["state"] == "calibrated"
+    assert path.exists()
+    saved = json.loads(path.read_text())
+    assert saved["version"] == 2
+    assert isinstance(saved["front"], list)
+    assert card._proc is None
+
+
+def test_wake_status_poll_survives_sdk_failure(monkeypatch, capsys):
+    module, _ = _load_device(monkeypatch)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("status down")
+
+    media = types.SimpleNamespace(get_system_status=boom)
+
+    next_poll, last_key, event = module._poll_mic_wake_status(
+        media, 10.0, 0.0, ("id", 5))
+    assert (next_poll, last_key, event) == (10.5, ("id", 5), None)
+    # 故障必须留痕；退避窗口内不再触碰 SDK，避免每次轮询都抛异常刷日志。
+    assert "wake status poll failed" in capsys.readouterr().out
+    next_poll, last_key, event = module._poll_mic_wake_status(
+        media, 10.2, next_poll, last_key)
+    assert (next_poll, last_key, event) == (10.5, ("id", 5), None)
+    assert "wake status poll failed" not in capsys.readouterr().out
+    assert len(calls) == 1
+
+
+def test_initial_wake_key_seeding_is_exception_safe(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+
+    def status(reason, message_id):
+        return types.SimpleNamespace(
+            reason=types.SimpleNamespace(name=reason),
+            header=types.SimpleNamespace(message_id=message_id,
+                                         timestamp_us=message_id * 1000))
+
+    def dead():
+        raise RuntimeError("down")
+
+    assert module._initial_wake_key(
+        types.SimpleNamespace(get_system_status=dead)) is None
+    assert module._initial_wake_key(types.SimpleNamespace(
+        get_system_status=lambda: status("CMD_SLEEPED", 8))) is None
+    assert module._initial_wake_key(types.SimpleNamespace(
+        get_system_status=lambda: status("AUDIO_WAKEUPED", 7))) == (7, 7000)

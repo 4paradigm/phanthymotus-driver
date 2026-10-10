@@ -43,6 +43,10 @@ The bundled SDK exposes only current-status polling. The driver checks as
 often as the capture loop permits, but a wake status that appears and disappears
 between checks can still be missed.
 
+Run the estimator and mic card tests from the repository root with
+`python -m pytest noetix/bumi/tests -q`. A bare `pytest noetix/bumi` stops on
+pre-existing collection errors in the SDK example stubs under `noetix_sdk_bumi`.
+
 ## App 图传与 Phanthy Camera Card
 
 Bumi 的官方 App 图传服务 `noetix-video-capture.service` 会占用 RealSense。
