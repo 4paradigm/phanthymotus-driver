@@ -892,9 +892,10 @@ class TestDriverContracts(unittest.TestCase):
         sequence = context.Value("Q", 0)
         active_slot = context.Value("i", 0)
         slot_lengths = context.Array("Q", [0, 0])
+        slot_capture_times = context.Array("d", [0.0, 0.0])
         frame_event = context.Event()
         stopped = context.Event()
-        statuses = context.Queue(4)
+        statuses = __import__("queue").Queue(4)
         metrics = {
             name: context.Value("d", 0.0)
             for name in (
@@ -906,18 +907,19 @@ class TestDriverContracts(unittest.TestCase):
             target=self.multimedia._camera_capture_process,
             args=(
                 shared_frames, max_frame_bytes, frame_lock, sequence,
-                active_slot, slot_lengths, frame_event, stopped, statuses,
-                metrics, "eth0", 10, 1, .1,
+                active_slot, slot_lengths, slot_capture_times, frame_event,
+                stopped, statuses, metrics, "eth0", 10, 1, .1,
             ),
             daemon=True,
         )
         thread.start()
         self.assertTrue(frame_event.wait(1))
-        _sequence, frame = self.multimedia._shared_camera_read(
+        _sequence, frame, captured_at = self.multimedia._shared_camera_read(
             shared_frames, max_frame_bytes, frame_lock, sequence,
-            active_slot, slot_lengths,
+            active_slot, slot_lengths, slot_capture_times,
         )
         self.assertEqual(b"\xff\xd8frame\xff\xd9", frame)
+        self.assertGreater(captured_at, 0)
         self.assertGreaterEqual(metrics["capture_frames"].value, 1)
         stopped.set()
         thread.join(timeout=1)
@@ -952,20 +954,23 @@ class TestDriverContracts(unittest.TestCase):
         sequence = context.Value("Q", 0)
         active_slot = context.Value("i", 0)
         slot_lengths = context.Array("Q", [0, 0])
+        slot_capture_times = context.Array("d", [0.0, 0.0])
         frame_event = context.Event()
         stopped = context.Event()
-        statuses = context.Queue(4)
+        statuses = __import__("queue").Queue(4)
         metrics = {
             name: context.Value("d", 0.0)
             for name in (
                 "frames", "queue_drops", "last_frame_ts",
                 "build_total_ms", "build_max_ms", "publish_total_ms",
-                "publish_max_ms",
+                "publish_max_ms", "frame_age_total_ms", "frame_age_max_ms",
+                "last_published_frame_age_ms", "stale_frame_drops",
             )
         }
         self.multimedia._shared_camera_write(
             shared_frames, max_frame_bytes, frame_lock, sequence,
-            active_slot, slot_lengths, b"\xff\xd8frame\xff\xd9",
+            active_slot, slot_lengths, slot_capture_times,
+            b"\xff\xd8frame\xff\xd9",
         )
         frame_event.set()
         rclpy = sys.modules["rclpy"]
@@ -977,8 +982,8 @@ class TestDriverContracts(unittest.TestCase):
                 target=self.multimedia._camera_publish_process,
                 args=(
                     shared_frames, max_frame_bytes, frame_lock, sequence,
-                    active_slot, slot_lengths, frame_event, stopped, statuses,
-                    metrics, "/test/camera",
+                    active_slot, slot_lengths, slot_capture_times, frame_event,
+                    stopped, statuses, metrics, "/test/camera", 5.0, 500.0,
                 ),
                 daemon=True,
             )
@@ -997,7 +1002,7 @@ class TestDriverContracts(unittest.TestCase):
             self.multimedia._shared_camera_write(
                 shared_frames, 8, context.Lock(), context.Value("Q", 0),
                 context.Value("i", 0), context.Array("Q", [0, 0]),
-                b"123456789",
+                context.Array("d", [0.0, 0.0]), b"123456789",
             )
 
     def test_camera_shared_buffer_exposes_only_newest_frame(self):
@@ -1009,22 +1014,24 @@ class TestDriverContracts(unittest.TestCase):
         sequence = context.Value("Q", 0)
         active_slot = context.Value("i", 0)
         slot_lengths = context.Array("Q", [0, 0])
+        slot_capture_times = context.Array("d", [0.0, 0.0])
 
         self.multimedia._shared_camera_write(
             shared_frames, max_frame_bytes, frame_lock, sequence,
-            active_slot, slot_lengths, b"old",
+            active_slot, slot_lengths, slot_capture_times, b"old",
         )
         self.multimedia._shared_camera_write(
             shared_frames, max_frame_bytes, frame_lock, sequence,
-            active_slot, slot_lengths, b"newest",
+            active_slot, slot_lengths, slot_capture_times, b"newest",
         )
-        current_sequence, frame = self.multimedia._shared_camera_read(
+        current_sequence, frame, captured_at = self.multimedia._shared_camera_read(
             shared_frames, max_frame_bytes, frame_lock, sequence,
-            active_slot, slot_lengths,
+            active_slot, slot_lengths, slot_capture_times,
         )
 
         self.assertEqual(2, current_sequence)
         self.assertEqual(b"newest", frame)
+        self.assertGreater(captured_at, 0)
 
     def test_speaker_worker_uses_a2_voice_service(self):
         channel = sys.modules["unitree_sdk2py.core.channel"]
@@ -1272,6 +1279,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertNotIn("create_publisher", camera_capture)
         self.assertIn('array("B", frame)', camera_publish)
         self.assertIn("publisher.publish(message)", camera_publish)
+        self.assertIn("max_frame_age_ms", camera_publish)
+        self.assertIn("next_publish_at", camera_publish)
         self.assertIn('RawArray("B", max_frame_bytes * 2)', camera_backend)
         self.assertIn("as2w_camera_capture", camera_backend)
         self.assertIn("as2w_camera_publish", camera_backend)
@@ -1285,6 +1294,8 @@ class TestDriverContracts(unittest.TestCase):
 
         self.assertEqual([], added)
         self.assertEqual("/test/camera/front", plugin._topic)
+        self.assertEqual(8.0, plugin._node.publish_fps)
+        self.assertEqual(300.0, plugin._node.max_frame_age_ms)
 
     def test_mic_waiting_state_explains_retry_and_wakeup_mode(self):
         node = self.multimedia._MicNode.__new__(self.multimedia._MicNode)

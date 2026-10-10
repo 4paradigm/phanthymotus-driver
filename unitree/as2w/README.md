@@ -103,10 +103,15 @@ roughly 300 KB frames are not pickled through a multiprocessing queue. The ROS
 publisher assigns `CompressedImage.data` through a buffer-compatible byte array,
 avoiding slow per-byte conversion. A busy FastDDS publisher therefore cannot
 hold the videohub client's Python GIL, while a slow publisher drops stale frame
-sequences instead of increasing end-to-end latency. Camera
+sequences instead of increasing end-to-end latency. Capture and publication
+have separate limits: the default 10 Hz capture continuously refreshes the
+shared slot, while the default 8 Hz publisher reads only the newest slot. This
+keeps the state-card preview responsive without filling Agent Core's deeper
+subscriber queue with every redundant 300 KB frame. Frames already older than
+the configured 300 ms limit are discarded before DDS publication. Camera
 `info` reports separate capture/publish rates, videohub RPC time, message-build
-and publish-call time, average frame size, dropped stale frames, and both child
-process states/PIDs. Like G1
+and publish-call time, capture-to-publish frame age, average frame size, dropped
+or expired frames, and both child process states/PIDs. Like G1
 `camera_rgb`, it is an always-on state source: canvas lifecycle `stop` detaches
 intelligent control but does not stop publication. The child processes are
 physically closed only when the driver bundle shuts down; repeated canvas starts

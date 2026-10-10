@@ -1065,7 +1065,7 @@ def _metric_max(metric, value):
 
 def _shared_camera_write(
         shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
-        slot_lengths, frame):
+        slot_lengths, slot_capture_times, frame):
     """Atomically replace the inactive slot and expose it as the newest JPEG."""
     frame_size = len(frame)
     if frame_size > max_frame_bytes:
@@ -1077,6 +1077,7 @@ def _shared_camera_write(
         start = slot * max_frame_bytes
         memoryview(shared_frames).cast("B")[start:start + frame_size] = frame
         slot_lengths[slot] = frame_size
+        slot_capture_times[slot] = time.monotonic()
         active_slot.value = slot
         sequence.value += 1
         return sequence.value
@@ -1084,7 +1085,7 @@ def _shared_camera_write(
 
 def _shared_camera_read(
         shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
-        slot_lengths):
+        slot_lengths, slot_capture_times):
     """Copy one coherent snapshot of the latest slot for ROS publication."""
     with frame_lock:
         current_sequence = sequence.value
@@ -1093,12 +1094,13 @@ def _shared_camera_read(
         start = slot * max_frame_bytes
         frame = bytes(
             memoryview(shared_frames).cast("B")[start:start + frame_size])
-    return current_sequence, frame
+        captured_at = slot_capture_times[slot]
+    return current_sequence, frame, captured_at
 
 
 def _camera_capture_process(
         shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
-        slot_lengths, frame_event, stop_event, event_queue, metrics,
+        slot_lengths, slot_capture_times, frame_event, stop_event, event_queue, metrics,
         interface, fps, timeout_s, retry_s):
     """Fetch videohub JPEGs without sharing a GIL with ROS serialization."""
     _install_logsafe()
@@ -1137,7 +1139,7 @@ def _camera_capture_process(
 
             _shared_camera_write(
                 shared_frames, max_frame_bytes, frame_lock, sequence,
-                active_slot, slot_lengths, frame)
+                active_slot, slot_lengths, slot_capture_times, frame)
             frame_event.set()
             failures = 0
             _metric_add(metrics["capture_frames"], 1)
@@ -1168,7 +1170,8 @@ def _camera_capture_process(
 
 def _camera_publish_process(
         shared_frames, max_frame_bytes, frame_lock, sequence, active_slot,
-        slot_lengths, frame_event, stop_event, event_queue, metrics, topic):
+        slot_lengths, slot_capture_times, frame_event, stop_event, event_queue,
+        metrics, topic, publish_fps, max_frame_age_ms):
     """Publish the newest shared JPEG from a dedicated FastDDS process."""
     _install_logsafe()
     node = None
@@ -1186,14 +1189,23 @@ def _camera_publish_process(
         report("ready")
         last_sequence = 0
         publish_healthy = False
+        publish_period = 1.0 / max(1.0, publish_fps)
+        next_publish_at = 0.0
 
         while not stop_event.is_set():
             if not frame_event.wait(0.1):
                 continue
             frame_event.clear()
-            current_sequence, frame = _shared_camera_read(
+            now = time.monotonic()
+            if next_publish_at > now:
+                if stop_event.wait(next_publish_at - now):
+                    break
+                # Capture may have replaced the slot while publication was
+                # throttled. Consume that notification and read once below.
+                frame_event.clear()
+            current_sequence, frame, captured_at = _shared_camera_read(
                 shared_frames, max_frame_bytes, frame_lock, sequence,
-                active_slot, slot_lengths)
+                active_slot, slot_lengths, slot_capture_times)
             if not frame or current_sequence == last_sequence:
                 continue
             _metric_add(
@@ -1201,6 +1213,10 @@ def _camera_publish_process(
                 max(0, current_sequence - last_sequence - 1),
             )
             last_sequence = current_sequence
+            frame_age_ms = max(0.0, (time.monotonic() - captured_at) * 1000.0)
+            if max_frame_age_ms > 0 and frame_age_ms > max_frame_age_ms:
+                _metric_add(metrics["stale_frame_drops"], 1)
+                continue
 
             try:
                 build_started = time.monotonic()
@@ -1220,6 +1236,10 @@ def _camera_publish_process(
                 _metric_max(metrics["build_max_ms"], build_ms)
                 _metric_add(metrics["publish_total_ms"], publish_ms)
                 _metric_max(metrics["publish_max_ms"], publish_ms)
+                _metric_add(metrics["frame_age_total_ms"], frame_age_ms)
+                _metric_max(metrics["frame_age_max_ms"], frame_age_ms)
+                metrics["last_published_frame_age_ms"].value = frame_age_ms
+                next_publish_at = finished_at + publish_period
                 if not publish_healthy:
                     report("running")
                     publish_healthy = True
@@ -1246,14 +1266,18 @@ def _camera_publish_process(
 class _CameraBackend:
     def __init__(
             self, topic, interface, fps, timeout_s, retry_s,
-            max_frame_bytes=4 * 1024 * 1024):
+            max_frame_bytes=4 * 1024 * 1024, publish_fps=8.0,
+            max_frame_age_ms=300.0):
         context = multiprocessing.get_context("spawn")
         self._max_frame_bytes = max_frame_bytes
+        self._publish_fps = max(1.0, min(float(fps), float(publish_fps)))
+        self._max_frame_age_ms = max(0.0, float(max_frame_age_ms))
         self._shared_frames = context.RawArray("B", max_frame_bytes * 2)
         self._frame_lock = context.Lock()
         self._sequence = context.Value("Q", 0)
         self._active_slot = context.Value("i", 0)
         self._slot_lengths = context.Array("Q", [0, 0])
+        self._slot_capture_times = context.Array("d", [0.0, 0.0])
         self._frame_event = context.Event()
         self._stop_event = context.Event()
         self._events = context.Queue(maxsize=16)
@@ -1264,6 +1288,8 @@ class _CameraBackend:
                 "last_frame_ts", "rpc_total_ms", "rpc_max_ms",
                 "convert_total_ms", "convert_max_ms", "build_total_ms",
                 "build_max_ms", "publish_total_ms", "publish_max_ms",
+                "frame_age_total_ms", "frame_age_max_ms",
+                "last_published_frame_age_ms", "stale_frame_drops",
             )
         }
         now = time.monotonic()
@@ -1278,7 +1304,8 @@ class _CameraBackend:
         common_args = (
             self._shared_frames, max_frame_bytes, self._frame_lock,
             self._sequence, self._active_slot, self._slot_lengths,
-            self._frame_event, self._stop_event, self._events, self._metrics,
+            self._slot_capture_times, self._frame_event, self._stop_event,
+            self._events, self._metrics,
         )
         self._capture_process = context.Process(
             target=_camera_capture_process,
@@ -1288,7 +1315,7 @@ class _CameraBackend:
         )
         self._publish_process = context.Process(
             target=_camera_publish_process,
-            args=common_args + (topic,),
+            args=common_args + (topic, self._publish_fps, self._max_frame_age_ms),
             name="as2w_camera_publish",
             daemon=True,
         )
@@ -1420,6 +1447,16 @@ class _CameraBackend:
                 self._metrics["publish_total_ms"].value / published
                 if published else 0.0),
             "publish_call_max_ms": self._metrics["publish_max_ms"].value,
+            "capture_to_publish_avg_ms": (
+                self._metrics["frame_age_total_ms"].value / published
+                if published else 0.0),
+            "capture_to_publish_max_ms": self._metrics["frame_age_max_ms"].value,
+            "last_published_frame_age_ms": (
+                self._metrics["last_published_frame_age_ms"].value),
+            "stale_frame_drops": int(
+                self._metrics["stale_frame_drops"].value),
+            "publish_fps_limit": self._publish_fps,
+            "max_frame_age_ms": self._max_frame_age_ms,
             "capture_process_alive": capture_alive,
             "publish_process_alive": publish_alive,
             "capture_process_state": self._capture_state,
@@ -1445,13 +1482,16 @@ class _CameraBackend:
 class _CameraNode:
     def __init__(
             self, topic, interface, fps, timeout_s, retry_s,
-            max_frame_bytes=4 * 1024 * 1024):
+            max_frame_bytes=4 * 1024 * 1024, publish_fps=8.0,
+            max_frame_age_ms=300.0):
         self.topic = topic
         self.interface = interface
         self.fps = fps
         self.timeout_s = timeout_s
         self.retry_s = retry_s
         self.max_frame_bytes = max_frame_bytes
+        self.publish_fps = publish_fps
+        self.max_frame_age_ms = max_frame_age_ms
         self.state = "idle"
         self.frames = 0
         self.last_error = ""
@@ -1465,7 +1505,7 @@ class _CameraNode:
         self.stop_capture()
         self._backend = _CameraBackend(
             self.topic, self.interface, self.fps, self.timeout_s, self.retry_s,
-            self.max_frame_bytes,
+            self.max_frame_bytes, self.publish_fps, self.max_frame_age_ms,
         )
         if self._backend.error:
             self.state = "error"
@@ -1516,6 +1556,8 @@ class CameraPlugin:
                 min(16 * 1024 * 1024,
                     int(config.get("max_frame_bytes", 4 * 1024 * 1024))),
             ),
+            max(1.0, min(20.0, float(config.get("publish_fps", 8.0)))),
+            max(0.0, float(config.get("max_frame_age_ms", 300.0))),
         )
 
     def get_tool(self):

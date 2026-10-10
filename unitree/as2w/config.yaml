@@ -20,7 +20,10 @@ plugins:
   camera:
     enabled: true
     backend: videohub
+    # Capture often, but publish only fresh frames at a rate Jetson consumers can sustain.
     fps: 10
+    publish_fps: 8
+    max_frame_age_ms: 300
     # Two latest-frame shared-memory slots; increase only if videohub JPEGs exceed 4 MiB.
     max_frame_bytes: 4194304
     rpc_timeout: 1.0
