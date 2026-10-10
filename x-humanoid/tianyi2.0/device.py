@@ -283,6 +283,9 @@ class _ActionSequence:
     def start(self, worker, on_done=None) -> None:
         """Start a worker sequence. on_done(cancelled: bool) called when finished."""
         self.cancel()
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError('previous_action_still_running')
         cancel_event = threading.Event()
 
         def _run():
@@ -319,7 +322,7 @@ class _ActionSequence:
         if thread and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         with self._lock:
-            if self._cancel_event is cancel_event:
+            if self._cancel_event is cancel_event and (thread is None or not thread.is_alive()):
                 self._cancel_event = None
                 self._thread = None
         return True
