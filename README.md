@@ -10,7 +10,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
-| [unitree/g1](unitree/g1/README.md) | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
 | `unitree/go1` | Unitree Go1 (EDU) Quadruped | 15715 | State, locomotion, camera (RGB/depth/pointcloud), ext peripherals, URDF |
 | `unitree/go2` | Unitree Go2 Quadruped | 15703 | Locomotion, obstacle avoidance, voice, video, navigation |
 | `unitree/r1` | Unitree R1 (EDU) Humanoid | 15702 | Mic, TTS, LED, locomotion, stereo camera, state monitoring |
