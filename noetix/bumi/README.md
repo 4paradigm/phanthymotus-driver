@@ -32,6 +32,9 @@ thresholds, then use `info` to see the active values. Leave unwanted fields
 empty. `reset_parameters` restores the defaults. Changes restart only the
 direction capture process and are saved in
 `/opt/phanthy-motus/data/bumi/sound_direction_settings.json`.
+The restarted worker loads these values before processing audio. If it exits
+immediately, the action returns `error`; if the sensor is idle, saved values
+take effect on its next start.
 
 | Parameter | Default | Effect |
 | --- | ---: | --- |

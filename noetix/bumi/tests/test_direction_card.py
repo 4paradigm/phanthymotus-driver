@@ -324,10 +324,91 @@ def test_reconfiguration_reports_restart_failure_with_saved_settings(monkeypatch
     assert json.loads(settings_path.read_text())["onset_ratio"] == 2.4
 
 
+def test_control_settings_restart_reader_with_new_values(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, "SETTINGS_PATH", tmp_path / "settings.json")
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+    events = []
+
+    class Process:
+        stdout = ()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("stop")
+
+        def wait(self, timeout=None):
+            events.append("reaped")
+            return 0
+
+    card._proc = Process()
+    def spawn(*args, **kwargs):
+        events.append(("spawn", module.load_parameters()))
+        return Process()
+
+    monkeypatch.setattr(module.subprocess, "Popen", spawn)
+    result = card.dispatch("set_parameters", {
+        "_tool_name": "sound_direction_control",
+        "onset_ratio": 2.6, "update_interval_ms": 250})
+    assert result["state"] == "configured"
+    assert events == ["stop", "reaped", ("spawn", result["parameters"])]
+    assert result["parameters"]["onset_ratio"] == 2.6
+    assert result["parameters"]["update_interval_ms"] == 250
+
+
+def test_control_reports_immediately_exited_reader(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, "SETTINGS_PATH", tmp_path / "settings.json")
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+
+    class Process:
+        stdout = ()
+
+        def __init__(self, exit_code):
+            self.exit_code = exit_code
+
+        def poll(self):
+            return self.exit_code
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    card._proc = Process(None)
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process(1))
+    result = card.dispatch("set_parameters", {
+        "_tool_name": "sound_direction_control", "onset_ratio": 2.6})
+    assert result["state"] == "error"
+    assert "restart" in result["message"]
+
+
 def test_direction_worker_publishes_speech_then_clears_without_fan_angle(
     monkeypatch, tmp_path
 ):
     module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, "SETTINGS_PATH", tmp_path / "settings.json")
+    card = module.SoundDirectionPlugin(
+        {}, "robot", types.SimpleNamespace(add_node=lambda node: None))
+    settings = {"onset_level": 11, "onset_ratio": 1.7,
+                "burst_level": 14, "burst_ratio": 2.9,
+                "update_interval_ms": 250}
+    assert card.dispatch("set_parameters", {
+        "_tool_name": "sound_direction_control", **settings})["state"] == "configured"
+    gate_options = []
+    original_gate = module.SoundActivityGate
+
+    class TrackedGate(original_gate):
+        def __init__(self, **kwargs):
+            gate_options.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(module, "SoundActivityGate", TrackedGate)
     path = tmp_path / "calibration.json"
     path.write_text(json.dumps({"front": [2, -3, 1], "right": [0, 1, -2]}))
     monkeypatch.setattr(module, "CALIBRATION_PATH", path)
@@ -376,6 +457,7 @@ def test_direction_worker_publishes_speech_then_clears_without_fan_angle(
         MediaController=types.SimpleNamespace(instance=lambda: media)))
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
     try:
         module._direction_subprocess("robot")
     except Done:
@@ -383,7 +465,11 @@ def test_direction_worker_publishes_speech_then_clears_without_fan_angle(
 
     messages = [json.loads(message.data) for message in published]
     fresh = [message for message in messages if message["state"] == "fresh"]
-    assert 3 <= len(fresh) <= 7
+    assert gate_options == [{key: settings[key] for key in (
+        "onset_level", "onset_ratio", "burst_level", "burst_ratio")}]
+    assert 2 <= len(fresh) <= 5
+    assert all(next_message["timestamp_ms"] - message["timestamp_ms"] >= 250
+               for message, next_message in zip(fresh, fresh[1:]))
     assert all(message["angle"] == 0 for message in fresh)
     assert messages[-1] == {"state": "no_event"}
     assert all(message["audio_window_start_us"] <= message["audio_window_end_us"]

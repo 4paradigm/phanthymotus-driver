@@ -350,6 +350,9 @@ class SoundDirectionPlugin:
             if running:
                 try:
                     self.start()
+                    if self._proc is None or self._proc.poll() is not None:
+                        return {"state": "error", "message": "direction restart exited immediately",
+                                "parameters": load_parameters()}
                 except Exception as exc:
                     return {"state": "error", "message": f"direction restart failed: {exc}",
                             "parameters": load_parameters()}
