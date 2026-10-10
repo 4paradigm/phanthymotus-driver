@@ -341,21 +341,61 @@ class TestTimingLogs(unittest.TestCase):
             w.start()
             w.timers[0].fire(lag=.2)
         rows = [json.loads(line.removeprefix('[LocoTiming] '))
-                for line in output.getvalue().splitlines()]
+                for line in output.getvalue().splitlines() if line.startswith("[LocoTiming] ")]
         fired = next(r for r in rows if r['stage'] == 'timer_fired')
         self.assertAlmostEqual(fired['lateness_s'], .2)
         stop = next(r for r in rows if r['stage'] == 'rpc_return' and r['method'] == 'StopMove')
         self.assertAlmostEqual(stop['elapsed_s'], 5.14)
         self.assertEqual({r['timing_id'] for r in rows}, {'a'})
 
-    def test_disabled_logs_are_silent(self):
+    def test_send_logs_work_without_optional_timing_flag(self):
         w = World()
         w.controller.timing = self.make_timing(False)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             w.start()
             w.timers[0].fire()
-        self.assertEqual(output.getvalue(), '')
+        self.assertNotIn('[LocoTiming]', output.getvalue())
+        self.assertEqual(output.getvalue().count('[LocoSend]'), 2)
+
+    def test_send_logs_measure_local_interval_without_response_wait(self):
+        w = World()
+        def delayed_move_response():
+            w.timers[0].fire(lag=.1)
+            w.now = 4.2
+        w.move_hook = delayed_move_response
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            w.start()
+        rows = [json.loads(line.removeprefix('[LocoSend] '))
+                for line in output.getvalue().splitlines()]
+        self.assertEqual([r['method'] for r in rows], ['Move', 'StopMove'])
+        stop = rows[1]
+        self.assertAlmostEqual(stop['write_gap_lower_s'], 1.1)
+        self.assertAlmostEqual(stop['write_gap_upper_s'], 1.1)
+        self.assertAlmostEqual(stop['timer_lateness_s'], .1)
+        self.assertEqual(stop['timer_to_stop_call_s'], 0.)
+        self.assertEqual(stop['requested_duration_s'], 1)
+        self.assertEqual(stop['stop_send_attempt'], 1)
+
+    def test_send_interval_bounds_include_send_call_duration(self):
+        w = World()
+        begin = w.controller.client.BeginMove
+        def slow_send(*args):
+            w.now += .2
+            return begin(*args)
+        w.controller.client.BeginMove = slow_send
+        w.stop_send_hook = lambda: setattr(w, 'now', w.now + .1)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            w.start()
+            w.timers[0].fire()
+        rows = [json.loads(line.removeprefix('[LocoSend] '))
+                for line in output.getvalue().splitlines()]
+        self.assertAlmostEqual(rows[0]['send_call_elapsed_s'], .2)
+        self.assertAlmostEqual(rows[1]['send_call_elapsed_s'], .1)
+        self.assertAlmostEqual(rows[1]['write_gap_lower_s'], .8)
+        self.assertAlmostEqual(rows[1]['write_gap_upper_s'], 1.1)
 
     def test_broken_log_output_does_not_prevent_stop(self):
         w = World()

@@ -1,5 +1,6 @@
 """Ordered locomotion writes with deadlines independent of RPC response waits."""
 import math
+import json
 import threading
 import time
 from collections import OrderedDict
@@ -22,6 +23,40 @@ class TimedMotion:
         if self.timing:
             self.timing.emit(stage, **data)
 
+    def _send_log(self, method, action_id, started, ended):
+        # Log local SDK send-call boundaries, never response arrival times.
+        action = self.actions.get(action_id)
+        record = {"action_id": action_id, "method": method,
+                  "send_start_s": started, "send_end_s": ended,
+                  "send_call_elapsed_s": ended - started}
+        if action:
+            initial = action.get("initial_move_send")
+            if method == "Move" and initial is None:
+                action["initial_move_send"] = (started, ended)
+                initial = action["initial_move_send"]
+            if initial is not None:
+                record["from_initial_move_start_s"] = started - initial[0]
+                record["from_initial_move_end_s"] = ended - initial[1]
+                # Bounds on the gap between writes occurring inside each call.
+                if method == "StopMove":
+                    record["write_gap_lower_s"] = started - initial[1]
+                    record["write_gap_upper_s"] = ended - initial[0]
+            record["requested_duration_s"] = action["duration"]
+            record["deadline_s"] = action["deadline"]
+            if method == "StopMove":
+                record["reason"] = action["reason"]
+                record["stop_send_attempt"] = action.get("stop_send_attempt", 0) + 1
+                action["stop_send_attempt"] = record["stop_send_attempt"]
+                if action["deadline"] is not None:
+                    record["stop_start_vs_deadline_s"] = started - action["deadline"]
+                if action.get("timer_fired_s") is not None:
+                    record["timer_lateness_s"] = action["timer_fired_s"] - action["deadline"]
+                    record["timer_to_stop_call_s"] = started - action["timer_fired_s"]
+        try:
+            print(f"[LocoSend] {json.dumps(record)}", flush=True)
+        except Exception:
+            pass
+
     def _begin(self, method, action_id, *args):
         started = self.clock()
         self._log("rpc_enter", method=method, timing_id=action_id, call_start_s=started)
@@ -31,8 +66,10 @@ class TimedMotion:
             self._log("rpc_exception", method=method, timing_id=action_id,
                       exception=repr(exc), elapsed_s=self.clock() - started)
             raise
+        sent = self.clock()
+        self._send_log(method, action_id, started, sent)
         self._log("rpc_sent", method=method, timing_id=action_id,
-                  send_elapsed_s=self.clock() - started)
+                  send_elapsed_s=sent - started)
 
         def response():
             try:
@@ -99,7 +136,7 @@ class TimedMotion:
                 old["status"], old["reason"] = "cancelled", "replaced"
                 old["outcome"] = self._outcome(old)
             started = self.clock()
-            action = {"id": action_id, "deadline": started + duration if duration > 0 else None,
+            action = {"id": action_id, "duration": duration, "deadline": started + duration if duration > 0 else None,
                       "timer": None, "move_ret": None, "move_done": False,
                       "updates_pending": 0, "update_ret": None,
                       "stop_ret": None, "stop_done": False, "stopping": False,
@@ -149,15 +186,18 @@ class TimedMotion:
             return result
 
     def _expire(self, action_id, deadline):
+        fired = self.clock()
         self._log("timer_fired", timing_id=action_id, timer_deadline_s=deadline,
-                  fired_s=self.clock(), lateness_s=self.clock() - deadline)
-        self.stop("duration_expired", expected_id=action_id)
+                  fired_s=fired, lateness_s=fired - deadline)
+        self.stop("duration_expired", expected_id=action_id, timer_fired_s=fired)
 
-    def stop(self, reason="command", expected_id=None, retry=False):
+    def stop(self, reason="command", expected_id=None, retry=False, timer_fired_s=None):
         with self.lock:
             action = self.active
             if expected_id is not None and (action is None or action["id"] != expected_id):
                 return {"state": "superseded", "action_id": expected_id}
+            if action and timer_fired_s is not None:
+                action["timer_fired_s"] = timer_fired_s
             owner = not action or not action["stopping"]
             # Explicit stops and guarded safety repeats send a fresh zero command.
             if action and action["stop_done"] and (expected_id is None or retry):
