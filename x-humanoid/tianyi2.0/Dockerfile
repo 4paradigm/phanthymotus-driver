@@ -15,6 +15,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         espeak-ng \
         alsa-utils \
         libasound2-dev \
+        libegl1 \
+        libgles2 \
         sshpass \
         openssh-client && \
     rm -rf /var/lib/apt/lists/*
