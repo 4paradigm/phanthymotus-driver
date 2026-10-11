@@ -1,6 +1,8 @@
 agilex-piper:
   container_name: embodied-agilex-piper
   image: __IMAGE__
+  # Required for SocketCAN and the loopback-only DDS profile, including PR deployments.
+  network_mode: host
   privileged: true
   volumes:
     - /dev:/dev
