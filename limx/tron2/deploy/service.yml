@@ -10,16 +10,16 @@ limx-tron2:
   extra_hosts:
     - "phanthy-motus:127.0.0.1"
   volumes:
-    - ${TRON2_POSE_DIR:-/opt/phanthy-motus/data/tron2-reset}:/data:ro
-    - ${TRON2_RUNTIME_DIR:-/opt/phanthy-motus/data/tron2-reset-runtime}:/runstate:rw
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${TRON2_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}:/certs/core.pem:ro
   environment:
     - TRON2_SERIAL=${TRON2_SERIAL:-}
     - TRON2_ROBOT_URL=${TRON2_ROBOT_URL:-ws://10.192.1.2:5000}
-    - TRON2_HOME_FILE=/data/home.json
-    - TRON2_COMMISSION_FILE=/data/commissioning.json
     - AGENT_CORE_URL=${TRON2_AGENT_CORE_URL:-https://phanthy-motus:15678}
     - AGENT_CORE_CA_CERT=/certs/core.pem
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONDONTWRITEBYTECODE=1
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
@@ -28,5 +28,5 @@ limx-tron2:
     options:
       max-size: "10m"
       max-file: "3"
-  stop_grace_period: 180s
+  stop_grace_period: 15s
   restart: always

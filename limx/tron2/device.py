@@ -1,234 +1,101 @@
-#!/usr/bin/env python3
-"""Commissioned fixed-pose reset, enabled by the Motus card lifecycle."""
+"""MCP discovery and always-on read-only sensor cards."""
 import asyncio
-import contextlib
-import hashlib
 import json
 import logging
 import os
-import time
-from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+from vendor import RobotReader
 
-import pose
-from motion import RobotClient, MotionFailure, preflight, plan_preview
-
-LOG = logging.getLogger('tron2-reset')
+LOG = logging.getLogger('tron2')
+VERSION = '0.4.0'
 PORT = 15791
-VERSION = '0.3.0'
-SERVER_NAME = 'LimX TRON2 Arms Reset'
-POSE_PATH = Path(os.environ.get('TRON2_HOME_FILE', '/data/home.json'))
-CONFIG_PATH = Path(os.environ.get('TRON2_COMMISSION_FILE', '/data/commissioning.json'))
-LATCH_PATH = Path('/runstate/unconfirmed-motion.json')
+SERVER_NAME = 'LimX TRON2 Read-only Sensors'
+TOPICS = {name: '/limx_tron2/' + name for name in
+          ('joint_state', 'robot_status', 'battery_state')}
+DESCRIPTIONS = {
+    'joint_state': 'TRON2 实时读取关节位置（rad/deg）、速度和力矩；名称缺失时显示索引',
+    'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
+    'battery_state': 'TRON2 电量百分比及厂家原始 BMS 参数（只读，不推测温度/电压单位）',
+}
 
 
 class Adapter:
-    def __init__(self, session, path=POSE_PATH, config_path=CONFIG_PATH,
-                 latch_path=LATCH_PATH, robot_factory=RobotClient):
-        self.session = session
-        self.path = path
+    def __init__(self, publish, settings, reader=None):
+        self.publish = publish
+        self.settings = settings
+        self.enabled = settings['enabled_cards']
+        self.reader = reader or RobotReader(settings)
         self.registered_id = None
-        self.config_path, self.latch_path = config_path, latch_path
-        self.robot_factory = robot_factory
-        self.lock = asyncio.Lock()
-        self.platform_active = False
-        self.lifecycle_epoch = 0
-        self.active_task = None
         self.core_ssl = True
-        self.stopping = False
 
-    def config(self, digest):
-        config = json.loads(self.config_path.read_text())
-        if not isinstance(config, dict) or config.get('commissioned') is not True \
-                or config.get('high_level_confirmed_by_operator') is not True \
-                or config.get('pose_sha256') != digest \
-                or not isinstance(config.get('expected_working_mode'), str) \
-                or not config['expected_working_mode']:
-            raise ValueError('Commissioning is incomplete or the recorded pose changed')
-        return config
+    def tools(self):
+        tools = []
+        for name in self.enabled:
+            tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
+                'description': DESCRIPTIONS[name],
+                'inputSchema': {'type': 'object', 'additionalProperties': False,
+                    'properties': {'action': {'type': 'string', 'enum': ['info', 'start', 'stop']}},
+                    'required': ['action']},
+                'topic_out': [{'topic': TOPICS[name], 'format': 'data/json'}]})
+        tools.append({'name': 'read_state', 'type': 'resource',
+            'description': '读取三张传感器卡片的当前缓存与接收时效；不发送机器人控制指令',
+            'inputSchema': {'type': 'object', 'additionalProperties': False,
+                'properties': {'action': {'type': 'string',
+                    'enum': ['info', 'read', 'start', 'stop'], 'default': 'read'}}}})
+        return tools
 
-    def load_pose(self):
-        raw = self.path.read_bytes()
-        data = json.loads(raw)
-        pose.validate_pose(data)
-        return data, hashlib.sha256(raw).hexdigest()
+    def snapshot(self):
+        return {name: self.reader.sample(name) for name in self.enabled}
 
-    @staticmethod
-    def tools():
-        return [{'name': 'reset_pose', 'type': 'actuator', 'multiInstance': False,
-                 'description': 'TRON 2 双臂固定姿态复位：平台开启智能控制后可执行 execute；按差值计算时间，连续反馈验收到位。只能使用已 commissioning 的目标，stop 禁用后续调用，不是急停。',
-                 'inputSchema': {'type': 'object', 'additionalProperties': False,
-                                 'properties': {'action': {'type': 'string',
-                                     'enum': ['info', 'preview', 'verify_at_home', 'status', 'execute']}},
-                                 'required': ['action'],
-                                 'x-action-params': {
-                                     'info': {'params': [], 'description': '查看已记录的复位姿态；不运动'},
-                                     'preview': {'params': [], 'description': '比较当前与复位姿态；不运动'},
-                                     'verify_at_home': {'params': [], 'description': '只检查当前双臂是否在记录姿态；不运动'},
-                                     'status': {'params': [], 'description': '直接查询厂家示教状态；不切换模式、不运动'},
-                                     'execute': {'params': [], 'description': '平台启用后，按关节差值计算时间执行 MoveJ 回到固定姿态并检查到位'}}}}]
-
-    async def direct_status(self):
-        async with self.robot_factory(self.session) as robot:
-            current, teach = await robot.status()
-        return {'robot': current['robot'], 'teach_status': teach,
-                'joint_state': current['joint_state'], 'motion_sent': False,
-                'automatic_high_level_confirmation': False}
-
-    async def clear_latch(self, body):
-        if body != {'confirm_inspected': True} or self.lock.locked():
-            raise ValueError('Inspect the robot before clearing; no operation may be running')
-        async with self.lock:
-            self.platform_active = False
-            self.lifecycle_epoch += 1
-            await self.current()  # Fresh, healthy and stationary, including head.
-            if self.latch_path.exists():
-                self.latch_path.unlink()
-            return {'armed': False, 'motion_sent': False,
-                    'note': 'Unconfirmed-operation latch cleared. No stop command was sent.'}
-
-    async def execute(self):
-        if self.stopping:
-            raise ValueError('Service is shutting down; no motion sent')
-        if self.lock.locked():
-            raise ValueError('A reset operation is already in progress')
-        async with self.lock:
-            if not self.platform_active:
-                raise ValueError('Enable intelligent control in Motus before reset; no motion sent')
-            epoch = self.lifecycle_epoch
-            if self.latch_path.exists():
-                raise ValueError('Previous operation is unconfirmed; no automatic retry')
-            home, digest = self.load_pose()
-            config = self.config(digest)
-            async def before_send(current):
-                if self.stopping or not self.platform_active or self.lifecycle_epoch != epoch:
-                    raise ValueError('Platform stopped or restarted before send; no motion sent')
-                if self.load_pose()[1] != digest or self.config(digest) != config:
-                    raise ValueError('Target or commissioning changed before send')
-                # Durable marker created BEFORE send; restart cannot silently retry.
-                with self.latch_path.open('x') as file:
-                    json.dump({'pose_sha256': digest, 'attempted_at': time.time()}, file)
-                    file.flush()
-                    os.fsync(file.fileno())
-                directory = os.open(str(self.latch_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-            try:
-                async with self.robot_factory(self.session) as robot:
-                    result = await robot.move_and_verify(home, config, before_send)
-            except MotionFailure:
-                raise
-            except (OSError, ValueError, TypeError, KeyError, aiohttp.ClientError, TimeoutError) as exc:
-                # A transport-close error after a successful send is still an uncertain result.
-                raise MotionFailure(str(exc), self.latch_path.exists()) from exc
-            try:
-                self.latch_path.unlink()
-            except OSError as exc:
-                raise MotionFailure('Arrived, but durable latch could not be cleared: ' + str(exc), True) from exc
-            result['pose_sha256'] = digest
-            return result
-
-    async def operator(self, request):
-        try:
-            body = await request.json()
-            if request.match_info['operation'] == 'clear':
-                result = await self.clear_latch(body)
-            else:
-                raise ValueError('Unknown operator operation')
-            return web.json_response(result)
-        except (OSError, ValueError, TypeError, KeyError, aiohttp.ClientError, TimeoutError) as exc:
-            return web.json_response({'error': str(exc), 'motion_sent': False}, status=409)
-
-    async def current(self):
-        # Self-contained: no separate prototype/read-only container is required.
-        async with self.robot_factory(self.session) as robot:
-            state, _teach = await robot.ready_state()
-        pose.validate_snapshot(state)
-        return state
-
-    async def call(self, args):
-        if not isinstance(args, dict) or 'action' not in args:
-            raise ValueError('An action object is required')
-        # Agent Core sends the canvas card ID on start, info, stop and manual
-        # calls. It is routing metadata, never a robot joint or motion setting.
-        unknown = set(args) - {'action', 'instance_id'}
-        if unknown:
-            raise ValueError('Unsupported parameter keys: ' +
-                             ', '.join(sorted(str(k)[:64] for k in unknown)) +
-                             '; custom target angles are forbidden')
+    def call(self, name, args):
+        if not isinstance(args, dict) or set(args) - {'action', 'instance_id'}:
+            raise ValueError('Only action and canvas instance_id are accepted')
         instance = args.get('instance_id', '')
-        if not isinstance(instance, str) or len(instance) > 128 or \
-                any(ord(c) < 32 or ord(c) == 127 for c in instance):
-            raise ValueError('instance_id must be a short canvas card identifier')
-        action = args['action']
+        if not isinstance(instance, str) or len(instance) > 128 or any(
+                ord(c) < 32 or ord(c) == 127 for c in instance):
+            raise ValueError('Invalid canvas instance_id')
+        action = args.get('action', 'read' if name == 'read_state' else None)
         if not isinstance(action, str):
-            raise ValueError('action must be a string')
-        if action in ('start', 'stop'):
-            if action == 'start':
-                if self.stopping:
-                    raise ValueError('Service is shutting down')
-                home, digest = self.load_pose()
-                self.config(digest)
-                self.platform_active = True
-            else:
-                self.platform_active = False
-            self.lifecycle_epoch += 1
-            return {'state': 'executing' if self.lock.locked() else
-                            ('ready' if action == 'start' else 'idle'),
-                    'platform_active': self.platform_active,
-                    'motion_enabled': self.platform_active and not self.latch_path.exists(),
-                    'motion_sent': False, 'operation_in_progress': self.lock.locked(),
-                    'note': 'Lifecycle controls future requests; stop does NOT stop physical motion.'}
-        if action == 'status':
-            if self.lock.locked():
-                raise ValueError('Operation in progress')
-            return await self.direct_status()
-        if action == 'execute':
-            if self.active_task is not None and not self.active_task.done():
-                raise ValueError('Operation in progress; do not retry')
-            # Keep completion monitoring alive if the HTTP caller disconnects/cancels.
-            self.active_task = asyncio.create_task(self.execute())
-            self.active_task.add_done_callback(lambda task: task.exception()
-                if not task.cancelled() else None)
-            return await asyncio.shield(self.active_task)
-        if action not in ('info', 'preview', 'verify_at_home'):
-            raise ValueError('Unsupported action')
-        home, digest = self.load_pose()
+            raise ValueError('An action string is required')
+        if name == 'read_state':
+            if action in ('start', 'stop'):
+                return {'state': 'ready' if action == 'start' else 'idle', 'read_only': True}
+            if action not in ('info', 'read'):
+                raise ValueError('Unsupported read-only action')
+            return {'read_only': True, 'samples': self.snapshot()}
+        if name not in self.enabled:
+            raise ValueError('Unknown tool; this driver exposes only parameter readers')
+        if action not in ('info', 'start', 'stop'):
+            raise ValueError('Unsupported sensor action')
+        # Single-instance sensors remain on; lifecycle calls do not affect the robot.
+        result = {'state': 'idle' if action == 'stop' else 'running', 'read_only': True,
+                  'always_on': True, 'topic_out': [{'topic': TOPICS[name], 'format': 'data/json'}]}
         if action == 'info':
-            return {'accid': home['accid'], 'target_q': home['target_q'],
-                    'joint_names': home['joint_names'], 'unit': 'rad',
-                    'recorded_at': home['recorded_at'], 'pose_sha256': digest,
-                    'state': 'ready', 'motion_enabled': False, 'motion_sent': False,
-                    'scope': 'arms_only', 'head_policy': 'unchanged', 'gripper_policy': 'unchanged'}
-        current = await self.current()
-        result = plan_preview(home, current)
-        result.update({'pose_sha256': digest, 'motion_enabled': False,
-                       'working_mode': current['robot'].get('working_mode'),
-                       'working_mode_valid': current['robot'].get('working_mode_valid')})
-        if action == 'verify_at_home':
-            result['status'] = 'observation_only'
-            result['tolerance_deg'] = 1.0
-            result['at_home'] = result['max_joint_change_deg'] <= 1.0
+            result['sample'] = self.reader.sample(name)
         return result
+
+    async def publish_loop(self):
+        while True:
+            for name, data in self.snapshot().items():
+                self.publish(TOPICS[name], data)
+            await asyncio.sleep(self.settings['poll_interval_seconds'])
 
     async def rpc(self, request):
         try:
             body = await request.json()
         except (ValueError, UnicodeError):
             return web.json_response({'jsonrpc': '2.0', 'id': None,
-                                      'error': {'code': -32700, 'message': 'Parse error'}})
+                'error': {'code': -32700, 'message': 'Parse error'}})
         if not isinstance(body, dict) or body.get('jsonrpc') != '2.0':
             return web.json_response({'jsonrpc': '2.0', 'id': None,
-                                      'error': {'code': -32600, 'message': 'Invalid request'}})
+                'error': {'code': -32600, 'message': 'Invalid request'}})
         if 'id' not in body:
             return web.Response(status=204)
         rid, method = body['id'], body.get('method')
+        params = body.get('params', {})
         try:
-            params = body.get('params', {})
             if not isinstance(params, dict):
                 raise ValueError('Parameters must be an object')
             if method == 'initialize':
@@ -241,71 +108,53 @@ class Adapter:
             elif method == 'ping':
                 result = {}
             elif method == 'tools/call':
-                if params.get('name') != 'reset_pose':
-                    raise ValueError('Unknown tool')
                 try:
-                    data = await self.call(params.get('arguments', {}))
+                    data = self.call(params.get('name'), params.get('arguments', {}))
                     error = False
-                except MotionFailure as exc:
-                    data, error = {'error': str(exc)[:300],
-                        'motion_sent': 'unknown' if exc.attempted else False,
-                        'motion_attempted': exc.attempted,
-                        'arrival_verified': False,
-                        'operator_inspection_required': exc.attempted,
-                        'automatic_retry': False}, True
-                except (OSError, ValueError, TypeError, KeyError, aiohttp.ClientError,
-                        TimeoutError) as exc:
-                    data, error = {'error': str(exc)[:300], 'motion_sent': False}, True
+                except (ValueError, TypeError) as exc:
+                    data, error = {'error': str(exc)[:240], 'read_only': True}, True
                 result = {'content': [{'type': 'text', 'text': json.dumps(data,
                            ensure_ascii=False, allow_nan=False)}], 'isError': error}
             else:
                 return web.json_response({'jsonrpc': '2.0', 'id': rid,
-                         'error': {'code': -32601, 'message': 'Method not found'}})
+                    'error': {'code': -32601, 'message': 'Method not found'}})
             return web.json_response({'jsonrpc': '2.0', 'id': rid, 'result': result})
         except (ValueError, TypeError) as exc:
             return web.json_response({'jsonrpc': '2.0', 'id': rid,
-                         'error': {'code': -32602, 'message': str(exc)}})
+                'error': {'code': -32602, 'message': str(exc)[:240]}})
 
     async def health(self, request):
-        try:
-            home, digest = self.load_pose()
-            enabled = self.platform_active and not self.stopping
-            return web.json_response({'pose_valid': True, 'pose_sha256': digest,
-                                      'accid': home['accid'],
-                                      'motion_enabled': enabled and not self.latch_path.exists(),
-                                      'motion_capability': True, 'version': VERSION,
-                                      'armed': False, 'platform_active': enabled,
-                                      'unconfirmed_operation': self.latch_path.exists(),
-                                      'operation_in_progress': self.lock.locked(),
-                                      'registered_mcp_id': self.registered_id})
-        except (OSError, ValueError, TypeError) as exc:
-            return web.json_response({'pose_valid': False, 'error': str(exc), 'version': VERSION,
-                'armed': False, 'platform_active': False, 'motion_enabled': False,
-                'operation_in_progress': self.lock.locked(),
-                'unconfirmed_operation': self.latch_path.exists(),
-                'registered_mcp_id': self.registered_id}, status=503)
+        samples = self.snapshot()
+        ready = all(s['available'] for s in samples.values())
+        return web.json_response({'version': VERSION, 'read_only': True, 'ready': ready,
+            'robot_connected': self.reader.connected, 'registered_mcp_id': self.registered_id,
+            'last_connection_error': self.reader.last_error,
+            'round_trip_seconds': self.reader.last_round_trip, 'samples': samples},
+            status=200 if ready else 503)
 
-    async def register(self):
+    async def register_loop(self, session):
         last = None
+        url = os.environ.get('AGENT_CORE_URL', 'https://phanthy-motus:15678').rstrip('/')
         while True:
             try:
-                async with self.session.post(os.environ.get('AGENT_CORE_URL', 'https://phanthy-motus:15678').rstrip('/') + '/api/mcp',
-                     ssl=self.core_ssl, allow_redirects=False, json={
-                         'name': SERVER_NAME, 'transport': 'http',
-                         'url': 'http://127.0.0.1:15791/mcp', 'category': 'driver',
-                         'render_hint': 'data/json'}) as resp:
-                    if resp.status != 200:
-                        raise ValueError('Core HTTP ' + str(resp.status))
-                    result = await resp.json()
-                if result.get('code') != 200 or not result.get('data', {}).get('id'):
-                    raise ValueError('Core registration failed')
-                self.registered_id = result['data']['id']
+                async with session.post(url + '/api/mcp', ssl=self.core_ssl,
+                        allow_redirects=False, json={'name': SERVER_NAME, 'transport': 'http',
+                        'url': 'http://127.0.0.1:15791/mcp', 'category': 'driver',
+                        'render_hint': 'data/json'}) as response:
+                    if response.status != 200:
+                        raise ValueError('Core registration HTTP ' + str(response.status))
+                    body = await response.json()
+                if body.get('code') != 200 or not isinstance(body.get('data'), dict) \
+                        or not body['data'].get('id'):
+                    raise ValueError('Core registration did not return an ID')
+                self.registered_id = body['data']['id']
                 if last != 'ok':
-                    LOG.info('Registered with Motus: %s', self.registered_id)
+                    LOG.info('Registered sensor driver with Motus')
                 last = 'ok'
-            except (OSError, ValueError, TypeError, aiohttp.ClientError, TimeoutError) as exc:
+            except (OSError, ValueError, TypeError, AttributeError, aiohttp.ClientError,
+                    asyncio.TimeoutError) as exc:
                 self.registered_id = None
                 if last != 'error':
-                    LOG.warning('Registration pending: %s', str(exc)[:240])
+                    LOG.warning('Core registration pending (%s)', type(exc).__name__)
                 last = 'error'
             await asyncio.sleep(30 if last == 'ok' else 5)

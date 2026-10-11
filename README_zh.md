@@ -14,7 +14,7 @@
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
 | `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
 | `chasing/qianjiao_p200_pro` | 潜行科技潜鲛 P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF 运动控制、锁定/解锁、心跳和连接状态 |
-| [`limx/tron2`](limx/tron2/README.md) | 逐际动力 TRON2 双臂机器人 | 15791 | 固定姿态双臂复位、平台启用、只读预览与反馈到位验收 |
+| [`limx/tron2`](limx/tron2/README.md) | 逐际动力 TRON2 双臂机器人 | 15791 | 只读关节角（rad/deg）、机器人状态及电池参数数据流 |
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 

@@ -1,8 +1,12 @@
 mcp_port: 15791
 robot:
   url: ws://10.192.1.2:5000
-  # Set TRON2_SERIAL in the deployment environment, or set the actual serial here.
+  # Optional identity lock. Blank learns the first notified serial for this process.
   serial: ""
+  poll_interval_seconds: 0.5
+  response_timeout_seconds: 5
+  stale_after_seconds: 5
 plugins:
-  reset_pose:
-    enabled: true
+  joint_state: {enabled: true}
+  robot_status: {enabled: true}
+  battery_state: {enabled: true}

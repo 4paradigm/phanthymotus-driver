@@ -1,73 +1,88 @@
 #!/usr/bin/env python3
-"""Actual Jetson HTTP check; cannot send robot motion commands."""
+"""Read-only MCP/HTTP readiness check; does not open a robot command socket."""
 import json
-import sys
 import time
+import urllib.error
 import urllib.request
 
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+BASE = 'http://127.0.0.1:15791'
+VERSION = '0.4.0'
+CARDS = {'joint_state', 'robot_status', 'battery_state'}
 
 
-def wait_ready(timeout=20):
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
+def rpc(method, params=None):
+    req = urllib.request.Request(BASE + '/mcp', data=json.dumps({
+        'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params or {}}).encode(),
+        headers={'Content-Type': 'application/json'})
+    with OPENER.open(req, timeout=5) as response:
+        body = json.load(response)
+    if 'error' in body:
+        raise ValueError('MCP request rejected')
+    return body['result']
+
+
+def read_samples():
+    result = rpc('tools/call', {'name': 'read_state', 'arguments': {'action': 'read'}})
+    if result.get('isError'):
+        raise ValueError('Read-state request failed')
+    return json.loads(result['content'][0]['text'])['samples']
+
+
+def run_check(timeout=20):
     deadline = time.monotonic() + timeout
-    last_error = 'Service has not started'
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError('Service was not ready within ' + str(timeout)
-                               + ' seconds: ' + last_error
-                               + '; inspect the limx-tron2 service logs')
+    reason = 'Service is not ready'
+    while time.monotonic() < deadline:
         try:
-            with opener.open('http://127.0.0.1:15791/health',
-                             timeout=min(8, remaining)) as resp:
-                health = json.load(resp)
-            if not isinstance(health, dict) or health.get('pose_valid') is not True:
-                raise ValueError('Pose validation is not ready')
+            with OPENER.open(BASE + '/health', timeout=min(5, max(.1, deadline-time.monotonic()))) as response:
+                health = json.load(response)
+            if health.get('version') != VERSION or health.get('read_only') is not True:
+                raise ValueError('Wrong driver version or a non-sensor service occupies port 15791')
             if not health.get('registered_mcp_id'):
-                raise ValueError('Core registration is pending')
-            return health
+                raise ValueError('Core registration is pending; check certificate and hostname')
+            break
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            last_error = str(exc)
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(1, remaining))
-
-
-def rpc(action, **metadata):
-    payload = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
-               'params': {'name': 'reset_pose', 'arguments': {'action': action, **metadata}}}
-    req = urllib.request.Request('http://127.0.0.1:15791/mcp',
-          data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
-    with opener.open(req, timeout=12) as resp:
-        data = json.load(resp)
-    if 'error' in data or data.get('result', {}).get('isError'):
-        raise ValueError(str(data))
-    return json.loads(data['result']['content'][0]['text'])
+            reason = str(exc)[:200]
+            time.sleep(min(.5, max(0, deadline-time.monotonic())))
+    else:
+        raise ValueError(reason)
+    tools = rpc('tools/list')['tools']
+    if {tool['name'] for tool in tools} != CARDS | {'read_state'} or any(
+            tool['type'] not in ('sensor', 'resource') for tool in tools):
+        raise ValueError('Unexpected card set; no actuators may be exposed')
+    for name in CARDS:
+        for action in ('start', 'info', 'stop'):
+            result = rpc('tools/call', {'name': name,
+                'arguments': {'action': action, 'instance_id': 'readonly-check'}})
+            if result.get('isError'):
+                raise ValueError('Sensor lifecycle failed: ' + name)
+    before = read_samples()
+    time.sleep(1)
+    after = read_samples()
+    for name in CARDS:
+        if not before[name]['available'] or not after[name]['available']:
+            raise ValueError('Sensor unavailable: ' + name)
+    joint = after['joint_state']
+    if joint['received_at'] <= before['joint_state']['received_at']:
+        raise ValueError('Joint response receipt did not update')
+    values = joint['data']
+    print('PASS: only sensor/resource cards; MCP lifecycle; Core registration; periodic replies')
+    print('Joint count:', values['joint_count'])
+    print('Joint labels:', values['name_source'])
+    print('First joint positions (degrees):', values['positions_deg'][:3])
+    print('Battery (%):', after['battery_state']['data']['battery_percent'])
+    print('Read-only. Measurement timestamp clock is unverified; receipt age is reported separately.')
 
 
 if __name__ == '__main__':
     try:
-        health = wait_ready()
-        if health.get('operation_in_progress') or health.get('platform_active') or health.get('armed') or health.get('unconfirmed_operation'):
-            raise ValueError('Check requires platform control off and no active or unconfirmed motion')
-        lifecycle = rpc('start', instance_id='compat-check-card')
-        if lifecycle.get('state') != 'ready' or lifecycle.get('motion_sent') is not False:
-            raise ValueError('Canvas lifecycle check failed')
-        rpc('info', instance_id='compat-check-card')
-        result = rpc('preview', instance_id='compat-check-card')
-        rpc('stop', instance_id='compat-check-card')
-        if result.get('motion_enabled') is not False or result.get('motion_sent') is not False:
-            raise ValueError('Unexpected motion capability')
-        print('PASS: pose, fresh state, Core registration and preview')
-        print('Max joint change (degrees):', result['max_joint_change_deg'])
-        print('Planned duration (seconds):', result['duration_seconds'])
-        print('Reported working mode:', result.get('working_mode'))
-        if health.get('version') != '0.3.0' or health.get('motion_capability') is not True:
-            raise ValueError('The expected control version is not running')
-        print('Control implementation is present; no motion sent by this check.')
-        print('PASS: canvas instance_id with start, info, preview and stop')
-        print('Platform authorization: start/stop lifecycle; no local arm required')
-        print('Unconfirmed operation:', health.get('unconfirmed_operation'))
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-        print('CHECK FAILED:', str(exc), file=sys.stderr)
-        sys.exit(1)
+        run_check()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SystemExit('CHECK FAILED: ' + str(exc))
