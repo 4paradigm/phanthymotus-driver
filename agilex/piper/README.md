@@ -29,7 +29,7 @@ Mac 通过 AVFoundation 选择名称包含 RealSense 的设备，**不会自动�
 仅开放深度/红外、画面无彩色信息或相机权限不足时会报错。
 Mac 不启动 ROS，照片在本地页面显示；`dds_published=false` 如实说明未发布 DDS。
 Ubuntu 的 DDS 显示已用明确标记的文件测试图在真实画布验证，详见验收记录。
-本次用户要求自己提供照片；后续使用文件导入，不调用相机。
+用户最初要求自己提供照片，后续已明确要求恢复真实相机拍照；文件导入仍可使用。
 已观察到部分 USB-CAN 关闭重开后需拔插 Mac 一侧 USB 才能恢复；重连稳定性尚未验收。
 
 可传 `--usb-index 0 --port 15741 --data-dir /path/to/acceptance`。
@@ -146,7 +146,10 @@ python3 agilex/piper/deploy/diagnose.py --query-firmware --output ubuntu-readonl
 保存新的 JPEG/JSON 并发布同一 DDS 图像话题；元数据明确 `source=user_provided`、
 `camera_accessed=false`、`captured_at=null`，不冒充实时采集或当前姿态。
 导入不会连接 CAN；与其它物理操作共用互斥锁，支持卡片停止及 ACP 完成回报。
-`PIPER_CAMERA_ENABLED` 默认 `0`，`capture` 在启动采集子进程前拒绝；只有取得新的明确授权后才能在部署端设置为 `1`，每次调用还须 `forward_view_confirmed=true`。
+`PIPER_CAMERA_ENABLED` 默认 `0`，`capture` 在启动采集子进程前拒绝；用户明确要求使用真实相机后，可在部署端设置为 `1`。
+在照片卡片选择 `capture`，将 `CAPTURE_CONFIRMED=true` 后执行，即拍摄当前画面一张，保存 JPEG/JSON 并发布 DDS。
+无需把相机调整到某个固定方向，也不会自动移动机械臂。每次拍照需确认，启动和重启不自动采集，不开启持续视频流。
+旧字段 `forward_view_confirmed` 仅作可选朝向记录，不能代替本次拍照确认。相机许可与运动许可独立。
 用户未重新授权前不执行 `capture`；诊断脚本默认不拍照，不传 `--photos`。
 
 Bot 的仓库通用构建默认可能为 arm64，**必须 inspect 镜像为 amd64 后才可部署到该 Ubuntu**。

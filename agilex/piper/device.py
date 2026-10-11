@@ -130,11 +130,13 @@ class PiperPlugin:
             "start": ([], "Ready; no capture or arm motion"),
             "stop": ([], "Cancel in-flight operation"),
             "info": ([], "Camera output topic"),
-            "capture": (["forward_view_confirmed"],
-                        "Capture current RGB view without moving the arm; confirm forward view for this shot only"),
+            "capture": (["capture_confirmed"],
+                        "拍摄当前相机 RGB 画面一张，保存并显示；确认本次拍照，不移动机械臂"),
             "import_photo": (["filename"], "保存并显示用户提供的照片；只读取数据目录 imports 下的文件，不调用相机"),
-        }, {"forward_view_confirmed": {"type": "boolean", "enum": [False, True], "default": False,
-             "description": "Operator has verified current arm/camera orientation, not a persistent calibration"},
+        }, {"capture_confirmed": {"type": "boolean", "enum": [False, True], "default": False,
+             "description": "确认允许本次拍摄当前画面；不调整机械臂或相机朝向"},
+            "forward_view_confirmed": {"type": "boolean", "enum": [False, True], "default": False,
+             "description": "旧版可选朝向记录；不能代替本次 capture_confirmed 拍照确认"},
             "filename": {"type": "string", "description": "imports 目录中的 JPEG/PNG 文件名，不含路径"}})
         camera_schema["additionalProperties"] = False
         # Camera is mounted on the wrist: prevent capture during an arm move.
@@ -707,9 +709,8 @@ class PiperPlugin:
     def capture(self, args):
         if not self.camera_enabled:
             raise RuntimeError("相机采集默认关闭；取得新的明确授权后在部署端设置 PIPER_CAMERA_ENABLED=1")
-        confirm(args, "forward_view_confirmed")
-        forward = args.get("forward_view_confirmed", False)
-        if type(forward) is not bool:
+        confirm(args, "capture_confirmed")
+        if "forward_view_confirmed" in args and type(args["forward_view_confirmed"]) is not bool:
             raise ValueError("forward_view_confirmed must be a boolean")
         cfg = self.config.get("camera", {})
         warmup = number(cfg, "warmup_seconds", 3, 0.1, 10)
@@ -740,7 +741,9 @@ class PiperPlugin:
             info = json.loads(stdout)
             info.pop("device", None)  # Do not publish the USB serial in card output.
             info.update(captured_at=datetime.now(timezone.utc).isoformat(), dds_published=self.ros2 is not None,
-                        forward_view_confirmed=forward, arm_moved=False)
+                        capture_confirmed=True, camera_accessed=True, arm_moved=False)
+            if "forward_view_confirmed" in args:
+                info["forward_view_confirmed"] = args["forward_view_confirmed"]
             if self.driver is not None:
                 try:
                     info["arm_state"] = asdict(self.read_state())

@@ -137,7 +137,7 @@ class PiperCardsTests(unittest.TestCase):
         child = Child()
         with patch("agilex.piper.device.subprocess.Popen", return_value=child):
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
-                self.bundle.dispatch("piper_photo", {"action": "capture", "forward_view_confirmed": True})
+                self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": True})
         self.assertTrue(child.killed)
         self.assertFalse(list(Path(self.tmp.name).glob("*.jpg")))
         self.assertIsNone(plugin.driver)
@@ -155,9 +155,11 @@ class PiperCardsTests(unittest.TestCase):
             def poll(self):
                 return 0
         with patch("agilex.piper.device.subprocess.Popen", Child):
-            result = self.bundle.dispatch("piper_photo", {"action": "capture", "forward_view_confirmed": True})
+            result = self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": True})
         self.assertNotIn("device", result)
-        self.assertTrue(result["forward_view_confirmed"])
+        self.assertTrue(result["capture_confirmed"])
+        self.assertTrue(result["camera_accessed"])
+        self.assertNotIn("forward_view_confirmed", result)
         self.assertFalse(result["arm_moved"])
         self.assertEqual(result["topic_out"][0]["format"], "image/jpeg")
         self.assertTrue(Path(result["output"]).with_suffix(".json").exists())
@@ -166,13 +168,23 @@ class PiperCardsTests(unittest.TestCase):
     def test_capture_requires_host_permission_and_current_shot_confirmation(self):
         with patch("agilex.piper.device.subprocess.Popen") as camera:
             with self.assertRaisesRegex(RuntimeError, "默认关闭"):
-                self.bundle.dispatch("piper_photo", {"action": "capture", "forward_view_confirmed": True})
+                self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": True})
             self.plugin.camera_enabled = True
             for value in (None, False, "true", 1):
                 with self.subTest(value=value), self.assertRaises(ValueError):
-                    self.bundle.dispatch("piper_photo", {"action": "capture", "forward_view_confirmed": value})
+                    self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": value})
+            with self.assertRaisesRegex(ValueError, "capture_confirmed"):
+                self.bundle.dispatch("piper_photo", {"action": "capture", "forward_view_confirmed": True})
+            with self.assertRaisesRegex(ValueError, "forward_view_confirmed"):
+                self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": True,
+                                                     "forward_view_confirmed": "true"})
         camera.assert_not_called()
         self.assertIsNone(self.plugin.driver)
+
+    def test_capture_card_exposes_current_shot_confirmation(self):
+        schema = next(t["inputSchema"] for t in self.plugin.get_tools() if t["name"] == "piper_photo")
+        self.assertEqual(schema["x-action-params"]["capture"]["params"], ["capture_confirmed"])
+        self.assertFalse(schema["properties"]["capture_confirmed"]["default"])
 
     def test_import_photo_saves_decodable_jpeg_without_camera_or_can(self):
         import cv2
