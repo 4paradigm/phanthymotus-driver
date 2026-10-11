@@ -447,7 +447,8 @@ class PiperDriver:
                 "delta_deg": delta, "speed_deg_s": speed_deg_s, "speed_pct": speed_pct,
                 "duration_seconds": 1.5 * max(map(abs, delta)) / speed_deg_s}
 
-    def move_joints(self, target, speed_deg_s=1., speed_pct=5):
+    def _move_joint_target(self, target, speed_deg_s=1., speed_pct=5):
+        """Internal interpolation for move_joint; other axes hold their feedback."""
         from agilex.piper.control import ready_to_move
         plan = self.joint_plan(target, speed_deg_s, speed_pct)
         start = tuple(round(v * 1000) for v in plan["start_deg"])
@@ -625,108 +626,15 @@ class PiperDriver:
             time.sleep(.05)
         raise RuntimeError("未确认夹爪失能，请读取状态")
 
-    def move_j1_to(self, target_deg, speed_pct=10, take_control=False):
-        """Move J1 by at most 12 degrees, verify feedback, then hold target."""
-        if type(speed_pct) is not int or not 1 <= speed_pct <= 10:
-            raise ValueError("速度百分比必须在 1–10")
-        if isinstance(target_deg, bool) or not isinstance(target_deg, (int,float)) or not math.isfinite(target_deg):
-            raise ValueError("J1 target must be finite")
-        base, state = self._healthy()
-        from agilex.piper.control import ready_to_move
-        ready_to_move(state)
-        if tuple(base) != self._bounded_target(base):
-            raise RuntimeError("Current pose exceeds SDK limits; run prepare first")
-        target_raw = round(target_deg * 1000)
-        delta = target_raw - base[0]
-        if abs(delta) < 100 or abs(delta) > 12000:
-            raise ValueError("单次 J1 目标必须距当前角度 0.1–12°")
-        if not -140000 <= target_raw <= 140000:
-            raise ValueError("J1 目标超出本驱动的 ±140° 范围")
-        if any(state.enabled) and not all(state.enabled):
-            raise RuntimeError("只有部分关节使能，拒绝运动")
-        if not state.control_mode.startswith("CAN_CTRL"):
-            raise RuntimeError(f"当前处于 {state.control_mode}，拒绝由 J1 命令切换到 CAN 控制")
-        if not all(state.enabled):
-            raise RuntimeError("六关节未全部使能，请先运行 prepare 预览并执行初始化")
-        if all(state.enabled) and not take_control:
-            raise RuntimeError("机械臂已被使能；确认没有其它控制程序后使用 take_control=True")
-
-        target = list(base)
-        def command():
-            actual, feedback = self._healthy()
-            if not all(feedback.enabled) or not feedback.control_mode.startswith("CAN_CTRL"):
-                raise RuntimeError("Motion lost enabled CAN control")
-            if abs(actual[0] - base[0]) > abs(delta) + 2000:
-                raise RuntimeError("J1 overshot the bounded motion envelope")
-            if any(abs(actual[k] - base[k]) > 5000 for k in range(1, 6)):
-                raise RuntimeError("Another joint moved outside the hold envelope")
-            self._command(target, speed_pct, expected_enabled=(True,) * 6)
-
-        def ramp(start, finish, seconds):
-            steps = round(seconds / 0.05)
-            for i in range(1, steps + 1):
-                target[0] = round(start + (finish - start) * i / steps)
-                command()
-                actual, feedback = self._healthy()
-                if not all(feedback.enabled) or not feedback.control_mode.startswith("CAN_CTRL"):
-                    raise RuntimeError("Motion lost enabled CAN control")
-                if abs(actual[0] - base[0]) > abs(delta) + 2000:
-                    raise RuntimeError("J1 实际角度越过目标范围")
-                if any(abs(actual[k] - base[k]) > 5000 for k in range(1, 6)):
-                    raise RuntimeError("其它关节偏移超过 5°")
-                time.sleep(0.05)
-
-        try:
-            for _ in range(10):
-                command()
-                time.sleep(0.05)
-            first = base[0] + (1000 if delta > 0 else -1000)
-            if abs(delta) < 1000:
-                first = target_raw
-            ramp(base[0], first, 3)
-            until = time.monotonic() + 2
-            while time.monotonic() < until:
-                command()
-                time.sleep(0.05)
-            actual, _ = self._healthy()
-            if abs(actual[0] - base[0]) < max(100, abs(first - base[0]) * 0.3):
-                raise RuntimeError("首段动作没有得到足够的关节反馈")
-
-            if first != target_raw:
-                ramp(first, target_raw, max(3, abs(target_raw - first) / 1000))
-            deadline = time.monotonic() + 5
-            near_since = None
-            while time.monotonic() < deadline:
-                command()
-                actual, feedback = self._healthy()
-                if not all(feedback.enabled) or not feedback.control_mode.startswith("CAN_CTRL"):
-                    raise RuntimeError("Motion lost enabled CAN control")
-                if abs(actual[0] - target_raw) <= 500:
-                    if near_since is None:
-                        near_since = time.monotonic()
-                    elif time.monotonic() - near_since >= .5:
-                        return self.get_state()
-                else:
-                    near_since = None
-                time.sleep(0.05)
-            raise RuntimeError("5 秒内未到达 J1 目标 ±0.5°")
-        except BaseException:
-            self._hold_on_error(speed_pct)
-            raise
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("status", "prepare", "hold", "move-j1-to", "disable",
+    parser.add_argument("command", choices=("status", "prepare", "hold", "disable",
                                             "home-check", "home-guide"))
     parser.add_argument("--can", default="can0")
-    parser.add_argument("--target-deg", type=float)
     parser.add_argument("--speed", type=int, default=10)
     parser.add_argument("--execute", action="store_true", help="执行 prepare；默认仅预览")
     parser.add_argument("--workspace-clear", action="store_true", help="现场有人、底座固定、活动范围清空")
     parser.add_argument("--allow-limit-adjustment", action="store_true", help="允许预览显示的不超过 3° 的 SDK 边界修正")
-    parser.add_argument("--take-control", action="store_true",
-                        help="确认当前使能无人控制后接管")
     parser.add_argument("--arm-supported", action="store_true",
                         help="现场人员已扶稳机械臂，允许解除使能")
     parser.add_argument("--tolerance-deg", type=float, default=2.0,
@@ -749,10 +657,6 @@ def main():
             state = driver.factory_zero_status(args.tolerance_deg)
         elif args.command == "home-guide":
             state = driver.guide_factory_zero(args.seconds, args.tolerance_deg)
-        else:
-            if args.target_deg is None:
-                parser.error("move-j1-to 需要 --target-deg")
-            state = driver.move_j1_to(args.target_deg, args.speed, args.take_control)
     except (RuntimeError, ValueError, KeyboardInterrupt) as exc:
         raise SystemExit(str(exc)) from exc
     print(json.dumps(asdict(state) if isinstance(state, ArmState) else state,

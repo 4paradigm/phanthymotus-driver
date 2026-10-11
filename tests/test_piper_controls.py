@@ -233,20 +233,21 @@ class ControlsTests(unittest.TestCase):
                 self.assertIn("preview_id", result)
         self.assertEqual(self.sdk.calls, [])
 
-    def test_two_joint_move_is_previewed_bounded_and_stable(self):
-        args = dict(j1_deg=2,j2_deg=11,j3_deg=-10,j4_deg=0,j5_deg=20,j6_deg=0)
-        preview = self.call("arm", "move_joints", **args)
+    def test_single_joint_move_is_previewed_bounded_and_stable(self):
+        args = dict(joint=1,target_deg=2)
+        preview = self.call("arm", "move_joint", **args)
         self.assertEqual(self.sdk.calls, [])
-        result = self.run_fast(lambda: self.call("arm", "move_joints", **args, execute=True,
+        result = self.run_fast(lambda: self.call("arm", "move_joint", **args, execute=True,
                                preview_id=preview["preview_id"],workspace_clear=True,take_control=True))
         self.assertTrue(result["executed"])
         targets = [c[1] for c in self.sdk.calls if c[0] == "joints"]
-        self.assertEqual(targets[-1], (2000,11000,-10000,0,20000,0))
+        self.assertEqual(targets[-1], (2000,10000,-10000,0,20000,0))
         self.assertTrue(all(abs(b[0]-a[0]) <= 101 for a,b in zip(targets,targets[1:])))
+        self.assertTrue(all(t[1:] == (10000,-10000,0,20000,0) for t in targets))
         self.assertTrue(all(c[3] <= 10 for c in self.sdk.calls if c[0] == "mode"))
         count = len(self.sdk.calls)
         with self.assertRaises(RuntimeError):
-            self.call("arm", "move_joints", **args, execute=True, workspace_clear=True,take_control=True)
+            self.call("arm", "move_joint", **args, execute=True, workspace_clear=True,take_control=True)
         self.assertEqual(len(self.sdk.calls),count)
 
     def test_expired_drifted_changed_or_wrong_preview_emits_zero_commands(self):
@@ -392,7 +393,7 @@ class ControlsTests(unittest.TestCase):
         self.assertEqual(self.sdk.calls, [])
 
     def test_independent_stops_and_status_during_action(self):
-        with self.plugin.operation("piper_arm","move_joints"):
+        with self.plugin.operation("piper_arm","move_joint"):
             self.assertEqual(self.call("status","read")["error_code"],0)
             self.call("photo","stop")
             self.call("gripper","stop")
@@ -418,7 +419,7 @@ class ControlsTests(unittest.TestCase):
                     self.sdk.mode = "TEACHING_MODE(0x2)"
             with patch("agilex.piper.arm.time.sleep",side_effect=interrupt), patch("agilex.piper.arm.time.monotonic",side_effect=self.clock):
                 with self.assertRaises(RuntimeError):
-                    self.driver.move_joints((2,11,-10,0,20,0))
+                    self.driver._move_joint_target((2,10,-10,0,20,0))
             self.assertLess(self.sdk.raw[0],2000)
             self.assertTrue(all(self.sdk.enabled))
             if kind == "mode":
@@ -427,7 +428,7 @@ class ControlsTests(unittest.TestCase):
     def test_unresponsive_joints_and_gripper_timeout(self):
         self.sdk.follow = False
         with self.assertRaisesRegex(RuntimeError,"超时"):
-            self.run_fast(lambda: self.driver.move_joints((3,10,-10,0,20,0)))
+            self.run_fast(lambda: self.driver._move_joint_target((3,10,-10,0,20,0)))
         self.sdk.calls.clear()
         with self.assertRaisesRegex(RuntimeError,"未确认到位"):
             self.run_fast(lambda: self.driver.move_gripper(30))

@@ -6,7 +6,7 @@ hardware_model: piper
 image_name: agilex-piper
 port: 15741
 mcp_url: "http://localhost:15741/mcp"
-description: "PiPER 单臂：状态、模式切换/按键引导、六关节低速运动与停放位、夹爪、D435 RGB 拍照。默认关闭运动权限。"
+description: "PiPER 单臂：状态、模式切换/按键引导、单轴低速运动、夹爪、D435 RGB 拍照。默认关闭运动权限。"
 build_context_extras:
   - ../../common
 cards:

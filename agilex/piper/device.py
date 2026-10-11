@@ -92,21 +92,14 @@ class PiperPlugin:
             "info": ([], "Driver configuration and busy state"),
             "prepare": (["execute", "preview_id", "workspace_clear", "allow_limit_adjustment", "speed_pct"],
                         "Preview first; explicit execution enables at measured pose"),
-            "move_j1": (["target_deg", "speed_pct", "workspace_clear", "take_control"],
-                        "Absolute J1 target, at most 12 degrees from current angle; then hold"),
             "disable": (["arm_supported"], "Release all six motors only with physical support"),
-            "save_default": (["confirm_save"], "Save current feedback as local parking pose; no motion"),
-            "return_default": (["execute", "preview_id", "speed_pct", "workspace_clear", "take_control"],
-                               "Preview/return J1 only if J2-J6 already match saved pose within 1 degree"),
             "move_joint": (["joint", "target_deg", "speed_deg_s", "speed_pct", "execute", "preview_id", "workspace_clear", "take_control"], "单轴绝对角度（度）；先预览，再执行"),
-            "move_joints": (["j1_deg", "j2_deg", "j3_deg", "j4_deg", "j5_deg", "j6_deg", "speed_deg_s", "speed_pct", "execute", "preview_id", "workspace_clear", "take_control"], "六关节绝对角度（度）；每轴最多 12°，先预览"),
-            "return_pose": (["execute", "preview_id", "speed_deg_s", "speed_pct", "workspace_clear", "take_control"], "返回保存的六关节停放位；超过 12° 时请分段移动"),
             "hold": (["workspace_clear", "take_control"], "保持当前反馈姿态；不失能"),
         }
         flags = {key: {"type": "boolean", "enum": [False, True], "default": False} for key in (
             "execute", "workspace_clear", "allow_limit_adjustment", "take_control", "arm_supported", "confirm_save",
             "other_controllers_stopped", "object_supported", "query_firmware")}
-        schema = action_schema(actions, {**flags,
+        schema = action_schema(actions, {**{key: value for key, value in flags.items() if key != "confirm_save"},
             "target_deg": {"type": "number", "minimum": -180, "maximum": 180},
             "speed_pct": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
             "speed_deg_s": {"type": "number", "minimum": .5, "maximum": 5, "default": 1},
@@ -114,7 +107,6 @@ class PiperPlugin:
             # JSON numbers. Keep this an integer input so strict validation works.
             "joint": {"type": "integer", "minimum": 1, "maximum": 6, "default": 1},
             "preview_id": {"type": "string", "description": "预览返回的编号；留空使用最近一次预览"},
-            **{f"j{i}_deg": {"type": "number", "minimum": -180, "maximum": 180} for i in range(1,7)},
         })
         schema["additionalProperties"] = False
         if self.config.get("can_transport", "socketcan") == "socketcan":
@@ -125,7 +117,7 @@ class PiperPlugin:
         schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
-        schema["x-completion"] = {"actions": ["prepare", "move_j1", "return_default", "move_joint", "move_joints", "return_pose"], "timeout": 60}
+        schema["x-completion"] = {"actions": ["prepare", "move_joint"], "timeout": 60}
         camera_schema = action_schema({
             "start": ([], "Ready; no capture or arm motion"),
             "stop": ([], "Cancel in-flight operation"),
@@ -176,7 +168,7 @@ class PiperPlugin:
                      "reconnect": ([], "重新连接，废弃预览；不使能、不重放动作"),
                  }, {})),
             tool("piper_mode", "actuator", "模式检查与切换；使能、失能、故障分别处理", mode_schema),
-            tool("piper_arm", "actuator", "初始化、六关节低速运动与停放位；运动权限默认关闭", schema),
+            tool("piper_arm", "actuator", "初始化、单轴低速运动与保持；运动权限默认关闭", schema),
             tool("piper_gripper", "actuator", "夹爪开度与保持；默认力矩 0.5 N·m，上限 1 N·m", gripper_schema),
             tool("piper_photo", "actuator", "导入用户照片并显示，或显式拍摄 RGB；不移动机械臂",
                  camera_schema, topic_out=[{"topic": self.topic, "format": "image/jpeg"}]),
@@ -362,8 +354,8 @@ class PiperPlugin:
     def dispatch(self, action, args):
         name = args.get("_tool_name", "piper_arm")
         long_action = (name == "piper_photo" and action in {"capture", "import_photo"}
-                       or name == "piper_arm" and (action == "move_j1" or action in
-                           {"prepare", "return_default", "move_joint", "move_joints", "return_pose"} and args.get("execute") is True)
+                       or name == "piper_arm" and action in
+                           {"prepare", "move_joint"} and args.get("execute") is True
                        or name == "piper_gripper" and action in {"open", "close", "set_width"} and args.get("execute") is True)
         if long_action and self.config.get("async_actions", True):
             return self.run_async(name, action, args)
@@ -470,33 +462,27 @@ class PiperPlugin:
             return self.mode_action(action, args)
         if name == "piper_gripper":
             return self.gripper_action(action, args)
-        if action not in {"prepare", "move_j1", "disable", "save_default", "return_default", "move_joint", "move_joints", "return_pose", "hold"}:
+        if action not in {"prepare", "disable", "move_joint", "hold"}:
             raise ValueError(f"Unknown arm action: {action}")
         # Reject strings like 'false' before any hardware access.
-        for key in ("execute", "workspace_clear", "allow_limit_adjustment", "take_control", "arm_supported", "confirm_save"):
+        for key in ("execute", "workspace_clear", "allow_limit_adjustment", "take_control", "arm_supported"):
             if key in args and type(args[key]) is not bool:
                 raise ValueError(f"{key} must be a boolean")
         speed = number(args, "speed_pct", 5, 1, 10, integer=True)
         rate = number(args, "speed_deg_s", 1, .5, 5)
-        if action in {"move_joint", "move_j1"}:
-            number(args, "target_deg", None, -140 if action == "move_j1" else -180, 140 if action == "move_j1" else 180)
         if action == "move_joint":
+            number(args, "target_deg", None, -180, 180)
             number(args, "joint", 1, 1, 6, integer=True)
-        if action == "move_joints":
-            for i in range(1,7):
-                number(args, f"j{i}_deg", None, -180, 180)
         execute = args.get("execute", False)
-        if action in {"move_j1", "hold"} or (action in {"prepare", "return_default", "move_joint", "move_joints", "return_pose"} and execute):
+        if action == "hold" or (action in {"prepare", "move_joint"} and execute):
             self.motion_allowed(args)
-        if action in {"move_j1", "return_default", "move_joint", "move_joints", "return_pose", "hold"} and (action in {"move_j1", "hold"} or execute):
+        if action == "hold" or (action == "move_joint" and execute):
             confirm(args, "take_control")
         if action == "disable":
             confirm(args, "arm_supported")
             self.require_motion_permission()
-        if action == "save_default":
-            confirm(args, "confirm_save")
         with self.operation(name, action):
-            if action in {"move_j1", "hold", "disable"} or execute:
+            if action in {"hold", "disable"} or execute:
                 self.require_motion_permission()
             driver = self.connected()
             state = self.read_state()
@@ -516,60 +502,20 @@ class PiperPlugin:
                     raise
             if action == "disable":
                 return asdict(driver.disable(supported=True))
-            if action == "move_j1":
-                target = number(args, "target_deg", None, -140, 140)
-                return asdict(driver.move_j1_to(target, speed, take_control=True))
             if action == "hold":
                 ready_to_move(state)
                 return asdict(driver.hold_current(speed_pct=speed))
-            if action == "save_default":
-                pose = {"joints_deg": state.joints_deg, "saved_at": datetime.now(timezone.utc).isoformat(),
-                        "kind": "operator_parking_pose", "factory_zero": False}
-                self.data_dir.mkdir(parents=True, exist_ok=True)
-                temp = self.data_dir / "default_pose.json.tmp"
-                temp.write_text(json.dumps(pose, indent=2) + "\n", encoding="utf-8")
-                temp.replace(self.data_dir / "default_pose.json")
-                return pose
-            if action in {"move_joint", "move_joints", "return_pose"}:
-                if action == "move_joint":
-                    target = list(state.joints_deg)
-                    joint = args.get("joint", 1)
-                    target[joint-1] = args["target_deg"]
-                    params = (joint, args["target_deg"])
-                elif action == "move_joints":
-                    target = [args[f"j{i}_deg"] for i in range(1,7)]
-                    params = target
-                else:
-                    target = self.load_pose()
-                    params = target
+            if action == "move_joint":
+                target = list(state.joints_deg)
+                joint = args.get("joint", 1)
+                target[joint-1] = args["target_deg"]
+                params = (joint, args["target_deg"])
                 key = json.dumps([action, params, rate, speed])
                 plan = driver.joint_plan(target, rate, speed)
                 if not execute:
                     return {**plan, "executed": False, **self.previews.put(key, state)}
                 self.previews.consume(args.get("preview_id") or None, key, self.read_state())
-                return {"executed": True, "state": asdict(driver.move_joints(target, rate, speed))}
-            target = self.load_pose()
-            if any(abs(a-b) > 1 for a, b in zip(state.joints_deg[1:], target[1:])):
-                raise RuntimeError("J2-J6 differ from default; this driver cannot plan a six-joint return")
-            delta = target[0] - state.joints_deg[0]
-            if abs(delta) > 12 or not -140 <= target[0] <= 140:
-                raise RuntimeError("Default J1 outside the bounded return range")
-            if not execute:
-                return {"executed": False, "j1_target_deg": target[0], "j1_delta_deg": delta,
-                        "other_joints": "Already within 1 degree; held at current angles",
-                        **self.previews.put(f"return_default:{target}:{speed}", state)}
-            self.previews.consume(args.get("preview_id") or None, f"return_default:{target}:{speed}", self.read_state())
-            if abs(delta) < 0.1:
-                return {"executed": False, "already_at_default": True, "state": asdict(state)}
-            return {"executed": True, "state": asdict(driver.move_j1_to(target[0], speed, True))}
-
-    def load_pose(self):
-        pose = json.loads((self.data_dir / "default_pose.json").read_text(encoding="utf-8"))
-        target = pose["joints_deg"]
-        if (not isinstance(target, list) or len(target) != 6
-                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in target)):
-            raise ValueError("Invalid saved pose")
-        return target
+                return {"executed": True, "state": asdict(driver._move_joint_target(target, rate, speed))}
 
     def verified_teaching(self):
         return (self.firmware_version is not None

@@ -117,7 +117,7 @@ class PrepareTests(unittest.TestCase):
     def test_move_five_degrees_reaches_target_without_changing_other_joints(self):
         self.ready_to_move()
         with patch('agilex.piper.arm.time.sleep'), patch('agilex.piper.arm.time.monotonic', side_effect=self.clock):
-            result = self.d.move_j1_to(6, 5, True)
+            result = self.d._move_joint_target((6, 0, -1, 0, 30.6, 0), 1, 5)
         self.assertAlmostEqual(result.joints_deg[0], 6)
         self.assertEqual(result.joints_deg[1:], (0, -1, 0, 30.6, 0))
         self.assertTrue(all(result.enabled))
@@ -129,7 +129,7 @@ class PrepareTests(unittest.TestCase):
                 self.d.cancel_motion()
         with patch('agilex.piper.arm.time.sleep', side_effect=cancel_after_progress):
             with self.assertRaisesRegex(RuntimeError, 'cancelled'):
-                self.d.move_j1_to(6, 5, True)
+                self.d._move_joint_target((6, 0, -1, 0, 30.6, 0), 1, 5)
         self.assertLess(self.d.arm.raw[0], 2000)
         self.assertTrue(all(self.d.arm.enabled))
         self.assertEqual(self.d.arm.calls[-1], ('target', self.d.arm.raw))
@@ -140,7 +140,7 @@ class PrepareTests(unittest.TestCase):
             self.d.arm.mode = 'TEACHING_MODE(0x2)'
         with patch('agilex.piper.arm.time.sleep', side_effect=switch_to_teach):
             with self.assertRaises(RuntimeError):
-                self.d.move_j1_to(6, 5, True)
+                self.d._move_joint_target((6, 0, -1, 0, 30.6, 0), 1, 5)
         self.assertEqual(self.d.arm.mode, 'TEACHING_MODE(0x2)')
         self.assertEqual(sum(call[0] == 'mode' for call in self.d.arm.calls), 1)
 
@@ -148,7 +148,7 @@ class PrepareTests(unittest.TestCase):
         self.ready_to_move()
         for value in (float('nan'), float('inf'), 20):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                self.d.move_j1_to(value, 5, True)
+                self.d._move_joint_target((value, 0, -1, 0, 30.6, 0), 1, 5)
         self.assertEqual(self.d.arm.calls, [])
 
 

@@ -1,5 +1,4 @@
 """No hardware required: MCP contracts, exclusive ownership and fail-closed gates."""
-from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -35,10 +34,6 @@ class FakeDriver:
     def cancel_motion(self):
         self.cancelled.set()
 
-    def move_j1_to(self, target, speed, take_control):
-        self.calls.append(("move", target, speed, take_control))
-        return self.state
-
 
 class PiperCardsTests(unittest.TestCase):
     def setUp(self):
@@ -69,16 +64,15 @@ class PiperCardsTests(unittest.TestCase):
         self.assertEqual(self.plugin.driver.calls, ["connect"])
 
     def test_motion_and_boolean_validation_before_connect(self):
-        for action, args in [("move_j1", {"target_deg": 5, "workspace_clear": True, "take_control": True}),
+        for action, args in [("move_joint", {"joint": 1, "target_deg": 5, "execute": True, "workspace_clear": True, "take_control": True}),
                              ("prepare", {"execute": "false"}),
-                             ("disable", {"arm_supported": "true"}),
-                             ("save_default", {})]:
+                             ("disable", {"arm_supported": "true"})]:
             with self.subTest(action=action), self.assertRaises((RuntimeError, ValueError)):
                 self.call(action, **args)
             self.assertIsNone(self.plugin.driver)
 
     def test_resource_cannot_dispatch_a_motion_action(self):
-        result = self.bundle.dispatch("piper_status", {"action": "move_j1", "target_deg": 9})
+        result = self.bundle.dispatch("piper_status", {"action": "move_joint", "joint": 1, "target_deg": 9})
         self.assertEqual(result["error_code"], 0)
         self.assertEqual(self.plugin.driver.calls, ["connect"])
 
@@ -99,24 +93,34 @@ class PiperCardsTests(unittest.TestCase):
         self.call("start")
         self.assertEqual(self.bundle.dispatch("piper_status", {})["error_code"], 0)
 
-    def test_default_is_local_pose_and_preview_does_not_move(self):
-        pose = self.call("save_default", confirm_save=True)
-        self.assertFalse(pose["factory_zero"])
-        self.plugin.driver.state = replace(self.plugin.driver.state, joints_deg=(6., 0., -1., 0., 30., 0.))
-        preview = self.call("return_default")
-        self.assertEqual(preview["j1_delta_deg"], -5)
-        self.assertEqual(self.plugin.driver.calls, ["connect"])
+    def test_removed_arm_actions_reject_before_connect_even_with_motion_permission(self):
         self.plugin.motion_enabled = True
-        self.call("return_default", execute=True, workspace_clear=True, take_control=True)
-        self.assertEqual(self.plugin.driver.calls[-1], ("move", 1., 5, True))
+        pose = Path(self.tmp.name) / "default_pose.json"
+        original = '{"joints_deg": [1, 0, -1, 0, 30, 0]}\n'
+        pose.write_text(original)
+        for async_actions in (False, True):
+            self.plugin.config["async_actions"] = async_actions
+            for action in ("return_default", "move_j1", "return_pose", "save_default", "move_joints"):
+                for execute in (False, True):
+                    with self.subTest(action=action, execute=execute, asynchronous=async_actions):
+                        with self.assertRaisesRegex(ValueError, "Unknown arm action"):
+                            self.call(action, execute=execute, workspace_clear=True, take_control=True)
+                        self.assertIsNone(self.plugin.driver)
+                        self.assertFalse(self.plugin.gate.locked())
+                        self.assertFalse(self.plugin.last_actions)
+        self.assertEqual(pose.read_text(), original)
+        self.assertFalse(self.plugin.previews.entries)
 
-    def test_default_return_rejects_other_joint_drift_and_large_steps(self):
-        self.call("save_default", confirm_save=True)
-        for joints in [(1., 0., -1., 0., 35., 0.), (20., 0., -1., 0., 30., 0.)]:
-            self.plugin.driver.state = replace(self.plugin.driver.state, joints_deg=joints)
-            with self.assertRaises(RuntimeError):
-                self.call("return_default")
-        self.assertEqual(self.plugin.driver.calls, ["connect"])
+    def test_arm_schema_exposes_only_retained_actions_and_parameters(self):
+        schemas = {t["name"]: t["inputSchema"] for t in self.plugin.get_tools()}
+        self.assertEqual(set(schemas), {"piper_status", "piper_mode", "piper_arm", "piper_gripper", "piper_photo"})
+        schema = schemas["piper_arm"]
+        self.assertEqual(set(schema["properties"]["action"]["enum"]),
+                         {"start", "stop", "info", "prepare", "disable", "move_joint", "hold", "allow_motion", "block_motion"})
+        self.assertEqual(set(schema["x-action-params"]),
+                         {"start", "stop", "info", "prepare", "disable", "move_joint", "hold"})
+        self.assertEqual(schema["x-completion"]["actions"], ["prepare", "move_joint"])
+        self.assertFalse({"confirm_save", *(f"j{i}_deg" for i in range(1, 7))} & set(schema["properties"]))
 
     def test_capture_releases_stalled_child_on_stop(self):
         plugin = self.plugin
@@ -236,6 +240,12 @@ class PiperCardsTests(unittest.TestCase):
             self.assertEqual({c["name"]: c["type"] for c in cards}, {
                 "piper_status": "resource", "piper_mode": "actuator", "piper_arm": "actuator",
                 "piper_gripper": "actuator", "piper_photo": "actuator"})
+            for action in ("return_default", "move_j1", "return_pose", "save_default", "move_joints"):
+                with self.subTest(removed_action=action):
+                    response = rpc("tools/call", {"name": "piper_arm", "arguments": {"action": action, "execute": True}})
+                    self.assertEqual(response["error"]["code"], -32602)
+                    self.assertIn("Unknown arm action", response["error"]["message"])
+                    self.assertIsNone(self.plugin.driver)
             response = rpc("tools/call", {"name": "piper_status", "arguments": {}})
             result = json.loads(response["result"]["content"][0]["text"])
             self.assertIsInstance(result, dict)
