@@ -1,5 +1,7 @@
 """Mac transport and SDK lifecycle regressions, without USB or cameras."""
 from enum import IntEnum
+from pathlib import Path
+import runpy
 import sys
 import threading
 import time
@@ -9,6 +11,43 @@ from unittest.mock import patch
 
 from agilex.piper.arm import PiperDriver
 from agilex.piper import mac_can
+
+
+def test_mac_entrypoint_installs_logsafe_before_server_or_output():
+    events = []
+
+    class Plugin:
+        def __init__(self, config):
+            self.data_dir = Path(config['data_dir'])
+            self.motion_enabled = False
+
+        def start(self):
+            events.append('plugin_start')
+
+        def stop(self):
+            events.append('plugin_stop')
+
+    class Server:
+        def __init__(self, address, handler):
+            events.append('server_created')
+
+        def serve_forever(self):
+            events.append('server_serving')
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            events.append('server_closed')
+
+    with patch('common.logsafe.install', side_effect=lambda: events.append('logsafe')), \
+         patch('agilex.piper.device.PiperPlugin', Plugin), \
+         patch('http.server.ThreadingHTTPServer', Server), \
+         patch('sys.argv', ['mac_main', '--data-dir', '/tmp/piper-test']), \
+         patch('builtins.print', side_effect=lambda *a, **k: events.append('output')):
+        runpy.run_module('agilex.piper.mac_main', run_name='__main__')
+
+    assert events[0] == 'logsafe'
+    assert 'output' in events and 'server_serving' in events
+    assert events[-2:] == ['server_closed', 'plugin_stop']
 
 
 class Status(IntEnum):

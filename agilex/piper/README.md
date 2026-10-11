@@ -150,10 +150,19 @@ Bot 的仓库通用构建默认可能为 arm64，**必须 inspect 镜像为 amd6
 不要把旧 Bot 镜像号当成当前提交。依 landing 流程更新 PR #382 → 请求 Bot 镜像 →
 核对提交/架构 → 现场验收 → Master/老师验收 → 合并与任务凭证。未验收不会自动合并或代发人员消息。
 
-镜像沿用既有 ROS base 和依赖；新增 Python 控制/策略模块不增加第三方依赖。
-Mac 的 gs_usb、libusb、PyObjC 只在 `requirements-mac.txt`，不进入 Ubuntu 镜像。
-OpenCV 用于 RGB JPEG、NumPy 用于 SDK/图像、PyYAML 用于配置；保留 sensor_msgs 与 FastDDS
-以支持画布图像。实际大小由 `check-image.sh` 输出，待镜像构建时记录，未虚构尺寸。
+依赖只加入 PiPER 组件镜像，不修改公共 ROS 基础镜像。Mac 的 gs_usb、libusb、PyObjC
+只在 `requirements-mac.txt`，不进入 Ubuntu 镜像。
+
+| 依赖 | 用途 |
+| --- | --- |
+| PiPER SDK、python-can | 厂商协议及 SocketCAN 通信 |
+| NumPy、headless OpenCV | 图像数组、V4L2 单帧采集、JPEG 编解码；不安装 GUI OpenCV |
+| PyYAML | 读取部署配置 |
+| python3-pip | 构建时安装固定 Python 依赖 |
+| ROS sensor_msgs、FastDDS | 向画布发布图像及使用既定 DDS 配置 |
+
+新驱动会增加组件镜像大小。Bot 构建的分层尺寸和本机 Docker 占用须区分，
+见 [ACCEPTANCE.md](ACCEPTANCE.md)；`check-image.sh` 可读取待部署镜像的本机报告值。
 
 ## 离线与真机验收记录
 
@@ -178,12 +187,23 @@ python3 -m unittest discover -s tests -p 'test_piper*.py'
 
 ### 构建与共享运行时说明
 
-ROS 基础标签沿用项目的 Humble 部署线，通用构建标签本身可变；因此不能以标签当作
-可复现的硬件验收版本。验收记录同时固定实际镜像 ID、源码提交、SDK 归档提交和依赖版本；
-部署使用已核验的 amd64 镜像，不随启动拉取浮动基础镜像。后续更换基础 OS/ROS 镜像须重新验收。
-SDK 使用官方 HTTPS 的固定 Git 提交归档，未引入第三方镜像源；当前仍依赖 GitHub 可达性，
-尚未迁移到内部 COS。受控依赖归档与不可变基础镜像是正式发布前仍需团队确认的供应链事项。
+默认 ROS Humble 基础镜像固定到多架构索引摘要
+`sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19`，
+支持 amd64 和 arm64。2026-10-11 核对项目 `ros-base:latest` 仅为 arm64，不能直接用于
+现场 amd64 控制器；因此本组件采用官方多架构 Humble 镜像。后续更换 OS/ROS 镜像须重新验收。
+验收同时记录实际镜像 ID、源码提交、SDK 提交和依赖版本。
+
+SDK 固定官方提交 `8d4dc29bd6e753066dedee235c008e90ecb2ab4a`，归档 SHA256 为
+`89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29`。
+pip 在安装前校验归档，关闭缓存，下载和临时文件清理在同一 RUN 内完成。
+Dockerfile 提供 `PIPER_SDK_URL` / `PIPER_SDK_SHA256` 构建参数；取得已批准的 COS
+归档后，可用 `build-local.sh IMAGE --build-arg PIPER_SDK_URL=URL --build-arg PIPER_SDK_SHA256=HASH`
+替换来源。两份桌面 landing 文档均无相关上传说明或 SDK 地址，按用户要求暂不迁移 COS，
+默认下载仍依赖 GitHub 可达性。
 
 公共 `common/vendor_runtime.py` 的唯一改动是 HTTP 请求日志转义和 200 字符截断，修复此前
 Bot 指出的控制字符注入问题。因为所有复用该 HTTP handler 的组件均有同一日志风险，修复放在
-公共 handler；不改变协议、设备生命周期、依赖或网络配置。公共生命周期与 Docker COPY 测试已通过。
+公共 handler；不改变协议、设备生命周期、依赖或网络配置。
+`tests/test_vendor_runtime_logging.py` 验证 LF/CR/NUL/ESC/DEL 转义、200 字符上限和原有
+MCP 成功请求静默行为。Mac 独立入口在创建线程服务器及任何启动输出前安装 `logsafe`，
+启动顺序与正常退出清理均有无硬件回归测试。

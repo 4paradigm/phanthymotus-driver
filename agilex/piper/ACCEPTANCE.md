@@ -1,3 +1,35 @@
+# Review 修复（2026-10-11）
+
+- Mac 独立入口在输出和线程 HTTP 服务启动前安装公共 `logsafe`；回归测试替换硬件及服务器，验证安装顺序和退出清理。
+- Compose 相机环境变量使用 `${PIPER_CAMERA_ENABLED:-0}`，部署覆盖生效，默认仍关闭。
+- 公共 HTTP 请求日志新增共享回归测试，覆盖控制字符注入、200 字符上限及成功 MCP 请求静默。
+- ROS Humble 默认基础镜像固定多架构索引 SHA256。官方 amd64/arm64 清单已核对；项目 `ros-base:latest`（摘要 `sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f`）配置仅为 arm64，未替换现场 amd64 基础镜像。
+- SDK 固定提交 ZIP 的实测大小 732413 字节，SHA256 为 `89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29`。pip 使用正确校验值成功构建 1.0.0 wheel；故意错误的校验值在安装前被拒绝。
+- 提供 SDK URL/校验值构建参数，pip 使用 `--no-cache-dir`，不留下下载缓存；临时 requirements 在同一 RUN 中删除。两份桌面 landing 文档未找到 COS 上传说明或 SDK 地址，按用户要求暂不迁移 COS；默认来源仍是 GitHub。
+- 指定 pytest 集合：145 passed、81 subtests passed；`bash -n` 和 `git diff --check` 通过。本轮未重启现场服务，未发送机器人动作或拍照命令。
+
+## 镜像尺寸核验与限制
+
+核对已有 Bot 正常 Dockerfile 构建 `release.261011.ec99be9`（源码 `a3f9175`，arm64），
+读取 registry manifest 中压缩层大小。基础层的未压缩 diff IDs 与本次固定的官方 arm64
+基础镜像完全一致；同一文件系统采用不同压缩方式时，registry blob 大小仍可能不同。
+以下均使用该 Bot 镜像自己的层，避免混用压缩口径。
+
+| 部分 | 压缩层总字节 |
+| --- | ---: |
+| 该构建已有 ROS 基础层（前 10 层） | 260565083 |
+| PiPER apt 安装层 | 3781821 |
+| PiPER Python 依赖安装层 | 50098119 |
+| 其他组件源码、配置层 | 78548 |
+| 完整镜像 | 314523571 |
+| 组件相对基础层新增 | 53958488 |
+
+这是 arm64 构建的压缩传输大小，不是 amd64 解压占用，也没有证据证明该 CI 使用 `--no-cache`。
+PiPER 组件新增依赖会增长镜像，未修改共享基础镜像；各依赖用途见 README。
+本轮 Ubuntu 尝试拉取固定官方基础镜像时 Docker Hub 请求超时，备用镜像域名无法解析，
+因此尚未完成从基础镜像开始的干净 amd64 构建和本轮修复前后尺寸对比。
+现场既有 amd64 镜像仍是此前离线叠加构建；不将其作为干净构建证据。
+
 # 当前接口精简（2026-10-11）
 
 按用户要求移除 `return_default`、`move_j1`、`return_pose`、`save_default`、`move_joints`。

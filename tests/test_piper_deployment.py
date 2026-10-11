@@ -33,6 +33,7 @@ class PiperDeploymentTests(unittest.TestCase):
         violations, _ = check(str(SERVICE), "agilex/piper")
         self.assertEqual(violations, [])
         self.assertEqual(self.environment["PIPER_MOTION_ENABLED"], "${PIPER_MOTION_ENABLED:-0}")
+        self.assertEqual(self.environment["PIPER_CAMERA_ENABLED"], "${PIPER_CAMERA_ENABLED:-0}")
 
 
 if __name__ == "__main__":

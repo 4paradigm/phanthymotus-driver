@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Run the same five cards on Mac, without requiring ROS or Docker."""
+from common import logsafe
+logsafe.install()
+
 import argparse
 from http.server import ThreadingHTTPServer
 import json
