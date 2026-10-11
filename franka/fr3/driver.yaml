@@ -1,0 +1,14 @@
+id: franka-fr3-driver
+name: Franka FR3 Driver
+category: driver
+hardware_provider: franka
+hardware_model: fr3
+image_name: franka-fr3
+port: 15723
+mcp_url: "http://localhost:15723/mcp"
+description: "Read-only Franka FR3 joint states and URDF skeleton model; multiple robot IPs share one driver using the official libfranka SDK"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: joint_states, type: sensor }
+  - { name: model, type: resource }
