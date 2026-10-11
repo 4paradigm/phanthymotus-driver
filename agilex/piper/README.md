@@ -58,6 +58,7 @@ Ubuntu 在机械臂卡片的 ACTION 下拉框选择 `allow_motion`（允许本�
 3. **初始化**：`prepare` 默认预览；核对边界修正，再用相同速度执行。
 4. **移动**：推荐 `move_joint` / `move_joints`，先 `execute=false`，再使用相同参数和
    `preview_id` 设置 `execute=true`、`workspace_clear=true`、`take_control=true`。
+   `move_joint` 的 `joint` 为 1～6 的整数输入框，请直接输入轴号；避免平台将枚举下拉值序列化为字符串。
 5. **停放位**：`save_default` + `confirm_save=true` 保存当前反馈，`return_pose` 预览/返回六轴。
 6. **夹爪**：`open` / `close` / `set_width` 默认预览；确认开度、力矩后执行。
 7. **停止**：本卡片的 `stop` 取消本卡片操作并尽力保持，不释放力矩。

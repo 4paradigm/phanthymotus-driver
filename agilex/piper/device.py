@@ -110,7 +110,9 @@ class PiperPlugin:
             "target_deg": {"type": "number", "minimum": -180, "maximum": 180},
             "speed_pct": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
             "speed_deg_s": {"type": "number", "minimum": .5, "maximum": 5, "default": 1},
-            "joint": {"type": "integer", "enum": [1,2,3,4,5,6], "default": 1},
+            # Canvas serializes enum selects as strings, but numeric inputs as
+            # JSON numbers. Keep this an integer input so strict validation works.
+            "joint": {"type": "integer", "minimum": 1, "maximum": 6, "default": 1},
             "preview_id": {"type": "string", "description": "预览返回的编号；留空使用最近一次预览"},
             **{f"j{i}_deg": {"type": "number", "minimum": -180, "maximum": 180} for i in range(1,7)},
         })

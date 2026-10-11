@@ -211,10 +211,26 @@ class ControlsTests(unittest.TestCase):
 
     def test_bad_parameters_and_limits_emit_zero_commands(self):
         for args in ({"speed_deg_s": .4}, {"speed_deg_s": 6}, {"speed_pct": 11},
-                     {"target_deg": float("nan")}, {"joint": True}, {"execute": "false"},
+                     {"target_deg": float("nan")}, {"joint": True}, {"joint": "1"},
+                     {"joint": 1.5}, {"joint": 0}, {"joint": 7}, {"execute": "false"},
                      {"target_deg": 14}, {"joint": 2, "target_deg": -1}):
             with self.subTest(args=args), self.assertRaises((RuntimeError,ValueError)):
                 self.call("arm", "move_joint", **{"joint":1,"target_deg":2, **args})
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_canvas_joint_numeric_input_previews_every_axis_without_commands(self):
+        schema = next(t["inputSchema"] for t in self.plugin.get_tools() if t["name"] == "piper_arm")
+        field = schema["properties"]["joint"]
+        # Agent Core renders enums as string selects; this must be a numeric input.
+        self.assertNotIn("enum", field)
+        self.assertEqual(field["type"], "integer")
+        self.assertEqual((field["minimum"], field["maximum"]), (1, 6))
+        for joint in range(1, 7):
+            with self.subTest(joint=joint):
+                result = self.call("arm", "move_joint", joint=joint,
+                                   target_deg=self.sdk.raw[joint-1]/1000+.5, execute=False)
+                self.assertFalse(result["executed"])
+                self.assertIn("preview_id", result)
         self.assertEqual(self.sdk.calls, [])
 
     def test_two_joint_move_is_previewed_bounded_and_stable(self):
