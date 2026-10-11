@@ -88,9 +88,11 @@ COPY --from=builder /tmp/libfranka/common/LICENSE /tmp/libfranka/common/NOTICE /
 COPY --from=builder /usr/share/doc/ros-humble-pinocchio/copyright /usr/share/licenses/pinocchio/copyright
 COPY --from=builder /usr/share/doc/ros-humble-coal/copyright /usr/share/licenses/coal/copyright
 COPY --from=builder /usr/share/doc/ros-humble-urdfdom/copyright /usr/share/licenses/urdfdom/copyright
-# ldconfig creates the libfranka.so.0.18 SONAME link. The no-argument smoke
-# check loads the libraries and exits with status 2, without contacting a robot.
-RUN ldconfig && (/usr/local/bin/franka-state-reader; test "$?" -eq 2)
+# Resolve copied SDK libraries without running ldconfig under QEMU.
+# Keep the no-argument smoke check: it loads all libraries and must exit 2.
+ENV LD_LIBRARY_PATH=/usr/local/lib
+RUN ln -s libfranka.so.0.18.1 /usr/local/lib/libfranka.so.0.18 \
+    && (/usr/local/bin/franka-state-reader; test "$?" -eq 2)
 
 WORKDIR /work
 COPY common/ /work/common/

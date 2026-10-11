@@ -55,6 +55,12 @@ requiring `.git`. Source revisions, checksums and the patch are documented in
 [`vendor/SOURCE.md`](vendor/SOURCE.md). Base-image and APT downloads still require
 network access.
 
+The runtime image uses an explicit libfranka SONAME link and
+`LD_LIBRARY_PATH=/usr/local/lib` for the copied SDK libraries. This avoids a
+final-stage `ldconfig` invocation, which can crash under some ARM64 QEMU
+versions. The build still runs the reader without arguments and requires exit
+code 2 to verify library loading without connecting to a robot.
+
 `deploy/service.yml` follows the resource-center service-fragment convention
 (`__IMAGE__` is replaced by the selected image). For standalone local Compose,
 wrap that fragment in a top-level `services:` mapping and replace `__IMAGE__`
