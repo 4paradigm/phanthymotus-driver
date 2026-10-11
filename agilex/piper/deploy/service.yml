@@ -16,6 +16,7 @@ agilex-piper:
     - PYTHONUNBUFFERED=1
     - AGENT_CORE_URL=https://localhost:15678
     - PIPER_MOTION_ENABLED=${PIPER_MOTION_ENABLED:-0}
+    - PIPER_CAMERA_ENABLED=0
   logging:
     driver: local
     options:

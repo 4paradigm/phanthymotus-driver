@@ -58,3 +58,22 @@
 - 真实机器人画布已登录；部署前只有旧版三卡片服务，不能算本版五卡片通过。
 - 新增 photo `import_photo` 路径；用户未重新授权前不执行相机采集。
 - Ubuntu 本版镜像、五卡片、DDS、ACP 与运动项目待部署后逐项填写实测结果。
+
+### Ubuntu 本版实际只读与画布结果（源码 54c401c）
+
+- 已部署 `agilex-piper:local-amd64-54c401c`，架构 amd64。
+  Docker image inspect 报告 ID `sha256:089f842639b1ef61e742b1a22c63f8cf454635017e77bdb6972b8ef35f02fc5a`、
+  `size_bytes=345244608`；这是该 Docker 存储后端的 inspect Size 值，不当作解压后的完整占用。
+- 普通构建访问 Docker Hub 超时。验收镜像从现场既有 amd64 镜像叠加本次 Git 归档代码构建；
+  已核对五个 pip 依赖版本及 SDK direct_url 均与本版 requirements 一致。
+- Bot 报告提交 54c401c 构建成功，tag `release.261011.60f4891`；registry manifest 实测为
+  **linux/arm64**，未部署。tag 后缀不等于 PR 提交，不能单凭 tag 判定版本。
+- 真实画布已添加五卡片；项目启动五卡片全部 ready，无 decision_core、麦克风或相机源卡片。
+- 在真实画布执行 status.read / mode.read / gripper.read / arm.prepare(execute=false) 均成功。
+  状态为待机、六轴失能、无故障；夹爪 0 mm、失能。Ubuntu 显式查询固件为 `S-V1.9-0`。
+- 当前初始化预览仍为 J2 +2.038°、J3 −0.899°；没有实际执行，预览超过 60 秒不可复用。
+- 在真实画布执行 photo.import_photo 导入明确标记的 `TEST_ONLY_NO_CAMERA.png`，保存 JPEG/JSON，
+  获得 action_id，真实 Agent Core 收到 completed 通知；监控页通过 DDS 实际显示测试图。
+  这只证明文件导入/保存/ACP/DDS 显示，不是用户实拍照片或本次真实相机采集验收。
+- 原始记录、构建日志和画布截图保存在本机 `acceptance/20261011_ubuntu/`，不含登录口令。
+- 相机门禁修正待以新提交重新部署：默认禁用采集，且每次要求明确确认；运动权限保持关闭。

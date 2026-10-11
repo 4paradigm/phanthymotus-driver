@@ -82,6 +82,7 @@ class PiperPlugin:
         self.publisher = None
         self.last_image = None
         self.motion_enabled = os.environ.get("PIPER_MOTION_ENABLED", "0") == "1"
+        self.camera_enabled = os.environ.get("PIPER_CAMERA_ENABLED", "0") == "1"
 
     def get_tools(self):
         actions = {
@@ -395,6 +396,7 @@ class PiperPlugin:
             return {"state": "idle" if self.closed or name in self.stopped_cards else "ready", "busy": self.gate.locked(),
                     "last_action": self.last_actions.get(name),
                     "active_card": self.active_card,
+                    "camera_enabled": self.camera_enabled,
                     "motion_enabled": self.motion_enabled, "max_j1_step_deg": 12,
                     "topic_out": [{"topic": self.topic, "format": "image/jpeg"}] if name == "piper_photo" else []}
         if name == "piper_photo":
@@ -646,6 +648,9 @@ class PiperPlugin:
             raise
 
     def capture(self, args):
+        if not self.camera_enabled:
+            raise RuntimeError("相机采集默认关闭；取得新的明确授权后在部署端设置 PIPER_CAMERA_ENABLED=1")
+        confirm(args, "forward_view_confirmed")
         forward = args.get("forward_view_confirmed", False)
         if type(forward) is not bool:
             raise ValueError("forward_view_confirmed must be a boolean")

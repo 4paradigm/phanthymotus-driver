@@ -136,6 +136,7 @@ python3 agilex/piper/deploy/diagnose.py --query-firmware --output ubuntu-readonl
 保存新的 JPEG/JSON 并发布同一 DDS 图像话题；元数据明确 `source=user_provided`、
 `camera_accessed=false`、`captured_at=null`，不冒充实时采集或当前姿态。
 导入不会连接 CAN；与其它物理操作共用互斥锁，支持卡片停止及 ACP 完成回报。
+`PIPER_CAMERA_ENABLED` 默认 `0`，`capture` 在启动采集子进程前拒绝；只有取得新的明确授权后才能在部署端设置为 `1`，每次调用还须 `forward_view_confirmed=true`。
 用户未重新授权前不执行 `capture`；诊断脚本默认不拍照，不传 `--photos`。
 
 Bot 的仓库通用构建默认可能为 arm64，**必须 inspect 镜像为 amd64 后才可部署到该 Ubuntu**。
@@ -162,3 +163,15 @@ python3 -m unittest discover -s tests -p 'test_piper*.py'
 重复点击、不支持固件、按键切换、切换超时与连接恢复分别记录。
 历史单机的 J1 演示不算本版六轴/夹爪/模式切换的验收。
 最新记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。
+
+### 构建与共享运行时说明
+
+ROS 基础标签沿用项目的 Humble 部署线，通用构建标签本身可变；因此不能以标签当作
+可复现的硬件验收版本。验收记录同时固定实际镜像 ID、源码提交、SDK 归档提交和依赖版本；
+部署使用已核验的 amd64 镜像，不随启动拉取浮动基础镜像。后续更换基础 OS/ROS 镜像须重新验收。
+SDK 使用官方 HTTPS 的固定 Git 提交归档，未引入第三方镜像源；当前仍依赖 GitHub 可达性，
+尚未迁移到内部 COS。受控依赖归档与不可变基础镜像是正式发布前仍需团队确认的供应链事项。
+
+公共 `common/vendor_runtime.py` 的唯一改动是 HTTP 请求日志转义和 200 字符截断，修复此前
+Bot 指出的控制字符注入问题。因为所有复用该 HTTP handler 的组件均有同一日志风险，修复放在
+公共 handler；不改变协议、设备生命周期、依赖或网络配置。公共生命周期与 Docker COPY 测试已通过。
