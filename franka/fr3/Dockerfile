@@ -1,6 +1,7 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE} AS ros-base
-ARG APT_MIRROR=http://mirrors.tencentyun.com/ubuntu-ports
+# Use a public mirror; the base image's Tencent mirror requires VPC DNS.
+ARG APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
 ARG ROS_APT_MIRROR=http://packages.ros.org/ros2/ubuntu
 
 # Some ros-base images remove the source link while retaining ros2-apt-source.
@@ -29,17 +30,22 @@ FROM build-deps AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential cmake pkg-config git libpoco-dev libeigen3-dev libfmt-dev \
+        build-essential cmake pkg-config patch libpoco-dev libeigen3-dev libfmt-dev \
         libtinyxml2-dev libconsole-bridge-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # libfranka 0.18.1 uses FCI protocol 10 (robot system >= 5.9.0).
-# Pin the commit as well as the release tag so builds cannot silently drift.
-RUN git clone --depth 1 --branch 0.18.1 --recurse-submodules --shallow-submodules \
-        https://github.com/frankarobotics/libfranka.git /tmp/libfranka \
-    && test "$(git -C /tmp/libfranka rev-parse HEAD)" = "182c9c4f7ffb512d4b2e2efbc86643e751389771"
-
+# Keep pinned official source archives in the context so SDK compilation does
+# not depend on GitHub access from the build container. See vendor/SOURCE.md.
+COPY vendor/ /tmp/franka-source/
 COPY cmake/ /tmp/franka-cmake/
+RUN echo "b682dbb2c6c564608b7b3ec443f332545dde94dee6969237f182441f21c23951  /tmp/franka-source/libfranka-182c9c4f7ffb512d4b2e2efbc86643e751389771.tar.gz" | sha256sum -c - \
+    && echo "75f26fc8794e4ae149086b59dda9de9d61cba845c375a51d13dd886ba7a9c104  /tmp/franka-source/libfranka-common-d96c221a32c343384cbe2f77c61116ed58b84231.tar.gz" | sha256sum -c - \
+    && mkdir -p /tmp/libfranka/common \
+    && tar -xzf /tmp/franka-source/libfranka-182c9c4f7ffb512d4b2e2efbc86643e751389771.tar.gz --strip-components=1 -C /tmp/libfranka \
+    && tar -xzf /tmp/franka-source/libfranka-common-d96c221a32c343384cbe2f77c61116ed58b84231.tar.gz --strip-components=1 -C /tmp/libfranka/common \
+    && patch --batch --forward --fuzz=0 -d /tmp/libfranka -p1 < /tmp/franka-cmake/libfranka-offline-version.patch
+
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash \
     && cmake -S /tmp/libfranka -B /tmp/libfranka/build \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -77,7 +83,8 @@ COPY --from=builder /opt/ros/humble/lib/*/libpinocchio_default.so.* \
     /opt/ros/humble/lib/*/liburdfdom_model.so.* \
     /opt/ros/humble/lib/*/liburdfdom_world.so.* /usr/local/lib/
 COPY --from=builder /usr/local/bin/franka-state-reader /usr/local/bin/
-COPY --from=builder /tmp/libfranka/LICENSE /usr/share/licenses/libfranka/LICENSE
+COPY --from=builder /tmp/libfranka/LICENSE /tmp/libfranka/NOTICE /usr/share/licenses/libfranka/
+COPY --from=builder /tmp/libfranka/common/LICENSE /tmp/libfranka/common/NOTICE /usr/share/licenses/libfranka-common/
 COPY --from=builder /usr/share/doc/ros-humble-pinocchio/copyright /usr/share/licenses/pinocchio/copyright
 COPY --from=builder /usr/share/doc/ros-humble-coal/copyright /usr/share/licenses/coal/copyright
 COPY --from=builder /usr/share/doc/ros-humble-urdfdom/copyright /usr/share/licenses/urdfdom/copyright

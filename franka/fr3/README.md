@@ -41,6 +41,20 @@ docker build -t franka-fr3:local-review "$context"
 # Optional: --build-arg ROS_BASE_IMAGE=ros:humble
 ```
 
+The Dockerfile defaults to the public TUNA Ubuntu mirror and the official ROS
+repository. Override `APT_MIRROR` and `ROS_APT_MIRROR` with `docker build
+--build-arg` when needed. The repository's `build.sh --mirror` option currently
+selects the Python package mirror only; it does not override these APT sources.
+
+The SDK and its `common` submodule are built from checksum-verified official
+source archives included in `vendor/`, following the repository's existing SDK
+packaging pattern. Docker builds do not clone or download SDK sources from
+GitHub. The archives preserve their upstream licenses and notices; a small
+CMake patch supplies the pinned release version for package metadata without
+requiring `.git`. Source revisions, checksums and the patch are documented in
+[`vendor/SOURCE.md`](vendor/SOURCE.md). Base-image and APT downloads still require
+network access.
+
 `deploy/service.yml` follows the resource-center service-fragment convention
 (`__IMAGE__` is replaced by the selected image). For standalone local Compose,
 wrap that fragment in a top-level `services:` mapping and replace `__IMAGE__`
