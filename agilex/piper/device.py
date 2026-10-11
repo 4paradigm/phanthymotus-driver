@@ -23,7 +23,7 @@ import urllib.request
 
 from common.vendor_runtime import action_schema, tool
 from agilex.piper.arm import PiperDriver
-from agilex.piper.control import Previews, mode_name, mode_plan, ready_to_move, signature, summary
+from agilex.piper.control import Previews, healthy, mode_name, mode_plan, ready_to_move, signature, summary, teaching_stopped
 
 
 def number(args, key, default, low, high, integer=False):
@@ -82,6 +82,7 @@ class PiperPlugin:
         self.publisher = None
         self.last_image = None
         self.motion_enabled = os.environ.get("PIPER_MOTION_ENABLED", "0") == "1"
+        self.manual_motion_permission = False
         self.camera_enabled = os.environ.get("PIPER_CAMERA_ENABLED", "0") == "1"
 
     def get_tools(self):
@@ -114,6 +115,11 @@ class PiperPlugin:
             **{f"j{i}_deg": {"type": "number", "minimum": -180, "maximum": 180} for i in range(1,7)},
         })
         schema["additionalProperties"] = False
+        if self.config.get("can_transport", "socketcan") == "socketcan":
+            # Canvas reads this enum; Agent Core advertises only x-action-params
+            # to the model. Permission changes are manual card operations.
+            # This is catalog separation, not authentication of the MCP caller.
+            schema["properties"]["action"]["enum"] += ["allow_motion", "block_motion"]
         schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
@@ -188,6 +194,8 @@ class PiperPlugin:
                 self.closed = True
             else:
                 self.stopped_cards.add(name)
+            if name is None or name == "piper_arm":
+                self.revoke_manual_permission()
             if name not in {"piper_photo", "piper_status"}:
                 self.previews.invalidate()
             affected = self.gate.locked() and (name is None or name == self.active_card)
@@ -249,7 +257,7 @@ class PiperPlugin:
                     candidate.joint_limits_deg = self.config.get("joint_limits_deg")
                     candidate.gripper_limits_mm = tuple(self.config.get("gripper_limits_mm", (0.,70.)))
                     candidate.connect()
-                    if self.closed:
+                    if self.closed or self.cancel.is_set():
                         candidate.close()
                         raise RuntimeError("Connection cancelled")
                     self.driver, self.owner_file = candidate, owner
@@ -260,6 +268,7 @@ class PiperPlugin:
 
     def disconnect(self):
         with self.connection_lock:
+            self.revoke_manual_permission()
             self.previews.invalidate()
             self.last_signature = self.firmware_version = None
             if self.driver is not None:
@@ -299,9 +308,52 @@ class PiperPlugin:
         return result
 
     def motion_allowed(self, args):
-        if not self.motion_enabled:
-            raise RuntimeError("Set PIPER_MOTION_ENABLED=1 on the host after commissioning")
+        self.require_motion_permission()
         confirm(args, "workspace_clear")
+
+    def require_motion_permission(self):
+        if not self.motion_enabled:
+            raise RuntimeError("运动许可关闭：请在机械臂卡片手动执行 allow_motion（允许本次运动）；Mac USB-CAN 仍需主机授权")
+
+    def revoke_manual_permission(self):
+        if self.manual_motion_permission:
+            self.motion_enabled = False
+            self.manual_motion_permission = False
+            self.previews.invalidate()
+
+    def motion_permission(self, action):
+        if self.config.get("can_transport", "socketcan") != "socketcan":
+            raise RuntimeError("本卡片开关仅支持 Ubuntu SocketCAN；Mac USB-CAN 仍需主机授权")
+        if action == "block_motion":
+            # Closing permission must remain available while a worker owns the
+            # operation gate. Cancellation preserves torque via its hold path.
+            with self.lifecycle:
+                self.motion_enabled = self.manual_motion_permission = False
+                self.previews.invalidate()
+                affected = self.gate.locked() and self.active_card in {"piper_arm", "piper_gripper", "piper_mode"}
+                if affected:
+                    self.cancel.set()
+                    if self.driver is not None:
+                        self.driver.cancel_motion()
+            return {"motion_enabled": False, "operation_stopping": affected,
+                    "motor_torque_released": False, "executed": False,
+                    "reminder": "运动许可已关闭；不会失能。失能仍需现场支撑确认。"}
+        with self.operation("piper_arm", action):
+            state = self.read_state()
+            if not math.isfinite(state.feedback_time) or abs(time.time() - state.feedback_time) > .5:
+                raise RuntimeError("机械臂反馈超过 0.5 秒未更新，请先检查状态")
+            healthy(state)
+            if mode_name(state) not in {"standby", "can"} or not teaching_stopped(state):
+                raise RuntimeError("请先退出示教或其它控制模式，再开启运动许可")
+            if any(state.enabled) and (mode_name(state) != "can" or not self.driver.stationary()):
+                raise RuntimeError("已使能时须为电脑控制且机械臂静止，才能开启运动许可")
+            with self.lifecycle:
+                if self.cancel.is_set() or self.closed or "piper_arm" in self.stopped_cards:
+                    raise RuntimeError("开启许可已取消，请重新操作")
+                self.previews.invalidate()
+                self.motion_enabled = self.manual_motion_permission = True
+            return {"motion_enabled": True, "executed": False,
+                    "reminder": "仅允许本次操作，未使能、未移动；请重新预览。停止机械臂卡片、重连或重启后许可关闭。"}
 
     def dispatch(self, action, args):
         name = args.get("_tool_name", "piper_arm")
@@ -399,6 +451,8 @@ class PiperPlugin:
                     "camera_enabled": self.camera_enabled,
                     "motion_enabled": self.motion_enabled, "max_j1_step_deg": 12,
                     "topic_out": [{"topic": self.topic, "format": "image/jpeg"}] if name == "piper_photo" else []}
+        if name == "piper_arm" and action in {"allow_motion", "block_motion"}:
+            return self.motion_permission(action)
         if name == "piper_photo":
             if action not in {"capture", "import_photo"}:
                 raise ValueError(f"Unknown photo action: {action}")
@@ -434,11 +488,12 @@ class PiperPlugin:
             confirm(args, "take_control")
         if action == "disable":
             confirm(args, "arm_supported")
-            if not self.motion_enabled:
-                raise RuntimeError("失能权限未开启：PIPER_MOTION_ENABLED=0")
+            self.require_motion_permission()
         if action == "save_default":
             confirm(args, "confirm_save")
         with self.operation(name, action):
+            if action in {"move_j1", "hold", "disable"} or execute:
+                self.require_motion_permission()
             driver = self.connected()
             state = self.read_state()
             if action == "prepare":
@@ -550,8 +605,7 @@ class PiperPlugin:
                 if plan["button_guidance"]:
                     return {**plan, "executed": False}
                 raise RuntimeError("；".join(plan["missing_conditions"]))
-            if not self.motion_enabled:
-                raise RuntimeError("模式切换权限未开启：PIPER_MOTION_ENABLED=0")
+            self.require_motion_permission()
             self.previews.consume(args.get("preview_id") or None, key, self.read_state())
             try:
                 return {**plan, **driver.switch_mode(target, state, self.verified_teaching())}
@@ -574,9 +628,10 @@ class PiperPlugin:
             confirm(args, "take_control")
         if action == "disable":
             confirm(args, "object_supported")
-            if not self.motion_enabled:
-                raise RuntimeError("失能权限未开启：PIPER_MOTION_ENABLED=0")
+            self.require_motion_permission()
         with self.operation("piper_gripper", action):
+            if action in {"hold", "disable"} or execute:
+                self.require_motion_permission()
             driver = self.connected()
             state = self.read_state()
             grip = driver.get_gripper()

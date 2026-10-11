@@ -117,6 +117,85 @@ class ControlsTests(unittest.TestCase):
         with patch("agilex.piper.arm.time.sleep"), patch("agilex.piper.arm.time.monotonic", side_effect=self.clock):
             return func()
 
+    def test_manual_permission_never_sends_commands_and_invalidates_preview(self):
+        self.plugin.motion_enabled = False
+        self.sdk.enabled, self.sdk.mode = (False,)*6, "STANDBY(0x0)"
+        preview = self.call("arm", "prepare")
+        result = self.call("arm", "allow_motion")
+        self.assertTrue(result["motion_enabled"])
+        self.assertFalse(result["executed"])
+        self.assertNotIn(preview["preview_id"], self.plugin.previews.entries)
+        self.assertEqual(self.sdk.calls, [])
+        self.assertFalse(self.call("arm", "block_motion")["motor_torque_released"])
+        self.assertFalse(self.plugin.motion_enabled)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_manual_permission_rejects_bad_feedback_busy_or_mac(self):
+        self.plugin.motion_enabled = False
+        for fields in (dict(error=1), dict(frozen=True), dict(enabled=(True,False,True,True,True,True)),
+                       dict(mode="TEACHING_MODE(0x2)"), dict(teach="EXECUTE_TRAJECTORY(0x3)")):
+            original = dict(vars(self.sdk))
+            with self.subTest(fields=fields):
+                self.sdk.__dict__.update(fields)
+                with self.assertRaises(RuntimeError):
+                    self.call("arm", "allow_motion")
+                self.assertFalse(self.plugin.motion_enabled)
+            self.sdk.__dict__.update(original)
+        with self.plugin.operation("piper_photo", "capture"), self.assertRaises(RuntimeError):
+            self.call("arm", "allow_motion")
+        self.plugin.config["can_transport"] = "gs_usb"
+        with self.assertRaises(RuntimeError):
+            self.call("arm", "allow_motion")
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_manual_permission_resets_on_stop_reconnect_and_new_instance(self):
+        for reset in (lambda: self.call("arm", "stop"),
+                      lambda: self.call("status", "reconnect"), self.plugin.request_stop):
+            self.call("arm", "start")
+            self.call("arm", "allow_motion")
+            reset()
+            self.assertFalse(self.plugin.motion_enabled)
+            self.call("arm", "start")
+            self.assertFalse(self.plugin.motion_enabled)
+        with patch.dict("os.environ", {"PIPER_MOTION_ENABLED": "0"}):
+            fresh = PiperPlugin({"data_dir": self.tmp.name}, driver_factory=Driver)
+            fresh.start()
+            self.assertFalse(fresh.motion_enabled)
+            self.assertIsNone(fresh.driver)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_closing_permission_cancels_motion_preserves_torque_and_photo(self):
+        self.call("arm", "allow_motion")
+        with self.plugin.operation("piper_gripper", "set_width"):
+            result = self.call("arm", "block_motion")
+            self.assertTrue(result["operation_stopping"])
+            self.assertTrue(self.driver.cancelled.is_set())
+            self.assertTrue(self.plugin.cancel.is_set())
+            self.assertTrue(all(self.sdk.enabled))
+        self.call("arm", "allow_motion")
+        with self.plugin.operation("piper_photo", "import_photo"):
+            self.assertFalse(self.call("arm", "block_motion")["operation_stopping"])
+            self.assertFalse(self.plugin.cancel.is_set())
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_permission_closed_between_validation_and_reservation_blocks_command(self):
+        original = self.plugin.operation
+        def revoke_then_reserve(*args, **kwargs):
+            self.call("arm", "block_motion")
+            return original(*args, **kwargs)
+        with patch.object(self.plugin, "operation", side_effect=revoke_then_reserve), self.assertRaises(RuntimeError):
+            self.call("arm", "hold",workspace_clear=True,take_control=True)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_manual_permission_actions_are_canvas_only(self):
+        schema = next(t["inputSchema"] for t in self.plugin.get_tools() if t["name"] == "piper_arm")
+        for action in ("allow_motion", "block_motion"):
+            self.assertIn(action, schema["properties"]["action"]["enum"])
+            self.assertNotIn(action, schema["x-action-params"])
+            for card in ("mode", "gripper", "photo"):
+                with self.assertRaises(ValueError):
+                    self.call(card, action)
+
     def test_invalid_motion_conditions_emit_zero_control_commands(self):
         cases = [dict(error=1), dict(enabled=(True,False,True,True,True,True)),
                  dict(mode="STANDBY(0x0)"), dict(mode="WIFI_CONTROL_MODE(0x4)"),
@@ -280,7 +359,7 @@ class ControlsTests(unittest.TestCase):
         self.plugin.motion_enabled = False
         for card, args in (("arm", {"arm_supported": True}),
                            ("gripper", {"object_supported": True})):
-            with self.subTest(card=card), self.assertRaisesRegex(RuntimeError, "权限未开启"):
+            with self.subTest(card=card), self.assertRaisesRegex(RuntimeError, "运动许可关闭"):
                 self.call(card, "disable", **args)
         self.assertEqual(self.sdk.calls, [])
 
