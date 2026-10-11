@@ -1,0 +1,33 @@
+limx-tron2:
+  image: __IMAGE__
+  container_name: embodied-limx-tron2
+  network_mode: host
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=16m
+  extra_hosts:
+    - "phanthy-motus:127.0.0.1"
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - ${TRON2_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}:/certs/core.pem:ro
+  environment:
+    - TRON2_SERIAL=${TRON2_SERIAL:-}
+    - TRON2_ROBOT_URL=${TRON2_ROBOT_URL:-ws://10.192.1.2:5000}
+    - AGENT_CORE_URL=${TRON2_AGENT_CORE_URL:-https://phanthy-motus:15678}
+    - AGENT_CORE_CA_CERT=/certs/core.pem
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - ROS_LOG_DIR=/tmp/ros-log
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONDONTWRITEBYTECODE=1
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  stop_grace_period: 15s
+  restart: always

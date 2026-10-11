@@ -1,0 +1,16 @@
+id: limx-tron2-driver
+name: LimX TRON2 Read-only Sensors
+category: driver
+hardware_provider: limx
+hardware_model: tron2
+image_name: limx-tron2
+port: 15791
+mcp_url: "http://localhost:15791/mcp"
+description: "TRON2 只读参数采集：关节角(rad/deg)、设备模式/固件状态、电量和原始 BMS 参数；无运动或模式切换接口"
+build_context_extras:
+  - ../../common
+cards:
+  - {name: joint_state, type: sensor}
+  - {name: robot_status, type: sensor}
+  - {name: battery_state, type: sensor}
+  - {name: read_state, type: resource}
