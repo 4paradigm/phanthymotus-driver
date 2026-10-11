@@ -161,6 +161,40 @@ class PiperCardsTests(unittest.TestCase):
         self.assertTrue(Path(result["output"]).with_suffix(".json").exists())
         self.assertIsNone(self.plugin.driver)
 
+    def test_import_photo_saves_decodable_jpeg_without_camera_or_can(self):
+        import cv2
+        import numpy as np
+        root = Path(self.tmp.name) / "imports"
+        root.mkdir()
+        cv2.imwrite(str(root / "provided.png"), np.full((24, 32, 3), 120, dtype=np.uint8))
+        with patch("agilex.piper.device.subprocess.Popen") as camera:
+            result = self.bundle.dispatch("piper_photo", {"action": "import_photo", "filename": "provided.png"})
+        camera.assert_not_called()
+        self.assertIsNone(self.plugin.driver)
+        self.assertEqual(result["source"], "user_provided")
+        self.assertFalse(result["camera_accessed"])
+        self.assertIsNone(result["captured_at"])
+        self.assertEqual(cv2.imread(result["output"]).shape, (24, 32, 3))
+        self.assertEqual(json.loads(Path(result["output"]).with_suffix(".json").read_text()), result)
+
+    def test_import_rejects_paths_symlinks_corruption_and_cleans_publication_failure(self):
+        import cv2
+        import numpy as np
+        root = Path(self.tmp.name) / "imports"
+        root.mkdir()
+        (root / "bad.jpg").write_bytes(b"not an image")
+        (root / "link.jpg").symlink_to(root / "bad.jpg")
+        for filename in ("../bad.jpg", "/tmp/image.jpg", "a\\b.jpg", "link.jpg", "bad.jpg", "missing.jpg", "a.txt", None):
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                self.bundle.dispatch("piper_photo", {"action": "import_photo", "filename": filename})
+        cv2.imwrite(str(root / "valid.jpg"), np.zeros((4, 4, 3), dtype=np.uint8))
+        with patch.object(self.plugin, "publish_photo", side_effect=RuntimeError("DDS failed")):
+            with self.assertRaisesRegex(RuntimeError, "DDS failed"):
+                self.bundle.dispatch("piper_photo", {"action": "import_photo", "filename": "valid.jpg"})
+        self.assertFalse(list(Path(self.tmp.name).glob("rgb_*")))
+        self.assertFalse(self.plugin.gate.locked())
+        self.assertIsNone(self.plugin.driver)
+
     def test_http_mcp_handshake_list_and_plain_dict_result(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: self.bundle, "piper", "agilex-piper-driver"))
         thread = threading.Thread(target=server.serve_forever, daemon=True)

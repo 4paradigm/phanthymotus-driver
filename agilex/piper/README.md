@@ -2,7 +2,7 @@
 
 同一套驱动支持 Ubuntu SocketCAN 和 Mac candleLight USB-CAN。
 启动、重连、容器重启均不使能、不重放动作。`PIPER_MOTION_ENABLED` 默认 `0`。
-当前按用户要求在 **Mac 验收**；Ubuntu 镜像与 ROS 画布部署保留，尚未视为通过。
+本次交付要求在 **Ubuntu 真实机器人画布**运行；Mac 与离线测试只作辅助证据。
 
 | 卡片 | 使用方式 |
 | --- | --- |
@@ -10,7 +10,7 @@
 | `piper_mode` | `read` / `preview` / `switch` / `stop_teaching`；未验证固件显示按键引导 |
 | `piper_arm` | 初始化、单轴/六轴低速控制、保存/返回停放位、保持、停止、失能 |
 | `piper_gripper` | 读取、开合、指定毫米开度、保持、停止、失能 |
-| `piper_photo` | 当前姿态 RGB 拍照，保存 JPEG + JSON；Ubuntu 发布画布图像 |
+| `piper_photo` | 导入用户照片并保存 JPEG + JSON、发布画布图像；真实采集须另获现场授权 |
 
 ## Mac 运行与验收
 
@@ -36,7 +36,7 @@ Ubuntu 的 DDS 画布显示需要在部署时另行验证。
 Mac USB-CAN 还有第二层只读门禁：环境变量为 `0` 时只允许固件信息查询，拒绝所有控制帧。
 
 ```bash
-python3 agilex/piper/deploy/diagnose.py --query-firmware --photos 3 --output mac-readonly.json
+python3 agilex/piper/deploy/diagnose.py --query-firmware --output mac-readonly.json
 ```
 
 只读检查通过后，现场确认底座固定、空间清空、有人可及时停止，再关闭服务并用
@@ -117,7 +117,7 @@ arm / mode / gripper / photo 共用操作锁，忙时立即拒绝，不排队。
 客户端超时或回调丢失不代表机械臂已停止，应调用对应卡片 `stop` 并检查反馈。
 最大新六轴动作约 44 秒，ACP 等待上限 60 秒。所有返回都是普通 JSON 字典。
 
-## Ubuntu 镜像与部署（保留，当前不作为 Mac 验收条件）
+## Ubuntu 镜像与部署（本次交付环境）
 
 Ubuntu 22.04 amd64、ROS2 Humble，`can0` 由部署人员配置为 1 Mbps 正常模式。
 Motion 默认关闭；保持 host network、DDS domain 42、FastDDS loopback profile 的只读挂载。
@@ -125,8 +125,18 @@ Motion 默认关闭；保持 host network、DDS domain 42、FastDDS loopback pro
 ```bash
 bash agilex/piper/build-local.sh agilex-piper:local-amd64
 bash agilex/piper/deploy/check-image.sh agilex-piper:local-amd64
-python3 agilex/piper/deploy/diagnose.py --query-firmware --photos 3 --output ubuntu-readonly.json
+python3 agilex/piper/deploy/diagnose.py --query-firmware --output ubuntu-readonly.json
 ```
+
+### 导入用户照片（不调用相机）
+
+将用户指定的 JPEG/PNG 放到宿主机 `/opt/phanthy-motus/data/piper/imports/`，
+在真实画布 photo 卡片选择 `import_photo`，`filename` 只填写文件名（如 `provided.jpg`）。
+只读取该目录普通文件，拒绝路径、符号链接、损坏图片和超过 20 MiB 的文件。
+保存新的 JPEG/JSON 并发布同一 DDS 图像话题；元数据明确 `source=user_provided`、
+`camera_accessed=false`、`captured_at=null`，不冒充实时采集或当前姿态。
+导入不会连接 CAN；与其它物理操作共用互斥锁，支持卡片停止及 ACP 完成回报。
+用户未重新授权前不执行 `capture`；诊断脚本默认不拍照，不传 `--photos`。
 
 Bot 的仓库通用构建默认可能为 arm64，**必须 inspect 镜像为 amd64 后才可部署到该 Ubuntu**。
 不要把旧 Bot 镜像号当成当前提交。依 landing 流程更新 PR #382 → 请求 Bot 镜像 →
@@ -147,7 +157,7 @@ python3 -m unittest discover -s tests -p 'test_piper*.py'
 独立停止、动作中读状态、夹爪单位/限位、进程互斥、MCP/ACP、日志及部署约束。
 模拟不满足条件时断言 **0 条控制命令**。
 
-真机依次验收：状态与三次照片 → 待机/CAN → 初始化 → 逐轴及双轴小幅动作 →
+真机依次验收：状态与用户提供照片 → 待机/CAN → 初始化 → 逐轴及双轴小幅动作 →
 空载夹爪 → 六轴停放位 → 示教进出 → 停止及支撑后失能。
 重复点击、不支持固件、按键切换、切换超时与连接恢复分别记录。
 历史单机的 J1 演示不算本版六轴/夹爪/模式切换的验收。

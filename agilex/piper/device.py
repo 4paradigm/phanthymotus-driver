@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -122,12 +123,14 @@ class PiperPlugin:
             "info": ([], "Camera output topic"),
             "capture": (["forward_view_confirmed"],
                         "Capture current RGB view without moving the arm; confirm forward view for this shot only"),
+            "import_photo": (["filename"], "保存并显示用户提供的照片；只读取数据目录 imports 下的文件，不调用相机"),
         }, {"forward_view_confirmed": {"type": "boolean", "enum": [False, True], "default": False,
-             "description": "Operator has verified current arm/camera orientation, not a persistent calibration"}})
+             "description": "Operator has verified current arm/camera orientation, not a persistent calibration"},
+            "filename": {"type": "string", "description": "imports 目录中的 JPEG/PNG 文件名，不含路径"}})
         camera_schema["additionalProperties"] = False
         # Camera is mounted on the wrist: prevent capture during an arm move.
         camera_schema["x-resource"] = ["arm", "camera"]
-        camera_schema["x-completion"] = {"actions": ["capture"], "timeout": 20}
+        camera_schema["x-completion"] = {"actions": ["capture", "import_photo"], "timeout": 20}
         mode_schema = action_schema({
             "start": ([], "就绪；不切换模式"), "stop": ([], "取消本卡片的切换等待；不失能"),
             "info": ([], "模式卡片信息"),
@@ -164,7 +167,7 @@ class PiperPlugin:
             tool("piper_mode", "actuator", "模式检查与切换；使能、失能、故障分别处理", mode_schema),
             tool("piper_arm", "actuator", "初始化、六关节低速运动与停放位；运动权限默认关闭", schema),
             tool("piper_gripper", "actuator", "夹爪开度与保持；默认力矩 0.5 N·m，上限 1 N·m", gripper_schema),
-            tool("piper_photo", "actuator", "当前姿态 D435 RGB 拍照并保存；不移动机械臂",
+            tool("piper_photo", "actuator", "导入用户照片并显示，或显式拍摄 RGB；不移动机械臂",
                  camera_schema, topic_out=[{"topic": self.topic, "format": "image/jpeg"}]),
         ]
 
@@ -301,7 +304,7 @@ class PiperPlugin:
 
     def dispatch(self, action, args):
         name = args.get("_tool_name", "piper_arm")
-        long_action = (name == "piper_photo" and action == "capture"
+        long_action = (name == "piper_photo" and action in {"capture", "import_photo"}
                        or name == "piper_arm" and (action == "move_j1" or action in
                            {"prepare", "return_default", "move_joint", "move_joints", "return_pose"} and args.get("execute") is True)
                        or name == "piper_gripper" and action in {"open", "close", "set_width"} and args.get("execute") is True)
@@ -395,10 +398,10 @@ class PiperPlugin:
                     "motion_enabled": self.motion_enabled, "max_j1_step_deg": 12,
                     "topic_out": [{"topic": self.topic, "format": "image/jpeg"}] if name == "piper_photo" else []}
         if name == "piper_photo":
-            if action != "capture":
+            if action not in {"capture", "import_photo"}:
                 raise ValueError(f"Unknown photo action: {action}")
             with self.operation(name, action):
-                return self.capture(args)
+                return self.import_photo(args) if action == "import_photo" else self.capture(args)
         for key in ("execute", "workspace_clear", "allow_limit_adjustment", "take_control", "arm_supported", "confirm_save",
                     "other_controllers_stopped", "object_supported", "query_firmware"):
             if key in args and type(args[key]) is not bool:
@@ -594,6 +597,53 @@ class PiperPlugin:
                         "executed": False, **self.previews.put(key, state, extra)}
             self.previews.consume(args.get("preview_id") or None, key, self.read_state(), extra)
             return {"executed": True, "gripper": asdict(driver.move_gripper(width, torque))}
+
+    def import_photo(self, args):
+        """Import an operator-staged image without camera or CAN access."""
+        filename = args.get("filename")
+        if (not isinstance(filename, str) or not filename or len(filename) > 255
+                or Path(filename).name != filename or "\\" in filename
+                or Path(filename).suffix.lower() not in {".jpg", ".jpeg", ".png"}):
+            raise ValueError("filename 必须为 imports 目录中的 JPEG/PNG 文件名，不含路径")
+        root = (self.data_dir / "imports").resolve()
+        source = root / filename
+        if source.is_symlink() or source.resolve().parent != root or not source.is_file():
+            raise ValueError("照片不存在或不是 imports 目录中的普通文件")
+        with source.open("rb") as handle:
+            data = handle.read(20 * 1024 * 1024 + 1)
+        if not data or len(data) > 20 * 1024 * 1024:
+            raise ValueError("照片须非空且不超过 20 MiB")
+        import cv2
+        import numpy as np
+        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("无法解码照片，请提供有效 JPEG/PNG")
+        height, width = image.shape[:2]
+        if height * width > 20_000_000:
+            raise ValueError("照片不超过 2000 万像素")
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not ok:
+            raise RuntimeError("照片 JPEG 保存失败")
+        if self.cancel.is_set():
+            raise RuntimeError("Photo import cancelled")
+        output = self.data_dir / f"rgb_{uuid4().hex}.jpg"
+        info = {"output": str(output), "width": width, "height": height,
+                "source": "user_provided", "source_sha256": hashlib.sha256(data).hexdigest(),
+                "imported_at": datetime.now(timezone.utc).isoformat(), "captured_at": None,
+                "camera_accessed": False, "arm_moved": False,
+                "dds_published": self.ros2 is not None,
+                "topic_out": [{"topic": self.topic, "format": "image/jpeg"}]}
+        try:
+            output.write_bytes(encoded.tobytes())
+            if self.cancel.is_set():
+                raise RuntimeError("Photo import cancelled")
+            output.with_suffix(".json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+            self.publish_photo(output)
+            return info
+        except BaseException:
+            output.unlink(missing_ok=True)
+            output.with_suffix(".json").unlink(missing_ok=True)
+            raise
 
     def capture(self, args):
         forward = args.get("forward_view_confirmed", False)
