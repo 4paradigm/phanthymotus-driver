@@ -57,7 +57,7 @@ PR 构建完成后，使用机器人评论给出的新镜像 / Try it 链接部�
 3. Core 信任证书是实际文件。HTTPS 保持证书及主机名验证；`TRON2_AGENT_CORE_URL` 的主机名必须与证书 SAN 匹配。需要时使用证书包含的主机名，并相应调整 Compose 的 `extra_hosts`；不要关闭 TLS 验证。
 4. MCP 端口 15791 未被其他本地原型占用。
 
-仅使用 WebSocket 读取参数，不挂载 `/dev`、Docker socket、姿态文件或可写控制目录，也不需要 privileged 或 GPU runtime。容器使用只读根文件系统和临时 `/tmp`；`restart: always`。
+仅使用 WebSocket 读取参数，不挂载 `/dev`、Docker socket、姿态文件或可写控制目录，也不需要 privileged 或 GPU runtime。容器使用只读根文件系统和临时 `/tmp`；ROS2 日志显式写入 `/tmp/ros-log`；`restart: always`。
 
 如果同机部署过早期复位原型，先备份其文件，再停止旧服务以释放 15791，并在 Motus 设置中移除旧复位服务注册及画布卡片。本驱动注册名称为 **LimX TRON2 Read-only Sensors**；不会自动删除旧容器、旧注册或已保存的姿态文件。
 

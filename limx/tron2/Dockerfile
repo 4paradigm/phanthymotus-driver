@@ -15,6 +15,7 @@ ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONPATH=/work
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV ROS_LOG_DIR=/tmp/ros-log
 # Import from the actual /work image layout; no robot or DDS participant is opened.
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && python3 -c 'import main, device, vendor, state, ros2, rclpy; from std_msgs.msg import String'"
 EXPOSE 15791

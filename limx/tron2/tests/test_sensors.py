@@ -462,6 +462,8 @@ class PackagingTests(unittest.TestCase):
         fragment = yaml.safe_load((DRIVER/'deploy/service.yml').read_text())['limx-tron2']
         self.assertIn('/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro',fragment['volumes'])
         self.assertEqual(fragment['restart'],'always')
+        self.assertIn('ROS_LOG_DIR=/tmp/ros-log', fragment['environment'])
+        self.assertIn('ENV ROS_LOG_DIR=/tmp/ros-log', (DRIVER/'Dockerfile').read_text())
         self.assertNotIn('privileged',fragment)
         self.assertFalse(any('/dev' in v or 'docker.sock' in v or 'runstate' in v for v in fragment['volumes']))
 
