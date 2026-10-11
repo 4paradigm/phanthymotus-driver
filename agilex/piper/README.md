@@ -28,8 +28,8 @@ PIPER_MOTION_ENABLED=0 .venv-piper/bin/python -m agilex.piper.mac_main
 Mac 通过 AVFoundation 选择名称包含 RealSense 的设备，**不会自动选择内置摄像头**。
 仅开放深度/红外、画面无彩色信息或相机权限不足时会报错。
 Mac 不启动 ROS，照片在本地页面显示；`dds_published=false` 如实说明未发布 DDS。
-Ubuntu 的 DDS 画布显示需要在部署时另行验证。
-本次用户要求只提供自己拍摄的照片，已停止 photo 卡片；后续验收不调用相机。
+Ubuntu 的 DDS 显示已用明确标记的文件测试图在真实画布验证，详见验收记录。
+本次用户要求自己提供照片；后续使用文件导入，不调用相机。
 已观察到部分 USB-CAN 关闭重开后需拔插 Mac 一侧 USB 才能恢复；重连稳定性尚未验收。
 
 可传 `--usb-index 0 --port 15741 --data-dir /path/to/acceptance`。
@@ -163,6 +163,11 @@ python3 -m unittest discover -s tests -p 'test_piper*.py'
 重复点击、不支持固件、按键切换、切换超时与连接恢复分别记录。
 历史单机的 J1 演示不算本版六轴/夹爪/模式切换的验收。
 最新记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。
+
+2026-10-11 已在 Ubuntu 真机完成模式往返、初始化、六轴逐轴小幅往返、双轴与停放位返回、
+空载夹爪、动作取消和支撑后失能。收尾为待机、全部失能、运动/相机权限关闭。
+纯手动验收应单独启动所需卡片：全局“智能控制”即使没有 decision_core 卡片，也可能因 ACP
+通知触发后台决策请求。本次收尾已停止智能控制，开机自启动未勾选。
 
 ### 构建与共享运行时说明
 
