@@ -45,7 +45,8 @@ class PiperCardsTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         with patch.dict("os.environ", {"PIPER_MOTION_ENABLED": "0"}):
-            self.plugin = PiperPlugin({"data_dir": self.tmp.name}, driver_factory=FakeDriver)
+            self.plugin = PiperPlugin({"data_dir": self.tmp.name, "async_actions": False}, driver_factory=FakeDriver)
+        self.addCleanup(self.plugin.stop)
         self.bundle = DriverBundle([self.plugin])
 
     def call(self, action, **kwargs):
@@ -57,6 +58,15 @@ class PiperCardsTests(unittest.TestCase):
         self.assertIsNone(self.plugin.driver)
         self.assertFalse(self.call("stop")["motor_torque_released"])
         self.assertIsNone(self.plugin.driver)
+
+    def test_status_has_canvas_read_action_and_safe_lifecycle(self):
+        schema = next(t for t in self.plugin.get_tools() if t["name"] == "piper_status")["inputSchema"]
+        self.assertIn("read", schema["properties"]["action"]["enum"])
+        for action in ("start", "info", "stop"):
+            self.assertIn(self.bundle.dispatch("piper_status", {"action": action})["state"], ("ready", "idle"))
+            self.assertIsNone(self.plugin.driver)
+        self.assertEqual(self.bundle.dispatch("piper_status", {"action": "read"})["error_code"], 0)
+        self.assertEqual(self.plugin.driver.calls, ["connect"])
 
     def test_motion_and_boolean_validation_before_connect(self):
         for action, args in [("move_j1", {"target_deg": 5, "workspace_clear": True, "take_control": True}),
@@ -80,14 +90,12 @@ class PiperCardsTests(unittest.TestCase):
     def test_busy_rejected_and_stop_survives_start_race(self):
         with self.plugin.operation():
             self.plugin.connected()
-            with self.assertRaises(RuntimeError):
-                self.bundle.dispatch("piper_status", {})
-            self.assertEqual(self.call("stop")["state"], "stopping")
+            self.assertEqual(self.bundle.dispatch("piper_status", {})["error_code"], 0)
+            self.assertTrue(self.call("stop")["operation_stopping"])
             with self.assertRaises(RuntimeError):
                 self.call("start")
             self.assertTrue(self.plugin.driver.cancelled.is_set())
-        with self.assertRaises(RuntimeError):
-            self.bundle.dispatch("piper_status", {})
+        self.assertEqual(self.bundle.dispatch("piper_status", {})["error_code"], 0)
         self.call("start")
         self.assertEqual(self.bundle.dispatch("piper_status", {})["error_code"], 0)
 
@@ -167,7 +175,8 @@ class PiperCardsTests(unittest.TestCase):
             self.assertIn("serverInfo", rpc("initialize")["result"])
             cards = rpc("tools/list")["result"]["tools"]
             self.assertEqual({c["name"]: c["type"] for c in cards}, {
-                "piper_status": "resource", "piper_arm": "actuator", "piper_photo": "actuator"})
+                "piper_status": "resource", "piper_mode": "actuator", "piper_arm": "actuator",
+                "piper_gripper": "actuator", "piper_photo": "actuator"})
             response = rpc("tools/call", {"name": "piper_status", "arguments": {}})
             result = json.loads(response["result"]["content"][0]["text"])
             self.assertIsInstance(result, dict)
