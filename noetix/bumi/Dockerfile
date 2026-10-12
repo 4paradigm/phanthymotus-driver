@@ -2,17 +2,18 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
-ARG UBUNTU_MIRROR=http://ports.ubuntu.com/ubuntu-ports
+ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
 
 WORKDIR /work
 
 # The shared ROS base image points apt at Tencent's private mirror, which is
-# unavailable on ordinary networks and on the Bumi host. Replace it before the
-# first apt invocation so this image remains buildable outside Tencent VPC.
+# unavailable on ordinary networks and on the Bumi host. Replace it with the
+# public HTTPS mirror before the first apt invocation; packages remain signed
+# and subject to apt's normal verification.
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         -exec sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_MIRROR}|g" {} + && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
         python3-pip \
         python3-dev \
         ffmpeg \
@@ -29,8 +30,8 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
         librealsense2-dev \
         librealsense2-utils || true && \
     rm -rf /var/lib/apt/lists/*

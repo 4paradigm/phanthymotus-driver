@@ -25,9 +25,11 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_bumi_loco_ser
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -110,6 +112,14 @@ def _sink(card):
     from common.control import ControlSink
     return ControlSink(card._descriptor, card._apply,
                        on_watchdog=card._hold, on_abort=card._hold)
+
+
+def _stream_submit(card, command, sink=None):
+    """Deliver a command through the same path as the ROS subscription."""
+    sink = sink or _sink(card)
+    card._sink = sink
+    card._on_message(SimpleNamespace(data=json.dumps(command)))
+    return sink
 
 
 # ── the descriptor ───────────────────────────────────────────────────────────
@@ -348,12 +358,12 @@ def test_a_refused_command_stops_the_robot_rather_than_leaving_it_walking():
     high_ctrl = FakeHighCtrl()
     card = _card(high_ctrl=high_ctrl, loco=loco, full_scale_vx_mps=0.5)
     sink = _sink(card)
-    sink.submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1))
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1), sink)
     assert card._target == (0.2, 0.0, 0.0)
 
     high_ctrl.mode = 30                      # disabled
     card._mode_checked_at = float("-inf")    # expire the cache, as time would
-    sink.submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2))
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2), sink)
     assert card._target == (0.0, 0.0, 0.0)
     assert loco.published[-1] == (0.0, 0.0, 0.0)
 
@@ -372,17 +382,41 @@ def test_starting_does_not_depend_on_posture():
 def test_a_command_is_refused_while_the_robot_is_not_walking():
     loco = FakeLoco()
     card = _card(high_ctrl=FakeHighCtrl(mode=30), loco=loco)
-    _sink(card).submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    sink = _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
     assert card._refused == 1
     assert "stand_up" in card.dispatch("info", {})["posture_problem"]
     assert (0.0, 0.0, 0.0) in loco.published     # and the chassis was stopped
+    assert sink.counters.get("applied", 0) == 0
+    assert card._last_command["verdict"] == "REJECTED"
+
+
+def test_resume_after_explicit_preemption_rechecks_workmode():
+    """A cached walking result must not survive another card changing posture."""
+    high_ctrl = FakeHighCtrl()
+    loco = FakeLoco()
+    card = _card(high_ctrl=high_ctrl, loco=loco, full_scale_vx_mps=0.5)
+    card._running = True
+    sink = _sink(card)
+
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1), sink)
+    assert high_ctrl.mode_reads == 1
+
+    high_ctrl.mode = 30
+    assert card.pause_for_explicit_command("stand_up_lie_prone") is True
+    assert card.dispatch("resume", {})["state"] == "running"
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2), sink)
+
+    assert high_ctrl.mode_reads == 2
+    assert card._last_command["verdict"] == "REJECTED"
+    assert sink.counters.get("applied", 0) == 1
+    assert card._target == (0.0, 0.0, 0.0)
 
 
 def test_protection_mode_says_protection_rather_than_just_the_number():
     """26 is the mode an operator has to recover from differently, and being
     told 'workmode=26' sends them looking for a stand_up that will be refused."""
     card = _card(high_ctrl=FakeHighCtrl(mode=loco_servo.PROTECTION_MODE))
-    _sink(card).submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
     assert "保护模式" in card.dispatch("info", {})["posture_problem"]
 
 
@@ -390,7 +424,7 @@ def test_a_command_is_refused_when_the_workmode_cannot_be_read():
     """Acting on a failed read is how a safe call becomes a fall."""
     loco = FakeLoco()
     card = _card(high_ctrl=FakeHighCtrl(raises=True), loco=loco)
-    _sink(card).submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
     assert card._refused == 1
     assert loco.published == [(0.0, 0.0, 0.0)]
 
@@ -401,12 +435,12 @@ def test_walking_later_lets_commands_through():
     high_ctrl = FakeHighCtrl(mode=30)
     card = _card(high_ctrl=high_ctrl, loco=loco, full_scale_vx_mps=0.5)
     sink = _sink(card)
-    sink.submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1))
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1), sink)
     loco.published.clear()
 
     high_ctrl.mode = loco_servo.WALKING_MODE
     card._mode_checked_at = float("-inf")
-    sink.submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2))
+    _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2), sink)
     assert loco.published == [(0.2, 0.0, 0.0)]
     assert card._refused == 0
 
@@ -418,7 +452,7 @@ def test_the_workmode_is_not_read_once_per_command():
     card = _card(high_ctrl=high_ctrl, loco=FakeLoco())
     sink = _sink(card)
     for seq in range(1, 6):
-        sink.submit(_command([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], seq=seq))
+        _stream_submit(card, _command([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], seq=seq), sink)
     assert high_ctrl.mode_reads == 1
 
 

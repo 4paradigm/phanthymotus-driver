@@ -54,6 +54,7 @@ import threading
 import time
 
 from common.control import ControlSink, parse_descriptor
+from common.control.sink import Outcome, Verdict
 
 AXIS_NAMES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 DOF = 6
@@ -603,6 +604,9 @@ class LocoServoPlugin:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             self._paused = bool(halted)
+            # A pause may be caused by a card that changes workmode. Never
+            # reuse a one-second mode cache on either side of that transition.
+            self._invalidate_mode_cache()
         if halted:
             self._hold()
         return {"state": "paused" if halted else "running",
@@ -748,6 +752,10 @@ class LocoServoPlugin:
             if not self._running or self._paused:
                 return False
             self._paused = True
+            # The explicit card may change workmode immediately after this
+            # returns. A cached walking result is no longer evidence it is safe
+            # to resume this stream.
+            self._invalidate_mode_cache()
         self._hold()
         print(f"[loco_servo] paused by an explicit command"
               f"{': ' + reason if reason else ''}", flush=True)
@@ -773,13 +781,37 @@ class LocoServoPlugin:
             command = json.loads(message.data)
         except Exception:                                     # noqa: BLE001
             return          # one bad frame must not take the stream down
-        outcome = sink.submit(command)
+        outcome = self._submit(sink, command)
         if outcome is not None and getattr(outcome, "verdict", None) is not None:
             self._last_command = {
                 "verdict": str(getattr(outcome.verdict, "name", outcome.verdict)),
                 "reason": getattr(outcome, "reason", ""),
                 "at": time.time(),
             }
+
+    def _invalidate_mode_cache(self):
+        """Require a controller-mode read before the next streamed command."""
+        self._mode_checked_at = float("-inf")
+        self._posture_problem_text = ""
+
+    def _refuse_posture(self, posture: str) -> Outcome:
+        """Reject before the sink can record the command as applied."""
+        self._refused += 1
+        if self._refused == 1 or self._refused % 100 == 0:
+            print(f"[loco_servo] 拒绝执行（第 {self._refused} 条）：{posture}",
+                  flush=True)
+        self._last_command = {"verdict": "REJECTED", "reason": posture,
+                              "at": time.time()}
+        # The repeat thread may still be sending the prior target.
+        self._hold()
+        return Outcome(Verdict.REJECTED, posture)
+
+    def _submit(self, sink: ControlSink, command: dict) -> Outcome:
+        """Apply posture gating before `ControlSink.submit` records success."""
+        posture = self._posture_problem()
+        if posture:
+            return self._refuse_posture(posture)
+        return sink.submit(command)
 
     # ── the repeat thread ────────────────────────────────────────────────────
 
@@ -872,23 +904,9 @@ class LocoServoPlugin:
             self._suppressed += 1
             vx = vy = 0.0
 
-        # The posture gate lives here, on the command, not on `start`.
-        posture = self._posture_problem()
-        if posture:
-            self._refused += 1
-            # Announced on the transition only. At `expected_hz` a line per
-            # refused command would bury every other log the robot produces.
-            if self._refused == 1 or self._refused % 100 == 0:
-                print(f"[loco_servo] 拒绝执行（第 {self._refused} 条）：{posture}",
-                      flush=True)
-            self._last_command = {"verdict": "REFUSED", "reason": posture,
-                                  "at": time.time()}
-            # A refused command must also stop the robot, not merely fail to
-            # update the target: the repeat thread is still sending whatever was
-            # accepted last, so "we stopped accepting" would otherwise mean
-            # "it keeps walking at the last speed it was told".
-            self._hold()
-            return
+        # `_on_message` performs the posture gate before `ControlSink.submit`.
+        # It must not live in this callback: returning here would still make the
+        # sink report APPLIED and reset its watchdog despite no motion.
 
         self._refused = 0
         self._applied += 1
