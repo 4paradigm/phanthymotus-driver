@@ -3720,8 +3720,13 @@ class SpatialPlugin:
 class MotionSwitcherPlugin:
     PREFIX = "motion_switcher"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, msc_client):
+    def __init__(self, plugin_config: dict, namespace: str, executor, msc_client,
+                 release_verifier=None):
         self._client = msc_client
+        # A future, trusted low-level controller may supply a handoff verifier.
+        # Canvas/config cannot set this; the normal deployment has no verifier.
+        self._release_verifier = release_verifier
+        self._lock = threading.RLock()
 
     def get_tool(self) -> dict:
         return {
@@ -3729,39 +3734,50 @@ class MotionSwitcherPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "G1 high-level motion mode switcher — check current mode, select mode "
-                "(ai/normal/advanced), or release mode for low-level control. "
-                "Modes: ai=AI locomotion, normal=normal locomotion, advanced=advanced mode. "
-                "release frees control for lowcmd/dex3."
+                "G1 high-level motion controller ownership. check reads the active mode; "
+                "select requests ai/normal/advanced (not a movement command). "
+                "DANGER: release is not stop_move; it gives up high-level control and "
+                "a standing robot may fall. "
+                "Release is blocked unless a trusted low-level controller verifies handoff readiness."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["check", "select", "release", "set_silent", "get_silent"],
-                        "description": "Action to perform",
+                        "enum": ["check", "select", "release"],
+                        "description": "check=read; select=request high-level mode; release=dangerous control handoff (blocked by default)",
                     },
                     "mode": {
                         "type": "string",
                         "enum": ["ai", "normal", "advanced"],
-                        "description": "Mode to select (for 'select' action)",
-                    },
-                    "silent": {
-                        "type": "boolean",
-                        "description": "Silent flag (for 'set_silent' action)",
+                        "description": "Required for select. SDK mode name; availability depends on robot firmware.",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "check":      {"params": [],         "description": "Check current motion mode"},
-                    "select":     {"params": ["mode"],   "description": "Select a motion mode (ai/normal/advanced)"},
-                    "release":    {"params": [],         "description": "Release current mode for low-level control"},
-                    "set_silent": {"params": ["silent"], "description": "Set silent mode on/off"},
-                    "get_silent": {"params": [],         "description": "Get current silent mode status"},
+                    "check":   {"params": [],       "description": "Read SDK-reported high-level mode (name/form); no motion"},
+                    "select":  {"params": ["mode"], "description": "Request a high-level mode; verify returned status before assuming completion"},
+                    "release": {"params": [],       "description": "DANGER: not a movement stop; relinquishes high-level control and is blocked without trusted low-level handoff verification"},
                 },
             },
         }
+
+    def _read_mode(self) -> dict:
+        try:
+            code, state = self._client.CheckMode()
+        except Exception as exc:
+            return {"ret": None, "error": f"CheckMode exception: {type(exc).__name__}: {exc}"}
+        if code != 0:
+            return {"ret": code, "error": f"CheckMode failed, code={code}"}
+        if not isinstance(state, dict) or not isinstance(state.get("name"), str):
+            return {"ret": code, "error": "CheckMode returned invalid mode data"}
+        name = state["name"]
+        return {"ret": code, "mode": name, "form": state.get("form"),
+                "mode_meaning": "No high-level controller selected" if not name else
+                                "SDK high-level controller name; behavior depends on firmware",
+                "message": "No high-level mode selected" if not name else
+                           f"SDK reports high-level mode '{name}'"}
 
     def start(self) -> None:
         pass
@@ -3775,34 +3791,82 @@ class MotionSwitcherPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "check":
-            if code != 0:
-                return {"error": f"CheckMode failed, code={code}"}
-            return {"mode": result}
+            return self._read_mode()
         elif action == "select":
-            mode = args.get("mode", "normal")
-            code, _ = self._client.SelectMode(mode)
-            if code != 0:
-                return {"error": f"SelectMode failed, code={code}"}
-            return {"ret": code, "selected": mode}
+            mode = args.get("mode")
+            if mode not in ("ai", "normal", "advanced"):
+                return {"ret": None, "status": "error",
+                        "error": "mode must be ai, normal, or advanced"}
+            with self._lock:
+                before = self._read_mode()
+                if "error" in before:
+                    return {"ret": before["ret"], "status": "error",
+                            "error": f"Cannot select: {before['error']}"}
+                if before["mode"] == mode:
+                    return {"ret": 0, "mode": mode, "selected": mode,
+                            "status": "already_selected", "message": "SDK already reports target mode"}
+                try:
+                    code, _ = self._client.SelectMode(mode)
+                except Exception as exc:
+                    return {"ret": None, "status": "error", "previous_mode": before["mode"],
+                            "error": f"SelectMode exception: {type(exc).__name__}: {exc}"}
+                if code != 0:
+                    return {"ret": code, "status": "error", "previous_mode": before["mode"],
+                            "error": f"SelectMode failed, code={code}: 目标模式被当前设备拒绝，可能不受支持。" if code == 7004 else
+                                     f"SelectMode failed, code={code}"}
+                after = self._read_mode()
+                if "error" in after:
+                    return {"ret": code, "selected": mode, "status": "unconfirmed",
+                            "message": f"Request accepted; mode verification failed: {after['error']}"}
+                return {"ret": code, "mode": after["mode"], "selected": mode,
+                        "status": "confirmed" if after["mode"] == mode else "unconfirmed",
+                        "message": "SDK now reports target mode" if after["mode"] == mode else
+                                   "Request accepted, but SDK does not yet report target mode"}
         elif action == "release":
-            code, _ = self._client.ReleaseMode()
-            if code != 0:
-                return {"error": f"ReleaseMode failed, code={code}"}
-            return {"ret": code, "released": True}
-        elif action == "set_silent":
-            # SetSilent/GetSilent may not be exposed by the client—fallback gracefully
-            silent = bool(args.get("silent", True))
-            try:
-                code, _ = self._client.SetSilent()
-                return {"ret": code, "silent": silent}
-            except Exception as e:
-                return {"error": str(e)}
-        elif action == "get_silent":
-            try:
-                code, _ = self._client.GetSilent()
-                return {"ret": code}
-            except Exception as e:
-                return {"error": str(e)}
+            with self._lock:
+                # CheckMode does not report controller identity or lowcmd readiness.
+                # A user-supplied flag is never accepted as handoff evidence.
+                if self._release_verifier is None:
+                    print("[MotionSwitcher] release blocked: no trusted handoff verifier", flush=True)
+                    return {"ret": None, "released": False, "status": "blocked",
+                            "error": "Release blocked: no trusted low-level controller handoff verifier is installed"}
+                try:
+                    evidence = self._release_verifier()
+                except Exception as exc:
+                    print(f"[MotionSwitcher] release blocked: verifier {type(exc).__name__}", flush=True)
+                    return {"ret": None, "released": False, "status": "blocked",
+                            "error": f"Handoff verification failed: {type(exc).__name__}: {exc}"}
+                if not isinstance(evidence, dict) or evidence.get("ready") is not True or not evidence.get("controller"):
+                    print("[MotionSwitcher] release blocked: handoff not ready", flush=True)
+                    return {"ret": None, "released": False, "status": "blocked",
+                            "error": "Release blocked: trusted verifier did not confirm a ready controller"}
+                before = self._read_mode()
+                if "error" in before:
+                    return {"ret": before["ret"], "released": False, "status": "blocked",
+                            "error": f"Release blocked: {before['error']}"}
+                print(f"[MotionSwitcher] release requested; trusted controller ready; mode={before['mode']}", flush=True)
+                try:
+                    code, _ = self._client.ReleaseMode()
+                except Exception as exc:
+                    print(f"[MotionSwitcher] release exception: {type(exc).__name__}", flush=True)
+                    return {"ret": None, "released": None, "status": "error",
+                            "error": f"ReleaseMode exception: {type(exc).__name__}: {exc}"}
+                if code != 0:
+                    print(f"[MotionSwitcher] release failed; code={code}", flush=True)
+                    return {"ret": code, "released": None, "status": "error",
+                            "error": f"ReleaseMode failed, code={code}"}
+                after = self._read_mode()
+                confirmed = "error" not in after and after["mode"] == ""
+                print(f"[MotionSwitcher] release RPC accepted; mode_cleared={confirmed}", flush=True)
+                return {"ret": code, "released": True if confirmed else None,
+                        "status": "mode_cleared" if confirmed else "unconfirmed",
+                        "mode": after.get("mode"),
+                        "message": "SDK reports no high-level mode; motor control is not verified" if confirmed else
+                                   "Release request accepted; mode state not confirmed"}
+        elif action in ("set_silent", "get_silent"):
+            # Kept as a clear legacy response, but omitted from the advertised schema.
+            return {"ret": None, "status": "unsupported",
+                    "error": "Silent mode is not implemented by the bundled G1 SDK client; no command was sent"}
         return None
 
 
