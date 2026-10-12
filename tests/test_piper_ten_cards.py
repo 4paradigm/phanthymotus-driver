@@ -1,4 +1,4 @@
-"""Public ten-card workflows, command isolation, cancellation and completion."""
+"""Public PiPER card workflows, command isolation, cancellation and completion."""
 from dataclasses import replace
 import json
 import tempfile
@@ -66,7 +66,7 @@ class TenCardTests(unittest.TestCase):
         with patch('agilex.piper.arm.time.sleep'), patch('agilex.piper.arm.time.monotonic', side_effect=clock):
             return func()
 
-    def test_exactly_ten_public_cards_and_start_never_connects(self):
+    def test_exactly_eleven_public_cards_and_start_never_connects(self):
         self.assertEqual({t['name'] for t in self.plugin.get_tools()}, set(TITLES))
         for name in TITLES:
             self.bundle.dispatch(name, {'action': 'start'})
@@ -258,7 +258,7 @@ class TenCardTests(unittest.TestCase):
             self.assertFalse(self.plugin.motion_enabled)
             self.assertTrue(self.plugin.driver.cancelled.is_set())
 
-    def test_http_exposes_ten_and_legacy_tools_cannot_be_called(self):
+    def test_http_exposes_eleven_and_legacy_tools_cannot_be_called(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(lambda: self.bundle, 'test', 'test'))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -268,7 +268,7 @@ class TenCardTests(unittest.TestCase):
                     json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode(),
                     {'Content-Type': 'application/json'})
                 with urllib.request.urlopen(req) as response:return json.load(response)
-            self.assertEqual(len(rpc('tools/list', {})['result']['tools']), 10)
+            self.assertEqual(len(rpc('tools/list', {})['result']['tools']), 11)
             self.assertEqual(rpc('tools/call', {'name': 'piper_arm', 'arguments': {'action': 'prepare'}})['error']['code'], -32601)
             self.assertIsNone(self.plugin.driver)
         finally:

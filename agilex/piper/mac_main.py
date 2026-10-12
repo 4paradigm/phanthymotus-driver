@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the same ten cards on Mac, without requiring ROS or Docker."""
+"""Run the same PiPER cards on Mac, without requiring ROS or Docker."""
 from common import logsafe
 logsafe.install()
 

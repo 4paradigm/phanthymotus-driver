@@ -1,9 +1,10 @@
-"""Ten focused PiPER contracts; Chinese labels are presentation metadata."""
+"""Eleven focused PiPER contracts; Chinese labels are presentation metadata."""
 from common.vendor_runtime import action_schema, tool
 
 
 TITLES = {
-    "piper_status": "机器人状态", "piper_standby": "切换待机",
+    "piper_status": "机器人状态", "piper_limits": "关节限位",
+    "piper_standby": "切换待机",
     "piper_can": "切换电脑控制", "piper_enable": "电机使能",
     "piper_disable": "电机失能", "piper_joint": "单轴运动",
     "piper_gripper": "夹爪开合", "piper_photo": "相机与照片",
@@ -41,7 +42,7 @@ def build_tools(topic):
             oneOf=[{"const": a, "title": text} for a, (_, text) in {**actions, **lifecycle}.items()])
         if confirmations:
             schema["x-confirmation"] = confirmations
-        if name not in {"piper_status", "piper_permission"}:
+        if name not in {"piper_status", "piper_limits", "piper_permission"}:
             schema["x-resource"] = ["arm", "camera"] if name == "piper_photo" else "arm"
             schema["x-is-dangerous"] = name != "piper_photo"
             schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
@@ -53,6 +54,8 @@ def build_tools(topic):
     add("piper_status", "模式、使能、故障分别反馈；只读取，不发送运动指令。",
         {"read": ([], "读取状态"), "firmware": ([], "查询固件"),
          "reconnect": ([], "重新连接（关闭许可并清除预览）")}, kind="resource")
+    add("piper_limits", "展示驱动配置的软件限位；实际可用范围还受 SDK 限位约束；不连接机械臂。",
+        {"read": ([], "查看限位")}, kind="resource")
     for name, label in [("piper_standby", "待机"), ("piper_can", "电脑控制（CAN）")]:
         props = {key: hidden[key] for key in ["execute", "preview_id"]}
         params = []

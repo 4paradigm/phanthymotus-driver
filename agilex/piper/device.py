@@ -1,4 +1,4 @@
-"""Ten focused cards on one shared PiPER runtime and CAN connection."""
+"""Eleven focused cards on one shared PiPER runtime and CAN connection."""
 from dataclasses import asdict
 import math
 import time
@@ -15,7 +15,7 @@ class PiperPlugin(PiperRuntime):
     def _validate(self, name, action, args):
         definition = next((t for t in self.get_tools() if t['name'] == name), None)
         if definition is None:
-            raise ValueError('未知卡片；请刷新十卡片工具列表')
+            raise ValueError('未知卡片；请刷新 PiPER 工具列表')
         properties = definition['inputSchema']['properties']
         if action not in properties['action']['enum']:
             raise ValueError(f'「{TITLES[name]}」不支持此操作；请使用对应功能卡片')
@@ -37,7 +37,7 @@ class PiperPlugin(PiperRuntime):
 
     def dispatch(self, action, args):
         name = args.get('_tool_name', 'piper_status')
-        if name == 'piper_status':
+        if name in {'piper_status', 'piper_limits'}:
             action = args.get('action', 'read')
         self._validate(name, action, args)
         long_action = (name == 'piper_photo' and action in {'capture', 'import_photo'}
@@ -54,7 +54,7 @@ class PiperPlugin(PiperRuntime):
 
     def dispatch_sync(self, action, args):
         name = args.get('_tool_name', 'piper_status')
-        if name == 'piper_status':
+        if name in {'piper_status', 'piper_limits'}:
             action = args.get('action', 'read')
         self._validate(name, action, args)
         if action == 'start':
@@ -84,6 +84,17 @@ class PiperPlugin(PiperRuntime):
                             self.firmware_version = self.connected().firmware(query=True)
                             self.previews.invalidate()
                 return self.status()
+            if name == 'piper_limits':
+                joint_limits = self.config.get('joint_limits_deg')
+                return {
+                    'title': TITLES[name],
+                    'joint_limits_deg': ([
+                        {'joint': f'J{i}', 'min': pair[0], 'max': pair[1]}
+                        for i, pair in enumerate(joint_limits, 1)
+                    ] if joint_limits is not None else None),
+                    'gripper_limits_mm': self.config.get('gripper_limits_mm', [0., 70.]),
+                    'note': '仅显示部署软件限位配置；实际动作还受 SDK 限位约束，最终可用范围可能更窄；未连接机械臂。',
+                }
             if name == 'piper_permission':
                 return self.motion_permission('allow_motion' if action == 'allow' else 'block_motion')
             if name == 'piper_stop':
