@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>PiPER Mac 验收</title>
+<style>
+body{font:15px system-ui;margin:24px;background:#f3f5f8;color:#17202d}h1{font-size:24px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px}
+section{background:white;padding:20px;border-radius:12px;border:1px solid #d8dfe9}
+h2{font-size:18px;margin-top:0}label{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0}
+select,input,button{font:inherit;padding:7px;border:1px solid #b7c4d5;border-radius:6px;max-width:190px}
+button{cursor:pointer;background:#edf3ff;margin:4px 6px 4px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;max-height:400px;overflow:auto}
+img{max-width:100%;border-radius:6px}.error{color:#ad2222}p{line-height:1.6}
+</style>
+<h1>PiPER · Mac 验收</h1>
+<p>先读取状态，再预览动作。运动权限默认关闭。停止会尽力保持；失能需单独确认支撑。<br>Mac 显示本地照片；ROS 画布图像发布需 Ubuntu 环境验收。</p>
+<div class="cards" id="cards"></div>
+<script type="module">
+import {fieldOptions, confirmedAction} from '/card-controls.js';
+async function rpc(method, params={}) {
+  const response=await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+  const body=await response.json();
+  if(body.error)throw Error(body.error.message);
+  return body.result;
+}
+function show(section,result,error=false) {
+  const pre=section.querySelector('pre');pre.className=error?'error':'';
+  pre.textContent=typeof result==='string'?result:JSON.stringify(result,null,2);
+  if(result?.output){const img=section.querySelector('img');img.src='/photo?name='+encodeURIComponent(result.output.split('/').pop());img.hidden=false;}
+}
+async function call(name,args) {
+  const result=await rpc('tools/call',{name,arguments:args});
+  if(result.isError)throw Error(result.content[0].text);
+  return JSON.parse(result.content[0].text);
+}
+async function finish(section,name,result) {
+  show(section,result);
+  if(!result.action_id)return;
+  const deadline=Date.now()+65000;
+  while(Date.now()<deadline) {
+    await new Promise(resolve=>setTimeout(resolve,350));
+    const info=await call(name,{action:'info'});
+    if(info.last_action?.action_id===result.action_id){show(section,info.last_action.result,info.last_action.status!=='completed');return;}
+  }
+  show(section,'未收到完成结果；请使用停止动作并读取状态。',true);
+}
+(async()=>{
+  const tools=(await rpc('tools/list')).tools;
+  for(const t of tools) {
+    const s=document.createElement('section');
+    const title=document.createElement('h2');title.textContent=t.title||t.name;s.append(title);
+    const desc=document.createElement('p');desc.textContent=t.description;s.append(desc);
+    const select=document.createElement('select');
+    for(const o of fieldOptions(t.inputSchema.properties.action).filter(o=>!['start','stop','info'].includes(o.value))){
+      const option=document.createElement('option');option.value=o.value;option.textContent=o.label;select.append(option);
+    }
+    if(select.options.length>1)s.append(select);
+    const form=document.createElement('div');s.append(form);
+    function draw() {
+      form.replaceChildren();
+      const params=t.inputSchema['x-action-params'][select.value]?.params||[];
+      for(const key of params) {
+        const p=t.inputSchema.properties[key];if(p['x-ui-hidden'])continue;
+        const label=document.createElement('label');const text=document.createElement('span');text.textContent=p.title||key;label.append(text);
+        const input=document.createElement(p.enum||p.oneOf?'select':'input');input.dataset.key=key;input.dataset.type=p.type;
+        if(p.enum||p.oneOf){for(const o of fieldOptions(p)){const option=document.createElement('option');option.value=String(o.value);option.textContent=o.label;input.append(option);}}
+        else{input.type=['number','integer'].includes(p.type)?'number':'text';input.step=p.type==='integer'?'1':'any';if(p.minimum!==undefined)input.min=p.minimum;if(p.maximum!==undefined)input.max=p.maximum;}
+        if(p.default!==undefined)input.value=p.default;
+        label.append(input);form.append(label);
+      }
+      applyConditions();
+    }
+    function applyConditions() {
+      for(const input of form.querySelectorAll('[data-key]')) {
+        const conditions=t.inputSchema.properties[input.dataset.key]['x-visible-when'];
+        const visible=!conditions||Object.entries(conditions).every(([key,v])=>form.querySelector(`[data-key="${key}"]`)?.value===String(v));
+        input.parentElement.hidden=!visible;
+      }
+    }
+    form.onchange=applyConditions;select.onchange=draw;draw();
+    const execute=document.createElement('button');execute.textContent='执行';
+    execute.onclick=async()=>{
+      const args={action:select.value};
+      for(const input of form.querySelectorAll('[data-key]')) {
+        if(input.parentElement.hidden||input.value==='')continue;
+        args[input.dataset.key]=input.dataset.type==='boolean'?input.value==='true':['integer','number'].includes(input.dataset.type)?Number(input.value):input.value;
+      }
+      execute.disabled=true;
+      try {const result=await confirmedAction(t.inputSchema,args,{call:a=>call(t.name,a),confirm:message=>window.confirm(message),showPreview:p=>show(s,p)});await finish(s,t.name,result);}
+      catch(e){show(s,e.message,true);}finally{execute.disabled=false;}
+    };
+    s.append(execute);const info=document.createElement('button');info.textContent='查看完成结果';info.onclick=async()=>show(s,await call(t.name,{action:'info'}));s.append(info);
+    s.append(document.createElement('pre'));const img=document.createElement('img');img.alt='本次 RGB 照片';img.hidden=true;s.append(img);
+    document.getElementById('cards').append(s);
+  }
+})().catch(e=>{document.getElementById('cards').textContent=e.message;});
+</script></html>
