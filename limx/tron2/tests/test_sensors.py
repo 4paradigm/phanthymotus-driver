@@ -438,6 +438,60 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             adapter.call('battery_state', {'action': 'start'})
 
+    async def test_arm_control_tool_appears_when_enabled(self):
+        adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
+        tools = adapter.tools()
+        names = {t['name'] for t in tools}
+        self.assertIn('arm_control', names)
+        arm = next(t for t in tools if t['name'] == 'arm_control')
+        self.assertEqual(arm['type'], 'actuator')
+        props = arm['inputSchema']['properties']
+        self.assertEqual(props['action']['enum'], ['move'])
+        self.assertEqual(props['joint']['minItems'], 16)
+        self.assertEqual(props['joint']['maxItems'], 16)
+
+    async def test_arm_control_move_rejects_wrong_joint_count(self):
+        adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
+        adapter.reader.accept_info(info())
+        adapter.reader.ws = MagicMock()
+        with self.assertRaises(ValueError):
+            adapter.call('arm_control', {'action': 'move', 'joint': [0.0] * 14})
+
+    async def test_arm_control_move_rejects_non_numeric_joints(self):
+        adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
+        adapter.reader.accept_info(info())
+        adapter.reader.ws = MagicMock()
+        with self.assertRaises(ValueError):
+            adapter.call('arm_control', {'action': 'move', 'joint': [0.0] * 15 + ['bad']})
+
+    async def test_arm_control_move_sends_movej_command(self):
+        adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
+        adapter.reader.accept_info(info())
+        mock_ws = MagicMock()
+        adapter.reader.ws = mock_ws
+        error, result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: adapter.call('arm_control', {
+                'action': 'move', 'joint': [0.1] * 16, 'time': 1.5}))
+        self.assertFalse(error)
+        self.assertEqual(result['action'], 'move')
+        self.assertEqual(result['joint_count'], 16)
+        self.assertEqual(result['time'], 1.5)
+        self.assertEqual(result['status'], 'sent')
+        call_args = mock_ws.send_json.call_args
+        self.assertIsNotNone(call_args)
+        payload = call_args[0][0]
+        self.assertEqual(payload['title'], 'request_movej')
+        self.assertEqual(payload['data']['joint'], [0.1] * 16)
+        self.assertEqual(payload['data']['time'], 1.5)
+
+    async def test_arm_control_rejects_invalid_action(self):
+        adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
+        adapter.reader.accept_info(info())
+        adapter.reader.ws = MagicMock()
+        error, result = await self.call('arm_control', action='info')
+        self.assertTrue(error)
+        self.assertIn('Unsupported actuator action', result['error'])
+
     async def test_json_rpc_notification_and_parse_errors(self):
         async with self.session.post(self.url+'/mcp', json={
                 'jsonrpc': '2.0', 'method': 'notifications/initialized'}) as response:

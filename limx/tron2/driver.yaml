@@ -6,10 +6,11 @@ hardware_model: tron2
 image_name: limx-tron2
 port: 15791
 mcp_url: "http://localhost:15791/mcp"
-description: "TRON2 三张只读卡片：关节角(rad/deg)、设备模式/固件状态、电池 soc/voltage/current/power；电压电流保留原始单位，功率未确认时为空"
+description: "TRON2 只读卡片（关节/状态/电池）与双臂运动控制卡片"
 build_context_extras:
   - ../../common
 cards:
   - {name: joint_state, type: sensor}
   - {name: robot_status, type: sensor}
   - {name: battery_state, type: sensor}
+  - {name: arm_control, type: actuator}

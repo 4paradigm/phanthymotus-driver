@@ -23,6 +23,7 @@ class RobotReader:
         self.info_received = self.joints_received = None
         self.last_error = None
         self.last_round_trip = None
+        self.ws = None
 
     def disconnect(self, reason):
         self.connected = False
@@ -90,6 +91,16 @@ class RobotReader:
             self.last_error = None
             return
 
+    async def send_movej(self, q, move_time):
+        """Send a single movej command (16 joint angles + duration)."""
+        if len(q) != 16:
+            raise ValueError('movej requires exactly 16 joint angles')
+        guid = str(uuid.uuid4())
+        await self.ws.send_json({'title': 'request_movej',
+                                 'accid': self.serial, 'guid': guid,
+                                 'timestamp': int(time.time() * 1000),
+                                 'data': {'joint': q, 'time': move_time}})
+
     def sample(self, name):
         info_card = name != 'joint_state'
         at = self.info_at if info_card else self.joints_at
@@ -120,6 +131,7 @@ class RobotReader:
                 self.disconnect(None)
                 async with session.ws_connect(self.settings['url'], autoping=True,
                         max_msg_size=256 * 1024) as ws:
+                    self.ws = ws
                     deadline = time.monotonic() + self.settings['response_timeout_seconds']
                     while not self.connected:
                         await self.receive(ws, deadline)

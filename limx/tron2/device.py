@@ -19,6 +19,7 @@ DESCRIPTIONS = {
     'joint_state': 'TRON2 实时读取关节位置（rad/deg）、速度和力矩；名称缺失时显示索引',
     'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
     'battery_state': 'TRON2 电量 soc（%）、电压 voltage（mV）、电流 current（mA）、功率 power（W）、温度 temp（℃）；单位未确认时相关字段为 null（只读）',
+    'arm_control': 'TRON2 双臂关节运动控制 — 一次命令移动全部 16 个关节到目标角度',
 }
 
 
@@ -49,13 +50,47 @@ class Adapter:
                 'properties': {**metadata_properties()}},
             'topic_out': [{'topic': TOPICS['battery_state'], 'format': 'data/json'}]}
 
+    def _arm_control_tool(self):
+        """Arm actuator — movej joint-space motion control."""
+        return {
+            'name': 'arm_control',
+            'type': 'actuator',
+            'multiInstance': False,
+            'description': DESCRIPTIONS['arm_control'],
+            'inputSchema': {
+                'type': 'object',
+                'additionalProperties': False,
+                'properties': {
+                    'action': {'type': 'string', 'enum': ['move']},
+                    'joint': {
+                        'type': 'array',
+                        'minItems': 16,
+                        'maxItems': 16,
+                        'items': {'type': 'number'},
+                        'description': 'Target angles for all 16 joints in order',
+                    },
+                    'time': {
+                        'type': 'number',
+                        'minimum': 0.1,
+                        'maximum': 60,
+                        'default': 2.0,
+                        'description': 'Movement duration in seconds',
+                    },
+                    **metadata_properties(),
+                },
+                'required': ['action', 'joint'],
+            },
+        }
+
     def tools(self):
         tools = []
         # Battery card uses Unitree pattern: no action required, auto-publish
         if 'battery_state' in self.enabled:
             tools.append(self._battery_tool())
+        if 'arm_control' in self.enabled:
+            tools.append(self._arm_control_tool())
         for name in self.enabled:
-            if name == 'battery_state':
+            if name in ('battery_state', 'arm_control'):
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -93,9 +128,25 @@ class Adapter:
             if action == 'info':
                 result['sample'] = self.reader.sample(name)
             return result
+        if name == 'arm_control':
+            if action != 'move':
+                raise ValueError('Unsupported actuator action')
+            joint = args.get('joint')
+            if not isinstance(joint, list) or len(joint) != 16:
+                raise ValueError('arm_control requires exactly 16 joint angles')
+            if any(not isinstance(j, (int, float)) or isinstance(j, bool) for j in joint):
+                raise ValueError('Joint angles must be numbers')
+            move_time = args.get('time', 2.0)
+            if not isinstance(move_time, (int, float)) or isinstance(move_time, bool):
+                raise ValueError('time must be a number')
+            try:
+                asyncio.get_event_loop().create_task(self.reader.send_movej(joint, move_time))
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(self.reader.send_movej(joint, move_time))
+            return {'action': 'move', 'joint_count': 16, 'time': move_time,
+                    'actuator': True, 'status': 'sent'}
         if action not in ('info', 'start', 'stop'):
-            raise ValueError('Unsupported sensor action')
-        # Single-instance sensors remain on; lifecycle calls do not affect the robot.
         result = {'state': 'idle' if action == 'stop' else 'running', 'read_only': True,
                   'always_on': True, 'topic_out': [{'topic': TOPICS[name], 'format': 'data/json'}]}
         if action == 'info':
