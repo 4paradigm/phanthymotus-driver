@@ -540,6 +540,16 @@ class A3Nodes:
         audio_qos = QoSProfile(depth=10, reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
                                                               QoSReliabilityPolicy.BEST_EFFORT),
                                 durability=QoSDurabilityPolicy.VOLATILE)
+        # Motion-control feedback publishers on the inspected A3 advertise
+        # RELIABLE (the vendor guide's BEST_EFFORT note is stale for this
+        # firmware). A BEST_EFFORT subscriber is DDS-incompatible and yields
+        # the exact "offering incompatible QoS" warning, leaving joints and
+        # hand feedback empty. Keep media on sensor QoS, but use reliable QoS
+        # for the small state channels.
+        joint_qos = QoSProfile(depth=10,
+                               reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
+                                                    QoSReliabilityPolicy.BEST_EFFORT),
+                               durability=QoSDurabilityPolicy.VOLATILE)
 
         self.streams = {}
         self._joint_cache = {}
@@ -664,11 +674,11 @@ class A3Nodes:
         self._encode_and_publish = self._encode_and_publish_frame
 
         # -- joint / state streams (plain sensor_msgs types) --
-        mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
-        mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
-        mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json")
-        mirror("waist_state", JointState, "/motion/control/waist_joint_state", "data/json")
-        mirror("leg_state", JointState, "/motion/control/leg_joint_state", "data/json")
+        mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json", qos=joint_qos)
+        mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json", qos=joint_qos)
+        mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json", qos=joint_qos)
+        mirror("waist_state", JointState, "/motion/control/waist_joint_state", "data/json", qos=joint_qos)
+        mirror("leg_state", JointState, "/motion/control/leg_joint_state", "data/json", qos=joint_qos)
         mirror("lidar_cloud", PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", "sensor/pointcloud")
         mirror("imu_pelvis", Imu, "/ros2/body_drive/pelvis_imu/data", "data/json")
         mirror("imu_torso", Imu, "/ros2/body_drive/torso_imu/data", "data/json")
@@ -1078,7 +1088,25 @@ class A3Nodes:
         """
         wrapper = self._wrapper_type(ros2)()
         wrapper.serialization_type = "pb"
-        wrapper.data = self._encode_pb(proto_dict)
+        encoded = self._encode_pb(proto_dict)
+        # rosidl represents IDL ``byte[]`` differently across Humble/Jazzy
+        # generated bindings: one accepts a bytes object, another requires a
+        # sequence whose elements are bytes objects. Try the native form first
+        # and fall back to the latter without changing the wire payload.
+        # ROS IDL ``byte`` is exposed by some Humble generators as a
+        # one-byte ``bytes`` element (rather than an integer).  The wire
+        # payload must therefore be tried in both native forms; the per-byte
+        # form is the portable fallback and avoids wrapping the complete
+        # protobuf as one oversized element.
+        byte_elements = [bytes((value,)) for value in encoded]
+        for candidate in (encoded, byte_elements, [encoded], list(encoded)):
+            try:
+                wrapper.data = candidate
+                break
+            except (TypeError, ValueError):
+                continue
+        else:
+            raise TypeError("RosMsgWrapper.data cannot accept serialized protobuf bytes")
         message_type = self._PB_TOPIC_MESSAGES.get(self._pb_topic, "")
         message_class = (self._pb or {}).get("commands", {}).get(message_type)
         if message_class is not None and hasattr(wrapper, "context"):
@@ -1105,10 +1133,34 @@ class A3Nodes:
             # keeps the concise velocity arguments, so add the envelope here.
             if message.DESCRIPTOR.full_name.endswith("MotionControlLocomotionVelocityChannel"):
                 proto_dict = {"data": proto_dict}
+            # AimDK ROS command channels carry the same timestamp/control
+            # header as the SDK examples.  Without it the topic is discoverable
+            # but MDU treats the sample as an anonymous/stale command.  Use the
+            # manual source for direct actuator cards; face/loco/waist all share
+            # this channel convention.
+            if "header" in message.DESCRIPTOR.fields_by_name and "header" not in proto_dict:
+                now = datetime.now(timezone.utc)
+                proto_dict = {
+                    "header": {
+                        "timestamp": {
+                            "seconds": int(now.timestamp()),
+                            "nanos": now.microsecond * 1000,
+                            "ms_since_epoch": int(now.timestamp() * 1000),
+                        },
+                        "control_source": "ControlSource_MANUAL",
+                        "uuid": "",
+                    },
+                    **proto_dict,
+                }
             _fill_protobuf(message, proto_dict)
             return message.SerializeToString()
-        except Exception:
-            return json.dumps(proto_dict, ensure_ascii=False).encode()
+        except Exception as exc:
+            # A JSON fallback is not a valid command for a protobuf carrier.
+            # Publishing it makes the card report success while the firmware
+            # silently ignores the command. Fail at the driver boundary with
+            # the actual serialization error instead.
+            raise RuntimeError(
+                f"cannot encode {message_type} protobuf command: {exc}") from exc
 
     def publish_wrapper(self, pub_attr, payload):
         """Fill + publish a RosMsgWrapper command onto a robot-domain topic."""
@@ -1369,7 +1421,23 @@ class A3Nodes:
             out = self._AudioPlayback()
             if hasattr(out, "stamps") and hasattr(msg, "header"):
                 out.stamps = msg.header.stamp
-            out.data = msg.data
+            # AudioPlayback.msg contains AudioData data, not a raw byte array.
+            # Assigning AudioChunk.data directly raises a generated-message
+            # type error and silently leaves the speaker disconnected.
+            audio_data = getattr(out, "data", None)
+            if hasattr(audio_data, "data"):
+                payload = list(bytes(getattr(msg, "data", b"")))
+                audio_data.data = payload
+                if hasattr(audio_data, "stamps") and hasattr(msg, "header"):
+                    audio_data.stamps = msg.header.stamp
+                audio_info = getattr(out, "info", None)
+                if audio_info is not None:
+                    audio_info.channels = 1
+                    audio_info.sample_rate = 16000
+                    audio_info.sample_format = "S16LE"
+                    audio_info.coding_format = "PCM"
+            else:
+                out.data = list(bytes(getattr(msg, "data", b"")))
             out.pkg_name = "phanthymotus"
             out.token_id = "phanthymotus"
             self.speaker_pub.publish(out)
@@ -2052,10 +2120,19 @@ def _mc_current_state(rpc):
     command.action. Actuator callers treat an empty result as UNKNOWN and fail
     closed; mc_mode itself can still query the runtime action list to recover.
     """
+    return _mc_current_state_from_response(rpc.get_action())
+
+
+def _mc_action_status(rpc):
+    """Return the vendor action status alongside the normalized action."""
     response = rpc.get_action()
-    # AimDK 3.2 returns the live state under `info.current_action`; older
-    # firmware used `data.state`/`action`. Search all known envelopes so the
-    # safety gate never treats PASSIVE as an unknown permissive state.
+    state = _mc_current_state_from_response(response)
+    info = response.get("info") if isinstance(response, dict) else None
+    status = str((info or {}).get("status") or response.get("status", "")).upper()
+    return state, status, response
+
+
+def _mc_current_state_from_response(response):
     containers = [response, response.get("info") or {}, response.get("data") or {}]
     for container in containers:
         if isinstance(container, dict):
@@ -2138,10 +2215,10 @@ class McModePlugin:
             ("get_state", "查询当前运动控制动作状态（GetAction，异步切换结果确认）"),
             ("available", "查询当前可用动作列表（GetAvailableActions）"),
             ("damping", "进入 Damping 阻尼模式（关节卸力，用于软急停/跌倒保护）"),
-            ("get_up", "执行 GetUp 起身动作，从坐/躺恢复到站立平衡（MOTION）"),
+            ("get_up", "执行 GetUp 起身动作并在完成后自动切入 MOTION 可控态"),
             ("lie_down", "执行 LieDown 坐/躺下动作（仅 MOTION 站立态可进入）"),
             ("passive", "进入 Passive 拖动示教模式（仅 MOTION 站立态可进入）"),
-            ("motion", "GetUp 完成后切入 MOTION 运行态（执行动作卡前必须完成）"),
+            ("motion", "兼容旧接口：GetUp 完成后手动切入 MOTION 运行态"),
             ("pd_stand", "GetUp 完成后进入 PD_STAND 稳定站立态"),
         )
     }
@@ -2155,9 +2232,9 @@ class McModePlugin:
         # during one — undeclared means exclusive against everything, which is exactly
         # right here. Aborting a controlled get_up/lie_down partway is how a robot
         # falls over.
-        return tool("mc_mode", "actuator", "运动控制状态机查询与模式切换（SetAction：get_up/lie_down/damping/passive；"
-                                          "get_state/available 查询当前动作与可用动作；get_up 完成后还需 motion/PD_STAND 进入可控的 MOTION，"
-                                          "非法迁移返回建议）",
+        return tool("mc_mode", "actuator", "运动控制状态机查询与模式切换（get_up 完成后自动进入 MOTION；"
+                                          "available 查询运行时动作；damping 为卸力保护，passive 为拖动示教，"
+                                          "lie_down 为受控躺下，非法迁移返回建议）",
                     action_schema(self.ACTIONS, {}))
 
     def start(self):
@@ -2203,7 +2280,48 @@ class McModePlugin:
                                   f"请先满足前置状态（通常为 get_up 站立）",
                     "available": commands}
         response = self.nodes.rpc.set_action(service_action, "")
-        return {"requested": short, "current": normalized, "response": response}
+        result = {"requested": short, "current": normalized, "response": response}
+        if action == "get_up":
+            # GET_UP is an asynchronous recovery action.  Make the public
+            # operation atomic: wait for recovery to leave GET_UP, then enter
+            # MOTION so subsequent arm/hand/waist/loco commands work after a
+            # single get_up request.
+            deadline = time.monotonic() + 30.0
+            settled = ""
+            action_status = ""
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                try:
+                    settled, action_status, _ = _mc_action_status(self.nodes.rpc)
+                except Exception:
+                    settled = ""
+                    action_status = ""
+                normalized_status = action_status.replace("MOTIONCONTROLACTIONSTATUS_", "")
+                running = normalized_status in {"", "RUNNING", "EXECUTING", "STARTED", "ACTIVE"}
+                if settled not in {"", "GET_UP"} or (settled == "GET_UP" and not running):
+                    break
+            normalized_status = action_status.replace("MOTIONCONTROLACTIONSTATUS_", "")
+            get_up_finished = settled == "GET_UP" and normalized_status not in {
+                "", "RUNNING", "EXECUTING", "STARTED", "ACTIVE"}
+            if settled == "" or (settled == "GET_UP" and not get_up_finished):
+                result.update({"state": "pending", "current": settled or "GET_UP",
+                               "suggestion": "GetUp 尚未完成，请稍后查询 mc_mode get_state"})
+                return result
+            if settled == "GET_UP" and get_up_finished:
+                motion_response = self.nodes.rpc.set_action(MC_ACTIONS["motion"][0], "")
+                result["auto_motion"] = motion_response
+                settled = "MOTION"
+            if settled not in {"MOTION", "PD_STAND"}:
+                result.update({"state": "rejected", "current": settled,
+                               "suggestion": "GetUp 未进入可控站立态，请查询 mc_mode get_state"})
+                return result
+            if settled == "PD_STAND":
+                motion_response = self.nodes.rpc.set_action(MC_ACTIONS["motion"][0], "")
+                result["auto_motion"] = motion_response
+                settled = "MOTION"
+            result.update({"state": "ready", "current": settled,
+                           "suggestion": "GetUp 已完成，已自动进入 MOTION"})
+        return result
 
 
 class LocoPlugin:
@@ -2558,12 +2676,11 @@ class HandControlPlugin:
             if values is None:
                 continue
             for i, value in enumerate(values):
-                live_names = live_left if side == "left" else live_right
-                # Prefer the names reported by the active O10Hand/AgiHand.
-                # Some firmware accepts only these channel labels; indexed
-                # names remain the documented fallback when no feedback has
-                # arrived yet.
-                name = live_names[i] if i < len(live_names) else f"{side}_hand_joint_{i}"
+                # Feedback uses descriptive finger labels on some firmware,
+                # but the command endpoint accepts only its indexed six-joint
+                # names. Sending feedback labels makes the firmware apply at
+                # most the thumb channel and ignore the remaining fingers.
+                name = f"{side}_hand_joint_{i}"
                 positions[name] = _clamp(float(value), 0.0, max_value, f"{side} 手指 {i}")
         _require(positions, "至少提供 left 或 right 张合等级")
         rejected = _motion_gate(self.nodes.rpc, "hand_control")
