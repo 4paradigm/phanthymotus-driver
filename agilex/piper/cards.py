@@ -6,6 +6,7 @@ TITLES = {
     "piper_status": "机器人状态", "piper_standby": "切换待机",
     "piper_can": "切换电脑控制", "piper_enable": "电机使能",
     "piper_disable": "电机失能", "piper_joint": "单轴运动",
+    "piper_cartesian": "末端空间移动",
     "piper_gripper": "夹爪开合", "piper_photo": "相机与照片",
     "piper_permission": "操作许可", "piper_stop": "停止动作",
 }
@@ -83,6 +84,16 @@ def build_tools(topic):
          "speed_pct": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5, "title": "SDK 速度上限（%）"}},
         {"move": {"preview": {"action": "move", "execute": False}, "execute": {"execute": True, **confirm_motion},
                   "message": "确认其他控制程序已停止、预览目标正确、活动范围无人无障碍，且可及时停止。"}})
+    add("piper_cartesian", "保持末端姿态，沿基座 X/Y/Z 轴小幅移动；关节插补，先预览再确认。不是避障规划。",
+        {"read": ([], "读取末端位置"),
+         "move": (["axis", "distance_mm", "speed_deg_s", "speed_pct"], "沿基座坐标轴移动")},
+        {**hidden, "axis": choice("基座坐标轴", [("x", "X 轴"), ("y", "Y 轴"), ("z", "Z 轴")], "z"),
+         "distance_mm": {"type": "number", "minimum": -20, "maximum": 20, "default": 5, "title": "带正负号的移动距离（mm）"},
+         "speed_deg_s": {"type": "number", "minimum": .5, "maximum": 5, "default": 1, "title": "关节速度上限（°/秒）"},
+         "speed_pct": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5, "title": "SDK 速度上限（%）"}},
+        {"move": {"preview": {"action": "move", "execute": False},
+                  "execute": {"execute": True, **confirm_motion},
+                  "message": "确认所选机械臂、基座坐标轴与目标正确；其他控制程序已停止，整个机械臂、相机和夹爪活动空间清空，可及时停止。"}})
     add("piper_gripper", "只负责开合；使能和失能请用独立电机卡片。张开到上限，闭合到下限。",
         {"read": ([], "读取夹爪"), "open": (["torque_nm"], "张开至最大开度"),
          "close": (["torque_nm"], "闭合至最小开度"),
@@ -111,12 +122,13 @@ def build_tools(topic):
             "piper_can": {"switch": ["execute", "preview_id"]},
             "piper_enable": {"enable": ["execute", "preview_id", "workspace_clear", "take_control", "allow_limit_adjustment"]},
             "piper_joint": {"move": ["execute", "preview_id", "workspace_clear", "take_control"]},
+            "piper_cartesian": {"move": ["execute", "preview_id", "workspace_clear", "take_control"]},
             "piper_gripper": {a: ["execute", "preview_id", "workspace_clear", "take_control"] for a in ["open", "close", "set_width"]},
             "piper_photo": {"capture": ["capture_confirmed"]},
         }
         for action, params in internal_params.get(name, {}).items():
             definition["inputSchema"]["x-action-params"][action]["params"] += params
-        completions = {"piper_enable": ["enable"], "piper_joint": ["move"],
+        completions = {"piper_enable": ["enable"], "piper_joint": ["move"], "piper_cartesian": ["move"],
                        "piper_gripper": ["open", "close", "set_width"], "piper_photo": ["capture", "import_photo"]}
         if definition["name"] in completions:
             definition["inputSchema"]["x-completion"] = {"actions": completions[definition["name"]], "timeout": 60}

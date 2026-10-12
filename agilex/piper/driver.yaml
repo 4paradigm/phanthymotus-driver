@@ -6,7 +6,7 @@ hardware_model: piper
 image_name: agilex-piper
 port: 15741
 mcp_url: "http://localhost:15741/mcp"
-description: "PiPER 十卡片：状态、待机、CAN、使能、失能、单轴、夹爪、照片、许可、停止。中文提示，默认关闭运动许可。"
+description: "PiPER 十一卡片：状态、待机、CAN、使能、失能、单轴、夹爪、照片、许可、停止。中文提示，默认关闭运动许可。"
 build_context_extras:
   - ../../common
 cards:
@@ -15,6 +15,7 @@ cards:
   - { name: piper_can, type: actuator }
   - { name: piper_enable, type: actuator }
   - { name: piper_disable, type: actuator }
+  - { name: piper_cartesian, type: actuator }
   - { name: piper_joint, type: actuator }
   - { name: piper_gripper, type: actuator }
   - { name: piper_photo, type: actuator }

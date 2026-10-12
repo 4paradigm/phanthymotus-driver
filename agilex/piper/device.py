@@ -1,12 +1,19 @@
 """Ten focused cards on one shared PiPER runtime and CAN connection."""
 from dataclasses import asdict
 import math
+import copy
+import json
 import time
 
+from agilex.piper import cartesian
 from agilex.piper.cards import TITLES, build_tools
 from agilex.piper.control import healthy, mode_name, ready_to_move, teaching_stopped
 from agilex.piper.runtime import PiperRuntime, confirm, number
 
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cartesian_preview = None
 
 class PiperPlugin(PiperRuntime):
     def get_tools(self):
@@ -42,6 +49,7 @@ class PiperPlugin(PiperRuntime):
         self._validate(name, action, args)
         long_action = (name == 'piper_photo' and action in {'capture', 'import_photo'}
                        or name in {'piper_enable', 'piper_joint'} and args.get('execute') is True
+                       or name == 'piper_cartesian' and action == 'move' and args.get('execute') is True
                        or name == 'piper_gripper' and action in {'open', 'close', 'set_width'} and args.get('execute') is True)
         if long_action and self.config.get('async_actions', True):
             previous = getattr(self.worker_context, 'operation_object', None)
@@ -101,6 +109,8 @@ class PiperPlugin(PiperRuntime):
                     raise ValueError('请填写所选关节的绝对目标角度（°）')
                 translated = {**args, '_tool_name': 'piper_arm'}
                 return super().dispatch_sync('move_joint', translated)
+            if name == 'piper_cartesian':
+                return self.cartesian_action(action, args)
             if name == 'piper_gripper':
                 if action != 'read':
                     grip = self.connected().get_gripper()
@@ -115,6 +125,48 @@ class PiperPlugin(PiperRuntime):
             self.worker_context.public_call = previous
             self.worker_context.operation_object = previous_object
 
+    def cartesian_action(self, action, args):
+        if action == 'read':
+            with self.connection_lock:
+                try:
+                    return cartesian.read_pose(self.connected())
+                except Exception:
+                    self.previews.invalidate()
+                    raise
+        axis = args.get('axis', 'z')
+        distance = number(args, 'distance_mm', 5, -20, 20)
+        if abs(distance) < .1:
+            raise ValueError('移动距离绝对值须为 0.1–20 mm')
+        rate = number(args, 'speed_deg_s', 1, .5, 5)
+        speed = number(args, 'speed_pct', 5, 1, 10, integer=True)
+        execute = args.get('execute', False)
+        if execute:
+            self.motion_allowed(args)
+            confirm(args, 'take_control')
+        key = json.dumps(['cartesian', axis, distance, rate, speed])
+        with self.operation('piper_cartesian', action):
+            driver = self.connected()
+            state = self.read_state()
+            ready_to_move(state)
+            if not execute:
+                self.previews.invalidate()
+                if not driver.stationary():
+                    raise RuntimeError('请等待机械臂静止，再预览末端位移')
+                state = self.read_state()
+                plan, model = cartesian.plan(driver, state, axis, distance, rate, speed)
+                driver._check_cancelled()
+                self.cartesian_preview = (key, copy.deepcopy(plan), model)
+                return {**plan, **self.previews.put(key, state)}
+            self.require_motion_permission()
+            self.previews.consume(args.get('preview_id') or None, key, state)
+            if self.cartesian_preview is None or self.cartesian_preview[0] != key:
+                raise RuntimeError('末端位移预览已失效，请重新预览')
+            _, plan, model = self.cartesian_preview
+            self.cartesian_preview = None
+            # Recheck the current pose against the frozen target after consuming
+            # the one-use preview; never shift a relative target at execution.
+            driver._check_cancelled()
+            return cartesian.execute(driver, plan, model)
     def status(self):
         result = super().status()
         result['active_title'] = TITLES.get(result['active_card'])
@@ -205,7 +257,7 @@ class PiperPlugin(PiperRuntime):
                     'message': '已确认失能；相应电机保持力已释放'}
 
     def halt(self, target):
-        affected_cards = {'piper_joint', 'piper_enable', 'piper_disable', 'piper_standby', 'piper_can'}
+        affected_cards = {'piper_joint', 'piper_cartesian', 'piper_enable', 'piper_disable', 'piper_standby', 'piper_can'}
         if target == 'gripper':
             affected_cards = {'piper_gripper'}
         elif target == 'all':

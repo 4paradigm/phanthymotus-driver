@@ -191,7 +191,7 @@ class PiperRuntime:
                 self.closed = True
             else:
                 self.stopped_cards.add(name)
-            if name is None or name in {"piper_arm", "piper_joint", "piper_permission"}:
+            if name is None or name in {"piper_arm", "piper_joint", "piper_cartesian", "piper_permission"}:
                 self.revoke_manual_permission()
             if name not in {"piper_photo", "piper_status"}:
                 self.previews.invalidate()
@@ -288,13 +288,13 @@ class PiperRuntime:
                 state = self.connected().get_state()
             except Exception:
                 self.previews.invalidate()
-                if self.driver is not None and self.active_card in {"piper_arm", "piper_joint", "piper_gripper", "piper_enable", "piper_disable"}:
+                if self.driver is not None and self.active_card in {"piper_arm", "piper_joint", "piper_cartesian", "piper_gripper", "piper_enable", "piper_disable"}:
                     self.driver.cancel_motion()
                 raise
             observed = signature(state)
             if self.last_signature is not None and self.last_signature != observed:
                 self.previews.invalidate()
-                if (monitor and self.active_card in {"piper_arm", "piper_joint", "piper_gripper", "piper_enable", "piper_disable"}
+                if (monitor and self.active_card in {"piper_arm", "piper_joint", "piper_cartesian", "piper_gripper", "piper_enable", "piper_disable"}
                         and self.active_action not in {"prepare", "enable", "disable"}):
                     self.driver.cancel_motion()
             self.last_signature = observed
@@ -334,7 +334,7 @@ class PiperRuntime:
             with self.lifecycle:
                 self.motion_enabled = self.manual_motion_permission = False
                 self.previews.invalidate()
-                affected = self.gate.locked() and self.active_card in {"piper_arm", "piper_joint", "piper_gripper", "piper_mode", "piper_enable", "piper_disable", "piper_standby", "piper_can"}
+                affected = self.gate.locked() and self.active_card in {"piper_arm", "piper_joint", "piper_cartesian", "piper_gripper", "piper_mode", "piper_enable", "piper_disable", "piper_standby", "piper_can"}
                 if affected:
                     self.cancel.set()
                     if self.driver is not None:

@@ -297,10 +297,9 @@ class PiperDriver:
         except Exception:
             pass  # Feedback/CAN failure means holding cannot be guaranteed.
 
-    def _bounded_target(self, raw):
-        """Expose the same limits the installed SDK otherwise applies silently."""
-        target = []
-        for i, value in enumerate(raw, 1):
+    def joint_bounds_deg(self):
+        bounds = []
+        for i in range(1, 7):
             low, high = self.arm.GetSDKJointLimitParam(f"j{i}")
             low, high = round(math.degrees(low) * 1000), round(math.degrees(high) * 1000)
             if self.joint_limits_deg is not None:
@@ -308,8 +307,13 @@ class PiperDriver:
                 low, high = max(low, round(deployed_low * 1000)), min(high, round(deployed_high * 1000))
             if low >= high:
                 raise RuntimeError(f"J{i} 的 SDK 限位无效")
-            target.append(max(low, min(value, high)))
-        return tuple(target)
+            bounds.append((low/1000, high/1000))
+        return tuple(bounds)
+
+    def _bounded_target(self, raw):
+        """Expose the same limits the installed SDK otherwise applies silently."""
+        return tuple(max(round(low*1000), min(value, round(high*1000)))
+                     for value, (low, high) in zip(raw, self.joint_bounds_deg()))
 
     def prepare_control(self, execute=False, workspace_clear=False,
                         allow_limit_adjustment=False, speed_pct=5):
@@ -447,7 +451,7 @@ class PiperDriver:
                 "delta_deg": delta, "speed_deg_s": speed_deg_s, "speed_pct": speed_pct,
                 "duration_seconds": 1.5 * max(map(abs, delta)) / speed_deg_s}
 
-    def _move_joint_target(self, target, speed_deg_s=1., speed_pct=5):
+    def _move_joint_target(self, target, speed_deg_s=1., speed_pct=5, monitor=None):
         """Internal interpolation for move_joint; other axes hold their feedback."""
         from agilex.piper.control import ready_to_move
         plan = self.joint_plan(target, speed_deg_s, speed_pct)
@@ -464,6 +468,10 @@ class PiperDriver:
                 self._check_cancelled()
                 actual, state = self._healthy()
                 ready_to_move(state)
+                if monitor is not None:
+                    monitor(state)
+                if monitor is not None:
+                    monitor(state)
                 if any(abs(a-c) > 3000 for a,c in zip(actual, commanded)):
                     raise RuntimeError("关节跟随偏差超过 3°，已取消旧目标")
                 now = time.monotonic()

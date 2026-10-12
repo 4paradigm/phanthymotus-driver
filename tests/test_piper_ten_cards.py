@@ -268,7 +268,7 @@ class TenCardTests(unittest.TestCase):
                     json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode(),
                     {'Content-Type': 'application/json'})
                 with urllib.request.urlopen(req) as response:return json.load(response)
-            self.assertEqual(len(rpc('tools/list', {})['result']['tools']), 10)
+            self.assertEqual(len(rpc('tools/list', {})['result']['tools']), 11)
             self.assertEqual(rpc('tools/call', {'name': 'piper_arm', 'arguments': {'action': 'prepare'}})['error']['code'], -32601)
             self.assertIsNone(self.plugin.driver)
         finally:
