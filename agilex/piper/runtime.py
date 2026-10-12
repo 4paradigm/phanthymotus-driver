@@ -73,6 +73,7 @@ class PiperRuntime:
         self.closed = False
         self.stopped_cards = set()
         self.active_card = None
+        self.active_object = None
         self.previews = Previews()
         self.last_signature = None
         self.firmware_version = None
@@ -235,6 +236,7 @@ class PiperRuntime:
                 raise RuntimeError("Arm/camera busy; concurrent operations are refused")
             self.cancel.clear()
             self.active_card, self.active_action = name, action
+            self.active_object = getattr(self.worker_context, "operation_object", None)
             self.worker_context.owned = (name, action) if public_call is not None else None
             if self.driver is not None:
                 self.driver.cancelled.clear()
@@ -242,7 +244,7 @@ class PiperRuntime:
             yield
         finally:
             with self.lifecycle:
-                self.active_card = self.active_action = None
+                self.active_card = self.active_action = self.active_object = None
                 self.worker_context.owned = None
                 self.gate.release()
 

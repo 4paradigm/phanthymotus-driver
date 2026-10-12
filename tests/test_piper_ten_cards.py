@@ -238,6 +238,17 @@ class TenCardTests(unittest.TestCase):
             process.assert_not_called()
         self.assertIsNone(self.plugin.driver)
 
+    def test_stop_scope_tracks_gripper_enable_on_shared_enable_card(self):
+        self.connected()
+        self.plugin.motion_enabled = True
+        self.plugin.worker_context.operation_object = 'gripper'
+        with self.plugin.operation('piper_enable', 'enable'):
+            self.assertFalse(self.call('stop', 'halt', target='arm')['operation_stopping'])
+            self.assertFalse(self.plugin.cancel.is_set())
+            self.assertTrue(self.call('stop', 'halt', target='gripper')['operation_stopping'])
+            self.assertTrue(self.plugin.cancel.is_set())
+        self.plugin.worker_context.operation_object = None
+
     def test_permission_block_can_cancel_public_joint_while_busy(self):
         self.connected()
         self.plugin.motion_enabled = self.plugin.manual_motion_permission = True

@@ -44,7 +44,12 @@ class PiperPlugin(PiperRuntime):
                        or name in {'piper_enable', 'piper_joint'} and args.get('execute') is True
                        or name == 'piper_gripper' and action in {'open', 'close', 'set_width'} and args.get('execute') is True)
         if long_action and self.config.get('async_actions', True):
-            return self.run_async(name, action, args)
+            previous = getattr(self.worker_context, 'operation_object', None)
+            self.worker_context.operation_object = args.get('object')
+            try:
+                return self.run_async(name, action, args)
+            finally:
+                self.worker_context.operation_object = previous
         return self.dispatch_sync(action, args)
 
     def dispatch_sync(self, action, args):
@@ -64,7 +69,9 @@ class PiperPlugin(PiperRuntime):
                     'camera_enabled': self.camera_enabled,
                     'topic_out': [{'topic': self.topic, 'format': 'image/jpeg'}] if name == 'piper_photo' else []}
         previous = getattr(self.worker_context, 'public_call', None)
+        previous_object = getattr(self.worker_context, 'operation_object', None)
         self.worker_context.public_call = (name, action)
+        self.worker_context.operation_object = args.get('object')
         try:
             if name == 'piper_status':
                 if self.closed or name in self.stopped_cards:
@@ -106,6 +113,7 @@ class PiperPlugin(PiperRuntime):
             raise ValueError('未知卡片')
         finally:
             self.worker_context.public_call = previous
+            self.worker_context.operation_object = previous_object
 
     def status(self):
         result = super().status()
@@ -204,7 +212,10 @@ class PiperPlugin(PiperRuntime):
         with self.lifecycle:
             self.previews.invalidate()
             active = self.active_card
-            affected = self.gate.locked() and active in affected_cards
+            in_scope = active in affected_cards
+            if active in {'piper_enable', 'piper_disable'} and target != 'all':
+                in_scope = self.active_object == ('arm' if target == 'arm' else 'gripper')
+            affected = self.gate.locked() and in_scope
             if affected:
                 self.cancel.set()
                 if self.driver is not None and active != 'piper_photo':
