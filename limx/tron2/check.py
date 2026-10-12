@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.4.4'
+VERSION = '0.4.5'
 CARDS = {'joint_state', 'robot_status', 'battery_state'}
 
 
@@ -58,9 +58,10 @@ def run_check(timeout=20):
     else:
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
-    if {tool['name'] for tool in tools} not in (CARDS, CARDS | {'arm_control'}) or any(
-            tool['type'] != ('actuator' if tool['name'] == 'arm_control' else 'sensor') for tool in tools):
-        raise ValueError('Unexpected card set; expected three sensors plus optional arm_control')
+    names = {tool['name'] for tool in tools}
+    if not CARDS <= names or names - CARDS - {'arm_control', 'reset_pose'} or any(
+            tool['type'] != ('actuator' if tool['name'] in {'arm_control', 'reset_pose'} else 'sensor') for tool in tools):
+        raise ValueError('Unexpected card set; expected three sensors plus optional arm/reset actuators')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,
@@ -68,6 +69,15 @@ def run_check(timeout=20):
                               '_trace_id': 'readonly-check-trace'}})
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
+    for name in names - CARDS:
+        for action in ('info', 'start', 'stop'):
+            reply = rpc('tools/call', {'name': name, 'arguments': {'action': action,
+                '_trace_id': 'readonly-check-trace', 'instance_id': 'readonly-check'}})
+            if reply.get('isError'):
+                raise ValueError('Actuator lifecycle failed: ' + name)
+            data = json.loads(reply['content'][0]['text'])
+            if data.get('motion_sent') is not False:
+                raise ValueError('Lifecycle must not send motion')
     before = read_samples()
     time.sleep(1)
     after = read_samples()

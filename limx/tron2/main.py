@@ -62,7 +62,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    if not isinstance(plugins, dict) or set(plugins) - {'joint_state', 'robot_status', 'battery_state', 'arm_control'}:
+    if not isinstance(plugins, dict) or set(plugins) - {'joint_state', 'robot_status', 'battery_state', 'arm_control', 'reset_pose'}:
         raise ValueError('Only TRON2 sensor and arm_control plugins may be configured')
     enabled = []
     for name, value in plugins.items():
@@ -73,6 +73,7 @@ def load_settings():
     if not enabled:
         raise ValueError('Enable at least one read-only sensor')
     settings['enabled_cards'] = enabled
+    settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
     return settings
 
 

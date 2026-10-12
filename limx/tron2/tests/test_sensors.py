@@ -25,6 +25,7 @@ from device import Adapter, TOPICS, VERSION
 from vendor import RobotReader
 import state
 import ros2
+from reset import ARM_NAMES
 
 
 def settings(**updates):
@@ -502,7 +503,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         arm = next(t for t in tools if t['name'] == 'arm_control')
         self.assertEqual(arm['type'], 'actuator')
         props = arm['inputSchema']['properties']
-        self.assertEqual(props['action']['enum'], ['info', 'move'])
+        self.assertEqual(props['action']['enum'], ['info', 'start', 'stop', 'move'])
         self.assertEqual(props['joint']['minItems'], 14)
         self.assertEqual(props['joint']['maxItems'], 14)
 
@@ -583,6 +584,92 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(error)
         self.assertIn('Unsupported actuator action', result['error'])
 
+    async def test_all_actuator_lifecycle_calls_never_send_even_with_move_fields(self):
+        self.adapter.enabled.extend(['arm_control', 'reset_pose'])
+        reader = self.adapter.reader
+        reader.ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
+        tools = {tool['name']: tool for tool in self.adapter.tools()}
+        for name in ('arm_control', 'reset_pose'):
+            for action in ('info', 'start', 'stop'):
+                self.assertIn(action, tools[name]['inputSchema']['properties']['action']['enum'])
+                kwargs = {'joint': [.1]*14, 'time': 8} if name == 'arm_control' else {}
+                error, result = await self.call(name, action=action,
+                    instance_id='canvas', _trace_id='valid', **kwargs)
+                self.assertFalse(error)
+                self.assertFalse(result['motion_sent'])
+        reader.ws.send_json.assert_not_called()
+        self.assertEqual(set(self.adapter.snapshot()), set(TOPICS))
+
+    def reset_pose_fixture(self, path, **updates):
+        pose = {'schema': 'tron2-arms-reset-pose-v1', 'scope': 'arms_only',
+                'unit': 'rad', 'joint_names': ARM_NAMES, 'accid': 'TEST_TRON2A',
+                'firmware': 'TEST_FW', 'target_q': [.1]*14,
+                'head_policy': 'unchanged', 'gripper_policy': 'unchanged', **updates}
+        path.write_text(json.dumps(pose))
+        self.adapter.reset.path = path
+        self.adapter.reader.info['sw_version'] = 'TEST_FW'
+
+    async def test_reset_missing_pose_does_not_block_start_but_execute_rejects(self):
+        self.adapter.enabled.append('reset_pose')
+        with tempfile.TemporaryDirectory() as temp:
+            self.adapter.reset.path = Path(temp)/'missing.json'
+            error, result = await self.call('reset_pose', action='start')
+            self.assertFalse(error)
+            self.assertFalse(result['motion_sent'])
+            error, result = await self.call('reset_pose', action='info')
+            self.assertFalse(error)
+            self.assertFalse(result['configured'])
+            error, result = await self.call('reset_pose', action='execute')
+            self.assertTrue(error)
+            self.assertFalse(result['motion_sent'])
+
+    async def test_reset_preview_verification_and_identity_validation_are_read_only(self):
+        self.adapter.enabled.append('reset_pose')
+        reader = self.adapter.reader
+        reader.ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'home.json'
+            self.reset_pose_fixture(path)
+            for action in ('preview', 'verify_at_home'):
+                error, result = await self.call('reset_pose', action=action)
+                self.assertFalse(error)
+                self.assertFalse(result['motion_sent'])
+                self.assertEqual(result['target_q'], [.1]*14)
+            self.assertTrue(result['at_home'])
+            for updates in ({'accid': 'OTHER'}, {'firmware': 'OTHER'},
+                            {'unit': 'deg'}, {'target_q': [0]*16}, {'target_q': [10]*14},
+                            {'joint_names': list(reversed(ARM_NAMES))}):
+                self.reset_pose_fixture(path, **updates)
+                error, result = await self.call('reset_pose', action='execute')
+                self.assertTrue(error)
+                self.assertFalse(result['motion_sent'])
+        reader.ws.send_json.assert_not_called()
+
+    async def test_reset_execute_uses_only_file_target_and_awaits_ack(self):
+        self.adapter.enabled.append('reset_pose')
+        reader = self.adapter.reader
+        sent = []
+        async def send(body):
+            sent.append(body)
+            packet = {'title': 'response_movej', 'guid': body['guid'],
+                      'accid': reader.serial, 'data': {'result': 'success'}}
+            ws = types.SimpleNamespace(receive=AsyncMock(return_value=types.SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT, data=json.dumps(packet))))
+            await reader.receive(ws, time.monotonic()+1)
+        reader.ws = types.SimpleNamespace(closed=False, send_json=send)
+        with tempfile.TemporaryDirectory() as temp:
+            self.reset_pose_fixture(Path(temp)/'home.json')
+            error, result = await self.call('reset_pose', action='execute', target_q=[0]*14)
+            self.assertTrue(error)
+            self.assertEqual(sent, [])
+            error, result = await self.call('reset_pose', action='execute', _trace_id='valid')
+            self.assertFalse(error)
+            self.assertEqual(result['action'], 'execute')
+            self.assertEqual(result['status'], 'accepted')
+            self.assertFalse(result['arrival_verified'])
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 8})
+
     async def test_json_rpc_notification_and_parse_errors(self):
         async with self.session.post(self.url+'/mcp', json={
                 'jsonrpc': '2.0', 'method': 'notifications/initialized'}) as response:
@@ -610,11 +697,11 @@ class PackagingTests(unittest.TestCase):
     def test_staged_entry_imports_without_repository_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common; '
-                'assert device.VERSION == "0.4.4"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.4.5"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -645,12 +732,12 @@ class PackagingTests(unittest.TestCase):
                     path.write_text(yaml.safe_dump(changed))
                     with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaises(ValueError): load()
                 changed = copy.deepcopy(config)
-                changed['plugins']['reset_pose'] = {'enabled':True}
+                changed['plugins']['unknown_motion'] = {'enabled':True}
                 path.write_text(yaml.safe_dump(changed))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaises(ValueError): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'reset_pose'})
 
     def test_missing_dds_profile_refuses_participant_creation(self):
         with patch.dict(os.environ,FASTRTPS_DEFAULT_PROFILES_FILE='/missing/tron2-dds.xml'):

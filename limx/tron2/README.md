@@ -1,6 +1,6 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供三张持续更新的传感器卡片和一张显式双臂运动控制卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.4`；MCP 仅监听 `127.0.0.1:15791`。
+为 Phanthy Motus 提供三张持续更新的传感器卡片和两张显式运动执行卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.5`；MCP 仅监听 `127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -8,12 +8,13 @@
 | `robot_status` | sensor | 工作模式、固件版本、IMU / 电机 / 相机等状态 | `/limx_tron2/robot_status` |
 | `battery_state` | sensor | 电量、电压、电流、功率和单路温度原始字段（缩放未核实） | `/limx_tron2/battery_state` |
 | `arm_control` | actuator | 双臂14项角度目标（rad），显式 MoveJ | 无 |
+| `reset_pose` | actuator | 从本机保存姿态读取固定双臂目标，预览/执行/到位检查 | 无 |
 
 三张传感器卡片使用 `data/json` 格式，通过 Motus 本机 ROS2 总线发布。默认每 0.5 秒查询一次关节状态并发布缓存，实际更新速率受机器人响应时间影响。状态和电池来自机器人主动发送的 `notify_robot_info`，其更新频率由机器人决定。
 
 ## 读取边界与字段说明
 
-传感器后台仅发送 `request_get_joint_state`。新增 `arm_control` actuator 通过显式 move 调用发送一次 `request_movej`；驱动不再是全只读服务。没有复位、模式切换或拖动示教接口。
+传感器后台仅发送 `request_get_joint_state`。新增 `arm_control` actuator 通过显式 move 调用发送一次 `request_movej`；驱动不再是全只读服务。reset_pose使用本机固定目标显式调用MoveJ；没有模式切换或拖动示教接口。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
@@ -31,7 +32,7 @@
 
 0.4.3 的电池发布格式有变更：消费端应使用 `soc` 代替 `data.battery_percent`，直接读取 `voltage` / `current`。MCP `info` 仍返回诊断封装，其中 `sample.data` 使用新字段。关节和设备状态的发布结构、三张卡片名称和 topic 均保留。
 
-卡片的 `start` / `stop` 是单实例常开传感器的生命周期兼容调用，不启动或停止机器人，也不停止后台采样。`info` 返回该传感器的当前状态和缓存，不额外发送机器人请求。驱动提供三张 sensor 及 arm_control actuator，不提供缓存聚合 resource 或助手卡片。
+卡片的 `start` / `stop` 是单实例常开传感器的生命周期兼容调用，不启动或停止机器人，也不停止后台采样。`info` 返回该传感器的当前状态和缓存，不额外发送机器人请求。驱动提供三张 sensor 及 arm_control/reset_pose actuator，不提供缓存聚合 resource 或助手卡片。
 
 兼容 Agent Core 自动注入的 `instance_id` 和 `_trace_id`：两者仅接受最长 128 字符、无控制字符的字符串，不参与机器人请求、不回显到采样数据。Schema 与运行时均接受这两项元数据；其他未声明参数仍被拒绝。0.4.2 保留追踪元数据兼容，并移除之前的缓存聚合资源工具；三张传感器仍能通过 info 查看当前缓存。
 
@@ -69,7 +70,7 @@ PR 构建完成后，使用机器人评论给出的新镜像 / Try it 链接部�
 
 通过 WebSocket 采样和显式 MoveJ 调用，不挂载 `/dev`、Docker socket、姿态文件或可写控制目录，也不需要 privileged 或 GPU runtime。容器使用只读根文件系统和临时 `/tmp`；ROS2 日志显式写入 `/tmp/ros-log`；`restart: always`。
 
-如果同机部署过早期复位原型，先备份其文件，再停止旧服务以释放 15791，并在 Motus 设置中移除旧复位服务注册及画布卡片。本驱动注册名称为 **LimX TRON2 Read-only Sensors**；不会自动删除旧容器、旧注册或已保存的姿态文件。
+如果同机部署过早期复位原型，先备份其文件，再停止旧服务以释放 15791，并在 Motus 设置中移除旧复位服务注册及画布卡片。本驱动注册名称为 **LimX TRON2 Sensors and Arm Control**；不会自动删除旧容器、旧注册或已保存的姿态文件。
 
 ## 网页查看与验收
 
@@ -82,7 +83,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪、检查 Core 注册和 MCP 卡片类型、验证生命周期以及关节回复接收时间持续更新。它不检查或调用运动接口。该脚本按默认三张卡片全部启用验收。
 
-刷新 Motus 控制台，找到 **LimX TRON2 Read-only Sensors**，将三张 sensor 卡片拖入画布并开启，再点击“查看数据流”。从旧版升级时，应从画布移除旧缓存读取、文字输入和决策卡片；助手 Skill 是单独的本机配置，不属于此 Driver。数据存在时应看到 `available: true`；断开机器人链路后应看到 `data: null` 和不可用状态，恢复连接后收到新通知 / 关节回复才恢复数值。各传感器的 `info` 可查看该卡片当前缓存。
+刷新 Motus 控制台，找到 **LimX TRON2 Sensors and Arm Control**，将三张 sensor 卡片拖入画布并开启，再点击“查看数据流”。从旧版升级时，应从画布移除旧缓存读取、文字输入和决策卡片；助手 Skill 是单独的本机配置，不属于此 Driver。数据存在时应看到 `available: true`；断开机器人链路后应看到 `data: null` 和不可用状态，恢复连接后收到新通知 / 关节回复才恢复数值。各传感器的 `info` 可查看该卡片当前缓存。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：全部已启用传感器有最近接收数据时为 HTTP 200，否则为 503。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
@@ -96,7 +97,7 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 
 测试包含真实本机 HTTP / WebSocket 服务、请求关联及超时、序列号约束、重连、断连清空、过期数据、卡片生命周期、ROS2 JSON 发布的模拟验证和镜像入口布局。测试不驱动实体机器人。
 
-此前现场已验证厂家 WebSocket 能返回机器人信息与 16 项关节值；本版本的 ROS2 / Compose 正式镜像仍需在 Jetson 上按上述步骤验收。固定姿态复位和摄像头不包含在当前版本；新增arm_control仍需真机单独验收。
+此前现场已验证厂家 WebSocket 能返回机器人信息与 16 项关节值；本版本的 ROS2 / Compose 正式镜像仍需在 Jetson 上按上述步骤验收。摄像头不包含在当前版本；arm_control和reset_pose真实运动仍需现场单独验收。
 
 ## arm_control 与构建修复（0.4.4）
 
@@ -107,3 +108,25 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 本次修复缺失if代码块的语法错误、motion参数被拒绝、错误后台任务成功提示、actuator被放进传感器采样/topic列表的问题；电池schema补齐实际接受的action并保留无参数调用兼容。check.py只检查三个传感器及卡片类型，不执行机械臂move。模拟接口测试不连接真机。
 
 自定义GitHub Actions改为源码、离线合同和部署配置验证；不再在未配置私有仓库凭据时尝试登录发布。正式PR镜像沿用上游PR Review Agent，通过/request_bot_review构建。摄像头工作已暂停，未包含在此版本。
+
+## 平台启动兼容与 reset_pose（0.4.5）
+
+平台开启智能控制会对每张卡片调用start。arm_control和reset_pose均接受info/start/stop；start/stop只返回生命周期状态，不调用机器人，也不是急停。只有arm_control.move或reset_pose.execute发送运动。
+
+reset_pose使用`/config/tron2/home.json`，宿主目录`/opt/phanthy-motus/data/tron2`只读挂载到容器。文件沿用此前保存的tron2-arms-reset-pose-v1格式，要求双臂14项弧度、标准关节顺序、机器人序列号和固件绑定；公共代码不带示例/默认运动目标。原保存姿态可以原样复制，不能用当前随机姿态覆盖原自然下垂目标。文件缺失或不匹配时，平台仍能启动，但execute会明确拒绝发送。
+
+- info：报告是否配置目标；不发运动。
+- preview：返回目标、最大关节变化和预计时间；不发运动。
+- execute：读取固定目标并发送一次MoveJ，等待厂家受理回复；不接收调用方传入的目标角。
+- verify_at_home：用当前最近收到的关节样本检查双臂最大误差≤1度，属于单样本检查，不是连续稳定验收。
+
+复位时间为max(8,ceil(最大角度差/5))秒；超过现有60秒MoveJ时间上限时拒绝，不放宽厂家绝对限位。头部和夹爪不发命令，没有15度变化限制或本机一次授权。execute回复accepted不表示已经到达；等待运动时间后可调用verify_at_home。不进行碰撞路径规划。
+
+首次部署前，将此前确认的姿态复制到宿主目录：
+
+```bash
+sudo install -d -m 0755 /opt/phanthy-motus/data/tron2
+sudo install -m 0600 ~/motus-local-drivers/tron2-reset/home.json /opt/phanthy-motus/data/tron2/home.json
+```
+
+check.py覆盖两个执行卡片的info/start/stop，明确验证motion_sent=false；不会调用move或execute。本次仅新增必要的本机姿态只读挂载及纯Python文件，不添加依赖或扩大硬件权限。

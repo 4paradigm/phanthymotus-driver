@@ -7,12 +7,13 @@ import os
 import aiohttp
 from aiohttp import web
 from vendor import RobotReader, validate_movej
+from reset import ResetPose
 from state import BATTERY_FIELDS
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.4.4'
+VERSION = '0.4.5'
 PORT = 15791
-SERVER_NAME = 'LimX TRON2 Read-only Sensors'
+SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
           ('joint_state', 'robot_status', 'battery_state')}
 DESCRIPTIONS = {
@@ -20,6 +21,7 @@ DESCRIPTIONS = {
     'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
     'battery_state': 'TRON2 电量 soc（%）、电压 voltage（mV）、电流 current（mA）、功率 power（W）、温度 temp（℃）；单位未确认时相关字段为 null（只读）',
     'arm_control': 'TRON2 双臂关节运动控制 — MoveJ 设置双臂 14 个关节目标（rad），头部不参与；响应仅确认受理',
+    'reset_pose': 'TRON2 双臂固定姿态复位：preview 只读，execute 使用本机保存的14项目标；start/stop不发送运动，stop不是急停',
 }
 
 
@@ -41,6 +43,7 @@ class Adapter:
         self.reader = reader or RobotReader(settings)
         self.registered_id = None
         self.core_ssl = True
+        self.reset = ResetPose(settings.get('home_file', '/config/tron2/home.json'), self.reader)
 
     def _battery_tool(self):
         """Battery sensor — empty inputSchema, auto-publishes via topic_out (Unitree pattern)."""
@@ -61,7 +64,7 @@ class Adapter:
                 'type': 'object',
                 'additionalProperties': False,
                 'properties': {
-                    'action': {'type': 'string', 'enum': ['info', 'move']},
+                    'action': {'type': 'string', 'enum': ['info', 'start', 'stop', 'move']},
                     'joint': {
                         'type': 'array',
                         'minItems': 14,
@@ -89,8 +92,15 @@ class Adapter:
             tools.append(self._battery_tool())
         if 'arm_control' in self.enabled:
             tools.append(self._arm_control_tool())
+        if 'reset_pose' in self.enabled:
+            tools.append({'name': 'reset_pose', 'type': 'actuator', 'multiInstance': False,
+                'description': DESCRIPTIONS['reset_pose'],
+                'inputSchema': {'type': 'object', 'additionalProperties': False,
+                    'properties': {'action': {'type': 'string',
+                        'enum': ['info', 'start', 'stop', 'preview', 'verify_at_home', 'execute']},
+                        **metadata_properties()}, 'required': ['action']}})
         for name in self.enabled:
-            if name in ('battery_state', 'arm_control'):
+            if name in ('battery_state', 'arm_control', 'reset_pose'):
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -122,6 +132,8 @@ class Adapter:
             raise ValueError('An action string is required')
         if name not in self.enabled:
             raise ValueError('Unknown tool; this driver exposes only parameter readers')
+        if name == 'reset_pose':
+            return self.reset.call(action)
         if name == 'battery_state':
             # Battery card: only 'info' returns sample data; start/stop are no-ops
             if action not in ('info', 'start', 'stop'):
@@ -132,6 +144,9 @@ class Adapter:
                 result['sample'] = self.reader.sample(name)
             return result
         if name == 'arm_control':
+            if action in ('start', 'stop'):
+                return {'state': 'running' if action == 'start' else 'idle',
+                        'motion_sent': False, 'lifecycle_only': True}
             if action == 'info':
                 return {'state': 'ready' if self.reader.connected else 'offline',
                         'joint_count': 14, 'position_unit': 'rad', 'motion_sent': False}
@@ -190,10 +205,13 @@ class Adapter:
                     data = self.call(params.get('name'), params.get('arguments', {}))
                     if params.get('name') == 'arm_control' and data.get('action') == 'move':
                         data = await self.reader.send_movej(data['joint'], data['time'])
+                    elif params.get('name') == 'reset_pose' and data.get('action') == 'execute':
+                        reply = await self.reader.send_movej(data['target_q'], data['duration_seconds'])
+                        data = {**reply, 'action': 'execute', 'pose_sha256': data['pose_sha256']}
                     error = False
                 except (ValueError, TypeError) as exc:
                     data, error = {'error': str(exc)[:240],
-                        'read_only': params.get('name') != 'arm_control',
+                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ('arm_control', 'reset_pose'),
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
                 result = {'content': [{'type': 'text', 'text': json.dumps(data,
                            ensure_ascii=False, allow_nan=False)}], 'isError': error}
@@ -208,7 +226,7 @@ class Adapter:
     async def health(self, request):
         samples = self.snapshot()
         ready = all(s['available'] for s in samples.values())
-        return web.json_response({'version': VERSION, 'read_only': 'arm_control' not in self.enabled, 'ready': ready,
+        return web.json_response({'version': VERSION, 'read_only': not set(self.enabled) & {'arm_control', 'reset_pose'}, 'ready': ready,
             'robot_connected': self.reader.connected, 'registered_mcp_id': self.registered_id,
             'last_connection_error': self.reader.last_error,
             'round_trip_seconds': self.reader.last_round_trip, 'samples': samples},

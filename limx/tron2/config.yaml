@@ -11,3 +11,4 @@ plugins:
   robot_status: {enabled: true}
   battery_state: {enabled: true}
   arm_control: {enabled: true}
+  reset_pose: {enabled: true}
