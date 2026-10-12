@@ -587,10 +587,12 @@ class A3Nodes:
                 self._json_stream_pubs[key] = pub
 
             def callback(msg):
-                if re_encode is not None or key in ("lidar_cloud", "mic", "ext_mic"):
+                if (re_encode is not None or key in ("lidar_cloud", "mic", "ext_mic")
+                        or (self._jazzy_relay and key.startswith("camera_"))):
                     count = self._media_received.get(key, 0) + 1
                     self._media_received[key] = count
-                    if count == 1 or count % 1000 == 0:
+                    interval = 300 if self._jazzy_relay and key.startswith("camera_") else 1000
+                    if count == 1 or count % interval == 0:
                         print(f"[media] received={count} key={key} topic={robot_topic}", flush=True)
                 if key in ("arm_state", "hand_state", "neck_state", "waist_state", "leg_state"):
                     self._joint_cache[key] = jsonable(msg)
@@ -639,7 +641,10 @@ class A3Nodes:
                 else:
                     pub.publish(msg)
 
-            callback_group = self._media_callback_group if (re_encode is not None or key == "lidar_cloud") else None
+            is_relay_camera = self._jazzy_relay and key.startswith("camera_")
+            callback_group = self._media_callback_group if (
+                re_encode is not None or key == "lidar_cloud" or is_relay_camera
+            ) else None
             kwargs = {"callback_group": callback_group} if callback_group is not None else {}
             subscription_node = self.media_robot if (callback_group is not None and self.media_robot is not None) else self.robot
             if self._jazzy_relay and key == "lidar_cloud":

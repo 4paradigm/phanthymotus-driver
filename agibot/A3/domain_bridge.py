@@ -126,7 +126,8 @@ class CoreBridge:
                 count = self._topic_counts.get(topic, 0) + 1
                 self._topic_counts[topic] = count
                 sent, dropped = self._sent, self._dropped
-            if count == 1 or count % 5000 == 0:
+            log_interval = 300 if "camera" in topic else 5000
+            if count == 1 or count % log_interval == 0:
                 print(f"[dds-bridge] enqueued_total={self._sent} replaced_stale={self._dropped} "
                       f"lane={lane} topic={topic} topic_count={count}", flush=True)
         except queue.Full:
@@ -228,7 +229,8 @@ def _run(messages, profile, domain, lane):
                 print(f"[dds-bridge] publisher created topic={topic} type={type_name}", flush=True)
             pub.publish(msg)
             published[topic] = published.get(topic, 0) + 1
-            if published[topic] == 1 or published[topic] % 1000 == 0:
+            log_interval = 300 if "camera" in topic else 1000
+            if published[topic] == 1 or published[topic] % log_interval == 0:
                 print(f"[dds-bridge] published={published[topic]} topic={topic}", flush=True)
             # This node only owns publishers, so no executor spin is needed.
     finally:

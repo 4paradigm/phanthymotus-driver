@@ -77,7 +77,7 @@ class FakeNode:
         self.publishers[topic] = pub
         return pub
 
-    def create_subscription(self, msg_type, topic, callback, qos):
+    def create_subscription(self, msg_type, topic, callback, qos, callback_group=None):
         self.subscriptions.append((topic, callback))
         return object()
 
@@ -100,7 +100,13 @@ class FakeQoSReliabilityPolicy:
 
 
 class FakeExecutor:
+    def __init__(self, *args, **kwargs):
+        pass
+
     def add_node(self, node):
+        pass
+
+    def spin(self):
         pass
 
 
@@ -412,6 +418,28 @@ class ToolInventoryTests(unittest.TestCase):
         camera = find_plugin(plugins, "camera")
         self.assertEqual(list(camera.streams), ["camera_head_left_fisheye",
                                                 "camera_chest_front_d457_depth"])
+
+    def test_jazzy_relay_camera_subscriptions_use_media_executor(self):
+        from unittest.mock import patch
+
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        executors = types.ModuleType("rclpy.executors")
+        executors.MultiThreadedExecutor = FakeExecutor
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    "A3_JAZZY_RELAY": "1",
+                    "A3_RELAY_CONTROL_FILE": str(Path(temp_dir) / "active_streams"),
+                }), \
+                patch.dict(sys.modules, {"rclpy.executors": executors}), \
+                patch.object(sys.modules["rclpy"], "executors", executors, create=True):
+            plugins, _ = build_bundle_plugins(config)
+            nodes = next(iter(plugins.values())).nodes
+
+        media_topics = {topic for topic, _ in nodes.media_robot.subscriptions}
+        robot_topics = {topic for topic, _ in nodes.robot.subscriptions}
+        self.assertIn("/test_ns/camera_head_left_fisheye", media_topics)
+        self.assertNotIn("/test_ns/camera_head_left_fisheye", robot_topics)
 
     def test_camera_rgb_stream_reencodes_to_jpeg_when_cv2_available(self):
         config = json.loads(json.dumps(BASE_CONFIG))
