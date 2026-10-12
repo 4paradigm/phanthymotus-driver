@@ -69,6 +69,8 @@ class _Instance:
 class FrankaPlugin:
     """Canvas instances are consumers; sessions own physical connections."""
 
+    PREFIX = "joint_states"
+
     def __init__(self, config, namespace="franka", ros2=None, *, manager=None,
                  publisher_factory=None):
         self._namespace = namespace.strip("/") or "franka"
@@ -85,7 +87,7 @@ class FrankaPlugin:
 
     def get_tools(self):
         definition = tool(
-            "joint_states", "sensor",
+            self.PREFIX, "sensor",
             "Franka FR3：读取七个关节的实际角度并显示姿态；只读，不触发运动。",
             topic_out=[{"format": JOINT_FORMAT}],
         )
@@ -261,7 +263,7 @@ class FrankaPlugin:
         name = args.get("_tool_name", action)
         if name == "model":
             return {"urdf": self._urdf}
-        if name != "joint_states":
+        if name != self.PREFIX:
             return None
         if action not in ("config", "start", "stop", "info"):
             return None

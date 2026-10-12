@@ -120,6 +120,7 @@ class FrankaCardTests(unittest.TestCase):
         return self.call(name, "start", instance_id, robot_ip=ip, **args)
 
     def test_only_joint_sensor_and_automatic_model_resource_are_registered(self):
+        self.assertEqual(self.plugin.PREFIX, "joint_states")
         definitions = {item["name"]: item for item in self.bundle.get_all_tools()}
         self.assertEqual(set(definitions), {"joint_states", "model"})
         spec = definitions["joint_states"]
