@@ -281,7 +281,6 @@ for idx in "${SELECTED_INDICES[@]}"; do
     provider="${DRIVER_PROVIDERS[$idx]}"
     model="${DRIVER_MODELS[$idx]}"
     FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${provider}/${model}:${TAG}"
-    build_args=(--build-arg "PYPI_MIRROR=${PYPI_MIRROR}")
 
     echo ""
     echo "============================================"
@@ -321,7 +320,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
     docker buildx build \
         --platform linux/arm64 \
         ${NO_CACHE} \
-        "${build_args[@]}" \
+        --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \
         $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \
