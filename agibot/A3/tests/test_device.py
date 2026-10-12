@@ -2503,6 +2503,17 @@ class MirrorStreamTests(unittest.TestCase):
         payload = struct.pack("<512h", *([7] * 512))
         self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload), payload)
 
+    def test_audio_normalization_ignores_reference_channels(self):
+        msg = types.SimpleNamespace(
+            mic_channels=1, ref_channels=1,
+            info=types.SimpleNamespace(sample_rate=16000, channels=2,
+                                       sample_format="S16LE", coding_format="PCM"))
+        # Main mic is +1000; reference channel is -1000. Averaging both would
+        # produce silence, while the AudioCapture contract requires mic only.
+        payload = struct.pack("<4h", 1000, -1000, 1000, -1000)
+        self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload),
+                         struct.pack("<2h", 1000, 1000))
+
     def test_imu_info_lists_both_topic_out_streams(self):
         # 6th PR review: Agent Core treats info() as authoritative for topic
         # inference — the imu card must advertise both mirrored streams.

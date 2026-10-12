@@ -523,6 +523,8 @@ class A3Nodes:
         self._audio_buffers = {"mic": bytearray(), "ext_mic": bytearray()}
         self._audio_lock = threading.Lock()
         self._audio_received = {"mic": 0, "ext_mic": 0}
+        self._audio_nonzero = {"mic": 0, "ext_mic": 0}
+        self._audio_peak = {"mic": 0, "ext_mic": 0}
         self._audio_queues = {"mic": queue.Queue(maxsize=8),
                               "ext_mic": queue.Queue(maxsize=8)}
         self._audio_threads = {}
@@ -810,7 +812,15 @@ class A3Nodes:
         # metadata belongs to info while data contains only the byte sequence.
         info = getattr(msg, "info", None)
         rate = int(getattr(info, "sample_rate", 16000) or 16000)
-        channels = int(getattr(info, "channels", 0) or 1)
+        info_channels = int(getattr(info, "channels", 0) or 0)
+        mic_channels = int(getattr(msg, "mic_channels", 0) or 0)
+        ref_channels = int(getattr(msg, "ref_channels", 0) or 0)
+        # AudioCapture carries mic and reference channels separately.  Some
+        # AimDK builds report info.channels as the total interleaved count,
+        # while others report only the mic count; prefer the explicit layout
+        # when it is available and never mix reference channels into the mic.
+        channels = max(1, info_channels, mic_channels + ref_channels)
+        selected_channels = max(1, mic_channels or info_channels or 1)
         sample_format = str(getattr(info, "sample_format", "") or "").upper().replace("-", "_")
         coding_format = str(getattr(info, "coding_format", "") or "").upper().replace("-", "_")
         if sample_format in {"S16_LE", "PCM16", "PCM_16", "SIGNED16"}:
@@ -829,7 +839,7 @@ class A3Nodes:
         if channels > 1:
             import struct
             samples = struct.unpack("<%dh" % (len(payload) // 2), payload)
-            mono = [sum(samples[i:i + channels]) // channels
+            mono = [sum(samples[i:i + selected_channels]) // selected_channels
                     for i in range(0, len(samples), channels)]
             payload = struct.pack("<%dh" % len(mono), *mono)
         if rate != 16000 and rate > 0:
@@ -849,8 +859,15 @@ class A3Nodes:
         if not payload:
             return
         self._audio_received[key] = self._audio_received.get(key, 0) + 1
+        import struct
+        nonzero = sum(1 for value in payload if value)
+        samples = struct.unpack("<%dh" % (len(payload) // 2), payload[:len(payload) - len(payload) % 2])
+        peak = max((abs(value) for value in samples), default=0)
+        self._audio_nonzero[key] = self._audio_nonzero.get(key, 0) + nonzero
+        self._audio_peak[key] = max(self._audio_peak.get(key, 0), peak)
         if self._audio_received[key] == 1 or self._audio_received[key] % 500 == 0:
-            print(f"[audio] received={self._audio_received[key]} key={key} bytes={len(payload)}", flush=True)
+            print(f"[audio] received={self._audio_received[key]} key={key} bytes={len(payload)} "
+                  f"nonzero={nonzero}/{len(payload)} peak={peak}", flush=True)
         with self._audio_lock:
             buffer = self._audio_buffers.setdefault(key, bytearray())
             buffer.extend(payload)
