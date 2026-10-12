@@ -30,21 +30,25 @@ FROM build-deps AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential cmake pkg-config patch libpoco-dev libeigen3-dev libfmt-dev \
+        build-essential cmake pkg-config patch curl libpoco-dev libeigen3-dev libfmt-dev \
         libtinyxml2-dev libconsole-bridge-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # libfranka 0.18.1 uses FCI protocol 10 (robot system >= 5.9.0).
-# Keep pinned official source archives in the context so SDK compilation does
-# not depend on GitHub access from the build container. See vendor/SOURCE.md.
-COPY vendor/ /tmp/franka-source/
+# Fetch pinned official sources from COS; verify before extracting or patching.
+# See vendor/SOURCE.md for upstream revisions and archive provenance.
+ARG LIBFRANKA_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/franka/libfranka-0.18.1.tar.gz
+ARG LIBFRANKA_COMMON_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/franka/libfranka-0.18.1-common.tar.gz
 COPY cmake/ /tmp/franka-cmake/
-RUN echo "b682dbb2c6c564608b7b3ec443f332545dde94dee6969237f182441f21c23951  /tmp/franka-source/libfranka-182c9c4f7ffb512d4b2e2efbc86643e751389771.tar.gz" | sha256sum -c - \
-    && echo "75f26fc8794e4ae149086b59dda9de9d61cba845c375a51d13dd886ba7a9c104  /tmp/franka-source/libfranka-common-d96c221a32c343384cbe2f77c61116ed58b84231.tar.gz" | sha256sum -c - \
-    && mkdir -p /tmp/libfranka/common \
-    && tar -xzf /tmp/franka-source/libfranka-182c9c4f7ffb512d4b2e2efbc86643e751389771.tar.gz --strip-components=1 -C /tmp/libfranka \
-    && tar -xzf /tmp/franka-source/libfranka-common-d96c221a32c343384cbe2f77c61116ed58b84231.tar.gz --strip-components=1 -C /tmp/libfranka/common \
-    && patch --batch --forward --fuzz=0 -d /tmp/libfranka -p1 < /tmp/franka-cmake/libfranka-offline-version.patch
+RUN mkdir -p /tmp/franka-source /tmp/libfranka/common \
+    && curl -fsSL --retry 3 --connect-timeout 20 --max-time 180 "${LIBFRANKA_URL}" -o /tmp/franka-source/libfranka.tar.gz \
+    && curl -fsSL --retry 3 --connect-timeout 20 --max-time 180 "${LIBFRANKA_COMMON_URL}" -o /tmp/franka-source/common.tar.gz \
+    && echo "b682dbb2c6c564608b7b3ec443f332545dde94dee6969237f182441f21c23951  /tmp/franka-source/libfranka.tar.gz" | sha256sum -c - \
+    && echo "75f26fc8794e4ae149086b59dda9de9d61cba845c375a51d13dd886ba7a9c104  /tmp/franka-source/common.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/franka-source/libfranka.tar.gz --strip-components=1 -C /tmp/libfranka \
+    && tar -xzf /tmp/franka-source/common.tar.gz --strip-components=1 -C /tmp/libfranka/common \
+    && patch --batch --forward --fuzz=0 -d /tmp/libfranka -p1 < /tmp/franka-cmake/libfranka-offline-version.patch \
+    && rm -rf /tmp/franka-source
 
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash \
     && cmake -S /tmp/libfranka -B /tmp/libfranka/build \

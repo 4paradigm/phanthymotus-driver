@@ -47,13 +47,16 @@ repository. Override `APT_MIRROR` and `ROS_APT_MIRROR` with `docker build
 selects the Python package mirror only; it does not override these APT sources.
 
 The SDK and its `common` submodule are built from checksum-verified official
-source archives included in `vendor/`, following the repository's existing SDK
-packaging pattern. Docker builds do not clone or download SDK sources from
-GitHub. The archives preserve their upstream licenses and notices; a small
-CMake patch supplies the pinned release version for package metadata without
-requiring `.git`. Source revisions, checksums and the patch are documented in
-[`vendor/SOURCE.md`](vendor/SOURCE.md). Base-image and APT downloads still require
-network access.
+source archives mirrored on the project's Tencent COS bucket, following the
+`unitree/g1` download pattern. Override `LIBFRANKA_URL` and
+`LIBFRANKA_COMMON_URL` with `docker build --build-arg` to use another mirror
+of the same archives; SHA-256 verification remains mandatory. SDK archives are
+not stored in this repository. Downloads have bounded timeouts and retries.
+The archives preserve their upstream licenses and notices; a small CMake patch
+supplies the pinned release version for package metadata without requiring
+`.git`. Source revisions, download URLs, checksums and the patch are documented
+in [`vendor/SOURCE.md`](vendor/SOURCE.md). Base-image, APT and SDK downloads
+require network access.
 
 The runtime image uses an explicit libfranka SONAME link and
 `LD_LIBRARY_PATH=/usr/local/lib` for the copied SDK libraries. This avoids a
