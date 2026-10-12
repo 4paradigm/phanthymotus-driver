@@ -14,7 +14,7 @@
 
 - SSH 可达；PiPER 新鲜反馈持续更新，待机、六轴与夹爪均失能、无故障。
 - USB 识别 Intel RealSense D435，系统识别多个 video 节点；本次仅检测，不采集图像。
-- 指定后端测试集合上一轮 159 passed、85 subtests passed；停止对象补充回归通过。
+- 指定后端测试集合：160 passed、85 subtests passed。
 - 前端 192 tests passed（包含六项预览/确认流程测试）。两组 Core Python unittest 在实际
   amd64 依赖镜像、隔离网络与临时数据库下通过：MCP registry merge 与 tool schema presentation。
 - 覆盖十卡注册/旧入口拒绝、无连接启动、厂家动作隔离、已就绪不发指令、修正显式确认、
@@ -22,16 +22,16 @@
 
 ## 实际部署
 
-驱动执行源码 03d5b90048b0724ed1d14a6ff013037c3c24424c；Core UI 补丁源码
-0b3ec7f72242e8dd8b122902d40dfdc903814c2f。
+驱动执行源码 ebbc69eb34d2ca583492a748d873802278792983；Core UI 补丁源码
+7e0d3c0b3850900366b94b55d1e94a41441f0900。
 
 | 服务 | amd64 镜像 | 镜像 ID |
 | --- | --- | --- |
-| PiPER | agilex-piper:local-amd64-ten-cards | sha256:1f2bd03fad5d764a30866fb8fa017102e04fcf8a24a2f0141719be0fa2839125 |
-| Core | phanthy-core:local-amd64-piper-ten-cards | sha256:6d98950db24be422eb96be8155377ae12fdebe96b9a97491cf26d74cdac4675b |
+| PiPER | agilex-piper:local-amd64-ten-cards | sha256:537ff46a64207fee4a39e6053c10695c39861b4baca2f9a1695c9d2ce310068e |
+| Core | phanthy-core:local-amd64-piper-ten-cards | sha256:c520d7aa1291e4ce1d3f606130e0ad8aed3acb16c87366f3528c4344fa0af9ba |
 
 沿用已核对依赖的现场 amd64 基础镜像离线叠加源码，不是从上游开始的干净构建。
-未增加第三方依赖。Docker inspect 当前存储后端报告 Size：PiPER 345275523、Core 493287185 字节；
+未增加第三方依赖。Docker inspect 当前存储后端报告 Size：PiPER 345275683、Core 493287287 字节；
 该值不等同 registry 压缩传输大小或完整解压占用。此前 COS/干净 amd64 构建项仍按原记录保留。
 
 更新前确认全失能、空闲、无故障，全局智能控制与开机自动开启均关闭。
@@ -45,6 +45,12 @@
 完整现场 JSON/图像证据仅存用户本机 acceptance/20261012_ubuntu。
 新版真机运动、夹爪、模式切换与拍照验收须由现场操作人员按明确确认流程进行；
 历史五卡的真机动作验收不冒充十卡已全面验收。
+
+实测 Edge 画布：十张中文卡片及字段/选项显示；关闭智能控制时手动读取状态成功；
+使能对象选择夹爪后机械臂速度字段隐藏。补充 resource 工具侧栏分组，状态卡片可从侧栏添加。
+十卡片通过 x-manual-execution 明确选择手动模式：界面只启动当前卡片的被动生命周期，不启动
+全局智能控制。服务端仍检查许可、当次确认、反馈、预览和操作锁。
+实际浏览器的运动/拍照确认取消流程未完成逐项验收，取消不发执行指令由六项前端测试验证。
 
 # Review 修复（2026-10-11）
 
