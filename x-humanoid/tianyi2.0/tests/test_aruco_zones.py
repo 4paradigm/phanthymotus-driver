@@ -135,6 +135,75 @@ class ArucoZonesTests(unittest.TestCase):
         self.assertEqual(captured[0].tolist(), [[[30, 20, 10], [60, 50, 40]]])
         self.assertEqual(captured[1].tolist(), captured[0].tolist())
 
+    def test_process_image_decodes_canvas_jpeg(self):
+        import numpy as np
+
+        class Detector:
+            def __init__(self, dictionary):
+                pass
+
+            def detectMarkers(self, gray):
+                return [], None, []
+
+        decoded = np.zeros((3, 4, 3), dtype=np.uint8)
+        fake_cv2 = SimpleNamespace(
+            IMREAD_COLOR=1, COLOR_BGR2GRAY=2, IMWRITE_JPEG_QUALITY=3,
+            imdecode=lambda encoded, mode: decoded,
+            cvtColor=lambda image, conversion: np.zeros(image.shape[:2], dtype=np.uint8),
+            imencode=lambda extension, frame, options: (True, np.array([1], dtype=np.uint8)),
+            aruco=SimpleNamespace(DICT_4X4_50=4,
+                                  getPredefinedDictionary=lambda marker_id: marker_id,
+                                  ArucoDetector=Detector),
+        )
+        jpeg = SimpleNamespace(format="jpeg", data=b"jpeg-data")
+        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}):
+            result, overlay = aruco.process_image(jpeg, *aruco.validate_config({}))
+        self.assertEqual((result["image_width"], result["image_height"]), (4, 3))
+        self.assertEqual(overlay, b"\x01")
+
+    def test_canvas_subscription_uses_connected_jpeg_on_core_domain(self):
+        calls = []
+
+        class Node:
+            def __init__(self, name, context):
+                self.name, self.context = name, context
+
+            def create_subscription(self, msg_type, topic, callback, qos):
+                calls.append((self.context, msg_type, topic, qos.reliability))
+                return object()
+
+            def create_publisher(self, msg_type, topic, qos):
+                return object()
+
+        class QoS:
+            def __init__(self, reliability, history, depth):
+                self.reliability = reliability
+
+        class CompressedImage:
+            pass
+
+        class String:
+            pass
+
+        core = object()
+        executor = SimpleNamespace(add_node=lambda node: None)
+        ros2 = SimpleNamespace(ctx_core=core, executor_core=executor,
+                               ctx_tianyi=object(), executor_tianyi=executor)
+        plugin = aruco.ArucoZonesPlugin({}, "tianyi", ros2)
+        modules = {
+            "rclpy": SimpleNamespace(), "rclpy.node": SimpleNamespace(Node=Node),
+            "rclpy.qos": SimpleNamespace(QoSProfile=QoS,
+                ReliabilityPolicy=SimpleNamespace(BEST_EFFORT="best_effort"),
+                HistoryPolicy=SimpleNamespace(KEEP_LAST="keep_last")),
+            "sensor_msgs": SimpleNamespace(),
+            "sensor_msgs.msg": SimpleNamespace(CompressedImage=CompressedImage),
+            "std_msgs": SimpleNamespace(), "std_msgs.msg": SimpleNamespace(String=String),
+        }
+        with mock.patch.dict(sys.modules, modules):
+            plugin._ensure_ros_endpoints()
+        self.assertEqual(calls, [(core, CompressedImage,
+                                  "/tianyi/camera/head", "best_effort")])
+
     def test_process_image_rejects_incomplete_buffer(self):
         with mock.patch.dict(sys.modules, {"cv2": SimpleNamespace()}):
             msg = SimpleNamespace(width=2, height=1, step=8, encoding="rgb8",

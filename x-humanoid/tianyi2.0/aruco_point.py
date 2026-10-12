@@ -107,6 +107,7 @@ class ArucoPointPlugin:
         self._config = {key: value for key, value in plugin_config.items()
                         if key not in ("enabled",)}
         self._lock = threading.Lock()
+        self._active = False
 
     def get_tool(self):
         properties = {
@@ -123,11 +124,13 @@ class ArucoPointPlugin:
         return {"name": "aruco_point", "type": "actuator",
                 "description": "按选中 ArUco ID 的视觉水平角及真机标定驱动单臂指向；底盘不动。",
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["info", "config", "preview", "point"]},
+                    "action": {"type": "string", "enum": ["start", "stop", "info", "config", "preview", "point"]},
                     **properties}, "required": ["action"],
                     "x-resource": ["arm_l", "arm_r", "hand_l", "hand_r"],
                     "x-is-dangerous": True,
                     "x-action-params": {
+                        "start": {"params": [], "description": "标定完成后启用指向动作"},
+                        "stop": {"params": [], "description": "禁用后续指向动作"},
                         "info": {"params": []},
                         "config": {"params": [key for key in properties if key not in ("marker_id", "confirm_motion")]},
                         "preview": {"params": ["marker_id"]},
@@ -137,15 +140,30 @@ class ArucoPointPlugin:
                     if key not in ("marker_id", "confirm_motion")}}}
 
     def start(self):
-        return None
+        # Bundle's lazy lifecycle calls this before dispatch("start"). No arm
+        # command is issued here; dispatch still checks calibration explicitly.
+        return {"state": "idle", "motion_enabled": False}
 
     def stop(self):
-        return None
+        with self._lock:
+            self._active = False
+        return {"state": "idle", "motion_enabled": False, "base_motion": False}
 
     def dispatch(self, action, args):
+        if action == "start":
+            with self._lock:
+                self._active = self._is_calibrated()
+                return {"state": "ready" if self._active else "needs_calibration",
+                        "calibrated": self._active, "motion_enabled": self._active,
+                        "base_motion": False}
+        if action == "stop":
+            return self.stop()
         if action == "info":
-            return {"state": "ready", "calibrated": self._is_calibrated(),
-                    "base_motion": False}
+            with self._lock:
+                calibrated = self._is_calibrated()
+                return {"state": "ready" if self._active else "idle",
+                        "calibrated": calibrated, "motion_enabled": self._active,
+                        "base_motion": False}
         if action == "config":
             changes = {key: value for key, value in args.items()
                        if key in self.get_tool()["configSchema"]["properties"]}
@@ -153,6 +171,7 @@ class ArucoPointPlugin:
             parse_calibration(config)
             with self._lock:
                 self._config = config
+                self._active = False  # A changed calibration requires a new start.
             return self.dispatch("info", {})
         if action not in ("preview", "point"):
             raise ValueError(f"Unsupported action: {action}")
@@ -168,6 +187,8 @@ class ArucoPointPlugin:
                 return {"state": "preview", **plan, "motion_enabled": False}
             if args.get("confirm_motion") is not True:
                 raise ValueError("执行前须明确设置 confirm_motion=true")
+            if not self._active:
+                raise ValueError("指向卡片未启动；完成标定后先调用 start")
             side = plan["side"]
             base = 11 if side == "left" else 21
             motor_ids = list(range(base, base + 7))

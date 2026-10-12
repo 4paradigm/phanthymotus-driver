@@ -144,23 +144,32 @@ def assign_zones(markers, sizes, width, height, config):
 
 
 def process_image(msg, config, sizes):
-    """Decode one ROS RGB Image, detect markers, and return JSON plus overlay JPEG."""
+    """Decode a canvas JPEG (or raw RGB Image), then detect and annotate markers."""
     import cv2
     import numpy as np
 
-    width, height = int(msg.width), int(msg.height)
-    if width <= 0 or height <= 0 or msg.encoding.lower() not in ("rgb8", "bgr8"):
-        raise ValueError("仅支持非空 rgb8/bgr8 RGB 画面")
-    stride = int(msg.step)
-    if stride < width * 3:
-        raise ValueError("RGB 图像行宽不足")
-    raw = np.frombuffer(msg.data, dtype=np.uint8)
-    if raw.size < stride * height:
-        raise ValueError("RGB 图像数据不完整")
-    image = np.ndarray((height, width, 3), dtype=np.uint8, buffer=raw,
-                       strides=(stride, 3, 1))
-    frame = (cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-             if msg.encoding.lower() == "rgb8" else image.copy())
+    if hasattr(msg, "width"):
+        width, height = int(msg.width), int(msg.height)
+        if width <= 0 or height <= 0 or msg.encoding.lower() not in ("rgb8", "bgr8"):
+            raise ValueError("仅支持非空 rgb8/bgr8 RGB 画面")
+        stride = int(msg.step)
+        if stride < width * 3:
+            raise ValueError("RGB 图像行宽不足")
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        if raw.size < stride * height:
+            raise ValueError("RGB 图像数据不完整")
+        image = np.ndarray((height, width, 3), dtype=np.uint8, buffer=raw,
+                           strides=(stride, 3, 1))
+        frame = (cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                 if msg.encoding.lower() == "rgb8" else image.copy())
+    else:
+        if not getattr(msg, "format", "").lower().startswith(("jpeg", "jpg")):
+            raise ValueError("画布输入必须是 JPEG")
+        encoded = np.frombuffer(msg.data, dtype=np.uint8)
+        frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("无法解码相机 JPEG")
+        height, width = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     aruco = cv2.aruco
     dictionary = aruco.getPredefinedDictionary(getattr(aruco, config["dictionary"]))
@@ -280,17 +289,17 @@ class ArucoZonesPlugin:
             return
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-        from sensor_msgs.msg import Image, CompressedImage
+        from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
-        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
-                         history=HistoryPolicy.KEEP_LAST, depth=10)
-        self._sub_node = Node("tianyi2_aruco_sub", context=self._ros2.ctx_tianyi)
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST, depth=1)
+        self._sub_node = Node("tianyi2_aruco_sub", context=self._ros2.ctx_core)
         self._pub_node = Node("tianyi2_aruco_pub", context=self._ros2.ctx_core)
-        self._ros2.executor_tianyi.add_node(self._sub_node)
+        self._ros2.executor_core.add_node(self._sub_node)
         self._ros2.executor_core.add_node(self._pub_node)
         self._subscription = self._sub_node.create_subscription(
-            Image, "/ob_camera_head/color/image_raw", self._on_image, qos)
+            CompressedImage, self._camera_topic, self._on_image, qos)
         self._overlay_pub = self._pub_node.create_publisher(
             CompressedImage, self._outputs[0]["topic"], qos)
         self._regions_pub = self._pub_node.create_publisher(

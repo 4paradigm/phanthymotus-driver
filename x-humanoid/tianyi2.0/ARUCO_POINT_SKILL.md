@@ -31,7 +31,8 @@
 3. 调用 `aruco_point(action="preview", marker_id=所选ID)`，向用户展示
    视觉水平角、使用哪只手和目标关节角。若返回缺少标定或目标丢失，
    提示先完成标定或重新取景。
-4. 用户明确要求执行后，调用
+4. 确认真机标定已经完成，调用 `aruco_point(action="start")`，只有返回
+   `motion_enabled=true` 才可继续。用户明确要求执行后，调用
    `aruco_point(action="point", marker_id=所选ID, confirm_motion=true)`。
    每次运动都重新预览并取得用户确认。不要调用 `nav` 或底盘速度工具。
 5. 报告手臂与手指动作的实际返回结果；如果返回错误，不要声称已经指到目标。

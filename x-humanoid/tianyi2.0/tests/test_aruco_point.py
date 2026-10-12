@@ -70,6 +70,19 @@ class ArucoPointTests(unittest.TestCase):
         arm.dispatch.assert_not_called()
         hand.dispatch.assert_not_called()
 
+    def test_lifecycle_requires_calibration_and_rearming(self):
+        card = pointing.ArucoPointPlugin({}, None, None, None)
+        tool = card.get_tool()
+        self.assertIn("start", tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertIn("stop", tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertEqual(card.dispatch("start", {})["state"], "needs_calibration")
+        self.assertFalse(card.dispatch("info", {})["motion_enabled"])
+        card.dispatch("config", CALIBRATION)
+        self.assertFalse(card.dispatch("info", {})["motion_enabled"])
+        self.assertTrue(card.dispatch("start", {})["motion_enabled"])
+        self.assertEqual(card.dispatch("stop", {})["state"], "idle")
+        self.assertFalse(card.dispatch("info", {})["motion_enabled"])
+
     def test_stale_image_blocks_motion_before_arm_access(self):
         zones = SimpleNamespace(dispatch=lambda action, args: {
             "state": "running", "latest": IMAGE, "latest_frame_age_s": 2.0})
@@ -89,6 +102,7 @@ class ArucoPointTests(unittest.TestCase):
                               _target_positions=lambda poses: {})
         hand = SimpleNamespace(dispatch=mock.Mock(return_value={"state": "moving"}))
         card = pointing.ArucoPointPlugin(CALIBRATION, zones, arm, hand)
+        card.dispatch("start", {})
         result = card.dispatch("point", {"marker_id": 9, "confirm_motion": True})
         self.assertEqual(result["state"], "commanded")
         self.assertFalse(result["base_motion"])
@@ -107,6 +121,7 @@ class ArucoPointTests(unittest.TestCase):
                               _send_pos=mock.Mock())
         hand = SimpleNamespace(dispatch=mock.Mock())
         card = pointing.ArucoPointPlugin(CALIBRATION, zones, arm, hand)
+        card.dispatch("start", {})
         with self.assertRaisesRegex(ValueError, "超过 12°"):
             card.dispatch("point", {"marker_id": 9, "confirm_motion": True})
         arm._send_pos.assert_not_called()

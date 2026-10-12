@@ -8,11 +8,11 @@ exposes the capabilities as MCP tools.
 
 The read-only `aruco_zones` processor uses the existing Orbbec head RGB
 camera. On the canvas, start `camera_head`, add `aruco_zones`, and connect
-the camera's `image/jpeg` output to it. The processor subscribes to the same
-raw Orbbec stream inside the driver, then publishes an annotated JPEG and a
-zone result JSON on domain 42. It never calls the arm, hand, or base controls.
-Only `camera_head` is accepted as an input: the card deliberately uses the
-Tianyi head camera's raw ROS topic rather than a general JPEG input subscriber.
+the camera's `image/jpeg` output to it. The processor subscribes to that
+connected JPEG topic through the domain-42 socket bridge, decodes the frame,
+then publishes an annotated JPEG and a zone result JSON on domain 42. It never
+calls the arm, hand, or base controls. Only the Tianyi `camera_head` topic is
+accepted as an input.
 
 First start the card to see detected marker IDs in its overlay and JSON output.
 Then choose one ID for each of `waiting_marker_id`, `sorting_1_marker_id`, and
@@ -59,8 +59,17 @@ control and record its seven angles and the bearing it points to. Observe a
 second safe pointing pose to measure the signed joint-angle change per camera
 bearing change. These values are installation-specific; the repository does
 not provide guessed defaults. Use `preview(marker_id=...)` to review the
-computed joint target, then use `point(marker_id=..., confirm_motion=true)`
+computed joint target. Call `start` after calibration, then use
+`point(marker_id=..., confirm_motion=true)`
 only during supervised testing.
+
+The card is listed by default so its `info` and configuration are available
+on the canvas. Its actuator state remains `needs_calibration` until all
+parameters validate; configuration changes disarm it, and `point` also requires
+an explicit `start`. `stop` disarms subsequent commands. These lifecycle
+actions never move the robot. Calibration values entered with the `config`
+action are runtime state and must be reapplied after a container restart unless
+added to the deployment's `plugins.aruco_point` configuration.
 
 The command rejects stale (>1 s) or ambiguous markers, missing calibration,
 angles outside URDF limits, an arm outside the measured reference posture,
@@ -73,6 +82,8 @@ widely separated markers; each step needs a new live image and confirmation.
 The image build replaces `opencv-python-headless` with the contrib wheel
 because the existing wheel does not provide `cv2.aruco`. This may increase
 the image size; the card source and manifest entry are negligible by comparison.
+NumPy stays pinned to 1.23.5 for the Ubuntu 22.04/ROS Humble Python 3.10
+environment's NumPy 1.x ABI, avoiding a NumPy 2 upgrade alongside the wheel.
 
 ## Head camera snapshot card
 
