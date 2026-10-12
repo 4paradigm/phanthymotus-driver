@@ -506,6 +506,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(props['action']['enum'], ['info', 'start', 'stop', 'move'])
         self.assertEqual(props['joint']['minItems'], 14)
         self.assertEqual(props['joint']['maxItems'], 14)
+        self.assertEqual(props['joint']['type'], ['array', 'string'])
+        self.assertEqual(props['joint']['maxLength'], 4096)
 
     async def test_arm_control_move_rejects_wrong_joint_count(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
@@ -533,16 +535,35 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 type=aiohttp.WSMsgType.TEXT, data=json.dumps(packet))))
             await reader.receive(ws, time.monotonic()+1)
         reader.ws = types.SimpleNamespace(closed=False, send_json=send)
-        error, result = await self.call('arm_control', action='move', joint=[.1]*14,
-                                       time=1.5, _trace_id='valid')
-        self.assertFalse(error)
-        self.assertEqual(result['status'], 'accepted')
-        self.assertFalse(result['arrival_verified'])
-        self.assertTrue(result['motion_sent'])
-        self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0]['title'], 'request_movej')
-        self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 1.5})
-        self.assertNotIn('_trace_id', sent[0])
+        for joint in ([.1]*14, json.dumps([.1]*14)):
+            with self.subTest(joint_type=type(joint).__name__):
+                sent.clear()
+                error, result = await self.call('arm_control', action='move', joint=joint,
+                                               time=1.5, _trace_id='valid')
+                self.assertFalse(error)
+                self.assertEqual(result['status'], 'accepted')
+                self.assertFalse(result['arrival_verified'])
+                self.assertTrue(result['motion_sent'])
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0]['title'], 'request_movej')
+                self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 1.5})
+                self.assertNotIn('_trace_id', sent[0])
+
+    async def test_arm_canvas_invalid_json_never_sends(self):
+        self.adapter.enabled.append('arm_control')
+        ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
+        self.adapter.reader.ws = ws
+        values = ['[0,', '0,0', 'null', '{}', '"[]"', '['*1100,
+                  ' '*4097, json.dumps([0]*13), json.dumps([0]*16),
+                  json.dumps([True]*14), json.dumps(['0']*14),
+                  json.dumps([10]*14), json.dumps([math.nan]*14),
+                  json.dumps([math.inf]*14)]
+        for value in values:
+            with self.subTest(value=value[:50]):
+                error, result = await self.call('arm_control', action='move', joint=value, time=8)
+                self.assertTrue(error)
+                self.assertFalse(result['motion_sent'])
+        ws.send_json.assert_not_called()
 
     async def test_arm_control_invalid_offline_and_stale_never_send(self):
         self.adapter.enabled.append('arm_control')
@@ -701,7 +722,7 @@ class PackagingTests(unittest.TestCase):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common; '
-                'assert device.VERSION == "0.4.5"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.4.6"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

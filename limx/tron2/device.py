@@ -6,12 +6,12 @@ import os
 
 import aiohttp
 from aiohttp import web
-from vendor import RobotReader, validate_movej
+from vendor import RobotReader, validate_movej, reject_constant
 from reset import ResetPose
 from state import BATTERY_FIELDS
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.4.5'
+VERSION = '0.4.6'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -66,11 +66,12 @@ class Adapter:
                 'properties': {
                     'action': {'type': 'string', 'enum': ['info', 'start', 'stop', 'move']},
                     'joint': {
-                        'type': 'array',
+                        'type': ['array', 'string'],
+                        'maxLength': 4096,
                         'minItems': 14,
                         'maxItems': 14,
                         'items': {'type': 'number'},
-                        'description': '14 arm angles in rad: left arm 7, then right arm 7; excludes head',
+                        'description': '14 arm angles in rad: left arm 7, then right arm 7; excludes head. Canvas: enter a JSON array with square brackets.',
                     },
                     'time': {
                         'type': 'number',
@@ -152,7 +153,17 @@ class Adapter:
                         'joint_count': 14, 'position_unit': 'rad', 'motion_sent': False}
             if action != 'move':
                 raise ValueError('Unsupported actuator action')
-            joint, duration = validate_movej(args.get('joint'), args.get('time', 2.0))
+            joint = args.get('joint')
+            # Motus canvas text inputs submit arrays as JSON strings. Decode only
+            # this field, then use the same strict motion validation as API arrays.
+            if isinstance(joint, str):
+                if len(joint) > 4096:
+                    raise ValueError('JOINT JSON text exceeds 4096 characters; no motion sent')
+                try:
+                    joint = json.loads(joint, parse_constant=reject_constant)
+                except (ValueError, RecursionError) as exc:
+                    raise ValueError('JOINT must be a JSON array of 14 numbers in rad; no motion sent') from exc
+            joint, duration = validate_movej(joint, args.get('time', 2.0))
             # Pure validation. Only the async RPC path performs and awaits the send.
             return {'action': 'move', 'joint': joint, 'time': duration,
                     'joint_count': 14, 'status': 'validated', 'motion_sent': False}
