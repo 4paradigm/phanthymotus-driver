@@ -42,6 +42,10 @@ def test_bundle_exposes_only_one_direction_card(monkeypatch):
     assert {tool['name'] for tool in bundle.get_all_tools()} == {'mic', 'sound_direction'}
     manifest = yaml.safe_load((path.parent / 'driver.yaml').read_text())
     assert 'sound_direction_control' not in {card['name'] for card in manifest['cards']}
+    monkeypatch.setattr(direction, 'load_calibration', lambda: {})
+    assert bundle.dispatch('sound_direction', {'action': 'info'})['state'] == 'unavailable'
+    assert bundle.dispatch('sound_direction', {'action': 'start'})['state'] == 'unavailable'
+    assert bundle.dispatch('sound_direction', {'action': 'stop'}) == {'state': 'idle'}
 
 
 def test_clean_install_does_not_enable_uncalibrated_direction(monkeypatch, tmp_path):

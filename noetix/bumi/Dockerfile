@@ -1,7 +1,10 @@
-ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+ARG ROS_BASE_IMAGE
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+
+# This driver imports the SoundDirection message added by the matching ros-base build.
+RUN /bin/bash -c 'source /ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import SoundDirection"'
 
 WORKDIR /work
 

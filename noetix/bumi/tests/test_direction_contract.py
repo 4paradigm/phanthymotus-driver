@@ -2,7 +2,7 @@ import json
 import sys
 import types
 
-from test_direction_card import _load_card
+from test_direction_card import _card, _load_card
 
 
 def test_only_sensor_card_and_shared_settings(monkeypatch):
@@ -30,6 +30,23 @@ def test_complete_calibration_file_falls_back_and_rejects_nonfinite(monkeypatch,
     assert module.load_calibration()['right'] == [0, 1, 0]
     default.write_text('{"front":[1,0,0]}')
     assert module.load_calibration() == {}
+
+
+def test_degenerate_calibration_falls_back_or_blocks_start(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    local = tmp_path / 'local.json'
+    default = tmp_path / 'default.json'
+    monkeypatch.setattr(module, 'CALIBRATION_PATH', local)
+    monkeypatch.setattr(module, 'DEFAULT_CALIBRATION_PATH', default)
+    local.write_text(json.dumps({'front': [1, 0, 0], 'right': [1, 0.01, 0]}))
+    default.write_text(json.dumps({'front': [1, 0, 0], 'right': [0, 1, 0]}))
+    assert module.load_calibration()['right'] == [0, 1, 0]
+
+    default.write_text(json.dumps({'front': [1, 0, 0], 'right': [1, 0, 0]}))
+    assert module.load_calibration() == {}
+    card = _card(module)
+    assert card.dispatch('start', {})['state'] == 'unavailable'
+    assert card.dispatch('info', {})['calibrated_directions'] == []
 
 
 def test_angle_boundary_and_window_end_use_last_frame_samples(monkeypatch):

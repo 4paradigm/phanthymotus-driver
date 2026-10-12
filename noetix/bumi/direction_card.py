@@ -17,7 +17,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from audio_msgs.msg import SoundDirection
 
-from sound_direction import SoundActivityGate, estimate_angle, estimate_signature
+from sound_direction import MAX_BASIS_CONDITION, SoundActivityGate, estimate_angle, estimate_signature
 
 
 CALIBRATION_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_calibration.json")
@@ -49,7 +49,8 @@ def load_calibration() -> dict:
                 and all(type(value) in (int, float) and math.isfinite(value)
                         and abs(value) <= 24 for value in data[name])
                 for name in ("front", "right"))):
-            return {name: data[name] for name in ("front", "right")}
+            if np.linalg.cond(np.column_stack((data["front"], data["right"]))) <= MAX_BASIS_CONDITION:
+                return {name: data[name] for name in ("front", "right")}
     return {}
 
 

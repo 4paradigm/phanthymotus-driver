@@ -5,6 +5,8 @@ from collections import deque
 
 import numpy as np
 
+MAX_BASIS_CONDITION = 20
+
 
 class SoundActivityGate:
     """Accept sounds clearly louder than the recent microphone background."""
@@ -43,24 +45,6 @@ class SoundActivityGate:
             return False  # 只维持语音状态，停顿时的风扇声不能刷新角度。
         self._hold_samples = max(0, self._hold_samples - len(head))
         return False
-
-
-def is_voiced_audio(audio, channels: int, sample_rate: int) -> bool:
-    """Reject silence, broad noise and a single tone before saving calibration."""
-    samples = np.asarray(audio, dtype=np.float64)
-    if channels != 8 or sample_rate != 16000 or samples.size < channels * 16000:
-        return False
-    voice = samples.reshape(-1, channels)[:, 0]
-    voice = voice - voice.mean()
-    if np.sqrt(np.mean(voice * voice)) < 10:
-        return False
-    power = np.abs(np.fft.rfft(voice * np.hanning(len(voice)))) ** 2
-    frequencies = np.fft.rfftfreq(len(voice), 1 / sample_rate)
-    band = power[(frequencies >= 100) & (frequencies <= 3500)]
-    if band.sum() < 0.65 * power.sum():
-        return False
-    flatness = np.exp(np.mean(np.log(band + 1))) / np.mean(band + 1)
-    return flatness < 0.45 and band.max() < 0.5 * band.sum()
 
 
 def estimate_signature(audio, channels: int, sample_rate: int):
@@ -104,7 +88,7 @@ def estimate_angle(signature, front, right):
         return None
     if not np.all(np.isfinite(basis)) or not np.all(np.isfinite(measured)):
         return None
-    if np.linalg.cond(basis) > 20 or np.linalg.norm(measured) < 0.5:
+    if np.linalg.cond(basis) > MAX_BASIS_CONDITION or np.linalg.norm(measured) < 0.5:
         return None
     weights, *_ = np.linalg.lstsq(basis, measured, rcond=None)
     if np.linalg.norm(basis @ weights - measured) > 0.35 * np.linalg.norm(measured):

@@ -51,6 +51,9 @@ the per-robot override as an emergency measure. The previous
 
 Run local tests from the repository root with
 `python -m pytest noetix/bumi/tests -q`.
+Build this driver with `BUMI_ROS_BASE_IMAGE` set to a verified
+`bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:...` image
+containing `audio_msgs/msg/SoundDirection`; the build checks that import.
 
 ## App 图传与 Phanthy Camera Card
 
