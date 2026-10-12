@@ -4,6 +4,22 @@ G1 Driver 通过 MCP 提供运动控制、机械臂动作、麦克风、扬声�
 
 现有 `arm.release` 使用厂商 action 99；连续控制入口包括 [servo.py](servo.py) 和 [servo_eef.py](servo_eef.py)。SDK 请求成功与实测动作完成是不同状态。
 
+## 构建
+
+业务镜像使用固定版本的 G1 base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
+
+首次构建，或修改依赖版本/编译配置时，在仓库根目录构建 base。优先使用本机 Linux ARM64 Docker：
+
+```sh
+docker build --platform linux/arm64 \
+  -f unitree/g1/Dockerfile.base \
+  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
+  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:humble-pin4.1.0-casadi3.8.1-v1 \
+  unitree/g1
+```
+
+base 必须存在于当前 builder 可访问的本地镜像库或镜像仓库。当前版本尚未发布到镜像仓库；首次使用需先执行该构建。跨机器使用前需发布并核验镜像摘要。修改依赖时更新 base 标签及业务 Dockerfile 的默认值，不覆盖已发布版本。自定义 base 可通过业务构建参数 `G1_BASE_IMAGE` 指定；`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
+
 ## 双臂遥操
 
 `teleop_control` 接收设备 Driver 的输入，在 G1 Driver 内完成相对映射、独立进程 IK 和双臂位置下发。默认注册该卡，市场清单包含 `teleop_control`。随镜像提供原厂 G1_23（每臂 5 关节、固定假手）的完整固定几何 profile；不依赖现场临时标定脚本或用户填写路径。Core 和 ActuCore 无需遥操专用修改。
