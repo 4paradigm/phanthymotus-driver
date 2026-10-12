@@ -49,21 +49,13 @@ _default_active = {item.strip() for item in os.environ.get(
 
 
 def _active_streams():
-    """Read the driver's latest card activation set without restarting Jazzy."""
-    try:
-        with open(_control_file, "r", encoding="utf-8") as handle:
-            requested = {line.strip() for line in handle if line.strip()}
-        # An empty control file is a valid legacy state, but the driver now
-        # deliberately keeps all configured streams alive. Never let a stale
-        # frontend stop event tear down the raw subscriptions.
-        return (requested or set(CAMERAS)) & set(CAMERAS)
-    except OSError:
-        # The control file is an optional optimization written by the
-        # frontend.  During startup it may not exist yet (and a bind mount
-        # may briefly hide its parent).  Do not interpret that transient
-        # condition as "disable every camera": keep the complete relay alive
-        # until an explicit non-empty selection is written.
-        return (_default_active or set(CAMERAS)) & set(CAMERAS)
+    """Return every configured stream.
+
+    Camera DDS subscriptions are intentionally process-lifetime resources.
+    Frontend card lifecycle events are not reliable across reconnects and
+    must never tear down a raw subscription or leave a camera with one frame.
+    """
+    return set(CAMERAS)
 
 
 def _encode_image(msg, key):
@@ -233,7 +225,6 @@ def _media_all():
     last_emit = {key: 0.0 for key in CAMERAS}
     received = {key: 0 for key in CAMERAS}
     emitted = {key: 0 for key in CAMERAS}
-    encoded_pending = {key: None for key in CAMERAS}
     pending = {key: None for key in CAMERAS}
     subscriptions = {}
     subscriptions_lock = threading.Lock()
@@ -245,25 +236,14 @@ def _media_all():
     # ADU CPU. Keep a fresh latest-frame preview at a bounded 4 FPS per stream;
     # the one-slot pending map means this never accumulates latency.
     min_interval = 1.0 / 6.0
-    active_state = {"keys": _active_streams(), "checked": 0.0}
+    active_state = {"keys": set(CAMERAS), "checked": 0.0}
 
     worker_count = 3
 
     def sync_subscriptions(active):
-        """Receive raw Image samples only for cards currently on the canvas.
-
-        A callback-side active check is insufficient: DDS deserializes an Image
-        before invoking the callback. Recreating these best-effort subscriptions
-        is what keeps inactive cameras out of the large-sample CPU path.
-        """
+        """Create the ten raw subscriptions once and keep them alive."""
         with subscriptions_lock:
             wanted = set(active)
-            for key in list(subscriptions):
-                if key not in wanted:
-                    try:
-                        node.destroy_subscription(subscriptions.pop(key))
-                    except Exception:
-                        subscriptions.pop(key, None)
             for key in wanted - set(subscriptions):
                 topic = CAMERAS[key]
                 pub = publishers[key]
@@ -314,9 +294,14 @@ def _media_all():
                     if emitted[stream_key] == 1 or emitted[stream_key] % 30 == 0:
                         print(f"[relay] frame encoded key={stream_key} count={emitted[stream_key]} "
                               f"bytes={len(output.data)}", flush=True)
-                    with wake:
-                        encoded_pending[stream_key] = output
-                        wake.notify()
+                    # rclpy publishers are safe to call from worker threads;
+                    # publishing here avoids relying on a timer callback in
+                    # the host Jazzy executor, which previously produced a
+                    # first frame followed by a stalled output stream.
+                    publishers[stream_key].publish(output)
+                    if emitted[stream_key] == 1 or emitted[stream_key] % 30 == 0:
+                        print(f"[relay] output published key={stream_key} count={emitted[stream_key]} "
+                              f"bytes={len(output.data)}", flush=True)
             except Exception as exc:
                 print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
 
@@ -331,27 +316,6 @@ def _media_all():
         threading.Thread(target=worker, args=(worker_index,), daemon=True,
                          name=f"a3-camera-encoder-{worker_index}").start()
 
-    published = {key: 0 for key in CAMERAS}
-    def publish_encoded():
-        # Keep all ROS publisher calls on the executor thread. Encoder workers
-        # only replace a latest-frame slot, so neither DDS nor the executor can
-        # accumulate stale camera frames when JPEG work falls behind.
-        with wake:
-            ready = [(key, encoded_pending[key]) for key in CAMERAS
-                     if key in active_state["keys"] and encoded_pending[key] is not None]
-            for key, _ in ready:
-                encoded_pending[key] = None
-        for key, output in ready:
-            try:
-                publishers[key].publish(output)
-                published[key] += 1
-                if published[key] == 1 or published[key] % 30 == 0:
-                    print(f"[relay] output published key={key} count={published[key]} "
-                          f"bytes={len(output.data)}", flush=True)
-            except Exception as exc:
-                print(f"[relay] output failed key={key}: {type(exc).__name__}: {exc!r}", flush=True)
-
-    node.create_timer(0.005, publish_encoded, callback_group=group)
     lidar_pub = node.create_publisher(UInt8MultiArray, "/agibot_a3/lidar_cloud", qos)
     def push_lidar(msg):
         try:
