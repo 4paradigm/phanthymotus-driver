@@ -1,10 +1,11 @@
-ARG ROS_BASE_IMAGE
+ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# This driver imports the SoundDirection message added by the matching ros-base build.
-RUN /bin/bash -c 'source /ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import SoundDirection"'
+# Build the audio interface in this image so Bumi does not require a newer ros-base.
+COPY audio_msgs/ /bumi_ros_ws/src/audio_msgs/
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release && source install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
 
 WORKDIR /work
 
@@ -104,4 +105,4 @@ EXPOSE 15704
 # systemd unit, because `jetson_clocks` is not persistent across a reboot while
 # `nvpmodel` is — so a rebooted machine and a fresh one would otherwise run at
 # different speeds with nothing anywhere saying why.
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 /work/main.py"]

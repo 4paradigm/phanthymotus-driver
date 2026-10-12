@@ -51,9 +51,10 @@ the per-robot override as an emergency measure. The previous
 
 Run local tests from the repository root with
 `python -m pytest noetix/bumi/tests -q`.
-Build this driver with `BUMI_ROS_BASE_IMAGE` set to a verified
-`bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:...` image
-containing `audio_msgs/msg/SoundDirection`; the build checks that import.
+The driver image builds its bundled `audio_msgs` definitions, including
+`SoundDirection`, over a pinned ROS base image. It does not require a new
+`ros-base` release from the main repository. ASR and Agent Core still need the
+matching message definition to consume the direction topic.
 
 ## App 图传与 Phanthy Camera Card
 

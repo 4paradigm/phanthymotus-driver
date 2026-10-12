@@ -243,11 +243,6 @@ for idx in "${SELECTED_INDICES[@]}"; do
         echo "错误：${DRIVER_NAMES[$idx]} ${buildable}"
         exit 1
     fi
-    if [ "${DRIVER_IDS[$idx]}" = "bumi-driver" ] &&
-       [[ ! "${BUMI_ROS_BASE_IMAGE:-}" =~ ^bj-warehouse\.tencentcloudcr\.com/phanthy-motus/ros-base@sha256:[[:xdigit:]]{64}$ ]]; then
-        echo "错误：构建 Bumi 需设置 BUMI_ROS_BASE_IMAGE 为已验证的 ros-base@sha256 digest" >&2
-        exit 1
-    fi
 done
 
 # ── 生成版本号 ─────────────────────────────────────────────────────────────
@@ -287,9 +282,6 @@ for idx in "${SELECTED_INDICES[@]}"; do
     model="${DRIVER_MODELS[$idx]}"
     FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${provider}/${model}:${TAG}"
     build_args=(--build-arg "PYPI_MIRROR=${PYPI_MIRROR}")
-    if [ "${DRIVER_IDS[$idx]}" = "bumi-driver" ]; then
-        build_args+=(--build-arg "ROS_BASE_IMAGE=${BUMI_ROS_BASE_IMAGE}")
-    fi
 
     echo ""
     echo "============================================"
