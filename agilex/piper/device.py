@@ -11,11 +11,11 @@ from agilex.piper.control import healthy, mode_name, ready_to_move, teaching_sto
 from agilex.piper.runtime import PiperRuntime, confirm, number
 
 
+class PiperPlugin(PiperRuntime):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.cartesian_preview = None
 
-class PiperPlugin(PiperRuntime):
     def get_tools(self):
         return build_tools(self.topic)
 

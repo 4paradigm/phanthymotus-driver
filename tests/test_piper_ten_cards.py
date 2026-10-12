@@ -68,6 +68,7 @@ class TenCardTests(unittest.TestCase):
 
     def test_exactly_ten_public_cards_and_start_never_connects(self):
         self.assertEqual({t['name'] for t in self.plugin.get_tools()}, set(TITLES))
+        self.assertEqual(TITLES['piper_cartesian'], '机械臂末端空间移动')
         for name in TITLES:
             self.bundle.dispatch(name, {'action': 'start'})
             self.assertIsNone(self.plugin.driver)

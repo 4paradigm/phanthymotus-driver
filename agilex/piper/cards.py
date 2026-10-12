@@ -6,7 +6,7 @@ TITLES = {
     "piper_status": "机器人状态", "piper_standby": "切换待机",
     "piper_can": "切换电脑控制", "piper_enable": "电机使能",
     "piper_disable": "电机失能", "piper_joint": "单轴运动",
-    "piper_cartesian": "末端空间移动",
+    "piper_cartesian": "机械臂末端空间移动",
     "piper_gripper": "夹爪开合", "piper_photo": "相机与照片",
     "piper_permission": "操作许可", "piper_stop": "停止动作",
 }
