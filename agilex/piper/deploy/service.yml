@@ -17,6 +17,7 @@ agilex-piper:
     - AGENT_CORE_URL=https://localhost:15678
     - PIPER_MOTION_ENABLED=${PIPER_MOTION_ENABLED:-0}
     - PIPER_CAMERA_ENABLED=${PIPER_CAMERA_ENABLED:-0}
+    - CONFIG_PATH=${PIPER_CONFIG_PATH:-/work/agilex/piper/config.yaml}
   logging:
     driver: local
     options:

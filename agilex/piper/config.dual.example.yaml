@@ -1,0 +1,30 @@
+# Copy to the existing data mount, set CONFIG_PATH, and verify both CAN bindings.
+mcp_port: 15741
+name: "PiPER 双臂与 D435"
+ros_namespace: piper
+data_dir: /opt/phanthy-motus/data/piper
+async_actions: true
+arms:
+  left:
+    can_interface: can0
+  right:
+    can_interface: can1
+calibration_path: /opt/phanthy-motus/data/piper/calibration.json
+joint_limits_deg:
+  - [-150, 150]
+  - [0, 180]
+  - [-170, 0]
+  - [-100, 100]
+  - [-70, 70]
+  - [-120, 120]
+gripper_limits_mm: [0, 70]
+mode:
+  verified_teaching_firmwares: []
+camera:
+  device: ""
+  warmup_seconds: 3
+  min_contrast: 8
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: lo

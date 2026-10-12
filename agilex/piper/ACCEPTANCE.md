@@ -1,3 +1,30 @@
+# 双臂遥操与轨迹回放：本地软件验收（2026-10-12）
+
+本节记录 `codex/piper-dual-teleop` 的本地实现。基线为十卡片 `f5ca598`；
+复用 PICO `77a9fa3` 的输入契约与 G1 `c5de68f` 的隔离数值工作进程。
+本轮没有连接现场主机，没有部署、相机采集或真实 CAN 控制。历史单臂记录保持原证据范围。
+
+- 指定回归集合通过：289 tests、85 subtests。包含原有十卡片、部署、公共生命周期、
+  HTTP 日志、共享输入契约，以及双臂映射/IK、互斥、停止、故障、文件校验与回放。
+- 真实 URDF/NumPy 求解与工作进程通过测试；控制测试使用模拟 SDK。
+- 最终 PiPER 镜像从固定官方 ROS Humble 基础镜像按正常 Dockerfile 构建，
+  使用 `bash agilex/piper/build-local.sh agilex-piper:dual-teleop-20261012 --progress plain`。
+  最初构建安装完整依赖，最终源码重建复用依赖层缓存；不是现场镜像叠加，也不声称 `--no-cache`。
+  架构检查通过 linux/amd64，Docker inspect ID：
+  `sha256:c5e700816332d87a640ea7ffa698085c15236672371973258f415c683db035ae`。
+- 最终镜像内运行 `tests/validate_piper_dds.py`，网络隔离、根目录只读、未挂载设备。
+  真实 loopback DDS domain 42、HTTP MCP、NumPy 工作进程完成 32 帧录制及回放，收到
+  13 条监控消息。测试输入保持固定姿态，CAN 为模拟 SDK；不等同头显、现场 DDS 或轨迹误差验收。
+- PICO `77a9fa3` 原 Dockerfile 在 amd64 下通过依赖安装、锁文件哈希和 APK 哈希校验，
+  容器内 `rclpy/aiohttp/aiortc/av/zeroconf/yaml` 导入通过。测试以此次 PiPER 镜像作
+  `ROS_BASE_IMAGE`，仅证明 amd64 兼容性，包含额外 PiPER 依赖，不是发布用 PICO 镜像。
+  本地标签 `pico-4ultra:piper-compat-20261012`，未修改或发布 PICO 源码、APK。
+- `git diff --check` 通过。未增加 Python 依赖；官方 URDF 的 MIT 许可证和来源随代码保留。
+
+未验收：左右 CAN 实物绑定、安装与 TCP 标定、模型/实物方向一致性、头显及实际画布、
+夹爪动作、断线停止距离、臂间/环境碰撞和真机回放误差。模型只检查 TCP 工作区，
+两路 CAN 不是原子同步。部署示例默认不提供有效标定，也不会自动切模式或使能。
+
 # 十卡片拆分与部署（2026-10-12）
 
 生产入口改为十个独立工具：机器人状态、待机、CAN、使能、失能、单轴、夹爪、照片、许可、停止。

@@ -228,4 +228,7 @@ class PiperPlugin(PiperRuntime):
 
 
 def build_plugins(config, namespace, ros2):
+    if "arms" in config:
+        from agilex.piper.dual import DualPiperPlugin
+        return [DualPiperPlugin(config, namespace, ros2)]
     return [PiperPlugin(config, namespace, ros2)]

@@ -1,0 +1,24 @@
+{
+  "schema": "motus.piper.calibration/1",
+  "calibration_id": "REPLACE-AFTER-PHYSICAL-MEASUREMENT",
+  "hardware_verified": false,
+  "model_sha256": "22c15f95e50003b01713bae158638f7d19cdb71b1bd1095289865b835067002b",
+  "arms": {
+    "left": {
+      "can_interface": "can0",
+      "flange_to_tcp": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "controller_to_tcp": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "tracking_to_base": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "base_to_world": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "workspace_m": [[0, 0, 0], [0, 0, 0]]
+    },
+    "right": {
+      "can_interface": "can1",
+      "flange_to_tcp": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "controller_to_tcp": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "tracking_to_base": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "base_to_world": {"position": [0, 0, 0], "orientation": [0, 0, 0, 1]},
+      "workspace_m": [[0, 0, 0], [0, 0, 0]]
+    }
+  }
+}

@@ -284,6 +284,64 @@ class PiperDriver:
             self.arm.MotionCtrl_2(0x01, 0x01, speed_pct, 0x00)
             self.arm.JointCtrl(*raw_target)
 
+    def validate_stream_target(self, q, width_mm):
+        """Validate a single continuous target without enabling or moving anything."""
+        from agilex.piper.control import ready_to_move
+        if (not isinstance(q, (list, tuple)) or len(q) != 6 or
+                any(type(v) not in (int, float) or not math.isfinite(v) for v in q)):
+            raise ValueError("invalid_stream_joints")
+        if type(width_mm) not in (int, float) or not math.isfinite(width_mm):
+            raise ValueError("invalid_stream_width")
+        state, grip = self.get_state(), self.get_gripper()
+        ready_to_move(state)
+        if not grip.enabled or grip.error_code:
+            raise RuntimeError("stream_requires_healthy_enabled_gripper")
+        if (not math.isfinite(state.feedback_time) or abs(time.time()-state.feedback_time) > .5
+                or not math.isfinite(grip.feedback_time) or abs(time.time()-grip.feedback_time) > .5):
+            raise RuntimeError("stream_feedback_stale")
+        raw = tuple(round(math.degrees(v)*1000) for v in q)
+        if raw != self._bounded_target(raw):
+            raise ValueError("stream_joint_limit")
+        low, high = self.gripper_range()
+        if not low <= width_mm <= high:
+            raise ValueError("stream_gripper_limit")
+        return raw
+
+    def stream_target(self, q, width_mm):
+        """Internal paired-controller entry; its owner must hold the operation gate."""
+        with self._send_lock:
+            self._check_cancelled()
+            raw = self.validate_stream_target(q, width_mm)
+            self._command(raw, 5, expected_enabled=(True,) * 6)
+            if not self.get_gripper().enabled:
+                raise RuntimeError("stream_gripper_disabled")
+            self._gripper_command(width_mm, .5)
+            return {"q": [math.radians(v/1000) for v in raw], "width_mm": round(width_mm*1000)/1000}
+
+    def stream_hold(self):
+        """Best-effort fresh feedback hold after cancellation; never enable/disable."""
+        result = {"arm_hold_sent": False, "gripper_hold_sent": False, "errors": []}
+        with self._send_lock:
+            try:
+                raw, state = self._healthy()
+                if (not state.control_mode.startswith("CAN_CTRL") or not all(state.enabled)
+                        or raw != self._bounded_target(raw) or not math.isfinite(state.feedback_time)
+                        or abs(time.time()-state.feedback_time) > .5):
+                    raise RuntimeError("arm_not_ready_for_hold")
+                self.arm.MotionCtrl_2(0x01, 0x01, 5, 0x00)
+                self.arm.JointCtrl(*raw)
+                result["arm_hold_sent"] = True
+                grip = self.get_gripper()
+                low, high = self.gripper_range()
+                if (not grip.enabled or grip.error_code or not low <= grip.width_mm <= high
+                        or not math.isfinite(grip.feedback_time) or abs(time.time()-grip.feedback_time) > .5):
+                    raise RuntimeError("gripper_not_ready_for_hold")
+                self.arm.GripperCtrl(round(grip.width_mm*1000), 500, 1, 0)
+                result["gripper_hold_sent"] = True
+            except Exception as exc:
+                result["errors"].append(str(exc))
+        return result
+
     def _hold_on_error(self, speed_pct):
         # Cancellation still allows one fresh-pose hold. Never disable or reset.
         try:
