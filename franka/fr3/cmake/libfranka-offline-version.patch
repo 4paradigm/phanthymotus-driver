@@ -1,0 +1,11 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -219,4 +219,6 @@
+ ## Packaging
+-include(SetVersionFromGit)
+-set_version_from_git(PACKAGE_VERSION PACKAGE_TAG)
++# PhanthyMotus modification: source archives have no Git metadata.
++# Use the pinned release version for package metadata only.
++set(PACKAGE_VERSION ${libfranka_VERSION})
++set(PACKAGE_TAG ${libfranka_VERSION})
+ execute_process(COMMAND dpkg --print-architecture OUTPUT_VARIABLE PACKAGE_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)

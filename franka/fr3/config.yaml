@@ -1,0 +1,10 @@
+mcp_port: 15723
+ros_namespace: franka
+name: Franka FR3
+
+# Robot IPs are configured on each canvas card, not on the driver container.
+# The native libfranka reader uses TCP/UDP, independently of ROS interfaces.
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: lo
