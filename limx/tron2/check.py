@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.4.0'
+VERSION = '0.4.1'
 CARDS = {'joint_state', 'robot_status', 'battery_state'}
 
 
@@ -30,7 +30,8 @@ def rpc(method, params=None):
 
 
 def read_samples():
-    result = rpc('tools/call', {'name': 'read_state', 'arguments': {'action': 'read'}})
+    result = rpc('tools/call', {'name': 'read_state', 'arguments': {
+        'action': 'read', 'instance_id': 'readonly-check', '_trace_id': 'readonly-check-trace'}})
     if result.get('isError'):
         raise ValueError('Read-state request failed')
     return json.loads(result['content'][0]['text'])['samples']
@@ -60,7 +61,8 @@ def run_check(timeout=20):
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,
-                'arguments': {'action': action, 'instance_id': 'readonly-check'}})
+                'arguments': {'action': action, 'instance_id': 'readonly-check',
+                              '_trace_id': 'readonly-check-trace'}})
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
     before = read_samples()
@@ -73,7 +75,7 @@ def run_check(timeout=20):
     if joint['received_at'] <= before['joint_state']['received_at']:
         raise ValueError('Joint response receipt did not update')
     values = joint['data']
-    print('PASS: only sensor/resource cards; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: only sensor/resource cards; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])

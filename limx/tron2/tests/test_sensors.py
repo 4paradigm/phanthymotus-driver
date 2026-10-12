@@ -310,6 +310,47 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['samples']['joint_state']['available'])
         self.assertEqual(result['samples']['joint_state']['data']['joint_count'], 16)
 
+    async def test_core_trace_and_instance_metadata_are_declared_and_ignored(self):
+        tools = (await self.rpc('tools/list'))['result']['tools']
+        trace = 'b2d39576-6402-4855-8367-3b19df60e76f'
+        # Exercise the actual HTTP tools/call path used after Core injection.
+        for tool in tools:
+            props = tool['inputSchema']['properties']
+            self.assertEqual(props['_trace_id']['maxLength'], 128)
+            self.assertEqual(props['instance_id']['type'], 'string')
+            actions = ('read', 'info', 'start', 'stop') if tool['name'] == 'read_state' else ('info', 'start', 'stop')
+            for action in actions:
+                with self.subTest(tool=tool['name'], action=action):
+                    error, original = await self.call(tool['name'], action=action)
+                    self.assertFalse(error)
+                    error, traced = await self.call(tool['name'], action=action,
+                        instance_id='tron2-assist-read_state', _trace_id=trace)
+                    self.assertFalse(error)
+                    self.assertTrue(traced['read_only'])
+                    # A different receipt age is natural; the sampled robot data
+                    # and lifecycle result must otherwise be independent of metadata.
+                    if tool['name'] == 'read_state' and action in ('read', 'info'):
+                        for name in TOPICS:
+                            self.assertEqual(traced['samples'][name]['data'], original['samples'][name]['data'])
+                    elif action == 'info':
+                        self.assertEqual(traced['sample']['data'], original['sample']['data'])
+                    else:
+                        self.assertEqual(traced, original)
+                    self.assertNotIn(trace, json.dumps(traced))
+
+    async def test_core_metadata_validation_does_not_allow_control_payloads(self):
+        for args in ({'_trace_id': None}, {'_trace_id': 10}, {'_trace_id': {}},
+                     {'_trace_id': 'x'*129}, {'_trace_id': 'bad\ntrace'},
+                     {'_trace_id': 'bad\x7ftrace'}, {'instance_id': ['card']},
+                     {'_trace_id': 'valid', 'target_q': [0]*14},
+                     {'_trace_id': 'valid', 'unexpected': True}):
+            with self.subTest(args=args):
+                error, result = await self.call('read_state', action='read', **args)
+                self.assertTrue(error)
+                self.assertTrue(result['read_only'])
+        error, result = await self.call('reset_pose', action='execute', _trace_id='valid')
+        self.assertTrue(error)
+
     async def test_reset_execute_custom_angles_and_bad_metadata_are_rejected(self):
         for name, args in [('reset_pose', {'action': 'execute'}),
                 ('joint_state', {'action': 'execute'}),
@@ -379,7 +420,7 @@ class PackagingTests(unittest.TestCase):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common; '
-                'assert device.VERSION == "0.4.0"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.4.1"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

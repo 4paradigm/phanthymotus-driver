@@ -9,7 +9,7 @@ from aiohttp import web
 from vendor import RobotReader
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.4.0'
+VERSION = '0.4.1'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Read-only Sensors'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -19,6 +19,16 @@ DESCRIPTIONS = {
     'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
     'battery_state': 'TRON2 电量百分比及厂家原始 BMS 参数（只读，不推测温度/电压单位）',
 }
+
+
+def metadata_properties():
+    """Reserved Core metadata; neither field changes a robot request."""
+    return {key: {'type': 'string', 'maxLength': 128,
+                  'pattern': r'^[^\x00-\x1f\x7f]*$',
+                  'description': description}
+            for key, description in (
+                ('instance_id', '画布调用层传入的卡片标识；可省略'),
+                ('_trace_id', 'Agent Core 自动注入的追踪标识；无需用户填写'))}
 
 
 class Adapter:
@@ -36,26 +46,31 @@ class Adapter:
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
                 'inputSchema': {'type': 'object', 'additionalProperties': False,
-                    'properties': {'action': {'type': 'string', 'enum': ['info', 'start', 'stop']}},
+                    'properties': {'action': {'type': 'string', 'enum': ['info', 'start', 'stop']},
+                                   **metadata_properties()},
                     'required': ['action']},
                 'topic_out': [{'topic': TOPICS[name], 'format': 'data/json'}]})
         tools.append({'name': 'read_state', 'type': 'resource',
             'description': '读取三张传感器卡片的当前缓存与接收时效；不发送机器人控制指令',
             'inputSchema': {'type': 'object', 'additionalProperties': False,
                 'properties': {'action': {'type': 'string',
-                    'enum': ['info', 'read', 'start', 'stop'], 'default': 'read'}}}})
+                    'enum': ['info', 'read', 'start', 'stop'], 'default': 'read'},
+                    **metadata_properties()}}})
         return tools
 
     def snapshot(self):
         return {name: self.reader.sample(name) for name in self.enabled}
 
     def call(self, name, args):
-        if not isinstance(args, dict) or set(args) - {'action', 'instance_id'}:
-            raise ValueError('Only action and canvas instance_id are accepted')
-        instance = args.get('instance_id', '')
-        if not isinstance(instance, str) or len(instance) > 128 or any(
-                ord(c) < 32 or ord(c) == 127 for c in instance):
-            raise ValueError('Invalid canvas instance_id')
+        if not isinstance(args, dict) or set(args) - {'action', 'instance_id', '_trace_id'}:
+            raise ValueError('Only action and Core instance_id/_trace_id metadata are accepted')
+        # Core injects both fields after the model has selected a tool. Accept
+        # bounded identifiers, but do not forward, log, or echo them as robot data.
+        for key in ('instance_id', '_trace_id'):
+            value = args.get(key, '')
+            if not isinstance(value, str) or len(value) > 128 or any(
+                    ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError('Invalid Core metadata: ' + key)
         action = args.get('action', 'read' if name == 'read_state' else None)
         if not isinstance(action, str):
             raise ValueError('An action string is required')
