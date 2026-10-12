@@ -835,7 +835,7 @@ class A3Nodes:
         return payload
 
     def _publish_audio(self, publisher, key, msg):
-        """Queue PCM and publish 32 ms frames at real-time speed."""
+        """Queue PCM and publish ASR-sized 32 ms frames at real-time speed."""
         chunk = self._audio_chunk(msg)
         payload = bytes(getattr(chunk, "data", ()))
         if not payload:
@@ -851,9 +851,13 @@ class A3Nodes:
             if len(buffer) > 4096:
                 del buffer[:-4096]
             frames = []
-            while len(buffer) >= 1024:
-                frames.append(bytes(buffer[:1024]))
-                del buffer[:1024]
+            # The HAL supplies 320 bytes per 10 ms. Agent Core's ASR drops
+            # frames below 1024 bytes, so coalesce to 512 mono S16 samples
+            # (32 ms) before pacing them downstream.
+            frame_bytes = 1024
+            while len(buffer) >= frame_bytes:
+                frames.append(bytes(buffer[:frame_bytes]))
+                del buffer[:frame_bytes]
         q = self._audio_queues[key]
         for frame in frames:
             try:
@@ -896,7 +900,13 @@ class A3Nodes:
             output.format = "audio/pcm-16k"
             output.data = list(data)
             publisher.publish(output)
-            next_deadline = max(next_deadline + 0.032, time.monotonic())
+            # Never catch up by publishing several old frames back-to-back.
+            # Once late, restart the real-time clock and discard queued stale
+            # frames through the bounded queue instead.
+            next_deadline += 0.032
+            now = time.monotonic()
+            if next_deadline < now - 0.020:
+                next_deadline = now
 
     def hand_command_layout(self, hand_type):
         """Use the real channel names reported by the installed hand."""

@@ -58,7 +58,12 @@ def _active_streams():
         # frontend stop event tear down the raw subscriptions.
         return (requested or set(CAMERAS)) & set(CAMERAS)
     except OSError:
-        return _default_active & set(CAMERAS)
+        # The control file is an optional optimization written by the
+        # frontend.  During startup it may not exist yet (and a bind mount
+        # may briefly hide its parent).  Do not interpret that transient
+        # condition as "disable every camera": keep the complete relay alive
+        # until an explicit non-empty selection is written.
+        return (_default_active or set(CAMERAS)) & set(CAMERAS)
 
 
 def _encode_image(msg, key):
@@ -228,6 +233,7 @@ def _media_all():
     last_emit = {key: 0.0 for key in CAMERAS}
     received = {key: 0 for key in CAMERAS}
     emitted = {key: 0 for key in CAMERAS}
+    encoded_pending = {key: None for key in CAMERAS}
     pending = {key: None for key in CAMERAS}
     subscriptions = {}
     subscriptions_lock = threading.Lock()
@@ -304,8 +310,13 @@ def _media_all():
                 last_emit[stream_key] = time.monotonic()
                 output = _encode_image(msg, stream_key)
                 if output is not None:
-                    publishers[stream_key].publish(output)
                     emitted[stream_key] += 1
+                    if emitted[stream_key] == 1 or emitted[stream_key] % 30 == 0:
+                        print(f"[relay] frame encoded key={stream_key} count={emitted[stream_key]} "
+                              f"bytes={len(output.data)}", flush=True)
+                    with wake:
+                        encoded_pending[stream_key] = output
+                        wake.notify()
             except Exception as exc:
                 print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
 
@@ -319,6 +330,28 @@ def _media_all():
     for worker_index in range(worker_count):
         threading.Thread(target=worker, args=(worker_index,), daemon=True,
                          name=f"a3-camera-encoder-{worker_index}").start()
+
+    published = {key: 0 for key in CAMERAS}
+    def publish_encoded():
+        # Keep all ROS publisher calls on the executor thread. Encoder workers
+        # only replace a latest-frame slot, so neither DDS nor the executor can
+        # accumulate stale camera frames when JPEG work falls behind.
+        with wake:
+            ready = [(key, encoded_pending[key]) for key in CAMERAS
+                     if key in active_state["keys"] and encoded_pending[key] is not None]
+            for key, _ in ready:
+                encoded_pending[key] = None
+        for key, output in ready:
+            try:
+                publishers[key].publish(output)
+                published[key] += 1
+                if published[key] == 1 or published[key] % 30 == 0:
+                    print(f"[relay] output published key={key} count={published[key]} "
+                          f"bytes={len(output.data)}", flush=True)
+            except Exception as exc:
+                print(f"[relay] output failed key={key}: {type(exc).__name__}: {exc!r}", flush=True)
+
+    node.create_timer(0.005, publish_encoded, callback_group=group)
     lidar_pub = node.create_publisher(UInt8MultiArray, "/agibot_a3/lidar_cloud", qos)
     def push_lidar(msg):
         try:
