@@ -72,6 +72,8 @@ FROM ros-base
 # Fortran compiler. Keep that SDK build environment out of the final image.
 # These runtime packages and five ROS library families were checked with ldd
 # against the ARM64 reader; apt resolves the Ubuntu libraries' dependencies.
+# libfranka needs TinyXML2 (libtinyxml2-9); urdfdom also needs the separate
+# original TinyXML library (libtinyxml2.6.2v5). Both are available in Jammy.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates python3-yaml ros-humble-rmw-fastrtps-cpp \
