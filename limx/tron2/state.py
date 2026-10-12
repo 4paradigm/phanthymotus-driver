@@ -5,9 +5,7 @@ STATUS_FIELDS = ('imu', 'camera', 'motor', 'sw_version', 'status',
                  'tele_operation', 'working_mode', 'working_mode_valid',
                  'collision_enable', 'collision_enable_valid',
                  'compliant_enable', 'compliant_enable_valid')
-BATTERY_FIELDS = ('battery', 'bms_voltage', 'bms_current', 'bms_current_valid',
-                  'bms_current_updated_at', 'bms_charging_cycle',
-                  'bms_temp1', 'bms_temp2', 'bms_temp3', 'bms_temp4', 'bms_temp5')
+BATTERY_FIELDS = ('soc', 'voltage', 'current', 'power')
 
 
 def vector(value, count, field):
@@ -65,15 +63,26 @@ def select_fields(data, fields):
     return result
 
 
-def battery_state(data):
-    result = {'raw': select_fields(data, BATTERY_FIELDS)}
-    raw = data.get('battery')
+def battery_number(raw):
+    """Parse a finite vendor number without guessing its physical unit."""
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        return None
     try:
-        percent = float(raw) if not isinstance(raw, bool) else None
-    except (ValueError, TypeError):
-        percent = None
-    result['battery_percent'] = percent if percent is not None and math.isfinite(percent) \
-        and 0 <= percent <= 100 else None
-    # SDK does not specify BMS voltage/current/temperature scaling here.
-    result['bms_units'] = 'vendor_raw_unverified'
-    return result
+        value = float(raw)
+    except (ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def battery_state(data):
+    soc = battery_number(data.get('battery'))
+    voltage = battery_number(data.get('bms_voltage'))
+    # Invalid or unverified current must not be presented as a real zero.
+    current = battery_number(data.get('bms_current')) \
+        if data.get('bms_current_valid') is True else None
+    return {'soc': soc if soc is not None and 0 <= soc <= 100 else None,
+            'voltage': voltage if voltage is not None and voltage >= 0 else None,
+            'current': current,
+            # Neither BMS scaling nor an explicit power field is documented.
+            # Multiplying raw voltage/current would not establish watts.
+            'power': None}

@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.4.2'
+VERSION = '0.4.3'
 CARDS = {'joint_state', 'robot_status', 'battery_state'}
 
 
@@ -78,11 +78,16 @@ def run_check(timeout=20):
     if joint['received_at'] <= before['joint_state']['received_at']:
         raise ValueError('Joint response receipt did not update')
     values = joint['data']
+    battery = after['battery_state']['data']
+    if set(battery) != {'soc', 'voltage', 'current', 'power'}:
+        raise ValueError('Unexpected battery fields')
     print('PASS: exactly three sensor cards; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
-    print('Battery (%):', after['battery_state']['data']['battery_percent'])
+    print('Battery (%):', battery['soc'])
+    print('Voltage/current (vendor raw units):', battery['voltage'], battery['current'])
+    print('Power (units unverified):', battery['power'])
     print('Read-only. Measurement timestamp clock is unverified; receipt age is reported separately.')
 
 

@@ -6,7 +6,7 @@ hardware_model: tron2
 image_name: limx-tron2
 port: 15791
 mcp_url: "http://localhost:15791/mcp"
-description: "TRON2 只读参数采集：关节角(rad/deg)、设备模式/固件状态、电量和原始 BMS 参数；无运动或模式切换接口"
+description: "TRON2 三张只读卡片：关节角(rad/deg)、设备模式/固件状态、电池 soc/voltage/current/power；电压电流保留原始单位，功率未确认时为空"
 build_context_extras:
   - ../../common
 cards:

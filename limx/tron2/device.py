@@ -7,9 +7,10 @@ import os
 import aiohttp
 from aiohttp import web
 from vendor import RobotReader
+from state import BATTERY_FIELDS
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.4.2'
+VERSION = '0.4.3'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Read-only Sensors'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -17,7 +18,7 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 DESCRIPTIONS = {
     'joint_state': 'TRON2 实时读取关节位置（rad/deg）、速度和力矩；名称缺失时显示索引',
     'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
-    'battery_state': 'TRON2 电量百分比及厂家原始 BMS 参数（只读，不推测温度/电压单位）',
+    'battery_state': 'TRON2 电量 soc（%）、电压 voltage、电流 current（厂家原始单位）；功率 power 单位未确认时为 null（只读）',
 }
 
 
@@ -82,6 +83,11 @@ class Adapter:
     async def publish_loop(self):
         while True:
             for name, data in self.snapshot().items():
+                # Compact battery stream, like Unitree's flat BMS display.
+                # Detailed connection/receipt metadata remains available via info.
+                if name == 'battery_state':
+                    data = data['data'] if data['available'] else \
+                        dict.fromkeys(BATTERY_FIELDS)
                 self.publish(TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 

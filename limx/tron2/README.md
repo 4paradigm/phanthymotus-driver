@@ -1,12 +1,12 @@
 # LimX TRON2 只读参数驱动
 
-为 Phanthy Motus 提供三张持续更新的传感器卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.2`；MCP 仅监听 `127.0.0.1:15791`。
+为 Phanthy Motus 提供三张持续更新的传感器卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.3`；MCP 仅监听 `127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 关节位置 `q`（rad）、`positions_deg`（度）、厂家返回的 `dq` / `tau` | `/limx_tron2/joint_state` |
 | `robot_status` | sensor | 工作模式、固件版本、IMU / 电机 / 相机等状态 | `/limx_tron2/robot_status` |
-| `battery_state` | sensor | 电量百分比及厂家原始 BMS 字段 | `/limx_tron2/battery_state` |
+| `battery_state` | sensor | 电量 `soc`、电压 `voltage`、电流 `current`、功率 `power` | `/limx_tron2/battery_state` |
 
 三张传感器卡片使用 `data/json` 格式，通过 Motus 本机 ROS2 总线发布。默认每 0.5 秒查询一次关节状态并发布缓存，实际更新速率受机器人响应时间影响。状态和电池来自机器人主动发送的 `notify_robot_info`，其更新频率由机器人决定。
 
@@ -16,11 +16,19 @@
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
-- `battery_percent` 只接受 0–100 的有效数值；无法解析时为 `null`。BMS 的电压、电流、温度保留在 `raw` 中，`bms_units: vendor_raw_unverified`，不猜测缩放和单位。
+- 电池数据流使用平铺的四个字段，与 Unitree 电池卡片的展示方式一致：`soc` 为 0–100 的电量百分比；`voltage` / `current` 为有限数值形式的厂家 `bms_voltage` / `bms_current` 原始值，不作缩放、不标成 V / A。电流仅在 `bms_current_valid` 严格为 `true` 时显示，保留厂家符号但不推测充放电方向。`power` 暂为 `null`：电压、电流单位未确认，不能将原始值直接相乘并宣称瓦数。温度、循环次数和 `raw` 已移除。
 - 厂家的 `UNKNOW` 等状态字符串原样保留；缺失字段为 `null`。
-- 每个数据包包含 `connected`、`available`、`sample_status`、`received_at` 和 `reception_age_seconds`。接收年龄使用主机单调时钟计算；`received_at` 是主机接收时的 Unix 秒数。
+- 关节和设备状态数据包包含 `connected`、`available`、`sample_status`、`received_at` 和 `reception_age_seconds`；电池卡片的 `info.sample` 同样保留这些诊断字段。接收年龄使用主机单调时钟计算；`received_at` 是主机接收时的 Unix 秒数，只表示整条通知的接收年龄，不能证明其中电流字段的采样年龄。
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
-- 默认超过 5 秒没有收到对应数据则 `available: false`、`sample_status: stale`、`data: null`。断连时立即清空缓存，发布 `offline`，再尝试重连；不会继续显示旧关节值。
+- 默认超过 5 秒没有收到对应数据则 `available: false`、`sample_status: stale`、`data: null`。断连时立即清空缓存，再尝试重连；不会继续显示旧关节值。电池数据流断连或过期时仍只含四个字段，全部为 `null`；具体原因通过该卡片 `info` 或 `/health` 查看。
+
+电池卡片“查看数据流”示例（电压、电流单位待厂家确认，示例不是实时测量）：
+
+```json
+{"soc": 85, "voltage": 52650, "current": -70, "power": null}
+```
+
+0.4.3 的电池发布格式有变更：消费端应使用 `soc` 代替 `data.battery_percent`，直接读取 `voltage` / `current`。MCP `info` 仍返回诊断封装，其中 `sample.data` 使用这四项新字段。关节和设备状态的发布结构、三张卡片名称和 topic 均保留。
 
 卡片的 `start` / `stop` 是单实例常开传感器的生命周期兼容调用，不启动或停止机器人，也不停止后台采样。`info` 返回该传感器的当前状态和缓存，不额外发送机器人请求。驱动仅暴露表中的三张 sensor，不提供缓存聚合 resource 或助手卡片。
 
