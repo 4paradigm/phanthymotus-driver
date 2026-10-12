@@ -31,6 +31,45 @@ and do not overlap. These are camera-image coordinates; placement in robot
 coordinates later requires camera calibration and hand-eye transforms. Keep
 the camera still while comparing the regions with a physical work surface.
 
+## ArUco horizontal arm pointing card
+
+`aruco_point` is a separate actuator. Keep the base stationary; this card only
+commands one arm and then asks the same-side `hand` card to extend its index
+finger. It uses the live `aruco_zones` result, so start the camera and zone
+processor first. The zone processor now includes `detected_markers` with the
+normalized center of every visible ID; the user may select any uniquely visible
+ID, including one not assigned to a sorting region.
+
+The camera angle is `atan((u - cx) / fx)`, where `u` is the marker's pixel x
+coordinate and `fx,cx` are **RGB** camera intrinsics in pixels. This camera
+bearing is mapped to one calibrated arm joint with
+`joint_target = reference_pose[joint] + gain *
+(bearing - reference_bearing_deg)`. The operator chooses `shoulder_roll` or
+`shoulder_yaw` according to a real robot trial; the correct joint and sign
+cannot be inferred from the image alone. The other six joints follow the
+operator-tested reference pose. This is approximate horizontal pointing, not
+3-D fingertip positioning or inverse kinematics.
+
+Before `point` can send a motor command, configure all seven calibration fields:
+`camera_fx_px`, `camera_cx_px`, `side`, `joint`, `reference_pose` (seven degrees
+in arm joint order), `reference_bearing_deg`, and
+`joint_deg_per_bearing_deg`. Measure the RGB intrinsics for the actual camera
+mode. Move the chosen arm into a tested, clear-space pointing pose under human
+control and record its seven angles and the bearing it points to. Observe a
+second safe pointing pose to measure the signed joint-angle change per camera
+bearing change. These values are installation-specific; the repository does
+not provide guessed defaults. Use `preview(marker_id=...)` to review the
+computed joint target, then use `point(marker_id=..., confirm_motion=true)`
+only during supervised testing.
+
+The command rejects stale (>1 s) or ambiguous markers, missing calibration,
+angles outside URDF limits, an arm outside the measured reference posture,
+single joint changes over 12°, stale/faulted motor feedback, and a missing
+explicit motion confirmation. It commands only the selected arm at 0.2 rad/s
+and waits for arm feedback before making the `hand(point)` gesture. `preview`
+never moves hardware. The 12° bound may require multiple supervised steps for
+widely separated markers; each step needs a new live image and confirmation.
+
 The image build replaces `opencv-python-headless` with the contrib wheel
 because the existing wheel does not provide `cv2.aruco`. This may increase
 the image size; the card source and manifest entry are negligible by comparison.

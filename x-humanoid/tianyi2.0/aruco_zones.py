@@ -127,6 +127,12 @@ def assign_zones(markers, sizes, width, height, config):
         "ready": ready,
         "zones": zones,
         "detected_marker_ids": [marker["id"] for marker in markers],
+        "detected_markers": [
+            {"id": marker["id"],
+             "center_normalized": [marker["center_px"][0] / width,
+                                   marker["center_px"][1] / height]}
+            for marker in markers
+        ],
         "assignment": "marker_id",
         "ambiguous_detected_ids": ambiguous_ids,
         "zones_overlap": overlap,

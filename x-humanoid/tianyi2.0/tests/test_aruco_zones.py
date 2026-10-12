@@ -30,6 +30,8 @@ class ArucoZonesTests(unittest.TestCase):
         self.assertTrue(result["ready"])
         self.assertFalse(result["motion_enabled"])
         self.assertEqual(result["zones"]["sorting_1"]["marker_id"], 2)
+        self.assertEqual(result["detected_markers"][0],
+                         {"id": 7, "center_normalized": [0.85, 0.5]})
         for actual, expected in zip(result["zones"]["waiting"]["rect_normalized"],
                                     [0.75, 0.4, 0.95, 0.6]):
             self.assertAlmostEqual(actual, expected)

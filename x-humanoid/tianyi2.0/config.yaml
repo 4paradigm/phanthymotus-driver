@@ -31,6 +31,9 @@ plugins:
     enabled: true
   aruco_zones:
     enabled: true
+  aruco_point:
+    enabled: true
+    # Motor commands stay locked until camera and arm are calibrated on the robot.
   camera_snapshot:
     enabled: true
     output_dir: "/opt/phanthy-motus/data/images"
