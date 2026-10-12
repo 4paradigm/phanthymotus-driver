@@ -812,8 +812,12 @@ class A3Nodes:
         info = getattr(msg, "info", None)
         rate = int(getattr(info, "sample_rate", 16000) or 16000)
         channels = int(getattr(info, "channels", 0) or 1)
-        sample_format = str(getattr(info, "sample_format", "") or "").upper()
-        coding_format = str(getattr(info, "coding_format", "") or "").upper()
+        sample_format = str(getattr(info, "sample_format", "") or "").upper().replace("-", "_")
+        coding_format = str(getattr(info, "coding_format", "") or "").upper().replace("-", "_")
+        if sample_format in {"S16_LE", "PCM16", "PCM_16", "SIGNED16"}:
+            sample_format = "S16LE"
+        if coding_format in {"PCM16", "PCM_16", "PCM_S16_LE"}:
+            coding_format = "PCM_S16LE"
         if sample_format not in {"", "S16LE", "PCM_S16LE", "SIGNED_16"}:
             return b""
         if coding_format not in {"", "PCM", "PCM_S16LE", "S16LE"}:

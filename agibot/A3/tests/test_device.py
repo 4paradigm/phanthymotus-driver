@@ -2504,6 +2504,13 @@ class MirrorStreamTests(unittest.TestCase):
         msg.info.coding_format = "AAC"
         self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload), b"")
 
+    def test_audio_normalization_accepts_sdk_pcm_aliases(self):
+        msg = types.SimpleNamespace(info=types.SimpleNamespace(
+            sample_rate=16000, channels=1, sample_format="S16_LE",
+            coding_format="PCM_S16_LE"))
+        payload = struct.pack("<512h", *([7] * 512))
+        self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload), payload)
+
     def test_imu_info_lists_both_topic_out_streams(self):
         # 6th PR review: Agent Core treats info() as authoritative for topic
         # inference — the imu card must advertise both mirrored streams.
