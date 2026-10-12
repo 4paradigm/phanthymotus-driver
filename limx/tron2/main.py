@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LimX TRON2 read-only sensors; no robot control interface."""
+"""LimX TRON2 sensors and explicit arm MoveJ control."""
 from pathlib import Path
 import sys
 
@@ -63,7 +63,7 @@ def load_settings():
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
     if not isinstance(plugins, dict) or set(plugins) - {'joint_state', 'robot_status', 'battery_state', 'arm_control'}:
-        raise ValueError('Only the three sensor plugins may be configured')
+        raise ValueError('Only TRON2 sensor and arm_control plugins may be configured')
     enabled = []
     for name, value in plugins.items():
         if not isinstance(value, dict) or type(value.get('enabled')) is not bool:
@@ -80,7 +80,7 @@ async def run():
     from device import Adapter, TOPICS, PORT, LOG
     from ros2 import JsonPublisher
     settings = load_settings()
-    publisher = JsonPublisher([TOPICS[name] for name in settings['enabled_cards']])
+    publisher = JsonPublisher([TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS])
     tasks = []
     runner = None
     loop = asyncio.get_running_loop()
@@ -100,7 +100,7 @@ async def run():
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
             await web.TCPSite(runner, '127.0.0.1', PORT).start()
-            LOG.info('Read-only MCP on loopback:%s; sensor poll interval %ss',
+            LOG.info('TRON2 MCP on loopback:%s; sensor poll interval %ss',
                      PORT, settings['poll_interval_seconds'])
             tasks = [asyncio.create_task(adapter.reader.run(session)),
                      asyncio.create_task(adapter.publish_loop()),

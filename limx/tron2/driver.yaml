@@ -1,5 +1,5 @@
 id: limx-tron2-driver
-name: LimX TRON2 Read-only Sensors
+name: LimX TRON2 Sensors and Arm Control
 category: driver
 hardware_provider: limx
 hardware_model: tron2

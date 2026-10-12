@@ -13,7 +13,7 @@ import tempfile
 import time
 import types
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 DRIVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DRIVER))
@@ -89,8 +89,6 @@ class StateTests(unittest.TestCase):
         # power = 52650 * (-70) / 1000 = -3685.5
         self.assertEqual(data, {'soc': 85, 'voltage': 52650, 'current': -70, 'power': -3685.5, 'temp': 35})
         self.assertEqual(set(data), {'soc', 'voltage', 'current', 'power', 'temp'})
-        # Extra temperatures/cycles and unsupported power are not published.
-        self.assertEqual(set(data), {'soc', 'voltage', 'current', 'power'})
         for raw in ('UNKNOW', '101', '-1', None, True, 'nan'):
             with self.subTest(raw=raw):
                 self.assertIsNone(state.battery_state({'battery': raw})['soc'])
@@ -267,6 +265,64 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             server.close()
             await server.wait_closed()
             await runner.cleanup()
+
+
+    async def test_real_websocket_movej_ack_correlation_reject_and_disconnect(self):
+        requests = []
+        mode = ['success']
+        async def robot(request):
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_json(info())
+            async for msg in ws:
+                body = json.loads(msg.data)
+                requests.append(body)
+                if body['title'] == 'request_get_joint_state':
+                    await ws.send_json({'title': 'response_get_joint_state', 'accid': 'TEST_TRON2A',
+                        'guid': body['guid'], 'data': joints()})
+                else:
+                    ack = {'title': 'response_movej', 'accid': 'TEST_TRON2A', 'guid': body['guid']}
+                    # These wrong ACKs must never satisfy the pending command.
+                    await ws.send_json({**ack, 'guid': 'wrong', 'data': {'result': 'success'}})
+                    await ws.send_json({**ack, 'accid': 'OTHER', 'data': {'result': 'success'}})
+                    if mode[0] == 'disconnect':
+                        await ws.close()
+                    elif mode[0] != 'timeout':
+                        await ws.send_json({**ack, 'data': {'result': mode[0]}})
+            return ws
+        app = web.Application()
+        app.router.add_get('/', robot)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        server = await asyncio.get_running_loop().create_server(runner.server, '127.0.0.1', 0)
+        reader = RobotReader(settings(url='ws://127.0.0.1:'+str(server.sockets[0].getsockname()[1]),
+                                      response_timeout_seconds=.15, poll_interval_seconds=.02))
+        async with aiohttp.ClientSession(trust_env=False) as session:
+            task = asyncio.create_task(reader.run(session))
+            try:
+                for _ in range(100):
+                    if reader.sample('joint_state')['available']: break
+                    await asyncio.sleep(.01)
+                result = await reader.send_movej([0]*14, 2)
+                self.assertEqual(result['status'], 'accepted')
+                self.assertFalse(result['arrival_verified'])
+                mode[0] = 'fail_invalid_cmd'
+                with self.assertRaisesRegex(ValueError, 'rejected'):
+                    await reader.send_movej([0]*14, 2)
+                mode[0] = 'timeout'
+                with self.assertRaisesRegex(ValueError, 'timed out'):
+                    await reader.send_movej([0]*14, 2)
+                mode[0] = 'disconnect'
+                with self.assertRaisesRegex(ValueError, 'Disconnected'):
+                    await reader.send_movej([0]*14, 2)
+                self.assertIsNone(reader.move_pending)
+                self.assertEqual(len([r for r in requests if r['title']=='request_movej']), 4)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+        await runner.cleanup()
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
@@ -446,49 +502,84 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         arm = next(t for t in tools if t['name'] == 'arm_control')
         self.assertEqual(arm['type'], 'actuator')
         props = arm['inputSchema']['properties']
-        self.assertEqual(props['action']['enum'], ['move'])
-        self.assertEqual(props['joint']['minItems'], 16)
-        self.assertEqual(props['joint']['maxItems'], 16)
+        self.assertEqual(props['action']['enum'], ['info', 'move'])
+        self.assertEqual(props['joint']['minItems'], 14)
+        self.assertEqual(props['joint']['maxItems'], 14)
 
     async def test_arm_control_move_rejects_wrong_joint_count(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
         adapter.reader.accept_info(info())
         adapter.reader.ws = MagicMock()
         with self.assertRaises(ValueError):
-            adapter.call('arm_control', {'action': 'move', 'joint': [0.0] * 14})
+            adapter.call('arm_control', {'action': 'move', 'joint': [0.0] * 16})
 
     async def test_arm_control_move_rejects_non_numeric_joints(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
         adapter.reader.accept_info(info())
         adapter.reader.ws = MagicMock()
         with self.assertRaises(ValueError):
-            adapter.call('arm_control', {'action': 'move', 'joint': [0.0] * 15 + ['bad']})
+            adapter.call('arm_control', {'action': 'move', 'joint': [0.0] * 13 + ['bad']})
 
-    async def test_arm_control_move_sends_movej_command(self):
-        adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
-        adapter.reader.accept_info(info())
-        mock_ws = MagicMock()
-        adapter.reader.ws = mock_ws
-        error, result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: adapter.call('arm_control', {
-                'action': 'move', 'joint': [0.1] * 16, 'time': 1.5}))
+    async def test_arm_control_move_sends_once_and_waits_for_ack(self):
+        self.adapter.enabled.append('arm_control')
+        reader = self.adapter.reader
+        sent = []
+        async def send(body):
+            sent.append(body)
+            packet = {'title': 'response_movej', 'guid': body['guid'],
+                      'accid': reader.serial, 'data': {'result': 'success'}}
+            ws = types.SimpleNamespace(receive=AsyncMock(return_value=types.SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT, data=json.dumps(packet))))
+            await reader.receive(ws, time.monotonic()+1)
+        reader.ws = types.SimpleNamespace(closed=False, send_json=send)
+        error, result = await self.call('arm_control', action='move', joint=[.1]*14,
+                                       time=1.5, _trace_id='valid')
         self.assertFalse(error)
-        self.assertEqual(result['action'], 'move')
-        self.assertEqual(result['joint_count'], 16)
-        self.assertEqual(result['time'], 1.5)
-        self.assertEqual(result['status'], 'sent')
-        call_args = mock_ws.send_json.call_args
-        self.assertIsNotNone(call_args)
-        payload = call_args[0][0]
-        self.assertEqual(payload['title'], 'request_movej')
-        self.assertEqual(payload['data']['joint'], [0.1] * 16)
-        self.assertEqual(payload['data']['time'], 1.5)
+        self.assertEqual(result['status'], 'accepted')
+        self.assertFalse(result['arrival_verified'])
+        self.assertTrue(result['motion_sent'])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]['title'], 'request_movej')
+        self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 1.5})
+        self.assertNotIn('_trace_id', sent[0])
 
-    async def test_arm_control_rejects_invalid_action(self):
-        adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
-        adapter.reader.accept_info(info())
-        adapter.reader.ws = MagicMock()
+    async def test_arm_control_invalid_offline_and_stale_never_send(self):
+        self.adapter.enabled.append('arm_control')
+        reader = self.adapter.reader
+        ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
+        reader.ws = ws
+        for values in ([0]*16, [0]*13, [math.nan]*14, [True]*14, [10]*14):
+            error, result = await self.call('arm_control', action='move', joint=values)
+            self.assertTrue(error)
+            self.assertFalse(result['motion_sent'])
+        for duration in (True, '2', math.inf, 0, 61):
+            error, result = await self.call('arm_control', action='move', joint=[0]*14, time=duration)
+            self.assertTrue(error)
+        reader.info_at = time.monotonic()-10
+        error, result = await self.call('arm_control', action='move', joint=[0]*14)
+        self.assertTrue(error)
+        self.assertFalse(result['motion_sent'])
+        reader.disconnect('test')
+        error, result = await self.call('arm_control', action='move', joint=[0]*14)
+        self.assertTrue(error)
+        self.assertFalse(result['motion_sent'])
+        ws.send_json.assert_not_called()
+
+    async def test_arm_info_and_periodic_sensor_publication_with_actuator_enabled(self):
+        self.adapter.enabled.append('arm_control')
         error, result = await self.call('arm_control', action='info')
+        self.assertFalse(error)
+        self.assertEqual(result['joint_count'], 14)
+        self.assertFalse(result['motion_sent'])
+        self.assertNotIn('arm_control', self.adapter.snapshot())
+        task = asyncio.create_task(self.adapter.publish_loop())
+        try:
+            await asyncio.sleep(.02)
+            self.assertEqual({topic for topic, _ in self.published}, set(TOPICS.values()))
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        error, result = await self.call('arm_control', action='execute')
         self.assertTrue(error)
         self.assertIn('Unsupported actuator action', result['error'])
 
@@ -523,7 +614,7 @@ class PackagingTests(unittest.TestCase):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common; '
-                'assert device.VERSION == "0.4.3"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.4.4"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -533,11 +624,11 @@ class PackagingTests(unittest.TestCase):
         source = ast.parse((DRIVER/'vendor.py').read_text())
         calls = [n for n in ast.walk(source) if isinstance(n,ast.Call)
                  and isinstance(n.func,ast.Attribute) and n.func.attr == 'send_json']
-        self.assertEqual(len(calls),1)
-        payload = calls[0].args[0]
-        fields = {k.value:v for k,v in zip(payload.keys,payload.values)}
-        self.assertEqual(fields['title'].value, 'request_get_joint_state')
-        self.assertEqual(fields['data'].keys, [])
+        self.assertEqual(len(calls),2)
+        payloads = [{k.value:v for k,v in zip(c.args[0].keys,c.args[0].values)} for c in calls]
+        self.assertEqual({p['title'].value for p in payloads}, {'request_get_joint_state', 'request_movej'})
+        query = next(p for p in payloads if p['title'].value == 'request_get_joint_state')
+        self.assertEqual(query['data'].keys, [])
         for filename in ('motion.py','pose.py','control.py','record.py','teach.py'):
             self.assertFalse((DRIVER/filename).exists())
 
@@ -559,7 +650,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaises(ValueError): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS))
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control'})
 
     def test_missing_dds_profile_refuses_participant_creation(self):
         with patch.dict(os.environ,FASTRTPS_DEFAULT_PROFILES_FILE='/missing/tron2-dds.xml'):

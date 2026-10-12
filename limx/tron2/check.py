@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.4.3'
+VERSION = '0.4.4'
 CARDS = {'joint_state', 'robot_status', 'battery_state'}
 
 
@@ -47,8 +47,8 @@ def run_check(timeout=20):
         try:
             with OPENER.open(BASE + '/health', timeout=min(5, max(.1, deadline-time.monotonic()))) as response:
                 health = json.load(response)
-            if health.get('version') != VERSION or health.get('read_only') is not True:
-                raise ValueError('Wrong driver version or a non-sensor service occupies port 15791')
+            if health.get('version') != VERSION:
+                raise ValueError('Wrong driver version on port 15791')
             if not health.get('registered_mcp_id'):
                 raise ValueError('Core registration is pending; check certificate and hostname')
             break
@@ -58,9 +58,9 @@ def run_check(timeout=20):
     else:
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
-    if {tool['name'] for tool in tools} != CARDS or any(
-            tool['type'] != 'sensor' for tool in tools):
-        raise ValueError('Unexpected card set; exactly three sensors are required')
+    if {tool['name'] for tool in tools} not in (CARDS, CARDS | {'arm_control'}) or any(
+            tool['type'] != ('actuator' if tool['name'] == 'arm_control' else 'sensor') for tool in tools):
+        raise ValueError('Unexpected card set; expected three sensors plus optional arm_control')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,
@@ -79,15 +79,15 @@ def run_check(timeout=20):
         raise ValueError('Joint response receipt did not update')
     values = joint['data']
     battery = after['battery_state']['data']
-    if set(battery) != {'soc', 'voltage', 'current', 'power'}:
+    if set(battery) != {'soc', 'voltage', 'current', 'power', 'temp'}:
         raise ValueError('Unexpected battery fields')
-    print('PASS: exactly three sensor cards; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: three sensor cards; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
     print('Battery (%):', battery['soc'])
     print('Voltage/current (vendor raw units):', battery['voltage'], battery['current'])
-    print('Power (units unverified):', battery['power'])
+    print('Power/temperature (unit conversion unverified):', battery['power'], battery['temp'])
     print('Read-only. Measurement timestamp clock is unverified; receipt age is reported separately.')
 
 
