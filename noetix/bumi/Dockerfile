@@ -1,11 +1,14 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
 ARG PYPI_MIRROR=https://pypi.org/simple/
-FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR
-
-# Build the audio interface in this image so Bumi does not require a newer ros-base.
+FROM ${ROS_BASE_IMAGE} AS audio_msgs_builder
 COPY audio_msgs/ /bumi_ros_ws/src/audio_msgs/
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release && source install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
+
+FROM ${ROS_BASE_IMAGE}
+ARG PYPI_MIRROR
+# Keep only the generated interface; source and build artifacts stay in the builder.
+COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
+RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
 
 WORKDIR /work
 
