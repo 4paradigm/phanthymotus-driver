@@ -74,13 +74,13 @@ def main():
     check("server", lambda: rpc(args.endpoint,"initialize"))
     def check_cards():
         cards = [t["name"] for t in rpc(args.endpoint,"tools/list")["tools"]]
-        expected = {"piper_status","piper_mode","piper_arm","piper_gripper","piper_photo"}
+        expected = {"piper_status","piper_standby","piper_can","piper_enable","piper_disable","piper_joint","piper_gripper","piper_photo","piper_permission","piper_stop"}
         if set(cards) != expected:
-            raise RuntimeError("五张卡片未完整注册")
+            raise RuntimeError("十张卡片未完整注册")
         return cards
     check("cards", check_cards)
     check("before", lambda: call(args.endpoint,"piper_status","read"))
-    check("mode", lambda: call(args.endpoint,"piper_mode","read",query_firmware=args.query_firmware))
+    check("mode", lambda: call(args.endpoint,"piper_status","firmware" if args.query_firmware else "read"))
     for index in range(args.photos):
         photo = check(f"photo_{index+1}", lambda: finish_photo(args.endpoint,call(args.endpoint,"piper_photo","capture")))
         if photo is not None:

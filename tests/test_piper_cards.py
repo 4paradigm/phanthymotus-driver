@@ -10,7 +10,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 from agilex.piper.arm import ArmState
-from agilex.piper.device import PiperPlugin
+from agilex.piper.runtime import PiperRuntime as PiperPlugin
 from common.vendor_runtime import DriverBundle, make_handler
 
 
@@ -139,7 +139,7 @@ class PiperCardsTests(unittest.TestCase):
                 self.killed = True
                 self.returncode = -9
         child = Child()
-        with patch("agilex.piper.device.subprocess.Popen", return_value=child):
+        with patch("agilex.piper.runtime.subprocess.Popen", return_value=child):
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
                 self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": True})
         self.assertTrue(child.killed)
@@ -158,7 +158,7 @@ class PiperCardsTests(unittest.TestCase):
                                    "width": 640, "height": 480}), ""
             def poll(self):
                 return 0
-        with patch("agilex.piper.device.subprocess.Popen", Child):
+        with patch("agilex.piper.runtime.subprocess.Popen", Child):
             result = self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": True})
         self.assertNotIn("device", result)
         self.assertTrue(result["capture_confirmed"])
@@ -170,7 +170,7 @@ class PiperCardsTests(unittest.TestCase):
         self.assertIsNone(self.plugin.driver)
 
     def test_capture_requires_host_permission_and_current_shot_confirmation(self):
-        with patch("agilex.piper.device.subprocess.Popen") as camera:
+        with patch("agilex.piper.runtime.subprocess.Popen") as camera:
             with self.assertRaisesRegex(RuntimeError, "默认关闭"):
                 self.bundle.dispatch("piper_photo", {"action": "capture", "capture_confirmed": True})
             self.plugin.camera_enabled = True
@@ -196,7 +196,7 @@ class PiperCardsTests(unittest.TestCase):
         root = Path(self.tmp.name) / "imports"
         root.mkdir()
         cv2.imwrite(str(root / "provided.png"), np.full((24, 32, 3), 120, dtype=np.uint8))
-        with patch("agilex.piper.device.subprocess.Popen") as camera:
+        with patch("agilex.piper.runtime.subprocess.Popen") as camera:
             result = self.bundle.dispatch("piper_photo", {"action": "import_photo", "filename": "provided.png"})
         camera.assert_not_called()
         self.assertIsNone(self.plugin.driver)

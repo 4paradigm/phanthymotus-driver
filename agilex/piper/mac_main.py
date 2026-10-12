@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the same five cards on Mac, without requiring ROS or Docker."""
+"""Run the same ten cards on Mac, without requiring ROS or Docker."""
 from common import logsafe
 logsafe.install()
 
@@ -31,6 +31,9 @@ def main():
             if path.path == "/":
                 body = Path(__file__).with_name("mac_console.html").read_bytes()
                 content_type = "text/html; charset=utf-8"
+            elif path.path == "/card-controls.js":
+                body = Path(__file__).with_name("card_controls.js").read_bytes()
+                content_type = "text/javascript; charset=utf-8"
             elif path.path == "/photo":
                 name = parse_qs(path.query).get("name",[""])[0]
                 if not (name.startswith("rgb_") and name.endswith(".jpg") and Path(name).name == name):

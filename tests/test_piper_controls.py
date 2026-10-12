@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from agilex.piper.arm import ArmState, PiperDriver
 from agilex.piper.control import Previews, mode_plan
-from agilex.piper.device import PiperPlugin
+from agilex.piper.runtime import PiperRuntime as PiperPlugin
 from common.vendor_runtime import DriverBundle, make_handler
 
 

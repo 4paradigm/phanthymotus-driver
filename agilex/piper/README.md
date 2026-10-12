@@ -1,21 +1,120 @@
-# PiPER 单臂与 D435：五张卡片
+# PiPER 十张独立卡片
 
-同一套驱动支持 Ubuntu SocketCAN 和 Mac candleLight USB-CAN。
-启动、重连、容器重启均不使能、不重放动作。`PIPER_MOTION_ENABLED` 默认 `0`。
-本次交付要求在 **Ubuntu 真实机器人画布**运行；Mac 与离线测试只作辅助证据。
+同一条 CAN 连接、同一个操作锁，对外提供十张卡片。启动卡片、重连和服务重启不使能、不回放动作。
+Ubuntu 的机械臂与夹爪均由操作人员通过卡片控制；运动许可默认关闭。
 
-| 卡片 | 使用方式 |
+| 卡片 | 用途 | 主要提醒 |
+| --- | --- | --- |
+| 机器人状态 `piper_status` | 状态、固件查询、重连 | 模式、使能、故障分别反馈；重连关闭许可并清除预览 |
+| 切换待机 `piper_standby` | 仅切换 STANDBY | 当前软件要求六轴全部失能；不自动失能或回零 |
+| 切换电脑控制 `piper_can` | 仅切换 CAN | 确认其他控制程序已停止；切换后使能仍单独操作 |
+| 电机使能 `piper_enable` | 选择六轴或夹爪使能 | 已经使能则返回已就绪；需要边界修正时明确展示并单独确认 |
+| 电机失能 `piper_disable` | 选择六轴或夹爪失能 | 确认机械臂可靠支撑，或夹爪空载/夹持物已支撑；释放对应保持力 |
+| 单轴运动 `piper_joint` | 一个关节的绝对目标角度 | 当前角度→目标角度→变化量，先预览再确认 |
+| 夹爪开合 `piper_gripper` | 读取、张开、闭合、指定开度 | 先用独立卡片使能；open 到上限、close 到下限，小开度用 set_width |
+| 相机与照片 `piper_photo` | 当前 RGB 拍照、文件导入 | 每次拍照明确确认；记录来源，不移动机械臂 |
+| 操作许可 `piper_permission` | 本次允许/关闭控制 | 不使能；关闭时请求取消控制并尽力保持 |
+| 停止动作 `piper_stop` | 机械臂/夹爪/全部动作取消 | 不排队，不失能；不是硬件急停，以实际反馈确认 |
+
+## 日常顺序
+
+读取状态 → 开启本次操作许可 → 切换 CAN → 使能六轴 → 按需使能夹爪 → 单轴/夹爪/拍照。
+已经处于 CAN 或已经使能时，重复操作返回当前已就绪，不重复发控制指令。
+收尾：停止动作 → 可靠支撑后分别失能 → 切换待机 → 关闭操作许可。
+全局智能控制保持关闭，单独启动所需卡片；ACP 完成通知在智能控制开启时可能触发后台决策。
+
+状态卡片提供 `summary`、实际角度/开度、模式/使能/故障、新鲜度、忙状态、完成结果和下一步。
+`running` 仅表示已提交。实际完成/错误/取消通过 ACP 回报，同一卡片 `info.last_action`
+或状态卡片 `completed_actions` 保留结果。
+
+### 中文画布与确认流程
+
+卡片和字段用 `title` 显示中文，`oneOf.const/title` 保留协议值同时提供中文选项。
+只显示当前动作需要的字段；选择夹爪使能时不显示机械臂调整速度。
+画布需搭配 Agent Core 的 card-controls 支持：点击执行先请求只读预览，展示目标/变化量，
+操作人员确认后携带当前预览编号提交执行。预览编号、execute、接管字段不需手填。
+取消确认不发送执行指令。拍照先询问本次授权，再调用一次 capture。
+原始 MCP 调用仍需明确传入各确认字段，UI 隐藏参数不构成调用者身份鉴权。
+
+### 直接 MCP 调用
+
+模式卡片 `switch(execute=false)` 预览，再用相同条件和 preview_id、`execute=true` 执行。
+CAN 预览/执行都需要 `other_controllers_stopped=true`。已经达到目标模式时只返回反馈。
+
+使能卡片 `enable(object=arm|gripper, execute=false)` 预览。实际使能要求本次许可、CAN
+和现场空间确认；六轴的边界修正还需 `allow_limit_adjustment=true`，夹爪使能需
+`take_control=true`。夹爪使能保持当前开度，不自动张开或闭合；当前软件要求六轴已使能。
+六轴部分使能/故障/示教中拒绝使能，并给出检查提示。
+
+单轴卡片 `move(joint=1..6, target_deg=绝对角度, speed_deg_s=1, speed_pct=5, execute=false)`
+预览；用相同参数、preview_id、`execute=true`、`workspace_clear=true`、`take_control=true` 执行。
+关节编号必须是整数，不接受字符串。夹爪 open/close/set_width 采用相同预览/确认方式。
+
+失能卡片 `disable(object=arm|gripper, supported=true)`，需要本次操作许可；已经失能时
+只返回反馈。停止卡片 `halt(target=arm|gripper|all)` 不要求开启许可，不等待动作锁；
+返回 operation_stopping=true 时，工作线程仍在执行取消/保持收尾，不能当作已经完成。
+停止范围不匹配当前动作时，不取消其他卡片。停止卡片不发送急停、回零、复位或失能指令。
+
+## 厂家协议与驱动策略
+
+STANDBY/CAN 编码及电机使能/失能指令来自厂家协议。全失能再切模式、运动许可、
+一次性预览、现场确认和速度/步长上限属于本驱动策略，提示中与厂家状态明确区分。
+模式与使能各自独立；切模式不代替使能。使能不作为厂家零位校准。
+
+待机↔CAN 要求六轴全部失能、反馈正常、示教/轨迹停止。切换后必须收到新鲜的目标模式
+反馈才能报告 confirmed=true，超时不自动重试。
+六轴使能前预置测得的当前姿态，防止继承旧目标。最多 3° 的 SDK 边界修正会在预览和
+确认中逐轴列出，未明确允许则不执行。大于 3° 拒绝，要求现场检查实物姿态。
+软件示教白名单默认空，当前十卡只显示实际示教状态、固件和机身按键说明，不发送未经
+验收的录制/退出指令。旧固件的退出行为可能涉及回零/重启，应另行安排现场操作。
+
+单轴速度 0.5–5°/秒，SDK 上限 1–10%，单次最多 12°；所有目标遵守 SDK 与部署限位交集。
+三次平滑插值，20 Hz 发目标；到位要求 ±0.5° 内稳定 0.5 秒。
+夹爪开度为 SDK 与部署范围交集（本部署 0–70 mm），力矩 0.001–1 N·m，默认 0.5。
+预览仅一次有效，60 秒过期；角度偏移 >0.5°、夹爪开度偏移 >0.5 mm、状态变化、停止、
+重连或新预览使旧编号失效。反馈超过 0.5 秒、故障或外部模式变化会拒绝/取消运动。
+不同物理卡片共用互斥锁，忙时拒绝而不排队；状态读取及停止请求不等待该锁。
+
+## 照片
+
+`PIPER_CAMERA_ENABLED` 默认 0，部署使用 `${PIPER_CAMERA_ENABLED:-0}`；取得相机授权后设置 1。
+`capture(capture_confirmed=true)` 拍当前 RGB 一张，保存 JPEG/JSON 并发布 DDS，不调整姿态。
+不启动连续视频采集；相机权限与运动许可独立。
+文件导入只接受宿主机 `/opt/phanthy-motus/data/piper/imports/` 下 JPEG/PNG 普通文件名，
+拒绝路径、符号链接、损坏或超过 20 MiB/2000 万像素文件。记录 source=user_provided、
+camera_accessed=false，不冒充实时拍照。
+
+## Ubuntu 构建部署
+
+Ubuntu 22.04 amd64、ROS2 Humble、can0 1 Mbps；host network、DDS domain 42、
+FastDDS loopback profile 只读挂载沿用现场设置。
+
+```bash
+bash agilex/piper/build-local.sh agilex-piper:local-amd64
+bash agilex/piper/deploy/check-image.sh agilex-piper:local-amd64
+python3 agilex/piper/deploy/diagnose.py --output ubuntu-readonly.json
+```
+
+Bot 默认可能为 arm64，必须 inspect 后再部署到 amd64 控制器。固定实际镜像 ID、提交和
+依赖版本，不将离线叠加构建冒充干净上游构建。基础镜像默认固定官方多架构索引
+`sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19`。
+项目 ros-base:latest 核对时仅 arm64，因此现场 amd64 使用官方多架构 Humble 基础镜像。
+
+| 依赖 | 用途 |
 | --- | --- |
-| `piper_status` | `read` 看关节、夹爪、模式、使能、故障、新鲜度；`reconnect` 废弃旧预览后重连 |
-| `piper_mode` | `read` / `preview` / `switch` / `stop_teaching`；未验证固件显示按键引导 |
-| `piper_arm` | 初始化、单轴低速控制、保持、停止、失能、运动许可 |
-| `piper_gripper` | 读取、开合、指定毫米开度、保持、停止、失能 |
-| `piper_photo` | 导入用户照片并保存 JPEG + JSON、发布画布图像；真实采集须另获现场授权 |
+| PiPER SDK、python-can | 厂商协议和 CAN 通信 |
+| NumPy、headless OpenCV | 图像数组、V4L2 单帧、JPEG；不安装 GUI OpenCV |
+| PyYAML | 部署配置 |
+| python3-pip | 构建时安装固定 Python 依赖 |
+| sensor_msgs、FastDDS | 图像 DDS 发布与既定隔离配置 |
 
-## Mac 运行与验收
+SDK 固定提交 8d4dc29bd6e753066dedee235c008e90ecb2ab4a；ZIP SHA256
+`89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29`，pip 安装前校验、禁用缓存。
+Dockerfile 提供 PIPER_SDK_URL / PIPER_SDK_SHA256 构建参数，临时文件在同一 RUN 清理。
+两份桌面 landing 文档没有 COS 上传说明/SDK 地址，按用户要求暂不迁移 COS。
+本轮拆分不增加第三方依赖，仅增加组件源码及少量无依赖前端代码。具体构建尺寸口径见 ACCEPTANCE。
 
-在仓库根目录使用 Python 3.10–3.12（现有 Mac 环境为 3.12）。
-只连接一台 candleLight / gs_usb 适配器；停止此前的 CAN 监听或控制程序。
+## Mac
 
 ```bash
 uv venv .venv-piper --python 3.12
@@ -23,187 +122,23 @@ uv pip install --python .venv-piper/bin/python -r agilex/piper/requirements-mac.
 PIPER_MOTION_ENABLED=0 .venv-piper/bin/python -m agilex.piper.mac_main
 ```
 
-打开 `http://127.0.0.1:15741/`，可直接操作同一 MCP 实现的五张卡片。
-此页面仅监听本机；运动仍受门禁、预览、互斥和现场条件检查。
-Mac 通过 AVFoundation 选择名称包含 RealSense 的设备，**不会自动选择内置摄像头**。
-仅开放深度/红外、画面无彩色信息或相机权限不足时会报错。
-Mac 不启动 ROS，照片在本地页面显示；`dds_published=false` 如实说明未发布 DDS。
-Ubuntu 的 DDS 显示已用明确标记的文件测试图在真实画布验证，详见验收记录。
-用户最初要求自己提供照片，后续已明确要求恢复真实相机拍照；文件导入仍可使用。
-已观察到部分 USB-CAN 关闭重开后需拔插 Mac 一侧 USB 才能恢复；重连稳定性尚未验收。
+打开 http://127.0.0.1:15741/。Mac 页面同样自动预览/确认，显示中文并跟踪实际完成结果。
+Mac USB-CAN 还有主机门禁：启动时 PIPER_MOTION_ENABLED=0 只允许信息查询；现场确认后
+由主机人员用 1 启动控制。人工许可卡片目前只支持 Ubuntu SocketCAN，不绕过 Mac 主机门禁。
+只连一台 candleLight/gs_usb 适配器，停止其他控制程序。Mac 相机仅选 RealSense，不自动
+选择内置摄像头；不启动 ROS，因此 dds_published=false。gs_usb/libusb/PyObjC 不进入 Ubuntu 镜像。
 
-可传 `--usb-index 0 --port 15741 --data-dir /path/to/acceptance`。
-Mac USB-CAN 还有第二层只读门禁：环境变量为 `0` 时只允许固件信息查询，拒绝所有控制帧。
+## 旧代码和验收
 
-```bash
-python3 agilex/piper/deploy/diagnose.py --query-firmware --output mac-readonly.json
-```
-
-只读检查通过后，现场确认底座固定、空间清空、有人可及时停止，再关闭服务并用
-`PIPER_MOTION_ENABLED=1` 启动。服务重启本身仍不使能。
-
-## 日常操作
-
-Ubuntu 在机械臂卡片的 ACTION 下拉框选择 `allow_motion`（允许本次运动），点击执行，
-即可开启本次机械臂、夹爪和模式切换许可，无需编辑环境变量。此操作只读检查反馈，
-**不使能、不移动**，并废弃旧预览。默认关闭；停止机械臂卡片、全局停止、重连或进程重启后，
-人工开启的许可关闭，不保存为配置。部署应保持 `PIPER_MOTION_ENABLED=0`。
-`block_motion`（关闭运动许可）取消正在进行的控制并尽力保持，**不会失能或释放力矩**；
-后续失能仍须重新开启许可并确认支撑。已有全部使能的静止 CAN 姿态也可开启许可。
-这两个操作只显示在人工卡片菜单，不加入 Agent Core 按 `x-action-params` 生成的模型工具目录；
-这不构成 MCP 调用者身份鉴权。Mac USB-CAN 保留原有主机门禁。
-
-1. **读取**：状态应显示“电脑控制｜六轴已使能｜无故障”这样的三段信息。
-2. **切换**：在模式卡片先预览，再按返回的缺少条件处理。切换不代替初始化。
-3. **初始化**：`prepare` 默认预览；核对边界修正，再用相同速度执行。
-4. **移动**：使用 `move_joint`，先 `execute=false`，再使用相同参数和
-   `preview_id` 设置 `execute=true`、`workspace_clear=true`、`take_control=true`。
-   `move_joint` 的 `joint` 为 1～6 的整数输入框，请直接输入轴号；避免平台将枚举下拉值序列化为字符串。
-5. **夹爪**：`open` / `close` / `set_width` 默认预览；确认开度、力矩后执行。
-6. **停止**：本卡片的 `stop` 取消本卡片操作并尽力保持，不释放力矩。
-7. **失能**：扶稳机械臂后单独调用 arm `disable` + `arm_supported=true`；
-   夹持物已支撑后调用 gripper `disable` + `object_supported=true`。
-
-预览编号可留空，此时使用最近一次匹配预览。预览只保存在进程内，**只能执行一次**；
-新预览会替换旧预览，超过 60 秒、任一关节偏移超过 0.5°、模式/使能/示教/故障变化，
-或重连、停止相关控制卡片后需重新预览。夹爪自身开度偏移超过 0.5 mm 或使能变化也需重预览。
-
-## 模式切换与提醒
-
-| 目标 | 要求 | 提醒 |
-| --- | --- | --- |
-| 待机 `standby` | 当前待机或 CAN，无其它动作，六轴全部失能 | 请先支撑机械臂并解除使能。 |
-| 电脑控制 `can` | 当前待机，六轴失能，反馈正常，其它程序已停止 | 切换后仍未使能，请再执行初始化。 |
-| 拖动示教 `teaching` | 当前 CAN，六轴已使能，静止 0.5 秒，人员扶稳、空间清空 | 扶稳后进入示教，轻推调整姿态。 |
-| 示教转电脑控制 | 人员扶稳，停止录制/回放，固件流程已验证 | 先退出示教，再检查状态并初始化。 |
-
-模式、使能、急停和故障分别处理。**待机不等于失能，停止不等于释放保持力。**
-普通切换不会回零、复位、重启、自动失能或自动使能；3 秒内没有切换后的新鲜反馈，
-返回“未确认切换成功”，不自动重试。以太网、Wi-Fi、遥控、主从和离线轨迹只显示状态。
-
-### 示教固件能力
-
-先用 `piper_mode.read(query_firmware=true)` 重新查询实际固件。此调用仅发 `0x4AF` 信息查询。
-默认 `mode.verified_teaching_firmwares: []`，所有示教进入/退出只显示按键引导。
-不能因 SDK 有函数或版本号较新，就视为软件示教已验证。
-
-部署人员仅可把**现场验证过**的完整 SDK 固件字符串加入白名单。验证内容包括
-`MotionCtrl_1(grag_teach_ctrl=1/2)` 的实际模式、录制、使能变化，且无回零、重启、
-复位或意外失去保持力；验收记录必须注明硬件、固件与证据。
-重新连接后须重新查询固件；软件进入示教指令也会开始录制。
-
-`stop_teaching` 不检查停放位：对未验证固件和录制状态提供按键停止引导；
-对已验证固件的回放发送暂停指令，并验证模式保持不变。
-不会把“结束录制/退出示教”伪装成保留原模式的停止，不自动接管 CAN。
-
-官方说明：[ROS 服务与固件差异](https://github.com/agilexrobotics/agx_arm_ros#服务调用)、
-[SDK 维护者关于按键示教的说明](https://github.com/agilexrobotics/piper_sdk/issues/11)。
-旧版退出流程可能涉及回零、重启；这些操作需单独安排。
-
-## 运动边界与兼容
-
-- 单轴运动接口单位为度、度/秒：默认 `1°/秒`，允许 `0.5–5°/秒`，单次每轴最多 `12°`。
-  三次平滑插值按峰值速度规划，20 Hz 发目标，调度中断不会直接跳到未来目标。
-- SDK 速度百分比独立限制在 `1–10%`。全部目标遵守 SDK 和部署限位交集。
-- 到位须在各轴 `±0.5°` 内稳定 `0.5 秒`；跟随偏差超过 `3°` 或超时会取消旧目标。
-- 夹爪以 mm 和 N·m 为单位，开度取 SDK 与配置交集，默认 `0.5 N·m`、上限 `1 N·m`。
-  确认到位后才报告完成，遇到夹持接触但未到指定开度不会虚报成功。
-- 初始化最多 `3°` 的限位修正会明确预览，须单独 `allow_limit_adjustment=true`。
-- 不提供停放位保存/返回、多轴同步运动、IK、自动避障或厂家零位校准。
-
-arm / mode / gripper / photo 共用操作锁，忙时立即拒绝，不排队。status 在动作期间可读。
-各卡片 `stop` 只取消自己的动作，返回 `state=idle`；`operation_stopping=true` 表示工作线程
-仍在清理，期间新的物理操作被拒绝。清理完成前不会断开总线。
-反馈超过 `0.5 秒`、某一关节/电机帧停更、故障、部分使能或外部模式变化会拒绝/终止动作。
-同一部署数据目录的进程锁防止此驱动双开；仍需人工确认其它厂商程序已停止。
-
-长动作返回 `action_id`，通过 ACP 回调完成/错误/取消；在卡片 `info.last_action` 可查看结果。
-客户端超时或回调丢失不代表机械臂已停止，应调用对应卡片 `stop` 并检查反馈。
-最大单轴动作约 44 秒，ACP 等待上限 60 秒。所有返回都是普通 JSON 字典。
-
-## Ubuntu 镜像与部署（本次交付环境）
-
-Ubuntu 22.04 amd64、ROS2 Humble，`can0` 由部署人员配置为 1 Mbps 正常模式。
-Motion 默认关闭；保持 host network、DDS domain 42、FastDDS loopback profile 的只读挂载。
+旧五卡片版本 e2c82e2 已保存到备份分支 codex/piper-five-cards-backup-20261012，并有本机
+完整工作文件备份与 Git bundle（包括未提交的 smoke-test.py）。共享 runtime 保留既有
+预览、控制、照片、异步与生命周期逻辑供回归验证；生产 device 只注册十张新卡片。
+旧 piper_arm / piper_mode 不作为兼容入口暴露，旧画布需更新。此前已删除的五个动作不恢复。
 
 ```bash
-bash agilex/piper/build-local.sh agilex-piper:local-amd64
-bash agilex/piper/deploy/check-image.sh agilex-piper:local-amd64
-python3 agilex/piper/deploy/diagnose.py --query-firmware --output ubuntu-readonly.json
+python -m pytest -q tests/test_piper_prepare.py tests/test_piper_cards.py tests/test_piper_controls.py tests/test_piper_mac.py tests/test_piper_deployment.py tests/test_piper_ten_cards.py tests/test_common_lifecycle.py tests/test_dockerfile_copies.py tests/test_vendor_runtime_logging.py
 ```
 
-### 导入用户照片（不调用相机）
-
-将用户指定的 JPEG/PNG 放到宿主机 `/opt/phanthy-motus/data/piper/imports/`，
-在真实画布 photo 卡片选择 `import_photo`，`filename` 只填写文件名（如 `provided.jpg`）。
-只读取该目录普通文件，拒绝路径、符号链接、损坏图片和超过 20 MiB 的文件。
-保存新的 JPEG/JSON 并发布同一 DDS 图像话题；元数据明确 `source=user_provided`、
-`camera_accessed=false`、`captured_at=null`，不冒充实时采集或当前姿态。
-导入不会连接 CAN；与其它物理操作共用互斥锁，支持卡片停止及 ACP 完成回报。
-`PIPER_CAMERA_ENABLED` 默认 `0`，`capture` 在启动采集子进程前拒绝；用户明确要求使用真实相机后，可在部署端设置为 `1`。
-在照片卡片选择 `capture`，将 `CAPTURE_CONFIRMED=true` 后执行，即拍摄当前画面一张，保存 JPEG/JSON 并发布 DDS。
-无需把相机调整到某个固定方向，也不会自动移动机械臂。每次拍照需确认，启动和重启不自动采集，不开启持续视频流。
-旧字段 `forward_view_confirmed` 仅作可选朝向记录，不能代替本次拍照确认。相机许可与运动许可独立。
-用户未重新授权前不执行 `capture`；诊断脚本默认不拍照，不传 `--photos`。
-
-Bot 的仓库通用构建默认可能为 arm64，**必须 inspect 镜像为 amd64 后才可部署到该 Ubuntu**。
-不要把旧 Bot 镜像号当成当前提交。依 landing 流程更新 PR #382 → 请求 Bot 镜像 →
-核对提交/架构 → 现场验收 → Master/老师验收 → 合并与任务凭证。未验收不会自动合并或代发人员消息。
-
-依赖只加入 PiPER 组件镜像，不修改公共 ROS 基础镜像。Mac 的 gs_usb、libusb、PyObjC
-只在 `requirements-mac.txt`，不进入 Ubuntu 镜像。
-
-| 依赖 | 用途 |
-| --- | --- |
-| PiPER SDK、python-can | 厂商协议及 SocketCAN 通信 |
-| NumPy、headless OpenCV | 图像数组、V4L2 单帧采集、JPEG 编解码；不安装 GUI OpenCV |
-| PyYAML | 读取部署配置 |
-| python3-pip | 构建时安装固定 Python 依赖 |
-| ROS sensor_msgs、FastDDS | 向画布发布图像及使用既定 DDS 配置 |
-
-新驱动会增加组件镜像大小。Bot 构建的分层尺寸和本机 Docker 占用须区分，
-见 [ACCEPTANCE.md](ACCEPTANCE.md)；`check-image.sh` 可读取待部署镜像的本机报告值。
-
-## 离线与真机验收记录
-
-```bash
-python3 -m unittest discover -s tests -p 'test_piper*.py'
-```
-
-测试覆盖参数、模式条件、一次性预览、过期/漂移/外部切换、取消/超时、门禁、
-独立停止、动作中读状态、夹爪单位/限位、进程互斥、MCP/ACP、日志及部署约束。
-模拟不满足条件时断言 **0 条控制命令**。
-
-真机依次验收：状态与用户提供照片 → 待机/CAN → 初始化 → 逐轴小幅动作 →
-空载夹爪 → 示教进出 → 停止及支撑后失能。
-重复点击、不支持固件、按键切换、切换超时与连接恢复分别记录。
-历史单机的 J1 演示不算本版逐轴/夹爪/模式切换的验收。
-最新记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。
-
-此前版本于 2026-10-11 在 Ubuntu 真机完成模式往返、初始化、六轴逐轴小幅往返、双轴与停放位返回、
-空载夹爪、动作取消和支撑后失能。收尾为待机、全部失能、运动/相机权限关闭。
-纯手动验收应单独启动所需卡片：全局“智能控制”即使没有 decision_core 卡片，也可能因 ACP
-通知触发后台决策请求。本次收尾已停止智能控制，开机自启动未勾选。
-
-### 构建与共享运行时说明
-
-默认 ROS Humble 基础镜像固定到多架构索引摘要
-`sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19`，
-支持 amd64 和 arm64。2026-10-11 核对项目 `ros-base:latest` 仅为 arm64，不能直接用于
-现场 amd64 控制器；因此本组件采用官方多架构 Humble 镜像。后续更换 OS/ROS 镜像须重新验收。
-验收同时记录实际镜像 ID、源码提交、SDK 提交和依赖版本。
-
-SDK 固定官方提交 `8d4dc29bd6e753066dedee235c008e90ecb2ab4a`，归档 SHA256 为
-`89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29`。
-pip 在安装前校验归档，关闭缓存，下载和临时文件清理在同一 RUN 内完成。
-Dockerfile 提供 `PIPER_SDK_URL` / `PIPER_SDK_SHA256` 构建参数；取得已批准的 COS
-归档后，可用 `build-local.sh IMAGE --build-arg PIPER_SDK_URL=URL --build-arg PIPER_SDK_SHA256=HASH`
-替换来源。两份桌面 landing 文档均无相关上传说明或 SDK 地址，按用户要求暂不迁移 COS，
-默认下载仍依赖 GitHub 可达性。
-
-公共 `common/vendor_runtime.py` 的唯一改动是 HTTP 请求日志转义和 200 字符截断，修复此前
-Bot 指出的控制字符注入问题。因为所有复用该 HTTP handler 的组件均有同一日志风险，修复放在
-公共 handler；不改变协议、设备生命周期、依赖或网络配置。
-`tests/test_vendor_runtime_logging.py` 验证 LF/CR/NUL/ESC/DEL 转义、200 字符上限和原有
-MCP 成功请求静默行为。Mac 独立入口在创建线程服务器及任何启动输出前安装 `logsafe`，
-启动顺序与正常退出清理均有无硬件回归测试。
+共享 HTTP 日志的控制字符转义/200 字符上限有独立回归；Mac 入口先安装 logsafe。
+当前软件、现场部署和历史真机记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。历史五卡及已删除动作
+的验收不代表十卡已完成全部真机动作验收。
