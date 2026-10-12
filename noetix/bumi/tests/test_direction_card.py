@@ -44,6 +44,22 @@ def test_bundle_exposes_only_one_direction_card(monkeypatch):
     assert 'sound_direction_control' not in {card['name'] for card in manifest['cards']}
 
 
+def test_clean_install_does_not_enable_uncalibrated_direction(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, 'CALIBRATION_PATH', tmp_path / 'override.json')
+    monkeypatch.setattr(module, 'DEFAULT_CALIBRATION_PATH', tmp_path / 'packaged.json')
+    config = yaml.safe_load((Path(__file__).resolve().parents[1] / 'config.yaml').read_text())
+    assert config['plugins']['sound_direction']['enabled'] is False
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs:
+                        (_ for _ in ()).throw(AssertionError('worker must not start')))
+    card = _card(module)
+    assert card.start() is False
+    info = card.dispatch('info', {})
+    assert info['state'] == 'unavailable'
+    assert info['calibrated_directions'] == []
+    assert 'calibration' in card.dispatch('start', {})['message']
+
+
 def test_config_saves_existing_field_names_and_rejects_invalid(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     path = tmp_path / 'settings.json'
@@ -59,6 +75,7 @@ def test_config_saves_existing_field_names_and_rejects_invalid(monkeypatch, tmp_
 def test_config_restarts_worker_and_waits_for_ready(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     monkeypatch.setattr(module, 'SETTINGS_PATH', tmp_path / 'settings.json')
+    monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
     card = _card(module)
     events = []
 
@@ -81,6 +98,7 @@ def test_config_restarts_worker_and_waits_for_ready(monkeypatch, tmp_path):
 def test_config_reports_failed_worker_restart(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     monkeypatch.setattr(module, 'SETTINGS_PATH', tmp_path / 'settings.json')
+    monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
     card = _card(module)
     card._proc = types.SimpleNamespace(poll=lambda: None, terminate=lambda: None,
                                        wait=lambda timeout=None: 0)

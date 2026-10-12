@@ -9,7 +9,7 @@ plugins:
   mic:
     enabled: true
   sound_direction:
-    enabled: true
+    enabled: false  # Enable after installing a verified calibration file.
   speaker:
     enabled: true
   camera:

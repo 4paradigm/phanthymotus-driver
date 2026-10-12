@@ -234,6 +234,9 @@ class SoundDirectionPlugin:
         with self._process_lock:
             if self._proc is not None and self._proc.poll() is None:
                 return True
+            if not load_calibration():
+                print("[direction] calibration unavailable; worker not started", flush=True)
+                return False
             self._last_direction = None
             self._last_direction_time = 0.0
             proc = subprocess.Popen(
@@ -333,6 +336,8 @@ class SoundDirectionPlugin:
         if action == "start":
             try:
                 if not self.start():
+                    if not load_calibration():
+                        return {"state": "unavailable", "message": "sound direction calibration is missing or invalid"}
                     return {"state": "error", "message": "direction worker failed to initialize"}
             except (OSError, subprocess.TimeoutExpired) as exc:
                 return {"state": "error", "message": f"direction worker failed to start: {exc}"}
@@ -344,6 +349,7 @@ class SoundDirectionPlugin:
                 return {"state": "error", "message": "direction subprocess did not exit after kill"}
             return {"state": "idle"}
         if action == "info":
+            calibration = load_calibration()
             with self._process_lock:
                 running = self._proc is not None and self._proc.poll() is None
                 if not running:
@@ -354,11 +360,12 @@ class SoundDirectionPlugin:
             observation = ({"state": "no_event"} if direction is None else
                            {"state": "stale"} if age > 10 else
                            {**direction, "age_ms": round(age * 1000)})
-            result = {"state": "running" if running else "idle",
+            result = {"state": "unavailable" if not calibration else
+                      "running" if running else "idle",
                       "sound_direction": observation,
                       "parameters": load_parameters(),
                       "calibrated_directions": [key for key in ("front", "right")
-                                                if key in load_calibration()]}
+                                                if key in calibration]}
             result["topic_out"] = self.get_tool()["topic_out"]
             return result
         if action == "config":

@@ -36,8 +36,11 @@ The card first loads a complete, valid per-robot calibration from
 packaged `resource/sound_direction_calibration.json`. Each file must contain
 `front` and `right`, each with three finite values of magnitude at most 24.
 The two files are never mixed. The packaged values are pending a read from an
-already calibrated Bumi; until a valid file is present, no direction is
-published. Before treating that file as common to all Bumi units, check a
+already calibrated Bumi. The direction card is disabled by default until a
+verified calibration is installed and `plugins.sound_direction.enabled` is set
+to `true` in `config.yaml`. If enabled without a valid file, `start` and `info`
+report it unavailable instead of starting a silent worker. Before treating
+the packaged file as common to all Bumi units, check a
 second robot at front, right, left and rear positions.
 
 For existing canvas projects, remove the old `sound_direction_control` card and
