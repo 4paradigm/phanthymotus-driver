@@ -3742,6 +3742,7 @@ class MotionSwitcherPlugin:
             ),
             "inputSchema": {
                 "type": "object",
+                "x-is-dangerous": True,
                 "properties": {
                     "action": {
                         "type": "string",
@@ -3753,12 +3754,17 @@ class MotionSwitcherPlugin:
                         "enum": ["ai", "normal", "advanced"],
                         "description": "Required for select. SDK mode name; availability depends on robot firmware.",
                     },
+                    "confirm": {
+                        "type": "boolean",
+                        "const": True,
+                        "description": "Required for release only: explicitly approve this control handoff request. Does not prove low-level controller readiness.",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "check":   {"params": [],       "description": "Read SDK-reported high-level mode (name/form); no motion"},
                     "select":  {"params": ["mode"], "description": "Request a high-level mode; verify returned status before assuming completion"},
-                    "release": {"params": [],       "description": "DANGER: not a movement stop; relinquishes high-level control and is blocked without trusted low-level handoff verification"},
+                    "release": {"params": ["confirm"], "description": "DANGER: not a movement stop; requires confirm=true and trusted low-level handoff verification"},
                 },
             },
         }
@@ -3830,6 +3836,10 @@ class MotionSwitcherPlugin:
                     print("[MotionSwitcher] release blocked: no trusted handoff verifier", flush=True)
                     return {"ret": None, "released": False, "status": "blocked",
                             "error": "Release blocked: no trusted low-level controller handoff verifier is installed"}
+                if (args or {}).get("confirm") is not True:
+                    print("[MotionSwitcher] release blocked: explicit confirmation missing", flush=True)
+                    return {"ret": None, "released": False, "status": "blocked",
+                            "error": "Release blocked: confirm=true is required for this request"}
                 try:
                     evidence = self._release_verifier()
                 except Exception as exc:

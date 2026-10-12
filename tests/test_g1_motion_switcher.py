@@ -133,7 +133,19 @@ class TestMotionSwitcher(unittest.TestCase):
 
     def test_release_verifier_failure_never_calls_sdk(self):
         plugin, sdk = card(verifier=lambda: {"ready": False, "controller": "test"})
-        self.assertEqual(plugin.dispatch("release", {})["status"], "blocked")
+        self.assertEqual(plugin.dispatch("release", {"confirm": True})["status"], "blocked")
+        self.assertEqual(sdk.calls, [])
+
+    def test_release_is_marked_dangerous_and_requires_explicit_confirmation(self):
+        plugin, sdk = card(verifier=lambda: {"ready": True, "controller": "offline-test"})
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertIs(schema["x-is-dangerous"], True)
+        self.assertEqual(schema["x-action-params"]["release"]["params"], ["confirm"])
+        self.assertIs(schema["properties"]["confirm"]["const"], True)
+        for args in ({}, {"confirm": False}, {"confirm": "true"}, {"confirm": 1}):
+            result = plugin.dispatch("release", args)
+            self.assertEqual(result["status"], "blocked")
+            self.assertFalse(result["released"])
         self.assertEqual(sdk.calls, [])
 
     def test_release_sdk_failure_and_confirmed_success_with_internal_verifier(self):
@@ -141,18 +153,18 @@ class TestMotionSwitcher(unittest.TestCase):
         plugin, sdk = card(verifier=verifier)
         sdk.release_code = 7008
         with contextlib.redirect_stdout(io.StringIO()):
-            failed = plugin.dispatch("release", {})
+            failed = plugin.dispatch("release", {"confirm": True})
         self.assertEqual((failed["ret"], failed["released"]), (7008, None))
         sdk.release_code = 0
         with contextlib.redirect_stdout(io.StringIO()):
-            done = plugin.dispatch("release", {})
+            done = plugin.dispatch("release", {"confirm": True})
         self.assertEqual((done["status"], done["released"]), ("mode_cleared", True))
 
     def test_release_after_rpc_timeout_does_not_claim_state(self):
         plugin, sdk = card(verifier=lambda: {"ready": True, "controller": "offline-test"})
         sdk.ReleaseMode = lambda: (_ for _ in ()).throw(TimeoutError("RPC timed out"))
         with contextlib.redirect_stdout(io.StringIO()):
-            result = plugin.dispatch("release", {})
+            result = plugin.dispatch("release", {"confirm": True})
         self.assertEqual(result["status"], "error")
         self.assertIsNone(result["released"])
 
@@ -160,7 +172,7 @@ class TestMotionSwitcher(unittest.TestCase):
         plugin, sdk = card(verifier=lambda: {"ready": True, "controller": "offline-test"})
         sdk.ReleaseMode = lambda: (0, None)
         with contextlib.redirect_stdout(io.StringIO()):
-            result = plugin.dispatch("release", {})
+            result = plugin.dispatch("release", {"confirm": True})
         self.assertEqual(result["status"], "unconfirmed")
         self.assertIsNone(result["released"])
 
