@@ -45,7 +45,7 @@ class PiperPlugin(PiperRuntime):
                        or name == 'piper_gripper' and action in {'open', 'close', 'set_width'} and args.get('execute') is True)
         if long_action and self.config.get('async_actions', True):
             previous = getattr(self.worker_context, 'operation_object', None)
-            self.worker_context.operation_object = args.get('object')
+            self.worker_context.operation_object = args.get('object', 'arm') if name in {'piper_enable', 'piper_disable'} else None
             try:
                 return self.run_async(name, action, args)
             finally:
@@ -71,7 +71,7 @@ class PiperPlugin(PiperRuntime):
         previous = getattr(self.worker_context, 'public_call', None)
         previous_object = getattr(self.worker_context, 'operation_object', None)
         self.worker_context.public_call = (name, action)
-        self.worker_context.operation_object = args.get('object')
+        self.worker_context.operation_object = args.get('object', 'arm') if name in {'piper_enable', 'piper_disable'} else None
         try:
             if name == 'piper_status':
                 if self.closed or name in self.stopped_cards:
