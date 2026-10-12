@@ -23,8 +23,6 @@ CAMERAS = {
     "head_stereo_left_fisheye": "/hal/head_stereo_left_fisheye_camera/rgb",
     "head_stereo_right_fisheye": "/hal/head_stereo_right_fisheye_camera/rgb",
     "armpit_right_fisheye": "/hal/armpit_right_fisheye_camera/rgb",
-    "wrist_left_d405_rgb": "/hal/wrist_left_d405_camera/rgb",
-    "wrist_right_d405_rgb": "/hal/wrist_right_d405_camera/rgb",
     "chest_front_d457_rgb": "/hal/chest_front_d457_camera/rgb",
     "chest_front_d457_depth": "/hal/chest_front_d457_camera/depth",
     "waist_front_d415_rgb": "/hal/waist_front_d415_camera/rgb",

@@ -593,7 +593,7 @@
     </collision>
   </link>
   <joint name="left_hand_palm_joint" type="fixed">
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="0.08 0 0" rpy="0 0 0"/>
     <parent link="left_wrist_yaw_Link"/>
     <child link="left_hand_palm_Link"/>
   </joint>
@@ -823,7 +823,7 @@
     </collision>
   </link>
   <joint name="right_hand_palm_joint" type="fixed">
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="0.08 0 0" rpy="0 0 0"/>
     <parent link="right_wrist_yaw_Link"/>
     <child link="right_hand_palm_Link"/>
   </joint>
@@ -1337,29 +1337,39 @@
     <axis xyz="1.0 0.0 0.0"/>
     <limit lower="-0.3490658503988659" upper="0.3490658503988659" effort="54.75" velocity="19.37"/>
   </joint>
-  <!-- O10 hand feedback channels. The vendor model stops at the palm; these
-       lightweight kinematic links make the ten reported channels visible in
-       the dashboard without pretending they are CAD meshes. -->
+  <!-- O10 hand skeleton: renderer uses joint origins, not CAD meshes. -->
   <link name="left_hand_channel_0"/><link name="left_hand_channel_1"/><link name="left_hand_channel_2"/><link name="left_hand_channel_3"/><link name="left_hand_channel_4"/><link name="left_hand_channel_5"/><link name="left_hand_channel_6"/><link name="left_hand_channel_7"/><link name="left_hand_channel_8"/><link name="left_hand_channel_9"/>
   <link name="right_hand_channel_0"/><link name="right_hand_channel_1"/><link name="right_hand_channel_2"/><link name="right_hand_channel_3"/><link name="right_hand_channel_4"/><link name="right_hand_channel_5"/><link name="right_hand_channel_6"/><link name="right_hand_channel_7"/><link name="right_hand_channel_8"/><link name="right_hand_channel_9"/>
-  <joint name="left_thumb_roration_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_0"/><origin xyz="0 0.03 0"/><axis xyz="1 0 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_thumb_wiggles_1" type="revolute"><parent link="left_hand_channel_0"/><child link="left_hand_channel_1"/><origin xyz="0 0.025 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_thumb_bent_2" type="revolute"><parent link="left_hand_channel_1"/><child link="left_hand_channel_2"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_index_wiggles_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_3"/><origin xyz="0 0.04 0.02"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_index_bent_1" type="revolute"><parent link="left_hand_channel_3"/><child link="left_hand_channel_4"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_middle_bent" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_5"/><origin xyz="0 0.04 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_ring_wiggles_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_6"/><origin xyz="0 0.04 -0.02"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_ring_bent_1" type="revolute"><parent link="left_hand_channel_6"/><child link="left_hand_channel_7"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_pinky_wiggles_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_8"/><origin xyz="0 0.04 -0.04"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="left_pinky_bent_1" type="revolute"><parent link="left_hand_channel_8"/><child link="left_hand_channel_9"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_thumb_rotation_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_0"/><origin xyz="0 0.03 0"/><axis xyz="1 0 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_thumb_wiggles_1" type="revolute"><parent link="right_hand_channel_0"/><child link="right_hand_channel_1"/><origin xyz="0 0.025 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_thumb_bent_2" type="revolute"><parent link="right_hand_channel_1"/><child link="right_hand_channel_2"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_index_wiggles_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_3"/><origin xyz="0 0.04 0.02"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_index_bent_1" type="revolute"><parent link="right_hand_channel_3"/><child link="right_hand_channel_4"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_middle_bent" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_5"/><origin xyz="0 0.04 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_ring_wiggles_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_6"/><origin xyz="0 0.04 -0.02"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_ring_bent_1" type="revolute"><parent link="right_hand_channel_6"/><child link="right_hand_channel_7"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_pinky_wiggles_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_8"/><origin xyz="0 0.04 -0.04"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
-  <joint name="right_pinky_bent_1" type="revolute"><parent link="right_hand_channel_8"/><child link="right_hand_channel_9"/><origin xyz="0 0.025 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_thumb_roration_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_0"/><origin xyz="0.025 0.034 0.006"/><axis xyz="1 0 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_thumb_wiggles_1" type="revolute"><parent link="left_hand_channel_0"/><child link="left_hand_channel_1"/><origin xyz="0.025 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_thumb_bent_2" type="revolute"><parent link="left_hand_channel_1"/><child link="left_hand_channel_2"/><origin xyz="0.025 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_index_wiggles_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_3"/><origin xyz="0.055 0.024 0.008"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_index_bent_1" type="revolute"><parent link="left_hand_channel_3"/><child link="left_hand_channel_4"/><origin xyz="0.035 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_middle_bent" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_5"/><origin xyz="0.07 0.008 0.01"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_ring_wiggles_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_6"/><origin xyz="0.055 -0.01 0.008"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_ring_bent_1" type="revolute"><parent link="left_hand_channel_6"/><child link="left_hand_channel_7"/><origin xyz="0.035 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_pinky_wiggles_0" type="revolute"><parent link="left_hand_palm_Link"/><child link="left_hand_channel_8"/><origin xyz="0.045 -0.028 0.006"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="left_pinky_bent_1" type="revolute"><parent link="left_hand_channel_8"/><child link="left_hand_channel_9"/><origin xyz="0.03 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_thumb_rotation_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_0"/><origin xyz="0.025 0.034 0.006"/><axis xyz="1 0 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_thumb_wiggles_1" type="revolute"><parent link="right_hand_channel_0"/><child link="right_hand_channel_1"/><origin xyz="0.025 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_thumb_bent_2" type="revolute"><parent link="right_hand_channel_1"/><child link="right_hand_channel_2"/><origin xyz="0.025 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_index_wiggles_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_3"/><origin xyz="0.055 0.024 0.008"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_index_bent_1" type="revolute"><parent link="right_hand_channel_3"/><child link="right_hand_channel_4"/><origin xyz="0.035 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_middle_bent" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_5"/><origin xyz="0.07 0.008 0.01"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_ring_wiggles_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_6"/><origin xyz="0.055 -0.01 0.008"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_ring_bent_1" type="revolute"><parent link="right_hand_channel_6"/><child link="right_hand_channel_7"/><origin xyz="0.035 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_pinky_wiggles_0" type="revolute"><parent link="right_hand_palm_Link"/><child link="right_hand_channel_8"/><origin xyz="0.045 -0.028 0.006"/><axis xyz="0 1 0"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <joint name="right_pinky_bent_1" type="revolute"><parent link="right_hand_channel_8"/><child link="right_hand_channel_9"/><origin xyz="0.03 0 0"/><axis xyz="0 0 1"/><limit lower="0" upper="1.5708" effort="0" velocity="0"/></joint>
+  <link name="left_thumb_tip"/><link name="left_index_tip"/><link name="left_middle_tip"/><link name="left_ring_tip"/><link name="left_pinky_tip"/>
+  <link name="right_thumb_tip"/><link name="right_index_tip"/><link name="right_middle_tip"/><link name="right_ring_tip"/><link name="right_pinky_tip"/>
+  <joint name="left_thumb_tip_fixed" type="fixed"><parent link="left_hand_channel_2"/><child link="left_thumb_tip"/><origin xyz="0.025 0 0"/></joint>
+  <joint name="left_index_tip_fixed" type="fixed"><parent link="left_hand_channel_4"/><child link="left_index_tip"/><origin xyz="0.03 0 0"/></joint>
+  <joint name="left_middle_tip_fixed" type="fixed"><parent link="left_hand_channel_5"/><child link="left_middle_tip"/><origin xyz="0.035 0 0"/></joint>
+  <joint name="left_ring_tip_fixed" type="fixed"><parent link="left_hand_channel_7"/><child link="left_ring_tip"/><origin xyz="0.03 0 0"/></joint>
+  <joint name="left_pinky_tip_fixed" type="fixed"><parent link="left_hand_channel_9"/><child link="left_pinky_tip"/><origin xyz="0.025 0 0"/></joint>
+  <joint name="right_thumb_tip_fixed" type="fixed"><parent link="right_hand_channel_2"/><child link="right_thumb_tip"/><origin xyz="0.025 0 0"/></joint>
+  <joint name="right_index_tip_fixed" type="fixed"><parent link="right_hand_channel_4"/><child link="right_index_tip"/><origin xyz="0.03 0 0"/></joint>
+  <joint name="right_middle_tip_fixed" type="fixed"><parent link="right_hand_channel_5"/><child link="right_middle_tip"/><origin xyz="0.035 0 0"/></joint>
+  <joint name="right_ring_tip_fixed" type="fixed"><parent link="right_hand_channel_7"/><child link="right_ring_tip"/><origin xyz="0.03 0 0"/></joint>
+  <joint name="right_pinky_tip_fixed" type="fixed"><parent link="right_hand_channel_9"/><child link="right_pinky_tip"/><origin xyz="0.025 0 0"/></joint>
 </robot>

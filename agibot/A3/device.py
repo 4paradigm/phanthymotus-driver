@@ -247,8 +247,6 @@ CAMERA_TOPICS = {
     "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-zlib", "胸前 D457 相机深度"),
     "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/jpeg", "腰前 D415 相机 RGB"),
     "waist_front_d415_depth": ("/hal/waist_front_d415_camera/depth", "image/depth-zlib", "腰前 D415 相机深度"),
-    "wrist_left_d405_rgb": ("/hal/wrist_left_d405_camera/rgb", "image/jpeg", "左腕 D405 相机 RGB（当前设备无实际帧）"),
-    "wrist_right_d405_rgb": ("/hal/wrist_right_d405_camera/rgb", "image/jpeg", "右腕 D405 相机 RGB（当前设备无实际帧）"),
 }
 # H265 foxglove CompressedVideo streams exist too, but consumer-side H265 decode support
 # is inconsistent — the raw sensor_msgs/Image feeds are mirrored and re-encoded instead
@@ -594,7 +592,7 @@ class A3Nodes:
                     self._media_received[key] = count
                     if count == 1 or count % 1000 == 0:
                         print(f"[media] received={count} key={key} topic={robot_topic}", flush=True)
-                if key in ("arm_state", "hand_state", "neck_state", "leg_state"):
+                if key in ("arm_state", "hand_state", "neck_state", "waist_state", "leg_state"):
                     self._joint_cache[key] = jsonable(msg)
                     self._publish_joint_streams()
                 elif key in ("imu_pelvis", "imu_torso"):
@@ -663,6 +661,7 @@ class A3Nodes:
         mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
         mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
         mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json")
+        mirror("waist_state", JointState, "/motion/control/waist_joint_state", "data/json")
         mirror("leg_state", JointState, "/motion/control/leg_joint_state", "data/json")
         mirror("lidar_cloud", PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", "sensor/pointcloud")
         mirror("imu_pelvis", Imu, "/ros2/body_drive/pelvis_imu/data", "data/json")
@@ -1213,10 +1212,11 @@ class A3Nodes:
 
     def _publish_joint_streams(self):
         groups = {key: self._joint_cache.get(key, {})
-                  for key in ("arm_state", "hand_state", "neck_state", "leg_state")}
+                  for key in ("arm_state", "hand_state", "neck_state", "waist_state", "leg_state")}
         raw = {}
         for prefix, group in (("arm", groups["arm_state"]), ("hand", groups["hand_state"]),
-                              ("neck", groups["neck_state"]), ("leg", groups["leg_state"])):
+                              ("neck", groups["neck_state"]), ("waist", groups["waist_state"]),
+                              ("leg", groups["leg_state"])):
             _flatten_joint_group(group, prefix, raw)
         output = self._String()
         output.data = json.dumps(raw, ensure_ascii=False)
@@ -1227,6 +1227,7 @@ class A3Nodes:
         group_aliases = {
             "arm_state": [*ARM_JOINTS["left"], *ARM_JOINTS["right"]],
             "neck_state": list(NECK_JOINTS),
+            "waist_state": ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
             "leg_state": [
                 "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
                 "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
@@ -1649,19 +1650,21 @@ class JointsPlugin:
         "arm": ("arm_state", "14 自由度手臂关节（position/velocity/effort）"),
         "hand": ("hand_state", "手指（0-4096；frame_id 标识 AgiHand/O10Hand；O10Hand 含压力阵列）"),
         "neck": ("neck_state", "头部偏航/俯仰关节"),
+        "waist": ("waist_state", "腰部偏航/滚转/俯仰关节"),
     }
 
     def __init__(self, nodes):
         self.nodes = nodes
-        self.streams = {k: nodes.streams[k] for k in ("arm_state", "hand_state", "neck_state")}
+        self.streams = {k: nodes.streams[k] for k in
+                        ("arm_state", "hand_state", "neck_state", "waist_state")}
 
     def get_tool(self):
-        return tool("joints", "sensor", "关节状态流（按 group 选择 arm/hand/neck；"
+        return tool("joints", "sensor", "关节状态流（按 group 选择 arm/hand/neck/waist；"
                                      "config.yaml plugins.joints 控制启用）", {
             "type": "object",
             "properties": {
                 "group": {"type": "string", "enum": list(self.GROUPS),
-                          "description": "关节组：arm 双臂 14 关节 / hand 手指 / neck 头部"},
+                          "description": "关节组：arm 双臂 / hand 手指 / neck 头部 / waist 腰部"},
             },
         }, topic_out=[{"topic": _core_topic(self.nodes.namespace, "state/joints"),
                        "format": "sensor/skeleton"}])
@@ -4339,8 +4342,6 @@ def build_plugins(config, namespace, ros2):
         "camera_head_stereo_left": "head_stereo_left_fisheye",
         "camera_head_stereo_right": "head_stereo_right_fisheye",
         "camera_armpit_right": "armpit_right_fisheye",
-        "camera_wrist_left": "wrist_left_d405_rgb",
-        "camera_wrist_right": "wrist_right_d405_rgb",
         "camera_waist_rgb": "waist_front_d415_rgb",
         "camera_waist_depth": "waist_front_d415_depth",
     }

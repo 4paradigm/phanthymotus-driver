@@ -175,7 +175,7 @@ FULL_PLUGINS = {
                "streams": ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye",
                            "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye",
                            "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb",
-                           "waist_front_d415_depth", "wrist_left_d405_rgb", "wrist_right_d405_rgb"]},
+                           "waist_front_d415_depth"]},
     "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
     "estop": {"enabled": True},
     "alerts": {"enabled": True, "poll_interval": 5.0}, "mc_mode": {"enabled": True},
@@ -529,7 +529,8 @@ class ToolInventoryTests(unittest.TestCase):
         joints = find_plugin(plugins, "joints")
         for group, robot_topic in (("arm", "/motion/control/arm_joint_state"),
                                    ("hand", "/motion/control/hand_joint_state"),
-                                   ("neck", "/motion/control/neck_joint_state")):
+                                   ("neck", "/motion/control/neck_joint_state"),
+                                   ("waist", "/motion/control/waist_joint_state")):
             result = joints.dispatch("query", {"group": group})
             self.assertEqual(result["robot_topic"], robot_topic)
         with self.assertRaises(ValueError):
@@ -542,7 +543,8 @@ class ToolInventoryTests(unittest.TestCase):
         config["plugins"] = FULL_PLUGINS
         plugins, _ = build_bundle_plugins(config)
         joints = find_plugin(plugins, "joints")
-        for group, key in (("arm", "arm_state"), ("hand", "hand_state"), ("neck", "neck_state")):
+        for group, key in (("arm", "arm_state"), ("hand", "hand_state"),
+                           ("neck", "neck_state"), ("waist", "waist_state")):
             result = joints.dispatch("info", {"group": group})
             self.assertEqual(result["topic_out"],
                              [{"topic": "/test_ns/state/joints", "format": "sensor/skeleton"}])
@@ -2443,6 +2445,27 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertAlmostEqual(payload["imu_quat"][1], 0.7071068, places=6)
         self.assertAlmostEqual(payload["imu_quat"][2], 0.0, places=6)
         self.assertAlmostEqual(payload["imu_quat"][3], 0.7071068, places=6)
+
+    def test_skeleton_includes_live_waist_feedback(self):
+        msg = types.SimpleNamespace(
+            name=["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
+            position=[0.1, -0.2, 0.3], velocity=[0.0, 0.0, 0.0],
+            effort=[0.0, 0.0, 0.0])
+        self._callback("/motion/control/waist_joint_state")(msg)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        by_name = {joint["name"]: joint["q"] for joint in payload["joints"]}
+        self.assertEqual(by_name["waist_yaw_joint"], 0.1)
+        self.assertEqual(by_name["waist_roll_joint"], -0.2)
+        self.assertEqual(by_name["waist_pitch_joint"], 0.3)
+
+    def test_wrist_camera_cards_are_not_exposed_without_source_frames(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        self.assertNotIn("camera_wrist_left", plugins)
+        self.assertNotIn("camera_wrist_right", plugins)
+        self.assertNotIn("wrist_left_d405_rgb", device.CAMERA_TOPICS)
+        self.assertNotIn("wrist_right_d405_rgb", device.CAMERA_TOPICS)
 
     def test_audio_normalization_reads_audio_capture_info_metadata(self):
         msg = types.SimpleNamespace(info=types.SimpleNamespace(

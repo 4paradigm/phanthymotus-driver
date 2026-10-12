@@ -39,11 +39,9 @@ plugins:
     # Which camera streams to mirror; keys of the CAMERA_TOPICS table in device.py.
     # RGB is re-encoded to JPEG and depth to zlib-compressed uint16 on the fly
     # (default includes chest D457 depth, image/depth-zlib).
-    # The wrist D405 topics are included deliberately: the robot firmware may
-    # advertise them even when a particular unit emits no frames. The relay
-    # keeps every input subscription alive and uses one-slot newest-frame
-    # queues, so a missing wrist publisher does not block the other cameras.
-    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye", "wrist_left_d405_rgb", "wrist_right_d405_rgb", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth"]
+    # The current HAL advertises wrist D405 topics but emits no Image samples;
+    # those unavailable streams are intentionally omitted until firmware fixes them.
+    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth"]
   camera_head_left:
     enabled: true
   camera_head_right:
@@ -63,10 +61,6 @@ plugins:
   camera_waist_rgb:
     enabled: true
   camera_waist_depth:
-    enabled: true
-  camera_wrist_left:
-    enabled: true
-  camera_wrist_right:
     enabled: true
   lidar_cloud:
     enabled: true
