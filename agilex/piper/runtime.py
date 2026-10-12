@@ -231,9 +231,9 @@ class PiperRuntime:
             return
         with self.lifecycle:
             if self.closed or name in self.stopped_cards:
-                raise RuntimeError("Driver stopped; call start before another operation")
+                raise RuntimeError("卡片已停止；请先启动卡片再操作")
             if not self.gate.acquire(blocking=False):
-                raise RuntimeError("Arm/camera busy; concurrent operations are refused")
+                raise RuntimeError("机械臂或相机正在执行操作；请等待完成或使用「停止动作」，不会排队执行")
             self.cancel.clear()
             self.active_card, self.active_action = name, action
             self.active_object = getattr(self.worker_context, "operation_object", None)
@@ -357,7 +357,7 @@ class PiperRuntime:
                 self.previews.invalidate()
                 self.motion_enabled = self.manual_motion_permission = True
             return {"motion_enabled": True, "executed": False,
-                    "reminder": "仅允许本次操作，未使能、未移动；请重新预览。停止机械臂卡片、重连或重启后许可关闭。"}
+                    "reminder": "本次控制许可已开启；未使能、未移动。停止单轴卡片、重连或重启后许可关闭。"}
 
     def dispatch(self, action, args):
         name = args.get("_tool_name", "piper_arm")

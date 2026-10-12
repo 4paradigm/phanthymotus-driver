@@ -196,7 +196,8 @@ class PiperPlugin(PiperRuntime):
             grip = driver.get_gripper() if obj == 'gripper' else None
             if grip is not None and not grip.enabled:
                 return {'confirmed': True, 'executed': False, 'gripper': asdict(grip), 'message': '夹爪已经失能'}
-            confirm(args, 'supported')
+            if args.get('supported') is not True:
+                raise ValueError('失能前请确认机械臂已可靠支撑，或夹爪空载/夹持物已支撑')
             self.require_motion_permission()
             self.previews.invalidate()
             result = asdict(driver.disable(supported=True) if obj == 'arm' else driver.disable_gripper())

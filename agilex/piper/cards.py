@@ -36,6 +36,7 @@ def build_tools(topic):
     def add(name, description, actions, props=None, confirmations=None, kind="actuator"):
         schema = action_schema({**actions, **lifecycle}, props or {})
         schema["additionalProperties"] = False
+        schema["x-manual-execution"] = True
         schema["properties"]["action"].update(title="操作", default=next(iter(actions)),
             oneOf=[{"const": a, "title": text} for a, (_, text) in {**actions, **lifecycle}.items()])
         if confirmations:
@@ -53,7 +54,7 @@ def build_tools(topic):
         {"read": ([], "读取状态"), "firmware": ([], "查询固件"),
          "reconnect": ([], "重新连接（关闭许可并清除预览）")}, kind="resource")
     for name, label in [("piper_standby", "待机"), ("piper_can", "电脑控制（CAN）")]:
-        props = {**hidden}
+        props = {key: hidden[key] for key in ["execute", "preview_id"]}
         params = []
         if name == "piper_can":
             props["other_controllers_stopped"] = flag("其他控制程序已停止")
@@ -104,6 +105,17 @@ def build_tools(topic):
         {"halt": (["target"], "停止动作")},
         {"target": choice("停止范围", [("all", "全部动作"), ("arm", "机械臂动作"), ("gripper", "夹爪动作")], "all")})
     for definition in result:
+        name = definition["name"]
+        internal_params = {
+            "piper_standby": {"switch": ["execute", "preview_id"]},
+            "piper_can": {"switch": ["execute", "preview_id"]},
+            "piper_enable": {"enable": ["execute", "preview_id", "workspace_clear", "take_control", "allow_limit_adjustment"]},
+            "piper_joint": {"move": ["execute", "preview_id", "workspace_clear", "take_control"]},
+            "piper_gripper": {a: ["execute", "preview_id", "workspace_clear", "take_control"] for a in ["open", "close", "set_width"]},
+            "piper_photo": {"capture": ["capture_confirmed"]},
+        }
+        for action, params in internal_params.get(name, {}).items():
+            definition["inputSchema"]["x-action-params"][action]["params"] += params
         completions = {"piper_enable": ["enable"], "piper_joint": ["move"],
                        "piper_gripper": ["open", "close", "set_width"], "piper_photo": ["capture", "import_photo"]}
         if definition["name"] in completions:
