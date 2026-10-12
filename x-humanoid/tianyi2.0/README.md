@@ -14,14 +14,22 @@ zone result JSON on domain 42. It never calls the arm, hand, or base controls.
 Only `camera_head` is accepted as an input: the card deliberately uses the
 Tianyi head camera's raw ROS topic rather than a general JPEG input subscriber.
 
-Configure `waiting_rect`, `sorting_1_rect`, and `sorting_2_rect` as
-`x1,y1,x2,y2` in normalized image coordinates (top-left `0,0`, bottom-right
-`1,1`). For three columns, use `0,0,0.3,1`, `0.35,0,0.65,1`, and
-`0.7,0,1,1`. Set the dictionary to match the printed markers; the default
-is `DICT_4X4_50`. The color fields are labels for later sorting, not object
-color recognition. `ready` becomes true only when each configured region
-contains exactly one marker and all three IDs differ. Keep the head still
-while testing because these are image coordinates, not robot coordinates.
+First start the card to see detected marker IDs in its overlay and JSON output.
+Then choose one ID for each of `waiting_marker_id`, `sorting_1_marker_id`, and
+`sorting_2_marker_id` from the canvas dropdowns. Each dropdown lists IDs 0–99;
+choose only IDs currently visible in the camera. Set `waiting_size`,
+`sorting_1_size`, and `sorting_2_size` as `width,height` fractions of the
+image, for example `0.2,0.3`. Each region is centered on its chosen marker
+and follows that marker when it moves. Set the dictionary to match the printed
+markers; the default is `DICT_4X4_50`, which accepts IDs 0–49. The color
+fields are labels for later sorting, not object color recognition.
+
+The JSON includes each zone's selected ID, normalized marker center, generated
+rectangle, and whether it was clipped by the image boundary. `ready` becomes
+true only when all three selected IDs are visible, their regions are complete
+and do not overlap. These are camera-image coordinates; placement in robot
+coordinates later requires camera calibration and hand-eye transforms. Keep
+the camera still while comparing the regions with a physical work surface.
 
 The image build replaces `opencv-python-headless` with the contrib wheel
 because the existing wheel does not provide `cv2.aruco`. This may increase

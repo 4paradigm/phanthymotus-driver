@@ -15,31 +15,56 @@ SPEC.loader.exec_module(aruco)
 
 
 class ArucoZonesTests(unittest.TestCase):
-    def test_three_distinct_markers_make_zones_ready(self):
-        config, rects = aruco.validate_config({
-            "waiting_rect": "0,0,0.3,1",
-            "sorting_1_rect": "0.35,0,0.65,1",
-            "sorting_2_rect": "0.7,0,1,1",
+    def test_marker_ids_anchor_sized_zones_as_markers_move(self):
+        config, sizes = aruco.validate_config({
+            "waiting_marker_id": "7", "waiting_size": "0.2,0.2",
+            "sorting_1_marker_id": "2", "sorting_1_size": "0.2,0.2",
+            "sorting_2_marker_id": "9", "sorting_2_size": "0.2,0.2",
         })
         markers = [
-            {"id": 1, "center_px": [15, 50]},
+            {"id": 7, "center_px": [85, 50]},
             {"id": 2, "center_px": [50, 50]},
-            {"id": 3, "center_px": [85, 50]},
+            {"id": 9, "center_px": [15, 50]},
         ]
-        result = aruco.assign_zones(markers, rects, 100, 100, config)
+        result = aruco.assign_zones(markers, sizes, 100, 100, config)
         self.assertTrue(result["ready"])
         self.assertFalse(result["motion_enabled"])
         self.assertEqual(result["zones"]["sorting_1"]["marker_id"], 2)
-        self.assertFalse(aruco.assign_zones(markers[:2], rects, 100, 100, config)["ready"])
-        markers[2]["id"] = 2
-        self.assertFalse(aruco.assign_zones(markers, rects, 100, 100, config)["ready"])
+        for actual, expected in zip(result["zones"]["waiting"]["rect_normalized"],
+                                    [0.75, 0.4, 0.95, 0.6]):
+            self.assertAlmostEqual(actual, expected)
+        markers[0]["center_px"] = [70, 50]
+        moved = aruco.assign_zones(markers, sizes, 100, 100, config)
+        for actual, expected in zip(moved["zones"]["waiting"]["rect_normalized"],
+                                    [0.6, 0.4, 0.8, 0.6]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertFalse(aruco.assign_zones(markers[:2], sizes, 100, 100, config)["ready"])
 
-    def test_overlapping_regions_and_invalid_rectangles_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "重叠"):
-            aruco.validate_config({"waiting_rect": "0,0,0.6,1",
-                                   "sorting_1_rect": "0.5,0,1,1"})
-        with self.assertRaisesRegex(ValueError, "区域须满足"):
-            aruco.parse_rect("0.8,0,0.2,1")
+    def test_invalid_sizes_and_duplicate_ids_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "必须不同"):
+            aruco.validate_config({"waiting_marker_id": "2", "sorting_1_marker_id": "2"})
+        with self.assertRaisesRegex(ValueError, "宽、高"):
+            aruco.parse_size("0,0.2")
+        with self.assertRaisesRegex(ValueError, "须小于"):
+            aruco.validate_config({"waiting_marker_id": "50"})
+
+    def test_overlapping_or_clipped_zones_are_not_ready(self):
+        config, sizes = aruco.validate_config({
+            "waiting_marker_id": "1", "waiting_size": "0.3,0.3",
+            "sorting_1_marker_id": "2", "sorting_1_size": "0.3,0.3",
+            "sorting_2_marker_id": "3", "sorting_2_size": "0.3,0.3",
+        })
+        markers = [{"id": 1, "center_px": [20, 50]},
+                   {"id": 2, "center_px": [30, 50]},
+                   {"id": 3, "center_px": [80, 50]}]
+        result = aruco.assign_zones(markers, sizes, 100, 100, config)
+        self.assertTrue(result["zones_overlap"])
+        self.assertFalse(result["ready"])
+        markers[0]["center_px"] = [5, 50]
+        markers[1]["center_px"] = [50, 50]
+        result = aruco.assign_zones(markers, sizes, 100, 100, config)
+        self.assertTrue(result["zones"]["waiting"]["clipped"])
+        self.assertFalse(result["ready"])
 
     def test_tool_contract_and_runtime_metadata_filter(self):
         class DummyROS:
@@ -49,6 +74,8 @@ class ArucoZonesTests(unittest.TestCase):
         tool = plugin.get_tool()
         self.assertEqual(tool["name"], "aruco_zones")
         self.assertEqual(tool["type"], "processor")
+        self.assertIn("7", tool["inputSchema"]["properties"]["waiting_marker_id"]["enum"])
+        self.assertIn("waiting_size", tool["configSchema"]["properties"])
         self.assertEqual(tool["topic_in"][0]["format"], "image/jpeg")
         self.assertEqual(tool["topic_out"][0]["topic"], "/tianyi/aruco_zones/overlay")
         self.assertEqual(tool["topic_out"][1]["format"], "data/json")

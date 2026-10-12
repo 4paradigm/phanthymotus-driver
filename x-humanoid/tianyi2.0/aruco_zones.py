@@ -10,9 +10,12 @@ LABELS = {"waiting": "待分拣区", "sorting_1": "分拣区 1", "sorting_2": "�
 DICTIONARIES = ("DICT_4X4_50", "DICT_4X4_100", "DICT_5X5_50", "DICT_6X6_50")
 DEFAULTS = {
     "dictionary": "DICT_4X4_50",
-    "waiting_rect": "",
-    "sorting_1_rect": "",
-    "sorting_2_rect": "",
+    "waiting_size": "",
+    "sorting_1_size": "",
+    "sorting_2_size": "",
+    "waiting_marker_id": "",
+    "sorting_1_marker_id": "",
+    "sorting_2_marker_id": "",
     "sorting_1_color": "red",
     "sorting_2_color": "blue",
 }
@@ -23,19 +26,31 @@ DRAW_COLORS = {
 }
 
 
-def parse_rect(value):
+def parse_size(value):
     if value is None or value == "":
         return None
     parts = value.split(",") if isinstance(value, str) else value
-    if not isinstance(parts, (list, tuple)) or len(parts) != 4:
-        raise ValueError("区域须为 x1,y1,x2,y2，坐标范围 0~1")
+    if not isinstance(parts, (list, tuple)) or len(parts) != 2:
+        raise ValueError("区域尺寸须为 宽,高，均为画面比例 0~1")
     try:
-        rect = [float(part) for part in parts]
+        size = [float(part) for part in parts]
     except (TypeError, ValueError) as exc:
-        raise ValueError("区域坐标必须是数字") from exc
-    if not (0 <= rect[0] < rect[2] <= 1 and 0 <= rect[1] < rect[3] <= 1):
-        raise ValueError("区域须满足 0 ≤ x1 < x2 ≤ 1、0 ≤ y1 < y2 ≤ 1")
-    return rect
+        raise ValueError("区域尺寸必须是数字") from exc
+    if not all(0 < side <= 1 for side in size):
+        raise ValueError("区域宽、高须大于 0 且不超过 1")
+    return size
+
+
+def parse_marker_id(value):
+    if value is None or value == "":
+        return None
+    try:
+        marker_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ArUco ID 必须是非负整数") from exc
+    if marker_id < 0 or str(marker_id) != str(value).strip():
+        raise ValueError("ArUco ID 必须是非负整数")
+    return marker_id
 
 
 def validate_config(raw):
@@ -45,45 +60,76 @@ def validate_config(raw):
     config = {**DEFAULTS, **raw}
     if config["dictionary"] not in DICTIONARIES:
         raise ValueError("不支持的 ArUco 字典")
-    rects = {role: parse_rect(config[f"{role}_rect"]) for role in ROLES}
-    present = [(role, rect) for role, rect in rects.items() if rect is not None]
-    for index, (role, rect) in enumerate(present):
-        for other_role, other in present[index + 1:]:
-            if max(rect[0], other[0]) < min(rect[2], other[2]) and (
-                    max(rect[1], other[1]) < min(rect[3], other[3])):
-                raise ValueError(f"{LABELS[role]}与{LABELS[other_role]}重叠")
+    sizes = {role: parse_size(config[f"{role}_size"]) for role in ROLES}
+    ids = [parse_marker_id(config[f"{role}_marker_id"]) for role in ROLES]
+    configured_ids = [marker_id for marker_id in ids if marker_id is not None]
+    if len(set(configured_ids)) != len(configured_ids):
+        raise ValueError("三个区域的 ArUco ID 必须不同")
+    marker_count = int(config["dictionary"].rsplit("_", 1)[1])
+    if any(marker_id >= marker_count for marker_id in configured_ids):
+        raise ValueError(f"当前字典的 ArUco ID 须小于 {marker_count}")
     for role in ("sorting_1", "sorting_2"):
         color = config[f"{role}_color"]
         if not isinstance(color, str) or not color.strip():
             raise ValueError("颜色标签不能为空")
         config[f"{role}_color"] = color.strip()
-    return config, rects
+    return config, sizes
 
 
-def assign_zones(markers, rects, width, height, config):
+def assign_zones(markers, sizes, width, height, config):
+    selected_ids = {role: parse_marker_id(config[f"{role}_marker_id"]) for role in ROLES}
+    assigned = {role: next((marker for marker in markers
+                            if marker["id"] == selected_ids[role]), None)
+                if selected_ids[role] is not None else None
+                for role in ROLES}
     zones = {}
     for role in ROLES:
-        rect = rects[role]
-        ids = [
-            marker["id"] for marker in markers
-            if rect is not None
-            and rect[0] <= marker["center_px"][0] / width <= rect[2]
-            and rect[1] <= marker["center_px"][1] / height <= rect[3]
-        ]
+        marker, size = assigned[role], sizes[role]
+        rect = None
+        clipped = False
+        center = None
+        if marker is not None:
+            center = [marker["center_px"][0] / width,
+                      marker["center_px"][1] / height]
+        if center is not None and size is not None:
+            raw = [center[0] - size[0] / 2, center[1] - size[1] / 2,
+                   center[0] + size[0] / 2, center[1] + size[1] / 2]
+            rect = [max(0.0, raw[0]), max(0.0, raw[1]),
+                    min(1.0, raw[2]), min(1.0, raw[3])]
+            clipped = rect != raw
         zones[role] = {
             "label": LABELS[role],
             "rect_normalized": rect,
-            "marker_id": ids[0] if len(ids) == 1 else None,
-            "marker_ids_in_region": ids,
+            "size_normalized": size,
+            "marker_id": marker["id"] if marker is not None else None,
+            "configured_marker_id": selected_ids[role],
+            "marker_visible": marker is not None,
+            "marker_center_normalized": center,
+            "clipped": clipped,
             "color": config[f"{role}_color"] if role != "waiting" else None,
         }
-    selected = [zone["marker_id"] for zone in zones.values()]
-    ready = (all(rects.values()) and all(marker_id is not None for marker_id in selected)
-             and len(set(selected)) == 3)
+    rects = [zone["rect_normalized"] for zone in zones.values()]
+    overlap = any(
+        max(first[0], second[0]) < min(first[2], second[2])
+        and max(first[1], second[1]) < min(first[3], second[3])
+        for index, first in enumerate(rects) if first is not None
+        for second in rects[index + 1:] if second is not None
+    )
+    chosen = [zone["marker_id"] for zone in zones.values()]
+    ambiguous_ids = [marker_id for marker_id in selected_ids.values()
+                     if marker_id is not None
+                     and sum(marker["id"] == marker_id for marker in markers) > 1]
+    ready = (all(rect is not None for rect in rects)
+             and len(set(chosen)) == len(ROLES)
+             and not ambiguous_ids and not overlap
+             and not any(zone["clipped"] for zone in zones.values()))
     return {
         "ready": ready,
         "zones": zones,
         "detected_marker_ids": [marker["id"] for marker in markers],
+        "assignment": "marker_id",
+        "ambiguous_detected_ids": ambiguous_ids,
+        "zones_overlap": overlap,
         "image_width": width,
         "image_height": height,
         "coordinate_system": "image_top_left_normalized_0_to_1",
@@ -91,7 +137,7 @@ def assign_zones(markers, rects, width, height, config):
     }
 
 
-def process_image(msg, config, rects):
+def process_image(msg, config, sizes):
     """Decode one ROS RGB Image, detect markers, and return JSON plus overlay JPEG."""
     import cv2
     import numpy as np
@@ -126,7 +172,7 @@ def process_image(msg, config, rects):
             cv2.polylines(frame, [np.rint(quad).astype(np.int32)], True, (0, 0, 255), 2)
             cv2.putText(frame, str(marker_id), tuple(map(round, center)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    result = assign_zones(markers, rects, width, height, config)
+    result = assign_zones(markers, sizes, width, height, config)
     for role, zone in result["zones"].items():
         rect = zone["rect_normalized"]
         if rect is None:
@@ -148,7 +194,7 @@ class ArucoZonesPlugin:
     def __init__(self, plugin_config, namespace, ros2):
         self._namespace = namespace.strip("/")
         self._ros2 = ros2
-        self._config, self._rects = validate_config({
+        self._config, self._sizes = validate_config({
             key: value for key, value in plugin_config.items() if key in DEFAULTS})
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
@@ -175,9 +221,14 @@ class ArucoZonesPlugin:
         properties = {"dictionary": {"type": "string", "enum": list(DICTIONARIES),
                                      "default": DEFAULTS["dictionary"]}}
         for role in ROLES:
-            properties[f"{role}_rect"] = {
+            properties[f"{role}_marker_id"] = {
+                "type": "string", "enum": [""] + [str(marker_id) for marker_id in range(100)],
+                "default": "",
+                "description": f"{LABELS[role]}对应的 ArUco ID；先在预览中查看识别结果",
+            }
+            properties[f"{role}_size"] = {
                 "type": "string", "default": "",
-                "description": f"{LABELS[role]}: x1,y1,x2,y2；左上角 0,0，右下角 1,1",
+                "description": f"{LABELS[role]}宽,高；占画面比例 0~1，以所选码中心为区域中心",
             }
         for role in ("sorting_1", "sorting_2"):
             properties[f"{role}_color"] = {
@@ -188,7 +239,7 @@ class ArucoZonesPlugin:
             "name": "aruco_zones",
             "type": "processor",
             "multiInstance": False,
-            "description": "识别天轶头部 RGB 画面中的 ArUco 并划分三区域；仅视觉，不抓取。",
+            "description": "按选定 ArUco ID 的实时位置与尺寸生成三区域；仅视觉，不抓取。",
             "topic_in": [{"format": "image/jpeg", "desc": "连接 camera_head 输出"}],
             "topic_out": self._outputs,
             "inputSchema": {
@@ -257,10 +308,10 @@ class ArucoZonesPlugin:
                 raise ValueError(f"请将 camera_head 输出 {self._camera_topic} 连接到此卡片")
             changes = {key: value for key, value in args.items() if key in DEFAULTS}
             with self._lifecycle_lock:
-                config, rects = validate_config({**self._config, **changes})
+                config, sizes = validate_config({**self._config, **changes})
                 self._ensure_ros_endpoints()
                 with self._lock:
-                    self._config, self._rects = config, rects
+                    self._config, self._sizes = config, sizes
                     self._input_topic = self._camera_topic
                     self._latest_frame = self._frame_at = self._last_data = None
                     if self._thread is not None and not self._thread.is_alive():
@@ -279,7 +330,7 @@ class ArucoZonesPlugin:
         if action == "config":
             changes = {key: value for key, value in args.items() if key in DEFAULTS}
             with self._lock:
-                self._config, self._rects = validate_config({**self._config, **changes})
+                self._config, self._sizes = validate_config({**self._config, **changes})
                 self._last_data = self._frame_at = None
             return self.dispatch("info", {})
         if action == "info":
@@ -312,12 +363,12 @@ class ArucoZonesPlugin:
             with self._lock:
                 frame = self._latest_frame
                 self._latest_frame = None
-                config, rects = dict(self._config), dict(self._rects)
+                config, sizes = dict(self._config), dict(self._sizes)
             if frame is None:
                 continue
             last_processed_at = now
             try:
-                result, jpeg = process_image(frame, config, rects)
+                result, jpeg = process_image(frame, config, sizes)
                 if self._stop.is_set():
                     break
                 overlay = CompressedImage()
