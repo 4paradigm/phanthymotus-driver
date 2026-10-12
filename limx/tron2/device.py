@@ -18,7 +18,7 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 DESCRIPTIONS = {
     'joint_state': 'TRON2 实时读取关节位置（rad/deg）、速度和力矩；名称缺失时显示索引',
     'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
-    'battery_state': 'TRON2 电量 soc（%）、电压 voltage、电流 current（厂家原始单位）；功率 power 单位未确认时为 null（只读）',
+    'battery_state': 'TRON2 电量 soc（%）、电压 voltage（mV）、电流 current（mA）、功率 power（W）；单位未确认时相关字段为 null（只读）',
 }
 
 

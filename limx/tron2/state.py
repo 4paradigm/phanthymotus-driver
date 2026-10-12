@@ -80,9 +80,10 @@ def battery_state(data):
     # Invalid or unverified current must not be presented as a real zero.
     current = battery_number(data.get('bms_current')) \
         if data.get('bms_current_valid') is True else None
-    return {'soc': soc if soc is not None and 0 <= soc <= 100 else None,
-            'voltage': voltage if voltage is not None and voltage >= 0 else None,
+    soc_valid = soc is not None and 0 <= soc <= 100
+    voltage_valid = voltage is not None and voltage >= 0
+    power = (voltage * current / 1000) if (voltage_valid and current is not None) else None
+    return {'soc': soc if soc_valid else None,
+            'voltage': voltage if voltage_valid else None,
             'current': current,
-            # Neither BMS scaling nor an explicit power field is documented.
-            # Multiplying raw voltage/current would not establish watts.
-            'power': None}
+            'power': round(power, 3) if power is not None else None}

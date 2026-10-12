@@ -82,11 +82,12 @@ class StateTests(unittest.TestCase):
         self.assertEqual(data['working_mode'], 'controller_mode')
         self.assertIsNone(data['sw_version'])
 
-    def test_battery_has_only_four_metrics_without_invented_scaling_or_power(self):
+    def test_battery_has_only_four_metrics_with_computed_power(self):
         source = info()['data']
         source.update(bms_current='-70', bms_current_valid=True, power=99)
         data = state.battery_state(source)
-        self.assertEqual(data, {'soc': 85, 'voltage': 52650, 'current': -70, 'power': None})
+        # power = 52650 * (-70) / 1000 = -3685.5
+        self.assertEqual(data, {'soc': 85, 'voltage': 52650, 'current': -70, 'power': -3685.5})
         # Extra temperatures/cycles and unsupported power are not published.
         self.assertEqual(set(data), {'soc', 'voltage', 'current', 'power'})
         for raw in ('UNKNOW', '101', '-1', None, True, 'nan'):
