@@ -184,7 +184,7 @@ FULL_PLUGINS = {
                            "waist_front_d415_depth"]},
     "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
     "estop": {"enabled": True},
-    "alerts": {"enabled": True, "poll_interval": 5.0}, "mc_mode": {"enabled": True},
+    "mc_mode": {"enabled": True},
     "loco": {"enabled": True}, "arm_control": {"enabled": True},
     "hand_control": {"enabled": True}, "head_control": {"enabled": True},
     "waist_control": {"enabled": True},
@@ -366,7 +366,7 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         for name in ("joints", "imu", "camera", "lidar_cloud", "battery", "estop",
-                     "alerts", "spatial_map"):
+                     "spatial_map"):
             self.assertEqual(by_name[name], "sensor", f"'{name}' must be a sensor tool")
 
     def test_pb_streams_withheld_without_wheel(self):
@@ -1342,7 +1342,7 @@ class RpcDispatchTests(unittest.TestCase):
             self.assertEqual(body["resource_type"], expected_type)
             self.transport.calls.clear()
 
-    # -- MDU motion_play / arm_compliance / alerts --
+    # -- MDU motion_play / arm_compliance --
 
     def test_motion_play_play_posts_path(self):
         motion = find_plugin(self.plugins, "motion_play")
@@ -1828,14 +1828,6 @@ class RpcDispatchTests(unittest.TestCase):
         arm.dispatch("compliance_enable", {})
         (url, _), = self.transport.calls_to("MotionControlMotionService", "EnableArmCompliance")
         self.assertIn("10.42.10.12:56322", url)
-
-    def test_alerts_cooldown_limits_rpc_rate(self):
-        alerts = find_plugin(self.plugins, "alerts")
-        self.transport.responses["HDSService"] = {"data": {"alerts": [{"code": 1}]}}
-        first = alerts.dispatch("query", {})
-        second = alerts.dispatch("query", {})  # within the 5 s cooldown → cached
-        self.assertEqual(self.transport.calls_to("HDSService", "GetAlertList").__len__(), 1)
-        self.assertEqual(first["alerts"], second["alerts"])
 
     # -- ADU controlled_spatial (mapping + navigation + relocalization + map query) --
 

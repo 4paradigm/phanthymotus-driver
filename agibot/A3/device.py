@@ -13,7 +13,6 @@ Compute-unit layout (fixed internal IPs, dev guide §3.2):
   - ADU 10.42.10.11 — :50807 Mapping/Localization/Topo, :53176 PncService navigation,
     :50583 SLAM relocalization
   - MDU 10.42.10.12 — :56322 MotionControlAction/MotionService, :56444 MotionCommand,
-    :50587 HDSService alerts
 The driver container must run on a third-party compute unit, never on the MDU.
 
 Protobuf-carrier topics use ros2_plugin_proto/msg/RosMsgWrapper (serialization_type
@@ -1478,9 +1477,6 @@ class A3Rpc:
 
     # -- MDU :50587 HDSService ---------------------------------------------------------
 
-    def get_alert_list(self) -> dict:
-        return self._unit(self.mdu_port, 50587).call("HDSService", "GetAlertList", {})
-
     # -- HDU :59301 TTSService / AgentControlService / HalAudioService mic ------------
 
     def play_tts(self, text: str, priority_level: str = "INTERACTION_L6", is_interrupted: bool = True,
@@ -1967,41 +1963,6 @@ class EstopPlugin:
         return {"state": "unavailable",
                 "reason": "estop 数据流需要 a3_aimdk protobuf wheel；"
                           "在机器人上挂载 /agibot-devkit 开发包后重启驱动"}
-
-
-class AlertsPlugin:
-    """HDSService/GetAlertList — poll-on-demand sensor. Dev guide hard limit: poll
-    frequency <= 0.2 Hz, enforced by a monotonic-clock cooldown between real RPCs."""
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-        interval = float(nodes.config.get("plugins", {}).get("alerts", {}).get("poll_interval", 5.0))
-        self._cooldown = max(interval, 5.0)
-        self._last_poll = 0.0
-        self._cached = None
-
-    def get_tool(self):
-        return tool("alerts", "sensor", "查询 HDS 告警列表（GetAlertList；含告警码/等级/中英文描述，<=0.2Hz 限频）")
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "running"}
-        now = time.monotonic()
-        if self._cached is None or now - self._last_poll >= self._cooldown:
-            response = self.nodes.rpc.get_alert_list()
-            self._cached = (response.get("data") or {}).get("alerts", [])
-            self._last_poll = now
-        return {"alerts": self._cached}
 
 
 class ModelPlugin:
@@ -4380,8 +4341,6 @@ def build_plugins(config, namespace, ros2):
         plugins["battery"] = BatteryPlugin(nodes)
     if enabled("estop"):
         plugins["estop"] = EstopPlugin(nodes)
-    if enabled("alerts"):
-        plugins["alerts"] = AlertsPlugin(nodes)
     if enabled("mc_mode"):
         plugins["mc_mode"] = McModePlugin(nodes)
     # loco/waist_control/face_play publish RosMsgWrapper commands and are withheld

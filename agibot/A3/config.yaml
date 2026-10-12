@@ -7,12 +7,12 @@ ros_namespace: "agibot_a3"
 
 # A3 splits its software across three compute units reached over fixed internal IPs
 # (AimDK v3.2 dev guide §7): HDU (interaction/audio/resources), ADU (mapping/navigation),
-# MDU (motion control/HDS alerts). The driver must run on a third-party compute unit
+# MDU (motion control). The driver must run on a third-party compute unit
 # (NOT on the MDU), so all control goes through these HTTP JSON RPC endpoints.
 rpc:
   hdu: "10.42.10.10"   # :59301 TTS/AgentControl, :56666 HalAudio, :51049 Resource
   adu: "10.42.10.11"   # :50807 Mapping/Localization, :53176 Pnc navi, :50583 SLAM relocalization
-  mdu: "10.42.10.12"   # :56322 MotionControlAction/Motion, :56444 MotionCommand, :50587 HDS alerts
+  mdu: "10.42.10.12"   # :56322 MotionControlAction/Motion, :56444 MotionCommand
   timeout: 5.0
 
 ros:
@@ -68,10 +68,6 @@ plugins:
     enabled: true
   estop:
     enabled: true
-  alerts:
-    enabled: true
-    # Dev guide hard limit: alert polling must stay <= 0.2 Hz (one call / 5s).
-    poll_interval: 5.0
   # --- actuators ---
   mc_mode:
     enabled: true

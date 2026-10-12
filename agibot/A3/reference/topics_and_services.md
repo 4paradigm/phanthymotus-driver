@@ -24,7 +24,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 |---|---|---|
 | HDU | 10.42.10.10 | interaction (TTS/agent/audio/mic), resources |
 | ADU | 10.42.10.11 | SLAM (mapping/localization/PnC/skills) |
-| MDU | 10.42.10.12 | motion control, HDS alerts |
+| MDU | 10.42.10.12 | motion control |
 
 ## Wired into this driver
 
@@ -37,7 +37,6 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | MotionControlActionService@MDU:56322 | GetAvailableActions | `mc_mode` (`available`) | |
 | MotionControlMotionService@MDU:56322 | Enable/Disable/CheckArmCompliance | `arm_control` (`compliance_enable`/`compliance_disable`/`compliance_check`) | all take `{}` |
 | MotionCommandService@MDU:56444 | SendMotionCommand | `motion_play` | `motion_id` is the motion file's **absolute path**; `cmd_end` auto-returns to initial pose |
-| HDSService@MDU:50587 | GetAlertList | `alerts` | hard doc limit ≤0.2 Hz — driver enforces a monotonic 5 s cooldown |
 | TTSService@HDU:59301 | PlayTTS | `tts` | `text` ≤1024 bytes, `priority_level` `INTERACTION_L6` |
 | TTSService@HDU:59301 | PlayMediaFile | `tts` (`play_media`) | |
 | TTSService@HDU:59301 | GetAudioStatus | `tts` (`status`) | by `trace_id` |
