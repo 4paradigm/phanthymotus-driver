@@ -41,9 +41,22 @@ class Adapter:
         self.registered_id = None
         self.core_ssl = True
 
+    def _battery_tool(self):
+        """Battery sensor — empty inputSchema, auto-publishes via topic_out (Unitree pattern)."""
+        return {'name': 'battery_state', 'type': 'sensor', 'multiInstance': False,
+            'description': DESCRIPTIONS['battery_state'],
+            'inputSchema': {'type': 'object', 'additionalProperties': False,
+                'properties': {**metadata_properties()}},
+            'topic_out': [{'topic': TOPICS['battery_state'], 'format': 'data/json'}]}
+
     def tools(self):
         tools = []
+        # Battery card uses Unitree pattern: no action required, auto-publish
+        if 'battery_state' in self.enabled:
+            tools.append(self._battery_tool())
         for name in self.enabled:
+            if name == 'battery_state':
+                continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
                 'inputSchema': {'type': 'object', 'additionalProperties': False,
@@ -71,6 +84,15 @@ class Adapter:
             raise ValueError('An action string is required')
         if name not in self.enabled:
             raise ValueError('Unknown tool; this driver exposes only parameter readers')
+        if name == 'battery_state':
+            # Battery card: only 'info' returns sample data; start/stop are no-ops
+            if action not in ('info', 'start', 'stop'):
+                raise ValueError('Unsupported sensor action')
+            result = {'state': 'idle' if action == 'stop' else 'running', 'read_only': True,
+                      'always_on': True, 'topic_out': [{'topic': TOPICS[name], 'format': 'data/json'}]}
+            if action == 'info':
+                result['sample'] = self.reader.sample(name)
+            return result
         if action not in ('info', 'start', 'stop'):
             raise ValueError('Unsupported sensor action')
         # Single-instance sensors remain on; lifecycle calls do not affect the robot.
