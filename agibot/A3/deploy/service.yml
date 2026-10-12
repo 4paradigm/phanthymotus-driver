@@ -33,11 +33,12 @@ agibot-a3:
     # then forwards those small samples to domain 42 through its child bridge.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - A3_JAZZY_RELAY=1
-    # Camera relay is fully demand-driven. A card start writes its stream key
-    # to the shared control file; stopping/removing the card removes it. Keep
-    # this explicitly empty so a restart never revives stale camera streams.
-    - A3_RELAY_STREAMS=head_left_fisheye,head_right_fisheye,head_rear_fisheye,head_stereo_left_fisheye,head_stereo_right_fisheye,armpit_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth,waist_front_d415_rgb,waist_front_d415_depth
-    - A3_RELAY_ACTIVE_STREAMS=
+    # Subscribe all configured camera inputs at startup. The relay still bounds
+    # memory/CPU with resize, JPEG quality and newest-frame replacement; relying
+    # on canvas start/stop made the stream disappear when lifecycle callbacks
+    # were not delivered by the frontend.
+    - A3_RELAY_STREAMS=head_left_fisheye,head_right_fisheye,head_rear_fisheye,head_stereo_left_fisheye,head_stereo_right_fisheye,armpit_right_fisheye,wrist_left_d405_rgb,wrist_right_d405_rgb,chest_front_d457_rgb,chest_front_d457_depth,waist_front_d415_rgb,waist_front_d415_depth
+    - A3_RELAY_ACTIVE_STREAMS=head_left_fisheye,head_right_fisheye,head_rear_fisheye,head_stereo_left_fisheye,head_stereo_right_fisheye,armpit_right_fisheye,wrist_left_d405_rgb,wrist_right_d405_rgb,chest_front_d457_rgb,chest_front_d457_depth,waist_front_d415_rgb,waist_front_d415_depth
     - A3_RELAY_CONTROL_FILE=/opt/phanthy-motus/data/a3-relay/active_streams
     - PYTHONUNBUFFERED=1
   logging:

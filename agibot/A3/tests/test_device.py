@@ -2439,7 +2439,10 @@ class MirrorStreamTests(unittest.TestCase):
             w=0.0, x=0.7071068, y=0.0, z=0.7071068))
         self._callback("/ros2/body_drive/pelvis_imu/data")(imu)
         payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
-        self.assertEqual(payload["imu_quat"], [0.0, 0.7071068, 0.0, 0.7071068])
+        self.assertAlmostEqual(payload["imu_quat"][0], 0.0, places=6)
+        self.assertAlmostEqual(payload["imu_quat"][1], 0.7071068, places=6)
+        self.assertAlmostEqual(payload["imu_quat"][2], 0.0, places=6)
+        self.assertAlmostEqual(payload["imu_quat"][3], 0.7071068, places=6)
 
     def test_audio_normalization_reads_audio_capture_info_metadata(self):
         msg = types.SimpleNamespace(info=types.SimpleNamespace(

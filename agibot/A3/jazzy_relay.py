@@ -23,6 +23,8 @@ CAMERAS = {
     "head_stereo_left_fisheye": "/hal/head_stereo_left_fisheye_camera/rgb",
     "head_stereo_right_fisheye": "/hal/head_stereo_right_fisheye_camera/rgb",
     "armpit_right_fisheye": "/hal/armpit_right_fisheye_camera/rgb",
+    "wrist_left_d405_rgb": "/hal/wrist_left_d405_camera/rgb",
+    "wrist_right_d405_rgb": "/hal/wrist_right_d405_camera/rgb",
     "chest_front_d457_rgb": "/hal/chest_front_d457_camera/rgb",
     "chest_front_d457_depth": "/hal/chest_front_d457_camera/depth",
     "waist_front_d415_rgb": "/hal/waist_front_d415_camera/rgb",
@@ -30,9 +32,9 @@ CAMERAS = {
 }
 
 # The relay runs on the host, but inherits this environment from the driver
-# container. Keep the default set aligned with config.yaml so unused raw
-# cameras do not consume CPU. Operators can opt in to an additional key with
-# A3_RELAY_STREAMS without changing the relay code.
+# container. All configured inputs are subscribed at startup. Each stream has
+# a one-slot latest-frame queue and a bounded output rate, so an absent or slow
+# camera cannot block the rest of the media lanes.
 _requested = {item.strip() for item in os.environ.get(
     "A3_RELAY_STREAMS",
     ",".join(CAMERAS),
@@ -53,7 +55,10 @@ def _active_streams():
     try:
         with open(_control_file, "r", encoding="utf-8") as handle:
             requested = {line.strip() for line in handle if line.strip()}
-        return requested & set(CAMERAS)
+        # An empty control file is a valid legacy state, but the driver now
+        # deliberately keeps all configured streams alive. Never let a stale
+        # frontend stop event tear down the raw subscriptions.
+        return (requested or set(CAMERAS)) & set(CAMERAS)
     except OSError:
         return _default_active & set(CAMERAS)
 

@@ -22,6 +22,8 @@ cards:
   - { name: camera_head_rear,  type: sensor }
   - { name: camera_head_stereo_left, type: sensor }
   - { name: camera_head_stereo_right, type: sensor }
+  - { name: camera_wrist_left, type: sensor }
+  - { name: camera_wrist_right, type: sensor }
   - { name: camera_armpit_right, type: sensor }
   - { name: camera_chest_rgb,  type: sensor }
   - { name: camera_chest_depth, type: sensor }

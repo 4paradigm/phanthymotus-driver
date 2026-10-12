@@ -39,15 +39,11 @@ plugins:
     # Which camera streams to mirror; keys of the CAMERA_TOPICS table in device.py.
     # RGB is re-encoded to JPEG and depth to zlib-compressed uint16 on the fly
     # (default includes chest D457 depth, image/depth-zlib).
-    # Wrist D405 topics exist on the robot, but the deployed hal_depth_camera_node
-    # currently publishes no samples. Keep them out of the live card inventory
-    # until the vendor node is repaired; see README.md.
-    # Keep the default live set small. The host relay still has the other
-    # topic mappings for explicit opt-in, but encoding ten raw cameras at once
-    # starves state/command traffic on the ADU CPU.
-    # All non-wrist cards are advertised. Raw camera subscriptions are opened
-    # only when the corresponding canvas card is started and closed on stop.
-    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth"]
+    # The wrist D405 topics are included deliberately: the robot firmware may
+    # advertise them even when a particular unit emits no frames. The relay
+    # keeps every input subscription alive and uses one-slot newest-frame
+    # queues, so a missing wrist publisher does not block the other cameras.
+    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye", "wrist_left_d405_rgb", "wrist_right_d405_rgb", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth"]
   camera_head_left:
     enabled: true
   camera_head_right:

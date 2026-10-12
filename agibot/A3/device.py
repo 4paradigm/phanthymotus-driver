@@ -121,6 +121,12 @@ MC_ACTIONS = {
     "get_up": ("MotionControlAction_GET_UP", "GET_UP"),
     "lie_down": ("MotionControlAction_LIE_DOWN", "LIE_DOWN"),
     "passive": ("MotionControlAction_PASSIVE", "PASSIVE"),
+    # GetUp is an asynchronous recovery action on A3.  Once its balance
+    # sequence finishes, firmware exposes MOTION/PD_STAND as separate mode
+    # transitions; without this explicit second step the robot can remain in
+    # GET_UP (or PASSIVE) and correctly reject every actuator command.
+    "motion": ("MotionControlAction_MOTION", "MOTION"),
+    "pd_stand": ("MotionControlAction_PD_STAND", "PD_STAND"),
 }
 
 # motion_play duration ceiling — must stay consistent with the 600 s x-completion
@@ -1251,7 +1257,7 @@ class A3Nodes:
                 # skeleton renderer applies q as a revolute angle. Keep the
                 # abstract hand axes within a useful visual range instead of
                 # rotating thousands of radians.
-                if group_key == "hand":
+                if group_key == "hand_state":
                     position = float(position) / HAND_O10_MAX * (math.pi / 2)
                 joints.append({"idx": model_indices[canonical], "name": canonical,
                                "q": position,
@@ -1265,8 +1271,9 @@ class A3Nodes:
         if isinstance(orientation, dict):
             try:
                 candidate = [float(orientation[key]) for key in ("w", "x", "y", "z")]
-                if all(math.isfinite(value) for value in candidate):
-                    imu_quat = candidate
+                norm = math.sqrt(sum(value * value for value in candidate))
+                if all(math.isfinite(value) for value in candidate) and norm > 1e-6:
+                    imu_quat = [value / norm for value in candidate]
             except (KeyError, TypeError, ValueError):
                 pass
         output.data = json.dumps({"format": "sensor/skeleton", "available": bool(joints),
@@ -1615,11 +1622,9 @@ def _set_relay_stream(stream_name, enabled):
 def _ensure_relay_defaults():
     """Seed the shared relay state once per deployment.
 
-    The relay is demand-driven: a restarted driver must not resurrect raw
-    camera subscriptions left behind by a previous canvas session.  An
-    explicitly configured value (including an empty value) therefore resets
-    the file on startup; the implicit fallback is only used by standalone
-    callers that do not configure the variable.
+    Seed the relay with the configured startup set. Camera lifecycle callbacks
+    may be absent when the frontend only subscribes to the advertised topic,
+    so the relay must have a stable set of inputs before any card is opened.
     """
     path = os.environ.get("A3_RELAY_CONTROL_FILE", "/opt/phanthy-motus/data/a3-relay/active_streams")
     configured = os.environ.get("A3_RELAY_ACTIVE_STREAMS")
@@ -1833,7 +1838,10 @@ class CameraStreamPlugin:
 
     def dispatch(self, action, args):
         if action == "stop":
-            _set_relay_stream(self.stream_name, False)
+            # Keep the raw subscription alive across canvas lifecycle events.
+            # The frontend can stop rendering a card without sending a reliable
+            # lifecycle event; removing the DDS subscription here makes the
+            # advertised stream disappear until the next container restart.
             return {"state": "idle", "topic_out": [{"topic": self.stream["topic"], "format": self.stream["format"]}]}
         if action == "start":
             _set_relay_stream(self.stream_name, True)
@@ -2008,10 +2016,12 @@ class ModelPlugin:
 #   DAMPING / PASSIVE / LIE_DOWN / (unknown resting states) → only GET_UP
 #   MOTION (standing after get_up) → DAMPING / LIE_DOWN / PASSIVE
 MC_STATE_TRANSITIONS = {
-    "MOTION": ("damping", "lie_down", "passive"),
+    "MOTION": ("damping", "lie_down", "passive", "get_up"),
     "DAMPING": ("get_up",),
     "PASSIVE": ("get_up",),
     "LIE_DOWN": ("get_up",),
+    "GET_UP": ("motion", "pd_stand"),
+    "PD_STAND": ("motion",),
     # IDLE/UNKNOWN and any unmapped state: mc_mode still consults the runtime list;
     # actuator cards use _motion_gate below and fail closed when state is unknown.
 }
@@ -2028,7 +2038,7 @@ def _mc_allowed_actions(state: str):
         return tuple(MC_ACTIONS)
     # MOTION also accepts GET_UP as a no-op re-stand; resting states reject it too
     if state == "MOTION":
-        return MC_STATE_TRANSITIONS["MOTION"] + ("get_up",)
+        return MC_STATE_TRANSITIONS["MOTION"]
     # IDLE and any unmapped state behave like a resting state: only get_up
     return MC_STATE_TRANSITIONS.get(state, ("get_up",))
 
@@ -2113,7 +2123,7 @@ class McModePlugin:
     """mc_mode 卡片：运动控制状态机查询 + 模式切换（原 mc_state 状态卡并入）。
 
     对应 MDU MotionControlActionService：SetAction 切换 GetUp/LieDown/Damping/
-    Passive（异步，返回 PENDING，结果经 get_state 轮询 GetAction 确认）；
+    Passive/MOTION/PD_STAND（异步，返回 PENDING，结果经 get_state 轮询 GetAction 确认）；
     get_state / available 合并自原 mc_state 卡（GetAction / GetAvailableActions）。
 
     固定状态机（开发文档 §7.1.2 + GetUp 示例流程）：DAMPING/PASSIVE/LIE_DOWN/
@@ -2131,6 +2141,8 @@ class McModePlugin:
             ("get_up", "执行 GetUp 起身动作，从坐/躺恢复到站立平衡（MOTION）"),
             ("lie_down", "执行 LieDown 坐/躺下动作（仅 MOTION 站立态可进入）"),
             ("passive", "进入 Passive 拖动示教模式（仅 MOTION 站立态可进入）"),
+            ("motion", "GetUp 完成后切入 MOTION 运行态（执行动作卡前必须完成）"),
+            ("pd_stand", "GetUp 完成后进入 PD_STAND 稳定站立态"),
         )
     }
 
@@ -2144,8 +2156,8 @@ class McModePlugin:
         # right here. Aborting a controlled get_up/lie_down partway is how a robot
         # falls over.
         return tool("mc_mode", "actuator", "运动控制状态机查询与模式切换（SetAction：get_up/lie_down/damping/passive；"
-                                          "get_state/available 查询当前动作与可用动作；固定迁移：非站立态仅 get_up，"
-                                          "MOTION 可 damping/lie_down/passive，非法迁移返回建议）",
+                                          "get_state/available 查询当前动作与可用动作；get_up 完成后还需 motion/PD_STAND 进入可控的 MOTION，"
+                                          "非法迁移返回建议）",
                     action_schema(self.ACTIONS, {}))
 
     def start(self):
@@ -4327,6 +4339,8 @@ def build_plugins(config, namespace, ros2):
         "camera_head_stereo_left": "head_stereo_left_fisheye",
         "camera_head_stereo_right": "head_stereo_right_fisheye",
         "camera_armpit_right": "armpit_right_fisheye",
+        "camera_wrist_left": "wrist_left_d405_rgb",
+        "camera_wrist_right": "wrist_right_d405_rgb",
         "camera_waist_rgb": "waist_front_d415_rgb",
         "camera_waist_depth": "waist_front_d415_depth",
     }
