@@ -29,7 +29,8 @@ def load_module(name, filename):
 
 # Other drivers also have a bare `hardware` import. Do not pollute their tests.
 hardware = load_module("franka_test_hardware", "hardware.py")
-with mock.patch.dict(sys.modules, {"hardware": hardware}):
+discovery = load_module("franka_test_discovery", "discovery.py")
+with mock.patch.dict(sys.modules, {"hardware": hardware, "discovery": discovery}):
     device = load_module("franka_test_device", "device.py")
 
 
@@ -106,8 +107,9 @@ class FrankaCardTests(unittest.TestCase):
 
         self.plugin = device.FrankaPlugin(
             {}, namespace="test_franka", manager=self.manager,
-            publisher_factory=publisher_factory,
+            publisher_factory=publisher_factory, discovery=mock.Mock(),
         )
+        self.plugin._discovery.snapshot.return_value = {"state": "ready", "robots": []}
         self.addCleanup(self.plugin.stop)
         self.bundle = DriverBundle([self.plugin])
 
@@ -145,6 +147,80 @@ class FrankaCardTests(unittest.TestCase):
                 }))
         self.assertEqual(self.sessions, [])
         self.assertEqual(self.publishers, [])
+
+    def test_discovery_options_preserve_configured_offline_ip(self):
+        self.call(action="config", robot_ip="172.16.0.8")
+        self.plugin._discovery.snapshot.return_value = {"state": "ready", "robots": [
+            {"ip": "172.16.0.3", "label": "Franka FR3 · TEST · 172.16.0.3"}]}
+        schema = self.plugin.get_tools()[0]["configSchema"]["properties"]
+        options = {row["const"]: row["title"] for row in schema["robot_ip"]["oneOf"]}
+        self.assertIn("172.16.0.3", options)
+        self.assertIn("172.16.0.8", options)
+        self.assertIn("暂未发现", options["172.16.0.8"])
+        self.assertIn("__manual__", options)
+        self.assertTrue(schema["manual_robot_ip"]["x-sensitive"])
+        self.assertTrue(schema["manual_robot_ip"]["advanced"])
+
+    def test_manual_selection_resolves_ip_and_requires_value(self):
+        with self.assertRaisesRegex(ValueError, "manual_robot_ip"):
+            self.call(action="config", robot_ip="__manual__")
+        result = self.call(action="start", robot_ip="__manual__", manual_robot_ip="172.16.0.3")
+        self.assertEqual(result["robot_ip"], "172.16.0.3")
+        self.assertEqual(self.sessions[0].address, "172.16.0.3")
+
+    def test_manual_option_remains_available_with_no_discovery_results(self):
+        for state in ("idle", "scanning", "ready", "partial", "error"):
+            self.plugin._discovery.snapshot.return_value = {"state": state, "robots": []}
+            schema = self.plugin.get_tools()[0]["configSchema"]["properties"]
+            self.assertEqual([row["const"] for row in schema["robot_ip"]["oneOf"]],
+                             ["__manual__"])
+
+    def test_manual_partial_update_changes_target_and_survives_stop(self):
+        self.call(action="config", robot_ip="__manual__", manual_robot_ip="172.16.0.3")
+        result = self.call(action="config", manual_robot_ip="172.16.0.2")
+        self.assertEqual(result["robot_ip"], "172.16.0.2")
+        self.call(action="start")
+        self.call(action="stop")
+        result = self.call(action="start", manual_robot_ip="172.16.0.3")
+        self.assertEqual(result["robot_ip"], "172.16.0.3")
+        self.assertEqual([s.address for s in self.sessions], ["172.16.0.2", "172.16.0.3"])
+
+    def test_shared_manual_defaults_accept_partial_updates(self):
+        self.bundle.dispatch("joint_states", {
+            "action": "config", "robot_ip": "__manual__", "manual_robot_ip": "172.16.0.3"})
+        self.bundle.dispatch("joint_states", {
+            "action": "config", "manual_robot_ip": "172.16.0.2"})
+        result = self.call(action="start")
+        self.assertEqual(result["robot_ip"], "172.16.0.2")
+        options = self.plugin.get_tools()[0]["configSchema"]["properties"]["robot_ip"]["oneOf"]
+        self.assertEqual(sum(row["const"] == "__manual__" for row in options), 1)
+
+    def test_ignored_manual_field_does_not_restart_or_reject_active_card(self):
+        self.start_card()
+        result = self.call(action="start", manual_robot_ip="unused")
+        self.assertEqual(result["robot_ip"], "172.16.0.3")
+        self.assertEqual(len(self.sessions), 1)
+        self.assertEqual(len(self.publishers), 1)
+        result = self.call(action="config", robot_ip="__manual__", manual_robot_ip="172.16.0.3")
+        self.assertEqual(result["robot_ip"], "172.16.0.3")
+        with self.assertRaisesRegex(ValueError, "Stop this card"):
+            self.call(action="config", manual_robot_ip="172.16.0.2")
+        self.assertEqual(self.call()["robot_ip"], "172.16.0.3")
+
+    def test_configured_instance_keeps_frequency_when_shared_defaults_change(self):
+        self.call(action="config", robot_ip="172.16.0.3")
+        self.bundle.dispatch("joint_states", {"action": "config", "publish_hz": 20})
+        self.call(action="start")
+        self.assertEqual(self.publishers[0].hz, 10)
+
+    def test_dropdown_wins_over_manual_value_and_active_card_does_not_rescan(self):
+        self.plugin.start()
+        self.plugin._discovery.refresh.reset_mock()
+        result = self.call(action="start", robot_ip="172.16.0.3", manual_robot_ip="172.16.0.2")
+        self.assertEqual(result["robot_ip"], "172.16.0.3")
+        self.plugin._discovery.refresh.reset_mock()
+        self.plugin.get_tools()
+        self.plugin._discovery.refresh.assert_not_called()
 
     def test_driver_start_and_unconfigured_info_do_not_open_hardware(self):
         self.bundle.start_all()

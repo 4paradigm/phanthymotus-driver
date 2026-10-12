@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 
 from common.vendor_runtime import tool
+from discovery import Discovery
 from hardware import SessionManager, canonical_ip
 
 
@@ -59,6 +60,7 @@ class RosPublisher:
 class _Instance:
     def __init__(self):
         self.lock = threading.RLock()
+        self.selection = {}
         self.config = {}
         self.session = None
         self.publisher = None
@@ -72,7 +74,7 @@ class FrankaPlugin:
     PREFIX = "joint_states"
 
     def __init__(self, config, namespace="franka", ros2=None, *, manager=None,
-                 publisher_factory=None):
+                 publisher_factory=None, discovery=None):
         self._namespace = namespace.strip("/") or "franka"
         self._manager = manager if manager is not None else SessionManager()
         self._publisher_factory = publisher_factory or (
@@ -82,10 +84,36 @@ class FrankaPlugin:
         self._instances = {}
         self._defaults = {}
         self._closed = False
+        self._started = False
+        self._discovery = discovery if discovery is not None else Discovery()
         resource = Path(__file__).with_name("resource") / "fr3.urdf"
         self._urdf = resource.read_text(encoding="utf-8")
 
     def get_tools(self):
+        with self._lock:
+            configs = [self._validate(self._defaults),
+                       *(instance.config for instance in self._instances.values())]
+            configured_ips = {cfg["robot_ip"] for cfg in configs if cfg.get("robot_ip")}
+            can_scan = self._started and not self._closed and not any(
+                instance.session is not None for instance in self._instances.values())
+        if can_scan:
+            self._discovery.refresh()
+        discovery = self._discovery.snapshot()
+        options = {robot["ip"]: robot["label"] for robot in discovery["robots"]}
+        for ip in sorted(configured_ips):
+            options.setdefault(ip, f"已配置 · {ip}（暂未发现）")
+        ip_schema = {
+            "type": "string", "title": "机械臂", "scope": "instance", "x-sensitive": True,
+            "description": "自动发现有线网络中的 FR3，按序列号和 IP 选择。原设备不在列表时，请手动填回其 IP 后再保存。",
+            "oneOf": [{"const": ip, "title": label} for ip, label in options.items()]
+                     + [{"const": "__manual__", "title": "手动输入 IP（展开高级设置）"}],
+        }
+        if not options:
+            ip_schema["description"] = (
+                "正在自动发现 FR3，可稍后重新打开配置；也可选择手动输入 IP。"
+                if discovery["state"] == "scanning" else
+                "暂未发现 FR3，请选择手动输入 IP；自动发现仅支持直连有线 /24–/30 网段。"
+            )
         definition = tool(
             self.PREFIX, "sensor",
             "Franka FR3：读取七个关节的实际角度并显示姿态；只读，不触发运动。",
@@ -95,15 +123,16 @@ class FrankaPlugin:
         definition["configSchema"] = {
             "type": "object",
             "properties": {
-                "robot_ip": {
-                    "type": "string", "title": "机械臂 IP", "scope": "instance",
-                    "x-sensitive": True,
-                    "description": "Franka 控制柜的 IP；相同 IP 的卡片共享状态读取连接。",
-                },
+                "robot_ip": ip_schema,
                 "publish_hz": {
                     "type": "number", "title": "显示频率 (Hz)", "scope": "instance",
                     "minimum": 1, "maximum": 30, "default": 10,
                     "description": "画布状态发布频率，不是机械臂控制频率。",
+                },
+                "manual_robot_ip": {
+                    "type": "string", "title": "手动 IP", "scope": "instance",
+                    "x-sensitive": True, "advanced": True,
+                    "description": "仅在机械臂选择“手动输入 IP”时使用；选择已发现设备时忽略。",
                 },
             },
             "required": ["robot_ip"],
@@ -111,14 +140,19 @@ class FrankaPlugin:
         return [definition, tool("model", "resource", "Franka FR3 七轴运动链 URDF，供姿态显示使用。")]
 
     def start(self):
-        # Registering the driver never opens robot connections.
-        pass
+        # Discovery reads Desk identity only; it never opens an FCI connection.
+        with self._lock:
+            if self._closed:
+                return
+            self._started = True
+        self._discovery.refresh()
 
     def stop(self):
         with self._lock:
             self._closed = True
             instances = list(self._instances.items())
         errors = []
+        self._discovery.close()
         for key, instance in instances:
             try:
                 with instance.lock:
@@ -162,6 +196,10 @@ class FrankaPlugin:
         cfg = dict(cfg)
         if "robot_ip" in cfg:
             value = cfg["robot_ip"]
+            if value == "__manual__":
+                value = cfg.get("manual_robot_ip", "")
+                if not value:
+                    raise ValueError("Fill in manual_robot_ip in advanced settings")
             if not isinstance(value, str):
                 raise ValueError("robot_ip must be an IP address string")
             # Clearing a saved field is allowed while idle, but cannot connect.
@@ -176,6 +214,8 @@ class FrankaPlugin:
         if not math.isfinite(hz) or not 1 <= hz <= 30:
             raise ValueError("publish_hz must be a number from 1 to 30")
         cfg["publish_hz"] = hz
+        # UI selection metadata must not change a running connection's identity.
+        cfg.pop("manual_robot_ip", None)
         return cfg
 
     def _info(self, instance_id, instance):
@@ -267,14 +307,16 @@ class FrankaPlugin:
             return None
         if action not in ("config", "start", "stop", "info"):
             return None
-        allowed = ("robot_ip", "publish_hz")
+        allowed = ("robot_ip", "manual_robot_ip", "publish_hz")
         supplied = {key: args[key] for key in allowed if key in args}
         if action == "config" and args.get("instance_id", "") == "":
             # Core's sidebar may send instance fields as shared defaults.
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Driver is shutting down")
-                self._defaults = self._validate({**self._defaults, **supplied})
+                selection = {**self._defaults, **supplied}
+                self._validate(selection)
+                self._defaults = selection
             return {"state": "configured", "read_only": True}
         instance_id = self._instance_id(args)
         instance = self._get_instance(instance_id)
@@ -293,9 +335,13 @@ class FrankaPlugin:
                     defaults = dict(self._defaults)
                 if action == "start" and self._start_cancelled(instance, epoch):
                     return self._info(instance_id, instance)
-                cfg = self._validate({**defaults, **instance.config, **supplied})
+                # Preserve manual mode for partial config updates, separately
+                # from the resolved IP/frequency used by sessions and publishers.
+                selection = {**defaults, **instance.selection, **supplied}
+                cfg = self._validate(selection)
                 if instance.session is not None and cfg != instance.config:
                     raise ValueError("Stop this card before changing its IP or publish frequency")
+                instance.selection = {**selection, "publish_hz": cfg["publish_hz"]}
                 instance.config = cfg
                 if action == "start" and instance.session is None:
                     if not cfg.get("robot_ip"):

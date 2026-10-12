@@ -7,9 +7,47 @@ using the same IP share one state reader; different IPs have independent readers
 and retry timers. No IP, credentials or installation-specific configuration is
 embedded in the image.
 
+The gear menu automatically lists discovered FR3s by model, serial number and
+IP. Choose a robot and save; this does not connect to FCI until the card starts.
+Choose **手动输入 IP** and fill **手动 IP** under advanced settings for an
+unlisted robot. This option remains available even when no devices are found,
+so a saved manual selection keeps the same form after a restart or scan failure.
+Existing IP-only configurations continue to work when starting a card.
+
+Discovery reads Desk HTML and one `/admin/api/robot/nameplate` WebSocket message;
+it never uses FCI or sends control commands. It runs asynchronously on startup,
+then refreshes its cache at most every two minutes when tool descriptions are
+requested and no card is reading state. Core's normal registration refresh
+fetches the schema; reopen the gear menu after discovery, or refresh the console
+if it still has an older description. No Core changes or additional cards are
+required. Discovery does not change an already selected IP.
+
+Only UP physical wired interfaces with directly connected private IPv4 /24–/30
+subnets are scanned (up to four, 12 concurrent probes, a 60-second scan budget).
+When the budget expires, unfinished probes are cancelled and already identified
+robots remain available.
+Wi-Fi, bridges and broad LAN subnets are excluded. Hosts receive bounded HTTPS
+probes; only matching FR3 Desk pages and connected FR3 nameplates are listed.
+Discovery is a device-type filter on a trusted local network, not authentication:
+Desk certificates name `robot.franka.de`, so IP discovery skips certificate
+verification, sends no credentials, ignores proxies/cookies and rejects redirects.
+The observed Desk identity endpoint may change with firmware. Discovery failure
+never blocks manual configuration or state reads, and discovery is not proof of
+FCI readiness. Configured IPs known to this driver process remain selectable if
+temporarily absent.
+
+**Core dropdown limitation:** Core saves card settings without sending them to
+the driver until startup. An IP saved before discovery finishes, or before a
+driver restart, may therefore be absent from the driver's dropdown. Core shows
+an empty selection in that case and saving it would omit the saved IP. Before
+saving, choose the manual option and enter the original IP; do not choose another
+arm to dismiss an empty selection. Starting an existing card without editing its
+configuration continues to use its saved IP. Fully preserving unknown saved
+options requires a Core form change, which is outside this driver change.
+
 | Card | Type | Configuration | Output |
 | --- | --- | --- | --- |
-| `joint_states` | multi-instance sensor | `robot_ip`, `publish_hz` (1–30, default 10 Hz) | `sensor/skeleton`, seven actual joint angles in radians |
+| `joint_states` | multi-instance sensor | discovered `robot_ip` or advanced `manual_robot_ip`; `publish_hz` (1–30, default 10 Hz) | `sensor/skeleton`, seven actual joint angles in radians |
 | `model` | resource | none | FR3 visualization URDF |
 
 ## Requirements
@@ -74,12 +112,13 @@ device mounts or real-time capabilities are required for this reader.
 
 The driver ID is **franka-fr3-driver** and its MCP port is **15723**. It registers
 as **Franka FR3** with Core, which assigns its own MCP record ID. Starting the
-container only registers cards; it does not connect to robots until a
-`joint_states` card is started.
+container registers cards and starts read-only Desk discovery; an FCI state
+connection is opened only when a `joint_states` card is started.
 
 ## Canvas workflow
 
-1. Add a `joint_states` card and set its robot IP with the card gear button.
+1. Add a `joint_states` card and select its robot with the card gear button,
+   or use the manual option and advanced IP field.
 2. Start the project. The card reports `loading` until a valid sample arrives,
    then `running`. Its info response includes `connected`, `readiness`,
    `data_age_ms` and `error` for diagnosis without a separate status card.
@@ -125,16 +164,17 @@ IP, info response and topic when using several robots.
 ## Development checks
 
 ```bash
-python3 -m pytest tests/test_franka_hardware.py tests/test_franka_driver.py
+python3 -m pip install -r franka/fr3/requirements.txt pytest
+python3 -m pytest tests/test_franka_hardware.py tests/test_franka_driver.py tests/test_franka_discovery.py
 python3 -m pytest tests/test_dockerfile_copies.py tests/test_common_lifecycle.py
 python3 scripts/check_service_yml.py franka/fr3
 ```
 
 Tests use process and DDS fixtures. Hardware validation must additionally confirm
 real FCI samples and DDS reception inside Core; successful HTTP registration is
-not sufficient. Only one real arm is available in the initial setup: multi-IP
-isolation is tested with fixtures and an unreachable second IP, not claimed as a
-multi-arm hardware test.
+not sufficient. Two physical FR3s have been verified for discovery; only one has
+been validated for FCI state reads. Multi-IP reader isolation is tested with
+fixtures and an unreachable second IP, not claimed as a multi-arm FCI test.
 
 
 ## Hardware validation scope

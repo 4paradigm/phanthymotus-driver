@@ -1,3 +1,4 @@
-# Docker supplies PyYAML and rclpy through Ubuntu/ROS packages.
+# Docker supplies PyYAML, aiohttp and rclpy through Ubuntu/ROS packages.
 # The native reader is built separately against the pinned libfranka release.
 PyYAML>=5.4.1,<7
+aiohttp>=3.8,<4
