@@ -5,7 +5,7 @@ STATUS_FIELDS = ('imu', 'camera', 'motor', 'sw_version', 'status',
                  'tele_operation', 'working_mode', 'working_mode_valid',
                  'collision_enable', 'collision_enable_valid',
                  'compliant_enable', 'compliant_enable_valid')
-BATTERY_FIELDS = ('soc', 'voltage', 'current', 'power')
+BATTERY_FIELDS = ('soc', 'voltage', 'current', 'power', 'temp')
 
 
 def vector(value, count, field):
@@ -82,8 +82,10 @@ def battery_state(data):
         if data.get('bms_current_valid') is True else None
     soc_valid = soc is not None and 0 <= soc <= 100
     voltage_valid = voltage is not None and voltage >= 0
+    temp = battery_number(data.get('bms_temp1'))
     power = (voltage * current / 1000) if (voltage_valid and current is not None) else None
     return {'soc': soc if soc_valid else None,
             'voltage': voltage if voltage_valid else None,
             'current': current,
-            'power': round(power, 3) if power is not None else None}
+            'power': round(power, 3) if power is not None else None,
+            'temp': temp}

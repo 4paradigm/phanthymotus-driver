@@ -84,10 +84,11 @@ class StateTests(unittest.TestCase):
 
     def test_battery_has_only_four_metrics_with_computed_power(self):
         source = info()['data']
-        source.update(bms_current='-70', bms_current_valid=True, power=99)
+        source.update(bms_current='-70', bms_current_valid=True, power=99, bms_temp1='35')
         data = state.battery_state(source)
         # power = 52650 * (-70) / 1000 = -3685.5
-        self.assertEqual(data, {'soc': 85, 'voltage': 52650, 'current': -70, 'power': -3685.5})
+        self.assertEqual(data, {'soc': 85, 'voltage': 52650, 'current': -70, 'power': -3685.5, 'temp': 35})
+        self.assertEqual(set(data), {'soc', 'voltage', 'current', 'power', 'temp'})
         # Extra temperatures/cycles and unsupported power are not published.
         self.assertEqual(set(data), {'soc', 'voltage', 'current', 'power'})
         for raw in ('UNKNOW', '101', '-1', None, True, 'nan'):
