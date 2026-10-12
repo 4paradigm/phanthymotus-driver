@@ -4,16 +4,16 @@
 
 ## 普通镜像构建
 
-主 Driver、`servo_eef` 和 IK 子进程共用 `/usr/local/bin/python3` 及同一套依赖。子进程使用 `sys.executable`，不再选择专用解释器；超时终止和重启机制不变。
+主 Driver、`servo_eef` 和 IK 子进程共用 ROS 基础镜像的 `/usr/bin/python3` 及同一套依赖。子进程使用 `sys.executable`；超时终止和重启机制不变。
 
-Dockerfile 在构建阶段使用固定版本 micromamba 安装 `requirements.numeric-linux-aarch64.lock`，将共享运行时复制到 `/usr/local`。最终镜像不保留 micromamba 或 `/opt/motion` 环境，也不再额外安装 pip `pin`。ROS 基础镜像的系统 Python 由系统包保留，Driver 不使用它。
+Dockerfile 使用系统 pip 安装依赖，不引入 Conda 或额外 Python 环境。PyPI 的普通 `pin` wheel 不提供 CasADi 绑定，因此构建时用 `--no-binary=pin` 编译 Pinocchio 4.1.0，并启用 `BUILD_WITH_CASADI_SUPPORT`。Docker 编译阶段与运行阶段共用依赖基础层；运行阶段只复制 Pinocchio 包、路径 hook 和安装元数据，不包含 cmeel 临时编译目录。
 
-共享依赖固定为 NumPy 1.26.4、Pinocchio 3.1.0、CasADi 3.6.7。OpenCV 固定到兼容 NumPy 1.x 的 4.11.0.86，避免 pip 升级 NumPy。`LD_LIBRARY_PATH` 包含 `/usr/local/lib`，使 ROS 和数值模块使用同一套兼容的 C++ 运行库。
+共享依赖固定为 NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3；OpenCV 保持 4.11.0.86。Pinocchio 使用单编译进程，构建机需要足够内存。`CMEEL_RUN_TESTS=OFF` 仅关闭打包时依赖额外模型和扩展资源的上游测试，项目回归单独执行。
 
-包清单固定下载 URL 和 MD5。开发环境也需要支持 `pinocchio.casadi` 的依赖；缺失时明确报错，不退化为未求解结果。镜像构建会检查版本并下载、验证模型资产：
+开发环境也需要支持 `pinocchio.casadi` 的依赖；缺失时明确报错，不退化为未求解结果。先导入 `casadi`，再导入 `pinocchio.casadi`，使动态加载器能找到 CasADi 库。镜像构建会检查版本、构造 CasADi 模型并验证模型资产：
 
 ```sh
-python3 -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"'
+python3 -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "2.2.6"; assert casadi.__version__ == "3.8.1"; assert pinocchio.__version__ == "4.1.0"; cpin.Model(pinocchio.buildSampleModelManipulator())'
 python3 /work/motion/fetch_assets.py --check
 ```
 
@@ -23,7 +23,9 @@ python3 /work/motion/fetch_assets.py --check
 
 ## 离线验证
 
-真实数值用例覆盖 G1_23 模型和已核验网格的完整关节解、独立数值子进程的 EEF14→joint10 和双末端反馈，以及空配置执行器接受新标定、无效候选保留前一配置。统一运行时已在 ARM64 镜像和上海 G1 的隔离构建环境中验证：Pinocchio 3.1.0、CasADi 3.6.7、NumPy 1.26.4，G1 与 servo_eef 回归共 196 项通过、无跳过。机上验证使用已构建候选的文件系统，不访问设备，不代表业务部署或物理动作验收。
+真实数值用例覆盖 G1_23 模型和已核验网格的完整关节解、独立数值子进程的 EEF14→joint10 和双末端反馈，以及空配置执行器接受新标定、无效候选保留前一配置。2026-10-12，上海 G1 的 ARM64 运行镜像通过 G1 与 servo_eef 回归：196 项通过、无跳过。ROS 隔离测试收到 541 帧，完成 21 个订阅代次及 3 次注入异常恢复。系统 Python、主要模块导入、模型哈希及无 cmeel 临时目录检查通过。
+
+本次先完成源码构建，再复用该构建结果验证最终运行阶段；未重复执行调整后的多阶段 Dockerfile 冷构建。M2 本机 Linux ARM64 Docker 编译的 wheel 也在 G1 通过同组 196 项测试。上述结果不代表 BOT 发布、业务部署或物理动作验收。
 
 ```sh
 python -m pytest -q unitree/g1/tests/test_motion_control_numeric.py

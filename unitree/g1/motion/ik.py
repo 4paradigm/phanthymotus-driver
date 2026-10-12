@@ -54,8 +54,8 @@ class PinocchioIk:
             from pinocchio import casadi as cpin
         except (ImportError, OSError) as exc:
             raise RuntimeError(
-                "G1_23 IK requires the conda-forge ABI set "
-                "pinocchio==3.1.0, casadi==3.6.7, numpy==1.26.4"
+                "G1_23 IK requires Pinocchio 4.1.0 built with CasADi support, "
+                "casadi==3.8.1 and numpy==2.2.6; see motion/README.md"
             ) from exc
 
         path = Path(urdf_path).resolve()

@@ -11,7 +11,8 @@ import time
 import numpy as np
 import pytest
 
-pytest.importorskip('pinocchio.casadi', reason='G1 requires CasADi-enabled Pinocchio 3.1 ABI')
+pytest.importorskip('casadi', reason='G1 requires CasADi 3.8.1')
+pytest.importorskip('pinocchio.casadi', reason='G1 requires CasADi-enabled Pinocchio 4.1.0')
 DRIVER=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(DRIVER))
 from motion.kinematics import IK

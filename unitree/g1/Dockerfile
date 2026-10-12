@@ -1,11 +1,6 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
-FROM mambaorg/micromamba:2.3.2@sha256:555746adba7e231c903aab4f59d51a4b11ad35bc1cab50e3d78024652508bd64 AS python-runtime
-USER root
-SHELL ["/bin/sh", "-c"]
-COPY motion/requirements.numeric-linux-aarch64.lock /tmp/numeric.lock
-RUN rm -rf /usr/local && micromamba create --yes --prefix /usr/local --file /tmp/numeric.lock && micromamba clean --all --yes
-FROM ${ROS_BASE_IMAGE}
+FROM ${ROS_BASE_IMAGE} AS numeric-deps
 ARG PYPI_MIRROR
 
 WORKDIR /work
@@ -13,6 +8,7 @@ WORKDIR /work
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
+        python3-dev \
         python3-colcon-common-extensions \
         cmake \
         build-essential \
@@ -25,11 +21,26 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=python-runtime /usr/local/ /usr/local/
-ENV LD_LIBRARY_PATH=/usr/local/lib
-
 RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces opencv-python-headless==4.11.0.86 numpy==1.26.4 pyrealsense2 sounddevice pyalsaaudio
+    pyyaml netifaces opencv-python-headless==4.11.0.86 numpy==2.2.6 pyrealsense2 sounddevice pyalsaaudio \
+    casadi==3.8.1 scipy==1.15.3 libpinocchio==4.1.0 coal==3.0.3 eigenpy==3.13.0 \
+    cmeel==0.61.0 cmeel-boost==1.90.0 cmeel-urdfdom==6.0.0 \
+    cmeel-eigen==3.4.1 cmeel-urdfdom-headers==3.0.0 jrl-cmakemodules==2.1.0
+
+# PyPI's pin wheel omits CasADi bindings; build them with the system Python.
+FROM numeric-deps AS pin-builder
+ARG PYPI_MIRROR
+RUN CMEEL_JOBS=1 CMEEL_RUN_TESTS=OFF \
+    CMEEL_CMAKE_ARGS="-DBUILD_WITH_CASADI_SUPPORT=ON -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -Dcasadi_DIR=/usr/local/lib/python3.10/dist-packages/casadi/cmake" \
+    python3 -m pip install --no-cache-dir --no-build-isolation --no-deps --no-binary=pin \
+    -i ${PYPI_MIRROR} pin==4.1.0
+
+# Keep cmeel's temporary build tree out of the runtime image.
+FROM numeric-deps
+ARG PYPI_MIRROR
+COPY --from=pin-builder /usr/local/lib/python3.10/dist-packages/cmeel.prefix/lib/python3.10/site-packages/pinocchio/ /usr/local/lib/python3.10/dist-packages/cmeel.prefix/lib/python3.10/site-packages/pinocchio/
+COPY --from=pin-builder /usr/local/lib/python3.10/dist-packages/cmeel.prefix/share/pinocchio/hook/ /usr/local/lib/python3.10/dist-packages/cmeel.prefix/share/pinocchio/hook/
+COPY --from=pin-builder /usr/local/lib/python3.10/dist-packages/pin-4.1.0.dist-info/ /usr/local/lib/python3.10/dist-packages/pin-4.1.0.dist-info/
 
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
@@ -69,7 +80,7 @@ COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py
 COPY arm_stream.py motion_control.py motion_bus.py teleop_control.py teleop_bus.py ros_spin.py /work/
 COPY motion/ /work/motion/
-RUN python3 -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"' && \
+RUN python3 -c 'import sys, numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert sys.executable == "/usr/bin/python3"; assert numpy.__version__ == "2.2.6"; assert casadi.__version__ == "3.8.1"; assert pinocchio.__version__ == "4.1.0"; cpin.Model(pinocchio.buildSampleModelManipulator())' && \
     python3 /work/motion/fetch_assets.py && python3 /work/motion/fetch_assets.py --check
 COPY servo_eef.py /work/servo_eef.py
 COPY test_slam_rpc.py /work/test_slam_rpc.py

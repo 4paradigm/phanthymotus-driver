@@ -6,6 +6,6 @@
 
 碰撞网格来自 Unitree `xr_teleoperate` 提交 `817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b` 的 `assets/g1/meshes`。`models/collision/sha256.json` 与 LICENSE 保留；构建需固定源下载并核验全部哈希，运行时不下载。网格缺失时明确拒绝初始化，不跳过几何验证。
 
-依赖仍要求带 CasADi 支持的 Pinocchio 3.1.0 / CasADi 3.6.7 / NumPy 1.26.4 ABI；普通 PyPI pin wheel 不提供该符号时不可冒充数值通过。目标 Linux ARM64 构建与真实求解需分别验证。
+依赖要求带 CasADi 支持的 Pinocchio 4.1.0、CasADi 3.8.1、NumPy 2.2.6 和 SciPy 1.15.3。Dockerfile 使用系统 Python 从源码构建 Pinocchio 的 CasADi 绑定；普通 PyPI pin wheel 不提供该绑定，不能据其安装成功声称数值通过。目标 Linux ARM64 构建与真实求解需分别验证。
 
 `fetch_assets.py` 选择性迁移主仓 `deploy/fetch_g1_collision.py`，只调整默认目录和宿主说明；构建通过此入口固定下载，未在数值控制循环引入网络。
