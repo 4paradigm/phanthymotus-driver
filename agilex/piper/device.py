@@ -1,4 +1,4 @@
-"""Ten focused cards on one shared PiPER runtime and CAN connection."""
+"""Eleven focused cards on one shared PiPER runtime and CAN connection."""
 from dataclasses import asdict
 import math
 import time
@@ -6,16 +6,52 @@ import time
 from agilex.piper.cards import TITLES, build_tools
 from agilex.piper.control import healthy, mode_name, ready_to_move, teaching_stopped
 from agilex.piper.runtime import PiperRuntime, confirm, number
+from agilex.piper.zero_stream import ZeroCheckStream
 
 
 class PiperPlugin(PiperRuntime):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.zero_stream = ZeroCheckStream(self.ros2, self.topic.rsplit('/', 1)[0] + '/zero_check',
+                                          self.read_zero_check)
+
+    def read_zero_check(self, tolerance):
+        # Share the existing connection; never take/clear the motion gate or cancellation flag.
+        with self.connection_lock:
+            if self.closed or 'piper_zero_check' in self.stopped_cards:
+                raise RuntimeError('实时角度卡片已停止，请先启动卡片')
+            report = self.connected().factory_zero_status(tolerance)
+            now = time.time()
+            if (not math.isfinite(report['feedback_time'])
+                    or abs(now - report['feedback_time']) > .5
+                    or len(report['joints_deg']) != 6
+                    or not all(math.isfinite(v) for v in report['joints_deg'])):
+                raise RuntimeError('六轴反馈无效或超过 0.5 秒未更新')
+            return {**report, 'timestamp_ms': int(now * 1000), 'available': True, 'fresh': True}
+
+    def request_stop(self, name=None):
+        if name is None or name == 'piper_zero_check':
+            with self.zero_stream.lock:
+                result = self.zero_stream.stop()
+                if name == 'piper_zero_check':
+                    with self.lifecycle:
+                        self.stopped_cards.add(name)
+                    return result
+                return super().request_stop(name)
+        return super().request_stop(name)
+
+    def stop(self):
+        # Keep a concurrent sensor start out of the connection shutdown window.
+        with self.zero_stream.lock:
+            super().stop()
+
     def get_tools(self):
         return build_tools(self.topic)
 
     def _validate(self, name, action, args):
         definition = next((t for t in self.get_tools() if t['name'] == name), None)
         if definition is None:
-            raise ValueError('未知卡片；请刷新十卡片工具列表')
+            raise ValueError('未知卡片；请刷新 PiPER 工具列表')
         properties = definition['inputSchema']['properties']
         if action not in properties['action']['enum']:
             raise ValueError(f'「{TITLES[name]}」不支持此操作；请使用对应功能卡片')
@@ -57,6 +93,17 @@ class PiperPlugin(PiperRuntime):
         if name == 'piper_status':
             action = args.get('action', 'read')
         self._validate(name, action, args)
+        if name == 'piper_zero_check':
+            if action in {'start', 'stream'}:
+                tolerance = number(args, 'tolerance_deg', 2, .1, 5)
+                with self.zero_stream.lock:
+                    self.start(name)
+                    return self.zero_stream.start(tolerance)
+            if action in {'stop', 'pause'}:
+                return self.request_stop(name)
+            if action == 'info':
+                return self.zero_stream.info()
+            return self.read_zero_check(number(args, 'tolerance_deg', 2, .1, 5))
         if action == 'start':
             self.start(name)
             return {'state': 'ready', 'message': f'「{TITLES[name]}」已就绪；未使能或移动'}

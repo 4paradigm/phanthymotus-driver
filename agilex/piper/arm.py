@@ -187,6 +187,7 @@ class PiperDriver:
             "teach_status": state.teach_status,
             "error_code": state.error_code,
             "physical_marks_verified": False,
+            "feedback_time": state.feedback_time,
         }
 
     def guide_factory_zero(self, seconds=180, tolerance_deg=2.0):

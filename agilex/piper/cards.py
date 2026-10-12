@@ -1,9 +1,10 @@
-"""Ten focused PiPER contracts; Chinese labels are presentation metadata."""
+"""Eleven focused PiPER contracts; Chinese labels are presentation metadata."""
 from common.vendor_runtime import action_schema, tool
 
 
 TITLES = {
-    "piper_status": "机器人状态", "piper_standby": "切换待机",
+    "piper_status": "机器人状态", "piper_zero_check": "实时角度与零位偏差",
+    "piper_standby": "切换待机",
     "piper_can": "切换电脑控制", "piper_enable": "电机使能",
     "piper_disable": "电机失能", "piper_joint": "单轴运动",
     "piper_gripper": "夹爪开合", "piper_photo": "相机与照片",
@@ -41,18 +42,32 @@ def build_tools(topic):
             oneOf=[{"const": a, "title": text} for a, (_, text) in {**actions, **lifecycle}.items()])
         if confirmations:
             schema["x-confirmation"] = confirmations
-        if name not in {"piper_status", "piper_permission"}:
+        if name not in {"piper_status", "piper_zero_check", "piper_permission"}:
             schema["x-resource"] = ["arm", "camera"] if name == "piper_photo" else "arm"
             schema["x-is-dangerous"] = name != "piper_photo"
             schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
-        definition = tool(name, kind, description, schema,
-                          topic_out=[{"topic": topic, "format": "image/jpeg"}] if name == "piper_photo" else None)
+        outputs = ([{"topic": topic, "format": "image/jpeg"}] if name == "piper_photo" else
+                   [{"topic": topic.rsplit('/', 1)[0] + '/zero_check', "format": "data/json"}]
+                   if name == "piper_zero_check" else None)
+        definition = tool(name, kind, description, schema, topic_out=outputs)
         definition["title"] = TITLES[name]
         result.append(definition)
 
     add("piper_status", "模式、使能、故障分别反馈；只读取，不发送运动指令。",
         {"read": ([], "读取状态"), "firmware": ([], "查询固件"),
          "reconnect": ([], "重新连接（关闭许可并清除预览）")}, kind="resource")
+    add("piper_zero_check", "启动后以 5 Hz 推送六轴角度、零位偏差与容差判断；过期反馈显示失效；只读，不移动或校准机械臂。",
+        {"stream": (["tolerance_deg"], "开始实时读取"),
+         "read": (["tolerance_deg"], "单次读取角度与偏差"),
+         "pause": ([], "暂停实时读取")},
+        {"tolerance_deg": {"type": "number", "minimum": .1, "maximum": 5, "default": 2,
+                           "title": "判定容差（°）"}}, kind="sensor")
+    zero_schema = result[-1]["inputSchema"]
+    zero_schema["x-action-params"]["start"] = {"params": ["tolerance_deg"], "description": "开始实时读取"}
+    zero_schema["properties"]["action"]["default"] = "stream"
+    for option in zero_schema["properties"]["action"]["oneOf"]:
+        if option["const"] == "start":
+            option["title"] = "开始实时读取"
     for name, label in [("piper_standby", "待机"), ("piper_can", "电脑控制（CAN）")]:
         props = {key: hidden[key] for key in ["execute", "preview_id"]}
         params = []

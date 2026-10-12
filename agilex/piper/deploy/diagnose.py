@@ -74,9 +74,9 @@ def main():
     check("server", lambda: rpc(args.endpoint,"initialize"))
     def check_cards():
         cards = [t["name"] for t in rpc(args.endpoint,"tools/list")["tools"]]
-        expected = {"piper_status","piper_standby","piper_can","piper_enable","piper_disable","piper_joint","piper_gripper","piper_photo","piper_permission","piper_stop"}
+        expected = {"piper_status","piper_zero_check","piper_standby","piper_can","piper_enable","piper_disable","piper_joint","piper_gripper","piper_photo","piper_permission","piper_stop"}
         if set(cards) != expected:
-            raise RuntimeError("十张卡片未完整注册")
+            raise RuntimeError("十一张卡片未完整注册")
         return cards
     check("cards", check_cards)
     check("before", lambda: call(args.endpoint,"piper_status","read"))
