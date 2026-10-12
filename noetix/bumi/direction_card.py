@@ -5,25 +5,23 @@ from __future__ import annotations
 import json
 import math
 import os
-import ssl
 import subprocess
 import threading
 import time
-import urllib.request
 from collections import deque
 from pathlib import Path
-from uuid import uuid4
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from std_msgs.msg import String
+from audio_msgs.msg import SoundDirection
 
-from sound_direction import SoundActivityGate, estimate_angle, estimate_signature, is_voiced_audio
+from sound_direction import SoundActivityGate, estimate_angle, estimate_signature
 
 
 CALIBRATION_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_calibration.json")
+DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "resource/sound_direction_calibration.json"
 SETTINGS_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_settings.json")
 DEFAULT_PARAMETERS = {
     "onset_level": 10.0, "onset_ratio": 1.8,
@@ -39,34 +37,20 @@ _QOS = QoSProfile(
 _READY_LINE = "__BUMI_DIRECTION_READY__"
 
 
-def _direction_acp_notify(action_id: str, status: str, result: dict, tool: str) -> None:
-    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-    payload = json.dumps({"action_id": action_id, "status": status,
-                          "result": result, "tool": tool, "ts": time.time()}).encode()
-    request = urllib.request.Request(
-        f"{url}/api/acp/complete", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
-    context = ssl._create_unverified_context() if url.startswith("https://") else None
-    try:
-        with urllib.request.urlopen(request, timeout=5, context=context) as response:
-            response.read()
-    except Exception as exc:
-        print(f"[direction ACP] callback failed for {action_id}: {exc}", flush=True)
-
-
 def load_calibration() -> dict:
-    """Reuse only valid front/right signatures from the existing mic calibration."""
-    try:
-        data = json.loads(CALIBRATION_PATH.read_text())
-    except Exception:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {name: signature for name, signature in data.items()
-            if name in ("front", "right")
-            and isinstance(signature, list) and len(signature) == 3
-            and all(type(value) in (int, float) and abs(value) <= 24
-                    for value in signature)}
+    """Use one complete, valid calibration; never mix signatures across files."""
+    for path in (CALIBRATION_PATH, DEFAULT_CALIBRATION_PATH):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(data, dict) and all(
+                isinstance(data.get(name), list) and len(data[name]) == 3
+                and all(type(value) in (int, float) and math.isfinite(value)
+                        and abs(value) <= 24 for value in data[name])
+                for name in ("front", "right"))):
+            return {name: data[name] for name in ("front", "right")}
+    return {}
 
 
 def _valid_parameter(name: str, value) -> bool:
@@ -92,7 +76,7 @@ def load_parameters() -> dict:
     return saved
 
 
-def activity_payload(audio, calibration, timestamp_ms, audio_window=None) -> str | None:
+def activity_payload(audio, calibration, audio_window, published_us) -> SoundDirection | None:
     if not {"front", "right"} <= calibration.keys():
         return None
     signature = estimate_signature(audio, 8, 16000)
@@ -101,13 +85,18 @@ def activity_payload(audio, calibration, timestamp_ms, audio_window=None) -> str
     angle = estimate_angle(signature, calibration["front"], calibration["right"])
     if angle is None:
         return None
-    result = {"state": "fresh", "trigger": "sound_activity",
-              "timestamp_ms": int(timestamp_ms), "angle": angle,
-              "unit": "deg", "reference": "robot_front_clockwise"}
-    if audio_window is not None:
-        result.update({"audio_window_start_us": audio_window[0],
-                       "audio_window_end_us": audio_window[1]})
-    return json.dumps(result, ensure_ascii=False)
+    msg = SoundDirection()
+    msg.state = SoundDirection.VALID
+    msg.angle_deg = float(angle if angle <= 180 else angle - 360)
+    begin, last, last_samples = audio_window
+    if begin >= 1_000_000_000_000_000 and last >= begin:
+        msg.window_start_us = begin
+        msg.window_end_us = last + last_samples * 1_000_000 // 16000
+    else:
+        msg.window_start_us = 0
+        msg.window_end_us = 0
+    msg.published_us = published_us
+    return msg
 
 
 def _direction_subprocess(namespace: str) -> None:
@@ -125,7 +114,7 @@ def _direction_subprocess(namespace: str) -> None:
     time.sleep(3)
     rclpy.init()
     node = Node("bumi_sound_direction")
-    pub = node.create_publisher(String, f"/{namespace}/sound_direction", _QOS)
+    pub = node.create_publisher(SoundDirection, f"/{namespace}/sound_direction", _QOS)
     recent_audio = deque(maxlen=8)
     recent_capture_us = deque(maxlen=8)
     parameters = load_parameters()
@@ -140,7 +129,10 @@ def _direction_subprocess(namespace: str) -> None:
     while True:
         try:
             if last_result_at is not None and time.monotonic() - last_result_at >= 1.0:
-                pub.publish(String(data=json.dumps({"state": "no_event"})))
+                event = SoundDirection()
+                event.state = SoundDirection.NO_EVENT
+                event.published_us = time.time_ns() // 1000
+                pub.publish(event)
                 last_result_at = None
             frame = media_ctrl.get_audio_capture_data()
             if frame.channels != 8 or frame.sample_rate != 16000 or not frame.audio_data:
@@ -150,25 +142,28 @@ def _direction_subprocess(namespace: str) -> None:
             if samples.size % 8:
                 continue
             capture_us = getattr(frame, "timestamp_us", 0)
-            if type(capture_us) is not int or capture_us <= 0:
-                capture_us = int(time.time() * 1_000_000)
+            if type(capture_us) is not int or capture_us < 1_000_000_000_000_000:
+                capture_us = 0
             if not gate.accepts(samples):
                 # 停顿帧不参与定位，避免机器人的风扇声改变说话者角度。
                 recent_audio.clear()
                 recent_capture_us.clear()
                 continue
             recent_audio.append(samples)
-            recent_capture_us.append(capture_us)
+            recent_capture_us.append((capture_us, samples.size // 8))
             if sum(part.size for part in recent_audio) < 8 * 1024:
                 continue
             if time.monotonic() < next_check:
                 continue
             next_check = time.monotonic() + parameters["update_interval_ms"] / 1000
+            valid_clock = all(capture for capture, _ in recent_capture_us)
             result = activity_payload(
                 np.concatenate(tuple(recent_audio)), load_calibration(),
-                time.time() * 1000, (recent_capture_us[0], recent_capture_us[-1]))
+                (recent_capture_us[0][0] if valid_clock else 0,
+                 recent_capture_us[-1][0] if valid_clock else 0,
+                 recent_capture_us[-1][1]), time.time_ns() // 1000)
             if result is not None:
-                pub.publish(String(data=result))
+                pub.publish(result)
                 last_result_at = time.monotonic()
         except Exception as exc:
             if time.monotonic() >= next_error_log:
@@ -190,72 +185,49 @@ class SoundDirectionPlugin:
         self._last_direction_time = 0.0
         self._node = Node("bumi_sound_direction_sub")
         executor.add_node(self._node)
-        self._node.create_subscription(String, self._topic, self._on_direction, _QOS)
+        self._node.create_subscription(SoundDirection, self._topic, self._on_direction, _QOS)
+        self._clear_pub = self._node.create_publisher(SoundDirection, self._topic, _QOS)
 
-    def _on_direction(self, msg: String) -> None:
-        try:
-            result = json.loads(msg.data)
-        except (TypeError, ValueError):
+    def _on_direction(self, msg: SoundDirection) -> None:
+        if msg.state == SoundDirection.NO_EVENT:
+            with self._process_lock:
+                self._last_direction = None
             return
-        if not isinstance(result, dict) or result.get("state") != "fresh":
+        if msg.state != SoundDirection.VALID:
             return
-        if type(result.get("angle")) is not int or not 0 <= result["angle"] < 360:
-            return
-        if any(type(value) not in (str, int, float, bool, type(None))
-               for value in result.values()):
+        if not math.isfinite(msg.angle_deg) or not -180 <= msg.angle_deg <= 180:
             return
         with self._process_lock:
             if self._proc is None or self._proc.poll() is not None:
                 return
-            self._last_direction = result
+            self._last_direction = {"state": "fresh", "angle_deg": msg.angle_deg,
+                                    "window_start_us": msg.window_start_us,
+                                    "window_end_us": msg.window_end_us}
             self._last_direction_time = time.monotonic()
 
     def get_tool(self) -> dict:
         return {
             "name": "sound_direction", "type": "sensor", "multiInstance": False,
             "description": "Bumi calibrated sound direction from the microphone array",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["info", "start", "stop"]}}},
+            "configSchema": {"type": "object", "properties": {
+                "onset_level": {"type": "number", "minimum": 1, "maximum": 1000,
+                                "default": 10, "scope": "shared"},
+                "onset_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
+                                "default": 1.8, "scope": "shared"},
+                "burst_level": {"type": "number", "minimum": 1, "maximum": 1000,
+                                "default": 15, "scope": "shared"},
+                "burst_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
+                                "default": 3.0, "scope": "shared"},
+                "update_interval_ms": {"type": "integer", "minimum": 50,
+                                       "maximum": 1000, "default": 100,
+                                       "scope": "shared"}}},
+            "topic_out": [{"topic": self._topic, "format": "sensor/sound-direction-v1"}],
         }
 
     def get_tools(self) -> list:
-        return [self.get_tool(), self.get_control_tool()]
-
-    def get_control_tool(self) -> dict:
-        return {
-            "name": "sound_direction_control", "type": "actuator", "multiInstance": False,
-            "description": "Calibrate and configure Bumi sound direction",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"action": {"type": "string", "enum": [
-                    "info", "check_direction",
-                    "calibrate_front", "calibrate_right",
-                    "set_parameters", "reset_parameters"]},
-                    "onset_level": {"type": "number", "minimum": 1, "maximum": 1000,
-                                    "description": "连续发声最低音量；默认 10"},
-                    "onset_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
-                                    "description": "连续发声相对背景倍数；默认 1.8"},
-                    "burst_level": {"type": "number", "minimum": 1, "maximum": 1000,
-                                    "description": "单次强声最低音量；默认 15"},
-                    "burst_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
-                                    "description": "单次强声相对背景倍数；默认 3.0"},
-                    "update_interval_ms": {"type": "integer", "minimum": 50, "maximum": 1000,
-                                           "description": "方向更新最短间隔，毫秒；默认 100"}},
-                "required": ["action"],
-                "x-action-params": {
-                    "info": {"params": [], "description": "查看状态、最近方向及标定进度。"},
-                    "check_direction": {"params": [], "description": "查看最近一次声音方向。"},
-                    "calibrate_front": {"params": [], "description": "正前方持续说话约 2 秒。"},
-                    "calibrate_right": {"params": [], "description": "正右方持续说话约 2 秒。"},
-                    "set_parameters": {"params": [
-                        "onset_level", "onset_ratio", "burst_level", "burst_ratio",
-                        "update_interval_ms"], "description": "只填写需要调整的参数；保存后重启方向采集。"},
-                    "reset_parameters": {"params": [], "description": "恢复当前版本的默认参数。"},
-                },
-                "x-completion": {"actions": ["calibrate_front", "calibrate_right"],
-                                 "timeout": 30},
-            },
-        }
+        return [self.get_tool()]
 
     def start(self) -> bool:
         import sys
@@ -303,76 +275,17 @@ class SoundDirectionPlugin:
                 self._proc = None
             self._last_direction = None
             self._last_direction_time = 0.0
-
-    def _calibrate(self, direction: str) -> dict:
-        # 标定只暂停本卡采集进程，绝不停止原有 mic 音频卡。
-        with self._process_lock:
-            running = self._proc is not None and self._proc.poll() is None
-            if running:
-                self.stop()
-            calibration_saved = False
-            try:
-                frames = []
-                seen = set()
-                samples = 0
-                deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline:
-                    frame = self._media_ctrl.get_audio_capture_data()
-                    if frame.channels == 8 and frame.sample_rate == 16000 and frame.audio_data:
-                        data = np.asarray(frame.audio_data, dtype=np.int16)
-                        if data.size % 8 == 0 and data.tobytes() not in seen:
-                            seen.add(data.tobytes())
-                            frames.append(data)
-                            samples += data.size // 8
-                    time.sleep(0.005)
-                if samples < 16000:
-                    return {"state": "no_voice", "message": "未采到足够的新音频，请靠近机器人重试"}
-                captured = np.concatenate(frames)
-                if not is_voiced_audio(captured, 8, 16000):
-                    return {"state": "no_voice", "message": "未采到清晰人声，请靠近机器人重试"}
-                signature = estimate_signature(captured, 8, 16000)
-                if signature is None:
-                    return {"state": "no_voice", "message": "未采到可用于标定的声音，请靠近机器人重试"}
-                calibration = load_calibration()
-                calibration[direction] = signature
-                try:
-                    previous = json.loads(CALIBRATION_PATH.read_text())
-                except Exception:
-                    previous = {}
-                if not isinstance(previous, dict):
-                    previous = {}
-                extras = {key: value for key, value in previous.items()
-                          if key not in ("front", "right")}
-                CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
-                temporary = CALIBRATION_PATH.with_suffix(".tmp")
-                temporary.write_text(json.dumps({**extras, **calibration}))
-                temporary.replace(CALIBRATION_PATH)
-                calibration_saved = True
-                return {"state": "calibrated", "direction": direction,
-                        "remaining": [key for key in ("front", "right") if key not in calibration]}
-            finally:
-                if running:
-                    try:
-                        if not self.start():
-                            return {"state": "error", "message": "direction restart failed to initialize",
-                                    "direction": direction, "calibration_saved": calibration_saved}
-                    except Exception as exc:
-                        return {"state": "error", "message": f"direction restart failed: {exc}",
-                                "direction": direction, "calibration_saved": calibration_saved}
-
-    def _calibrate_async(self, direction: str, action_id: str) -> None:
-        try:
-            result = self._calibrate(direction)
-        except Exception as exc:
-            result = {"state": "error", "direction": direction, "message": str(exc)}
-        status = "completed" if result.get("state") == "calibrated" else "error"
-        _direction_acp_notify(action_id, status, result, "sound_direction_control")
+            event = SoundDirection()
+            event.state = SoundDirection.NO_EVENT
+            event.published_us = time.time_ns() // 1000
+            self._clear_pub.publish(event)
 
     def _set_parameters(self, changes: dict | None) -> dict:
         with self._process_lock:
+            previous_parameters = load_parameters()
             if changes is not None:
                 changes = {key: value for key, value in changes.items()
-                           if key != "_tool_name"}
+                           if key not in ("_tool_name", "action")}
                 if any(key not in DEFAULT_PARAMETERS for key in changes):
                     return {"state": "invalid_parameters"}
                 changes = {key: value for key, value in changes.items()
@@ -380,7 +293,7 @@ class SoundDirectionPlugin:
                 if not changes or any(not _valid_parameter(key, value)
                                       for key, value in changes.items()):
                     return {"state": "invalid_parameters"}
-                parameters = {**load_parameters(), **changes}
+                parameters = {**previous_parameters, **changes}
             else:
                 parameters = DEFAULT_PARAMETERS.copy()
             running = self._proc is not None and self._proc.poll() is None
@@ -401,22 +314,21 @@ class SoundDirectionPlugin:
                 try:
                     if not self.start():
                         return {"state": "error", "message": "direction restart failed to initialize",
-                                "parameters": load_parameters()}
+                                "parameters": load_parameters(),
+                                "file_parameters": load_parameters(), "running_parameters": None}
                 except Exception as exc:
                     return {"state": "error", "message": f"direction restart failed: {exc}",
-                            "parameters": load_parameters()}
+                            "parameters": load_parameters(),
+                            "file_parameters": load_parameters(), "running_parameters": None}
             if write_error is not None:
                 return {"state": "error", "message": str(write_error),
-                        "parameters": load_parameters()}
+                        "parameters": load_parameters(),
+                        "file_parameters": load_parameters(),
+                        "running_parameters": previous_parameters if running else None}
             return {"state": "configured", "parameters": parameters}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        tool_name = args.get("_tool_name")
-        if tool_name == "sound_direction_control" and action == "start":
-            return {"state": "ready"}
-        if tool_name == "sound_direction_control" and action == "stop":
-            return {"state": "idle"}
-        if tool_name == "sound_direction" and action not in ("start", "stop", "info"):
+        if action not in ("start", "stop", "info", "config"):
             return None
         if action == "start":
             try:
@@ -431,7 +343,7 @@ class SoundDirectionPlugin:
             except subprocess.TimeoutExpired:
                 return {"state": "error", "message": "direction subprocess did not exit after kill"}
             return {"state": "idle"}
-        if action in ("info", "check_direction"):
+        if action == "info":
             with self._process_lock:
                 running = self._proc is not None and self._proc.poll() is None
                 if not running:
@@ -447,18 +359,8 @@ class SoundDirectionPlugin:
                       "parameters": load_parameters(),
                       "calibrated_directions": [key for key in ("front", "right")
                                                 if key in load_calibration()]}
-            if tool_name != "sound_direction_control":
-                result["topic_out"] = self.get_tool()["topic_out"]
+            result["topic_out"] = self.get_tool()["topic_out"]
             return result
-        if action == "set_parameters":
+        if action == "config":
             return self._set_parameters(args)
-        if action == "reset_parameters":
-            return self._set_parameters(None)
-        if action in ("calibrate_front", "calibrate_right"):
-            direction = action.removeprefix("calibrate_")
-            action_id = f"sound_direction_calibrate_{direction}_{uuid4().hex}"
-            # 标定和采集进程重启在后台完成，结果通过 ACP 回报。
-            threading.Thread(target=self._calibrate_async, args=(direction, action_id),
-                             daemon=True).start()
-            return {"state": "queued", "action_id": action_id, "direction": direction}
         return None

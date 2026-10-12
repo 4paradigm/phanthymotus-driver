@@ -9,9 +9,13 @@ def _load_device(monkeypatch):
     class Node:
         def __init__(self, name):
             self.subscriptions = []
+            self.published = []
 
         def create_subscription(self, message_type, topic, callback, qos):
             self.subscriptions.append((topic, callback))
+
+        def create_publisher(self, message_type, topic, qos):
+            return types.SimpleNamespace(publish=self.published.append)
 
     class String:
         def __init__(self, data=""):
@@ -41,6 +45,18 @@ def _load_device(monkeypatch):
                 stamp=types.SimpleNamespace(sec=0, nanosec=0))
 
     modules["audio_msgs.msg"].AudioChunk = AudioChunk
+    class SoundDirection:
+        NO_EVENT = 0
+        VALID = 1
+
+        def __init__(self):
+            self.state = 0
+            self.angle_deg = 0.0
+            self.window_start_us = 0
+            self.window_end_us = 0
+            self.published_us = 0
+
+    modules["audio_msgs.msg"].SoundDirection = SoundDirection
     modules["sensor_msgs.msg"].CompressedImage = type("CompressedImage", (), {})
     modules["sensor_msgs.msg"].Image = type("Image", (), {})
     for name, module in modules.items():
@@ -98,3 +114,5 @@ def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch):
     assert len(audio) == 1
     assert audio[0].format == "pcm_16k_16bit_mono"
     assert audio[0].data == (500).to_bytes(2, "little", signed=True) * 640
+    assert (audio[0].header.stamp.sec, audio[0].header.stamp.nanosec) == (
+        1_700_000_000, 0)
