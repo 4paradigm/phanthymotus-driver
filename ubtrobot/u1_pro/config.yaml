@@ -12,6 +12,9 @@ ros:
 
 plugins:
   qr_scan:
+    auto_speak: true
+    speak_cooldown_s: 10
+    speak_max_chars: 80
     scan_hz: 2
     stale_after_s: 3
     rearm_after_s: 3

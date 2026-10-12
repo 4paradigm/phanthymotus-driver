@@ -203,3 +203,116 @@ def test_start_idempotent_and_partial_failure_cleanup(nodes):
 def test_invalid_config(nodes, cfg):
     with pytest.raises(ValueError):
         qr.QrScanPlugin(nodes, cfg)
+
+
+class FakeTTS:
+    def __init__(self, busy=False):
+        self.calls = []
+        self.busy = busy
+
+    def dispatch(self, action, args):
+        if action == 'info':
+            return {'active': {'action_id': 'other'} if self.busy else None}
+        self.calls.append(args)
+        return {'state': 'queued', 'action_id': args['action_id']}
+
+
+def test_native_auto_speech_once_without_extra_card(nodes):
+    tts = FakeTTS()
+    scanner = qr.QrScanPlugin(nodes, {'auto_speak': True, 'scan_hz': 10}, tts_plugin=tts)
+    scanner.start()
+    try:
+        scanner._on_frame(SimpleNamespace(format='jpeg', data=jpeg(image('U1-001'))))
+        wait_status(scanner, 'detected', 1)
+        deadline = time.monotonic()+2
+        while not tts.calls and time.monotonic()<deadline:
+            time.sleep(0.01)
+        assert tts.calls[0]['text'] == '扫码成功，内容是：U1-001'
+        scanner._on_frame(SimpleNamespace(format='jpeg', data=jpeg(image('U1-001'))))
+        wait_status(scanner, 'detected', 2)
+        assert len(tts.calls) == 1
+        assert scanner.dispatch('read', {})['speech']['state'] == 'queued'
+        assert scanner.dispatch('config', {'config': {'auto_speak': False}})['auto_speak'] is False
+        scanner._on_frame(SimpleNamespace(format='jpeg', data=jpeg(image('SECOND'))))
+        wait_status(scanner, 'detected', 3)
+        assert len(tts.calls) == 1
+    finally:
+        scanner.stop()
+    assert scanner._speech_thread is None and scanner._speech_queue.empty()
+
+
+def test_cooldown_links_and_long_content(nodes):
+    scanner = qr.QrScanPlugin(nodes, {'auto_speak': True}, tts_plugin=FakeTTS())
+    def result(text):
+        return {'status': 'detected', 'new_events': [{'sequence': 1, 'text': text}]}
+    scanner._queue_speech(result('https://example.com'))
+    assert scanner._speech_queue.get_nowait()['text'] == '扫码成功，识别到一个链接。'
+    scanner._queue_speech(result('A'))
+    assert scanner._speech_queue.empty()
+    scanner._last_speech = None
+    scanner._queue_speech(result('字'*1000))
+    assert len(scanner._speech_queue.get_nowait()['text']) < 120
+
+
+def test_busy_tts_is_not_interrupted(nodes):
+    tts = FakeTTS(busy=True)
+    scanner = qr.QrScanPlugin(nodes, {'auto_speak': True, 'scan_hz': 10}, tts_plugin=tts)
+    scanner.start()
+    try:
+        scanner._on_frame(SimpleNamespace(format='jpeg', data=jpeg(image('U1-001'))))
+        wait_status(scanner, 'detected')
+        deadline = time.monotonic()+2
+        while scanner.dispatch('read', {})['speech']['state'] != 'skipped' and time.monotonic()<deadline:
+            time.sleep(0.01)
+        assert not tts.calls
+        assert scanner.dispatch('read', {})['speech']['state'] == 'skipped'
+    finally:
+        scanner.stop()
+
+
+def test_slow_tts_does_not_block_scanning(nodes):
+    import threading
+    release = threading.Event()
+    entered = threading.Event()
+    class Slow(FakeTTS):
+        def dispatch(self, action, args):
+            if action == 'speak':
+                entered.set()
+                release.wait(3)
+            return super().dispatch(action, args)
+    scanner = qr.QrScanPlugin(nodes, {'auto_speak': True, 'scan_hz': 10}, tts_plugin=Slow())
+    scanner.start()
+    try:
+        scanner._on_frame(SimpleNamespace(format='jpeg', data=jpeg(image('U1-001'))))
+        assert entered.wait(2)
+        scanner._on_frame(SimpleNamespace(format='jpeg', data=jpeg(image('SECOND'))))
+        assert wait_status(scanner, 'detected', 2)['codes'][0]['text'] == 'SECOND'
+    finally:
+        release.set()
+        scanner.stop()
+
+
+def test_stop_prevents_late_speak_after_busy_check(nodes):
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    class SlowInfo(FakeTTS):
+        def dispatch(self, action, args):
+            if action == 'info':
+                entered.set()
+                release.wait(3)
+            return super().dispatch(action, args)
+    tts = SlowInfo()
+    scanner = qr.QrScanPlugin(nodes, {'auto_speak': True, 'scan_hz': 10}, tts_plugin=tts)
+    scanner.start()
+    try:
+        scanner._on_frame(SimpleNamespace(format='jpeg', data=jpeg(image('U1-001'))))
+        assert entered.wait(2)
+        stopping = threading.Thread(target=scanner.stop)
+        stopping.start()
+        assert scanner._stop.wait(1)
+        release.set()
+        stopping.join(3)
+        assert not stopping.is_alive() and not tts.calls
+    finally:
+        release.set()
+        scanner.stop()

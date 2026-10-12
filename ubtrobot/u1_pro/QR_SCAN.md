@@ -1,6 +1,7 @@
 # U1 Pro 单眼二维码卡片
 
 第一版只使用 `camera_left`。卡片不会打开相机、控制机器人、访问网址或执行二维码内容。
+现在可以在同一卡片直接调用 U1 原生 TTS 播报新识别事件。
 
 ## 数据链路
 
@@ -79,3 +80,19 @@ python3 tests/u1_qr_dds_check.py
   成功收到 JSON 输出，断流后成功收到 `stale` 且码内容清空。
 - 验证依赖为 OpenCV 4.11.0（wheel 4.11.0.86）和 NumPy 1.26.4；依赖检查无冲突。
 - 未完成：完整 U1 driver ARM64 镜像构建、厂商 SDK/相机硬件、画布、实机距离和光照测试。
+
+## U1 原生自动播报（无需 perception / Decision Core / Skill）
+
+`config.yaml` 默认 `auto_speak: true`。画布只需 `camera_left → U1 qr_scan`，
+新的二维码事件由独立语音线程调用 U1 原生 TTS，不阻塞图像扫描。
+可在卡片配置切换 auto_speak；speak_cooldown_s 默认 10 秒，speak_max_chars 默认 80。
+普通文字说“扫码成功，内容是……”，http/https/weixin 链接只提示识别到链接。
+
+持续同一码只播报一次；冷却期间的新事件跳过，队列最多一个，过期内容不播报。
+若原生 TTS 正在进行其他播报，则跳过，不打断；多码时先播报第一个码。
+`read/info` 的 speech 字段显示最近请求状态（queued/skipped/error），queued 不等于确认听见。
+停止扫码会清理待播队列，但不会中断已经交给原生 TTS 播放的语音。
+不要同时让 Decision Core 或感知 TTS 对同一事件播报，以免重复。
+
+这项更新只修改 U1 driver，新镜像更新原 PR 的 feat/u1-driver 分支即可。
+不需要通用 perception 镜像，不需要 Agent Core 更新，不包含 Activity 功能。
