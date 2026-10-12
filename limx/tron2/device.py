@@ -9,7 +9,7 @@ from aiohttp import web
 from vendor import RobotReader
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.4.1'
+VERSION = '0.4.2'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Read-only Sensors'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -50,12 +50,6 @@ class Adapter:
                                    **metadata_properties()},
                     'required': ['action']},
                 'topic_out': [{'topic': TOPICS[name], 'format': 'data/json'}]})
-        tools.append({'name': 'read_state', 'type': 'resource',
-            'description': '读取三张传感器卡片的当前缓存与接收时效；不发送机器人控制指令',
-            'inputSchema': {'type': 'object', 'additionalProperties': False,
-                'properties': {'action': {'type': 'string',
-                    'enum': ['info', 'read', 'start', 'stop'], 'default': 'read'},
-                    **metadata_properties()}}})
         return tools
 
     def snapshot(self):
@@ -71,15 +65,9 @@ class Adapter:
             if not isinstance(value, str) or len(value) > 128 or any(
                     ord(c) < 32 or ord(c) == 127 for c in value):
                 raise ValueError('Invalid Core metadata: ' + key)
-        action = args.get('action', 'read' if name == 'read_state' else None)
+        action = args.get('action')
         if not isinstance(action, str):
             raise ValueError('An action string is required')
-        if name == 'read_state':
-            if action in ('start', 'stop'):
-                return {'state': 'ready' if action == 'start' else 'idle', 'read_only': True}
-            if action not in ('info', 'read'):
-                raise ValueError('Unsupported read-only action')
-            return {'read_only': True, 'samples': self.snapshot()}
         if name not in self.enabled:
             raise ValueError('Unknown tool; this driver exposes only parameter readers')
         if action not in ('info', 'start', 'stop'):

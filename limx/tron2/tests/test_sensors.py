@@ -287,12 +287,13 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         result = reply['result']
         return result['isError'], json.loads(result['content'][0]['text'])
 
-    async def test_handshake_and_three_sensors_plus_resource(self):
+    async def test_handshake_and_exactly_three_sensors(self):
         reply = await self.rpc('initialize')
         self.assertEqual(reply['result']['serverInfo']['version'], VERSION)
         tools = (await self.rpc('tools/list'))['result']['tools']
-        self.assertEqual({t['name'] for t in tools}, set(TOPICS) | {'read_state'})
-        self.assertEqual({t['type'] for t in tools}, {'sensor', 'resource'})
+        self.assertEqual({t['name'] for t in tools}, set(TOPICS))
+        self.assertEqual({t['type'] for t in tools}, {'sensor'})
+        self.assertEqual((await self.rpc('resources/list'))['result']['resources'], [])
         for tool in tools:
             if tool['type'] == 'sensor':
                 self.assertEqual(tool['topic_out'][0]['topic'], TOPICS[tool['name']])
@@ -305,10 +306,18 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(error)
                 self.assertTrue(result['read_only'])
                 self.assertTrue(result['always_on'])
-        error, result = await self.call('read_state')
+        error, result = await self.call('joint_state', action='info')
         self.assertFalse(error)
-        self.assertTrue(result['samples']['joint_state']['available'])
-        self.assertEqual(result['samples']['joint_state']['data']['joint_count'], 16)
+        self.assertTrue(result['sample']['available'])
+        self.assertEqual(result['sample']['data']['joint_count'], 16)
+
+    async def test_removed_read_state_is_not_callable(self):
+        for action in ('read', 'info', 'start', 'stop'):
+            with self.subTest(action=action):
+                error, result = await self.call('read_state', action=action,
+                    instance_id='old-resource', _trace_id='valid')
+                self.assertTrue(error)
+                self.assertIn('Unknown tool', result['error'])
 
     async def test_core_trace_and_instance_metadata_are_declared_and_ignored(self):
         tools = (await self.rpc('tools/list'))['result']['tools']
@@ -318,21 +327,18 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             props = tool['inputSchema']['properties']
             self.assertEqual(props['_trace_id']['maxLength'], 128)
             self.assertEqual(props['instance_id']['type'], 'string')
-            actions = ('read', 'info', 'start', 'stop') if tool['name'] == 'read_state' else ('info', 'start', 'stop')
+            actions = ('info', 'start', 'stop')
             for action in actions:
                 with self.subTest(tool=tool['name'], action=action):
                     error, original = await self.call(tool['name'], action=action)
                     self.assertFalse(error)
                     error, traced = await self.call(tool['name'], action=action,
-                        instance_id='tron2-assist-read_state', _trace_id=trace)
+                        instance_id='tron2-sensor-card', _trace_id=trace)
                     self.assertFalse(error)
                     self.assertTrue(traced['read_only'])
                     # A different receipt age is natural; the sampled robot data
                     # and lifecycle result must otherwise be independent of metadata.
-                    if tool['name'] == 'read_state' and action in ('read', 'info'):
-                        for name in TOPICS:
-                            self.assertEqual(traced['samples'][name]['data'], original['samples'][name]['data'])
-                    elif action == 'info':
+                    if action == 'info':
                         self.assertEqual(traced['sample']['data'], original['sample']['data'])
                     else:
                         self.assertEqual(traced, original)
@@ -345,7 +351,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                      {'_trace_id': 'valid', 'target_q': [0]*14},
                      {'_trace_id': 'valid', 'unexpected': True}):
             with self.subTest(args=args):
-                error, result = await self.call('read_state', action='read', **args)
+                error, result = await self.call('joint_state', action='info', **args)
                 self.assertTrue(error)
                 self.assertTrue(result['read_only'])
         error, result = await self.call('reset_pose', action='execute', _trace_id='valid')
@@ -385,7 +391,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_card_is_not_discovered(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['joint_state']))
-        self.assertEqual({t['name'] for t in adapter.tools()}, {'joint_state', 'read_state'})
+        self.assertEqual({t['name'] for t in adapter.tools()}, {'joint_state'})
         with self.assertRaises(ValueError):
             adapter.call('battery_state', {'action': 'start'})
 
@@ -420,7 +426,7 @@ class PackagingTests(unittest.TestCase):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common; '
-                'assert device.VERSION == "0.4.1"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.4.2"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

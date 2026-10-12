@@ -1,13 +1,12 @@
 # LimX TRON2 只读参数驱动
 
-为 Phanthy Motus 提供三张持续更新的传感器卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.1`；MCP 仅监听 `127.0.0.1:15791`。
+为 Phanthy Motus 提供三张持续更新的传感器卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.2`；MCP 仅监听 `127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 关节位置 `q`（rad）、`positions_deg`（度）、厂家返回的 `dq` / `tau` | `/limx_tron2/joint_state` |
 | `robot_status` | sensor | 工作模式、固件版本、IMU / 电机 / 相机等状态 | `/limx_tron2/robot_status` |
 | `battery_state` | sensor | 电量百分比及厂家原始 BMS 字段 | `/limx_tron2/battery_state` |
-| `read_state` | resource | 上述已启用卡片的当前缓存和接收状态 | MCP 返回 JSON |
 
 三张传感器卡片使用 `data/json` 格式，通过 Motus 本机 ROS2 总线发布。默认每 0.5 秒查询一次关节状态并发布缓存，实际更新速率受机器人响应时间影响。状态和电池来自机器人主动发送的 `notify_robot_info`，其更新频率由机器人决定。
 
@@ -23,9 +22,9 @@
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
 - 默认超过 5 秒没有收到对应数据则 `available: false`、`sample_status: stale`、`data: null`。断连时立即清空缓存，发布 `offline`，再尝试重连；不会继续显示旧关节值。
 
-卡片的 `start` / `stop` 是单实例常开传感器的生命周期兼容调用，不启动或停止机器人，也不停止后台采样。`info` 返回当前状态。`read_state` 从缓存读取，不额外发送机器人请求。
+卡片的 `start` / `stop` 是单实例常开传感器的生命周期兼容调用，不启动或停止机器人，也不停止后台采样。`info` 返回该传感器的当前状态和缓存，不额外发送机器人请求。驱动仅暴露表中的三张 sensor，不提供缓存聚合 resource 或助手卡片。
 
-兼容 Agent Core 自动注入的 `instance_id` 和 `_trace_id`：两者仅接受最长 128 字符、无控制字符的字符串，不参与机器人请求、不回显到采样数据。Schema 与运行时均接受这两项元数据；其他未声明参数仍被拒绝。0.4.1 修复了网页直接读取成功、模型调用却因 `_trace_id` 被拒绝的问题。
+兼容 Agent Core 自动注入的 `instance_id` 和 `_trace_id`：两者仅接受最长 128 字符、无控制字符的字符串，不参与机器人请求、不回显到采样数据。Schema 与运行时均接受这两项元数据；其他未声明参数仍被拒绝。0.4.2 保留追踪元数据兼容，并移除之前的缓存聚合资源工具；三张传感器仍能通过 info 查看当前缓存。
 
 ## 配置
 
@@ -74,7 +73,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪、检查 Core 注册和 MCP 卡片类型、验证生命周期以及关节回复接收时间持续更新。它不检查或调用运动接口。该脚本按默认三张卡片全部启用验收。
 
-刷新 Motus 控制台，找到 **LimX TRON2 Read-only Sensors**，将三张 sensor 卡片拖入画布，点击“查看数据流”。数据存在时应看到 `available: true`；断开机器人链路后应看到 `data: null` 和不可用状态，恢复连接后收到新通知 / 关节回复才恢复数值。`read_state` 可查看当前缓存。
+刷新 Motus 控制台，找到 **LimX TRON2 Read-only Sensors**，将三张 sensor 卡片拖入画布并开启，再点击“查看数据流”。从旧版升级时，应从画布移除旧缓存读取、文字输入和决策卡片；助手 Skill 是单独的本机配置，不属于此 Driver。数据存在时应看到 `available: true`；断开机器人链路后应看到 `data: null` 和不可用状态，恢复连接后收到新通知 / 关节回复才恢复数值。各传感器的 `info` 可查看该卡片当前缓存。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：全部已启用卡片有最近接收数据时为 HTTP 200，否则为 503。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 

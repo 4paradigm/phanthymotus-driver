@@ -13,4 +13,3 @@ cards:
   - {name: joint_state, type: sensor}
   - {name: robot_status, type: sensor}
   - {name: battery_state, type: sensor}
-  - {name: read_state, type: resource}

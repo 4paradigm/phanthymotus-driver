@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.4.1'
+VERSION = '0.4.2'
 CARDS = {'joint_state', 'robot_status', 'battery_state'}
 
 
@@ -30,11 +30,14 @@ def rpc(method, params=None):
 
 
 def read_samples():
-    result = rpc('tools/call', {'name': 'read_state', 'arguments': {
-        'action': 'read', 'instance_id': 'readonly-check', '_trace_id': 'readonly-check-trace'}})
-    if result.get('isError'):
-        raise ValueError('Read-state request failed')
-    return json.loads(result['content'][0]['text'])['samples']
+    samples = {}
+    for name in CARDS:
+        result = rpc('tools/call', {'name': name, 'arguments': {
+            'action': 'info', 'instance_id': 'readonly-check', '_trace_id': 'readonly-check-trace'}})
+        if result.get('isError'):
+            raise ValueError('Sensor info request failed: ' + name)
+        samples[name] = json.loads(result['content'][0]['text'])['sample']
+    return samples
 
 
 def run_check(timeout=20):
@@ -55,9 +58,9 @@ def run_check(timeout=20):
     else:
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
-    if {tool['name'] for tool in tools} != CARDS | {'read_state'} or any(
-            tool['type'] not in ('sensor', 'resource') for tool in tools):
-        raise ValueError('Unexpected card set; no actuators may be exposed')
+    if {tool['name'] for tool in tools} != CARDS or any(
+            tool['type'] != 'sensor' for tool in tools):
+        raise ValueError('Unexpected card set; exactly three sensors are required')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,
@@ -75,7 +78,7 @@ def run_check(timeout=20):
     if joint['received_at'] <= before['joint_state']['received_at']:
         raise ValueError('Joint response receipt did not update')
     values = joint['data']
-    print('PASS: only sensor/resource cards; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: exactly three sensor cards; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
