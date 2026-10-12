@@ -368,6 +368,36 @@ def test_a_refused_command_stops_the_robot_rather_than_leaving_it_walking():
     assert loco.published[-1] == (0.0, 0.0, 0.0)
 
 
+def test_watchdog_activity_reports_hold_stand_down_and_fresh_resume():
+    """Silence holds the base; the first fresh command says that it restarted."""
+    from common.control import ControlSink
+
+    now = [1]
+    wall = [int(time.time() * 1000)]
+    card = _card(loco=FakeLoco(), full_scale_vx_mps=0.5)
+    sink = ControlSink(card._descriptor, card._apply, on_watchdog=card._hold,
+                       on_abort=card._hold, escalate_after=2,
+                       clock=lambda: now[0], wall_clock=lambda: wall[0])
+    card._sink = sink
+    _stream_submit(card, _command([0.1, 0, 0, 0, 0, 0], seq=1, stamp_ms=wall[0]), sink)
+
+    now[0] += loco_servo.WATCHDOG_MS
+    first = card._tick_watchdog(sink)
+    assert first.verdict is Verdict.DROPPED
+    assert card.dispatch("info", {})["activity"]["state"] == "holding"
+
+    now[0] += loco_servo.WATCHDOG_MS
+    second = card._tick_watchdog(sink)
+    assert second.verdict is Verdict.ABORTED
+    assert card.dispatch("info", {})["activity"]["state"] == "stood_down"
+
+    wall[0] += 1
+    _stream_submit(card, _command([0.1, 0, 0, 0, 0, 0], seq=2, stamp_ms=wall[0]), sink)
+    activity = card.dispatch("info", {})["activity"]
+    assert activity["state"] == "running"
+    assert activity["event"] == "resumed"
+
+
 # ── posture ──────────────────────────────────────────────────────────────────
 
 def test_starting_does_not_depend_on_posture():

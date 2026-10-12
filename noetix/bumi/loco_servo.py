@@ -378,6 +378,11 @@ class LocoServoPlugin:
         self._running = False
         self._paused = False
         self._last_command = None
+        # Surfaced through ``info`` on every safety transition.  A watchdog
+        # hold is not a terminal state: the next fresh command resumes motion,
+        # and that restart must be visible to both an operator and upstream.
+        self._activity = {"state": "idle", "event": "created", "reason": "",
+                          "at": time.time()}
         self._applied = 0
         self._holds = 0
         self._refused = 0
@@ -576,6 +581,7 @@ class LocoServoPlugin:
             self._holds = 0
             self._published = 0
             self._target = (0.0, 0.0, 0.0)
+        self._set_activity("waiting", "started", "waiting for a valid command")
 
         try:
             self._open(topic)
@@ -608,7 +614,11 @@ class LocoServoPlugin:
             # reuse a one-second mode cache on either side of that transition.
             self._invalidate_mode_cache()
         if halted:
+            self._set_activity("paused", "paused", "operator paused the stream")
             self._hold()
+        else:
+            self._set_activity("waiting", "resume_armed",
+                               "waiting for a fresh valid command")
         return {"state": "paused" if halted else "running",
                 "input": self._input_topic}
 
@@ -667,6 +677,7 @@ class LocoServoPlugin:
                 # canvas to one that is working, and this is the difference.
                 "posture_problem": self._posture_problem_text,
                 "last": self._last_command,
+                "activity": dict(self._activity),
                 "control_interface": self._interface(),
             }
 
@@ -781,11 +792,20 @@ class LocoServoPlugin:
             command = json.loads(message.data)
         except Exception:                                     # noqa: BLE001
             return          # one bad frame must not take the stream down
+        with self._lock:
+            resuming = self._activity.get("state") in ("holding", "stood_down")
         outcome = self._submit(sink, command)
         if outcome is not None and getattr(outcome, "verdict", None) is not None:
+            resumed = bool(getattr(outcome, "applied", False) and resuming)
+            event = "resumed" if resumed else "command"
+            if getattr(outcome, "applied", False):
+                self._set_activity("running", event,
+                                   "fresh valid command resumed motion" if resumed else
+                                   "valid command accepted")
             self._last_command = {
                 "verdict": str(getattr(outcome.verdict, "name", outcome.verdict)),
                 "reason": getattr(outcome, "reason", ""),
+                "activity_event": event if getattr(outcome, "applied", False) else None,
                 "at": time.time(),
             }
 
@@ -845,15 +865,40 @@ class LocoServoPlugin:
         while not self._repeat_stop.is_set():
             sink = self._sink
             if sink is not None:
-                try:
-                    sink.tick()
-                except Exception as exc:                      # noqa: BLE001
-                    print(f"[loco_servo] watchdog tick failed: {exc}", flush=True)
+                self._tick_watchdog(sink)
             if not self._dry_run:
                 with self._lock:
                     target = self._target
                 self._publish(*target)
             self._repeat_stop.wait(period)
+
+    def _set_activity(self, state: str, event: str, reason: str = ""):
+        """Expose control safety transitions through the card's info state."""
+        with self._lock:
+            previous = self._activity.get("state")
+            self._activity = {"state": state, "event": event,
+                              "reason": reason, "at": time.time()}
+        if previous != state or event == "resumed":
+            print(f"[loco_servo] activity {previous or 'none'} -> {state}: {reason}",
+                  flush=True)
+
+    def _tick_watchdog(self, sink: ControlSink):
+        """Drive and report watchdog transitions from the repeat-thread clock."""
+        try:
+            outcome = sink.tick()
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[loco_servo] watchdog tick failed: {exc}", flush=True)
+            return None
+        if outcome is None:
+            return None
+        stood_down = outcome.verdict is Verdict.ABORTED
+        state = "stood_down" if stood_down else "holding"
+        event = "watchdog_stand_down" if stood_down else "watchdog_hold"
+        self._set_activity(state, event, outcome.reason)
+        self._last_command = {"verdict": str(outcome.verdict.name),
+                              "reason": outcome.reason, "activity_event": event,
+                              "at": time.time()}
+        return outcome
 
     def _publish(self, nx: float, ny: float, nz: float):
         """Hand one normalised command to the SDK, through `loco`'s rate limiter.
