@@ -86,7 +86,8 @@ python3 tests/u1_qr_dds_check.py
 `config.yaml` 默认 `auto_speak: true`。画布只需 `camera_left → U1 qr_scan`，
 新的二维码事件由独立语音线程调用 U1 原生 TTS，不阻塞图像扫描。
 可在卡片配置切换 auto_speak；speak_cooldown_s 默认 10 秒，speak_max_chars 默认 80。
-普通文字说“扫码成功，内容是……”，http/https/weixin 链接只提示识别到链接。
+普通文字说“扫码成功，内容是……”，URI 链接（含 wxp://、weixin://、其他应用协议和 mailto:）及常见裸域名只提示识别到链接。
+完整内容仍保留在 codes.text 中，不会访问链接。
 
 持续同一码只播报一次；冷却期间的新事件跳过，队列最多一个，过期内容不播报。
 若原生 TTS 正在进行其他播报，则跳过，不打断；多码时先播报第一个码。

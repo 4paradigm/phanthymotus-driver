@@ -316,3 +316,22 @@ def test_stop_prevents_late_speak_after_busy_check(nodes):
     finally:
         release.set()
         scanner.stop()
+
+
+@pytest.mark.parametrize('content', [
+    'wxp://f2f/example', 'weixin://dl/chat?example', 'wx://example',
+    'WXPay://example', '  wxp://example  ', 'https://example.com',
+    'http://example.com', 'alipays://platformapi/startapp',
+    'mailto:user@example.com', 'www.example.com/item/001', 'wxp.cn/item/001',
+])
+def test_link_payloads_are_not_read_aloud(nodes, content):
+    scanner = qr.QrScanPlugin(nodes, {'auto_speak': True}, tts_plugin=FakeTTS())
+    scanner._queue_speech({'status': 'detected', 'new_events': [{'sequence': 1, 'text': content}]})
+    assert scanner._speech_queue.get_nowait()['text'] == '扫码成功，识别到一个链接。'
+
+
+@pytest.mark.parametrize('content', ['U1-001', '展品编号：001', 'wx测试编号001'])
+def test_plain_text_is_still_read_aloud(nodes, content):
+    scanner = qr.QrScanPlugin(nodes, {'auto_speak': True}, tts_plugin=FakeTTS())
+    scanner._queue_speech({'status': 'detected', 'new_events': [{'sequence': 1, 'text': content}]})
+    assert scanner._speech_queue.get_nowait()['text'] == '扫码成功，内容是：'+content

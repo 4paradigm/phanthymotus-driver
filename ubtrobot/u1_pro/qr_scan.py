@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import queue
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -229,7 +230,13 @@ class QrScanPlugin:
             return
         event = result['new_events'][0]
         content = event['text']
-        if content.lower().startswith(('http://', 'https://', 'weixin://')):
+        normalized = content.strip()
+        # URI schemes include wxp:, weixin:, app links and mailto:, not only HTTP.
+        # Also recognize common bare web addresses. Preserve the original in codes.
+        is_link = bool(re.match(r'^[a-z][a-z0-9+.-]*:', normalized, re.IGNORECASE)
+                       or re.match(r'^(?:www\.|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/:?#]|$))',
+                                   normalized, re.IGNORECASE))
+        if is_link:
             text = '扫码成功，识别到一个链接。'
         else:
             text = '扫码成功，内容是：' + content[:self.speak_max_chars]
