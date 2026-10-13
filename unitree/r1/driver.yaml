@@ -15,6 +15,7 @@ build_context_extras:
 # smart_motion is not in config.yaml but defaults to enabled=True in main.py
 # (R1DeviceBundle.__init__), so it is included too.
 cards:
+  - { name: demo_echo,    type: processor }
   - { name: mic,          type: sensor }
   - { name: tts,          type: actuator }
   - { name: speaker,      type: actuator }
@@ -36,3 +37,4 @@ cards:
   - { name: ext_mic,      type: sensor }
   - { name: ext_camera,   type: sensor }
   - { name: smart_motion, type: actuator }
+
