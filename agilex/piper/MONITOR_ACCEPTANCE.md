@@ -5,7 +5,7 @@
 ## 结果
 
 - 监控测试 22 项：通过（含现场快照命名适配新增 2 项）。
-- 最新指定回归集合：187 passed、114 subtests passed（含 5 项部署适配测试）。
+- 最新指定回归集合：190 passed、114 subtests passed（含 5 项部署适配与 3 项状态拆卡测试）。
 - 实际 Edge headless + 未修改 Core 渲染器：通过；528 个矩阵值对比，无页面脚本错误。
 - 浏览器场景：三组实测角度模拟、过期冻结、读取失败提示、恢复、双设备隔离。
 - ROS transport 使用假 ROS 对象验证 Core context、QoS、消息序列化、重复关闭及部分初始化失败释放。
@@ -18,6 +18,7 @@ Python 3.12 回归命令（pytest、PyYAML、OpenCV 为测试环境依赖，不�
 
 ```bash
 python -m pytest -q \
+  tests/test_piper_status_card.py \
   tests/test_piper_monitor.py tests/test_piper_monitor_bundle.py tests/test_piper_ten_cards.py \
   tests/test_piper_cards.py tests/test_piper_controls.py tests/test_piper_prepare.py \
   tests/test_piper_deployment.py tests/test_piper_mac.py tests/test_common_lifecycle.py \
@@ -83,6 +84,24 @@ python -m pytest -q \
 - 部署脚本在服务器 `/home/agilex/piper-monitor-deploy-20261013/deploy_monitor.py`。
   回退命令（只恢复驱动，不动 Core）：
   `sudo python3 /home/agilex/piper-monitor-deploy-20261013/deploy_monitor.py --rollback /opt/phanthy-motus/backups/piper-monitor-20261013-120447`
+
+### 2026-10-13 12:27 仅机械臂 1 两张卡
+
+- 用户要求先仅操作机械臂 1，把读取状态与控制拆成两张卡，移除其余画布卡片。
+  当前布局精确包含 `piper_status`、`arm_control` 两个节点，无数据或执行连线。
+- 新增独立 `status_card.py`；手动读状态复用现有连接和安全缓存快照，不发送控制命令。
+  控制卡移除读取状态选项，保留原预览/确认控制流程，默认「请选择控制动作」为空操作。
+- 仅重建机械臂 1：`agilex-piper:local-arm1-status-78b61ded`。
+  核对机械臂 2 镜像与启动时间均未改变；Core 镜像未变，不修改或重启 Core。
+- 原布局与部署备份保留。最初完整多卡备份：
+  `/opt/phanthy-motus/backups/piper-arm1-two-cards-20261013-122517/`；
+  最终部署备份：`/opt/phanthy-motus/backups/piper-arm1-two-cards-20261013-122741/`。
+  迁移仅更新已有画布配置，避免 Core 删除节点时自动调用机械臂 2 的停止方法。
+- Edge 实际服务器页面刷新验证通过：两卡可见，读取状态独立，控制默认未选动作。
+  现场截图 `arm1-two-cards.png`。侧栏注册工具仍保留，其他画布节点已移除。
+- 本次仅做软件与界面验证，没有执行真机动作或手动读取；真实控制由用户自行测试。
+  状态卡测试覆盖安全连接、独立生命周期、拒绝控制参数与控制卡动作隔离；最终回归 190 项通过。
+- 部署脚本：`/home/agilex/piper-monitor-deploy-20261013/split_arm1_deploy.py`。
 
 用户要求先测试再提交 PR，因此本阶段保留本地独立提交，不创建或更新 PR。
 最终目标：[驱动 PR #382](https://github.com/4paradigm/phanthymotus-driver/pull/382)。
