@@ -25,7 +25,7 @@ python3 /work/motion/fetch_assets.py --check
 
 真实数值用例覆盖 G1_23 模型和已核验网格的完整关节解、独立数值子进程的 EEF14→joint10 和双末端反馈，以及空配置执行器接受新标定、无效候选保留前一配置。2026-10-12，上海 G1 的 ARM64 运行镜像通过 G1 与 servo_eef 回归：196 项通过、无跳过。ROS 隔离测试收到 541 帧，完成 21 个订阅代次及 3 次注入异常恢复。系统 Python、主要模块导入、模型哈希及无 cmeel 临时目录检查通过。
 
-源码构建和产物运行已分别验证。M2 本机 Linux ARM64 Docker 编译的 wheel 也在 G1 通过同组 196 项测试。随后将依赖拆为固定版本 base，首个 base 复用已验证的编译产物，未重复冷编译 Pinocchio。业务 Dockerfile 使用该 base，在 `--no-cache` 下构建耗时 12.38 秒；新镜像通过 196 项回归、无跳过，ROS 隔离测试收到 394 帧，完成 21 个订阅代次及 3 次注入异常恢复。上述结果不代表 base 远端发布、BOT 发布、业务部署或物理动作验收。
+源码构建和产物运行已分别验证。M2 本机 Linux ARM64 Docker 编译的 wheel 也在 G1 通过同组 196 项测试。随后将依赖拆为固定版本 base，首个 base 复用已验证的编译产物，未重复冷编译 Pinocchio。业务 Dockerfile 使用该 base，在 `--no-cache` 下构建耗时 12.38 秒；新镜像通过 196 项回归、无跳过，ROS 隔离测试收到 394 帧，完成 21 个订阅代次及 3 次注入异常恢复。2026-10-13，该 base 已按 [G1 构建说明](../README.md#构建) 中的名称发布，远端摘要与本地一致；BOT 发布、业务部署和物理动作验收仍未完成。
 
 ```sh
 python -m pytest -q unitree/g1/tests/test_motion_control_numeric.py

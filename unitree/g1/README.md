@@ -6,19 +6,19 @@ G1 Driver 通过 MCP 提供运动控制、机械臂动作、麦克风、扬声�
 
 ## 构建
 
-业务镜像使用固定版本的 G1 base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
+业务镜像使用固定版本的 teleop base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
 
-首次构建，或修改依赖版本/编译配置时，在仓库根目录构建 base。优先使用本机 Linux ARM64 Docker：
+已发布的 base 可直接拉取，日常业务构建无需执行以下源码构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
 
 ```sh
 docker build --platform linux/arm64 \
   -f unitree/g1/Dockerfile.base \
   --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
-  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:humble-pin4.1.0-casadi3.8.1-v1 \
+  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:release.261012.4674297 \
   unitree/g1
 ```
 
-base 必须存在于当前 builder 可访问的本地镜像库或镜像仓库。当前版本尚未发布到镜像仓库；首次使用需先执行该构建。跨机器使用前需发布并核验镜像摘要。修改依赖时更新 base 标签及业务 Dockerfile 的默认值，不覆盖已发布版本。自定义 base 可通过业务构建参数 `G1_BASE_IMAGE` 指定；`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
+base 必须存在于当前 builder 可访问的本地镜像库或镜像仓库。当前版本已发布，远端 linux/arm64 镜像的索引摘要为 `sha256:88b1730d68102f21a20328f1fd87ec5ad3657766c0858db239e84f09dcdbac58`，与已验证的本地产物一致。修改依赖时更新 base 标签及业务 Dockerfile 的默认值，不覆盖已发布版本。自定义 base 可通过业务构建参数 `G1_BASE_IMAGE` 指定；`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
 
 ## 双臂遥操
 

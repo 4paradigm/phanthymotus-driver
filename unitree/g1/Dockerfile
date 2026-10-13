@@ -1,4 +1,4 @@
-ARG G1_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:humble-pin4.1.0-casadi3.8.1-v1
+ARG G1_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:release.261012.4674297
 FROM ${G1_BASE_IMAGE}
 
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.
