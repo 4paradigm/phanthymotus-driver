@@ -327,6 +327,52 @@ def _media_all():
     node.create_subscription(PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud",
                              push_lidar, qos, callback_group=group)
     print("[relay] Jazzy input ready key=lidar_cloud topic=/agibot_a3/lidar_cloud domain=232", flush=True)
+
+    # The official AimDK audio route is a protobuf inside RosMsgWrapper. Decode
+    # it while still on the host Jazzy side and forward only the PCM bytes via
+    # std_msgs, avoiding cross-distro deserialization of the wrapper payload.
+    try:
+        from ros2_plugin_proto.msg import RosMsgWrapper
+        from aimdk.protocol.agent.agent_data_pb2 import ProcessedAudioOutput
+        audio_publishers = {
+            1: node.create_publisher(UInt8MultiArray, "/agibot_a3/mic_pcm", 10),
+            2: node.create_publisher(UInt8MultiArray, "/agibot_a3/ext_mic_pcm", 10),
+        }
+        audio_received = {1: 0, 2: 0}
+
+        def push_processed_audio(msg):
+            try:
+                wrapper_data = getattr(msg, "data", b"")
+                if isinstance(wrapper_data, (list, tuple)):
+                    if all(isinstance(part, int) for part in wrapper_data):
+                        wrapper_data = bytes((part & 0xff) for part in wrapper_data)
+                    else:
+                        wrapper_data = b"".join(bytes(part) for part in wrapper_data)
+                else:
+                    wrapper_data = bytes(wrapper_data)
+                processed = ProcessedAudioOutput()
+                processed.ParseFromString(wrapper_data)
+                stream_id = int(processed.stream_id)
+                publisher = audio_publishers.get(stream_id)
+                if publisher is None or not processed.audio_data:
+                    return
+                output = UInt8MultiArray()
+                output.data = list(processed.audio_data)
+                publisher.publish(output)
+                audio_received[stream_id] += 1
+                if audio_received[stream_id] == 1 or audio_received[stream_id] % 500 == 0:
+                    source = "mic" if stream_id == 1 else "ext_mic"
+                    print(f"[relay] audio received source={source} chunks={audio_received[stream_id]} "
+                          f"bytes={len(processed.audio_data)} vad={processed.vad_state}", flush=True)
+            except Exception as exc:
+                print(f"[relay] audio decode failed: {type(exc).__name__}: {exc!r}", flush=True)
+
+        node.create_subscription(RosMsgWrapper, "/agent/process_audio_output",
+                                 push_processed_audio, 10, callback_group=group)
+        print("[relay] audio subscription ready topic=/agent/process_audio_output", flush=True)
+    except (ImportError, AttributeError) as exc:
+        print(f"[relay] audio relay unavailable: {type(exc).__name__}: {exc}", flush=True)
+
     executor = MultiThreadedExecutor(num_threads=8)
     executor.add_node(node)
     executor.spin()

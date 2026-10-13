@@ -79,6 +79,36 @@ def _flatten_joint_group(group, prefix, output):
             _flatten_json(item, f"{prefix}_{field}", output)
 
 
+def _imu_quaternion(value):
+    """Return a normalized usable sensor_msgs/Imu orientation or None.
+
+    ROS reserves orientation_covariance[0] == -1 to mean that orientation is
+    unavailable. Some HAL publishers still fill orientation with the default
+    identity quaternion in that case; forwarding it makes a fallen robot look
+    upright in the skeleton renderer.
+    """
+    if not isinstance(value, dict):
+        return None
+    covariance = value.get("orientation_covariance")
+    if isinstance(covariance, (list, tuple)) and covariance:
+        try:
+            if float(covariance[0]) < 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+    orientation = value.get("orientation")
+    if not isinstance(orientation, dict):
+        return None
+    try:
+        candidate = [float(orientation[key]) for key in ("w", "x", "y", "z")]
+        norm = math.sqrt(sum(component * component for component in candidate))
+        if not all(math.isfinite(component) for component in candidate) or norm <= 1e-6:
+            return None
+        return [component / norm for component in candidate]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
     """POST action completion to Agent Core (module-level ACP helper)."""
     import urllib.request as _urllib
@@ -190,6 +220,27 @@ NECK_JOINTS = ("head_yaw_joint", "head_pitch_joint")
 HAND_COMMAND_MAX = 2000
 HAND_O10_MAX = 4096
 HAND_TYPES = {"AgiHand": "agi_hand", "O10Hand": "o10_hand"}
+
+# The hand state topic is not consistent across A3 firmware revisions.  Some
+# builds publish the command-channel names (left_hand_joint_0..9), while
+# others publish the descriptive URDF names.  The skeleton renderer can only
+# animate URDF joints, so keep one positional mapping for the indexed form.
+# The first three channels are the thumb, followed by index, middle, ring and
+# pinky channels; this is also the O10 command order documented by AimDK.
+HAND_SKELETON_JOINTS = {
+    "left": (
+        "left_thumb_rotation_0", "left_thumb_wiggles_1", "left_thumb_bent_2",
+        "left_index_wiggles_0", "left_index_bent_1", "left_middle_bent",
+        "left_ring_wiggles_0", "left_ring_bent_1", "left_pinky_wiggles_0",
+        "left_pinky_bent_1",
+    ),
+    "right": (
+        "right_thumb_rotation_0", "right_thumb_wiggles_1", "right_thumb_bent_2",
+        "right_index_wiggles_0", "right_index_bent_1", "right_middle_bent",
+        "right_ring_wiggles_0", "right_ring_bent_1", "right_pinky_wiggles_0",
+        "right_pinky_bent_1",
+    ),
+}
 
 # Mic source (docs §7.3.5): 0=internal (v3.2 has a known hardware BUG — avoid),
 # 1=external (recommended).
@@ -520,6 +571,7 @@ class A3Nodes:
         self._AudioPlayback = AudioPlayback
         self._AudioChunk = AudioChunk
         self._UInt8MultiArray = UInt8MultiArray
+        self._wrapper_msg_type = None
         self._audio_buffers = {"mic": bytearray(), "ext_mic": bytearray()}
         self._audio_lock = threading.Lock()
         self._audio_received = {"mic": 0, "ext_mic": 0}
@@ -701,12 +753,14 @@ class A3Nodes:
         try:
             from aimdk.protocol.hal.bms import hal_bms_channel_pb2
             from aimdk.protocol.hal.state import hal_state_channel_pb2
+            from aimdk.protocol.agent import agent_data_pb2
             from aimdk.protocol.skill_pilot import skill_pilot_channel_pb2
             from aimdk.protocol.motion_control.motion import mc_motion_channel_pb2
             from aimdk.protocol.aim_master import am_channel_pb2
             self._pb = {
                 "bms": hal_bms_channel_pb2.BmsStateChannel,
                 "estop": hal_state_channel_pb2.EmergencyStateChannel,
+                "processed_audio": agent_data_pb2.ProcessedAudioOutput,
                 "skill": getattr(skill_pilot_channel_pb2, "SkillPilotStatus", None),
                 "commands": {
                     "MotionControlLocomotionVelocityChannel":
@@ -733,30 +787,54 @@ class A3Nodes:
             self._slow_state_timer = self.robot.create_timer(0.1, self._republish_slow_states)
 
         self.audio_topics = {}
+        self._audio_publishers = {}
         self.speaker_subscription = None
         if AudioCapture is not None and AudioPlayback is not None and AudioChunk is not None:
-            # Keep the two physical/logical routes as separate cards. On the
-            # deployed A3, /audiohal/audio/capture is the only topic with a
-            # live writer; /agent/audio/data/external is a downstream route.
-            # On the A3 actually deployed on the robot, the only live writer is
-            # aimrt_hal_audio_node on /audiohal/audio/capture.  The agent
-            # external topic is a consumer-facing route and currently has no
-            # writer, so it must remain the explicitly named ext_mic card.
-            for key, topic in (("mic", "/audiohal/audio/capture"),
-                               ("ext_mic", "/agent/audio/data/external")):
+            # AimDK v3.2's documented custom-interaction stream is the processed
+            # wrapper topic /agent/process_audio_output. It contains stream_id
+            # (1=internal, 2=external) and audio_data. The old HAL capture topic
+            # is an implementation detail and can be silent even while the
+            # official stream is live; subscribing to both also duplicated and
+            # reordered audio. Keep each card separate by filtering stream_id.
+            for key in ("mic", "ext_mic"):
                 core_topic = _core_topic(namespace, f"{key}/audio")
                 pub = self.core.create_publisher(AudioChunk, core_topic, 5)
+                self._audio_publishers[key] = pub
+                self.audio_topics[key] = {"robot_topic": "/agent/process_audio_output",
+                                          "topic": core_topic,
+                                          "format": "audio/pcm-16k"}
+
+            wrapper_type = self._probe_wrapper_type()
+            audio_node = self.media_robot or self.robot
+            if self._jazzy_relay:
+                # jazzy_relay.py decodes the protobuf on the host and exposes
+                # source-separated PCM byte streams in the robot domain.
+                for key, topic in (("mic", "/agibot_a3/mic_pcm"),
+                                   ("ext_mic", "/agibot_a3/ext_mic_pcm")):
+                    try:
+                        audio_node.create_subscription(
+                            UInt8MultiArray, topic,
+                            lambda msg, key=key: self._publish_relay_audio(key, msg),
+                            audio_qos, callback_group=self._media_callback_group)
+                    except TypeError:
+                        audio_node.create_subscription(
+                            UInt8MultiArray, topic,
+                            lambda msg, key=key: self._publish_relay_audio(key, msg),
+                            audio_qos)
+                print("[audio] subscribed host-relayed /agibot_a3/{mic,ext_mic}_pcm", flush=True)
+            elif wrapper_type is not None and self._pb is not None:
                 try:
-                    (self.media_robot or self.robot).create_subscription(
-                        AudioCapture, topic,
-                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), audio_qos,
+                    audio_node.create_subscription(
+                        wrapper_type, "/agent/process_audio_output",
+                        self._publish_processed_audio, audio_qos,
                         callback_group=self._media_callback_group)
                 except TypeError:
-                    (self.media_robot or self.robot).create_subscription(
-                        AudioCapture, topic,
-                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), audio_qos)
-                self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
-                                          "format": "audio/pcm-16k"}
+                    audio_node.create_subscription(
+                        wrapper_type, "/agent/process_audio_output",
+                        self._publish_processed_audio, audio_qos)
+                print("[audio] subscribed /agent/process_audio_output (stream_id 1=mic, 2=ext_mic)", flush=True)
+            else:
+                print("[warn] processed audio topic unavailable: RosMsgWrapper/protobuf not installed", flush=True)
 
         # -- command publishers (robot domain) --
         self.wrapper_available = self._probe_wrapper_type() is not None
@@ -830,7 +908,11 @@ class A3Nodes:
         # while others report only the mic count; prefer the explicit layout
         # when it is available and never mix reference channels into the mic.
         channels = max(1, info_channels, mic_channels + ref_channels)
-        selected_channels = max(1, mic_channels or info_channels or 1)
+        # ``info.channels`` is the interleaved total on the HAL message.  A
+        # few SDK builds omit mic_channels but still set ref_channels; using
+        # the total in that case averages the microphone with its cancellation
+        # reference and can produce a perfectly flat waveform.
+        selected_channels = max(1, mic_channels or (info_channels - ref_channels) or info_channels or 1)
         sample_format = str(getattr(info, "sample_format", "") or "").upper().replace("-", "_")
         coding_format = str(getattr(info, "coding_format", "") or "").upper().replace("-", "_")
         if sample_format in {"S16_LE", "PCM16", "PCM_16", "SIGNED16"}:
@@ -866,6 +948,50 @@ class A3Nodes:
         """Queue PCM and publish ASR-sized 32 ms frames at real-time speed."""
         chunk = self._audio_chunk(msg)
         payload = bytes(getattr(chunk, "data", ()))
+        self._queue_audio_payload(publisher, key, payload)
+
+    def _publish_processed_audio(self, msg):
+        """Route AimDK's official processed-audio wrapper by physical source.
+
+        ``/agent/process_audio_output`` is a RosMsgWrapper carrying
+        ``ProcessedAudioOutput``. It is the only documented stream for custom
+        interaction; stream_id 1 is the built-in microphone and 2 is the
+        external microphone. An absent external device therefore produces no
+        ext_mic samples instead of a duplicated or synthetic flat waveform.
+        """
+        message_type = (self._pb or {}).get("processed_audio")
+        if message_type is None:
+            return
+        message = message_type()
+        try:
+            message.ParseFromString(self._wrapper_bytes(msg))
+            stream_id = int(message.stream_id)
+            key = {1: "mic", 2: "ext_mic"}.get(stream_id)
+            payload = bytes(message.audio_data)
+        except Exception as exc:
+            if "processed_audio" not in self._media_failures:
+                self._media_failures.add("processed_audio")
+                print(f"[audio] processed audio decode failed: {exc}", flush=True)
+            return
+        if key is not None:
+            publisher = self._audio_publishers.get(key)
+            if publisher is not None:
+                self._queue_audio_payload(publisher, key, payload)
+
+    def _publish_relay_audio(self, key, msg):
+        """Accept PCM already decoded by the host Jazzy relay."""
+        publisher = self._audio_publishers.get(key)
+        if publisher is None:
+            return
+        payload = getattr(msg, "data", b"")
+        try:
+            payload = bytes(payload or b"")
+        except (TypeError, ValueError):
+            return
+        self._queue_audio_payload(publisher, key, payload)
+
+    def _queue_audio_payload(self, publisher, key, payload):
+        """Queue already-normalized mono PCM and pace it at real time."""
         if not payload:
             return
         self._audio_received[key] = self._audio_received.get(key, 0) + 1
@@ -896,7 +1022,12 @@ class A3Nodes:
         q = self._audio_queues[key]
         for frame in frames:
             try:
-                q.put_nowait((publisher, frame, getattr(chunk, "header", None)))
+                # The payload has already been normalized and detached from
+                # the source ROS message.  Do not reference the old ``chunk``
+                # local here: relay/processed-audio callers have no source
+                # message header, and that stale reference used to raise a
+                # NameError on the first real microphone frame.
+                q.put_nowait((publisher, frame, None))
             except queue.Full:
                 try:
                     q.get_nowait()
@@ -908,10 +1039,11 @@ class A3Nodes:
                     pass
         with self._audio_thread_lock:
             if key not in self._audio_threads:
-                self._audio_threads[key] = threading.Thread(
+                thread = threading.Thread(
                     target=self._audio_pump, args=(key,), daemon=True,
                     name=f"a3-{key}-pacer")
-                self._audio_threads[key].start()
+                self._audio_threads[key] = thread
+                thread.start()
 
     def _audio_pump(self, key):
         q = self._audio_queues[key]
@@ -1328,6 +1460,7 @@ class A3Nodes:
             velocities = group.get("velocity", []) if isinstance(group, dict) else []
             efforts = group.get("effort", []) if isinstance(group, dict) else []
             aliases = group_aliases.get(group_key, [])
+            hand_side_counts = {"left": 0, "right": 0}
             for index, name in enumerate(names):
                 # AimDK firmware revisions have emitted generic channel names
                 # (for example arm_joint_0) while preserving the documented
@@ -1335,6 +1468,19 @@ class A3Nodes:
                 # usable; exact URDF names remain preferred.
                 canonical = name if name in model_indices else (
                     aliases[index] if index < len(aliases) else name)
+                if group_key == "hand_state" and canonical not in model_indices:
+                    # Indexed command names and generic hand_joint_N names are
+                    # both positional; map them to the matching URDF finger
+                    # joint before deciding whether to drop the channel.
+                    side = "left" if str(name).lower().startswith("left") else (
+                        "right" if str(name).startswith("right") else None)
+                    if side is not None and "hand" in str(name).lower():
+                        channel_index = hand_side_counts[side]
+                        hand_side_counts[side] += 1
+                        if channel_index < len(HAND_SKELETON_JOINTS[side]):
+                            canonical = HAND_SKELETON_JOINTS[side][channel_index]
+                # One vendor build used the correctly-spelled thumb rotation
+                # name while the compact URDF retained its historical typo.
                 # Only actuated joints that exist in the model belong in the
                 # skeleton stream. Unknown metadata/fixed sensor joints remain
                 # available in joint_state's raw JSON stream.
@@ -1353,19 +1499,20 @@ class A3Nodes:
                                "tau": efforts[index] if index < len(efforts) else 0.0})
                 seen.add(canonical)
         output = self._String()
-        imu_quat = None
-        imu = self.values.get("imu_pelvis") or {}
-        orientation = imu.get("orientation") if isinstance(imu, dict) else None
-        if isinstance(orientation, dict):
-            try:
-                candidate = [float(orientation[key]) for key in ("w", "x", "y", "z")]
-                norm = math.sqrt(sum(value * value for value in candidate))
-                if all(math.isfinite(value) for value in candidate) and norm > 1e-6:
-                    imu_quat = [value / norm for value in candidate]
-            except (KeyError, TypeError, ValueError):
-                pass
+        imu_quat = _imu_quaternion(self.values.get("imu_pelvis") or {})
+        leg_names = set(group_aliases["leg_state"])
+        leg_seen = len(seen.intersection(leg_names))
+        has_pelvis_orientation = imu_quat is not None
+        # A3 firmware does not consistently expose leg feedback. Do not let a
+        # renderer infer a standing pose from URDF defaults when lower-body
+        # state or the pelvis orientation is missing.
+        pose_valid = bool(joints) and leg_seen == len(leg_names) and has_pelvis_orientation
         output.data = json.dumps({"format": "sensor/skeleton", "available": bool(joints),
                                   "fresh": bool(joints), "complete": len(seen) == len(model_indices),
+                                  "pose_valid": pose_valid,
+                                  "pose_reason": ("complete_leg_feedback_and_pelvis_imu"
+                                                   if pose_valid else
+                                                   "missing_leg_feedback_or_pelvis_imu"),
                                   "coverage": len(seen), "joint_count": len(joints),
                                   "timestamp_ms": int(time.time() * 1000),
                                   **({"imu_quat": imu_quat} if imu_quat is not None else {}),
@@ -2094,9 +2241,9 @@ MC_STATE_TRANSITIONS = {
     # actuator cards use _motion_gate below and fail closed when state is unknown.
 }
 MC_TRANSITION_SUGGESTIONS = {
-    "damping": "damping 用于关节卸力/跌倒保护，切换前确保机器人周围有足够空间；如当前未站立请先 get_up",
+    "damping": "damping 会释放主动关节支撑，仅用于卸力/安全保护；站立运行前不要停留在此模式",
     "lie_down": "lie_down 仅可从 MOTION 站立状态进入；如需起身请先 get_up",
-    "passive": "passive 拖动示教仅可从 MOTION 站立状态进入；退出示教请执行 get_up",
+    "passive": "passive 会让关节柔顺并失去主动支撑，仅用于拖动示教；退出示教请执行 get_up",
 }
 
 
@@ -2214,10 +2361,10 @@ class McModePlugin:
         for name, desc in (
             ("get_state", "查询当前运动控制动作状态（GetAction，异步切换结果确认）"),
             ("available", "查询当前可用动作列表（GetAvailableActions）"),
-            ("damping", "进入 Damping 阻尼模式（关节卸力，用于软急停/跌倒保护）"),
+            ("damping", "进入 Damping 阻尼模式（释放主动支撑，仅用于卸力/安全保护）"),
             ("get_up", "执行 GetUp 起身动作并在完成后自动切入 MOTION 可控态"),
             ("lie_down", "执行 LieDown 坐/躺下动作（仅 MOTION 站立态可进入）"),
-            ("passive", "进入 Passive 拖动示教模式（仅 MOTION 站立态可进入）"),
+            ("passive", "进入 Passive 拖动示教模式（关节柔顺、会失去主动支撑；仅 MOTION 站立态可进入）"),
             ("motion", "兼容旧接口：GetUp 完成后手动切入 MOTION 运行态"),
             ("pd_stand", "GetUp 完成后进入 PD_STAND 稳定站立态"),
         )
@@ -2675,12 +2822,17 @@ class HandControlPlugin:
             values = args.get(side)
             if values is None:
                 continue
+            live_names = live_left if side == "left" else live_right
             for i, value in enumerate(values):
                 # Feedback uses descriptive finger labels on some firmware,
                 # but the command endpoint accepts only its indexed six-joint
                 # names. Sending feedback labels makes the firmware apply at
                 # most the thumb channel and ignore the remaining fingers.
-                name = f"{side}_hand_joint_{i}"
+                # The vendor command accepts the names returned by the live
+                # hand_joint_state message. Indexed placeholder names are
+                # ignored by some AgiHand firmware builds (only the thumb
+                # appears to move), so prefer the reported descriptive names.
+                name = live_names[i] if i < len(live_names) else f"{side}_hand_joint_{i}"
                 positions[name] = _clamp(float(value), 0.0, max_value, f"{side} 手指 {i}")
         _require(positions, "至少提供 left 或 right 张合等级")
         rejected = _motion_gate(self.nodes.rpc, "hand_control")

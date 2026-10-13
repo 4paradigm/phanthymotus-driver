@@ -4,11 +4,13 @@ ROOT=/opt/phanthy-motus/data/a3-relay
 PIDFILE=$ROOT/relay.pid
 SOURCE=/work/agibot/A3/jazzy_relay.py
 HOST_SOURCE=/proc/1/root/tmp/a3-jazzy-relay.py
+HOST_AIMDK_WHEEL=/proc/1/root/tmp/a3_aimdk-3.2.0-py3-none-any.whl
 mkdir -p "$ROOT"
 case "${1:-start}" in
 start)
   if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
-      && grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null; then exit 0; fi
+      && grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null \
+      && grep -q "audio subscription ready" "$ROOT/relay.log" 2>/dev/null; then exit 0; fi
   if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
   # Keep the host-side log bounded; Docker's rotation does not cover this
@@ -22,6 +24,10 @@ start)
   # instead, then enter the host root (without -m) so the host Jazzy install and
   # /tmp path are visible.  PID/network namespaces are still entered for DDS.
   cp "$SOURCE" "$HOST_SOURCE"
+  # The relay parses the documented ProcessedAudioOutput wrapper with the same
+  # vendor-generated protobuf schema shipped in this image. It is pure Python
+  # and is staged into host /tmp alongside the relay so ADU needs no network.
+  cp /work/agibot/A3/vendor/a3_aimdk-3.2.0-py3-none-any.whl "$HOST_AIMDK_WHEEL"
   # Do not let nsenter inherit a removed container cwd.  Also avoid a login
   # shell: host profiles can re-source the container's Humble environment.
   cd /tmp
@@ -44,6 +50,7 @@ start)
      else
        echo "[relay] ERROR: host Jazzy setup not found" >&2; exit 41
      fi
+     export PYTHONPATH=/tmp/a3_aimdk-3.2.0-py3-none-any.whl:${PYTHONPATH:-}
      python3 -c "import rclpy, sensor_msgs" || {
        echo "[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable" >&2; exit 42;
      }
