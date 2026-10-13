@@ -122,8 +122,8 @@ class BumiDeviceBundle:
         camera_plugin = None
 
         if plugins_cfg.get("demo_echo", {}).get("enabled", False):
-            from demo_echo import demoPlugin
-            demo_plugin = demoPlugin(plugins_cfg["demo_echo"], namespace, executor)
+            from demo_echo import DemoEchoPlugin
+            demo_plugin = DemoEchoPlugin(plugins_cfg["demo_echo"], namespace, executor)
             self._plugins.append(demo_plugin)
             print("[bundle] DemoEchoPlugin loaded")
 
