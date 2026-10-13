@@ -29,11 +29,11 @@ from common.vendor_runtime import action_schema, jsonable, tool
 SERVICE_TIMEOUT = 10.0
 AUDIO_ENABLE_TIMEOUT = 2.0
 PULSE_SERVER_DEFAULT = "tcp:127.0.0.1:34567"
-SPEAKER_BLOCK_MS = 20
+SPEAKER_BLOCK_MS = 40
 SPEAKER_BLOCK_BYTES = 16_000 * 2 * SPEAKER_BLOCK_MS // 1000
-SPEAKER_QUEUE_DEPTH = 50
+SPEAKER_QUEUE_DEPTH = 25
 SPEAKER_INPUT_QUEUE_DEPTH = SPEAKER_QUEUE_DEPTH
-SPEAKER_PULSE_MAX_LEAD_MS = 40
+SPEAKER_PULSE_MAX_LEAD_MS = 80
 CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
@@ -980,7 +980,7 @@ class U1Nodes:
         try:
             process = subprocess.Popen(
                 [paplay, "--raw", "--format=s16le", "--rate=16000", "--channels=1",
-                 "--latency-msec=40", "--process-time-msec=20", "--server", server],
+                 "--latency-msec=80", "--process-time-msec=40", "--server", server],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

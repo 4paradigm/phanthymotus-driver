@@ -1430,6 +1430,26 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(nodes._speaker_frames, 3)
         self.assertEqual(nodes._speaker_audio_blocks_dropped, 0)
 
+    def test_speaker_pulse_blocks_are_40ms_and_preserve_pcm_bytes(self):
+        import device
+
+        payload = bytes(index % 256 for index in range(device.SPEAKER_BLOCK_BYTES + 320))
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_frames=0,
+            _speaker_use_pulse=True,
+            _speaker_audio_queue=device.queue.Queue(),
+            _speaker_publisher=FakePublisher(),
+        )
+        message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=payload)
+
+        device.U1Nodes._speaker_callback(nodes, message)
+
+        blocks = list(nodes._speaker_audio_queue.queue)
+        self.assertEqual([len(block) for block in blocks], [device.SPEAKER_BLOCK_BYTES, 320])
+        self.assertEqual(b"".join(blocks), payload)
+        self.assertEqual(device.SPEAKER_BLOCK_MS, 40)
+
     def test_speaker_callback_rejects_non_pcm_input(self):
         import device
 
