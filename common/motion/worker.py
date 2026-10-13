@@ -167,23 +167,6 @@ class NumericalWorker:
     def self_test(self, q):
         return self.call('self_test', {'q': q}, deadline=time.monotonic()+5.)
 
-    def solve_frame(self, body, state, generation):
-        identity = {k: body[k] for k in ('boot_id', 'session_id', 'seq', 'source_seq',
-                    'mapping_epoch', 'model_version', 'calibration_version', 'frame', 'valid_until_ns')}
-        identity['generation'] = generation
-        result = self.call('solve', {'values': body['values'], 'q': state['feedback']['q'],
-            'commanded': state.get('commanded_q'),
-            'measured_ns': state['feedback'].get('arm_ns')}, identity=identity,
-            deadline=body['valid_until_ns']/1e9)
-        self.last_ms = result['last_ms']
-        self.last_envelope = result['envelope']
-        return result['q']
-
-    def return_step(self, q, previous, deadline, measured_ns):
-        result = self.call('return_step', {'q': list(q), 'previous': list(previous), 'measured_ns': measured_ns}, deadline=deadline)
-        self.last_envelope = result['envelope']
-        return result['q']
-
 
 def serve(sock, solver_module, solver_class):
     solver = None
@@ -227,15 +210,6 @@ def serve(sock, solver_module, solver_class):
                 targets = [transform({'position': values[i:i+3], 'orientation': values[i+3:i+7]}) for i in (0, 7)]
                 q = solver.solve(targets, data['q'], data['commanded'], deadline_monotonic=deadline)
                 result = {'q': list(q), 'last_ms': solver.last_ms, 'envelope': {**solver.last_envelope, 'measured_ns': data['measured_ns']}}
-            elif op == 'return_step':
-                import numpy as np
-                q, previous = np.asarray(data['q']), np.asarray(data['previous'])
-                lower, upper = solver.model.lowerPositionLimit[solver.indices], solver.model.upperPositionLimit[solver.indices]
-                if np.any(lower > 0) or np.any(upper < 0):
-                    raise ValueError('neutral_outside_limits')
-                target = np.zeros_like(q)
-                result = {'q': target.tolist(),
-                          'envelope': {**solver.motion_envelope(q, previous, target, budget), 'measured_ns': data['measured_ns']}}
             else:
                 raise ValueError('ik_worker_unknown_operation')
             budget()
