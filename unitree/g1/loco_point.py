@@ -63,8 +63,16 @@ class LocoPointPlugin:
         direction = args.get("direction", "left")
         if not all(math.isfinite(v) for v in (x, y)):
             raise ValueError("x and y must be finite")
-        if isinstance(angle, bool) or angle not in (0, 30, 45, 60, 90, 180):
+        # Canvas enum controls may serialize numeric selections as strings.
+        if isinstance(angle, bool):
             raise ValueError("angle must be 0, 30, 45, 60, 90 or 180 degrees")
+        try:
+            angle = float(angle)
+        except (ValueError, TypeError, OverflowError):
+            raise ValueError("angle must be 0, 30, 45, 60, 90 or 180 degrees") from None
+        if angle not in (0, 30, 45, 60, 90, 180):
+            raise ValueError("angle must be 0, 30, 45, 60, 90 or 180 degrees")
+        angle = int(angle)
         if direction not in ("left", "right"):
             raise ValueError("direction must be left or right")
         stages = []

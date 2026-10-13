@@ -55,6 +55,16 @@ class TestLocoPoint(unittest.TestCase):
             self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5)
             self.assertEqual(stages[2]['vyaw'], -0.5)
 
+    def test_canvas_string_angles_match_numeric_plan(self):
+        point, _, _, _ = self.setup_point()
+        for angle in (0, 30, 45, 60, 90, 180):
+            with self.subTest(angle=angle):
+                self.assertEqual(point.plan(dict(x='1', y='1', angle=str(angle), direction='left')),
+                                 point.plan(dict(x=1, y=1, angle=angle, direction='left')))
+        for angle in ('45.5', 'bad', '', 'nan', 'inf', None, True):
+            with self.subTest(invalid=angle):
+                self.assertIn('error', point.dispatch('move', dict(angle=angle)))
+
     def test_whole_sequence_notifies_once_with_distinct_internal_ids(self):
         point, backend, notices, done = self.setup_point()
         result = point.dispatch('move', dict(x=0.3, y=-0.3, angle=90))
