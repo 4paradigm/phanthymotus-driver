@@ -13,7 +13,9 @@ import os
 import queue
 import re
 import ssl
+import shutil
 import struct
+import subprocess
 import threading
 import time
 import urllib.request
@@ -25,9 +27,18 @@ from common.vendor_runtime import action_schema, jsonable, tool
 
 
 SERVICE_TIMEOUT = 10.0
+AUDIO_ENABLE_TIMEOUT = 2.0
+PULSE_SERVER_DEFAULT = "tcp:127.0.0.1:34567"
+SPEAKER_BLOCK_MS = 40
+SPEAKER_BLOCK_BYTES = 16_000 * 2 * SPEAKER_BLOCK_MS // 1000
+SPEAKER_QUEUE_DEPTH = 25
+SPEAKER_INPUT_QUEUE_DEPTH = SPEAKER_QUEUE_DEPTH
+SPEAKER_PULSE_MAX_LEAD_MS = 80
+SPEAKER_WRITER_STALL_TIMEOUT = 2.0
 CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
+MIC_SDK_FIRST_FRAME_TIMEOUT = 1.0
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
@@ -35,7 +46,6 @@ VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
 SDK_AUDIO_OPEN = "/robo/audio/call/open_stream"
 SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
 SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
-ASR_AUDIO_TOPIC = "/audio/sense/audio_data_to_asr"
 MOTION_LIST_SERVICE = "/robo/audio/call/get_motion_info_list"
 JPEG_MAX_PIXELS = 1280 * 720
 
@@ -198,10 +208,12 @@ class VideoSharedMemoryReader:
     _RING_HEADER = struct.Struct("<8Q")
     _HEADER = struct.Struct("<4Q")
 
-    def __init__(self, config: dict, metadata_getter, frame_callback):
+    def __init__(self, config: dict, metadata_getter, frame_callback, *, latest_only=True):
         self.config = dict(config)
         self.metadata_getter = metadata_getter
         self.frame_callback = frame_callback
+        self.latest_only = latest_only
+        self.skip_backlog = False
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread = None
@@ -235,7 +247,6 @@ class VideoSharedMemoryReader:
             self._error = "U1 shared-memory stream configuration is incomplete"
             self._ready.set()
             return
-        slot_size = self._HEADER.size + payload_size
         try:
             deadline = time.monotonic() + SERVICE_TIMEOUT
             handle = None
@@ -252,14 +263,25 @@ class VideoSharedMemoryReader:
                 raise FileNotFoundError(path)
             with handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as shared:
                 data_offset = self._RING_HEADER.size
-                if len(shared) < data_offset + slot_size * max_frames:
+                data_bytes = len(shared) - data_offset
+                if data_bytes < (self._HEADER.size + payload_size) * max_frames:
                     raise ValueError("shared-memory ring is smaller than the stream configuration")
                 ring = self._RING_HEADER.unpack_from(shared, 0)
                 if ring[1] != max_frames or ring[2] != payload_size:
                     raise ValueError("shared-memory ring header does not match stream configuration")
+                # U1 aligns each slot to a 64-byte boundary.  The metadata
+                # reports payload size only, so deriving the stride from the
+                # mapped file is required; using header + payload reads the
+                # first slot correctly and then walks into padding/data.
+                if data_bytes % max_frames:
+                    raise ValueError("shared-memory ring has an invalid slot stride")
+                slot_size = data_bytes // max_frames
+                if slot_size < self._HEADER.size + payload_size:
+                    raise ValueError("shared-memory ring slot is smaller than its payload")
                 self._ready.set()
+                read_latest = self.latest_only or self.skip_backlog
                 while not self._stop.is_set():
-                    newest = None
+                    selected = None
                     write_index, ring_frames, ring_payload = self._RING_HEADER.unpack_from(shared, 0)[:3]
                     if ring_frames != max_frames or ring_payload != payload_size:
                         raise ValueError("shared-memory ring header changed unexpectedly")
@@ -269,19 +291,25 @@ class VideoSharedMemoryReader:
                         if (sequence <= self._last_sequence or sequence >= write_index
                                 or not 0 < size <= payload_size):
                             continue
-                        if newest is None or sequence > newest[0]:
+                        if selected is None or (
+                                read_latest and sequence > selected[0]) or (
+                                not read_latest and sequence < selected[0]):
                             start = offset + self._HEADER.size
                             payload = bytes(shared[start:start + size])
                             after = self._HEADER.unpack_from(shared, offset)[:3]
                             latest_write_index = self._RING_HEADER.unpack_from(shared, 0)[0]
                             if after != (sequence, timestamp_ns, size) or sequence >= latest_write_index:
                                 continue
-                            newest = (sequence, timestamp_ns, payload)
-                    if newest is None:
+                            selected = (sequence, timestamp_ns, payload)
+                    if selected is None:
                         self._stop.wait(0.005)
                     else:
-                        self._last_sequence = newest[0]
-                        self.frame_callback(newest[2], self.metadata_getter(), newest[1])
+                        self._last_sequence = selected[0]
+                        self.frame_callback(selected[2], self.metadata_getter(), selected[1])
+                        if not self.latest_only and read_latest:
+                            # Discard the pre-existing backlog once, then
+                            # consume subsequent audio frames in sequence.
+                            read_latest = False
         except FileNotFoundError:
             self._error = f"U1 shared-memory path is unavailable: {path}"
             self._ready.set()
@@ -418,6 +446,7 @@ class U1Nodes:
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
         from audio_msgs.msg import AudioChunk, AudioInData, AudioInfo, AudioOutData
+        from audio_msgs.srv import EnableAudioOut
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
@@ -454,11 +483,24 @@ class U1Nodes:
         self.CompressedImage = CompressedImage
         self.Image6m = Image6m
         self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
+        self._speaker_enable_client = self.audio_device.create_client(
+            EnableAudioOut, "/sys/device/audio_out/enable")
+        self._speaker_enable_request_type = EnableAudioOut.Request
         self._speaker_subscription = None
         self._speaker_forwarding = False
         self._speaker_uuid = ""
         self._speaker_frames = 0
         self._speaker_enabled = False
+        self._speaker_use_pulse = False
+        self._speaker_process = None
+        # Backpressure the input callback when playback falls behind; never
+        # discard PCM blocks, which would make speech discontinuous.
+        self._speaker_audio_queue = queue.Queue(maxsize=SPEAKER_QUEUE_DEPTH)
+        self._speaker_audio_thread = None
+        self._speaker_audio_blocks_dropped = 0
+        self._speaker_playback_error = ""
+        self._speaker_writer_stop = threading.Event()
+        self._speaker_writer_last_progress = time.monotonic()
         self._audio_service_lock = threading.Lock()
         # Image6m callbacks perform a bounded JPEG conversion. Keep them in
         # their own re-entrant group so left/right conversion does not block
@@ -473,6 +515,8 @@ class U1Nodes:
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._audio_qos = best_effort
+        self._speaker_qos = QoSProfile(
+            depth=SPEAKER_INPUT_QUEUE_DEPTH, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._sensor_qos = best_effort
         self._camera_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
@@ -484,10 +528,12 @@ class U1Nodes:
         self._mic_reader = None
         self._mic_stream = {}
         self._mic_stream_open = False
+        self._mic_source = None
+        self._mic_source_lock = threading.Lock()
+        self._mic_pending_topic = None
+        self._mic_source_timer = None
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
-        self._mic_asr_subscription = self.audio_device.create_subscription(
-            AudioInData, ASR_AUDIO_TOPIC, self._mic_topic_callback, self._audio_qos)
         self._playback_listeners = []
         self._robot_subscriptions = []
         for name, topic in EVENT_TOPICS.items():
@@ -643,6 +689,9 @@ class U1Nodes:
         return future.result()
 
     def set_mic_enabled(self, enabled: bool) -> dict:
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
         if not enabled:
             self.stop_mic_reader()
             close_error = None
@@ -660,7 +709,7 @@ class U1Nodes:
         if self._mic_stream_open and self._mic_reader is not None:
             self._mic_forwarding = True
             return {"state": "running", "stream": dict(self._mic_stream),
-                    "source": "U1 SDK audio shared-memory stream"}
+                    "source": "U1 SDK shared-memory stream with device raw-topic fallback"}
         if self._mic_stream_open:
             self.set_mic_enabled(False)
         self._mic_forwarding = False
@@ -687,12 +736,23 @@ class U1Nodes:
             # is already publishing on the device topic, so it is optional.
             self._mic_reader = VideoSharedMemoryReader(
                 stream, lambda: {}, self._publish_mic_frame)
+            self._mic_reader.latest_only = False
+            self._mic_reader.skip_backlog = True
             try:
                 self._mic_reader.start(timeout=2.0)
+                # Opening the ring proves only that it can be mapped. Give it
+                # a short first-frame priority window before using the topic.
+                self._start_mic_source_timer()
             except Exception:
                 # Some firmware opens the SDK stream but only publishes the
                 # domain-2 AudioInData topic. Keep that topic fallback alive.
                 self._mic_reader = None
+                with self._mic_source_lock:
+                    self._mic_source = "topic"
+                    pending_topic = self._mic_pending_topic
+                    self._mic_pending_topic = None
+                if pending_topic is not None:
+                    self._publish_topic_mic_frame(*pending_topic)
         except Exception as exc:
             self.stop_mic_reader()
             try:
@@ -702,11 +762,22 @@ class U1Nodes:
             raise
         self._mic_forwarding = True
         return {"state": state, "stream": stream,
-                "source": "U1 SDK audio shared-memory stream"}
+                "source": "U1 SDK shared-memory stream with device raw-topic fallback"}
 
     def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
         if not self._mic_forwarding:
             return
+        if not payload or len(payload) % 2:
+            return
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
+        with self._mic_source_lock:
+            if self._mic_source is None:
+                self._mic_source = "sdk"
+                U1Nodes._cancel_mic_source_timer_locked(self)
+            if self._mic_source != "sdk":
+                return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -721,6 +792,12 @@ class U1Nodes:
         """Accept the device-domain raw topic when the SDK ring is unavailable."""
         if not self._mic_forwarding:
             return
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+            self._mic_source = None
+        with self._mic_source_lock:
+            if self._mic_source == "sdk":
+                return
         data = getattr(getattr(message, "data", None), "data", None)
         if data is None:
             data = getattr(message, "data", None)
@@ -729,14 +806,52 @@ class U1Nodes:
         payload = _normalize_pcm16k(message, data)
         if not payload:
             return
+        with self._mic_source_lock:
+            if self._mic_source is None:
+                self._mic_pending_topic = (payload, getattr(message, "header", None))
+                return
+            if self._mic_source != "topic":
+                return
+        self._publish_topic_mic_frame(payload, getattr(message, "header", None))
+
+    def _publish_topic_mic_frame(self, payload: bytes, header: Any = None) -> None:
+        if not self._mic_forwarding:
+            return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
-        header = getattr(message, "header", None)
         chunk.header = header if header is not None else self._audio_header()
         self._mic_publisher.publish(chunk)
         self._mic_frames += 1
         self._mic_frame_event.set()
+
+    def _start_mic_source_timer(self) -> None:
+        with self._mic_source_lock:
+            self._cancel_mic_source_timer_locked()
+            if self._mic_source is not None or not self._mic_forwarding:
+                return
+            timer = threading.Timer(
+                MIC_SDK_FIRST_FRAME_TIMEOUT, self._select_topic_mic_source)
+            timer.daemon = True
+            self._mic_source_timer = timer
+            timer.start()
+
+    def _cancel_mic_source_timer_locked(self) -> None:
+        timer = getattr(self, "_mic_source_timer", None)
+        self._mic_source_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _select_topic_mic_source(self) -> None:
+        with self._mic_source_lock:
+            self._mic_source_timer = None
+            if self._mic_source is not None or not self._mic_forwarding:
+                return
+            self._mic_source = "topic"
+            pending = getattr(self, "_mic_pending_topic", None)
+            self._mic_pending_topic = None
+        if pending is not None:
+            self._publish_topic_mic_frame(*pending)
 
     def wait_for_mic_frame(self, timeout: float) -> bool:
         if self._mic_frame_event.wait(timeout):
@@ -752,6 +867,12 @@ class U1Nodes:
             self._mic_reader.stop()
             self._mic_reader = None
         self._mic_stream = {}
+        if not hasattr(self, "_mic_source_lock"):
+            self._mic_source_lock = threading.Lock()
+        with self._mic_source_lock:
+            self._cancel_mic_source_timer_locked()
+            self._mic_source = None
+            self._mic_pending_topic = None
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
@@ -887,26 +1008,173 @@ class U1Nodes:
         if self._speaker_subscription is not None:
             self.core.destroy_subscription(self._speaker_subscription)
             self._speaker_subscription = None
-        # U1 firmware accepts PCM on the raw topic; audio_out/enable is
-        # present in the graph but blocks indefinitely on the target image.
+        if self._speaker_enabled:
+            try:
+                self._set_speaker_enabled(False)
+            except Exception as exc:
+                print(f"[U1 speaker] disable failed: {str(exc)[:160]}", flush=True)
         self._speaker_enabled = False
+        self._stop_pulse_output()
+
+    def _start_pulse_output(self) -> bool:
+        paplay = shutil.which("paplay")
+        if not paplay:
+            return False
+        server = str(
+            os.environ.get("PULSE_SERVER")
+            or self.config.get("speaker_pulse_server")
+            or PULSE_SERVER_DEFAULT
+        )
+        env = os.environ.copy()
+        env["PULSE_SERVER"] = server
+        try:
+            process = subprocess.Popen(
+                [paplay, "--raw", "--format=s16le", "--rate=16000", "--channels=1",
+                 "--latency-msec=80", "--process-time-msec=40", "--server", server],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except OSError as exc:
+            print(f"[U1 speaker] PulseAudio start failed: {str(exc)[:160]}", flush=True)
+            return False
+        if process.poll() is not None:
+            return False
+        self._speaker_process = process
+        self._speaker_audio_queue = queue.Queue(maxsize=SPEAKER_QUEUE_DEPTH)
+        self._speaker_playback_error = ""
+        self._speaker_writer_stop = threading.Event()
+        self._speaker_writer_last_progress = time.monotonic()
+        self._speaker_audio_thread = threading.Thread(
+            target=self._pulse_writer, daemon=True, name="u1-speaker-pulse")
+        self._speaker_audio_thread.start()
+        return True
+
+    def _pulse_writer(self) -> None:
+        process = self._speaker_process
+        if process is None or process.stdin is None:
+            U1Nodes._mark_pulse_failed(self, "paplay process or stdin is unavailable")
+            return
+        pending_until = time.monotonic()
+        stop_event = self._speaker_writer_stop
+        while True:
+            payload = self._speaker_audio_queue.get()
+            if payload is None:
+                break
+            return_code = process.poll()
+            if return_code is not None:
+                U1Nodes._mark_pulse_failed(self, f"paplay exited with status {return_code}")
+                break
+            now = time.monotonic()
+            duration = len(payload) / (16_000 * 2)
+            # Keep no more than the configured lead inside paplay/PulseAudio.
+            # Input bursts are paced here; PCM blocks are never discarded.
+            write_at = max(pending_until, now) + duration - (SPEAKER_PULSE_MAX_LEAD_MS / 1000)
+            delay = write_at - now
+            if delay > 0 and stop_event.wait(delay):
+                break
+            if stop_event.is_set():
+                break
+            try:
+                process.stdin.write(payload)
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                U1Nodes._mark_pulse_failed(self, f"paplay write failed: {str(exc)[:120]}")
+                break
+            self._speaker_writer_last_progress = time.monotonic()
+            pending_until = max(pending_until, time.monotonic()) + duration
+
+    @staticmethod
+    def _mark_pulse_failed(nodes, error: str) -> None:
+        nodes._speaker_playback_error = str(error)[:160]
+        nodes._speaker_forwarding = False
+
+    def _stop_pulse_output(self) -> None:
+        process = self._speaker_process
+        self._speaker_process = None
+        if process is None:
+            return
+        self._speaker_writer_stop.set()
+        while True:
+            try:
+                self._speaker_audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self._speaker_audio_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._speaker_audio_thread is not None:
+            self._speaker_audio_thread.join(timeout=1.0)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self._speaker_audio_thread = None
 
     def connect_speaker(self, input_topic: str) -> dict:
-        self._speaker_forwarding = False
-        if self._speaker_subscription is not None:
-            self.core.destroy_subscription(self._speaker_subscription)
-            self._speaker_subscription = None
+        self.close_speaker_subscription()
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
+        self._speaker_audio_blocks_dropped = 0
+        self._speaker_use_pulse = self._start_pulse_output()
+        output_enabled = self._speaker_use_pulse
+        enable_error = None
+        if not self._speaker_use_pulse:
+            try:
+                self._set_speaker_enabled(True)
+                output_enabled = True
+            except Exception as exc:
+                self._speaker_forwarding = False
+                self._speaker_playback_error = (
+                    "no verified output path: PulseAudio unavailable and "
+                    f"EnableAudioOut failed: {str(exc)[:128]}"
+                )
+                raise RuntimeError(f"U1 Pro speaker unavailable: {self._speaker_playback_error}") from exc
         self._speaker_subscription = self.core.create_subscription(
-            self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
+            self.AudioChunk, input_topic, self._speaker_callback, self._speaker_qos)
         self._speaker_forwarding = True
-        return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
+        result = {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC,
+                  "output_enabled": output_enabled, "pulse_output": self._speaker_use_pulse}
+        if self._speaker_use_pulse:
+            result["message"] = "playing through PulseAudio"
+        return result
+
+    def _set_speaker_enabled(self, enabled: bool) -> dict:
+        request = self._speaker_enable_request_type()
+        request.header = self._audio_header()
+        try:
+            request.header.stamp = self.audio_device.get_clock().now().to_msg()
+        except Exception:
+            pass
+        request.enable = bool(enabled)
+        request.info = self._audio_info()
+        request.mode = 0
+        request.gain = 1.0
+        if not self._speaker_enable_client.wait_for_service(timeout_sec=AUDIO_ENABLE_TIMEOUT):
+            raise RuntimeError(f"service unavailable: {self._speaker_enable_client.srv_name}")
+        future = self._speaker_enable_client.call_async(request)
+        deadline = time.monotonic() + AUDIO_ENABLE_TIMEOUT
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise TimeoutError(f"service timeout: {self._speaker_enable_client.srv_name}")
+        response = future.result()
+        code = getattr(response, "code", 0)
+        if code not in (None, 0, "0", "OK"):
+            raise RuntimeError(f"U1 Pro speaker output request failed: {code}")
+        self._speaker_enabled = bool(enabled)
+        return {"state": "running" if enabled else "idle", "code": code}
 
     def _audio_info(self):
         info = self.AudioInfo()
         info.uuid = self._speaker_uuid or f"u1-{uuid.uuid4().hex}"
-        info.channels = 1
+        # The U1 audio adapter consumes stereo S16LE, even though Agent Core's
+        # shared audio contract is mono.
+        info.channels = 2
         info.sample_rate = 16000
         info.sample_format = "S16LE"
         return info
@@ -921,12 +1189,48 @@ class U1Nodes:
             return
         if getattr(message, "format", "") != AUDIO_FORMAT:
             return
-        output = self.AudioOutData()
-        output.header = message.header
-        output.uuid = self._speaker_uuid
-        output.data.data = list(message.data)
-        self._speaker_publisher.publish(output)
+        raw = bytes(message.data)
+        if len(raw) % 2:
+            return
+        if getattr(self, "_speaker_use_pulse", False):
+            for offset in range(0, len(raw), SPEAKER_BLOCK_BYTES):
+                U1Nodes._enqueue_speaker_block(self, raw[offset:offset + SPEAKER_BLOCK_BYTES])
+        else:
+            stereo = bytearray(len(raw) * 2)
+            for offset in range(0, len(raw), 2):
+                sample = raw[offset:offset + 2]
+                out = offset * 2
+                stereo[out:out + 2] = sample
+                stereo[out + 2:out + 4] = sample
+            output = self.AudioOutData()
+            output.header = message.header
+            output.uuid = self._speaker_uuid
+            output.data.data = list(stereo)
+            self._speaker_publisher.publish(output)
         self._speaker_frames += 1
+
+    @staticmethod
+    def _enqueue_speaker_block(nodes, payload: bytes) -> None:
+        audio_queue = nodes._speaker_audio_queue
+        while nodes._speaker_forwarding:
+            process = getattr(nodes, "_speaker_process", None)
+            writer = getattr(nodes, "_speaker_audio_thread", None)
+            if process is None or process.poll() is not None or writer is None or not writer.is_alive():
+                return_code = process.poll() if process is not None else "unavailable"
+                nodes._speaker_audio_blocks_dropped += 1
+                U1Nodes._mark_pulse_failed(nodes, f"speaker playback unavailable (status {return_code})")
+                return
+            try:
+                audio_queue.put(payload, timeout=0.1)
+                return
+            except queue.Full:
+                last_progress = getattr(nodes, "_speaker_writer_last_progress", time.monotonic())
+                if time.monotonic() - last_progress > SPEAKER_WRITER_STALL_TIMEOUT:
+                    nodes._speaker_audio_blocks_dropped += 1
+                    U1Nodes._mark_pulse_failed(
+                        nodes, "speaker playback writer stopped making progress")
+                    return
+                continue
 
     def close(self) -> None:
         if self._closed:
@@ -941,9 +1245,6 @@ class U1Nodes:
         if self._mic_subscription is not None:
             self.audio_device.destroy_subscription(self._mic_subscription)
             self._mic_subscription = None
-        if self._mic_asr_subscription is not None:
-            self.audio_device.destroy_subscription(self._mic_asr_subscription)
-            self._mic_asr_subscription = None
         if self._video_users:
             try:
                 self.trigger_call("video_close")
@@ -1068,8 +1369,32 @@ class SpeakerPlugin:
             self.stop()
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running" if self.running else "idle", "input_topic": self.input_topic,
-                    "frames_received": self.nodes._speaker_frames}
+            audio_queue = getattr(self.nodes, "_speaker_audio_queue", None)
+            queued_bytes = 0
+            if audio_queue is not None:
+                with audio_queue.mutex:
+                    queued_bytes = sum(
+                        len(item) for item in list(audio_queue.queue) if item is not None)
+            process = getattr(self.nodes, "_speaker_process", None)
+            process_alive = bool(process and process.poll() is None)
+            writer = getattr(self.nodes, "_speaker_audio_thread", None)
+            writer_alive = bool(writer and writer.is_alive())
+            playback_error = getattr(self.nodes, "_speaker_playback_error", "")
+            if self.running and getattr(self.nodes, "_speaker_use_pulse", False):
+                if not process_alive:
+                    playback_error = playback_error or "PulseAudio playback process is not running"
+                elif not writer_alive:
+                    playback_error = playback_error or "PulseAudio playback writer is not running"
+            state = "error" if self.running and playback_error else "running" if self.running else "idle"
+            return {"state": state, "input_topic": self.input_topic,
+                    "frames_received": self.nodes._speaker_frames,
+                    "audio_blocks_dropped": getattr(self.nodes, "_speaker_audio_blocks_dropped", 0),
+                    "queued_frames": getattr(getattr(self.nodes, "_speaker_audio_queue", None), "qsize", lambda: 0)(),
+                    "queued_audio_ms": round(queued_bytes / 32, 1),
+                    "pulse_output": bool(getattr(self.nodes, "_speaker_use_pulse", False)),
+                    "playback_process_alive": process_alive,
+                    "playback_writer_alive": writer_alive,
+                    "playback_error": playback_error}
         return None
 
 

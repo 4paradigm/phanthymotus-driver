@@ -147,6 +147,21 @@ class FakeAudioOutData:
         self.data = types.SimpleNamespace(data=[])
 
 
+class FakeAudioEnableClient:
+    def __init__(self, code=0):
+        self.code = code
+        self.requests = []
+        self.srv_name = "/sys/device/audio_out/enable"
+
+    def wait_for_service(self, timeout_sec):
+        return True
+
+    def call_async(self, request):
+        self.requests.append(request)
+        response = types.SimpleNamespace(code=self.code)
+        return types.SimpleNamespace(done=lambda: True, result=lambda: response)
+
+
 class FakeNodes:
     def __init__(self):
         self.namespace = "test"
@@ -237,12 +252,9 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("/dev/shm:/dev/shm", text)
 
     def test_stream_topics_match_robot_contract(self):
-        import device
-
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(MIC_TOPIC, "/sys/device/audio_in/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
-        self.assertEqual(device.ASR_AUDIO_TOPIC, "/audio/sense/audio_data_to_asr")
 
     def test_audio_in_data_is_normalized_to_driver_pcm_contract(self):
         import device
@@ -281,6 +293,10 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_reader = None
         nodes._mic_stream = {}
         nodes._mic_stream_open = False
+        nodes._mic_source = None
+        nodes._mic_source_lock = threading.Lock()
+        nodes._mic_pending_topic = None
+        nodes._mic_source_timer = None
         class Reader:
             def __init__(self, config, metadata, callback):
                 self.config = config
@@ -291,7 +307,7 @@ class U1CardContractTests(unittest.TestCase):
         with mock.patch.object(device, "VideoSharedMemoryReader", Reader):
             result = nodes.set_mic_enabled(True)
         self.assertTrue(nodes._mic_forwarding)
-        self.assertEqual(result["source"], "U1 SDK audio shared-memory stream")
+        self.assertIn("device raw-topic fallback", result["source"])
         nodes.set_mic_enabled(False)
         self.assertFalse(nodes._mic_forwarding)
         self.assertEqual([call.args[0] for call in nodes.trigger_call.call_args_list],
@@ -331,10 +347,36 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_stream_open = False
         nodes._mic_frame_event = threading.Event()
         nodes._mic_frames = 0
-        result = nodes.set_mic_enabled(True)
+        nodes._mic_source = None
+        nodes._mic_source_lock = threading.Lock()
+        nodes._mic_pending_topic = None
+        nodes._mic_source_timer = None
+        class SilentReader:
+            def __init__(self, config, metadata, callback):
+                self.config = config
+                self.callback = callback
+
+            def start(self, timeout=2.0):
+                pass
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(device, "VideoSharedMemoryReader", SilentReader):
+            result = nodes.set_mic_enabled(True)
         self.assertTrue(nodes._mic_stream_open)
-        self.assertIsNone(nodes._mic_reader)
-        self.assertEqual(result["source"], "U1 SDK audio shared-memory stream")
+        self.assertIsNotNone(nodes._mic_reader)
+        self.assertIn("device raw-topic fallback", result["source"])
+        publisher = FakePublisher()
+        nodes._mic_publisher = publisher
+        nodes.AudioChunk = FakeAudioChunk
+        nodes._audio_header = lambda: types.SimpleNamespace(
+            stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id="")
+        nodes._mic_topic_callback(types.SimpleNamespace(
+            data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE"))
+        nodes._select_topic_mic_source()
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(nodes._mic_source, "topic")
         nodes.set_mic_enabled(False)
         self.assertEqual([call.args[0] for call in nodes.trigger_call.call_args_list],
                          ["audio_open", "audio_state", "audio_close"])
@@ -365,6 +407,34 @@ class U1CardContractTests(unittest.TestCase):
             self.assertTrue(ready.wait(1.0))
             reader.stop()
             self.assertEqual(received, [(b"LEFT", {"width": 1}, 1234)])
+
+    def test_sdk_ring_reader_honors_aligned_slot_stride(self):
+        import device
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audio.stream"
+            payload_size = 8
+            max_frames = 2
+            header = struct.pack("<8Q", 2, max_frames, payload_size, 0, 0, 0, 0, 0)
+            first = (struct.pack("<4Q", 1, 1234, 4, 0) + b"PCM1"
+                     + bytes(payload_size - 4) + bytes(64 - 32 - payload_size))
+            second = (struct.pack("<4Q", 2, 5678, 4, 0) + b"RACE"
+                      + bytes(payload_size - 4) + bytes(64 - 32 - payload_size))
+            path.write_bytes(header + first + second)
+            received = []
+            ready = threading.Event()
+
+            def on_frame(payload, metadata, timestamp):
+                received.append((payload, metadata, timestamp))
+                ready.set()
+
+            reader = device.VideoSharedMemoryReader({
+                "path": str(path), "frame_payload_size": payload_size, "max_frames": max_frames,
+            }, lambda: {}, on_frame)
+            reader.start()
+            self.assertTrue(ready.wait(1.0))
+            reader.stop()
+            self.assertEqual(received, [(b"PCM1", {}, 1234)])
 
     def test_event_bridge_keeps_sdk_string_payloads(self):
         import device
@@ -500,7 +570,7 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
             self.assertEqual(len(nodes.robot.subscriptions), 2)
-            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 2)
+            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 1)
             self.assertEqual(initialized_domains[0][1], 2)
             self.assertIn("/sys/device/audio_in/raw",
                           [sub[1] for sub in nodes.audio_device.subscriptions])
@@ -992,6 +1062,56 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(publisher.messages[0].header.stamp.sec, 1)
         self.assertEqual(publisher.messages[0].header.stamp.nanosec, 2)
 
+    def test_mic_sources_are_mutually_exclusive(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_source="sdk",
+            _mic_source_lock=threading.Lock(),
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+            _audio_header=lambda: types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
+        )
+        message = types.SimpleNamespace(data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE")
+        device.U1Nodes._mic_topic_callback(nodes, message)
+        self.assertEqual(publisher.messages, [])
+        device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02", {}, 1)
+        self.assertEqual(len(publisher.messages), 1)
+
+    def test_mic_sdk_wins_when_topic_arrives_first(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_source=None,
+            _mic_source_lock=threading.Lock(),
+            _mic_pending_topic=None,
+            _mic_source_timer=None,
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+            _audio_header=lambda: types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
+        )
+        message = types.SimpleNamespace(
+            data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE",
+            header=types.SimpleNamespace())
+
+        device.U1Nodes._mic_topic_callback(nodes, message)
+        self.assertEqual(nodes._mic_source, None)
+        device.U1Nodes._publish_mic_frame(nodes, b"\x05\x06", {}, 1)
+
+        self.assertEqual(nodes._mic_source, "sdk")
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(publisher.messages[0].data, [5, 6])
+
     def test_expression_and_head_call_deployed_sdk_motion_service(self):
         import device
 
@@ -1217,7 +1337,7 @@ class U1CardContractTests(unittest.TestCase):
         }
         self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "vision_enabled", False)["enabled"], False)
 
-    def test_speaker_forwards_input_without_blocking_audio_enable_service(self):
+    def test_speaker_enables_stereo_output_before_subscribing(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
@@ -1227,19 +1347,49 @@ class U1CardContractTests(unittest.TestCase):
         nodes._speaker_enabled = False
         nodes._audio_service_lock = threading.Lock()
         nodes._audio_qos = object()
+        nodes._speaker_qos = object()
         nodes._speaker_forwarding = False
-        nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes._speaker_enable_client = FakeAudioEnableClient()
+        nodes._speaker_enable_request_type = type("Request", (), {})
         nodes.AudioInfo = type("AudioInfo", (), {})
-        nodes._prepare_audio_device = mock.Mock()
-        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
+        nodes.AudioChunk = object
+        nodes.close_speaker_subscription = lambda: None
+        nodes._start_pulse_output = lambda: False
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
-        nodes.call.assert_not_called()
+        self.assertEqual(len(nodes._speaker_enable_client.requests), 1)
+        request = nodes._speaker_enable_client.requests[0]
+        self.assertTrue(request.enable)
+        self.assertEqual(request.info.channels, 2)
+        self.assertEqual(request.info.sample_rate, 16000)
+        self.assertEqual(request.info.sample_format, "S16LE")
         nodes.core.create_subscription.assert_called_once()
         self.assertEqual(nodes.core.create_subscription.call_args.args[1], "/tts/audio")
         self.assertEqual(result["input_topic"], "/tts/audio")
         self.assertTrue(nodes._speaker_forwarding)
+
+    def test_speaker_rejects_start_when_no_output_path_is_available(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes._speaker_subscription = None
+        nodes._speaker_uuid = ""
+        nodes._speaker_frames = 0
+        nodes._speaker_enabled = False
+        nodes._speaker_enable_client = FakeAudioEnableClient(code=7)
+        nodes._speaker_enable_request_type = type("Request", (), {})
+        nodes.AudioInfo = type("AudioInfo", (), {})
+        nodes.AudioChunk = object
+        nodes._audio_qos = object()
+        nodes._speaker_qos = object()
+        nodes.close_speaker_subscription = lambda: None
+        nodes._start_pulse_output = lambda: False
+        nodes.core = types.SimpleNamespace(create_subscription=mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, "no verified output path"):
+            nodes.connect_speaker("/tts/audio")
+        nodes.core.create_subscription.assert_not_called()
+        self.assertFalse(nodes._speaker_forwarding)
 
     def test_tts_uses_documented_play_text_payload(self):
         import device
@@ -1291,14 +1441,171 @@ class U1CardContractTests(unittest.TestCase):
         message = types.SimpleNamespace(
             header=types.SimpleNamespace(frame_id="input", stamp=types.SimpleNamespace(sec=12, nanosec=34)),
             format=device.AUDIO_FORMAT,
-            data=[1, 2, 3],
+            data=[1, 0, 2, 0],
         )
         device.U1Nodes._speaker_callback(nodes, message)
         nodes._speaker_forwarding = False
         device.U1Nodes._speaker_callback(nodes, message)
         self.assertEqual(len(publisher.messages), 1)
         self.assertIs(publisher.messages[0].header, message.header)
-        self.assertEqual(publisher.messages[0].data.data, [1, 2, 3])
+        self.assertEqual(publisher.messages[0].data.data, [1, 0, 1, 0, 2, 0, 2, 0])
+
+    def test_speaker_pulse_queue_applies_backpressure_then_continues(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_frames=0,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_use_pulse=True,
+            _speaker_audio_queue=device.queue.Queue(maxsize=2),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
+            _speaker_writer_last_progress=device.time.monotonic(),
+            _speaker_publisher=FakePublisher(),
+        )
+        for value in (1, 2):
+            message = types.SimpleNamespace(
+                format=device.AUDIO_FORMAT,
+                data=[value, 0],
+            )
+            device.U1Nodes._speaker_callback(nodes, message)
+
+        enqueue_done = threading.Event()
+
+        def enqueue_last_block():
+            message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=[3, 0])
+            device.U1Nodes._speaker_callback(nodes, message)
+            enqueue_done.set()
+
+        producer = threading.Thread(target=enqueue_last_block)
+        producer.start()
+        self.assertFalse(enqueue_done.wait(timeout=0.05))
+        self.assertEqual(nodes._speaker_audio_queue.get(timeout=0.1), bytes([1, 0]))
+        self.assertTrue(enqueue_done.wait(timeout=0.5))
+        producer.join(timeout=0.5)
+
+        self.assertEqual(list(nodes._speaker_audio_queue.queue), [bytes([2, 0]), bytes([3, 0])])
+        self.assertEqual(nodes._speaker_frames, 3)
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 0)
+        self.assertTrue(nodes._speaker_forwarding)
+
+    def test_speaker_stops_forwarding_when_writer_stalls(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_audio_queue=device.queue.Queue(maxsize=1),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
+            _speaker_writer_last_progress=(
+                device.time.monotonic() - device.SPEAKER_WRITER_STALL_TIMEOUT - 1),
+        )
+        nodes._speaker_audio_queue.put(b"queued")
+
+        device.U1Nodes._enqueue_speaker_block(nodes, b"incoming")
+
+        self.assertFalse(nodes._speaker_forwarding)
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 1)
+        self.assertIn("stopped making progress", nodes._speaker_playback_error)
+
+    def test_speaker_accepts_audio_after_idle_writer_wait(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_audio_queue=device.queue.Queue(maxsize=1),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
+            _speaker_writer_last_progress=(
+                device.time.monotonic() - device.SPEAKER_WRITER_STALL_TIMEOUT - 1),
+        )
+
+        device.U1Nodes._enqueue_speaker_block(nodes, b"first audio")
+
+        self.assertTrue(nodes._speaker_forwarding)
+        self.assertEqual(nodes._speaker_audio_queue.get_nowait(), b"first audio")
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 0)
+
+    def test_speaker_pulse_blocks_are_40ms_and_preserve_pcm_bytes(self):
+        import device
+
+        payload = bytes(index % 256 for index in range(device.SPEAKER_BLOCK_BYTES + 320))
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_frames=0,
+            _speaker_use_pulse=True,
+            _speaker_audio_queue=device.queue.Queue(),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
+            _speaker_publisher=FakePublisher(),
+        )
+        message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=payload)
+
+        device.U1Nodes._speaker_callback(nodes, message)
+
+        blocks = list(nodes._speaker_audio_queue.queue)
+        self.assertEqual([len(block) for block in blocks], [device.SPEAKER_BLOCK_BYTES, 320])
+        self.assertEqual(b"".join(blocks), payload)
+        self.assertEqual(device.SPEAKER_BLOCK_MS, 40)
+
+    def test_speaker_pulse_writer_failure_stops_forwarding_without_blocking(self):
+        import device
+
+        class BrokenPipe:
+            def write(self, payload):
+                raise BrokenPipeError("sink disconnected")
+
+            def flush(self):
+                pass
+
+        process = types.SimpleNamespace(stdin=BrokenPipe(), poll=lambda: None)
+        nodes = types.SimpleNamespace(
+            _speaker_process=process,
+            _speaker_writer_stop=threading.Event(),
+            _speaker_forwarding=True,
+            _speaker_audio_queue=device.queue.Queue(),
+            _speaker_audio_thread=None,
+        )
+        nodes._speaker_audio_queue.put(b"pcm")
+
+        device.U1Nodes._pulse_writer(nodes)
+
+        self.assertFalse(nodes._speaker_forwarding)
+        self.assertIn("paplay write failed", nodes._speaker_playback_error)
+        plugin = device.SpeakerPlugin(types.SimpleNamespace(
+            _speaker_frames=1,
+            _speaker_audio_queue=nodes._speaker_audio_queue,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_use_pulse=True,
+            _speaker_process=process,
+            _speaker_playback_error=nodes._speaker_playback_error,
+        ))
+        plugin.running = True
+        self.assertEqual(plugin.dispatch("info", {})["state"], "error")
+        nodes._speaker_audio_queue = device.queue.Queue(maxsize=1)
+        nodes._speaker_audio_queue.put(b"stale")
+        device.U1Nodes._enqueue_speaker_block(nodes, b"next")
+        self.assertEqual(nodes._speaker_audio_queue.get_nowait(), b"stale")
+
+    def test_speaker_uses_pulse_server_environment_override(self):
+        import device
+
+        process = mock.Mock()
+        process.poll.return_value = None
+        nodes = object.__new__(device.U1Nodes)
+        nodes.config = {"speaker_pulse_server": "tcp:configured:1111"}
+        nodes._speaker_process = None
+        with mock.patch.dict(device.os.environ, {"PULSE_SERVER": "tcp:environment:2222"}), \
+                mock.patch.object(device.shutil, "which", return_value="/usr/bin/paplay"), \
+                mock.patch.object(device.subprocess, "Popen", return_value=process) as popen:
+            self.assertTrue(device.U1Nodes._start_pulse_output(nodes))
+            args = popen.call_args.args[0]
+            self.assertEqual(args[args.index("--server") + 1], "tcp:environment:2222")
+            self.assertEqual(popen.call_args.kwargs["env"]["PULSE_SERVER"], "tcp:environment:2222")
+            device.U1Nodes._stop_pulse_output(nodes)
 
     def test_speaker_callback_rejects_non_pcm_input(self):
         import device
