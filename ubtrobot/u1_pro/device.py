@@ -34,6 +34,7 @@ SPEAKER_BLOCK_BYTES = 16_000 * 2 * SPEAKER_BLOCK_MS // 1000
 SPEAKER_QUEUE_DEPTH = 25
 SPEAKER_INPUT_QUEUE_DEPTH = SPEAKER_QUEUE_DEPTH
 SPEAKER_PULSE_MAX_LEAD_MS = 80
+SPEAKER_WRITER_STALL_TIMEOUT = 2.0
 CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
@@ -498,6 +499,7 @@ class U1Nodes:
         self._speaker_audio_blocks_dropped = 0
         self._speaker_playback_error = ""
         self._speaker_writer_stop = threading.Event()
+        self._speaker_writer_last_progress = time.monotonic()
         self._audio_service_lock = threading.Lock()
         # Image6m callbacks perform a bounded JPEG conversion. Keep them in
         # their own re-entrant group so left/right conversion does not block
@@ -704,7 +706,7 @@ class U1Nodes:
         if self._mic_stream_open and self._mic_reader is not None:
             self._mic_forwarding = True
             return {"state": "running", "stream": dict(self._mic_stream),
-                    "source": "U1 SDK audio shared-memory stream"}
+                    "source": "U1 SDK shared-memory stream with device raw-topic fallback"}
         if self._mic_stream_open:
             self.set_mic_enabled(False)
         self._mic_forwarding = False
@@ -735,10 +737,8 @@ class U1Nodes:
             self._mic_reader.skip_backlog = True
             try:
                 self._mic_reader.start(timeout=2.0)
-                # The SDK ring and raw topic carry the same microphone stream.
-                # Prefer the SDK ring once it has opened to avoid duplicates.
-                with self._mic_source_lock:
-                    self._mic_source = "sdk"
+                # Opening the ring proves only that it can be mapped. Select
+                # it as the source only after the first valid PCM frame.
             except Exception:
                 # Some firmware opens the SDK stream but only publishes the
                 # domain-2 AudioInData topic. Keep that topic fallback alive.
@@ -754,16 +754,20 @@ class U1Nodes:
             raise
         self._mic_forwarding = True
         return {"state": state, "stream": stream,
-                "source": "U1 SDK audio shared-memory stream"}
+                "source": "U1 SDK shared-memory stream with device raw-topic fallback"}
 
     def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
         if not self._mic_forwarding:
+            return
+        if not payload or len(payload) % 2:
             return
         if not hasattr(self, "_mic_source_lock"):
             self._mic_source_lock = threading.Lock()
             self._mic_source = None
         with self._mic_source_lock:
-            if self._mic_source not in (None, "sdk"):
+            if self._mic_source is None:
+                self._mic_source = "sdk"
+            if self._mic_source != "sdk":
                 return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
@@ -997,6 +1001,7 @@ class U1Nodes:
         self._speaker_audio_queue = queue.Queue(maxsize=SPEAKER_QUEUE_DEPTH)
         self._speaker_playback_error = ""
         self._speaker_writer_stop = threading.Event()
+        self._speaker_writer_last_progress = time.monotonic()
         self._speaker_audio_thread = threading.Thread(
             target=self._pulse_writer, daemon=True, name="u1-speaker-pulse")
         self._speaker_audio_thread.start()
@@ -1033,6 +1038,7 @@ class U1Nodes:
             except (BrokenPipeError, OSError) as exc:
                 U1Nodes._mark_pulse_failed(self, f"paplay write failed: {str(exc)[:120]}")
                 break
+            self._speaker_writer_last_progress = time.monotonic()
             pending_until = max(pending_until, time.monotonic()) + duration
 
     @staticmethod
@@ -1078,20 +1084,18 @@ class U1Nodes:
                 self._set_speaker_enabled(True)
                 output_enabled = True
             except Exception as exc:
-                # Some U1 firmware exposes the raw audio topic without
-                # exporting the EnableAudioOut service. Keep the data path
-                # usable in that mode instead of failing the card.
-                output_enabled = False
-                enable_error = str(exc)[:192]
-                print(f"[U1 speaker] enable unavailable; using raw topic: {enable_error}", flush=True)
+                self._speaker_forwarding = False
+                self._speaker_playback_error = (
+                    "no verified output path: PulseAudio unavailable and "
+                    f"EnableAudioOut failed: {str(exc)[:128]}"
+                )
+                raise RuntimeError(f"U1 Pro speaker unavailable: {self._speaker_playback_error}") from exc
         self._speaker_subscription = self.core.create_subscription(
             self.AudioChunk, input_topic, self._speaker_callback, self._speaker_qos)
         self._speaker_forwarding = True
         result = {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC,
                   "output_enabled": output_enabled, "pulse_output": self._speaker_use_pulse}
-        if enable_error:
-            result["message"] = "PulseAudio and audio_out/enable unavailable; forwarding raw PCM topic"
-        elif self._speaker_use_pulse:
+        if self._speaker_use_pulse:
             result["message"] = "playing through PulseAudio"
         return result
 
@@ -1172,14 +1176,16 @@ class U1Nodes:
                 nodes._speaker_audio_blocks_dropped += 1
                 U1Nodes._mark_pulse_failed(nodes, f"speaker playback unavailable (status {return_code})")
                 return
+            last_progress = getattr(nodes, "_speaker_writer_last_progress", time.monotonic())
+            if time.monotonic() - last_progress > SPEAKER_WRITER_STALL_TIMEOUT:
+                nodes._speaker_audio_blocks_dropped += 1
+                U1Nodes._mark_pulse_failed(nodes, "speaker playback writer stopped making progress")
+                return
             try:
-                audio_queue.put_nowait(payload)
+                audio_queue.put(payload, timeout=0.1)
                 return
             except queue.Full:
-                nodes._speaker_audio_blocks_dropped += 1
-                U1Nodes._mark_pulse_failed(
-                    nodes, "speaker playback queue full; stopped input to protect ROS callbacks")
-                return
+                continue
 
     def close(self) -> None:
         if self._closed:

@@ -293,6 +293,8 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_reader = None
         nodes._mic_stream = {}
         nodes._mic_stream_open = False
+        nodes._mic_source = None
+        nodes._mic_source_lock = threading.Lock()
         class Reader:
             def __init__(self, config, metadata, callback):
                 self.config = config
@@ -303,7 +305,7 @@ class U1CardContractTests(unittest.TestCase):
         with mock.patch.object(device, "VideoSharedMemoryReader", Reader):
             result = nodes.set_mic_enabled(True)
         self.assertTrue(nodes._mic_forwarding)
-        self.assertEqual(result["source"], "U1 SDK audio shared-memory stream")
+        self.assertIn("device raw-topic fallback", result["source"])
         nodes.set_mic_enabled(False)
         self.assertFalse(nodes._mic_forwarding)
         self.assertEqual([call.args[0] for call in nodes.trigger_call.call_args_list],
@@ -343,10 +345,33 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_stream_open = False
         nodes._mic_frame_event = threading.Event()
         nodes._mic_frames = 0
-        result = nodes.set_mic_enabled(True)
+        nodes._mic_source = None
+        nodes._mic_source_lock = threading.Lock()
+        class SilentReader:
+            def __init__(self, config, metadata, callback):
+                self.config = config
+                self.callback = callback
+
+            def start(self, timeout=2.0):
+                pass
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(device, "VideoSharedMemoryReader", SilentReader):
+            result = nodes.set_mic_enabled(True)
         self.assertTrue(nodes._mic_stream_open)
-        self.assertIsNone(nodes._mic_reader)
-        self.assertEqual(result["source"], "U1 SDK audio shared-memory stream")
+        self.assertIsNotNone(nodes._mic_reader)
+        self.assertIn("device raw-topic fallback", result["source"])
+        publisher = FakePublisher()
+        nodes._mic_publisher = publisher
+        nodes.AudioChunk = FakeAudioChunk
+        nodes._audio_header = lambda: types.SimpleNamespace(
+            stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id="")
+        nodes._mic_topic_callback(types.SimpleNamespace(
+            data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE"))
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(nodes._mic_source, "topic")
         nodes.set_mic_enabled(False)
         self.assertEqual([call.args[0] for call in nodes.trigger_call.call_args_list],
                          ["audio_open", "audio_state", "audio_close"])
@@ -1310,7 +1335,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(result["input_topic"], "/tts/audio")
         self.assertTrue(nodes._speaker_forwarding)
 
-    def test_speaker_falls_back_to_raw_topic_when_enable_is_rejected(self):
+    def test_speaker_rejects_start_when_no_output_path_is_available(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
@@ -1327,10 +1352,10 @@ class U1CardContractTests(unittest.TestCase):
         nodes.close_speaker_subscription = lambda: None
         nodes._start_pulse_output = lambda: False
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock())
-        result = nodes.connect_speaker("/tts/audio")
-        nodes.core.create_subscription.assert_called_once()
-        self.assertFalse(result["output_enabled"])
-        self.assertTrue(nodes._speaker_forwarding)
+        with self.assertRaisesRegex(RuntimeError, "no verified output path"):
+            nodes.connect_speaker("/tts/audio")
+        nodes.core.create_subscription.assert_not_called()
+        self.assertFalse(nodes._speaker_forwarding)
 
     def test_tts_uses_documented_play_text_payload(self):
         import device
@@ -1391,7 +1416,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIs(publisher.messages[0].header, message.header)
         self.assertEqual(publisher.messages[0].data.data, [1, 0, 1, 0, 2, 0, 2, 0])
 
-    def test_speaker_pulse_queue_overflow_stops_forwarding_without_blocking(self):
+    def test_speaker_pulse_queue_applies_backpressure_then_continues(self):
         import device
 
         nodes = types.SimpleNamespace(
@@ -1402,6 +1427,7 @@ class U1CardContractTests(unittest.TestCase):
             _speaker_audio_queue=device.queue.Queue(maxsize=2),
             _speaker_process=types.SimpleNamespace(poll=lambda: None),
             _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
+            _speaker_writer_last_progress=device.time.monotonic(),
             _speaker_publisher=FakePublisher(),
         )
         for value in (1, 2):
@@ -1411,14 +1437,44 @@ class U1CardContractTests(unittest.TestCase):
             )
             device.U1Nodes._speaker_callback(nodes, message)
 
-        message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=[3, 0])
-        device.U1Nodes._speaker_callback(nodes, message)
+        enqueue_done = threading.Event()
 
-        self.assertEqual(list(nodes._speaker_audio_queue.queue), [bytes([1, 0]), bytes([2, 0])])
+        def enqueue_last_block():
+            message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=[3, 0])
+            device.U1Nodes._speaker_callback(nodes, message)
+            enqueue_done.set()
+
+        producer = threading.Thread(target=enqueue_last_block)
+        producer.start()
+        self.assertFalse(enqueue_done.wait(timeout=0.05))
+        self.assertEqual(nodes._speaker_audio_queue.get(timeout=0.1), bytes([1, 0]))
+        self.assertTrue(enqueue_done.wait(timeout=0.5))
+        producer.join(timeout=0.5)
+
+        self.assertEqual(list(nodes._speaker_audio_queue.queue), [bytes([2, 0]), bytes([3, 0])])
         self.assertEqual(nodes._speaker_frames, 3)
-        self.assertEqual(nodes._speaker_audio_blocks_dropped, 1)
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 0)
+        self.assertTrue(nodes._speaker_forwarding)
+
+    def test_speaker_stops_forwarding_when_writer_stalls(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_audio_queue=device.queue.Queue(maxsize=1),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
+            _speaker_writer_last_progress=(
+                device.time.monotonic() - device.SPEAKER_WRITER_STALL_TIMEOUT - 1),
+        )
+        nodes._speaker_audio_queue.put(b"queued")
+
+        device.U1Nodes._enqueue_speaker_block(nodes, b"incoming")
+
         self.assertFalse(nodes._speaker_forwarding)
-        self.assertIn("queue full", nodes._speaker_playback_error)
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 1)
+        self.assertIn("stopped making progress", nodes._speaker_playback_error)
 
     def test_speaker_pulse_blocks_are_40ms_and_preserve_pcm_bytes(self):
         import device
