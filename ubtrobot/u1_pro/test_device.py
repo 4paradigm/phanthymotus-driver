@@ -252,12 +252,9 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("/dev/shm:/dev/shm", text)
 
     def test_stream_topics_match_robot_contract(self):
-        import device
-
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(MIC_TOPIC, "/sys/device/audio_in/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
-        self.assertEqual(device.ASR_AUDIO_TOPIC, "/audio/sense/audio_data_to_asr")
 
     def test_audio_in_data_is_normalized_to_driver_pcm_contract(self):
         import device
@@ -1394,7 +1391,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIs(publisher.messages[0].header, message.header)
         self.assertEqual(publisher.messages[0].data.data, [1, 0, 1, 0, 2, 0, 2, 0])
 
-    def test_speaker_pulse_queue_backpressures_without_dropping_audio(self):
+    def test_speaker_pulse_queue_overflow_stops_forwarding_without_blocking(self):
         import device
 
         nodes = types.SimpleNamespace(
@@ -1414,23 +1411,14 @@ class U1CardContractTests(unittest.TestCase):
             )
             device.U1Nodes._speaker_callback(nodes, message)
 
-        enqueue_done = threading.Event()
+        message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=[3, 0])
+        device.U1Nodes._speaker_callback(nodes, message)
 
-        def enqueue_last_block():
-            message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=[3, 0])
-            device.U1Nodes._speaker_callback(nodes, message)
-            enqueue_done.set()
-
-        producer = threading.Thread(target=enqueue_last_block)
-        producer.start()
-        self.assertFalse(enqueue_done.wait(timeout=0.05))
-        self.assertEqual(nodes._speaker_audio_queue.get(timeout=0.1), bytes([1, 0]))
-        self.assertTrue(enqueue_done.wait(timeout=0.5))
-        producer.join(timeout=0.5)
-
-        self.assertEqual(list(nodes._speaker_audio_queue.queue), [bytes([2, 0]), bytes([3, 0])])
+        self.assertEqual(list(nodes._speaker_audio_queue.queue), [bytes([1, 0]), bytes([2, 0])])
         self.assertEqual(nodes._speaker_frames, 3)
-        self.assertEqual(nodes._speaker_audio_blocks_dropped, 0)
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 1)
+        self.assertFalse(nodes._speaker_forwarding)
+        self.assertIn("queue full", nodes._speaker_playback_error)
 
     def test_speaker_pulse_blocks_are_40ms_and_preserve_pcm_bytes(self):
         import device

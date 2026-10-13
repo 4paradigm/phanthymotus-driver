@@ -44,7 +44,6 @@ VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
 SDK_AUDIO_OPEN = "/robo/audio/call/open_stream"
 SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
 SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
-ASR_AUDIO_TOPIC = "/audio/sense/audio_data_to_asr"
 MOTION_LIST_SERVICE = "/robo/audio/call/get_motion_info_list"
 JPEG_MAX_PIXELS = 1280 * 720
 
@@ -736,9 +735,8 @@ class U1Nodes:
             self._mic_reader.skip_backlog = True
             try:
                 self._mic_reader.start(timeout=2.0)
-                # The SDK ring and the raw topic carry the same microphone
-                # stream. Once the ring is usable, do not forward the topic
-                # copy as well or ASR receives every utterance twice.
+                # The SDK ring and raw topic carry the same microphone stream.
+                # Prefer the SDK ring once it has opened to avoid duplicates.
                 with self._mic_source_lock:
                     self._mic_source = "sdk"
             except Exception:
@@ -1171,13 +1169,17 @@ class U1Nodes:
             writer = getattr(nodes, "_speaker_audio_thread", None)
             if process is None or process.poll() is not None or writer is None or not writer.is_alive():
                 return_code = process.poll() if process is not None else "unavailable"
+                nodes._speaker_audio_blocks_dropped += 1
                 U1Nodes._mark_pulse_failed(nodes, f"speaker playback unavailable (status {return_code})")
                 return
             try:
-                audio_queue.put(payload, timeout=0.1)
+                audio_queue.put_nowait(payload)
                 return
             except queue.Full:
-                continue
+                nodes._speaker_audio_blocks_dropped += 1
+                U1Nodes._mark_pulse_failed(
+                    nodes, "speaker playback queue full; stopped input to protect ROS callbacks")
+                return
 
     def close(self) -> None:
         if self._closed:
