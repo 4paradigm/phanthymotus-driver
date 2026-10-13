@@ -19,6 +19,12 @@ mode:
   # reboot, reset or unexpected torque loss, with results recorded in acceptance.
   verified_teaching_firmwares: []
 camera:
+  live:
+    enabled: false
+    width: 640
+    height: 480
+    fps: 10
+    jpeg_quality: 80
   # Empty: auto-select only when exactly one RealSense video-index0 exists.
   # For multiple cameras choose the COLOR V4L2 by-id path on the host.
   device: ""

@@ -16,7 +16,7 @@ class PiperEntrypointTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.plugins = build_plugins({'name': '机械臂 1', 'data_dir': self.tmp.name,
                                       'async_actions': False}, 'agilex', None)
-        self.runtime, self.status = self.plugins
+        self.runtime, self.status = self.plugins[:2]
         self.runtime.factory = Driver
         self.status.auto_connect = False
         self.bundle = DriverBundle(self.plugins)
@@ -28,7 +28,7 @@ class PiperEntrypointTests(unittest.TestCase):
 
     def test_production_registration_metadata_and_passive_lifecycle(self):
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(set(tools), {'arm_control', 'piper_status', 'model', 'piper_photo'})
+        self.assertEqual(set(tools), {'arm_control', 'piper_status', 'model', 'piper_photo', 'piper_camera_live'})
         schema = tools['arm_control']['inputSchema']
         self.assertNotIn('x-confirmation', schema)
         self.assertFalse({'read', 'allow_motion', 'block_motion', 'enter_teaching', 'exit_teaching'}

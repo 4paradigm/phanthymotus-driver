@@ -6,11 +6,12 @@ hardware_model: piper
 image_name: agilex-piper
 port: 15741
 mcp_url: "http://localhost:15741/mcp"
-description: "PiPER 两卡片：机械臂直接控制、自动骨架动作检测；模式与电机分别操作，六轴实测姿态持续监控。"
+description: "PiPER 三卡片：机械臂直接控制、自动骨架动作检测、实时彩色相机；模式与电机分别操作。"
 build_context_extras:
   - ../../common
 cards:
   - { name: piper_status, type: resource }
   - { name: arm_control, type: actuator }
+  - { name: piper_camera_live, type: resource }
   - { name: piper_photo, type: actuator }
   - { name: model, type: resource }
