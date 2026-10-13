@@ -361,11 +361,11 @@ def test_a_refused_command_stops_the_robot_rather_than_leaving_it_walking():
     _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1), sink)
     assert card._target == (0.2, 0.0, 0.0)
 
-    high_ctrl.mode = 30                      # disabled
-    card._mode_checked_at = float("-inf")    # expire the cache, as time would
+    high_ctrl.mode = 30                      # disabled within the former cache window
     _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2), sink)
     assert card._target == (0.0, 0.0, 0.0)
     assert loco.published[-1] == (0.0, 0.0, 0.0)
+    assert high_ctrl.mode_reads == 2
 
 
 def test_watchdog_activity_reports_hold_stand_down_and_fresh_resume():
@@ -469,21 +469,19 @@ def test_walking_later_lets_commands_through():
     loco.published.clear()
 
     high_ctrl.mode = loco_servo.WALKING_MODE
-    card._mode_checked_at = float("-inf")
     _stream_submit(card, _command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2), sink)
     assert loco.published == [(0.2, 0.0, 0.0)]
     assert card._refused == 0
 
 
-def test_the_workmode_is_not_read_once_per_command():
-    """At 10 Hz a DDS read per command puts a round trip to the robot's own
-    controller in the path of every velocity."""
+def test_the_workmode_is_read_for_every_command():
+    """An asynchronous mode change must stop the very next stream command."""
     high_ctrl = FakeHighCtrl()
     card = _card(high_ctrl=high_ctrl, loco=FakeLoco())
     sink = _sink(card)
     for seq in range(1, 6):
         _stream_submit(card, _command([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], seq=seq), sink)
-    assert high_ctrl.mode_reads == 1
+    assert high_ctrl.mode_reads == 5
 
 
 def test_require_standing_off_skips_the_check_entirely():

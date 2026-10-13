@@ -142,9 +142,6 @@ REPEAT_HZ = 50.0
 WALKING_MODE = 2
 PROTECTION_MODE = 26
 
-# How long a workmode reading stays good for. See `_posture_problem`.
-MODE_CACHE_S = 1.0
-
 # The largest normalised value the SDK takes on any axis.
 FULL_SCALE = 1.0
 
@@ -317,9 +314,9 @@ def build_descriptor(calibration: Calibration,
             "source": "measured",
             "arms": "at-rest",
         },
-        # Whether the three metric ceilings above mean anything. See
-        # `Calibration` — the whole velocity space is a guess until somebody
-        # walks the robot, and the policy upstream has no other way to find out.
+        # Whether the calibrated metric ceilings came from measured trials or
+        # are still estimates. The policy upstream has no other way to assess
+        # that provenance.
         "calibration": calibration.as_dict(),
     }
 
@@ -341,16 +338,11 @@ class LocoServoPlugin:
         if not 0 < self._expected_hz <= MAX_HZ:
             raise ValueError(f"loco_servo.expected_hz must be in (0, {MAX_HZ}]")
 
-        # **Defaults to on, unlike R1's.** R1's `dry_run` default was flipped off
-        # because a deployed chassis that silently refuses to move is worse than
-        # one that moves: `applied: 33, refused: 0, sdk_errors: 0` on screen
-        # while the robot stood still cost an afternoon there. That reasoning
-        # holds once the numbers are right. Here they are not: nothing has
-        # measured what `x = 1.0` means on a Bumi, so the first connection has
-        # to be an observation of what this card *wants* to send. Flip it off —
-        # from the card, at runtime, no redeploy — once the log's signs and
-        # magnitudes look right, and set `calibration_source: measured` in the
-        # same breath.
+        # **Defaults to on, unlike R1's.** Bumi's velocity conversion has been
+        # measured, but a newly wired visual-policy pipeline can still have a
+        # reversed axis or an unexpected target. The first connection therefore
+        # observes the metric-to-stick commands before enabling hardware output.
+        # Flip it off at runtime once directions and magnitudes are verified.
         self._dry_run = bool(config.get("dry_run", True))
         # Whether a command requires the robot to be walking. Checked per
         # command rather than at start — see `_posture_problem`. Configurable
@@ -388,8 +380,6 @@ class LocoServoPlugin:
         self._refused = 0
         self._sdk_errors = 0
         self._posture_problem_text = ""
-        # -inf rather than 0: the first command must actually read the workmode.
-        self._mode_checked_at = float("-inf")
 
         # The standing target the repeat thread keeps sending, already
         # normalised. Zero is a real command here, not an absence — see
@@ -451,13 +441,13 @@ class LocoServoPlugin:
                 "properties": {
                     "dry_run": {
                         "type": "boolean",
-                        # On, until somebody measures this chassis. See
-                        # `__init__` — the default is also what a form sends for
-                        # a field nobody touched, so it matters twice over.
+                        # On for the first visual-policy connection. See
+                        # `__init__` — a form may submit this default even when
+                        # an operator did not touch the field.
                         "default": True,
                         "description": "空跑：照常接收、检查、计数，但不调用 SDK —— "
-                                       "机器人不会动。Bumi 的速度标定还没人量过，"
-                                       "所以出厂是开的：先连上去看它想发什么",
+                                       "机器人不会动。Bumi 的速度已完成标定；首次连接"
+                                       "视觉策略时仍先核对它想发什么",
                     },
                     "rotate_only": {
                         "type": "boolean",
@@ -610,8 +600,8 @@ class LocoServoPlugin:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             self._paused = bool(halted)
-            # A pause may be caused by a card that changes workmode. Never
-            # reuse a one-second mode cache on either side of that transition.
+            # A pause may be caused by a card that changes workmode; clear its
+            # displayed status before the next per-command controller read.
             self._invalidate_mode_cache()
         if halted:
             self._set_activity("paused", "paused", "operator paused the stream")
@@ -724,17 +714,14 @@ class LocoServoPlugin:
         says nothing about whether the wiring is right, and by the time a
         command arrives the robot may well have stood up anyway.
 
-        Cached, because at `expected_hz` a DDS read per command would put a
-        round-trip to the robot's own controller in the path of every velocity.
+        This reads the controller for **every** streamed command.  A cached
+        ``walking`` result can outlive an asynchronous fall or protection
+        transition; waiting even one policy tick would keep publishing motion
+        after the state that authorises it has disappeared.
         """
         if not self._require_standing:
             return ""
 
-        now = time.monotonic()
-        if now - self._mode_checked_at < MODE_CACHE_S:
-            return self._posture_problem_text
-
-        self._mode_checked_at = now
         try:
             mode = int(self._high_ctrl.get_mode())
         except Exception as exc:                              # noqa: BLE001
@@ -764,8 +751,7 @@ class LocoServoPlugin:
                 return False
             self._paused = True
             # The explicit card may change workmode immediately after this
-            # returns. A cached walking result is no longer evidence it is safe
-            # to resume this stream.
+            # returns. Clear the prior status before the next controller read.
             self._invalidate_mode_cache()
         self._hold()
         print(f"[loco_servo] paused by an explicit command"
@@ -810,8 +796,11 @@ class LocoServoPlugin:
             }
 
     def _invalidate_mode_cache(self):
-        """Require a controller-mode read before the next streamed command."""
-        self._mode_checked_at = float("-inf")
+        """Clear the displayed posture status after an explicit mode change.
+
+        Workmode is now read on every streamed command; the method remains the
+        handoff point for callers that change it asynchronously.
+        """
         self._posture_problem_text = ""
 
     def _refuse_posture(self, posture: str) -> Outcome:
