@@ -523,6 +523,26 @@ def test_being_preempted_stops_the_chassis_immediately():
     assert loco.published[-1] == (0.0, 0.0, 0.0)
 
 
+
+def test_explicit_preemption_stops_the_repeat_zero_publisher():
+    """Once loco owns the chassis, servo must not interleave zero commands."""
+    loco = FakeLoco()
+    card = _card(loco=loco)
+    card._running = True
+    card._target = (0.4, 0.0, 0.0)
+    card._start_repeat()
+    try:
+        deadline = time.monotonic() + 1.0
+        while not loco.published and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert loco.published
+        assert card.pause_for_explicit_command("loco.move") is True
+        after_handoff = len(loco.published)
+        time.sleep(0.10)                 # five repeat periods
+        assert len(loco.published) == after_handoff
+    finally:
+        card._stop_repeat()
+
 def test_pause_for_explicit_command_reports_whether_it_did_anything():
     """The caller uses the return value to say it preempted something; a card
     that was already idle must not claim it was interrupted."""

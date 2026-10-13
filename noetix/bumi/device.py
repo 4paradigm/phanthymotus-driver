@@ -1977,6 +1977,10 @@ class _MotionStateNode(Node):
         self._odom_thread = None
         self._odom_samples = 0
         self._odom_burst_size = 0
+        # Consecutive SDK failures are one outage, not fifty independent
+        # warnings per second.  The first failure and every hundredth retain
+        # visibility; the first good sample announces recovery immediately.
+        self._odom_read_failures = 0
 
     @property
     def topic(self) -> str:
@@ -2037,7 +2041,16 @@ class _MotionStateNode(Node):
                 # A reading we could not take is not a reading of zero.
                 # Dropping it leaves the window holding only what was
                 # understood, and an empty window publishes all-`None`.
-                self.get_logger().warn(f"motus.odom/1 read failed: {exc}")
+                self._odom_read_failures += 1
+                if self._odom_read_failures == 1 or self._odom_read_failures % 100 == 0:
+                    self.get_logger().warn(
+                        f"motus.odom/1 read failed ({self._odom_read_failures}): {exc}")
+            else:
+                if self._odom_read_failures:
+                    self.get_logger().info(
+                        "motus.odom/1 read recovered after "
+                        f"{self._odom_read_failures} failure(s)")
+                    self._odom_read_failures = 0
 
             now = time.monotonic()
             if now - last_publish < odom_spec.PUBLISH_S:

@@ -863,13 +863,20 @@ class LocoServoPlugin:
         """
         period = 1.0 / REPEAT_HZ
         while not self._repeat_stop.is_set():
-            sink = self._sink
-            if sink is not None:
-                self._tick_watchdog(sink)
-            if not self._dry_run:
-                with self._lock:
-                    target = self._target
-                self._publish(*target)
+            # Explicit cards own the chassis while they run.  Do not merely
+            # change the standing target to zero here: a 50 Hz zero publisher
+            # interleaved with loco.move's 50 Hz publisher makes a human
+            # command stutter or disappear.  `_hold()` sends one immediate
+            # zero during handoff; after that this thread yields completely.
+            with self._lock:
+                paused = self._paused
+                sink = self._sink
+                target = self._target
+            if not paused:
+                if sink is not None:
+                    self._tick_watchdog(sink)
+                if not self._dry_run:
+                    self._publish(*target)
             self._repeat_stop.wait(period)
 
     def _set_activity(self, state: str, event: str, reason: str = ""):
