@@ -1,1 +1,1 @@
-upstream/piper_description.urdf -text
+upstream/piper_description.urdf -text -whitespace
