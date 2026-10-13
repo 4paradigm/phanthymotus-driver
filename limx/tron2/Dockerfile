@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3-pip ca-
 COPY requirements.txt /tmp/tron2-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/tron2-requirements.txt
 COPY common/ /work/common/
-COPY main.py device.py vendor.py state.py reset.py skeleton.py ros2.py check.py config.yaml driver.yaml /work/
+COPY main.py device.py vendor.py state.py reset.py skeleton.py joint_angles.py ros2.py check.py config.yaml driver.yaml /work/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 ENV PYTHONUNBUFFERED=1

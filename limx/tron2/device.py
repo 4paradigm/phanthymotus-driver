@@ -10,15 +10,17 @@ from vendor import RobotReader, validate_movej, reject_constant
 from reset import ResetPose, POSES
 from skeleton import skeleton_stream, model
 from state import battery_stream
+from joint_angles import angle_sample, angles_stream
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.2'
+VERSION = '0.5.3'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
-          ('joint_state', 'battery_state')}
+          ('joint_state', 'joint_angles', 'battery_state')}
 DESCRIPTIONS = {
     'joint_state': 'TRON2 双臂与头部16关节实时骨架；配套厂家URDF，原始rad/deg及速度力矩可通过info查看',
+    'joint_angles': 'TRON2 16关节实际角度（度）：J0–6左臂、J7–13右臂、J14–15头部；与骨架共用实时反馈，断连/过期清空。监控选择最新查看数值，原始rad见joint_state的info（只读）',
     'battery_state': 'TRON2 电量（%）、电压原始值/电流绝对值、估算功率 estimated_power_w（按 mV/mA 假设）、单个温度原始值 temperature_raw（五路有效值中最高值，非℃）、循环次数；随厂家通知更新，诊断含接收年龄及五路原值（只读）',
     'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，pose命名姿态，reset回到本机自然垂下目标；preview/list/verify_at_home只读；头部与夹爪不参与，响应仅确认受理，stop不是急停',
 }
@@ -121,7 +123,17 @@ class Adapter:
         return tools
 
     def snapshot(self):
-        return {name: self.reader.sample(name) for name in self.enabled if name in TOPICS}
+        samples = {}
+        joint = self.reader.sample('joint_state') if any(
+            name in self.enabled for name in ('joint_state', 'joint_angles')) else None
+        for name in self.enabled:
+            if name == 'joint_angles':
+                samples[name] = angle_sample(joint)
+            elif name == 'joint_state':
+                samples[name] = joint
+            elif name in TOPICS:
+                samples[name] = self.reader.sample(name)
+        return samples
 
     def call(self, name, args):
         allowed = {'action', 'instance_id', '_trace_id'}
@@ -195,7 +207,7 @@ class Adapter:
         result = {'state': 'idle' if action == 'stop' else 'running', 'read_only': True,
                   'always_on': True, 'topic_out': [{'topic': TOPICS[name], 'format': 'sensor/skeleton' if name == 'joint_state' else 'data/json'}]}
         if action == 'info':
-            result['sample'] = self.reader.sample(name)
+            result['sample'] = self.snapshot()[name]
         return result
 
     async def publish_loop(self):
@@ -207,6 +219,8 @@ class Adapter:
                     data = battery_stream(data)
                 elif name == 'joint_state':
                     data = skeleton_stream(data)
+                elif name == 'joint_angles':
+                    data = angles_stream(data)
                 self.publish(TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 

@@ -26,6 +26,7 @@ from vendor import RobotReader
 import state
 import ros2
 import skeleton
+from joint_angles import ANGLE_FIELDS
 from reset import ARM_NAMES
 
 
@@ -236,7 +237,7 @@ class CacheTests(unittest.TestCase):
         self.reader.joints = state.joint_state(joints())
         self.reader.joints_at, self.reader.joints_received = time.monotonic(), time.time()
         self.reader.disconnect('Disconnected')
-        for card in TOPICS:
+        for card in ('joint_state', 'battery_state'):
             self.assertFalse(self.reader.sample(card)['available'])
             self.assertIsNone(self.reader.sample(card)['data'])
         self.assertIsNone(self.reader.info)
@@ -563,7 +564,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         result = reply['result']
         return result['isError'], json.loads(result['content'][0]['text'])
 
-    async def test_handshake_two_sensors_and_model_resource(self):
+    async def test_handshake_three_sensors_and_model_resource(self):
         reply = await self.rpc('initialize')
         self.assertEqual(reply['result']['serverInfo']['version'], VERSION)
         tools = (await self.rpc('tools/list'))['result']['tools']
@@ -664,6 +665,9 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(packet['status']['available'])
                     self.assertEqual(packet['status']['sample_status'], 'recently_received')
                     self.assertFalse(packet['status']['measurement_time_verified'])
+                elif topic == TOPICS['joint_angles']:
+                    self.assertEqual(set(packet), set(ANGLE_FIELDS))
+                    self.assertTrue(all(value == math.degrees(.1) for value in packet.values()))
                 else:
                     self.assertTrue(packet['status']['available'])
                     self.assertEqual(len(packet['joints']), 16)
@@ -683,6 +687,9 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(packet['status']['available'])
                     self.assertEqual(packet['status']['sample_status'], 'offline')
                     self.assertIsNone(packet['status']['current_updated_at_raw'])
+                elif topic == TOPICS['joint_angles']:
+                    self.assertEqual(set(packet), set(ANGLE_FIELDS))
+                    self.assertTrue(all(value is None for value in packet.values()))
                 else:
                     self.assertEqual(packet['joints'], [])
                     self.assertFalse(packet['status']['available'])
@@ -747,7 +754,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
     async def test_removed_cards_are_not_discovered_or_callable(self):
         self.adapter.enabled.append('arm_control')
         names = {tool['name'] for tool in self.adapter.tools()}
-        self.assertEqual(names, {'joint_state', 'battery_state', 'arm_control', 'model'})
+        self.assertEqual(names, {'joint_state', 'joint_angles', 'battery_state', 'arm_control', 'model'})
         for name in ('robot_status', 'robot_state', 'reset_pose'):
             error, result = await self.call(name, action='info')
             self.assertTrue(error)
@@ -1027,13 +1034,13 @@ class PackagingTests(unittest.TestCase):
     def test_staged_entry_imports_without_repository_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','joint_angles.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.2"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.3"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

@@ -6,8 +6,8 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.2'
-CARDS = {'joint_state', 'battery_state'}
+VERSION = '0.5.3'
+CARDS = {'joint_state', 'joint_angles', 'battery_state'}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -61,7 +61,7 @@ def run_check(timeout=20):
     names = {tool['name'] for tool in tools}
     expected = {**dict.fromkeys(CARDS, 'sensor'), 'arm_control': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
-        raise ValueError('Expected two sensors, optional arm_control and model resource')
+        raise ValueError('Expected three sensors, optional arm_control and model resource')
     if 'model' not in names:
         raise ValueError('Skeleton model resource is missing')
     model_reply = rpc('tools/call', {'name': 'model', 'arguments': {}})
@@ -104,6 +104,16 @@ def run_check(timeout=20):
     skeleton_data = skeleton_stream(joint)
     if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != 16:
         raise ValueError('Unsupported skeleton joint layout or names')
+    from joint_angles import angle_sample, ANGLE_FIELDS
+    angles = after['joint_angles']
+    if set(angles['data']) != set(ANGLE_FIELDS) or len(angles['data']) != 16:
+        raise ValueError('Expected sixteen joint-angle fields')
+    # Separate info calls may straddle an incoming response. Compare only when
+    # both samples refer to the same received frame; never assume static arms.
+    if angles['received_at'] == joint['received_at'] and angles['data'] != angle_sample(joint)['data']:
+        raise ValueError('Joint-angle values do not match the skeleton feedback')
+    if angles['received_at'] <= before['joint_angles']['received_at']:
+        raise ValueError('Joint-angle feedback receipt did not update')
     battery = after['battery_state']['data']
     if set(battery) != {'schema_version', 'soc', 'voltage', 'current', 'power',
                        'temperature', 'cycle', 'units', 'validity',
@@ -113,7 +123,7 @@ def run_check(timeout=20):
     if battery['schema_version'] != 3 or len(battery['temperature_channels_raw']) != 5 \
             or battery['power_status'] != 'estimated_assuming_mV_mA':
         raise ValueError('Unexpected battery schema, channels or power interpretation')
-    print('PASS: two sensors, skeleton/model and arm actions; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: three sensors including 16 joint-angle tiles, skeleton/model and arm actions; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])

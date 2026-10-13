@@ -1,15 +1,16 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供关节骨架、电池两张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.2`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架、关节角度、电池三张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.3`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
+| `joint_angles` | sensor | 16项实际关节角度（度），字段标明左/右臂或头部、索引与关节名称；数值在最新模式可读 | `/limx_tron2/joint_angles`（data/json） |
 | `battery_state` | sensor | 电量、电压原始值/电流绝对值、按mV/mA假设的估算功率、单个温度原始值（五路最大有效值）、循环次数 | `/limx_tron2/battery_state` |
 | `arm_control` | actuator | move自定义目标、pose预设、reset复位、只读预览/列表/到位检查 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
-传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton，battery_state保留data/json。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。电池来自notify_robot_info通知。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
+传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton，joint_angles与battery_state使用现有data/json。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。电池来自notify_robot_info通知。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
 ## 读取边界与字段说明
 
@@ -17,7 +18,8 @@
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
-- 0.5.2的骨架流每项增加q_deg（由同一q换算，不舍入）、group（左臂/右臂/头部）及label（简短关节名称）。完整16项角度都输出；更新后的Motus骨架组件可展开角度表，同时显示度与rad三位小数，完整精度留在数据和数值提示中。旧平台会忽略这些可选字段，不会自动出现表格，必须同时更新Agent Core前端。表格是实际反馈，不是arm_control的目标角；停更/断连应显示不可用，不把未知值补成0。
+- `joint_angles`独立卡片直接使用当前平台的data/json“最新”模式显示16项数值，无需修改或升级Agent Core。每个字段按左臂、右臂、头部顺序包含组别、官方索引、中文关节名及“度”，例如左臂_J3_肘_度。数值由实际反馈q换算而来，未在驱动中舍入；当前平台通常显示三位小数，JSON保留完整精度。原始rad、速度/力矩仍通过joint_state的info查看。
+- joint_angles与joint_state共用同一个缓存样本、名称映射和接收时间，不额外查询机器人。左臂0–6、右臂7–13、头部俯仰14/偏航15；提供厂家名称时按名称映射，不支持的布局/名称、过期/断连时全部16项发布null，避免旧平台保留上次读数。运动目标值不会被当作反馈，也不会把静止关节强制归零。骨架中的可选q_deg/group/label字段保留，旧平台会忽略它们，本版本不依赖平台PR或同卡片角度表。
 - 骨架使用Motus既有joints协议和model资源。名称缺失时按官方SDK索引顺序映射到URDF：左臂0–6、右臂7–13、头部俯仰14/偏航15；URDF文本中头部关节顺序相反，不使用文件遍历顺序。若厂家提供名称则按名称匹配，不支持的关节数或名称返回空骨架和不可用诊断。没有可用IMU姿态时省略可选imu_quat；不能发送空数组，因为平台会将其解构成四个undefined值、破坏根节点旋转。模型来源和Apache-2.0归属见resource/SOURCE.md；只保留厂家运动学，不包含网格资产。
 - 电池数据schema版本为3。MCP/health缓存字段为 `soc/voltage/current/power/temperature/cycle`；`soc`为百分比，`voltage/current/temperature`为厂家原始单位。`temperature`只显示五路有效原始值中的最大值，不标成℃、不判断正常/过热；五路原值仍在`temperature_channels_raw`中按`bms_temp1`至`bms_temp5`保留，无效通道保留null。所有通道无效时单个温度也是null。`cycle`只接受厂家`bms_charging_cycle`的非负整数。
 - 电流`current`按用户要求只展示绝对值，例如厂家`-2620`显示`2620`；0保留，无效值仍为null。缩放保持厂家原始单位，这个字段不再保留正负方向，不用于判断充放电状态。
@@ -53,11 +55,11 @@
 }
 ```
 
-电池沿用0.4.8的schema v3，功率为estimated_power_w，温度为单值temperature_raw；诊断位于status。MCP/health仍提供power和temperature，五路原数组为temperature_channels_raw。本次0.5.0不修改电池计算、显示字段或本机复位目标。
+电池沿用0.4.8的schema v3，功率为estimated_power_w，温度为单值temperature_raw；诊断位于status。MCP/health仍提供power和temperature，五路原数组为temperature_channels_raw。本次0.5.3不修改电池计算、显示字段或本机复位目标。
 
-传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。公开两张sensor、一张arm_control actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
+传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。公开三张sensor、一张arm_control actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
 
-兼容Agent Core自动注入的instance_id和_trace_id：最长128字符、无控制字符，不参与机器人请求或回显。两张传感器通过info查看当前原始缓存。
+兼容Agent Core自动注入的instance_id和_trace_id：最长128字符、无控制字符，不参与机器人请求或回显。三张传感器通过info查看当前原始缓存。
 
 ## 配置
 
@@ -104,9 +106,9 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 # 或：python3 limx/tron2/check.py
 ```
 
-脚本等待就绪，检查Core注册、两张sensor/arm_control/model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/pose/reset，也不验证真实运动。
+脚本等待就绪，检查Core注册、三张sensor/arm_control/model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/pose/reset，也不验证真实运动。
 
-升级到0.5.0后刷新Motus，移除画布上的旧robot_status与reset_pose实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、battery_state、arm_control三张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后joint_state应显示厂家双臂/头部骨架。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
+升级到0.5.0后刷新Motus，移除画布上的旧robot_status与reset_pose实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、joint_angles、battery_state、arm_control四张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架；joint_angles在监控中切换“最新”查看16项度数。不需要将两张传感器连线。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：全部已启用传感器有最近接收数据时为 HTTP 200，否则为 503。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
