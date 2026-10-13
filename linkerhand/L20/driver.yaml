@@ -1,0 +1,11 @@
+id: linkerhand-l20-driver
+name: LinkerHand L20 Dexterous Hand
+category: driver
+hardware_provider: linkerhand
+hardware_model: "L20"
+image_name: linkerhand-l20
+port: 15710
+mcp_url: "http://localhost:15710/mcp"
+description: "灵心巧手 L20 灵巧手 — 多关节控制、预设手势、状态遥测"
+cards:
+  - { name: hand, type: actuator }
