@@ -60,7 +60,7 @@ def main():
     report = {"time":datetime.now(timezone.utc).isoformat(),"architecture":platform.machine(),
               "can":host_check(["ip","-details","link","show","can0"]),
               "containers":host_check(["docker","ps","--format","{{.Names}} {{.Image}}"]),
-              "control_commands_requested":0,"photos":[]}
+              "control_commands_requested":0,"validation_scope":"software_only", "photos":[]}
     errors = {}
     def check(key, operation):
         try:
@@ -73,22 +73,22 @@ def main():
     check("server", lambda: rpc(args.endpoint,"initialize"))
     def check_cards():
         cards = [t["name"] for t in rpc(args.endpoint,"tools/list")["tools"]]
-        expected = {"arm_control", "piper_photo"}
+        expected = {"arm_control", "piper_photo", "piper_status", "model", "piper_camera_live"}
         if set(cards) != expected:
             raise RuntimeError("控制卡与相机未完整注册；请核对本版本工具清单")
         return cards
     check("cards", check_cards)
-    check("before", lambda: call(args.endpoint,"arm_control","read"))
+    check("before", lambda: call(args.endpoint,"arm_control","info"))
     for index in range(args.photos):
         photo = check(f"photo_{index+1}", lambda: finish_photo(args.endpoint,call(args.endpoint,"piper_photo","capture")))
         if photo is not None:
             report["photos"].append(photo)
-    check("after", lambda: call(args.endpoint,"arm_control","read"))
+    check("after", lambda: call(args.endpoint,"arm_control","info"))
     def check_unchanged():
         if not report.get("before") or not report.get("after"):
             raise RuntimeError("缺少新鲜状态，无法确认只读期间模式和使能未变化")
         for field in ("control_mode","enabled","teach_status"):
-            if report["before"][field] != report["after"][field]:
+            if report["before"]["snapshot"].get(field) != report["after"]["snapshot"].get(field):
                 raise RuntimeError(f"只读验收期间 {field} 发生变化，需现场核查")
         if report["after"]["motion_enabled"]:
             raise RuntimeError("只读验收要求 PIPER_MOTION_ENABLED=0")

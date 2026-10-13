@@ -11,6 +11,7 @@ build_context_extras:
   - ../../common
 cards:
   - { name: model, type: resource }
+  - { name: piper_camera_live, type: resource }
   - { name: arm_control, type: actuator }
   - { name: piper_status, type: resource }
   - { name: piper_standby, type: actuator }
