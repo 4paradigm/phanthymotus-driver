@@ -26,7 +26,7 @@ python main.py
 
 ### Building Docker Images
 
-For G1, prepare the versioned base image once as described in the [G1 build instructions](unitree/g1/README.md#构建). Rebuild it only when its dependencies or build configuration change.
+For G1, use the published base image described in the [G1 build instructions](unitree/g1/README.md#构建). Rebuild it only when its dependencies or build configuration change.
 
 ```bash
 cp .env.example .env  # Configure registry settings

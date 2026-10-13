@@ -184,11 +184,6 @@ class NumericalWorker:
         return self.call('render', {'state': state, 'output': output, 'hardware': hardware},
                          identity={'generation': generation})
 
-    def return_step(self, q, previous, deadline, measured_ns):
-        result = self.call('return_step', {'q': list(q), 'previous': list(previous), 'measured_ns': measured_ns}, deadline=deadline)
-        self.last_envelope = result['envelope']
-        return result['q']
-
 
 def serve(sock, solver_module, solver_class, visualization_module):
     solver = None
@@ -246,15 +241,6 @@ def serve(sock, solver_module, solver_class, visualization_module):
                 adapter = SimpleNamespace(solver=solver, link=SimpleNamespace(feedback=lambda: state),
                     output=data['output'], hardware_output=data['hardware'])
                 result = {'poses': poses, 'visualization': snapshot(adapter)}
-            elif op == 'return_step':
-                import numpy as np
-                q, previous = np.asarray(data['q']), np.asarray(data['previous'])
-                lower, upper = solver.model.lowerPositionLimit[solver.indices], solver.model.upperPositionLimit[solver.indices]
-                if np.any(lower > 0) or np.any(upper < 0):
-                    raise ValueError('neutral_outside_limits')
-                target = np.zeros_like(q)
-                result = {'q': target.tolist(),
-                          'envelope': {**solver.motion_envelope(q, previous, target, budget), 'measured_ns': data['measured_ns']}}
             else:
                 raise ValueError('ik_worker_unknown_operation')
             budget()

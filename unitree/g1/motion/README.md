@@ -2,40 +2,23 @@
 
 `MotionControl` 在 Driver 主进程只处理校验、最新目标和生命周期。`NumericalWorker` 在独立 CPU Python 进程加载 G1_23 模型、FK/IK、碰撞和显示；ROS、控制权、持续执行、保持和停止留在 arm。两个进程之间只有一个在途请求，协调器只保留最新待处理输入。没有GPU依赖或额外遥操构建开关。
 
-## 普通镜像构建
+## 代码与依赖
 
-主 Driver、`servo_eef` 和 IK 子进程共用 ROS 基础镜像的 `/usr/bin/python3` 及同一套依赖。子进程使用 `sys.executable`；超时终止和重启机制不变。
+| 模块 | 职责 |
+|---|---|
+| `../teleop_control.py`、`../teleop_bus.py` | 设备输入、相对映射、会话与 ROS 订阅 |
+| `../motion_control.py`、`../motion_bus.py` | 数值协调、最新目标与运动卡传输 |
+| `worker.py`、`../../../common/motion/worker.py` | G1 求解器入口与独立进程 IPC |
+| `kinematics.py`、`ik.py` | 固定关节、FK 与 CasADi IK |
+| `profile.py`、`body23_fixed_hand.json` | 机型几何及每轮实测基准 |
+| `collision.py`、`workspace.py`、`visualization.py` | 可选空间检查与诊断数据 |
+| `../arm_stream.py` | 控制权、位置下发、保持与停止 |
 
-`Dockerfile.base` 使用系统 pip 安装依赖，不引入 Conda 或额外 Python 环境。PyPI 的普通 `pin` wheel 不提供 CasADi 绑定，因此构建时用 `--no-binary=pin` 编译 Pinocchio 4.1.0，并启用 `BUILD_WITH_CASADI_SUPPORT`。base 的编译阶段与运行阶段共用依赖基础层；运行阶段只复制 Pinocchio 包、路径 hook 和安装元数据，不包含 cmeel 临时编译目录。业务 Dockerfile 从固定版本的 base 构建，不再编译这些依赖。首次构建和版本更新步骤见 [G1 构建说明](../README.md#构建)。
+主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [Dockerfile.base](../Dockerfile.base) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [G1 构建说明](../README.md#构建)。
 
-共享依赖固定为 NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3；OpenCV 保持 4.11.0.86。Pinocchio 使用单编译进程，构建机需要足够内存。`CMEEL_RUN_TESTS=OFF` 仅关闭打包时依赖额外模型和扩展资源的上游测试，项目回归单独执行。
+普通 `pin` wheel 不包含所需 CasADi 绑定。base 从源码启用 `BUILD_WITH_CASADI_SUPPORT`，运行阶段只复制安装产物。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
 
-开发环境也需要支持 `pinocchio.casadi` 的依赖；缺失时明确报错，不退化为未求解结果。先导入 `casadi`，再导入 `pinocchio.casadi`，使动态加载器能找到 CasADi 库。镜像构建会检查版本、构造 CasADi 模型并验证模型资产：
-
-```sh
-python3 -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "2.2.6"; assert casadi.__version__ == "3.8.1"; assert pinocchio.__version__ == "4.1.0"; cpin.Model(pinocchio.buildSampleModelManipulator())'
-python3 /work/motion/fetch_assets.py --check
-```
-
-七个碰撞网格只在构建时下载并逐文件核验 SHA256。网格不进入Git；许可证和清单随源码，运行时再次验证哈希。`calibration.example.json` 仍是未实物标定样例，不能填写假验收或直接作为Live配置。
-
-主进程与数值进程使用同一 Pinocchio 版本，但各自创建模型和 Data。执行器校验模型哈希和关节顺序，不能跨进程共享可变求解状态。当前遥操不增加重力补偿。
-
-## 离线验证
-
-真实数值用例覆盖 G1_23 模型和已核验网格的完整关节解、独立数值子进程的 EEF14→joint10 和双末端反馈，以及空配置执行器接受新标定、无效候选保留前一配置。2026-10-12，上海 G1 的 ARM64 运行镜像通过 G1 与 servo_eef 回归：196 项通过、无跳过。ROS 隔离测试收到 541 帧，完成 21 个订阅代次及 3 次注入异常恢复。系统 Python、主要模块导入、模型哈希及无 cmeel 临时目录检查通过。
-
-源码构建和产物运行已分别验证。M2 本机 Linux ARM64 Docker 编译的 wheel 也在 G1 通过同组 196 项测试。随后将依赖拆为固定版本 base，首个 base 复用已验证的编译产物，未重复冷编译 Pinocchio。业务 Dockerfile 使用该 base，在 `--no-cache` 下构建耗时 12.38 秒；新镜像通过 196 项回归、无跳过，ROS 隔离测试收到 394 帧，完成 21 个订阅代次及 3 次注入异常恢复。2026-10-13，该 base 已按 [G1 构建说明](../README.md#构建) 中的名称发布，远端摘要与本地一致；BOT 发布、业务部署和物理动作验收仍未完成。
-
-```sh
-python -m pytest -q unitree/g1/tests/test_motion_control_numeric.py
-python -m pytest -q unitree/g1/tests/test_motion_control_contract.py
-python -m pytest -q unitree/g1/tests/test_motion_control_threads.py
-```
-
-第二组6项为明确执行器/数值替身的卡片协议测试，覆盖最新值、会话栅栏、失败后同映射恢复、完整参考及包络。它不证明SDK执行或物理完成。缺少真实数值ABI时第一组会skip，不能把skip记作通过。
-
-第三组运行真实遥操线程、运动协调线程和数值 IPC 子进程，验证最新待处理帧覆盖、通信超时、旧进程退出、重启、新代次拒绝旧结果以及新帧恢复发布。测试复用硬件替身，并以可阻塞的合成求解器替代 IK；需要 pytest、NumPy 和 SciPy，不需要 ROS、SDK 或 Pinocchio。它不验证实际求解精度或物理停止。
+七个碰撞网格在构建时下载，构建和运行时均核验 SHA256。网格不进入 Git；许可证与哈希清单位于 `models/collision/`。测试专用的未标定数据位于 `../tests/fixtures/calibration.json`，不随业务镜像安装。
 
 ## 输入与状态
 
@@ -48,9 +31,9 @@ python -m pytest -q unitree/g1/tests/test_motion_control_threads.py
 
 ## 机型 profile 与每轮基准
 
-`motion/body23_fixed_hand.json` 固定关节映射、URDF SHA、双掌 TCP（腕轴前方 0.2 m）和手柄局部变换，沿用本轮 r11b 已实测的原厂固定手配置。该文件不包含某次现场腰腿角度，也不填写 acceptance 通过标记。每次初始化映射时，从同一份新鲜 LowState 采集双臂和 13 个腰腿关节，为数值工作进程生成本轮临时 profile；工作进程重启沿用同一份基准，新的遥操会话重新采样。缺失、过期或非有限实测值会明确报告，不用零值猜测机器人姿态。松握重握不重新标定。
+`motion/body23_fixed_hand.json` 固定关节映射、URDF SHA、双掌 TCP（腕轴前方 0.2 m）和手柄局部变换。该文件不包含某次现场腰腿角度，也不填写 acceptance 通过标记。每次初始化映射时，从同一份新鲜 LowState 采集双臂和 13 个腰腿关节，为数值工作进程生成本轮临时 profile；工作进程重启沿用同一份基准，新的遥操会话重新采样。缺失、过期或非有限实测值会明确报告，不用零值猜测机器人姿态。松握重握不重新标定。
 
-适用范围是原厂 G1_23 固定假手；不宣称自动适配 G1_29、灵巧手或改装 TCP。附加碰撞检查仍关闭，旧现场预览空间盒未纳入默认 profile，不能将其当作碰撞验收结果。模型及上述 TCP 有本轮现场使用依据，但没有补造独立尺寸或长时机械验收记录。
+适用范围是原厂 G1_23 固定假手；不宣称自动适配 G1_29、灵巧手或改装 TCP。附加碰撞检查仍关闭，旧现场预览空间盒未纳入默认 profile，不能将其当作碰撞验收结果。
 
 卡片注册、info、默认启用及空闲 stop 不申请运动权、不创建 SDK 命令通道。`servo`、`servo_eef` 可以同时注册；本实现不新增统一控制器仲裁，也不在装载时因其他卡片 enabled 而拒绝遥操。旧会话/过期指令隔离与本遥操的停止取消仍保留。
 
@@ -70,9 +53,17 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 
 空闲且从未接管 SDK 时，重复停止返回 no-op；不创建释放任务，也不声称已验证物理停止。未知的厂商动作结果仍报告未知，不通过重复 stop 清除。Driver 不持久化或自动恢复运动租约。
 
-## 平滑与轨迹衔接的参考来源
+“以后端最后成功下发的位置续接”的设计参考 **@jsmy-CTH** 的 [PR #322](https://github.com/4paradigm/phanthymotus-driver/pull/322)。120 ms 平滑、1 rad/s 限幅及 50 ms 时间上限为本次 G1 适配参数。其他来源见 [NOTICE](NOTICE.md)。
 
-感谢 **@jsmy-CTH** 在 [PR #322：提供实际下发状态用于轨迹衔接](https://github.com/4paradigm/phanthymotus-driver/pull/322) 中的贡献。本实现参考其“以实际成功下发的关节参考作为后续轨迹衔接起点”的做法，避免反复以存在滞后的实测位置作为推进起点。请将 #322 作为这部分设计来源保留。120ms一阶指数平滑及本卡1rad/s、dt最大50ms的组合是本次G1适配追加的实现，不冒称为#322原有全部算法，也不将参考部分描述为本PR独立首创。
+## 离线验证
+
+在仓库根目录、具备 G1 运行依赖和 pytest 的环境中执行：
+
+```sh
+python3 -m pytest -q -rs tests/test_teleop_contract.py tests/test_g1_servo_eef.py unitree/g1/tests
+```
+
+`test_motion_control_numeric.py` 使用真实模型、网格和 IK 子进程；缺少数值依赖时会跳过，不能把跳过记作通过。协议、执行器与线程用例使用硬件替身；线程用例还使用合成求解器测试超时、重启和旧代次隔离。这些测试不验证机器人动作或物理停止。
 
 ## ROS 生命周期验证
 

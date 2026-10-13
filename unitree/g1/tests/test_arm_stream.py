@@ -29,7 +29,7 @@ class Channel:
 
 
 def calibration(tmp_path):
-    data=json.loads((DRIVER/'motion/calibration.example.json').read_text())
+    data=json.loads((DRIVER/'tests/fixtures/calibration.json').read_text())
     data['urdf_path']=str(DRIVER/'motion/models/body23.urdf')
     data['locked_joints']=dict.fromkeys(data['locked_joints'],0.)
     path=tmp_path/'synthetic.json';path.write_text(json.dumps(data));return path
@@ -302,23 +302,6 @@ def test_readonly_matched_count_migration_uses_subscription_event():
     assert obj.MatchedPublisherCount()==0
     obj._Reader__OnSubscriptionMatched(None,SimpleNamespace(current_count=2))
     assert obj.MatchedPublisherCount()==2
-
-
-def test_readonly_publication_handle_preserves_unsigned_value_and_reports_error(monkeypatch):
-    import ctypes
-    source=DRIVER/'unitree_sdk2py/core/channel.py';tree=ast.parse(source.read_text())
-    channel=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Channel')
-    writer=next(n for n in channel.body if isinstance(n,ast.ClassDef) and n.name=='__Writer')
-    dds=SimpleNamespace(instance_handle=ctypes.c_int64,publication_matched_status=object)
-    ns={'DomainParticipant':object,'Topic':object,'Qos':object,'Any':object,'DataWriter':object,'dds_c_t':dds}
-    monkeypatch.setitem(sys.modules,'cyclonedds.internal',SimpleNamespace(dds_c_t=dds))
-    exec(compile(ast.Module(body=[writer],type_ignores=[]),str(source),'exec'),ns)
-    obj=ns['__Writer']()
-    def handle(ref,pointer):pointer._obj.value=-1;return 0
-    obj._Writer__writer=SimpleNamespace(_ref=123,_get_instance_handle=handle)
-    assert obj.PublicationHandle()==2**64-1
-    obj._Writer__writer._get_instance_handle=lambda *args:-1
-    with pytest.raises(RuntimeError,match='writer_handle_unavailable'):obj.PublicationHandle()
 
 
 @pytest.mark.parametrize('records', [{}, {'acceptance': {}}, {'first_acceptance': {'operator': '', 'evidence_sha256': 'invalid'}}])

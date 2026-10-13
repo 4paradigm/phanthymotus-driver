@@ -1,5 +1,6 @@
 """Configuration migration must not create an operator session or publish motion."""
 import json
+import pytest
 from types import SimpleNamespace
 from pathlib import Path
 import sys
@@ -7,14 +8,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from teleop_control import TeleopControl
 
 
-def test_legacy_canvas_settings_cannot_override_driver_preset(tmp_path):
+@pytest.mark.parametrize('contents', [json.dumps({'mode': 'shadow', 'calibration_path': '/old', 'position_scale': .1}), '{invalid', '[]'])
+def test_legacy_canvas_settings_cannot_override_driver_preset(tmp_path, contents):
     path = tmp_path / 'settings.json'
-    path.write_text(json.dumps({'mode': 'shadow', 'calibration_path': '/old', 'position_scale': .1}))
+    path.write_text(contents)
     executor = SimpleNamespace(cfg={})
     motion = SimpleNamespace(executor=executor, clock_id='offline')
     card = TeleopControl({'state_path': str(path), 'mode': 'live',
                          'calibration_path': '/driver/model.json', 'position_scale': 1.}, motion)
-    assert card.live and card._config_error is None
+    assert card.live
     assert card.cfg['calibration_path'] == '/driver/model.json'
     assert card.mapping.scale == 1.
     assert card._operator is None and card._thread is None
@@ -102,3 +104,27 @@ def test_arm_release_fences_input_until_explicit_canvas_start(tmp_path):
     assert card._generation == generation+1 and cancelled == [True]
     frame['sequence'] += 1
     assert card.receive(frame) is False
+
+
+@pytest.mark.parametrize('mode,scale,error', [('invalid', 1., 'invalid_mode'),
+    ('live', 0., 'invalid_position_scale'), ('live', float('nan'), 'invalid_position_scale'),
+    ('live', True, 'invalid_position_scale'), ('live', 1.1, 'invalid_position_scale')])
+def test_driver_preset_is_validated_at_startup(mode, scale, error):
+    motion = SimpleNamespace(executor=SimpleNamespace(cfg={}), clock_id='offline')
+    with pytest.raises(ValueError, match=error):
+        TeleopControl({'mode': mode, 'position_scale': scale}, motion)
+    assert motion.executor.cfg == {}
+
+
+def test_config_action_does_not_write_or_reset_mapping(tmp_path):
+    path = tmp_path / 'unused' / 'settings.json'
+    motion = SimpleNamespace(executor=SimpleNamespace(cfg={}), clock_id='offline')
+    card = TeleopControl({'state_path': str(path)}, motion)
+    anchor = object()
+    card.mapping.anchor = anchor
+    card._operator = 'active-session'
+    result = card.dispatch('config', {'mode': 'shadow', 'position_scale': .1,
+                                      'calibration_path': '/old', 'usage_guide': '无需配置'})
+    assert result['operator_session_id'] == 'active-session'
+    assert card.mapping.anchor is anchor and card.mapping.scale == 1.
+    assert card.live and not path.parent.exists()

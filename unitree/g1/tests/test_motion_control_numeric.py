@@ -21,7 +21,7 @@ from motion.worker import NumericalWorker
 
 def profile(tmp_path):
     root=DRIVER/'motion'
-    p=json.loads((root/'calibration.example.json').read_text())
+    p=json.loads((DRIVER/'tests/fixtures/calibration.json').read_text())
     p['urdf_path']=str(root/'models/body23.urdf')
     assert hashlib.sha256(Path(p['urdf_path']).read_bytes()).hexdigest()==p['urdf_sha256']
     p['version']='SYNTHETIC-NOT-ACCEPTED'

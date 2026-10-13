@@ -4,22 +4,6 @@ G1 Driver 通过 MCP 提供运动控制、机械臂动作、麦克风、扬声�
 
 现有 `arm.release` 使用厂商 action 99；连续控制入口包括 [servo.py](servo.py) 和 [servo_eef.py](servo_eef.py)。SDK 请求成功与实测动作完成是不同状态。
 
-## 构建
-
-业务镜像使用固定版本的 teleop base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
-
-已发布的 base 可直接拉取，日常业务构建无需执行以下源码构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
-
-```sh
-docker build --platform linux/arm64 \
-  -f unitree/g1/Dockerfile.base \
-  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
-  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:release.261012.4674297 \
-  unitree/g1
-```
-
-base 必须存在于当前 builder 可访问的本地镜像库或镜像仓库。当前版本已发布，远端 linux/arm64 镜像的索引摘要为 `sha256:88b1730d68102f21a20328f1fd87ec5ad3657766c0858db239e84f09dcdbac58`，与已验证的本地产物一致。修改依赖时更新 base 标签及业务 Dockerfile 的默认值，不覆盖已发布版本。自定义 base 可通过业务构建参数 `G1_BASE_IMAGE` 指定；`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
-
 ## 双臂遥操
 
 `teleop_control` 接收设备 Driver 的输入，在 G1 Driver 内完成相对映射、独立进程 IK 和双臂位置下发。默认注册该卡，市场清单包含 `teleop_control`。随镜像提供原厂 G1_23（每臂 5 关节、固定假手）的完整固定几何 profile；不依赖现场临时标定脚本或用户填写路径。Core 和 ActuCore 无需遥操专用修改。
@@ -39,6 +23,22 @@ base 必须存在于当前 builder 可访问的本地镜像库或镜像仓库。
 Canvas 显示输入等待、过期和传输错误等状态。IK 子进程超时或退出后，控制卡暂停并等待后续有效输入恢复。MCP 在线不代表 DDS 接收正常。Driver 不持久化或自动恢复运动租约。
 
 模型、话题、平滑参数、诊断与测试见 [G1 数值进程说明](motion/README.md)。
+
+## 构建
+
+业务镜像使用固定版本的 teleop base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
+
+已发布的 base 可直接拉取，日常业务构建无需执行以下源码构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
+
+```sh
+docker build --platform linux/arm64 \
+  -f unitree/g1/Dockerfile.base \
+  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
+  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:YOUR_NEW_TAG \
+  unitree/g1
+```
+
+当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:release.261012.4674297`。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
 
 ## ROS 配置来源
 

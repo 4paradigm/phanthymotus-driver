@@ -178,17 +178,6 @@ class Channel:
 
             return True
 
-        def PublicationHandle(self):
-            # Frozen visible-follow adapter: preserve the unsigned SampleInfo
-            # handle representation used by CycloneDDS 0.10.5/Python 3.10.
-            import ctypes
-            from cyclonedds.internal import dds_c_t
-            handle = dds_c_t.instance_handle()
-            result = self.__writer._get_instance_handle(self.__writer._ref, ctypes.byref(handle))
-            if result != 0:
-                raise RuntimeError('writer_handle_unavailable')
-            return handle.value & ((1 << 64) - 1)
-        
         def Close(self):
             if self.__writer is not None:
                 del self.__writer
@@ -224,9 +213,6 @@ class Channel:
 
     def MatchedPublisherCount(self):
         return self.__reader.MatchedPublisherCount()
-
-    def PublicationHandle(self):
-        return self.__writer.PublicationHandle()
 
     def CloseReader(self):
         self.__reader.Close()
@@ -320,9 +306,6 @@ class ChannelPublisher:
 
     def Write(self, sample: Any, timeout: float = None):
         return self.__channel.Write(sample, timeout)
-
-    def PublicationHandle(self):
-        return self.__channel.PublicationHandle()
 
 """
 " class ChannelSubscriber

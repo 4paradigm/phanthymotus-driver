@@ -24,7 +24,6 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 
-
 ## Quick Start
 
 ### Prerequisites
@@ -40,7 +39,7 @@ The easiest way to deploy a driver is through the Agent Core Web Dashboard. Navi
 
 If you need to build from source or develop a custom driver:
 
-For G1, first build or obtain its versioned base image using the [G1 build instructions](unitree/g1/README.md#构建).
+For G1 base image details, see the [G1 build instructions](unitree/g1/README.md#构建).
 
 ```bash
 cp .env.example .env  # Fill in registry credentials

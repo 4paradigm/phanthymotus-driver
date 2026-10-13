@@ -9,11 +9,7 @@ MotionControl's isolated worker, and DDS in the existing local-profile helper.
 """
 import copy
 import html
-import json
 import math
-import os
-import tempfile
-from pathlib import Path
 import secrets
 import threading
 import time
@@ -90,6 +86,7 @@ class TeleopControl:
     CAPABILITIES = ['dual_arm']
 
     def __init__(self, cfg, motion, *, clock=time.monotonic_ns):
+        self._validate_config(cfg)
         self.cfg, self.motion, self.executor = cfg, motion, motion.executor
         self.clock, self.clock_id = clock, motion.clock_id
         self.server_epoch = secrets.token_hex(16)
@@ -114,16 +111,6 @@ class TeleopControl:
         self._needs_calibration = False
         self._state, self._reason = 'idle', None
         self._auto_retry_after_ns = 0
-        self._config_error = None
-        self._config_path = Path(cfg.get('state_path', '/opt/phanthy-motus/data/g1-teleop-control.json'))
-        try:
-            if self._config_path.is_file():
-                saved = json.loads(self._config_path.read_text())
-                # Legacy Canvas preferences must not override the robot deployment preset.
-                keys = {'mode', 'calibration_path', 'position_scale', 'usage_guide'}
-                if not isinstance(saved, dict) or set(saved)-keys:raise ValueError('invalid_saved_config')
-        except (ValueError, OSError) as exc:
-            self._config_error = str(exc)
         self.executor.cfg['live_enabled'] = self.live
         self.executor.cfg['operator_session_enabled'] = self.live
 
@@ -148,56 +135,19 @@ class TeleopControl:
 
     @staticmethod
     def _validate_config(candidate):
-        if candidate.get('mode', 'shadow') not in ('shadow', 'live'): raise ValueError('invalid_mode')
-        for name, default, upper in [('position_scale', 1., 1.)]:
-            value = candidate.get(name, default)
-            if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= upper:
-                raise ValueError('invalid_'+name)
-
-    def configure(self, args):
-        keys = self.get_tool()['configSchema']['properties']
-        candidate = {**self.cfg, **{k:v for k,v in args.items() if k in keys}}
-        self._validate_config(candidate)
-        with self._lock:
-            if self._operator or self.motion.gate.session_id:
-                raise ValueError('configuration_requires_idle')
-            old_motion = self.motion.config_snapshot()
-            self._config_path.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(prefix='.teleop-config-', dir=self._config_path.parent)
-            try:
-                with os.fdopen(fd, 'w') as stream:
-                    json.dump({k:candidate[k] for k in keys if k in candidate}, stream, allow_nan=False)
-                    stream.flush(); os.fsync(stream.fileno())
-            except Exception:
-                Path(temporary).unlink(missing_ok=True)
-                raise
-            try:
-                if candidate.get('calibration_path'):
-                    self.motion.configure({k:candidate[k] for k in ('calibration_path','joint_velocity_rad_s') if k in candidate})
-                os.replace(temporary, self._config_path)
-            except Exception:
-                Path(temporary).unlink(missing_ok=True)
-                if old_motion.get('calibration_path'):
-                    self.motion.configure(old_motion)
-                raise
-            # Values are applied only after the model/limits validation succeeds.
-            self.cfg.clear(); self.cfg.update(candidate)
-            self.mapping.scale = candidate.get('position_scale', 1.)
-            self.executor.cfg['live_enabled'] = self.live
-            self.executor.cfg['operator_session_enabled'] = self.live
-            self.mapping.anchor = None
-            self._config_error = None
-            return self.info()
+        if candidate.get('mode', 'live') not in ('shadow', 'live'):
+            raise ValueError('invalid_mode')
+        scale = candidate.get('position_scale', 1.)
+        if type(scale) not in (int, float) or not math.isfinite(scale) or not 0 < scale <= 1.:
+            raise ValueError('invalid_position_scale')
 
     def dispatch(self, action, args):
         try:
-            if action == 'info': return self.info()
-            if action == 'config': return self.configure(args)
+            if action in ('info', 'config'): return self.info()
             if action == 'start': return self.start(args)
             if action == 'stop': return self.stop()
             raise ValueError('unknown_action')
         except (ValueError, RuntimeError, OSError) as exc:
-            if action == 'config': self._config_error = str(exc)
             return {'state': 'error', 'code': str(exc), 'error': str(exc)}
 
     def start(self, args=None):
@@ -530,7 +480,7 @@ class TeleopControl:
             return {'state': self._state, 'reason': self._reason, 'mode': self.cfg.get('mode', 'live'),
                 'config': copy.deepcopy(self.cfg),
                 'effective_config': {k:self.cfg.get(k,v.get('default')) for k,v in self.get_tool()['configSchema']['properties'].items()},
-                'config_error': self._config_error, 'binding': copy.deepcopy(self.binding),
+                'binding': copy.deepcopy(self.binding),
                 'input_status': self.input_status(),
                 'mapping_epoch': self.mapping.epoch, 'operator_session_id': self._operator,
                 'capabilities': list(self.CAPABILITIES), 'feedback': self.feedback() if self.binding else None,
