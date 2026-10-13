@@ -9,7 +9,9 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `FrontFlip`, `BackFlip`, `HandStand`, and `BipedStand`.
 
 The driver accepts an explicit robot interface from a command-line argument or
-`NETWORK_INTERFACE`, for example `NETWORK_INTERFACE=eno1`. Command-line values
+`NETWORK_INTERFACE`, for example `NETWORK_INTERFACE=eno1`. The shipped service
+declares `${NETWORK_INTERFACE:-auto}`, so deployments on another subnet can set
+the value before Compose renders the service instead of editing driver code. Command-line values
 take priority over the environment, followed by `robot_interface` in
 `config.yaml`. An empty value or `auto` enables safe discovery: the driver
 selects a unique, UP, wired, non-virtual interface on Unitree's
@@ -116,11 +118,54 @@ or expired frames, and both child process states/PIDs. Like G1
 intelligent control but does not stop publication. The child processes are
 physically closed only when the driver bundle shuts down; repeated canvas starts
 reuse the live stream without resetting frame counters.
+
+`vision_capture` subscribes to that existing
+`/<namespace>/camera/front` JPEG stream; it never creates another Unitree
+`VideoClient` or calls `videohub` itself. `capture_photo` waits for a frame
+that arrived after the request and stores it under
+`/opt/phanthy-motus/data/vision_capture/photos`. `record_video` returns an
+action ID and destination path immediately, then uses FFmpeg at the configured
+8 FPS to create a silent H.264 MP4 under the sibling `videos` directory. Only
+one recording can run at a time. Completion, cancellation, and encoding errors
+are reported through ACP; failed or cancelled files are removed. `stop`
+cancels the active recording, while `info` reports camera freshness, encoder
+availability, and the latest recording result. The runtime image installs both
+`ffmpeg` and its companion `ffprobe`; completed files are checked for one H.264
+video track, no audio track, requested duration, and expected frame count.
+The existing `/opt/phanthy-motus/data` deployment mount persists both folders.
+
+`remote_controller` is a read-only LowState view. The existing shared
+`rt/lowstate` subscriber decodes the 13 documented buttons and four
+little-endian float32 joystick axes, applies a 0.1 activity deadzone, caches the
+latest sample, and publishes JSON on
+`/<namespace>/state/remote_controller` at no more than 10 Hz. `read` returns
+the cached snapshot; `fresh` becomes false after 0.5 seconds without new data.
+The AS2W's observed `55 51` wireless-frame header distinguishes a valid neutral
+controller frame from a 40-byte zero-filled placeholder; the latter is reported
+as unavailable instead of as an online but idle controller.
+Stopping this card only disables its logical ROS output and does not close the
+shared IMU, joint, or battery subscription. `active` is an observation for
+future operator-takeover logic; this driver does not turn it into a motion
+command.
+
+For a no-hardware check, run `python3 test_driver.py` in `as2w`. In a built
+container, verify the media tools with `ffmpeg -version` and
+`ffprobe -version`. On an AS2W host, inspect the shared inputs and outputs with
+`ros2 topic hz /<namespace>/camera/front`,
+`ros2 topic echo /<namespace>/state/remote_controller --once`, and the MCP
+`info`/`capture_photo`/`record_video` actions. These checks do not replace
+opening the JPG and MP4 or exercising every physical remote control on robot.
+
 The component vendors the three-field `audio_msgs/AudioChunk` interface used by
 the perception audio bus and builds it in a dedicated Docker stage. The runtime
 image receives only the generated `/as2w_ws/install` overlay and validates an
 `AudioChunk` import during the build; it does not depend on an undocumented
-`/ros_ws` artifact in the shared ROS base image.
+`/ros_ws` artifact in the shared ROS base image. The vendored source is about
+12 KiB; colcon, ROS generators, and `python3-dev` exist only in the discarded
+audio builder stage, so they do not increase the final image. The runtime's
+CMake/build-essential packages are required to build the pinned CycloneDDS C
+library and matching Python extension against this base image. The downloaded
+0.10.5 archive is verified with its pinned SHA-256 before extraction.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, RPC correlation, and full-size

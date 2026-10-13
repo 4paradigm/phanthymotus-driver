@@ -1565,7 +1565,11 @@ class CameraPlugin:
             "name": "camera",
             "type": "sensor",
             "multiInstance": False,
-            "description": "As2W front camera — JPEG frames from the verified videohub service.",
+            "description": (
+                "As2W front camera — an always-on JPEG state stream from the "
+                "verified videohub service. Canvas stop detaches the logical "
+                "card but intentionally keeps the state stream alive; the "
+                "processes close when the driver bundle shuts down."),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
         }
@@ -1603,6 +1607,7 @@ class CameraPlugin:
             result = self._node.status()
             result["stream_state"] = result.get("state", "error")
             result["state"] = "idle"
+            result["always_on"] = True
             result["topic_out"] = [{"topic": self._topic, "format": "image/jpeg"}]
             return result
         if action == "info":

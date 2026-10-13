@@ -131,6 +131,10 @@ class Bundle:
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
         if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
         if dds_ready and p.get("camera", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera", {}), namespace, executor, interface))
+        if dds_ready and p.get("vision_capture", {}).get("enabled", False):
+            from vision_capture import VisionCapturePlugin
+            self.plugins.append(VisionCapturePlugin(
+                p.get("vision_capture", {}), namespace, executor))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
@@ -152,6 +156,12 @@ class Bundle:
             if any(item["name"] == name for item in defs):
                 return plugin.dispatch(args.pop("action", name), {**args, "_tool_name": name})
         return None
+
+
+def _tool_call_arguments(params):
+    """Default an omitted/null argument object without hiding wrong JSON types."""
+    arguments = params.get("arguments")
+    return {} if arguments is None else arguments
 
 def handler(bundle):
     sse_sessions, sse_lock = {}, threading.Lock()
@@ -227,7 +237,37 @@ def handler(bundle):
             if method == "initialize": result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "as2w-driver", "version": "1.0"}}
             elif method == "tools/list": result = {"tools": bundle.tools()}
             elif method == "tools/call":
-                result = {"content": [{"type": "text", "text": json.dumps(bundle.call(params.get("name", ""), params.get("arguments") or {}))}]}
+                arguments = _tool_call_arguments(params)
+                if not isinstance(arguments, dict):
+                    call_result = {
+                        "ok": False, "ret": -1, "accepted": False,
+                        "code": "INVALID_ARGUMENT",
+                        "error": "tool arguments must be an object",
+                    }
+                else:
+                    try:
+                        call_result = bundle.call(
+                            params.get("name", ""), arguments)
+                    except (TypeError, ValueError) as exc:
+                        call_result = {
+                            "ok": False, "ret": -1, "accepted": False,
+                            "code": "INVALID_ARGUMENT",
+                            "error": str(exc) or "invalid tool arguments",
+                        }
+                    except Exception as exc:
+                        print(
+                            f"[mcp] tool call failed: {type(exc).__name__}: {exc}",
+                            flush=True)
+                        respond({
+                            "jsonrpc": "2.0", "id": rid,
+                            "error": {
+                                "code": -32603,
+                                "message": "Internal error",
+                            },
+                        })
+                        return
+                result = {"content": [{
+                    "type": "text", "text": json.dumps(call_result)}]}
             else:
                 respond({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Method not found: {method}"}}); return
             respond({"jsonrpc": "2.0", "id": rid, "result": result})

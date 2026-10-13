@@ -1,6 +1,7 @@
 """Unitree As2W driver plugins (official AS2 SDK SportClient)."""
 import json
 import math
+import struct
 import threading
 import time
 from uuid import uuid4
@@ -26,6 +27,71 @@ except ImportError:
 
 
 _STATE_PUBLISH_HZ = 60.0
+_REMOTE_PUBLISH_HZ = 10.0
+_REMOTE_FRESH_S = 0.5
+_REMOTE_DEADZONE = 0.1
+_REMOTE_FRAME_HEADER = b"\x55\x51"
+
+
+def _unavailable_remote():
+    return {"available": False, "fresh": False,
+            "control_level": "LOWLEVEL"}
+
+
+def _parse_wireless_remote(raw):
+    """Decode Unitree's little-endian 24-byte controller prefix."""
+    try:
+        data = bytes(raw)
+    except (TypeError, ValueError):
+        return _unavailable_remote()
+    if len(data) < 24:
+        return _unavailable_remote()
+    # A connected AS2W controller produces Unitree frames beginning 55 51,
+    # including the neutral frame whose buttons and axes are all zero. Some
+    # firmware paths expose a correctly sized but entirely zero-filled array
+    # when no controller payload is available; length alone must not report
+    # that placeholder as an online remote.
+    if data[:2] != _REMOTE_FRAME_HEADER:
+        return _unavailable_remote()
+    try:
+        buttons = {
+            "LT": bool(data[2] & (1 << 5)),
+            "RT": bool(data[2] & (1 << 4)),
+            "start": bool(data[2] & (1 << 2)),
+            "LB": bool(data[2] & (1 << 1)),
+            "RB": bool(data[2] & (1 << 0)),
+            "left": bool(data[3] & (1 << 7)),
+            "down": bool(data[3] & (1 << 6)),
+            "right": bool(data[3] & (1 << 5)),
+            "up": bool(data[3] & (1 << 4)),
+            "Y": bool(data[3] & (1 << 3)),
+            "X": bool(data[3] & (1 << 2)),
+            "B": bool(data[3] & (1 << 1)),
+            "A": bool(data[3] & (1 << 0)),
+        }
+        axes = {
+            "lx": round(struct.unpack("<f", data[4:8])[0], 4),
+            "rx": round(struct.unpack("<f", data[8:12])[0], 4),
+            "ry": round(struct.unpack("<f", data[12:16])[0], 4),
+            "ly": round(struct.unpack("<f", data[20:24])[0], 4),
+        }
+    except (IndexError, struct.error):
+        return _unavailable_remote()
+    if not all(math.isfinite(value) for value in axes.values()):
+        return _unavailable_remote()
+    # float32(0.1) is slightly greater than Python's binary64 0.1. Keep the
+    # configured boundary itself inside the deadzone despite that conversion.
+    active = any(buttons.values()) or any(
+        abs(value) > _REMOTE_DEADZONE + 1e-6 for value in axes.values())
+    return {
+        "available": True,
+        "fresh": True,
+        "control_level": "LOWLEVEL",
+        "buttons": buttons,
+        "axes": axes,
+        "active": active,
+        "timestamp_ms": int(time.time() * 1000),
+    }
 
 
 def _number(value, default=0.0):
@@ -33,6 +99,41 @@ def _number(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _invalid_argument(message, field=None):
+    """Return the card-level rejection expected by direct MCP callers."""
+    result = {
+        "ok": False,
+        "ret": -1,
+        "accepted": False,
+        "code": "INVALID_ARGUMENT",
+        "error": message,
+    }
+    if field:
+        result["field"] = field
+    return result
+
+
+def _finite_argument(args, name, default=0.0):
+    """Read one JSON number without accepting booleans, strings, NaN, or inf."""
+    value = args.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, _invalid_argument(
+            f"{name} must be a finite number", name)
+    number = float(value)
+    if not math.isfinite(number):
+        return None, _invalid_argument(
+            f"{name} must be a finite number", name)
+    return number, None
+
+
+def _boolean_argument(args, name, default=True):
+    """Read one literal JSON boolean instead of relying on Python truthiness."""
+    value = args.get(name, default)
+    if value is not True and value is not False:
+        return None, _invalid_argument(f"{name} must be a boolean", name)
+    return value, None
 
 
 def _values(value):
@@ -67,6 +168,8 @@ class _StateNode:
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", _LOW_LAT_QOS or 1)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", _LOW_LAT_QOS or 1)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", _LOW_LAT_QOS or 1)
+        self.remote = self.node.create_publisher(
+            String, f"/{namespace}/state/remote_controller", _LOW_LAT_QOS or 1)
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
@@ -86,6 +189,11 @@ class _StateNode:
         self._published_low_generation = -1
         self._published_bms_generation = -1
         self._published_sport_generation = -1
+        self._remote_lock = threading.Lock()
+        self._remote = _unavailable_remote()
+        self._remote_received_mono = None
+        self._remote_enabled = True
+        self._remote_last_publish_mono = 0.0
         self._stop_event = threading.Event()
         self._publisher_thread = threading.Thread(
             target=self._publish_loop, daemon=True, name="as2w-state-publish")
@@ -138,6 +246,7 @@ class _StateNode:
             if sport is not None and sport_generation != self._published_sport_generation:
                 self._publish_sport(sport)
                 self._published_sport_generation = sport_generation
+            self._maybe_publish_remote()
             self._stop_event.wait(wait_for)
 
     def _on_low(self, msg):
@@ -154,6 +263,8 @@ class _StateNode:
             self._publish_low(msg)
 
     def _publish_low(self, msg):
+        if hasattr(self, "remote"):
+            self._cache_remote(getattr(msg, "wireless_remote", None))
         imu = getattr(msg, "imu_state", getattr(msg, "imu", None))
         if imu is not None:
             imu_data = {}
@@ -185,6 +296,40 @@ class _StateNode:
         # expects these two top-level fields and does not consume joint_count.
         self._publish(self.joints, {"joints": skeleton,
                                     "imu_quat": list(getattr(imu, "quaternion", [])) if imu else []})
+
+    def _cache_remote(self, raw):
+        parsed = _parse_wireless_remote(raw)
+        with self._remote_lock:
+            self._remote = parsed
+            self._remote_received_mono = (
+                time.monotonic() if parsed.get("available") else None)
+
+    def remote_snapshot(self):
+        with self._remote_lock:
+            snapshot = dict(self._remote)
+            received = self._remote_received_mono
+        snapshot["fresh"] = bool(
+            snapshot.get("available") and received is not None
+            and time.monotonic() - received <= _REMOTE_FRESH_S)
+        return snapshot
+
+    def set_remote_enabled(self, enabled):
+        with self._remote_lock:
+            self._remote_enabled = bool(enabled)
+
+    def remote_enabled(self):
+        with self._remote_lock:
+            return self._remote_enabled
+
+    def _maybe_publish_remote(self):
+        now = time.monotonic()
+        with self._remote_lock:
+            if (not self._remote_enabled
+                    or now - self._remote_last_publish_mono
+                    < 1.0 / _REMOTE_PUBLISH_HZ):
+                return
+            self._remote_last_publish_mono = now
+        self._publish(self.remote, self.remote_snapshot())
 
     def _on_bms(self, bms):
         latest_lock = getattr(self, "_latest_lock", None)
@@ -236,11 +381,27 @@ class StatePlugin:
                  ("joints", "state/joints", "sensor/skeleton", "As2W 12-joint leg skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
-        return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
-                 "inputSchema": {"type": "object", "properties": {}},
-                 "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
-                for name, path, fmt, desc in specs]
+                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"),
+                 ("remote_controller", "state/remote_controller", "data/json",
+                  "Read-only Unitree remote buttons and joystick state"))
+        tools = [{"name": name, "type": "sensor", "multiInstance": False,
+                  "description": desc,
+                  "inputSchema": {"type": "object", "properties": {}},
+                  "topic_out": [{"topic": f"/{self._namespace}/{path}",
+                                 "format": fmt}]}
+                 for name, path, fmt, desc in specs]
+        remote = next(tool for tool in tools
+                      if tool["name"] == "remote_controller")
+        remote["inputSchema"] = {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": [
+                    "start", "stop", "info", "read"]},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        }
+        return tools
     def start(self):
         # Sensor cards share one LowState subscription.  Recreate it when a
         # dashboard stopped the card instead of claiming a dead stream is live.
@@ -252,6 +413,32 @@ class StatePlugin:
             self._state.close()
             self._state = None
     def dispatch(self, action, args):
+        name = args.get("_tool_name")
+        if name == "remote_controller":
+            if action == "start":
+                if self._state is None:
+                    self.start()
+                self._state.set_remote_enabled(True)
+                return {"state": "running"}
+            if action == "stop":
+                # The LowState subscriber is shared with IMU/joints/battery.
+                # Only disable this card's ROS publication.
+                if self._state is not None:
+                    self._state.set_remote_enabled(False)
+                return {"state": "idle"}
+            if action == "read":
+                return (self._state.remote_snapshot() if self._state is not None
+                        else _unavailable_remote())
+            if action == "info":
+                running = (self._state is not None
+                           and self._state.remote_enabled())
+                return {
+                    "state": "running" if running else "idle",
+                    "topic_out": [{
+                        "topic": f"/{self._namespace}/state/remote_controller",
+                        "format": "data/json",
+                    }],
+                }
         if action == "start":
             self.start()
             return {"state": "running"}
@@ -259,18 +446,18 @@ class StatePlugin:
             self.stop()
             return {"state": "idle"}
         if action == "info":
-            name = args.get("_tool_name")
             paths = {"imu": ("state/imu", "data/json"),
                      "joints": ("state/joints", "sensor/skeleton"),
                      "joint_state": ("state/joint_state", "data/json"),
                      "battery": ("state/battery", "data/json"),
-                     "loco_state": ("loco/state", "data/json")}
+                     "loco_state": ("loco/state", "data/json"),
+                     "remote_controller": ("state/remote_controller", "data/json")}
             if name in paths:
                 path, fmt = paths[name]
                 return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
             return {"state": "running"}
-        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
-            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
+        if action in ("imu", "joints", "joint_state", "battery", "loco_state", "remote_controller"):
+            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state", "remote_controller": "state/remote_controller"}[action]
             fmt = "sensor/skeleton" if action == "joints" else "data/json"
             return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
         return {"state": "running"} if action == "info" else None
@@ -592,16 +779,28 @@ class LocoPlugin:
             self._stop_continuous()
             return {"state": "idle", "ret": self.proxy.StopMove()}
         if action == "move":
-            vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
+            values = {}
+            for name in ("vx", "vy", "vyaw"):
+                values[name], error = _finite_argument(args, name)
+                if error:
+                    return error
+            vx = max(-1.5, min(1.5, values["vx"]))
+            vy = max(-1.0, min(1.0, values["vy"]))
+            yaw = max(-2.0, min(2.0, values["vyaw"]))
             duration = args.get("duration")
-            if duration == 0:
-                duration = None
             if duration is not None:
-                duration = float(duration)
-                if not math.isfinite(duration) or duration > 30:
-                    return {"ret": -1, "error": "duration must be at most 30 seconds"}
+                duration, error = _finite_argument(args, "duration")
+                if error:
+                    return error
+                if duration == 0:
+                    duration = None
+            if duration is not None:
+                if duration > 30:
+                    return _invalid_argument(
+                        "duration must be at most 30 seconds", "duration")
                 if duration < 0 and duration != -1:
-                    return {"ret": -1, "error": "duration must be -1, 0, or positive"}
+                    return _invalid_argument(
+                        "duration must be -1, 0, or positive", "duration")
             state_name, state, state_error = self._read_state()
             if state_error:
                 return {**state_error, "action": "move"}
@@ -620,7 +819,6 @@ class LocoPlugin:
                         **({} if ret == 0 else {"error": "Sport controller rejected Move",
                           "reason": "The robot is standing but the velocity command was refused",
                           "suggested_actions": ["get_state", "stop_move"]})}
-            duration = float(duration)
             if duration == -1:
                 self._cancel_transition()
                 self._stop_continuous()
@@ -648,7 +846,9 @@ class LocoPlugin:
                 return {"ret": 0, "accepted": True, "status": "running",
                         "action": "move", "action_id": action_id,
                         "current_state": state_name, "duration": -1}
-            if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
+            if duration < 0:
+                return _invalid_argument(
+                    "duration must be -1, 0, or positive", "duration")
             self._stop_continuous()
             ret = self.proxy.Move(vx, vy, yaw)
             if ret != 0:
@@ -741,17 +941,43 @@ class LocoPlugin:
                       "reason": "The controller refused damping from the current posture",
                       "suggested_actions": ["get_state", "stop_move", "recovery_stand"],
                       "rpc_ret": ret})}
-        if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
+        if action == "euler":
+            values = {}
+            for name in ("roll", "pitch", "yaw"):
+                values[name], error = _finite_argument(args, name)
+                if error:
+                    return error
+            return {"ret": self.proxy.Euler(
+                values["roll"], values["pitch"], values["yaw"])}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
             if preset not in {"slow", "normal", "fast"}: return {"ret": -1, "error": "speed_preset must be slow, normal, or fast"}
             return {"ret": self.proxy.SpeedLevel({"slow": -1, "normal": 0, "fast": 1}[preset]), "speed_preset": preset}
-        if action == "body_height": return {"ret": self.proxy.BodyHeight(float(args.get("height", 0)))}
-        if action == "body_position": return {"ret": self.proxy.BodyPosition(float(args.get("x", 0)), float(args.get("y", 0)), float(args.get("z", 0)), float(args.get("yaw", 0)))}
-        if action == "auto_recovery": return {"ret": self.proxy.SetAutoRecovery(1 if args.get("flag", True) else 0)}
-        if action == "switch_joystick": return {"ret": self.proxy.SwitchJoystick(1 if args.get("flag", True) else 0)}
-        if action == "left_side_gait": return {"ret": self.proxy.LeftSideGait(1 if args.get("flag", True) else 0)}
-        if action == "right_side_gait": return {"ret": self.proxy.RightSideGait(1 if args.get("flag", True) else 0)}
+        if action == "body_height":
+            height, error = _finite_argument(args, "height")
+            if error:
+                return error
+            return {"ret": self.proxy.BodyHeight(height)}
+        if action == "body_position":
+            values = {}
+            for name in ("x", "y", "z", "yaw"):
+                values[name], error = _finite_argument(args, name)
+                if error:
+                    return error
+            return {"ret": self.proxy.BodyPosition(
+                values["x"], values["y"], values["z"], values["yaw"])}
+        flag_methods = {
+            "auto_recovery": "SetAutoRecovery",
+            "switch_joystick": "SwitchJoystick",
+            "left_side_gait": "LeftSideGait",
+            "right_side_gait": "RightSideGait",
+        }
+        if action in flag_methods:
+            flag, error = _boolean_argument(args, "flag")
+            if error:
+                return error
+            return {"ret": getattr(self.proxy, flag_methods[action])(
+                1 if flag else 0)}
         if action == "get_state":
             result = self.proxy.GetState()
             if isinstance(result, tuple) and len(result) == 2:

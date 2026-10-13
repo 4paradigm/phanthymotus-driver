@@ -17,12 +17,17 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl ffmpeg && \
+    command -v ffmpeg && command -v ffprobe && \
+    rm -rf /var/lib/apt/lists/*
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
-RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
+ARG CYCLONEDDS_SHA256=ec3ec898c52b02f939a969cd1a276e219420e5e8419b21cea276db35b4821848
+RUN curl -fsSL ${CYCLONEDDS_URL} -o /tmp/cyclonedds-0.10.5.tar.gz && \
+    echo "${CYCLONEDDS_SHA256}  /tmp/cyclonedds-0.10.5.tar.gz" | sha256sum -c - && \
+    tar xzf /tmp/cyclonedds-0.10.5.tar.gz -C /tmp && \
     cmake -S /tmp/cyclonedds-0.10.5 -B /tmp/cyclonedds-0.10.5/build -DCMAKE_INSTALL_PREFIX=/opt/cyclonedds && \
     cmake --build /tmp/cyclonedds-0.10.5/build --parallel --target install && \
-    rm -rf /tmp/cyclonedds-0.10.5
+    rm -rf /tmp/cyclonedds-0.10.5 /tmp/cyclonedds-0.10.5.tar.gz
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 COPY requirements.txt /work/requirements.txt
@@ -38,7 +43,7 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
     source /as2w_ws/install/setup.bash && \
     python3 -c "from audio_msgs.msg import AudioChunk"'
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py multimedia.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
+COPY main.py device.py multimedia.py vision_capture.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/

@@ -3,8 +3,12 @@
 Run with: python3 -m unittest unitree/as2w/test_driver.py
 """
 import importlib.util
+import json
 import struct
 import sys
+import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -48,6 +52,7 @@ def _install_device_stubs():
     qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
     qos.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT=1)
     qos.QoSProfile = lambda **kwargs: kwargs
+    qos.qos_profile_sensor_data = 1
     sys.modules["rclpy.qos"] = qos
     audio_msgs = types.ModuleType("audio_msgs.msg")
     audio_msgs.AudioChunk = type("AudioChunk", (), {})
@@ -123,6 +128,7 @@ class TestDriverContracts(unittest.TestCase):
         _install_device_stubs()
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
         cls.multimedia = _load("as2w_multimedia_under_test", ROOT / "multimedia.py")
+        cls.vision = _load("as2w_vision_capture_under_test", ROOT / "vision_capture.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
         cls.mapping = _load("as2w_slam_mapping_under_test", ROOT / "slam_mapping.py")
         cls.main = _load("as2w_main_under_test", ROOT / "main.py")
@@ -204,14 +210,56 @@ class TestDriverContracts(unittest.TestCase):
                 patch.object(self.main, "_network_interfaces", side_effect=OSError("ioctl unavailable")):
             self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "auto"}))
 
-    def test_deployment_does_not_hardcode_robot_interface(self):
+    def test_deployment_exposes_safe_robot_interface_override(self):
         service = (ROOT / "deploy" / "service.yml").read_text()
         dockerfile = (ROOT / "Dockerfile").read_text()
         config = (ROOT / "config.yaml").read_text()
-        self.assertNotIn("NETWORK_INTERFACE=", service)
+        self.assertIn("NETWORK_INTERFACE=${NETWORK_INTERFACE:-auto}", service)
         self.assertIn("robot_interface: auto", config)
         self.assertIn("exec python3 /work/main.py", dockerfile)
         self.assertNotIn("${NETWORK_INTERFACE", dockerfile)
+
+    def test_loco_rejects_malformed_or_non_finite_numbers(self):
+        class GuardProxy(_Proxy):
+            def __getattr__(self, name):
+                if name in {"Euler", "BodyHeight", "BodyPosition"}:
+                    return lambda *_args: self.moves.append((name, _args)) or 0
+                raise AttributeError(name)
+
+        cases = [
+            ("move", {"vx": "not-a-number"}, "vx"),
+            ("move", {"vx": float("nan")}, "vx"),
+            ("move", {"vy": float("inf")}, "vy"),
+            ("move", {"duration": "1"}, "duration"),
+            ("move", {"duration": False}, "duration"),
+            ("euler", {"roll": None}, "roll"),
+            ("body_height", {"height": True}, "height"),
+            ("body_position", {"z": float("-inf")}, "z"),
+        ]
+        for action, arguments, field in cases:
+            with self.subTest(action=action, arguments=arguments):
+                proxy = GuardProxy()
+                plugin = self.device.LocoPlugin({}, "test", None, proxy)
+                result = plugin.dispatch(action, arguments)
+                self.assertEqual("INVALID_ARGUMENT", result["code"])
+                self.assertEqual(field, result["field"])
+                self.assertFalse(result["accepted"])
+                self.assertEqual([], proxy.moves)
+
+    def test_loco_rejects_non_boolean_switch_flags(self):
+        plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
+        result = plugin.dispatch("auto_recovery", {"flag": "false"})
+        self.assertEqual("INVALID_ARGUMENT", result["code"])
+        self.assertEqual("flag", result["field"])
+
+    def test_mcp_argument_default_preserves_falsey_wrong_types(self):
+        self.assertEqual({}, self.main._tool_call_arguments({}))
+        self.assertEqual({}, self.main._tool_call_arguments(
+            {"arguments": None}))
+        for value in ([], False, 0, ""):
+            with self.subTest(value=value):
+                self.assertIs(value, self.main._tool_call_arguments(
+                    {"arguments": value}))
 
     def test_card_stop_cancels_continuous_move(self):
         proxy = _Proxy()
@@ -570,6 +618,10 @@ class TestDriverContracts(unittest.TestCase):
             def __init__(self, *_args):
                 created.append("mic")
 
+        class FakeVisionCapturePlugin:
+            def __init__(self, *_args):
+                created.append("vision_capture")
+
         device = types.ModuleType("device")
         device.StatePlugin = device.LocoPlugin = device.SpecialMotionPlugin = object
         device.LedPlugin = object
@@ -582,6 +634,8 @@ class TestDriverContracts(unittest.TestCase):
         spatial.ControlledSpatialPlugin = object
         mapping = types.ModuleType("slam_mapping")
         mapping.SlamMappingPlugin = object
+        vision = types.ModuleType("vision_capture")
+        vision.VisionCapturePlugin = FakeVisionCapturePlugin
         config = {"plugins": {
             "state": {"enabled": False},
             "loco": {"enabled": False},
@@ -590,6 +644,7 @@ class TestDriverContracts(unittest.TestCase):
             "speaker": {"enabled": False},
             "led": {"enabled": False},
             "camera": {"enabled": False},
+            "vision_capture": {"enabled": True},
             "lidar": {"enabled": False},
             "controlled_spatial": {"enabled": False},
             "slam_mapping": {"enabled": False},
@@ -601,6 +656,7 @@ class TestDriverContracts(unittest.TestCase):
             "lidar": lidar,
             "controlled_spatial": spatial,
             "slam_mapping": mapping,
+            "vision_capture": vision,
         }
         with patch.dict(sys.modules, modules):
             degraded = self.main.Bundle(
@@ -609,8 +665,8 @@ class TestDriverContracts(unittest.TestCase):
                 config, "test", object(), object(), "eth0", dds_ready=True)
 
         self.assertEqual([], degraded.plugins)
-        self.assertEqual(["mic"], created)
-        self.assertEqual(1, len(ready.plugins))
+        self.assertEqual(["mic", "vision_capture"], created)
+        self.assertEqual(2, len(ready.plugins))
 
     def test_camera_start_returns_running_with_async_readiness(self):
         plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
@@ -676,6 +732,7 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual([], stopped)
         self.assertEqual("idle", result["state"])
         self.assertEqual("running", result["stream_state"])
+        self.assertTrue(result["always_on"])
         self.assertEqual(42, result["frames"])
 
         plugin.stop()
@@ -860,6 +917,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("test -f /as2w_ws/install/setup.bash", dockerfile)
         self.assertNotIn("/ros_ws/install/setup.bash", dockerfile)
         self.assertIn("from audio_msgs.msg import AudioChunk", dockerfile)
+        self.assertIn("CYCLONEDDS_SHA256=", dockerfile)
+        self.assertIn("sha256sum -c -", dockerfile)
         self.assertEqual(
             ["std_msgs/Header header", "string format", "uint8[] data"],
             audio_message.splitlines(),
@@ -1363,6 +1422,372 @@ class TestDriverContracts(unittest.TestCase):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
+
+    def test_remote_controller_button_map_and_reserved_bit(self):
+        mappings = {
+            "LT": (2, 5), "RT": (2, 4), "start": (2, 2),
+            "LB": (2, 1), "RB": (2, 0), "left": (3, 7),
+            "down": (3, 6), "right": (3, 5), "up": (3, 4),
+            "Y": (3, 3), "X": (3, 2), "B": (3, 1), "A": (3, 0),
+        }
+        for expected, (offset, bit) in mappings.items():
+            with self.subTest(button=expected):
+                raw = bytearray(40)
+                raw[:2] = b"\x55\x51"
+                raw[offset] = 1 << bit
+                result = self.device._parse_wireless_remote(raw)
+                self.assertTrue(result["available"])
+                self.assertEqual([expected], [
+                    name for name, pressed in result["buttons"].items()
+                    if pressed])
+                self.assertTrue(result["active"])
+        reserved = bytearray(40)
+        reserved[:2] = b"\x55\x51"
+        reserved[2] = 1 << 3
+        result = self.device._parse_wireless_remote(reserved)
+        self.assertEqual(13, len(result["buttons"]))
+        self.assertNotIn("back", result["buttons"])
+        self.assertFalse(result["active"])
+
+    def test_remote_controller_axes_offsets_signs_and_deadzone(self):
+        raw = bytearray(40)
+        raw[:2] = b"\x55\x51"
+        raw[4:8] = struct.pack("<f", -0.05)
+        raw[8:12] = struct.pack("<f", -0.25)
+        raw[12:16] = struct.pack("<f", 0.5)
+        raw[20:24] = struct.pack("<f", -0.75)
+        result = self.device._parse_wireless_remote(raw)
+        self.assertAlmostEqual(-0.05, result["axes"]["lx"], places=5)
+        self.assertAlmostEqual(-0.25, result["axes"]["rx"], places=5)
+        self.assertAlmostEqual(0.5, result["axes"]["ry"], places=5)
+        self.assertAlmostEqual(-0.75, result["axes"]["ly"], places=5)
+        self.assertTrue(result["active"])
+        quiet = bytearray(40)
+        quiet[:2] = b"\x55\x51"
+        quiet[4:8] = struct.pack("<f", 0.1)
+        self.assertFalse(
+            self.device._parse_wireless_remote(quiet)["active"])
+        quiet[4:8] = struct.pack("<f", 0.1001)
+        self.assertTrue(self.device._parse_wireless_remote(quiet)["active"])
+
+    def test_remote_controller_short_input_and_freshness(self):
+        self.assertEqual(
+            {"available": False, "fresh": False,
+             "control_level": "LOWLEVEL"},
+            self.device._parse_wireless_remote(bytes(23)))
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        node._remote_lock = threading.Lock()
+        node._remote = self.device._unavailable_remote()
+        node._remote_received_mono = None
+        neutral = bytearray(40)
+        neutral[:2] = b"\x55\x51"
+        with patch.object(self.device.time, "monotonic",
+                          side_effect=[10.0, 10.4, 10.6]):
+            node._cache_remote(neutral)
+            self.assertTrue(node.remote_snapshot()["fresh"])
+            self.assertFalse(node.remote_snapshot()["fresh"])
+
+    def test_remote_controller_json_is_limited_to_ten_hz(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.remote = types.SimpleNamespace(
+            publish=lambda message: published.append(json.loads(message.data)))
+        node._remote_lock = threading.Lock()
+        neutral = bytearray(40)
+        neutral[:2] = b"\x55\x51"
+        node._remote = self.device._parse_wireless_remote(neutral)
+        node._remote_received_mono = 1.0
+        node._remote_enabled = True
+        node._remote_last_publish_mono = 0.0
+        with patch.object(self.device.time, "monotonic",
+                          side_effect=[1.0, 1.0, 1.05, 1.11, 1.11]):
+            node._maybe_publish_remote()
+            node._maybe_publish_remote()
+            node._maybe_publish_remote()
+        self.assertEqual(2, len(published))
+        self.assertTrue(all(isinstance(item, dict) for item in published))
+        self.assertEqual("LOWLEVEL", published[0]["control_level"])
+
+    def test_remote_controller_rejects_zero_placeholder_but_accepts_real_neutral_frame(self):
+        placeholder = self.device._parse_wireless_remote(bytearray(40))
+        self.assertFalse(placeholder["available"])
+        self.assertFalse(placeholder["fresh"])
+
+        neutral = bytearray(40)
+        neutral[:2] = b"\x55\x51"
+        parsed = self.device._parse_wireless_remote(neutral)
+        self.assertTrue(parsed["available"])
+        self.assertFalse(parsed["active"])
+
+    def test_remote_controller_decodes_observed_as2w_wire_bytes(self):
+        # Captured on AS2W: lx reached +1.0 and start set byte 2 bit 2.
+        raw = bytearray.fromhex(
+            "55 51 04 00 00 00 80 3f 00 00 00 00 "
+            "a1 81 d0 bd 00 00 00 00 00 00 00 00 "
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
+        parsed = self.device._parse_wireless_remote(raw)
+        self.assertTrue(parsed["available"])
+        self.assertTrue(parsed["active"])
+        self.assertTrue(parsed["buttons"]["start"])
+        self.assertAlmostEqual(1.0, parsed["axes"]["lx"], places=4)
+        self.assertLess(parsed["axes"]["ry"], 0)
+
+    def test_remote_controller_read_and_stop_are_logical_only(self):
+        class SharedState:
+            def __init__(self):
+                self.enabled = True
+                self.closed = False
+            def set_remote_enabled(self, enabled):
+                self.enabled = enabled
+            def remote_enabled(self):
+                return self.enabled
+            def remote_snapshot(self):
+                return {"available": True, "fresh": True,
+                        "control_level": "LOWLEVEL"}
+            def close(self):
+                self.closed = True
+
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        plugin._executor = object()
+        plugin._state = SharedState()
+        result = plugin.dispatch(
+            "read", {"_tool_name": "remote_controller"})
+        self.assertTrue(result["fresh"])
+        stopped = plugin.dispatch(
+            "stop", {"_tool_name": "remote_controller"})
+        self.assertEqual("idle", stopped["state"])
+        self.assertFalse(plugin._state.enabled)
+        self.assertFalse(plugin._state.closed)
+        self.assertEqual(
+            "running", plugin.dispatch(
+                "start", {"_tool_name": "remote_controller"})["state"])
+        self.assertTrue(plugin._state.enabled)
+
+    def test_remote_controller_schema_and_driver_card(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        tool = next(item for item in plugin.get_tools()
+                    if item["name"] == "remote_controller")
+        self.assertEqual("sensor", tool["type"])
+        self.assertEqual(
+            ["start", "stop", "info", "read"],
+            tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertEqual(
+            "/test/state/remote_controller",
+            tool["topic_out"][0]["topic"])
+        self.assertIn("name: remote_controller", (ROOT / "driver.yaml").read_text())
+
+    @staticmethod
+    def _vision_plugin(output_dir):
+        plugin = TestDriverContracts.vision.VisionCapturePlugin.__new__(
+            TestDriverContracts.vision.VisionCapturePlugin)
+        plugin._topic = "/test/camera/front"
+        plugin._output_dir = Path(output_dir)
+        plugin._fps = 8
+        plugin._max_duration_s = 30
+        plugin._condition = threading.Condition()
+        plugin._latest = None
+        plugin._sequence = 0
+        plugin._recording_lock = threading.Lock()
+        plugin._active_recording = None
+        plugin._last_recording = None
+        now_ns = int(time.time() * 1e9)
+        plugin._node = types.SimpleNamespace(
+            get_clock=lambda: types.SimpleNamespace(
+                now=lambda: types.SimpleNamespace(nanoseconds=now_ns)))
+        return plugin
+
+    @staticmethod
+    def _jpeg_message(data=b"\xff\xd8payload\xff\xd9", image_format="jpeg",
+                      timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        seconds = int(timestamp)
+        stamp = types.SimpleNamespace(
+            sec=seconds, nanosec=int((timestamp - seconds) * 1e9))
+        return types.SimpleNamespace(
+            data=data, format=image_format,
+            header=types.SimpleNamespace(stamp=stamp))
+
+    def test_vision_capture_schema_and_single_front_camera(self):
+        plugin = self._vision_plugin("/tmp/unused")
+        tool = plugin.get_tool()
+        self.assertEqual("actuator", tool["type"])
+        self.assertEqual(
+            ["start", "capture_photo", "record_video", "list_cameras",
+             "info", "stop"],
+            tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertEqual(["record_video"],
+                         tool["inputSchema"]["x-completion"]["actions"])
+        self.assertEqual(55, tool["inputSchema"]["x-completion"]["timeout"])
+        cameras = plugin.dispatch("list_cameras", {})["cameras"]
+        self.assertEqual(["front"], [item["camera"] for item in cameras])
+
+    def test_vision_capture_filters_invalid_and_stale_jpegs(self):
+        plugin = self._vision_plugin("/tmp/unused")
+        plugin._on_frame(self._jpeg_message(image_format="png"))
+        plugin._on_frame(self._jpeg_message(data=b"not-a-jpeg"))
+        plugin._on_frame(self._jpeg_message(timestamp=time.time() - 4))
+        self.assertEqual(0, plugin._sequence)
+        plugin._on_frame(self._jpeg_message())
+        self.assertEqual(1, plugin._sequence)
+
+    def test_photo_waits_for_post_request_frame_and_names_are_unique(self):
+        with tempfile.TemporaryDirectory() as output:
+            plugin = self._vision_plugin(output)
+            plugin._on_frame(self._jpeg_message(data=b"\xff\xd8old\xff\xd9"))
+            results = []
+
+            def capture_once(payload):
+                worker = threading.Thread(
+                    target=lambda: results.append(plugin._capture_photo()))
+                worker.start()
+                time.sleep(0.03)
+                self.assertTrue(worker.is_alive())
+                plugin._on_frame(self._jpeg_message(data=payload))
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+
+            capture_once(b"\xff\xd8new-one\xff\xd9")
+            capture_once(b"\xff\xd8new-two\xff\xd9")
+            self.assertTrue(all(item["ok"] for item in results))
+            paths = [Path(item["file_path"]) for item in results]
+            self.assertNotEqual(paths[0].name, paths[1].name)
+            self.assertEqual(b"\xff\xd8new-one\xff\xd9", paths[0].read_bytes())
+            self.assertTrue((Path(output) / "photos").is_dir())
+            self.assertIn("captured_at", results[0])
+            self.assertIn("frame_age_s", results[0])
+
+    def test_photo_without_camera_returns_structured_error(self):
+        plugin = self._vision_plugin("/tmp/unused")
+        with patch.object(plugin, "_frame",
+                          side_effect=RuntimeError("No fresh JPEG frame")):
+            result = plugin.dispatch("capture_photo", {})
+        self.assertFalse(result["ok"])
+        self.assertEqual("CAPTURE_FAILED", result["code"])
+
+    def test_video_duration_validation_and_missing_tools(self):
+        with tempfile.TemporaryDirectory() as output:
+            plugin = self._vision_plugin(output)
+            for value in (True, 1.5, "5", 0, 31):
+                with self.subTest(value=value):
+                    result = plugin.dispatch(
+                        "record_video", {"duration_s": value})
+                    self.assertEqual("INVALID_DURATION", result["code"])
+            with patch.object(self.vision.shutil, "which", return_value=None):
+                result = plugin.dispatch("record_video", {"duration_s": 5})
+            self.assertEqual("ENCODER_UNAVAILABLE", result["code"])
+            self.assertIn("ffmpeg", result["message"])
+            with patch.object(
+                    self.vision.shutil, "which",
+                    side_effect=lambda name: "/bin/ffmpeg" if name == "ffmpeg" else None):
+                result = plugin.dispatch("record_video", {"duration_s": 5})
+            self.assertEqual("ENCODER_UNAVAILABLE", result["code"])
+            self.assertIn("ffprobe", result["message"])
+
+    def test_video_probe_requires_h264_without_audio(self):
+        good = {
+            "format": {"duration": "5.000"},
+            "streams": [{"codec_type": "video", "codec_name": "h264",
+                         "duration": "5.000", "nb_frames": "40"}],
+        }
+        with patch.object(self.vision.subprocess, "check_output",
+                          return_value=json.dumps(good).encode()):
+            result = self.vision.VisionCapturePlugin._probe_video(
+                Path("video.mp4"), 5, 8)
+        self.assertEqual(5.0, result["duration_s"])
+        bad = {**good, "streams": good["streams"] + [
+            {"codec_type": "audio", "codec_name": "aac"}]}
+        with patch.object(self.vision.subprocess, "check_output",
+                          return_value=json.dumps(bad).encode()):
+            with self.assertRaisesRegex(RuntimeError, "no audio"):
+                self.vision.VisionCapturePlugin._probe_video(
+                    Path("video.mp4"), 5, 8)
+
+    def test_video_admission_is_immediate_and_rejects_concurrency(self):
+        class DeferredThread:
+            def __init__(self, *args, **kwargs):
+                self.started = False
+            def start(self):
+                self.started = True
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as output, \
+                patch.object(self.vision.shutil, "which", return_value="/bin/tool"), \
+                patch.object(self.vision.threading, "Thread", DeferredThread):
+            plugin = self._vision_plugin(output)
+            started = time.monotonic()
+            first = plugin.dispatch("record_video", {"duration_s": 5})
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(first["action_id"])
+            self.assertTrue(first["file_path"].endswith(".mp4"))
+            self.assertTrue((Path(output) / "videos").is_dir())
+            second = plugin.dispatch("record_video", {"duration_s": 5})
+            self.assertEqual("RECORD_IN_PROGRESS", second["code"])
+            stopped = plugin.dispatch("stop", {})
+            self.assertEqual(first["action_id"], stopped["action_id"])
+            self.assertTrue(plugin._active_recording["cancel"].is_set())
+
+    def test_video_completion_posts_acp_and_cancel_removes_file(self):
+        with tempfile.TemporaryDirectory() as output:
+            plugin = self._vision_plugin(output)
+            path = Path(output) / "partial.mp4"
+            path.write_bytes(b"partial")
+            notifications = []
+            active = {
+                "action_id": "action-1", "cancel": threading.Event(),
+                "path": path, "state": "recording", "process": None,
+            }
+            plugin._active_recording = active
+            success = {"ok": True, "file_path": str(path),
+                       "media_type": "video"}
+            with patch.object(plugin, "_record_video", return_value=success), \
+                    patch.object(plugin, "_notify_complete",
+                                 side_effect=lambda *args: notifications.append(args)):
+                plugin._record_video_async(active)
+            self.assertEqual("completed", notifications[0][1])
+
+            path.write_bytes(b"partial")
+            active = {
+                "action_id": "action-2", "cancel": threading.Event(),
+                "path": path, "state": "recording", "process": None,
+            }
+            active["cancel"].set()
+            plugin._active_recording = active
+            with patch.object(plugin, "_record_video", return_value=success), \
+                    patch.object(plugin, "_notify_complete",
+                                 side_effect=lambda *args: notifications.append(args)):
+                plugin._record_video_async(active)
+            self.assertFalse(path.exists())
+            self.assertEqual("cancelled", notifications[-1][1])
+
+    def test_video_start_failure_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as output:
+            plugin = self._vision_plugin(output)
+            path = Path(output) / "failed.mp4"
+            path.write_bytes(b"partial")
+            active = {
+                "action_id": "action-3", "cancel": threading.Event(),
+                "path": path, "duration_s": 1, "process": None,
+                "source": plugin._source(),
+            }
+            with patch.object(plugin, "_frame",
+                              return_value=(b"\xff\xd8x\xff\xd9", 0.0, 1)), \
+                    patch.object(self.vision.subprocess, "Popen",
+                                 side_effect=OSError("ffmpeg unavailable")):
+                result = plugin._record_video(active)
+            self.assertEqual("RECORD_FAILED", result["code"])
+            self.assertFalse(path.exists())
+
+    def test_vision_capture_is_registered_and_declared(self):
+        source = (ROOT / "main.py").read_text()
+        driver = (ROOT / "driver.yaml").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("VisionCapturePlugin", source)
+        self.assertIn("name: vision_capture", driver)
+        self.assertIn("ffmpeg", dockerfile)
+        self.assertIn("vision_capture.py", dockerfile)
 
     def test_lowstate_extra_motor_slots_are_ignored(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
