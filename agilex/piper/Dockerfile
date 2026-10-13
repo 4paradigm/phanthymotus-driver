@@ -17,7 +17,7 @@ RUN sed '/^piper-sdk @ /d' /work/agilex/piper/requirements.txt > /tmp/piper-depe
        "${PIPER_SDK_URL}#sha256=${PIPER_SDK_SHA256}" \
     && rm /tmp/piper-dependencies.txt
 COPY common/ /work/common/
-COPY main.py device.py runtime.py cards.py arm.py control.py mac_can.py camera_capture.py config.yaml driver.yaml /work/agilex/piper/
+COPY main.py device.py arm_control.py runtime.py cards.py arm.py control.py mac_can.py camera_capture.py config.yaml driver.yaml /work/agilex/piper/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PIPER_MOTION_ENABLED=0 PIPER_CAMERA_ENABLED=0

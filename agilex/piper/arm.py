@@ -297,10 +297,10 @@ class PiperDriver:
         except Exception:
             pass  # Feedback/CAN failure means holding cannot be guaranteed.
 
-    def _bounded_target(self, raw):
-        """Expose the same limits the installed SDK otherwise applies silently."""
-        target = []
-        for i, value in enumerate(raw, 1):
+    def joint_bounds_deg(self):
+        """Read the effective SDK/deployment intersection; no CAN command."""
+        bounds = []
+        for i in range(1, 7):
             low, high = self.arm.GetSDKJointLimitParam(f"j{i}")
             low, high = round(math.degrees(low) * 1000), round(math.degrees(high) * 1000)
             if self.joint_limits_deg is not None:
@@ -308,6 +308,14 @@ class PiperDriver:
                 low, high = max(low, round(deployed_low * 1000)), min(high, round(deployed_high * 1000))
             if low >= high:
                 raise RuntimeError(f"J{i} 的 SDK 限位无效")
+            bounds.append((low / 1000, high / 1000))
+        return tuple(bounds)
+
+    def _bounded_target(self, raw):
+        """Apply the same effective limits returned to the monitor."""
+        target = []
+        for value, (low_deg, high_deg) in zip(raw, self.joint_bounds_deg()):
+            low, high = round(low_deg * 1000), round(high_deg * 1000)
             target.append(max(low, min(value, high)))
         return tuple(target)
 

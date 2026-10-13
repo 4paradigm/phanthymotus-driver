@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the same ten cards on Mac, without requiring ROS or Docker."""
+"""Run the control card and optional camera on Mac, without ROS or Docker."""
 from common import logsafe
 logsafe.install()
 
@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from agilex.piper.device import PiperPlugin
+from agilex.piper.arm_control import ArmControlPlugin as PiperPlugin
 from common.vendor_runtime import DriverBundle, make_handler
 
 

@@ -5,6 +5,7 @@ Each physical operation owns one gate shared by the arm and mounted camera.
 """
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 import fcntl
@@ -191,7 +192,7 @@ class PiperRuntime:
                 self.closed = True
             else:
                 self.stopped_cards.add(name)
-            if name is None or name in {"piper_arm", "piper_joint", "piper_permission"}:
+            if name is None or name in {"arm_control", "piper_arm", "piper_joint", "piper_permission"}:
                 self.revoke_manual_permission()
             if name not in {"piper_photo", "piper_status"}:
                 self.previews.invalidate()
@@ -288,14 +289,14 @@ class PiperRuntime:
                 state = self.connected().get_state()
             except Exception:
                 self.previews.invalidate()
-                if self.driver is not None and self.active_card in {"piper_arm", "piper_joint", "piper_gripper", "piper_enable", "piper_disable"}:
+                if self.driver is not None and self.active_card in {"arm_control", "piper_arm", "piper_joint", "piper_gripper", "piper_enable", "piper_disable"}:
                     self.driver.cancel_motion()
                 raise
             observed = signature(state)
             if self.last_signature is not None and self.last_signature != observed:
                 self.previews.invalidate()
-                if (monitor and self.active_card in {"piper_arm", "piper_joint", "piper_gripper", "piper_enable", "piper_disable"}
-                        and self.active_action not in {"prepare", "enable", "disable"}):
+                if (monitor and self.active_card in {"arm_control", "piper_arm", "piper_joint", "piper_gripper", "piper_enable", "piper_disable"}
+                        and self.active_action not in {"prepare", "enable", "disable", "switch_mode"}):
                     self.driver.cancel_motion()
             self.last_signature = observed
             return state
@@ -310,6 +311,62 @@ class PiperRuntime:
         except (RuntimeError, AttributeError) as exc:
             result["gripper"] = {"available": False, "reason": str(exc)}
         return result
+
+    def read_monitor_snapshot(self):
+        """Passive shared-connection snapshot. Never connects or sends commands.
+
+        No operation-gate acquisition and no waiting behind connection changes.
+        Missing/stale values remain None with a field-specific reason.
+        """
+        result = {
+            "device_name": self.config.get("name", self.config.get("can_interface", "PiPER")),
+            "can_interface": self.config.get("can_interface", "can0"),
+            "connected": self.driver is not None and not self.closed,
+            "feedback_time": None, "fresh": False, "joints_deg": None,
+            "joint_limits_deg": None, "control_mode": None, "enabled": None,
+            "gripper": None, "faults": None, "motion_enabled": self.motion_enabled,
+            "busy": self.gate.locked(), "active_card": self.active_card,
+            "active_object": self.active_object, "active_action": getattr(self, "active_action", None),
+            "last_actions": deepcopy(dict(self.last_actions)),
+            "reasons": {},
+        }
+        if not self.connection_lock.acquire(blocking=False):
+            result["reasons"]["connection"] = "连接正在变更，本次监控读取不等待"
+            return result
+        try:
+            if self.driver is None or self.closed:
+                result["reasons"]["connection"] = "尚未连接或驱动已停止；监控不会另开 CAN"
+                return result
+            try:
+                state = self.driver.get_state()
+                stamp = state.feedback_time
+                if math.isfinite(stamp):
+                    result["feedback_time"] = stamp
+                if (not math.isfinite(stamp) or abs(time.time() - stamp) > .5
+                        or len(state.joints_deg) != 6
+                        or not all(math.isfinite(value) for value in state.joints_deg)):
+                    raise RuntimeError("六轴反馈无效或超过 0.5 秒未更新")
+                result.update(fresh=True, joints_deg=list(state.joints_deg), enabled=list(state.enabled),
+                              control_mode=state.control_mode,
+                              faults={"arm_status": state.arm_status, "teach_status": state.teach_status,
+                                      "error_code": state.error_code, "motor_faults": list(state.motor_faults)})
+            except Exception as exc:
+                result["reasons"]["feedback"] = str(exc)
+            try:
+                result["joint_limits_deg"] = [list(pair) for pair in self.driver.joint_bounds_deg()]
+            except Exception as exc:
+                result["reasons"]["joint_limits_deg"] = str(exc)
+            try:
+                grip = self.driver.get_gripper()
+                values = (grip.width_mm, grip.effort_nm, grip.feedback_time)
+                if not all(math.isfinite(value) for value in values) or abs(time.time() - grip.feedback_time) > .5:
+                    raise RuntimeError("夹爪反馈无效或超过 0.5 秒未更新")
+                result["gripper"] = asdict(grip)
+            except Exception as exc:
+                result["reasons"]["gripper"] = str(exc)
+            return result
+        finally:
+            self.connection_lock.release()
 
     def motion_allowed(self, args):
         self.require_motion_permission()
@@ -334,7 +391,7 @@ class PiperRuntime:
             with self.lifecycle:
                 self.motion_enabled = self.manual_motion_permission = False
                 self.previews.invalidate()
-                affected = self.gate.locked() and self.active_card in {"piper_arm", "piper_joint", "piper_gripper", "piper_mode", "piper_enable", "piper_disable", "piper_standby", "piper_can"}
+                affected = self.gate.locked() and self.active_card in {"arm_control", "piper_arm", "piper_joint", "piper_gripper", "piper_mode", "piper_enable", "piper_disable", "piper_standby", "piper_can"}
                 if affected:
                     self.cancel.set()
                     if self.driver is not None:
@@ -405,7 +462,7 @@ class PiperRuntime:
         outcome["notify"] = True
         published.set()
         return {"state": "running", "action_id": action_id,
-                "reminder": "动作已提交；请查看卡片完成结果，也可到「机器人状态」核对实际反馈。"}
+                "reminder": "动作已提交；请查看卡片完成结果，也可在机械臂控制卡读取实际反馈。"}
 
     def acp_complete(self, action_id, status, result, name):
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")

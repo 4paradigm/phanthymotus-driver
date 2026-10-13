@@ -228,4 +228,5 @@ class PiperPlugin(PiperRuntime):
 
 
 def build_plugins(config, namespace, ros2):
-    return [PiperPlugin(config, namespace, ros2)]
+    from agilex.piper.arm_control import ArmControlPlugin
+    return [ArmControlPlugin(config, namespace, ros2)]
