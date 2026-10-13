@@ -2,7 +2,7 @@
 
 Numerical subprocess only: preserve the PR152 five-DOF objective and conservative
 geometry, output complete position reference; execution interpolation and final-q
-RNEA belong to arm. See NOTICE.md for exact source provenance.
+RNEA belong to arm. See README.md#来源与迁移边界 for exact source provenance.
 """
 import copy
 import hashlib
