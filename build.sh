@@ -90,6 +90,7 @@ declare -a DRIVER_CATS
 declare -a DRIVER_PROVIDERS
 declare -a DRIVER_MODELS
 declare -a DRIVER_BUILDABLE   # "yes" / "no (no Dockerfile)"
+declare -a DRIVER_ARCHS
 declare -a DRIVER_CARDS       # JSON array, e.g. [{"name":"base_drive","type":"actuator"}]
 
 _parse_yaml_field() {
@@ -152,6 +153,8 @@ for yaml_file in "${SCRIPT_DIR}"/*/*/driver.yaml "${SCRIPT_DIR}"/*/driver.yaml; 
     DRIVER_MODELS+=("$(_parse_yaml_field "${yaml_file}" hardware_model)")
     DRIVER_BUILDABLE+=("${has_dockerfile}")
     DRIVER_CARDS+=("$(_parse_yaml_cards_json "${yaml_file}")")
+    cpu_arch="$(_parse_yaml_field "${yaml_file}" cpu_arch)"
+    DRIVER_ARCHS+=("${cpu_arch:-arm64}")
 done
 
 if [ ${#DRIVER_DIRS[@]} -eq 0 ]; then
@@ -238,6 +241,10 @@ fi
 
 # ── 检查选中 driver 是否可构建 ────────────────────────────────────────────
 for idx in "${SELECTED_INDICES[@]}"; do
+    case "${DRIVER_ARCHS[$idx]}" in
+        arm64|amd64) ;;
+        *) echo "错误：不支持的 cpu_arch: ${DRIVER_ARCHS[$idx]}"; exit 1 ;;
+    esac
     buildable="${DRIVER_BUILDABLE[$idx]}"
     if [ "${buildable}" != "yes" ]; then
         echo "错误：${DRIVER_NAMES[$idx]} ${buildable}"
@@ -262,15 +269,17 @@ fi
 
 select_mirror
 
-# ARM64 hosts (including Apple Silicon Docker Desktop) build linux/arm64
-# natively. Registering binfmt there is unnecessary and may fail because
-# Docker Desktop does not expose /proc/sys/fs/binfmt_misc/register.
 HOST_ARCH="$(uname -m)"
-if [ "${HOST_ARCH}" != "arm64" ] && [ "${HOST_ARCH}" != "aarch64" ]; then
-    docker run --privileged --rm "${BINFMT_IMAGE}" --install arm64
-else
-    echo "[info] Native ${HOST_ARCH} host — skipping ARM64 binfmt setup."
-fi
+case "${HOST_ARCH}" in
+    aarch64) HOST_ARCH=arm64 ;;
+    x86_64) HOST_ARCH=amd64 ;;
+esac
+for idx in "${SELECTED_INDICES[@]}"; do
+    cpu_arch="${DRIVER_ARCHS[$idx]}"
+    if [ "${HOST_ARCH}" != "${cpu_arch}" ]; then
+        docker run --privileged --rm "${BINFMT_IMAGE}" --install "${cpu_arch}"
+    fi
+done
 
 # ── 构建 ──────────────────────────────────────────────────────────────────
 declare -a BUILT_INDICES
@@ -318,7 +327,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
     # commonly names it desktop-linux; forcing `default` crosses contexts and
     # fails before the build starts.
     docker buildx build \
-        --platform linux/arm64 \
+        --platform "linux/${DRIVER_ARCHS[$idx]}" \
         ${NO_CACHE} \
         --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
         --file "${dir}Dockerfile" \
@@ -362,17 +371,14 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
             cards="${DRIVER_CARDS[$idx]:-[]}"
             FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${hw_provider}/${hw_model}:${TAG}"
 
-            # 架构 facet（resource-center 据此过滤目录，见 resource-center/lib/arch.ts）。
-            # driver 是普通 ROS 容器，没有 L4T / CUDA base，所以不绑定加速器；镜像统一
-            # --platform linux/arm64 构建。将来某个 driver 真需要 Jetson，从它的
-            # driver.yaml 读一个 acc_arch 覆盖这里即可。
+            # Keep the catalog architecture equal to the built image.
             payload="{
   \"imageRef\": \"${FULL_IMAGE}\",
   \"registryImage\": \"${img}\",
   \"tag\": \"${TAG}\",
   \"category\": \"${cat}\",
   \"acc_arch\": \"agnostic\",
-  \"cpu_arch\": \"arm64\",
+  \"cpu_arch\": \"${DRIVER_ARCHS[$idx]}\",
   \"hardware_provider\": \"${hw_provider}\",
   \"hardware_model\": \"${hw_model}\",
   \"name\": \"${name}\",

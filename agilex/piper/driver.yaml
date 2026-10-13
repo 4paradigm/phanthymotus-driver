@@ -1,6 +1,7 @@
 id: agilex-piper-driver
 name: AgileX PiPER Driver
 category: driver
+cpu_arch: amd64
 hardware_provider: agilex
 hardware_model: piper
 image_name: agilex-piper
