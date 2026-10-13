@@ -62,7 +62,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    if not isinstance(plugins, dict) or set(plugins) - {'joint_state', 'joint_angles', 'battery_state', 'arm_control'}:
+    if not isinstance(plugins, dict) or set(plugins) - {'joint_state', 'joint_angles', 'battery_state', 'arm_control', 'camera'}:
         raise ValueError('Only TRON2 sensor and arm_control plugins may be configured')
     enabled = []
     for name, value in plugins.items():
@@ -70,18 +70,25 @@ def load_settings():
             raise ValueError('Expected boolean enabled for ' + name)
         if value['enabled']:
             enabled.append(name)
-    if not any(name in enabled for name in ('joint_state', 'joint_angles', 'battery_state')):
+    if not any(name in enabled for name in ('joint_state', 'joint_angles', 'battery_state', 'camera')):
         raise ValueError('Enable at least one read-only sensor')
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
+    # Fixed read-only video source on the same configured robot host. Callers
+    # cannot select arbitrary URLs, topics, credentials, or control endpoints.
+    host = '[' + parsed.hostname + ']' if ':' in parsed.hostname else parsed.hostname
+    settings['camera_url'] = ('http://' + host + ':59001/stream?topic='
+        '/camera/top/color/image_raw/compressed&quality=80&rotate=0')
     return settings
 
 
 async def run():
     from device import Adapter, TOPICS, PORT, LOG
     from ros2 import JsonPublisher
+    from camera import TOPIC as CAMERA_TOPIC
     settings = load_settings()
-    publisher = JsonPublisher([TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS])
+    publisher = JsonPublisher([TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS],
+        image_topics=[CAMERA_TOPIC] if 'camera' in settings['enabled_cards'] else [])
     tasks = []
     runner = None
     loop = asyncio.get_running_loop()
@@ -112,6 +119,7 @@ async def run():
                 for task in done:
                     task.result()
             finally:
+                await adapter.camera.close()
                 await adapter.motion.close()
                 for task in tasks:
                     task.cancel()

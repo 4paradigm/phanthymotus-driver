@@ -1063,13 +1063,13 @@ class PackagingTests(unittest.TestCase):
     def test_staged_entry_imports_without_repository_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','joint_angles.py','completion.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','joint_angles.py','completion.py','camera.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.4"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.5"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -1108,7 +1108,18 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'camera'})
+
+    def test_camera_only_and_fixed_source_configuration(self):
+        load = self.function('load_settings')
+        config = yaml.safe_load((DRIVER/'config.yaml').read_text())
+        config['plugins'] = {'camera': {'enabled': True}}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'config.yaml'; path.write_text(yaml.safe_dump(config))
+            with patch.dict(os.environ, CONFIG_PATH=str(path), TRON2_ROBOT_URL='ws://[::1]:5000'):
+                settings = load()
+                self.assertEqual(settings['enabled_cards'], ['camera'])
+                self.assertEqual(settings['camera_url'], 'http://[::1]:59001/stream?topic=/camera/top/color/image_raw/compressed&quality=80&rotate=0')
 
     def test_missing_dds_profile_refuses_participant_creation(self):
         with patch.dict(os.environ,FASTRTPS_DEFAULT_PROFILES_FILE='/missing/tron2-dds.xml'):

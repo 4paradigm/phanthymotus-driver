@@ -11,3 +11,4 @@ plugins:
   joint_angles: {enabled: true}
   battery_state: {enabled: true}
   arm_control: {enabled: true}
+  camera: {enabled: true}
