@@ -1403,6 +1403,8 @@ class U1CardContractTests(unittest.TestCase):
             _speaker_audio_blocks_dropped=0,
             _speaker_use_pulse=True,
             _speaker_audio_queue=device.queue.Queue(maxsize=2),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
             _speaker_publisher=FakePublisher(),
         )
         for value in (1, 2):
@@ -1439,6 +1441,8 @@ class U1CardContractTests(unittest.TestCase):
             _speaker_frames=0,
             _speaker_use_pulse=True,
             _speaker_audio_queue=device.queue.Queue(),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
             _speaker_publisher=FakePublisher(),
         )
         message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=payload)
@@ -1449,6 +1453,62 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual([len(block) for block in blocks], [device.SPEAKER_BLOCK_BYTES, 320])
         self.assertEqual(b"".join(blocks), payload)
         self.assertEqual(device.SPEAKER_BLOCK_MS, 40)
+
+    def test_speaker_pulse_writer_failure_stops_forwarding_without_blocking(self):
+        import device
+
+        class BrokenPipe:
+            def write(self, payload):
+                raise BrokenPipeError("sink disconnected")
+
+            def flush(self):
+                pass
+
+        process = types.SimpleNamespace(stdin=BrokenPipe(), poll=lambda: None)
+        nodes = types.SimpleNamespace(
+            _speaker_process=process,
+            _speaker_writer_stop=threading.Event(),
+            _speaker_forwarding=True,
+            _speaker_audio_queue=device.queue.Queue(),
+            _speaker_audio_thread=None,
+        )
+        nodes._speaker_audio_queue.put(b"pcm")
+
+        device.U1Nodes._pulse_writer(nodes)
+
+        self.assertFalse(nodes._speaker_forwarding)
+        self.assertIn("paplay write failed", nodes._speaker_playback_error)
+        plugin = device.SpeakerPlugin(types.SimpleNamespace(
+            _speaker_frames=1,
+            _speaker_audio_queue=nodes._speaker_audio_queue,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_use_pulse=True,
+            _speaker_process=process,
+            _speaker_playback_error=nodes._speaker_playback_error,
+        ))
+        plugin.running = True
+        self.assertEqual(plugin.dispatch("info", {})["state"], "error")
+        nodes._speaker_audio_queue = device.queue.Queue(maxsize=1)
+        nodes._speaker_audio_queue.put(b"stale")
+        device.U1Nodes._enqueue_speaker_block(nodes, b"next")
+        self.assertEqual(nodes._speaker_audio_queue.get_nowait(), b"stale")
+
+    def test_speaker_uses_pulse_server_environment_override(self):
+        import device
+
+        process = mock.Mock()
+        process.poll.return_value = None
+        nodes = object.__new__(device.U1Nodes)
+        nodes.config = {"speaker_pulse_server": "tcp:configured:1111"}
+        nodes._speaker_process = None
+        with mock.patch.dict(device.os.environ, {"PULSE_SERVER": "tcp:environment:2222"}), \
+                mock.patch.object(device.shutil, "which", return_value="/usr/bin/paplay"), \
+                mock.patch.object(device.subprocess, "Popen", return_value=process) as popen:
+            self.assertTrue(device.U1Nodes._start_pulse_output(nodes))
+            args = popen.call_args.args[0]
+            self.assertEqual(args[args.index("--server") + 1], "tcp:environment:2222")
+            self.assertEqual(popen.call_args.kwargs["env"]["PULSE_SERVER"], "tcp:environment:2222")
+            device.U1Nodes._stop_pulse_output(nodes)
 
     def test_speaker_callback_rejects_non_pcm_input(self):
         import device

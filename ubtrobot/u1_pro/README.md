@@ -5,7 +5,9 @@
 ## 卡片
 
 - `mic`：调用 U1 SDK 的音频 `open_stream`/`stream_state`，并同时接收设备 raw 与 `/audio/sense/audio_data_to_asr` 的 `AudioInData`。驱动会按消息中的采样率、声道和格式转换为统一的 `audio/pcm-16k`，启动时等待首个 PCM 帧；失败会关闭流并报告错误。
-- `speaker`：订阅连接到卡片的 `audio/pcm-16k` 输入，优先通过设备 PulseAudio TCP sink（`127.0.0.1:34567`）实时播放；没有 `paplay` 时才尝试 `EnableAudioOut` 和 `/sys/device/audio_out/raw` 兼容路径。停止时关闭播放进程和已打开的输出流。音量和静音服务不属于本驱动能力。
+- `speaker`：订阅连接到卡片的 `audio/pcm-16k` 输入，优先通过设备 PulseAudio TCP sink 实时播放；`PULSE_SERVER` 环境变量可覆盖默认地址 `tcp:127.0.0.1:34567`。运行镜像中的 `pulseaudio-utils` 提供 `paplay`，设备侧必须开放对应 PulseAudio sink。未安装或无法启动 `paplay` 时才尝试 `EnableAudioOut` 和 `/sys/device/audio_out/raw` 兼容路径；播放进程异常退出会将卡标记为错误并停止接收，避免阻塞 ROS 回调。音量和静音服务不属于本驱动能力。
+
+部署服务使用 `restart: always`，用于主机或 Docker daemon 重启后自动恢复驱动；运维人员手动停止容器后，Docker 会在 daemon 重启时再次启动它。若需临时停用，应通过部署编排管理该服务，而不是依赖 `docker stop` 保持停机。
 - `tts`：通过 U1 SDK `play_text` 进行文本播报，支持打断和 ACP 异步完成回报。真机音量服务不纳入本驱动能力。
 - `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。

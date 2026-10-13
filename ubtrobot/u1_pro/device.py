@@ -974,7 +974,11 @@ class U1Nodes:
         paplay = shutil.which("paplay")
         if not paplay:
             return False
-        server = str(self.config.get("speaker_pulse_server", PULSE_SERVER_DEFAULT))
+        server = str(
+            os.environ.get("PULSE_SERVER")
+            or self.config.get("speaker_pulse_server")
+            or PULSE_SERVER_DEFAULT
+        )
         env = os.environ.copy()
         env["PULSE_SERVER"] = server
         try:
@@ -1003,12 +1007,17 @@ class U1Nodes:
     def _pulse_writer(self) -> None:
         process = self._speaker_process
         if process is None or process.stdin is None:
+            U1Nodes._mark_pulse_failed(self, "paplay process or stdin is unavailable")
             return
         pending_until = time.monotonic()
         stop_event = self._speaker_writer_stop
         while True:
             payload = self._speaker_audio_queue.get()
             if payload is None:
+                break
+            return_code = process.poll()
+            if return_code is not None:
+                U1Nodes._mark_pulse_failed(self, f"paplay exited with status {return_code}")
                 break
             now = time.monotonic()
             duration = len(payload) / (16_000 * 2)
@@ -1024,9 +1033,14 @@ class U1Nodes:
                 process.stdin.write(payload)
                 process.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
-                self._speaker_playback_error = str(exc)[:160]
+                U1Nodes._mark_pulse_failed(self, f"paplay write failed: {str(exc)[:120]}")
                 break
             pending_until = max(pending_until, time.monotonic()) + duration
+
+    @staticmethod
+    def _mark_pulse_failed(nodes, error: str) -> None:
+        nodes._speaker_playback_error = str(error)[:160]
+        nodes._speaker_forwarding = False
 
     def _stop_pulse_output(self) -> None:
         process = self._speaker_process
@@ -1151,7 +1165,19 @@ class U1Nodes:
 
     @staticmethod
     def _enqueue_speaker_block(nodes, payload: bytes) -> None:
-        nodes._speaker_audio_queue.put(payload)
+        audio_queue = nodes._speaker_audio_queue
+        while nodes._speaker_forwarding:
+            process = getattr(nodes, "_speaker_process", None)
+            writer = getattr(nodes, "_speaker_audio_thread", None)
+            if process is None or process.poll() is not None or writer is None or not writer.is_alive():
+                return_code = process.poll() if process is not None else "unavailable"
+                U1Nodes._mark_pulse_failed(nodes, f"speaker playback unavailable (status {return_code})")
+                return
+            try:
+                audio_queue.put(payload, timeout=0.1)
+                return
+            except queue.Full:
+                continue
 
     def close(self) -> None:
         if self._closed:
@@ -1296,16 +1322,26 @@ class SpeakerPlugin:
                 with audio_queue.mutex:
                     queued_bytes = sum(
                         len(item) for item in list(audio_queue.queue) if item is not None)
-            return {"state": "running" if self.running else "idle", "input_topic": self.input_topic,
+            process = getattr(self.nodes, "_speaker_process", None)
+            process_alive = bool(process and process.poll() is None)
+            writer = getattr(self.nodes, "_speaker_audio_thread", None)
+            writer_alive = bool(writer and writer.is_alive())
+            playback_error = getattr(self.nodes, "_speaker_playback_error", "")
+            if self.running and getattr(self.nodes, "_speaker_use_pulse", False):
+                if not process_alive:
+                    playback_error = playback_error or "PulseAudio playback process is not running"
+                elif not writer_alive:
+                    playback_error = playback_error or "PulseAudio playback writer is not running"
+            state = "error" if self.running and playback_error else "running" if self.running else "idle"
+            return {"state": state, "input_topic": self.input_topic,
                     "frames_received": self.nodes._speaker_frames,
                     "audio_blocks_dropped": getattr(self.nodes, "_speaker_audio_blocks_dropped", 0),
                     "queued_frames": getattr(getattr(self.nodes, "_speaker_audio_queue", None), "qsize", lambda: 0)(),
                     "queued_audio_ms": round(queued_bytes / 32, 1),
                     "pulse_output": bool(getattr(self.nodes, "_speaker_use_pulse", False)),
-                    "playback_process_alive": bool(
-                        getattr(self.nodes, "_speaker_process", None)
-                        and self.nodes._speaker_process.poll() is None),
-                    "playback_error": getattr(self.nodes, "_speaker_playback_error", "")}
+                    "playback_process_alive": process_alive,
+                    "playback_writer_alive": writer_alive,
+                    "playback_error": playback_error}
         return None
 
 
