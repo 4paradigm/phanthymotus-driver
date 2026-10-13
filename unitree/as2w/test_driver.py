@@ -1604,6 +1604,9 @@ class TestDriverContracts(unittest.TestCase):
         plugin._recording_lock = threading.Lock()
         plugin._active_recording = None
         plugin._last_recording = None
+        plugin._executor = None
+        plugin._subscription = None
+        plugin._closed = False
         now_ns = int(time.time() * 1e9)
         plugin._node = types.SimpleNamespace(
             get_clock=lambda: types.SimpleNamespace(
@@ -1739,6 +1742,33 @@ class TestDriverContracts(unittest.TestCase):
             self.assertEqual(first["action_id"], stopped["action_id"])
             self.assertTrue(plugin._active_recording["cancel"].is_set())
 
+    def test_vision_capture_bundle_stop_tears_down_ros_once(self):
+        calls = []
+        plugin = self._vision_plugin("/tmp/unused")
+        plugin._subscription = object()
+        plugin._node = types.SimpleNamespace(
+            destroy_subscription=lambda subscription: calls.append(
+                ("destroy_subscription", subscription)),
+            destroy_node=lambda: calls.append(("destroy_node",)),
+        )
+        plugin._executor = types.SimpleNamespace(
+            remove_node=lambda node: calls.append(("remove_node", node)))
+
+        # Canvas stop cancels recordings but retains the ROS source.
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertEqual([], calls)
+
+        first = plugin.stop()
+        second = plugin.stop()
+
+        self.assertEqual("complete", first["teardown"])
+        self.assertNotIn("teardown", second)
+        self.assertEqual([
+            ("remove_node", plugin._node),
+            ("destroy_subscription", plugin._subscription),
+            ("destroy_node",),
+        ], calls)
+
     def test_video_completion_posts_acp_and_cancel_removes_file(self):
         with tempfile.TemporaryDirectory() as output:
             plugin = self._vision_plugin(output)
@@ -1797,6 +1827,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("VisionCapturePlugin", source)
         self.assertIn("name: vision_capture", driver)
         self.assertIn("ffmpeg", dockerfile)
+        self.assertIn("--no-install-recommends ffmpeg", dockerfile)
+        self.assertIn("FFmpeg runtime filesystem increase:", dockerfile)
         self.assertIn("vision_capture.py", dockerfile)
 
     def test_lowstate_extra_motor_slots_are_ignored(self):

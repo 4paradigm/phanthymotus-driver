@@ -18,9 +18,22 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl ffmpeg && \
-    command -v ffmpeg && command -v ffprobe && \
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+# FFmpeg is a runtime dependency of record_video, not a test-only tool. Measure
+# its architecture-specific uncompressed filesystem delta while installing the
+# smallest distro-supported package set; the build log makes the cost visible.
+RUN set -eux; \
+    before_bytes="$(du -sx -B1 / | cut -f1)"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ffmpeg; \
+    command -v ffmpeg; \
+    command -v ffprobe; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*; \
+    after_bytes="$(du -sx -B1 / | cut -f1)"; \
+    echo "FFmpeg runtime filesystem increase: $((after_bytes - before_bytes)) bytes"
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
 ARG CYCLONEDDS_SHA256=ec3ec898c52b02f939a969cd1a276e219420e5e8419b21cea276db35b4821848
 RUN curl --proto '=https' --tlsv1.2 -fsSL ${CYCLONEDDS_URL} -o /tmp/cyclonedds-0.10.5.tar.gz && \

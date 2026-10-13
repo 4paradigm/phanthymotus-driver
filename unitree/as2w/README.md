@@ -159,6 +159,16 @@ container, verify the media tools with `ffmpeg -version` and
 `info`/`capture_photo`/`record_video` actions. These checks do not replace
 opening the JPG and MP4 or exercising every physical remote control on robot.
 
+FFmpeg is not installed only for validation: `record_video` pipes the live JPEG
+frames into the `ffmpeg` executable to produce H.264 MP4, and rejects the action
+when it is absent. `ffprobe` then verifies that the completed file has an H.264
+video stream, no audio stream, and plausible duration/frame count. The image
+uses the distro package with `--no-install-recommends`, removes APT caches, and
+prints `FFmpeg runtime filesystem increase: ... bytes` during each target-
+architecture build. This is the uncompressed final-filesystem delta; registry
+transfer size can be checked from the resulting compressed layer or
+`docker image inspect` and will vary by architecture and base-image cache.
+
 The component vendors the three-field `audio_msgs/AudioChunk` interface used by
 the perception audio bus and builds it in a dedicated Docker stage. The runtime
 image receives only the generated `/as2w_ws/install` overlay and validates an

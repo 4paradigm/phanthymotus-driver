@@ -47,6 +47,8 @@ class VisionCapturePlugin:
         self._recording_lock = threading.Lock()
         self._active_recording = None
         self._last_recording = None
+        self._executor = executor
+        self._closed = False
         self._node = Node("as2w_vision_capture")
         self._subscription = self._node.create_subscription(
             CompressedImage, self._topic, self._on_frame,
@@ -444,7 +446,7 @@ class VisionCapturePlugin:
             "file_path": str(path),
         }
 
-    def stop(self):
+    def _cancel_recording(self):
         with self._recording_lock:
             active = self._active_recording
             if active is None:
@@ -466,6 +468,27 @@ class VisionCapturePlugin:
         return {"ok": True, "state": "stopping" if stopping else "idle",
                 "action_id": active["action_id"]}
 
+    def stop(self):
+        """Bundle shutdown: cancel work, then release the ROS subscription."""
+        result = self._cancel_recording()
+        if self._closed:
+            return result
+        self._closed = True
+        try:
+            self._executor.remove_node(self._node)
+        except Exception as exc:
+            log.warning("[vision_capture] Could not remove ROS node: %s", exc)
+        try:
+            self._node.destroy_subscription(self._subscription)
+        except Exception as exc:
+            log.warning("[vision_capture] Could not destroy subscription: %s", exc)
+        try:
+            self._node.destroy_node()
+        except Exception as exc:
+            log.warning("[vision_capture] Could not destroy ROS node: %s", exc)
+        result["teardown"] = "complete"
+        return result
+
     def dispatch(self, action, args):
         if action == "start":
             return self.start()
@@ -476,5 +499,7 @@ class VisionCapturePlugin:
         if action == "info":
             return self._info()
         if action == "stop":
-            return self.stop()
+            # Canvas stop owns recording state only. The shared ROS executor
+            # and subscription live until Bundle.stop_all() calls stop().
+            return self._cancel_recording()
         return None
