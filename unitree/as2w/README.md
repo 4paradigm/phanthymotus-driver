@@ -117,7 +117,10 @@ or expired frames, and both child process states/PIDs. Like G1
 `camera_rgb`, it is an always-on state source: canvas lifecycle `stop` detaches
 intelligent control but does not stop publication. The child processes are
 physically closed only when the driver bundle shuts down; repeated canvas starts
-reuse the live stream without resetting frame counters.
+reuse the live stream without resetting frame counters. Every `start`, `info`,
+and `stop` response makes that split explicit with `always_on=true`,
+`lifecycle=logical`, `stop_behavior=detach_only`, the independent
+`stream_state`, and `physical_shutdown=driver_bundle_stop`.
 
 `vision_capture` subscribes to that existing
 `/<namespace>/camera/front` JPEG stream; it never creates another Unitree
@@ -165,7 +168,11 @@ image receives only the generated `/as2w_ws/install` overlay and validates an
 audio builder stage, so they do not increase the final image. The runtime's
 CMake/build-essential packages are required to build the pinned CycloneDDS C
 library and matching Python extension against this base image. The downloaded
-0.10.5 archive is verified with its pinned SHA-256 before extraction.
+0.10.5 archive is restricted to HTTPS/TLS 1.2 or newer and verified with its
+pinned SHA-256 before extraction. Both Docker stages print the generated
+`audio_msgs` overlay size in their build logs, so image-growth reviews can use
+the actual architecture-specific artifact size rather than treating the
+builder toolchain as runtime content.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, RPC correlation, and full-size

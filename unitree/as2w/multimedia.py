@@ -1540,6 +1540,13 @@ class _CameraNode:
 class CameraPlugin:
     PREFIX = "camera"
 
+    _LIFECYCLE_FIELDS = {
+        "always_on": True,
+        "lifecycle": "logical",
+        "stop_behavior": "detach_only",
+        "physical_shutdown": "driver_bundle_stop",
+    }
+
     def __init__(self, config, namespace, executor, network_iface="eth0"):
         backend = config.get("backend", "videohub")
         if backend != "videohub":
@@ -1570,7 +1577,15 @@ class CameraPlugin:
                 "verified videohub service. Canvas stop detaches the logical "
                 "card but intentionally keeps the state stream alive; the "
                 "processes close when the driver bundle shuts down."),
-            "inputSchema": {"type": "object", "properties": {}},
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "x-action-descriptions": {
+                    "start": "Attach the logical card to the existing always-on stream.",
+                    "stop": "Detach the logical card; JPEG publication continues.",
+                    "info": "Report logical lifecycle and physical stream state.",
+                },
+            },
             "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
         }
 
@@ -1579,6 +1594,18 @@ class CameraPlugin:
 
     def stop(self):
         self._node.stop_capture()
+
+    def _with_lifecycle(self, result, logical_state=None, stream_state=None):
+        """Expose the logical-card/physical-stream ownership split."""
+        result = dict(result)
+        physical_state = stream_state or result.get("state", "error")
+        result.update(self._LIFECYCLE_FIELDS)
+        result["stream_state"] = physical_state
+        if logical_state is not None:
+            result["state"] = logical_state
+        result["topic_out"] = [
+            {"topic": self._topic, "format": "image/jpeg"}]
+        return result
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1597,22 +1624,15 @@ class CameraPlugin:
                 # Sensor lifecycle is ready for the canvas while asynchronous
                 # frame readiness remains visible in the separate field.
                 result["state"] = "running"
-            result["topic_out"] = [
-                {"topic": self._topic, "format": "image/jpeg"}]
-            return result
+            return self._with_lifecycle(
+                result, logical_state=result["state"],
+                stream_state=actual_state)
         elif action == "stop":
             # Match G1 camera_rgb: stopping intelligent control detaches the
             # logical card but keeps the state stream alive. Physical shutdown
             # remains CameraPlugin.stop(), called by Bundle.stop_all().
             result = self._node.status()
-            result["stream_state"] = result.get("state", "error")
-            result["state"] = "idle"
-            result["always_on"] = True
-            result["topic_out"] = [{"topic": self._topic, "format": "image/jpeg"}]
-            return result
+            return self._with_lifecycle(result, logical_state="idle")
         if action == "info":
-            result = self._node.status()
-            result["topic_out"] = [
-                {"topic": self._topic, "format": "image/jpeg"}]
-            return result
+            return self._with_lifecycle(self._node.status())
         return None

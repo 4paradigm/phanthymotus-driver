@@ -17,8 +17,8 @@ unitree-as2w:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
-    # Safe discovery is the default. Set NETWORK_INTERFACE in the deployment
-    # environment for non-standard robot subnets or a known interface name.
+    # Safe discovery is the default. Override explicitly for a known interface
+    # or non-standard subnet, e.g. NETWORK_INTERFACE=eno1 docker compose up -d.
     - NETWORK_INTERFACE=${NETWORK_INTERFACE:-auto}
     - PYTHONUNBUFFERED=1
   logging:

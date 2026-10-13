@@ -610,6 +610,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("audio/pcm-16k", speaker.get_tool()["topic_in"][0]["format"])
         self.assertEqual("camera", camera.get_tool()["name"])
         self.assertEqual("image/jpeg", camera.get_tool()["topic_out"][0]["format"])
+        camera_actions = camera.get_tool()["inputSchema"]["x-action-descriptions"]
+        self.assertIn("publication continues", camera_actions["stop"])
 
     def test_degraded_bundle_omits_microphone_card(self):
         created = []
@@ -689,7 +691,12 @@ class TestDriverContracts(unittest.TestCase):
 
         self.assertEqual("running", result["state"])
         self.assertEqual("starting", result["readiness"])
-        self.assertEqual("starting", plugin.dispatch("info", {})["state"])
+        self.assertEqual("starting", result["stream_state"])
+        self.assertEqual("logical", result["lifecycle"])
+        info = plugin.dispatch("info", {})
+        self.assertEqual("starting", info["state"])
+        self.assertEqual("starting", info["stream_state"])
+        self.assertTrue(info["always_on"])
 
     def test_camera_start_preserves_backend_failure(self):
         plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
@@ -733,6 +740,9 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("idle", result["state"])
         self.assertEqual("running", result["stream_state"])
         self.assertTrue(result["always_on"])
+        self.assertEqual("logical", result["lifecycle"])
+        self.assertEqual("detach_only", result["stop_behavior"])
+        self.assertEqual("driver_bundle_stop", result["physical_shutdown"])
         self.assertEqual(42, result["frames"])
 
         plugin.stop()
@@ -919,6 +929,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("from audio_msgs.msg import AudioChunk", dockerfile)
         self.assertIn("CYCLONEDDS_SHA256=", dockerfile)
         self.assertIn("sha256sum -c -", dockerfile)
+        self.assertIn("--proto '=https' --tlsv1.2", dockerfile)
+        self.assertIn("du -sh /as2w_ws/install", dockerfile)
         self.assertEqual(
             ["std_msgs/Header header", "string format", "uint8[] data"],
             audio_message.splitlines(),
