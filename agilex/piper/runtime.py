@@ -801,4 +801,3 @@ class PiperRuntime:
     def republish_photo(self):
         if not self.closed and "piper_photo" not in self.stopped_cards and self.last_image is not None:
             self.publisher.publish(self.last_image)
-
