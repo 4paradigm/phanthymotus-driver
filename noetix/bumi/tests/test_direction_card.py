@@ -29,7 +29,7 @@ def _card(module):
         types.SimpleNamespace(add_node=lambda node: None))
 
 
-def test_bundle_exposes_only_one_direction_card(monkeypatch):
+def test_bundle_exposes_only_one_direction_card(monkeypatch, tmp_path):
     device, _ = _load_device(monkeypatch)
     direction = _load_card(monkeypatch)
     monkeypatch.setitem(sys.modules, 'device', device)
@@ -46,6 +46,10 @@ def test_bundle_exposes_only_one_direction_card(monkeypatch):
     manifest = yaml.safe_load((path.parent / 'driver.yaml').read_text())
     assert 'sound_direction_control' not in {card['name'] for card in manifest['cards']}
     monkeypatch.setattr(direction, 'load_calibration', lambda: {})
+    monkeypatch.setattr(direction, 'SETTINGS_PATH', tmp_path / 'settings.json')
+    assert bundle.dispatch('sound_direction', {
+        'action': 'config', 'onset_ratio': 2.4})['state'] == 'configured'
+    assert json.loads((tmp_path / 'settings.json').read_text())['onset_ratio'] == 2.4
     assert bundle.dispatch('sound_direction', {'action': 'info'})['state'] == 'unavailable'
     assert bundle.dispatch('sound_direction', {'action': 'start'})['state'] == 'unavailable'
     assert bundle.dispatch('sound_direction', {'action': 'stop'}) == {'state': 'idle'}
@@ -162,7 +166,7 @@ def test_worker_exit_clears_published_direction(monkeypatch):
     assert card._last_direction is None
 
 
-def test_ready_wait_allows_slow_sdk_init(monkeypatch):
+def test_ready_timeout_waits_15_seconds_and_returns_false(monkeypatch):
     module = _load_card(monkeypatch)
     monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
     card = _card(module)

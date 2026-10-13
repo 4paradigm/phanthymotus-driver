@@ -56,6 +56,18 @@ The driver image builds its bundled `audio_msgs` definitions, including
 `ros-base` release from the main repository. ASR and Agent Core still need the
 matching message definition to consume the direction topic.
 
+Before deploying the three images together, compare
+`noetix/bumi/audio_msgs/msg/SoundDirection.msg` with the main repository's
+`deploy/ros-base/audio_msgs/msg/SoundDirection.msg` byte for byte. They match
+in these source branches (SHA-256
+`78c52d09d430df6e12e1200529d99f3b0f219abe0ffb340f6a847453a5e1016d`).
+For the release, record the immutable image digests for Bumi, Perception and
+Agent Core, then verify `ros2 interface show audio_msgs/msg/SoundDirection`
+inside each published image. Confirm one direction event reaches the ASR input
+and the canvas on the target robot. Source equality alone does not establish
+which image versions were deployed together; keep this release check open
+until those published-image and robot checks pass.
+
 ## App 图传与 Phanthy Camera Card
 
 Bumi 的官方 App 图传服务 `noetix-video-capture.service` 会占用 RealSense。
