@@ -12,7 +12,7 @@ from skeleton import skeleton_stream, model
 from state import battery_stream
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.0'
+VERSION = '0.5.1'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in

@@ -62,7 +62,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual([j['name'] for j in packet['joints']], skeleton.JOINT_NAMES)
         self.assertEqual(packet['joints'][14]['q'], .14)
         self.assertEqual(packet['joints'][15]['q'], .15)
-        self.assertEqual(packet['imu_quat'], [])
+        self.assertNotIn('imu_quat', packet)
         sample['data'] = state.joint_state(joints(names=list(reversed(skeleton.JOINT_NAMES))))
         packet = skeleton.skeleton_stream(sample)
         self.assertEqual(packet['joints'][0]['name'], 'head_yaw_Joint')
@@ -256,11 +256,11 @@ class CacheTests(unittest.TestCase):
 
 
 class BatteryPublicationTests(unittest.IsolatedAsyncioTestCase):
-    async def first_packet(self, adapter):
+    async def first_packet(self, adapter, expected_topic=TOPICS['battery_state']):
         ready = asyncio.Event()
         packets = []
         def capture(topic, data):
-            self.assertEqual(topic, TOPICS['battery_state'])
+            self.assertEqual(topic, expected_topic)
             packets.append(data)
             ready.set()
         adapter.publish = capture
@@ -321,6 +321,29 @@ class BatteryPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after['estimated_power_w'], 107.06)
         self.assertGreater(after['status']['received_at'], before['status']['received_at'])
         self.assertFalse(after['status']['measurement_time_verified'])
+
+    async def test_new_joint_feedback_updates_skeleton_without_invalid_orientation(self):
+        adapter = Adapter(lambda *args: None, settings(enabled_cards=['joint_state']))
+        adapter.reader.accept_info(info())
+        packets = []
+        for elbow in (-.0032, -.3522657):
+            q = [0.0]*16
+            q[3] = elbow
+            adapter.reader.joints = joints(q=q)
+            adapter.reader.joints_at = time.monotonic()
+            adapter.reader.joints_received = time.time()
+            adapter.reader.joints = state.joint_state(adapter.reader.joints)
+            packet = await self.first_packet(adapter, TOPICS['joint_state'])
+            self.assertNotIn('imu_quat', packet)
+            self.assertTrue(packet['status']['available'])
+            angle = next(j['q'] for j in packet['joints'] if j['name'] == 'elbow_L_Joint')
+            self.assertEqual(angle, elbow)
+            packets.append(packet)
+        self.assertNotEqual(packets[0]['joints'][3]['q'], packets[1]['joints'][3]['q'])
+        adapter.reader.disconnect('test')
+        packet = await self.first_packet(adapter, TOPICS['joint_state'])
+        self.assertNotIn('imu_quat', packet)
+        self.assertEqual(packet['joints'], [])
 
     async def test_battery_publication_stale_or_disconnected_does_not_retain_old_values(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['battery_state']))
@@ -1005,7 +1028,7 @@ class PackagingTests(unittest.TestCase):
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.0"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.1"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

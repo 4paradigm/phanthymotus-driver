@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.0'
+VERSION = '0.5.1'
 CARDS = {'joint_state', 'battery_state'}
 
 
@@ -117,6 +117,7 @@ def run_check(timeout=20):
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
+    print('Left/right elbow feedback (degrees):', values['positions_deg'][3], values['positions_deg'][10])
     print('Battery (%):', battery['soc'])
     print('Voltage raw/current magnitude (vendor units unverified):', battery['voltage'], battery['current'])
     print('Estimated power (W, assuming mV/mA):', battery['power'])

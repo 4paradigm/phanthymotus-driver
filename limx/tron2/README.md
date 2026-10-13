@@ -1,6 +1,6 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供关节骨架、电池两张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.0`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架、电池两张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.1`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -17,7 +17,7 @@
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
-- 骨架使用Motus既有joints/imu_quat协议和model资源。名称缺失时按官方SDK索引顺序映射到URDF：左臂0–6、右臂7–13、头部俯仰14/偏航15；URDF文本中头部关节顺序相反，不使用文件遍历顺序。若厂家提供名称则按名称匹配，不支持的关节数或名称返回空骨架和不可用诊断；不画成错误的人形。没有可用IMU姿态时imu_quat为空。模型来源和Apache-2.0归属见resource/SOURCE.md；只保留厂家运动学，不包含网格资产。
+- 骨架使用Motus既有joints协议和model资源。名称缺失时按官方SDK索引顺序映射到URDF：左臂0–6、右臂7–13、头部俯仰14/偏航15；URDF文本中头部关节顺序相反，不使用文件遍历顺序。若厂家提供名称则按名称匹配，不支持的关节数或名称返回空骨架和不可用诊断。没有可用IMU姿态时省略可选imu_quat；不能发送空数组，因为平台会将其解构成四个undefined值、破坏根节点旋转。模型来源和Apache-2.0归属见resource/SOURCE.md；只保留厂家运动学，不包含网格资产。
 - 电池数据schema版本为3。MCP/health缓存字段为 `soc/voltage/current/power/temperature/cycle`；`soc`为百分比，`voltage/current/temperature`为厂家原始单位。`temperature`只显示五路有效原始值中的最大值，不标成℃、不判断正常/过热；五路原值仍在`temperature_channels_raw`中按`bms_temp1`至`bms_temp5`保留，无效通道保留null。所有通道无效时单个温度也是null。`cycle`只接受厂家`bms_charging_cycle`的非负整数。
 - 电流`current`按用户要求只展示绝对值，例如厂家`-2620`显示`2620`；0保留，无效值仍为null。缩放保持厂家原始单位，这个字段不再保留正负方向，不用于判断充放电状态。
 - 按用户授权启用估算：假设电压mV、电流mA，以`(voltage/1000)*(current/1000)`计算功率大小，保留两位小数。`power_status: estimated_assuming_mV_mA`明确表示单位假设，未经厂家确认。电压或有效电流缺失、计算溢出时仍为null；有效0则显示0。电流不保留方向，因此功率也是大小，不能表示充放电方向或外接电源下整机耗电。
@@ -122,6 +122,8 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 此前现场验证了16项关节值和运动ACK；0.5.0的骨架网页效果和新增pose/reset操作仍需部署后单独验收。摄像头工作继续暂停。
 
 ## arm_control 动作
+
+0.5.1修正骨架数据兼容：缺少真实IMU四元数时不再发送imu_quat空数组。升级后重新加载网页/骨架组件，清除旧数据留下的无效根旋转；后续关节反馈仍按原名称应用到URDF。发布回归验证两帧肘角变化，检查脚本同时显示左右肘角，便于区分真实反馈与网页显示问题。电池和机械臂动作保持0.5.0实现。
 
 参考现有宇树arm卡片的命名姿态列表与x-action-params参数分组；实际执行仍使用TRON2 MoveJ，不复制宇树动作ID或硬件命令。
 

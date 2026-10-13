@@ -15,7 +15,10 @@ def skeleton_stream(sample):
     status = {key: sample[key] for key in (
         'connected', 'available', 'sample_status', 'received_at',
         'reception_age_seconds', 'measurement_time_verified')}
-    result = {'joints': [], 'imu_quat': [], 'status': status}
+    # IMU orientation is not supplied by this vendor interface. Omit the
+    # optional field: [] is truthy in JS and the Motus renderer destructures
+    # it as [w,x,y,z], corrupting the model root with undefined components.
+    result = {'joints': [], 'status': status}
     if not sample['available']:
         return result
     data = sample['data']
