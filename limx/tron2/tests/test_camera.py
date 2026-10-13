@@ -14,7 +14,7 @@ from aiohttp import web
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import camera
-from camera import HeadCamera, TOPIC, jpeg_size
+from camera import HeadCamera, TOPIC, CAMERA_SOURCES, jpeg_size
 from device import Adapter
 import ros2
 
@@ -38,6 +38,7 @@ class CameraTests(unittest.IsolatedAsyncioTestCase):
         self.requests = 0
         self.closed = 0
         self.mode = 'valid'
+        self.source_modes = {}
         self.published = []
         self.session = aiohttp.ClientSession(trust_env=False)
         app = web.Application()
@@ -60,7 +61,7 @@ class CameraTests(unittest.IsolatedAsyncioTestCase):
 
     async def stream(self, request):
         self.requests += 1
-        mode = self.mode
+        mode = self.source_modes.get(request.query.get('source'), self.mode)
         if mode == 'status': return web.Response(status=503)
         if mode == 'redirect': return web.Response(status=302,headers={'Location':self.url})
         if mode == 'mime': return web.Response(text='not video')
@@ -166,6 +167,51 @@ class CameraTests(unittest.IsolatedAsyncioTestCase):
         adapter.snapshot.return_value={'joint_state':{'available':False}}
         self.assertEqual((await adapter.health(None)).status,503)
 
+    async def test_wrist_streams_publish_separate_topics_and_stop_independently(self):
+        settings={'enabled_cards':list(CAMERA_SOURCES),
+                  'camera_urls':{name:self.url+'?source='+name for name in CAMERA_SOURCES},
+                  'url':'ws://127.0.0.1:5000','serial':'','poll_interval_seconds':.5,
+                  'response_timeout_seconds':5,'stale_after_seconds':5}
+        adapter=Adapter(lambda topic,data:self.published.append((topic,data)),settings,session=self.session)
+        self.camera=adapter.camera
+        self.assertEqual({tool['name'] for tool in adapter.tools()},set(CAMERA_SOURCES))
+        try:
+            replies=await asyncio.gather(adapter.cameras['camera_left'].call('start'),adapter.cameras['camera_right'].call('start'))
+            self.assertTrue(all(info['available'] for info in replies))
+            self.assertEqual({info['topic_out'][0]['topic'] for info in replies},
+                             {CAMERA_SOURCES[name][0] for name in ('camera_left','camera_right')})
+            self.assertFalse(adapter.camera.info()['active'])
+            await adapter.cameras['camera_left'].call('stop')
+            left=adapter.cameras['camera_left'].frames_published
+            right=adapter.cameras['camera_right'].frames_published
+            await asyncio.sleep(.14)
+            self.assertEqual(adapter.cameras['camera_left'].frames_published,left)
+            self.assertGreater(adapter.cameras['camera_right'].frames_published,right)
+            self.assertNotIn(TOPIC,{topic for topic,data in self.published})
+            for name in ('camera_left','camera_right'):
+                with self.assertRaises(ValueError):adapter.call(name,{'url':'http://wrong-host/'})
+        finally:await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
+
+    async def test_one_failed_camera_does_not_stop_other_camera_or_json_feedback(self):
+        settings={'enabled_cards':['camera_left','camera_right'],
+                  'camera_urls':{name:self.url+'?source='+name for name in CAMERA_SOURCES},
+                  'url':'ws://127.0.0.1:5000','serial':'','poll_interval_seconds':.5,
+                  'response_timeout_seconds':5,'stale_after_seconds':5}
+        adapter=Adapter(lambda *args:None,settings,session=self.session)
+        self.source_modes['camera_right']='badframe'
+        try:
+            await adapter.cameras['camera_left'].call('start')
+            before=adapter.cameras['camera_left'].frames_published
+            with self.assertRaises(ValueError):await adapter.cameras['camera_right'].call('start')
+            self.assertGreater(adapter.cameras['camera_left'].frames_published,before)
+            self.assertTrue(adapter.cameras['camera_left'].info()['available'])
+            self.assertFalse(adapter.cameras['camera_right'].info()['available'])
+            self.assertEqual((await adapter.health(None)).status,503)
+            adapter.reader.connected=True
+            adapter.snapshot=MagicMock(return_value={'joint_state':{'available':True}})
+            self.assertEqual((await adapter.health(None)).status,200)
+        finally:await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
+
     async def test_rpc_registration_info_and_rejection_never_issue_motion(self):
         settings={'enabled_cards':['camera'],'camera_url':self.url, 'url':'ws://127.0.0.1:5000',
                   'serial':'', 'poll_interval_seconds':.5,'response_timeout_seconds':5,'stale_after_seconds':5}
@@ -203,7 +249,8 @@ class ROSImageTests(unittest.TestCase):
     def test_compressed_jpeg_binary_qos_and_stamp(self):
         rclpy=types.ModuleType('rclpy')
         rclpy.init=MagicMock(); rclpy.ok=MagicMock(return_value=True); rclpy.shutdown=MagicMock()
-        node=MagicMock(); sink=MagicMock(); node.create_publisher.return_value=sink
+        node=MagicMock(); sinks={source[0]:MagicMock() for source in CAMERA_SOURCES.values()}
+        node.create_publisher.side_effect=lambda kind,topic,qos:sinks[topic]
         node.get_clock().now().to_msg.return_value='receipt-time'
         rclpy.create_node=MagicMock(return_value=node)
         qos=types.ModuleType('rclpy.qos'); qos.QoSProfile=MagicMock()
@@ -221,11 +268,13 @@ class ROSImageTests(unittest.TestCase):
             profile=Path(temp)/'dds.xml'; profile.write_text('<profiles/>')
             with patch.dict(sys.modules,modules),patch.dict(os.environ,{
                     'FASTRTPS_DEFAULT_PROFILES_FILE':str(profile),'ROS_DOMAIN_ID':'42','RMW_IMPLEMENTATION':'rmw_fastrtps_cpp'}):
-                publisher=ros2.JsonPublisher([],image_topics=[TOPIC])
-                publisher.publish(TOPIC,JPEG)
-                message=sink.publish.call_args[0][0]
-                self.assertEqual(message.data,JPEG); self.assertEqual(message.format,'jpeg')
-                self.assertEqual(message.header.stamp,'receipt-time')
-                self.assertEqual(message.header.frame_id,'tron2_head_camera')
+                publisher=ros2.JsonPublisher([],image_topics=list(sinks))
+                for topic in sinks:
+                    publisher.publish(topic,JPEG)
+                    message=sinks[topic].publish.call_args[0][0]
+                    self.assertEqual(message.data,JPEG); self.assertEqual(message.format,'jpeg')
+                    self.assertEqual(message.header.stamp,'receipt-time')
+                    self.assertEqual(message.header.frame_id,ros2.IMAGE_FRAMES[topic])
+                    sinks[topic].publish.assert_called_once()
                 self.assertEqual(qos.QoSProfile.call_args.kwargs['depth'],1)
                 publisher.close(); node.destroy_node.assert_called_once(); rclpy.shutdown.assert_called_once()

@@ -12,3 +12,5 @@ plugins:
   battery_state: {enabled: true}
   arm_control: {enabled: true}
   camera: {enabled: true}
+  camera_left: {enabled: true}
+  camera_right: {enabled: true}

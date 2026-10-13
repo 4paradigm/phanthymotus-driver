@@ -13,16 +13,18 @@ from skeleton import skeleton_stream, model
 from state import battery_stream
 from joint_angles import angle_sample, angles_stream
 from completion import ArmCompletion, ACP_TIMEOUT
-from camera import HeadCamera, TOPIC as CAMERA_TOPIC
+from camera import CameraStream, CAMERA_SOURCES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.5'
+VERSION = '0.5.6'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
           ('joint_state', 'joint_angles', 'battery_state')}
 DESCRIPTIONS = {
     'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
+    'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
+    'camera_right': 'TRON2 右腕RGB实时画面；厂家right校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'joint_state': 'TRON2 双臂与头部16关节实时骨架；配套厂家URDF，原始rad/deg及速度力矩可通过info查看',
     'joint_angles': 'TRON2 16关节实际角度（度）：J0–6左臂、J7–13右臂、J14–15头部；与骨架共用实时反馈，断连/过期清空。监控选择最新查看数值，原始rad见joint_state的info（只读）',
     'battery_state': 'TRON2 电量（%）、电压原始值/电流绝对值、估算功率 estimated_power_w（按 mV/mA 假设）、单个温度原始值 temperature_raw（五路有效值中最高值，非℃）、循环次数；随厂家通知更新，诊断含接收年龄及五路原值（只读）',
@@ -51,7 +53,11 @@ class Adapter:
         self.session = session
         self.reset = ResetPose(settings.get('home_file', '/config/tron2/home.json'), self.reader)
         self.motion = ArmCompletion(self.reader, self.report_completion)
-        self.camera = HeadCamera(settings.get('camera_url', ''), publish, session)
+        urls = settings.get('camera_urls', {})
+        self.cameras = {name: CameraStream(urls.get(name, settings.get('camera_url', '') if name == 'camera' else ''),
+                                          publish, session, topic=source[0])
+                        for name, source in CAMERA_SOURCES.items()}
+        self.camera = self.cameras['camera']
 
     async def report_completion(self, action_id, status, result):
         if self.session is None:
@@ -136,15 +142,17 @@ class Adapter:
             tools.append(self._battery_tool())
         if 'arm_control' in self.enabled:
             tools.append(self._arm_control_tool())
-        if 'camera' in self.enabled:
-            tools.append({'name': 'camera', 'type': 'sensor', 'multiInstance': False,
-                'description': DESCRIPTIONS['camera'],
+        for name in CAMERA_SOURCES:
+            if name not in self.enabled:
+                continue
+            tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
+                'description': DESCRIPTIONS[name],
                 'inputSchema': {'type': 'object', 'additionalProperties': False,
                     'properties': {'action': {'type': 'string', 'enum': ['info', 'start', 'stop']},
                                    **metadata_properties()}},
-                'topic_out': [{'topic': CAMERA_TOPIC, 'format': 'image/jpeg'}]})
+                'topic_out': [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}]})
         for name in self.enabled:
-            if name in ('battery_state', 'arm_control', 'camera'):
+            if name in ('battery_state', 'arm_control') or name in CAMERA_SOURCES:
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -190,15 +198,15 @@ class Adapter:
             if 'action' in args:
                 raise ValueError('Model has no action')
             return model()
-        action = args.get('action', 'info' if name in TOPICS or name == 'camera' else None)
+        action = args.get('action', 'info' if name in TOPICS or name in CAMERA_SOURCES else None)
         if not isinstance(action, str):
             raise ValueError('An action string is required')
         if name not in self.enabled:
             raise ValueError('Unknown tool')
-        if name == 'camera':
+        if name in CAMERA_SOURCES:
             if action not in ('info', 'start', 'stop'):
                 raise ValueError('Unsupported camera action')
-            return self.camera.info()  # Lifecycle I/O is awaited in the RPC path.
+            return self.cameras[name].info()  # Lifecycle I/O is awaited in the RPC path.
         if name == 'battery_state':
             # Battery card: only 'info' returns sample data; start/stop are no-ops
             if action not in ('info', 'start', 'stop'):
@@ -296,8 +304,8 @@ class Adapter:
             elif method == 'tools/call':
                 try:
                     data = self.call(params.get('name'), params.get('arguments', {}))
-                    if params.get('name') == 'camera':
-                        data = await self.camera.call(params.get('arguments', {}).get('action', 'info'))
+                    if params.get('name') in CAMERA_SOURCES:
+                        data = await self.cameras[params['name']].call(params.get('arguments', {}).get('action', 'info'))
                     if params.get('name') == 'arm_control' and data.get('action') in ('move', 'pose', 'reset'):
                         action = data['action']
                         target = data['joint'] if action == 'move' else data['target_q']
@@ -322,11 +330,13 @@ class Adapter:
     async def health(self, request):
         samples = self.snapshot()
         ready = self.reader.connected and bool(samples) and all(s['available'] for s in samples.values())
-        if not samples and 'camera' in self.enabled:
-            ready = self.camera.info()['available']
+        cameras = {name: stream.info() for name, stream in self.cameras.items() if name in self.enabled}
+        if not samples and cameras:
+            ready = all(info['available'] for info in cameras.values())
         return web.json_response({'version': VERSION, 'read_only': not set(self.enabled) & {'arm_control'}, 'ready': ready,
             'arm_motion': self.motion.summary(),
             'camera': self.camera.info() if 'camera' in self.enabled else None,
+            'cameras': cameras,
             'robot_connected': self.reader.connected, 'registered_mcp_id': self.registered_id,
             'last_connection_error': self.reader.last_error,
             'round_trip_seconds': self.reader.last_round_trip, 'samples': samples},

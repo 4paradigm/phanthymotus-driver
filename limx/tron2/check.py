@@ -6,8 +6,9 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.5'
+VERSION = '0.5.6'
 CARDS = {'joint_state', 'joint_angles', 'battery_state'}
+from camera import CAMERA_SOURCES
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -40,7 +41,7 @@ def read_samples():
     return samples
 
 
-def check_camera_bus():
+def check_camera_bus(topics):
     """Optional actual DDS subscriber proof, no frame files or motion calls."""
     try:
         import rclpy
@@ -48,26 +49,31 @@ def check_camera_bus():
         raise ValueError('Camera DDS check requires the ROS environment; source /opt/ros/humble/setup.bash first') from exc
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from sensor_msgs.msg import CompressedImage
-    from camera import TOPIC, jpeg_size
+    from camera import jpeg_size
     # Match the driver's authoritative mounted FastDDS profile.
     import os
     os.environ.pop('FASTDDS_BUILTIN_TRANSPORTS', None)
     rclpy.init()
     node = None
-    frames = []
+    frames = {topic: [] for topic in topics}
     try:
         node = rclpy.create_node('tron2_camera_readonly_check')
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
                         history=HistoryPolicy.KEEP_LAST, durability=DurabilityPolicy.VOLATILE)
-        node.create_subscription(CompressedImage, TOPIC, lambda msg: frames.append(msg), qos)
+        def receive(msg, topic):
+            if len(frames[topic]) < 2:
+                frames[topic].append(msg)
+        for topic in topics:
+            node.create_subscription(CompressedImage, topic, lambda msg, topic=topic: receive(msg, topic), qos)
         deadline = time.monotonic() + 5
-        while len(frames) < 2 and time.monotonic() < deadline:
+        while any(len(messages) < 2 for messages in frames.values()) and time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=.2)
-        if len(frames) < 2:
-            raise ValueError('JPEG publisher is active but no continuous frames reached the local DDS subscriber')
-        if any(msg.format != 'jpeg' for msg in frames):
+        missing = [topic for topic, messages in frames.items() if len(messages) < 2]
+        if missing:
+            raise ValueError('No continuous JPEG frames reached local DDS for: ' + ', '.join(missing))
+        if any(msg.format != 'jpeg' for messages in frames.values() for msg in messages):
             raise ValueError('Unexpected ROS image encoding')
-        return jpeg_size(bytes(frames[-1].data))
+        return {topic: jpeg_size(bytes(messages[-1].data)) for topic, messages in frames.items()}
     finally:
         if node is not None:
             node.destroy_node()
@@ -93,15 +99,15 @@ def run_check(timeout=20, camera=False):
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | {'camera'}, 'sensor'), 'arm_control': 'actuator', 'model': 'resource'}
+    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
         raise ValueError('Expected three JSON/skeleton sensors, optional camera/arm_control and model resource')
-    camera_tool = next((tool for tool in tools if tool['name'] == 'camera'), None)
-    if camera_tool:
-        if camera_tool['topic_out'] != [{'topic': '/limx_tron2/camera', 'format': 'image/jpeg'}] \
+    camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
+    for name, camera_tool in camera_tools.items():
+        if camera_tool['topic_out'] != [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}] \
                 or camera_tool['inputSchema']['properties']['action']['enum'] != ['info', 'start', 'stop']:
             raise ValueError('Unexpected camera topic, format or lifecycle')
-        camera_info = rpc('tools/call', {'name': 'camera', 'arguments': {'action': 'info'}})
+        camera_info = rpc('tools/call', {'name': name, 'arguments': {'action': 'info'}})
         if camera_info.get('isError') or json.loads(camera_info['content'][0]['text']).get('read_only') is not True:
             raise ValueError('Camera information request failed')
     if 'model' not in names:
@@ -181,30 +187,36 @@ def run_check(timeout=20, camera=False):
     print('Temperature (maximum valid vendor raw channel, not Celsius):', battery['temperature'])
     print('Charge cycles:', battery['cycle'])
     if camera:
-        if not camera_tool:
+        if not camera_tools:
             raise ValueError('Camera card is not enabled')
-        reply = rpc('tools/call', {'name': 'camera', 'arguments': {'action': 'start'}})
-        if reply.get('isError'):
-            raise ValueError('Camera start failed: ' + reply['content'][0]['text'])
-        first = json.loads(reply['content'][0]['text'])
+        first = {}
+        for name in camera_tools:
+            reply = rpc('tools/call', {'name': name, 'arguments': {'action': 'start'}})
+            if reply.get('isError'):
+                raise ValueError('Camera start failed: ' + name + ': ' + reply['content'][0]['text'])
+            first[name] = json.loads(reply['content'][0]['text'])
         time.sleep(1)
-        latest = json.loads(rpc('tools/call', {'name': 'camera', 'arguments': {'action': 'info'}})['content'][0]['text'])
-        if not latest['available'] or latest['frames_published'] <= first['frames_published']:
-            raise ValueError('Camera frames did not continue publishing')
-        width, height = check_camera_bus()
-        if (width, height) != (latest['width'], latest['height']):
-            raise ValueError('Camera dimensions changed between metadata and DDS check; repeat the probe')
-        print('Camera PASS: continuous JPEG frames received through local DDS; resolution:', width, height)
-        print('Camera remains active for platform viewing; stop through the camera lifecycle when finished.')
-    elif camera_tool:
-        print('Camera card ready; live video not tested. Use --camera to start and verify frame publication.')
+        latest = {name: json.loads(rpc('tools/call', {'name': name, 'arguments': {'action': 'info'}})['content'][0]['text'])
+                  for name in camera_tools}
+        for name, info in latest.items():
+            if not info['available'] or info['frames_published'] <= first[name]['frames_published']:
+                raise ValueError('Camera frames did not continue publishing: ' + name)
+        dimensions = check_camera_bus([CAMERA_SOURCES[name][0] for name in camera_tools])
+        for name, info in latest.items():
+            width, height = dimensions[CAMERA_SOURCES[name][0]]
+            if (width, height) != (info['width'], info['height']):
+                raise ValueError('Camera dimensions changed between metadata and DDS check; repeat the probe')
+            print('Camera PASS:', name, 'continuous JPEG frames received through local DDS; resolution:', width, height)
+        print('Cameras remain active for platform viewing; stop each camera lifecycle when finished.')
+    elif camera_tools:
+        print('Camera cards ready; live video not tested. Use --camera to start enabled sources and verify publication.')
     print('Read-only. Measurement timestamp clock is unverified; receipt age is reported separately.')
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--camera', action='store_true', help='Start read-only head video, verify publication, and leave it active')
+    parser.add_argument('--camera', action='store_true', help='Start enabled read-only RGB streams, verify each DDS topic, and leave them active')
     args = parser.parse_args()
     try:
         run_check(camera=args.camera)

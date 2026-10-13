@@ -1069,7 +1069,7 @@ class PackagingTests(unittest.TestCase):
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.5"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.6"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -1108,7 +1108,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'camera'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'camera', 'camera_left', 'camera_right'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')
@@ -1120,6 +1120,8 @@ class PackagingTests(unittest.TestCase):
                 settings = load()
                 self.assertEqual(settings['enabled_cards'], ['camera'])
                 self.assertEqual(settings['camera_url'], 'http://[::1]:59001/stream?topic=/camera/top/color/image_raw/compressed&quality=80&rotate=0')
+                self.assertEqual(settings['camera_urls']['camera_left'], 'http://[::1]:59001/stream?topic=/camera/left/color/image_rect_raw/compressed&quality=80&rotate=0')
+                self.assertEqual(settings['camera_urls']['camera_right'], 'http://[::1]:59001/stream?topic=/camera/right/color/image_rect_raw/compressed&quality=80&rotate=0')
 
     def test_missing_dds_profile_refuses_participant_creation(self):
         with patch.dict(os.environ,FASTRTPS_DEFAULT_PROFILES_FILE='/missing/tron2-dds.xml'):

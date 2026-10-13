@@ -31,6 +31,7 @@ import yaml
 
 
 def load_settings():
+    from camera import CAMERA_SOURCES
     path = Path(os.environ.get('CONFIG_PATH', Path(__file__).with_name('config.yaml')))
     config = yaml.safe_load(path.read_text())
     if not isinstance(config, dict) or config.get('mcp_port') != 15791:
@@ -62,7 +63,8 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    if not isinstance(plugins, dict) or set(plugins) - {'joint_state', 'joint_angles', 'battery_state', 'arm_control', 'camera'}:
+    allowed = {'joint_state', 'joint_angles', 'battery_state', 'arm_control'} | set(CAMERA_SOURCES)
+    if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor and arm_control plugins may be configured')
     enabled = []
     for name, value in plugins.items():
@@ -70,25 +72,26 @@ def load_settings():
             raise ValueError('Expected boolean enabled for ' + name)
         if value['enabled']:
             enabled.append(name)
-    if not any(name in enabled for name in ('joint_state', 'joint_angles', 'battery_state', 'camera')):
+    if not set(enabled) & ({'joint_state', 'joint_angles', 'battery_state'} | set(CAMERA_SOURCES)):
         raise ValueError('Enable at least one read-only sensor')
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
     # Fixed read-only video source on the same configured robot host. Callers
     # cannot select arbitrary URLs, topics, credentials, or control endpoints.
     host = '[' + parsed.hostname + ']' if ':' in parsed.hostname else parsed.hostname
-    settings['camera_url'] = ('http://' + host + ':59001/stream?topic='
-        '/camera/top/color/image_raw/compressed&quality=80&rotate=0')
+    settings['camera_urls'] = {name: 'http://' + host + ':59001/stream?topic=' + source[1] + '&quality=80&rotate=0'
+                               for name, source in CAMERA_SOURCES.items()}
+    settings['camera_url'] = settings['camera_urls']['camera']
     return settings
 
 
 async def run():
     from device import Adapter, TOPICS, PORT, LOG
     from ros2 import JsonPublisher
-    from camera import TOPIC as CAMERA_TOPIC
+    from camera import CAMERA_SOURCES
     settings = load_settings()
     publisher = JsonPublisher([TOPICS[name] for name in settings['enabled_cards'] if name in TOPICS],
-        image_topics=[CAMERA_TOPIC] if 'camera' in settings['enabled_cards'] else [])
+        image_topics=[source[0] for name, source in CAMERA_SOURCES.items() if name in settings['enabled_cards']])
     tasks = []
     runner = None
     loop = asyncio.get_running_loop()
@@ -119,7 +122,7 @@ async def run():
                 for task in done:
                     task.result()
             finally:
-                await adapter.camera.close()
+                await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
                 await adapter.motion.close()
                 for task in tasks:
                     task.cancel()

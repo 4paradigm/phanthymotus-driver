@@ -3,6 +3,10 @@ import json
 import os
 from pathlib import Path
 
+IMAGE_FRAMES = {'/limx_tron2/camera': 'tron2_head_camera',
+                '/limx_tron2/camera_left': 'tron2_left_wrist_camera',
+                '/limx_tron2/camera_right': 'tron2_right_wrist_camera'}
+
 
 class JsonPublisher:
     def __init__(self, topics, image_topics=()):
@@ -45,7 +49,7 @@ class JsonPublisher:
             # This stamp is the relay's receipt/publish clock, not the camera's
             # unverified measurement timestamp. JPEG bytes remain unchanged.
             message.header.stamp = self.node.get_clock().now().to_msg()
-            message.header.frame_id = 'tron2_head_camera'
+            message.header.frame_id = IMAGE_FRAMES[topic]
             message.format, message.data = 'jpeg', data
         else:
             message = self.message_type()

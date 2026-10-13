@@ -1,6 +1,6 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供关节骨架、关节角度、电池、头部RGB摄像头四张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.5`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架、关节角度、电池及头部/左右腕RGB摄像头六张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.6`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -8,6 +8,8 @@
 | `joint_angles` | sensor | 16项实际关节角度（度），字段标明左/右臂或头部、索引与关节名称；数值在最新模式可读 | `/limx_tron2/joint_angles`（data/json） |
 | `battery_state` | sensor | 电量、电压原始值/电流绝对值、按mV/mA假设的估算功率、单个温度原始值（五路最大有效值）、循环次数 | `/limx_tron2/battery_state` |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
+| `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
+| `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
 | `arm_control` | actuator | move自定义目标、pose预设、reset复位、只读预览/列表/到位检查 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
@@ -58,7 +60,7 @@
 
 电池沿用0.4.8的schema v3，功率为estimated_power_w，温度为单值temperature_raw；诊断位于status。MCP/health仍提供power和temperature，五路原数组为temperature_channels_raw。本次0.5.3不修改电池计算、显示字段或本机复位目标。
 
-关节/电池传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。公开四张sensor、一张arm_control actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
+关节/电池传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。camera的start/stop实际开启/释放只读视频连接。公开六张sensor、一张arm_control actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
 
 兼容Agent Core自动注入的instance_id和_trace_id：最长128字符、无控制字符，不参与机器人请求或回显。三张传感器通过info查看当前原始缓存。
 
@@ -109,9 +111,9 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪，检查Core注册、三张JSON/骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/pose/reset，也不验证真实运动。
 
-升级到0.5.0后刷新Motus，移除画布上的旧robot_status与reset_pose实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、joint_angles、battery_state、camera、arm_control五张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架；joint_angles在监控中切换“最新”查看16项度数。不需要将两张传感器连线。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
+升级到0.5.0后刷新Motus，移除画布上的旧robot_status与reset_pose实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、joint_angles、battery_state、camera、camera_left、camera_right、arm_control七张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架；joint_angles在监控中切换“最新”查看16项度数。不需要将两张传感器连线。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
-`GET http://127.0.0.1:15791/health` 返回卡片状态：启用关节/电池时，机器人连接且这些已启用传感器全部有最近接收数据为HTTP 200。可选camera的idle/断流不会阻塞它们或机械臂任务。只启用camera时，至少一帧最近成功发布的JPEG才就绪，否则为503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
+`GET http://127.0.0.1:15791/health` 返回卡片状态：启用关节/电池时，机器人连接且这些已启用传感器全部有最近接收数据为HTTP 200。可选camera的idle/断流不会阻塞它们或机械臂任务。只启用相机时，所有已启用相机都有最近成功发布的JPEG才就绪，否则为503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
 ## 开发测试与验证范围
 
@@ -163,20 +165,28 @@ check.py只调用生命周期/信息和model资源，不执行运动。源码和
 Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺少时执行apt更新/安装；基础镜像已提供的包不重复安装。aiohttp/PyYAML仍由requirements.txt管理，是既有HTTP/WebSocket和配置解析依赖；完成机制只增加Python标准库源码，没有新增pip包、设备权限或资源资产。
 
 
-## 头部摄像头（0.5.5）
+## 头部与左右腕RGB摄像头（0.5.6）
 
-新增camera sensor，默认发现但启动进程不会打开视频连接。刷新Motus后，把camera拖到画布，点击“开启智能控制”，再在“监控”或“查看数据流”查看画面，无需与arm_control连线。Core调用camera.start才连接厂家服务；camera.stop释放连接，info只返回状态、接收年龄、尺寸与帧计数，不请求新画面。不自动执行任何机械臂、头部或夹爪运动。
+camera保留0.5.5的头部卡片名称与topic；新增camera_left、camera_right，使用三路独立中继和DDS topic。默认均可发现但进程启动不打开视频连接。刷新Motus，把需要的相机卡片拖到画布，开启智能控制，从监控或查看数据流观看，无需与arm_control连线或填写URL。Core显式start连接对应厂家源，stop只释放该相机连接，info只读，不影响其他相机或关节/电池后台采样。不自动执行任何机械臂、头部、夹爪运动。
 
-厂家源固定为同一TRON2_ROBOT_URL主机的HTTP 59001端口：`/stream?topic=/camera/top/color/image_raw/compressed&quality=80&rotate=0`。只接入头部RGB；没有手腕相机、深度、PTZ、录制或调用者指定URL/topic。原始JPEG无需解码转码，复用既有aiohttp与ROS sensor_msgs/CompressedImage，声明image/jpeg供平台现有CameraRenderer显示。
+| 卡片 | 厂家源topic | Motus输出topic | 只读现场尺寸 |
+| --- | --- | --- | --- |
+| camera（头部） | /camera/top/color/image_raw/compressed | /limx_tron2/camera | 640×480 |
+| camera_left（左腕） | /camera/left/color/image_rect_raw/compressed | /limx_tron2/camera_left | 848×480 |
+| camera_right（右腕） | /camera/right/color/image_rect_raw/compressed | /limx_tron2/camera_right | 848×480 |
 
-转发上限10fps（实际帧率取决于厂家源）、4MiB/帧、宽高各≤4096。检查JPEG封装、头部尺寸、SOF/SOS分段完整性；不是完整熵解码验证。拒绝非200、重定向、非MJPEG、压缩HTTP编码及非法帧。整帧读取限3秒，连接失败/断流按1秒间隔重试，首次start最多等待8秒并要求成功发布一帧。并发start共用单个连接，stop可中断等待中的start；旧start不能关停新一代连接。图像DDS队列仅1帧、best-effort、volatile，接收/发布时钟不代表厂家测量时间。info断流立即清空尺寸/接收时间和available。旧平台图像组件可能继续保留最后一帧：静止画面不能证明连接正常，需用info.available与接收年龄核对或重新打开面板。
+固定读取同一TRON2_ROBOT_URL主机HTTP59001：`/stream?topic=<表中厂家源>&quality=80&rotate=0`。左右腕使用现场ROS2发布并有连续有效帧的image_rect_raw，不使用当前无有效帧的image_resized或套用头部image_raw名称。厂家的camera_service状态不是每路实时帧证据；话题存在/有发布者也不能代替实际帧验收。保留厂家left/right标识，现场可分别在对应镜头前放纸核对左右画面，不发运动命令。
 
-普通check.py只检查camera发现/协议/info，不改变已有视频启停。显式视频验收：
+只接入三路RGB，不发布depth/标定/metadata，不支持PTZ、录制或调用者指定URL/topic。原始JPEG不解码转码，复用既有aiohttp与ROS sensor_msgs/CompressedImage，声明image/jpeg供平台现有CameraRenderer显示。每路header.frame_id分别为tron2_head_camera、tron2_left_wrist_camera、tron2_right_wrist_camera；stamp是中继接收/发布时间，不是已验证的厂家测量时钟。原有Core和loopback domain42总线配置不变。
+
+每路限10fps（实际受厂家源影响）、4MiB/帧、宽高各≤4096；三路各自depth=1、best-effort/volatile，独立任务/连接/锁/代际标记。校验JPEG封装、头部尺寸、SOF/SOS分段，不宣称完整熵解码。拒绝非200、重定向、非MJPEG、压缩HTTP编码及非法帧。整帧限3秒，断流清空available/尺寸/接收时间并按1秒间隔重连；首次start限8秒且要求成功发布一帧，并发start共用该路连接，stop能中断该路等待。一路断流不会停止另外两路或机械臂任务。health.cameras独立列出各路状态，旧health.camera保留头部；普通关节/电池就绪不受可选相机idle/断流影响。只启用相机时则要求所有已启用源可用。
+
+旧平台图像组件可能保留最后一帧；静止图像不能证明连接正常，需查该路info.available与接收年龄或重新打开面板。普通check.py只验证发现/协议/info，不改变既有视频启停。显式视频验收开启全部已启用源：
 
 ```bash
 sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 /work/check.py --camera'
 ```
 
-这项只读检查开启头部视频、验证持续发布和实际本机DDS订阅收到至少两帧合法JPEG，并保留视频连接供平台查看；不发送运动，不保存图像。完成后通过camera.stop或停止画布释放连接。
+检查每路计数持续增长，并用实际本机DDS订阅逐topic收到至少两帧合法JPEG（每topic只缓存两帧，整体限5秒），打印各路名称/尺寸，保留连接供平台查看；不保存图像或发送运动。完成后停止对应卡片/画布释放连接。Mac诊断SSH隧道仅用于开发读取，不是Jetson平台正常视频链路的一部分。
 
-本地测试使用合成MJPEG帧覆盖启停/并发start/中断等待、断流/重连、无效响应/帧/超限/停滞、RPC元数据与禁止运动，以及CompressedImage原始二进制和depth=1队列。现场隧道只读诊断已确认连续640×480画面；这只证明视频源及中继，不代替部署后的Core/DDS/网页链路验收。实际相机图像与现场信息不进入仓库或公开PR。
+测试使用合成MJPEG，覆盖启停/并发/中断等待、断流清空/重连、无效响应/畸形/截断/超限/停滞帧、RPC元数据与禁止运动；左右腕分开输出/独立停止、失败不影响其他源/JSON就绪，以及三路CompressedImage原始二进制、独立frame_id/单帧队列。只读隧道现场诊断确认三路同时连续视频，左停止后头部/右继续发布；实际图像/现场标识不进入仓库或公开PR。源/中继测试不能代替新镜像部署后的DDS/Core/平台验收。

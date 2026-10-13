@@ -1,9 +1,14 @@
-"""On-demand head MJPEG relay. No motion commands, recording, or new codecs."""
+"""Independent on-demand RGB MJPEG relays; no motion, recording or new codecs."""
 import asyncio
 import time
 import aiohttp
 
-TOPIC = '/limx_tron2/camera'
+CAMERA_SOURCES = {
+    'camera': ('/limx_tron2/camera', '/camera/top/color/image_raw/compressed'),
+    'camera_left': ('/limx_tron2/camera_left', '/camera/left/color/image_rect_raw/compressed'),
+    'camera_right': ('/limx_tron2/camera_right', '/camera/right/color/image_rect_raw/compressed'),
+}
+TOPIC = CAMERA_SOURCES['camera'][0]
 MAX_FRAME = 4 * 1024 * 1024
 MAX_DIMENSION = 4096
 FRAME_TIMEOUT = 3
@@ -72,9 +77,10 @@ async def read_frame(reader):
     return bytes(data), dimensions
 
 
-class HeadCamera:
-    def __init__(self, url, publish, session=None):
+class CameraStream:
+    def __init__(self, url, publish, session=None, topic=TOPIC):
         self.url, self.publish, self.session = url, publish, session
+        self.topic = topic
         self.task = None
         self.active = False
         self.received_at = self.last_frame_at = None
@@ -97,7 +103,7 @@ class HeadCamera:
                 'width': self.width, 'height': self.height, 'last_frame_bytes': self.frame_bytes,
                 'publish_fps_limit': 10, 'received_at': self.received_at,
                 'reception_age_seconds': age, 'measurement_time_verified': False,
-                'last_error': self.error, 'topic_out': [{'topic': TOPIC, 'format': 'image/jpeg'}]}
+                'last_error': self.error, 'topic_out': [{'topic': self.topic, 'format': 'image/jpeg'}]}
 
     async def call(self, action):
         if action == 'info':
@@ -127,7 +133,7 @@ class HeadCamera:
             async with self.lock:
                 if epoch == self.epoch:
                     await self._close()
-            raise ValueError('Head camera did not provide a frame; check vendor camera service') from exc
+            raise ValueError('Camera did not provide a frame; check vendor camera service') from exc
         if epoch != self.epoch or not self.info()['available']:
             raise ValueError('Camera start was stopped or no recent frame is available')
         return self.info()
@@ -176,7 +182,7 @@ class HeadCamera:
                         now = time.monotonic()
                         if last_publish is not None and now-last_publish < PUBLISH_INTERVAL:
                             continue
-                        self.publish(TOPIC, data)
+                        self.publish(self.topic, data)
                         self.width, self.height = dimensions
                         self.frame_bytes = len(data)
                         last_publish = self.last_frame_at = now
@@ -188,3 +194,7 @@ class HeadCamera:
                 self.error = type(exc).__name__
                 self.unavailable()
                 await asyncio.sleep(1)
+
+
+# Preserve the 0.5.5 read-only diagnostic import; all sources use the same relay.
+HeadCamera = CameraStream
