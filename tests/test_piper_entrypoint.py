@@ -129,6 +129,53 @@ class PiperEntrypointTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertIsNone(self.runtime.driver)
 
+    def test_stop_during_sdk_connect_closes_candidate_and_releases_can_owner(self):
+        entered, release = threading.Event(), threading.Event()
+        closed = []
+        class BlockingDriver(Driver):
+            def connect(self):
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError('test connection was not released')
+                return self
+            def close(self):
+                closed.append(self)
+                super().close()
+        self.runtime.factory = BlockingDriver
+        self.status.auto_connect = True
+        self.status.start()
+        stopper = None
+        try:
+            self.assertTrue(entered.wait(1))
+            stopper = threading.Thread(target=self.status.stop)
+            stopper.start()
+            self.assertTrue(self.status._connection_stop.wait(1))
+        finally:
+            release.set()
+            if stopper is not None:
+                stopper.join(2)
+            self.status._connection_thread.join(1)
+        self.assertFalse(stopper.is_alive())
+        self.assertFalse(self.status._connection_thread.is_alive())
+        self.assertIsNone(self.runtime.driver)
+        self.assertIsNone(self.runtime.owner_file)
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(self.status.info()['state'], 'idle')
+        self.assertIsNone(self.status.info()['connection_error'])
+        self.assertTrue(all(candidate.arm is None for candidate in closed))
+        # The aborted receiver must not keep the bus-owner file locked.
+        self.runtime.factory = Driver
+        self.assertIsNotNone(self.runtime.connected())
+
+    def test_cancelled_connection_never_constructs_sdk(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        with patch.object(self.runtime, 'factory', side_effect=AssertionError('SDK constructed')):
+            with self.assertRaisesRegex(RuntimeError, 'Connection cancelled'):
+                self.runtime.connected(cancel_event=cancelled)
+        self.assertIsNone(self.runtime.driver)
+        self.assertIsNone(self.runtime.owner_file)
+
     def test_two_device_entrypoints_have_separate_runtime_and_topics(self):
         other = build_plugins({'name': '机械臂 2', 'data_dir': str(Path(self.tmp.name) / 'arm2')}, 'piper2', None)
         self.addCleanup(other[0].stop)

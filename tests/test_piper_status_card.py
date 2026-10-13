@@ -20,10 +20,11 @@ class StatusCardTests(unittest.TestCase):
         r=SimpleNamespace(config={"name":"机械臂 1"},topic='/agilex/piper/rgb',closed=False,connection_lock=threading.RLock(),
                           driver=None,gate=threading.Lock(),connected_event=threading.Event(),
                           connected=lambda:connects.append('same-runtime'),read_monitor_snapshot=lambda:deepcopy(data))
-        def connected():
+        def connected(**kwargs):
             connects.append('same-runtime'); r.driver=object();r.connected_event.set()
             return r.driver
         r.connected=connected
+        r.disconnect=lambda:setattr(r,'driver',None)
         r.get_tools=lambda:[{"name":"arm_control","type":"actuator","inputSchema":{
             "properties":{"action":{"enum":["read","info","halt","move_joint"],"default":"read",
             "oneOf":[{"const":x,"title":x} for x in ['read','info','halt','move_joint']]}},
@@ -128,7 +129,7 @@ class StatusCardTests(unittest.TestCase):
 
     def test_auto_connection_failure_is_visible_and_restart_can_recover(self):
         r,connects=self.runtime();good=r.connected;failed=threading.Event()
-        def fail():
+        def fail(**kwargs):
             failed.set();raise RuntimeError('CAN unavailable')
         r.connected=fail;plugin=PiperStatusCard(r,auto_connect=True)
         self.addCleanup(plugin.stop)
@@ -136,6 +137,49 @@ class StatusCardTests(unittest.TestCase):
         self.assertEqual(plugin.info()['connection_error'],'CAN unavailable')
         r.connected=good;plugin.start();self.assertTrue(r.connected_event.wait(1));plugin.stop()
         self.assertIsNone(plugin.info()['connection_error'])
+
+    def test_stop_during_blocked_connection_rolls_back_late_connection(self):
+        r,connects=self.runtime();entered=threading.Event();release=threading.Event()
+        good=r.connected;disconnected=[]
+        def blocked(**kwargs):
+            entered.set();release.wait(5)
+            # Simulate completion after the runtime's last cancellation check.
+            return good(**kwargs)
+        def disconnect():
+            disconnected.append(r.driver);r.driver=None
+        r.connected=blocked;r.disconnect=disconnect
+        plugin=PiperStatusCard(r,auto_connect=True)
+        self.addCleanup(plugin.stop)
+        plugin.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            stopped=plugin.stop()
+            self.assertEqual(stopped['state'],'stopping')
+            self.assertTrue(stopped['connection_stopping'])
+            self.assertIsNone(r.driver)
+            with self.assertRaises(RuntimeError):plugin.start()
+        finally:
+            release.set();plugin._connection_thread.join(1)
+        self.assertFalse(plugin._connection_thread.is_alive())
+        self.assertIsNone(r.driver)
+        self.assertEqual(len(disconnected),1)
+        self.assertEqual(connects,['same-runtime'])
+        self.assertEqual(plugin.info()['state'],'idle')
+        # A new generation can connect after the stale worker has released CAN.
+        r.connected=good;r.connected_event.clear();plugin.start();self.assertTrue(r.connected_event.wait(1))
+        plugin._connection_thread.join(1)
+        self.assertFalse(plugin._connection_thread.is_alive())
+        plugin.stop()
+        self.assertIsNotNone(r.driver)
+        self.assertEqual(len(disconnected),1)
+
+    def test_stop_never_disconnects_an_existing_control_connection(self):
+        r,connects=self.runtime();existing=object();r.driver=existing
+        r.disconnect=lambda:self.fail('existing control connection was closed')
+        plugin=PiperStatusCard(r,auto_connect=True)
+        plugin.start();plugin.stop()
+        self.assertIs(r.driver,existing)
+        self.assertEqual(connects,[])
 
 
 if __name__=='__main__':unittest.main()

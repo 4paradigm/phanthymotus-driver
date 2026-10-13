@@ -61,6 +61,11 @@ class PiperStatusCard:
         info = self.monitor.info()
         info["topic_out"] = self.monitor._topics()[:1]
         info["connection_error"] = self._connection_error
+        thread = self._connection_thread
+        info["connection_stopping"] = bool(
+            self._connection_stop.is_set() and thread is not None and thread.is_alive())
+        if info["connection_stopping"]:
+            info["state"] = "stopping"
         return info
 
     def _connect_shared(self):
@@ -72,11 +77,23 @@ class PiperStatusCard:
             if not runtime.closed and not runtime.gate.locked() and runtime.connection_lock.acquire(blocking=False):
                 try:
                     if not self._connection_stop.is_set():
-                        runtime.connected()
+                        previous_driver = runtime.driver
+                        try:
+                            runtime.connected(cancel_event=self._connection_stop)
+                        finally:
+                            # The event may be set just after connected's final
+                            # cancellation check. Roll back only a connection
+                            # created by this worker, while still holding the
+                            # shared connection lock. A control caller cannot
+                            # acquire/use it between creation and rollback.
+                            if (self._connection_stop.is_set() and previous_driver is None
+                                    and runtime.driver is not None):
+                                runtime.disconnect()
                         self._connection_error = None
                         return
                 except Exception as exc:
-                    self._connection_error = str(exc).replace("\n", " ")[:200]
+                    if not self._connection_stop.is_set():
+                        self._connection_error = str(exc).replace("\n", " ")[:200]
                 finally:
                     runtime.connection_lock.release()
             self._connection_stop.wait(2)

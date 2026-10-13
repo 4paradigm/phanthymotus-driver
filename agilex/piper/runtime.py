@@ -249,9 +249,11 @@ class PiperRuntime:
                 self.worker_context.owned = None
                 self.gate.release()
 
-    def connected(self):
+    def connected(self, *, cancel_event=None):
         with self.connection_lock:
             if self.driver is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Connection cancelled")
                 self.data_dir.mkdir(parents=True, exist_ok=True)
                 owner = (self.data_dir / "can-owner.lock").open("a+")
                 try:
@@ -262,7 +264,8 @@ class PiperRuntime:
                     candidate.joint_limits_deg = self.config.get("joint_limits_deg")
                     candidate.gripper_limits_mm = tuple(self.config.get("gripper_limits_mm", (0.,70.)))
                     candidate.connect()
-                    if self.closed or self.cancel.is_set():
+                    if (self.closed or self.cancel.is_set()
+                            or cancel_event is not None and cancel_event.is_set()):
                         candidate.close()
                         raise RuntimeError("Connection cancelled")
                     self.driver, self.owner_file = candidate, owner

@@ -58,6 +58,10 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 使用现有 `ConnectPort(piper_init=False)`；不发送运动、模式、示教或使能指令。
 连接线程不等待动作锁，连接锁忙或有动作时稍后重试；采样器仍只调用安全缓存快照，
 不会等待连接初始化。只读连接失败在 `info.connection_error` 中显示，停止时取消重试。
+停止信号传入 `runtime.connected(cancel_event=...)`，SDK 初始化结束后、共享连接发布前检查取消。
+连接线程在发布后再次检查停止信号，并在共享连接锁内回收本线程刚创建的过期连接，
+不关闭已存在的控制连接。若初始化未在停止等待期内结束，`info.state=stopping`、
+`connection_stopping=true`，禁止新一轮启动；待旧线程完成取消与释放后才恢复 idle。
 诊断用的显式 `read` 分发仍保留兼容，但不出现在画布表单。
 它不调用 `status/read_state`，不获取动作锁、不发送运动、模式或电机命令。
 骨架卡接管原监控插件的采样与模型资源，避免重复注册或发布。
