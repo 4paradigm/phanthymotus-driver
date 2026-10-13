@@ -369,6 +369,10 @@ class LocoServoPlugin:
         self._input_topic = ""
         self._running = False
         self._paused = False
+        # A call-shaped loco.move owns the velocity publisher only after its
+        # own 50 Hz loop is running. Before that, paused servo keeps refreshing
+        # zero so Bumi's non-persistent command cannot revive prior motion.
+        self._explicit_velocity_owner = False
         self._last_command = None
         # Surfaced through ``info`` on every safety transition.  A watchdog
         # hold is not a terminal state: the next fresh command resumes motion,
@@ -600,6 +604,8 @@ class LocoServoPlugin:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             self._paused = bool(halted)
+            if not halted:
+                self._explicit_velocity_owner = False
             # A pause may be caused by a card that changes workmode; clear its
             # displayed status before the next per-command controller read.
             self._invalidate_mode_cache()
@@ -750,12 +756,27 @@ class LocoServoPlugin:
             if not self._running or self._paused:
                 return False
             self._paused = True
+            self._explicit_velocity_owner = False
             # The explicit card may change workmode immediately after this
             # returns. Clear the prior status before the next controller read.
             self._invalidate_mode_cache()
         self._hold()
         print(f"[loco_servo] paused by an explicit command"
               f"{': ' + reason if reason else ''}", flush=True)
+        return True
+
+    def set_explicit_velocity_owner(self, owned: bool) -> bool:
+        """Let ``loco.move`` take/release the 50 Hz velocity publisher.
+
+        Pausing alone is not ownership: posture and preset actions need this
+        card to keep refreshing zero while they change modes.  ``loco.move``
+        calls this only when its own loop is about to publish, preventing zero
+        and motion commands from interleaving on the shared controller.
+        """
+        with self._lock:
+            if not self._paused:
+                return False
+            self._explicit_velocity_owner = bool(owned)
         return True
 
     # ── wiring ───────────────────────────────────────────────────────────────
@@ -852,16 +873,18 @@ class LocoServoPlugin:
         """
         period = 1.0 / REPEAT_HZ
         while not self._repeat_stop.is_set():
-            # Explicit cards own the chassis while they run.  Do not merely
-            # change the standing target to zero here: a 50 Hz zero publisher
-            # interleaved with loco.move's 50 Hz publisher makes a human
-            # command stutter or disappear.  `_hold()` sends one immediate
-            # zero during handoff; after that this thread yields completely.
             with self._lock:
                 paused = self._paused
+                explicit_owner = self._explicit_velocity_owner
                 sink = self._sink
                 target = self._target
-            if not paused:
+            if paused:
+                # A pause is a safe zero-refresh state until an explicit
+                # velocity loop has actually taken ownership.  This matters on
+                # Bumi because publish_cmd is non-persistent.
+                if not explicit_owner and not self._dry_run:
+                    self._publish(*target)
+            else:
                 if sink is not None:
                     self._tick_watchdog(sink)
                 if not self._dry_run:

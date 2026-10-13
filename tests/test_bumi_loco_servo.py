@@ -522,8 +522,8 @@ def test_being_preempted_stops_the_chassis_immediately():
 
 
 
-def test_explicit_preemption_stops_the_repeat_zero_publisher():
-    """Once loco owns the chassis, servo must not interleave zero commands."""
+def test_explicit_preemption_refreshes_zero_until_loco_owns_velocity():
+    """Bumi needs zero refreshes until loco's own 50 Hz loop takes over."""
     loco = FakeLoco()
     card = _card(loco=loco)
     card._running = True
@@ -533,11 +533,17 @@ def test_explicit_preemption_stops_the_repeat_zero_publisher():
         deadline = time.monotonic() + 1.0
         while not loco.published and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert loco.published
         assert card.pause_for_explicit_command("loco.move") is True
-        after_handoff = len(loco.published)
-        time.sleep(0.10)                 # five repeat periods
-        assert len(loco.published) == after_handoff
+        after_pause = len(loco.published)
+        time.sleep(0.10)                 # five repeat periods of zero refresh
+        assert len(loco.published) > after_pause
+        assert set(loco.published[after_pause:]) == {(0.0, 0.0, 0.0)}
+
+        assert card.set_explicit_velocity_owner(True) is True
+        time.sleep(0.03)                 # let an already-entered iteration finish
+        after_owner = len(loco.published)
+        time.sleep(0.10)
+        assert len(loco.published) == after_owner
     finally:
         card._stop_repeat()
 

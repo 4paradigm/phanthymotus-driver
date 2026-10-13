@@ -245,6 +245,11 @@ class StatePlugin:
         self._node = _BumiStateNode(namespace, high_ctrl)
         executor.add_node(self._node)
 
+    def _set_servo_velocity_owner(self, owned: bool) -> None:
+        """Transfer the shared velocity publisher after/before loco.move."""
+        if self._servo is not None:
+            self._servo.set_explicit_velocity_owner(owned)
+
     def get_tools(self) -> list:
         ns = self._namespace
         return [
@@ -360,6 +365,11 @@ class LocoPlugin:
         if self._servo is None:
             return False
         return bool(self._servo.pause_for_explicit_command(reason))
+
+    def _set_servo_velocity_owner(self, owned: bool) -> None:
+        """Transfer the shared velocity publisher after/before loco.move."""
+        if self._servo is not None:
+            self._servo.set_explicit_velocity_owner(owned)
 
     def get_tools(self) -> list:
         return [
@@ -586,16 +596,25 @@ class LocoPlugin:
 
         self._move_stop_event.clear()
         default_cmd = _get_default_cmd()
+        # The servo keeps refreshing zero until this point.  From here until
+        # this move's final zero, this loop is the sole velocity publisher.
+        self._set_servo_velocity_owner(True)
 
         if duration > 0:
             # Timed move
             def _move_timed():
-                end_time = time.monotonic() + duration
-                while not self._move_stop_event.is_set() and time.monotonic() < end_time:
-                    self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
-                    time.sleep(0.02)  # 50 Hz
-                # Stop
-                self._publish_cmd(0, 0, 0, default_cmd, 0)
+                try:
+                    end_time = time.monotonic() + duration
+                    while not self._move_stop_event.is_set() and time.monotonic() < end_time:
+                        self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
+                        time.sleep(0.02)  # 50 Hz
+                finally:
+                    # Stop before returning zero refresh to the paused servo,
+                    # including if the SDK publisher itself raises.
+                    try:
+                        self._publish_cmd(0, 0, 0, default_cmd, 0)
+                    finally:
+                        self._set_servo_velocity_owner(False)
 
             self._move_thread = threading.Thread(target=_move_timed, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -603,11 +622,16 @@ class LocoPlugin:
         else:
             # Continuous move with 5s watchdog
             def _move_continuous():
-                watchdog_end = time.monotonic() + 5.0
-                while not self._move_stop_event.is_set() and time.monotonic() < watchdog_end:
-                    self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
-                    time.sleep(0.02)
-                self._publish_cmd(0, 0, 0, default_cmd, 0)
+                try:
+                    watchdog_end = time.monotonic() + 5.0
+                    while not self._move_stop_event.is_set() and time.monotonic() < watchdog_end:
+                        self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
+                        time.sleep(0.02)
+                finally:
+                    try:
+                        self._publish_cmd(0, 0, 0, default_cmd, 0)
+                    finally:
+                        self._set_servo_velocity_owner(False)
 
             self._move_thread = threading.Thread(target=_move_continuous, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -619,6 +643,7 @@ class LocoPlugin:
             self._move_thread.join(timeout=1)
         if self._high_ctrl is not None:
             self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+        self._set_servo_velocity_owner(False)
         return {"state": "stopped"}
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
@@ -1808,6 +1833,11 @@ class CameraPlugin:
             # consumer's own fallback is conservative and says so.
             print(f"[camera] camera_info for {tool_name} failed: {exc}", flush=True)
             return []
+
+    def _set_servo_velocity_owner(self, owned: bool) -> None:
+        """Transfer the shared velocity publisher after/before loco.move."""
+        if self._servo is not None:
+            self._servo.set_explicit_velocity_owner(owned)
 
     def get_tools(self) -> list:
         return [
