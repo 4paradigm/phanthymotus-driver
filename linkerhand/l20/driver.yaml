@@ -2,7 +2,7 @@ id: linkerhand-l20-driver
 name: LinkerHand L20 Dexterous Hand
 category: driver
 hardware_provider: linkerhand
-hardware_model: "L20"
+hardware_model: "l20"
 image_name: linkerhand-l20
 port: 15710
 mcp_url: "http://localhost:15710/mcp"
