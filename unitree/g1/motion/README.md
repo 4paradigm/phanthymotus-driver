@@ -18,16 +18,18 @@
 
 ## 构建
 
+基础镜像配方位于 `unitree/base/Dockerfile`，与 `dji/base/Dockerfile` 一样放在机型目录的同级。该配方目前供 G1 使用；其他 Unitree 机型沿用各自的基础镜像。
+
 业务镜像使用固定版本的 teleop base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
 
 已发布的 base 可直接拉取，日常业务构建无需执行以下源码构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
 
 ```sh
 docker build --platform linux/arm64 \
-  -f unitree/g1/Dockerfile.base \
+  -f unitree/base/Dockerfile \
   --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   -t bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:YOUR_NEW_TAG \
-  unitree/g1
+  unitree/base
 ```
 
 当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:release.261012.4674297`。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
@@ -48,7 +50,7 @@ docker build --platform linux/arm64 \
 | `collision.py`、`workspace.py`、`visualization.py` | 可选空间检查与诊断数据 |
 | `../arm_stream.py` | 控制权、位置下发、保持与停止 |
 
-主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [Dockerfile.base](../Dockerfile.base) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [构建说明](#构建)。
+主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [基础镜像配方](../../base/Dockerfile) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [构建说明](#构建)。
 
 普通 `pin` wheel 不包含所需 CasADi 绑定。base 从源码启用 `BUILD_WITH_CASADI_SUPPORT`，运行阶段只复制安装产物。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
 
