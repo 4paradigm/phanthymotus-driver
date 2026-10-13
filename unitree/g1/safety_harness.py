@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from timed_motion import TimedMotion, trace_event
+from timed_motion import TimedMotion
 
 
 # The robot has arrived when it is this close to the target. There is no other
@@ -38,24 +38,6 @@ from timed_motion import TimedMotion, trace_event
 # "arrives" at a different distance depending on which process is watching is a
 # bug that gets blamed on the map.
 NAV_ARRIVAL_RADIUS_M = 0.3
-
-
-class _LocoTiming:
-    """Optional diagnostics only; RPC results and exceptions pass through unchanged."""
-
-    def __init__(self):
-        self.enabled = os.environ.get("G1_LOCO_TIMING") == "1"
-
-    def emit(self, stage, **data):
-        if not self.enabled:
-            return
-        try:
-            record = {"stage": stage, "mono_s": time.monotonic(),
-                      "pid": os.getpid(), "thread": threading.get_ident(), **data}
-            print(f"[LocoTiming] {json.dumps(record, default=str)}", flush=True)
-        except Exception:
-            # A diagnostic output failure must not prevent movement or stopping.
-            pass
 
 
 # ── Enums & Data Classes (shared between processes) ──────────────────────────
@@ -151,13 +133,8 @@ class SmartMotionProxy:
         with self._dispatch_lock:
             self._pending[req_id] = result_q
         try:
-            if method == "motion_result":
-                trace_event("query_enqueue", action_id=kwargs.get("action_id"), query_id=req_id)
             self._cmd_queue.put({"method": method, "_req_id": req_id, **kwargs})
             result = result_q.get(timeout=timeout)
-            if method == "motion_result":
-                trace_event("query_received", action_id=kwargs.get("action_id"),
-                            query_id=req_id, status=result.get("status"))
             return result
         except queue.Empty:
             return {"error": f"SmartMotion subprocess timeout ({method})"}
@@ -255,8 +232,6 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     )
 
     # ── Initialize DDS ──
-    trace_event("process_start", component="smart_motion",
-                domain_id=0, network_interface=network_iface)
     ChannelFactoryInitialize(0, network_iface)
     print(f"[SmartMotion:pid={os.getpid()}] DDS initialized on {network_iface}")
 
@@ -304,7 +279,6 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     current_cmd = None  # dict: {vx, vy, vyaw, duration, start_time, end_time}
     nav_cmd = None      # dict: {target_name, target_pose, start_time}
     speed_zone = SpeedZone.NORMAL
-    loco_timing = _LocoTiming()
     motion = None
 
     # Obstacle state (written by LiDAR callback, read by main loop)
@@ -377,7 +351,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             publish_event("nav_stopped", {"reason": "command"})
         return {"status": "stopped"}
 
-    motion = TimedMotion(loco_client, timing=loco_timing, on_stop=on_motion_stop)
+    motion = TimedMotion(loco_client, on_stop=on_motion_stop)
 
     # ── LiDAR DDS Subscription ──
     def on_cloud(msg):
@@ -962,10 +936,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             if method == "move":
                 result = handle_move(cmd["vx"], cmd["vy"], cmd["vyaw"], cmd["duration"], cmd.get("action_id"))
             elif method == "motion_result":
-                trace_event("query_processing", action_id=cmd["action_id"], query_id=cmd.get("_req_id"))
                 result = motion.get_result(cmd["action_id"])
-                trace_event("query_processed", action_id=cmd["action_id"],
-                            query_id=cmd.get("_req_id"), status=result.get("status"))
             elif method == "stop":
                 result = do_stop(cmd.get("reason", "command"))
             elif method == "navigate_to":
