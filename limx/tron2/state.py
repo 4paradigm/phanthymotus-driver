@@ -93,26 +93,39 @@ def battery_state(data):
     cycle_valid = cycle is not None and cycle >= 0 and cycle.is_integer()
     updated = battery_number(data.get('bms_current_updated_at'))
     updated = updated if updated is not None and updated >= 0 else None
-    return {'schema_version': 2,
+    # User-authorized estimate: assume voltage=mV and current=mA. Divide
+    # before multiplying so even finite extreme inputs cannot leak infinity.
+    power = (voltage / 1000) * (current / 1000) \
+        if voltage_valid and current is not None else None
+    power = round(power, 2) if power is not None and math.isfinite(power) else None
+    valid_temperatures = [t for t in temperatures if t is not None]
+    temperature = max(valid_temperatures) if valid_temperatures else None
+    return {'schema_version': 3,
             'soc': soc if soc_valid else None,
             'voltage': voltage if voltage_valid else None,
             'current': current,
-            # Raw BMS scales are not documented. Do not invent watts from them.
-            'power': None, 'power_status': 'unit_conversion_unverified',
-            'temperature': temperatures,
+            'power': power, 'power_status': 'estimated_assuming_mV_mA',
+            'temperature': temperature,
+            'temperature_channels_raw': temperatures,
+            'temperature_policy': 'maximum_valid_raw_channel',
             'cycle': int(cycle) if cycle_valid else None,
             'units': dict(BATTERY_UNITS),
             'validity': {'soc': soc_valid, 'voltage': voltage_valid,
-                         'current': current is not None, 'power': False,
-                         'temperature': [t is not None for t in temperatures],
+                         'current': current is not None, 'power': power is not None,
+                         'temperature': temperature is not None,
+                         'temperature_channels_raw': [t is not None for t in temperatures],
                          'cycle': cycle_valid},
             # Opaque vendor marker: do not subtract it from the host clock.
             'current_updated_at_raw': updated}
 
 
 def battery_stream(sample):
-    """Flat measurements plus diagnostics, including when offline or stale."""
+    """Six readable tiles, with assumptions and raw channels in diagnostics."""
     data = sample['data'] if sample['available'] else battery_state({})
-    return {**data, 'status': {key: sample[key] for key in (
+    status = {key: sample[key] for key in (
         'connected', 'available', 'sample_status', 'received_at',
-        'reception_age_seconds', 'measurement_time_verified')}}
+        'reception_age_seconds', 'measurement_time_verified')}
+    status.update({key: value for key, value in data.items() if key not in BATTERY_FIELDS})
+    return {'soc': data['soc'], 'voltage': data['voltage'], 'current': data['current'],
+            'estimated_power_w': data['power'], 'temperature_raw': data['temperature'],
+            'cycle': data['cycle'], 'status': status}

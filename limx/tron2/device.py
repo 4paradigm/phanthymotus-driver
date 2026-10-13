@@ -11,7 +11,7 @@ from reset import ResetPose
 from state import battery_stream
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.4.7'
+VERSION = '0.4.8'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -19,7 +19,7 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 DESCRIPTIONS = {
     'joint_state': 'TRON2 实时读取关节位置（rad/deg）、速度和力矩；名称缺失时显示索引',
     'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
-    'battery_state': 'TRON2 电量 soc（%）、电压原始值/电流绝对值、五路 temperature 原始值、循环次数 cycle；电流不表示充放电方向；功率单位待确认时为 null；含有效性及消息接收时间（只读）',
+    'battery_state': 'TRON2 电量（%）、电压原始值/电流绝对值、估算功率 estimated_power_w（按 mV/mA 假设）、单个温度原始值 temperature_raw（五路有效值中最高值，非℃）、循环次数；随厂家通知更新，诊断含接收年龄及五路原值（只读）',
     'arm_control': 'TRON2 双臂关节运动控制 — MoveJ 设置双臂 14 个关节目标（rad），头部不参与；响应仅确认受理',
     'reset_pose': 'TRON2 双臂固定姿态复位：preview 只读，execute 使用本机保存的14项目标；start/stop不发送运动，stop不是急停',
 }

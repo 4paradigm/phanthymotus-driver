@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.4.7'
+VERSION = '0.4.8'
 CARDS = {'joint_state', 'robot_status', 'battery_state'}
 
 
@@ -91,11 +91,11 @@ def run_check(timeout=20):
     battery = after['battery_state']['data']
     if set(battery) != {'schema_version', 'soc', 'voltage', 'current', 'power',
                        'temperature', 'cycle', 'units', 'validity',
-                       'power_status', 'current_updated_at_raw'}:
+                       'power_status', 'current_updated_at_raw', 'temperature_channels_raw',
+                       'temperature_policy'}:
         raise ValueError('Unexpected battery fields')
-    if battery['schema_version'] != 2 or len(battery['temperature']) != 5 \
-            or battery['power'] is not None \
-            or battery['power_status'] != 'unit_conversion_unverified':
+    if battery['schema_version'] != 3 or len(battery['temperature_channels_raw']) != 5 \
+            or battery['power_status'] != 'estimated_assuming_mV_mA':
         raise ValueError('Unexpected battery schema, channels or power interpretation')
     print('PASS: three sensor cards; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
@@ -103,8 +103,8 @@ def run_check(timeout=20):
     print('First joint positions (degrees):', values['positions_deg'][:3])
     print('Battery (%):', battery['soc'])
     print('Voltage raw/current magnitude (vendor units unverified):', battery['voltage'], battery['current'])
-    print('Power (units unverified):', battery['power'])
-    print('Five temperature channels (vendor raw units):', battery['temperature'])
+    print('Estimated power (W, assuming mV/mA):', battery['power'])
+    print('Temperature (maximum valid vendor raw channel, not Celsius):', battery['temperature'])
     print('Charge cycles:', battery['cycle'])
     print('Read-only. Measurement timestamp clock is unverified; receipt age is reported separately.')
 
