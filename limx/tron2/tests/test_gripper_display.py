@@ -4,7 +4,6 @@ import json
 import math
 import unittest
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from skeleton import model, JOINT_NAMES
 
 PREFIX='display_hand_gripper_'

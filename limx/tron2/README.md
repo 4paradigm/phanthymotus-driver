@@ -1,6 +1,6 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.11`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.12`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -63,7 +63,7 @@ PR 构建完成后，使用机器人评论给出的新镜像 / Try it 链接部�
 3. Core 信任证书是实际文件。HTTPS 保持证书及主机名验证；`TRON2_AGENT_CORE_URL` 的主机名必须与证书 SAN 匹配。需要时使用证书包含的主机名，并相应调整 Compose 的 `extra_hosts`；不要关闭 TLS 验证。
 4. MCP 端口 15791 未被其他本地原型占用。
 
-通过 WebSocket 采样和显式 MoveJ 调用，不挂载 `/dev`、Docker socket、姿态文件或可写控制目录，也不需要 privileged 或 GPU runtime。容器使用只读根文件系统和临时 `/tmp`；ROS2 日志显式写入 `/tmp/ros-log`；`restart: always`。
+通过 WebSocket 采样和显式 MoveJ 调用，仅将本机保存的home目录只读挂载到`/config/tron2`；不挂载 `/dev`、Docker socket或可写控制目录，也不需要 privileged 或 GPU runtime。容器使用只读根文件系统和临时 `/tmp`；ROS2 日志显式写入 `/tmp/ros-log`；`restart: always`。
 
 如果同机部署过早期复位原型，先备份其文件，再停止旧服务以释放 15791，并在 Motus 设置中移除旧复位服务注册及画布卡片。本驱动注册名称为 **LimX TRON2 Sensors and Arm Control**；不会自动删除旧容器、旧注册或已保存的姿态文件。
 
@@ -78,7 +78,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪，检查Core注册、joint_state骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/reset，也不验证真实运动。
 
-升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、camera、camera_left、camera_right、arm_control五张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
+升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、camera、camera_left、camera_right、arm_control五张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。监控和查看数据流均加载同一model资源；升级后应重新加载组件以更新缓存。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：启用关节时，机器人连接且这些已启用传感器全部有最近接收数据为HTTP 200。可选camera的idle/断流不会阻塞它们或机械臂任务。只启用相机时，所有已启用相机都有最近成功发布的JPEG才就绪，否则为503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
@@ -92,13 +92,11 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 
 测试包含真实本机 HTTP / WebSocket 服务、请求关联及超时、序列号约束、重连、断连清空、过期数据、卡片生命周期、ROS2 JSON 发布的模拟验证和镜像入口布局。测试不驱动实体机器人。
 
-此前现场验证了16项关节值和运动ACK；0.5.0的骨架网页效果和新增reset操作仍需部署后单独验收。0.5.5新增按需头部RGB摄像头，平台画面仍需部署后验收。
+发布后使用check.py核对当前源码版本、骨架与动作声明、Core注册及实时关节；使用--camera核对三路实际DDS图像。该检查不会执行运动，不能代替move/reset的实际动作验收。
 
 ## arm_control 动作
 
-0.5.1修正骨架数据兼容：缺少真实IMU四元数时不再发送imu_quat空数组。升级后重新加载网页/骨架组件，清除旧数据留下的无效根旋转；后续关节反馈仍按原名称应用到URDF。发布回归验证两帧肘角变化，检查脚本同时显示左右肘角，便于区分真实反馈与网页显示问题。机械臂动作仍使用明确验证的MoveJ。
-
-参考现有宇树arm卡片的命名姿态列表与x-action-params参数分组；实际执行仍使用TRON2 MoveJ，不复制宇树动作ID或硬件命令。
+按x-action-params显示每个动作所需参数；实际运动使用厂家TRON2 MoveJ接口。
 
 | ACTION | 参数 | 行为 |
 | --- | --- | --- |
@@ -121,7 +119,7 @@ check.py只调用生命周期/信息和model资源，不执行运动。源码和
 
 MCP用于卡片发现与tools/call请求，ACP（Action Completion Protocol）用于异步动作完成跟踪。
 这是仓库README_dev.md规定的配合方式：保留/mcp、x-completion及唯一action_id，在实际验证结束后POST /api/acp/complete，不能将MCP路由简单改名为ACP。
-平台日志中的MCP_CALL finish是Agent结束当前推理轮次的工具调用，不代表机械臂跳过ACP。三种动作的受理/终态结果均标明completion_protocol=acp。
+平台日志中的MCP_CALL finish是Agent结束当前推理轮次的工具调用，不代表机械臂跳过ACP。move和reset的受理/终态结果均标明completion_protocol=acp。
 
 reset自动复位检查与动作完成跟踪为同一个过程，无需另调verify_at_home。reset的初始结果为reset_verified=false、at_home=null；运动结束后的连续新反馈通过后，ACP completed结果携带reset_verified=true、at_home=true、最大角度误差、容差、样本数和本次home摘要。
 未通过验证时通过ACP报告error、reset_verified=false、at_home=null，并保留错误原因；不能把失联或缺少反馈时的未知位置声称为已复位。复位目标固定为发送时已验证的home，不在动作途中重新加载或覆盖文件。
@@ -136,10 +134,9 @@ reset自动复位检查与动作完成跟踪为同一个过程，无需另调ver
 
 Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺少时执行apt更新/安装；基础镜像已提供的包不重复安装。aiohttp/PyYAML仍由requirements.txt管理，是既有HTTP/WebSocket和配置解析依赖；完成机制只增加Python标准库源码，没有新增pip包、设备权限或资源资产。
 
+## 头部与左右腕RGB摄像头
 
-## 头部与左右腕RGB摄像头（0.5.6）
-
-camera保留0.5.5的头部卡片名称与topic；新增camera_left、camera_right，使用三路独立中继和DDS topic。默认均可发现但进程启动不打开视频连接。刷新Motus，把需要的相机卡片拖到画布，开启智能控制，从监控或查看数据流观看，无需与arm_control连线或填写URL。Core显式start连接对应厂家源，stop只释放该相机连接，info只读，不影响其他相机或关节后台采样。不自动执行任何机械臂、头部、夹爪运动。
+camera、camera_left、camera_right使用三路独立中继和DDS topic。默认均可发现但进程启动不打开视频连接。刷新Motus，把需要的相机卡片拖到画布，开启智能控制，从监控或查看数据流观看，无需与arm_control连线或填写URL。Core显式start连接对应厂家源，stop只释放该相机连接，info只读，不影响其他相机或关节后台采样。不自动执行任何机械臂、头部、夹爪运动。
 
 | 卡片 | 厂家源topic | Motus输出topic | 只读现场尺寸 |
 | --- | --- | --- | --- |
@@ -147,7 +144,7 @@ camera保留0.5.5的头部卡片名称与topic；新增camera_left、camera_righ
 | camera_left（左腕） | /camera/left/color/image_rect_raw/compressed | /limx_tron2/camera_left | 848×480 |
 | camera_right（右腕） | /camera/right/color/image_rect_raw/compressed | /limx_tron2/camera_right | 848×480 |
 
-固定读取同一TRON2_ROBOT_URL主机HTTP59001：`/stream?topic=<表中厂家源>&quality=80&rotate=0`。左右腕使用现场ROS2发布并有连续有效帧的image_rect_raw，不使用当前无有效帧的image_resized或套用头部image_raw名称。厂家的camera_service状态不是每路实时帧证据；话题存在/有发布者也不能代替实际帧验收。保留厂家left/right标识，现场可分别在对应镜头前放纸核对左右画面，不发运动命令。
+固定读取同一TRON2_ROBOT_URL主机HTTP59001：`/stream?topic=<表中厂家源>&quality=80&rotate=0`。左右腕使用现场ROS2发布并有连续有效帧的image_rect_raw，不将其他话题名称套用到这三路源。厂家的camera_service状态不是每路实时帧证据；话题存在/有发布者也不能代替实际帧验收。保留厂家left/right标识，现场可分别在对应镜头前放纸核对左右画面，不发运动命令。
 
 只接入三路RGB，不发布depth/标定/metadata，不支持PTZ、录制或调用者指定URL/topic。原始JPEG不解码转码，复用既有aiohttp与ROS sensor_msgs/CompressedImage，声明image/jpeg供平台现有CameraRenderer显示。每路header.frame_id分别为tron2_head_camera、tron2_left_wrist_camera、tron2_right_wrist_camera；stamp是中继接收/发布时间，不是已验证的厂家测量时钟。原有Core和loopback domain42总线配置不变。
 

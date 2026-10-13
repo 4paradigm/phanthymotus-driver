@@ -1,7 +1,6 @@
 """Bounded feedback completion, exclusive arm ownership, and actual ACP HTTP."""
 import asyncio
 import hashlib
-import math
 import json
 import os
 from pathlib import Path

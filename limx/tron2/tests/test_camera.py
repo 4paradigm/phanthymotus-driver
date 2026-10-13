@@ -14,7 +14,7 @@ from aiohttp import web
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import camera
-from camera import HeadCamera, TOPIC, CAMERA_SOURCES, jpeg_size
+from camera import CameraStream, TOPIC, CAMERA_SOURCES, jpeg_size
 from device import Adapter
 import ros2
 
@@ -49,7 +49,7 @@ class CameraTests(unittest.IsolatedAsyncioTestCase):
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
         self.url = f'http://127.0.0.1:{port}/stream'
-        self.camera = HeadCamera(self.url,lambda topic,data:self.published.append((topic,data)),self.session)
+        self.camera = CameraStream(self.url,lambda topic,data:self.published.append((topic,data)),self.session)
         self.timing = patch.multiple(camera, FRAME_TIMEOUT=.12, START_TIMEOUT=.35)
         self.timing.start()
 

@@ -1,4 +1,4 @@
-"""Publish sensor JSON and head JPEGs to Motus's loopback ROS2 bus."""
+"""Publish sensor JSON and three RGB JPEG streams to Motus's loopback ROS2 bus."""
 import json
 import os
 from pathlib import Path

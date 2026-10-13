@@ -6,7 +6,7 @@ hardware_model: tron2
 image_name: limx-tron2
 port: 15791
 mcp_url: "http://localhost:15791/mcp"
-description: "TRON2 头部/左右腕RGB相机、实时骨架与左右夹爪轮廓、双臂MoveJ/命名姿态/复位；含骨架URDF资源"
+description: "TRON2 头部/左右腕RGB相机、实时骨架与默认闭合夹爪示意、双臂MoveJ与自动验证复位；含骨架URDF资源"
 build_context_extras:
   - ../../common
 cards:

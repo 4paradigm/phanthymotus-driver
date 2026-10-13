@@ -194,7 +194,3 @@ class CameraStream:
                 self.error = type(exc).__name__
                 self.unavailable()
                 await asyncio.sleep(1)
-
-
-# Preserve the 0.5.5 read-only diagnostic import; all sources use the same relay.
-HeadCamera = CameraStream

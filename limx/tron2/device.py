@@ -14,7 +14,7 @@ from completion import ArmCompletion, ACP_TIMEOUT
 from camera import CameraStream, CAMERA_SOURCES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.11'
+VERSION = '0.5.12'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
