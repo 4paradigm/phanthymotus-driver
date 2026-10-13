@@ -1,12 +1,12 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供三张持续更新的传感器卡片和两张显式运动执行卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.6`；MCP 仅监听 `127.0.0.1:15791`。
+为 Phanthy Motus 提供三张持续更新的传感器卡片和两张显式运动执行卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.7`；MCP 仅监听 `127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 关节位置 `q`（rad）、`positions_deg`（度）、厂家返回的 `dq` / `tau` | `/limx_tron2/joint_state` |
 | `robot_status` | sensor | 工作模式、固件版本、IMU / 电机 / 相机等状态 | `/limx_tron2/robot_status` |
-| `battery_state` | sensor | 电量、电压、电流、功率和单路温度原始字段（缩放未核实） | `/limx_tron2/battery_state` |
+| `battery_state` | sensor | 电量、电压/电流原始值、五路温度原始值、循环次数、有效性与接收时间；功率单位未确认时为null | `/limx_tron2/battery_state` |
 | `arm_control` | actuator | 双臂14项角度目标（rad），显式 MoveJ | 无 |
 | `reset_pose` | actuator | 从本机保存姿态读取固定双臂目标，预览/执行/到位检查 | 无 |
 
@@ -18,19 +18,34 @@
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
-- 电池发布五项平铺字段 `soc/voltage/current/power/temp`。本次机械臂修复沿用已有电池实现：voltage/current/temp 为厂家原始数值，power 使用已有公式；其物理单位和缩放尚未验证，不能据此宣称准确瓦数或摄氏度。此问题待单独修正；本次没有改变电池换算。
+- 电池测量字段为 `soc/voltage/current/power/temperature/cycle`，数据schema版本为2。`soc`为百分比；`voltage/current/temperature`保留厂家原始数值，通过`units`明确标记`vendor_raw_unverified`。`temperature`固定五项，对应`bms_temp1`至`bms_temp5`，无效通道保留`null`，不能过滤后改变通道顺序。`cycle`来自`bms_charging_cycle`，只接受非负整数；没有厂家数据的SOH、电芯电压和充放电状态不推测或补造。
+- 未确认电压和电流的缩放时，`power: null`、`power_status: unit_conversion_unverified`、`validity.power: false`。移除原来的`voltage*current/1000`公式；若两者后来被确认分别是mV和mA，瓦数应除以1000000，但当前没有启用此假设。`units.power`表示目标单位W，不代表已经有有效瓦数。不能用电池电流推算外接电源供电时的整机耗电，也不能仅凭电流符号推测充放电状态。
+- `validity`提供各测量字段及五路温度通道的有效性。有效原始0保留为0，缺失、无效和非有限数值为null；数据有效不等于厂家单位或测量时间已验证。
 - 厂家的 `UNKNOW` 等状态字符串原样保留；缺失字段为 `null`。
-- 关节和设备状态数据包包含 `connected`、`available`、`sample_status`、`received_at` 和 `reception_age_seconds`；电池卡片的 `info.sample` 同样保留这些诊断字段。接收年龄使用主机单调时钟计算；`received_at` 是主机接收时的 Unix 秒数，只表示整条通知的接收年龄，不能证明其中电流字段的采样年龄。
+- 关节和设备状态数据包包含 `connected`、`available`、`sample_status`、`received_at` 和 `reception_age_seconds`；电池发布包将这些信息放在`status`中，`info.sample`保留原有诊断封装。接收年龄使用主机单调时钟计算；`received_at` 是主机接收时的 Unix 秒数，只表示整条通知的接收年龄，不能证明其中电流或温度字段的采样年龄。`current_updated_at_raw`保留厂家`bms_current_updated_at`的非负有限原始标记；没有验证其时钟，因此不与主机时间相减，不标成测量年龄。消息接收新鲜且`available: true`也不意味着所有测量字段都有效或更新了。
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
-- 默认超过 5 秒没有收到对应数据则 `available: false`、`sample_status: stale`、`data: null`。断连时立即清空缓存，再尝试重连；不会继续显示旧关节值。电池数据流断连或过期时仍只含五个字段，全部为 `null`；具体原因通过该卡片 `info` 或 `/health` 查看。
+- 默认超过 5 秒没有收到对应数据则 `available: false`、`sample_status: stale`、`data: null`。断连时立即清空缓存，再尝试重连；不会继续显示旧关节值。电池发布包断连或过期时清空所有测量值，五路温度为`[null,null,null,null,null]`，有效性全部为false；保留`units`及`status`以显示具体原因，清空旧电流更新标记。
 
 电池卡片“查看数据流”示例（电压、电流单位待厂家确认，示例不是实时测量）：
 
 ```json
-{"soc": 85, "voltage": 52650, "current": -70, "power": -3685.5, "temp": 94}
+{
+  "schema_version": 2,
+  "soc": 85,
+  "voltage": 52650,
+  "current": -70,
+  "power": null,
+  "power_status": "unit_conversion_unverified",
+  "temperature": [74, 64, 74, 104, 94],
+  "cycle": 22,
+  "units": {"soc": "%", "voltage": "vendor_raw_unverified", "current": "vendor_raw_unverified", "power": "W", "temperature": "vendor_raw_unverified", "cycle": "count"},
+  "validity": {"soc": true, "voltage": true, "current": true, "power": false, "temperature": [true, true, true, true, true], "cycle": true},
+  "current_updated_at_raw": 1791780203689,
+  "status": {"connected": true, "available": true, "sample_status": "recently_received", "received_at": 1791780232.899, "reception_age_seconds": 0.398, "measurement_time_verified": false}
+}
 ```
 
-0.4.3 的电池发布格式有变更：消费端应使用 `soc` 代替 `data.battery_percent`，直接读取 `voltage` / `current`。MCP `info` 仍返回诊断封装，其中 `sample.data` 使用新字段。关节和设备状态的发布结构、三张卡片名称和 topic 均保留。
+0.4.7的电池schema v2将单路`temp`替换为五路`temperature`，增加`cycle/units/validity/current_updated_at_raw/status`并暂停未经确认的功率计算。消费端继续直接读取`soc/voltage/current/power`，温度消费者需要改为读取数组；MCP `info.sample.data`包含测量字段及单位/有效性信息，诊断仍在`info.sample`。0.4.3以前使用`data.battery_percent`的消费端应读取`soc`。关节和设备状态的发布结构、三张卡片名称和topic均保留。
 
 卡片的 `start` / `stop` 是单实例常开传感器的生命周期兼容调用，不启动或停止机器人，也不停止后台采样。`info` 返回该传感器的当前状态和缓存，不额外发送机器人请求。驱动提供三张 sensor 及 arm_control/reset_pose actuator，不提供缓存聚合 resource 或助手卡片。
 

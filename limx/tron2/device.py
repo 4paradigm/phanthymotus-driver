@@ -8,10 +8,10 @@ import aiohttp
 from aiohttp import web
 from vendor import RobotReader, validate_movej, reject_constant
 from reset import ResetPose
-from state import BATTERY_FIELDS
+from state import battery_stream
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.4.6'
+VERSION = '0.4.7'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -19,7 +19,7 @@ TOPICS = {name: '/limx_tron2/' + name for name in
 DESCRIPTIONS = {
     'joint_state': 'TRON2 实时读取关节位置（rad/deg）、速度和力矩；名称缺失时显示索引',
     'robot_status': 'TRON2 模式、固件与 IMU/电机/相机状态（只读）',
-    'battery_state': 'TRON2 电量 soc（%）、电压 voltage（mV）、电流 current（mA）、功率 power（W）、温度 temp（℃）；单位未确认时相关字段为 null（只读）',
+    'battery_state': 'TRON2 电量 soc（%）、电压/电流原始值、五路 temperature 原始值、循环次数 cycle；功率单位待确认时为 null；含有效性及消息接收时间（只读）',
     'arm_control': 'TRON2 双臂关节运动控制 — MoveJ 设置双臂 14 个关节目标（rad），头部不参与；响应仅确认受理',
     'reset_pose': 'TRON2 双臂固定姿态复位：preview 只读，execute 使用本机保存的14项目标；start/stop不发送运动，stop不是急停',
 }
@@ -178,11 +178,10 @@ class Adapter:
     async def publish_loop(self):
         while True:
             for name, data in self.snapshot().items():
-                # Compact battery stream, like Unitree's flat BMS display.
-                # Detailed connection/receipt metadata remains available via info.
+                # Keep flat battery measurements; expose validity/receipt age
+                # instead of making a fresh notification imply fresh BMS data.
                 if name == 'battery_state':
-                    data = data['data'] if data['available'] else \
-                        dict.fromkeys(BATTERY_FIELDS)
+                    data = battery_stream(data)
                 self.publish(TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 
