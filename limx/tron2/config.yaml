@@ -8,7 +8,6 @@ robot:
   stale_after_seconds: 5
 plugins:
   joint_state: {enabled: true}
-  battery_state: {enabled: true}
   arm_control: {enabled: true}
   camera: {enabled: true}
   camera_left: {enabled: true}

@@ -6,8 +6,8 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.7'
-CARDS = {'joint_state', 'battery_state'}
+VERSION = '0.5.8'
+CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
 
@@ -101,7 +101,7 @@ def run_check(timeout=20, camera=False):
     names = {tool['name'] for tool in tools}
     expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
-        raise ValueError('Expected two JSON/skeleton sensors, optional camera/arm_control and model resource')
+        raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
     for name, camera_tool in camera_tools.items():
         if camera_tool['topic_out'] != [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}] \
@@ -163,25 +163,11 @@ def run_check(timeout=20, camera=False):
     skeleton_data = skeleton_stream(joint)
     if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != 16:
         raise ValueError('Unsupported skeleton joint layout or names')
-    battery = after['battery_state']['data']
-    if set(battery) != {'schema_version', 'soc', 'voltage', 'current', 'power',
-                       'temperature', 'cycle', 'units', 'validity',
-                       'power_status', 'current_updated_at_raw', 'temperature_channels_raw',
-                       'temperature_policy'}:
-        raise ValueError('Unexpected battery fields')
-    if battery['schema_version'] != 3 or len(battery['temperature_channels_raw']) != 5 \
-            or battery['power_status'] != 'estimated_assuming_mV_mA':
-        raise ValueError('Unexpected battery schema, channels or power interpretation')
-    print('PASS: two sensors, skeleton/model with fixed gripper outlines and move/pose/reset with ACP completion; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: skeleton/model with fixed gripper outlines and move/pose/reset with ACP completion; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
     print('Left/right elbow feedback (degrees):', values['positions_deg'][3], values['positions_deg'][10])
-    print('Battery (%):', battery['soc'])
-    print('Voltage raw/current magnitude (vendor units unverified):', battery['voltage'], battery['current'])
-    print('Estimated power (W, assuming mV/mA):', battery['power'])
-    print('Temperature (maximum valid vendor raw channel, not Celsius):', battery['temperature'])
-    print('Charge cycles:', battery['cycle'])
     if camera:
         if not camera_tools:
             raise ValueError('Camera card is not enabled')

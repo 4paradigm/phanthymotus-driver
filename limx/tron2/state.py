@@ -5,10 +5,6 @@ STATUS_FIELDS = ('imu', 'camera', 'motor', 'sw_version', 'status',
                  'tele_operation', 'working_mode', 'working_mode_valid',
                  'collision_enable', 'collision_enable_valid',
                  'compliant_enable', 'compliant_enable_valid')
-BATTERY_FIELDS = ('soc', 'voltage', 'current', 'power', 'temperature', 'cycle')
-BATTERY_UNITS = {'soc': '%', 'voltage': 'vendor_raw_unverified',
-                 'current': 'vendor_raw_unverified', 'power': 'W',
-                 'temperature': 'vendor_raw_unverified', 'cycle': 'count'}
 
 
 def vector(value, count, field):
@@ -64,68 +60,3 @@ def select_fields(data, fields):
         else:
             raise ValueError('Invalid status value: ' + key)
     return result
-
-
-def battery_number(raw):
-    """Parse a finite vendor number without guessing its physical unit."""
-    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
-        return None
-    try:
-        value = float(raw)
-    except (ValueError, OverflowError):
-        return None
-    return value if math.isfinite(value) else None
-
-
-def battery_state(data):
-    soc = battery_number(data.get('battery'))
-    voltage = battery_number(data.get('bms_voltage'))
-    # Invalid or unverified current must not be presented as a real zero.
-    current = battery_number(data.get('bms_current')) \
-        if data.get('bms_current_valid') is True else None
-    # User-facing current is magnitude only; preserve missing/invalid as null.
-    current = abs(current) if current is not None else None
-    soc_valid = soc is not None and 0 <= soc <= 100
-    voltage_valid = voltage is not None and voltage >= 0
-    # Keep fixed channel order; missing/invalid channels must not shift indices.
-    temperatures = [battery_number(data.get('bms_temp' + str(i))) for i in range(1, 6)]
-    cycle = battery_number(data.get('bms_charging_cycle'))
-    cycle_valid = cycle is not None and cycle >= 0 and cycle.is_integer()
-    updated = battery_number(data.get('bms_current_updated_at'))
-    updated = updated if updated is not None and updated >= 0 else None
-    # User-authorized estimate: assume voltage=mV and current=mA. Divide
-    # before multiplying so even finite extreme inputs cannot leak infinity.
-    power = (voltage / 1000) * (current / 1000) \
-        if voltage_valid and current is not None else None
-    power = round(power, 2) if power is not None and math.isfinite(power) else None
-    valid_temperatures = [t for t in temperatures if t is not None]
-    temperature = max(valid_temperatures) if valid_temperatures else None
-    return {'schema_version': 3,
-            'soc': soc if soc_valid else None,
-            'voltage': voltage if voltage_valid else None,
-            'current': current,
-            'power': power, 'power_status': 'estimated_assuming_mV_mA',
-            'temperature': temperature,
-            'temperature_channels_raw': temperatures,
-            'temperature_policy': 'maximum_valid_raw_channel',
-            'cycle': int(cycle) if cycle_valid else None,
-            'units': dict(BATTERY_UNITS),
-            'validity': {'soc': soc_valid, 'voltage': voltage_valid,
-                         'current': current is not None, 'power': power is not None,
-                         'temperature': temperature is not None,
-                         'temperature_channels_raw': [t is not None for t in temperatures],
-                         'cycle': cycle_valid},
-            # Opaque vendor marker: do not subtract it from the host clock.
-            'current_updated_at_raw': updated}
-
-
-def battery_stream(sample):
-    """Six readable tiles, with assumptions and raw channels in diagnostics."""
-    data = sample['data'] if sample['available'] else battery_state({})
-    status = {key: sample[key] for key in (
-        'connected', 'available', 'sample_status', 'received_at',
-        'reception_age_seconds', 'measurement_time_verified')}
-    status.update({key: value for key, value in data.items() if key not in BATTERY_FIELDS})
-    return {'soc': data['soc'], 'voltage': data['voltage'], 'current': data['current'],
-            'estimated_power_w': data['power'], 'temperature_raw': data['temperature'],
-            'cycle': data['cycle'], 'status': status}

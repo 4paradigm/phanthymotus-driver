@@ -10,22 +10,20 @@ from aiohttp import web
 from vendor import RobotReader, validate_movej, reject_constant
 from reset import ResetPose, POSES
 from skeleton import skeleton_stream, model
-from state import battery_stream
 from completion import ArmCompletion, ACP_TIMEOUT
 from camera import CameraStream, CAMERA_SOURCES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.7'
+VERSION = '0.5.8'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
-          ('joint_state', 'battery_state')}
+          ('joint_state',)}
 DESCRIPTIONS = {
     'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
     'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'camera_right': 'TRON2 右腕RGB实时画面；厂家right校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'joint_state': 'TRON2 双臂与头部16关节实时骨架，左右夹爪轮廓随手腕运动；夹爪为静态开合示意，未接入开合反馈；原始rad/deg及速度力矩可通过info查看',
-    'battery_state': 'TRON2 电量（%）、电压原始值/电流绝对值、估算功率 estimated_power_w（按 mV/mA 假设）、单个温度原始值 temperature_raw（五路有效值中最高值，非℃）、循环次数；随厂家通知更新，诊断含接收年龄及五路原值（只读）',
     'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，pose命名姿态，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；reset自动验证自然垂下复位，三个动作均通过ACP报告完成',
 }
 
@@ -81,14 +79,6 @@ class Adapter:
         LOG.warning('Arm completion delivery failed; local motion owner retained')
         return False
 
-    def _battery_tool(self):
-        """Battery sensor — empty inputSchema, auto-publishes via topic_out (Unitree pattern)."""
-        return {'name': 'battery_state', 'type': 'sensor', 'multiInstance': False,
-            'description': DESCRIPTIONS['battery_state'],
-            'inputSchema': {'type': 'object', 'additionalProperties': False,
-                'properties': {'action': {'type': 'string', 'enum': ['info', 'start', 'stop']}, **metadata_properties()}},
-            'topic_out': [{'topic': TOPICS['battery_state'], 'format': 'data/json'}]}
-
     def _arm_control_tool(self):
         """Arm actuator — movej joint-space motion control."""
         return {
@@ -133,9 +123,6 @@ class Adapter:
 
     def tools(self):
         tools = []
-        # Battery card uses Unitree pattern: no action required, auto-publish
-        if 'battery_state' in self.enabled:
-            tools.append(self._battery_tool())
         if 'arm_control' in self.enabled:
             tools.append(self._arm_control_tool())
         for name in CAMERA_SOURCES:
@@ -148,7 +135,7 @@ class Adapter:
                                    **metadata_properties()}},
                 'topic_out': [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}]})
         for name in self.enabled:
-            if name in ('battery_state', 'arm_control') or name in CAMERA_SOURCES:
+            if name == 'arm_control' or name in CAMERA_SOURCES:
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -193,15 +180,6 @@ class Adapter:
             if action not in ('info', 'start', 'stop'):
                 raise ValueError('Unsupported camera action')
             return self.cameras[name].info()  # Lifecycle I/O is awaited in the RPC path.
-        if name == 'battery_state':
-            # Battery card: only 'info' returns sample data; start/stop are no-ops
-            if action not in ('info', 'start', 'stop'):
-                raise ValueError('Unsupported sensor action')
-            result = {'state': 'idle' if action == 'stop' else 'running', 'read_only': True,
-                      'always_on': True, 'topic_out': [{'topic': TOPICS[name], 'format': 'sensor/skeleton' if name == 'joint_state' else 'data/json'}]}
-            if action == 'info':
-                result['sample'] = self.reader.sample(name)
-            return result
         if name == 'arm_control':
             if action in ('start', 'stop'):
                 return {'state': 'ready' if action == 'start' else 'idle',
@@ -246,12 +224,7 @@ class Adapter:
     async def publish_loop(self):
         while True:
             for name, data in self.snapshot().items():
-                # Keep flat battery measurements; expose validity/receipt age
-                # instead of making a fresh notification imply fresh BMS data.
-                if name == 'battery_state':
-                    data = battery_stream(data)
-                elif name == 'joint_state':
-                    data = skeleton_stream(data)
+                data = skeleton_stream(data)
                 self.publish(TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 

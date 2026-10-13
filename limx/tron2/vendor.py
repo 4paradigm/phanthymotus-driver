@@ -7,7 +7,7 @@ import time
 import uuid
 
 import aiohttp
-from state import joint_state, select_fields, STATUS_FIELDS, battery_state
+from state import joint_state, select_fields, STATUS_FIELDS
 
 
 def reject_constant(value):
@@ -88,7 +88,6 @@ class RobotReader:
             raise ValueError('Robot information serial mismatch')
         # Validate only published fields; do not expose unrelated vendor payloads.
         select_fields(data, STATUS_FIELDS)
-        battery_state(data)
         self.serial = serial
         self.info, self.info_at, self.info_received = data, time.monotonic(), time.time()
         self.connected, self.last_error = True, None
@@ -177,6 +176,8 @@ class RobotReader:
                 future.exception()  # retrieve a disconnect exception even if send failed
 
     def sample(self, name):
+        if name not in ('joint_state', 'robot_status'):
+            raise ValueError('Unknown sensor')
         info_card = name != 'joint_state'
         at = self.info_at if info_card else self.joints_at
         received = self.info_received if info_card else self.joints_received
@@ -191,8 +192,6 @@ class RobotReader:
                 data = self.joints
             elif name == 'robot_status':
                 data = select_fields(self.info, STATUS_FIELDS)
-            elif name == 'battery_state':
-                data = battery_state(self.info)
             else:
                 raise ValueError('Unknown sensor')
         return {'schema_version': 1, 'accid': self.serial, 'read_only': True, 'connected': self.connected,

@@ -38,8 +38,7 @@ def settings(**updates):
 def info(serial='TEST_TRON2A'):
     return {'title': 'notify_robot_info', 'accid': serial,
             'data': {'imu': 'OK', 'motor': 'OK', 'camera': 'UNKNOW',
-                     'working_mode': 'controller_mode', 'battery': '85',
-                     'bms_voltage': '52650', 'bms_temp1': '94'}}
+                     'working_mode': 'controller_mode'}}
 
 
 def joints(**updates):
@@ -115,92 +114,10 @@ class StateTests(unittest.TestCase):
         self.assertEqual(data['working_mode'], 'controller_mode')
         self.assertIsNone(data['sw_version'])
 
-    def test_battery_estimated_power_and_single_temperature(self):
-        source = info()['data']
-        source.update(bms_current='-70', bms_current_valid=True, power=99,
-                      bms_temp1='74', bms_temp2='64', bms_temp3='74',
-                      bms_temp4='104', bms_temp5='94', bms_charging_cycle='22',
-                      bms_current_updated_at=1791780203689)
-        data = state.battery_state(source)
-        self.assertEqual(data['schema_version'], 3)
-        self.assertEqual({key: data[key] for key in state.BATTERY_FIELDS},
-                         {'soc': 85, 'voltage': 52650, 'current': 70,
-                          'power': 3.69, 'temperature': 104, 'cycle': 22})
-        self.assertEqual(data['power_status'], 'estimated_assuming_mV_mA')
-        self.assertEqual(data['units']['temperature'], 'vendor_raw_unverified')
-        self.assertEqual(data['units']['voltage'], 'vendor_raw_unverified')
-        self.assertEqual(data['units']['current'], 'vendor_raw_unverified')
-        self.assertEqual(data['validity'], {'soc': True, 'voltage': True,
-                         'current': True, 'power': True,
-                         'temperature': True, 'temperature_channels_raw': [True]*5, 'cycle': True})
-        self.assertEqual(data['current_updated_at_raw'], 1791780203689)
-        self.assertNotIn('temp', data)
-        for raw in ('UNKNOW', '101', '-1', None, True, 'nan'):
-            with self.subTest(raw=raw):
-                self.assertIsNone(state.battery_state({'battery': raw})['soc'])
 
-    def test_battery_invalid_missing_and_nonfinite_values_are_null(self):
-        for raw in (None, True, {}, [], 'UNKNOW', 'nan', 'inf', math.inf, 10**400):
-            with self.subTest(raw=raw):
-                data = state.battery_state({'battery': raw,
-                    'bms_voltage': raw, 'bms_current': raw, 'bms_current_valid': True,
-                    'bms_charging_cycle': raw,
-                    **{'bms_temp'+str(i): raw for i in range(1, 6)}})
-                self.assertEqual({key: data[key] for key in state.BATTERY_FIELDS},
-                    {'soc': None, 'voltage': None, 'current': None, 'power': None,
-                     'temperature': None, 'cycle': None})
-                self.assertFalse(data['validity']['current'])
-                self.assertEqual(data['validity']['temperature_channels_raw'], [False]*5)
-                json.dumps(data, allow_nan=False)
-        for valid in (False, None, 'true', 1):
-            self.assertIsNone(state.battery_state({'bms_current': '70',
-                'bms_current_valid': valid})['current'])
-        self.assertIsNone(state.battery_state({'bms_voltage': '-1'})['voltage'])
-        for raw, expected in ((0, 0), (-0.0, 0), ('-2620', 2620), ('2620', 2620), (-2.5, 2.5)):
-            with self.subTest(current=raw):
-                self.assertEqual(state.battery_state({'bms_current': raw,
-                    'bms_current_valid': True})['current'], expected)
 
-    def test_battery_temperature_channels_keep_zero_missing_and_negative_raw_values(self):
-        data = state.battery_state({'bms_temp1': 0, 'bms_temp2': 'UNKNOW',
-                                   'bms_temp4': '-2', 'bms_temp5': '104'})
-        self.assertEqual(data['temperature_channels_raw'], [0, None, None, -2, 104])
-        self.assertEqual(data['temperature'], 104)
-        self.assertEqual(data['validity']['temperature_channels_raw'], [True, False, False, True, True])
-        for value in (-1, '1.5', True, None, 'nan'):
-            self.assertIsNone(state.battery_state({'bms_charging_cycle': value})['cycle'])
-        self.assertEqual(state.battery_state({'bms_charging_cycle': '0'})['cycle'], 0)
 
-    def test_estimate_uses_milli_scales_and_magnitude_without_fabricating_missing_values(self):
-        data = state.battery_state({'bms_voltage': 53530, 'bms_current': -2740,
-                                    'bms_current_valid': True})
-        self.assertEqual(data['power'], 146.67)
-        self.assertEqual(data['power_status'], 'estimated_assuming_mV_mA')
-        for source in ({'bms_voltage': 53530},
-                       {'bms_voltage': 53530, 'bms_current': 0, 'bms_current_valid': False},
-                       {'bms_current': 2740, 'bms_current_valid': True},
-                       {'bms_voltage': 1e308, 'bms_current': 1e308, 'bms_current_valid': True}):
-            with self.subTest(source=source):
-                data = state.battery_state(source)
-                self.assertIsNone(data['power'])
-                self.assertFalse(data['validity']['power'])
-                json.dumps(data, allow_nan=False)
 
-    def test_battery_current_update_marker_is_opaque_not_host_measurement_time(self):
-        # Even a tiny, very old or future-looking marker is not a verified clock.
-        for stamp in (1, 1791780203689, 9999999999999):
-            data = state.battery_state({'bms_current': '70', 'bms_current_valid': True,
-                                       'bms_current_updated_at': stamp})
-            sample = {'data': data, 'connected': True, 'available': True,
-                      'sample_status': 'recently_received', 'received_at': 20,
-                      'reception_age_seconds': .1, 'measurement_time_verified': False}
-            packet = state.battery_stream(sample)
-            self.assertEqual(packet['status']['current_updated_at_raw'], stamp)
-            self.assertEqual(packet['status']['reception_age_seconds'], .1)
-            self.assertFalse(packet['status']['measurement_time_verified'])
-            self.assertNotIn('measurement_age_seconds', packet['status'])
-        for stamp in (None, -1, True, 'nan', {}, 10**400):
-            self.assertIsNone(state.battery_state({'bms_current_updated_at': stamp})['current_updated_at_raw'])
 
 
 class CacheTests(unittest.TestCase):
@@ -236,7 +153,7 @@ class CacheTests(unittest.TestCase):
         self.reader.joints = state.joint_state(joints())
         self.reader.joints_at, self.reader.joints_received = time.monotonic(), time.time()
         self.reader.disconnect('Disconnected')
-        for card in ('joint_state', 'battery_state'):
+        for card in ('joint_state', 'robot_status'):
             self.assertFalse(self.reader.sample(card)['available'])
             self.assertIsNone(self.reader.sample(card)['data'])
         self.assertIsNone(self.reader.info)
@@ -260,8 +177,8 @@ class CacheTests(unittest.TestCase):
             reader.accept_info(info('OTHER'))
 
 
-class BatteryPublicationTests(unittest.IsolatedAsyncioTestCase):
-    async def first_packet(self, adapter, expected_topic=TOPICS['battery_state']):
+class JointPublicationTests(unittest.IsolatedAsyncioTestCase):
+    async def first_packet(self, adapter, expected_topic=TOPICS['joint_state']):
         ready = asyncio.Event()
         packets = []
         def capture(topic, data):
@@ -277,55 +194,8 @@ class BatteryPublicationTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
         return packets[0]
 
-    async def test_live_battery_publication_has_all_channels_cycle_and_validity(self):
-        adapter = Adapter(lambda *args: None, settings(enabled_cards=['battery_state']))
-        body = info()
-        body['data'].update(bms_current=0, bms_current_valid=True, bms_charging_cycle='22',
-            **{'bms_temp'+str(i): i*10 for i in range(1, 6)})
-        adapter.reader.accept_info(body)
-        packet = await self.first_packet(adapter)
-        self.assertEqual(packet['temperature_raw'], 50)
-        self.assertEqual(packet['cycle'], 22)
-        self.assertEqual(packet['current'], 0)
-        self.assertTrue(packet['status']['validity']['current'])
-        self.assertEqual(packet['estimated_power_w'], 0)
-        self.assertTrue(packet['status']['validity']['power'])
-        self.assertTrue(packet['status']['available'])
-        self.assertFalse(packet['status']['measurement_time_verified'])
-        self.assertEqual(packet['status']['schema_version'], 3)
 
-    async def test_repeated_bms_marker_does_not_become_verified_measurement_time(self):
-        adapter = Adapter(lambda *args: None, settings(enabled_cards=['battery_state']))
-        body = info()
-        body['data'].update(bms_current='-70', bms_current_valid=True, bms_current_updated_at=123)
-        adapter.reader.accept_info(body)
-        adapter.reader.info_at = time.monotonic()-10
-        # A new notification repeats exactly the same BMS update marker.
-        adapter.reader.accept_info(body)
-        packet = await self.first_packet(adapter)
-        self.assertEqual(packet['current'], 70)
-        self.assertEqual(packet['status']['current_updated_at_raw'], 123)
-        self.assertLess(packet['status']['reception_age_seconds'], 1)
-        self.assertTrue(packet['status']['available'])
-        self.assertFalse(packet['status']['measurement_time_verified'])
-        self.assertNotIn('measurement_age_seconds', packet)
 
-    async def test_new_notifications_refresh_temperature_and_estimated_power(self):
-        adapter = Adapter(lambda *args: None, settings(enabled_cards=['battery_state']))
-        body = info()
-        body['data'].update(bms_voltage=53530, bms_current=-2740, bms_current_valid=True,
-                            bms_temp1=54, bms_temp2=54, bms_temp3=54, bms_temp4=84, bms_temp5=84)
-        adapter.reader.accept_info(body)
-        before = await self.first_packet(adapter)
-        body['data'].update(bms_current=-2000, bms_temp4=85)
-        adapter.reader.accept_info(body)
-        after = await self.first_packet(adapter)
-        self.assertEqual(before['temperature_raw'], 84)
-        self.assertEqual(after['temperature_raw'], 85)
-        self.assertEqual(before['estimated_power_w'], 146.67)
-        self.assertEqual(after['estimated_power_w'], 107.06)
-        self.assertGreater(after['status']['received_at'], before['status']['received_at'])
-        self.assertFalse(after['status']['measurement_time_verified'])
 
     async def test_new_joint_feedback_updates_skeleton_without_invalid_orientation(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['joint_state']))
@@ -350,22 +220,6 @@ class BatteryPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('imu_quat', packet)
         self.assertEqual(packet['joints'], [])
 
-    async def test_battery_publication_stale_or_disconnected_does_not_retain_old_values(self):
-        adapter = Adapter(lambda *args: None, settings(enabled_cards=['battery_state']))
-        for condition in ('stale', 'offline'):
-            adapter.reader.accept_info(info())
-            if condition == 'stale':
-                adapter.reader.info_at = time.monotonic()-10
-            else:
-                adapter.reader.disconnect('test disconnect')
-            packet = await self.first_packet(adapter)
-            self.assertEqual(packet['status']['sample_status'], condition)
-            self.assertFalse(packet['status']['available'])
-            for key in ('soc', 'voltage', 'current', 'estimated_power_w', 'cycle'):
-                self.assertIsNone(packet[key])
-            self.assertIsNone(packet['temperature_raw'])
-            self.assertEqual(packet['status']['validity']['temperature_channels_raw'], [False]*5)
-            self.assertEqual(packet['status']['units']['temperature'], 'vendor_raw_unverified')
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
@@ -568,7 +422,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         result = reply['result']
         return result['isError'], json.loads(result['content'][0]['text'])
 
-    async def test_handshake_two_sensors_and_model_resource(self):
+    async def test_handshake_skeleton_and_model_resource(self):
         reply = await self.rpc('initialize')
         self.assertEqual(reply['result']['serverInfo']['version'], VERSION)
         tools = (await self.rpc('tools/list'))['result']['tools']
@@ -660,40 +514,18 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.sleep(.02)
             self.assertEqual({t for t,d in self.published}, set(TOPICS.values()))
-            for topic, packet in self.published:
-                if topic == TOPICS['battery_state']:
-                    self.assertEqual(set(packet), {'soc', 'voltage', 'current', 'estimated_power_w',
-                                                   'temperature_raw', 'cycle', 'status'})
-                    self.assertEqual(packet['current'],
-                                     self.adapter.reader.sample('battery_state')['data']['current'])
-                    self.assertTrue(packet['status']['available'])
-                    self.assertEqual(packet['status']['sample_status'], 'recently_received')
-                    self.assertFalse(packet['status']['measurement_time_verified'])
-                else:
-                    self.assertTrue(packet['status']['available'])
-                    self.assertEqual(len(packet['joints']), 16)
-            self.published.clear()
-            self.adapter.reader.disconnect('Disconnected')
+            for topic,packet in self.published:
+                self.assertEqual(topic,TOPICS['joint_state'])
+                self.assertTrue(packet['status']['available'])
+                self.assertEqual(len(packet['joints']),16)
+            self.published.clear();self.adapter.reader.disconnect('Disconnected')
             await asyncio.sleep(.51)
             self.assertTrue(self.published)
-            for topic, packet in self.published:
-                if topic == TOPICS['battery_state']:
-                    self.assertIsNone(packet['soc'])
-                    self.assertIsNone(packet['voltage'])
-                    self.assertIsNone(packet['current'])
-                    self.assertIsNone(packet['estimated_power_w'])
-                    self.assertIsNone(packet['temperature_raw'])
-                    self.assertIsNone(packet['cycle'])
-                    self.assertFalse(packet['status']['connected'])
-                    self.assertFalse(packet['status']['available'])
-                    self.assertEqual(packet['status']['sample_status'], 'offline')
-                    self.assertIsNone(packet['status']['current_updated_at_raw'])
-                else:
-                    self.assertEqual(packet['joints'], [])
-                    self.assertFalse(packet['status']['available'])
+            for topic,packet in self.published:
+                self.assertEqual(packet['joints'],[])
+                self.assertFalse(packet['status']['available'])
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            task.cancel();await asyncio.gather(task,return_exceptions=True)
 
     async def test_health_reports_failure_after_disconnect(self):
         self.adapter.reader.disconnect('Disconnected')
@@ -701,30 +533,6 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 503)
             self.assertFalse((await response.json())['ready'])
 
-    async def test_stale_battery_stream_clears_metrics_and_retains_diagnostics(self):
-        self.adapter.reader.info_at = time.monotonic() - 10
-        task = asyncio.create_task(self.adapter.publish_loop())
-        try:
-            await asyncio.sleep(.02)
-            battery = [packet for topic, packet in self.published
-                       if topic == TOPICS['battery_state']]
-            self.assertTrue(battery)
-            packet = battery[0]
-            for key in ('soc', 'voltage', 'current', 'estimated_power_w', 'cycle'):
-                self.assertIsNone(packet[key])
-            self.assertIsNone(packet['temperature_raw'])
-            self.assertEqual(packet['status']['validity']['temperature_channels_raw'], [False]*5)
-            self.assertFalse(packet['status']['available'])
-            self.assertEqual(packet['status']['sample_status'], 'stale')
-            self.assertGreater(packet['status']['reception_age_seconds'], 5)
-            self.assertEqual(packet['status']['units']['temperature'], 'vendor_raw_unverified')
-            error, result = await self.call('battery_state', action='info')
-            self.assertFalse(error)
-            self.assertEqual(result['sample']['sample_status'], 'stale')
-            self.assertIsNone(result['sample']['data'])
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
     async def test_disabled_card_is_not_discovered(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['joint_state']))
@@ -751,8 +559,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
     async def test_removed_cards_are_not_discovered_or_callable(self):
         self.adapter.enabled.append('arm_control')
         names = {tool['name'] for tool in self.adapter.tools()}
-        self.assertEqual(names, {'joint_state', 'battery_state', 'arm_control', 'model'})
-        for name in ('robot_status', 'robot_state', 'reset_pose', 'joint_angles', 'joint_angle'):
+        self.assertEqual(names, {'joint_state', 'arm_control', 'model'})
+        for name in ('robot_status', 'robot_state', 'reset_pose', 'joint_angles', 'joint_angle', 'battery_state'):
             error, result = await self.call(name, action='info')
             self.assertTrue(error)
             self.assertFalse(result['motion_sent'])
@@ -1050,6 +858,25 @@ class PackagingTests(unittest.TestCase):
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'main.py', 'exec'), namespace)
         return namespace[name]
 
+    def test_removed_battery_has_no_config_card_topic_or_sample(self):
+        config=yaml.safe_load((DRIVER/'config.yaml').read_text())
+        manifest=yaml.safe_load((DRIVER/'driver.yaml').read_text())
+        self.assertNotIn('battery_state',config['plugins'])
+        self.assertNotIn('battery_state', {c['name'] for c in manifest['cards']})
+        self.assertEqual(set(TOPICS),{'joint_state'})
+        config['plugins']['battery_state']={'enabled':True}
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'config.yaml';path.write_text(yaml.safe_dump(config))
+            with patch.dict(os.environ,CONFIG_PATH=str(path)):
+                with self.assertRaisesRegex(ValueError,'Only TRON2'):
+                    self.function('load_settings')()
+        reader=RobotReader(settings())
+        for connected in (False,True):
+            if connected: reader.accept_info(info())
+            with self.assertRaisesRegex(ValueError,'Unknown sensor'):reader.sample('battery_state')
+        with self.assertRaisesRegex(ValueError,'Unknown TRON2 card'):
+            Adapter(lambda *args:None,settings(enabled_cards=['battery_state']))
+
     def test_removed_angle_plugin_is_rejected_in_configuration(self):
         config=yaml.safe_load((DRIVER/'config.yaml').read_text())
         self.assertNotIn('joint_angles',config['plugins'])
@@ -1076,7 +903,7 @@ class PackagingTests(unittest.TestCase):
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.7"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.8"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

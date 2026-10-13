@@ -63,7 +63,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'battery_state', 'arm_control'} | set(CAMERA_SOURCES)
+    allowed = {'joint_state', 'arm_control'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor and arm_control plugins may be configured')
     enabled = []
@@ -72,7 +72,7 @@ def load_settings():
             raise ValueError('Expected boolean enabled for ' + name)
         if value['enabled']:
             enabled.append(name)
-    if not set(enabled) & ({'joint_state', 'battery_state'} | set(CAMERA_SOURCES)):
+    if not set(enabled) & ({'joint_state'} | set(CAMERA_SOURCES)):
         raise ValueError('Enable at least one read-only sensor')
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
