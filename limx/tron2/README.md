@@ -1,19 +1,18 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供关节骨架、关节角度、电池及头部/左右腕RGB摄像头六张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.6`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架、电池及头部/左右腕RGB摄像头五张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.7`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
-| `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
-| `joint_angles` | sensor | 16项实际关节角度（度），字段标明左/右臂或头部、索引与关节名称；数值在最新模式可读 | `/limx_tron2/joint_angles`（data/json） |
+| `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架，附随腕运动的左右夹爪示意；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
 | `battery_state` | sensor | 电量、电压原始值/电流绝对值、按mV/mA假设的估算功率、单个温度原始值（五路最大有效值）、循环次数 | `/limx_tron2/battery_state` |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
 | `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
-| `arm_control` | actuator | move自定义目标、pose预设、reset复位、只读预览/列表/到位检查 | 无 |
+| `arm_control` | actuator | move自定义目标、pose预设、reset复位并自动校验；ACP完成通知 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
-传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton，joint_angles与battery_state使用现有data/json。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。电池来自notify_robot_info通知。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
+传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton，battery_state使用现有data/json。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。电池来自notify_robot_info通知。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
 ## 读取边界与字段说明
 
@@ -21,8 +20,7 @@
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
-- `joint_angles`独立卡片直接使用当前平台的data/json“最新”模式显示16项数值，无需修改或升级Agent Core。每个字段按左臂、右臂、头部顺序包含组别、官方索引、中文关节名及“度”，例如左臂_J3_肘_度。数值由实际反馈q换算而来，未在驱动中舍入；当前平台通常显示三位小数，JSON保留完整精度。原始rad、速度/力矩仍通过joint_state的info查看。
-- joint_angles与joint_state共用同一个缓存样本、名称映射和接收时间，不额外查询机器人。左臂0–6、右臂7–13、头部俯仰14/偏航15；提供厂家名称时按名称映射，不支持的布局/名称、过期/断连时全部16项发布null，避免旧平台保留上次读数。运动目标值不会被当作反馈，也不会把静止关节强制归零。骨架中的可选q_deg/group/label字段保留，旧平台会忽略它们，本版本不依赖平台PR或同卡片角度表。
+- 左右夹爪通过安装点上的固定双指轮廓显示，跟随对应手腕运动。开合是静态示意，不表示当前实际夹持状态；没有夹爪开合反馈时不伪造角度或开合动画。附加display_hand_gripper_*节点只供渲染，全部fixed，不增加16关节反馈数量，不改变原始运动学、控制限位或夹爪命令。显示间距/指长为示意尺寸，不是标定的实物外形、TCP或碰撞模型。
 - 骨架使用Motus既有joints协议和model资源。名称缺失时按官方SDK索引顺序映射到URDF：左臂0–6、右臂7–13、头部俯仰14/偏航15；URDF文本中头部关节顺序相反，不使用文件遍历顺序。若厂家提供名称则按名称匹配，不支持的关节数或名称返回空骨架和不可用诊断。没有可用IMU姿态时省略可选imu_quat；不能发送空数组，因为平台会将其解构成四个undefined值、破坏根节点旋转。模型来源和Apache-2.0归属见resource/SOURCE.md；只保留厂家运动学，不包含网格资产。
 - 电池数据schema版本为3。MCP/health缓存字段为 `soc/voltage/current/power/temperature/cycle`；`soc`为百分比，`voltage/current/temperature`为厂家原始单位。`temperature`只显示五路有效原始值中的最大值，不标成℃、不判断正常/过热；五路原值仍在`temperature_channels_raw`中按`bms_temp1`至`bms_temp5`保留，无效通道保留null。所有通道无效时单个温度也是null。`cycle`只接受厂家`bms_charging_cycle`的非负整数。
 - 电流`current`按用户要求只展示绝对值，例如厂家`-2620`显示`2620`；0保留，无效值仍为null。缩放保持厂家原始单位，这个字段不再保留正负方向，不用于判断充放电状态。
@@ -111,7 +109,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 脚本等待就绪，检查Core注册、三张JSON/骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/pose/reset，也不验证真实运动。
 
-升级到0.5.0后刷新Motus，移除画布上的旧robot_status与reset_pose实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、joint_angles、battery_state、camera、camera_left、camera_right、arm_control七张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架；joint_angles在监控中切换“最新”查看16项度数。不需要将两张传感器连线。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
+升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、battery_state、camera、camera_left、camera_right、arm_control六张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：启用关节/电池时，机器人连接且这些已启用传感器全部有最近接收数据为HTTP 200。可选camera的idle/断流不会阻塞它们或机械臂任务。只启用相机时，所有已启用相机都有最近成功发布的JPEG才就绪，否则为503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
@@ -137,10 +135,7 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 | --- | --- | --- |
 | move | joint、time（默认8秒） | 14项绝对目标，左7右7，rad，不包含头部 |
 | pose | pose_name、time（省略则自动计算） | 执行以本机保存home为基准的命名姿态 |
-| reset | 无 | 回到本机保存的自然垂下目标 |
-| preview | pose_name（默认arms_down） | 读取目标/角度差/预计时长，不发送运动 |
-| list | 无 | 列出可选姿态，不发送运动 |
-| verify_at_home | 无 | 单个最近关节样本与home误差≤1度检查 |
+| reset | 无 | 回到自然垂下目标，并自动检查连续反馈是否正确复位 |
 
 pose_name选项：arms_down、left_elbow_20、right_elbow_20、both_elbows_20。后3项分别将home的左肘索引3、右肘索引10或两者减去20度（转成rad），其余关节保持home目标。它们是绝对目标，不会重复点击累积增加角度。自定义move继续接受数组或≤4096字符的JSON数组文本，不接受NaN/Infinity、bool、数字字符串、头部角度或超限值。
 
@@ -148,18 +143,25 @@ reset及pose使用现有`/config/tron2/home.json`（宿主`/opt/phanthy-motus/da
 
 pose/reset时长至少max(8,ceil(最大关节变化度数/5))秒，超过60秒拒绝；pose显式填写time时不得短于此值。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
 
-start返回ready，stop返回idle，均不发送运动，也不是机器人急停。只有显式move/pose/reset发送一次request_movej并等待GUID/序列号匹配的ACK；初始accepted响应不表示到达，arrival_verified为false，并提供唯一action_id。三个动作声明x-completion（120秒上限）和共享资源arm_l/arm_r；动作完成由后台反馈验证和ACP回调跟踪，不以ACK代替完成。
+ACTION仅公开move、pose、reset。info/start/stop由平台内部生命周期和诊断使用，不显示为可选动作；start返回ready，stop返回idle，均不发送运动，也不是机器人急停。preview/list/verify_at_home已删除，旧调用会拒绝。只有显式move/pose/reset发送一次request_movej并等待GUID/序列号匹配的ACK；初始accepted响应不表示到达，arrival_verified为false，并提供唯一action_id。三个动作声明x-completion（120秒上限）和共享资源arm_l/arm_r；动作完成由后台反馈验证和ACP回调跟踪，不以ACK代替完成。
 
 check.py只调用生命周期/信息和model资源，不执行运动。源码和模拟接口通过不代表网页渲染、实际运动到位或PR审批已经通过。正式镜像由上游PR Review Agent的/request_bot_review发布；部署后仍需现场验收。
 
-## 动作完成协议（0.5.4）
+## 动作完成协议（ACP）
+
+MCP用于卡片发现与tools/call请求，ACP（Action Completion Protocol）用于异步动作完成跟踪。
+这是仓库README_dev.md规定的配合方式：保留/mcp、x-completion及唯一action_id，在实际验证结束后POST /api/acp/complete，不能将MCP路由简单改名为ACP。
+平台日志中的MCP_CALL finish是Agent结束当前推理轮次的工具调用，不代表机械臂跳过ACP。三种动作的受理/终态结果均标明completion_protocol=acp。
+
+reset自动复位检查与动作完成跟踪为同一个过程，无需另调verify_at_home。reset的初始结果为reset_verified=false、at_home=null；运动结束后的连续新反馈通过后，ACP completed结果携带reset_verified=true、at_home=true、最大角度误差、容差、样本数和本次home摘要。
+未通过验证时通过ACP报告error、reset_verified=false、at_home=null，并保留错误原因；不能把失联或缺少反馈时的未知位置声称为已复位。复位目标固定为发送时已验证的home，不在动作途中重新加载或覆盖文件。
 
 - move、pose、reset返回唯一action_id；awaiting_ack/moving期间同一个驱动实例保留双臂所有权，第二个动作拒绝，不依赖Core的资源标签作为唯一锁。HTTP调用方断开不会取消正在发送的物理命令，也不会释放所有权。
 - 从ACK结束后保守等待完整time/duration_seconds，再检查至少3个不同的新关节回复，跨度至少0.5秒；14项误差均≤1度、相对首个样本变化≤0.2度，有dq时额外要求每项原始值绝对值≤0.05（未将dq单位认证为rad/s）。位置稳定性直接由q判断。厂家名称重排时先映射至官方索引；不能用同一缓存样本或命令目标伪造到位。
 - 到位后POST /api/acp/complete：action_id、status=completed、result.arrival_verified=true及误差/样本数，tool=arm_control。初始响应仍是受理；通过arm_control.info或/health的arm_motion可查看最终状态。该验证基于连续新收到的关节回复，厂家测量时间戳仍未验证，不代表路径碰撞规划或独立运动安全认证。
 - 超出预计时长再加10秒仍未满足条件、反馈过期、断连或连接更换，报告status=error、arrival_verified=false。发送/ACK结果不明时仍返回跟踪ID并检查反馈，不重发MoveJ；厂家明确拒绝或发送前拒绝不生成已受理动作。
 - ACP使用与注册相同的已验证HTTPS证书上下文，禁止重定向、不读取ACCESS_TOKEN、不关闭TLS验证；同一终态payload最多尝试3次，每次最多3秒，退避0.5/1秒。最坏发送/ACK、60秒动作、验证和回调仍小于声明的120秒上限。
-- 只有验证成功且回调送达才释放本地所有权。反馈验证失败或回调无法送达会保留blocked_requires_operator_check，阻止新的运动。失败通知和Core超时不会物理停止机械臂；现场确认停止、处理原因后再重启驱动。start/stop、预览/列表/到位查询不会清除该状态，stop仍不是急停。
+- 只有验证成功且回调送达才释放本地所有权。反馈验证失败或回调无法送达会保留blocked_requires_operator_check，阻止新的运动。失败通知和Core超时不会物理停止机械臂；现场确认停止、处理原因后再重启驱动。内部start/stop不会清除该状态，stop仍不是急停。
 - 进程正常关闭时终止验证任务并报告error，说明运动可能继续；不发送停机、复位或第二条运动命令。进程强制退出无法保证回调，Core保留120秒超时兜底。
 
 Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺少时执行apt更新/安装；基础镜像已提供的包不重复安装。aiohttp/PyYAML仍由requirements.txt管理，是既有HTTP/WebSocket和配置解析依赖；完成机制只增加Python标准库源码，没有新增pip包、设备权限或资源资产。

@@ -1,5 +1,7 @@
 """Bounded feedback completion, exclusive arm ownership, and actual ACP HTTP."""
 import asyncio
+import hashlib
+import math
 import json
 import os
 from pathlib import Path
@@ -123,6 +125,17 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError,'Fresh'): await self.dispatch()
         self.reader.send_movej.assert_not_called()
 
+    async def test_reset_failure_reports_acp_error_without_claiming_home(self):
+        admission=await self.motion.dispatch('reset',[.1]*14,.1,{'pose_sha256':'test-home'})
+        self.assertFalse(admission['reset_verified']);self.assertIsNone(admission['at_home'])
+        # No new feedback: the cached sample cannot pass automatic reset verification.
+        await self.motion.task
+        body=self.report.await_args.args[2]
+        self.assertEqual(self.report.await_args.args[:2],(admission['action_id'],'error'))
+        self.assertFalse(body['reset_verified']);self.assertIsNone(body['at_home'])
+        self.assertFalse(body['arrival_verified']);self.assertIsNotNone(self.motion.active)
+        self.reader.send_movej.assert_awaited_once()
+
     async def test_core_followup_waits_for_callback_response_after_verified_arrival(self):
         entered=asyncio.Event(); release=asyncio.Event()
         async def report(*args): entered.set();await release.wait();return True
@@ -178,6 +191,83 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await adapter.motion.close();rpc_server.close();await rpc_server.wait_closed();await rpc_runner.cleanup()
         server.close();await server.wait_closed();await runner.cleanup()
+
+    async def test_all_three_actions_use_real_acp_and_reset_verifies_saved_home(self):
+        # Use actual RPC and callback HTTP. Only nominal movement time is
+        # shortened; feedback verification still requires distinct new samples.
+        from reset import ARM_NAMES, POSES
+        received=[]; pending=set(); terminal=asyncio.Event()
+        async def callback(request):
+            body=await request.json()
+            self.assertIn(body['action_id'],pending)
+            received.append(body); terminal.set()
+            return web.json_response({'ok':True,'action_id':body['action_id']})
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('completion.ARRIVAL_GRACE',.5),patch('completion.STABILITY_SECONDS',.05):
+            path=Path(temp)/'home.json'
+            path.write_text(json.dumps({'schema':'tron2-arms-reset-pose-v1','scope':'arms_only',
+                'unit':'rad','joint_names':ARM_NAMES,'accid':'TEST_TRON2A','firmware':'TEST_FW',
+                'target_q':[.1]*14,'head_policy':'unchanged','gripper_policy':'unchanged'}))
+            raw=path.read_bytes()
+            async with aiohttp.ClientSession(trust_env=False) as session:
+                adapter=Adapter(lambda *args:None,settings(enabled_cards=['joint_state','arm_control'],home_file=str(path)),session=session)
+                r=adapter.reader; r.accept_info(info()); r.info['sw_version']='TEST_FW'
+                r.ws=types.SimpleNamespace(closed=False)
+                r.joints=joint_state(joints(q=[0]*16)); r.joints_at=time.monotonic();r.joints_received=time.time()
+                r.send_movej=AsyncMock(return_value={'status':'accepted','motion_sent':True})
+                app=web.Application();app.router.add_post('/mcp',adapter.rpc)
+                app.router.add_post('/api/acp/complete',callback)
+                runner=web.AppRunner(app);await runner.setup()
+                server=await asyncio.get_running_loop().create_server(runner.server,'127.0.0.1',0)
+                url='http://127.0.0.1:'+str(server.sockets[0].getsockname()[1])
+                prepare=adapter.reset.call
+                def short_prepare(*args,**kwargs):
+                    result=prepare(*args,**kwargs)
+                    if args[0]=='execute': result['duration_seconds']=.1
+                    return result
+                try:
+                    with patch.dict(os.environ,AGENT_CORE_URL=url),patch.object(adapter.reset,'call',side_effect=short_prepare):
+                        for action,args in (('move',{'joint':[.2]*14,'time':.1}),
+                                            ('pose',{'pose_name':'left_elbow_20'}),('reset',{})):
+                            terminal.clear(); count=len(received)
+                            async with session.post(url+'/mcp',json={'jsonrpc':'2.0','id':1,'method':'tools/call',
+                                    'params':{'name':'arm_control','arguments':{'action':action,**args}}}) as reply:
+                                rpc=await reply.json()
+                            self.assertFalse(rpc['result']['isError'])
+                            admission=json.loads(rpc['result']['content'][0]['text'])
+                            pending.add(admission['action_id'])
+                            self.assertEqual(admission['completion_protocol'],'acp')
+                            self.assertFalse(admission['arrival_verified'])
+                            self.assertEqual(len(received),count)
+                            if action=='reset':
+                                self.assertFalse(admission['reset_verified']);self.assertIsNone(admission['at_home'])
+                            expected=[.2]*14 if action=='move' else [.1]*14
+                            if action=='pose': expected[3]-=math.radians(20)
+                            self.assertEqual(r.send_movej.await_args.args[0],expected)
+                            async def pump():
+                                while True:
+                                    r.joints=joint_state(joints(q=expected+[1,-1]))
+                                    r.joints_at=time.monotonic();r.joints_received=time.time()
+                                    r.info_at=time.monotonic()
+                                    await asyncio.sleep(.02)
+                            task=asyncio.create_task(pump())
+                            try:
+                                await asyncio.wait_for(terminal.wait(),2);await adapter.motion.task
+                            finally:
+                                task.cancel();await asyncio.gather(task,return_exceptions=True)
+                            body=received[-1];self.assertEqual(body['action_id'],admission['action_id'])
+                            self.assertEqual(body['status'],'completed');self.assertEqual(body['tool'],'arm_control')
+                            self.assertTrue(body['result']['arrival_verified'])
+                            self.assertGreaterEqual(body['result']['verified_samples'],3)
+                            if action=='reset':
+                                self.assertTrue(body['result']['reset_verified']);self.assertTrue(body['result']['at_home'])
+                                self.assertEqual(body['result']['pose_sha256'],hashlib.sha256(raw).hexdigest())
+                            else: self.assertNotIn('at_home',body['result'])
+                            self.assertIsNone(adapter.motion.active)
+                    self.assertEqual(path.read_bytes(),raw)
+                    self.assertEqual(len(received),3);self.assertEqual(r.send_movej.await_count,3)
+                finally:
+                    await adapter.motion.close();server.close();await server.wait_closed();await runner.cleanup()
 
     async def test_callback_retries_identical_payload_preserves_ssl_and_blocks_redirects(self):
         context=object();calls=[]

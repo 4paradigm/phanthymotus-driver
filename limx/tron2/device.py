@@ -11,24 +11,22 @@ from vendor import RobotReader, validate_movej, reject_constant
 from reset import ResetPose, POSES
 from skeleton import skeleton_stream, model
 from state import battery_stream
-from joint_angles import angle_sample, angles_stream
 from completion import ArmCompletion, ACP_TIMEOUT
 from camera import CameraStream, CAMERA_SOURCES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.6'
+VERSION = '0.5.7'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
-          ('joint_state', 'joint_angles', 'battery_state')}
+          ('joint_state', 'battery_state')}
 DESCRIPTIONS = {
     'camera': 'TRON2 头部RGB实时画面；start连接厂家MJPEG并发布JPEG图像，stop释放连接；限10fps，不录像、不控制头部，接收时间不是测量时间（只读）',
     'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'camera_right': 'TRON2 右腕RGB实时画面；厂家right校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
-    'joint_state': 'TRON2 双臂与头部16关节实时骨架；配套厂家URDF，原始rad/deg及速度力矩可通过info查看',
-    'joint_angles': 'TRON2 16关节实际角度（度）：J0–6左臂、J7–13右臂、J14–15头部；与骨架共用实时反馈，断连/过期清空。监控选择最新查看数值，原始rad见joint_state的info（只读）',
+    'joint_state': 'TRON2 双臂与头部16关节实时骨架，左右夹爪轮廓随手腕运动；夹爪为静态开合示意，未接入开合反馈；原始rad/deg及速度力矩可通过info查看',
     'battery_state': 'TRON2 电量（%）、电压原始值/电流绝对值、估算功率 estimated_power_w（按 mV/mA 假设）、单个温度原始值 temperature_raw（五路有效值中最高值，非℃）、循环次数；随厂家通知更新，诊断含接收年龄及五路原值（只读）',
-    'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，pose命名姿态，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；preview/list/verify_at_home只读，stop不是急停',
+    'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，pose命名姿态，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；reset自动验证自然垂下复位，三个动作均通过ACP报告完成',
 }
 
 
@@ -47,6 +45,8 @@ class Adapter:
         self.publish = publish
         self.settings = settings
         self.enabled = settings['enabled_cards']
+        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | {'arm_control'}):
+            raise ValueError('Unknown TRON2 card in configuration')
         self.reader = reader or RobotReader(settings)
         self.registered_id = None
         self.core_ssl = True
@@ -100,8 +100,7 @@ class Adapter:
                 'type': 'object',
                 'additionalProperties': False,
                 'properties': {
-                    'action': {'type': 'string', 'enum': ['info', 'start', 'stop', 'move',
-                        'pose', 'reset', 'preview', 'list', 'verify_at_home']},
+                    'action': {'type': 'string', 'enum': ['move', 'pose', 'reset']},
                     'pose_name': {'type': 'string', 'enum': list(POSES),
                         'description': 'arms_down自然垂下；left_elbow_20左肘、right_elbow_20右肘、both_elbows_20双肘弯曲20度，均基于本机保存姿态'},
                     'joint': {
@@ -127,10 +126,7 @@ class Adapter:
                 'x-action-params': {
                     'move': {'params': ['joint', 'time'], 'description': '自定义双臂14项绝对关节目标'},
                     'pose': {'params': ['pose_name', 'time'], 'description': '执行命名姿态；时长至少8秒且满足角度差要求'},
-                    'reset': {'params': [], 'description': '回到本机保存的自然垂下姿态'},
-                    'preview': {'params': ['pose_name'], 'description': '预览姿态目标与角度差，不发送运动'},
-                    'list': {'params': [], 'description': '列出姿态名称，不发送运动'},
-                    'verify_at_home': {'params': [], 'description': '检查当前单个最近样本是否在复位目标1度内'},
+                    'reset': {'params': [], 'description': '回到自然垂下目标；连续新反馈自动确认复位后，通过ACP通知完成'},
                 },
             },
         }
@@ -163,23 +159,13 @@ class Adapter:
                 'topic_out': [{'topic': TOPICS[name], 'format': 'sensor/skeleton' if name == 'joint_state' else 'data/json'}]})
         if 'joint_state' in self.enabled:
             tools.append({'name': 'model', 'type': 'resource', 'multiInstance': False,
-                'description': 'TRON2 DACH dual-arm/head URDF for the skeleton renderer',
+                'description': 'TRON2 DACH dual-arm/head URDF with fixed gripper outlines for the skeleton renderer',
                 'inputSchema': {'type': 'object', 'additionalProperties': False,
                     'properties': metadata_properties()}})
         return tools
 
     def snapshot(self):
-        samples = {}
-        joint = self.reader.sample('joint_state') if any(
-            name in self.enabled for name in ('joint_state', 'joint_angles')) else None
-        for name in self.enabled:
-            if name == 'joint_angles':
-                samples[name] = angle_sample(joint)
-            elif name == 'joint_state':
-                samples[name] = joint
-            elif name in TOPICS:
-                samples[name] = self.reader.sample(name)
-        return samples
+        return {name: self.reader.sample(name) for name in self.enabled if name in TOPICS}
 
     def call(self, name, args):
         allowed = {'action', 'instance_id', '_trace_id'}
@@ -226,16 +212,11 @@ class Adapter:
                         'joint_count': 14, 'position_unit': 'rad', 'motion_sent': False,
                         'motion': self.motion.summary(),
                         'home': self.reset.call('info'), 'poses': list(POSES)}
-            if action == 'list':
-                return {'poses': list(POSES), 'reference': 'saved_home', 'motion_sent': False}
-            if action in ('reset', 'pose', 'preview', 'verify_at_home'):
-                pose_name = args.get('pose_name', 'arms_down') if action in ('pose', 'preview') else 'arms_down'
+            if action in ('reset', 'pose'):
+                pose_name = args.get('pose_name') if action == 'pose' else 'arms_down'
                 if not isinstance(pose_name, str) or pose_name not in POSES:
-                    raise ValueError('Select a known pose_name; no motion sent')
-                if action == 'pose' and 'pose_name' not in args:
-                    raise ValueError('pose requires pose_name; no motion sent')
-                operation = 'execute' if action in ('pose', 'reset') else action
-                result = self.reset.call(operation, pose_name,
+                    raise ValueError('pose requires a known pose_name; no motion sent')
+                result = self.reset.call('execute', pose_name,
                                          args.get('time') if action == 'pose' else None)
                 return {**result, 'action': action}
             if action != 'move':
@@ -271,8 +252,6 @@ class Adapter:
                     data = battery_stream(data)
                 elif name == 'joint_state':
                     data = skeleton_stream(data)
-                elif name == 'joint_angles':
-                    data = angles_stream(data)
                 self.publish(TOPICS[name], data)
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 

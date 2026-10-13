@@ -40,10 +40,6 @@ class ResetPose:
         return pose, target, hashlib.sha256(raw).hexdigest()
 
     def call(self, action, pose_name='arms_down', time=None):
-        # Lifecycle never loads a target or sends a command, even with no pose configured.
-        if action in ('start', 'stop'):
-            return {'state': 'ready' if action == 'start' else 'idle',
-                    'motion_sent': False, 'lifecycle_only': True}
         if action == 'info':
             try:
                 _, target, digest = self.load()
@@ -51,7 +47,7 @@ class ResetPose:
                         'motion_sent': False}
             except ValueError as exc:
                 return {'configured': False, 'error': str(exc), 'motion_sent': False}
-        if action not in ('preview', 'verify_at_home', 'execute'):
+        if action != 'execute':
             raise ValueError('Unsupported reset action')
         if pose_name not in POSES:
             raise ValueError('Unknown pose; no motion sent')
@@ -89,7 +85,4 @@ class ResetPose:
                   'pose_sha256': digest, 'head_policy': 'unchanged',
                   'gripper_policy': 'unchanged', 'path_validated': False,
                   'pose_name': pose_name}
-        if action == 'verify_at_home':
-            result.update(at_home=delta <= 1, tolerance_deg=1,
-                          verification='single_recent_sample')
         return result

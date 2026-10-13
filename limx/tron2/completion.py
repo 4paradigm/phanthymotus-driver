@@ -111,7 +111,9 @@ class ArmCompletion:
             admitted = True
             job['admission'].set_result({**reply, **job['details'], 'action': job['action'],
                 'action_id': job['action_id'], 'state': 'moving', 'joint_count': 14,
-                'time': job['duration'], 'arrival_verified': False})
+                'time': job['duration'], 'arrival_verified': False,
+                'completion_protocol': 'acp',
+                **({'reset_verified': False, 'at_home': None} if job['action'] == 'reset' else {})})
             result = await self.wait_for_arrival(job)
             status = 'completed'
         except asyncio.CancelledError:
@@ -123,7 +125,14 @@ class ArmCompletion:
                 return
             if not admitted and not job['admission'].done():
                 job['admission'].set_exception(MoveError('Motion result unknown; driver stopping', None))
-            result.update(action=job['action'], joint_count=14)
+            result.update(job['details'])
+            result.update(action=job['action'], joint_count=14, completion_protocol='acp')
+            if job['action'] == 'reset':
+                # The dispatched reset target came from the validated home file.
+                # Verify it using the same multi-frame, post-duration feedback;
+                # an ACK or a cached pre-motion sample cannot mark it at home.
+                result['reset_verified'] = status == 'completed' and result['arrival_verified'] is True
+                result['at_home'] = True if result['reset_verified'] else None
             result['motion_may_continue'] = status != 'completed'
             job['arrival_verified'] = result['arrival_verified']
             job['state'] = 'reporting'

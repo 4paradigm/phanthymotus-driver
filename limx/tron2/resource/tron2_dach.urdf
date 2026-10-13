@@ -1,4 +1,5 @@
-<?xml version='1.0' encoding='utf-8'?>
+<?xml version="1.0" encoding="utf-8"?>
+<!-- display_hand_gripper_*: fixed, schematic outlines only; no gripper opening feedback. -->
 <robot name="robot_description/tron2/DACH_TRON2A">
   <link name="base_Link">
     </link>
@@ -201,5 +202,53 @@
     <origin rpy="-1.5707963267948966 0 -1.5707963267948966" xyz="0 0 0" />
     <parent link="d435_Link" />
     <child link="d435_optical_frame" />
+  </joint>
+  <link name="display_hand_gripper_L_a_base_Link" />
+  <joint name="display_hand_gripper_L_a_base_Joint" type="fixed">
+    <origin xyz="0 0.025 0" rpy="0 0 0" />
+    <parent link="grasper_L_Link" />
+    <child link="display_hand_gripper_L_a_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_L_a_tip_Link" />
+  <joint name="display_hand_gripper_L_a_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_L_a_base_Link" />
+    <child link="display_hand_gripper_L_a_tip_Link" />
+  </joint>
+  <link name="display_hand_gripper_L_b_base_Link" />
+  <joint name="display_hand_gripper_L_b_base_Joint" type="fixed">
+    <origin xyz="0 -0.025 0" rpy="0 0 0" />
+    <parent link="grasper_L_Link" />
+    <child link="display_hand_gripper_L_b_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_L_b_tip_Link" />
+  <joint name="display_hand_gripper_L_b_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_L_b_base_Link" />
+    <child link="display_hand_gripper_L_b_tip_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_a_base_Link" />
+  <joint name="display_hand_gripper_R_a_base_Joint" type="fixed">
+    <origin xyz="0 0.025 0" rpy="0 0 0" />
+    <parent link="grasper_R_Link" />
+    <child link="display_hand_gripper_R_a_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_a_tip_Link" />
+  <joint name="display_hand_gripper_R_a_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_R_a_base_Link" />
+    <child link="display_hand_gripper_R_a_tip_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_b_base_Link" />
+  <joint name="display_hand_gripper_R_b_base_Joint" type="fixed">
+    <origin xyz="0 -0.025 0" rpy="0 0 0" />
+    <parent link="grasper_R_Link" />
+    <child link="display_hand_gripper_R_b_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_b_tip_Link" />
+  <joint name="display_hand_gripper_R_b_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_R_b_base_Link" />
+    <child link="display_hand_gripper_R_b_tip_Link" />
   </joint>
 </robot>

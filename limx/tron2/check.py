@@ -6,8 +6,8 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.6'
-CARDS = {'joint_state', 'joint_angles', 'battery_state'}
+VERSION = '0.5.7'
+CARDS = {'joint_state', 'battery_state'}
 from camera import CAMERA_SOURCES
 
 
@@ -101,7 +101,7 @@ def run_check(timeout=20, camera=False):
     names = {tool['name'] for tool in tools}
     expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
-        raise ValueError('Expected three JSON/skeleton sensors, optional camera/arm_control and model resource')
+        raise ValueError('Expected two JSON/skeleton sensors, optional camera/arm_control and model resource')
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
     for name, camera_tool in camera_tools.items():
         if camera_tool['topic_out'] != [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}] \
@@ -119,13 +119,19 @@ def run_check(timeout=20, camera=False):
     model_names = {joint.get('name') for joint in ET.fromstring(model_data['urdf']).findall('joint')}
     if model_reply.get('isError') or not set(JOINT_NAMES) <= model_names:
         raise ValueError('Skeleton joint names do not match model')
+    display_joints = [joint for joint in ET.fromstring(model_data['urdf']).findall('joint')
+                      if joint.get('name', '').startswith('display_hand_gripper_')]
+    if len(display_joints) != 8 or any(joint.get('type') != 'fixed' for joint in display_joints):
+        raise ValueError('Fixed left/right gripper display outlines are missing')
     joint_tool = next(tool for tool in tools if tool['name'] == 'joint_state')
     if joint_tool['topic_out'][0]['format'] != 'sensor/skeleton':
         raise ValueError('Joint card must use skeleton format')
     arm_tool = next((tool for tool in tools if tool['name'] == 'arm_control'), None)
     if arm_tool and (arm_tool['inputSchema'].get('x-completion') != {
             'actions': ['move', 'pose', 'reset'], 'timeout': 120}
-            or arm_tool['inputSchema'].get('x-resource') != ['arm_l', 'arm_r']):
+            or arm_tool['inputSchema'].get('x-resource') != ['arm_l', 'arm_r']
+            or arm_tool['inputSchema']['properties']['action']['enum'] != ['move', 'pose', 'reset']
+            or set(arm_tool['inputSchema']['x-action-params']) != {'move', 'pose', 'reset'}):
         raise ValueError('Arm completion tracking or physical resources are missing')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
@@ -157,16 +163,6 @@ def run_check(timeout=20, camera=False):
     skeleton_data = skeleton_stream(joint)
     if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != 16:
         raise ValueError('Unsupported skeleton joint layout or names')
-    from joint_angles import angle_sample, ANGLE_FIELDS
-    angles = after['joint_angles']
-    if set(angles['data']) != set(ANGLE_FIELDS) or len(angles['data']) != 16:
-        raise ValueError('Expected sixteen joint-angle fields')
-    # Separate info calls may straddle an incoming response. Compare only when
-    # both samples refer to the same received frame; never assume static arms.
-    if angles['received_at'] == joint['received_at'] and angles['data'] != angle_sample(joint)['data']:
-        raise ValueError('Joint-angle values do not match the skeleton feedback')
-    if angles['received_at'] <= before['joint_angles']['received_at']:
-        raise ValueError('Joint-angle feedback receipt did not update')
     battery = after['battery_state']['data']
     if set(battery) != {'schema_version', 'soc', 'voltage', 'current', 'power',
                        'temperature', 'cycle', 'units', 'validity',
@@ -176,7 +172,7 @@ def run_check(timeout=20, camera=False):
     if battery['schema_version'] != 3 or len(battery['temperature_channels_raw']) != 5 \
             or battery['power_status'] != 'estimated_assuming_mV_mA':
         raise ValueError('Unexpected battery schema, channels or power interpretation')
-    print('PASS: three sensors including 16 joint-angle tiles, skeleton/model and arm actions; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: two sensors, skeleton/model with fixed gripper outlines and move/pose/reset with ACP completion; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
