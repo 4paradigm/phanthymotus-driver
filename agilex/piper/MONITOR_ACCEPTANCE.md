@@ -5,7 +5,7 @@
 ## 结果
 
 - 监控测试 23 项：通过（含现场快照适配与固定轮廓跟随验证）。
-- 最新指定回归集合：205 passed、114 subtests passed（含直接执行、骨架卡及已移除示教入口验证）。
+- 最新指定回归集合：212 passed、118 subtests passed（含生产入口接线、直接执行、骨架卡及已移除示教入口验证）。
 - 实际 Edge headless + 未修改 Core 渲染器：通过；528 个矩阵值对比，无页面脚本错误。
 - 浏览器场景：三组实测角度模拟、过期冻结、读取失败提示、恢复、双设备隔离。
 - ROS transport 使用假 ROS 对象验证 Core context、QoS、消息序列化、重复关闭及部分初始化失败释放。
@@ -18,6 +18,7 @@ Python 3.12 回归命令（pytest、PyYAML、OpenCV 为测试环境依赖，不�
 
 ```bash
 python -m pytest -q \
+  tests/test_piper_entrypoint.py \
   tests/test_piper_direct_control.py \
   tests/test_piper_status_card.py \
   tests/test_piper_monitor.py tests/test_piper_monitor_bundle.py tests/test_piper_ten_cards.py \
@@ -183,7 +184,19 @@ python -m pytest -q \
 - 部署脚本：`/home/agilex/piper-monitor-deploy-20261013/deploy_direct_control_arm1.py`。
   本阶段没有执行真机运动、模式切换、使能/失能或拍照，真实控制留给用户测试。
 
-用户要求先测试再提交 PR，因此本阶段保留本地独立提交，不创建或更新 PR。
+### 2026-10-13 PR 集成提交
+
+- 用户明确要求按照本机 landing 文档提交 PR。继续使用 fork 的 `codex/piper-driver` 和已有 #382，
+  推送后评论 `/request_bot_review` 请求构建，不创建重复 PR，不合并主干。
+- 对照机械臂 1 当前容器源码，将现场已有 `ArmControlPlugin`、被动监控快照及有效限位方法
+  纳入此分支；整理默认入口并更新 Docker COPY、driver.yaml 工具清单与 README。
+  未复制现场配置、环境变量或凭据。此步骤未重启或修改现场服务。
+- 完整指定集合 212 passed、118 subtests passed。生产入口模拟 SDK 测试覆盖工具注册、
+  无连接生命周期、直接微动、一次性预览、错误反馈/模式/限位拒绝、夹爪独立使能、
+  实际异步回报、动作忙时的无副作用快照、非阻塞连接锁及双设备话题隔离。
+- 沿用既有现场部署与真实骨架反馈证据；真机动作验收未由本代理执行，不声称完整动作验收。
+
+先前按用户要求保留本地独立提交；本次用户已授权更新 PR 并请求 Bot 构建。
 最终目标：[驱动 PR #382](https://github.com/4paradigm/phanthymotus-driver/pull/382)。
 本次监控版本：**尚未生成**。
 查询时该 PR 历史最近成功 Bot Version 为 `release.261011.ec99be9`，对应历史构建，

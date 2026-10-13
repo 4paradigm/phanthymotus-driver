@@ -228,4 +228,9 @@ class PiperPlugin(PiperRuntime):
 
 
 def build_plugins(config, namespace, ros2):
-    return [PiperPlugin(config, namespace, ros2)]
+    from agilex.piper.arm_control import ArmControlPlugin
+    from agilex.piper.monitor_bundle import add_monitor
+    from agilex.piper.status_card import split_status_card
+
+    plugins = add_monitor([ArmControlPlugin(config, namespace, ros2)], config, ros2)
+    return split_status_card(plugins)

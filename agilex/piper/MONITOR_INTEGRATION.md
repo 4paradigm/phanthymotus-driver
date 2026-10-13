@@ -2,7 +2,8 @@
 
 本分支提供 `PiperMonitorPlugin`、模型和测试。原约定由计划一负责最终集成；
 用户于 2026-10-13 明确要求现场部署后，新增 `monitor_bundle.py` 和 Docker COPY，
-基于两台现有镜像叠加监控，并在现场画布添加监控卡。PR 仍等待用户测试后更新。
+基于两台现有镜像叠加监控，并在现场画布添加监控卡。随后用户要求按 landing 文档提交 PR，
+将已部署的 `ArmControlPlugin`、被动快照和有效限位读取接入默认入口，更新已有 PR #382。
 
 ## 共同约定
 
@@ -64,7 +65,9 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 `piper_status` 是 resource，诊断用 `read` 返回 `skeleton/parameters`；画布只声明骨架输出，
 顶部「监控」只有一张机械臂骨架卡。参数继续后台发布并包含在读取结果中。
 控制卡移除 `read` 操作，默认「请选择控制动作」为空操作，
-必须由用户选择具体控制动作才执行。部署仅叠加独立文件，不修改 runtime 或 Core 源码。
+必须由用户选择具体控制动作才执行。现场部署只叠加独立文件；此次 PR 打包将现场已有的
+`arm_control.py`、`runtime.read_monitor_snapshot` 和 `arm.joint_bounds_deg` 纳入源码。
+默认 `device.build_plugins` 顺序创建控制、监控、两卡适配；旧 `PiperPlugin` 留作回归，不对外注册。
 
 用户最新要求无需请求控制、满足条件直接执行。`direct_control.py` 移除许可菜单及额外确认弹窗，
 每次控制调用内部生成一次性预览并重新校验后执行；保留模式、使能、反馈、故障、限位、
@@ -89,7 +92,7 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 只有显式 `read` 和运行中的定时回调调用快照函数。`stop` 不调用任何控制停止方法，允许再次启动。
 不提供 `ros2` 时仍可手动 `read`，但 `info.publishing=false`，不会伪称正在发布 DDS。
 
-## 快照接口：交给计划一实现
+## 快照接口：已接入现场计划一实现
 
 函数签名 `read_monitor_snapshot() -> MonitorSnapshot`，返回一份独立、可稳定遍历的字典快照。
 所有时间为 Unix 秒，所有关节角度为度。字段在 `monitor.py` 的 `MonitorSnapshot` 定义：
@@ -149,7 +152,8 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 
 镜像需复制 `monitor.py`、`monitor_bundle.py`、`status_card.py`、`direct_control.py`
 和整个 `resource/` 到 `/work/agilex/piper/`。
-使用现有 ROS/std_msgs 依赖，不新增 Pinocchio、网格、SDK 或前端库。不要直接修改本阶段以外的 shared runtime。
+使用现有 ROS/std_msgs 依赖，不新增 Pinocchio、网格、SDK 或前端库。此次集成包含现场既有
+PiPER runtime 接线，不修改跨驱动的 shared runtime 或 Agent Core。
 
 ## 验证与交付边界
 
@@ -177,5 +181,5 @@ node tests/piper_monitor_browser.mjs
 真机模型方向/物理尺寸最终核对及 ROS2 现场联调由计划一集成后安排。
 
 最终集成目标：[驱动 PR #382](https://github.com/4paradigm/phanthymotus-driver/pull/382)。
-本监控提交不更新该 PR；计划一接入后更新。每次正式交付记录 Bot 表格实际 Version，
+默认两卡及现场快照实现已集成，本次更新已有 PR。每次正式交付记录 Bot 表格实际 Version，
 没有生成写“尚未生成”，提交 SHA 不作为 Version。

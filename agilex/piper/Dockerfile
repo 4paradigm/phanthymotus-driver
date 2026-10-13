@@ -17,7 +17,7 @@ RUN sed '/^piper-sdk @ /d' /work/agilex/piper/requirements.txt > /tmp/piper-depe
        "${PIPER_SDK_URL}#sha256=${PIPER_SDK_SHA256}" \
     && rm /tmp/piper-dependencies.txt
 COPY common/ /work/common/
-COPY main.py device.py runtime.py cards.py arm.py control.py mac_can.py camera_capture.py config.yaml driver.yaml /work/agilex/piper/
+COPY main.py device.py runtime.py cards.py arm.py arm_control.py control.py mac_can.py camera_capture.py config.yaml driver.yaml /work/agilex/piper/
 COPY monitor.py monitor_bundle.py /work/agilex/piper/
 COPY status_card.py direct_control.py /work/agilex/piper/
 COPY resource/ /work/agilex/piper/resource/
