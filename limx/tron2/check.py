@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.8'
+VERSION = '0.5.9'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -140,6 +140,7 @@ def run_check(timeout=20, camera=False):
                               '_trace_id': 'readonly-check-trace'}})
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
+    motion_readiness = None
     for name in names & {'arm_control'}:
         for action in ('info', 'start', 'stop'):
             reply = rpc('tools/call', {'name': name, 'arguments': {'action': action,
@@ -147,6 +148,8 @@ def run_check(timeout=20, camera=False):
             if reply.get('isError'):
                 raise ValueError('Actuator lifecycle failed: ' + name)
             data = json.loads(reply['content'][0]['text'])
+            if action == 'info':
+                motion_readiness = data.get('motion_readiness')
             if data.get('motion_sent') is not False:
                 raise ValueError('Lifecycle must not send motion')
     before = read_samples()
@@ -164,6 +167,7 @@ def run_check(timeout=20, camera=False):
     if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != 16:
         raise ValueError('Unsupported skeleton joint layout or names')
     print('PASS: skeleton/model with fixed gripper outlines and move/pose/reset with ACP completion; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('Arm motion readiness:', motion_readiness)
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])

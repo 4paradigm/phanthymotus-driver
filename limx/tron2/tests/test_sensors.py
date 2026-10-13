@@ -38,7 +38,9 @@ def settings(**updates):
 def info(serial='TEST_TRON2A'):
     return {'title': 'notify_robot_info', 'accid': serial,
             'data': {'imu': 'OK', 'motor': 'OK', 'camera': 'UNKNOW',
-                     'working_mode': 'controller_mode'}}
+                     'working_mode': 'controller_mode', 'working_mode_valid': True,
+                     'collision_enable': True, 'collision_enable_valid': True,
+                     'compliant_enable': False, 'compliant_enable_valid': True}}
 
 
 def joints(**updates):
@@ -903,7 +905,7 @@ class PackagingTests(unittest.TestCase):
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.8"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.9"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

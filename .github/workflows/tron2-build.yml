@@ -4,6 +4,22 @@ on:
   push:
     branches:
       - feat/tron2-arm-reset
+      - main
+    paths:
+      - 'limx/tron2/**'
+      - 'common/**'
+      - '.github/workflows/tron2-build.yml'
+      - 'scripts/check_service_yml.py'
+      - 'tests/test_dockerfile_copies.py'
+      - 'README_dev.md'
+  pull_request:
+    paths:
+      - 'limx/tron2/**'
+      - 'common/**'
+      - '.github/workflows/tron2-build.yml'
+      - 'scripts/check_service_yml.py'
+      - 'tests/test_dockerfile_copies.py'
+      - 'README_dev.md'
   workflow_dispatch:
 
 permissions:

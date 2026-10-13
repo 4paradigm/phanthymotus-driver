@@ -7,14 +7,14 @@ import time
 
 import aiohttp
 from aiohttp import web
-from vendor import RobotReader, validate_movej, reject_constant
+from vendor import RobotReader, validate_movej, reject_constant, motion_readiness
 from reset import ResetPose, POSES
 from skeleton import skeleton_stream, model
 from completion import ArmCompletion, ACP_TIMEOUT
 from camera import CameraStream, CAMERA_SOURCES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.8'
+VERSION = '0.5.9'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -189,6 +189,7 @@ class Adapter:
                         'ready' if self.reader.connected else 'offline',
                         'joint_count': 14, 'position_unit': 'rad', 'motion_sent': False,
                         'motion': self.motion.summary(),
+                        'motion_readiness': motion_readiness(self.reader.sample('robot_status')['data'] or {}),
                         'home': self.reset.call('info'), 'poses': list(POSES)}
             if action in ('reset', 'pose'):
                 pose_name = args.get('pose_name') if action == 'pose' else 'arms_down'

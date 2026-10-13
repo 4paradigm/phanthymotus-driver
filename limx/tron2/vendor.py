@@ -51,6 +51,25 @@ class MoveError(ValueError):
         self.code = code
 
 
+def motion_readiness(data):
+    """Conservative admission policy for the commissioned MoveJ controller mode.
+
+    *_valid fields are vendor capability/validity flags, not independent safety
+    certification. Require explicit booleans; never infer readiness from missing
+    status. Compliance/drag mode must be off for a commanded position move.
+    """
+    if data.get('working_mode') != 'controller_mode':
+        return {'ready': False, 'reason': 'MoveJ requires controller_mode'}
+    for key in ('working_mode_valid','collision_enable_valid','compliant_enable_valid'):
+        if data.get(key) is not True:
+            return {'ready': False, 'reason': key + ' must be explicitly true'}
+    if data.get('collision_enable') is not True:
+        return {'ready': False, 'reason': 'Collision protection must be explicitly enabled'}
+    if data.get('compliant_enable') is not False:
+        return {'ready': False, 'reason': 'Compliance/drag mode must be explicitly disabled for MoveJ'}
+    return {'ready': True, 'reason': None}
+
+
 class RobotReader:
     def __init__(self, settings):
         self.settings = settings
@@ -146,8 +165,12 @@ class RobotReader:
         q, move_time = validate_movej(q, move_time)
         if not self.connected or self.ws is None or self.ws.closed or not self.serial:
             raise MoveError('Robot is disconnected; no motion command sent', False)
-        if not self.sample('robot_status')['available']:
+        status=self.sample('robot_status')
+        if not status['available']:
             raise MoveError('Robot status is stale; no motion command sent', False)
+        readiness=motion_readiness(status['data'])
+        if not readiness['ready']:
+            raise MoveError(readiness['reason'] + '; no motion command sent', False, 'vendor_not_ready')
         if self.move_pending:
             raise MoveError('A MoveJ reply is pending; no additional command sent', False)
         guid = str(uuid.uuid4())
