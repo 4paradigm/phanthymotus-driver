@@ -1,3 +1,4 @@
+import itertools
 import logging
 import time
 from typing import Any, Callable
@@ -41,13 +42,20 @@ class Channel:
     class __Reader:
         def __init__(self):
             self.__reader = None
+            self.__topic_name = None
+            self.__trace_loco = False
+            self.__callback_ids = itertools.count(1)
             self.__handler = None
             self.__queue = None
             self.__queueEnable = False
             self.__threadEvent = None
             self.__threadReader = None
         
-        def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
+        def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None, handler: Callable = None, queueLen: int = 0, topic_name: str = None):
+            self.__topic_name = topic_name
+            self.__trace_loco = topic_name == "rt/api/loco/response"
+            if self.__trace_loco:
+                trace_event("dds_reader_init", topic=topic_name, queue_length=queueLen)
             if handler is None:
                 self.__reader = DataReader(participant, topic, qos)
             else:
@@ -87,9 +95,23 @@ class Channel:
                 self.__threadReader.join()
 
         def __OnDataAvailable(self, reader: DataReader):
+            callback_id = next(self.__callback_ids) if self.__trace_loco else None
+            if self.__trace_loco:
+                trace_event("dds_callback_enter", topic=self.__topic_name, callback_id=callback_id)
             samples = []
             try:
+                take_start = time.monotonic() if self.__trace_loco else None
+                if self.__trace_loco:
+                    trace_event("dds_take_start", topic=self.__topic_name, callback_id=callback_id)
                 samples = reader.take(1)
+                if self.__trace_loco:
+                    take_end = time.monotonic()
+                    identities = [getattr(getattr(sample, "header", None), "identity", None)
+                                  for sample in (samples or [])]
+                    trace_event("dds_take_end", topic=self.__topic_name, callback_id=callback_id,
+                                take_start_s=take_start, take_end_s=take_end,
+                                request_ids=[getattr(identity, "id", None) for identity in identities],
+                                sample_count=len(samples) if samples is not None else 0)
             except DDSException as e:
                 _log.warning("[Reader] DDSException: %s", e.msg)
                 return
@@ -111,7 +133,8 @@ class Channel:
             identity = getattr(getattr(sample, "header", None), "identity", None)
             if getattr(identity, "api_id", None) == 7105:
                 trace_event("dds_sample_taken", request_id=identity.id,
-                            sample_type=type(sample).__name__)
+                            sample_type=type(sample).__name__,
+                            topic=self.__topic_name, callback_id=callback_id)
 
             # do sample
             if self.__queueEnable:
@@ -201,7 +224,7 @@ class Channel:
         self.__writer.Init(self.__participant, self.__topic, qos, self.__name)
 
     def SetReader(self, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
-        self.__reader.Init(self.__participant, self.__topic, qos, handler, queueLen)
+        self.__reader.Init(self.__participant, self.__topic, qos, handler, queueLen, self.__name)
         
     def Write(self, sample: Any, timeout: float = None):
         return self.__writer.Write(sample, timeout)
@@ -265,6 +288,8 @@ class ChannelFactory(Singleton):
 
             self.__class__.__qos = qos
             self.__class__.__initialized = True
+            trace_event("dds_factory_initialized", domain_id=id, network_interface=networkInterface,
+                        configuration=config)
             return True
 
     def CreateChannel(self, name: str, type: Any):

@@ -237,7 +237,7 @@ class TestRpcWorkerMotion(unittest.TestCase):
             'common': module('common', logsafe=SimpleNamespace(install=lambda **kw: None)),
             'unitree_sdk2py.core.channel': module('channel', ChannelFactoryInitialize=lambda *args: None),
             'unitree_sdk2py.g1.loco.g1_loco_client': module('loco', LocoClient=lambda: w.controller.client),
-            'timed_motion': module('timed_motion', TimedMotion=lambda *args, **kw: w.controller),
+            'timed_motion': module('timed_motion', TimedMotion=lambda *args, **kw: w.controller, trace_event=trace_event),
             'safety_harness': module('safety_harness', _LocoTiming=lambda: None),
         }
         commands, results = queue.Queue(), queue.Queue()

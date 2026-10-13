@@ -25,9 +25,11 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
-    from timed_motion import TimedMotion
+    from timed_motion import TimedMotion, trace_event
     from safety_harness import _LocoTiming
 
+    trace_event("process_start", component="loco_rpc_worker",
+                domain_id=0, network_interface=network_iface)
     ChannelFactoryInitialize(0, network_iface)
 
     loco = LocoClient()

@@ -407,5 +407,35 @@ class TestTimingLogs(unittest.TestCase):
         self.assertEqual(w.controller.get_result('a')['status'], 'completed')
 
 
+class TestDdsCallbackTrace(unittest.TestCase):
+    def test_callback_trace_correlates_take_without_changing_read_count(self):
+        import itertools
+        source = (ROOT / 'unitree_sdk2py/core/channel.py').read_text()
+        channel = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == 'Channel')
+        node = next(n for n in channel.body if isinstance(n, ast.ClassDef) and n.name == '__Reader')
+        rows = []
+        namespace = dict(itertools=itertools, time=time,
+                         trace_event=lambda stage, **data: rows.append(dict(stage=stage, **data)),
+                         InvalidSample=type('InvalidSample', (), {}))
+        exec('from __future__ import annotations\n' + ast.get_source_segment(source, node), namespace)
+        reader = namespace['__Reader']()
+        reader._Reader__trace_loco = True
+        reader._Reader__topic_name = 'rt/api/loco/response'
+        samples = [SimpleNamespace(header=SimpleNamespace(identity=SimpleNamespace(id=123, api_id=7105)))]
+        delivered, calls = [], []
+        reader._Reader__handler = delivered.append
+        def take(count):
+            calls.append(count)
+            return samples
+        reader._Reader__OnDataAvailable(SimpleNamespace(take=take))
+        self.assertEqual(calls, [1])
+        self.assertEqual(delivered, samples)
+        self.assertEqual([r['stage'] for r in rows],
+                         ['dds_callback_enter', 'dds_take_start', 'dds_take_end', 'dds_sample_taken'])
+        self.assertEqual({r['callback_id'] for r in rows}, {1})
+        self.assertEqual(rows[2]['request_ids'], [123])
+        self.assertGreaterEqual(rows[2]['take_end_s'], rows[2]['take_start_s'])
+
+
 if __name__ == '__main__':
     unittest.main()

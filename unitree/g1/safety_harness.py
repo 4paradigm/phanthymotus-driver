@@ -255,6 +255,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     )
 
     # ── Initialize DDS ──
+    trace_event("process_start", component="smart_motion",
+                domain_id=0, network_interface=network_iface)
     ChannelFactoryInitialize(0, network_iface)
     print(f"[SmartMotion:pid={os.getpid()}] DDS initialized on {network_iface}")
 
