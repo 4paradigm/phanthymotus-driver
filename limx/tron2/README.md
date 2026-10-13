@@ -1,23 +1,23 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供三张持续更新的传感器卡片和两张显式运动执行卡片。适用于与 TRON2 原有主控制器通过以太网连接的 Jetson / ARM64 主机。驱动版本：`0.4.8`；MCP 仅监听 `127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架、电池两张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.0`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
-| `joint_state` | sensor | 关节位置 `q`（rad）、`positions_deg`（度）、厂家返回的 `dq` / `tau` | `/limx_tron2/joint_state` |
-| `robot_status` | sensor | 工作模式、固件版本、IMU / 电机 / 相机等状态 | `/limx_tron2/robot_status` |
+| `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
 | `battery_state` | sensor | 电量、电压原始值/电流绝对值、按mV/mA假设的估算功率、单个温度原始值（五路最大有效值）、循环次数 | `/limx_tron2/battery_state` |
-| `arm_control` | actuator | 双臂14项角度目标（rad），显式 MoveJ | 无 |
-| `reset_pose` | actuator | 从本机保存姿态读取固定双臂目标，预览/执行/到位检查 | 无 |
+| `arm_control` | actuator | move自定义目标、pose预设、reset复位、只读预览/列表/到位检查 | 无 |
+| `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
-三张传感器卡片使用 `data/json` 格式，通过 Motus 本机 ROS2 总线发布。默认每 0.5 秒查询一次关节状态并发布缓存，实际更新速率受机器人响应时间影响。状态和电池来自机器人主动发送的 `notify_robot_info`，其更新频率由机器人决定。
+传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton，battery_state保留data/json。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。电池来自notify_robot_info通知。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
 ## 读取边界与字段说明
 
-传感器后台仅发送 `request_get_joint_state`。新增 `arm_control` actuator 通过显式 move 调用发送一次 `request_movej`；驱动不再是全只读服务。reset_pose使用本机固定目标显式调用MoveJ；没有模式切换或拖动示教接口。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/pose/reset调用时发送一次request_movej；没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
+- 骨架使用Motus既有joints/imu_quat协议和model资源。名称缺失时按官方SDK索引顺序映射到URDF：左臂0–6、右臂7–13、头部俯仰14/偏航15；URDF文本中头部关节顺序相反，不使用文件遍历顺序。若厂家提供名称则按名称匹配，不支持的关节数或名称返回空骨架和不可用诊断；不画成错误的人形。没有可用IMU姿态时imu_quat为空。模型来源和Apache-2.0归属见resource/SOURCE.md；只保留厂家运动学，不包含网格资产。
 - 电池数据schema版本为3。MCP/health缓存字段为 `soc/voltage/current/power/temperature/cycle`；`soc`为百分比，`voltage/current/temperature`为厂家原始单位。`temperature`只显示五路有效原始值中的最大值，不标成℃、不判断正常/过热；五路原值仍在`temperature_channels_raw`中按`bms_temp1`至`bms_temp5`保留，无效通道保留null。所有通道无效时单个温度也是null。`cycle`只接受厂家`bms_charging_cycle`的非负整数。
 - 电流`current`按用户要求只展示绝对值，例如厂家`-2620`显示`2620`；0保留，无效值仍为null。缩放保持厂家原始单位，这个字段不再保留正负方向，不用于判断充放电状态。
 - 按用户授权启用估算：假设电压mV、电流mA，以`(voltage/1000)*(current/1000)`计算功率大小，保留两位小数。`power_status: estimated_assuming_mV_mA`明确表示单位假设，未经厂家确认。电压或有效电流缺失、计算溢出时仍为null；有效0则显示0。电流不保留方向，因此功率也是大小，不能表示充放电方向或外接电源下整机耗电。
@@ -52,11 +52,11 @@
 }
 ```
 
-0.4.8的schema v3将主显示精简为六项，功率消费者改读`estimated_power_w`，温度消费者改读单值`temperature_raw`；诊断字段移入`status`。MCP/health中的`temperature`由数组改成单值，原数组改名`temperature_channels_raw`，`power`恢复有标记的估算。关节/设备状态结构、卡片名称和topic不变；升级后刷新网页。此显示更新不修改机械臂控制或本机复位目标。
+电池沿用0.4.8的schema v3，功率为estimated_power_w，温度为单值temperature_raw；诊断位于status。MCP/health仍提供power和temperature，五路原数组为temperature_channels_raw。本次0.5.0不修改电池计算、显示字段或本机复位目标。
 
-卡片的 `start` / `stop` 是单实例常开传感器的生命周期兼容调用，不启动或停止机器人，也不停止后台采样。`info` 返回该传感器的当前状态和缓存，不额外发送机器人请求。驱动提供三张 sensor 及 arm_control/reset_pose actuator，不提供缓存聚合 resource 或助手卡片。
+传感器start/stop兼容单实例生命周期，不启动/停止机器人，也不停止后台采样。info读取缓存，不额外请求机器人。公开两张sensor、一张arm_control actuator及model resource；不提供独立robot_status/reset_pose卡片或助手卡片。
 
-兼容 Agent Core 自动注入的 `instance_id` 和 `_trace_id`：两者仅接受最长 128 字符、无控制字符的字符串，不参与机器人请求、不回显到采样数据。Schema 与运行时均接受这两项元数据；其他未声明参数仍被拒绝。0.4.2 保留追踪元数据兼容，并移除之前的缓存聚合资源工具；三张传感器仍能通过 info 查看当前缓存。
+兼容Agent Core自动注入的instance_id和_trace_id：最长128字符、无控制字符，不参与机器人请求或回显。两张传感器通过info查看当前原始缓存。
 
 ## 配置
 
@@ -103,9 +103,9 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 # 或：python3 limx/tron2/check.py
 ```
 
-脚本等待就绪、检查 Core 注册和 MCP 卡片类型、验证生命周期以及关节回复接收时间持续更新。它不检查或调用运动接口。该脚本按默认三张卡片全部启用验收。
+脚本等待就绪，检查Core注册、两张sensor/arm_control/model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/pose/reset，也不验证真实运动。
 
-刷新 Motus 控制台，找到 **LimX TRON2 Sensors and Arm Control**，将三张 sensor 卡片拖入画布并开启，再点击“查看数据流”。从旧版升级时，应从画布移除旧缓存读取、文字输入和决策卡片；助手 Skill 是单独的本机配置，不属于此 Driver。数据存在时应看到 `available: true`；断开机器人链路后应看到 `data: null` 和不可用状态，恢复连接后收到新通知 / 关节回复才恢复数值。各传感器的 `info` 可查看该卡片当前缓存。
+升级到0.5.0后刷新Motus，移除画布上的旧robot_status与reset_pose实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、battery_state、arm_control三张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后joint_state应显示厂家双臂/头部骨架。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
 `GET http://127.0.0.1:15791/health` 返回卡片状态：全部已启用传感器有最近接收数据时为 HTTP 200，否则为 503。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
@@ -119,38 +119,27 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 
 测试包含真实本机 HTTP / WebSocket 服务、请求关联及超时、序列号约束、重连、断连清空、过期数据、卡片生命周期、ROS2 JSON 发布的模拟验证和镜像入口布局。测试不驱动实体机器人。
 
-此前现场已验证厂家 WebSocket 能返回机器人信息与 16 项关节值；本版本的 ROS2 / Compose 正式镜像仍需在 Jetson 上按上述步骤验收。摄像头不包含在当前版本；arm_control和reset_pose真实运动仍需现场单独验收。
+此前现场验证了16项关节值和运动ACK；0.5.0的骨架网页效果和新增pose/reset操作仍需部署后单独验收。摄像头工作继续暂停。
 
-## arm_control 与构建修复（0.4.4）
+## arm_control 动作
 
-0.4.6兼容Motus画布将JOINT作为文本提交的行为：接受真正的数组或不超过4096字符的JSON数组文本，解析后仍要求14个有限数值及厂家绝对关节限位。网页JOINT填写带方括号的完整14项数组；不接受逗号列表、数字字符串、NaN、Infinity或头部的末尾两项。此兼容不触发自动运动或重试。
+参考现有宇树arm卡片的命名姿态列表与x-action-params参数分组；实际执行仍使用TRON2 MoveJ，不复制宇树动作ID或硬件命令。
 
-`arm_control` 的 `info` 只报告连接状态；`move` 必须传入双臂14项 `joint`（左臂7项、右臂7项，单位rad）和0.1–60秒的 `time`（默认2秒）。读取关节状态虽然有16项，MoveJ不接受末尾两项头部目标。依据[厂家SDK指南3.6.1](https://www.limxdynamics.com/zh/documents/847884267345285120)校验14项及公布的绝对关节限位。没有15度变化限制，也没有本机一次授权步骤。
+| ACTION | 参数 | 行为 |
+| --- | --- | --- |
+| move | joint、time（默认8秒） | 14项绝对目标，左7右7，rad，不包含头部 |
+| pose | pose_name、time（省略则自动计算） | 执行以本机保存home为基准的命名姿态 |
+| reset | 无 | 回到本机保存的自然垂下目标 |
+| preview | pose_name（默认arms_down） | 读取目标/角度差/预计时长，不发送运动 |
+| list | 无 | 列出可选姿态，不发送运动 |
+| verify_at_home | 无 | 单个最近关节样本与home误差≤1度检查 |
 
-运动仅由显式MCP调用触发。运行时先拒绝非法值、超限、断连及过期状态，然后在原有WebSocket发送一次并按GUID/序列号等待response_movej。`status: accepted`只表示厂家回复success；`arrival_verified: false`，不保证到达或碰撞路径。超时/断连/发送错误不自动重试，返回结果未知或失败。
+pose_name选项：arms_down、left_elbow_20、right_elbow_20、both_elbows_20。后3项分别将home的左肘索引3、右肘索引10或两者减去20度（转成rad），其余关节保持home目标。它们是绝对目标，不会重复点击累积增加角度。自定义move继续接受数组或≤4096字符的JSON数组文本，不接受NaN/Infinity、bool、数字字符串、头部角度或超限值。
 
-本次修复缺失if代码块的语法错误、motion参数被拒绝、错误后台任务成功提示、actuator被放进传感器采样/topic列表的问题；电池schema补齐实际接受的action并保留无参数调用兼容。check.py只检查三个传感器及卡片类型，不执行机械臂move。模拟接口测试不连接真机。
+reset及pose使用现有`/config/tron2/home.json`（宿主`/opt/phanthy-motus/data/tron2`只读目录挂载）。沿用tron2-arms-reset-pose-v1、14项rad、标准顺序、序列号与固件绑定。升级不重新采集或覆盖home，也不从历史home文件回拷。文件缺失/不匹配时info报告未配置、实际运动拒绝，但平台仍可启动。
 
-自定义GitHub Actions改为源码、离线合同和部署配置验证；不再在未配置私有仓库凭据时尝试登录发布。正式PR镜像沿用上游PR Review Agent，通过/request_bot_review构建。摄像头工作已暂停，未包含在此版本。
+pose/reset时长至少max(8,ceil(最大关节变化度数/5))秒，超过60秒拒绝；pose显式填写time时不得短于此值。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
 
-## 平台启动兼容与 reset_pose（0.4.5）
+start返回ready，stop返回idle，均不发送运动，也不是机器人急停。只有显式move/pose/reset发送一次request_movej并等待GUID/序列号匹配的ACK；accepted不表示到达，arrival_verified为false。超时、断连、未知结果不自动重试；等待运动时长后可单独检查实际关节反馈。
 
-平台开启智能控制会对每张卡片调用start。arm_control和reset_pose均接受info/start/stop；start/stop只返回生命周期状态，不调用机器人，也不是急停。只有arm_control.move或reset_pose.execute发送运动。
-
-reset_pose使用`/config/tron2/home.json`，宿主目录`/opt/phanthy-motus/data/tron2`只读挂载到容器。文件沿用此前保存的tron2-arms-reset-pose-v1格式，要求双臂14项弧度、标准关节顺序、机器人序列号和固件绑定；公共代码不带示例/默认运动目标。原保存姿态可以原样复制，不能用当前随机姿态覆盖原自然下垂目标。文件缺失或不匹配时，平台仍能启动，但execute会明确拒绝发送。
-
-- info：报告是否配置目标；不发运动。
-- preview：返回目标、最大关节变化和预计时间；不发运动。
-- execute：读取固定目标并发送一次MoveJ，等待厂家受理回复；不接收调用方传入的目标角。
-- verify_at_home：用当前最近收到的关节样本检查双臂最大误差≤1度，属于单样本检查，不是连续稳定验收。
-
-复位时间为max(8,ceil(最大角度差/5))秒；超过现有60秒MoveJ时间上限时拒绝，不放宽厂家绝对限位。头部和夹爪不发命令，没有15度变化限制或本机一次授权。execute回复accepted不表示已经到达；等待运动时间后可调用verify_at_home。不进行碰撞路径规划。
-
-首次部署前，将此前确认的姿态复制到宿主目录：
-
-```bash
-sudo install -d -m 0755 /opt/phanthy-motus/data/tron2
-sudo install -m 0600 ~/motus-local-drivers/tron2-reset/home.json /opt/phanthy-motus/data/tron2/home.json
-```
-
-check.py覆盖两个执行卡片的info/start/stop，明确验证motion_sent=false；不会调用move或execute。本次仅新增必要的本机姿态只读挂载及纯Python文件，不添加依赖或扩大硬件权限。
+check.py只调用生命周期/信息和model资源，不执行运动。源码和模拟接口通过不代表网页渲染、实际运动到位或PR审批已经通过。正式镜像由上游PR Review Agent的/request_bot_review发布；部署后仍需现场验收。

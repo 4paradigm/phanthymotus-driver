@@ -25,6 +25,7 @@ from device import Adapter, TOPICS, VERSION
 from vendor import RobotReader
 import state
 import ros2
+import skeleton
 from reset import ARM_NAMES
 
 
@@ -47,6 +48,32 @@ def joints(**updates):
 
 
 class StateTests(unittest.TestCase):
+    def test_skeleton_motor_order_matches_official_model_including_head(self):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(skeleton.model()['urdf'])
+        moving = {joint.get('name') for joint in root.findall('joint') if joint.get('type') != 'fixed'}
+        self.assertEqual(moving, set(skeleton.JOINT_NAMES))
+        self.assertEqual(skeleton.JOINT_NAMES[14:], ['head_pitch_Joint', 'head_yaw_Joint'])
+        self.assertFalse(root.findall('.//mesh'))
+        sample = {'connected': True, 'available': True, 'sample_status': 'recently_received',
+                  'received_at': 1, 'reception_age_seconds': .1, 'measurement_time_verified': False,
+                  'data': state.joint_state(joints(q=[i/100 for i in range(16)]))}
+        packet = skeleton.skeleton_stream(sample)
+        self.assertEqual([j['name'] for j in packet['joints']], skeleton.JOINT_NAMES)
+        self.assertEqual(packet['joints'][14]['q'], .14)
+        self.assertEqual(packet['joints'][15]['q'], .15)
+        self.assertEqual(packet['imu_quat'], [])
+        sample['data'] = state.joint_state(joints(names=list(reversed(skeleton.JOINT_NAMES))))
+        packet = skeleton.skeleton_stream(sample)
+        self.assertEqual(packet['joints'][0]['name'], 'head_yaw_Joint')
+        self.assertEqual(packet['joints'][0]['idx'], 15)
+        sample['data'] = state.joint_state(joints(names=['unknown_'+str(i) for i in range(16)]))
+        packet = skeleton.skeleton_stream(sample)
+        self.assertFalse(packet['status']['available'])
+        self.assertEqual(packet['joints'], [])
+        sample.update(available=False, data=None, sample_status='offline')
+        self.assertEqual(skeleton.skeleton_stream(sample)['joints'], [])
+
     def test_index_labels_and_degree_display_do_not_invent_names(self):
         result = state.joint_state(joints())
         self.assertEqual(result['joint_count'], 16)
@@ -508,17 +535,18 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         result = reply['result']
         return result['isError'], json.loads(result['content'][0]['text'])
 
-    async def test_handshake_and_exactly_three_sensors(self):
+    async def test_handshake_two_sensors_and_model_resource(self):
         reply = await self.rpc('initialize')
         self.assertEqual(reply['result']['serverInfo']['version'], VERSION)
         tools = (await self.rpc('tools/list'))['result']['tools']
-        self.assertEqual({t['name'] for t in tools}, set(TOPICS))
-        self.assertEqual({t['type'] for t in tools}, {'sensor'})
+        self.assertEqual({t['name'] for t in tools}, set(TOPICS) | {'model'})
+        self.assertEqual({t['type'] for t in tools}, {'sensor', 'resource'})
         self.assertEqual((await self.rpc('resources/list'))['result']['resources'], [])
         for tool in tools:
             if tool['type'] == 'sensor':
                 self.assertEqual(tool['topic_out'][0]['topic'], TOPICS[tool['name']])
-                self.assertEqual(tool['topic_out'][0]['format'], 'data/json')
+                self.assertEqual(tool['topic_out'][0]['format'],
+                                 'sensor/skeleton' if tool['name'] == 'joint_state' else 'data/json')
 
     async def test_canvas_lifecycle_and_cache_read_have_no_robot_write_path(self):
         for name in TOPICS:
@@ -548,6 +576,11 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             props = tool['inputSchema']['properties']
             self.assertEqual(props['_trace_id']['maxLength'], 128)
             self.assertEqual(props['instance_id']['type'], 'string')
+            if tool['name'] == 'model':
+                error, result = await self.call('model', instance_id='model', _trace_id=trace)
+                self.assertFalse(error)
+                self.assertIn('<robot', result['urdf'])
+                continue
             actions = ('info', 'start', 'stop')
             for action in actions:
                 with self.subTest(tool=tool['name'], action=action):
@@ -604,7 +637,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(packet['status']['sample_status'], 'recently_received')
                     self.assertFalse(packet['status']['measurement_time_verified'])
                 else:
-                    self.assertTrue(packet['available'])
+                    self.assertTrue(packet['status']['available'])
+                    self.assertEqual(len(packet['joints']), 16)
             self.published.clear()
             self.adapter.reader.disconnect('Disconnected')
             await asyncio.sleep(.51)
@@ -622,8 +656,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(packet['status']['sample_status'], 'offline')
                     self.assertIsNone(packet['status']['current_updated_at_raw'])
                 else:
-                    self.assertIsNone(packet['data'])
-                    self.assertFalse(packet['available'])
+                    self.assertEqual(packet['joints'], [])
+                    self.assertFalse(packet['status']['available'])
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -661,7 +695,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_card_is_not_discovered(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['joint_state']))
-        self.assertEqual({t['name'] for t in adapter.tools()}, {'joint_state'})
+        self.assertEqual({t['name'] for t in adapter.tools()}, {'joint_state', 'model'})
         with self.assertRaises(ValueError):
             adapter.call('battery_state', {'action': 'start'})
 
@@ -673,11 +707,88 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         arm = next(t for t in tools if t['name'] == 'arm_control')
         self.assertEqual(arm['type'], 'actuator')
         props = arm['inputSchema']['properties']
-        self.assertEqual(props['action']['enum'], ['info', 'start', 'stop', 'move'])
+        self.assertEqual(props['action']['enum'], ['info', 'start', 'stop', 'move',
+                         'pose', 'reset', 'preview', 'list', 'verify_at_home'])
         self.assertEqual(props['joint']['minItems'], 14)
         self.assertEqual(props['joint']['maxItems'], 14)
         self.assertEqual(props['joint']['type'], ['array', 'string'])
         self.assertEqual(props['joint']['maxLength'], 4096)
+        self.assertEqual(arm['inputSchema']['x-action-params']['reset']['params'], [])
+        self.assertEqual(arm['inputSchema']['x-action-params']['pose']['params'], ['pose_name', 'time'])
+
+    async def test_removed_cards_are_not_discovered_or_callable(self):
+        self.adapter.enabled.append('arm_control')
+        names = {tool['name'] for tool in self.adapter.tools()}
+        self.assertEqual(names, {'joint_state', 'battery_state', 'arm_control', 'model'})
+        for name in ('robot_status', 'robot_state', 'reset_pose'):
+            error, result = await self.call(name, action='info')
+            self.assertTrue(error)
+            self.assertFalse(result['motion_sent'])
+
+    async def test_pose_preview_preserves_other_joints_and_home_file(self):
+        self.adapter.enabled.append('arm_control')
+        reader = self.adapter.reader
+        reader.ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'home.json'
+            self.reset_pose_fixture(path)
+            raw = path.read_bytes()
+            for name, indices in (('left_elbow_20', (3,)), ('right_elbow_20', (10,)),
+                                  ('both_elbows_20', (3, 10)), ('arms_down', ())):
+                error, result = await self.call('arm_control', action='preview', pose_name=name)
+                self.assertFalse(error)
+                self.assertFalse(result['motion_sent'])
+                for index, angle in enumerate(result['target_q']):
+                    self.assertAlmostEqual(angle, .1-math.radians(20) if index in indices else .1)
+                self.assertEqual(result['duration_seconds'], 8)
+            self.assertEqual(path.read_bytes(), raw)
+            error, result = await self.call('arm_control', action='list')
+            self.assertFalse(error)
+            self.assertIn('right_elbow_20', result['poses'])
+            for kwargs in ({}, {'pose_name': 'bad'}, {'pose_name': []},
+                           {'pose_name': 'left_elbow_20', 'time': .1}):
+                error, result = await self.call('arm_control', action='pose', **kwargs)
+                self.assertTrue(error)
+                self.assertFalse(result['motion_sent'])
+            # The offset must still respect absolute vendor joint limits.
+            target = [.1]*14
+            target[3] = -2.6
+            self.reset_pose_fixture(path, target_q=target)
+            error, result = await self.call('arm_control', action='pose', pose_name='left_elbow_20')
+            self.assertTrue(error)
+            self.assertFalse(result['motion_sent'])
+            self.reset_pose_fixture(path)
+            reader.info_at = time.monotonic()-10
+            error, result = await self.call('arm_control', action='pose', pose_name='right_elbow_20')
+            self.assertTrue(error)
+            self.assertFalse(result['motion_sent'])
+        reader.ws.send_json.assert_not_called()
+
+    async def test_pose_sends_one_correlated_request_and_reports_acceptance(self):
+        self.adapter.enabled.append('arm_control')
+        reader = self.adapter.reader
+        sent = []
+        async def send(body):
+            sent.append(body)
+            packet = {'title': 'response_movej', 'guid': body['guid'],
+                      'accid': reader.serial, 'data': {'result': 'success'}}
+            ws = types.SimpleNamespace(receive=AsyncMock(return_value=types.SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT, data=json.dumps(packet))))
+            await reader.receive(ws, time.monotonic()+1)
+        reader.ws = types.SimpleNamespace(closed=False, send_json=send)
+        with tempfile.TemporaryDirectory() as temp:
+            self.reset_pose_fixture(Path(temp)/'home.json')
+            error, result = await self.call('arm_control', action='pose',
+                                            pose_name='both_elbows_20', time=10)
+            self.assertFalse(error)
+            self.assertEqual(result['action'], 'pose')
+            self.assertEqual(result['status'], 'accepted')
+            self.assertTrue(result['motion_sent'])
+            self.assertFalse(result['arrival_verified'])
+            self.assertEqual(len(sent), 1)
+            self.assertAlmostEqual(sent[0]['data']['joint'][3], .1-math.radians(20))
+            self.assertAlmostEqual(sent[0]['data']['joint'][10], .1-math.radians(20))
+            self.assertEqual(sent[0]['data']['time'], 10)
 
     async def test_arm_control_move_rejects_wrong_joint_count(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
@@ -776,11 +887,11 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Unsupported actuator action', result['error'])
 
     async def test_all_actuator_lifecycle_calls_never_send_even_with_move_fields(self):
-        self.adapter.enabled.extend(['arm_control', 'reset_pose'])
+        self.adapter.enabled.append('arm_control')
         reader = self.adapter.reader
         reader.ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
         tools = {tool['name']: tool for tool in self.adapter.tools()}
-        for name in ('arm_control', 'reset_pose'):
+        for name in ('arm_control',):
             for action in ('info', 'start', 'stop'):
                 self.assertIn(action, tools[name]['inputSchema']['properties']['action']['enum'])
                 kwargs = {'joint': [.1]*14, 'time': 8} if name == 'arm_control' else {}
@@ -801,28 +912,28 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.reader.info['sw_version'] = 'TEST_FW'
 
     async def test_reset_missing_pose_does_not_block_start_but_execute_rejects(self):
-        self.adapter.enabled.append('reset_pose')
+        self.adapter.enabled.append('arm_control')
         with tempfile.TemporaryDirectory() as temp:
             self.adapter.reset.path = Path(temp)/'missing.json'
-            error, result = await self.call('reset_pose', action='start')
+            error, result = await self.call('arm_control', action='start')
             self.assertFalse(error)
             self.assertFalse(result['motion_sent'])
-            error, result = await self.call('reset_pose', action='info')
+            error, result = await self.call('arm_control', action='info')
             self.assertFalse(error)
-            self.assertFalse(result['configured'])
-            error, result = await self.call('reset_pose', action='execute')
+            self.assertFalse(result['home']['configured'])
+            error, result = await self.call('arm_control', action='reset')
             self.assertTrue(error)
             self.assertFalse(result['motion_sent'])
 
     async def test_reset_preview_verification_and_identity_validation_are_read_only(self):
-        self.adapter.enabled.append('reset_pose')
+        self.adapter.enabled.append('arm_control')
         reader = self.adapter.reader
         reader.ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)/'home.json'
             self.reset_pose_fixture(path)
             for action in ('preview', 'verify_at_home'):
-                error, result = await self.call('reset_pose', action=action)
+                error, result = await self.call('arm_control', action=action)
                 self.assertFalse(error)
                 self.assertFalse(result['motion_sent'])
                 self.assertEqual(result['target_q'], [.1]*14)
@@ -831,13 +942,13 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                             {'unit': 'deg'}, {'target_q': [0]*16}, {'target_q': [10]*14},
                             {'joint_names': list(reversed(ARM_NAMES))}):
                 self.reset_pose_fixture(path, **updates)
-                error, result = await self.call('reset_pose', action='execute')
+                error, result = await self.call('arm_control', action='reset')
                 self.assertTrue(error)
                 self.assertFalse(result['motion_sent'])
         reader.ws.send_json.assert_not_called()
 
     async def test_reset_execute_uses_only_file_target_and_awaits_ack(self):
-        self.adapter.enabled.append('reset_pose')
+        self.adapter.enabled.append('arm_control')
         reader = self.adapter.reader
         sent = []
         async def send(body):
@@ -850,12 +961,12 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         reader.ws = types.SimpleNamespace(closed=False, send_json=send)
         with tempfile.TemporaryDirectory() as temp:
             self.reset_pose_fixture(Path(temp)/'home.json')
-            error, result = await self.call('reset_pose', action='execute', target_q=[0]*14)
+            error, result = await self.call('arm_control', action='reset', target_q=[0]*14)
             self.assertTrue(error)
             self.assertEqual(sent, [])
-            error, result = await self.call('reset_pose', action='execute', _trace_id='valid')
+            error, result = await self.call('arm_control', action='reset', _trace_id='valid')
             self.assertFalse(error)
-            self.assertEqual(result['action'], 'execute')
+            self.assertEqual(result['action'], 'reset')
             self.assertEqual(result['status'], 'accepted')
             self.assertFalse(result['arrival_verified'])
             self.assertEqual(len(sent), 1)
@@ -888,11 +999,13 @@ class PackagingTests(unittest.TestCase):
     def test_staged_entry_imports_without_repository_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
+            shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
-            script = ('from pathlib import Path; import main, device, vendor, state, ros2, common; '
-                'assert device.VERSION == "0.4.8"; assert Path(common.__file__).parent.resolve() == Path('+
+            script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
+                'assert "<robot" in skeleton.model()["urdf"]; '
+                'assert device.VERSION == "0.5.0"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -928,7 +1041,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaises(ValueError): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'reset_pose'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control'})
 
     def test_missing_dds_profile_refuses_participant_creation(self):
         with patch.dict(os.environ,FASTRTPS_DEFAULT_PROFILES_FILE='/missing/tron2-dds.xml'):

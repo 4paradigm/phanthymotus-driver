@@ -6,8 +6,8 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.4.8'
-CARDS = {'joint_state', 'robot_status', 'battery_state'}
+VERSION = '0.5.0'
+CARDS = {'joint_state', 'battery_state'}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -59,9 +59,21 @@ def run_check(timeout=20):
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
     names = {tool['name'] for tool in tools}
-    if not CARDS <= names or names - CARDS - {'arm_control', 'reset_pose'} or any(
-            tool['type'] != ('actuator' if tool['name'] in {'arm_control', 'reset_pose'} else 'sensor') for tool in tools):
-        raise ValueError('Unexpected card set; expected three sensors plus optional arm/reset actuators')
+    expected = {**dict.fromkeys(CARDS, 'sensor'), 'arm_control': 'actuator', 'model': 'resource'}
+    if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
+        raise ValueError('Expected two sensors, optional arm_control and model resource')
+    if 'model' not in names:
+        raise ValueError('Skeleton model resource is missing')
+    model_reply = rpc('tools/call', {'name': 'model', 'arguments': {}})
+    model_data = json.loads(model_reply['content'][0]['text'])
+    from skeleton import JOINT_NAMES
+    import xml.etree.ElementTree as ET
+    model_names = {joint.get('name') for joint in ET.fromstring(model_data['urdf']).findall('joint')}
+    if model_reply.get('isError') or not set(JOINT_NAMES) <= model_names:
+        raise ValueError('Skeleton joint names do not match model')
+    joint_tool = next(tool for tool in tools if tool['name'] == 'joint_state')
+    if joint_tool['topic_out'][0]['format'] != 'sensor/skeleton':
+        raise ValueError('Joint card must use skeleton format')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,
@@ -69,7 +81,7 @@ def run_check(timeout=20):
                               '_trace_id': 'readonly-check-trace'}})
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
-    for name in names - CARDS:
+    for name in names & {'arm_control'}:
         for action in ('info', 'start', 'stop'):
             reply = rpc('tools/call', {'name': name, 'arguments': {'action': action,
                 '_trace_id': 'readonly-check-trace', 'instance_id': 'readonly-check'}})
@@ -88,6 +100,10 @@ def run_check(timeout=20):
     if joint['received_at'] <= before['joint_state']['received_at']:
         raise ValueError('Joint response receipt did not update')
     values = joint['data']
+    from skeleton import skeleton_stream
+    skeleton_data = skeleton_stream(joint)
+    if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != 16:
+        raise ValueError('Unsupported skeleton joint layout or names')
     battery = after['battery_state']['data']
     if set(battery) != {'schema_version', 'soc', 'voltage', 'current', 'power',
                        'temperature', 'cycle', 'units', 'validity',
@@ -97,7 +113,7 @@ def run_check(timeout=20):
     if battery['schema_version'] != 3 or len(battery['temperature_channels_raw']) != 5 \
             or battery['power_status'] != 'estimated_assuming_mV_mA':
         raise ValueError('Unexpected battery schema, channels or power interpretation')
-    print('PASS: three sensor cards; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: two sensors, skeleton/model and arm actions; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])

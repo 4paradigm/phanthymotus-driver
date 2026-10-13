@@ -11,6 +11,9 @@ ARM_NAMES = ['proximal_pitch_L_Joint', 'proximal_roll_L_Joint', 'proximal_yaw_L_
              'proximal_pitch_R_Joint', 'proximal_roll_R_Joint', 'proximal_yaw_R_Joint',
              'elbow_R_Joint', 'wrist_yaw_R_Joint', 'wrist_pitch_R_Joint', 'wrist_roll_R_Joint']
 
+POSES = {'arms_down': (), 'left_elbow_20': (3,),
+         'right_elbow_20': (10,), 'both_elbows_20': (3, 10)}
+
 
 class ResetPose:
     def __init__(self, path, reader):
@@ -36,10 +39,10 @@ class ResetPose:
         target, _ = validate_movej(pose.get('target_q'), 8)
         return pose, target, hashlib.sha256(raw).hexdigest()
 
-    def call(self, action):
+    def call(self, action, pose_name='arms_down', time=None):
         # Lifecycle never loads a target or sends a command, even with no pose configured.
         if action in ('start', 'stop'):
-            return {'state': 'running' if action == 'start' else 'idle',
+            return {'state': 'ready' if action == 'start' else 'idle',
                     'motion_sent': False, 'lifecycle_only': True}
         if action == 'info':
             try:
@@ -50,6 +53,8 @@ class ResetPose:
                 return {'configured': False, 'error': str(exc), 'motion_sent': False}
         if action not in ('preview', 'verify_at_home', 'execute'):
             raise ValueError('Unsupported reset action')
+        if pose_name not in POSES:
+            raise ValueError('Unknown pose; no motion sent')
         pose, target, digest = self.load()
         status = self.reader.sample('robot_status')
         joint = self.reader.sample('joint_state')
@@ -61,14 +66,24 @@ class ResetPose:
         current = joint['data']['q']
         if len(current) < 14:
             raise ValueError('Expected at least 14 arm joint positions; no motion sent')
+        # Fixed named targets relative to the saved home, never cumulative
+        # increments on the current pose. Head and gripper stay unchanged.
+        for index in POSES[pose_name]:
+            target[index] -= math.radians(20)
         delta = max(abs(math.degrees(a-b)) for a, b in zip(current[:14], target))
         # At least eight seconds; retain a conservative duration for larger changes.
         duration = max(8, math.ceil(delta / 5))
+        if time is not None:
+            _, requested = validate_movej(target, time)
+            if requested < duration:
+                raise ValueError('Pose time must be at least ' + str(duration) + ' seconds; no motion sent')
+            duration = requested
         validate_movej(target, duration)
         result = {'action': action, 'motion_sent': False, 'target_q': target,
                   'duration_seconds': duration, 'max_joint_change_deg': delta,
                   'pose_sha256': digest, 'head_policy': 'unchanged',
-                  'gripper_policy': 'unchanged', 'path_validated': False}
+                  'gripper_policy': 'unchanged', 'path_validated': False,
+                  'pose_name': pose_name}
         if action == 'verify_at_home':
             result.update(at_home=delta <= 1, tolerance_deg=1,
                           verification='single_recent_sample')
