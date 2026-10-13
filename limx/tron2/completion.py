@@ -12,6 +12,9 @@ ARRIVAL_GRACE = 10
 TOLERANCE_DEG = 1
 STABILITY_DEG = .2
 STABILITY_SECONDS = .5
+# Vendor dq is preserved without a verified unit definition. This is an
+# additional raw near-zero gate; stationary position is checked from q itself.
+VELOCITY_RAW_TOLERANCE = .05
 
 
 def arm_feedback(reader):
@@ -34,6 +37,12 @@ class ArmCompletion:
                 if self.active else self.last)
 
     async def dispatch(self, action, target, duration, details):
+        # Core can wake its next action before the callback HTTP response has
+        # reached us. Wait for that bounded delivery only after verified arrival;
+        # reject immediately while moving or when completion is uncertain.
+        if self.active and self.active['state'] == 'reporting' \
+                and self.active.get('arrival_verified'):
+            await asyncio.shield(self.task)
         if self.closed or self.active:
             raise MoveError('Arms are busy or require operator verification; no additional motion sent', False)
         target, duration = validate_movej(target, duration)
@@ -68,7 +77,7 @@ class ArmCompletion:
                 last_at = at
                 now = time.monotonic()
                 error = max(abs(math.degrees(a-b)) for a, b in zip(q, job['target']))
-                slow = all(v is None or abs(v) <= .05 for v in dq)
+                slow = all(v is None or abs(v) <= VELOCITY_RAW_TOLERANCE for v in dq)
                 if now < not_before or error > TOLERANCE_DEG or not slow:
                     window = []
                 else:
@@ -116,6 +125,7 @@ class ArmCompletion:
                 job['admission'].set_exception(MoveError('Motion result unknown; driver stopping', None))
             result.update(action=job['action'], joint_count=14)
             result['motion_may_continue'] = status != 'completed'
+            job['arrival_verified'] = result['arrival_verified']
             job['state'] = 'reporting'
             delivered = False
             try:

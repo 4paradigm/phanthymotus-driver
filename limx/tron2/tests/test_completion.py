@@ -123,6 +123,19 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError,'Fresh'): await self.dispatch()
         self.reader.send_movej.assert_not_called()
 
+    async def test_core_followup_waits_for_callback_response_after_verified_arrival(self):
+        entered=asyncio.Event(); release=asyncio.Event()
+        async def report(*args): entered.set();await release.wait();return True
+        self.report.side_effect=report
+        first=await self.dispatch();self.pump([.1]*14+[0,0])
+        await asyncio.wait_for(entered.wait(),1)
+        followup=asyncio.create_task(self.dispatch());await asyncio.sleep(.02)
+        self.assertFalse(followup.done());self.reader.send_movej.assert_awaited_once()
+        release.set();second=await asyncio.wait_for(followup,1)
+        self.assertNotEqual(first['action_id'],second['action_id'])
+        self.assertEqual(self.reader.send_movej.await_count,2)
+        await self.motion.task
+
 class CallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_rpc_admission_then_real_http_callback_matches_registered_action(self):
         received=[]; terminal=asyncio.Event(); pending=set()

@@ -152,7 +152,7 @@ check.py只调用生命周期/信息和model资源，不执行运动。源码和
 ## 动作完成协议（0.5.4）
 
 - move、pose、reset返回唯一action_id；awaiting_ack/moving期间同一个驱动实例保留双臂所有权，第二个动作拒绝，不依赖Core的资源标签作为唯一锁。HTTP调用方断开不会取消正在发送的物理命令，也不会释放所有权。
-- 从ACK结束后保守等待完整time/duration_seconds，再检查至少3个不同的新关节回复，跨度至少0.5秒；14项误差均≤1度、相对首个样本变化≤0.2度，有dq时每项速度绝对值≤0.05rad/s。厂家名称重排时先映射至官方索引；不能用同一缓存样本或命令目标伪造到位。
+- 从ACK结束后保守等待完整time/duration_seconds，再检查至少3个不同的新关节回复，跨度至少0.5秒；14项误差均≤1度、相对首个样本变化≤0.2度，有dq时额外要求每项原始值绝对值≤0.05（未将dq单位认证为rad/s）。位置稳定性直接由q判断。厂家名称重排时先映射至官方索引；不能用同一缓存样本或命令目标伪造到位。
 - 到位后POST /api/acp/complete：action_id、status=completed、result.arrival_verified=true及误差/样本数，tool=arm_control。初始响应仍是受理；通过arm_control.info或/health的arm_motion可查看最终状态。该验证基于连续新收到的关节回复，厂家测量时间戳仍未验证，不代表路径碰撞规划或独立运动安全认证。
 - 超出预计时长再加10秒仍未满足条件、反馈过期、断连或连接更换，报告status=error、arrival_verified=false。发送/ACK结果不明时仍返回跟踪ID并检查反馈，不重发MoveJ；厂家明确拒绝或发送前拒绝不生成已受理动作。
 - ACP使用与注册相同的已验证HTTPS证书上下文，禁止重定向、不读取ACCESS_TOKEN、不关闭TLS验证；同一终态payload最多尝试3次，每次最多3秒，退避0.5/1秒。最坏发送/ACK、60秒动作、验证和回调仍小于声明的120秒上限。
