@@ -4,11 +4,12 @@ import json
 import pytest
 from common.teleop_contract import (
     COMMAND_SCHEMA, FEEDBACK_SCHEMA, TRACKING_FRAME, command_from_input,
-    topics, binding_from_topic, validate_input, validate_operation, validate_feedback,
+    validate_input, validate_operation, validate_feedback,
 )
 
 NOW = 1_000_000_000
-OPTIONS = dict(instance_id="pico_1", clock_id="boot-test", now_ns=NOW)
+INPUT_OPTIONS = dict(clock_id="boot-test", now_ns=NOW)
+OPTIONS = dict(instance_id="pico_1", **INPUT_OPTIONS)
 
 
 def input_frame():
@@ -50,34 +51,21 @@ def feedback():
 def test_json_round_trip_and_detached_snapshot(factory, validator):
     value = json.loads(json.dumps(factory()))
     original = copy.deepcopy(value)
-    result = validator(value, **OPTIONS)
+    result = validator(value, **(INPUT_OPTIONS if validator is validate_input else OPTIONS))
     assert result == original
     value["instance_id"] = "changed"
     assert result["instance_id"] == original["instance_id"]
 
 
-def test_topic_binding_round_trip():
-    assert topics("/robot/fleet", "pico-1") == (
-        "/robot/fleet/teleop/pico_1/command", "/robot/fleet/teleop/pico_1/feedback")
-    assert binding_from_topic(topics("robot/fleet", "pico-1")[0]) == ("robot/fleet", "pico_1")
-
-
-@pytest.mark.parametrize("value", ["a", "/x/command", "/x/teleop//command",
-    "/x/teleop/pico/feedback", "/x//teleop/pico/command", "/../teleop/pico/command",
-    "/x/teleop/pico-1/command"])
-def test_invalid_binding_rejected(value):
-    with pytest.raises(ValueError): binding_from_topic(value)
-
-
 @pytest.mark.parametrize("key,value", [
     ("schema", "motus.xr.input/1"), ("schema", "asr/1"), ("kind", "operation"),
-    ("clock_id", "other-boot"), ("instance_id", "other-headset"),
+    ("clock_id", "other-boot"), ("instance_id", ""),
     ("sequence", True), ("connection_epoch", -1), ("sequence", 1 << 63),
     ("tracking_frame", "robot_base"), ("received_monotonic_ns", NOW+1),
     ("received_monotonic_ns", NOW-300_000_001)])
 def test_input_rejects_wrong_identity_clock_or_stale_data(key, value):
     frame = input_frame(); frame[key] = value
-    with pytest.raises(ValueError): validate_input(frame, **OPTIONS)
+    with pytest.raises(ValueError): validate_input(frame, **INPUT_OPTIONS)
 
 
 @pytest.mark.parametrize("key,value", [("grip", float("nan")), ("trigger", 1.1),
@@ -85,13 +73,13 @@ def test_input_rejects_wrong_identity_clock_or_stale_data(key, value):
     ("tracked", "true")])
 def test_invalid_controller_rejected(key, value):
     frame = input_frame(); frame["left"][key] = value
-    with pytest.raises(ValueError): validate_input(frame, **OPTIONS)
+    with pytest.raises(ValueError): validate_input(frame, **INPUT_OPTIONS)
 
 
 def test_tracking_loss_is_an_admissible_stop_signal_without_pose():
     frame = input_frame()
     frame["left"].update(tracked=False, position=None, orientation_xyzw=None)
-    assert validate_input(frame, **OPTIONS)["left"]["tracked"] is False
+    assert validate_input(frame, **INPUT_OPTIONS)["left"]["tracked"] is False
 
 
 def test_wrapping_does_not_refresh_a_stale_pose():
@@ -99,7 +87,7 @@ def test_wrapping_does_not_refresh_a_stale_pose():
     frame["received_monotonic_ns"] -= 300_000_001
     wrapped = command_from_input(frame)
     assert wrapped["received_monotonic_ns"] == frame["received_monotonic_ns"]
-    with pytest.raises(ValueError): validate_input(wrapped, **OPTIONS)
+    with pytest.raises(ValueError): validate_input(wrapped, **INPUT_OPTIONS)
 
 
 @pytest.mark.parametrize("change", [dict(action="release_all"), dict(request_id=""),
@@ -113,7 +101,7 @@ def test_invalid_operation_and_deadlines_rejected(change):
 def test_operation_is_not_a_pose_and_can_request_stop_without_tracking():
     value = operation(); value["action"] = "stop"
     assert validate_operation(value, **OPTIONS)["action"] == "stop"
-    with pytest.raises(ValueError): validate_input(value, **OPTIONS)
+    with pytest.raises(ValueError): validate_input(value, **INPUT_OPTIONS)
 
 
 @pytest.mark.parametrize("change", [dict(schema="motus.motion.feedback/1"),
@@ -155,7 +143,7 @@ def test_optional_controls_and_future_tracking_survive_round_trip():
     }
     frame['extensions'] = {'trackers': {'left_foot': {'tracked': False}}}
     frame['future_metadata'] = {'revision': 2}
-    admitted = validate_input(json.loads(json.dumps(frame)), **OPTIONS)
+    admitted = validate_input(json.loads(json.dumps(frame)), **INPUT_OPTIONS)
     assert admitted == frame
     frame['left']['controls']['axes']['thumbstick']['value'][0] = 1
     assert admitted['left']['controls']['axes']['thumbstick']['value'] == [.3, -.4]
@@ -175,7 +163,7 @@ def test_malformed_known_controls_are_not_silently_accepted(controls):
     frame = input_frame()
     frame['left']['controls'] = controls
     with pytest.raises(ValueError):
-        validate_input(frame, **OPTIONS)
+        validate_input(frame, **INPUT_OPTIONS)
 
 
 @pytest.mark.parametrize('extension', [[], 'unknown', {'future': float('nan')}])
@@ -183,4 +171,4 @@ def test_extension_keeps_finite_json_object_contract(extension):
     frame = input_frame()
     frame['extensions'] = extension
     with pytest.raises(ValueError):
-        validate_input(frame, **OPTIONS)
+        validate_input(frame, **INPUT_OPTIONS)

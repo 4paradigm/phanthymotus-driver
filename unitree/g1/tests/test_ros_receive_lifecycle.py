@@ -58,12 +58,11 @@ def bus_stub():
     return bus,events,callbacks
 
 
-def test_first_source_identity_does_not_recreate_subscription(tmp_path):
+def test_input_does_not_recreate_subscription(tmp_path):
     card, frame=input_card(tmp_path)
     bus,events,callbacks=bus_stub();bus.control=card
     bus._bind(dict(card.binding))
     callbacks[0](SimpleNamespace(data=json.dumps(frame)))
-    assert card.binding['instance_id']=='card_random'
     bus._bind(dict(card.binding))
     assert events==['create_sub'] and bus.subscription_generation==1
     assert bus.status()['last_accepted_sequence']==1
@@ -91,13 +90,13 @@ def test_restart_reports_binding_missing_not_stale(tmp_path):
     assert card._operator is None
 
 
-def test_duplicate_canvas_start_keeps_pinned_identity_and_baseline(tmp_path):
+def test_duplicate_canvas_start_keeps_baseline(tmp_path):
     card,frame=input_card(tmp_path);card.receive(frame)
     card._thread=SimpleNamespace(is_alive=lambda:True)
     card.info=lambda:{'ok':True}
     card.mapping.anchor=object();anchor=card.mapping.anchor
     assert card.start({'input_topic':'/teleop/command'})=={'ok':True}
-    assert card.mapping.anchor is anchor and card.binding['instance_id']=='card_random'
+    assert card.mapping.anchor is anchor
 
 
 def test_stop_without_authority_is_idempotent_and_does_not_call_sdk(tmp_path):
@@ -117,3 +116,17 @@ def test_old_topic_packet_rejected_before_owner_rebinds(tmp_path):
     card.binding=dict(card.binding,command_topic='/new/topic')
     callbacks[0](SimpleNamespace(data=json.dumps(frame)))
     assert card._input_sequence==-1 and bus.last_accepted_sequence is None
+
+
+def test_canvas_topic_is_used_without_source_path_convention(tmp_path):
+    card, _ = input_card(tmp_path)
+    card.motion.start = lambda: None
+    card._thread = SimpleNamespace(is_alive=lambda: True)
+    card.info = lambda: {'ok': True}
+    assert card.start({'input_topic': '/canvas/custom_input'}) == {'ok': True}
+    assert card.binding == {'command_topic': '/canvas/custom_input', 'feedback_topic': '/teleop/state'}
+    bus, _, _ = bus_stub()
+    subscribed = []
+    bus.node.create_subscription = lambda _, topic, *args: subscribed.append(topic)
+    bus._bind(card.binding)
+    assert subscribed == ['/canvas/custom_input']

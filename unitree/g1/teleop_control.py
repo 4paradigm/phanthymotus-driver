@@ -14,8 +14,7 @@ import secrets
 import threading
 import time
 
-from common.teleop_contract import (binding_from_topic, topics, validate_input,
-                                    FEEDBACK_SCHEMA, canonical_instance)
+from common.teleop_contract import validate_input, FEEDBACK_SCHEMA
 from common.motion.protocol import envelope
 
 
@@ -154,22 +153,11 @@ class TeleopControl:
         args = args or {}
         if not args.get('input_topic'):
             return {**self.info(), 'state': 'waiting_binding', 'reason': 'input_topic_required'}
-        if args['input_topic'] == '/teleop/command':
-            namespace, source_instance = '', None
-            command_topic, feedback_topic = '/teleop/command', '/teleop/state'
-        else:
-            namespace, source_instance = binding_from_topic(args['input_topic'])
-            command_topic, _ = topics(namespace, source_instance)
-            feedback_topic = '/teleop/state'
-        binding = {'namespace': namespace, 'instance_id': source_instance,
-                   'command_topic': command_topic, 'feedback_topic': feedback_topic}
+        binding = {'command_topic': args['input_topic'], 'feedback_topic': '/teleop/state'}
         with self._lock:
             same_topics = bool(self.binding and all(self.binding.get(k) == binding[k]
                                for k in ('command_topic', 'feedback_topic')))
             if same_topics:
-                # Source pinning is not a transport rebind. Repeated Canvas
-                # start must not erase identity or remap an active operator.
-                binding['instance_id'] = self.binding['instance_id']
                 if not self._closed.is_set() and self._thread and self._thread.is_alive():
                     return self.info()
             if self.binding and not same_topics and self._operator:
@@ -195,22 +183,15 @@ class TeleopControl:
 
     def receive(self, value):
         if not self.binding:return False
-        # The single-device topic carries identity in JSON, not in its path.
         if value.get('kind') != 'input':
             raise ValueError('device_input_only')
-        with self._lock:
-            if self.binding['instance_id'] is None:
-                source = canonical_instance(value.get('instance_id'))
-                validate_input(value, instance_id=source, clock_id=self.clock_id, now_ns=self.clock())
-                self.binding['instance_id'] = source
         if self._closed.is_set():return False
-        frame = validate_input(value, instance_id=self.binding['instance_id'], clock_id=self.clock_id,
+        frame = validate_input(value, clock_id=self.clock_id,
                                now_ns=self.clock())
         identity = self._identity(frame)
         with self._lock:
             old = self._input_identity
-            if old and (identity[0] != old[0] and self._operator or
-                        identity[0] == old[0] and (identity[1] < old[1] or identity[2] < old[2])):
+            if old and identity[0] == old[0] and (identity[1] < old[1] or identity[2] < old[2]):
                 raise ValueError('old_input_generation')
             if identity == old and frame['sequence'] <= self._input_sequence: return False
             self._input_identity, self._input_sequence = identity, frame['sequence']
@@ -226,7 +207,7 @@ class TeleopControl:
     def _latest_fresh(self):
         frame = copy.deepcopy(self._latest)
         if frame is None: raise ValueError('input_missing')
-        frame = validate_input(frame, instance_id=self.binding['instance_id'], clock_id=self.clock_id,
+        frame = validate_input(frame, clock_id=self.clock_id,
                                 now_ns=self.clock())
         if not all(frame[k]['tracked'] for k in ('head_reference','left','right')):
             raise ValueError('tracking_lost')
@@ -465,7 +446,7 @@ class TeleopControl:
             input_status = self.input_status()
             return {'schema': FEEDBACK_SCHEMA,
                 'text': html.escape(f"遥操：{self._state} | 输入：{input_status['state']} | 输入帧：{self._input_sequence} | 执行：{state['state']} | 已下发：{state['applied_sequence']} | 输出：{state['output_active']} | 原因：{self._reason or state['reason'] or '无'}"),
-                'instance_id': self.binding['instance_id'] if self.binding else '',
+                'instance_id': self._latest['instance_id'] if self._latest else '',
                 'control_instance_id': self.instance_id, 'server_epoch': self.server_epoch,
                 'sequence': self._feedback_sequence, 'emitted_monotonic_ns': self.clock(),
                 'clock_id': self.clock_id, 'source_sequence': self._input_sequence,

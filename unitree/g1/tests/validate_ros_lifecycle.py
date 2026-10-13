@@ -22,12 +22,12 @@ ctx=Context();rclpy.init(context=ctx,domain_id=42)
 shared=SingleThreadedExecutor(context=ctx)
 class Control:
  def __init__(self):
-  self._lock=threading.RLock();self.binding={'command_topic':'/test/a','feedback_topic':'/test/state','instance_id':None}
+  self._lock=threading.RLock();self.binding={'command_topic':'/test/a','feedback_topic':'/test/state'}
   self.executor=types.SimpleNamespace(set_joint_publisher=lambda cb:None,accept_control=lambda *a:None)
   self.received=[]
  def receive(self,value):
   with self._lock:
-   self.binding['instance_id']='pinned';self.received.append(value['sequence']);return True
+   self.received.append(value['sequence']);return True
  def feedback(self):return {'count':len(self.received)}
 control=Control();bus=TeleopBus(shared,control)
 node=Node('isolated_input_test',context=ctx)
@@ -52,7 +52,7 @@ try:
  first=len(control.received)
  for i in range(20):
   topic='/test/b' if i%2==0 else '/test/a'
-  with control._lock:control.binding={'command_topic':topic,'feedback_topic':'/test/state','instance_id':None}
+  with control._lock:control.binding={'command_topic':topic,'feedback_topic':'/test/state'}
   send(.12,topic)
  assert len(control.received)>first and bus.health.status()['healthy']
  assert owner_events and all(name=='g1-teleop-ros' for _,name in owner_events),owner_events

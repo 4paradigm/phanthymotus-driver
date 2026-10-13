@@ -63,6 +63,8 @@ docker build --platform linux/arm64 \
 | 设备 → 控制卡 | `/teleop/command` | `data/teleop-cmd`，JSON schema `motus.teleop.command/1` |
 | 控制卡 → Canvas 监控 | `/teleop/state` | `data/teleop-state` |
 
+输入来源由 Canvas 连线决定。控制卡直接订阅传入的 `input_topic`，不限定 topic 路径、不按首帧绑定来源实例，也不额外认证消息中的实例或设备 ID。格式、时效、序号和代次检查仍保留；设备或跟踪空间变化后，需要松握重建坐标基准。
+
 设备输入为左右控制器位姿、握把、跟踪状态、身份、代次、序号与时效。设备卡不订阅机器人反馈；PICO 只显示连接状态和握把提示。URDF、关节顺序、数值求解与执行均在机器人 Driver 内。
 
 ### 机型 profile 与每轮基准

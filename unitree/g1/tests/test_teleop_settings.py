@@ -33,7 +33,7 @@ def test_internal_shadow_is_still_supported(tmp_path):
 def input_card(tmp_path):
     motion = SimpleNamespace(executor=SimpleNamespace(cfg={}), clock_id='offline')
     card = TeleopControl({'state_path': str(tmp_path / 'none'), 'mode': 'shadow'}, motion, clock=lambda: 1_000_000_000)
-    card.binding = {'namespace':'', 'instance_id':None, 'command_topic':'/teleop/command', 'feedback_topic':'/teleop/state'}
+    card.binding = {'command_topic':'/teleop/command', 'feedback_topic':'/teleop/state'}
     pose = {'tracked':True, 'position':[0.,0.,1.], 'orientation_xyzw':[0.,0.,0.,1.]}
     frame = {'schema':'motus.teleop.command/1','kind':'input','instance_id':'card-random',
       'device_id':'paired-device','connection_epoch':1,'space_epoch':1,'sequence':1,
@@ -43,14 +43,17 @@ def input_card(tmp_path):
     return card, frame
 
 
-def test_fixed_topic_pins_valid_source_and_rejects_other_instances(tmp_path):
-    import pytest
+def test_canvas_input_accepts_new_source_and_preserves_generation_checks(tmp_path):
     card, frame = input_card(tmp_path)
     assert card.receive(frame)
-    assert card.binding['instance_id'] == 'card_random'
     assert card.receive(frame) is False
-    with pytest.raises(ValueError, match='input_binding_mismatch'):
-        card.receive(dict(frame, instance_id='another-device-card', sequence=2))
+    assert card.receive(dict(frame, instance_id='another-device-card', sequence=2))
+    card._operator = 'active-session'
+    card._mapping_identity = (frame['device_id'], frame['space_epoch'])
+    changed = dict(frame, instance_id='new-card', device_id='new-device', sequence=1)
+    assert card.receive(changed) and card._needs_calibration
+    with pytest.raises(ValueError, match='old_input_generation'):
+        card.receive(dict(changed, connection_epoch=0, sequence=2))
     with pytest.raises(ValueError, match='device_input_only'):
         card.receive({'kind':'operation','action':'begin'})
 

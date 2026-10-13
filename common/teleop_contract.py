@@ -53,28 +53,6 @@ def canonical_instance(value):
     return normalized
 
 
-def topics(namespace, instance_id):
-    namespace = _text(namespace, "namespace").strip("/")
-    parts = namespace.split("/")
-    if any(not _TOKEN.fullmatch(part) for part in parts):
-        raise ValueError("invalid_namespace")
-    root = "/" + namespace + "/teleop/" + canonical_instance(instance_id)
-    return root + "/command", root + "/feedback"
-
-
-def binding_from_topic(input_topic):
-    value = _text(input_topic, "input_topic", maximum=512)
-    if not value.startswith("/") or not value.endswith("/command"):
-        raise ValueError("invalid_input_topic")
-    parts = value.split("/")
-    if len(parts) < 5 or parts[-3] != "teleop":
-        raise ValueError("invalid_input_topic")
-    namespace, instance = "/".join(parts[1:-3]), parts[-2]
-    if topics(namespace, instance)[0] != value:
-        raise ValueError("invalid_input_topic")
-    return namespace, instance
-
-
 def _wire(value):
     if not isinstance(value, dict):
         raise ValueError("invalid_message")
@@ -86,9 +64,8 @@ def _wire(value):
         raise ValueError("message_too_large")
 
 
-def _identity(value, *, instance_id, clock_id):
-    if canonical_instance(value.get("instance_id")) != canonical_instance(instance_id):
-        raise ValueError("input_binding_mismatch")
+def _identity(value, *, clock_id):
+    _text(value.get("instance_id"), "instance_id")
     _text(value.get("device_id"), "device_id")
     if value.get("clock_id") != clock_id:
         raise ValueError("input_clock_mismatch")
@@ -165,11 +142,11 @@ def validate_controls(value):
     return value
 
 
-def validate_input(value, *, instance_id, clock_id, now_ns, max_age_ns=MAX_INPUT_AGE_NS):
+def validate_input(value, *, clock_id, now_ns, max_age_ns=MAX_INPUT_AGE_NS):
     _wire(value)
     if value.get("schema") != COMMAND_SCHEMA or value.get("kind") != "input":
         raise ValueError("invalid_input_schema")
-    _identity(value, instance_id=instance_id, clock_id=clock_id)
+    _identity(value, clock_id=clock_id)
     _integer(value.get("source_monotonic_ns"), "source_monotonic_ns")
     _fresh(value["received_monotonic_ns"], now_ns, max_age_ns)
     if value.get("tracking_frame") != TRACKING_FRAME:
@@ -196,7 +173,9 @@ def validate_operation(value, *, instance_id, clock_id, now_ns,
     _wire(value)
     if value.get("schema") != COMMAND_SCHEMA or value.get("kind") != "operation":
         raise ValueError("invalid_operation_schema")
-    _identity(value, instance_id=instance_id, clock_id=clock_id)
+    if canonical_instance(value.get("instance_id")) != canonical_instance(instance_id):
+        raise ValueError("input_binding_mismatch")
+    _identity(value, clock_id=clock_id)
     _text(value.get("request_id"), "request_id", maximum=128)
     if value.get("action") not in ACTIONS:
         raise ValueError("unsupported_operation")
