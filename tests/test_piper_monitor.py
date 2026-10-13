@@ -63,6 +63,33 @@ class MonitorTests(unittest.TestCase):
                                          ros2=object(), clock=lambda: self.now, publisher_factory=factory)
         self.addCleanup(self.plugin.stop)
 
+    def test_deployed_passive_snapshot_names_without_mutation(self):
+        data = snapshot()
+        data["fresh"] = data.pop("feedback_fresh")
+        data["faults"] = {key: data.pop(key) for key in ("arm_status", "error_code", "motor_faults")}
+        data["last_actions"] = data.pop("completed_actions")
+        original = deepcopy(data)
+        skeleton, params, stamp = monitor_frame(data, now=1000., device_name="机械臂 1")
+        self.assertIsNotNone(skeleton)
+        self.assertEqual(params["反馈状态"], "新鲜")
+        self.assertEqual(params["设备状态"], "NORMAL(0x0)")
+        self.assertEqual(params["故障码"], 0)
+        self.assertEqual(params["最近动作结果"], data["last_actions"])
+        self.assertEqual(data, original)
+        data["fresh"] = False
+        self.assertIsNone(monitor_frame(data, now=1000., device_name="机械臂 1")[0])
+
+    def test_explicit_canonical_fields_override_snapshot_aliases(self):
+        data = snapshot()
+        data.update(fresh=True, feedback_fresh=False,
+                    faults={"error_code": 99, "arm_status": "ERROR", "motor_faults": ["J1"]},
+                    last_actions={"other": "ignored"})
+        skeleton, params, stamp = monitor_frame(data, now=1000., device_name="机械臂 1")
+        self.assertIsNone(skeleton)
+        self.assertEqual(params["故障码"], 0)
+        self.assertEqual(params["设备状态"], "NORMAL(0x0)")
+        self.assertEqual(params["最近动作结果"], data["completed_actions"])
+
     def test_bundle_contract_plain_model_and_no_construction_or_start_reads(self):
         bundle = DriverBundle([self.plugin])
         tools = bundle.get_all_tools()

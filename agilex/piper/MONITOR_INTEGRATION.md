@@ -8,6 +8,9 @@
 - 每台机械臂两张核心卡：`arm_control` 与 `piper_monitor`；`piper_photo` 保留为可选卡。
 - 使用现场已有 Core（含 PR #305 的中文标签和手动执行支持），本次不修改 Core。
   通用表单采用“选择操作＋执行按钮”；骨架和参数由监控区域的两个输出展示。
+- 已核实 Core 的卡片「查看数据流」入口向骨架渲染器传递固定设备 ID `detail`，模型查询失败后
+  回退为人形。用户明确选择不改 Core，当前使用顶部「监控」入口；该入口携带真实 MCP ID。
+  独立渲染器验收通过不能代表卡片详情入口通过，不应把人形回退当作 PiPER 展示结果。
 - 每台继续使用原有 MCP、CAN、数据目录和相机绑定。权限、预览、动作结果和话题按设备隔离。
 - 监控复用共享 runtime/CAN，只接受一个只读快照函数；不创建 SDK 或第二个 CAN 连接。
 - 保留旧十卡源码、未提交的 `smoke-test.py`、现场额外关节限位功能及部署备份。
@@ -60,6 +63,11 @@ plugins = [runtime, monitor]  # 返回给现有 DriverBundle
 | `error_code` / `motor_faults` | 故障码整数 / 故障名称列表 |
 | `busy` / `active_card` | 是否执行动作 / 当前动作卡名称或 None |
 | `completed_actions` | 按公共工具名保存的动作结果字典，缺失不得冒充成功 |
+
+2026-10-13 计划一现场实现使用 `fresh`、`faults`、`last_actions`。
+监控也接受这些字段：`fresh` 对应 `feedback_fresh`；`faults` 内取 `arm_status/error_code/motor_faults`；
+`last_actions` 对应 `completed_actions`。若同时给出表中字段，则表中字段优先；不修改提供方快照。
+生产插件与共享 runtime 同主机使用同一时钟；跨主机临时测试须核验时钟差，不能把接收时间当作 CAN 时间。
 
 缺失字段按“不可用”显示，禁止填零、false 或空成功结果来假装设备反馈。夹爪反馈须单独检查有效性。
 提供方应尽快返回缓存反馈；连接、断线重连和 SDK 查询归共享 runtime 管理，不在此回调中执行。

@@ -99,6 +99,10 @@ class MonitorSnapshot(TypedDict, total=False):
     busy: bool
     active_card: str | None
     completed_actions: dict
+    # Names used by plan one's deployed read_monitor_snapshot(); accepted aliases.
+    fresh: bool
+    faults: dict
+    last_actions: dict
 
 
 def _finite(value):
@@ -145,6 +149,19 @@ def _timestamp(value):
 def monitor_frame(snapshot: Mapping, *, now: float, device_name: str,
                   last_valid_time: float | None = None, error: str | None = None):
     """Return (optional real skeleton, Chinese parameters, last valid timestamp)."""
+    # Plan one's deployed passive snapshot uses fresh/faults/last_actions.
+    # Accept those names without calling any control/status method or changing
+    # the provider's data. Explicit canonical fields always take precedence.
+    snapshot = dict(snapshot)
+    if "feedback_fresh" not in snapshot and "fresh" in snapshot:
+        snapshot["feedback_fresh"] = snapshot["fresh"]
+    faults = snapshot.get("faults")
+    if isinstance(faults, Mapping):
+        for key in ("arm_status", "error_code", "motor_faults"):
+            if key not in snapshot and key in faults:
+                snapshot[key] = faults[key]
+    if "completed_actions" not in snapshot and "last_actions" in snapshot:
+        snapshot["completed_actions"] = snapshot["last_actions"]
     angles = snapshot.get("joints_deg")
     valid_angles = _vector(angles, 6)
     stamp = snapshot.get("feedback_time")
