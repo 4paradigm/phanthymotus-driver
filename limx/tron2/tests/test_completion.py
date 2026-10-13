@@ -192,10 +192,10 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
                 await adapter.motion.close();rpc_server.close();await rpc_server.wait_closed();await rpc_runner.cleanup()
         server.close();await server.wait_closed();await runner.cleanup()
 
-    async def test_all_three_actions_use_real_acp_and_reset_verifies_saved_home(self):
+    async def test_both_actions_use_real_acp_and_reset_verifies_saved_home(self):
         # Use actual RPC and callback HTTP. Only nominal movement time is
         # shortened; feedback verification still requires distinct new samples.
-        from reset import ARM_NAMES, POSES
+        from reset import ARM_NAMES
         received=[]; pending=set(); terminal=asyncio.Event()
         async def callback(request):
             body=await request.json()
@@ -228,7 +228,7 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     with patch.dict(os.environ,AGENT_CORE_URL=url),patch.object(adapter.reset,'call',side_effect=short_prepare):
                         for action,args in (('move',{'joint':[.2]*14,'time':.1}),
-                                            ('pose',{'pose_name':'left_elbow_20'}),('reset',{})):
+                                            ('reset',{})):
                             terminal.clear(); count=len(received)
                             async with session.post(url+'/mcp',json={'jsonrpc':'2.0','id':1,'method':'tools/call',
                                     'params':{'name':'arm_control','arguments':{'action':action,**args}}}) as reply:
@@ -242,7 +242,6 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
                             if action=='reset':
                                 self.assertFalse(admission['reset_verified']);self.assertIsNone(admission['at_home'])
                             expected=[.2]*14 if action=='move' else [.1]*14
-                            if action=='pose': expected[3]-=math.radians(20)
                             self.assertEqual(r.send_movej.await_args.args[0],expected)
                             async def pump():
                                 while True:
@@ -265,7 +264,7 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
                             else: self.assertNotIn('at_home',body['result'])
                             self.assertIsNone(adapter.motion.active)
                     self.assertEqual(path.read_bytes(),raw)
-                    self.assertEqual(len(received),3);self.assertEqual(r.send_movej.await_count,3)
+                    self.assertEqual(len(received),2);self.assertEqual(r.send_movej.await_count,2)
                 finally:
                     await adapter.motion.close();server.close();await server.wait_closed();await runner.cleanup()
 
@@ -291,7 +290,7 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_completion_schema_and_actuator_only_health_not_falsely_ready(self):
         adapter=Adapter(lambda *args:None,settings(enabled_cards=['arm_control']))
         tool=adapter.tools()[0]['inputSchema']
-        self.assertEqual(tool['x-completion'],{'actions':['move','pose','reset'],'timeout':120})
+        self.assertEqual(tool['x-completion'],{'actions':['move','reset'],'timeout':120})
         self.assertEqual(tool['x-resource'],['arm_l','arm_r'])
         self.assertEqual((await adapter.health(None)).status,503)
         adapter.reader.accept_info(info())

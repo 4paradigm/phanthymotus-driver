@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.9'
+VERSION = '0.5.10'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -128,10 +128,10 @@ def run_check(timeout=20, camera=False):
         raise ValueError('Joint card must use skeleton format')
     arm_tool = next((tool for tool in tools if tool['name'] == 'arm_control'), None)
     if arm_tool and (arm_tool['inputSchema'].get('x-completion') != {
-            'actions': ['move', 'pose', 'reset'], 'timeout': 120}
+            'actions': ['move', 'reset'], 'timeout': 120}
             or arm_tool['inputSchema'].get('x-resource') != ['arm_l', 'arm_r']
-            or arm_tool['inputSchema']['properties']['action']['enum'] != ['move', 'pose', 'reset']
-            or set(arm_tool['inputSchema']['x-action-params']) != {'move', 'pose', 'reset'}):
+            or arm_tool['inputSchema']['properties']['action']['enum'] != ['move', 'reset']
+            or set(arm_tool['inputSchema']['x-action-params']) != {'move', 'reset'}):
         raise ValueError('Arm completion tracking or physical resources are missing')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
@@ -166,7 +166,7 @@ def run_check(timeout=20, camera=False):
     skeleton_data = skeleton_stream(joint)
     if not skeleton_data['status']['available'] or len(skeleton_data['joints']) != 16:
         raise ValueError('Unsupported skeleton joint layout or names')
-    print('PASS: skeleton/model with fixed gripper outlines and move/pose/reset with ACP completion; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
+    print('PASS: skeleton/model with fixed gripper outlines and move/reset with ACP completion; motion not tested; Core trace metadata; MCP lifecycle; Core registration; periodic replies')
     print('Arm motion readiness:', motion_readiness)
     print('Joint count:', values['joint_count'])
     print('Joint labels:', values['name_source'])

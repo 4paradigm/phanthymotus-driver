@@ -13,7 +13,7 @@ class MotionReadinessTests(unittest.IsolatedAsyncioTestCase):
         return r
 
     async def test_each_invalid_missing_and_nonboolean_vendor_flag_never_sends(self):
-        conditions=[{'working_mode':value} for value in (None,'teleop_mode','low_level_mode','unknown',1)]
+        conditions=[{'working_mode':value} for value in (None,'controller_mode','teleop_mode','low_level_mode','unknown',1)]
         for key in ('working_mode_valid','collision_enable_valid','compliant_enable_valid','collision_enable'):
             conditions.extend({key:value} for value in (False,None,0,1,'true','false'))
         conditions.extend({'compliant_enable':value} for value in (True,None,0,1,'false'))
@@ -29,7 +29,7 @@ class MotionReadinessTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(MoveError):await r.send_movej([.1]*14,8)
             r.ws.send_json.assert_not_called()
 
-    async def test_policy_accepts_commissioned_state_and_rejects_drag_without_requiring_drag_on(self):
+    async def test_policy_accepts_upper_level_developer_mode_and_rejects_drag_without_requiring_drag_on(self):
         ready=info()['data']
         self.assertTrue(motion_readiness(ready)['ready'])
         drag={**ready,'compliant_enable':True}

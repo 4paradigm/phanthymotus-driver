@@ -1,6 +1,6 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.9`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.10`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -8,7 +8,7 @@
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
 | `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
-| `arm_control` | actuator | move自定义目标、pose预设、reset复位并自动校验；ACP完成通知 | 无 |
+| `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
 传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
@@ -17,7 +17,7 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/pose/reset调用时发送一次request_movej；没有模式切换、拖动示教或自动演示循环。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
@@ -76,7 +76,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 # 或：python3 limx/tron2/check.py
 ```
 
-脚本等待就绪，检查Core注册、三张JSON/骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/pose/reset，也不验证真实运动。
+脚本等待就绪，检查Core注册、joint_state骨架sensor、可选camera/arm_control及model类型、骨架格式和URDF名称，验证生命周期及关节接收时间更新。它不调用move/reset，也不验证真实运动。
 
 升级后刷新Motus，移除画布上的旧robot_status、reset_pose、joint_angles、battery_state实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、camera、camera_left、camera_right、arm_control五张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
@@ -92,7 +92,7 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 
 测试包含真实本机 HTTP / WebSocket 服务、请求关联及超时、序列号约束、重连、断连清空、过期数据、卡片生命周期、ROS2 JSON 发布的模拟验证和镜像入口布局。测试不驱动实体机器人。
 
-此前现场验证了16项关节值和运动ACK；0.5.0的骨架网页效果和新增pose/reset操作仍需部署后单独验收。0.5.5新增按需头部RGB摄像头，平台画面仍需部署后验收。
+此前现场验证了16项关节值和运动ACK；0.5.0的骨架网页效果和新增reset操作仍需部署后单独验收。0.5.5新增按需头部RGB摄像头，平台画面仍需部署后验收。
 
 ## arm_control 动作
 
@@ -103,18 +103,17 @@ python3 -m pytest tests/test_dockerfile_copies.py -q
 | ACTION | 参数 | 行为 |
 | --- | --- | --- |
 | move | joint、time（默认8秒） | 14项绝对目标，左7右7，rad，不包含头部 |
-| pose | pose_name、time（省略则自动计算） | 执行以本机保存home为基准的命名姿态 |
 | reset | 无 | 回到自然垂下目标，并自动检查连续反馈是否正确复位 |
 
-pose_name选项：arms_down、left_elbow_20、right_elbow_20、both_elbows_20。后3项分别将home的左肘索引3、右肘索引10或两者减去20度（转成rad），其余关节保持home目标。它们是绝对目标，不会重复点击累积增加角度。自定义move继续接受数组或≤4096字符的JSON数组文本，不接受NaN/Infinity、bool、数字字符串、头部角度或超限值。
+自定义move继续接受数组或≤4096字符的JSON数组文本，不接受NaN/Infinity、bool、数字字符串、头部角度或超限值。
 
-reset及pose使用现有`/config/tron2/home.json`（宿主`/opt/phanthy-motus/data/tron2`只读目录挂载）。沿用tron2-arms-reset-pose-v1、14项rad、标准顺序、序列号与固件绑定。升级不重新采集或覆盖home，也不从历史home文件回拷。文件缺失/不匹配时info报告未配置、实际运动拒绝，但平台仍可启动。
+reset使用现有`/config/tron2/home.json`（宿主`/opt/phanthy-motus/data/tron2`只读目录挂载）。沿用tron2-arms-reset-pose-v1、14项rad、标准顺序、序列号与固件绑定。升级不重新采集或覆盖home，也不从历史home文件回拷。文件缺失/不匹配时info报告未配置、实际运动拒绝，但平台仍可启动。
 
-发送任何move/pose/reset前，除连接、近期状态、目标身份/限位与互斥检查外，还要求本驱动已调试的controller_mode、working_mode_valid=true、collision_enable_valid=true且collision_enable=true、compliant_enable_valid=true且compliant_enable=false。compliant_enable表示柔顺/拖动状态，本驱动不在该状态下发位置MoveJ；不是要求把柔顺模式开启。字段缺失、无效、非严格布尔值或其他模式全部拒绝，返回motion_sent=false。*_valid作为厂家字段可用性/有效性门槛，不被当作独立安全认证。驱动只拒绝不合适的运动，不自动切换模式、开启保护或关闭拖动；内部info.motion_readiness给出拒绝原因。这是基于已调试上层MoveJ通道的保守准入策略，不宣称穷举厂家所有可执行模式。
+发送任何move/reset前，除连接、近期状态、目标身份/限位与互斥检查外，还要求厂家SDK 3.1要求的上层developer_mode、working_mode_valid=true、collision_enable_valid=true且collision_enable=true、compliant_enable_valid=true且compliant_enable=false。compliant_enable表示柔顺/拖动状态，本驱动不在该状态下发位置MoveJ；不是要求把柔顺模式开启。字段缺失、无效、非严格布尔值或其他模式全部拒绝，返回motion_sent=false。*_valid作为厂家字段可用性/有效性门槛，不被当作独立安全认证。驱动只拒绝不合适的运动，不自动切换模式、开启保护或关闭拖动；内部info.motion_readiness给出拒绝原因。模式要求见[厂家SDK 3.1](https://www.limxdynamics.com/zh/documents/847884267345285120)，controller_mode等其他模式拒绝，不宣称穷举厂家所有可执行模式。
 
-pose/reset时长至少max(8,ceil(最大关节变化度数/5))秒，超过60秒拒绝；pose显式填写time时不得短于此值。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
+reset时长至少max(8,ceil(最大关节变化度数/5))秒，超过60秒拒绝。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
 
-ACTION仅公开move、pose、reset。info/start/stop由平台内部生命周期和诊断使用，不显示为可选动作；start返回ready，stop返回idle，均不发送运动，也不是机器人急停。preview/list/verify_at_home已删除，旧调用会拒绝。只有显式move/pose/reset发送一次request_movej并等待GUID/序列号匹配的ACK；初始accepted响应不表示到达，arrival_verified为false，并提供唯一action_id。三个动作声明x-completion（120秒上限）和共享资源arm_l/arm_r；动作完成由后台反馈验证和ACP回调跟踪，不以ACK代替完成。
+ACTION仅公开move、reset。info/start/stop由平台内部生命周期和诊断使用，不显示为可选动作；start返回ready，stop返回idle，均不发送运动，也不是机器人急停。pose/pose_name/preview/list/verify_at_home已删除，旧调用会拒绝。只有显式move/reset发送一次request_movej并等待GUID/序列号匹配的ACK；初始accepted响应不表示到达，arrival_verified为false，并提供唯一action_id。两个动作声明x-completion（120秒上限）和共享资源arm_l/arm_r；动作完成由后台反馈验证和ACP回调跟踪，不以ACK代替完成。
 
 check.py只调用生命周期/信息和model资源，不执行运动。源码和模拟接口通过不代表网页渲染、实际运动到位或PR审批已经通过。正式镜像由上游PR Review Agent的/request_bot_review发布；部署后仍需现场验收。
 
@@ -127,7 +126,7 @@ MCP用于卡片发现与tools/call请求，ACP（Action Completion Protocol）�
 reset自动复位检查与动作完成跟踪为同一个过程，无需另调verify_at_home。reset的初始结果为reset_verified=false、at_home=null；运动结束后的连续新反馈通过后，ACP completed结果携带reset_verified=true、at_home=true、最大角度误差、容差、样本数和本次home摘要。
 未通过验证时通过ACP报告error、reset_verified=false、at_home=null，并保留错误原因；不能把失联或缺少反馈时的未知位置声称为已复位。复位目标固定为发送时已验证的home，不在动作途中重新加载或覆盖文件。
 
-- move、pose、reset返回唯一action_id；awaiting_ack/moving期间同一个驱动实例保留双臂所有权，第二个动作拒绝，不依赖Core的资源标签作为唯一锁。HTTP调用方断开不会取消正在发送的物理命令，也不会释放所有权。
+- move、reset返回唯一action_id；awaiting_ack/moving期间同一个驱动实例保留双臂所有权，第二个动作拒绝，不依赖Core的资源标签作为唯一锁。HTTP调用方断开不会取消正在发送的物理命令，也不会释放所有权。
 - 从ACK结束后保守等待完整time/duration_seconds，再检查至少3个不同的新关节回复，跨度至少0.5秒；14项误差均≤1度、相对首个样本变化≤0.2度，有dq时额外要求每项原始值绝对值≤0.05（未将dq单位认证为rad/s）。位置稳定性直接由q判断。厂家名称重排时先映射至官方索引；不能用同一缓存样本或命令目标伪造到位。
 - 到位后POST /api/acp/complete：action_id、status=completed、result.arrival_verified=true及误差/样本数，tool=arm_control。初始响应仍是受理；通过arm_control.info或/health的arm_motion可查看最终状态。该验证基于连续新收到的关节回复，厂家测量时间戳仍未验证，不代表路径碰撞规划或独立运动安全认证。
 - 超出预计时长再加10秒仍未满足条件、反馈过期、断连或连接更换，报告status=error、arrival_verified=false。发送/ACK结果不明时仍返回跟踪ID并检查反馈，不重发MoveJ；厂家明确拒绝或发送前拒绝不生成已受理动作。

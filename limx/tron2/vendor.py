@@ -52,14 +52,15 @@ class MoveError(ValueError):
 
 
 def motion_readiness(data):
-    """Conservative admission policy for the commissioned MoveJ controller mode.
+    """Admit the documented upper-level WebSocket developer mode for MoveJ.
 
+    LimX SDK guide section 3.1 specifies upper-level developer mode on port 5000.
     *_valid fields are vendor capability/validity flags, not independent safety
     certification. Require explicit booleans; never infer readiness from missing
     status. Compliance/drag mode must be off for a commanded position move.
     """
-    if data.get('working_mode') != 'controller_mode':
-        return {'ready': False, 'reason': 'MoveJ requires controller_mode'}
+    if data.get('working_mode') != 'developer_mode':
+        return {'ready': False, 'reason': 'MoveJ requires upper-level developer_mode'}
     for key in ('working_mode_valid','collision_enable_valid','compliant_enable_valid'):
         if data.get(key) is not True:
             return {'ready': False, 'reason': key + ' must be explicitly true'}

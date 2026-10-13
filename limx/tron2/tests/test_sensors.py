@@ -38,7 +38,7 @@ def settings(**updates):
 def info(serial='TEST_TRON2A'):
     return {'title': 'notify_robot_info', 'accid': serial,
             'data': {'imu': 'OK', 'motor': 'OK', 'camera': 'UNKNOW',
-                     'working_mode': 'controller_mode', 'working_mode_valid': True,
+                     'working_mode': 'developer_mode', 'working_mode_valid': True,
                      'collision_enable': True, 'collision_enable_valid': True,
                      'compliant_enable': False, 'compliant_enable_valid': True}}
 
@@ -113,7 +113,7 @@ class StateTests(unittest.TestCase):
     def test_status_keeps_unknown_values_and_does_not_require_idle(self):
         data = state.select_fields(info()['data'], state.STATUS_FIELDS)
         self.assertEqual(data['camera'], 'UNKNOW')
-        self.assertEqual(data['working_mode'], 'controller_mode')
+        self.assertEqual(data['working_mode'], 'developer_mode')
         self.assertIsNone(data['sw_version'])
 
 
@@ -550,13 +550,14 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         arm = next(t for t in tools if t['name'] == 'arm_control')
         self.assertEqual(arm['type'], 'actuator')
         props = arm['inputSchema']['properties']
-        self.assertEqual(props['action']['enum'], ['move', 'pose', 'reset'])
+        self.assertEqual(props['action']['enum'], ['move', 'reset'])
         self.assertEqual(props['joint']['minItems'], 14)
         self.assertEqual(props['joint']['maxItems'], 14)
         self.assertEqual(props['joint']['type'], ['array', 'string'])
         self.assertEqual(props['joint']['maxLength'], 4096)
         self.assertEqual(arm['inputSchema']['x-action-params']['reset']['params'], [])
-        self.assertEqual(arm['inputSchema']['x-action-params']['pose']['params'], ['pose_name', 'time'])
+        self.assertNotIn('pose_name', props)
+        self.assertEqual(set(arm['inputSchema']['x-action-params']), {'move', 'reset'})
 
     async def test_removed_cards_are_not_discovered_or_callable(self):
         self.adapter.enabled.append('arm_control')
@@ -567,7 +568,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(error)
             self.assertFalse(result['motion_sent'])
 
-    async def test_pose_target_preparation_preserves_other_joints_and_home_file(self):
+    async def test_removed_pose_and_pose_name_reject_without_motion(self):
         self.adapter.enabled.append('arm_control')
         reader = self.adapter.reader
         reader.ws = types.SimpleNamespace(closed=False, send_json=AsyncMock())
@@ -575,63 +576,15 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             path = Path(temp)/'home.json'
             self.reset_pose_fixture(path)
             raw = path.read_bytes()
-            for name, indices in (('left_elbow_20', (3,)), ('right_elbow_20', (10,)),
-                                  ('both_elbows_20', (3, 10)), ('arms_down', ())):
-                result = self.adapter.reset.call('execute', name)
-                self.assertFalse(result['motion_sent'])
-                for index, angle in enumerate(result['target_q']):
-                    self.assertAlmostEqual(angle, .1-math.radians(20) if index in indices else .1)
-                self.assertEqual(result['duration_seconds'], 8)
-            self.assertEqual(path.read_bytes(), raw)
-            tool = next(t for t in self.adapter.tools() if t['name'] == 'arm_control')
-            self.assertIn('right_elbow_20', tool['inputSchema']['properties']['pose_name']['enum'])
-            for kwargs in ({}, {'pose_name': 'bad'}, {'pose_name': []},
-                           {'pose_name': 'left_elbow_20', 'time': .1}):
-                error, result = await self.call('arm_control', action='pose', **kwargs)
+            for args in ({'action':'pose'}, {'action':'pose','pose_name':'left_elbow_20'},
+                         {'action':'reset','pose_name':'arms_down'},
+                         {'action':'move','joint':[.1]*14,'time':8,'pose_name':'arms_down'}):
+                error, result = await self.call('arm_control', **args)
                 self.assertTrue(error)
                 self.assertFalse(result['motion_sent'])
-            # The offset must still respect absolute vendor joint limits.
-            target = [.1]*14
-            target[3] = -2.6
-            self.reset_pose_fixture(path, target_q=target)
-            error, result = await self.call('arm_control', action='pose', pose_name='left_elbow_20')
-            self.assertTrue(error)
-            self.assertFalse(result['motion_sent'])
-            self.reset_pose_fixture(path)
-            reader.info_at = time.monotonic()-10
-            error, result = await self.call('arm_control', action='pose', pose_name='right_elbow_20')
-            self.assertTrue(error)
-            self.assertFalse(result['motion_sent'])
+            self.assertEqual(path.read_bytes(), raw)
         reader.ws.send_json.assert_not_called()
-
-    async def test_pose_sends_one_correlated_request_and_reports_acceptance(self):
-        self.adapter.enabled.append('arm_control')
-        reader = self.adapter.reader
-        sent = []
-        async def send(body):
-            sent.append(body)
-            packet = {'title': 'response_movej', 'guid': body['guid'],
-                      'accid': reader.serial, 'data': {'result': 'success'}}
-            ws = types.SimpleNamespace(receive=AsyncMock(return_value=types.SimpleNamespace(
-                type=aiohttp.WSMsgType.TEXT, data=json.dumps(packet))))
-            await reader.receive(ws, time.monotonic()+1)
-        reader.ws = types.SimpleNamespace(closed=False, send_json=send)
-        with tempfile.TemporaryDirectory() as temp:
-            self.reset_pose_fixture(Path(temp)/'home.json')
-            error, result = await self.call('arm_control', action='pose',
-                                            pose_name='both_elbows_20', time=10)
-            self.assertFalse(error)
-            self.assertEqual(result['action'], 'pose')
-            self.assertEqual(result['status'], 'accepted')
-            self.assertTrue(result['motion_sent'])
-            self.assertFalse(result['arrival_verified'])
-            self.assertEqual(len(sent), 1)
-            self.assertAlmostEqual(sent[0]['data']['joint'][3], .1-math.radians(20))
-            self.assertAlmostEqual(sent[0]['data']['joint'][10], .1-math.radians(20))
-            self.assertEqual(sent[0]['data']['time'], 10)
-            await self.adapter.motion.task
-            self.assertEqual(self.adapter.motion.report.await_args.args[:2],
-                             (result['action_id'], 'completed'))
+        self.assertIsNone(self.adapter.motion.active)
 
     async def test_arm_control_move_rejects_wrong_joint_count(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
@@ -905,7 +858,7 @@ class PackagingTests(unittest.TestCase):
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.9"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.10"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

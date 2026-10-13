@@ -8,13 +8,13 @@ import time
 import aiohttp
 from aiohttp import web
 from vendor import RobotReader, validate_movej, reject_constant, motion_readiness
-from reset import ResetPose, POSES
+from reset import ResetPose
 from skeleton import skeleton_stream, model
 from completion import ArmCompletion, ACP_TIMEOUT
 from camera import CameraStream, CAMERA_SOURCES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.9'
+VERSION = '0.5.10'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -24,7 +24,7 @@ DESCRIPTIONS = {
     'camera_left': 'TRON2 左腕RGB实时画面；厂家left校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'camera_right': 'TRON2 右腕RGB实时画面；厂家right校正图像，独立start/stop/info；限10fps，不录像、不控制机械臂，接收时间不是测量时间（只读）',
     'joint_state': 'TRON2 双臂与头部16关节实时骨架，左右夹爪轮廓随手腕运动；夹爪为静态开合示意，未接入开合反馈；原始rad/deg及速度力矩可通过info查看',
-    'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，pose命名姿态，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；reset自动验证自然垂下复位，三个动作均通过ACP报告完成',
+    'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；reset自动验证自然垂下复位，两个动作均通过ACP报告完成',
 }
 
 
@@ -90,9 +90,7 @@ class Adapter:
                 'type': 'object',
                 'additionalProperties': False,
                 'properties': {
-                    'action': {'type': 'string', 'enum': ['move', 'pose', 'reset']},
-                    'pose_name': {'type': 'string', 'enum': list(POSES),
-                        'description': 'arms_down自然垂下；left_elbow_20左肘、right_elbow_20右肘、both_elbows_20双肘弯曲20度，均基于本机保存姿态'},
+                    'action': {'type': 'string', 'enum': ['move', 'reset']},
                     'joint': {
                         'type': ['array', 'string'],
                         'maxLength': 4096,
@@ -106,16 +104,15 @@ class Adapter:
                         'minimum': 0.1,
                         'maximum': 60,
                         'default': 8.0,
-                        'description': 'Movement duration in seconds; pose requires at least 8 seconds and may need longer for a larger change',
+                        'description': 'Movement duration in seconds for move; reset computes its duration from the saved home',
                     },
                     **metadata_properties(),
                 },
                 'required': ['action'],
-                'x-completion': {'actions': ['move', 'pose', 'reset'], 'timeout': ACP_TIMEOUT},
+                'x-completion': {'actions': ['move', 'reset'], 'timeout': ACP_TIMEOUT},
                 'x-resource': ['arm_l', 'arm_r'],
                 'x-action-params': {
                     'move': {'params': ['joint', 'time'], 'description': '自定义双臂14项绝对关节目标'},
-                    'pose': {'params': ['pose_name', 'time'], 'description': '执行命名姿态；时长至少8秒且满足角度差要求'},
                     'reset': {'params': [], 'description': '回到自然垂下目标；连续新反馈自动确认复位后，通过ACP通知完成'},
                 },
             },
@@ -157,7 +154,7 @@ class Adapter:
     def call(self, name, args):
         allowed = {'action', 'instance_id', '_trace_id'}
         if name == 'arm_control':
-            allowed |= {'joint', 'time', 'pose_name'}
+            allowed |= {'joint', 'time'}
         if not isinstance(args, dict) or set(args) - allowed:
             raise ValueError('Only action and Core instance_id/_trace_id metadata are accepted')
         # Core injects both fields after the model has selected a tool. Accept
@@ -190,14 +187,9 @@ class Adapter:
                         'joint_count': 14, 'position_unit': 'rad', 'motion_sent': False,
                         'motion': self.motion.summary(),
                         'motion_readiness': motion_readiness(self.reader.sample('robot_status')['data'] or {}),
-                        'home': self.reset.call('info'), 'poses': list(POSES)}
-            if action in ('reset', 'pose'):
-                pose_name = args.get('pose_name') if action == 'pose' else 'arms_down'
-                if not isinstance(pose_name, str) or pose_name not in POSES:
-                    raise ValueError('pose requires a known pose_name; no motion sent')
-                result = self.reset.call('execute', pose_name,
-                                         args.get('time') if action == 'pose' else None)
-                return {**result, 'action': action}
+                        'home': self.reset.call('info')}
+            if action == 'reset':
+                return {**self.reset.call('execute'), 'action': 'reset'}
             if action != 'move':
                 raise ValueError('Unsupported actuator action')
             joint = args.get('joint')
@@ -259,11 +251,11 @@ class Adapter:
                     data = self.call(params.get('name'), params.get('arguments', {}))
                     if params.get('name') in CAMERA_SOURCES:
                         data = await self.cameras[params['name']].call(params.get('arguments', {}).get('action', 'info'))
-                    if params.get('name') == 'arm_control' and data.get('action') in ('move', 'pose', 'reset'):
+                    if params.get('name') == 'arm_control' and data.get('action') in ('move', 'reset'):
                         action = data['action']
                         target = data['joint'] if action == 'move' else data['target_q']
                         duration = data['time'] if action == 'move' else data['duration_seconds']
-                        details = {key: data[key] for key in ('pose_sha256', 'pose_name') if key in data}
+                        details = {key: data[key] for key in ('pose_sha256',) if key in data}
                         data = await self.motion.dispatch(action, target, duration, details)
                     error = False
                 except (ValueError, TypeError) as exc:
