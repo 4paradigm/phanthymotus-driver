@@ -174,7 +174,7 @@ Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺�
 普通check.py只检查camera发现/协议/info，不改变已有视频启停。显式视频验收：
 
 ```bash
-sudo docker exec embodied-limx-tron2 python3 /work/check.py --camera
+sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 /work/check.py --camera'
 ```
 
 这项只读检查开启头部视频、验证持续发布和实际本机DDS订阅收到至少两帧合法JPEG，并保留视频连接供平台查看；不发送运动，不保存图像。完成后通过camera.stop或停止画布释放连接。

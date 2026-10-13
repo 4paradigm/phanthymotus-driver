@@ -42,7 +42,10 @@ def read_samples():
 
 def check_camera_bus():
     """Optional actual DDS subscriber proof, no frame files or motion calls."""
-    import rclpy
+    try:
+        import rclpy
+    except ImportError as exc:
+        raise ValueError('Camera DDS check requires the ROS environment; source /opt/ros/humble/setup.bash first') from exc
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from sensor_msgs.msg import CompressedImage
     from camera import TOPIC, jpeg_size
