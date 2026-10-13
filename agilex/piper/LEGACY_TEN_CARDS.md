@@ -112,7 +112,7 @@ Bot 默认可能为 arm64，必须 inspect 后再部署到 amd64 控制器。固
 SDK 固定提交 8d4dc29bd6e753066dedee235c008e90ecb2ab4a；ZIP SHA256
 `89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29`，pip 安装前校验、禁用缓存。
 Dockerfile 提供 PIPER_SDK_URL / PIPER_SDK_SHA256 构建参数，临时文件在同一 RUN 清理。
-两份桌面 landing 文档没有 COS 上传说明/SDK 地址，按用户要求暂不迁移 COS。
+SDK 从项目公共 COS 制品地址下载；归档与官方提交 ZIP 字节一致，继续使用原 SHA256。
 本轮拆分不增加第三方依赖，仅增加组件源码及少量无依赖前端代码。具体构建尺寸口径见 ACCEPTANCE。
 
 ## Mac

@@ -260,3 +260,9 @@ CAN 控制、无故障；未执行使能、失能、移动或拍照。运动许�
 Mac 历史保留在 `acceptance/20261011_mac/`：已验证首次 CAN 读取、固件与原相机路径；
 关闭再打开 USB-CAN 的恢复稳定性尚未通过。历史照片采集发生在用户要求停止相机之前。
 Mac 和旧版 J1 演示均不替代本次 Ubuntu 新功能验收。
+
+## PR #395 建议处理（2026-10-14）
+
+- 删除数值工作进程未被调用的 render RPC、SciPy 导入和 visualization_module 参数；保留真实子进程的 load/solve/close 回归。没有增加依赖。
+- Dockerfile 与 requirements.txt 改为项目公共 COS 的固定提交归档。来源为官方 piper_sdk 提交 8d4dc29bd6e753066dedee235c008e90ecb2ab4a，732413 字节；上传后匿名下载的 SHA256 与原固定值 89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29 一致。归档包含原 LICENSE，未重打包或提交二进制。
+- 双臂、轨迹与输入合约回归：129 passed。该检查不代表真机或 COS 镜像构建验收，正式构建以本 PR 的最新 bot 回执为准。

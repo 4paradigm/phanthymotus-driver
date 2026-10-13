@@ -21,8 +21,7 @@ PERIOD = .05
 
 def numerical_worker(path):
     return NumericalWorker(path, driver_dir=Path(__file__).resolve().parents[2],
-                           solver_module="agilex.piper.motion.kinematics", solver_class="PiperIK",
-                           visualization_module="agilex.piper.motion.kinematics")
+                           solver_module="agilex.piper.motion.kinematics", solver_class="PiperIK")
 
 
 class PairedMotion:

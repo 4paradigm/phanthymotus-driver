@@ -2,14 +2,14 @@
 ARG ROS_BASE_IMAGE=ros:humble-ros-base@sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
-ARG PIPER_SDK_URL=https://github.com/agilexrobotics/piper_sdk/archive/8d4dc29bd6e753066dedee235c008e90ecb2ab4a.zip
+ARG PIPER_SDK_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/piper-sdk-8d4dc29bd6e753066dedee235c008e90ecb2ab4a.zip
 ARG PIPER_SDK_SHA256=89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip ros-humble-rmw-fastrtps-cpp ros-humble-sensor-msgs \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 COPY requirements.txt /work/agilex/piper/requirements.txt
-# The SDK URL can be replaced by an approved COS artifact without editing code.
+# COS mirrors the unchanged official SDK archive; its license stays bundled.
 # pip verifies its hash before installation and removes its temporary download;
 # --no-cache-dir prevents the ZIP/wheel cache from becoming an image layer.
 RUN sed '/^piper-sdk @ /d' /work/agilex/piper/requirements.txt > /tmp/piper-dependencies.txt \
