@@ -1,5 +1,4 @@
 """Configuration migration must not create an operator session or publish motion."""
-import json
 import pytest
 from types import SimpleNamespace
 from pathlib import Path
@@ -8,13 +7,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from teleop_control import TeleopControl
 
 
-@pytest.mark.parametrize('contents', [json.dumps({'mode': 'shadow', 'calibration_path': '/old', 'position_scale': .1}), '{invalid', '[]'])
-def test_legacy_canvas_settings_cannot_override_driver_preset(tmp_path, contents):
-    path = tmp_path / 'settings.json'
-    path.write_text(contents)
+def test_driver_preset_and_fixed_canvas_schema():
     executor = SimpleNamespace(cfg={})
     motion = SimpleNamespace(executor=executor, clock_id='offline')
-    card = TeleopControl({'state_path': str(path), 'mode': 'live',
+    card = TeleopControl({'mode': 'live',
                          'calibration_path': '/driver/model.json', 'position_scale': 1.}, motion)
     assert card.live
     assert card.cfg['calibration_path'] == '/driver/model.json'
@@ -116,10 +112,9 @@ def test_driver_preset_is_validated_at_startup(mode, scale, error):
     assert motion.executor.cfg == {}
 
 
-def test_config_action_does_not_write_or_reset_mapping(tmp_path):
-    path = tmp_path / 'unused' / 'settings.json'
+def test_config_action_does_not_reset_active_mapping():
     motion = SimpleNamespace(executor=SimpleNamespace(cfg={}), clock_id='offline')
-    card = TeleopControl({'state_path': str(path)}, motion)
+    card = TeleopControl({}, motion)
     anchor = object()
     card.mapping.anchor = anchor
     card._operator = 'active-session'
@@ -127,4 +122,4 @@ def test_config_action_does_not_write_or_reset_mapping(tmp_path):
                                       'calibration_path': '/old', 'usage_guide': '无需配置'})
     assert result['operator_session_id'] == 'active-session'
     assert card.mapping.anchor is anchor and card.mapping.scale == 1.
-    assert card.live and not path.parent.exists()
+    assert card.live

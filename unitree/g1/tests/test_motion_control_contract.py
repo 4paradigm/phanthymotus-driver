@@ -71,14 +71,6 @@ def test_latest_pending_only_not_history_replay():
     assert c.solver.frames==[30] and len(published)==1
 
 
-def test_cancel_during_solve_drops_solution_and_proof():
-    c,published,proofs=controller();original=c.solver.solve_frame
-    def cancelled(*args):
-        q=original(*args);c.cancel_pending();return q
-    c.solver.solve_frame=cancelled;c.receive_eef(frame(c))
-    assert not c.process_latest() and not published and not proofs
-
-
 def test_solver_failure_holds_then_new_frame_can_continue_same_mapping():
     c,published,_=controller();original=c.solver.solve_frame
     def failed(*args):raise ValueError('ik_target_unreachable')

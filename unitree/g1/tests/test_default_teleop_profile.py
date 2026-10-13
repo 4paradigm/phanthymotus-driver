@@ -46,7 +46,11 @@ def test_default_registration_and_idle_stop_never_create_sdk_or_claim():
     assert arm.profile_error is None
     assert arm._channel is None and arm.session_id is None
     for _ in range(3):
-        assert arm.dispatch('stop', {})['no_op']
+        result = arm.dispatch('stop', {})
+        assert result['no_op'] and result['authority_released']
+        assert not result['physical_confirmed']
+        arm.tick()
+        assert arm._operation is None
     assert arm._channel is None and not arm.status()['ownership_held'] and calls == []
 
 

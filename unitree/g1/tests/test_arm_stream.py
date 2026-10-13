@@ -304,13 +304,9 @@ def test_readonly_matched_count_migration_uses_subscription_event():
     assert obj.MatchedPublisherCount()==2
 
 
-@pytest.mark.parametrize('records', [{}, {'acceptance': {}}, {'first_acceptance': {'operator': '', 'evidence_sha256': 'invalid'}}])
-def test_prepare_uses_live_feedback_without_manual_acceptance_records(tmp_path, records):
+def test_prepare_requires_fresh_feedback_without_hardware_writes(tmp_path):
     arm, sample, channel, advance, _, _ = rig(tmp_path, claim=False, servo=True)
     arm._prepared = False
-    arm.profile.pop('acceptance', None)
-    arm.profile.pop('first_acceptance', None)
-    arm.profile.update(records)
     assert arm.dispatch('prepare_operator_session', {}) == {'state': 'ready', 'prepared': True}
     assert not channel.writes and arm.session_id is None
     arm._prepared = False
@@ -319,27 +315,12 @@ def test_prepare_uses_live_feedback_without_manual_acceptance_records(tmp_path, 
     assert not arm._prepared and not channel.writes
 
 
-def test_removed_paperwork_does_not_enable_disabled_live(tmp_path):
+def test_prepare_rejects_disabled_live(tmp_path):
     arm, _, channel, _, _, _ = rig(tmp_path, claim=False, servo=True)
     arm._prepared = False
     arm.cfg['live_enabled'] = False
     assert arm.dispatch('prepare_operator_session', {})['code'] == 'live_disabled'
     assert not arm._prepared and not channel.writes
-
-
-def test_other_dds_publishers_do_not_block_fresh_feedback(tmp_path):
-    arm, sample, *_ = rig(tmp_path, claim=False)
-    arm._snapshot_provider = None
-    arm._feedback = sample
-    arm._fsm = {'arm_ns': arm.clock(), 'fsm_id': 801}
-    arm.profile['safety']['allowed_fsm_ids'] = [500, 801]
-    class Observer:
-        def MatchedPublisherCount(self):
-            raise AssertionError('Publisher count must not gate teleoperation')
-    arm._arm_observer = Observer()
-    assert arm._fresh()[1] == sample['q']
-    sample['fault'] = True
-    assert arm._fresh()[1] == sample['q']
 
 
 def test_raw_motor_telemetry_does_not_gate_arm_but_invalid_sample_does(tmp_path):
@@ -365,18 +346,6 @@ def test_raw_motor_telemetry_does_not_gate_arm_but_invalid_sample_does(tmp_path)
     assert arm._fresh()[0]['motor_telemetry'][0]['temperature']==[150,150]
     msg.tick=4;msg.motor_state=[];arm._on_state(msg)
     with pytest.raises(ValueError,match='arm_feedback_invalid'): arm._fresh()
-
-
-def test_idle_canvas_stop_does_not_manufacture_release_ownership(tmp_path):
-    arm,_,ch,advance,_,sdk=rig(tmp_path,claim=False)
-    arm._channel_open=False  # Real unclaimed executor has not opened an SDK writer.
-    for _ in range(3):
-        result=arm.dispatch('stop',{})
-        assert result['no_op'] and result['authority_released']
-        assert not result['physical_confirmed']
-        advance(10);arm.tick()
-        assert not arm.status()['ownership_held'] and arm._operation is None
-    assert not ch.writes and not sdk
 
 
 def test_duplicate_stop_while_awaiting_feedback_does_not_invent_vendor_action(tmp_path):

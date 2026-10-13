@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 import pytest
 from test_arm_stream import rig
 
@@ -10,7 +9,10 @@ def test_both_confirmed_modes_admitted_without_switching(tmp_path, fsm):
     arm._snapshot_provider = None
     arm._fsm = {'arm_ns': arm.clock(), 'fsm_id': fsm}
     arm._observer_started_ns = arm.clock()-600_000_000
-    arm._arm_observer = SimpleNamespace(MatchedPublisherCount=lambda: 1)
+    class Observer:
+        def MatchedPublisherCount(self):
+            raise AssertionError('Publisher count must not gate teleoperation')
+    arm._arm_observer = Observer()
     assert arm._fresh()[1] == sample['q']
     assert sdk == []
     arm._fsm['fsm_id'] = 0

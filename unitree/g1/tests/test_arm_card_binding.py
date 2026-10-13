@@ -25,14 +25,6 @@ def test_existing_arm_gestures_and_release_keep_legacy_behavior():
     assert calls==[('sdk',1),('sdk',99)]
 
 
-@pytest.mark.parametrize('action,args', [('release',{}),('execute',{'action_id':99}),('execute',{'gesture':'release arm'})])
-def test_all_existing_release_aliases_share_stream_handback(action,args):
-    arm,calls=plugin()
-    arm._stream=SimpleNamespace(dispatch=lambda verb,body:calls.append((verb,body)) or {'state':'accepted'})
-    assert arm.dispatch(action,args)=={'state':'accepted'}
-    assert calls==[('release',args)]
-
-
 def test_legacy_motion_cannot_bypass_stream_owner():
     arm,calls=plugin()
     @contextmanager
@@ -59,7 +51,10 @@ def test_current_metadata_is_exposed_by_discovery_and_info():
 @pytest.mark.parametrize('action,args', [('release',{}),('execute',{'action_id':99}),('execute',{'gesture':'release arm'})])
 def test_release_cancels_teleop_before_stream_handback(action,args):
     arm,calls=plugin()
-    arm._teleop_control=SimpleNamespace(cancel_for_arm_release=lambda:calls.append(('cancel',)))
     arm._stream=SimpleNamespace(dispatch=lambda verb,body:calls.append((verb,body)) or {'state':'accepted'})
+    assert arm.dispatch(action,args)=={'state':'accepted'}
+    assert calls==[('release',args)]
+    calls.clear()
+    arm._teleop_control=SimpleNamespace(cancel_for_arm_release=lambda:calls.append(('cancel',)))
     assert arm.dispatch(action,args)=={'state':'accepted'}
     assert calls==[('cancel',),('release',args)]
