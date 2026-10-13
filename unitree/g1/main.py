@@ -132,13 +132,20 @@ class G1DeviceBundle:
                                             state_node=loco_state.node,
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
-            if plugins_cfg.get("loco_point", {}).get("enabled", True):
+            if plugins_cfg.get("loco_point", {}).get("enabled", True) and smart_motion is not None:
                 from loco_point import LocoPointPlugin, PointBackend
                 from device import _loco_acp_notify
                 loco = self._plugins[-1]
+                def prepare_point():
+                    current = smart_motion.get_state()
+                    if current.get("error"):
+                        return {"ret": None, "error": current["error"]}
+                    if current.get("state") in ("navigating", "nav_paused"):
+                        return {"ret": None, "error": "Stop navigation before loco_point"}
+                    return loco.dispatch("stop_move", {})
                 self._point_card = LocoPointPlugin(
-                    plugins_cfg.get("loco_point", {}), PointBackend(), _loco_acp_notify,
-                    prepare=lambda: loco.dispatch("stop_move", {}))
+                    plugins_cfg.get("loco_point", {}), PointBackend(smart_motion), _loco_acp_notify,
+                    prepare=prepare_point)
                 self._plugins.append(self._point_card)
                 print("[bundle] LocoPointPlugin loaded")
 

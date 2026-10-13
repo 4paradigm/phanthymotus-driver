@@ -1,4 +1,4 @@
-"""Sequential relative movement with its own deadline controller and velocity RPC path."""
+"""Sequential relative movement through the shared SmartMotion safety owner."""
 import math
 import threading
 import time
@@ -164,6 +164,14 @@ class LocoPointPlugin:
             except Exception as exc:
                 result = {"ret": None, "error": str(exc), "state": "stop_failed"}
             self.faulted = result.get("ret") != 0
+            if not job and not self.faulted:
+                finish = getattr(self.loco, "finish_sequence", None)
+                if finish:
+                    try:
+                        finish()
+                    except Exception as exc:
+                        self.faulted = True
+                        result = {"ret": None, "error": str(exc), "state": "stop_failed"}
             if job:
                 job["stop_result"] = result
                 job["stop_done"].set()
@@ -177,7 +185,7 @@ class LocoPointPlugin:
                     if not job["cancel"].is_set():
                         prepared = self.prepare()
                         if prepared.get("ret") != 0:
-                            raise RuntimeError("Could not stop preceding loco movement")
+                            raise RuntimeError(prepared.get("error") or "Could not stop preceding loco movement")
             for index, stage in enumerate(stages):
                 with self.command_lock:
                     if job["cancel"].is_set():
@@ -218,6 +226,14 @@ class LocoPointPlugin:
             result["error"] = str(exc)
             result["stop_result"] = self.cancel_and_stop()
         finally:
+            finish = getattr(self.loco, "finish_sequence", None)
+            if finish:
+                try:
+                    finish()
+                except Exception as exc:
+                    self.faulted = True
+                    status = "error"
+                    result["error"] = f"Sequence release failed: {exc}"
             with self.command_lock:
                 if self.active is job:
                     self.active = None
@@ -225,24 +241,37 @@ class LocoPointPlugin:
 
 
 class PointBackend:
-    """Card-owned controller; no dependency on LocoPlugin or its revisions."""
-    def __init__(self):
-        from point_motion import PointMotion
-        from point_rpc import PointRpc
-        self.rpc = PointRpc()
-        self.motion = PointMotion(self.rpc)
+    """Point sequence adapter; all velocity and stop RPCs belong to SmartMotion."""
+    def __init__(self, smart_motion):
+        if smart_motion is None:
+            raise ValueError("loco_point requires the SmartMotion safety harness")
+        self.smart_motion = smart_motion
+        self.sequence_id = None
 
     def _begin_motion(self, vx, vy, vyaw, duration, action_id):
-        return self.motion.begin_start(vx, vy, vyaw, duration, action_id)
-
-    def close(self):
-        self.rpc.close()
+        self.sequence_id = action_id.rsplit("_", 1)[0]
+        return self.smart_motion.point_move(vx, vy, vyaw, duration, action_id, self.sequence_id)
 
     def _start_motion(self, vx, vy, vyaw, duration, action_id):
-        return self.motion.start(vx, vy, vyaw, duration, action_id)
+        return self._begin_motion(vx, vy, vyaw, duration, action_id)
 
     def _motion_result(self, action_id):
-        return self.motion.get_result(action_id)
+        return self.smart_motion.point_result(action_id, self.sequence_id)
 
     def _stop_motion(self):
-        return self.motion.stop()
+        return self.smart_motion.point_stop(self.sequence_id)
+
+    def finish_sequence(self):
+        if self.sequence_id is not None:
+            result = self.smart_motion.point_finish(self.sequence_id)
+            if result.get("ret") != 0:
+                raise RuntimeError(result.get("error") or "Point ownership release failed")
+            self.sequence_id = None
+
+    def close(self):
+        # A failed stop deliberately retains ownership in the safety process.
+        # Shutdown must still allow the bundle to stop that process afterwards.
+        try:
+            self.finish_sequence()
+        except RuntimeError:
+            pass

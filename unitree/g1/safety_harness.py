@@ -112,15 +112,13 @@ class SmartMotionProxy:
             try:
                 item = self._result_queue.get(timeout=1.0)
                 req_id = item.pop("_req_id", None) if isinstance(item, dict) else None
-                if req_id and req_id in self._pending:
-                    self._pending[req_id].put(item)
-                else:
-                    # Fallback: shouldn't happen, but don't lose the result
-                    # Put it in any waiting queue (legacy behavior)
-                    with self._dispatch_lock:
-                        for q in self._pending.values():
-                            q.put(item)
-                            break
+                with self._dispatch_lock:
+                    result_q = self._pending.get(req_id)
+                if result_q is not None:
+                    try:
+                        result_q.put_nowait(item)
+                    except queue.Full:
+                        pass
             except queue.Empty:
                 continue
             except Exception:
@@ -144,6 +142,19 @@ class SmartMotionProxy:
 
     def move(self, vx: float, vy: float, vyaw: float, duration: float = -1.0) -> dict:
         return self._call("move", vx=vx, vy=vy, vyaw=vyaw, duration=duration)
+
+    def point_move(self, vx, vy, vyaw, duration, action_id, sequence_id):
+        return self._call("point_move", vx=vx, vy=vy, vyaw=vyaw, duration=duration,
+                          action_id=action_id, sequence_id=sequence_id)
+
+    def point_result(self, action_id, sequence_id):
+        return self._call("point_result", action_id=action_id, sequence_id=sequence_id)
+
+    def point_stop(self, sequence_id):
+        return self._call("point_stop", sequence_id=sequence_id)
+
+    def point_finish(self, sequence_id):
+        return self._call("point_finish", sequence_id=sequence_id)
 
     def stop(self, reason: str = "command") -> dict:
         return self._call("stop", reason=reason)
@@ -203,6 +214,12 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     Initializes its own DDS channel, RPC clients, ROS2 node, and LiDAR subscription.
     Runs independently from the main driver process — no GIL contention.
     """
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+
     import numpy as np
     import rclpy
     from rclpy.node import Node
@@ -301,8 +318,42 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         event_node.publish(event)
         print(f"[SmartMotion] event: {event_type} | {json.dumps(data)}", flush=True)
 
+    point_motion = None
+    point_sequence = None
+    point_cancelled = {}  # Sequence-wide latch survives the gap between segments.
+
+    def cancel_point(reason):
+        nonlocal point_sequence, stop_repeat_count, state, current_cmd, speed_zone
+        if point_motion is None or point_sequence is None:
+            return None
+        with point_motion.lock:
+            sequence = point_sequence
+            point_cancelled[sequence] = {"status": "pending", "result": {"reason": reason}}
+            while len(point_cancelled) > 256:
+                del point_cancelled[next(iter(point_cancelled))]
+        result = point_motion.stop(reason)
+        with point_motion.lock:
+            point_cancelled[sequence] = {"status": "cancelled" if result.get("ret") == 0 else "error",
+                                         "result": {**result, "stop_acknowledged": result.get("ret") == 0}}
+            if result.get("ret") == 0 and point_sequence == sequence:
+                state, current_cmd, speed_zone = MotionState.IDLE, None, SpeedZone.NORMAL
+        stop_repeat_count = 0  # PointMotion owns its stop; no untracked repeats.
+        return result
+
+    def point_stopped(outcome):
+        nonlocal state, current_cmd, speed_zone, stop_repeat_count
+        if current_cmd and current_cmd.get("point_action_id") == outcome["action_id"]:
+            if outcome["ret"] == 0:
+                state, current_cmd, speed_zone = MotionState.IDLE, None, SpeedZone.NORMAL
+            else:
+                speed_zone = SpeedZone.STOPPED
+            stop_repeat_count = 0
+            publish_event("motion_stop" if outcome["ret"] == 0 else "motion_stop_failed", outcome)
+
     def do_stop(reason_str):
         nonlocal state, current_cmd, speed_zone, move_timer, stop_repeat_count
+        if point_sequence is not None:
+            return cancel_point(reason_str)
         if move_timer:
             move_timer.cancel()
             move_timer = None
@@ -462,6 +513,15 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     def emergency_stop(reason_str, extra=None):
         """Emergency stop with optional damp mode for tilt."""
         nonlocal state, current_cmd, speed_zone, move_timer, stop_repeat_count
+        if point_sequence is not None:
+            result = cancel_point(reason_str)
+            if reason_str == "tilt":
+                try:
+                    loco_client.SetFsmId(1)
+                except Exception:
+                    pass
+            publish_event("safety_stop", {"reason": reason_str, **(extra or {}), "ret": result.get("ret")})
+            return
         if move_timer:
             move_timer.cancel()
             move_timer = None
@@ -630,6 +690,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     # ── Command handlers ──
     def handle_move(vx, vy, vyaw, duration):
         nonlocal state, current_cmd, speed_zone, move_timer
+        if point_sequence is not None:
+            return {"error": "loco_point owns the base; stop its sequence first"}
 
         if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
             do_stop_nav()
@@ -673,6 +735,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
     def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60):
         nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error
+        if point_sequence is not None:
+            return {"error": "loco_point owns the base; stop it before navigation"}
 
         if state == MotionState.MOVING:
             do_stop("command")
@@ -832,6 +896,14 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return result
 
     # ── Safety checks (inline in main loop) ──
+    def update_velocity(vx, vy, vyaw):
+        if point_sequence is not None:
+            action_id = current_cmd.get("point_action_id") if current_cmd else None
+            if action_id:
+                return point_motion.update(action_id, vx, vy, vyaw)
+            return None
+        return loco_client.Move(vx, vy, vyaw, True)
+
     def process_safety_checks():
         nonlocal state, speed_zone
 
@@ -854,7 +926,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     speed_zone = SpeedZone.DECELERATED
                     if current_cmd:
                         dvx, dvy, dvyaw = clamp(current_cmd["vx"], current_cmd["vy"], current_cmd["vyaw"], SpeedZone.DECELERATED)
-                        loco_client.Move(dvx, dvy, dvyaw, True)
+                        update_velocity(dvx, dvy, dvyaw)
                         publish_event("joint_overheat", {
                             "max_temp": round(temp, 1),
                             "action": "decelerate",
@@ -880,7 +952,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     print(f"[SmartMotion:obstacle] DECEL — dist={dist:.2f}m angle={math.degrees(obstacle_angle):.1f}° lateral={lateral}", flush=True)
                     if cmd:
                         dvx, dvy, dvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.DECELERATED)
-                        loco_client.Move(dvx, dvy, dvyaw, True)
+                        update_velocity(dvx, dvy, dvyaw)
                         with obstacle_lock:
                             od = obstacle_dist
                             oa = obstacle_angle
@@ -895,7 +967,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     speed_zone = SpeedZone.NORMAL
                     if cmd:
                         cvx, cvy, cvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.NORMAL)
-                        loco_client.Move(cvx, cvy, cvyaw, True)
+                        update_velocity(cvx, cvy, cvyaw)
                         publish_event("motion_resume", {"speed": {"vx": cvx, "vy": cvy, "vyaw": cvyaw}})
 
         elif state == MotionState.NAVIGATING:
@@ -917,6 +989,50 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 print(f"[SmartMotion:nav_obstacle] RESUME NAV — "
                       f"dist={dist:.2f}m, obstacle cleared", flush=True)
 
+    def handle_point_move(cmd):
+        nonlocal point_motion, point_sequence, state, current_cmd, speed_zone, stop_repeat_count
+        if point_motion is None:
+            from point_motion import PointMotion
+            from point_rpc import PointRpc
+            point_motion = PointMotion(PointRpc(), on_stop=point_stopped)
+        sequence = cmd["sequence_id"]
+        with point_motion.lock:
+            if sequence in point_cancelled:
+                return {"error": "Point sequence interrupted by safety stop", **point_cancelled[sequence]}
+            if point_sequence not in (None, sequence):
+                return {"error": "Another point sequence owns the base"}
+            if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
+                return {"error": "Stop navigation before starting loco_point"}
+            point_sequence = sequence
+            stop_repeat_count = 0
+            current_cmd = {"vx": cmd["vx"], "vy": cmd["vy"], "vyaw": cmd["vyaw"],
+                           "duration": cmd["duration"], "start_time": time.time(),
+                           "end_time": time.time() + cmd["duration"],
+                           "point_action_id": cmd["action_id"]}
+            state, speed_zone = MotionState.MOVING, SpeedZone.NORMAL
+            if tilt_triggered:
+                cancel_point("tilt")
+            else:
+                process_safety_checks()
+            if sequence in point_cancelled or state != MotionState.MOVING:
+                return {"error": "Point movement rejected by safety checks"}
+            velocity = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], speed_zone)
+            pending = point_motion.begin_start(*velocity, cmd["duration"], cmd["action_id"])
+            if not callable(pending):
+                return pending
+            threading.Thread(target=pending, daemon=True).start()
+            publish_event("motion_start", {"action_id": cmd["action_id"], "params": cmd})
+            return {"ret": 0, "action_id": cmd["action_id"], "state": "moving"}
+
+    def handle_point_result(cmd):
+        if point_motion is None:
+            return {"status": "error", "result": {"error": "Unknown point movement"}}
+        with point_motion.lock:
+            interrupted = point_cancelled.get(cmd["sequence_id"])
+            if interrupted:
+                return {"status": interrupted["status"], "result": dict(interrupted["result"])}
+            return point_motion.get_result(cmd["action_id"])
+
     # ── Main loop ──
     print(f"[SmartMotion:pid={os.getpid()}] entering main loop")
     running = True
@@ -932,6 +1048,28 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
             if method == "move":
                 result = handle_move(cmd["vx"], cmd["vy"], cmd["vyaw"], cmd["duration"])
+            elif method == "point_move":
+                result = handle_point_move(cmd)
+            elif method == "point_result":
+                result = handle_point_result(cmd)
+            elif method == "point_stop":
+                if point_sequence == cmd.get("sequence_id") and point_sequence is not None:
+                    result = cancel_point("command")
+                elif point_sequence is None and state == MotionState.IDLE:
+                    if point_motion:
+                        result = point_motion.stop("command")
+                    else:
+                        code = loco_client.StopMove()
+                        result = {"ret": code, "state": "idle" if code == 0 else "stop_failed"}
+                else:
+                    result = {"ret": None, "error": "Point sequence does not own current movement"}
+            elif method == "point_finish":
+                if point_sequence == cmd["sequence_id"] and current_cmd and current_cmd.get("point_action_id"):
+                    result = {"ret": None, "error": "Point stop remains unconfirmed"}
+                else:
+                    if point_sequence == cmd["sequence_id"]:
+                        point_sequence = None
+                    result = {"ret": 0}
             elif method == "stop":
                 result = do_stop(cmd.get("reason", "command"))
             elif method == "navigate_to":

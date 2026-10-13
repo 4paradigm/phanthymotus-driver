@@ -33,7 +33,7 @@ class PointMotion:
 
     def _finish(self, action):
         if (action["status"] is not None or not action["move_done"] or
-                not action["stop_done"]):
+                not action["stop_done"] or action["updates_pending"]):
             return
         if (action["move_ret"] != 0 or action["stop_ret"] != 0 or
                 action["reason"] == "move_failed" or action.get("update_error")):
@@ -79,7 +79,7 @@ class PointMotion:
             started = self.clock()
             action = {"id": action_id, "deadline": started + duration if duration > 0 else None,
                       "timer": None, "move_ret": None, "move_done": False,
-                      "update_ret": None,
+                      "updates_pending": 0, "update_ret": None,
                       "stop_ret": None, "stop_done": False, "stopping": False,
                       "stop_event": threading.Event(), "status": None, "reason": None}
             self.active = action
@@ -178,6 +178,40 @@ class PointMotion:
         if ret != 0:
             result["error"] = f"StopMove failed or unconfirmed: code={ret}"
         return result
+
+    def update(self, action_id, vx, vy, vyaw):
+        if not all(math.isfinite(v) for v in (vx, vy, vyaw)):
+            return {"error": "Motion parameters must be finite"}
+        with self.lock:
+            action = self.active
+            if not action or action["id"] != action_id or action["stopping"]:
+                return {"state": "superseded"}
+            expired = action["deadline"] is not None and self.clock() >= action["deadline"]
+            wait = None
+            if not expired:
+                action["updates_pending"] += 1
+                try:
+                    wait = self._begin("Move", action_id, vx, vy, vyaw, True)
+                except Exception as exc:
+                    action["error"] = repr(exc)
+        if expired:
+            return self.stop("duration_expired", expected_id=action_id)
+        ret = None
+        try:
+            if wait:
+                ret = wait()
+        except Exception as exc:
+            action["error"] = repr(exc)
+        with self.lock:
+            action["updates_pending"] -= 1
+            action["update_ret"] = ret
+            if ret != 0:
+                action["update_error"] = True
+                action.setdefault("error", f"Speed update failed: code={ret}")
+            self._finish(action)
+        if ret != 0:
+            self.stop("move_failed", expected_id=action_id)
+        return {"ret": ret}
 
     def get_result(self, action_id):
         with self.lock:

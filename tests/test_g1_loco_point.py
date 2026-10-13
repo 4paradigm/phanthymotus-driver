@@ -1,4 +1,7 @@
 """Offline contracts for sequential loco_point movement."""
+import ast
+from pathlib import Path
+import time
 import json
 import types
 from types import SimpleNamespace
@@ -7,7 +10,7 @@ import math
 import threading
 import unittest
 
-from unitree.g1.loco_point import LocoPointPlugin
+from unitree.g1.loco_point import LocoPointPlugin, PointBackend
 from unitree.g1.point_motion import PointMotion
 from unitree.g1.point_rpc import PointRpc
 
@@ -329,3 +332,139 @@ class TestPointRpc(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(closes, ['reader', 'writer'])
         self.assertEqual(rpc.pending, {})
+
+
+class TestSmartMotionPointIntegration(unittest.TestCase):
+    def harness(self):
+        source = (Path(__file__).resolve().parents[1] / 'unitree/g1/safety_harness.py').read_text()
+        process = next(n for n in ast.parse(source).body
+                       if isinstance(n, ast.FunctionDef) and n.name == '_run_smart_motion_process')
+        selected = ('cancel_point', 'point_stopped', 'do_stop', 'emergency_stop',
+                    'handle_point_move', 'handle_point_result', 'update_velocity')
+        functions = [n for n in process.body if isinstance(n, ast.FunctionDef) and n.name in selected]
+        calls, events = [], []
+        class Client:
+            def BeginMove(self, *args):
+                calls.append(('move', args))
+                return lambda: 0
+            def BeginStopMove(self):
+                calls.append(('stop', ()))
+                return lambda: 0
+            def StopMove(self):
+                calls.append(('legacy_stop', ()))
+                return 0
+            def SetFsmId(self, value):
+                calls.append(('fsm', value))
+        class Timer:
+            def __init__(self, *args, **kwargs):
+                pass
+            def start(self):
+                pass
+            def cancel(self):
+                pass
+        class Thread:
+            def __init__(self, target, **kwargs):
+                self.target = target
+            def start(self):
+                self.target()
+        client = Client()
+        namespace = dict(time=time, threading=SimpleNamespace(Thread=Thread),
+            MotionState=SimpleNamespace(IDLE='idle', MOVING='moving', NAVIGATING='nav', NAV_PAUSED='paused'),
+            SpeedZone=SimpleNamespace(NORMAL='normal', STOPPED='stopped'),
+            clamp=lambda vx, vy, vyaw, zone: (vx, vy, vyaw),
+            publish_event=lambda kind, data: events.append((kind, data)), loco_client=client)
+        text = """def factory():
+    point_motion = None
+    point_sequence = None
+    point_cancelled = {}
+    state = MotionState.IDLE
+    current_cmd = None
+    speed_zone = SpeedZone.NORMAL
+    stop_repeat_count = 0
+    move_timer = None
+    tilt_triggered = False
+    process_safety_checks = lambda: None
+"""
+        for node in functions:
+            text += '\n'.join('    ' + line for line in ast.get_source_segment(source, node).splitlines()) + '\n'
+        text += """    def snapshot():
+        return point_motion, point_sequence, state, point_cancelled
+    return locals()
+"""
+        exec(text, namespace)
+        env = namespace['factory']()
+        modules = {
+            'point_motion': SimpleNamespace(PointMotion=lambda c, **kw: PointMotion(c, timer_factory=Timer, **kw)),
+            'point_rpc': SimpleNamespace(PointRpc=lambda: client),
+        }
+        return env, calls, events, modules
+
+    def command(self, index=0):
+        return dict(vx=.3, vy=0., vyaw=0., duration=1.,
+                    action_id=f'point_job_{index}', sequence_id='point_job')
+
+    def test_emergency_interrupt_cancels_sequence_and_rejects_next_step(self):
+        for reason in ('tilt', 'foot_airborne', 'comm_timeout', 'joint_overheat'):
+            with self.subTest(reason=reason):
+                env, calls, events, modules = self.harness()
+                with patch.dict('sys.modules', modules):
+                    self.assertEqual(env['handle_point_move'](self.command())['ret'], 0)
+                    env['emergency_stop'](reason)
+                    result = env['handle_point_result'](self.command())
+                    self.assertEqual(result['status'], 'cancelled')
+                    self.assertTrue(result['result']['stop_acknowledged'])
+                    self.assertIn('error', env['handle_point_move'](self.command(1)))
+                self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
+                self.assertTrue(any(kind == 'safety_stop' for kind, _ in events))
+
+    def test_safety_interrupt_between_steps_latches_entire_sequence(self):
+        env, calls, _, modules = self.harness()
+        with patch.dict('sys.modules', modules):
+            env['handle_point_move'](self.command())
+            motion = env['snapshot']()[0]
+            motion._expire('point_job_0', 1.)
+            self.assertEqual(motion.get_result('point_job_0')['status'], 'completed')
+            env['emergency_stop']('tilt')
+            self.assertIn('error', env['handle_point_move'](self.command(1)))
+            self.assertEqual(env['handle_point_result'](self.command())['status'], 'cancelled')
+        self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
+
+    def test_obstacle_stop_is_tracked_and_speed_updates_use_same_owner(self):
+        env, calls, _, modules = self.harness()
+        with patch.dict('sys.modules', modules):
+            env['handle_point_move'](self.command())
+            env['update_velocity'](.1, 0, 0)
+            self.assertEqual(calls[-1][1][:3], (.1, 0, 0))
+            self.assertEqual(env['do_stop']('obstacle')['ret'], 0)
+            self.assertEqual(env['handle_point_result'](self.command())['status'], 'cancelled')
+            self.assertIn('error', env['handle_point_move'](self.command(1)))
+
+    def test_failed_safety_stop_reports_error_and_still_rejects_next_step(self):
+        env, calls, _, modules = self.harness()
+        with patch.dict('sys.modules', modules):
+            env['handle_point_move'](self.command())
+            motion = env['snapshot']()[0]
+            motion.client.BeginStopMove = lambda: (lambda: 3104)
+            self.assertEqual(env['do_stop']('obstacle')['ret'], 3104)
+            result = env['handle_point_result'](self.command())
+            self.assertEqual(result['status'], 'error')
+            self.assertFalse(result['result']['stop_acknowledged'])
+            self.assertIn('error', env['handle_point_move'](self.command(1)))
+        self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
+
+    def test_point_backend_only_calls_safety_proxy(self):
+        calls = []
+        proxy = SimpleNamespace(
+            point_move=lambda *args: calls.append(('move', args)) or {'ret': 0},
+            point_result=lambda *args: {'status': 'cancelled'},
+            point_stop=lambda *args: calls.append(('stop', args)) or {'ret': 0},
+            point_finish=lambda *args: calls.append(('finish', args)) or {'ret': 0})
+        backend = PointBackend(proxy)
+        backend._begin_motion(.3, 0, 0, 1, 'point_job_0')
+        self.assertEqual(calls[0][1][-1], 'point_job')
+        self.assertEqual(backend._motion_result('point_job_0')['status'], 'cancelled')
+        backend._stop_motion()
+        backend.finish_sequence()
+        self.assertEqual([c[0] for c in calls], ['move', 'stop', 'finish'])
+        with self.assertRaises(ValueError):
+            PointBackend(None)
