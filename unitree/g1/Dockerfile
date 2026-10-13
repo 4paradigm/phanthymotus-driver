@@ -1,4 +1,4 @@
-ARG G1_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:release.261012.4674297
+ARG G1_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:release.261012.4674297@sha256:88b1730d68102f21a20328f1fd87ec5ad3657766c0858db239e84f09dcdbac58
 FROM ${G1_BASE_IMAGE}
 
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.

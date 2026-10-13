@@ -32,7 +32,7 @@ docker build --platform linux/arm64 \
   unitree/g1
 ```
 
-当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:release.261012.4674297`。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
+当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:release.261012.4674297@sha256:88b1730d68102f21a20328f1fd87ec5ad3657766c0858db239e84f09dcdbac58`，按已发布的 OCI 索引摘要锁定内容，其中运行镜像为 linux/arm64。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile 中的标签和摘要；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
 
 ## 实现
 
