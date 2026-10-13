@@ -52,6 +52,10 @@ class PointMotion:
                 pass
 
     def start(self, vx, vy, vyaw, duration, action_id=None):
+        result = self.begin_start(vx, vy, vyaw, duration, action_id)
+        return result() if callable(result) else result
+
+    def begin_start(self, vx, vy, vyaw, duration, action_id=None):
         if not all(math.isfinite(v) for v in (vx, vy, vyaw, duration)):
             return {"error": "Motion parameters must be finite", "state": "idle"}
         action_id = action_id or f"g1_move_{uuid4().hex[:8]}"
@@ -93,30 +97,33 @@ class PointMotion:
             except Exception as exc:
                 wait = None
                 action["error"] = repr(exc)
-        ret = None
-        try:
-            if wait:
-                ret = wait()
-        except Exception as exc:
-            action["error"] = repr(exc)
-        with self.lock:
-            action["move_ret"], action["move_done"] = ret, True
-            self._finish(action)
-        if ret != 0:
-            # A timeout is ambiguous: the robot may have executed the command.
-            self.stop("move_failed", expected_id=action_id)
-        with self.lock:
-            result = {"ret": ret, "action_id": action_id, "vx": vx, "vy": vy,
-                      "vyaw": vyaw, "duration": duration,
-                      "state": "superseded" if self.active is not action else
-                      "moving" if not action["stopping"] else
-                      "idle" if action["stop_ret"] == 0 else
-                      "stop_failed" if action["stop_done"] else "stop_pending"}
+        def finish():
+            ret = None
+            try:
+                if wait:
+                    ret = wait()
+            except Exception as exc:
+                action["error"] = repr(exc)
+            with self.lock:
+                action["move_ret"], action["move_done"] = ret, True
+                self._finish(action)
             if ret != 0:
-                result["error"] = action.get("error") or f"Move failed: code={ret}"
-            if action["status"] is not None:
-                result["motion_status"] = action["status"]
-            return result
+                # A timeout is ambiguous: the robot may have executed the command.
+                self.stop("move_failed", expected_id=action_id)
+            with self.lock:
+                result = {"ret": ret, "action_id": action_id, "vx": vx, "vy": vy,
+                          "vyaw": vyaw, "duration": duration,
+                          "state": "superseded" if self.active is not action else
+                          "moving" if not action["stopping"] else
+                          "idle" if action["stop_ret"] == 0 else
+                          "stop_failed" if action["stop_done"] else "stop_pending"}
+                if ret != 0:
+                    result["error"] = action.get("error") or f"Move failed: code={ret}"
+                if action["status"] is not None:
+                    result["motion_status"] = action["status"]
+                return result
+
+        return finish
 
     def _expire(self, action_id, deadline):
         self.stop("duration_expired", expected_id=action_id)

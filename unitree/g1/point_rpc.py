@@ -11,6 +11,7 @@ class PointRpc:
         from unitree_sdk2py.g1.loco.g1_loco_api import LOCO_SERVICE_NAME
         self.lock = threading.Lock()
         self.pending = {}
+        self.closed = False
         factory = factory or ChannelFactory()
         self.writer = factory.CreateSendChannel(f"rt/api/{LOCO_SERVICE_NAME}/request", Request_)
         self.reader = factory.CreateRecvChannel(f"rt/api/{LOCO_SERVICE_NAME}/response", Response_,
@@ -38,6 +39,8 @@ class PointRpc:
         future = RequestFuture()
         future.SetRequestId(request_id)
         with self.lock:
+            if getattr(self, "closed", False):
+                return lambda: RPC_ERR_CLIENT_SEND
             self.pending[request_id] = future
         try:
             sent = self.writer.Write(request, 10.)
@@ -70,3 +73,15 @@ class PointRpc:
 
     def BeginStopMove(self):
         return self._velocity(0., 0., 0., 1.)
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            pending = list(self.pending.values())
+            self.pending.clear()
+        for future in pending:
+            future.Fail("loco_point transport shut down")
+        self.reader.Close()
+        self.writer.Close()

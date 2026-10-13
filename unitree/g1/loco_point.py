@@ -16,6 +16,8 @@ class LocoPointPlugin:
         self.prepare = prepare
         self.command_lock = threading.RLock()
         self.active = None
+        self.faulted = False
+        self.closed = False
         self.speed = float(config.get("translation_speed", 0.3))
         self.yaw_speed = float(config.get("rotation_speed", 0.5))
         if not (math.isfinite(self.speed) and 0 < self.speed <= 1 and
@@ -84,8 +86,17 @@ class LocoPointPlugin:
         pass
 
     def stop(self):
-        if self.busy:
+        self.closed = True
+        job = self.active
+        if job or self.faulted:
             self.cancel_and_stop()
+        if job:
+            worker = job.get("worker")
+            if worker and worker is not threading.current_thread():
+                worker.join(12.)
+        close = getattr(self.loco, "close", None)
+        if close:
+            close()
 
     def dispatch(self, action, args):
         if action == "start":
@@ -101,6 +112,10 @@ class LocoPointPlugin:
         if not stages:
             return {"ret": 0, "state": "idle", "stages": []}
         with self.command_lock:
+            if self.closed:
+                return {"error": "loco_point is shut down"}
+            if self.faulted:
+                return {"error": "Previous stop was not confirmed; retry stop_move first"}
             if self.busy:
                 return {"error": "loco_point is already running"}
             job = dict(id=f"g1_point_{uuid4().hex[:8]}", cancel=threading.Event(),
@@ -108,7 +123,8 @@ class LocoPointPlugin:
                        deadline=time.monotonic() + self.TIMEOUT - 15)
             self.active = job
             try:
-                threading.Thread(target=self._run, args=(job, stages), daemon=True).start()
+                job["worker"] = threading.Thread(target=self._run, args=(job, stages), daemon=True)
+                job["worker"].start()
             except Exception:
                 self.active = None
                 raise
@@ -119,8 +135,9 @@ class LocoPointPlugin:
             action == "switch_mode" and args.get("mode") == "emergency_stop")
         if stopping and self.busy:
             self.cancel_and_stop()
+        querying = action.startswith("get_") or action in ("list", "list_tags", "list_maps", "check")
         with self.command_lock:
-            if self.busy and not stopping:
+            if (self.busy or self.faulted) and not stopping and not querying:
                 return {"error": "loco_point is running; stop it before another base action"}
             return plugin.dispatch(action, args)
 
@@ -138,6 +155,7 @@ class LocoPointPlugin:
                 result = self.loco._stop_motion()
             except Exception as exc:
                 result = {"ret": None, "error": str(exc), "state": "stop_failed"}
+            self.faulted = result.get("ret") != 0
             if job:
                 job["stop_result"] = result
                 job["stop_done"].set()
@@ -159,8 +177,10 @@ class LocoPointPlugin:
                     if time.monotonic() >= job["deadline"]:
                         raise TimeoutError("loco_point deadline expired")
                     segment_id = f"{job['id']}_{index}"
-                    reply = self.loco._start_motion(stage["vx"], stage["vy"], stage["vyaw"],
-                                                    stage["duration"], segment_id)
+                    begin = getattr(self.loco, "_begin_motion", self.loco._start_motion)
+                    pending = begin(stage["vx"], stage["vy"], stage["vyaw"],
+                                    stage["duration"], segment_id)
+                reply = pending() if callable(pending) else pending
                 if reply.get("error") or reply.get("ret") != 0:
                     raise RuntimeError(reply.get("error") or f"Move failed: {reply.get('ret')}")
                 while not job["cancel"].is_set():
@@ -201,7 +221,14 @@ class PointBackend:
     def __init__(self):
         from point_motion import PointMotion
         from point_rpc import PointRpc
-        self.motion = PointMotion(PointRpc())
+        self.rpc = PointRpc()
+        self.motion = PointMotion(self.rpc)
+
+    def _begin_motion(self, vx, vy, vyaw, duration, action_id):
+        return self.motion.begin_start(vx, vy, vyaw, duration, action_id)
+
+    def close(self):
+        self.rpc.close()
 
     def _start_motion(self, vx, vy, vyaw, duration, action_id):
         return self.motion.start(vx, vy, vyaw, duration, action_id)

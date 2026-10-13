@@ -260,7 +260,10 @@ class G1DeviceBundle:
             p for p in self._plugins if getattr(p, "PREFIX", "") == "vision_capture"]
         other_plugins = [
             p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
-        for p in capture_plugins + other_plugins:
+        # Cancel the point sequence before shutting down its prepare/stop peer.
+        point_plugins = [p for p in other_plugins if getattr(p, "PREFIX", "") == "loco_point"]
+        remaining_plugins = [p for p in other_plugins if p not in point_plugins]
+        for p in capture_plugins + point_plugins + remaining_plugins:
             p.stop()
         print("[bundle] All plugins stopped")
 
@@ -284,7 +287,8 @@ class G1DeviceBundle:
                     args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
                     point = getattr(self, "_point_card", None)
                     resource = tool_def.get("inputSchema", {}).get("x-resource")
-                    is_base = resource == "base" or isinstance(resource, list) and "base" in resource
+                    is_base = (resource == "base" or isinstance(resource, list) and "base" in resource
+                               or tool_name in ("loco", "switch_mode", "switch_mode_expert", "spatial"))
                     if point and tool_name != "loco_point" and is_base and tool_def["type"] == "actuator":
                         result = point.dispatch_base(p, action, args)
                     else:

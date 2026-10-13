@@ -134,6 +134,72 @@ class TestLocoPoint(unittest.TestCase):
         self.assertTrue(done.wait(2))
         self.assertEqual(len(backend.calls), 1)
 
+    def test_stop_failure_blocks_new_jobs_until_successful_retry(self):
+        point, backend, _, done = self.setup_point()
+        backend.status = 'pending'
+        backend.stop_ret = 3104
+        point.dispatch('move', dict(x=.3))
+        self.assertTrue(backend.sent.wait(2))
+        point.cancel_and_stop()
+        self.assertTrue(done.wait(2))
+        self.assertIn('error', point.dispatch('move', dict(x=.3)))
+        backend.stop_ret = 0
+        self.assertEqual(point.cancel_and_stop()['ret'], 0)
+        self.assertFalse(point.faulted)
+
+    def test_manual_stop_does_not_wait_for_move_ack(self):
+        release, sent, stopped = threading.Event(), threading.Event(), threading.Event()
+        backend = Backend()
+        def begin(*args):
+            backend.calls.append(args)
+            sent.set()
+            def wait():
+                release.wait(2)
+                return {'ret': 0}
+            return wait
+        backend._begin_motion = begin
+        original_stop = backend._stop_motion
+        def stop():
+            stopped.set()
+            return original_stop()
+        backend._stop_motion = stop
+        point, _, notices, done = self.setup_point(backend)
+        point.dispatch('move', dict(x=.3, y=.3))
+        try:
+            self.assertTrue(sent.wait(1))
+            caller = threading.Thread(target=point.cancel_and_stop)
+            caller.start()
+            self.assertTrue(stopped.wait(1))
+            self.assertFalse(release.is_set())
+            caller.join(1)
+            self.assertFalse(caller.is_alive())
+        finally:
+            release.set()
+        self.assertTrue(done.wait(2))
+        self.assertEqual(len(backend.calls), 1)
+        self.assertEqual(notices[0][0][1], 'cancelled')
+
+    def test_shutdown_cancels_joins_and_closes(self):
+        point, backend, notices, done = self.setup_point()
+        backend.status = 'pending'
+        closed = threading.Event()
+        backend.close = closed.set
+        point.dispatch('move', dict(x=.3, y=.3))
+        self.assertTrue(backend.sent.wait(1))
+        point.stop()
+        self.assertTrue(done.is_set())
+        self.assertTrue(closed.is_set())
+        self.assertIn('error', point.dispatch('move', dict(x=.3)))
+        self.assertEqual(notices[0][0][1], 'cancelled')
+
+    def test_prepare_failure_never_sends_a_movement(self):
+        point, backend, notices, done = self.setup_point()
+        point.prepare = lambda: {'ret': 3104}
+        point.dispatch('move', dict(x=.3))
+        self.assertTrue(done.wait(1))
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(notices[0][0][1], 'error')
+
     def test_schema_declares_base_and_completion(self):
         point, _, _, _ = self.setup_point()
         schema = point.get_tools()[0]['inputSchema']
@@ -240,3 +306,16 @@ class TestPointRpc(unittest.TestCase):
                                  {'velocity': [.3, -.2, .5], 'duration': 864000.})
                 self.assertEqual(wait(), expected)
                 self.assertEqual(rpc.pending, {})
+
+    def test_close_fails_pending_waiters_and_closes_channels_once(self):
+        rpc = PointRpc.__new__(PointRpc)
+        rpc.lock, rpc.closed = threading.Lock(), False
+        failures, closes = [], []
+        rpc.pending = {1: SimpleNamespace(Fail=failures.append)}
+        rpc.reader = SimpleNamespace(Close=lambda: closes.append('reader'))
+        rpc.writer = SimpleNamespace(Close=lambda: closes.append('writer'))
+        rpc.close()
+        rpc.close()
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(closes, ['reader', 'writer'])
+        self.assertEqual(rpc.pending, {})
