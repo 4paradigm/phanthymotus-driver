@@ -1,0 +1,179 @@
+"""Ordered locomotion writes with deadlines independent of RPC response waits."""
+import math
+import threading
+import time
+from collections import OrderedDict
+from uuid import uuid4
+
+
+class PointMotion:
+    def __init__(self, client, *, on_stop=None,
+                 clock=time.monotonic, timer_factory=threading.Timer):
+        self.client = client
+        self.on_stop = on_stop
+        self.clock = clock
+        self.timer_factory = timer_factory
+        self.lock = threading.RLock()
+        self.active = None
+        self.actions = OrderedDict()
+
+    def _begin(self, method, action_id, *args):
+        return getattr(self.client, "Begin" + method)(*args)
+
+    def _outcome(self, action):
+        if "outcome" in action:
+            return {**action["outcome"], "result": dict(action["outcome"]["result"])}
+        if action["status"] is None:
+            return {"action_id": action["id"], "status": "pending"}
+        return {"action_id": action["id"], "status": action["status"],
+                "result": {"reason": action["reason"], "move_ret": action["move_ret"],
+                           "stop_ret": action["stop_ret"], "update_ret": action["update_ret"],
+                           "stop_acknowledged": action["stop_ret"] == 0,
+                           "error": action.get("error")}}
+
+    def _finish(self, action):
+        if (action["status"] is not None or not action["move_done"] or
+                not action["stop_done"]):
+            return
+        if (action["move_ret"] != 0 or action["stop_ret"] != 0 or
+                action["reason"] == "move_failed" or action.get("update_error")):
+            action["status"] = "error"
+            action.setdefault("error", f"Motion failed: move_ret={action['move_ret']}, stop_ret={action['stop_ret']}")
+        else:
+            action["status"] = "completed" if action["reason"] == "duration_expired" else "cancelled"
+        action["outcome"] = self._outcome(action)
+
+    def _stopped(self, action):
+        if self.on_stop and self.active is action:
+            try:
+                self.on_stop({"action_id": action["id"], "ret": action["stop_ret"],
+                              "reason": action["reason"], "error": action.get("error")})
+            except Exception:
+                pass
+
+    def start(self, vx, vy, vyaw, duration, action_id=None):
+        if not all(math.isfinite(v) for v in (vx, vy, vyaw, duration)):
+            return {"error": "Motion parameters must be finite", "state": "idle"}
+        action_id = action_id or f"g1_move_{uuid4().hex[:8]}"
+        with self.lock:
+            if action_id in self.actions:
+                return {"error": "Duplicate motion action_id", "action_id": action_id}
+            # Bound history, but keep unfinished actions until their replies arrive.
+            for key in list(self.actions):
+                if len(self.actions) < 256:
+                    break
+                if self.actions[key]["status"] is not None and self.actions[key] is not self.active:
+                    del self.actions[key]
+            if len(self.actions) >= 256:
+                return {"error": "Too many retained motion actions", "action_id": action_id}
+            old = self.active
+            if old and old["status"] is None:
+                if old["timer"]:
+                    old["timer"].cancel()
+                old["status"], old["reason"] = "cancelled", "replaced"
+                old["outcome"] = self._outcome(old)
+            started = self.clock()
+            action = {"id": action_id, "deadline": started + duration if duration > 0 else None,
+                      "timer": None, "move_ret": None, "move_done": False,
+                      "update_ret": None,
+                      "stop_ret": None, "stop_done": False, "stopping": False,
+                      "stop_event": threading.Event(), "status": None, "reason": None}
+            self.active = action
+            self.actions[action_id] = action
+            try:
+                # Arm before sending. The same lock prevents a timer/stop/new move
+                # from overtaking this send, but is released before response wait.
+                if duration > 0:
+                    timer = self.timer_factory(max(0., action["deadline"] - self.clock()),
+                                               self._expire, args=(action_id, action["deadline"]))
+                    timer.daemon = True
+                    action["timer"] = timer
+                    timer.start()
+                wait = self._begin("Move", action_id, vx, vy, vyaw, True)
+            except Exception as exc:
+                wait = None
+                action["error"] = repr(exc)
+        ret = None
+        try:
+            if wait:
+                ret = wait()
+        except Exception as exc:
+            action["error"] = repr(exc)
+        with self.lock:
+            action["move_ret"], action["move_done"] = ret, True
+            self._finish(action)
+        if ret != 0:
+            # A timeout is ambiguous: the robot may have executed the command.
+            self.stop("move_failed", expected_id=action_id)
+        with self.lock:
+            result = {"ret": ret, "action_id": action_id, "vx": vx, "vy": vy,
+                      "vyaw": vyaw, "duration": duration,
+                      "state": "superseded" if self.active is not action else
+                      "moving" if not action["stopping"] else
+                      "idle" if action["stop_ret"] == 0 else
+                      "stop_failed" if action["stop_done"] else "stop_pending"}
+            if ret != 0:
+                result["error"] = action.get("error") or f"Move failed: code={ret}"
+            if action["status"] is not None:
+                result["motion_status"] = action["status"]
+            return result
+
+    def _expire(self, action_id, deadline):
+        self.stop("duration_expired", expected_id=action_id)
+
+    def stop(self, reason="command", expected_id=None, retry=False):
+        with self.lock:
+            action = self.active
+            if expected_id is not None and (action is None or action["id"] != expected_id):
+                return {"state": "superseded", "action_id": expected_id}
+            owner = not action or not action["stopping"]
+            # Explicit stops and guarded safety repeats send a fresh zero command.
+            if action and action["stop_done"] and (expected_id is None or retry):
+                owner = True
+                action["stop_event"] = threading.Event()
+                action["stop_done"] = False
+            event = action["stop_event"] if action else None
+            wait = None
+            if owner:
+                if action:
+                    action["stopping"] = True
+                    if action["status"] is None:
+                        action["reason"] = reason
+                    if action["timer"]:
+                        action["timer"].cancel()
+                try:
+                    wait = self._begin("StopMove", action["id"] if action else None)
+                except Exception as exc:
+                    if action:
+                        action["error"] = repr(exc)
+        if not owner:
+            event.wait()
+            ret = action["stop_ret"]
+        else:
+            ret = None
+            try:
+                if wait:
+                    ret = wait()
+            except Exception as exc:
+                if action:
+                    action["error"] = repr(exc)
+            with self.lock:
+                if action:
+                    action["stop_ret"], action["stop_done"] = ret, True
+                    event.set()
+                    self._finish(action)
+                    self._stopped(action)
+        with self.lock:
+            state = "superseded" if self.active is not action else "idle" if ret == 0 else "stop_failed"
+        result = {"ret": ret, "state": state, "reason": reason}
+        if action:
+            result["action_id"] = action["id"]
+        if ret != 0:
+            result["error"] = f"StopMove failed or unconfirmed: code={ret}"
+        return result
+
+    def get_result(self, action_id):
+        with self.lock:
+            action = self.actions.get(action_id)
+            return self._outcome(action) if action else {"action_id": action_id, "status": "error",
+                                                       "result": {"error": "Unknown motion action"}}

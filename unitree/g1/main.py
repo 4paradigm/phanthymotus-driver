@@ -132,6 +132,15 @@ class G1DeviceBundle:
                                             state_node=loco_state.node,
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+            if plugins_cfg.get("loco_point", {}).get("enabled", True):
+                from loco_point import LocoPointPlugin, PointBackend
+                from device import _loco_acp_notify
+                loco = self._plugins[-1]
+                self._point_card = LocoPointPlugin(
+                    plugins_cfg.get("loco_point", {}), PointBackend(), _loco_acp_notify,
+                    prepare=lambda: loco.dispatch("stop_move", {}))
+                self._plugins.append(self._point_card)
+                print("[bundle] LocoPointPlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
@@ -273,7 +282,13 @@ class G1DeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
-                    result = p.dispatch(action, args)
+                    point = getattr(self, "_point_card", None)
+                    resource = tool_def.get("inputSchema", {}).get("x-resource")
+                    is_base = resource == "base" or isinstance(resource, list) and "base" in resource
+                    if point and tool_name != "loco_point" and is_base and tool_def["type"] == "actuator":
+                        result = point.dispatch_base(p, action, args)
+                    else:
+                        result = p.dispatch(action, args)
                     # A plugin that only knows its own verbs declines these
                     # rather than failing at them — see common/lifecycle.py.
                     if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):

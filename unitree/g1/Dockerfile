@@ -53,6 +53,9 @@ COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
+COPY loco_point.py /work/loco_point.py
+COPY point_motion.py /work/point_motion.py
+COPY point_rpc.py /work/point_rpc.py
 COPY sport_mode_state.py /work/sport_mode_state.py
 COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
