@@ -10,10 +10,19 @@
 
 `upstream/piper_description.urdf` retains the original bytes and exporter notice.
 No mesh assets are bundled or fetched at runtime. `monitor.renderer_urdf`
-exports links and joints only, removing inertia/visual/collision elements that
-the Core skeleton renderer does not use. It freezes the two prismatic finger
+exports the motion chain, removing upstream inertia/mesh/collision elements.
+`monitor.load_model()` then adds simple URDF box/cylinder visuals from
+`monitor_shapes.json`: wider base and joint housings, slimmer grey arm links,
+a smaller wrist and two fingers. Dimensions/colors are approximate display
+shells based on the user's side and gripper reference photos, not calibrated
+collision geometry. The photos themselves are not bundled. Core remains
+unchanged and currently ignores these `<visual>` elements: they are ready for
+a standard URDF viewer, but the existing canvas still draws thin bones.
+
+The export freezes the two prismatic finger
 joints at q=0 because that renderer handles revolute joints only. Gripper opening
-is measured and displayed as a parameter, not drawn as finger motion.
+is measured and displayed as a parameter, not drawn as finger motion; the new
+double-finger shell has a fixed illustrative opening and no camera/accessories.
 
 Mixed RPY origins are factored into fixed yaw, fixed pitch, and the original
 joint's roll, preserving translation and the six original arm joint names.

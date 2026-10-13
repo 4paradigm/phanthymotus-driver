@@ -5,27 +5,27 @@
 ## 结果
 
 - 监控测试 22 项：通过（含现场快照命名适配新增 2 项）。
-- 最新指定回归集合：182 passed、114 subtests passed。
+- 最新指定回归集合：187 passed、114 subtests passed（含 5 项部署适配测试）。
 - 实际 Edge headless + 未修改 Core 渲染器：通过；528 个矩阵值对比，无页面脚本错误。
 - 浏览器场景：三组实测角度模拟、过期冻结、读取失败提示、恢复、双设备隔离。
 - ROS transport 使用假 ROS 对象验证 Core context、QoS、消息序列化、重复关闭及部分初始化失败释放。
 - 官方源 URDF 与许可证原始字节 SHA256 核验：通过。
 - 监控生命周期中假硬件记录的控制命令数：0。
 - 以上开发模拟验收未访问真实反馈。后续现场缓存测试见下节；均未执行机械臂动作、
-  模式切换、使能/失能、拍照或现场部署。
+  模式切换、使能/失能或拍照。随后用户明确授权部署，记录见下节。
 
 Python 3.12 回归命令（pytest、PyYAML、OpenCV 为测试环境依赖，不是本提交新增的驱动依赖）：
 
 ```bash
 python -m pytest -q \
-  tests/test_piper_monitor.py tests/test_piper_ten_cards.py \
+  tests/test_piper_monitor.py tests/test_piper_monitor_bundle.py tests/test_piper_ten_cards.py \
   tests/test_piper_cards.py tests/test_piper_controls.py tests/test_piper_prepare.py \
   tests/test_piper_deployment.py tests/test_piper_mac.py tests/test_common_lifecycle.py \
   tests/test_dockerfile_copies.py tests/test_vendor_runtime_logging.py
 ```
 
-初次回归环境缺少 PyYAML/OpenCV，补齐隔离测试环境后通过。首次打包检查发现新增模块间依赖需要
-提前更改 Docker COPY，随后把模型导出合并进独立 `monitor.py`；最终打包检查通过，未修改 Dockerfile。
+初次回归环境缺少 PyYAML/OpenCV，补齐隔离测试环境后通过。独立阶段模型导出合并到 `monitor.py`。
+现场部署阶段新增 `monitor_bundle.py`，补充 Docker COPY 与模型资源打包；最终打包回归通过。
 
 ## 浏览器模拟证据
 
@@ -63,9 +63,26 @@ python -m pytest -q \
   用户明确选择保持不改 Core，仅使用顶部「监控」入口。本次未修改 Core。
 - 测试桥接脚本和证据在本机 `acceptance/20261013_piper_monitor/`，不属于生产注册或部署。
 
-按 `MONITOR_INTEGRATION.md` 由计划一提供无控制副作用的 `read_monitor_snapshot()`、注册插件、
-复制模块和资源、调整画布布局。此独立分支尚未把插件注册进现场服务；假反馈验收不能替代
-集成后的 ROS2 联调或真机模型方向/尺寸核对。
+### 2026-10-13 12:04 现场部署
+
+- 用户明确要求部署供检查。分别从现场原镜像叠加监控文件、模型、只读注册适配器；
+  保留机械臂 1 `arm_control/piper_photo`，机械臂 2 旧十卡，以及各自 CAN、相机、配置和数据目录。
+- 新镜像：`agilex-piper:local-monitor-ae45f64d-arm1` 与 `agilex-piper:local-monitor-ae45f64d-arm2`。
+  Core 镜像 ID 部署前后完全一致，Core 未改动或重启。
+- 原 compose、两台运行中驱动源码、镜像身份、画布前后布局备份：
+  `/opt/phanthy-motus/backups/piper-monitor-20261013-120447/`。
+- 镜像构建检查禁用网络、未映射设备，验证保留原工具、六轴官方模型、未创建硬件连接。
+  两台 MCP 健康检查通过，监控 `running/publishing=true`，发布错误为空，独立话题注册成功。
+- 两台参数话题通过实际 DDS → Core → WebSocket 到达 Edge 画布；切到「最新」后分别显示正确设备名、
+  未连接、动作许可关闭和缺失字段不可用。现场截图 `server-monitor-deployed.png`。
+- 驱动重启后尚未建立共享 CAN 连接；监控不负责连接，因此骨架尚无实测帧。用户需在原控制卡
+  手动读取一次状态再检查姿态。此阶段不宣称完成两台真实运动跟随或物理尺寸验收。
+- 未发送运动、模式、使能/失能命令，未查询固件、未拍照。画布仅新增两个监控节点，未删旧卡。
+- 照片参考的粗细外壳是标准 URDF visual，随镜像发布；当前 Core 忽略外壳，仍显示线条骨架。
+  卡片详情入口的既有模型寻址问题仍保留，请使用顶部「监控」。
+- 部署脚本在服务器 `/home/agilex/piper-monitor-deploy-20261013/deploy_monitor.py`。
+  回退命令（只恢复驱动，不动 Core）：
+  `sudo python3 /home/agilex/piper-monitor-deploy-20261013/deploy_monitor.py --rollback /opt/phanthy-motus/backups/piper-monitor-20261013-120447`
 
 用户要求先测试再提交 PR，因此本阶段保留本地独立提交，不创建或更新 PR。
 最终目标：[驱动 PR #382](https://github.com/4paradigm/phanthymotus-driver/pull/382)。

@@ -1,7 +1,8 @@
 # PiPER 计划二：姿态与参数监控集成
 
-本分支只交付 `PiperMonitorPlugin`、模型适配、模型来源及测试。计划一负责共享 runtime
-快照、工具注册、Dockerfile、配置、布局迁移、PR 更新和最终部署。
+本分支提供 `PiperMonitorPlugin`、模型和测试。原约定由计划一负责最终集成；
+用户于 2026-10-13 明确要求现场部署后，新增 `monitor_bundle.py` 和 Docker COPY，
+基于两台现有镜像叠加监控，并在现场画布添加监控卡。PR 仍等待用户测试后更新。
 
 ## 共同约定
 
@@ -15,7 +16,7 @@
 - 监控复用共享 runtime/CAN，只接受一个只读快照函数；不创建 SDK 或第二个 CAN 连接。
 - 保留旧十卡源码、未提交的 `smoke-test.py`、现场额外关节限位功能及部署备份。
   现场额外功能尚未核对，不能用本地旧驱动覆盖现场。
-- 本阶段使用假反馈，不执行真机动作、模式切换、使能/失能、拍照或现场部署。
+- 用户已授权只读部署与现场测试；仍不执行真机动作、模式切换、使能/失能或拍照。
 
 ## 构造与注册
 
@@ -32,6 +33,18 @@ monitor = PiperMonitorPlugin(
 )
 plugins = [runtime, monitor]  # 返回给现有 DriverBundle
 ```
+
+保留既有工具注册的部署接线：
+
+```python
+from agilex.piper.monitor_bundle import add_monitor
+plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, ros2)
+```
+
+适配器优先调用计划一安全快照。机械臂 2 的旧十卡镜像没有该接口，适配器仅在现有
+非阻塞连接锁内读取共享 driver 的缓存 getter；未连接时直接返回不可用，不调用
+`connected/status/read_state`，不连接、不获取动作锁、不改变许可或预览。
+现有配置、原控制工具、相机和命名空间保留。不会用本地旧 runtime 覆盖现场。
 
 `PiperMonitorPlugin` 提供 `get_tools/start/stop/dispatch`，适配 `DriverBundle`。
 其中 `piper_monitor` 为 sensor，动作是 `start/stop/read/info`，允许智能控制关闭时手动操作。
@@ -96,7 +109,11 @@ plugins = [runtime, monitor]  # 返回给现有 DriverBundle
 模型详情见 `resource/SOURCE.md`。模型在构造时校验并导出，缺失/损坏时显式失败，避免 Core
 悄悄使用人形骨架回退。六轴支持旋转；夹爪手指在 q=0 处固定，开度只显示数值。
 
-计划一需把 `monitor.py`、整个 `resource/` 复制到镜像的 `/work/agilex/piper/`。
+用户照片对应的简化外壳已加入 `resource/monitor_shapes.json`，导出为标准 URDF `<visual>`。
+底座/关节较粗、臂杆/腕部较细、夹爪为双指固定示意。用户明确保持 Core 不改；当前 Core
+忽略这些外壳，因此只准备模型及独立预览，不宣称现有卡片已显示新外形。
+
+镜像需复制 `monitor.py`、`monitor_bundle.py` 和整个 `resource/` 到 `/work/agilex/piper/`。
 使用现有 ROS/std_msgs 依赖，不新增 Pinocchio、网格、SDK 或前端库。不要直接修改本阶段以外的 shared runtime。
 
 ## 验证与交付边界

@@ -79,7 +79,30 @@ def renderer_urdf(source: str) -> str:
 
 
 def load_model() -> str:
-    return renderer_urdf((RESOURCE_DIR / "upstream" / "piper_description.urdf").read_text(encoding="utf-8"))
+    robot = ET.fromstring(renderer_urdf(
+        (RESOURCE_DIR / "upstream" / "piper_description.urdf").read_text(encoding="utf-8")))
+    links = {link.attrib["name"]: link for link in robot.findall("link")}
+    shapes = json.loads((RESOURCE_DIR / "monitor_shapes.json").read_text(encoding="utf-8"))
+    for name, primitives in shapes["links"].items():
+        if name not in links:
+            raise ValueError(f"Unknown display-shell link: {name}")
+        for index, primitive in enumerate(primitives):
+            kind = "box" if "box" in primitive else "cylinder"
+            size, xyz, rpy, rgba = (primitive[kind], primitive.get("xyz", [0, 0, 0]),
+                                    primitive.get("rpy", [0, 0, 0]), primitive["rgba"])
+            if (not _vector(size, 3 if kind == "box" else 2) or any(v <= 0 for v in size)
+                    or not _vector(xyz, 3) or not _vector(rpy, 3)
+                    or not _vector(rgba, 4) or any(v < 0 or v > 1 for v in rgba)):
+                raise ValueError(f"Invalid display shell: {name}/{index}")
+            visual = ET.SubElement(links[name], "visual", name=f"monitor_{name}_{index}")
+            ET.SubElement(visual, "origin", xyz=" ".join(map(str, xyz)), rpy=" ".join(map(str, rpy)))
+            geometry = ET.SubElement(visual, "geometry")
+            ET.SubElement(geometry, kind, **({"size": " ".join(map(str, size))} if kind == "box" else
+                                           {"radius": str(size[0]), "length": str(size[1])}))
+            material = ET.SubElement(visual, "material", name=f"monitor_material_{name}_{index}")
+            ET.SubElement(material, "color", rgba=" ".join(map(str, rgba)))
+    ET.indent(robot, space="  ")
+    return ET.tostring(robot, encoding="unicode")
 
 
 class MonitorSnapshot(TypedDict, total=False):

@@ -18,6 +18,8 @@ RUN sed '/^piper-sdk @ /d' /work/agilex/piper/requirements.txt > /tmp/piper-depe
     && rm /tmp/piper-dependencies.txt
 COPY common/ /work/common/
 COPY main.py device.py runtime.py cards.py arm.py control.py mac_can.py camera_capture.py config.yaml driver.yaml /work/agilex/piper/
+COPY monitor.py monitor_bundle.py /work/agilex/piper/
+COPY resource/ /work/agilex/piper/resource/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PIPER_MOTION_ENABLED=0 PIPER_CAMERA_ENABLED=0
