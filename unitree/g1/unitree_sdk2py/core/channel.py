@@ -53,7 +53,7 @@ class Channel:
         
         def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None, handler: Callable = None, queueLen: int = 0, topic_name: str = None):
             self.__topic_name = topic_name
-            self.__trace_loco = topic_name == "rt/api/loco/response"
+            self.__trace_loco = topic_name == "rt/api/sport/response"
             if self.__trace_loco:
                 trace_event("dds_reader_init", topic=topic_name, queue_length=queueLen)
             if handler is None:

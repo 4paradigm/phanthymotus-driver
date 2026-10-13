@@ -419,8 +419,13 @@ class TestDdsCallbackTrace(unittest.TestCase):
                          InvalidSample=type('InvalidSample', (), {}))
         exec('from __future__ import annotations\n' + ast.get_source_segment(source, node), namespace)
         reader = namespace['__Reader']()
-        reader._Reader__trace_loco = True
-        reader._Reader__topic_name = 'rt/api/loco/response'
+        namespace['DataReader'] = lambda *args: None
+        namespace['Listener'] = lambda **kwargs: None
+        reader.Init(None, None, handler=lambda sample: None,
+                    topic_name='rt/api/sport/response')
+        self.assertTrue(reader._Reader__trace_loco)
+        self.assertEqual(rows[0]['stage'], 'dds_reader_init')
+        rows.clear()
         samples = [SimpleNamespace(header=SimpleNamespace(identity=SimpleNamespace(id=123, api_id=7105)))]
         delivered, calls = [], []
         reader._Reader__handler = delivered.append
