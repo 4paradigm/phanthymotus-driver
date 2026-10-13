@@ -259,6 +259,58 @@ class TestPointMotion(unittest.TestCase):
             thread.join(2)
         self.assertEqual(controller.get_result('step')['status'], 'completed')
 
+    def test_stop_timeout_recovers_before_terminal_outcome(self):
+        replies, stops = iter([3104, 0]), []
+        class Client:
+            def BeginMove(self, *args):
+                return lambda: 0
+            def BeginStopMove(self):
+                stops.append('stop')
+                return lambda: next(replies)
+        class Timer:
+            def __init__(self, *args, **kwargs): pass
+            def start(self): pass
+            def cancel(self): pass
+        controller = PointMotion(Client(), timer_factory=Timer)
+        controller.start(.3, 0, 0, 1, 'step')
+        controller._expire('step', 1)
+        outcome = controller.get_result('step')
+        self.assertEqual(len(stops), 2)
+        self.assertEqual(outcome['status'], 'completed')
+        self.assertTrue(outcome['result']['stop_acknowledged'])
+        self.assertIsNone(outcome['result']['error'])
+
+    def test_stop_timeout_retries_are_bounded_and_fail_closed(self):
+        stops = []
+        class Client:
+            def BeginStopMove(self):
+                stops.append('stop')
+                return lambda: 3104
+        controller = PointMotion(Client())
+        self.assertEqual(controller.stop()['ret'], 3104)
+        self.assertEqual(len(stops), 3)
+
+    def test_old_stop_timeout_does_not_send_retry_after_replacement(self):
+        stops, controller = [], None
+        class Timer:
+            def __init__(self, *args, **kwargs): pass
+            def start(self): pass
+            def cancel(self): pass
+        class Client:
+            def BeginMove(self, *args):
+                return lambda: 0
+            def BeginStopMove(self):
+                stops.append('stop')
+                def wait():
+                    controller.start(.3, 0, 0, 1, 'new')
+                    return 3104
+                return wait
+        controller = PointMotion(Client(), timer_factory=Timer)
+        controller.start(.3, 0, 0, 1, 'old')
+        controller._expire('old', 1)
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(controller.get_result('new')['status'], 'pending')
+
     def test_move_failure_is_not_reported_completed(self):
         class Client:
             def BeginMove(self, *args):
@@ -438,6 +490,34 @@ class TestSmartMotionPointIntegration(unittest.TestCase):
             self.assertEqual(env['do_stop']('obstacle')['ret'], 0)
             self.assertEqual(env['handle_point_result'](self.command())['status'], 'cancelled')
             self.assertIn('error', env['handle_point_move'](self.command(1)))
+
+    def test_deadline_stop_retry_recovers_harness_state(self):
+        env, calls, _, modules = self.harness()
+        with patch.dict('sys.modules', modules):
+            env['handle_point_move'](self.command())
+            motion = env['snapshot']()[0]
+            replies = iter([3104, 0])
+            attempts = []
+            def begin_stop():
+                attempts.append(1)
+                return lambda: next(replies)
+            motion.client.BeginStopMove = begin_stop
+            motion._expire('point_job_0', 1.)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(env['snapshot']()[2], 'idle')
+            self.assertEqual(env['handle_point_result'](self.command())['status'], 'completed')
+
+    def test_safety_stop_retry_never_resumes_sequence(self):
+        env, calls, _, modules = self.harness()
+        with patch.dict('sys.modules', modules):
+            env['handle_point_move'](self.command())
+            motion = env['snapshot']()[0]
+            replies = iter([3104, 0])
+            motion.client.BeginStopMove = lambda: (lambda: next(replies))
+            self.assertEqual(env['do_stop']('obstacle')['ret'], 0)
+            self.assertEqual(env['handle_point_result'](self.command())['status'], 'cancelled')
+            self.assertIn('error', env['handle_point_move'](self.command(1)))
+        self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
 
     def test_failed_safety_stop_reports_error_and_still_rejects_next_step(self):
         env, calls, _, modules = self.harness()

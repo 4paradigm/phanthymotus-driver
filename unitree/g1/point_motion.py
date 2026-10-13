@@ -158,12 +158,29 @@ class PointMotion:
             ret = action["stop_ret"]
         else:
             ret = None
-            try:
-                if wait:
-                    ret = wait()
-            except Exception as exc:
-                if action:
-                    action["error"] = repr(exc)
+            # A timeout does not mean the robot ignored the zero command.
+            # Retry only the stop, at most twice, before freezing its outcome.
+            for attempt in range(3):
+                try:
+                    if wait:
+                        ret = wait()
+                except Exception as exc:
+                    if action:
+                        action["error"] = repr(exc)
+                    break
+                if ret != 3104 or attempt == 2:
+                    break
+                with self.lock:
+                    # Never let an old action's retry stop a replacement move.
+                    if self.active is not action:
+                        break
+                    try:
+                        wait = self._begin("StopMove", action["id"] if action else None)
+                    except Exception as exc:
+                        ret = None
+                        if action:
+                            action["error"] = repr(exc)
+                        break
             with self.lock:
                 if action:
                     action["stop_ret"], action["stop_done"] = ret, True
