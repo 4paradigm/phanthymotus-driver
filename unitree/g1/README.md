@@ -1,47 +1,59 @@
 # Unitree G1 Driver
 
-G1 Driver 通过 MCP 提供运动控制、机械臂动作、麦克风、扬声器、LED 与状态监控。启用配置见 [config.yaml](config.yaml)，构建入口见[仓库 README](../../README.md)。
+## 驱动概述
 
-现有 `arm.release` 使用厂商 action 99；连续控制入口包括 [servo.py](servo.py) 和 [servo_eef.py](servo_eef.py)。SDK 请求成功与实测动作完成是不同状态。
+本驱动将 Unitree G1 的运动、手臂、音频、视觉和状态能力接入 Phanthy Motus Agent Core。驱动通过 MCP HTTP 提供卡片，通过 ROS 传输卡片数据，通过 Unitree SDK 访问本体服务。
 
-## 双臂遥操
+默认 MCP 地址为 `http://localhost:15701/mcp`。驱动启动后向 Agent Core 注册；默认 Core 地址为 `https://localhost:15678`，可通过 `AGENT_CORE_URL` 指定。
 
-`teleop_control` 接收设备 Driver 的输入，在 G1 Driver 内完成相对映射、独立进程 IK 和双臂位置下发。默认注册该卡，市场清单包含 `teleop_control`。随镜像提供原厂 G1_23（每臂 5 关节、固定假手）的完整固定几何 profile；不依赖现场临时标定脚本或用户填写路径。Core 和 ActuCore 无需遥操专用修改。
+## 能力与卡片
 
-1. 安装 PICO Driver，在 Canvas 添加 `teleop_device` 和 `teleop_control`，连接命令输出与控制卡输入。
-2. 在设备卡齿轮页查看安装和配对说明，连接 PICO。
-3. 启动项目，先松开双握把；控制卡收到有效输入后建立初始相对基准。
-4. 同时按住双握把控制双臂。松开任一握把暂停，重新握住沿用原基准；跟踪空间重置后需松握重新就绪。
-5. 从 Canvas 停止项目；收臂复用既有 `arm.release`，它先取消遥操输入及待发目标再交还 SDK，之后需从 Canvas 重新启动遥操。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
+默认配置见 [config.yaml](config.yaml)，市场卡片清单见 [driver.yaml](driver.yaml)。默认启用表示驱动会加载对应功能，实际可用性取决于设备和本体服务。
 
-用户不需要填写实例 ID、模型路径、位移比例或 Shadow/Live。这些由框架和 Driver 预设管理；启动项目本身不发送运动目标。支持 FSM 500、801，不自动切换本体模式。
+| 能力 | 卡片 | 默认状态与用途 |
+|---|---|---|
+| 运动与模式 | `loco`、`switch_mode`、`switch_mode_expert`、`motion_switcher`、`smart_motion` | 启用；运动指令、模式切换和打断控制 |
+| 手臂动作 | `arm` | 启用；厂商预设手势和收臂 |
+| 双臂遥操 | `teleop_control` | 启用；接收设备输入，控制原厂 G1_23 固定假手双臂；见[遥操使用说明](motion/README.md#使用) |
+| 连续控制 | `servo`、`servo_eef` | 关闭；分别接收关节目标和末端位姿目标，按需启用 |
+| 音频与灯光 | `mic`、`tts`、`speaker`、`led` | 启用；麦克风输入、文本播报、音频播放和 LED 控制 |
+| 视觉 | `camera_rgb`、`camera_depth`、`camera_distance`、`vision_capture` | 启用；RealSense 图像、距离、拍照和录像 |
+| 雷达与空间服务 | `lidar_cloud`、`controlled_spatial`、`controlled_spatial_map` | 启用；点云、厂商 SLAM 空间操作及地图数据 |
+| 本体状态 | `loco_state`、`loco_motion_state`、`motion_events`、`posture`、`imu`、`battery`、`joints`、`mainboard`、`model` | 启用；运动状态、姿态、电池、关节和模型数据 |
+| 外接设备 | `ext_mic`、`ext_camera` | 启用；外接麦克风和相机 |
 
-适用范围仅为原厂 G1_23 固定假手，不自动适配 G1_29、灵巧手或改装 TCP。附加碰撞与工作区扫描默认关闭；Driver 不自动停止其他控制程序。`servo`、`servo_eef` 可同时注册，但本实现不提供统一控制器仲裁。
+旧 `slam` 插件和独立 `motion_control` 入口默认关闭。通常使用空间服务卡片和 `teleop_control`；不要同时启用 `motion_control` 与 `teleop_control`。
 
-## 状态与恢复
+## 安装与启动
 
-Canvas 显示输入等待、过期和传输错误等状态。IK 子进程超时或退出后，控制卡暂停并等待后续有效输入恢复。MCP 在线不代表 DDS 接收正常。Driver 不持久化或自动恢复运动租约。
+在 Agent Core Web 界面的部署页选择 Unitree G1 Driver 和已发布版本，完成部署。驱动注册后，在 Canvas 中添加所需卡片。通用操作见[仓库部署说明](../../README.md#deploy-via-web-dashboard-recommended)。
 
-模型、话题、平滑参数、诊断与测试见 [G1 数值进程说明](motion/README.md)。
-
-## 构建
-
-业务镜像使用固定版本的 teleop base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
-
-已发布的 base 可直接拉取，日常业务构建无需执行以下源码构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
+本地开发需要先具备 ROS Humble、项目 ROS 消息包、Unitree SDK 和 G1 运行依赖。准备方法见[运行环境与构建说明](motion/README.md#构建)。在仓库根目录执行：
 
 ```sh
-docker build --platform linux/arm64 \
-  -f unitree/g1/Dockerfile.base \
-  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
-  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:YOUR_NEW_TAG \
-  unitree/g1
+source /opt/ros/humble/setup.bash
+source /ros_ws/install/setup.bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+python3 unitree/g1/main.py eth0
 ```
 
-当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:release.261012.4674297`。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
+将 `eth0` 替换为连接机器人网络的实际网卡。将 ROS 消息包的 setup 路径替换为本机工作空间路径。启动前配置 ROS 环境，要求见“运行配置与限制”。
 
-## ROS 配置来源
+驱动默认读取同目录的 `config.yaml`；使用 `CONFIG_PATH` 可指定其他配置文件。`mcp_port` 设置 MCP 端口；`ros_namespace` 为空时使用规范化后的主机名。
 
-ROS 初始化沿用主线 `rclpy.init()`，读取部署环境变量；Driver 不新增初始化校验或内置 XML 副本。
-`deploy/service.yml` 统一挂载 `/opt/phanthy-motus/dds-local.xml`，指定该 profile 和 `ROS_DOMAIN_ID=42`。
-开发和测试由启动环境显式提供相同配置。遥操开关不覆盖配置；Unitree SDK 的 domain 0 与网卡配置不变。
+## 运行配置与限制
+
+- ROS 使用 FastDDS、domain `42` 和 `/opt/phanthy-motus/dds-local.xml`。部署模板设置 `ROS_DOMAIN_ID`、`RMW_IMPLEMENTATION` 和 `FASTRTPS_DEFAULT_PROFILES_FILE`；本地运行也需提供这些环境变量及配置文件。
+- Unitree SDK 使用 CycloneDDS、domain `0` 和启动参数指定的机器人网卡。容器入口默认使用 `eth0`，可通过 `NETWORK_INTERFACE` 修改。
+- [部署模板](deploy/service.yml)使用宿主网络并挂载设备和持久数据目录。相机、麦克风、雷达和空间操作分别依赖对应设备或厂商服务；卡片注册成功不代表已收到传感器数据。
+- `servo` 和 `servo_eef` 默认关闭。启用前核对关节布局、夹爪和腰部配置，并阅读对应模块说明。驱动没有统一的多控制器仲裁，不要让多个控制源同时控制同一组关节。
+- SDK 请求成功与实测动作完成是不同状态。检查返回结果和本体反馈；软件检查不能替代物理动作验收。
+
+## 开发与验证入口
+
+- [仓库构建流程](../../CONTRIBUTING.md#building-docker-images)：业务镜像构建与发布入口。
+- [G1 专项说明](motion/README.md)：遥操使用、运行依赖、base 构建、数值实现和隔离验证。
+- [关节连续控制](servo.py)与[末端连续控制](servo_eef.py)：输入契约、硬件配置和执行限制。
+- [G1 测试目录](tests/)：音频、视觉、状态和遥操测试；[共享测试目录](../../tests/)另含 G1 SDK、连续控制和导航测试。
+
+测试环境要求和结果边界以对应测试说明为准。离线测试通过不代表设备、DDS 通信或机器人动作已验收。
