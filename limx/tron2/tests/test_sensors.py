@@ -92,7 +92,7 @@ class StateTests(unittest.TestCase):
         data = state.battery_state(source)
         self.assertEqual(data['schema_version'], 2)
         self.assertEqual({key: data[key] for key in state.BATTERY_FIELDS},
-                         {'soc': 85, 'voltage': 52650, 'current': -70,
+                         {'soc': 85, 'voltage': 52650, 'current': 70,
                           'power': None, 'temperature': [74, 64, 74, 104, 94], 'cycle': 22})
         self.assertEqual(data['power_status'], 'unit_conversion_unverified')
         self.assertEqual(data['units']['temperature'], 'vendor_raw_unverified')
@@ -124,8 +124,10 @@ class StateTests(unittest.TestCase):
             self.assertIsNone(state.battery_state({'bms_current': '70',
                 'bms_current_valid': valid})['current'])
         self.assertIsNone(state.battery_state({'bms_voltage': '-1'})['voltage'])
-        self.assertEqual(state.battery_state({'bms_current': 0,
-            'bms_current_valid': True})['current'], 0)
+        for raw, expected in ((0, 0), (-0.0, 0), ('-2620', 2620), ('2620', 2620), (-2.5, 2.5)):
+            with self.subTest(current=raw):
+                self.assertEqual(state.battery_state({'bms_current': raw,
+                    'bms_current_valid': True})['current'], expected)
 
     def test_battery_temperature_channels_keep_zero_missing_and_negative_raw_values(self):
         data = state.battery_state({'bms_temp1': 0, 'bms_temp2': 'UNKNOW',
@@ -247,12 +249,13 @@ class BatteryPublicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_bms_marker_does_not_become_verified_measurement_time(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['battery_state']))
         body = info()
-        body['data'].update(bms_current='70', bms_current_valid=True, bms_current_updated_at=123)
+        body['data'].update(bms_current='-70', bms_current_valid=True, bms_current_updated_at=123)
         adapter.reader.accept_info(body)
         adapter.reader.info_at = time.monotonic()-10
         # A new notification repeats exactly the same BMS update marker.
         adapter.reader.accept_info(body)
         packet = await self.first_packet(adapter)
+        self.assertEqual(packet['current'], 70)
         self.assertEqual(packet['current_updated_at_raw'], 123)
         self.assertLess(packet['status']['reception_age_seconds'], 1)
         self.assertTrue(packet['status']['available'])

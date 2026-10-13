@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 关节位置 `q`（rad）、`positions_deg`（度）、厂家返回的 `dq` / `tau` | `/limx_tron2/joint_state` |
 | `robot_status` | sensor | 工作模式、固件版本、IMU / 电机 / 相机等状态 | `/limx_tron2/robot_status` |
-| `battery_state` | sensor | 电量、电压/电流原始值、五路温度原始值、循环次数、有效性与接收时间；功率单位未确认时为null | `/limx_tron2/battery_state` |
+| `battery_state` | sensor | 电量、电压原始值/电流绝对值、五路温度原始值、循环次数、有效性与接收时间；功率单位未确认时为null | `/limx_tron2/battery_state` |
 | `arm_control` | actuator | 双臂14项角度目标（rad），显式 MoveJ | 无 |
 | `reset_pose` | actuator | 从本机保存姿态读取固定双臂目标，预览/执行/到位检查 | 无 |
 
@@ -19,7 +19,8 @@
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
 - 电池测量字段为 `soc/voltage/current/power/temperature/cycle`，数据schema版本为2。`soc`为百分比；`voltage/current/temperature`保留厂家原始数值，通过`units`明确标记`vendor_raw_unverified`。`temperature`固定五项，对应`bms_temp1`至`bms_temp5`，无效通道保留`null`，不能过滤后改变通道顺序。`cycle`来自`bms_charging_cycle`，只接受非负整数；没有厂家数据的SOH、电芯电压和充放电状态不推测或补造。
-- 未确认电压和电流的缩放时，`power: null`、`power_status: unit_conversion_unverified`、`validity.power: false`。移除原来的`voltage*current/1000`公式；若两者后来被确认分别是mV和mA，瓦数应除以1000000，但当前没有启用此假设。`units.power`表示目标单位W，不代表已经有有效瓦数。不能用电池电流推算外接电源供电时的整机耗电，也不能仅凭电流符号推测充放电状态。
+- 电流`current`按用户要求只展示绝对值，例如厂家`-2620`显示`2620`；0保留，无效值仍为null。缩放保持厂家原始单位，这个字段不再保留正负方向，不用于判断充放电状态。
+- 未确认电压和电流的缩放时，`power: null`、`power_status: unit_conversion_unverified`、`validity.power: false`。移除原来的`voltage*current/1000`公式；若两者后来被确认分别是mV和mA，功率大小应除以1000000，但当前没有启用此假设。`units.power`表示目标单位W，不代表已经有有效瓦数。不能用电池电流推算外接电源供电时的整机耗电。
 - `validity`提供各测量字段及五路温度通道的有效性。有效原始0保留为0，缺失、无效和非有限数值为null；数据有效不等于厂家单位或测量时间已验证。
 - 厂家的 `UNKNOW` 等状态字符串原样保留；缺失字段为 `null`。
 - 关节和设备状态数据包包含 `connected`、`available`、`sample_status`、`received_at` 和 `reception_age_seconds`；电池发布包将这些信息放在`status`中，`info.sample`保留原有诊断封装。接收年龄使用主机单调时钟计算；`received_at` 是主机接收时的 Unix 秒数，只表示整条通知的接收年龄，不能证明其中电流或温度字段的采样年龄。`current_updated_at_raw`保留厂家`bms_current_updated_at`的非负有限原始标记；没有验证其时钟，因此不与主机时间相减，不标成测量年龄。消息接收新鲜且`available: true`也不意味着所有测量字段都有效或更新了。
@@ -33,7 +34,7 @@
   "schema_version": 2,
   "soc": 85,
   "voltage": 52650,
-  "current": -70,
+  "current": 70,
   "power": null,
   "power_status": "unit_conversion_unverified",
   "temperature": [74, 64, 74, 104, 94],

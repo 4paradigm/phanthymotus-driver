@@ -102,7 +102,7 @@ def run_check(timeout=20):
     print('Joint labels:', values['name_source'])
     print('First joint positions (degrees):', values['positions_deg'][:3])
     print('Battery (%):', battery['soc'])
-    print('Voltage/current (vendor raw units):', battery['voltage'], battery['current'])
+    print('Voltage raw/current magnitude (vendor units unverified):', battery['voltage'], battery['current'])
     print('Power (units unverified):', battery['power'])
     print('Five temperature channels (vendor raw units):', battery['temperature'])
     print('Charge cycles:', battery['cycle'])

@@ -83,6 +83,8 @@ def battery_state(data):
     # Invalid or unverified current must not be presented as a real zero.
     current = battery_number(data.get('bms_current')) \
         if data.get('bms_current_valid') is True else None
+    # User-facing current is magnitude only; preserve missing/invalid as null.
+    current = abs(current) if current is not None else None
     soc_valid = soc is not None and 0 <= soc <= 100
     voltage_valid = voltage is not None and voltage >= 0
     # Keep fixed channel order; missing/invalid channels must not shift indices.
