@@ -20,7 +20,7 @@
 
 基础镜像配方位于 `unitree/base/Dockerfile`，与 `dji/base/Dockerfile` 一样放在机型目录的同级。该配方目前供 G1 使用；其他 Unitree 机型沿用各自的基础镜像。
 
-业务镜像使用固定版本的 teleop base。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
+业务镜像使用固定版本的 `g1-base`。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
 
 已发布的 base 可直接拉取，日常业务构建无需执行以下源码构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
 
@@ -28,11 +28,11 @@
 docker build --platform linux/arm64 \
   -f unitree/base/Dockerfile \
   --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
-  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:YOUR_NEW_TAG \
+  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:YOUR_NEW_TAG \
   unitree/base
 ```
 
-当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/teleop/base:release.261012.4674297`。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
+当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:release.261012.4674297`。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
 
 ## 实现
 
