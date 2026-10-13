@@ -29,6 +29,11 @@ from common.vendor_runtime import action_schema, jsonable, tool
 SERVICE_TIMEOUT = 10.0
 AUDIO_ENABLE_TIMEOUT = 2.0
 PULSE_SERVER_DEFAULT = "tcp:127.0.0.1:34567"
+SPEAKER_BLOCK_MS = 20
+SPEAKER_BLOCK_BYTES = 16_000 * 2 * SPEAKER_BLOCK_MS // 1000
+SPEAKER_QUEUE_DEPTH = 50
+SPEAKER_INPUT_QUEUE_DEPTH = SPEAKER_QUEUE_DEPTH
+SPEAKER_PULSE_MAX_LEAD_MS = 40
 CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
@@ -487,8 +492,13 @@ class U1Nodes:
         self._speaker_enabled = False
         self._speaker_use_pulse = False
         self._speaker_process = None
-        self._speaker_audio_queue = queue.Queue(maxsize=32)
+        # Backpressure the input callback when playback falls behind; never
+        # discard PCM blocks, which would make speech discontinuous.
+        self._speaker_audio_queue = queue.Queue(maxsize=SPEAKER_QUEUE_DEPTH)
         self._speaker_audio_thread = None
+        self._speaker_audio_blocks_dropped = 0
+        self._speaker_playback_error = ""
+        self._speaker_writer_stop = threading.Event()
         self._audio_service_lock = threading.Lock()
         # Image6m callbacks perform a bounded JPEG conversion. Keep them in
         # their own re-entrant group so left/right conversion does not block
@@ -503,6 +513,8 @@ class U1Nodes:
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._audio_qos = best_effort
+        self._speaker_qos = QoSProfile(
+            depth=SPEAKER_INPUT_QUEUE_DEPTH, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._sensor_qos = best_effort
         self._camera_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
@@ -968,7 +980,7 @@ class U1Nodes:
         try:
             process = subprocess.Popen(
                 [paplay, "--raw", "--format=s16le", "--rate=16000", "--channels=1",
-                 "--server", server],
+                 "--latency-msec=40", "--process-time-msec=20", "--server", server],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -980,7 +992,9 @@ class U1Nodes:
         if process.poll() is not None:
             return False
         self._speaker_process = process
-        self._speaker_audio_queue = queue.Queue(maxsize=32)
+        self._speaker_audio_queue = queue.Queue(maxsize=SPEAKER_QUEUE_DEPTH)
+        self._speaker_playback_error = ""
+        self._speaker_writer_stop = threading.Event()
         self._speaker_audio_thread = threading.Thread(
             target=self._pulse_writer, daemon=True, name="u1-speaker-pulse")
         self._speaker_audio_thread.start()
@@ -990,29 +1004,45 @@ class U1Nodes:
         process = self._speaker_process
         if process is None or process.stdin is None:
             return
+        pending_until = time.monotonic()
+        stop_event = self._speaker_writer_stop
         while True:
             payload = self._speaker_audio_queue.get()
             if payload is None:
                 break
+            now = time.monotonic()
+            duration = len(payload) / (16_000 * 2)
+            # Keep no more than the configured lead inside paplay/PulseAudio.
+            # Input bursts are paced here; PCM blocks are never discarded.
+            write_at = max(pending_until, now) + duration - (SPEAKER_PULSE_MAX_LEAD_MS / 1000)
+            delay = write_at - now
+            if delay > 0 and stop_event.wait(delay):
+                break
+            if stop_event.is_set():
+                break
             try:
                 process.stdin.write(payload)
                 process.stdin.flush()
-            except (BrokenPipeError, OSError):
+            except (BrokenPipeError, OSError) as exc:
+                self._speaker_playback_error = str(exc)[:160]
                 break
+            pending_until = max(pending_until, time.monotonic()) + duration
 
     def _stop_pulse_output(self) -> None:
         process = self._speaker_process
         self._speaker_process = None
         if process is None:
             return
+        self._speaker_writer_stop.set()
+        while True:
+            try:
+                self._speaker_audio_queue.get_nowait()
+            except queue.Empty:
+                break
         try:
             self._speaker_audio_queue.put_nowait(None)
         except queue.Full:
-            try:
-                self._speaker_audio_queue.get_nowait()
-                self._speaker_audio_queue.put_nowait(None)
-            except queue.Empty:
-                pass
+            pass
         if self._speaker_audio_thread is not None:
             self._speaker_audio_thread.join(timeout=1.0)
         if process.poll() is None:
@@ -1027,6 +1057,7 @@ class U1Nodes:
         self.close_speaker_subscription()
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
+        self._speaker_audio_blocks_dropped = 0
         self._speaker_use_pulse = self._start_pulse_output()
         output_enabled = self._speaker_use_pulse
         enable_error = None
@@ -1042,7 +1073,7 @@ class U1Nodes:
                 enable_error = str(exc)[:192]
                 print(f"[U1 speaker] enable unavailable; using raw topic: {enable_error}", flush=True)
         self._speaker_subscription = self.core.create_subscription(
-            self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
+            self.AudioChunk, input_topic, self._speaker_callback, self._speaker_qos)
         self._speaker_forwarding = True
         result = {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC,
                   "output_enabled": output_enabled, "pulse_output": self._speaker_use_pulse}
@@ -1101,28 +1132,26 @@ class U1Nodes:
         raw = bytes(message.data)
         if len(raw) % 2:
             return
-        stereo = bytearray(len(raw) * 2)
-        for offset in range(0, len(raw), 2):
-            sample = raw[offset:offset + 2]
-            out = offset * 2
-            stereo[out:out + 2] = sample
-            stereo[out + 2:out + 4] = sample
         if getattr(self, "_speaker_use_pulse", False):
-            try:
-                self._speaker_audio_queue.put_nowait(raw)
-            except queue.Full:
-                try:
-                    self._speaker_audio_queue.get_nowait()
-                    self._speaker_audio_queue.put_nowait(raw)
-                except queue.Empty:
-                    pass
+            for offset in range(0, len(raw), SPEAKER_BLOCK_BYTES):
+                U1Nodes._enqueue_speaker_block(self, raw[offset:offset + SPEAKER_BLOCK_BYTES])
         else:
+            stereo = bytearray(len(raw) * 2)
+            for offset in range(0, len(raw), 2):
+                sample = raw[offset:offset + 2]
+                out = offset * 2
+                stereo[out:out + 2] = sample
+                stereo[out + 2:out + 4] = sample
             output = self.AudioOutData()
             output.header = message.header
             output.uuid = self._speaker_uuid
             output.data.data = list(stereo)
             self._speaker_publisher.publish(output)
         self._speaker_frames += 1
+
+    @staticmethod
+    def _enqueue_speaker_block(nodes, payload: bytes) -> None:
+        nodes._speaker_audio_queue.put(payload)
 
     def close(self) -> None:
         if self._closed:
@@ -1261,8 +1290,22 @@ class SpeakerPlugin:
             self.stop()
             return {"state": "idle"}
         if action == "info":
+            audio_queue = getattr(self.nodes, "_speaker_audio_queue", None)
+            queued_bytes = 0
+            if audio_queue is not None:
+                with audio_queue.mutex:
+                    queued_bytes = sum(
+                        len(item) for item in list(audio_queue.queue) if item is not None)
             return {"state": "running" if self.running else "idle", "input_topic": self.input_topic,
-                    "frames_received": self.nodes._speaker_frames}
+                    "frames_received": self.nodes._speaker_frames,
+                    "audio_blocks_dropped": getattr(self.nodes, "_speaker_audio_blocks_dropped", 0),
+                    "queued_frames": getattr(getattr(self.nodes, "_speaker_audio_queue", None), "qsize", lambda: 0)(),
+                    "queued_audio_ms": round(queued_bytes / 32, 1),
+                    "pulse_output": bool(getattr(self.nodes, "_speaker_use_pulse", False)),
+                    "playback_process_alive": bool(
+                        getattr(self.nodes, "_speaker_process", None)
+                        and self.nodes._speaker_process.poll() is None),
+                    "playback_error": getattr(self.nodes, "_speaker_playback_error", "")}
         return None
 
 

@@ -1291,12 +1291,12 @@ class U1CardContractTests(unittest.TestCase):
         nodes._speaker_enabled = False
         nodes._audio_service_lock = threading.Lock()
         nodes._audio_qos = object()
+        nodes._speaker_qos = object()
         nodes._speaker_forwarding = False
         nodes._speaker_enable_client = FakeAudioEnableClient()
         nodes._speaker_enable_request_type = type("Request", (), {})
         nodes.AudioInfo = type("AudioInfo", (), {})
         nodes.AudioChunk = object
-        nodes._audio_qos = object()
         nodes.close_speaker_subscription = lambda: None
         nodes._start_pulse_output = lambda: False
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
@@ -1326,6 +1326,7 @@ class U1CardContractTests(unittest.TestCase):
         nodes.AudioInfo = type("AudioInfo", (), {})
         nodes.AudioChunk = object
         nodes._audio_qos = object()
+        nodes._speaker_qos = object()
         nodes.close_speaker_subscription = lambda: None
         nodes._start_pulse_output = lambda: False
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock())
@@ -1392,6 +1393,42 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(len(publisher.messages), 1)
         self.assertIs(publisher.messages[0].header, message.header)
         self.assertEqual(publisher.messages[0].data.data, [1, 0, 1, 0, 2, 0, 2, 0])
+
+    def test_speaker_pulse_queue_backpressures_without_dropping_audio(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_frames=0,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_use_pulse=True,
+            _speaker_audio_queue=device.queue.Queue(maxsize=2),
+            _speaker_publisher=FakePublisher(),
+        )
+        for value in (1, 2):
+            message = types.SimpleNamespace(
+                format=device.AUDIO_FORMAT,
+                data=[value, 0],
+            )
+            device.U1Nodes._speaker_callback(nodes, message)
+
+        enqueue_done = threading.Event()
+
+        def enqueue_last_block():
+            message = types.SimpleNamespace(format=device.AUDIO_FORMAT, data=[3, 0])
+            device.U1Nodes._speaker_callback(nodes, message)
+            enqueue_done.set()
+
+        producer = threading.Thread(target=enqueue_last_block)
+        producer.start()
+        self.assertFalse(enqueue_done.wait(timeout=0.05))
+        self.assertEqual(nodes._speaker_audio_queue.get(timeout=0.1), bytes([1, 0]))
+        self.assertTrue(enqueue_done.wait(timeout=0.5))
+        producer.join(timeout=0.5)
+
+        self.assertEqual(list(nodes._speaker_audio_queue.queue), [bytes([2, 0]), bytes([3, 0])])
+        self.assertEqual(nodes._speaker_frames, 3)
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 0)
 
     def test_speaker_callback_rejects_non_pcm_input(self):
         import device
