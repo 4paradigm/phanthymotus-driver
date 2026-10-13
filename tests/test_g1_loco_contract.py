@@ -62,6 +62,35 @@ class TestLocoCard(unittest.TestCase):
         result = card.dispatch('move', dict(vyaw=1, duration=1))
         self.assertEqual(calls, [result['action_id']])
 
+    def test_continuous_move_keeps_identity_internal_on_all_paths(self):
+        for duration in (0, -1):
+            for path in ('smart', 'direct', 'proxy'):
+                with self.subTest(duration=duration, path=path):
+                    w = World()
+                    if path == 'smart':
+                        card, namespace = self.card(smart=SimpleNamespace(move=w.controller.start))
+                    else:
+                        card, namespace = self.card(fallback=w.controller if path == 'direct' else None)
+                        if path == 'proxy':
+                            card._client = SimpleNamespace(TimedMove=w.controller.start)
+                    namespace['threading'] = SimpleNamespace(
+                        Thread=lambda **kw: self.fail('Continuous move must not register an ACP waiter'))
+                    result = card.dispatch('move', dict(vyaw=1, duration=duration))
+                    self.assertNotIn('action_id', result)
+                    self.assertEqual(result['ret'], 0)
+                    self.assertIsNotNone(w.controller.active['id'])
+                    self.assertEqual(w.controller.get_result(w.controller.active['id'])['status'], 'pending')
+                    self.assertEqual(w.timers, [])
+                    self.assertEqual(w.controller.stop()['ret'], 0)
+
+    def test_continuous_move_preserves_failure_without_external_identity(self):
+        card, _ = self.card(smart=SimpleNamespace(move=lambda *args, **kw: {
+            'action_id': kw['action_id'], 'ret': 3104, 'error': 'RPC timeout'}))
+        result = card.dispatch('move', dict(vyaw=1, duration=0))
+        self.assertNotIn('action_id', result)
+        self.assertEqual(result['ret'], 3104)
+        self.assertEqual(result['error'], 'RPC timeout')
+
     def test_completion_comes_from_stop_outcome(self):
         w = World()
         w.start()

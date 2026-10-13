@@ -1587,6 +1587,10 @@ class LocoPlugin:
                     result = self._fallback_motion.start(vx, vy, vyaw, duration, action_id)
                 else:
                     result = self._client.TimedMove(vx, vy, vyaw, duration, action_id)
+            if duration <= 0:
+                # Continuous moves enter a state; keep identity internal so ACP
+                # does not register an unbounded pending completion.
+                return {key: value for key, value in result.items() if key != "action_id"}
             if duration > 0 and result.get("action_id") == action_id:
                 threading.Thread(target=self._acp_wait_move, args=(action_id,), daemon=True).start()
             return result
