@@ -444,6 +444,22 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(model.findall(".//mesh"))
         self.assertFalse([j for j in model.findall("joint") if j.attrib["type"] == "prismatic"])
 
+    def test_display_shell_branches_are_fixed_and_follow_the_original_links(self):
+        model = load_model()
+        root = ET.fromstring(model)
+        display = [j for j in root.findall('joint') if j.get('name').startswith('display_')]
+        self.assertGreater(len(display), 100)
+        self.assertTrue(all(j.get('type') == 'fixed' for j in display))
+        # A housing vertex retains its local offset at both measured poses;
+        # the real joints/link transforms remain covered independently above.
+        for degrees in ([0]*6, [20,40,-50,10,-15,60]):
+            actual = forward(model, [math.radians(x) for x in degrees], renderer=True)
+            parent = actual['link2']
+            vertex = actual['display_link2_0_vertex0']
+            expected = [sum(parent[row][k]*[.043,0,-.037,1][k] for k in range(4)) for row in range(4)]
+            for row in range(4):
+                self.assertAlmostEqual(vertex[row][3], expected[row], places=12)
+
 
 if __name__ == "__main__":
     unittest.main()

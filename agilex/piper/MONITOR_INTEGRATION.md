@@ -7,7 +7,7 @@
 ## 共同约定
 
 - 原计划每台机械臂两张核心卡为 `arm_control` 与 `piper_monitor`；用户最新要求先仅操作机械臂 1，
-  当前现场画布只保留 `piper_status`（读取状态）和 `arm_control`（机械臂控制）。其他画布节点移除，
+  当前现场画布只保留 `piper_status`（读取骨架位置）和 `arm_control`（机械臂控制）。其他画布节点移除，
   后台模型、监控及相机工具保留注册，机械臂 2 服务不改动。
 - 使用现场已有 Core（含 PR #305 的中文标签和手动执行支持），本次不修改 Core。
   通用表单采用“选择操作＋执行按钮”；骨架和参数由监控区域的两个输出展示。
@@ -48,10 +48,13 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 `connected/status/read_state`，不连接、不获取动作锁、不改变许可或预览。
 现有配置、原控制工具、相机和命名空间保留。不会用本地旧 runtime 覆盖现场。
 
-机械臂 1 最新部署再用 `status_card.split_status_card(plugins)` 拆出读取状态：
+机械臂 1 最新部署再用 `status_card.split_status_card(plugins)` 拆出骨架读取卡：
 `piper_status.read` 显式手动读取时可建立同一 runtime 的 CAN 连接，然后读取安全缓存快照。
 它不调用 `status/read_state`，不获取动作锁、不发送运动、模式或电机命令。
-状态卡启停仅改变自身状态；监控采样仍不会主动连接。
+骨架卡接管原监控插件的采样与模型资源，避免重复注册或发布。
+启停仅管理采样、发布和资源释放；监控采样仍不会主动连接。
+`piper_status` 是 sensor，显式 `read` 返回 `skeleton/parameters`；画布只声明骨架输出，
+顶部「监控」只有一张机械臂骨架卡。参数继续后台发布并包含在读取结果中。
 控制卡移除 `read` 操作，其他控制流程保持原实现；默认「请选择控制动作」为空操作，
 必须由用户选择具体控制动作才执行。部署仅叠加独立文件，不修改 runtime 或 Core 源码。
 
@@ -60,7 +63,7 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 `read` 返回 `{"skeleton": dict或None, "parameters": 中文字典}`。
 `model` 为 resource，调用返回普通字典 `{"urdf": "<robot …>…</robot>"}`，不可预包装 MCP content。
 `model` 留作骨架渲染器自动调用的后台资源；Core 可能仍在资源列表中列出它。
-最新两卡现场布局不再摆放监控节点，后台发布仍保留。
+机械臂 1 的最新两卡布局由 `piper_status` 接管骨架输出与原后台发布。
 
 共享 bundle 启动先启动 runtime、再启动监控，关闭时顺序相反。构造和 `start` 均不采样；
 只有显式 `read` 和运行中的定时回调调用快照函数。`stop` 不调用任何控制停止方法，允许再次启动。
@@ -121,7 +124,8 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 
 用户照片对应的简化外壳已加入 `resource/monitor_shapes.json`，导出为标准 URDF `<visual>`。
 底座/关节较粗、臂杆/腕部较细、夹爪为双指固定示意。用户明确保持 Core 不改；当前 Core
-忽略这些外壳，因此只准备模型及独立预览，不宣称现有卡片已显示新外形。
+忽略 `<visual>`，因此额外导出固定骨架分支，给主要模块画出有体积的轮廓。
+新增分支仅供显示，实际六轴名称、角度映射及运动链保持不变；现场已经显示这些轮廓。
 
 镜像需复制 `monitor.py`、`monitor_bundle.py`、`status_card.py` 和整个 `resource/` 到 `/work/agilex/piper/`。
 使用现有 ROS/std_msgs 依赖，不新增 Pinocchio、网格、SDK 或前端库。不要直接修改本阶段以外的 shared runtime。

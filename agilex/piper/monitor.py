@@ -101,8 +101,60 @@ def load_model() -> str:
                                            {"radius": str(size[0]), "length": str(size[1])}))
             material = ET.SubElement(visual, "material", name=f"monitor_material_{name}_{index}")
             ET.SubElement(material, "color", rgba=" ".join(map(str, rgba)))
+    _add_skeleton_shells(robot, shapes)
     ET.indent(robot, space="  ")
     return ET.tostring(robot, encoding="unicode")
+
+
+def _add_skeleton_shells(robot, shapes):
+    """Display-only fixed branches for Core's existing bone renderer.
+
+    Core ignores URDF visual geometry but draws significant fixed segments.
+    Outline the major housings/links with those segments, never inserting
+    anything into the original six-axis motion chain. Small decorative strips
+    are omitted. These branches are illustrative, not additional sensors.
+    """
+    for link, primitives in shapes["links"].items():
+        for index, primitive in enumerate(primitives):
+            size = primitive.get("box", primitive.get("cylinder"))
+            if min(size) < .012:
+                continue
+            prefix = f"display_{link}_{index}"
+            if link == "gripper_base" and "box" in primitive and size[0] < .02:
+                prefix += "_hand"  # existing renderer's slimmer finger bones
+            parent = link
+            # Single-axis factors also preserve URDF RPY in the Core renderer.
+            roll, pitch, yaw = primitive.get("rpy", [0, 0, 0])
+            for axis, rpy in (("yaw", [0, 0, yaw]), ("pitch", [0, pitch, 0]), ("roll", [roll, 0, 0])):
+                name = f"{prefix}_{axis}"
+                _fixed_display_joint(robot, name, parent,
+                                     primitive.get("xyz", [0, 0, 0]) if axis == "yaw" else [0, 0, 0], rpy)
+                parent = name
+            if "box" in primitive:
+                vertices = [(x*size[0]/2, y*size[1]/2, z*size[2]/2)
+                            for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+                edges = [(a, b) for a in range(8) for b in range(a+1, 8)
+                         if sum(vertices[a][d] != vertices[b][d] for d in range(3)) == 1]
+            else:
+                radius, length = size
+                vertices = [(radius*math.cos(i*math.tau/6), radius*math.sin(i*math.tau/6), z)
+                            for z in (-length/2, length/2) for i in range(6)]
+                edges = [(i, (i+1) % 6) for i in range(6)]
+                edges += [(6+i, 6+(i+1) % 6) for i in range(6)]
+                edges += [(i, 6+i) for i in range(6)]
+            for i, vertex in enumerate(vertices):
+                _fixed_display_joint(robot, f"{prefix}_vertex{i}", parent, vertex)
+            for i, (a, b) in enumerate(edges):
+                _fixed_display_joint(robot, f"{prefix}_edge{i}", f"{prefix}_vertex{a}",
+                                     [vertices[b][d]-vertices[a][d] for d in range(3)])
+
+
+def _fixed_display_joint(robot, name, parent, xyz, rpy=(0, 0, 0)):
+    ET.SubElement(robot, "link", name=name)
+    joint = ET.SubElement(robot, "joint", name=name, type="fixed")
+    ET.SubElement(joint, "parent", link=parent)
+    ET.SubElement(joint, "child", link=name)
+    ET.SubElement(joint, "origin", xyz=" ".join(map(str, xyz)), rpy=" ".join(map(str, rpy)))
 
 
 class MonitorSnapshot(TypedDict, total=False):

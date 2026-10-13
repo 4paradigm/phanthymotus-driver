@@ -16,8 +16,13 @@ exports the motion chain, removing upstream inertia/mesh/collision elements.
 a smaller wrist and two fingers. Dimensions/colors are approximate display
 shells based on the user's side and gripper reference photos, not calibrated
 collision geometry. The photos themselves are not bundled. Core remains
-unchanged and currently ignores these `<visual>` elements: they are ready for
-a standard URDF viewer, but the existing canvas still draws thin bones.
+unchanged and currently ignores these `<visual>` elements. To show modest body
+volume in that renderer, the export also adds `display_*` fixed branches outlining
+the major boxes and hexagonal cylinder cages. They attach to the existing links,
+never replace the six measured joints or alter the original link transforms.
+Core renders these branches with its existing bone cylinders and endpoint spheres.
+They are approximate skeletal housings rather than filled mesh surfaces. Fine
+decorative strips are omitted; fingers use the existing renderer's slimmer bones.
 
 The export freezes the two prismatic finger
 joints at q=0 because that renderer handles revolute joints only. Gripper opening
