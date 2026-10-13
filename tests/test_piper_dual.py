@@ -127,10 +127,10 @@ def feed(pair, duration=.3, held=True, first=2):
     return sequence
 
 
-def test_single_arm_factory_and_public_cards_unchanged(tmp_path):
+def test_single_arm_factory_preserves_deployed_control_card(tmp_path):
     plugins = build_plugins({"data_dir": str(tmp_path)}, "piper", None)
     assert len(plugins) == 1 and isinstance(plugins[0], PiperPlugin)
-    assert len(plugins[0].get_tools()) == 10
+    assert {t["name"] for t in plugins[0].get_tools()} == {"arm_control", "piper_photo"}
 
 
 @pytest.mark.parametrize("arms", [{"left": {"can_interface": "can0"}},

@@ -39,7 +39,7 @@ def test_mac_entrypoint_installs_logsafe_before_server_or_output():
             events.append('server_closed')
 
     with patch('common.logsafe.install', side_effect=lambda: events.append('logsafe')), \
-         patch('agilex.piper.device.PiperPlugin', Plugin), \
+         patch('agilex.piper.arm_control.ArmControlPlugin', Plugin), \
          patch('http.server.ThreadingHTTPServer', Server), \
          patch('sys.argv', ['mac_main', '--data-dir', '/tmp/piper-test']), \
          patch('builtins.print', side_effect=lambda *a, **k: events.append('output')):

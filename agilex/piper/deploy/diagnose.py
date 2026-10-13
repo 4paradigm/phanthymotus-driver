@@ -56,7 +56,6 @@ def main():
     parser.add_argument("--endpoint",default="http://localhost:15741/mcp")
     parser.add_argument("--output",type=Path,default=Path("piper-diagnosis.json"))
     parser.add_argument("--photos",type=int,choices=range(4),default=0)
-    parser.add_argument("--query-firmware",action="store_true")
     args = parser.parse_args()
     report = {"time":datetime.now(timezone.utc).isoformat(),"architecture":platform.machine(),
               "can":host_check(["ip","-details","link","show","can0"]),
@@ -74,18 +73,17 @@ def main():
     check("server", lambda: rpc(args.endpoint,"initialize"))
     def check_cards():
         cards = [t["name"] for t in rpc(args.endpoint,"tools/list")["tools"]]
-        expected = {"piper_status","piper_standby","piper_can","piper_enable","piper_disable","piper_joint","piper_gripper","piper_photo","piper_permission","piper_stop"}
+        expected = {"arm_control", "piper_photo"}
         if set(cards) != expected:
-            raise RuntimeError("十张卡片未完整注册")
+            raise RuntimeError("控制卡与相机未完整注册；请核对本版本工具清单")
         return cards
     check("cards", check_cards)
-    check("before", lambda: call(args.endpoint,"piper_status","read"))
-    check("mode", lambda: call(args.endpoint,"piper_status","firmware" if args.query_firmware else "read"))
+    check("before", lambda: call(args.endpoint,"arm_control","read"))
     for index in range(args.photos):
         photo = check(f"photo_{index+1}", lambda: finish_photo(args.endpoint,call(args.endpoint,"piper_photo","capture")))
         if photo is not None:
             report["photos"].append(photo)
-    check("after", lambda: call(args.endpoint,"piper_status","read"))
+    check("after", lambda: call(args.endpoint,"arm_control","read"))
     def check_unchanged():
         if not report.get("before") or not report.get("after"):
             raise RuntimeError("缺少新鲜状态，无法确认只读期间模式和使能未变化")
