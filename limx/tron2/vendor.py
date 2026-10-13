@@ -45,9 +45,10 @@ def validate_movej(joint, duration):
 
 
 class MoveError(ValueError):
-    def __init__(self, message, motion_sent):
+    def __init__(self, message, motion_sent, code='unknown'):
         super().__init__(message)
         self.motion_sent = motion_sent
+        self.code = code
 
 
 class RobotReader:
@@ -165,7 +166,7 @@ class RobotReader:
             except asyncio.TimeoutError as exc:
                 raise MoveError('MoveJ acknowledgement timed out; result unknown, do not automatically retry', True) from exc
             if not isinstance(reply, dict) or reply.get('result') != 'success':
-                raise MoveError('Vendor rejected MoveJ; no arrival confirmed', True)
+                raise MoveError('Vendor rejected MoveJ; no arrival confirmed', True, 'vendor_rejected')
             return {'action': 'move', 'joint_count': 14, 'time': move_time,
                     'status': 'accepted', 'motion_sent': True, 'arrival_verified': False}
         finally:

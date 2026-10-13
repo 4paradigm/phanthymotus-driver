@@ -1,6 +1,6 @@
 # LimX TRON2 参数与双臂控制驱动
 
-为 Phanthy Motus 提供关节骨架、关节角度、电池三张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.3`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架、关节角度、电池三张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.4`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -110,7 +110,7 @@ sudo docker exec embodied-limx-tron2 python3 /work/check.py
 
 升级到0.5.0后刷新Motus，移除画布上的旧robot_status与reset_pose实例，重新添加joint_state以更新缓存的渲染格式。使用joint_state、joint_angles、battery_state、arm_control四张业务卡片；model由骨架组件自动读取，不需要手动执行或连接。开启后从监控查看joint_state的厂家双臂/头部骨架；joint_angles在监控中切换“最新”查看16项度数。不需要将两张传感器连线。右侧骨架详情面板的旧平台模型请求问题未在本驱动修复，查看骨架优先使用监控。断连/过期发布空joints列表和不可用诊断，原始info缓存data为null。恢复并收到新关节回复后更新骨架。已保存画布不会随tools/list改变而自动删除旧实例；部署工具不得在未确认时覆写整张画布。
 
-`GET http://127.0.0.1:15791/health` 返回卡片状态：全部已启用传感器有最近接收数据时为 HTTP 200，否则为 503。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
+`GET http://127.0.0.1:15791/health` 返回卡片状态：至少一张已启用传感器、机器人连接且所有已启用传感器有最近接收数据时为 HTTP 200，否则为 503。配置必须启用至少一张传感器，禁止仅开启arm_control却将空样本集合当成就绪。`registered_mcp_id` 单独表明 Core 注册是否完成；机器人可读与 Core 已注册是两项独立条件。
 
 ## 开发测试与验证范围
 
@@ -145,6 +145,18 @@ reset及pose使用现有`/config/tron2/home.json`（宿主`/opt/phanthy-motus/da
 
 pose/reset时长至少max(8,ceil(最大关节变化度数/5))秒，超过60秒拒绝；pose显式填写time时不得短于此值。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
 
-start返回ready，stop返回idle，均不发送运动，也不是机器人急停。只有显式move/pose/reset发送一次request_movej并等待GUID/序列号匹配的ACK；accepted不表示到达，arrival_verified为false。超时、断连、未知结果不自动重试；等待运动时长后可单独检查实际关节反馈。
+start返回ready，stop返回idle，均不发送运动，也不是机器人急停。只有显式move/pose/reset发送一次request_movej并等待GUID/序列号匹配的ACK；初始accepted响应不表示到达，arrival_verified为false，并提供唯一action_id。三个动作声明x-completion（120秒上限）和共享资源arm_l/arm_r；动作完成由后台反馈验证和ACP回调跟踪，不以ACK代替完成。
 
 check.py只调用生命周期/信息和model资源，不执行运动。源码和模拟接口通过不代表网页渲染、实际运动到位或PR审批已经通过。正式镜像由上游PR Review Agent的/request_bot_review发布；部署后仍需现场验收。
+
+## 动作完成协议（0.5.4）
+
+- move、pose、reset返回唯一action_id；awaiting_ack/moving期间同一个驱动实例保留双臂所有权，第二个动作拒绝，不依赖Core的资源标签作为唯一锁。HTTP调用方断开不会取消正在发送的物理命令，也不会释放所有权。
+- 从ACK结束后保守等待完整time/duration_seconds，再检查至少3个不同的新关节回复，跨度至少0.5秒；14项误差均≤1度、相对首个样本变化≤0.2度，有dq时每项速度绝对值≤0.05rad/s。厂家名称重排时先映射至官方索引；不能用同一缓存样本或命令目标伪造到位。
+- 到位后POST /api/acp/complete：action_id、status=completed、result.arrival_verified=true及误差/样本数，tool=arm_control。初始响应仍是受理；通过arm_control.info或/health的arm_motion可查看最终状态。该验证基于连续新收到的关节回复，厂家测量时间戳仍未验证，不代表路径碰撞规划或独立运动安全认证。
+- 超出预计时长再加10秒仍未满足条件、反馈过期、断连或连接更换，报告status=error、arrival_verified=false。发送/ACK结果不明时仍返回跟踪ID并检查反馈，不重发MoveJ；厂家明确拒绝或发送前拒绝不生成已受理动作。
+- ACP使用与注册相同的已验证HTTPS证书上下文，禁止重定向、不读取ACCESS_TOKEN、不关闭TLS验证；同一终态payload最多尝试3次，每次最多3秒，退避0.5/1秒。最坏发送/ACK、60秒动作、验证和回调仍小于声明的120秒上限。
+- 只有验证成功且回调送达才释放本地所有权。反馈验证失败或回调无法送达会保留blocked_requires_operator_check，阻止新的运动。失败通知和Core超时不会物理停止机械臂；现场确认停止、处理原因后再重启驱动。start/stop、预览/列表/到位查询不会清除该状态，stop仍不是急停。
+- 进程正常关闭时终止验证任务并报告error，说明运动可能继续；不发送停机、复位或第二条运动命令。进程强制退出无法保证回调，Core保留120秒超时兜底。
+
+Dockerfile按dpkg实际安装状态检查python3-pip和ca-certificates，仅缺少时执行apt更新/安装；基础镜像已提供的包不重复安装。aiohttp/PyYAML仍由requirements.txt管理，是既有HTTP/WebSocket和配置解析依赖；完成机制只增加Python标准库源码，没有新增pip包、设备权限或资源资产。

@@ -70,7 +70,7 @@ def load_settings():
             raise ValueError('Expected boolean enabled for ' + name)
         if value['enabled']:
             enabled.append(name)
-    if not enabled:
+    if not any(name in enabled for name in ('joint_state', 'joint_angles', 'battery_state')):
         raise ValueError('Enable at least one read-only sensor')
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
@@ -91,7 +91,7 @@ async def run():
             loop.add_signal_handler(signum, stopping.set)
         async with aiohttp.ClientSession(trust_env=False,
                 timeout=aiohttp.ClientTimeout(total=8)) as session:
-            adapter = Adapter(publisher.publish, settings)
+            adapter = Adapter(publisher.publish, settings, session=session)
             ca = os.environ.get('AGENT_CORE_CA_CERT')
             if ca:
                 adapter.core_ssl = ssl.create_default_context(cafile=ca)
@@ -112,6 +112,7 @@ async def run():
                 for task in done:
                     task.result()
             finally:
+                await adapter.motion.close()
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)

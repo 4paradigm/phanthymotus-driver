@@ -66,6 +66,11 @@ class ResetPose:
         current = joint['data']['q']
         if len(current) < 14:
             raise ValueError('Expected at least 14 arm joint positions; no motion sent')
+        names = joint['data']['names']
+        if names:
+            if not set(ARM_NAMES) <= set(names):
+                raise ValueError('Unsupported named arm feedback; no motion sent')
+            current = [current[names.index(name)] for name in ARM_NAMES]
         # Fixed named targets relative to the saved home, never cumulative
         # increments on the current pose. Head and gripper stay unchanged.
         for index in POSES[pose_name]:

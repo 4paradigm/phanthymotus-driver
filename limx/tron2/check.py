@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.3'
+VERSION = '0.5.4'
 CARDS = {'joint_state', 'joint_angles', 'battery_state'}
 
 
@@ -74,6 +74,11 @@ def run_check(timeout=20):
     joint_tool = next(tool for tool in tools if tool['name'] == 'joint_state')
     if joint_tool['topic_out'][0]['format'] != 'sensor/skeleton':
         raise ValueError('Joint card must use skeleton format')
+    arm_tool = next((tool for tool in tools if tool['name'] == 'arm_control'), None)
+    if arm_tool and (arm_tool['inputSchema'].get('x-completion') != {
+            'actions': ['move', 'pose', 'reset'], 'timeout': 120}
+            or arm_tool['inputSchema'].get('x-resource') != ['arm_l', 'arm_r']):
+        raise ValueError('Arm completion tracking or physical resources are missing')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,

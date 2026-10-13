@@ -534,6 +534,10 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.published = []
         self.adapter = Adapter(lambda topic, data: self.published.append((topic, data)), settings())
+        # These tests cover admission/ACK wire behavior; feedback verification
+        # and real ACP HTTP delivery are exercised separately in test_completion.
+        self.adapter.motion.wait_for_arrival = AsyncMock(return_value={'arrival_verified': True})
+        self.adapter.motion.report = AsyncMock(return_value=True)
         self.adapter.reader.accept_info(info())
         self.adapter.reader.joints = state.joint_state(joints())
         self.adapter.reader.joints_at = time.monotonic()
@@ -548,6 +552,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.session = aiohttp.ClientSession(trust_env=False)
 
     async def asyncTearDown(self):
+        await self.adapter.motion.close()
         await self.session.close()
         self.server.close()
         await self.server.wait_closed()
@@ -824,6 +829,9 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(sent[0]['data']['joint'][3], .1-math.radians(20))
             self.assertAlmostEqual(sent[0]['data']['joint'][10], .1-math.radians(20))
             self.assertEqual(sent[0]['data']['time'], 10)
+            await self.adapter.motion.task
+            self.assertEqual(self.adapter.motion.report.await_args.args[:2],
+                             (result['action_id'], 'completed'))
 
     async def test_arm_control_move_rejects_wrong_joint_count(self):
         adapter = Adapter(lambda *args: None, settings(enabled_cards=['arm_control']))
@@ -851,6 +859,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 type=aiohttp.WSMsgType.TEXT, data=json.dumps(packet))))
             await reader.receive(ws, time.monotonic()+1)
         reader.ws = types.SimpleNamespace(closed=False, send_json=send)
+        ids = set()
         for joint in ([.1]*14, json.dumps([.1]*14)):
             with self.subTest(joint_type=type(joint).__name__):
                 sent.clear()
@@ -864,6 +873,11 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sent[0]['title'], 'request_movej')
                 self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 1.5})
                 self.assertNotIn('_trace_id', sent[0])
+                self.assertNotIn(result['action_id'], ids)
+                ids.add(result['action_id'])
+                await self.adapter.motion.task
+                self.assertEqual(self.adapter.motion.report.await_args.args[:2],
+                                 (result['action_id'], 'completed'))
 
     async def test_arm_canvas_invalid_json_never_sends(self):
         self.adapter.enabled.append('arm_control')
@@ -1006,6 +1020,21 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result['arrival_verified'])
             self.assertEqual(len(sent), 1)
             self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 8})
+            await self.adapter.motion.task
+            self.assertEqual(self.adapter.motion.report.await_args.args[:2],
+                             (result['action_id'], 'completed'))
+
+    async def test_reset_verification_named_feedback_uses_arm_order_excludes_head(self):
+        self.adapter.enabled.append('arm_control')
+        with tempfile.TemporaryDirectory() as temp:
+            self.reset_pose_fixture(Path(temp)/'home.json')
+            names = list(reversed(skeleton.JOINT_NAMES))
+            self.adapter.reader.joints = state.joint_state(joints(
+                names=names, q=list(reversed([.1]*14+[1, -1]))))
+            error, result = await self.call('arm_control', action='verify_at_home')
+            self.assertFalse(error)
+            self.assertTrue(result['at_home'])
+            self.assertEqual(result['max_joint_change_deg'], 0)
 
     async def test_json_rpc_notification_and_parse_errors(self):
         async with self.session.post(self.url+'/mcp', json={
@@ -1034,13 +1063,13 @@ class PackagingTests(unittest.TestCase):
     def test_staged_entry_imports_without_repository_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','joint_angles.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','joint_angles.py','completion.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.3"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.5.4"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -1074,6 +1103,9 @@ class PackagingTests(unittest.TestCase):
                 changed['plugins']['unknown_motion'] = {'enabled':True}
                 path.write_text(yaml.safe_dump(changed))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaises(ValueError): load()
+                changed['plugins'] = {'arm_control': {'enabled': True}}
+                path.write_text(yaml.safe_dump(changed))
+                with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
                     self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control'})

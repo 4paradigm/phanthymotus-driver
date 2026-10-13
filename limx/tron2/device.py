@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import aiohttp
 from aiohttp import web
@@ -11,9 +12,10 @@ from reset import ResetPose, POSES
 from skeleton import skeleton_stream, model
 from state import battery_stream
 from joint_angles import angle_sample, angles_stream
+from completion import ArmCompletion, ACP_TIMEOUT
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.5.3'
+VERSION = '0.5.4'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -22,7 +24,7 @@ DESCRIPTIONS = {
     'joint_state': 'TRON2 双臂与头部16关节实时骨架；配套厂家URDF，原始rad/deg及速度力矩可通过info查看',
     'joint_angles': 'TRON2 16关节实际角度（度）：J0–6左臂、J7–13右臂、J14–15头部；与骨架共用实时反馈，断连/过期清空。监控选择最新查看数值，原始rad见joint_state的info（只读）',
     'battery_state': 'TRON2 电量（%）、电压原始值/电流绝对值、估算功率 estimated_power_w（按 mV/mA 假设）、单个温度原始值 temperature_raw（五路有效值中最高值，非℃）、循环次数；随厂家通知更新，诊断含接收年龄及五路原值（只读）',
-    'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，pose命名姿态，reset回到本机自然垂下目标；preview/list/verify_at_home只读；头部与夹爪不参与，响应仅确认受理，stop不是急停',
+    'arm_control': 'TRON2 双臂控制：move自定义14项rad目标，pose命名姿态，reset自然垂下；响应含action_id，连续实时反馈确认到位后通知Core完成；preview/list/verify_at_home只读，stop不是急停',
 }
 
 
@@ -37,14 +39,38 @@ def metadata_properties():
 
 
 class Adapter:
-    def __init__(self, publish, settings, reader=None):
+    def __init__(self, publish, settings, reader=None, session=None):
         self.publish = publish
         self.settings = settings
         self.enabled = settings['enabled_cards']
         self.reader = reader or RobotReader(settings)
         self.registered_id = None
         self.core_ssl = True
+        self.session = session
         self.reset = ResetPose(settings.get('home_file', '/config/tron2/home.json'), self.reader)
+        self.motion = ArmCompletion(self.reader, self.report_completion)
+
+    async def report_completion(self, action_id, status, result):
+        if self.session is None:
+            return False
+        url = os.environ.get('AGENT_CORE_URL', 'https://phanthy-motus:15678').rstrip('/')
+        payload = {'action_id': action_id, 'status': status, 'result': result,
+                   'tool': 'arm_control', 'ts': time.time()}
+        for attempt in range(3):
+            try:
+                async with self.session.post(url + '/api/acp/complete',
+                        ssl=self.core_ssl, allow_redirects=False,
+                        timeout=aiohttp.ClientTimeout(total=3), json=payload) as response:
+                    body = await response.json() if response.status == 200 else {}
+                    if isinstance(body, dict) and body.get('ok') is True \
+                            and body.get('action_id', action_id) == action_id:
+                        return True
+            except (OSError, ValueError, aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+            if attempt < 2:
+                await asyncio.sleep(.5 * 2 ** attempt)
+        LOG.warning('Arm completion delivery failed; local motion owner retained')
+        return False
 
     def _battery_tool(self):
         """Battery sensor — empty inputSchema, auto-publishes via topic_out (Unitree pattern)."""
@@ -87,6 +113,8 @@ class Adapter:
                     **metadata_properties(),
                 },
                 'required': ['action'],
+                'x-completion': {'actions': ['move', 'pose', 'reset'], 'timeout': ACP_TIMEOUT},
+                'x-resource': ['arm_l', 'arm_r'],
                 'x-action-params': {
                     'move': {'params': ['joint', 'time'], 'description': '自定义双臂14项绝对关节目标'},
                     'pose': {'params': ['pose_name', 'time'], 'description': '执行命名姿态；时长至少8秒且满足角度差要求'},
@@ -171,8 +199,10 @@ class Adapter:
                 return {'state': 'ready' if action == 'start' else 'idle',
                         'motion_sent': False, 'lifecycle_only': True}
             if action == 'info':
-                return {'state': 'ready' if self.reader.connected else 'offline',
+                return {'state': self.motion.active['state'] if self.motion.active else
+                        'ready' if self.reader.connected else 'offline',
                         'joint_count': 14, 'position_unit': 'rad', 'motion_sent': False,
+                        'motion': self.motion.summary(),
                         'home': self.reset.call('info'), 'poses': list(POSES)}
             if action == 'list':
                 return {'poses': list(POSES), 'reference': 'saved_home', 'motion_sent': False}
@@ -257,8 +287,7 @@ class Adapter:
                         target = data['joint'] if action == 'move' else data['target_q']
                         duration = data['time'] if action == 'move' else data['duration_seconds']
                         details = {key: data[key] for key in ('pose_sha256', 'pose_name') if key in data}
-                        reply = await self.reader.send_movej(target, duration)
-                        data = {**reply, 'action': action, **details}
+                        data = await self.motion.dispatch(action, target, duration, details)
                     error = False
                 except (ValueError, TypeError) as exc:
                     data, error = {'error': str(exc)[:240],
@@ -276,8 +305,9 @@ class Adapter:
 
     async def health(self, request):
         samples = self.snapshot()
-        ready = all(s['available'] for s in samples.values())
+        ready = self.reader.connected and bool(samples) and all(s['available'] for s in samples.values())
         return web.json_response({'version': VERSION, 'read_only': not set(self.enabled) & {'arm_control'}, 'ready': ready,
+            'arm_motion': self.motion.summary(),
             'robot_connected': self.reader.connected, 'registered_mcp_id': self.registered_id,
             'last_connection_error': self.reader.last_error,
             'round_trip_seconds': self.reader.last_round_trip, 'samples': samples},
