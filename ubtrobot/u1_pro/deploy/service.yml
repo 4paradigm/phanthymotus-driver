@@ -17,6 +17,7 @@ ubtrobot-u1-pro:
     - U1_PRO_AUTH_FILE=/run/ubtrobot-u1-pro-auth/robo_auth.json
     - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
+    - PULSE_SERVER=tcp:127.0.0.1:34567
   logging:
     driver: local
     options:

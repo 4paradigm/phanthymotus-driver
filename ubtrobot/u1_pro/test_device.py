@@ -1295,7 +1295,10 @@ class U1CardContractTests(unittest.TestCase):
         nodes._speaker_enable_client = FakeAudioEnableClient()
         nodes._speaker_enable_request_type = type("Request", (), {})
         nodes.AudioInfo = type("AudioInfo", (), {})
+        nodes.AudioChunk = object
+        nodes._audio_qos = object()
         nodes.close_speaker_subscription = lambda: None
+        nodes._start_pulse_output = lambda: False
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
@@ -1310,7 +1313,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(result["input_topic"], "/tts/audio")
         self.assertTrue(nodes._speaker_forwarding)
 
-    def test_speaker_does_not_subscribe_when_enable_is_rejected(self):
+    def test_speaker_falls_back_to_raw_topic_when_enable_is_rejected(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
@@ -1321,11 +1324,15 @@ class U1CardContractTests(unittest.TestCase):
         nodes._speaker_enable_client = FakeAudioEnableClient(code=7)
         nodes._speaker_enable_request_type = type("Request", (), {})
         nodes.AudioInfo = type("AudioInfo", (), {})
+        nodes.AudioChunk = object
+        nodes._audio_qos = object()
         nodes.close_speaker_subscription = lambda: None
+        nodes._start_pulse_output = lambda: False
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock())
-        with self.assertRaises(RuntimeError):
-            nodes.connect_speaker("/tts/audio")
-        nodes.core.create_subscription.assert_not_called()
+        result = nodes.connect_speaker("/tts/audio")
+        nodes.core.create_subscription.assert_called_once()
+        self.assertFalse(result["output_enabled"])
+        self.assertTrue(nodes._speaker_forwarding)
 
     def test_tts_uses_documented_play_text_payload(self):
         import device

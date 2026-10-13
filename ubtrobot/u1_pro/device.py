@@ -13,7 +13,9 @@ import os
 import queue
 import re
 import ssl
+import shutil
 import struct
+import subprocess
 import threading
 import time
 import urllib.request
@@ -25,6 +27,8 @@ from common.vendor_runtime import action_schema, jsonable, tool
 
 
 SERVICE_TIMEOUT = 10.0
+AUDIO_ENABLE_TIMEOUT = 2.0
+PULSE_SERVER_DEFAULT = "tcp:127.0.0.1:34567"
 CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
@@ -481,6 +485,10 @@ class U1Nodes:
         self._speaker_uuid = ""
         self._speaker_frames = 0
         self._speaker_enabled = False
+        self._speaker_use_pulse = False
+        self._speaker_process = None
+        self._speaker_audio_queue = queue.Queue(maxsize=32)
+        self._speaker_audio_thread = None
         self._audio_service_lock = threading.Lock()
         # Image6m callbacks perform a bounded JPEG conversion. Keep them in
         # their own re-entrant group so left/right conversion does not block
@@ -948,16 +956,101 @@ class U1Nodes:
             except Exception as exc:
                 print(f"[U1 speaker] disable failed: {str(exc)[:160]}", flush=True)
         self._speaker_enabled = False
+        self._stop_pulse_output()
+
+    def _start_pulse_output(self) -> bool:
+        paplay = shutil.which("paplay")
+        if not paplay:
+            return False
+        server = str(self.config.get("speaker_pulse_server", PULSE_SERVER_DEFAULT))
+        env = os.environ.copy()
+        env["PULSE_SERVER"] = server
+        try:
+            process = subprocess.Popen(
+                [paplay, "--raw", "--format=s16le", "--rate=16000", "--channels=1",
+                 "--server", server],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except OSError as exc:
+            print(f"[U1 speaker] PulseAudio start failed: {str(exc)[:160]}", flush=True)
+            return False
+        if process.poll() is not None:
+            return False
+        self._speaker_process = process
+        self._speaker_audio_queue = queue.Queue(maxsize=32)
+        self._speaker_audio_thread = threading.Thread(
+            target=self._pulse_writer, daemon=True, name="u1-speaker-pulse")
+        self._speaker_audio_thread.start()
+        return True
+
+    def _pulse_writer(self) -> None:
+        process = self._speaker_process
+        if process is None or process.stdin is None:
+            return
+        while True:
+            payload = self._speaker_audio_queue.get()
+            if payload is None:
+                break
+            try:
+                process.stdin.write(payload)
+                process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                break
+
+    def _stop_pulse_output(self) -> None:
+        process = self._speaker_process
+        self._speaker_process = None
+        if process is None:
+            return
+        try:
+            self._speaker_audio_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._speaker_audio_queue.get_nowait()
+                self._speaker_audio_queue.put_nowait(None)
+            except queue.Empty:
+                pass
+        if self._speaker_audio_thread is not None:
+            self._speaker_audio_thread.join(timeout=1.0)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self._speaker_audio_thread = None
 
     def connect_speaker(self, input_topic: str) -> dict:
         self.close_speaker_subscription()
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
-        self._set_speaker_enabled(True)
+        self._speaker_use_pulse = self._start_pulse_output()
+        output_enabled = self._speaker_use_pulse
+        enable_error = None
+        if not self._speaker_use_pulse:
+            try:
+                self._set_speaker_enabled(True)
+                output_enabled = True
+            except Exception as exc:
+                # Some U1 firmware exposes the raw audio topic without
+                # exporting the EnableAudioOut service. Keep the data path
+                # usable in that mode instead of failing the card.
+                output_enabled = False
+                enable_error = str(exc)[:192]
+                print(f"[U1 speaker] enable unavailable; using raw topic: {enable_error}", flush=True)
         self._speaker_subscription = self.core.create_subscription(
             self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
         self._speaker_forwarding = True
-        return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
+        result = {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC,
+                  "output_enabled": output_enabled, "pulse_output": self._speaker_use_pulse}
+        if enable_error:
+            result["message"] = "PulseAudio and audio_out/enable unavailable; forwarding raw PCM topic"
+        elif self._speaker_use_pulse:
+            result["message"] = "playing through PulseAudio"
+        return result
 
     def _set_speaker_enabled(self, enabled: bool) -> dict:
         request = self._speaker_enable_request_type()
@@ -970,10 +1063,10 @@ class U1Nodes:
         request.info = self._audio_info()
         request.mode = 0
         request.gain = 1.0
-        if not self._speaker_enable_client.wait_for_service(timeout_sec=SERVICE_TIMEOUT):
+        if not self._speaker_enable_client.wait_for_service(timeout_sec=AUDIO_ENABLE_TIMEOUT):
             raise RuntimeError(f"service unavailable: {self._speaker_enable_client.srv_name}")
         future = self._speaker_enable_client.call_async(request)
-        deadline = time.monotonic() + SERVICE_TIMEOUT
+        deadline = time.monotonic() + AUDIO_ENABLE_TIMEOUT
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not future.done():
@@ -1014,11 +1107,21 @@ class U1Nodes:
             out = offset * 2
             stereo[out:out + 2] = sample
             stereo[out + 2:out + 4] = sample
-        output = self.AudioOutData()
-        output.header = message.header
-        output.uuid = self._speaker_uuid
-        output.data.data = list(stereo)
-        self._speaker_publisher.publish(output)
+        if getattr(self, "_speaker_use_pulse", False):
+            try:
+                self._speaker_audio_queue.put_nowait(raw)
+            except queue.Full:
+                try:
+                    self._speaker_audio_queue.get_nowait()
+                    self._speaker_audio_queue.put_nowait(raw)
+                except queue.Empty:
+                    pass
+        else:
+            output = self.AudioOutData()
+            output.header = message.header
+            output.uuid = self._speaker_uuid
+            output.data.data = list(stereo)
+            self._speaker_publisher.publish(output)
         self._speaker_frames += 1
 
     def close(self) -> None:
