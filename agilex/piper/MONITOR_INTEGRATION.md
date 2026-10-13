@@ -10,9 +10,10 @@
   当前现场画布只保留 `piper_status`（骨架动作检测）和 `arm_control`（机械臂控制）。其他画布节点移除，
   后台模型、监控及相机工具保留注册，机械臂 2 服务不改动。
 - 使用现场已有 Core（含 PR #305 的中文标签和手动执行支持），本次不修改 Core。
-  通用表单采用“选择操作＋执行按钮”；骨架和参数由监控区域的两个输出展示。
+  控制表单采用“选择操作＋执行按钮”；骨架由监控区域展示，参数保留后台发布和诊断读取。
 - 已核实 Core 的卡片「查看数据流」入口向骨架渲染器传递固定设备 ID `detail`，模型查询失败后
   回退为人形。用户明确选择不改 Core，当前使用顶部「监控」入口；该入口携带真实 MCP ID。
+  最新骨架卡沿用只读资源卡样式，不再显示这个数据流入口。
   独立渲染器验收通过不能代表卡片详情入口通过，不应把人形回退当作 PiPER 展示结果。
 - 每台继续使用原有 MCP、CAN、数据目录和相机绑定。权限、预览、动作结果和话题按设备隔离。
 - 监控复用共享 runtime/CAN，只接受一个只读快照函数；不创建 SDK 或第二个 CAN 连接。
@@ -50,8 +51,8 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 
 机械臂 1 最新部署再用 `status_card.split_status_card(plugins)` 拆出骨架读取卡：
 最新用户要求去掉业务按钮并自动检测，因此 `piper_status` 的公开 schema 只有框架生命周期
-`start/stop/info`。Core 不生成读取或执行表单；Core 固定的「查看数据流」按钮仍存在，
-且其错误模型寻址未修复。用户再次明确保持 Core 不改，继续使用顶部「监控」。
+`start/stop/info`，类型为只读 `resource`。Core 的资源卡不生成读取、执行或数据流按钮，
+监控页仍从画布节点的 `sensor/skeleton` 输出话题取数据和对应设备模型。
 部署接线以 `auto_connect=True` 在单独线程初始化同一 runtime 的 CAN 接收连接，
 使用现有 `ConnectPort(piper_init=False)`；不发送运动、模式、示教或使能指令。
 连接线程不等待动作锁，连接锁忙或有动作时稍后重试；采样器仍只调用安全缓存快照，
@@ -60,18 +61,14 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 它不调用 `status/read_state`，不获取动作锁、不发送运动、模式或电机命令。
 骨架卡接管原监控插件的采样与模型资源，避免重复注册或发布。
 启停管理采样、发布、只读连接初始化线程和资源释放；监控采样回调本身不会主动连接。
-`piper_status` 是 sensor，显式 `read` 返回 `skeleton/parameters`；画布只声明骨架输出，
+`piper_status` 是 resource，诊断用 `read` 返回 `skeleton/parameters`；画布只声明骨架输出，
 顶部「监控」只有一张机械臂骨架卡。参数继续后台发布并包含在读取结果中。
 控制卡移除 `read` 操作，原控制流程保持原实现；默认「请选择控制动作」为空操作，
 必须由用户选择具体控制动作才执行。部署仅叠加独立文件，不修改 runtime 或 Core 源码。
 
-`teaching_control.py` 给同一控制卡增加 `enter_teaching/exit_teaching`，不增加画布卡。
-预览检查真实反馈、支撑、活动范围、其他控制程序、静止及配置中已验证的固件完整字符串。
-不查询或自动批准固件，不修改现场 `verified_teaching_firmwares` 列表。
-仅固件已验证、操作许可开启且一次性预览仍有效时，允许发 SDK 记录/结束记录指令。
-结束录制后接受待机或 CAN 的实测反馈，不额外切换 CAN、回零或使能；回放中禁止用结束录制接管。
-当前现场验证列表为空：这两个入口仅提供机身按键指引，软件切换尚不能作为现场通过项。
-官方兼容性说明：<https://github.com/agilexrobotics/piper_sdk/issues/11>。
+用户决定暂不实现软件示教，`enter_teaching/exit_teaching` 已从工具列表和控制卡菜单移除，
+旧客户端直接发送这两个动作也会被拒绝。`teaching_control.py` 的候选代码和模拟测试保留作历史参考，
+当前不接线、不作为新镜像复制文件；不改变现有固件验证配置或物理示教状态。
 
 `PiperMonitorPlugin` 提供 `get_tools/start/stop/dispatch`，适配 `DriverBundle`。
 其中 `piper_monitor` 为 sensor，动作是 `start/stop/read/info`，允许智能控制关闭时手动操作。
@@ -142,7 +139,7 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 忽略 `<visual>`，因此额外导出固定骨架分支，给主要模块画出有体积的轮廓。
 新增分支仅供显示，实际六轴名称、角度映射及运动链保持不变；现场已经显示这些轮廓。
 
-镜像需复制 `monitor.py`、`monitor_bundle.py`、`status_card.py`、`teaching_control.py`
+镜像需复制 `monitor.py`、`monitor_bundle.py`、`status_card.py`
 和整个 `resource/` 到 `/work/agilex/piper/`。
 使用现有 ROS/std_msgs 依赖，不新增 Pinocchio、网格、SDK 或前端库。不要直接修改本阶段以外的 shared runtime。
 

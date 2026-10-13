@@ -69,7 +69,7 @@ class StatusCardTests(unittest.TestCase):
         bundle=DriverBundle(plugins)
         tools={t['name']:t for t in bundle.get_all_tools()}
         self.assertNotIn('piper_monitor',tools)
-        self.assertEqual(tools['piper_status']['type'],'sensor')
+        self.assertEqual(tools['piper_status']['type'],'resource')
         self.assertEqual(tools['piper_status']['topic_out'],[
             {'topic':'/agilex/piper/state/joints','format':'sensor/skeleton'}])
         self.assertIn('<robot',bundle.dispatch('model',{})['urdf'])
@@ -78,6 +78,16 @@ class StatusCardTests(unittest.TestCase):
         self.assertTrue(r.connected_event.wait(1))
         self.assertEqual(bundle.dispatch('piper_status',{'action':'stop'})['state'],'idle')
         self.assertEqual(connects,['same-runtime'])
+
+    def test_teaching_actions_are_removed_and_rejected_without_hardware(self):
+        r,connects=self.runtime();plugins=split_status_card([r])
+        bundle=DriverBundle(plugins)
+        control=next(t for t in bundle.get_all_tools() if t['name']=='arm_control')
+        for action in ('enter_teaching','exit_teaching'):
+            self.assertNotIn(action,control['inputSchema']['properties']['action']['enum'])
+            self.assertNotIn(action,control['inputSchema'].get('x-action-params',{}))
+            with self.assertRaises(ValueError):bundle.dispatch('arm_control',{'action':action})
+        self.assertEqual(connects,[])
 
     def test_continuous_pose_updates_and_stop_release_without_hardware_commands(self):
         r,connects=self.runtime(); transports=[]

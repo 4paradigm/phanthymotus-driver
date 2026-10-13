@@ -2,7 +2,6 @@
 from common.vendor_runtime import action_schema, tool
 from agilex.piper.monitor_bundle import read_passive_snapshot
 from agilex.piper.monitor import PiperMonitorPlugin
-from agilex.piper.teaching_control import add_teaching_schema, teaching_action, TEACHING_ACTIONS
 import threading
 
 
@@ -26,7 +25,10 @@ class PiperStatusCard:
         schema.update({"additionalProperties": False})
         schema["properties"]["action"].update(title="操作", default="info",
             oneOf=[{"const": key, "title": label} for key, (_, label) in actions.items()])
-        definition = tool("piper_status", "sensor", "自动检测实测六轴位置并持续发布骨架；顶部「监控」显示，不使能、不移动。",
+        # Core's sensor template always adds its broken detail-stream button.
+        # Expose this read-only state as a resource instead: lifecycle and topic
+        # publishing remain intact, and its renderer is only the monitor page.
+        definition = tool("piper_status", "resource", "自动检测实测六轴位置并持续发布骨架；顶部「监控」显示，不使能、不移动。",
                           schema, topic_out=self.monitor._topics()[:1])
         definition["title"] = "骨架动作检测"
         return [definition, self.monitor.get_tools()[1]]
@@ -83,7 +85,7 @@ class PiperStatusCard:
             return self.monitor.dispatch(action, args)
         if set(args) - {"action", "instance_id", "_tool_name"}:
             raise ValueError("状态卡不接受控制参数")
-        # DriverBundle removes action from sensor arguments before dispatch.
+        # Resource calls keep action in args; preserve sensor-call compatibility.
         action = args.get("action", "info" if action == "piper_status" else action)
         if action in {"start", "stop", "info"}:
             return getattr(self, action)()
@@ -100,8 +102,7 @@ class PiperStatusCard:
             runtime.connected()
         finally:
             runtime.connection_lock.release()
-        # Continuous sampling never connects. Only this explicit manual read
-        # can initialize the shared connection, then all frames use its cache.
+        # The sampler only reads cache; connection initialization is separate.
         return self.monitor.read()
 
 
@@ -124,15 +125,15 @@ def split_status_card(plugins):
             prop["default"] = "select_action"
             schema.get("x-action-params", {}).pop("read", None)
             schema.setdefault("x-action-params", {})["select_action"] = {"params": [], "description": "请选择控制动作"}
-            add_teaching_schema(definition)
+            definition["description"] = "机械臂控制：许可、待机/CAN、电机、关节、夹爪和停止；先预览再确认。"
         return definitions
     def dispatch(action, args):
         if args.get("_tool_name") == "arm_control" and action == "select_action":
             return {"executed": False, "message": "请在操作下拉框选择要执行的控制动作。"}
         if args.get("_tool_name") == "arm_control" and action == "read":
             raise ValueError("请使用独立的「读取状态」卡")
-        if args.get("_tool_name") == "arm_control" and action in TEACHING_ACTIONS:
-            return teaching_action(runtime, action, args)
+        if args.get("_tool_name") == "arm_control" and action in {"enter_teaching", "exit_teaching"}:
+            raise ValueError("软件示教入口已移除，请使用机身示教按键")
         return original_dispatch(action, args)
     runtime.get_tools = get_tools
     runtime.dispatch = dispatch

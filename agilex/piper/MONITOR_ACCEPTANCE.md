@@ -5,7 +5,7 @@
 ## 结果
 
 - 监控测试 23 项：通过（含现场快照适配与固定轮廓跟随验证）。
-- 最新指定回归集合：204 passed、118 subtests passed（含 8 项自动骨架卡与 8 项示教控制测试）。
+- 最新指定回归集合：197 passed、114 subtests passed（含 9 项骨架卡与已移除示教入口验证）。
 - 实际 Edge headless + 未修改 Core 渲染器：通过；528 个矩阵值对比，无页面脚本错误。
 - 浏览器场景：三组实测角度模拟、过期冻结、读取失败提示、恢复、双设备隔离。
 - ROS transport 使用假 ROS 对象验证 Core context、QoS、消息序列化、重复关闭及部分初始化失败释放。
@@ -18,7 +18,7 @@ Python 3.12 回归命令（pytest、PyYAML、OpenCV 为测试环境依赖，不�
 
 ```bash
 python -m pytest -q \
-  tests/test_piper_status_card.py tests/test_piper_teaching_control.py \
+  tests/test_piper_status_card.py \
   tests/test_piper_monitor.py tests/test_piper_monitor_bundle.py tests/test_piper_ten_cards.py \
   tests/test_piper_cards.py tests/test_piper_controls.py tests/test_piper_prepare.py \
   tests/test_piper_deployment.py tests/test_piper_mac.py tests/test_common_lifecycle.py \
@@ -146,6 +146,22 @@ python -m pytest -q \
   记录 `auto-pose-result.json`，画布截图 `auto-detector-teaching-form.png`，
   自动骨架截图 `automatic-skeleton-live.png`。菜单选择仅做表单验证，未点击示教执行。
 - 脚本：`/home/agilex/piper-monitor-deploy-20261013/deploy_auto_teaching_arm1.py`。
+
+### 2026-10-13 13:11 仅监控入口，暂缓软件示教
+
+- 用户要求骨架卡不显示「查看数据流」，骨架只在监控页显示，并移除进入/退出示教选项。
+  保持 Core 不改，将骨架状态作为只读 resource 展示，继续保留自动采样、六轴骨架输出及模型。
+- 现场画布刷新验证骨架卡没有读取、执行或数据流按钮；控制菜单没有进入/退出示教。
+  顶部监控仍正确显示 PiPER 骨架。资源类型的 start/stop/info 分发通过隔离镜像检查。
+  老客户端发送示教动作会在接触硬件前被拒绝。候选示教文件保留，但当前未注册或新复制打包。
+- 197 项相关回归、114 项子测试通过。用户关闭智能控制后继续部署；只重建机械臂 1。
+  Core 镜像、机械臂 2 镜像与启动时间保持一致，画布布局对应的 JSON 未变更。
+- 镜像：`agilex-piper:local-arm1-monitor-only-c1122e8b`。
+  备份：`/opt/phanthy-motus/backups/piper-arm1-monitor-only-20261013-131144/`。
+- 查询 info 确认自动反馈新鲜、时间持续推进，动作许可关闭，模式仍为示教；未退出或进入示教，
+  未执行模式、使能/失能、运动或相机动作。
+  证据：`monitor-only-result.json`、`no-stream-no-teaching.png`、`monitor-only-skeleton-live.png`。
+- 脚本：`/home/agilex/piper-monitor-deploy-20261013/deploy_monitor_only_arm1.py`。
 
 用户要求先测试再提交 PR，因此本阶段保留本地独立提交，不创建或更新 PR。
 最终目标：[驱动 PR #382](https://github.com/4paradigm/phanthymotus-driver/pull/382)。
