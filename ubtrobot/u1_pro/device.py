@@ -38,6 +38,7 @@ SPEAKER_WRITER_STALL_TIMEOUT = 2.0
 CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
+MIC_SDK_FIRST_FRAME_TIMEOUT = 1.0
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
@@ -529,6 +530,8 @@ class U1Nodes:
         self._mic_stream_open = False
         self._mic_source = None
         self._mic_source_lock = threading.Lock()
+        self._mic_pending_topic = None
+        self._mic_source_timer = None
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
         self._playback_listeners = []
@@ -737,14 +740,19 @@ class U1Nodes:
             self._mic_reader.skip_backlog = True
             try:
                 self._mic_reader.start(timeout=2.0)
-                # Opening the ring proves only that it can be mapped. Select
-                # it as the source only after the first valid PCM frame.
+                # Opening the ring proves only that it can be mapped. Give it
+                # a short first-frame priority window before using the topic.
+                self._start_mic_source_timer()
             except Exception:
                 # Some firmware opens the SDK stream but only publishes the
                 # domain-2 AudioInData topic. Keep that topic fallback alive.
                 self._mic_reader = None
                 with self._mic_source_lock:
                     self._mic_source = "topic"
+                    pending_topic = self._mic_pending_topic
+                    self._mic_pending_topic = None
+                if pending_topic is not None:
+                    self._publish_topic_mic_frame(*pending_topic)
         except Exception as exc:
             self.stop_mic_reader()
             try:
@@ -767,6 +775,7 @@ class U1Nodes:
         with self._mic_source_lock:
             if self._mic_source is None:
                 self._mic_source = "sdk"
+                U1Nodes._cancel_mic_source_timer_locked(self)
             if self._mic_source != "sdk":
                 return
         chunk = self.AudioChunk()
@@ -799,17 +808,50 @@ class U1Nodes:
             return
         with self._mic_source_lock:
             if self._mic_source is None:
-                self._mic_source = "topic"
+                self._mic_pending_topic = (payload, getattr(message, "header", None))
+                return
             if self._mic_source != "topic":
                 return
+        self._publish_topic_mic_frame(payload, getattr(message, "header", None))
+
+    def _publish_topic_mic_frame(self, payload: bytes, header: Any = None) -> None:
+        if not self._mic_forwarding:
+            return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
-        header = getattr(message, "header", None)
         chunk.header = header if header is not None else self._audio_header()
         self._mic_publisher.publish(chunk)
         self._mic_frames += 1
         self._mic_frame_event.set()
+
+    def _start_mic_source_timer(self) -> None:
+        with self._mic_source_lock:
+            self._cancel_mic_source_timer_locked()
+            if self._mic_source is not None or not self._mic_forwarding:
+                return
+            timer = threading.Timer(
+                MIC_SDK_FIRST_FRAME_TIMEOUT, self._select_topic_mic_source)
+            timer.daemon = True
+            self._mic_source_timer = timer
+            timer.start()
+
+    def _cancel_mic_source_timer_locked(self) -> None:
+        timer = getattr(self, "_mic_source_timer", None)
+        self._mic_source_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _select_topic_mic_source(self) -> None:
+        with self._mic_source_lock:
+            self._mic_source_timer = None
+            if self._mic_source is not None or not self._mic_forwarding:
+                return
+            self._mic_source = "topic"
+            pending = getattr(self, "_mic_pending_topic", None)
+            self._mic_pending_topic = None
+        if pending is not None:
+            self._publish_topic_mic_frame(*pending)
 
     def wait_for_mic_frame(self, timeout: float) -> bool:
         if self._mic_frame_event.wait(timeout):
@@ -828,7 +870,9 @@ class U1Nodes:
         if not hasattr(self, "_mic_source_lock"):
             self._mic_source_lock = threading.Lock()
         with self._mic_source_lock:
+            self._cancel_mic_source_timer_locked()
             self._mic_source = None
+            self._mic_pending_topic = None
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
@@ -1176,15 +1220,16 @@ class U1Nodes:
                 nodes._speaker_audio_blocks_dropped += 1
                 U1Nodes._mark_pulse_failed(nodes, f"speaker playback unavailable (status {return_code})")
                 return
-            last_progress = getattr(nodes, "_speaker_writer_last_progress", time.monotonic())
-            if time.monotonic() - last_progress > SPEAKER_WRITER_STALL_TIMEOUT:
-                nodes._speaker_audio_blocks_dropped += 1
-                U1Nodes._mark_pulse_failed(nodes, "speaker playback writer stopped making progress")
-                return
             try:
                 audio_queue.put(payload, timeout=0.1)
                 return
             except queue.Full:
+                last_progress = getattr(nodes, "_speaker_writer_last_progress", time.monotonic())
+                if time.monotonic() - last_progress > SPEAKER_WRITER_STALL_TIMEOUT:
+                    nodes._speaker_audio_blocks_dropped += 1
+                    U1Nodes._mark_pulse_failed(
+                        nodes, "speaker playback writer stopped making progress")
+                    return
                 continue
 
     def close(self) -> None:

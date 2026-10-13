@@ -295,6 +295,8 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_stream_open = False
         nodes._mic_source = None
         nodes._mic_source_lock = threading.Lock()
+        nodes._mic_pending_topic = None
+        nodes._mic_source_timer = None
         class Reader:
             def __init__(self, config, metadata, callback):
                 self.config = config
@@ -347,6 +349,8 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_frames = 0
         nodes._mic_source = None
         nodes._mic_source_lock = threading.Lock()
+        nodes._mic_pending_topic = None
+        nodes._mic_source_timer = None
         class SilentReader:
             def __init__(self, config, metadata, callback):
                 self.config = config
@@ -370,6 +374,7 @@ class U1CardContractTests(unittest.TestCase):
             stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id="")
         nodes._mic_topic_callback(types.SimpleNamespace(
             data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE"))
+        nodes._select_topic_mic_source()
         self.assertEqual(len(publisher.messages), 1)
         self.assertEqual(nodes._mic_source, "topic")
         nodes.set_mic_enabled(False)
@@ -1078,6 +1083,35 @@ class U1CardContractTests(unittest.TestCase):
         device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02", {}, 1)
         self.assertEqual(len(publisher.messages), 1)
 
+    def test_mic_sdk_wins_when_topic_arrives_first(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_source=None,
+            _mic_source_lock=threading.Lock(),
+            _mic_pending_topic=None,
+            _mic_source_timer=None,
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+            _audio_header=lambda: types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
+        )
+        message = types.SimpleNamespace(
+            data=[1, 2, 3, 4], sample_rate=16000, channels=1, sample_format="S16LE",
+            header=types.SimpleNamespace())
+
+        device.U1Nodes._mic_topic_callback(nodes, message)
+        self.assertEqual(nodes._mic_source, None)
+        device.U1Nodes._publish_mic_frame(nodes, b"\x05\x06", {}, 1)
+
+        self.assertEqual(nodes._mic_source, "sdk")
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(publisher.messages[0].data, [5, 6])
+
     def test_expression_and_head_call_deployed_sdk_motion_service(self):
         import device
 
@@ -1475,6 +1509,25 @@ class U1CardContractTests(unittest.TestCase):
         self.assertFalse(nodes._speaker_forwarding)
         self.assertEqual(nodes._speaker_audio_blocks_dropped, 1)
         self.assertIn("stopped making progress", nodes._speaker_playback_error)
+
+    def test_speaker_accepts_audio_after_idle_writer_wait(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            _speaker_audio_blocks_dropped=0,
+            _speaker_audio_queue=device.queue.Queue(maxsize=1),
+            _speaker_process=types.SimpleNamespace(poll=lambda: None),
+            _speaker_audio_thread=types.SimpleNamespace(is_alive=lambda: True),
+            _speaker_writer_last_progress=(
+                device.time.monotonic() - device.SPEAKER_WRITER_STALL_TIMEOUT - 1),
+        )
+
+        device.U1Nodes._enqueue_speaker_block(nodes, b"first audio")
+
+        self.assertTrue(nodes._speaker_forwarding)
+        self.assertEqual(nodes._speaker_audio_queue.get_nowait(), b"first audio")
+        self.assertEqual(nodes._speaker_audio_blocks_dropped, 0)
 
     def test_speaker_pulse_blocks_are_40ms_and_preserve_pcm_bytes(self):
         import device
