@@ -436,6 +436,7 @@ class U1Nodes:
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
         from audio_msgs.msg import AudioChunk, AudioInData, AudioInfo, AudioOutData
+        from audio_msgs.srv import EnableAudioOut
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
@@ -472,6 +473,9 @@ class U1Nodes:
         self.CompressedImage = CompressedImage
         self.Image6m = Image6m
         self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
+        self._speaker_enable_client = self.audio_device.create_client(
+            EnableAudioOut, "/sys/device/audio_out/enable")
+        self._speaker_enable_request_type = EnableAudioOut.Request
         self._speaker_subscription = None
         self._speaker_forwarding = False
         self._speaker_uuid = ""
@@ -938,26 +942,55 @@ class U1Nodes:
         if self._speaker_subscription is not None:
             self.core.destroy_subscription(self._speaker_subscription)
             self._speaker_subscription = None
-        # U1 firmware accepts PCM on the raw topic; audio_out/enable is
-        # present in the graph but blocks indefinitely on the target image.
+        if self._speaker_enabled:
+            try:
+                self._set_speaker_enabled(False)
+            except Exception as exc:
+                print(f"[U1 speaker] disable failed: {str(exc)[:160]}", flush=True)
         self._speaker_enabled = False
 
     def connect_speaker(self, input_topic: str) -> dict:
-        self._speaker_forwarding = False
-        if self._speaker_subscription is not None:
-            self.core.destroy_subscription(self._speaker_subscription)
-            self._speaker_subscription = None
+        self.close_speaker_subscription()
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
+        self._set_speaker_enabled(True)
         self._speaker_subscription = self.core.create_subscription(
             self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
         self._speaker_forwarding = True
         return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
 
+    def _set_speaker_enabled(self, enabled: bool) -> dict:
+        request = self._speaker_enable_request_type()
+        request.header = self._audio_header()
+        try:
+            request.header.stamp = self.audio_device.get_clock().now().to_msg()
+        except Exception:
+            pass
+        request.enable = bool(enabled)
+        request.info = self._audio_info()
+        request.mode = 0
+        request.gain = 1.0
+        if not self._speaker_enable_client.wait_for_service(timeout_sec=SERVICE_TIMEOUT):
+            raise RuntimeError(f"service unavailable: {self._speaker_enable_client.srv_name}")
+        future = self._speaker_enable_client.call_async(request)
+        deadline = time.monotonic() + SERVICE_TIMEOUT
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise TimeoutError(f"service timeout: {self._speaker_enable_client.srv_name}")
+        response = future.result()
+        code = getattr(response, "code", 0)
+        if code not in (None, 0, "0", "OK"):
+            raise RuntimeError(f"U1 Pro speaker output request failed: {code}")
+        self._speaker_enabled = bool(enabled)
+        return {"state": "running" if enabled else "idle", "code": code}
+
     def _audio_info(self):
         info = self.AudioInfo()
         info.uuid = self._speaker_uuid or f"u1-{uuid.uuid4().hex}"
-        info.channels = 1
+        # The U1 audio adapter consumes stereo S16LE, even though Agent Core's
+        # shared audio contract is mono.
+        info.channels = 2
         info.sample_rate = 16000
         info.sample_format = "S16LE"
         return info
@@ -972,10 +1005,19 @@ class U1Nodes:
             return
         if getattr(message, "format", "") != AUDIO_FORMAT:
             return
+        raw = bytes(message.data)
+        if len(raw) % 2:
+            return
+        stereo = bytearray(len(raw) * 2)
+        for offset in range(0, len(raw), 2):
+            sample = raw[offset:offset + 2]
+            out = offset * 2
+            stereo[out:out + 2] = sample
+            stereo[out + 2:out + 4] = sample
         output = self.AudioOutData()
         output.header = message.header
         output.uuid = self._speaker_uuid
-        output.data.data = list(message.data)
+        output.data.data = list(stereo)
         self._speaker_publisher.publish(output)
         self._speaker_frames += 1
 

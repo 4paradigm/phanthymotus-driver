@@ -147,6 +147,21 @@ class FakeAudioOutData:
         self.data = types.SimpleNamespace(data=[])
 
 
+class FakeAudioEnableClient:
+    def __init__(self, code=0):
+        self.code = code
+        self.requests = []
+        self.srv_name = "/sys/device/audio_out/enable"
+
+    def wait_for_service(self, timeout_sec):
+        return True
+
+    def call_async(self, request):
+        self.requests.append(request)
+        response = types.SimpleNamespace(code=self.code)
+        return types.SimpleNamespace(done=lambda: True, result=lambda: response)
+
+
 class FakeNodes:
     def __init__(self):
         self.namespace = "test"
@@ -1266,7 +1281,7 @@ class U1CardContractTests(unittest.TestCase):
         }
         self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "vision_enabled", False)["enabled"], False)
 
-    def test_speaker_forwards_input_without_blocking_audio_enable_service(self):
+    def test_speaker_enables_stereo_output_before_subscribing(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
@@ -1277,18 +1292,40 @@ class U1CardContractTests(unittest.TestCase):
         nodes._audio_service_lock = threading.Lock()
         nodes._audio_qos = object()
         nodes._speaker_forwarding = False
-        nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes._speaker_enable_client = FakeAudioEnableClient()
+        nodes._speaker_enable_request_type = type("Request", (), {})
         nodes.AudioInfo = type("AudioInfo", (), {})
-        nodes._prepare_audio_device = mock.Mock()
-        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
+        nodes.close_speaker_subscription = lambda: None
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
-        nodes.call.assert_not_called()
+        self.assertEqual(len(nodes._speaker_enable_client.requests), 1)
+        request = nodes._speaker_enable_client.requests[0]
+        self.assertTrue(request.enable)
+        self.assertEqual(request.info.channels, 2)
+        self.assertEqual(request.info.sample_rate, 16000)
+        self.assertEqual(request.info.sample_format, "S16LE")
         nodes.core.create_subscription.assert_called_once()
         self.assertEqual(nodes.core.create_subscription.call_args.args[1], "/tts/audio")
         self.assertEqual(result["input_topic"], "/tts/audio")
         self.assertTrue(nodes._speaker_forwarding)
+
+    def test_speaker_does_not_subscribe_when_enable_is_rejected(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes._speaker_subscription = None
+        nodes._speaker_uuid = ""
+        nodes._speaker_frames = 0
+        nodes._speaker_enabled = False
+        nodes._speaker_enable_client = FakeAudioEnableClient(code=7)
+        nodes._speaker_enable_request_type = type("Request", (), {})
+        nodes.AudioInfo = type("AudioInfo", (), {})
+        nodes.close_speaker_subscription = lambda: None
+        nodes.core = types.SimpleNamespace(create_subscription=mock.Mock())
+        with self.assertRaises(RuntimeError):
+            nodes.connect_speaker("/tts/audio")
+        nodes.core.create_subscription.assert_not_called()
 
     def test_tts_uses_documented_play_text_payload(self):
         import device
@@ -1340,14 +1377,14 @@ class U1CardContractTests(unittest.TestCase):
         message = types.SimpleNamespace(
             header=types.SimpleNamespace(frame_id="input", stamp=types.SimpleNamespace(sec=12, nanosec=34)),
             format=device.AUDIO_FORMAT,
-            data=[1, 2, 3],
+            data=[1, 0, 2, 0],
         )
         device.U1Nodes._speaker_callback(nodes, message)
         nodes._speaker_forwarding = False
         device.U1Nodes._speaker_callback(nodes, message)
         self.assertEqual(len(publisher.messages), 1)
         self.assertIs(publisher.messages[0].header, message.header)
-        self.assertEqual(publisher.messages[0].data.data, [1, 2, 3])
+        self.assertEqual(publisher.messages[0].data.data, [1, 0, 1, 0, 2, 0, 2, 0])
 
     def test_speaker_callback_rejects_non_pcm_input(self):
         import device
