@@ -73,7 +73,7 @@ class GripperDisplayTests(unittest.TestCase):
                 # Existing Motus shows fixed connectors and a sphere at leaf links.
                 self.assertGreater(math.sqrt(sum(float(v)**2 for v in downstream[0].find('origin').get('xyz').split())),.005)
 
-    def test_two_fingers_follow_only_their_own_arm_with_constant_display_gap(self):
+    def test_closed_fingers_touch_and_follow_only_their_own_arm(self):
         before=positions(self.root,{})
         after=positions(self.root,{'wrist_roll_R_Joint':.4,'elbow_R_Joint':-.2})
         for finger in ('a','b'):
@@ -82,9 +82,11 @@ class GripperDisplayTests(unittest.TestCase):
             self.assertGreater(math.dist(before[right],after[right]),.01)
         for poses in (before,after):
             for side in ('L','R'):
-                self.assertAlmostEqual(math.dist(poses[f'{PREFIX}{side}_a_tip_Link'],poses[f'{PREFIX}{side}_b_tip_Link']),.05)
+                # Fixed display cylinders have radius 4 mm: touching surfaces
+                # indicate closure without pretending to measure jaw opening.
+                self.assertAlmostEqual(math.dist(poses[f'{PREFIX}{side}_a_tip_Link'],poses[f'{PREFIX}{side}_b_tip_Link']),2*.004)
                 for f in ('a','b'):
-                    self.assertAlmostEqual(math.dist(poses[f'{PREFIX}{side}_{f}_tip_Link'],poses[f'grasper_{side}_Link']),math.hypot(.025,.065))
+                    self.assertAlmostEqual(math.dist(poses[f'{PREFIX}{side}_{f}_tip_Link'],poses[f'grasper_{side}_Link']),math.hypot(.004,.065))
 
     def test_head_motion_does_not_move_gripper_outlines(self):
         before=positions(self.root,{})

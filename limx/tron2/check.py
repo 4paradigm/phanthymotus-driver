@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.10'
+VERSION = '0.5.11'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
