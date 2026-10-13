@@ -10,6 +10,7 @@ description: "PiPER 单臂控制卡；双臂模式保留十卡片并增加 VR �
 build_context_extras:
   - ../../common
 cards:
+  - { name: model, type: resource }
   - { name: arm_control, type: actuator }
   - { name: piper_status, type: resource }
   - { name: piper_standby, type: actuator }

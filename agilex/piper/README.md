@@ -11,7 +11,7 @@
 - [历史验收记录](ACCEPTANCE.md)：原版本记录不能用作本控制卡的真机验收证据。
 
 计划一与计划二从同一驱动提交建立独立分支。本分支交付控制卡、快照及测试；
-当前尚未接入计划二监控/模型。完成集成后，每台画布放控制与监控两张核心卡，
+单臂已保留现场独立 `piper_status` 骨架卡和 `model`，源码来源见 [部署兼容记录](DEPLOYMENT_COMPATIBILITY.md)。每台画布放控制与监控两张核心卡，
 相机可选，后台 model 不摆成卡片。两台沿用各自 MCP、CAN 和话题绑定。
 
 ## 验证
@@ -31,7 +31,7 @@ Docker 打包新增 `arm_control.py`，沿用原 ROS 与固定 SDK 依赖，不�
 
 ## 双臂 VR 遥操与轨迹回放
 
-默认单臂配置注册 `arm_control` 与 `piper_photo`，兼容现场两卡接口。配置 `arms.left` 和 `arms.right` 后，同一 Driver
+默认单臂配置注册 `arm_control`、`piper_photo`、`piper_status` 和 `model`，兼容现场接口。配置 `arms.left` 和 `arms.right` 后，同一 Driver
 管理两路独立 SocketCAN，使用原有十卡片并增加 `piper_teleop` 和 `piper_motion` 两张卡片。
 切换双臂配置前，必须停用原来分别占用这两路 CAN 的单臂实例；不能并行抢占同一设备。
 左右臂各有一个 SDK 连接，十卡片、遥操和回放复用这些连接。双臂动作占用两个原有操作锁，

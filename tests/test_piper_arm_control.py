@@ -41,7 +41,7 @@ class ArmControlTests(unittest.TestCase):
             preview_id=plan["preview_id"], workspace_clear=True, take_control=True))
 
     def test_registration_and_lifecycle_are_passive(self):
-        plugin = build_plugins({"data_dir": self.tmp.name}, "arm-a", None)[0]
+        plugin = build_plugins({"data_dir": self.tmp.name}, "arm_a", None)[0]
         self.addCleanup(plugin.stop)
         self.assertIsInstance(plugin, ArmControlPlugin)
         self.assertEqual({tool["name"] for tool in plugin.get_tools()}, {"arm_control", "piper_photo"})
