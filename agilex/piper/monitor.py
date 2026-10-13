@@ -299,6 +299,39 @@ def monitor_frame(snapshot: Mapping, *, now: float, device_name: str,
     return skeleton, parameters, last_valid_time
 
 
+def english_parameters(parameters, snapshot):
+    names = {'设备名称': 'Device', '连接状态': 'Connection', '反馈状态': 'Feedback',
+             '反馈时间（UTC）': 'Feedback time (UTC)', '最后有效时间（UTC）': 'Last valid time (UTC)',
+             '反馈年龄（秒）': 'Feedback age (s)', '控制模式': 'Control mode', '设备状态': 'Arm status',
+             '动作许可': 'Control policy', '动作状态': 'Activity', '当前动作卡': 'Active tool',
+             '故障码': 'Fault code', '电机故障': 'Motor faults', '最近动作结果': 'Last result',
+             '读取错误': 'Read error', '夹爪电机': 'Gripper motor', '夹爪开度（mm）': 'Gripper opening (mm)'}
+    for i in range(1, 7):
+        names.update({f'J{i} 角度（°）': f'J{i} angle (deg)', f'J{i} 电机': f'J{i} motor',
+                      f'J{i} 有效限位（°）': f'J{i} limits (deg)'})
+    values = {'不可用': 'unavailable', '读取失败': 'read failed', '未连接': 'disconnected',
+              '反馈无效': 'invalid', '新鲜': 'fresh', '反馈过期': 'stale', '已连接': 'connected',
+              '开启': 'enabled', '关闭': 'disabled', '执行中': 'busy', '空闲': 'idle', '无': 'none',
+              '待机': 'standby', '电脑控制（CAN）': 'CAN control', '示教': 'teaching',
+              '已使能': 'enabled', '已失能': 'disabled', '直接控制（逐次校验）': 'checked direct control'}
+    def convert(value):
+        if isinstance(value, str):
+            return values.get(value, value)
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [convert(item) for item in value]
+        return value
+    result = {names[key]: convert(value) for key, value in parameters.items()}
+    if snapshot.get('control_policy') == 'automatic_preparation':
+        result['Control policy'] = 'automatic preparation, checked per task'
+    pose = snapshot.get('end_pose') or {}
+    result['End position (mm)'] = pose.get('position_mm', 'unavailable')
+    result['End orientation (deg)'] = pose.get('orientation_deg', 'unavailable')
+    result['Task'] = snapshot.get('task', {'state': 'unavailable'})
+    return result
+
+
 class _RosPublisher:
     """Lazy ROS transport, using the shared Core domain/executor only."""
     def __init__(self, ros2, namespace, topic_out, period, callback):
@@ -340,7 +373,7 @@ class PiperMonitorPlugin:
     """One monitor per existing PiPER runtime/MCP, no ownership of hardware."""
     def __init__(self, read_monitor_snapshot: Callable[[], MonitorSnapshot], *, namespace: str,
                  device_name: str, ros2=None, publish_hz: float = 10,
-                 clock: Callable[[], float] = time.time, publisher_factory=None):
+                 clock: Callable[[], float] = time.time, publisher_factory=None, language='zh'):
         if not callable(read_monitor_snapshot):
             raise TypeError("read_monitor_snapshot must be callable")
         namespace = namespace.strip("/")
@@ -351,6 +384,7 @@ class PiperMonitorPlugin:
         if not isinstance(device_name, str) or not device_name.strip():
             raise ValueError("device_name is required")
         self._read_snapshot = read_monitor_snapshot
+        self._language = language
         self._namespace, self._device_name = namespace, device_name
         self._ros2, self._publish_hz, self._clock = ros2, float(publish_hz), clock
         self._publisher_factory = publisher_factory or _RosPublisher
@@ -424,6 +458,8 @@ class PiperMonitorPlugin:
             skeleton, parameters, last_valid_time = monitor_frame(
                 snapshot, now=self._clock(), device_name=self._device_name,
                 last_valid_time=self._last_valid_time, error=error)
+            if self._language == 'en':
+                parameters = english_parameters(parameters, snapshot)
             if generation is None or generation == self._generation:
                 self._last_parameters = parameters
                 self._last_valid_time = last_valid_time

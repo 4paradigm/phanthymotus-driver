@@ -110,18 +110,34 @@ class PiperCameraLive:
                           '自动显示绑定彩色相机的当前画面；在顶部「监控」查看，不控制机械臂。', schema,
                           topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
         definition['title'] = '实时相机画面'
+        if getattr(self.runtime, 'interface_language', None) == 'en':
+            definition['title'] = 'Live camera'
+            definition['description'] = 'Current bound color camera view in Monitor; no arm commands.'
+            for action, description in (('start', 'Start live monitoring'), ('stop', 'Stop and release the camera'),
+                                        ('info', 'Read camera status')):
+                schema['x-action-params'][action]['description'] = description
         return [definition]
 
     def info(self):
         labels = {'idle': '已停止', 'disabled': '未启用相机采集', 'starting': '相机启动中',
                   'running': '实时画面正常', 'offline': '相机断流，正在重试', 'stopping': '相机停止中'}
         with self._lock:
-            return dict(state=self._state, 状态=labels[self._state], 设备名称=self.runtime.config.get('name', '机械臂 1'),
+            result = dict(state=self._state, 状态=labels[self._state], 设备名称=self.runtime.config.get('name', '机械臂 1'),
                         实际分辨率=None if self._width is None else [self._width, self._height],
                         采集帧率=round(self._capture_fps, 2), 发布帧率=round(self._publish_fps, 2),
                         目标帧率=self.settings['fps'], 有效帧数=self._frames, 最后有效时间=self._last_time,
                         错误原因=self._error, publishing=self._publisher is not None,
                         topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
+            if getattr(self.runtime, 'interface_language', None) == 'en':
+                from agilex.piper.intent_control import public_error
+                keys = {'状态': 'status', '设备名称': 'device', '实际分辨率': 'resolution', '采集帧率': 'capture_fps',
+                        '发布帧率': 'publish_fps', '目标帧率': 'target_fps', '有效帧数': 'frames',
+                        '最后有效时间': 'last_valid_time', '错误原因': 'error'}
+                result = {keys.get(key, key): value for key, value in result.items()}
+                result['status'] = self._state
+                result['device'] = 'PiPER ' + self.runtime.config.get('can_interface', 'can0')
+                result['error'] = public_error(result['error']) if result['error'] else None
+            return result
 
     def start(self):
         with self._lock:
@@ -152,12 +168,19 @@ class PiperCameraLive:
         return self.info()
 
     def dispatch(self, action, args):
+        english = getattr(self.runtime, 'interface_language', None) == 'en'
         if set(args) - {'action', 'instance_id', '_tool_name'}:
-            raise ValueError('实时相机卡不接受控制或拍照参数')
+            raise ValueError('Live camera accepts lifecycle arguments only.' if english else '实时相机卡不接受控制或拍照参数')
         action = args.get('action', 'info' if action == 'piper_camera_live' else action)
         if action not in ('start', 'stop', 'info'):
-            raise ValueError('实时相机只支持启动、停止和状态查询')
-        return getattr(self, action)()
+            raise ValueError('Live camera supports start, stop and info only.' if english else '实时相机只支持启动、停止和状态查询')
+        try:
+            return getattr(self, action)()
+        except RuntimeError as exc:
+            if english:
+                from agilex.piper.intent_control import public_error
+                raise RuntimeError(public_error(exc)) from exc
+            raise
 
     def _publish(self, stop, jpeg, stamp):
         # Serialize with cancellation: no frame can be published after stop wins.

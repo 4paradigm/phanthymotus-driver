@@ -1,20 +1,27 @@
-"""Test the production two-card registration with a simulated SDK only."""
+"""Keep the historical two-card integration covered with a simulated SDK."""
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agilex.piper.device import build_plugins
+from agilex.piper.arm_control import ArmControlPlugin
+from agilex.piper.monitor_bundle import add_monitor
+from agilex.piper.status_card import split_status_card
+from agilex.piper.camera_live import add_camera_live
 from common.vendor_runtime import DriverBundle
 from test_piper_controls import Driver
+
+
+def legacy_plugins(config, namespace, ros2):
+    return add_camera_live(split_status_card(add_monitor([ArmControlPlugin(config, namespace, ros2)], config, ros2)), config, ros2)
 
 
 class PiperEntrypointTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.plugins = build_plugins({'name': '机械臂 1', 'data_dir': self.tmp.name,
+        self.plugins = legacy_plugins({'name': '机械臂 1', 'data_dir': self.tmp.name,
                                       'async_actions': False}, 'agilex', None)
         self.runtime, self.status = self.plugins[:2]
         self.runtime.factory = Driver
@@ -177,7 +184,7 @@ class PiperEntrypointTests(unittest.TestCase):
         self.assertIsNone(self.runtime.owner_file)
 
     def test_two_device_entrypoints_have_separate_runtime_and_topics(self):
-        other = build_plugins({'name': '机械臂 2', 'data_dir': str(Path(self.tmp.name) / 'arm2')}, 'piper2', None)
+        other = legacy_plugins({'name': '机械臂 2', 'data_dir': str(Path(self.tmp.name) / 'arm2')}, 'piper2', None)
         self.addCleanup(other[0].stop)
         self.addCleanup(other[1].stop)
         self.assertIsNot(self.runtime, other[0])
