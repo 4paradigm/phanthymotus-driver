@@ -143,7 +143,8 @@ def _direction_subprocess(namespace: str) -> None:
             if samples.size % 8:
                 continue
             capture_us = getattr(frame, "timestamp_us", 0)
-            if type(capture_us) is not int or capture_us < 1_000_000_000_000_000:
+            if (type(capture_us) is not int or not
+                    1_000_000_000_000_000 <= capture_us < 10_000_000_000_000_000):
                 capture_us = 0
             if not gate.accepts(samples):
                 # 停顿帧不参与定位，避免机器人的风扇声改变说话者角度。
@@ -260,8 +261,20 @@ class SoundDirectionPlugin:
                     else:
                         print(message, flush=True)
                 ready_event.set()
+                exit_code = proc.poll()
+                if exit_code is not None:
+                    with self._process_lock:
+                        if self._proc is proc:
+                            print(f"[direction] worker exited unexpectedly ({exit_code})", flush=True)
+                            self._proc = None
+                            self._last_direction = None
+                            self._last_direction_time = 0.0
+                            event = SoundDirection()
+                            event.state = SoundDirection.NO_EVENT
+                            event.published_us = time.time_ns() // 1000
+                            self._clear_pub.publish(event)
             threading.Thread(target=forward, daemon=True).start()
-            if (not ready_event.wait(timeout=8) or not ready[0]
+            if (not ready_event.wait(timeout=15) or not ready[0]
                     or proc.poll() is not None):
                 self.stop()
                 return False
@@ -287,6 +300,12 @@ class SoundDirectionPlugin:
     def _set_parameters(self, changes: dict | None) -> dict:
         with self._process_lock:
             previous_parameters = load_parameters()
+            try:
+                previous_settings = SETTINGS_PATH.read_bytes()
+            except FileNotFoundError:
+                previous_settings = None
+            except OSError as exc:
+                return {"state": "error", "message": str(exc)}
             if changes is not None:
                 changes = {key: value for key, value in changes.items()
                            if key not in ("_tool_name", "action")}
@@ -317,13 +336,23 @@ class SoundDirectionPlugin:
             if running:
                 try:
                     if not self.start():
-                        return {"state": "error", "message": "direction restart failed to initialize",
+                        raise RuntimeError("direction restart failed to initialize")
+                except Exception as exc:
+                    try:
+                        if previous_settings is None:
+                            SETTINGS_PATH.unlink(missing_ok=True)
+                        else:
+                            temporary.write_bytes(previous_settings)
+                            temporary.replace(SETTINGS_PATH)
+                        restored = self.start()
+                    except Exception as restore_exc:
+                        return {"state": "error", "message": f"direction restart failed: {exc}; recovery failed: {restore_exc}",
                                 "parameters": load_parameters(),
                                 "file_parameters": load_parameters(), "running_parameters": None}
-                except Exception as exc:
                     return {"state": "error", "message": f"direction restart failed: {exc}",
                             "parameters": load_parameters(),
-                            "file_parameters": load_parameters(), "running_parameters": None}
+                            "file_parameters": load_parameters(),
+                            "running_parameters": previous_parameters if restored else None}
             if write_error is not None:
                 return {"state": "error", "message": str(write_error),
                         "parameters": load_parameters(),

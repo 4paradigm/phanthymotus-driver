@@ -3,6 +3,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 
 
 def _load_device(monkeypatch):
@@ -68,7 +69,11 @@ def _load_device(monkeypatch):
     return module, String
 
 
-def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch):
+@pytest.mark.parametrize('timestamps, expected_stamp', [
+    ((1_700_000_000_000_000, 1_700_000_000_020_000), (1_700_000_000, 0)),
+    ((1_700_000_000_000_000_000, 1_700_000_000_020_000_000), (0, 0)),
+])
+def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch, timestamps, expected_stamp):
     module, String = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     published = {}
@@ -84,7 +89,7 @@ def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch):
     class Done(BaseException):
         pass
 
-    times = iter((1_700_000_000_000_000, 1_700_000_000_020_000))
+    times = iter(timestamps)
 
     def capture():
         try:
@@ -114,5 +119,4 @@ def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch):
     assert len(audio) == 1
     assert audio[0].format == "pcm_16k_16bit_mono"
     assert audio[0].data == (500).to_bytes(2, "little", signed=True) * 640
-    assert (audio[0].header.stamp.sec, audio[0].header.stamp.nanosec) == (
-        1_700_000_000, 0)
+    assert (audio[0].header.stamp.sec, audio[0].header.stamp.nanosec) == expected_stamp

@@ -2,7 +2,10 @@
 
 import importlib.util
 import json
+import queue
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -48,12 +51,12 @@ def test_bundle_exposes_only_one_direction_card(monkeypatch):
     assert bundle.dispatch('sound_direction', {'action': 'stop'}) == {'state': 'idle'}
 
 
-def test_clean_install_does_not_enable_uncalibrated_direction(monkeypatch, tmp_path):
+def test_clean_install_exposes_unavailable_uncalibrated_direction(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     monkeypatch.setattr(module, 'CALIBRATION_PATH', tmp_path / 'override.json')
     monkeypatch.setattr(module, 'DEFAULT_CALIBRATION_PATH', tmp_path / 'packaged.json')
     config = yaml.safe_load((Path(__file__).resolve().parents[1] / 'config.yaml').read_text())
-    assert config['plugins']['sound_direction']['enabled'] is False
+    assert config['plugins']['sound_direction']['enabled'] is True
     monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs:
                         (_ for _ in ()).throw(AssertionError('worker must not start')))
     card = _card(module)
@@ -104,15 +107,84 @@ def test_config_reports_failed_worker_restart(monkeypatch, tmp_path):
     monkeypatch.setattr(module, 'SETTINGS_PATH', tmp_path / 'settings.json')
     monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
     card = _card(module)
-    card._proc = types.SimpleNamespace(poll=lambda: None, terminate=lambda: None,
-                                       wait=lambda timeout=None: 0)
-    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: (
-        _ for _ in ()).throw(OSError('spawn failed')))
+    card._proc = types.SimpleNamespace(poll=lambda: None)
+    starts = []
+    monkeypatch.setattr(card, 'stop', lambda: setattr(card, '_proc', None))
+    def restart():
+        starts.append(module.load_parameters()['onset_ratio'])
+        if len(starts) == 1:
+            raise OSError('spawn failed')
+        card._proc = types.SimpleNamespace(poll=lambda: None)
+        return True
+    monkeypatch.setattr(card, 'start', restart)
     result = card.dispatch('config', {'onset_ratio': 2.6})
     assert result['state'] == 'error'
-    assert result['parameters']['onset_ratio'] == 2.6
-    assert result['running_parameters'] is None
-    assert result['file_parameters']['onset_ratio'] == 2.6
+    assert starts == [2.6, 1.8]
+    assert result['running_parameters']['onset_ratio'] == 1.8
+    assert result['file_parameters']['onset_ratio'] == 1.8
+    assert module.load_parameters()['onset_ratio'] == 1.8
+
+
+def test_worker_exit_clears_published_direction(monkeypatch):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
+    card = _card(module)
+    lines = queue.Queue()
+    lines.put(b'__BUMI_DIRECTION_READY__\n')
+
+    class Process:
+        exit_code = None
+        def __init__(self):
+            self.stdout = self._lines()
+        def _lines(self):
+            while True:
+                line = lines.get()
+                if line is None:
+                    return
+                yield line
+        def poll(self): return self.exit_code
+        def wait(self, timeout=None): return self.exit_code
+
+    proc = Process()
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: proc)
+    assert card.start() is True
+    valid = module.SoundDirection()
+    valid.state = valid.VALID
+    valid.angle_deg = 90
+    card._on_direction(valid)
+    proc.exit_code = 137
+    lines.put(None)
+    deadline = time.monotonic() + 1
+    while not card._node.published and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert card._node.published[-1].state == module.SoundDirection.NO_EVENT
+    assert card._proc is None
+    assert card._last_direction is None
+
+
+def test_ready_wait_allows_slow_sdk_init(monkeypatch):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
+    card = _card(module)
+    waits = []
+
+    class Event:
+        def set(self): pass
+        def wait(self, timeout):
+            waits.append(timeout)
+            return False
+
+    class Process:
+        stdout = ()
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(module, 'threading', types.SimpleNamespace(
+        Event=Event, Thread=threading.Thread, RLock=threading.RLock))
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: Process())
+    assert card.start() is False
+    assert waits == [15]
 
 
 def test_no_event_clears_last_direction(monkeypatch):

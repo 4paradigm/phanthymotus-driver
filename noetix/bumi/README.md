@@ -16,7 +16,8 @@ clock only when it has a Unix-microsecond shape. `mic` stamps each chunk with
 the first frame's time; the direction window ends after the final frame's last
 sample. Invalid timestamps leave the audio stamp unset and direction window
 at zero, so ASR cannot mistake publication time for capture time. The SDK
-clock's meaning and simultaneous readers still require verification on Bumi.
+clock's meaning still requires verification on Bumi. Simultaneous readers were
+verified on Bumi with commit cc2c1e2; this capture topology is unchanged.
 
 Set the five shared parameters from the direction card's left-list gear.
 Saving them restarts the direction worker and waits for it to become ready.
@@ -36,10 +37,9 @@ The card first loads a complete, valid per-robot calibration from
 packaged `resource/sound_direction_calibration.json`. Each file must contain
 `front` and `right`, each with three finite values of magnitude at most 24.
 The two files are never mixed. The packaged values are pending a read from an
-already calibrated Bumi. The direction card is disabled by default until a
-verified calibration is installed and `plugins.sound_direction.enabled` is set
-to `true` in `config.yaml`. If enabled without a valid file, `start` and `info`
-report it unavailable instead of starting a silent worker. Before treating
+already calibrated Bumi. The direction card is registered by default; without
+a valid file, `start` and `info` report it unavailable instead of starting a
+silent worker. Before treating
 the packaged file as common to all Bumi units, check a
 second robot at front, right, left and rear positions.
 

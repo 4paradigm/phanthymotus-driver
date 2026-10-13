@@ -2,6 +2,8 @@ import json
 import sys
 import types
 
+import pytest
+
 from test_direction_card import _card, _load_card
 
 
@@ -63,7 +65,11 @@ def test_angle_boundary_and_window_end_use_last_frame_samples(monkeypatch):
     assert msg.published_us == 1700000000040000
 
 
-def test_worker_publishes_structured_direction_message(monkeypatch, tmp_path):
+@pytest.mark.parametrize('timestamps, expected_end', [
+    ((1700000000000000, 1700000000020000), 1700000000060000),
+    ((1700000000000000000, 1700000000020000000), 0),
+])
+def test_worker_publishes_structured_direction_message(monkeypatch, tmp_path, timestamps, expected_end):
     module = _load_card(monkeypatch)
     calibration = tmp_path / 'calibration.json'
     calibration.write_text(json.dumps({'front': [1, 0, 0], 'right': [0, 1, 0]}))
@@ -81,7 +87,7 @@ def test_worker_publishes_structured_direction_message(monkeypatch, tmp_path):
             return types.SimpleNamespace(publish=published.append)
 
     class Done(BaseException): pass
-    frames = iter((1700000000000000, 1700000000020000))
+    frames = iter(timestamps)
     def capture():
         try: timestamp_us = next(frames)
         except StopIteration: raise Done()
@@ -100,4 +106,4 @@ def test_worker_publishes_structured_direction_message(monkeypatch, tmp_path):
     except Done: pass
     assert len(published) == 1
     assert published[0].angle_deg == -90
-    assert published[0].window_end_us == 1700000000060000
+    assert published[0].window_end_us == expected_end

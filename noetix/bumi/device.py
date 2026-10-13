@@ -985,7 +985,7 @@ def _mic_subprocess(namespace: str):
             if len(buffer) == 0:
                 timestamp_us = getattr(audio, 'timestamp_us', 0)
                 buffer_start_us = (timestamp_us if type(timestamp_us) is int
-                                   and timestamp_us >= 1_000_000_000_000_000 else 0)
+                                   and 1_000_000_000_000_000 <= timestamp_us < 10_000_000_000_000_000 else 0)
             buffer = _np.concatenate([buffer, mono])
 
             if len(buffer) >= MIN_CHUNK_SAMPLES:

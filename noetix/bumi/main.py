@@ -12,6 +12,8 @@ drivers/noetix/bumi/main.py — Noetix Bumi-EDU 设备 bundle 统一入口。
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+from __future__ import annotations
+
 # Make every log line one atomic, control-character-free write, so concurrent
 # writers cannot tear a Docker log record. Must run before anything prints.
 try:
