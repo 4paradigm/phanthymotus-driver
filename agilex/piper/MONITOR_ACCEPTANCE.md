@@ -5,7 +5,7 @@
 ## 结果
 
 - 监控测试 23 项：通过（含现场快照适配与固定轮廓跟随验证）。
-- 最新指定回归集合：193 passed、114 subtests passed（含 5 项部署适配与 5 项骨架拆卡测试）。
+- 最新指定回归集合：204 passed、118 subtests passed（含 8 项自动骨架卡与 8 项示教控制测试）。
 - 实际 Edge headless + 未修改 Core 渲染器：通过；528 个矩阵值对比，无页面脚本错误。
 - 浏览器场景：三组实测角度模拟、过期冻结、读取失败提示、恢复、双设备隔离。
 - ROS transport 使用假 ROS 对象验证 Core context、QoS、消息序列化、重复关闭及部分初始化失败释放。
@@ -18,7 +18,7 @@ Python 3.12 回归命令（pytest、PyYAML、OpenCV 为测试环境依赖，不�
 
 ```bash
 python -m pytest -q \
-  tests/test_piper_status_card.py \
+  tests/test_piper_status_card.py tests/test_piper_teaching_control.py \
   tests/test_piper_monitor.py tests/test_piper_monitor_bundle.py tests/test_piper_ten_cards.py \
   tests/test_piper_cards.py tests/test_piper_controls.py tests/test_piper_prepare.py \
   tests/test_piper_deployment.py tests/test_piper_mac.py tests/test_common_lifecycle.py \
@@ -123,6 +123,29 @@ python -m pytest -q \
   截图 `arm1-full-skeleton-live.png`，记录 `pose-live-result.json`；未执行运动、模式或电机命令。
   真实运动跟随仍由用户自行验证。
 - 脚本：`/home/agilex/piper-monitor-deploy-20261013/deploy_pose_arm1.py`。
+
+### 2026-10-13 12:56 自动检测与示教入口
+
+- 用户要求骨架卡没有业务按钮、自动检测动作；公开 schema 改为仅框架生命周期，
+  确认画布不再出现读取/执行表单。Core 固定的「查看数据流」按钮仍保留，
+  用户再次选择不改 Core，骨架使用顶部监控。
+- 自动初始化共享 runtime 的 CAN 监听（`piper_init=False`），采样回调不做连接操作。
+  无第二个 SDK/CAN 连接，不发送运动、模式或电机控制指令。
+- 控制卡增加进入/退出拖动示教菜单，带一次性预览、支撑和模式/固件检查。
+  本阶段无真实软件示教动作验证。现场验证固件列表为空，软件入口提供按键指引；
+  不自动查询或把现场固件加入验证列表。
+- 模拟 SDK 验证开始/结束录制只发送对应指令，结束后的待机反馈不会被强制切回 CAN；
+  无权限、过期或已变更预览、未知固件、回放中均不发模式或电机指令。
+  自动连接覆盖锁忙、失败、重启恢复和停止重试的资源释放。完整回归 204 项、118 项子测试通过。
+- 初次部署检查发现智能控制正在运行，因此未改现场；用户关闭后明确要求继续，
+  重新检查通过后仅重启机械臂 1 驱动。机械臂 2 镜像/启动时间及 Core 镜像均未改变。
+- 镜像：`agilex-piper:local-arm1-auto-teaching-bbb7c2a5`。
+  备份：`/opt/phanthy-motus/backups/piper-arm1-auto-teaching-20261013-125617/`。
+- 不调用手动 read，仅查询监控 info，确认自动反馈新鲜且时间推进。
+  状态曾为示教，角度 `[2.662, 35.149, -32.335, 6.977, 4.461, -14.111]` 度，许可关闭。
+  记录 `auto-pose-result.json`，画布截图 `auto-detector-teaching-form.png`，
+  自动骨架截图 `automatic-skeleton-live.png`。菜单选择仅做表单验证，未点击示教执行。
+- 脚本：`/home/agilex/piper-monitor-deploy-20261013/deploy_auto_teaching_arm1.py`。
 
 用户要求先测试再提交 PR，因此本阶段保留本地独立提交，不创建或更新 PR。
 最终目标：[驱动 PR #382](https://github.com/4paradigm/phanthymotus-driver/pull/382)。

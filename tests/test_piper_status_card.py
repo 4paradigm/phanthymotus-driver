@@ -18,7 +18,12 @@ class StatusCardTests(unittest.TestCase):
               "joints_deg":[1,2,3,4,5,6],"motion_enabled":False}
         connects=[]
         r=SimpleNamespace(config={"name":"机械臂 1"},topic='/agilex/piper/rgb',closed=False,connection_lock=threading.RLock(),
+                          driver=None,gate=threading.Lock(),connected_event=threading.Event(),
                           connected=lambda:connects.append('same-runtime'),read_monitor_snapshot=lambda:deepcopy(data))
+        def connected():
+            connects.append('same-runtime'); r.driver=object();r.connected_event.set()
+            return r.driver
+        r.connected=connected
         r.get_tools=lambda:[{"name":"arm_control","type":"actuator","inputSchema":{
             "properties":{"action":{"enum":["read","info","halt","move_joint"],"default":"read",
             "oneOf":[{"const":x,"title":x} for x in ['read','info','halt','move_joint']]}},
@@ -70,8 +75,9 @@ class StatusCardTests(unittest.TestCase):
         self.assertIn('<robot',bundle.dispatch('model',{})['urdf'])
         self.assertEqual(bundle.dispatch('piper_status',{'action':'info'})['state'],'idle')
         bundle.dispatch('piper_status',{'action':'start'})
+        self.assertTrue(r.connected_event.wait(1))
         self.assertEqual(bundle.dispatch('piper_status',{'action':'stop'})['state'],'idle')
-        self.assertEqual(connects,[])
+        self.assertEqual(connects,['same-runtime'])
 
     def test_continuous_pose_updates_and_stop_release_without_hardware_commands(self):
         r,connects=self.runtime(); transports=[]
@@ -88,6 +94,35 @@ class StatusCardTests(unittest.TestCase):
         self.assertEqual(transports[0].closed,1)
         self.assertEqual(connects,[])
         self.assertFalse(r.closed)
+
+    def test_detector_has_no_read_or_execute_form_and_initializes_shared_listener_once(self):
+        r,connects=self.runtime();plugin=PiperStatusCard(r,auto_connect=True)
+        self.addCleanup(plugin.stop)
+        definition=plugin.get_tools()[0]
+        self.assertEqual(set(definition['inputSchema']['properties']['action']['enum']),{'start','stop','info'})
+        self.assertNotIn('x-manual-execution',definition['inputSchema'])
+        plugin.start();self.assertTrue(r.connected_event.wait(1));plugin.start()
+        self.assertEqual(connects,['same-runtime'])
+        plugin.stop();self.assertFalse(plugin._connection_thread.is_alive())
+
+    def test_auto_connection_does_not_wait_for_action_gate_or_take_motion_permission(self):
+        r,connects=self.runtime();r.gate.acquire()
+        self.addCleanup(r.gate.release)
+        plugin=PiperStatusCard(r,auto_connect=True)
+        plugin.start();plugin.stop()
+        self.assertEqual(connects,[])
+        self.assertFalse(plugin._connection_thread.is_alive())
+
+    def test_auto_connection_failure_is_visible_and_restart_can_recover(self):
+        r,connects=self.runtime();good=r.connected;failed=threading.Event()
+        def fail():
+            failed.set();raise RuntimeError('CAN unavailable')
+        r.connected=fail;plugin=PiperStatusCard(r,auto_connect=True)
+        self.addCleanup(plugin.stop)
+        plugin.start();self.assertTrue(failed.wait(1));plugin.stop()
+        self.assertEqual(plugin.info()['connection_error'],'CAN unavailable')
+        r.connected=good;plugin.start();self.assertTrue(r.connected_event.wait(1));plugin.stop()
+        self.assertIsNone(plugin.info()['connection_error'])
 
 
 if __name__=='__main__':unittest.main()
