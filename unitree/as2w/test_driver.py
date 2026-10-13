@@ -1621,19 +1621,17 @@ class TestDriverContracts(unittest.TestCase):
             data=data, format=image_format,
             header=types.SimpleNamespace(stamp=stamp))
 
-    def test_vision_capture_schema_and_single_front_camera(self):
+    def test_vision_capture_schema_uses_fixed_front_camera(self):
         plugin = self._vision_plugin("/tmp/unused")
         tool = plugin.get_tool()
         self.assertEqual("actuator", tool["type"])
         self.assertEqual(
-            ["start", "capture_photo", "record_video", "list_cameras",
-             "info", "stop"],
+            ["start", "capture_photo", "record_video", "info", "stop"],
             tool["inputSchema"]["properties"]["action"]["enum"])
         self.assertEqual(["record_video"],
                          tool["inputSchema"]["x-completion"]["actions"])
         self.assertEqual(55, tool["inputSchema"]["x-completion"]["timeout"])
-        cameras = plugin.dispatch("list_cameras", {})["cameras"]
-        self.assertEqual(["front"], [item["camera"] for item in cameras])
+        self.assertEqual("front", plugin._source()["camera"])
 
     def test_vision_capture_filters_invalid_and_stale_jpegs(self):
         plugin = self._vision_plugin("/tmp/unused")

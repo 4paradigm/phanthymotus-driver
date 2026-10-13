@@ -66,7 +66,7 @@ class VisionCapturePlugin:
                 "properties": {
                     "action": {"type": "string", "enum": [
                         "start", "capture_photo", "record_video",
-                        "list_cameras", "info", "stop"]},
+                        "info", "stop"]},
                     "duration_s": {
                         "type": "integer", "minimum": 1,
                         "maximum": self._max_duration_s,
@@ -79,7 +79,6 @@ class VisionCapturePlugin:
                     "start": {"params": []},
                     "capture_photo": {"params": []},
                     "record_video": {"params": ["duration_s"]},
-                    "list_cameras": {"params": []},
                     "info": {"params": []},
                     "stop": {"params": []},
                 },
@@ -474,8 +473,6 @@ class VisionCapturePlugin:
             return self._capture_photo()
         if action == "record_video":
             return self._start_video_recording(args)
-        if action == "list_cameras":
-            return {"ok": True, "cameras": [self._source()]}
         if action == "info":
             return self._info()
         if action == "stop":
