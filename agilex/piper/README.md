@@ -64,7 +64,9 @@ PICO App → PICO teleop_device → /teleop/command → piper_teleop → IK 工�
    核对 mDNS、安装网址和配对邀请都使用新端口，不修改 App 或构建另一套输入协议。
 
 两服务使用相同宿主机启动时钟、DDS domain 42 和既有 loopback DDS 配置。
-当前固定 `/teleop/command` 只支持一组设备输入和一组双臂消费者；同域不要同时运行另一组
+当前只支持一组设备输入和一组双臂消费者。PiPER 只订阅画布在 `start` 中传入的
+`input_topic`，不回退到固定 topic；缺少连线输入时返回 `waiting_binding`，不能开始遥操。
+更换输入 topic 前先停止卡片。设备当前通常发布 `/teleop/command`，同域不要同时运行另一组
 G1/双臂消费者。PiPER 沿用 SDK 直连 CAN，不启动 `piper_ros` 控制程序。
 双臂功能不修改 Core/ActuCore；中文预览确认沿用 PiPER 十卡片配套 Core 能力。
 

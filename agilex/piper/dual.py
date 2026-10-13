@@ -9,7 +9,7 @@ from agilex.piper.cards import build_tools, choice, flag
 from agilex.piper.device import PiperPlugin
 from agilex.piper.paired_motion import PairedMotion
 from agilex.piper.teleop_bus import TeleopBus
-from common.teleop_contract import COMMAND_TOPIC, STATE_TOPIC, COMMAND_FORMAT, FEEDBACK_FORMAT, binding_from_topic
+from common.teleop_contract import STATE_TOPIC, COMMAND_FORMAT, FEEDBACK_FORMAT
 from common.vendor_runtime import action_schema, tool
 
 SIDES = ("left", "right")
@@ -36,7 +36,7 @@ def dual_tools(topic):
                  "info": ([], "读取会话、录制及完成结果")}
     for name, title, actions, properties in [
         ("piper_teleop", "双臂 VR 遥操", {"begin": (list(hidden), "预览并启用遥操会话"), "finish": ([], "结束遥操并保持")},
-         {**hidden, "input_topic": {"type": "string", "title": "设备输入", "enum": [COMMAND_TOPIC]}}),
+         {**hidden, "input_topic": {"type": "string", "title": "设备输入"}}),
         ("piper_motion", "动作录制与回放", {"record_start": ([], "开始记录双臂与夹爪轨迹"),
             "record_stop": ([], "结束录制并保存"), "list": ([], "列出录制文件"),
             "inspect": (["filename"], "检查轨迹文件"),
@@ -55,10 +55,12 @@ def dual_tools(topic):
         schema["x-confirmation"] = {action: {"preview": {"action": action, "execute": False},
             "execute": {"execute": True, "workspace_clear": True, "take_control": True},
             "message": "核对左右机械臂、夹爪、起始姿态和活动空间。确认其他控制程序已停止，并可立即停止双臂。"}}
+        if name == "piper_teleop":
+            schema["x-action-params"]["start"]["params"] = ["input_topic"]
         if name == "piper_motion":
             schema["x-completion"] = {"actions": ["play"], "timeout": 610}
         definition = tool(name, "actuator", title + "；不会自动切模式、使能或回起点。", schema,
-                          topic_in=[{"topic": COMMAND_TOPIC, "format": COMMAND_FORMAT}] if name == "piper_teleop" else None,
+                          topic_in=[{"format": COMMAND_FORMAT}] if name == "piper_teleop" else None,
                           topic_out=[{"topic": STATE_TOPIC, "format": FEEDBACK_FORMAT}] if name == "piper_teleop" else None)
         definition["title"] = title
         result.append(definition)
@@ -88,12 +90,16 @@ class DualPiperPlugin:
             self.arms[side].motion_enabled = False
         self.motion = PairedMotion(self.arms, config.get("calibration_path"), root, **motion_options)
         self.ros2, self.bus_factory, self.bus = ros2, bus_factory, None
+        self.input_topic = None
         self.lock = threading.RLock()
         self.stopped = set()
         self.closed = False
 
     def get_tools(self):
-        return dual_tools(self.arms["left"].topic)
+        definitions = dual_tools(self.arms["left"].topic)
+        if self.input_topic:
+            next(d for d in definitions if d["name"] == "piper_teleop")["topic_in"][0]["topic"] = self.input_topic
+        return definitions
 
     def start(self):
         with self.lock:
@@ -109,15 +115,18 @@ class DualPiperPlugin:
             if self.bus is not None:
                 self.bus.close()
                 self.bus = None
+            self.input_topic = None
             for arm in self.arms.values():
                 arm.stop()
 
     def _bus(self):
         with self.lock:
+            if not self.input_topic:
+                raise RuntimeError("input_topic_required")
             if self.bus is None:
                 if self.ros2 is None:
                     raise RuntimeError("teleop_requires_ros2_input")
-                self.bus = self.bus_factory(self.ros2, self.motion)
+                self.bus = self.bus_factory(self.ros2, self.motion, self.input_topic)
             if not self.bus.status()["running"]:
                 raise RuntimeError("teleop_dds_unhealthy_restart_card")
 
@@ -141,7 +150,9 @@ class DualPiperPlugin:
             if "enum" in prop and value not in prop["enum"]:
                 raise ValueError("invalid_" + key)
         if "input_topic" in args:
-            binding_from_topic(args["input_topic"])
+            topic = args["input_topic"]
+            if len(topic) > 255 or not re.fullmatch(r"(?:/[A-Za-z_][A-Za-z0-9_]*)+", topic):
+                raise ValueError("invalid_input_topic")
 
     def dispatch(self, action, args):
         name = args.get("_tool_name", "piper_status")
@@ -155,6 +166,17 @@ class DualPiperPlugin:
                     raise RuntimeError("piper_driver_closed")
                 self.stopped.discard(name)
                 if name == "piper_teleop":
+                    topic = args.get("input_topic")
+                    if not topic:
+                        self.motion.request_stop("input_topic_missing")
+                        if self.bus is not None:
+                            self.bus.close()
+                            self.bus = None
+                        self.input_topic = None
+                        return {"state": "waiting_binding", "reason": "input_topic_required", "executed": False}
+                    if self.bus is not None and topic != self.input_topic:
+                        raise RuntimeError("stop_before_rebinding_input_topic")
+                    self.input_topic = topic
                     self._bus()
             return {"state": "ready", "executed": False}
         if action == "stop" and paired:
@@ -164,11 +186,13 @@ class DualPiperPlugin:
                 if name == "piper_teleop" and self.bus is not None:
                     self.bus.close()
                     self.bus = None
+                if name == "piper_teleop":
+                    self.input_topic = None
             return result
         if paired:
             if action == "info":
                 return {**self.motion.status(),
-                        "topic_in": [{"topic": COMMAND_TOPIC, "format": COMMAND_FORMAT}] if name == "piper_teleop" else [],
+                        "topic_in": [{"format": COMMAND_FORMAT, **({"topic": self.input_topic} if self.input_topic else {})}] if name == "piper_teleop" else [],
                         "topic_out": [{"topic": STATE_TOPIC, "format": FEEDBACK_FORMAT}] if name == "piper_teleop" else [],
                         "transport": self.bus.status() if self.bus else None}
             if action in {"finish", "halt"}:

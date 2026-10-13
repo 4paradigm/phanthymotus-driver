@@ -32,7 +32,9 @@ def run():
     executor = SingleThreadedExecutor(context=context)
     node = Node("piper_test_source", context=context)
     executor.add_node(node)
-    publisher = node.create_publisher(String, "/teleop/command", 1)
+    input_topic = "/canvas/piper_test/command"
+    publisher = node.create_publisher(String, input_topic, 1)
+    unrelated = node.create_publisher(String, "/teleop/command", 1)
     received = []
     node.create_subscription(String, "/teleop/state", lambda m: received.append(json.loads(m.data)), 10)
     sequence = 0
@@ -70,11 +72,15 @@ def run():
                 return json.loads(result["content"][0]["text"])
 
             assert len(rpc("tools/list", {})["tools"]) == 12
-            call("piper_teleop", "start", input_topic="/teleop/command")
+            assert call("piper_teleop", "start")["state"] == "waiting_binding"
+            assert plugin.bus is None
+            assert publisher.get_subscription_count() == unrelated.get_subscription_count() == 0
+            call("piper_teleop", "start", input_topic=input_topic)
             until = time.monotonic()+10
             while publisher.get_subscription_count() == 0 and time.monotonic() < until:
                 executor.spin_once(timeout_sec=.05)
             assert publisher.get_subscription_count() > 0, "DDS discovery failed"
+            assert unrelated.get_subscription_count() == 0, "unexpected default-topic subscription"
             preview = call("piper_teleop", "begin")
             call("piper_teleop", "begin", execute=True, preview_id=preview["preview_id"], workspace_clear=True, take_control=True)
 
@@ -118,7 +124,8 @@ def run():
             assert plugin.motion.last_action["status"] == "completed", plugin.motion.last_action
             print(json.dumps({"evidence": "real_loopback_DDS_MCP_NumPy_worker_simulated_CAN",
                               "frames": recording["frames"], "monitor_messages": len(received),
-                              "replay": plugin.motion.last_action["status"], "physical_acceptance": False}))
+                              "replay": plugin.motion.last_action["status"], "canvas_input_topic": input_topic,
+                              "default_topic_subscribers": unrelated.get_subscription_count(), "physical_acceptance": False}))
         finally:
             if plugin is not None:
                 plugin.stop()

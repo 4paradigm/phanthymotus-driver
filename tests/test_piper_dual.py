@@ -53,8 +53,9 @@ class FastWorker:
 
 
 class FakeBus:
-    def __init__(self, ros2, motion):
+    def __init__(self, ros2, motion, input_topic):
         self.running = True
+        self.input_topic = input_topic
 
     def status(self):
         return {"running": self.running}
@@ -73,6 +74,7 @@ def pair(tmp_path, monkeypatch):
                               "calibration_path": str(path)}, ros2=object(), driver_factory=Driver,
                              bus_factory=FakeBus, worker_factory=FastWorker, clock_id="boot-test")
     plugin.start()
+    call(plugin, "teleop", "start", input_topic="/teleop/command")
     yield plugin
     plugin.stop()
 
@@ -463,7 +465,7 @@ def test_monitor_card_stop_does_not_cancel_paired_motion(pair):
 
 
 def test_bus_restart_waits_for_previous_bus_close(pair):
-    call(pair, "teleop", "start")
+    call(pair, "teleop", "start", input_topic="/teleop/command")
     old_bus = pair.bus
     closing, release = threading.Event(), threading.Event()
     def slow_close():
@@ -474,7 +476,7 @@ def test_bus_restart_waits_for_previous_bus_close(pair):
         stop = threading.Thread(target=lambda: call(pair, "teleop", "stop"))
         stop.start()
         assert closing.wait(1)
-        start = threading.Thread(target=lambda: call(pair, "teleop", "start"))
+        start = threading.Thread(target=lambda: call(pair, "teleop", "start", input_topic="/teleop/command"))
         start.start()
         try:
             start.join(.05)
@@ -485,3 +487,36 @@ def test_bus_restart_waits_for_previous_bus_close(pair):
             start.join(2)
     assert not stop.is_alive() and not start.is_alive()
     assert pair.bus is not old_bus and pair.bus.running
+
+
+def test_canvas_input_required_and_begin_cannot_create_default_subscription(pair):
+    old_bus = pair.bus
+    assert call(pair, "teleop", "start")["state"] == "waiting_binding"
+    assert pair.bus is None and not old_bus.running
+    assert "topic" not in call(pair, "teleop", "info")["topic_in"][0]
+    with pytest.raises(RuntimeError, match="input_topic_required"):
+        call(pair, "teleop", "begin")
+    assert pair.bus is None
+
+
+def test_canvas_topic_forwarded_and_rebind_requires_stop(pair):
+    call(pair, "teleop", "stop")
+    call(pair, "teleop", "start", input_topic="/canvas/pico/command")
+    bus = pair.bus
+    assert bus.input_topic == "/canvas/pico/command"
+    assert call(pair, "teleop", "info")["topic_in"][0]["topic"] == bus.input_topic
+    with pytest.raises(RuntimeError, match="stop_before_rebinding"):
+        call(pair, "teleop", "start", input_topic="/other/command")
+    assert pair.bus is bus and bus.running
+    call(pair, "teleop", "stop")
+    assert not bus.running and pair.input_topic is None
+    call(pair, "teleop", "start", input_topic="/other/command")
+    assert pair.bus.input_topic == "/other/command"
+
+
+@pytest.mark.parametrize("topic", ["relative/topic", "/bad//topic", "/bad topic", "/bad/1topic"])
+def test_invalid_canvas_topic_does_not_change_subscription(pair, topic):
+    bus = pair.bus
+    with pytest.raises(ValueError, match="invalid_input_topic"):
+        call(pair, "teleop", "start", input_topic=topic)
+    assert pair.bus is bus and bus.running

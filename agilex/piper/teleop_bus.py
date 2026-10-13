@@ -6,14 +6,15 @@ import time
 from uuid import uuid4
 
 from agilex.piper.trajectory import unique
-from common.teleop_contract import COMMAND_TOPIC, STATE_TOPIC, FEEDBACK_SCHEMA, MAX_WIRE_BYTES
+from common.teleop_contract import STATE_TOPIC, FEEDBACK_SCHEMA, MAX_WIRE_BYTES
 
 
 class TeleopBus:
-    def __init__(self, ros2, motion):
+    def __init__(self, ros2, motion, input_topic):
         if ros2.ctx_core.get_domain_id() != 42:
             raise ValueError("teleop_requires_domain_42")
         self.context, self.motion = ros2.ctx_core, motion
+        self.input_topic = input_topic
         self.closed, self.ready = threading.Event(), threading.Event()
         self.error = None
         self.last_received_ns = self.last_accepted_ns = None
@@ -70,7 +71,7 @@ class TeleopBus:
             executor = SingleThreadedExecutor(context=self.context)
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
             publisher = node.create_publisher(String, STATE_TOPIC, qos)
-            node.create_subscription(String, COMMAND_TOPIC, self.receive, qos)
+            node.create_subscription(String, self.input_topic, self.receive, qos)
             executor.add_node(node)
             self.ready.set()
             next_publish = 0
