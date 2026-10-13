@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.1'
+VERSION = '0.5.2'
 CARDS = {'joint_state', 'battery_state'}
 
 

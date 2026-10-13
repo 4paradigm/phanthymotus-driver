@@ -1,10 +1,13 @@
 """Motus sensor/skeleton contract, using the official DACH_TRON2A model."""
 from pathlib import Path
+import math
 
 from reset import ARM_NAMES
 
 JOINT_NAMES = ARM_NAMES + ['head_pitch_Joint', 'head_yaw_Joint']
 MODEL_PATH = Path(__file__).with_name('resource') / 'tron2_dach.urdf'
+ARM_LABELS = ['肩俯仰', '肩侧摆', '肩旋转', '肘', '腕偏航', '腕俯仰', '腕旋转']
+JOINT_LABELS = ARM_LABELS + ARM_LABELS + ['头部俯仰', '头部偏航']
 
 
 def model():
@@ -31,7 +34,11 @@ def skeleton_stream(sample):
         return result
     status['name_source'] = 'vendor' if data['names'] else 'official_sdk_index_order'
     for index, name in enumerate(names):
-        joint = {'idx': JOINT_NAMES.index(name), 'name': name, 'q': data['q'][index]}
+        motor_index = JOINT_NAMES.index(name)
+        joint = {'idx': motor_index, 'name': name, 'q': data['q'][index],
+                 'q_deg': math.degrees(data['q'][index]),
+                 'group': '左臂' if motor_index < 7 else '右臂' if motor_index < 14 else '头部',
+                 'label': JOINT_LABELS[motor_index]}
         for field in ('dq', 'tau'):
             if data[field]:
                 joint[field] = data[field][index]
