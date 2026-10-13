@@ -5,7 +5,7 @@
 ## 结果
 
 - 监控测试 23 项：通过（含现场快照适配与固定轮廓跟随验证）。
-- 最新指定回归集合：197 passed、114 subtests passed（含 9 项骨架卡与已移除示教入口验证）。
+- 最新指定回归集合：205 passed、114 subtests passed（含直接执行、骨架卡及已移除示教入口验证）。
 - 实际 Edge headless + 未修改 Core 渲染器：通过；528 个矩阵值对比，无页面脚本错误。
 - 浏览器场景：三组实测角度模拟、过期冻结、读取失败提示、恢复、双设备隔离。
 - ROS transport 使用假 ROS 对象验证 Core context、QoS、消息序列化、重复关闭及部分初始化失败释放。
@@ -18,6 +18,7 @@ Python 3.12 回归命令（pytest、PyYAML、OpenCV 为测试环境依赖，不�
 
 ```bash
 python -m pytest -q \
+  tests/test_piper_direct_control.py \
   tests/test_piper_status_card.py \
   tests/test_piper_monitor.py tests/test_piper_monitor_bundle.py tests/test_piper_ten_cards.py \
   tests/test_piper_cards.py tests/test_piper_controls.py tests/test_piper_prepare.py \
@@ -162,6 +163,25 @@ python -m pytest -q \
   未执行模式、使能/失能、运动或相机动作。
   证据：`monitor-only-result.json`、`no-stream-no-teaching.png`、`monitor-only-skeleton-live.png`。
 - 脚本：`/home/agilex/piper-monitor-deploy-20261013/deploy_monitor_only_arm1.py`。
+
+### 2026-10-13 13:37 无需请求，直接执行
+
+- 用户要求去掉请求控制，满足条件直接执行。菜单移除开启/关闭许可，删除额外确认弹窗元数据；
+  每次执行内部使用原一次性预览，再核对当前状态后执行，不全局开启操作许可。
+  保留模式、使能、反馈、故障、限位、支撑、停止与取消检查；不自动授权使能边界修正。
+- 205 项回归、114 项子测试通过。隔离容器禁用网络且不映射设备，使用现场实际
+  `ArmControlPlugin` 配合模拟 SDK，验证微动直接执行一次、错误模式不发命令、线程外无许可。
+  模拟测试的 SDK 命令不连接真实机械臂。
+- 用户关闭智能控制后继续部署，仅更新机械臂 1。镜像：
+  `agilex-piper:local-arm1-direct-control-e19c68ef`；备份：
+  `/opt/phanthy-motus/backups/piper-arm1-direct-control-20261013-133755/`。
+  Core 镜像、机械臂 2 镜像与启动时间一致；画布布局 JSON 未变化。
+- 只读 `info` 验证自动反馈新鲜且时间推进，快照策略为 `direct_operator`。
+  Edge 服务器画布确认两张卡、控制菜单无请求许可和示教选项；未点击真机执行按钮。
+  顶部监控显示正确 PiPER 轮廓。证据：`direct-control-readonly-result.json`、
+  `direct-control-deployed.png`、`direct-control-monitor-live.png`。
+- 部署脚本：`/home/agilex/piper-monitor-deploy-20261013/deploy_direct_control_arm1.py`。
+  本阶段没有执行真机运动、模式切换、使能/失能或拍照，真实控制留给用户测试。
 
 用户要求先测试再提交 PR，因此本阶段保留本地独立提交，不创建或更新 PR。
 最终目标：[驱动 PR #382](https://github.com/4paradigm/phanthymotus-driver/pull/382)。

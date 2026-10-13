@@ -63,8 +63,16 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 启停管理采样、发布、只读连接初始化线程和资源释放；监控采样回调本身不会主动连接。
 `piper_status` 是 resource，诊断用 `read` 返回 `skeleton/parameters`；画布只声明骨架输出，
 顶部「监控」只有一张机械臂骨架卡。参数继续后台发布并包含在读取结果中。
-控制卡移除 `read` 操作，原控制流程保持原实现；默认「请选择控制动作」为空操作，
+控制卡移除 `read` 操作，默认「请选择控制动作」为空操作，
 必须由用户选择具体控制动作才执行。部署仅叠加独立文件，不修改 runtime 或 Core 源码。
+
+用户最新要求无需请求控制、满足条件直接执行。`direct_control.py` 移除许可菜单及额外确认弹窗，
+每次控制调用内部生成一次性预览并重新校验后执行；保留模式、使能、反馈、故障、限位、
+取消及停止检查，不自动切换模式或使能。许可只在该动作的工作线程内生效，结束立即释放，
+不把共享 `motion_enabled` 打开。监控参数明确显示「直接控制（逐次校验）」。
+按钮调用代表操作者选择执行；旧工作区/接管确认字段在适配器内部传入，软件不检测现场障碍物。
+失能仍需要支撑字段，模式切换仍需要其他控制器已停止字段；使能导致边界修正不会自动授权。
+显式带 `execute=False/True` 的旧客户端保留预览/执行语义。
 
 用户决定暂不实现软件示教，`enter_teaching/exit_teaching` 已从工具列表和控制卡菜单移除，
 旧客户端直接发送这两个动作也会被拒绝。`teaching_control.py` 的候选代码和模拟测试保留作历史参考，
@@ -139,7 +147,7 @@ plugins = add_monitor(existing_build_plugins(config, namespace, ros2), config, r
 忽略 `<visual>`，因此额外导出固定骨架分支，给主要模块画出有体积的轮廓。
 新增分支仅供显示，实际六轴名称、角度映射及运动链保持不变；现场已经显示这些轮廓。
 
-镜像需复制 `monitor.py`、`monitor_bundle.py`、`status_card.py`
+镜像需复制 `monitor.py`、`monitor_bundle.py`、`status_card.py`、`direct_control.py`
 和整个 `resource/` 到 `/work/agilex/piper/`。
 使用现有 ROS/std_msgs 依赖，不新增 Pinocchio、网格、SDK 或前端库。不要直接修改本阶段以外的 shared runtime。
 

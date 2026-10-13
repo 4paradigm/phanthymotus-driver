@@ -29,6 +29,9 @@ class StatusCardTests(unittest.TestCase):
             "oneOf":[{"const":x,"title":x} for x in ['read','info','halt','move_joint']]}},
             "x-action-params":{"read":{},"halt":{}}}}]
         r.dispatch=lambda action,args:{"action":action}
+        r.dispatch_sync=r.dispatch
+        r.require_motion_permission=lambda:None
+        r.worker_context=threading.local()
         return r, connects
 
     def test_manual_read_uses_shared_connection_and_passive_snapshot(self):

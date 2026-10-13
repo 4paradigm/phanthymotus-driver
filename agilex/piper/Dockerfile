@@ -19,7 +19,7 @@ RUN sed '/^piper-sdk @ /d' /work/agilex/piper/requirements.txt > /tmp/piper-depe
 COPY common/ /work/common/
 COPY main.py device.py runtime.py cards.py arm.py control.py mac_can.py camera_capture.py config.yaml driver.yaml /work/agilex/piper/
 COPY monitor.py monitor_bundle.py /work/agilex/piper/
-COPY status_card.py /work/agilex/piper/
+COPY status_card.py direct_control.py /work/agilex/piper/
 COPY resource/ /work/agilex/piper/resource/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 \

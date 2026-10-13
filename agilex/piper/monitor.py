@@ -271,6 +271,8 @@ def monitor_frame(snapshot: Mapping, *, now: float, device_name: str,
         "最近动作结果": _safe_json(snapshot.get("completed_actions", UNAVAILABLE)),
         "读取错误": error or "无",
     }
+    if snapshot.get("control_policy") == "direct_operator":
+        parameters["动作许可"] = "直接控制（逐次校验）"
     mode = snapshot.get("control_mode")
     if isinstance(mode, str) and mode:
         parameters["控制模式"] = next((label for prefix, label in (

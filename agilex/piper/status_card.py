@@ -2,6 +2,7 @@
 from common.vendor_runtime import action_schema, tool
 from agilex.piper.monitor_bundle import read_passive_snapshot
 from agilex.piper.monitor import PiperMonitorPlugin
+from agilex.piper.direct_control import direct_schema, install_direct_control
 import threading
 
 
@@ -109,6 +110,7 @@ class PiperStatusCard:
 def split_status_card(plugins):
     plugins = list(plugins)
     runtime = next(p for p in plugins if hasattr(p, "read_monitor_snapshot") and hasattr(p, "connected"))
+    install_direct_control(runtime)
     original_tools = runtime.get_tools
     original_dispatch = runtime.dispatch
     def get_tools():
@@ -125,7 +127,7 @@ def split_status_card(plugins):
             prop["default"] = "select_action"
             schema.get("x-action-params", {}).pop("read", None)
             schema.setdefault("x-action-params", {})["select_action"] = {"params": [], "description": "请选择控制动作"}
-            definition["description"] = "机械臂控制：许可、待机/CAN、电机、关节、夹爪和停止；先预览再确认。"
+            direct_schema(definition)
         return definitions
     def dispatch(action, args):
         if args.get("_tool_name") == "arm_control" and action == "select_action":
