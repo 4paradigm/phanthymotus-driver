@@ -465,6 +465,8 @@ GRIPPER_POLL_INTERVAL_SECONDS = 0.15
 GRIPPER_POSITION_TOLERANCE = 5
 GRIPPER_PROGRESS_THRESHOLD = 5
 GRIPPER_DEFAULT_STALL_TIMEOUT_SECONDS = 3.0
+GRIPPER_MOVING_MODES = frozenset((4, 5))
+GRIPPER_TERMINAL_MODES = frozenset((1, 2, 3, 6))
 CARTESIAN_STOP_JOIN_MARGIN = 10  # 笛卡尔 stop 等待监控线程收尾的额外余量（秒）
 
 
@@ -510,6 +512,7 @@ class GripperPlugin:
         self._interrupted = set()
         self._worker_thread = None
         self._last_completion = None
+        self._last_state = None
 
     def get_tools(self):
         schema = action_schema(
@@ -563,10 +566,11 @@ class GripperPlugin:
         pass
 
     def stop(self):
-        # SDK 没有夹爪中途停止 API：请求停止时由 worker 把最后
-        # 测得位置重新设为目标，收尾后才允许共享 SDK 连接被上层销毁。
+        # SDK 没有夹爪中途停止 API：请求停止时通知 worker，且只有确认
+        # worker 已结束后才允许共享 SDK 连接被上层销毁。
         self._mark_interrupted()
-        self._wait_for_worker()
+        if not self._wait_for_worker():
+            raise RuntimeError("gripper worker is still active; refusing teardown")
 
     def _mark_interrupted(self):
         with self._action_lock:
@@ -578,22 +582,45 @@ class GripperPlugin:
         thread = self._worker_thread
         if thread is not None and thread.is_alive():
             thread.join(GRIPPER_COMPLETION_TIMEOUT * 2 + GRIPPER_STOP_WAIT_MARGIN)
+        return thread is None or not thread.is_alive()
 
     def dispatch(self, action, args):
         if action == "info":
             with self._action_lock:
                 active = self._active_action_id
                 last_completion = dict(self._last_completion) if self._last_completion else None
+                gripper_state = dict(self._last_state) if self._last_state else None
+            # 空闲时主动刷新；运动期间由 worker 持续更新缓存，避免 info 与一个
+            # 卡住的 SDK 命令争用底层连接锁。
+            if active is None and self.client.connected:
+                try:
+                    gripper_state = self._read_gripper_state()
+                except Exception as exc:
+                    return {
+                        "state": "error",
+                        "active_action_id": active,
+                        "last_completion": last_completion,
+                        "gripper_state": gripper_state,
+                        "state_error": str(exc),
+                    }
             return {
                 "state": "connected" if self.client.connected else "disconnected",
                 "active_action_id": active,
                 "last_completion": last_completion,
+                "gripper_state": gripper_state,
             }
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
             self._mark_interrupted()
-            self._wait_for_worker()
+            if not self._wait_for_worker():
+                with self._action_lock:
+                    active = self._active_action_id
+                return {
+                    "state": "busy",
+                    "active_action_id": active,
+                    "reason": "gripper worker did not stop before the safety deadline",
+                }
             return {"state": "idle"}
         if action != "set_position":
             return None
@@ -637,13 +664,24 @@ class GripperPlugin:
             raise RuntimeError(f"invalid gripper state: {state!r}") from exc
         if not math.isfinite(actual) or not math.isfinite(current_force):
             raise RuntimeError(f"invalid gripper state: {state!r}")
-        return {
+        normalized = {
             **state,
             "actpos": int(round(actual)),
             "current_force": current_force,
             "mode": mode,
             "error": error,
         }
+        with self._action_lock:
+            self._last_state = dict(normalized)
+        return normalized
+
+    @staticmethod
+    def _gripper_is_terminal(state):
+        return state["mode"] in GRIPPER_TERMINAL_MODES or bool(state["error"] & 1)
+
+    def _is_interrupted(self, action_id):
+        with self._action_lock:
+            return action_id in self._interrupted
 
     def _wait_for_gripper(
             self, action_id, target, stall_timeout, deadline, *, allow_interrupt=True):
@@ -653,8 +691,7 @@ class GripperPlugin:
         while True:
             now = time.monotonic()
             error = abs(state["actpos"] - target)
-            with self._action_lock:
-                interrupted = action_id in self._interrupted
+            interrupted = self._is_interrupted(action_id)
             if allow_interrupt and interrupted:
                 return "interrupted", state
             if error <= GRIPPER_POSITION_TOLERANCE:
@@ -664,7 +701,8 @@ class GripperPlugin:
             if best_error - error >= GRIPPER_PROGRESS_THRESHOLD:
                 best_error = error
                 last_progress = now
-            elif now - last_progress >= stall_timeout:
+            elif (state["mode"] not in GRIPPER_MOVING_MODES
+                    and now - last_progress >= stall_timeout):
                 return "stalled", state
             if now >= deadline:
                 return "timed_out", state
@@ -683,78 +721,135 @@ class GripperPlugin:
         try:
             initial = self._read_gripper_state()
             start_position = initial["actpos"]
-            deadline = started + GRIPPER_COMPLETION_TIMEOUT
-            # 非阻塞下发后轮询真实位置，才能区分到位、受阻与超时。
-            # 在调用前即视为可能已下发；SDK 抛错时无法证明控制器未接受命令。
-            command_started = True
-            self.client.command("rm_set_gripper_position", position, False, 1)
-            outcome, terminal = self._wait_for_gripper(
-                action_id, position, stall_timeout, deadline
-            )
-            common = {
-                "requested_position": position,
-                "start_position": start_position,
-                "current_force": terminal["current_force"],
-                "mode": terminal["mode"],
-                "error": terminal["error"],
-                "stall_policy": on_stall,
-                "elapsed_seconds": time.monotonic() - started,
-            }
-            if outcome == "reached":
+            # stop 可能在线程启动后、首条 SDK 命令前到达。此时没有在途动作，
+            # 直接取消即可；绝不能先发送用户目标再尝试恢复。
+            if self._is_interrupted(action_id):
                 safe_terminal = True
-                status, result = "completed", {
-                    **common,
-                    "reason": "target_reached",
-                    "final_position": terminal["actpos"],
+                status, result = "cancelled", {
+                    "reason": "interrupted_before_start",
+                    "requested_position": position,
+                    "start_position": start_position,
+                    "final_position": start_position,
+                    "current_force": initial["current_force"],
+                    "mode": initial["mode"],
+                    "error": initial["error"],
+                    "stall_policy": on_stall,
                     "rollback_succeeded": None,
-                }
-            elif outcome in ("stalled", "interrupted", "timed_out"):
-                blocked_position = terminal["actpos"]
-                recovery_target = (
-                    blocked_position if on_stall == "keep" else start_position
-                )
-                recovery_target = self._safe_gripper_position(recovery_target)
-                # The interrupt selected this recovery; do not let the recovery
-                # wait immediately observe the old interrupt marker again.
-                with self._action_lock:
-                    self._interrupted.discard(action_id)
-                # 重新将当前位置设为目标，可停止位置模式继续向物体顶压。
-                self.client.command("rm_set_gripper_position", recovery_target, False, 1)
-                # 原始 30 秒窗口可能已经耗尽。安全恢复必须拥有独立窗口，且恢复
-                # 完成前继续持有 gripper/motion_gate，不能把仍运动的硬件声明为空闲。
-                recovery_deadline = time.monotonic() + GRIPPER_COMPLETION_TIMEOUT
-                recovery, final = self._wait_for_gripper(
-                    action_id,
-                    recovery_target,
-                    stall_timeout,
-                    recovery_deadline,
-                    allow_interrupt=False,
-                )
-                rollback_succeeded = on_stall == "rollback" and recovery == "reached"
-                handled = recovery == "reached"
-                safe_terminal = handled
-                status = "completed" if handled and outcome != "timed_out" else "failed"
-                if outcome == "interrupted":
-                    reason = "interrupted_kept" if on_stall == "keep" else "interrupted_rolled_back"
-                elif outcome == "timed_out":
-                    reason = "motion_timed_out_kept" if on_stall == "keep" else "motion_timed_out_rolled_back"
-                else:
-                    reason = "motion_stalled_kept" if on_stall == "keep" else "motion_stalled_rolled_back"
-                if not handled:
-                    reason = f"{reason}_failed"
-                result = {
-                    **common,
-                    "reason": reason,
-                    "blocked_position": blocked_position,
-                    "final_position": final["actpos"],
-                    "current_force": final["current_force"],
-                    "mode": final["mode"],
-                    "error": final["error"],
-                    "rollback_succeeded": rollback_succeeded if on_stall == "rollback" else None,
                     "elapsed_seconds": time.monotonic() - started,
                 }
+            else:
+                deadline = started + GRIPPER_COMPLETION_TIMEOUT
+                # 非阻塞下发后轮询真实位置，才能区分到位、受阻与超时。
+                # 在调用前即视为可能已下发；SDK 抛错时无法证明控制器未接受命令。
+                command_started = True
+                self.client.command("rm_set_gripper_position", position, False, 1)
+                outcome, terminal = self._wait_for_gripper(
+                    action_id, position, stall_timeout, deadline
+                )
+                common = {
+                    "requested_position": position,
+                    "start_position": start_position,
+                    "current_force": terminal["current_force"],
+                    "mode": terminal["mode"],
+                    "error": terminal["error"],
+                    "stall_policy": on_stall,
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+                if outcome == "reached":
+                    safe_terminal = True
+                    status, result = "completed", {
+                        **common,
+                        "reason": "target_reached",
+                        "final_position": terminal["actpos"],
+                        "rollback_succeeded": None,
+                    }
+                elif on_stall == "keep":
+                    blocked_position = terminal["actpos"]
+                    final = terminal
+                    # keep 不再把 actpos 重新下发。现场控制器可能在运动完成前
+                    # 持续返回旧位置（常见值为 0/1）；把这个旧值作为新目标正是
+                    # “到达用户位置后又闭合”的原因。若控制器仍报告正在运动，
+                    # 只继续观察到安全终态，期间保持资源锁。
+                    if not self._gripper_is_terminal(final):
+                        _, final = self._wait_for_gripper(
+                            action_id,
+                            position,
+                            stall_timeout,
+                            time.monotonic() + GRIPPER_COMPLETION_TIMEOUT,
+                            allow_interrupt=False,
+                        )
+                    safe_terminal = (
+                        abs(final["actpos"] - position) <= GRIPPER_POSITION_TOLERANCE
+                        or self._gripper_is_terminal(final)
+                    )
+                    if outcome == "interrupted":
+                        reason = "interrupted_kept"
+                        status = "cancelled" if safe_terminal else "error"
+                    elif outcome == "timed_out":
+                        reason = "motion_timed_out_kept"
+                        status = "error"
+                    else:
+                        reason = "motion_stalled_kept"
+                        status = "completed" if safe_terminal else "error"
+                    if not safe_terminal:
+                        reason = f"{reason}_failed"
+                    result = {
+                        **common,
+                        "reason": reason,
+                        "blocked_position": blocked_position,
+                        "final_position": final["actpos"],
+                        "current_force": final["current_force"],
+                        "mode": final["mode"],
+                        "error": final["error"],
+                        "rollback_succeeded": None,
+                        "elapsed_seconds": time.monotonic() - started,
+                    }
+                else:
+                    blocked_position = terminal["actpos"]
+                    recovery_target = self._safe_gripper_position(start_position)
+                    # The interrupt selected this recovery; do not let the recovery
+                    # wait immediately observe the old interrupt marker again.
+                    with self._action_lock:
+                        self._interrupted.discard(action_id)
+                    self.client.command(
+                        "rm_set_gripper_position", recovery_target, False, 1
+                    )
+                    # 原始窗口可能已经耗尽；rollback 使用独立恢复窗口。
+                    recovery, final = self._wait_for_gripper(
+                        action_id,
+                        recovery_target,
+                        stall_timeout,
+                        time.monotonic() + GRIPPER_COMPLETION_TIMEOUT,
+                        allow_interrupt=False,
+                    )
+                    rollback_succeeded = recovery == "reached"
+                    safe_terminal = rollback_succeeded or self._gripper_is_terminal(final)
+                    status = (
+                        "completed"
+                        if rollback_succeeded and outcome != "timed_out"
+                        else "error"
+                    )
+                    if outcome == "interrupted":
+                        reason = "interrupted_rolled_back"
+                    elif outcome == "timed_out":
+                        reason = "motion_timed_out_rolled_back"
+                    else:
+                        reason = "motion_stalled_rolled_back"
+                    if not rollback_succeeded:
+                        reason = f"{reason}_failed"
+                    result = {
+                        **common,
+                        "reason": reason,
+                        "blocked_position": blocked_position,
+                        "final_position": final["actpos"],
+                        "current_force": final["current_force"],
+                        "mode": final["mode"],
+                        "error": final["error"],
+                        "rollback_succeeded": rollback_succeeded,
+                        "elapsed_seconds": time.monotonic() - started,
+                    }
         except Exception as exc:
-            status, result = "failed", {
+            status, result = "error", {
                 "reason": str(exc),
                 "requested_position": position,
                 "start_position": start_position,

@@ -115,6 +115,16 @@ class SDKOwnershipTests(unittest.TestCase):
         self.client.command("rm_set_arm_slow_stop")
         self.robot.rm_set_arm_slow_stop.assert_called_once_with()
 
+    def test_sdk_disconnect_is_refused_while_shared_motion_gate_is_held(self):
+        self.client.motion_gate.acquire()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "arm operation is active"):
+                self.client.stop()
+            self.assertTrue(self.client.connected)
+            self.robot.rm_delete_robot_arm.assert_not_called()
+        finally:
+            self.client.motion_gate.release()
+
     def test_scoped_commands_require_ownership_and_cannot_release_another_owner(self):
         with self.assertRaisesRegex(RuntimeError, "ownership"):
             self.owner.command("rm_movej")

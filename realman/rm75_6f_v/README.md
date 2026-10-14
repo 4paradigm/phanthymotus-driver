@@ -46,20 +46,25 @@ mode, and error feedback. A movement is considered stalled when its distance to
 the target has not improved by at least five position units for
 `stall_timeout_seconds` (default 3 seconds).
 
-Set `on_stall=keep` to replace the unreachable target with the last measured
-position, stopping position control from continuing to push against the object.
-Set `on_stall=rollback` to return to the measured position captured immediately
-before the request. A handled stall is a completed action with reason
+Set `on_stall=keep` to leave the gripper at the controller-reported terminal
+position after an obstruction. It deliberately does not submit the sampled
+`actpos` as a second target: some controller/firmware combinations briefly
+report the old or minimum position while a command is in flight, and replaying
+that stale value can unexpectedly close the gripper. Moving modes 4 and 5 are
+treated as still active; mode 6 or the obstruction error bit is treated as a
+controller-terminal obstruction. Set `on_stall=rollback` to return to the
+measured position captured immediately before the request. A handled stall is a completed action with reason
 `motion_stalled_kept` or `motion_stalled_rolled_back`; the result includes the
 requested, start, blocked, and final positions plus current force, mode, error,
 elapsed time, and rollback outcome. `info` exposes the same terminal result as
-`last_completion`. This is position-mode obstruction handling, not continuous
-force control.
+`last_completion` together with the latest sampled `gripper_state`. This is
+position-mode obstruction handling, not continuous force control.
 
 If an otherwise progressing command exceeds the 30-second overall motion
-window, the same keep/rollback policy is applied with a separate recovery
-window. The gripper and shared arm resource remain locked until that recovery is
-confirmed. If a safe terminal state cannot be verified, the locks remain held
+window, keep continues observing the original command without replaying sampled
+feedback, while rollback gets a separate recovery window. The gripper and
+shared arm resource remain locked until a safe terminal state is confirmed. If
+that state cannot be verified, the locks remain held
 instead of advertising idle hardware while the controller may still be moving;
 operator inspection or a driver restart is then required.
 

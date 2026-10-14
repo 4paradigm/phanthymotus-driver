@@ -306,12 +306,88 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertEqual(320, payload["blocked_position"])
         self.assertEqual(320, payload["final_position"])
         self.assertEqual(
-            [("rm_set_gripper_position", (50, False, 1)),
-             ("rm_set_gripper_position", (320, False, 1))],
+            [("rm_set_gripper_position", (50, False, 1))],
             client.calls,
         )
         self.assertFalse(plugin._gripper_lock.locked())
         self.assertFalse(client.motion_gate.locked())
+
+    def test_keep_never_replays_stale_minimum_position_as_a_new_target(self):
+        class StaleFeedbackClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.calls = []
+
+            def command(client, method, *args):
+                client.calls.append((method, args))
+                return 0
+
+            def call(client, method, *args):
+                # 部分现场固件在动作过程中继续返回旧的最小位置。
+                return {"actpos": 0, "current_force": 0,
+                        "mode": 3, "error": 0}
+
+        client = StaleFeedbackClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda *event: events.append(event)
+        plugin.dispatch("set_position", {
+            "position": 800, "on_stall": "keep",
+            "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+
+        self.assertTrue(self._wait_for(lambda: len(events) == 1))
+        self.assertEqual(
+            [("rm_set_gripper_position", (800, False, 1))], client.calls
+        )
+        self.assertEqual("motion_stalled_kept", events[0][2]["reason"])
+
+    def test_moving_mode_prevents_stale_feedback_from_triggering_false_stall(self):
+        class DelayedFeedbackClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.calls = []
+                self.read_count = 0
+
+            def command(client, method, *args):
+                client.calls.append((method, args))
+                return 0
+
+            def call(client, method, *args):
+                client.read_count += 1
+                if not client.calls or client.read_count < 6:
+                    return {"actpos": 1000, "current_force": 0,
+                            "mode": 4, "error": 0}
+                return {"actpos": 800, "current_force": 0,
+                        "mode": 3, "error": 0}
+
+        client = DelayedFeedbackClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda *event: events.append(event)
+        clock = [0.0]
+
+        def advancing_monotonic():
+            clock[0] += 1.0
+            return clock[0]
+
+        with mock.patch.object(self.device.time, "monotonic", advancing_monotonic), \
+                mock.patch.object(self.device, "GRIPPER_POLL_INTERVAL_SECONDS", 0.001):
+            plugin.dispatch("set_position", {
+                "position": 800, "on_stall": "keep",
+                "stall_timeout_seconds": 0.5, "confirm_motion": True,
+            })
+            self.assertTrue(self._wait_for(lambda: len(events) == 1))
+
+        self.assertEqual("completed", events[0][1])
+        self.assertEqual("target_reached", events[0][2]["reason"])
+        self.assertEqual(
+            [("rm_set_gripper_position", (800, False, 1))], client.calls
+        )
 
     def test_stall_rollback_returns_to_the_measured_start_position(self):
         class ObstructedClient:
@@ -361,22 +437,23 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
                 self.motion_gate = threading.Lock()
                 self.position = 1000
                 self.calls = []
+                self.read_count = 0
+                self.mode = 4
 
             def command(client, method, *args):
                 client.calls.append((method, args))
-                if len(client.calls) == 1:
-                    return 0
-                recovery_started.set()
-                finish_recovery.wait(2.0)
-                client.position = args[0]
                 return 0
 
             def call(client, method, *args):
                 # 原动作持续取得进展，确保走到总超时而不是 stall 分支。
-                if len(client.calls) == 1:
-                    client.position = max(2, client.position - 10)
+                client.read_count += 1
+                client.position = max(2, client.position - 10)
+                if client.read_count >= 16 and not finish_recovery.is_set():
+                    recovery_started.set()
+                    finish_recovery.wait(2.0)
+                    client.mode = 3
                 return {"actpos": client.position, "current_force": 40,
-                        "mode": 6, "error": 0}
+                        "mode": client.mode, "error": 0}
 
         client = SlowlyProgressingClient()
         plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
@@ -409,9 +486,9 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
             self.assertTrue(self._wait_for(lambda: len(events) == 1))
 
         _, status, payload = events[0]
-        self.assertEqual("failed", status)
+        self.assertEqual("error", status)
         self.assertEqual("motion_timed_out_kept", payload["reason"])
-        self.assertEqual(payload["blocked_position"], payload["final_position"])
+        self.assertEqual(1, len(client.calls))
         self.assertFalse(plugin._gripper_lock.locked())
         self.assertFalse(client.motion_gate.locked())
         self.assertIsNone(plugin.dispatch("info", {})["active_action_id"])
@@ -537,8 +614,97 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertFalse(stop_thread.is_alive())
         action_id, status, payload = self.acp_events[0]
         self.assertEqual(started["action_id"], action_id)
-        self.assertEqual("completed", status)
+        self.assertEqual("cancelled", status)
         self.assertEqual("interrupted_kept", payload["reason"])
+
+    def test_stop_before_initial_command_never_sends_requested_target(self):
+        state_read_started = threading.Event()
+        release_state_read = threading.Event()
+
+        class StartupBlockedClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.commands = []
+
+            def call(self, method, *args):
+                state_read_started.set()
+                release_state_read.wait(2.0)
+                return {"actpos": 1000, "current_force": 0,
+                        "mode": 1, "error": 0}
+
+            def command(self, method, *args):
+                self.commands.append((method, args))
+                return 0
+
+        client = StartupBlockedClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda *event: events.append(event)
+        plugin.dispatch("set_position", {
+            "position": 50, "on_stall": "rollback", "confirm_motion": True,
+        })
+        self.assertTrue(state_read_started.wait(1.0))
+
+        stop_result = []
+        stopper = threading.Thread(
+            target=lambda: stop_result.append(plugin.dispatch("stop", {}))
+        )
+        stopper.start()
+        time.sleep(0.05)
+        release_state_read.set()
+        stopper.join(2.0)
+
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual([{"state": "idle"}], stop_result)
+        self.assertEqual([], client.commands)
+        self.assertEqual("cancelled", events[0][1])
+        self.assertEqual("interrupted_before_start", events[0][2]["reason"])
+
+    def test_stop_reports_busy_and_teardown_fails_when_worker_does_not_return(self):
+        command_started = threading.Event()
+        release_command = threading.Event()
+
+        class StuckClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.position = 1000
+
+            def call(self, method, *args):
+                return {"actpos": self.position, "current_force": 0,
+                        "mode": 3, "error": 0}
+
+            def command(self, method, *args):
+                command_started.set()
+                release_command.wait(2.0)
+                self.position = args[0]
+                return 0
+
+        client = StuckClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        plugin._acp_callback = lambda *event: None
+        plugin.dispatch("set_position", {
+            "position": 500, "confirm_motion": True,
+        })
+        self.assertTrue(command_started.wait(1.0))
+
+        with mock.patch.object(self.device, "GRIPPER_COMPLETION_TIMEOUT", 0.01), \
+                mock.patch.object(self.device, "GRIPPER_STOP_WAIT_MARGIN", 0):
+            result = plugin.dispatch("stop", {})
+            self.assertEqual("busy", result["state"])
+            self.assertIsNotNone(result["active_action_id"])
+            with self.assertRaisesRegex(RuntimeError, "refusing teardown"):
+                plugin.stop()
+
+        self.assertTrue(plugin._gripper_lock.locked())
+        self.assertTrue(client.motion_gate.locked())
+        release_command.set()
+        self.assertTrue(self._wait_for(lambda: not plugin._worker_thread.is_alive()))
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
 
     def test_plugin_stop_waits_for_worker_before_teardown(self):
         released = threading.Event()
@@ -579,6 +745,7 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertEqual("connected", info["state"])
         self.assertIn("active_action_id", info)
         self.assertIn("last_completion", info)
+        self.assertEqual(1000, info["gripper_state"]["actpos"])
 
     def test_unknown_action_returns_none(self):
         self.assertIsNone(self.plugin.dispatch("something_else", {}))
