@@ -48,8 +48,8 @@ def test_bundle_exposes_only_one_direction_card(monkeypatch, tmp_path):
     monkeypatch.setattr(direction, 'load_calibration', lambda: {})
     monkeypatch.setattr(direction, 'SETTINGS_PATH', tmp_path / 'settings.json')
     assert bundle.dispatch('sound_direction', {
-        'action': 'config', 'onset_ratio': 2.4})['state'] == 'configured'
-    assert json.loads((tmp_path / 'settings.json').read_text())['onset_ratio'] == 2.4
+        'action': 'config', 'sensitivity': 'low'})['state'] == 'configured'
+    assert json.loads((tmp_path / 'settings.json').read_text())['sensitivity'] == 'low'
     assert bundle.dispatch('sound_direction', {'action': 'info'})['state'] == 'unavailable'
     assert bundle.dispatch('sound_direction', {'action': 'start'})['state'] == 'unavailable'
     assert bundle.dispatch('sound_direction', {'action': 'stop'}) == {'state': 'idle'}
@@ -138,16 +138,17 @@ def test_packaged_robot_calibration_starts_without_machine_override(monkeypatch,
     card.stop()
 
 
-def test_config_saves_existing_field_names_and_rejects_invalid(monkeypatch, tmp_path):
+def test_config_saves_sensitivity_and_rejects_invalid(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     path = tmp_path / 'settings.json'
     monkeypatch.setattr(module, 'SETTINGS_PATH', path)
     card = _card(module)
-    assert card.dispatch('config', {'onset_ratio': 2.4})['state'] == 'configured'
-    assert json.loads(path.read_text())['onset_ratio'] == 2.4
-    assert card.dispatch('config', {'burst_ratio': 0.5})['state'] == 'invalid_parameters'
-    assert json.loads(path.read_text())['onset_ratio'] == 2.4
-    assert card.dispatch('set_parameters', {'onset_ratio': 2.0}) is None
+    assert card.dispatch('config', {'sensitivity': 'low'})['state'] == 'configured'
+    assert json.loads(path.read_text())['sensitivity'] == 'low'
+    assert card.dispatch('config', {'sensitivity': 'turbo'})['state'] == 'invalid_parameters'
+    assert card.dispatch('config', {'update_interval_ms': 50})['state'] == 'invalid_parameters'
+    assert json.loads(path.read_text())['sensitivity'] == 'low'
+    assert card.dispatch('set_parameters', {'sensitivity': 'normal'}) is None
 
 
 def test_config_restarts_worker_and_waits_for_ready(monkeypatch, tmp_path):
@@ -168,7 +169,7 @@ def test_config_restarts_worker_and_waits_for_ready(monkeypatch, tmp_path):
         events.append(('spawn', module.load_parameters()))
         return Process()
     monkeypatch.setattr(module.subprocess, 'Popen', spawn)
-    result = card.dispatch('config', {'onset_ratio': 2.6})
+    result = card.dispatch('config', {'sensitivity': 'low'})
     assert result['state'] == 'configured'
     assert events == ['stop', 'reaped', ('spawn', result['parameters'])]
 
@@ -182,18 +183,18 @@ def test_config_reports_failed_worker_restart(monkeypatch, tmp_path):
     starts = []
     monkeypatch.setattr(card, 'stop', lambda: setattr(card, '_proc', None))
     def restart():
-        starts.append(module.load_parameters()['onset_ratio'])
+        starts.append(module.load_parameters()['sensitivity'])
         if len(starts) == 1:
             raise OSError('spawn failed')
         card._proc = types.SimpleNamespace(poll=lambda: None)
         return True
     monkeypatch.setattr(card, 'start', restart)
-    result = card.dispatch('config', {'onset_ratio': 2.6})
+    result = card.dispatch('config', {'sensitivity': 'low'})
     assert result['state'] == 'error'
-    assert starts == [2.6, 2.0]
-    assert result['running_parameters']['onset_ratio'] == 2.0
-    assert result['file_parameters']['onset_ratio'] == 2.0
-    assert module.load_parameters()['onset_ratio'] == 2.0
+    assert starts == ['low', 'normal']
+    assert result['running_parameters']['sensitivity'] == 'normal'
+    assert result['file_parameters']['sensitivity'] == 'normal'
+    assert module.load_parameters()['sensitivity'] == 'normal'
 
 
 def test_worker_exit_clears_published_direction(monkeypatch):
@@ -280,3 +281,58 @@ def test_stop_publishes_no_event(monkeypatch):
     card = _card(module)
     card.stop()
     assert card._node.published[-1].state == module.SoundDirection.NO_EVENT
+
+
+def test_legacy_settings_file_maps_to_presets(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    path = tmp_path / 'settings.json'
+    monkeypatch.setattr(module, 'SETTINGS_PATH', path)
+
+    legacy = {'onset_level': 10.0, 'onset_ratio': 2.0, 'burst_level': 15.0,
+              'burst_ratio': 4.0, 'update_interval_ms': 100}
+    path.write_text(json.dumps(legacy))
+    assert module.load_parameters() == {'sensitivity': 'normal'}
+
+    path.write_text(json.dumps({**legacy, 'onset_ratio': 2.6}))
+    assert module.load_parameters() == {'sensitivity': 'low'}
+
+    path.write_text(json.dumps({**legacy, 'onset_ratio': 1.5}))
+    assert module.load_parameters() == {'sensitivity': 'high'}
+
+    # 手调过的刷新节流一律丢弃，固定 100ms
+    path.write_text(json.dumps({**legacy, 'update_interval_ms': 50}))
+    assert module.load_parameters() == {'sensitivity': 'normal'}
+    assert module.UPDATE_INTERVAL_MS == 100
+
+    # 迁移不回写盘：文件保持旧格式
+    assert set(json.loads(path.read_text())) == set(legacy)
+
+    # 混键/非法/损坏 -> 新默认
+    path.write_text(json.dumps({'onset_ratio': 2.0, 'sensitivity': 'low'}))
+    assert module.load_parameters() == {'sensitivity': 'normal'}
+    path.write_text('not json')
+    assert module.load_parameters() == {'sensitivity': 'normal'}
+
+
+def test_sensitivity_preset_table_matches_documentation(monkeypatch):
+    module = _load_card(monkeypatch)
+    assert module.DEFAULT_PARAMETERS == {'sensitivity': 'normal'}
+    assert set(module.SENSITIVITY_GATE_PARAMS) == {'high', 'normal', 'low'}
+    assert module.SENSITIVITY_GATE_PARAMS['normal'] == {
+        'onset_level': 10.0, 'onset_ratio': 2.0,
+        'burst_level': 15.0, 'burst_ratio': 4.0}
+    for preset in module.SENSITIVITY_GATE_PARAMS.values():
+        assert set(preset) == {'onset_level', 'onset_ratio', 'burst_level', 'burst_ratio'}
+    assert module.UPDATE_INTERVAL_MS == 100
+
+
+def test_config_rejects_legacy_key_names(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    path = tmp_path / 'settings.json'
+    monkeypatch.setattr(module, 'SETTINGS_PATH', path)
+    card = _card(module)
+    assert card.dispatch('config', {'sensitivity': 'normal'})['state'] == 'configured'
+    for legacy_key, value in [('onset_ratio', 2.4), ('burst_ratio', 0.5),
+                              ('update_interval_ms', 50), ('onset_level', 12.0)]:
+        assert card.dispatch('config', {legacy_key: value})['state'] == 'invalid_parameters'
+    assert json.loads(path.read_text()) == {'sensitivity': 'normal'}

@@ -23,11 +23,18 @@ from sound_direction import MAX_BASIS_CONDITION, SoundActivityGate, estimate_ang
 CALIBRATION_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_calibration.json")
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "resource/sound_direction_calibration.json"
 SETTINGS_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_settings.json")
-DEFAULT_PARAMETERS = {
-    "onset_level": 10.0, "onset_ratio": 2.0,
-    "burst_level": 15.0, "burst_ratio": 4.0,
-    "update_interval_ms": 100,
+DEFAULT_PARAMETERS = {"sensitivity": "normal"}
+# 门限档位含义由本表定义，与用户面板解耦；面板只有「灵敏度」一个旋钮。
+# normal 档逐值等于历史默认（burst_ratio 已按操作者决定提至 4.0）。
+SENSITIVITY_GATE_PARAMS = {
+    "high":   {"onset_level": 8.0,  "onset_ratio": 1.6, "burst_level": 12.0, "burst_ratio": 3.2},
+    "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
+    "low":    {"onset_level": 15.0, "onset_ratio": 2.5, "burst_level": 25.0, "burst_ratio": 5.0},
 }
+# 方向刷新节流固定现行默认 100ms，不再暴露给操作者（操作者决定 2026-10-14）。
+UPDATE_INTERVAL_MS = 100
+_LEGACY_KEYS = ("onset_level", "onset_ratio", "burst_level", "burst_ratio",
+                "update_interval_ms")
 _QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -55,15 +62,32 @@ def load_calibration() -> dict:
 
 
 def _valid_parameter(name: str, value) -> bool:
-    if name == "update_interval_ms":
-        return type(value) is int and 50 <= value <= 1000
-    if type(value) not in (int, float) or not math.isfinite(value):
-        return False
-    if name in ("onset_level", "burst_level"):
-        return 1 <= value <= 1000
-    if name in ("onset_ratio", "burst_ratio"):
+    return name in DEFAULT_PARAMETERS and value in SENSITIVITY_GATE_PARAMS
+
+
+def _migrate_legacy(saved: dict) -> dict | None:
+    """Map a legacy 5-key settings file onto presets in memory; never written back."""
+    if set(saved) != set(_LEGACY_KEYS):
+        return None
+
+    def legacy_ok(key, value) -> bool:
+        if key == "update_interval_ms":
+            return type(value) is int and 50 <= value <= 1000
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return False
+        if key in ("onset_level", "burst_level"):
+            return 1 <= value <= 1000
         return 1.05 <= value <= 10
-    return False
+
+    if any(not legacy_ok(key, saved[key]) for key in _LEGACY_KEYS):
+        return None
+    # 就近归档到三档灵敏度；update_interval_ms 丢弃，刷新固定 100ms。
+    ratio = saved["onset_ratio"]
+    if ratio <= 1.75:
+        return {"sensitivity": "high"}
+    if ratio < 2.25:
+        return {"sensitivity": "normal"}
+    return {"sensitivity": "low"}
 
 
 def load_parameters() -> dict:
@@ -71,10 +95,13 @@ def load_parameters() -> dict:
         saved = json.loads(SETTINGS_PATH.read_text())
     except Exception:
         return DEFAULT_PARAMETERS.copy()
-    if (not isinstance(saved, dict) or saved.keys() != DEFAULT_PARAMETERS.keys()
-            or any(not _valid_parameter(key, value) for key, value in saved.items())):
+    if not isinstance(saved, dict):
         return DEFAULT_PARAMETERS.copy()
-    return saved
+    if set(saved) == set(DEFAULT_PARAMETERS):
+        if all(_valid_parameter(key, value) for key, value in saved.items()):
+            return dict(saved)
+        return DEFAULT_PARAMETERS.copy()
+    return _migrate_legacy(saved) or DEFAULT_PARAMETERS.copy()
 
 
 def activity_payload(audio, calibration, audio_window, published_us) -> SoundDirection | None:
@@ -119,8 +146,7 @@ def _direction_subprocess(namespace: str) -> None:
     recent_audio = deque(maxlen=8)
     recent_capture_us = deque(maxlen=8)
     parameters = load_parameters()
-    gate = SoundActivityGate(**{key: parameters[key] for key in (
-        "onset_level", "onset_ratio", "burst_level", "burst_ratio")})
+    gate = SoundActivityGate(**SENSITIVITY_GATE_PARAMS[parameters["sensitivity"]])
     # SDK 和 ROS 发布器都就绪后，才允许控制卡报告配置成功。
     print(_READY_LINE, flush=True)
     next_check = 0.0
@@ -157,7 +183,7 @@ def _direction_subprocess(namespace: str) -> None:
                 continue
             if time.monotonic() < next_check:
                 continue
-            next_check = time.monotonic() + parameters["update_interval_ms"] / 1000
+            next_check = time.monotonic() + UPDATE_INTERVAL_MS / 1000
             valid_clock = all(capture for capture, _ in recent_capture_us)
             result = activity_payload(
                 np.concatenate(tuple(recent_audio)), load_calibration(),
@@ -214,17 +240,19 @@ class SoundDirectionPlugin:
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["info", "start", "stop"]}}},
             "configSchema": {"type": "object", "properties": {
-                "onset_level": {"type": "number", "minimum": 1, "maximum": 1000,
-                                "default": 10, "scope": "shared"},
-                "onset_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
-                                "default": 2.0, "scope": "shared"},
-                "burst_level": {"type": "number", "minimum": 1, "maximum": 1000,
-                                "default": 15, "scope": "shared"},
-                "burst_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
-                                "default": 4.0, "scope": "shared"},
-                "update_interval_ms": {"type": "integer", "minimum": 50,
-                                       "maximum": 1000, "default": 100,
-                                       "scope": "shared"}}},
+                "sensitivity": {
+                    "type": "string", "title": "灵敏度",
+                    "default": "normal", "scope": "shared",
+                    "oneOf": [
+                        {"const": "high",   "title": "高：安静房间 / 轻声说话也要识别"},
+                        {"const": "normal", "title": "中：普通室内（默认）"},
+                        {"const": "low",    "title": "低：嘈杂环境 / 只需大声说话"},
+                    ],
+                    "description": (
+                        "多大声会被当成有人说话。轻声说话经常没反应选「高」；"
+                        "环境动静大、一点声音就出方向选「低」。"
+                    ),
+                }}},
             "topic_out": [{"topic": self._topic, "format": "sensor/sound-direction"}],
         }
 

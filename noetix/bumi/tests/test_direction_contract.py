@@ -13,8 +13,12 @@ def test_only_sensor_card_and_shared_settings(monkeypatch):
     assert [tool['name'] for tool in card.get_tools()] == ['sound_direction']
     tool = card.get_tool()
     assert tool['topic_out'][0]['format'] == 'sensor/sound-direction'
+    assert set(tool['configSchema']['properties']) == {'sensitivity'}
     assert set(tool['configSchema']['properties']) == set(module.DEFAULT_PARAMETERS)
     assert all(field['scope'] == 'shared' for field in tool['configSchema']['properties'].values())
+    sensitivity = tool['configSchema']['properties']['sensitivity']
+    assert sensitivity['oneOf'] and all('title' in item for item in sensitivity['oneOf'])
+    assert sensitivity.get('description')
     assert tool['inputSchema']['properties']['action']['enum'] == ['info', 'start', 'stop']
 
 
