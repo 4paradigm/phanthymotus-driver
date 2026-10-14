@@ -151,6 +151,20 @@ def _encode_cloud(msg):
     return out
 
 
+def _check_image_dependencies():
+    """Fail before announcing relay readiness if host image codecs are absent."""
+    try:
+        import cv2
+        import numpy
+    except ImportError as exc:
+        raise RuntimeError(
+            "host Python is missing numpy/OpenCV; the container's pip packages "
+            "are not visible to the host-root Jazzy relay") from exc
+    cv2.setNumThreads(1)
+    print(f"[relay] host image dependencies ready numpy={numpy.__version__} "
+          f"opencv={cv2.__version__}", flush=True)
+
+
 def _media_one(key, topic, msg_type, node=None, publisher=None, callback_group=None):
     """Subscribe and convert one raw stream in one Jazzy process.
 
@@ -213,11 +227,6 @@ def _media_all():
     from std_msgs.msg import UInt8MultiArray
 
     rclpy.init()
-    try:
-        import cv2
-        cv2.setNumThreads(1)
-    except Exception:
-        pass
     node = Node("a3_jazzy_media_relay")
     group = ReentrantCallbackGroup()
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -371,6 +380,7 @@ def _output_one(key, messages):
 
 
 def main():
+    _check_image_dependencies()
     _media_all()
 
 

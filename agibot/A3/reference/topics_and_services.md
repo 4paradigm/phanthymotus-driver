@@ -101,17 +101,26 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 - The A3's 12 leg joints: no dev-interface topic exposes them individually
   (naming is internal to the MC firmware), so they appear in the URDF only.
 
-## Wheel / vendor artifacts (NOT vendored in this repo)
+## Runtime packaging and relay prerequisites
 
-- `prebuilt/a3_aimdk-3.1.0-py3-none-any.whl` — protobuf definitions
-  (`aimdk.protocol_pb2`). Ships in the robot's AimDK 开发包 (dev kit); the image
-  CMD pip-installs it from the `/agibot-devkit` mount at container start.
-- `prebuilt/ros2_plugin_proto_aarch64/` — the ROS 2 interface package providing
-  `ros2_plugin_proto/msg/RosMsgWrapper`; its `local_setup.bash` is sourced by the
-  image CMD from the same mount.
-- Without these the driver degrades gracefully: pb payloads fall back to JSON
-  bytes in `RosMsgWrapper.data`, and the pb-decoded stream cards
-  (battery/estop + skill_play's `state` query) are withheld.
+- The A3 AimDK 3.2 wheel is fetched from the project COS URL during the Docker
+  build (`A3_AIMDK_URL`) and SHA-256 verified (`A3_AIMDK_SHA256`); it is
+  installed into the image, not downloaded from `/agibot-devkit` at startup.
+- `audio_msgs` and `ros2_plugin_proto` are built from this source tree into
+  `/tmp/a3_ws/install`. The container starts with the Humble setup and this
+  generated overlay. The `/agibot-devkit` mount remains a host development-kit
+  mount; it is not the source of the wheel or these generated interfaces.
+- The host-side Jazzy media relay is launched through `nsenter` with the host's
+  `/usr/bin/python3` and `/opt/ros/jazzy`. Its Python environment is separate
+  from the container: camera/depth conversion additionally requires host
+  `numpy` and `opencv-python`. Relay startup checks and logs these imports and
+  versions before reporting readiness; container pip packages do not satisfy
+  host Python imports.
+- Without the wheel or generated ROS interfaces in the container, the driver
+  degrades gracefully: protobuf-backed battery/estop streams and wrapped
+  command cards are unavailable. Without the host relay image dependencies,
+  camera/depth conversion cannot run and the relay reports the missing modules
+  in its host relay log.
 
 ## URDF
 

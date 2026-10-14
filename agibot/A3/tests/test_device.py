@@ -21,6 +21,7 @@ import threading
 import time
 import types
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 DEVICE_DIR = Path(__file__).resolve().parent.parent
@@ -2516,6 +2517,13 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertIn('name="R_thumb_roll_joint"', urdf)
         self.assertNotIn("left_hand_channel_", urdf)
         self.assertIn('mimic joint="L_thumb_mcp_joint" multiplier="1.33"', urdf)
+
+    def test_o10_hand_mount_aligns_fingers_with_a3_wrist_forward_axis(self):
+        root = ET.parse(device.RESOURCE_DIR / "a3_o10_hand.urdf").getroot()
+        for name in ("L_palm_joint", "R_palm_joint"):
+            origin = root.find(f"joint[@name='{name}']/origin")
+            self.assertIsNotNone(origin)
+            self.assertEqual(origin.attrib["rpy"], "0 1.5707963 0")
 
     def test_skeleton_maps_right_o10_channels_with_official_signs(self):
         msg = types.SimpleNamespace(
