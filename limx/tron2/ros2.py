@@ -1,6 +1,7 @@
 """Publish sensor JSON and three RGB JPEG streams to Motus's loopback ROS2 bus."""
 import json
 import os
+import re
 from pathlib import Path
 
 IMAGE_FRAMES = {'/limx_tron2/camera': 'tron2_head_camera',
@@ -13,9 +14,10 @@ class JsonPublisher:
         profile = os.environ.get('FASTRTPS_DEFAULT_PROFILES_FILE', '')
         if not profile or not Path(profile).is_file():
             raise ValueError('Mount the Core DDS profile before starting this sensor driver')
-        if os.environ.get('ROS_DOMAIN_ID') != '42' or \
+        domain = os.environ.get('ROS_DOMAIN_ID', '')
+        if not re.fullmatch(r'0|[1-9][0-9]{0,2}', domain) or int(domain) > 232 or \
                 os.environ.get('RMW_IMPLEMENTATION') != 'rmw_fastrtps_cpp':
-            raise ValueError('Motus sensor bus requires ROS_DOMAIN_ID=42 and FastDDS')
+            raise ValueError('Motus sensor bus requires a valid ROS_DOMAIN_ID (0..232) matching Core and FastDDS')
         # The profile must be authoritative even if an inherited base env sets this.
         os.environ.pop('FASTDDS_BUILTIN_TRANSPORTS', None)
         import rclpy

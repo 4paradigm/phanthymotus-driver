@@ -63,9 +63,9 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'arm_control'} | set(CAMERA_SOURCES)
+    allowed = {'joint_state', 'arm_control', 'gripper'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
-        raise ValueError('Only TRON2 sensor and arm_control plugins may be configured')
+        raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
     for name, value in plugins.items():
         if not isinstance(value, dict) or type(value.get('enabled')) is not bool:
@@ -124,6 +124,7 @@ async def run():
             finally:
                 await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
                 await adapter.motion.close()
+                await adapter.gripper.close()
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)

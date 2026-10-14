@@ -83,10 +83,14 @@ class RobotReader:
         self.last_round_trip = None
         self.ws = None
         self.move_pending = None
+        self.gripper_pending = {}
 
     def disconnect(self, reason):
         self.connected = False
         self.ws = None
+        for _, future in self.gripper_pending.values():
+            if not future.done():
+                future.set_exception(MoveError('夹爪连接中断，结果未确认；不会自动重发', None))
         if self.move_pending:
             future = self.move_pending[1]
             if not future.done():
@@ -125,6 +129,13 @@ class RobotReader:
         body = json.loads(msg.data, parse_constant=reject_constant)
         if not isinstance(body, dict):
             raise ValueError('Expected robot JSON object')
+        pending = self.gripper_pending.get(body.get('guid'))
+        if pending and body.get('accid') == self.serial:
+            expected, future = pending
+            if not future.done() and body.get('title') == expected:
+                future.set_result(body.get('data'))
+            elif not future.done() and body.get('title') == 'notify_invalid_request':
+                future.set_result({'result': 'fail_invalid_cmd'})
         if self.move_pending and body.get('guid') == self.move_pending[0] \
                 and body.get('accid') == self.serial:
             future = self.move_pending[1]
@@ -198,6 +209,56 @@ class RobotReader:
                 future.cancel()
             elif not future.cancelled():
                 future.exception()  # retrieve a disconnect exception even if send failed
+
+    async def _gripper_request(self, title, data, motion):
+        if (motion is True and title != 'request_set_limx_2fclaw_cmd') or \
+                (motion is False and (title != 'request_get_limx_2fclaw_state' or data != {})) or type(motion) is not bool:
+            raise MoveError('不支持的夹爪协议请求', False)
+        if not self.connected or self.ws is None or self.ws.closed or not self.serial:
+            raise MoveError('机器人未连接，未发送夹爪指令', False)
+        ws, serial = self.ws, self.serial
+        guid = str(uuid.uuid4())
+        future = asyncio.get_running_loop().create_future()
+        self.gripper_pending[guid] = (title.replace('request_', 'response_', 1), future)
+        sent = False
+        try:
+            try:
+                await asyncio.wait_for(ws.send_json({'title': title, 'accid': serial, 'guid': guid,
+                    'timestamp': int(time.time() * 1000), 'data': data}), 5)
+                sent = True
+                reply = await asyncio.wait_for(future, self.settings['response_timeout_seconds'])
+            except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise MoveError('夹爪请求结果未确认；不会自动重发', (True if sent else None) if motion else False) from exc
+            if self.ws is not ws or self.serial != serial or not self.connected:
+                raise MoveError('机器人连接已改变，夹爪结果未确认', True if motion else False)
+            if not isinstance(reply, dict) or reply.get('result') != 'success':
+                raise MoveError('厂家拒绝夹爪请求或报告电机故障', True if motion else False, 'vendor_rejected')
+            return reply
+        finally:
+            self.gripper_pending.pop(guid, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
+
+    async def read_gripper(self):
+        return await self._gripper_request('request_get_limx_2fclaw_state', {}, False)
+
+    async def send_gripper(self, data):
+        # This private transport accepts exactly one validated side, never a generic vendor command.
+        from gripper import percentage
+        keys = set(data) if isinstance(data, dict) else set()
+        sides = [side for side in ('left', 'right') if keys == {side + '_' + key for key in ('opening', 'speed', 'force')}]
+        if len(sides) != 1:
+            raise MoveError('夹爪参数必须只包含所选侧', False)
+        for key, value in data.items():
+            percentage(value, key)
+        if data[sides[0] + '_speed'] == 0:
+            raise MoveError('开合速度须大于0', False)
+        status = self.sample('robot_status')
+        if not status['available'] or status['data'].get('working_mode') != 'developer_mode' or status['data'].get('working_mode_valid') is not True:
+            raise MoveError('需要机器人处于上层开发模式且状态反馈有效，未发送夹爪指令', False)
+        return await self._gripper_request('request_set_limx_2fclaw_cmd', data, True)
 
     def sample(self, name):
         if name not in ('joint_state', 'robot_status'):
