@@ -355,6 +355,9 @@ class LocoPlugin:
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
+        # loco_destination rotate bookkeeping, read by _rotate_status.
+        self._rotate_lock = threading.Lock()
+        self._rotate_state: dict = {"state": "idle", "last_result": None}
 
     def get_tools(self) -> list:
         return [
@@ -629,6 +632,22 @@ class LocoPlugin:
         return {"state": "stopped"}
 
     def _do_rotate(self, args: dict) -> dict:
+        # Bookkeeping wrapper: mark running on entry; on every completed path
+        # (done/timeout/stopped/error) record idle + the full result so
+        # _rotate_status can report the last real outcome.
+        with self._rotate_lock:
+            self._rotate_state["state"] = "running"
+        result = None
+        try:
+            result = self._do_rotate_impl(args)
+            return result
+        finally:
+            with self._rotate_lock:
+                self._rotate_state["state"] = "idle"
+                if result is not None:
+                    self._rotate_state["last_result"] = result
+
+    def _do_rotate_impl(self, args: dict) -> dict:
         # 1. Validate the requested angle before touching hardware.
         raw_angle = args.get("angle_deg")
         try:
@@ -748,8 +767,9 @@ class LocoPlugin:
         }
 
     def _rotate_status(self) -> dict:
-        # Placeholder: real status (running / last_result) lands in Task 4.
-        return {"state": "idle"}
+        with self._rotate_lock:
+            return {"state": self._rotate_state["state"],
+                    "last_result": self._rotate_state["last_result"]}
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)

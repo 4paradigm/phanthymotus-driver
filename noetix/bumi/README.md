@@ -139,6 +139,30 @@ play-teach mode and confirms the return to walking.
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
 unexposed.
 
+### `loco_destination`
+
+A motion card on the `loco` plugin: turn-in-place to a heading target. A
+50 Hz closed loop reads IMU yaw, drives `vyaw` with a P-term that caps to
+slower speeds as the error shrinks, and brakes to zero velocity once the
+robot settles — the closed-loop answer to `loco`'s open-loop `move`, where
+velocity × duration leaves the actual turn to ground slip and payload and
+reports nothing back. `loco_destination` measures where the robot really
+turned instead.
+
+- Actions and parameters: `rotate angle_deg` blocks until the robot settles,
+  is stopped or times out; `angle_deg` spans −360 to 360 degrees (positive =
+  counter-clockwise/left) and requires walking mode, flat non-slip ground and
+  at least 1 m clearance. `stop_move` brakes an active rotation immediately
+  (also the `on_interrupt_motion` hook). `status` reports `idle`/`running`
+  plus `last_result`, the full result of the most recent completed rotation.
+- Tolerance: `done` requires the heading error inside ±2° while yaw is nearly
+  still; requests beyond ±150° run as chained absolute sub-targets so the
+  whole request still holds the ±2° window. Timeout and stopped exits brake
+  first and still report the actually turned degrees and final error.
+- No distance feedback: the card consumes IMU heading only and reports
+  angles, never meters. Translational/leg-odometry distance feedback is not
+  included in Phase 2 either.
+
 ## `speaker`
 
 Plays the PCM audio of its connected input topic (`audio_msgs/AudioChunk`, mono

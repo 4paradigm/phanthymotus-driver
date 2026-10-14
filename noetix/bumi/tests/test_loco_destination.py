@@ -1,11 +1,14 @@
 """Angle math, control law, and closed-loop rotate for the Bumi loco_destination card."""
 
+import __future__
 import importlib.util
 import sys
 import threading
 import time
 import types
 from pathlib import Path
+
+import yaml
 
 
 def _load_device(monkeypatch):
@@ -279,3 +282,83 @@ def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):
     assert -66 <= result['turned_deg'] <= -54
     assert abs(result['final_error_deg']) <= 2.0
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
+
+
+# ── status 真值 / driver.yaml 注册 ────────────────────────────────────────────
+
+def test_status_reflects_last_rotate_result(monkeypatch):
+    # status 必须给真值：idle 时带前次 rotate 的完整 result（缺失 last_result 即失败），
+    # rotate 在另一线程进行中时报 running；stopped 退出同样要记录进 last_result。
+    module, _ = _load_device(monkeypatch)
+
+    idle_plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl(gain_deg_per_tick=3.0))
+    assert idle_plugin.dispatch(
+        'status', {'_tool_name': 'loco_destination'}
+    ) == {"state": "idle", "last_result": None}         # 初始：无前次结果
+
+    result = idle_plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    assert result['state'] == 'done'
+    assert idle_plugin.dispatch(
+        'status', {'_tool_name': 'loco_destination'}
+    ) == {"state": "idle", "last_result": result}       # 与前次 rotate 完全一致
+
+    # 另一线程跑 150°（gain=1 转不完），主线程轮询到 running 再断言。
+    run_plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl(gain_deg_per_tick=1.0))
+    box = {}
+
+    def _run():
+        box['result'] = run_plugin.dispatch(
+            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    status = None
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        status = run_plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+        if status['state'] == 'running':
+            break
+        time.sleep(0.01)
+    assert status['state'] == 'running'                 # 进行中必须报 running
+    assert status['last_result'] is None                # 尚无完成记录
+
+    run_plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    final = run_plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+    assert final['state'] == 'idle'
+    assert final['last_result'] is not None             # stopped 退出也记录 last_result
+    assert final['last_result']['state'] == 'stopped'
+
+
+def test_bundle_exposes_loco_destination_card(monkeypatch, tmp_path):
+    # 按 test_direction_card 的 bundle 装配法（该文件不在本分支）：以 Task 1 的
+    # _load_device 脚手架加载 device/main，BumiDeviceBundle 只启用 loco 插件。
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setitem(sys.modules, 'device', module)  # main.py: from device import ...
+    monkeypatch.setitem(sys.modules, 'rclpy.executors', types.ModuleType('rclpy.executors'))
+    # 避免真实 common.logsafe.install() 在测试进程里替换 sys.stdout/stderr
+    monkeypatch.setitem(sys.modules, 'common', types.ModuleType('common'))
+
+    main_path = Path(__file__).resolve().parents[1] / 'main.py'
+    spec = importlib.util.spec_from_file_location('bumi_main_loco_destination_test', main_path)
+    main = importlib.util.module_from_spec(spec)
+    # main.py 内联 `dict | None` 注解但无 __future__ annotations；本机 Python 3.9
+    # 在类定义处会立刻求值并报 TypeError（机器人镜像是 3.10+）。按
+    # tests/test_go2_remote_controller.py 的做法以 annotations 标志编译，运行时
+    # 行为不变（注解仅延迟为字符串）。
+    exec(compile(main_path.read_text(), str(main_path), 'exec',
+                 flags=__future__.annotations.compiler_flag),
+         main.__dict__)
+
+    bundle = main.BumiDeviceBundle(
+        {'plugins': {'loco': {'enabled': True}}},
+        'robot', types.SimpleNamespace(add_node=lambda n: None),
+        FakeHighCtrl(), media_ctrl=None)
+    names = [t['name'] for t in bundle.get_all_tools()]
+    assert 'loco_destination' in names                   # bundle 对外暴露该卡
+
+    driver = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / 'driver.yaml').read_text())
+    assert {'name': 'loco_destination', 'type': 'actuator'} in driver['cards']
