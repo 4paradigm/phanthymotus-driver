@@ -285,11 +285,11 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
     import time
     import urllib.request
 
-    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    url = os.environ.get("AGENT_CORE_URL", "http://127.0.0.1:15678")
     payload = json.dumps({
         "id": driver_id,
         "name": config.get("name", driver_id),
-        "url": f"http://localhost:{port}/mcp",
+        "url": f"http://127.0.0.1:{port}/mcp",
         "transport": "http",
         "category": "driver",
     }).encode()
