@@ -56,6 +56,13 @@ elapsed time, and rollback outcome. `info` exposes the same terminal result as
 `last_completion`. This is position-mode obstruction handling, not continuous
 force control.
 
+If an otherwise progressing command exceeds the 30-second overall motion
+window, the same keep/rollback policy is applied with a separate recovery
+window. The gripper and shared arm resource remain locked until that recovery is
+confirmed. If a safe terminal state cannot be verified, the locks remain held
+instead of advertising idle hardware while the controller may still be moving;
+operator inspection or a driver restart is then required.
+
 ## Upper-computer RealSense camera
 
 The camera is connected to the Linux upper computer that runs this Driver,

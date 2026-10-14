@@ -350,6 +350,95 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertEqual(987, payload["final_position"])
         self.assertTrue(payload["rollback_succeeded"])
 
+    def test_total_timeout_keeps_resource_owned_until_safe_recovery_finishes(self):
+        recovery_started = threading.Event()
+        finish_recovery = threading.Event()
+
+        class SlowlyProgressingClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.position = 1000
+                self.calls = []
+
+            def command(client, method, *args):
+                client.calls.append((method, args))
+                if len(client.calls) == 1:
+                    return 0
+                recovery_started.set()
+                finish_recovery.wait(2.0)
+                client.position = args[0]
+                return 0
+
+            def call(client, method, *args):
+                # 原动作持续取得进展，确保走到总超时而不是 stall 分支。
+                if len(client.calls) == 1:
+                    client.position = max(2, client.position - 10)
+                return {"actpos": client.position, "current_force": 40,
+                        "mode": 6, "error": 0}
+
+        client = SlowlyProgressingClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda *event: events.append(event)
+        clock = [0.0]
+
+        def advancing_monotonic():
+            clock[0] += 2.0
+            return clock[0]
+
+        with mock.patch.object(self.device.time, "monotonic", advancing_monotonic), \
+                mock.patch.object(self.device, "GRIPPER_POLL_INTERVAL_SECONDS", 0.001):
+            started = plugin.dispatch("set_position", {
+                "position": 1, "on_stall": "keep",
+                "stall_timeout_seconds": 30, "confirm_motion": True,
+            })
+            self.assertTrue(recovery_started.wait(1.0))
+            self.assertTrue(plugin._gripper_lock.locked())
+            self.assertTrue(client.motion_gate.locked())
+            self.assertEqual(
+                started["action_id"], plugin.dispatch("info", {})["active_action_id"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "another gripper motion is active"):
+                plugin.dispatch("set_position", {
+                    "position": 500, "confirm_motion": True,
+                })
+
+            finish_recovery.set()
+            self.assertTrue(self._wait_for(lambda: len(events) == 1))
+
+        _, status, payload = events[0]
+        self.assertEqual("failed", status)
+        self.assertEqual("motion_timed_out_kept", payload["reason"])
+        self.assertEqual(payload["blocked_position"], payload["final_position"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+        self.assertIsNone(plugin.dispatch("info", {})["active_action_id"])
+
+    def test_invalid_or_non_finite_gripper_feedback_is_rejected(self):
+        invalid_states = (
+            None,
+            {},
+            {"actpos": "invalid"},
+            {"actpos": float("nan")},
+            {"actpos": 500, "current_force": float("inf")},
+        )
+        for state in invalid_states:
+            with self.subTest(state=state):
+                self.client.call = mock.Mock(return_value=state)
+                with self.assertRaisesRegex(RuntimeError, "invalid gripper state"):
+                    self.plugin._read_gripper_state()
+
+    def test_non_stall_gripper_error_is_rejected(self):
+        self.client.call = mock.Mock(return_value={
+            "actpos": 700, "current_force": 10, "mode": 6, "error": 2,
+        })
+        with self.assertRaisesRegex(RuntimeError, "gripper error 0x2"):
+            self.plugin._wait_for_gripper(
+                "error-action", 500, 0.5, time.monotonic() + 1.0
+            )
+
     def test_gripper_completion_posts_bounded_stall_details(self):
         result = {
             "reason": "motion_stalled_kept",
