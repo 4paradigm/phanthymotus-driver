@@ -129,7 +129,12 @@ class LocoRelativeMovePlugin:
     def dispatch(self, action, args):
         if action == "start":
             return {"state": "ready"}
-        if action in ("stop", "stop_move"):
+        if action == "stop":
+            # Lifecycle state is separate from the physical stop acknowledgement.
+            # Retain any stop failure internally to prevent another movement.
+            self.cancel_and_stop()
+            return {"state": "idle"}
+        if action == "stop_move":
             return self.cancel_and_stop()
         if action != "move":
             return {"error": f"Unknown loco_relative_move action: {action}"}

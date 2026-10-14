@@ -126,6 +126,31 @@ class TestLocoRelativeMove(unittest.TestCase):
         self.assertEqual(backend.stop_count, 1)
         self.assertEqual(notices[0][0][1], 'cancelled')
 
+    def test_lifecycle_stop_cancels_sequence_and_returns_idle(self):
+        for stop_ret in (0, 3104):
+            with self.subTest(stop_ret=stop_ret):
+                point, backend, notices, done = self.setup_point()
+                backend.status = 'pending'
+                backend.stop_ret = stop_ret
+                point.dispatch('move', dict(x=0.3, y=0.3, angle=90))
+                self.assertTrue(backend.sent.wait(2))
+                self.assertEqual(point.dispatch('stop', {}), {'state': 'idle'})
+                self.assertTrue(done.wait(2))
+                self.assertEqual(backend.stop_count, 1)
+                self.assertEqual(len(backend.calls), 1)
+                self.assertEqual(notices[0][0][1], 'cancelled' if stop_ret == 0 else 'error')
+                self.assertEqual(point.faulted, stop_ret != 0)
+                if stop_ret != 0:
+                    self.assertIn('error', point.dispatch('move', dict(x=0.3)))
+
+    def test_idle_lifecycle_stop_returns_idle_but_operational_stop_preserves_failure(self):
+        point, backend, _, _ = self.setup_point()
+        backend.stop_ret = 3104
+        self.assertEqual(point.dispatch('stop', {}), {'state': 'idle'})
+        self.assertTrue(point.faulted)
+        self.assertEqual(point.dispatch('stop_move', {})['ret'], 3104)
+        self.assertEqual(backend.stop_count, 2)
+
     def test_failed_cancel_stop_reports_error(self):
         point, backend, notices, done = self.setup_point()
         backend.status = 'pending'
