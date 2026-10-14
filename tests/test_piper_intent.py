@@ -93,7 +93,7 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(tools['model']['type'], 'resource')
         actions = tools['arm_control']['inputSchema']['properties']['action']['enum']
         self.assertEqual(set(actions) - {'start', 'stop', 'info', 'select_action'},
-                         {'move', 'stop_motion', 'open_gripper', 'close_gripper', 'set_gripper_opening',
+                         {*('move_' + d for d in DIRECTIONS), 'stop_motion', 'open_gripper', 'close_gripper', 'set_gripper_opening',
                           'exit_teaching_and_hold'})
         self.assertEqual(tools['arm_control']['topic_out'][0]['topic'], '/agilex/piper/state/joints')
         self.assertFalse(self.call('select_action')['executed'])
@@ -110,7 +110,7 @@ class IntentTests(unittest.TestCase):
             with self.subTest(direction=direction):
                 self.sdk.pose = (200000, 0, 250000, 180000, 0, 90000)
                 self.sdk.calls.clear()
-                result = self.call('move', direction=direction, distance_mm=1, speed_percent=1)
+                result = self.call('move_' + direction)
                 expected = tuple(a + int(1000 * d) for a, d in zip((200000, 0, 250000), vector)) + (180000, 0, 90000)
                 targets = [c[1] for c in self.sdk.calls if c[0] == 'end_pose']
                 self.assertTrue(targets)
@@ -120,10 +120,10 @@ class IntentTests(unittest.TestCase):
                 self.assertFalse(any(c[0] in ('prepare', 'enable_arm', 'joints') for c in self.sdk.calls))
                 self.assertFalse(self.runtime.motion_enabled)
 
-    def test_empty_and_missing_optional_parameters_use_declared_defaults(self):
-        self.call('move', direction='', distance_mm='', speed_percent='')
-        self.assertEqual(self.sdk.pose[2], 255000)
-        self.assertTrue(all(c[3] == 5 for c in self.sdk.calls if c[0] == 'mode'))
+    def test_direction_action_uses_fixed_small_step_and_low_speed(self):
+        self.call('move_up')
+        self.assertEqual(self.sdk.pose[2], 251000)
+        self.assertTrue(all(c[3] == 1 for c in self.sdk.calls if c[0] == 'mode'))
 
     def test_bad_arguments_and_old_actions_send_nothing(self):
         cases = [{'distance_mm': 0}, {'distance_mm': 11}, {'distance_mm': True},
@@ -132,8 +132,8 @@ class IntentTests(unittest.TestCase):
                  {'execute': True}, {'preview_id': 'old'}]
         for args in cases:
             with self.subTest(args=args), self.assertRaises(ValueError):
-                self.call('move', **args)
-        for action in ('enable', 'disable', 'allow_motion', 'move_joint', 'jog_positive', 'switch_mode'):
+                self.call('move_up', **args)
+        for action in ('move', 'enable', 'disable', 'allow_motion', 'move_joint', 'jog_positive', 'switch_mode'):
             with self.subTest(action=action), self.assertRaisesRegex(ValueError, 'replaced'):
                 self.call(action)
         self.assertEqual(self.sdk.calls, [])
@@ -141,11 +141,11 @@ class IntentTests(unittest.TestCase):
     def test_preparation_once_before_move_then_repeated_move_is_already_ready(self):
         self.sdk.enabled = (False,) * 6
         self.sdk.mode = 'STANDBY(0x0)'
-        self.call('move', direction='up', distance_mm=1, speed_percent=1)
+        self.call('move_up')
         self.assertEqual(self.sdk.calls[0][0], 'prepare')
         self.assertFalse(self.sdk.calls[0][1]['allow_limit_adjustment'])
         self.assertEqual(self.sdk.calls[0][1]['speed_pct'], 1)
-        self.call('move', direction='down', distance_mm=1)
+        self.call('move_down')
         self.assertEqual(sum(c[0] == 'prepare' for c in self.sdk.calls), 1)
 
     def test_real_preparation_primitive_is_compatible_with_intent_ownership(self):
@@ -158,7 +158,7 @@ class IntentTests(unittest.TestCase):
             tick[0] += .05
             return tick[0]
         with patch('agilex.piper.arm.time.sleep'), patch('agilex.piper.arm.time.monotonic', side_effect=now):
-            result = self.call('move', distance_mm=1)
+            result = self.call('move_up')
         self.assertTrue(result['executed'])
         kinds = [c[0] for c in self.sdk.calls]
         self.assertIn('enable_arm', kinds)
@@ -171,7 +171,7 @@ class IntentTests(unittest.TestCase):
             old = getattr(self.sdk, attr)
             setattr(self.sdk, attr, value)
             with self.subTest(attr=attr, value=value), self.assertRaises(RuntimeError):
-                self.call('move')
+                self.call('move_up')
             setattr(self.sdk, attr, old)
         self.assertEqual(self.sdk.calls, [])
 
@@ -181,13 +181,13 @@ class IntentTests(unittest.TestCase):
         self.sdk.frame_counts = {}
         self.sdk._arm_can = SimpleNamespace(tx_frames=[])
         with self.assertRaisesRegex(RuntimeError, 'stale'):
-            self.call('move')
+            self.call('move_up')
         self.assertEqual(self.sdk.calls, [])
 
     def test_unreached_target_times_out_and_does_not_claim_completion(self):
         self.sdk.reached = False
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
-            self.call('move', distance_mm=1)
+            self.call('move_up')
         self.assertEqual(self.call('info')['state'], 'failed')
         self.assertFalse(self.runtime.gate.locked())
 
@@ -198,7 +198,7 @@ class IntentTests(unittest.TestCase):
             self.sdk.pose_frozen = True
         self.sdk.EndPoseCtrl = send
         with self.assertRaisesRegex(RuntimeError, 'stale'):
-            self.call('move')
+            self.call('move_up')
         self.assertEqual(sum(c[0] == 'end_pose' for c in self.sdk.calls), 1)
 
     def test_gripper_prepares_and_enables_at_measured_width_before_target(self):
@@ -230,13 +230,13 @@ class IntentTests(unittest.TestCase):
             return original(**kwargs)
         self.driver.prepare_control = prepare
         with patch.object(self.runtime, 'acp_complete', side_effect=lambda *args: complete.set()):
-            accepted = self.call('move', distance_mm=1)
+            accepted = self.call('move_up')
             self.assertIn('action_id', accepted)
             try:
                 self.assertTrue(entered.wait(1))
                 self.assertEqual(self.call('info')['state'], 'preparing')
                 with self.assertRaises(RuntimeError):
-                    self.call('move')
+                    self.call('move_up')
                 self.assertEqual(self.call('stop_motion')['state'], 'stopping')
                 self.assertEqual(self.call('stop_motion')['state'], 'stopping')
             finally:
@@ -253,9 +253,9 @@ class IntentTests(unittest.TestCase):
         def sleep(seconds):
             entered.set(); release.wait(3); clock.sleep(seconds)
         self.motion.stop()
-        with patch('agilex.piper.intent_control.move_cartesian', side_effect=lambda *args: move_cartesian(*args, clock=clock.now, sleep=sleep)), \
+        with patch('agilex.piper.intent_control.move_cartesian', side_effect=lambda *args, **kwargs: move_cartesian(*args, **kwargs, clock=clock.now, sleep=sleep)), \
              patch.object(self.runtime, 'acp_complete', side_effect=lambda *args: complete.set()):
-            self.call('move', distance_mm=1)
+            self.call('move_up')
             try:
                 self.assertTrue(entered.wait(1))
                 self.assertEqual(self.call('stop_motion')['state'], 'stopping')
@@ -301,7 +301,7 @@ class IntentTests(unittest.TestCase):
         stops = []
         with patch.object(self.runtime, '_phase', side_effect=phase), \
              patch.object(self.runtime, 'acp_complete', side_effect=lambda *args:complete.set()):
-            self.call('move', distance_mm=1)
+            self.call('move_up')
             self.assertTrue(publishing.wait(1))
             stop = threading.Thread(target=lambda:stops.append(self.call('stop_motion')))
             stop.start()
@@ -316,12 +316,12 @@ class IntentTests(unittest.TestCase):
         entered, release, complete = threading.Event(), threading.Event(), threading.Event()
         original = self.runtime.dispatch_sync
         def sync(action, args):
-            if action == 'move':
+            if action == 'move_up':
                 entered.set();release.wait(2)
             return original(action, args)
         with patch.object(self.runtime, 'dispatch_sync', side_effect=sync), \
              patch.object(self.runtime, 'acp_complete', side_effect=lambda *args:complete.set()):
-            self.call('move')
+            self.call('move_up')
             self.assertTrue(entered.wait(1))
             self.assertEqual(self.call('stop_motion')['state'], 'stopping')
             release.set()
@@ -333,7 +333,7 @@ class IntentTests(unittest.TestCase):
         self.sdk.GetArmStatus = lambda:SimpleNamespace(time_stamp=time.time() - .1,
             arm_status=SimpleNamespace(motion_status=0))
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
-            self.call('move', distance_mm=1)
+            self.call('move_up')
         self.sdk.GetArmStatus = lambda:SimpleNamespace(time_stamp=time.time(),
             arm_status=SimpleNamespace(motion_status=0))
         original = self.sdk.EndPoseCtrl
@@ -342,16 +342,176 @@ class IntentTests(unittest.TestCase):
             self.sdk.pose = (*self.sdk.pose[:3], self.sdk.pose[3] + 2000, *self.sdk.pose[4:])
         self.sdk.EndPoseCtrl = wrong_orientation
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
-            self.call('move', distance_mm=1)
+            self.call('move_up')
 
     def test_preparation_failure_does_not_submit_a_move(self):
         self.sdk.enabled = (False,) * 6
         self.driver.prepare_control = lambda **kwargs:(_ for _ in ()).throw(RuntimeError('Preparation failed'))
         with self.assertRaisesRegex(RuntimeError, 'Preparation failed'):
-            self.call('move')
+            self.call('move_up')
         self.assertEqual(self.sdk.calls, [])
         self.assertEqual(self.call('info')['state'], 'failed')
 
+
+    def test_direction_actions_need_no_movement_parameters(self):
+        schema = self.runtime.get_tools()[0]['inputSchema']
+        self.assertFalse({'direction', 'distance_mm', 'speed_percent'} & schema['properties'].keys())
+        for direction in DIRECTIONS:
+            self.assertEqual(schema['x-action-params']['move_' + direction]['params'], [])
+        self.assertNotIn('move', schema['properties']['action']['enum'])
+        self.assertEqual(schema['properties']['action']['default'], 'select_action')
+        for supplied in ({'distance_mm': 1}, {'speed_percent': 1}, {'direction': 'up'}):
+            with self.assertRaisesRegex(ValueError, 'Unexpected'):
+                self.call('move_up', **supplied)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_standby_enabled_arm_prepares_once_at_low_speed(self):
+        self.sdk.mode = 'STANDBY(0x0)'
+        self.call('move_up')
+        self.assertEqual(self.sdk.calls[0][0], 'prepare')
+        self.assertEqual(self.sdk.calls[0][1]['speed_pct'], 1)
+        self.call('move_down')
+        self.assertEqual(sum(c[0] == 'prepare' for c in self.sdk.calls), 1)
+
+    def test_original_target_is_persisted_before_first_transmission(self):
+        from pathlib import Path
+        path = Path(self.tmp.name) / 'arm-control-events.jsonl'
+        original = self.sdk.EndPoseCtrl
+        def send(*target):
+            entries = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertTrue(any(e.get('details', {}).get('target_mm') == [200., 0., 251.] for e in entries))
+            original(*target)
+        self.sdk.EndPoseCtrl = send
+        self.call('move_up')
+        entries = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(entries[0]['event'], 'request')
+        self.assertEqual(entries[-1]['task']['state'], 'completed')
+        self.assertEqual(entries[-1]['task']['action'], 'move_up')
+        self.assertEqual(entries[-1]['task']['diagnostics']['actual_displacement_mm'], 1.)
+        self.assertNotIn('token', path.read_text().lower())
+
+    def test_latched_target_rejection_blocks_every_control_without_reset(self):
+        self.sdk.status = 'TARGET_POS_EXCEEDS_LIMIT(0x4)'
+        for action in ('move_up', 'move_down', 'open_gripper', 'exit_teaching_and_hold'):
+            with self.assertRaisesRegex(RuntimeError, 'still active'):
+                self.call(action)
+            task = self.call('info')['task']
+            self.assertEqual(task['outcome'], 'direction_unavailable')
+            self.assertEqual(task['diagnostics']['controller_status'], self.sdk.status)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_journal_failure_before_control_fails_closed(self):
+        with patch.object(self.runtime, '_audit', side_effect=OSError('Diagnostic storage unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'storage unavailable'):
+                self.call('move_up')
+        self.assertEqual(self.sdk.calls, [])
+        self.assertFalse(self.runtime.gate.locked())
+        self.assertEqual(self.call('info')['state'], 'failed')
+
+    def test_target_rejection_after_motion_records_partial_displacement(self):
+        original = self.sdk.EndPoseCtrl
+        def send(*target):
+            original(*target)
+            self.sdk.status = 'TARGET_POS_EXCEEDS_LIMIT(0x4)'
+        self.sdk.EndPoseCtrl = send
+        with self.assertRaisesRegex(RuntimeError, 'Cannot continue up'):
+            self.call('move_up')
+        task = self.call('info')['task']
+        self.assertEqual(task['outcome'], 'direction_unavailable')
+        self.assertEqual(task['diagnostics']['commands_sent'], 1)
+        self.assertEqual(task['diagnostics']['actual_displacement_mm'], 1.)
+        self.assertFalse(task['diagnostics']['measured_hold_sent'])
+        self.assertEqual(task['diagnostics']['first_error_feedback']['controller_status'], self.sdk.status)
+        self.assertEqual(sum(c[0] == 'end_pose' for c in self.sdk.calls), 1)
+        self.assertFalse(any(c[0] in ('teach', 'joints', 'enable_arm') for c in self.sdk.calls))
+
+    def test_internal_longer_request_uses_original_reference_and_one_mm_steps(self):
+        self.motion.stop()
+        clock = FastClock()
+        original = self.sdk.EndPoseCtrl
+        reports = []
+        def send(*target):
+            original(*target)
+            self.sdk.pose = (*self.sdk.pose[:2], self.sdk.pose[2] - 200, *self.sdk.pose[3:])
+        self.sdk.EndPoseCtrl = send
+        result = move_cartesian(self.driver, 'up', 2.5, 1, clock=clock.now, sleep=clock.sleep,
+                                report=lambda d:reports.append(deepcopy(d)))
+        targets = [c[1] for c in self.sdk.calls if c[0] == 'end_pose']
+        self.assertEqual(sorted(set(t[2] for t in targets)), [251000, 252000, 252500])
+        self.assertTrue(all(t[3:] == (180000, 0, 90000) for t in targets))
+        self.assertEqual(result['target_mm'], (200., 0., 252.5))
+        self.assertEqual(result['completed_steps'], 3)
+        self.assertAlmostEqual(result['actual_displacement_mm'], 2.3)
+        self.assertEqual(reports[-1]['completed_steps'], 3)
+
+    def test_second_step_rejection_never_sends_third_step_or_recovery(self):
+        self.motion.stop()
+        clock = FastClock()
+        original = self.sdk.EndPoseCtrl
+        reports = []
+        def send(*target):
+            if target[2] == 252000:
+                self.sdk.calls.append(('end_pose', target))
+                self.sdk.status = 'TARGET_POS_EXCEEDS_LIMIT(0x4)'
+            else:
+                original(*target)
+        self.sdk.EndPoseCtrl = send
+        with self.assertRaisesRegex(RuntimeError, 'Cannot continue up'):
+            move_cartesian(self.driver, 'up', 3, 1, clock=clock.now, sleep=clock.sleep,
+                           report=lambda d:reports.append(deepcopy(d)))
+        self.assertEqual(sorted(set(c[1][2] for c in self.sdk.calls if c[0] == 'end_pose')), [251000, 252000])
+        self.assertEqual(sum(c[0] == 'end_pose' and c[1][2] == 252000 for c in self.sdk.calls), 1)
+        self.assertEqual(reports[-1]['completed_steps'], 1)
+        self.assertEqual(reports[-1]['actual_displacement_mm'], 1.)
+        self.assertEqual(reports[-1]['controller_status'], self.sdk.status)
+        self.assertFalse(reports[-1]['measured_hold_sent'])
+
+    def test_cancel_between_steps_never_advances_old_target(self):
+        self.motion.stop()
+        clock = FastClock()
+        def report(details):
+            if details['completed_steps'] == 1:
+                self.driver.cancel_motion()
+        with self.assertRaises(RuntimeError):
+            move_cartesian(self.driver, 'up', 3, 1, clock=clock.now, sleep=clock.sleep, report=report)
+        self.assertTrue(all(c[1][2] == 251000 for c in self.sdk.calls if c[0] == 'end_pose'))
+        self.assertTrue(all(self.sdk.enabled))
+
+    def test_device_error_bits_are_not_classified_as_direction_only(self):
+        self.sdk.status = 'TARGET_POS_EXCEEDS_LIMIT(0x4)'
+        self.sdk.error = 1
+        with self.assertRaisesRegex(RuntimeError, 'device fault'):
+            self.call('move_up')
+        self.assertEqual(self.call('info')['task']['outcome'], 'operation_failed')
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_core_topic_discovery_is_read_only_and_movement_stays_strict(self):
+        result = self.call('info', input_topic='')
+        self.assertEqual(result['state'], 'idle')
+        for action, args in [('info', {'input_topic': '/unexpected'}),
+                             ('move_up', {'input_topic': ''})]:
+            with self.assertRaisesRegex(ValueError, 'Unexpected'):
+                self.call(action, **args)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_retry_is_available_only_after_external_healthy_feedback(self):
+        self.sdk.status = 'TARGET_POS_EXCEEDS_LIMIT(0x4)'
+        with self.assertRaises(RuntimeError):
+            self.call('move_up')
+        self.assertEqual(self.sdk.calls, [])
+        self.sdk.status = 'NORMAL(0x0)'  # Robot recovers externally, not via our driver.
+        self.assertEqual(self.call('move_down')['state'], 'completed')
+        self.assertEqual(self.sdk.pose[2], 249000)
+        self.assertFalse(any(c[0] in ('teach', 'enable_arm', 'prepare', 'joints') for c in self.sdk.calls))
+
+    def test_gripper_input_remains_strict_and_empty_width_uses_default(self):
+        for value in (-1, 71, True, float('nan'), float('inf'), [], None, '20'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.call('set_gripper_opening', width_mm=value)
+        self.assertEqual(self.sdk.calls, [])
+        with patch('agilex.piper.arm.time.sleep'), patch('agilex.piper.arm.time.monotonic', side_effect=[i * .1 for i in range(100)]):
+            result = self.call('set_gripper_opening', width_mm='')
+        self.assertEqual(result['gripper']['width_mm'], 20.)
 
 if __name__ == '__main__':
     unittest.main()

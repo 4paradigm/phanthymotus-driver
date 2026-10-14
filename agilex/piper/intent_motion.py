@@ -8,6 +8,25 @@ DIRECTIONS = {'forward': (1, 0, 0), 'backward': (-1, 0, 0),
               'left': (0, 1, 0), 'right': (0, -1, 0),
               'up': (0, 0, 1), 'down': (0, 0, -1)}
 POSE_FIELDS = ('X_axis', 'Y_axis', 'Z_axis', 'RX_axis', 'RY_axis', 'RZ_axis')
+SMALL_STEP_MM = 1
+JOG_SPEED_PERCENT = 1
+
+
+class DirectionUnavailable(RuntimeError):
+    """A controller target rejection, distinct from a motor/device failure."""
+    def __init__(self, message):
+        super().__init__(message)
+        self.feedback = None
+
+
+def controller_error(status):
+    if status.startswith('TARGET_POS_EXCEEDS_LIMIT'):
+        return DirectionUnavailable('The controller rejected a movement target as outside its limits. '
+            'The target-limit report is still active; check the robot state before retrying. No reset was sent.')
+    if status.startswith(('NO_SOLUTION', 'SINGULARITY_POINT')):
+        return DirectionUnavailable('The controller cannot follow this direction from the current pose '
+            'while keeping the gripper orientation. Check the robot state before retrying. No reset was sent.')
+    return RuntimeError('The arm reports a fault: ' + status)
 
 
 @dataclass(frozen=True)
@@ -48,7 +67,13 @@ def checked_state(driver, *, ready=False, allow_teaching=False):
     if any(state.enabled) and not all(state.enabled):
         raise RuntimeError('Some arm motors are disabled; check the arm before retrying.')
     if state.error_code or state.motor_faults or not state.arm_status.startswith('NORMAL'):
-        raise RuntimeError('The arm reports a fault: ' + state.arm_status)
+        if state.error_code or state.motor_faults:
+            raise RuntimeError('The arm reports a device fault: ' + state.arm_status)
+        error = controller_error(state.arm_status)
+        if isinstance(error, DirectionUnavailable):
+            error.feedback = {'controller_status': state.arm_status, 'error_code': state.error_code,
+                              'joints_deg': state.joints_deg, 'feedback_time': state.feedback_time}
+        raise error
     if not state.teach_status.startswith(('DISABLED', 'STOP_RECORDING', 'TERMINATE_EXECUTION')):
         raise RuntimeError('Teaching or trajectory playback is active; stop it on the robot first.')
     modes = ('STANDBY', 'CAN_CTRL', 'TEACHING_MODE') if allow_teaching else ('STANDBY', 'CAN_CTRL')
@@ -83,42 +108,101 @@ def hold_cartesian(driver, speed):
         return False
 
 
-def move_cartesian(driver, direction, distance, speed, *, clock=time.monotonic, sleep=time.sleep):
+def move_cartesian(driver, direction, distance, speed, *, clock=time.monotonic, sleep=time.sleep,
+                   report=lambda details: None):
+    """Confirm each <=1 mm target before advancing; one original reference.
+
+    Public direction actions always request 1 mm at 1%. Longer distances are
+    internal only until physical acceptance. Subdivision does not guarantee IK
+    feasibility, and never clears a controller error or retries a rejected goal.
+    """
+    if direction not in DIRECTIONS:
+        raise ValueError('Unknown movement direction.')
+    if (isinstance(distance, bool) or not isinstance(distance, (int, float))
+            or not math.isfinite(distance) or not 1 <= distance <= 10
+            or type(speed) is not int or not 1 <= speed <= 10):
+        raise ValueError('Movement requires 1–10 mm and integer speed 1–10%.')
     checked_state(driver, ready=True)
     start = end_pose(driver)
     vector = DIRECTIONS[direction]
-    target = EndPose(tuple(p + distance * d for p, d in zip(start.position_mm, vector)),
-                     start.orientation_deg, start.feedback_time)
+    final = tuple(p + distance * d for p, d in zip(start.position_mm, vector))
+    details = {'direction': direction, 'requested_distance_mm': distance, 'speed_percent': speed,
+               'start_mm': start.position_mm, 'target_mm': final, 'orientation_deg': start.orientation_deg,
+               'start_joints_deg': driver.get_state().joints_deg, 'completed_steps': 0, 'commands_sent': 0,
+               'command_attempted': False}
+    report(dict(details))  # Persist the original target before any control frame.
     deadline = clock() + 30
-    stable_since = None
-    sent_at = None
+    actual = start
     try:
-        while clock() < deadline:
+        travelled = 0.
+        while travelled < distance:
             driver._check_cancelled()
             checked_state(driver, ready=True)
-            actual = end_pose(driver)
-            # Joint and end-position frames are checked independently. Status
-            # must also be received AFTER our first command, never a cached
-            # 'reached' flag from an earlier action.
-            status = driver.arm.GetArmStatus()
-            if not fresh(status.time_stamp):
-                raise RuntimeError('Controller status is stale.')
-            reached = int(status.arm_status.motion_status) == 0
-            near = (math.dist(actual.position_mm, target.position_mm) <= .5
-                    and all(abs((a - b + 180) % 360 - 180) <= 1
-                            for a, b in zip(actual.orientation_deg, target.orientation_deg)))
-            if sent_at is not None and actual.feedback_time > sent_at and status.time_stamp > sent_at and near and reached:
-                stable_since = clock() if stable_since is None else stable_since
-                if clock() - stable_since >= .5:
-                    return {'executed': True, 'position_mm': actual.position_mm,
-                            'orientation_deg': actual.orientation_deg, 'target_mm': target.position_mm}
+            travelled = min(distance, travelled + SMALL_STEP_MM)
+            target = EndPose(tuple(p + travelled * d for p, d in zip(start.position_mm, vector)),
+                             start.orientation_deg, start.feedback_time)
+            details.update(step_target_mm=target.position_mm)
+            report(dict(details))
+            stable_since = sent_at = None
+            while clock() < deadline:
+                driver._check_cancelled()
+                checked_state(driver, ready=True)
+                actual = end_pose(driver)
+                status = driver.arm.GetArmStatus()
+                if not fresh(status.time_stamp):
+                    raise RuntimeError('Controller status is stale.')
+                reached = int(status.arm_status.motion_status) == 0
+                near = (math.dist(actual.position_mm, target.position_mm) <= .5
+                        and all(abs((a - b + 180) % 360 - 180) <= 1
+                                for a, b in zip(actual.orientation_deg, target.orientation_deg)))
+                if sent_at is not None and actual.feedback_time > sent_at and status.time_stamp > sent_at and near and reached:
+                    stable_since = clock() if stable_since is None else stable_since
+                    if clock() - stable_since >= .5:
+                        break
+                else:
+                    stable_since = None
+                # Set the reference before transmission: subsequent feedback
+                # must be newer than this command, not a previous reached flag.
+                stamp = time.time()
+                details['command_attempted'] = True
+                _send(driver, target, speed)
+                details['commands_sent'] += 1
+                if sent_at is None:
+                    sent_at = stamp
+                sleep(.05)
             else:
-                stable_since = None
-            _send(driver, target, speed)
-            if sent_at is None:
-                sent_at = time.time()
-            sleep(.05)
-        raise RuntimeError('Move timed out after 30 seconds; target completion was not confirmed.')
-    except BaseException:
-        hold_cartesian(driver, speed)
+                raise RuntimeError('Move timed out after 30 seconds; target completion was not confirmed.')
+            details.update(completed_steps=details['completed_steps'] + 1,
+                           position_mm=actual.position_mm, actual_displacement_mm=math.dist(start.position_mm, actual.position_mm))
+            report(dict(details))
+        displacement = math.dist(start.position_mm, actual.position_mm)
+        return {'executed': True, 'message': f'Move {direction} completed; requested {distance:g} mm, '
+                    f'measured displacement {displacement:.2f} mm.',
+                'position_mm': actual.position_mm, 'orientation_deg': actual.orientation_deg,
+                'target_mm': final, 'actual_displacement_mm': math.dist(start.position_mm, actual.position_mm),
+                'completed_steps': details['completed_steps']}
+    except BaseException as exc:
+        if isinstance(exc, DirectionUnavailable):
+            details['first_error_feedback'] = exc.feedback
+        # Best effort only when fresh, healthy feedback still allows control.
+        # A rejected target must never be followed by another target/reset.
+        held = hold_cartesian(driver, speed) if details['command_attempted'] else False
+        details.update(error=str(exc), measured_hold_sent=held)
+        try:
+            state = driver.get_state()
+            details.update(controller_status=state.arm_status, error_code=state.error_code,
+                           joints_deg=state.joints_deg, joint_feedback_time=state.feedback_time)
+            observed = end_pose(driver)
+            details.update(position_mm=observed.position_mm,
+                           actual_displacement_mm=math.dist(start.position_mm, observed.position_mm))
+        except Exception:
+            details['position_available'] = False
+        try:
+            report(dict(details))
+        except Exception:
+            pass  # Diagnostic storage must not hide the original failure.
+        if isinstance(exc, DirectionUnavailable):
+            raise DirectionUnavailable(f'Cannot continue {direction} from this pose while keeping the gripper orientation. '
+                'The controller rejected the target; movement may be partial. '
+                'Check the robot state before retrying. No reset was sent.') from exc
         raise

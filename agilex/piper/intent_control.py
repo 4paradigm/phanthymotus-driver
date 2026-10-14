@@ -3,18 +3,22 @@ from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict
 import math
+import json
 import re
 import threading
 import time
+from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
 from agilex.piper.device import PiperPlugin
 from agilex.piper.runtime import PiperRuntime
-from agilex.piper.intent_motion import DIRECTIONS, checked_state, end_pose, move_cartesian
+from agilex.piper.intent_motion import (DIRECTIONS, JOG_SPEED_PERCENT, SMALL_STEP_MM,
+    DirectionUnavailable, checked_state, end_pose, move_cartesian)
 from agilex.piper.intent_teaching import exit_teaching_and_hold
 
 CONTROL = 'arm_control'
-TASK_ACTIONS = {'move', 'open_gripper', 'close_gripper', 'set_gripper_opening', 'exit_teaching_and_hold'}
+DIRECTION_ACTIONS = {f'move_{direction}': direction for direction in DIRECTIONS}
+TASK_ACTIONS = {*DIRECTION_ACTIONS, 'open_gripper', 'close_gripper', 'set_gripper_opening', 'exit_teaching_and_hold'}
 
 
 def public_error(error):
@@ -55,6 +59,7 @@ class IntentControlPlugin(PiperPlugin):
         self.interface_language = 'en'
         self.task = {'state': 'idle', 'action': None}
         self.task_lock = threading.Lock()
+        self.audit_lock = threading.Lock()
         self.monitor_service = None
         self.gripper_torque = self.config.get('intent_control', {}).get('gripper_torque_nm', .5)
         if isinstance(self.gripper_torque, bool) or not isinstance(self.gripper_torque, (int, float)) or not math.isfinite(self.gripper_torque) or not .001 <= self.gripper_torque <= 1:
@@ -75,7 +80,9 @@ class IntentControlPlugin(PiperPlugin):
     def get_tools(self):
         low, high = self._width_bounds()
         actions = {'select_action': ([], 'Choose an action'),
-                   'move': (['direction', 'distance_mm', 'speed_percent'], 'Move the end effector; keep its orientation'),
+                   **{action: ([], f'Move the gripper {direction} by 1 mm at 1% speed; keep its orientation. '
+                       'Directions are fixed to the robot base. Small steps do not guarantee reachability.')
+                      for action, direction in DIRECTION_ACTIONS.items()},
                    'stop_motion': ([], 'Stop the current action; keep motor torque'),
                    'open_gripper': ([], 'Open the gripper'), 'close_gripper': ([], 'Close the gripper'),
                    'set_gripper_opening': (['width_mm'], 'Set the gripper opening'),
@@ -84,16 +91,12 @@ class IntentControlPlugin(PiperPlugin):
                    'start': ([], 'Ready the card; no motor commands'),
                    'stop': ([], 'Stop the card and cancel its action'), 'info': ([], 'Read feedback and the last task result')}
         schema = action_schema(actions, {
-            'direction': {'type': 'string', 'enum': list(DIRECTIONS), 'default': 'up', 'title': 'Direction',
-                          'description': 'Base frame: forward +X, left +Y, up +Z.',
-                          'oneOf': [{'const': d, 'title': d.capitalize()} for d in DIRECTIONS]},
-            'distance_mm': {'type': 'number', 'minimum': 1, 'maximum': 10, 'default': 5,
-                            'title': 'Distance (mm)', 'description': '1–10 mm; default 5 mm.'},
-            'speed_percent': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'default': 5,
-                              'title': 'Movement speed (%)', 'description': '1–10%; default 5%. Not a fixed mm/s.'},
             'width_mm': {'type': 'number', 'minimum': low, 'maximum': high, 'default': min(high, max(low, 20)),
                          'title': 'Gripper opening (mm)', 'description': f'{low:g}–{high:g} mm; effective limits.'}})
-        labels = {'select_action': 'Choose an action', 'move': 'Move', 'stop_motion': 'Stop',
+        labels = {'select_action': 'Choose an action',
+                  **{action: ('Raise' if direction == 'up' else 'Lower' if direction == 'down'
+                              else 'Move ' + direction) + ' · 1 mm' for action, direction in DIRECTION_ACTIONS.items()},
+                  'stop_motion': 'Stop',
                   'open_gripper': 'Open gripper', 'close_gripper': 'Close gripper',
                   'set_gripper_opening': 'Set gripper opening', 'exit_teaching_and_hold': 'Exit teaching and hold',
                   'start': 'Start', 'stop': 'Stop card', 'info': 'Info'}
@@ -106,9 +109,10 @@ class IntentControlPlugin(PiperPlugin):
         schema['x-action-params'].pop('select_action')
         namespace = self.topic.rsplit('/', 1)[0]
         arm = tool(CONTROL, 'actuator',
-                   'Move the end effector in the fixed robot base frame, control the gripper, or stop. '
-                   'Normal mode and motor preparation are automatic. Exit teaching and hold is an explicit action: '
-                   'keep the arm stationary; no reset or homing. Check physical clearance before executing.',
+                   'Choose a direction to move the gripper by one small step (1 mm, 1% speed), control the gripper, or stop. '
+                   'Forward +X, backward -X, left +Y, right -Y, raise +Z, lower -Z in the fixed robot base frame; '
+                   'directions do not follow the camera. Keep the workspace clear. '
+                   'Gripper orientation stays fixed. Exit teaching and hold requires a stationary arm.',
                    schema, topic_out=[{'topic': namespace + '/state/joints', 'format': 'sensor/skeleton'},
                                       {'topic': namespace + '/state/parameters', 'format': 'data/json'}])
         arm['title'] = 'Arm control'
@@ -135,6 +139,11 @@ class IntentControlPlugin(PiperPlugin):
             raise ValueError('This action has been replaced; refresh Arm control and choose a user action.')
         allowed = set(schema['x-action-params'].get(action, {}).get('params', []))
         supplied = set(args) - {'_tool_name', 'instance_id', 'action'}
+        # Core's generic output-topic discovery adds an empty input_topic to
+        # Info for input-less cards. Accept only that read-only framework value;
+        # movement requests retain strict parameter rejection.
+        if action == 'info' and args.get('input_topic') == '':
+            supplied.discard('input_topic')
         if supplied - allowed:
             raise ValueError('Unexpected parameters for this action: ' + ', '.join(sorted(supplied - allowed)))
         result = dict(args)
@@ -163,6 +172,38 @@ class IntentControlPlugin(PiperPlugin):
         with self.task_lock:
             self.task = {**self.task, 'state': state, **values}
 
+    def _audit(self, event, details=None):
+        """Bounded per-device journal; only validated request/feedback fields.
+
+        Initial/target writes are required before control. Terminal write failure
+        must not hide a controller error or claim an unsuccessful task succeeded.
+        """
+        with self.task_lock:
+            task = deepcopy(self.task)
+        entry = {'time': time.time(), 'event': event, 'task': task}
+        if details is not None:
+            entry['details'] = details
+        line = json.dumps(entry, ensure_ascii=True, allow_nan=False) + '\n'
+        with self.audit_lock:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            path = self.data_dir / 'arm-control-events.jsonl'
+            if path.exists() and path.stat().st_size >= 2 * 1024 * 1024:
+                path.replace(path.with_suffix('.jsonl.1'))
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(line)
+
+    def _motion_report(self, details):
+        with self.task_lock:
+            self.task['diagnostics'] = deepcopy(details)
+        self._audit('motion', details)
+
+    def _terminal_audit(self):
+        try:
+            self._audit('terminal')
+        except Exception:
+            with self.task_lock:
+                self.task['diagnostic_warning'] = 'The terminal event could not be saved; check diagnostic storage.'
+
     @contextmanager
     def operation(self, name='piper_arm', action=None):
         nested = (getattr(self.worker_context, 'reserved', None) == (name, action)
@@ -171,7 +212,8 @@ class IntentControlPlugin(PiperPlugin):
             if not nested and name == CONTROL and action in TASK_ACTIONS:
                 # Publish preparation at reservation time, before an async
                 # worker starts; Stop cannot mistake the previous task for it.
-                self._phase('preparing', action=action, started_at=time.time(), result=None, error=None)
+                self._phase('preparing', action=action, started_at=time.time(), result=None, error=None,
+                            diagnostics=None, outcome=None, diagnostic_warning=None, task_id=uuid4().hex, request=None)
             yield
 
     def dispatch(self, action, args):
@@ -222,18 +264,27 @@ class IntentControlPlugin(PiperPlugin):
 
     def _execute_task(self, action, args):
         with self.operation(CONTROL, action):
-            self._phase('preparing', action=action, started_at=time.time(), result=None, error=None)
+            self._phase('preparing', action=action, started_at=time.time(), result=None, error=None,
+                        diagnostics=None, outcome=None, diagnostic_warning=None,
+                        request={key: value for key, value in args.items() if key in {'action', 'width_mm'}})
             try:
+                self._audit('request')
                 driver = self.connected(cancel_event=self.cancel)
+                observed = driver.get_state()
+                self._motion_report({'stage': 'preflight', 'controller_status': observed.arm_status,
+                    'control_mode': observed.control_mode, 'error_code': observed.error_code,
+                    'joints_deg': [q if math.isfinite(q) else None for q in observed.joints_deg],
+                    'joint_feedback_time': observed.feedback_time if math.isfinite(observed.feedback_time) else None})
                 if action == 'exit_teaching_and_hold':
                     result = exit_teaching_and_hold(driver, on_switch=lambda: self._phase('moving'))
                     with self.lifecycle:
                         driver._check_cancelled()
                         self._phase('completed', result=result)
+                    self._terminal_audit()
                     return {**result, 'state': 'completed'}
                 state = checked_state(driver)
                 # Validate end feedback/actual gripper limits BEFORE enabling.
-                if action == 'move':
+                if action in DIRECTION_ACTIONS:
                     end_pose(driver)
                 else:
                     grip = driver.get_gripper()
@@ -244,14 +295,15 @@ class IntentControlPlugin(PiperPlugin):
                     if not low <= width <= high:
                         raise ValueError(f'Gripper opening must be in [{low}, {high}] mm.')
                 driver._check_cancelled()
-                if not all(state.enabled):
+                if state.control_mode.startswith('STANDBY') or not all(state.enabled):
                     driver.prepare_control(execute=True, workspace_clear=True, allow_limit_adjustment=False,
-                                           speed_pct=args.get('speed_percent', 5))
+                                           speed_pct=JOG_SPEED_PERCENT)
                 checked_state(driver, ready=True)
                 driver._check_cancelled()
                 self._phase('moving')
-                if action == 'move':
-                    result = move_cartesian(driver, args['direction'], args['distance_mm'], args['speed_percent'])
+                if action in DIRECTION_ACTIONS:
+                    result = move_cartesian(driver, DIRECTION_ACTIONS[action], SMALL_STEP_MM,
+                                            JOG_SPEED_PERCENT, report=self._motion_report)
                 else:
                     grip = driver.get_gripper()
                     if not grip.enabled:
@@ -263,9 +315,13 @@ class IntentControlPlugin(PiperPlugin):
                 with self.lifecycle:
                     driver._check_cancelled()
                     self._phase('completed', result=result)
+                self._terminal_audit()
                 return {**result, 'state': 'completed'}
             except BaseException as exc:
-                self._phase('cancelled' if self.cancel.is_set() else 'failed', error=public_error(exc))
+                self._phase('cancelled' if self.cancel.is_set() else 'failed', error=public_error(exc),
+                            outcome='cancelled' if self.cancel.is_set() else
+                                'direction_unavailable' if isinstance(exc, DirectionUnavailable) else 'operation_failed')
+                self._terminal_audit()
                 raise RuntimeError(public_error(exc)) from exc
 
     def stop_motion(self):
