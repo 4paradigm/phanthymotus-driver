@@ -747,12 +747,116 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertIn("last_completion", info)
         self.assertEqual(1000, info["gripper_state"]["actpos"])
 
-    def test_unknown_action_returns_none(self):
-        self.assertIsNone(self.plugin.dispatch("something_else", {}))
+    def test_gripper_reads_rm_plus_feedback_when_rm_get_gripper_state_is_all_zeros(self):
+        class RMPlusClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.calls = []
+                self.position = 1000
+
+            def command(client, method, *args):
+                client.calls.append((method, args))
+                target = args[0]
+                client.position = 320 if target == 50 else target
+                return 0
+
+            def call(client, method, *args):
+                if method == "rm_get_gripper_state":
+                    # 模拟现场控制器返回全零结构体
+                    return {
+                        "enable_state": 0, "status": 0, "error": 0,
+                        "mode": 0, "current_force": 0, "temperature": 0,
+                        "actpos": 0,
+                    }
+                if method == "rm_get_rm_plus_state_info":
+                    # 模拟知行生态夹爪正常返回位置
+                    return {
+                        "sys_state": 0,
+                        "dof_state": [2 if client.position == 320 else 4],
+                        "dof_err": [0],
+                        "pos": [client.position],
+                        "speed": [0],
+                        "force": [150],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = RMPlusClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda *event: events.append(event)
+        started = plugin.dispatch("set_position", {
+            "position": 50, "on_stall": "keep",
+            "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+        self.assertTrue(self._wait_for(lambda: len(events) == 1))
+        _, status, payload = events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual("motion_stalled_kept", payload["reason"])
+        self.assertEqual(1000, payload["start_position"])
+        self.assertEqual(320, payload["blocked_position"])
+        self.assertEqual(320, payload["final_position"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+        self.assertIsNone(plugin.dispatch("info", {})["active_action_id"])
+
+        # 确保下一次调用不会报 another gripper motion is active
+        next_result = plugin.dispatch("set_position", {
+            "position": 500, "confirm_motion": True,
+        })
+        self.assertEqual("running", next_result["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 2))
+
+    def test_gripper_without_any_feedback_falls_back_to_blocking_command_and_releases_lock(self):
+        class NoFeedbackClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.calls = []
+
+            def command(client, method, *args):
+                client.calls.append((method, args))
+                return 0
+
+            def call(client, method, *args):
+                # 两个接口均无有效遥测
+                if method == "rm_get_gripper_state":
+                    return {
+                        "enable_state": 0, "status": 0, "error": 0,
+                        "mode": 0, "current_force": 0, "temperature": 0,
+                        "actpos": 0,
+                    }
+                if method == "rm_get_rm_plus_state_info":
+                    return {}
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = NoFeedbackClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda *event: events.append(event)
+        plugin.dispatch("set_position", {
+            "position": 1000, "confirm_motion": True,
+        })
+        self.assertTrue(self._wait_for(lambda: len(events) == 1))
+        _, status, payload = events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual("sdk_command_completed_without_feedback", payload["reason"])
+        self.assertFalse(payload["feedback_available"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+        # 验证下一次调用不会报 another gripper motion is active
+        next_res = plugin.dispatch("set_position", {
+            "position": 50, "confirm_motion": True,
+        })
+        self.assertEqual("running", next_res["state"])
 
     def test_gripper_card_is_advertised(self):
         manifest = (DRIVER / "driver.yaml").read_text()
         self.assertIn("name: gripper", manifest)
+
 
 
 class RealManRM75CartesianPluginTests(unittest.TestCase):

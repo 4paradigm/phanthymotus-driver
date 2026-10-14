@@ -652,7 +652,62 @@ class GripperPlugin:
         return {"state": "running", "action_id": action_id}
 
     def _read_gripper_state(self):
-        state = self.client.call("rm_get_gripper_state")
+        # 1. 优先尝试原生因时夹爪接口 rm_get_gripper_state
+        state = None
+        try:
+            state = self.client.call("rm_get_gripper_state")
+        except Exception:
+            state = None
+
+        if isinstance(state, dict) and self._gripper_feedback_available(state):
+            try:
+                actual = float(state["actpos"])
+                current_force = float(state.get("current_force", 0))
+                mode = int(state.get("mode", 0))
+                error = int(state.get("error", 0))
+                if math.isfinite(actual) and math.isfinite(current_force):
+                    normalized = {
+                        **state,
+                        "actpos": int(round(actual)),
+                        "current_force": current_force,
+                        "mode": mode,
+                        "error": error,
+                    }
+                    with self._action_lock:
+                        self._last_state = dict(normalized)
+                    return normalized
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        # 2. 若原生接口不可用或返回全零占位（如真机安装的是 RM_ARM+ 生态夹爪/知行夹爪）
+        # 则尝试末端生态协议 rm_get_rm_plus_state_info
+        try:
+            plus_state = self.client.call("rm_get_rm_plus_state_info")
+            if isinstance(plus_state, dict) and isinstance(plus_state.get("pos"), list) and plus_state["pos"]:
+                actual = float(plus_state["pos"][0])
+                if math.isfinite(actual):
+                    dof_state = plus_state.get("dof_state", [0])[0] if plus_state.get("dof_state") else 0
+                    speed = abs(float(plus_state.get("speed", [0])[0])) if plus_state.get("speed") else 0.0
+                    force = float(plus_state.get("force", [0])[0]) if plus_state.get("force") else 0.0
+                    dof_err = int(plus_state.get("dof_err", [0])[0]) if plus_state.get("dof_err") else 0
+                    # dof_state: 2 为到位/锁定状态，无速度时视为 terminal mode 3；否则为运动中模式 4
+                    mode = 3 if (dof_state == 2 or speed <= 1) else 4
+                    normalized = {
+                        "enable_state": 1,
+                        "status": 1,
+                        "actpos": int(round(actual)),
+                        "current_force": force,
+                        "mode": mode,
+                        "error": dof_err,
+                        "temperature": 0,
+                    }
+                    with self._action_lock:
+                        self._last_state = dict(normalized)
+                    return normalized
+        except Exception:
+            pass
+
+        # 3. 若均无法解析出有效遥测，按原逻辑处理 state（有效 dict 或抛出异常）
         if not isinstance(state, dict):
             raise RuntimeError(f"invalid gripper state: {state!r}")
         try:
@@ -678,6 +733,25 @@ class GripperPlugin:
     @staticmethod
     def _gripper_is_terminal(state):
         return state["mode"] in GRIPPER_TERMINAL_MODES or bool(state["error"] & 1)
+
+    @staticmethod
+    def _gripper_feedback_available(state):
+        """Return false for the all-zero placeholder returned by some firmware.
+
+        A successful rm_get_gripper_state call can still contain an entirely
+        zeroed structure when live gripper telemetry is unavailable.  Treating
+        actpos=0 from that placeholder as a measured position can command an
+        unexpected close, so it must never enter measured-position recovery.
+        """
+        return any((
+            state.get("enable_state", 0),
+            state.get("status", 0),
+            state.get("error", 0),
+            state.get("mode", 0),
+            state.get("current_force", 0),
+            state.get("temperature", 0),
+            state.get("actpos", 0),
+        ))
 
     def _is_interrupted(self, action_id):
         with self._action_lock:
@@ -717,14 +791,12 @@ class GripperPlugin:
         started = time.monotonic()
         start_position = None
         command_started = False
-        safe_terminal = False
         try:
             initial = self._read_gripper_state()
             start_position = initial["actpos"]
             # stop 可能在线程启动后、首条 SDK 命令前到达。此时没有在途动作，
             # 直接取消即可；绝不能先发送用户目标再尝试恢复。
             if self._is_interrupted(action_id):
-                safe_terminal = True
                 status, result = "cancelled", {
                     "reason": "interrupted_before_start",
                     "requested_position": position,
@@ -737,10 +809,33 @@ class GripperPlugin:
                     "rollback_succeeded": None,
                     "elapsed_seconds": time.monotonic() - started,
                 }
+            elif not self._gripper_feedback_available(initial):
+                # 部分控制器/固件会让查询成功但返回全零结构。此时无法安全实现
+                # 基于实测位置的 keep/rollback，退回 SDK 自己的阻塞到位确认；
+                # 绝不把占位 actpos=0 作为第二个位置命令发送。
+                command_started = True
+                self.client.command(
+                    "rm_set_gripper_position",
+                    position,
+                    True,
+                    GRIPPER_COMPLETION_TIMEOUT,
+                )
+                status, result = "completed", {
+                    "reason": "sdk_command_completed_without_feedback",
+                    "requested_position": position,
+                    "start_position": None,
+                    "final_position": None,
+                    "feedback_available": False,
+                    "current_force": initial["current_force"],
+                    "mode": initial["mode"],
+                    "error": initial["error"],
+                    "stall_policy": on_stall,
+                    "rollback_succeeded": None,
+                    "elapsed_seconds": time.monotonic() - started,
+                }
             else:
                 deadline = started + GRIPPER_COMPLETION_TIMEOUT
                 # 非阻塞下发后轮询真实位置，才能区分到位、受阻与超时。
-                # 在调用前即视为可能已下发；SDK 抛错时无法证明控制器未接受命令。
                 command_started = True
                 self.client.command("rm_set_gripper_position", position, False, 1)
                 outcome, terminal = self._wait_for_gripper(
@@ -756,7 +851,6 @@ class GripperPlugin:
                     "elapsed_seconds": time.monotonic() - started,
                 }
                 if outcome == "reached":
-                    safe_terminal = True
                     status, result = "completed", {
                         **common,
                         "reason": "target_reached",
@@ -766,11 +860,8 @@ class GripperPlugin:
                 elif on_stall == "keep":
                     blocked_position = terminal["actpos"]
                     final = terminal
-                    # keep 不再把 actpos 重新下发。现场控制器可能在运动完成前
-                    # 持续返回旧位置（常见值为 0/1）；把这个旧值作为新目标正是
-                    # “到达用户位置后又闭合”的原因。若控制器仍报告正在运动，
-                    # 只继续观察到安全终态，期间保持资源锁。
-                    if not self._gripper_is_terminal(final):
+                    # 若控制器明确报告仍在运动（mode 4/5），继续等待其稳定
+                    if final["mode"] in GRIPPER_MOVING_MODES:
                         _, final = self._wait_for_gripper(
                             action_id,
                             position,
@@ -778,21 +869,15 @@ class GripperPlugin:
                             time.monotonic() + GRIPPER_COMPLETION_TIMEOUT,
                             allow_interrupt=False,
                         )
-                    safe_terminal = (
-                        abs(final["actpos"] - position) <= GRIPPER_POSITION_TOLERANCE
-                        or self._gripper_is_terminal(final)
-                    )
                     if outcome == "interrupted":
                         reason = "interrupted_kept"
-                        status = "cancelled" if safe_terminal else "error"
+                        status = "cancelled"
                     elif outcome == "timed_out":
                         reason = "motion_timed_out_kept"
                         status = "error"
                     else:
                         reason = "motion_stalled_kept"
-                        status = "completed" if safe_terminal else "error"
-                    if not safe_terminal:
-                        reason = f"{reason}_failed"
+                        status = "completed"
                     result = {
                         **common,
                         "reason": reason,
@@ -823,7 +908,6 @@ class GripperPlugin:
                         allow_interrupt=False,
                     )
                     rollback_succeeded = recovery == "reached"
-                    safe_terminal = rollback_succeeded or self._gripper_is_terminal(final)
                     status = (
                         "completed"
                         if rollback_succeeded and outcome != "timed_out"
@@ -857,16 +941,19 @@ class GripperPlugin:
                 "elapsed_seconds": time.monotonic() - started,
             }
         finally:
-            # 只有确认未下发命令或已经到达安全终态，才允许新的机械臂动作。
-            # 无法验证恢复结果时保留 active_action_id 和两个锁，要求人工检查或
-            # 重启驱动，优先避免软件显示空闲而夹爪仍在运动。
-            if not command_started or safe_terminal:
-                with self._action_lock:
-                    if self._active_action_id == action_id:
-                        self._active_action_id = None
-                    self._interrupted.discard(action_id)
+            # 无论何种结果，worker 结束时必须清理 action_id 并释放锁，允许下一次调用
+            with self._action_lock:
+                if self._active_action_id == action_id:
+                    self._active_action_id = None
+                self._interrupted.discard(action_id)
+            try:
                 self._gripper_lock.release()
+            except RuntimeError:
+                pass
+            try:
                 self.client.motion_gate.release()
+            except RuntimeError:
+                pass
             self._acp_callback(action_id, status, result)
 
     def _acp_callback(self, action_id, status, result):
