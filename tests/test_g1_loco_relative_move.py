@@ -56,7 +56,7 @@ class TestLocoRelativeMove(unittest.TestCase):
             self.assertAlmostEqual(stages[0]['duration'], 2. / 0.6)
             self.assertAlmostEqual(stages[1]['duration'], 1. / 0.6 / 1.2)
             factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
-            self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor / 1.23)
+            self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor / 1.18)
             self.assertEqual(stages[2]['vyaw'], -0.5)
 
     def test_compensation_is_limited_to_measured_speed(self):
@@ -73,7 +73,7 @@ class TestLocoRelativeMove(unittest.TestCase):
         stages = point.plan(dict(x=1, y=-1))
         self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.3, -0.3))
         self.assertAlmostEqual(stages[0]['duration'], 1 / 0.3 / 0.6)
-        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6 / 1.2 / 1.10)
+        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6 / 1.2 / 1.05)
         point.speed = 0.5
         stages = point.plan(dict(x=1, y=-1))
         self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.5, -0.5))
@@ -87,12 +87,12 @@ class TestLocoRelativeMove(unittest.TestCase):
             right = point.plan(dict(angle=angle, direction='right'))[0]
             factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
             self.assertAlmostEqual(left['duration'], math.radians(angle) / 0.5 * factor)
-            self.assertAlmostEqual(right['duration'], left['duration'] / 1.23)
+            self.assertAlmostEqual(right['duration'], left['duration'] / 1.18)
             self.assertEqual((left['vyaw'], right['vyaw']), (0.5, -0.5))
         positive = point.plan(dict(y=1))[0]
         negative = point.plan(dict(y=-1))[0]
         self.assertAlmostEqual(positive['duration'], 1 / 0.3 / 0.6 / 1.2)
-        self.assertAlmostEqual(negative['duration'], positive['duration'] / 1.10)
+        self.assertAlmostEqual(negative['duration'], positive['duration'] / 1.05)
         self.assertEqual((positive['vy'], negative['vy']), (0.3, -0.3))
 
     def test_canvas_string_angles_match_numeric_plan(self):
@@ -300,6 +300,35 @@ class TestLocoRelativeMove(unittest.TestCase):
             self.assertEqual((field['minimum'], field['maximum']), (-5, 5))
             self.assertEqual(field['anyOf'], [{'const': 0}, {'minimum': 0.3}, {'maximum': -0.3}])
         self.assertEqual(schema['properties']['angle']['title'], 'Angle (°)')
+
+
+class TestBundleShutdown(unittest.TestCase):
+    def test_cards_stop_before_safety_peer_even_when_card_cleanup_fails(self):
+        source = Path(__file__).resolve().parents[1] / 'unitree/g1/main.py'
+        tree = ast.parse(source.read_text())
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        server_loop = next(node for node in reversed(main.body) if isinstance(node, ast.Try))
+        cleanup = compile(ast.Module(body=server_loop.finalbody, type_ignores=[]), str(source), 'exec')
+        for fail in (False, True):
+            with self.subTest(card_cleanup_fails=fail):
+                calls = []
+                def stop_cards():
+                    calls.append('cards')
+                    if fail:
+                        raise RuntimeError('card cleanup failed')
+                namespace = {
+                    '_bundle': SimpleNamespace(stop_all=stop_cards),
+                    'smart_motion': SimpleNamespace(shutdown=lambda: calls.append('safety')),
+                    'loco_client': SimpleNamespace(stop=lambda: calls.append('rpc')),
+                    'executor': SimpleNamespace(shutdown=lambda: calls.append('executor')),
+                    'rclpy': SimpleNamespace(shutdown=lambda: calls.append('ros')),
+                }
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, 'card cleanup failed'):
+                        exec(cleanup, namespace)
+                else:
+                    exec(cleanup, namespace)
+                self.assertEqual(calls, ['cards', 'safety', 'rpc', 'executor', 'ros'])
 
 
 class TestPointMotion(unittest.TestCase):

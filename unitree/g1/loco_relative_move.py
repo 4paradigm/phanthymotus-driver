@@ -17,8 +17,8 @@ class LocoRelativeMovePlugin:
     # Lateral travel then overshot by ~20%; shorten only its compensated time.
     TRANSLATION_TIME_FACTORS = (1. / 0.6, 1. / 0.6 / 1.2)
     # Direction-specific visual measurements at the default speeds.
-    RIGHT_ROTATION_TIME_FACTOR = 1. / 1.23
-    NEGATIVE_Y_TIME_FACTOR = 1. / 1.10
+    RIGHT_ROTATION_TIME_FACTOR = 1. / 1.18
+    NEGATIVE_Y_TIME_FACTOR = 1. / 1.05
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
 

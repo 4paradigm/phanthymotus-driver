@@ -509,10 +509,6 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
-        if smart_motion:
-            smart_motion.shutdown()
-        _bundle.stop_all()
-        loco_client.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -521,9 +517,22 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop_all()
-        executor.shutdown()
-        rclpy.shutdown()
+        # Keep the safety peer alive while cards cancel and release sequences.
+        # Perform cleanup once, including after a signal-triggered server exit.
+        try:
+            _bundle.stop_all()
+        finally:
+            try:
+                if smart_motion:
+                    smart_motion.shutdown()
+            finally:
+                try:
+                    loco_client.stop()
+                finally:
+                    try:
+                        executor.shutdown()
+                    finally:
+                        rclpy.shutdown()
 
 
 if __name__ == "__main__":
