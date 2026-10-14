@@ -309,7 +309,8 @@ class IntentControlPlugin(PiperPlugin):
                     'joint_feedback_time': observed.feedback_time if math.isfinite(observed.feedback_time) else None})
                 self.require_motion_permission()
                 if action == 'exit_teaching_and_hold':
-                    result = exit_teaching_and_hold(driver, on_switch=lambda: self._phase('moving'))
+                    result = exit_teaching_and_hold(driver, on_switch=lambda: self._phase('moving'),
+                                                    require_permission=self.require_motion_permission)
                     with self.lifecycle:
                         driver._check_cancelled()
                         self._phase('completed', result=result)

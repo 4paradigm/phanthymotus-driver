@@ -80,6 +80,59 @@ class TeachingExitTests(unittest.TestCase):
         self.assertFalse(self.call()['executed'])
         self.assertEqual(self.sdk.calls, calls)
 
+    def test_permission_revoked_after_mode_blocks_target_and_recovery(self):
+        original = self.sdk.MotionCtrl_2
+        def revoke(*args):
+            original(*args)
+            self.runtime.motion_enabled = False
+        self.sdk.MotionCtrl_2 = revoke
+        with self.assertRaisesRegex(RuntimeError, 'Motion is disabled'):
+            self.call()
+        self.assertEqual(self.controls(), [('mode', 1, 1, 1, 0)])
+
+    def test_permission_revoked_after_first_target_blocks_followup_and_recovery(self):
+        original = self.sdk.JointCtrl
+        def revoke(*args):
+            original(*args)
+            self.runtime.motion_enabled = False
+        self.sdk.JointCtrl = revoke
+        with self.assertRaisesRegex(RuntimeError, 'Motion is disabled'):
+            self.call()
+        self.assertEqual([c[0] for c in self.controls()], ['mode', 'joints'])
+
+    def test_permission_revoked_before_followup_target_blocks_send(self):
+        state = self.driver.get_state
+        reads_after_target = 0
+        def revoke():
+            nonlocal reads_after_target
+            if any(c[0] == 'joints' for c in self.controls()):
+                reads_after_target += 1
+                # First read is confirmation polling; second is the send-lock
+                # feedback check immediately before the followup target.
+                if reads_after_target == 2:self.runtime.motion_enabled = False
+            return state()
+        self.driver.get_state = revoke
+        with self.assertRaisesRegex(RuntimeError, 'Motion is disabled'):
+            self.call()
+        self.assertEqual([c[0] for c in self.controls()], ['mode', 'joints'])
+
+    def test_permission_revoked_between_recovery_mode_and_hold_blocks_hold(self):
+        original = self.sdk.MotionCtrl_2
+        modes = 0
+        def revoke(*args):
+            nonlocal modes
+            original(*args);modes += 1
+            if modes == 2:self.runtime.motion_enabled = False
+        self.sdk.MotionCtrl_2 = revoke
+        def drift(seconds):
+            if self.sdk.mode.startswith('CAN_CTRL'):
+                self.sdk.raw = (self.sdk.raw[0] + 1500, *self.sdk.raw[1:])
+        self.sleep_hook = drift
+        with self.assertRaisesRegex(RuntimeError, 'more than 1 degree'):
+            self.call()
+        self.assertEqual(self.controls()[-1], ('mode', 1, 1, 1, 0))
+        self.assertEqual(modes, 2)
+
     def test_firmware_gate_no_controls_for_old_unknown_or_missing_version(self):
         for version in ('S-V1.8-4', 'S-V1.7-9', 'S-V2.0-0', None, '', 'bogus', 'S-V1.9-0junk'):
             with self.subTest(version=version), patch.object(self.driver, 'firmware', return_value=version), \

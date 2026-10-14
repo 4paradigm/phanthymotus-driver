@@ -27,7 +27,7 @@ def _state(driver, *, ready=False):
     return state
 
 
-def _hold_current_if_ready(driver):
+def _hold_current_if_ready(driver, require_permission):
     try:
         with driver._send_lock:
             actual = _state(driver, ready=True)
@@ -36,13 +36,16 @@ def _hold_current_if_ready(driver):
             target = tuple(round(q * 1000) for q in actual.joints_deg)
             if target != driver._bounded_target(target):
                 return
+            require_permission()
             driver.arm.MotionCtrl_2(0x01, 0x01, 1, 0x00)
+            require_permission()
             driver.arm.JointCtrl(*target)
     except Exception:
         pass  # Lost feedback/ownership means a hold cannot be guaranteed.
 
 
 def exit_teaching_and_hold(driver, *, on_switch=lambda: None,
+                           require_permission=lambda: None,
                            clock=time.monotonic, sleep=time.sleep):
     """Hold measured joints at 1% speed; verify post-command feedback.
 
@@ -93,8 +96,10 @@ def exit_teaching_and_hold(driver, *, on_switch=lambda: None,
             if target != driver._bounded_target(target):
                 raise RuntimeError('The measured pose exceeds effective joint limits.')
             sent_at = time.time()
+            require_permission()
             sent = True  # A partially transmitted mode change also needs recovery.
             driver.arm.MotionCtrl_2(0x01, 0x01, 1, 0x00)
+            require_permission()
             driver.arm.JointCtrl(*target)
 
         deadline = clock() + 5
@@ -103,6 +108,7 @@ def exit_teaching_and_hold(driver, *, on_switch=lambda: None,
         max_drift = 0.
         while clock() < deadline:
             driver._check_cancelled()
+            require_permission()
             actual = _state(driver, ready=can_seen)
             drift = max(abs(a-b) for a,b in zip(actual.joints_deg, target_deg))
             max_drift = max(max_drift, drift)
@@ -134,6 +140,7 @@ def exit_teaching_and_hold(driver, *, on_switch=lambda: None,
                     current = _state(driver, ready=True)
                     if max(abs(a-b) for a,b in zip(current.joints_deg, target_deg)) > 1:
                         raise RuntimeError('The arm moved unexpectedly during teaching exit.')
+                    require_permission()
                     driver.arm.JointCtrl(*target)
             sleep(.05)
         raise RuntimeError('Teaching exit timed out; CAN mode and a stable position were not confirmed.')
@@ -141,5 +148,5 @@ def exit_teaching_and_hold(driver, *, on_switch=lambda: None,
         if sent:
             # At most one measured-pose hold, and only if feedback says CAN
             # control is still healthy and enabled. Never re-enter from teaching.
-            _hold_current_if_ready(driver)
+            _hold_current_if_ready(driver, require_permission)
         raise

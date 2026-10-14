@@ -194,6 +194,30 @@ class IntentTests(unittest.TestCase):
             self.call('move_up')
         self.assertEqual([c[0] for c in self.sdk.calls], ['prepare'])
 
+    def test_teaching_permission_revoked_during_firmware_or_stability_never_controls(self):
+        from agilex.piper.intent_teaching import exit_teaching_and_hold
+        firmware = self.driver.firmware
+        for stage in ('firmware', 'stability'):
+            self.sdk.mode = 'TEACHING_MODE(0x2)'
+            self.sdk.teach = 'STOP_RECORDING(0x2)'
+            self.sdk.calls.clear()
+            self.runtime.motion_enabled = True
+            clock = FastClock()
+            def query(**kwargs):
+                result = firmware(**kwargs)
+                if stage == 'firmware':self.runtime.motion_enabled = False
+                return result
+            def sleep(seconds):
+                if stage == 'stability':self.runtime.motion_enabled = False
+                clock.sleep(seconds)
+            with self.subTest(stage=stage), patch.object(self.driver, 'firmware', side_effect=query), \
+                 patch('agilex.piper.intent_control.exit_teaching_and_hold',
+                       side_effect=lambda *a, **kw: exit_teaching_and_hold(*a, **kw, clock=clock.now, sleep=sleep)), \
+                 self.assertRaisesRegex(RuntimeError, 'Motion is disabled'):
+                self.call('exit_teaching_and_hold')
+            self.assertEqual([c for c in self.sdk.calls if c[0] != 'firmware_query'], [])
+            self.assertEqual(self.call('info')['state'], 'failed')
+
     def test_async_disabled_deployment_reports_failure_without_sdk_commands(self):
         self.runtime.config['async_actions'] = True
         self.runtime.motion_enabled = False

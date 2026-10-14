@@ -28,6 +28,8 @@ CAN adapters are not persistently identified by device hardware yet. Recheck aft
 
 [PR_ACCEPTANCE.md](PR_ACCEPTANCE.md) records current verification and remaining physical acceptance. [DIRECTION_JOG.md](DIRECTION_JOG.md) and [TEACHING_EXIT.md](TEACHING_EXIT.md) contain detailed contracts/history. Deployment is limited to arm 1, preserving arm 2, old code, configuration/backups and the original untracked smoke-test.py. Current forward/right trials passed; this is a review candidate with further physical tests pending.
 
+[JETSON_ARM64.md](JETSON_ARM64.md) describes native ARM64 builds and isolated development tests. Building or testing that image does not deploy it, register with Core or access robot hardware.
+
 The following sections document retained historical implementations and build/photography tooling; their action contracts do not describe the current production entry point.
 
 `direct_control.py` is retained for `status_card.split_status_card` and the legacy entrypoint/direct-control regression fixtures. Production `device.build_plugins` uses `IntentControlPlugin` without installing the legacy adapter.
