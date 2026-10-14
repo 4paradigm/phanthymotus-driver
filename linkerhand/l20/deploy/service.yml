@@ -12,7 +12,7 @@ linkerhand-l20:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
-    - AGENT_CORE_URL=http://127.0.0.1:15678
+    - AGENT_CORE_URL=https://127.0.0.1:15678
   logging:
     driver: local
     options:
