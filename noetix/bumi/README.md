@@ -41,9 +41,10 @@ the calibrated Bumi host `ubuntu` on 2026-10-14, at the per-robot path above.
 Its SHA-256 is `89813968f99881310d5f49ca748d48303dfadfd27e550893d27f1023e5fc660a`.
 The direction card is registered by default; without
 a valid file, `start` and `info` report it unavailable instead of starting a
-silent worker. Before treating
-the packaged file as common to all Bumi units, check a
-second robot at front, right, left and rear positions.
+silent worker. On 2026-10-14, the operator confirmed that this calibration
+can be shared between Bumi robots. This portability confirmation is supplied
+by the operator; the repository's tests validate file geometry and loading,
+not physical direction accuracy.
 
 For existing canvas projects, remove the old `sound_direction_control` card and
 reconnect `sound_direction` to the ASR direction input. Its calibration actions
