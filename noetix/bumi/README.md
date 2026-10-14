@@ -22,13 +22,18 @@ clock's meaning still requires verification on Bumi. Simultaneous readers were
 verified on Bumi with commit cc2c1e2; this capture topology is unchanged.
 
 Lifecycle follows the same contract as the other sensor cards: the driver
-spawns the direction worker at boot and tears it down only on driver
-shutdown or a config save. The canvas `start`/`stop` actions are status
-replies — they never spawn or kill the worker — so stopping intelligent
-control leaves `/<namespace>/sound_direction` streaming.
+spawns the direction worker at boot and tears it down on driver shutdown,
+a config save, or a failed worker start. The canvas `start`/`stop` actions
+are status replies — they never spawn or kill the worker — so stopping
+intelligent control leaves `/<namespace>/sound_direction` streaming.
+
+A worker that dies mid-session is **not** revived by `start`/`stop`/`info`;
+restart the driver to bring the stream back. A config save restarts the
+worker only while it is running; on a dead worker it just writes the
+settings.
 
 Set the one shared parameter from the direction card's left-list gear.
-Saving it restarts the direction worker and waits for it to become ready.
+Saving it restarts a running direction worker and waits for it to become ready.
 
 | Parameter | Default | Effect |
 | --- | --- | --- |

@@ -62,7 +62,10 @@ def load_calibration() -> dict:
 
 
 def _valid_parameter(name: str, value) -> bool:
-    return name in DEFAULT_PARAMETERS and value in SENSITIVITY_GATE_PARAMS
+    # isinstance 先行：value 可能是 list/dict 等不可哈希值（手改坏的 settings.json），
+    # 直接 in 会抛 TypeError 而不是回 False。
+    return (name in DEFAULT_PARAMETERS and isinstance(value, str)
+            and value in SENSITIVITY_GATE_PARAMS)
 
 
 def _migrate_legacy(saved: dict) -> dict | None:
@@ -97,11 +100,15 @@ def load_parameters() -> dict:
         return DEFAULT_PARAMETERS.copy()
     if not isinstance(saved, dict):
         return DEFAULT_PARAMETERS.copy()
-    if set(saved) == set(DEFAULT_PARAMETERS):
-        if all(_valid_parameter(key, value) for key, value in saved.items()):
-            return dict(saved)
+    try:
+        if set(saved) == set(DEFAULT_PARAMETERS):
+            if all(_valid_parameter(key, value) for key, value in saved.items()):
+                return dict(saved)
+            return DEFAULT_PARAMETERS.copy()
+        return _migrate_legacy(saved) or DEFAULT_PARAMETERS.copy()
+    except Exception:
+        # 任何形状的损坏内容都回默认，不让坏文件卡死控制面。
         return DEFAULT_PARAMETERS.copy()
-    return _migrate_legacy(saved) or DEFAULT_PARAMETERS.copy()
 
 
 def activity_payload(audio, calibration, audio_window, published_us) -> SoundDirection | None:

@@ -312,17 +312,28 @@ def test_legacy_settings_file_maps_to_presets(monkeypatch, tmp_path):
     assert module.load_parameters() == {'sensitivity': 'normal'}
     path.write_text('not json')
     assert module.load_parameters() == {'sensitivity': 'normal'}
+    # 不可哈希/错误类型的值不得抛 TypeError，一律回默认
+    path.write_text(json.dumps({'sensitivity': ['high']}))
+    assert module.load_parameters() == {'sensitivity': 'normal'}
+    path.write_text(json.dumps({'sensitivity': {'a': 1}}))
+    assert module.load_parameters() == {'sensitivity': 'normal'}
+    path.write_text(json.dumps({'sensitivity': 5}))
+    assert module.load_parameters() == {'sensitivity': 'normal'}
 
 
 def test_sensitivity_preset_table_matches_documentation(monkeypatch):
     module = _load_card(monkeypatch)
     assert module.DEFAULT_PARAMETERS == {'sensitivity': 'normal'}
     assert set(module.SENSITIVITY_GATE_PARAMS) == {'high', 'normal', 'low'}
-    assert module.SENSITIVITY_GATE_PARAMS['normal'] == {
-        'onset_level': 10.0, 'onset_ratio': 2.0,
-        'burst_level': 15.0, 'burst_ratio': 4.0}
-    for preset in module.SENSITIVITY_GATE_PARAMS.values():
-        assert set(preset) == {'onset_level', 'onset_ratio', 'burst_level', 'burst_ratio'}
+    # 三档全部逐值冻结：任何一档的语义漂移都必须炸测试（含后续风扇修复的改档）。
+    assert module.SENSITIVITY_GATE_PARAMS == {
+        'high':   {'onset_level': 8.0,  'onset_ratio': 1.6,
+                   'burst_level': 12.0, 'burst_ratio': 3.2},
+        'normal': {'onset_level': 10.0, 'onset_ratio': 2.0,
+                   'burst_level': 15.0, 'burst_ratio': 4.0},
+        'low':    {'onset_level': 15.0, 'onset_ratio': 2.5,
+                   'burst_level': 25.0, 'burst_ratio': 5.0},
+    }
     assert module.UPDATE_INTERVAL_MS == 100
 
 
@@ -335,4 +346,7 @@ def test_config_rejects_legacy_key_names(monkeypatch, tmp_path):
     for legacy_key, value in [('onset_ratio', 2.4), ('burst_ratio', 0.5),
                               ('update_interval_ms', 50), ('onset_level', 12.0)]:
         assert card.dispatch('config', {legacy_key: value})['state'] == 'invalid_parameters'
+    # 不可哈希/错误类型的值也要走 invalid_parameters，而不是 TypeError
+    for bad in (['high'], {'a': 1}, 5):
+        assert card.dispatch('config', {'sensitivity': bad})['state'] == 'invalid_parameters'
     assert json.loads(path.read_text()) == {'sensitivity': 'normal'}
