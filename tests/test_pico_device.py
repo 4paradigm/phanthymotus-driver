@@ -261,7 +261,8 @@ def load_driver_module(name):
     return module
 
 
-def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path):
+@pytest.mark.parametrize("port", [None, 17441])
+def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path, port):
     import yaml
 
     root = Path(__file__).parents[1]
@@ -271,6 +272,7 @@ def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path):
         {
             "state_dir": str(tmp_path),
             "public_wss_url": "wss://127.0.0.1:15741/ws/teleop-capture",
+            **({"port": port} if port is not None else {}),
         },
         "pico",
     )
@@ -282,9 +284,13 @@ def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path):
         assert info["topic_out"][0]["topic"] == "/teleop/command"
         assert "feedback_topic" not in info
         assert info["config"]["driver_installed"]
-        assert set(tool["configSchema"]["properties"]) == {"management_pin"}
+        assert set(tool["configSchema"]["properties"]) == {"management_pin", "install"}
+        qr = tool["configSchema"]["properties"]["install"]
+        assert qr["format"] == "qr" and qr["scope"] == "instance"
+        assert qr["x-qr-options"] == [{"label": "下载与配对", "url": f"https://{{host}}:{port or 15741}/onboarding"}]
+        assert "install" not in tool["configSchema"].get("required", [])
+        assert "install" not in info["config"]
         assert tool["configSchema"]["properties"]["management_pin"]["x-sensitive"] is True
-        assert info["installation_url"] in tool["configSchema"]["description"]
         assert plugin.instances == {}
     finally:
         plugin.close()

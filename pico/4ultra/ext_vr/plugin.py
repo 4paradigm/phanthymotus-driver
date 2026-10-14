@@ -39,20 +39,13 @@ class ExtVrPlugin:
         return [self.get_tool()]
 
     def get_tool(self):
-        origin = (
-            self.config.get("public_wss_url", "")
-            .replace("wss://", "https://")
-            .split("/ws/")[0]
-        )
         return {
             "name": self.PREFIX,
             "type": "sensor",
             "description": (
                 "PICO 设备安装步骤：1. 部署 PICO 和机器人遥操 Driver；"
                 "2. 首次设置四位管理 PIN 并保存配置；下载 App 无需 PIN；"
-                "3. 复制网址下载 App 并在网页配对，连接 teleop_control 后开启项目；佩戴头显，松开双握把就绪后按住双握把遥操。"
-                + "下载与配对网址：" + origin + "/onboarding。"
-                +
+                "3. 扫码或复制二维码旁的链接下载 App 并在网页配对，连接 teleop_control 后开启项目；佩戴头显，松开双握把就绪后按住双握把遥操。"
                 "本卡只采集输入，不直接执行机器人动作。"
             ),
             "multiInstance": False,
@@ -69,8 +62,16 @@ class ExtVrPlugin:
             },
             "configSchema": {
                 "type": "object",
-                "description": "App 下载与配对网址（复制到浏览器）：" + origin + "/onboarding。地址由 Driver 自动生成。配对不会启动机器人。",
+                "description": "扫码或复制二维码旁的链接打开 App 下载与配对页。配对不会启动机器人。",
                 "properties": {
+                    "install": {
+                        "type": "string", "format": "qr", "scope": "instance",
+                        "description": "扫码打开 PICO App 下载与配对页",
+                        "x-qr-options": [{
+                            "label": "下载与配对",
+                            "url": f"https://{{host}}:{self.config.get('port', 15741)}/onboarding",
+                        }],
+                    },
                     "management_pin": {
                         "type": "string", "title": "管理 PIN（四位数字）",
                         "description": "首次自行设置，之后固定保存；留空保留已有 PIN。仅用于网页配对管理，下载和已配对设备重连无需输入。",
