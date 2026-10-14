@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import sys
+import threading
+import io
+import json
 from pathlib import Path
 
 import pytest
@@ -120,6 +123,35 @@ class FakeConnection:
         self.client.close()
 
 
+def capture_completions(plugin):
+    events = []
+    done = threading.Event()
+
+    def callback(action_id, status, result):
+        events.append((action_id, status, result))
+        done.set()
+
+    plugin._acp_callback = callback
+    return events, done
+
+
+def completed_motion(plugin, action, args, events, done):
+    done.clear()
+    accepted = plugin.dispatch(action, args)
+    assert accepted["state"] == "running"
+    assert accepted["action_id"].startswith(f"hand_{action}_")
+    assert done.wait(2), "ACP completion was not delivered"
+    action_id, status, result = events[-1]
+    assert action_id == accepted["action_id"]
+    assert status == "completed"
+    for _ in range(100):
+        if plugin.dispatch("info", {})["active_action_id"] is None:
+            break
+        threading.Event().wait(0.001)
+    assert plugin.dispatch("info", {})["active_action_id"] is None
+    return result
+
+
 def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
     assert JOINT_NAMES == [
         "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
@@ -128,15 +160,16 @@ def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
     assert RIGHT_FIST_POSE == [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
     connection = FakeConnection()
     plugin = HandPlugin(connection, {"poll_interval_s": 0.02})
+    events, done = capture_completions(plugin)
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
     plugin.start()
     assert connection.transport.sent == []
     assert plugin.dispatch("start", {}) == {"state": "ready"}
     assert connection.transport.sent == []
-    closed = plugin.dispatch("close", {"confirm_motion": True})
+    closed = completed_motion(plugin, "close", {"confirm_motion": True}, events, done)
     assert closed["state"] == "completed"
     assert connection.client.get_positions() == RIGHT_FIST_POSE
-    opened = plugin.dispatch("open", {"confirm_motion": True})
+    opened = completed_motion(plugin, "open", {"confirm_motion": True}, events, done)
     assert opened["state"] == "completed"
     assert connection.client.get_positions() == RIGHT_OPEN_POSE
     assert plugin.dispatch("stop", {})["state"] == "idle"
@@ -181,20 +214,123 @@ def test_canvas_card_schema_and_csv_positions(monkeypatch):
         "description": "确认手附近无人和障碍物后，每次运动显式输入 true",
     }
     assert card["inputSchema"]["x-is-dangerous"] is True
+    assert plugin.PREFIX == "hand"
+    assert card["inputSchema"]["x-completion"]["actions"] == ["open", "close", "set_joint", "set_positions"]
     assert card["inputSchema"]["allOf"][0]["then"]["required"] == ["confirm_motion"]
     for action in ("open", "close", "set_joint", "set_positions"):
         assert card["inputSchema"]["x-action-params"][action]["params"][-1] == "confirm_motion"
     for action in ("get_state", "set_speed", "set_torque", "release"):
         assert "confirm_motion" not in card["inputSchema"]["x-action-params"][action]["params"]
     assert plugin.dispatch("info", {})["serial_port"] == "/dev/fake"
+    events, done = capture_completions(plugin)
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
     pose = [254, 254, 234, 254, 254, 254, 127, 126, 127, 254]
-    result = plugin.dispatch("set_positions", {"positions": ",".join(map(str, pose)), "confirm_motion": True})
+    result = completed_motion(plugin, "set_positions", {"positions": ",".join(map(str, pose)), "confirm_motion": True}, events, done)
     assert result["state"] == "completed"
     assert connection.client.get_positions() == pose
     assert plugin.dispatch("release", {})["state"] == "released"
     with pytest.raises(ValueError, match="expected 10"):
         plugin.dispatch("set_positions", {"positions": "1,2,3", "confirm_motion": True})
+
+
+def test_motion_error_notifies_acp_and_allows_later_request():
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, {})
+    events, done = capture_completions(plugin)
+    connection.transport.corrupt_next = True
+    accepted = plugin.dispatch("close", {"confirm_motion": True})
+    assert accepted["state"] == "running"
+    assert done.wait(2)
+    assert events[0][0] == accepted["action_id"]
+    assert events[0][1] == "error"
+    assert "CRC" in events[0][2]["message"]
+    for _ in range(100):
+        if plugin.dispatch("info", {})["active_action_id"] is None:
+            break
+        threading.Event().wait(0.001)
+    assert plugin.dispatch("info", {})["active_action_id"] is None
+
+
+def test_acp_callback_posts_terminal_payload_and_checks_acknowledgement(monkeypatch):
+    plugin = HandPlugin(FakeConnection(), {})
+    requests = []
+
+    def fake_urlopen(request, **kwargs):
+        requests.append((request, kwargs))
+        return io.BytesIO(b'{"ok": true, "action_id": "hand-test"}')
+
+    monkeypatch.setattr("modbus_device.urllib.request.urlopen", fake_urlopen)
+    plugin._acp_callback("hand-test", "completed", {"state": "completed"})
+    request, kwargs = requests[0]
+    assert request.full_url == "https://localhost:15678/api/acp/complete"
+    assert kwargs["timeout"] == 5
+    assert json.loads(request.data)["tool"] == "hand"
+    assert json.loads(request.data)["status"] == "completed"
+
+
+def test_failed_acp_delivery_blocks_new_motion():
+    plugin = HandPlugin(FakeConnection(), {})
+    done = threading.Event()
+
+    def reject(*_args):
+        done.set()
+        raise RuntimeError("Core did not acknowledge")
+
+    plugin._acp_callback = reject
+    accepted = plugin.dispatch("open", {"confirm_motion": True})
+    assert accepted["state"] == "running"
+    assert done.wait(2)
+    for _ in range(100):
+        if plugin._completion_delivery_failed:
+            break
+        threading.Event().wait(0.001)
+    with pytest.raises(RuntimeError, match="ACP completion delivery failed"):
+        plugin.dispatch("close", {"confirm_motion": True})
+
+
+def test_overlapping_motion_is_rejected_until_completion(monkeypatch):
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, {})
+    events, done = capture_completions(plugin)
+    entered, proceed = threading.Event(), threading.Event()
+
+    def pause(_seconds):
+        entered.set()
+        assert proceed.wait(2)
+
+    monkeypatch.setattr("modbus_device.time.sleep", pause)
+    accepted = plugin.dispatch("close", {"confirm_motion": True})
+    assert entered.wait(2)
+    with pytest.raises(RuntimeError, match="another hand motion"):
+        plugin.dispatch("open", {"confirm_motion": True})
+    proceed.set()
+    assert done.wait(2)
+    assert events[0][0] == accepted["action_id"]
+
+
+def test_stop_notifies_cancelled_without_followup_target(monkeypatch):
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, {})
+    events, done = capture_completions(plugin)
+    entered, proceed = threading.Event(), threading.Event()
+
+    def pause(_seconds):
+        entered.set()
+        assert proceed.wait(2)
+
+    monkeypatch.setattr("modbus_device.time.sleep", pause)
+    accepted = plugin.dispatch("close", {"confirm_motion": True})
+    assert entered.wait(2)
+    stopped = threading.Thread(target=lambda: plugin.dispatch("stop", {}))
+    stopped.start()
+    assert plugin._stop_requested.wait(2)
+    proceed.set()
+    stopped.join(2)
+    assert done.wait(2)
+    assert events[0][0] == accepted["action_id"]
+    assert events[0][1] == "cancelled"
+    assert connection.client.get_positions() != RIGHT_FIST_POSE
+    assert connection.client.get_torques() == [0] * 10
 
 
 @pytest.mark.parametrize("action,args", [

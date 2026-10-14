@@ -17,9 +17,10 @@ COPY deploy/       /deploy/
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_LOCALHOST_ONLY=0
+ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/work
 
-EXPOSE 15731
+EXPOSE 15733
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]

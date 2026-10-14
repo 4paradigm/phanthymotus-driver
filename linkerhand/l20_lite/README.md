@@ -33,6 +33,13 @@ configured torque enabled after success so the hand holds its position.
 If a move times out or raises after a position command, the driver attempts to
 release torque.
 
+Motion actions use ACP: the card returns `state=running` and a unique
+`action_id` immediately, then reports `completed`, `error` or `cancelled` to
+Agent Core at `/api/acp/complete`. Do not repeat an action while it is pending.
+The driver also rejects overlapping motions locally. `stop` interrupts a
+pending motion and releases torque; if completion delivery fails, the driver
+blocks further motion until it is inspected and restarted.
+
 For local tests without hardware:
 
 ```bash

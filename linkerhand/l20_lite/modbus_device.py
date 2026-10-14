@@ -5,6 +5,11 @@ from __future__ import annotations
 import threading
 import time
 import re
+import json
+import os
+import ssl
+import urllib.request
+from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
 from modbus_client import JOINT_COUNT, L20LiteModbusClient, _bytes
@@ -66,6 +71,8 @@ class L20LiteConnection:
 
 
 class HandPlugin:
+    PREFIX = "hand"
+
     def __init__(self, connection: L20LiteConnection, config: dict):
         self.connection = connection
         if connection.side != "right" and ("open_pose" not in config or "fist_pose" not in config):
@@ -85,6 +92,10 @@ class HandPlugin:
             raise ValueError("poll_interval_s must be in 0.02..1 seconds")
         self._motion_lock = threading.RLock()
         self._stop_requested = threading.Event()
+        self._state_lock = threading.Lock()
+        self._active: dict | None = None
+        self._last_result: dict | None = None
+        self._completion_delivery_failed = False
 
     @staticmethod
     def _setting(value, name: str) -> int:
@@ -118,6 +129,11 @@ class HandPlugin:
             "then": {"required": ["confirm_motion"]},
         }]
         schema["x-is-dangerous"] = True
+        schema["x-completion"] = {
+            # Allow the motion deadline plus callback retries and Core registration.
+            "actions": list(MOTION_ACTIONS), "timeout": int(self.motion_timeout_s) + 25,
+        }
+        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
         definition = tool(
             "hand", "actuator",
             "LinkerHand L20 Lite USB-RS485/Modbus 控制。每次运动必须显式传 confirm_motion=true。",
@@ -141,16 +157,21 @@ class HandPlugin:
 
     def _move(self, target: list[int], action: str) -> dict:
         with self._motion_lock:
-            self._stop_requested.clear()
+            if self._stop_requested.is_set():
+                raise InterruptedError("hand motion stopped")
             client = self.connection.get()
             current = client.get_positions()  # fail closed if no valid reply
             if all(abs(a - b) <= self.position_tolerance for a, b in zip(current, target)):
                 return {"state": "already_at_target", "action": action, "positions": _named(current)}
+            if self._stop_requested.is_set():
+                raise InterruptedError("hand motion stopped")
             energized = False
             try:
                 client.set_speeds([self.motion_speed] * JOINT_COUNT)
                 energized = True
                 client.set_torques([self.motion_torque] * JOINT_COUNT)
+                if self._stop_requested.is_set():
+                    raise InterruptedError("hand motion stopped")
                 halfway = [(a + b) // 2 for a, b in zip(current, target)]
                 client.set_positions(halfway)
                 time.sleep(0.8)
@@ -183,6 +204,99 @@ class HandPlugin:
                         pass
                 raise
 
+    def _acp_callback(self, action_id: str, status: str, result: dict) -> None:
+        """Deliver one terminal result; retry only the notification, never motion."""
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        context = ssl.create_default_context(cafile=os.environ.get("AGENT_CORE_CA_CERT") or None)
+        if not os.environ.get("AGENT_CORE_CA_CERT") and url.startswith(
+            ("https://localhost:", "https://127.0.0.1:")
+        ):
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        payload = json.dumps({
+            "action_id": action_id, "status": status, "result": result,
+            "tool": self.PREFIX, "ts": time.time(),
+        }, ensure_ascii=False).encode()
+        error = None
+        for attempt in range(3):
+            try:
+                request = urllib.request.Request(
+                    url + "/api/acp/complete", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5, context=context) as response:
+                    acknowledgement = json.load(response)
+                if acknowledgement.get("ok") is not True or acknowledgement.get("action_id") != action_id:
+                    raise RuntimeError("Agent Core did not acknowledge action_id")
+                return
+            except Exception as exc:
+                error = exc
+                if attempt < 2:
+                    time.sleep(0.5)
+        raise RuntimeError(f"ACP completion delivery failed: {error}")
+
+    def _run_motion(self, active: dict) -> None:
+        action = active["action"]
+        try:
+            if action == "set_joint":
+                with self._motion_lock:
+                    if self._stop_requested.is_set():
+                        raise InterruptedError("hand motion stopped")
+                    target = self.connection.get().get_positions()
+                    target[JOINT_NAMES.index(active["joint"])] = active["position"]
+                    result = self._move(target, action)
+            else:
+                result = self._move(active["target"], action)
+            status = "error" if result["state"] == "released_timeout" else "completed"
+        except InterruptedError as exc:
+            status, result = "cancelled", {"state": "cancelled", "message": str(exc)}
+        except Exception as exc:
+            status, result = "error", {"state": "error", "message": str(exc)}
+        terminal = {"action_id": active["action_id"], "status": status, "result": result}
+        with self._state_lock:
+            self._last_result = terminal
+        try:
+            self._acp_callback(active["action_id"], status, result)
+        except Exception as exc:
+            # Fail closed: Core may still hold a pending barrier. Do not admit
+            # another motion until the failed notification is investigated.
+            with self._state_lock:
+                self._completion_delivery_failed = True
+                terminal["callback_error"] = str(exc)
+            print(f"[ACP] {active['action_id']}: {exc}", flush=True)
+        else:
+            with self._state_lock:
+                if self._active is active:
+                    self._active = None
+
+    def _start_motion(self, action: str, args: dict) -> dict:
+        # Validate all user input before accepting an ACP action or opening serial.
+        active = {"action": action, "action_id": f"hand_{action}_{uuid4().hex}"}
+        if action == "set_joint":
+            joint = args.get("joint")
+            if joint not in JOINT_NAMES:
+                raise ValueError(f"unknown joint: {joint}")
+            active["joint"] = joint
+            active["position"] = _bytes([args.get("position")], expected=1)[0]
+        elif action == "set_positions":
+            active["target"] = _positions_from_card(args.get("positions"))
+        else:
+            active["target"] = list(self.open_pose if action == "open" else self.fist_pose)
+        with self._state_lock:
+            if self._completion_delivery_failed:
+                raise RuntimeError("ACP completion delivery failed; restart driver after checking Core")
+            if self._active is not None:
+                raise RuntimeError("another hand motion is active")
+            self._stop_requested.clear()
+            self._active = active
+            try:
+                threading.Thread(target=self._run_motion, args=(active,),
+                                 name=active["action_id"], daemon=True).start()
+            except Exception:
+                self._active = None
+                raise
+        return {"state": "running", "action_id": active["action_id"]}
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in MOTION_ACTIONS and args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true for every movement request")
@@ -190,11 +304,16 @@ class HandPlugin:
             # Canvas lifecycle marker; opening a card must not move the hand.
             return {"state": "ready"}
         if action == "info":
+            with self._state_lock:
+                active_id = self._active["action_id"] if self._active else None
+                last_result = self._last_result
             return {
                 "description": f"L20 Lite {self.connection.side} USB-RS485/Modbus 控制卡片",
                 "side": self.connection.side,
                 "serial_port": self.connection.port,
                 "joint_names": JOINT_NAMES,
+                "active_action_id": active_id,
+                "last_result": last_result,
             }
         if action == "get_state":
             with self._motion_lock:
@@ -213,21 +332,8 @@ class HandPlugin:
             if speeds is None:
                 result["speed_error"] = speed_error
             return result
-        if action == "open":
-            return self._move(self.open_pose, "open")
-        if action == "close":
-            return self._move(self.fist_pose, "close")
-        if action == "set_joint":
-            joint = args.get("joint")
-            if joint not in JOINT_NAMES:
-                raise ValueError(f"unknown joint: {joint}")
-            value = _bytes([args.get("position")], expected=1)[0]
-            with self._motion_lock:
-                target = self.connection.get().get_positions()
-                target[JOINT_NAMES.index(joint)] = value
-                return self._move(target, "set_joint")
-        if action == "set_positions":
-            return self._move(_positions_from_card(args.get("positions")), "set_positions")
+        if action in MOTION_ACTIONS:
+            return self._start_motion(action, args)
         if action == "set_speed":
             speed = self._setting(args.get("speed"), "speed")
             with self._motion_lock:

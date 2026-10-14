@@ -23,7 +23,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
-| `linkerhand/l20_lite` | LinkerHand L20 Lite | 15731 | USB-RS485/Modbus 115200, 10-joint position/speed/torque control and state reads |
+| `linkerhand/l20_lite` | LinkerHand L20 Lite | 15733 | USB-RS485/Modbus 115200, 10-joint position/speed/torque control and state reads |
 
 ## Quick Start
 
