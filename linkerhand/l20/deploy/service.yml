@@ -8,7 +8,7 @@ linkerhand-l20:
     - /run/udev:/run/udev:ro
   environment:
     - PYTHONUNBUFFERED=1
-    - AGENT_CORE_URL=http://127.0.0.1:15678
+    - AGENT_CORE_URL=https://127.0.0.1:15678
   logging:
     driver: local
     options:
