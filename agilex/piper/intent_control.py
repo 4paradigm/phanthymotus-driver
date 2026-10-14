@@ -95,7 +95,7 @@ class IntentControlPlugin(PiperPlugin):
                          'title': 'Gripper opening (mm)', 'description': f'{low:g}–{high:g} mm; effective limits.'}})
         labels = {'select_action': 'Choose an action',
                   **{action: ('Raise' if direction == 'up' else 'Lower' if direction == 'down'
-                              else 'Move ' + direction) + ' · 1 mm' for action, direction in DIRECTION_ACTIONS.items()},
+                              else 'Move ' + direction) for action, direction in DIRECTION_ACTIONS.items()},
                   'stop_motion': 'Stop',
                   'open_gripper': 'Open gripper', 'close_gripper': 'Close gripper',
                   'set_gripper_opening': 'Set gripper opening', 'exit_teaching_and_hold': 'Exit teaching and hold',
