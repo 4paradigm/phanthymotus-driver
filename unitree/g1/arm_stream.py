@@ -10,6 +10,7 @@ import copy
 import hashlib
 import hmac
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -705,6 +706,10 @@ class ArmStreamExecutor:
                     next_q=[p+max(-limit,min(limit,t-p)) for p,t in zip(self.last_q,self.latest['values'])]
                 if (not self._proof or not self._proof.allows(self.latest,q,self.last_q,next_q,now_ns=now)
                         or any(not lo<=x<=hi for x,(lo,hi) in zip(next_q,self.limits))):
+                    logging.getLogger(__name__).warning('motion envelope rejected: seq=%s age_ms=%s measured=%s previous=%s next=%s lower=%s upper=%s',
+                        self.latest['seq'], None if not self._proof else (now-self._proof.measured_ns)/1e6,
+                        q, self.last_q, next_q, None if not self._proof else self._proof.lower,
+                        None if not self._proof else self._proof.upper)
                     self.hold('motion_envelope_exceeded',recoverable=True);return
                 tau = None if servo else vector(self._gravity(next_q),10,'gravity_tau')
                 if tau is not None and any(abs(t)>lim for t,lim in zip(tau,self.torque_limits)):raise ValueError('gravity_torque_limit')
