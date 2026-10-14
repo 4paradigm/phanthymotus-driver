@@ -356,6 +356,76 @@ def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
     assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
 
 
+def test_stop_during_rotate_startup_is_preserved(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    entered, release = threading.Event(), threading.Event()
+    box = {}
+
+    def get_mode():
+        entered.set()
+        assert release.wait(2)
+        return 2
+
+    monkeypatch.setattr(fake, 'get_mode', get_mode)
+    monkeypatch.setattr(module, '_rotate_timeout_s', lambda angle: 0.1)
+    worker = threading.Thread(target=lambda: box.update(result=plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'}) == {'state': 'stopped'}
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert box['result']['state'] == 'stopped'
+    assert all(cmd == (0, 0, 0) for cmd in fake.cmds)
+
+
+def test_move_startup_cannot_overlap_rotate(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    entered, release, rotating = threading.Event(), threading.Event(), threading.Event()
+    box = {}
+
+    def get_mode():
+        if threading.current_thread().name == 'starting_move':
+            entered.set()
+            assert release.wait(2)
+        return 2
+
+    publish = fake.publish_cmd
+
+    def publish_cmd(x, y, z, action_cmd, index=0):
+        publish(x, y, z, action_cmd, index)
+        if z != 0:
+            rotating.set()
+
+    monkeypatch.setattr(fake, 'get_mode', get_mode)
+    monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
+    monkeypatch.setattr(module, '_rotate_timeout_s', lambda angle: 0.3)
+    mover = threading.Thread(name='starting_move', target=lambda: box.update(move=plugin.dispatch(
+        'move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 0.1})), daemon=True)
+    rotator = threading.Thread(target=lambda: box.update(rotate=plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})), daemon=True)
+    mover.start()
+    try:
+        assert entered.wait(2)
+        rotator.start()
+        rotating.wait(0.1)
+    finally:
+        release.set()
+        mover.join(2)
+        rotator.join(2)
+        plugin.dispatch('stop_move', {'_tool_name': 'loco'})
+    assert not mover.is_alive() and not rotator.is_alive()
+    first_rotate = next(i for i, cmd in enumerate(fake.cmds) if cmd[2] != 0)
+    assert all(x == 0 and y == 0 for x, y, z in fake.cmds[first_rotate:])
+
+
 def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):
     # 负角与正角对称（copysign 对称性）：-60 → 实际转过 ≈ -60，仍在 ±2° 容差内收敛。
     module, _ = _load_device(monkeypatch)

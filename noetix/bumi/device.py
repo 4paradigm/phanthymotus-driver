@@ -357,6 +357,7 @@ class LocoPlugin:
         self._move_stop_event = threading.Event()
         # loco_destination rotate bookkeeping, read by _rotate_status.
         self._rotate_lock = threading.Lock()
+        self._rotate_stop_event = threading.Event()
         self._rotate_state: dict = {"state": "idle", "last_result": None}
 
     def get_tools(self) -> list:
@@ -570,11 +571,8 @@ class LocoPlugin:
             self._last_cmd_time = time.monotonic()
 
     def _do_move(self, args: dict) -> dict:
-        # Busy-guard (C1): a running loco_destination rotate lives on this
-        # dispatch thread, not _move_thread, so the set→join→clear preamble
-        # below would join nothing and its clear() could wipe a pending stop
-        # meant for that rotate. Refuse while a rotate runs; stop_move never
-        # routes through here, so stopping always works.
+        # Reserve move startup until its worker exists, so rotate cannot
+        # enter between the busy check and launching the move thread.
         with self._rotate_lock:
             if self._rotate_state["state"] == "running":
                 return {
@@ -584,6 +582,9 @@ class LocoPlugin:
                         "finish or call stop_move first"
                     ),
                 }
+            return self._do_move_impl(args)
+
+    def _do_move_impl(self, args: dict) -> dict:
         # Check if in walking mode
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
@@ -638,6 +639,7 @@ class LocoPlugin:
             return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
 
     def _stop_move(self) -> dict:
+        self._rotate_stop_event.set()
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
@@ -649,12 +651,8 @@ class LocoPlugin:
         # Bookkeeping wrapper: mark running on entry; on every completed path
         # (done/timeout/stopped/error) record idle + the full result so
         # _rotate_status can report the last real outcome.
-        # Busy-guard (C1): atomic check-and-set so a re-entrant rotate (from
-        # any thread) is refused before it can run a second mutex preamble
-        # whose clear() would wipe the active rotate's pending stop signal.
-        # The guard lives here, before the "running" mark, because inside
-        # _do_rotate_impl the state already reads "running" for this very
-        # caller — an impl-level check would refuse the active rotate itself.
+        # Reserve one rotation and initialize its cancellation atomically,
+        # before exposing running status. Later stops survive move cleanup.
         with self._rotate_lock:
             if self._rotate_state["state"] == "running":
                 return {
@@ -664,6 +662,7 @@ class LocoPlugin:
                         "finish or call stop_move first"
                     ),
                 }
+            self._rotate_stop_event.clear()
             self._rotate_state["state"] = "running"
         result = None
         try:
@@ -766,7 +765,7 @@ class LocoPlugin:
                     if time.monotonic() >= deadline:
                         result_state = "timeout"
                         break
-                    if self._move_stop_event.is_set():
+                    if self._rotate_stop_event.is_set():
                         result_state = "stopped"
                         break
                     if abs(err) <= _ROTATE_TOL_DEG:
