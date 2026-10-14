@@ -22,7 +22,21 @@ struct IkVisualization {
   std::string mode, state, reason;
   double intent_age_ms{1e9};
   IkChains measured, ik, command, body, held_ik;
-  bool tianyi{false}, unified{false};
+  bool tianyi{false}, unified{false}, teleop{false}, alignment_ready{false};
+  std::string alignment_state{"unavailable"};
+  std::array<double,2> position_error_m{}, orientation_error_rad{};
+  double feedback_age_ms{0};
+  bool ready() const {
+    return fresh() && feedback_fresh && current_ik() && alignment_ready;
+  }
+  std::string alignment_label() const {
+    if(!fresh() || !feedback_fresh || alignment_state=="unavailable")return "ALIGNMENT UNAVAILABLE";
+    if(alignment_state=="unreachable")return "TARGET UNREACHABLE";
+    if(!current_ik())return "ALIGNMENT UNAVAILABLE";
+    if(ready())return "READY";
+    if(alignment_state=="active")return "ACTIVE";
+    return "NOT ALIGNED";
+  }
   float shoulder_height{.29178f};
   std::vector<IkPoint> targets, requested_targets;
   IkChains workspace_bounds;
@@ -30,13 +44,15 @@ struct IkVisualization {
   std::chrono::steady_clock::time_point received{};
   bool current_ik() const {
     return fresh() && intent_age_ms + std::chrono::duration<double,std::milli>(
-      std::chrono::steady_clock::now()-received).count() < 750 && !ik.empty();
+      std::chrono::steady_clock::now()-received).count() < (teleop ? 300 : 750) && !ik.empty();
   }
   const IkChains& displayed_ik() const {
+    if(teleop && !current_ik()) { static const IkChains empty; return empty; }
     return current_ik() || !tianyi ? ik : (held_ik.empty() ? ik : held_ik);
   }
   bool fresh() const {
-    return available && std::chrono::steady_clock::now()-received < std::chrono::milliseconds(750);
+    const auto age=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-received).count();
+    return available && age + (teleop ? feedback_age_ms : 0) < 750;
   }
 };
 inline IkPoint ParseIkPoint(const nlohmann::json& value) {
@@ -62,14 +78,15 @@ inline IkChains ParseIkChains(const nlohmann::json& value, std::size_t count=6) 
   return result;
 }
 inline IkVisualization ParseIkVisualization(const nlohmann::json& envelope) {
-  const bool motion=envelope.value("schema",std::string{})=="motus.motion.feedback/1";
+  const bool teleop=envelope.value("schema",std::string{})=="motus.teleop.feedback/1";
+  const bool motion=teleop || envelope.value("schema",std::string{})=="motus.motion.feedback/1";
   if(motion && (!envelope.value("available",true) || !envelope.contains("visualization"))) {
-    IkVisualization empty; empty.reason=envelope.value("reason",std::string("feedback_unavailable"));return empty;
+    IkVisualization empty; empty.teleop=teleop;empty.unified=teleop; empty.reason=envelope.contains("reason") && envelope["reason"].is_string()?envelope["reason"].get<std::string>():"feedback_unavailable";return empty;
   }
   if(motion) {
     if(envelope.dump().size()>65536)throw std::invalid_argument("feedback_size");
     const auto& v=envelope.at("visualization");
-    IkVisualization r;r.tianyi=true;r.unified=true;r.received=std::chrono::steady_clock::now();
+    IkVisualization r;r.teleop=teleop;r.tianyi=true;r.unified=true;r.received=std::chrono::steady_clock::now();
     r.available=v.value("available",false);r.reason=v.value("reason",std::string{});
     if(!r.available)return r;
     r.mode=envelope.value("mode",std::string("shadow"));r.state=envelope.value("state",std::string{});
@@ -93,6 +110,26 @@ inline IkVisualization ParseIkVisualization(const nlohmann::json& envelope) {
     }
     r.shoulder_height=v.value("shoulder_height",.29178f);
     if(!std::isfinite(r.shoulder_height)||std::abs(r.shoulder_height)>2)throw std::invalid_argument("feedback_shoulder");
+    if(teleop) {
+      r.feedback_age_ms=v.value("feedback_age_ms",0.0);
+      if(!std::isfinite(r.feedback_age_ms)||r.feedback_age_ms<0)throw std::invalid_argument("feedback_age");
+      if(envelope.contains("alignment")){
+        const auto& a=envelope.at("alignment");
+        r.alignment_state=a.at("state").get<std::string>();
+        r.alignment_ready=a.at("ready").get<bool>();
+        if(r.alignment_state!="ready" && r.alignment_state!="unaligned" && r.alignment_state!="active"
+           && r.alignment_state!="unreachable" && r.alignment_state!="unavailable")throw std::invalid_argument("alignment_state");
+        if(r.alignment_ready!=(r.alignment_state=="ready"))throw std::invalid_argument("alignment_ready");
+        if(r.alignment_state!="unavailable")for(int i=0;i<2;++i){
+          const auto& arm=a.at(i==0?"left":"right");
+          auto number=[&](const char* key,double max){double x=arm.at(key).get<double>();if(!std::isfinite(x)||x<0||x>max)throw std::invalid_argument("alignment_error");return x;};
+          r.position_error_m[i]=number("position_error_m",8);
+          r.orientation_error_rad[i]=number("orientation_error_rad",3.141592653589793);
+          number("position_tolerance_m",8);number("orientation_tolerance_rad",3.141592653589793);
+        }
+        if(r.alignment_ready && (!r.feedback_fresh || r.measured.size()!=2 || r.ik.size()!=2))throw std::invalid_argument("alignment_skeletons");
+      }
+    }
     if(!r.feedback_fresh)r.measured.clear();
     return r;
   }
@@ -151,7 +188,7 @@ inline IkVisualization ParseIkVisualization(const nlohmann::json& envelope) {
 // Mark it stale immediately; never borrow an old model after calibration removal.
 inline void UpdateIkVisualization(IkVisualization& current, const nlohmann::json& value) {
   auto next=ParseIkVisualization(value);
-  if(!next.available && current.tianyi && current.available &&
+  if(!next.teleop && !next.available && current.tianyi && current.available &&
      (next.reason=="visualization_unavailable" || next.reason=="feedback_unavailable" || (current.unified && next.reason=="feedback_stale"))) {
     current.reason=next.reason;
     current.feedback_fresh=false;

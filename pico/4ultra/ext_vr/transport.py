@@ -1,10 +1,10 @@
-"""One local DDS input publisher; no robot feedback subscription."""
+"""Local DDS input publisher and read-only robot feedback subscription."""
 
 import json
 import copy
 import threading
 from collections import OrderedDict
-from common.teleop_contract import COMMAND_TOPIC
+from common.teleop_contract import COMMAND_TOPIC, STATE_TOPIC, MAX_WIRE_BYTES
 
 
 class BoundedWriter:
@@ -101,7 +101,17 @@ class RosTransport:
         command = COMMAND_TOPIC
         self.pub = self.node.create_publisher(String, command, qos)
 
-        self.sub = None  # Device is an input source; no robot feedback subscription.
+        def receive(message):
+            try:
+                if len(message.data.encode("utf-8")) > MAX_WIRE_BYTES:
+                    raise ValueError("feedback_too_large")
+                value = json.loads(message.data)
+            except (ValueError, TypeError, RecursionError):
+                value = {}
+            if feedback_callback is not None:
+                feedback_callback(value)
+
+        self.sub = self.node.create_subscription(String, STATE_TOPIC, receive, qos)
         self.executor.add_node(self.node)
         self.writer = BoundedWriter(self._send, self._cleanup)
 

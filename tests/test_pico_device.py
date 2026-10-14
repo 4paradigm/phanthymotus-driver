@@ -491,11 +491,6 @@ def test_stop_after_rtc_loss_does_not_require_tracking_or_feedback():
     asyncio.run(run())
 
 
-def test_device_plugin_does_not_consume_robot_feedback():
-    assert not hasattr(ExtVrPlugin, 'feedback')
-    assert not hasattr(ExtVrPlugin, '_accept_feedback')
-
-
 def test_missing_or_nonlocal_dds_profile_cannot_silently_start(tmp_path):
     validate = load_driver_module("identity").validate_dds_profile
     source = Path(__file__).parents[1] / "pico/4ultra/dds-local.xml"
@@ -549,6 +544,9 @@ def test_named_controls_and_extensions_survive_rtc_to_dds_without_filtering(monk
                 sent.set()
             return SimpleNamespace(publish=publish)
 
+        def create_subscription(self, message_type, topic, callback, qos):
+            return SimpleNamespace(topic=topic, receive=callback)
+
         def destroy_node(self):
             pass
 
@@ -562,7 +560,12 @@ def test_named_controls_and_extensions_survive_rtc_to_dds_without_filtering(monk
     from ext_vr.transport import RosTransport
     executor = SimpleNamespace(context=SimpleNamespace(get_domain_id=lambda: 42),
                                add_node=lambda node: None, remove_node=lambda node: None)
-    transport = RosTransport(executor, "ignored-brand", "vr-1", None)
+    received = []
+    transport = RosTransport(executor, "ignored-brand", "vr-1", received.append)
+    assert transport.sub.topic == "/teleop/state"
+    transport.sub.receive(SimpleNamespace(data='{"state":"preview"}'))
+    transport.sub.receive(SimpleNamespace(data='invalid json'))
+    assert received == [{"state": "preview"}, {}]
 
     async def publish():
         task = asyncio.create_task(ExtVrPlugin._publish(None, {"runtime": runtime, "transport": transport}))

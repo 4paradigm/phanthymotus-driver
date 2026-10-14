@@ -338,7 +338,7 @@ void CaptureTransport::HandleServerMessage(const std::string& payload) {
           }
           UpdateIkVisualization(visualization_, visual);
         }
-        catch (const std::exception&) { Log("ik_visualization_invalid"); }
+        catch (const std::exception&) { visualization_ = {}; Log("ik_visualization_invalid"); }
       }
       return; // Display updates never enter authority or heartbeat state machines.
     }

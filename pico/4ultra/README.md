@@ -7,8 +7,11 @@
 1. 用普通部署入口部署PICO与机器人Driver，添加两张卡并连接 `teleop_device → teleop_control`。
 2. 在 `teleop_device` 齿轮中首次自行设置四位数字管理 PIN，保存后扫描配置页二维码打开下载与配对页，也可复制 `https://<主机>:15741/onboarding` 到浏览器。二维码使用 Dashboard 提供的网卡地址和 PICO 配置端口（默认 15741），多网口时可切换网卡；不提供已安装勾选、设备名或滤波参数。后续留空保存保留已有 PIN，填写新 PIN 则更新。
 3. 在PICO浏览器进入下载页、下载APK并确认系统安装；返回网页，输入管理 PIN 解锁，点击“连接这台机器人”，然后点击“打开 App 并连接”，地址自动填入。其他连接方式折叠在设备管理中：允许手动配对后，在App发现设备、核对指纹，网页会自动显示待批准请求。
-4. 开启Canvas项目只启动采集与DDS。设备配对和项目运行都不会自动启动机器人；控制卡在有效的松握输入上准备基准，双握把使能；PICO不再发操作请求，执行状态在控制卡监控查看。
-5. 已配对设备冷启动自动重连。停止Canvas只停止采集，控制卡按其停止语义保持，不追加收臂。
+4. 启动 Canvas 项目，在头显中查看机器人真实骨架与半透明映射目标，以及左右末端误差。
+5. 调整姿态，等待机器人端反馈“可开始”，然后重新按下双 Grip 接通。松开后继续预览，再次接通前重新检查对齐。
+6. 跟踪丢失、设备重连或空间重置后重新对齐，不自动恢复运动。已配对 App 冷启动自动重连；停止 Canvas 不追加收臂。
+
+对齐判定与 Grip 接通由机器人控制卡实现，PICO 显示不构成运动授权。控制卡尚未提供对齐反馈时，头显显示 `ALIGNMENT UNAVAILABLE`，不能据此认为已经就绪。App 和 PICO Driver 必须一起升级到本版。
 
 二维码通过 `configSchema` 的 `format: "qr"`、`scope: "instance"` 显示，只打开现有安装页，不携带管理 PIN、邀请或访问 token，也不保存为配置。普通Core的实际齿轮保存、项目启动/停止和输入文字监控已在隔离浏览器验证；PICO浏览器安装与证书首次信任仍待设备验收。研发APK安装不能代替这条普通用户流程。
 
@@ -68,7 +71,33 @@ Canvas 连接 `teleop_device` 输出到机器人 `teleop_control` 输入。设�
 
 设备配对只建立输入连接，不启动机器人运动。Canvas 启动和停止设备采集及机器人控制卡；握把是否使能由机器人控制卡处理。
 
-PICO 显示连接状态、透视画面及握把提示，不发送 begin/finish/stop 操作请求，不订阅机器人执行反馈。机器人卡的 `/teleop/state` 用于 Canvas 监控，不是设备卡的输入或输出。共享模块中保留的历史操作/反馈辅助接口，不属于当前设备接线契约。
+PICO 保留透视画面，只读订阅机器人卡已有的 `/teleop/state` 并通过 WSS 转发显示，不增加 topic 或 Canvas 反向连线，不发送 begin/finish/stop 操作请求。显示最多 30 Hz，只保留最新反馈；显示拥塞不阻塞输入采集。
+
+### 骨架与对齐反馈
+
+沿用 `motus.teleop.feedback/1`、`data/teleop-state` 和同机 domain 42。机器人端保留现有身份、时钟、代次、序号与 `source_sequence`，增加两个可选对象：
+
+| 对象 | 字段与约束 |
+|---|---|
+| `visualization` | `available`、`feedback_fresh`、`intent_age_ms`；`measured` 和 `ik` 各为左右两条关节位置链；可选 `torso`、`targets`、`shoulder_height` |
+| `alignment` | `state` 为 `unaligned/ready/active/unreachable/unavailable`；仅 `ready` 状态的 `ready` 为 true |
+| `alignment.left/right` | `position_error_m`、`orientation_error_rad`、`position_tolerance_m`、`orientation_tolerance_rad`；除 unavailable 外均提供有限非负值 |
+
+两套骨架均为机器人基座 FLU 坐标（X 前、Y 左、Z 上），使用相同模型与米制单位。每条链包含 2–32 个三维点；每个坐标绝对值不超过 4 米，躯干最多 16 条链。`ik` 是机器人 IK 结果，不是实测人体肘部。目标不可达时发空 `ik`，不得沿用旧解冒充当前目标。`intent_age_ms` 是产生目标的输入在反馈发出时的年龄，不得随重复发布归零。
+
+```json
+"alignment": {
+  "state": "ready", "ready": true,
+  "left": {"position_error_m": 0.01, "orientation_error_rad": 0.02,
+           "position_tolerance_m": 0.03, "orientation_tolerance_rad": 0.1},
+  "right": {"position_error_m": 0.01, "orientation_error_rad": 0.02,
+            "position_tolerance_m": 0.03, "orientation_tolerance_rad": 0.1}
+}
+```
+
+示例数值不是默认阈值；机器人端决定阈值、稳定时间、身体标定和接通规则。PICO 只校验数据并显示判定，界面误差换算为毫米与度。反馈超过 750 ms、目标输入超过 300 ms、跟踪丢失或代次改变时不显示“可开始”。无效消息立即清除当前显示，来源冲突保持不可用，重新启动采集后重新绑定；旧来源不能覆盖新会话。
+
+真实骨架用绿色实线，映射目标用橙色半透明线，并附图例。状态文字为 `NOT ALIGNED / READY / ACTIVE / TARGET UNREACHABLE / ALIGNMENT UNAVAILABLE`，不提供动作方向指导。缺少反馈扩展时显示不可用，不推断对齐。
 
 ## 构建与验证
 
@@ -101,7 +130,7 @@ PICO 是独立进程，复用 `ros-base` 提供的 ROS/Python，不依赖另一�
 本地软件测试：
 
 ```sh
-PYTHONPATH=.:tests python -m pytest -q tests/test_pico_device.py tests/test_pico_lifecycle.py tests/test_pico_management_pin.py tests/test_pico_onboarding.py tests/test_pico_transport.py tests/test_teleop_contract.py
+PYTHONPATH=.:tests python -m pytest -q tests/test_pico_device.py tests/test_pico_lifecycle.py tests/test_pico_management_pin.py tests/test_pico_onboarding.py tests/test_pico_transport.py tests/test_pico_feedback.py tests/test_teleop_contract.py
 ```
 
 安装页的浏览器回归覆盖 PIN 解锁、错误 PIN、会话过期/退出、邀请生成、过期重试、指纹批准及已配对重连，可用现有 Playwright 与 Chrome 运行：
@@ -122,3 +151,5 @@ PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs CHROME_BINARY=/path/to/chrome no
 App 使用 Android NsdManager 发现 `_motus-teleop._tcp` DNS-SD/mDNS 服务，读取机器人广播的名称、地址和端口，不扫描 IP。头显与机器人应在允许组播的同一局域网；跨网段或访客 Wi-Fi 可能无法发现。此时使用下载页的连接入口，或在 App 输入地址。配对凭据保存在头显本地，后续打开 App 自动重连。
 
 App 图标使用 PhanthyMotus [官方 Logo](https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/embodied_logo.svg)，按 Android 图标密度导出。
+
+真实反馈链路测试须在无外网、无机器人设备的 ROS 容器中运行：加载 ROS Humble 与本目录 `dds-local.xml`，执行 `PYTHONPATH=.:tests python3 -m pytest tests/test_pico_feedback_dds.py`。该项覆盖真实 DDS、TLS WSS、启停失效；不等同于头显显示或机器人动作验收。

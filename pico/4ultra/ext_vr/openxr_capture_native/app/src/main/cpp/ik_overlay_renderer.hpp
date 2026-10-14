@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <cstdio>
 
 namespace motus::openxr_capture {
 // A binocular, head-relative model panel. No world/robot extrinsic is implied.
@@ -29,6 +30,7 @@ class IkOverlayRenderer {
       return p;
     };
     const auto inverse=XrQuaternionf{-eye.pose.orientation.x,-eye.pose.orientation.y,-eye.pose.orientation.z,eye.pose.orientation.w};
+    float alpha=1.f;
     auto vertex=[&](IkPoint p,IkPoint color){
       auto world=rotate(center.orientation,p);
       world[0]+=center.position.x-eye.pose.position.x;
@@ -40,7 +42,7 @@ class IkOverlayRenderer {
       float depth=-view[2];
       vertices.insert(vertices.end(),{2*view[0]/(right-left)-(right+left)/(right-left)*depth,
                                      2*view[1]/(up-down)-(up+down)/(up-down)*depth,0,depth,
-                                     color[0],color[1],color[2]});
+                                     color[0],color[1],color[2],alpha});
     };
     auto line=[&](IkPoint a,IkPoint b,IkPoint color){vertex(a,color);vertex(b,color);};
     const IkPoint green{.25f,1.f,.65f},orange{1.f,.65f,.2f},pink{1.f,.35f,.85f},gray{.55f,.6f,.65f};
@@ -68,7 +70,7 @@ class IkOverlayRenderer {
         x+=.017f;
       }
     };
-    if(panel.enabled && panel.input_only){
+    if(panel.enabled && panel.input_only && !show_model){
       for(const auto& pixel:kOperatorLabelPixels){
         const bool status=pixel[0]==(panel.armed?4:5);
         if(!status && pixel[0]!=6)continue;
@@ -76,7 +78,7 @@ class IkOverlayRenderer {
         const float y=(status?.52f:.44f)-pixel[2]*.002f;
         line({x,y,-1.3f},{x+.0016f,y,-1.3f},panel.armed?green:gray);
       }
-    } else if(panel.enabled){
+    } else if(panel.enabled && !panel.input_only){
       for(int i=0;i<3;++i){
         const float x=OperatorPanel::center(i),y=OperatorPanel::y,w=OperatorPanel::width/2,h=OperatorPanel::height/2,z=OperatorPanel::z;
         IkPoint color=i==0 && !panel.armed?IkPoint{.28f,.3f,.32f}:(i==panel.hover?orange:(i==2?pink:gray));
@@ -97,13 +99,24 @@ class IkOverlayRenderer {
     }
     std::size_t measured_begin=0,measured_count=0;
     if(show_model) {
-    text(value.unified?"ROBOT REAR VIEW":(value.tianyi?"TIANYI REAR VIEW":"G1 REAR VIEW"),-.34f,.34f,gray);
+    if(value.teleop || !value.available){
+      text(value.alignment_label(),-.34f,.39f,value.ready()?green:pink);
+      if(value.fresh() && value.feedback_fresh && value.alignment_state!="unavailable"){
+        for(int i=0;i<2;++i){
+          char error[48];std::snprintf(error,sizeof(error),"%s %d MM  %d DEG",i==0?"L":"R",
+            static_cast<int>(std::round(value.position_error_m[i]*1000)),
+            static_cast<int>(std::round(value.orientation_error_rad[i]*180/3.141592653589793)));
+          text(error,-.34f,.48f-i*.04f,gray);
+        }
+      }
+    }
+    text("ROBOT REAR VIEW",-.34f,.34f,gray);
     text("LEFT",-.23f,-.08f,gray);text("RIGHT",.16f,-.08f,gray);
     if(!value.available || (!value.fresh() && !value.tianyi)){
       text("NO FRESH DATA",-.16f,.08f,pink);
     }else{
-      text(value.mode+" / "+value.state,-.34f,.30f,gray);
-      text("MEASURED",-.34f,.25f,green);text("DESIRED",-.12f,.25f,orange);text("TARGET",.19f,.25f,pink);
+      if(!value.teleop)text(value.mode+" / "+value.state,-.34f,.30f,gray);
+      text("MEASURED",-.34f,.25f,green);text("MAPPED TARGET",-.10f,.25f,orange);
       // Fixed orientation reference, not tracked torso/head feedback.
       auto body=[&](IkPoint a,IkPoint b){line(model(a),model(b),gray);};
       if(value.tianyi){
@@ -134,9 +147,9 @@ class IkOverlayRenderer {
       if(!value.workspace_bounds.empty())text("OUTER SAFETY BOUNDS",-.34f,-.55f,boundary);
       auto draw=[&](const IkChains& chains,IkPoint color){for(const auto& chain:chains)for(std::size_t i=1;i<chain.size();++i)line(model(chain[i-1]),model(chain[i]),color);};
       if(value.fresh() && value.feedback_fresh){
-        measured_begin=vertices.size()/7;
+        measured_begin=vertices.size()/8;
         draw(value.measured,green);
-        measured_count=vertices.size()/7-measured_begin;
+        measured_count=vertices.size()/8-measured_begin;
       }
       else text("MEASURED STALE",-.34f,-.47f,pink);
       double age=value.intent_age_ms+std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-value.received).count();
@@ -144,8 +157,10 @@ class IkOverlayRenderer {
         const bool current=value.current_ik();
         // Keep geometry brightness stable across transient solve failures.
         // Explicit HELD/STALE labels distinguish history from a current result.
+        alpha=value.teleop?.45f:1.f;
         draw(value.displayed_ik(),orange);
-        if(!current && !value.displayed_ik().empty())text("LAST VALID - HELD",-.34f,-.39f,orange);
+        alpha=1.f;
+        if(!value.teleop && !current && !value.displayed_ik().empty())text("LAST VALID - HELD",-.34f,-.39f,orange);
         if(!value.fresh())text("NO FRESH DATA",-.16f,.08f,pink);
       }
       if(value.fresh() && age<750){
@@ -158,24 +173,25 @@ class IkOverlayRenderer {
     }
     glUseProgram(program_);glBindVertexArray(vao_);glBindBuffer(GL_ARRAY_BUFFER,buffer_);
     glBufferData(GL_ARRAY_BUFFER,vertices.size()*sizeof(float),vertices.data(),GL_STREAM_DRAW);
-    glEnableVertexAttribArray(0);glVertexAttribPointer(0,4,GL_FLOAT,GL_FALSE,7*sizeof(float),nullptr);
-    glEnableVertexAttribArray(1);glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,7*sizeof(float),reinterpret_cast<void*>(4*sizeof(float)));
-    glDisable(GL_DEPTH_TEST);glDisable(GL_BLEND);glLineWidth(2);
+    glEnableVertexAttribArray(0);glVertexAttribPointer(0,4,GL_FLOAT,GL_FALSE,8*sizeof(float),nullptr);
+    glEnableVertexAttribArray(1);glVertexAttribPointer(1,4,GL_FLOAT,GL_FALSE,8*sizeof(float),reinterpret_cast<void*>(4*sizeof(float)));
+    glDisable(GL_DEPTH_TEST);glEnable(GL_BLEND);glBlendFuncSeparate(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA,GL_ONE,GL_ONE_MINUS_SRC_ALPHA);glLineWidth(2);
     // Measured outline remains visible when the thinner IK/command overlaps it.
     if(measured_count){
       glLineWidth(6);
       glDrawArrays(GL_LINES,static_cast<GLint>(measured_begin),static_cast<GLsizei>(measured_count));
     }
     glLineWidth(2);
-    glDrawArrays(GL_LINES,0,static_cast<GLsizei>(vertices.size()/7));
+    glDrawArrays(GL_LINES,0,static_cast<GLsizei>(vertices.size()/8));
+    glDisable(GL_BLEND);
     glBindVertexArray(0);glBindBuffer(GL_ARRAY_BUFFER,0);glUseProgram(0);
   }
  private:
   GLuint program_{0},buffer_{0},vao_{0};
   void Initialize(){
     auto shader=[](GLenum type,const char* source){GLuint id=glCreateShader(type);glShaderSource(id,1,&source,nullptr);glCompileShader(id);GLint ok=0;glGetShaderiv(id,GL_COMPILE_STATUS,&ok);if(!ok){glDeleteShader(id);throw std::runtime_error("IK overlay shader compile failed");}return id;};
-    GLuint vs=shader(GL_VERTEX_SHADER,"#version 300 es\nlayout(location=0) in vec4 p;layout(location=1) in vec3 c;out vec3 color;void main(){gl_Position=p;color=c;}");
-    GLuint fs=shader(GL_FRAGMENT_SHADER,"#version 300 es\nprecision mediump float;in vec3 color;out vec4 frag;void main(){frag=vec4(color,1.0);}");
+    GLuint vs=shader(GL_VERTEX_SHADER,"#version 300 es\nlayout(location=0) in vec4 p;layout(location=1) in vec4 c;out vec4 color;void main(){gl_Position=p;color=c;}");
+    GLuint fs=shader(GL_FRAGMENT_SHADER,"#version 300 es\nprecision mediump float;in vec4 color;out vec4 frag;void main(){frag=color;}");
     program_=glCreateProgram();glAttachShader(program_,vs);glAttachShader(program_,fs);glLinkProgram(program_);glDeleteShader(vs);glDeleteShader(fs);
     GLint ok=0;glGetProgramiv(program_,GL_LINK_STATUS,&ok);if(!ok){Destroy();throw std::runtime_error("IK overlay shader link failed");}
     glGenBuffers(1,&buffer_);glGenVertexArrays(1,&vao_);

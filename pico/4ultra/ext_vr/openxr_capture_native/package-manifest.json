@@ -1,14 +1,14 @@
 {
   "filename": "pico.apk",
   "application_id": "com.phanthymotus.picocapture",
-  "version_code": 28,
-  "version": "0.4.4-pico-input",
+  "version_code": 29,
+  "version": "0.4.5-pico-feedback",
   "build_type": "release",
-  "size_bytes": 2475958,
-  "sha256": "4eeab7626bb3a39dd485d212a0c891194376987d3de88c3cb20217b26d4f4e31",
+  "size_bytes": 2479942,
+  "sha256": "386564097ab4973537b8b067ea7622704c14f010a8e041bff6f213c0ace2b073",
   "signing_certificate_sha256": "12b025ef35194425aa994c025e87f3733ff02d30637fdcd9e78e89a488c38b5f",
   "source_encoding": "gzip",
-  "source_sha256": "4247be32f09cd15dd6ae041614d8f101d5143ce882366c846d705028ef898033",
-  "source_size_bytes": 2423082,
-  "source_url": "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/teleop/pico/0.4.4-pico-input/4247be32f09cd15dd6ae041614d8f101d5143ce882366c846d705028ef898033/container-apk.gz"
+  "source_sha256": "f1f083f393307a25106c940367b6f78386e4310ec6dc072771ff64b73bf90c6d",
+  "source_size_bytes": 2426571,
+  "source_url": "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/teleop/pico/0.4.5-pico-feedback/f1f083f393307a25106c940367b6f78386e4310ec6dc072771ff64b73bf90c6d/container-apk.gz"
 }

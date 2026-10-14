@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from common.teleop_contract import COMMAND_TOPIC, canonical_instance
 from .runtime import DeviceRuntime
+from .feedback import RobotFeedback
 
 
 class ExtVrPlugin:
@@ -45,7 +46,7 @@ class ExtVrPlugin:
             "description": (
                 "PICO 设备安装步骤：1. 部署 PICO 和机器人遥操 Driver；"
                 "2. 首次设置四位管理 PIN 并保存配置；下载 App 无需 PIN；"
-                "3. 扫码或复制二维码旁的链接下载 App 并在网页配对，连接 teleop_control 后开启项目；佩戴头显，松开双握把就绪后按住双握把遥操。"
+                "3. 扫码或复制二维码旁的链接下载 App 并在网页配对，连接 teleop_control 后开启项目；佩戴头显查看双骨架及误差；机器人端确认对齐后，重新按下双握把接通，松握返回预览。"
                 "本卡只采集输入，不直接执行机器人动作。"
             ),
             "multiInstance": False,
@@ -152,6 +153,8 @@ class ExtVrPlugin:
                 public_wss_url=self.config["public_wss_url"],
                 ca_certificate_base64=capture_certificate_base64(self.config),
             )
+            feedback = RobotFeedback(runtime)
+            manager.visualization_provider = feedback.snapshot
             server = CaptureWssServer(manager, self.config)
             item = {
                 "runtime": runtime,
@@ -160,6 +163,7 @@ class ExtVrPlugin:
                 "server": server,
                 "config": config,
                 "config_file": state / (instance_id + ".config.json"),
+                "feedback": feedback,
                 "transport": None,
                 "task": None,
             }
@@ -307,7 +311,7 @@ class ExtVrPlugin:
             if not runtime.running:
                 if self.transport_factory:
                     item["transport"] = self.transport_factory(
-                        self.namespace, instance, None
+                        self.namespace, instance, item["feedback"].accept
                     )
                 else:
                     from .transport import RosTransport
@@ -316,7 +320,7 @@ class ExtVrPlugin:
                         self.ros2,
                         self.namespace,
                         instance,
-                        None,
+                        item["feedback"].accept,
                     )
                 runtime.start()
                 item["task"] = asyncio.create_task(self._publish(item))

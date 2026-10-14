@@ -1,7 +1,21 @@
 #include "ik_visualization.hpp"
 #include <cassert>
+#include <fstream>
 using namespace motus::openxr_capture;
-int main(){
+int main(int argc, char** argv){
+ if(argc==2){
+   std::ifstream stream(argv[1]);assert(stream.good());
+   std::string line;int frames=0,ready=0;
+   while(std::getline(stream,line)){
+     auto wire=nlohmann::json::parse(line);auto preview=ParseIkVisualization(wire);
+     assert(preview.ready()==wire.at("alignment").at("ready").get<bool>());
+     if(preview.ready()){assert(preview.displayed_ik().size()==2);++ready;}
+     preview.received-=std::chrono::seconds(1);
+     assert(!preview.ready() && preview.displayed_ik().empty());
+     ++frames;
+   }
+   assert(frames>=2 && ready>0 && ready<frames);
+ }
  auto origin=IkOperatorViewPoint({0,0,0});
  auto forward=IkOperatorViewPoint({1,0,0});
  auto left=IkOperatorViewPoint({0,1,0});
@@ -79,4 +93,35 @@ int main(){
  rejected=false;try{ParseIkVisualization(feedback);}catch(const std::exception&){rejected=true;}assert(rejected);
  auto missing=ParseIkVisualization({{"schema","motus.motion.feedback/1"},{"available",false},{"reason","feedback_stale"}});
  assert(!missing.available);
+
+ feedback["schema"]="motus.teleop.feedback/1";
+ feedback["visualization"]["measured"]={chain,tchain};
+ feedback["visualization"]["feedback_fresh"]=true;
+ feedback["visualization"]["feedback_age_ms"]=0;
+ auto arm=nlohmann::json{{"position_error_m",.01},{"orientation_error_rad",.02},
+   {"position_tolerance_m",.03},{"orientation_tolerance_rad",.1}};
+ feedback["alignment"]={{"state","ready"},{"ready",true},{"left",arm},{"right",arm}};
+ auto preview=ParseIkVisualization(feedback);
+ assert(preview.ready() && preview.alignment_label()=="READY");
+ assert(preview.position_error_m[0]==.01 && preview.displayed_ik().size()==2);
+ preview.received-=std::chrono::milliseconds(301);
+ assert(!preview.ready() && preview.displayed_ik().empty());
+ assert(preview.alignment_label()=="ALIGNMENT UNAVAILABLE");
+ feedback["visualization"]["feedback_age_ms"]=751;
+ assert(!ParseIkVisualization(feedback).ready());
+ feedback["visualization"]["feedback_age_ms"]=0;
+ feedback["alignment"]["state"]="unaligned";
+ rejected=false;try{ParseIkVisualization(feedback);}catch(const std::exception&){rejected=true;}assert(rejected);
+ feedback["alignment"]["ready"]=false;
+ assert(ParseIkVisualization(feedback).alignment_label()=="NOT ALIGNED");
+ feedback["alignment"]["state"]="unreachable";
+ feedback["visualization"]["ik"]=nlohmann::json::array();
+ auto unreachable=ParseIkVisualization(feedback);
+ assert(!unreachable.ready() && unreachable.displayed_ik().empty());
+ assert(unreachable.alignment_label()=="TARGET UNREACHABLE");
+ feedback["alignment"]["left"]["position_error_m"]=-1;
+ rejected=false;try{ParseIkVisualization(feedback);}catch(const std::exception&){rejected=true;}assert(rejected);
+ UpdateIkVisualization(preview,{{"schema","motus.teleop.feedback/1"},{"available",false},{"reason","feedback_stale"}});
+ assert(!preview.available && !preview.ready() && preview.displayed_ik().empty());
+ assert(ParseIkVisualization({{"schema","motus.teleop.feedback/1"},{"reason",nullptr}}).alignment_label()=="ALIGNMENT UNAVAILABLE");
 }

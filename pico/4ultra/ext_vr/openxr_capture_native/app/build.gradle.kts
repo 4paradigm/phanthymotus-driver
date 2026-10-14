@@ -18,8 +18,8 @@ android {
         applicationId = "com.phanthymotus.picocapture"
         minSdk = 29
         targetSdk = 35
-        versionCode = 28
-        versionName = "0.4.4-pico-input"
+        versionCode = 29
+        versionName = "0.4.5-pico-feedback"
 
         ndk {
             abiFilters += "arm64-v8a"

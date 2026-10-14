@@ -58,7 +58,7 @@ def canonical_instance(value):
 def topics(namespace=None, instance_id=None):
     """Fixed single-source topics; legacy arguments never select a destination.
 
-    State is the robot card's monitor output, not a device feedback subscription.
+    State is the robot card's monitor output, also read by the PICO display.
     Device identity belongs in the message, independently of these topic names.
     """
     return COMMAND_TOPIC, STATE_TOPIC

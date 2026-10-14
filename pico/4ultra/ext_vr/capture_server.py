@@ -283,7 +283,7 @@ async def capture_websocket_handler(request: web.Request) -> web.StreamResponse:
             }
         await websocket.send_json(acknowledgement)
         provider = getattr(manager, "visualization_provider", None)
-        if (onboarding_client or version.endswith("-ikview2")) and provider is not None:
+        if provider is not None:
             visual_task = asyncio.create_task(visualization_stream(websocket, provider))
         receive_task = asyncio.create_task(_ws_text(websocket))
         event_task = asyncio.create_task(connection.events.get())
