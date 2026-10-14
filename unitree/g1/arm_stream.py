@@ -327,7 +327,7 @@ class ArmStreamExecutor:
             if not self._prepared or self.cfg.get('live_enabled') is not True: raise ValueError('live_not_prepared')
             if self.profile is None or (not self.cfg.get('servo_position') and self._gravity is None): raise ValueError('calibration_missing')
             s,q,dq = self._fresh()
-            if max(map(abs,dq))>.02: raise ValueError('robot_not_stopped')
+            if not self.cfg.get('servo_position') and max(map(abs,dq))>.02: raise ValueError('robot_not_stopped')
             generation = self._generation
             self._opening = True
         try:
@@ -339,7 +339,7 @@ class ArmStreamExecutor:
                 self._channel_open = True
                 if generation != self._generation: raise ValueError('claim_cancelled')
                 _,q,dq = self._fresh()
-                if max(map(abs,dq))>.02: raise ValueError('robot_not_stopped')
+                if not self.cfg.get('servo_position') and max(map(abs,dq))>.02: raise ValueError('robot_not_stopped')
                 self.session_id,self.secret = secrets.token_hex(16),secrets.token_hex(32)
                 self.seq,self.applied_seq,self._epoch = -1,-1,-1
                 self._proofs.clear(); self.latest=self._proof=None

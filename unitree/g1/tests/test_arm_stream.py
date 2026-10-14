@@ -385,3 +385,19 @@ def test_execution_polls_latest_feedback_without_refreshing_missing_samples(tmp_
     assert snapshots[0]['q'] == [.1]*10
     assert snapshots[0]['source_tick'] == 1000
     assert snapshots[1]['arm_ns'] == snapshots[0]['arm_ns']
+
+
+@pytest.mark.parametrize('servo', [False, True])
+def test_servo_claim_starts_at_measured_position_despite_velocity_noise(tmp_path, servo):
+    arm, sample, channel, _, _, _ = rig(tmp_path, claim=False, servo=servo)
+    sample['q'] = [.1]*10
+    sample['dq'] = [.035]*10
+    channel.open = lambda: None
+    result = arm.dispatch('claim', {})
+    if servo:
+        assert result['state'] == 'ready'
+        assert arm.last_q == sample['q'] and arm._weight == 0
+        assert not channel.writes
+    else:
+        assert result['code'] == 'robot_not_stopped'
+        assert not arm.session_id
