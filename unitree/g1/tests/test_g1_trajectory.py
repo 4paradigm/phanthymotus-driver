@@ -97,13 +97,14 @@ def test_exact_replay_reference_bypasses_filter_but_not_execution_gate(tmp_path)
     assert len(channel.positions) == before
 
 
-def test_replay_rejects_fast_target_and_stale_feedback(tmp_path):
+def test_replay_limits_fast_target_and_rejects_stale_feedback(tmp_path):
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     command = packet(arm, target=.1)
     proof = {'schema': 'motus.motion.envelope/1', **{k: command[k] for k in IDENTITY},
              'lower': [-1.]*10, 'upper': [1.]*10, 'measured_ns': arm.clock()}
     advance(10); arm.replay_deadline_ns = arm.clock()+200_000_000
-    with pytest.raises(ValueError, match='speed'): arm.write_replay(command, proof)
+    arm.write_replay(command, proof)
+    assert channel.positions[-1][0] == pytest.approx([.01]*10)
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     arm.replay_deadline_ns = arm.clock()+200_000_000
     command = packet(arm, seq=2, target=.1)
@@ -475,8 +476,8 @@ def test_replay_does_not_race_teleop_during_file_read(tmp_path, monkeypatch, cha
         card.trajectory.stop(); done.set(); ticker.join(1)
 
 
-@pytest.mark.parametrize('delay, expected', [(.025, 'completed'), (.075, 'error')])
-def test_close_pause_frame_uses_execution_deadline_not_preparation_time(tmp_path, delay, expected):
+@pytest.mark.parametrize('delay', [.025, .075])
+def test_close_pause_frame_tolerates_scheduler_jitter(tmp_path, delay):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     try:
         card.stop(); channel.positions.clear()
@@ -496,10 +497,8 @@ def test_close_pause_frame_uses_execution_deadline_not_preparation_time(tmp_path
         card.trajectory.cancel.clear()
         card.trajectory.last_action = {'phase': 'moving_to_start'}
         card.trajectory._run('close-pause', recording)
-        assert card.trajectory.last_action['status'] == expected, card.trajectory.last_action
-        if expected == 'error':
-            assert card.trajectory.last_action['result']['reason'] == 'replay_schedule_missed'
-        assert receipts[-1][1] == expected
+        assert card.trajectory.last_action['status'] == 'completed', card.trajectory.last_action
+        assert receipts[-1][1] == 'completed'
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
 
@@ -527,3 +526,54 @@ def test_live_and_replay_use_same_execution_failure_handling(tmp_path, replay, f
                           'envelope': 'motion_envelope_exceeded',
                           'expired': 'command_timeout'}[failure]
     assert arm.state == ('fault' if failure == 'sdk' else 'hold')
+
+
+def test_delayed_replay_skips_obsolete_targets_but_keeps_pause(tmp_path):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        card.stop()
+        target = list(sample['q'])
+        frame = {'kind': 'target', 'target_q': target, 'mapping_epoch': 1}
+        frames = [dict(frame, t_ns=t*1_000_000, source_sequence=i+1,
+                       kind='hold' if i == 4 else 'target')
+                  for i, t in enumerate((10, 20, 30, 40, 45, 100))]
+        recording = {'filename': 'latest.jsonl', 'sha256': 'test',
+            'binding': card.trajectory.binding(), 'joint_names': arm.profile['arm_joint_names'],
+            'duration_ns': 150_000_000, 'frames': frames}
+        sent = []; holds = []
+        send = card.trajectory._send_frame
+        hold = arm.hold
+        def delayed(frame, seq, due):
+            send(frame, seq, due); sent.append(frame['source_sequence'])
+            if len(sent) == 1: time.sleep(.055)
+        def pause(reason, **kwargs):
+            holds.append(reason); return hold(reason, **kwargs)
+        card.trajectory._send_frame = delayed; arm.hold = pause
+        card.trajectory.cancel.clear()
+        card.trajectory.last_action = {'phase': 'moving_to_start'}
+        card.trajectory._run('latest', recording)
+        assert card.trajectory.last_action['status'] == 'completed', card.trajectory.last_action
+        assert sent == [1, 4, 6]
+        assert 'replay_pause' in holds
+    finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+def test_final_reference_finishes_through_shared_slew_limiter(tmp_path):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        card.stop(); channel.positions.clear()
+        start = list(sample['q']); target = [q+.08 for q in start]
+        frame = {'kind': 'target', 'mapping_epoch': 1}
+        recording = {'filename': 'final.jsonl', 'sha256': 'test',
+            'binding': card.trajectory.binding(), 'joint_names': arm.profile['arm_joint_names'],
+            'duration_ns': 60_000_000,
+            'frames': [dict(frame, t_ns=10_000_000, target_q=start, source_sequence=1),
+                       dict(frame, t_ns=40_000_000, target_q=target, source_sequence=2)]}
+        card.trajectory.cancel.clear(); card.trajectory.last_action = {'phase': 'moving_to_start'}
+        card.trajectory._run('final', recording)
+        assert card.trajectory.last_action['status'] == 'completed', card.trajectory.last_action
+        assert channel.positions[-1][0] == pytest.approx(target)
+        assert len(channel.positions) > 2
+    finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)

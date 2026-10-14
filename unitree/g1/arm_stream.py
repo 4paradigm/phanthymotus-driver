@@ -683,13 +683,7 @@ class ArmStreamExecutor:
                 if servo and self.applied_seq == self.latest['seq']:return
                 dt=max(0.,min((now-self.last_emit)/1e9,.02))
                 limit=self.velocity*dt
-                if self.replay_deadline_ns is not None:
-                    # Recordings already contain the smoothed SDK references.
-                    next_q = self.latest['values']
-                    step = max(0., min((now-self.last_emit)/1e9, .05))
-                    if any(abs(a-b) > step+1e-9 for a,b in zip(next_q, self.last_q)):
-                        raise ValueError('replay_speed_exceeded')
-                elif servo:
+                if servo:
                     # Continuity/reference handoff follows jsmy-CTH's PR #322:
                     # https://github.com/4paradigm/phanthymotus-driver/pull/322
                     # Use the last successful output, not measured-position noise.
@@ -697,7 +691,8 @@ class ArmStreamExecutor:
                     # Cap dt after input gaps so
                     # a regrip cannot skip smoothing by accumulating idle time.
                     smooth_dt=max(0.,min((now-self.last_emit)/1e9,.05))
-                    alpha=-math.expm1(-smooth_dt/.12)
+                    # Recorded references already include the low-pass filter.
+                    alpha=1.0 if self.replay_deadline_ns is not None else -math.expm1(-smooth_dt/.12)
                     # 1 rad/s reference slew limit, independent for each joint.
                     max_step=1.0*smooth_dt
                     next_q=[p+max(-max_step,min(max_step,alpha*(t-p)))

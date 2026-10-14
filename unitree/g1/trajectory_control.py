@@ -161,9 +161,7 @@ class TrajectoryControl:
                 self.arm._fresh()
                 self.arm.replay_deadline_ns = now+100_000_000
             remaining = (deadline-now)/1e9
-            if remaining <= 0:
-                if remaining < -.05: raise ValueError('replay_schedule_missed')
-                return
+            if remaining <= 0: return
             self.cancel.wait(min(.02, remaining))
 
     def _send_frame(self, frame, seq, due):
@@ -207,7 +205,14 @@ class TrajectoryControl:
             next_seq = self._move_to_start(recording)
             self.last_action['phase'] = 'replaying'
             start = self.control.clock()+50_000_000
-            for seq, frame in enumerate(recording['frames'], start=next_seq):
+            frames = recording['frames']
+            for index, frame in enumerate(frames):
+                seq = next_seq+index
+                # Match live input: keep the latest due target, preserving pauses.
+                if (frame['kind'] == 'target' and index+1 < len(frames)
+                        and frames[index+1]['kind'] == 'target'
+                        and start+frames[index+1]['t_ns'] <= self.control.clock()):
+                    continue
                 self._check_binding(recording)
                 due = start+frame['t_ns']
                 self._wait_until(max(start, due-60_000_000, self.control.clock()))
@@ -216,6 +221,8 @@ class TrajectoryControl:
                     self.arm.hold('replay_pause')
                     continue
                 if self.arm.state == 'hold':
+                    self._wait_until(due)
+                    self.arm.tick()
                     resumed = self.motion.dispatch('resume', self.motion._lease())
                     if resumed.get('error'): raise ValueError(resumed['error'])
                 self._send_frame(frame, seq, due)
@@ -226,9 +233,15 @@ class TrajectoryControl:
             while True:
                 self._wait_until(self.control.clock()+20_000_000)
                 sample, q, dq = self.arm._fresh()
-                if sample['arm_ns'] > last_write and max(abs(a-b) for a,b in zip(q, recording['frames'][-1]['target_q'])) <= .02 and max(map(abs, dq)) <= .02:
+                if self.arm.last_q == recording['frames'][-1]['target_q'] and sample['arm_ns'] > last_write and max(abs(a-b) for a,b in zip(q, recording['frames'][-1]['target_q'])) <= .02 and max(map(abs, dq)) <= .02:
                     break
                 if self.control.clock() >= end: raise ValueError('replay_final_feedback_unconfirmed')
+                final = recording['frames'][-1]
+                if final['kind'] == 'target' and self.arm.last_q != final['target_q']:
+                    self._check_binding(recording)
+                    seq += 1
+                    self._send_frame(final, seq, self.control.clock())
+                    last_write = self.arm.last_emit
             status = 'completed'
             result = {'filename': recording['filename'], 'sha256': recording['sha256'], 'frames': len(recording['frames'])}
         except Exception as exc:
