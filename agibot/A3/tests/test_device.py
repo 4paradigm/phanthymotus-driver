@@ -2466,6 +2466,17 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertAlmostEqual(payload["imu_quat"][2], 0.0, places=6)
         self.assertAlmostEqual(payload["imu_quat"][3], 0.7071068, places=6)
 
+    def test_skeleton_ignores_unavailable_imu_orientation(self):
+        # ROS defines covariance[0] == -1 as "orientation unavailable".  The
+        # HAL may nevertheless populate an identity quaternion; using it
+        # would force the rendered body upright while it is lying down.
+        imu = types.SimpleNamespace(
+            orientation=types.SimpleNamespace(w=1.0, x=0.0, y=0.0, z=0.0),
+            orientation_covariance=[-1.0] + [0.0] * 8)
+        self._callback("/ros2/body_drive/pelvis_imu/data")(imu)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        self.assertNotIn("imu_quat", payload)
+
     def test_skeleton_includes_live_waist_feedback(self):
         msg = types.SimpleNamespace(
             name=["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
@@ -2477,21 +2488,6 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertEqual(by_name["waist_yaw_joint"], 0.1)
         self.assertEqual(by_name["waist_roll_joint"], -0.2)
         self.assertEqual(by_name["waist_pitch_joint"], 0.3)
-
-    def test_skeleton_maps_indexed_hand_feedback_to_urdf_finger_joints(self):
-        msg = types.SimpleNamespace(
-            name=([f"left_hand_joint_{i}" for i in range(10)] +
-                  [f"right_hand_joint_{i}" for i in range(10)]),
-            position=[0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4095, 2048] * 2,
-            velocity=[0.0] * 20, effort=[0.0] * 20)
-        self._callback("/motion/control/hand_joint_state")(msg)
-        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
-        names = {joint["name"] for joint in payload["joints"]}
-        self.assertIn("left_thumb_rotation_0", names)
-        self.assertIn("left_index_wiggles_0", names)
-        self.assertIn("left_pinky_bent_1", names)
-        self.assertIn("right_thumb_rotation_0", names)
-        self.assertIn("right_pinky_bent_1", names)
 
     def test_wrist_camera_cards_are_not_exposed_without_source_frames(self):
         config = json.loads(json.dumps(BASE_CONFIG))
@@ -2517,25 +2513,6 @@ class MirrorStreamTests(unittest.TestCase):
             coding_format="PCM_S16_LE"))
         payload = struct.pack("<512h", *([7] * 512))
         self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload), payload)
-
-    def test_audio_normalization_does_not_average_reference_when_mic_count_is_omitted(self):
-        msg = types.SimpleNamespace(info=types.SimpleNamespace(
-            sample_rate=16000, channels=2, sample_format="S16LE",
-            coding_format="PCM"), mic_channels=0, ref_channels=1)
-        payload = struct.pack("<4h", 1000, -1000, 2000, -2000)
-        self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload),
-                         struct.pack("<2h", 1000, 2000))
-
-    def test_audio_normalization_ignores_reference_channels(self):
-        msg = types.SimpleNamespace(
-            mic_channels=1, ref_channels=1,
-            info=types.SimpleNamespace(sample_rate=16000, channels=2,
-                                       sample_format="S16LE", coding_format="PCM"))
-        # Main mic is +1000; reference channel is -1000. Averaging both would
-        # produce silence, while the AudioCapture contract requires mic only.
-        payload = struct.pack("<4h", 1000, -1000, 1000, -1000)
-        self.assertEqual(device.A3Nodes._normalize_audio_payload(msg, payload),
-                         struct.pack("<2h", 1000, 1000))
 
     def test_imu_info_lists_both_topic_out_streams(self):
         # 6th PR review: Agent Core treats info() as authoritative for topic
