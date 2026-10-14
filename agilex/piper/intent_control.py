@@ -243,8 +243,7 @@ class IntentControlPlugin(PiperPlugin):
         if action == 'select_action':
             return {'executed': False, 'message': 'Choose an action first.'}
         if action == 'start':
-            self.start(name)
-            return {'state': 'ready', 'executed': False}
+            return self.start(name) or {'state': 'ready', 'executed': False}
         if action in {'stop', 'stop_motion'}:
             if action == 'stop':
                 self.request_stop(name)
@@ -262,11 +261,31 @@ class IntentControlPlugin(PiperPlugin):
                 self._phase('cancelled', error='The action was cancelled.')
             raise
 
+    def start(self, name=None):
+        """Core precedes each manual execution (including Stop) with Start.
+
+        While this card owns a task, acknowledge that harmless lifecycle call
+        without changing readiness/cancellation or the operation gate. The next
+        action remains responsible for rejecting a new task or stopping it.
+        """
+        if name != CONTROL:
+            return super().start(name)
+        with self.lifecycle:
+            if self.gate.locked() and self.active_card == CONTROL:
+                stopping = self.closed or name in self.stopped_cards or self.cancel.is_set()
+                return {'state': 'stopping' if stopping else 'busy', 'executed': False,
+                        'operation_stopping': stopping,
+                        'message': 'The current action is stopping; no restart was performed.' if stopping else
+                            'An action is still running. Wait for completion or choose Stop; new actions are not queued.'}
+            self.closed = False
+            self.stopped_cards.discard(name)
+            return {'state': 'ready', 'executed': False}
+
     def _execute_task(self, action, args):
         with self.operation(CONTROL, action):
             self._phase('preparing', action=action, started_at=time.time(), result=None, error=None,
                         diagnostics=None, outcome=None, diagnostic_warning=None,
-                        request={key: value for key, value in args.items() if key in {'action', 'width_mm'}})
+                        request={'action': action, **{key: value for key, value in args.items() if key == 'width_mm'}})
             try:
                 self._audit('request')
                 driver = self.connected(cancel_event=self.cancel)

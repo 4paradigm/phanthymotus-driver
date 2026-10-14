@@ -513,5 +513,94 @@ class IntentTests(unittest.TestCase):
             result = self.call('set_gripper_opening', width_mm='')
         self.assertEqual(result['gripper']['width_mm'], 20.)
 
+    def test_core_start_before_second_move_reports_busy_without_cancelling(self):
+        self.runtime.config['async_actions'] = True
+        self.sdk.enabled = (False,) * 6
+        entered, release, complete = threading.Event(), threading.Event(), threading.Event()
+        original = self.driver.prepare_control
+        def prepare(**kwargs):
+            entered.set(); release.wait(3)
+            return original(**kwargs)
+        self.driver.prepare_control = prepare
+        with patch.object(self.runtime, 'acp_complete', side_effect=lambda *args:complete.set()):
+            self.call('start')
+            self.call('move_forward')
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('start')['state'], 'busy')
+                self.assertFalse(self.runtime.cancel.is_set())
+                with self.assertRaisesRegex(RuntimeError, 'busy'):
+                    self.call('move_forward')
+                self.assertEqual(self.call('info')['task']['action'], 'move_forward')
+                self.assertEqual(self.call('info')['state'], 'preparing')
+            finally:
+                release.set()
+            self.assertTrue(complete.wait(3))
+        self.assertEqual(self.call('info')['state'], 'completed')
+        self.assertEqual(sum(c[0]=='prepare' for c in self.sdk.calls),1)
+        self.assertEqual(self.call('start')['state'], 'ready')
+        self.call('move_backward')
+        # Wait for the second async request before tearing down the fake driver.
+        for _ in range(100):
+            if not self.runtime.gate.locked():break
+            time.sleep(.01)
+        self.assertFalse(self.runtime.gate.locked())
+
+    def test_core_start_before_stop_is_reachable_and_cannot_clear_cancellation(self):
+        self.runtime.config['async_actions'] = True
+        entered, release, complete = threading.Event(), threading.Event(), threading.Event()
+        clock = FastClock()
+        def sleep(seconds):
+            entered.set();release.wait(3);clock.sleep(seconds)
+        self.motion.stop()
+        with patch('agilex.piper.intent_control.move_cartesian',
+                   side_effect=lambda *args,**kwargs:move_cartesian(*args,**kwargs,clock=clock.now,sleep=sleep)), \
+             patch.object(self.runtime,'acp_complete',side_effect=lambda *args:complete.set()):
+            self.call('start');self.call('move_forward')
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.call('start')['state'],'busy')
+                self.assertEqual(self.call('stop_motion')['state'],'stopping')
+                count=len(self.sdk.calls)
+                self.assertEqual(self.call('start')['state'],'stopping')
+                self.assertTrue(self.runtime.cancel.is_set())
+                self.assertTrue(self.driver.cancelled.is_set())
+                self.assertEqual(len(self.sdk.calls),count)
+                self.assertEqual(self.call('stop_motion')['state'],'stopping')
+                with self.assertRaisesRegex(RuntimeError,'busy'):
+                    self.call('move_backward')
+            finally:
+                release.set()
+            self.assertTrue(complete.wait(3))
+        self.assertEqual(self.call('info')['state'],'cancelled')
+        self.assertEqual(self.call('start')['state'],'ready')
+        self.assertTrue(all(self.sdk.enabled))
+        targets=[c[1] for c in self.sdk.calls if c[0]=='end_pose']
+        self.assertEqual(len(targets),2)  # original goal, then measured hold
+        self.assertTrue(all(t[0]==201000 for t in targets))
+
+    def test_start_during_card_shutdown_preserves_stopped_flags_until_worker_finishes(self):
+        self.runtime.config['async_actions'] = True
+        self.sdk.enabled=(False,)*6
+        entered,release,complete=threading.Event(),threading.Event(),threading.Event()
+        original=self.driver.prepare_control
+        def prepare(**kwargs):
+            entered.set();release.wait(3);return original(**kwargs)
+        self.driver.prepare_control=prepare
+        with patch.object(self.runtime,'acp_complete',side_effect=lambda *args:complete.set()):
+            self.call('move_forward')
+            try:
+                self.assertTrue(entered.wait(1))
+                self.call('stop')
+                self.assertIn('arm_control',self.runtime.stopped_cards)
+                self.assertEqual(self.call('start')['state'],'stopping')
+                self.assertIn('arm_control',self.runtime.stopped_cards)
+                self.assertTrue(self.runtime.cancel.is_set())
+            finally:release.set()
+            self.assertTrue(complete.wait(3))
+        self.assertEqual(self.sdk.calls,[])
+        self.assertEqual(self.call('start')['state'],'ready')
+        self.assertNotIn('arm_control',self.runtime.stopped_cards)
+
 if __name__ == '__main__':
     unittest.main()

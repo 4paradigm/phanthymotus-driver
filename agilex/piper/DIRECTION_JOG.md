@@ -57,3 +57,17 @@ Common agreements remain: no Core modifications, no arm-2 operation, preserve ol
 - The controller still reports TARGET_POS_EXCEEDS_LIMIT. Deployment did not clear that error; motion/gripper tasks remain blocked until healthy feedback returns.
 - Evidence: workspace `acceptance/20261014_piper_direction/`, including browser result/screenshot, simulated rejection/journal, full Python test log, deployment helper and live read-only verification.
 - PR #382 has not been pushed/updated for this candidate, pending user testing. Bot Version: 尚未生成.
+
+## 2026-10-14 manual Start/Stop compatibility fix
+
+The real Core sends `start` before every manual Execute, including Stop. Previously, the inherited Start rejected any task-owning gate as "An operation is still stopping", even when it was merely running. This obscured the busy state and could prevent the manual Stop action from reaching the driver.
+
+Arm control's Start now returns a harmless `busy` or `stopping` acknowledgment while it owns a task. It does not clear cancellation, reopen stopped readiness flags, release the gate, send a control, or queue an action. The following movement request is still rejected as busy; the following Stop can reach its cancellation path. After the worker releases its gate, a later Start can ready the card normally. Other tools and the historical runtime are unchanged. Journals now explicitly include the action in the request object even when the framework has removed it from argument fields.
+
+Tests reproduce actual Core sequences: Start → action → Start → second action; Start → action → Start → Stop; and Start while a stopped-card worker drains. Full regression: **206 passed, 195 subtests passed**; offline candidate **48 unittest tests passed**; unchanged Core card/monitor browser verification passed.
+
+Deployed arm-1 image `agilex-piper:local-arm1-lifecycle-ea016db5`; backup `/opt/phanthy-motus/backups/piper-arm1-lifecycle-20261014-125747/`. Freshly checked intelligent control off and no active task before restart. Core/arm 2/config/camera worker identities remain unchanged. Post-restart feedback and camera verified read-only; no real control commands executed.
+
+The original forward request did **not** succeed: recorded start `[53.907, 2.765, 220.173]` mm, target `[54.907, 2.765, 220.173]` mm, measured displacement 0 mm, timeout at 30 seconds. The driver then attempted its existing healthy-current-pose hold; later feedback again reported target-limit rejection. These observations do not establish why MOVE_L did not move or prove the hold caused the error. This compatibility fix does not change actuation or claim physical movement acceptance. The active target-limit report continues to block physical tasks.
+
+Evidence: workspace `acceptance/20261014_piper_lifecycle/`, including the original task snapshot, test log, browser result, deployment helper, and post-deployment read-only verification. PR #382 still waits for user testing; this candidate's Bot Version remains 尚未生成.

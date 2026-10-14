@@ -84,3 +84,12 @@
 - 智能控制重新读取为关闭且无当前任务后，仅部署机械臂 1：`agilex-piper:local-arm1-direction-b38149e6`；备份 `/opt/phanthy-motus/backups/piper-arm1-direction-20261014-124447/`。
 - 部署前后 CAN 模式、使能和关节/末端反馈一致，超限报警仍在；未自动清错。元数据、PiPER 模型、反馈时间推进及相机约 10 fps 已只读验证。
 - 未推送 PR #382，Bot Version 尚未生成，等待用户真机测试。机械臂 2、Core、现场配置、相机 worker 及原 smoke-test.py 未改。
+
+## 2026-10-14 重复手动执行与 Stop 入口修复
+
+- 用户点 Move forward 后重复执行报 stopping。现场日志和代码确认：Core 每次执行前调用 Start，历史 runtime 对所有占用中的任务都报 still stopping，连手动 Stop 也可能被挡住。
+- Intent Arm control 单独兼容 Start：已有任务时只返回 busy/stopping，不修改取消、就绪或互斥状态；新动作继续拒绝，Stop 可到达；其它历史卡不变。
+- 206 passed、195 subtests passed；候选镜像无设备/网络运行 48 项相关 unittest 通过；未修改 Core 卡片与骨架浏览器验证通过。
+- 新鲜确认智能控制关闭、当前无任务后仅部署 arm 1：`agilex-piper:local-arm1-lifecycle-ea016db5`；备份 `/opt/phanthy-motus/backups/piper-arm1-lifecycle-20261014-125747/`。其它容器、现场配置、相机 worker 不变；仅 Info 验证反馈及相机，未执行控制。
+- 原向前动作证据保存：起点 [53.907,2.765,220.173] mm，目标 X+1 mm，实际位移 0 mm，30 秒超时。现在又有目标超限报警。此修复只处理生命周期误报和 Stop 可达性，真实 MOVE_L 无位移原因仍待排查/验收。
+- 未推送 PR #382，Bot Version 尚未生成，原 smoke-test.py 保留。证据目录 acceptance/20261014_piper_lifecycle/。
