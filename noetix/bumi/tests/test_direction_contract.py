@@ -12,7 +12,7 @@ def test_only_sensor_card_and_shared_settings(monkeypatch):
     card = module.SoundDirectionPlugin({}, 'robot', types.SimpleNamespace(add_node=lambda _: None))
     assert [tool['name'] for tool in card.get_tools()] == ['sound_direction']
     tool = card.get_tool()
-    assert tool['topic_out'][0]['format'] == 'sensor/sound-direction-v1'
+    assert tool['topic_out'][0]['format'] == 'sensor/sound-direction'
     assert set(tool['configSchema']['properties']) == set(module.DEFAULT_PARAMETERS)
     assert all(field['scope'] == 'shared' for field in tool['configSchema']['properties'].values())
     assert tool['inputSchema']['properties']['action']['enum'] == ['info', 'start', 'stop']

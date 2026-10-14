@@ -7,7 +7,7 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 `mic` publishes mono PCM `AudioChunk` messages on `/<namespace>/mic/audio`.
 `sound_direction` is the only direction card. It publishes
 `audio_msgs/msg/SoundDirection` on `/<namespace>/sound_direction` with the
-`sensor/sound-direction-v1` canvas format. The angle uses the robot frame:
+`sensor/sound-direction` canvas format. The angle uses the robot frame:
 front 0°, right positive, left negative, and rear +180°. `NO_EVENT` clears
 the live angle after activity stops.
 

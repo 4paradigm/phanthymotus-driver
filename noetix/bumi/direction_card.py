@@ -225,7 +225,7 @@ class SoundDirectionPlugin:
                 "update_interval_ms": {"type": "integer", "minimum": 50,
                                        "maximum": 1000, "default": 100,
                                        "scope": "shared"}}},
-            "topic_out": [{"topic": self._topic, "format": "sensor/sound-direction-v1"}],
+            "topic_out": [{"topic": self._topic, "format": "sensor/sound-direction"}],
         }
 
     def get_tools(self) -> list:
