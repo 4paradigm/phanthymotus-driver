@@ -20,9 +20,9 @@ JOINT_NAMES = [
 ]
 MOTION_ACTIONS = ("open", "close", "set_joint", "set_positions")
 
-# Open pose was captured from the connected RIGHT hand. The fist pose is the
-# user's requested target, not a hardware-verified reachable pose. Values are
-# 0..255 position units, not degrees; config.yaml can override either pose.
+# These poses were confirmed on the connected RIGHT hand. They are examples for
+# this unit, not universal defaults: close requires an explicit fist_pose in
+# the deployment config. Values are 0..255 position units, not degrees.
 RIGHT_OPEN_POSE = [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
 RIGHT_FIST_POSE = [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
 
@@ -77,8 +77,10 @@ class HandPlugin:
         self.connection = connection
         if connection.side != "right" and ("open_pose" not in config or "fist_pose" not in config):
             raise ValueError("left-hand open_pose and fist_pose must be configured explicitly")
+        if "fist_pose" not in config:
+            raise ValueError("fist_pose must be explicitly calibrated and configured before enabling close")
         self.open_pose = _bytes(config.get("open_pose", RIGHT_OPEN_POSE))
-        self.fist_pose = _bytes(config.get("fist_pose", RIGHT_FIST_POSE))
+        self.fist_pose = _bytes(config["fist_pose"])
         self.motion_speed = self._setting(config.get("motion_speed", 60), "motion_speed")
         self.motion_torque = self._setting(config.get("motion_torque", 100), "motion_torque")
         self.motion_timeout_s = float(config.get("motion_timeout_s", 8.0))
@@ -108,7 +110,7 @@ class HandPlugin:
             {
                 "get_state": ([], "读取 10 个关节位置和速度"),
                 "open": (["confirm_motion"], "展开到已验证的右手姿态；每次运动需确认"),
-                "close": (["confirm_motion"], "握拳到用户指定的右手姿态（尚未实机验证）；每次运动需确认"),
+                "close": (["confirm_motion"], "握拳到当前设备已校准的姿态；每次运动需确认"),
                 "set_joint": (["joint", "position", "confirm_motion"], "设置单关节位置 0..255；每次运动需确认"),
                 "set_positions": (["positions", "confirm_motion"], "按关节顺序设置 10 个位置；画布输入逗号分隔值；每次运动需确认"),
                 "set_speed": (["speed"], "配置后续动作速度，不立即驱动"),

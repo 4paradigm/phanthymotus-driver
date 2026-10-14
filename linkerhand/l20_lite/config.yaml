@@ -20,7 +20,8 @@ plugins:
     motion_timeout_s: 8.0
     position_tolerance: 6
     poll_interval_s: 0.2
-    # Right-hand open pose measured on this hand; fist pose requested by user.
+    # Calibrated on this specific right hand and confirmed by the operator with
+    # successful close/open motions. Recalibrate before deploying to another hand.
     # Joint order: thumb root/sway, four finger roots, index/middle/ring sway,
     # thumb roll. Values are 0..255 position units, not degrees.
     open_pose: [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]

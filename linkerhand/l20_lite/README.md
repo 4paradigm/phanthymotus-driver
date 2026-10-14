@@ -21,9 +21,12 @@ after checking that the hand and its surroundings are clear. State reads,
 speed/torque configuration and torque release do not need motion confirmation.
 The right-hand default
 `open` pose is the pose read immediately before a successful physical fist/open
-test. The default `close` pose is the user's requested right-hand target:
-`[93,255,0,0,0,0,128,128,128,255]`. This new pose has not yet been verified
-on hardware. The official L20 Lite example maps slots 7–10 to index sway,
+test. The configured `close` pose is the user's requested right-hand target:
+`[93,255,0,0,0,0,128,128,128,255]`. The operator confirmed successful
+close/open motions on this specific right hand. The driver requires an explicit
+`fist_pose` in the deployment config and refuses to start without one; this
+calibration must not be assumed safe for another hand. The official L20 Lite
+example maps slots 7–10 to index sway,
 middle sway, ring sway and thumb rotation; it has no separate pinky-sway slot.
 These are 0–255 position commands, not degrees. Both
 actions first read position, set speed/torque to the tested 60/100 values,

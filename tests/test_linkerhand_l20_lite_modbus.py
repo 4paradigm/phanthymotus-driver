@@ -17,7 +17,11 @@ sys.path.insert(0, str(DRIVER))
 
 from modbus_client import L20LiteModbusClient, crc16
 from modbus_device import HandPlugin, JOINT_NAMES, RIGHT_FIST_POSE, RIGHT_OPEN_POSE
-from common.vendor_runtime import DriverBundle
+from common.vendor_runtime import DriverBundle, load_config
+
+
+def calibrated_config(**overrides):
+    return {"fist_pose": list(RIGHT_FIST_POSE), **overrides}
 
 
 class FakeSerial:
@@ -159,7 +163,7 @@ def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
     ]
     assert RIGHT_FIST_POSE == [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {"poll_interval_s": 0.02})
+    plugin = HandPlugin(connection, calibrated_config(poll_interval_s=0.02))
     events, done = capture_completions(plugin)
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
     plugin.start()
@@ -180,7 +184,7 @@ def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
 
 def test_card_rejects_bad_joint_without_position_write():
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {})
+    plugin = HandPlugin(connection, calibrated_config())
     with pytest.raises(ValueError, match="unknown joint"):
         plugin.dispatch("set_joint", {"joint": "nonexistent", "position": 12, "confirm_motion": True})
     assert connection.transport.sent == []
@@ -193,16 +197,29 @@ def test_left_hand_needs_explicit_side_specific_poses():
         HandPlugin(connection, {})
 
 
+def test_right_hand_needs_explicit_calibrated_fist_pose():
+    connection = FakeConnection()
+    with pytest.raises(ValueError, match="fist_pose must be explicitly calibrated"):
+        HandPlugin(connection, {})
+    assert connection.transport.sent == []
+
+
+def test_bundled_right_hand_config_explicitly_sets_calibrated_fist_pose():
+    config = load_config(str(DRIVER / "main.py"))
+    assert config["side"] == "right"
+    assert config["plugins"]["hand"]["fist_pose"] == RIGHT_FIST_POSE
+
+
 def test_canvas_stop_before_connection_does_not_open_serial():
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {})
+    plugin = HandPlugin(connection, calibrated_config())
     assert plugin.dispatch("stop", {}) == {"state": "idle", "torque_released": True}
     assert connection.transport.sent == []
 
 
 def test_canvas_card_schema_and_csv_positions(monkeypatch):
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {"poll_interval_s": 0.02})
+    plugin = HandPlugin(connection, calibrated_config(poll_interval_s=0.02))
     card = plugin.get_tool()
     actions = card["inputSchema"]["properties"]["action"]["enum"]
     assert card["title"] == "L20 Lite 灵巧手"
@@ -235,7 +252,7 @@ def test_canvas_card_schema_and_csv_positions(monkeypatch):
 
 def test_motion_error_notifies_acp_and_allows_later_request():
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {})
+    plugin = HandPlugin(connection, calibrated_config())
     events, done = capture_completions(plugin)
     connection.transport.corrupt_next = True
     accepted = plugin.dispatch("close", {"confirm_motion": True})
@@ -252,7 +269,7 @@ def test_motion_error_notifies_acp_and_allows_later_request():
 
 
 def test_acp_callback_posts_terminal_payload_and_checks_acknowledgement(monkeypatch):
-    plugin = HandPlugin(FakeConnection(), {})
+    plugin = HandPlugin(FakeConnection(), calibrated_config())
     requests = []
 
     def fake_urlopen(request, **kwargs):
@@ -269,7 +286,7 @@ def test_acp_callback_posts_terminal_payload_and_checks_acknowledgement(monkeypa
 
 
 def test_failed_acp_delivery_blocks_new_motion():
-    plugin = HandPlugin(FakeConnection(), {})
+    plugin = HandPlugin(FakeConnection(), calibrated_config())
     done = threading.Event()
 
     def reject(*_args):
@@ -290,7 +307,7 @@ def test_failed_acp_delivery_blocks_new_motion():
 
 def test_overlapping_motion_is_rejected_until_completion(monkeypatch):
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {})
+    plugin = HandPlugin(connection, calibrated_config())
     events, done = capture_completions(plugin)
     entered, proceed = threading.Event(), threading.Event()
 
@@ -310,7 +327,7 @@ def test_overlapping_motion_is_rejected_until_completion(monkeypatch):
 
 def test_stop_notifies_cancelled_without_followup_target(monkeypatch):
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {})
+    plugin = HandPlugin(connection, calibrated_config())
     events, done = capture_completions(plugin)
     entered, proceed = threading.Event(), threading.Event()
 
@@ -342,7 +359,7 @@ def test_stop_notifies_cancelled_without_followup_target(monkeypatch):
 @pytest.mark.parametrize("confirmation", [None, False, 1, "true"])
 def test_motion_requires_explicit_boolean_confirmation_before_serial_access(action, args, confirmation):
     connection = FakeConnection()
-    plugin = HandPlugin(connection, {})
+    plugin = HandPlugin(connection, calibrated_config())
     request = dict(args)
     if confirmation is not None:
         request["confirm_motion"] = confirmation
@@ -354,7 +371,7 @@ def test_motion_requires_explicit_boolean_confirmation_before_serial_access(acti
 
 def test_mcp_bundle_discovers_hand_card_without_opening_serial():
     connection = FakeConnection()
-    bundle = DriverBundle([HandPlugin(connection, {})])
+    bundle = DriverBundle([HandPlugin(connection, calibrated_config())])
     assert bundle.get_all_tools()[0]["name"] == "hand"
     assert bundle.dispatch("hand", {"action": "start"}) == {"state": "ready"}
     assert connection.transport.sent == []
