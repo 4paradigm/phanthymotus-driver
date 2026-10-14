@@ -520,3 +520,24 @@ def test_invalid_canvas_topic_does_not_change_subscription(pair, topic):
     with pytest.raises(ValueError, match="invalid_input_topic"):
         call(pair, "teleop", "start", input_topic=topic)
     assert pair.bus is bus and bus.running
+
+
+def test_deployment_template_exposes_cards_without_connecting_can(tmp_path, monkeypatch):
+    import yaml
+    monkeypatch.setenv("PIPER_MOTION_ENABLED", "1")
+    template = Path(__file__).parents[1] / "agilex/piper/config.dual.example.yaml"
+    config = yaml.safe_load(template.read_text())
+    config["data_dir"] = str(tmp_path)
+    config["calibration_path"] = str(tmp_path / "missing-calibration.json")
+    plugin, = build_plugins(config, "piper", None)
+    try:
+        plugin.start()
+        assert {"piper_teleop", "piper_motion"} <= {t["name"] for t in plugin.get_tools()}
+        for arm in plugin.arms.values():
+            assert arm.driver is None
+            assert arm.motion_enabled is False
+        assert call(plugin, "teleop", "info")["output"] is False
+        with pytest.raises((OSError, ValueError)):
+            plugin.motion.configuration()
+    finally:
+        plugin.stop()
