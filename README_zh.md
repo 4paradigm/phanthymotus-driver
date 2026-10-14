@@ -15,6 +15,7 @@
 | `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
 | `chasing/qianjiao_p200_pro` | 潜行科技潜鲛 P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF 运动控制、锁定/解锁、心跳和连接状态 |
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
+| `linkerhand/l20_lite` | 灵心巧手 L20 Lite | 15723 | USB-RS485/Modbus 115200、10 关节控制与状态读取 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
 ## 快速开始

@@ -1,0 +1,25 @@
+mcp_port: 15723
+ros_namespace: ""
+
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+
+name: "LinkerHand L20 Lite"
+side: "right"
+serial_port: "/dev/ttyUSB0"
+baudrate: 115200
+response_timeout_s: 0.5
+
+plugins:
+  hand:
+    enabled: true
+    # Values used by the successful Ubuntu/USB-RS485 SDK hardware test.
+    motion_speed: 60
+    motion_torque: 100
+    motion_timeout_s: 8.0
+    position_tolerance: 6
+    poll_interval_s: 0.2
+    # Right-hand pose read before fist, and the official Modbus example's fist.
+    open_pose: [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
+    fist_pose: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
