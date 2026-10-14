@@ -131,10 +131,11 @@ class TeleopBus:
                     with self.control._lock:
                         binding = copy.deepcopy(self.control.binding)
                     self._bind(binding)
-                    self.executor.spin_once(timeout_sec=.02)
+                    timeout = min(.02, max(0., next_publish-time.monotonic())) if self.pub else .02
+                    self.executor.spin_once(timeout_sec=timeout)
                     self.health.beat()
                     if self.pub and time.monotonic() >= next_publish:
-                        next_publish = time.monotonic()+.2
+                        next_publish = time.monotonic()+1/30
                         try:
                             message = self.String()
                             message.data = json.dumps(self.control.feedback(), allow_nan=False, separators=(',', ':'))

@@ -21,6 +21,8 @@ Reset 使用 [宇树手臂动作接口](https://support.unitree.com/home/en/G1_d
 
 原厂99发出后没有可靠取消接口；发送期间发生停止或输入中断时，不得声称动作已经取消。
 
+骨架反馈发布目标频率为30 Hz。ROS 接收等待以最早发布时间为上限，发布延迟后只发送最新快照，不补发积压帧；机器人控制频率保持不变。
+
 PICO 继续使用既有 `left/right.controls.buttons` 的 `available`、`pressed`，不新增 topic。确认键是 `left.x + right.a`，Reset 键是 `left.y + right.b`；已有遥操、暂停、Reset 处理中或错误状态均接收这两组按键；X+A 重建基准，新的 Y+B 按键可重试发送。X+A 会先完成旧通道交权；已经进行的 DDS 写入需结束，不声称撤销已发送请求。同时按两组键不执行。输入超过 300 ms、按键松开或握把按下会中断一秒计时。
 
 | 顶层 state | 顶层 reason | PICO 提示含义 |

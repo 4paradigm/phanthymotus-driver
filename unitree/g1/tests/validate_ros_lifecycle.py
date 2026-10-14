@@ -33,6 +33,9 @@ control=Control();bus=TeleopBus(shared,control)
 node=Node('isolated_input_test',context=ctx)
 qos=QoSProfile(depth=16,reliability=ReliabilityPolicy.RELIABLE,history=HistoryPolicy.KEEP_LAST)
 pubs={name:node.create_publisher(String,name,qos) for name in ['/test/a','/test/b']}
+feedback_times=[]
+feedback_sub=node.create_subscription(String,'/test/state',lambda message:feedback_times.append(time.monotonic()),qos)
+shared.add_node(node)
 seq=0
 owner_events=[]
 for method in ['create_subscription','destroy_subscription']:
@@ -44,11 +47,18 @@ def send(seconds,topic='/test/a'):
  global seq
  deadline=time.monotonic()+seconds
  while time.monotonic()<deadline:
-  seq+=1;message=String();message.data=json.dumps({'sequence':seq});pubs[topic].publish(message);time.sleep(.01)
+  seq+=1;message=String();message.data=json.dumps({'sequence':seq});pubs[topic].publish(message);shared.spin_once(timeout_sec=.01)
 try:
  send(2)
  assert len(control.received)>20,(len(control.received),bus.status())
  assert bus.subscription_generation==1,bus.status()
+ active=feedback_times[-20:]
+ active_hz=(len(active)-1)/(active[-1]-active[0])
+ assert len(active)==20 and 27<=active_hz<=33,active_hz
+ feedback_times.clear();deadline=time.monotonic()+1.2
+ while time.monotonic()<deadline:shared.spin_once(timeout_sec=.02)
+ idle_hz=(len(feedback_times)-1)/(feedback_times[-1]-feedback_times[0])
+ assert len(feedback_times)>25 and 27<=idle_hz<=33,idle_hz
  first=len(control.received)
  for i in range(20):
   topic='/test/b' if i%2==0 else '/test/a'
@@ -68,7 +78,7 @@ try:
  error=bus.status()['receive_error'];assert error,bus.status()
  time.sleep(.3);assert bus.status()['receive_error']==error
  send(.5);assert bus.status()['receive_error'] is None
- print(json.dumps({'result':'ROS ISOLATED PASS','received':len(control.received),'subscription_generation':bus.subscription_generation,'invalid_handle_count':3,'lifecycle_owner':sorted(set(x[1] for x in owner_events)),'hardware_output':False}))
+ print(json.dumps({'result':'ROS ISOLATED PASS','received':len(control.received),'subscription_generation':bus.subscription_generation,'invalid_handle_count':3,'lifecycle_owner':sorted(set(x[1] for x in owner_events)),'feedback_hz_active':round(active_hz,2),'feedback_hz_idle':round(idle_hz,2),'hardware_output':False}))
 finally:
  bus.close();assert not bus.thread.is_alive()
- node.destroy_node();shared.shutdown();ctx.shutdown()
+ shared.remove_node(node);node.destroy_node();shared.shutdown();ctx.shutdown()
