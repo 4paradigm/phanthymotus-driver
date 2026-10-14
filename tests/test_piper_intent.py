@@ -93,7 +93,8 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(tools['model']['type'], 'resource')
         actions = tools['arm_control']['inputSchema']['properties']['action']['enum']
         self.assertEqual(set(actions) - {'start', 'stop', 'info', 'select_action'},
-                         {'move', 'stop_motion', 'open_gripper', 'close_gripper', 'set_gripper_opening'})
+                         {'move', 'stop_motion', 'open_gripper', 'close_gripper', 'set_gripper_opening',
+                          'exit_teaching_and_hold'})
         self.assertEqual(tools['arm_control']['topic_out'][0]['topic'], '/agilex/piper/state/joints')
         self.assertFalse(self.call('select_action')['executed'])
         self.assertEqual(self.sdk.calls, [])

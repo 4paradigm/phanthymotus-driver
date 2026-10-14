@@ -57,3 +57,17 @@
 - 后续真实方向、自动准备、夹爪与停止验收由用户进行；尚未更新 PR 或请求新 Bot 构建。
   本候选版本 Version：尚未生成。旧 release.261013.74ab514 不代表此候选版本。
 - 证据目录：工作区 `acceptance/20261014_piper_intent/`；部署脚本和只读验证记录已保留。
+
+## 2026-10-14 退出示教并保持位置候选
+
+- Arm control 新增 `exit_teaching_and_hold`（Exit teaching and hold），参见 `TEACHING_EXIT.md`。
+- 先查询当前连接固件、确认静止与正常全使能反馈，再通过固定 SDK 的 CAN/MOVE_J
+  以实测关节位置保持。无 Reset、回零或失能，普通 Move 仍拒绝示教模式。
+- PiPER 测试集合：190 passed、186 subtests passed；候选容器内禁用网络且不映射设备，
+  32 项相关模拟测试通过。现场只验元数据、反馈和相机，没有执行新动作。
+- 已部署机械臂 1 镜像 `agilex-piper:local-arm1-teaching-hold-ef3d4022`；
+  备份 `/opt/phanthy-motus/backups/piper-arm1-teaching-hold-20261014-115424/`。
+- 保留新从臂 CAN1 和相机 /dev/piper-camera-2 绑定，Core、机械臂 2、相机 worker 未改；
+  部署前后示教模式、关节角度及使能反馈一致。浏览器刷新后卡片说明已显示新动作。
+- 现场退出示教与保持效果待用户验收；尚未推送 PR #382，新功能 Version 尚未生成。
+- 证据目录：工作区 `acceptance/20261014_piper_teaching/`。

@@ -39,7 +39,7 @@ def end_pose(driver):
     return EndPose(tuple(v / 1000 for v in raw[:3]), tuple(v / 1000 for v in raw[3:]), stamp)
 
 
-def checked_state(driver, *, ready=False):
+def checked_state(driver, *, ready=False, allow_teaching=False):
     state = driver.get_state()
     if not fresh(state.feedback_time):
         raise RuntimeError('Joint feedback is stale; check the CAN connection.')
@@ -51,7 +51,8 @@ def checked_state(driver, *, ready=False):
         raise RuntimeError('The arm reports a fault: ' + state.arm_status)
     if not state.teach_status.startswith(('DISABLED', 'STOP_RECORDING', 'TERMINATE_EXECUTION')):
         raise RuntimeError('Teaching or trajectory playback is active; stop it on the robot first.')
-    if not state.control_mode.startswith(('STANDBY', 'CAN_CTRL')):
+    modes = ('STANDBY', 'CAN_CTRL', 'TEACHING_MODE') if allow_teaching else ('STANDBY', 'CAN_CTRL')
+    if not state.control_mode.startswith(modes):
         raise RuntimeError('The arm is in an unsupported mode: ' + state.control_mode)
     for i, (q, bounds) in enumerate(zip(state.joints_deg, driver.joint_bounds_deg()), 1):
         if not bounds[0] <= q <= bounds[1]:

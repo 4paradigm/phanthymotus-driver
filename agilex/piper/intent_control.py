@@ -11,9 +11,10 @@ from common.vendor_runtime import action_schema, tool
 from agilex.piper.device import PiperPlugin
 from agilex.piper.runtime import PiperRuntime
 from agilex.piper.intent_motion import DIRECTIONS, checked_state, end_pose, move_cartesian
+from agilex.piper.intent_teaching import exit_teaching_and_hold
 
 CONTROL = 'arm_control'
-TASK_ACTIONS = {'move', 'open_gripper', 'close_gripper', 'set_gripper_opening'}
+TASK_ACTIONS = {'move', 'open_gripper', 'close_gripper', 'set_gripper_opening', 'exit_teaching_and_hold'}
 
 
 def public_error(error):
@@ -78,6 +79,8 @@ class IntentControlPlugin(PiperPlugin):
                    'stop_motion': ([], 'Stop the current action; keep motor torque'),
                    'open_gripper': ([], 'Open the gripper'), 'close_gripper': ([], 'Close the gripper'),
                    'set_gripper_opening': (['width_mm'], 'Set the gripper opening'),
+                   'exit_teaching_and_hold': ([], 'Exit teaching and hold the measured pose. Keep the arm stationary; '
+                       'requires PiPER firmware >= 1.8.5 and all arm motors enabled. No reset or homing.'),
                    'start': ([], 'Ready the card; no motor commands'),
                    'stop': ([], 'Stop the card and cancel its action'), 'info': ([], 'Read feedback and the last task result')}
         schema = action_schema(actions, {
@@ -92,7 +95,8 @@ class IntentControlPlugin(PiperPlugin):
                          'title': 'Gripper opening (mm)', 'description': f'{low:g}–{high:g} mm; effective limits.'}})
         labels = {'select_action': 'Choose an action', 'move': 'Move', 'stop_motion': 'Stop',
                   'open_gripper': 'Open gripper', 'close_gripper': 'Close gripper',
-                  'set_gripper_opening': 'Set gripper opening', 'start': 'Start', 'stop': 'Stop card', 'info': 'Info'}
+                  'set_gripper_opening': 'Set gripper opening', 'exit_teaching_and_hold': 'Exit teaching and hold',
+                  'start': 'Start', 'stop': 'Stop card', 'info': 'Info'}
         schema['properties']['action'].update(title='Action', default='select_action',
             oneOf=[{'const': a, 'title': labels[a]} for a in actions])
         schema.update({'additionalProperties': False, 'x-manual-execution': True, 'x-resource': 'arm',
@@ -103,7 +107,8 @@ class IntentControlPlugin(PiperPlugin):
         namespace = self.topic.rsplit('/', 1)[0]
         arm = tool(CONTROL, 'actuator',
                    'Move the end effector in the fixed robot base frame, control the gripper, or stop. '
-                   'Normal mode and motor preparation are automatic. Check physical clearance before executing.',
+                   'Normal mode and motor preparation are automatic. Exit teaching and hold is an explicit action: '
+                   'keep the arm stationary; no reset or homing. Check physical clearance before executing.',
                    schema, topic_out=[{'topic': namespace + '/state/joints', 'format': 'sensor/skeleton'},
                                       {'topic': namespace + '/state/parameters', 'format': 'data/json'}])
         arm['title'] = 'Arm control'
@@ -220,6 +225,12 @@ class IntentControlPlugin(PiperPlugin):
             self._phase('preparing', action=action, started_at=time.time(), result=None, error=None)
             try:
                 driver = self.connected(cancel_event=self.cancel)
+                if action == 'exit_teaching_and_hold':
+                    result = exit_teaching_and_hold(driver, on_switch=lambda: self._phase('moving'))
+                    with self.lifecycle:
+                        driver._check_cancelled()
+                        self._phase('completed', result=result)
+                    return {**result, 'state': 'completed'}
                 state = checked_state(driver)
                 # Validate end feedback/actual gripper limits BEFORE enabling.
                 if action == 'move':
