@@ -552,7 +552,7 @@ class TeleopControl:
             confirmed = operator_confirmation and self.executor.confirm_operator_reset()
             result = {} if confirmed else self.executor.dispatch('stop', {})
             if result.get('error'): raise ValueError(result.get('code', result['error']))
-            deadline = time.monotonic()+(12. if confirmed else 4.)
+            deadline = time.monotonic()+12.
             while self.executor.status()['ownership_held'] and time.monotonic() < deadline:
                 if confirmed:self.executor.confirm_operator_reset()
                 time.sleep(.02)

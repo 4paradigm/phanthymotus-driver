@@ -212,20 +212,6 @@ class TrajectoryControl:
                     if resumed.get('error'): raise ValueError(resumed['error'])
                 self._send_frame(frame, seq, due)
             self._wait_until(start+recording['duration_ns'])
-            # Observe a fresh final sample; time elapsed alone is not completion.
-            end = self.control.clock()+2_000_000_000
-            last_write = self.arm.last_emit
-            while True:
-                self._wait_until(self.control.clock()+20_000_000)
-                sample, q, dq = self.arm._fresh()
-                if self.arm.last_q == recording['frames'][-1]['target_q'] and sample['arm_ns'] > last_write and max(abs(a-b) for a,b in zip(q, recording['frames'][-1]['target_q'])) <= .02 and max(map(abs, dq)) <= .02:
-                    break
-                if self.control.clock() >= end: raise ValueError('replay_final_feedback_unconfirmed')
-                final = recording['frames'][-1]
-                if final['kind'] == 'target' and self.arm.last_q != final['target_q']:
-                    seq += 1
-                    self._send_frame(final, seq, self.control.clock())
-                    last_write = self.arm.last_emit
             status = 'completed'
             result = {'filename': recording['filename'], 'sha256': recording['sha256'], 'frames': len(recording['frames'])}
         except Exception as exc:

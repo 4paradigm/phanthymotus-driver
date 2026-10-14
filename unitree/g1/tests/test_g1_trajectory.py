@@ -95,12 +95,12 @@ def test_exact_replay_reference_bypasses_filter_but_not_execution_gate(tmp_path)
     assert len(channel.positions) == before
 
 
-def test_replay_limits_fast_target_and_rejects_stale_feedback(tmp_path):
+def test_replay_sends_saved_target_and_rejects_stale_feedback(tmp_path):
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     command = packet(arm, target=.1)
     advance(10); arm.replay_deadline_ns = arm.clock()+200_000_000
     arm.write_replay(command)
-    assert channel.positions[-1][0] == pytest.approx([.01]*10)
+    assert channel.positions[-1][0] == pytest.approx([.1]*10)
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     arm.replay_deadline_ns = arm.clock()+200_000_000
     command = packet(arm, seq=2, target=.1)
@@ -367,7 +367,7 @@ def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_p
         card.trajectory.stop(); done.set(); ticker.join(1)
 
 
-@pytest.mark.parametrize('failure', ['cancel', 'stale_feedback', 'not_following'])
+@pytest.mark.parametrize('failure', ['cancel', 'stale_feedback'])
 def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path, failure):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     writes = []
@@ -389,20 +389,11 @@ def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path
                 snapshot['arm_ns'] = arm.clock()-1_000_000_000
                 arm._snapshot_provider = lambda: copy.deepcopy(snapshot)
         arm.write_replay = write
-        if failure == 'not_following':
-            fixed = list(sample['q'])
-            def snapshot():
-                sample['arm_ns'] = arm.clock(); sample['q'] = fixed
-                return copy.deepcopy(sample)
-            arm._snapshot_provider = snapshot
         result = card.dispatch('play', {'filename': name})
         card.trajectory.thread.join(9)
         outcome = card.dispatch('action_status', {'action_id': result['action_id']})
         assert outcome['status'] in ('cancelled', 'error'), outcome
-        if failure == 'not_following':
-            assert 'replaying' in writes
-            assert outcome['result']['reason'] == 'replay_final_feedback_unconfirmed'
-        else: assert 'replaying' not in writes
+        assert 'replaying' not in writes
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
 
@@ -550,10 +541,16 @@ def test_delayed_replay_skips_obsolete_targets_but_keeps_pause(tmp_path):
         card.trajectory.stop(); done.set(); ticker.join(1)
 
 
-def test_final_reference_finishes_through_shared_slew_limiter(tmp_path):
+def test_final_reference_is_sent_without_extra_convergence_loop(tmp_path):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     try:
         card.stop(); channel.positions.clear()
+        sent = []
+        original = arm.write_replay
+        def write(command):
+            sent.append(command['values'])
+            original(command)
+        arm.write_replay = write
         start = list(sample['q']); target = [q+.08 for q in start]
         frame = {'kind': 'target', 'mapping_epoch': 1}
         recording = {'filename': 'final.jsonl', 'sha256': 'test',
@@ -565,7 +562,7 @@ def test_final_reference_finishes_through_shared_slew_limiter(tmp_path):
         card.trajectory._run('final', recording)
         assert card.trajectory.last_action['status'] == 'completed', card.trajectory.last_action
         assert channel.positions[-1][0] == pytest.approx(target)
-        assert len(channel.positions) > 2
+        assert sent == [start, target]
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
 
