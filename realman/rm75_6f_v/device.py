@@ -465,6 +465,9 @@ GRIPPER_POLL_INTERVAL_SECONDS = 0.15
 GRIPPER_POSITION_TOLERANCE = 5
 GRIPPER_PROGRESS_THRESHOLD = 5
 GRIPPER_DEFAULT_STALL_TIMEOUT_SECONDS = 3.0
+GRIPPER_FORCE_MIN = 50
+GRIPPER_FORCE_MAX = 1000
+GRIPPER_DEFAULT_FORCE = 200
 GRIPPER_MOVING_MODES = frozenset((4, 5))
 GRIPPER_TERMINAL_MODES = frozenset((1, 2, 3, 6))
 CARTESIAN_STOP_JOIN_MARGIN = 10  # 笛卡尔 stop 等待监控线程收尾的额外余量（秒）
@@ -494,6 +497,20 @@ def _gripper_stall_timeout(value) -> float:
     return numeric
 
 
+def _gripper_force(value) -> int:
+    if value is None:
+        return GRIPPER_DEFAULT_FORCE
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("force must be a number") from exc
+    if not math.isfinite(numeric) or not GRIPPER_FORCE_MIN <= numeric <= GRIPPER_FORCE_MAX:
+        raise ValueError(
+            f"force must be within {GRIPPER_FORCE_MIN}~{GRIPPER_FORCE_MAX}"
+        )
+    return int(round(numeric))
+
+
 class GripperPlugin:
     """RealMan 二指夹爪位置控制：复用 RM75SDKClient 的 SDK 连接调用 SDK 夹爪 API。
 
@@ -513,6 +530,7 @@ class GripperPlugin:
         self._worker_thread = None
         self._last_completion = None
         self._last_state = None
+        self._last_target_position = GRIPPER_POSITION_MAX
 
     def get_tools(self):
         schema = action_schema(
@@ -542,6 +560,13 @@ class GripperPlugin:
                     "maximum": GRIPPER_COMPLETION_TIMEOUT,
                     "default": GRIPPER_DEFAULT_STALL_TIMEOUT_SECONDS,
                     "description": "连续无明显位置进展多久后判定受阻（秒）",
+                },
+                "force": {
+                    "type": "integer",
+                    "minimum": GRIPPER_FORCE_MIN,
+                    "maximum": GRIPPER_FORCE_MAX,
+                    "default": GRIPPER_DEFAULT_FORCE,
+                    "description": "力控夹持阈值 (50~1000)，在受阻停止或力控夹取时生效",
                 },
                 "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
             },
@@ -633,6 +658,7 @@ class GripperPlugin:
         if on_stall not in ("keep", "rollback"):
             raise ValueError("on_stall must be keep or rollback")
         stall_timeout = _gripper_stall_timeout(args.get("stall_timeout_seconds"))
+        force = _gripper_force(args.get("force"))
         if not self._gripper_lock.acquire(blocking=False):
             raise RuntimeError(f"another gripper motion is active: {self._active_action_id}")
         if not self.client.motion_gate.acquire(blocking=False):
@@ -644,7 +670,7 @@ class GripperPlugin:
             self._interrupted.discard(action_id)
         self._worker_thread = threading.Thread(
             target=self._gripper_worker,
-            args=(action_id, position, on_stall, stall_timeout),
+            args=(action_id, position, on_stall, stall_timeout, force),
             daemon=True,
         )
         self._worker_thread.start()
@@ -787,13 +813,16 @@ class GripperPlugin:
     def _safe_gripper_position(position):
         return max(GRIPPER_POSITION_MIN, min(GRIPPER_POSITION_MAX, int(round(position))))
 
-    def _gripper_worker(self, action_id, position, on_stall, stall_timeout):
+    def _gripper_worker(self, action_id, position, on_stall, stall_timeout, force=GRIPPER_DEFAULT_FORCE):
         started = time.monotonic()
         start_position = None
         command_started = False
         try:
             initial = self._read_gripper_state()
-            start_position = initial["actpos"]
+            if self._gripper_feedback_available(initial):
+                start_position = initial["actpos"]
+            else:
+                start_position = self._last_target_position or GRIPPER_POSITION_MAX
             # stop 可能在线程启动后、首条 SDK 命令前到达。此时没有在途动作，
             # 直接取消即可；绝不能先发送用户目标再尝试恢复。
             if self._is_interrupted(action_id):
@@ -810,29 +839,90 @@ class GripperPlugin:
                     "elapsed_seconds": time.monotonic() - started,
                 }
             elif not self._gripper_feedback_available(initial):
-                # 部分控制器/固件会让查询成功但返回全零结构。此时无法安全实现
-                # 基于实测位置的 keep/rollback，退回 SDK 自己的阻塞到位确认；
-                # 绝不把占位 actpos=0 作为第二个位置命令发送。
+                # 部分控制器/固件会让查询成功但返回全零结构。此时无法获取
+                # 实时位移做轮询，使用带 stall_timeout 的阻塞模式下发命令。
                 command_started = True
-                self.client.command(
-                    "rm_set_gripper_position",
-                    position,
-                    True,
-                    GRIPPER_COMPLETION_TIMEOUT,
-                )
-                status, result = "completed", {
-                    "reason": "sdk_command_completed_without_feedback",
-                    "requested_position": position,
-                    "start_position": None,
-                    "final_position": None,
-                    "feedback_available": False,
-                    "current_force": initial["current_force"],
-                    "mode": initial["mode"],
-                    "error": initial["error"],
-                    "stall_policy": on_stall,
-                    "rollback_succeeded": None,
-                    "elapsed_seconds": time.monotonic() - started,
-                }
+                timeout_int = max(1, int(math.ceil(stall_timeout)))
+                stalled = False
+                try:
+                    self.client.command(
+                        "rm_set_gripper_position",
+                        position,
+                        True,
+                        timeout_int,
+                    )
+                except Exception as exc:
+                    err_msg = str(exc)
+                    if "code -4" in err_msg or "code 1" in err_msg:
+                        stalled = True
+                    else:
+                        raise exc
+
+                if not stalled:
+                    self._last_target_position = position
+                    status, result = "completed", {
+                        "reason": "sdk_command_completed_without_feedback",
+                        "requested_position": position,
+                        "start_position": start_position,
+                        "final_position": position,
+                        "feedback_available": False,
+                        "current_force": initial["current_force"],
+                        "mode": initial["mode"],
+                        "error": initial["error"],
+                        "stall_policy": on_stall,
+                        "rollback_succeeded": None,
+                        "elapsed_seconds": time.monotonic() - started,
+                    }
+                elif on_stall == "keep":
+                    # 方案 B：受阻时下发力控夹取 rm_set_gripper_pick。
+                    # 由于夹爪已压在障碍物上，受力达到 force 阈值后，
+                    # 机械臂控制箱底层自动停止驱动并锁定，实现保持在极限位置。
+                    try:
+                        self.client.command("rm_set_gripper_pick", 100, force, False, 1)
+                    except Exception as pick_err:
+                        print(f"[rm75 gripper] force stop attempt: {pick_err}", flush=True)
+                    status, result = "completed", {
+                        "reason": "motion_stalled_kept",
+                        "requested_position": position,
+                        "start_position": start_position,
+                        "blocked_position": None,
+                        "final_position": None,
+                        "feedback_available": False,
+                        "current_force": initial["current_force"],
+                        "mode": initial["mode"],
+                        "error": initial["error"],
+                        "stall_policy": "keep",
+                        "rollback_succeeded": None,
+                        "elapsed_seconds": time.monotonic() - started,
+                    }
+                else:  # on_stall == "rollback"
+                    recovery_target = start_position
+                    rollback_ok = True
+                    try:
+                        self.client.command(
+                            "rm_set_gripper_position",
+                            recovery_target,
+                            True,
+                            GRIPPER_COMPLETION_TIMEOUT,
+                        )
+                        self._last_target_position = recovery_target
+                    except Exception:
+                        rollback_ok = False
+                    status = "completed" if rollback_ok else "error"
+                    result = {
+                        "reason": "motion_stalled_rolled_back" if rollback_ok else "motion_stalled_rollback_failed",
+                        "requested_position": position,
+                        "start_position": start_position,
+                        "blocked_position": None,
+                        "final_position": recovery_target if rollback_ok else None,
+                        "feedback_available": False,
+                        "current_force": initial["current_force"],
+                        "mode": initial["mode"],
+                        "error": initial["error"],
+                        "stall_policy": "rollback",
+                        "rollback_succeeded": rollback_ok,
+                        "elapsed_seconds": time.monotonic() - started,
+                    }
             else:
                 deadline = started + GRIPPER_COMPLETION_TIMEOUT
                 # 非阻塞下发后轮询真实位置，才能区分到位、受阻与超时。
