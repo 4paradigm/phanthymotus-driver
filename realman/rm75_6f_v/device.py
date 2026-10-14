@@ -539,8 +539,8 @@ class GripperPlugin:
     def get_tools(self):
         schema = action_schema(
             {
-                "set_position": (["position", "confirm_motion"], "设置二指夹爪目标位置与受阻保护策略"),
-                "info": ([], "读取夹爪与 SDK 连接状态"),
+                "set_position": (["position", "on_stall", "force", "confirm_motion"], "设置二指夹爪目标位置与受阻保护策略"),
+                "info": ([], "读取夹爪与 SDK 连接状态及实时开度"),
             },
             {
                 "position": {
