@@ -9,7 +9,6 @@ import threading
 import time
 
 from common.motion.protocol import envelope
-from common.motion.envelope import IDENTITY, MotionEnvelope
 from trajectory import Recorder, list_recordings, read_recording
 
 
@@ -52,16 +51,6 @@ class TrajectoryControl:
             raise ValueError('recording_binding_mismatch')
         if recording['joint_names'] != self.arm.profile['arm_joint_names']:
             raise ValueError('recording_joint_order')
-        baseline = stored.get('locked_joints')
-        if not isinstance(baseline, dict) or not baseline: raise ValueError('recording_body_baseline_missing')
-        sample = self.arm._fresh()[0]
-        measured = sample.get('locked_joints', {})
-        model_baseline = current['locked_joints']
-        if set(measured) != set(baseline) or set(model_baseline) != set(baseline) or any(type(v) not in (int, float) for v in baseline.values()):
-            raise ValueError('recording_body_baseline_mismatch')
-        if any(not math.isfinite(baseline[n]) or not math.isfinite(measured[n]) or abs(measured[n]-baseline[n]) > .02
-               or abs(model_baseline[n]-baseline[n]) > .02
-               for n in baseline): raise ValueError('recording_body_baseline_mismatch')
 
     def info(self):
         return {'recording': self.recorder.status() if self.recorder else None,
@@ -133,8 +122,11 @@ class TrajectoryControl:
         with self.lock:
             self._idle()
             generation = self.control._generation
-            self.motion.start()
-            if self.motion.solver is None: self.motion.calibrate()
+            self.motion.stop()
+            if self.arm.profile is None:
+                self.arm.configure_profile(self.motion.cfg['calibration_path'],
+                    velocity=self.motion.cfg.get('joint_velocity_rad_s', 1.))
+            self.arm.start()
             recording = read_recording(self.directory, args.get('filename'), self.arm.limits)
             self._check_binding(recording)
             if recording['frames'][0]['kind'] != 'target': raise ValueError('recording_initial_target_missing')
@@ -166,28 +158,19 @@ class TrajectoryControl:
 
     def _send_frame(self, frame, seq, due):
         self._wait_until(due)
-        state, q = self.motion._fresh()
-        proof = self.motion.solver.joint_envelope(q, state['commanded_q'], frame['target_q'])
         now = self.control.clock()
-        command = envelope(self.motion._lease(), seq=seq, source_seq=frame['source_sequence'],
-            mapping_epoch=frame['mapping_epoch'], generated_ns=now, valid_until_ns=now+100_000_000,
-            mode='joint_position', dof=10, values=frame['target_q'], **self.motion.versions)
-        record = {**{k: command[k] for k in IDENTITY}, 'schema': 'motus.motion.envelope/1',
-                  **proof, 'measured_ns': state['feedback']['arm_ns']}
+        command = envelope(dict(boot_id=self.arm.boot_id, session_id=self.arm.session_id, secret=self.arm.secret),
+            seq=seq, source_seq=frame['source_sequence'], mapping_epoch=frame['mapping_epoch'],
+            generated_ns=now, valid_until_ns=now+100_000_000, mode='joint_position', dof=10,
+            values=frame['target_q'], **self.arm.versions)
         if self.cancel.is_set(): raise ValueError('replay_cancelled')
-        with self.arm.lock:
-            checked = MotionEnvelope.from_record(record, dof=10)
-            _, current, _ = self.arm._fresh()
-            # Drop stale numerical work; later frames use current feedback.
-            if not checked.contains(current) or not checked.contains(self.arm.last_q): return
-            self.arm.write_replay(command, record)
+        self.arm.write_replay(command)
 
     def _move_to_start(self, recording):
         first, seq = recording['frames'][0], 0
         target = first['target_q']
         while self.arm.last_q != target:
             self._wait_until(self.control.clock()+20_000_000)
-            self._check_binding(recording)
             # Bound each reference step by elapsed time; never catch up after a delay.
             dt = max(0., min((self.control.clock()-self.arm.last_emit)/1e9, .05))
             step = self.START_SPEED*dt
@@ -201,11 +184,10 @@ class TrajectoryControl:
         status, result = 'error', {}
         try:
             if self.cancel.is_set(): raise ValueError('replay_cancelled')
-            self._check_binding(recording)
-            prepared = self.motion.dispatch('prepare_operator_session', {})
+            prepared = self.arm.dispatch('prepare_operator_session', {})
             if prepared.get('error'): raise ValueError(prepared['error'])
             if self.cancel.is_set(): raise ValueError('replay_cancelled')
-            claimed = self.motion.dispatch('claim', {})
+            claimed = self.arm.dispatch('claim', {})
             if claimed.get('error'): raise ValueError(claimed['error'])
             next_seq = self._move_to_start(recording)
             self.last_action['phase'] = 'replaying'
@@ -218,9 +200,7 @@ class TrajectoryControl:
                         and frames[index+1]['kind'] == 'target'
                         and start+frames[index+1]['t_ns'] <= self.control.clock()):
                     continue
-                self._check_binding(recording)
                 due = start+frame['t_ns']
-                self._wait_until(max(start, due-60_000_000, self.control.clock()))
                 if frame['kind'] == 'hold':
                     self._wait_until(due)
                     self.arm.hold('replay_pause')
@@ -228,7 +208,7 @@ class TrajectoryControl:
                 if self.arm.state == 'hold':
                     self._wait_until(due)
                     self.arm.tick()
-                    resumed = self.motion.dispatch('resume', self.motion._lease())
+                    resumed = self.arm.dispatch('resume', {k: claimed[k] for k in ('session_id', 'secret')})
                     if resumed.get('error'): raise ValueError(resumed['error'])
                 self._send_frame(frame, seq, due)
             self._wait_until(start+recording['duration_ns'])
@@ -243,7 +223,6 @@ class TrajectoryControl:
                 if self.control.clock() >= end: raise ValueError('replay_final_feedback_unconfirmed')
                 final = recording['frames'][-1]
                 if final['kind'] == 'target' and self.arm.last_q != final['target_q']:
-                    self._check_binding(recording)
                     seq += 1
                     self._send_frame(final, seq, self.control.clock())
                     last_write = self.arm.last_emit

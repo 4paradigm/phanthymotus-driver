@@ -10,7 +10,6 @@ import copy
 import hashlib
 import hmac
 import json
-import logging
 import math
 from pathlib import Path
 import re
@@ -264,7 +263,7 @@ class ArmStreamExecutor:
             self._proofs[record['seq']] = proof
             while len(self._proofs)>8: self._proofs.popitem(last=False)
 
-    def accept_control(self, packet):
+    def accept_control(self, packet, *, replay=False):
         with self.lock:
             if not self.session_id or self.state not in ('ready','active','hold') or self.release_requested:
                 raise ValueError('motion_not_armed')
@@ -278,7 +277,7 @@ class ArmStreamExecutor:
             if any(not lo <= q <= hi for q,(lo,hi) in zip(body['values'],self.limits)):
                 self.hold('joint_limit'); raise ValueError('joint_limit')
             proof = self._proofs.get(body['seq'])
-            if proof is None or not proof.matches(body,now_ns=self.clock()):
+            if not replay and (proof is None or not proof.matches(body,now_ns=self.clock())):
                 self.hold('motion_envelope_unavailable',recoverable=True)
                 raise ValueError('motion_envelope_unavailable')
             self._fresh()
@@ -554,15 +553,14 @@ class ArmStreamExecutor:
                 'mapping_epoch': command['mapping_epoch'], 'sdk_sequence': command['seq'],
                 'session_id': self.session_id})
 
-    def write_replay(self, command, proof_record):
+    def write_replay(self, command):
         """Internal trajectory path: exact references, with the same execution gate."""
         with self.lock:
             if self.replay_deadline_ns is None or self.clock() >= self.replay_deadline_ns:
                 raise ValueError('replay_watchdog')
             if self.state not in ('ready', 'active') or self.release_requested:
                 raise ValueError('replay_not_armed')
-            self.install_motion_envelope(proof_record)
-            self.accept_control(command)
+            self.accept_control(command, replay=True)
             self.tick()
             if self.applied_seq != command['seq']:
                 raise ValueError(self.reason or 'replay_not_applied')
@@ -704,12 +702,9 @@ class ArmStreamExecutor:
                             for p,t in zip(self.last_q,self.latest['values'])]
                 else:
                     next_q=[p+max(-limit,min(limit,t-p)) for p,t in zip(self.last_q,self.latest['values'])]
-                if (not self._proof or not self._proof.allows(self.latest,q,self.last_q,next_q,now_ns=now)
+                if ((self.replay_deadline_ns is None and
+                        (not self._proof or not self._proof.allows(self.latest,q,self.last_q,next_q,now_ns=now)))
                         or any(not lo<=x<=hi for x,(lo,hi) in zip(next_q,self.limits))):
-                    logging.getLogger(__name__).warning('motion envelope rejected: seq=%s age_ms=%s measured=%s previous=%s next=%s lower=%s upper=%s',
-                        self.latest['seq'], None if not self._proof else (now-self._proof.measured_ns)/1e6,
-                        q, self.last_q, next_q, None if not self._proof else self._proof.lower,
-                        None if not self._proof else self._proof.upper)
                     self.hold('motion_envelope_exceeded',recoverable=True);return
                 tau = None if servo else vector(self._gravity(next_q),10,'gravity_tau')
                 if tau is not None and any(abs(t)>lim for t,lim in zip(tau,self.torque_limits)):raise ValueError('gravity_torque_limit')

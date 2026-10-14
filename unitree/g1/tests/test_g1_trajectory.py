@@ -85,32 +85,27 @@ def test_corrupt_or_unsafe_file_rejected(tmp_path, change):
 def test_exact_replay_reference_bypasses_filter_but_not_execution_gate(tmp_path):
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     command = packet(arm, target=.02)
-    proof = dict(zip(IDENTITY, arm._proofs[1].identity),
-                 schema='motus.motion.envelope/1', lower=[-1.]*10, upper=[1.]*10, measured_ns=arm.clock())
     advance(50); arm.replay_deadline_ns = arm.clock()+100_000_000
-    arm.write_replay(command, proof)
+    arm.write_replay(command)
     assert channel.positions[-1][0] == [.02]*10
     advance(101); arm.tick()
     assert arm.state == 'hold' and arm.reason == 'replay_watchdog'
     before = len(channel.positions)
-    with pytest.raises(ValueError): arm.write_replay(command, proof)
+    with pytest.raises(ValueError): arm.write_replay(command)
     assert len(channel.positions) == before
 
 
 def test_replay_limits_fast_target_and_rejects_stale_feedback(tmp_path):
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     command = packet(arm, target=.1)
-    proof = {'schema': 'motus.motion.envelope/1', **{k: command[k] for k in IDENTITY},
-             'lower': [-1.]*10, 'upper': [1.]*10, 'measured_ns': arm.clock()}
     advance(10); arm.replay_deadline_ns = arm.clock()+200_000_000
-    arm.write_replay(command, proof)
+    arm.write_replay(command)
     assert channel.positions[-1][0] == pytest.approx([.01]*10)
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     arm.replay_deadline_ns = arm.clock()+200_000_000
     command = packet(arm, seq=2, target=.1)
-    proof.update({k: command[k] for k in IDENTITY})
     advance(101, fresh=False)
-    with pytest.raises(ValueError, match='feedback'): arm.write_replay(command, proof)
+    with pytest.raises(ValueError, match='feedback'): arm.write_replay(command)
     assert not channel.positions
 
 
@@ -131,9 +126,10 @@ def api_rig(tmp_path):
     arm._snapshot_provider = snapshot
     motion = MotionControl({}, arm)
     arm.motion_control = motion
-    motion.start = lambda: None  # No DDS or SDK setup in this synthetic plant.
+    motion.start = arm.start = lambda: None  # No DDS or SDK setup in this synthetic plant.
     motion._live_session = arm.session_id
     motion.solver = SimpleNamespace(profile=arm.profile, profile_sha256=arm.profile_sha256,
+        interrupt=lambda: None, close=lambda: None,
         joint_envelope=lambda measured, previous, target: {'lower': [-1.]*10, 'upper': [1.]*10})
     receipts = []
     card = TeleopControl({'mode': 'live', 'data_dir': str(tmp_path), 'trajectory_device_id': 'synthetic-g1'},
@@ -215,7 +211,7 @@ def test_replay_stop_is_not_blocked_by_file_verification(tmp_path, monkeypatch):
         release.set(); done.set(); ticker.join(1)
 
 
-@pytest.mark.parametrize('failure', ['cancel', 'stop_unconfirmed', 'body_changed'])
+@pytest.mark.parametrize('failure', ['cancel', 'stop_unconfirmed'])
 def test_replay_failure_never_reports_completed(tmp_path, failure):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     try:
@@ -226,11 +222,6 @@ def test_replay_failure_never_reports_completed(tmp_path, failure):
         asset = card.dispatch('inspect', {'filename': name})
         card.stop(); channel.positions.clear(); sample['q'] = list(asset['preview'][0]['target_q'])
         preview = card.dispatch('start_difference', {'filename': name})
-        if failure == 'body_changed':
-            key = next(iter(sample['locked_joints'])); sample['locked_joints'][key] += .1
-            result = card.dispatch('play', {'filename': name})
-            assert result['code'] == 'recording_body_baseline_mismatch' and not arm.session_id
-            return
         original_wait = card.trajectory._wait_until
         def wait(deadline):
             if failure == 'cancel': card.trajectory.cancel.set()
@@ -353,9 +344,9 @@ def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_p
         preview = card.dispatch('start_difference', {'filename': name})
         assert preview['ready'] and not channel.positions
         original = arm.write_replay
-        def write(command, proof):
+        def write(command):
             before, stamp = list(arm.last_q), arm.last_emit
-            original(command, proof)
+            original(command)
             writes.append((card.trajectory.last_action['phase'], before, stamp,
                            list(command['values']), arm.last_emit, command['seq']))
         arm.write_replay = write
@@ -376,7 +367,7 @@ def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_p
         card.trajectory.stop(); done.set(); ticker.join(1)
 
 
-@pytest.mark.parametrize('failure', ['cancel', 'collision', 'stale_feedback', 'not_following'])
+@pytest.mark.parametrize('failure', ['cancel', 'stale_feedback', 'not_following'])
 def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path, failure):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     writes = []
@@ -388,11 +379,9 @@ def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path
         target = read_recording(card.trajectory.directory, name, arm.limits)['frames'][0]['target_q']
         card.stop(); channel.positions.clear(); sample['q'] = [q+.12 for q in target]
         preview = card.dispatch('start_difference', {'filename': name})
-        if failure == 'collision':
-            card.motion.solver.joint_envelope = lambda *a: (_ for _ in ()).throw(ValueError('collision'))
         original = arm.write_replay
-        def write(command, proof):
-            original(command, proof)
+        def write(command):
+            original(command)
             writes.append(card.trajectory.last_action['phase'])
             if failure == 'cancel': card.trajectory.stop()
             elif failure == 'stale_feedback':
@@ -414,7 +403,6 @@ def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path
             assert 'replaying' in writes
             assert outcome['result']['reason'] == 'replay_final_feedback_unconfirmed'
         else: assert 'replaying' not in writes
-        if failure == 'collision': assert not writes and outcome['result']['reason'] == 'collision'
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
 
@@ -521,6 +509,9 @@ def test_live_and_replay_use_same_execution_failure_handling(tmp_path, replay, f
         arm.replay_deadline_ns = arm.clock()+100_000_000
     advance(2)
     arm.tick()
+    if replay and failure == 'envelope':
+        assert channel.positions and arm.applied_seq == command['seq']
+        return
     assert not channel.positions and arm.applied_seq == -1
     assert arm.reason == {'sdk': 'arm_sdk_write_failed',
                           'envelope': 'motion_envelope_exceeded',
@@ -579,41 +570,26 @@ def test_final_reference_finishes_through_shared_slew_limiter(tmp_path):
         card.trajectory.stop(); done.set(); ticker.join(1)
 
 
-def test_replay_checks_position_after_waiting_for_frame():
-    replay = TrajectoryControl.__new__(TrajectoryControl)
-    measured = [0.] * 10
-    target = [.1] * 10
-    def wait(due):
-        measured[:] = [.03] * 10
-    def check(q, previous, requested):
-        assert q == [.03] * 10
-        assert requested == target
-        raise ValueError('checked_current_position')
-    replay._wait_until = wait
-    replay.motion = SimpleNamespace(
-        _fresh=lambda: ({'commanded_q': [0.] * 10}, list(measured)),
-        solver=SimpleNamespace(joint_envelope=check))
-    with pytest.raises(ValueError, match='checked_current_position'):
-        replay._send_frame({'target_q': target}, 1, 60_000_000)
-
-
-def test_replay_drops_stale_proof_then_sends_fresh_target(tmp_path):
+@pytest.mark.parametrize('cold_profile', [False, True])
+def test_replay_uses_recorded_joints_without_numerical_worker_or_body_baseline(tmp_path, cold_profile):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     try:
-        arm.replay_deadline_ns = arm.clock()+100_000_000
-        frame = {'target_q': list(sample['q']), 'source_sequence': 1, 'mapping_epoch': 1}
-        original = card.motion.solver.joint_envelope
-        def stale(*args):
-            proof = original(*args)
-            proof['lower'] = [x+.1 for x in sample['q']]
-            proof['upper'] = [x+.2 for x in sample['q']]
-            return proof
-        card.motion.solver.joint_envelope = stale
-        count = len(channel.positions)
-        card.trajectory._send_frame(frame, 1, arm.clock())
-        assert len(channel.positions) == count and arm.state != 'hold'
-        card.motion.solver.joint_envelope = original
-        card.trajectory._send_frame(frame, 2, arm.clock())
-        assert len(channel.positions) == count+1 and arm.applied_seq == 2
+        card.dispatch('record_start', {})
+        for seq in (1, 2):
+            arm.accept_control(packet(arm, seq, target=.01)); time.sleep(.06)
+        name = card.dispatch('record_stop', {})['filename']
+        card.stop(); channel.positions.clear()
+        sample['locked_joints'][next(iter(sample['locked_joints']))] += .1
+        if cold_profile:
+            arm.profile = None
+            card.motion.cfg['calibration_path'] = str(tmp_path/'synthetic.json')
+        card.motion.calibrate = lambda *a: pytest.fail('replay must not calibrate IK')
+        card.motion.solver.joint_envelope = lambda *a: pytest.fail('replay must not calculate envelopes')
+        result = card.dispatch('play', {'filename': name})
+        assert result['status'] == 'running', result
+        card.trajectory.thread.join(6)
+        assert card.trajectory.last_action['status'] == 'completed', card.trajectory.last_action
+        assert card.motion.solver is None and channel.positions
+        assert receipts[-1][1] == 'completed' and not arm.session_id
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
