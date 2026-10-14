@@ -359,6 +359,7 @@ class LocoPlugin:
     def get_tools(self) -> list:
         return [
             self._loco_tool(),
+            self._loco_destination_tool(),
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
@@ -409,6 +410,28 @@ class LocoPlugin:
                         "description": "Stop all movement immediately.",
                     },
                 },
+            },
+            "topic_out": [],
+        }
+
+    def _loco_destination_tool(self) -> dict:
+        return {
+            "name": "loco_destination", "type": "actuator", "multiInstance": False,
+            "description": "Bumi 有目标的转角运动——IMU 航向闭环原地转过指定角度后自动刹停。执行前确认机器人已处于行走模式、地面平坦防滑，旋转范围内留出至少 1m 半径无人无障碍空间。到达有 ±2° 容差；超时会刹停并返回实际转角。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["rotate", "stop_move", "status"]},
+                    "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
+                                  "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
+                    "stop_move": {"params": [], "description": "立即停止当前转角动作并刹停。"},
+                    "status": {"params": [], "description": "查询当前转角动作状态。"},
+                },
+                "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
             },
             "topic_out": [],
         }
@@ -519,6 +542,12 @@ class LocoPlugin:
             return self._do_move(args)
         if tool_name == "loco" and action == "stop_move":
             return self._stop_move()
+        if tool_name == "loco_destination" and action == "rotate":
+            return self._do_rotate(args)
+        if tool_name == "loco_destination" and action == "stop_move":
+            return self._stop_move()
+        if tool_name == "loco_destination" and action == "status":
+            return self._rotate_status()
         if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
             return self._do_posture_action(action, args)
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
@@ -598,6 +627,106 @@ class LocoPlugin:
         if self._high_ctrl is not None:
             self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
         return {"state": "stopped"}
+
+    def _do_rotate(self, args: dict) -> dict:
+        # 1. Validate the requested angle before touching hardware.
+        raw_angle = args.get("angle_deg")
+        try:
+            angle_deg = float(raw_angle)
+        except (TypeError, ValueError):
+            return {"state": "error",
+                    "error": f"angle_deg must be a number, got {raw_angle!r}"}
+        if not math.isfinite(angle_deg) or abs(angle_deg) > _ROTATE_ANGLE_LIMIT_DEG:
+            return {"state": "error",
+                    "error": (f"angle_deg must be a finite number within "
+                              f"±{_ROTATE_ANGLE_LIMIT_DEG:g} degrees, got {angle_deg}")}
+        if abs(angle_deg) < 0.05:  # zero-turn: instant done, no motion commanded
+            yaw = _yaw_deg_from_quat(self._high_ctrl.get_imu_data().ori)
+            return {"state": "done", "requested_angle_deg": angle_deg,
+                    "start_yaw_deg": yaw, "end_yaw_deg": yaw, "turned_deg": 0.0,
+                    "final_error_deg": 0.0, "elapsed_s": 0.0,
+                    "tolerance_deg": _ROTATE_TOL_DEG}
+
+        # 2. Mode checks (same branches as _do_move).
+        mode = int(self._high_ctrl.get_mode())
+        if mode == 26:
+            return {"state": "error", "error": "Robot in protection mode, cannot move"}
+        if mode != 2:
+            return {
+                "state": "error",
+                "error": (
+                    f"movement requires workmode=2 (walking); current mode is "
+                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
+                    "Use switch_mode switch=walk first."
+                ),
+            }
+
+        # 3. Stop any existing move thread (mutex preamble as in _do_move).
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+        self._move_stop_event.clear()
+
+        default_cmd = _get_default_cmd()
+        start_yaw = _yaw_deg_from_quat(self._high_ctrl.get_imu_data().ori)
+        target = start_yaw + angle_deg  # not taken modulo: preserves whole-turn count
+        start_time = time.monotonic()
+        deadline = start_time + _rotate_timeout_s(angle_deg)
+        prev_yaw = start_yaw
+        turned_deg = 0.0
+        still = 0
+        end_yaw = start_yaw
+        result_state = "timeout"
+        try:
+            # 4. 50 Hz closed loop on IMU yaw until settled, timed out, or stopped.
+            while True:
+                imu = self._high_ctrl.get_imu_data()
+                cur_yaw = _yaw_deg_from_quat(imu.ori)
+                turned_deg += _wrap180(cur_yaw - prev_yaw)
+                prev_yaw = cur_yaw
+                end_yaw = cur_yaw
+                err = _wrap180(target - cur_yaw)
+                wz = float(imu.angular_vel[2])
+                if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
+                    still += 1
+                else:
+                    still = 0
+                if still >= _ROTATE_SETTLE_TICKS:
+                    result_state = "done"
+                    break
+                if time.monotonic() >= deadline:
+                    result_state = "timeout"
+                    break
+                if self._move_stop_event.is_set():
+                    result_state = "stopped"
+                    break
+                if abs(err) <= _ROTATE_TOL_DEG:
+                    # Angle reached but not yet confirmed still: coast with zero cmd.
+                    self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                else:
+                    self._publish_cmd(0.0, 0.0,
+                                      _ROTATE_VYAW_SIGN * _rotate_vyaw(err),
+                                      default_cmd, 0)
+                time.sleep(0.02)  # 50 Hz
+        finally:
+            # Every exit path — including exceptions — brakes to zero velocity.
+            self._publish_cmd(0, 0, 0, default_cmd, 0)
+
+        # 5. Report actual motion: per-frame yaw deltas, wrapped error at the end.
+        return {
+            "state": result_state,
+            "requested_angle_deg": angle_deg,
+            "start_yaw_deg": start_yaw,
+            "end_yaw_deg": end_yaw,
+            "turned_deg": turned_deg,
+            "final_error_deg": _wrap180(target - end_yaw),
+            "elapsed_s": time.monotonic() - start_time,
+            "tolerance_deg": _ROTATE_TOL_DEG,
+        }
+
+    def _rotate_status(self) -> dict:
+        # Placeholder: real status (running / last_result) lands in Task 4.
+        return {"state": "idle"}
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
