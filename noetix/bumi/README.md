@@ -8,8 +8,10 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 `sound_direction` is the only direction card. It publishes
 `audio_msgs/msg/SoundDirection` on `/<namespace>/sound_direction` with the
 `sensor/sound-direction` canvas format. The angle uses the robot frame:
-front 0°, right positive, left negative, and rear +180°. `NO_EVENT` clears
-the live angle after activity stops.
+front 0°, **left positive** (counter-clockwise, REP-103 — the same sign as
+the locomotion `vyaw` command), right negative, rear ±180°. A source at
+front-left reads about +45 and passes straight to a `vyaw` turn with no
+negation. `NO_EVENT` clears the live angle after activity stops.
 
 The two capture workers use the SDK frame timestamp as their common capture
 clock only when it has a Unix-microsecond shape. `mic` stamps each chunk with
@@ -19,18 +21,60 @@ at zero, so ASR cannot mistake publication time for capture time. The SDK
 clock's meaning still requires verification on Bumi. Simultaneous readers were
 verified on Bumi with commit cc2c1e2; this capture topology is unchanged.
 
-Set the five shared parameters from the direction card's left-list gear.
-Saving them restarts the direction worker and waits for it to become ready.
-The existing `/opt/phanthy-motus/data/bumi/sound_direction_settings.json`
-uses the same field names and remains readable.
+Lifecycle follows the same contract as the other sensor cards: the driver
+spawns the direction worker at boot and tears it down only on driver
+shutdown or a config save. The canvas `start`/`stop` actions are status
+replies — they never spawn or kill the worker — so stopping intelligent
+control leaves `/<namespace>/sound_direction` streaming.
+
+Set the one shared parameter from the direction card's left-list gear.
+Saving it restarts the direction worker and waits for it to become ready.
 
 | Parameter | Default | Effect |
-| --- | ---: | --- |
-| `onset_level` | 10 | Minimum level for sustained speech detection |
-| `onset_ratio` | 2.0 | Sustained speech level relative to recent background |
-| `burst_level` | 15 | Minimum level for one strong sound frame |
-| `burst_ratio` | 4.0 | Strong sound level relative to recent background |
-| `update_interval_ms` | 100 | Minimum time between direction updates |
+| --- | --- | --- |
+| `sensitivity` | `normal` | How loud a sound must be to count as someone speaking |
+
+Sensitivity presets (choose by room, not by gear knowledge):
+
+- **高** — 安静房间 / 轻声说话也要识别
+- **中** — 普通室内（默认）
+- **低** — 嘈杂环境 / 只需大声说话
+
+The publish throttle is fixed at 100 ms (about 10 updates per second) and
+is no longer operator-adjustable. Gate thresholds per preset live in the
+engineer appendix below.
+
+### 旧 settings.json 迁移
+
+The legacy 5-key file at `/opt/phanthy-motus/data/bumi/sound_direction_settings.json`
+(`onset_level` / `onset_ratio` / `burst_level` / `burst_ratio` /
+`update_interval_ms`) is still read after upgrade: it maps **in memory** to
+the nearest sensitivity preset (`onset_ratio` ≤1.75→high, <2.25→normal,
+otherwise low) and is never rewritten — the file keeps its old shape until
+the operator saves the config once. `update_interval_ms` is dropped; the
+throttle stays at 100 ms regardless of any hand-tuned 50/300 value.
+
+Rolling back to an older image: before the first config save the old image
+reads the legacy file as before; after a save the old key-set check falls
+back to defaults silently. Legacy key names sent to `config` are rejected
+(`invalid_parameters`). Keys saved in a canvas config are dropped by the
+platform, not migrated.
+
+### 工程师附录：门限映射表
+
+```
+SENSITIVITY_GATE_PARAMS = {
+    "high":   {"onset_level": 8.0,  "onset_ratio": 1.6, "burst_level": 12.0, "burst_ratio": 3.2},
+    "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
+    "low":    {"onset_level": 15.0, "onset_ratio": 2.5, "burst_level": 25.0, "burst_ratio": 5.0},
+}
+UPDATE_INTERVAL_MS = 100
+```
+
+Preset meaning is defined by this table, not by the panel wording. The
+normal preset equals the historical defaults value for value. Sensitivity
+only adjusts how easily sounds trigger; it does **not** remove fan-noise
+false angles (known, unfixed).
 
 The card first loads a complete, valid per-robot calibration from
 `/opt/phanthy-motus/data/bumi/sound_direction_calibration.json`, then tries the
