@@ -62,7 +62,7 @@ PR 构建完成后，使用机器人评论给出的新镜像 / Try it 链接部�
 部署前确认：
 
 1. 主机已能通过机器人网口访问厂家 WebSocket；保留机器人原有主控制器。
-2. 挂载当前Core生成的实际DDS文件，不能把缺失文件误挂为目录。驱动使用FastDDS和loopback数据总线，ROS_DOMAIN_ID须与当前Core一致（默认42，可由部署配置为0至232）；文件缺失或域号无效则拒绝创建participant。
+2. 挂载当前Core生成的实际DDS文件，不能把缺失文件误挂为目录。驱动使用FastDDS和loopback数据总线，默认只接受ROS_DOMAIN_ID=42。已有Core采用非标准域的专用现场，部署须先核对实际Core，再显式设置相同的ROS_DOMAIN_ID及TRON2_CORE_DOMAIN_ID（0至232）；只修改ROS_DOMAIN_ID会被拒绝。文件缺失或域号不匹配则拒绝创建participant。
 3. Core 信任证书是实际文件。HTTPS 保持证书及主机名验证；`TRON2_AGENT_CORE_URL` 的主机名必须与证书 SAN 匹配。需要时使用证书包含的主机名，并相应调整 Compose 的 `extra_hosts`；不要关闭 TLS 验证。
 4. MCP 端口 15791 未被其他本地原型占用。
 

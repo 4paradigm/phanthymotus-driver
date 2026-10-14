@@ -56,7 +56,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(schema['properties']['action']['enum'][0], 'get_state')
         self.assertEqual(schema['x-action-params']['get_state']['params'], [])
         self.assertEqual(schema['x-completion']['actions'], list(gripper.MOTION_ACTIONS))
-        self.assertEqual(schema['x-resource'], ['gripper_l', 'gripper_r'])
+        self.assertEqual(schema['x-resource'], ['arm_l', 'arm_r'])
         self.assertNotIn('url', schema['properties'])
         self.assertNotIn('ACP', tool['description'])
 
@@ -180,6 +180,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 if title=='request_set_limx_2fclaw_cmd':
                     self.opening=data['data'].get('left_opening',self.opening)
                     payload={'result':'success'}
+                if title=='request_movej': payload={'result':'success'}
                 if payload is not None:
                     if '2fclaw' in title and self.bad_reply:
                         await ws.send_json({'title':title.replace('request_','response_'), 'accid':'OTHER','guid':data['guid'],'data':payload})
@@ -262,5 +263,45 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),1)
         finally:
             await adapter.gripper.close();await runner.cleanup()
+
+    async def shared_http_app(self):
+        adapter=Adapter(lambda *a:None,settings(enabled_cards=['joint_state','arm_control','gripper']),reader=self.reader)
+        adapter._report_completion=AsyncMock(return_value=True)
+        app=web.Application();app.router.add_post('/mcp',adapter.rpc)
+        runner=web.AppRunner(app);await runner.setup()
+        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        endpoint='http://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])+'/mcp'
+        async def call(name,args):
+            async with self.session.post(endpoint,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
+                    'params':{'name':name,'arguments':args}}) as resp:
+                return (await resp.json())['result']
+        return adapter,runner,call
+
+    async def test_pending_arm_blocks_gripper_through_actual_http(self):
+        adapter,runner,call=await self.shared_http_app()
+        try:
+            for _ in range(100):
+                if self.reader.sample('joint_state')['available']:break
+                await asyncio.sleep(.005)
+            result=await call('arm_control',{'action':'move','joint':[.2]*14,'time':.1})
+            self.assertFalse(result['isError'])
+            result=await call('gripper',{'action':'open','side':'left','speed':30,'force':20})
+            self.assertTrue(result['isError'])
+            self.assertFalse(any(r['title']=='request_set_limx_2fclaw_cmd' for r in self.requests))
+            schemas={t['name']:t['inputSchema'] for t in adapter.tools()}
+            self.assertEqual(schemas['gripper']['x-resource'],schemas['arm_control']['x-resource'])
+        finally:
+            await adapter.motion.close();await adapter.gripper.close();await runner.cleanup()
+
+    async def test_pending_gripper_blocks_arm_through_actual_http(self):
+        adapter,runner,call=await self.shared_http_app()
+        try:
+            result=await call('gripper',{'action':'open','side':'left','speed':30,'force':20})
+            self.assertFalse(result['isError'])
+            result=await call('arm_control',{'action':'move','joint':[.2]*14,'time':.1})
+            self.assertTrue(result['isError'])
+            self.assertFalse(any(r['title']=='request_movej' for r in self.requests))
+        finally:
+            await adapter.motion.close();await adapter.gripper.close();await runner.cleanup()
 
 if __name__=='__main__':unittest.main()

@@ -78,7 +78,7 @@ def tool(metadata):
                     'open': {'params': ['side', 'speed', 'force'], 'description': '张开所选夹爪至最大开口'},
                     'close': {'params': ['side', 'speed', 'force'], 'description': '闭合所选夹爪；遇物体无法达到最小开口时不会报告目标到位或抓取成功'},
                     'set_opening': {'params': ['side', 'opening', 'speed', 'force'], 'description': '将所选夹爪调整至指定开口度'}},
-                'x-resource': ['gripper_l', 'gripper_r'],
+                'x-resource': ['arm_l', 'arm_r'],
                 'x-completion': {'actions': list(MOTION_ACTIONS), 'timeout': ACP_TIMEOUT}}}
 
 
@@ -87,6 +87,7 @@ class Gripper:
         self.reader, self.report = reader, report
         self.active = self.last = self.task = self.sample = None
         self.closed = False
+        self.peer = None
 
     def info(self):
         age = None if self.sample is None else max(0, time.monotonic() - self.sample[0])
@@ -107,6 +108,10 @@ class Gripper:
         data = command(action, args)
         if self.active and self.active['state'] == 'reporting' and self.active.get('target_opening_verified'):
             await asyncio.shield(self.task)
+        if self.peer and self.peer.active and self.peer.active['state'] == 'reporting' and self.peer.active.get('arrival_verified'):
+            await asyncio.shield(self.peer.task)
+        if self.peer and (self.peer.closed or self.peer.active):
+            raise MoveError('机械臂动作进行中或结果尚未确认，暂不接受夹爪开合', False)
         if self.closed or self.active:
             raise MoveError('夹爪忙或上次动作结果尚未确认，请先检查状态', False)
         future = asyncio.get_running_loop().create_future()

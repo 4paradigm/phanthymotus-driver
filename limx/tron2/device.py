@@ -53,6 +53,7 @@ class Adapter:
         self.reset = ResetPose(settings.get('home_file', '/config/tron2/home.json'), self.reader)
         self.motion = ArmCompletion(self.reader, self.report_completion)
         self.gripper = Gripper(self.reader, self.report_gripper_completion)
+        self.motion.peer, self.gripper.peer = self.gripper, self.motion
         urls = settings.get('camera_urls', {})
         self.cameras = {name: CameraStream(urls.get(name, settings.get('camera_url', '') if name == 'camera' else ''),
                                           publish, session, topic=source[0])

@@ -924,8 +924,15 @@ class PackagingTests(unittest.TestCase):
             for domain in ('', '-1', '233', '999999', '43x', '04', '42.0'):
                 with self.subTest(domain=domain), patch.dict(os.environ, {
                         'FASTRTPS_DEFAULT_PROFILES_FILE':str(profile),'ROS_DOMAIN_ID':domain,
-                        'RMW_IMPLEMENTATION':'rmw_fastrtps_cpp'}), self.assertRaisesRegex(ValueError,'ROS_DOMAIN_ID'):
+                        'RMW_IMPLEMENTATION':'rmw_fastrtps_cpp','TRON2_CORE_DOMAIN_ID':'42'}), self.assertRaises(ValueError):
                     ros2.JsonPublisher(TOPICS.values())
+
+    def test_nonstandard_dds_domain_without_explicit_core_binding_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp)/'dds.xml';profile.write_text('<profiles/>')
+            with patch.dict(os.environ,{'FASTRTPS_DEFAULT_PROFILES_FILE':str(profile),
+                    'ROS_DOMAIN_ID':'43','RMW_IMPLEMENTATION':'rmw_fastrtps_cpp','TRON2_CORE_DOMAIN_ID':'42'}), self.assertRaises(ValueError):
+                ros2.JsonPublisher(TOPICS.values())
 
     def test_ros2_publisher_serializes_each_topic_and_closes_participant(self):
         rclpy = types.ModuleType('rclpy')
@@ -950,6 +957,7 @@ class PackagingTests(unittest.TestCase):
             profile.write_text('<profiles/>')
             with patch.dict(sys.modules, modules), patch.dict(os.environ, {
                     'FASTRTPS_DEFAULT_PROFILES_FILE': str(profile), 'ROS_DOMAIN_ID': '43',
+                    'TRON2_CORE_DOMAIN_ID': '43',
                     'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp', 'FASTDDS_BUILTIN_TRANSPORTS': 'UDPv4'}):
                 publisher = ros2.JsonPublisher(TOPICS.values())
                 self.assertNotIn('FASTDDS_BUILTIN_TRANSPORTS', os.environ)
