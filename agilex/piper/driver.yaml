@@ -1,0 +1,29 @@
+id: agilex-piper-driver
+name: AgileX PiPER Driver
+category: driver
+cpu_arch: amd64
+hardware_provider: agilex
+hardware_model: piper
+image_name: agilex-piper
+port: 15741
+mcp_url: "http://localhost:15741/mcp"
+description: "PiPER 单臂控制卡；双臂模式保留十卡片并增加 VR 遥操和轨迹录制回放。中文预览确认，默认关闭运动许可。"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: model, type: resource }
+  - { name: piper_camera_live, type: resource }
+  - { name: arm_control, type: actuator }
+  - { name: piper_status, type: resource }
+  - { name: piper_standby, type: actuator }
+  - { name: piper_can, type: actuator }
+  - { name: piper_enable, type: actuator }
+  - { name: piper_disable, type: actuator }
+  - { name: piper_joint, type: actuator }
+  - { name: piper_gripper, type: actuator }
+  - { name: piper_photo, type: actuator }
+  - { name: piper_permission, type: actuator }
+  - { name: piper_stop, type: actuator }
+  - { name: piper_teleop, type: actuator }
+  - { name: piper_motion, type: actuator }
+  - { name: piper_teaching, type: actuator }

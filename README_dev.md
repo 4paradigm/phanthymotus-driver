@@ -810,7 +810,7 @@ cd drivers/unitree/g1
 docker build -t g1-driver .
 ```
 
-- All Dockerfiles are based on ARM64 architecture
+- Builds default to ARM64. A driver for an AMD64 controller declares `cpu_arch: amd64` in `driver.yaml`; its Dockerfile must support that architecture.
 - Tencent Cloud mirror sources are used for acceleration
 - Image naming format: `${REGISTRY}/${IMAGE_NAMESPACE}/${image_name}:${TAG}`
 - See `.env.example` for environment variable configuration

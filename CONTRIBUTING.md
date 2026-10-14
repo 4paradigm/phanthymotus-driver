@@ -34,7 +34,7 @@ cp .env.example .env  # Configure registry settings
 ./build.sh phanthy/remote_control
 ```
 
-- All Dockerfiles target ARM64 architecture
+- Builds default to ARM64. Set `cpu_arch: amd64` in `driver.yaml` for an AMD64 controller; the build and Resource Center registration use the same architecture.
 - Tencent Cloud mirrors are used for PyPI/Docker images
 - Image naming: `${REGISTRY}/${IMAGE_NAMESPACE}/${image_name}:${TAG}`
 
