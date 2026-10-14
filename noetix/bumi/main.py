@@ -172,12 +172,15 @@ class BumiDeviceBundle:
             print("[bundle] FaceWhitelistPlugin loaded")
 
         if plugins_cfg.get("auto_guard", {}).get("enabled", False):
-            from auto_guard import AutoGuardPlugin
-            self._plugins.append(AutoGuardPlugin(
+            from auto_guard import AutoGuardPlugin, GuardStatusPlugin
+            guard_plugin = AutoGuardPlugin(
                 plugins_cfg["auto_guard"], namespace, executor,
                 camera_plugin, face_whitelist_plugin, speaker_plugin,
-            ))
+            )
+            self._plugins.append(guard_plugin)
             print("[bundle] AutoGuardPlugin loaded")
+            self._plugins.append(GuardStatusPlugin(guard_plugin, face_whitelist_plugin))
+            print("[bundle] GuardStatusPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):

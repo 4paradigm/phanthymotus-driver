@@ -46,6 +46,47 @@ action reports `waiting_for_pipeline` or `running`, `pipeline_ready`, and the
 last announcement type. ROS topic delivery is not proof that audio was heard:
 verify one known and one unknown visitor on the physical robot.
 
+## Agent Core `bumi-guard` Skill
+
+This is a landing-style Agent Core Skill, not another driver card. Its JSON
+definition is `deploy/bumi_guard_skill.json`; the `instruction` tells the LLM
+how to discuss the guard and query its read-only status. The driver-side
+`auto_guard` still performs continuous recognition and fixed speech without
+an LLM turn for each visitor. Installing or activating the Skill alone does
+not start the camera or the canvas project.
+
+Deploy an image containing this version of the Bumi driver first. Stop the
+Agent Core project in the authenticated Dashboard before editing its canvas.
+Install the four-card route above, then ensure the canvas has exactly one
+`decision_core` card. The following commands run on the **robot host**;
+each first previews and then applies one scoped change:
+
+```bash
+docker exec -e AGENT_CORE_TOKEN embodied-noetix-bumi python3 /deploy/install_guard_status_binding.py
+docker exec -e AGENT_CORE_TOKEN embodied-noetix-bumi python3 /deploy/install_guard_status_binding.py --apply
+docker exec embodied-noetix-bumi python3 /deploy/install_bumi_guard_skill.py
+docker exec embodied-noetix-bumi python3 /deploy/install_bumi_guard_skill.py --apply
+```
+
+The status binder adds only `guard_status` and an execution connection from
+the existing `decision_core`. It refuses a running project or a missing or
+ambiguous controller. The Skill installer updates only Agent Core's
+`skills.installed` record in the host-mounted SQLite database; it preserves
+other skills and requires `--replace` if the same slug has different content.
+It starts with `active: false`. Refresh the Dashboard, open **Skills**, enable
+**Bumi 门卫**, and start the project. In a conversation, ask the agent to use
+the Bumi guard skill and report status; Agent Core's `activate_skill` loads
+the instruction for that conversation. `requiredTools` is descriptive
+metadata, not a wiring command. If the status card is not connected, the
+Skill must say it cannot verify live state.
+
+Only an authenticated operator should start or stop the project in the
+Dashboard; the Skill does not call hidden processor lifecycle actions or
+authorize visitors. Keep enrollment photos on the robot host. Validate one
+known and one unknown visitor, TTS playback, cooldown, and the read-only
+status result on the real Bumi before enabling project auto-start. Publishing
+the Skill to Resource Center is a separate review step after validation.
+
 ## `face_whitelist` card
 
 Local proof-of-concept face recognition for one person in the current RGB

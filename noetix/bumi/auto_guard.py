@@ -357,3 +357,98 @@ class AutoGuardPlugin:
         if action == "info":
             return self._info()
         return None
+
+
+class GuardStatusPlugin:
+    """Read-only LLM-facing summary of the automatic guard's health.
+
+    Agent Core intentionally hides processor lifecycle actions from the LLM;
+    ``auto_guard`` only declares those actions. This separate on-demand card
+    exposes one user action, ``status``, without exposing visitor identities.
+    Agent Core sends unadvertised ``start``/``stop``/``info`` during canvas
+    lifecycle through its direct card endpoint; those remain safe no-ops or
+    read-only snapshots, while the LLM schema permits only ``status``.
+    """
+
+    PREFIX = "guard_status"
+    _STATES = frozenset({
+        "idle", "stopping", "waiting_for_pipeline", "running", "error",
+    })
+
+    def __init__(self, guard: AutoGuardPlugin, whitelist) -> None:
+        self._guard = guard
+        self._whitelist = whitelist
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "guard_status",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": (
+                "Read-only Bumi guard health. `status` reports monitoring, "
+                "pipeline and whitelist readiness; no visitor identity, "
+                "photos, motion or access decisions. Use status only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status"],
+                        "description": "Use status to query guard health.",
+                    },
+                },
+                "required": ["action"],
+            },
+        }
+
+    def start(self) -> None:
+        """Canvas lifecycle hook; status queries never arm monitoring."""
+
+    def stop(self) -> None:
+        """Canvas lifecycle hook; stopping this card never stops monitoring."""
+
+    def _snapshot(self) -> dict:
+        try:
+            guard_info = self._guard._info()
+            if not isinstance(guard_info, dict):
+                raise TypeError("guard info must be a dict")
+        except Exception:
+            guard_info = {}
+            guard_error = True
+        else:
+            guard_error = bool(guard_info.get("last_error"))
+
+        try:
+            whitelist_ready = bool(
+                self._whitelist is not None and self._whitelist.is_ready()
+            )
+        except Exception:
+            whitelist_ready = False
+
+        guard_state = guard_info.get("state")
+        if not isinstance(guard_state, str) or guard_state not in self._STATES:
+            guard_state = "unavailable"
+        checked_frames = guard_info.get("checked_frames")
+        if type(checked_frames) is not int or checked_frames < 0:
+            checked_frames = 0
+        return {
+            "state": "ready",  # this query card is usable; monitor may not be
+            "guard_state": guard_state,
+            "pipeline_ready": guard_info.get("pipeline_ready") is True,
+            "whitelist_ready": whitelist_ready,
+            "checked_frames": checked_frames,
+            "guard_has_error": guard_error,
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        del args
+        if action == "start":
+            self.start()
+            return {"state": "ready"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "status"):
+            return self._snapshot()
+        return None
