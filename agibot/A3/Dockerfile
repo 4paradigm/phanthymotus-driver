@@ -1,19 +1,22 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG A3_AIMDK_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/agibot/a3_aimdk-3.2.0-py3-none-any.whl
+ARG A3_AIMDK_SHA256=2ce4ede82a5e82f4724414c0cb82f9966538b7232eef6cf70c96c1b6dd55edb4
 
 # The robot publishes Jazzy ROS types. Keep the main participant on FastDDS so
 # its type-hash negotiation matches the robot; the isolated domain-42 bridge
 # also uses FastDDS in its child workers. The base image already provides the
 # FastDDS RMW, so no extra apt package is needed here.
 
-# A3 has no vendored msgs package to colcon-build (unlike X2's aimdk_msgs zip):
-# The official AimDK v3.2 wheel is vendored below (the vendor package does not
-# require a device-specific runtime).  ros2_plugin_proto remains sourced from
-# the mounted dev-kit because it is an AArch64 ROS interface package.
+# A3 has no vendored msgs package to colcon-build (unlike X2's aimdk_msgs zip).
+# Fetch the official AimDK wheel from COS at build time instead of committing a
+# binary artifact to Git. ros2_plugin_proto remains built from this source tree.
 COPY requirements.txt /tmp/agibot-a3-requirements.txt
-COPY vendor/a3_aimdk-3.2.0-py3-none-any.whl /tmp/a3_aimdk-3.2.0-py3-none-any.whl
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk-3.2.0-py3-none-any.whl && rm -f /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk-3.2.0-py3-none-any.whl
+RUN python3 -c "import urllib.request; urllib.request.urlretrieve('${A3_AIMDK_URL}', '/tmp/a3_aimdk-3.2.0-py3-none-any.whl')" && \
+    echo "${A3_AIMDK_SHA256}  /tmp/a3_aimdk-3.2.0-py3-none-any.whl" | sha256sum -c - && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk-3.2.0-py3-none-any.whl && \
+    rm -f /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk-3.2.0-py3-none-any.whl
 COPY audio_msgs/ /tmp/a3_ws/src/audio_msgs/
 COPY ros2_plugin_proto/ /tmp/a3_ws/src/ros2_plugin_proto/
 RUN cd /tmp/a3_ws && \
