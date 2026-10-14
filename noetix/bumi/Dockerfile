@@ -70,6 +70,8 @@ COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY face_whitelist.py /work/face_whitelist.py
+COPY guard_policy.py /work/guard_policy.py
+COPY auto_guard.py /work/auto_guard.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

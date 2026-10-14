@@ -120,6 +120,8 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
+        speaker_plugin = None
+        face_whitelist_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -139,7 +141,8 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("speaker", {}).get("enabled", False) and media_ctrl is not None:
             from device import SpeakerPlugin
-            self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl))
+            speaker_plugin = SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, media_ctrl)
+            self._plugins.append(speaker_plugin)
             print("[bundle] SpeakerPlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
@@ -163,9 +166,18 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("face_whitelist", {}).get("enabled", False):
             from face_whitelist import FaceWhitelistPlugin
-            self._plugins.append(FaceWhitelistPlugin(
-                plugins_cfg["face_whitelist"], camera_plugin))
+            face_whitelist_plugin = FaceWhitelistPlugin(
+                plugins_cfg["face_whitelist"], camera_plugin)
+            self._plugins.append(face_whitelist_plugin)
             print("[bundle] FaceWhitelistPlugin loaded")
+
+        if plugins_cfg.get("auto_guard", {}).get("enabled", False):
+            from auto_guard import AutoGuardPlugin
+            self._plugins.append(AutoGuardPlugin(
+                plugins_cfg["auto_guard"], namespace, executor,
+                camera_plugin, face_whitelist_plugin, speaker_plugin,
+            ))
+            print("[bundle] AutoGuardPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):

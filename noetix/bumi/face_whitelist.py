@@ -224,6 +224,7 @@ class FaceWhitelistPlugin:
         )
         self._started = False
         self._last_error: str | None = None
+        self._reload_error: str | None = None
         self._lock = threading.Lock()
 
     def get_tool(self) -> dict:
@@ -275,7 +276,8 @@ class FaceWhitelistPlugin:
         return self._reload()
 
     def stop(self) -> dict:
-        self._started = False
+        with self._lock:
+            self._started = False
         return {"state": "idle"}
 
     def _reload(self) -> dict:
@@ -283,46 +285,66 @@ class FaceWhitelistPlugin:
             try:
                 summary = self._backend.reload()
                 self._last_error = None
+                self._reload_error = None
             except Exception as exc:
                 self._last_error = str(exc)
+                self._reload_error = self._last_error
                 return {"state": "error", "error": self._last_error}
         state = "ready" if summary.get("ready") else "unconfigured"
         return {"state": state, **summary}
 
     def _info(self) -> dict:
-        summary = self._backend.summary()
-        if not self._started:
-            state = "idle"
-        elif self._last_error:
-            state = "error"
-        elif summary.get("ready"):
-            state = "ready"
-        else:
-            state = "unconfigured"
-        result = {"state": state, **summary}
-        if self._last_error:
-            result["error"] = self._last_error
-        return result
-
-    def _recognize(self) -> dict:
-        if not self._started:
-            return {"state": "error", "error": "face_whitelist is not started"}
-        if self._camera is None or not self._camera.is_running():
-            return {"state": "error", "error": "Bumi camera worker is unavailable"}
         with self._lock:
+            summary = self._backend.summary()
+            if not self._started:
+                state = "idle"
+            elif self._last_error:
+                state = "error"
+            elif summary.get("ready"):
+                state = "ready"
+            else:
+                state = "unconfigured"
+            result = {"state": state, **summary}
+            if self._last_error:
+                result["error"] = self._last_error
+            return result
+
+    def is_ready(self) -> bool:
+        """Return readiness under the same lock used by model reload/predict."""
+        with self._lock:
+            return self._started and self._reload_error is None and self._backend.ready
+
+    def recognize_jpeg(self, jpeg: bytes) -> dict:
+        """Recognize one supplied frame without opening another camera stream."""
+        with self._lock:
+            if not self._started:
+                return {"state": "error", "error": "face_whitelist is not started"}
+            if self._reload_error:
+                return {"state": "error", "error": self._reload_error}
+            if not self._backend.ready:
+                return {"state": "error", "error": "face whitelist is unconfigured"}
             try:
-                frame, _ = self._camera.wait_for_color_frame(timeout_s=5.0)
-                if not isinstance(frame, dict) or not frame.get("data"):
-                    raise FaceWhitelistError("no RGB frame has arrived")
-                timestamp_ms = float(frame.get("timestamp_ms", 0) or 0)
-                if timestamp_ms and time.time() - timestamp_ms / 1000 > 3.0:
-                    raise FaceWhitelistError("latest RGB frame is stale")
-                result = self._backend.recognize(bytes(frame["data"]))
+                result = self._backend.recognize(jpeg)
                 self._last_error = None
                 return {"state": "completed", **result}
             except Exception as exc:
                 self._last_error = str(exc)
                 return {"state": "error", "error": self._last_error}
+
+    def _recognize(self) -> dict:
+        if self._camera is None or not self._camera.is_running():
+            return {"state": "error", "error": "Bumi camera worker is unavailable"}
+        try:
+            frame, _ = self._camera.wait_for_color_frame(timeout_s=5.0)
+            if not isinstance(frame, dict) or not frame.get("data"):
+                raise FaceWhitelistError("no RGB frame has arrived")
+            timestamp_ms = float(frame.get("timestamp_ms", 0) or 0)
+            if timestamp_ms and time.time() - timestamp_ms / 1000 > 3.0:
+                raise FaceWhitelistError("latest RGB frame is stale")
+            return self.recognize_jpeg(bytes(frame["data"]))
+        except Exception as exc:
+            self._last_error = str(exc)
+            return {"state": "error", "error": self._last_error}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         del args

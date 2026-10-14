@@ -40,3 +40,14 @@ plugins:
     distance_threshold: 60
     min_face_size: 80
     max_images_per_person: 20
+  auto_guard:
+    enabled: true
+    # The canvas must connect camera -> auto_guard -> tts -> speaker and
+    # start the project. Driver boot alone never arms this speech-only card.
+    sample_interval_s: 0.5
+    confirm_frames: 3
+    rearm_no_face_frames: 3
+    cooldown_s: 30
+    max_frame_age_s: 2
+    # Must equal the dedicated Perception TTS card ID installed on the canvas.
+    tts_instance_id: bumi-guard-tts
