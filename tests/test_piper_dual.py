@@ -529,10 +529,13 @@ def test_deployment_template_exposes_cards_without_connecting_can(tmp_path, monk
     config = yaml.safe_load(template.read_text())
     config["data_dir"] = str(tmp_path)
     config["calibration_path"] = str(tmp_path / "missing-calibration.json")
-    plugin, = build_plugins(config, "piper", None)
+    plugins = build_plugins(config, "piper", None)
+    plugin = plugins[0]
     try:
-        plugin.start()
-        assert {"piper_teleop", "piper_motion"} <= {t["name"] for t in plugin.get_tools()}
+        for item in plugins:
+            item.start()
+        assert {"piper_teleop", "piper_motion", "piper_teaching"} <= {
+            t["name"] for t in DriverBundle(plugins).get_all_tools()}
         for arm in plugin.arms.values():
             assert arm.driver is None
             assert arm.motion_enabled is False
@@ -540,4 +543,5 @@ def test_deployment_template_exposes_cards_without_connecting_can(tmp_path, monk
         with pytest.raises((OSError, ValueError)):
             plugin.motion.configuration()
     finally:
-        plugin.stop()
+        for item in reversed(plugins):
+            item.stop()
