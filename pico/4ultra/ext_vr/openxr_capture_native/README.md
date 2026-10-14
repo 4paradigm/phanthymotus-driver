@@ -1,6 +1,6 @@
 # PICO 原生遥操 App
 
-此模块由独立PICO Driver维护，复用原生Android OpenXR、现场透视、WSS配对与WebRTC采集。当前 `versionCode=29`，`0.4.5-pico-feedback`。透视中显示机器人真实骨架、半透明映射目标及左右末端误差。App不求解IK、不发送机器人关节命令；末端映射与执行由机器人 `teleop_control` 承担。
+此模块由独立PICO Driver维护，复用原生Android OpenXR、现场透视、WSS配对与WebRTC采集。当前 `versionCode=30`，`0.4.6-pico-feedback`。透视中显示机器人真实骨架、半透明映射目标及左右末端误差。App不求解IK、不发送机器人关节命令；末端映射与执行由机器人 `teleop_control` 承担。
 
 ## 安装、连接与使用
 

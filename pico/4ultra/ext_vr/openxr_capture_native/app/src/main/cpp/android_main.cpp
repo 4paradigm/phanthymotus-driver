@@ -427,6 +427,7 @@ void android_main(android_app* app) {
         last_focused = focused;
       }
       transport->Tick();
+      xr.SetVisualization(transport->visualization());
       xr.SetDevicePanel(transport->paired_connected());
       const auto link = transport->link_state();
       if (link == CaptureLinkState::kStandby || link == CaptureLinkState::kNegotiating ||
