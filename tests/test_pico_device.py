@@ -305,6 +305,58 @@ def test_tls_identity_is_persistent_and_not_core_key(tmp_path):
     assert Path(second["tls_key_file"]).stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.parametrize("mode", [None, 0o755, 0o700])
+def test_startup_prepares_private_state_and_preserves_identity(tmp_path, mode):
+    from ext_vr.management_pin import ManagementPin
+
+    root = tmp_path / "state"
+    if mode is not None:
+        root.mkdir(mode=mode)
+        root.chmod(mode)
+    prepare = load_driver_module("identity").prepare_config
+    config = {"state_dir": str(root), "public_host": "127.0.0.1"}
+    prepare(config)
+    assert root.stat().st_mode & 0o777 == 0o700
+    auth = ManagementPin(root / "management-pin.json")
+    auth.configure("0123")
+    pairing = root / "device.json"
+    pairing.write_text('{"schema_version": 1, "capture": {}}')
+    pairing.chmod(0o600)
+    before = {p.relative_to(root): (p.read_bytes(), p.stat().st_mode) for p in root.rglob("*") if p.is_file()}
+    root.chmod(0o755)
+    prepare(config)
+    assert root.stat().st_mode & 0o777 == 0o700
+    assert before == {p.relative_to(root): (p.read_bytes(), p.stat().st_mode) for p in root.rglob("*") if p.is_file()}
+    restored = ManagementPin(auth.path)
+    restored.authorize(restored.login("0123"))
+
+
+@pytest.mark.parametrize("invalid", ["symlink", "file", "owner"])
+def test_startup_rejects_unsafe_state_without_changing_target(tmp_path, monkeypatch, invalid):
+    identity = load_driver_module("identity")
+    root = tmp_path / "state"
+    target = tmp_path / "target"
+    target.mkdir(mode=0o755)
+    marker = target / "keep"
+    marker.write_text("unchanged")
+    if invalid == "symlink":
+        root.symlink_to(target, target_is_directory=True)
+    elif invalid == "file":
+        root.write_text("unchanged")
+    else:
+        root.mkdir(mode=0o755)
+        monkeypatch.setattr(identity.os, "geteuid", lambda: root.stat().st_uid + 1)
+    with pytest.raises(ValueError, match="pico_state_directory_"):
+        identity.prepare_config({"state_dir": str(root), "public_host": "127.0.0.1"})
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert marker.read_text() == "unchanged"
+    if invalid == "file":
+        assert root.read_text() == "unchanged"
+    elif invalid == "owner":
+        assert root.stat().st_mode & 0o777 == 0o755
+        assert list(root.iterdir()) == []
+
+
 def test_transport_write_failure_does_not_kill_request_recovery():
     async def run():
         runtime, binding, epoch = ready_runtime()

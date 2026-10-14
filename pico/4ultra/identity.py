@@ -5,6 +5,7 @@ import datetime
 import ipaddress
 import os
 import socket
+import stat
 from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -48,7 +49,23 @@ def validate_dds_profile(path):
 def prepare_config(config):
     result = dict(config)
     root = Path(result.get("state_dir", "/var/lib/motus/pico"))
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        try:
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except FileExistsError:
+            pass  # Validate existing paths with O_DIRECTORY and O_NOFOLLOW.
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(directory)
+            if metadata.st_uid != os.geteuid():
+                raise ValueError("pico_state_directory_owner_mismatch")
+            # Docker may create the bind-mount directory as 0755 before startup.
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                os.fchmod(directory, 0o700)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        raise ValueError("pico_state_directory_unavailable") from exc
     host = os.environ.get("PICO_PUBLIC_HOST") or result.get("public_host")
     if not host:
         # Routing lookup only; no UDP packet is sent.
