@@ -317,8 +317,8 @@ class TeleopControl:
             self._state, self._reason = 'hold', reason
             self._enabled = self._ready_on_release = False
             self._engage_sequence = None
-            if reason != 'operator_pause' and self.trajectory.recorder and self.trajectory.recorder.thread.is_alive():
-                self.trajectory.recorder.fail(reason)
+            if self.trajectory.recorder:
+                self.trajectory.recorder.pause()
             if grip: self._paused = True
             kind = 'pause' if grip else 'recoverable_hold'
             if self._hold_kind == (kind, reason): return

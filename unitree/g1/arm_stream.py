@@ -289,11 +289,7 @@ class ArmStreamExecutor:
             if recoverable and (self.state=='fault' or self.release_requested
                     or self.state=='hold' and not self._recoverable): raise ValueError('hold_not_resumable')
             self._generation += 1
-            if self.record_sink is not None:
-                if reason == 'operator_pause' and self.latest is not None and self.applied_seq == self.latest['seq']:
-                    self._record('hold', self._snapshot(), self.latest)
-                elif reason != 'operator_pause':
-                    self.record_sink.fail(reason)
+            if self.record_sink is not None:self.record_sink.pause()
             self.latest = self._proof = None
             self.release_requested |= release
             if self.session_id or self._channel_open:
@@ -725,7 +721,7 @@ class ArmStreamExecutor:
                 self._record('target', s, self.latest)
                 self.applied_seq=self.latest['seq'];self.state,self.reason='active',None
             except Exception as exc:
-                if self.record_sink is not None: self.record_sink.fail(str(exc))
+                if self.record_sink is not None: self.record_sink.pause()
                 snapshot=self._snapshot()
                 age=self.clock()-(self._fsm.get('arm_ns',0) if str(exc)=='motion_feedback_stale' else snapshot.get('arm_ns',0))
                 if str(exc) in ('arm_feedback_stale','motion_feedback_stale') and 0 <= age <= 300_000_000 and self.state!='fault':

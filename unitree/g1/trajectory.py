@@ -111,9 +111,10 @@ class Recorder:
         self.partial = self.directory/(self.filename+'.partial')
         self.header = {'type': 'header', 'schema': SCHEMA, 'binding': binding, 'joint_names': joint_names, 'units': UNITS}
         self.queue = queue.Queue(maxsize=256)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.stopping, self.ready = threading.Event(), threading.Event()
         self.error, self.complete, self.count = None, False, 0
+        self._last_frame = None
         self.origin_ns, self.end_ns = clock(), None
         self.thread = threading.Thread(target=self._write, name='g1-recorder', daemon=True)
         self.thread.start()
@@ -131,9 +132,18 @@ class Recorder:
             try:
                 value = dict(frame, type='frame', t_ns=frame['t_ns']-self.origin_ns)
                 self.queue.put_nowait(encode(value))
+                self._last_frame = dict(frame)
             except (queue.Full, ValueError) as exc:
                 self.error = 'recording_queue_full' if isinstance(exc, queue.Full) else str(exc)
                 self.stopping.set()
+
+    def pause(self):
+        with self.lock:
+            frame = self._last_frame
+            now = self.clock()
+            if frame and frame['kind'] != 'hold' and now > frame['t_ns']:
+                # Keep the last accepted reference and its original feedback timestamp.
+                self.append(dict(frame, kind='hold', t_ns=now))
 
     def _write(self):
         try:

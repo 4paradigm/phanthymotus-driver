@@ -243,3 +243,80 @@ def test_replay_failure_never_reports_completed(tmp_path, failure):
         assert receipts[-1][0] == result['action_id'] and receipts[-1][1] != 'completed'
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+
+def test_command_timeout_preserves_recording_and_resumes_same_file(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    recorder = Recorder(tmp_path/'recordings', {}, [], arm.limits, clock=arm.clock)
+    arm.record_sink = recorder
+    advance(50); arm.accept_control(packet(arm, 1, target=.03)); arm.tick()
+    first_feedback_ns = sample['arm_ns']
+    advance(301); arm.tick()
+    advance(10); arm.tick()
+    assert arm.status()['continuation_ready'] and recorder.status()['recording']
+    assert recorder.status()['error'] is None
+    for seq in range(2, 12):
+        advance(50); arm.accept_control(packet(arm, seq, target=.03)); arm.tick()
+    result = recorder.stop()
+    assert result['complete'], result
+    frames = read_recording(recorder.directory, result['filename'], arm.limits)['frames']
+    assert len(channel.positions) == 11 and len(frames) == 12
+    assert [f['target_q'] for f in frames if f['kind'] == 'target'] == [q for q, _ in channel.positions]
+    assert frames[1]['kind'] == 'hold' and frames[1]['feedback_ns'] == first_feedback_ns
+    assert frames[2]['t_ns']-frames[1]['t_ns'] == 60_000_000
+
+
+@pytest.mark.parametrize('failure', ['sdk', 'feedback'])
+def test_execution_failure_keeps_recording_valid_prefix(tmp_path, failure):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    recorder = Recorder(tmp_path/'recordings', {}, [], arm.limits, clock=arm.clock)
+    arm.record_sink = recorder
+    advance(50); arm.accept_control(packet(arm, 1, target=.03)); arm.tick()
+    if failure == 'sdk':
+        channel.publish_servo_position = lambda *a, **k: False
+        advance(50); arm.accept_control(packet(arm, 2, target=.04)); arm.tick()
+        assert arm.state == 'fault'
+    else:
+        advance(101, fresh=False); arm.tick()
+        assert arm.state == 'hold'
+    for _ in range(3): advance(10, fresh=False); arm.tick()
+    assert recorder.status()['recording'] and recorder.error is None
+    result = recorder.stop()
+    assert result['complete'], result
+    frames = read_recording(recorder.directory, result['filename'], arm.limits)['frames']
+    assert [f['kind'] for f in frames] == ['target', 'hold']
+    assert all(f['target_q'] == channel.positions[0][0] and f['sdk_sequence'] == 1 for f in frames)
+
+
+@pytest.mark.parametrize('reason', ['input_stale', 'tracking_lost', 'ik_worker_timeout'])
+def test_teleop_hold_does_not_terminate_recording(tmp_path, reason):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        assert card.dispatch('record_start', {})['recording']
+        arm.accept_control(packet(arm, 1, target=.01))
+        time.sleep(.06)
+        card._hold(reason, grip=True)
+        card._hold(reason, grip=True)
+        assert card.trajectory.recorder.status()['recording']
+        time.sleep(.03)
+        resumed = arm.dispatch('resume', card.motion._lease())
+        assert not resumed.get('error'), resumed
+        arm.accept_control(packet(arm, 2, target=.02))
+        time.sleep(.06)
+        result = card.dispatch('record_stop', {})
+        assert result['complete'], result
+        frames = read_recording(card.trajectory.directory, result['filename'], arm.limits)['frames']
+        assert [f['kind'] for f in frames] == ['target', 'hold', 'target']
+    finally:
+        done.set(); ticker.join(1)
+        if card.trajectory.recorder: card.trajectory.recorder.stop()
+
+
+def test_pause_without_successful_output_does_not_fabricate_frame(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    recorder = Recorder(tmp_path/'recordings', {}, [], arm.limits, clock=arm.clock)
+    for _ in range(3): advance(100); recorder.pause()
+    result = recorder.stop()
+    assert result['frames'] == 0 and not result['complete']
+    assert result['error'] == 'recording_duration_or_count'
