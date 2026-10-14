@@ -2598,13 +2598,13 @@ class MirrorStreamTests(unittest.TestCase):
 
         mounts = {
             "left": ("L_palm_joint", "left_hand_O10_joint",
-                     "-3.1415913 0.0015939 -1.57",
-                     "0.0015927 -2.5e-06 0.0007963"),
+                     "1.5707963 0 0.0008",
+                     "-3.1415913 0.0015939 -1.57"),
             "right": ("R_palm_joint", "right_hand_O10_joint",
-                      "-0.0 -0.0015926 -1.5707926",
-                      "3.14 0 0.0000036"),
+                      "1.5707963 0 0.000004",
+                      "-0.0 -0.0015926 -1.5707926"),
         }
-        relative_correction = ((0, -1, 0), (-1, 0, 0), (0, 0, -1))
+        relative_correction = ((0, 0, 1), (-1, 0, 0), (0, -1, 0))
         for side, (name, wrist_joint, expected, previous) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
             self.assertEqual(origin.attrib["rpy"], expected)
