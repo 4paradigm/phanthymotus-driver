@@ -59,6 +59,13 @@ The driver image builds its bundled `audio_msgs` definitions, including
 `ros-base` release from the main repository. ASR and Agent Core still need the
 matching message definition to consume the direction topic.
 
+The published-image [size measurement](review-evidence/image-size-2026-10-14.md)
+records a 2,088,960-byte increase in summed history-layer size over the earlier
+release without the local interface overlay; the ROS overlay and import-check layers account for
+1,146,880 bytes. Both measured images use the same ordered base layers, matching
+this robot's cached `ros-base:latest` and the pinned digest. The report separates
+Docker size accounting from actual disk consumption and includes raw evidence.
+
 Before deploying the three images together, compare
 `noetix/bumi/audio_msgs/msg/SoundDirection.msg` with the main repository's
 `deploy/ros-base/audio_msgs/msg/SoundDirection.msg` byte for byte. They match
