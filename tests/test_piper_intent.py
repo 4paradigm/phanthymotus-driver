@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from agilex.piper.device import build_plugins
 from agilex.piper.intent_motion import DIRECTIONS, end_pose, move_cartesian
+from agilex.piper.intent_control import TASK_ACTIONS
 from common.vendor_runtime import DriverBundle
 from test_piper_controls import Driver, SDK
 
@@ -68,9 +69,14 @@ class IntentTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        motion_env = patch.dict('os.environ', {'PIPER_MOTION_ENABLED': '1'})
+        motion_env.start()
+        self.addCleanup(motion_env.stop)
         self.plugins = build_plugins({'data_dir': self.tmp.name, 'async_actions': False,
                                       'name': '机械臂 1'}, 'agilex', None)
         self.runtime, self.background = self.plugins[:2]
+        # Positive motion fixtures model an explicitly authorized deployment.
+        self.assertTrue(self.runtime.motion_enabled)
         self.runtime.factory = IntentDriver
         self.background.auto_connect = False
         self.bundle = DriverBundle(self.plugins)
@@ -118,12 +124,99 @@ class IntentTests(unittest.TestCase):
                 self.assertEqual(result['state'], 'completed')
                 self.assertEqual(result['orientation_deg'], (180., 0., 90.))
                 self.assertFalse(any(c[0] in ('prepare', 'enable_arm', 'joints') for c in self.sdk.calls))
-                self.assertFalse(self.runtime.motion_enabled)
+                self.assertTrue(self.runtime.motion_enabled)
+                self.assertFalse(self.runtime.manual_motion_permission)
 
     def test_direction_action_uses_fixed_small_step_and_low_speed(self):
         self.call('move_up')
         self.assertEqual(self.sdk.pose[2], 251000)
         self.assertTrue(all(c[3] == 1 for c in self.sdk.calls if c[0] == 'mode'))
+
+    def test_disabled_deployment_blocks_every_task_before_any_sdk_command(self):
+        self.runtime.motion_enabled = False
+        for mode, enabled in [('CAN_CTRL(0x1)', (True,) * 6),
+                              ('STANDBY(0x0)', (False,) * 6),
+                              ('TEACHING_MODE(0x2)', (True,) * 6)]:
+            self.sdk.mode, self.sdk.enabled = mode, enabled
+            for action in sorted(TASK_ACTIONS):
+                with self.subTest(mode=mode, action=action), \
+                     self.assertRaisesRegex(RuntimeError, 'PIPER_MOTION_ENABLED=1'):
+                    self.call(action)
+                self.assertEqual(self.sdk.calls, [])
+                self.assertEqual(self.call('info')['state'], 'failed')
+                self.assertFalse(self.runtime.motion_enabled)
+                self.assertFalse(self.runtime.gate.locked())
+
+    def test_default_disabled_deployment_does_not_connect_and_start_cannot_open_gate(self):
+        for value in (None, '0'):
+            with self.subTest(value=value), patch.dict('os.environ', {}, clear=True):
+                if value is not None:
+                    import os
+                    os.environ['PIPER_MOTION_ENABLED'] = value
+                plugins = build_plugins({'data_dir': self.tmp.name, 'async_actions': False}, 'agilex', None)
+                runtime, background = plugins[:2]
+                background.auto_connect = False
+                runtime.factory = lambda *args: self.fail('Disabled task constructed a CAN driver')
+                bundle = DriverBundle(plugins)
+                try:
+                    bundle.dispatch('arm_control', {'action': 'start'})
+                    for action in sorted(TASK_ACTIONS):
+                        with self.assertRaisesRegex(RuntimeError, 'Motion is disabled'):
+                            bundle.dispatch('arm_control', {'action': action})
+                    self.assertFalse(runtime.motion_enabled)
+                    self.assertIsNone(runtime.driver)
+                    self.assertFalse(bundle.dispatch('arm_control', {'action': 'select_action'})['executed'])
+                    self.assertEqual(bundle.dispatch('arm_control', {'action': 'stop_motion'})['state'], 'stopped')
+                    self.assertIn('<robot', bundle.dispatch('model', {})['urdf'])
+                finally:
+                    runtime.stop(); background.stop(); plugins[2].stop()
+
+    def test_gate_is_rechecked_after_feedback_and_preparation(self):
+        original = self.driver.get_state
+        def revoke_on_feedback():
+            self.runtime.motion_enabled = False
+            return original()
+        self.driver.get_state = revoke_on_feedback
+        with self.assertRaisesRegex(RuntimeError, 'Motion is disabled'):
+            self.call('move_up')
+        self.assertEqual(self.sdk.calls, [])
+        self.driver.get_state = original
+        self.runtime.motion_enabled = True
+        self.sdk.mode = 'STANDBY(0x0)'
+        self.sdk.enabled = (False,) * 6
+        prepare = self.driver.prepare_control
+        def revoke_after_prepare(**kwargs):
+            result = prepare(**kwargs)
+            self.runtime.motion_enabled = False
+            return result
+        self.driver.prepare_control = revoke_after_prepare
+        with self.assertRaisesRegex(RuntimeError, 'Motion is disabled'):
+            self.call('move_up')
+        self.assertEqual([c[0] for c in self.sdk.calls], ['prepare'])
+
+    def test_async_disabled_deployment_reports_failure_without_sdk_commands(self):
+        self.runtime.config['async_actions'] = True
+        self.runtime.motion_enabled = False
+        for action in sorted(TASK_ACTIONS):
+            complete, entered, release = threading.Event(), threading.Event(), threading.Event()
+            require = self.runtime.require_motion_permission
+            def delayed_gate():
+                entered.set()
+                release.wait(2)
+                require()
+            with self.subTest(action=action), patch.object(self.runtime, 'acp_complete',
+                    side_effect=lambda *args: complete.set()), \
+                 patch.object(self.runtime, 'require_motion_permission', side_effect=delayed_gate):
+                try:
+                    self.assertEqual(self.call(action)['state'], 'running')
+                    self.assertTrue(entered.wait(1))
+                finally:
+                    release.set()
+                self.assertTrue(complete.wait(2))
+            task = self.call('info')['task']
+            self.assertEqual(task['state'], 'failed')
+            self.assertIn('Motion is disabled', task['error'])
+            self.assertEqual(self.sdk.calls, [])
 
     def test_control_card_discovers_background_camera_only_when_configured(self):
         def outputs(runtime):

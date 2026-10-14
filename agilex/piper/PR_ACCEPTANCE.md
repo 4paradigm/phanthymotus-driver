@@ -6,7 +6,7 @@ One Arm control canvas node discovers the background skeleton, English parameter
 
 ## Software verification
 
-- Latest PiPER and shared request-logging regression: **212 passed, 195 subtests passed** (`python -m pytest -q tests/test_piper*.py tests/test_vendor_runtime_logging.py`).
+- Latest PiPER, shared logging, lifecycle and Docker COPY regression after the deployment-gate fix: **291 passed, 237 subtests passed** (`python -m pytest -q tests/test_piper*.py tests/test_vendor_runtime_logging.py tests/test_common_lifecycle.py tests/test_dockerfile_copies.py`).
 - Candidate image: **63 unittest tests passed** offline, with no network or robot device mappings, covering intent control, teaching exit and camera lifecycle.
 - Unmodified Core browser harness: one control canvas node, default no-op, six direction selectors, gripper-specific fields, simulated production request/result, PiPER model and skeleton/parameter/image subscriptions; a simulated JPEG renders with expected dimensions. No page script errors.
 - This scope retains tests for stale component frames, faults/limits, cancellation and concurrent Start/Stop, target-reference invariance, cached-arrival rejection, diagnostics, namespaces, camera ownership/stalls/recovery and monitor connection-stop races. These are simulations, not physical acceptance claims.
@@ -47,3 +47,11 @@ The canvas contains only Arm control. Background camera output through Core was 
 Robot logic, camera modules, tests and build COPY/component metadata are driver-local. No Agent Core files or new Python/apt dependencies were added in this update. The PR's older common/vendor_runtime.py change only escapes and caps untrusted HTTP request log text; its shared impact is explicitly justified, does not alter MCP/DDS/lifecycle or introduce dependencies, and has regression coverage.
 
 Local evidence directories are acceptance/20261014_piper_single_target, acceptance/20261014_piper_background_camera and acceptance/20261014_piper_can0_binding in the project workspace. Raw CAN logs, robot-specific config, canvas backups and credentials are not committed. Previous stage documents are historical records; this file is the current acceptance summary. Bot Version for this new head is pending until its build table appears.
+
+## Review response: deployment motion gate
+
+Production tasks now require the operator's PIPER_MOTION_ENABLED gate before CAN connection/preflight and immediately before teaching exit, preparation and movement/gripper controls. Start never changes it; the public request-control UI remains absent. With the default unset/0 gate, all six directions, all three gripper actions and teaching exit emit no SDK commands. Stop and passive interfaces remain available.
+
+Regressions cover ready CAN, standby/all-disabled and teaching states, default/unset deployment, asynchronous worker failure and gate closure after feedback or preparation. Positive motion fixtures and the simulated Core action backend explicitly use PIPER_MOTION_ENABLED=1 instead of relying on a bypass. This fix has not been redeployed or physically reaccepted: the server was replaced by a separate temporary old-image test deployment. Prior physical trial numbers above precede this repair.
+
+SDK COS migration remains outstanding for the concrete artifact-upload dependency recorded in SDK_ARTIFACT.md; existing commit/hash/URL override are retained. Shared HTTP logging already has a justified scope and requires no additional change.

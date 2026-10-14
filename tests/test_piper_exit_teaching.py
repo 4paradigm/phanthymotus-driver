@@ -17,8 +17,12 @@ class TeachingExitTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        motion_env = patch.dict('os.environ', {'PIPER_MOTION_ENABLED': '1'})
+        motion_env.start()
+        self.addCleanup(motion_env.stop)
         self.plugins = build_plugins({'data_dir': self.tmp.name, 'async_actions': False}, 'agilex', None)
         self.runtime, self.background = self.plugins[:2]
+        self.assertTrue(self.runtime.motion_enabled)
         self.runtime.factory = IntentDriver
         self.background.auto_connect = False
         self.addCleanup(self.runtime.stop)

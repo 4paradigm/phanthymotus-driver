@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory() as d:
   jpeg=base64.b64encode(cv2.imencode('.jpg',np.zeros((48,64,3),dtype=np.uint8))[1]).decode()
   print(json.dumps({'tools':DriverBundle(p).get_all_tools(),'frame':p[1].monitor.read(),'urdf':DriverBundle(p).dispatch('model',{})['urdf'],'jpeg':jpeg}))
  finally:p[0].stop()
-`], {encoding:'utf8'});
+`], {encoding:'utf8',env:{...process.env,PIPER_MOTION_ENABLED:'1'}});
 assert.equal(fixtureResult.status,0,fixtureResult.stderr);
 const fixture=JSON.parse(fixtureResult.stdout);
 const requests=[];const controlResults=[];
@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory() as d:
    result=DriverBundle(p).dispatch('arm_control',args)
   print(json.dumps({'result':result,'commands':driver.arm.calls,'frame':p[1].monitor.read()}))
  finally:p[0].stop()
-`],{encoding:'utf8',input:JSON.stringify(arguments_)});
+`],{encoding:'utf8',input:JSON.stringify(arguments_),env:{...process.env,PIPER_MOTION_ENABLED:'1'}});
  assert.equal(run.status,0,run.stderr);return JSON.parse(run.stdout);
 }
 const topic='/agilex/piper/state/joints';

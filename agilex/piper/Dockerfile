@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 COPY requirements.txt /work/agilex/piper/requirements.txt
+# COS publication/access dependency and exact pinned artifact: SDK_ARTIFACT.md.
 # The SDK URL can be replaced by an approved COS artifact without editing code.
 # pip verifies its hash before installation and removes its temporary download;
 # --no-cache-dir prevents the ZIP/wheel cache from becoming an image layer.

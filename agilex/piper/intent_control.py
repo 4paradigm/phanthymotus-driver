@@ -286,6 +286,13 @@ class IntentControlPlugin(PiperPlugin):
             self.stopped_cards.discard(name)
             return {'state': 'ready', 'executed': False}
 
+    def require_motion_permission(self):
+        # This is the operator's deployment gate, independent of the removed
+        # per-action request-control UI. Start never opens it.
+        if not self.motion_enabled:
+            raise RuntimeError('Motion is disabled by deployment configuration. '
+                               'An operator must set PIPER_MOTION_ENABLED=1 before retrying.')
+
     def _execute_task(self, action, args):
         with self.operation(CONTROL, action):
             self._phase('preparing', action=action, started_at=time.time(), result=None, error=None,
@@ -293,12 +300,14 @@ class IntentControlPlugin(PiperPlugin):
                         request={'action': action, **{key: value for key, value in args.items() if key == 'width_mm'}})
             try:
                 self._audit('request')
+                self.require_motion_permission()
                 driver = self.connected(cancel_event=self.cancel)
                 observed = driver.get_state()
                 self._motion_report({'stage': 'preflight', 'controller_status': observed.arm_status,
                     'control_mode': observed.control_mode, 'error_code': observed.error_code,
                     'joints_deg': [q if math.isfinite(q) else None for q in observed.joints_deg],
                     'joint_feedback_time': observed.feedback_time if math.isfinite(observed.feedback_time) else None})
+                self.require_motion_permission()
                 if action == 'exit_teaching_and_hold':
                     result = exit_teaching_and_hold(driver, on_switch=lambda: self._phase('moving'))
                     with self.lifecycle:
@@ -320,10 +329,12 @@ class IntentControlPlugin(PiperPlugin):
                         raise ValueError(f'Gripper opening must be in [{low}, {high}] mm.')
                 driver._check_cancelled()
                 if state.control_mode.startswith('STANDBY') or not all(state.enabled):
+                    self.require_motion_permission()
                     driver.prepare_control(execute=True, workspace_clear=True, allow_limit_adjustment=False,
                                            speed_pct=JOG_SPEED_PERCENT)
                 checked_state(driver, ready=True)
                 driver._check_cancelled()
+                self.require_motion_permission()
                 self._phase('moving')
                 if action in DIRECTION_ACTIONS:
                     result = move_cartesian(driver, DIRECTION_ACTIONS[action], SMALL_STEP_MM,
@@ -331,8 +342,10 @@ class IntentControlPlugin(PiperPlugin):
                 else:
                     grip = driver.get_gripper()
                     if not grip.enabled:
+                        self.require_motion_permission()
                         driver.move_gripper(grip.width_mm, self.gripper_torque)
                     driver._check_cancelled()
+                    self.require_motion_permission()
                     result = {'executed': True, 'gripper': asdict(driver.move_gripper(width, self.gripper_torque))}
                 # Stop owns lifecycle as well: completion cannot overwrite a
                 # cancellation published between the final check and result.

@@ -14,6 +14,8 @@ Place **Arm control** (`arm_control`) on the canvas. Choose a direction to move 
 
 Directions are fixed to the robot base, independent of the camera. Each public movement requests **1 mm at 1% SDK speed**, preserving the current end orientation; option titles omit the numeric suffix. Speed percent does not specify a fixed mm/s. Default **Choose an action** executes nothing. Mode, enable/disable, permission, joint adjustment and preview management are internal/historical interfaces, excluded from the current public action list. Old action requests fail explicitly rather than being translated. No home, end rotation, teaching recording, obstacle avoidance or automatic fault reset is provided.
 
+The operator must explicitly enable physical control in deployment with `PIPER_MOTION_ENABLED=1`; its default is `0`. With the gate off, all direction/gripper/teaching-exit tasks fail before preparation or control commands. Start cannot open this gate, while Info, model/background monitoring, no-op selection and Stop remain available. This deployment setting does not add a request-control action to the card.
+
 Normal ready CAN control executes directly. Healthy standby or all-disabled states use preparation at the measured pose; partial enable, faults, teaching and unknown modes are rejected. Gripper preparation holds measured opening before enabling. One cancellable task owns preparation through completion; busy requests are rejected, not queued. `info` reports preparing/moving/stopping/completed/cancelled/failed and actual results. Accepted/submitted is not completion. Manual Core Start calls while a task is active acknowledge busy/stopping without clearing cancellation, allowing the subsequent Stop request to reach the task.
 
 Movement uses the pinned official SDK's MOVE_L and controller end feedback. Each step target is submitted **once**, followed by feedback polling; it is not resent every 50 ms. Actual joints, end-pose component frames and status must remain fresh within 0.5 s. Completion requires controller arrival plus position error <=0.5 mm and orientation error <=1 degree, stable for 0.5 s; motion deadline 30 s. Rejected targets halt further submissions. Stop/timeout may attempt one measured Cartesian hold only while feedback remains fresh, healthy and controllable. A retained target-limit report blocks new tasks; this driver does not clear it. A small step does not guarantee reachability or physical clearance.
@@ -142,7 +144,7 @@ Bot 默认可能为 arm64，必须 inspect 后再部署到 amd64 控制器。固
 SDK 固定提交 8d4dc29bd6e753066dedee235c008e90ecb2ab4a；ZIP SHA256
 `89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29`，pip 安装前校验、禁用缓存。
 Dockerfile 提供 PIPER_SDK_URL / PIPER_SDK_SHA256 构建参数，临时文件在同一 RUN 清理。
-两份桌面 landing 文档没有 COS 上传说明/SDK 地址，按用户要求暂不迁移 COS。
+COS 归档发布目前缺少已验证对象链接及授权上传路径；具体依赖和迁移步骤见 [SDK_ARTIFACT.md](SDK_ARTIFACT.md)。
 本轮拆分不增加第三方依赖，仅增加组件源码及少量无依赖前端代码。具体构建尺寸口径见 ACCEPTANCE。
 
 ## Mac
