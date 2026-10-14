@@ -289,7 +289,7 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
                     if result is None:
                         error(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(jsonable(result), ensure_ascii=False)}]})
+                        ok({"content": [{"type": "text", "text": json.dumps(jsonable(result), ensure_ascii=False)}], "isError": False})
                 else:
                     error(-32601, f"Method not found: {method}")
             except (TypeError, ValueError) as exc:
