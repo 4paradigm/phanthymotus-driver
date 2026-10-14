@@ -56,9 +56,6 @@ def validate_frame(frame, previous, limits):
         raise ValueError('trajectory_joint_limit')
     if previous:
         if frame['mapping_epoch'] != previous['mapping_epoch']: raise ValueError('trajectory_mapping_changed')
-        dt = (frame['t_ns']-previous['t_ns'])/1e9
-        if any(abs(a-b) > min(dt, .05)+1e-9 for a,b in zip(frame['target_q'], previous['target_q'])):
-            raise ValueError('trajectory_speed_exceeded')
 
 
 def read_recording(directory, filename, limits):

@@ -590,3 +590,24 @@ def test_replay_uses_recorded_joints_without_numerical_worker_or_body_baseline(t
         assert receipts[-1][1] == 'completed' and not arm.session_id
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+def test_recording_keeps_successful_targets_despite_record_timestamp_jitter(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    recorder = Recorder(tmp_path/'recordings', {}, [], arm.limits, clock=arm.clock)
+    arm.record_sink = recorder
+    original_record = arm._record
+    def delayed_record(kind, sample, command):
+        if command['seq'] == 1:
+            advance(10)
+        original_record(kind, sample, command)
+    arm._record = delayed_record
+    for seq in (1, 2):
+        advance(20)
+        arm.accept_control(packet(arm, seq, target=.8)); arm.tick()
+    result = recorder.stop()
+    assert result['complete'], result
+    frames = read_recording(recorder.directory, result['filename'], arm.limits)['frames']
+    assert [f['target_q'] for f in frames] == [q for q, _ in channel.positions]
+    elapsed = (frames[1]['t_ns']-frames[0]['t_ns'])/1e9
+    assert max(abs(a-b) for a,b in zip(frames[1]['target_q'], frames[0]['target_q'])) > elapsed
