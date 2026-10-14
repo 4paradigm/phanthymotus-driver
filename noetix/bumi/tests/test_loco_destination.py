@@ -2,6 +2,8 @@
 
 import importlib.util
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -174,3 +176,106 @@ def test_rotate_large_angle_turns_requested_direction_not_shortcut(monkeypatch):
     assert 194 <= result['turned_deg'] <= 206
     assert result['turned_deg'] > 0                      # 正向，绝不 ≈ −160
     assert abs(result['final_error_deg']) <= 2.0         # 整请求仍守 ±2° 容差
+
+
+# ── 失败路径：超时 / 打断 / 模式拒绝 / 与 loco move 互斥 ─────────────────────
+
+def test_rotate_timeout_stops_and_reports_turned_degrees(monkeypatch):
+    # 植物 gain=0（永远不动）+ 超时预算压到 0.05s → 必然走 timeout 支：
+    # 报告实际转角（≈0）与末帧零速，而不是挂着或带着残速退出。
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setattr(module, '_rotate_timeout_s', lambda a: 0.05)
+    fake = FakeHighCtrl(gain_deg_per_tick=0.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    assert result['state'] == 'timeout'
+    assert abs(result['turned_deg']) < 1e-6             # 植物没动，实际转角为 0
+    assert 'final_error_deg' in result                  # timeout 契约含误差报告
+    assert abs(result['final_error_deg'] - 60.0) < 1e-6  # 仍差 60°，如实报告
+    assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
+
+
+def test_stop_move_interrupts_running_rotate(monkeypatch):
+    # rotate 在工作线程里跑（150° / 小 gain 转不完），主线程 30ms 后下发 stop_move：
+    # rotate 必须经 _move_stop_event 以 stopped 收尾，且末帧零速。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=1.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    box = {}
+
+    def _run():
+        box['result'] = plugin.dispatch(
+            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    time.sleep(0.03)
+    stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+    worker.join(timeout=5)
+    assert not worker.is_alive()                        # rotate 确实被打断返回，而非挂死
+    assert stopped == {'state': 'stopped'}
+    result = box['result']
+    assert result['state'] == 'stopped'
+    assert 'final_error_deg' in result                  # stopped 契约含误差报告
+    assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
+
+
+def test_rotate_refuses_non_walking_and_protection_modes(monkeypatch):
+    # 模式拒绝与 _do_move 逐字一致：26 → protection；非 2 → workmode + switch_mode 指引。
+    # 两种情况都必须在发出任何指令之前就拒绝（fake.cmds 为空）。
+    module, _ = _load_device(monkeypatch)
+
+    fake_protection = FakeHighCtrl(mode=26)
+    plugin_protection = _rotate_plugin(module, monkeypatch, fake_protection)
+    result = plugin_protection.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    assert result['state'] == 'error'
+    assert 'protection' in result['error']
+    assert fake_protection.cmds == []                   # 未发任何指令
+
+    fake_ready = FakeHighCtrl(mode=1)
+    plugin_ready = _rotate_plugin(module, monkeypatch, fake_ready)
+    result = plugin_ready.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    assert result['state'] == 'error'
+    assert 'workmode' in result['error'] and 'switch_mode' in result['error']
+    assert fake_ready.cmds == []                        # 未发任何指令
+
+
+def test_rotate_stops_a_running_loco_move(monkeypatch):
+    # loco move 线程运行中发起 rotate：互斥前导必须先停 move 线程再转角，
+    # 全程 fake.cmds 只有一路指令流（rotate 首个转速帧之后不得再混入 move 的 x≠0 帧）。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    move = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 3})
+    assert move['state'] == 'moving'
+    time.sleep(0.03)                                    # 确保 move 线程真的在发指令
+    assert any(c == (0.2, 0.0, 0.0) for c in fake.cmds) # move 流已开
+
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    assert result['state'] == 'done'
+    assert abs(result['final_error_deg']) <= 2.0
+    # move 线程已被互斥前导 join 停掉
+    assert plugin._move_thread is not None and not plugin._move_thread.is_alive()
+    # 只有一路指令流：rotate 发出转速后，move 的 (0.2, 0, 0) 不得再出现
+    rotate_started = False
+    for cmd in fake.cmds:
+        if cmd[2] != 0:
+            rotate_started = True
+        elif rotate_started:
+            assert cmd[0] == 0, f"move 指令流混入 rotate 之后: {cmd}"
+    assert rotate_started
+    assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
+
+
+def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):
+    # 负角与正角对称（copysign 对称性）：-60 → 实际转过 ≈ -60，仍在 ±2° 容差内收敛。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': -60})
+    assert result['state'] == 'done'
+    assert -66 <= result['turned_deg'] <= -54
+    assert abs(result['final_error_deg']) <= 2.0
+    assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
