@@ -55,7 +55,7 @@ def test_bundle_exposes_only_one_direction_card(monkeypatch, tmp_path):
     assert bundle.dispatch('sound_direction', {'action': 'stop'}) == {'state': 'idle'}
 
 
-def test_clean_install_exposes_unavailable_uncalibrated_direction(monkeypatch, tmp_path):
+def test_missing_calibration_exposes_unavailable_direction(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     monkeypatch.setattr(module, 'CALIBRATION_PATH', tmp_path / 'override.json')
     monkeypatch.setattr(module, 'DEFAULT_CALIBRATION_PATH', tmp_path / 'packaged.json')
@@ -69,6 +69,22 @@ def test_clean_install_exposes_unavailable_uncalibrated_direction(monkeypatch, t
     assert info['state'] == 'unavailable'
     assert info['calibrated_directions'] == []
     assert 'calibration' in card.dispatch('start', {})['message']
+
+
+def test_packaged_robot_calibration_starts_without_machine_override(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, 'CALIBRATION_PATH', tmp_path / 'missing.json')
+    calibration = module.load_calibration()
+    assert set(calibration) == {'front', 'right'}
+    assert module.estimate_angle(calibration['front'], **calibration) == 0
+    assert module.estimate_angle(calibration['right'], **calibration) == 90
+    proc = types.SimpleNamespace(stdout=(b'__BUMI_DIRECTION_READY__\n',),
+        poll=lambda: None, terminate=lambda: None, wait=lambda **kwargs: 0)
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: proc)
+    card = _card(module)
+    assert card.dispatch('info', {})['calibrated_directions'] == ['front', 'right']
+    assert card.dispatch('start', {})['state'] == 'running'
+    card.stop()
 
 
 def test_config_saves_existing_field_names_and_rejects_invalid(monkeypatch, tmp_path):

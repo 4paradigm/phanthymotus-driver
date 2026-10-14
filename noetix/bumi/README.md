@@ -36,8 +36,10 @@ The card first loads a complete, valid per-robot calibration from
 `/opt/phanthy-motus/data/bumi/sound_direction_calibration.json`, then tries the
 packaged `resource/sound_direction_calibration.json`. Each file must contain
 `front` and `right`, each with three finite values of magnitude at most 24.
-The two files are never mixed. The packaged values are pending a read from an
-already calibrated Bumi. The direction card is registered by default; without
+The two files are never mixed. The packaged file was copied unchanged from
+the calibrated Bumi host `ubuntu` on 2026-10-14, at the per-robot path above.
+Its SHA-256 is `89813968f99881310d5f49ca748d48303dfadfd27e550893d27f1023e5fc660a`.
+The direction card is registered by default; without
 a valid file, `start` and `info` report it unavailable instead of starting a
 silent worker. Before treating
 the packaged file as common to all Bumi units, check a
