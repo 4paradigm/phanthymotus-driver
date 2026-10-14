@@ -19,7 +19,7 @@ inline IkPoint IkOperatorViewPoint(IkPoint p) {
 
 struct IkVisualization {
   bool available{false}, feedback_fresh{false};
-  std::string mode, state, reason;
+  std::string mode, state, reason, control_reason;
   double intent_age_ms{1e9};
   IkChains measured, ik, command, body, held_ik;
   bool tianyi{false}, unified{false}, teleop{false}, alignment_ready{false};
@@ -42,6 +42,28 @@ struct IkVisualization {
   IkChains workspace_bounds;
   bool target_limited{false}, boundary_search_pending{false};
   std::chrono::steady_clock::time_point received{};
+  bool control_fresh() const {
+    return teleop && !state.empty() && feedback_age_ms + std::chrono::duration<double,std::milli>(
+      std::chrono::steady_clock::now()-received).count() < 750;
+  }
+  std::string control_label() const {
+    if(!control_fresh())return "NO ROBOT FEEDBACK";
+    if(control_reason=="waiting_baseline_confirmation")return "CONFIRM ARMS DOWN";
+    if(control_reason=="release_buttons_then_regrip")return "RELEASE BUTTONS";
+    if(control_reason=="regrip_required")return "GRIP TO START";
+    if(control_reason=="resetting")return "RESETTING ARMS";
+    if(state=="active")return "ACTIVE";
+    if(state=="hold" || state=="fault" || state=="error")return "STOPPED";
+    return "WAITING FOR ROBOT";
+  }
+  std::string control_hint() const {
+    if(!control_fresh())return "";
+    if(control_reason=="waiting_baseline_confirmation")return "GRIPS OFF  HOLD X AND A 1 SEC";
+    if(control_reason=="release_buttons_then_regrip")return "THEN PRESS BOTH GRIPS";
+    if(control_reason=="resetting")return "WAIT THEN CONFIRM ARMS DOWN";
+    if(state=="hold" || state=="fault" || state=="error")return control_reason;
+    return "GRIPS OFF  HOLD Y AND B 1 SEC TO RESET";
+  }
   bool current_ik() const {
     return fresh() && intent_age_ms + std::chrono::duration<double,std::milli>(
       std::chrono::steady_clock::now()-received).count() < (teleop ? 300 : 750) && !ik.empty();
@@ -80,16 +102,22 @@ inline IkChains ParseIkChains(const nlohmann::json& value, std::size_t count=6) 
 inline IkVisualization ParseIkVisualization(const nlohmann::json& envelope) {
   const bool teleop=envelope.value("schema",std::string{})=="motus.teleop.feedback/1";
   const bool motion=teleop || envelope.value("schema",std::string{})=="motus.motion.feedback/1";
-  if(motion && (!envelope.value("available",true) || !envelope.contains("visualization"))) {
+  if(motion && !envelope.value("available",true)) {
     IkVisualization empty; empty.teleop=teleop;empty.unified=teleop; empty.reason=envelope.contains("reason") && envelope["reason"].is_string()?envelope["reason"].get<std::string>():"feedback_unavailable";return empty;
   }
   if(motion) {
     if(envelope.dump().size()>65536)throw std::invalid_argument("feedback_size");
-    const auto& v=envelope.at("visualization");
     IkVisualization r;r.teleop=teleop;r.tianyi=true;r.unified=true;r.received=std::chrono::steady_clock::now();
+    r.mode=envelope.value("mode",std::string("shadow"));r.state=envelope.value("state",std::string{});
+    if(envelope.contains("reason") && envelope["reason"].is_string())r.control_reason=envelope["reason"].get<std::string>();
+    r.feedback_age_ms=envelope.value("feedback_age_ms",0.0);
+    if(!std::isfinite(r.feedback_age_ms)||r.feedback_age_ms<0)throw std::invalid_argument("feedback_age");
+    if(!envelope.contains("visualization"))return r;
+    const auto& v=envelope.at("visualization");
+    r.feedback_age_ms=v.value("feedback_age_ms",r.feedback_age_ms);
+    if(!std::isfinite(r.feedback_age_ms)||r.feedback_age_ms<0)throw std::invalid_argument("feedback_age");
     r.available=v.value("available",false);r.reason=v.value("reason",std::string{});
     if(!r.available)return r;
-    r.mode=envelope.value("mode",std::string("shadow"));r.state=envelope.value("state",std::string{});
     r.feedback_fresh=v.value("feedback_fresh",false);
     r.intent_age_ms=v.value("intent_age_ms",1e9);
     if(!std::isfinite(r.intent_age_ms)||r.intent_age_ms<0)throw std::invalid_argument("feedback_age");
@@ -111,8 +139,6 @@ inline IkVisualization ParseIkVisualization(const nlohmann::json& envelope) {
     r.shoulder_height=v.value("shoulder_height",.29178f);
     if(!std::isfinite(r.shoulder_height)||std::abs(r.shoulder_height)>2)throw std::invalid_argument("feedback_shoulder");
     if(teleop) {
-      r.feedback_age_ms=v.value("feedback_age_ms",0.0);
-      if(!std::isfinite(r.feedback_age_ms)||r.feedback_age_ms<0)throw std::invalid_argument("feedback_age");
       if(envelope.contains("alignment")){
         const auto& a=envelope.at("alignment");
         r.alignment_state=a.at("state").get<std::string>();

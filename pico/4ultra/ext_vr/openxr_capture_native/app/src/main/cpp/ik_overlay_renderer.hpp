@@ -100,7 +100,8 @@ class IkOverlayRenderer {
     std::size_t measured_begin=0,measured_count=0;
     if(show_model) {
     if(value.teleop || !value.available){
-      text(value.alignment_label(),-.34f,.39f,value.ready()?green:pink);
+      text(value.control_label(),-.34f,.39f,value.control_fresh() && value.state=="active"?green:pink);
+      text(value.control_hint(),-.34f,.55f,gray);
       if(value.fresh() && value.feedback_fresh && value.alignment_state!="unavailable"){
         for(int i=0;i<2;++i){
           char error[48];std::snprintf(error,sizeof(error),"%s %d MM  %d DEG",i==0?"L":"R",

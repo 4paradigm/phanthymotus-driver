@@ -118,6 +118,7 @@ class RobotFeedback:
             if age_ms < 0 or age_ms >= 750 or not status["input_fresh"] or not status["tracking"] or not all(status["tracking"].values()):
                 return {**unavailable, "reason": "feedback_stale"}
             value = copy.deepcopy(self.value)
+            value["feedback_age_ms"] = age_ms
             visual = value.get("visualization")
             if visual is not None and visual.get("available"):
                 visual["intent_age_ms"] += age_ms

@@ -113,3 +113,17 @@ def test_missing_extension_and_unreachable_target_never_reuse_old_ik(preview):
     cache.accept(candidate)
     assert cache.snapshot()["visualization"]["ik"] == []
     assert cache.snapshot()["alignment"]["state"] == "unreachable"
+
+
+def test_control_status_keeps_age_without_an_ik_preview(preview):
+    runtime, cache, now = preview
+    candidate = feedback(runtime)
+    candidate.update(state="hold", reason="motion_feedback_stale")
+    cache.accept(candidate)
+    now[0] += 100_000_000
+    result = cache.snapshot()
+    assert result["state"] == "hold"
+    assert result["reason"] == "motion_feedback_stale"
+    assert result["feedback_age_ms"] == 100
+    assert not result["alignment"]["ready"]
+    assert "feedback_age_ms" not in candidate

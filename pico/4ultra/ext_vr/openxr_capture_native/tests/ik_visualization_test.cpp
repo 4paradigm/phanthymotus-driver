@@ -94,6 +94,22 @@ int main(int argc, char** argv){
  auto missing=ParseIkVisualization({{"schema","motus.motion.feedback/1"},{"available",false},{"reason","feedback_stale"}});
  assert(!missing.available);
 
+ nlohmann::json status={{"schema","motus.teleop.feedback/1"},{"state","hold"},
+   {"reason","motion_feedback_stale"},{"feedback_age_ms",700}};
+ auto status_only=ParseIkVisualization(status);
+ assert(status_only.control_fresh() && !status_only.available);
+ assert(status_only.control_reason=="motion_feedback_stale");
+ assert(status_only.control_label()=="STOPPED");
+ status_only.received-=std::chrono::milliseconds(51);
+ assert(!status_only.control_fresh());
+ assert(status_only.control_label()=="NO ROBOT FEEDBACK" && status_only.control_hint().empty());
+ status["visualization"]={{"available",false}};
+ assert(ParseIkVisualization(status).control_fresh());
+ status["available"]=false;
+ assert(!ParseIkVisualization(status).control_fresh());
+ status.erase("available");status["feedback_age_ms"]=-1;
+ rejected=false;try{ParseIkVisualization(status);}catch(const std::exception&){rejected=true;}assert(rejected);
+
  feedback["schema"]="motus.teleop.feedback/1";
  feedback["visualization"]["measured"]={chain,tchain};
  feedback["visualization"]["feedback_fresh"]=true;
@@ -114,6 +130,17 @@ int main(int argc, char** argv){
  rejected=false;try{ParseIkVisualization(feedback);}catch(const std::exception&){rejected=true;}assert(rejected);
  feedback["alignment"]["ready"]=false;
  assert(ParseIkVisualization(feedback).alignment_label()=="NOT ALIGNED");
+ feedback["state"]="ready";feedback["reason"]="regrip_required";
+ auto regrip=ParseIkVisualization(feedback);
+ assert(!regrip.ready() && regrip.control_label()=="GRIP TO START");
+ feedback["reason"]="waiting_baseline_confirmation";
+ assert(ParseIkVisualization(feedback).control_label()=="CONFIRM ARMS DOWN");
+ feedback["reason"]="release_buttons_then_regrip";
+ assert(ParseIkVisualization(feedback).control_label()=="RELEASE BUTTONS");
+ feedback["state"]="hold";feedback["reason"]="resetting";
+ assert(ParseIkVisualization(feedback).control_label()=="RESETTING ARMS");
+ feedback["state"]="active";feedback["reason"]=nullptr;
+ assert(ParseIkVisualization(feedback).control_label()=="ACTIVE");
  feedback["alignment"]["state"]="unreachable";
  feedback["visualization"]["ik"]=nlohmann::json::array();
  auto unreachable=ParseIkVisualization(feedback);
