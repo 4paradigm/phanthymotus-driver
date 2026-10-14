@@ -84,6 +84,7 @@ class RelativeMapping:
 
 class TeleopControl:
     CAPABILITIES = ['dual_arm']
+    INPUT_HOLDS = ('input_missing', 'input_stale', 'tracking_lost')
 
     def __init__(self, cfg, motion, *, clock=time.monotonic_ns, notify=None):
         self._validate_config(cfg)
@@ -406,7 +407,7 @@ class TeleopControl:
                     return
                 initialize = not self._operator or self._needs_calibration
                 if initialize and not confirm_event:
-                    if self._state != 'hold':
+                    if self._state != 'hold' or self._reason in self.INPUT_HOLDS:
                         self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
                     return
                 if not initialize and (reset or confirm):
@@ -420,11 +421,17 @@ class TeleopControl:
                 return
         except (ValueError, RuntimeError, OSError) as exc:
             with self._lock:
+                reason = str(exc)
                 if self._reset_operation:
-                    self.executor.dispatch('stop', {})
+                    stopped = self.executor.dispatch('stop', {})
                     self._reset_operation = None
-                if self._operator: self._hold(str(exc), grip=True)
-                else: self._state, self._reason = 'hold', str(exc)
+                    reason = stopped.get('reason') or stopped.get('error') or 'reset_interrupted'
+                # A later input gap must not replace an unresolved SDK/reset failure.
+                if (reason in self.INPUT_HOLDS and self._state == 'hold'
+                        and self._reason not in self.INPUT_HOLDS):
+                    return
+                if self._operator: self._hold(reason, grip=True)
+                else: self._state, self._reason = 'hold', reason
             return
         try:
             with self._lock:

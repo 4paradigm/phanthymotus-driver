@@ -90,6 +90,11 @@ def test_reset_sdk_failure_never_claims_completion(tmp_path):
     assert card._state == 'hold' and card._reason == 'release_sdk_error'
     assert not card._enabled and not card._operator
     assert arm._operation['physical_confirmed'] is False
+    feed()
+    advance(400); card.step()
+    feed()
+    assert card._state == 'hold' and card._reason == 'release_sdk_error'
+    assert not card._operator and not card._enabled
 
 
 def test_stop_fences_reset_before_native_action(tmp_path):
@@ -129,3 +134,29 @@ def test_one_stale_frame_cannot_complete_button_hold(tmp_path):
     feed('xa')
     for _ in range(12): advance(100); card.step()
     assert not begun and not sdk
+
+
+@pytest.mark.parametrize('failure', ['input_missing', 'input_stale', 'tracking_lost'])
+def test_uninitialized_input_recovery_restores_confirmation_only(tmp_path, failure):
+    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
+    begun = []
+    card._begin = lambda *args: begun.append(True)
+    if failure != 'input_missing':
+        feed()
+        if failure == 'input_stale': advance(400)
+        else: card._latest['left'].update(tracked=False, position=None, orientation_xyzw=None)
+    card.step()
+    assert card._state == 'hold' and card._reason == failure
+    feed()
+    assert card._state == 'ready' and card._reason == 'waiting_baseline_confirmation'
+    assert not begun and not sdk and not card._enabled and card.mapping.anchor is None
+
+
+def test_reset_interrupted_by_input_gap_stays_failed_after_recovery(tmp_path):
+    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
+    for _ in range(11): feed('yb')
+    advance(400); card.step()
+    assert card._state == 'hold' and card._reason == 'reset_interrupted'
+    feed()
+    assert card._state == 'hold' and card._reason == 'reset_interrupted'
+    assert not sdk and not card._operator and not card._enabled

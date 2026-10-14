@@ -86,6 +86,8 @@ PICO 继续使用既有 `left/right.controls.buttons` 的 `available`、`pressed
 
 Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_input`、`input_stale`、`transport_error` 和 `fresh`。`transport` 提供接收/接受序号、拒绝原因、订阅代次和执行器心跳；MCP 在线不等于 DDS 接收正常。
 
+尚未建立基准时，启动无帧、输入过期或跟踪丢失会暂时进入 hold；新鲜且跟踪有效的输入恢复后，显示 `waiting_baseline_confirmation`，仍需 X+A 明确确认。SDK/复位失败及 `reset_interrupted` 保持原错误；后续输入中断和恢复不能清除这些错误。
+
 订阅创建、读取和销毁由同一专用 ROS 线程执行；设备身份补全不重建同 topic 订阅。IK 子进程故障分别报告 `ik_worker_timeout`、`ik_worker_exited` 或 `ik_worker_unavailable`，原始异常保留在日志中。
 
 空闲且从未接管 SDK 时，重复停止返回 no-op；不创建释放任务，也不声称已验证物理停止。未知的厂商动作结果仍报告未知，不通过重复 stop 清除。Driver 不持久化或自动恢复运动租约。
