@@ -2598,10 +2598,10 @@ class MirrorStreamTests(unittest.TestCase):
 
         mounts = {
             "left": ("L_palm_joint", "left_hand_O10_joint",
-                     "-3.14 0 0.0007964",
+                     "0.0015927 -2.5e-06 0.0007963",
                      (-1, 0, 0), (0, 1, 0)),
             "right": ("R_palm_joint", "right_hand_O10_joint",
-                      "-0.0015927 0 0.0000037",
+                      "3.14 0 0.0000036",
                       (-1, 0, 0), (0, -1, 0)),
         }
         expected_targets = ((0, 0, 1), (1, 0, 0))
@@ -2616,8 +2616,8 @@ class MirrorStreamTests(unittest.TestCase):
             wrist = rotation(wrist_origin.attrib["rpy"])
             total = multiply(wrist, rotation(origin.attrib["rpy"]))
             expected_total = {
-                "left": ((0, 1, 0), (-1, 0, 0), (0, 0, 1)),
-                "right": ((0, 1, 0), (1, 0, 0), (0, 0, -1)),
+                "left": ((0, -1, 0), (-1, 0, 0), (0, 0, -1)),
+                "right": ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
             }[side]
             for row in range(3):
                 for col in range(3):
