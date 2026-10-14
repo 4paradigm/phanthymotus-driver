@@ -16,6 +16,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent
+# Driver images place ``common`` beside the card modules.  Mirror that import
+# layout when this file is run directly from the unitree subdirectory.
+sys.path.insert(0, str(ROOT.parents[1]))
 
 
 def _load(name, path):
@@ -131,6 +134,8 @@ class TestDriverContracts(unittest.TestCase):
         cls.vision = _load("as2w_vision_capture_under_test", ROOT / "vision_capture.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
         cls.mapping = _load("as2w_slam_mapping_under_test", ROOT / "slam_mapping.py")
+        cls.loco_servo = _load(
+            "as2w_loco_servo_under_test", ROOT / "loco_servo.py")
         cls.main = _load("as2w_main_under_test", ROOT / "main.py")
 
     @staticmethod
@@ -1434,6 +1439,258 @@ class TestDriverContracts(unittest.TestCase):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
+
+    def test_loco_state_keeps_vendor_stream_and_adds_standard_odom(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        tool = next(item for item in plugin.get_tools()
+                    if item["name"] == "loco_state")
+        self.assertEqual([
+            {"topic": "/test/loco/state", "format": "data/json"},
+            {"topic": "/test/state/odom", "format": "state/odom"},
+        ], tool["topic_out"])
+        info = plugin.dispatch("info", {"_tool_name": "loco_state"})
+        self.assertEqual(tool["topic_out"], info["topic_out"])
+        self.assertEqual("motus.odom/1", info["odom_interface"]["schema"])
+        self.assertEqual(["vx", "vy", "wz"],
+                         info["odom_interface"]["provides"])
+
+    def test_sport_state_publishes_both_payload_shapes(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        vendor, odom = [], []
+        node.loco = types.SimpleNamespace(
+            publish=lambda message: vendor.append(json.loads(message.data)))
+        node.odom = types.SimpleNamespace(
+            publish=lambda message: odom.append(json.loads(message.data)))
+        node._publish_sport(types.SimpleNamespace(
+            mode=2, gait_type=3, velocity=[0.4, -0.2, 0.0],
+            yaw_speed=0.6, position=[1, 2, 3], body_height=0.25))
+        self.assertEqual(0.4, vendor[0]["velocity_0"])
+        self.assertEqual("motus.odom/1", odom[0]["schema"])
+        self.assertEqual([0.4, -0.2, None, None, None, 0.6],
+                         odom[0]["twist"])
+        self.assertIsNone(odom[0]["pose"])
+
+    def test_loco_servo_descriptor_and_card_contract(self):
+        descriptor = self.loco_servo.build_descriptor()
+        parsed = __import__("common.control", fromlist=["parse_descriptor"])
+        parsed.parse_descriptor(descriptor)
+        self.assertEqual("twist", descriptor["mode"])
+        self.assertEqual([0.0, 0.0, 0.0], [
+            descriptor["limits"]["upper"][2],
+            descriptor["limits"]["upper"][3],
+            descriptor["limits"]["upper"][4],
+        ])
+        plugin = self.loco_servo.LocoServoPlugin(
+            {}, "test", None, _Proxy())
+        tool = plugin.get_tool()
+        self.assertEqual("loco_servo", tool["name"])
+        self.assertEqual("control/velocity", tool["topic_in"][0]["format"])
+        self.assertEqual(["base"], tool["inputSchema"]["x-resource"])
+
+    def test_loco_servo_applies_twist_and_explicit_loco_preempts_it(self):
+        proxy = _Proxy()
+        loco = self.device.LocoPlugin({}, "test", None, proxy)
+        servo = self.loco_servo.LocoServoPlugin(
+            {}, "test", None, proxy, loco_plugin=loco)
+        servo._running = True
+        servo._apply([0.2, -0.1, 0, 0, 0, 0.3])
+        self.assertEqual((0.2, -0.1, 0.3), proxy.moves[-1])
+        result = loco.dispatch(
+            "move", {"vx": 0.1, "vy": 0.0, "vyaw": 0.0})
+        self.assertTrue(result["preempted_loco_servo"])
+        self.assertTrue(servo._paused)
+        self.assertGreaterEqual(proxy.stops, 1)
+
+    def _started_servo(self, proxy=None, loco=None):
+        proxy = proxy or _Proxy()
+        servo = self.loco_servo.LocoServoPlugin(
+            {}, "test", object(), proxy, loco_plugin=loco)
+        with patch.object(servo, "_open"):
+            result = servo.dispatch("start", {"input_topic": "/test/velocity"})
+        self.assertEqual("running", result["state"])
+        return servo, proxy
+
+    def _velocity_message(self, seq=1, **changes):
+        command = {"schema": "motus.control/1", "mode": "twist", "dof": 6,
+                   "values": [0.1, -0.1, 0, 0, 0, 0.2], "source": "navigation",
+                   "seq": seq, "stamp_ms": int(time.time() * 1000), "ttl_ms": 300}
+        command.update(changes)
+        return types.SimpleNamespace(data=json.dumps(command))
+
+    def test_loco_servo_start_is_inert_and_requires_wiring(self):
+        servo = self.loco_servo.LocoServoPlugin({}, "test", object(), _Proxy())
+        servo.start()
+        self.assertFalse(servo._running)
+        self.assertEqual([], servo._proxy.moves)
+        self.assertEqual("error", servo.dispatch("start", {})["state"])
+        with patch.object(servo, "_open", side_effect=RuntimeError("ROS failed")):
+            self.assertEqual("error", servo.dispatch(
+                "start", {"input_topic": "/velocity"})["state"])
+        self.assertIsNone(servo._sink)
+        self.assertFalse(servo._running)
+
+    def test_loco_servo_watchdog_stops_after_stream_silence(self):
+        servo, proxy = self._started_servo()
+        now = [1000]
+        servo._sink._clock = lambda: now[0]
+        servo._on_message(self._velocity_message())
+        self.assertEqual(1, len(proxy.moves))
+        now[0] += 301
+        servo._tick()
+        self.assertEqual(1, proxy.stops)
+        self.assertTrue(servo._sink.holding)
+
+    def test_loco_servo_rejects_expired_and_unsupported_axis_commands(self):
+        for changes in ({"stamp_ms": 1}, {"values": [0, 0, 1, 0, 0, 0]},
+                        {"values": [float("nan"), 0, 0, 0, 0, 0]}, {"dof": 3}):
+            with self.subTest(changes=changes):
+                servo, proxy = self._started_servo()
+                servo._on_message(self._velocity_message(**changes))
+                self.assertEqual([], proxy.moves)
+                self.assertNotEqual("APPLIED", servo._last_command["verdict"])
+
+    def test_loco_servo_pause_and_stop_do_not_interrupt_manual_move(self):
+        proxy = _Proxy()
+        loco = self.device.LocoPlugin({}, "test", None, proxy)
+        servo, _ = self._started_servo(proxy, loco)
+        servo._on_message(self._velocity_message())
+        loco.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        count = len(proxy.moves)
+        stops = proxy.stops
+        servo._on_message(self._velocity_message(seq=2))
+        servo._tick()
+        self.assertEqual("error", servo.dispatch("resume", {})["state"])
+        servo.dispatch("stop", {})
+        self.assertEqual(count, len(proxy.moves))
+        self.assertEqual(stops, proxy.stops)
+        self.assertEqual("error", servo.dispatch(
+            "start", {"input_topic": "/velocity"})["state"])
+
+    def test_loco_servo_refuses_bad_posture_and_stops_on_sdk_failure(self):
+        servo, proxy = self._started_servo()
+        proxy.state = "AI_STAND_DOWN"
+        servo._on_message(self._velocity_message())
+        self.assertEqual([], proxy.moves)
+        self.assertEqual("REFUSED", servo._last_command["verdict"])
+        self.assertEqual(1, proxy.stops)
+        proxy.state = "AI_STAND_UP"
+        servo.dispatch("config", {"require_standing": True})
+        with patch.object(proxy, "Move", side_effect=RuntimeError("RPC failed")):
+            servo._on_message(self._velocity_message(seq=2))
+        self.assertEqual("SDK_ERROR", servo._last_command["verdict"])
+        self.assertEqual(0, servo._applied)
+        self.assertEqual(2, proxy.stops)
+
+    def test_loco_servo_config_dry_run_halts_existing_motion(self):
+        servo, proxy = self._started_servo()
+        servo._on_message(self._velocity_message())
+        servo.dispatch("config", {"dry_run": True})
+        self.assertEqual(1, proxy.stops)
+        servo._on_message(self._velocity_message(seq=2))
+        self.assertEqual(1, len(proxy.moves))
+        servo.dispatch("config", {"dry_run": False, "rotate_only": True})
+        servo._on_message(self._velocity_message(seq=3))
+        self.assertEqual((0.0, 0.0), proxy.moves[-1][:2])
+        self.assertGreater(proxy.moves[-1][2], 0)
+
+    def test_loco_servo_preemption_waits_for_inflight_callback(self):
+        proxy = _Proxy()
+        loco = self.device.LocoPlugin({}, "test", None, proxy)
+        servo, _ = self._started_servo(proxy, loco)
+        entered, release, paused = threading.Event(), threading.Event(), threading.Event()
+        def blocked_move(*args):
+            entered.set()
+            release.wait(2)
+            proxy.moves.append(args)
+            return 0
+        def preempt():
+            servo.pause_for_explicit_command("test")
+            paused.set()
+        with patch.object(proxy, "Move", side_effect=blocked_move):
+            callback = threading.Thread(target=servo._on_message,
+                                        args=(self._velocity_message(),))
+            callback.start()
+            self.assertTrue(entered.wait(1))
+            takeover = threading.Thread(target=preempt)
+            takeover.start()
+            try:
+                self.assertFalse(paused.wait(0.05))
+            finally:
+                release.set()
+                callback.join(2)
+                takeover.join(2)
+        self.assertTrue(paused.is_set())
+        servo._on_message(self._velocity_message(seq=2))
+        self.assertEqual(1, len(proxy.moves))
+        self.assertEqual(1, proxy.stops)
+
+    def test_standard_odom_reports_missing_or_invalid_axes_as_null(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        node.loco = types.SimpleNamespace(publish=lambda message: None)
+        samples = []
+        node.odom = types.SimpleNamespace(
+            publish=lambda message: samples.append(json.loads(message.data)))
+        node._publish_sport(types.SimpleNamespace(velocity=[float("nan")]))
+        self.assertEqual([None] * 6, samples[0]["twist"])
+
+    def test_old_loco_worker_cannot_stop_or_release_new_motion(self):
+        proxy = _Proxy()
+        loco = self.device.LocoPlugin({}, "test", None, proxy)
+        old_event = threading.Event()
+        loco._moving_owner = old_event
+        loco._moving = True
+        loco.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        moves, stops = len(proxy.moves), proxy.stops
+        old_event.set()
+        loco._worker_move(old_event, 1.0, 0, 0)
+        loco._release_move(old_event, stop=True)
+        self.assertTrue(loco.is_moving())
+        self.assertEqual(moves, len(proxy.moves))
+        self.assertEqual(stops, proxy.stops)
+
+    def test_invalid_loco_request_does_not_pause_navigation(self):
+        proxy = _Proxy()
+        loco = self.device.LocoPlugin({}, "test", None, proxy)
+        servo, _ = self._started_servo(proxy, loco)
+        result = loco.dispatch("move", {"vx": float("nan"), "vy": 0, "vyaw": 0})
+        self.assertFalse(result["accepted"])
+        self.assertFalse(servo._paused)
+        self.assertEqual(0, proxy.stops)
+
+    def test_loco_state_start_returns_both_ports_and_interface(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        with patch.object(plugin, "start"):
+            result = plugin.dispatch("start", {"_tool_name": "loco_state"})
+        self.assertEqual(2, len(result["topic_out"]))
+        self.assertEqual("motus.odom/1", result["odom_interface"]["schema"])
+
+    def test_loco_workers_release_ownership_on_completion_and_rpc_failure(self):
+        for timed in (True, False):
+            with self.subTest(timed=timed):
+                proxy = _Proxy()
+                loco = self.device.LocoPlugin({}, "test", None, proxy)
+                event = threading.Event()
+                loco._moving = True
+                loco._moving_owner = event
+                if timed:
+                    loco._transition_stop = event
+                else:
+                    loco._stop = event
+                with patch.object(self.device, "_acp_notify"), \
+                        patch.object(proxy, "Move", return_value=1):
+                    if timed:
+                        loco._run_timed_move("test", 0.1, 0, 0, 0.01, event)
+                    else:
+                        loco._run_continuous_move("test", 0.1, 0, 0, event)
+                self.assertFalse(loco.is_moving())
+                self.assertEqual(1, proxy.stops)
+
+    def test_loco_servo_is_packaged_and_listed(self):
+        self.assertIn("loco_servo.py", (ROOT / "Dockerfile").read_text())
+        self.assertIn("name: loco_servo", (ROOT / "driver.yaml").read_text())
+        self.assertIn("loco_servo:", (ROOT / "config.yaml").read_text())
 
     def test_remote_controller_button_map_and_reserved_bit(self):
         mappings = {

@@ -3,6 +3,15 @@ robot_interface: auto
 ros_namespace: ""
 plugins:
   loco: {enabled: true}
+  # Continuous motus.control/1 twist input used by ActuCore navigation.
+  # Starting the container is inert; the card subscribes only when wired and
+  # started by a canvas project.
+  loco_servo:
+    enabled: true
+    expected_hz: 10
+    dry_run: false
+    rotate_only: false
+    require_standing: true
   special_motion: {enabled: true}
   mic:
     enabled: true

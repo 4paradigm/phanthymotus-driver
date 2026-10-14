@@ -58,7 +58,7 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
     python3 -c "from audio_msgs.msg import AudioChunk" && \
     echo "Runtime audio_msgs overlay size:" && du -sh /as2w_ws/install'
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py multimedia.py vision_capture.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
+COPY main.py device.py loco_servo.py multimedia.py vision_capture.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/

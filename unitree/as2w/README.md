@@ -37,6 +37,30 @@ any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Special motions should only
 be invoked with a clear area and appropriate operator approval.
 
+`loco_state` retains its `data/json` output at `/<namespace>/loco/state`
+and also publishes `state/odom` at `/<namespace>/state/odom` for visual
+navigation. The new JSON stream uses `motus.odom/1`: body-frame twist ordered
+as `[vx, vy, vz, wx, wy, wz]`, with unmeasured axes represented by `null`.
+It reports vx, vy and yaw speed; no pose is declared. `start` and `info`
+return both output ports and the `odom_interface` declaration.
+
+`loco_servo` consumes a wired `control/velocity` topic carrying
+`motus.control/1` twist commands. Bundle startup is inert; canvas `start`
+requires `input_topic` (or `input_topics`). It uses the shared ControlSink for
+contract validation, freshness, source arbitration, speed limits and command
+step limits, and calls the AS2 three-argument `Move(vx, vy, vyaw)` API.
+Unsupported vz/wx/wy axes are pinned to zero. Stream silence triggers
+`StopMove` after 300 ms, checked by a 150 ms timer. Invalid posture or a failed
+Move RPC also stops motion. The card supports `pause`, `resume`, `info` and
+runtime `config` for `dry_run`, `rotate_only` and `require_standing`.
+
+Explicit `loco.move` and `loco.stop_move` pause the policy stream before
+sending their commands. Servo start/resume refuses while loco owns a movement;
+stopping a preempted servo does not stop that manual movement. After stopping
+loco, explicitly resume the policy. AS2 speed deadbands and footprint dimensions
+have not been measured, so the descriptor does not copy R1's hardware values.
+The velocity frame and physical stop behavior still need verification on AS2W.
+
 The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
