@@ -138,7 +138,8 @@ def test_estimator_rejects_bad_inputs_and_off_basis_direction():
     assert estimate_signature(np.zeros(8 * 100, dtype=np.int16), 8, 16000) is None
     assert estimate_signature(np.zeros(8 * 2048 + 1, dtype=np.int16), 8, 16000) is None
     assert estimate_signature(np.zeros(8 * 2048, dtype=np.int16), 4, 16000) is None
-    assert estimate_angle(tuple(a + b for a, b in zip(front, right)), front, right) == 45
+    # 左正（REP-103）：front+right 指向右前 45°，即 -45°（=315）。
+    assert estimate_angle(tuple(a + b for a, b in zip(front, right)), front, right) == 315
     assert estimate_angle((1, 1, 10), front, right) is None
     assert estimate_angle((float("nan"), 1, 0), front, right) is None
     assert estimate_angle(front, (float("inf"), 0, 0), right) is None
@@ -163,10 +164,11 @@ def test_two_known_directions_calibrate_full_circle():
     front = (2.0, -1.0, 0.0)
     right = (0.0, 1.0, -2.0)
 
+    # 左正（REP-103，与 vyaw 同号）：左 +、右 -。
     assert estimate_angle(front, front, right) == 0
-    assert estimate_angle(right, front, right) == 90
+    assert estimate_angle(right, front, right) == 270      # 右侧 = -90°
     assert estimate_angle(tuple(-x for x in front), front, right) == 180
-    assert estimate_angle(tuple(-x for x in right), front, right) == 270
+    assert estimate_angle(tuple(-x for x in right), front, right) == 90   # 左侧 = +90°
 
 
 def test_silence_and_degenerate_calibration_do_not_report_a_direction():

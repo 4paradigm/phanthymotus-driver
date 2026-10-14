@@ -126,7 +126,7 @@ def test_packaged_robot_calibration_starts_without_machine_override(monkeypatch,
     calibration = module.load_calibration()
     assert set(calibration) == {'front', 'right'}
     assert module.estimate_angle(calibration['front'], **calibration) == 0
-    assert module.estimate_angle(calibration['right'], **calibration) == 90
+    assert module.estimate_angle(calibration['right'], **calibration) == 270   # 左正：右侧 -90°
     proc = types.SimpleNamespace(stdout=(b'__BUMI_DIRECTION_READY__\n',),
         poll=lambda: None, terminate=lambda: None, wait=lambda **kwargs: 0)
     monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: proc)

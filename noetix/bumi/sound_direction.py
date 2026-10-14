@@ -85,7 +85,10 @@ def estimate_signature(audio, channels: int, sample_rate: int):
 
 
 def estimate_angle(signature, front, right):
-    """Clockwise degrees from robot front; return None for ambiguous signatures."""
+    """Counter-clockwise degrees from robot front (REP-103: left positive, same sign as vyaw).
+
+    0 = front, 90 = left, 270 (=-90) = right; return None for ambiguous signatures.
+    """
     basis = np.column_stack((front, right)).astype(np.float64)
     measured = np.asarray(signature, dtype=np.float64)
     if basis.shape != (3, 2) or measured.shape != (3,):
@@ -97,4 +100,5 @@ def estimate_angle(signature, front, right):
     weights, *_ = np.linalg.lstsq(basis, measured, rcond=None)
     if np.linalg.norm(basis @ weights - measured) > 0.35 * np.linalg.norm(measured):
         return None
-    return round(math.degrees(math.atan2(weights[1], weights[0]))) % 360
+    # atan2(right, front) 是顺时针角；取反得 REP-103 的逆时针（左正）角。
+    return round(-math.degrees(math.atan2(weights[1], weights[0]))) % 360
