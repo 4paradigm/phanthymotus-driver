@@ -160,6 +160,7 @@ def test_rotate_full_turn_actually_turns(monkeypatch):
     result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
     assert result['state'] == 'done'
     assert 354 <= result['turned_deg'] <= 366
+    assert abs(result['final_error_deg']) <= 2.0         # 整请求仍守 ±2° 容差
     assert 354 <= fake.yaw <= 366                        # 植物 yaw 真的推进了 ≈360，而非 0
 
 
@@ -172,3 +173,4 @@ def test_rotate_large_angle_turns_requested_direction_not_shortcut(monkeypatch):
     assert result['state'] == 'done'
     assert 194 <= result['turned_deg'] <= 206
     assert result['turned_deg'] > 0                      # 正向，绝不 ≈ −160
+    assert abs(result['final_error_deg']) <= 2.0         # 整请求仍守 ±2° 容差

@@ -691,8 +691,14 @@ class LocoPlugin:
         try:
             # 4. 50 Hz closed loop per segment on IMU yaw until settled, timed
             # out, or stopped; each segment settles before the next starts.
+            cumulative_angle = 0.0
             for seg_angle in segments:
-                seg_target = end_yaw + seg_angle  # chained on measured yaw
+                cumulative_angle += seg_angle
+                # Absolute sub-target: segment k aims at start_yaw + cumulative
+                # angle (the final one == the whole-request target), so each
+                # segment corrects prior settle shortfall and final_error_deg
+                # for the whole request stays within ±2°.
+                seg_target = start_yaw + cumulative_angle
                 still = 0
                 while True:
                     imu = self._high_ctrl.get_imu_data()
