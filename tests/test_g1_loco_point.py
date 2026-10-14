@@ -55,7 +55,7 @@ class TestLocoPoint(unittest.TestCase):
             self.assertEqual((stages[1]['vx'], stages[1]['vy'], stages[1]['vyaw']), (0., 0.3, 0.))
             self.assertAlmostEqual(stages[0]['duration'], 2.)
             self.assertAlmostEqual(stages[1]['duration'], 1.)
-            factor = {90: 1.2, 180: 4. / 3.}.get(angle, 1.)
+            factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
             self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor)
             self.assertEqual(stages[2]['vyaw'], -0.5)
 

@@ -9,9 +9,10 @@ class LocoPointPlugin:
     PREFIX = "loco_point"
     TIMEOUT = 300
     MAX_MOTION_SECONDS = 120
-    # Initial estimates from observed 90->75 and 180->135 degree turns.
+    # Refined from compensated turns observed at ~80 and ~175 degrees.
     # Calibrated only at 0.5 rad/s; smaller angles keep theoretical duration.
-    ROTATION_TIME_FACTORS = {90: 90. / 75., 180: 180. / 135.}
+    ROTATION_TIME_FACTORS = {90: (90. / 75.) * (90. / 80.),
+                             180: (180. / 135.) * (180. / 175.)}
 
     def __init__(self, config, loco, notify, prepare=None):
         self.loco = loco
