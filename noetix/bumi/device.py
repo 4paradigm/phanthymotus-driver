@@ -135,6 +135,47 @@ _WORKMODE_NAMES = {
     29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2", 33: "tear",
 }
 
+# ── loco_destination: angle math and rotate control law ──────────────────────
+
+_ROTATE_TOL_DEG = 2.0
+_ROTATE_WZ_STILL_RAD_S = 0.05
+_ROTATE_SETTLE_TICKS = 10
+_ROTATE_KP_PER_DEG = 0.05
+_ROTATE_VYAW_FULL = 0.6
+_ROTATE_VYAW_MID = 0.3
+_ROTATE_VYAW_SLOW = 0.15
+_ROTATE_VYAW_SIGN = 1.0
+_ROTATE_ANGLE_LIMIT_DEG = 360.0
+
+
+def _wrap180(deg: float) -> float:
+    """Normalize an angle in degrees to [-180, 180)."""
+    return ((deg + 180) % 360) - 180
+
+
+def _yaw_deg_from_quat(ori) -> float:
+    """Yaw in degrees from an SDK-order [x, y, z, w] quaternion, in (-180, 180]."""
+    x, y, z, w = ori
+    return math.degrees(math.atan2(2.0 * (w * z + x * y),
+                                   1.0 - 2.0 * (y * y + z * z)))
+
+
+def _rotate_vyaw(err_deg: float) -> float:
+    """Signed vyaw for a heading error: P-term capped by segment speed."""
+    abs_err = abs(err_deg)
+    if abs_err >= 15:
+        cap = _ROTATE_VYAW_FULL
+    elif abs_err >= 5:
+        cap = _ROTATE_VYAW_MID
+    else:
+        cap = _ROTATE_VYAW_SLOW
+    return math.copysign(min(_ROTATE_KP_PER_DEG * abs_err, cap), err_deg)
+
+
+def _rotate_timeout_s(angle_deg: float) -> float:
+    """Rotate timeout in seconds, capped to stay under the 60s LLM budget."""
+    return min(45.0, 8.0 + abs(angle_deg) / 10.0)
+
 
 # ── StatePlugin (sensor, multi-tool) ─────────────────────────────────────────
 
