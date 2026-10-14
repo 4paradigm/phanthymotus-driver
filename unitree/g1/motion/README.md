@@ -18,21 +18,20 @@
 
 ## 构建
 
-G1 专用基础镜像配方位于 `unitree/g1/Dockerfile.base`，与业务镜像配方 `unitree/g1/Dockerfile` 放在同一目录。
+G1 使用 `unitree/g1/Dockerfile`，从 ROS 基础镜像安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。依赖步骤位于源码 COPY 之前，正常构建可复用 Docker 缓存。
 
-业务镜像使用固定版本的 `g1-base`。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
-
-已发布的 base 可直接拉取，日常业务构建无需执行以下基础镜像构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
+在仓库根目录执行本地 ARM64 构建。与现有 build.sh 一样，构建上下文需要包含共享 common 目录：
 
 ```sh
+G1_BUILD_CONTEXT=$(mktemp -d)
+cp -R unitree/g1/. "$G1_BUILD_CONTEXT/"
+cp -R common "$G1_BUILD_CONTEXT/common"
 docker build --platform linux/arm64 \
-  -f unitree/g1/Dockerfile.base \
   --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
-  -t bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:YOUR_NEW_TAG \
-  unitree/g1
+  -t local/g1:dev "$G1_BUILD_CONTEXT"
 ```
 
-当前业务镜像使用 `bj-warehouse.tencentcloudcr.com/phanthy-motus/g1-base:release.261012.4674297@sha256:88b1730d68102f21a20328f1fd87ec5ad3657766c0858db239e84f09dcdbac58`，按已发布的 OCI 索引摘要锁定内容，其中运行镜像为 linux/arm64。重建时将示例中的 `YOUR_NEW_TAG` 换成新版本，发布后更新业务 Dockerfile 中的标签和摘要；不要覆盖已发布版本。自定义 base 使用 `G1_BASE_IMAGE`，`ROS_BASE_IMAGE` 和 `PYPI_MIRROR` 仅用于 base 构建。
+`ROS_BASE_IMAGE` 可指定 ROS 基础镜像，`PYPI_MIRROR` 可指定 Python 包索引。原有 `./build.sh unitree/g1` 入口保持可用，但该脚本会按 `.env` 配置推送镜像。
 
 ## 实现
 
@@ -50,9 +49,9 @@ docker build --platform linux/arm64 \
 | `collision.py`、`workspace.py`、`visualization.py` | 可选空间检查与诊断数据 |
 | `../arm_stream.py` | 控制权、位置下发、保持与停止 |
 
-主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [基础镜像配方](../Dockerfile.base) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [构建说明](#构建)。
+主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [镜像配方](../Dockerfile) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [构建说明](#构建)。
 
-普通 PyPI `pin` wheel 不包含所需 CasADi 绑定。base 通过 `PIN_WHEEL_URL` 直接安装预编译 wheel，适用于 Linux ARM64、Python 3.10 和 glibc 2.35 及以上版本。已有依赖保持不变，pip 使用 `--no-deps`；安装后沿用版本和 CasADi 模型检查。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。
+普通 PyPI `pin` wheel 不包含所需 CasADi 绑定。Dockerfile 通过 `PIN_WHEEL_URL` 直接安装预编译 wheel，适用于 Linux ARM64、Python 3.10 和 glibc 2.35 及以上版本。已有依赖保持不变，pip 使用 `--no-deps`；安装后沿用版本和 CasADi 模型检查。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。
 
 需要重新生成 wheel 时，在已安装相同数值依赖的 Linux ARM64 环境执行：
 
@@ -63,7 +62,7 @@ python3 -m pip wheel --no-cache-dir --no-build-isolation --no-deps --no-binary=p
   --wheel-dir /tmp/pin-wheel pin==4.1.0
 ```
 
-上传 wheel 后，将 `PIN_WHEEL_URL` 设为实际下载地址，再构建 base。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
+上传 wheel 后，将 `PIN_WHEEL_URL` 设为实际下载地址，再构建 G1 镜像。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
 
 七个碰撞网格在构建时下载，构建和运行时均核验 SHA256。网格不进入 Git；许可证与哈希清单位于 `models/collision/`。测试专用的未标定数据位于 `../tests/fixtures/calibration.json`，不随业务镜像安装。
 

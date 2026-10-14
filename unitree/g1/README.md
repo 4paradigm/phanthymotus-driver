@@ -52,7 +52,7 @@ python3 unitree/g1/main.py eth0
 ## 开发与验证入口
 
 - [仓库构建流程](../../CONTRIBUTING.md#building-docker-images)：业务镜像构建与发布入口。
-- [G1 专项说明](motion/README.md)：遥操使用、运行依赖、base 构建、数值实现和隔离验证。
+- [G1 专项说明](motion/README.md)：遥操使用、运行依赖、镜像构建、数值实现和隔离验证。
 - [关节连续控制](servo.py)与[末端连续控制](servo_eef.py)：输入契约、硬件配置和执行限制。
 - [G1 测试目录](tests/)：音频、视觉、状态和遥操测试；[共享测试目录](../../tests/)另含 G1 SDK、连续控制和导航测试。
 
