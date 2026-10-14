@@ -1,42 +1,32 @@
-# PiPER 控制、骨架与实时相机监控
+# PiPER user-intent control and background monitoring
 
-当前本地分支新增第三张「实时相机画面」`piper_camera_live`，自动发布绑定相机的当前彩色画面，
-与旧照片话题隔离。默认关闭，部署配置启用后在顶部「监控」查看；说明及现场记录见
-[CAMERA_LIVE.md](CAMERA_LIVE.md)。此功能尚未推送或更新 PR。
+Place **Arm control** (`arm_control`) on the canvas. Choose a direction to move the end-effector one small step, open/close the gripper, set its opening, or stop the current action. The driver performs necessary mode/motor preparation in supported healthy states. The top Monitor shows the measured PiPER skeleton, English parameters and an enabled live camera without separate skeleton or camera canvas cards.
 
-默认入口 `device.build_plugins` 提供三张主要画布卡。控制与骨架共用同一 CAN 连接和反馈缓存，
-实时相机独立管理采集，不占用机械臂动作锁。
-
-| 卡片 | 用途 |
+| Action | Meaning |
 | --- | --- |
-| 机械臂控制 `arm_control` | 待机/CAN、六轴或夹爪使能/失能、关节正反微动/绝对角度、夹爪开合、停止 |
-| 骨架动作检测 `piper_status` | 自动读取实测六轴并发布骨架；在顶部「监控」显示，无业务按钮或「查看数据流」入口 |
-| 实时相机画面 `piper_camera_live` | 自动采集绑定彩色接口，以 10 FPS 在顶部「监控」显示当前画面 |
+| Move forward / backward | +X / −X in the robot base frame |
+| Move left / right | +Y / −Y in the robot base frame |
+| Raise / Lower | +Z / −Z in the robot base frame |
+| Stop | Cancel the current preparation/action and best-effort hold; retain motor torque |
+| Open gripper / Close gripper | Move to the effective opening limit |
+| Set gripper opening | Opening in mm; SDK/deployment range intersection, normally 0–70 mm; default 20 mm adjusted to the effective range |
+| Exit teaching and hold | Explicitly leave teaching while holding measured joints; requires recognized PiPER 1.x firmware >= 1.8.5, a stationary arm and all six motors already enabled |
 
-后台 `model` 返回 PiPER URDF，不作为画布业务卡。原相机工具 `piper_photo` 保留，可按需添加；
-现场机械臂 1 画布放置三张主要卡。旧十卡源码保留，默认入口不注册。
+Directions are fixed to the robot base, independent of the camera. Each public movement requests **1 mm at 1% SDK speed**, preserving the current end orientation; option titles omit the numeric suffix. Speed percent does not specify a fixed mm/s. Default **Choose an action** executes nothing. Mode, enable/disable, permission, joint adjustment and preview management are internal/historical interfaces, excluded from the current public action list. Old action requests fail explicitly rather than being translated. No home, end rotation, teaching recording, obstacle avoidance or automatic fault reset is provided.
 
-控制卡无需先请求许可：选择动作后点击执行，内部创建一次性预览并重新检查条件，通过后执行。
-模式、电机使能和动作仍分别操作，不自动切模式、使能或回零。反馈、故障、限位、取消/停止检查保留。
-许可只作用于这次动作的工作线程，结束即释放，不全局打开 `motion_enabled`。
-软件检查不检测现场障碍物；操作者点击执行前应核对实际空间。失能仍需填写支撑确认，
-切换 CAN 仍需确认其他控制器已停止。可能移动的使能边界修正不会自动授权。
-微动步长 0.5°/1°/2°，单轴速度 0.5–5°/秒，目标遵守 SDK 与部署限位交集。
-智能控制关闭时也可手动执行；软件示教入口暂不提供，使用机身示教按键。
+Normal ready CAN control executes directly. Healthy standby or all-disabled states use preparation at the measured pose; partial enable, faults, teaching and unknown modes are rejected. Gripper preparation holds measured opening before enabling. One cancellable task owns preparation through completion; busy requests are rejected, not queued. `info` reports preparing/moving/stopping/completed/cancelled/failed and actual results. Accepted/submitted is not completion. Manual Core Start calls while a task is active acknowledge busy/stopping without clearing cancellation, allowing the subsequent Stop request to reach the task.
 
-`arm_control.info` 提供被动快照和最近结果。省略 `execute` 的 MCP 动作调用直接检查并执行；
-显式 `execute=false` 保持只读预览，显式 `execute=true` 仍需一次性 `preview_id` 等旧确认字段。
-权限字段或隐藏参数不是调用者身份鉴权，MCP 仍应仅开放给受信任调用者。
+Movement uses the pinned official SDK's MOVE_L and controller end feedback. Each step target is submitted **once**, followed by feedback polling; it is not resent every 50 ms. Actual joints, end-pose component frames and status must remain fresh within 0.5 s. Completion requires controller arrival plus position error <=0.5 mm and orientation error <=1 degree, stable for 0.5 s; motion deadline 30 s. Rejected targets halt further submissions. Stop/timeout may attempt one measured Cartesian hold only while feedback remains fresh, healthy and controllable. A retained target-limit report blocks new tasks; this driver does not clear it. A small step does not guarantee reachability or physical clearance.
 
-骨架默认 10 Hz、关节角度使用弧度；参数以中文后台发布。反馈超过 0.5 秒停止更新骨架，
-参数持续报告过期和最后有效时间。监控不调用带取消/预览副作用的 `status/read_state`，也不等待动作锁。
-连接初始化使用同一 runtime 的 CAN 接收连接，不发送运动、模式或电机控制指令。
-官方模型固定来源提交并保留许可；模块粗细以固定骨架轮廓表现，夹爪开度第一版仅显示数值。
-不修改 Agent Core。当前 Core 的详情数据流入口模型寻址错误，骨架卡采用资源样式隐藏此入口，
-显示使用顶部「监控」。模型、监控和验收细节见 [MONITOR_INTEGRATION.md](MONITOR_INTEGRATION.md)
-与 [MONITOR_ACCEPTANCE.md](MONITOR_ACCEPTANCE.md)。
+Skeleton and English parameters publish at 10 Hz from a side-effect-free shared snapshot. Stale feedback freezes the skeleton while parameters report the last valid time. `model` is the **Skeleton model** resource returning a plain `{"urdf": "..."}` dictionary. Official URDF provenance/license and the existing contour are retained. No Agent Core changes are required; use the top Monitor for correct device model addressing.
 
-以下保留旧十卡的历史协议说明；当前两卡使用上面的直接执行策略。构建、照片和厂家协议约束仍适用。
+For live images, set `PIPER_CAMERA_ENABLED=1` and `camera.live.enabled: true`. Arm control declares the existing namespaced `/camera/live` JPEG topic. `piper_camera_live` remains a background lifecycle/Info resource; no camera node is needed on the canvas. Acquisition, restart and camera ownership are independent of arm motion. When migrating an existing canvas, remove its live-camera node, refresh Arm control's output topics and resume the camera resource after Core's node-removal Stop. Bind the color camera by serial + USB interface 03 + video index 0. `piper_photo` remains optional; live capture and single-photo capture share camera ownership, so concurrent capture reports busy. See [CAMERA_LIVE.md](CAMERA_LIVE.md).
+
+CAN adapters are not persistently identified by device hardware yet. Recheck after cable reconnection. Two arms emitting the same IDs on a shared bus cannot be separated by this SDK; fresh timestamps alone do not prove a coherent single-device pose. The tested deployment was rebound to the isolated CAN0 slave; the shared CAN1 master/slave bus is not used by this control card. Camera binding remains separate and does not establish which arm physically carries the camera.
+
+[PR_ACCEPTANCE.md](PR_ACCEPTANCE.md) records current verification and remaining physical acceptance. [DIRECTION_JOG.md](DIRECTION_JOG.md) and [TEACHING_EXIT.md](TEACHING_EXIT.md) contain detailed contracts/history. Deployment is limited to arm 1, preserving arm 2, old code, configuration/backups and the original untracked smoke-test.py. Current forward/right trials passed; this is a review candidate with further physical tests pending.
+
+The following sections document retained historical implementations and build/photography tooling; their action contracts do not describe the current production entry point.
 
 ## 历史十卡实现（保留作回归，默认不注册）
 
@@ -173,7 +163,7 @@ Mac USB-CAN 还有主机门禁：启动时 PIPER_MOTION_ENABLED=0 只允许信�
 
 旧五卡片版本 e2c82e2 已保存到备份分支 codex/piper-five-cards-backup-20261012，并有本机
 完整工作文件备份与 Git bundle（包括未提交的 smoke-test.py）。共享 runtime 保留既有
-预览、控制、照片、异步与生命周期逻辑供回归验证；生产 device 只注册十张新卡片。
+预览、控制、照片、异步与生命周期逻辑供回归验证；生产 device 使用本文顶部的用户意图合同，历史十卡只用于回归。
 旧 piper_arm / piper_mode 不作为兼容入口暴露，旧画布需更新。此前已删除的五个动作不恢复。
 
 ```bash
