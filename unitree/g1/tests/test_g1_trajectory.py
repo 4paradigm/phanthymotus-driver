@@ -595,3 +595,25 @@ def test_replay_checks_position_after_waiting_for_frame():
         solver=SimpleNamespace(joint_envelope=check))
     with pytest.raises(ValueError, match='checked_current_position'):
         replay._send_frame({'target_q': target}, 1, 60_000_000)
+
+
+def test_replay_drops_stale_proof_then_sends_fresh_target(tmp_path):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        arm.replay_deadline_ns = arm.clock()+100_000_000
+        frame = {'target_q': list(sample['q']), 'source_sequence': 1, 'mapping_epoch': 1}
+        original = card.motion.solver.joint_envelope
+        def stale(*args):
+            proof = original(*args)
+            proof['lower'] = [x+.1 for x in sample['q']]
+            proof['upper'] = [x+.2 for x in sample['q']]
+            return proof
+        card.motion.solver.joint_envelope = stale
+        count = len(channel.positions)
+        card.trajectory._send_frame(frame, 1, arm.clock())
+        assert len(channel.positions) == count and arm.state != 'hold'
+        card.motion.solver.joint_envelope = original
+        card.trajectory._send_frame(frame, 2, arm.clock())
+        assert len(channel.positions) == count+1 and arm.applied_seq == 2
+    finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)

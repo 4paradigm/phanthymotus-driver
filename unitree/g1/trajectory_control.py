@@ -9,7 +9,7 @@ import threading
 import time
 
 from common.motion.protocol import envelope
-from common.motion.envelope import IDENTITY
+from common.motion.envelope import IDENTITY, MotionEnvelope
 from trajectory import Recorder, list_recordings, read_recording
 
 
@@ -175,7 +175,12 @@ class TrajectoryControl:
         record = {**{k: command[k] for k in IDENTITY}, 'schema': 'motus.motion.envelope/1',
                   **proof, 'measured_ns': state['feedback']['arm_ns']}
         if self.cancel.is_set(): raise ValueError('replay_cancelled')
-        self.arm.write_replay(command, record)
+        with self.arm.lock:
+            checked = MotionEnvelope.from_record(record, dof=10)
+            _, current, _ = self.arm._fresh()
+            # Drop stale numerical work; later frames use current feedback.
+            if not checked.contains(current) or not checked.contains(self.arm.last_q): return
+            self.arm.write_replay(command, record)
 
     def _move_to_start(self, recording):
         first, seq = recording['frames'][0], 0
