@@ -225,7 +225,8 @@ class ArmStreamExecutor:
                 from unitree_sdk2py.core.channel import ChannelSubscriber
                 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
                 self._subscriber = ChannelSubscriber('rt/lowstate', LowState_)
-                self._subscriber.Init(self._on_state,1)
+                # Poll DDS KeepLast(1); a 1 kHz Python callback can lag seconds.
+                self._subscriber.Init()
                 from sport_mode_state import SportModeState_
                 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
                 self._fsm_subscriber = ChannelSubscriber('rt/sportmodestate', SportModeState_)
@@ -240,6 +241,9 @@ class ArmStreamExecutor:
     def _run(self):
         while not self._closed.is_set():
             begin = time.monotonic()
+            if self._subscriber is not None:
+                sample = self._subscriber.Read(0)
+                if sample is not None: self._on_state(sample)
             self.tick()
             self._closed.wait(max(0., .004-(time.monotonic()-begin)))
 
