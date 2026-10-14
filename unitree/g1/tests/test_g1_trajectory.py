@@ -164,7 +164,9 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         # The operator, represented by this plant substitute, restores the start.
         sample['q'] = list(asset['preview'][0]['target_q']); channel.positions.clear()
         sample['q'] = [q+.1 for q in sample['q']]
-        assert card.dispatch('play', {'filename': name})['code'] == 'recording_start_mismatch'
+        offset_preview = card.dispatch('play', {'filename': name})
+        assert offset_preview['start_difference']['ready']
+        assert offset_preview['start_transition']['estimated_seconds'] == pytest.approx(1.)
         sample['q'] = list(asset['preview'][0]['target_q'])
         preview = card.dispatch('play', {'filename': name})
         assert preview['execute'] is False and not arm.session_id
@@ -320,3 +322,101 @@ def test_pause_without_successful_output_does_not_fabricate_frame(tmp_path):
     result = recorder.stop()
     assert result['frames'] == 0 and not result['complete']
     assert result['error'] == 'recording_duration_or_count'
+
+
+@pytest.mark.parametrize('degrees', [3., 5., 20.])
+def test_start_difference_reports_offset_without_position_gate(tmp_path, degrees):
+    import math
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    control = SimpleNamespace(cfg={}, motion=SimpleNamespace(executor=arm), executor=arm)
+    trajectory = TrajectoryControl(control)
+    sample['q'] = [math.radians(degrees)]*10
+    difference = trajectory._difference({'frames': [{'target_q': [0.]*10}]})
+    assert difference['ready']
+    assert difference['joint_delta_rad'] == [math.radians(degrees)]*10
+    assert 'joint_tolerance_rad' not in difference
+    sample['dq'][0] = .03
+    assert not trajectory._difference({'frames': [{'target_q': [0.]*10}]})['ready']
+
+
+def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_path):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    writes = []
+    try:
+        card.dispatch('record_start', {})
+        for seq in (1, 2, 3):
+            arm.accept_control(packet(arm, seq, target=.01*seq)); time.sleep(.06)
+        name = card.dispatch('record_stop', {})['filename']
+        recording = read_recording(card.trajectory.directory, name, arm.limits)
+        card.stop(); channel.positions.clear()
+        sample['q'] = [q+.12 for q in recording['frames'][0]['target_q']]
+        preview = card.dispatch('play', {'filename': name})
+        assert preview['start_difference']['ready'] and not channel.positions
+        assert preview['start_transition'] == {'speed_rad_s': .1, 'estimated_seconds': pytest.approx(1.2)}
+        original = arm.write_replay
+        def write(command, proof):
+            before, stamp = list(arm.last_q), arm.last_emit
+            original(command, proof)
+            writes.append((card.trajectory.last_action['phase'], before, stamp,
+                           list(command['values']), arm.last_emit, command['seq']))
+        arm.write_replay = write
+        result = card.dispatch('play', {'filename': name, 'execute': True, 'preview_id': preview['preview_id'],
+                                       'workspace_clear': True, 'take_control': True})
+        card.trajectory.thread.join(7)
+        outcome = card.dispatch('action_status', {'action_id': result['action_id']})
+        assert outcome['status'] == 'completed', outcome
+        lead = [w for w in writes if w[0] == 'moving_to_start']
+        replay = [w for w in writes if w[0] == 'replaying']
+        assert len(lead) > 1 and lead[-1][3] == recording['frames'][0]['target_q']
+        for _, before, start, after, end, _ in lead:
+            assert max(abs(a-b) for a,b in zip(after, before)) <= .1*(end-start)/1e9+1e-9
+        assert [w[3] for w in replay] == [f['target_q'] for f in recording['frames']]
+        assert [w[5] for w in writes] == list(range(len(writes)))
+        for previous, current, fp, fc in zip(replay, replay[1:], recording['frames'], recording['frames'][1:]):
+            assert (current[4]-previous[4])/1e9 == pytest.approx((fc['t_ns']-fp['t_ns'])/1e9, abs=.02)
+    finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+@pytest.mark.parametrize('failure', ['cancel', 'collision', 'stale_feedback', 'not_following'])
+def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path, failure):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    writes = []
+    try:
+        card.dispatch('record_start', {})
+        for seq in (1, 2):
+            arm.accept_control(packet(arm, seq, target=.01)); time.sleep(.06)
+        name = card.dispatch('record_stop', {})['filename']
+        target = read_recording(card.trajectory.directory, name, arm.limits)['frames'][0]['target_q']
+        card.stop(); channel.positions.clear(); sample['q'] = [q+.12 for q in target]
+        preview = card.dispatch('play', {'filename': name})
+        if failure == 'collision':
+            card.motion.solver.joint_envelope = lambda *a: (_ for _ in ()).throw(ValueError('collision'))
+        original = arm.write_replay
+        def write(command, proof):
+            original(command, proof)
+            writes.append(card.trajectory.last_action['phase'])
+            if failure == 'cancel': card.trajectory.stop()
+            elif failure == 'stale_feedback':
+                snapshot = arm._snapshot_provider()
+                snapshot['arm_ns'] = arm.clock()-1_000_000_000
+                arm._snapshot_provider = lambda: copy.deepcopy(snapshot)
+        arm.write_replay = write
+        if failure == 'not_following':
+            fixed = list(sample['q'])
+            def snapshot():
+                sample['arm_ns'] = arm.clock(); sample['q'] = fixed
+                return copy.deepcopy(sample)
+            arm._snapshot_provider = snapshot
+        result = card.dispatch('play', {'filename': name, 'execute': True, 'preview_id': preview['preview_id'],
+                                       'workspace_clear': True, 'take_control': True})
+        card.trajectory.thread.join(9)
+        outcome = card.dispatch('action_status', {'action_id': result['action_id']})
+        assert outcome['status'] in ('cancelled', 'error'), outcome
+        if failure == 'not_following':
+            assert 'replaying' in writes
+            assert outcome['result']['reason'] == 'replay_final_feedback_unconfirmed'
+        else: assert 'replaying' not in writes
+        if failure == 'collision': assert not writes and outcome['result']['reason'] == 'collision'
+    finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)

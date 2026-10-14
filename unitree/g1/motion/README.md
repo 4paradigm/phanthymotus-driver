@@ -109,7 +109,7 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 | `record_stop` | 无 | 停止录制并等待最多 2 秒落盘；`complete`、`stopping`、`error` 分别说明结果 |
 | `recordings` | 无 | 文件名、大小、完整文件/临时文件；列表不代替 `inspect` 校验 |
 | `inspect` | `filename` | 校验后的 `filename/sha256/binding/joint_names/duration_seconds/frames/preview` |
-| `start_difference` | `filename` | `ready/target_q/current_q/joint_delta_rad/joint_tolerance_rad` |
+| `start_difference` | `filename` | `ready/target_q/current_q/joint_delta_rad` |
 | `play` | `filename`；执行时另传确认参数 | 默认仅预检；确认后返回异步 `action_id` |
 | `action_status` | `action_id` | 最近一次回放的 `running/completed/cancelled/error` 和结果 |
 | `stop` | 无 | 立即请求取消遥操/回放，再等待原执行器交权；失败不报告停止成功 |
@@ -134,7 +134,7 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 {"name":"teleop_control","arguments":{"action":"start_difference","filename":"g1-<id>.jsonl"}}
 ```
 
-用户手动恢复起点与现场物体。起点要求每关节误差不超过 0.02 rad、实测速度不超过 0.02 rad/s；接口不自动移动到起点。`inspect.preview` 最多 181 点，包含 `t/kind/target_q/feedback_q`，单位保持 rad。下游负责转换显示单位，不套用 PiPER 的 12 关节或夹爪字段。
+用户先恢复现场物体并确认运动空间无障碍。起点位置差值仅供显示，不设置位置容差门禁；`start_difference.ready` 只表示当前实测速度不超过0.02 rad/s，申请控制权仍保留原静止检查。确认执行后，Driver 先以每关节不超过0.1 rad/s的参考变化速度移动到录制首帧，再开始原录制时间轴；任意非零差值均通过限速过渡发送首帧，不直接跳到目标。每个过渡目标仍检查反馈、腰腿基准、关节限位和碰撞包围区间。首帧目标下发完成后直接进入原时间轴，不另等实测位置进入容差或自动确认物理到位。`inspect.preview` 最多 181 点，包含 `t/kind/target_q/feedback_q`，单位保持 rad。下游负责转换显示单位，不套用 PiPER 的 12 关节或夹爪字段。
 
 ```json
 {"name":"teleop_control","arguments":{"action":"play","filename":"g1-<id>.jsonl"}}
@@ -142,7 +142,7 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 {"name":"teleop_control","arguments":{"action":"action_status","action_id":"<执行返回值>"}}
 ```
 
-预检返回 `execute=false`、单次 `preview_id`、30 秒有效期、文件摘要、时长和起点差异。执行时重新检查；文件、绑定或控制代次改变后确认失效。成功启动返回 `status=running` 和 `action_id`；仅最后一项回放结果保留在 `info.last_action`，Driver 重启后不恢复动作。失败返回 `state=error/code/error`，例如 `recording_start_mismatch`、`recording_binding_mismatch`、`replay_preview_expired_or_changed`。
+预检返回 `execute=false`、单次 `preview_id`、30 秒有效期、文件摘要、时长、起点差异及 `start_transition`（`speed_rad_s=0.1`、`estimated_seconds`）。预检不执行动作；起点位置不匹配不再直接拒绝预检或执行，而在确认后限速过渡。预计过渡时长为最大关节差值除以0.1，不含模型计算和调度延迟。执行时重新检查；文件、绑定或控制代次改变后确认失效。成功启动返回 `status=running` 和 `action_id`；`action_status` 的 `phase` 先为 `moving_to_start`，首帧目标下发完成后为 `replaying`。仅最后一项回放结果保留在 `info.last_action`，Driver 重启后不恢复动作。失败返回 `state=error/code/error`，例如 `recording_binding_mismatch`、`replay_preview_expired_or_changed`。
 
 回放与遥操互斥。回放按原时间发送已经录制的关节参考，不再施加 120 ms 低通滤波；仍通过同一执行器的控制权、反馈、关节限位、数值包围区间和 1 rad/s 参考变化检查。暂停事件停止输出，恢复事件沿原时间继续。调度落后超过 50 ms、执行心跳超过 100 ms、反馈失效或速度不符时终止，不补发积压目标、不静默降速。回放不需要 PICO 持续跟踪，也不会消费手柄指令。
 

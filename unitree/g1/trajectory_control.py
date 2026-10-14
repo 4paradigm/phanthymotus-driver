@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import secrets
 import threading
@@ -13,6 +14,8 @@ from trajectory import Recorder, list_recordings, read_recording
 
 
 class TrajectoryControl:
+    START_SPEED = .1
+
     def __init__(self, control, notify=None):
         self.control, self.motion, self.arm = control, control.motion, control.executor
         self.directory = Path(control.cfg.get('data_dir', '/opt/phanthy-motus/data/g1'))/'recordings'
@@ -56,7 +59,6 @@ class TrajectoryControl:
         model_baseline = current['locked_joints']
         if set(measured) != set(baseline) or set(model_baseline) != set(baseline) or any(type(v) not in (int, float) for v in baseline.values()):
             raise ValueError('recording_body_baseline_mismatch')
-        import math
         if any(not math.isfinite(baseline[n]) or not math.isfinite(measured[n]) or abs(measured[n]-baseline[n]) > .02
                or abs(model_baseline[n]-baseline[n]) > .02
                for n in baseline): raise ValueError('recording_body_baseline_mismatch')
@@ -113,8 +115,8 @@ class TrajectoryControl:
         target = recording['frames'][0]['target_q']
         _, q, dq = self.arm._fresh()
         delta = [a-b for a,b in zip(q, target)]
-        return {'ready': max(map(abs, delta)) <= .02 and max(map(abs, dq)) <= .02,
-                'target_q': target, 'current_q': q, 'joint_delta_rad': delta, 'joint_tolerance_rad': .02}
+        return {'ready': max(map(abs, dq)) <= .02,
+                'target_q': target, 'current_q': q, 'joint_delta_rad': delta}
 
     def _idle(self):
         if not self.control._closed.is_set() or self.control._operator: raise ValueError('stop_teleop_before_replay')
@@ -134,7 +136,6 @@ class TrajectoryControl:
             self._check_binding(recording)
             if recording['frames'][0]['kind'] != 'target': raise ValueError('recording_initial_target_missing')
             difference = self._difference(recording)
-            if not difference['ready']: raise ValueError('recording_start_mismatch')
             if args.get('execute') is not True:
                 ident = secrets.token_hex(16)
                 self.preview = {'id': ident, 'until': self.control.clock()+30_000_000_000,
@@ -142,7 +143,9 @@ class TrajectoryControl:
                                 'generation': self.control._generation}
                 return {'execute': False, 'preview_id': ident, 'expires_in_seconds': 30,
                         'sha256': recording['sha256'], 'duration_seconds': recording['duration_seconds'],
-                        'start_difference': difference}
+                        'start_difference': difference,
+                        'start_transition': {'speed_rad_s': self.START_SPEED,
+                            'estimated_seconds': max(map(abs, difference['joint_delta_rad']))/self.START_SPEED}}
             preview, self.preview = self.preview, None
             if (not preview or args.get('preview_id') != preview['id'] or
                     self.control.clock() >= preview['until'] or preview['sha256'] != recording['sha256'] or
@@ -154,7 +157,7 @@ class TrajectoryControl:
             with self.control._lock:
                 if generation != self.control._generation: raise ValueError('replay_cancelled')
                 self.cancel.clear()
-                self.last_action = {'action_id': ident, 'status': 'running', 'result': {}}
+                self.last_action = {'action_id': ident, 'status': 'running', 'phase': 'moving_to_start', 'result': {}}
                 self.thread = threading.Thread(target=self._run, args=(ident, recording), name='g1-replay', daemon=True)
                 self.thread.start()
             return {'action_id': ident, 'status': 'running'}
@@ -175,20 +178,48 @@ class TrajectoryControl:
                 return
             self.cancel.wait(min(.02, remaining))
 
+    def _send_frame(self, frame, seq, due):
+        state, q = self.motion._fresh()
+        proof = self.motion.solver.joint_envelope(q, state['commanded_q'], frame['target_q'])
+        self._wait_until(due)
+        now = self.control.clock()
+        command = envelope(self.motion._lease(), seq=seq, source_seq=frame['source_sequence'],
+            mapping_epoch=frame['mapping_epoch'], generated_ns=now, valid_until_ns=now+100_000_000,
+            mode='joint_position', dof=10, values=frame['target_q'], **self.motion.versions)
+        record = {**{k: command[k] for k in IDENTITY}, 'schema': 'motus.motion.envelope/1',
+                  **proof, 'measured_ns': state['feedback']['arm_ns']}
+        if self.cancel.is_set(): raise ValueError('replay_cancelled')
+        self.arm.write_replay(command, record)
+
+    def _move_to_start(self, recording):
+        first, seq = recording['frames'][0], 0
+        target = first['target_q']
+        while self.arm.last_q != target:
+            self._wait_until(self.control.clock()+20_000_000)
+            self._check_binding(recording)
+            # Bound each reference step by elapsed time; never catch up after a delay.
+            dt = max(0., min((self.control.clock()-self.arm.last_emit)/1e9, .05))
+            step = self.START_SPEED*dt
+            values = [t if abs(t-p) <= step else p+math.copysign(step, t-p)
+                      for p,t in zip(self.arm.last_q, target)]
+            self._send_frame(dict(first, target_q=values), seq, self.control.clock())
+            seq += 1
+        return seq
+
     def _run(self, ident, recording):
         status, result = 'error', {}
         try:
             if self.cancel.is_set(): raise ValueError('replay_cancelled')
             self._check_binding(recording)
-            if not self._difference(recording)['ready']: raise ValueError('recording_start_mismatch')
             prepared = self.motion.dispatch('prepare_operator_session', {})
             if prepared.get('error'): raise ValueError(prepared['error'])
             if self.cancel.is_set(): raise ValueError('replay_cancelled')
             claimed = self.motion.dispatch('claim', {})
             if claimed.get('error'): raise ValueError(claimed['error'])
+            next_seq = self._move_to_start(recording)
+            self.last_action['phase'] = 'replaying'
             start = self.control.clock()+50_000_000
-            lease = self.motion._lease()
-            for seq, frame in enumerate(recording['frames']):
+            for seq, frame in enumerate(recording['frames'], start=next_seq):
                 self._check_binding(recording)
                 due = start+frame['t_ns']
                 self._wait_until(max(start, due-60_000_000))
@@ -197,20 +228,9 @@ class TrajectoryControl:
                     self.arm.hold('replay_pause')
                     continue
                 if self.arm.state == 'hold':
-                    resumed = self.motion.dispatch('resume', lease)
+                    resumed = self.motion.dispatch('resume', self.motion._lease())
                     if resumed.get('error'): raise ValueError(resumed['error'])
-                    lease = self.motion._lease()
-                state, q = self.motion._fresh()
-                proof = self.motion.solver.joint_envelope(q, state['commanded_q'], frame['target_q'])
-                self._wait_until(due)
-                now = self.control.clock()
-                command = envelope(lease, seq=seq, source_seq=frame['source_sequence'], mapping_epoch=frame['mapping_epoch'],
-                    generated_ns=now, valid_until_ns=now+100_000_000, mode='joint_position', dof=10,
-                    values=frame['target_q'], **self.motion.versions)
-                record = {**{k: command[k] for k in IDENTITY}, 'schema': 'motus.motion.envelope/1',
-                          **proof, 'measured_ns': state['feedback']['arm_ns']}
-                if self.cancel.is_set(): raise ValueError('replay_cancelled')
-                self.arm.write_replay(command, record)
+                self._send_frame(frame, seq, due)
             self._wait_until(start+recording['duration_ns'])
             # Observe a fresh final sample; time elapsed alone is not completion.
             end = self.control.clock()+2_000_000_000
