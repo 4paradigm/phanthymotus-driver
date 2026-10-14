@@ -358,8 +358,7 @@ class TeleopControl:
         with self.motion._lock:
             self.motion._preview = None
             self.motion._preview_state = 'idle'
-        if self.trajectory.recorder and self.trajectory.recorder.thread.is_alive():
-            self.trajectory.recorder.fail('operator_reset')
+        self.trajectory.record_stop()
         self.executor.cancel_preparation()
         result = self.executor.dispatch('operator_reset', {})
         if result.get('error'): raise ValueError(result['error'])
@@ -567,8 +566,7 @@ class TeleopControl:
 
     def cancel_for_arm_release(self):
         self.trajectory.stop()
-        if self.trajectory.recorder and self.trajectory.recorder.thread.is_alive():
-            self.trajectory.recorder.fail('arm_release')
+        self.trajectory.record_stop()
         # The existing arm.release is an explicit operator cancellation, not a
         # global controller arbiter. Stop accepting teleop before SDK handback.
         with self._lock:
@@ -594,7 +592,7 @@ class TeleopControl:
         try:
             result = self._stop_motion()
         finally:
-            self.trajectory.record_stop('teleop_stopped')
+            self.trajectory.record_stop()
         worker = self._thread
         if worker and worker is not threading.current_thread(): worker.join(.5)
         return result

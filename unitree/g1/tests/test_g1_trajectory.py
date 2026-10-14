@@ -611,3 +611,29 @@ def test_recording_keeps_successful_targets_despite_record_timestamp_jitter(tmp_
     assert [f['target_q'] for f in frames] == [q for q, _ in channel.positions]
     elapsed = (frames[1]['t_ns']-frames[0]['t_ns'])/1e9
     assert max(abs(a-b) for a,b in zip(frames[1]['target_q'], frames[0]['target_q'])) > elapsed
+
+
+@pytest.mark.parametrize('ending', ['reset', 'stop', 'release'])
+def test_operator_end_preserves_recording_and_later_record_stop(tmp_path, ending):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        assert card.dispatch('record_start', {})['recording']
+        for seq in (1, 2):
+            arm.accept_control(packet(arm, seq, target=.01)); time.sleep(.06)
+        recorder = card.trajectory.recorder
+        if ending == 'reset':
+            card._start_reset()
+        elif ending == 'release':
+            card.cancel_for_arm_release()
+        else:
+            card.stop()
+        result = card.dispatch('record_stop', {})
+        assert result['complete'] and result['error'] is None, result
+        assert result == recorder.status()
+        assert arm.record_sink is None
+        frames = read_recording(recorder.directory, result['filename'], arm.limits)['frames']
+        assert len([f for f in frames if f['kind'] == 'target']) == 2
+        assert card.dispatch('record_stop', {}) == result
+    finally:
+        done.set(); ticker.join(1)
+        if card.trajectory.recorder: card.trajectory.recorder.stop()

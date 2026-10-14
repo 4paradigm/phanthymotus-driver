@@ -74,13 +74,12 @@ class TrajectoryControl:
                 self.arm.record_sink = recorder
             return recorder.status()
 
-    def record_stop(self, reason=None):
+    def record_stop(self):
         # Stop must not wait for play's file validation / model preparation lock.
         recorder = self.recorder
         if not recorder: return {'recording': False, 'complete': False, 'reason': 'no_recording'}
         with self.arm.lock:
             if self.arm.record_sink is recorder: self.arm.record_sink = None
-        if reason and recorder.thread.is_alive(): recorder.fail(reason)
         return recorder.stop()
 
     def inspect(self, filename):
