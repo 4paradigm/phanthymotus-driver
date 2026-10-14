@@ -671,43 +671,60 @@ class LocoPlugin:
         start_yaw = _yaw_deg_from_quat(self._high_ctrl.get_imu_data().ori)
         target = start_yaw + angle_deg  # not taken modulo: preserves whole-turn count
         start_time = time.monotonic()
+        # Timeout budget covers the whole request, every segment included.
         deadline = start_time + _rotate_timeout_s(angle_deg)
         prev_yaw = start_yaw
         turned_deg = 0.0
-        still = 0
         end_yaw = start_yaw
         result_state = "timeout"
+        # Angle-as-motion: |angle| > 150 is split into chained ≤150° sub-rotations
+        # so the wrapped error can never shortcut the requested direction
+        # (a single ±360 request would otherwise wrap to err=0 and never move).
+        segments = []
+        remaining = angle_deg
+        while abs(remaining) > 150.0:
+            step = math.copysign(150.0, remaining)
+            segments.append(step)
+            remaining -= step
+        if abs(remaining) > 1e-9:
+            segments.append(remaining)
         try:
-            # 4. 50 Hz closed loop on IMU yaw until settled, timed out, or stopped.
-            while True:
-                imu = self._high_ctrl.get_imu_data()
-                cur_yaw = _yaw_deg_from_quat(imu.ori)
-                turned_deg += _wrap180(cur_yaw - prev_yaw)
-                prev_yaw = cur_yaw
-                end_yaw = cur_yaw
-                err = _wrap180(target - cur_yaw)
-                wz = float(imu.angular_vel[2])
-                if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
-                    still += 1
-                else:
-                    still = 0
-                if still >= _ROTATE_SETTLE_TICKS:
-                    result_state = "done"
-                    break
-                if time.monotonic() >= deadline:
-                    result_state = "timeout"
-                    break
-                if self._move_stop_event.is_set():
-                    result_state = "stopped"
-                    break
-                if abs(err) <= _ROTATE_TOL_DEG:
-                    # Angle reached but not yet confirmed still: coast with zero cmd.
-                    self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
-                else:
-                    self._publish_cmd(0.0, 0.0,
-                                      _ROTATE_VYAW_SIGN * _rotate_vyaw(err),
-                                      default_cmd, 0)
-                time.sleep(0.02)  # 50 Hz
+            # 4. 50 Hz closed loop per segment on IMU yaw until settled, timed
+            # out, or stopped; each segment settles before the next starts.
+            for seg_angle in segments:
+                seg_target = end_yaw + seg_angle  # chained on measured yaw
+                still = 0
+                while True:
+                    imu = self._high_ctrl.get_imu_data()
+                    cur_yaw = _yaw_deg_from_quat(imu.ori)
+                    turned_deg += _wrap180(cur_yaw - prev_yaw)
+                    prev_yaw = cur_yaw
+                    end_yaw = cur_yaw
+                    err = _wrap180(seg_target - cur_yaw)
+                    wz = float(imu.angular_vel[2])
+                    if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
+                        still += 1
+                    else:
+                        still = 0
+                    if still >= _ROTATE_SETTLE_TICKS:
+                        result_state = "done"
+                        break
+                    if time.monotonic() >= deadline:
+                        result_state = "timeout"
+                        break
+                    if self._move_stop_event.is_set():
+                        result_state = "stopped"
+                        break
+                    if abs(err) <= _ROTATE_TOL_DEG:
+                        # Angle reached but not yet confirmed still: coast with zero cmd.
+                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                    else:
+                        self._publish_cmd(0.0, 0.0,
+                                          _ROTATE_VYAW_SIGN * _rotate_vyaw(err),
+                                          default_cmd, 0)
+                    time.sleep(0.02)  # 50 Hz
+                if result_state != "done":
+                    break  # timeout/stopped abort the remaining segments
         finally:
             # Every exit path — including exceptions — brakes to zero velocity.
             self._publish_cmd(0, 0, 0, default_cmd, 0)

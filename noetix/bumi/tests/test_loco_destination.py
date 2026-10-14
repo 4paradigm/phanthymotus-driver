@@ -150,3 +150,25 @@ def test_rotate_takes_shortest_path_across_yaw_wrap(monkeypatch):
     result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 20})
     assert result['state'] == 'done' and abs(result['final_error_deg']) <= 2.0
     assert result['turned_deg'] > 0                      # 逆时针 +20，而非 -340
+
+
+def test_rotate_full_turn_actually_turns(monkeypatch):
+    # 整圈：360° 拆成 ≤150° 子段链式执行，实际转过 ≈360（而非 wrap 到 0 不动）
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    assert result['state'] == 'done'
+    assert 354 <= result['turned_deg'] <= 366
+    assert 354 <= fake.yaw <= 366                        # 植物 yaw 真的推进了 ≈360，而非 0
+
+
+def test_rotate_large_angle_turns_requested_direction_not_shortcut(monkeypatch):
+    # +200 必须向请求方向转过 ≈200（两段 150+50），而非 wrap 最短路转 -160
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 200})
+    assert result['state'] == 'done'
+    assert 194 <= result['turned_deg'] <= 206
+    assert result['turned_deg'] > 0                      # 正向，绝不 ≈ −160
