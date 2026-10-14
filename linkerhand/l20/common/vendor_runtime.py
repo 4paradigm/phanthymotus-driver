@@ -220,28 +220,6 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
         def do_GET(self):
             if self.path == "/health":
                 self.send_json(200, {"state": "running", "driver": driver_id})
-            elif self.path == "/mcp/sse":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                try:
-                    self.wfile.write(b"event: endpoint\ndata: /mcp\n\n")
-                    self.wfile.flush()
-                    bundle = bundle_getter()
-                    tools = bundle.get_all_tools()
-                    payload = json.dumps({"tools": tools}, ensure_ascii=False)
-                    self.wfile.write(f"event: message\ndata: {payload}\n\n".encode())
-                    self.wfile.flush()
-                    import time as _t
-                    while True:
-                        _t.sleep(30)
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
-                except Exception:
-                    pass
             else:
                 self.send_json(404, {"error": "not found"})
 
