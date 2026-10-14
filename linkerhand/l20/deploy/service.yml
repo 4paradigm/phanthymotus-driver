@@ -2,6 +2,7 @@ linkerhand-l20:
   image: bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/linkerhand/l20:latest
   container_name: embodied-linkerhand-l20
   privileged: true
+  network_mode: host
   volumes:
     - /dev:/dev
     - /run/udev:/run/udev:ro
