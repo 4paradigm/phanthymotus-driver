@@ -72,6 +72,7 @@ class FakeNode:
         self.context = context
         self.publishers = {}
         self.subscriptions = []
+        self.timers = []
 
     def create_publisher(self, msg_type, topic, qos):
         pub = FakePublisher(msg_type, topic, qos)
@@ -81,6 +82,11 @@ class FakeNode:
     def create_subscription(self, msg_type, topic, callback, qos, callback_group=None):
         self.subscriptions.append((topic, callback))
         return object()
+
+    def create_timer(self, period, callback):
+        timer = types.SimpleNamespace(period=period, callback=callback)
+        self.timers.append(timer)
+        return timer
 
     def get_clock(self):
         return FakeMsg()  # .now().to_msg() auto-vivifies
@@ -305,6 +311,12 @@ def run_concurrently(fn_a, fn_b):
 # ---------------------------------------------------------------------------
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_relay_start_failure_is_fatal_when_cameras_use_host_relay(self):
+        dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("if ! /work/agibot/A3/jazzy_relay.sh start; then", dockerfile)
+        self.assertIn("[fatal] host Jazzy relay is required for A3 cameras", dockerfile)
+        self.assertIn("exit 1; fi; trap '/work/agibot/A3/jazzy_relay.sh stop || true' EXIT", dockerfile)
+
     def test_driver_bundle_accepts_named_plugin_mapping(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = {"joints": {"enabled": True}}
@@ -2446,6 +2458,12 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertEqual(payload["name"], ["left_shoulder_pitch_joint"])
         self.assertEqual(self.nodes.snapshot("arm_state")["position"], [0.1])
 
+    def test_battery_and_estop_cached_state_republish_is_limited_to_1hz(self):
+        timers = self.nodes.robot.timers
+        slow_state_timer = next(timer for timer in timers
+                                if timer.callback == self.nodes._republish_slow_states)
+        self.assertEqual(slow_state_timer.period, 1.0)
+
     def test_imu_snapshots_merge(self):
         for topic, key in (("/ros2/body_drive/pelvis_imu/data", "imu_pelvis"),
                            ("/ros2/body_drive/torso_imu/data", "imu_torso")):
@@ -2518,7 +2536,7 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertNotIn("left_hand_channel_", urdf)
         self.assertIn('mimic joint="L_thumb_mcp_joint" multiplier="1.33"', urdf)
 
-    def test_o10_hand_mount_aligns_fingers_with_a3_wrist_forward_axis(self):
+    def test_o10_hand_mount_keeps_palms_up_and_preserves_mirrored_wrist_mounts(self):
         hand_root = ET.parse(device.RESOURCE_DIR / "a3_o10_hand.urdf").getroot()
         a3_root = ET.parse(device.RESOURCE_DIR / "a3_ultra.urdf").getroot()
 
@@ -2543,17 +2561,16 @@ class MirrorStreamTests(unittest.TestCase):
         }
         for side, (name, wrist_joint) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
-            expected = {
-                "L_palm_joint": "0 1.5707963 -1.5707963",
-                "R_palm_joint": "0 1.5707963 1.5707963",
-            }[name]
-            self.assertEqual(origin.attrib["rpy"], expected)
+            self.assertEqual(origin.attrib["rpy"], "0 1.5707963 0")
             wrist_origin = a3_root.find(f"joint[@name='{wrist_joint}']/origin")
             total = multiply(rotation(wrist_origin.attrib["rpy"]),
                              rotation(origin.attrib["rpy"]))
-            # O10 palm normal is +X and fingers extend along +Z.
-            for axis, target in (((1, 0, 0), (0, 0, 1)),
-                                 ((0, 0, 1), (1, 0, 0))):
+            # Official OmniHand palm normal is +X. A3's mirrored wrist mounts
+            # keep that normal upright while retaining their opposite lateral
+            # finger directions; the hand root must not add another yaw.
+            targets = (((1, 0, 0), (0, 0, 1)),
+                       ((0, 0, 1), (0, -1, 0) if side == "left" else (0, 1, 0)))
+            for axis, target in targets:
                 mapped = [sum(total[row][col] * axis[col] for col in range(3))
                           for row in range(3)]
                 for actual, expected_component in zip(mapped, target):
