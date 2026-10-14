@@ -1,6 +1,6 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
-FROM ${ROS_BASE_IMAGE} AS numeric-deps
+FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
 WORKDIR /work
@@ -27,20 +27,9 @@ RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} \
     cmeel==0.61.0 cmeel-boost==1.90.0 cmeel-urdfdom==6.0.0 \
     cmeel-eigen==3.4.1 cmeel-urdfdom-headers==3.0.0 jrl-cmakemodules==2.1.0
 
-# PyPI's pin wheel omits CasADi bindings; build them with the system Python.
-FROM numeric-deps AS pin-builder
-ARG PYPI_MIRROR
-RUN CMEEL_JOBS=1 CMEEL_RUN_TESTS=OFF \
-    CMEEL_CMAKE_ARGS="-DBUILD_WITH_CASADI_SUPPORT=ON -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -Dcasadi_DIR=/usr/local/lib/python3.10/dist-packages/casadi/cmake" \
-    python3 -m pip install --no-cache-dir --no-build-isolation --no-deps --no-binary=pin \
-    -i ${PYPI_MIRROR} pin==4.1.0
-
-# Keep cmeel's temporary build tree out of the runtime image.
-FROM numeric-deps
-ARG PYPI_MIRROR
-COPY --from=pin-builder /usr/local/lib/python3.10/dist-packages/cmeel.prefix/lib/python3.10/site-packages/pinocchio/ /usr/local/lib/python3.10/dist-packages/cmeel.prefix/lib/python3.10/site-packages/pinocchio/
-COPY --from=pin-builder /usr/local/lib/python3.10/dist-packages/cmeel.prefix/share/pinocchio/hook/ /usr/local/lib/python3.10/dist-packages/cmeel.prefix/share/pinocchio/hook/
-COPY --from=pin-builder /usr/local/lib/python3.10/dist-packages/pin-4.1.0.dist-info/ /usr/local/lib/python3.10/dist-packages/pin-4.1.0.dist-info/
+# PyPI's pin wheel omits CasADi bindings; use the prebuilt ARM64 wheel.
+ARG PIN_WHEEL_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/pinocchio/pin-4.1.0-0-cp310-cp310-manylinux_2_35_aarch64.whl
+RUN python3 -m pip install --no-cache-dir --no-deps "${PIN_WHEEL_URL}"
 
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz

@@ -22,7 +22,7 @@ G1 专用基础镜像配方位于 `unitree/g1/Dockerfile.base`，与业务镜像
 
 业务镜像使用固定版本的 `g1-base`。base 包含系统库、数值库、带 CasADi 绑定的 Pinocchio 和 CycloneDDS。只改 Python、配置或模型时，运行原有 `./build.sh unitree/g1`，无需再次编译依赖。该脚本会按 `.env` 配置推送业务镜像。
 
-已发布的 base 可直接拉取，日常业务构建无需执行以下源码构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
+已发布的 base 可直接拉取，日常业务构建无需执行以下基础镜像构建。仅在修改依赖版本或编译配置时，在仓库根目录用本机 Linux ARM64 Docker 重建 base，并使用新的发布标签：
 
 ```sh
 docker build --platform linux/arm64 \
@@ -52,7 +52,18 @@ docker build --platform linux/arm64 \
 
 主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [基础镜像配方](../Dockerfile.base) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [构建说明](#构建)。
 
-普通 `pin` wheel 不包含所需 CasADi 绑定。base 从源码启用 `BUILD_WITH_CASADI_SUPPORT`，运行阶段只复制安装产物。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
+普通 PyPI `pin` wheel 不包含所需 CasADi 绑定。base 通过 `PIN_WHEEL_URL` 直接安装预编译 wheel，适用于 Linux ARM64、Python 3.10 和 glibc 2.35 及以上版本。已有依赖保持不变，pip 使用 `--no-deps`；安装后沿用版本和 CasADi 模型检查。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。
+
+需要重新生成 wheel 时，在已安装相同数值依赖的 Linux ARM64 环境执行：
+
+```sh
+CMEEL_JOBS=1 CMEEL_RUN_TESTS=OFF \
+CMEEL_CMAKE_ARGS="-DBUILD_WITH_CASADI_SUPPORT=ON -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -Dcasadi_DIR=/usr/local/lib/python3.10/dist-packages/casadi/cmake" \
+python3 -m pip wheel --no-cache-dir --no-build-isolation --no-deps --no-binary=pin \
+  --wheel-dir /tmp/pin-wheel pin==4.1.0
+```
+
+上传 wheel 后，将 `PIN_WHEEL_URL` 设为实际下载地址，再构建 base。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
 
 七个碰撞网格在构建时下载，构建和运行时均核验 SHA256。网格不进入 Git；许可证与哈希清单位于 `models/collision/`。测试专用的未标定数据位于 `../tests/fixtures/calibration.json`，不随业务镜像安装。
 
@@ -130,6 +141,6 @@ docker run --rm --network none --read-only --tmpfs /tmp \
 
 碰撞网格来自 Unitree `xr_teleoperate` 提交 `817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b` 的 `assets/g1/meshes`。`models/collision/sha256.json` 与 LICENSE 保留；构建需固定源下载并核验全部哈希，运行时不下载。网格缺失时明确拒绝初始化，不跳过几何验证。
 
-依赖要求带 CasADi 支持的 Pinocchio 4.1.0、CasADi 3.8.1、NumPy 2.2.6 和 SciPy 1.15.3。Dockerfile 使用系统 Python 从源码构建 Pinocchio 的 CasADi 绑定；普通 PyPI pin wheel 不提供该绑定，不能据其安装成功声称数值通过。目标 Linux ARM64 构建与真实求解需分别验证。
+依赖要求带 CasADi 支持的 Pinocchio 4.1.0、CasADi 3.8.1、NumPy 2.2.6 和 SciPy 1.15.3。Dockerfile 使用系统 Python 安装带 CasADi 绑定的预编译 Pinocchio wheel；普通 PyPI pin wheel 不提供该绑定，不能据其安装成功声称数值通过。目标 Linux ARM64 构建与真实求解需分别验证。
 
 `fetch_assets.py` 选择性迁移主仓 `deploy/fetch_g1_collision.py`，只调整默认目录和宿主说明；构建通过此入口固定下载，未在数值控制循环引入网络。
