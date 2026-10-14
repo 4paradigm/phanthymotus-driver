@@ -256,7 +256,7 @@ class TeleopControl:
             recalibrate = action == 'calibrate' or self._needs_calibration
             if recalibrate:self._operator = None
         if recalibrate:
-            self._stop_motion()
+            self._stop_motion(operator_confirmation=True)
             self._check_generation(generation)
         if (self.cfg.get('calibration_path')
                 and self.executor.cfg.get('calibration_path') != self.cfg['calibration_path']):
@@ -285,8 +285,7 @@ class TeleopControl:
                     raise ValueError('operation_input_generation_changed')
                 if not self._pressed(frame, 'x', 'a') or any(frame[s]['grip'] >= .5 for s in ('left', 'right')):
                     raise ValueError('baseline_confirmation_released')
-                _, _, dq = self.executor._fresh()
-                if max(map(abs, dq)) > .02: raise ValueError('robot_not_stopped')
+                self.executor._fresh()
                 snap = copy.deepcopy(self.motion._snapshot)
                 if not snap or not 0 <= self.clock()-snap['monotonic_ns'] <= 100_000_000:
                     raise ValueError('arm_feedback_stale')
@@ -365,7 +364,7 @@ class TeleopControl:
         if self.trajectory.recorder and self.trajectory.recorder.thread.is_alive():
             self.trajectory.recorder.fail('operator_reset')
         self.executor.cancel_preparation()
-        result = self.executor.dispatch('release', {'operation_id': secrets.token_hex(16)})
+        result = self.executor.dispatch('operator_reset', {})
         if result.get('error'): raise ValueError(result['error'])
         self._reset_operation = result['operation_id']
         self._state, self._reason = 'hold', 'resetting'
@@ -376,8 +375,8 @@ class TeleopControl:
             self._reset_operation = None
             raise ValueError(result.get('reason') or result.get('error') or 'reset_failed')
         if result['state'] == 'completed':
-            if not result.get('physical_confirmed') or not result.get('authority_released'):
-                raise ValueError('reset_feedback_unconfirmed')
+            if not result.get('request_sent') or not result.get('authority_released'):
+                raise ValueError('reset_request_unconfirmed')
             self._reset_operation = None
             stamp = self._latest['received_monotonic_ns']
             self._buttons['confirm'] = (stamp, stamp, True)
@@ -394,9 +393,6 @@ class TeleopControl:
                 if self._input_changed:
                     self._input_changed = False
                     if self._operator: self._hold('input_generation_changed', grip=True)
-                if self._reset_operation:
-                    self._poll_reset()
-                    return
                 released = all(frame[s]['grip'] < .5 for s in ('left', 'right'))
                 reset = self._pressed(frame, 'y', 'b')
                 confirm = self._pressed(frame, 'x', 'a')
@@ -405,7 +401,10 @@ class TeleopControl:
                 if reset_event:
                     self._start_reset()
                     return
-                initialize = not self._operator or self._needs_calibration
+                if self._reset_operation and not confirm_event:
+                    self._poll_reset()
+                    return
+                initialize = confirm_event or not self._operator or self._needs_calibration
                 if initialize and not confirm_event:
                     if self._state != 'hold' or self._reason in self.INPUT_HOLDS:
                         self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
@@ -417,7 +416,7 @@ class TeleopControl:
                     self._state, self._reason = 'ready', 'release_buttons_then_regrip'
                     return
             if initialize:
-                self._begin(generation, 'calibrate' if self._needs_calibration else 'begin')
+                self._begin(generation, 'calibrate' if confirm_event or self._needs_calibration else 'begin')
                 return
         except (ValueError, RuntimeError, OSError) as exc:
             with self._lock:
@@ -541,7 +540,7 @@ class TeleopControl:
                 with self._lock: self._state, self._reason = 'fault', str(exc)
             self._closed.wait(.005)
 
-    def _stop_motion(self):
+    def _stop_motion(self, *, operator_confirmation=False):
         self.motion.cancel_pending()
         with self.motion._lock:
             self.motion._preview = None
@@ -553,15 +552,18 @@ class TeleopControl:
         if not state['ownership_held'] and not self.executor.opening and not self._reset_operation:
             result = {'state': 'idle', 'authority_released': True, 'return_required': False}
         else:
-            result = self.executor.dispatch('stop', {})
+            confirmed = operator_confirmation and self.executor.confirm_operator_reset()
+            result = {} if confirmed else self.executor.dispatch('stop', {})
             if result.get('error'): raise ValueError(result.get('code', result['error']))
-            deadline = time.monotonic()+4.
+            deadline = time.monotonic()+(12. if confirmed else 4.)
             while self.executor.status()['ownership_held'] and time.monotonic() < deadline:
+                if confirmed:self.executor.confirm_operator_reset()
                 time.sleep(.02)
             state = self.executor.status()
             if state['ownership_held']: raise ValueError(state['reason'] or 'stop_unconfirmed')
             result = {'state': 'idle', 'authority_released': True, 'return_required': False}
         with self._lock:
+            self._reset_operation = None
             self._state, self._reason = 'idle', None
             self._paused = False
         return result

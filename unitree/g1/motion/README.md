@@ -11,20 +11,24 @@
 3. 启动项目。确认机器人和操作者的双臂自然下垂，松开双握把，长按左 X + 右 A 一秒。保持按钮直到基准建立；模型首次准备可能需要数秒。Driver 只在这次明确确认后采集实际姿态建立映射，不在首帧自动标定。
 4. 松开按钮，再按下双握把接通。握把按下时的新目标必须通过 IK、输入时效和执行门禁。末端对齐误差仅供显示，不再作为接通条件。
 5. 松开任一握把暂停输出并继续预览。再次接通需新一次双握；沿用原映射基准。输入中断或 IK 失败后不自动恢复；设备连接或跟踪空间改变后需再次确认双方下垂姿态并长按 X+A。
-6. 需要复位时，松开双握把，长按左 Y + 右 B 一秒。每次按住只触发一次。Driver 取消旧映射和待发目标，复用既有 `arm.release` 执行器路径：交还 SDK 后调用 `ExecuteAction(99)`。厂商控制复位轨迹和速度；Driver 不另设关节目标或保存任意姿态作为复位点。
-7. 原厂指令成功且后续实测静止后，Driver 等待再次确认。现场确认机器人与操作者双臂下垂，再长按 X+A 建立新映射，松键并重新双握。Reset 完成不自动接通。
+6. 需要复位时，松开双握把，长按左 Y + 右 B 一秒。每次按住只触发一次。Driver 取消旧映射和待发目标，复用执行器的权重交还路径：完成五次零权重写入后，通过 SDK 的 no-reply RPC 发送动作99。厂商控制复位轨迹和速度；Driver 不另设关节目标或保存任意姿态作为复位点。
+7. 请求写入 DDS 成功后，Driver 立即显示 `waiting_baseline_confirmation`。操作员现场判断复位结果，确认机器人与操作者双臂下垂后，长按 X+A 建立新映射，松键并重新双握。Driver 不用自动静止或姿态判据确认 Reset，也不自动接通。
 8. 从 Canvas 停止项目。独立调用 `arm.release` 会取消遥操并关闭输入，之后需从 Canvas 重新启动项目。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
 
-Reset 使用 [宇树手臂动作接口](https://support.unitree.com/home/en/G1_developer/arm_action_interface) 的 **Recover Initial Arm Pose（99）**。SDK 返回成功不是姿态验收；执行器检查返回后的新鲜静止反馈，现场用户确认下垂姿态。接口依赖本体内置运控和可用的 Arm Action Service；失败时保留错误，不自动重试或启停厂商服务。原厂 99 已发出后，现有 SDK 没有可靠取消接口，停止会报告结果未知，不能报告已取消。
+Reset 使用 [宇树手臂动作接口](https://support.unitree.com/home/en/G1_developer/arm_action_interface) 的 **Recover Initial Arm Pose（99）**。`RequestReset()` 复用 SDK `_CallNoReply`，返回0只表示本地 DDS 写入成功，不表示服务端接受或物理复位成功。无匹配订阅者、DDS 写入异常等发送失败保留错误，不自动重试。服务端执行失败不会经此 no-reply 调用返回，由操作员现场判断；不自动启停厂商服务。
 
-PICO 继续使用既有 `left/right.controls.buttons` 的 `available`、`pressed`，不新增 topic。确认键是 `left.x + right.a`，Reset 键是 `left.y + right.b`；同时按两组键不执行。输入超过 300 ms、按键松开或握把按下会中断一秒计时。
+遥操 Reset 的回执含 `operator_reset=true`、`request_sent=true`；发送阶段完成后 `state=completed`、`authority_released=true`，但 `physical_confirmed=false`、`return_completed=false`。Driver 清理旧租约、待发目标、proof 和 release_requested，关闭旧发送通道。`X+A` 只建立新基准，仍需新一次双握才申请新的运动租约。基准确认不检查静止阈值；反馈新鲜度、跟踪、IK 和接通执行检查继续生效。独立 `arm.release` 与轨迹停止仍保留原完成判据。
+
+原厂99发出后没有可靠取消接口；发送期间发生停止或输入中断时，不得声称动作已经取消。
+
+PICO 继续使用既有 `left/right.controls.buttons` 的 `available`、`pressed`，不新增 topic。确认键是 `left.x + right.a`，Reset 键是 `left.y + right.b`；已有遥操、暂停、Reset 处理中或错误状态均接收这两组按键；X+A 重建基准，新的 Y+B 按键可重试发送。X+A 会先完成旧通道交权；已经进行的 DDS 写入需结束，不声称撤销已发送请求。同时按两组键不执行。输入超过 300 ms、按键松开或握把按下会中断一秒计时。
 
 | 顶层 state | 顶层 reason | PICO 提示含义 |
 |---|---|---|
 | `ready` | `waiting_baseline_confirmation` | 双方双臂下垂，松握，长按 X+A 确认 |
 | `ready` | `release_buttons_then_regrip` | 松开按钮，再次双握接通 |
 | `ready` | `regrip_required` | 松握后再次双握；对齐数值仅供参考 |
-| `hold` | `resetting` | 原厂复位进行中；不接通遥操 |
+| `hold` | `resetting` | 正在交还控制权并发送复位请求；不接通遥操 |
 | `active` | `null` | 遥操已接通 |
 | `hold` / `fault` | 具体错误码 | 显示失败原因；不报告复位成功 |
 

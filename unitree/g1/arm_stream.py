@@ -356,7 +356,23 @@ class ArmStreamExecutor:
         finally:
             with self.lock:self._opening=False
 
-    def _release(self, args, *, action99=True, cancel_pending=False):
+    def confirm_operator_reset(self):
+        with self.lock:
+            op = self._operation
+            if not op or not op.get('operator_reset') or op['state'] == 'completed':
+                return False
+            # A local confirmation cannot cancel a DDS write already in progress.
+            if self._rpc_thread and self._rpc_thread.is_alive():
+                return True
+            op['cancel_requested'] = True
+            op['action_id'] = None
+            if op.get('handback_confirmed'):
+                self._complete_release(op, physical_confirmed=False)
+            elif op['state'] in ('failed', 'unknown'):
+                op.update(state='holding', started_ns=self.clock())
+            return True
+
+    def _release(self, args, *, action99=True, cancel_pending=False, operator_reset=False):
         ident = args.get('operation_id') or args.get('request_id')
         if ident is not None and (not isinstance(ident,str) or not 1<=len(ident)<=128):
             raise ValueError('invalid_operation_id')
@@ -393,7 +409,7 @@ class ArmStreamExecutor:
                 # again. An operator must explicitly retry after fresh rest.
                 if args.get('retry') is not True: raise ValueError('release_result_unknown')
                 _,_,dq=self._fresh()
-                if max(map(abs,dq))>.02: raise ValueError('robot_not_stopped')
+                if not operator_reset and max(map(abs,dq))>.02: raise ValueError('robot_not_stopped')
             if self._legacy_busy(): raise ValueError('external_control_owned')
             self._fresh()
             self.hold('release_requested',release=True)
@@ -401,6 +417,7 @@ class ArmStreamExecutor:
             ident = ident or secrets.token_hex(16)
             self._operation = {'operation_id':ident,'state':'holding','started_ns':self.clock(),
                 'action_id':99 if action99 else None,'sdk_return':None,'sdk_returned_ns':None,
+                'operator_reset':operator_reset, 'request_sent':False,
                 'zero_writes':0,'handback_confirmed':False,'physical_confirmed':False,
                 'return_completed':False,'authority_released':False}
             self._operations[ident]=self._operation
@@ -454,7 +471,7 @@ class ArmStreamExecutor:
                 if not result.get('error') and ident is not None and action in ('claim','resume'):
                     if receipt:self._cancelled_management[receipt['id']]=receipt['args']['request_valid_until_ns']
                     self._management_receipt={'id':ident,'action':action,'args':dict(args),'result':dict(result),'cancelled':False}
-                elif not result.get('error') and receipt and action in ('pause','release','stop','finish','end_operator_session'):
+                elif not result.get('error') and receipt and action in ('pause','release','stop','finish','end_operator_session','operator_reset'):
                     receipt['cancelled']=True
                 return result
             except (ValueError,RuntimeError,OSError) as exc:
@@ -492,6 +509,7 @@ class ArmStreamExecutor:
             if action in ('pause','recoverable_hold'):
                 if not self._authorized(args):raise ValueError('invalid_lease')
                 return self.hold('ik_recoverable' if action=='recoverable_hold' else 'operator_pause',recoverable=action=='recoverable_hold')
+            if action=='operator_reset':return self._release({'retry':True}, operator_reset=True)
             if action=='finish_status':
                 with self.lock:
                     ident=args.get('operation_id')
@@ -564,21 +582,28 @@ class ArmStreamExecutor:
 
     def _invoke99(self, op):
         try:
-            ret=self.arm_client.ExecuteAction(99)
+            ret=(self.arm_client.RequestReset() if op.get('operator_reset')
+                 else self.arm_client.ExecuteAction(99))
             with self.lock:
                 op['sdk_return'],op['sdk_returned_ns']=ret,self.clock()
-                if op['state']=='unknown':return  # Do not overwrite an observed unknown result.
                 success=type(ret) is int and ret==0
+                if op.get('operator_reset'): op['request_sent'] = success
+                if op['state']=='unknown':return  # Stop cannot retract an in-flight request.
+                if success and op.get('operator_reset'):
+                    self._complete_release(op, physical_confirmed=False)
+                    return
                 op['state']='awaiting_feedback' if success else 'failed'
                 if not success:op['reason']='release_sdk_error'
                 self._settle=None
         except Exception as exc:
-            with self.lock:op.update(state='unknown',reason=type(exc).__name__)
+            with self.lock:op.update(state='failed' if op.get('operator_reset') else 'unknown',
+                                     reason=type(exc).__name__)
 
     def _release_tick(self,s,q,dq):
         op=self._operation
         if op is None or op['state'] in ('completed','failed','unknown'):return
         now=self.clock()
+        if op.get('operator_reset') and op['state']=='sdk_pending':return
         if now-op['started_ns']>10_000_000_000:
             op.update(state='unknown',reason='release_timeout');return
         if op['state']=='holding':
@@ -609,7 +634,7 @@ class ArmStreamExecutor:
                     self._settle=None
             return
         if op['state']=='confirming_handback':
-            if not self._stationary(s,q,dq,op['zero_confirmed_ns']):return
+            if not op.get('operator_reset') and not self._stationary(s,q,dq,op['zero_confirmed_ns']):return
             op['handback_confirmed']=True
             if op['action_id']==99:
                 op['state']='sdk_pending'
@@ -617,14 +642,25 @@ class ArmStreamExecutor:
                 self._rpc_thread.start()
             else:op['state']='awaiting_feedback';op['sdk_returned_ns']=now;self._settle=None
             return
-        if op['state']=='awaiting_feedback' and self._stationary(s,q,dq,op['sdk_returned_ns']):
-            op.update(state='completed',physical_confirmed=True,return_completed=True,
-                      authority_released=True,completed_ns=now)
-            self.session_id=self.secret=None
-            self._legacy_pending=False;self._prepared=False
-            self.state,self.reason='idle','release_confirmed'
-            self._hold_confirmed=True
-            if self._channel_open:self._channel.close();self._channel_open=False
+        if op['state']=='awaiting_feedback':
+            if op.get('operator_reset'):
+                self._complete_release(op, physical_confirmed=False)
+            elif self._stationary(s,q,dq,op['sdk_returned_ns']):
+                self._complete_release(op, physical_confirmed=True)
+
+    def _complete_release(self, op, *, physical_confirmed):
+        op.update(state='completed', physical_confirmed=physical_confirmed,
+                  return_completed=physical_confirmed, authority_released=True,
+                  completed_ns=self.clock())
+        self.session_id=self.secret=None
+        self._legacy_pending=False;self._prepared=False
+        if op.get('operator_reset'):
+            self.release_requested=False
+            self.latest=self._proof=None
+            self._proofs.clear()
+        self.state,self.reason='idle','release_confirmed' if physical_confirmed else 'reset_requested'
+        self._hold_confirmed=physical_confirmed
+        if self._channel_open:self._channel.close();self._channel_open=False
 
     def tick(self):
         with self.lock:
