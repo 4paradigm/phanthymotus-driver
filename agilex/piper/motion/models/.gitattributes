@@ -1,0 +1,2 @@
+# Preserve the upstream bytes used by calibration SHA256 bindings.
+piper.urdf -text whitespace=cr-at-eol,-blank-at-eol
