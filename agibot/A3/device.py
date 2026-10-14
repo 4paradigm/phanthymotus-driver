@@ -464,9 +464,11 @@ class A3Nodes:
             QoSHistoryPolicy = type("QoSHistoryPolicy", (), {"KEEP_LAST": None})
             qos_profile_sensor_data = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         try:
-            from rclpy.callback_groups import ReentrantCallbackGroup
+            from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
         except ImportError:  # lightweight test doubles / older rclpy
             class ReentrantCallbackGroup:  # noqa: N801
+                pass
+            class MutuallyExclusiveCallbackGroup:  # noqa: N801
                 pass
         from sensor_msgs.msg import Image, Imu, JointState, PointCloud2
         from std_msgs.msg import String, UInt8MultiArray
@@ -564,6 +566,11 @@ class A3Nodes:
 
         self.streams = {}
         self._joint_cache = {}
+        self._joint_cache_lock = threading.RLock()
+        # Joint feedback can be high-rate. Give it a separate mutually
+        # exclusive group so it cannot serialize IMU/BMS/estop callbacks on
+        # the robot executor's default group.
+        self._joint_callback_group = MutuallyExclusiveCallbackGroup()
         self._joint_skeleton_pub = self.core.create_publisher(
             String, _core_topic(namespace, "state/joints"), 5)
         self._joint_state_pub = self.core.create_publisher(
@@ -617,8 +624,9 @@ class A3Nodes:
                     if count == 1 or count % interval == 0:
                         print(f"[media] received={count} key={key} topic={robot_topic}", flush=True)
                 if key in ("arm_state", "hand_state", "neck_state", "waist_state", "leg_state"):
-                    self._joint_cache[key] = jsonable(msg)
-                    self._publish_joint_streams()
+                    with self._joint_cache_lock:
+                        self._joint_cache[key] = jsonable(msg)
+                        self._publish_joint_streams()
                 elif key in ("imu_pelvis", "imu_torso"):
                     self._publish_imu_streams(key, jsonable(msg))
                     # The IMU quaternion is the root orientation in the
@@ -664,9 +672,12 @@ class A3Nodes:
                     pub.publish(msg)
 
             is_relay_camera = self._jazzy_relay and key.startswith("camera_")
-            callback_group = self._media_callback_group if (
-                re_encode is not None or key == "lidar_cloud" or is_relay_camera
-            ) else None
+            if key in ("arm_state", "hand_state", "neck_state", "waist_state", "leg_state"):
+                callback_group = self._joint_callback_group
+            else:
+                callback_group = self._media_callback_group if (
+                    re_encode is not None or key == "lidar_cloud" or is_relay_camera
+                ) else None
             kwargs = {"callback_group": callback_group} if callback_group is not None else {}
             subscription_node = self.media_robot if (callback_group is not None and self.media_robot is not None) else self.robot
             if self._jazzy_relay and key == "lidar_cloud":
@@ -712,7 +723,6 @@ class A3Nodes:
         try:
             from aimdk.protocol.hal.bms import hal_bms_channel_pb2
             from aimdk.protocol.hal.state import hal_state_channel_pb2
-            from aimdk.protocol.agent import agent_data_pb2
             from aimdk.protocol.skill_pilot import skill_pilot_channel_pb2
             from aimdk.protocol.motion_control.motion import mc_motion_channel_pb2
             from aimdk.protocol.aim_master import am_channel_pb2
@@ -731,6 +741,14 @@ class A3Nodes:
             }
         except (ImportError, AttributeError):
             self._pb = None
+        # ProcessedAudioOutput is optional across A3 SDK wheel revisions. It
+        # must never disable the independent BMS/emergency decoders.
+        if self._pb is not None:
+            try:
+                from aimdk.protocol.agent import agent_data_pb2
+                self._pb["processed_audio"] = agent_data_pb2.ProcessedAudioOutput
+            except (ImportError, AttributeError):
+                pass
         if self._pb is not None and self._probe_wrapper_type() is not None:
             mirror("battery", self._wrapper_type(ros2), "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel",
                    "data/json", json_filter=self._decode_bms)
@@ -1283,8 +1301,9 @@ class A3Nodes:
             return self.values.get(key, {})
 
     def _publish_joint_streams(self):
-        groups = {key: self._joint_cache.get(key, {})
-                  for key in ("arm_state", "hand_state", "neck_state", "waist_state", "leg_state")}
+        with self._joint_cache_lock:
+            groups = {key: self._joint_cache.get(key, {})
+                      for key in ("arm_state", "hand_state", "neck_state", "waist_state", "leg_state")}
         raw = {}
         for prefix, group in (("arm", groups["arm_state"]), ("hand", groups["hand_state"]),
                               ("neck", groups["neck_state"]), ("waist", groups["waist_state"]),
