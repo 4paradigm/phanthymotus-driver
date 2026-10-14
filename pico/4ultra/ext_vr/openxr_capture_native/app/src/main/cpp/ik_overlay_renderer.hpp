@@ -1,6 +1,5 @@
 #pragma once
 #include "ik_visualization.hpp"
-#include "operator_panel.hpp"
 #include "operator_labels.hpp"
 #include <GLES3/gl3.h>
 #include <openxr/openxr.h>
@@ -19,7 +18,7 @@ class IkOverlayRenderer {
     if(vao_)glDeleteVertexArrays(1,&vao_);
     program_=buffer_=vao_=0;
   }
-  void Draw(const IkVisualization& value,const XrView& eye,const XrPosef& center,const OperatorPanel& panel,bool show_model=false) {
+  void Draw(const IkVisualization& value,const XrView& eye,const XrPosef& center,bool connected,bool show_model=false) {
     if(!program_) Initialize();
     std::vector<float> vertices;
     auto rotate=[](XrQuaternionf q,IkPoint p){
@@ -70,31 +69,13 @@ class IkOverlayRenderer {
         x+=.017f;
       }
     };
-    if(panel.enabled && panel.input_only && !show_model){
+    if(!show_model){
       for(const auto& pixel:kOperatorLabelPixels){
-        const bool status=pixel[0]==(panel.armed?4:5);
-        if(!status && pixel[0]!=6)continue;
+        const bool status=pixel[0]==(connected?0:1);
+        if(!status && pixel[0]!=2)continue;
         const float x=(status?-.12f:-.20f)+pixel[1]*.002f;
         const float y=(status?.52f:.44f)-pixel[2]*.002f;
-        line({x,y,-1.3f},{x+.0016f,y,-1.3f},panel.armed?green:gray);
-      }
-    } else if(panel.enabled && !panel.input_only){
-      for(int i=0;i<3;++i){
-        const float x=OperatorPanel::center(i),y=OperatorPanel::y,w=OperatorPanel::width/2,h=OperatorPanel::height/2,z=OperatorPanel::z;
-        IkPoint color=i==0 && !panel.armed?IkPoint{.28f,.3f,.32f}:(i==panel.hover?orange:(i==2?pink:gray));
-        line({x-w,y-h,z},{x+w,y-h,z},color);line({x+w,y-h,z},{x+w,y+h,z},color);
-        line({x+w,y+h,z},{x-w,y+h,z},color);line({x-w,y+h,z},{x-w,y-h,z},color);
-        for(const auto& pixel:kOperatorLabelPixels)if(pixel[0]==i){
-          float px=x-.10f+pixel[1]*.002f,py=y+.024f-pixel[2]*.002f;
-          line({px,py,z},{px+.0016f,py,z},color);
-        }
-      }
-      if(panel.pointing){auto p=panel.cursor;line({p[0]-.007f,p[1],p[2]},{p[0]+.007f,p[1],p[2]},orange);line({p[0],p[1]-.007f,p[2]},{p[0],p[1]+.007f,p[2]},orange);}
-      text(panel.mode+" / "+panel.state,-.34f,.52f,gray);
-      if(!panel.error.empty())text(panel.error,-.34f,.56f,pink);
-      if(!panel.armed)for(const auto& pixel:kOperatorLabelPixels)if(pixel[0]==3){
-        const float x=-.17f+pixel[1]*.002f,y=.62f-pixel[2]*.002f;
-        line({x,y,OperatorPanel::z},{x+.0016f,y,OperatorPanel::z},orange);
+        line({x,y,-1.3f},{x+.0016f,y,-1.3f},connected?green:gray);
       }
     }
     std::size_t measured_begin=0,measured_count=0;

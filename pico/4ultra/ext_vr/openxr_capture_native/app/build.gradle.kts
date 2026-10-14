@@ -18,8 +18,8 @@ android {
         applicationId = "com.phanthymotus.picocapture"
         minSdk = 29
         targetSdk = 35
-        versionCode = 32
-        versionName = "0.4.8-pico-status"
+        versionCode = 33
+        versionName = "0.4.9-pico-cleanup"
 
         ndk {
             abiFilters += "arm64-v8a"

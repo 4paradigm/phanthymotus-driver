@@ -13,7 +13,6 @@
 #include "motus/openxr_capture/frame_v1.hpp"
 #include "runtime_profile.hpp"
 #include "ik_overlay_renderer.hpp"
-#include "operator_panel.hpp"
 
 struct android_app;
 
@@ -29,14 +28,7 @@ class OpenXrCapture final {
 
   void Initialize(android_app* app);
   void PollEvents();
-  void SetDevicePanel(bool connected) {
-    panel_.enabled=true;panel_.input_only=true;panel_.armed=connected;
-    panel_.pending.clear();panel_.pointing=false;
-  }
-  void SetOperatorPanel(bool enabled,bool armed,const std::string& state,const std::string& mode,const std::string& error) {
-    panel_.enabled=enabled;panel_.armed=armed;panel_.state=state;panel_.mode=mode;panel_.error=error;
-  }
-  std::string TakeOperatorAction(){auto result=panel_.pending;panel_.pending.clear();return OperatorCommandAllowed(panel_.enabled,panel_.armed,result)?result:std::string{};}
+  void SetDevicePanel(bool connected) { paired_connected_ = connected; }
   void SetVisualization(const IkVisualization& value) { visualization_ = value; }
 
   // Drives xrWaitFrame/xrBeginFrame/xrEndFrame and returns a controller sample
@@ -78,9 +70,7 @@ class OpenXrCapture final {
 
   IkVisualization visualization_;
   IkOverlayRenderer overlay_;
-  OperatorPanel panel_;
-  XrAction aim_action_{XR_NULL_HANDLE};
-  std::array<XrSpace,2> aim_spaces_{XR_NULL_HANDLE,XR_NULL_HANDLE};
+  bool paired_connected_{false};
   XrInstance instance_{XR_NULL_HANDLE};
   XrSystemId system_id_{XR_NULL_SYSTEM_ID};
   XrSession session_{XR_NULL_HANDLE};

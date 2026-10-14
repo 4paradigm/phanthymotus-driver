@@ -352,7 +352,6 @@ void OpenXrCapture::CreateActions() {
       "squeeze_value",
       "Squeeze value",
       &squeeze_action_);
-  create_action(XR_ACTION_TYPE_POSE_INPUT,"aim_pose","Aim pose",&aim_action_);
   create_action(XR_ACTION_TYPE_FLOAT_INPUT, "trigger_value", "Trigger", &trigger_action_);
   create_action(
       XR_ACTION_TYPE_VECTOR2F_INPUT,
@@ -380,7 +379,6 @@ void OpenXrCapture::CreateActions() {
       Check(xrStringToPath(instance_, value.c_str(), &path), "xrStringToPath(binding)");
       return path;
     };
-    bindings.push_back({aim_action_, binding_path("/input/aim/pose")});
     bindings.push_back({grip_pose_action_, binding_path("/input/grip/pose")});
     bindings.push_back({squeeze_action_, binding_path("/input/squeeze/value")});
     bindings.push_back({trigger_action_, binding_path("/input/trigger/value")});
@@ -431,8 +429,6 @@ void OpenXrCapture::CreateActions() {
     space_info.poseInActionSpace = IdentityPose();
     Check(xrCreateActionSpace(session_, &space_info, &grip_spaces_[index]),
           "xrCreateActionSpace");
-    space_info.action=aim_action_;
-    Check(xrCreateActionSpace(session_, &space_info, &aim_spaces_[index]),"xrCreateAimSpace");
   }
 }
 
@@ -718,9 +714,6 @@ void OpenXrCapture::SyncActions(XrTime predicted_display_time, FrameSample* samp
   };
   fill_hand(0, &sample->left_controller, &sample->left_input);
   fill_hand(1, &sample->right_controller, &sample->right_input);
-  std::array<PoseSample,2> aim;
-  for(int i=0;i<2;++i)aim[i]=LocatePose(aim_spaces_[i],predicted_display_time,HasAllowedInteractionProfile(i));
-  panel_.Sample(sample->head,aim,*sample);
   sample->distinct_input_sources =
       sample->left_input.correct_handedness &&
       sample->right_input.correct_handedness;
@@ -857,7 +850,7 @@ void OpenXrCapture::RenderProjection(
       center.position.y=(views[0].pose.position.y+views[1].pose.position.y)*.5f;
       center.position.z=(views[0].pose.position.z+views[1].pose.position.z)*.5f;
     }
-    overlay_.Draw(visualization_,views[index],center,panel_,true);
+    overlay_.Draw(visualization_,views[index],center,paired_connected_,true);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &framebuffer);
 
@@ -920,7 +913,6 @@ void OpenXrCapture::Destroy() noexcept {
   for (auto& space : grip_spaces_) {
     destroy_space(&space);
   }
-  for(auto& space:aim_spaces_)destroy_space(&space);
   destroy_space(&view_space_);
   destroy_space(&floor_space_);
   for (auto& swapchain : swapchains_) {

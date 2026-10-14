@@ -270,17 +270,6 @@ async def capture_websocket_handler(request: web.Request) -> web.StreamResponse:
     try:
         first = capture_json(await _ws_text(websocket, timeout=5.0))
         connection, acknowledgement = await manager.connect(first)
-        version = first.get("app_version", "")
-        # This release changed its version label, not its existing wire features.
-        # Keep opt-in exact for unsuffixed releases: older clients reject extra messages.
-        onboarding_client = version == "0.3.18-onboarding1"
-        if (onboarding_client or version.endswith("-operator1-ikview2")) and getattr(
-            manager, "operator_commands", None
-        ) is not None:
-            acknowledgement["operator_control"] = {
-                "version": 1,
-                "connection_id": connection.connection_id,
-            }
         await websocket.send_json(acknowledgement)
         provider = getattr(manager, "visualization_provider", None)
         if provider is not None:
@@ -339,21 +328,6 @@ async def capture_websocket_handler(request: web.Request) -> web.StreamResponse:
                             }
                         if visual is not None:
                             response["visualization"] = visual
-                elif (
-                    message_type == "operator_command"
-                    and getattr(manager, "operator_commands", None) is not None
-                ):
-                    try:
-                        response = await manager.operator_commands.submit(
-                            connection, incoming
-                        )
-                    except ValueError as exc:
-                        response = {
-                            "type": "operator_result",
-                            "request_id": incoming.get("request_id"),
-                            "state": "failed",
-                            "error": str(exc),
-                        }
                 elif message_type == "signaling_offer":
                     response = await manager.signaling_offer(connection, incoming)
                 else:

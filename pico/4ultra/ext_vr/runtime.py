@@ -199,12 +199,12 @@ class DeviceRuntime:
             self.error = None
             return copy.deepcopy(out)
 
-    def command_identity(self, *, require_capture=True):
+    def command_identity(self):
         with self._lock:
             if (
                 not self.running
                 or self._capture_id is None
-                or (require_capture and self._binding is None)
+                or self._binding is None
             ):
                 raise ValueError("capture_not_ready")
             return {

@@ -4,6 +4,7 @@
   "source_path": "actucore/plugins/teleop",
   "license": "Apache-2.0",
   "scope": "Device transport only; no runtime motion, URDF, IK or execution implementation adopted",
+  "local_changes": "Removed unused operator-command UI, ray interaction and server request queue; retained pairing, input transport and read-only robot visualization. Original source hashes below identify the adoption baseline.",
   "original_prs": {
     "transport": "https://github.com/4paradigm/phanthymotus-driver/pull/152",
     "native_client": "https://github.com/4paradigm/phanthymotus-driver/pull/151"

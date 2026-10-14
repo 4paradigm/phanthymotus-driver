@@ -45,13 +45,7 @@ class CaptureTransport final
   void Tick();
   void SetXrFocused(bool focused);
   void SendFrame(const FrameSample& sample);
-  void SendOperatorCommand(const std::string& action);
   bool paired_connected() const {return state_.authenticated;}
-  bool operator_enabled() const {return state_.authenticated && !operator_connection_.empty();}
-  bool operator_armed() const {return operator_armed_;}
-  const std::string& operator_state() const {return operator_state_;}
-  const std::string& operator_mode() const {return operator_mode_;}
-  const std::string& operator_error() const {return operator_error_;}
   const IkVisualization& visualization() const { return visualization_; }
 
   [[nodiscard]] CaptureLinkState link_state() const { return state_.link; }
@@ -99,9 +93,6 @@ class CaptureTransport final
   void Log(const std::string& message) const;
 
   IkVisualization visualization_;
-  std::string operator_connection_,operator_state_,operator_mode_,operator_error_;
-  bool operator_armed_{false};
-  std::uint64_t operator_sequence_{0};
   CaptureTransportConfiguration configuration_;
   IdentitySink identity_sink_;
   LogSink log_sink_;

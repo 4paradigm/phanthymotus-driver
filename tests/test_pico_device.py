@@ -1,5 +1,4 @@
 import asyncio
-import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -12,9 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pico/4ultra'))
 from ext_vr.runtime import DeviceRuntime
 from ext_vr.protocol import ProtocolError
 from ext_vr.plugin import ExtVrPlugin
-from ext_vr.management import OperatorCommands
 from ext_vr.transport import BoundedWriter
-from common.teleop_contract import validate_input, validate_operation
+from common.teleop_contract import validate_input
 
 
 def frame(sequence=1, grip=1.0, x=1.0):
@@ -121,7 +119,7 @@ def test_pose_input_is_unfiltered_across_grip_and_tracking_changes():
     assert resumed["space_epoch"] == runtime._space_epoch
 
 
-def test_bounded_writer_stalled_dds_keeps_only_latest_and_stop_priority():
+def test_bounded_writer_stalled_dds_keeps_only_latest():
     entered, release = threading.Event(), threading.Event()
     sent = []
     cleaned = []
@@ -137,120 +135,15 @@ def test_bounded_writer_stalled_dds_keeps_only_latest_and_stop_priority():
     assert entered.wait(1)
     for seq in range(1, 101):
         writer.publish({"kind": "input", "sequence": seq})
-    for index in range(16):
-        writer.publish(
-            {"kind": "operation", "request_id": str(index), "action": "begin"}
-        )
-    with pytest.raises(ValueError, match="operator_queue_full"):
-        writer.publish(
-            {"kind": "operation", "request_id": "overflow", "action": "begin"}
-        )
-    writer.publish({"kind": "operation", "request_id": "stop", "action": "stop"})
     writer.publish({"kind": "input", "sequence": 101})
     release.set()
     for _ in range(100):
-        if len(sent) >= 3:
+        if len(sent) >= 2:
             break
         time.sleep(0.01)
     writer.close()
-    assert [v.get("request_id", v.get("sequence")) for v in sent] == [0, "stop", 101]
+    assert [v["sequence"] for v in sent] == [0, 101]
     assert cleaned == [True]
-
-
-def test_operation_retry_is_identical_and_stop_bypasses_finish():
-    async def run():
-        runtime, binding, epoch = ready_runtime()
-        put(runtime, binding, epoch)
-        connection = SimpleNamespace(
-            capture_id="device", connection_id="conn", events=asyncio.Queue(maxsize=8)
-        )
-        manager = SimpleNamespace(
-            _connection=connection, presence_expired=lambda c: False
-        )
-        sent = []
-        ops = OperatorCommands(manager, runtime, lambda v: sent.append(v))
-        ops.bind(True)
-        ops.feedback(feedback(runtime))
-        request = {
-            "connection_id": "conn",
-            "request_id": "finish-1",
-            "action": "finish",
-        }
-        first = await ops.submit(connection, request)
-        assert await ops.submit(connection, request) == first
-        await asyncio.sleep(0.13)
-        assert len(sent) >= 2 and sent[0] == sent[1]
-        validate_operation(
-            sent[0],
-            instance_id="vr-1",
-            clock_id=runtime.clock_id,
-            now_ns=runtime.clock_ns(),
-        )
-        await ops.submit(
-            connection,
-            {"connection_id": "conn", "request_id": "stop-1", "action": "stop"},
-        )
-        assert sent[-1]["action"] == "stop"
-        assert ops.receipts[("device", "finish-1")]["error"] == "superseded_by_stop"
-        ops.feedback(
-            feedback(
-                runtime,
-                receipts=[
-                    {
-                        "request_id": "stop-1",
-                        "action": "stop",
-                        **{
-                            k: sent[-1][k]
-                            for k in ("device_id", "connection_epoch", "space_epoch")
-                        },
-                        "status": "completed",
-                        "error": None,
-                        "result": {"state": "idle", "lease": "private"},
-                    }
-                ],
-                sequence=2,
-            )
-        )
-        receipt = ops.receipts[("device", "stop-1")]
-        assert receipt["state"] == "completed" and "lease" not in receipt["result"]
-        await ops.close()
-
-    asyncio.run(run())
-
-
-def test_old_connection_operation_not_replayed_after_reconnect():
-    async def run():
-        runtime, binding, epoch = ready_runtime()
-        put(runtime, binding, epoch)
-        connection = SimpleNamespace(
-            capture_id="device", connection_id="conn", events=asyncio.Queue()
-        )
-        manager = SimpleNamespace(
-            _connection=connection, presence_expired=lambda c: False
-        )
-        sent = []
-        ops = OperatorCommands(manager, runtime, sent.append)
-        ops.bind(True)
-        ops.feedback(feedback(runtime))
-        await ops.submit(
-            connection,
-            {"connection_id": "conn", "request_id": "begin-1", "action": "start"},
-        )
-        runtime.mark_capture_disconnected("device", epoch)
-        replacement = SimpleNamespace(
-            capture_id="device", connection_id="new-conn", events=asyncio.Queue()
-        )
-        manager._connection = replacement
-        await asyncio.sleep(0.04)
-        assert len(sent) == 1
-        assert (
-            ops.receipts[("device", "begin-1")]["error"]
-            == "operator_connection_changed"
-        )
-        assert replacement.events.empty()
-        await ops.close()
-
-    asyncio.run(run())
 
 
 def load_driver_module(name):
@@ -355,140 +248,6 @@ def test_startup_rejects_unsafe_state_without_changing_target(tmp_path, monkeypa
     elif invalid == "owner":
         assert root.stat().st_mode & 0o777 == 0o755
         assert list(root.iterdir()) == []
-
-
-def test_transport_write_failure_does_not_kill_request_recovery():
-    async def run():
-        runtime, binding, epoch = ready_runtime()
-        put(runtime, binding, epoch)
-        connection = SimpleNamespace(
-            capture_id="device", connection_id="conn", events=asyncio.Queue()
-        )
-        manager = SimpleNamespace(
-            _connection=connection, presence_expired=lambda c: False
-        )
-        calls = []
-
-        def publish(value):
-            calls.append(copy.deepcopy(value))
-            if len(calls) == 1:
-                raise ValueError("operator_queue_full")
-
-        ops = OperatorCommands(manager, runtime, publish)
-        ops.bind(True)
-        ops.feedback(feedback(runtime))
-        receipt = await ops.submit(
-            connection,
-            {"connection_id": "conn", "request_id": "begin-retry", "action": "start"},
-        )
-        assert receipt["state"] == "accepted"
-        await asyncio.sleep(0.13)
-        assert len(calls) >= 2 and calls[0] == calls[1]
-        assert not ops._task.done()
-        await ops.close()
-
-    asyncio.run(run())
-
-
-def test_stop_survives_saturated_retired_filter_and_receipt_capacity():
-    async def run():
-        runtime, binding, epoch = ready_runtime()
-        put(runtime, binding, epoch)
-        connection = SimpleNamespace(
-            capture_id="device", connection_id="conn", events=asyncio.Queue(maxsize=1)
-        )
-        manager = SimpleNamespace(
-            _connection=connection, presence_expired=lambda c: False
-        )
-        sent = []
-        ops = OperatorCommands(manager, runtime, sent.append)
-        ops.bind(True)
-        ops._seen[:] = b"\xff" * len(ops._seen)
-        for index in range(256):
-            key = ("device", str(index))
-            ops.receipts[key] = {
-                "type": "operator_result",
-                "request_id": str(index),
-                "action": "finish",
-                "state": "accepted",
-            }
-            ops.pending[key] = {"connection": connection}
-        request = {"connection_id": "conn", "request_id": "new-stop", "action": "stop"}
-        result = await ops.submit(connection, request)
-        assert result["state"] == "accepted" and sent[-1]["action"] == "stop"
-        assert len(ops.pending) == 1 and len(ops.receipts) == 256
-        count = len(sent)
-        assert await ops.submit(connection, request) == result
-        assert len(sent) == count
-        await ops.close()
-
-    asyncio.run(run())
-
-
-def test_stop_after_rtc_loss_does_not_require_tracking_or_feedback():
-    async def run():
-        runtime, binding, epoch = ready_runtime()
-        put(runtime, binding, epoch)
-        connection = SimpleNamespace(
-            capture_id="device", connection_id="conn", events=asyncio.Queue()
-        )
-        manager = SimpleNamespace(
-            _connection=connection, presence_expired=lambda c: False
-        )
-        sent = []
-        ops = OperatorCommands(manager, runtime, sent.append)
-        ops.bind(True)
-        runtime.mark_rtc_disconnected(epoch, "focus_lost")
-        assert runtime._binding is None
-        result = await ops.submit(
-            connection,
-            {
-                "connection_id": "conn",
-                "request_id": "stop-no-tracking",
-                "action": "stop",
-            },
-        )
-        assert result["state"] == "accepted" and sent[0]["action"] == "stop"
-        validate_operation(
-            sent[0],
-            instance_id="vr-1",
-            clock_id=runtime.clock_id,
-            now_ns=runtime.clock_ns(),
-        )
-        old_status = copy.deepcopy(ops.status)
-        receipt = {
-            **{
-                k: sent[0][k]
-                for k in (
-                    "request_id",
-                    "action",
-                    "device_id",
-                    "connection_epoch",
-                    "space_epoch",
-                )
-            },
-            "status": "completed",
-            "error": None,
-            "result": {"state": "idle"},
-        }
-        value = feedback(runtime, receipts=[receipt])
-        value["connection_epoch"] = epoch
-        # Same request ID cannot be completed by another device or space.
-        wrong = copy.deepcopy(value)
-        wrong["receipts"][0]["device_id"] = "another-device"
-        ops.feedback(wrong, update_status=False)
-        assert ops.pending
-        wrong["receipts"][0]["device_id"] = "device"
-        wrong["receipts"][0]["space_epoch"] += 1
-        ops.feedback(wrong, update_status=False)
-        assert ops.pending
-        ops.feedback(value, update_status=False)
-        assert not ops.pending
-        assert ops.receipts[("device", "stop-no-tracking")]["state"] == "completed"
-        assert ops.status == old_status
-        await ops.close()
-
-    asyncio.run(run())
 
 
 def test_missing_or_nonlocal_dds_profile_cannot_silently_start(tmp_path):

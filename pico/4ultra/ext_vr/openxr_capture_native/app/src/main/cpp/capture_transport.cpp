@@ -1,6 +1,4 @@
 #include "capture_transport.hpp"
-#include "operator_panel.hpp"
-#include "operator_state.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -296,46 +294,13 @@ void CaptureTransport::HandleEvent(const Event& event) {
   }
 }
 
-void CaptureTransport::SendOperatorCommand(const std::string& action) {
-  if(!OperatorCommandAllowed(operator_enabled(),operator_armed_,action))return;
-  const auto id=operator_connection_+":"+std::to_string(++operator_sequence_);
-  SendWebSocket(nlohmann::json{{"type","operator_command"},{"connection_id",operator_connection_},
-    {"request_id",id},{"action",action}}.dump());
-  operator_state_="pending";operator_error_.clear();
-  Log("operator_request action="+action+" request_id="+id);
-}
-
 void CaptureTransport::HandleServerMessage(const std::string& payload) {
   try {
     auto wire = nlohmann::json::parse(payload);
-    if(wire.contains("operator_control")){
-      operator_armed_=false;
-      operator_connection_=wire.at("operator_control").value("connection_id",std::string{});
-      wire.erase("operator_control");
-    }
-    if(wire.value("type",std::string{})=="operator_result"){
-      if(state_.authenticated){
-        operator_state_=wire.value("state",std::string{});operator_error_=wire.value("error",std::string{});
-        Log("operator_result state="+operator_state_+" error="+operator_error_);
-      }
-      return;
-    }
     if (wire.value("type", std::string{}) == "visualization") {
-      operator_armed_=false;
       if (state_.authenticated) {
         try {
           const auto& visual=wire.at("visualization");
-          operator_armed_=ParseOperatorArmed(visual);
-          if(visual.contains("operator")){
-            const auto& op=visual.at("operator");
-            operator_mode_=op.value("mode",std::string{});
-            // An early server rejection has no broker status. Keep its receipt
-            // visible until another explicit operation, not just the next frame.
-            if(operator_state_!="failed") {
-              operator_state_=op.value("state",std::string{});
-              operator_error_=op.contains("error") && op["error"].is_string()?op["error"].get<std::string>():"";
-            }
-          }
           UpdateIkVisualization(visualization_, visual);
         }
         catch (const std::exception&) { visualization_ = {}; Log("ik_visualization_invalid"); }
@@ -343,7 +308,6 @@ void CaptureTransport::HandleServerMessage(const std::string& payload) {
       return; // Display updates never enter authority or heartbeat state machines.
     }
     if (wire.value("type", std::string{}) == "presence_ack" && wire.contains("visualization")) {
-      operator_armed_=state_.authenticated && ParseOperatorArmed(wire.at("visualization"));
       try { UpdateIkVisualization(visualization_, wire.at("visualization")); }
       catch (const std::exception&) { visualization_ = {}; Log("ik_visualization_invalid"); }
       wire.erase("visualization");
@@ -629,8 +593,6 @@ void CaptureTransport::CloseRtc(const std::string& reason) {
 
 void CaptureTransport::CloseWebSocket() {
   visualization_ = {};
-  operator_armed_=false;
-  operator_connection_.clear();operator_state_="disconnected";operator_error_.clear();
   pending_authentication_.reset();
   if (websocket_) {
     websocket_->resetCallbacks();

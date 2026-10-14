@@ -3,18 +3,16 @@
 import json
 import copy
 import threading
-from collections import OrderedDict
 from common.teleop_contract import COMMAND_TOPIC, STATE_TOPIC, MAX_WIRE_BYTES
 
 
 class BoundedWriter:
-    """One potentially blocking DDS write, one latest pose and bounded operations."""
+    """One potentially blocking DDS write and one latest input frame."""
 
     def __init__(self, send, cleanup=lambda: None):
         self.send, self.cleanup = send, cleanup
         self.condition = threading.Condition()
         self.latest = None
-        self.operations = OrderedDict()
         self.closed = False
         self.last_error = None
         self.thread = threading.Thread(
@@ -26,16 +24,7 @@ class BoundedWriter:
         with self.condition:
             if self.closed:
                 raise ValueError("device_transport_closed")
-            if value.get("kind") == "operation":
-                rid = value["request_id"]
-                if value.get("action") == "stop":
-                    self.operations.clear()
-                    self.latest = None
-                if rid not in self.operations and len(self.operations) >= 16:
-                    raise ValueError("operator_queue_full")
-                self.operations[rid] = copy.deepcopy(value)
-            else:
-                self.latest = copy.deepcopy(value)
+            self.latest = copy.deepcopy(value)
             self.condition.notify()
 
     def _run(self):
@@ -43,16 +32,11 @@ class BoundedWriter:
             while True:
                 with self.condition:
                     self.condition.wait_for(
-                        lambda: self.closed
-                        or self.latest is not None
-                        or self.operations
+                        lambda: self.closed or self.latest is not None
                     )
                     if self.closed:
                         return
-                    if self.operations:
-                        _, value = self.operations.popitem(last=False)
-                    else:
-                        value, self.latest = self.latest, None
+                    value, self.latest = self.latest, None
                 try:
                     self.send(value)
                 except Exception as exc:
@@ -64,7 +48,6 @@ class BoundedWriter:
         with self.condition:
             self.closed = True
             self.latest = None
-            self.operations.clear()
             self.condition.notify()
         # A stalled middleware cannot delay lifecycle/stop indefinitely. Its
         # isolated writer owns eventual destruction, avoiding publish/free races.
