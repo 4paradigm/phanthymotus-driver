@@ -40,6 +40,37 @@ def test_activity_gate_does_not_extend_voice_on_modest_continuous_noise():
     assert not gate.accepts(frame(60))  # 保持期已经结束。
 
 
+def test_activity_gate_keeps_accepting_during_sustained_speech():
+    gate = SoundActivityGate()
+
+    def frame(level, dc=100):
+        wave = np.tile([dc + level, dc - level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    assert not gate.accepts(frame(85))
+    assert gate.accepts(frame(85))
+    # 连续说话不能把自己抬成背景；同电平发声仍要持续定位。
+    accepted = [gate.accepts(frame(85)) for _ in range(50)]
+    assert sum(accepted) >= 40
+    assert gate.accepts(frame(85))
+
+
+def test_activity_gate_tracks_continuous_noise_without_true_silence():
+    gate = SoundActivityGate()
+
+    def frame(level, dc=100):
+        wave = np.tile([dc + level, dc - level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    # 持续噪声没有真静音；电平变低后底噪必须跟得上，否则后面的发声会被旧底噪卡住。
+    assert not any(gate.accepts(frame(20)) for _ in range(40))
+    # 40 落在旧底噪 40×1.8=72 与新底噪 20×1.8=36 之间：只有底噪跟着下调才会被判定为发声。
+    assert not gate.accepts(frame(40))
+    assert gate.accepts(frame(40))
+
+
 def test_activity_gate_uses_user_thresholds_without_changing_defaults():
     def frame(level):
         wave = np.tile([level, -level], 320)

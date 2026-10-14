@@ -30,8 +30,8 @@ class SoundActivityGate:
         level = float(np.median(np.sqrt(np.mean(head * head, axis=0))))
         background = (float(np.percentile(self._levels, 20))
                       if len(self._levels) >= 6 else None)
-        self._levels.append(level)
         if background is None:
+            self._levels.append(level)
             return False
         # 去直流后用连续两帧识别较轻的说话声；短暂停顿只保留状态，不输出底噪角度。
         rising = level >= max(self._onset_level, background * self._onset_ratio)
@@ -43,6 +43,10 @@ class SoundActivityGate:
         if self._hold_samples > 0 and level >= max(10.0, background * 1.5):
             self._hold_samples = 9600
             return False  # 只维持语音状态，停顿时的风扇声不能刷新角度。
+        if not rising:
+            # 只把非发声帧计入背景：持续背景噪声仍会更新底噪，
+            # 但持续说话不能把自己抬成背景，否则同电平发声会永远过不了门。
+            self._levels.append(level)
         self._hold_samples = max(0, self._hold_samples - len(head))
         return False
 
