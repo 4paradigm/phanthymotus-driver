@@ -31,6 +31,12 @@ class HandPlugin:
     def stop(self): self.nodes.close()
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "started"}
+        if action == "stop":
+            return {"state": "stopped"}
+        if action == "info":
+            return {"state": "ready", "tool": "hand"}
         if action == "open":
             self.nodes.send([0x02, 255, 255, 255, 255, 255])
             return {"state": "opening"}
