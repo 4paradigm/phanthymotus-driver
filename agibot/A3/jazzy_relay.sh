@@ -4,6 +4,7 @@ ROOT=/opt/phanthy-motus/data/a3-relay
 PIDFILE=$ROOT/relay.pid
 SOURCE=/work/agibot/A3/jazzy_relay.py
 HOST_SOURCE=/proc/1/root/tmp/a3-jazzy-relay.py
+HOST_PROFILE=$ROOT/dds-profile.xml
 mkdir -p "$ROOT"
 case "${1:-start}" in
 start)
@@ -22,6 +23,12 @@ start)
   # instead, then enter the host root (without -m) so the host Jazzy install and
   # /tmp path are visible.  PID/network namespaces are still entered for DDS.
   cp "$SOURCE" "$HOST_SOURCE"
+  # The container-generated profile lives under /work and is invisible after
+  # nsenter switches to the host root. Materialize a host-visible copy so the
+  # Jazzy participant keeps the same robot-NIC/loopback whitelist.
+  if [[ -f /work/agibot/A3/dds-profile.xml ]]; then
+    cp /work/agibot/A3/dds-profile.xml "$HOST_PROFILE"
+  fi
   # Do not let nsenter inherit a removed container cwd.  Also avoid a login
   # shell: host profiles can re-source the container's Humble environment.
   cd /tmp
@@ -34,6 +41,11 @@ start)
      unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION AMENT_PREFIX_PATH
      unset COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
      unset AMENT_TRACE_SETUP_FILES AMENT_TRACE_SETUP
+     if [ -f /opt/phanthy-motus/data/a3-relay/dds-profile.xml ]; then
+       export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/data/a3-relay/dds-profile.xml
+     else
+       echo "[relay] ERROR: constrained FastDDS profile not found" >&2; exit 40
+     fi
      export ROS_HOME=/opt/phanthy-motus/data/a3-relay/ros-home
      export ROS_LOG_DIR=/opt/phanthy-motus/data/a3-relay/ros-log
      mkdir -p "$ROS_HOME" "$ROS_LOG_DIR"

@@ -590,9 +590,7 @@ class A3Nodes:
         self.namespace = namespace
         self.rpc = rpc
         self.robot = Node("agibot_a3_driver_robot", context=ros2.ctx_robot)
-        core_node = Node("agibot_a3_driver_core", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self.robot)
-        ros2.executor_core.add_node(core_node)
         self.media_robot = None
         self._media_ros_executor = None
         self._media_ros_thread = None
@@ -628,6 +626,10 @@ class A3Nodes:
             self.core_bridge = CoreBridge()
             self.core_bridge.start()
             atexit.register(self.core_bridge.stop)
+        core_node = None
+        if self.core_bridge is None:
+            core_node = Node("agibot_a3_driver_core", context=ros2.ctx_core)
+            ros2.executor_core.add_node(core_node)
 
         class _CoreFacade:
             def __init__(self, node, bridge):
@@ -638,7 +640,23 @@ class A3Nodes:
                     return BridgePublisher(self._bridge, topic, msg_type)
                 return self._node.create_publisher(msg_type, topic, qos)
 
+            def create_subscription(self, msg_type, topic, callback, qos):
+                if self._bridge is not None:
+                    return self._bridge.subscribe(topic, msg_type, callback, qos)
+                return self._node.create_subscription(msg_type, topic, callback, qos)
+
+            def destroy_subscription(self, subscription):
+                if self._bridge is not None:
+                    return self._bridge.unsubscribe(subscription)
+                return self._node.destroy_subscription(subscription)
+
+            def destroy_node(self):
+                if self._node is not None:
+                    return self._node.destroy_node()
+
             def __getattr__(self, name):
+                if self._node is None:
+                    raise AttributeError(name)
                 return getattr(self._node, name)
 
         self.core = _CoreFacade(core_node, self.core_bridge)
@@ -702,6 +720,7 @@ class A3Nodes:
         self._encoding_keys = set()
         self._media_failures = set()
         self._media_received = {}
+        self._stream_errors = {}
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
         self._jazzy_relay = os.environ.get("A3_JAZZY_RELAY") == "1"
@@ -743,6 +762,11 @@ class A3Nodes:
                     # IMU data changes, otherwise the model stays at the
                     # orientation captured when the last joint packet arrived.
                     self._publish_joint_streams()
+                elif key in ("battery", "estop"):
+                    count = self._media_received.get(key, 0) + 1
+                    self._media_received[key] = count
+                    if count == 1 or count % 100 == 0:
+                        print(f"[state] received={count} key={key} topic={robot_topic}", flush=True)
                 if key == "lidar_cloud":
                     if self._jazzy_relay:
                         pub.publish(msg)
@@ -771,7 +795,15 @@ class A3Nodes:
                                     lambda _future, stream_key=key: self._clear_encoding(stream_key))
                     return
                 if as_json:
-                    value = json_filter(msg) if json_filter else jsonable(msg)
+                    try:
+                        value = json_filter(msg) if json_filter else jsonable(msg)
+                    except Exception as exc:
+                        count = self._stream_errors.get(key, 0) + 1
+                        self._stream_errors[key] = count
+                        if count == 1 or count % 100 == 0:
+                            print(f"[state] decode failed key={key} topic={robot_topic} "
+                                  f"count={count} error={exc}", flush=True)
+                        return
                     output = self._String()
                     output.data = json.dumps(value, ensure_ascii=False)
                     pub.publish(output)
@@ -867,13 +899,18 @@ class A3Nodes:
                 self._pb["processed_audio"] = agent_data_pb2.ProcessedAudioOutput
             except (ImportError, AttributeError):
                 pass
-        if self._pb is not None and self._probe_wrapper_type() is not None:
-            mirror("battery", self._wrapper_type(ros2), "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel",
-                   "data/json", json_filter=self._decode_bms)
-            mirror("estop", self._wrapper_type(ros2), "/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel",
-                   "data/json", json_filter=self._decode_emergency)
-            mirror("skill_status", self._wrapper_type(ros2), "/skill/pilot/skill_status",
+        wrapper_type = self._probe_wrapper_type() if self._pb is not None else None
+        if self._pb is not None and wrapper_type is not None:
+            bms_topic = "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel"
+            estop_topic = "/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel"
+            mirror("battery", wrapper_type, bms_topic, "data/json", json_filter=self._decode_bms)
+            mirror("estop", wrapper_type, estop_topic, "data/json", json_filter=self._decode_emergency)
+            mirror("skill_status", wrapper_type, "/skill/pilot/skill_status",
                    "data/json", json_filter=self._decode_skill_status)
+            print(f"[state] subscribed battery={bms_topic} estop={estop_topic}", flush=True)
+        else:
+            missing = "a3_aimdk protobuf" if self._pb is None else "ros2_plugin_proto RosMsgWrapper"
+            print(f"[state] battery/estop subscriptions unavailable: missing {missing}", flush=True)
 
         # BMS and emergency channels are event/state reports, not high-rate
         # sensors.  Republish the latest decoded value once per second so the
@@ -1361,6 +1398,7 @@ class A3Nodes:
         try:
             channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
+            self._log_pb_decode_failure("battery", msg)
             return self._wrapper_json(msg)
         return self._protobuf_flat_json(channel)
 
@@ -1371,8 +1409,16 @@ class A3Nodes:
         try:
             channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
+            self._log_pb_decode_failure("estop", msg)
             return self._wrapper_json(msg)
         return self._protobuf_flat_json(channel)
+
+    def _log_pb_decode_failure(self, key, msg):
+        count = self._stream_errors.get(key, 0) + 1
+        self._stream_errors[key] = count
+        if count == 1 or count % 100 == 0:
+            print(f"[state] protobuf decode failed key={key} count={count} "
+                  f"bytes={len(self._wrapper_bytes(msg))}", flush=True)
 
     @staticmethod
     def _protobuf_json(message):
@@ -1644,6 +1690,8 @@ class A3Nodes:
     def close(self):
         self.robot.destroy_node()
         self.core.destroy_node()
+        if self.core_bridge is not None:
+            self.core_bridge.stop()
 
 
 class A3Rpc:

@@ -11,10 +11,9 @@
   <link name="R_ring_abad_link"/><link name="R_ring_pip_link"/><link name="R_ring_dip_link"/><link name="R_ring_tip"/>
   <link name="R_pinky_abad_link"/><link name="R_pinky_pip_link"/><link name="R_pinky_dip_link"/><link name="R_pinky_tip"/>
 
-  <!-- Mount the official OmniHand frame on the A3 wrist: palm normal +X -> up
-       (+Z). The A3 wrist mounts provide the left/right mirror; do not add a
-       yaw here, otherwise both palms are rendered toward the robot rear. -->
-  <joint name="L_palm_joint" type="fixed"><origin xyz="0 0 0" rpy="0 1.5707963 0"/><parent link="left_hand_palm_Link"/><child link="L_palm"/></joint>
+  <!-- Compose with each mirrored A3 wrist mount so the official OmniHand
+       palm normal (+X) points up (+Z) and fingers (+Z) point forward (+X). -->
+  <joint name="L_palm_joint" type="fixed"><origin xyz="0 0 0" rpy="0 1.5707963 -1.5707963"/><parent link="left_hand_palm_Link"/><child link="L_palm"/></joint>
   <joint name="L_thumb_roll_joint" type="revolute"><origin xyz="0 -0.018529 0.046851" rpy="0 0 0"/><parent link="L_palm"/><child link="L_thumb_roll_link"/><axis xyz="1 0 0"/><limit lower="-1.1213740444063567" upper="0.029670597283903602" effort="0.784" velocity="8.729"/></joint>
   <joint name="L_thumb_abad_joint" type="revolute"><origin xyz="0.020033 -0.004292 0.00075" rpy="0 0 0"/><parent link="L_thumb_roll_link"/><child link="L_thumb_abad_link"/><axis xyz="0 0 1"/><limit lower="-0.04537856055185257" upper="1.642354826126664" effort="0.588" velocity="11.636"/></joint>
   <joint name="L_thumb_mcp_joint" type="revolute"><origin xyz="0 -0.0265 -0.0058001" rpy="0 0 0"/><parent link="L_thumb_abad_link"/><child link="L_thumb_mcp_link"/><axis xyz="1 0 0"/><limit lower="-0.8415977653116657" upper="0" effort="1.764" velocity="3.879"/></joint>
@@ -38,7 +37,7 @@
   <joint name="L_pinky_dip_joint" type="revolute"><origin xyz="-0.0014266 0 0.036" rpy="0 0 0"/><parent link="L_pinky_pip_link"/><child link="L_pinky_dip_link"/><axis xyz="0 1 0"/><limit lower="0" upper="1.7540558982543013" effort="1.764" velocity="3.879"/><mimic joint="L_pinky_pip_joint" multiplier="1.097" offset="0"/></joint>
   <joint name="L_pinky_tip_joint" type="fixed"><origin xyz="-0.00131 0 0.03841" rpy="0 0 0"/><parent link="L_pinky_dip_link"/><child link="L_pinky_tip"/></joint>
 
-  <joint name="R_palm_joint" type="fixed"><origin xyz="0 0 0" rpy="0 1.5707963 0"/><parent link="right_hand_palm_Link"/><child link="R_palm"/></joint>
+  <joint name="R_palm_joint" type="fixed"><origin xyz="0 0 0" rpy="0 1.5707963 1.5707963"/><parent link="right_hand_palm_Link"/><child link="R_palm"/></joint>
   <joint name="R_thumb_roll_joint" type="revolute"><origin xyz="0 0.018529 0.046851" rpy="0 0 0"/><parent link="R_palm"/><child link="R_thumb_roll_link"/><axis xyz="1 0 0"/><limit lower="-0.029670597283903602" upper="1.1213740444063567" effort="0.784" velocity="8.729"/></joint>
   <joint name="R_thumb_abad_joint" type="revolute"><origin xyz="0.020033 0.004292 0.00075" rpy="0 0 0"/><parent link="R_thumb_roll_link"/><child link="R_thumb_abad_link"/><axis xyz="0 0 1"/><limit lower="-1.642354826126664" upper="0.04537856055185257" effort="0.588" velocity="11.636"/></joint>
   <joint name="R_thumb_mcp_joint" type="revolute"><origin xyz="0 0.0265 -0.0058001" rpy="0 0 0"/><parent link="R_thumb_abad_link"/><child link="R_thumb_mcp_link"/><axis xyz="1 0 0"/><limit lower="0" upper="0.8415977653116657" effort="1.764" velocity="3.879"/></joint>

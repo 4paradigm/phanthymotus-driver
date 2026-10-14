@@ -49,6 +49,7 @@ class CoreBridge:
         self._dropped = 0
         self._topic_counts = {}
         self._metrics_lock = threading.Lock()
+        self._subscriptions = set()
 
     def start(self):
         for lane, messages in self._queues.items():
@@ -136,7 +137,23 @@ class CoreBridge:
         except Exception as exc:
             print(f"[dds-bridge] enqueue failed topic={topic}: {exc}", flush=True)
 
+    def subscribe(self, topic, msg_type, callback, qos=5):
+        """Receive a domain-42 topic in an isolated loopback-profiled process."""
+        subscription = _BridgeSubscription(
+            self._ctx, self._profile, self._domain, topic, msg_type, callback, qos)
+        subscription.start()
+        self._subscriptions.add(subscription)
+        return subscription
+
+    def unsubscribe(self, subscription):
+        if subscription in self._subscriptions:
+            subscription.stop()
+            self._subscriptions.discard(subscription)
+
     def stop(self):
+        for subscription in tuple(self._subscriptions):
+            subscription.stop()
+        self._subscriptions.clear()
         if not self._procs:
             return
         try:
@@ -164,6 +181,97 @@ class BridgePublisher:
 
     def publish(self, msg):
         self.bridge.publish(self.topic, msg, self.msg_type)
+
+
+class _BridgeSubscription:
+    def __init__(self, context, profile, domain, topic, msg_type, callback, qos):
+        self._ctx = context
+        self._profile = profile
+        self._domain = domain
+        self._topic = topic
+        self._msg_type = msg_type
+        self._callback = callback
+        self._qos = qos
+        self._messages = context.Queue(maxsize=8)
+        self._stop = context.Event()
+        self._process = context.Process(
+            target=_run_subscription,
+            args=(self._messages, self._stop, profile, domain, topic,
+                  _type_name(msg_type), qos),
+            name="a3-core-domain-bridge-subscription", daemon=True)
+        self._thread = threading.Thread(target=self._dispatch, daemon=True,
+                                        name="a3-core-domain-bridge-dispatch")
+
+    def start(self):
+        self._process.start()
+        self._thread.start()
+        print(f"[dds-bridge] subscription started topic={self._topic} "
+              f"pid={self._process.pid} domain={self._domain}", flush=True)
+
+    def _dispatch(self):
+        from rclpy.serialization import deserialize_message
+        while not self._stop.is_set():
+            try:
+                payload = self._messages.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if payload is None:
+                return
+            try:
+                self._callback(deserialize_message(payload, self._msg_type))
+            except Exception as exc:
+                print(f"[dds-bridge] subscription callback failed topic={self._topic}: {exc}",
+                      flush=True)
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self._messages.put_nowait(None)
+        except queue.Full:
+            pass
+        self._process.join(timeout=2)
+        if self._process.is_alive():
+            self._process.terminate()
+        self._thread.join(timeout=1)
+
+
+def _run_subscription(messages, stop, profile, domain, topic, type_name, qos_depth):
+    os.environ["ROS_DOMAIN_ID"] = str(domain)
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+    if os.path.isfile(profile):
+        os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.serialization import serialize_message
+    from sensor_msgs.msg import JointState
+    from std_msgs.msg import String, UInt8MultiArray
+    types = {"sensor_msgs/msg/JointState": JointState,
+             "std_msgs/msg/String": String,
+             "std_msgs/msg/UInt8MultiArray": UInt8MultiArray}
+    try:
+        from audio_msgs.msg import AudioChunk
+        types["audio_msgs/msg/AudioChunk"] = AudioChunk
+    except ImportError:
+        pass
+    msg_type = types.get(type_name)
+    if msg_type is None:
+        print(f"[dds-bridge] unsupported subscription type={type_name} topic={topic}",
+              flush=True)
+        return
+    rclpy.init()
+    node = Node("agibot_a3_core_bridge_subscription")
+    qos = QoSProfile(depth=int(qos_depth), reliability=ReliabilityPolicy.RELIABLE)
+    node.create_subscription(msg_type, topic,
+                             lambda msg: messages.put(serialize_message(msg)), qos)
+    print(f"[dds-bridge] subscriber created topic={topic} type={type_name}", flush=True)
+    try:
+        while rclpy.ok() and not stop.is_set():
+            rclpy.spin_once(node, timeout_sec=0.1)
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def _run(messages, profile, domain, lane):

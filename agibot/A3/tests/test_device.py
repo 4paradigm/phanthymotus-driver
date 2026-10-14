@@ -23,6 +23,7 @@ import types
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest.mock import patch
 
 DEVICE_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = DEVICE_DIR.parent.parent
@@ -108,10 +109,10 @@ class FakeQoSReliabilityPolicy:
 
 class FakeExecutor:
     def __init__(self, *args, **kwargs):
-        pass
+        self.nodes = []
 
     def add_node(self, node):
-        pass
+        self.nodes.append(node)
 
     def spin(self):
         pass
@@ -239,7 +240,7 @@ class RecordingTransport:
         return [(url, body) for url, body in self.calls if marker in url]
 
 
-def build_bundle_plugins(config=None, transport=None):
+def build_bundle_plugins(config=None, transport=None, ros2=None):
     config = config if config is not None else json.loads(json.dumps(BASE_CONFIG))
     config.setdefault("plugins", {}).setdefault("camera", {}).setdefault(
         "streams", ["head_left_fisheye", "chest_front_d457_rgb",
@@ -255,7 +256,7 @@ def build_bundle_plugins(config=None, transport=None):
 
     device.A3Rpc.__init__ = patched_init
     try:
-        return device.build_plugins(config, "test_ns", FakeROS2()), transport
+        return device.build_plugins(config, "test_ns", ros2 or FakeROS2()), transport
     finally:
         device.A3Rpc.__init__ = original_init
 
@@ -316,6 +317,46 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertIn("if ! /work/agibot/A3/jazzy_relay.sh start; then", dockerfile)
         self.assertIn("[fatal] host Jazzy relay is required for A3 cameras", dockerfile)
         self.assertIn("exit 1; fi; trap '/work/agibot/A3/jazzy_relay.sh stop || true' EXIT", dockerfile)
+
+    def test_host_relay_uses_materialized_constrained_profile(self):
+        script = (DEVICE_DIR / "jazzy_relay.sh").read_text(encoding="utf-8")
+        self.assertIn("HOST_PROFILE=$ROOT/dds-profile.xml", script)
+        self.assertIn("cp /work/agibot/A3/dds-profile.xml \"$HOST_PROFILE\"", script)
+        self.assertIn("export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/data/a3-relay/dds-profile.xml", script)
+
+    def test_core_bridge_does_not_create_parent_domain_42_node(self):
+        class FakeBridge:
+            def __init__(self):
+                self.subscriptions = []
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def publish(self, topic, msg, msg_type):
+                pass
+
+            def subscribe(self, topic, msg_type, callback, qos):
+                self.subscriptions.append(topic)
+                return object()
+
+            def unsubscribe(self, subscription):
+                pass
+
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["ros"]["core_bridge"] = True
+        config["plugins"] = FULL_PLUGINS
+        ros2 = FakeROS2()
+        with patch.object(device, "CoreBridge", FakeBridge):
+            plugins, _ = build_bundle_plugins(config, ros2=ros2)
+        self.assertEqual(ros2.executor_core.nodes, [])
+        nodes = next(iter(plugins.values())).nodes
+        self.assertIsNone(nodes.core._node)
+        nodes.core.create_subscription(FakeMsg, "/test_ns/mic/audio", lambda _msg: None, 5)
+        self.assertIn("/test_ns/mic/audio", nodes.core_bridge.subscriptions)
+        nodes.close()
 
     def test_driver_bundle_accepts_named_plugin_mapping(self):
         config = json.loads(json.dumps(BASE_CONFIG))
@@ -2561,15 +2602,16 @@ class MirrorStreamTests(unittest.TestCase):
         }
         for side, (name, wrist_joint) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
-            self.assertEqual(origin.attrib["rpy"], "0 1.5707963 0")
+            expected = {"left": "0 1.5707963 -1.5707963",
+                        "right": "0 1.5707963 1.5707963"}[side]
+            self.assertEqual(origin.attrib["rpy"], expected)
             wrist_origin = a3_root.find(f"joint[@name='{wrist_joint}']/origin")
             total = multiply(rotation(wrist_origin.attrib["rpy"]),
                              rotation(origin.attrib["rpy"]))
-            # Official OmniHand palm normal is +X. A3's mirrored wrist mounts
-            # keep that normal upright while retaining their opposite lateral
-            # finger directions; the hand root must not add another yaw.
+            # Official OmniHand palm normal +X maps up; finger axis +Z maps
+            # forward for both sides after composing with the mirrored wrists.
             targets = (((1, 0, 0), (0, 0, 1)),
-                       ((0, 0, 1), (0, -1, 0) if side == "left" else (0, 1, 0)))
+                       ((0, 0, 1), (1, 0, 0)))
             for axis, target in targets:
                 mapped = [sum(total[row][col] * axis[col] for col in range(3))
                           for row in range(3)]
