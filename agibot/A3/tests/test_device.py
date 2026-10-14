@@ -2602,15 +2602,15 @@ class MirrorStreamTests(unittest.TestCase):
         }
         for side, (name, wrist_joint) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
-            expected = {"left": "-3.1415927 0 1.5707963",
-                        "right": "-3.1415927 0 -1.5707963"}[side]
+            expected = {"left": "3.1415914 -0.0015927 1.5715927",
+                        "right": "3.1415926 -0.0015927 -1.5707927"}[side]
             self.assertEqual(origin.attrib["rpy"], expected)
             wrist_origin = a3_root.find(f"joint[@name='{wrist_joint}']/origin")
             total = multiply(rotation(wrist_origin.attrib["rpy"]),
                              rotation(origin.attrib["rpy"]))
-            # The last deployed frame appeared as palm-back/fingers-down.
-            # One -90 degree robot-frame Y correction maps palm +Z to up and
-            # finger direction -X to forward for both mirrored mounts.
+            # The deployed robot is palm-up with fingers forward.  Verify the
+            # complete wrist-plus-hand transform, rather than accumulating
+            # intuitive quarter-turns in Euler-angle form.
             targets = (((0, 0, 1), (0, 0, 1)),
                        ((-1, 0, 0), (1, 0, 0)))
             for axis, target in targets:

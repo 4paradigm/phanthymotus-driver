@@ -113,7 +113,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 - The host-side Jazzy media relay is launched through `nsenter` with the host's
   `/usr/bin/python3` and `/opt/ros/jazzy`. Its Python environment is separate
   from the container: camera/depth conversion additionally requires host
-  `numpy` and `opencv-python`. Relay startup checks and logs these imports and
+  `numpy` and `opencv-python` in the host Jazzy interpreter. Relay startup checks and logs these imports and
   versions before reporting readiness; container pip packages do not satisfy
   host Python imports.
 - Without the wheel or generated ROS interfaces in the container, the driver

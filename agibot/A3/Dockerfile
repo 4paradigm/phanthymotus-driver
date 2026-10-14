@@ -12,6 +12,10 @@ ARG A3_AIMDK_SHA256=2ce4ede82a5e82f4724414c0cb82f9966538b7232eef6cf70c96c1b6dd55
 # A3 has no vendored msgs package to colcon-build (unlike X2's aimdk_msgs zip).
 # Fetch the official AimDK wheel from COS at build time instead of committing a
 # binary artifact to Git. ros2_plugin_proto remains built from this source tree.
+# Camera conversion is performed by the host Jazzy relay in the deployed
+# service, so image codec wheels are intentionally not installed in this image.
+# A manually selected non-relay development run must provide numpy/OpenCV in
+# that interpreter before using the local re-encoding fallback.
 COPY requirements.txt /tmp/agibot-a3-requirements.txt
 RUN python3 -c "import urllib.request; urllib.request.urlretrieve('${A3_AIMDK_URL}', '/tmp/a3_aimdk-3.2.0-py3-none-any.whl')" && \
     echo "${A3_AIMDK_SHA256}  /tmp/a3_aimdk-3.2.0-py3-none-any.whl" | sha256sum -c - && \

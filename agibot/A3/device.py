@@ -622,7 +622,7 @@ class A3Nodes:
             self._media_ros_executor = None
             print(f"[media] dedicated executor unavailable: {exc}", flush=True)
         self.core_bridge = None
-        if config.get("ros", {}).get("core_bridge", False) and os.environ.get("A3_ZENOH_BRIDGE") != "1":
+        if config.get("ros", {}).get("core_bridge", False):
             self.core_bridge = CoreBridge()
             self.core_bridge.start()
             atexit.register(self.core_bridge.stop)
@@ -690,9 +690,6 @@ class A3Nodes:
         audio_qos = QoSProfile(depth=10, reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
                                                               QoSReliabilityPolicy.BEST_EFFORT),
                                 durability=QoSDurabilityPolicy.VOLATILE)
-        state_qos = QoSProfile(depth=10, reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
-                                                              QoSReliabilityPolicy.BEST_EFFORT),
-                               durability=QoSDurabilityPolicy.VOLATILE)
 
         self.streams = {}
         self._joint_cache = {}
@@ -906,12 +903,15 @@ class A3Nodes:
         if self._pb is not None and wrapper_type is not None:
             bms_topic = "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel"
             estop_topic = "/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel"
-            mirror("battery", wrapper_type, bms_topic, "data/json", qos=state_qos,
+            # BMS/emergency writers on the robot use the sensor-data
+            # (BEST_EFFORT) profile.  Do not force RELIABLE here: DDS treats
+            # that as incompatible and the state stream then stays empty.
+            mirror("battery", wrapper_type, bms_topic, "data/json",
                    json_filter=self._decode_bms)
-            mirror("estop", wrapper_type, estop_topic, "data/json", qos=state_qos,
+            mirror("estop", wrapper_type, estop_topic, "data/json",
                    json_filter=self._decode_emergency)
             mirror("skill_status", wrapper_type, "/skill/pilot/skill_status",
-                   "data/json", qos=state_qos, json_filter=self._decode_skill_status)
+                   "data/json", json_filter=self._decode_skill_status)
             print(f"[state] subscribed battery={bms_topic} estop={estop_topic}", flush=True)
         else:
             missing = "a3_aimdk protobuf" if self._pb is None else "ros2_plugin_proto RosMsgWrapper"
