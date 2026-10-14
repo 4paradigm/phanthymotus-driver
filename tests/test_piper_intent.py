@@ -125,6 +125,23 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(self.sdk.pose[2], 251000)
         self.assertTrue(all(c[3] == 1 for c in self.sdk.calls if c[0] == 'mode'))
 
+    def test_control_card_discovers_background_camera_only_when_configured(self):
+        def outputs(runtime):
+            return runtime.get_tools()[0]['topic_out']
+        self.assertFalse(any(t['format'] == 'image/jpeg' for t in outputs(self.runtime)))
+        self.runtime.config['camera'] = {'live': {'enabled': True}}
+        self.assertEqual(outputs(self.runtime)[-1],
+                         {'topic': '/agilex/piper/camera/live', 'format': 'image/jpeg'})
+        other = build_plugins({'camera': {'device': '/dev/piper-camera-2',
+                               'live': {'enabled': True}}, 'data_dir': self.tmp.name}, 'piper2', None)
+        self.addCleanup(other[0].stop)
+        self.addCleanup(other[1].stop)
+        self.addCleanup(other[2].stop)
+        self.assertEqual(outputs(other[0])[-1],
+                         {'topic': '/piper2/piper/camera/live', 'format': 'image/jpeg'})
+        self.assertEqual(outputs(other[0])[-1], other[2].get_tools()[0]['topic_out'][0])
+        self.assertEqual(self.sdk.calls, [])
+
     def test_move_waits_for_controller_planning_without_resending_target(self):
         # This controller needs uninterrupted planning time. Every submitted
         # target restarts that delay, even when the coordinates are identical.

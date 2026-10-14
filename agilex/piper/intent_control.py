@@ -108,13 +108,18 @@ class IntentControlPlugin(PiperPlugin):
                        'x-completion': {'actions': sorted(TASK_ACTIONS), 'timeout': 45}})
         schema['x-action-params'].pop('select_action')
         namespace = self.topic.rsplit('/', 1)[0]
+        outputs = [{'topic': namespace + '/state/joints', 'format': 'sensor/skeleton'},
+                   {'topic': namespace + '/state/parameters', 'format': 'data/json'}]
+        # The existing background camera owns acquisition and publication.
+        # Declare its stream here so Monitor discovers it with only this card.
+        if self.config.get('camera', {}).get('live', {}).get('enabled', False):
+            outputs.append({'topic': namespace + '/camera/live', 'format': 'image/jpeg'})
         arm = tool(CONTROL, 'actuator',
                    'Choose a direction to move the gripper by one small step (1 mm, 1% speed), control the gripper, or stop. '
                    'Forward +X, backward -X, left +Y, right -Y, raise +Z, lower -Z in the fixed robot base frame; '
                    'directions do not follow the camera. Keep the workspace clear. '
                    'Gripper orientation stays fixed. Exit teaching and hold requires a stationary arm.',
-                   schema, topic_out=[{'topic': namespace + '/state/joints', 'format': 'sensor/skeleton'},
-                                      {'topic': namespace + '/state/parameters', 'format': 'data/json'}])
+                   schema, topic_out=outputs)
         arm['title'] = 'Arm control'
         photo_schema = action_schema({'start': ([], 'Ready without capture'), 'stop': ([], 'Cancel photo operation'),
             'info': ([], 'Photo status'), 'capture': (['capture_confirmed'], 'Capture one current RGB photo'),

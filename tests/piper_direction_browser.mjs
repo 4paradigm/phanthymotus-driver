@@ -17,9 +17,12 @@ from test_piper_intent import IntentDriver
 from agilex.piper.device import build_plugins
 from common.vendor_runtime import DriverBundle
 with tempfile.TemporaryDirectory() as d:
- p=build_plugins({'data_dir':d,'name':'PiPER arm 1','async_actions':False},'agilex',None)
+ p=build_plugins({'data_dir':d,'name':'PiPER arm 1','async_actions':False,'camera':{'live':{'enabled':True}}},'agilex',None)
  p[0].factory=IntentDriver;p[0].connected()
- try:print(json.dumps({'tools':DriverBundle(p).get_all_tools(),'frame':p[1].monitor.read(),'urdf':DriverBundle(p).dispatch('model',{})['urdf']}))
+ try:
+  import cv2,numpy as np,base64
+  jpeg=base64.b64encode(cv2.imencode('.jpg',np.zeros((48,64,3),dtype=np.uint8))[1]).decode()
+  print(json.dumps({'tools':DriverBundle(p).get_all_tools(),'frame':p[1].monitor.read(),'urdf':DriverBundle(p).dispatch('model',{})['urdf'],'jpeg':jpeg}))
  finally:p[0].stop()
 `], {encoding:'utf8'});
 assert.equal(fixtureResult.status,0,fixtureResult.stderr);
@@ -35,7 +38,7 @@ from agilex.piper.device import build_plugins
 from common.vendor_runtime import DriverBundle
 args=json.load(sys.stdin)
 with tempfile.TemporaryDirectory() as d:
- p=build_plugins({'data_dir':d,'async_actions':False},'agilex',None)
+ p=build_plugins({'data_dir':d,'async_actions':False,'camera':{'live':{'enabled':True}}},'agilex',None)
  p[0].factory=IntentDriver;driver=p[0].connected()
  try:
   with patch('agilex.piper.intent_control.move_cartesian',side_effect=fast_move):
@@ -47,6 +50,7 @@ with tempfile.TemporaryDirectory() as d:
 }
 const topic='/agilex/piper/state/joints';
 const params='/agilex/piper/state/parameters';
+const camera='/agilex/piper/camera/live';
 const mcp={id:'intent-arm1',name:'PiPER arm 1',online:true,tools:fixture.tools};
 const layout={cards:[{id:'arm1-control',mcpId:mcp.id,toolName:'arm_control',driverName:'PiPER simulated arm',x:30,y:20,topicOut:fixture.tools.find(t=>t.name==='arm_control').topic_out}],connections:[]};
 const server=createServer(async(req,res)=>{
@@ -54,7 +58,7 @@ const server=createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost');
   let data;
   if(url.pathname==='/api/mcp')data={data:[mcp]};
-  else if(url.pathname==='/api/topics')data={data:[{topic,format:'sensor/skeleton',mcp_id:mcp.id},{topic:params,format:'data/json',mcp_id:mcp.id}]};
+  else if(url.pathname==='/api/topics')data={data:[{topic,format:'sensor/skeleton',mcp_id:mcp.id},{topic:params,format:'data/json',mcp_id:mcp.id},{topic:camera,format:'image/jpeg',mcp_id:mcp.id}]};
   else if(url.pathname==='/favicon.ico'){res.statusCode=204;res.end();return;}
   else if(url.pathname==='/api/canvas/layout')data={data:layout};
   else if(url.pathname==='/api/config/project-running')data={running:false};
@@ -124,15 +128,20 @@ try{
  const urls=await page.evaluate(()=>window.sockets.map(s=>s.url));
  assert.ok(urls.some(u=>u.endsWith('/state/joints')));
  assert.ok(urls.some(u=>u.endsWith('/state/parameters')));
+ assert.ok(urls.some(u=>u.endsWith('/camera/live')));
+ assert.equal(layout.cards.length,1);
+ assert.ok(!layout.cards.some(c=>c.toolName==='piper_camera_live'));
+ await page.evaluate(jpeg=>{for(const ws of window.sockets){if(ws.url.endsWith('/camera/live'))ws.onmessage({data:Uint8Array.from(atob(jpeg),c=>c.charCodeAt(0)).buffer});}},fixture.jpeg);
+ await page.waitForFunction(()=>document.querySelector('#monitor-dashboard-grid img')?.naturalWidth===64);
  for(const angle of [.1,.2,.3]){
   const frame=structuredClone(controlResults.at(-1).frame);frame.skeleton.joints[0].q=angle;frame.parameters['J1 angle (deg)']=angle*180/Math.PI;
-  await page.evaluate(frame=>{for(const ws of window.sockets){const data=ws.url.endsWith('/joints')?frame.skeleton:frame.parameters;ws.onmessage({data:new TextEncoder().encode(JSON.stringify(data)).buffer});}},frame);
+  await page.evaluate(frame=>{for(const ws of window.sockets){if(ws.url.endsWith('/camera/live'))continue;const data=ws.url.endsWith('/joints')?frame.skeleton:frame.parameters;ws.onmessage({data:new TextEncoder().encode(JSON.stringify(data)).buffer});}},frame);
  }
- assert.equal(await page.locator('#monitor-dashboard-grid .monitor-card').count(),2);
+ assert.equal(await page.locator('#monitor-dashboard-grid .monitor-card').count(),3);
  assert.ok(await page.locator('#monitor-dashboard-grid canvas').count());
  await page.waitForFunction(()=>document.querySelector('#monitor-dashboard-grid').textContent.includes('completed'));
  assert.deepEqual(errors,[]);
  await page.screenshot({path:path.join(out,'direction-card-dashboard.png'),fullPage:false});
  await writeFile(path.join(out,'browser-result.json'),JSON.stringify({canvas_nodes:1,tool:'arm_control',subscriptions:urls,requests,control_results:controlResults,script_errors:errors},null,2));
- console.log('Unchanged Core card passed: six no-parameter direction actions, default no-op, simulated production Move, PiPER model and both topics.');
+ console.log('Unchanged Core card passed: six no-parameter direction actions, default no-op, simulated production Move, PiPER model and background camera with only a control canvas node.');
 }catch(e){await page.screenshot({path:path.join(out,'browser-failure.png'),fullPage:false});console.error({errors,requests});throw e;}finally{await page.evaluate(()=>window.dashboard?.deactivate());await browser.close();server.close();}

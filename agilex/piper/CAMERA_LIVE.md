@@ -77,3 +77,15 @@ V4L2/OpenCV 采集使用 spawn 子进程，尽量排空相机采集缓冲；只�
 
 本轮没有 PR 更新；相机版本尚未生成。已有 PR #382 的历史 Version
 `release.261013.74ab514` 不包含这次实时相机功能。
+
+## 2026-10-14 background discovery through Arm control
+
+The live camera runs in the existing shared driver lifecycle and requires no camera canvas node. When camera.live.enabled is configured, Arm control declares the existing namespaced /camera/live JPEG topic alongside its skeleton and parameter outputs. Camera acquisition, ownership, retries and worker implementation are unchanged. The piper_camera_live resource retains its lifecycle/Info interface for diagnostics, like the model resource.
+
+Arm 1 canvas migration removes only that device's piper_camera_live node and its incident connections, and updates control topicOut. The canvas now contains only Arm control. The latest layout and source/config/compose were backed up; unrelated cards and arm 2 are preserved.
+
+Validation: 51 related tests and 44 subtests passed; the candidate image passed 63 offline unittest tests. The unchanged Core browser harness, with one control node and no camera node, discovers skeleton, parameters and camera, renders a simulated JPEG with its expected dimensions and loads PiPER URDF. Server read-only checks confirm fresh arm feedback and live camera publication around 10 fps. Browser access to the actual server tab was blocked by tool policy, so final visual refresh remains with the user. No physical arm controls were invoked.
+
+Image: agilex-piper:local-arm1-background-camera-539a4529. Backup: /opt/phanthy-motus/backups/piper-arm1-background-camera-20261014-140525/. Motion, camera worker, configuration, Core and arm 2 checked unchanged. Evidence: workspace acceptance/20261014_piper_background_camera/. PR #382 pending user testing; current Bot Version 尚未生成.
+
+Removing the last camera canvas node makes Core stop that resource. The migration resumes only piper_camera_live acquisition with its camera-only start action after removal; arm control receives no Start/Stop or mode/motor command. Post-migration live publication is verified separately. The first stream probe overlapped camera warm-up and failed its steady 10 fps check; the warmed-up repeat passed. Frame contents were not saved.
