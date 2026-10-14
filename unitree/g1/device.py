@@ -1343,7 +1343,9 @@ class LocoPlugin:
         self._slam_client = slam_client
         self._smart_motion = smart_motion
         self._namespace = namespace
-        self._move_timer: threading.Timer | None = None
+        # Direct clients and the subprocess fallback share the same deadline logic.
+        from timed_motion import TimedMotion
+        self._fallback_motion = TimedMotion(loco_client) if hasattr(loco_client, "BeginMove") else None
         # _LocoStateNode — authoritative fsm_id/fsm_mode from rt/sportmodestate.
         self._state_node = state_node
         # _LowStateNode — joint-derived posture, needed to tell lying from squatting
@@ -1530,26 +1532,30 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
-        if self._move_timer:
-            self._move_timer.cancel()
-            self._move_timer = None
-        self._client.StopMove()
+        if self._smart_motion:
+            self._smart_motion.stop(reason="shutdown")
+        elif self._fallback_motion:
+            self._fallback_motion.stop("shutdown")
+        else:
+            self._client.StopMove()
 
-    def _auto_stop(self):
-        """Timer 回调：自动停止运动"""
-        self._move_timer = None
-        self._client.StopMove()
-
-    def _auto_stop_acp(self, action_id: str):
-        """Timer 回调：自动停止运动 + fire ACP callback."""
-        self._move_timer = None
-        self._client.StopMove()
-        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
-
-    def _acp_wait_move(self, action_id: str, duration: float):
-        """Wait for SmartMotion timed move to complete, then fire ACP callback."""
-        time.sleep(duration + 0.5)  # SmartMotion auto-stops after duration; small buffer
-        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
+    def _acp_wait_move(self, action_id: str):
+        """Notify from this action's recorded stop outcome, never a fixed sleep."""
+        while True:
+            if self._smart_motion:
+                outcome = self._smart_motion.get_motion_result(action_id)
+            elif self._fallback_motion:
+                outcome = self._fallback_motion.get_result(action_id)
+            else:
+                outcome = self._client.GetMotionResult(action_id)
+            if outcome.get("error"):
+                _loco_acp_notify(action_id, "error", {"error": outcome["error"]}, tool="loco")
+                return
+            status = outcome.get("status")
+            if status in ("completed", "cancelled", "error"):
+                _loco_acp_notify(action_id, status, outcome.get("result", {}), tool="loco")
+                return
+            time.sleep(0.1)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -1563,64 +1569,48 @@ class LocoPlugin:
                 return {"state": "running", "topic_out": [{"topic": topic, "format": "data/json"}]}
             return None
         if action == "move":
-            vx   = float(args.get("vx",   0))
-            vy   = float(args.get("vy",   0))
+            from uuid import uuid4
+            vx = float(args.get("vx", 0))
+            vy = float(args.get("vy", 0))
             vyaw = float(args.get("vyaw", 0))
             duration = float(args.get("duration", 0))
-
-            # Route through SmartMotion safety harness
+            if not all(math.isfinite(v) for v in (vx, vy, vyaw, duration)):
+                return {"error": "Motion parameters must be finite"}
+            action_id = f"g1_move_{uuid4().hex[:8]}"
             if self._smart_motion:
-                result = self._smart_motion.move(vx, vy, vyaw, duration)
-                if duration > 0:
-                    from uuid import uuid4
-                    action_id = f"g1_move_{uuid4().hex[:8]}"
-                    result["action_id"] = action_id
-                    # SmartMotion handles auto-stop internally; spawn thread to wait and notify
-                    threading.Thread(
-                        target=self._acp_wait_move,
-                        args=(action_id, duration),
-                        daemon=True,
-                    ).start()
-                return result
-
-            # Fallback: direct control (no safety harness)
-            vx   = max(-1.0, min(1.0, vx))
-            vy   = max(-1.0, min(1.0, vy))
-            vyaw = max(-2.0, min(2.0, vyaw))
-
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
-
-            if duration > 0:
-                from uuid import uuid4
-                action_id = f"g1_move_{uuid4().hex[:8]}"
-                # G1 SetVelocity duration has known bugs — use Timer fallback
-                ret = self._client.Move(vx, vy, vyaw, True)
-                self._move_timer = threading.Timer(duration, self._auto_stop_acp, args=[action_id])
-                self._move_timer.start()
-                return {"status": "moving", "action_id": action_id,
-                        "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+                result = self._smart_motion.move(vx, vy, vyaw, duration, action_id=action_id)
             else:
-                # Continuous move until explicit stop
-                ret = self._client.Move(vx, vy, vyaw, True)
-                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+                vx = max(-1.0, min(1.0, vx))
+                vy = max(-1.0, min(1.0, vy))
+                vyaw = max(-2.0, min(2.0, vyaw))
+                if self._fallback_motion:
+                    result = self._fallback_motion.start(vx, vy, vyaw, duration, action_id)
+                else:
+                    result = self._client.TimedMove(vx, vy, vyaw, duration, action_id)
+            if duration <= 0:
+                # Continuous moves enter a state; keep identity internal so ACP
+                # does not register an unbounded pending completion.
+                return {key: value for key, value in result.items() if key != "action_id"}
+            if duration > 0 and result.get("action_id") == action_id:
+                threading.Thread(target=self._acp_wait_move, args=(action_id,), daemon=True).start()
+            return result
         elif action == "stop_move":
-            # Route through SmartMotion safety harness
             if self._smart_motion:
                 return self._smart_motion.stop()
-
-            # Fallback: direct control
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
+            # Send the movement stop before waiting for navigation RPCs.
+            if self._fallback_motion:
+                result = self._fallback_motion.stop()
+            else:
+                ret = self._client.StopMove()
+                result = {"ret": ret, "state": "idle" if ret == 0 else "stop_failed"}
+                if ret != 0:
+                    result["error"] = f"StopMove failed or unconfirmed: code={ret}"
             if self._slam_client:
                 try:
                     self._slam_client.PauseNav()
                 except Exception:
                     pass
-            ret = self._client.StopMove()
-            return {"ret": ret}
+            return result
         elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
                         "squat2standup", "emergency_stop", "get_current_mode"):
             # x-action-params split: action is the mode directly
@@ -3712,97 +3702,6 @@ class SpatialPlugin:
             self._node.set_nav_target(None)
             return {"status": "stopped"}
 
-        return None
-
-
-# ── MotionSwitcherPlugin (actuator) ──────────────────────────────────────────
-
-class MotionSwitcherPlugin:
-    PREFIX = "motion_switcher"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor, msc_client):
-        self._client = msc_client
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "motion_switcher",
-            "type": "actuator",
-            "multiInstance": False,
-            "description": (
-                "G1 high-level motion mode switcher — check current mode, select mode "
-                "(ai/normal/advanced), or release mode for low-level control. "
-                "Modes: ai=AI locomotion, normal=normal locomotion, advanced=advanced mode. "
-                "release frees control for lowcmd/dex3."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["check", "select", "release", "set_silent", "get_silent"],
-                        "description": "Action to perform",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["ai", "normal", "advanced"],
-                        "description": "Mode to select (for 'select' action)",
-                    },
-                    "silent": {
-                        "type": "boolean",
-                        "description": "Silent flag (for 'set_silent' action)",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "check":      {"params": [],         "description": "Check current motion mode"},
-                    "select":     {"params": ["mode"],   "description": "Select a motion mode (ai/normal/advanced)"},
-                    "release":    {"params": [],         "description": "Release current mode for low-level control"},
-                    "set_silent": {"params": ["silent"], "description": "Set silent mode on/off"},
-                    "get_silent": {"params": [],         "description": "Get current silent mode status"},
-                },
-            },
-        }
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "check":
-            if code != 0:
-                return {"error": f"CheckMode failed, code={code}"}
-            return {"mode": result}
-        elif action == "select":
-            mode = args.get("mode", "normal")
-            code, _ = self._client.SelectMode(mode)
-            if code != 0:
-                return {"error": f"SelectMode failed, code={code}"}
-            return {"ret": code, "selected": mode}
-        elif action == "release":
-            code, _ = self._client.ReleaseMode()
-            if code != 0:
-                return {"error": f"ReleaseMode failed, code={code}"}
-            return {"ret": code, "released": True}
-        elif action == "set_silent":
-            # SetSilent/GetSilent may not be exposed by the client—fallback gracefully
-            silent = bool(args.get("silent", True))
-            try:
-                code, _ = self._client.SetSilent()
-                return {"ret": code, "silent": silent}
-            except Exception as e:
-                return {"error": str(e)}
-        elif action == "get_silent":
-            try:
-                code, _ = self._client.GetSilent()
-                return {"ret": code}
-            except Exception as e:
-                return {"error": str(e)}
         return None
 
 

@@ -22,6 +22,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
+| [`limx/tron2`](limx/tron2/README.md) | LimX TRON2 dual-arm robot | 15791 | Head/wrist RGB cameras, joint skeleton with gripper outlines, arm MoveJ and verified saved-home reset |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 
 ## Quick Start
@@ -133,6 +134,7 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `data/json` | Text / KV panel | JSON key-value display |
 | `text/*` | Text | Plain text display |
 | `sensor/skeleton` | 3D Skeleton | URDF-based 3D skeleton with joint rotation |
+| `sensor/pose2d` | 2D human skeleton | COCO-17 human keypoints overlaid on the frame, with a per-person posture and activity label |
 | `sensor/lidar*` | Lidar scan | 2D/3D lidar point visualization |
 | `sensor/pointcloud` | Point cloud | 3D point cloud renderer |
 | `sensor/mapping` | 2D Map | Occupancy grid / SLAM map |

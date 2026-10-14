@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(franka_state_reader LANGUAGES CXX)
+find_package(Franka 0.13 REQUIRED)
+add_executable(franka-state-reader read_state.cpp)
+target_compile_features(franka-state-reader PRIVATE cxx_std_17)
+target_compile_options(franka-state-reader PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(franka-state-reader PRIVATE Franka::Franka)
+install(TARGETS franka-state-reader RUNTIME DESTINATION bin)

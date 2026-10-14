@@ -16,7 +16,7 @@ WORKDIR /work
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) -exec sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" {} + ; \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client && \
+        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /work/requirements.txt
@@ -42,6 +42,8 @@ COPY sensors.py        /work/sensors.py
 COPY controllers.py    /work/controllers.py
 COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
+# 拍照录像共用 vision_capture 模块；照片无额外依赖，录像使用上面安装的 ffmpeg。
+COPY vision_capture.py /work/vision_capture.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 COPY resource/         /work/resource/
@@ -53,7 +55,6 @@ COPY deploy/camera/           /deploy/camera/
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
 # ANSI colour codes are control bytes; in a non-tty container log they are

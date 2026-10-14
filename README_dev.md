@@ -612,6 +612,7 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `data/json` | Text / KV panel | `hint === 'data/json'` |
 | `text/*` | Text display | `hint.startsWith('text/')` |
 | `sensor/skeleton` | 3D Skeleton (URDF) | `hint === 'sensor/skeleton'` |
+| `sensor/pose2d` | 2D human skeleton | `hint === 'sensor/pose2d'` |
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
@@ -654,6 +655,48 @@ topic_out:
   - topic: /{namespace}/camera/depth
     format: image/depth-zlib
 ```
+
+### 2D Human Pose Rendering (`sensor/pose2d`) — Full Spec
+
+Note this is a different thing from `sensor/skeleton` above, and the names are
+close enough to pick the wrong one. `sensor/skeleton` is **the robot's own
+body**: a URDF plus joint angles, drawn in 3D. `sensor/pose2d` is **people the
+robot is looking at**: COCO-17 image-space keypoints, drawn flat over the frame.
+A quadruped publishing its legs wants `sensor/skeleton`; a camera plugin
+detecting a person wants `sensor/pose2d`.
+
+The payload is one JSON object per frame. `persons` is the only required key —
+a message without it is dropped, and an empty list is the correct way to say
+"nobody in frame" (which clears the overlay):
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `persons` | **yes** | one entry per detected person, see below |
+| `image_size` | no | `[width, height]` of the source frame. Without it the renderer infers an extent from the keypoints, which drifts as people move — send it |
+| `count` | no | defaults to `persons.length` |
+| `keypoint_names` | no | names in keypoint order; defaults to COCO-17 |
+| `skeleton` | no | bone list as index pairs; defaults to the COCO-17 skeleton |
+
+Each entry in `persons`:
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `keypoints` | **yes** | `[[x, y, v], ...]` in **pixels**, in `keypoint_names` order. `v` is visibility/confidence; `[x, y]` is accepted and counts as fully visible |
+| `id` | no | track id — keeps one person's colour stable across frames. Defaults to `0`, so omitting it on a multi-person stream makes everyone the same colour |
+| `posture` | no | the shape the body is in (`standing`, `sitting`, `lying`, ...). Everybody has one |
+| `activity` | no | what they are doing (`hand waving`, `falling down`, ...). Legitimately absent — not every frame supports a verdict |
+| `posture_confidence` | no | 0..1, shown beside the label when present |
+| `bbox` | no | `[x1, y1, x2, y2]` in pixels |
+
+Two channels rather than one label, because they answer different questions and
+degrade independently: a posture is geometric and always available, an activity
+needs a time window and may abstain. The renderer draws the activity when there
+is one and falls back to the posture, so a driver that can only do postures
+still renders correctly. `falling down` and `lying` are drawn in the alert
+colour.
+
+Do **not** clip keypoints to the frame: an off-image wrist is real information,
+and the renderer handles out-of-bounds points.
 
 ### Skeleton Rendering (`sensor/skeleton`) — Full Spec
 
