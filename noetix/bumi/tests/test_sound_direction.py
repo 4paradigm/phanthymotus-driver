@@ -66,9 +66,40 @@ def test_activity_gate_tracks_continuous_noise_without_true_silence():
     assert not any(gate.accepts(frame(40)) for _ in range(8))
     # 持续噪声没有真静音；电平变低后底噪必须跟得上，否则后面的发声会被旧底噪卡住。
     assert not any(gate.accepts(frame(20)) for _ in range(40))
-    # 40 落在旧底噪 40×1.8=72 与新底噪 20×1.8=36 之间：只有底噪跟着下调才会被判定为发声。
+    # 40 落在旧底噪 40×2.0=80 与新底噪 20×2.0=40 之间：只有底噪跟着下调才会被判定为发声。
     assert not gate.accepts(frame(40))
     assert gate.accepts(frame(40))
+
+
+def test_activity_gate_rejects_oscillating_fan_noise():
+    gate = SoundActivityGate()
+
+    def frame(level, dc=100):
+        wave = np.tile([dc + level, dc - level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    # 机器人风扇是安静段/轰鸣段交替的双峰噪声：轰鸣段 75 超过 1.8×40=72
+    # 会长得和语音 onset 一模一样，必须整体拒掉。
+    fan = [40.0, 40.0, 75.0, 75.0, 75.0] * 30
+    assert not any(gate.accepts(frame(level)) for level in fan)
+
+
+def test_activity_gate_rejects_fan_noise_after_speech():
+    gate = SoundActivityGate()
+
+    def frame(level, dc=100):
+        wave = np.tile([dc + level, dc - level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    assert not gate.accepts(frame(85))  # 单帧升高不等于发声。
+    assert gate.accepts(frame(85))
+    for _ in range(10):
+        gate.accepts(frame(85))
+    # 说话结束后底噪保持在风扇安静段，轰鸣段同样不能被当成下一次发声。
+    fan = [40.0, 75.0, 75.0, 40.0, 75.0] * 20
+    assert not any(gate.accepts(frame(level)) for level in fan)
 
 
 def test_activity_gate_uses_user_thresholds_without_changing_defaults():

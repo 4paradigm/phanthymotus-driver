@@ -139,10 +139,10 @@ def test_config_reports_failed_worker_restart(monkeypatch, tmp_path):
     monkeypatch.setattr(card, 'start', restart)
     result = card.dispatch('config', {'onset_ratio': 2.6})
     assert result['state'] == 'error'
-    assert starts == [2.6, 1.8]
-    assert result['running_parameters']['onset_ratio'] == 1.8
-    assert result['file_parameters']['onset_ratio'] == 1.8
-    assert module.load_parameters()['onset_ratio'] == 1.8
+    assert starts == [2.6, 2.0]
+    assert result['running_parameters']['onset_ratio'] == 2.0
+    assert result['file_parameters']['onset_ratio'] == 2.0
+    assert module.load_parameters()['onset_ratio'] == 2.0
 
 
 def test_worker_exit_clears_published_direction(monkeypatch):

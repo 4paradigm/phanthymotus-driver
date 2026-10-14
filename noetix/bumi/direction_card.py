@@ -24,7 +24,7 @@ CALIBRATION_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_calibratio
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "resource/sound_direction_calibration.json"
 SETTINGS_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_settings.json")
 DEFAULT_PARAMETERS = {
-    "onset_level": 10.0, "onset_ratio": 1.8,
+    "onset_level": 10.0, "onset_ratio": 2.0,
     "burst_level": 15.0, "burst_ratio": 3.0,
     "update_interval_ms": 100,
 }
@@ -217,7 +217,7 @@ class SoundDirectionPlugin:
                 "onset_level": {"type": "number", "minimum": 1, "maximum": 1000,
                                 "default": 10, "scope": "shared"},
                 "onset_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
-                                "default": 1.8, "scope": "shared"},
+                                "default": 2.0, "scope": "shared"},
                 "burst_level": {"type": "number", "minimum": 1, "maximum": 1000,
                                 "default": 15, "scope": "shared"},
                 "burst_ratio": {"type": "number", "minimum": 1.05, "maximum": 10,
