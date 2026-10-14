@@ -2026,10 +2026,8 @@ class _LowStateNode(Node):
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-            self._state_sub = ChannelSubscriber("rt/lowstate", LowState_)
-            self._state_sub.Init()
-            # Decode only the latest state; 1 kHz callbacks stall shared DDS reception.
-            self.create_timer(.02, self._poll_state)
+            sub = ChannelSubscriber("rt/lowstate", LowState_)
+            sub.Init(self._on_state, 10)
             self.get_logger().info(f"LowStateNode subscribed rt/lowstate → {imu_topic}, {joints_topic}")
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lowstate: {e}")
@@ -2051,10 +2049,6 @@ class _LowStateNode(Node):
             self.get_logger().info(f"LowStateNode subscribed rt/lf/mainboardstate → {mainboard_topic}")
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lf/mainboardstate: {e}")
-
-    def _poll_state(self):
-        sample = self._state_sub.Read(0)
-        if sample is not None and hasattr(sample, "motor_state"): self._on_state(sample)
 
     def _on_state(self, msg) -> None:
         now = time.monotonic()

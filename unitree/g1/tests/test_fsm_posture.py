@@ -248,18 +248,6 @@ class TestPosture(unittest.TestCase):
     def setUp(self):
         self.node = DEV._LowStateNode.__new__(DEV._LowStateNode)
 
-    def test_poll_reads_without_blocking_and_ignores_missing_sample(self):
-        message = make_lowstate(knee=.2, hip_pitch=-.1)
-        pending = [message, None, object()]; seen = []; timeouts = []
-        def read(timeout):
-            timeouts.append(timeout)
-            return pending.pop(0)
-        self.node._state_sub = types.SimpleNamespace(Read=read)
-        self.node._on_state = seen.append
-        self.node._poll_state(); self.node._poll_state(); self.node._poll_state()
-        self.assertEqual(timeouts, [0, 0, 0])
-        self.assertEqual(seen, [message])
-
     def estimate(self, **kw):
         return self.node._estimate_posture(make_lowstate(**kw))
 

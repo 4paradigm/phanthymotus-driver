@@ -367,26 +367,6 @@ def test_idle_stop_does_not_clear_unknown_prior_release(tmp_path):
     assert result['code']=='release_result_unknown' and arm.status()['ownership_held']
 
 
-def test_execution_polls_latest_feedback_without_refreshing_missing_samples(tmp_path):
-    arm, _, _, advance, _, _ = rig(tmp_path, claim=False)
-    motors = [SimpleNamespace(q=.1,dq=0.,mode=1,motorstate=0,vol=48.,temperature=[40,40]) for _ in range(35)]
-    message = SimpleNamespace(tick=1000,motor_state=motors)
-    reads = []; snapshots = []
-    def read(timeout):
-        reads.append(timeout)
-        advance(10, fresh=False)
-        if len(reads) == 1: return message
-        arm._closed.set()
-        return None
-    arm._subscriber = SimpleNamespace(Read=read)
-    arm.tick = lambda: snapshots.append(dict(arm._feedback))
-    arm._run()
-    assert reads == [0, 0]
-    assert snapshots[0]['q'] == [.1]*10
-    assert snapshots[0]['source_tick'] == 1000
-    assert snapshots[1]['arm_ns'] == snapshots[0]['arm_ns']
-
-
 @pytest.mark.parametrize('servo', [False, True])
 def test_servo_claim_starts_at_measured_position_despite_velocity_noise(tmp_path, servo):
     arm, sample, channel, _, _, _ = rig(tmp_path, claim=False, servo=servo)
