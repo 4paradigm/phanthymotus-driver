@@ -3,7 +3,13 @@
 import time
 from pathlib import Path
 
-from noetix.bumi.face_whitelist import FaceWhitelistPlugin
+import pytest
+
+from noetix.bumi.face_whitelist import (
+    FaceWhitelistError,
+    FaceWhitelistPlugin,
+    OpenCvLbphBackend,
+)
 
 
 class FakeBackend:
@@ -56,8 +62,11 @@ def test_tool_contract_is_a_processor_with_explicit_actions():
     assert tool["type"] == "processor"
     assert tool["multiInstance"] is False
     assert tool["inputSchema"]["properties"]["action"]["enum"] == [
-        "recognize", "reload", "info",
+        "start", "stop", "recognize", "reload", "info",
     ]
+    assert set(tool["inputSchema"]["x-action-params"]) == {
+        "start", "stop", "recognize", "reload", "info",
+    }
 
 
 def test_start_loads_the_private_whitelist_without_exposing_a_path():
@@ -104,10 +113,89 @@ def test_stop_prevents_later_recognition():
     assert plugin.dispatch("recognize", {})["state"] == "error"
 
 
+class FakeRecognizer:
+    def __init__(self, label=0, distance=20.0):
+        self.result = label, distance
+
+    def predict(self, face):
+        del face
+        return self.result
+
+
+def make_loaded_backend(crops, distance=20.0):
+    backend = OpenCvLbphBackend(Path("/unused"), 60.0, 80, 20)
+    backend._recognizer = FakeRecognizer(distance=distance)
+    backend._identities = {
+        0: {"person_id": "person_001", "display_name": "Test Person"},
+    }
+    backend._decode = lambda data: data
+    backend._face_crops = lambda image: list(crops)
+    return backend
+
+
+@pytest.mark.parametrize(
+    ("crops", "distance", "expected"),
+    [
+        ([], 20.0, "no_face"),
+        ([object(), object()], 20.0, "multiple_faces"),
+        ([object()], 60.01, "unknown"),
+        ([object()], 59.99, "matched"),
+    ],
+)
+def test_backend_outcomes_do_not_need_camera_hardware(crops, distance, expected):
+    result = make_loaded_backend(crops, distance).recognize(b"jpeg")
+    assert result["result"] == expected
+    if expected == "matched":
+        assert result["person_id"] == "person_001"
+    else:
+        assert "person_id" not in result
+
+
+def test_invalid_enrollment_metadata_is_rejected(tmp_path):
+    person_dir = tmp_path / "person_001"
+    person_dir.mkdir()
+    (person_dir / "person.json").write_text("not-json", encoding="utf-8")
+    with pytest.raises(FaceWhitelistError, match="invalid metadata"):
+        OpenCvLbphBackend._identity(person_dir)
+
+
+def test_stale_camera_frame_is_rejected():
+    class StaleCamera(FakeCamera):
+        def wait_for_color_frame(self, timeout_s):
+            assert timeout_s == 5.0
+            return {
+                "data": b"jpeg",
+                "timestamp_ms": (time.time() - 4.0) * 1000,
+            }, 1
+
+    plugin = make_plugin(camera=StaleCamera())
+    plugin.dispatch("start", {})
+    result = plugin.dispatch("recognize", {})
+    assert result["state"] == "error"
+    assert "stale" in result["error"]
+
+
+def test_reload_failure_is_visible_in_info_state():
+    class FailingBackend(FakeBackend):
+        def reload(self):
+            raise RuntimeError("model load failed")
+
+    plugin = make_plugin(backend=FailingBackend(ready=False))
+    assert plugin.dispatch("start", {}) == {
+        "state": "error", "error": "model load failed",
+    }
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "error"
+    assert info["error"] == "model load failed"
+
+
 def test_bundle_manifest_config_and_image_all_ship_the_card():
     driver_dir = Path(__file__).resolve().parents[1]
     assert "face_whitelist:" in (driver_dir / "config.yaml").read_text()
     assert "name: face_whitelist" in (driver_dir / "driver.yaml").read_text()
     dockerfile = (driver_dir / "Dockerfile").read_text()
+    assert "COPY requirements.txt /tmp/bumi-requirements.txt" in dockerfile
+    assert "-r /tmp/bumi-requirements.txt" in dockerfile
     assert "COPY face_whitelist.py /work/face_whitelist.py" in dockerfile
-    assert "opencv-contrib-python-headless==4.11.0.86" in dockerfile
+    requirements = (driver_dir / "requirements.txt").read_text()
+    assert "opencv-contrib-python-headless==4.11.0.86" in requirements

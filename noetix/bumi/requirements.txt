@@ -3,3 +3,4 @@ netifaces
 numpy
 opencv-contrib-python-headless==4.11.0.86
 pyrealsense2
+pybind11

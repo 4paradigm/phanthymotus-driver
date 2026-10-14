@@ -240,12 +240,20 @@ class FaceWhitelistPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["recognize", "reload", "info"],
+                        "enum": ["start", "stop", "recognize", "reload", "info"],
                     },
                 },
                 "required": ["action"],
                 "additionalProperties": False,
                 "x-action-params": {
+                    "start": {
+                        "params": [],
+                        "description": "Load the private whitelist and make recognition ready.",
+                    },
+                    "stop": {
+                        "params": [],
+                        "description": "Transition the card to idle without stopping the camera.",
+                    },
                     "recognize": {
                         "params": [],
                         "description": "Recognize exactly one face in the latest RGB frame.",

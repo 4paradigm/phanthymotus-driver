@@ -29,8 +29,9 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         librealsense2-utils || true && \
     rm -rf /var/lib/apt/lists/*
 
+COPY requirements.txt /tmp/bumi-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-contrib-python-headless==4.11.0.86 pyrealsense2 pybind11
+    -r /tmp/bumi-requirements.txt
 
 # Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
