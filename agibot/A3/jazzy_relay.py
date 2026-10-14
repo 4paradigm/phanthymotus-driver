@@ -244,6 +244,8 @@ def _media_all():
     last_emit = {key: 0.0 for key in CAMERAS}
     received = {key: 0 for key in CAMERAS}
     emitted = {key: 0 for key in CAMERAS}
+    failures = {key: 0 for key in CAMERAS}
+    failure_lock = threading.Lock()
     pending = {key: None for key in CAMERAS}
     subscriptions = {}
     subscriptions_lock = threading.Lock()
@@ -256,6 +258,14 @@ def _media_all():
     # the one-slot pending map means this never accumulates latency.
     min_interval = 1.0 / 6.0
     active_state = {"keys": set(CAMERAS), "checked": 0.0}
+
+    def log_frame_failure(key, exc):
+        with failure_lock:
+            failures[key] += 1
+            count = failures[key]
+        if count == 1 or count % 100 == 0:
+            print(f"[relay] frame failed key={key} count={count}: "
+                  f"{type(exc).__name__}: {exc!r}", flush=True)
 
     worker_count = 3
 
@@ -276,7 +286,7 @@ def _media_all():
                                 pending[stream_key] = msg
                             wake.notify()
                     except Exception as exc:
-                        print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
+                        log_frame_failure(stream_key, exc)
                 subscriptions[key] = node.create_subscription(Image, topic, push, qos,
                                                                callback_group=group)
                 print(f"[relay] raw subscription enabled key={key}", flush=True)
@@ -322,7 +332,7 @@ def _media_all():
                         print(f"[relay] output published key={stream_key} count={emitted[stream_key]} "
                               f"bytes={len(output.data)}", flush=True)
             except Exception as exc:
-                print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
+                log_frame_failure(stream_key, exc)
 
     publishers = {}
     for key, topic in CAMERAS.items():

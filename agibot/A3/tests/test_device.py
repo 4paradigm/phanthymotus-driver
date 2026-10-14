@@ -2577,7 +2577,7 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertNotIn("left_hand_channel_", urdf)
         self.assertIn('mimic joint="L_thumb_mcp_joint" multiplier="1.33"', urdf)
 
-    def test_o10_hand_mount_corrects_observed_rear_down_pose(self):
+    def test_o10_hand_mount_applies_relative_pose_correction(self):
         hand_root = ET.parse(device.RESOURCE_DIR / "a3_o10_hand.urdf").getroot()
         a3_root = ET.parse(device.RESOURCE_DIR / "a3_ultra.urdf").getroot()
 
@@ -2598,34 +2598,28 @@ class MirrorStreamTests(unittest.TestCase):
 
         mounts = {
             "left": ("L_palm_joint", "left_hand_O10_joint",
-                     "0.0015927 -2.5e-06 0.0007963",
-                     (-1, 0, 0), (0, 1, 0)),
+                     "0.0015927 -0.0000025 0.0007963",
+                     "-3.1415913 0.0015939 -1.57"),
             "right": ("R_palm_joint", "right_hand_O10_joint",
                       "3.14 0 0.0000036",
-                      (-1, 0, 0), (0, -1, 0)),
+                      "-0.0 -0.0015926 -1.5707926"),
         }
-        expected_targets = ((0, 0, 1), (1, 0, 0))
-        prior_mounts = {
-            "left": "1.5700295 1.5692037 1.5708258",
-            "right": "-1.5708292 1.5692037 -1.5708255",
-        }
-        for side, (name, wrist_joint, expected, old_palm, old_fingers) in mounts.items():
+        relative_correction = ((0, -1, 0), (-1, 0, 0), (0, 0, -1))
+        for side, (name, wrist_joint, expected, previous) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
             self.assertEqual(origin.attrib["rpy"], expected)
             wrist_origin = a3_root.find(f"joint[@name='{wrist_joint}']/origin")
             wrist = rotation(wrist_origin.attrib["rpy"])
             total = multiply(wrist, rotation(origin.attrib["rpy"]))
-            expected_total = {
-                "left": ((0, -1, 0), (-1, 0, 0), (0, 0, -1)),
-                "right": ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
-            }[side]
+            previous_total = multiply(wrist, rotation(previous))
+            relative_total = multiply(total, [list(row) for row in zip(*previous_total)])
             for row in range(3):
                 for col in range(3):
-                    self.assertAlmostEqual(total[row][col], expected_total[row][col],
-                                           delta=0.003, msg=f"{side} corrected frame {total}")
+                    self.assertAlmostEqual(relative_total[row][col], relative_correction[row][col],
+                                           delta=0.003, msg=f"{side} relative correction {relative_total}")
 
-    def test_battery_estop_republish_matches_100ms_state_cadence(self):
-        self.assertAlmostEqual(self.nodes._slow_state_timer.period, 0.1)
+    def test_battery_estop_republish_matches_1hz_state_cadence(self):
+        self.assertAlmostEqual(self.nodes._slow_state_timer.period, 1.0)
 
     def test_o10_flexion_feedback_is_inverted_from_command_counts(self):
         msg = types.SimpleNamespace(

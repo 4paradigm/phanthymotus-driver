@@ -921,7 +921,7 @@ class A3Nodes:
         # sensors.  Republish the latest decoded value once per second so the
         # dashboard stays fresh even when the robot only emits on change.
         if hasattr(self.robot, "create_timer"):
-            self._slow_state_timer = self.robot.create_timer(0.1, self._republish_slow_states)
+            self._slow_state_timer = self.robot.create_timer(1.0, self._republish_slow_states)
 
         self.audio_topics = {}
         self._audio_publishers = {}
