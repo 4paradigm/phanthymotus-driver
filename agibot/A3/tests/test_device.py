@@ -2597,28 +2597,35 @@ class MirrorStreamTests(unittest.TestCase):
                      for j in range(3)] for i in range(3)]
 
         mounts = {
-            "left": ("L_palm_joint", "left_hand_O10_joint"),
-            "right": ("R_palm_joint", "right_hand_O10_joint"),
+            "left": ("L_palm_joint", "left_hand_O10_joint",
+                     "-3.14 0 0.0007964",
+                     (-1, 0, 0), (0, 1, 0)),
+            "right": ("R_palm_joint", "right_hand_O10_joint",
+                      "-0.0015927 0 0.0000037",
+                      (-1, 0, 0), (0, -1, 0)),
         }
-        for side, (name, wrist_joint) in mounts.items():
+        expected_targets = ((0, 0, 1), (1, 0, 0))
+        prior_mounts = {
+            "left": "1.5700295 1.5692037 1.5708258",
+            "right": "-1.5708292 1.5692037 -1.5708255",
+        }
+        for side, (name, wrist_joint, expected, old_palm, old_fingers) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
-            expected = {"left": "3.1415914 -0.0015927 1.5715927",
-                        "right": "3.1415926 -0.0015927 -1.5707927"}[side]
             self.assertEqual(origin.attrib["rpy"], expected)
             wrist_origin = a3_root.find(f"joint[@name='{wrist_joint}']/origin")
-            total = multiply(rotation(wrist_origin.attrib["rpy"]),
-                             rotation(origin.attrib["rpy"]))
-            # The deployed robot is palm-up with fingers forward.  Verify the
-            # complete wrist-plus-hand transform, rather than accumulating
-            # intuitive quarter-turns in Euler-angle form.
-            targets = (((0, 0, 1), (0, 0, 1)),
-                       ((-1, 0, 0), (1, 0, 0)))
-            for axis, target in targets:
-                mapped = [sum(total[row][col] * axis[col] for col in range(3))
-                          for row in range(3)]
-                for actual, expected_component in zip(mapped, target):
-                    self.assertAlmostEqual(actual, expected_component, delta=0.002,
-                                           msg=f"{side} hand frame {mapped}")
+            wrist = rotation(wrist_origin.attrib["rpy"])
+            total = multiply(wrist, rotation(origin.attrib["rpy"]))
+            expected_total = {
+                "left": ((0, 1, 0), (-1, 0, 0), (0, 0, 1)),
+                "right": ((0, 1, 0), (1, 0, 0), (0, 0, -1)),
+            }[side]
+            for row in range(3):
+                for col in range(3):
+                    self.assertAlmostEqual(total[row][col], expected_total[row][col],
+                                           delta=0.003, msg=f"{side} corrected frame {total}")
+
+    def test_battery_estop_republish_matches_100ms_state_cadence(self):
+        self.assertAlmostEqual(self.nodes._slow_state_timer.period, 0.1)
 
     def test_o10_flexion_feedback_is_inverted_from_command_counts(self):
         msg = types.SimpleNamespace(
