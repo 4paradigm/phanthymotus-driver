@@ -254,7 +254,8 @@ HAND_JOINT_LIMITS = {
     "R_pinky_abad_joint": (0.0, 0.1850049007113989),
     "R_pinky_pip_joint": (0.0, 1.4835298641951802),
 }
-HAND_FLEXION_JOINTS = {
+HAND_INVERTED_COUNT_JOINTS = {
+    "L_thumb_abad_joint", "R_thumb_abad_joint",
     "L_index_pip_joint", "L_middle_pip_joint",
     "L_ring_pip_joint", "L_pinky_pip_joint",
     "R_thumb_mcp_joint", "R_index_pip_joint", "R_middle_pip_joint",
@@ -1549,10 +1550,9 @@ class A3Nodes:
                     low, high = HAND_JOINT_LIMITS[canonical]
                     count = min(HAND_STATE_COUNT_MAX, max(0.0, float(position)))
                     direction = 1.0
-                    if canonical in HAND_FLEXION_JOINTS:
-                        # The mirrored left thumb already follows its URDF
-                        # sign; the other flexion feedback channels run
-                        # opposite to the command count direction.
+                    if canonical in HAND_INVERTED_COUNT_JOINTS:
+                        # These feedback counts increase opposite to the
+                        # matching URDF joint direction.
                         count = HAND_STATE_COUNT_MAX - count
                         direction = -1.0
                     scale = (high - low) / HAND_STATE_COUNT_MAX

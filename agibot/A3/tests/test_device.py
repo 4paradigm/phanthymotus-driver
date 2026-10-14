@@ -2682,6 +2682,20 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertAlmostEqual(by_name["L_thumb_roll_joint"],
                                device.HAND_JOINT_LIMITS["L_thumb_roll_joint"][1])
 
+    def test_skeleton_inverts_thumb_root_opening_feedback(self):
+        for side in ("L", "R"):
+            joint = f"{side}_thumb_abad_joint"
+            firmware_name = f"{'left' if side == 'L' else 'right'}_thumb_wiggles_1"
+            low, high = device.HAND_JOINT_LIMITS[joint]
+            for count, expected in ((0, high), (device.HAND_STATE_COUNT_MAX, low)):
+                msg = types.SimpleNamespace(
+                    name=[firmware_name], position=[count], velocity=[0.0],
+                    effort=[0.0], frame_id="O10Hand")
+                self._callback("/motion/control/hand_joint_state")(msg)
+                payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+                by_name = {item["name"]: item["q"] for item in payload["joints"]}
+                self.assertAlmostEqual(by_name[joint], expected)
+
     def test_wrist_camera_cards_are_not_exposed_without_source_frames(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = FULL_PLUGINS
