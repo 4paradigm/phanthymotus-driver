@@ -54,7 +54,7 @@ class TestLocoRelativeMove(unittest.TestCase):
             self.assertEqual((stages[0]['vx'], stages[0]['vy'], stages[0]['vyaw']), (-0.3, 0., 0.))
             self.assertEqual((stages[1]['vx'], stages[1]['vy'], stages[1]['vyaw']), (0., 0.3, 0.))
             self.assertAlmostEqual(stages[0]['duration'], 2. / 0.6)
-            self.assertAlmostEqual(stages[1]['duration'], 1. / 0.6)
+            self.assertAlmostEqual(stages[1]['duration'], 1. / 0.6 / 1.2)
             factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
             self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor)
             self.assertEqual(stages[2]['vyaw'], -0.5)
@@ -73,7 +73,7 @@ class TestLocoRelativeMove(unittest.TestCase):
         stages = point.plan(dict(x=1, y=-1))
         self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.3, -0.3))
         self.assertAlmostEqual(stages[0]['duration'], 1 / 0.3 / 0.6)
-        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6)
+        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6 / 1.2)
         point.speed = 0.5
         stages = point.plan(dict(x=1, y=-1))
         self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.5, -0.5))
@@ -89,6 +89,19 @@ class TestLocoRelativeMove(unittest.TestCase):
         for angle in (45, '45', '45.5', 'bad', '', 'nan', 'inf', None, True):
             with self.subTest(invalid=angle):
                 self.assertIn('error', point.dispatch('move', dict(angle=angle)))
+
+    def test_distance_bounds_allow_zero_and_both_signed_endpoints(self):
+        point, backend, notices, _ = self.setup_point()
+        for axis in ('x', 'y'):
+            for distance in (0, 0.3, -0.3, 5, -5):
+                with self.subTest(axis=axis, distance=distance):
+                    stages = point.plan({axis: distance})
+                    self.assertEqual(len(stages), int(distance != 0))
+            for distance in (0.299, -0.299, 5.001, -5.001):
+                with self.subTest(axis=axis, distance=distance):
+                    self.assertIn('error', point.dispatch('move', {axis: distance}))
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(notices, [])
 
     def test_whole_sequence_notifies_once_with_distinct_internal_ids(self):
         point, backend, notices, done = self.setup_point()
@@ -241,6 +254,12 @@ class TestLocoRelativeMove(unittest.TestCase):
         self.assertEqual(schema['x-resource'], 'base')
         self.assertEqual(schema['x-completion']['actions'], ['move'])
         self.assertEqual(schema['properties']['angle']['enum'], [0, 30, 60, 90, 180])
+        for axis in ('x', 'y'):
+            field = schema['properties'][axis]
+            self.assertEqual(field['title'], f'{axis.upper()} (m)')
+            self.assertEqual((field['minimum'], field['maximum']), (-5, 5))
+            self.assertEqual(field['anyOf'], [{'const': 0}, {'minimum': 0.3}, {'maximum': -0.3}])
+        self.assertEqual(schema['properties']['angle']['title'], 'Angle (°)')
 
 
 class TestPointMotion(unittest.TestCase):

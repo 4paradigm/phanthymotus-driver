@@ -14,7 +14,10 @@ class LocoRelativeMovePlugin:
     ROTATION_TIME_FACTORS = {90: (90. / 75.) * (90. / 80.),
                              180: (180. / 135.) * (180. / 175.)}
     # Rough observed travel was 60% of the requested displacement at 0.3 m/s.
-    TRANSLATION_TIME_FACTOR = 1. / 0.6
+    # Lateral travel then overshot by ~20%; shorten only its compensated time.
+    TRANSLATION_TIME_FACTORS = (1. / 0.6, 1. / 0.6 / 1.2)
+    MIN_DISTANCE = 0.3
+    MAX_DISTANCE = 5.
 
     def __init__(self, config, loco, notify, prepare=None):
         self.loco = loco
@@ -46,11 +49,15 @@ class LocoRelativeMovePlugin:
                 "type": "object", "required": ["action"],
                 "properties": {
                     "action": {"type": "string", "enum": ["move", "stop_move"]},
-                    "x": {"type": "number", "default": 0,
-                          "description": "Relative longitudinal distance in metres: positive forward, negative backward (same as loco vx)."},
-                    "y": {"type": "number", "default": 0,
-                          "description": "Relative lateral distance in metres: positive left, negative right (same as loco vy)."},
-                    "angle": {"type": "integer", "enum": [0, 30, 60, 90, 180], "default": 0,
+                    "x": {"type": "number", "title": "X (m)", "default": 0,
+                          "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
+                          "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
+                          "description": "Relative longitudinal distance (m): 0 skips this stage; otherwise absolute value must be 0.3–5 m. Positive forward, negative backward (same as loco vx)."},
+                    "y": {"type": "number", "title": "Y (m)", "default": 0,
+                          "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
+                          "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
+                          "description": "Relative lateral distance (m): 0 skips this stage; otherwise absolute value must be 0.3–5 m. Positive left, negative right (same as loco vy)."},
+                    "angle": {"type": "integer", "title": "Angle (°)", "enum": [0, 30, 60, 90, 180], "default": 0,
                               "description": "Final rotation in degrees; 0 skips rotation."},
                     "direction": {"type": "string", "enum": ["left", "right"], "default": "left",
                                   "description": "Left uses positive loco vyaw, right uses negative vyaw."},
@@ -71,6 +78,9 @@ class LocoRelativeMovePlugin:
         direction = args.get("direction", "left")
         if not all(math.isfinite(v) for v in (x, y)):
             raise ValueError("x and y must be finite")
+        for axis, distance in (("x", x), ("y", y)):
+            if distance != 0 and not self.MIN_DISTANCE <= abs(distance) <= self.MAX_DISTANCE:
+                raise ValueError(f"{axis} must be 0 or have an absolute value between 0.3 and 5 m")
         # Canvas enum controls may serialize numeric selections as strings.
         if isinstance(angle, bool):
             raise ValueError("angle must be 0, 30, 60, 90 or 180 degrees")
@@ -90,7 +100,7 @@ class LocoRelativeMovePlugin:
                 velocity[axis] = math.copysign(self.speed, distance)
                 stages.append(dict(stage=name, vx=velocity[0], vy=velocity[1], vyaw=0.,
                                    duration=abs(distance) / self.speed *
-                                   (self.TRANSLATION_TIME_FACTOR if self.speed == 0.3 else 1.)))
+                                   (self.TRANSLATION_TIME_FACTORS[axis] if self.speed == 0.3 else 1.)))
         if angle:
             factor = self.ROTATION_TIME_FACTORS.get(angle, 1.) if self.yaw_speed == 0.5 else 1.
             stages.append(dict(stage="rotation", vx=0., vy=0.,
