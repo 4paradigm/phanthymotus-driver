@@ -125,6 +125,43 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(self.sdk.pose[2], 251000)
         self.assertTrue(all(c[3] == 1 for c in self.sdk.calls if c[0] == 'mode'))
 
+    def test_move_waits_for_controller_planning_without_resending_target(self):
+        # This controller needs uninterrupted planning time. Every submitted
+        # target restarts that delay, even when the coordinates are identical.
+        clock = FastClock()
+        pending = {}
+        self.sdk.follow_pose = False
+        original = self.sdk.EndPoseCtrl
+        def send(*target):
+            original(*target)
+            self.sdk.reached = False
+            pending.update(target=target, ready_at=clock.now() + .3)
+        def sleep(seconds):
+            clock.sleep(seconds)
+            if pending and clock.now() >= pending['ready_at']:
+                self.sdk.pose = pending['target']
+                self.sdk.reached = True
+        self.sdk.EndPoseCtrl = send
+        result = move_cartesian(self.driver, 'forward', 1, 1,
+                                clock=clock.now, sleep=sleep)
+        self.assertTrue(result['executed'])
+        self.assertGreaterEqual(clock.now(), .8)
+        self.assertEqual(sum(c[0] == 'end_pose' for c in self.sdk.calls), 1)
+        self.assertEqual(sum(c[0] == 'mode' for c in self.sdk.calls), 1)
+
+    def test_unmoving_controller_is_not_flooded_with_repeated_goals(self):
+        self.sdk.follow_pose = False
+        reports = []
+        clock = FastClock()
+        with self.assertRaisesRegex(RuntimeError, 'timed out'):
+            move_cartesian(self.driver, 'forward', 1, 1, clock=clock.now,
+                           sleep=clock.sleep, report=lambda d: reports.append(deepcopy(d)))
+        targets = [c[1] for c in self.sdk.calls if c[0] == 'end_pose']
+        # One movement submission and the existing best-effort measured hold.
+        self.assertEqual(targets, [(201000, 0, 250000, 180000, 0, 90000), self.sdk.pose])
+        self.assertEqual(reports[-1]['commands_sent'], 1)
+        self.assertEqual(reports[-1]['actual_displacement_mm'], 0)
+
     def test_bad_arguments_and_old_actions_send_nothing(self):
         cases = [{'distance_mm': 0}, {'distance_mm': 11}, {'distance_mm': True},
                  {'distance_mm': float('nan')}, {'speed_percent': 0}, {'speed_percent': 11},

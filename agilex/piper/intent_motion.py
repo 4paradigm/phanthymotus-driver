@@ -161,13 +161,15 @@ def move_cartesian(driver, direction, distance, speed, *, clock=time.monotonic, 
                         break
                 else:
                     stable_since = None
-                # Set the reference before transmission: subsequent feedback
-                # must be newer than this command, not a previous reached flag.
-                stamp = time.time()
-                details['command_attempted'] = True
-                _send(driver, target, speed)
-                details['commands_sent'] += 1
                 if sent_at is None:
+                    # MOVE_L owns the trajectory after submission. Resending
+                    # the same target can restart controller planning; poll
+                    # feedback without submitting again while it is running.
+                    # Timestamp before transmission excludes cached arrival.
+                    stamp = time.time()
+                    details['command_attempted'] = True
+                    _send(driver, target, speed)
+                    details['commands_sent'] += 1
                     sent_at = stamp
                 sleep(.05)
             else:
