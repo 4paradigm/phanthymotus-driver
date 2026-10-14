@@ -1,14 +1,18 @@
 linkerhand-l20:
-  image: bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/linkerhand/l20:latest
+  image: __IMAGE__
   container_name: embodied-linkerhand-l20
-  privileged: true
   network_mode: host
+  privileged: true
   volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
     - /run/udev:/run/udev:ro
   environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
-    - AGENT_CORE_URL=https://127.0.0.1:15678
+    - AGENT_CORE_URL=http://127.0.0.1:15678
   logging:
     driver: local
     options:
