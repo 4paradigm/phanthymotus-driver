@@ -44,6 +44,8 @@ COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
 # 拍照录像共用 vision_capture 模块；照片无额外依赖，录像使用上面安装的 ffmpeg。
 COPY vision_capture.py /work/vision_capture.py
+# 拜年讨红包卡：HOG 人形检测 + 作揖 + 扬声器播报。
+COPY bai_nian.py       /work/bai_nian.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 COPY resource/         /work/resource/

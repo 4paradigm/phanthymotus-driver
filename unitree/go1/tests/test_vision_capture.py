@@ -938,9 +938,10 @@ def test_stream_cannot_start_during_snapshot(tmp_path, monkeypatch):
     plugin = camera.make_camera_rgb({}, "test", None, None)
     plugin._node = object()
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
-    release = threading.Event()
+    entered, release = threading.Event(), threading.Event()
 
     def capture(position):
+        entered.set()
         assert release.wait(3)
         return b"\xff\xd8photo\xff\xd9"
 
@@ -949,6 +950,7 @@ def test_stream_cannot_start_during_snapshot(tmp_path, monkeypatch):
     caller = threading.Thread(target=lambda: responses.put(card.dispatch("capture_photo", {"position": "front"})))
     caller.start()
     try:
+        assert entered.wait(1)
         assert card.dispatch("info", {})["state"] == "capturing"
         assert plugin.dispatch("start", {"position": "front"})["code"] == "RESOURCE_BUSY"
         assert plugin._streams == {}

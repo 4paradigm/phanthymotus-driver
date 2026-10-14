@@ -4,3 +4,6 @@
 pyyaml
 paho-mqtt          # face_light / system_health 经狗自带 MQTT broker(灯带、bms/state)
 # numpy 基础镜像已自带(1.21.5)，本 bundle 也不直接用。
+# bai_nian 卡人形检测用；必须 <4.8：4.8+ 的 cv2.typing 需要 numpy>=1.22，
+# 与镜像自带 numpy 1.21.5 一起 import cv2 会 TypeError（已在 arm64 镜像内实测）。
+opencv-python-headless>=4.5,<4.8

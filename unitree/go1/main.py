@@ -161,6 +161,11 @@ class Go1Bundle:
             self._plugins.append(controllers.make_special_motion(pc["special_motion"], namespace, executor, client))
             print("[bundle] special_motion loaded")
 
+        if pc.get("bai_nian", {}).get("enabled", False):
+            import bai_nian
+            self._plugins.append(bai_nian.make_bai_nian(pc["bai_nian"], namespace, executor, client))
+            print("[bundle] bai_nian loaded")
+
         # 外部设备 - 从 ext_devices.py 导入
         if pc.get("beep", {}).get("enabled", False):
             import ext_devices
