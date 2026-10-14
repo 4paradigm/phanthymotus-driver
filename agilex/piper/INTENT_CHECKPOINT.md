@@ -1,6 +1,7 @@
 # User-intent control checkpoint — 2026-10-13
 
-用户要求找一个检查点暂停。本地工作保存在 `codex/piper-monitor`；本轮没有推送、更新 PR 或部署。
+用户此前要求暂停，检查点为 `e649701`；独立保存分支为 `codex/piper-user-intent`。
+2026-10-14 用户要求部署供自行测试，已按下方续接记录恢复工作。
 
 ## 已完成
 
@@ -19,7 +20,7 @@
 - 证据：工作区 `acceptance/20261013_piper_intent/intent-one-card-dashboard.png` 和 `browser-result.json`。
 - 所有动作测试均使用模拟 SDK，未执行真机动作。
 
-## 继续时优先处理
+## 暂停时记录的剩余工作（续接完成情况见末节）
 
 1. 将新 runtime 的 task 状态同步与生命周期锁分开，保证停止等待 SDK 发送时，后台监控读取任务状态仍不阻塞。
 2. 将最后一次取消检查和 completed 状态发布与 Stop 串行，补完成边界取消的并发回归，避免停止信号与完成发布之间的小窗口。
@@ -37,3 +38,22 @@
 - 下次继续应先完成本地工作；现场部署/动作验收需遵循最新用户安排，不沿用历史状态直接操作。
 - 保持 Core 不改、先仅机械臂 1、保留原 smoke-test.py 与部署备份；不将凭据写入 Git。
 - 已发布 PR #382 的历史基线：`7d9e997`，Version `release.261013.74ab514`；此候选版本没有 Bot Version。
+
+## 2026-10-14 续接与候选部署
+
+- 已分离任务锁与生命周期锁，停止等待 SDK 时监控读取任务不等待生命周期锁。
+- 完成发布与 Stop 串行；在异步预留执行权时先发布 preparing，防止早期停止遗漏，
+  或 Stop 将已完成任务永久覆盖为 stopping。
+- 补完成边界、异步线程启动前停止、缓存完成标志、朝向误差及准备失败回归。
+- 指定集合：248 passed、153 subtests passed；候选镜像内以禁用网络、无设备映射方式运行
+  20 项新接口模拟 SDK 测试，全部通过。
+- 用户关闭智能控制后，仅重建机械臂 1。镜像 `agilex-piper:local-arm1-intent-9b5ae0e8`，
+  备份 `/opt/phanthy-motus/backups/piper-arm1-intent-20261014-101007/`。
+- 核对 Core 与机械臂 2 镜像及启动时间一致，camera_worker.py 哈希一致；保留现场配置，
+  未用本地旧 runtime 覆盖现场，已核实 runtime.py 与 arm.py 内容一致。
+- 画布移除机械臂 1 的独立 piper_status 节点，Arm control 声明骨架/参数话题；保留实时相机节点。
+- 只调用 info 验证六轴与末端反馈新鲜且时间推进；未发送运动、模式、使能/失能命令。
+  实际 Edge 确认英文动作菜单及参数范围提示，手动测试参数预置 1 mm、1%。
+- 后续真实方向、自动准备、夹爪与停止验收由用户进行；尚未更新 PR 或请求新 Bot 构建。
+  本候选版本 Version：尚未生成。旧 release.261013.74ab514 不代表此候选版本。
+- 证据目录：工作区 `acceptance/20261014_piper_intent/`；部署脚本和只读验证记录已保留。

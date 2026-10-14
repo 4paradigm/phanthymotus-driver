@@ -1,8 +1,10 @@
 """User-intent control. Each request owns preparation and execution together."""
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import asdict
 import math
 import re
+import threading
 import time
 
 from common.vendor_runtime import action_schema, tool
@@ -51,6 +53,7 @@ class IntentControlPlugin(PiperPlugin):
         super().__init__(*args, **kwargs)
         self.interface_language = 'en'
         self.task = {'state': 'idle', 'action': None}
+        self.task_lock = threading.Lock()
         self.monitor_service = None
         self.gripper_torque = self.config.get('intent_control', {}).get('gripper_torque_nm', .5)
         if isinstance(self.gripper_torque, bool) or not isinstance(self.gripper_torque, (int, float)) or not math.isfinite(self.gripper_torque) or not .001 <= self.gripper_torque <= 1:
@@ -152,8 +155,19 @@ class IntentControlPlugin(PiperPlugin):
         return result
 
     def _phase(self, state, **values):
-        with self.lifecycle:
+        with self.task_lock:
             self.task = {**self.task, 'state': state, **values}
+
+    @contextmanager
+    def operation(self, name='piper_arm', action=None):
+        nested = (getattr(self.worker_context, 'reserved', None) == (name, action)
+                  or getattr(self.worker_context, 'owned', None) == (name, action))
+        with super().operation(name, action):
+            if not nested and name == CONTROL and action in TASK_ACTIONS:
+                # Publish preparation at reservation time, before an async
+                # worker starts; Stop cannot mistake the previous task for it.
+                self._phase('preparing', action=action, started_at=time.time(), result=None, error=None)
+            yield
 
     def dispatch(self, action, args):
         name = args.get('_tool_name', CONTROL)
@@ -189,11 +203,19 @@ class IntentControlPlugin(PiperPlugin):
                 self.request_stop(name)
             return self.stop_motion()
         if action == 'info':
-            with self.lifecycle:
+            with self.task_lock:
                 task = deepcopy(self.task)
             return {'state': task['state'], 'task': task, 'snapshot': self.read_monitor_snapshot()}
         if action not in TASK_ACTIONS:
             raise ValueError('Unsupported user action; refresh Arm control.')
+        try:
+            return self._execute_task(action, args)
+        except BaseException:
+            if self.cancel.is_set() and getattr(self.worker_context, 'reserved', None) == (CONTROL, action):
+                self._phase('cancelled', error='The action was cancelled.')
+            raise
+
+    def _execute_task(self, action, args):
         with self.operation(CONTROL, action):
             self._phase('preparing', action=action, started_at=time.time(), result=None, error=None)
             try:
@@ -225,8 +247,11 @@ class IntentControlPlugin(PiperPlugin):
                         driver.move_gripper(grip.width_mm, self.gripper_torque)
                     driver._check_cancelled()
                     result = {'executed': True, 'gripper': asdict(driver.move_gripper(width, self.gripper_torque))}
-                driver._check_cancelled()
-                self._phase('completed', result=result)
+                # Stop owns lifecycle as well: completion cannot overwrite a
+                # cancellation published between the final check and result.
+                with self.lifecycle:
+                    driver._check_cancelled()
+                    self._phase('completed', result=result)
                 return {**result, 'state': 'completed'}
             except BaseException as exc:
                 self._phase('cancelled' if self.cancel.is_set() else 'failed', error=public_error(exc))
@@ -234,18 +259,20 @@ class IntentControlPlugin(PiperPlugin):
 
     def stop_motion(self):
         with self.lifecycle:
-            affected = self.gate.locked() and self.active_card == CONTROL
+            with self.task_lock:
+                terminal = self.task['state'] in {'completed', 'cancelled', 'failed'}
+            affected = self.gate.locked() and self.active_card == CONTROL and not terminal
             if affected:
                 self.cancel.set()
                 if self.driver is not None:
                     self.driver.cancel_motion()
-                self.task = {**self.task, 'state': 'stopping'}
+                self._phase('stopping')
         return {'state': 'stopping' if affected else 'stopped', 'operation_stopping': affected,
                 'motor_torque_released': False}
 
     def read_monitor_snapshot(self):
         result = super().read_monitor_snapshot()
-        with self.lifecycle:
+        with self.task_lock:
             result['task'] = deepcopy(self.task)
         result['control_policy'] = 'automatic_preparation'
         result['device_name'] = 'PiPER ' + self.config.get('can_interface', 'can0')

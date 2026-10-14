@@ -274,6 +274,83 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(self.sdk.calls, [])
         self.assertIsNone(other[0].driver)
 
+    def test_monitor_does_not_wait_for_lifecycle_lock_during_stop(self):
+        locked, release = threading.Event(), threading.Event()
+        def hold():
+            with self.runtime.lifecycle:
+                locked.set();release.wait(2)
+        thread = threading.Thread(target=hold);thread.start()
+        try:
+            self.assertTrue(locked.wait(1))
+            result = self.runtime.read_monitor_snapshot()
+            self.assertEqual(result['task']['state'], 'idle')
+            self.assertTrue(result['fresh'])
+            self.assertFalse(release.is_set())
+        finally:
+            release.set();thread.join(1)
+
+    def test_stop_and_completed_publication_are_serialized_without_stuck_stopping(self):
+        self.runtime.config['async_actions'] = True
+        publishing, release, complete = threading.Event(), threading.Event(), threading.Event()
+        original = self.runtime._phase
+        def phase(state, **values):
+            if state == 'completed':
+                publishing.set();release.wait(3)
+            return original(state, **values)
+        stops = []
+        with patch.object(self.runtime, '_phase', side_effect=phase), \
+             patch.object(self.runtime, 'acp_complete', side_effect=lambda *args:complete.set()):
+            self.call('move', distance_mm=1)
+            self.assertTrue(publishing.wait(1))
+            stop = threading.Thread(target=lambda:stops.append(self.call('stop_motion')))
+            stop.start()
+            release.set();stop.join(2)
+            self.assertTrue(complete.wait(2))
+        self.assertFalse(stop.is_alive())
+        self.assertEqual(stops[0]['state'], 'stopped')
+        self.assertEqual(self.call('info')['state'], 'completed')
+
+    def test_stop_immediately_after_async_reservation_cancels_before_commands(self):
+        self.runtime.config['async_actions'] = True
+        entered, release, complete = threading.Event(), threading.Event(), threading.Event()
+        original = self.runtime.dispatch_sync
+        def sync(action, args):
+            if action == 'move':
+                entered.set();release.wait(2)
+            return original(action, args)
+        with patch.object(self.runtime, 'dispatch_sync', side_effect=sync), \
+             patch.object(self.runtime, 'acp_complete', side_effect=lambda *args:complete.set()):
+            self.call('move')
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(self.call('stop_motion')['state'], 'stopping')
+            release.set()
+            self.assertTrue(complete.wait(2))
+        self.assertEqual(self.call('info')['state'], 'cancelled')
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_cached_reached_flag_and_orientation_error_do_not_report_completion(self):
+        self.sdk.GetArmStatus = lambda:SimpleNamespace(time_stamp=time.time() - .1,
+            arm_status=SimpleNamespace(motion_status=0))
+        with self.assertRaisesRegex(RuntimeError, 'timed out'):
+            self.call('move', distance_mm=1)
+        self.sdk.GetArmStatus = lambda:SimpleNamespace(time_stamp=time.time(),
+            arm_status=SimpleNamespace(motion_status=0))
+        original = self.sdk.EndPoseCtrl
+        def wrong_orientation(*target):
+            original(*target)
+            self.sdk.pose = (*self.sdk.pose[:3], self.sdk.pose[3] + 2000, *self.sdk.pose[4:])
+        self.sdk.EndPoseCtrl = wrong_orientation
+        with self.assertRaisesRegex(RuntimeError, 'timed out'):
+            self.call('move', distance_mm=1)
+
+    def test_preparation_failure_does_not_submit_a_move(self):
+        self.sdk.enabled = (False,) * 6
+        self.driver.prepare_control = lambda **kwargs:(_ for _ in ()).throw(RuntimeError('Preparation failed'))
+        with self.assertRaisesRegex(RuntimeError, 'Preparation failed'):
+            self.call('move')
+        self.assertEqual(self.sdk.calls, [])
+        self.assertEqual(self.call('info')['state'], 'failed')
+
 
 if __name__ == '__main__':
     unittest.main()
