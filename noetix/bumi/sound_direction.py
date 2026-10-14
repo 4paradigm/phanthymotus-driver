@@ -12,7 +12,7 @@ class SoundActivityGate:
     """Accept sounds clearly louder than the recent microphone background."""
 
     def __init__(self, onset_level=10.0, onset_ratio=2.0,
-                 burst_level=15.0, burst_ratio=3.0):
+                 burst_level=15.0, burst_ratio=4.0):
         self._levels = deque(maxlen=50)
         self._rising_frames = 0
         self._hold_samples = 0

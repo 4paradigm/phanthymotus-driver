@@ -102,6 +102,21 @@ def test_activity_gate_rejects_fan_noise_after_speech():
     assert not any(gate.accepts(frame(level)) for level in fan)
 
 
+def test_activity_gate_burst_path_requires_four_times_background():
+    gate = SoundActivityGate()
+
+    def frame(level, dc=100):
+        wave = np.tile([dc + level, dc - level], 320)
+        return np.stack([wave] * 4 + [np.zeros_like(wave)] * 4, axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    # 单帧 140 落在 3×40=120 与 4×40=160 之间：强声旁路不应再放行它。
+    assert not gate.accepts(frame(140))
+    assert not gate.accepts(frame(40))  # 清掉连续发声计数。
+    # 真正的强声（单帧 ≥4×40=160）仍然立刻放行，无需两帧确认。
+    assert gate.accepts(frame(165))
+
+
 def test_activity_gate_uses_user_thresholds_without_changing_defaults():
     def frame(level):
         wave = np.tile([level, -level], 320)

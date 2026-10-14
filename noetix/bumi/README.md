@@ -29,7 +29,7 @@ uses the same field names and remains readable.
 | `onset_level` | 10 | Minimum level for sustained speech detection |
 | `onset_ratio` | 2.0 | Sustained speech level relative to recent background |
 | `burst_level` | 15 | Minimum level for one strong sound frame |
-| `burst_ratio` | 3.0 | Strong sound level relative to recent background |
+| `burst_ratio` | 4.0 | Strong sound level relative to recent background |
 | `update_interval_ms` | 100 | Minimum time between direction updates |
 
 The card first loads a complete, valid per-robot calibration from
