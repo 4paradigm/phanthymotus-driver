@@ -141,7 +141,7 @@ unexposed.
 
 ### `loco_destination`
 
-A motion card on the `loco` plugin: turn-in-place to a heading target. A
+A motion card on the `loco` plugin: turn in place by the requested angle. A
 50 Hz closed loop reads IMU yaw, drives `vyaw` with a P-term that caps to
 slower speeds as the error shrinks, and brakes to zero velocity once the
 robot settles — the closed-loop answer to `loco`'s open-loop `move`, where
@@ -155,13 +155,13 @@ turned instead.
   at least 1 m clearance. `stop_move` brakes an active rotation immediately
   (also the `on_interrupt_motion` hook). `status` reports `idle`/`running`
   plus `last_result`, the full result of the most recent completed rotation.
-- Tolerance: `done` requires the heading error inside ±2° while yaw is nearly
-  still; requests beyond ±150° run as chained absolute sub-targets so the
-  whole request still holds the ±2° window. Timeout and stopped exits brake
-  first and still report the actually turned degrees and final error.
+- Tolerance: `done` requires the angle error inside ±2° while yaw is nearly
+  still; a large turn is executed as a few shorter closed-loop turns so the
+  whole request keeps its ±2° accuracy. Timeout and stopped exits brake
+  first and still report the actually turned degrees and the final error
+  against the requested angle.
 - No distance feedback: the card consumes IMU heading only and reports
-  angles, never meters. Translational/leg-odometry distance feedback is not
-  included in Phase 2 either.
+  angles, never meters. Distance feedback is not part of this card today.
 
 ## `speaker`
 
