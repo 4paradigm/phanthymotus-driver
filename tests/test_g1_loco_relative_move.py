@@ -56,7 +56,7 @@ class TestLocoRelativeMove(unittest.TestCase):
             self.assertAlmostEqual(stages[0]['duration'], 2. / 0.6)
             self.assertAlmostEqual(stages[1]['duration'], 1. / 0.6 / 1.2)
             factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
-            self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor)
+            self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor / 1.23)
             self.assertEqual(stages[2]['vyaw'], -0.5)
 
     def test_compensation_is_limited_to_measured_speed(self):
@@ -73,12 +73,27 @@ class TestLocoRelativeMove(unittest.TestCase):
         stages = point.plan(dict(x=1, y=-1))
         self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.3, -0.3))
         self.assertAlmostEqual(stages[0]['duration'], 1 / 0.3 / 0.6)
-        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6 / 1.2)
+        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6 / 1.2 / 1.10)
         point.speed = 0.5
         stages = point.plan(dict(x=1, y=-1))
         self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.5, -0.5))
         self.assertAlmostEqual(stages[0]['duration'], 2.)
         self.assertAlmostEqual(stages[1]['duration'], 2.)
+
+    def test_direction_calibration_preserves_left_and_positive_y(self):
+        point, _, _, _ = self.setup_point()
+        for angle in (30, 60, 90, 180):
+            left = point.plan(dict(angle=angle, direction='left'))[0]
+            right = point.plan(dict(angle=angle, direction='right'))[0]
+            factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
+            self.assertAlmostEqual(left['duration'], math.radians(angle) / 0.5 * factor)
+            self.assertAlmostEqual(right['duration'], left['duration'] / 1.23)
+            self.assertEqual((left['vyaw'], right['vyaw']), (0.5, -0.5))
+        positive = point.plan(dict(y=1))[0]
+        negative = point.plan(dict(y=-1))[0]
+        self.assertAlmostEqual(positive['duration'], 1 / 0.3 / 0.6 / 1.2)
+        self.assertAlmostEqual(negative['duration'], positive['duration'] / 1.10)
+        self.assertEqual((positive['vy'], negative['vy']), (0.3, -0.3))
 
     def test_canvas_string_angles_match_numeric_plan(self):
         point, _, _, _ = self.setup_point()

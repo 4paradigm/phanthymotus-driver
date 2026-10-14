@@ -16,6 +16,9 @@ class LocoRelativeMovePlugin:
     # Rough observed travel was 60% of the requested displacement at 0.3 m/s.
     # Lateral travel then overshot by ~20%; shorten only its compensated time.
     TRANSLATION_TIME_FACTORS = (1. / 0.6, 1. / 0.6 / 1.2)
+    # Direction-specific visual measurements at the default speeds.
+    RIGHT_ROTATION_TIME_FACTOR = 1. / 1.23
+    NEGATIVE_Y_TIME_FACTOR = 1. / 1.10
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
 
@@ -43,7 +46,8 @@ class LocoRelativeMovePlugin:
             "description": "Sequential relative movement: straight along x, sideways along y, then rotate. "
                            "Uses loco velocity/time control; distances and angles are approximate, "
                            "without position feedback. At 0.3 m/s, translation uses empirical time compensation; "
-                           "at 0.5 rad/s, 90/180 degree turns use empirical time compensation. "
+                           "Negative y has a separate time correction at 0.3 m/s. "
+                           "At 0.5 rad/s, 90/180 degree turns and right turns use empirical time compensation. "
                            "Axes refer to the starting body heading.",
             "inputSchema": {
                 "type": "object", "required": ["action"],
@@ -98,11 +102,15 @@ class LocoRelativeMovePlugin:
             if distance:
                 velocity = [0., 0., 0.]
                 velocity[axis] = math.copysign(self.speed, distance)
+                factor = self.TRANSLATION_TIME_FACTORS[axis] if self.speed == 0.3 else 1.
+                if self.speed == 0.3 and axis == 1 and distance < 0:
+                    factor *= self.NEGATIVE_Y_TIME_FACTOR
                 stages.append(dict(stage=name, vx=velocity[0], vy=velocity[1], vyaw=0.,
-                                   duration=abs(distance) / self.speed *
-                                   (self.TRANSLATION_TIME_FACTORS[axis] if self.speed == 0.3 else 1.)))
+                                   duration=abs(distance) / self.speed * factor))
         if angle:
             factor = self.ROTATION_TIME_FACTORS.get(angle, 1.) if self.yaw_speed == 0.5 else 1.
+            if self.yaw_speed == 0.5 and direction == "right":
+                factor *= self.RIGHT_ROTATION_TIME_FACTOR
             stages.append(dict(stage="rotation", vx=0., vy=0.,
                                vyaw=self.yaw_speed if direction == "left" else -self.yaw_speed,
                                duration=math.radians(angle) / self.yaw_speed * factor))
