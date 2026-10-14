@@ -24,11 +24,43 @@
 
 旧 `slam` 插件和独立 `motion_control` 入口默认关闭。通常使用空间服务卡片和 `teleop_control`；不要同时启用 `motion_control` 与 `teleop_control`。
 
+## 构建
+
+G1 使用 `unitree/g1/Dockerfile`，从 ROS 基础镜像安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。依赖步骤位于源码 COPY 之前，正常构建可复用 Docker 缓存。
+
+在仓库根目录执行本地 ARM64 构建。与现有 build.sh 一样，构建上下文需要包含共享 common 目录：
+
+```sh
+G1_BUILD_CONTEXT=$(mktemp -d)
+cp -R unitree/g1/. "$G1_BUILD_CONTEXT/"
+cp -R common "$G1_BUILD_CONTEXT/common"
+docker build --platform linux/arm64 \
+  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
+  -t local/g1:dev "$G1_BUILD_CONTEXT"
+```
+
+`ROS_BASE_IMAGE` 可指定 ROS 基础镜像，`PYPI_MIRROR` 可指定 Python 包索引。原有 `./build.sh unitree/g1` 入口保持可用，但该脚本会按 `.env` 配置推送镜像。
+
+### 重新生成 Pinocchio wheel
+
+普通 PyPI `pin` wheel 不包含所需 CasADi 绑定。Dockerfile 通过 `PIN_WHEEL_URL` 直接安装预编译 wheel，适用于 Linux ARM64、Python 3.10 和 glibc 2.35 及以上版本。已有依赖保持不变，pip 使用 `--no-deps`；安装后沿用版本和 CasADi 模型检查。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。
+
+需要重新生成 wheel 时，在已安装相同数值依赖的 Linux ARM64 环境执行：
+
+```sh
+CMEEL_JOBS=1 CMEEL_RUN_TESTS=OFF \
+CMEEL_CMAKE_ARGS="-DBUILD_WITH_CASADI_SUPPORT=ON -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -Dcasadi_DIR=/usr/local/lib/python3.10/dist-packages/casadi/cmake" \
+python3 -m pip wheel --no-cache-dir --no-build-isolation --no-deps --no-binary=pin \
+  --wheel-dir /tmp/pin-wheel pin==4.1.0
+```
+
+上传 wheel 后，将 `PIN_WHEEL_URL` 设为实际下载地址，再构建 G1 镜像。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
+
 ## 安装与启动
 
 在 Agent Core Web 界面的部署页选择 Unitree G1 Driver 和已发布版本，完成部署。驱动注册后，在 Canvas 中添加所需卡片。通用操作见[仓库部署说明](../../README.md#deploy-via-web-dashboard-recommended)。
 
-本地开发需要先具备 ROS Humble、项目 ROS 消息包、Unitree SDK 和 G1 运行依赖。准备方法见[运行环境与构建说明](motion/README.md#构建)。在仓库根目录执行：
+本地开发需要先具备 ROS Humble、项目 ROS 消息包、Unitree SDK 和 G1 运行依赖。准备方法见[运行环境与构建说明](#构建)。在仓库根目录执行：
 
 ```sh
 source /opt/ros/humble/setup.bash
@@ -52,7 +84,7 @@ python3 unitree/g1/main.py eth0
 ## 开发与验证入口
 
 - [仓库构建流程](../../CONTRIBUTING.md#building-docker-images)：业务镜像构建与发布入口。
-- [G1 专项说明](motion/README.md)：遥操使用、运行依赖、镜像构建、数值实现和隔离验证。
+- [G1 专项说明](motion/README.md)：遥操使用、运行依赖、数值实现和隔离验证。
 - [关节连续控制](servo.py)与[末端连续控制](servo_eef.py)：输入契约、硬件配置和执行限制。
 - [G1 测试目录](tests/)：音频、视觉、状态和遥操测试；[共享测试目录](../../tests/)另含 G1 SDK、连续控制和导航测试。
 

@@ -16,23 +16,6 @@
 
 适用范围仅为原厂 G1_23 固定假手，不自动适配 G1_29、灵巧手或改装 TCP。附加碰撞与工作区扫描默认关闭；Driver 不自动停止其他控制程序。`servo`、`servo_eef` 可同时注册，但本实现不提供统一控制器仲裁。
 
-## 构建
-
-G1 使用 `unitree/g1/Dockerfile`，从 ROS 基础镜像安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。依赖步骤位于源码 COPY 之前，正常构建可复用 Docker 缓存。
-
-在仓库根目录执行本地 ARM64 构建。与现有 build.sh 一样，构建上下文需要包含共享 common 目录：
-
-```sh
-G1_BUILD_CONTEXT=$(mktemp -d)
-cp -R unitree/g1/. "$G1_BUILD_CONTEXT/"
-cp -R common "$G1_BUILD_CONTEXT/common"
-docker build --platform linux/arm64 \
-  --build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
-  -t local/g1:dev "$G1_BUILD_CONTEXT"
-```
-
-`ROS_BASE_IMAGE` 可指定 ROS 基础镜像，`PYPI_MIRROR` 可指定 Python 包索引。原有 `./build.sh unitree/g1` 入口保持可用，但该脚本会按 `.env` 配置推送镜像。
-
 ## 实现
 
 `MotionControl` 在 Driver 主进程只处理校验、最新目标和生命周期。`NumericalWorker` 在独立 CPU Python 进程加载 G1_23 模型、FK/IK、碰撞和显示；ROS、控制权、持续执行、保持和停止留在 arm。两个进程之间只有一个在途请求，协调器只保留最新待处理输入。没有GPU依赖或额外遥操构建开关。
@@ -49,20 +32,7 @@ docker build --platform linux/arm64 \
 | `collision.py`、`workspace.py`、`visualization.py` | 可选空间检查与诊断数据 |
 | `../arm_stream.py` | 控制权、位置下发、保持与停止 |
 
-主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [镜像配方](../Dockerfile) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [构建说明](#构建)。
-
-普通 PyPI `pin` wheel 不包含所需 CasADi 绑定。Dockerfile 通过 `PIN_WHEEL_URL` 直接安装预编译 wheel，适用于 Linux ARM64、Python 3.10 和 glibc 2.35 及以上版本。已有依赖保持不变，pip 使用 `--no-deps`；安装后沿用版本和 CasADi 模型检查。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。
-
-需要重新生成 wheel 时，在已安装相同数值依赖的 Linux ARM64 环境执行：
-
-```sh
-CMEEL_JOBS=1 CMEEL_RUN_TESTS=OFF \
-CMEEL_CMAKE_ARGS="-DBUILD_WITH_CASADI_SUPPORT=ON -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -Dcasadi_DIR=/usr/local/lib/python3.10/dist-packages/casadi/cmake" \
-python3 -m pip wheel --no-cache-dir --no-build-isolation --no-deps --no-binary=pin \
-  --wheel-dir /tmp/pin-wheel pin==4.1.0
-```
-
-上传 wheel 后，将 `PIN_WHEEL_URL` 设为实际下载地址，再构建 G1 镜像。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
+主进程和数值子进程共用系统 `/usr/bin/python3` 及依赖，各自创建模型和 Data。数值依赖由 [镜像配方](../Dockerfile) 固定：NumPy 2.2.6、Pinocchio 4.1.0、CasADi 3.8.1、SciPy 1.15.3。构建步骤见 [G1 构建说明](../README.md#构建)。
 
 七个碰撞网格在构建时下载，构建和运行时均核验 SHA256。网格不进入 Git；许可证与哈希清单位于 `models/collision/`。测试专用的未标定数据位于 `../tests/fixtures/calibration.json`，不随业务镜像安装。
 
