@@ -1,4 +1,4 @@
-"""Offline contracts for sequential loco_point movement."""
+"""Offline contracts for sequential loco_relative_move movement."""
 import ast
 from pathlib import Path
 import time
@@ -10,7 +10,7 @@ import math
 import threading
 import unittest
 
-from unitree.g1.loco_point import LocoPointPlugin, PointBackend
+from unitree.g1.loco_relative_move import LocoRelativeMovePlugin, PointBackend
 from unitree.g1.point_motion import PointMotion
 from unitree.g1.point_rpc import PointRpc
 
@@ -37,14 +37,14 @@ class Backend:
         return {"ret": self.stop_ret}
 
 
-class TestLocoPoint(unittest.TestCase):
+class TestLocoRelativeMove(unittest.TestCase):
     def setup_point(self, backend=None):
         backend = backend or Backend()
         notifications, done = [], threading.Event()
         def notify(*args, **kwargs):
             notifications.append((args, kwargs))
             done.set()
-        return LocoPointPlugin({}, backend, notify), backend, notifications, done
+        return LocoRelativeMovePlugin({}, backend, notify), backend, notifications, done
 
     def test_plan_uses_separate_rotation_compensation_and_body_axis_signs(self):
         point, _, _, _ = self.setup_point()
@@ -53,8 +53,8 @@ class TestLocoPoint(unittest.TestCase):
             self.assertEqual([s['stage'] for s in stages], ['straight', 'lateral', 'rotation'])
             self.assertEqual((stages[0]['vx'], stages[0]['vy'], stages[0]['vyaw']), (-0.3, 0., 0.))
             self.assertEqual((stages[1]['vx'], stages[1]['vy'], stages[1]['vyaw']), (0., 0.3, 0.))
-            self.assertAlmostEqual(stages[0]['duration'], 2.)
-            self.assertAlmostEqual(stages[1]['duration'], 1.)
+            self.assertAlmostEqual(stages[0]['duration'], 2. / 0.6)
+            self.assertAlmostEqual(stages[1]['duration'], 1. / 0.6)
             factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
             self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor)
             self.assertEqual(stages[2]['vyaw'], -0.5)
@@ -67,6 +67,18 @@ class TestLocoPoint(unittest.TestCase):
                 stage = point.plan(dict(angle=angle, direction=direction))[0]
                 self.assertAlmostEqual(stage['duration'], math.radians(angle) / 0.7)
                 self.assertEqual(abs(stage['vyaw']), 0.7)
+
+    def test_translation_compensation_keeps_command_speed_and_applies_to_both_axes(self):
+        point, _, _, _ = self.setup_point()
+        stages = point.plan(dict(x=1, y=-1))
+        self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.3, -0.3))
+        self.assertAlmostEqual(stages[0]['duration'], 1 / 0.3 / 0.6)
+        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6)
+        point.speed = 0.5
+        stages = point.plan(dict(x=1, y=-1))
+        self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.5, -0.5))
+        self.assertAlmostEqual(stages[0]['duration'], 2.)
+        self.assertAlmostEqual(stages[1]['duration'], 2.)
 
     def test_canvas_string_angles_match_numeric_plan(self):
         point, _, _, _ = self.setup_point()
@@ -86,7 +98,7 @@ class TestLocoPoint(unittest.TestCase):
         self.assertEqual(len({call[4] for call in backend.calls}), 3)
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0][0][:2], (result['action_id'], 'completed'))
-        self.assertEqual(notices[0][1]['tool'], 'loco_point')
+        self.assertEqual(notices[0][1]['tool'], 'loco_relative_move')
         self.assertEqual(notices[0][0][2]['completed_stages'], ['straight', 'lateral', 'rotation'])
 
     def test_cancel_stops_and_prevents_remaining_stages(self):

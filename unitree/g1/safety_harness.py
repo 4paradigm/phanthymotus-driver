@@ -699,7 +699,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     def handle_move(vx, vy, vyaw, duration, action_id=None):
         nonlocal state, current_cmd, speed_zone
         if point_sequence is not None:
-            return {"error": "loco_point owns the base; stop its sequence first"}
+            return {"error": "loco_relative_move owns the base; stop its sequence first"}
         from uuid import uuid4
         if not all(math.isfinite(v) for v in (vx, vy, vyaw, duration)):
             return {"error": "Motion parameters must be finite"}
@@ -734,7 +734,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60):
         nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error
         if point_sequence is not None:
-            return {"error": "loco_point owns the base; stop it before navigation"}
+            return {"error": "loco_relative_move owns the base; stop it before navigation"}
 
         if state == MotionState.MOVING:
             do_stop("command")
@@ -1004,7 +1004,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             if point_sequence not in (None, sequence):
                 return {"error": "Another point sequence owns the base"}
             if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
-                return {"error": "Stop navigation before starting loco_point"}
+                return {"error": "Stop navigation before starting loco_relative_move"}
             point_sequence = sequence
             stop_repeat_count = 0
             current_cmd = {"vx": cmd["vx"], "vy": cmd["vy"], "vyaw": cmd["vyaw"],

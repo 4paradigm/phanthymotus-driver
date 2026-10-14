@@ -1,4 +1,4 @@
-"""Dedicated velocity RPC transport for loco_point; does not patch the SDK."""
+"""Dedicated velocity RPC transport for loco_relative_move; does not patch the SDK."""
 import json
 import threading
 import time
@@ -82,6 +82,6 @@ class PointRpc:
             pending = list(self.pending.values())
             self.pending.clear()
         for future in pending:
-            future.Fail("loco_point transport shut down")
+            future.Fail("loco_relative_move transport shut down")
         self.reader.Close()
         self.writer.Close()

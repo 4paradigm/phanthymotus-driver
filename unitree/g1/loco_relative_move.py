@@ -5,14 +5,16 @@ import time
 from uuid import uuid4
 
 
-class LocoPointPlugin:
-    PREFIX = "loco_point"
+class LocoRelativeMovePlugin:
+    PREFIX = "loco_relative_move"
     TIMEOUT = 300
     MAX_MOTION_SECONDS = 120
     # Refined from compensated turns observed at ~80 and ~175 degrees.
     # Calibrated only at 0.5 rad/s; smaller angles keep theoretical duration.
     ROTATION_TIME_FACTORS = {90: (90. / 75.) * (90. / 80.),
                              180: (180. / 135.) * (180. / 175.)}
+    # Rough observed travel was 60% of the requested displacement at 0.3 m/s.
+    TRANSLATION_TIME_FACTOR = 1. / 0.6
 
     def __init__(self, config, loco, notify, prepare=None):
         self.loco = loco
@@ -26,7 +28,7 @@ class LocoPointPlugin:
         self.yaw_speed = float(config.get("rotation_speed", 0.5))
         if not (math.isfinite(self.speed) and 0 < self.speed <= 1 and
                 math.isfinite(self.yaw_speed) and 0 < self.yaw_speed <= 2):
-            raise ValueError("loco_point speeds must be finite: translation (0,1], rotation (0,2]")
+            raise ValueError("loco_relative_move speeds must be finite: translation (0,1], rotation (0,2]")
 
     @property
     def busy(self):
@@ -35,9 +37,10 @@ class LocoPointPlugin:
     def get_tools(self):
         return [{
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": "Relative movement: straight along x, sideways along y, then rotate. "
+            "description": "Sequential relative movement: straight along x, sideways along y, then rotate. "
                            "Uses loco velocity/time control; distances and angles are approximate, "
-                           "without position feedback. At 0.5 rad/s, 90/180 degree turns use empirical time compensation. "
+                           "without position feedback. At 0.3 m/s, translation uses empirical time compensation; "
+                           "at 0.5 rad/s, 90/180 degree turns use empirical time compensation. "
                            "Axes refer to the starting body heading.",
             "inputSchema": {
                 "type": "object", "required": ["action"],
@@ -86,7 +89,8 @@ class LocoPointPlugin:
                 velocity = [0., 0., 0.]
                 velocity[axis] = math.copysign(self.speed, distance)
                 stages.append(dict(stage=name, vx=velocity[0], vy=velocity[1], vyaw=0.,
-                                   duration=abs(distance) / self.speed))
+                                   duration=abs(distance) / self.speed *
+                                   (self.TRANSLATION_TIME_FACTOR if self.speed == 0.3 else 1.)))
         if angle:
             factor = self.ROTATION_TIME_FACTORS.get(angle, 1.) if self.yaw_speed == 0.5 else 1.
             stages.append(dict(stage="rotation", vx=0., vy=0.,
@@ -118,7 +122,7 @@ class LocoPointPlugin:
         if action in ("stop", "stop_move"):
             return self.cancel_and_stop()
         if action != "move":
-            return {"error": f"Unknown loco_point action: {action}"}
+            return {"error": f"Unknown loco_relative_move action: {action}"}
         try:
             stages = self.plan(args)
         except (ValueError, TypeError, OverflowError) as exc:
@@ -127,11 +131,11 @@ class LocoPointPlugin:
             return {"ret": 0, "state": "idle", "stages": []}
         with self.command_lock:
             if self.closed:
-                return {"error": "loco_point is shut down"}
+                return {"error": "loco_relative_move is shut down"}
             if self.faulted:
                 return {"error": "Previous stop was not confirmed; retry stop_move first"}
             if self.busy:
-                return {"error": "loco_point is already running"}
+                return {"error": "loco_relative_move is already running"}
             job = dict(id=f"g1_point_{uuid4().hex[:8]}", cancel=threading.Event(),
                        stop_done=threading.Event(), stop_result=None,
                        deadline=time.monotonic() + self.TIMEOUT - 15)
@@ -152,7 +156,7 @@ class LocoPointPlugin:
         querying = action.startswith("get_") or action in ("list", "list_tags", "list_maps", "check")
         with self.command_lock:
             if (self.busy or self.faulted) and not stopping and not querying:
-                return {"error": "loco_point is running; stop it before another base action"}
+                return {"error": "loco_relative_move is running; stop it before another base action"}
             return plugin.dispatch(action, args)
 
     def cancel_and_stop(self):
@@ -197,7 +201,7 @@ class LocoPointPlugin:
                     if job["cancel"].is_set():
                         break
                     if time.monotonic() >= job["deadline"]:
-                        raise TimeoutError("loco_point deadline expired")
+                        raise TimeoutError("loco_relative_move deadline expired")
                     segment_id = f"{job['id']}_{index}"
                     begin = getattr(self.loco, "_begin_motion", self.loco._start_motion)
                     pending = begin(stage["vx"], stage["vy"], stage["vyaw"],
@@ -207,7 +211,7 @@ class LocoPointPlugin:
                     raise RuntimeError(reply.get("error") or f"Move failed: {reply.get('ret')}")
                 while not job["cancel"].is_set():
                     if time.monotonic() >= job["deadline"]:
-                        raise TimeoutError("loco_point deadline expired")
+                        raise TimeoutError("loco_relative_move deadline expired")
                     outcome = self.loco._motion_result(segment_id)
                     if outcome.get("error"):
                         raise RuntimeError(outcome["error"])
@@ -250,7 +254,7 @@ class PointBackend:
     """Point sequence adapter; all velocity and stop RPCs belong to SmartMotion."""
     def __init__(self, smart_motion):
         if smart_motion is None:
-            raise ValueError("loco_point requires the SmartMotion safety harness")
+            raise ValueError("loco_relative_move requires the SmartMotion safety harness")
         self.smart_motion = smart_motion
         self.sequence_id = None
 

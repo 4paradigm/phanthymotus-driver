@@ -132,8 +132,8 @@ class G1DeviceBundle:
                                             state_node=loco_state.node,
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
-            if plugins_cfg.get("loco_point", {}).get("enabled", True) and smart_motion is not None:
-                from loco_point import LocoPointPlugin, PointBackend
+            if plugins_cfg.get("loco_relative_move", {}).get("enabled", True) and smart_motion is not None:
+                from loco_relative_move import LocoRelativeMovePlugin, PointBackend
                 from device import _loco_acp_notify
                 loco = self._plugins[-1]
                 def prepare_point():
@@ -141,13 +141,13 @@ class G1DeviceBundle:
                     if current.get("error"):
                         return {"ret": None, "error": current["error"]}
                     if current.get("state") in ("navigating", "nav_paused"):
-                        return {"ret": None, "error": "Stop navigation before loco_point"}
+                        return {"ret": None, "error": "Stop navigation before loco_relative_move"}
                     return loco.dispatch("stop_move", {})
-                self._point_card = LocoPointPlugin(
-                    plugins_cfg.get("loco_point", {}), PointBackend(smart_motion), _loco_acp_notify,
+                self._point_card = LocoRelativeMovePlugin(
+                    plugins_cfg.get("loco_relative_move", {}), PointBackend(smart_motion), _loco_acp_notify,
                     prepare=prepare_point)
                 self._plugins.append(self._point_card)
-                print("[bundle] LocoPointPlugin loaded")
+                print("[bundle] LocoRelativeMovePlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
@@ -268,7 +268,7 @@ class G1DeviceBundle:
         other_plugins = [
             p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
         # Cancel the point sequence before shutting down its prepare/stop peer.
-        point_plugins = [p for p in other_plugins if getattr(p, "PREFIX", "") == "loco_point"]
+        point_plugins = [p for p in other_plugins if getattr(p, "PREFIX", "") == "loco_relative_move"]
         remaining_plugins = [p for p in other_plugins if p not in point_plugins]
         for p in capture_plugins + point_plugins + remaining_plugins:
             p.stop()
@@ -296,7 +296,7 @@ class G1DeviceBundle:
                     resource = tool_def.get("inputSchema", {}).get("x-resource")
                     is_base = (resource == "base" or isinstance(resource, list) and "base" in resource
                                or tool_name in ("loco", "switch_mode", "switch_mode_expert", "spatial"))
-                    if point and tool_name != "loco_point" and is_base and tool_def["type"] == "actuator":
+                    if point and tool_name != "loco_relative_move" and is_base and tool_def["type"] == "actuator":
                         result = point.dispatch_base(p, action, args)
                     else:
                         result = p.dispatch(action, args)
