@@ -4,6 +4,7 @@ ROOT=/opt/phanthy-motus/data/a3-relay
 PIDFILE=$ROOT/relay.pid
 SOURCE=/work/agibot/A3/jazzy_relay.py
 HOST_SOURCE=/proc/1/root/tmp/a3-jazzy-relay.py
+HOST_LOGSAFE=/proc/1/root/tmp/logsafe.py
 HOST_PROFILE=$ROOT/dds-profile.xml
 mkdir -p "$ROOT"
 case "${1:-start}" in
@@ -23,6 +24,9 @@ start)
   # instead, then enter the host root (without -m) so the host Jazzy install and
   # /tmp path are visible.  PID/network namespaces are still entered for DDS.
   cp "$SOURCE" "$HOST_SOURCE"
+  # The relay runs with the host Python, outside /work. Ship the same atomic,
+  # control-character-safe log writer as a single module beside the entrypoint.
+  cp /work/common/logsafe.py "$HOST_LOGSAFE"
   # The container-generated profile lives under /work and is invisible after
   # nsenter switches to the host root. Materialize a host-visible copy so the
   # Jazzy participant keeps the same robot-NIC/loopback whitelist.

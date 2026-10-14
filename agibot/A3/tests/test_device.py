@@ -2577,7 +2577,7 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertNotIn("left_hand_channel_", urdf)
         self.assertIn('mimic joint="L_thumb_mcp_joint" multiplier="1.33"', urdf)
 
-    def test_o10_hand_mount_keeps_palms_up_and_preserves_mirrored_wrist_mounts(self):
+    def test_o10_hand_mount_corrects_observed_rear_down_pose(self):
         hand_root = ET.parse(device.RESOURCE_DIR / "a3_o10_hand.urdf").getroot()
         a3_root = ET.parse(device.RESOURCE_DIR / "a3_ultra.urdf").getroot()
 
@@ -2602,16 +2602,17 @@ class MirrorStreamTests(unittest.TestCase):
         }
         for side, (name, wrist_joint) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
-            expected = {"left": "0 1.5707963 -1.5707963",
-                        "right": "0 1.5707963 1.5707963"}[side]
+            expected = {"left": "-3.1415927 0 1.5707963",
+                        "right": "-3.1415927 0 -1.5707963"}[side]
             self.assertEqual(origin.attrib["rpy"], expected)
             wrist_origin = a3_root.find(f"joint[@name='{wrist_joint}']/origin")
             total = multiply(rotation(wrist_origin.attrib["rpy"]),
                              rotation(origin.attrib["rpy"]))
-            # Official OmniHand palm normal +X maps up; finger axis +Z maps
-            # forward for both sides after composing with the mirrored wrists.
-            targets = (((1, 0, 0), (0, 0, 1)),
-                       ((0, 0, 1), (1, 0, 0)))
+            # The last deployed frame appeared as palm-back/fingers-down.
+            # One -90 degree robot-frame Y correction maps palm +Z to up and
+            # finger direction -X to forward for both mirrored mounts.
+            targets = (((0, 0, 1), (0, 0, 1)),
+                       ((-1, 0, 0), (1, 0, 0)))
             for axis, target in targets:
                 mapped = [sum(total[row][col] * axis[col] for col in range(3))
                           for row in range(3)]

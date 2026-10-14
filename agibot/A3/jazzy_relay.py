@@ -16,6 +16,16 @@ import threading
 import time
 import zlib
 
+try:
+    from common import logsafe
+except ImportError:
+    try:
+        import logsafe
+    except ImportError:
+        logsafe = None
+if logsafe is not None:
+    logsafe.install()
+
 CAMERAS = {
     "head_left_fisheye": "/hal/head_left_fisheye_camera/rgb",
     "head_right_fisheye": "/hal/head_right_fisheye_camera/rgb",

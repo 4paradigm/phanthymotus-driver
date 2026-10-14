@@ -236,6 +236,11 @@ class _BridgeSubscription:
 
 
 def _run_subscription(messages, stop, profile, domain, topic, type_name, qos_depth):
+    try:
+        from common import logsafe
+        logsafe.install()
+    except ImportError:
+        pass
     os.environ["ROS_DOMAIN_ID"] = str(domain)
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     if os.path.isfile(profile):
