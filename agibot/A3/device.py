@@ -561,13 +561,6 @@ class A3Nodes:
         audio_qos = QoSProfile(depth=10, reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
                                                               QoSReliabilityPolicy.BEST_EFFORT),
                                 durability=QoSDurabilityPolicy.VOLATILE)
-        # Motion-state feedback on the deployed A3 is RELIABLE.  Keep this
-        # separate from camera/lidar's BEST_EFFORT sensor QoS: subscribing to
-        # the former as BEST_EFFORT leaves the skeleton intermittently stale.
-        joint_qos = QoSProfile(depth=10,
-                               reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
-                                                    QoSReliabilityPolicy.BEST_EFFORT),
-                               durability=QoSDurabilityPolicy.VOLATILE)
 
         self.streams = {}
         self._joint_cache = {}
@@ -692,11 +685,11 @@ class A3Nodes:
         self._encode_and_publish = self._encode_and_publish_frame
 
         # -- joint / state streams (plain sensor_msgs types) --
-        mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json", qos=joint_qos)
-        mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json", qos=joint_qos)
-        mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json", qos=joint_qos)
-        mirror("waist_state", JointState, "/motion/control/waist_joint_state", "data/json", qos=joint_qos)
-        mirror("leg_state", JointState, "/motion/control/leg_joint_state", "data/json", qos=joint_qos)
+        mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
+        mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
+        mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json")
+        mirror("waist_state", JointState, "/motion/control/waist_joint_state", "data/json")
+        mirror("leg_state", JointState, "/motion/control/leg_joint_state", "data/json")
         mirror("lidar_cloud", PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", "sensor/pointcloud")
         mirror("imu_pelvis", Imu, "/ros2/body_drive/pelvis_imu/data", "data/json")
         mirror("imu_torso", Imu, "/ros2/body_drive/torso_imu/data", "data/json")
@@ -756,9 +749,10 @@ class A3Nodes:
         self._audio_publishers = {}
         self.speaker_subscription = None
         if AudioCapture is not None and AudioPlayback is not None and AudioChunk is not None:
-            # Keep the cards separate.  Mic input uses the documented agent
-            # protobuf stream; ext_mic remains a real physical input and is
-            # therefore not synthesized when no external device is attached.
+            # This A3 firmware has no writer on /agent/process_audio_output;
+            # its live capture endpoint is /audiohal/audio/capture.  Keep the
+            # external card on its own route rather than duplicating internal
+            # microphone audio into it.
             for key, topic in (("mic", "/audiohal/audio/capture"),
                                ("ext_mic", "/agent/audio/data/external")):
                 core_topic = _core_topic(namespace, f"{key}/audio")
@@ -776,24 +770,6 @@ class A3Nodes:
                 self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
                                           "format": "audio/pcm-16k"}
 
-            # This small wrapper is safe to deserialize directly in the
-            # Humble driver, unlike the large image/pointcloud samples that
-            # use the Jazzy relay.  Keeping it out of jazzy_relay.py is
-            # deliberate: audio import/parse failures must never affect
-            # camera startup or its process-lifetime subscriptions.
-            wrapper_type = self._probe_wrapper_type()
-            if wrapper_type is not None and self._pb is not None:
-                try:
-                    (self.media_robot or self.robot).create_subscription(
-                        wrapper_type, "/agent/process_audio_output",
-                        self._publish_processed_audio, audio_qos,
-                        callback_group=self._media_callback_group)
-                except TypeError:
-                    (self.media_robot or self.robot).create_subscription(
-                        wrapper_type, "/agent/process_audio_output",
-                        self._publish_processed_audio, audio_qos)
-                self.audio_topics["mic"]["robot_topic"] = "/agent/process_audio_output"
-                print("[audio] subscribed /agent/process_audio_output (stream_id=1 mic, 2 ext_mic)", flush=True)
 
         # -- command publishers (robot domain) --
         self.wrapper_available = self._probe_wrapper_type() is not None
@@ -859,7 +835,13 @@ class A3Nodes:
         # metadata belongs to info while data contains only the byte sequence.
         info = getattr(msg, "info", None)
         rate = int(getattr(info, "sample_rate", 16000) or 16000)
-        channels = int(getattr(info, "channels", 0) or 1)
+        info_channels = int(getattr(info, "channels", 0) or 0)
+        mic_channels = int(getattr(msg, "mic_channels", 0) or 0)
+        ref_channels = int(getattr(msg, "ref_channels", 0) or 0)
+        channels = max(1, info_channels, mic_channels + ref_channels)
+        # Some SDK builds omit mic_channels but still report the reference
+        # channel.  Averaging all channels cancels the true microphone signal.
+        selected_channels = max(1, mic_channels or (info_channels - ref_channels) or info_channels or 1)
         sample_format = str(getattr(info, "sample_format", "") or "").upper().replace("-", "_")
         coding_format = str(getattr(info, "coding_format", "") or "").upper().replace("-", "_")
         if sample_format in {"S16_LE", "PCM16", "PCM_16", "SIGNED16"}:
@@ -878,7 +860,7 @@ class A3Nodes:
         if channels > 1:
             import struct
             samples = struct.unpack("<%dh" % (len(payload) // 2), payload)
-            mono = [sum(samples[i:i + channels]) // channels
+            mono = [sum(samples[i:i + selected_channels]) // selected_channels
                     for i in range(0, len(samples), channels)]
             payload = struct.pack("<%dh" % len(mono), *mono)
         if rate != 16000 and rate > 0:
