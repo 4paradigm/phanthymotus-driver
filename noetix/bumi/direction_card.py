@@ -364,19 +364,18 @@ class SoundDirectionPlugin:
         if action not in ("start", "stop", "info", "config"):
             return None
         if action == "start":
-            try:
-                if not self.start():
-                    if not load_calibration():
-                        return {"state": "unavailable", "message": "sound direction calibration is missing or invalid"}
-                    return {"state": "error", "message": "direction worker failed to initialize"}
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                return {"state": "error", "message": f"direction worker failed to start: {exc}"}
-            return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
+            # 与其他 sensor 卡一致：纯状态应答，永不 spawn。spawn 只在 plugin.start()
+            # （driver boot 或配置保存重启）发生。状态取真值，避免「silence that looks
+            # like success」——worker 不在时不能回 running。
+            with self._process_lock:
+                running = self._proc is not None and self._proc.poll() is None
+            if running:
+                return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
+            if not load_calibration():
+                return {"state": "unavailable", "message": "sound direction calibration is missing or invalid"}
+            return {"state": "idle", "topic_out": self.get_tool()["topic_out"]}
         if action == "stop":
-            try:
-                self.stop()
-            except subprocess.TimeoutExpired:
-                return {"state": "error", "message": "direction subprocess did not exit after kill"}
+            # 状态回复，不杀 worker：停止智能控制不应中断传感器流（与 mic 相同）。
             return {"state": "idle"}
         if action == "info":
             calibration = load_calibration()

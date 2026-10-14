@@ -71,6 +71,55 @@ def test_missing_calibration_exposes_unavailable_direction(monkeypatch, tmp_path
     assert 'calibration' in card.dispatch('start', {})['message']
 
 
+def test_dispatch_stop_keeps_worker_and_publishes_nothing(monkeypatch):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
+    card = _card(module)
+    terminated = []
+
+    class Process:
+        stdout = ()
+        def poll(self): return None
+        def terminate(self): terminated.append(True)
+        def wait(self, timeout=None): return 0
+
+    proc = Process()
+    card._proc = proc
+    valid = module.SoundDirection()
+    valid.state = valid.VALID
+    valid.angle_deg = -90
+    card._on_direction(valid)
+    published_before = len(card._node.published)
+
+    result = card.dispatch('stop', {})
+
+    assert result == {'state': 'idle'}
+    assert card._proc is proc          # 与其他 sensor 卡一致：stop 不碰 worker
+    assert terminated == []
+    assert len(card._node.published) == published_before  # 不发 NO_EVENT
+    info = card.dispatch('info', {})
+    assert info['state'] == 'running'
+    assert info['sound_direction']['angle_deg'] == -90
+
+
+def test_dispatch_start_never_spawns(monkeypatch):
+    module = _load_card(monkeypatch)
+    monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
+    spawns = []
+
+    def fake_popen(*args, **kwargs):
+        spawns.append(True)
+        return types.SimpleNamespace(stdout=(), poll=lambda: None,
+                                     terminate=lambda: None, wait=lambda **kwargs: 0)
+    monkeypatch.setattr(module.subprocess, 'Popen', fake_popen)
+    card = _card(module)
+    card._proc = None
+
+    result = card.dispatch('start', {})
+
+    assert spawns == []                # 与其他 sensor 卡一致：start 永不 spawn
+    assert result == {'state': 'idle', 'topic_out': card.get_tool()['topic_out']}
+
 def test_packaged_robot_calibration_starts_without_machine_override(monkeypatch, tmp_path):
     module = _load_card(monkeypatch)
     monkeypatch.setattr(module, 'CALIBRATION_PATH', tmp_path / 'missing.json')
@@ -83,6 +132,8 @@ def test_packaged_robot_calibration_starts_without_machine_override(monkeypatch,
     monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: proc)
     card = _card(module)
     assert card.dispatch('info', {})['calibrated_directions'] == ['front', 'right']
+    assert card.dispatch('start', {})['state'] == 'idle'   # 纯状态应答，不 spawn
+    assert card.start() is True                            # spawn 只走 plugin.start()
     assert card.dispatch('start', {})['state'] == 'running'
     card.stop()
 
@@ -223,6 +274,8 @@ def test_no_event_clears_last_direction(monkeypatch):
 
 
 def test_stop_publishes_no_event(monkeypatch):
+    # 钉住 plugin.stop() 的驱动关停清屏路径；dispatch('stop') 由
+    # test_dispatch_stop_keeps_worker_and_publishes_nothing 覆盖（不再清屏）。
     module = _load_card(monkeypatch)
     card = _card(module)
     card.stop()
