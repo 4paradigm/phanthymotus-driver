@@ -230,6 +230,16 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
                 try:
                     self.wfile.write(b"event: endpoint\ndata: /mcp\n\n")
                     self.wfile.flush()
+                    bundle = bundle_getter()
+                    tools = bundle.get_all_tools()
+                    payload = json.dumps({"tools": tools}, ensure_ascii=False)
+                    self.wfile.write(f"event: message\ndata: {payload}\n\n".encode())
+                    self.wfile.flush()
+                    import time as _t
+                    while True:
+                        _t.sleep(30)
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
                 except Exception:
                     pass
             else:
