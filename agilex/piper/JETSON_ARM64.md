@@ -86,3 +86,46 @@ This correction does not reset, home or release motor torque.
 The developer image/source changes are not yet a new PR Bot release. The base
 dependency image Version is release.261014.4f9cd06; it must not be reported as a
 Bot Version for this newer development source.
+
+## Operator-approved deployment and passive hardware verification
+
+After the isolated development checks, the operator authorized a separate PiPER
+Docker deployment and explicitly requested stopping the existing Franka/Core
+containers without deleting them. Their containers/data/images were preserved.
+PiPER uses its own Compose project, Core data/port and DDS domain 71/topic
+namespace. Core source was not changed; the Intel controller was not redeployed.
+
+Jetson's 5.15.148-tegra kernel lacked CONFIG_CAN_GS_USB. The official Linux
+v5.15.148 gs_usb module was compiled against the installed matching headers and
+loaded without a reboot. This host prerequisite is outside the driver image;
+it is not an SDK or robot-firmware replacement. USB adapters enumerated but
+initial hub-path checks received no frames. After the operator directly
+connected the target USB-CAN to Jetson, passive feedback arrived at about 200 Hz.
+The exact earlier hub-path failure cause remains undetermined.
+
+The target adapter was bound by serial to can_piper_arm1 with a host udev rule
+and a dedicated systemd service for 1 Mbps activation. The other CAN interface
+was not rebound. Color camera binding uses serial, USB interface 03 and video
+index 0. Serial numbers, robot-specific host rules/config and credentials are
+kept in local deployment evidence rather than committed here. Replug/reboot
+persistence has been configured but is not yet acceptance-tested.
+
+The only canvas node is Arm control. A real DDS subscriber in the separate
+Core container received 40 six-axis skeleton frames, 40 fresh English parameter
+frames and 41 valid JPEG frames in four seconds. Model joint names and finite
+radian angles passed. Arm and gripper feedback was available, with no reported
+faults and an idle task. The arm was already enabled and in teaching mode;
+the deployment did not command those states. The operator had authorized the
+manual deployment gate; it is enabled for subsequent operator tests. No
+movement, mode, enable/disable or reset was requested during these checks.
+
+Jetson movement, teaching exit, preparation, gripper/Stop and visible browser
+acceptance remain pending. This host config does not assert any firmware is
+verified for software teaching exit. A teaching-mode arm continues to reject
+Move. Previous Intel-controller movement trials are not Jetson acceptance.
+
+The locally inspected ARM64 dependency image is 883,757,181 bytes; its tested
+development overlay is 884,167,612 bytes, an increase of 410,431 bytes (~0.39 MiB)
+from source layers and no new dependency install. These are local Docker image
+sizes on the same host, not registry transfer sizes or the original component's
+growth relative to the ROS base. A new clean Bot build/Version remains required.
