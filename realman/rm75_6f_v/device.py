@@ -461,6 +461,10 @@ GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
 GRIPPER_POSITION_MAX = 1000
 GRIPPER_COMPLETION_TIMEOUT = 30  # SDK 阻塞模式下等待夹爪到位的秒数上限（ACP 完成窗口取 +10）
 GRIPPER_STOP_WAIT_MARGIN = 5     # stop 等待在途命令到达安全终态的额外余量
+GRIPPER_POLL_INTERVAL_SECONDS = 0.15
+GRIPPER_POSITION_TOLERANCE = 5
+GRIPPER_PROGRESS_THRESHOLD = 5
+GRIPPER_DEFAULT_STALL_TIMEOUT_SECONDS = 3.0
 CARTESIAN_STOP_JOIN_MARGIN = 10  # 笛卡尔 stop 等待监控线程收尾的额外余量（秒）
 
 
@@ -472,6 +476,20 @@ def _gripper_position(value) -> int:
     if not math.isfinite(numeric) or not GRIPPER_POSITION_MIN <= numeric <= GRIPPER_POSITION_MAX:
         raise ValueError(f"position must be within {GRIPPER_POSITION_MIN}~{GRIPPER_POSITION_MAX}")
     return int(round(numeric))
+
+
+def _gripper_stall_timeout(value) -> float:
+    if value is None:
+        return GRIPPER_DEFAULT_STALL_TIMEOUT_SECONDS
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stall_timeout_seconds must be a number") from exc
+    if not math.isfinite(numeric) or not 0.5 <= numeric <= GRIPPER_COMPLETION_TIMEOUT:
+        raise ValueError(
+            f"stall_timeout_seconds must be within 0.5~{GRIPPER_COMPLETION_TIMEOUT}"
+        )
+    return numeric
 
 
 class GripperPlugin:
@@ -496,7 +514,10 @@ class GripperPlugin:
     def get_tools(self):
         schema = action_schema(
             {
-                "set_position": (["position", "confirm_motion"], "设置二指夹爪目标位置"),
+                "set_position": (
+                    ["position", "on_stall", "stall_timeout_seconds", "confirm_motion"],
+                    "设置二指夹爪目标位置，并指定受阻时保持当前位置或返回起点",
+                ),
                 "info": ([], "读取夹爪与 SDK 连接状态"),
             },
             {
@@ -505,6 +526,19 @@ class GripperPlugin:
                     "minimum": GRIPPER_POSITION_MIN,
                     "maximum": GRIPPER_POSITION_MAX,
                     "description": f"夹爪驱动器目标位置，{GRIPPER_POSITION_MIN}~{GRIPPER_POSITION_MAX}，对应 0~120 mm 行程",
+                },
+                "on_stall": {
+                    "type": "string",
+                    "enum": ["keep", "rollback"],
+                    "default": "keep",
+                    "description": "夹爪连续无进展时：keep 保持当前实际位置；rollback 返回运动前实际位置",
+                },
+                "stall_timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": GRIPPER_COMPLETION_TIMEOUT,
+                    "default": GRIPPER_DEFAULT_STALL_TIMEOUT_SECONDS,
+                    "description": "连续无明显位置进展多久后判定受阻（秒）",
                 },
                 "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
             },
@@ -525,8 +559,8 @@ class GripperPlugin:
         pass
 
     def stop(self):
-        # SDK 没有夹爪中途停止 API：请求停止时等待在途命令到达安全终态
-        # （夹爪走完目标位），再允许共享 SDK 连接被上层销毁。
+        # SDK 没有夹爪中途停止 API：请求停止时由 worker 把最后
+        # 测得位置重新设为目标，收尾后才允许共享 SDK 连接被上层销毁。
         self._mark_interrupted()
         self._wait_for_worker()
 
@@ -545,9 +579,11 @@ class GripperPlugin:
         if action == "info":
             with self._action_lock:
                 active = self._active_action_id
+                last_completion = dict(self._last_completion) if self._last_completion else None
             return {
                 "state": "connected" if self.client.connected else "disconnected",
                 "active_action_id": active,
+                "last_completion": last_completion,
             }
         if action == "start":
             return {"state": "ready"}
@@ -562,6 +598,10 @@ class GripperPlugin:
         if args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true")
         position = _gripper_position(args.get("position"))
+        on_stall = args.get("on_stall", "keep")
+        if on_stall not in ("keep", "rollback"):
+            raise ValueError("on_stall must be keep or rollback")
+        stall_timeout = _gripper_stall_timeout(args.get("stall_timeout_seconds"))
         if not self._gripper_lock.acquire(blocking=False):
             raise RuntimeError(f"another gripper motion is active: {self._active_action_id}")
         if not self.client.motion_gate.acquire(blocking=False):
@@ -573,25 +613,141 @@ class GripperPlugin:
             self._interrupted.discard(action_id)
         self._worker_thread = threading.Thread(
             target=self._gripper_worker,
-            args=(action_id, position),
+            args=(action_id, position, on_stall, stall_timeout),
             daemon=True,
         )
         self._worker_thread.start()
         print(f"[rm75 ACP] {action_id}: started", flush=True)
         return {"state": "running", "action_id": action_id}
 
-    def _gripper_worker(self, action_id, position):
+    def _read_gripper_state(self):
+        state = self.client.call("rm_get_gripper_state")
+        if not isinstance(state, dict):
+            raise RuntimeError(f"invalid gripper state: {state!r}")
         try:
-            # 阻塞模式：SDK 等待夹爪到位（上限 GRIPPER_COMPLETION_TIMEOUT 秒）后返回状态码。
-            # SDK 没有夹爪中途停止 API，收到停止请求后夹爪仍会走完目标位 —— 这是唯一
-            # 确定的安全终态，因此如实上报 completed/target_reached，并附 interrupted 标记。
-            self.client.command("rm_set_gripper_position", position, True, GRIPPER_COMPLETION_TIMEOUT)
-            interrupted = action_id in self._interrupted
-            status, result = "completed", {
-                "reason": "target_reached", "position": position, "interrupted": interrupted,
+            actual = float(state["actpos"])
+            current_force = float(state.get("current_force", 0))
+            mode = int(state.get("mode", 0))
+            error = int(state.get("error", 0))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid gripper state: {state!r}") from exc
+        if not math.isfinite(actual) or not math.isfinite(current_force):
+            raise RuntimeError(f"invalid gripper state: {state!r}")
+        return {
+            **state,
+            "actpos": int(round(actual)),
+            "current_force": current_force,
+            "mode": mode,
+            "error": error,
+        }
+
+    def _wait_for_gripper(self, action_id, target, stall_timeout, deadline):
+        state = self._read_gripper_state()
+        best_error = abs(state["actpos"] - target)
+        last_progress = time.monotonic()
+        while True:
+            now = time.monotonic()
+            error = abs(state["actpos"] - target)
+            with self._action_lock:
+                interrupted = action_id in self._interrupted
+            if interrupted:
+                return "interrupted", state
+            if error <= GRIPPER_POSITION_TOLERANCE:
+                return "reached", state
+            if state["error"] & ~1:
+                raise RuntimeError(f"gripper error 0x{state['error']:x}")
+            if best_error - error >= GRIPPER_PROGRESS_THRESHOLD:
+                best_error = error
+                last_progress = now
+            elif now - last_progress >= stall_timeout:
+                return "stalled", state
+            if now >= deadline:
+                return "timed_out", state
+            time.sleep(GRIPPER_POLL_INTERVAL_SECONDS)
+            state = self._read_gripper_state()
+
+    @staticmethod
+    def _safe_gripper_position(position):
+        return max(GRIPPER_POSITION_MIN, min(GRIPPER_POSITION_MAX, int(round(position))))
+
+    def _gripper_worker(self, action_id, position, on_stall, stall_timeout):
+        started = time.monotonic()
+        start_position = None
+        try:
+            initial = self._read_gripper_state()
+            start_position = initial["actpos"]
+            deadline = started + GRIPPER_COMPLETION_TIMEOUT
+            # 非阻塞下发后轮询真实位置，才能区分到位、受阻与超时。
+            self.client.command("rm_set_gripper_position", position, False, 1)
+            outcome, terminal = self._wait_for_gripper(
+                action_id, position, stall_timeout, deadline
+            )
+            common = {
+                "requested_position": position,
+                "start_position": start_position,
+                "current_force": terminal["current_force"],
+                "mode": terminal["mode"],
+                "error": terminal["error"],
+                "stall_policy": on_stall,
+                "elapsed_seconds": time.monotonic() - started,
             }
+            if outcome == "reached":
+                status, result = "completed", {
+                    **common,
+                    "reason": "target_reached",
+                    "final_position": terminal["actpos"],
+                    "rollback_succeeded": None,
+                }
+            elif outcome in ("stalled", "interrupted"):
+                blocked_position = terminal["actpos"]
+                recovery_target = (
+                    blocked_position if on_stall == "keep" else start_position
+                )
+                recovery_target = self._safe_gripper_position(recovery_target)
+                # The interrupt selected this recovery; do not let the recovery
+                # wait immediately observe the old interrupt marker again.
+                with self._action_lock:
+                    self._interrupted.discard(action_id)
+                # 重新将当前位置设为目标，可停止位置模式继续向物体顶压。
+                self.client.command("rm_set_gripper_position", recovery_target, False, 1)
+                recovery, final = self._wait_for_gripper(
+                    action_id, recovery_target, stall_timeout, deadline
+                )
+                rollback_succeeded = on_stall == "rollback" and recovery == "reached"
+                handled = recovery == "reached"
+                status = "completed" if handled else "failed"
+                if outcome == "interrupted":
+                    reason = "interrupted_kept" if on_stall == "keep" else "interrupted_rolled_back"
+                else:
+                    reason = "motion_stalled_kept" if on_stall == "keep" else "motion_stalled_rolled_back"
+                if not handled:
+                    reason = f"{reason}_failed"
+                result = {
+                    **common,
+                    "reason": reason,
+                    "blocked_position": blocked_position,
+                    "final_position": final["actpos"],
+                    "current_force": final["current_force"],
+                    "mode": final["mode"],
+                    "error": final["error"],
+                    "rollback_succeeded": rollback_succeeded if on_stall == "rollback" else None,
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+            else:
+                status, result = "failed", {
+                    **common,
+                    "reason": "motion_timeout",
+                    "final_position": terminal["actpos"],
+                    "rollback_succeeded": None,
+                }
         except Exception as exc:
-            status, result = "failed", {"reason": str(exc), "position": position}
+            status, result = "failed", {
+                "reason": str(exc),
+                "requested_position": position,
+                "start_position": start_position,
+                "stall_policy": on_stall,
+                "elapsed_seconds": time.monotonic() - started,
+            }
         finally:
             with self._action_lock:
                 if self._active_action_id == action_id:
@@ -626,7 +782,19 @@ def _acp_complete(action_id, status, result, tool_name):
         print(f"[rm75 ACP] {action_id} {status}: callback failed: {error}", flush=True)
         return "failed", error
     summary = {}
-    if status == "completed":
+    if tool_name == "gripper":
+        # Keep the completion useful to Canvas while limiting it to bounded,
+        # JSON-safe gripper telemetry rather than forwarding arbitrary SDK data.
+        for key in (
+                "reason", "requested_position", "start_position",
+                "blocked_position", "final_position", "stall_policy",
+                "rollback_succeeded", "current_force", "mode", "error",
+                "elapsed_seconds"):
+            if key in result:
+                summary[key] = result[key]
+        if "reason" in summary:
+            summary["reason"] = str(summary["reason"])[:240]
+    elif status == "completed":
         summary = {"reason": "target_reached"}
     elif "reason" in result:
         summary = {"reason": str(result["reason"])[:240]}
