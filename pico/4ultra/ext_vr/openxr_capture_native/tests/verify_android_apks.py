@@ -108,8 +108,8 @@ def verify_apk(
     badging = run(str(build_tools / "aapt2"), "dump", "badging", str(apk))
     for fragment in (
         f"package: name='{expected['package']}'",
-        "versionCode='31'",
-        "versionName='0.4.7-pico-reset'",
+        "versionCode='32'",
+        "versionName='0.4.8-pico-status'",
         "minSdkVersion:'29'",
         "targetSdkVersion:'35'",
         f"application-label:'{expected['label']}'",
@@ -172,7 +172,7 @@ def verify_apk(
     )
 
     with zipfile.ZipFile(apk) as archive:
-        require(b"0.4.7-pico-reset" in archive.read("lib/arm64-v8a/libmotus_openxr_capture.so"),
+        require(b"0.4.8-pico-status" in archive.read("lib/arm64-v8a/libmotus_openxr_capture.so"),
                 f"{flavor} native handshake version differs from APK version")
         libraries = {name for name in archive.namelist() if name.startswith("lib/")}
         require(libraries == EXPECTED_LIBRARIES, f"{flavor} native library set mismatch: {sorted(libraries)}")

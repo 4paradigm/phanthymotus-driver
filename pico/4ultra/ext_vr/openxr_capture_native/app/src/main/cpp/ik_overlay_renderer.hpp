@@ -114,7 +114,7 @@ class IkOverlayRenderer {
     text("ROBOT REAR VIEW",-.34f,.34f,gray);
     text("LEFT",-.23f,-.08f,gray);text("RIGHT",.16f,-.08f,gray);
     if(!value.available || (!value.fresh() && !value.tianyi)){
-      text("NO FRESH DATA",-.16f,.08f,pink);
+      text("NO ARM PREVIEW",-.16f,.08f,gray);
     }else{
       if(!value.teleop)text(value.mode+" / "+value.state,-.34f,.30f,gray);
       text("MEASURED",-.34f,.25f,green);text("MAPPED TARGET",-.10f,.25f,orange);
