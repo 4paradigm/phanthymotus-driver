@@ -4,8 +4,8 @@ category: driver
 hardware_provider: linkerhand
 hardware_model: "l20_lite"
 image_name: linkerhand-l20-lite
-port: 15723
-mcp_url: "http://localhost:15723/mcp"
+port: 15731
+mcp_url: "http://localhost:15731/mcp"
 description: "灵心巧手 L20 Lite — USB-RS485/Modbus 115200、10 关节位置/速度/力矩控制与状态读取"
 build_context_extras:
   - ../../common

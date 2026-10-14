@@ -133,10 +133,10 @@ def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
     assert connection.transport.sent == []
     assert plugin.dispatch("start", {}) == {"state": "ready"}
     assert connection.transport.sent == []
-    closed = plugin.dispatch("close", {})
+    closed = plugin.dispatch("close", {"confirm_motion": True})
     assert closed["state"] == "completed"
     assert connection.client.get_positions() == RIGHT_FIST_POSE
-    opened = plugin.dispatch("open", {})
+    opened = plugin.dispatch("open", {"confirm_motion": True})
     assert opened["state"] == "completed"
     assert connection.client.get_positions() == RIGHT_OPEN_POSE
     assert plugin.dispatch("stop", {})["state"] == "idle"
@@ -149,7 +149,7 @@ def test_card_rejects_bad_joint_without_position_write():
     connection = FakeConnection()
     plugin = HandPlugin(connection, {})
     with pytest.raises(ValueError, match="unknown joint"):
-        plugin.dispatch("set_joint", {"joint": "nonexistent", "position": 12})
+        plugin.dispatch("set_joint", {"joint": "nonexistent", "position": 12, "confirm_motion": True})
     assert connection.transport.sent == []
 
 
@@ -176,16 +176,44 @@ def test_canvas_card_schema_and_csv_positions(monkeypatch):
     assert card["type"] == "actuator"
     assert "release" in actions and "set_positions" in actions
     assert card["inputSchema"]["properties"]["positions"]["type"] == "string"
-    assert card["inputSchema"]["x-action-params"]["set_positions"]["params"] == ["positions"]
+    assert card["inputSchema"]["properties"]["confirm_motion"] == {
+        "type": "boolean", "const": True,
+        "description": "确认手附近无人和障碍物后，每次运动显式输入 true",
+    }
+    assert card["inputSchema"]["x-is-dangerous"] is True
+    assert card["inputSchema"]["allOf"][0]["then"]["required"] == ["confirm_motion"]
+    for action in ("open", "close", "set_joint", "set_positions"):
+        assert card["inputSchema"]["x-action-params"][action]["params"][-1] == "confirm_motion"
+    for action in ("get_state", "set_speed", "set_torque", "release"):
+        assert "confirm_motion" not in card["inputSchema"]["x-action-params"][action]["params"]
     assert plugin.dispatch("info", {})["serial_port"] == "/dev/fake"
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
     pose = [254, 254, 234, 254, 254, 254, 127, 126, 127, 254]
-    result = plugin.dispatch("set_positions", {"positions": ",".join(map(str, pose))})
+    result = plugin.dispatch("set_positions", {"positions": ",".join(map(str, pose)), "confirm_motion": True})
     assert result["state"] == "completed"
     assert connection.client.get_positions() == pose
     assert plugin.dispatch("release", {})["state"] == "released"
     with pytest.raises(ValueError, match="expected 10"):
-        plugin.dispatch("set_positions", {"positions": "1,2,3"})
+        plugin.dispatch("set_positions", {"positions": "1,2,3", "confirm_motion": True})
+
+
+@pytest.mark.parametrize("action,args", [
+    ("open", {}),
+    ("close", {}),
+    ("set_joint", {"joint": "index_root", "position": 100}),
+    ("set_positions", {"positions": "100,100,100,100,100,100,100,100,100,100"}),
+])
+@pytest.mark.parametrize("confirmation", [None, False, 1, "true"])
+def test_motion_requires_explicit_boolean_confirmation_before_serial_access(action, args, confirmation):
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, {})
+    request = dict(args)
+    if confirmation is not None:
+        request["confirm_motion"] = confirmation
+    with pytest.raises(ValueError, match="confirm_motion must be true"):
+        plugin.dispatch(action, request)
+    assert connection.transport.sent == []
+    assert connection._client is None
 
 
 def test_mcp_bundle_discovers_hand_card_without_opening_serial():

@@ -25,13 +25,13 @@ def main() -> int:
         original = plugin.dispatch("get_state", {})["positions"]["index_root"]
         target = original - 20 if original > 40 else original + 20
         print(f"index_root initial={original}, target={target}", flush=True)
-        moved = plugin.dispatch("set_joint", {"joint": "index_root", "position": target})
+        moved = plugin.dispatch("set_joint", {"joint": "index_root", "position": target, "confirm_motion": True})
         print(f"move: {moved['state']}, readback={moved['positions']['index_root']}", flush=True)
         return 0 if moved["state"] == "completed" else 1
     finally:
         if original is not None:
             try:
-                restored = plugin.dispatch("set_joint", {"joint": "index_root", "position": original})
+                restored = plugin.dispatch("set_joint", {"joint": "index_root", "position": original, "confirm_motion": True})
                 print(f"restore: {restored['state']}, readback={restored['positions']['index_root']}", flush=True)
             except Exception as exc:
                 print(f"restore failed: {exc}", file=sys.stderr)

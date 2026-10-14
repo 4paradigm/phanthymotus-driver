@@ -13,6 +13,7 @@ JOINT_NAMES = [
     "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
     "pinky_root", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
 ]
+MOTION_ACTIONS = ("open", "close", "set_joint", "set_positions")
 
 # Open pose was captured from the connected RIGHT hand. The fist pose is the
 # user's requested target, not a hardware-verified reachable pose. Values are
@@ -92,28 +93,35 @@ class HandPlugin:
         return value
 
     def get_tool(self) -> dict:
+        schema = action_schema(
+            {
+                "get_state": ([], "读取 10 个关节位置和速度"),
+                "open": (["confirm_motion"], "展开到已验证的右手姿态；每次运动需确认"),
+                "close": (["confirm_motion"], "握拳到用户指定的右手姿态（尚未实机验证）；每次运动需确认"),
+                "set_joint": (["joint", "position", "confirm_motion"], "设置单关节位置 0..255；每次运动需确认"),
+                "set_positions": (["positions", "confirm_motion"], "按关节顺序设置 10 个位置；画布输入逗号分隔值；每次运动需确认"),
+                "set_speed": (["speed"], "配置后续动作速度，不立即驱动"),
+                "set_torque": (["torque"], "配置后续动作力矩，不立即驱动"),
+                "release": ([], "立即将所有关节力矩设为 0"),
+            },
+            {
+                "joint": {"type": "string", "enum": JOINT_NAMES},
+                "position": {"type": "integer", "minimum": 0, "maximum": 255},
+                "positions": {"type": "string", "description": "10 个位置，逗号分隔，如 254,254,234,254,254,254,127,126,127,254"},
+                "speed": {"type": "integer", "minimum": 1, "maximum": 255},
+                "torque": {"type": "integer", "minimum": 1, "maximum": 255},
+                "confirm_motion": {"type": "boolean", "const": True, "description": "确认手附近无人和障碍物后，每次运动显式输入 true"},
+            },
+        )
+        schema["allOf"] = [{
+            "if": {"properties": {"action": {"enum": list(MOTION_ACTIONS)}}},
+            "then": {"required": ["confirm_motion"]},
+        }]
+        schema["x-is-dangerous"] = True
         definition = tool(
             "hand", "actuator",
-            "LinkerHand L20 Lite USB-RS485/Modbus 控制。动作会驱动真实机械手；执行前需获得用户确认。",
-            action_schema(
-                {
-                    "get_state": ([], "读取 10 个关节位置和速度"),
-                    "open": ([], "展开到已验证的右手姿态"),
-                    "close": ([], "握拳到用户指定的右手姿态（尚未实机验证）"),
-                    "set_joint": (["joint", "position"], "设置单关节位置 0..255"),
-                    "set_positions": (["positions"], "按关节顺序设置 10 个位置；画布输入逗号分隔值"),
-                    "set_speed": (["speed"], "配置后续动作速度，不立即驱动"),
-                    "set_torque": (["torque"], "配置后续动作力矩，不立即驱动"),
-                    "release": ([], "立即将所有关节力矩设为 0"),
-                },
-                {
-                    "joint": {"type": "string", "enum": JOINT_NAMES},
-                    "position": {"type": "integer", "minimum": 0, "maximum": 255},
-                    "positions": {"type": "string", "description": "10 个位置，逗号分隔，如 254,254,234,254,254,254,127,126,127,254"},
-                    "speed": {"type": "integer", "minimum": 1, "maximum": 255},
-                    "torque": {"type": "integer", "minimum": 1, "maximum": 255},
-                },
-            ),
+            "LinkerHand L20 Lite USB-RS485/Modbus 控制。每次运动必须显式传 confirm_motion=true。",
+            schema,
         )
         definition["title"] = "L20 Lite 灵巧手"
         return definition
@@ -176,6 +184,8 @@ class HandPlugin:
                 raise
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in MOTION_ACTIONS and args.get("confirm_motion") is not True:
+            raise ValueError("confirm_motion must be true for every movement request")
         if action == "start":
             # Canvas lifecycle marker; opening a card must not move the hand.
             return {"state": "ready"}

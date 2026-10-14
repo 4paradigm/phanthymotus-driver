@@ -5,7 +5,8 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} PyYAML==6.0.2 pyserial==3.5
+COPY requirements.txt /work/requirements.txt
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
 
 COPY common/       /work/common/
 COPY main.py       /work/main.py
@@ -19,6 +20,6 @@ ENV ROS_LOCALHOST_ONLY=0
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/work
 
-EXPOSE 15723
+EXPOSE 15731
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]

@@ -13,7 +13,13 @@ low byte of a register. The separate `can_client.py` and `device.py` files are
 the previous CAN draft; `main.py` now imports `modbus_device.py` instead.
 
 Configure `serial_port` and `side` in `config.yaml`. The driver never moves the
-hand on startup; only explicit MCP `hand` actions do. The right-hand default
+hand on startup; only explicit MCP `hand` actions do. Every `open`, `close`,
+`set_joint` or `set_positions` request must include the boolean
+`confirm_motion: true`; missing, false or string values are rejected before
+opening the serial port. On the canvas, enter `true` in the confirmation field
+after checking that the hand and its surroundings are clear. State reads,
+speed/torque configuration and torque release do not need motion confirmation.
+The right-hand default
 `open` pose is the pose read immediately before a successful physical fist/open
 test. The default `close` pose is the user's requested right-hand target:
 `[93,255,0,0,0,0,128,128,128,255]`. This new pose has not yet been verified
@@ -33,17 +39,23 @@ For local tests without hardware:
 python3 -m pytest tests/test_linkerhand_l20_lite_modbus.py -q
 ```
 
-With the powered right hand connected and clear of obstacles, run the optional
-full hardware acceptance check from this directory with the repository root on
-`PYTHONPATH`:
+With the powered right hand connected, run the tracked hardware smoke script
+from this directory with the repository root on `PYTHONPATH`. First read state
+without motion:
 
 ```bash
-PYTHONPATH=../.. python3 hardware_acceptance.py --run
+PYTHONPATH=../.. python3 hardware_smoke.py --read-only
 ```
 
-It checks state, speed/torque configuration, one-joint and full-pose writes,
-close/open and stop, then leaves the hand open with torque released. It does
-not test Docker, MCP HTTP or Agent Core registration.
+Only after checking that the hand and its surroundings are clear, optionally
+move the index root by 20 position units and restore it:
+
+```bash
+PYTHONPATH=../.. python3 hardware_smoke.py --move-index-and-restore
+```
+
+This is a small one-joint smoke test, not full acceptance testing. It does not
+test Docker, MCP HTTP or Agent Core registration.
 
 The container requires access to the USB serial device. Its Compose service
 already passes `/dev` into the privileged container. Do not run two hand
