@@ -56,10 +56,12 @@ def make_plugin(backend=None, camera=None):
     )
 
 
-def test_tool_contract_is_a_processor_with_explicit_actions():
+def test_tool_contract_is_an_on_demand_actuator_with_explicit_actions():
     tool = make_plugin().get_tool()
     assert tool["name"] == "face_whitelist"
-    assert tool["type"] == "processor"
+    assert tool["type"] == "actuator"
+    assert "topic_in" not in tool
+    assert "topic_out" not in tool
     assert tool["multiInstance"] is False
     assert tool["inputSchema"]["properties"]["action"]["enum"] == [
         "start", "stop", "recognize", "reload", "info",
@@ -111,6 +113,10 @@ def test_stop_prevents_later_recognition():
     plugin.dispatch("start", {})
     assert plugin.dispatch("stop", {}) == {"state": "idle"}
     assert plugin.dispatch("recognize", {})["state"] == "error"
+
+
+def test_unknown_action_uses_bundle_unsupported_action_handling():
+    assert make_plugin().dispatch("not_an_action", {}) is None
 
 
 class FakeRecognizer:
@@ -192,7 +198,9 @@ def test_reload_failure_is_visible_in_info_state():
 def test_bundle_manifest_config_and_image_all_ship_the_card():
     driver_dir = Path(__file__).resolve().parents[1]
     assert "face_whitelist:" in (driver_dir / "config.yaml").read_text()
-    assert "name: face_whitelist" in (driver_dir / "driver.yaml").read_text()
+    assert "{ name: face_whitelist,    type: actuator }" in (
+        driver_dir / "driver.yaml"
+    ).read_text()
     dockerfile = (driver_dir / "Dockerfile").read_text()
     assert "COPY requirements.txt /tmp/bumi-requirements.txt" in dockerfile
     assert "-r /tmp/bumi-requirements.txt" in dockerfile

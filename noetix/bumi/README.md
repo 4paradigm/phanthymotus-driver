@@ -5,9 +5,11 @@ The bundle exposes the original Bumi sensor, locomotion, audio and camera cards 
 ## `face_whitelist` card
 
 Local proof-of-concept face recognition for one person in the current RGB
-frame. The processor reuses the existing Bumi camera worker and never opens a
-second RealSense pipeline. It does not save visitor frames, speak, move the
-robot, or make an access-control decision.
+frame. The on-demand actuator reuses the existing Bumi camera worker and never
+opens a second RealSense pipeline. It does not save visitor frames, speak, move
+the robot, or make an access-control decision. It is an actuator because each
+`recognize` call returns a result directly; it does not subscribe to an input
+topic or publish an output topic as a processor would.
 
 Enrollment remains in the host-mounted private directory:
 
@@ -26,6 +28,18 @@ recent camera frame. Results are `matched`, `unknown`, `no_face`, or
 calibrated probability. Validate `distance_threshold` on the actual device and
 do not treat this proof of concept as an unattended physical access-control
 system.
+
+The Bumi image replaces `opencv-python-headless` with the pinned
+`opencv-contrib-python-headless==4.11.0.86` wheel because the recognition code
+requires `cv2.face.LBPHFaceRecognizer_create`. For Linux ARM64, the compressed
+wheel grows from [29.5 MB](https://pypi.org/project/opencv-python-headless/4.11.0.86/)
+to [35.1 MB](https://pypi.org/project/opencv-contrib-python-headless/4.11.0.86/),
+an increase of about 5.6 MB. This is a wheel download comparison, not the
+installed Docker image delta; measure the latter after the ARM64 build. The
+extra size is accepted for this proof of concept because the chosen LBPH API
+is only in OpenCV contrib. The dependency is scoped to this driver, installed
+without a pip cache, and listed once in `requirements.txt`. `driver.yaml`
+publishes the card to Resource Center and has no meaningful image-size effect.
 
 ## App 图传与 Phanthy Camera Card
 

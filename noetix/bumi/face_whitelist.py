@@ -229,7 +229,7 @@ class FaceWhitelistPlugin:
     def get_tool(self) -> dict:
         return {
             "name": "face_whitelist",
-            "type": "processor",
+            "type": "actuator",
             "multiInstance": False,
             "description": (
                 "Compare one recent Bumi RGB frame with a private local face "
@@ -336,4 +336,4 @@ class FaceWhitelistPlugin:
             return self._reload()
         if action == "recognize":
             return self._recognize()
-        return {"state": "error", "error": f"unsupported action: {action}"}
+        return None

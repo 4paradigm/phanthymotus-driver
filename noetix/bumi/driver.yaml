@@ -28,4 +28,4 @@ cards:
   - { name: depth,             type: sensor }
   - { name: motion_state,      type: sensor }
   - { name: vision_capture,    type: actuator }
-  - { name: face_whitelist,    type: processor }
+  - { name: face_whitelist,    type: actuator }
