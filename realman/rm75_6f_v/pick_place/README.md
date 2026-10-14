@@ -85,7 +85,7 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
 
 | 配置 | 默认值 | 范围与含义 |
 | --- | --- | --- |
-| `speed_percent` | 5 | 整数 1～Driver 速度上限（最高 10），用于全部关节与笛卡尔运动 |
+| `speed_percent` | 50 | 整数 1～100，用于本卡片全部关节与笛卡尔运动 |
 | `observation_joints_deg` | `-90,0,0,90,0,90,0` | 英文逗号分隔的 J1～J7 关节角，单位 °，按设备各关节限位校验 |
 | `x_compensation_mm` | 30 | 有限数值，基坐标 X 绝对目标补偿，单位 mm |
 | `y_compensation_mm` | -75 | 有限数值，基坐标 Y 绝对目标补偿，单位 mm |
@@ -94,10 +94,10 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
 | `place_descent_mm` | 60 | 有限正数，放置下降距离，单位 mm |
 | `observe_after_transfer` | false | 搬运后拍照的布尔开关；搬运后始终返回观察位，开启时再保存新照片并返回物品列表 |
 
-速度上限为 `min(safety.max_speed_percent, 10)`，默认速度取
-`min(safety.default_speed_percent, 速度上限)`，由 Driver 配置在卡片初始化时确定。
+本卡片速度范围为 1～100%，默认 50%，不受 Driver 的
+`safety.max_speed_percent` 和 `safety.default_speed_percent` 配置影响。
 MCP 配置 Schema 展示实际默认值和上限；超限配置返回 `INVALID_CONFIG`，不截断请求值，
-也不修改当前配置。卡片直接读取 Driver 配置，不依赖其他卡片的实现或运行状态。
+也不修改当前配置。其他卡片的速度配置保持不变。
 
 下降距离是从本次下降起点向下移动的距离。
 X/Y 补偿是独立的水平定位参数，作用于基坐标系中的目标位置。
