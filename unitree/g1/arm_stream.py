@@ -558,19 +558,10 @@ class ArmStreamExecutor:
                 raise ValueError('replay_not_armed')
             self.install_motion_envelope(proof_record)
             self.accept_control(command)
-            sample, q, _ = self._fresh()
-            now = self.clock()
-            target = self.latest['values']
-            if not self._proof.allows(self.latest, q, self.last_q, target, now_ns=now):
-                raise ValueError('replay_envelope_exceeded')
-            dt = max(0., min((now-self.last_emit)/1e9, .05))
-            if any(abs(a-b) > dt+1e-9 for a,b in zip(target, self.last_q)):
-                raise ValueError('replay_speed_exceeded')
-            weight = min(1., max(0., (now-self._takeover_ns)/1e9))**2
-            self._write(target, None, weight)
-            self.applied_seq = self.latest['seq']
+            self.tick()
+            if self.applied_seq != command['seq']:
+                raise ValueError(self.reason or 'replay_not_applied')
             self.latest = self._proof = None
-            self.state, self.reason = 'active', None
 
     def _stationary(self, s, q, dq, after):
         if s['arm_ns']<=after or max(map(abs,dq))>.02:
@@ -674,8 +665,6 @@ class ArmStreamExecutor:
                     if now >= self.replay_deadline_ns:
                         self.hold('replay_watchdog')
                         self.replay_deadline_ns = None
-                    elif self.state != 'hold':
-                        return
                 if self.latest and now>=self.latest['valid_until_ns']:
                     self.hold('command_timeout',recoverable=True)
                 if self.state=='hold':
@@ -694,7 +683,13 @@ class ArmStreamExecutor:
                 if servo and self.applied_seq == self.latest['seq']:return
                 dt=max(0.,min((now-self.last_emit)/1e9,.02))
                 limit=self.velocity*dt
-                if servo:
+                if self.replay_deadline_ns is not None:
+                    # Recordings already contain the smoothed SDK references.
+                    next_q = self.latest['values']
+                    step = max(0., min((now-self.last_emit)/1e9, .05))
+                    if any(abs(a-b) > step+1e-9 for a,b in zip(next_q, self.last_q)):
+                        raise ValueError('replay_speed_exceeded')
+                elif servo:
                     # Continuity/reference handoff follows jsmy-CTH's PR #322:
                     # https://github.com/4paradigm/phanthymotus-driver/pull/322
                     # Use the last successful output, not measured-position noise.

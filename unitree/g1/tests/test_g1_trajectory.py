@@ -104,6 +104,8 @@ def test_replay_rejects_fast_target_and_stale_feedback(tmp_path):
              'lower': [-1.]*10, 'upper': [1.]*10, 'measured_ns': arm.clock()}
     advance(10); arm.replay_deadline_ns = arm.clock()+200_000_000
     with pytest.raises(ValueError, match='speed'): arm.write_replay(command, proof)
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.replay_deadline_ns = arm.clock()+200_000_000
     command = packet(arm, seq=2, target=.1)
     proof.update({k: command[k] for k in IDENTITY})
     advance(101, fresh=False)
@@ -500,3 +502,28 @@ def test_close_pause_frame_uses_execution_deadline_not_preparation_time(tmp_path
         assert receipts[-1][1] == expected
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+@pytest.mark.parametrize('replay', [False, True])
+@pytest.mark.parametrize('failure', ['sdk', 'envelope', 'expired'])
+def test_live_and_replay_use_same_execution_failure_handling(tmp_path, replay, failure):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    advance(50)
+    command = packet(arm, target=.01, life=1 if failure == 'expired' else 300)
+    proof = {'schema': 'motus.motion.envelope/1', **{k: command[k] for k in IDENTITY},
+             'lower': [-1.]*10, 'upper': [1.]*10, 'measured_ns': arm.clock()}
+    if failure == 'sdk':
+        channel.publish_servo_position = lambda *a, **k: False
+    if failure == 'envelope':
+        proof['lower'] = [.5]*10
+    arm.install_motion_envelope(proof)
+    arm.accept_control(command)
+    if replay:
+        arm.replay_deadline_ns = arm.clock()+100_000_000
+    advance(2)
+    arm.tick()
+    assert not channel.positions and arm.applied_seq == -1
+    assert arm.reason == {'sdk': 'arm_sdk_write_failed',
+                          'envelope': 'motion_envelope_exceeded',
+                          'expired': 'command_timeout'}[failure]
+    assert arm.state == ('fault' if failure == 'sdk' else 'hold')
