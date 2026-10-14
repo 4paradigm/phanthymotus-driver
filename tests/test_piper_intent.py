@@ -536,6 +536,35 @@ class IntentTests(unittest.TestCase):
                 self.call('move_up', **supplied)
         self.assertEqual(self.sdk.calls, [])
 
+    def test_core_retained_width_does_not_change_direction_target_or_audit(self):
+        # Older Core keeps a populated width input when selecting Move.
+        result = self.call('move_up', width_mm=50)
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(self.sdk.pose[2], 251000)
+        targets = [c for c in self.sdk.calls if c[0] == 'end_pose']
+        self.assertEqual(len(targets), 1)
+        self.assertNotIn('width_mm', self.call('info')['task']['request'])
+        self.assertFalse(any(c[0] == 'gripper' for c in self.sdk.calls))
+
+    def test_core_retained_width_does_not_block_passive_lifecycle_or_stop(self):
+        for action in ('select_action', 'info', 'start', 'stop_motion'):
+            with self.subTest(action=action):
+                self.call(action, width_mm=50)
+        self.assertEqual(self.sdk.calls, [])
+        for action in TASK_ACTIONS - {'set_gripper_opening'}:
+            validated = self.runtime._args('arm_control', action,
+                                          {'action': action, 'width_mm': 50})
+            self.assertNotIn('width_mm', validated)
+        with self.assertRaisesRegex(ValueError, 'Unexpected'):
+            self.call('move_up', width_mm=50, width_typo=50)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_retained_width_does_not_bypass_teaching_guard(self):
+        self.sdk.mode = 'TEACHING_MODE(0x2)'
+        with self.assertRaisesRegex(RuntimeError, 'TEACHING_MODE'):
+            self.call('move_up', width_mm=50)
+        self.assertEqual(self.sdk.calls, [])
+
     def test_standby_enabled_arm_prepares_once_at_low_speed(self):
         self.sdk.mode = 'STANDBY(0x0)'
         self.call('move_up')

@@ -144,6 +144,13 @@ class IntentControlPlugin(PiperPlugin):
             raise ValueError('This action has been replaced; refresh Arm control and choose a user action.')
         allowed = set(schema['x-action-params'].get(action, {}).get('params', []))
         supplied = set(args) - {'_tool_name', 'instance_id', 'action'}
+        result = dict(args)
+        # Older Core submits hidden fields retained from previous actions.
+        # Width has no meaning outside Set gripper opening: discard only this
+        # declared field, preserving strict rejection of all unknown inputs.
+        if name == CONTROL and action != 'set_gripper_opening':
+            supplied.discard('width_mm')
+            result.pop('width_mm', None)
         # Core's generic output-topic discovery adds an empty input_topic to
         # Info for input-less cards. Accept only that read-only framework value;
         # movement requests retain strict parameter rejection.
@@ -151,7 +158,6 @@ class IntentControlPlugin(PiperPlugin):
             supplied.discard('input_topic')
         if supplied - allowed:
             raise ValueError('Unexpected parameters for this action: ' + ', '.join(sorted(supplied - allowed)))
-        result = dict(args)
         for key in allowed:
             prop = schema['properties'][key]
             if result.get(key) == '' or key not in result:

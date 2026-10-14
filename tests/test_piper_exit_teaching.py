@@ -56,13 +56,13 @@ class TeachingExitTests(unittest.TestCase):
         self.assertIn({'const': 'exit_teaching_and_hold', 'title': 'Exit teaching and hold'},
                       schema['properties']['action']['oneOf'])
         with self.assertRaises(ValueError):
-            self.call(width_mm=20)
+            self.call(width_typo=20)
         self.assertEqual(self.sdk.calls, [])
 
     def test_current_pose_once_no_home_reset_enable_or_gripper_commands(self):
         target = self.sdk.raw
         gripper_before = self.sdk.gripper_enabled
-        result = self.call()
+        result = self.call(width_mm=20)  # Retained hidden Core field must not move the gripper.
         self.assertEqual(result['state'], 'completed')
         self.assertEqual(result['firmware'], 'S-V1.9-0')
         self.assertEqual(result['target_joints_deg'], tuple(q/1000 for q in target))
@@ -74,6 +74,7 @@ class TeachingExitTests(unittest.TestCase):
         self.assertEqual(sum(c[0] == 'mode' for c in self.controls()), 1)
         self.assertTrue(all(self.sdk.enabled))
         self.assertEqual(self.sdk.gripper_enabled, gripper_before)
+        self.assertNotIn('width_mm', self.call('info')['task']['request'])
         self.assertFalse(result['motor_torque_released'])
         self.assertEqual(self.call('info')['task']['result'], {k:v for k,v in result.items() if k != 'state'})
         calls = list(self.sdk.calls)
