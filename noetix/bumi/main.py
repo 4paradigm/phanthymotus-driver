@@ -161,6 +161,12 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("face_whitelist", {}).get("enabled", False):
+            from face_whitelist import FaceWhitelistPlugin
+            self._plugins.append(FaceWhitelistPlugin(
+                plugins_cfg["face_whitelist"], camera_plugin))
+            print("[bundle] FaceWhitelistPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

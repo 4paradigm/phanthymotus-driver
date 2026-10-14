@@ -2,6 +2,31 @@
 
 The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
 
+## `face_whitelist` card
+
+Local proof-of-concept face recognition for one person in the current RGB
+frame. The processor reuses the existing Bumi camera worker and never opens a
+second RealSense pipeline. It does not save visitor frames, speak, move the
+robot, or make an access-control decision.
+
+Enrollment remains in the host-mounted private directory:
+
+```text
+/opt/phanthy-motus/data/face_whitelist/
+  employee_001/
+    01.jpg
+    02.jpg
+    person.json       # optional: {"display_name": "Zhang San"}
+```
+
+Use 3–5 clear images per person, each containing exactly one frontal face.
+After changing the directory, call `reload`; call `recognize` to inspect one
+recent camera frame. Results are `matched`, `unknown`, `no_face`, or
+`multiple_faces`. OpenCV LBPH reports a distance (lower is closer), not a
+calibrated probability. Validate `distance_threshold` on the actual device and
+do not treat this proof of concept as an unattended physical access-control
+system.
+
 ## App 图传与 Phanthy Camera Card
 
 Bumi 的官方 App 图传服务 `noetix-video-capture.service` 会占用 RealSense。

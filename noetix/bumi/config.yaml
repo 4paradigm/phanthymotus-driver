@@ -30,3 +30,13 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  face_whitelist:
+    enabled: true
+    # Each direct child directory is one person. Keep biometric data on the
+    # robot host; never copy enrollment photos into the image or Git.
+    whitelist_dir: /opt/phanthy-motus/data/face_whitelist
+    # LBPH uses a distance: lower is more similar. Start strict and validate
+    # the threshold on the actual camera before using the result in a workflow.
+    distance_threshold: 60
+    min_face_size: 80
+    max_images_per_person: 20

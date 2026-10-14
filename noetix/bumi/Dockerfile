@@ -30,7 +30,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
+    pyyaml netifaces numpy opencv-contrib-python-headless==4.11.0.86 pyrealsense2 pybind11
 
 # Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
@@ -68,6 +68,7 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY face_whitelist.py /work/face_whitelist.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
