@@ -2519,11 +2519,63 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertIn('mimic joint="L_thumb_mcp_joint" multiplier="1.33"', urdf)
 
     def test_o10_hand_mount_aligns_fingers_with_a3_wrist_forward_axis(self):
-        root = ET.parse(device.RESOURCE_DIR / "a3_o10_hand.urdf").getroot()
-        for name in ("L_palm_joint", "R_palm_joint"):
-            origin = root.find(f"joint[@name='{name}']/origin")
-            self.assertIsNotNone(origin)
-            self.assertEqual(origin.attrib["rpy"], "0 1.5707963 0")
+        hand_root = ET.parse(device.RESOURCE_DIR / "a3_o10_hand.urdf").getroot()
+        a3_root = ET.parse(device.RESOURCE_DIR / "a3_ultra.urdf").getroot()
+
+        def rotation(rpy_text):
+            roll, pitch, yaw = map(float, rpy_text.split())
+            cr, sr = math.cos(roll), math.sin(roll)
+            cp, sp = math.cos(pitch), math.sin(pitch)
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            return [
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
+            ]
+
+        def multiply(a, b):
+            return [[sum(a[i][k] * b[k][j] for k in range(3))
+                     for j in range(3)] for i in range(3)]
+
+        mounts = {
+            "left": ("L_palm_joint", "left_hand_O10_joint"),
+            "right": ("R_palm_joint", "right_hand_O10_joint"),
+        }
+        for side, (name, wrist_joint) in mounts.items():
+            origin = hand_root.find(f"joint[@name='{name}']/origin")
+            expected = {
+                "L_palm_joint": "0 1.5707963 -1.5707963",
+                "R_palm_joint": "0 1.5707963 1.5707963",
+            }[name]
+            self.assertEqual(origin.attrib["rpy"], expected)
+            wrist_origin = a3_root.find(f"joint[@name='{wrist_joint}']/origin")
+            total = multiply(rotation(wrist_origin.attrib["rpy"]),
+                             rotation(origin.attrib["rpy"]))
+            # O10 palm normal is +X and fingers extend along +Z.
+            for axis, target in (((1, 0, 0), (0, 0, 1)),
+                                 ((0, 0, 1), (1, 0, 0))):
+                mapped = [sum(total[row][col] * axis[col] for col in range(3))
+                          for row in range(3)]
+                for actual, expected_component in zip(mapped, target):
+                    self.assertAlmostEqual(actual, expected_component, delta=0.002,
+                                           msg=f"{side} hand frame {mapped}")
+
+    def test_o10_flexion_feedback_is_inverted_from_command_counts(self):
+        msg = types.SimpleNamespace(
+            name=["left_index_bent_1", "right_index_bent_1",
+                  "left_thumb_bent_2", "right_thumb_bent_2"],
+            position=[4096, 4096, 4096, 4010], velocity=[4.0, 0.0, 0.0, 0.0],
+            effort=[0.0] * 4,
+            frame_id="O10Hand")
+        self._callback("/motion/control/hand_joint_state")(msg)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        by_name = {joint["name"]: joint for joint in payload["joints"]}
+        self.assertAlmostEqual(by_name["L_index_pip_joint"]["q"], 0.0)
+        self.assertAlmostEqual(by_name["R_index_pip_joint"]["q"], 0.0)
+        self.assertAlmostEqual(by_name["L_thumb_mcp_joint"]["q"], 0.0)
+        self.assertAlmostEqual(by_name["R_thumb_mcp_joint"]["q"], 0.0, delta=0.03)
+        self.assertAlmostEqual(by_name["L_index_pip_joint"]["dq"],
+                               -4.0 * 1.4835298641951802 / 4096)
 
     def test_skeleton_maps_right_o10_channels_with_official_signs(self):
         msg = types.SimpleNamespace(
@@ -2535,7 +2587,8 @@ class MirrorStreamTests(unittest.TestCase):
         by_name = {joint["name"]: joint["q"] for joint in payload["joints"]}
         self.assertAlmostEqual(by_name["R_thumb_roll_joint"],
                                device.HAND_JOINT_LIMITS["R_thumb_roll_joint"][0])
-        self.assertAlmostEqual(by_name["R_thumb_mcp_joint"], 0.0)
+        self.assertAlmostEqual(by_name["R_thumb_mcp_joint"],
+                               device.HAND_JOINT_LIMITS["R_thumb_mcp_joint"][1])
         self.assertAlmostEqual(by_name["R_ring_abad_joint"], 0.0)
 
     def test_skeleton_splits_combined_generic_o10_channels_by_side(self):
