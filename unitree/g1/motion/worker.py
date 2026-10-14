@@ -8,3 +8,6 @@ class NumericalWorker(_Worker):
         super().__init__(path, velocity, driver_dir=Path(__file__).resolve().parents[1],
             solver_module='motion.kinematics', solver_class='IK',
             visualization_module='motion.visualization')
+
+    def joint_envelope(self, measured, previous, target):
+        return self.call('joint_envelope', {'measured': measured, 'previous': previous, 'target': target})

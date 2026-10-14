@@ -1,4 +1,4 @@
-"""Latest device input and Canvas monitoring; no reverse device feedback.
+"""Latest device input and robot feedback for Canvas and the paired PICO Driver.
 
 A dedicated single-thread executor owns this node's subscriptions and lifecycle.
 No other thread creates/destroys/spins its ROS entities, including on rebind.

@@ -124,6 +124,7 @@ motion_control:
 # Canvas start plus fresh tracked input and both grips are required for motion.
 teleop_control:
   enabled: true
+  data_dir: /opt/phanthy-motus/data/g1
   # Internal deployment setting; Canvas users do not select an execution mode.
   mode: live
   calibration_path: /work/motion/body23_fixed_hand.json

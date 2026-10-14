@@ -93,6 +93,8 @@ class ArmStreamExecutor:
         self.seq = self.applied_seq = self._epoch = -1
         self.state, self.reason = 'idle', None
         self.latest, self.last_q = None, None
+        self.record_sink = None
+        self.replay_deadline_ns = None
         self.last_emit = self.clock()
         self._proofs = OrderedDict()
         self._proof = None
@@ -287,6 +289,11 @@ class ArmStreamExecutor:
             if recoverable and (self.state=='fault' or self.release_requested
                     or self.state=='hold' and not self._recoverable): raise ValueError('hold_not_resumable')
             self._generation += 1
+            if self.record_sink is not None:
+                if reason == 'operator_pause' and self.latest is not None and self.applied_seq == self.latest['seq']:
+                    self._record('hold', self._snapshot(), self.latest)
+                elif reason != 'operator_pause':
+                    self.record_sink.fail(reason)
             self.latest = self._proof = None
             self.release_requested |= release
             if self.session_id or self._channel_open:
@@ -516,6 +523,38 @@ class ArmStreamExecutor:
             raise ValueError('arm_sdk_write_failed')
         self.last_q,self.last_emit,self._weight = list(q),self.clock(),weight
 
+    def _record(self, kind, sample, command):
+        sink = self.record_sink
+        if sink is not None:
+            sink.append({'kind': kind, 't_ns': self.clock(), 'target_q': list(self.last_q),
+                'feedback_q': list(sample['q']), 'feedback_dq': list(sample['dq']),
+                'feedback_ns': sample['arm_ns'], 'source_sequence': command['source_seq'],
+                'mapping_epoch': command['mapping_epoch'], 'sdk_sequence': command['seq'],
+                'session_id': self.session_id})
+
+    def write_replay(self, command, proof_record):
+        """Internal trajectory path: exact references, with the same execution gate."""
+        with self.lock:
+            if self.replay_deadline_ns is None or self.clock() >= self.replay_deadline_ns:
+                raise ValueError('replay_watchdog')
+            if self.state not in ('ready', 'active') or self.release_requested:
+                raise ValueError('replay_not_armed')
+            self.install_motion_envelope(proof_record)
+            self.accept_control(command)
+            sample, q, _ = self._fresh()
+            now = self.clock()
+            target = self.latest['values']
+            if not self._proof.allows(self.latest, q, self.last_q, target, now_ns=now):
+                raise ValueError('replay_envelope_exceeded')
+            dt = max(0., min((now-self.last_emit)/1e9, .05))
+            if any(abs(a-b) > dt+1e-9 for a,b in zip(target, self.last_q)):
+                raise ValueError('replay_speed_exceeded')
+            weight = min(1., max(0., (now-self._takeover_ns)/1e9))**2
+            self._write(target, None, weight)
+            self.applied_seq = self.latest['seq']
+            self.latest = self._proof = None
+            self.state, self.reason = 'active', None
+
     def _stationary(self, s, q, dq, after):
         if s['arm_ns']<=after or max(map(abs,dq))>.02:
             self._settle=None;return False
@@ -596,6 +635,12 @@ class ArmStreamExecutor:
                     self._release_tick(s,q,dq);return
                 if self.state=='fault':return
                 now=self.clock()
+                if self.replay_deadline_ns is not None:
+                    if now >= self.replay_deadline_ns:
+                        self.hold('replay_watchdog')
+                        self.replay_deadline_ns = None
+                    elif self.state != 'hold':
+                        return
                 if self.latest and now>=self.latest['valid_until_ns']:
                     self.hold('command_timeout',recoverable=True)
                 if self.state=='hold':
@@ -638,8 +683,10 @@ class ArmStreamExecutor:
                     self.hold('command_timeout',recoverable=True);return
                 weight=min(1.,max(0.,(now-self._takeover_ns)/1e9))**2
                 self._write(next_q,tau,weight)
+                self._record('target', s, self.latest)
                 self.applied_seq=self.latest['seq'];self.state,self.reason='active',None
             except Exception as exc:
+                if self.record_sink is not None: self.record_sink.fail(str(exc))
                 snapshot=self._snapshot()
                 age=self.clock()-(self._fsm.get('arm_ns',0) if str(exc)=='motion_feedback_stale' else snapshot.get('arm_ns',0))
                 if str(exc) in ('arm_feedback_stale','motion_feedback_stale') and 0 <= age <= 300_000_000 and self.state!='fault':

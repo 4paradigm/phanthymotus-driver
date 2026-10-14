@@ -227,6 +227,8 @@ def serve(sock, solver_module, solver_class, visualization_module):
                 targets = [transform({'position': values[i:i+3], 'orientation': values[i+3:i+7]}) for i in (0, 7)]
                 q = solver.solve(targets, data['q'], data['commanded'], deadline_monotonic=deadline)
                 result = {'q': list(q), 'last_ms': solver.last_ms, 'envelope': {**solver.last_envelope, 'measured_ns': data['measured_ns']}}
+            elif op == 'joint_envelope':
+                result = solver.motion_envelope(data['measured'], data['previous'], data['target'], budget)
             elif op == 'render':
                 from scipy.spatial.transform import Rotation
                 snapshot = importlib.import_module(visualization_module).snapshot

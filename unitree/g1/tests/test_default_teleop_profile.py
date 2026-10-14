@@ -92,9 +92,9 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch):
         PREFIX = 'arm'
         def __init__(self, *args): pass
     class Stub:
-        def __init__(self, *args): pass
+        def __init__(self, *args, **kwargs): pass
     for name, attrs in {
-        'device': {'ArmActionPlugin': Arm},
+        'device': {'ArmActionPlugin': Arm, '_loco_acp_notify': lambda *a, **k: None},
         'arm_stream': {'ArmStreamExecutor': Stub},
         'motion_control': {'MotionControl': Stub},
         'motion_bus': {'MotionBus': Stub},

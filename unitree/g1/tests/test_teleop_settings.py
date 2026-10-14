@@ -72,6 +72,7 @@ def test_canvas_session_prepares_only_after_both_grips_released(tmp_path):
     card.receive(frame);card.step()
     assert calls == ['begin']
     card._hold=lambda *a,**k:None
+    card._submit=lambda *a,**k:None
     card.step()
     assert calls == ['begin']
     # A real tracking-space reset requires neutral input before another baseline.

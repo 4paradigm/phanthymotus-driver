@@ -6,6 +6,7 @@ unitree-g1:
   pid: host
   privileged: true
   volumes:
+    - /etc/machine-id:/run/g1-machine-id:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data

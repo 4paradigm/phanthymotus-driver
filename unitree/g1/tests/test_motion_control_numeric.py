@@ -175,3 +175,29 @@ def test_default_profile_real_worker_lifetime_and_no_hardware(tmp_path):
     finally:
         motion.stop()
     assert not second.exists()
+
+
+def test_real_alignment_and_joint_replay_envelope_without_hardware(tmp_path):
+    from types import SimpleNamespace
+    from motion.visualization import snapshot
+    solver = IK(profile(tmp_path))
+    q = [0.]*10
+    solver.self_test(q)
+    solver.solve(solver.palms(q), q, q)
+    state = {'feedback': {'q': q, 'dq': q, 'arm_ns': time.monotonic_ns()}, 'state': 'ready'}
+    display = snapshot(SimpleNamespace(solver=solver, link=SimpleNamespace(feedback=lambda: state),
+                                       output={}, hardware_output=False))
+    assert display['alignment']['ready']
+    assert display['alignment']['error_reference'] == 'ik'
+    assert display['alignment']['left']['position_error_m'] <= .03
+    state['feedback']['arm_ns'] -= 200_000_000
+    assert snapshot(SimpleNamespace(solver=solver, link=SimpleNamespace(feedback=lambda: state),
+                                   output={}, hardware_output=False))['alignment']['state'] == 'unavailable'
+    worker = NumericalWorker(profile(tmp_path), 1.)
+    try:
+        proof = worker.joint_envelope(q, q, [.01]*10)
+        assert all(lo <= .01 <= hi for lo, hi in zip(proof['lower'], proof['upper']))
+        with pytest.raises(ValueError, match='joint_limit'):
+            worker.joint_envelope(q, q, [100.]*10)
+    finally:
+        worker.close()

@@ -65,11 +65,17 @@ def test_threads_timeout_restart_discard_old_work_and_resume(tmp_path, monkeypat
     card.clock = time.monotonic_ns
     card.cfg['mode'] = 'live'
     def dispatch(action, args):
-        assert action == 'recoverable_hold'
+        if action == 'resume':
+            motion.gate.state = 'ready'
+            motion.gate.session_id += '-resumed'
+            return {'session_id': motion.gate.session_id, 'boot_id': motion.gate.boot_id, 'secret': motion.gate.secret}
+        assert action in ('recoverable_hold', 'pause')
         motion.gate.hold('input_stale')
         return {}
     motion.executor.dispatch = dispatch
     card._operator, card._release_seen = 'prepared-test-session', True
+    card._enabled = card._gripped = True
+    card.display_feedback = lambda: {'alignment': {'ready': True}, 'visualization': motion._visualization}
     card.mapping.calibrate(sample, [[0, 0, 0, 0, 0, 0, 1]]*2)
     status = motion.gate.status
     monkeypatch.setattr(motion.gate, 'status', lambda: dict(status(),
@@ -97,11 +103,11 @@ def test_threads_timeout_restart_discard_old_work_and_resume(tmp_path, monkeypat
     monkeypatch.setattr(worker, 'call', recorded_call)
     monkeypatch.setattr(worker, 'solve_frame', recorded_solve)
 
-    def feed(sequence):
+    def feed(sequence, held=True):
         value = copy.deepcopy(sample)
         value['sequence'] = sequence
         value['received_monotonic_ns'] = value['source_monotonic_ns'] = time.monotonic_ns()
-        value['left']['grip'] = value['right']['grip'] = 1.
+        value['left']['grip'] = value['right']['grip'] = float(held)
         assert card.receive(value)
         wait_for(lambda: card._processed is not None and card._processed[-1] == sequence)
 
@@ -134,11 +140,13 @@ def test_threads_timeout_restart_discard_old_work_and_resume(tmp_path, monkeypat
         (tmp_path / 'release').touch()
         wait_for(lambda: 5 in completed)
         (tmp_path / 'block').unlink()
-        feed(6)
+        feed(6, held=False)
+        wait_for(lambda: 6 in completed)
+        feed(7)
         wait_for(lambda: len(published) == 1)
-        assert calls == [1, 5, 6]
-        assert published[0]['source_seq'] == 6 and len(proofs) == 1
-        assert published[0]['session_id'] == 'session'
+        assert calls == [1, 5, 6, 7, 7]
+        assert published[0]['source_seq'] == 7 and len(proofs) == 1
+        assert published[0]['session_id'] == motion.gate.session_id
         assert card._thread.is_alive() and motion._worker.is_alive()
     finally:
         card._closed.set()

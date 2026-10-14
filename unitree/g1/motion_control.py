@@ -40,6 +40,7 @@ class MotionControl:
         self._live_session = None
         self._snapshot = None
         self._visualization = {'available': False, 'reason': 'calibration_missing'}
+        self._intent = None
         self._decision = {}
         self._state_seq = 0
         self._finish = {'state':'idle','return_completed':False,'authority_released':False}
@@ -129,6 +130,8 @@ class MotionControl:
         with self._lock:
             self._generation += 1
             self._pending = None
+            self._intent = None
+            self._visualization = {'available': False, 'reason': 'intent_cancelled'}
 
     def start(self):
         self.executor.start()
@@ -288,16 +291,16 @@ class MotionControl:
             if action == 'stop': self.stop()
         return result
 
-    def receive_eef(self, packet):
+    def receive_eef(self, packet, *, preview_only=False):
         with self._lock:
             if self._closed.is_set(): raise ValueError('motion_control_stopped')
             lease = self._lease()
             body = validate(packet, lease, mode='eef_pose', now=self.gate.clock(),
                 previous_seq=self._last_seq, previous_epoch=self._last_epoch, **self.versions)
-            if self._preview and self._preview_state == 'hold': raise ValueError('preview_paused')
+            if self._preview and self._preview_state == 'hold' and not preview_only: raise ValueError('preview_paused')
             if body['mapping_epoch'] > self._last_epoch: self.cancel_pending()
             self._last_seq, self._last_epoch = body['seq'], body['mapping_epoch']
-            self._pending = body, lease, self._generation, bool(self._preview)
+            self._pending = body, lease, self._generation, bool(self._preview) or preview_only
             self._wake.set()
         return True
 
@@ -319,6 +322,13 @@ class MotionControl:
                 self._snapshot = {'poses':rendered['poses'],**self.versions,
                     'monotonic_ns':stamp,'state_seq':self._state_seq}
             self._visualization = rendered['visualization']
+            intent = self._intent
+            if intent and self.gate.clock() < intent['valid_until_ns']:
+                self._visualization.update(source_sequence=intent['source_seq'], mapping_epoch=intent['mapping_epoch'],
+                    sampled_ns=stamp if rendered['poses'] is not None else 0,
+                    intent_received_ns=intent['generated_ns'], valid_until_ns=intent['valid_until_ns'])
+            else:
+                self._visualization.update(ik=[], alignment={'state': 'unavailable', 'ready': False})
 
     def process_latest(self):
         with self._lock: work,self._pending = self._pending,None
@@ -351,6 +361,7 @@ class MotionControl:
                     self.executor.install_motion_envelope(record)
                     self.executor.publish_joint_command(command)
                 else: self._preview_state = 'active'
+                self._intent = body
                 self._decision = {'state':'preview' if preview else 'target_published','reason':None,
                     'seq':body['seq'],'source_seq':body['source_seq'],'mapping_epoch':body['mapping_epoch'],
                     'monotonic_ns':now,'ik_ms':self.solver.last_ms}
@@ -358,6 +369,7 @@ class MotionControl:
         except (ValueError,RuntimeError) as exc:
             with self._lock:
                 if generation == self._generation:
+                    self._intent = body
                     if str(exc).startswith('ik_worker_'): self.cancel_pending()
                     self._decision = {'state':'hold','reason':str(exc),'seq':body['seq'],
                                       'source_seq':body['source_seq'],'monotonic_ns':self.gate.clock()}

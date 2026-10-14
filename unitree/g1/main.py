@@ -162,7 +162,9 @@ class G1DeviceBundle:
             if control_enabled:
                 from teleop_control import TeleopControl
                 from teleop_bus import TeleopBus
-                control = TeleopControl(dict(control_cfg), motion)
+                from device import _loco_acp_notify
+                control = TeleopControl(dict(control_cfg), motion,
+                    notify=lambda ident, status, result: _loco_acp_notify(ident, status, result, tool='teleop_control'))
                 arm._teleop_control = control
                 stream.public_motion_topics = False
                 self._motion_bus = TeleopBus(executor, control)

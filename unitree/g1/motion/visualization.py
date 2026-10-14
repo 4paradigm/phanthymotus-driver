@@ -1,4 +1,5 @@
 """Read-only kinematic telemetry. Never claims authority or sends motion commands."""
+import math
 import time
 import numpy as np
 
@@ -29,6 +30,21 @@ def snapshot(adapter):
         fresh = 0 <= age <= getattr(adapter.link,'feedback_max_age_ns',100_000_000)/1e6
         preview = solver.visualization_sample
         intent_age = (now-preview['monotonic_ns'])/1e6 if preview else None
+        alignment = {'state': 'unavailable', 'ready': False}
+        valid = preview and preview.get('ik_q') is not None and intent_age is not None and 0 <= intent_age < 300
+        if fresh and preview and intent_age is not None and 0 <= intent_age < 300:
+            measured = solver.palms(feedback['q'])
+            target = solver.palms(preview['ik_q']) if valid else [np.asarray(t) for t in preview['targets']]
+            errors = {}
+            for side, a, b in zip(('left', 'right'), measured, target):
+                errors[side] = {'position_error_m': float(np.linalg.norm(a[:3, 3]-b[:3, 3])),
+                    'orientation_error_rad': float(np.linalg.norm(solver.pin.log3(a[:3, :3].T@b[:3, :3]))),
+                    'position_tolerance_m': .03, 'orientation_tolerance_rad': math.radians(15)}
+            ready = all(e['position_error_m'] <= .03 and e['orientation_error_rad'] <= math.radians(15)
+                        for e in errors.values())
+            alignment = {'state': ('ready' if ready else 'unaligned') if valid else 'unreachable',
+                         'ready': bool(valid and ready), **errors,
+                         'error_reference': 'ik' if valid else 'requested_target'}
         targets = [np.asarray(t)[:3,3].tolist() for t in preview['targets']] if preview else []
         # Model-based orientation reference, not a body mesh or collision proof.
         neutral = chains(solver, np.zeros(10))
@@ -45,9 +61,10 @@ def snapshot(adapter):
                 'feedback_fresh':fresh,'feedback_age_ms':max(0.,age),
                 'feedback_source':state.get('feedback_source','teleop_executor'),
                 'source_timestamp_available':state.get('source_timestamp_available',True),
-                'intent_age_ms':intent_age,'solve_ms':solver.last_ms,
+                'intent_age_ms':intent_age if intent_age is not None else 1e12,'solve_ms':solver.last_ms,
+                'alignment': alignment, 'target_residual': solver.residual,
                 'measured':chains(solver,feedback['q']) if fresh else [],
-                'ik':chains(solver,preview['ik_q']) if preview and preview.get('ik_q') is not None else [],
+                'ik':chains(solver,preview['ik_q']) if valid else [],
                 'command':chains(solver,output['target_q']) if output.get('target_q') is not None else [],
                 'targets':targets,
                 'torso':torso,'shoulder_height':height,

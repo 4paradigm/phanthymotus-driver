@@ -16,6 +16,7 @@ import time
 
 from common.teleop_contract import validate_input, FEEDBACK_SCHEMA
 from common.motion.protocol import envelope
+from trajectory_control import TrajectoryControl
 
 
 def _mul(a, b):
@@ -84,7 +85,7 @@ class RelativeMapping:
 class TeleopControl:
     CAPABILITIES = ['dual_arm']
 
-    def __init__(self, cfg, motion, *, clock=time.monotonic_ns):
+    def __init__(self, cfg, motion, *, clock=time.monotonic_ns, notify=None):
         self._validate_config(cfg)
         self.cfg, self.motion, self.executor = cfg, motion, motion.executor
         self.clock, self.clock_id = clock, motion.clock_id
@@ -105,6 +106,10 @@ class TeleopControl:
         self._generation = self._sequence = self._feedback_sequence = 0
         self._operator = None
         self._release_seen = False
+        self._gripped = False
+        self._enabled = False
+        self._ready_on_release = False
+        self._engage_sequence = None
         self._paused = False
         self._hold_kind = None
         self._needs_calibration = False
@@ -112,6 +117,8 @@ class TeleopControl:
         self._auto_retry_after_ns = 0
         self.executor.cfg['live_enabled'] = self.live
         self.executor.cfg['operator_session_enabled'] = self.live
+        self.trajectory = TrajectoryControl(self, notify)
+        self._input_changed = False
 
     @property
     def live(self): return self.cfg.get('mode', 'live') == 'live'
@@ -120,14 +127,22 @@ class TeleopControl:
         fields = {'usage_guide': {'type': 'string', 'title': '使用说明（固定，无需配置）',
                     'enum': ['无需配置'], 'default': '无需配置', 'scope': 'instance'}}
         return {'name': 'teleop_control', 'type': 'actuator', 'multiInstance': False,
-            'description': 'G1双臂遥操：先安装遥操设备 Driver，在画布添加 teleop_device 并连接本卡；在设备卡齿轮页获取 App 下载和配对入口。启动项目后松开双握把建立初始基准，再按住双握把跟随。松握保持，再握不重标定；在监控面板查看执行状态。停止项目停止遥操；收臂使用 arm release。',
+            'description': 'G1双臂遥操：先安装遥操设备 Driver，在画布添加 teleop_device 并连接本卡；在设备卡齿轮页获取 App 下载和配对入口。启动项目后松开双握把建立初始基准，在头显查看实测与目标骨架，对齐后重新按下双握把接通。松握继续预览，再次接通前重新对齐；映射基准不变。支持轨迹录制、检查及确认后回放。停止项目停止遥操；收臂使用 arm release。',
             'configSchema': {'type': 'object', 'additionalProperties': False, 'properties': fields},
             'inputSchema': {'type': 'object', 'required': ['action'],
-                'properties': {'action': {'type': 'string', 'enum': ['info', 'config', 'start', 'stop']},
-                    'input_topic': {'type': 'string'}},
+                'properties': {'action': {'type': 'string', 'enum': ['info', 'config', 'start', 'stop', 'record_start', 'record_stop', 'recordings', 'inspect', 'start_difference', 'play', 'action_status']},
+                    'input_topic': {'type': 'string'}, 'filename': {'type': 'string'},
+                    'execute': {'type': 'boolean', 'default': False}, 'preview_id': {'type': 'string'},
+                    'workspace_clear': {'type': 'boolean'}, 'take_control': {'type': 'boolean'},
+                    'action_id': {'type': 'string'}},
+                'x-completion': {'actions': ['play'], 'timeout': 620},
                 'x-resource': ['arm_l', 'arm_r'],
                 'x-action-params': {'info': {'params': []}, 'config': {'params': []},
-                    'start': {'params': ['input_topic']}, 'stop': {'params': []}}},
+                    'start': {'params': ['input_topic']}, 'stop': {'params': []},
+                    'record_start': {'params': []}, 'record_stop': {'params': []}, 'recordings': {'params': []},
+                    'inspect': {'params': ['filename']}, 'start_difference': {'params': ['filename']},
+                    'play': {'params': ['filename', 'execute', 'preview_id', 'workspace_clear', 'take_control']},
+                    'action_status': {'params': ['action_id']}}},
             'topic_in': [{'port_id': 'command', 'format': 'data/teleop-cmd',
                 **({'topic': self.binding['command_topic']} if self.binding else {})}],
             'topic_out': [{'port_id': 'state', 'format': 'data/teleop-state', 'topic': '/teleop/state'}]}
@@ -143,9 +158,13 @@ class TeleopControl:
     def dispatch(self, action, args):
         try:
             if action in ('info', 'config'): return self.info()
-            if action == 'start': return self.start(args)
+            if action == 'start':
+                with self.trajectory.lock:
+                    if self.trajectory.busy: raise ValueError('replay_active')
+                    self.trajectory.preview = None
+                    return self.start(args)
             if action == 'stop': return self.stop()
-            raise ValueError('unknown_action')
+            return self.trajectory.dispatch(action, args)
         except (ValueError, RuntimeError, OSError) as exc:
             return {'state': 'error', 'code': str(exc), 'error': str(exc)}
 
@@ -195,7 +214,11 @@ class TeleopControl:
                 raise ValueError('old_input_generation')
             if identity == old and frame['sequence'] <= self._input_sequence: return False
             self._input_identity, self._input_sequence = identity, frame['sequence']
+            source_changed = self._latest and self._latest['instance_id'] != frame['instance_id']
             self._latest = frame
+            if old and (identity != old or source_changed):
+                self._input_changed = True
+                self._ready_on_release = False
             if self._mapping_identity and (identity[0], identity[2]) != self._mapping_identity:
                 self._needs_calibration = True
             self._wake.set()
@@ -240,8 +263,10 @@ class TeleopControl:
             if identity != self._input_identity:raise ValueError('operation_input_generation_changed')
         prepared = False
         try:
-            action_name = 'prepare_operator_session' if self.live else 'prepare_preview'
-            result = self.motion.dispatch(action_name, {})
+            if self.live:
+                result = self.motion.dispatch('prepare_operator_session', {})
+                if result.get('error'): raise ValueError(result.get('code', result['error']))
+            result = self.motion.dispatch('prepare_preview', {})
             if result.get('error'):raise ValueError(result.get('code', result['error']))
             prepared = True
             self._check_generation(generation)
@@ -262,6 +287,8 @@ class TeleopControl:
                 self._operator = secrets.token_hex(16)
                 self._release_seen = not all(frame[s]['grip'] >= .5 for s in ('left','right'))
                 self._paused = False
+                self._gripped = self._enabled = self._ready_on_release = False
+                self._engage_sequence = None
                 self._processed = None
                 self._hold_kind = None
                 self._sequence = 0
@@ -279,20 +306,27 @@ class TeleopControl:
     def _hold(self, reason, *, grip=False):
         with self._lock:
             self._state, self._reason = 'hold', reason
+            self._enabled = self._ready_on_release = False
+            self._engage_sequence = None
+            if reason != 'operator_pause' and self.trajectory.recorder and self.trajectory.recorder.thread.is_alive():
+                self.trajectory.recorder.fail(reason)
             if grip: self._paused = True
             kind = 'pause' if grip else 'recoverable_hold'
-            if self._hold_kind == kind: return
+            if self._hold_kind == (kind, reason): return
             self.motion.cancel_pending()
             credentials = self._credentials()
             if credentials:
                 result = self.motion.dispatch(kind, credentials)
                 if result.get('error'): raise ValueError(result.get('code', result['error']))
-            self._hold_kind = kind
+            self._hold_kind = (kind, reason)
 
     def step(self):
         with self._lock:
             if self._closed.is_set() or not self.binding: return
             generation = self._generation
+            if self._input_changed:
+                self._input_changed = False
+                if self._operator: self._hold('input_generation_changed', grip=True)
             initialize = not self._operator or self._needs_calibration
         if initialize:
             if self.clock() < self._auto_retry_after_ns: return
@@ -311,16 +345,36 @@ class TeleopControl:
                 self._check_generation(generation)
                 if self._needs_calibration: raise ValueError('needs_calibration')
                 frame = self._latest_fresh()
-                if not all(frame[s]['grip'] >= .5 for s in ('left','right')):
-                    self._release_seen = True
-                    hold_reason = 'operator_pause'
-                elif not self._release_seen:
-                    hold_reason = 'release_grips_before_enable'
-                else: hold_reason = None
+                held = all(frame[s]['grip'] >= .5 for s in ('left', 'right'))
+                rising = held and not self._gripped
+                self._gripped = held
                 key = (*self._identity(frame), frame['sequence'])
-                if not hold_reason and key == self._processed: return
-            if hold_reason:
-                self._hold(hold_reason, grip=True); return
+                display = self.display_feedback()
+                aligned = display['alignment']['ready']
+                if not held:
+                    if self._enabled:
+                        self._hold('operator_pause', grip=True)
+                    self._engage_sequence = None
+                    self._ready_on_release = aligned
+                    self._release_seen = True
+                elif not self._enabled:
+                    if rising:
+                        self._engage_sequence = frame['sequence'] if self._ready_on_release and aligned else None
+                        self._ready_on_release = False
+                    elif self._engage_sequence is not None:
+                        # The grip-edge pose must pass IK before live output.
+                        if display['visualization'].get('source_sequence', -1) >= self._engage_sequence:
+                            self._enabled = aligned
+                            if aligned: self._processed = None
+                            self._engage_sequence = None
+                if self._enabled and self.motion._decision.get('state') in ('hold', 'error'):
+                    self._hold(self.motion._decision.get('reason') or 'ik_unavailable', grip=True)
+                if not self._enabled:
+                    self._state, self._reason = 'ready', 'align_then_regrip'
+                    if key != self._processed and self._engage_sequence in (None, frame['sequence']):
+                        self._submit(frame, preview=True)
+                    return
+                if key == self._processed: return
             # SDK acquisition/resume must not own the input/operation lock:
             # cancellation can fence us while a channel is still opening.
             state = self.motion.gate.status()
@@ -344,22 +398,46 @@ class TeleopControl:
                 with self._lock: self._sequence = 0
             with self._lock:
                 self._check_generation(generation)
-                now = self.clock()
-                values = self.mapping.targets(frame)
-                self._sequence += 1
-                command = envelope(self.motion._lease(), seq=self._sequence,
-                    source_seq=frame['sequence'], mapping_epoch=self.mapping.epoch,
-                    generated_ns=now, valid_until_ns=min(now+300_000_000, frame['received_monotonic_ns']+300_000_000),
-                    mode='eef_pose', values=values, **self.motion.versions)
-                self.motion.receive_eef(command)
-                self._processed = key
+                self._submit(frame, preview=False)
                 self._paused, self._hold_kind = False, None
                 self._state, self._reason = 'active', None
         except (ValueError, RuntimeError, OSError) as exc:
             with self._lock:
                 if generation != self._generation or self._closed.is_set(): return
             code = str(exc)
-            self._hold(code, grip=code in ('driver_fault','needs_calibration'))
+            self._hold(code, grip=True)
+
+    def _submit(self, frame, *, preview):
+        now = self.clock()
+        self._sequence += 1
+        command = envelope(self.motion._lease(), seq=self._sequence,
+            source_seq=frame['sequence'], mapping_epoch=self.mapping.epoch,
+            generated_ns=now, valid_until_ns=min(now+300_000_000, frame['received_monotonic_ns']+300_000_000),
+            mode='eef_pose', values=self.mapping.targets(frame), **self.motion.versions)
+        self.motion.receive_eef(command, preview_only=preview)
+        self._processed = (*self._identity(frame), frame['sequence'])
+
+    def display_feedback(self):
+        visual = copy.deepcopy(getattr(self.motion, '_visualization', {'available': False}))
+        alignment = visual.pop('alignment', {'state': 'unavailable', 'ready': False})
+        now = self.clock()
+        try:
+            self._latest_fresh()
+            valid = (not self._closed.is_set() and not self._needs_calibration
+                and not self._input_changed
+                and visual.get('mapping_epoch') == self.mapping.epoch
+                and 0 <= now-visual.get('sampled_ns', 0) <= 100_000_000
+                and now < visual.get('valid_until_ns', 0))
+        except ValueError:
+            valid = False
+        if not valid:
+            visual.update(available=False, ik=[])
+            alignment = {'state': 'unavailable', 'ready': False}
+        else:
+            visual['intent_age_ms'] = max(0., (now-visual['intent_received_ns'])/1e6)
+            if self._enabled and alignment['state'] not in ('unavailable', 'unreachable'):
+                alignment.update(state='active', ready=False)
+        return {'visualization': visual, 'alignment': alignment}
 
     def _run(self):
         while not self._closed.is_set():
@@ -395,10 +473,15 @@ class TeleopControl:
         return result
 
     def cancel_for_arm_release(self):
+        self.trajectory.stop()
+        if self.trajectory.recorder and self.trajectory.recorder.thread.is_alive():
+            self.trajectory.recorder.fail('arm_release')
         # The existing arm.release is an explicit operator cancellation, not a
         # global controller arbiter. Stop accepting teleop before SDK handback.
         with self._lock:
             self._generation += 1
+            self._enabled = self._ready_on_release = False
+            self._engage_sequence = None
             self._operator = None
             self._latest = None
             self._closed.set()
@@ -408,10 +491,16 @@ class TeleopControl:
 
     def stop(self):
         with self._lock:
+            self.trajectory.stop()
             self._generation += 1
+            self._enabled = self._ready_on_release = False
+            self._engage_sequence = None
             self._operator = None
             self._closed.set(); self._wake.set()
-        result = self._stop_motion()
+        try:
+            result = self._stop_motion()
+        finally:
+            self.trajectory.record_stop('teleop_stopped')
         worker = self._thread
         if worker and worker is not threading.current_thread(): worker.join(.5)
         return result
@@ -454,7 +543,16 @@ class TeleopControl:
                 'space_epoch': self._input_identity[2] if self._input_identity else 0,
                 'operator_session_id': self._operator, 'mapping_epoch': self.mapping.epoch,
                 'state': self._state, 'reason': self._reason, 'capabilities': list(self.CAPABILITIES),
-                'input_status': input_status, 'execution': execution, 'receipts': []}
+                'input_status': input_status, 'execution': execution, 'receipts': [], **self.display_feedback()}
+
+    def can_record(self):
+        if not self.live or self._closed.is_set() or not self._operator or not self.mapping.anchor or self._needs_calibration:
+            return False
+        try:
+            self._latest_fresh()
+            return not self._input_changed and self._state in ('ready', 'active')
+        except ValueError:
+            return False
 
     def info(self):
         with self._lock:
@@ -464,5 +562,7 @@ class TeleopControl:
                 'binding': copy.deepcopy(self.binding),
                 'input_status': self.input_status(),
                 'mapping_epoch': self.mapping.epoch, 'operator_session_id': self._operator,
+                **self.trajectory.info(), 'input_fresh': self.input_status()['state'] == 'fresh',
+                'mapped': bool(self.mapping.anchor and not self._needs_calibration), 'can_record': self.can_record(),
                 'capabilities': list(self.CAPABILITIES), 'feedback': self.feedback() if self.binding else None,
                 **{k:self.get_tool()[k] for k in ('topic_in','topic_out')}}

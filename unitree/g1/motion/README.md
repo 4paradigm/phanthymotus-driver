@@ -9,8 +9,9 @@
 1. 安装 PICO Driver，在 Canvas 添加 `teleop_device` 和 `teleop_control`，连接命令输出与控制卡输入。
 2. 在设备卡齿轮页查看安装和配对说明，连接 PICO。
 3. 启动项目，先松开双握把；控制卡收到有效输入后建立初始相对基准。
-4. 同时按住双握把控制双臂。松开任一握把暂停，重新握住沿用原基准；跟踪空间重置后需松握重新就绪。
-5. 从 Canvas 停止项目；收臂复用既有 `arm.release`，它先取消遥操输入及待发目标再交还 SDK，之后需从 Canvas 重新启动遥操。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
+4. 松握时在头显查看实测骨架与 IK 目标骨架。两臂位置误差不超过 3 cm、朝向误差不超过 15°，且输入、反馈及求解有效后，重新按下双握把接通。提前握住不会在就绪后自动接通。
+5. 松开任一握把暂停输出并继续预览。再次接通仍需对齐和新一次双握；沿用原映射基准。跟踪丢失、连接或空间代次改变后撤销就绪，不自动恢复运动。
+6. 从 Canvas 停止项目；收臂复用既有 `arm.release`，它先取消遥操输入及待发目标再交还 SDK，之后需从 Canvas 重新启动遥操。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
 
 用户不需要填写实例 ID、模型路径、位移比例或 Shadow/Live。这些由框架和 Driver 预设管理；启动项目本身不发送运动目标。支持 FSM 500、801，不自动切换本体模式。
 
@@ -41,11 +42,13 @@
 | 方向 | Topic | 格式 |
 |---|---|---|
 | 设备 → 控制卡 | `/teleop/command` | `data/teleop-cmd`，JSON schema `motus.teleop.command/1` |
-| 控制卡 → Canvas 监控 | `/teleop/state` | `data/teleop-state` |
+| 控制卡 → Canvas 监控与 PICO Driver | `/teleop/state` | `data/teleop-state` |
 
 输入来源由 Canvas 连线决定。控制卡直接订阅传入的 `input_topic`，不限定 topic 路径、不按首帧绑定来源实例，也不额外认证消息中的实例或设备 ID。格式、时效、序号和代次检查仍保留；设备或跟踪空间变化后，需要松握重建坐标基准。
 
-设备输入为左右控制器位姿、握把、跟踪状态、身份、代次、序号与时效。设备卡不订阅机器人反馈；PICO 只显示连接状态和握把提示。URDF、关节顺序、数值求解与执行均在机器人 Driver 内。
+设备输入为左右控制器位姿、握把、跟踪状态、身份、代次、序号与时效。PICO Driver 订阅同机 `/teleop/state`，把 `motus.teleop.feedback/1` 转发到头显。G1 提供 `visualization`（实测、IK、躯干线框）和 `alignment`（左右末端位置/朝向误差、阈值、状态、`ready`）。两端使用新版协议，不新增 topic 或协商。URDF、关节顺序、数值求解、对齐判定与执行均在 G1 Driver 内。
+
+对齐比较实测末端和可执行 IK 末端，`error_reference=ik`。求解失败时状态为 `unreachable`，误差参考请求目标（`error_reference=requested_target`），不能使能；求解残差另列 `target_residual`。实测反馈超过 100 ms、输入/目标超过 300 ms 或代次改变时，撤销就绪与旧目标。3 cm / 15° 是软件初值，尚未完成硬件阈值验收。
 
 ### 机型 profile 与每轮基准
 
@@ -59,7 +62,7 @@
 
 每个有效目标仅下发一次。以后端最后成功下发的位置为起点，做 120 ms 一阶指数平滑，再将各关节增量裁剪到 ±1 rad/s × dt；dt 最大 50 ms，断帧或重握不积累追赶额度。仅处理最新目标，不排队补发历史动作。这限制的是位置参考的变化率，不是实测电机速度的硬保证。
 
-遥操肩肘增益为 kp=80/kd=3，腕部为 40/1.5；普通 servo 增益不变，不增加重力补偿。短暂 IK 失败丢弃失败结果及其滤波历史，后续有效新帧可续接。松握恢复不等待静止阈值；`continuation_ready` 表示可以继续接收目标，与物理保持确认 `hold_confirmed` 区分。
+遥操肩肘增益为 kp=80/kd=3，腕部为 40/1.5；普通 servo 增益不变，不增加重力补偿。IK 失败丢弃失败结果及其滤波历史，并要求松握、对齐和重新双握后续接。松握后的执行器恢复不新增静止阈值；`continuation_ready` 表示可以继续接收目标，与物理保持确认 `hold_confirmed` 区分。
 
 输入有效性、反馈时效与 URDF 关节限位仍校验；附加软件碰撞/工作区扫描默认关闭，不能据此认为任意姿态均无碰撞。原始电机遥测保留，厂商保护不修改。Driver 不自动停止其他控制程序。
 
@@ -72,6 +75,56 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 空闲且从未接管 SDK 时，重复停止返回 no-op；不创建释放任务，也不声称已验证物理停止。未知的厂商动作结果仍报告未知，不通过重复 stop 清除。Driver 不持久化或自动恢复运动租约。
 
 “以后端最后成功下发的位置续接”的设计参考 **@jsmy-CTH** 的 [PR #322](https://github.com/4paradigm/phanthymotus-driver/pull/322)。120 ms 平滑、1 rad/s 限幅及 50 ms 时间上限为本次 G1 适配参数。其他来源见 [来源与迁移边界](#来源与迁移边界)。
+
+## 轨迹接口（供示教适配器调用）
+
+录制、文件校验和回放属于 `teleop_control`；下游 #402 负责页面、试运行流程和 Skill。没有新增示教卡或 Core 改动。接口由现有 loopback MCP 提供，参数均放在 `arguments` 中。
+
+| action | 参数 | 结果 |
+|---|---|---|
+| `info` | 无 | `input_fresh`、`mapped`、`can_record`、`recording`、`replay_active`、`last_action` |
+| `record_start` | 无 | 新鲜、已映射的 live 遥操中开始录制；返回文件和服务端开始时间 |
+| `record_stop` | 无 | 停止录制并等待最多 2 秒落盘；`complete`、`stopping`、`error` 分别说明结果 |
+| `recordings` | 无 | 文件名、大小、完整文件/临时文件；列表不代替 `inspect` 校验 |
+| `inspect` | `filename` | 校验后的 `filename/sha256/binding/joint_names/duration_seconds/frames/preview` |
+| `start_difference` | `filename` | `ready/target_q/current_q/joint_delta_rad/joint_tolerance_rad` |
+| `play` | `filename`；执行时另传确认参数 | 默认仅预检；确认后返回异步 `action_id` |
+| `action_status` | `action_id` | 最近一次回放的 `running/completed/cancelled/error` 和结果 |
+| `stop` | 无 | 立即请求取消遥操/回放，再等待原执行器交权；失败不报告停止成功 |
+
+`record_stop` **不停止遥操**。适配器须先确认 `complete=true`，再调用 `stop`，分别检查文件结果与交权结果。仍在落盘时用 `info.recording` 轮询。停止、空间重置、输入断流、SDK/录制异常均使活动录制失败；不把临时文件列为可回放资产。松握暂停是正常事件，保留在原时间线上。
+
+录制仅保存 SDK 成功接受的最终关节参考，已包含遥操平滑与限速。同时保存实测位置/速度、反馈单调时间、源输入序号、SDK 序号、映射代次及执行会话 ID。格式为 `motus.g1.trajectory/1` JSONL，10 维关节顺序在头部列出，角度 rad、速度 rad/s、时间 ns，无夹爪字段。后台队列最多 256 帧；单文件最多 64 MiB、120000 帧、10 分钟。溢出或写盘失败不会阻塞运动线程，但该录制无效。
+
+文件位于 `teleop_control.data_dir/recordings`，默认 `/opt/phanthy-motus/data/g1/recordings`。部署模板已挂载持久化数据目录及只读 `/etc/machine-id:/run/g1-machine-id`。非模板部署可设置稳定且设备唯一的内部 `trajectory_device_id`；未提供设备身份时，录制明确失败。不要给多台设备配置相同身份。
+
+文件绑定设备身份摘要、模型哈希、固定几何、关节顺序及录制时的腰腿基准。每次检查和运行重新核对设备/模型；当前实测腰腿和当前模型基准与记录各关节的差异须不超过 0.02 rad。更换设备、模型或标定后不能直接复用文件。未完成文件、符号链接、越界文件名、摘要错误、非法时间或超限关节均拒绝。`sha256` 是完整文件摘要。
+
+### 适配调用示例
+
+在 Canvas 已启动遥操且 `info.can_record=true` 时：
+
+```json
+{"name":"teleop_control","arguments":{"action":"record_start"}}
+{"name":"teleop_control","arguments":{"action":"record_stop"}}
+{"name":"teleop_control","arguments":{"action":"stop"}}
+{"name":"teleop_control","arguments":{"action":"inspect","filename":"g1-<id>.jsonl"}}
+{"name":"teleop_control","arguments":{"action":"start_difference","filename":"g1-<id>.jsonl"}}
+```
+
+用户手动恢复起点与现场物体。起点要求每关节误差不超过 0.02 rad、实测速度不超过 0.02 rad/s；接口不自动移动到起点。`inspect.preview` 最多 181 点，包含 `t/kind/target_q/feedback_q`，单位保持 rad。下游负责转换显示单位，不套用 PiPER 的 12 关节或夹爪字段。
+
+```json
+{"name":"teleop_control","arguments":{"action":"play","filename":"g1-<id>.jsonl"}}
+{"name":"teleop_control","arguments":{"action":"play","filename":"g1-<id>.jsonl","execute":true,"preview_id":"<预检返回值>","workspace_clear":true,"take_control":true}}
+{"name":"teleop_control","arguments":{"action":"action_status","action_id":"<执行返回值>"}}
+```
+
+预检返回 `execute=false`、单次 `preview_id`、30 秒有效期、文件摘要、时长和起点差异。执行时重新检查；文件、绑定或控制代次改变后确认失效。成功启动返回 `status=running` 和 `action_id`；仅最后一项回放结果保留在 `info.last_action`，Driver 重启后不恢复动作。失败返回 `state=error/code/error`，例如 `recording_start_mismatch`、`recording_binding_mismatch`、`replay_preview_expired_or_changed`。
+
+回放与遥操互斥。回放按原时间发送已经录制的关节参考，不再施加 120 ms 低通滤波；仍通过同一执行器的控制权、反馈、关节限位、数值包围区间和 1 rad/s 参考变化检查。暂停事件停止输出，恢复事件沿原时间继续。调度落后超过 50 ms、执行心跳超过 100 ms、反馈失效或速度不符时终止，不补发积压目标、不静默降速。回放不需要 PICO 持续跟踪，也不会消费手柄指令。
+
+最后一个参考发送后，还须观察更新的末端关节反馈（误差 ≤0.02 rad、速度 ≤0.02 rad/s，最多等 2 秒）并完成原执行器交权，才报告 `completed`。取消为 `cancelled`；停止未确认仍为 `error`。ACP 事件 `tool=teleop_control` 与查询接口使用相同 `action_id`，只发一次终态通知。原有 action 99 未确认等控制故障不会由回放清除。
 
 ## 验证
 
