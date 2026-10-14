@@ -30,6 +30,14 @@ CAN adapters are not persistently identified by device hardware yet. Recheck aft
 
 The following sections document retained historical implementations and build/photography tooling; their action contracts do not describe the current production entry point.
 
+`direct_control.py` is retained for `status_card.split_status_card` and the legacy entrypoint/direct-control regression fixtures. Production `device.build_plugins` uses `IntentControlPlugin` without installing the legacy adapter.
+
+## Production passive diagnosis
+
+Run `python3 agilex/piper/deploy/diagnose.py --output ubuntu-readonly.json` on the deployment host. It checks the current four tools (`arm_control`, `model`, `piper_photo`, `piper_camera_live`), reads `arm_control.info.snapshot` before/after, validates fresh six-axis feedback and the PiPER model, and queries camera Info. It never starts, reconnects, stops or prepares the arm. An obsolete tool set fails before any tool call. A deployment motion gate already set to 1 is recorded, not modified; PASS does not establish motion acceptance.
+
+The CAN host check uses the snapshot's configured interface. Docker/CAN command output and camera Info are diagnostic evidence, not automatic repair. `--photos 1` (up to 3) explicitly authorizes capture with `capture_confirmed=true`; the default captures nothing and does not stop the live camera. The historical `--query-firmware` option is removed because firmware querying is not a public production action; do not run teaching exit just to obtain firmware. Reports use the nested `before.snapshot` and `after.snapshot` fields.
+
 ## 历史十卡实现（保留作回归，默认不注册）
 
 同一条 CAN 连接、同一个操作锁，对外提供十张卡片。启动卡片、重连和服务重启不使能、不回放动作。

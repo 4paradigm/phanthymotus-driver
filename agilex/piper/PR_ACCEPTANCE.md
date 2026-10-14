@@ -6,7 +6,7 @@ One Arm control canvas node discovers the background skeleton, English parameter
 
 ## Software verification
 
-- Latest PiPER, shared logging, lifecycle and Docker COPY regression after the deployment-gate fix: **291 passed, 237 subtests passed** (`python -m pytest -q tests/test_piper*.py tests/test_vendor_runtime_logging.py tests/test_common_lifecycle.py tests/test_dockerfile_copies.py`).
+- Latest PiPER, shared logging, lifecycle and Docker COPY regression after the deployment-gate and production-diagnostic fixes: **297 passed, 241 subtests passed** (`python -m pytest -q tests/test_piper*.py tests/test_vendor_runtime_logging.py tests/test_common_lifecycle.py tests/test_dockerfile_copies.py`).
 - Candidate image: **63 unittest tests passed** offline, with no network or robot device mappings, covering intent control, teaching exit and camera lifecycle.
 - Unmodified Core browser harness: one control canvas node, default no-op, six direction selectors, gripper-specific fields, simulated production request/result, PiPER model and skeleton/parameter/image subscriptions; a simulated JPEG renders with expected dimensions. No page script errors.
 - This scope retains tests for stale component frames, faults/limits, cancellation and concurrent Start/Stop, target-reference invariance, cached-arrival rejection, diagnostics, namespaces, camera ownership/stalls/recovery and monitor connection-stop races. These are simulations, not physical acceptance claims.
@@ -55,3 +55,9 @@ Production tasks now require the operator's PIPER_MOTION_ENABLED gate before CAN
 Regressions cover ready CAN, standby/all-disabled and teaching states, default/unset deployment, asynchronous worker failure and gate closure after feedback or preparation. Positive motion fixtures and the simulated Core action backend explicitly use PIPER_MOTION_ENABLED=1 instead of relying on a bypass. This fix has not been redeployed or physically reaccepted: the server was replaced by a separate temporary old-image test deployment. Prior physical trial numbers above precede this repair.
 
 SDK COS migration remains outstanding for the concrete artifact-upload dependency recorded in SDK_ARTIFACT.md; existing commit/hash/URL override are retained. Shared HTTP logging already has a justified scope and requires no additional change.
+
+## Review response: production diagnostic interface
+
+The passive diagnostic now validates the four production tools, reads Arm control Info snapshots before/after, validates the six-axis model and queries camera Info. It no longer calls removed piper_status actions, assumes CAN0, or treats an already-enabled deployment gate as proof of diagnostic motion. Mismatched images fail before tool calls. Disconnected/stale feedback and mode/enable changes fail without automatic recovery. Optional photos explicitly confirm capture; no arm Start/Stop, mode, motor or motion commands are requested.
+
+Six added regression tests exercise the actual production plugin bundle through a fake MCP transport and fake SDK. They cover enabled/disabled deployment gates, obsolete interfaces, disconnection/staleness, feedback changes, optional capture and CLI reports/removal of the obsolete firmware flag. SDK command recordings stay empty. The retained direct_control adapter is documented as a dependency of the historical split_status_card interface and legacy regression fixtures, not installed by production. No deployment or physical action was performed for this correction. COS migration remains paused at the user's request.

@@ -1,4 +1,10 @@
-"""Direct operator actions, checked by the existing one-use preview machinery.
+"""Historical direct operator adapter using the one-use preview machinery.
+
+Installed only by status_card.split_status_card for the retained legacy
+two-card interface and its regression fixtures (test_piper_entrypoint and
+test_piper_direct_control). Production device.build_plugins uses
+IntentControlPlugin and does not install these hooks. Keep this module because
+status_card imports it and historical consumers still exercise it.
 
 No permission is latched globally. The confirmed invocation grants only its
 own worker thread access; monitoring and other callers receive no grant.
