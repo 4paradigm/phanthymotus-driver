@@ -359,8 +359,11 @@ class ArmStreamExecutor:
     def confirm_operator_reset(self):
         with self.lock:
             op = self._operation
-            if not op or not op.get('operator_reset') or op['state'] == 'completed':
-                return False
+            if not op or op['state'] == 'completed':
+                if not self.session_id and not self._channel_open:return False
+                self._release({'retry':True}, action99=False, operator_reset=True)
+                op = self._operation
+            op['operator_reset'] = True
             # A local confirmation cannot cancel a DDS write already in progress.
             if self._rpc_thread and self._rpc_thread.is_alive():
                 return True

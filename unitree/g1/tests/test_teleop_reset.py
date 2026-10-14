@@ -307,3 +307,15 @@ def test_confirmation_during_reset_cancels_unsent_action(tmp_path):
     assert begun == ['calibrate']
     for _ in range(40): advance(100); arm.tick()
     assert not sdk and not arm.status()['ownership_held']
+
+
+def test_active_confirmation_hands_back_without_reset_or_stationarity(tmp_path):
+    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
+    sample['dq'] = [.03]*10
+    arm._stationary = lambda *args: pytest.fail('explicit baseline must not require rest')
+    assert arm.confirm_operator_reset()
+    assert arm._operation['action_id'] is None
+    for _ in range(40): advance(100); arm.tick()
+    assert arm._operation['state'] == 'completed'
+    assert not arm.status()['ownership_held'] and not arm.release_requested
+    assert not sdk and not arm._operation['physical_confirmed']
