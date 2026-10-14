@@ -214,6 +214,23 @@ HAND_COMMAND_MAX = 2000
 HAND_O10_MAX = 4096
 HAND_TYPES = {"AgiHand": "agi_hand", "O10Hand": "o10_hand"}
 
+# Indexed hand feedback is emitted by some A3 firmware builds instead of the
+# descriptive URDF names. Keep the channel order aligned with the hand URDF.
+HAND_SKELETON_JOINTS = {
+    "left": (
+        "left_thumb_roration_0", "left_thumb_wiggles_1", "left_thumb_bent_2",
+        "left_index_wiggles_0", "left_index_bent_1", "left_middle_bent",
+        "left_ring_wiggles_0", "left_ring_bent_1", "left_pinky_wiggles_0",
+        "left_pinky_bent_1",
+    ),
+    "right": (
+        "right_thumb_roration_0", "right_thumb_wiggles_1", "right_thumb_bent_2",
+        "right_index_wiggles_0", "right_index_bent_1", "right_middle_bent",
+        "right_ring_wiggles_0", "right_ring_bent_1", "right_pinky_wiggles_0",
+        "right_pinky_bent_1",
+    ),
+}
+
 # Mic source (docs §7.3.5): 0=internal (v3.2 has a known hardware BUG — avoid),
 # 1=external (recommended).
 MIC_SOURCES = {"internal": 0, "external": 1}
@@ -723,23 +740,33 @@ class A3Nodes:
         try:
             from aimdk.protocol.hal.bms import hal_bms_channel_pb2
             from aimdk.protocol.hal.state import hal_state_channel_pb2
-            from aimdk.protocol.skill_pilot import skill_pilot_channel_pb2
-            from aimdk.protocol.motion_control.motion import mc_motion_channel_pb2
-            from aimdk.protocol.aim_master import am_channel_pb2
             self._pb = {
                 "bms": hal_bms_channel_pb2.BmsStateChannel,
                 "estop": hal_state_channel_pb2.EmergencyStateChannel,
-                "skill": getattr(skill_pilot_channel_pb2, "SkillPilotStatus", None),
-                "commands": {
+            }
+        except (ImportError, AttributeError):
+            self._pb = None
+        if self._pb is not None:
+            try:
+                from aimdk.protocol.skill_pilot import skill_pilot_channel_pb2
+                self._pb["skill"] = getattr(skill_pilot_channel_pb2, "SkillPilotStatus", None)
+            except (ImportError, AttributeError):
+                self._pb["skill"] = None
+            try:
+                from aimdk.protocol.motion_control.motion import mc_motion_channel_pb2
+                self._pb.setdefault("commands", {}).update({
                     "MotionControlLocomotionVelocityChannel":
                         mc_motion_channel_pb2.MotionControlLocomotionVelocityChannel,
                     "MotionControlMoveWaistChannel":
                         mc_motion_channel_pb2.MotionControlMoveWaistChannel,
-                    "HFAEmoction": am_channel_pb2.HFAEmoction,
-                },
-            }
-        except (ImportError, AttributeError):
-            self._pb = None
+                })
+            except (ImportError, AttributeError):
+                pass
+            try:
+                from aimdk.protocol.aim_master import am_channel_pb2
+                self._pb.setdefault("commands", {})["HFAEmoction"] = am_channel_pb2.HFAEmoction
+            except (ImportError, AttributeError):
+                pass
         # ProcessedAudioOutput is optional across A3 SDK wheel revisions. It
         # must never disable the independent BMS/emergency decoders.
         if self._pb is not None:
@@ -1331,6 +1358,7 @@ class A3Nodes:
             velocities = group.get("velocity", []) if isinstance(group, dict) else []
             efforts = group.get("effort", []) if isinstance(group, dict) else []
             aliases = group_aliases.get(group_key, [])
+            hand_side_counts = {"left": 0, "right": 0}
             for index, name in enumerate(names):
                 # AimDK firmware revisions have emitted generic channel names
                 # (for example arm_joint_0) while preserving the documented
@@ -1338,6 +1366,15 @@ class A3Nodes:
                 # usable; exact URDF names remain preferred.
                 canonical = name if name in model_indices else (
                     aliases[index] if index < len(aliases) else name)
+                if group_key == "hand_state" and canonical not in model_indices:
+                    text_name = str(name).lower()
+                    side = ("left" if text_name.startswith("left") else
+                            "right" if text_name.startswith("right") else None)
+                    if side is not None and "hand" in text_name:
+                        channel = hand_side_counts[side]
+                        hand_side_counts[side] += 1
+                        if channel < len(HAND_SKELETON_JOINTS[side]):
+                            canonical = HAND_SKELETON_JOINTS[side][channel]
                 # Only actuated joints that exist in the model belong in the
                 # skeleton stream. Unknown metadata/fixed sensor joints remain
                 # available in joint_state's raw JSON stream.
@@ -1989,8 +2026,8 @@ class BatteryPlugin:
         # a3_aimdk wheel 缺失 → 无可解码的数据流：显式声明不可用，而不是
         # 永远返回 running 的占位状态（Agent Core 会把 running 当作可订阅）。
         return {"state": "unavailable",
-                "reason": "battery 数据流需要 a3_aimdk protobuf wheel；"
-                          "在机器人上挂载 /agibot-devkit 开发包后重启驱动"}
+                "reason": "battery 数据流需要包含 a3_aimdk wheel 和 ros2_plugin_proto 的新 A3 镜像；"
+                          "请重新构建并部署镜像后重启驱动"}
 
 
 class EstopPlugin:
@@ -2023,8 +2060,8 @@ class EstopPlugin:
                     "topic_out": [{"topic": stream["topic"], "format": stream["format"]}]}
         # 同 battery：降级时显式 unavailable，而不是伪装成 running。
         return {"state": "unavailable",
-                "reason": "estop 数据流需要 a3_aimdk protobuf wheel；"
-                          "在机器人上挂载 /agibot-devkit 开发包后重启驱动"}
+                "reason": "estop 数据流需要包含 a3_aimdk wheel 和 ros2_plugin_proto 的新 A3 镜像；"
+                          "请重新构建并部署镜像后重启驱动"}
 
 
 class ModelPlugin:

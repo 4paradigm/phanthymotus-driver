@@ -8,10 +8,9 @@ agibot-a3:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
-    # AimDK 开发包 (dev kit): provides prebuilt/a3_aimdk wheel + ros2_plugin_proto.
-    # Per dev guide §5.2 the wheel is pip-installed at container start and the
-    # ros2_plugin_proto environment is sourced from here by the image CMD. Absent
-    # on a non-robot host -- device.py then falls back to its no-wheel code paths.
+    # AimDK development package: retains host-side runtime files and the
+    # vendor ROS interface fallback. The a3_aimdk wheel is baked into the image
+    # during Docker build from COS; it is not downloaded at container startup.
     - /agibot/software/v0/entry:/agibot-devkit:ro
     # Runtime ROS interfaces installed by AimDK on the ADU/HDU image.
     - /opt/agibot:/opt/agibot:ro

@@ -2489,6 +2489,18 @@ class MirrorStreamTests(unittest.TestCase):
         self.assertEqual(by_name["waist_roll_joint"], -0.2)
         self.assertEqual(by_name["waist_pitch_joint"], 0.3)
 
+    def test_skeleton_maps_indexed_hand_feedback_to_urdf_fingers(self):
+        msg = types.SimpleNamespace(
+            name=[f"left_hand_joint_{index}" for index in range(10)],
+            position=[0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4000, 4096],
+            velocity=[0.0] * 10, effort=[0.0] * 10, frame_id="O10Hand")
+        self._callback("/motion/control/hand_joint_state")(msg)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        by_name = {joint["name"]: joint["q"] for joint in payload["joints"]}
+        self.assertIn("left_thumb_roration_0", by_name)
+        self.assertIn("left_pinky_bent_1", by_name)
+        self.assertAlmostEqual(by_name["left_thumb_wiggles_1"], math.pi / 16)
+
     def test_wrist_camera_cards_are_not_exposed_without_source_frames(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = FULL_PLUGINS
