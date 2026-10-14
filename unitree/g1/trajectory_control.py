@@ -210,7 +210,7 @@ class TrajectoryControl:
             for seq, frame in enumerate(recording['frames'], start=next_seq):
                 self._check_binding(recording)
                 due = start+frame['t_ns']
-                self._wait_until(max(start, due-60_000_000))
+                self._wait_until(max(start, due-60_000_000, self.control.clock()))
                 if frame['kind'] == 'hold':
                     self._wait_until(due)
                     self.arm.hold('replay_pause')

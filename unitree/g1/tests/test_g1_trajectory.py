@@ -471,3 +471,32 @@ def test_replay_does_not_race_teleop_during_file_read(tmp_path, monkeypatch, cha
         if card._begin_lock.locked(): card._begin_lock.release()
         card._reset_operation = None
         card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+@pytest.mark.parametrize('delay, expected', [(.025, 'completed'), (.075, 'error')])
+def test_close_pause_frame_uses_execution_deadline_not_preparation_time(tmp_path, delay, expected):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        card.stop(); channel.positions.clear()
+        target = list(sample['q'])
+        frame = {'kind': 'target', 'target_q': target, 'source_sequence': 1, 'mapping_epoch': 1}
+        recording = {'filename': 'timing.jsonl', 'sha256': 'test',
+            'binding': card.trajectory.binding(), 'joint_names': arm.profile['arm_joint_names'],
+            'duration_ns': 200_000_000,
+            'frames': [dict(frame, t_ns=50_000_000),
+                       dict(frame, kind='hold', t_ns=64_000_000),
+                       dict(frame, t_ns=150_000_000, source_sequence=2)]}
+        original = card.trajectory._send_frame
+        def send(frame, seq, due):
+            original(frame, seq, due)
+            if seq == 0: time.sleep(delay)
+        card.trajectory._send_frame = send
+        card.trajectory.cancel.clear()
+        card.trajectory.last_action = {'phase': 'moving_to_start'}
+        card.trajectory._run('close-pause', recording)
+        assert card.trajectory.last_action['status'] == expected, card.trajectory.last_action
+        if expected == 'error':
+            assert card.trajectory.last_action['result']['reason'] == 'replay_schedule_missed'
+        assert receipts[-1][1] == expected
+    finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)
