@@ -112,7 +112,7 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 | `recordings` | 无 | 文件名、大小、完整文件/临时文件；列表不代替 `inspect` 校验 |
 | `inspect` | `filename` | 校验后的 `filename/sha256/binding/joint_names/duration_seconds/frames/preview` |
 | `start_difference` | `filename` | `ready/target_q/current_q/joint_delta_rad` |
-| `play` | `filename`；执行时另传确认参数 | 默认仅预检；确认后返回异步 `action_id` |
+| `play` | `filename` | 自动检查后开始回放，返回异步 `action_id` |
 | `action_status` | `action_id` | 最近一次回放的 `running/completed/cancelled/error` 和结果 |
 | `stop` | 无 | 立即请求取消遥操/回放，再等待原执行器交权；失败不报告停止成功 |
 
@@ -140,11 +140,10 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 
 ```json
 {"name":"teleop_control","arguments":{"action":"play","filename":"g1-<id>.jsonl"}}
-{"name":"teleop_control","arguments":{"action":"play","filename":"g1-<id>.jsonl","execute":true,"preview_id":"<预检返回值>","workspace_clear":true,"take_control":true}}
 {"name":"teleop_control","arguments":{"action":"action_status","action_id":"<执行返回值>"}}
 ```
 
-预检返回 `execute=false`、单次 `preview_id`、30 秒有效期、文件摘要、时长、起点差异及 `start_transition`（`speed_rad_s=0.1`、`estimated_seconds`）。预检不执行动作；起点位置不匹配不再直接拒绝预检或执行，而在确认后限速过渡。预计过渡时长为最大关节差值除以0.1，不含模型计算和调度延迟。执行时重新检查；文件、绑定或控制代次改变后确认失效。成功启动返回 `status=running` 和 `action_id`；`action_status` 的 `phase` 先为 `moving_to_start`，首帧目标下发完成后为 `replaying`。仅最后一项回放结果保留在 `info.last_action`，Driver 重启后不恢复动作。失败返回 `state=error/code/error`，例如 `recording_binding_mismatch`、`replay_preview_expired_or_changed`。
+`play` 只需文件名，调用即表示执行回放，不再填写布尔确认项或复制限时预检 ID。Driver 每次执行均重新读取并校验文件、设备、模型、身体基准和控制权。未开始遥操或仅等待基准确认时，Driver 自动关闭输入等待后回放；已有操作员会话或控制租约时仍拒绝抢占。查看文件用 `inspect`，查看起点差异用 `start_difference`，两者不触发运动。旧调用若明确传入 `execute=false`，返回 `use_inspect_before_replay`，不会意外执行动作。成功启动返回 `status=running` 和 `action_id`；`action_status` 的 `phase` 先为 `moving_to_start`，首帧目标下发完成后为 `replaying`。仅最后一项结果保留在 `info.last_action`，Driver 重启后不恢复动作。失败返回 `state=error/code/error`。
 
 回放与遥操互斥。回放按原时间发送已经录制的关节参考，不再施加 120 ms 低通滤波；仍通过同一执行器的控制权、反馈、关节限位、数值包围区间和 1 rad/s 参考变化检查。暂停事件停止输出，恢复事件沿原时间继续。调度落后超过 50 ms、执行心跳超过 100 ms、反馈失效或速度不符时终止，不补发积压目标、不静默降速。回放不需要 PICO 持续跟踪，也不会消费手柄指令。
 

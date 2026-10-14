@@ -164,15 +164,13 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         # The operator, represented by this plant substitute, restores the start.
         sample['q'] = list(asset['preview'][0]['target_q']); channel.positions.clear()
         sample['q'] = [q+.1 for q in sample['q']]
-        offset_preview = card.dispatch('play', {'filename': name})
-        assert offset_preview['start_difference']['ready']
-        assert offset_preview['start_transition']['estimated_seconds'] == pytest.approx(1.)
+        offset_preview = card.dispatch('start_difference', {'filename': name})
+        assert offset_preview['ready']
         sample['q'] = list(asset['preview'][0]['target_q'])
-        preview = card.dispatch('play', {'filename': name})
-        assert preview['execute'] is False and not arm.session_id
+        preview = card.dispatch('start_difference', {'filename': name})
+        assert preview['ready'] and not arm.session_id
         count = len(channel.positions)
-        result = card.dispatch('play', {'filename': name, 'execute': True, 'preview_id': preview['preview_id'],
-                                        'workspace_clear': True, 'take_control': True})
+        result = card.dispatch('play', {'filename': name})
         assert result['status'] == 'running', result
         assert card.dispatch('start', {'input_topic': '/teleop/command'})['code'] == 'replay_active'
         card.trajectory.thread.join(6)
@@ -183,9 +181,10 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         assert [q for q, _ in channel.positions[count:count+3]] == [f['target_q'] for f in asset['preview']]
         assert not card.trajectory.recorder.status()['error']
         arm.cfg['live_enabled'] = False
-        rejected = card.dispatch('play', {'filename': name, 'execute': True, 'preview_id': preview['preview_id'],
-                                         'workspace_clear': True, 'take_control': True})
-        assert rejected['state'] == 'error'  # A consumed confirmation cannot run again.
+        rejected = card.dispatch('play', {'filename': name})
+        assert rejected['status'] == 'running'
+        card.trajectory.thread.join(6)
+        assert card.trajectory.last_action['status'] == 'error'  # Hardware gates still apply.
         card.cfg['trajectory_device_id'] = 'different-robot'
         assert card.dispatch('inspect', {'filename': name})['code'] == 'recording_binding_mismatch'
     finally:
@@ -223,11 +222,10 @@ def test_replay_failure_never_reports_completed(tmp_path, failure):
         name = card.dispatch('record_stop', {})['filename']
         asset = card.dispatch('inspect', {'filename': name})
         card.stop(); channel.positions.clear(); sample['q'] = list(asset['preview'][0]['target_q'])
-        preview = card.dispatch('play', {'filename': name})
+        preview = card.dispatch('start_difference', {'filename': name})
         if failure == 'body_changed':
             key = next(iter(sample['locked_joints'])); sample['locked_joints'][key] += .1
-            result = card.dispatch('play', {'filename': name, 'execute': True,
-                'preview_id': preview['preview_id'], 'workspace_clear': True, 'take_control': True})
+            result = card.dispatch('play', {'filename': name})
             assert result['code'] == 'recording_body_baseline_mismatch' and not arm.session_id
             return
         original_wait = card.trajectory._wait_until
@@ -237,8 +235,7 @@ def test_replay_failure_never_reports_completed(tmp_path, failure):
         card.trajectory._wait_until = wait
         if failure == 'stop_unconfirmed':
             card._stop_motion = lambda: (_ for _ in ()).throw(ValueError('stop_unconfirmed'))
-        result = card.dispatch('play', {'filename': name, 'execute': True,
-            'preview_id': preview['preview_id'], 'workspace_clear': True, 'take_control': True})
+        result = card.dispatch('play', {'filename': name})
         card.trajectory.thread.join(6)
         outcome = card.dispatch('action_status', {'action_id': result['action_id']})
         assert outcome['status'] == ('cancelled' if failure == 'cancel' else 'error'), outcome
@@ -350,9 +347,8 @@ def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_p
         recording = read_recording(card.trajectory.directory, name, arm.limits)
         card.stop(); channel.positions.clear()
         sample['q'] = [q+.12 for q in recording['frames'][0]['target_q']]
-        preview = card.dispatch('play', {'filename': name})
-        assert preview['start_difference']['ready'] and not channel.positions
-        assert preview['start_transition'] == {'speed_rad_s': .1, 'estimated_seconds': pytest.approx(1.2)}
+        preview = card.dispatch('start_difference', {'filename': name})
+        assert preview['ready'] and not channel.positions
         original = arm.write_replay
         def write(command, proof):
             before, stamp = list(arm.last_q), arm.last_emit
@@ -360,8 +356,7 @@ def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_p
             writes.append((card.trajectory.last_action['phase'], before, stamp,
                            list(command['values']), arm.last_emit, command['seq']))
         arm.write_replay = write
-        result = card.dispatch('play', {'filename': name, 'execute': True, 'preview_id': preview['preview_id'],
-                                       'workspace_clear': True, 'take_control': True})
+        result = card.dispatch('play', {'filename': name})
         card.trajectory.thread.join(7)
         outcome = card.dispatch('action_status', {'action_id': result['action_id']})
         assert outcome['status'] == 'completed', outcome
@@ -389,7 +384,7 @@ def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path
         name = card.dispatch('record_stop', {})['filename']
         target = read_recording(card.trajectory.directory, name, arm.limits)['frames'][0]['target_q']
         card.stop(); channel.positions.clear(); sample['q'] = [q+.12 for q in target]
-        preview = card.dispatch('play', {'filename': name})
+        preview = card.dispatch('start_difference', {'filename': name})
         if failure == 'collision':
             card.motion.solver.joint_envelope = lambda *a: (_ for _ in ()).throw(ValueError('collision'))
         original = arm.write_replay
@@ -408,8 +403,7 @@ def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path
                 sample['arm_ns'] = arm.clock(); sample['q'] = fixed
                 return copy.deepcopy(sample)
             arm._snapshot_provider = snapshot
-        result = card.dispatch('play', {'filename': name, 'execute': True, 'preview_id': preview['preview_id'],
-                                       'workspace_clear': True, 'take_control': True})
+        result = card.dispatch('play', {'filename': name})
         card.trajectory.thread.join(9)
         outcome = card.dispatch('action_status', {'action_id': result['action_id']})
         assert outcome['status'] in ('cancelled', 'error'), outcome
@@ -419,4 +413,61 @@ def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path
         else: assert 'replaying' not in writes
         if failure == 'collision': assert not writes and outcome['result']['reason'] == 'collision'
     finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+@pytest.mark.parametrize('waiting_binding', [False, True])
+def test_filename_only_replay_without_teleop_start_or_manual_stop(tmp_path, waiting_binding):
+    from teleop_control import TeleopControl
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        card.dispatch('record_start', {})
+        for seq in (1, 2):
+            arm.accept_control(packet(arm, seq, target=.01)); time.sleep(.06)
+        name = card.dispatch('record_stop', {})['filename']
+        card.stop(); channel.positions.clear()
+        card = TeleopControl(card.cfg, card.motion)
+        if waiting_binding:
+            card.binding = {'command_topic': '/teleop/command', 'feedback_topic': '/teleop/state'}
+        schema = card.get_tool()['inputSchema']
+        assert schema['x-action-params']['play']['params'] == ['filename']
+        assert not {'execute', 'preview_id', 'workspace_clear', 'take_control'} & schema['properties'].keys()
+        assert card.dispatch('play', {'filename': name, 'execute': False})['code'] == 'use_inspect_before_replay'
+        assert not channel.positions
+        result = card.dispatch('play', {'filename': name})
+        assert result['status'] == 'running', result
+        assert card._closed.is_set()
+        card.trajectory.thread.join(6)
+        assert card.trajectory.last_action['status'] == 'completed', card.trajectory.last_action
+    finally:
+        card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+@pytest.mark.parametrize('change', ['stop', 'operator', 'begin', 'reset'])
+def test_replay_does_not_race_teleop_during_file_read(tmp_path, monkeypatch, change):
+    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+    try:
+        card.dispatch('record_start', {})
+        for seq in (1, 2):
+            arm.accept_control(packet(arm, seq, target=.01)); time.sleep(.06)
+        recorded = card.dispatch('record_stop', {})
+        assert recorded['complete'], recorded
+        name = recorded['filename']
+        card.stop(); channel.positions.clear()
+        original = __import__('trajectory_control').read_recording
+        def read(*args):
+            recording = original(*args)
+            if change == 'stop': card.stop()
+            elif change == 'operator': card._operator = 'concurrent-session'
+            elif change == 'begin': card._begin_lock.acquire()
+            else: card._reset_operation = object()
+            return recording
+        monkeypatch.setattr('trajectory_control.read_recording', read)
+        result = card.dispatch('play', {'filename': name})
+        assert result['code'] == {'stop': 'replay_cancelled', 'operator': 'stop_teleop_before_replay',
+                                  'begin': 'motion_busy', 'reset': 'motion_busy'}[change]
+        assert not channel.positions and not card.trajectory.busy
+    finally:
+        if card._begin_lock.locked(): card._begin_lock.release()
+        card._reset_operation = None
         card.trajectory.stop(); done.set(); ticker.join(1)

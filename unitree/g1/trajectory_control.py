@@ -21,7 +21,7 @@ class TrajectoryControl:
         self.directory = Path(control.cfg.get('data_dir', '/opt/phanthy-motus/data/g1'))/'recordings'
         self.notify = notify or (lambda *args: None)
         self.lock = threading.RLock()
-        self.recorder = self.thread = self.preview = None
+        self.recorder = self.thread = None
         self.cancel = threading.Event()
         self.last_action = None
 
@@ -119,14 +119,17 @@ class TrajectoryControl:
                 'target_q': target, 'current_q': q, 'joint_delta_rad': delta}
 
     def _idle(self):
-        if not self.control._closed.is_set() or self.control._operator: raise ValueError('stop_teleop_before_replay')
+        if self.control._operator: raise ValueError('stop_teleop_before_replay')
         if self.busy: raise ValueError('replay_active')
         if self.recorder and self.recorder.thread.is_alive(): raise ValueError('recording_busy')
         state = self.arm.status()
-        if state['ownership_held'] or self.arm.opening: raise ValueError('motion_busy')
+        if (state['ownership_held'] or self.arm.opening or self.control._begin_lock.locked()
+                or self.control._reset_operation): raise ValueError('motion_busy')
         if state['state'] == 'fault': raise ValueError('driver_fault')
 
     def play(self, args):
+        # Never turn an older client's explicit dry run into motion.
+        if args.get('execute') is False: raise ValueError('use_inspect_before_replay')
         with self.lock:
             self._idle()
             generation = self.control._generation
@@ -135,27 +138,12 @@ class TrajectoryControl:
             recording = read_recording(self.directory, args.get('filename'), self.arm.limits)
             self._check_binding(recording)
             if recording['frames'][0]['kind'] != 'target': raise ValueError('recording_initial_target_missing')
-            difference = self._difference(recording)
-            if args.get('execute') is not True:
-                ident = secrets.token_hex(16)
-                self.preview = {'id': ident, 'until': self.control.clock()+30_000_000_000,
-                                'sha256': recording['sha256'], 'binding': self.binding(),
-                                'generation': self.control._generation}
-                return {'execute': False, 'preview_id': ident, 'expires_in_seconds': 30,
-                        'sha256': recording['sha256'], 'duration_seconds': recording['duration_seconds'],
-                        'start_difference': difference,
-                        'start_transition': {'speed_rad_s': self.START_SPEED,
-                            'estimated_seconds': max(map(abs, difference['joint_delta_rad']))/self.START_SPEED}}
-            preview, self.preview = self.preview, None
-            if (not preview or args.get('preview_id') != preview['id'] or
-                    self.control.clock() >= preview['until'] or preview['sha256'] != recording['sha256'] or
-                    preview['binding'] != self.binding() or preview['generation'] != self.control._generation):
-                raise ValueError('replay_preview_expired_or_changed')
-            if args.get('workspace_clear') is not True or args.get('take_control') is not True:
-                raise ValueError('replay_confirmation_required')
             ident = secrets.token_hex(16)
             with self.control._lock:
                 if generation != self.control._generation: raise ValueError('replay_cancelled')
+                self._idle()
+                self.control._closed.set()
+                self.control._generation += 1
                 self.cancel.clear()
                 self.last_action = {'action_id': ident, 'status': 'running', 'phase': 'moving_to_start', 'result': {}}
                 self.thread = threading.Thread(target=self._run, args=(ident, recording), name='g1-replay', daemon=True)
@@ -258,7 +246,6 @@ class TrajectoryControl:
 
     def stop(self):
         self.cancel.set()
-        self.preview = None
 
     def dispatch(self, action, args):
         if action == 'record_start': return self.record_start()

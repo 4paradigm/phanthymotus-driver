@@ -129,13 +129,11 @@ class TeleopControl:
         fields = {'usage_guide': {'type': 'string', 'title': '使用说明（固定，无需配置）',
                     'enum': ['无需配置'], 'default': '无需配置', 'scope': 'instance'}}
         return {'name': 'teleop_control', 'type': 'actuator', 'multiInstance': False,
-            'description': 'G1双臂遥操：先安装遥操设备 Driver，在画布添加 teleop_device 并连接本卡；在设备卡齿轮页获取 App 下载和配对入口。启动项目后双方双臂下垂，松开双握把并长按 X+A 一秒确认基准，松键后重新双握接通。Y+B 长按一秒复用原厂收臂复位；完成后重新确认基准。松握暂停；对齐误差仅用于显示。支持轨迹录制、检查及确认后回放。停止项目停止遥操；收臂使用 arm release。',
+            'description': 'G1双臂遥操：先安装遥操设备 Driver，在画布添加 teleop_device 并连接本卡；在设备卡齿轮页获取 App 下载和配对入口。启动项目后双方双臂下垂，松开双握把并长按 X+A 一秒确认基准，松键后重新双握接通。Y+B 长按一秒复用原厂收臂复位；完成后重新确认基准。松握暂停；对齐误差仅用于显示。支持轨迹录制和检查；play 只需文件名，调用后直接限速移动到起点并回放，请先确认运动空间无人、无障碍。停止项目停止遥操；收臂使用 arm release。',
             'configSchema': {'type': 'object', 'additionalProperties': False, 'properties': fields},
             'inputSchema': {'type': 'object', 'required': ['action'],
                 'properties': {'action': {'type': 'string', 'enum': ['info', 'config', 'start', 'stop', 'record_start', 'record_stop', 'recordings', 'inspect', 'start_difference', 'play', 'action_status']},
                     'input_topic': {'type': 'string'}, 'filename': {'type': 'string'},
-                    'execute': {'type': 'boolean', 'default': False}, 'preview_id': {'type': 'string'},
-                    'workspace_clear': {'type': 'boolean'}, 'take_control': {'type': 'boolean'},
                     'action_id': {'type': 'string'}},
                 'x-completion': {'actions': ['play'], 'timeout': 620},
                 'x-resource': ['arm_l', 'arm_r'],
@@ -143,7 +141,7 @@ class TeleopControl:
                     'start': {'params': ['input_topic']}, 'stop': {'params': []},
                     'record_start': {'params': []}, 'record_stop': {'params': []}, 'recordings': {'params': []},
                     'inspect': {'params': ['filename']}, 'start_difference': {'params': ['filename']},
-                    'play': {'params': ['filename', 'execute', 'preview_id', 'workspace_clear', 'take_control']},
+                    'play': {'params': ['filename']},
                     'action_status': {'params': ['action_id']}}},
             'topic_in': [{'port_id': 'command', 'format': 'data/teleop-cmd',
                 **({'topic': self.binding['command_topic']} if self.binding else {})}],
@@ -163,7 +161,6 @@ class TeleopControl:
             if action == 'start':
                 with self.trajectory.lock:
                     if self.trajectory.busy: raise ValueError('replay_active')
-                    self.trajectory.preview = None
                     return self.start(args)
             if action == 'stop': return self.stop()
             return self.trajectory.dispatch(action, args)
