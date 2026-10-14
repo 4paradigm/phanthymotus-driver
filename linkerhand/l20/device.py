@@ -25,7 +25,13 @@ class HandPlugin:
 
     def get_tool(self):
         return tool("hand", "actuator", "LinkerHand L20 control",
-            action_schema({"open": ([], "open"), "close": ([], "close")}, {}))
+            action_schema({
+                "start": ([], "start"),
+                "stop": ([], "stop"),
+                "info": ([], "info"),
+                "open": ([], "open"),
+                "close": ([], "close"),
+            }, {}))
 
     def start(self): pass
     def stop(self): self.nodes.close()
