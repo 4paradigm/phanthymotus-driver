@@ -9,6 +9,9 @@ class LocoPointPlugin:
     PREFIX = "loco_point"
     TIMEOUT = 300
     MAX_MOTION_SECONDS = 120
+    # Initial estimates from observed 90->75 and 180->135 degree turns.
+    # Calibrated only at 0.5 rad/s; smaller angles keep theoretical duration.
+    ROTATION_TIME_FACTORS = {90: 90. / 75., 180: 180. / 135.}
 
     def __init__(self, config, loco, notify, prepare=None):
         self.loco = loco
@@ -33,7 +36,8 @@ class LocoPointPlugin:
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": "Relative movement: straight along x, sideways along y, then rotate. "
                            "Uses loco velocity/time control; distances and angles are approximate, "
-                           "without feedback or compensation. Axes refer to the starting body heading.",
+                           "without position feedback. At 0.5 rad/s, 90/180 degree turns use empirical time compensation. "
+                           "Axes refer to the starting body heading.",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
@@ -42,7 +46,7 @@ class LocoPointPlugin:
                           "description": "Relative longitudinal distance in metres: positive forward, negative backward (same as loco vx)."},
                     "y": {"type": "number", "default": 0,
                           "description": "Relative lateral distance in metres: positive left, negative right (same as loco vy)."},
-                    "angle": {"type": "integer", "enum": [0, 30, 45, 60, 90, 180], "default": 0,
+                    "angle": {"type": "integer", "enum": [0, 30, 60, 90, 180], "default": 0,
                               "description": "Final rotation in degrees; 0 skips rotation."},
                     "direction": {"type": "string", "enum": ["left", "right"], "default": "left",
                                   "description": "Left uses positive loco vyaw, right uses negative vyaw."},
@@ -65,13 +69,13 @@ class LocoPointPlugin:
             raise ValueError("x and y must be finite")
         # Canvas enum controls may serialize numeric selections as strings.
         if isinstance(angle, bool):
-            raise ValueError("angle must be 0, 30, 45, 60, 90 or 180 degrees")
+            raise ValueError("angle must be 0, 30, 60, 90 or 180 degrees")
         try:
             angle = float(angle)
         except (ValueError, TypeError, OverflowError):
-            raise ValueError("angle must be 0, 30, 45, 60, 90 or 180 degrees") from None
-        if angle not in (0, 30, 45, 60, 90, 180):
-            raise ValueError("angle must be 0, 30, 45, 60, 90 or 180 degrees")
+            raise ValueError("angle must be 0, 30, 60, 90 or 180 degrees") from None
+        if angle not in (0, 30, 60, 90, 180):
+            raise ValueError("angle must be 0, 30, 60, 90 or 180 degrees")
         angle = int(angle)
         if direction not in ("left", "right"):
             raise ValueError("direction must be left or right")
@@ -83,9 +87,10 @@ class LocoPointPlugin:
                 stages.append(dict(stage=name, vx=velocity[0], vy=velocity[1], vyaw=0.,
                                    duration=abs(distance) / self.speed))
         if angle:
+            factor = self.ROTATION_TIME_FACTORS.get(angle, 1.) if self.yaw_speed == 0.5 else 1.
             stages.append(dict(stage="rotation", vx=0., vy=0.,
                                vyaw=self.yaw_speed if direction == "left" else -self.yaw_speed,
-                               duration=math.radians(angle) / self.yaw_speed))
+                               duration=math.radians(angle) / self.yaw_speed * factor))
         if sum(s["duration"] for s in stages) > self.MAX_MOTION_SECONDS:
             raise ValueError("Planned motion exceeds 120 seconds; reduce distances")
         return stages

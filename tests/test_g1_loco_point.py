@@ -46,25 +46,35 @@ class TestLocoPoint(unittest.TestCase):
             done.set()
         return LocoPointPlugin({}, backend, notify), backend, notifications, done
 
-    def test_plan_has_no_compensation_and_uses_body_axis_signs(self):
+    def test_plan_uses_separate_rotation_compensation_and_body_axis_signs(self):
         point, _, _, _ = self.setup_point()
-        for angle in (30, 45, 60, 90, 180):
+        for angle in (30, 60, 90, 180):
             stages = point.plan(dict(x=-0.6, y=0.3, angle=angle, direction="right"))
             self.assertEqual([s['stage'] for s in stages], ['straight', 'lateral', 'rotation'])
             self.assertEqual((stages[0]['vx'], stages[0]['vy'], stages[0]['vyaw']), (-0.3, 0., 0.))
             self.assertEqual((stages[1]['vx'], stages[1]['vy'], stages[1]['vyaw']), (0., 0.3, 0.))
             self.assertAlmostEqual(stages[0]['duration'], 2.)
             self.assertAlmostEqual(stages[1]['duration'], 1.)
-            self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5)
+            factor = {90: 1.2, 180: 4. / 3.}.get(angle, 1.)
+            self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor)
             self.assertEqual(stages[2]['vyaw'], -0.5)
+
+    def test_compensation_is_limited_to_measured_speed(self):
+        point, _, _, _ = self.setup_point()
+        point.yaw_speed = 0.7
+        for angle in (90, 180):
+            for direction in ('left', 'right'):
+                stage = point.plan(dict(angle=angle, direction=direction))[0]
+                self.assertAlmostEqual(stage['duration'], math.radians(angle) / 0.7)
+                self.assertEqual(abs(stage['vyaw']), 0.7)
 
     def test_canvas_string_angles_match_numeric_plan(self):
         point, _, _, _ = self.setup_point()
-        for angle in (0, 30, 45, 60, 90, 180):
+        for angle in (0, 30, 60, 90, 180):
             with self.subTest(angle=angle):
                 self.assertEqual(point.plan(dict(x='1', y='1', angle=str(angle), direction='left')),
                                  point.plan(dict(x=1, y=1, angle=angle, direction='left')))
-        for angle in ('45.5', 'bad', '', 'nan', 'inf', None, True):
+        for angle in (45, '45', '45.5', 'bad', '', 'nan', 'inf', None, True):
             with self.subTest(invalid=angle):
                 self.assertIn('error', point.dispatch('move', dict(angle=angle)))
 
@@ -218,7 +228,7 @@ class TestLocoPoint(unittest.TestCase):
         schema = point.get_tools()[0]['inputSchema']
         self.assertEqual(schema['x-resource'], 'base')
         self.assertEqual(schema['x-completion']['actions'], ['move'])
-        self.assertEqual(schema['properties']['angle']['enum'], [0, 30, 45, 60, 90, 180])
+        self.assertEqual(schema['properties']['angle']['enum'], [0, 30, 60, 90, 180])
 
 
 class TestPointMotion(unittest.TestCase):
