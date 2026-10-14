@@ -8,11 +8,27 @@
 
 1. 安装 PICO Driver，在 Canvas 添加 `teleop_device` 和 `teleop_control`，连接命令输出与控制卡输入。
 2. 在设备卡齿轮页查看安装和配对说明，连接 PICO。
-3. 启动项目，先松开双握把；控制卡收到有效输入后建立初始相对基准。
-4. 松握时在头显查看实测骨架与 IK 目标骨架。两臂位置误差不超过 3 cm、朝向误差不超过 15°，且输入、反馈及求解有效后，重新按下双握把接通。提前握住不会在就绪后自动接通。
-5. 松开任一握把暂停输出并继续预览。再次接通仍需对齐和新一次双握；沿用原映射基准。跟踪丢失、连接或空间代次改变后撤销就绪，不自动恢复运动。
-6. 从 Canvas 停止项目；收臂复用既有 `arm.release`，它先取消遥操输入及待发目标再交还 SDK，之后需从 Canvas 重新启动遥操。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
+3. 启动项目。确认机器人和操作者的双臂自然下垂，松开双握把，长按左 X + 右 A 一秒。保持按钮直到基准建立；模型首次准备可能需要数秒。Driver 只在这次明确确认后采集实际姿态建立映射，不在首帧自动标定。
+4. 松开按钮，再按下双握把接通。握把按下时的新目标必须通过 IK、输入时效和执行门禁。末端对齐误差仅供显示，不再作为接通条件。
+5. 松开任一握把暂停输出并继续预览。再次接通需新一次双握；沿用原映射基准。输入中断或 IK 失败后不自动恢复；设备连接或跟踪空间改变后需再次确认双方下垂姿态并长按 X+A。
+6. 需要复位时，松开双握把，长按左 Y + 右 B 一秒。每次按住只触发一次。Driver 取消旧映射和待发目标，复用既有 `arm.release` 执行器路径：交还 SDK 后调用 `ExecuteAction(99)`。厂商控制复位轨迹和速度；Driver 不另设关节目标或保存任意姿态作为复位点。
+7. 原厂指令成功且后续实测静止后，Driver 等待再次确认。现场确认机器人与操作者双臂下垂，再长按 X+A 建立新映射，松键并重新双握。Reset 完成不自动接通。
+8. 从 Canvas 停止项目。独立调用 `arm.release` 会取消遥操并关闭输入，之后需从 Canvas 重新启动项目。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
 
+Reset 使用 [宇树手臂动作接口](https://support.unitree.com/home/en/G1_developer/arm_action_interface) 的 **Recover Initial Arm Pose（99）**。SDK 返回成功不是姿态验收；执行器检查返回后的新鲜静止反馈，现场用户确认下垂姿态。接口依赖本体内置运控和可用的 Arm Action Service；失败时保留错误，不自动重试或启停厂商服务。原厂 99 已发出后，现有 SDK 没有可靠取消接口，停止会报告结果未知，不能报告已取消。
+
+PICO 继续使用既有 `left/right.controls.buttons` 的 `available`、`pressed`，不新增 topic。确认键是 `left.x + right.a`，Reset 键是 `left.y + right.b`；同时按两组键不执行。输入超过 300 ms、按键松开或握把按下会中断一秒计时。
+
+| 顶层 state | 顶层 reason | PICO 提示含义 |
+|---|---|---|
+| `ready` | `waiting_baseline_confirmation` | 双方双臂下垂，松握，长按 X+A 确认 |
+| `ready` | `release_buttons_then_regrip` | 松开按钮，再次双握接通 |
+| `ready` | `regrip_required` | 松握后再次双握；对齐数值仅供参考 |
+| `hold` | `resetting` | 原厂复位进行中；不接通遥操 |
+| `active` | `null` | 遥操已接通 |
+| `hold` / `fault` | 具体错误码 | 显示失败原因；不报告复位成功 |
+
+`alignment.state/ready` 继续表达真实的几何诊断；PICO 不得用它替代顶层执行状态或修改成恒为 true。
 用户不需要填写实例 ID、模型路径、位移比例或 Shadow/Live。这些由框架和 Driver 预设管理；启动项目本身不发送运动目标。支持 FSM 500、801，不自动切换本体模式。
 
 适用范围仅为原厂 G1_23 固定假手，不自动适配 G1_29、灵巧手或改装 TCP。附加碰撞与工作区扫描默认关闭；Driver 不自动停止其他控制程序。`servo`、`servo_eef` 可同时注册，但本实现不提供统一控制器仲裁。
@@ -44,11 +60,11 @@
 | 设备 → 控制卡 | `/teleop/command` | `data/teleop-cmd`，JSON schema `motus.teleop.command/1` |
 | 控制卡 → Canvas 监控与 PICO Driver | `/teleop/state` | `data/teleop-state` |
 
-输入来源由 Canvas 连线决定。控制卡直接订阅传入的 `input_topic`，不限定 topic 路径、不按首帧绑定来源实例，也不额外认证消息中的实例或设备 ID。格式、时效、序号和代次检查仍保留；设备或跟踪空间变化后，需要松握重建坐标基准。
+输入来源由 Canvas 连线决定。控制卡直接订阅传入的 `input_topic`，不限定 topic 路径、不按首帧绑定来源实例，也不额外认证消息中的实例或设备 ID。格式、时效、序号和代次检查仍保留；设备或跟踪空间变化后，需要松握并长按 X+A 明确确认后重建坐标基准。
 
 设备输入为左右控制器位姿、握把、跟踪状态、身份、代次、序号与时效。PICO Driver 订阅同机 `/teleop/state`，把 `motus.teleop.feedback/1` 转发到头显。G1 提供 `visualization`（实测、IK、躯干线框）和 `alignment`（左右末端位置/朝向误差、阈值、状态、`ready`）。两端使用新版协议，不新增 topic 或协商。URDF、关节顺序、数值求解、对齐判定与执行均在 G1 Driver 内。
 
-对齐比较实测末端和可执行 IK 末端，`error_reference=ik`。求解失败时状态为 `unreachable`，误差参考请求目标（`error_reference=requested_target`），不能使能；求解残差另列 `target_residual`。实测反馈超过 100 ms、输入/目标超过 300 ms 或代次改变时，撤销就绪与旧目标。3 cm / 15° 是软件初值，尚未完成硬件阈值验收。
+对齐比较实测末端和可执行 IK 末端，`error_reference=ik`。求解失败时状态为 `unreachable`，误差参考请求目标（`error_reference=requested_target`），不能使能；求解残差另列 `target_residual`。实测反馈超过 100 ms、输入/目标超过 300 ms 或代次改变时，撤销就绪与旧目标。3 cm / 15° 仅为诊断显示阈值，不用于使能。
 
 ### 机型 profile 与每轮基准
 
@@ -62,7 +78,7 @@
 
 每个有效目标仅下发一次。以后端最后成功下发的位置为起点，做 120 ms 一阶指数平滑，再将各关节增量裁剪到 ±1 rad/s × dt；dt 最大 50 ms，断帧或重握不积累追赶额度。仅处理最新目标，不排队补发历史动作。这限制的是位置参考的变化率，不是实测电机速度的硬保证。
 
-遥操肩肘增益为 kp=80/kd=3，腕部为 40/1.5；普通 servo 增益不变，不增加重力补偿。IK 失败丢弃失败结果及其滤波历史，并要求松握、对齐和重新双握后续接。松握后的执行器恢复不新增静止阈值；`continuation_ready` 表示可以继续接收目标，与物理保持确认 `hold_confirmed` 区分。
+遥操肩肘增益为 kp=80/kd=3，腕部为 40/1.5；普通 servo 增益不变，不增加重力补偿。IK 失败丢弃失败结果及其滤波历史，并要求松握和重新双握后续接。松握后的执行器恢复不新增静止阈值；`continuation_ready` 表示可以继续接收目标，与物理保持确认 `hold_confirmed` 区分。
 
 输入有效性、反馈时效与 URDF 关节限位仍校验；附加软件碰撞/工作区扫描默认关闭，不能据此认为任意姿态均无碰撞。原始电机遥测保留，厂商保护不修改。Driver 不自动停止其他控制程序。
 

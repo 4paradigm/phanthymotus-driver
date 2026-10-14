@@ -114,11 +114,12 @@ class TeleopControl:
         self._hold_kind = None
         self._needs_calibration = False
         self._state, self._reason = 'idle', None
-        self._auto_retry_after_ns = 0
         self.executor.cfg['live_enabled'] = self.live
         self.executor.cfg['operator_session_enabled'] = self.live
         self.trajectory = TrajectoryControl(self, notify)
         self._input_changed = False
+        self._buttons = {}
+        self._reset_operation = None
 
     @property
     def live(self): return self.cfg.get('mode', 'live') == 'live'
@@ -127,7 +128,7 @@ class TeleopControl:
         fields = {'usage_guide': {'type': 'string', 'title': '使用说明（固定，无需配置）',
                     'enum': ['无需配置'], 'default': '无需配置', 'scope': 'instance'}}
         return {'name': 'teleop_control', 'type': 'actuator', 'multiInstance': False,
-            'description': 'G1双臂遥操：先安装遥操设备 Driver，在画布添加 teleop_device 并连接本卡；在设备卡齿轮页获取 App 下载和配对入口。启动项目后松开双握把建立初始基准，在头显查看实测与目标骨架，对齐后重新按下双握把接通。松握继续预览，再次接通前重新对齐；映射基准不变。支持轨迹录制、检查及确认后回放。停止项目停止遥操；收臂使用 arm release。',
+            'description': 'G1双臂遥操：先安装遥操设备 Driver，在画布添加 teleop_device 并连接本卡；在设备卡齿轮页获取 App 下载和配对入口。启动项目后双方双臂下垂，松开双握把并长按 X+A 一秒确认基准，松键后重新双握接通。Y+B 长按一秒复用原厂收臂复位；完成后重新确认基准。松握暂停；对齐误差仅用于显示。支持轨迹录制、检查及确认后回放。停止项目停止遥操；收臂使用 arm release。',
             'configSchema': {'type': 'object', 'additionalProperties': False, 'properties': fields},
             'inputSchema': {'type': 'object', 'required': ['action'],
                 'properties': {'action': {'type': 'string', 'enum': ['info', 'config', 'start', 'stop', 'record_start', 'record_stop', 'recordings', 'inspect', 'start_difference', 'play', 'action_status']},
@@ -188,7 +189,8 @@ class TeleopControl:
             self.binding = binding
             self.instance_id = args.get('instance_id') or 'teleop_control'
             self._closed.clear()
-            self._state, self._reason = 'ready', 'waiting_input'
+            self._buttons.clear()
+            self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
         self.motion.start()
         with self._lock:
             if self._thread is None or not self._thread.is_alive():
@@ -217,6 +219,8 @@ class TeleopControl:
             source_changed = self._latest and self._latest['instance_id'] != frame['instance_id']
             self._latest = frame
             if old and (identity != old or source_changed):
+                self._buttons.clear()
+                self._needs_calibration = True
                 self._input_changed = True
                 self._ready_on_release = False
             if self._mapping_identity and (identity[0], identity[2]) != self._mapping_identity:
@@ -276,7 +280,12 @@ class TeleopControl:
             with self._lock:
                 self._check_generation(generation)
                 frame = self._latest_fresh()
-                if identity != self._identity(frame):raise ValueError('operation_input_generation_changed')
+                if identity != self._identity(frame) or self._input_changed:
+                    raise ValueError('operation_input_generation_changed')
+                if not self._pressed(frame, 'x', 'a') or any(frame[s]['grip'] >= .5 for s in ('left', 'right')):
+                    raise ValueError('baseline_confirmation_released')
+                _, _, dq = self.executor._fresh()
+                if max(map(abs, dq)) > .02: raise ValueError('robot_not_stopped')
                 snap = copy.deepcopy(self.motion._snapshot)
                 if not snap or not 0 <= self.clock()-snap['monotonic_ns'] <= 100_000_000:
                     raise ValueError('arm_feedback_stale')
@@ -292,7 +301,7 @@ class TeleopControl:
                 self._processed = None
                 self._hold_kind = None
                 self._sequence = 0
-                self._state, self._reason = 'ready', None
+                self._state, self._reason = 'ready', 'release_buttons_then_regrip'
                 return {'operator_session_id': self._operator, 'mapping_epoch': self.mapping.epoch,
                         'state': 'ready', 'output_active': False}
         except Exception:
@@ -320,25 +329,102 @@ class TeleopControl:
                 if result.get('error'): raise ValueError(result.get('code', result['error']))
             self._hold_kind = (kind, reason)
 
+    @staticmethod
+    def _pressed(frame, left, right):
+        def pressed(side, name):
+            value = frame[side].get('controls', {}).get('buttons', {}).get(name, {})
+            return value.get('available') is True and value.get('pressed') is True
+        return pressed('left', left) and pressed('right', right)
+
+    def _button_event(self, frame, name, pressed):
+        # Count distinct fresh samples; one held/replayed sample cannot confirm.
+        if not pressed:
+            self._buttons.pop(name, None)
+            return False
+        stamp = frame['received_monotonic_ns']
+        start, last, fired = self._buttons.get(name, (stamp, stamp, False))
+        if stamp-last > 300_000_000: start = stamp
+        event = not fired and stamp-start >= 1_000_000_000
+        self._buttons[name] = (start, stamp, fired or event)
+        return event
+
+    def _start_reset(self):
+        if not self.live: raise ValueError('reset_requires_live')
+        if self.trajectory.busy: raise ValueError('replay_active')
+        self._generation += 1
+        self._operator = None
+        self._needs_calibration = True
+        self.mapping.anchor = None
+        self._enabled = self._ready_on_release = False
+        self._engage_sequence = None
+        self.motion.cancel_pending()
+        with self.motion._lock:
+            self.motion._preview = None
+            self.motion._preview_state = 'idle'
+        if self.trajectory.recorder and self.trajectory.recorder.thread.is_alive():
+            self.trajectory.recorder.fail('operator_reset')
+        self.executor.cancel_preparation()
+        result = self.executor.dispatch('release', {'operation_id': secrets.token_hex(16)})
+        if result.get('error'): raise ValueError(result['error'])
+        self._reset_operation = result['operation_id']
+        self._state, self._reason = 'hold', 'resetting'
+
+    def _poll_reset(self):
+        result = self.executor.dispatch('finish_status', {'operation_id': self._reset_operation})
+        if result.get('error') or result['state'] in ('failed', 'unknown'):
+            self._reset_operation = None
+            raise ValueError(result.get('reason') or result.get('error') or 'reset_failed')
+        if result['state'] == 'completed':
+            if not result.get('physical_confirmed') or not result.get('authority_released'):
+                raise ValueError('reset_feedback_unconfirmed')
+            self._reset_operation = None
+            stamp = self._latest['received_monotonic_ns']
+            self._buttons['confirm'] = (stamp, stamp, True)
+            self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
+        else:
+            self._state, self._reason = 'hold', 'resetting'
+
     def step(self):
-        with self._lock:
-            if self._closed.is_set() or not self.binding: return
-            generation = self._generation
-            if self._input_changed:
-                self._input_changed = False
-                if self._operator: self._hold('input_generation_changed', grip=True)
-            initialize = not self._operator or self._needs_calibration
-        if initialize:
-            if self.clock() < self._auto_retry_after_ns: return
-            try:
+        try:
+            with self._lock:
+                if self._closed.is_set() or not self.binding: return
+                generation = self._generation
                 frame = self._latest_fresh()
-                if any(frame[s]['grip'] >= .5 for s in ('left', 'right')):
-                    with self._lock: self._state, self._reason = 'ready', 'release_grips_before_enable'
+                if self._input_changed:
+                    self._input_changed = False
+                    if self._operator: self._hold('input_generation_changed', grip=True)
+                if self._reset_operation:
+                    self._poll_reset()
                     return
+                released = all(frame[s]['grip'] < .5 for s in ('left', 'right'))
+                reset = self._pressed(frame, 'y', 'b')
+                confirm = self._pressed(frame, 'x', 'a')
+                reset_event = self._button_event(frame, 'reset', reset and released and not confirm)
+                confirm_event = self._button_event(frame, 'confirm', confirm and released and not reset)
+                if reset_event:
+                    self._start_reset()
+                    return
+                initialize = not self._operator or self._needs_calibration
+                if initialize and not confirm_event:
+                    if self._state != 'hold':
+                        self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
+                    return
+                if not initialize and (reset or confirm):
+                    if self._enabled: self._hold('operator_pause', grip=True)
+                    self._gripped = self._ready_on_release = False
+                    self._engage_sequence = None
+                    self._state, self._reason = 'ready', 'release_buttons_then_regrip'
+                    return
+            if initialize:
                 self._begin(generation, 'calibrate' if self._needs_calibration else 'begin')
-            except (ValueError, RuntimeError, OSError) as exc:
-                with self._lock: self._state, self._reason = 'hold', str(exc)
-                self._auto_retry_after_ns = self.clock() + 500_000_000
+                return
+        except (ValueError, RuntimeError, OSError) as exc:
+            with self._lock:
+                if self._reset_operation:
+                    self.executor.dispatch('stop', {})
+                    self._reset_operation = None
+                if self._operator: self._hold(str(exc), grip=True)
+                else: self._state, self._reason = 'hold', str(exc)
             return
         try:
             with self._lock:
@@ -349,28 +435,29 @@ class TeleopControl:
                 rising = held and not self._gripped
                 self._gripped = held
                 key = (*self._identity(frame), frame['sequence'])
-                display = self.display_feedback()
-                aligned = display['alignment']['ready']
+                decision = self.motion._decision
+                solved = (decision.get('state') == 'preview'
+                    and 0 <= self.clock()-decision.get('monotonic_ns', 0) <= 300_000_000)
                 if not held:
                     if self._enabled:
                         self._hold('operator_pause', grip=True)
                     self._engage_sequence = None
-                    self._ready_on_release = aligned
+                    self._ready_on_release = True
                     self._release_seen = True
                 elif not self._enabled:
                     if rising:
-                        self._engage_sequence = frame['sequence'] if self._ready_on_release and aligned else None
+                        self._engage_sequence = frame['sequence'] if self._ready_on_release else None
                         self._ready_on_release = False
                     elif self._engage_sequence is not None:
                         # The grip-edge pose must pass IK before live output.
-                        if display['visualization'].get('source_sequence', -1) >= self._engage_sequence:
-                            self._enabled = aligned
-                            if aligned: self._processed = None
+                        if decision.get('source_seq', -1) >= self._engage_sequence:
+                            self._enabled = solved
+                            if solved: self._processed = None
                             self._engage_sequence = None
                 if self._enabled and self.motion._decision.get('state') in ('hold', 'error'):
                     self._hold(self.motion._decision.get('reason') or 'ik_unavailable', grip=True)
                 if not self._enabled:
-                    self._state, self._reason = 'ready', 'align_then_regrip'
+                    self._state, self._reason = 'ready', 'regrip_required'
                     if key != self._processed and self._engage_sequence in (None, frame['sequence']):
                         self._submit(frame, preview=True)
                     return
@@ -456,7 +543,7 @@ class TeleopControl:
         # still opening its SDK channel and a cold begin not yet prepared.
         self.executor.cancel_preparation()
         state = self.executor.status()
-        if not state['ownership_held'] and not self.executor.opening:
+        if not state['ownership_held'] and not self.executor.opening and not self._reset_operation:
             result = {'state': 'idle', 'authority_released': True, 'return_required': False}
         else:
             result = self.executor.dispatch('stop', {})
@@ -492,6 +579,7 @@ class TeleopControl:
     def stop(self):
         with self._lock:
             self.trajectory.stop()
+            self._buttons.clear()
             self._generation += 1
             self._enabled = self._ready_on_release = False
             self._engage_sequence = None

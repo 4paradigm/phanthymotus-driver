@@ -116,7 +116,7 @@ def test_g1_feedback_passes_current_pico_consumer(tmp_path):
     assert card.feedback()['alignment']['state'] == 'unavailable'
 
 
-def test_grip_edge_movement_must_pass_its_own_alignment(tmp_path):
+def test_alignment_error_does_not_block_successful_ik(tmp_path):
     card, motion, outputs, feed = rig(tmp_path)
     feed(1); feed(2)
     good_render = motion.solver.render
@@ -127,9 +127,5 @@ def test_grip_edge_movement_must_pass_its_own_alignment(tmp_path):
         return result
     motion.solver.render = moved
     feed(3, True)
-    assert not card._enabled and not outputs
-    motion.solver.render = good_render
-    feed(4, True); feed(5, True)
-    assert not card._enabled and not outputs
-    feed(6); feed(7, True)
     assert card._enabled and len(outputs) == 1
+    assert card.display_feedback()['alignment']['left']['position_error_m'] == .1

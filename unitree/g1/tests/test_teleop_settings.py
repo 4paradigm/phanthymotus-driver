@@ -58,26 +58,6 @@ def test_canvas_input_accepts_new_source_and_preserves_generation_checks(tmp_pat
         card.receive({'kind':'operation','action':'begin'})
 
 
-def test_canvas_session_prepares_only_after_both_grips_released(tmp_path):
-    card, frame = input_card(tmp_path)
-    calls=[]
-    def begin(generation, action):
-        calls.append(action)
-        card._operator='session'
-    card._begin=begin
-    frame['left']['grip']=frame['right']['grip']=1.
-    card.receive(frame);card.step()
-    assert calls == [] and card._reason == 'release_grips_before_enable'
-    frame['sequence']=2;frame['left']['grip']=frame['right']['grip']=0.
-    card.receive(frame);card.step()
-    assert calls == ['begin']
-    card._hold=lambda *a,**k:None
-    card._submit=lambda *a,**k:None
-    card.step()
-    assert calls == ['begin']
-    # A real tracking-space reset requires neutral input before another baseline.
-    card._needs_calibration=True;card.step()
-    assert calls == ['begin','calibrate']
 
 
 def test_monitor_summary_has_execution_state_and_escapes_html(tmp_path):
