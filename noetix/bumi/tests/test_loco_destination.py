@@ -198,6 +198,20 @@ def test_rotate_timeout_stops_and_reports_turned_degrees(monkeypatch):
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
 
 
+def test_rotate_timeout_on_full_turn_reports_full_shortfall(monkeypatch):
+    # final_error_deg（I1）必须报“请求还欠多少角”：360° 请求超时且完全没转时，
+    # wrap180(target−end) 会把 360° 折叠成 0.0（谎报已对准）；修复后如实报 ≈360。
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setattr(module, '_rotate_timeout_s', lambda a: 0.05)
+    fake = FakeHighCtrl(gain_deg_per_tick=0.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    assert result['state'] == 'timeout'
+    assert abs(result['turned_deg']) < 1e-6              # 植物没动
+    assert abs(result['final_error_deg'] - 360.0) < 1e-6  # 欠整整一圈，如实报 360（而非 0）
+    assert fake.cmds[-1] == (0, 0, 0)                     # 退出必零速
+
+
 def test_stop_move_interrupts_running_rotate(monkeypatch):
     # rotate 在工作线程里跑（150° / 小 gain 转不完），主线程 30ms 后下发 stop_move：
     # rotate 必须经 _move_stop_event 以 stopped 收尾，且末帧零速。
@@ -270,6 +284,76 @@ def test_rotate_stops_a_running_loco_move(monkeypatch):
             assert cmd[0] == 0, f"move 指令流混入 rotate 之后: {cmd}"
     assert rotate_started
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
+
+
+def test_concurrent_move_is_refused_while_rotate_runs(monkeypatch):
+    # busy-guard（T2-2）：rotate 运行中（跑在 dispatch 线程，非 _move_thread）并发
+    # 下发 loco move 必须被拒绝且错误点名冲突——否则 move 前导 set→join(None)→clear
+    # 会擦掉 rotate 待读的 stop 信号，move 帧还会与 rotate 帧交错。stop 不受限。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=1.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    box = {}
+
+    def _run():
+        box['result'] = plugin.dispatch(
+            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
+        time.sleep(0.01)
+    assert any(c[2] != 0 for c in fake.cmds)         # rotate 已在发转速帧
+
+    refused = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 3})
+    assert refused['state'] == 'error'
+    assert 'rotate in progress' in refused['error']  # 错误点名 rotate 冲突
+    assert plugin._move_thread is None               # 拒绝发生在起 move 线程之前
+    assert not any(c[0] != 0 or c[1] != 0 for c in fake.cmds)  # 无 move 帧混入
+    status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+    assert status['state'] == 'running'              # 拒 move 不得动 rotate 状态
+
+    stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert stopped == {'state': 'stopped'}           # busy-guard 不拦 stop_move
+    assert box['result']['state'] == 'stopped'
+    assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
+
+
+def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
+    # busy-guard（T4-3）：rotate 运行中重入第二个 rotate 必须被拒绝——否则第二个
+    # 前导的 clear() 会擦掉第一个 rotate 待读的 stop 信号（显式 stop 被静默吞掉）。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=1.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    box = {}
+
+    def _run():
+        box['result'] = plugin.dispatch(
+            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
+        time.sleep(0.01)
+    assert any(c[2] != 0 for c in fake.cmds)         # rotate 已在发转速帧
+
+    refused = plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    assert refused['state'] == 'error'
+    assert 'rotate in progress' in refused['error']  # 错误点名 rotate 冲突
+    status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+    assert status['state'] == 'running'              # 重入拒绝不得清掉 running
+
+    stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert stopped == {'state': 'stopped'}           # stop 信号未被重入擦掉
+    assert box['result']['state'] == 'stopped'
+    assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
 
 
 def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):

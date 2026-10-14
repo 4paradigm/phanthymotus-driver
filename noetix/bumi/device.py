@@ -570,6 +570,20 @@ class LocoPlugin:
             self._last_cmd_time = time.monotonic()
 
     def _do_move(self, args: dict) -> dict:
+        # Busy-guard (C1): a running loco_destination rotate lives on this
+        # dispatch thread, not _move_thread, so the set→join→clear preamble
+        # below would join nothing and its clear() could wipe a pending stop
+        # meant for that rotate. Refuse while a rotate runs; stop_move never
+        # routes through here, so stopping always works.
+        with self._rotate_lock:
+            if self._rotate_state["state"] == "running":
+                return {
+                    "state": "error",
+                    "error": (
+                        "loco_destination rotate in progress; wait for it to "
+                        "finish or call stop_move first"
+                    ),
+                }
         # Check if in walking mode
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
@@ -635,7 +649,21 @@ class LocoPlugin:
         # Bookkeeping wrapper: mark running on entry; on every completed path
         # (done/timeout/stopped/error) record idle + the full result so
         # _rotate_status can report the last real outcome.
+        # Busy-guard (C1): atomic check-and-set so a re-entrant rotate (from
+        # any thread) is refused before it can run a second mutex preamble
+        # whose clear() would wipe the active rotate's pending stop signal.
+        # The guard lives here, before the "running" mark, because inside
+        # _do_rotate_impl the state already reads "running" for this very
+        # caller — an impl-level check would refuse the active rotate itself.
         with self._rotate_lock:
+            if self._rotate_state["state"] == "running":
+                return {
+                    "state": "error",
+                    "error": (
+                        "loco_destination rotate in progress; wait for it to "
+                        "finish or call stop_move first"
+                    ),
+                }
             self._rotate_state["state"] = "running"
         result = None
         try:
@@ -659,6 +687,8 @@ class LocoPlugin:
             return {"state": "error",
                     "error": (f"angle_deg must be a finite number within "
                               f"±{_ROTATE_ANGLE_LIMIT_DEG:g} degrees, got {angle_deg}")}
+        # 0° is a deliberate no-op: it succeeds in any workmode and returns
+        # before the mutex preamble, so it never cancels a running move.
         if abs(angle_deg) < 0.05:  # zero-turn: instant done, no motion commanded
             yaw = _yaw_deg_from_quat(self._high_ctrl.get_imu_data().ori)
             return {"state": "done", "requested_angle_deg": angle_deg,
@@ -688,7 +718,6 @@ class LocoPlugin:
 
         default_cmd = _get_default_cmd()
         start_yaw = _yaw_deg_from_quat(self._high_ctrl.get_imu_data().ori)
-        target = start_yaw + angle_deg  # not taken modulo: preserves whole-turn count
         start_time = time.monotonic()
         # Timeout budget covers the whole request, every segment included.
         deadline = start_time + _rotate_timeout_s(angle_deg)
@@ -754,14 +783,18 @@ class LocoPlugin:
             # Every exit path — including exceptions — brakes to zero velocity.
             self._publish_cmd(0, 0, 0, default_cmd, 0)
 
-        # 5. Report actual motion: per-frame yaw deltas, wrapped error at the end.
+        # 5. Report actual motion: per-frame yaw deltas, plus the unwrapped
+        # shortfall/overshoot of the REQUEST (angle_deg - turned_deg): positive
+        # = less turned than asked, negative = overshot. A wrap180 residual
+        # would fold a 360° shortfall to 0 and multi-wrap residuals to the
+        # wrong sign, so early exits (timeout/stopped) must not use it.
         return {
             "state": result_state,
             "requested_angle_deg": angle_deg,
             "start_yaw_deg": start_yaw,
             "end_yaw_deg": end_yaw,
             "turned_deg": turned_deg,
-            "final_error_deg": _wrap180(target - end_yaw),
+            "final_error_deg": angle_deg - turned_deg,
             "elapsed_s": time.monotonic() - start_time,
             "tolerance_deg": _ROTATE_TOL_DEG,
         }
