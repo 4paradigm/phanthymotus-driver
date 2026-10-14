@@ -27,9 +27,6 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
-- `gripper`: two-finger position control from 1 (closed) to 1000 (fully open),
-  with measured-position feedback and configurable keep/rollback behavior when
-  an object prevents the requested position.
 - `abs_move`: `move` reads the current TCP as A and moves to
   the requested base-frame B using
   joint-space planning by default, with an explicit TCP-linear mode available.
@@ -37,36 +34,6 @@ Available tools are:
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
-
-## Two-finger gripper stall handling
-
-`gripper.set_position` samples the measured `actpos` before motion, submits the
-position command without blocking the SDK thread, and polls position, force,
-mode, and error feedback. A movement is considered stalled when its distance to
-the target has not improved by at least five position units for
-`stall_timeout_seconds` (default 3 seconds).
-
-Set `on_stall=keep` to leave the gripper at the controller-reported terminal
-position after an obstruction. It deliberately does not submit the sampled
-`actpos` as a second target: some controller/firmware combinations briefly
-report the old or minimum position while a command is in flight, and replaying
-that stale value can unexpectedly close the gripper. Moving modes 4 and 5 are
-treated as still active; mode 6 or the obstruction error bit is treated as a
-controller-terminal obstruction. Set `on_stall=rollback` to return to the
-measured position captured immediately before the request. A handled stall is a completed action with reason
-`motion_stalled_kept` or `motion_stalled_rolled_back`; the result includes the
-requested, start, blocked, and final positions plus current force, mode, error,
-elapsed time, and rollback outcome. `info` exposes the same terminal result as
-`last_completion` together with the latest sampled `gripper_state`. This is
-position-mode obstruction handling, not continuous force control.
-
-If an otherwise progressing command exceeds the 30-second overall motion
-window, keep continues observing the original command without replaying sampled
-feedback, while rollback gets a separate recovery window. The gripper and
-shared arm resource remain locked until a safe terminal state is confirmed. If
-that state cannot be verified, the locks remain held
-instead of advertising idle hardware while the controller may still be moving;
-operator inspection or a driver restart is then required.
 
 ## Upper-computer RealSense camera
 
@@ -229,10 +196,9 @@ joint/gripper/Cartesian completion callback fails with
 `AGENT_CORE_CA_CERT is required` while motion itself continues — verify the
 path before enabling the deployment.
 
-The immediate card result contains only `state` and `action_id`. Joint and
-Cartesian completion callbacks keep the standard status and a short reason;
-the gripper callback also includes its bounded position/force/stall result.
-Full final evidence is available from each card's `info` in `last_completion`. Its `callback` is
+The immediate card result contains only `state` and `action_id`. Completion
+callbacks keep the standard status and a short reason; full final joint evidence
+is available from `joint_control.info` in `last_completion`. Its `callback` is
 `accepted` only when Core acknowledges the same ID, or `failed` with an error.
 Acceptance confirms HTTP receipt, not pending-action matching or a visible UI
 trigger. No extra `/api/event` notifications are sent. This Driver cannot repair

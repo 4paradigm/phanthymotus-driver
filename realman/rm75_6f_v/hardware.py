@@ -118,8 +118,6 @@ class RM75SDKClient:
         with self._lock:
             if self._protected_owner is not None:
                 raise RuntimeError("Cannot disconnect SDK while an exclusive action owns it")
-            if self.motion_gate.locked():
-                raise RuntimeError("Cannot disconnect SDK while an arm operation is active")
             self.discard_trajectory_wait()
             robot, self._robot = self._robot, None
             self._handle = None
