@@ -20,6 +20,8 @@ plugins:
     motion_timeout_s: 8.0
     position_tolerance: 6
     poll_interval_s: 0.2
-    # Right-hand pose read before fist, and the official Modbus example's fist.
+    # Right-hand open pose measured on this hand; fist pose requested by user.
+    # Joint order: thumb root/sway, four finger roots, index/middle/ring sway,
+    # thumb roll. Values are 0..255 position units, not degrees.
     open_pose: [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
-    fist_pose: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    fist_pose: [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]

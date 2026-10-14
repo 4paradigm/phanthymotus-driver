@@ -15,7 +15,11 @@ the previous CAN draft; `main.py` now imports `modbus_device.py` instead.
 Configure `serial_port` and `side` in `config.yaml`. The driver never moves the
 hand on startup; only explicit MCP `hand` actions do. The right-hand default
 `open` pose is the pose read immediately before a successful physical fist/open
-test, and `close` is the official Modbus example's all-zero fist pose. Both
+test. The default `close` pose is the user's requested right-hand target:
+`[93,255,0,0,0,0,128,128,128,255]`. This new pose has not yet been verified
+on hardware. The official L20 Lite example maps slots 7–10 to index sway,
+middle sway, ring sway and thumb rotation; it has no separate pinky-sway slot.
+These are 0–255 position commands, not degrees. Both
 actions first read position, set speed/torque to the tested 60/100 values,
 command a halfway pose, then command and poll the final pose. They leave the
 configured torque enabled after success so the hand holds its position.
@@ -29,6 +33,29 @@ For local tests without hardware:
 python3 -m pytest tests/test_linkerhand_l20_lite_modbus.py -q
 ```
 
+With the powered right hand connected and clear of obstacles, run the optional
+full hardware acceptance check from this directory with the repository root on
+`PYTHONPATH`:
+
+```bash
+PYTHONPATH=../.. python3 hardware_acceptance.py --run
+```
+
+It checks state, speed/torque configuration, one-joint and full-pose writes,
+close/open and stop, then leaves the hand open with torque released. It does
+not test Docker, MCP HTTP or Agent Core registration.
+
 The container requires access to the USB serial device. Its Compose service
 already passes `/dev` into the privileged container. Do not run two hand
 controllers against the same port simultaneously.
+
+## Canvas card
+
+`driver.yaml` declares one actuator card, `hand`. Once the driver is deployed
+and registered, Agent Core discovers its `get_tool()` schema and the canvas
+renders the card automatically; no custom frontend component is required.
+The card title is **L20 Lite 灵巧手**. It offers `get_state`, `open`, `close`,
+`set_joint`, `set_positions`, `set_speed`, `set_torque` and `release`. The
+`set_positions` canvas field accepts ten comma-separated numbers in joint
+order; direct Python calls may still pass a ten-element list. `start` and
+`stop` are canvas lifecycle actions, with `stop` also releasing torque.

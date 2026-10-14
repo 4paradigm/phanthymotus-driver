@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import re
 
 from common.vendor_runtime import action_schema, tool
 from modbus_client import JOINT_COUNT, L20LiteModbusClient, _bytes
@@ -13,14 +14,25 @@ JOINT_NAMES = [
     "pinky_root", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
 ]
 
-# Captured from the connected RIGHT hand immediately before the successful
-# fist/open test. The official L20 Lite example also defines fist as ten zeros.
+# Open pose was captured from the connected RIGHT hand. The fist pose is the
+# user's requested target, not a hardware-verified reachable pose. Values are
+# 0..255 position units, not degrees; config.yaml can override either pose.
 RIGHT_OPEN_POSE = [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
-RIGHT_FIST_POSE = [0] * JOINT_COUNT
+RIGHT_FIST_POSE = [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
 
 
 def _named(values: list[int]) -> dict[str, int]:
     return dict(zip(JOINT_NAMES, values))
+
+
+def _positions_from_card(value) -> list[int]:
+    """Accept a 10-value list or the CSV text emitted by the canvas form."""
+    if isinstance(value, str):
+        parts = re.split(r"[\s,]+", value.strip())
+        if not parts or any(not re.fullmatch(r"\d+", part) for part in parts):
+            raise ValueError("positions must be 10 comma-separated integers in 0..255")
+        value = [int(part) for part in parts]
+    return _bytes(value)
 
 
 class L20LiteConnection:
@@ -80,29 +92,31 @@ class HandPlugin:
         return value
 
     def get_tool(self) -> dict:
-        return tool(
+        definition = tool(
             "hand", "actuator",
             "LinkerHand L20 Lite USB-RS485/Modbus 控制。动作会驱动真实机械手；执行前需获得用户确认。",
             action_schema(
                 {
                     "get_state": ([], "读取 10 个关节位置和速度"),
                     "open": ([], "展开到已验证的右手姿态"),
-                    "close": ([], "按官方示例握拳"),
+                    "close": ([], "握拳到用户指定的右手姿态（尚未实机验证）"),
                     "set_joint": (["joint", "position"], "设置单关节位置 0..255"),
-                    "set_positions": (["positions"], "设置完整的 10 关节位置"),
+                    "set_positions": (["positions"], "按关节顺序设置 10 个位置；画布输入逗号分隔值"),
                     "set_speed": (["speed"], "配置后续动作速度，不立即驱动"),
                     "set_torque": (["torque"], "配置后续动作力矩，不立即驱动"),
-                    "stop": ([], "将所有关节力矩设为 0"),
+                    "release": ([], "立即将所有关节力矩设为 0"),
                 },
                 {
                     "joint": {"type": "string", "enum": JOINT_NAMES},
                     "position": {"type": "integer", "minimum": 0, "maximum": 255},
-                    "positions": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 10, "maxItems": 10},
+                    "positions": {"type": "string", "description": "10 个位置，逗号分隔，如 254,254,234,254,254,254,127,126,127,254"},
                     "speed": {"type": "integer", "minimum": 1, "maximum": 255},
                     "torque": {"type": "integer", "minimum": 1, "maximum": 255},
                 },
             ),
         )
+        definition["title"] = "L20 Lite 灵巧手"
+        return definition
 
     def start(self) -> None:
         pass
@@ -165,6 +179,13 @@ class HandPlugin:
         if action == "start":
             # Canvas lifecycle marker; opening a card must not move the hand.
             return {"state": "ready"}
+        if action == "info":
+            return {
+                "description": f"L20 Lite {self.connection.side} USB-RS485/Modbus 控制卡片",
+                "side": self.connection.side,
+                "serial_port": self.connection.port,
+                "joint_names": JOINT_NAMES,
+            }
         if action == "get_state":
             with self._motion_lock:
                 client = self.connection.get()
@@ -196,7 +217,7 @@ class HandPlugin:
                 target[JOINT_NAMES.index(joint)] = value
                 return self._move(target, "set_joint")
         if action == "set_positions":
-            return self._move(_bytes(args.get("positions")), "set_positions")
+            return self._move(_positions_from_card(args.get("positions")), "set_positions")
         if action == "set_speed":
             speed = self._setting(args.get("speed"), "speed")
             with self._motion_lock:
@@ -207,16 +228,16 @@ class HandPlugin:
             with self._motion_lock:
                 self.motion_torque = torque
             return {"state": "configured", "torque": torque, "applied": False}
-        if action == "stop":
+        if action in ("stop", "release"):
             self._stop_requested.set()
             with self._motion_lock:
                 # Canvas stop may arrive before the serial device was ever used.
                 client = self.connection._client
                 if client is None:
-                    return {"state": "idle", "torque_released": True}
+                    return {"state": "idle" if action == "stop" else "released", "torque_released": True}
                 client.set_torques([0] * JOINT_COUNT)
                 positions = client.get_positions()
-            return {"state": "idle", "positions": _named(positions), "torque_released": True}
+            return {"state": "idle" if action == "stop" else "released", "positions": _named(positions), "torque_released": True}
         return None
 
 

@@ -13,7 +13,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DRIVER))
 
 from modbus_client import L20LiteModbusClient, crc16
-from modbus_device import HandPlugin, RIGHT_OPEN_POSE
+from modbus_device import HandPlugin, JOINT_NAMES, RIGHT_FIST_POSE, RIGHT_OPEN_POSE
+from common.vendor_runtime import DriverBundle
 
 
 class FakeSerial:
@@ -120,6 +121,11 @@ class FakeConnection:
 
 
 def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
+    assert JOINT_NAMES == [
+        "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
+        "pinky_root", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
+    ]
+    assert RIGHT_FIST_POSE == [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
     connection = FakeConnection()
     plugin = HandPlugin(connection, {"poll_interval_s": 0.02})
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
@@ -129,7 +135,7 @@ def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
     assert connection.transport.sent == []
     closed = plugin.dispatch("close", {})
     assert closed["state"] == "completed"
-    assert connection.client.get_positions() == [0] * 10
+    assert connection.client.get_positions() == RIGHT_FIST_POSE
     opened = plugin.dispatch("open", {})
     assert opened["state"] == "completed"
     assert connection.client.get_positions() == RIGHT_OPEN_POSE
@@ -158,4 +164,33 @@ def test_canvas_stop_before_connection_does_not_open_serial():
     connection = FakeConnection()
     plugin = HandPlugin(connection, {})
     assert plugin.dispatch("stop", {}) == {"state": "idle", "torque_released": True}
+    assert connection.transport.sent == []
+
+
+def test_canvas_card_schema_and_csv_positions(monkeypatch):
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, {"poll_interval_s": 0.02})
+    card = plugin.get_tool()
+    actions = card["inputSchema"]["properties"]["action"]["enum"]
+    assert card["title"] == "L20 Lite 灵巧手"
+    assert card["type"] == "actuator"
+    assert "release" in actions and "set_positions" in actions
+    assert card["inputSchema"]["properties"]["positions"]["type"] == "string"
+    assert card["inputSchema"]["x-action-params"]["set_positions"]["params"] == ["positions"]
+    assert plugin.dispatch("info", {})["serial_port"] == "/dev/fake"
+    monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
+    pose = [254, 254, 234, 254, 254, 254, 127, 126, 127, 254]
+    result = plugin.dispatch("set_positions", {"positions": ",".join(map(str, pose))})
+    assert result["state"] == "completed"
+    assert connection.client.get_positions() == pose
+    assert plugin.dispatch("release", {})["state"] == "released"
+    with pytest.raises(ValueError, match="expected 10"):
+        plugin.dispatch("set_positions", {"positions": "1,2,3"})
+
+
+def test_mcp_bundle_discovers_hand_card_without_opening_serial():
+    connection = FakeConnection()
+    bundle = DriverBundle([HandPlugin(connection, {})])
+    assert bundle.get_all_tools()[0]["name"] == "hand"
+    assert bundle.dispatch("hand", {"action": "start"}) == {"state": "ready"}
     assert connection.transport.sent == []
