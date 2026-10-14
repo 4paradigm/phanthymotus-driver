@@ -729,7 +729,6 @@ class A3Nodes:
             self._pb = {
                 "bms": hal_bms_channel_pb2.BmsStateChannel,
                 "estop": hal_state_channel_pb2.EmergencyStateChannel,
-                "processed_audio": agent_data_pb2.ProcessedAudioOutput,
                 "skill": getattr(skill_pilot_channel_pb2, "SkillPilotStatus", None),
                 "commands": {
                     "MotionControlLocomotionVelocityChannel":
