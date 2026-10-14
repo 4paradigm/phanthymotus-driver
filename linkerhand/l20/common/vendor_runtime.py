@@ -202,7 +202,7 @@ class DriverBundle:
 def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, driver_id: str):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
-            msg = fmt % args
+            msg = (fmt % args).encode("unicode_escape").decode("ascii")[:200]
             if '"POST /mcp' not in msg or "200" not in msg:
                 print(f"[mcp] {self.address_string()} {msg}")
 
@@ -293,16 +293,17 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
         "category": "driver",
         "render_hint": "data/json",
     }).encode()
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
+    ca_file = os.environ.get("AGENT_CORE_CA")
+    context = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
 
     def loop():
         while True:
             try:
                 request = urllib.request.Request(f"{url}/api/mcp", data=payload, headers={"Content-Type": "application/json"}, method="POST")
-                with urllib.request.urlopen(request, timeout=3, context=context):
-                    pass
+                with urllib.request.urlopen(request, timeout=3, context=context) as response:
+                    result = json.load(response)
+                    if response.status != 200 or result.get("code") != 200:
+                        raise RuntimeError("Agent Core rejected driver registration")
                 time.sleep(30)
             except Exception as exc:
                 print(f"[register] failed: {exc}; retrying in 5s", flush=True)
@@ -339,7 +340,7 @@ def run_driver(
     bundle = DriverBundle(build_plugins(config, namespace, ros2))
     bundle.start_all()
     start_registration(port, config, driver_id)
-    server = ThreadingHTTPServer(("", port), make_handler(lambda: bundle, server_name, driver_id))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(lambda: bundle, server_name, driver_id))
     stopping = threading.Event()
 
     def shutdown(signum, _frame):

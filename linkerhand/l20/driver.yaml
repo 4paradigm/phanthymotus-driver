@@ -6,6 +6,6 @@ hardware_model: "l20"
 image_name: linkerhand-l20
 port: 15710
 mcp_url: "http://localhost:15710/mcp"
-description: "灵心巧手 L20 灵巧手 — 多关节控制、预设手势、状态遥测"
+description: "灵心巧手 L20 open/close control over SocketCAN"
 cards:
   - { name: hand, type: actuator }

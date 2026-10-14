@@ -5,6 +5,7 @@ linkerhand-l20:
   privileged: true
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data/certs/cert.pem:/isolation/cert.pem:ro
     - /dev:/dev
     - /run/udev:/run/udev:ro
   environment:
@@ -13,6 +14,7 @@ linkerhand-l20:
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
     - AGENT_CORE_URL=https://127.0.0.1:15678
+    - AGENT_CORE_CA=/isolation/cert.pem
   logging:
     driver: local
     options:
