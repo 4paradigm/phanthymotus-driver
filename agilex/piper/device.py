@@ -230,7 +230,9 @@ class PiperPlugin(PiperRuntime):
 def build_plugins(config, namespace, ros2):
     if "arms" in config:
         from agilex.piper.dual import DualPiperPlugin
-        return [DualPiperPlugin(config, namespace, ros2)]
+        from agilex.piper.teaching import teaching_plugin
+        paired = DualPiperPlugin(config, namespace, ros2)
+        return [paired, teaching_plugin(paired, config)]
     from agilex.piper.arm_control import ArmControlPlugin
     from agilex.piper.monitor_bundle import add_monitor
     from agilex.piper.status_card import split_status_card

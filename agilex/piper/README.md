@@ -31,6 +31,8 @@ Docker 打包新增 `arm_control.py`，沿用原 ROS 与固定 SDK 依赖，不�
 
 ## 双臂 VR 遥操与轨迹回放
 
+双臂模式还提供网页示教扩展 `piper_teaching`：在 Phanthymotus 的「技能管理 → 示教新技能」中录制、试运行并保存本机技能。设置和验收步骤见 [网页示教扩展](../../common/teaching/README.md)。
+
 默认单臂配置注册 `arm_control`、`piper_photo`、`piper_status`、`model` 和 `piper_camera_live`；控制许可与确认差异见部署兼容记录。配置 `arms.left` 和 `arms.right` 后，同一 Driver
 管理两路独立 SocketCAN，使用原有十卡片并增加 `piper_teleop` 和 `piper_motion` 两张卡片。
 切换双臂配置前，必须停用原来分别占用这两路 CAN 的单臂实例；不能并行抢占同一设备。

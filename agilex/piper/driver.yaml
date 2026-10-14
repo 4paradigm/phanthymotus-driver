@@ -26,3 +26,4 @@ cards:
   - { name: piper_stop, type: actuator }
   - { name: piper_teleop, type: actuator }
   - { name: piper_motion, type: actuator }
+  - { name: piper_teaching, type: actuator }
