@@ -2497,9 +2497,65 @@ class MirrorStreamTests(unittest.TestCase):
         self._callback("/motion/control/hand_joint_state")(msg)
         payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
         by_name = {joint["name"]: joint["q"] for joint in payload["joints"]}
-        self.assertIn("left_thumb_roration_0", by_name)
-        self.assertIn("left_pinky_bent_1", by_name)
-        self.assertAlmostEqual(by_name["left_thumb_wiggles_1"], math.pi / 16)
+        self.assertAlmostEqual(by_name["L_thumb_roll_joint"],
+                               device.HAND_JOINT_LIMITS["L_thumb_roll_joint"][0])
+        low, high = device.HAND_JOINT_LIMITS["L_thumb_abad_joint"]
+        self.assertAlmostEqual(by_name["L_thumb_abad_joint"], low + (high - low) / 8)
+        self.assertIn("L_pinky_pip_joint", by_name)
+        self.assertAlmostEqual(by_name["L_index_dip_joint"],
+                               by_name["L_index_pip_joint"] * 1.097)
+        self.assertNotIn("left_thumb_roration_0", by_name)
+
+    def test_skeleton_uses_o10_model_and_mirrored_hand_limits(self):
+        model_indices = device._skeleton_joint_indices()
+        for name in ("L_thumb_roll_joint", "L_index_dip_joint",
+                     "R_thumb_roll_joint", "R_index_dip_joint"):
+            self.assertIn(name, model_indices)
+        urdf = self.nodes.urdf_text()
+        self.assertIn('name="L_thumb_roll_joint"', urdf)
+        self.assertIn('name="R_thumb_roll_joint"', urdf)
+        self.assertNotIn("left_hand_channel_", urdf)
+        self.assertIn('mimic joint="L_thumb_mcp_joint" multiplier="1.33"', urdf)
+
+    def test_skeleton_maps_right_o10_channels_with_official_signs(self):
+        msg = types.SimpleNamespace(
+            name=[f"right_hand_joint_{index}" for index in range(10)],
+            position=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            velocity=[0.0] * 10, effort=[0.0] * 10, frame_id="O10Hand")
+        self._callback("/motion/control/hand_joint_state")(msg)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        by_name = {joint["name"]: joint["q"] for joint in payload["joints"]}
+        self.assertAlmostEqual(by_name["R_thumb_roll_joint"],
+                               device.HAND_JOINT_LIMITS["R_thumb_roll_joint"][0])
+        self.assertAlmostEqual(by_name["R_thumb_mcp_joint"], 0.0)
+        self.assertAlmostEqual(by_name["R_ring_abad_joint"], 0.0)
+
+    def test_skeleton_splits_combined_generic_o10_channels_by_side(self):
+        msg = types.SimpleNamespace(
+            name=[f"hand_joint_{index}" for index in range(20)],
+            position=list(range(20)), velocity=[0.0] * 20,
+            effort=[0.0] * 20, frame_id="O10Hand")
+        self._callback("/motion/control/hand_joint_state")(msg)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        by_name = {joint["name"]: joint["q"] for joint in payload["joints"]}
+        left_low, left_high = device.HAND_JOINT_LIMITS["L_thumb_roll_joint"]
+        right_low, right_high = device.HAND_JOINT_LIMITS["R_thumb_roll_joint"]
+        self.assertAlmostEqual(by_name["L_thumb_roll_joint"], left_low)
+        self.assertAlmostEqual(by_name["R_thumb_roll_joint"],
+                               right_low + (right_high - right_low) * 10 / 4096)
+
+    def test_skeleton_maps_descriptive_firmware_hand_names(self):
+        msg = types.SimpleNamespace(
+            name=["left_index_bent_1", "left_thumb_roration_0"],
+            position=[2048, 4096], velocity=[0.0, 0.0],
+            effort=[0.0, 0.0], frame_id="O10Hand")
+        self._callback("/motion/control/hand_joint_state")(msg)
+        payload = json.loads(self.nodes._joint_skeleton_pub.published[-1].data)
+        by_name = {joint["name"]: joint["q"] for joint in payload["joints"]}
+        self.assertAlmostEqual(by_name["L_index_pip_joint"],
+                               device.HAND_JOINT_LIMITS["L_index_pip_joint"][1] / 2)
+        self.assertAlmostEqual(by_name["L_thumb_roll_joint"],
+                               device.HAND_JOINT_LIMITS["L_thumb_roll_joint"][1])
 
     def test_wrist_camera_cards_are_not_exposed_without_source_frames(self):
         config = json.loads(json.dumps(BASE_CONFIG))

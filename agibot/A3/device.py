@@ -214,21 +214,83 @@ HAND_COMMAND_MAX = 2000
 HAND_O10_MAX = 4096
 HAND_TYPES = {"AgiHand": "agi_hand", "O10Hand": "o10_hand"}
 
-# Indexed hand feedback is emitted by some A3 firmware builds instead of the
-# descriptive URDF names. Keep the channel order aligned with the hand URDF.
+# A3's O10Hand state is ten encoder channels per side. The channel order is
+# from the official A3/O10 URDF; position counts are mapped through each
+# calibrated joint's limits before entering the radian-valued skeleton.
 HAND_SKELETON_JOINTS = {
     "left": (
-        "left_thumb_roration_0", "left_thumb_wiggles_1", "left_thumb_bent_2",
-        "left_index_wiggles_0", "left_index_bent_1", "left_middle_bent",
-        "left_ring_wiggles_0", "left_ring_bent_1", "left_pinky_wiggles_0",
-        "left_pinky_bent_1",
+        "L_thumb_roll_joint", "L_thumb_abad_joint", "L_thumb_mcp_joint",
+        "L_index_abad_joint", "L_index_pip_joint", "L_middle_pip_joint",
+        "L_ring_abad_joint", "L_ring_pip_joint", "L_pinky_abad_joint",
+        "L_pinky_pip_joint",
     ),
     "right": (
-        "right_thumb_roration_0", "right_thumb_wiggles_1", "right_thumb_bent_2",
-        "right_index_wiggles_0", "right_index_bent_1", "right_middle_bent",
-        "right_ring_wiggles_0", "right_ring_bent_1", "right_pinky_wiggles_0",
-        "right_pinky_bent_1",
+        "R_thumb_roll_joint", "R_thumb_abad_joint", "R_thumb_mcp_joint",
+        "R_index_abad_joint", "R_index_pip_joint", "R_middle_pip_joint",
+        "R_ring_abad_joint", "R_ring_pip_joint", "R_pinky_abad_joint",
+        "R_pinky_pip_joint",
     ),
+}
+HAND_STATE_COUNT_MAX = 4096
+HAND_JOINT_LIMITS = {
+    "L_thumb_roll_joint": (-1.1213740444063567, 0.029670597283903602),
+    "L_thumb_abad_joint": (-0.04537856055185257, 1.642354826126664),
+    "L_thumb_mcp_joint": (-0.8415977653116657, 0.0),
+    "L_index_abad_joint": (0.0, 0.16406094968746698),
+    "L_index_pip_joint": (0.0, 1.4835298641951802),
+    "L_middle_pip_joint": (0.0, 1.4835298641951802),
+    "L_ring_abad_joint": (-0.16929693744344995, 0.0),
+    "L_ring_pip_joint": (0.0, 1.4835298641951802),
+    "L_pinky_abad_joint": (-0.1850049007113989, 0.0),
+    "L_pinky_pip_joint": (0.0, 1.4835298641951802),
+    "R_thumb_roll_joint": (-0.029670597283903602, 1.1213740444063567),
+    "R_thumb_abad_joint": (-1.642354826126664, 0.04537856055185257),
+    "R_thumb_mcp_joint": (0.0, 0.8415977653116657),
+    "R_index_abad_joint": (-0.16406094968746698, 0.0),
+    "R_index_pip_joint": (0.0, 1.4835298641951802),
+    "R_middle_pip_joint": (0.0, 1.4835298641951802),
+    "R_ring_abad_joint": (0.0, 0.16929693744344995),
+    "R_ring_pip_joint": (0.0, 1.4835298641951802),
+    "R_pinky_abad_joint": (0.0, 0.1850049007113989),
+    "R_pinky_pip_joint": (0.0, 1.4835298641951802),
+}
+HAND_MIMIC_JOINTS = {
+    "L_thumb_pip_joint": ("L_thumb_mcp_joint", 1.33),
+    "L_thumb_dip_joint": ("L_thumb_mcp_joint", 1.3),
+    "L_index_dip_joint": ("L_index_pip_joint", 1.097),
+    "L_middle_dip_joint": ("L_middle_pip_joint", 1.097),
+    "L_ring_dip_joint": ("L_ring_pip_joint", 1.097),
+    "L_pinky_dip_joint": ("L_pinky_pip_joint", 1.097),
+    "R_thumb_pip_joint": ("R_thumb_mcp_joint", 1.33),
+    "R_thumb_dip_joint": ("R_thumb_mcp_joint", 1.3),
+    "R_index_dip_joint": ("R_index_pip_joint", 1.097),
+    "R_middle_dip_joint": ("R_middle_pip_joint", 1.097),
+    "R_ring_dip_joint": ("R_ring_pip_joint", 1.097),
+    "R_pinky_dip_joint": ("R_pinky_pip_joint", 1.097),
+}
+HAND_JOINT_ALIASES = {
+    "left_thumb_roration_0": "L_thumb_roll_joint",
+    "left_thumb_rotation_0": "L_thumb_roll_joint",
+    "left_thumb_wiggles_1": "L_thumb_abad_joint",
+    "left_thumb_bent_2": "L_thumb_mcp_joint",
+    "left_index_wiggles_0": "L_index_abad_joint",
+    "left_index_bent_1": "L_index_pip_joint",
+    "left_middle_bent": "L_middle_pip_joint",
+    "left_ring_wiggles_0": "L_ring_abad_joint",
+    "left_ring_bent_1": "L_ring_pip_joint",
+    "left_pinky_wiggles_0": "L_pinky_abad_joint",
+    "left_pinky_bent_1": "L_pinky_pip_joint",
+    "right_thumb_roration_0": "R_thumb_roll_joint",
+    "right_thumb_rotation_0": "R_thumb_roll_joint",
+    "right_thumb_wiggles_1": "R_thumb_abad_joint",
+    "right_thumb_bent_2": "R_thumb_mcp_joint",
+    "right_index_wiggles_0": "R_index_abad_joint",
+    "right_index_bent_1": "R_index_pip_joint",
+    "right_middle_bent": "R_middle_pip_joint",
+    "right_ring_wiggles_0": "R_ring_abad_joint",
+    "right_ring_bent_1": "R_ring_pip_joint",
+    "right_pinky_wiggles_0": "R_pinky_abad_joint",
+    "right_pinky_bent_1": "R_pinky_pip_joint",
 }
 
 # Mic source (docs §7.3.5): 0=internal (v3.2 has a known hardware BUG — avoid),
@@ -294,6 +356,31 @@ CAMERA_TOPICS = {
 RESOURCE_DIR = Path(__file__).with_name("resource")
 
 
+def _a3_urdf_root():
+    """Load the A3 model with the calibrated O10 hand kinematics attached."""
+    root = ET.parse(RESOURCE_DIR / "a3_ultra.urdf").getroot()
+    for element in list(root):
+        name = element.get("name", "")
+        if element.tag == "link" and (
+                "_hand_channel_" in name or name in {
+                    "left_thumb_tip", "left_index_tip", "left_middle_tip",
+                    "left_ring_tip", "left_pinky_tip", "right_thumb_tip",
+                    "right_index_tip", "right_middle_tip", "right_ring_tip",
+                    "right_pinky_tip"}):
+            root.remove(element)
+        elif element.tag == "joint":
+            parent = element.find("parent")
+            child = element.find("child")
+            names = (parent.get("link", "") if parent is not None else "",
+                     child.get("link", "") if child is not None else "")
+            if (any("_hand_channel_" in link for link in names)
+                    or name.endswith("_tip_fixed")):
+                root.remove(element)
+    hand = ET.parse(RESOURCE_DIR / "a3_o10_hand.urdf").getroot()
+    root.extend(list(hand))
+    return root
+
+
 def _skeleton_joint_indices() -> dict[str, int]:
     """Return stable indices for the A3 URDF's kinematic joints.
 
@@ -301,9 +388,8 @@ def _skeleton_joint_indices() -> dict[str, int]:
     some JointState groups.  Those must not be assigned arbitrary stream-order
     indices: the canvas uses ``idx`` to look up the URDF joint transform.
     """
-    path = RESOURCE_DIR / "a3_ultra.urdf"
     try:
-        root = ET.parse(path).getroot()
+        root = _a3_urdf_root()
     except (OSError, ET.ParseError):
         return {}
     # Keep the original URDF element index.  The canvas model indexes joints
@@ -1359,6 +1445,16 @@ class A3Nodes:
             efforts = group.get("effort", []) if isinstance(group, dict) else []
             aliases = group_aliases.get(group_key, [])
             hand_side_counts = {"left": 0, "right": 0}
+            hand_values = {}
+            hand_names = [str(item).lower() for item in names]
+            # Some AimDK builds publish one 20-channel JointState for both
+            # O10 hands with generic names (hand_joint_0..19). Infer the side
+            # from the documented left-then-right channel layout in that
+            # case; named per-side channels still take precedence below.
+            combined_hand_channels = (
+                group_key == "hand_state" and len(names) >= 20 and
+                not any(name.startswith(("left", "right", "l_", "r_"))
+                        for name in hand_names))
             for index, name in enumerate(names):
                 # AimDK firmware revisions have emitted generic channel names
                 # (for example arm_joint_0) while preserving the documented
@@ -1366,32 +1462,52 @@ class A3Nodes:
                 # usable; exact URDF names remain preferred.
                 canonical = name if name in model_indices else (
                     aliases[index] if index < len(aliases) else name)
-                if group_key == "hand_state" and canonical not in model_indices:
+                if group_key == "hand_state":
                     text_name = str(name).lower()
+                    if text_name in HAND_JOINT_ALIASES:
+                        canonical = HAND_JOINT_ALIASES[text_name]
                     side = ("left" if text_name.startswith("left") else
-                            "right" if text_name.startswith("right") else None)
-                    if side is not None and "hand" in text_name:
-                        channel = hand_side_counts[side]
-                        hand_side_counts[side] += 1
+                            "right" if text_name.startswith("right") else
+                            "left" if text_name.startswith("l_") else
+                            "right" if text_name.startswith("r_") else None)
+                    if side is None and combined_hand_channels:
+                        side = "left" if index < 10 else "right"
+                    if canonical not in HAND_JOINT_LIMITS and side is not None:
+                        channel = (index % 10 if combined_hand_channels
+                                   else hand_side_counts[side])
+                        if not combined_hand_channels:
+                            hand_side_counts[side] += 1
                         if channel < len(HAND_SKELETON_JOINTS[side]):
                             canonical = HAND_SKELETON_JOINTS[side][channel]
+                    if canonical not in HAND_JOINT_LIMITS:
+                        continue
                 # Only actuated joints that exist in the model belong in the
                 # skeleton stream. Unknown metadata/fixed sensor joints remain
                 # available in joint_state's raw JSON stream.
                 if canonical not in model_indices:
                     continue
                 position = positions[index] if index < len(positions) else 0.0
-                # O10Hand reports scalar counts (0..4096), while the
-                # skeleton renderer applies q as a revolute angle. Keep the
-                # abstract hand axes within a useful visual range instead of
-                # rotating thousands of radians.
+                velocity = velocities[index] if index < len(velocities) else 0.0
                 if group_key == "hand_state":
-                    position = float(position) / HAND_O10_MAX * (math.pi / 2)
+                    low, high = HAND_JOINT_LIMITS[canonical]
+                    count = min(HAND_STATE_COUNT_MAX, max(0.0, float(position)))
+                    scale = (high - low) / HAND_STATE_COUNT_MAX
+                    position = low + count * scale
+                    velocity = float(velocity) * scale
+                    hand_values[canonical] = (position, velocity)
                 joints.append({"idx": model_indices[canonical], "name": canonical,
                                "q": position,
-                               "dq": velocities[index] if index < len(velocities) else 0.0,
+                               "dq": velocity,
                                "tau": efforts[index] if index < len(efforts) else 0.0})
                 seen.add(canonical)
+            for mimic, (source, multiplier) in HAND_MIMIC_JOINTS.items():
+                if group_key != "hand_state" or source not in hand_values:
+                    continue
+                position, velocity = hand_values[source]
+                joints.append({"idx": model_indices[mimic], "name": mimic,
+                               "q": position * multiplier,
+                               "dq": velocity * multiplier, "tau": 0.0})
+                seen.add(mimic)
         output = self._String()
         imu_quat = _imu_quaternion(self.values.get("imu_pelvis") or {})
         output.data = json.dumps({"format": "sensor/skeleton", "available": bool(joints),
@@ -1471,10 +1587,8 @@ class A3Nodes:
         # The canvas skeleton contract needs the kinematic tree and limits,
         # not the vendor CAD package. Keep this compact model self-contained
         # so deployments do not carry dozens of megabytes of unused meshes.
-        path = RESOURCE_DIR / "a3_ultra.urdf"
-        if not path.exists():
+        if not (RESOURCE_DIR / "a3_ultra.urdf").exists():
             raise ValueError("no URDF vendored for A3 (placeholder resource)")
-        text = path.read_text(encoding="utf-8")
         # The compact vendor-neutral URDF intentionally omits CAD geometry,
         # but Three.js still needs link offsets to draw a visible skeleton.
         # Supply the measured A3 kinematic proportions at the driver boundary;
@@ -1507,15 +1621,12 @@ class A3Nodes:
             "right_knee_joint": (0, 0, -0.38), "right_ankle_pitch_joint": (0, 0, -0.38),
             "right_ankle_roll_joint": (0, 0, -0.08),
         }
-        try:
-            root = ET.fromstring(text)
-            for joint in root.findall("joint"):
-                origin = origins.get(joint.get("name"))
-                if origin is not None and joint.find("origin") is None:
-                    ET.SubElement(joint, "origin", xyz="%g %g %g" % origin, rpy="0 0 0")
-            return ET.tostring(root, encoding="unicode")
-        except ET.ParseError:
-            return text
+        root = _a3_urdf_root()
+        for joint in root.findall("joint"):
+            origin = origins.get(joint.get("name"))
+            if origin is not None and joint.find("origin") is None:
+                ET.SubElement(joint, "origin", xyz="%g %g %g" % origin, rpy="0 0 0")
+        return ET.tostring(root, encoding="unicode")
 
     def close(self):
         self.robot.destroy_node()

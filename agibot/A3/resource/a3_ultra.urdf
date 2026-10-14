@@ -592,8 +592,8 @@
       </geometry>
     </collision>
   </link>
-  <joint name="left_hand_palm_joint" type="fixed">
-    <origin xyz="0.08 0 0" rpy="0 0 0"/>
+  <joint name="left_hand_O10_joint" type="fixed">
+    <origin xyz="0.08 0 0" rpy="3.14 0 -1.57"/>
     <parent link="left_wrist_yaw_Link"/>
     <child link="left_hand_palm_Link"/>
   </joint>
@@ -822,8 +822,8 @@
       </geometry>
     </collision>
   </link>
-  <joint name="right_hand_palm_joint" type="fixed">
-    <origin xyz="0.08 0 0" rpy="0 0 0"/>
+  <joint name="right_hand_O10_joint" type="fixed">
+    <origin xyz="0.08 0 0" rpy="-3.14 0 1.5708"/>
     <parent link="right_wrist_yaw_Link"/>
     <child link="right_hand_palm_Link"/>
   </joint>
