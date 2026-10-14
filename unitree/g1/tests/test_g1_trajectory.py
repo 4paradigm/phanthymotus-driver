@@ -577,3 +577,21 @@ def test_final_reference_finishes_through_shared_slew_limiter(tmp_path):
         assert len(channel.positions) > 2
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+def test_replay_checks_position_after_waiting_for_frame():
+    replay = TrajectoryControl.__new__(TrajectoryControl)
+    measured = [0.] * 10
+    target = [.1] * 10
+    def wait(due):
+        measured[:] = [.03] * 10
+    def check(q, previous, requested):
+        assert q == [.03] * 10
+        assert requested == target
+        raise ValueError('checked_current_position')
+    replay._wait_until = wait
+    replay.motion = SimpleNamespace(
+        _fresh=lambda: ({'commanded_q': [0.] * 10}, list(measured)),
+        solver=SimpleNamespace(joint_envelope=check))
+    with pytest.raises(ValueError, match='checked_current_position'):
+        replay._send_frame({'target_q': target}, 1, 60_000_000)

@@ -165,9 +165,9 @@ class TrajectoryControl:
             self.cancel.wait(min(.02, remaining))
 
     def _send_frame(self, frame, seq, due):
+        self._wait_until(due)
         state, q = self.motion._fresh()
         proof = self.motion.solver.joint_envelope(q, state['commanded_q'], frame['target_q'])
-        self._wait_until(due)
         now = self.control.clock()
         command = envelope(self.motion._lease(), seq=seq, source_seq=frame['source_sequence'],
             mapping_epoch=frame['mapping_epoch'], generated_ns=now, valid_until_ns=now+100_000_000,
