@@ -292,6 +292,7 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
         "url": f"http://127.0.0.1:{port}/mcp",
         "transport": "http",
         "category": "driver",
+        "render_hint": "data/json",
     }).encode()
     context = ssl.create_default_context()
     context.check_hostname = False
