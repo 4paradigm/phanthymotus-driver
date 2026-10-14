@@ -760,7 +760,7 @@ class LocoServoPlugin:
             # The explicit card may change workmode immediately after this
             # returns. Clear the prior status before the next controller read.
             self._invalidate_mode_cache()
-        self._hold()
+            self._hold()
         print(f"[loco_servo] paused by an explicit command"
               f"{': ' + reason if reason else ''}", flush=True)
         return True
@@ -792,29 +792,44 @@ class LocoServoPlugin:
             self._sub_node = node
 
     def _on_message(self, message):
-        sink = self._sink
-        if sink is None or self._paused:
-            return
         try:
             command = json.loads(message.data)
-        except Exception:                                     # noqa: BLE001
-            return          # one bad frame must not take the stream down
+        except Exception:  # noqa: BLE001
+            return
+
         with self._lock:
-            resuming = self._activity.get("state") in ("holding", "stood_down")
-        outcome = self._submit(sink, command)
-        if outcome is not None and getattr(outcome, "verdict", None) is not None:
-            resumed = bool(getattr(outcome, "applied", False) and resuming)
-            event = "resumed" if resumed else "command"
-            if getattr(outcome, "applied", False):
-                self._set_activity("running", event,
-                                   "fresh valid command resumed motion" if resumed else
-                                   "valid command accepted")
-            self._last_command = {
-                "verdict": str(getattr(outcome.verdict, "name", outcome.verdict)),
-                "reason": getattr(outcome, "reason", ""),
-                "activity_event": event if getattr(outcome, "applied", False) else None,
-                "at": time.time(),
-            }
+            sink = self._sink
+            if sink is None or self._paused:
+                return
+
+            resuming = self._activity.get("state") in (
+                "holding", "stood_down"
+            )
+
+            outcome = self._submit(sink, command)
+
+            if outcome is not None and getattr(outcome, "verdict", None) is not None:
+                resumed = bool(getattr(outcome, "applied", False) and resuming)
+                event = "resumed" if resumed else "command"
+
+                if getattr(outcome, "applied", False):
+                    self._set_activity(
+                        "running",
+                        event,
+                        "fresh valid command resumed motion"
+                        if resumed else "valid command accepted",
+                    )
+
+                self._last_command = {
+                    "verdict": str(
+                        getattr(outcome.verdict, "name", outcome.verdict)
+                    ),
+                    "reason": getattr(outcome, "reason", ""),
+                    "activity_event": (
+                        event if getattr(outcome, "applied", False) else None
+                    ),
+                    "at": time.time(),
+                }
 
     def _invalidate_mode_cache(self):
         """Clear the displayed posture status after an explicit mode change.
@@ -860,35 +875,18 @@ class LocoServoPlugin:
             thread.join(timeout=1.0)
 
     def _repeat_loop(self):
-        """Re-send the standing target, and drive the watchdog off the same clock.
-
-        The watchdog lives here rather than on a ROS timer for the same reason
-        the repeat does: both have to keep running when the executor is busy,
-        and noticing that commands have *stopped* arriving is not something to
-        do on the thread that would also be blocked by whatever stopped them.
-
-        A failure to publish does not end the loop. The chassis is moving; the
-        one thing worse than an SDK that rejects commands is a robot travelling
-        with nothing left in the process trying to stop it.
-        """
+        """Refresh the target and watchdog, serialized with preemption."""
         period = 1.0 / REPEAT_HZ
         while not self._repeat_stop.is_set():
             with self._lock:
-                paused = self._paused
-                explicit_owner = self._explicit_velocity_owner
-                sink = self._sink
-                target = self._target
-            if paused:
-                # A pause is a safe zero-refresh state until an explicit
-                # velocity loop has actually taken ownership.  This matters on
-                # Bumi because publish_cmd is non-persistent.
-                if not explicit_owner and not self._dry_run:
-                    self._publish(*target)
-            else:
-                if sink is not None:
-                    self._tick_watchdog(sink)
-                if not self._dry_run:
-                    self._publish(*target)
+                if self._paused:
+                    if not self._explicit_velocity_owner and not self._dry_run:
+                        self._publish(0.0, 0.0, 0.0)
+                else:
+                    if self._sink is not None:
+                        self._tick_watchdog(self._sink)
+                    if not self._dry_run and not self._paused:
+                        self._publish(*self._target)
             self._repeat_stop.wait(period)
 
     def _set_activity(self, state: str, event: str, reason: str = ""):
@@ -961,56 +959,49 @@ class LocoServoPlugin:
     def _apply(self, values, _gripper=None):
         vx, vy, wz = float(values[0]), float(values[1]), float(values[5])
 
-        if self._rotate_only and (vx or vy):
-            if self._suppressed == 0:
-                print(f"[loco_servo] rotate_only: 抑制平移 vx={vx:+.3f} "
-                      f"vy={vy:+.3f}，只执行 vyaw={wz:+.3f}", flush=True)
-            self._suppressed += 1
-            vx = vy = 0.0
-
-        # `_on_message` performs the posture gate before `ControlSink.submit`.
-        # It must not live in this callback: returning here would still make the
-        # sink report APPLIED and reset its watchdog despite no motion.
-
-        self._refused = 0
-        self._applied += 1
-        target = self._calibration.to_normalised(vx, vy, wz)
         with self._lock:
+            if self._rotate_only and (vx or vy):
+                if self._suppressed == 0:
+                    print(
+                        f"[loco_servo] rotate_only: 抑制平移 vx={vx:+.3f} "
+                        f"vy={vy:+.3f}，只执行 vyaw={wz:+.3f}",
+                        flush=True,
+                    )
+                self._suppressed += 1
+                vx = vy = 0.0
+
+            self._refused = 0
+            self._applied += 1
+            target = self._calibration.to_normalised(vx, vy, wz)
             self._target = target
 
-        if self._dry_run:
-            # Only when the target changes. The metric values are the useful
-            # half — they are what the policy asked for — and the normalised
-            # ones are what would reach the SDK, so both are printed: this log
-            # is the whole point of `dry_run` on an unmeasured chassis.
-            if target != self._last_dry_run_target:
-                self._last_dry_run_target = target
-                print(f"[loco_servo] DRY RUN vx={vx:+.3f} m/s vy={vy:+.3f} m/s "
-                      f"wz={wz:+.3f} rad/s -> publish_cmd("
-                      f"{target[0]:+.3f}, {target[1]:+.3f}, {target[2]:+.3f})",
-                      flush=True)
-            return
+            if self._dry_run:
+                if target != self._last_dry_run_target:
+                    self._last_dry_run_target = target
+                    print(
+                        f"[loco_servo] DRY RUN vx={vx:+.3f} m/s "
+                        f"vy={vy:+.3f} m/s wz={wz:+.3f} rad/s "
+                        f"-> publish_cmd({target[0]:+.3f}, "
+                        f"{target[1]:+.3f}, {target[2]:+.3f})",
+                        flush=True,
+                    )
+                return
 
-        # Sent now rather than waiting up to 20 ms for the repeat thread's next
-        # turn: at `expected_hz` the policy's own period is 100 ms, so letting
-        # the repeat rate set the latency would add a fifth of it for nothing.
-        self._publish(*target)
+            self._publish(*target)
 
     def _hold(self, *_args):
-        """Watchdog, abort, pause, refusal and teardown all land here.
-
-        A chassis holds by being told to stop, **and told again** — which is the
-        one way this differs from every arm card in the repo, and from R1's
-        version of this file, where a single `StopMove` latches.
-        """
-        self._holds += 1
+        """Clear and publish zero atomically with the command path."""
         with self._lock:
+            self._holds += 1
             self._target = (0.0, 0.0, 0.0)
-        self._last_dry_run_target = None
-        if self._dry_run:
-            print("[loco_servo] DRY RUN hold: publish_cmd(0, 0, 0)", flush=True)
-            return
-        self._publish(0.0, 0.0, 0.0)
+            self._last_dry_run_target = None
+
+            if self._dry_run:
+                print("[loco_servo] DRY RUN hold: publish_cmd(0, 0, 0)",
+                      flush=True)
+                return
+
+            self._publish(0.0, 0.0, 0.0)
 
 
 def _default_cmd():

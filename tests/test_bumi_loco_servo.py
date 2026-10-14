@@ -646,3 +646,128 @@ def test_start_and_stop_are_not_offered_to_the_llm():
     stopped this card could not start it again."""
     params = _card().get_tool()["inputSchema"]["x-action-params"]
     assert set(params) == {"pause", "resume"}
+
+
+def test_explicit_pause_serializes_with_inflight_dds_command():
+    """Pause cannot return before an admitted DDS command finishes."""
+    import threading
+
+    loco = FakeLoco()
+    card = _card(loco=loco, full_scale_vx_mps=0.5)
+    card._running = True
+
+    real_sink = _sink(card)
+    entered = threading.Event()
+    release = threading.Event()
+    errors = []
+    pause_result = []
+
+    class BlockingSink:
+        def submit(self, command):
+            entered.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError("DDS callback was not released")
+            return real_sink.submit(command)
+
+    card._sink = BlockingSink()
+    message = SimpleNamespace(
+        data=json.dumps(_command([0.1, 0, 0, 0, 0, 0]))
+    )
+
+    def deliver():
+        try:
+            card._on_message(message)
+        except Exception as exc:
+            errors.append(exc)
+
+    def pause():
+        try:
+            pause_result.append(
+                card.pause_for_explicit_command("race test")
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    callback = threading.Thread(target=deliver)
+    pauser = threading.Thread(target=pause)
+
+    callback.start()
+    try:
+        assert entered.wait(timeout=2), "DDS callback did not enter submit"
+
+        pauser.start()
+        release.set()
+
+        callback.join(timeout=2)
+        pauser.join(timeout=2)
+
+        assert not callback.is_alive()
+        assert not pauser.is_alive()
+        assert not errors
+        assert pause_result == [True]
+        assert card._paused is True
+        assert card._target == (0.0, 0.0, 0.0)
+        assert loco.published[-1] == (0.0, 0.0, 0.0)
+    finally:
+        release.set()
+        callback.join(timeout=2)
+        if pauser.ident is not None:
+            pauser.join(timeout=2)
+
+
+def test_repeat_publish_cannot_outlive_explicit_pause():
+    """An in-flight repeat publish must finish before pause returns."""
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    pause_done = threading.Event()
+
+    class BlockingLoco(FakeLoco):
+        def publish_velocity(self, x, y, z):
+            if x != 0 and not entered.is_set():
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise TimeoutError("repeat publish not released")
+            super().publish_velocity(x, y, z)
+
+    loco = BlockingLoco()
+    card = _card(loco=loco)
+    card._running = True
+    card._target = (0.4, 0.0, 0.0)
+
+    card._start_repeat()
+    pauser = None
+
+    try:
+        assert entered.wait(timeout=2)
+
+        def pause():
+            card.pause_for_explicit_command("repeat race test")
+            pause_done.set()
+
+        pauser = threading.Thread(target=pause)
+        pauser.start()
+
+        release.set()
+
+        assert pause_done.wait(timeout=2)
+        pauser.join(timeout=2)
+
+        assert card._paused is True
+        assert card._target == (0.0, 0.0, 0.0)
+
+        after_pause = len(loco.published)
+        time.sleep(0.08)
+
+        assert all(
+            cmd == (0.0, 0.0, 0.0)
+            for cmd in loco.published[after_pause:]
+        )
+        assert loco.published[-1] == (0.0, 0.0, 0.0)
+
+    finally:
+        release.set()
+        if pauser is not None:
+            pauser.join(timeout=2)
+        card._stop_repeat()

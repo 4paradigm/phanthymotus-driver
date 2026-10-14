@@ -245,11 +245,6 @@ class StatePlugin:
         self._node = _BumiStateNode(namespace, high_ctrl)
         executor.add_node(self._node)
 
-    def _set_servo_velocity_owner(self, owned: bool) -> None:
-        """Transfer the shared velocity publisher after/before loco.move."""
-        if self._servo is not None:
-            self._servo.set_explicit_velocity_owner(owned)
-
     def get_tools(self) -> list:
         ns = self._namespace
         return [
@@ -1833,11 +1828,6 @@ class CameraPlugin:
             # consumer's own fallback is conservative and says so.
             print(f"[camera] camera_info for {tool_name} failed: {exc}", flush=True)
             return []
-
-    def _set_servo_velocity_owner(self, owned: bool) -> None:
-        """Transfer the shared velocity publisher after/before loco.move."""
-        if self._servo is not None:
-            self._servo.set_explicit_velocity_owner(owned)
 
     def get_tools(self) -> list:
         return [
