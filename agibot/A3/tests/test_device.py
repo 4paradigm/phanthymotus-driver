@@ -2598,13 +2598,16 @@ class MirrorStreamTests(unittest.TestCase):
 
         mounts = {
             "left": ("L_palm_joint", "left_hand_O10_joint",
-                     "1.5707963 0 0.0008",
-                     "-3.1415913 0.0015939 -1.57"),
+                     "-1.5707964 -0.0000025 0.0007927",
+                     "1.5707963 0 0.0008"),
             "right": ("R_palm_joint", "right_hand_O10_joint",
-                      "1.5707963 0 0.000004",
-                      "-0.0 -0.0015926 -1.5707926"),
+                      "-1.567611 -0.000000001 -3.1415893",
+                      "1.5707963 0 0.000004"),
         }
-        relative_correction = ((0, 0, 1), (-1, 0, 0), (0, -1, 0))
+        relative_corrections = {
+            "left": ((-1, 0, 0), (0, 1, 0), (0, 0, -1)),
+            "right": ((1, 0, 0), (0, -1, 0), (0, 0, -1)),
+        }
         for side, (name, wrist_joint, expected, previous) in mounts.items():
             origin = hand_root.find(f"joint[@name='{name}']/origin")
             self.assertEqual(origin.attrib["rpy"], expected)
@@ -2615,7 +2618,7 @@ class MirrorStreamTests(unittest.TestCase):
             relative_total = multiply(total, [list(row) for row in zip(*previous_total)])
             for row in range(3):
                 for col in range(3):
-                    self.assertAlmostEqual(relative_total[row][col], relative_correction[row][col],
+                    self.assertAlmostEqual(relative_total[row][col], relative_corrections[side][row][col],
                                            delta=0.003, msg=f"{side} relative correction {relative_total}")
 
     def test_battery_estop_republish_matches_1hz_state_cadence(self):
