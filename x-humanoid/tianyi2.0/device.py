@@ -4567,14 +4567,22 @@ class TtsPlugin:
         self._stop_client = None
         self._pause_client = None
         self._resume_client = None
-        # 取消信号：interrupt 时 set，通知 _speak_segments 线程停止
-        self._cancel_event: threading.Event | None = None
+        # 播放队列：speak 只入队，由单个 worker 顺序消费（见 _worker_loop）。
+        # 这里原先是一个 `self._cancel_event` 单槽位 + last-writer-wins 覆盖，
+        # 后果见 `_worker_loop` 上方那段注释。
+        import queue as _queue
+        self._jobs: "_queue.Queue[dict]" = _queue.Queue(maxsize=self._QUEUE_MAX)
+        self._queue_lock = threading.RLock()
+        self._worker: threading.Thread | None = None
+        self._current_job: dict | None = None
         # ACP: PlayEvent 订阅，用于判断播放真正完成
         self._play_event_sub = None
         self._play_progress_sub = None
         self._pending_play: dict[str, threading.Event] = {}  # sid → Event
         self._pending_play_status: dict[str, int] = {}  # sid → event_code
         self._pending_play_duration: dict[str, float] = {}  # sid → total duration (from progress)
+        self._pending_play_progress_at: dict[str, float] = {}  # sid → 最近一条推进的 progress 时刻
+        self._pending_play_position: dict[str, float] = {}  # sid → 最近一条 progress 的 position
         self._play_event_buffer: dict[str, int] = {}  # 缓存最近的 PlayEvent（防竞态）
 
     def get_tool(self) -> dict:
@@ -4841,10 +4849,21 @@ class TtsPlugin:
         sid = msg.sid
         duration = msg.duration
         if sid and duration > 0 and sid in self._pending_play:
-            # 只更新一次（取第一次收到的 duration）
+            import time as _t
+            position = float(getattr(msg, "position", 0.0) or 0.0)
             if sid not in self._pending_play_duration:
                 self._pending_play_duration[sid] = duration
                 print(f"[TtsPlugin] PlayProgress: sid={sid} duration={duration:.1f}s")
+            # 每一条推进了 position 的 progress 都要记时刻 —— 它是播放器的**存活
+            # 信号**，等待方靠它续期（见 _await_segment）。lyre 正常每 0.5s 一条。
+            #
+            # 原先只记第一条，截止时间一次算定为「首条 progress + duration + 余量」。
+            # 10-15 14:34 实测：lyre 播到 31.6/48.6s 卡死，position 在 32 秒墙钟里只
+            # 走了 0.5s，而我们要等整个 duration 走完才察觉 —— 声音早停了 32 秒。
+            prev = self._pending_play_position.get(sid)
+            if prev is None or position > prev + 0.01:
+                self._pending_play_position[sid] = position
+                self._pending_play_progress_at[sid] = _t.time()
 
     def stop(self):
         pass
@@ -4857,11 +4876,9 @@ class TtsPlugin:
                 return {"error": "text is required"}
             return self._speak(text, force)
         elif action == "interrupt":
-            # 先通知后台线程停止循环
-            ce = self._cancel_event
-            if ce:
-                ce.set()
-            return self._call_empty_service(self._stop_client, "interrupt")
+            # 打断 = 停当前 + 丢弃队列里还没播的。这是唯一会停 lyre 的入口；
+            # 普通 speak 一律排队，不再互相覆盖。
+            return self._interrupt_all("interrupt")
         elif action == "pause":
             return self._call_empty_service(self._pause_client, "pause")
         elif action == "resume":
@@ -4884,38 +4901,139 @@ class TtsPlugin:
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
+    # ── 播放队列 ───────────────────────────────────────────────────────────────
+    #
+    # 一个嘴只能有一个消费者。这里曾经是 last-writer-wins：每次 speak 都把上一条的
+    # cancel_event 置位，意思是"新的话盖掉旧的话"。两个后果，都在天轶 2026-10-15 的
+    # 展厅导览里实测到：
+    #
+    #   1. 自动播报（on_notify）在 LLM 的讲解发出后 16ms 到达，把讲解那条顶掉 →
+    #      驱动把它报成 cancelled → agent-core 的 ACP barrier 认为嘴空了 → 3 秒后
+    #      导航发车。而 lyre 那边把整段 269 字的讲解完整播完（47 秒），机器人全程
+    #      在走。也就是"还没播报完就走了"。
+    #   2. 盖掉的那一半本来想对 lyre 发 stop，但请求构造写的是
+    #      `type(client.srv_type.Request)()` —— 那是元类，调用它必抛 TypeError，又被
+    #      一个 bare except 吞掉。所以"停 lyre"从来没有发生过，症状才表现为"边走边
+    #      讲"而不是"话被掐断"。
+    #
+    # 而正确的语义本来就不是覆盖：只有 interrupt（用户打断）才该停当前的并丢掉剩下
+    # 的；LLM 的下一段讲解、自动播报都该**排队**，各自的 ACP 等自己那条真的播完。
+    # 所以这里改成单消费者队列，`_cancel_event` 那个单槽位整个去掉。
+    _QUEUE_MAX = 16
+
+    def _ensure_worker(self) -> None:
+        """懒启动播放线程。调用方必须持有 _queue_lock。"""
+        if self._worker and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True,
+                                        name="tianyi2-tts-queue")
+        self._worker.start()
+
+    def _worker_loop(self) -> None:
+        """顺序消费队列：一条播完（或失败/被打断）才取下一条。
+
+        每个 job 恰好回一次 ACP —— 回调放在这里而不是放在播放函数里，是为了让
+        "排队时就被 flush 掉"的 job 也有回执。少回一次，agent-core 那边的 pending
+        就永远挂着，barrier 会一直等到超时。
+        """
+        import queue as _queue
+        while True:
+            try:
+                job = self._jobs.get(timeout=5.0)
+            except _queue.Empty:
+                # 空闲就退出，下一次 speak 会再拉起来。常驻一个空转线程没有意义。
+                with self._queue_lock:
+                    if self._jobs.empty():
+                        self._worker = None
+                        return
+                continue
+            status = "cancelled"
+            try:
+                self._current_job = job
+                if job["cancel"].is_set():
+                    print(f"[TtsPlugin] job {job['action_id']} 在排队期间被取消，不播")
+                else:
+                    status = self._play_job(job)
+            except Exception as e:
+                status = "error"
+                print(f"[TtsPlugin] job {job['action_id']} 异常: {e}", flush=True)
+            finally:
+                self._current_job = None
+                self._acp_callback(job, status)
+
+    def _flush_queue(self, reason: str) -> list:
+        """清空待播队列，每条回一次 cancelled 回执。返回被清掉的 job。
+
+        先置位再出队：置位是非阻塞的，保证一条正要被 worker 取走的 job 也能看到取消
+        （CLAUDE.md「stop 先发取消信号，再拿锁」的同一条规矩）。
+        """
+        import queue as _queue
+        drained = []
+        while True:
+            try:
+                drained.append(self._jobs.get_nowait())
+            except _queue.Empty:
+                break
+        for j in drained:
+            j["cancel"].set()
+            print(f"[TtsPlugin] 队列中的 {j['action_id']} 被丢弃（{reason}）")
+        if drained:
+            # 回执是一次阻塞 HTTP（5s 超时）。interrupt 挂在 on_interrupt_speak 上，
+            # 要尽快返回，所以别在调用线程里串行发 N 次。
+            threading.Thread(
+                target=lambda: [self._acp_callback(j, "cancelled") for j in drained],
+                daemon=True, name="tianyi2-tts-flush-acp").start()
+        return drained
+
+    def _interrupt_all(self, reason: str) -> dict:
+        """打断当前播放 + 丢弃队列里剩下的。这是唯一会停 lyre 的路径。"""
+        cur = self._current_job
+        if cur:
+            cur["cancel"].set()
+        self._flush_queue(reason)
+        return self._call_empty_service(self._stop_client, "interrupt")
+
+    def _stop_lyre(self, why: str) -> None:
+        """对 lyre 发 stop。
+
+        判超时/判失败之前必须先停它：lyre 的 play_text 是**进队列**不是开始播，队头
+        卡住时我们这边的等待会先到点，而音频可能几十秒后才真的放出来。实测 10-15
+        13:20:36 驱动把 seg1 判成 error，lyre 随后完整播了它 48 秒。不停就等于"判了
+        失败还在响"，barrier 放行后就是边走边讲。
+        """
+        r = self._call_empty_service(self._stop_client, "stop")
+        if r.get("error"):
+            print(f"[TtsPlugin] stop lyre 失败（{why}）: {r['error']}", flush=True)
+        else:
+            print(f"[TtsPlugin] stop lyre（{why}）", flush=True)
+
     def _speak(self, text: str, force: bool) -> dict:
         if not self._play_client:
             return {"error": "service client not initialized"}
+        import queue as _queue
         try:
             import uuid as _uuid
             action_id = f"tts-{_uuid.uuid4().hex[:8]}"
 
             # 分段：超过 280 字按标点切分，避免超长文本 PlayEvent 丢失
             segments = self._split_text(text, max_chars=280)
+            job = {"action_id": action_id, "segments": segments, "force": force,
+                   "text": text, "cancel": threading.Event()}
 
-            # 取消旧的播放线程（如果有）— 同时对 lyre 发 stop
-            old_ce = self._cancel_event
-            if old_ce and not old_ce.is_set():
-                old_ce.set()
-                # 停止 lyre 当前播放，确保新请求能拿到 sid
-                if self._stop_client:
-                    try:
-                        req = type(self._stop_client.srv_type.Request)()
-                        self._stop_client.call_async(req)
-                    except Exception:
-                        pass
-            cancel_event = threading.Event()
-            self._cancel_event = cancel_event
+            # force 的既有语义就是"打断当前播放"，保留；不带 force 的一律排队。
+            if force:
+                self._interrupt_all(f"force speak {action_id}")
 
-            # Background thread: 逐段播放, 全部完成后 ACP callback
-            threading.Thread(
-                target=self._speak_segments,
-                args=(segments, force, action_id, text, cancel_event),
-                daemon=True,
-            ).start()
-            return {"state": "speaking", "action_id": action_id, "text": text[:50],
-                    "segments": len(segments)}
+            with self._queue_lock:
+                try:
+                    self._jobs.put_nowait(job)
+                except _queue.Full:
+                    return {"error": f"TTS 队列已满（{self._QUEUE_MAX}），本次未入队"}
+                ahead = self._jobs.qsize() - 1 + (1 if self._current_job else 0)
+                self._ensure_worker()
+            return {"state": "speaking" if ahead <= 0 else "queued",
+                    "action_id": action_id, "text": text[:50],
+                    "segments": len(segments), "queued_ahead": ahead}
         except Exception as e:
             return {"error": str(e)}
 
@@ -4938,13 +5056,35 @@ class TtsPlugin:
             segments.append(current)
         return segments if segments else [text]
 
-    def _speak_segments(self, segments: list, force: bool, action_id: str, full_text: str, cancel_event: threading.Event):
-        """顺序播放多段文本，全部完成后 ACP callback。支持 cancel_event 打断。"""
+    # 开播宽限：lyre 收到 play_text 后要先去讯飞云端合成（实测 0–7s，280 字那次
+    # 6.8s），然后才进播放器并发第一条 PlayProgress。超过这个窗口还没有任何
+    # PlayProgress，就当作"根本没开播"处理 —— 而不是像以前那样按字数估一个时长、
+    # 假装它正在播。10-15 那次云端 connect 超时（ws://wsapi.xfyun.cn，websocketpp
+    # 默认 5s，不可配、不重试）之后，死任务卡在 lyre 队头 150 秒，字数兜底算出来的
+    # 122 秒就这么被白等掉了。
+    _PLAY_START_GRACE_S = 20.0
+    # 开播之后：progress 每来一条就续期这么久。lyre 实测 0.5s 一条（position 每次
+    # +0.5019），所以 5s 是 10 倍余量；播完时最后一条 progress 与 COMPLETED 相隔
+    # 0.14s，不会因为这个阈值把正常结尾判成停滞。
+    #
+    # 这个值决定「卡死多久被发现」。10-15 14:34 那次用的是 duration+8 的一次性
+    # 截止，发现用了 32 秒；换成续期之后同样的故障 5 秒就能发现，而真的播久了
+    # （COMPLETED 比 duration 晚几秒）也不会被误杀 —— 两个方向都对。
+    _PROGRESS_STALL_S = 5.0
+    # 兜底上限：防止一个「一直发 progress 却永远不 COMPLETED」的播放器把队列挂死。
+    # 乘以 3 是因为真实播放时长本来就可能超过 duration，这条只拦病态情况。
+    _PLAY_DURATION_CAP_FACTOR = 3.0
+
+    def _play_job(self, job: dict) -> str:
+        """顺序播放一个 job 的各段，返回 overall_status。不回 ACP（由 worker 统一回）。"""
         import time as _t
         from lyre_msgs.srv import PlayText
 
+        segments = job["segments"]
+        force = job["force"]
+        cancel_event = job["cancel"]
         overall_status = "completed"
-        sid = None  # 记录最后一个成功的 sid（用于 ACP callback）
+        job["sid"] = None
 
         for i, seg_text in enumerate(segments):
             # 每段开始前检查取消
@@ -4972,6 +5112,9 @@ class TtsPlugin:
             if cancel_event.is_set():
                 overall_status = "cancelled"
                 print(f"[TtsPlugin] cancelled during service wait seg {i+1}/{len(segments)}")
+                # 请求可能已经被 lyre 收下了 —— 取消是我们这边的状态，lyre 不知道。
+                # 不停它就会在我们报 cancelled 之后把这段放出来。
+                self._stop_lyre(f"cancelled during service wait {job['action_id']}")
                 break
 
             seg_sid = None
@@ -4990,91 +5133,24 @@ class TtsPlugin:
                 print(f"[TtsPlugin] no response from play_text in "
                       f"{timeout_service:.0f}s seg {i+1}/{len(segments)}", flush=True)
             if seg_sid:
-                sid = seg_sid
+                job["sid"] = seg_sid
 
             # Phase 2: 等 PlayEvent
             if seg_sid:
-                buffered = self._play_event_buffer.pop(seg_sid, None)
-                if buffered is not None:
-                    # 被 interrupt 停止的情况
-                    if buffered >= 2 and cancel_event.is_set():
-                        overall_status = "cancelled"
-                        print(f"[TtsPlugin] cancelled (buffered STOPPED/CANCELLED) seg {i+1}/{len(segments)}")
-                        self._pending_play_duration.pop(seg_sid, None)
-                        break
-                    seg_status = "completed" if buffered == 1 else "error"
-                    print(f"[TtsPlugin] seg {i+1}/{len(segments)} from buffer: sid={seg_sid} event={buffered}")
-                else:
-                    ev = threading.Event()
-                    self._pending_play[seg_sid] = ev
-                    _t.sleep(0.3)
-                    reported_duration = self._pending_play_duration.get(seg_sid)
-                    if reported_duration and reported_duration > 0:
-                        play_timeout = reported_duration + 8.0
-                    else:
-                        # 更宽松: 2.5字/秒 + 10s buffer
-                        play_timeout = len(seg_text) / 2.5 + 10.0
-                    # 分段等待，每 0.5s 检查一次 cancel
-                    waited = 0.0
-                    timed_out = True
-                    while waited < play_timeout:
-                        if cancel_event.is_set():
-                            break
-                        chunk = min(0.5, play_timeout - waited)
-                        if ev.wait(timeout=chunk):
-                            timed_out = False
-                            break
-                        waited += chunk
-
-                    if cancel_event.is_set():
-                        overall_status = "cancelled"
-                        self._pending_play.pop(seg_sid, None)
-                        self._pending_play_status.pop(seg_sid, None)
-                        self._pending_play_duration.pop(seg_sid, None)
-                        self._play_event_buffer.pop(seg_sid, None)
-                        print(f"[TtsPlugin] cancelled during PlayEvent wait seg {i+1}/{len(segments)}")
-                        break
-                    elif timed_out:
-                        seg_status = "error"
-                        print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{len(segments)} sid={seg_sid}, waited {play_timeout:.0f}s (duration={reported_duration})")
-                    else:
-                        event_code = self._pending_play_status.get(seg_sid, 1)
-                        # STOPPED(2) 或 CANCELLED(3) + cancel_event → 被打断
-                        if event_code >= 2 and cancel_event.is_set():
-                            overall_status = "cancelled"
-                            self._pending_play.pop(seg_sid, None)
-                            self._pending_play_status.pop(seg_sid, None)
-                            self._pending_play_duration.pop(seg_sid, None)
-                            self._play_event_buffer.pop(seg_sid, None)
-                            print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{len(segments)}")
-                            break
-                        # event_code: 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED.
-                        # STOPPED here means something *other* than our own cancel_event
-                        # stopped it — that path already broke out above as "cancelled".
-                        # This used to collapse STOPPED into "completed", which hid every
-                        # such interruption from ACP and the LLM: a segment cut short by
-                        # an external stop looked identical to one that played in full.
-                        if event_code == 1:
-                            seg_status = "completed"
-                        elif event_code == 2:
-                            seg_status = "interrupted"
-                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED externally (not our own cancel)")
-                        else:
-                            seg_status = "error"
-                            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
-                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
-                    self._pending_play.pop(seg_sid, None)
-                    self._pending_play_status.pop(seg_sid, None)
-                self._pending_play_duration.pop(seg_sid, None)
-                self._play_event_buffer.pop(seg_sid, None)
-
-                if seg_status == "error" and not is_last:
-                    # 某段 error 但还有后续段，继续播下一段
-                    print(f"[TtsPlugin] seg {i+1} error, continuing to next segment")
-                    continue
-                elif seg_status == "error" and is_last:
+                seg_status = self._await_segment(job, seg_sid, seg_text, i, len(segments))
+                if seg_status == "cancelled":
+                    overall_status = "cancelled"
+                    break
+                if seg_status == "error":
+                    # 以前这里是「不是最后一段就继续播下一段」。那等于在 lyre 可能还
+                    # 压着上一段的情况下又塞一段进它的队列 —— 10-15 的 3 分钟静默就
+                    # 是这么攒出来的（seg1 判 error、seg2 入队、两段在 lyre 里排队）。
+                    # 现在整条 job 失败，由 agent-core 决定要不要整句重发。
                     overall_status = "error"
-                elif seg_status == "interrupted":
+                    print(f"[TtsPlugin] seg {i+1}/{len(segments)} 失败，整条放弃"
+                          f"（不再续播后面 {len(segments)-i-1} 段）", flush=True)
+                    break
+                if seg_status == "interrupted":
                     # Something external stopped this segment — later segments would just
                     # be talking over whatever stopped it, so don't keep playing.
                     overall_status = "interrupted"
@@ -5090,7 +5166,7 @@ class TtsPlugin:
                 self._startup_error = self._recheck_health() or (
                     "play_text 调用无响应。")
                 break
-            elif not seg_sid:
+            else:
                 # 没拿到 sid，fallback 按字数估算（但也要检查 cancel）
                 fallback_s = len(seg_text) / 2.5 + 5.0
                 waited = 0.0
@@ -5100,21 +5176,136 @@ class TtsPlugin:
                         break
                     _t.sleep(min(0.5, fallback_s - waited))
                     waited += 0.5
-                if cancel_event.is_set() and overall_status != "cancelled":
-                    overall_status = "cancelled"
                 if overall_status == "cancelled":
                     print(f"[TtsPlugin] cancelled during fallback wait seg {i+1}/{len(segments)}")
+                    self._stop_lyre(f"cancelled during fallback wait {job['action_id']}")
                     break
                 print(f"[TtsPlugin] no sid from service seg {i+1}, fallback sleep {fallback_s:.0f}s")
 
-        # ACP callback
+        return overall_status
+
+    def _await_segment(self, job: dict, seg_sid: str, seg_text: str,
+                       i: int, n: int) -> str:
+        """等一段真的播完。返回 completed / error / cancelled / interrupted。
+
+        时长的唯一可信来源是 PlayProgress 里的 duration —— 它只有在**开播之后**才
+        发。所以这里分两段计时：开播前用 `_PLAY_START_GRACE_S`，PlayProgress 一到就
+        换成 duration + 余量。原先只在注册后固定 `sleep(0.3)` 看一眼 duration，而那
+        个窗口永远落空（lyre 正常也要 2 秒才发第一条 progress），于是实际上一直在走
+        字数兜底：280 字算出 122 秒，真实时长 48.1 秒，宽了 2.5 倍。
+        """
+        import time as _t
+        cancel_event = job["cancel"]
+
+        buffered = self._play_event_buffer.pop(seg_sid, None)
+        if buffered is not None:
+            # 被 interrupt 停止的情况
+            if buffered >= 2 and cancel_event.is_set():
+                print(f"[TtsPlugin] cancelled (buffered STOPPED/CANCELLED) seg {i+1}/{n}")
+                self._pending_play_duration.pop(seg_sid, None)
+                self._pending_play_progress_at.pop(seg_sid, None)
+                self._pending_play_position.pop(seg_sid, None)
+                return "cancelled"
+            print(f"[TtsPlugin] seg {i+1}/{n} from buffer: sid={seg_sid} event={buffered}")
+            self._pending_play_duration.pop(seg_sid, None)
+            self._pending_play_progress_at.pop(seg_sid, None)
+            self._pending_play_position.pop(seg_sid, None)
+            return "completed" if buffered == 1 else "error"
+
+        ev = threading.Event()
+        self._pending_play[seg_sid] = ev
+        try:
+            t0 = _t.time()
+            first_at = None       # 第一条 progress 的时刻（开播）
+            duration = 0.0
+            why = None
+            while True:
+                if cancel_event.is_set():
+                    break
+                if ev.wait(timeout=0.5):
+                    why = None
+                    break
+                now = _t.time()
+                last_at = self._pending_play_progress_at.get(seg_sid)
+                if last_at is not None and first_at is None:
+                    first_at = last_at
+                    duration = self._pending_play_duration.get(seg_sid) or 0.0
+                    print(f"[TtsPlugin] seg {i+1}/{n} 开播，duration={duration:.1f}s，"
+                          f"progress 续期 {self._PROGRESS_STALL_S:.0f}s/条")
+                if last_at is None:
+                    # 还没开播：lyre 要先去云端合成（实测 0–7s），还可能排在别人后面。
+                    if now - t0 >= self._PLAY_START_GRACE_S:
+                        why = (f"{self._PLAY_START_GRACE_S:.0f}s 内没有任何 "
+                               f"PlayProgress，判定为未开播"
+                               f"（lyre 合成失败或队头堵塞）")
+                        break
+                    continue
+                # 开播了：只要 progress 还在推进就一直等 —— 真实播放时长超过 duration
+                # 是正常的，被误杀的代价是把话切断。
+                stalled = now - last_at
+                if stalled >= self._PROGRESS_STALL_S:
+                    pos = self._pending_play_position.get(seg_sid, 0.0)
+                    why = (f"播放停滞：{stalled:.1f}s 没有新的 PlayProgress"
+                           f"（停在 {pos:.1f}/{duration:.1f}s，播放器卡死）")
+                    break
+                if duration and now - first_at >= duration * self._PLAY_DURATION_CAP_FACTOR \
+                        + self._PLAY_START_GRACE_S:
+                    why = (f"已播 {now - first_at:.0f}s，超过 duration "
+                           f"{duration:.1f}s 的 {self._PLAY_DURATION_CAP_FACTOR:.0f} 倍"
+                           f"仍未 COMPLETED")
+                    break
+
+            if cancel_event.is_set():
+                print(f"[TtsPlugin] cancelled during PlayEvent wait seg {i+1}/{n}")
+                self._stop_lyre(f"cancelled {job['action_id']} seg{i+1}")
+                return "cancelled"
+
+            if why is not None:
+                print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{n} sid={seg_sid} — {why}",
+                      flush=True)
+                # 必须先停：不停的话 lyre 可能在我们报 error 之后才把它放出来。
+                self._stop_lyre(f"timeout {job['action_id']} seg{i+1}")
+                return "error"
+
+            event_code = self._pending_play_status.get(seg_sid, 1)
+            # STOPPED(2) 或 CANCELLED(3) + cancel_event → 被打断
+            if event_code >= 2 and cancel_event.is_set():
+                print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{n}")
+                return "cancelled"
+            # event_code: 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED.
+            # STOPPED here means something *other* than our own cancel_event
+            # stopped it — that path already broke out above as "cancelled".
+            # This used to collapse STOPPED into "completed", which hid every
+            # such interruption from ACP and the LLM: a segment cut short by
+            # an external stop looked identical to one that played in full.
+            if event_code == 1:
+                return "completed"
+            if event_code == 2:
+                print(f"[TtsPlugin] seg {i+1}/{n} STOPPED externally (not our own cancel)")
+                return "interrupted"
+            event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
+            print(f"[TtsPlugin] seg {i+1}/{n} failed: {event_name} (code={event_code})")
+            return "error"
+        finally:
+            self._pending_play.pop(seg_sid, None)
+            self._pending_play_status.pop(seg_sid, None)
+            self._pending_play_duration.pop(seg_sid, None)
+            self._pending_play_progress_at.pop(seg_sid, None)
+            self._pending_play_position.pop(seg_sid, None)
+            self._play_event_buffer.pop(seg_sid, None)
+
+    def _acp_callback(self, job: dict, overall_status: str) -> None:
+        """回一次 /api/acp/complete。每个 job 恰好一次。"""
+        action_id = job["action_id"]
+        segments = job["segments"]
+        full_text = job["text"]
         try:
             import urllib.request, ssl, json as _json, os as _os
             url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            acp_result = {"action": "speak", "sid": sid or "unknown",
+            acp_result = {"action": "speak", "sid": job.get("sid") or "unknown",
                           "segments": len(segments)}
             # Carry the reason, not just the verdict — "error" with no detail sends the
             # reader to the logs, and this is the field the dashboard already shows.
