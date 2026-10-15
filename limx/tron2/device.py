@@ -12,10 +12,10 @@ from reset import ResetPose
 from skeleton import skeleton_stream, model
 from completion import ArmCompletion, ACP_TIMEOUT
 from camera import CameraStream, CAMERA_SOURCES
-from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments
+from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.6.1'
+VERSION = '0.6.2'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -187,17 +187,18 @@ class Adapter:
         if name not in self.enabled:
             raise ValueError('Unknown tool')
         if name == 'gripper':
+            args = normalize_arguments(action, args)
             if action == 'recover':
                 recovery_arguments(args)
                 return {'action': 'recover', 'read_only': True, 'motion_sent': False}
-            if action in ('start', 'stop', 'info', 'get_state'):
+            if action in ('start', 'stop', 'info'):
                 if set(args) - {'action', 'instance_id', '_trace_id'}:
                     raise ValueError('读取状态和系统操作无需开合参数')
                 if action in ('start', 'stop'):
                     return {'state': 'ready' if action == 'start' else 'idle',
                             'motion_sent': False, 'lifecycle_only': True,
                             'message': '仅改变卡片生命周期，不发送夹爪开合或急停指令'}
-                return self.gripper.info() if action == 'info' else {'action': 'get_state', 'motion_sent': False}
+                return self.gripper.info()
             gripper_command(action, args)
             return {'action': action, 'motion_sent': False, 'status': 'validated'}
         if name in CAMERA_SOURCES:
@@ -286,8 +287,8 @@ class Adapter:
                         data = await self.motion.dispatch(action, target, duration, details)
                     if params.get('name') == 'gripper':
                         action = params.get('arguments', {}).get('action')
-                        if action == 'get_state':
-                            data = await self.gripper.get_state()
+                        if action == 'info':
+                            data = await self.gripper.read_state()
                         elif action == 'recover':
                             data = await self.gripper.recover(params['arguments'])
                         elif action in MOTION_ACTIONS:

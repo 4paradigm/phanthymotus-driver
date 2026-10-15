@@ -1,6 +1,6 @@
 # LimX TRON2 传感器、双臂与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂控制卡片和夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.6.1`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂控制卡片和夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.6.2`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -12,7 +12,7 @@
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
-夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。新增卡片默认读取状态，系统启动/停止不会发送夹爪开合。
+夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。公开操作为open、close、set_opening、recover，不再提供get_state。新增卡片默认恢复选项且确认false，系统启动/停止不会发送夹爪开合。
 
 传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
