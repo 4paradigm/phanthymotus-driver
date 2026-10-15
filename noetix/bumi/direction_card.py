@@ -25,10 +25,10 @@ DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "resource/sound_dir
 SETTINGS_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_settings.json")
 DEFAULT_PARAMETERS = {"sensitivity": "normal"}
 # 门限档位含义由本表定义，与用户面板解耦；面板只有「灵敏度」一个旋钮。
-# normal 档逐值等于历史默认（burst_ratio 已按操作者决定提至 4.0）。
+# onset_ratio 按操作者指定的高/中/低三档设置。
 SENSITIVITY_GATE_PARAMS = {
-    "high":   {"onset_level": 8.0,  "onset_ratio": 1.8, "burst_level": 12.0, "burst_ratio": 3.2},
-    "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
+    "high":   {"onset_level": 8.0,  "onset_ratio": 2.0, "burst_level": 12.0, "burst_ratio": 3.2},
+    "normal": {"onset_level": 10.0, "onset_ratio": 2.2, "burst_level": 15.0, "burst_ratio": 4.0},
     "low":    {"onset_level": 15.0, "onset_ratio": 2.5, "burst_level": 25.0, "burst_ratio": 5.0},
 }
 # 方向刷新节流固定现行默认 100ms，不再暴露给操作者（操作者决定 2026-10-14）。

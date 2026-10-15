@@ -69,15 +69,15 @@ platform, not migrated.
 
 ```
 SENSITIVITY_GATE_PARAMS = {
-    "high":   {"onset_level": 8.0,  "onset_ratio": 1.8, "burst_level": 12.0, "burst_ratio": 3.2},
-    "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
+    "high":   {"onset_level": 8.0,  "onset_ratio": 2.0, "burst_level": 12.0, "burst_ratio": 3.2},
+    "normal": {"onset_level": 10.0, "onset_ratio": 2.2, "burst_level": 15.0, "burst_ratio": 4.0},
     "low":    {"onset_level": 15.0, "onset_ratio": 2.5, "burst_level": 25.0, "burst_ratio": 5.0},
 }
 UPDATE_INTERVAL_MS = 100
 ```
 
 Preset meaning is defined by this table, not by the panel wording. The
-normal preset equals the historical defaults value for value. Sensitivity
+onset ratios are 2.0 / 2.2 / 2.5 for high / normal / low. Sensitivity
 only adjusts how easily sounds trigger; it does **not** remove fan-noise
 false angles (known, unfixed).
 

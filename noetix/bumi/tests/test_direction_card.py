@@ -10,6 +10,7 @@ import types
 from pathlib import Path
 
 import yaml
+import pytest
 
 from test_mic_card import _load_device
 
@@ -321,9 +322,12 @@ def test_legacy_settings_file_maps_to_presets(monkeypatch, tmp_path):
     assert module.load_parameters() == {'sensitivity': 'normal'}
 
 
-def test_high_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypatch):
+@pytest.mark.parametrize('sensitivity, below_threshold, speech_level', [
+    ('high', 78, 80), ('normal', 86, 88), ('low', 98, 100),
+])
+def test_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypatch, sensitivity, below_threshold, speech_level):
     module = _load_card(monkeypatch)
-    gate = module.SoundActivityGate(**module.SENSITIVITY_GATE_PARAMS['high'])
+    gate = module.SoundActivityGate(**module.SENSITIVITY_GATE_PARAMS[sensitivity])
 
     def frame(level):
         wave = module.np.tile([level, -level], 320)
@@ -331,10 +335,10 @@ def test_high_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypa
                                axis=1).reshape(-1)
 
     assert not any(gate.accepts(frame(40)) for _ in range(8))
-    assert not gate.accepts(frame(70))
-    assert not gate.accepts(frame(70))
-    assert not gate.accepts(frame(80))
-    assert gate.accepts(frame(80))
+    assert not gate.accepts(frame(below_threshold))
+    assert not gate.accepts(frame(below_threshold))
+    assert not gate.accepts(frame(speech_level))
+    assert gate.accepts(frame(speech_level))
 
 
 def test_sensitivity_preset_table_matches_documentation(monkeypatch):
@@ -343,9 +347,9 @@ def test_sensitivity_preset_table_matches_documentation(monkeypatch):
     assert set(module.SENSITIVITY_GATE_PARAMS) == {'high', 'normal', 'low'}
     # 三档全部逐值冻结：任何一档的语义漂移都必须炸测试（含后续风扇修复的改档）。
     assert module.SENSITIVITY_GATE_PARAMS == {
-        'high':   {'onset_level': 8.0,  'onset_ratio': 1.8,
+        'high':   {'onset_level': 8.0,  'onset_ratio': 2.0,
                    'burst_level': 12.0, 'burst_ratio': 3.2},
-        'normal': {'onset_level': 10.0, 'onset_ratio': 2.0,
+        'normal': {'onset_level': 10.0, 'onset_ratio': 2.2,
                    'burst_level': 15.0, 'burst_ratio': 4.0},
         'low':    {'onset_level': 15.0, 'onset_ratio': 2.5,
                    'burst_level': 25.0, 'burst_ratio': 5.0},
