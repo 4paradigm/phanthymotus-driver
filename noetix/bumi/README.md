@@ -50,6 +50,9 @@ settings.
 
 Set the one shared parameter from the direction card's left-list gear.
 Saving it restarts a running direction worker and waits for it to become ready.
+If stopping the worker times out, the previous settings file is restored and
+no replacement worker is spawned. If settings recovery also fails, the error
+reports the file and running parameters separately.
 
 | Parameter | Default | Effect |
 | --- | --- | --- |
@@ -103,6 +106,10 @@ The card first loads a complete, valid per-robot calibration from
 `/opt/phanthy-motus/data/bumi/sound_direction_calibration.json`, then tries the
 packaged `resource/sound_direction_calibration.json`. Each file must contain
 `front` and `right`, each with three finite values of magnitude at most 24.
+Each vector must also have a norm of at least 0.5 samples, matching the
+estimator's minimum meaningful delay signature; a near-zero override falls
+back to the packaged calibration. The existing condition-number limit still
+rejects nearly collinear vectors.
 The two files are never mixed. The packaged file was copied unchanged from
 the calibrated Bumi host `ubuntu` on 2026-10-14, at the per-robot path above.
 Its SHA-256 is `89813968f99881310d5f49ca748d48303dfadfd27e550893d27f1023e5fc660a`.

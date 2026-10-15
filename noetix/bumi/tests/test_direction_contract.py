@@ -73,6 +73,33 @@ def test_angle_boundary_and_window_end_use_last_frame_samples(monkeypatch):
     assert msg.published_us == 1700000000040000
 
 
+@pytest.mark.parametrize('magnitude', [1e-12, 0.49])
+def test_near_zero_calibration_falls_back_or_blocks_start(monkeypatch, tmp_path, magnitude):
+    module = _load_card(monkeypatch)
+    local, default = tmp_path / 'local.json', tmp_path / 'default.json'
+    monkeypatch.setattr(module, 'CALIBRATION_PATH', local)
+    monkeypatch.setattr(module, 'DEFAULT_CALIBRATION_PATH', default)
+    weak = {'front': [magnitude, 0, 0], 'right': [0, magnitude, 0]}
+    good = {'front': [1, 0, 0], 'right': [0, 1, 0]}
+    local.write_text(json.dumps(weak))
+    default.write_text(json.dumps(good))
+    assert module.load_calibration() == good
+    default.write_text(json.dumps(weak))
+    assert module.load_calibration() == {}
+    card = _card(module)
+    assert card.start() is False
+    assert card.dispatch('start', {})['state'] == 'unavailable'
+
+
+def test_calibration_at_minimum_useful_delay_is_accepted(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    local = tmp_path / 'local.json'
+    monkeypatch.setattr(module, 'CALIBRATION_PATH', local)
+    calibration = {'front': [0.5, 0, 0], 'right': [0, 0.5, 0]}
+    local.write_text(json.dumps(calibration))
+    assert module.load_calibration() == calibration
+
+
 @pytest.mark.parametrize('timestamps, expected_end', [
     ((1700000000000000, 1700000000020000), 1700000000060000),
     ((1700000000000000000, 1700000000020000000), 0),

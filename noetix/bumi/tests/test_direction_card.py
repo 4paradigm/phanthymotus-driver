@@ -441,3 +441,55 @@ def test_config_write_failure_keeps_running_worker_and_old_settings(monkeypatch,
     info = card.dispatch('info', {})
     assert info['state'] == 'running'
     assert info['parameters'] == {'sensitivity': 'normal'}
+
+
+@pytest.mark.parametrize('existing_file', [True, False])
+def test_stop_timeout_restores_previous_settings_without_spawning(monkeypatch, tmp_path, existing_file):
+    module = _load_card(monkeypatch)
+    settings = tmp_path / 'settings.json'
+    previous = b'{"sensitivity": "normal"}\n'
+    if existing_file:
+        settings.write_bytes(previous)
+    monkeypatch.setattr(module, 'SETTINGS_PATH', settings)
+    card = _card(module)
+    calls = []
+
+    class Process:
+        def poll(self): return None
+        def terminate(self): calls.append('terminate')
+        def kill(self): calls.append('kill')
+        def wait(self, timeout): raise module.subprocess.TimeoutExpired('direction', timeout)
+
+    proc = Process()
+    card._proc = proc
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *a, **kw:
+                        (_ for _ in ()).throw(AssertionError('must not spawn another worker')))
+    result = card.dispatch('config', {'sensitivity': 'noisy'})
+    assert result['state'] == 'error'
+    assert calls == ['terminate', 'kill']
+    assert card._proc is proc
+    if existing_file:
+        assert settings.read_bytes() == previous
+    else:
+        assert not settings.exists()
+    assert result['file_parameters'] == {'sensitivity': 'normal'}
+    assert result['running_parameters'] == {'sensitivity': 'normal'}
+    assert card.dispatch('info', {})['parameters'] == {'sensitivity': 'normal'}
+
+
+def test_stop_timeout_reports_failed_settings_restore(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    settings = tmp_path / 'settings.json'
+    settings.write_text('{"sensitivity":"normal"}')
+    monkeypatch.setattr(module, 'SETTINGS_PATH', settings)
+    card = _card(module)
+    card._proc = types.SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(card, 'stop', lambda:
+                        (_ for _ in ()).throw(module.subprocess.TimeoutExpired('direction', 2)))
+    monkeypatch.setattr(type(settings), 'write_bytes', lambda *a, **kw:
+                        (_ for _ in ()).throw(OSError('read-only filesystem')))
+    result = card.dispatch('config', {'sensitivity': 'noisy'})
+    assert result['state'] == 'error'
+    assert 'read-only filesystem' in result['message']
+    assert result['file_parameters'] == {'sensitivity': 'noisy'}
+    assert result['running_parameters'] == {'sensitivity': 'normal'}

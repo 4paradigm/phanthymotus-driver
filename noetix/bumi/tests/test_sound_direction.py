@@ -145,6 +145,11 @@ def test_estimator_rejects_bad_inputs_and_off_basis_direction():
     assert estimate_angle(front, (float("inf"), 0, 0), right) is None
 
 
+def test_estimator_rejects_tiny_well_conditioned_calibration():
+    assert estimate_angle((1, 1, 0), (1e-12, 0, 0), (0, 1e-12, 0)) is None
+    assert estimate_angle((1, 1, 0), (0.5, 0, 0), (0, 0.5, 0)) == 315
+
+
 def test_estimate_signature_uses_interleaved_head_microphones():
     rng = np.random.default_rng(7)
     source = rng.normal(0, 2000, 4096).astype(np.int16)

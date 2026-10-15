@@ -6,6 +6,9 @@ from collections import deque
 import numpy as np
 
 MAX_BASIS_CONDITION = 20
+# Delays are measured in samples; calibration must meet the estimator's
+# existing half-sample minimum for a meaningful direction signature.
+MIN_BASIS_NORM = 0.5
 
 
 class SoundActivityGate:
@@ -95,7 +98,9 @@ def estimate_angle(signature, front, right):
         return None
     if not np.all(np.isfinite(basis)) or not np.all(np.isfinite(measured)):
         return None
-    if np.linalg.cond(basis) > MAX_BASIS_CONDITION or np.linalg.norm(measured) < 0.5:
+    if (np.min(np.linalg.norm(basis, axis=0)) < MIN_BASIS_NORM
+            or np.linalg.cond(basis) > MAX_BASIS_CONDITION
+            or np.linalg.norm(measured) < 0.5):
         return None
     weights, *_ = np.linalg.lstsq(basis, measured, rcond=None)
     if np.linalg.norm(basis @ weights - measured) > 0.35 * np.linalg.norm(measured):

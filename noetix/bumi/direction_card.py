@@ -18,7 +18,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from audio_msgs.msg import SoundDirection
 from std_msgs.msg import String
 
-from sound_direction import MAX_BASIS_CONDITION, SoundActivityGate, estimate_angle, estimate_signature
+from sound_direction import MAX_BASIS_CONDITION, MIN_BASIS_NORM, SoundActivityGate, estimate_angle, estimate_signature
 
 
 CALIBRATION_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_calibration.json")
@@ -55,7 +55,9 @@ def load_calibration() -> dict:
                 and all(type(value) in (int, float) and math.isfinite(value)
                         and abs(value) <= 24 for value in data[name])
                 for name in ("front", "right"))):
-            if np.linalg.cond(np.column_stack((data["front"], data["right"]))) <= MAX_BASIS_CONDITION:
+            basis = np.column_stack((data["front"], data["right"]))
+            if (np.min(np.linalg.norm(basis, axis=0)) >= MIN_BASIS_NORM
+                    and np.linalg.cond(basis) <= MAX_BASIS_CONDITION):
                 return {name: data[name] for name in ("front", "right")}
     return {}
 
@@ -406,22 +408,36 @@ class SoundDirectionPlugin:
                         "parameters": previous_parameters,
                         "file_parameters": previous_parameters,
                         "running_parameters": previous_parameters if running else None}
+
+            def restore_settings():
+                if previous_settings is None:
+                    SETTINGS_PATH.unlink(missing_ok=True)
+                else:
+                    temporary.write_bytes(previous_settings)
+                    temporary.replace(SETTINGS_PATH)
+
             if running:
                 try:
                     self.stop()
                 except subprocess.TimeoutExpired:
-                    return {"state": "error", "message": "direction subprocess did not exit after kill"}
+                    message = "direction subprocess did not exit after kill"
+                    try:
+                        restore_settings()
+                    except OSError as exc:
+                        message += f"; settings recovery failed: {exc}"
+                    file_parameters = load_parameters()
+                    still_running = self._proc is not None and self._proc.poll() is None
+                    return {"state": "error", "message": message,
+                            "parameters": file_parameters,
+                            "file_parameters": file_parameters,
+                            "running_parameters": previous_parameters if still_running else None}
             if running:
                 try:
                     if not self.start():
                         raise RuntimeError("direction restart failed to initialize")
                 except Exception as exc:
                     try:
-                        if previous_settings is None:
-                            SETTINGS_PATH.unlink(missing_ok=True)
-                        else:
-                            temporary.write_bytes(previous_settings)
-                            temporary.replace(SETTINGS_PATH)
+                        restore_settings()
                         restored = self.start()
                     except Exception as restore_exc:
                         return {"state": "error", "message": f"direction restart failed: {exc}; recovery failed: {restore_exc}",
