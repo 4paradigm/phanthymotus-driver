@@ -33,29 +33,28 @@ class PickPlaceConfigTests(unittest.TestCase):
     def configure(self, **values):
         return self.bundle.dispatch("vision_pick_and_drop", {"action": "config", **values})
 
-    def test_driver_speed_limits_apply_to_schema_defaults_and_atomic_updates(self):
+    def test_card_speed_is_independent_of_driver_limits_and_updates_atomically(self):
         from pick_place import PickPlacePlugin
-        for safety, maximum, default in (
-            ({}, 10, 5),
-            ({"max_speed_percent": 3}, 3, 3),
-            ({"max_speed_percent": 7, "default_speed_percent": 2}, 7, 2),
-            ({"max_speed_percent": 7, "default_speed_percent": 9}, 7, 7),
-            ({"max_speed_percent": 100, "default_speed_percent": 50}, 10, 10),
+        for safety in (
+            {},
+            {"max_speed_percent": 3},
+            {"max_speed_percent": 7, "default_speed_percent": 2},
+            {"max_speed_percent": 7, "default_speed_percent": 9},
+            {"max_speed_percent": 10, "default_speed_percent": 5},
+            {"max_speed_percent": 100, "default_speed_percent": 50},
         ):
             with self.subTest(safety=safety):
                 card = PickPlacePlugin(object(), {"safety": safety})
                 speed = card.get_tools()[0]["configSchema"]["properties"]["speed_percent"]
-                self.assertEqual((speed["maximum"], speed["default"]), (maximum, default))
-                self.assertEqual(card.dispatch("config", {})["speed_percent"], default)
-                accepted = card.dispatch("config", {"speed_percent": maximum})
-                self.assertTrue(accepted["ok"])
-                for value in (maximum + 1, 50, 100):
-                    rejected = card.dispatch("config", {"speed_percent": value, "pick_grip_force": 20})
-                    self.assertEqual(rejected["code"], "INVALID_CONFIG")
-                    self.assertEqual(card.dispatch("config", {}), accepted)
-        # Instance-specific limits must not change the next card's schema.
-        self.assertEqual(PickPlacePlugin(object(), {}).get_tools()[0]["configSchema"]
-                         ["properties"]["speed_percent"]["maximum"], 10)
+                self.assertEqual((speed["minimum"], speed["maximum"], speed["default"]), (1, 100, 50))
+                self.assertEqual(card.dispatch("config", {})["speed_percent"], 50)
+                for value in (1, 50, 100):
+                    accepted = card.dispatch("config", {"speed_percent": value})
+                    self.assertTrue(accepted["ok"])
+                    self.assertEqual(accepted["speed_percent"], value)
+                rejected = card.dispatch("config", {"speed_percent": 101, "pick_grip_force": 20})
+                self.assertEqual(rejected["code"], "INVALID_CONFIG")
+                self.assertEqual(card.dispatch("config", {}), accepted)
 
     def test_registered_config_defaults(self):
         card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "vision_pick_and_drop")
@@ -63,7 +62,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertEqual([p["format"] for p in card["topic_in"]], ["image/depth-zlib", "image/jpeg", "data/json"])
         self.assertNotIn("topic_out", card)
         expected = {
-            "speed_percent": 5, "observation_joints_deg": "-90,0,0,90,0,90,0",
+            "speed_percent": 50, "observation_joints_deg": "-90,0,0,90,0,90,0",
             "x_compensation_mm": 30, "y_compensation_mm": -75,
             "pick_descent_mm": 91, "pick_grip_force": 15, "place_descent_mm": 60, "observe_after_transfer": False,
         }
@@ -138,7 +137,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertTrue(configured["ok"])
         self.assertEqual(configured["pick_grip_force"], 15)
         for invalid in (
-            {"speed_percent": 0}, {"speed_percent": 11}, {"speed_percent": 1.5},
+            {"speed_percent": 0}, {"speed_percent": 101}, {"speed_percent": 1.5},
             {"speed_percent": True}, {"pick_grip_force": -1}, {"pick_grip_force": 101},
             {"pick_grip_force": 2.5}, {"pick_descent_mm": 0}, {"place_descent_mm": -1},
             {"x_compensation_mm": float("nan")}, {"y_compensation_mm": float("inf")},
@@ -156,7 +155,7 @@ class PickPlaceConfigTests(unittest.TestCase):
                 self.assertEqual(self.configure(), configured)
 
     def test_boundaries_and_placeholder_do_not_call_hardware(self):
-        self.assertTrue(self.configure(speed_percent=10, pick_grip_force=0,
+        self.assertTrue(self.configure(speed_percent=100, pick_grip_force=0,
                                       pick_descent_mm=0.5, place_descent_mm=0.5,
                                       observation_joints_deg="178,130,178,135,178,128,360")["ok"])
         self.assertTrue(self.configure(speed_percent=1, pick_grip_force=100,
@@ -194,7 +193,7 @@ sys.exit(not result.wasSuccessful())
         card = PickPlacePlugin(RM75SDKClient({}).exclusive_client(), config)
         self.assertIsInstance(card._inputs, ObservationInputs)
         self.assertIsNone(card._observation)
-        self.assertEqual(card.dispatch("config", {})["speed_percent"], 5)
+        self.assertEqual(card.dispatch("config", {})["speed_percent"], 50)
 
 
 class ObserveTests(unittest.TestCase):
@@ -304,7 +303,7 @@ class ObserveTests(unittest.TestCase):
         self.assertIsNone(self.plugin._active)
         self.assertTrue(result["action_id"].startswith("vision_pick_and_drop_observe_"))
         self.assertNotIn("request_id", result)
-        self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 5, 0, 0, 0))])
+        self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 50, 0, 0, 0))])
         self.camera.snapshot.assert_called_once()
         self.assertEqual(result["result"]["objects"], [{"name": "banana", "position": [.1, .2], "confidence": .9}])
         snapshot = self.plugin._observation
@@ -379,14 +378,18 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(self.commands, [("rm_movej", ([-80., 1., 2., 85., 3., 80., 4.], 7, 0, 0, 0))])
 
-    def test_observe_obeys_lower_driver_speed_limit(self):
+    def test_observe_uses_default_and_full_speed_despite_lower_driver_limit(self):
         from pick_place import PickPlacePlugin
-        self.plugin = PickPlacePlugin(self.client, {"safety": {"max_speed_percent": 3}}, inputs=self.camera)
-        self.assertEqual(self.plugin.dispatch("config", {"speed_percent": 4})["code"], "INVALID_CONFIG")
-        self.assertEqual(self.commands, [])
-        result = self.observe()
-        self.assertEqual(result["state"], "completed", result)
-        self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 3, 0, 0, 0))])
+        self.plugin = PickPlacePlugin(self.client, {"safety": {"max_speed_percent": 3,
+                                                             "default_speed_percent": 2}}, inputs=self.camera)
+        for speed in (50, 100):
+            with self.subTest(speed=speed):
+                if speed == 100:
+                    self.assertTrue(self.plugin.dispatch("config", {"speed_percent": speed})["ok"])
+                self.commands.clear()
+                result = self.observe()
+                self.assertEqual(result["state"], "completed", result)
+                self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], speed, 0, 0, 0))])
 
     def test_activation_and_info_do_not_capture_or_move(self):
         self.plugin.start()
