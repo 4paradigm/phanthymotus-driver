@@ -1138,6 +1138,22 @@ class LocoPlugin:
 
     def _prepare_workmode(self, target_mode: int, requested_action: str) -> dict:
         """Automatically reach ready(1) or walking(2) through documented steps."""
+        # I-A: a posture/semantic/teaching change cancels an in-flight
+        # loco_destination rotate the same way this path already stops move —
+        # worker exits "stopped" → ACP "cancelled" → zero brake, instead of
+        # workmode edges racing a bumi_rotate still streaming vyaw. The set
+        # takes _rotate_lock so it cannot land inside a concurrent dispatch's
+        # reservation window (busy-check → clear) and be wiped by that clear;
+        # the join runs after the lock is released (the worker's finally
+        # needs it) and waits out the brake, so no two command streams
+        # overlap. The 1s cap mirrors move: even if the ACP notify is slow,
+        # the motion has already braked to zero by then.
+        with self._rotate_lock:
+            self._rotate_stop_event.set()
+            worker = self._rotate_worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1)
+
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)

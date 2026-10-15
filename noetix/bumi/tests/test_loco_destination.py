@@ -686,6 +686,113 @@ def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
 
 
+# ── I-A：posture/semantic/teaching 动作取消进行中的 rotate ───────────────────
+
+def test_posture_action_cancels_inflight_rotate(monkeypatch):
+    # I-A：realistic 植物上 rotate 转 360°（远未完成）时下发 lie_prone——
+    # _prepare_workmode 必须先取消 rotate：worker 以 stopped 收尾、恰 1 次
+    # ACP cancelled（对应该 action_id）、退出必零速；posture 路径照常继续
+    # （STANDTOFALL 被接受 → running）；且 STANDTOFALL 边沿之后不得再出现
+    # 任何 vyaw 转速帧——两路指令流不重叠。
+    module, _ = _load_device(monkeypatch)
+    acp_calls = []
+    monkeypatch.setattr(
+        module, '_acp_notify',
+        lambda action_id, status, result, tool: acp_calls.append(
+            (action_id, status, result, tool)))
+    fake = FakeHighCtrl(plant="realistic")
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+
+    frames = []                               # (x, y, z, action_cmd) 全量指令流
+    publish = fake.publish_cmd
+
+    def publish_cmd(x, y, z, action_cmd, index=0):
+        publish(x, y, z, action_cmd, index)
+        frames.append((x, y, z, action_cmd))
+        if action_cmd == 'STANDTOFALL':
+            fake.mode = 30                    # 反馈：卧倒动作被接受，posture 继续
+
+    monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
+
+    started = plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    assert started['state'] == 'running'
+    deadline = time.monotonic() + 3.0         # 确认真在转（已有转速帧）
+    while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
+        time.sleep(0.01)
+    assert any(c[2] != 0 for c in fake.cmds)
+
+    posture = plugin.dispatch(
+        'lie_prone', {'_tool_name': 'stand_up_lie_prone'})
+    assert posture['state'] == 'running'      # posture 路径不受阻，照常继续
+    assert posture['command_sent'] is True
+
+    result = wait_rotate(plugin)
+    assert result['state'] == 'stopped'       # I-A：被 posture 取消，而非转完
+    assert len(acp_calls) == 1                # 恰一次 ACP 终态
+    assert acp_calls[0][1] == 'cancelled'
+    assert acp_calls[0][0] == started['action_id']
+    assert fake.cmds[-1] == (0, 0, 0)         # 退出必零速
+    first_edge = next(i for i, f in enumerate(frames) if f[3] == 'STANDTOFALL')
+    last_stream = max(i for i, f in enumerate(frames) if f[2] != 0)
+    assert last_stream < first_edge           # 边沿后无转速帧：两路流不重叠
+
+
+def test_posture_cancel_sticks_during_rotate_dispatch_acceptance(monkeypatch):
+    # I-A 跨步(straddle)回归：取消必须在 _rotate_lock 内置位——普通 set 可
+    # 落在 dispatch 受理窗口的 busy-check→clear 之间，被 reservation 的
+    # clear 擦掉。构造：dispatch 卡在 preflight（clear 已过、worker 未发布），
+    # 此时取消必须阻塞在锁上且尚未置位；锁释放后置位不得再被擦除——受理
+    # 完成的 rotate 帧 1 即见取消，一帧未发即以 stopped/cancelled 收尾。
+    module, _ = _load_device(monkeypatch)
+    acp_calls = []
+    monkeypatch.setattr(
+        module, '_acp_notify',
+        lambda action_id, status, result, tool: acp_calls.append(
+            (action_id, status, result, tool)))
+    fake = FakeHighCtrl(gain_deg_per_tick=1.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    entered, release = threading.Event(), threading.Event()
+
+    def get_mode():
+        entered.set()
+        assert release.wait(5)
+        return 2
+
+    monkeypatch.setattr(fake, 'get_mode', get_mode)
+    box = {}
+    dispatcher = threading.Thread(
+        target=lambda: box.update(result=plugin.dispatch(
+            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})),
+        daemon=True)
+    dispatcher.start()
+    assert entered.wait(2)                    # 受理窗口内：clear 已过、worker 未发布
+
+    cancel_box = {}
+    canceler = threading.Thread(
+        target=lambda: cancel_box.update(
+            prepared=plugin._prepare_workmode(2, 'lie_prone')),
+        daemon=True)
+    with plugin._rotate_lock:                 # 模拟 reservation 持锁期间到达的取消
+        canceler.start()
+        canceler.join(0.3)
+        assert canceler.is_alive()            # 取消阻塞在 _rotate_lock 上
+        assert not plugin._rotate_stop_event.is_set()  # 锁内不得先行置位
+    release.set()
+    canceler.join(5)
+    assert not canceler.is_alive()
+    assert cancel_box['prepared']['state'] == 'completed'
+    assert plugin._rotate_stop_event.is_set()  # 置位在 clear 之后，未被擦除
+    dispatcher.join(5)
+    assert not dispatcher.is_alive()
+    assert box['result']['state'] == 'running'  # 受理照常完成
+    result = wait_rotate(plugin)
+    assert result['state'] == 'stopped'       # 受理后的 worker 帧 1 即见取消
+    assert len(acp_calls) == 1
+    assert acp_calls[0][1] == 'cancelled'
+    assert all(cmd == (0, 0, 0) for cmd in fake.cmds)  # 一帧运动都未发
+
+
 # ── realistic 植物症状回归：stiction 小角度 / 极限环 / 整圈契约 ───────────────
 
 def _vyaw_sign_flips(cmds):
