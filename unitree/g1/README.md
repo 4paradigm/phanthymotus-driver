@@ -26,7 +26,7 @@
 
 ## 构建
 
-G1 使用 `unitree/g1/Dockerfile`，从 ROS 基础镜像安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。依赖步骤位于源码 COPY 之前，正常构建可复用 Docker 缓存。
+G1 使用 `unitree/g1/Dockerfile`，默认从 `bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest` 安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。依赖步骤位于源码 COPY 之前，正常构建可复用 Docker 缓存。
 
 在仓库根目录执行本地 ARM64 构建。与现有 build.sh 一样，构建上下文需要包含共享 common 目录：
 

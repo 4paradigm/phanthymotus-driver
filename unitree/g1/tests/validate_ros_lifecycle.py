@@ -28,7 +28,7 @@ class Control:
  def receive(self,value):
   with self._lock:
    self.received.append(value['sequence']);return True
- def feedback(self):return {'count':len(self.received)}
+ def feedback(self):return {'instance_id':'isolated-source' if self.received else '', 'count':len(self.received)}
 control=Control();bus=TeleopBus(shared,control)
 node=Node('isolated_input_test',context=ctx)
 qos=QoSProfile(depth=16,reliability=ReliabilityPolicy.RELIABLE,history=HistoryPolicy.KEEP_LAST)
@@ -49,6 +49,9 @@ def send(seconds,topic='/test/a'):
  while time.monotonic()<deadline:
   seq+=1;message=String();message.data=json.dumps({'sequence':seq});pubs[topic].publish(message);shared.spin_once(timeout_sec=.01)
 try:
+ deadline=time.monotonic()+.3
+ while time.monotonic()<deadline:shared.spin_once(timeout_sec=.02)
+ assert not feedback_times,'feedback published before first input'
  send(2)
  assert len(control.received)>20,(len(control.received),bus.status())
  assert bus.subscription_generation==1,bus.status()

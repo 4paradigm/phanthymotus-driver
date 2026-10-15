@@ -137,8 +137,11 @@ class TeleopBus:
                     if self.pub and time.monotonic() >= next_publish:
                         next_publish = time.monotonic()+1/30
                         try:
+                            feedback = self.control.feedback()
+                            if not feedback['instance_id']:
+                                continue
                             message = self.String()
-                            message.data = json.dumps(self.control.feedback(), allow_nan=False, separators=(',', ':'))
+                            message.data = json.dumps(feedback, allow_nan=False, separators=(',', ':'))
                             self.pub.publish(message)
                             with self._status_lock:
                                 self.publish_error = None

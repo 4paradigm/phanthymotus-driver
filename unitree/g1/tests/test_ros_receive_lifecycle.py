@@ -134,8 +134,9 @@ def test_canvas_topic_is_used_without_source_path_convention(tmp_path):
     assert subscribed == ['/canvas/custom_input']
 
 
-@pytest.mark.parametrize('input_hz,stall', [(0, 0.), (72, 0.), (72, .2)])
-def test_feedback_publishes_at_thirty_hz_without_catchup(monkeypatch, input_hz, stall):
+@pytest.mark.parametrize('input_hz,stall,known_source',
+                         [(0, 0., True), (72, 0., True), (72, .2, True), (0, 0., False), (72, 0., False)])
+def test_feedback_publishes_at_thirty_hz_without_catchup(monkeypatch, input_hz, stall, known_source):
     bus, _, _ = bus_stub()
     now, next_input, spins, received = [0.], [1/input_hz if input_hz else float('inf')], [0], [0]
     published = []
@@ -147,24 +148,32 @@ def test_feedback_publishes_at_thirty_hz_without_catchup(monkeypatch, input_hz, 
                         ShutdownException=type('ShutdownException', (Exception,), {})))
     bus.closed = threading.Event()
     bus.String = SimpleNamespace
-    bus.control = SimpleNamespace(_lock=threading.RLock(), binding={}, feedback=lambda: {'sequence': received[0]})
+    bus.control = SimpleNamespace(_lock=threading.RLock(), binding={}, feedback=lambda: {
+        'instance_id': 'pico-source' if known_source or received[0] >= 5 else '', 'sequence': received[0]})
     bus._bind = lambda binding: None
     def spin(timeout_sec):
         spins[0] += 1
         now[0] = min(now[0]+timeout_sec, next_input[0])
         if now[0] >= next_input[0]:
             received[0] += 1; next_input[0] += 1/input_hz
+        if not input_hz and not known_source and now[0] >= 1.: bus.closed.set()
         if spins[0] == 10 and stall:
             now[0] += stall
             next_input[0] = now[0]+1/input_hz
     def publish(message):
-        published.append((now[0], json.loads(message.data)['sequence']))
+        feedback = json.loads(message.data)
+        assert feedback['instance_id'] == 'pico-source'
+        published.append((now[0], feedback['sequence']))
         if len(published) == 31: bus.closed.set()
     bus.pub = SimpleNamespace(publish=publish)
     bus.executor = SimpleNamespace(context=SimpleNamespace(ok=lambda: True), spin_once=spin,
                                    remove_node=lambda node: None, shutdown=lambda: None)
     bus.node.destroy_node = lambda: None
     bus._run()
+    if not known_source and not input_hz:
+        assert not published and not bus.health.status()['fatal']
+        return
+    if not known_source: assert published[0][0] >= 5/input_hz
     intervals = [b[0]-a[0] for a,b in zip(published, published[1:])]
     assert min(intervals) >= 1/30-1e-9
     if stall: assert max(intervals) >= stall
