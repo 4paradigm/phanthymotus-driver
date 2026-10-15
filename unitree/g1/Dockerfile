@@ -21,16 +21,6 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces opencv-python-headless==4.11.0.86 numpy==2.2.6 pyrealsense2 sounddevice pyalsaaudio \
-    casadi==3.8.1 scipy==1.15.3 libpinocchio==4.1.0 coal==3.0.3 eigenpy==3.13.0 \
-    cmeel==0.61.0 cmeel-boost==1.90.0 cmeel-urdfdom==6.0.0 \
-    cmeel-eigen==3.4.1 cmeel-urdfdom-headers==3.0.0 jrl-cmakemodules==2.1.0
-
-# PyPI's pin wheel omits CasADi bindings; use the prebuilt ARM64 wheel.
-ARG PIN_WHEEL_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/pinocchio/pin-4.1.0-0-cp310-cp310-manylinux_2_35_aarch64.whl
-RUN python3 -m pip install --no-cache-dir --no-deps "${PIN_WHEEL_URL}"
-
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
 RUN curl -fsSL ${CYCLONEDDS_URL} \
@@ -44,7 +34,13 @@ RUN curl -fsSL ${CYCLONEDDS_URL} \
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 
-RUN python3 -m pip install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
+COPY requirements.txt /work/requirements.txt
+RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
+
+# PyPI's pin wheel omits CasADi bindings; use the verified ARM64 build artifact.
+ARG PIN_WHEEL_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/pinocchio/pin-4.1.0-0-cp310-cp310-manylinux_2_35_aarch64.whl
+ARG PIN_WHEEL_SHA256=bde8d1726200b93ee2fd291128ccc97d32123db6e1b49dfaa4b311cbfcaa28ef
+RUN python3 -m pip install --no-cache-dir --no-deps "${PIN_WHEEL_URL}#sha256=${PIN_WHEEL_SHA256}"
 
 # Isolate rclpy topics (domain 42) from unitree_sdk2py's domain 0.
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).

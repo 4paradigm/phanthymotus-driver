@@ -26,7 +26,7 @@
 
 ## 构建
 
-G1 使用 `unitree/g1/Dockerfile`，默认从 `bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest` 安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。依赖步骤位于源码 COPY 之前，正常构建可复用 Docker 缓存。
+G1 使用 `unitree/g1/Dockerfile`，默认从 `bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest` 安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。普通 pip 依赖统一维护在 `requirements.txt`，Dockerfile 在编译 CycloneDDS 库后通过 `pip install -r` 安装，包括从源码安装其 Python 绑定。依赖步骤位于业务源码 COPY 之前，正常构建可复用 Docker 缓存。
 
 在仓库根目录执行本地 ARM64 构建。与现有 build.sh 一样，构建上下文需要包含共享 common 目录：
 
@@ -39,11 +39,13 @@ docker build --platform linux/arm64 \
   -t local/g1:dev "$G1_BUILD_CONTEXT"
 ```
 
+非 Docker 环境安装 requirements 前，也须先安装 CycloneDDS 0.10.5 库并设置 `CYCLONEDDS_HOME`；之后仍须按下一节安装带校验的定制 Pinocchio wheel。
+
 `ROS_BASE_IMAGE` 可指定 ROS 基础镜像，`PYPI_MIRROR` 可指定 Python 包索引。原有 `./build.sh unitree/g1` 入口保持可用，但该脚本会按 `.env` 配置推送镜像。
 
 ### 重新生成 Pinocchio wheel
 
-普通 PyPI `pin` wheel 不包含所需 CasADi 绑定。Dockerfile 通过 `PIN_WHEEL_URL` 直接安装预编译 wheel，适用于 Linux ARM64、Python 3.10 和 glibc 2.35 及以上版本。已有依赖保持不变，pip 使用 `--no-deps`；安装后沿用版本和 CasADi 模型检查。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。
+普通 PyPI `pin` wheel 不包含所需 CasADi 绑定。Dockerfile 通过 `PIN_WHEEL_URL` 单独安装预编译 wheel，并使用 pip 原生 URL 哈希校验 `#sha256=${PIN_WHEEL_SHA256}`；内容不匹配时构建失败。该 wheel 适用于 Linux ARM64、Python 3.10 和 glibc 2.35 及以上版本。已有依赖保持不变，pip 使用 `--no-deps`；安装后沿用版本和 CasADi 模型检查。开发环境先导入 `casadi`，再导入 `pinocchio.casadi`；缺失绑定时明确报错。
 
 需要重新生成 wheel 时，在已安装相同数值依赖的 Linux ARM64 环境执行：
 
@@ -54,7 +56,9 @@ python3 -m pip wheel --no-cache-dir --no-build-isolation --no-deps --no-binary=p
   --wheel-dir /tmp/pin-wheel pin==4.1.0
 ```
 
-上传 wheel 后，将 `PIN_WHEEL_URL` 设为实际下载地址，再构建 G1 镜像。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
+当前默认 SHA-256 为 `bde8d1726200b93ee2fd291128ccc97d32123db6e1b49dfaa4b311cbfcaa28ef`，来源是2026-10-12已验证的 Linux ARM64 构建产物及当日构建记录；不是以当前下载内容重新确定的期望值。
+
+重新发布时，先在验证后的原始构建产物上计算 `sha256sum` 并保存构建记录，再上传。构建时同时设置 `PIN_WHEEL_URL`（不带 URL fragment）和 `PIN_WHEEL_SHA256`。只换下载地址仍会使用原哈希并拒绝不同内容。`CMEEL_RUN_TESTS=OFF` 仅关闭依赖上游的打包测试，项目回归须单独运行。
 
 ## 安装与启动
 
