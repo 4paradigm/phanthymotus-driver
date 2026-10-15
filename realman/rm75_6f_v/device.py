@@ -40,6 +40,16 @@ class RM75Plugin:
         "controller_state": "rm_get_controller_state",
     }
 
+    @staticmethod
+    def _pose_violations(poses):
+        """关节限位安全校验：供跨模块姿态规划与指向调用校验。"""
+        violations = []
+        for side, pose in poses.items():
+            for i, val in enumerate(pose):
+                if not math.isfinite(val) or abs(val) > 180.0:
+                    violations.append({"joint": f"joint_{i+1}", "value": val})
+        return violations
+
     def __init__(self, client, config, namespace="rm75", ros2=None):
         self.client = client
         self._ros2 = ros2
@@ -2531,6 +2541,12 @@ def build_plugins(config, namespace, ros2):
             camera_config, namespace, ros2.executor_core
         )
         plugins.append(ext_camera_plugin)
+    if config.get("aruco_zones", {}).get("enabled", False):
+        from aruco_canvas import ArucoZonesPlugin
+
+        plugins.append(
+            ArucoZonesPlugin(config["aruco_zones"], namespace, ros2.executor_core)
+        )
     vision_config = config.get("vision_capture", {})
     # Vision capture is an explicit capability; an enabled RGB camera alone
     # must not implicitly add an undeclared recording card.
@@ -2546,3 +2562,8 @@ def build_plugins(config, namespace, ros2):
             )
         )
     return plugins
+
+
+# 模块级兼容别名，便于跨模块姿态规划与通用机械臂插件调用
+ArmPlugin = RM75Plugin
+

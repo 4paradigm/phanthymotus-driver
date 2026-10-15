@@ -21,6 +21,11 @@ def load_device():
     # The driver directory goes on sys.path the way main.py puts it there at
     # runtime: build_plugins imports its siblings by bare name (`camera`,
     # `servo`), so a loader that skips this tests a module the driver never runs.
+    if "numpy" not in sys.modules:
+        try:
+            import numpy
+        except ImportError:
+            sys.modules["numpy"] = mock.MagicMock()
     if str(DRIVER) not in sys.path:
         sys.path.insert(0, str(DRIVER))
     spec = importlib.util.spec_from_file_location("realman_rm75_device", DRIVER / "device.py")
@@ -54,9 +59,10 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("||", dockerfile)
         self.assertIn("pyrealsense2==2.56.5.9235", dockerfile)
         self.assertIn("numpy==1.23.5", dockerfile)
-        self.assertIn("opencv-python-headless==4.11.0.86", dockerfile)
+        self.assertIn("opencv-contrib-python-headless==4.11.0.86", dockerfile)
         self.assertIn("--only-binary=:all:", dockerfile)
         self.assertIn("COPY main.py device.py hardware.py servo.py camera.py realsense.py", dockerfile)
+        self.assertIn("aruco_canvas.py", dockerfile)
         camera = (DRIVER / "camera.py").read_text()
         self.assertNotIn("v4l2-ctl", camera)
         self.assertNotIn("import subprocess", camera)
@@ -173,7 +179,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn(f"output_dir: {directory}", (DRIVER / "config.yaml").read_text())
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("ros-humble-rmw-fastrtps-cpp ffmpeg", dockerfile)
-        self.assertIn("realsense.py vision_capture.py config.yaml", dockerfile)
+        self.assertIn("realsense.py vision_capture.py aruco_zones.py aruco_canvas.py config.yaml", dockerfile)
 
     def test_pick_place_needs_no_storage_configuration_or_mount(self):
         service = (DRIVER / "deploy/service.yml").read_text()

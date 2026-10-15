@@ -266,3 +266,24 @@ RealSense enumeration and capture, as described above.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
+
+## ArUco 标记识别与分拣辅助卡片 (`aruco_zones`)
+
+Driver 已注册 `aruco_zones` 处理卡片（`type: processor`），用于识别 RealSense 相机画面中的 ArUco 码 ID 及位置坐标，为下游物体分拣任务提供视觉依据：
+
+1. **输入与输出**：
+   - 输入：连接 `ext_camera` 的 RGB 图像流（`format: image/jpeg`）。
+   - 输出：带标记框与区域框的 JPEG 预览图（`/{namespace}/aruco_zones/overlay`）与 regions JSON 数据（`/{namespace}/aruco_zones/regions`）。
+2. **纯视觉识别与分拣查询**：
+   - 动作：支持 `start`、`info`、`detect`、`config`、`stop`。
+   - 调用 `dispatch("info", {})` 或 `dispatch("detect", {})` 即可获取当前检测到的所有码：
+     - `detected_marker_ids`: 画面中可见的 ArUco ID 列表，如 `[1, 5, 9]`。
+     - `detected_markers`: 包含每个码的详细位置列表：
+       - `id`: 标记 ID（整数）。
+       - `center_normalized`: `[x, y]`，范围 0~1 的归一化图像中心坐标。
+       - `center_px`: `[px_x, px_y]`，像素中心坐标。
+       - `corners_px`: 四个角点的像素坐标列表。
+       - `corners_normalized`: 四个角点的归一化坐标列表。
+   - 当无需预设分区时（纯识别模式），画面只要检测到有效码即可作为就绪状态（`ready: true`）。
+   - 当配置了分拣分区（`waiting_rect`、`sorting_1_rect`、`sorting_2_rect`）时，卡片还会自动按归一化矩形范围分配角色，并在三个区域均有唯一码时置 `ready: true`。
+
