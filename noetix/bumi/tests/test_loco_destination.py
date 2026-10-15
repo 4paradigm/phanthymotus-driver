@@ -8,6 +8,7 @@ import time
 import types
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -99,20 +100,33 @@ def test_rotate_timeout_s_stays_under_llm_budget(monkeypatch):
 
 
 class FakeHighCtrl:
-    """一阶植物：publish_cmd 的 z(vyaw) 按 GAIN 度/次推进 yaw。"""
-    def __init__(self, mode=2, yaw0=0.0, gain_deg_per_tick=3.0):
+    """双模植物：plant="ideal"（默认）逐帧 yaw += z*gain，与原行为完全一致；
+    plant="realistic" 带 stiction 死区（|z|<0.4 → 目标速度归零）与一阶速度迟滞
+    （目标 45*z °/s，τ=0.15s，dt=0.02s），yaw 按内部速度 wz_dps 推进。"""
+    def __init__(self, mode=2, yaw0=0.0, gain_deg_per_tick=3.0, plant="ideal"):
+        if plant not in ("ideal", "realistic"):
+            raise ValueError(f"unknown plant: {plant!r}")
+        self.plant = plant
         self.mode, self.yaw, self.gain = mode, yaw0, gain_deg_per_tick
         self.cmds = []          # (x, y, z) 每次 publish_cmd 记录
+        self.wz_dps = 0.0       # realistic 内部速度状态（°/s）；ideal 恒 0
     def get_mode(self): return self.mode
     def get_imu_data(self):
         import math
         half = math.radians(self.yaw) / 2
         return types.SimpleNamespace(
             ori=[0.0, 0.0, math.sin(half), math.cos(half)],
-            angular_vel=[0.0, 0.0, 0.0], linear_acc=[0.0, 0.0, 9.8])
+            # ideal：wz_dps 恒 0 → 仍报 0.0；realistic：真速度的 rad/s
+            angular_vel=[0.0, 0.0, math.radians(self.wz_dps)],
+            linear_acc=[0.0, 0.0, 9.8])
     def publish_cmd(self, x, y, z, action_cmd, index=0):
         self.cmds.append((x, y, z))
-        self.yaw += z * self.gain          # z 即 vyaw
+        if self.plant == "realistic":
+            target = 0.0 if abs(z) < 0.4 else 45.0 * z      # stiction 死区
+            self.wz_dps += (target - self.wz_dps) * (0.02 / 0.15)  # τ=0.15s
+            self.yaw += self.wz_dps * 0.02
+        else:
+            self.yaw += z * self.gain          # z 即 vyaw
 
 
 def _rotate_plugin(module, monkeypatch, fake):
@@ -120,6 +134,71 @@ def _rotate_plugin(module, monkeypatch, fake):
     monkeypatch.setattr(module, '_get_control_cmd', lambda name: name)
     return module.LocoPlugin(
         {}, 'robot', types.SimpleNamespace(add_node=lambda n: None), fake)
+
+
+# ── 双模植物真实性钉死（ideal/realistic） ─────────────────────────────────────
+
+def test_realistic_plant_has_stiction_deadband(monkeypatch):
+    # plant="realistic"：stiction 死区 |z| < 0.4 —— 连发 z=0.3（死区内）100 帧，
+    # 目标速度恒 0 → wz 与 yaw 一帧都不得动；0.39 仍在死区；恰在 0.4 边界必须开动。
+    fake = FakeHighCtrl(yaw0=10.0, plant="realistic")
+    for _ in range(100):
+        fake.publish_cmd(0.0, 0.0, 0.3, "test")
+    assert fake.yaw == 10.0                      # 死区内：yaw 精确不变
+    assert fake.wz_dps == 0.0                    # 内部速度状态保持静止
+    assert fake.get_imu_data().angular_vel[2] == 0.0
+    assert len(fake.cmds) == 100                 # cmds 仍逐帧全量记录
+
+    fake.publish_cmd(0.0, 0.0, 0.39, "test")
+    assert fake.yaw == 10.0                      # 0.39 < 0.4 仍在死区
+
+    fake.publish_cmd(0.0, 0.0, 0.4, "test")      # |z| < 0.4 不成立 → 必须开动
+    assert fake.yaw > 10.0
+
+
+def test_realistic_plant_velocity_lags(monkeypatch):
+    # plant="realistic"：首帧 z=1.0 → 目标 45°/s，一阶迟滞（τ=0.15s, dt=0.02s）
+    # 单帧只爬到 45*(0.02/0.15)；随后停令（只发 z=0 帧）→ 惯性使 yaw 继续增长，
+    # 每帧增量按 (1 - 0.02/0.15) 单调衰减趋零，而非 ideal 停令后增量即刻归 0。
+    import math
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0, plant="realistic")
+    fake.publish_cmd(0.0, 0.0, 1.0, "test")
+    assert fake.wz_dps == pytest.approx(45.0 * (0.02 / 0.15))  # 首帧仅爬升一截
+    assert fake.wz_dps < 45.0                    # 迟滞：单帧到不了目标速度
+    assert fake.yaw == pytest.approx(fake.wz_dps * 0.02)
+    # Task 2 的 settle 逻辑读 angular_vel[2]：必须是真 wz 的 rad/s（非 0、非 °/s）
+    wz_rad = fake.get_imu_data().angular_vel[2]
+    assert wz_rad == pytest.approx(math.radians(fake.wz_dps))
+    assert wz_rad > 0.0
+
+    increments = [fake.yaw]                      # 首帧位移（yaw0=0.0）
+    for _ in range(8):                           # 静默：此后只发零速帧
+        prev = fake.yaw
+        fake.publish_cmd(0.0, 0.0, 0.0, "test")
+        assert fake.yaw > prev                   # 惯性：停令后仍在继续转
+        increments.append(fake.yaw - prev)
+    assert all(a > b for a, b in zip(increments, increments[1:]))  # 单调衰减
+    decay = 1.0 - 0.02 / 0.15
+    for prev_step, step in zip(increments, increments[1:]):
+        assert step == pytest.approx(prev_step * decay)  # 精确一阶衰减
+    assert increments[-1] > 0                    # 尚未停死 —— 迟滞而非瞬停
+
+
+def test_ideal_plant_unchanged(monkeypatch):
+    # plant="ideal"（默认值）：逐帧精确 yaw += z*gain —— 无死区、无迟滞、无速度
+    # 状态，钉住既有 21 个测试赖以成立的旧行为；angular_vel[2] 恒 0.0。
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0)           # 默认即 ideal
+    explicit = FakeHighCtrl(gain_deg_per_tick=3.0, plant="ideal")
+    expected = 0.0
+    for z in (1.0, 0.5, -2.0, 0.0, 0.3):        # 含死区内的 0.3：ideal 不吃死区
+        fake.publish_cmd(0.0, 0.0, z, "test")
+        explicit.publish_cmd(0.0, 0.0, z, "test")
+        expected += z * 3.0
+        assert fake.yaw == expected              # 逐帧精确相等（非近似）
+        assert explicit.yaw == expected          # 显式 plant="ideal" 同轨
+    assert fake.wz_dps == 0.0 and explicit.wz_dps == 0.0  # ideal 无速度状态
+    assert fake.get_imu_data().angular_vel[2] == 0.0      # ideal 恒报 0.0
+    assert len(fake.cmds) == 5                   # cmds 全量记录不变
 
 
 def test_loco_destination_tool_schema_contract(monkeypatch):
