@@ -42,5 +42,8 @@ Thumbs.db
 # Docker
 .docker/
 
+# A3 AimDK wheel is stored in COS and fetched during Docker builds.
+agibot/A3/vendor/a3_aimdk-*.whl
+
 # Private SDK copied from the robot; not redistributed
 .local/face-light-sdk/

@@ -49,6 +49,13 @@ class Client(ClientBase):
         else:
             return RPC_ERR_CLIENT_API_NOT_REG, None
             
+    def _BeginCall(self, apiId: int, parameter: str):
+        """Send now, return a callable that waits for this request's response."""
+        ret, priority, leaseId = self.__CheckApi(apiId)
+        if ret != 0:
+            return lambda: (RPC_ERR_CLIENT_API_NOT_REG, None)
+        return self._BeginCallBase(apiId, parameter, priority, leaseId)
+
     def _CallNoReply(self, apiId: int, parameter: str):
         ret, proirity, leaseId = self.__CheckApi(apiId)
         if ret == 0:

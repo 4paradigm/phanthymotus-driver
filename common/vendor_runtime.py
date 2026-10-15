@@ -16,6 +16,7 @@ import re
 import signal
 import socket
 import threading
+from collections.abc import Mapping
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -164,7 +165,11 @@ def tool(
 
 class DriverBundle:
     def __init__(self, plugins: Iterable[Any]):
-        self.plugins = list(plugins)
+        # Most drivers return a list, while config-gated drivers may retain a
+        # name -> plugin mapping for tests and lookup.  Iterating a mapping
+        # yields its string keys, which later produces misleading errors such
+        # as "str has no attribute get_tool" and "str has no attribute start".
+        self.plugins = list(plugins.values()) if isinstance(plugins, Mapping) else list(plugins)
 
     def start_all(self) -> None:
         for plugin in self.plugins:
@@ -204,7 +209,9 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
         def log_message(self, fmt, *args):
             msg = fmt % args
             if '"POST /mcp' not in msg or "200" not in msg:
-                # The request line is remote-controlled on host networking.
+                # The request line is attacker-controlled: keep it ASCII-safe
+                # (no control chars / homoglyph noise via escapes) and capped,
+                # so a hostile client cannot forge or bloat log records.
                 safe = msg.encode("unicode_escape").decode("ascii")[:200]
                 print(f"[mcp] {self.address_string()} {safe}")
 
