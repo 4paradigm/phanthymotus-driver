@@ -132,22 +132,18 @@ class G1DeviceBundle:
                                             state_node=loco_state.node,
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
-            if plugins_cfg.get("loco_relative_move", {}).get("enabled", True) and smart_motion is not None:
-                from loco_relative_move import LocoRelativeMovePlugin, PointBackend
-                from device import _loco_acp_notify
-                loco = self._plugins[-1]
-                def prepare_point():
-                    current = smart_motion.get_state()
-                    if current.get("error"):
-                        return {"ret": None, "error": current["error"]}
-                    if current.get("state") in ("navigating", "nav_paused"):
-                        return {"ret": None, "error": "Stop navigation before loco_relative_move"}
-                    return loco.dispatch("stop_move", {})
-                self._point_card = LocoRelativeMovePlugin(
-                    plugins_cfg.get("loco_relative_move", {}), PointBackend(smart_motion), _loco_acp_notify,
-                    prepare=prepare_point)
-                self._plugins.append(self._point_card)
-                print("[bundle] LocoRelativeMovePlugin loaded")
+
+        if plugins_cfg.get("loco_relative_move", {}).get("enabled", True):
+            from loco_relative_move import LocoRelativeMovePlugin, PointBackend
+            from device import _loco_acp_notify
+            from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+            relative_client = LocoClient()
+            relative_client.SetTimeout(10.0)
+            relative_client.Init()
+            self._point_card = LocoRelativeMovePlugin(
+                plugins_cfg.get("loco_relative_move", {}), PointBackend(relative_client), _loco_acp_notify)
+            self._plugins.append(self._point_card)
+            print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin

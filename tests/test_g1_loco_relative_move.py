@@ -290,14 +290,6 @@ class TestLocoRelativeMove(unittest.TestCase):
         self.assertIn('error', point.dispatch('move', dict(x=.3)))
         self.assertEqual(notices[0][0][1], 'cancelled')
 
-    def test_prepare_failure_never_sends_a_movement(self):
-        point, backend, notices, done = self.setup_point()
-        point.prepare = lambda: {'ret': 3104}
-        point.dispatch('move', dict(x=.3))
-        self.assertTrue(done.wait(1))
-        self.assertEqual(backend.calls, [])
-        self.assertEqual(notices[0][0][1], 'error')
-
     def test_schema_declares_base_and_completion(self):
         point, _, _, _ = self.setup_point()
         schema = point.get_tools()[0]['inputSchema']
@@ -652,19 +644,76 @@ class TestSmartMotionPointIntegration(unittest.TestCase):
             self.assertIn('error', env['handle_point_move'](self.command(1)))
         self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
 
-    def test_point_backend_only_calls_safety_proxy(self):
+class TestDirectPointBackend(unittest.TestCase):
+    def test_bundle_registers_direct_sdk_card_without_loco_or_safety_proxy(self):
+        source = Path(__file__).resolve().parents[1] / 'unitree/g1/main.py'
+        tree = ast.parse(source.read_text())
+        bundle = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'G1DeviceBundle')
+        init = next(node for node in bundle.body if isinstance(node, ast.FunctionDef) and node.name == '__init__')
+        registration = next(node for node in init.body if isinstance(node, ast.If)
+                            and 'loco_relative_move' in ast.unparse(node.test))
         calls = []
-        proxy = SimpleNamespace(
-            point_move=lambda *args: calls.append(('move', args)) or {'ret': 0},
-            point_result=lambda *args: {'status': 'cancelled'},
-            point_stop=lambda *args: calls.append(('stop', args)) or {'ret': 0},
-            point_finish=lambda *args: calls.append(('finish', args)) or {'ret': 0})
-        backend = PointBackend(proxy)
-        backend._begin_motion(.3, 0, 0, 1, 'point_job_0')
-        self.assertEqual(calls[0][1][-1], 'point_job')
+        client = SimpleNamespace(SetTimeout=lambda timeout: calls.append(('timeout', timeout)),
+                                 Init=lambda: calls.append(('init',)))
+        modules = {
+            'loco_relative_move': SimpleNamespace(LocoRelativeMovePlugin=LocoRelativeMovePlugin, PointBackend=PointBackend),
+            'device': SimpleNamespace(_loco_acp_notify=lambda *args, **kwargs: None),
+            'unitree_sdk2py.g1.loco.g1_loco_client': SimpleNamespace(LocoClient=lambda: client),
+        }
+        instance = SimpleNamespace(_plugins=[])
+        with patch.dict('sys.modules', modules):
+            exec(compile(ast.Module(body=[registration], type_ignores=[]), str(source), 'exec'),
+                 {'self': instance, 'plugins_cfg': {'loco_relative_move': {'enabled': True}}, 'print': lambda *args: None})
+        self.assertEqual(calls, [('timeout', 10.), ('init',)])
+        self.assertEqual(instance._plugins, [instance._point_card])
+        self.assertIs(instance._point_card.loco.motion.client, client)
+
+    def backend(self):
+        calls = []
+        client = SimpleNamespace(
+            BeginMove=lambda *args: calls.append(('move', args)) or (lambda: 0),
+            BeginStopMove=lambda: calls.append(('stop', ())) or (lambda: 0))
+        return PointBackend(client), client, calls
+
+    def test_direct_sdk_runs_all_stages_and_notifies_completion(self):
+        backend, _, calls = self.backend()
+        backend.motion.timer_factory = lambda delay, callback, args: threading.Timer(.01, callback, args)
+        done, notifications = threading.Event(), []
+        def notify(*args, **kwargs):
+            notifications.append(args)
+            done.set()
+        card = LocoRelativeMovePlugin({}, backend, notify)
+        card.dispatch('move', dict(x=.3, y=-.3, angle=90))
+        self.assertTrue(done.wait(2))
+        self.assertEqual([call[0] for call in calls], ['move', 'stop'] * 3)
+        self.assertEqual([call[1][:3] for call in calls if call[0] == 'move'],
+                         [(.3, 0., 0.), (0., -.3, 0.), (0., 0., .5)])
+        self.assertEqual(notifications[0][1], 'completed')
+        self.assertEqual(notifications[0][2]['completed_stages'], ['straight', 'lateral', 'rotation'])
+
+    def test_direct_sdk_cancel_stops_and_does_not_send_next_stage(self):
+        backend, _, calls = self.backend()
+        pending = backend._begin_motion(.3, 0., 0., 30, 'point_job_0')
+        self.assertTrue(callable(pending))
+        self.assertEqual(pending()['ret'], 0)
+        self.assertEqual(backend._stop_motion()['ret'], 0)
         self.assertEqual(backend._motion_result('point_job_0')['status'], 'cancelled')
-        backend._stop_motion()
-        backend.finish_sequence()
-        self.assertEqual([c[0] for c in calls], ['move', 'stop', 'finish'])
+        self.assertEqual([call[0] for call in calls], ['move', 'stop'])
+
+    def test_direct_sdk_move_failure_never_advances_sequence(self):
+        backend, client, calls = self.backend()
+        client.BeginMove = lambda *args: calls.append(('move', args)) or (lambda: 3104)
+        done, statuses = threading.Event(), []
+        def notify(action_id, status, result, **kwargs):
+            statuses.append(status)
+            done.set()
+        card = LocoRelativeMovePlugin({}, backend, notify)
+        card.dispatch('move', dict(x=.3, y=.3))
+        self.assertTrue(done.wait(2))
+        self.assertEqual(statuses, ['error'])
+        self.assertEqual(len([call for call in calls if call[0] == 'move']), 1)
+        self.assertTrue(any(call[0] == 'stop' for call in calls))
+
+    def test_requires_sdk_client(self):
         with self.assertRaises(ValueError):
             PointBackend(None)

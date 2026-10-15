@@ -1,4 +1,4 @@
-"""Sequential relative movement through the shared SmartMotion safety owner."""
+"""Sequential relative movement through a dedicated SDK client in the main process."""
 import math
 import threading
 import time
@@ -24,10 +24,9 @@ class LocoRelativeMovePlugin:
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
 
-    def __init__(self, config, loco, notify, prepare=None):
+    def __init__(self, config, loco, notify):
         self.loco = loco
         self.notify = notify
-        self.prepare = prepare
         self.command_lock = threading.RLock()
         self.active = None
         self.faulted = False
@@ -46,7 +45,8 @@ class LocoRelativeMovePlugin:
         return [{
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": "Sequential relative movement: straight along x, sideways along y, then rotate. "
-                           "Uses loco velocity/time control; distances and angles are approximate, "
+                           "Calls the Unitree SDK directly without the SmartMotion safety subprocess. "
+                           "Uses velocity/time control; distances and angles are approximate, "
                            "without position feedback. At 0.3 m/s, translation uses empirical time compensation; "
                            "Negative x and y have separate time corrections at 0.3 m/s. "
                            "At 0.5 rad/s, 90/180 degree turns and right turns use empirical time compensation. "
@@ -215,12 +215,6 @@ class LocoRelativeMovePlugin:
     def _run(self, job, stages):
         status, result = "completed", {"completed_stages": []}
         try:
-            if self.prepare:
-                with self.command_lock:
-                    if not job["cancel"].is_set():
-                        prepared = self.prepare()
-                        if prepared.get("ret") != 0:
-                            raise RuntimeError(prepared.get("error") or "Could not stop preceding loco movement")
             for index, stage in enumerate(stages):
                 with self.command_lock:
                     if job["cancel"].is_set():
@@ -276,37 +270,24 @@ class LocoRelativeMovePlugin:
 
 
 class PointBackend:
-    """Point sequence adapter; all velocity and stop RPCs belong to SmartMotion."""
-    def __init__(self, smart_motion):
-        if smart_motion is None:
-            raise ValueError("loco_relative_move requires the SmartMotion safety harness")
-        self.smart_motion = smart_motion
-        self.sequence_id = None
+    """Direct SDK adapter; deadlines remain independent of RPC response waits."""
+    def __init__(self, client):
+        if client is None:
+            raise ValueError("loco_relative_move requires an SDK client")
+        try:
+            from .point_motion import PointMotion
+        except ImportError:  # Container modules live directly under /work.
+            from point_motion import PointMotion
+        self.motion = PointMotion(client)
 
     def _begin_motion(self, vx, vy, vyaw, duration, action_id):
-        self.sequence_id = action_id.rsplit("_", 1)[0]
-        return self.smart_motion.point_move(vx, vy, vyaw, duration, action_id, self.sequence_id)
+        return self.motion.begin_start(vx, vy, vyaw, duration, action_id)
 
     def _start_motion(self, vx, vy, vyaw, duration, action_id):
-        return self._begin_motion(vx, vy, vyaw, duration, action_id)
+        return self.motion.start(vx, vy, vyaw, duration, action_id)
 
     def _motion_result(self, action_id):
-        return self.smart_motion.point_result(action_id, self.sequence_id)
+        return self.motion.get_result(action_id)
 
     def _stop_motion(self):
-        return self.smart_motion.point_stop(self.sequence_id)
-
-    def finish_sequence(self):
-        if self.sequence_id is not None:
-            result = self.smart_motion.point_finish(self.sequence_id)
-            if result.get("ret") != 0:
-                raise RuntimeError(result.get("error") or "Point ownership release failed")
-            self.sequence_id = None
-
-    def close(self):
-        # A failed stop deliberately retains ownership in the safety process.
-        # Shutdown must still allow the bundle to stop that process afterwards.
-        try:
-            self.finish_sequence()
-        except RuntimeError:
-            pass
+        return self.motion.stop()
