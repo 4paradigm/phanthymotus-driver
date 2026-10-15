@@ -8,6 +8,7 @@ from uuid import uuid4
 from vendor import MoveError
 
 GRIPPER_SIDES = {'gripper_left': 'left', 'gripper_right': 'right'}
+MAX_OPENING = 94  # Operator-selected control limit; raw vendor feedback stays 0..100.
 MOTION_ACTIONS = ('open', 'close')
 TIMEOUT = 20
 ACP_TIMEOUT = 40
@@ -47,13 +48,20 @@ def percentage(value, name):
     return value
 
 
+def opening_target(value):
+    value = percentage(value, '开口度')
+    if value > MAX_OPENING:
+        raise ValueError('目标开口度请填写0至'+str(MAX_OPENING)+'；当前最大张开目标为'+str(MAX_OPENING))
+    return value
+
+
 def command(action, args, side):
     args = normalize_arguments(action, args)
     if side not in ('left', 'right'):
         raise ValueError('请选择左侧或右侧夹爪')
     if action not in MOTION_ACTIONS:
         raise ValueError('不支持的夹爪操作')
-    opening = percentage(args.get('opening'), '开口度') if action == 'open' else 0
+    opening = opening_target(args.get('opening')) if action == 'open' else 0
     speed, force = percentage(args.get('speed'), '速度'), percentage(args.get('force'), '夹持力')
     if speed == 0:
         raise ValueError('执行开合时速度须大于0')
@@ -80,12 +88,12 @@ def state_data(data, selected_side=None):
 def tool(metadata, side):
     label = '左' if side == 'left' else '右'
     return {'name': 'gripper_' + side, 'type': 'actuator', 'multiInstance': False,
-            'description': 'TRON2' + label + '夹爪：open设置目标开口，close闭合，recover检查静止反馈后恢复本侧失败任务。开口0为最小闭合、100为最大张开；速度/力为相对档位，不代表毫米或牛顿。达到开口不代表夹住物体。恢复前须现场确认静止空载；恢复不是急停。',
+            'description': 'TRON2' + label + '夹爪：open设置目标开口，close闭合，recover检查静止反馈后恢复本侧失败任务。开口0为最小闭合、94为当前配置最大张开目标；速度/力为相对档位，不代表毫米或牛顿。达到开口不代表夹住物体。恢复前须现场确认静止空载；恢复不是急停。',
             'inputSchema': {'type': 'object', 'additionalProperties': False,
                 'properties': {
                     'action': {'type': 'string', 'enum': ['open', 'close', 'recover'],
                                'description': 'open设置目标开口；close闭合；recover恢复本侧失败任务'},
-                    'opening': {'type': 'number', 'minimum': 0, 'maximum': 100, 'description': '目标开口度：0闭合，100张开；请填写实物可达到的目标'},
+                    'opening': {'type': 'number', 'minimum': 0, 'maximum': MAX_OPENING, 'description': '目标开口度：0闭合，94为当前最大张开目标；保持厂家原始单位'},
                     'speed': {'type': 'number', 'exclusiveMinimum': 0, 'maximum': 100, 'description': '开合速度档位：大于0至100'},
                     'force': {'type': 'number', 'minimum': 0, 'maximum': 100, 'description': '夹持力档位：0至100，并非牛顿'},
                     **metadata},

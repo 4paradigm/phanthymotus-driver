@@ -246,13 +246,14 @@ class RobotReader:
 
     async def send_gripper(self, data):
         # This private transport accepts exactly one validated side, never a generic vendor command.
-        from gripper import percentage
+        from gripper import percentage, opening_target
         keys = set(data) if isinstance(data, dict) else set()
         sides = [side for side in ('left', 'right') if keys == {side + '_' + key for key in ('opening', 'speed', 'force')}]
         if len(sides) != 1:
             raise MoveError('夹爪参数必须只包含所选侧', False)
         for key, value in data.items():
             percentage(value, key)
+        opening_target(data[sides[0] + '_opening'])
         if data[sides[0] + '_speed'] == 0:
             raise MoveError('开合速度须大于0', False)
         status = self.sample('robot_status')
