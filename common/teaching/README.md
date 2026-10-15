@@ -2,7 +2,7 @@
 
 本模块承载草稿、试运行、效果确认、资产持久化、普通 Skill 定义及四步网页流程；运动和设备状态仍由各机器人原控制器负责。模块来源为 [PiPER 示教 PR #402](https://github.com/4paradigm/phanthymotus-driver/pull/402) 的公共部分。当前 G1 分支只复用公共模块，不包含 PiPER 适配器、驱动改动、测试或 #395 的提交历史。
 
-共享路径与 #402 重叠；合并前需根据先后顺序重放公共模块改动并验证两边适配器，不应把公共模块当作两套独立实现。G1 的适配和验收属于独立 PR。网页宿主和本地 Skill 导入依赖 [Core #318](https://github.com/4paradigm/phanthymotus/pull/318)，G1 不新增 Core 改动。
+共享路径与 #402 重叠；合并前需根据先后顺序重放公共模块改动并验证两边适配器，不应把公共模块当作两套独立实现。已通过交叉检查确认原 PiPER #402 缺少新接口 `presentation` / `replay_instruction`，不能直接套用该公共模块；需要在独立 PiPER 适配中补齐并重新回归。G1 的适配和验收属于独立 PR。网页宿主和本地 Skill 导入依赖 [Core #318](https://github.com/4paradigm/phanthymotus/pull/318)，Core 中的新增逻辑保持通用，含每动作必填参数、型号元数据及动作包传输。
 
 ## 宇树 G1 的使用流程
 
@@ -42,7 +42,7 @@ G1 预览 60 秒内单次有效。回放入口核对预期 SHA 和停止代次�
 
 保存到 Driver 后由工作台宿主导入 Core 现有 Skill 格式，失败可幂等重试。不上传资源中心，不改变未来动作的确认要求。一个活动草稿；页面刷新恢复，Driver 重启后载入完整录制重新验证，已保存资产可直接请求运行。
 
-Skill 定义目前尚未固定来源 MCP 服务 / 卡片 ID。当前验证范围为一个绑定 G1 服务；多台同名 G1 的选择仍待完善。网页没有新增聊天框，Agent 使用已有语音/消息渠道；网页「运行技能」仍是资产 ID 参数表单，按名称选择运行的便捷页面尚未实现。
+G1 新定义记录来源 MCP/卡片，动作包导出和调用说明更新严格使用该来源；这不是 Agent 多设备自主路由的强制限制，多台同名 G1 的 Agent 选择仍待完善。网页没有新增聊天框，Agent 使用已有语音/消息渠道；网页「运行技能」仍是资产 ID 参数表单，按名称选择运行的便捷页面尚未实现。
 
 ## 浏览器复现
 
@@ -56,3 +56,14 @@ uv run --python 3.12 --no-project --with pytest --with numpy --with scipy --with
 ```
 
 预先安装 Playwright Chromium，或用 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 指定可执行文件。测试启动真实 Core API、MCP HTTP 和临时 SQLite，硬件输入/SDK 为模拟，不连接机器人，不调用真实 LLM。
+
+
+## 可选的动作包能力
+
+适配器实现 `compatibility()`、`export_recording(recording)` 和 `import_recording(manifest, data)` 后，工具声明 `inputSchema.x-skill-package.schema=motus.teaching.package/1`。未实现的机器人不暴露此能力。G1 当前支持 G1_23 双臂 10 关节固定手，兼容性与重新绑定由 G1 适配器执行。
+
+`package_export` / `package_read` 下载完整包；`package_begin` / `package_write` / `package_finish` 上传并创建未批准草稿。它们不暴露给 LLM，不移动机器人。必须重新试运行和确认效果后通过原 `save` 流程安装新的本机 Skill。`package_definition` 为原已保存资产生成当前调用说明，供用户显式更新旧 Skill。
+
+预览使用 `preview(asset_id)`，返回完整 `execution_arguments`，确认字段为 false。执行 `run` 的 per-action required 声明要求 asset_id、execute、preview_id、workspace_clear、take_control；用户明确确认后再填写 true。执行仍由适配器校验，不依赖 LLM schema 作为安全门。旧 `run(execute=false)` 线接口兼容保留。
+
+资源中心的附件发布尚未接通；不要把仅含资产 ID 的文字 Skill 当作能在别的设备安装使用的动作包。文件格式、界面和资源中心调查边界见 [G1 文档](../../docs/teaching/g1.md)。

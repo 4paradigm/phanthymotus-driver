@@ -45,7 +45,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     </div><aside class="panel soft"><h3 id="trial-status" class="outcome" role="status">等待试运行</h3><p id="trial-help" class="note">先检查起点，再按录制速度运行。</p><label class="effect"><input id="effect" type="checkbox" disabled><span>已观察真机，动作效果符合预期</span></label></aside>
   </section>
   <section id="save" hidden>
-    <div id="skill-form" class="layout"><div class="panel"><h2 class="section-title">保存为技能</h2><label class="field"><span>技能名称</span><input id="skill-name" maxlength="100" placeholder="例如：零件放入托盘"></label><label class="field" style="margin-bottom:0"><span>使用条件</span><textarea id="skill-conditions" maxlength="1000" placeholder="例如：零件和托盘位置固定，双臂已恢复录制起点。"></textarea></label></div><aside class="panel soft"><div class="aside-block"><h3 class="success">✓ 试运行与效果已确认</h3></div><div class="aside-block"><h3>以后可以这样说</h3><span id="phrase-preview" class="phrase">填写技能名称</span><p class="note">保存后加入现有技能库。</p></div></aside></div>
+    <div id="skill-form" class="layout"><div class="panel"><h2 class="section-title">保存为技能</h2><label class="field"><span>技能名称</span><input id="skill-name" maxlength="100" placeholder="例如：零件放入托盘"></label><label class="field" style="margin-bottom:0"><span>使用条件</span><textarea id="skill-conditions" maxlength="1000" placeholder="例如：零件和托盘位置固定，双臂已恢复录制起点。"></textarea></label></div><aside class="panel soft"><div class="aside-block"><h3 class="success">✓ 试运行与效果已确认</h3></div><div id="compatibility-panel" class="aside-block" hidden><h3>适用设备</h3><p id="compatibility-label"></p><p class="note">型号与完整动作会一起保存在动作包中。</p></div><div class="aside-block"><h3>以后可以这样说</h3><span id="phrase-preview" class="phrase">填写技能名称</span><p class="note">保存后加入现有技能库。</p></div></aside></div>
     <div id="confirmation-result" class="panel saved" role="status" hidden><div class="saved-mark">✓</div><h2>技能已保存</h2><p id="saved-hint" class="muted"></p><span id="saved-phrase" class="phrase"></span><p class="note">可在现有技能列表中查看和管理。</p></div>
   </section>
       <details id="existing" class="details-card"><summary>使用已有录制</summary><div class="load"><select id="recordings" aria-label="选择已有录制"><option value="">选择完整录制…</option></select><button id="load-btn">载入</button></div></details>
@@ -140,6 +140,9 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('next-hint').textContent=presentation().next_hint || '';
     $('trial-hint').textContent=presentation().trial_hint || '';
     $('skill-conditions').placeholder=presentation().conditions_placeholder || '';
+    const compatible=status.compatibility;
+    $('compatibility-panel').hidden=!compatible;
+    $('compatibility-label').textContent=compatible?[compatible.variant || compatible.model,presentation().recording_label,compatible.end_effectors==='fixed_hand'?'固定手':compatible.end_effectors].filter(Boolean).join(' · '):'';
     ['prepare','record','review','save'].forEach((id,i)=>{$(id).hidden=i!==stage;});
     document.querySelectorAll('.steps li').forEach((el,i)=>{el.classList.toggle('current',i===stage);el.classList.toggle('done',i<stage);el.querySelector('b').textContent=i<stage?'✓':String(i+1);if(i===stage)el.setAttribute('aria-current','step');else el.removeAttribute('aria-current');});
     $('check-btn').hidden=stage!==0;$('next-btn').hidden=stage!==0;$('to-save-btn').hidden=stage!==2;$('save-btn').hidden=stage!==3 || installed;
@@ -164,7 +167,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('start-hint').classList.toggle('success',!!inspection?.start.ready && inspection.start.mode!=='move_to_start');
     $('inspect-btn').disabled=locked || moving;$('trial-btn').disabled=locked || moving || !canTrial() || !!status.saved;
     $('again-btn').disabled=locked || moving;
-    $('trial-status').textContent=trial?.status==='completed'?'✓ 试运行已完成':trial?.status==='running'?'正在试运行':trial?.status==='cancelled'?'试运行已取消':trial?.status==='error'?'试运行失败':'等待试运行';
+    $('trial-status').textContent=trial?.status==='completed'?'✓ 试运行已完成':trial?.status==='running'?'正在试运行':trial?.status==='cancelled'?'试运行已取消':trial?.status==='error'?'试运行失败':draft.imported?'导入完成 · 等待本机试运行':'等待试运行';
     $('trial-status').classList.toggle('success',trial?.status==='completed');
     $('trial-help').textContent=trial?.status==='completed'?'请观察实际动作效果，确认后保存技能。':trial?.status==='error'?readable(trial.result?.reason) || '请检查设备后重试。':moving?'请观察真机，必要时停止动作。':presentation().trial_hint || '恢复物体布置，检查起点后试运行。';
     if(trial?.status!=='completed' || approvedTrial!==trial.action_id){approvedTrial=null;$('effect').checked=false;}
@@ -184,7 +187,10 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
       const changed=draft.id && status.draft?.id!==draft.id;
       if(changed)reset(status.draft || {});
       draft=status.draft || {};
-      if(!initialized || changed){stage=draft.recording?2:draft.teleop_id?1:0;initialized=true;}
+      if(!initialized || changed){
+        stage=draft.recording?2:draft.teleop_id?1:0;initialized=true;
+        if(draft.imported){for(const key of ['name','conditions'])$('skill-'+key).value=draft.imported.metadata[key] || '';updatePhrase();}
+      }
       if(draft.recording && stage===1)stage=2;
       if(draft.recording && plottedId!==draft.id)plot(draft.recording);
       $('connection').textContent='驱动已连接';$('connection-dot').classList.add('online');

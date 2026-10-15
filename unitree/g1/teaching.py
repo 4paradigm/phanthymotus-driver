@@ -1,9 +1,15 @@
 """Adapt G1's existing trajectory owner to the shared skill workbench."""
 import math
+import hashlib
+import os
+from pathlib import Path
 import secrets
+import tempfile
 import time
 
 from common.teaching import TeachingPlugin
+from common.teaching.package import SCHEMA as PACKAGE_SCHEMA
+from trajectory import SCHEMA as RECORDING_SCHEMA, UNITS, encode, read_recording
 
 
 class G1TeachingAdapter:
@@ -48,6 +54,80 @@ class G1TeachingAdapter:
         if result.get("error") or result.get("state") == "error":
             raise ValueError(result.get("code") or result.get("error") or "g1_control_error")
         return result
+
+    def compatibility(self):
+        profile = self.arm.profile or {}
+        if profile.get("profile_id") != "unitree_g1_23_dual_arm_relative_v1":
+            raise ValueError("unsupported_g1_package_profile")
+        binding = self.trajectory.binding()
+        return {"manufacturer": "unitree", "model": "G1", "variant": "G1_23",
+                "scope": "dual_arm", "end_effectors": "fixed_hand",
+                "joint_names": list(profile["arm_joint_names"]),
+                "model_sha256": binding["model_sha256"], "geometry_sha256": binding["geometry_sha256"],
+                "profile_id": profile["profile_id"], "profile_version": profile["version"],
+                "driver": "unitree/g1", "tool": "g1_teaching", "package_api": PACKAGE_SCHEMA,
+                "recording_schema": RECORDING_SCHEMA,
+                "driver_version": os.environ.get("IMAGE_TAG", "unknown"),
+                "requires_local_trial": True}
+
+    @staticmethod
+    def _portable_bytes(recording, binding):
+        header = {"type": "header", "schema": RECORDING_SCHEMA, "units": UNITS,
+                  "binding": binding, "joint_names": recording["joint_names"]}
+        data = bytearray(encode(header))
+        for frame in recording["frames"]:
+            # A controller session from the source robot has no authority here.
+            data.extend(encode(dict(frame, session_id="portable")))
+        digest = hashlib.sha256(data)
+        digest.update(str(recording["duration_ns"]).encode())
+        data.extend(encode({"type": "complete", "frames": len(recording["frames"]),
+                            "sha256": digest.hexdigest(), "duration_ns": recording["duration_ns"]}))
+        return bytes(data)
+
+    def export_recording(self, recording):
+        value = read_recording(self.trajectory.directory, recording["filename"], self.arm.limits)
+        self.trajectory._check_binding(value)
+        if value["sha256"] != recording["sha256"]:
+            raise ValueError("recording_changed_record_again")
+        return self._portable_bytes(value, {**value["binding"], "device_id": "requires_local_binding"})
+
+    def import_recording(self, manifest, data):
+        self.trajectory._idle()
+        current, required = self.compatibility(), manifest["compatibility"]
+        if set(required) != set(current):
+            raise ValueError("invalid_package_compatibility")
+        # Build labels are informative. Capability, geometry and joint order
+        # are the compatibility contract, never a loose substring of "G1".
+        for key in current.keys() - {"driver_version"}:
+            if current[key] != required[key]:
+                raise ValueError("incompatible_robot_" + key)
+        if manifest["recording"]["schema"] != RECORDING_SCHEMA:
+            raise ValueError("incompatible_recording_schema")
+        with tempfile.TemporaryDirectory(prefix="g1-package-check-") as directory:
+            (Path(directory)/"trajectory.jsonl").write_bytes(data)
+            recording = read_recording(directory, "trajectory.jsonl", self.arm.limits)
+        if recording["joint_names"] != current["joint_names"]:
+            raise ValueError("recording_joint_order")
+        for key in ("model_sha256", "geometry_sha256"):
+            if recording["binding"].get(key) != current[key]:
+                raise ValueError("incompatible_recording_" + key)
+        if recording["binding"].get("device_id") != "requires_local_binding":
+            raise ValueError("package_contains_device_binding")
+        if recording["frames"][0]["kind"] != "target":
+            raise ValueError("recording_initial_target_missing")
+        local = self._portable_bytes(recording, self.trajectory.binding())
+        directory = self.trajectory.directory
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        filename = "g1-import-" + secrets.token_hex(16) + ".jsonl"
+        path = directory / filename
+        try:
+            with path.open("xb") as stream:
+                os.chmod(path, 0o600)
+                stream.write(local); stream.flush(); os.fsync(stream.fileno())
+            return self.inspect(filename)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
 
     def info(self):
         value = self._call("info")
@@ -155,6 +235,11 @@ class G1TeachingAdapter:
             return {"ready": False, "can_trial": False, "error": str(exc)}
 
     def play(self, filename, args):
+        # Reject malformed execution before consuming the one-use preview.
+        if args.get("execute") is True and not args.get("preview_id"):
+            raise ValueError("missing_preview_id: 请补齐本次预览编号，没有执行动作")
+        if args.get("execute") is True and (args.get("workspace_clear") is not True or args.get("take_control") is not True):
+            raise ValueError("user_confirmation_required: 请取得用户本次路径与双臂接管确认")
         epoch, generation = self.epoch, self.control._generation
         self.trajectory._idle()
         recording = self.inspect(filename)
@@ -171,12 +256,13 @@ class G1TeachingAdapter:
                     "duration_seconds": recording["duration_seconds"], "binding": recording["binding"],
                     "binding_label": "G1 · " + recording["binding"]["device_id"][:12],
                     "description": self.presentation["trial_hint"]}
-        preview, self.preview = self.preview, None
-        if (not preview or preview[0] != args.get("preview_id") or time.monotonic() >= preview[1]
-                or preview[2] != signature):
+        preview = self.preview
+        if not preview or time.monotonic() >= preview[1] or preview[2] != signature:
+            self.preview = None
             raise ValueError("teaching_preview_expired")
-        if args.get("workspace_clear") is not True or args.get("take_control") is not True:
-            raise ValueError("本次接管和移动路径需要确认")
+        if preview[0] != args["preview_id"]:
+            raise ValueError("teaching_preview_mismatch: 请使用本次预览返回的完整编号，没有执行动作")
+        self.preview = None
         result = self._call("play", filename=filename, expected_generation=generation,
                             expected_sha256=recording["sha256"])
         return {**result, "state": result["status"]}

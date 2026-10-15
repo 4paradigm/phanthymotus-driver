@@ -94,6 +94,16 @@ def test_registration_and_checks_do_not_write_or_create_another_controller(g1_te
     assert "html" in call(service, "ui")
 
 
+def test_missing_profile_keeps_device_check_page_available(g1_teaching):
+    service, _, arm, _, channel, _ = g1_teaching
+    arm.profile = None
+    before = list(channel.positions)
+    assert call(service, "info")["compatibility"] is None
+    checks = {c["id"]: c for c in call(service, "check")["checks"]}
+    assert not checks["model"]["ok"]
+    assert channel.positions == before
+
+
 def test_recording_trial_saved_skill_reload_run_and_original_acp(g1_teaching):
     service, card, arm, sample, channel, receipts = g1_teaching
     draft, saved, trial = save(service)
@@ -192,6 +202,38 @@ def test_changed_device_cannot_run_saved_skill(g1_teaching):
     card.cfg["trajectory_device_id"] = "another-g1"
     with pytest.raises(ValueError, match="binding_mismatch"):
         call(service, "run", asset_id=saved["asset_id"])
+
+
+def test_agent_missing_parameters_are_recoverable_without_motion(g1_teaching):
+    service, _, _, _, channel, receipts = g1_teaching
+    _, saved, _ = save(service)
+    asset_id = saved["asset_id"]
+    before = len(channel.positions)
+    preview = call(service, "preview", asset_id=asset_id)
+    assert preview["execution_arguments"]["asset_id"] == asset_id
+    assert preview["confirmation_required"]
+    assert preview["execution_arguments"]["workspace_clear"] is False
+    with pytest.raises(ValueError, match="missing_preview_id"):
+        call(service, "run", asset_id=asset_id, execute=True, workspace_clear=True, take_control=True)
+    with pytest.raises(ValueError, match="missing_asset_id"):
+        call(service, "run", execute=True, preview_id=preview["preview_id"], workspace_clear=True, take_control=True)
+    with pytest.raises(ValueError, match="user_confirmation_required"):
+        call(service, "run", **preview["execution_arguments"])
+    assert len(channel.positions) == before
+    result = call(service, "run", **{**preview["execution_arguments"], "workspace_clear": True, "take_control": True})
+    wait_for(lambda: service.last_run is not None)
+    assert service.last_run["action_id"] == result["action_id"]
+    assert service.last_run["status"] == "completed" and len(receipts) == 2
+
+
+def test_wrong_preview_is_not_reported_as_timeout(g1_teaching):
+    service, _, _, _, channel, _ = g1_teaching
+    _, saved, _ = save(service)
+    preview = call(service, "preview", asset_id=saved["asset_id"])
+    before = len(channel.positions)
+    with pytest.raises(ValueError, match="teaching_preview_mismatch"):
+        call(service, "run", **{**preview["execution_arguments"], "preview_id": "wrong", "workspace_clear": True, "take_control": True})
+    assert len(channel.positions) == before
 
 
 def test_preview_fences_stop_at_native_handoff(g1_teaching, monkeypatch):
