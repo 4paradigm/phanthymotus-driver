@@ -447,12 +447,17 @@ def test_rotate_timeout_stops_and_reports_turned_degrees(monkeypatch):
     # 植物 gain=0（永远不动）+ 超时预算压到 0.05s → 必然走 timeout 支：
     # 报告实际转角（≈0）与末帧零速，而不是挂着或带着残速退出。
     module, _ = _load_device(monkeypatch)
+    calls = []
+    monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
     monkeypatch.setattr(module, '_rotate_timeout_s', lambda a: 0.05)
     fake = FakeHighCtrl(gain_deg_per_tick=0.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
     plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
     result = wait_rotate(plugin)
     assert result['state'] == 'timeout'
+    assert len(calls) == 1
+    assert calls[0][1] == 'error'
+    assert calls[0][2] is result
     assert abs(result['turned_deg']) < 1e-6             # 植物没动，实际转角为 0
     assert 'final_error_deg' in result                  # timeout 契约含误差报告
     assert abs(result['final_error_deg'] - 60.0) < 1e-6  # 仍差 60°，如实报告
@@ -472,6 +477,39 @@ def test_rotate_timeout_on_full_turn_reports_full_shortfall(monkeypatch):
     assert abs(result['turned_deg']) < 1e-6              # 植物没动
     assert abs(result['final_error_deg'] - 360.0) < 1e-6  # 欠整整一圈，如实报 360（而非 0）
     assert fake.cmds[-1] == (0, 0, 0)                     # 退出必零速
+
+
+@pytest.mark.parametrize('angle, pending_send', [(60, 1), (10, 1), (10, 2)])
+def test_rotate_cannot_publish_motion_after_stop_returns(monkeypatch, angle, pending_send):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    entered, release = threading.Event(), threading.Event()
+    publish = plugin._publish_cmd
+    nonzero_sends = 0
+
+    def pending_publish(x, y, z, action_cmd, index=0, **kwargs):
+        nonlocal nonzero_sends
+        if z != 0:
+            nonzero_sends += 1
+            if nonzero_sends == pending_send:
+                entered.set()
+                assert release.wait(2)
+        return publish(x, y, z, action_cmd, index, **kwargs)
+
+    monkeypatch.setattr(plugin, '_publish_cmd', pending_publish)
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': angle})
+    try:
+        assert entered.wait(2)
+        stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+        assert stopped == {'state': 'stopped'}
+        after_stop = len(fake.cmds)
+        assert fake.cmds[-1] == (0, 0, 0)
+    finally:
+        release.set()
+        result = wait_rotate(plugin, timeout_s=3)
+    assert result['state'] == 'stopped'
+    assert all(cmd == (0, 0, 0) for cmd in fake.cmds[after_stop:])
 
 
 def test_stop_move_interrupts_running_rotate(monkeypatch):

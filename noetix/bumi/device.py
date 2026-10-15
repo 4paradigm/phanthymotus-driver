@@ -588,13 +588,18 @@ class LocoPlugin:
             return self._do_teaching_action(action, args)
         return None
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
+                     *, cancel_event: threading.Event | None = None):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
             if elapsed < 0.002:
                 time.sleep(0.002 - elapsed)
+            # Recheck after taking the brake's publish lock, including any
+            # rate-limit wait: a cancelled rotation must not restart motion.
+            if cancel_event is not None and cancel_event.is_set():
+                return
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
 
@@ -733,7 +738,7 @@ class LocoPlugin:
                     self._active_action_id = None
             if claimed:
                 status = {"done": "completed", "stopped": "cancelled",
-                          "timeout": "timeout"}.get(
+                          "timeout": "error"}.get(
                               result.get("state") if result else None,
                               "error")
                 _acp_notify(action_id, status, result, "loco_destination")
@@ -882,7 +887,8 @@ class LocoPlugin:
                     self._publish_cmd(0.0, 0.0,
                                       _ROTATE_VYAW_SIGN
                                       * math.copysign(_ROTATE_VYAW_FULL, err),
-                                      default_cmd, 0)
+                                      default_cmd, 0,
+                                      cancel_event=self._rotate_stop_event)
                 else:
                     if stage == "cruise":
                         stage = "brake"
@@ -911,10 +917,12 @@ class LocoPlugin:
                         pulse_cmd = (_ROTATE_VYAW_SIGN
                                      * math.copysign(_ROTATE_PULSE_VYAW, err))
                         pulse_phase = "pulse"
-                        self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0)
+                        self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
+                                          cancel_event=self._rotate_stop_event)
                     elif pulse_phase == "pulse":
                         if time.monotonic() < pulse_end:
-                            self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0)
+                            self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
+                                              cancel_event=self._rotate_stop_event)
                         else:
                             # Pulse over → coast on zero cmd and re-read yaw
                             # until still (0.3 s cap) before the next pulse.

@@ -160,7 +160,7 @@ measures where the robot really turned instead.
 - Actions and parameters: `rotate angle_deg` returns immediately with
   `state: running`, an `action_id` and `expected_duration_s`; the motion
   runs on a background thread and its terminal result (`done` → completed,
-  `stopped` → cancelled, `timeout` → timeout, `error` → error) is posted
+  `stopped` → cancelled, `timeout` → error, `error` → error) is posted
   exactly once to `AGENT_CORE_URL/api/acp/complete`, which is how Agent
   Core releases the waiting LLM barrier (a delivery failure is logged, not
   retried). `expected_duration_s` is the whole-request timeout budget, not
