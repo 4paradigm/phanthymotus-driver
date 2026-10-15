@@ -147,6 +147,19 @@ def _rotate_plugin(module, monkeypatch, fake):
         {}, 'robot', types.SimpleNamespace(add_node=lambda n: None), fake)
 
 
+def wait_rotate(plugin, timeout_s=120):
+    """轮询 status 至 idle，返回 last_result（ACP 异步后行为测试的取结果方式）。"""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+        if status['state'] == 'idle':
+            return status['last_result']
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"rotate still {status['state']} after {timeout_s}s")
+        time.sleep(0.05)
+
+
 # ── 双模植物真实性钉死（ideal/realistic） ─────────────────────────────────────
 
 def test_realistic_plant_has_stiction_deadband(monkeypatch):
@@ -221,15 +234,102 @@ def test_loco_destination_tool_schema_contract(monkeypatch):
     assert set(props['action']['enum']) == {'rotate', 'stop_move', 'status'}
     assert props['angle_deg']['minimum'] == -360 and props['angle_deg']['maximum'] == 360
     assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
+    assert tool['inputSchema']['x-completion'] == {'actions': ['rotate'], 'timeout': 90}
     assert set(tool['inputSchema']['x-action-params']) == {'rotate', 'stop_move', 'status'}
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
+
+
+def test_rotate_dispatch_returns_immediately_with_action_id(monkeypatch):
+    # ACP 异步契约：dispatch('rotate') 立即返回 running + action_id + 预算，
+    # 不得阻塞到动作结束；随后 wait_rotate 取终态。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    started_at = time.monotonic()
+    started = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    elapsed = time.monotonic() - started_at
+    assert started['state'] == 'running'
+    assert started['action_id'].startswith('bumi_loco_destination_')
+    assert started['expected_duration_s'] == module._rotate_timeout_s(60)
+    assert started['requested_angle_deg'] == 60
+    assert elapsed < 0.5                       # 返回远早于动作完成（~0.6s+）
+    status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+    assert status['state'] == 'running'        # 返回瞬间动作仍在进行
+    result = wait_rotate(plugin)
+    assert result['state'] == 'done'
+    assert abs(result['final_error_deg']) <= 2.0
+
+
+def test_acp_terminal_state_fires_exactly_once(monkeypatch):
+    # 每个 action 恰一次 ACP 终态回调：done → completed；stop → cancelled。
+    # payload 与 last_result 同一 result dict（wait_rotate 返回即回调已发）。
+    module, _ = _load_device(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        module, '_acp_notify',
+        lambda action_id, status, result, tool: calls.append(
+            (action_id, status, result, tool)))
+
+    fake = FakeHighCtrl(gain_deg_per_tick=3.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    started = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(plugin)
+    assert result['state'] == 'done'
+    assert len(calls) == 1                     # done 路径恰 1 次
+    action_id, status, payload, tool = calls[0]
+    assert status == 'completed'
+    assert action_id == started['action_id']
+    assert tool == 'loco_destination'
+    assert payload is result                    # ACP payload 与 last_result 同一 dict
+
+    calls.clear()
+    fake2 = FakeHighCtrl(gain_deg_per_tick=1.0)
+    plugin2 = _rotate_plugin(module, monkeypatch, fake2)
+    started2 = plugin2.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+    stopped = plugin2.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+    assert stopped == {'state': 'stopped'}
+    result2 = wait_rotate(plugin2)
+    assert result2['state'] == 'stopped'
+    assert len(calls) == 1                     # stop 路径恰 1 次
+    assert calls[0][1] == 'cancelled'
+    assert calls[0][0] == started2['action_id']
+    assert calls[0][2] is result2
+
+
+def test_sigterm_stop_completes_pending_acp(monkeypatch):
+    # SIGTERM 路径（bundle stop_all → plugin.stop()）：进行中的 rotate 以
+    # cancelled 收尾（worker 自己完成回调），stop() 返回后状态回 idle。
+    module, _ = _load_device(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        module, '_acp_notify',
+        lambda action_id, status, result, tool: calls.append(
+            (action_id, status, result, tool)))
+    fake = FakeHighCtrl(gain_deg_per_tick=1.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    started = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+    assert started['state'] == 'running'
+    deadline = time.monotonic() + 2.0          # 确认真在转（已有转速帧）
+    while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
+        time.sleep(0.01)
+    assert any(c[2] != 0 for c in fake.cmds)
+
+    plugin.stop()                              # SIGTERM/redeploy 收尾路径
+    assert len(calls) == 1
+    assert calls[0][1] == 'cancelled'
+    assert calls[0][0] == started['action_id']
+    status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+    assert status['state'] == 'idle'
+    assert status['last_result']['state'] == 'stopped'
+    assert fake.cmds[-1] == (0, 0, 0)           # 退出必零速
 
 
 def test_rotate_converges_within_tolerance_and_brakes(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0
     assert abs(result['turned_deg'] - 60) < 3            # 植物实际转过约 60°
@@ -242,7 +342,8 @@ def test_rotate_takes_shortest_path_across_yaw_wrap(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(yaw0=170.0, gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 20})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 20})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done' and abs(result['final_error_deg']) <= 2.0
     assert result['turned_deg'] > 0                      # 逆时针 +20，而非 -340
 
@@ -252,7 +353,8 @@ def test_rotate_full_turn_actually_turns(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert 354 <= result['turned_deg'] <= 366
     assert abs(result['final_error_deg']) <= 2.0         # 整请求仍守 ±2° 容差
@@ -264,7 +366,8 @@ def test_rotate_large_angle_turns_requested_direction_not_shortcut(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 200})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 200})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert 194 <= result['turned_deg'] <= 206
     assert result['turned_deg'] > 0                      # 正向，绝不 ≈ −160
@@ -280,7 +383,8 @@ def test_rotate_timeout_stops_and_reports_turned_degrees(monkeypatch):
     monkeypatch.setattr(module, '_rotate_timeout_s', lambda a: 0.05)
     fake = FakeHighCtrl(gain_deg_per_tick=0.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(plugin)
     assert result['state'] == 'timeout'
     assert abs(result['turned_deg']) < 1e-6             # 植物没动，实际转角为 0
     assert 'final_error_deg' in result                  # timeout 契约含误差报告
@@ -295,7 +399,8 @@ def test_rotate_timeout_on_full_turn_reports_full_shortfall(monkeypatch):
     monkeypatch.setattr(module, '_rotate_timeout_s', lambda a: 0.05)
     fake = FakeHighCtrl(gain_deg_per_tick=0.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    result = wait_rotate(plugin)
     assert result['state'] == 'timeout'
     assert abs(result['turned_deg']) < 1e-6              # 植物没动
     assert abs(result['final_error_deg'] - 360.0) < 1e-6  # 欠整整一圈，如实报 360（而非 0）
@@ -303,25 +408,18 @@ def test_rotate_timeout_on_full_turn_reports_full_shortfall(monkeypatch):
 
 
 def test_stop_move_interrupts_running_rotate(monkeypatch):
-    # rotate 在工作线程里跑（150° / 小 gain 转不完），主线程 30ms 后下发 stop_move：
-    # rotate 必须经 _move_stop_event 以 stopped 收尾，且末帧零速。
+    # rotate 在 bumi_rotate 工作线程里跑（150° / 小 gain 转不完），主线程 30ms 后
+    # 下发 stop_move：rotate 必须经 _rotate_stop_event 以 stopped 收尾，且末帧零速。
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    box = {}
-
-    def _run():
-        box['result'] = plugin.dispatch(
-            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
-
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
+    started = plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+    assert started['state'] == 'running'                # dispatch 立即返回，不阻塞
     time.sleep(0.03)
     stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
-    worker.join(timeout=5)
-    assert not worker.is_alive()                        # rotate 确实被打断返回，而非挂死
+    result = wait_rotate(plugin)
     assert stopped == {'state': 'stopped'}
-    result = box['result']
     assert result['state'] == 'stopped'
     assert 'final_error_deg' in result                  # stopped 契约含误差报告
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
@@ -360,7 +458,8 @@ def test_rotate_stops_a_running_loco_move(monkeypatch):
     time.sleep(0.03)                                    # 确保 move 线程真的在发指令
     assert any(c == (0.2, 0.0, 0.0) for c in fake.cmds) # move 流已开
 
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0
     # move 线程已被互斥前导 join 停掉
@@ -377,20 +476,15 @@ def test_rotate_stops_a_running_loco_move(monkeypatch):
 
 
 def test_concurrent_move_is_refused_while_rotate_runs(monkeypatch):
-    # busy-guard（T2-2）：rotate 运行中（跑在 dispatch 线程，非 _move_thread）并发
+    # busy-guard（T2-2）：rotate 运行中（跑在 bumi_rotate 线程，非 _move_thread）并发
     # 下发 loco move 必须被拒绝且错误点名冲突——否则 move 前导 set→join(None)→clear
     # 会擦掉 rotate 待读的 stop 信号，move 帧还会与 rotate 帧交错。stop 不受限。
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    box = {}
-
-    def _run():
-        box['result'] = plugin.dispatch(
-            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
-
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
+    started = plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+    assert started['state'] == 'running'
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
         time.sleep(0.01)
@@ -405,10 +499,9 @@ def test_concurrent_move_is_refused_while_rotate_runs(monkeypatch):
     assert status['state'] == 'running'              # 拒 move 不得动 rotate 状态
 
     stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
-    worker.join(timeout=5)
-    assert not worker.is_alive()
+    result = wait_rotate(plugin)
     assert stopped == {'state': 'stopped'}           # busy-guard 不拦 stop_move
-    assert box['result']['state'] == 'stopped'
+    assert result['state'] == 'stopped'
     assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
 
 
@@ -418,14 +511,9 @@ def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    box = {}
-
-    def _run():
-        box['result'] = plugin.dispatch(
-            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
-
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
+    started = plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+    assert started['state'] == 'running'
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
         time.sleep(0.01)
@@ -439,10 +527,9 @@ def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
     assert status['state'] == 'running'              # 重入拒绝不得清掉 running
 
     stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
-    worker.join(timeout=5)
-    assert not worker.is_alive()
+    result = wait_rotate(plugin)
     assert stopped == {'state': 'stopped'}           # stop 信号未被重入擦掉
-    assert box['result']['state'] == 'stopped'
+    assert result['state'] == 'stopped'
     assert fake.cmds[-1] == (0, 0, 0)                # 退出必零速
 
 
@@ -470,7 +557,9 @@ def test_stop_during_rotate_startup_is_preserved(monkeypatch):
         release.set()
         worker.join(2)
     assert not worker.is_alive()
-    assert box['result']['state'] == 'stopped'
+    assert box['result']['state'] == 'running'       # dispatch 立即返回 running
+    result = wait_rotate(plugin)
+    assert result['state'] == 'stopped'
     assert all(cmd == (0, 0, 0) for cmd in fake.cmds)
 
 
@@ -510,8 +599,9 @@ def test_move_startup_cannot_overlap_rotate(monkeypatch):
         release.set()
         mover.join(2)
         rotator.join(2)
-        plugin.dispatch('stop_move', {'_tool_name': 'loco'})
     assert not mover.is_alive() and not rotator.is_alive()
+    wait_rotate(plugin)                              # rotate 线程跑完（0.3s 超时收尾）
+    plugin.dispatch('stop_move', {'_tool_name': 'loco'})
     first_rotate = next(i for i, cmd in enumerate(fake.cmds) if cmd[2] != 0)
     assert all(x == 0 and y == 0 for x, y, z in fake.cmds[first_rotate:])
 
@@ -521,7 +611,8 @@ def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': -60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': -60})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert -66 <= result['turned_deg'] <= -54
     assert abs(result['final_error_deg']) <= 2.0
@@ -548,7 +639,8 @@ def test_small_angle_reaches_target_despite_stiction(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(plant="realistic")
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 10})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 10})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
@@ -561,7 +653,8 @@ def test_no_limit_cycle_on_20_and_90(monkeypatch):
     for angle in (20, 90):
         fake = FakeHighCtrl(plant="realistic")
         plugin = _rotate_plugin(module, monkeypatch, fake)
-        result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': angle})
+        plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': angle})
+        result = wait_rotate(plugin)
         assert result['state'] == 'done', f"{angle}°: {result}"
         assert abs(result['final_error_deg']) <= 2.0, f"{angle}°: {result}"
         flips = _vyaw_sign_flips(fake.cmds)
@@ -574,7 +667,8 @@ def test_realistic_plant_full_turn_contract(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(plant="realistic")
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert 354 <= result['turned_deg'] <= 366
     assert abs(result['final_error_deg']) <= 2.0
@@ -585,7 +679,8 @@ def test_realistic_plant_full_turn_contract(monkeypatch):
 
 def test_status_reflects_last_rotate_result(monkeypatch):
     # status 必须给真值：idle 时带前次 rotate 的完整 result（缺失 last_result 即失败），
-    # rotate 在另一线程进行中时报 running；stopped 退出同样要记录进 last_result。
+    # rotate 进行中时报 running（dispatch 返回的 action_id 流确认动作已启动）；
+    # stopped 退出同样要记录进 last_result。
     module, _ = _load_device(monkeypatch)
 
     idle_plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl(gain_deg_per_tick=3.0))
@@ -593,36 +688,26 @@ def test_status_reflects_last_rotate_result(monkeypatch):
         'status', {'_tool_name': 'loco_destination'}
     ) == {"state": "idle", "last_result": None}         # 初始：无前次结果
 
-    result = idle_plugin.dispatch(
+    idle_plugin.dispatch(
         'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(idle_plugin)
     assert result['state'] == 'done'
     assert idle_plugin.dispatch(
         'status', {'_tool_name': 'loco_destination'}
     ) == {"state": "idle", "last_result": result}       # 与前次 rotate 完全一致
 
-    # 另一线程跑 150°（gain=1 转不完），主线程轮询到 running 再断言。
+    # dispatch 立即返回 action_id（150° / gain=1 转不完），进行中 status 报 running。
     run_plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl(gain_deg_per_tick=1.0))
-    box = {}
-
-    def _run():
-        box['result'] = run_plugin.dispatch(
-            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
-
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
-    status = None
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        status = run_plugin.dispatch('status', {'_tool_name': 'loco_destination'})
-        if status['state'] == 'running':
-            break
-        time.sleep(0.01)
+    started = run_plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+    assert started['state'] == 'running'                # action_id 流：立即返回 running
+    status = run_plugin.dispatch('status', {'_tool_name': 'loco_destination'})
     assert status['state'] == 'running'                 # 进行中必须报 running
     assert status['last_result'] is None                # 尚无完成记录
 
     run_plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
-    worker.join(timeout=5)
-    assert not worker.is_alive()
+    stopped = wait_rotate(run_plugin)
+    assert stopped['state'] == 'stopped'
     final = run_plugin.dispatch('status', {'_tool_name': 'loco_destination'})
     assert final['state'] == 'idle'
     assert final['last_result'] is not None             # stopped 退出也记录 last_result

@@ -357,6 +357,10 @@ class LocoPlugin:
         self._rotate_lock = threading.Lock()
         self._rotate_stop_event = threading.Event()
         self._rotate_state: dict = {"state": "idle", "last_result": None}
+        # ACP async completion for rotate: worker thread + the single active
+        # action whose terminal callback fires exactly once.
+        self._rotate_worker: threading.Thread | None = None
+        self._active_action_id: str | None = None
 
     def get_tools(self) -> list:
         return [
@@ -434,6 +438,10 @@ class LocoPlugin:
                     "status": {"params": [], "description": "查询当前转角动作状态。"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
+                # rotate 经后台线程异步完成，终态由 Agent Core 的 /api/acp/complete
+                # 回调上报；90 = _rotate_timeout_s(360) + 15。
+                "x-completion": {"actions": ["rotate"],
+                                 "timeout": _rotate_timeout_s(360) + 15},
             },
             "topic_out": [],
         }
@@ -529,7 +537,15 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
+        # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
+        # stop event ends the running rotate as "stopped", and the worker's
+        # own completion fires the ACP "cancelled" callback — joining here
+        # completes the ACP action before Agent Core is left holding a
+        # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
+        worker = self._rotate_worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=6)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -646,11 +662,13 @@ class LocoPlugin:
         return {"state": "stopped"}
 
     def _do_rotate(self, args: dict) -> dict:
-        # Bookkeeping wrapper: mark running on entry; on every completed path
-        # (done/timeout/stopped/error) record idle + the full result so
-        # _rotate_status can report the last real outcome.
-        # Reserve one rotation and initialize its cancellation atomically,
-        # before exposing running status. Later stops survive move cleanup.
+        # Sync entry: reserve one rotation atomically (busy-guard + clear
+        # cancellation) before exposing running status, then run the
+        # pre-flight checks. Validation/mode refusals complete here, before
+        # any motion starts, so they return synchronously WITHOUT an
+        # action_id (never ACP-wrapped). Anything that will move is handed
+        # to the bumi_rotate daemon thread, which records idle + the full
+        # result and fires the ACP terminal exactly once.
         with self._rotate_lock:
             if self._rotate_state["state"] == "running":
                 return {
@@ -662,28 +680,92 @@ class LocoPlugin:
                 }
             self._rotate_stop_event.clear()
             self._rotate_state["state"] = "running"
+        angle_deg, terminal = self._rotate_preflight(args)
+        if terminal is not None:
+            with self._rotate_lock:
+                self._rotate_state["state"] = "idle"
+                self._rotate_state["last_result"] = terminal
+            return terminal
+        action_id = f"bumi_loco_destination_{time.time_ns()}"
+        with self._rotate_lock:
+            self._active_action_id = action_id
+        worker = threading.Thread(target=self._do_rotate_worker,
+                                  args=(args, action_id),
+                                  daemon=True, name="bumi_rotate")
+        self._rotate_worker = worker
+        worker.start()
+        return {"state": "running", "action_id": action_id,
+                "expected_duration_s": _rotate_timeout_s(angle_deg),
+                "requested_angle_deg": angle_deg}
+
+    def _do_rotate_worker(self, args: dict, action_id: str) -> dict | None:
+        # bumi_rotate thread body: run the impl, then publish exactly one
+        # ACP terminal. The active action is claimed (cleared) under the
+        # lock BEFORE notifying — a duplicate completion is structurally
+        # impossible — and idle becomes visible only after the notify
+        # returns, so wait_rotate observing idle implies the callback fired.
         result = None
         try:
             result = self._do_rotate_impl(args)
             return result
+        except Exception as exc:
+            result = {"state": "error",
+                      "error": f"{type(exc).__name__}: {exc}"}
+            return result
         finally:
+            with self._rotate_lock:
+                claimed = self._active_action_id == action_id
+                if claimed:
+                    self._active_action_id = None
+            if claimed:
+                status = {"done": "completed", "stopped": "cancelled",
+                          "timeout": "timeout"}.get(
+                              result.get("state") if result else None,
+                              "error")
+                _acp_notify(action_id, status, result, "loco_destination")
             with self._rotate_lock:
                 self._rotate_state["state"] = "idle"
                 if result is not None:
                     self._rotate_state["last_result"] = result
 
-    def _do_rotate_impl(self, args: dict) -> dict:
-        # 1. Validate the requested angle before touching hardware.
+    def _rotate_preflight(self, args: dict) -> tuple[float | None, dict | None]:
+        # Synchronous pre-motion checks (Task 2 impl steps 1–2), shared by
+        # the dispatch path and the worker. Returns (angle_deg, None) when
+        # rotation may start, else (None, terminal) — a done/error dict the
+        # caller records and returns as-is. Zero-turn skips the workmode
+        # check: it is a deliberate no-op that succeeds in any mode.
         raw_angle = args.get("angle_deg")
         try:
             angle_deg = float(raw_angle)
         except (TypeError, ValueError):
-            return {"state": "error",
-                    "error": f"angle_deg must be a number, got {raw_angle!r}"}
+            return None, {"state": "error",
+                          "error": f"angle_deg must be a number, got {raw_angle!r}"}
         if not math.isfinite(angle_deg) or abs(angle_deg) > _ROTATE_ANGLE_LIMIT_DEG:
-            return {"state": "error",
-                    "error": (f"angle_deg must be a finite number within "
-                              f"±{_ROTATE_ANGLE_LIMIT_DEG:g} degrees, got {angle_deg}")}
+            return None, {"state": "error",
+                          "error": (f"angle_deg must be a finite number within "
+                                    f"±{_ROTATE_ANGLE_LIMIT_DEG:g} degrees, got {angle_deg}")}
+        if abs(angle_deg) < 0.05:
+            return angle_deg, None
+        mode = int(self._high_ctrl.get_mode())
+        if mode == 26:
+            return None, {"state": "error", "error": "Robot in protection mode, cannot move"}
+        if mode != 2:
+            return None, {
+                "state": "error",
+                "error": (
+                    f"movement requires workmode=2 (walking); current mode is "
+                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
+                    "Use switch_mode switch=walk first."
+                ),
+            }
+        return angle_deg, None
+
+    def _do_rotate_impl(self, args: dict) -> dict:
+        # 1. Pre-flight (validation + workmode) — shared with the sync
+        # dispatch path so refusals there return before any action_id exists.
+        angle_deg, terminal = self._rotate_preflight(args)
+        if terminal is not None:
+            return terminal
         # 0° is a deliberate no-op: it succeeds in any workmode and returns
         # before the mutex preamble, so it never cancels a running move.
         if abs(angle_deg) < 0.05:  # zero-turn: instant done, no motion commanded
@@ -693,19 +775,8 @@ class LocoPlugin:
                     "final_error_deg": 0.0, "elapsed_s": 0.0,
                     "tolerance_deg": _ROTATE_TOL_DEG}
 
-        # 2. Mode checks (same branches as _do_move).
-        mode = int(self._high_ctrl.get_mode())
-        if mode == 26:
-            return {"state": "error", "error": "Robot in protection mode, cannot move"}
-        if mode != 2:
-            return {
-                "state": "error",
-                "error": (
-                    f"movement requires workmode=2 (walking); current mode is "
-                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Use switch_mode switch=walk first."
-                ),
-            }
+        # (Mode checks live in _rotate_preflight, shared with the sync
+        # dispatch path so refusals return before any action_id exists.)
 
         # 3. Stop any existing move thread (mutex preamble as in _do_move).
         self._move_stop_event.set()
@@ -2290,7 +2361,7 @@ CARD = "vision_capture"
 _FIRST_FRAME_TIMEOUT_S = 5.0
 
 
-def _vision_acp_notify(action_id, status, result, tool):
+def _acp_notify(action_id, status, result, tool):
     """Report the asynchronous terminal result using the same ACP API as Q5."""
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
     payload = json.dumps({"action_id": action_id, "status": status,
@@ -2431,7 +2502,7 @@ class VisionCapturePlugin:
             if self._active_recording is active:
                 self._active_recording = None
             action_id = active["action_id"]
-        _vision_acp_notify(action_id, status, result, CARD)
+        _acp_notify(action_id, status, result, CARD)
         return True
 
     @staticmethod
