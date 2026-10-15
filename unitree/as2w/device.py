@@ -74,6 +74,28 @@ def _timespec_ms(stamp):
     return sec * 1000 + nanosec // 1_000_000
 
 
+def _quaternion_yaw(quaternion):
+    """Yaw in radians from the vendor's `[w, x, y, z]` quaternion, or None.
+
+    As2W's `SportModeState_.imu_state` reports `rpy` as all zeros (measured
+    2026-10-15), so the quaternion is the only attitude in the message — and its
+    yaw is what makes the world-frame `velocity` usable as a body-frame twist.
+    Anything unreadable returns None: the caller must then publish `null` rather
+    than label a world-frame number as `body`.
+    """
+    try:
+        w, x, y, z = (float(value) for value in quaternion)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (w, x, y, z)):
+        return None
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 1e-9:
+        return None
+    w, x, y, z = w / norm, x / norm, y / norm, z / norm
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
 def _acp_notify(action_id, status, result, tool="loco"):
     import os, ssl, urllib.request
     endpoint = f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete"
@@ -183,6 +205,9 @@ class _StateNode:
             if sport is not None and sport_generation != self._published_sport_generation:
                 self._publish_sport(sport)
                 self._published_sport_generation = sport_generation
+            # The odom port keeps its own 10 Hz cadence instead of riding the
+            # vendor's 20 Hz tick — see `_maybe_publish_odom`.
+            self._maybe_publish_odom()
             self._stop_event.wait(wait_for)
 
     def _on_low(self, msg):
@@ -279,8 +304,21 @@ class _StateNode:
         loco.update(self._flat("position", getattr(msg, "position", [])))
         self._publish(self.loco, loco)
 
-        # The odom port goes second and on its own: loco/state above has
-        # already gone out, and an odom failure must not reach it.
+    def _maybe_publish_odom(self):
+        """Drain the window on the odom port's own cadence, ~10 Hz.
+
+        This used to happen inside `_publish_sport`, i.e. only when a new sport
+        reading arrived, and the `>= 100 ms` gate was then quantised onto the
+        20 Hz feed's own jitter (ticks measured at 31-70 ms on 2026-10-15): the
+        interval landed on 2 or 3 ticks, so the port published **7.38 Hz**
+        against a declared 10 Hz while `odom_burst_samples` swung between 2 and
+        3. Checking on every `_STATE_PUBLISH_HZ` tick instead gives 6 ticks =
+        100.2 ms = 9.998 Hz with about two readings per window, which is what
+        the interface declares.
+
+        Runs on the publisher worker, after loco/state has already gone out, so
+        an odom failure can never reach the other port.
+        """
         if getattr(self, "odom", None) is None:
             return
         try:
@@ -288,7 +326,11 @@ class _StateNode:
             if now - self._last_odom_time < self._ODOM_INTERVAL:
                 return
             self._last_odom_time = now
-            self._publish_odom(msg)
+            with self._latest_lock:
+                sport = self._latest_sport
+            if sport is None:
+                return
+            self._publish_odom(sport)
         except Exception:
             pass
 
@@ -301,16 +343,46 @@ class _StateNode:
         """
         with self._odom_lock:
             return {"odom_burst_samples": self._odom_burst_size,
+                    # Measured on the robot, 2026-10-15, so that the next person
+                    # does not have to re-derive it from another morning of
+                    # walking a tethered As2W. What the measurements settled:
+                    #   * `velocity` is odometry-**world** frame, the same frame
+                    #     as `position` in the message (heading 57.5 deg from the
+                    #     quaternion while velocity and the position deltas both
+                    #     read 58 deg; rotating by -yaw left vy at +0.0007 m/s).
+                    #     Publishing that as `frame: "body"` swapped vx/vy at any
+                    #     non-zero heading.
+                    #   * `yaw_speed` is a false zero: hand-rotating the robot
+                    #     ~96 deg (yaw 57.5 -> -38.3) with `gyroscope[2]` at
+                    #     -0.88 rad/s left `yaw_speed` at exactly 0.0000 in every
+                    #     sample, so `wz` comes from the IMU gyro.
+                    #   * `stamp` is 0/0 in every message, hence `received`.
+                    "odom_measured": (
+                        "velocity 与 position 同属 odometry 世界系（朝向 57.5° 时两者均沿 58°；按 -yaw "
+                        "旋正后 vy 仅 0.0007 m/s），故发布前用 IMU 四元数 yaw 旋到机体系。"
+                        "yaw_speed 恒 0 为假零（手转 96°、gyro_z 达 0.88 rad/s 时仍为 0），"
+                        "wz 取自 imu_state.gyroscope[2]。厂商 stamp 全 0，stamp_source 恒为 received。"),
                     **self._odom_stamp_provenance}
 
     def _accumulate_odom(self, msg):
         """Read one vendor sport message into the averaging window, ~20 Hz.
 
-        As2W's `SportModeState_` measures `velocity[0]`/`velocity[1]` and
-        `yaw_speed`; vertical velocity, roll rate and pitch rate stay `None`,
-        not zero — reporting zero would claim the robot measured no such
-        motion, which is what makes a stuck-detector fire on a robot that
-        simply cannot answer.
+        Two things about this robot have to be handled rather than assumed:
+
+        * `velocity[0]`/`velocity[1]` are **odometry-world** frame, like the
+          `position` field in the same message (measured 2026-10-15; see
+          `odom_health`). The port declares `frame: "body"`, so every reading is
+          rotated by the yaw of *its own* quaternion before joining the window —
+          rotating at publish time would apply one attitude to a window that can
+          span a rotation.
+        * `yaw_speed` is a false zero on As2W; the yaw rate comes from
+          `imu_state.gyroscope[2]`, which was live in the very same samples.
+
+        An unreadable attitude publishes `null` axes: a world-frame number
+        labelled `body` is worse than no number, because it is plausible.
+        Vertical velocity, roll rate and pitch rate stay `None`, not zero —
+        reporting zero would claim the robot measured no such motion, which is
+        what makes a stuck-detector fire on a robot that simply cannot answer.
         """
         if getattr(self, "odom", None) is None:
             return
@@ -318,11 +390,21 @@ class _StateNode:
             from common.odom import resolve_stamp_ms
 
             velocity = list(getattr(msg, "velocity", []))
+            vx_world = _finite(velocity[0]) if len(velocity) > 0 else None
+            vy_world = _finite(velocity[1]) if len(velocity) > 1 else None
+            imu = getattr(msg, "imu_state", None)
+            yaw = _quaternion_yaw(getattr(imu, "quaternion", None))
+            if yaw is None or vx_world is None or vy_world is None:
+                vx_body = vy_body = None
+            else:
+                cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+                vx_body = cos_yaw * vx_world + sin_yaw * vy_world
+                vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
+            gyroscope = list(getattr(imu, "gyroscope", []) or [])
             row = [
-                _finite(velocity[0]) if len(velocity) > 0 else None,
-                _finite(velocity[1]) if len(velocity) > 1 else None,
+                vx_body, vy_body,
                 None, None, None,  # vz, roll rate, pitch rate are not measured
-                _finite(getattr(msg, "yaw_speed", None)),
+                _finite(gyroscope[2]) if len(gyroscope) > 2 else None,
             ]
             stamp_ms, provenance = resolve_stamp_ms(
                 vendor_ms=_timespec_ms(getattr(msg, "stamp", None)),
@@ -401,8 +483,10 @@ class StatePlugin:
 
     @classmethod
     def _odom_interface(cls):
-        # As2W's sport feed reports body-frame forward/lateral velocity and yaw
-        # rate. Legged dead reckoning, as on R1: good for "how fast am I going",
+        # As2W's sport feed reports forward/lateral velocity in the odometry
+        # world frame and a yaw rate only in its IMU (see `_accumulate_odom`),
+        # so the card rotates the velocity into body and takes `wz` from the
+        # gyro. Legged dead reckoning, as on R1: good for "how fast am I going",
         # useless as an absolute position, so pose stays null and drift is
         # declared unbounded. Deterministic, so build it once; class-level
         # because tests instantiate via __new__ without __init__.
