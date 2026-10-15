@@ -398,8 +398,10 @@ class _StateNode:
                 vx_body = vy_body = None
             else:
                 cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
-                vx_body = cos_yaw * vx_world + sin_yaw * vy_world
-                vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
+                # Finite inputs can still overflow once rotated (two huge
+                # components at 45 deg); `_finite` turns that into None.
+                vx_body = _finite(cos_yaw * vx_world + sin_yaw * vy_world)
+                vy_body = _finite(-sin_yaw * vx_world + cos_yaw * vy_world)
             gyroscope = list(getattr(imu, "gyroscope", []) or [])
             row = [
                 vx_body, vy_body,
@@ -441,9 +443,13 @@ class _StateNode:
         try:
             from common.odom import build_sample, mean_twist
 
+            # `mean_twist` sums finite readings, and two near-maximum ones
+            # overflow its accumulator to inf; json.dumps would then write a bare
+            # `Infinity`. An axis that cannot be averaged is unknown, so None.
+            twist = [_finite(value) for value in mean_twist(burst)]
             sample = build_sample(
                 stamp_ms=stamp_ms,
-                twist=mean_twist(burst),
+                twist=twist,
                 vendor={"mode": int(getattr(msg, "mode", 0)),
                         "body_height": _number(getattr(msg, "body_height", 0)),
                         # How many raw readings this average came from. Zero

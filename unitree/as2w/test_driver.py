@@ -1625,6 +1625,41 @@ class TestDriverContracts(unittest.TestCase):
         node._publish_odom(self._sport())
         self.assertAlmostEqual(0.3, published[0]["twist"][5])
 
+    def test_odom_matches_the_measured_robot_reading(self):
+        """2026-10-15: heading 57.5 deg, world (0.1818, 0.2839) -> body (0.336, 0.0007)."""
+        published = []
+        node = self._odom_node(published)
+        node._accumulate_odom(self._sport(velocity=[0.1818, 0.2839, 0.0],
+                                          imu_state=self._imu(yaw_deg=57.5, gyro_z=-0.88)))
+        node._publish_odom(self._sport())
+        vx, vy, _, _, _, wz = published[0]["twist"]
+        self.assertAlmostEqual(0.336, vx, places=2)
+        self.assertAlmostEqual(0.0, vy, places=2)
+        self.assertAlmostEqual(-0.88, wz)
+
+    def test_odom_rotation_overflow_is_null_not_infinity(self):
+        """Two finite, near-maximum components overflow once rotated at 45 deg."""
+        published = []
+        node = self._odom_node(published)
+        huge = 1.7e308
+        node._accumulate_odom(self._sport(velocity=[huge, huge, 0.0],
+                                          imu_state=self._imu(yaw_deg=45.0)))
+        node._publish_odom(self._sport())
+        vx, vy, _, _, _, _ = published[0]["twist"]
+        self.assertIsNone(vx)
+        self.assertTrue(vy is None or __import__("math").isfinite(vy))
+
+    def test_odom_average_overflow_is_null_not_infinity(self):
+        """`mean_twist` sums readings; two near-maximum ones overflow its total."""
+        published = []
+        node = self._odom_node(published)
+        for _ in range(2):
+            node._accumulate_odom(self._sport(velocity=[1.7e308, 0.0, 0.0],
+                                              imu_state=self._imu(yaw_deg=0.0)))
+        node._publish_odom(self._sport())
+        self.assertIsNone(published[0]["twist"][0])
+        self.assertEqual(2, published[0]["vendor"]["samples"])
+
     def test_odom_publishes_on_its_own_cadence_not_the_vendor_tick(self):
         published = []
         node = self._odom_node(published)
