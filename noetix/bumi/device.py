@@ -543,9 +543,23 @@ class LocoPlugin:
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
-        worker = self._rotate_worker
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=6)
+        # Cover the dispatch-acceptance window: stop may land after the
+        # reservation (state=running) but before the worker thread exists
+        # (mid-preflight, or between assigning _rotate_worker and start()).
+        # Loop until the worker shows up, then join it; if the reservation
+        # resolves to a sync refusal (state flips idle, no worker), no ACP
+        # action was ever opened and there is nothing to join.
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            with self._rotate_lock:
+                state_running = self._rotate_state["state"] == "running"
+                worker = self._rotate_worker
+            if not state_running:
+                return
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+                return
+            time.sleep(0.01)   # accepted but worker not yet started
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -2363,15 +2377,18 @@ _FIRST_FRAME_TIMEOUT_S = 5.0
 
 def _acp_notify(action_id, status, result, tool):
     """Report the asynchronous terminal result using the same ACP API as Q5."""
-    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-    payload = json.dumps({"action_id": action_id, "status": status,
-                          "result": result, "tool": tool, "ts": time.time()}).encode()
-    request = urllib.request.Request(
-        f"{url}/api/acp/complete", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
-    # The local Agent Core endpoint uses a self-signed certificate.
-    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    # Build the payload inside the try: json.dumps or the env lookup raising
+    # must not escape the rotate worker's finally (it would skip the idle
+    # flip and wedge the busy-guard forever).
     try:
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        payload = json.dumps({"action_id": action_id, "status": status,
+                              "result": result, "tool": tool, "ts": time.time()}).encode()
+        request = urllib.request.Request(
+            f"{url}/api/acp/complete", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        # The local Agent Core endpoint uses a self-signed certificate.
+        context = ssl._create_unverified_context() if url.startswith("https://") else None
         with urllib.request.urlopen(request, timeout=5, context=context) as response:
             response.read()
     except Exception as exc:

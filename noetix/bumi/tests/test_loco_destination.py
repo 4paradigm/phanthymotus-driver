@@ -65,6 +65,21 @@ def _load_device(monkeypatch):
     return module, String
 
 
+@pytest.fixture(autouse=True)
+def _stub_acp_notify(monkeypatch):
+    """单测绝不对真实 Agent Core 发 HTTP 回调：默认桩掉每个新建 device 模块的
+    _acp_notify（先例 unitree/g1/tests/test_vision_capture_race.py:34）。
+    需要断言回调的测试随后自行 monkeypatch.setattr 覆盖。"""
+    real_load = _load_device
+
+    def _load_with_stub(mp):
+        module, String = real_load(mp)
+        mp.setattr(module, '_acp_notify', lambda *args, **kwargs: None)
+        return module, String
+
+    monkeypatch.setattr(sys.modules[__name__], '_load_device', _load_with_stub)
+
+
 def test_wrap180_takes_shortest_path(monkeypatch):
     module, _ = _load_device(monkeypatch)
     assert module._wrap180(190) == -170
@@ -322,6 +337,58 @@ def test_sigterm_stop_completes_pending_acp(monkeypatch):
     assert status['state'] == 'idle'
     assert status['last_result']['state'] == 'stopped'
     assert fake.cmds[-1] == (0, 0, 0)           # 退出必零速
+
+
+def test_sigterm_during_dispatch_acceptance_still_cancels(monkeypatch):
+    # I1 回归：stop() 落在 dispatch 受理窗口（preflight 阻塞、worker 尚未
+    # 发布）时不得直接返回——必须等 worker 出现并 join，返回前回调已发。
+    module, _ = _load_device(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        module, '_acp_notify',
+        lambda action_id, status, result, tool: calls.append(
+            (action_id, status, result, tool)))
+    fake = FakeHighCtrl(gain_deg_per_tick=1.0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    entered, release = threading.Event(), threading.Event()
+
+    def get_mode():
+        entered.set()
+        assert release.wait(5)
+        return 2
+
+    monkeypatch.setattr(fake, 'get_mode', get_mode)
+    box = {}
+
+    def _dispatch():
+        box['result'] = plugin.dispatch(
+            'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 150})
+
+    dispatcher = threading.Thread(target=_dispatch, daemon=True)
+    dispatcher.start()
+    assert entered.wait(2)                     # dispatch 卡在 preflight（受理窗口内）
+
+    stopper = threading.Thread(target=plugin.stop, daemon=True)
+    stopper.start()
+    deadline = time.monotonic() + 2.0          # 等 stop() 走过 _stop_move
+    while time.monotonic() < deadline and not plugin._rotate_stop_event.is_set():
+        time.sleep(0.01)
+    assert plugin._rotate_stop_event.is_set()  # stop 已置位停止信号
+    stopper.join(timeout=0.5)
+    early_return = not stopper.is_alive()      # 受理窗口内就返回 = 漏 join
+    assert dispatcher.is_alive()               # dispatch 仍在受理中
+
+    release.set()
+    dispatcher.join(5)
+    stopper.join(5)
+    assert not dispatcher.is_alive() and not stopper.is_alive()
+    assert not early_return                     # I1：stop 必须覆盖受理窗口
+    assert box['result']['state'] == 'running'
+    assert len(calls) == 1                      # 恰一次 ACP 终态
+    assert calls[0][1] == 'cancelled'
+    status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
+    assert status['state'] == 'idle'
+    assert status['last_result']['state'] == 'stopped'
 
 
 def test_rotate_converges_within_tolerance_and_brakes(monkeypatch):
