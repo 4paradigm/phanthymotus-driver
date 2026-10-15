@@ -299,8 +299,8 @@ class ArucoDetectorPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["detect", "get_marker_center", "info", "start", "stop"],
-                        "description": "操作动作：detect（获取所有码或指定码中心坐标）、get_marker_center（根据 ID 获取目标码中心）、info（查看状态）、start（启动订阅）、stop（停止订阅）",
+                        "enum": ["config", "start", "stop", "info", "detect", "get_marker_center"],
+                        "description": "操作动作：config（配置参数）、start（启动订阅）、stop（停止订阅）、info（查看状态）、detect（获取所有码或指定码中心坐标）、get_marker_center（根据 ID 获取目标码中心）",
                     },
                     "marker_id": {
                         "type": "integer",
@@ -327,6 +327,10 @@ class ArucoDetectorPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
+                    "config": {
+                        "params": ["input_topic", "dictionary"],
+                        "description": "配置卡片参数（图像输入话题与字典类型）",
+                    },
                     "detect": {
                         "params": ["marker_id", "timeout_s"],
                         "description": "调用卡片识别画面中的 ArUco 码，提取 ID 及中心点坐标（支持传入 marker_id 筛选目标码）",
@@ -402,39 +406,68 @@ class ArucoDetectorPlugin:
     def _start_subscription(self, topic: str, dictionary: str):
         """启动对指定图像话题的订阅。"""
         with self._frame_condition:
-            if Node is object:
-                raise RuntimeError("rclpy 运行时未就绪")
             if not topic:
                 raise ValueError("图像输入话题 input_topic 不能为空")
             if dictionary not in DICTIONARIES:
                 raise ValueError(f"未知 ArUco 字典: {dictionary}")
 
-            if self._node is None:
-                node_name = f"rm75_{self.PREFIX}"
-                context = getattr(self._executor, "context", None)
-                node = Node(node_name, context=context)
-                self._node = node
-                base = f"/{self._namespace}/{self.PREFIX}" if self._namespace else f"/{self.PREFIX}"
-                self._image_pub = node.create_publisher(CompressedImage, f"{base}/overlay", 1)
-                self._data_pub = node.create_publisher(String, f"{base}/markers", 1)
-                self._subscription = node.create_subscription(
-                    CompressedImage, topic, self._on_frame, qos_profile_sensor_data
-                )
-                if self._executor is not None:
-                    self._executor.add_node(node)
-            elif topic != self._input_topic:
-                if self._subscription is not None:
-                    self._node.destroy_subscription(self._subscription)
-                self._subscription = self._node.create_subscription(
-                    CompressedImage, topic, self._on_frame, qos_profile_sensor_data
-                )
+            if Node is not object:
+                if self._node is None:
+                    node_name = f"rm75_{self.PREFIX}"
+                    context = getattr(self._executor, "context", None)
+                    node = Node(node_name, context=context)
+                    self._node = node
+                    base = f"/{self._namespace}/{self.PREFIX}" if self._namespace else f"/{self.PREFIX}"
+                    self._image_pub = node.create_publisher(CompressedImage, f"{base}/overlay", 1)
+                    self._data_pub = node.create_publisher(String, f"{base}/markers", 1)
+                    self._subscription = node.create_subscription(
+                        CompressedImage, topic, self._on_frame, qos_profile_sensor_data
+                    )
+                    if self._executor is not None:
+                        self._executor.add_node(node)
+                elif topic != self._input_topic:
+                    if self._subscription is not None:
+                        self._node.destroy_subscription(self._subscription)
+                    self._subscription = self._node.create_subscription(
+                        CompressedImage, topic, self._on_frame, qos_profile_sensor_data
+                    )
 
             self._input_topic = topic
             self._dictionary = dictionary
-            return {"state": "running", "input_topic": topic, "dictionary": dictionary, "topic_out": self._outputs}
+            return {
+                "ok": True,
+                "state": "running",
+                "status": "ready",
+                "ready": True,
+                "input_topic": topic,
+                "dictionary": dictionary,
+                "topic_out": self._outputs,
+            }
 
     def dispatch(self, action, args):
         """统一动作分发入口，提供可调用的动作执行能力。"""
+        if action == "config":
+            topic = str(args.get("input_topic") or self._input_topic).strip()
+            dictionary = str(args.get("dictionary") or self._dictionary).strip()
+            if dictionary:
+                if dictionary not in DICTIONARIES:
+                    raise ValueError(f"未知 ArUco 字典: {dictionary}")
+                self._dictionary = dictionary
+            if topic:
+                old_topic = self._input_topic
+                self._input_topic = topic
+                with self._frame_condition:
+                    if self._subscription is not None and self._node is not None and topic != old_topic:
+                        self._node.destroy_subscription(self._subscription)
+                        self._subscription = self._node.create_subscription(
+                            CompressedImage, topic, self._on_frame, qos_profile_sensor_data
+                        )
+            info = self._info_action()
+            info["ok"] = True
+            info["status"] = "ready"
+            info["ready"] = True
+            return info
+
         if action == "start":
             topic = str(args.get("input_topic") or self._input_topic).strip()
             dictionary = str(args.get("dictionary") or self._dictionary).strip()
@@ -459,7 +492,7 @@ class ArucoDetectorPlugin:
         if action == "info":
             return self._info_action()
 
-        raise ValueError(f"不支持的动作: {action}。支持的动作包括: detect, get_marker_center, info, start, stop")
+        raise ValueError(f"不支持的动作: {action}。支持的动作包括: config, start, stop, info, detect, get_marker_center")
 
     def _detect_action(self, marker_id, timeout_s: float):
         """执行 detect 动作：返回当前画面中所有码或指定 ID 码的中心坐标。"""
@@ -555,10 +588,16 @@ class ArucoDetectorPlugin:
                 else None
             )
             latest = dict(self._latest_result) if self._latest_result else None
+            is_running = self._subscription is not None
             return {
-                "state": "running" if self._subscription else "idle",
+                "ok": True,
+                "state": "running" if is_running else "idle",
+                "status": "ready",
+                "ready": True,
+                "readiness": "ready",
                 "card_name": self.PREFIX,
                 "input_topic": self._input_topic,
+                "topic_in": [{"topic": self._input_topic, "format": "image/jpeg"}],
                 "topic_out": self._outputs,
                 "dictionary": self._dictionary,
                 "latest": latest,

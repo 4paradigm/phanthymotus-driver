@@ -180,7 +180,13 @@ class ArucoDetectorCardTests(unittest.TestCase):
             self.assertEqual(info["card_name"], "aruco_detector")
             self.assertEqual(info["detected_marker_ids"], [3, 7])
 
-            # 6. 调用 stop
+            # 6. 调用 config：更新配置（界面保存/启动智能控制时触发）
+            cfg_res = plugin.dispatch("config", {"input_topic": "/ext_camera/default/rgb", "dictionary": "DICT_5X5_50"})
+            self.assertTrue(cfg_res.get("ok"))
+            self.assertEqual(cfg_res["input_topic"], "/ext_camera/default/rgb")
+            self.assertEqual(cfg_res["dictionary"], "DICT_5X5_50")
+
+            # 7. 调用 stop
             stopped = plugin.dispatch("stop", {})
             self.assertEqual(stopped["state"], "idle")
 
