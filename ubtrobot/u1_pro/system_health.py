@@ -350,7 +350,7 @@ class SystemHealthPlugin:
         problems = [{"check": name, "status": item["status"], "reasons": item["reasons"]}
                     for name, item in checks.items() if item["status"] != "ok"]
         incomplete = any(
-            item["status"] in {"unknown", "unreadable", "stale", "not_started"}
+            item["status"] in {"unknown", "unreadable", "stale", "not_started", "error"}
             or (isinstance(item["value"], dict) and (
                 item["value"].get("hardware_identity_confirmed") is False
                 or item["value"].get("hierarchy_complete") is False))

@@ -70,7 +70,8 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 状态分别为 `ok`、`warning`、`error`（异常）、`stale`（数据过期）、
 `not_started`（未启动）、`unreadable`（无法读取）、`unknown`（能读到值但含义/边界未知）。
 有告警/异常/过期时整体为 `warning`；没有告警但存在未知、无法读取或未启动时为 `unknown`；
-只有完整且所有项正常才为 `ok`。有告警同时存在未知时，`complete: false` 与逐项原因仍保留。
+只有完整且所有项正常才为 `ok`。存在设备异常（`error`）、未知、无法读取、过期或未启动时，
+`complete` 为 `false`，逐项原因仍保留。
 
 配置阈值是可调整的观察策略，不是厂商安全限值：CPU 每可见核负载 ≥ 1.0、内存和磁盘
 使用率 ≥ 90% 告警；相机有效帧年龄 ≥ 5 秒、共享播放任务未完成 ≥ 120 秒标为过期。
@@ -81,4 +82,4 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 
 第一版不检查电池、IMU、关节、电机温度，也不确认 ROS 远端或厂商接口的健康。
 Dockerfile 包含 `system_health.py`；新增实现仅使用 Python 标准库，无新增运行依赖。
-完整本地检查、提交流程和真机验收边界见 [SYSTEM_HEALTH_VALIDATION.md](SYSTEM_HEALTH_VALIDATION.md)。
+可复现的本地检查和真机验证边界见 [SYSTEM_HEALTH_VALIDATION.md](SYSTEM_HEALTH_VALIDATION.md)。

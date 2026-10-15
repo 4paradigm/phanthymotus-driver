@@ -237,6 +237,28 @@ class CardTests(unittest.TestCase):
         self.report()
         self.assertEqual(bundle.dispatch("system_health", {"action": "robot_info"})["overall"], "ok")
 
+    def assert_device_error_is_incomplete(self, failed_prefix):
+        for component in (*self.cameras, self.audio):
+            status = "error" if component.PREFIX == failed_prefix else "ok"
+            component.health_snapshot = mock.Mock(return_value=observation(
+                status, "fixture:" + component.PREFIX, "driver", {},
+                reasons=["device failed"] if status == "error" else [],
+                sampled_at=time.time()))
+        result = self.report()
+        self.assertEqual(result["overall"], "warning")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["checks"][failed_prefix]["status"], "error")
+        self.assertEqual(result["problems"], [{
+            "check": failed_prefix, "status": "error",
+            "reasons": ["device failed"]}])
+        self.assertEqual(self.nodes.mock_calls, [])
+
+    def test_camera_error_with_otherwise_normal_checks_is_incomplete(self):
+        self.assert_device_error_is_incomplete("camera_left")
+
+    def test_playback_error_with_otherwise_normal_checks_is_incomplete(self):
+        self.assert_device_error_is_incomplete("tts")
+
     def test_stop_during_sampling_cancels_publication_and_prevents_overlap(self):
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
