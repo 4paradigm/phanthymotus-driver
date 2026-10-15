@@ -15,6 +15,7 @@
 | 运动与模式 | `loco`、`switch_mode`、`switch_mode_expert`、`motion_switcher`、`smart_motion` | 启用；运动指令、模式切换和打断控制 |
 | 手臂动作 | `arm` | 启用；厂商预设手势和收臂 |
 | 双臂遥操 | `teleop_control` | 启用；接收设备输入，控制原厂 G1_23 固定假手双臂，提供对齐反馈及轨迹录制/回放；见[遥操使用说明](motion/README.md#使用) |
+| 网页录制技能 | `g1_teaching` | 复用双臂遥操的录制和回放；在原执行卡完成检查、录制、试运行并保存普通 Skill；见[接入说明](../../common/teaching/README.md#宇树-g1-的使用流程) |
 | 连续控制 | `servo`、`servo_eef` | 关闭；分别接收关节目标和末端位姿目标，按需启用 |
 | 音频与灯光 | `mic`、`tts`、`speaker`、`led` | 启用；麦克风输入、文本播报、音频播放和 LED 控制 |
 | 视觉 | `camera_rgb`、`camera_depth`、`camera_distance`、`vision_capture` | 启用；RealSense 图像、距离、拍照和录像 |

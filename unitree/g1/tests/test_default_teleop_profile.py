@@ -100,6 +100,7 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch):
         'motion_bus': {'MotionBus': Stub},
         'teleop_control': {'TeleopControl': Stub},
         'teleop_bus': {'TeleopBus': Stub},
+        'teaching': {'teaching_plugin': lambda control: Stub()},
         'servo': {'G1ServoPlugin': Stub},
         'servo_eef': {'G1ServoEefPlugin': Stub},
     }.items():
@@ -108,5 +109,5 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch):
               'teleop_control': {'enabled': True}}
     config['plugins']['smart_motion'] = {'enabled': False}
     bundle = namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None, None)
-    assert len(bundle._plugins) == 4
+    assert len(bundle._plugins) == 5
     assert bundle._plugins[0]._teleop_control is bundle._plugins[1]

@@ -2,6 +2,8 @@
 
 本说明包含 G1 双臂遥操的使用、运行依赖与实现。驱动全部能力和启动入口见 [G1 Driver 说明](../README.md)。
 
+网页生成可调用 Skill 使用 `g1_teaching` 卡，复用本文的原录制、回放与停止接口；不新建运动控制器。网页宿主需要 Core PR #318，G1 适配本身不修改 Core。流程、设备检查和持久化约束见[通用示教说明](../../../common/teaching/README.md#宇树-g1-的使用流程)，实际网页截图见[G1 界面验收](../../../docs/teaching/g1.md)。
+
 ## 使用
 
 `teleop_control` 接收设备 Driver 的输入，在 G1 Driver 内完成相对映射、独立进程 IK 和双臂位置下发。默认注册该卡，市场清单包含 `teleop_control`。随镜像提供原厂 G1_23（每臂 5 关节、固定假手）的完整固定几何 profile；不依赖现场临时标定脚本或用户填写路径。Core 和 ActuCore 无需遥操专用修改。

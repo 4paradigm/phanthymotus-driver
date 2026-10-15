@@ -29,13 +29,13 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
       <div class="check-row"><span>实时跟踪与握键</span><span class="check-result"><i class="pill">·</i>进入遥操后确认</span></div>
       <details style="margin-top:12px"><summary>检查详情</summary><div id="check-details" class="technical">尚未检查</div></details>
     </div>
-    <aside class="panel soft"><div class="aside-block"><h3 id="check-summary">等待设备检查</h3><p id="check-hint">检查连接、标定、运动许可和遥操通道后继续。</p></div><div class="aside-block"><h3>接下来</h3><p>进入遥操后确认实时输入，松开双手握键建立映射，再开始录制。</p></div></aside>
+    <aside class="panel soft"><div class="aside-block"><h3 id="check-summary">等待设备检查</h3><p id="check-hint">检查连接、标定、运动许可和遥操通道后继续。</p></div><div class="aside-block"><h3>接下来</h3><p id="next-hint"></p></div></aside>
   </section>
   <section id="record" class="layout" hidden>
     <div><h2 class="section-title">动作录制</h2><div class="ready-strip"><span id="input-state" class="status">等待 VR 输入</span><span id="mapping-state" class="status">等待建立映射</span></div>
       <div class="panel recording"><span class="status"><i id="record-dot" class="dot"></i><span id="motion-state">准备进入遥操</span></span><div id="live-duration" class="duration">00:00.0</div><p id="teleop-hint">先进入遥操，确认本次接管。</p><small id="frame-count" hidden>0</small><div class="actions"><button id="begin-btn" class="primary">进入遥操</button><button id="record-btn" class="primary" hidden>开始录制</button><button id="finish-btn" class="primary" hidden>结束录制</button></div></div>
-      <details id="existing" class="details-card"><summary>使用已有录制</summary><div class="load"><select id="recordings" aria-label="选择已有录制"><option value="">选择完整录制…</option></select><button id="load-btn">载入</button></div></details>
-    </div><aside class="panel soft"><div class="aside-block"><h3>示范一次完整动作</h3><p>开始录制后，按住双手握键操作。动作完成后结束录制。</p></div><div class="aside-block"><h3>下一步：试运行</h3><p>恢复物体布置和双臂起点，验证录制效果。</p></div></aside>
+
+    </div><aside class="panel soft"><div class="aside-block"><h3>示范一次完整动作</h3><p>开始录制后，按住双手握键操作。动作完成后结束录制。</p></div><div class="aside-block"><h3>下一步：试运行</h3><p id="trial-hint"></p></div></aside>
   </section>
   <section id="review" class="layout" hidden>
     <div><div class="record-summary"><span class="record-symbol" aria-hidden="true">◉</span><div><h3>当前录制</h3><small id="duration"></small></div></div>
@@ -48,6 +48,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     <div id="skill-form" class="layout"><div class="panel"><h2 class="section-title">保存为技能</h2><label class="field"><span>技能名称</span><input id="skill-name" maxlength="100" placeholder="例如：零件放入托盘"></label><label class="field" style="margin-bottom:0"><span>使用条件</span><textarea id="skill-conditions" maxlength="1000" placeholder="例如：零件和托盘位置固定，双臂已恢复录制起点。"></textarea></label></div><aside class="panel soft"><div class="aside-block"><h3 class="success">✓ 试运行与效果已确认</h3></div><div class="aside-block"><h3>以后可以这样说</h3><span id="phrase-preview" class="phrase">填写技能名称</span><p class="note">保存后加入现有技能库。</p></div></aside></div>
     <div id="confirmation-result" class="panel saved" role="status" hidden><div class="saved-mark">✓</div><h2>技能已保存</h2><p id="saved-hint" class="muted"></p><span id="saved-phrase" class="phrase"></span><p class="note">可在现有技能列表中查看和管理。</p></div>
   </section>
+      <details id="existing" class="details-card"><summary>使用已有录制</summary><div class="load"><select id="recordings" aria-label="选择已有录制"><option value="">选择完整录制…</option></select><button id="load-btn">载入</button></div></details>
   <p id="chat-hint" class="note" hidden></p>
 </main>
 <footer><div class="row"><button id="stop-btn" class="stop" disabled>■ 停止动作</button><small id="footer-hint">检查不会启动机器人动作。</small></div><div class="footer-buttons"><button id="back-btn" hidden>上一步</button><button id="check-btn" class="primary">检查设备</button><button id="next-btn" disabled>进入录制 →</button><button id="to-save-btn" class="primary" hidden disabled>下一步：保存 →</button><button id="save-btn" class="primary" hidden disabled>保存技能</button></div></footer>
@@ -57,8 +58,12 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   const $ = id => document.getElementById(id);
   let port, serial=0, pending=new Map(), status={}, draft={}, stage=0, busy=false, online=false, initialized=false;
   let preview, plotData, plottedId, inspection, checks, checkedAt=0, installed=false, approvedTrial, refreshVersion=0;
-  const errors={replay_start_mismatch_no_automatic_return:'起点不匹配，请手动恢复双臂与夹爪后重试。',robot_busy_wait_for_completion:'请等待当前动作结束。',successful_trial_required:'请先完成试运行。',complete_recording_required:'尚无完整录制，请结束录制或重新录制。',paired_preview_required:'确认已失效，请重新预览。',teaching_draft_changed_reload:'草稿已在其他页面更改，请重新操作。',live_mapped_teleop_input_required:'请等待有效 VR 输入，并松开双手握键完成映射。',input_timeout_restart_required:'未收到 VR 输入，请检查头显后重新进入遥操。',input_stale_restart_required:'VR 输入已中断，请检查头显后重新进入遥操。',tracking_lost_restart_required:'跟踪已丢失，请恢复跟踪后重新进入遥操。'};
+  const errors={replay_start_mismatch_no_automatic_return:'起点不匹配，请手动恢复双臂与夹爪后重试。',robot_busy_wait_for_completion:'请等待当前动作结束。',successful_trial_required:'请先完成试运行。',complete_recording_required:'尚无完整录制，请结束录制或重新录制。',paired_preview_required:'确认已失效，请重新预览。',teaching_draft_changed_reload:'草稿已在其他页面更改，请重新操作。',teaching_preview_expired:'预览已失效，请重新检查并确认。',live_mapped_teleop_required:'请确认 VR 输入有效，并松握、长按 X+A 建立基准。',live_mapped_teleop_input_required:'请等待有效 VR 输入，并松开双手握键完成映射。',input_timeout_restart_required:'未收到 VR 输入，请检查头显后重新进入遥操。',input_stale_restart_required:'VR 输入已中断，请检查头显后重新进入遥操。',tracking_lost_restart_required:'跟踪已丢失，请恢复跟踪后重新进入遥操。'};
   const readable = value => errors[value] || value;
+  const presentation = () => status.presentation || {};
+  const groups = () => presentation().joint_groups || [];
+  const canTrial = () => inspection && (inspection.start.can_trial ?? inspection.start.ready);
+  function jointLabel(index) {for(const group of groups()){if(index<group.count)return `${group.label} J${index+1} / °`;index-=group.count;}return '关节';}
   function fail(error) { $('error').textContent=readable(error.message);$('error').hidden=false; }
   function request(method,args) {
     if(!port) return Promise.reject(new Error('连接尚未建立'));
@@ -88,7 +93,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     const failed=list.filter(c=>c.ok===false),fresh=checks && Date.now()-checkedAt<30000;
     $('check-summary').textContent=!checks?'等待设备检查':failed.length?`还有 ${failed.length} 项待处理`:fresh?'设备检查通过':'请重新检查';
     $('check-summary').className=failed.length?'warning':checks?.ready && fresh?'success':'';
-    $('check-hint').textContent=failed.length?failed.map(c=>c.label).join('、')+'未通过，请处理后重新检查。':checks?.ready && fresh?'可以进入录制。实时跟踪与握键会在遥操中确认。':'检查连接、标定、运动许可和遥操通道后继续。';
+    $('check-hint').textContent=failed.length?failed.map(c=>c.label).join('、')+'未通过，请处理后重新检查。':checks?.ready && fresh?'可以进入录制。实时跟踪与握键会在遥操中确认。':presentation().prepare_hint || '检查设备后继续。';
     $('check-details').textContent=checks?list.map(c=>`${c.label}：${c.ok?'通过':c.reason || '待确认'}`).join('\n'):'尚未检查';
   }
   async function runChecks() {
@@ -98,7 +103,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   function table(container,headers,rows) {const table=document.createElement('table');[headers,...rows].forEach((values,i)=>{const tr=document.createElement('tr');values.forEach(v=>{const el=document.createElement(i?'td':'th');el.textContent=v;tr.append(el);});table.append(tr);});container.replaceChildren(table);}
   function plot(recording) {
     plotData=recording.preview || [];plottedId=draft.id;
-    $('duration').textContent=`${recording.duration_seconds.toFixed(2)} 秒 · 双臂与夹爪`;
+    $('duration').textContent=`${recording.duration_seconds.toFixed(2)} 秒 · ${presentation().recording_label || '动作录制'}`;
     const svg=$('plot');svg.replaceChildren();
     const add=(tag,attrs)=>{const el=document.createElementNS('http://www.w3.org/2000/svg',tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));svg.append(el);return el;};
     [35,105,175].forEach(y=>add('line',{x1:35,y1:y,x2:607,y2:y,stroke:'#ded7ca','stroke-dasharray':'4 5'}));
@@ -106,28 +111,40 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     const duration=Math.max(.001,plotData.at(-1).t),first=plotData[0].joints,scale=Math.max(.1,...plotData.flatMap(f=>f.joints.map((q,i)=>Math.abs(q-first[i]))));
     add('text',{x:0,y:27,fill:'#78716C','font-size':11}).textContent=`+${scale.toFixed(1)}`;
     add('text',{x:0,y:195,fill:'#78716C','font-size':11}).textContent=`−${scale.toFixed(1)}`;
-    for(let j=0;j<first.length;j++)add('polyline',{points:plotData.map(f=>`${35+f.t/duration*570},${105-(f.joints[j]-first[j])/scale*75}`).join(' '),fill:'none',stroke:j<6?'#C4673A':'#78716C','stroke-width':2,opacity:.35+(j%6)*.1});
+    const split=groups()[0]?.count || first.length;
+    for(let j=0;j<first.length;j++)add('polyline',{points:plotData.map(f=>`${35+f.t/duration*570},${105-(f.joints[j]-first[j])/scale*75}`).join(' '),fill:'none',stroke:j<split?'#C4673A':'#78716C','stroke-width':2,opacity:.35+(j%split)*.1});
     add('line',{id:'cursor',x1:35,y1:20,x2:35,y2:195,stroke:'#1C1917','stroke-width':1});$('scrub').value=0;scrub();
   }
   function scrub() {
     if(!plotData?.length)return;
     const frame=plotData[Math.round(Number($('scrub').value)/100*(plotData.length-1))],x=35+frame.t/Math.max(.001,plotData.at(-1).t)*570;
     $('cursor-time').textContent=frame.t.toFixed(2)+' s';$('cursor')?.setAttribute('x1',x);$('cursor')?.setAttribute('x2',x);
-    table($('frame-values'),['目标','左臂','右臂'],[...Array.from({length:6},(_,i)=>['关节 '+(i+1)+' / °',frame.joints[i].toFixed(3),frame.joints[i+6].toFixed(3)]),['夹爪 / mm',...frame.widths.map(v=>v.toFixed(2))]]);
+    const rows=frame.joints.map((q,i)=>[jointLabel(i),q.toFixed(3)]);
+    if(presentation().grippers && frame.widths)rows.push(...frame.widths.map((v,i)=>[`${groups()[i]?.label || ''}夹爪 / mm`,v.toFixed(2)]));
+    table($('frame-values'),['目标','数值'],rows);
   }
   async function inspect() {
     inspection=null;render();
     const result=await call('inspect',{draft_id:draft.id});inspection=result;plot(result.recording);
     const start=result.start;$('start-values').replaceChildren();
-    if(start.joint_delta_deg)table($('start-values'),['部位','起点','当前 − 起点'],[...start.joint_delta_deg.map((v,i)=>[`${i<6?'左':'右'}臂 J${i%6+1} / °`,start.target_joints_deg[i].toFixed(3),v.toFixed(3)]),...start.width_delta_mm.map((v,i)=>[`${i?'右':'左'}夹爪 / mm`,start.target_width_mm[i].toFixed(2),v.toFixed(2)]),['允许误差','关节 ±0.05°','夹爪 ±0.5 mm']]);
+    if(start.joint_delta_deg){
+      const rows=start.joint_delta_deg.map((v,i)=>[jointLabel(i),start.target_joints_deg[i].toFixed(3),v.toFixed(3)]);
+      if(presentation().grippers && start.width_delta_mm)rows.push(...start.width_delta_mm.map((v,i)=>[`${groups()[i]?.label || ''}夹爪 / mm`,start.target_width_mm[i].toFixed(2),v.toFixed(2)]));
+      if(start.tolerance_label)rows.push(['允许误差',start.tolerance_label,'']);
+      table($('start-values'),['部位','起点','当前 − 起点'],rows);
+    }
   }
   function render() {
     const rec=status.recording || {},clip=!!draft.recording,trial=draft.trial,moving=!!status.busy,locked=busy || !online;
+    const canPrepare=status.can_prepare ?? !moving,external=presentation().session_start==='controller';
+    $('next-hint').textContent=presentation().next_hint || '';
+    $('trial-hint').textContent=presentation().trial_hint || '';
+    $('skill-conditions').placeholder=presentation().conditions_placeholder || '';
     ['prepare','record','review','save'].forEach((id,i)=>{$(id).hidden=i!==stage;});
     document.querySelectorAll('.steps li').forEach((el,i)=>{el.classList.toggle('current',i===stage);el.classList.toggle('done',i<stage);el.querySelector('b').textContent=i<stage?'✓':String(i+1);if(i===stage)el.setAttribute('aria-current','step');else el.removeAttribute('aria-current');});
     $('check-btn').hidden=stage!==0;$('next-btn').hidden=stage!==0;$('to-save-btn').hidden=stage!==2;$('save-btn').hidden=stage!==3 || installed;
-    $('check-btn').disabled=locked || moving;$('check-btn').textContent=busy && stage===0?'检查中…':checks?'重新检查':'检查设备';
-    $('next-btn').disabled=locked || moving || !checks?.ready || Date.now()-checkedAt>=30000;
+    $('check-btn').disabled=locked || !canPrepare;$('check-btn').textContent=busy && stage===0?'检查中…':checks?'重新检查':'检查设备';
+    $('next-btn').disabled=locked || !canPrepare || !checks?.ready || Date.now()-checkedAt>=30000;
     $('next-btn').classList.toggle('primary',!!checks?.ready);$('check-btn').classList.toggle('primary',!checks?.ready);
     $('back-btn').hidden=stage===0 || stage===2 || installed;$('back-btn').disabled=locked || moving;
     $('stop-btn').disabled=online && !moving && !busy;
@@ -137,19 +154,19 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('input-state').textContent=status.input_fresh?'● VR 输入正常':status.state==='teleop'?'○ 等待有效 VR 输入':'○ 进入遥操后确认输入';
     $('input-state').classList.toggle('success',!!status.input_fresh);$('mapping-state').textContent=status.mapped?'✓ 映射已建立':'○ 等待建立映射';
     const hints={waiting_for_input:'等待 VR 实时输入，请打开头显遥操应用。',release_both_grips_to_map:'请松开双手握键，建立起始映射。',mapped_waiting_for_both_grips:'映射已建立。开始录制后按住双手握键操作。'};
-    $('teleop-hint').textContent=rec.error?readable(rec.error):rec.recording?'按住双手握键操作，完成后结束录制。':hints[status.reason] || (status.state==='idle' && status.reason && !['operator_stop','card_stopped'].includes(status.reason)?readable(status.reason):'先进入遥操，确认本次接管。');
-    $('begin-btn').hidden=moving;$('begin-btn').disabled=locked;
-    $('record-btn').hidden=status.state!=='teleop' || !!rec.recording;$('record-btn').disabled=locked || !status.can_record;
+    $('teleop-hint').textContent=rec.error?readable(rec.error):rec.recording?'按住双手握键操作，完成后结束录制。':status.teleop_hint || hints[status.reason] || (status.state==='idle' && status.reason && !['operator_stop','card_stopped'].includes(status.reason)?readable(status.reason):'先进入遥操，确认本次接管。');
+    $('begin-btn').hidden=external || moving;$('begin-btn').disabled=locked;
+    $('record-btn').hidden=(!external && status.state!=='teleop') || !!rec.recording;$('record-btn').disabled=locked || !status.can_record;
     $('finish-btn').hidden=!draft.teleop_id || (!rec.recording && !rec.complete && !rec.error);$('finish-btn').disabled=locked;
-    $('existing').hidden=moving;$('load-btn').disabled=locked || moving;
+    $('existing').hidden=moving || ![0,1].includes(stage);$('load-btn').disabled=locked || moving;
     $('clip-check').textContent=inspection?'✓ 录制完整':'待检查';$('clip-check').classList.toggle('success',!!inspection);
-    $('start-hint').textContent=!inspection?'待检查':inspection.start.ready?'✓ 起点匹配':readable(inspection.start.error) || '起点未匹配，请手动恢复。';
-    $('start-hint').classList.toggle('success',!!inspection?.start.ready);
-    $('inspect-btn').disabled=locked || moving;$('trial-btn').disabled=locked || moving || !inspection?.start.ready || !!status.saved;
+    $('start-hint').textContent=!inspection?'待检查':inspection.start.message || (inspection.start.ready?'✓ 起点匹配':readable(inspection.start.error) || '起点未匹配，请手动恢复。');
+    $('start-hint').classList.toggle('success',!!inspection?.start.ready && inspection.start.mode!=='move_to_start');
+    $('inspect-btn').disabled=locked || moving;$('trial-btn').disabled=locked || moving || !canTrial() || !!status.saved;
     $('again-btn').disabled=locked || moving;
     $('trial-status').textContent=trial?.status==='completed'?'✓ 试运行已完成':trial?.status==='running'?'正在试运行':trial?.status==='cancelled'?'试运行已取消':trial?.status==='error'?'试运行失败':'等待试运行';
     $('trial-status').classList.toggle('success',trial?.status==='completed');
-    $('trial-help').textContent=trial?.status==='completed'?'请观察实际动作效果，确认后保存技能。':trial?.status==='error'?readable(trial.result?.reason) || '请检查设备后重试。':moving?'请观察真机，必要时停止动作。':'恢复物体布置，检查起点后试运行。';
+    $('trial-help').textContent=trial?.status==='completed'?'请观察实际动作效果，确认后保存技能。':trial?.status==='error'?readable(trial.result?.reason) || '请检查设备后重试。':moving?'请观察真机，必要时停止动作。':presentation().trial_hint || '恢复物体布置，检查起点后试运行。';
     if(trial?.status!=='completed' || approvedTrial!==trial.action_id){approvedTrial=null;$('effect').checked=false;}
     $('effect').disabled=locked || moving || trial?.status!=='completed';
     $('to-save-btn').disabled=locked || moving || !$('effect').checked;
@@ -183,8 +200,8 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     preview=await call(action,{draft_id:draft.id,execute:false});
     if(!preview.preview_id)throw new Error('未获得本次动作预览');
     preview.action=action;preview.created=Date.now();
-    $('confirm-description').textContent=action==='begin'?'准备进入双臂 VR 遥操。':`按录制速度试运行 ${preview.duration_seconds?.toFixed(2) || ''} 秒，请先恢复物体布置。`;
-    $('confirm-binding').textContent=`左臂 ${preview.binding?.arms?.left || ''} · 右臂 ${preview.binding?.arms?.right || ''} · 标定 ${preview.binding?.calibration_id || ''}`;
+    $('confirm-description').textContent=preview.description || (action==='begin'?'准备进入双臂 VR 遥操。':`按录制速度试运行 ${preview.duration_seconds?.toFixed(2) || ''} 秒，请先恢复物体布置。`);
+    $('confirm-binding').textContent=preview.binding_label || `左臂 ${preview.binding?.arms?.left || ''} · 右臂 ${preview.binding?.arms?.right || ''} · 标定 ${preview.binding?.calibration_id || ''}`;
     $('confirm-control').checked=false;$('confirm-go').disabled=true;$('confirm').hidden=false;$('confirm-control').focus();
   }
   $('check-btn').onclick=()=>act(runChecks);
@@ -201,7 +218,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   $('to-save-btn').onclick=()=>setStage(3);$('scrub').oninput=scrub;
   $('confirm-control').onchange=()=>{$('confirm-go').disabled=!$('confirm-control').checked;};
   $('confirm-cancel').onclick=()=>{preview=null;$('confirm').hidden=true;};
-  $('confirm-go').onclick=()=>act(async()=>{if(!preview || Date.now()-preview.created>60000)throw new Error('预览已过期，请取消后重试。');const p=preview;preview=null;$('confirm').hidden=true;await call(p.action,{draft_id:draft.id,execute:true,preview_id:p.preview_id,workspace_clear:true,take_control:true});if(p.action==='trial' && inspection)inspection.start={ready:false,error:'再次试运行前需复查'};});
+  $('confirm-go').onclick=()=>act(async()=>{if(!preview || Date.now()-preview.created>60000)throw new Error('预览已过期，请取消后重试。');const p=preview;preview=null;$('confirm').hidden=true;await call(p.action,{draft_id:draft.id,execute:true,preview_id:p.preview_id,workspace_clear:true,take_control:true});if(p.action==='trial' && inspection)inspection.start={ready:false,can_trial:false,error:'再次试运行前需复查'};});
   $('stop-btn').onclick=async()=>{preview=null;$('confirm').hidden=true;try{await call('stop');await refresh();}catch(error){fail(error);}};
   function updatePhrase() {$('phrase-preview').textContent=$('skill-name').value.trim()?`“${$('skill-name').value.trim()}”`:'填写技能名称';}
   $('skill-name').oninput=updatePhrase;

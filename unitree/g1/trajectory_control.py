@@ -121,6 +121,10 @@ class TrajectoryControl:
         with self.lock:
             self._idle()
             generation = self.control._generation
+            # Teaching previews bind the exact file and stop generation. Keep
+            # the ordinary filename-only teleop API unchanged.
+            if args.get('expected_generation', generation) != generation:
+                raise ValueError('replay_cancelled')
             self.motion.stop()
             if self.arm.profile is None:
                 self.arm.configure_profile(self.motion.cfg['calibration_path'],
@@ -128,6 +132,8 @@ class TrajectoryControl:
             self.arm.start()
             recording = read_recording(self.directory, args.get('filename'), self.arm.limits)
             self._check_binding(recording)
+            if args.get('expected_sha256', recording['sha256']) != recording['sha256']:
+                raise ValueError('recording_changed_after_preview')
             if recording['frames'][0]['kind'] != 'target': raise ValueError('recording_initial_target_missing')
             ident = secrets.token_hex(16)
             with self.control._lock:

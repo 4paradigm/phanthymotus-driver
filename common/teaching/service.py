@@ -69,13 +69,13 @@ class TeachingPlugin:
             "trial": (["draft_id", *confirmation], "预览或确认试运行当前录制"),
             "save": (["draft_id", "name", "description", "conditions", "phrase", "effect_confirmed"], "试运行成功且用户确认效果后保存技能"),
             "run": (["asset_id", *confirmation], "执行已保存的技能；先预览，再取得用户本次确认，最后提交执行。running 不是完成"),
-            "stop": ([], "请求停止并保持，读取 info 确認完成；不会释放电机力矩"),
+            "stop": ([], "请求原控制器停止，读取 info 确认完成结果"),
         }
         schema = action_schema(actions, fields)
         schema["additionalProperties"] = False
-        schema["x-resource"] = "arm"
+        schema["x-resource"] = getattr(self.adapter, "resources", "arm")
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
-        schema["x-completion"] = {"actions": ["run"], "timeout": 610}
+        schema["x-completion"] = {"actions": ["run"], "timeout": getattr(self.adapter, "completion_timeout", 610)}
         schema["x-workbench"] = {"protocol": PROTOCOL, "kind": "skill-authoring",
                                  "title": "录制技能 · " + self.adapter.title, "entry": "ui", "actions": list(actions)}
         schema["properties"]["action"]["oneOf"] = [
@@ -195,7 +195,8 @@ class TeachingPlugin:
                 f"使用当前设备的 {self.name} 工具 run 动作，asset_id={asset_id}，先 execute=false 预览。\n"
                 "向用户说明活动空间、双臂接管及起始姿态要求；取得本次确认后，带返回的 preview_id、"
                 "execute=true、workspace_clear=true、take_control=true 再次 run。不得复用旧确认。\n"
-                "预览不通过时报告原因；不得自动回起点、切模式、使能、换设备、改速度或改录制。"
+                "预览不通过时报告原因，不得改录制或绕过检查。"
+                + self.adapter.replay_instruction +
                 "设备/标定绑定由驱动强制检查。running 只表示已提交，等待 ACP 完成或通过 info 核对相同 action_id 的终态。"
                 "停止使用 stop 并等待完成结果。动作完成不等于任务效果成功，按需让用户确认。"
                 "本技能保持录制时环境和物体布置，不具有视觉泛化或物体定位能力。"
@@ -232,6 +233,7 @@ class TeachingPlugin:
                 if (status.get("recording") or {}).get("recording") and self.record_started is not None:
                     status["recording"]["elapsed_seconds"] = max(0, time.monotonic() - self.record_started)
                 return {**status, "title": self.adapter.title,
+                        "presentation": copy.deepcopy(self.adapter.presentation),
                         "busy": bool(self.pending) or status["busy"],
                         "draft": copy.deepcopy({k: v for k, v in (self.draft or {}).items() if k != "saved"}),
                         "saved": copy.deepcopy((self.draft or {}).get("saved", {}).get("metadata")),
@@ -243,7 +245,12 @@ class TeachingPlugin:
             if action == "check":
                 return self.adapter.check()
             if action == "new":
-                self._idle()
+                if args.get("filename"):
+                    self._idle()
+                else:
+                    status = self.adapter.info()
+                    if self.pending or not status.get("can_prepare", not status["busy"]):
+                        raise RuntimeError("robot_busy_wait_for_completion")
                 recording = self.adapter.inspect(args["filename"]) if args.get("filename") else None
                 self.draft = {"id": uuid4().hex, "recording": recording, "trial": None}
                 self.record_started = None
@@ -266,7 +273,12 @@ class TeachingPlugin:
                     draft["teleop_id"] = result["action_id"]
                 return result
             if action == "record":
-                if not draft.get("teleop_id") or self.adapter.info().get("session_id") != draft["teleop_id"]:
+                status = self.adapter.info()
+                if self.adapter.presentation.get("session_start") == "controller" and not draft.get("teleop_id"):
+                    if not status.get("can_record") or not status.get("session_id"):
+                        raise ValueError("live_mapped_teleop_required")
+                    draft["teleop_id"] = status["session_id"]
+                if not draft.get("teleop_id") or status.get("session_id") != draft["teleop_id"]:
                     raise ValueError("start_teaching_teleop_first")
                 result = self.adapter.record()
                 self.record_started = time.monotonic()

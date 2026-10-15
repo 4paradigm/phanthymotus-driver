@@ -169,6 +169,8 @@ class G1DeviceBundle:
                 stream.public_motion_topics = False
                 self._motion_bus = TeleopBus(executor, control)
                 self._plugins.append(control)
+                from teaching import teaching_plugin
+                self._plugins.append(teaching_plugin(control))
             else:
                 self._motion_bus = MotionBus(namespace, executor, motion, stream)
                 self._plugins.append(motion)
@@ -400,7 +402,7 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
-                    if name in ('motion_control', 'teleop_control'):
+                    if name in ('motion_control', 'teleop_control', 'g1_teaching'):
                         import ipaddress
                         if self.headers.get('Origin') or not ipaddress.ip_address(self.client_address[0]).is_loopback:
                             err(-32600, 'teleop control requires loopback')
