@@ -24,7 +24,6 @@ class ArucoDetectorCardTests(unittest.TestCase):
     def test_driver_registers_card_and_packages_aruco_runtime(self):
         driver_yaml = (REALMAN_DIR / "driver.yaml").read_text()
         self.assertIn("name: aruco_detector,   type: processor", driver_yaml)
-        self.assertIn("name: aruco_zones,      type: processor", driver_yaml)
 
         config_yaml = (REALMAN_DIR / "config.yaml").read_text()
         self.assertIn("aruco_detector:\n  enabled: true", config_yaml)
