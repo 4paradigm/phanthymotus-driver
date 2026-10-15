@@ -164,10 +164,114 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.report.call_args.args[1], 'error')
         self.assertFalse(self.controller.last['target_opening_verified'])
 
+    async def blocked_at_94(self):
+        self.reader.read_gripper.return_value = sample(94,left_speed=0,right_speed=0)
+        await self.dispatch();await self.controller.task
+        self.assertEqual(self.controller.info()['state'],'blocked_requires_operator_check')
+        return {'action':'recover','side':'left','confirm_stopped':True}
+
+    async def test_state_query_exposes_failure_without_unlocking_94_as_100(self):
+        await self.blocked_at_94()
+        state=await self.controller.get_state()
+        self.assertEqual(state['state'],'blocked_requires_operator_check')
+        self.assertFalse(state['can_accept_motion'])
+        self.assertEqual(state['motion']['target_opening'],100)
+        self.assertEqual(state['motion']['reported_opening'],94)
+        self.assertIn('94',state['motion']['error'])
+        self.assertFalse(state['motion']['target_opening_verified'])
+
+    async def test_operator_recovery_preserves_failed_result_and_never_resends_motion(self):
+        args=await self.blocked_at_94()
+        with patch.multiple('gripper',RECOVERY_TIMEOUT=.15,RECOVERY_STABILITY_SECONDS=.015):
+            result=await self.controller.recover(args)
+        self.assertTrue(result['recovered']);self.assertTrue(result['can_accept_motion'])
+        self.assertFalse(result['motion_sent']);self.assertFalse(result['recovering'])
+        self.assertEqual(self.controller.last['status'],'error')
+        self.assertFalse(self.controller.last['target_opening_verified'])
+        self.assertEqual(self.controller.last['operator_recovery']['observed_opening'],94)
+        self.reader.send_gripper.assert_awaited_once()
+        self.assertIsNone(self.controller.active)
+        self.reader.read_gripper.return_value=sample(0,left_speed=0,right_speed=0)
+        await self.controller.dispatch('close',{'side':'left','speed':10,'force':10})
+        self.assertNotIn('error',self.controller.info()['motion'])
+        await self.controller.task
+        self.assertEqual(self.reader.send_gripper.await_count,2)
+        self.assertEqual(self.controller.last['status'],'completed')
+
+    async def test_recovery_requires_literal_confirmation_and_original_side(self):
+        args=await self.blocked_at_94();count=self.reader.read_gripper.await_count
+        for update in ({'confirm_stopped':False},{'confirm_stopped':'true'},{'side':'right'},{'force':10}):
+            with self.assertRaises(ValueError):await self.controller.recover({**args,**update})
+        self.assertEqual(self.reader.read_gripper.await_count,count)
+        self.assertIsNotNone(self.controller.active)
+
+    async def test_recovery_rejects_moving_or_cached_or_missing_timestamp_feedback(self):
+        args=await self.blocked_at_94()
+        for updates in ({'left_speed':1},{'right_speed':1},{'timestamp':None},{'result':'fail_motor'}):
+            self.reader.read_gripper.return_value=sample(94,left_speed=0,right_speed=0)
+            self.reader.read_gripper.return_value.update(updates)
+            if 'timestamp' in updates:self.reader.read_gripper.side_effect=None
+            with patch.multiple('gripper',RECOVERY_TIMEOUT=.04,RECOVERY_STABILITY_SECONDS=.015):
+                with self.assertRaises(ValueError):await self.controller.recover(args)
+            self.assertIsNotNone(self.controller.active);self.assertFalse(self.controller.recovering)
+        self.reader.read_gripper.side_effect=None
+        self.reader.read_gripper.return_value=sample(94,left_speed=0,right_speed=0)
+        with patch.multiple('gripper',RECOVERY_TIMEOUT=.04,RECOVERY_STABILITY_SECONDS=.015):
+            with self.assertRaises(ValueError):await self.controller.recover(args)
+        self.reader.send_gripper.assert_awaited_once()
+
+    async def test_recovery_rejects_cumulative_opening_drift(self):
+        args=await self.blocked_at_94();opening=60
+        async def drift():
+            nonlocal opening
+            opening+=1;self.tick+=1
+            return sample(opening,left_speed=0,right_speed=0,timestamp=self.tick)
+        self.reader.read_gripper.side_effect=drift
+        with patch.multiple('gripper',RECOVERY_TIMEOUT=.04,RECOVERY_STABILITY_SECONDS=.015):
+            with self.assertRaises(ValueError):await self.controller.recover(args)
+        self.assertIsNotNone(self.controller.active)
+
+    async def test_recovery_retains_lock_if_original_callback_still_fails(self):
+        self.report.return_value=False;args=await self.blocked_at_94()
+        with patch.multiple('gripper',RECOVERY_TIMEOUT=.15,RECOVERY_STABILITY_SECONDS=.015):
+            with self.assertRaises(ValueError):await self.controller.recover(args)
+            self.assertIsNotNone(self.controller.active)
+            self.report.return_value=True
+            result=await self.controller.recover(args)
+        self.assertTrue(result['recovered'])
+        self.assertEqual(self.report.call_args.args[1],'error')
+        self.reader.send_gripper.assert_awaited_once()
+
+    async def test_recovery_stops_if_connection_changes(self):
+        args=await self.blocked_at_94()
+        async def changed():
+            self.reader.ws=object()
+            return sample(94,left_speed=0,right_speed=0,timestamp=999999)
+        self.reader.read_gripper.side_effect=changed
+        with self.assertRaises(ValueError):await self.controller.recover(args)
+        self.assertIsNotNone(self.controller.active)
+
+    async def test_recovery_callback_exception_keeps_lock_and_query_truthful(self):
+        self.report.return_value=False;args=await self.blocked_at_94()
+        self.report.side_effect=OSError('callback offline')
+        with patch.multiple('gripper',RECOVERY_TIMEOUT=.15,RECOVERY_STABILITY_SECONDS=.015):
+            with self.assertRaises(ValueError):await self.controller.recover(args)
+        self.assertIsNotNone(self.controller.active)
+        self.assertFalse(self.controller.recovering)
+
+    async def test_recovery_cannot_clear_active_arm_or_ongoing_gripper(self):
+        args=await self.blocked_at_94()
+        from types import SimpleNamespace
+        self.controller.peer=SimpleNamespace(closed=False,active={'state':'moving'})
+        with self.assertRaises(ValueError):await self.controller.recover(args)
+        self.controller.peer=None;self.controller.active['state']='moving'
+        with self.assertRaises(ValueError):await self.controller.recover(args)
+        self.assertIsNotNone(self.controller.active)
+
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.requests=[];self.opening=40;self.bad_reply=False;self.mode='developer_mode'
+        self.requests=[];self.opening=40;self.bad_reply=False;self.mode='developer_mode';self.cap=None
         async def vendor(request):
             ws=web.WebSocketResponse();await ws.prepare(request)
             packet=info();packet['data']['working_mode']=self.mode
@@ -176,9 +280,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 data=json.loads(msg.data);self.requests.append(data)
                 title=data['title'];payload=None
                 if title=='request_get_joint_state': payload=joints()
-                if title=='request_get_limx_2fclaw_state': payload=sample(self.opening,timestamp=len(self.requests))
+                if title=='request_get_limx_2fclaw_state':
+                    payload=sample(self.opening,timestamp=len(self.requests))
+                    if self.cap is not None:payload.update(left_speed=0,right_speed=0)
                 if title=='request_set_limx_2fclaw_cmd':
                     self.opening=data['data'].get('left_opening',self.opening)
+                    if self.cap is not None:self.opening=min(self.opening,self.cap)
                     payload={'result':'success'}
                 if title=='request_movej': payload={'result':'success'}
                 if payload is not None:
@@ -260,6 +367,35 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(result['isError']);await adapter.gripper.task
             self.assertEqual(adapter._report_completion.call_args.args[0],'gripper')
             self.assertEqual(adapter._report_completion.call_args.args[2],'completed')
+            self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),1)
+        finally:
+            await adapter.gripper.close();await runner.cleanup()
+
+    async def test_failed_94_feedback_and_recovery_through_actual_mcp(self):
+        self.cap=94
+        adapter=Adapter(lambda *a:None,settings(enabled_cards=['gripper']),reader=self.reader)
+        adapter._report_completion=AsyncMock(return_value=True)
+        app=web.Application();app.router.add_post('/mcp',adapter.rpc)
+        runner=web.AppRunner(app);await runner.setup()
+        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        endpoint='http://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])+'/mcp'
+        async def call(action,**args):
+            async with self.session.post(endpoint,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
+                'params':{'name':'gripper','arguments':{'action':action,**args}}}) as response:
+                body=(await response.json())['result']
+                self.assertFalse(body['isError'],body)
+                return json.loads(body['content'][0]['text'])
+        try:
+            with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.01,RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.025):
+                await call('open',side='left',speed=10,force=10)
+                await adapter.gripper.task
+                state=await call('get_state')
+                self.assertEqual(state['motion']['reported_opening'],94)
+                self.assertFalse(state['can_accept_motion'])
+                recovered=await call('recover',side='left',confirm_stopped=True)
+                self.assertTrue(recovered['recovered']);self.assertTrue(recovered['can_accept_motion'])
+                self.assertEqual(recovered['motion']['status'],'error')
+                self.assertFalse(recovered['motion']['target_opening_verified'])
             self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),1)
         finally:
             await adapter.gripper.close();await runner.cleanup()

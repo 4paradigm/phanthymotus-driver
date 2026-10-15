@@ -12,10 +12,10 @@ from reset import ResetPose
 from skeleton import skeleton_stream, model
 from completion import ArmCompletion, ACP_TIMEOUT
 from camera import CameraStream, CAMERA_SOURCES
-from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS
+from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.6.0'
+VERSION = '0.6.1'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -167,7 +167,7 @@ class Adapter:
         if name == 'arm_control':
             allowed |= {'joint', 'time'}
         if name == 'gripper':
-            allowed |= {'side', 'opening', 'speed', 'force'}
+            allowed |= {'side', 'opening', 'speed', 'force', 'confirm_stopped'}
         if not isinstance(args, dict) or set(args) - allowed:
             raise ValueError('Only action and Core instance_id/_trace_id metadata are accepted')
         # Core injects both fields after the model has selected a tool. Accept
@@ -187,6 +187,9 @@ class Adapter:
         if name not in self.enabled:
             raise ValueError('Unknown tool')
         if name == 'gripper':
+            if action == 'recover':
+                recovery_arguments(args)
+                return {'action': 'recover', 'read_only': True, 'motion_sent': False}
             if action in ('start', 'stop', 'info', 'get_state'):
                 if set(args) - {'action', 'instance_id', '_trace_id'}:
                     raise ValueError('读取状态和系统操作无需开合参数')
@@ -285,6 +288,8 @@ class Adapter:
                         action = params.get('arguments', {}).get('action')
                         if action == 'get_state':
                             data = await self.gripper.get_state()
+                        elif action == 'recover':
+                            data = await self.gripper.recover(params['arguments'])
                         elif action in MOTION_ACTIONS:
                             data = await self.gripper.dispatch(action, params['arguments'])
                     error = False

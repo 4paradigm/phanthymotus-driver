@@ -1,6 +1,7 @@
 """LimX two-finger gripper: explicit side, correlated status and ACP completion."""
 import asyncio
 import math
+import logging
 import time
 from uuid import uuid4
 
@@ -12,6 +13,16 @@ ACP_TIMEOUT = 40
 POLL_SECONDS = .2
 STABILITY_SECONDS = .5
 TOLERANCE = 1
+RECOVERY_TIMEOUT = 8
+RECOVERY_STABILITY_SECONDS = 1
+LOG = logging.getLogger('tron2')
+
+
+def recovery_arguments(args):
+    if set(args) - {'action', 'side', 'confirm_stopped', 'instance_id', '_trace_id'}:
+        raise ValueError('恢复操作只需选择原任务侧并确认夹爪已停止，请清除开合参数')
+    if args.get('side') not in ('left', 'right') or args.get('confirm_stopped') is not True:
+        raise ValueError('检查实物已停止且无夹持物体后，选择原任务侧并勾选确认；此操作不发送急停或开合')
 
 
 def percentage(value, name):
@@ -61,23 +72,27 @@ def tool(metadata):
             'inputSchema': {'type': 'object', 'additionalProperties': False,
                 'properties': {
                     # get_state comes first: adding the card selects a read operation.
-                    'action': {'type': 'string', 'enum': ['get_state', *MOTION_ACTIONS],
-                               'description': 'get_state读取状态；open张开；close闭合；set_opening设置开口度'},
+                    'action': {'type': 'string', 'enum': ['get_state', *MOTION_ACTIONS, 'recover'],
+                               'description': 'get_state读取状态；open张开；close闭合；set_opening设置开口度；recover确认停止后恢复'},
                     'side': {'type': 'string', 'enum': ['left', 'right'], 'description': 'left左夹爪；right右夹爪'},
                     'opening': {'type': 'number', 'minimum': 0, 'maximum': 100, 'description': '目标开口度：0闭合，100张开'},
                     'speed': {'type': 'number', 'exclusiveMinimum': 0, 'maximum': 100, 'description': '开合速度档位：大于0至100'},
                     'force': {'type': 'number', 'minimum': 0, 'maximum': 100, 'description': '夹持力档位：0至100，并非牛顿'},
+                    'confirm_stopped': {'type': 'boolean', 'description': '已现场确认夹爪停止、空载且周围无人手或障碍物；恢复不发送急停或开合'},
                     **metadata},
                 'required': ['action'],
                 'allOf': [{'if': {'properties': {'action': {'enum': list(MOTION_ACTIONS)}}, 'required': ['action']},
                            'then': {'required': ['side', 'speed', 'force']}},
                           {'if': {'properties': {'action': {'const': 'set_opening'}}, 'required': ['action']},
-                           'then': {'required': ['opening']}}],
+                           'then': {'required': ['opening']}},
+                          {'if': {'properties': {'action': {'const': 'recover'}}, 'required': ['action']},
+                           'then': {'required': ['side', 'confirm_stopped'], 'properties': {'confirm_stopped': {'const': True}}}}],
                 'x-action-params': {
                     'get_state': {'params': [], 'description': '读取左右夹爪厂家报告的开口度、速度档位和夹持力档位，不移动夹爪'},
                     'open': {'params': ['side', 'speed', 'force'], 'description': '张开所选夹爪至最大开口'},
                     'close': {'params': ['side', 'speed', 'force'], 'description': '闭合所选夹爪；遇物体无法达到最小开口时不会报告目标到位或抓取成功'},
-                    'set_opening': {'params': ['side', 'opening', 'speed', 'force'], 'description': '将所选夹爪调整至指定开口度'}},
+                    'set_opening': {'params': ['side', 'opening', 'speed', 'force'], 'description': '将所选夹爪调整至指定开口度'},
+                    'recover': {'params': ['side', 'confirm_stopped'], 'description': '现场确认停止后，检查连续反馈并恢复失败任务；不补发动作，不把未到位改成成功'}},
                 'x-resource': ['arm_l', 'arm_r'],
                 'x-completion': {'actions': list(MOTION_ACTIONS), 'timeout': ACP_TIMEOUT}}}
 
@@ -88,21 +103,94 @@ class Gripper:
         self.active = self.last = self.task = self.sample = None
         self.closed = False
         self.peer = None
+        self.recovering = False
 
     def info(self):
         age = None if self.sample is None else max(0, time.monotonic() - self.sample[0])
         available = self.reader.connected and age is not None and age <= self.reader.settings['stale_after_seconds'] \
             and self.reader.ws is self.sample[2] and self.reader.serial == self.sample[3]
+        motion = dict(self.last) if self.last and (not self.active or
+                    self.last['action_id'] == self.active['action_id']) else None
+        if self.active:
+            motion = {**(motion or {}), **{k: self.active[k] for k in ('action_id', 'action', 'side', 'state')},
+                      'target_opening': self.active['target']}
         return {'state': self.active['state'] if self.active else 'ready' if self.reader.connected else 'offline',
                 'motion_sent': False, 'available': available,
                 'reception_age_seconds': age, 'data': self.sample[1] if available else None,
-                'motion': self.last if not self.active else {k: self.active[k] for k in ('action_id', 'action', 'side', 'state')},
+                'motion': motion, 'recovering': self.recovering,
+                'can_accept_motion': not self.closed and not self.active and not self.recovering and
+                    self.reader.connected and not (self.peer and (self.peer.closed or self.peer.active)),
                 'grasp_verified': False}
 
     async def get_state(self):
         data = state_data(await self.reader.read_gripper())
         self.sample = (time.monotonic(), data, self.reader.ws, self.reader.serial)
-        return {'state': 'ready', 'read_only': True, 'motion_sent': False, 'data': data}
+        return {**self.info(), 'read_only': True}
+
+    async def recover(self, args):
+        recovery_arguments(args)
+        if self.closed or self.recovering or self.peer and (self.peer.closed or self.peer.active):
+            raise MoveError('驱动关闭、正在恢复或机械臂任务未结束，不能恢复夹爪', False)
+        job = self.active
+        if job is None:
+            return {**self.info(), 'read_only': True, 'recovered': False, 'message': '没有需要恢复的夹爪任务'}
+        if job['side'] != args['side'] or job['state'] != 'blocked_requires_operator_check' or \
+                self.task and not self.task.done() or not self.last or self.last['action_id'] != job['action_id']:
+            raise MoveError('请选择原失败任务的侧；任务仍在执行或报告时不能恢复', False)
+        self.recovering = True
+        try:
+            ws, serial = self.reader.ws, self.reader.serial
+            deadline = time.monotonic() + RECOVERY_TIMEOUT
+            start = None; count = 0; previous = None; stamp = None
+            while time.monotonic() < deadline:
+                if not self.reader.connected or self.reader.ws is not ws or self.reader.serial != serial:
+                    raise ValueError('恢复期间连接发生变化，请重新检查；未解除任务保护')
+                state = (await self.get_state())['data']
+                if self.reader.ws is not ws or self.reader.serial != serial or not self.reader.connected:
+                    raise ValueError('恢复期间连接发生变化，未解除任务保护')
+                current_stamp = state['vendor_timestamp_ms']
+                openings = [state[side]['opening'] for side in ('left', 'right')]
+                fresh = current_stamp is not None and (stamp is None or current_stamp > stamp)
+                stationary = all(state[side]['speed'] == 0 for side in ('left', 'right'))
+                stable = previous is None or all(abs(a-b) <= TOLERANCE for a,b in zip(openings,previous))
+                stamp = current_stamp
+                if fresh and stationary and stable:
+                    if start is None:
+                        start = time.monotonic()
+                        previous = openings
+                    count += 1
+                    if count >= 3 and time.monotonic()-start >= RECOVERY_STABILITY_SECONDS:
+                        break
+                else:
+                    start = None; count = 0; previous = None
+                await asyncio.sleep(POLL_SECONDS)
+            else:
+                raise ValueError('未收到连续更新且稳定的零速度夹爪反馈，未解除任务保护')
+            # Acknowledgement loss is not converted to success, nor is any
+            # motion command retried. Only re-deliver the original ACP outcome.
+            if not self.last['callback_delivered']:
+                try:
+                    delivered = await self.report(job['action_id'], self.last['status'],
+                        {k:v for k,v in self.last.items() if k not in ('action_id','status','callback_delivered')})
+                except Exception:
+                    delivered = False
+                if not delivered:
+                    raise ValueError('原任务结果仍无法通知平台，未解除任务保护')
+                self.last['callback_delivered'] = True
+            if self.closed or self.reader.ws is not ws or self.reader.serial != serial or not self.reader.connected or \
+                    self.peer and (self.peer.closed or self.peer.active):
+                raise ValueError('恢复期间驱动、连接或机械臂状态变化，未解除任务保护')
+            self.last['operator_recovery'] = {'confirmed_stopped': True, 'side': args['side'],
+                'reported_stationary_verified': True, 'verified_samples': count,
+                'observed_opening': state[args['side']]['opening'], 'vendor_timestamp_ms': stamp,
+                'motion_sent': False, 'recovered_at': time.time()}
+            self.active = None
+            self.recovering = False
+            LOG.info('Gripper task recovered after operator confirmation: %s', job['action_id'])
+            return {**self.info(), 'read_only': True, 'recovered': True,
+                    'message': '已恢复后续操作；原任务结果保留，未发送任何开合或急停指令'}
+        finally:
+            self.recovering = False
 
     async def dispatch(self, action, args):
         data = command(action, args)
@@ -112,7 +200,7 @@ class Gripper:
             await asyncio.shield(self.peer.task)
         if self.peer and (self.peer.closed or self.peer.active):
             raise MoveError('机械臂动作进行中或结果尚未确认，暂不接受夹爪开合', False)
-        if self.closed or self.active:
+        if self.closed or self.active or self.recovering:
             raise MoveError('夹爪忙或上次动作结果尚未确认，请先检查状态', False)
         future = asyncio.get_running_loop().create_future()
         future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
@@ -136,6 +224,8 @@ class Gripper:
             result = await self.get_state()  # Each sample is a new correlated query.
             self.same_session(job)
             actual = result['data'][job['side']]['opening']
+            job['reported_opening'] = actual
+            job['reported_speed'] = result['data'][job['side']]['speed']
             stamp = result['data']['vendor_timestamp_ms']
             now = time.monotonic()
             if stamp is None or stamp <= last_stamp:
@@ -153,7 +243,8 @@ class Gripper:
             else:
                 start = None; matches = 0
             await asyncio.sleep(POLL_SECONDS)
-        raise ValueError('未确认达到目标开口；可能受物体阻挡或反馈异常，请检查夹爪。未确认抓取成功')
+        raise ValueError('未确认达到目标开口'+str(job['target'])+'，最近反馈'+str(job.get('reported_opening'))+
+                         '；检查实物停止后可使用recover恢复。未确认抓取成功')
 
     async def _run(self, job, data):
         admitted = False
@@ -201,6 +292,9 @@ class Gripper:
                       motion_sent=job['motion_sent'], grasp_verified=False,
                       motion_may_continue=status != 'completed')
         result.setdefault('target_opening_verified', False)
+        result.update({k: job[k] for k in ('reported_opening','reported_speed') if k in job})
+        if status != 'completed':
+            LOG.warning('Gripper action %s failed: %s', job['action_id'], result.get('error'))
         job['target_opening_verified'] = result['target_opening_verified']
         job['state'] = 'reporting'
         try:
