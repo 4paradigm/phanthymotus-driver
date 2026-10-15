@@ -53,7 +53,7 @@ class TestLocoRelativeMove(unittest.TestCase):
             self.assertEqual([s['stage'] for s in stages], ['straight', 'lateral', 'rotation'])
             self.assertEqual((stages[0]['vx'], stages[0]['vy'], stages[0]['vyaw']), (-0.3, 0., 0.))
             self.assertEqual((stages[1]['vx'], stages[1]['vy'], stages[1]['vyaw']), (0., 0.3, 0.))
-            self.assertAlmostEqual(stages[0]['duration'], 2. / 0.6 / 1.20)
+            self.assertAlmostEqual(stages[0]['duration'], 2. / 0.6 / 1.20 * 15. / 16.)
             self.assertAlmostEqual(stages[1]['duration'], 1. / 0.6 / 1.2)
             factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
             self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor / 1.18)
@@ -100,7 +100,7 @@ class TestLocoRelativeMove(unittest.TestCase):
         positive = point.plan(dict(x=1))[0]
         negative = point.plan(dict(x=-1))[0]
         self.assertAlmostEqual(positive['duration'], 1 / 0.3 / 0.6)
-        self.assertAlmostEqual(negative['duration'], positive['duration'] / 1.20)
+        self.assertAlmostEqual(negative['duration'], positive['duration'] / 1.20 * 15. / 16.)
         self.assertEqual((positive['vx'], negative['vx']), (0.3, -0.3))
         point.speed = 0.5
         self.assertAlmostEqual(point.plan(dict(x=-1))[0]['duration'], 2.)
@@ -306,7 +306,7 @@ class TestLocoRelativeMove(unittest.TestCase):
         self.assertEqual(schema['properties']['angle']['enum'], [0, 30, 60, 90, 180])
         for axis in ('x', 'y'):
             field = schema['properties'][axis]
-            self.assertEqual(field['title'], f'{axis.upper()} (m)')
+            self.assertEqual(field['title'], 'X (m)' if axis == 'x' else 'Y (m，正向左 / 负向右)')
             self.assertEqual((field['minimum'], field['maximum']), (-5, 5))
             self.assertEqual(field['anyOf'], [{'const': 0}, {'minimum': 0.3}, {'maximum': -0.3}])
         self.assertEqual(schema['properties']['angle']['title'], 'Angle (°)')

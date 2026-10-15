@@ -18,7 +18,8 @@ class LocoRelativeMovePlugin:
     TRANSLATION_TIME_FACTORS = (1. / 0.6, 1. / 0.6 / 1.2)
     # Direction-specific visual measurements at the default speeds.
     RIGHT_ROTATION_TIME_FACTOR = 1. / 1.18
-    NEGATIVE_X_TIME_FACTOR = 1. / 1.20
+    # A subsequent test still overshot by ~1/15 of the target distance.
+    NEGATIVE_X_TIME_FACTOR = 1. / 1.20 * (15. / 16.)
     NEGATIVE_Y_TIME_FACTOR = 1. / 1.05
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
@@ -58,10 +59,10 @@ class LocoRelativeMovePlugin:
                           "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
                           "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
                           "description": "Relative longitudinal distance (m): 0 skips this stage; otherwise absolute value must be 0.3–5 m. Positive forward, negative backward (same as loco vx)."},
-                    "y": {"type": "number", "title": "Y (m)", "default": 0,
+                    "y": {"type": "number", "title": "Y (m，正向左 / 负向右)", "default": 0,
                           "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
                           "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
-                          "description": "Relative lateral distance (m): 0 skips this stage; otherwise absolute value must be 0.3–5 m. Positive left, negative right (same as loco vy)."},
+                          "description": "横移距离（m）：相对于机器人运动开始时的朝向，正值向左、负值向右（同 loco vy）；0 跳过，非零绝对值为 0.3–5 m。"},
                     "angle": {"type": "integer", "title": "Angle (°)", "enum": [0, 30, 60, 90, 180], "default": 0,
                               "description": "Final rotation in degrees; 0 skips rotation."},
                     "direction": {"type": "string", "enum": ["left", "right"], "default": "left",
