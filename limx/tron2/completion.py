@@ -32,6 +32,7 @@ class ArmCompletion:
         self.active = self.last = self.task = None
         self.closed = False
         self.peer = None
+        self.peers = []
 
     def summary(self):
         return ({key: self.active[key] for key in ('action_id', 'action', 'state')}
@@ -44,10 +45,11 @@ class ArmCompletion:
         if self.active and self.active['state'] == 'reporting' \
                 and self.active.get('arrival_verified'):
             await asyncio.shield(self.task)
-        if self.peer and self.peer.active and self.peer.active['state'] == 'reporting' \
-                and self.peer.active.get('target_opening_verified'):
-            await asyncio.shield(self.peer.task)
-        if self.peer and (self.peer.closed or self.peer.active):
+        peers = self.peers + ([self.peer] if self.peer else [])
+        for peer in peers:
+            if peer.active and peer.active['state'] == 'reporting' and peer.active.get('target_opening_verified'):
+                await asyncio.shield(peer.task)
+        if any(peer.closed or peer.active or peer.recovering for peer in peers):
             raise MoveError('Gripper action is active or uncertain; no arm motion sent', False)
         if self.closed or self.active:
             raise MoveError('Arms are busy or require operator verification; no additional motion sent', False)

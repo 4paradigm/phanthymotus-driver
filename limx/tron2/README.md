@@ -1,18 +1,18 @@
 # LimX TRON2 传感器、双臂与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂控制卡片和夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.6.2`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂控制卡片和左、右夹爪两张控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.6.3`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架，附随腕运动的左右夹爪示意；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
-| `gripper` | actuator | 左右夹爪状态查询、张开、闭合及指定开口度 | 无；状态查询返回左右夹爪厂家报告值 |
+| `gripper_left` / `gripper_right` | actuator | 固定左/右夹爪，独立设置开口、闭合、恢复 | 无；详情显示本侧厂家反馈 |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
 | `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
-夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。公开操作为open、close、set_opening、recover，不再提供get_state。新增卡片默认恢复选项且确认false，系统启动/停止不会发送夹爪开合。
+夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。操作顺序为open、close、recover；open明确填写opening、speed、force。两侧独立任务，无SIDE或CONFIRM_STOPPED。未填写有效开合参数、系统启动/停止均不会发送夹爪开合。
 
 传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
@@ -20,11 +20,11 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；gripper仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。没有模式切换、拖动示教或自动演示循环。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
-- 左右夹爪通过安装点上的固定双指轮廓显示，跟随对应手腕运动。默认显示闭合，状态是静态示意，不表示当前实际夹持状态；gripper卡片查询的相对开口度未接入骨架动画。附加display_hand_gripper_*节点只供渲染，全部fixed，不增加16关节反馈数量，不改变原始运动学或控制限位。显示间距/指长为示意尺寸，不是标定的实物外形、TCP或碰撞模型。
+- 左右夹爪通过安装点上的固定双指轮廓显示，跟随对应手腕运动。默认显示闭合，状态是静态示意，不表示当前实际夹持状态；夹爪卡片查询的相对开口度未接入骨架动画。附加display_hand_gripper_*节点只供渲染，全部fixed，不增加16关节反馈数量，不改变原始运动学或控制限位。显示间距/指长为示意尺寸，不是标定的实物外形、TCP或碰撞模型。
 - 骨架使用Motus既有joints协议和model资源。名称缺失时按官方SDK索引顺序映射到URDF：左臂0–6、右臂7–13、头部俯仰14/偏航15；URDF文本中头部关节顺序相反，不使用文件遍历顺序。若厂家提供名称则按名称匹配，不支持的关节数或名称返回空骨架和不可用诊断。没有可用IMU姿态时省略可选imu_quat；不能发送空数组，因为平台会将其解构成四个undefined值、破坏根节点旋转。模型来源和Apache-2.0归属见resource/SOURCE.md；只保留厂家运动学，不包含网格资产。
 - 厂家的 `UNKNOW` 等状态字符串原样保留；缺失字段为 `null`。
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
