@@ -391,11 +391,8 @@ class SoundDirectionPlugin:
             else:
                 parameters = DEFAULT_PARAMETERS.copy()
             running = self._proc is not None and self._proc.poll() is None
-            if running:
-                try:
-                    self.stop()
-                except subprocess.TimeoutExpired:
-                    return {"state": "error", "message": "direction subprocess did not exit after kill"}
+            # 先原子写盘、再重启 worker：写失败（ENOSPC/权限等）时 worker 与
+            # 旧设置原样保留，不能先杀掉 worker 再拿旧文件重启、还宣称配置成功。
             write_error = None
             try:
                 SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -404,6 +401,16 @@ class SoundDirectionPlugin:
                 temporary.replace(SETTINGS_PATH)
             except OSError as exc:
                 write_error = exc
+            if write_error is not None:
+                return {"state": "error", "message": str(write_error),
+                        "parameters": previous_parameters,
+                        "file_parameters": previous_parameters,
+                        "running_parameters": previous_parameters if running else None}
+            if running:
+                try:
+                    self.stop()
+                except subprocess.TimeoutExpired:
+                    return {"state": "error", "message": "direction subprocess did not exit after kill"}
             if running:
                 try:
                     if not self.start():
@@ -424,11 +431,6 @@ class SoundDirectionPlugin:
                             "parameters": load_parameters(),
                             "file_parameters": load_parameters(),
                             "running_parameters": previous_parameters if restored else None}
-            if write_error is not None:
-                return {"state": "error", "message": str(write_error),
-                        "parameters": load_parameters(),
-                        "file_parameters": load_parameters(),
-                        "running_parameters": previous_parameters if running else None}
             return {"state": "configured", "parameters": parameters}
 
     def dispatch(self, action: str, args: dict) -> dict | None:

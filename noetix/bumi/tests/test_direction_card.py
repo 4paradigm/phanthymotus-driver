@@ -401,3 +401,43 @@ def test_environment_burst_path_has_distinct_thresholds(monkeypatch, sensitivity
     assert not gate.accepts(frame(below_burst))
     assert not gate.accepts(frame(40))
     assert gate.accepts(frame(burst))
+
+
+def test_config_write_failure_keeps_running_worker_and_old_settings(monkeypatch, tmp_path):
+    module = _load_card(monkeypatch)
+    settings = tmp_path / 'settings.json'
+    settings.write_text(json.dumps({'sensitivity': 'normal'}))
+    monkeypatch.setattr(module, 'SETTINGS_PATH', settings)
+    monkeypatch.setattr(module, 'load_calibration', lambda: {'front': [1, 0, 0], 'right': [0, 1, 0]})
+    card = _card(module)
+    events = []
+
+    class Process:
+        stdout = (b'__BUMI_DIRECTION_READY__\n',)
+        def poll(self): return None
+        def terminate(self): events.append('stop')
+        def wait(self, timeout=None): events.append('reaped'); return 0
+
+    proc = Process()
+    card._proc = proc
+
+    def broken_write_text(self, *args, **kwargs):
+        raise OSError('No space left on device')
+    monkeypatch.setattr(type(settings), 'write_text', broken_write_text)
+
+    result = card.dispatch('config', {'sensitivity': 'low'})
+
+    # 写盘失败：报 error，绝不能宣称 configured。
+    assert result['state'] == 'error'
+    assert 'No space left' in result['message']
+    # worker 全程未停：既不杀也不重启，进程对象原样。
+    assert events == []
+    assert card._proc is proc
+    assert card._proc.poll() is None
+    # 旧设置保留，上报的运行/文件参数都是旧值。
+    assert json.loads(settings.read_text()) == {'sensitivity': 'normal'}
+    assert result['running_parameters'] == {'sensitivity': 'normal'}
+    assert result['file_parameters'] == {'sensitivity': 'normal'}
+    info = card.dispatch('info', {})
+    assert info['state'] == 'running'
+    assert info['parameters'] == {'sensitivity': 'normal'}
