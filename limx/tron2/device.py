@@ -171,7 +171,7 @@ class Adapter:
         if name == 'arm_control':
             allowed |= {'joint', 'time'}
         if name in GRIPPER_SIDES:
-            allowed |= {'opening', 'speed', 'force'}
+            allowed |= {'opening_mm', 'opening', 'speed', 'force'}
         if not isinstance(args, dict) or set(args) - allowed:
             raise ValueError('Only action and Core instance_id/_trace_id metadata are accepted')
         # Core injects both fields after the model has selected a tool. Accept

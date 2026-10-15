@@ -12,7 +12,7 @@
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
-夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。操作顺序为open、close、recover；open明确填写opening、speed、force。两侧独立任务，无SIDE或CONFIRM_STOPPED。未填写有效开合参数、系统启动/停止均不会发送夹爪开合。
+夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。操作顺序为open、close、recover；open明确填写opening_mm（0至85mm）、speed、force；驱动按底层值=毫米数×94/85自动换算。两侧独立任务，无SIDE或CONFIRM_STOPPED。未填写有效开合参数、系统启动/停止均不会发送夹爪开合。
 
 传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 

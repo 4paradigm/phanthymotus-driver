@@ -9,6 +9,8 @@ from vendor import MoveError
 
 GRIPPER_SIDES = {'gripper_left': 'left', 'gripper_right': 'right'}
 MAX_OPENING = 94  # Operator-selected control limit; raw vendor feedback stays 0..100.
+MAX_OPENING_MM = 85
+OPENING_MAPPING = 'nominal_linear_0_85mm_to_0_94_raw'
 MOTION_ACTIONS = ('open', 'close')
 TIMEOUT = 20
 ACP_TIMEOUT = 40
@@ -20,7 +22,7 @@ RECOVERY_STABILITY_SECONDS = 1
 PREVIOUS_TIMEOUT = 40
 LOG = logging.getLogger('tron2')
 ACTION_FIELDS = {'info': set(), 'start': set(), 'stop': set(),
-                 'open': {'opening','speed','force'}, 'close': {'speed','force'},
+                 'open': {'opening_mm','speed','force'}, 'close': {'speed','force'},
                  'recover': set()}
 METADATA_FIELDS = {'action','instance_id','_trace_id'}
 
@@ -28,11 +30,13 @@ METADATA_FIELDS = {'action','instance_id','_trace_id'}
 def normalize_arguments(action, args):
     if not isinstance(args, dict) or action not in ACTION_FIELDS:
         raise ValueError('不支持的夹爪操作或参数格式')
-    known = METADATA_FIELDS | set().union(*ACTION_FIELDS.values())
+    known = METADATA_FIELDS | set().union(*ACTION_FIELDS.values()) | {'opening'}
     if set(args) - known:
         raise ValueError('当前操作包含未声明的参数')
     if 'action' in args and args['action'] != action:
         raise ValueError('操作与参数中的action不一致')
+    if action == 'open' and 'opening' in args:
+        raise ValueError('旧opening参数已停用；请刷新卡片，使用opening_mm填写0至85mm开口大小')
     # Some dashboard versions submit inputs hidden by x-action-params. Ignore
     # only declared, inactive fields; never reinterpret them as motor values.
     return {key:value for key,value in args.items() if key in ACTION_FIELDS[action] | METADATA_FIELDS}
@@ -55,13 +59,32 @@ def opening_target(value):
     return value
 
 
+def opening_mm(value):
+    if isinstance(value,bool) or not isinstance(value,(int,float)) or \
+            not 0 <= value <= MAX_OPENING_MM or not math.isfinite(value):
+        raise ValueError('夹爪开口大小请填写0至85mm的数值')
+    return value
+
+
+def raw_from_mm(value):
+    return round(opening_mm(value)*MAX_OPENING/MAX_OPENING_MM,6)
+
+
+def mm_estimate(raw):
+    return round(raw*MAX_OPENING_MM/MAX_OPENING,3)
+
+
+def position_text(raw):
+    return '尚无反馈' if raw is None else str(mm_estimate(raw))+'mm（底层'+str(raw)+'）'
+
+
 def command(action, args, side):
     args = normalize_arguments(action, args)
     if side not in ('left', 'right'):
         raise ValueError('请选择左侧或右侧夹爪')
     if action not in MOTION_ACTIONS:
         raise ValueError('不支持的夹爪操作')
-    opening = opening_target(args.get('opening')) if action == 'open' else 0
+    opening = raw_from_mm(args.get('opening_mm')) if action == 'open' else 0
     speed, force = percentage(args.get('speed'), '速度'), percentage(args.get('force'), '夹持力')
     if speed == 0:
         raise ValueError('执行开合时速度须大于0')
@@ -76,24 +99,26 @@ def state_data(data, selected_side=None):
     for side in ((selected_side,) if selected_side else ('left', 'right')):
         out[side] = {key: percentage(data.get(side + '_' + key), side + '_' + key)
                      for key in ('opening', 'speed', 'force')}
+        out[side]['opening_mm_estimate'] = mm_estimate(out[side]['opening'])
     stamp = data.get('timestamp')
     if stamp is not None and (isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or
                               not 0 <= stamp <= 2**63 - 1 or not math.isfinite(stamp)):
         raise ValueError('夹爪状态时间戳无效')
     return {**out, 'vendor_timestamp_ms': stamp,
             'received_at': time.time(), 'measurement_time_verified': False,
-            'value_unit': '0_to_100_dimensionless', 'grasp_verified': False}
+            'value_unit': '0_to_100_dimensionless', 'opening_mapping': OPENING_MAPPING,
+            'opening_mm_is_calibrated': False, 'grasp_verified': False}
 
 
 def tool(metadata, side):
     label = '左' if side == 'left' else '右'
     return {'name': 'gripper_' + side, 'type': 'actuator', 'multiInstance': False,
-            'description': 'TRON2' + label + '夹爪：open设置目标开口，close闭合，recover检查静止反馈后恢复本侧失败任务。开口0为最小闭合、94为当前配置最大张开目标；速度/力为相对档位，不代表毫米或牛顿。达到开口不代表夹住物体。恢复前须现场确认静止空载；恢复不是急停。',
+            'description': 'TRON2' + label + '夹爪：open按毫米设置开口大小，0mm为最小闭合、85mm为最大目标；驱动自动线性换算为底层0至94。毫米值采用名义换算，实际间距精度待标定。close闭合，recover检查静止反馈后恢复本侧失败任务。速度/力为相对档位，并非牛顿。达到开口不代表夹住物体。恢复前须现场确认静止空载；恢复不是急停。',
             'inputSchema': {'type': 'object', 'additionalProperties': False,
                 'properties': {
                     'action': {'type': 'string', 'enum': ['open', 'close', 'recover'],
                                'description': 'open设置目标开口；close闭合；recover恢复本侧失败任务'},
-                    'opening': {'type': 'number', 'minimum': 0, 'maximum': MAX_OPENING, 'description': '目标开口度：0闭合，94为当前最大张开目标；保持厂家原始单位'},
+                    'opening_mm': {'type': 'number', 'title': '夹爪开口大小（mm）', 'minimum': 0, 'maximum': MAX_OPENING_MM, 'description': '夹爪开口大小（mm）：0至85；自动换算到底层0至94，实际间距精度待标定'},
                     'speed': {'type': 'number', 'exclusiveMinimum': 0, 'maximum': 100, 'description': '开合速度档位：大于0至100'},
                     'force': {'type': 'number', 'minimum': 0, 'maximum': 100, 'description': '夹持力档位：0至100，并非牛顿'},
                     **metadata},
@@ -101,9 +126,9 @@ def tool(metadata, side):
                 'allOf': [{'if': {'properties': {'action': {'enum': list(MOTION_ACTIONS)}}, 'required': ['action']},
                            'then': {'required': ['speed', 'force']}},
                           {'if': {'properties': {'action': {'const': 'open'}}, 'required': ['action']},
-                           'then': {'required': ['opening']}}],
+                           'then': {'required': ['opening_mm']}}],
                 'x-action-params': {
-                    'open': {'params': ['opening', 'speed', 'force'], 'description': '将本侧夹爪调整至填写的目标开口度'},
+                    'open': {'params': ['opening_mm', 'speed', 'force'], 'description': '按填写的毫米数调整本侧夹爪开口大小'},
                     'close': {'params': ['speed', 'force'], 'description': '闭合本侧夹爪；未到最小开口不会报告到位或抓取成功'},
                     'recover': {'params': [], 'description': '现场确认本侧静止空载后使用；连续反馈验证后恢复，不重发动作、不把未到位改成成功'}},
                 'x-resource': ['arm_l' if side == 'left' else 'arm_r'],
@@ -132,7 +157,8 @@ class Gripper:
                     self.last['action_id'] == self.active['action_id']) else None
         if self.active:
             motion = {**(motion or {}), **{k: self.active[k] for k in ('action_id', 'action', 'side', 'state')},
-                      'target_opening': self.active['target']}
+                      'target_opening': self.active['target'], 'target_opening_raw': self.active['target'],
+                      'target_opening_mm': self.active['target_mm']}
         return {'side': self.side, 'state': self.active['state'] if self.active else
                     'recovering' if self.recovering else 'waiting_for_previous' if self.waiting else
                     'ready' if self.reader.connected else 'offline',
@@ -263,8 +289,8 @@ class Gripper:
         last = self.last or {}
         label = '左' if self.side == 'left' else '右'
         return MoveError(label + '夹爪上一条' + str(job.get('action', '动作')) +
-            '结果尚未确认：目标' + str(job.get('target')) + '，最近反馈' +
-            str(last.get('reported_opening', job.get('reported_opening'))) +
+            '结果尚未确认：目标' + position_text(job.get('target')) + '，最近反馈' +
+            position_text(last.get('reported_opening', job.get('reported_opening'))) +
             '；后续指令未发送。现场确认静止空载后使用本侧recover', False)
 
     async def wait_previous(self, action, allow_blocked=False):
@@ -303,6 +329,7 @@ class Gripper:
 
     async def dispatch(self, action, args):
         data = command(action, args, self.side)
+        requested_mm = opening_mm(args.get('opening_mm')) if action == 'open' else 0
         await self.wait_previous(action, allow_blocked=action == 'close')
         previous_error = None
         if self.active:
@@ -315,7 +342,7 @@ class Gripper:
             self.same_session(failed)
             previous_error = {k:self.last[k] for k in ('action_id','action','status','error','error_code',
                 'target_opening','reported_opening','target_opening_verified','callback_delivered','close_handover',
-                'stationary_target_miss')
+                'stationary_target_miss','target_opening_mm','target_opening_raw','reported_opening_mm_estimate')
                 if k in self.last}
         if self.peer and self.peer.active and self.peer.active['state'] == 'reporting' and self.peer.active.get('arrival_verified'):
             await asyncio.shield(self.peer.task)
@@ -327,6 +354,7 @@ class Gripper:
         future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
         job = {'action_id': 'tron2_gripper_' + uuid4().hex, 'action': action, 'side': self.side,
                'target': data[self.side + '_opening'], 'state': 'checking', 'admission': future,
+               'target_mm': requested_mm,
                'ws': self.reader.ws, 'serial': self.reader.serial, 'motion_sent': False,
                'vendor_acknowledged': False}
         if previous_error:
@@ -389,13 +417,13 @@ class Gripper:
                     job['stationary_target_miss'] = {'verified_samples': stationary_samples,
                         'observed_opening': actual, 'vendor_timestamp_ms': stamp,
                         'reason': 'explicit_close_waiting_after_stationary_open'}
-                    raise MoveError('收到新的close；原open目标'+str(job['target'])+'尚未到位，反馈'+str(actual)+
+                    raise MoveError('收到新的close；原open目标'+position_text(job['target'])+'尚未到位，反馈'+position_text(actual)+
                                     '已连续静止；原open按失败结束，关闭仍须通过接替检查',
                                     True, 'target_not_reached')
             else:
                 replacement = None; stationary_start = None; stationary_samples = 0; stationary_opening = None
             await asyncio.sleep(POLL_SECONDS)
-        raise MoveError('未确认达到目标开口'+str(job['target'])+'，最近反馈'+str(job.get('reported_opening'))+
+        raise MoveError('未确认达到目标开口'+position_text(job['target'])+'，最近反馈'+position_text(job.get('reported_opening'))+
                         '；检查实物停止后可使用recover恢复。未确认抓取成功',
                         job['motion_sent'], 'target_not_reached')
 
@@ -428,6 +456,8 @@ class Gripper:
             admitted = True
             job['admission'].set_result({'action_id': job['action_id'], 'action': job['action'],
                 'side': job['side'], 'target_opening': job['target'], 'state': job['state'],
+                'target_opening_raw': job['target'], 'target_opening_mm': job['target_mm'],
+                'opening_mapping': OPENING_MAPPING, 'opening_mm_is_calibrated': False,
                 'motion_sent': job['motion_sent'], 'no_op': job['no_op'],
                 'target_opening_verified': False, 'grasp_verified': False,
                 'can_accept_motion': False,
@@ -451,6 +481,8 @@ class Gripper:
                 'motion_sent': job['motion_sent'], 'target_opening_verified': False,
                 'grasp_verified': False, 'completion_protocol': 'acp', 'message': result['error']})
         result.update(action=job['action'], side=job['side'], target_opening=job['target'],
+                      target_opening_raw=job['target'], target_opening_mm=job['target_mm'],
+                      opening_mapping=OPENING_MAPPING, opening_mm_is_calibrated=False,
                       motion_sent=job['motion_sent'], grasp_verified=False,
                       motion_may_continue=status != 'completed' and job['motion_sent'] is not False,
                       no_op=bool(job.get('no_op')), vendor_acknowledged=job['vendor_acknowledged'])
@@ -460,6 +492,8 @@ class Gripper:
             result['stationary_target_miss'] = job['stationary_target_miss']
         result.setdefault('target_opening_verified', False)
         result.update({k: job[k] for k in ('reported_opening','reported_speed') if k in job})
+        if 'reported_opening' in job:
+            result['reported_opening_mm_estimate'] = mm_estimate(job['reported_opening'])
         if status != 'completed':
             LOG.warning('Gripper action %s failed: %s', job['action_id'], result.get('error'))
         job['target_opening_verified'] = result['target_opening_verified']

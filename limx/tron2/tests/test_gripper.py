@@ -16,6 +16,11 @@ from vendor import RobotReader, MoveError
 from test_sensors import info, joints, settings
 
 
+def mm(raw):
+    """Keep historical protocol fixtures in raw units while public inputs use mm."""
+    return raw*85/94
+
+
 def sample(opening=40, **updates):
     out = {'result': 'success', 'timestamp': 123456,
            'left_opening': opening, 'left_speed': 30, 'left_force': 30,
@@ -25,26 +30,40 @@ def sample(opening=40, **updates):
 
 
 class ValidationTests(unittest.TestCase):
-    def test_opening_control_limit94_does_not_rescale_feedback_speed_or_force(self):
+    def test_known_millimeter_targets_and_invalid_mm_are_unambiguous(self):
+        for value,expected in ((0,0),(42.5,47),(85,94),(40,44.235294)):
+            for side in ('left','right'):
+                payload=gripper.command('open',{'opening_mm':value,'speed':10,'force':10},side)
+                self.assertAlmostEqual(payload[side+'_opening'],expected,places=6)
+        for value in (85.0001,94,100,-.01,True,None,'40',float('nan'),float('inf')):
+            with self.assertRaises(ValueError):
+                gripper.command('open',{'opening_mm':value,'speed':10,'force':10},'left')
+        for old in ({'opening':50},{'opening':50,'opening_mm':40}):
+            with self.assertRaisesRegex(ValueError,'旧opening'):
+                gripper.command('open',{**old,'speed':10,'force':10},'left')
+        self.assertEqual(gripper.command('close',{'opening':100,'speed':10,'force':10},'left'),
+                         {'left_opening':0,'left_speed':10,'left_force':10})
+
+    def test_mm_input_limit85_maps_to_raw94_preserving_feedback_speed_and_force(self):
         for side in ('left','right'):
-            self.assertEqual(gripper.command('open',{'opening':94,'speed':100,'force':100},side),
+            self.assertEqual(gripper.command('open',{'opening_mm':mm(94),'speed':100,'force':100},side),
                 {side+'_opening':94,side+'_speed':100,side+'_force':100})
-            self.assertEqual(gripper.tool({},side)['inputSchema']['properties']['opening']['maximum'],94)
+            self.assertEqual(gripper.tool({},side)['inputSchema']['properties']['opening_mm']['maximum'],85)
             for value in (94.01,95,100):
-                with self.assertRaisesRegex(ValueError,'94'):
-                    gripper.command('open',{'opening':value,'speed':10,'force':10},side)
+                with self.assertRaisesRegex(ValueError,'85mm'):
+                    gripper.command('open',{'opening_mm':mm(value),'speed':10,'force':10},side)
         raw=gripper.state_data(sample(100,left_speed=0),'left')
         self.assertEqual(raw['left']['opening'],100)
 
     def test_each_action_only_controls_fixed_side(self):
         for side in ('left', 'right'):
             for action, expected in [('open', 43), ('close', 0)]:
-                args = {'opening':43, 'speed':30, 'force':25}
+                args = {'opening_mm':mm(43), 'speed':30, 'force':25}
                 self.assertEqual(gripper.command(action,args,side),
                     {side+'_opening':expected,side+'_speed':30,side+'_force':25})
 
     def test_bad_values_and_cross_side_payload_never_pass_validation(self):
-        base={'opening':40,'speed':30,'force':20}
+        base={'opening_mm':mm(40),'speed':30,'force':20}
         for key in base:
             for value in (True,None,'50',float('nan'),float('inf'),-1,101,10**1000):
                 with self.subTest(key=key,value=type(value).__name__),self.assertRaises(ValueError):
@@ -67,16 +86,16 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(tool['name'],'gripper_'+side)
             self.assertEqual(schema['properties']['action']['enum'],['open','close','recover'])
             self.assertEqual(schema['x-action-params']['recover']['params'],[])
-            self.assertEqual(schema['x-action-params']['open']['params'],['opening','speed','force'])
+            self.assertEqual(schema['x-action-params']['open']['params'],['opening_mm','speed','force'])
             self.assertEqual(schema['x-resource'],[resource])
             self.assertNotIn('side',schema['properties']);self.assertNotIn('confirm_stopped',schema['properties'])
-            self.assertNotIn('default',schema['properties']['opening'])
+            self.assertNotIn('default',schema['properties']['opening_mm'])
             self.assertEqual(schema['x-completion']['actions'],['open','close'])
         for old in ('get_state','set_opening'):
-            with self.assertRaises(ValueError):gripper.command(old,{'opening':40,'speed':10,'force':10},'left')
+            with self.assertRaises(ValueError):gripper.command(old,{'opening_mm':mm(40),'speed':10,'force':10},'left')
 
     def test_hidden_declared_fields_are_filtered_but_unknown_keys_rejected(self):
-        residual={'action':'close','speed':10,'force':10,'opening':88}
+        residual={'action':'close','speed':10,'force':10,'opening_mm':mm(88)}
         self.assertEqual(gripper.command('close',residual,'right'),{'right_opening':0,'right_speed':10,'right_force':10})
         self.assertEqual(gripper.normalize_arguments('info',{**residual,'action':'info'}),{'action':'info'})
         self.assertEqual(gripper.recovery_arguments({**residual,'action':'recover'}),{'action':'recover'})
@@ -106,7 +125,7 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.close();self.fast.stop()
 
     async def dispatch(self):
-        return await self.controller.dispatch('open', {'opening':94, 'speed':30, 'force':20})
+        return await self.controller.dispatch('open', {'opening_mm':mm(94), 'speed':30, 'force':20})
 
     async def test_ack_does_not_complete_until_post_ack_fresh_queries(self):
         received = await self.dispatch()
@@ -329,7 +348,7 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.read_state()
         self.reader.read_gripper.return_value=sample(0,left_speed=0,right_opening=0,right_speed=0)
         for _ in range(2):
-            result=await self.controller.dispatch('close',{'speed':10, 'force':10, 'opening':88})
+            result=await self.controller.dispatch('close',{'speed':10, 'force':10, 'opening_mm':mm(88)})
             self.assertFalse(result['motion_sent']);self.assertTrue(result['no_op'])
             await self.controller.task
             self.assertEqual(self.controller.last['status'],'completed')
@@ -453,7 +472,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_and_write_use_exact_guid_title_identity_and_one_side(self):
         state=await self.reader.read_gripper();self.assertEqual(state['left_opening'],40)
-        payload=gripper.command('open',{'opening':94,'speed':30,'force':20},'left')
+        payload=gripper.command('open',{'opening_mm':mm(94),'speed':30,'force':20},'left')
         await self.reader.send_gripper(payload)
         self.assertEqual((await self.reader.read_gripper())['left_opening'],94)
         writes=[r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']
@@ -465,7 +484,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.bad_reply=True
         adapter=Adapter(lambda *a:None,settings(enabled_cards=['gripper_left']),reader=self.reader)
         with self.assertRaises(MoveError):
-            await adapter.grippers['gripper_left'].dispatch('open',{'opening':94, 'speed':30, 'force':20})
+            await adapter.grippers['gripper_left'].dispatch('open',{'opening_mm':mm(94), 'speed':30, 'force':20})
         self.assertFalse(any(r['title']=='request_set_limx_2fclaw_cmd' for r in self.requests))
 
     async def test_stale_mode_and_invalid_side_refuse_before_send(self):
@@ -511,7 +530,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(json.loads(inactive['content'][0]['text'])['read_only'])
             self.assertFalse(any(r['title']=='request_set_limx_2fclaw_cmd' for r in self.requests))
             with patch.multiple('gripper',POLL_SECONDS=.01,STABILITY_SECONDS=.025):
-                result=await call('open',opening=94,speed=30,force=20)
+                result=await call('open',opening_mm=85,speed=30,force=20)
                 self.assertFalse(result['isError']);await adapter.grippers['gripper_left'].task
             self.assertEqual(adapter._report_completion.call_args.args[0],'gripper_left')
             self.assertEqual(adapter._report_completion.call_args.args[2],'completed')
@@ -535,7 +554,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 return json.loads(body['content'][0]['text'])
         try:
             with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.01,RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.025):
-                await call('open',opening=94,speed=10,force=10)
+                await call('open',opening_mm=85,speed=10,force=10)
                 await adapter.grippers['gripper_left'].task
                 state=await call('info')
                 self.assertEqual(state['motion']['reported_opening'],88)
@@ -564,12 +583,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_action_switch_and_closed_right_close_over_actual_http(self):
         self.stationary=True;self.right_opening=0
         adapter,runner,call=await self.shared_http_app()
-        old_fields={'opening':35, 'speed':10, 'force':10}
+        old_fields={'opening_mm':mm(35), 'speed':10, 'force':10}
         try:
             with patch.multiple('gripper',POLL_SECONDS=.01,STABILITY_SECONDS=.025):
                 state=await call('gripper_left',{'action':'info',**old_fields})
                 self.assertFalse(state['isError'])
-                moved=await call('gripper_left',{'action':'open','opening':94,**old_fields})
+                moved=await call('gripper_left',{'action':'open','opening_mm':mm(94),**old_fields})
                 self.assertFalse(moved['isError']);await adapter.grippers['gripper_left'].task
                 closed=await call('gripper_right',{'action':'close', **old_fields})
                 self.assertFalse(closed['isError'])
@@ -591,7 +610,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(.005)
             result=await call('arm_control',{'action':'move','joint':[.2]*14,'time':.1})
             self.assertFalse(result['isError'])
-            result=await call('gripper_left',{'action':'open','opening':94, 'speed':30, 'force':20})
+            result=await call('gripper_left',{'action':'open','opening_mm':mm(94), 'speed':30, 'force':20})
             self.assertTrue(result['isError'])
             self.assertFalse(any(r['title']=='request_set_limx_2fclaw_cmd' for r in self.requests))
             schemas={t['name']:t['inputSchema'] for t in adapter.tools()}
@@ -602,7 +621,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_gripper_blocks_arm_through_actual_http(self):
         adapter,runner,call=await self.shared_http_app()
         try:
-            result=await call('gripper_left',{'action':'open','opening':94, 'speed':30, 'force':20})
+            result=await call('gripper_left',{'action':'open','opening_mm':mm(94), 'speed':30, 'force':20})
             self.assertFalse(result['isError'])
             result=await call('arm_control',{'action':'move','joint':[.2]*14,'time':.1})
             self.assertTrue(result['isError'])
@@ -616,10 +635,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.multiple('gripper',TIMEOUT=.15,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
                                 RECOVERY_TIMEOUT=.15,RECOVERY_STABILITY_SECONDS=.015):
-                left=await call('gripper_left',{'action':'open','opening':94,'speed':10,'force':10})
+                left=await call('gripper_left',{'action':'open','opening_mm':mm(94),'speed':10,'force':10})
                 self.assertFalse(left['isError']);await adapter.grippers['gripper_left'].task
                 self.assertEqual(adapter.grippers['gripper_left'].active['state'],'blocked_requires_operator_check')
-                right=await call('gripper_right',{'action':'open','opening':70,'speed':10,'force':10})
+                right=await call('gripper_right',{'action':'open','opening_mm':mm(70),'speed':10,'force':10})
                 self.assertFalse(right['isError']);await adapter.grippers['gripper_right'].task
                 self.assertEqual(adapter.grippers['gripper_right'].last['status'],'completed')
                 noop=await call('gripper_right',{'action':'recover'})
@@ -631,7 +650,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 async def moving_right():
                     data=await original();data.update(left_speed=0,right_speed=30);return data
                 self.reader.read_gripper=moving_right
-                recovered=await call('gripper_left',{'action':'recover','opening':94,'speed':10,'force':10})
+                recovered=await call('gripper_left',{'action':'recover','opening_mm':mm(94),'speed':10,'force':10})
                 self.assertFalse(recovered['isError'])
                 self.assertTrue(json.loads(recovered['content'][0]['text'])['recovered'])
                 self.assertEqual(adapter.grippers['gripper_left'].last['status'],'error')
@@ -642,17 +661,17 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             for owner in adapter.grippers.values():await owner.close()
             await runner.cleanup()
 
-    async def test_both_open94_complete_without_recovery_and_release_arm_guard(self):
+    async def test_both_open85mm_complete_without_recovery_and_release_arm_guard(self):
         self.cap=self.right_cap=94
         adapter,runner,call=await self.shared_http_app()
         try:
             with patch.multiple('gripper',TIMEOUT=.4,POLL_SECONDS=.005,STABILITY_SECONDS=.015):
                 for side in ('left','right'):
-                    rejected=await call('gripper_'+side,{'action':'open','opening':100,'speed':10,'force':10})
+                    rejected=await call('gripper_'+side,{'action':'open','opening_mm':mm(100),'speed':10,'force':10})
                     self.assertTrue(rejected['isError'])
                     self.assertFalse(any(r['title']=='request_set_limx_2fclaw_cmd' for r in self.requests))
                 for side in ('left','right'):
-                    result=await call('gripper_'+side,{'action':'open','opening':94,'speed':10,'force':10})
+                    result=await call('gripper_'+side,{'action':'open','opening_mm':mm(94),'speed':10,'force':10})
                     self.assertFalse(result['isError'],result)
                 await asyncio.gather(*(o.task for o in adapter.grippers.values()))
                 for owner in adapter.grippers.values():
@@ -661,6 +680,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(owner.last['target_opening_verified'])
                     self.assertTrue(owner.last['callback_delivered'])
                     self.assertEqual(owner.last['reported_opening'],94)
+                    self.assertEqual(owner.last['target_opening_mm'],85)
+                    self.assertEqual(owner.last['target_opening_raw'],94)
+                    self.assertEqual(owner.last['reported_opening_mm_estimate'],85)
+                    self.assertFalse(owner.last['opening_mm_is_calibrated'])
                     self.assertNotIn('previous_action_error',owner.last)
                 writes=[r['data'] for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']
                 self.assertEqual(writes,[{'left_opening':94,'left_speed':10,'left_force':10},
@@ -673,11 +696,38 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             for o in adapter.grippers.values():await o.close()
             await runner.cleanup()
 
+    async def test_customer40mm_is_converted_once_over_http_and_reported_in_acp(self):
+        self.stationary=True
+        adapter,runner,call=await self.shared_http_app()
+        try:
+            with patch.multiple('gripper',TIMEOUT=.4,POLL_SECONDS=.005,STABILITY_SECONDS=.015):
+                result=await call('gripper_left',{'action':'open','opening_mm':40,'speed':10,'force':10})
+                self.assertFalse(result['isError'],result)
+                admission=json.loads(result['content'][0]['text'])
+                self.assertEqual(admission['target_opening_mm'],40)
+                self.assertAlmostEqual(admission['target_opening_raw'],44.235294)
+                self.assertFalse(admission['opening_mm_is_calibrated'])
+                await adapter.grippers['gripper_left'].task
+                info=adapter.grippers['gripper_left'].info()
+                self.assertEqual(info['motion']['status'],'completed')
+                self.assertAlmostEqual(info['data']['left']['opening'],44.235294)
+                self.assertEqual(info['data']['left']['opening_mm_estimate'],40)
+                callback=adapter._report_completion.call_args
+                self.assertEqual(callback.args[2],'completed')
+                self.assertEqual(callback.args[3]['target_opening_mm'],40)
+                writes=[r['data'] for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']
+                self.assertEqual(len(writes),1)
+                self.assertAlmostEqual(writes[0]['left_opening'],44.235294)
+                self.assertEqual(set(writes[0]),{'left_opening','left_speed','left_force'})
+        finally:
+            for owner in adapter.grippers.values():await owner.close()
+            await runner.cleanup()
+
     async def test_concurrent_left_right_open_have_separate_owners_and_callbacks(self):
         adapter,runner,call=await self.shared_http_app()
         try:
             with patch.multiple('gripper',POLL_SECONDS=.005,STABILITY_SECONDS=.015):
-                responses=await asyncio.gather(*[call('gripper_'+side,{'action':'open','opening':target,'speed':10,'force':10})
+                responses=await asyncio.gather(*[call('gripper_'+side,{'action':'open','opening_mm':mm(target),'speed':10,'force':10})
                                                 for side,target in [('left',55),('right',75)]])
                 self.assertTrue(all(not r['isError'] for r in responses))
                 await asyncio.gather(*(o.task for o in adapter.grippers.values()))
@@ -687,7 +737,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             for side in ('left','right'):
                 result=await call('gripper_'+side,{'action':'open','speed':10,'force':10})
                 self.assertTrue(result['isError'])
-                result=await call('gripper_'+side,{'action':'open','opening':50,'side':'right','speed':10,'force':10})
+                result=await call('gripper_'+side,{'action':'open','opening_mm':mm(50),'side':'right','speed':10,'force':10})
                 self.assertTrue(result['isError'])
             self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),2)
         finally:
@@ -702,7 +752,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             arm=await call('arm_control',{'action':'move','joint':[.2]*14,'time':.1})
             self.assertTrue(arm['isError'])
             with patch.multiple('gripper',POLL_SECONDS=.005,STABILITY_SECONDS=.015):
-                left=await call('gripper_left',{'action':'open','opening':50,'speed':10,'force':10})
+                left=await call('gripper_left',{'action':'open','opening_mm':mm(50),'speed':10,'force':10})
                 self.assertFalse(left['isError']);await adapter.grippers['gripper_left'].task
             self.assertEqual(adapter.grippers['gripper_left'].last['status'],'completed')
             self.assertFalse(any(r['title']=='request_movej' for r in self.requests))
@@ -727,13 +777,13 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.multiple('gripper',TIMEOUT=.2,POLL_SECONDS=.005,STABILITY_SECONDS=.015):
                 for side in ('left','right'):
-                    result=await call('gripper_'+side,{'action':'open','opening':70,'speed':10,'force':10})
+                    result=await call('gripper_'+side,{'action':'open','opening_mm':mm(70),'speed':10,'force':10})
                     self.assertFalse(result['isError'])
                 prior=owner.task
                 queued=asyncio.create_task(call('gripper_right',{'action':'close','speed':10,'force':10}))
                 await self.wait_until_queued(owner)
                 self.assertFalse(queued.done());self.assertFalse(owner.info()['can_accept_motion'])
-                extra=await call('gripper_right',{'action':'open','opening':60,'speed':10,'force':10})
+                extra=await call('gripper_right',{'action':'open','opening_mm':mm(60),'speed':10,'force':10})
                 self.assertTrue(extra['isError']);self.assertIn('已有一条',json.loads(extra['content'][0]['text'])['error'])
                 writes=[r['data'] for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']
                 self.assertEqual(writes,[{'left_opening':70,'left_speed':10,'left_force':10},
@@ -761,12 +811,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
                                 RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.015):
                 for side in ('left','right'):
-                    result=await call('gripper_'+side,{'action':'open','opening':94,'speed':10,'force':10})
+                    result=await call('gripper_'+side,{'action':'open','opening_mm':mm(94),'speed':10,'force':10})
                     self.assertFalse(result['isError'])
-                result=await call('gripper_right',{'action':'open','opening':70,'speed':10,'force':10})
+                result=await call('gripper_right',{'action':'open','opening_mm':mm(70),'speed':10,'force':10})
                 self.assertTrue(result['isError'])
                 details=json.loads(result['content'][0]['text'])
-                self.assertIn('目标94',details['error']);self.assertIn('88',details['error'])
+                self.assertIn('底层94',details['error']);self.assertIn('88',details['error'])
                 self.assertFalse(details['motion_sent']);self.assertEqual(details['gripper']['state'],'blocked_requires_operator_check')
                 self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),2)
                 for side in ('left','right'):
@@ -790,7 +840,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         owner.verify_target=delayed;queued=None
         try:
             with patch.multiple('gripper',TIMEOUT=.2,POLL_SECONDS=.005,STABILITY_SECONDS=.015):
-                await call('gripper_left',{'action':'open','opening':70,'speed':10,'force':10})
+                await call('gripper_left',{'action':'open','opening_mm':mm(70),'speed':10,'force':10})
                 original_task=owner.task
                 queued=asyncio.create_task(call('gripper_left',{'action':'close','speed':10,'force':10}))
                 await self.wait_until_queued(owner)
@@ -816,7 +866,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         owner.verify_target=delayed
         try:
             with patch.multiple('gripper',TIMEOUT=.2,POLL_SECONDS=.005,STABILITY_SECONDS=.015,PREVIOUS_TIMEOUT=.02):
-                await owner.dispatch('open',{'opening':70,'speed':10,'force':10})
+                await owner.dispatch('open',{'opening_mm':mm(70),'speed':10,'force':10})
                 physical=owner.task
                 with self.assertRaises(MoveError):await owner.dispatch('close',{'speed':10,'force':10})
                 self.assertFalse(physical.done());self.assertIsNone(owner.waiting)
@@ -844,7 +894,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
                                 RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.015):
-                await owner.dispatch('open',{'opening':94,'speed':10,'force':10});await owner.task
+                await owner.dispatch('open',{'opening_mm':mm(94),'speed':10,'force':10});await owner.task
                 self.reader.read_gripper=held_feedback
                 recovering=asyncio.create_task(call('gripper_left',{'action':'recover'}))
                 await asyncio.wait_for(entered.wait(),1)
@@ -871,7 +921,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
                                 RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.015):
                 for side,target in [('left',94),('right',70)]:
-                    result=await call('gripper_'+side,{'action':'open','opening':target,'speed':10,'force':10})
+                    result=await call('gripper_'+side,{'action':'open','opening_mm':mm(target),'speed':10,'force':10})
                     self.assertFalse(result['isError'])
                 result=await call('gripper_left',{'action':'close','speed':10,'force':10})
                 self.assertFalse(result['isError'],result)
@@ -903,7 +953,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             with patch.multiple('gripper',TIMEOUT=2,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
                                 RECOVERY_TIMEOUT=.4,RECOVERY_STABILITY_SECONDS=.025):
                 for side in ('left','right'):
-                    result=await call('gripper_'+side,{'action':'open','opening':94,'speed':10,'force':10})
+                    result=await call('gripper_'+side,{'action':'open','opening_mm':mm(94),'speed':10,'force':10})
                     self.assertFalse(result['isError'])
                 for side in ('left','right'):
                     started=time.monotonic()
@@ -944,7 +994,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
                                 RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.015):
-                await owner.dispatch('open',{'opening':94,'speed':10,'force':10});await owner.task
+                await owner.dispatch('open',{'opening_mm':mm(94),'speed':10,'force':10});await owner.task
                 self.reader.read_gripper=held_feedback
                 closing=asyncio.create_task(call('gripper_left',{'action':'close','speed':10,'force':10}))
                 await asyncio.wait_for(entered.wait(),1)
