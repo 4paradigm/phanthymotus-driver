@@ -24,9 +24,12 @@ plugins:
     motion_timeout_s: 8.0
     position_tolerance: 6
     poll_interval_s: 0.2
-    # The operator confirmed these open/close targets on both hands in this
-    # setup. Recalibrate before deploying to different hardware.
+    # The operator confirmed these targets on both hands in this setup.
+    # Keep each side's calibration explicit, even when the values match.
+    # Recalibrate before deploying to different hardware.
     # Joint order: thumb root/sway, four finger roots, index/middle/ring sway,
     # thumb roll. Values are 0..255 position units, not degrees.
     open_pose: [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
     fist_pose: [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
+    left_open_pose: [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
+    left_fist_pose: [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]

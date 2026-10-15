@@ -23,7 +23,16 @@ from common.vendor_runtime import DriverBundle, load_config
 
 
 def calibrated_config(**overrides):
-    return {"fist_pose": list(RIGHT_FIST_POSE), **overrides}
+    return {"open_pose": list(RIGHT_OPEN_POSE),
+            "fist_pose": list(RIGHT_FIST_POSE), **overrides}
+
+
+def both_sides_config(**overrides):
+    return calibrated_config(**{
+        "left_open_pose": list(RIGHT_OPEN_POSE),
+        "left_fist_pose": list(RIGHT_FIST_POSE),
+        **overrides,
+    })
 
 
 class FakeSerial:
@@ -226,7 +235,7 @@ def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
 @pytest.mark.parametrize("side,slave_id", [("right", 0x27), ("left", 0x28)])
 def test_auto_detected_hand_receives_all_device_actions(monkeypatch, side, slave_id):
     connection, transports = make_detecting_connection(monkeypatch, {slave_id})
-    plugin = HandPlugin(connection, calibrated_config(auto_detect_gestures=True, poll_interval_s=0.02))
+    plugin = HandPlugin(connection, both_sides_config(auto_detect_gestures=True, poll_interval_s=0.02))
     events, done = capture_completions(plugin)
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
 
@@ -344,7 +353,7 @@ def test_card_rejects_bad_structured_position_without_serial_access():
 @pytest.mark.parametrize("side,slave_id", [("right", 0x27), ("left", 0x28)])
 def test_colleague_card_actions_keep_auto_detection_and_confirmation(monkeypatch, side, slave_id):
     connection, transports = make_detecting_connection(monkeypatch, {slave_id})
-    plugin = HandPlugin(connection, calibrated_config(auto_detect_gestures=True, poll_interval_s=0.02))
+    plugin = HandPlugin(connection, both_sides_config(auto_detect_gestures=True, poll_interval_s=0.02))
     events, done = capture_completions(plugin)
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
 
@@ -399,7 +408,52 @@ def test_left_hand_needs_explicit_side_specific_poses():
     connection = FakeConnection()
     connection.side = "left"
     with pytest.raises(ValueError, match="left-hand"):
-        HandPlugin(connection, {})
+        HandPlugin(connection, calibrated_config())
+
+
+@pytest.mark.parametrize("action,args", [
+    ("open", {}), ("close", {}), ("set_positions", {"index_flex": 220}),
+])
+@pytest.mark.parametrize("left_pose_config", [
+    {}, {"left_open_pose": list(RIGHT_OPEN_POSE)},
+    {"left_fist_pose": list(RIGHT_FIST_POSE)},
+])
+def test_detected_left_without_complete_left_calibration_refuses_motion(
+    monkeypatch, action, args, left_pose_config,
+):
+    connection, transports = make_detecting_connection(monkeypatch, {0x28})
+    plugin = HandPlugin(connection, calibrated_config(
+        auto_detect_gestures=True, **left_pose_config,
+    ))
+    events, done = capture_completions(plugin)
+    assert plugin.dispatch("info", {})["side"] == "left"
+    assert plugin.dispatch("get_state", {})["side"] == "left"
+    accepted = plugin.dispatch(action, {**args, "confirm_motion": True})
+    assert accepted["state"] == "running"
+    assert done.wait(2)
+    assert events[-1][0] == accepted["action_id"]
+    assert events[-1][1] == "error"
+    assert "left-hand motion requires explicit calibrated" in events[-1][2]["message"]
+    assert all(frame[1] == 0x04 for transport in transports for frame in transport.sent)
+
+
+def test_detected_left_uses_its_own_calibrated_poses(monkeypatch):
+    connection, transports = make_detecting_connection(monkeypatch, {0x28})
+    left_open = list(RIGHT_OPEN_POSE)
+    left_fist = list(RIGHT_FIST_POSE)
+    left_open[0] = 250
+    left_fist[0] = 90
+    plugin = HandPlugin(connection, both_sides_config(
+        auto_detect_gestures=True, poll_interval_s=0.02,
+        left_open_pose=left_open, left_fist_pose=left_fist,
+    ))
+    events, done = capture_completions(plugin)
+    monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
+    closed = completed_motion(plugin, "close", {"confirm_motion": True}, events, done)
+    assert closed["requested_positions"] == dict(zip(JOINT_NAMES, left_fist))
+    opened = completed_motion(plugin, "open", {"confirm_motion": True}, events, done)
+    assert opened["requested_positions"] == dict(zip(JOINT_NAMES, left_open))
+    assert all(frame[0] == 0x28 for transport in transports for frame in transport.sent if frame[1] == 0x10)
 
 
 def test_right_hand_needs_explicit_calibrated_fist_pose():
@@ -414,6 +468,8 @@ def test_bundled_right_hand_config_explicitly_sets_calibrated_fist_pose():
     assert config["side"] == "right"
     assert config["plugins"]["hand"]["fist_pose"] == RIGHT_FIST_POSE
     assert config["plugins"]["hand"]["open_pose"] == RIGHT_OPEN_POSE
+    assert config["plugins"]["hand"]["left_fist_pose"] == RIGHT_FIST_POSE
+    assert config["plugins"]["hand"]["left_open_pose"] == RIGHT_OPEN_POSE
     assert config["plugins"]["hand"]["auto_detect_gestures"] is True
 
 

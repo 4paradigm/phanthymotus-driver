@@ -3,8 +3,7 @@
 This is the active PhanthyMotus driver for the L20 Lite connected through a
 USB-RS485 adapter. It uses Modbus RTU at 115200 baud, 8N1. The configured
 right-hand slave address is `0x27`; the left-hand address is `0x28`. The operator
-confirmed that the open/close targets below work on both hands. Automatic
-left/right switching has offline coverage but still needs a physical test.
+confirmed that the open/close targets below work on both hands.
 
 The transport in `modbus_client.py` implements the frames emitted by the
 official LinkerHand C++ SDK: function `0x04` reads ten 16-bit registers and
@@ -20,12 +19,15 @@ or `set_positions` request must include the boolean
 opening the serial port. On the canvas, enter `true` in the confirmation field
 after checking that the hand and its surroundings are clear. State reads,
 torque configuration and torque release do not need motion confirmation.
-The configured `open` pose is `[254,254,254,254,254,254,127,126,127,254]`.
-The configured `close` pose is
+The configured right-hand `open_pose` is
+`[254,254,254,254,254,254,127,126,127,254]`; `fist_pose` is
 `[93,255,0,0,0,0,128,128,128,255]`. The operator confirmed both poses on
-their left and right hands. The driver requires an explicit
-`fist_pose` in the deployment config and refuses to start without one; this
-calibration must not be assumed safe for other hardware. The official L20 Lite
+their left and right hands, so this deployment explicitly sets
+`left_open_pose` and `left_fist_pose` to the same respective values. The
+driver selects poses after detecting the hand and rejects all motion,
+including `set_positions`, if that side lacks explicit calibration. Detection
+and state reads remain available. These calibrations must not be assumed safe
+for other hardware. The official L20 Lite
 example maps slots 7–10 to index sway,
 middle sway, ring sway and thumb rotation; it has no separate pinky-sway slot.
 These are 0–255 position commands, not degrees. Both
@@ -51,7 +53,9 @@ and target the sole responding hand. Zero or two responding hands, a bad frame,
 or a serial error prevents those actions from using an ambiguous target.
 `set_torque` only changes later command settings and never writes
 to the device immediately. The `side` setting remains a fallback when automatic
-detection is disabled. This stage still scans only one configured serial port.
+detection is disabled. The legacy `open_pose`/`fist_pose` keys calibrate the
+right hand; `left_open_pose`/`left_fist_pose` calibrate the left hand. This
+stage still scans only one configured serial port.
 The canvas card name remains `hand`; its `info` result describes the detected
 left/right side, but the card header does not live-rename on USB hot-plug.
 

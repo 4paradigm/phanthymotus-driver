@@ -33,9 +33,9 @@ STRUCTURED_POSITION_FIELDS = [
 ]
 SPEED_RATIOS = {f"{ratio:.1f}x": ratio for ratio in (1.0, 1.5, 2.0, 2.5, 3.0)}
 
-# These poses were confirmed on the connected RIGHT hand. They are examples for
-# this unit, not universal defaults: close requires an explicit fist_pose in
-# the deployment config. Values are 0..255 position units, not degrees.
+# These are reference values for this installation, not universal defaults.
+# Each side must have its own explicit calibration in the deployment config.
+# Values are 0..255 position units, not degrees.
 RIGHT_OPEN_POSE = [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
 RIGHT_FIST_POSE = [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
 
@@ -108,12 +108,23 @@ class HandPlugin:
 
     def __init__(self, connection: L20LiteConnection, config: dict):
         self.connection = connection
-        if connection.side != "right" and ("open_pose" not in config or "fist_pose" not in config):
-            raise ValueError("left-hand open_pose and fist_pose must be configured explicitly")
-        if "fist_pose" not in config:
+        if connection.side == "right" and "fist_pose" not in config:
             raise ValueError("fist_pose must be explicitly calibrated and configured before enabling close")
-        self.open_pose = _bytes(config.get("open_pose", RIGHT_OPEN_POSE))
-        self.fist_pose = _bytes(config["fist_pose"])
+        if connection.side == "right" and "open_pose" not in config:
+            raise ValueError("open_pose must be explicitly calibrated and configured before enabling open")
+        if connection.side == "left" and not {"left_open_pose", "left_fist_pose"} <= config.keys():
+            raise ValueError("left-hand left_open_pose and left_fist_pose must be configured explicitly")
+        self.poses_by_side = {}
+        if {"open_pose", "fist_pose"} <= config.keys():
+            self.poses_by_side["right"] = {
+                "open": _bytes(config["open_pose"]),
+                "close": _bytes(config["fist_pose"]),
+            }
+        if {"left_open_pose", "left_fist_pose"} <= config.keys():
+            self.poses_by_side["left"] = {
+                "open": _bytes(config["left_open_pose"]),
+                "close": _bytes(config["left_fist_pose"]),
+            }
         self.auto_detect_gestures = config.get("auto_detect_gestures", False)
         if not isinstance(self.auto_detect_gestures, bool):
             raise ValueError("auto_detect_gestures must be a boolean")
@@ -315,14 +326,14 @@ class HandPlugin:
                     time.sleep(0.5)
         raise RuntimeError(f"ACP completion delivery failed: {error}")
 
-    @staticmethod
-    def _target_for_action(active: dict, client: L20LiteModbusClient) -> list[int]:
+    def _target_for_action(self, active: dict, client: L20LiteModbusClient,
+                           side: str) -> list[int]:
         if active["action"] == "set_positions":
             target = client.get_positions()
             for index, value in active["joint_positions"].items():
                 target[index] = value
             return target
-        return active["target"]
+        return list(self.poses_by_side[side][active["action"]])
 
     def _run_motion(self, active: dict) -> None:
         action = active["action"]
@@ -338,8 +349,11 @@ class HandPlugin:
                     side = sides[0]
                 if self._stop_requested.is_set():
                     raise InterruptedError("hand motion stopped")
+                active_side = side or self.connection.side
+                if active_side not in self.poses_by_side:
+                    raise RuntimeError(f"{active_side}-hand motion requires explicit calibrated open and fist poses")
                 client = self.connection.get(side) if side is not None else self.connection.get()
-                target = self._target_for_action(active, client)
+                target = self._target_for_action(active, client, active_side)
                 result = self._move(target, action, side=side, speed=active["speed"],
                                     hold_torque=active["hold_torque"])
             status = "error" if result["state"] == "released_timeout" else "completed"
@@ -380,8 +394,6 @@ class HandPlugin:
             if not joint_positions:
                 raise ValueError("at least one joint position must be specified")
             active["joint_positions"] = joint_positions
-        else:
-            active["target"] = list(self.open_pose if action == "open" else self.fist_pose)
         with self._state_lock:
             if self._completion_delivery_failed:
                 raise RuntimeError("ACP completion delivery failed; restart driver after checking Core")
