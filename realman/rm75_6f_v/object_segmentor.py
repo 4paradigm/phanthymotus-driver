@@ -71,8 +71,16 @@ def estimate_dominant_color(cv2_module, roi_bgr):
     return "colored"
 
 
-def segment_objects(image_bgr, min_area=500, max_area=None):
+def segment_objects(image_bgr, min_area=500, max_area=None,
+                    x_compensation_mm=30.0, y_compensation_mm=-75.0, camera_z_mm=450.0):
     """在 BGR 图像上执行物体轮廓分割，并计算物体的尺寸、大小等级与边缘。
+
+    坐标系同步说明：
+    - position: VOP 统一归一化居中坐标系 [-1.0, 1.0]，图像中心为 [0, 0]，左上角 [-1, -1]，右下角 [1, 1]。
+      与 vision_pick_and_drop 完全对齐，可直接作为抓取点传入。
+    - compensated_position: 已叠加机械臂物理安装位姿补偿 (x_compensation_mm, y_compensation_mm) 的预补偿归一化坐标。
+    - center_px: 原始像素坐标 [cx, cy]。
+    - center_normalized: 传统左上角归一化坐标 [0.0, 1.0]。
 
     返回:
         list[dict]: 检测到的各物体详情列表，包含中心点、尺寸面积、大小等级与边缘点。
@@ -82,8 +90,15 @@ def segment_objects(image_bgr, min_area=500, max_area=None):
 
     height, width = image_bgr.shape[:2]
     total_image_area = float(max(1, width * height))
+    half_w = float(max(1, width)) / 2.0
+    half_h = float(max(1, height)) / 2.0
     if max_area is None:
         max_area = total_image_area * 0.85
+
+    # 计算机械臂基座补偿在相机像平面上的像素偏移 (俯视标准工作位姿 Z≈450mm)
+    z_m = max(50.0, float(camera_z_mm))
+    delta_px = -(float(x_compensation_mm) / z_m) * float(width)
+    delta_py = (float(y_compensation_mm) / z_m) * float(height)
 
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -123,6 +138,16 @@ def segment_objects(image_bgr, min_area=500, max_area=None):
             cx = float(x + w / 2.0)
             cy = float(y + h / 2.0)
 
+        # 1. VOP 标准居中归一化坐标 [-1.0, 1.0]
+        pos_x = max(-1.0, min(1.0, round(float((cx - half_w) / half_w), 4)))
+        pos_y = max(-1.0, min(1.0, round(float((cy - half_h) / half_h), 4)))
+
+        # 2. 考虑基座补偿后的像平面与归一化坐标
+        comp_cx = round(cx + delta_px, 2)
+        comp_cy = round(cy + delta_py, 2)
+        comp_pos_x = max(-1.0, min(1.0, round(float((comp_cx - half_w) / half_w), 4)))
+        comp_pos_y = max(-1.0, min(1.0, round(float((comp_cy - half_h) / half_h), 4)))
+
         perimeter = float(cv2.arcLength(c, True))
 
         # 尺寸级别划分
@@ -151,9 +176,15 @@ def segment_objects(image_bgr, min_area=500, max_area=None):
 
         objects.append({
             "id": obj_idx,
+            "name": f"object_{obj_idx}",
+            "confidence": 0.90,
+            "position": [pos_x, pos_y],
+            "compensated_position": [comp_pos_x, comp_pos_y],
+            "center": [pos_x, pos_y],
+            "center_vop": [pos_x, pos_y],
             "center_px": [round(cx, 2), round(cy, 2)],
+            "compensated_center_px": [comp_cx, comp_cy],
             "center_normalized": [round(cx / width, 4), round(cy / height, 4)],
-            "center": [round(cx / width, 4), round(cy / height, 4)],
             "size_level": size_level,
             "size_description": f"{size_name_cn} (宽 {int(w)}px, 高 {int(h)}px, 面积 {int(area)}px)",
             "width_px": int(w),
@@ -165,6 +196,7 @@ def segment_objects(image_bgr, min_area=500, max_area=None):
             "height_normalized": round(h / height, 4),
             "area_normalized": round(area_ratio, 4),
             "bbox_px": [int(x), int(y), int(w), int(h)],
+            "bbox": [int(x), int(y), int(x + w), int(y + h)],
             "bbox_normalized": [
                 round(x / width, 4),
                 round(y / height, 4),
@@ -175,14 +207,19 @@ def segment_objects(image_bgr, min_area=500, max_area=None):
             "edge_points_count": len(edge_pts_px),
             "edge_points_normalized": edge_pts_norm,
             "edge_points_px": edge_pts_px,
+            "compensation": {
+                "x_compensation_mm": float(x_compensation_mm),
+                "y_compensation_mm": float(y_compensation_mm),
+            },
         })
         obj_idx += 1
 
     # 按面积从大到小排序
     objects.sort(key=lambda item: item["area_px"], reverse=True)
-    # 重排 id
+    # 重排 id 与 name
     for i, obj in enumerate(objects, 1):
         obj["id"] = i
+        obj["name"] = f"object_{i}"
 
     return objects
 
@@ -217,11 +254,13 @@ def annotate_segmented_image(image_bgr, objects):
     return canvas
 
 
-def process_image(msg, min_area=500, max_area=None):
+def process_image(msg, min_area=500, max_area=None,
+                  x_compensation_mm=30.0, y_compensation_mm=-75.0, camera_z_mm=450.0):
     """解码图像并执行分割与尺寸计算。"""
     import cv2
     import numpy as np
 
+    t0 = time.time()
     if isinstance(msg, (bytes, bytearray)):
         image = cv2.imdecode(np.frombuffer(msg, dtype=np.uint8), cv2.IMREAD_COLOR)
     elif hasattr(msg, "format") and hasattr(msg, "data"):
@@ -244,15 +283,27 @@ def process_image(msg, min_area=500, max_area=None):
         raise ValueError("图像解码失败或数据为空")
 
     height, width = image.shape[:2]
-    objects = segment_objects(image, min_area=min_area, max_area=max_area)
+    objects = segment_objects(
+        image, min_area=min_area, max_area=max_area,
+        x_compensation_mm=x_compensation_mm, y_compensation_mm=y_compensation_mm,
+        camera_z_mm=camera_z_mm,
+    )
+    t_done = time.time()
 
     result = {
         "status": "success",
         "object_count": len(objects),
+        "count": len(objects),
         "objects": objects,
+        "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+        "compensation": {
+            "x_compensation_mm": float(x_compensation_mm),
+            "y_compensation_mm": float(y_compensation_mm),
+        },
         "image_width": width,
         "image_height": height,
-        "timestamp": time.time(),
+        "timestamp": t_done,
+        "latency_ms": round((t_done - t0) * 1000, 2),
     }
 
     annotated = annotate_segmented_image(image, objects)
@@ -274,6 +325,9 @@ class ObjectSegmentorPlugin:
             f"/{namespace}/ext_camera/default/rgb" if namespace else "/ext_camera/default/rgb"
         )
         self._min_area = int(plugin_config.get("min_area", 500))
+        self._x_compensation_mm = float(plugin_config.get("x_compensation_mm", 30.0))
+        self._y_compensation_mm = float(plugin_config.get("y_compensation_mm", -75.0))
+        self._camera_z_mm = float(plugin_config.get("camera_z_mm", 450.0))
 
         self._lock = threading.Lock()
         self._frame_condition = threading.Condition(self._lock)
@@ -290,7 +344,7 @@ class ObjectSegmentorPlugin:
         base = f"/{self._namespace}/{self.PREFIX}" if self._namespace else f"/{self.PREFIX}"
         self._outputs = [
             {"topic": f"{base}/overlay", "format": "image/jpeg", "desc": "标注了物体边缘轮廓与尺寸的预览图"},
-            {"topic": f"{base}/objects", "format": "data/json", "desc": "分割出的物体尺寸、面积与边缘点 JSON"},
+            {"topic": f"{base}/objects", "format": "data/json", "desc": "分割出的物体尺寸、面积与边缘点 JSON（VOP 统一格式）"},
         ]
 
     def get_tool(self):
@@ -299,7 +353,7 @@ class ObjectSegmentorPlugin:
             "name": self.PREFIX,
             "type": "processor",
             "multiInstance": False,
-            "description": "分割画面中的物体轮廓，检测物体边缘、几何中心、宽度、高度、面积与大小等级（小型/中型/大型）。用于判断物体大小、形状与边界；纯视觉处理，不控制机械臂运动。",
+            "description": "分割画面中的物体轮廓，检测物体边缘、几何中心（与 VOP 统一的 [-1, 1] 居中坐标）、宽度、高度、面积与大小等级（小型/中型/大型），并提供物理位姿补偿坐标。可直接用于抓取与分拣任务。",
             "topic_in": [{"format": "image/jpeg", "desc": "RealSense 相机 RGB 图像流"}],
             "topic_out": self._outputs,
             "inputSchema": {
@@ -327,24 +381,39 @@ class ObjectSegmentorPlugin:
                         "default": 3.0,
                         "description": "等待新图像帧的超时时间（秒）",
                     },
+                    "apply_compensation": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否在返回的 position 主字段中直接应用物理位姿安装补偿；默认 False（返回 VOP 标准像平面归一化居中坐标，由下游 pick_place 计算补偿）",
+                    },
+                    "x_compensation_mm": {
+                        "type": "number",
+                        "default": 30.0,
+                        "description": "基座坐标系 X 补偿（mm），用于校准相机与机械臂末端水平偏置",
+                    },
+                    "y_compensation_mm": {
+                        "type": "number",
+                        "default": -75.0,
+                        "description": "基座坐标系 Y 补偿（mm），用于校准相机与机械臂末端水平偏置",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "segment": {
-                        "params": ["min_area", "timeout_s"],
-                        "description": "分割画面中所有物体，获取其大小等级、宽度、高度、面积与边缘轮廓",
+                        "params": ["min_area", "timeout_s", "apply_compensation", "x_compensation_mm", "y_compensation_mm"],
+                        "description": "分割画面中所有物体，获取其大小等级、宽度、高度、面积、VOP 坐标与边缘轮廓",
                     },
                     "measure_size": {
-                        "params": ["min_area", "timeout_s"],
-                        "description": "测量画面中物体的大小尺寸与轮廓边界",
+                        "params": ["min_area", "timeout_s", "apply_compensation", "x_compensation_mm", "y_compensation_mm"],
+                        "description": "测量画面中物体的大小尺寸、中心坐标与轮廓边界",
                     },
                     "detect_objects": {
-                        "params": ["min_area", "timeout_s"],
+                        "params": ["min_area", "timeout_s", "apply_compensation", "x_compensation_mm", "y_compensation_mm"],
                         "description": "检测画面中所有独立物体的位置、尺寸与主要颜色",
                     },
                     "config": {
-                        "params": ["input_topic", "min_area"],
-                        "description": "配置卡片参数（图像输入话题与最小检测面积）",
+                        "params": ["input_topic", "min_area", "x_compensation_mm", "y_compensation_mm"],
+                        "description": "配置卡片参数（图像输入话题、最小检测面积与位姿补偿）",
                     },
                     "info": {
                         "params": [],
@@ -372,6 +441,16 @@ class ObjectSegmentorPlugin:
                         "type": "integer",
                         "default": 500,
                         "description": "默认最小检测像素面积",
+                    },
+                    "x_compensation_mm": {
+                        "type": "number",
+                        "default": 30.0,
+                        "description": "基坐标 X 补偿（mm）",
+                    },
+                    "y_compensation_mm": {
+                        "type": "number",
+                        "default": -75.0,
+                        "description": "基坐标 Y 补偿（mm）",
                     },
                 },
             },
@@ -440,6 +519,12 @@ class ObjectSegmentorPlugin:
             topic = str(args.get("input_topic") or self._input_topic).strip()
             if "min_area" in args:
                 self._min_area = int(args["min_area"])
+            if "x_compensation_mm" in args:
+                self._x_compensation_mm = float(args["x_compensation_mm"])
+            if "y_compensation_mm" in args:
+                self._y_compensation_mm = float(args["y_compensation_mm"])
+            if "camera_z_mm" in args:
+                self._camera_z_mm = float(args["camera_z_mm"])
             if topic:
                 old_topic = self._input_topic
                 self._input_topic = topic
@@ -465,14 +550,23 @@ class ObjectSegmentorPlugin:
         if action in ("segment", "measure_size", "detect_objects"):
             min_area = int(args.get("min_area", self._min_area))
             timeout_s = float(args.get("timeout_s", 3.0))
-            return self._segment_action(min_area, timeout_s)
+            apply_comp = bool(args.get("apply_compensation", False))
+            x_comp = float(args.get("x_compensation_mm", self._x_compensation_mm))
+            y_comp = float(args.get("y_compensation_mm", self._y_compensation_mm))
+            return self._segment_action(min_area, timeout_s, apply_comp, x_comp, y_comp)
 
         if action == "info":
             return self._info_action()
 
         raise ValueError(f"不支持的动作: {action}。支持动作: config, segment, measure_size, detect_objects, info, start, stop")
 
-    def _segment_action(self, min_area, timeout_s):
+    def _segment_action(self, min_area, timeout_s, apply_compensation=False,
+                        x_compensation_mm=None, y_compensation_mm=None):
+        if x_compensation_mm is None:
+            x_compensation_mm = self._x_compensation_mm
+        if y_compensation_mm is None:
+            y_compensation_mm = self._y_compensation_mm
+
         with self._frame_condition:
             if self._subscription is None and Node is not object and self._executor is not None:
                 try:
@@ -492,19 +586,42 @@ class ObjectSegmentorPlugin:
                     "found": False,
                     "error": "在指定超时时间内未接收到相机图像帧",
                     "object_count": 0,
+                    "count": 0,
                     "objects": [],
+                    "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+                    "compensation": {
+                        "x_compensation_mm": x_compensation_mm,
+                        "y_compensation_mm": y_compensation_mm,
+                        "applied": apply_compensation,
+                    },
                 }
 
             all_objects = list(self._latest_result.get("objects", []))
             objects = [obj for obj in all_objects if obj["area_px"] >= min_area]
+            first_target = objects[0] if objects else None
+            pos = (first_target["compensated_position"] if apply_compensation else first_target["position"]) if first_target else None
 
             return {
                 "status": "success",
                 "success": True,
                 "found": len(objects) > 0,
+                "position": pos,
+                "target_position": pos,
+                "compensated_position": first_target["compensated_position"] if first_target else None,
+                "center": pos,
+                "center_normalized": first_target["center_normalized"] if first_target else None,
+                "center_px": first_target["center_px"] if first_target else None,
+                "compensated_center_px": first_target["compensated_center_px"] if first_target else None,
                 "object_count": len(objects),
+                "count": len(objects),
                 "objects": objects,
                 "summary": f"共检测到 {len(objects)} 个物体，包含尺寸与边缘信息",
+                "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+                "compensation": {
+                    "x_compensation_mm": x_compensation_mm,
+                    "y_compensation_mm": y_compensation_mm,
+                    "applied": apply_compensation,
+                },
                 "image_width": self._latest_result.get("image_width"),
                 "image_height": self._latest_result.get("image_height"),
                 "frame_age_s": round(time.monotonic() - self._last_frame_at, 3) if self._last_frame_at else None,
@@ -530,8 +647,12 @@ class ObjectSegmentorPlugin:
                 "topic_in": [{"topic": self._input_topic, "format": "image/jpeg"}],
                 "topic_out": self._outputs,
                 "min_area": self._min_area,
+                "x_compensation_mm": self._x_compensation_mm,
+                "y_compensation_mm": self._y_compensation_mm,
+                "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
                 "latest": latest,
                 "object_count": latest.get("object_count", 0) if latest else 0,
+                "count": latest.get("count", 0) if latest else 0,
                 "latest_frame_age_s": round(age, 3) if age is not None else None,
                 "last_error": self._last_error,
             }
@@ -543,9 +664,18 @@ class ObjectSegmentorPlugin:
                 return
             self._last_processed_at = now
             min_area = self._min_area
+            x_comp = self._x_compensation_mm
+            y_comp = self._y_compensation_mm
+            z_m = self._camera_z_mm
 
         try:
-            result, jpeg = process_image(message, min_area=min_area)
+            result, jpeg = process_image(
+                message,
+                min_area=min_area,
+                x_compensation_mm=x_comp,
+                y_compensation_mm=y_comp,
+                camera_z_mm=z_m,
+            )
             image_message = CompressedImage()
             image_message.header = getattr(message, "header", image_message.header)
             image_message.format = "jpeg"

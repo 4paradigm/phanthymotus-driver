@@ -8,12 +8,18 @@ ext_camera:
   enabled: true
 aruco_detector:
   enabled: true
+  x_compensation_mm: 30.0
+  y_compensation_mm: -75.0
 aruco_zones:
   enabled: true
 color_detector:
   enabled: true
+  x_compensation_mm: 30.0
+  y_compensation_mm: -75.0
 object_segmentor:
   enabled: true
+  x_compensation_mm: 30.0
+  y_compensation_mm: -75.0
 vision_capture:
   enabled: true
   camera: external

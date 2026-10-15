@@ -54,23 +54,41 @@ def get_aruco_dict(cv2_module, dict_name: str):
     return aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 
 
-def extract_markers_from_corners(corners, ids, image_width: int, image_height: int):
+def extract_markers_from_corners(corners, ids, image_width: int, image_height: int,
+                                 x_compensation_mm: float = 30.0, y_compensation_mm: float = -75.0,
+                                 camera_z_mm: float = 450.0):
     """从角点坐标与 ID 列表中提取每个标记码的几何中心点与位置坐标。
+
+    坐标系同步说明：
+    - position: VOP 统一归一化居中坐标系 [-1.0, 1.0]，图像中心为 [0, 0]，左上角 [-1, -1]，右下角 [1, 1]。
+      与 vision_pick_and_drop 完全对齐，可直接作为抓取点传入。
+    - compensated_position: 已叠加机械臂物理安装位姿补偿 (x_compensation_mm, y_compensation_mm) 的预补偿归一化坐标。
+    - center_px: 原始像素坐标 [cx, cy]。
+    - center_normalized: 传统左上角归一化坐标 [0.0, 1.0]。
 
     参数:
         corners: OpenCV 检测出的角点列表（numpy ndarray 或嵌套列表）
         ids: OpenCV 检测出的标记 ID 列表
         image_width: 画面宽度（像素）
         image_height: 画面高度（像素）
+        x_compensation_mm: 基座 X 补偿（mm）
+        y_compensation_mm: 基座 Y 补偿（mm）
+        camera_z_mm: 相机观察高度（mm，默认 450mm）
 
     返回:
         list[dict]: 提取出的标记列表，每个标记包含:
             - id: 标记 ID (int)
-            - center: [x, y] 归一化中心坐标 (0.0~1.0)
-            - center_normalized: [x, y] 归一化中心坐标 (0.0~1.0)
+            - name: "aruco_{id}" (str)
+            - confidence: 1.0 (float)
+            - position: [x, y] VOP 归一化居中坐标 (-1.0~1.0)
+            - compensated_position: [x, y] 叠加基座位姿补偿的归一化坐标 (-1.0~1.0)
+            - center: [x, y] (与 position 对齐)
+            - center_normalized: [x, y] 传统左上角归一化坐标 (0.0~1.0)
             - center_px: [x, y] 像素中心坐标
+            - compensated_center_px: [x, y] 补偿后像素中心坐标
             - corners_normalized: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]] 归一化角点
             - corners_px: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]] 像素角点
+            - compensation: 补偿参数字典
     """
     markers = []
     if ids is None or len(ids) == 0:
@@ -78,6 +96,13 @@ def extract_markers_from_corners(corners, ids, image_width: int, image_height: i
 
     width = float(max(1, image_width))
     height = float(max(1, image_height))
+    half_w = width / 2.0
+    half_h = height / 2.0
+
+    # 计算机械臂基座补偿在相机像平面上的像素偏移 (俯视标准工作位姿 Z≈450mm)
+    z_m = max(50.0, float(camera_z_mm))
+    delta_px = -(float(x_compensation_mm) / z_m) * width
+    delta_py = (float(y_compensation_mm) / z_m) * height
 
     for i in range(len(ids)):
         raw_id = ids[i]
@@ -99,9 +124,19 @@ def extract_markers_from_corners(corners, ids, image_width: int, image_height: i
         cx = sum(p[0] for p in pts) / 4.0
         cy = sum(p[1] for p in pts) / 4.0
 
-        # 归一化中心坐标（左上角为 0,0，右下角为 1,1）
+        # 1. VOP 标准居中归一化坐标 [-1.0, 1.0]
+        pos_x = max(-1.0, min(1.0, round(float((cx - half_w) / half_w), 4)))
+        pos_y = max(-1.0, min(1.0, round(float((cy - half_h) / half_h), 4)))
+
+        # 2. 传统左上角归一化坐标 (0.0~1.0)
         norm_x = round(cx / width, 4)
         norm_y = round(cy / height, 4)
+
+        # 3. 考虑基座补偿后的像平面与归一化坐标
+        comp_cx = round(cx + delta_px, 2)
+        comp_cy = round(cy + delta_py, 2)
+        comp_pos_x = max(-1.0, min(1.0, round(float((comp_cx - half_w) / half_w), 4)))
+        comp_pos_y = max(-1.0, min(1.0, round(float((comp_cy - half_h) / half_h), 4)))
 
         corners_px = [[round(p[0], 2), round(p[1], 2)] for p in pts]
         corners_norm = [
@@ -111,11 +146,21 @@ def extract_markers_from_corners(corners, ids, image_width: int, image_height: i
 
         markers.append({
             "id": marker_id,
-            "center": [norm_x, norm_y],
+            "name": f"aruco_{marker_id}",
+            "confidence": 1.0,
+            "position": [pos_x, pos_y],
+            "compensated_position": [comp_pos_x, comp_pos_y],
+            "center": [pos_x, pos_y],
+            "center_vop": [pos_x, pos_y],
             "center_normalized": [norm_x, norm_y],
             "center_px": [round(cx, 2), round(cy, 2)],
+            "compensated_center_px": [comp_cx, comp_cy],
             "corners_normalized": corners_norm,
             "corners_px": corners_px,
+            "compensation": {
+                "x_compensation_mm": float(x_compensation_mm),
+                "y_compensation_mm": float(y_compensation_mm),
+            },
         })
 
     # 按 marker_id 升序排序输出
@@ -123,15 +168,20 @@ def extract_markers_from_corners(corners, ids, image_width: int, image_height: i
     return markers
 
 
-def detect_markers(image_bgr, dictionary_name: str = DEFAULT_DICTIONARY):
+def detect_markers(image_bgr, dictionary_name: str = DEFAULT_DICTIONARY,
+                   x_compensation_mm: float = 30.0, y_compensation_mm: float = -75.0,
+                   camera_z_mm: float = 450.0):
     """直接在 BGR 图像上运行 ArUco 检测并提取中心点坐标（供 Python 脚本或方法直接调用）。
 
     参数:
         image_bgr: OpenCV numpy ndarray (BGR 图像)
         dictionary_name: ArUco 字典名称，默认 DICT_4X4_50
+        x_compensation_mm: 基座 X 补偿（mm）
+        y_compensation_mm: 基座 Y 补偿（mm）
+        camera_z_mm: 相机观察高度（mm）
 
     返回:
-        list[dict]: 提取出的标记列表，每项包含 id, center_normalized, center_px 等
+        list[dict]: 提取出的标记列表，每项包含 id, position, center_normalized, center_px 等
     """
     import cv2
 
@@ -148,7 +198,12 @@ def detect_markers(image_bgr, dictionary_name: str = DEFAULT_DICTIONARY):
         detector_params = cv2.aruco.DetectorParameters_create()
         corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=detector_params)
 
-    return extract_markers_from_corners(corners, ids, width, height)
+    return extract_markers_from_corners(
+        corners, ids, width, height,
+        x_compensation_mm=x_compensation_mm,
+        y_compensation_mm=y_compensation_mm,
+        camera_z_mm=camera_z_mm,
+    )
 
 
 def annotate_image(image_bgr, markers):
@@ -186,12 +241,17 @@ def annotate_image(image_bgr, markers):
     return canvas
 
 
-def process_image(msg, dictionary_name: str = DEFAULT_DICTIONARY):
+def process_image(msg, dictionary_name: str = DEFAULT_DICTIONARY,
+                  x_compensation_mm: float = 30.0, y_compensation_mm: float = -75.0,
+                  camera_z_mm: float = 450.0):
     """解码相机输入的图像消息，执行标记检测并提取几何中心坐标。
 
     参数:
         msg: CompressedImage / sensor_msgs.msg.Image / bytes / numpy.ndarray
         dictionary_name: ArUco 字典名称
+        x_compensation_mm: 基座 X 补偿（mm）
+        y_compensation_mm: 基座 Y 补偿（mm）
+        camera_z_mm: 相机观察高度（mm）
 
     返回:
         tuple[dict, bytes]: (检测数据字典, 带中心点标注的 JPEG 字节流)
@@ -199,6 +259,7 @@ def process_image(msg, dictionary_name: str = DEFAULT_DICTIONARY):
     import cv2
     import numpy as np
 
+    t0 = time.time()
     # 1. 图像解码与格式转换
     if isinstance(msg, (bytes, bytearray)):
         image = cv2.imdecode(np.frombuffer(msg, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -226,16 +287,30 @@ def process_image(msg, dictionary_name: str = DEFAULT_DICTIONARY):
     height, width = image.shape[:2]
 
     # 2. 检测标记并提取中心坐标
-    markers = detect_markers(image, dictionary_name)
+    markers = detect_markers(
+        image, dictionary_name,
+        x_compensation_mm=x_compensation_mm,
+        y_compensation_mm=y_compensation_mm,
+        camera_z_mm=camera_z_mm,
+    )
+    t_done = time.time()
 
     result = {
+        "status": "success",
         "detected_markers": markers,
         "detected_marker_ids": [m["id"] for m in markers],
         "marker_count": len(markers),
+        "count": len(markers),
+        "objects": markers,
+        "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+        "compensation": {
+            "x_compensation_mm": float(x_compensation_mm),
+            "y_compensation_mm": float(y_compensation_mm),
+        },
         "image_width": width,
         "image_height": height,
-        "coordinate_system": "image_top_left_normalized_0_to_1",
-        "timestamp": time.time(),
+        "timestamp": t_done,
+        "latency_ms": round((t_done - t0) * 1000, 2),
     }
 
     # 3. 渲染标注图像（轮廓与中心十字线）
@@ -253,6 +328,7 @@ class ArucoDetectorPlugin:
     - 订阅 RealSense RGB 图像流并识别 ArUco 码中心点
     - 发布 /{namespace}/aruco_detector/overlay 预览图像
     - 发布 /{namespace}/aruco_detector/markers 检测结果 JSON
+    - 发布 /{namespace}/aruco_detector/objects VOP 兼容格式的标记物体列表 JSON
     - 提供直接可调用的 detect / get_marker_center 动作接口
     """
 
@@ -267,12 +343,17 @@ class ArucoDetectorPlugin:
             "input_topic",
             f"/{namespace}/ext_camera/default/rgb" if namespace else "/ext_camera/default/rgb"
         )
+        self._x_compensation_mm = float(plugin_config.get("x_compensation_mm", 30.0))
+        self._y_compensation_mm = float(plugin_config.get("y_compensation_mm", -75.0))
+        self._camera_z_mm = float(plugin_config.get("camera_z_mm", 450.0))
+
         self._lock = threading.Lock()
         self._frame_condition = threading.Condition(self._lock)
         self._node = None
         self._subscription = None
         self._image_pub = None
         self._data_pub = None
+        self._objects_pub = None
         self._latest_result = None
         self._latest_jpeg = None
         self._last_frame_at = 0.0
@@ -291,7 +372,7 @@ class ArucoDetectorPlugin:
             "name": self.PREFIX,
             "type": "processor",
             "multiInstance": False,
-            "description": "识别 RealSense 相机画面中的 ArUco 标记码，提取其 ID 数值与几何中心点坐标（像素坐标及 0~1 归一化坐标）；纯视觉卡片，直接支持动作调用，不控制机械臂运动，不包含分拣区配置。",
+            "description": "识别 RealSense 相机画面中的 ArUco 标记码，提取其 ID 数值与几何中心点坐标（与 VOP 统一的 [-1, 1] 居中坐标 position 及物理安装位姿补偿坐标）。可直接用于抓取与放置任务。",
             "topic_in": [{"format": "image/jpeg", "desc": "RealSense 相机 RGB 图像流"}],
             "topic_out": self._outputs,
             "inputSchema": {
@@ -324,20 +405,35 @@ class ArucoDetectorPlugin:
                         "default": DEFAULT_DICTIONARY,
                         "description": "使用的 ArUco 字典类型，默认 DICT_4X4_50",
                     },
+                    "apply_compensation": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否在返回的 position 主字段中直接应用物理位姿安装补偿；默认 False（返回 VOP 标准像平面归一化居中坐标，由下游 pick_place 计算补偿）",
+                    },
+                    "x_compensation_mm": {
+                        "type": "number",
+                        "default": 30.0,
+                        "description": "基座坐标系 X 补偿（mm），用于校准相机与机械臂末端水平偏置",
+                    },
+                    "y_compensation_mm": {
+                        "type": "number",
+                        "default": -75.0,
+                        "description": "基座坐标系 Y 补偿（mm），用于校准相机与机械臂末端水平偏置",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "config": {
-                        "params": ["input_topic", "dictionary"],
-                        "description": "配置卡片参数（图像输入话题与字典类型）",
+                        "params": ["input_topic", "dictionary", "x_compensation_mm", "y_compensation_mm"],
+                        "description": "配置卡片参数（图像输入话题、字典类型与位姿补偿）",
                     },
                     "detect": {
-                        "params": ["marker_id", "timeout_s"],
-                        "description": "调用卡片识别画面中的 ArUco 码，提取 ID 及中心点坐标（支持传入 marker_id 筛选目标码）",
+                        "params": ["marker_id", "timeout_s", "apply_compensation", "x_compensation_mm", "y_compensation_mm"],
+                        "description": "调用卡片识别画面中的 ArUco 码，提取 ID 及 VOP 居中坐标（支持传入 marker_id 筛选目标码）",
                     },
                     "get_marker_center": {
-                        "params": ["marker_id", "timeout_s"],
-                        "description": "调用卡片获取指定 ID 的 ArUco 码中心位置坐标",
+                        "params": ["marker_id", "timeout_s", "apply_compensation", "x_compensation_mm", "y_compensation_mm"],
+                        "description": "调用卡片获取指定 ID 的 ArUco 码中心位置坐标（VOP 统一格式）",
                     },
                     "info": {
                         "params": [],
@@ -366,6 +462,16 @@ class ArucoDetectorPlugin:
                         "type": "string",
                         "default": "",
                         "description": "默认 RGB 图像话题",
+                    },
+                    "x_compensation_mm": {
+                        "type": "number",
+                        "default": 30.0,
+                        "description": "基坐标 X 补偿（mm）",
+                    },
+                    "y_compensation_mm": {
+                        "type": "number",
+                        "default": -75.0,
+                        "description": "基坐标 Y 补偿（mm）",
                     },
                 },
             },
@@ -420,6 +526,7 @@ class ArucoDetectorPlugin:
                     base = f"/{self._namespace}/{self.PREFIX}" if self._namespace else f"/{self.PREFIX}"
                     self._image_pub = node.create_publisher(CompressedImage, f"{base}/overlay", 1)
                     self._data_pub = node.create_publisher(String, f"{base}/markers", 1)
+                    self._objects_pub = node.create_publisher(String, f"{base}/objects", 1)
                     self._subscription = node.create_subscription(
                         CompressedImage, topic, self._on_frame, qos_profile_sensor_data
                     )
@@ -453,6 +560,12 @@ class ArucoDetectorPlugin:
                 if dictionary not in DICTIONARIES:
                     raise ValueError(f"未知 ArUco 字典: {dictionary}")
                 self._dictionary = dictionary
+            if "x_compensation_mm" in args:
+                self._x_compensation_mm = float(args["x_compensation_mm"])
+            if "y_compensation_mm" in args:
+                self._y_compensation_mm = float(args["y_compensation_mm"])
+            if "camera_z_mm" in args:
+                self._camera_z_mm = float(args["camera_z_mm"])
             if topic:
                 old_topic = self._input_topic
                 self._input_topic = topic
@@ -487,15 +600,24 @@ class ArucoDetectorPlugin:
                 marker_id = None
 
             timeout_s = float(args.get("timeout_s", 3.0))
-            return self._detect_action(marker_id, timeout_s)
+            apply_comp = bool(args.get("apply_compensation", False))
+            x_comp = float(args.get("x_compensation_mm", self._x_compensation_mm))
+            y_comp = float(args.get("y_compensation_mm", self._y_compensation_mm))
+            return self._detect_action(marker_id, timeout_s, apply_comp, x_comp, y_comp)
 
         if action == "info":
             return self._info_action()
 
         raise ValueError(f"不支持的动作: {action}。支持的动作包括: config, start, stop, info, detect, get_marker_center")
 
-    def _detect_action(self, marker_id, timeout_s: float):
-        """执行 detect 动作：返回当前画面中所有码或指定 ID 码的中心坐标。"""
+    def _detect_action(self, marker_id, timeout_s: float, apply_compensation: bool = False,
+                       x_compensation_mm: float = None, y_compensation_mm: float = None):
+        """执行 detect 动作：返回当前画面中所有码或指定 ID 码的中心坐标（与 VOP 统一的 [-1, 1] 居中坐标与物理补偿）。"""
+        if x_compensation_mm is None:
+            x_compensation_mm = self._x_compensation_mm
+        if y_compensation_mm is None:
+            y_compensation_mm = self._y_compensation_mm
+
         with self._frame_condition:
             # 若尚未启动订阅且处于 ROS 节点可用环境，自动启动订阅
             if self._subscription is None and Node is not object and self._executor is not None:
@@ -520,6 +642,14 @@ class ArucoDetectorPlugin:
                     "detected_markers": [],
                     "detected_marker_ids": [],
                     "marker_count": 0,
+                    "count": 0,
+                    "objects": [],
+                    "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+                    "compensation": {
+                        "x_compensation_mm": x_compensation_mm,
+                        "y_compensation_mm": y_compensation_mm,
+                        "applied": apply_compensation,
+                    },
                 }
 
             markers = list(self._latest_result.get("detected_markers", []))
@@ -532,18 +662,33 @@ class ArucoDetectorPlugin:
                 matched = [m for m in markers if m["id"] == marker_id]
                 if matched:
                     target = matched[0]
+                    pos = (target.get("compensated_position") if apply_compensation else target.get("position", target.get("center"))) if target else None
                     return {
                         "status": "success",
                         "success": True,
                         "found": True,
                         "marker_id": marker_id,
-                        "center": target["center_normalized"],
-                        "center_normalized": target["center_normalized"],
-                        "center_px": target["center_px"],
+                        "position": pos,
+                        "target_position": pos,
+                        "compensated_position": target.get("compensated_position"),
+                        "center": pos,
+                        "center_normalized": target.get("center_normalized"),
+                        "center_px": target.get("center_px"),
+                        "compensated_center_px": target.get("compensated_center_px"),
+                        "corners_normalized": target.get("corners_normalized"),
+                        "corners_px": target.get("corners_px"),
                         "marker": target,
                         "detected_markers": markers,
                         "detected_marker_ids": [m["id"] for m in markers],
                         "marker_count": len(markers),
+                        "count": len(markers),
+                        "objects": markers,
+                        "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+                        "compensation": {
+                            "x_compensation_mm": x_compensation_mm,
+                            "y_compensation_mm": y_compensation_mm,
+                            "applied": apply_compensation,
+                        },
                         "image_width": width,
                         "image_height": height,
                         "frame_age_s": frame_age,
@@ -554,13 +699,25 @@ class ArucoDetectorPlugin:
                         "success": True,
                         "found": False,
                         "marker_id": marker_id,
+                        "position": None,
+                        "target_position": None,
+                        "compensated_position": None,
                         "center": None,
                         "center_normalized": None,
                         "center_px": None,
+                        "compensated_center_px": None,
                         "marker": None,
                         "detected_markers": markers,
                         "detected_marker_ids": [m["id"] for m in markers],
                         "marker_count": len(markers),
+                        "count": len(markers),
+                        "objects": markers,
+                        "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+                        "compensation": {
+                            "x_compensation_mm": x_compensation_mm,
+                            "y_compensation_mm": y_compensation_mm,
+                            "applied": apply_compensation,
+                        },
                         "image_width": width,
                         "image_height": height,
                         "frame_age_s": frame_age,
@@ -568,12 +725,30 @@ class ArucoDetectorPlugin:
                     }
 
             # 未指定 marker_id 时，返回检测到的全部标记码列表
+            first_target = markers[0] if markers else None
+            pos = (first_target.get("compensated_position") if apply_compensation else first_target.get("position", first_target.get("center"))) if first_target else None
             return {
                 "status": "success",
                 "success": True,
+                "found": len(markers) > 0,
+                "position": pos,
+                "target_position": pos,
+                "compensated_position": first_target.get("compensated_position") if first_target else None,
+                "center": pos,
+                "center_normalized": first_target.get("center_normalized") if first_target else None,
+                "center_px": first_target.get("center_px") if first_target else None,
+                "compensated_center_px": first_target.get("compensated_center_px") if first_target else None,
                 "detected_markers": markers,
                 "detected_marker_ids": [m["id"] for m in markers],
                 "marker_count": len(markers),
+                "count": len(markers),
+                "objects": markers,
+                "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
+                "compensation": {
+                    "x_compensation_mm": x_compensation_mm,
+                    "y_compensation_mm": y_compensation_mm,
+                    "applied": apply_compensation,
+                },
                 "image_width": width,
                 "image_height": height,
                 "frame_age_s": frame_age,
@@ -600,10 +775,14 @@ class ArucoDetectorPlugin:
                 "topic_in": [{"topic": self._input_topic, "format": "image/jpeg"}],
                 "topic_out": self._outputs,
                 "dictionary": self._dictionary,
+                "x_compensation_mm": self._x_compensation_mm,
+                "y_compensation_mm": self._y_compensation_mm,
+                "coordinate_system": "vop_centered_normalized_minus1_to_plus1",
                 "latest": latest,
                 "detected_markers": latest.get("detected_markers", []) if latest else [],
                 "detected_marker_ids": latest.get("detected_marker_ids", []) if latest else [],
                 "marker_count": len(latest.get("detected_markers", [])) if latest else 0,
+                "count": len(latest.get("detected_markers", [])) if latest else 0,
                 "latest_frame_age_s": round(age, 3) if age is not None else None,
                 "last_error": self._last_error,
             }
@@ -616,9 +795,18 @@ class ArucoDetectorPlugin:
                 return
             self._last_processed_at = now
             dictionary = self._dictionary
+            x_comp = self._x_compensation_mm
+            y_comp = self._y_compensation_mm
+            z_m = self._camera_z_mm
 
         try:
-            result, jpeg = process_image(message, dictionary)
+            result, jpeg = process_image(
+                message,
+                dictionary_name=dictionary,
+                x_compensation_mm=x_comp,
+                y_compensation_mm=y_comp,
+                camera_z_mm=z_m,
+            )
             image_message = CompressedImage()
             image_message.header = getattr(message, "header", image_message.header)
             image_message.format = "jpeg"
@@ -640,6 +828,8 @@ class ArucoDetectorPlugin:
                     self._image_pub.publish(image_message)
                 if self._data_pub is not None:
                     self._data_pub.publish(json_message)
+                if self._objects_pub is not None:
+                    self._objects_pub.publish(json_message)
         except Exception as exc:
             with self._frame_condition:
                 self._last_error = str(exc)
