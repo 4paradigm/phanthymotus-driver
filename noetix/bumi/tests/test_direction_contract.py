@@ -12,7 +12,7 @@ def test_only_sensor_card_and_shared_settings(monkeypatch):
     card = module.SoundDirectionPlugin({}, 'robot', types.SimpleNamespace(add_node=lambda _: None))
     assert [tool['name'] for tool in card.get_tools()] == ['sound_direction']
     tool = card.get_tool()
-    assert tool['topic_out'][0]['format'] == 'sensor/sound-direction'
+    assert tool['topic_out'] == [{'topic': '/robot/sound_direction/events', 'format': 'sensor/sound-direction'}]
     assert set(tool['configSchema']['properties']) == {'sensitivity'}
     assert set(tool['configSchema']['properties']) == set(module.DEFAULT_PARAMETERS)
     assert all(field['scope'] == 'shared' for field in tool['configSchema']['properties'].values())
@@ -114,3 +114,44 @@ def test_worker_publishes_structured_direction_message(monkeypatch, tmp_path, ti
     assert len(published) == 1
     assert published[0].angle_deg == -90
     assert published[0].window_end_us == expected_end
+
+
+def test_direction_json_preserves_precision_and_capture_window(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = _card(module)
+    card._proc = types.SimpleNamespace(poll=lambda: None)
+    msg = module.SoundDirection()
+    msg.state = msg.VALID
+    msg.angle_deg = -29.678
+    msg.window_start_us = 1700000000000000
+    msg.window_end_us = 1700000000020000
+    msg.published_us = 1700000000040000
+    card._on_direction(msg)
+    payload = json.loads(card._node.published[-1].data)
+    assert payload == {
+        'state': 'fresh', 'trigger': 'sound_activity', 'angle': -30,
+        'angle_deg': -29.678, 'unit': 'deg', 'timestamp_ms': 1700000000040,
+        'audio_window_start_us': 1700000000000000,
+        'audio_window_end_us': 1700000000020000,
+    }
+    # Freshness belongs to the sensor, so ordinary JSON viewers need no timer.
+    monkeypatch.setattr(module.time, 'monotonic', lambda: card._last_direction_time + 2.1)
+    card._tick()
+    assert json.loads(card._node.published[-1].data) == {'state': 'stale'}
+    count = len(card._node.published)
+    card._tick()
+    assert len(card._node.published) == count + 1
+    assert json.loads(card._node.published[-1].data) == {'state': 'stale'}
+    clear = module.SoundDirection()
+    card._on_direction(clear)
+    assert json.loads(card._node.published[-1].data) == {'state': 'no_event'}
+    card._node.published.clear()  # Simulate a late reader or a lost terminal packet.
+    card._tick()
+    assert json.loads(card._node.published[-1].data) == {'state': 'no_event'}
+
+
+def test_sensor_reports_no_event_before_first_activity(monkeypatch):
+    module = _load_card(monkeypatch)
+    card = _card(module)
+    card._tick()
+    assert json.loads(card._node.published[-1].data) == {'state': 'no_event'}

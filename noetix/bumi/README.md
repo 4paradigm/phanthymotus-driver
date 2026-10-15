@@ -5,13 +5,27 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 ## `mic` and `sound_direction`
 
 `mic` publishes mono PCM `AudioChunk` messages on `/<namespace>/mic/audio`.
-`sound_direction` is the only direction card. It publishes
-`audio_msgs/msg/SoundDirection` on `/<namespace>/sound_direction` with the
-`sensor/sound-direction` canvas format. The angle uses the robot frame:
+`sound_direction` is the only direction card. Its canvas output is
+`std_msgs/msg/String` on `/<namespace>/sound_direction/events`, declared as
+`sensor/sound-direction`. Like `sensor/pose2d`, it has a specific canvas type
+with the standard String transport; it is not a generic `data/json` port.
+Driver owns freshness and display data; Core uses its standard text/latest
+viewers. The angle uses the robot frame:
 front 0°, **left positive** (counter-clockwise, REP-103 — the same sign as
 the locomotion `vyaw` command), right negative, rear ±180°. A source at
 front-left reads about +45 and passes straight to a `vyaw` turn with no
-negation. `NO_EVENT` clears the live angle after activity stops.
+negation. The observation reports `state: "fresh"`, an integer `angle` for display,
+and the exact `angle_deg` for ASR, with `audio_window_start_us`,
+`audio_window_end_us`, `timestamp_ms`, and `unit: "deg"`.
+After activity stops it publishes `state: "no_event"`; if updates disappear,
+the driver publishes `state: "stale"` after two seconds. Latest-mode viewers
+retain the previous reading with that explicit state. No-event/stale messages
+are not valid ASR observations. Driver repeats terminal states every 500 ms,
+including no-event before first activity, so late readers or a lost
+best-effort packet do not leave an old reading marked fresh.
+
+The original `audio_msgs/msg/SoundDirection` stream on
+`/<namespace>/sound_direction` remains available to existing ROS clients.
 
 The two capture workers use the SDK frame timestamp as their common capture
 clock only when it has a Unix-microsecond shape. `mic` stamps each chunk with
@@ -25,7 +39,8 @@ Lifecycle follows the same contract as the other sensor cards: the driver
 spawns the direction worker at boot and tears it down on driver shutdown,
 a config save, or a failed worker start. The canvas `start`/`stop` actions
 are status replies — they never spawn or kill the worker — so stopping
-intelligent control leaves `/<namespace>/sound_direction` streaming.
+intelligent control leaves both direction streams running. No special canvas
+start call is required to view the sensor.
 
 A worker that dies mid-session is **not** revived by `start`/`stop`/`info`;
 restart the driver to bring the stream back. A config save restarts the
@@ -97,9 +112,13 @@ can be shared between Bumi robots. This portability confirmation is supplied
 by the operator; the repository's tests validate file geometry and loading,
 not physical direction accuracy.
 
-For existing canvas projects, remove the old `sound_direction_control` card and
-reconnect `sound_direction` to the ASR direction input. Its calibration actions
-have been removed; update the packaged file through a reviewed change, or use
+For existing canvas projects, remove the old `sound_direction_control` card,
+remove/re-add `sound_direction` and ASR, and reconnect the dedicated direction output
+to the ASR direction input (and mic to the audio input). This replaces saved
+typed ROS topics; update Driver and Perception together for the standard
+sensor transport. The canvas type remains `sensor/sound-direction`.
+Update Core once for this migration to remove its old custom ROS decoder.
+Calibration actions have been removed; update the packaged file through a reviewed change, or use
 the per-robot override as an emergency measure. The previous
 `/<namespace>/mic/sound_direction` stream is no longer produced.
 
@@ -107,8 +126,9 @@ Run local tests from the repository root with
 `python -m pytest noetix/bumi/tests -q`.
 The driver image builds its bundled `audio_msgs` definitions, including
 `SoundDirection`, over a pinned ROS base image. It does not require a new
-`ros-base` release from the main repository. ASR and Agent Core still need the
-matching message definition to consume the direction topic.
+`ros-base` release from the main repository. The canvas/ASR path does not require
+`SoundDirection` in Agent Core or Perception. Legacy typed consumers still
+need the matching message definition.
 
 The published-image [size measurement](review-evidence/image-size-2026-10-14.md)
 records a 2,088,960-byte increase in summed history-layer size over the earlier
@@ -117,16 +137,15 @@ release without the local interface overlay; the ROS overlay and import-check la
 this robot's cached `ros-base:latest` and the pinned digest. The report separates
 Docker size accounting from actual disk consumption and includes raw evidence.
 
-Before deploying the three images together, compare
-`noetix/bumi/audio_msgs/msg/SoundDirection.msg` with the main repository's
-`deploy/ros-base/audio_msgs/msg/SoundDirection.msg` byte for byte. They match
-in these source branches (SHA-256
-`78c52d09d430df6e12e1200529d99f3b0f219abe0ffb340f6a847453a5e1016d`).
-For the release, record the immutable image digests for Bumi, Perception and
-Agent Core, then verify `ros2 interface show audio_msgs/msg/SoundDirection`
-inside each published image. Confirm one direction event reaches the ASR input
-and the canvas on the target robot. Source equality alone does not establish
-which image versions were deployed together; keep this release check open
+The original `/<namespace>/sound_direction` stream still uses the bundled
+`audio_msgs/msg/SoundDirection` for existing ROS clients. The Driver itself
+builds that definition; the standard sensor observation is a separate topic
+so there are never two ROS types on one topic.
+
+For the migration release, record the immutable image digests for Bumi,
+Perception, and the compatible Core.
+Confirm a direction event reaches the ASR input and the canvas viewer on the
+target robot, including no-event/stale states. Keep the release check open
 until those published-image and robot checks pass.
 
 ## App 图传与 Phanthy Camera Card

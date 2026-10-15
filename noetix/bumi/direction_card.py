@@ -16,6 +16,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from audio_msgs.msg import SoundDirection
+from std_msgs.msg import String
 
 from sound_direction import MAX_BASIS_CONDITION, SoundActivityGate, estimate_angle, estimate_signature
 
@@ -214,20 +215,41 @@ class SoundDirectionPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl=None):
         self._namespace = namespace
         self._topic = f"/{namespace}/sound_direction"
+        self._output_topic = f"{self._topic}/events"
         self._media_ctrl = media_ctrl
         self._proc: subprocess.Popen | None = None
         self._process_lock = threading.RLock()
         self._last_direction = None
         self._last_direction_time = 0.0
+        self._observation = {"state": "no_event"}
         self._node = Node("bumi_sound_direction_sub")
         executor.add_node(self._node)
         self._node.create_subscription(SoundDirection, self._topic, self._on_direction, _QOS)
         self._clear_pub = self._node.create_publisher(SoundDirection, self._topic, _QOS)
+        self._observation_pub = self._node.create_publisher(String, self._output_topic, _QOS)
+        self._node.create_timer(0.5, self._tick)
+
+    def _publish_observation(self, payload: dict) -> None:
+        self._observation = payload
+        msg = String()
+        msg.data = json.dumps(payload)
+        self._observation_pub.publish(msg)
+
+    def _tick(self) -> None:
+        with self._process_lock:
+            if (self._last_direction is not None
+                    and time.monotonic() - self._last_direction_time >= 2.0):
+                self._publish_observation({"state": "stale"})
+            elif self._observation["state"] != "fresh":
+                # Best-effort delivery: late readers and a lost terminal packet
+                # must still learn that the previous angle is no longer fresh.
+                self._publish_observation(self._observation)
 
     def _on_direction(self, msg: SoundDirection) -> None:
         if msg.state == SoundDirection.NO_EVENT:
             with self._process_lock:
                 self._last_direction = None
+                self._publish_observation({"state": "no_event"})
             return
         if msg.state != SoundDirection.VALID:
             return
@@ -240,6 +262,16 @@ class SoundDirectionPlugin:
                                     "window_start_us": msg.window_start_us,
                                     "window_end_us": msg.window_end_us}
             self._last_direction_time = time.monotonic()
+            # Keep the exact angle for ASR and an integer angle for display.
+            angle = math.floor(msg.angle_deg + 0.5)
+            self._publish_observation({
+                "state": "fresh", "trigger": "sound_activity",
+                "timestamp_ms": msg.published_us // 1000,
+                "angle": 180 if angle == -180 else angle,
+                "angle_deg": msg.angle_deg, "unit": "deg",
+                "audio_window_start_us": msg.window_start_us,
+                "audio_window_end_us": msg.window_end_us,
+            })
 
     def get_tool(self) -> dict:
         return {
@@ -260,7 +292,7 @@ class SoundDirectionPlugin:
                         "嘈杂环境：风扇或环境噪声较大时使用，需要更靠近或更大声说话。"
                     ),
                 }}},
-            "topic_out": [{"topic": self._topic, "format": "sensor/sound-direction"}],
+            "topic_out": [{"topic": self._output_topic, "format": "sensor/sound-direction"}],
         }
 
     def get_tools(self) -> list:
@@ -307,6 +339,7 @@ class SoundDirectionPlugin:
                             event = SoundDirection()
                             event.state = SoundDirection.NO_EVENT
                             event.published_us = time.time_ns() // 1000
+                            self._publish_observation({"state": "no_event"})
                             self._clear_pub.publish(event)
             threading.Thread(target=forward, daemon=True).start()
             if (not ready_event.wait(timeout=15) or not ready[0]
@@ -330,6 +363,7 @@ class SoundDirectionPlugin:
             event = SoundDirection()
             event.state = SoundDirection.NO_EVENT
             event.published_us = time.time_ns() // 1000
+            self._publish_observation({"state": "no_event"})
             self._clear_pub.publish(event)
 
     def _set_parameters(self, changes: dict | None) -> dict:
@@ -424,7 +458,7 @@ class SoundDirectionPlugin:
                 direction = self._last_direction
                 age = time.monotonic() - self._last_direction_time
             observation = ({"state": "no_event"} if direction is None else
-                           {"state": "stale"} if age > 10 else
+                           {"state": "stale"} if age >= 2 else
                            {**direction, "age_ms": round(age * 1000)})
             result = {"state": "unavailable" if not calibration else
                       "running" if running else "idle",

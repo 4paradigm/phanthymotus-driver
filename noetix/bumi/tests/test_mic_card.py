@@ -18,6 +18,9 @@ def _load_device(monkeypatch):
         def create_publisher(self, message_type, topic, qos):
             return types.SimpleNamespace(publish=self.published.append)
 
+        def create_timer(self, interval, callback):
+            return types.SimpleNamespace(interval=interval, callback=callback)
+
     class String:
         def __init__(self, data=""):
             self.data = data

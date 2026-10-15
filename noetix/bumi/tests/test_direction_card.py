@@ -228,7 +228,8 @@ def test_worker_exit_clears_published_direction(monkeypatch):
     proc.exit_code = 137
     lines.put(None)
     deadline = time.monotonic() + 1
-    while not card._node.published and time.monotonic() < deadline:
+    while (not any(getattr(msg, 'state', None) == module.SoundDirection.NO_EVENT
+                   for msg in card._node.published) and time.monotonic() < deadline):
         time.sleep(0.01)
     assert card._node.published[-1].state == module.SoundDirection.NO_EVENT
     assert card._proc is None
