@@ -50,7 +50,7 @@ def test_bundle_exposes_only_one_direction_card(monkeypatch, tmp_path):
     monkeypatch.setattr(direction, 'SETTINGS_PATH', tmp_path / 'settings.json')
     assert bundle.dispatch('sound_direction', {
         'action': 'config', 'sensitivity': 'low'})['state'] == 'configured'
-    assert json.loads((tmp_path / 'settings.json').read_text())['sensitivity'] == 'low'
+    assert json.loads((tmp_path / 'settings.json').read_text())['sensitivity'] == 'noisy'
     assert bundle.dispatch('sound_direction', {'action': 'info'})['state'] == 'unavailable'
     assert bundle.dispatch('sound_direction', {'action': 'start'})['state'] == 'unavailable'
     assert bundle.dispatch('sound_direction', {'action': 'stop'}) == {'state': 'idle'}
@@ -144,11 +144,11 @@ def test_config_saves_sensitivity_and_rejects_invalid(monkeypatch, tmp_path):
     path = tmp_path / 'settings.json'
     monkeypatch.setattr(module, 'SETTINGS_PATH', path)
     card = _card(module)
-    assert card.dispatch('config', {'sensitivity': 'low'})['state'] == 'configured'
-    assert json.loads(path.read_text())['sensitivity'] == 'low'
+    assert card.dispatch('config', {'sensitivity': 'noisy'})['state'] == 'configured'
+    assert json.loads(path.read_text())['sensitivity'] == 'noisy'
     assert card.dispatch('config', {'sensitivity': 'turbo'})['state'] == 'invalid_parameters'
     assert card.dispatch('config', {'update_interval_ms': 50})['state'] == 'invalid_parameters'
-    assert json.loads(path.read_text())['sensitivity'] == 'low'
+    assert json.loads(path.read_text())['sensitivity'] == 'noisy'
     assert card.dispatch('set_parameters', {'sensitivity': 'normal'}) is None
 
 
@@ -170,7 +170,7 @@ def test_config_restarts_worker_and_waits_for_ready(monkeypatch, tmp_path):
         events.append(('spawn', module.load_parameters()))
         return Process()
     monkeypatch.setattr(module.subprocess, 'Popen', spawn)
-    result = card.dispatch('config', {'sensitivity': 'low'})
+    result = card.dispatch('config', {'sensitivity': 'noisy'})
     assert result['state'] == 'configured'
     assert events == ['stop', 'reaped', ('spawn', result['parameters'])]
 
@@ -190,9 +190,9 @@ def test_config_reports_failed_worker_restart(monkeypatch, tmp_path):
         card._proc = types.SimpleNamespace(poll=lambda: None)
         return True
     monkeypatch.setattr(card, 'start', restart)
-    result = card.dispatch('config', {'sensitivity': 'low'})
+    result = card.dispatch('config', {'sensitivity': 'noisy'})
     assert result['state'] == 'error'
-    assert starts == ['low', 'normal']
+    assert starts == ['noisy', 'normal']
     assert result['running_parameters']['sensitivity'] == 'normal'
     assert result['file_parameters']['sensitivity'] == 'normal'
     assert module.load_parameters()['sensitivity'] == 'normal'
@@ -295,10 +295,10 @@ def test_legacy_settings_file_maps_to_presets(monkeypatch, tmp_path):
     assert module.load_parameters() == {'sensitivity': 'normal'}
 
     path.write_text(json.dumps({**legacy, 'onset_ratio': 2.6}))
-    assert module.load_parameters() == {'sensitivity': 'low'}
+    assert module.load_parameters() == {'sensitivity': 'noisy'}
 
     path.write_text(json.dumps({**legacy, 'onset_ratio': 1.5}))
-    assert module.load_parameters() == {'sensitivity': 'high'}
+    assert module.load_parameters() == {'sensitivity': 'normal'}
 
     # 手调过的刷新节流一律丢弃，固定 100ms
     path.write_text(json.dumps({**legacy, 'update_interval_ms': 50}))
@@ -322,10 +322,11 @@ def test_legacy_settings_file_maps_to_presets(monkeypatch, tmp_path):
     assert module.load_parameters() == {'sensitivity': 'normal'}
 
 
-@pytest.mark.parametrize('sensitivity, below_threshold, speech_level', [
-    ('high', 78, 80), ('normal', 86, 88), ('low', 98, 100),
+@pytest.mark.parametrize('sensitivity, background, below_threshold, speech_level', [
+    ('normal', 40, 78, 80), ('noisy', 40, 118, 120),
+    ('normal', 1, 9, 10), ('noisy', 1, 19, 20),
 ])
-def test_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypatch, sensitivity, below_threshold, speech_level):
+def test_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypatch, sensitivity, background, below_threshold, speech_level):
     module = _load_card(monkeypatch)
     gate = module.SoundActivityGate(**module.SENSITIVITY_GATE_PARAMS[sensitivity])
 
@@ -334,7 +335,7 @@ def test_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypatch, 
         return module.np.stack([wave] * 4 + [module.np.zeros_like(wave)] * 4,
                                axis=1).reshape(-1)
 
-    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    assert not any(gate.accepts(frame(background)) for _ in range(8))
     assert not gate.accepts(frame(below_threshold))
     assert not gate.accepts(frame(below_threshold))
     assert not gate.accepts(frame(speech_level))
@@ -344,15 +345,13 @@ def test_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypatch, 
 def test_sensitivity_preset_table_matches_documentation(monkeypatch):
     module = _load_card(monkeypatch)
     assert module.DEFAULT_PARAMETERS == {'sensitivity': 'normal'}
-    assert set(module.SENSITIVITY_GATE_PARAMS) == {'high', 'normal', 'low'}
-    # 三档全部逐值冻结：任何一档的语义漂移都必须炸测试（含后续风扇修复的改档）。
+    assert set(module.SENSITIVITY_GATE_PARAMS) == {'normal', 'noisy'}
+    # 两档门限与工程文档保持一致。
     assert module.SENSITIVITY_GATE_PARAMS == {
-        'high':   {'onset_level': 8.0,  'onset_ratio': 2.0,
-                   'burst_level': 12.0, 'burst_ratio': 3.2},
-        'normal': {'onset_level': 10.0, 'onset_ratio': 2.2,
+        'normal': {'onset_level': 10.0, 'onset_ratio': 2.0,
                    'burst_level': 15.0, 'burst_ratio': 4.0},
-        'low':    {'onset_level': 15.0, 'onset_ratio': 2.5,
-                   'burst_level': 25.0, 'burst_ratio': 5.0},
+        'noisy':  {'onset_level': 20.0, 'onset_ratio': 3.0,
+                   'burst_level': 30.0, 'burst_ratio': 6.0},
     }
     assert module.UPDATE_INTERVAL_MS == 100
 
@@ -370,3 +369,34 @@ def test_config_rejects_legacy_key_names(monkeypatch, tmp_path):
     for bad in (['high'], {'a': 1}, 5):
         assert card.dispatch('config', {'sensitivity': bad})['state'] == 'invalid_parameters'
     assert json.loads(path.read_text()) == {'sensitivity': 'normal'}
+
+
+@pytest.mark.parametrize('old, expected', [('high', 'normal'), ('normal', 'normal'),
+                                          ('low', 'noisy'), ('noisy', 'noisy')])
+def test_old_sensitivity_values_migrate_in_files_and_config(monkeypatch, tmp_path, old, expected):
+    module = _load_card(monkeypatch)
+    path = tmp_path / 'settings.json'
+    monkeypatch.setattr(module, 'SETTINGS_PATH', path)
+    original = json.dumps({'sensitivity': old})
+    path.write_text(original)
+    assert module.load_parameters() == {'sensitivity': expected}
+    assert path.read_text() == original
+    result = _card(module).dispatch('config', {'sensitivity': old})
+    assert result == {'state': 'configured', 'parameters': {'sensitivity': expected}}
+    assert json.loads(path.read_text()) == {'sensitivity': expected}
+
+
+@pytest.mark.parametrize('sensitivity, below_burst, burst', [('normal', 159, 160), ('noisy', 239, 240)])
+def test_environment_burst_path_has_distinct_thresholds(monkeypatch, sensitivity, below_burst, burst):
+    module = _load_card(monkeypatch)
+    gate = module.SoundActivityGate(**module.SENSITIVITY_GATE_PARAMS[sensitivity])
+
+    def frame(level):
+        wave = module.np.tile([level, -level], 320)
+        return module.np.stack([wave] * 4 + [module.np.zeros_like(wave)] * 4,
+                               axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    assert not gate.accepts(frame(below_burst))
+    assert not gate.accepts(frame(40))
+    assert gate.accepts(frame(burst))

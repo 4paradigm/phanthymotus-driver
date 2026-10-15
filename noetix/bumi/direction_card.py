@@ -24,12 +24,10 @@ CALIBRATION_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_calibratio
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "resource/sound_direction_calibration.json"
 SETTINGS_PATH = Path("/opt/phanthy-motus/data/bumi/sound_direction_settings.json")
 DEFAULT_PARAMETERS = {"sensitivity": "normal"}
-# 门限档位含义由本表定义，与用户面板解耦；面板只有「灵敏度」一个旋钮。
-# onset_ratio 按操作者指定的高/中/低三档设置。
+# 门限档位含义由本表定义，面板按使用环境选择。
 SENSITIVITY_GATE_PARAMS = {
-    "high":   {"onset_level": 8.0,  "onset_ratio": 2.0, "burst_level": 12.0, "burst_ratio": 3.2},
-    "normal": {"onset_level": 10.0, "onset_ratio": 2.2, "burst_level": 15.0, "burst_ratio": 4.0},
-    "low":    {"onset_level": 15.0, "onset_ratio": 2.5, "burst_level": 25.0, "burst_ratio": 5.0},
+    "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
+    "noisy":  {"onset_level": 20.0, "onset_ratio": 3.0, "burst_level": 30.0, "burst_ratio": 6.0},
 }
 # 方向刷新节流固定现行默认 100ms，不再暴露给操作者（操作者决定 2026-10-14）。
 UPDATE_INTERVAL_MS = 100
@@ -68,6 +66,10 @@ def _valid_parameter(name: str, value) -> bool:
             and value in SENSITIVITY_GATE_PARAMS)
 
 
+def _normalize_sensitivity(value):
+    return {"high": "normal", "low": "noisy"}.get(value, value) if isinstance(value, str) else value
+
+
 def _migrate_legacy(saved: dict) -> dict | None:
     """Map a legacy 5-key settings file onto presets in memory; never written back."""
     if set(saved) != set(_LEGACY_KEYS):
@@ -84,13 +86,11 @@ def _migrate_legacy(saved: dict) -> dict | None:
 
     if any(not legacy_ok(key, saved[key]) for key in _LEGACY_KEYS):
         return None
-    # 就近归档到三档灵敏度；update_interval_ms 丢弃，刷新固定 100ms。
+    # 保留旧三档的归档边界，再将旧 high/normal 合并为普通环境。
     ratio = saved["onset_ratio"]
-    if ratio <= 1.75:
-        return {"sensitivity": "high"}
     if ratio < 2.25:
         return {"sensitivity": "normal"}
-    return {"sensitivity": "low"}
+    return {"sensitivity": "noisy"}
 
 
 def load_parameters() -> dict:
@@ -102,6 +102,7 @@ def load_parameters() -> dict:
         return DEFAULT_PARAMETERS.copy()
     try:
         if set(saved) == set(DEFAULT_PARAMETERS):
+            saved["sensitivity"] = _normalize_sensitivity(saved["sensitivity"])
             if all(_valid_parameter(key, value) for key, value in saved.items()):
                 return dict(saved)
             return DEFAULT_PARAMETERS.copy()
@@ -248,16 +249,15 @@ class SoundDirectionPlugin:
                 "action": {"type": "string", "enum": ["info", "start", "stop"]}}},
             "configSchema": {"type": "object", "properties": {
                 "sensitivity": {
-                    "type": "string", "title": "灵敏度",
+                    "type": "string", "title": "使用环境",
                     "default": "normal", "scope": "shared",
                     "oneOf": [
-                        {"const": "high",   "title": "高：安静房间 / 轻声说话也要识别"},
-                        {"const": "normal", "title": "中：普通室内（默认）"},
-                        {"const": "low",    "title": "低：嘈杂环境 / 只需大声说话"},
+                        {"const": "normal", "title": "普通环境"},
+                        {"const": "noisy",  "title": "嘈杂环境"},
                     ],
                     "description": (
-                        "多大声会被当成有人说话。轻声说话经常没反应选「高」；"
-                        "环境动静大、一点声音就出方向选「低」。"
+                        "普通环境：日常室内使用，优先识别正常音量说话。"
+                        "嘈杂环境：风扇或环境噪声较大时使用，需要更靠近或更大声说话。"
                     ),
                 }}},
             "topic_out": [{"topic": self._topic, "format": "sensor/sound-direction"}],
@@ -348,6 +348,8 @@ class SoundDirectionPlugin:
                     return {"state": "invalid_parameters"}
                 changes = {key: value for key, value in changes.items()
                            if value is not None and value != ""}
+                if "sensitivity" in changes:
+                    changes["sensitivity"] = _normalize_sensitivity(changes["sensitivity"])
                 if not changes or any(not _valid_parameter(key, value)
                                       for key, value in changes.items()):
                     return {"state": "invalid_parameters"}

@@ -17,7 +17,10 @@ def test_only_sensor_card_and_shared_settings(monkeypatch):
     assert set(tool['configSchema']['properties']) == set(module.DEFAULT_PARAMETERS)
     assert all(field['scope'] == 'shared' for field in tool['configSchema']['properties'].values())
     sensitivity = tool['configSchema']['properties']['sensitivity']
-    assert sensitivity['oneOf'] and all('title' in item for item in sensitivity['oneOf'])
+    assert sensitivity['oneOf'] == [
+        {'const': 'normal', 'title': '普通环境'},
+        {'const': 'noisy', 'title': '嘈杂环境'},
+    ]
     assert sensitivity.get('description')
     assert tool['inputSchema']['properties']['action']['enum'] == ['info', 'start', 'stop']
 

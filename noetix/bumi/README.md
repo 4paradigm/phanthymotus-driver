@@ -39,11 +39,10 @@ Saving it restarts a running direction worker and waits for it to become ready.
 | --- | --- | --- |
 | `sensitivity` | `normal` | How loud a sound must be to count as someone speaking |
 
-Sensitivity presets (choose by room, not by gear knowledge):
+Environment presets:
 
-- **高** — 安静房间 / 轻声说话也要识别
-- **中** — 普通室内（默认）
-- **低** — 嘈杂环境 / 只需大声说话
+- **普通环境** (`normal`, default) — 日常室内使用，优先识别正常音量说话。
+- **嘈杂环境** (`noisy`) — 风扇或环境噪声较大时使用，需要更靠近或更大声说话。
 
 The publish throttle is fixed at 100 ms (about 10 updates per second) and
 is no longer operator-adjustable. Gate thresholds per preset live in the
@@ -54,10 +53,13 @@ engineer appendix below.
 The legacy 5-key file at `/opt/phanthy-motus/data/bumi/sound_direction_settings.json`
 (`onset_level` / `onset_ratio` / `burst_level` / `burst_ratio` /
 `update_interval_ms`) is still read after upgrade: it maps **in memory** to
-the nearest sensitivity preset (`onset_ratio` ≤1.75→high, <2.25→normal,
-otherwise low) and is never rewritten — the file keeps its old shape until
+an environment preset (`onset_ratio` <2.25→normal, otherwise noisy) and is never rewritten — the file keeps its old shape until
 the operator saves the config once. `update_interval_ms` is dropped; the
 throttle stays at 100 ms regardless of any hand-tuned 50/300 value.
+
+旧三档值 `high` / `normal` 映射为 `normal`，`low` 映射为 `noisy`，
+读取设置文件和接收配置请求时都会兼容转换。读取不回写，保存会写入新值。
+升级后请在齿轮面板重新选择并保存一次，将画布保留的旧值更新为新值。
 
 Rolling back to an older image: before the first config save the old image
 reads the legacy file as before; after a save the old key-set check falls
@@ -69,15 +71,15 @@ platform, not migrated.
 
 ```
 SENSITIVITY_GATE_PARAMS = {
-    "high":   {"onset_level": 8.0,  "onset_ratio": 2.0, "burst_level": 12.0, "burst_ratio": 3.2},
-    "normal": {"onset_level": 10.0, "onset_ratio": 2.2, "burst_level": 15.0, "burst_ratio": 4.0},
-    "low":    {"onset_level": 15.0, "onset_ratio": 2.5, "burst_level": 25.0, "burst_ratio": 5.0},
+    "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
+    "noisy":  {"onset_level": 20.0, "onset_ratio": 3.0, "burst_level": 30.0, "burst_ratio": 6.0},
 }
 UPDATE_INTERVAL_MS = 100
 ```
 
 Preset meaning is defined by this table, not by the panel wording. The
-onset ratios are 2.0 / 2.2 / 2.5 for high / normal / low. Sensitivity
+noisy preset doubles both absolute level floors and raises both background
+ratios by 50% compared with normal. Sensitivity
 only adjusts how easily sounds trigger; it does **not** remove fan-noise
 false angles (known, unfixed).
 
