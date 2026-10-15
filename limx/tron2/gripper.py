@@ -114,6 +114,7 @@ class Gripper:
         self.recovering = False
         self.recovery_task = None
         self.waiting = None
+        self.handover_cancel = None
 
     def info(self):
         age = None if self.sample is None else max(0, time.monotonic() - self.sample[0])
@@ -130,7 +131,8 @@ class Gripper:
                 'motion_sent': False, 'available': available,
                 'reception_age_seconds': age, 'data': self.sample[1] if available else None,
                 'motion': motion, 'recovering': self.recovering,
-                'waiting_action': self.waiting['action'] if self.waiting else None,
+                'waiting_action': self.waiting['action'] if self.waiting else
+                    'close' if self.handover_cancel else None,
                 'can_accept_motion': not self.closed and not self.active and not self.recovering and
                     not self.waiting and
                     self.reader.connected and not (self.peer and (self.peer.closed or self.peer.active)),
@@ -141,7 +143,15 @@ class Gripper:
         self.sample = (time.monotonic(), data, self.reader.ws, self.reader.serial)
         return {**self.info(), 'read_only': True}
 
-    async def recover(self, args):
+    def check_close_handover(self, job):
+        last = self.last or {}
+        if job.get('action') != 'open' or last.get('action_id') != job['action_id'] or \
+                last.get('status') != 'error' or last.get('error_code') != 'target_not_reached' or \
+                job.get('vendor_acknowledged') is not True or last.get('motion_sent') is not True:
+            raise self.blocked_error()
+        self.same_session(job)
+
+    async def recover(self, args, *, close_handover=False):
         args = recovery_arguments(args)
         await self.wait_previous('recover', allow_blocked=True)
         if self.closed or self.recovering or self.peer and (self.peer.closed or self.peer.active):
@@ -152,15 +162,22 @@ class Gripper:
         if job['state'] != 'blocked_requires_operator_check' or \
                 self.task and not self.task.done() or not self.last or self.last['action_id'] != job['action_id']:
             raise MoveError('本侧任务仍在执行或报告时不能恢复', False)
+        if close_handover:
+            self.check_close_handover(job)
         self.recovering = True
         # Completion belongs to this recovery operation, not its HTTP caller's
         # lifetime (which may continue after recover returns).
         self.recovery_task = asyncio.get_running_loop().create_future()
+        cancellation = asyncio.Event()
+        if close_handover:
+            self.handover_cancel = cancellation
         try:
             ws, serial = self.reader.ws, self.reader.serial
             deadline = time.monotonic() + RECOVERY_TIMEOUT
             start = None; count = 0; previous = None; stamp = None
             while time.monotonic() < deadline:
+                if close_handover and (self.closed or cancellation.is_set()):
+                    raise MoveError('已取消关闭接替检查，未发送关闭指令', False)
                 if not self.reader.connected or self.reader.ws is not ws or self.reader.serial != serial:
                     raise ValueError('恢复期间连接发生变化，请重新检查；未解除任务保护')
                 state = (await self.read_state())['data']
@@ -196,9 +213,11 @@ class Gripper:
                     raise ValueError('原任务结果仍无法通知平台，未解除任务保护')
                 self.last['callback_delivered'] = True
             if self.closed or self.reader.ws is not ws or self.reader.serial != serial or not self.reader.connected or \
-                    self.peer and (self.peer.closed or self.peer.active):
+                    self.peer and (self.peer.closed or self.peer.active) or cancellation.is_set():
                 raise ValueError('恢复期间驱动、连接或机械臂状态变化，未解除任务保护')
-            self.last['operator_recovery'] = {'side': self.side,
+            if close_handover:
+                self.check_close_handover(job)
+            self.last['close_handover' if close_handover else 'operator_recovery'] = {'side': self.side,
                 'reported_stationary_verified': True, 'verified_samples': count,
                 'observed_opening': state[self.side]['opening'], 'vendor_timestamp_ms': stamp,
                 'motion_sent': False, 'recovered_at': time.time()}
@@ -211,11 +230,14 @@ class Gripper:
             self.recovering = False
             self.recovery_task.set_result(None)
             self.recovery_task = None
+            self.handover_cancel = None
 
     def cancel_waiting(self):
         # Cancels only a request not yet admitted. Never claims to stop a motor.
         if self.waiting:
             self.waiting['cancel'].set()
+        if self.handover_cancel:
+            self.handover_cancel.set()
 
     def blocked_error(self):
         job = self.active or {}
@@ -229,7 +251,7 @@ class Gripper:
     async def wait_previous(self, action, allow_blocked=False):
         if self.closed:
             raise MoveError('夹爪驱动已关闭，后续指令未发送', False)
-        if self.waiting:
+        if self.waiting or self.handover_cancel:
             raise MoveError('本侧已有一条后续指令等待，请勿重复提交', False)
         previous = self.recovery_task if self.recovering else self.task if self.active else None
         if previous and not previous.done():
@@ -262,7 +284,19 @@ class Gripper:
 
     async def dispatch(self, action, args):
         data = command(action, args, self.side)
-        await self.wait_previous(action)
+        await self.wait_previous(action, allow_blocked=action == 'close')
+        previous_error = None
+        if self.active:
+            failed = self.active
+            # A NEW explicit close may supersede only an acknowledged open
+            # that missed its target. Preserve its failed outcome; never retry
+            # an uncertain ACK, reinterpret a fault, or call94 an achieved100.
+            self.check_close_handover(failed)
+            await self.recover({}, close_handover=True)
+            self.same_session(failed)
+            previous_error = {k:self.last[k] for k in ('action_id','action','status','error','error_code',
+                'target_opening','reported_opening','target_opening_verified','callback_delivered','close_handover')
+                if k in self.last}
         if self.peer and self.peer.active and self.peer.active['state'] == 'reporting' and self.peer.active.get('arrival_verified'):
             await asyncio.shield(self.peer.task)
         if self.peer and (self.peer.closed or self.peer.active):
@@ -273,7 +307,10 @@ class Gripper:
         future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
         job = {'action_id': 'tron2_gripper_' + uuid4().hex, 'action': action, 'side': self.side,
                'target': data[self.side + '_opening'], 'state': 'checking', 'admission': future,
-               'ws': self.reader.ws, 'serial': self.reader.serial, 'motion_sent': False}
+               'ws': self.reader.ws, 'serial': self.reader.serial, 'motion_sent': False,
+               'vendor_acknowledged': False}
+        if previous_error:
+            job['previous_action_error'] = previous_error
         self.active = job
         self.task = asyncio.create_task(self._run(job, data))
         return await asyncio.shield(future)
@@ -312,8 +349,9 @@ class Gripper:
             else:
                 start = None; matches = 0
             await asyncio.sleep(POLL_SECONDS)
-        raise ValueError('未确认达到目标开口'+str(job['target'])+'，最近反馈'+str(job.get('reported_opening'))+
-                         '；检查实物停止后可使用recover恢复。未确认抓取成功')
+        raise MoveError('未确认达到目标开口'+str(job['target'])+'，最近反馈'+str(job.get('reported_opening'))+
+                        '；检查实物停止后可使用recover恢复。未确认抓取成功',
+                        job['motion_sent'], 'target_not_reached')
 
     async def _run(self, job, data):
         admitted = False
@@ -333,6 +371,7 @@ class Gripper:
                 try:
                     await self.reader.send_gripper(data)
                     job['motion_sent'] = True
+                    job['vendor_acknowledged'] = True
                 except MoveError as exc:
                     job['motion_sent'] = exc.motion_sent
                     if exc.motion_sent is False or exc.code == 'vendor_rejected':
@@ -347,6 +386,7 @@ class Gripper:
                 'target_opening_verified': False, 'grasp_verified': False,
                 'can_accept_motion': False,
                 'message': '指令已受理，仍在等待目标反馈和完成回调；本侧下一条指令会等待本条确认',
+                **({'previous_action_error': job['previous_action_error']} if 'previous_action_error' in job else {}),
                 'completion_protocol': 'acp'})
             result = await self.verify_target(job)
             status = 'completed'
@@ -359,7 +399,7 @@ class Gripper:
                 self.active = None
                 job['admission'].set_exception(exc)
                 return
-            result, status = {'error': str(exc)}, 'error'
+            result, status = {'error': str(exc), 'error_code': getattr(exc, 'code', None)}, 'error'
         if not job['admission'].done():
             job['admission'].set_result({'action_id': job['action_id'], 'state': 'result_unconfirmed',
                 'motion_sent': job['motion_sent'], 'target_opening_verified': False,
@@ -367,7 +407,9 @@ class Gripper:
         result.update(action=job['action'], side=job['side'], target_opening=job['target'],
                       motion_sent=job['motion_sent'], grasp_verified=False,
                       motion_may_continue=status != 'completed' and job['motion_sent'] is not False,
-                      no_op=bool(job.get('no_op')))
+                      no_op=bool(job.get('no_op')), vendor_acknowledged=job['vendor_acknowledged'])
+        if 'previous_action_error' in job:
+            result['previous_action_error'] = job['previous_action_error']
         result.setdefault('target_opening_verified', False)
         result.update({k: job[k] for k in ('reported_opening','reported_speed') if k in job})
         if status != 'completed':
