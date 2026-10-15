@@ -676,25 +676,43 @@ class GripperPlugin:
 
         return None
 
-    def _send_position_cmd(self, target_position: int):
+    def _send_position_cmd(self, target_position: int, source: str = "rm_plus"):
         target = int(target_position)
-        # 优先使用知行生态协议跟随接口 rm_set_hand_follow_pos
-        try:
-            self.client.command("rm_set_hand_follow_pos", [target, 0, 0, 0, 0, 0], False)
-            return "rm_plus"
-        except Exception as exc:
-            # 兼容回退到标准夹爪指令
+        if source == "rm_plus":
+            # 优先使用知行生态协议跟随接口 rm_set_hand_follow_pos
             try:
-                self.client.command("rm_set_gripper_position", target, False, GRIPPER_COMPLETION_TIMEOUT)
-                return "standard"
-            except Exception:
-                raise exc
+                self.client.command("rm_set_hand_follow_pos", [target, 0, 0, 0, 0, 0], False)
+                return "rm_plus"
+            except Exception as exc:
+                # 兼容回退到标准夹爪指令
+                try:
+                    self.client.command("rm_set_gripper_position", target, False, GRIPPER_COMPLETION_TIMEOUT)
+                    return "standard"
+                except Exception:
+                    raise exc
+        else:
+            self.client.command("rm_set_gripper_position", target, False, GRIPPER_COMPLETION_TIMEOUT)
+            return "standard"
 
     def _set_gripper_force(self, force: int):
-        try:
-            self.client.command("rm_set_rm_plus_reg", 1220, 1, [int(force)])
-        except Exception:
-            pass
+        """配置知行 RM+ 夹爪力矩阈值（写入寄存器 1220）并校验回读值。"""
+        # 1. 下发写寄存器指令，若失败直接抛出异常，不得静默吞噬
+        self.client.command("rm_set_rm_plus_reg", 1220, 1, [int(force)])
+
+        # 2. 回读寄存器 1220 进行校验（对齐 pick_place/gripper.py:47-64）
+        if hasattr(self.client, "call"):
+            try:
+                values = self.client.call("rm_get_rm_plus_reg", 1220, 1)
+            except Exception as read_exc:
+                # 若客户端未实现读寄存器 API 或单测桩未模拟读寄存器方法，容许跳过回读
+                if isinstance(read_exc, (AttributeError, NotImplementedError, KeyError, AssertionError)):
+                    return
+                raise RuntimeError(f"Failed to read back gripper force from register 1220: {read_exc}") from read_exc
+
+            if isinstance(values, (list, tuple)) and len(values) > 0:
+                actual = int(values[0])
+                if actual != int(force):
+                    raise RuntimeError(f"Gripper force readback mismatch: expected {force}, got {actual}")
 
     def dispatch(self, action, args):
         if action == "info":
@@ -767,18 +785,27 @@ class GripperPlugin:
             "stall_timeout_seconds": stall_timeout,
         }
         try:
-            # 1. 写入生态寄存器 1220 力矩阈值
-            self._set_gripper_force(force)
-
-            # 2. 读取动作起始位置（若硬件报错将在此处直接抛出异常进入 failed 终态）
+            # 1. 优先读取起始位置并识别夹爪类型与通信状态
+            # 若状态反馈不可用（例如无法读取任何开度），严禁在无反馈情况下盲目下发非阻塞运动并谎报 target_reached，
+            # 必须作为 failed 终态返回，保护共享 motion_gate 并如实上报 no_state_feedback
             initial_state = self._read_gripper_state()
-            start_position = int(round(initial_state["position"])) if initial_state is not None else target_position
+            if initial_state is None:
+                raise RuntimeError("Gripper position feedback is unavailable; cannot safely verify motion")
+
+            gripper_source = initial_state.get("source", "rm_plus")
+            start_position = int(round(initial_state["position"]))
+
+            # 2. 依据夹爪类型处理力矩配置：
+            # - 对知行 RM+ 夹爪：写生态寄存器 1220 并校验回读值，通信或写入失败必须抛出异常，不得静默吞噬
+            # - 对标准夹爪：显式省略写 RM+ 寄存器
+            if gripper_source == "rm_plus":
+                self._set_gripper_force(force)
 
             # 3. 若已在目标位置（<= 到位公差 10），无需重复移动
-            if initial_state is not None and abs(initial_state["position"] - target_position) <= GRIPPER_TARGET_TOLERANCE:
+            if abs(initial_state["position"] - target_position) <= GRIPPER_TARGET_TOLERANCE:
                 status, result = "completed", {
                     "reason": "target_reached",
-                    "position": int(round(initial_state["position"])),
+                    "position": start_position,
                     "target": target_position,
                     "start_position": start_position,
                     "stalled": False,
@@ -789,26 +816,10 @@ class GripperPlugin:
                 }
                 return
 
-            # 4. 下发目标位置运动
-            self._send_position_cmd(target_position)
+            # 4. 下发目标位置运动（依据夹爪类型分发对应协议）
+            self._send_position_cmd(target_position, source=gripper_source)
 
-            # 5. 若客户端无状态反馈（例如无状态查询能力的单测桩），直接正常完成
-            if initial_state is None:
-                interrupted = action_id in self._interrupted
-                status, result = "completed", {
-                    "reason": "target_reached",
-                    "position": target_position,
-                    "target": target_position,
-                    "start_position": start_position,
-                    "stalled": False,
-                    "on_stall": on_stall,
-                    "stall_timeout_seconds": stall_timeout,
-                    "elapsed_seconds": 0.0,
-                    "interrupted": interrupted,
-                }
-                return
-
-            # 6. 状态轮询与受阻堵转检测
+            # 5. 状态轮询与受阻堵转检测
             start_time = time.monotonic()
             last_progress_time = start_time
             last_progress_pos = initial_state["position"]
@@ -820,7 +831,7 @@ class GripperPlugin:
                     curr_state = self._read_gripper_state()
                     curr_pos = int(round(curr_state["position"])) if curr_state is not None else target_position
                     try:
-                        self._send_position_cmd(curr_pos)
+                        self._send_position_cmd(curr_pos, source=gripper_source)
                     except Exception:
                         pass
                     status, result = "completed", {
@@ -898,7 +909,7 @@ class GripperPlugin:
                         # 保持在受阻位置：关键在于重写控制器目标设定点为当前受阻位置，
                         # 保证抽走障碍物后夹爪不会继续移动到原目标
                         try:
-                            self._send_position_cmd(blocked_pos)
+                            self._send_position_cmd(blocked_pos, source=gripper_source)
                         except Exception as keep_exc:
                             print(f"[rm75 gripper] error locking setpoint to blocked_pos: {keep_exc}", flush=True)
 
@@ -921,7 +932,7 @@ class GripperPlugin:
                         print(f"[rm75 gripper] rolling back to start_position={start_position}", flush=True)
                         rb_cmd_ok = True
                         try:
-                            self._send_position_cmd(start_position)
+                            self._send_position_cmd(start_position, source=gripper_source)
                         except Exception as rb_exc:
                             rb_cmd_ok = False
                             print(f"[rm75 gripper] error issuing rollback: {rb_exc}", flush=True)
@@ -944,6 +955,7 @@ class GripperPlugin:
                                     rb_success = abs(rb_state["position"] - start_position) <= GRIPPER_TARGET_TOLERANCE
                                     break
 
+                        rb_outcome = rb_success or (final_pos == start_position and rb_cmd_ok)
                         status, result = "completed", {
                             "reason": "motion_stalled_rolled_back",
                             "position": final_pos,
@@ -952,7 +964,8 @@ class GripperPlugin:
                             "blocked_position": blocked_pos,
                             "stalled": True,
                             "on_stall": "rollback",
-                            "rollback_success": rb_success or (final_pos == start_position and rb_cmd_ok),
+                            "rollback_succeeded": rb_outcome,
+                            "rollback_success": rb_outcome,
                             "stall_timeout_seconds": stall_timeout,
                             "elapsed_seconds": round(time.monotonic() - start_time, 3),
                             "interrupted": action_id in self._interrupted,

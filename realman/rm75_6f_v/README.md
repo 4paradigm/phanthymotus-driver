@@ -165,7 +165,7 @@ The `gripper` card exposes position control for RealMan two-finger end-effectors
 
 ### Force and stall parameters
 
-- `force`: integer from `10` to `100` (default `20`). Configures the ZX gripper torque threshold written to ecosystem register `1220`. Values below `10` are rejected because they fall inside the mechanical static friction deadband and cannot reliably drive motion.
+- `force`: integer from `10` to `100` (default `20`). Configures the ZX gripper torque threshold written to ecosystem register `1220` (and verified via readback). Values below `10` are rejected because they fall inside the mechanical static friction deadband and cannot reliably drive motion. Force configuration failures on RM+ grippers immediately fail the action. Standard grippers omit register 1220 force configuration.
 - `on_stall`: protection policy when the gripper is blocked during movement:
   - `keep` (default): keeps the gripper at the blocked position. Crucially, it updates the controller setpoint to the blocked position so that removing the obstacle does not cause the gripper to jump forward toward the original target.
   - `rollback`: automatically and safely backs off to the start position recorded before the motion began.
@@ -182,8 +182,8 @@ Following the standard asynchronous ACP contract (`x-completion`):
      - `motion_stalled_kept`: stalled and locked at blocked position.
      - `motion_stalled_rolled_back`: stalled and returned to start position.
      - `interrupted`: stopped during execution.
-   - `status: "failed"` with reason (e.g., hardware fault or timeout).
-4. Full completion details (including `position`, `target`, `start_position`, `blocked_position`, `stalled`, `on_stall`, `stall_timeout_seconds`, `elapsed_seconds`) are preserved in the completion payload and queryable via `gripper.info` under `last_completion`.
+   - `status: "failed"` with reason (e.g., feedback unavailable, hardware fault, or timeout).
+4. Full completion details (including `position`, `target`, `start_position`, `blocked_position`, `stalled`, `on_stall`, `rollback_succeeded`, `stall_timeout_seconds`, `elapsed_seconds`) are preserved in the completion payload and queryable via `gripper.info` under `last_completion`.
 
 ### Hardware fault detection and recovery limitations
 
