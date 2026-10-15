@@ -167,8 +167,8 @@ The `gripper` card exposes position control for RealMan two-finger end-effectors
 
 - `force`: integer from `10` to `100` (default `20`). Configures the ZX gripper torque threshold written to ecosystem register `1220` (and verified via readback). Values below `10` are rejected because they fall inside the mechanical static friction deadband and cannot reliably drive motion. Force configuration failures on RM+ grippers immediately fail the action. Standard grippers omit register 1220 force configuration.
 - `on_stall`: protection policy when the gripper is blocked during movement:
-  - `keep` (default): keeps the gripper at the blocked position. Crucially, it updates the controller setpoint to the blocked position so that removing the obstacle does not cause the gripper to jump forward toward the original target.
-  - `rollback`: automatically and safely backs off to the start position recorded before the motion began.
+  - `keep` (default): keeps the gripper at the blocked position. Crucially, it updates the controller setpoint to the blocked position so that removing the obstacle does not cause the gripper to jump forward toward the original target. If updating the setpoint command fails, the action reports `status: "failed"` with `stall_keep_failed` to prevent claiming an insecure setpoint.
+  - `rollback`: automatically and safely backs off to the start position recorded before the motion began. If issuing the rollback command fails (`rollback_command_failed`) or the gripper fails to reach the start position (`rollback_failed`), the action reports `status: "failed"` with `rollback_succeeded: false`.
 - `stall_timeout_seconds`: floating-point number between `0.5` and `30.0` seconds (default `3.0`). Defines the idle timeout without position progress (>10 units deadband) before motion is declared stalled.
 
 ### Completion semantics and ACP contract
@@ -180,14 +180,15 @@ Following the standard asynchronous ACP contract (`x-completion`):
    - `status: "completed"` with reason:
      - `target_reached`: reached target within tolerance (<= 10 units).
      - `motion_stalled_kept`: stalled and locked at blocked position.
-     - `motion_stalled_rolled_back`: stalled and returned to start position.
+     - `motion_stalled_rolled_back`: stalled and returned to start position successfully (`rollback_succeeded: true`).
      - `interrupted`: stopped during execution.
-   - `status: "failed"` with reason (e.g., feedback unavailable, hardware fault, or timeout).
-4. Full completion details (including `position`, `target`, `start_position`, `blocked_position`, `stalled`, `on_stall`, `rollback_succeeded`, `stall_timeout_seconds`, `elapsed_seconds`) are preserved in the completion payload and queryable via `gripper.info` under `last_completion`.
+   - `status: "failed"` with reason (e.g., feedback unavailable or lost during motion, hardware fault, timeout, `stall_keep_failed`, `rollback_command_failed`, or `rollback_failed`).
+4. Full completion details (including `position` / `final_position`, `target` / `requested_position`, `start_position`, `blocked_position`, `stalled`, `on_stall`, `rollback_succeeded`, `force`, `mode`, `error`, `stall_timeout_seconds`, `elapsed_seconds`) are preserved in the completion payload and queryable via `gripper.info` under `last_completion`.
 
 ### Hardware fault detection and recovery limitations
 
 - RM+ feedback validation: the driver inspects `sys_state` and `dof_err` from `rm_get_rm_plus_state_info`. If `sys_state != 0` or any `dof_err != 0` is reported by the controller, the driver raises an error and terminates with `status: "failed"` rather than mistaking hardware failure for a mechanical stall.
+- Continuous feedback loss: if feedback samples drop continuously for 1.0 second during motion, the action aborts immediately with `status: "failed"` and reports the last known observed position rather than inventing the target position.
 - The standard SDK provides no dedicated pre-emptive gripper cancel API; calling `stop` marks the action interrupted and waits for the ongoing command to conclude in a safe terminal state before releasing locks.
 
 The HTTP service listens on port `15718` and provides `/health` and `/mcp`.

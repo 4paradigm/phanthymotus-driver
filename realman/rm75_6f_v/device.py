@@ -807,12 +807,17 @@ class GripperPlugin:
                     "reason": "target_reached",
                     "position": start_position,
                     "target": target_position,
+                    "requested_position": target_position,
+                    "final_position": start_position,
                     "start_position": start_position,
                     "stalled": False,
                     "on_stall": on_stall,
                     "stall_timeout_seconds": stall_timeout,
                     "elapsed_seconds": 0.0,
                     "interrupted": action_id in self._interrupted,
+                    "force": force,
+                    "mode": gripper_source,
+                    "error": None,
                 }
                 return
 
@@ -823,13 +828,16 @@ class GripperPlugin:
             start_time = time.monotonic()
             last_progress_time = start_time
             last_progress_pos = initial_state["position"]
+            last_known_pos = start_position
+            consecutive_missing_feedback = 0
+            MAX_CONSECUTIVE_MISSING_FEEDBACK = 10  # 连续 10 次（1.0秒）读取不到反馈判定为通信中断
             poll_interval = 0.1
             start_grace = 0.5  # 启动宽限期（0.5秒），避免刚启动时 dof_state 瞬态判定为停止
 
             while True:
                 if action_id in self._interrupted:
                     curr_state = self._read_gripper_state()
-                    curr_pos = int(round(curr_state["position"])) if curr_state is not None else target_position
+                    curr_pos = int(round(curr_state["position"])) if curr_state is not None else last_known_pos
                     try:
                         self._send_position_cmd(curr_pos, source=gripper_source)
                     except Exception:
@@ -838,51 +846,72 @@ class GripperPlugin:
                         "reason": "interrupted",
                         "position": curr_pos,
                         "target": target_position,
+                        "requested_position": target_position,
+                        "final_position": curr_pos,
                         "start_position": start_position,
                         "stalled": False,
                         "on_stall": on_stall,
                         "stall_timeout_seconds": stall_timeout,
                         "elapsed_seconds": round(time.monotonic() - start_time, 3),
                         "interrupted": True,
+                        "force": force,
+                        "mode": gripper_source,
+                        "error": None,
                     }
                     break
 
                 if time.monotonic() - start_time > GRIPPER_COMPLETION_TIMEOUT:
                     curr_state = self._read_gripper_state()
-                    curr_pos = int(round(curr_state["position"])) if curr_state is not None else target_position
+                    curr_pos = int(round(curr_state["position"])) if curr_state is not None else last_known_pos
                     status, result = "failed", {
                         "reason": f"motion timed out after {GRIPPER_COMPLETION_TIMEOUT}s",
                         "position": curr_pos,
                         "target": target_position,
+                        "requested_position": target_position,
+                        "final_position": curr_pos,
                         "start_position": start_position,
                         "stalled": False,
                         "on_stall": on_stall,
                         "stall_timeout_seconds": stall_timeout,
                         "elapsed_seconds": round(time.monotonic() - start_time, 3),
                         "interrupted": action_id in self._interrupted,
+                        "force": force,
+                        "mode": gripper_source,
+                        "error": f"motion timed out after {GRIPPER_COMPLETION_TIMEOUT}s",
                     }
                     break
 
                 time.sleep(poll_interval)
                 state = self._read_gripper_state()
                 if state is None:
+                    consecutive_missing_feedback += 1
+                    if consecutive_missing_feedback >= MAX_CONSECUTIVE_MISSING_FEEDBACK:
+                        raise RuntimeError(f"Gripper position feedback lost for {consecutive_missing_feedback * poll_interval:.1f}s during motion; aborting for safety")
                     continue
+                consecutive_missing_feedback = 0
 
                 current_pos = state["position"]
+                last_known_pos = int(round(current_pos))
                 dist_to_target = abs(current_pos - target_position)
 
                 # 到位判定（公差 10）
                 if dist_to_target <= GRIPPER_TARGET_TOLERANCE:
+                    curr_pos = int(round(current_pos))
                     status, result = "completed", {
                         "reason": "target_reached",
-                        "position": int(round(current_pos)),
+                        "position": curr_pos,
                         "target": target_position,
+                        "requested_position": target_position,
+                        "final_position": curr_pos,
                         "start_position": start_position,
                         "stalled": False,
                         "on_stall": on_stall,
                         "stall_timeout_seconds": stall_timeout,
                         "elapsed_seconds": round(time.monotonic() - start_time, 3),
                         "interrupted": action_id in self._interrupted,
+                        "force": force,
+                        "mode": gripper_source,
+                        "error": None,
                     }
                     break
 
@@ -908,58 +937,118 @@ class GripperPlugin:
                     if on_stall == "keep":
                         # 保持在受阻位置：关键在于重写控制器目标设定点为当前受阻位置，
                         # 保证抽走障碍物后夹爪不会继续移动到原目标
+                        keep_ok = True
+                        keep_err = None
                         try:
                             self._send_position_cmd(blocked_pos, source=gripper_source)
                         except Exception as keep_exc:
+                            keep_ok = False
+                            keep_err = str(keep_exc)
                             print(f"[rm75 gripper] error locking setpoint to blocked_pos: {keep_exc}", flush=True)
 
-                        status, result = "completed", {
-                            "reason": "motion_stalled_kept",
-                            "position": blocked_pos,
-                            "target": target_position,
-                            "start_position": start_position,
-                            "blocked_position": blocked_pos,
-                            "stalled": True,
-                            "on_stall": "keep",
-                            "stall_timeout_seconds": stall_timeout,
-                            "elapsed_seconds": round(time.monotonic() - start_time, 3),
-                            "interrupted": action_id in self._interrupted,
-                        }
+                        if not keep_ok:
+                            # 设定点重写失败：控制器仍处于原始运动状态，移走障碍物可能继续闭合，必须上报失败终态
+                            status, result = "failed", {
+                                "reason": f"stall_keep_failed: {keep_err}",
+                                "position": blocked_pos,
+                                "target": target_position,
+                                "requested_position": target_position,
+                                "final_position": blocked_pos,
+                                "start_position": start_position,
+                                "blocked_position": blocked_pos,
+                                "stalled": True,
+                                "on_stall": "keep",
+                                "stall_timeout_seconds": stall_timeout,
+                                "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                                "interrupted": action_id in self._interrupted,
+                                "force": force,
+                                "mode": gripper_source,
+                                "error": keep_err,
+                            }
+                        else:
+                            status, result = "completed", {
+                                "reason": "motion_stalled_kept",
+                                "position": blocked_pos,
+                                "target": target_position,
+                                "requested_position": target_position,
+                                "final_position": blocked_pos,
+                                "start_position": start_position,
+                                "blocked_position": blocked_pos,
+                                "stalled": True,
+                                "on_stall": "keep",
+                                "stall_timeout_seconds": stall_timeout,
+                                "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                                "interrupted": action_id in self._interrupted,
+                                "force": force,
+                                "mode": gripper_source,
+                                "error": None,
+                            }
                         break
 
                     elif on_stall == "rollback":
                         # 回滚至动作起始位置
                         print(f"[rm75 gripper] rolling back to start_position={start_position}", flush=True)
                         rb_cmd_ok = True
+                        rb_cmd_err = None
                         try:
                             self._send_position_cmd(start_position, source=gripper_source)
                         except Exception as rb_exc:
                             rb_cmd_ok = False
+                            rb_cmd_err = str(rb_exc)
                             print(f"[rm75 gripper] error issuing rollback: {rb_exc}", flush=True)
 
                         rb_start = time.monotonic()
                         rb_timeout = 10.0
-                        final_pos = start_position
+                        final_pos = blocked_pos
                         rb_success = False
-                        while time.monotonic() - rb_start < rb_timeout:
-                            if action_id in self._interrupted:
-                                break
-                            time.sleep(poll_interval)
-                            rb_state = self._read_gripper_state()
-                            if rb_state is not None:
-                                final_pos = int(round(rb_state["position"]))
-                                if abs(rb_state["position"] - start_position) <= GRIPPER_TARGET_TOLERANCE:
-                                    rb_success = True
+                        rb_interrupted = False
+                        consecutive_rb_missing = 0
+                        if rb_cmd_ok:
+                            while time.monotonic() - rb_start < rb_timeout:
+                                if action_id in self._interrupted:
+                                    rb_interrupted = True
                                     break
-                                if time.monotonic() - rb_start >= start_grace and rb_state.get("dof_state") == 2 and abs(rb_state.get("speed", 0.0)) <= 1.0:
-                                    rb_success = abs(rb_state["position"] - start_position) <= GRIPPER_TARGET_TOLERANCE
-                                    break
+                                time.sleep(poll_interval)
+                                rb_state = self._read_gripper_state()
+                                if rb_state is not None:
+                                    consecutive_rb_missing = 0
+                                    final_pos = int(round(rb_state["position"]))
+                                    if abs(rb_state["position"] - start_position) <= GRIPPER_TARGET_TOLERANCE:
+                                        rb_success = True
+                                        break
+                                    if time.monotonic() - rb_start >= start_grace and rb_state.get("dof_state") == 2 and abs(rb_state.get("speed", 0.0)) <= 1.0:
+                                        rb_success = abs(rb_state["position"] - start_position) <= GRIPPER_TARGET_TOLERANCE
+                                        break
+                                else:
+                                    consecutive_rb_missing += 1
+                                    if consecutive_rb_missing >= MAX_CONSECUTIVE_MISSING_FEEDBACK:
+                                        break
 
                         rb_outcome = rb_success or (final_pos == start_position and rb_cmd_ok)
-                        status, result = "completed", {
-                            "reason": "motion_stalled_rolled_back",
+
+                        if rb_interrupted:
+                            status = "completed"
+                            reason = "interrupted"
+                            err = None
+                        elif not rb_cmd_ok:
+                            status = "failed"
+                            reason = f"rollback_command_failed: {rb_cmd_err}" if rb_cmd_err else "rollback_command_failed"
+                            err = rb_cmd_err or "failed to issue rollback command"
+                        elif rb_outcome:
+                            status = "completed"
+                            reason = "motion_stalled_rolled_back"
+                            err = None
+                        else:
+                            status = "failed"
+                            reason = "rollback_failed"
+                            err = f"failed to return to start position {start_position}, ended at {final_pos}"
+
+                        status, result = status, {
+                            "reason": reason,
                             "position": final_pos,
                             "target": target_position,
+                            "requested_position": target_position,
+                            "final_position": final_pos,
                             "start_position": start_position,
                             "blocked_position": blocked_pos,
                             "stalled": True,
@@ -968,20 +1057,30 @@ class GripperPlugin:
                             "rollback_success": rb_outcome,
                             "stall_timeout_seconds": stall_timeout,
                             "elapsed_seconds": round(time.monotonic() - start_time, 3),
-                            "interrupted": action_id in self._interrupted,
+                            "interrupted": rb_interrupted or (action_id in self._interrupted),
+                            "force": force,
+                            "mode": gripper_source,
+                            "error": err,
                         }
                         break
 
         except Exception as exc:
-            # 捕获硬件故障异常或执行异常，如实汇报失败原因与目标位置
+            # 捕获硬件故障异常或执行异常，如实汇报失败原因与真实位置（绝不虚构目标位置）
             status = "failed"
+            current_known_pos = locals().get("last_known_pos", locals().get("start_position", target_position))
             result = {
                 "reason": str(exc),
-                "position": target_position,
+                "position": current_known_pos,
                 "target": target_position,
-                "stalled": False,
+                "requested_position": target_position,
+                "final_position": current_known_pos,
+                "start_position": locals().get("start_position", current_known_pos),
+                "stalled": locals().get("is_stalled", False),
                 "on_stall": on_stall,
                 "stall_timeout_seconds": stall_timeout,
+                "force": force,
+                "mode": locals().get("gripper_source", "rm_plus"),
+                "error": str(exc),
             }
         finally:
             with self._action_lock:
