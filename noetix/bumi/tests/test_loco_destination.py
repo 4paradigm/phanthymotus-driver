@@ -479,6 +479,96 @@ def test_rotate_timeout_on_full_turn_reports_full_shortfall(monkeypatch):
     assert fake.cmds[-1] == (0, 0, 0)                     # 退出必零速
 
 
+@pytest.mark.parametrize('during_motion', [False, True])
+@pytest.mark.parametrize('field, value', [
+    ('ori', [0, 0, float('nan'), 1]),
+    ('ori', [0, 0, float('inf'), 1]),
+    ('ori', [0, 0, 0, 0]),
+    ('angular_vel', [0, 0, float('nan')]),
+    ('angular_vel', [0, 0, float('inf')]),
+])
+def test_invalid_imu_aborts_rotate(monkeypatch, during_motion, field, value):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    calls = []
+    monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
+    monkeypatch.setattr(module, '_rotate_timeout_s', lambda angle: 0.15)
+    read = fake.get_imu_data
+
+    def get_imu():
+        imu = read()
+        if not during_motion or any(z != 0 for x, y, z in fake.cmds):
+            setattr(imu, field, value)
+        return imu
+
+    monkeypatch.setattr(fake, 'get_imu_data', get_imu)
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(plugin, timeout_s=2)
+    assert result['state'] == 'error'
+    assert 'IMU' in result['error']
+    assert sum(z != 0 for x, y, z in fake.cmds) == int(during_motion)
+    if during_motion:
+        assert fake.cmds[-1] == (0, 0, 0)
+    assert len(calls) == 1 and calls[0][1] == 'error'
+    assert calls[0][2] is result
+
+
+@pytest.mark.parametrize('mode', [1, 26, None])
+def test_mode_loss_during_rotate_brakes_and_reports_error(monkeypatch, mode):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    calls = []
+    monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
+    monkeypatch.setattr(module, '_rotate_timeout_s', lambda angle: 0.15)
+
+    def get_mode():
+        if any(z != 0 for x, y, z in fake.cmds):
+            if mode is None:
+                raise RuntimeError('mode feedback unavailable')
+            return mode
+        return 2
+
+    monkeypatch.setattr(fake, 'get_mode', get_mode)
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(plugin, timeout_s=2)
+    assert result['state'] == 'error'
+    assert sum(z != 0 for x, y, z in fake.cmds) == 1
+    assert fake.cmds[-1] == (0, 0, 0)
+    assert len(calls) == 1 and calls[0][1] == 'error'
+    assert calls[0][2] is result
+
+
+@pytest.mark.parametrize('failure', ['mode_check', 'thread_start'])
+def test_rotate_startup_failure_releases_busy_state(monkeypatch, failure):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    calls = []
+    monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
+
+    def fail(*args):
+        raise RuntimeError('startup unavailable')
+
+    with monkeypatch.context() as startup:
+        if failure == 'mode_check':
+            startup.setattr(fake, 'get_mode', fail)
+        else:
+            startup.setattr(threading.Thread, 'start', fail)
+        result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    assert result['state'] == 'error'
+    assert 'startup unavailable' in result['error']
+    assert 'action_id' not in result
+    assert plugin._rotate_status() == {'state': 'idle', 'last_result': result}
+    assert calls == []
+    assert fake.cmds == []
+    restarted = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 0})
+    assert restarted['state'] == 'running'
+    assert wait_rotate(plugin, timeout_s=2)['state'] == 'done'
+    assert len(calls) == 1 and calls[0][1] == 'completed'
+
+
 @pytest.mark.parametrize('angle, pending_send', [(60, 1), (10, 1), (10, 2)])
 def test_rotate_cannot_publish_motion_after_stop_returns(monkeypatch, angle, pending_send):
     module, _ = _load_device(monkeypatch)

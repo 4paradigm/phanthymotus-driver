@@ -158,6 +158,10 @@ def _wrap180(deg: float) -> float:
 def _yaw_deg_from_quat(ori) -> float:
     """Yaw in degrees from an SDK-order [x, y, z, w] quaternion, in (-180, 180]."""
     x, y, z, w = ori
+    norm = math.hypot(x, y, z, w)
+    if not math.isfinite(norm) or norm == 0:
+        raise ValueError("IMU quaternion must be finite and nonzero")
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
     return math.degrees(math.atan2(2.0 * (w * z + x * y),
                                    1.0 - 2.0 * (y * y + z * z)))
 
@@ -699,23 +703,32 @@ class LocoPlugin:
                 }
             self._rotate_stop_event.clear()
             self._rotate_state["state"] = "running"
-        angle_deg, terminal = self._rotate_preflight(args)
-        if terminal is not None:
-            with self._rotate_lock:
-                self._rotate_state["state"] = "idle"
-                self._rotate_state["last_result"] = terminal
-            return terminal
-        action_id = f"bumi_loco_destination_{time.time_ns()}"
+        try:
+            angle_deg, terminal = self._rotate_preflight(args)
+            if terminal is None:
+                expected_duration_s = _rotate_timeout_s(angle_deg)
+                action_id = f"bumi_loco_destination_{time.time_ns()}"
+                worker = threading.Thread(target=self._do_rotate_worker,
+                                          args=(args, action_id),
+                                          daemon=True, name="bumi_rotate")
+                with self._rotate_lock:
+                    self._active_action_id = action_id
+                    self._rotate_worker = worker
+                worker.start()
+                return {"state": "running", "action_id": action_id,
+                        "expected_duration_s": expected_duration_s,
+                        "requested_angle_deg": angle_deg}
+        except Exception as exc:
+            terminal = {"state": "error",
+                        "error": f"{type(exc).__name__}: {exc}"}
+        # No worker accepted the action: release its reservation so a
+        # transient SDK or thread-start failure does not leave the card busy.
         with self._rotate_lock:
-            self._active_action_id = action_id
-        worker = threading.Thread(target=self._do_rotate_worker,
-                                  args=(args, action_id),
-                                  daemon=True, name="bumi_rotate")
-        self._rotate_worker = worker
-        worker.start()
-        return {"state": "running", "action_id": action_id,
-                "expected_duration_s": _rotate_timeout_s(angle_deg),
-                "requested_angle_deg": angle_deg}
+            self._active_action_id = None
+            self._rotate_worker = None
+            self._rotate_state["state"] = "idle"
+            self._rotate_state["last_result"] = terminal
+        return terminal
 
     def _do_rotate_worker(self, args: dict, action_id: str) -> dict | None:
         # bumi_rotate thread body: run the impl, then publish exactly one
@@ -765,11 +778,14 @@ class LocoPlugin:
                                     f"±{_ROTATE_ANGLE_LIMIT_DEG:g} degrees, got {angle_deg}")}
         if abs(angle_deg) < 0.05:
             return angle_deg, None
+        return angle_deg, self._rotate_mode_error()
+
+    def _rotate_mode_error(self) -> dict | None:
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
-            return None, {"state": "error", "error": "Robot in protection mode, cannot move"}
+            return {"state": "error", "error": "Robot in protection mode, cannot move"}
         if mode != 2:
-            return None, {
+            return {
                 "state": "error",
                 "error": (
                     f"movement requires workmode=2 (walking); current mode is "
@@ -777,7 +793,15 @@ class LocoPlugin:
                     "Use switch_mode switch=walk first."
                 ),
             }
-        return angle_deg, None
+        return None
+
+    def _read_rotate_imu(self) -> tuple[float, float]:
+        imu = self._high_ctrl.get_imu_data()
+        yaw = _yaw_deg_from_quat(imu.ori)
+        wz = float(imu.angular_vel[2])
+        if not math.isfinite(wz):
+            raise ValueError("IMU yaw rate must be finite")
+        return yaw, wz
 
     def _do_rotate_impl(self, args: dict) -> dict:
         # 1. Pre-flight (validation + workmode) — shared with the sync
@@ -788,7 +812,7 @@ class LocoPlugin:
         # 0° is a deliberate no-op: it succeeds in any workmode and returns
         # before the mutex preamble, so it never cancels a running move.
         if abs(angle_deg) < 0.05:  # zero-turn: instant done, no motion commanded
-            yaw = _yaw_deg_from_quat(self._high_ctrl.get_imu_data().ori)
+            yaw, _ = self._read_rotate_imu()
             return {"state": "done", "requested_angle_deg": angle_deg,
                     "start_yaw_deg": yaw, "end_yaw_deg": yaw, "turned_deg": 0.0,
                     "final_error_deg": 0.0, "elapsed_s": 0.0,
@@ -804,7 +828,7 @@ class LocoPlugin:
         self._move_stop_event.clear()
 
         default_cmd = _get_default_cmd()
-        start_yaw = _yaw_deg_from_quat(self._high_ctrl.get_imu_data().ori)
+        start_yaw, _ = self._read_rotate_imu()
         start_time = time.monotonic()
         # Timeout budget covers the whole request, every segment included.
         deadline = start_time + _rotate_timeout_s(angle_deg)
@@ -846,13 +870,17 @@ class LocoPlugin:
             halvings = 0                # overshoots seen within this segment
             still = 0
             while True:
-                imu = self._high_ctrl.get_imu_data()
-                cur_yaw = _yaw_deg_from_quat(imu.ori)
+                if self._rotate_stop_event.is_set():
+                    result_state = "stopped"
+                    break
+                mode_error = self._rotate_mode_error()
+                if mode_error is not None:
+                    return mode_error
+                cur_yaw, wz = self._read_rotate_imu()
                 turned_deg += _wrap180(cur_yaw - prev_yaw)
                 prev_yaw = cur_yaw
                 end_yaw = cur_yaw
                 err = _wrap180(seg_target - cur_yaw)
-                wz = float(imu.angular_vel[2])
                 # Sub-target advance: inside the cruise-exit band (≤20°) jumps
                 # straight to the next sub-target, so non-final segments never
                 # brake or creep — one continuous cruise, one creep at the end.
@@ -870,9 +898,6 @@ class LocoPlugin:
                     continue
                 if time.monotonic() >= deadline:
                     result_state = "timeout"
-                    break
-                if self._rotate_stop_event.is_set():
-                    result_state = "stopped"
                     break
                 if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
                     still += 1
