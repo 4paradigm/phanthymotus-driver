@@ -1,26 +1,19 @@
-"""Sequential relative movement through a dedicated SDK client in the main process."""
+"""Closed-loop relative pose movement through a direct, no-reply SDK client."""
 import math
 import threading
 import time
 from uuid import uuid4
+
+try:
+    from .relative_feedback import RelativeController
+except ImportError:
+    from relative_feedback import RelativeController
 
 
 class LocoRelativeMovePlugin:
     PREFIX = "loco_relative_move"
     TIMEOUT = 300
     MAX_MOTION_SECONDS = 120
-    # Refined from compensated turns observed at ~80 and ~175 degrees.
-    # Calibrated only at 0.5 rad/s; smaller angles keep theoretical duration.
-    ROTATION_TIME_FACTORS = {90: (90. / 75.) * (90. / 80.),
-                             180: (180. / 135.) * (180. / 175.)}
-    # Rough observed travel was 60% of the requested displacement at 0.3 m/s.
-    # Lateral travel then overshot by ~20%; shorten only its compensated time.
-    TRANSLATION_TIME_FACTORS = (1. / 0.6, 1. / 0.6 / 1.2)
-    # Direction-specific visual measurements at the default speeds.
-    RIGHT_ROTATION_TIME_FACTOR = 1. / 1.18
-    # A subsequent test still overshot by ~1/15 of the target distance.
-    NEGATIVE_X_TIME_FACTOR = 1. / 1.20 * (15. / 16.)
-    NEGATIVE_Y_TIME_FACTOR = 1. / 1.05
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
 
@@ -44,13 +37,11 @@ class LocoRelativeMovePlugin:
     def get_tools(self):
         return [{
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": "Sequential relative movement: straight along x, sideways along y, then rotate. "
-                           "Calls the Unitree SDK directly without the SmartMotion safety subprocess. "
-                           "Uses velocity/time control; distances and angles are approximate, "
-                           "without position feedback. At 0.3 m/s, translation uses empirical time compensation; "
-                           "Negative x and y have separate time corrections at 0.3 m/s. "
-                           "At 0.5 rad/s, 90/180 degree turns and right turns use empirical time compensation. "
-                           "Axes refer to the starting body heading.",
+            "description": "Closed-loop relative position and heading control using odometry and IMU. "
+                           "Translation and rotation run simultaneously; the path may curve. "
+                           "Calls SDK directly without SmartMotion sensor safety checks. "
+                           "Targets use the starting body frame. Completion requires position within "
+                           "5 cm and heading within 3 degrees, stable after stopping.",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
@@ -58,20 +49,20 @@ class LocoRelativeMovePlugin:
                     "x": {"type": "number", "title": "X (m)", "default": 0,
                           "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
                           "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
-                          "description": "Relative longitudinal distance (m): 0 skips this stage; otherwise absolute value must be 0.3–5 m. Positive forward, negative backward (same as loco vx)."},
+                          "description": "Relative longitudinal distance (m): 0 requests no displacement on this axis; otherwise absolute value must be 0.3–5 m. Positive forward, negative backward (same as loco vx)."},
                     "y": {"type": "number", "title": "Y (m，正向左 / 负向右)", "default": 0,
                           "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
                           "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
-                          "description": "横移距离（m）：相对于机器人运动开始时的朝向，正值向左、负值向右（同 loco vy）；0 跳过，非零绝对值为 0.3–5 m。"},
+                          "description": "横移距离（m）：相对于机器人运动开始时的朝向，正值向左、负值向右（同 loco vy）；0 表示该轴目标位移为零，非零绝对值为 0.3–5 m。"},
                     "angle": {"type": "integer", "title": "Angle (°)", "enum": [0, 30, 60, 90, 180], "default": 0,
-                              "description": "Final rotation in degrees; 0 skips rotation."},
+                              "description": "Final heading change from the starting heading (degrees); 0 holds starting heading."},
                     "direction": {"type": "string", "enum": ["left", "right"], "default": "left",
                                   "description": "Left uses positive loco vyaw, right uses negative vyaw."},
                 },
                 "x-action-params": {
                     "move": {"params": ["x", "y", "angle", "direction"],
-                             "description": "Execute x, y, rotation in order, stopping between stages. Maximum planned motion time 120 seconds."},
-                    "stop_move": {"params": [], "description": "Cancel remaining stages and stop movement."},
+                             "description": "Move to relative x/y and heading simultaneously. Maximum execution time 120 seconds."},
+                    "stop_move": {"params": [], "description": "Cancel the entire pose goal and stop movement."},
                 },
                 "x-resource": "base",
                 "x-completion": {"actions": ["move"], "timeout": self.TIMEOUT},
@@ -99,26 +90,7 @@ class LocoRelativeMovePlugin:
         angle = int(angle)
         if direction not in ("left", "right"):
             raise ValueError("direction must be left or right")
-        stages = []
-        for name, distance, axis in (("straight", x, 0), ("lateral", y, 1)):
-            if distance:
-                velocity = [0., 0., 0.]
-                velocity[axis] = math.copysign(self.speed, distance)
-                factor = self.TRANSLATION_TIME_FACTORS[axis] if self.speed == 0.3 else 1.
-                if self.speed == 0.3 and distance < 0:
-                    factor *= self.NEGATIVE_X_TIME_FACTOR if axis == 0 else self.NEGATIVE_Y_TIME_FACTOR
-                stages.append(dict(stage=name, vx=velocity[0], vy=velocity[1], vyaw=0.,
-                                   duration=abs(distance) / self.speed * factor))
-        if angle:
-            factor = self.ROTATION_TIME_FACTORS.get(angle, 1.) if self.yaw_speed == 0.5 else 1.
-            if self.yaw_speed == 0.5 and direction == "right":
-                factor *= self.RIGHT_ROTATION_TIME_FACTOR
-            stages.append(dict(stage="rotation", vx=0., vy=0.,
-                               vyaw=self.yaw_speed if direction == "left" else -self.yaw_speed,
-                               duration=math.radians(angle) / self.yaw_speed * factor))
-        if sum(s["duration"] for s in stages) > self.MAX_MOTION_SECONDS:
-            raise ValueError("Planned motion exceeds 120 seconds; reduce distances")
-        return stages
+        return {"x": x, "y": y, "yaw": math.radians(angle) * (1 if direction == "left" else -1)}
 
     def start(self):
         pass
@@ -149,11 +121,9 @@ class LocoRelativeMovePlugin:
         if action != "move":
             return {"error": f"Unknown loco_relative_move action: {action}"}
         try:
-            stages = self.plan(args)
+            target = self.plan(args)
         except (ValueError, TypeError, OverflowError) as exc:
             return {"error": str(exc)}
-        if not stages:
-            return {"ret": 0, "state": "idle", "stages": []}
         with self.command_lock:
             if self.closed:
                 return {"error": "loco_relative_move is shut down"}
@@ -161,133 +131,140 @@ class LocoRelativeMovePlugin:
                 return {"error": "Previous stop was not confirmed; retry stop_move first"}
             if self.busy:
                 return {"error": "loco_relative_move is already running"}
+            try:
+                initial = self.loco.snapshot()
+            except Exception as exc:
+                return {"error": str(exc)}
             job = dict(id=f"g1_point_{uuid4().hex[:8]}", cancel=threading.Event(),
-                       stop_done=threading.Event(), stop_result=None,
-                       deadline=time.monotonic() + self.TIMEOUT - 15)
+                       deadline=time.monotonic() + self.MAX_MOTION_SECONDS,
+                       initial=initial)
             self.active = job
             try:
-                job["worker"] = threading.Thread(target=self._run, args=(job, stages), daemon=True)
+                job["worker"] = threading.Thread(target=self._run, args=(job, target), daemon=True)
                 job["worker"].start()
             except Exception:
                 self.active = None
                 raise
-        return {"ret": 0, "state": "moving", "action_id": job["id"], "stages": stages}
+        return {"ret": 0, "state": "moving", "action_id": job["id"], "target": target, "control": "closed_loop"}
 
     def dispatch_base(self, plugin, action, args):
-        stopping = action in ("stop_move", "emergency_stop", "stop") or (
+        stopping = action in ("stop_move", "emergency_stop", "stop", "interrupt_motion") or (
             action == "switch_mode" and args.get("mode") == "emergency_stop")
-        if stopping and self.busy:
-            self.cancel_and_stop()
+        cancelled = None
+        if stopping and (self.busy or self.faulted):
+            cancelled = self.cancel_and_stop()
         querying = action.startswith("get_") or action in ("list", "list_tags", "list_maps", "check")
         with self.command_lock:
             if (self.busy or self.faulted) and not stopping and not querying:
                 return {"error": "loco_relative_move is running; stop it before another base action"}
-            return plugin.dispatch(action, args)
+            result = plugin.dispatch(action, args)
+            if cancelled is not None and cancelled.get("ret") != 0:
+                return {**cancelled, "peer_result": result}
+            return result
 
     def cancel_and_stop(self):
-        job = self.active
-        if job:
-            job["cancel"].set()
-        # Order stop after an in-progress segment submission. Response waits
-        # can delay this explicit stop; timed segment stops remain independent.
         with self.command_lock:
             job = self.active
             if job:
                 job["cancel"].set()
-            try:
-                result = self.loco._stop_motion()
-            except Exception as exc:
-                result = {"ret": None, "error": str(exc), "state": "stop_failed"}
-            self.faulted = result.get("ret") != 0
-            if not job and not self.faulted:
-                finish = getattr(self.loco, "finish_sequence", None)
-                if finish:
-                    try:
-                        finish()
-                    except Exception as exc:
-                        self.faulted = True
-                        result = {"ret": None, "error": str(exc), "state": "stop_failed"}
-            if job:
-                job["stop_result"] = result
-                job["stop_done"].set()
+            result = self._send_stop()
+            if not job:
+                stopped = result['ret'] == 0 and self._confirm_stop()
+                self.faulted = not stopped
+                result.update(state='idle' if stopped else 'stop_failed',
+                              stop_confirmed_by_feedback=stopped)
+                if not stopped:
+                    result.update(ret=None, error='Stop could not be confirmed from fresh feedback')
             return result
 
-    def _run(self, job, stages):
-        status, result = "completed", {"completed_stages": []}
+    def _send_stop(self):
         try:
-            for index, stage in enumerate(stages):
-                with self.command_lock:
-                    if job["cancel"].is_set():
-                        break
-                    if time.monotonic() >= job["deadline"]:
-                        raise TimeoutError("loco_relative_move deadline expired")
-                    segment_id = f"{job['id']}_{index}"
-                    begin = getattr(self.loco, "_begin_motion", self.loco._start_motion)
-                    pending = begin(stage["vx"], stage["vy"], stage["vyaw"],
-                                    stage["duration"], segment_id)
-                reply = pending() if callable(pending) else pending
-                if reply.get("error") or reply.get("ret") != 0:
-                    raise RuntimeError(reply.get("error") or f"Move failed: {reply.get('ret')}")
-                while not job["cancel"].is_set():
-                    if time.monotonic() >= job["deadline"]:
-                        raise TimeoutError("loco_relative_move deadline expired")
-                    outcome = self.loco._motion_result(segment_id)
-                    if outcome.get("error"):
-                        raise RuntimeError(outcome["error"])
-                    terminal = outcome.get("status")
-                    if terminal in ("completed", "cancelled", "error"):
-                        if terminal != "completed":
-                            status = terminal
-                            result["segment_result"] = outcome.get("result", {})
-                        break
-                    job["cancel"].wait(0.1)
-                if job["cancel"].is_set() or status != "completed":
-                    break
-                result["completed_stages"].append(stage["stage"])
-            if job["cancel"].is_set():
-                if not job["stop_done"].wait(max(0., job["deadline"] - time.monotonic())):
-                    raise TimeoutError("Cancellation stop was not confirmed")
-                stop = job["stop_result"]
-                status = "cancelled" if stop.get("ret") == 0 else "error"
-                result["stop_result"] = stop
+            ret = self.loco.command(0., 0., 0.)
+            return {"ret": ret, "state": "stop_pending" if ret == 0 else "stop_failed",
+                    "stop_acknowledged": False, "error": None if ret == 0 else f"Stop send failed: {ret}"}
         except Exception as exc:
-            status = "error"
-            result["error"] = str(exc)
-            result["stop_result"] = self.cancel_and_stop()
-        finally:
-            finish = getattr(self.loco, "finish_sequence", None)
-            if finish:
-                try:
-                    finish()
-                except Exception as exc:
-                    self.faulted = True
-                    status = "error"
-                    result["error"] = f"Sequence release failed: {exc}"
+            return {"ret": None, "state": "stop_failed", "error": str(exc), "stop_acknowledged": False}
+
+    def _confirm_stop(self):
+        deadline, stable = time.monotonic() + 3., None
+        while time.monotonic() < deadline:
             with self.command_lock:
+                if self._send_stop()['ret'] != 0:
+                    return False
+            try:
+                pose = self.loco.snapshot()
+            except Exception:
+                return False
+            if pose['speed'] <= .03 and abs(pose['yaw_rate']) <= .03:
+                if stable is None:
+                    stable = time.monotonic()
+                if min(pose['odom_stamp'], pose['imu_stamp']) - stable >= .5:
+                    return True
+            else:
+                stable = None
+            time.sleep(.05)
+        return False
+
+    def _run(self, job, target):
+        status, result = "error", {}
+        controller = RelativeController(job['initial'], target, self.speed, self.yaw_speed, time.monotonic())
+        try:
+            while True:
+                with self.command_lock:
+                    if job['cancel'].is_set():
+                        break
+                    now = time.monotonic()
+                    if now >= job['deadline']:
+                        raise TimeoutError('Relative movement deadline expired')
+                    pose = self.loco.snapshot()
+                    velocity, done = controller.step(pose, now)
+                    ret = self.loco.command(*velocity)
+                    if ret != 0:
+                        raise RuntimeError(f'Velocity send failed: {ret}')
+                    if done:
+                        status = 'completed'
+                        break
+                job['cancel'].wait(.05)
+            if job['cancel'].is_set():
+                status = 'cancelled'
+        except Exception as exc:
+            result['error'] = str(exc)
+        finally:
+            if status != 'completed':
+                stopped = self._confirm_stop()
+                if not stopped:
+                    status = 'error'
+                    result.setdefault('error', 'Stop could not be confirmed from fresh feedback')
+            else:
+                stopped = True  # Controller already observed stable zero-speed feedback.
+            result.update(controller.error)
+            result['stop_confirmed_by_feedback'] = stopped
+            result['target'] = dict(x=controller.x, y=controller.y, yaw=controller.yaw)
+            with self.command_lock:
+                self.faulted = not stopped
                 if self.active is job:
                     self.active = None
-            self.notify(job["id"], status, result, tool=self.PREFIX)
+            self.notify(job['id'], status, result, tool=self.PREFIX)
 
 
 class PointBackend:
-    """Direct SDK adapter; deadlines remain independent of RPC response waits."""
-    def __init__(self, client):
-        if client is None:
-            raise ValueError("loco_relative_move requires an SDK client")
-        try:
-            from .point_motion import PointMotion
-        except ImportError:  # Container modules live directly under /work.
-            from point_motion import PointMotion
-        self.motion = PointMotion(client)
+    """No-reply SDK writes: no request futures and no response-wait threads."""
+    COMMAND_DURATION = .3
 
-    def _begin_motion(self, vx, vy, vyaw, duration, action_id):
-        return self.motion.begin_start(vx, vy, vyaw, duration, action_id)
+    def __init__(self, client, feedback, close=None):
+        self.client = client
+        self.feedback = feedback
+        self._close = close
 
-    def _start_motion(self, vx, vy, vyaw, duration, action_id):
-        return self.motion.start(vx, vy, vyaw, duration, action_id)
+    def snapshot(self):
+        return self.feedback.snapshot()
 
-    def _motion_result(self, action_id):
-        return self.motion.get_result(action_id)
+    def command(self, vx, vy, vyaw):
+        import json
+        from unitree_sdk2py.g1.loco.g1_loco_api import ROBOT_API_ID_LOCO_SET_VELOCITY
+        parameter = json.dumps({'velocity': [vx, vy, vyaw], 'duration': self.COMMAND_DURATION})
+        return self.client._CallNoReply(ROBOT_API_ID_LOCO_SET_VELOCITY, parameter)
 
-    def _stop_motion(self):
-        return self.motion.stop()
+    def close(self):
+        if self._close:
+            self._close()

@@ -1,4 +1,4 @@
-"""Offline contracts for sequential loco_relative_move movement."""
+"""Closed-loop relative movement and existing locomotion regressions (no hardware)."""
 import ast
 from pathlib import Path
 import time
@@ -9,300 +9,10 @@ from unittest.mock import patch
 import math
 import threading
 import unittest
-
 from unitree.g1.loco_relative_move import LocoRelativeMovePlugin, PointBackend
+from unitree.g1.relative_feedback import PoseFeedback, RelativeController, wrap
 from unitree.g1.point_motion import PointMotion
 from unitree.g1.point_rpc import PointRpc
-
-
-class Backend:
-    def __init__(self):
-        self.calls = []
-        self.status = "completed"
-        self.ret = 0
-        self.stop_ret = 0
-        self.sent = threading.Event()
-        self.stop_count = 0
-
-    def _start_motion(self, vx, vy, vyaw, duration, action_id):
-        self.calls.append((vx, vy, vyaw, duration, action_id))
-        self.sent.set()
-        return {"ret": self.ret, "action_id": action_id}
-
-    def _motion_result(self, action_id):
-        return {"status": self.status, "result": {"stop_acknowledged": True}}
-
-    def _stop_motion(self):
-        self.stop_count += 1
-        return {"ret": self.stop_ret}
-
-
-class TestLocoRelativeMove(unittest.TestCase):
-    def setup_point(self, backend=None):
-        backend = backend or Backend()
-        notifications, done = [], threading.Event()
-        def notify(*args, **kwargs):
-            notifications.append((args, kwargs))
-            done.set()
-        return LocoRelativeMovePlugin({}, backend, notify), backend, notifications, done
-
-    def test_plan_uses_separate_rotation_compensation_and_body_axis_signs(self):
-        point, _, _, _ = self.setup_point()
-        for angle in (30, 60, 90, 180):
-            stages = point.plan(dict(x=-0.6, y=0.3, angle=angle, direction="right"))
-            self.assertEqual([s['stage'] for s in stages], ['straight', 'lateral', 'rotation'])
-            self.assertEqual((stages[0]['vx'], stages[0]['vy'], stages[0]['vyaw']), (-0.3, 0., 0.))
-            self.assertEqual((stages[1]['vx'], stages[1]['vy'], stages[1]['vyaw']), (0., 0.3, 0.))
-            self.assertAlmostEqual(stages[0]['duration'], 2. / 0.6 / 1.20 * 15. / 16.)
-            self.assertAlmostEqual(stages[1]['duration'], 1. / 0.6 / 1.2)
-            factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
-            self.assertAlmostEqual(stages[2]['duration'], math.radians(angle) / 0.5 * factor / 1.18)
-            self.assertEqual(stages[2]['vyaw'], -0.5)
-
-    def test_compensation_is_limited_to_measured_speed(self):
-        point, _, _, _ = self.setup_point()
-        point.yaw_speed = 0.7
-        for angle in (90, 180):
-            for direction in ('left', 'right'):
-                stage = point.plan(dict(angle=angle, direction=direction))[0]
-                self.assertAlmostEqual(stage['duration'], math.radians(angle) / 0.7)
-                self.assertEqual(abs(stage['vyaw']), 0.7)
-
-    def test_translation_compensation_keeps_command_speed_and_applies_to_both_axes(self):
-        point, _, _, _ = self.setup_point()
-        stages = point.plan(dict(x=1, y=-1))
-        self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.3, -0.3))
-        self.assertAlmostEqual(stages[0]['duration'], 1 / 0.3 / 0.6)
-        self.assertAlmostEqual(stages[1]['duration'], 1 / 0.3 / 0.6 / 1.2 / 1.05)
-        point.speed = 0.5
-        stages = point.plan(dict(x=1, y=-1))
-        self.assertEqual((stages[0]['vx'], stages[1]['vy']), (0.5, -0.5))
-        self.assertAlmostEqual(stages[0]['duration'], 2.)
-        self.assertAlmostEqual(stages[1]['duration'], 2.)
-
-    def test_direction_calibration_preserves_left_and_positive_y(self):
-        point, _, _, _ = self.setup_point()
-        for angle in (30, 60, 90, 180):
-            left = point.plan(dict(angle=angle, direction='left'))[0]
-            right = point.plan(dict(angle=angle, direction='right'))[0]
-            factor = {90: 1.35, 180: 48. / 35.}.get(angle, 1.)
-            self.assertAlmostEqual(left['duration'], math.radians(angle) / 0.5 * factor)
-            self.assertAlmostEqual(right['duration'], left['duration'] / 1.18)
-            self.assertEqual((left['vyaw'], right['vyaw']), (0.5, -0.5))
-        positive = point.plan(dict(y=1))[0]
-        negative = point.plan(dict(y=-1))[0]
-        self.assertAlmostEqual(positive['duration'], 1 / 0.3 / 0.6 / 1.2)
-        self.assertAlmostEqual(negative['duration'], positive['duration'] / 1.05)
-        self.assertEqual((positive['vy'], negative['vy']), (0.3, -0.3))
-
-    def test_negative_x_calibration_preserves_speed_and_positive_x(self):
-        point, _, _, _ = self.setup_point()
-        positive = point.plan(dict(x=1))[0]
-        negative = point.plan(dict(x=-1))[0]
-        self.assertAlmostEqual(positive['duration'], 1 / 0.3 / 0.6)
-        self.assertAlmostEqual(negative['duration'], positive['duration'] / 1.20 * 15. / 16.)
-        self.assertEqual((positive['vx'], negative['vx']), (0.3, -0.3))
-        point.speed = 0.5
-        self.assertAlmostEqual(point.plan(dict(x=-1))[0]['duration'], 2.)
-
-    def test_canvas_string_angles_match_numeric_plan(self):
-        point, _, _, _ = self.setup_point()
-        for angle in (0, 30, 60, 90, 180):
-            with self.subTest(angle=angle):
-                self.assertEqual(point.plan(dict(x='1', y='1', angle=str(angle), direction='left')),
-                                 point.plan(dict(x=1, y=1, angle=angle, direction='left')))
-        for angle in (45, '45', '45.5', 'bad', '', 'nan', 'inf', None, True):
-            with self.subTest(invalid=angle):
-                self.assertIn('error', point.dispatch('move', dict(angle=angle)))
-
-    def test_distance_bounds_allow_zero_and_both_signed_endpoints(self):
-        point, backend, notices, _ = self.setup_point()
-        for axis in ('x', 'y'):
-            for distance in (0, 0.3, -0.3, 5, -5):
-                with self.subTest(axis=axis, distance=distance):
-                    stages = point.plan({axis: distance})
-                    self.assertEqual(len(stages), int(distance != 0))
-            for distance in (0.299, -0.299, 5.001, -5.001):
-                with self.subTest(axis=axis, distance=distance):
-                    self.assertIn('error', point.dispatch('move', {axis: distance}))
-        self.assertEqual(backend.calls, [])
-        self.assertEqual(notices, [])
-
-    def test_whole_sequence_notifies_once_with_distinct_internal_ids(self):
-        point, backend, notices, done = self.setup_point()
-        result = point.dispatch('move', dict(x=0.3, y=-0.3, angle=90))
-        self.assertTrue(done.wait(2))
-        self.assertEqual(len(backend.calls), 3)
-        self.assertEqual(len({call[4] for call in backend.calls}), 3)
-        self.assertEqual(len(notices), 1)
-        self.assertEqual(notices[0][0][:2], (result['action_id'], 'completed'))
-        self.assertEqual(notices[0][1]['tool'], 'loco_relative_move')
-        self.assertEqual(notices[0][0][2]['completed_stages'], ['straight', 'lateral', 'rotation'])
-
-    def test_cancel_stops_and_prevents_remaining_stages(self):
-        point, backend, notices, done = self.setup_point()
-        backend.status = 'pending'
-        point.dispatch('move', dict(x=0.3, y=0.3, angle=90))
-        self.assertTrue(backend.sent.wait(2))
-        self.assertIn('error', point.dispatch('move', dict(x=0.3)))
-        self.assertEqual(point.dispatch('stop_move', {})['ret'], 0)
-        self.assertTrue(done.wait(2))
-        self.assertEqual(len(backend.calls), 1)
-        self.assertEqual(backend.stop_count, 1)
-        self.assertEqual(notices[0][0][1], 'cancelled')
-
-    def test_lifecycle_stop_cancels_sequence_and_returns_idle(self):
-        for stop_ret in (0, 3104):
-            with self.subTest(stop_ret=stop_ret):
-                point, backend, notices, done = self.setup_point()
-                backend.status = 'pending'
-                backend.stop_ret = stop_ret
-                point.dispatch('move', dict(x=0.3, y=0.3, angle=90))
-                self.assertTrue(backend.sent.wait(2))
-                self.assertEqual(point.dispatch('stop', {}), {'state': 'idle'})
-                self.assertTrue(done.wait(2))
-                self.assertEqual(backend.stop_count, 1)
-                self.assertEqual(len(backend.calls), 1)
-                self.assertEqual(notices[0][0][1], 'cancelled' if stop_ret == 0 else 'error')
-                self.assertEqual(point.faulted, stop_ret != 0)
-                if stop_ret != 0:
-                    self.assertIn('error', point.dispatch('move', dict(x=0.3)))
-
-    def test_idle_lifecycle_stop_returns_idle_but_operational_stop_preserves_failure(self):
-        point, backend, _, _ = self.setup_point()
-        backend.stop_ret = 3104
-        self.assertEqual(point.dispatch('stop', {}), {'state': 'idle'})
-        self.assertTrue(point.faulted)
-        self.assertEqual(point.dispatch('stop_move', {})['ret'], 3104)
-        self.assertEqual(backend.stop_count, 2)
-
-    def test_failed_cancel_stop_reports_error(self):
-        point, backend, notices, done = self.setup_point()
-        backend.status = 'pending'
-        backend.stop_ret = 3104
-        point.dispatch('move', dict(x=0.3, y=0.3))
-        self.assertTrue(backend.sent.wait(2))
-        self.assertEqual(point.cancel_and_stop()['ret'], 3104)
-        self.assertTrue(done.wait(2))
-        self.assertEqual(notices[0][0][1], 'error')
-        self.assertEqual(len(backend.calls), 1)
-
-    def test_safety_stop_or_failure_does_not_advance(self):
-        for status in ('cancelled', 'error'):
-            with self.subTest(status=status):
-                point, backend, notices, done = self.setup_point()
-                backend.status = status
-                point.dispatch('move', dict(x=0.3, y=0.3, angle=90))
-                self.assertTrue(done.wait(2))
-                self.assertEqual(len(backend.calls), 1)
-                self.assertEqual(notices[0][0][1], status)
-
-    def test_failed_submission_preserves_error_and_requests_stop(self):
-        point, backend, notices, done = self.setup_point()
-        backend.ret = 3104
-        point.dispatch('move', dict(x=0.3, y=0.3))
-        self.assertTrue(done.wait(2))
-        self.assertEqual(len(backend.calls), 1)
-        self.assertEqual(backend.stop_count, 1)
-        self.assertEqual(notices[0][0][1], 'error')
-        self.assertIn('3104', notices[0][0][2]['error'])
-
-    def test_invalid_inputs_and_zero_plan_do_not_move(self):
-        point, backend, notices, _ = self.setup_point()
-        for args in (dict(x=float('nan')), dict(y=float('inf')), dict(angle=10),
-                     dict(angle=True), dict(direction='bad'), dict(x=100), dict(x=None)):
-            with self.subTest(args=args):
-                self.assertIn('error', point.dispatch('move', args))
-        reply = point.dispatch('move', {})
-        self.assertEqual(reply['state'], 'idle')
-        self.assertNotIn('action_id', reply)
-        self.assertEqual(backend.calls, [])
-        self.assertEqual(notices, [])
-
-    def test_base_dispatch_blocks_move_and_allows_stop(self):
-        point, backend, notices, done = self.setup_point()
-        backend.status = 'pending'
-        point.dispatch('move', dict(x=0.3, y=0.3))
-        self.assertTrue(backend.sent.wait(2))
-        class Other:
-            def dispatch(self, action, args):
-                return {'action': action}
-        self.assertIn('error', point.dispatch_base(Other(), 'move', {}))
-        self.assertEqual(point.dispatch_base(Other(), 'stop_move', {})['action'], 'stop_move')
-        self.assertTrue(done.wait(2))
-        self.assertEqual(len(backend.calls), 1)
-
-    def test_stop_failure_blocks_new_jobs_until_successful_retry(self):
-        point, backend, _, done = self.setup_point()
-        backend.status = 'pending'
-        backend.stop_ret = 3104
-        point.dispatch('move', dict(x=.3))
-        self.assertTrue(backend.sent.wait(2))
-        point.cancel_and_stop()
-        self.assertTrue(done.wait(2))
-        self.assertIn('error', point.dispatch('move', dict(x=.3)))
-        backend.stop_ret = 0
-        self.assertEqual(point.cancel_and_stop()['ret'], 0)
-        self.assertFalse(point.faulted)
-
-    def test_manual_stop_does_not_wait_for_move_ack(self):
-        release, sent, stopped = threading.Event(), threading.Event(), threading.Event()
-        backend = Backend()
-        def begin(*args):
-            backend.calls.append(args)
-            sent.set()
-            def wait():
-                release.wait(2)
-                return {'ret': 0}
-            return wait
-        backend._begin_motion = begin
-        original_stop = backend._stop_motion
-        def stop():
-            stopped.set()
-            return original_stop()
-        backend._stop_motion = stop
-        point, _, notices, done = self.setup_point(backend)
-        point.dispatch('move', dict(x=.3, y=.3))
-        try:
-            self.assertTrue(sent.wait(1))
-            caller = threading.Thread(target=point.cancel_and_stop)
-            caller.start()
-            self.assertTrue(stopped.wait(1))
-            self.assertFalse(release.is_set())
-            caller.join(1)
-            self.assertFalse(caller.is_alive())
-        finally:
-            release.set()
-        self.assertTrue(done.wait(2))
-        self.assertEqual(len(backend.calls), 1)
-        self.assertEqual(notices[0][0][1], 'cancelled')
-
-    def test_shutdown_cancels_joins_and_closes(self):
-        point, backend, notices, done = self.setup_point()
-        backend.status = 'pending'
-        closed = threading.Event()
-        backend.close = closed.set
-        point.dispatch('move', dict(x=.3, y=.3))
-        self.assertTrue(backend.sent.wait(1))
-        point.stop()
-        self.assertTrue(done.is_set())
-        self.assertTrue(closed.is_set())
-        self.assertIn('error', point.dispatch('move', dict(x=.3)))
-        self.assertEqual(notices[0][0][1], 'cancelled')
-
-    def test_schema_declares_base_and_completion(self):
-        point, _, _, _ = self.setup_point()
-        schema = point.get_tools()[0]['inputSchema']
-        self.assertEqual(schema['x-resource'], 'base')
-        self.assertEqual(schema['x-completion']['actions'], ['move'])
-        self.assertEqual(schema['properties']['angle']['enum'], [0, 30, 60, 90, 180])
-        for axis in ('x', 'y'):
-            field = schema['properties'][axis]
-            self.assertEqual(field['title'], 'X (m)' if axis == 'x' else 'Y (m，正向左 / 负向右)')
-            self.assertEqual((field['minimum'], field['maximum']), (-5, 5))
-            self.assertEqual(field['anyOf'], [{'const': 0}, {'minimum': 0.3}, {'maximum': -0.3}])
-        self.assertEqual(schema['properties']['angle']['title'], 'Angle (°)')
-
 
 class TestBundleShutdown(unittest.TestCase):
     def test_cards_stop_before_safety_peer_even_when_card_cleanup_fails(self):
@@ -644,76 +354,265 @@ class TestSmartMotionPointIntegration(unittest.TestCase):
             self.assertIn('error', env['handle_point_move'](self.command(1)))
         self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
 
-class TestDirectPointBackend(unittest.TestCase):
-    def test_bundle_registers_direct_sdk_card_without_loco_or_safety_proxy(self):
+
+
+def pose(x=0., y=0., yaw=0., odom_yaw=0., now=0., speed=0., rate=0.):
+    return dict(x=x, y=y, yaw=yaw, odom_yaw=odom_yaw, speed=speed, yaw_rate=rate,
+                odom_stamp=now, imu_stamp=now)
+
+
+class TestPoseFeedback(unittest.TestCase):
+    def test_freshness_validation_alignment_and_yaw_unwrap(self):
+        now = [10.]
+        feedback = PoseFeedback(clock=lambda: now[0])
+        with self.assertRaises(RuntimeError):
+            feedback.snapshot()
+        odom = dict(position=[1, 2, 0], velocity=[0, 0, 0], imu=dict(rpy=[0, 0, .2]))
+        feedback.update_odom(odom)
+        feedback.update_imu(dict(rpy=[0, 0, 3.1], gyroscope=[0, 0, 0]))
+        feedback.update_imu(dict(rpy=[0, 0, -3.1], gyroscope=[0, 0, 0]))
+        self.assertGreater(feedback.snapshot()['yaw'], math.pi)
+        now[0] += .3
+        feedback.update_imu(dict(rpy=[0, 0, -3.], gyroscope=[0, 0, 0]))
+        with self.assertRaisesRegex(RuntimeError, 'synchronized'):
+            feedback.snapshot()
+        now[0] += .3
+        with self.assertRaisesRegex(RuntimeError, 'stale'):
+            feedback.snapshot()
+        feedback.update_odom(dict(position=[float('nan'), 0], velocity=[0, 0], imu=dict(rpy=[0, 0, 0])))
+        with self.assertRaises(RuntimeError):
+            feedback.snapshot()
+
+
+class TestRelativeController(unittest.TestCase):
+    def test_simulated_slip_and_rotation_drift_converge_to_pose(self):
+        for angle in (0, math.pi, -math.pi, math.pi / 2):
+            with self.subTest(angle=angle):
+                initial = pose(2., -1., yaw=2.9, odom_yaw=.6)
+                controller = RelativeController(initial, dict(x=.6, y=-.4, yaw=angle), .3, .5, 0.)
+                current = dict(initial)
+                for step in range(2400):
+                    now = step * .05
+                    current['odom_stamp'] = current['imu_stamp'] = now
+                    (vx, vy, w), done = controller.step(current, now)
+                    self.assertLessEqual(math.hypot(vx, vy), .300001)
+                    self.assertLessEqual(abs(w), .500001)
+                    if done:
+                        break
+                    heading = .6 + current['yaw'] - initial['yaw']
+                    # Unequal axis gains and translation while turning simulate the observed robot.
+                    bx, by = .6 * vx + .015 * w, .8 * vy - .01 * w
+                    current['x'] += (math.cos(heading) * bx - math.sin(heading) * by) * .05
+                    current['y'] += (math.sin(heading) * bx + math.cos(heading) * by) * .05
+                    rate = .85 * w - .015 * abs(vx)
+                    current['yaw'] += rate * .05
+                    current['speed'], current['yaw_rate'] = math.hypot(bx, by), rate
+                self.assertTrue(done)
+                self.assertLessEqual(controller.error['position_error_m'], .05)
+                self.assertLessEqual(abs(controller.error['angle_error_deg']), 3.)
+
+    def test_pure_rotation_corrects_position_drift(self):
+        initial = pose()
+        controller = RelativeController(initial, dict(x=0, y=0, yaw=math.pi/2), .3, .5, 0)
+        velocity, done = controller.step(pose(x=.1, y=-.1, yaw=.2, now=.1), .1)
+        self.assertLess(velocity[0], 0)
+        self.assertGreater(velocity[1], 0)
+        self.assertGreater(velocity[2], 0)
+        self.assertFalse(done)
+
+    def test_frozen_feedback_never_completes_and_no_progress_times_out(self):
+        controller = RelativeController(pose(), dict(x=0, y=0, yaw=0), .3, .5, 0)
+        for now in (0., .6, 1.):
+            self.assertFalse(controller.step(pose(now=0.), now)[1])
+        controller = RelativeController(pose(), dict(x=1, y=0, yaw=0), .3, .5, 0)
+        controller.step(pose(), 0)
+        with self.assertRaisesRegex(RuntimeError, 'progress'):
+            controller.step(pose(now=11), 11)
+
+    def test_reset_is_an_error(self):
+        controller = RelativeController(pose(), dict(x=1, y=0, yaw=0), .3, .5, 0)
+        with self.assertRaisesRegex(RuntimeError, 'discontinuity'):
+            controller.step(pose(x=2, now=.1), .1)
+
+
+class FeedbackBackend:
+    def __init__(self):
+        self.calls = []
+        self.position = pose()
+        self.failure = None
+        self.sent = threading.Event()
+        self.send_ret = 0
+        self.arrive = False
+
+    def snapshot(self):
+        if self.failure:
+            raise RuntimeError(self.failure)
+        return {**self.position, 'odom_stamp': time.monotonic(), 'imu_stamp': time.monotonic()}
+
+    def command(self, *velocity):
+        self.calls.append(velocity)
+        if any(velocity):
+            self.sent.set()
+            if self.arrive:
+                self.position = pose(x=.3)
+        return self.send_ret
+
+
+class TestClosedLoopCard(unittest.TestCase):
+    def card(self, backend=None):
+        backend = backend or FeedbackBackend()
+        notifications, done = [], threading.Event()
+        def notify(*args, **kwargs):
+            notifications.append((args, kwargs))
+            done.set()
+        return LocoRelativeMovePlugin({}, backend, notify), backend, notifications, done
+
+    def test_validation_schema_and_relative_target_without_calibration(self):
+        card, _, _, _ = self.card()
+        for axis in ('x', 'y'):
+            for value in (0, .3, -.3, 5, -5):
+                self.assertEqual(card.plan({axis: value})[axis], value)
+            for value in (.29, -.29, 5.01, -5.01, float('nan')):
+                self.assertIn('error', card.dispatch('move', {axis: value}))
+        for angle in (True, 45, 'bad', float('inf')):
+            self.assertIn('error', card.dispatch('move', dict(angle=angle)))
+        self.assertAlmostEqual(card.plan(dict(angle='180', direction='right'))['yaw'], -math.pi)
+        tool = card.get_tools()[0]
+        self.assertEqual(tool['inputSchema']['x-resource'], 'base')
+        self.assertIn('正向左', tool['inputSchema']['properties']['y']['title'])
+
+    def test_no_feedback_rejects_before_sending(self):
+        card, backend, _, _ = self.card()
+        backend.failure = 'stale feedback'
+        self.assertIn('error', card.dispatch('move', dict(x=.3)))
+        self.assertEqual(backend.calls, [])
+
+    def test_feedback_completion_not_rpc_ack(self):
+        card, backend, notices, done = self.card()
+        backend.arrive = True
+        reply = card.dispatch('move', dict(x=.3))
+        self.assertEqual(reply['control'], 'closed_loop')
+        self.assertTrue(done.wait(3))
+        self.assertEqual(notices[0][0][1], 'completed')
+        self.assertTrue(notices[0][0][2]['stop_confirmed_by_feedback'])
+        self.assertEqual(backend.calls[-1], (0., 0., 0.))
+
+    def test_interrupt_cancels_and_lifecycle_response_is_idle(self):
+        card, backend, notices, done = self.card()
+        card.dispatch('move', dict(x=.3, y=.3, angle=90))
+        self.assertTrue(backend.sent.wait(1))
+        job = card.active
+        def dispatch(action, args):
+            self.assertTrue(job['cancel'].is_set())
+            return {'ret': 0}
         source = Path(__file__).resolve().parents[1] / 'unitree/g1/main.py'
         tree = ast.parse(source.read_text())
-        bundle = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'G1DeviceBundle')
-        init = next(node for node in bundle.body if isinstance(node, ast.FunctionDef) and node.name == '__init__')
-        registration = next(node for node in init.body if isinstance(node, ast.If)
-                            and 'loco_relative_move' in ast.unparse(node.test))
+        bundle = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'G1DeviceBundle')
+        method = next(n for n in bundle.body if isinstance(n, ast.FunctionDef) and n.name == 'dispatch')
+        future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
+        module = ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[]))
+        env = {'_lifecycle': SimpleNamespace(LIFECYCLE_ACTIONS=())}
+        exec(compile(module, str(source), 'exec'), env)
+        peer = SimpleNamespace(dispatch=dispatch, get_tool=lambda: {
+            'name': 'smart_motion', 'type': 'actuator', 'inputSchema': {}})
+        env['dispatch'](SimpleNamespace(_plugins=[peer], _point_card=card),
+                        'smart_motion', {'action': 'interrupt_motion'})
+        index = len(backend.calls)
+        self.assertTrue(done.wait(3))
+        self.assertEqual(notices[0][0][1], 'cancelled')
+        self.assertTrue(all(command == (0., 0., 0.) for command in backend.calls[index:]))
+        self.assertEqual(card.dispatch('stop', {}), {'state': 'idle'})
+
+    def test_stale_feedback_and_send_failure_report_error(self):
+        for failure in ('stale', 'send'):
+            with self.subTest(failure=failure):
+                card, backend, notices, done = self.card()
+                card.dispatch('move', dict(x=.3))
+                self.assertTrue(backend.sent.wait(1))
+                if failure == 'stale':
+                    backend.failure = 'feedback stale'
+                else:
+                    backend.send_ret = 3102
+                self.assertTrue(done.wait(3))
+                self.assertEqual(notices[0][0][1], 'error')
+                self.assertTrue(card.faulted)
+                self.assertEqual(backend.calls[-1], (0., 0., 0.))
+                self.assertIn('error', card.dispatch('move', dict(x=.3)))
+
+    def test_expired_goal_sends_stop_and_errors(self):
+        card, backend, notices, done = self.card()
+        card.MAX_MOTION_SECONDS = .01
+        card.dispatch('move', dict(x=.3))
+        self.assertTrue(done.wait(3))
+        self.assertEqual(notices[0][0][1], 'error')
+        self.assertIn('deadline', notices[0][0][2]['error'])
+
+    def test_adapter_uses_no_reply_and_short_command_duration(self):
+        calls = []
+        client = SimpleNamespace(_CallNoReply=lambda api, payload: calls.append((api, json.loads(payload))) or 0)
+        module = 'unitree_sdk2py.g1.loco.g1_loco_api'
+        with patch.dict('sys.modules', {module: SimpleNamespace(ROBOT_API_ID_LOCO_SET_VELOCITY=7105)}):
+            backend = PointBackend(client, FeedbackBackend())
+            self.assertEqual(backend.command(.1, -.2, .3), 0)
+        self.assertEqual(calls, [(7105, {'velocity': [.1, -.2, .3], 'duration': .3})])
+
+
+class TestClosedLoopWiring(unittest.TestCase):
+    def test_feedback_subscribes_to_card_topics(self):
+        from unitree.g1.relative_feedback import create_feedback_node
+        subscriptions = {}
+        class Node:
+            def __init__(self, name):
+                pass
+            def create_subscription(self, msg_type, topic, callback, qos):
+                subscriptions[topic] = callback
+        modules = {
+            'rclpy.node': SimpleNamespace(Node=Node),
+            'rclpy.qos': SimpleNamespace(QoSProfile=lambda **kwargs: kwargs,
+                ReliabilityPolicy=SimpleNamespace(BEST_EFFORT=1), HistoryPolicy=SimpleNamespace(KEEP_LAST=1)),
+            'std_msgs.msg': SimpleNamespace(String=object),
+        }
+        feedback = PoseFeedback()
+        with patch.dict('sys.modules', modules):
+            create_feedback_node('g1', feedback)
+        subscriptions['/g1/loco/state'](SimpleNamespace(data=json.dumps(dict(
+            position=[1, 2, 0], velocity=[0, 0, 0], imu=dict(rpy=[0, 0, .2])))))
+        subscriptions['/g1/state/imu'](SimpleNamespace(data=json.dumps(dict(
+            rpy=[0, 0, .4], gyroscope=[0, 0, 0]))))
+        self.assertEqual(feedback.snapshot()['x'], 1)
+        self.assertEqual(feedback.snapshot()['yaw'], .4)
+        subscriptions['/g1/state/imu'](SimpleNamespace(data='invalid json'))
+        with self.assertRaises(RuntimeError):
+            feedback.snapshot()
+
+    def test_bundle_installs_and_closes_feedback_node_with_bounded_no_reply_client(self):
+        from unitree.g1.relative_feedback import PoseFeedback
+        source = Path(__file__).resolve().parents[1] / 'unitree/g1/main.py'
+        tree = ast.parse(source.read_text())
+        bundle = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'G1DeviceBundle')
+        init = next(n for n in bundle.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+        registration = next(n for n in init.body if isinstance(n, ast.If) and 'loco_relative_move' in ast.unparse(n.test))
+        code = compile(ast.Module(body=[registration], type_ignores=[]), str(source), 'exec')
         calls = []
         client = SimpleNamespace(SetTimeout=lambda timeout: calls.append(('timeout', timeout)),
                                  Init=lambda: calls.append(('init',)))
+        node = SimpleNamespace(destroy_node=lambda: calls.append(('destroy',)))
+        executor = SimpleNamespace(add_node=lambda n: calls.append(('add', n)),
+                                   remove_node=lambda n: calls.append(('remove', n)))
         modules = {
             'loco_relative_move': SimpleNamespace(LocoRelativeMovePlugin=LocoRelativeMovePlugin, PointBackend=PointBackend),
+            'relative_feedback': SimpleNamespace(PoseFeedback=PoseFeedback, create_feedback_node=lambda ns, fb: node),
             'device': SimpleNamespace(_loco_acp_notify=lambda *args, **kwargs: None),
             'unitree_sdk2py.g1.loco.g1_loco_client': SimpleNamespace(LocoClient=lambda: client),
         }
         instance = SimpleNamespace(_plugins=[])
+        cfg = {key: {'enabled': True} for key in ('loco', 'state', 'loco_relative_move')}
+        env = dict(self=instance, plugins_cfg=cfg, executor=executor, namespace='g1', print=lambda *args: None)
         with patch.dict('sys.modules', modules):
-            exec(compile(ast.Module(body=[registration], type_ignores=[]), str(source), 'exec'),
-                 {'self': instance, 'plugins_cfg': {'loco_relative_move': {'enabled': True}}, 'print': lambda *args: None})
-        self.assertEqual(calls, [('timeout', 10.), ('init',)])
-        self.assertEqual(instance._plugins, [instance._point_card])
-        self.assertIs(instance._point_card.loco.motion.client, client)
-
-    def backend(self):
-        calls = []
-        client = SimpleNamespace(
-            BeginMove=lambda *args: calls.append(('move', args)) or (lambda: 0),
-            BeginStopMove=lambda: calls.append(('stop', ())) or (lambda: 0))
-        return PointBackend(client), client, calls
-
-    def test_direct_sdk_runs_all_stages_and_notifies_completion(self):
-        backend, _, calls = self.backend()
-        backend.motion.timer_factory = lambda delay, callback, args: threading.Timer(.01, callback, args)
-        done, notifications = threading.Event(), []
-        def notify(*args, **kwargs):
-            notifications.append(args)
-            done.set()
-        card = LocoRelativeMovePlugin({}, backend, notify)
-        card.dispatch('move', dict(x=.3, y=-.3, angle=90))
-        self.assertTrue(done.wait(2))
-        self.assertEqual([call[0] for call in calls], ['move', 'stop'] * 3)
-        self.assertEqual([call[1][:3] for call in calls if call[0] == 'move'],
-                         [(.3, 0., 0.), (0., -.3, 0.), (0., 0., .5)])
-        self.assertEqual(notifications[0][1], 'completed')
-        self.assertEqual(notifications[0][2]['completed_stages'], ['straight', 'lateral', 'rotation'])
-
-    def test_direct_sdk_cancel_stops_and_does_not_send_next_stage(self):
-        backend, _, calls = self.backend()
-        pending = backend._begin_motion(.3, 0., 0., 30, 'point_job_0')
-        self.assertTrue(callable(pending))
-        self.assertEqual(pending()['ret'], 0)
-        self.assertEqual(backend._stop_motion()['ret'], 0)
-        self.assertEqual(backend._motion_result('point_job_0')['status'], 'cancelled')
-        self.assertEqual([call[0] for call in calls], ['move', 'stop'])
-
-    def test_direct_sdk_move_failure_never_advances_sequence(self):
-        backend, client, calls = self.backend()
-        client.BeginMove = lambda *args: calls.append(('move', args)) or (lambda: 3104)
-        done, statuses = threading.Event(), []
-        def notify(action_id, status, result, **kwargs):
-            statuses.append(status)
-            done.set()
-        card = LocoRelativeMovePlugin({}, backend, notify)
-        card.dispatch('move', dict(x=.3, y=.3))
-        self.assertTrue(done.wait(2))
-        self.assertEqual(statuses, ['error'])
-        self.assertEqual(len([call for call in calls if call[0] == 'move']), 1)
-        self.assertTrue(any(call[0] == 'stop' for call in calls))
-
-    def test_requires_sdk_client(self):
-        with self.assertRaises(ValueError):
-            PointBackend(None)
+            exec(code, env)
+            self.assertEqual(calls[:3], [('timeout', .05), ('init',), ('add', node)])
+            instance._point_card.stop()
+            self.assertEqual(calls[-2:], [('remove', node), ('destroy',)])
+            cfg['state']['enabled'] = False
+            with self.assertRaisesRegex(ValueError, 'publishers'):
+                exec(code, env)

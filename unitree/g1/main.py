@@ -134,14 +134,25 @@ class G1DeviceBundle:
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
         if plugins_cfg.get("loco_relative_move", {}).get("enabled", True):
+            if not (plugins_cfg.get("loco", {}).get("enabled", False)
+                    and plugins_cfg.get("state", {}).get("enabled", False)):
+                raise ValueError("loco_relative_move requires loco_state and IMU publishers (enable loco and state)")
             from loco_relative_move import LocoRelativeMovePlugin, PointBackend
+            from relative_feedback import PoseFeedback, create_feedback_node
             from device import _loco_acp_notify
             from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
             relative_client = LocoClient()
-            relative_client.SetTimeout(10.0)
+            relative_client.SetTimeout(0.05)  # Bound local DDS writes; never await RPC responses.
             relative_client.Init()
+            feedback = PoseFeedback()
+            feedback_node = create_feedback_node(namespace, feedback)
+            executor.add_node(feedback_node)
+            def close_relative_feedback():
+                executor.remove_node(feedback_node)
+                feedback_node.destroy_node()
             self._point_card = LocoRelativeMovePlugin(
-                plugins_cfg.get("loco_relative_move", {}), PointBackend(relative_client), _loco_acp_notify)
+                plugins_cfg.get("loco_relative_move", {}),
+                PointBackend(relative_client, feedback, close_relative_feedback), _loco_acp_notify)
             self._plugins.append(self._point_card)
             print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
 
@@ -292,7 +303,8 @@ class G1DeviceBundle:
                     resource = tool_def.get("inputSchema", {}).get("x-resource")
                     is_base = (resource == "base" or isinstance(resource, list) and "base" in resource
                                or tool_name in ("loco", "switch_mode", "switch_mode_expert", "spatial"))
-                    if point and tool_name != "loco_relative_move" and is_base and tool_def["type"] == "actuator":
+                    interrupts_motion = tool_name == "smart_motion" and action == "interrupt_motion"
+                    if point and tool_name != "loco_relative_move" and (is_base or interrupts_motion) and tool_def["type"] == "actuator":
                         result = point.dispatch_base(p, action, args)
                     else:
                         result = p.dispatch(action, args)
