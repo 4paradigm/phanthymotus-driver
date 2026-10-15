@@ -321,13 +321,29 @@ def test_legacy_settings_file_maps_to_presets(monkeypatch, tmp_path):
     assert module.load_parameters() == {'sensitivity': 'normal'}
 
 
+def test_high_sensitivity_rejects_modest_rises_and_accepts_clear_speech(monkeypatch):
+    module = _load_card(monkeypatch)
+    gate = module.SoundActivityGate(**module.SENSITIVITY_GATE_PARAMS['high'])
+
+    def frame(level):
+        wave = module.np.tile([level, -level], 320)
+        return module.np.stack([wave] * 4 + [module.np.zeros_like(wave)] * 4,
+                               axis=1).reshape(-1)
+
+    assert not any(gate.accepts(frame(40)) for _ in range(8))
+    assert not gate.accepts(frame(70))
+    assert not gate.accepts(frame(70))
+    assert not gate.accepts(frame(80))
+    assert gate.accepts(frame(80))
+
+
 def test_sensitivity_preset_table_matches_documentation(monkeypatch):
     module = _load_card(monkeypatch)
     assert module.DEFAULT_PARAMETERS == {'sensitivity': 'normal'}
     assert set(module.SENSITIVITY_GATE_PARAMS) == {'high', 'normal', 'low'}
     # 三档全部逐值冻结：任何一档的语义漂移都必须炸测试（含后续风扇修复的改档）。
     assert module.SENSITIVITY_GATE_PARAMS == {
-        'high':   {'onset_level': 8.0,  'onset_ratio': 1.6,
+        'high':   {'onset_level': 8.0,  'onset_ratio': 1.8,
                    'burst_level': 12.0, 'burst_ratio': 3.2},
         'normal': {'onset_level': 10.0, 'onset_ratio': 2.0,
                    'burst_level': 15.0, 'burst_ratio': 4.0},

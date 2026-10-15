@@ -69,7 +69,7 @@ platform, not migrated.
 
 ```
 SENSITIVITY_GATE_PARAMS = {
-    "high":   {"onset_level": 8.0,  "onset_ratio": 1.6, "burst_level": 12.0, "burst_ratio": 3.2},
+    "high":   {"onset_level": 8.0,  "onset_ratio": 1.8, "burst_level": 12.0, "burst_ratio": 3.2},
     "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
     "low":    {"onset_level": 15.0, "onset_ratio": 2.5, "burst_level": 25.0, "burst_ratio": 5.0},
 }
