@@ -31,6 +31,7 @@ Available tools are:
   the requested base-frame B using
   joint-space planning by default, with an explicit TCP-linear mode available.
   Relative `move_offset`, absolute `movel`, and waypoint `movep` are not exposed.
+- `gripper`: RealMan two-finger gripper position control (1~1000 opening stroke, 0~120 mm) with force configuration (10~100%), stall detection, and keep/rollback protection policies.
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
@@ -151,6 +152,43 @@ consumed; this prevents a late event from completing the next action.
 The controller's collision level, electronic fences, virtual walls, and
 physical safety system remain responsible for collision protection; the driver
 has no environment model and does not plan a detour around obstacles.
+
+## Two-finger gripper (`gripper`)
+
+The `gripper` card exposes position control for RealMan two-finger end-effectors, supporting ZX (知行) 1-DOF ecosystem grippers via the `RM_ARM+` protocol as well as standard grippers via SDK position commands.
+
+### Position convention
+
+- `position`: integer from `1` (fully closed) to `1000` (fully open), corresponding to a physical opening travel stroke of 0~120 mm.
+- Every motion request requires explicit safety confirmation: `confirm_motion=true`.
+- Motion is guarded by the client's `motion_gate` and an internal `_gripper_lock`, preventing concurrent overlapping motions.
+
+### Force and stall parameters
+
+- `force`: integer from `10` to `100` (default `20`). Configures the ZX gripper torque threshold written to ecosystem register `1220`. Values below `10` are rejected because they fall inside the mechanical static friction deadband and cannot reliably drive motion.
+- `on_stall`: protection policy when the gripper is blocked during movement:
+  - `keep` (default): keeps the gripper at the blocked position. Crucially, it updates the controller setpoint to the blocked position so that removing the obstacle does not cause the gripper to jump forward toward the original target.
+  - `rollback`: automatically and safely backs off to the start position recorded before the motion began.
+- `stall_timeout_seconds`: floating-point number between `0.5` and `30.0` seconds (default `3.0`). Defines the idle timeout without position progress (>10 units deadband) before motion is declared stalled.
+
+### Completion semantics and ACP contract
+
+Following the standard asynchronous ACP contract (`x-completion`):
+1. `set_position` returns immediately with `{"state": "running", "action_id": "rm75_gripper_..."}`.
+2. The background monitor polls position progress and stall status.
+3. Upon reaching the target, detecting stall, being interrupted, or failing, it POSTs the terminal outcome to `/api/acp/complete`:
+   - `status: "completed"` with reason:
+     - `target_reached`: reached target within tolerance (<= 10 units).
+     - `motion_stalled_kept`: stalled and locked at blocked position.
+     - `motion_stalled_rolled_back`: stalled and returned to start position.
+     - `interrupted`: stopped during execution.
+   - `status: "failed"` with reason (e.g., hardware fault or timeout).
+4. Full completion details (including `position`, `target`, `start_position`, `blocked_position`, `stalled`, `on_stall`, `stall_timeout_seconds`, `elapsed_seconds`) are preserved in the completion payload and queryable via `gripper.info` under `last_completion`.
+
+### Hardware fault detection and recovery limitations
+
+- RM+ feedback validation: the driver inspects `sys_state` and `dof_err` from `rm_get_rm_plus_state_info`. If `sys_state != 0` or any `dof_err != 0` is reported by the controller, the driver raises an error and terminates with `status: "failed"` rather than mistaking hardware failure for a mechanical stall.
+- The standard SDK provides no dedicated pre-emptive gripper cancel API; calling `stop` marks the action interrupted and waits for the ongoing command to conclude in a safe terminal state before releasing locks.
 
 The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
