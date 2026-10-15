@@ -4581,7 +4581,8 @@ class TtsPlugin:
         self._pending_play: dict[str, threading.Event] = {}  # sid → Event
         self._pending_play_status: dict[str, int] = {}  # sid → event_code
         self._pending_play_duration: dict[str, float] = {}  # sid → total duration (from progress)
-        self._pending_play_progress_at: dict[str, float] = {}  # sid → 第一条 progress 的到达时刻
+        self._pending_play_progress_at: dict[str, float] = {}  # sid → 最近一条推进的 progress 时刻
+        self._pending_play_position: dict[str, float] = {}  # sid → 最近一条 progress 的 position
         self._play_event_buffer: dict[str, int] = {}  # 缓存最近的 PlayEvent（防竞态）
 
     def get_tool(self) -> dict:
@@ -4848,14 +4849,21 @@ class TtsPlugin:
         sid = msg.sid
         duration = msg.duration
         if sid and duration > 0 and sid in self._pending_play:
-            # 只更新一次（取第一次收到的 duration）。到达时刻也要记：等待方的截止
-            # 时间是「第一条 progress 的时刻 + duration + 余量」，用它自己的 now
-            # 会把 progress 在它两次轮询之间到达的那段算进去。
+            import time as _t
+            position = float(getattr(msg, "position", 0.0) or 0.0)
             if sid not in self._pending_play_duration:
-                import time as _t
                 self._pending_play_duration[sid] = duration
-                self._pending_play_progress_at[sid] = _t.time()
                 print(f"[TtsPlugin] PlayProgress: sid={sid} duration={duration:.1f}s")
+            # 每一条推进了 position 的 progress 都要记时刻 —— 它是播放器的**存活
+            # 信号**，等待方靠它续期（见 _await_segment）。lyre 正常每 0.5s 一条。
+            #
+            # 原先只记第一条，截止时间一次算定为「首条 progress + duration + 余量」。
+            # 10-15 14:34 实测：lyre 播到 31.6/48.6s 卡死，position 在 32 秒墙钟里只
+            # 走了 0.5s，而我们要等整个 duration 走完才察觉 —— 声音早停了 32 秒。
+            prev = self._pending_play_position.get(sid)
+            if prev is None or position > prev + 0.01:
+                self._pending_play_position[sid] = position
+                self._pending_play_progress_at[sid] = _t.time()
 
     def stop(self):
         pass
@@ -5055,8 +5063,17 @@ class TtsPlugin:
     # 默认 5s，不可配、不重试）之后，死任务卡在 lyre 队头 150 秒，字数兜底算出来的
     # 122 秒就这么被白等掉了。
     _PLAY_START_GRACE_S = 20.0
-    # 开播之后的余量：PlayProgress 自带 duration，加这点余量兜解码/喇叭的尾巴。
-    _PLAY_SLACK_S = 8.0
+    # 开播之后：progress 每来一条就续期这么久。lyre 实测 0.5s 一条（position 每次
+    # +0.5019），所以 5s 是 10 倍余量；播完时最后一条 progress 与 COMPLETED 相隔
+    # 0.14s，不会因为这个阈值把正常结尾判成停滞。
+    #
+    # 这个值决定「卡死多久被发现」。10-15 14:34 那次用的是 duration+8 的一次性
+    # 截止，发现用了 32 秒；换成续期之后同样的故障 5 秒就能发现，而真的播久了
+    # （COMPLETED 比 duration 晚几秒）也不会被误杀 —— 两个方向都对。
+    _PROGRESS_STALL_S = 5.0
+    # 兜底上限：防止一个「一直发 progress 却永远不 COMPLETED」的播放器把队列挂死。
+    # 乘以 3 是因为真实播放时长本来就可能超过 duration，这条只拦病态情况。
+    _PLAY_DURATION_CAP_FACTOR = 3.0
 
     def _play_job(self, job: dict) -> str:
         """顺序播放一个 job 的各段，返回 overall_status。不回 ACP（由 worker 统一回）。"""
@@ -5187,33 +5204,55 @@ class TtsPlugin:
                 print(f"[TtsPlugin] cancelled (buffered STOPPED/CANCELLED) seg {i+1}/{n}")
                 self._pending_play_duration.pop(seg_sid, None)
                 self._pending_play_progress_at.pop(seg_sid, None)
+                self._pending_play_position.pop(seg_sid, None)
                 return "cancelled"
             print(f"[TtsPlugin] seg {i+1}/{n} from buffer: sid={seg_sid} event={buffered}")
             self._pending_play_duration.pop(seg_sid, None)
             self._pending_play_progress_at.pop(seg_sid, None)
+            self._pending_play_position.pop(seg_sid, None)
             return "completed" if buffered == 1 else "error"
 
         ev = threading.Event()
         self._pending_play[seg_sid] = ev
         try:
-            deadline = _t.time() + self._PLAY_START_GRACE_S
-            started = False
-            timed_out = True
+            t0 = _t.time()
+            first_at = None       # 第一条 progress 的时刻（开播）
+            duration = 0.0
+            why = None
             while True:
                 if cancel_event.is_set():
                     break
                 if ev.wait(timeout=0.5):
-                    timed_out = False
+                    why = None
                     break
-                if not started:
-                    d = self._pending_play_duration.get(seg_sid)
-                    if d and d > 0:
-                        started = True
-                        at = self._pending_play_progress_at.get(seg_sid, _t.time())
-                        deadline = at + d + self._PLAY_SLACK_S
-                        print(f"[TtsPlugin] seg {i+1}/{n} 开播，duration={d:.1f}s，"
-                              f"等到 +{deadline - _t.time():.0f}s")
-                if _t.time() >= deadline:
+                now = _t.time()
+                last_at = self._pending_play_progress_at.get(seg_sid)
+                if last_at is not None and first_at is None:
+                    first_at = last_at
+                    duration = self._pending_play_duration.get(seg_sid) or 0.0
+                    print(f"[TtsPlugin] seg {i+1}/{n} 开播，duration={duration:.1f}s，"
+                          f"progress 续期 {self._PROGRESS_STALL_S:.0f}s/条")
+                if last_at is None:
+                    # 还没开播：lyre 要先去云端合成（实测 0–7s），还可能排在别人后面。
+                    if now - t0 >= self._PLAY_START_GRACE_S:
+                        why = (f"{self._PLAY_START_GRACE_S:.0f}s 内没有任何 "
+                               f"PlayProgress，判定为未开播"
+                               f"（lyre 合成失败或队头堵塞）")
+                        break
+                    continue
+                # 开播了：只要 progress 还在推进就一直等 —— 真实播放时长超过 duration
+                # 是正常的，被误杀的代价是把话切断。
+                stalled = now - last_at
+                if stalled >= self._PROGRESS_STALL_S:
+                    pos = self._pending_play_position.get(seg_sid, 0.0)
+                    why = (f"播放停滞：{stalled:.1f}s 没有新的 PlayProgress"
+                           f"（停在 {pos:.1f}/{duration:.1f}s，播放器卡死）")
+                    break
+                if duration and now - first_at >= duration * self._PLAY_DURATION_CAP_FACTOR \
+                        + self._PLAY_START_GRACE_S:
+                    why = (f"已播 {now - first_at:.0f}s，超过 duration "
+                           f"{duration:.1f}s 的 {self._PLAY_DURATION_CAP_FACTOR:.0f} 倍"
+                           f"仍未 COMPLETED")
                     break
 
             if cancel_event.is_set():
@@ -5221,12 +5260,7 @@ class TtsPlugin:
                 self._stop_lyre(f"cancelled {job['action_id']} seg{i+1}")
                 return "cancelled"
 
-            if timed_out:
-                if started:
-                    why = "播放超过 duration + 余量仍未收到 COMPLETED"
-                else:
-                    why = (f"{self._PLAY_START_GRACE_S:.0f}s 内没有任何 PlayProgress，"
-                           f"判定为未开播（lyre 合成失败或队头堵塞）")
+            if why is not None:
                 print(f"[TtsPlugin] PlayEvent timeout: seg {i+1}/{n} sid={seg_sid} — {why}",
                       flush=True)
                 # 必须先停：不停的话 lyre 可能在我们报 error 之后才把它放出来。
@@ -5257,6 +5291,7 @@ class TtsPlugin:
             self._pending_play_status.pop(seg_sid, None)
             self._pending_play_duration.pop(seg_sid, None)
             self._pending_play_progress_at.pop(seg_sid, None)
+            self._pending_play_position.pop(seg_sid, None)
             self._play_event_buffer.pop(seg_sid, None)
 
     def _acp_callback(self, job: dict, overall_status: str) -> None:

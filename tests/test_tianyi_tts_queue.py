@@ -97,37 +97,72 @@ class _Future:
         return self._resp
 
 
-class FakeLyre:
-    """记录每次 play_text，并按脚本回放 progress / event。
+NEVER = object()        # COMPLETED 永远不来
 
-    `script` 是 per-submission 的列表，每项 None 表示「永远不回任何事件」（合成失败
-    或队头堵塞），否则是 (duration, delay_progress, delay_event)。
+
+def plan(duration, *, progress_from=0.05, progress_every=0.05,
+         progress_until=None, event_at=None, event=1):
+    """一条播放计划。
+
+    真实的 lyre 每 0.5s 发一条 progress（position 单调推进），播完时最后一条
+    progress 与 COMPLETED 相隔 0.14s。用例里把这个节奏按比例缩小。
+
+    `progress_until=None` 表示 progress 一直发到 `event_at`；给一个更小的值就是
+    **播放中途卡死**（progress 停了但 COMPLETED 永远不来）—— 10-15 14:34 的形状。
+
+    `event_at=NEVER` 表示 COMPLETED 永远不来。必须是显式哨兵而不是 None：None 在这里
+    的含义是「沿用 duration」，拿它表达「永不」会静默变成「按时完成」，用例于是以
+    completed 通过，看着像在测超时其实什么都没测到。
     """
+    if event_at is None:
+        event_at = duration
+    if progress_until is None:
+        progress_until = duration if event_at is NEVER else event_at
+    return {"duration": duration, "progress_from": progress_from,
+            "progress_every": progress_every, "progress_until": progress_until,
+            "event_at": None if event_at is NEVER else event_at, "event": event}
+
+
+DEAD = None             # lyre 收下了但永远不回任何事件（合成失败 / 队头堵塞）
+
+
+class FakeLyre:
+    """记录每次 play_text，并按计划回放 progress 流 / event。"""
 
     def __init__(self, plugin, script):
         self.plugin = plugin
         self.script = list(script)
         self.submitted = []        # [(sid, text, force, last)]
         self.timers = []
+        self.progress_counts = {}
         self.srv_type = types.SimpleNamespace(Request=_Req)
 
     def call_async(self, req):
         n = len(self.submitted)
         sid = f"sid{n}"
         self.submitted.append((sid, req.text, req.force, req.last))
-        plan = self.script[n] if n < len(self.script) else (0.2, 0.05, 0.2)
-        if plan is not None:
-            duration, d_prog, d_ev = plan
-            t1 = threading.Timer(d_prog, self._progress, args=(sid, duration))
-            t2 = threading.Timer(d_ev, self._event, args=(sid, 1))
-            for t in (t1, t2):
-                t.daemon = True
-                t.start()
-                self.timers.append(t)
+        p = self.script[n] if n < len(self.script) else plan(0.2)
+        if p is not None:
+            t = p["progress_from"]
+            pos = 0.0
+            while t <= p["progress_until"] + 1e-9:
+                self._at(t, self._progress, sid, pos, p["duration"])
+                pos += p["progress_every"]
+                t += p["progress_every"]
+            if p["event_at"] is not None and p["event"] is not None:
+                self._at(p["event_at"], self._event, sid, p["event"])
         return _Future(_Resp(sid))
 
-    def _progress(self, sid, duration):
-        self.plugin._on_play_progress(types.SimpleNamespace(sid=sid, duration=duration))
+    def _at(self, delay, fn, *args):
+        timer = threading.Timer(delay, fn, args=args)
+        timer.daemon = True
+        timer.start()
+        self.timers.append(timer)
+
+    def _progress(self, sid, position, duration):
+        self.progress_counts[sid] = self.progress_counts.get(sid, 0) + 1
+        self.plugin._on_play_progress(types.SimpleNamespace(
+            sid=sid, position=position, duration=duration))
 
     def _event(self, sid, code):
         self.plugin._on_play_event(types.SimpleNamespace(sid=sid, event=code))
@@ -139,7 +174,7 @@ class FakeStopClient:
         self.srv_type = types.SimpleNamespace(Request=_Req)
 
 
-def make_plugin(script, grace=2.0, slack=0.4):
+def make_plugin(script, grace=2.0, stall=0.4):
     p = TtsPlugin.__new__(TtsPlugin)
     p._jobs = queue.Queue(maxsize=TtsPlugin._QUEUE_MAX)
     p._queue_lock = threading.RLock()
@@ -149,10 +184,11 @@ def make_plugin(script, grace=2.0, slack=0.4):
     p._pending_play_status = {}
     p._pending_play_duration = {}
     p._pending_play_progress_at = {}
+    p._pending_play_position = {}
     p._play_event_buffer = {}
     p._startup_error = None
     p._PLAY_START_GRACE_S = grace
-    p._PLAY_SLACK_S = slack
+    p._PROGRESS_STALL_S = stall
 
     lyre = FakeLyre(p, script)
     p._play_client = lyre
@@ -200,7 +236,7 @@ def test_two_speaks_both_play_in_order_and_each_gets_one_acp():
     这是 13:06 那次「还没播完就走了」的最小复现：第二条（自动播报）到达时，第一条
     （讲解）必须继续，并且在它真的播完之后才报 completed。
     """
-    p = make_plugin(script=[(0.3, 0.05, 0.35), (0.2, 0.05, 0.25)])
+    p = make_plugin(script=[plan(0.35), plan(0.25)])
     first = p._speak("第一段讲解。", force=False)
     second = p._speak("自动播报。", force=False)
 
@@ -221,7 +257,7 @@ def test_second_speak_is_submitted_only_after_the_first_finished():
 
     否则就还是今天那个形状：两段在 lyre 里排队，而我们这边以为各自独立。
     """
-    p = make_plugin(script=[(0.6, 0.05, 0.6), (0.1, 0.05, 0.15)])
+    p = make_plugin(script=[plan(0.6), plan(0.15)])
     p._speak("长的一段。", force=False)
     p._speak("短的一段。", force=False)
 
@@ -234,7 +270,7 @@ def test_second_speak_is_submitted_only_after_the_first_finished():
 # ── 2. interrupt 才是打断 ────────────────────────────────────────────────────
 
 def test_interrupt_stops_lyre_and_cancels_everything_queued():
-    p = make_plugin(script=[(5.0, 0.05, 5.0), None, None], grace=5.0)
+    p = make_plugin(script=[plan(5.0), DEAD, DEAD], grace=5.0)
     a = p._speak("正在播的。", force=False)
     b = p._speak("排队的一。", force=False)
     c = p._speak("排队的二。", force=False)
@@ -254,7 +290,7 @@ def test_interrupt_stops_lyre_and_cancels_everything_queued():
 
 def test_force_speak_interrupts_then_plays():
     """force 的既有语义是「打断当前播放」，保留。"""
-    p = make_plugin(script=[(5.0, 0.05, 5.0), (0.1, 0.05, 0.15)], grace=5.0)
+    p = make_plugin(script=[plan(5.0), plan(0.15)], grace=5.0)
     a = p._speak("正在播的。", force=False)
     assert wait_for(lambda: len(p.lyre.submitted) == 1)
     b = p._speak("插队的。", force=True)
@@ -274,7 +310,7 @@ def test_no_playprogress_within_grace_stops_lyre_and_fails_the_job():
     旧代码按字数估一个时长继续等，到点判 error 就走，而 lyre 之后才把音频放出来。
     现在必须先把 lyre 停掉再报错。
     """
-    p = make_plugin(script=[None], grace=0.6)
+    p = make_plugin(script=[DEAD], grace=0.6)
     job = p._speak("一段不会被 lyre 回事件的话。", force=False)
 
     assert wait_for(lambda: len(p.acp) == 1), p.acp
@@ -288,7 +324,7 @@ def test_failed_segment_does_not_queue_the_next_segment():
     13:18–13:21 的 3 分钟静默就是这么攒出来的。
     """
     long_text = "甲" * 300 + "。" + "乙" * 200 + "。"
-    p = make_plugin(script=[None, (0.1, 0.05, 0.15)], grace=0.6)
+    p = make_plugin(script=[DEAD, plan(0.15)], grace=0.6)
     job = p._speak(long_text, force=False)
     assert job["segments"] == 2, "用例前提：这段文本应被切成两段"
 
@@ -304,7 +340,7 @@ def test_playprogress_duration_beats_the_character_estimate():
     """
     # 7 个字：字数兜底会给出 7/2.5+10 ≈ 12.8s；这里 grace 只有 0.5s，
     # 只有 progress 续约（duration=1.2s）才能等到 1.0s 的 COMPLETED。
-    p = make_plugin(script=[(1.2, 0.1, 1.0)], grace=0.5, slack=0.4)
+    p = make_plugin(script=[plan(1.2, event_at=1.0)], grace=0.5, stall=0.4)
     job = p._speak("七个字的一句话", force=False)
 
     assert wait_for(lambda: len(p.acp) == 1, timeout=5), p.acp
@@ -312,14 +348,69 @@ def test_playprogress_duration_beats_the_character_estimate():
     assert p._stop_client.calls == 0, "不该停 lyre"
 
 
-def test_overrunning_playback_stops_lyre_instead_of_claiming_success():
-    """开播了但 duration + 余量到点还没 COMPLETED → 停 lyre 并报错，不能假成功。"""
-    p = make_plugin(script=[(0.3, 0.05, 30.0)], grace=5.0, slack=0.2)
+def test_mid_playback_stall_is_caught_by_the_progress_watchdog():
+    """开播之后 progress 断流 = 播放器卡死 → 停 lyre 并报错，不能假成功。
+
+    10-15 14:34 的真机形状：lyre 播到 31.6/48.6s 卡死，position 在 32 秒墙钟里只走了
+    0.5s。当时的规则是「首条 progress + duration + 8s」一次算定，所以要等整个
+    duration 走完才察觉 —— 声音早停了 32 秒。按 progress 续期之后，停滞阈值到点就判。
+    """
+    p = make_plugin(script=[plan(2.0, progress_until=0.3, event_at=NEVER)], grace=5.0, stall=0.4)
     job = p._speak("开了播但不报完成。", force=False)
 
     assert wait_for(lambda: len(p.acp) == 1, timeout=5), p.acp
     assert p.acp == [(job["action_id"], "error")]
     assert p._stop_client.calls >= 1
+
+
+def test_playback_longer_than_reported_duration_is_not_killed():
+    """真实播放时长超过 lyre 报的 duration 时，只要 progress 还在推进就必须继续等。
+
+    这是「按 progress 续期」相对「首条 progress + duration + 余量」的核心差别。后者
+    在这个场景下会把话从中间切断 —— 而被误杀的代价是用户听到半句话，比多等几秒糟得多。
+    """
+    # duration 报 0.4s，progress 一直发到 1.2s，COMPLETED 也在 1.2s。
+    # 一次算定的旧规则（0.4 + 余量）会在 1.2s 之前就判超时。
+    p = make_plugin(script=[plan(0.4, progress_until=1.2, event_at=1.2)],
+                    grace=0.5, stall=0.4)
+    job = p._speak("一句被 lyre 低报了时长的话。", force=False)
+
+    assert wait_for(lambda: len(p.acp) == 1, timeout=6), p.acp
+    assert p.acp == [(job["action_id"], "completed")]
+    assert p.stops == [], "把还在推进的播放停掉了"
+
+
+def test_stall_is_detected_in_about_one_stall_window_not_one_duration():
+    """卡死的发现时间应该是「一个停滞窗口」量级，而不是「一整个 duration」。
+
+    14:34 那次 duration=48.6s，卡死在 31.6s 处，旧规则用了 32 秒才发现。续期之后，
+    发现时间与 duration 无关。
+    """
+    import time as _t
+    # duration 报 10s（相当于真机的 48.6s），progress 在 0.3s 就断（相当于卡死）
+    p = make_plugin(script=[plan(10.0, progress_until=0.3, event_at=NEVER)],
+                    grace=5.0, stall=0.5)
+    t0 = _t.time()
+    job = p._speak("一句播到一半就卡死的话。", force=False)
+    assert wait_for(lambda: len(p.acp) == 1, timeout=6), p.acp
+    elapsed = _t.time() - t0
+
+    assert p.acp == [(job["action_id"], "error")]
+    assert p.stops, "卡死后没有停 lyre"
+    # 0.3s 断流 + 0.5s 停滞窗口 ≈ 0.8s；给足轮询余量也该远小于 duration
+    assert elapsed < 3.0, f"用了 {elapsed:.1f}s 才发现，接近一整个 duration"
+
+
+def test_chatty_but_never_completing_player_still_fails_eventually():
+    """一直发 progress 却永远不 COMPLETED 的病态播放器不能把队列挂死。"""
+    p = make_plugin(script=[plan(0.3, progress_until=30.0, event_at=NEVER)],
+                    grace=0.4, stall=5.0)
+    job = p._speak("一句永远不报完成的话。", force=False)
+
+    # 上限 = duration * _PLAY_DURATION_CAP_FACTOR + grace = 0.3*3 + 0.4 ≈ 1.3s
+    assert wait_for(lambda: len(p.acp) == 1, timeout=8), p.acp
+    assert p.acp == [(job["action_id"], "error")]
+    assert p.stops
 
 
 # ── 4. stop 请求的构造 ──────────────────────────────────────────────────────
