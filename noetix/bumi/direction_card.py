@@ -264,13 +264,10 @@ class SoundDirectionPlugin:
                                     "window_start_us": msg.window_start_us,
                                     "window_end_us": msg.window_end_us}
             self._last_direction_time = time.monotonic()
-            # Keep the exact angle for ASR and an integer angle for display.
-            angle = math.floor(msg.angle_deg + 0.5)
             self._publish_observation({
                 "state": "fresh", "trigger": "sound_activity",
                 "timestamp_ms": msg.published_us // 1000,
-                "angle": 180 if angle == -180 else angle,
-                "angle_deg": msg.angle_deg, "unit": "deg",
+                "angle_deg": msg.angle_deg,
                 "angle_convention": "robot_front_0_left_positive_ccw",
                 "audio_window_start_us": msg.window_start_us,
                 "audio_window_end_us": msg.window_end_us,
