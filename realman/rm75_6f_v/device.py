@@ -459,7 +459,7 @@ class RM75Plugin:
 
 GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
 GRIPPER_POSITION_MAX = 1000
-GRIPPER_FORCE_MIN = 1
+GRIPPER_FORCE_MIN = 10     # 知行夹爪物理机械起动静摩擦临界值约为 8~10%，低于 10 处于死区无法驱动
 GRIPPER_FORCE_MAX = 100
 GRIPPER_DEFAULT_FORCE = 20
 GRIPPER_STALL_DEADBAND = 10  # 堵转受阻范围判定：位置变化小于 10 个单位
@@ -554,7 +554,7 @@ class GripperPlugin:
                     "minimum": GRIPPER_FORCE_MIN,
                     "maximum": GRIPPER_FORCE_MAX,
                     "default": GRIPPER_DEFAULT_FORCE,
-                    "description": "知行生态夹爪力矩阈值（1~100，默认 20，写入生态寄存器 1220）",
+                    "description": f"知行生态夹爪力矩阈值（{GRIPPER_FORCE_MIN}~{GRIPPER_FORCE_MAX}，默认 20，写入生态寄存器 1220；低于 10 会因机械静摩擦阻力死区无法驱动）",
                 },
                 "on_stall": {
                     "type": "string",

@@ -259,15 +259,15 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         tools = self.plugin.get_tools()
         props = tools[0]["inputSchema"]["properties"]
         self.assertIn("force", props)
-        self.assertEqual(1, props["force"]["minimum"])
+        self.assertEqual(10, props["force"]["minimum"])
         self.assertEqual(100, props["force"]["maximum"])
         self.assertEqual(20, props["force"]["default"])
         self.assertIn("on_stall", props)
         self.assertEqual(["keep", "rollback"], props["on_stall"]["enum"])
         self.assertEqual("keep", props["on_stall"]["default"])
 
-        # Invalid force
-        for invalid_force in (0, -1, 101, "abc", float("nan"), float("inf")):
+        # Invalid force (below 10, above 100, or non-finite/non-numeric)
+        for invalid_force in (0, -1, 5, 8, 9, 101, "abc", float("nan"), float("inf")):
             with self.subTest(force=invalid_force):
                 with self.assertRaises(ValueError):
                     self.plugin.dispatch("set_position", {
