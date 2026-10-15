@@ -31,3 +31,54 @@
 PYTHONPATH=ubtrobot/u1_pro python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py' -v
 python3 scripts/check_service_yml.py ubtrobot/u1_pro
 ```
+
+## system_health：只读系统健康
+
+`system_health` 是单实例 `sensor` 卡片。`start` 启动一个后台采样线程，立即进行首轮采样，
+之后按 `sample_interval_seconds: 1.0` 每 **1 秒**持续采样；`stop` 唤醒等待并回收线程。
+`robot_info` / `diagnose` 只返回最近一次采样结果的副本，查询不会额外采样；`info` 返回
+运行状态、采样间隔和累计采样次数。驱动按既有生命周期启动该卡片，无需反复查询来维持监测。
+
+未启动或等待首个样本时返回未知；停止后可读取最后样本，但明确标记监测停止，不能表示当前健康。
+结果增加 `sample_age_seconds`、`samples_collected`、`sample_interval_seconds`；
+运行中样本年龄达到两个采样间隔（默认 2 秒）时，监测状态标为 `stale`，整体结果不再正常。
+重新启动会清空上轮缓存与计数。单次读取超过间隔时不重叠采样，实际周期会延长；
+采样异常记录为不可读取并在后续周期继续尝试。采样遵循单调时钟，系统时间仍用于返回时间戳。
+
+重复启动不会创建第二个线程。停止最多等待 2 秒；若底层只读操作阻塞，返回 `stopping`，
+保留线程引用并拒绝重启，直到原线程退出；停止请求后不再发布在途采样结果。
+卡片没有 ROS 节点或订阅，不启动相机、麦克风或播放任务，不调用 SDK 服务，
+不改变 `system_controls` 的唤醒或视觉开关。配置 `plugins.system_health.enabled: false`
+可从工具列表移除这张卡片，已有卡片保持原有装配方式。
+
+| 检查 | 数据来源与边界 |
+| --- | --- |
+| CPU 负载 | `/proc/loadavg` 的 1/5/15 分钟负载和 `/proc/stat` 可见核数；这是 Linux 负载，不是 CPU 利用率，也未按容器 CPU quota 归一化 |
+| 内存 | `/proc/meminfo` 的 MemTotal / MemAvailable；单独返回进程 cgroup 内存使用量和可见限制，不能用 `/proc` 总量代替容器限制 |
+| 内存限制 | 解析 `/proc/self/cgroup`、`/proc/self/mountinfo`，支持 cgroup v1/v2，并检查可见上级的使用率；容器或隐藏上级时有效限制保留未知，`limit_bytes: null` 只表示可见层级未发现有限限制 |
+| 磁盘 | `statvfs(disk_path)` 的当前挂载文件系统总量和当前用户可用空间；容器根目录可能是 overlay，不代表宿主机磁盘清单或配额 |
+| 温度 | `/sys/class/thermal/thermal_zone*/temp`、`/sys/class/hwmon/hwmon*/temp*_input`；保留每个来源和标签，读取失败逐项报告，硬件归属未经确认，不能宣称是 CPU 或电机温度 |
+| 左右眼相机 | 现有 EyeCameraPlugin 的运行标记、有效 JPEG 发布计数、本地接收时间、当前错误和最近错误；不打开相机或等待新帧，重启会话不复用旧帧的新鲜度 |
+| 播放 | 现有 AudioPlugin 的共享 TTS/expression/head 队列、任务类型和关联 ID、排队年龄、最近播放事件和错误；只覆盖驱动管理的任务，不能判断固件自主播放或实际是否发声 |
+
+部署片段通过 `U1_PRO_HEALTH_CONTAINER=1` 明确标记容器观察环境，不额外挂载宿主机
+`/proc`、`/sys`，不扩大硬件访问权限。非容器标记环境也仅报告 `process_visible_host_unconfirmed`，
+不自动认定这是机器人计算板。无 Linux 接口的开发电脑会返回不可读取，仍可完成其余检查。
+
+结果含 `overall`、`complete`、`checks`、`problems`、`sampled_at` 和实际 `policy`。
+每项含 `status`、`value`、`source`、`scope`、`sampled_at`（Unix 秒）和 `reasons`。
+状态分别为 `ok`、`warning`、`error`（异常）、`stale`（数据过期）、
+`not_started`（未启动）、`unreadable`（无法读取）、`unknown`（能读到值但含义/边界未知）。
+有告警/异常/过期时整体为 `warning`；没有告警但存在未知、无法读取或未启动时为 `unknown`；
+只有完整且所有项正常才为 `ok`。有告警同时存在未知时，`complete: false` 与逐项原因仍保留。
+
+配置阈值是可调整的观察策略，不是厂商安全限值：CPU 每可见核负载 ≥ 1.0、内存和磁盘
+使用率 ≥ 90% 告警；相机有效帧年龄 ≥ 5 秒、共享播放任务未完成 ≥ 120 秒标为过期。
+播放过期不代表确认播放失败，长任务可调整此窗口。温度默认不设阈值；设置
+`temperature_warn_celsius` 前应核对真机传感器及适用温度策略，即使配置了阈值，
+传感器硬件归属仍保留未知。最近错误保留最后一次及发生时间，不因健康查询清空；
+相机恢复发布后当前错误清除、历史错误仍可见，播放最近错误保持异常提示直到驱动重建。
+
+第一版不检查电池、IMU、关节、电机温度，也不确认 ROS 远端或厂商接口的健康。
+Dockerfile 包含 `system_health.py`；新增实现仅使用 Python 标准库，无新增运行依赖。
+完整本地检查、提交流程和真机验收边界见 [SYSTEM_HEALTH_VALIDATION.md](SYSTEM_HEALTH_VALIDATION.md)。

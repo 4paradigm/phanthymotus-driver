@@ -9,3 +9,17 @@ ros:
   # The Adapter's vendor graph uses localhost; device streams use domain 2.
   robot_interface: "lo"
   cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><MaxAutoParticipantIndex>200</MaxAutoParticipantIndex></Discovery><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+
+plugins:
+  system_health:
+    enabled: true
+    sample_interval_seconds: 1.0
+    # Local observation policies, not vendor safety limits.
+    cpu_load_per_core_warn: 1.0
+    memory_used_percent_warn: 90.0
+    disk_used_percent_warn: 90.0
+    disk_path: "/"
+    frame_stale_seconds: 5.0
+    playback_stale_seconds: 120.0
+    # No verified U1 thermal limit; set only after hardware review.
+    temperature_warn_celsius: null
