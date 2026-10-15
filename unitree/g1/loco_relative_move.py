@@ -18,6 +18,7 @@ class LocoRelativeMovePlugin:
     TRANSLATION_TIME_FACTORS = (1. / 0.6, 1. / 0.6 / 1.2)
     # Direction-specific visual measurements at the default speeds.
     RIGHT_ROTATION_TIME_FACTOR = 1. / 1.18
+    NEGATIVE_X_TIME_FACTOR = 1. / 1.20
     NEGATIVE_Y_TIME_FACTOR = 1. / 1.05
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
@@ -46,7 +47,7 @@ class LocoRelativeMovePlugin:
             "description": "Sequential relative movement: straight along x, sideways along y, then rotate. "
                            "Uses loco velocity/time control; distances and angles are approximate, "
                            "without position feedback. At 0.3 m/s, translation uses empirical time compensation; "
-                           "Negative y has a separate time correction at 0.3 m/s. "
+                           "Negative x and y have separate time corrections at 0.3 m/s. "
                            "At 0.5 rad/s, 90/180 degree turns and right turns use empirical time compensation. "
                            "Axes refer to the starting body heading.",
             "inputSchema": {
@@ -103,8 +104,8 @@ class LocoRelativeMovePlugin:
                 velocity = [0., 0., 0.]
                 velocity[axis] = math.copysign(self.speed, distance)
                 factor = self.TRANSLATION_TIME_FACTORS[axis] if self.speed == 0.3 else 1.
-                if self.speed == 0.3 and axis == 1 and distance < 0:
-                    factor *= self.NEGATIVE_Y_TIME_FACTOR
+                if self.speed == 0.3 and distance < 0:
+                    factor *= self.NEGATIVE_X_TIME_FACTOR if axis == 0 else self.NEGATIVE_Y_TIME_FACTOR
                 stages.append(dict(stage=name, vx=velocity[0], vy=velocity[1], vyaw=0.,
                                    duration=abs(distance) / self.speed * factor))
         if angle:
