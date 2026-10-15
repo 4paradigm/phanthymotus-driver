@@ -89,3 +89,11 @@ Validation: 51 related tests and 44 subtests passed; the candidate image passed 
 Image: agilex-piper:local-arm1-background-camera-539a4529. Backup: /opt/phanthy-motus/backups/piper-arm1-background-camera-20261014-140525/. Motion, camera worker, configuration, Core and arm 2 checked unchanged. Evidence: workspace acceptance/20261014_piper_background_camera/. PR #382 pending user testing; current Bot Version 尚未生成.
 
 Removing the last camera canvas node makes Core stop that resource. The migration resumes only piper_camera_live acquisition with its camera-only start action after removal; arm control receives no Start/Stop or mode/motor command. Post-migration live publication is verified separately. The first stream probe overlapped camera warm-up and failed its steady 10 fps check; the warmed-up repeat passed. Frame contents were not saved.
+
+
+## Current two-card contract after the 2026-10-15 review
+
+Arm control now declares only the optional live JPEG output. Joints owns the
+skeleton output. The current bundle declares/publishes no Parameters stream.
+The camera resource, device binding and acquisition lifecycle are unchanged;
+no camera card is required. Earlier single-card validation above is historical.

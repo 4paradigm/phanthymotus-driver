@@ -44,6 +44,24 @@ class Transport:
 
 
 class MonitorTests(unittest.TestCase):
+    def test_new_skeleton_only_mode_never_declares_or_publishes_parameters(self):
+        plugin = PiperMonitorPlugin(snapshot, namespace='arm1/piper', device_name='PiPER',
+            ros2=object(), clock=lambda: 1000., publisher_factory=Transport,
+            language='en', publish_parameters=False)
+        self.addCleanup(plugin.stop)
+        plugin.start()
+        transport = plugin._transport
+        self.assertEqual(transport.period, .1)
+        self.assertEqual(transport.topics, [{'topic': '/arm1/piper/state/joints', 'format': 'sensor/skeleton'}])
+        transport.callback()
+        self.assertEqual([fmt for fmt, _ in transport.messages], ['sensor/skeleton'])
+        self.assertEqual(transport.messages[0][1]['joints'][1]['q'], math.pi / 2)
+        self.assertIn('Fault code', plugin.info()['parameters'])
+        plugin.stop()
+        transport.callback()
+        self.assertEqual(len(transport.messages), 1)
+        self.assertEqual(transport.closed, 1)
+
     def setUp(self):
         self.now = 1000.
         self.data = snapshot()

@@ -1,4 +1,4 @@
-"""Public single-card acceptance using a recording SDK; no robot access."""
+"""Public two-card acceptance using a recording SDK; no robot access."""
 import json
 import math
 import tempfile
@@ -13,7 +13,7 @@ from agilex.piper.intent_teaching import exit_teaching_and_hold
 from agilex.piper.user_motion import (Transform, rotation, euler, orientation_error, vector,
                                       execute_target, target_pose)
 from agilex.piper.path_capability import path_capability, driver_digest, configuration_digest
-from agilex.piper.preset import capture_position, read_preset
+from agilex.piper.preset import capture_position
 from common.vendor_runtime import DriverBundle
 from test_piper_intent import IntentDriver, FastClock
 
@@ -44,6 +44,9 @@ class UnifiedTests(unittest.TestCase):
             'preset_joints_deg': [1, 10, -10, 0, 20, 0]}}
         self.plugins = build_plugins(self.config, 'piper_arm1', None)
         self.runtime, self.background = self.plugins[:2]
+        # No unit test should accidentally post to a locally running Core.
+        self.completion_mock = patch.object(self.runtime, 'acp_complete', return_value=None)
+        self.completion_mock.start(); self.addCleanup(self.completion_mock.stop)
         self.runtime.factory = IntentDriver
         self.background.auto_connect = False
         for plugin in self.plugins:
@@ -51,10 +54,12 @@ class UnifiedTests(unittest.TestCase):
         self.driver = self.runtime.connected()
         self.sdk = self.driver.arm
         self.bundle = DriverBundle(self.plugins)
-        for name, function in [('execute_target', fast_execute), ('exit_teaching_and_hold', fast_exit),
-                               ('capture_position', fast_capture)]:
+        for name, function in [('execute_target', fast_execute), ('exit_teaching_and_hold', fast_exit)]:
             mock = patch('agilex.piper.unified_control.' + name, side_effect=function)
             mock.start(); self.addCleanup(mock.stop)
+
+    def tearDown(self):
+        self.runtime.completions.wait(12)
 
     def call(self, action, **args):
         return self.bundle.dispatch('arm_control', {'action': action, **args})
@@ -62,21 +67,32 @@ class UnifiedTests(unittest.TestCase):
     def targets(self, kind='end_pose'):
         return [call[1] for call in self.sdk.calls if call[0] == kind]
 
-    def test_single_card_schema_topics_and_legacy_request_rejection(self):
+    def test_two_card_schema_topics_and_legacy_request_rejection(self):
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(set(tools), {'arm_control', 'model', 'piper_photo', 'piper_camera_live'})
+        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
         arm = tools['arm_control']
         self.assertEqual(arm['title'], 'Arm control')
         schema = arm['inputSchema']
         self.assertEqual(schema['x-completion']['actions'], sorted(self.runtime.task_actions))
         self.assertNotRegex(json.dumps(tools, ensure_ascii=False), r'[\u3400-\u9fff]')
-        self.assertEqual(arm['topic_out'][0]['format'], 'sensor/skeleton')
+        self.assertEqual(arm['topic_out'], [])
+        self.assertEqual(tools['joints']['topic_out'][0]['format'], 'sensor/skeleton')
+        self.assertEqual(tools['joints']['title'], 'Joints')
+        self.assertEqual(tools['joints']['type'], 'sensor')
+        self.assertFalse(any(t['format'] == 'data/json' for tool in tools.values() for t in tool.get('topic_out', [])))
         self.assertIn('tip-relative', arm['description'])
         self.assertIn('Every control action first exits', arm['description'])
-        for old in ('move_forward', 'exit_teaching_and_hold', 'enable', 'switch', 'move_joint'):
+        for old in ('move_forward', 'exit_teaching_and_hold', 'enable', 'switch', 'move_joint', 'set_position', 'open_gripper', 'close_gripper'):
             with self.subTest(old=old), self.assertRaisesRegex(ValueError, 'replaced'):
                 self.call(old)
         self.assertEqual(self.sdk.calls, [])
+
+    def test_driver_catalog_matches_runtime_tools(self):
+        import yaml
+        from pathlib import Path
+        definition = yaml.safe_load((Path(__file__).resolve().parents[1] / 'agilex/piper/driver.yaml').read_text())
+        self.assertEqual({(card['name'], card['type']) for card in definition['cards']},
+                         {(tool['name'], tool['type']) for tool in self.bundle.get_all_tools()})
 
     def test_start_status_and_default_selection_are_passive(self):
         self.call('start')
@@ -116,109 +132,53 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(result['reference_frame'], 'joint_angles')
         self.assertEqual(result['motion_mode'], 'joint')
 
-    def preset_identity(self):
-        mock=patch('agilex.piper.unified_control.adapter_serial',return_value='fake-arm1')
-        mock.start();self.addCleanup(mock.stop)
-
-    def test_set_position_exits_teaching_before_saving_without_return_move(self):
-        self.preset_identity();self.sdk.mode='TEACHING_MODE(0x2)'
-        before=tuple(q/1000 for q in self.sdk.raw)
-        result=self.call('set_position')
-        self.assertTrue(result['position_saved']);self.assertTrue(result['executed'])
-        self.assertFalse(result['return_motion_executed'])
-        self.assertEqual(result['saved_joints_deg'],before)
-        self.assertTrue(self.sdk.mode.startswith('CAN_CTRL'))
-        self.assertEqual([c[2] for c in self.sdk.calls if c[0]=='mode'],[1])
-        self.assertEqual(self.targets(),[])
-        self.assertTrue(self.runtime.task['preparation']['teaching_exit']['executed'])
-        self.assertEqual(self.call('get_status')['snapshot']['return_position']['joints_deg'],before)
-
-    def test_set_position_permission_or_exit_failure_cannot_write_preset(self):
+    def test_reset_uses_official_zero_and_preserves_old_saved_file(self):
         from pathlib import Path
-        self.preset_identity();self.config['intent_control']['preset_joints_deg']=None
-        self.sdk.mode='TEACHING_MODE(0x2)';self.runtime.motion_enabled=False
-        with self.assertRaisesRegex(RuntimeError,'Motion is disabled'):self.call('set_position')
-        self.assertFalse((Path(self.tmp.name)/'return-preset.json').exists())
-        self.runtime.motion_enabled=True
-        with patch('agilex.piper.unified_control.exit_teaching_and_hold',side_effect=RuntimeError('Exit not confirmed')):
-            with self.assertRaisesRegex(RuntimeError,'Exit not confirmed'):self.call('set_position')
-        self.assertFalse((Path(self.tmp.name)/'return-preset.json').exists())
-        self.assertEqual(self.sdk.calls,[])
+        old = Path(self.tmp.name) / 'return-preset.json'
+        old.write_text('{invalid legacy data, deliberately retained')
+        before = old.read_bytes()
+        self.config['intent_control']['preset_joints_deg'] = [2, 11, -12, 1, 21, 1]
+        result = self.call('reset')
+        self.assertEqual(result['target'], (0.,) * 6)
+        self.assertEqual(self.targets('joints'), [(0,) * 6])
+        self.assertEqual(result['return_position']['source'], 'official_zero')
+        self.assertEqual(result['return_position']['physical_acceptance'], 'pending')
+        self.assertEqual(old.read_bytes(), before)
+        self.assertFalse(any(c[0] in {'reset', 'gripper', 'teach', 'enable_arm'} for c in self.sdk.calls))
 
-    def test_reset_returns_to_saved_joints_without_changing_gripper(self):
-        self.preset_identity();saved=self.call('set_position')['saved_joints_deg']
-        self.sdk.raw=(2000,11000,-12000,1000,21000,1000)
-        self.sdk.calls.clear()
-        result=self.call('reset',speed_percent=1)
-        self.assertEqual(result['target'],saved)
-        self.assertEqual(self.targets('joints'),[tuple(round(q*1000) for q in saved)])
-        self.assertFalse(any(c[0] in {'reset','gripper','teach','enable_arm'} for c in self.sdk.calls))
-
-    def test_saved_position_survives_runtime_restart(self):
-        self.preset_identity();self.call('set_position');self.runtime.stop()
-        plugins=build_plugins(self.config,'piper_arm1',None)
+    def test_fixed_reset_survives_restart_and_ignores_preset_configuration(self):
+        self.runtime.stop()
+        self.config['intent_control']['preset_joints_deg'] = None
+        plugins = build_plugins(self.config, 'piper_arm1', None)
         try:
-            self.assertEqual(plugins[0].return_preset()['joints_deg'],(1,10,-10,0,20,0))
-            labels=plugins[0].get_tools()[0]['inputSchema']['properties']['action']['oneOf']
-            self.assertIn({'const':'reset','title':'Reset'},labels)
+            self.assertEqual(plugins[0].return_preset()['joints_deg'], [0.] * 6)
+            labels = plugins[0].get_tools()[0]['inputSchema']['properties']['action']['oneOf']
+            self.assertIn({'const': 'reset', 'title': 'Reset'}, labels)
         finally:
-            for p in plugins:p.stop()
+            for plugin in plugins: plugin.stop()
 
-    def test_set_position_replaces_old_preset_only_after_stable_capture(self):
-        self.preset_identity();self.call('set_position')
-        self.sdk.raw=(2000,11000,-12000,1000,21000,1000)
-        self.call('set_position')
-        self.assertEqual(self.runtime.return_preset()['joints_deg'],(2,11,-12,1,21,1))
-        original=self.runtime.return_preset()
-        with patch('agilex.piper.unified_control.capture_position',side_effect=RuntimeError('Keep stationary')):
-            with self.assertRaisesRegex(RuntimeError,'stationary'):self.call('set_position')
-        self.assertEqual(self.runtime.return_preset(),original)
+    def test_reset_exits_teaching_then_moves_to_official_zero(self):
+        self.sdk.mode = 'TEACHING_MODE(0x2)'
+        original = tuple(self.sdk.raw)
+        result = self.call('reset')
+        self.assertEqual(result['target'], (0.,) * 6)
+        self.assertEqual([c[2] for c in self.sdk.calls if c[0] == 'mode'], [1, 1])
+        self.assertTrue(all(target == original for target in self.targets('joints')[:-1]))
+        self.assertEqual(self.targets('joints')[-1], (0,) * 6)
+        self.assertFalse(any(c[0] in {'gripper', 'reset'} for c in self.sdk.calls))
 
-    def test_moving_or_stale_feedback_cannot_overwrite_saved_position(self):
-        self.preset_identity();self.call('set_position');original=self.runtime.return_preset()
-        clock=FastClock()
-        def move(seconds):
-            clock.sleep(seconds);self.sdk.raw=(4000,*self.sdk.raw[1:])
-        with patch('agilex.piper.unified_control.capture_position',side_effect=lambda *a,**kw:
-                   capture_position(*a,**kw,clock=clock.now,sleep=move)):
-            with self.assertRaisesRegex(RuntimeError,'stationary'):self.call('set_position')
-        self.assertEqual(self.runtime.return_preset(),original)
-        self.sdk.frozen=True
-        with self.assertRaisesRegex(RuntimeError,'stale'):self.call('set_position')
-        self.assertEqual(self.runtime.return_preset(),original)
-        self.assertEqual(self.sdk.calls,[])
+    def test_reset_respects_effective_joint_limits_without_fallback(self):
+        with patch.object(self.driver, 'joint_bounds_deg', return_value=[(0.5, 150), (0, 180), (-170, 0), (-100, 100), (-70, 70), (-120, 120)]):
+            with self.assertRaisesRegex(RuntimeError, 'within'):
+                self.call('reset')
+        self.assertEqual(self.sdk.calls, [])
 
-    def test_other_adapter_or_corrupt_file_never_falls_back_to_old_config(self):
-        from pathlib import Path
-        self.preset_identity();self.call('set_position')
-        with patch('agilex.piper.unified_control.adapter_serial',return_value='other-arm'):
-            self.assertFalse(self.runtime.capabilities()['return_preset']['available'])
-            with self.assertRaisesRegex(RuntimeError,'another arm'):self.call('reset')
-        (Path(self.tmp.name)/'return-preset.json').write_text('{invalid')
-        self.assertFalse(self.runtime.capabilities()['return_preset']['available'])
-        with self.assertRaisesRegex(RuntimeError,'unavailable'):self.call('reset')
-        self.assertEqual(self.sdk.calls,[])
-
-    def test_cancel_or_storage_failure_retains_previous_position(self):
-        self.preset_identity();self.call('set_position');original=self.runtime.return_preset()
-        with patch('agilex.piper.preset.os.replace',side_effect=OSError('disk unavailable')):
-            with self.assertRaisesRegex((OSError,RuntimeError),'disk unavailable'):self.call('set_position')
-        self.assertEqual(self.runtime.return_preset(),original)
-        def cancel(*args,**kwargs):
-            record=fast_capture(*args,**kwargs);self.call('stop_motion');return record
-        with patch('agilex.piper.unified_control.capture_position',side_effect=cancel):
-            with self.assertRaisesRegex(RuntimeError,'cancelled'):self.call('set_position')
-        self.assertEqual(self.runtime.return_preset(),original)
-        self.assertEqual(self.sdk.calls,[])
-
-    def test_reset_still_exits_teaching_before_returning_to_saved_position(self):
-        self.preset_identity();saved=self.call('set_position')['saved_joints_deg']
-        self.sdk.raw=(2000,11000,-12000,1000,21000,1000)
-        self.sdk.mode='TEACHING_MODE(0x2)';self.sdk.calls.clear()
-        result=self.call('reset')
-        self.assertEqual(result['target'],saved)
-        self.assertEqual([c[2] for c in self.sdk.calls if c[0]=='mode'],[1,1])
-        self.assertEqual(self.targets('joints')[-1],tuple(round(q*1000) for q in saved))
+    def test_legacy_capture_helper_is_retained_without_a_public_action(self):
+        record = fast_capture(self.driver, interface='can0', serial='fake-arm1')
+        self.assertEqual(record['joints_deg'], tuple(q / 1000 for q in self.sdk.raw))
+        self.assertEqual(self.sdk.calls, [])
+        with self.assertRaisesRegex(ValueError, 'replaced'):
+            self.call('set_position')
 
     def test_nullable_pose_uses_calibrated_tip_not_sdk_reference(self):
         self.config['intent_control']['tcp_offset_mm_deg'] = [0,0,100,0,0,0]
@@ -272,7 +232,7 @@ class UnifiedTests(unittest.TestCase):
         tool=self.runtime.get_tools()[0]
         schema=tool['inputSchema']
         self.assertNotIn('pose',schema['properties']['action']['enum'])
-        self.assertNotIn('reset',schema['properties']['action']['enum'])
+        self.assertIn('reset',schema['properties']['action']['enum'])
         self.assertNotIn('pose_mm_deg',schema['properties'])
         self.assertNotIn('rotation_deg',schema['properties'])
         self.assertNotIn('motion_mode',schema['properties'])
@@ -396,7 +356,7 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(self.targets('joints'), [(3000,12000,-12000,2000,22000,2000)])
         self.sdk.calls.clear()
         self.call('reset')
-        self.assertEqual(self.targets('joints'), [(1000,10000,-10000,0,20000,0)])
+        self.assertEqual(self.targets('joints'), [(0,0,0,0,0,0)])
 
     def test_invalid_arrays_ranges_and_unknown_fields_never_send(self):
         cases = [('move', {'translation_mm': [True,0,0]}), ('move', {'translation_mm': [1,2]}),
@@ -415,7 +375,7 @@ class UnifiedTests(unittest.TestCase):
                 self.call(action, **args)
             self.assertEqual(self.sdk.calls, [])
 
-    def test_unconfigured_tip_or_preset_blocks_before_preparation(self):
+    def test_unconfigured_tip_blocks_before_preparation(self):
         self.sdk.mode, self.sdk.enabled = 'STANDBY(0x0)', (False,)*6
         self.config['intent_control']['tcp_verified'] = False
         with self.assertRaisesRegex(RuntimeError, 'not calibrated'):
@@ -423,8 +383,7 @@ class UnifiedTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'rotation requires TCP calibration'):
             self.call('move', rotation_deg=[1,0,0])
         self.config['intent_control']['preset_joints_deg'] = None
-        with self.assertRaisesRegex(RuntimeError, 'No return posture'):
-            self.call('reset')
+        self.assertTrue(self.runtime.capabilities()['return_preset']['available'])
         self.assertEqual(self.sdk.calls, [])
 
     def test_uncalibrated_translation_preserves_sdk_axes_and_orientation(self):
@@ -509,7 +468,7 @@ class UnifiedTests(unittest.TestCase):
         cases=[('move',{'translation_mm':[1,0,0]}),
                ('pose',{'pose_mm_deg':[201,0,250,0,0,0]}),
                ('set_joints',{'joints_deg':[None,11,None,None,None,None]}),
-               ('reset',{}),('open_gripper',{}),('close_gripper',{}),
+               ('reset',{}),
                ('set_gripper_opening',{'width_mm':25})]
         for action,args in cases:
             with self.subTest(action=action):
@@ -728,7 +687,7 @@ class UnifiedTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
             self.call('pose', pose_mm_deg=[200,0,350,0,0,0])
 
-    def test_background_only_control_card_and_dual_namespace_isolation(self):
+    def test_independent_joints_and_dual_namespace_isolation(self):
         self.background.start()
         data = self.background.monitor.read()
         self.assertEqual(len(data['skeleton']['joints']), 6)
@@ -736,11 +695,68 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(self.sdk.calls, [])
         plugins = build_plugins({'data_dir': self.tmp.name+'/arm2'}, 'piper_arm2', None)
         try:
-            self.assertNotEqual(self.runtime.get_tools()[0]['topic_out'][0]['topic'],
-                                plugins[0].get_tools()[0]['topic_out'][0]['topic'])
+            self.assertNotEqual(self.background.get_tools()[0]['topic_out'][0]['topic'],
+                                plugins[1].get_tools()[0]['topic_out'][0]['topic'])
         finally:
             for plugin in plugins:
                 plugin.stop()
+
+    def test_joints_only_connects_once_without_control_and_survives_arm_card_stop(self):
+        self.runtime.stop()
+        self.sdk.calls.clear()
+        self.background.auto_connect = True
+        with patch.object(self.runtime, 'factory', wraps=IntentDriver) as factory:
+            self.bundle.dispatch('joints', {'action': 'start'})
+            deadline = time.monotonic() + 2
+            while self.runtime.driver is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertIsNotNone(self.runtime.driver)
+            self.bundle.dispatch('joints', {'action': 'start'})
+            self.assertEqual(factory.call_count, 1)
+            self.assertEqual(self.runtime.driver.arm.calls, [])
+            self.call('stop')
+            self.assertTrue(self.background.monitor.read()['skeleton'])
+            self.assertEqual(self.bundle.dispatch('joints', {'action': 'info'})['state'], 'running')
+            self.assertEqual(self.runtime.driver.arm.calls, [])
+            self.bundle.dispatch('joints', {'action': 'stop'})
+            self.assertEqual(self.background.info()['state'], 'idle')
+
+    def test_joints_rejects_control_parameters_and_unsupported_actions(self):
+        for args in ({'action': 'move'}, {'action': 'info', 'width_mm': 20},
+                     {'action': 'info', 'input_topic': '/another/device'}):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'Joints'):
+                self.bundle.dispatch('joints', args)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_joints_cannot_reopen_a_driver_with_a_stopping_action(self):
+        with self.runtime.operation('arm_control', 'move'):
+            self.runtime.closed = True
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'driver is stopping'):
+                    self.bundle.dispatch('joints', {'action': 'start'})
+                self.assertTrue(self.runtime.closed)
+                self.assertIsNone(self.background._connection_thread)
+            finally:
+                self.runtime.closed = False
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_gripper_menu_is_one_width_field_with_effective_bounds(self):
+        schema = self.runtime.get_tools()[0]['inputSchema']
+        self.assertIn({'const': 'set_gripper_opening', 'title': 'Set gripper'},
+                      schema['properties']['action']['oneOf'])
+        prop = schema['properties']['width_mm']
+        self.assertEqual((prop['minimum'], prop['maximum'], prop['default']), (0, 70, 20))
+        for width in (0, 20, 70):
+            self.sdk.gripper_enabled = True
+            self.sdk.calls.clear()
+            result = self.call('set_gripper_opening', width_mm=width)
+            self.assertEqual(result['state'], 'completed')
+            self.assertEqual(self.sdk.width, width)
+        self.sdk.calls.clear()
+        for width in (-1, 71, float('nan'), True):
+            with self.subTest(width=width), self.assertRaises(ValueError):
+                self.call('set_gripper_opening', width_mm=width)
+        self.assertEqual(self.sdk.calls, [])
 
 
 class TransformTests(unittest.TestCase):

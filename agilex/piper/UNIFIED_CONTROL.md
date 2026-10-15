@@ -1,156 +1,107 @@
-# Single-card control implementation, 2026-10-14
+# Arm control + Joints contract — review remediation, 2026-10-15
 
-User requirements: one Arm control card using RealMan RM75's shared connection,
-mutually exclusive task ownership, asynchronous completion and interruptible
-submission structure. PiPER official SDK remains the hardware planner; no custom
-IK, SDK replacement, teaching card, recording or replay is introduced.
+This document supersedes the previous single-card/saved-position contract.
+The canvas has Arm control and Joints. Camera capture resources and `model`
+remain available for explicit use; the live camera needs no canvas node.
 
-## Public requests
-
-All requests use `arm_control` and the `action` parameter. Examples below are
-interface examples; they do not authorize or imply a hardware trial.
+## Public interface
 
 ```json
-{"action":"move","translation_mm":[1,0,0],"rotation_deg":[0,0,0],"speed_percent":1}
-{"action":"pose","pose_mm_deg":[200,0,350,0,0,0],"speed_percent":1}
+{"action":"move","translation_mm":[1,0,0],"speed_percent":1}
+{"action":"set_joints","joint_mode":"absolute","joints_deg":[null,30,null,null,null,null],"speed_percent":1}
 {"action":"set_joints","joint_mode":"relative","joints_deg":[1,0,0,0,0,0],"speed_percent":1}
-{"action":"set_gripper_opening","width_mm":20}
 {"action":"reset","speed_percent":1}
+{"action":"set_gripper_opening","width_mm":20}
 {"action":"stop_motion"}
 {"action":"get_status"}
 ```
 
-Core currently submits array fields as text, so JSON-array strings also work.
-Wrong lengths, nonfinite values, boolean/string items, malformed JSON, unknown
-fields and out-of-range active values are rejected. Clearing optional values
-uses schema defaults; required pose/joint arrays have no default. Inactive
-declared fields retained by old Core are discarded. Legacy public actions fail
-with an interface-update message and are not automatically translated.
+These are schema examples, not authorization for physical movements; 30 degrees
+is not a recommended on-site target. Requests use `arm_control`. Absolute Pose
+and Move rotation appear only after existing TCP calibration requirements pass.
+Arrays may be JSON-array strings; length, finite numeric values, nullable absolute
+targets, default speed/ranges and no-op handling retain their existing behavior.
+Official Core retains some inactive hidden fields in requests; the driver ignores
+only declared inactive fields and still validates active values strictly.
 
-Relative translations use the initial TCP's axes. Relative rotations compose
-`R_initial * R_delta`, with `R_delta=Rz(yaw)Ry(pitch)Rx(roll)`. Pose is a base-frame
-absolute TCP target. Without calibration, zero-rotation Move is permitted in
-axes parallel to the SDK J6/end frame, retaining the exact measured orientation.
-No tool length or absolute tip coordinate is invented; arrival is checked at
-the SDK reference. Nonzero rotation and absolute Pose still require calibration.
-For calibrated actions, the configured full rigid TCP offset is applied before
-target composition and inverted before the SDK command. Completion is checked
-at the actual TCP, including tool displacement due to rotational error.
+Only one gripper action is public: Set gripper, using millimetres, normally 0–70.
+Open/Close and Set position are absent from schema, descriptions and completion
+metadata. Direct legacy requests fail before taking control. Reset always uses
+the official six-zero joint target, never a saved file or legacy configured
+preset. Saved files remain untouched. Reset is a guarded joint trajectory with
+unchanged gripper, not firmware reset, zero calibration or error clearing.
+All actual control actions retain automatic stationary-teaching exit/hold before
+target resolution; read-only operations and Stop do not take over teaching.
 
-Joint absolute targets use six effective SDK/deployment limits. Relative targets
-are calculated once from measured joints; the final absolute values must satisfy
-the same limits. Numeric preset/absolute joint movements have no tiny-step
-restriction beyond those limits, but SDK speed is limited to 1–10%.
+## Independent monitoring
 
-## Operator configuration and hardware acceptance
+`joints` is a sensor with an empty input schema, title Joints, and one output:
+`/<namespace>/piper/state/joints`, `sensor/skeleton`, 10 Hz, measured radians.
+It supports framework start/stop/info and shares the same receiver as control.
+Starting only Joints connects a read receiver and sends no control command.
+Stopping Arm control leaves the receiver, Joints and live camera available.
+The whole driver owns final shutdown. Namespaces remain isolated per device.
 
-Defaults intentionally leave the TCP and return posture unconfigured:
+`arm_control.topic_out` contains only the existing live image topic when enabled.
+No public tool in the new bundle declares `state/parameters` or a JSON stream;
+the new monitor does not publish one. Internal snapshots/Info and Get status keep
+faults, mode, enable state, gripper width, limits, freshness and task results.
+Legacy monitor construction retains parameter publication by default.
+`model` still returns ordinary `{"urdf":"..."}` with the unchanged PiPER chain.
+Current Core has no prismatic animation; fingers are static and width is queried
+from feedback. No Core or artificial finger-motion changes are included.
 
-```yaml
-intent_control:
-  tcp_offset_mm_deg: null
-  tcp_verified: false
-  preset_joints_deg: null
-```
+## Completion delivery
 
-Measure the installed gripper-tip offset relative to the SDK feedback reference,
-verify axes/rotation and set `tcp_verified` only after this physical check. A
-zero offset is acceptable only when the reference is actually verified as the
-tip. Save the user's intended fixed return posture as six measured degrees;
-do not assume zero angles correspond to a desired straight posture.
+A running request has one `action_id`, also used as its task ID. Actual completed,
+error or cancelled outcomes are recorded before releasing the operation gate.
+ACP delivery happens outside that gate and never repeats robot instructions.
+The worker allows .15 second after publishing its MCP return for Core to register
+its waiter. A request completed inside .05 second instead returns its actual
+terminal result immediately, without a pending `action_id` or a spurious callback.
 
-Control checks task cancellation and deployment permission before submission
-and throughout preparation/gripper loops. A healthy, stationary teaching arm
-uses the retained seamless-exit primitive only on recognized supported firmware.
-Active recording/playback and unknown firmware are rejected. Any exit failure
-blocks the requested target. Mode preparation holds measured joints; excessive
-drift cancels the original target. No fault reset or motor disable is used.
+Callback HTTP must return JSON `ok: true` and the same `action_id`. There are at
+most four attempts, each with a 2-second timeout and .25/.5/1-second backoff.
+No extra POST follows a successful acknowledgment. TLS/loopback behavior remains
+compatible with the existing local deployment; AGENT_CORE_CA_CERT, if configured,
+is used to verify the Core. No credentials are logged.
 
-After simulation, verify arm 1 on Jetson ARM64 using Docker: TCP identity and
-axes, low-speed small translations/rotations, absolute Pose, six joints in both
-modes, gripper, auto-preparation, teaching exit and Stop during each stage.
-Configure and verify the return posture separately. Record actual feedback,
-arrival/cancellation and stopping latency; prior base-frame direction acceptance
-does not establish acceptance of this interface.
+Get status includes `snapshot.action_completions`, up to 64 records with actual
+status/result plus delivery state/attempts/error. Pending deliveries are not
+evicted. A callback from an older action cannot overwrite the latest action.
+Records are in memory and delivery logs go to stdout; callbacks are not durable
+across process replacement, and no robot action resumes after restart.
 
-## Tests and packaging
+**Model entry boundary:** installed official Core release.261015.0897a8d's
+`detail-panel.js` mounts skeleton renderers with the literal MCP ID `detail`.
+Joints' View data stream button consequently requests `/api/mcp/detail/call`
+and shows a fallback humanoid. The top Monitor resolves the real device ID and
+correctly displays PiPER. The browser test reproduces and records both outcomes;
+this is a known Core defect, not a passed detail-entry acceptance or a driver
+model failure. Use top Monitor until the Core owner fixes device forwarding.
 
-`test_piper_unified.py` exercises the production bundle and recording SDK.
-Historical intent/exit tests use an explicit legacy fixture so internal behavior
-remains covered after public replacement. Model/monitor tests preserve the
-official chain and radians, stale freezing and independent namespaces.
-Both normal and ARM64 development Dockerfiles copy the new modules explicitly.
+**Remaining Core boundary:** release.261015.0897a8d acknowledges receipt even if
+`mark_action_complete` did not find a pending waiter. It does not buffer an early
+completion. The unchanged-Core integration test reproduces this: acknowledge
+before registration, register afterwards, and sync times out. A fixed grace is
+not a protocol guarantee for arbitrary response/network delay. Fully resolving
+that race requires a Core acknowledgment/buffering change and remains an explicit
+platform issue outside this driver-only request. An ambiguous failed HTTP retry
+may also be delivered more than once to Core, which has no deduplication promise;
+the robot trajectory still executes once.
 
-Local acceptance on 2026-10-14: 336 driver tests plus 283 subtests passed;
-14 related Core tests plus 6 subtests passed. Actual Edge browser tests passed
-for action-specific card inputs, strict JSON-array submission, tip Move,
-relative joints, passive status, background camera/skeleton/parameters, both
-model entrances and model-loading failures/races. These are fake-hardware
-results, not ARM64 image build or physical acceptance.
+## Acceptance
 
-The companion Core browser regression loads the actual detail-panel, dashboard
-and skeleton modules using a local fake MCP server. It validates the six PiPER
-joints, animation, both view entrances, topic-owner lookup, model failure,
-invalid URDF, missing device ID, delayed responses and unmount cleanup.
-The change touches only model addressing/loading and its tests in Core.
+Local tests cover schema, one gripper width, official Reset, legacy-file
+preservation, independent monitoring, stale freezing, cancellation and ACP
+success/error/cancellation, failed acknowledgments, bounded retry and interleaved
+results. A source snapshot of the installed official Core is used unchanged for
+ACP register/sync/complete integration and real-browser rendering tests with
+fake SDK feedback. No test connects to a physical robot.
 
-No server deployment, hardware commands, Git commits, pushes, PR updates or Bot
-requests are included in this implementation turn. Preserve existing files,
-backups, arm 2 and the original untracked smoke-test.py. Request submission only
-when the user explicitly says to submit.
-
-
-## Usability update, 2026-10-15
-
-Absolute Pose/absolute joints accept partial JSON arrays (`null` = retain fresh
-measured component), for example `joints_deg=[null,30,null,null,null,null]`.
-No default posture is substituted. Relative joints/Move reject nulls. All-null
-absolute arrays are invalid; all-zero relative requests are successful no-ops
-without hardware preparation. The measured target is composed once and remains
-subject to effective bounds, preparation drift and arrival checks.
-
-Public tools are generated from valid configured capabilities. Uncalibrated
-Move exposes only translation and speed. Pose/rotation and preset return remain
-hidden until their configuration is valid. Hidden old requests fail explicitly.
-`capabilities` is available through passive status and background parameters.
-Pose retains the linear default; candidate point-to-point is acceptance-bound
-and absent from current public definitions. See PATH_VALIDATION.md.
-
-
-## Automatic teaching exit before control, 2026-10-15
-
-Every nonzero Arm control request (Move relative, Move to pose, Set joints,
-return preset and gripper actions) first checks the actual mode. In stationary
-teaching it performs the existing guarded SDK exit-and-measured-joint-hold,
-confirms CAN mode and stable feedback, and only then resolves the requested
-movement/gripper target from post-exit feedback. Failure ends the same task;
-no user target follows a failed takeover. No separate exit button is required.
-This does not clear faults, reset, home, release torque, interrupt active
-recording/playback, or bypass firmware/freshness/permission checks.
-
-Core's lifecycle Start precedes Info and Stop as well as control calls, so it
-remains passive. Status, monitoring, selection, zero relative requests and Stop
-do not take over teaching. Actual control owns preparation, exit and execution
-under one cancellable reservation. A repeated action already in CAN skips exit.
-
-
-## Set position and Reset, 2026-10-15
-
-`set_position` (**Set position**) first performs the same automatic teaching
-exit/hold as control actions, then captures the stationary six measured joint
-angles for 0.5 seconds (maximum drift 0.2 degree). It atomically replaces
-`data_dir/return-preset.json`, bound to this USB-CAN serial/interface. No return
-trajectory or gripper command is sent. Failed exit, stale/moving feedback,
-cancellation, missing adapter identity or write failure retains the old preset.
-The operator must re-save after replacing the physical arm on the same adapter.
-
-`reset` is displayed as **Reset** when a valid saved/configured target exists.
-It exits teaching/holds first, then returns all six joints via SDK MOVE_J at
-1% by default (range 1–10%). The gripper remains unchanged. This is a planned
-movement, not ResetPiper, fault clearing, zero calibration or motor disable.
-The return path is a joint-space trajectory, not a straight TCP segment.
-Effective limits, fresh feedback, cancellation, task serialization and stable
-arrival checks still apply. The saved target survives driver/container restarts.
-Invalid/mismatched stored data hides Reset and never falls back to an unrelated
-configuration preset. Get status/background parameters show the saved position.
-Refresh device/tool metadata after first save to make Reset visible in Core.
+ARM64 test builds are development overlays over the verified Bot dependency
+image, not a clean release build or a Bot Version. On-site acceptance remains:
+small relative/partial absolute joints, gripper widths, Stop during movement,
+then the official zero-angle posture from reviewed starting poses. Record actual
+feedback, terminal outcome, callback reception and physical observations.
+No deployment or PR update is included in this remediation.

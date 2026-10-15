@@ -87,7 +87,7 @@ class PiperDiagnosticTests(unittest.TestCase):
                 self.runtime.config['can_interface'] = 'can1'
                 result = diagnose.diagnose('http://fake/mcp')
                 self.assertTrue(result['passed'], result['errors'])
-                self.assertEqual(set(result['cards']), {'arm_control', 'model', 'piper_photo', 'piper_camera_live'})
+                self.assertEqual(set(result['cards']), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
                 calls = [p for method, p in self.requests if method == 'tools/call']
                 self.assertEqual(calls, [
                     {'name': 'arm_control', 'arguments': {'action': 'info'}},

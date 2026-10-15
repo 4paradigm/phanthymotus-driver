@@ -19,7 +19,8 @@ intent_control:
   # Never substitute zero for an unknown reference. Verify on the installed tool.
   tcp_offset_mm_deg: null
   tcp_verified: false
-  # Six measured angles, degrees. Save only an operator-approved return posture.
+  # Legacy/internal preset only. Current Arm control Reset uses the fixed
+  # official [0,0,0,0,0,0] degree target and ignores this field/saved files.
   preset_joints_deg: null
   # Default closed. Acceptance binds adapter serial, firmware, source/config hashes
   # and an operator-reviewed evidence record. Never enable from SDK support alone.

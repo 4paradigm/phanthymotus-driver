@@ -379,9 +379,13 @@ class PiperMonitorPlugin:
     """One monitor per existing PiPER runtime/MCP, no ownership of hardware."""
     def __init__(self, read_monitor_snapshot: Callable[[], MonitorSnapshot], *, namespace: str,
                  device_name: str, ros2=None, publish_hz: float = 10,
-                 clock: Callable[[], float] = time.time, publisher_factory=None, language='zh'):
+                 clock: Callable[[], float] = time.time, publisher_factory=None, language='zh',
+                 publish_parameters: bool = True):
         if not callable(read_monitor_snapshot):
             raise TypeError("read_monitor_snapshot must be callable")
+        if type(publish_parameters) is not bool:
+            raise TypeError('publish_parameters must be a boolean')
+        self._publish_parameters = publish_parameters
         namespace = namespace.strip("/")
         if not namespace or not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in namespace.split("/")):
             raise ValueError("namespace must contain valid, explicit ROS name segments")
@@ -406,8 +410,10 @@ class PiperMonitorPlugin:
         self._model = load_model()
 
     def _topics(self):
-        return [{"topic": f"/{self._namespace}/state/joints", "format": "sensor/skeleton"},
-                {"topic": f"/{self._namespace}/state/parameters", "format": "data/json"}]
+        topics = [{"topic": f"/{self._namespace}/state/joints", "format": "sensor/skeleton"}]
+        if self._publish_parameters:
+            topics.append({"topic": f"/{self._namespace}/state/parameters", "format": "data/json"})
+        return topics
 
     def get_tools(self):
         actions = {"start": ([], "开始只读监控"), "stop": ([], "停止监控发布"),
@@ -491,7 +497,8 @@ class PiperMonitorPlugin:
                 if not self._running or generation != self._generation or self._transport is None:
                     return
                 try:
-                    self._transport.publish("data/json", frame["parameters"])
+                    if self._publish_parameters:
+                        self._transport.publish("data/json", frame["parameters"])
                     if frame["skeleton"] is not None:
                         self._transport.publish("sensor/skeleton", frame["skeleton"])
                     self._publish_error = None

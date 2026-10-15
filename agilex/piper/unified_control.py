@@ -12,11 +12,12 @@ from agilex.piper.intent_control import CONTROL, IntentControlPlugin, public_err
 from agilex.piper.intent_motion import checked_state, end_pose, JOG_SPEED_PERCENT
 from agilex.piper.intent_teaching import exit_teaching_and_hold
 from agilex.piper.path_capability import path_capability, adapter_serial
-from agilex.piper.preset import read_preset, write_preset, capture_position
+from agilex.piper.completion import ActionCompletions, run_async
 from agilex.piper.user_motion import vector, target_pose, joint_target, execute_target, tcp_transform, Transform
 
 
-USER_TASKS = {'move', 'pose', 'set_joints', 'set_position', 'reset', 'open_gripper', 'close_gripper', 'set_gripper_opening'}
+USER_TASKS = {'move', 'pose', 'set_joints', 'reset', 'set_gripper_opening'}
+OFFICIAL_ZERO_JOINTS = (0., 0., 0., 0., 0., 0.)
 
 
 def array_property(title, description, size, default=None, *, allow_null=False):
@@ -32,25 +33,35 @@ def array_property(title, description, size, default=None, *, allow_null=False):
 
 class UnifiedControlPlugin(IntentControlPlugin):
     task_actions = USER_TASKS
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.completions = ActionCompletions(self)
+
+    def run_async(self, name, action, args):
+        return run_async(self, name, action, args, error_text=public_error)
+
+    def acp_complete(self, action_id, status, result, name):
+        return self.completions.send(action_id, status, result, name)
+
+    def stop(self):
+        super().stop()
+        self.completions.wait()
+
     def return_preset(self):
-        return read_preset(self.data_dir, self.config,
-                           adapter_serial(self.config.get('can_interface', 'can0')))
+        # Fixed SDK go-zero target. Never load, modify or delete the operator's
+        # legacy return-preset.json. Robot path acceptance is still separate.
+        return {'joints_deg': list(OFFICIAL_ZERO_JOINTS), 'source': 'official_zero',
+                'reference': 'piper_sdk@8d4dc29/demo/V2/piper_ctrl_go_zero.py',
+                'physical_acceptance': 'pending'}
 
     def capabilities(self):
-        cfg = self.config.get('intent_control', {})
         calibrated = False
         try:
             tcp_transform(self.config)
             calibrated = True
         except (RuntimeError, ValueError):
             pass
-        preset = False
-        preset_reason = None
-        try:
-            self.return_preset()
-            preset = True
-        except ValueError as exc:
-            preset_reason = str(exc)
         firmware = None
         if self.connection_lock.acquire(blocking=False):
             try:
@@ -64,8 +75,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
                          'Calibrate and verify the installed gripper-tip TCP.'},
                 'rotation': {'available': calibrated, 'reason': None if calibrated else
                              'Calibrate and verify the installed gripper-tip TCP.'},
-                'return_preset': {'available': preset, 'reason': None if preset else
-                                 preset_reason},
+                'return_preset': {'available': True, 'reason': None, **self.return_preset()},
                 'point_to_point': point}
 
     def require_path_permission(self):
@@ -85,11 +95,8 @@ class UnifiedControlPlugin(IntentControlPlugin):
                      'Relative tool-frame motion. Without TCP calibration: SDK end axes, translation only, unchanged orientation.'),
             'pose': (['pose_mm_deg', 'motion_mode', 'speed_percent'], 'Absolute base-frame gripper-tip target; null keeps the measured component.'),
             'set_joints': (['joints_deg', 'joint_mode', 'speed_percent'], 'Six joint angles in degrees. Absolute: null keeps measured angle. Relative: 0 keeps angle.'),
-            'set_position': ([], 'Exit stationary teaching and hold, then save the measured six-joint position for Reset.'),
-            'reset': (['speed_percent'], 'Return all six joints to the saved Set position. Gripper unchanged; no firmware reset or zero calibration.'),
+            'reset': (['speed_percent'], 'Move all six joints to the official zero-angle posture [0,0,0,0,0,0] deg. Verify the return path on site. Gripper unchanged.'),
             'stop_motion': ([], 'Cancel preparation or motion; keep motor torque.'),
-            'open_gripper': ([], 'Open to the effective opening upper limit.'),
-            'close_gripper': ([], 'Close to the effective opening lower limit.'),
             'set_gripper_opening': (['width_mm'], 'Set gripper opening in millimetres.'),
             'get_status': ([], 'Read actual pose, joints, limits, mode, faults and the task result; no control commands.'),
             'start': ([], 'Connect and read; no mode, enable or motion commands.'),
@@ -119,12 +126,9 @@ class UnifiedControlPlugin(IntentControlPlugin):
             props['motion_mode'] = {'type': 'string', 'enum': paths, 'default': 'linear',
                 'title': 'Path', 'description': 'Linear TCP path, or accepted point-to-point: final pose only; no obstacle avoidance.',
                 'oneOf': [{'const': p, 'title': 'Linear' if p == 'linear' else 'Point-to-point'} for p in paths]}
-        if not caps['return_preset']['available']:
-            actions.pop('reset')
         schema = action_schema(actions, props)
         labels = {'select_action': 'Choose an action', 'move': 'Move relative', 'pose': 'Move to pose', 'set_joints': 'Set joints',
-                  'set_position': 'Set position', 'reset': 'Reset', 'stop_motion': 'Stop', 'open_gripper': 'Open gripper',
-                  'close_gripper': 'Close gripper', 'set_gripper_opening': 'Set gripper opening',
+                  'reset': 'Reset', 'stop_motion': 'Stop', 'set_gripper_opening': 'Set gripper',
                   'get_status': 'Get status', 'start': 'Start', 'stop': 'Stop card', 'info': 'Info'}
         schema['properties']['action'].update(title='Action', default='select_action',
             oneOf=[{'const': a, 'title': labels[a]} for a in actions])
@@ -134,14 +138,17 @@ class UnifiedControlPlugin(IntentControlPlugin):
                        'x-completion': {'actions': sorted(USER_TASKS.intersection(actions)), 'timeout': 60}})
         schema['x-action-params'].pop('select_action')
         arm['inputSchema'] = schema
+        # Joints owns skeleton discovery; no Parameters topic is public in this
+        # bundle. The independent background camera keeps its existing output.
+        arm['topic_out'] = [t for t in arm.get('topic_out', []) if t['format'] == 'image/jpeg']
         arm['description'] = ('One arm: tool-relative Move, absolute/relative joint targets, gripper, Stop and Get status. '
                               'Every control action first exits stationary teaching and holds measured joints when supported, '
                               'then computes and executes the requested target. Failed takeover cancels the action. '
                               'Relative Move uses a linear path. 0 means no increment. '
                               + ('Calibrated tip-relative rotation and absolute base-frame Move to pose are available. '
                                  if calibrated else 'Uncalibrated Move translates along SDK end axes with unchanged orientation. ')
-                              + 'Set position exits teaching and holds before saving measured joints. '
-                              + ('Reset returns to the saved operator position. ' if 'reset' in actions else '')
+                              + 'Reset moves six joints to the official zero-angle posture, with the gripper unchanged. '
+                              + 'Set gripper uses the opening width in millimetres. '
                               + 'Keep the workspace clear; a numeric target may still be unreachable.')
         return tools
 
@@ -152,8 +159,6 @@ class UnifiedControlPlugin(IntentControlPlugin):
         caps = self.capabilities()
         if action == 'pose' and not caps['pose']['available']:
             raise RuntimeError('The gripper-tip reference is not calibrated. Configure and verify tcp_offset_mm_deg first.')
-        if action == 'reset' and not caps['return_preset']['available']:
-            raise RuntimeError(caps['return_preset']['reason'])
         schema = self.get_tools()[0]['inputSchema']
         if action not in schema['properties']['action']['enum']:
             raise ValueError('This action has been replaced; refresh Arm control and choose an available action.')
@@ -264,24 +269,6 @@ class UnifiedControlPlugin(IntentControlPlugin):
                 driver._check_cancelled = check
                 try:
                     state = self._enter_action_control(driver)
-                    if action == 'set_position':
-                        record = capture_position(driver, interface=self.config.get('can_interface', 'can0'),
-                                                  serial=adapter_serial(self.config.get('can_interface', 'can0')))
-                        with self.lifecycle:
-                            if self.cancel.is_set():
-                                raise RuntimeError('Set position was cancelled; previous position was retained.')
-                            driver._check_cancelled()
-                            write_preset(self.data_dir, record)
-                            with self.task_lock:
-                                preparation = deepcopy(self.task.get('preparation') or {})
-                            result = {'executed': preparation.get('teaching_exit', {}).get('executed', False),
-                                      'return_motion_executed': False, 'teaching_exit': preparation.get('teaching_exit'),
-                                      'position_saved': True, 'saved_joints_deg': record['joints_deg'],
-                                      'saved_at': record['saved_at'], 'message': 'Current position saved for Reset. Teaching exit and hold were confirmed when required.',
-                                      'refresh_tools': True}
-                            self._phase('completed', result=result)
-                        self._terminal_audit()
-                        return {**result, 'state': 'completed'}
                     target = tip_goal = None
                     width = None
                     if action in {'move', 'pose'}:
@@ -295,7 +282,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
                     else:
                         grip = driver.get_gripper()
                         low, high = driver.gripper_range()
-                        width = high if action == 'open_gripper' else low if action == 'close_gripper' else args['width_mm']
+                        width = args['width_mm']
                         if grip.error_code or not low <= width <= high:
                             raise RuntimeError('The gripper target or feedback is invalid.')
                     self._motion_report({'stage': 'validated', 'control_mode': state.control_mode,
@@ -320,6 +307,8 @@ class UnifiedControlPlugin(IntentControlPlugin):
                             require_path_permission=self.require_path_permission)
                         if action in {'set_joints', 'reset'}:
                             result['reference_frame'] = 'joint_angles'
+                        if action == 'reset':
+                            result['return_position'] = self.return_preset()
                         if tip_goal is not None:
                             result['tip_target_mm_deg'] = tip_goal
                             result['reference_frame'] = 'calibrated_gripper_tip'
@@ -350,6 +339,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
 
     def read_monitor_snapshot(self):
         snapshot = super().read_monitor_snapshot()
+        snapshot['action_completions'] = self.completions.snapshot()
         snapshot['capabilities'] = self.capabilities()
         snapshot['return_preset_configured'] = snapshot['capabilities']['return_preset']['available']
         snapshot['tcp_verified'] = snapshot['capabilities']['pose']['available']
