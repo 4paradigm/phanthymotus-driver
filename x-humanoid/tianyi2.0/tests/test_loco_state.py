@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -96,7 +97,9 @@ class Client:
 def plugin(client=None):
     executor = types.SimpleNamespace(add_node=lambda node: None)
     ros = types.SimpleNamespace(ctx_core=object(), executor_core=executor)
-    return STATE.LocoStatePlugin({"request_timeout": 0.05}, "ubuntu", ros, client or Client())
+    state = STATE.LocoStatePlugin({"request_timeout": 0.05}, "ubuntu", ros, "http://chassis")
+    state._client = client or Client()
+    return state
 
 
 def wait_for(predicate):
@@ -244,13 +247,17 @@ class PluginTests(unittest.TestCase):
         source = ast.parse((ROOT / "main.py").read_text())
         node = next(item for item in source.body if isinstance(item, ast.ClassDef)
                     and item.name == "TianyiDeviceBundle")
-        namespace = {"DualDomainROS2": object, "_lifecycle": lifecycle}
+        namespace = {"DualDomainROS2": object, "_lifecycle": lifecycle, "os": os}
         exec(compile(ast.Module(body=[node], type_ignores=[]), "main.py", "exec"), namespace)
         ros = types.SimpleNamespace(ctx_core=object(), executor_core=types.SimpleNamespace(add_node=lambda _: None))
-        with patch.dict(sys.modules, {"loco_state": STATE}):
+        with patch.dict(sys.modules, {"loco_state": STATE}), patch.dict(
+                os.environ, {"SLAMTEC_URL": "http://chassis-override"}):
             bundle = namespace["TianyiDeviceBundle"](
-                {"plugins": {"loco_state": {"enabled": True}}}, "robot", ros, Client())
+                {"slamtec": {"base_url": "http://configured-chassis"},
+                 "plugins": {"loco_state": {"enabled": True}}}, "robot", ros, object())
         try:
+            self.assertEqual("http://chassis-override", bundle._plugins[0]._client._base)
+            bundle._plugins[0]._client = Client()
             self.assertEqual(["loco_state"], [tool["name"] for tool in bundle.get_all_tools()])
             bundle.start_all()
             wait_for(lambda: bundle._plugins[0]._odom_pub.messages)
@@ -271,11 +278,8 @@ class PluginTests(unittest.TestCase):
 
 class ClientTests(unittest.TestCase):
     def test_api_paths_methods_and_request_deadlines(self):
-        spec = importlib.util.spec_from_file_location("tianyi_nav_test", ROOT / "nav_client.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        client = module.SlamtecClient("http://chassis")
-        with patch.object(module.urllib.request, "urlopen") as urlopen:
+        client = STATE._LocoStateClient("http://chassis/")
+        with patch.object(STATE.urllib.request, "urlopen") as urlopen:
             urlopen.return_value.__enter__.return_value.read.return_value = b'{"vx":0}'
             for method, path in (
                 (client.get_odometry_pose, "/api/core/slam/v1/localization/odopose"),
@@ -288,7 +292,27 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual("GET", request.get_method())
                 self.assertIsNone(request.data)
                 self.assertEqual(0.2, urlopen.call_args.kwargs["timeout"])
-            client.get_speed()
+
+    def test_bad_http_responses_become_current_errors(self):
+        client = STATE._LocoStateClient("http://chassis")
+        with patch.object(STATE.urllib.request, "urlopen") as urlopen:
+            for body in (b"", b"broken-json", b"[]", b"false"):
+                with self.subTest(body=body):
+                    urlopen.return_value.__enter__.return_value.read.return_value = body
+                    self.assertIn("error", client.get_speed(timeout=0.2))
+            urlopen.side_effect = TimeoutError("timed out")
+            self.assertEqual({"error": "timed out"}, client.get_speed(timeout=0.2))
+
+    def test_existing_navigation_client_still_has_its_original_contract(self):
+        spec = importlib.util.spec_from_file_location("tianyi_nav_test", ROOT / "nav_client.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        client = module.SlamtecClient("http://chassis")
+        self.assertFalse(hasattr(client, "get_odometry_pose"))
+        self.assertFalse(hasattr(client, "get_imu"))
+        with patch.object(module.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b'{"vx":0}'
+            self.assertEqual({"vx": 0}, client.get_speed())
             self.assertEqual(5, urlopen.call_args.kwargs["timeout"])
 
 

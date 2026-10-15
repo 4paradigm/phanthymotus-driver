@@ -12,7 +12,9 @@ exposes the capabilities as MCP tools.
 object. The namespace comes from `ros_namespace` or the hostname.
 `nav_state` remains available with its existing map-localized pose output.
 
-The new card polls these read-only Slamware REST endpoints concurrently:
+The new card uses its own read-only HTTP client in `loco_state.py`, leaving
+`nav_client.py` and existing cards unchanged. It reads the chassis address from
+`SLAMTEC_URL` or `slamtec.base_url` and polls these endpoints concurrently:
 
 | Reading | Endpoint | Meaning |
 | --- | --- | --- |

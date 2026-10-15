@@ -23,11 +23,11 @@ class SlamtecClient:
     def __init__(self, base_url: str = "http://192.168.11.1:1448"):
         self._base = base_url.rstrip("/")
 
-    def _get(self, path: str, *, timeout: float = _TIMEOUT) -> dict:
+    def _get(self, path: str) -> dict:
         url = f"{self._base}{path}"
         req = urllib.request.Request(url, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 resp_body = resp.read()
                 if not resp_body:
                     return {}
@@ -168,14 +168,6 @@ class SlamtecClient:
         """获取机器人位姿 {x, y, z, yaw, pitch, roll}"""
         return self._get("/api/core/slam/v1/localization/pose")
 
-    def get_odometry_pose(self, *, timeout: float = _TIMEOUT) -> dict:
-        """获取里程计位姿，与地图定位位姿 get_pose() 区分。"""
-        return self._get("/api/core/slam/v1/localization/odopose", timeout=timeout)
-
-    def get_imu(self, *, timeout: float = _TIMEOUT) -> dict:
-        """获取底盘坐标系 IMU；availibilityBitMap 指明有效字段。"""
-        return self._get("/api/core/slam/v1/imu", timeout=timeout)
-
     def get_localization_quality(self) -> dict:
         """获取定位质量"""
         return self._get("/api/core/slam/v1/localization/quality")
@@ -190,9 +182,9 @@ class SlamtecClient:
         """终止当前运动行为"""
         return self._delete("/api/core/motion/v1/actions/:current")
 
-    def get_speed(self, *, timeout: float = _TIMEOUT) -> dict:
-        """获取实测速度 {vx, vy, omega}，不是目标速度。"""
-        return self._get("/api/core/motion/v1/speed", timeout=timeout)
+    def get_speed(self) -> dict:
+        """获取当前运动速度"""
+        return self._get("/api/core/motion/v1/speed")
 
     def set_max_moving_speed(self, speed: float) -> dict:
         """设置最大移动速度 (m/s)"""

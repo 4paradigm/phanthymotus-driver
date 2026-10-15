@@ -10,12 +10,40 @@ import json
 import math
 import threading
 import time
+import urllib.request
 
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
 
 from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
+
+
+class _LocoStateClient:
+    """Private, read-only transport for this card; no shared navigation client."""
+
+    def __init__(self, base_url):
+        self._base = base_url.rstrip("/")
+
+    def _get(self, path, *, timeout):
+        request = urllib.request.Request(self._base + path, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read())
+            if not isinstance(result, dict):
+                return {"error": "invalid_response_type"}
+            return result
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def get_odometry_pose(self, *, timeout):
+        return self._get("/api/core/slam/v1/localization/odopose", timeout=timeout)
+
+    def get_speed(self, *, timeout):
+        return self._get("/api/core/motion/v1/speed", timeout=timeout)
+
+    def get_imu(self, *, timeout):
+        return self._get("/api/core/slam/v1/imu", timeout=timeout)
 
 
 def _number(value):
@@ -123,8 +151,8 @@ def odometry_sample(snapshot):
 class LocoStatePlugin:
     """Always-on observer; MCP stop leaves polling active, shutdown stops it."""
 
-    def __init__(self, plugin_config, namespace, ros2, slamtec_client):
-        self._client = slamtec_client
+    def __init__(self, plugin_config, namespace, ros2, base_url):
+        self._client = _LocoStateClient(base_url)
         self._hz = float(plugin_config.get("hz", 10))
         self._timeout = float(plugin_config.get("request_timeout", 0.5))
         if not math.isfinite(self._hz) or not 0 < self._hz <= 10:

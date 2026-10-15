@@ -473,8 +473,10 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("loco_state", {}).get("enabled", False):
             from loco_state import LocoStatePlugin
+            loco_state_url = os.environ.get("SLAMTEC_URL", cfg.get("slamtec", {}).get(
+                "base_url", "http://192.168.11.1:1448"))
             self._plugins.append(LocoStatePlugin(
-                plugins_cfg["loco_state"], namespace, ros2, slamtec_client))
+                plugins_cfg["loco_state"], namespace, ros2, loco_state_url))
             print("[bundle] LocoStatePlugin loaded")
 
         if plugins_cfg.get("power_board", {}).get("enabled", False):
