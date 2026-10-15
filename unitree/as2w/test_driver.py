@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT.parent.parent))  # make `common` importable, as in the image
 
 
 def _load(name, path):
@@ -1409,6 +1410,181 @@ class TestDriverContracts(unittest.TestCase):
         node._on_sport(types.SimpleNamespace(mode=2, velocity=[1, 2, 3], position=[4, 5, 6], body_height=0.2,
                                               imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
         self.assertNotIn("imu_rpy_0", __import__("json").loads(published[0]))
+
+    # ── loco_state card: second port carries motus.odom/1 ───────────────────
+
+    @staticmethod
+    def _odom_node(published, loco=None):
+        """A _StateNode shell whose odom publisher captures JSON payloads."""
+        node = TestDriverContracts.device._StateNode.__new__(
+            TestDriverContracts.device._StateNode)
+        node.odom = types.SimpleNamespace(
+            publish=lambda message: published.append(__import__("json").loads(message.data)))
+        node.loco = types.SimpleNamespace(
+            publish=lambda message: (loco if loco is not None else []).append(message.data))
+        node._odom_lock = __import__("threading").Lock()
+        node._odom_burst = []
+        node._odom_burst_size = 0
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 0.0
+        return node
+
+    def test_odom_failure_never_stops_loco_state(self):
+        published, loco = [], []
+        node = self._odom_node(published, loco)
+        node._odom_lock = None  # every odom path now raises
+        node.odom = types.SimpleNamespace(publish=lambda message: 1 / 0)
+        node._on_sport(self._sport())
+        node._on_sport(self._sport())
+        self.assertEqual(2, len(loco))
+        self.assertEqual(2, __import__("json").loads(loco[0])["mode"])
+        self.assertEqual([], published)
+
+    def test_loco_state_without_odom_publisher_behaves_as_before(self):
+        loco = []
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        node.loco = types.SimpleNamespace(publish=lambda message: loco.append(message.data))
+        node._on_sport(self._sport())
+        self.assertEqual(1, len(loco))
+
+    @staticmethod
+    def _sport(**overrides):
+        msg = types.SimpleNamespace(mode=2, body_height=0.2,
+                                    velocity=[0.3, -0.1, 0.0], yaw_speed=0.05,
+                                    position=[0.0, 0.0, 0.0], stamp=None)
+        for key, value in overrides.items():
+            setattr(msg, key, value)
+        return msg
+
+    def test_odom_sample_follows_motus_odom_1(self):
+        published = []
+        self._odom_node(published)._on_sport(self._sport())
+        self.assertEqual(1, len(published))
+        sample = published[0]
+        self.assertEqual("motus.odom/1", sample["schema"])
+        self.assertEqual("body", sample["frame"])
+        self.assertIsInstance(sample["stamp_ms"], int)
+        self.assertEqual(6, len(sample["twist"]))
+
+    def test_odom_unmeasured_axes_are_null_not_zero(self):
+        published = []
+        self._odom_node(published)._on_sport(self._sport())
+        vx, vy, vz, wx, wy, wz = published[0]["twist"]
+        self.assertAlmostEqual(0.3, vx)
+        self.assertAlmostEqual(-0.1, vy)
+        self.assertAlmostEqual(0.05, wz)
+        self.assertIsNone(vz)
+        self.assertIsNone(wx)
+        self.assertIsNone(wy)
+
+    def test_loco_state_payload_is_unchanged_and_not_throttled(self):
+        published, loco = [], []
+        node = self._odom_node(published, loco)
+        for _ in range(3):
+            node._on_sport(self._sport())
+        # loco/state keeps one message per reading with its original keys;
+        # only the odom port is throttled to 10 Hz.
+        self.assertEqual(3, len(loco))
+        self.assertEqual(1, len(published))
+        self.assertEqual({"mode", "body_height", "velocity_0", "velocity_1", "velocity_2",
+                          "position_0", "position_1", "position_2"},
+                         set(__import__("json").loads(loco[0])))
+
+    def test_odom_averages_every_reading_in_the_window(self):
+        published = []
+        node = self._odom_node(published)
+        node._accumulate_odom(self._sport(velocity=[0.3, 0.0, 0.0], yaw_speed=0.1))
+        node._accumulate_odom(self._sport(velocity=[0.5, 0.2, 0.0], yaw_speed=0.3))
+        node._accumulate_odom(self._sport(velocity=[0.4, 0.1, 0.0], yaw_speed=0.2))
+        node._publish_odom(self._sport())
+        vx, vy, _, _, _, wz = published[0]["twist"]
+        self.assertAlmostEqual(0.4, vx)
+        self.assertAlmostEqual(0.1, vy)
+        self.assertAlmostEqual(0.2, wz)
+        self.assertEqual(3, published[0]["vendor"]["samples"])
+
+    def test_odom_accumulates_in_callback_even_when_worker_skips(self):
+        published = []
+        node = self._odom_node(published)
+        node._latest_lock = __import__("threading").Lock()
+        node._latest_sport = None
+        node._sport_generation = 0
+        node._publisher_thread = object()
+        node._on_sport(self._sport())
+        node._on_sport(self._sport())
+        self.assertEqual([], published)
+        self.assertEqual(2, len(node._odom_burst))
+
+    def test_odom_vendor_block_carries_stamp_provenance(self):
+        published = []
+        self._odom_node(published)._on_sport(self._sport())
+        vendor = published[0]["vendor"]
+        self.assertIn("stamp_source", vendor)
+        self.assertIn("mode", vendor)
+        self.assertIn("body_height", vendor)
+
+    def test_odom_non_finite_axis_is_null_not_nan(self):
+        published = []
+        self._odom_node(published)._on_sport(
+            self._sport(velocity=[float("nan"), float("inf"), 0.0], yaw_speed=float("-inf")))
+        vx, vy, _, _, _, wz = published[0]["twist"]
+        self.assertIsNone(vx)
+        self.assertIsNone(vy)
+        self.assertIsNone(wz)
+
+    def test_odom_empty_window_does_not_reuse_stamp(self):
+        published = []
+        node = self._odom_node(published)
+        with patch.object(self.device.time, "time", return_value=1000.0):
+            node._on_sport(self._sport())
+        self.assertEqual(1000_000, published[0]["stamp_ms"])
+        node._accumulate_odom(types.SimpleNamespace(velocity=None))  # unreadable, dropped
+        with patch.object(self.device.time, "time", return_value=2000.0):
+            node._publish_odom(self._sport())
+        second = published[1]
+        self.assertEqual([None] * 6, second["twist"])
+        self.assertEqual(0, second["vendor"]["samples"])
+        self.assertEqual(2000_000, second["stamp_ms"])
+        self.assertEqual("published", second["vendor"]["stamp_source"])
+
+    def test_odom_timespec_ms_reads_vendor_stamp(self):
+        stamp = types.SimpleNamespace(sec=1_700_000_000, nanosec=250_000_000)
+        self.assertEqual(1_700_000_000_250, self.device._timespec_ms(stamp))
+        self.assertIsNone(self.device._timespec_ms(None))
+        self.assertIsNone(self.device._timespec_ms(types.SimpleNamespace(sec=0, nanosec=0)))
+
+    def test_loco_state_card_declares_both_ports_and_odom_interface(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        tool = next(t for t in plugin.get_tools() if t["name"] == "loco_state")
+        expected = [{"topic": "/test/loco/state", "format": "data/json"},
+                    {"topic": "/test/state/odom", "format": "state/odom"}]
+        self.assertEqual(expected, tool["topic_out"])
+        self.assertNotIn("odometry", [t["name"] for t in plugin.get_tools()])
+        for result in (plugin.dispatch("loco_state", {}),
+                       plugin.dispatch("info", {"_tool_name": "loco_state"})):
+            self.assertEqual(expected, result["topic_out"])
+            interface = result["odom_interface"]
+            self.assertEqual("motus.odom/1", interface["schema"])
+            self.assertEqual(["vx", "vy", "wz"], interface["provides"])
+            self.assertEqual(10.0, interface["rate_hz"])
+            self.assertEqual("unbounded", interface["pose_drift"])
+        self.assertNotIn("odom_interface", plugin.dispatch("imu", {}))
+
+    def test_loco_state_info_reports_odom_window(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        plugin._state = node
+        result = plugin.dispatch("info", {"_tool_name": "loco_state"})
+        self.assertEqual(1, result["odom_burst_samples"])
+        self.assertIn("stamp_source", result)
+        plugin._state = None  # card stopped: info still answers
+        self.assertNotIn("odom_burst_samples",
+                         plugin.dispatch("info", {"_tool_name": "loco_state"}))
 
     def test_loco_uses_presets_and_acp_completion(self):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())

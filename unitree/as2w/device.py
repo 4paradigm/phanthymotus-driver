@@ -42,6 +42,38 @@ def _values(value):
         return [value]
 
 
+def _finite(value):
+    """A measured axis value, or None when it is unreadable or not finite.
+
+    A NaN or infinity from the sport feed is not a measurement, and json.dumps
+    would serialize it as bare NaN/Infinity — which is not valid JSON and breaks
+    every motus.odom/1 consumer. Unreadable is likewise None, never a measured
+    zero.
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _timespec_ms(stamp):
+    """`unitree_go.msg.dds_.TimeSpec_` as epoch milliseconds, or None.
+
+    Returns None rather than 0 for anything unreadable, so that
+    `common.odom.resolve_stamp_ms` sees "no stamp" instead of "1970" — the two
+    produce the same fallback but only one of them says why in the sample.
+    """
+    try:
+        sec = int(stamp.sec)
+        nanosec = int(stamp.nanosec)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if sec <= 0 and nanosec <= 0:
+        return None
+    return sec * 1000 + nanosec // 1_000_000
+
+
 def _acp_notify(action_id, status, result, tool="loco"):
     import os, ssl, urllib.request
     endpoint = f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete"
@@ -59,6 +91,8 @@ def _acp_notify(action_id, status, result, tool="loco"):
 
 
 class _StateNode:
+    _ODOM_INTERVAL = 0.1  # 10 Hz throttle for the published motus.odom/1 sample
+
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
@@ -67,6 +101,17 @@ class _StateNode:
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", _LOW_LAT_QOS or 1)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", _LOW_LAT_QOS or 1)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", _LOW_LAT_QOS or 1)
+        # The loco_state card's second port: the same sport feed as motus.odom/1,
+        # published *alongside* loco/state rather than replacing it (R1 does the
+        # same). The window is filled from the DDS callback and drained by the
+        # publisher worker, hence its own lock.
+        self.odom = self.node.create_publisher(String, f"/{namespace}/state/odom", _LOW_LAT_QOS or 1)
+        self._odom_lock = threading.Lock()
+        self._odom_burst = []
+        self._odom_burst_size = 0
+        self._odom_stamp_ms = 0
+        self._odom_stamp_provenance = {}
+        self._last_odom_time = 0.0
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
@@ -207,6 +252,16 @@ class _StateNode:
         self._publish(self.battery, battery)
 
     def _on_sport(self, msg):
+        # Every reading is measured for odom; the worker below only sees the
+        # newest one. The cheap part (three scalars and a timestamp) runs here
+        # at 20 Hz; the dict, the JSON and the publish stay in the worker. See
+        # `common.odom.mean_twist` for why decimating without averaging is not
+        # a neutral choice for a stuck-detector. Nothing odom does may stop
+        # loco/state from being published.
+        try:
+            self._accumulate_odom(msg)
+        except Exception:
+            pass
         latest_lock = getattr(self, "_latest_lock", None)
         if latest_lock is None:
             self._publish_sport(msg)
@@ -224,6 +279,100 @@ class _StateNode:
         loco.update(self._flat("position", getattr(msg, "position", [])))
         self._publish(self.loco, loco)
 
+        # The odom port goes second and on its own: loco/state above has
+        # already gone out, and an odom failure must not reach it.
+        if getattr(self, "odom", None) is None:
+            return
+        try:
+            now = time.monotonic()
+            if now - self._last_odom_time < self._ODOM_INTERVAL:
+                return
+            self._last_odom_time = now
+            self._publish_odom(msg)
+        except Exception:
+            pass
+
+    def odom_health(self):
+        """What the odom port is actually doing, for the loco_state card's info.
+
+        `odom_burst_samples` is the number of raw readings behind the last
+        published average: about 2 on a healthy 20 Hz feed, 0 when the window
+        was empty and every axis of that sample was `null`.
+        """
+        with self._odom_lock:
+            return {"odom_burst_samples": self._odom_burst_size,
+                    **self._odom_stamp_provenance}
+
+    def _accumulate_odom(self, msg):
+        """Read one vendor sport message into the averaging window, ~20 Hz.
+
+        As2W's `SportModeState_` measures `velocity[0]`/`velocity[1]` and
+        `yaw_speed`; vertical velocity, roll rate and pitch rate stay `None`,
+        not zero — reporting zero would claim the robot measured no such
+        motion, which is what makes a stuck-detector fire on a robot that
+        simply cannot answer.
+        """
+        if getattr(self, "odom", None) is None:
+            return
+        try:
+            from common.odom import resolve_stamp_ms
+
+            velocity = list(getattr(msg, "velocity", []))
+            row = [
+                _finite(velocity[0]) if len(velocity) > 0 else None,
+                _finite(velocity[1]) if len(velocity) > 1 else None,
+                None, None, None,  # vz, roll rate, pitch rate are not measured
+                _finite(getattr(msg, "yaw_speed", None)),
+            ]
+            stamp_ms, provenance = resolve_stamp_ms(
+                vendor_ms=_timespec_ms(getattr(msg, "stamp", None)),
+                received_ms=int(time.time() * 1000),
+            )
+        except Exception:
+            # A message shape we cannot read is not an averaging window of zeros.
+            # Dropping it leaves the window holding only what was understood.
+            return
+        with self._odom_lock:
+            self._odom_burst.append(row)
+            self._odom_stamp_ms = stamp_ms
+            self._odom_stamp_provenance = provenance
+
+    def _publish_odom(self, msg):
+        """The averaged window as one motus.odom/1 sample.
+
+        `mode` and `body_height` come from the current message, because
+        averaging a mode enum is meaningless; the twist a consumer acts on comes
+        from the window.
+        """
+        with self._odom_lock:
+            burst, self._odom_burst = self._odom_burst, []
+            self._odom_burst_size = len(burst)
+            stamp_ms = self._odom_stamp_ms
+            provenance = self._odom_stamp_provenance
+        if not burst:
+            # Nothing readable arrived in the window — quoting the previous
+            # stamp would call an empty sample fresh. Use the publish time and
+            # say so, so is_fresh judges this honestly.
+            stamp_ms = int(time.time() * 1000)
+            provenance = {"stamp_source": "published",
+                          "stamp_reason": "no readable vendor reading in window"}
+        try:
+            from common.odom import build_sample, mean_twist
+
+            sample = build_sample(
+                stamp_ms=stamp_ms,
+                twist=mean_twist(burst),
+                vendor={"mode": int(getattr(msg, "mode", 0)),
+                        "body_height": _number(getattr(msg, "body_height", 0)),
+                        # How many raw readings this average came from. Zero
+                        # means the window was empty and every axis is `null`.
+                        "samples": len(burst),
+                        **provenance},
+            )
+        except Exception:
+            return
+        self._publish(self.odom, sample)
+
 
 class StatePlugin:
     PREFIX = "state"
@@ -236,11 +385,47 @@ class StatePlugin:
                  ("joints", "state/joints", "sensor/skeleton", "As2W 12-joint leg skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
+                 ("loco_state", "loco/state", "data/json",
+                  "As2W high-level locomotion state, plus the same reading as motus.odom/1 "
+                  "(vx, vy, wz measured; vz, roll, pitch null) averaged to 10Hz on state/odom"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
-                 "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+                 "topic_out": self._topic_out(name, path, fmt)}
                 for name, path, fmt, desc in specs]
+
+    def _topic_out(self, name, path, fmt):
+        topic_out = [{"topic": f"/{self._namespace}/{path}", "format": fmt}]
+        if name == "loco_state":
+            topic_out.append({"topic": f"/{self._namespace}/state/odom", "format": "state/odom"})
+        return topic_out
+
+    @classmethod
+    def _odom_interface(cls):
+        # As2W's sport feed reports body-frame forward/lateral velocity and yaw
+        # rate. Legged dead reckoning, as on R1: good for "how fast am I going",
+        # useless as an absolute position, so pose stays null and drift is
+        # declared unbounded. Deterministic, so build it once; class-level
+        # because tests instantiate via __new__ without __init__.
+        if "_odom_interface_cache" not in cls.__dict__:
+            from common.odom import build_interface
+
+            cls._odom_interface_cache = build_interface(
+                provides=["vx", "vy", "wz"], rate_hz=10, pose_drift="unbounded")
+        return cls._odom_interface_cache
+
+    def _sensor_info(self, name, path, fmt):
+        result = {"state": "running", "topic_out": self._topic_out(name, path, fmt)}
+        if name == "loco_state":
+            # Read once at start by anything that needs to know whether this
+            # robot reports its own motion, and which axes of it.
+            result["odom_interface"] = self._odom_interface()
+            state = getattr(self, "_state", None)
+            if state is not None:
+                try:
+                    result.update(state.odom_health())
+                except Exception:
+                    pass
+        return result
     def start(self):
         # Sensor cards share one LowState subscription.  Recreate it when a
         # dashboard stopped the card instead of claiming a dead stream is live.
@@ -267,12 +452,12 @@ class StatePlugin:
                      "loco_state": ("loco/state", "data/json")}
             if name in paths:
                 path, fmt = paths[name]
-                return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+                return self._sensor_info(name, path, fmt)
             return {"state": "running"}
         if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
             path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
             fmt = "sensor/skeleton" if action == "joints" else "data/json"
-            return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+            return self._sensor_info(action, path, fmt)
         return {"state": "running"} if action == "info" else None
 
 
