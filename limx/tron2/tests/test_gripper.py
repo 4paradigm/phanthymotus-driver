@@ -344,6 +344,19 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.controller.active);self.reader.send_gripper.assert_awaited_once()
         self.assertEqual(self.controller.last['status'],'error')
         self.assertNotIn('close_handover',self.controller.last)
+    async def test_close_handover_rechecks_stationarity_after_delayed_error_callback(self):
+        self.report.return_value=False;await self.blocked_at_94()
+        async def callback(*args):
+            self.reader.read_gripper.return_value.update(left_speed=1)
+            return True
+        self.report.side_effect=callback
+        with patch.multiple('gripper',RECOVERY_TIMEOUT=.15,RECOVERY_STABILITY_SECONDS=.015):
+            with self.assertRaises(ValueError):await self.controller.dispatch('close',{'speed':10,'force':10})
+        self.assertIsNotNone(self.controller.active)
+        self.assertTrue(self.controller.last['callback_delivered'])
+        self.assertNotIn('close_handover',self.controller.last)
+        self.reader.send_gripper.assert_awaited_once()
+
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):

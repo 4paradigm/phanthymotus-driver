@@ -212,6 +212,17 @@ class Gripper:
                 if not delivered:
                     raise ValueError('原任务结果仍无法通知平台，未解除任务保护')
                 self.last['callback_delivered'] = True
+                if close_handover:
+                    # Callback delivery can take seconds. Recheck the robot
+                    # before using the earlier stationary proof for a close.
+                    state = (await self.read_state())['data']
+                    current_stamp = state['vendor_timestamp_ms']
+                    if current_stamp is None or current_stamp <= stamp or \
+                            state[self.side]['speed'] != 0 or \
+                            abs(state[self.side]['opening']-previous[0]) > TOLERANCE:
+                        raise ValueError('回调后静止反馈变化，关闭接替未放行')
+                    stamp = current_stamp
+                    count += 1
             if self.closed or self.reader.ws is not ws or self.reader.serial != serial or not self.reader.connected or \
                     self.peer and (self.peer.closed or self.peer.active) or cancellation.is_set():
                 raise ValueError('恢复期间驱动、连接或机械臂状态变化，未解除任务保护')
