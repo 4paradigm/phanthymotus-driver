@@ -821,8 +821,8 @@ class LocoPlugin:
         try:
             # 4. 50 Hz three-phase closed loop (cruise → brake → creep) over
             # chained ≤150° absolute sub-targets: cruise chains sub-targets with
-            # no settle between segments (advance at |err_sub| ≤ 2); the settle
-            # judgement runs once, on the final target.
+            # no intermediate brake/creep (advance at |err_sub| ≤ cruise band);
+            # the settle judgement runs once, on the final target.
             cumulative_angle = 0.0
             seg_i = 0
             cumulative_angle += segments[seg_i]
@@ -848,10 +848,13 @@ class LocoPlugin:
                 end_yaw = cur_yaw
                 err = _wrap180(seg_target - cur_yaw)
                 wz = float(imu.angular_vel[2])
-                # Sub-target advance: |err_sub| ≤ 2 jumps straight to the next
-                # sub-target — no settle between segments; settle below runs
-                # only against the final target.
-                if seg_i + 1 < len(segments) and abs(err) <= _ROTATE_TOL_DEG:
+                # Sub-target advance: inside the cruise-exit band (≤20°) jumps
+                # straight to the next sub-target, so non-final segments never
+                # brake or creep — one continuous cruise, one creep at the end.
+                # Wrap safety: non-final segments are exactly 150° and we
+                # advance within 20° of one, so err to the next stays in
+                # [130, 170] < 180 — wrap180 cannot shortcut the direction.
+                if seg_i + 1 < len(segments) and abs(err) <= _ROTATE_CRUISE_EXIT_DEG:
                     seg_i += 1
                     cumulative_angle += segments[seg_i]
                     seg_target = start_yaw + cumulative_angle

@@ -849,6 +849,31 @@ def test_realistic_plant_full_turn_contract(monkeypatch):
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
 
 
+def test_large_angle_subtargets_advance_in_cruise_band(monkeypatch):
+    # 最小版插补：非末段子目标在巡航带内（±20°）即推进，中途不再 brake/creep
+    # 爬行——指令序列必须是「巡航 0.8 段打头 + 刹停/爬行尾巴」的前缀形状。
+    # 旧推进阈值（±2°）会把中间段的 creep 脉冲（0.5）和零速打进序列中部，
+    # 0.8 不再是前缀 → 此断言必红。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(plant="realistic")
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    result = wait_rotate(plugin)
+    assert result['state'] == 'done'
+    assert abs(result['final_error_deg']) <= 2.0        # 末段一次爬行收敛不变
+
+    cruise_done = False
+    for (x, y, z) in fake.cmds:
+        if not cruise_done:
+            if abs(z) == module._ROTATE_VYAW_FULL:
+                continue                                # 巡航段：连续 0.8
+            cruise_done = True                          # 首个非巡航令开始尾巴
+        else:
+            assert abs(z) != module._ROTATE_VYAW_FULL, (
+                "cruise command reappeared after brake/creep began — "
+                "intermediate sub-target crawled instead of advancing")
+
+
 # ── status 真值 / driver.yaml 注册 ────────────────────────────────────────────
 
 def test_status_reflects_last_rotate_result(monkeypatch):
