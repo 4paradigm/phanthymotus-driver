@@ -17,6 +17,7 @@ sys.path.insert(0, str(DRIVER))
 
 from modbus_client import L20LiteModbusClient, crc16
 import modbus_device
+import hardware_smoke
 from modbus_device import HandPlugin, JOINT_NAMES, RIGHT_FIST_POSE, RIGHT_OPEN_POSE
 from common.vendor_runtime import DriverBundle, load_config
 
@@ -300,6 +301,35 @@ def test_info_recognizes_hot_swap_before_next_gesture(monkeypatch):
     assert plugin.dispatch("info", {})["side"] is None
     responding_ids.add(0x28)
     assert plugin.dispatch("info", {})["side"] == "left"
+    assert all(frame[1] == 0x04 for transport in transports for frame in transport.sent)
+
+
+def test_hardware_smoke_motion_uses_current_card_api_without_hardware(monkeypatch, capsys):
+    connection, transports = make_detecting_connection(monkeypatch, {0x27})
+    monkeypatch.setattr(hardware_smoke, "L20LiteConnection", lambda _config: connection)
+    monkeypatch.delenv("CONFIG_PATH", raising=False)
+    monkeypatch.setattr(sys, "argv", ["hardware_smoke.py", "--move-index-and-restore"])
+    monkeypatch.setattr("modbus_device.time.sleep", lambda _seconds: None)
+
+    assert hardware_smoke.main() == 0
+    output = capsys.readouterr().out
+    assert "move: completed" in output
+    assert "restore: completed" in output
+    assert connection._client is None
+    writes = [frame for transport in transports for frame in transport.sent if frame[1] == 0x10]
+    position_writes = [frame for frame in writes if frame[2:4] == b"\x00\x00"]
+    assert len(position_writes) >= 4
+    assert all(frame[0] == 0x27 for frame in writes)
+
+
+def test_hardware_smoke_read_only_detects_left_without_writes(monkeypatch, capsys):
+    connection, transports = make_detecting_connection(monkeypatch, {0x28})
+    monkeypatch.setattr(hardware_smoke, "L20LiteConnection", lambda _config: connection)
+    monkeypatch.delenv("CONFIG_PATH", raising=False)
+    monkeypatch.setattr(sys, "argv", ["hardware_smoke.py", "--read-only"])
+
+    assert hardware_smoke.main() == 0
+    assert "side: left" in capsys.readouterr().out
     assert all(frame[1] == 0x04 for transport in transports for frame in transport.sent)
 
 

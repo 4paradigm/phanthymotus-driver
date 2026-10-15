@@ -61,9 +61,12 @@ For local tests without hardware:
 python3 -m pytest tests/test_linkerhand_l20_lite_modbus.py -q
 ```
 
-With the powered right hand connected, run the tracked hardware smoke script
-from this directory with the repository root on `PYTHONPATH`. First read state
-without motion:
+With one powered hand connected to the configured serial port, run the tracked
+hardware smoke script from this directory with the repository root on
+`PYTHONPATH`. Stop the running driver container first so two processes do not
+access the same RS-485 port. The script loads the calibrated `config.yaml`
+(or `CONFIG_PATH`) and detects the responding hand. First read state without
+motion:
 
 ```bash
 PYTHONPATH=../.. python3 hardware_smoke.py --read-only
