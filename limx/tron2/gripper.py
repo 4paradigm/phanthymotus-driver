@@ -306,7 +306,8 @@ class Gripper:
             await self.recover({}, close_handover=True)
             self.same_session(failed)
             previous_error = {k:self.last[k] for k in ('action_id','action','status','error','error_code',
-                'target_opening','reported_opening','target_opening_verified','callback_delivered','close_handover')
+                'target_opening','reported_opening','target_opening_verified','callback_delivered','close_handover',
+                'stationary_target_miss')
                 if k in self.last}
         if self.peer and self.peer.active and self.peer.active['state'] == 'reporting' and self.peer.active.get('arrival_verified'):
             await asyncio.shield(self.peer.task)
@@ -332,6 +333,7 @@ class Gripper:
 
     async def verify_target(self, job):
         start = None; matches = 0
+        replacement = None; stationary_start = None; stationary_samples = 0; stationary_opening = None
         last_stamp = job['before_timestamp']
         deadline = time.monotonic() + TIMEOUT
         while time.monotonic() < deadline:
@@ -345,6 +347,7 @@ class Gripper:
             now = time.monotonic()
             if stamp is None or stamp <= last_stamp:
                 start = None; matches = 0
+                stationary_start = None; stationary_samples = 0; stationary_opening = None
                 await asyncio.sleep(POLL_SECONDS)
                 continue
             last_stamp = stamp
@@ -359,6 +362,30 @@ class Gripper:
                             'no_op': bool(job.get('no_op'))}
             else:
                 start = None; matches = 0
+            # An explicit queued close need not wait out the full open timeout
+            # when fresh feedback already proves the acknowledged open is
+            # stationary short of its target. Keep the original outcome an
+            # error; normal recovery and ACP delivery still guard the close.
+            waiting = self.waiting
+            can_replace = job['action'] == 'open' and job.get('vendor_acknowledged') is True and \
+                job['motion_sent'] is True and not job.get('no_op') and waiting and \
+                waiting['action'] == 'close' and not waiting['cancel'].is_set() and not self.closed and \
+                abs(actual-job['target']) > TOLERANCE and job['reported_speed'] == 0
+            if can_replace:
+                if replacement is not waiting or stationary_opening is None or \
+                        abs(actual-stationary_opening) > TOLERANCE:
+                    replacement = waiting; stationary_start = now
+                    stationary_samples = 0; stationary_opening = actual
+                stationary_samples += 1
+                if stationary_samples >= 3 and now-stationary_start >= RECOVERY_STABILITY_SECONDS:
+                    job['stationary_target_miss'] = {'verified_samples': stationary_samples,
+                        'observed_opening': actual, 'vendor_timestamp_ms': stamp,
+                        'reason': 'explicit_close_waiting_after_stationary_open'}
+                    raise MoveError('收到新的close；原open目标'+str(job['target'])+'尚未到位，反馈'+str(actual)+
+                                    '已连续静止；原open按失败结束，关闭仍须通过接替检查',
+                                    True, 'target_not_reached')
+            else:
+                replacement = None; stationary_start = None; stationary_samples = 0; stationary_opening = None
             await asyncio.sleep(POLL_SECONDS)
         raise MoveError('未确认达到目标开口'+str(job['target'])+'，最近反馈'+str(job.get('reported_opening'))+
                         '；检查实物停止后可使用recover恢复。未确认抓取成功',
@@ -421,6 +448,8 @@ class Gripper:
                       no_op=bool(job.get('no_op')), vendor_acknowledged=job['vendor_acknowledged'])
         if 'previous_action_error' in job:
             result['previous_action_error'] = job['previous_action_error']
+        if 'stationary_target_miss' in job:
+            result['stationary_target_miss'] = job['stationary_target_miss']
         result.setdefault('target_opening_verified', False)
         result.update({k: job[k] for k in ('reported_opening','reported_speed') if k in job})
         if status != 'completed':

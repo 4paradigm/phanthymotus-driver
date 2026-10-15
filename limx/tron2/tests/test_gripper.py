@@ -3,6 +3,7 @@ import asyncio
 import json
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -132,6 +133,36 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.controller.last['target_opening_verified'])
         self.assertFalse(self.controller.last['grasp_verified'])
         self.assertEqual(self.controller.active['state'], 'blocked_requires_operator_check')
+
+    async def test_stationary_open_without_queued_close_keeps_full_verification_window(self):
+        self.reader.read_gripper.return_value = sample(94, left_speed=0)
+        with patch.multiple('gripper', TIMEOUT=.12, RECOVERY_STABILITY_SECONDS=.015):
+            started = time.monotonic()
+            await self.dispatch();await self.controller.task
+            self.assertGreaterEqual(time.monotonic()-started, .12)
+        self.assertNotIn('stationary_target_miss', self.controller.last)
+        self.assertEqual(self.controller.last['status'], 'error')
+        self.assertEqual(self.reader.send_gripper.await_count, 1)
+
+    async def test_pending_close_cannot_end_open_while_moving_or_after_stop(self):
+        self.reader.read_gripper.return_value = sample(94, left_speed=1)
+        closing = None
+        try:
+            with patch.multiple('gripper', TIMEOUT=1, RECOVERY_STABILITY_SECONDS=.015):
+                await self.dispatch();opening = self.controller.task
+                closing = asyncio.create_task(self.controller.dispatch('close', {'speed':10,'force':10}))
+                await asyncio.sleep(.06)
+                self.assertIsNotNone(self.controller.waiting)
+                self.assertFalse(opening.done())
+                self.assertEqual(self.reader.send_gripper.await_count, 1)
+                self.controller.cancel_waiting()
+                with self.assertRaises(MoveError):await closing
+                self.reader.read_gripper.return_value = sample(94, left_speed=0)
+                await asyncio.sleep(.06)
+                self.assertFalse(opening.done())
+                self.assertEqual(self.reader.send_gripper.await_count, 1)
+        finally:
+            if closing:await asyncio.gather(closing, return_exceptions=True)
 
     async def test_callback_failure_keeps_local_owner(self):
         self.report.return_value = False
@@ -378,6 +409,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     self.opening=data['data'].get('left_opening',self.opening)
                     self.right_opening=data['data'].get('right_opening',self.right_opening)
                     if self.cap is not None:self.opening=min(self.opening,self.cap)
+                    if getattr(self,'right_cap',None) is not None:
+                        self.right_opening=min(self.right_opening,self.right_cap)
                     payload={'result':'success'}
                 if title=='request_movej': payload={'result':'success'}
                 if payload is not None:
@@ -810,6 +843,42 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 {'left_opening':0,'left_speed':10,'left_force':10}])
             left=[c.args for c in adapter._report_completion.call_args_list if c.args[0]=='gripper_left']
             self.assertEqual([c[2] for c in left],['error','completed'])
+        finally:
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
+    async def test_both_open100_then_both_close_skip_open_timeout_only_after_stationary_proof(self):
+        self.cap=self.right_cap=94
+        adapter,runner,call=await self.shared_http_app()
+        try:
+            with patch.multiple('gripper',TIMEOUT=2,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
+                                RECOVERY_TIMEOUT=.4,RECOVERY_STABILITY_SECONDS=.025):
+                for side in ('left','right'):
+                    result=await call('gripper_'+side,{'action':'open','opening':100,'speed':10,'force':10})
+                    self.assertFalse(result['isError'])
+                for side in ('left','right'):
+                    started=time.monotonic()
+                    result=await asyncio.wait_for(call('gripper_'+side,{'action':'close','speed':10,'force':10}),1)
+                    self.assertFalse(result['isError'],result)
+                    self.assertLess(time.monotonic()-started,1)
+                    prior=json.loads(result['content'][0]['text'])['previous_action_error']
+                    self.assertEqual(prior['status'],'error');self.assertEqual(prior['target_opening'],100)
+                    self.assertEqual(prior['reported_opening'],94)
+                    self.assertFalse(prior['target_opening_verified'])
+                    self.assertGreaterEqual(prior['stationary_target_miss']['verified_samples'],3)
+                    self.assertTrue(prior['close_handover']['reported_stationary_verified'])
+                for side,owner in adapter.grippers.items():
+                    await owner.task
+                    self.assertEqual(owner.last['status'],'completed')
+                    self.assertEqual(owner.last['reported_opening'],0)
+            writes=[r['data'] for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']
+            self.assertEqual(writes,[{'left_opening':100,'left_speed':10,'left_force':10},
+                {'right_opening':100,'right_speed':10,'right_force':10},
+                {'left_opening':0,'left_speed':10,'left_force':10},
+                {'right_opening':0,'right_speed':10,'right_force':10}])
+            for name in ('gripper_left','gripper_right'):
+                callbacks=[c.args[2] for c in adapter._report_completion.call_args_list if c.args[0]==name]
+                self.assertEqual(callbacks,['error','completed'])
         finally:
             for o in adapter.grippers.values():await o.close()
             await runner.cleanup()
