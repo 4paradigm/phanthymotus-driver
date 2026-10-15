@@ -231,9 +231,9 @@ def annotate_image(image_bgr, markers):
         cv2.line(canvas, (cx - 8, cy), (cx + 8, cy), (0, 0, 255), 1)
         cv2.line(canvas, (cx, cy - 8), (cx, cy + 8), (0, 0, 255), 1)
 
-        # 3. 绘制 ID 与归一化中心坐标标签（黄色字体）
-        norm_center = marker["center_normalized"]
-        text = f"ID:{marker['id']} ({norm_center[0]:.2f},{norm_center[1]:.2f})"
+        # 3. 绘制 ID 与 VOP 居中归一化坐标标签（[-1, 1] 范围，供机械臂直接使用）
+        vop_pos = marker.get("position", marker.get("center", [0.0, 0.0]))
+        text = f"ID:{marker['id']} ({vop_pos[0]:+.2f},{vop_pos[1]:+.2f})"
         tx = int(marker["corners_px"][0][0])
         ty = max(16, int(marker["corners_px"][0][1]) - 6)
         cv2.putText(canvas, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
@@ -433,7 +433,7 @@ class ArucoDetectorPlugin:
                     },
                     "get_marker_center": {
                         "params": ["marker_id", "timeout_s", "apply_compensation", "x_compensation_mm", "y_compensation_mm"],
-                        "description": "调用卡片获取指定 ID 的 ArUco 码中心位置坐标（VOP 统一格式）",
+                        "description": "调用卡片获取指定 ID 的 ArUco 码中心位置坐标。返回的 position 字段为机械臂专用的 VOP 居中坐标 [-1, 1]（画面中心为 0,0，左/上为负，右/下为正），请务必直接使用 position 字段作为抓取或移动目标坐标",
                     },
                     "info": {
                         "params": [],
@@ -670,11 +670,13 @@ class ArucoDetectorPlugin:
                         "marker_id": marker_id,
                         "position": pos,
                         "target_position": pos,
-                        "compensated_position": target.get("compensated_position"),
                         "center": pos,
-                        "center_normalized": target.get("center_normalized"),
+                        "vop_position": pos,
+                        "description": "机械臂移动控制请使用 position 字段（VOP 居中归一化坐标 [-1, 1]）",
+                        "compensated_position": target.get("compensated_position"),
                         "center_px": target.get("center_px"),
                         "compensated_center_px": target.get("compensated_center_px"),
+                        "center_normalized": target.get("center_normalized"),
                         "corners_normalized": target.get("corners_normalized"),
                         "corners_px": target.get("corners_px"),
                         "marker": target,
