@@ -964,6 +964,13 @@ class CameraPlugin:
         # ThreadingHTTPServer, and the canvas issues stop→start within seconds.
         self._lifecycle_lock = threading.RLock()
 
+        # 帧率看门狗状态（见 _watchdog_loop）
+        self._last_frame_at = 0.0        # 最近一帧到达的时刻，0 = 本次 arm 后还没来过
+        self._armed_at = 0.0             # 本次 start() 的时刻，首帧宽限的起点
+        self._watchdog_thread = None
+        self._watchdog_restarts = 0      # 本次 arm 周期内看门狗重启过几次
+        self._watchdog_gave_up = False   # 已经报过「放弃」，别刷屏
+
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
@@ -1041,6 +1048,10 @@ class CameraPlugin:
                     Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
 
             self._running = True
+            self._armed_at = time.time()
+            self._last_frame_at = 0.0
+            self._watchdog_restarts = 0
+            self._watchdog_gave_up = False
 
             # Separate encoding thread - avoids blocking executor
             if previous is not None and previous.is_alive():
@@ -1050,6 +1061,13 @@ class CameraPlugin:
             else:
                 self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
                 self._encode_thread.start()
+
+            wd = self._watchdog_thread
+            if wd is None or not wd.is_alive():
+                self._watchdog_thread = threading.Thread(
+                    target=self._watchdog_loop, daemon=True,
+                    name="tianyi2-camera-watchdog")
+                self._watchdog_thread.start()
 
             print("[CameraPlugin] subscription + encode thread created", flush=True)
 
@@ -1145,6 +1163,8 @@ class CameraPlugin:
         """Callback: just grab the latest frame, don't encode here (non-blocking)."""
         if not self._running:
             return
+        # 看门狗的唯一存活信号。放在锁外、只写一个 float —— 这是 30fps 的路径。
+        self._last_frame_at = time.time()
         with self._frame_lock:
             self._latest_frame = msg
 
@@ -1174,6 +1194,96 @@ class CameraPlugin:
                 self._pub.publish(out)
             except Exception as e:
                 print(f"[CameraPlugin] encode error: {e}", flush=True)
+
+    # ── 帧率看门狗 ────────────────────────────────────────────────────────────
+    #
+    # 2026-10-15 天轶实测的一次故障，形状是「所有健康指标都正常，只有画面没了」：
+    #
+    #   14:34:18  厂商的 Orbbec 节点（component_container，ppid=start_orbbec_camera.sh）
+    #             在 CPU 0 上死转，把 RCU grace-period kthread 和 timer softirq 一起饿死
+    #   14:34:39  rcu_preempt self-detected stall on CPU 6（5251 jiffies，HZ=250 → 21 秒）
+    #   之后      相机流再不出帧：服务 active/running、NRestarts=0、日志零报错、
+    #             USB 设备在位、我们的订阅也正常挂着（Subscription count: 2）
+    #   19:03     `systemctl restart orbbec_head` 之后立刻恢复（6 秒 70 帧）
+    #
+    # 也就是说这类死亡**只有量帧率能发现**，服务状态和日志都看不出来，当天是靠人
+    # 工发现 + 一条命令救回来的。而重启主机服务之后，容器里**既有的订阅会自动
+    # 重新匹配新的发布者** —— 19:04 在 15:47 创建的那个容器里量到 57 帧/6s，所以
+    # 看门狗只需要重启服务，不要去重建订阅（`start` 的注释说明了重建为什么不可靠）。
+    #
+    # 首帧宽限比断流阈值宽得多：arm 的时候服务可能正在重启（device init 实测
+    # 1.6 秒）外加 DDS 发现，而断流是在已经出过帧之后，30fps 下 15 秒等于 450 帧。
+    _FIRST_FRAME_GRACE_S = 30.0
+    _FRAME_STALL_S = 15.0
+    _WATCHDOG_POLL_S = 1.0
+    # 重启两次还不回来就不是这条路能修的了（USB 需要重新枚举、或者要重启主机）。
+    # 继续重启只会让每 15 秒都掉一次流，且把真实原因埋在刷屏里。
+    _MAX_WATCHDOG_RESTARTS = 2
+
+    _NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+
+    @classmethod
+    def _restart_orbbec_service(cls) -> str | None:
+        """无条件重启主机上的 orbbec_head。成功返回 None，失败返回原因。
+
+        和 `_ensure_orbbec_service` 区别开：那个是「必要时才动」（active 且配置没变
+        就不碰正在跑的流），看门狗要的恰恰是「它看着是 active 但其实死了，给我重启」。
+        """
+        import subprocess
+        try:
+            subprocess.run(
+                cls._NSENTER + ["systemctl", "restart", "orbbec_head.service"],
+                check=True, capture_output=True, text=True, timeout=30)
+            return None
+        except Exception as e:
+            return str(e)
+
+    def _watchdog_loop(self):
+        """卡片已 arm 但收不到帧时，重启一次主机相机服务。
+
+        参考点有两个：还没收到过任何一帧时用 `_armed_at`（走首帧宽限），收到过之后
+        用 `_last_frame_at`（走断流阈值）。`stop()` 清 `_running`，循环随之退出 ——
+        **停掉的卡片绝不能去重启主机服务**，那会把别的使用者的流掐掉。
+        """
+        while self._running:
+            time.sleep(self._WATCHDOG_POLL_S)
+            if not self._running:
+                return
+            last = self._last_frame_at
+            ref = last or self._armed_at
+            if not ref:
+                continue
+            gap = time.time() - ref
+            limit = self._FRAME_STALL_S if last else self._FIRST_FRAME_GRACE_S
+            if gap < limit:
+                continue
+
+            if self._watchdog_restarts >= self._MAX_WATCHDOG_RESTARTS:
+                if not self._watchdog_gave_up:
+                    self._watchdog_gave_up = True
+                    print(f"[CameraPlugin] 看门狗放弃：已重启 "
+                          f"{self._watchdog_restarts} 次，{gap:.0f}s 仍无帧。"
+                          f"相机服务重启救不回来 —— 需要 USB 重新枚举或重启主机。"
+                          f"检查 dmesg 有没有 rcu stall / xhci 报错。", flush=True)
+                continue
+
+            # 判定与重启之间卡片可能刚好被 stop 掉。这里不持 _lifecycle_lock —— 重启
+            # 要几秒，持锁会把并发的 stop 堵在后面 —— 所以改成动手前再确认一次。
+            if not self._running:
+                return
+            self._watchdog_restarts += 1
+            why = ("开播后一直没有首帧" if not last else f"断流 {gap:.0f}s")
+            print(f"[CameraPlugin] 看门狗触发（{why}）：重启 orbbec_head.service "
+                  f"（第 {self._watchdog_restarts}/{self._MAX_WATCHDOG_RESTARTS} 次）。"
+                  f"厂商节点可能 active 但已死 —— 2026-10-15 实测过一次，"
+                  f"服务状态与日志均正常而一帧不出。", flush=True)
+            err = self._restart_orbbec_service()
+            if err:
+                print(f"[CameraPlugin] 看门狗重启失败: {err}", flush=True)
+            # 重置参考点，否则下一次轮询会立刻再判一次超时。重启后给它完整的
+            # 首帧宽限：服务刚起来，device init 加发现本来就要几秒。
+            self._armed_at = time.time()
+            self._last_frame_at = 0.0
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
