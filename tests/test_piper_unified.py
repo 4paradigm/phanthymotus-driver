@@ -628,7 +628,11 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(self.targets()[-1], self.sdk.pose)
 
     def test_joint_near_without_controller_completion_is_not_success(self):
-        self.sdk.reached = False
+        submit = self.sdk.JointCtrl
+        def moving_without_completion(*target):
+            submit(*target)
+            self.sdk.reached = False
+        self.sdk.JointCtrl = moving_without_completion
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
             self.call('set_joints', joints_deg=[1,10,-10,0,20,0])
 

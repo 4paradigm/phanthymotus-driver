@@ -72,7 +72,7 @@ evicted. A callback from an older action cannot overwrite the latest action.
 Records are in memory and delivery logs go to stdout; callbacks are not durable
 across process replacement, and no robot action resumes after restart.
 
-**Model entry boundary:** installed official Core release.261015.0897a8d's
+**Historical model entry boundary:** official Core release.261015.0897a8d's
 `detail-panel.js` mounts skeleton renderers with the literal MCP ID `detail`.
 Joints' View data stream button consequently requests `/api/mcp/detail/call`
 and shows a fallback humanoid. The top Monitor resolves the real device ID and
@@ -80,7 +80,7 @@ correctly displays PiPER. The browser test reproduces and records both outcomes;
 this is a known Core defect, not a passed detail-entry acceptance or a driver
 model failure. Use top Monitor until the Core owner fixes device forwarding.
 
-**Remaining Core boundary:** release.261015.0897a8d acknowledges receipt even if
+**Historical completion boundary:** release.261015.0897a8d acknowledges receipt even if
 `mark_action_complete` did not find a pending waiter. It does not buffer an early
 completion. The unchanged-Core integration test reproduces this: acknowledge
 before registration, register afterwards, and sync times out. A fixed grace is
@@ -89,6 +89,41 @@ that race requires a Core acknowledgment/buffering change and remains an explici
 platform issue outside this driver-only request. An ambiguous failed HTTP retry
 may also be delivered more than once to Core, which has no deduplication promise;
 the robot trajectory still executes once.
+
+Core PR #330 resolves both boundaries, including bounded early receipts,
+deduplication and manual-canvas registration. The operator's current Core is
+release.261015.5440953; it is unchanged by the driver-only local fix below.
+
+## Boundary handling and rejection diagnostics
+
+- Cartesian Move/Pose require an interior joint posture. An exact effective
+  joint endpoint is rejected before takeover/preparation; posture is rechecked
+  after preparation and under the send lock, before mode and target submission.
+  This conservative guard is not IK, collision checking or proof of reachability.
+  Use Set joints to choose a working posture; zero-angle Reset is not one.
+- Command and measured-joint limits stay strict. Only an already-submitted Reset
+  boundary target may observe a small endpoint excursion (within the existing
+  0.5 degree arrival window) for at most 0.5 second. No additional command is
+  sent during observation. Feedback must return inside every strict limit and
+  then satisfy the existing 0.5 second stable-arrival test before success.
+  Persistent/gross excursions, faults, stale data, lost mode/enable/permission
+  and cancellation still fail. No measurement is clamped or accepted outside
+  limits; the grace is not a new measurement tolerance or retry.
+- A rejection or measured-limit failure never triggers another hold target,
+  even if a subsequent read becomes healthy. A new task is refused while the
+  controller still reports a previous trajectory in motion.
+- Get status/journal distinguish pre-existing reports, setup failures and target
+  rejection after submission. They retain the SDK target, first error feedback,
+  measured joints/limits, actual status, submission flags and hold result.
+  Stop without a live driver task reports `stop_unconfirmed` when fresh healthy
+  stationary feedback cannot be confirmed, rather than claiming physical stop.
+- Existing controller faults are never cleared automatically. Reset returns
+  joint angles; it does not clear a latched target-limit report.
+
+This repair adds no dependencies and changes no Core/shared runtime. Local
+regression passed 449 tests plus 331 subtests; the ARM64 isolated image passed
+220 unittest tests without hardware mappings. Physical acceptance remains
+separate from those results. A local overlay tag is not a PR Bot Version.
 
 ## Acceptance
 
@@ -104,4 +139,6 @@ image, not a clean release build or a Bot Version. On-site acceptance remains:
 small relative/partial absolute joints, gripper widths, Stop during movement,
 then the official zero-angle posture from reviewed starting poses. Record actual
 feedback, terminal outcome, callback reception and physical observations.
-No deployment or PR update is included in this remediation.
+The remediation and boundary repair are submitted through driver PR #382. A
+registry deployment must use the actual Version reported by its Bot build and
+preserve the operator's CAN identity, camera binding, DDS and Core configuration.

@@ -9,11 +9,13 @@ import time
 
 from common.vendor_runtime import action_schema
 from agilex.piper.intent_control import CONTROL, IntentControlPlugin, public_error
-from agilex.piper.intent_motion import checked_state, end_pose, JOG_SPEED_PERCENT
+from agilex.piper.intent_motion import (DirectionUnavailable, checked_state, cartesian_start_check,
+                                       end_pose, JOG_SPEED_PERCENT)
 from agilex.piper.intent_teaching import exit_teaching_and_hold
 from agilex.piper.path_capability import path_capability, adapter_serial
 from agilex.piper.completion import ActionCompletions, run_async
-from agilex.piper.user_motion import vector, target_pose, joint_target, execute_target, tcp_transform, Transform
+from agilex.piper.user_motion import (vector, target_pose, joint_target, execute_target,
+                                     tcp_transform, Transform, failure_feedback, require_controller_idle)
 
 
 USER_TASKS = {'move', 'pose', 'set_joints', 'reset', 'set_gripper_opening'}
@@ -92,10 +94,10 @@ class UnifiedControlPlugin(IntentControlPlugin):
         actions = {
             'select_action': ([], 'Choose an action'),
             'move': (['translation_mm', 'rotation_deg', 'speed_percent'],
-                     'Relative tool-frame motion. Without TCP calibration: SDK end axes, translation only, unchanged orientation.'),
+                     'Relative tool-frame motion. Select an in-range joint working posture first. Without TCP calibration: SDK end axes, translation only, unchanged orientation.'),
             'pose': (['pose_mm_deg', 'motion_mode', 'speed_percent'], 'Absolute base-frame gripper-tip target; null keeps the measured component.'),
             'set_joints': (['joints_deg', 'joint_mode', 'speed_percent'], 'Six joint angles in degrees. Absolute: null keeps measured angle. Relative: 0 keeps angle.'),
-            'reset': (['speed_percent'], 'Move all six joints to the official zero-angle posture [0,0,0,0,0,0] deg. Verify the return path on site. Gripper unchanged.'),
+            'reset': (['speed_percent'], 'Return to official [0,0,0,0,0,0] deg. Not a working posture or fault clear. Verify the return path on site. Gripper unchanged.'),
             'stop_motion': ([], 'Cancel preparation or motion; keep motor torque.'),
             'set_gripper_opening': (['width_mm'], 'Set gripper opening in millimetres.'),
             'get_status': ([], 'Read actual pose, joints, limits, mode, faults and the task result; no control commands.'),
@@ -104,7 +106,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
             'info': ([], 'Read actual state and the current task result.'),
         }
         props = {
-            'translation_mm': array_property('Tool displacement (mm)', 'Max 10 mm; [dx,dy,dz] in tool axes. Without TCP calibration, axes are parallel to the SDK end frame.', 3, [1, 0, 0]),
+            'translation_mm': array_property('Tool displacement (mm)', 'Max 10 mm total vector length; [dx,dy,dz] in tool axes. Without TCP calibration, axes are parallel to the SDK end frame.', 3, [1, 0, 0]),
             'rotation_deg': array_property('Tip rotation (deg)', '[0,0,0] without TCP calibration; otherwise each -5 to 5 deg [roll,pitch,yaw].', 3, [0, 0, 0]),
             'pose_mm_deg': array_property('Base-frame tip pose', '[x,y,z,roll,pitch,yaw]; mm/deg. null keeps measured value; at least one number.', 6, allow_null=True),
             'joints_deg': array_property('Joint angles (deg)', '[J1,J2,J3,J4,J5,J6]; absolute: null keeps measured angle; relative: numbers only. Limits in Get status.', 6, allow_null=True),
@@ -118,7 +120,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
         if not calibrated:
             actions.pop('pose')
             actions['move'] = (['translation_mm', 'speed_percent'],
-                               'Relative translation along SDK end axes; keep orientation. 0 means no displacement.')
+                               'Relative translation along SDK end axes; keep orientation. Use an in-range joint working posture first. 0 means no displacement.')
             props.pop('rotation_deg')
             props.pop('pose_mm_deg')
         else:
@@ -237,6 +239,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
 
     def _execute_task(self, action, args):
         with self.operation(CONTROL, action):
+            setup_control_attempted = False
             self._phase('preparing', action=action, started_at=time.time(), result=None, error=None,
                         diagnostics=None, outcome=None, diagnostic_warning=None, preparation=None,
                         request={k: v for k, v in args.items() if k not in {'_tool_name', 'instance_id'}})
@@ -256,6 +259,13 @@ class UnifiedControlPlugin(IntentControlPlugin):
                     self.require_path_permission()
                 self.require_motion_permission()
                 driver = self.connected(cancel_event=self.cancel)
+                # A capability refusal must not first take over teaching,
+                # switch modes, enable motors, or create a controller fault.
+                initial = checked_state(driver, allow_teaching=True)
+                if action in {'move', 'pose'}:
+                    cartesian_start_check(driver, initial)
+                if initial.control_mode.startswith('CAN_CTRL'):
+                    require_controller_idle(driver)
                 # Recheck the operator gate inside every primitive's cancellation
                 # check, including prepare loops and gripper follow-up frames.
                 original_check = driver._check_cancelled
@@ -268,10 +278,12 @@ class UnifiedControlPlugin(IntentControlPlugin):
                     self.require_motion_permission()
                 driver._check_cancelled = check
                 try:
+                    setup_control_attempted = initial.control_mode.startswith('TEACHING_MODE')
                     state = self._enter_action_control(driver)
                     target = tip_goal = None
                     width = None
                     if action in {'move', 'pose'}:
+                        cartesian_start_check(driver, state)
                         target, tip_goal = target_pose(driver, action, args, self.config)
                     elif action in {'set_joints', 'reset'}:
                         config = self.config
@@ -289,6 +301,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
                                          'joints_deg': state.joints_deg, 'tip_target_mm_deg': tip_goal,
                                          'joint_target_deg': target if action in {'set_joints', 'reset'} else None})
                     if state.control_mode.startswith('STANDBY') or not all(state.enabled):
+                        setup_control_attempted = True
                         driver.prepare_control(execute=True, workspace_clear=True, allow_limit_adjustment=False,
                                                speed_pct=JOG_SPEED_PERCENT)
                     ready = checked_state(driver, ready=True)
@@ -296,6 +309,8 @@ class UnifiedControlPlugin(IntentControlPlugin):
                     # recomputed after preparation or a mode change.
                     if max(abs(q-b) for q, b in zip(ready.joints_deg, state.joints_deg)) > .5:
                         raise RuntimeError('The arm moved during preparation; the original target was cancelled.')
+                    if action in {'move', 'pose'}:
+                        cartesian_start_check(driver, ready)
                     driver._check_cancelled()
                     self._phase('moving')
                     if action in {'move', 'pose', 'set_joints', 'reset'}:
@@ -304,7 +319,8 @@ class UnifiedControlPlugin(IntentControlPlugin):
                             require_permission=self.require_motion_permission, report=self._motion_report,
                             tcp_offset=tcp_transform(self.config) if tip_goal is not None else None,
                             tip_goal=tip_goal, motion_mode=args.get('motion_mode', 'linear'),
-                            require_path_permission=self.require_path_permission)
+                            require_path_permission=self.require_path_permission,
+                            boundary_settling=action == 'reset')
                         if action in {'set_joints', 'reset'}:
                             result['reference_frame'] = 'joint_angles'
                         if action == 'reset':
@@ -332,10 +348,51 @@ class UnifiedControlPlugin(IntentControlPlugin):
                     driver._check_cancelled = original_check
                     driver.require_control_permission = original_permission
             except BaseException as exc:
+                with self.task_lock:
+                    existing = deepcopy(self.task.get('diagnostics'))
+                if not existing or existing.get('stage') != 'interrupted':
+                    code = getattr(exc, 'failure_code', 'preflight_failed')
+                    if isinstance(exc, DirectionUnavailable):
+                        code = 'controller_report_already_active'
+                    setup_control_attempted = setup_control_attempted or (existing or {}).get('stage') == 'exiting_teaching'
+                    detail = {**(existing or {}), 'stage': 'rejected_before_submission', 'failure_code': code,
+                        'control_attempted': setup_control_attempted,
+                        'target_attempted': False, 'target_submitted': False,
+                        'first_error_feedback': getattr(exc, 'feedback', None),
+                        'actual_feedback': failure_feedback(self.driver), 'error': public_error(exc)}
+                    try:
+                        self._motion_report(detail)
+                    except Exception:
+                        with self.task_lock:
+                            self.task['diagnostic_warning'] = 'The failure diagnostic could not be saved.'
+                elif setup_control_attempted:
+                    with self.task_lock:
+                        self.task['diagnostics']['setup_control_attempted'] = True
+                with self.task_lock:
+                    code = self.task['diagnostics'].get('failure_code', 'operation_failed')
                 self._phase('cancelled' if self.cancel.is_set() else 'failed', error=public_error(exc),
-                            outcome='cancelled' if self.cancel.is_set() else 'operation_failed')
+                            outcome='cancelled' if self.cancel.is_set() else code)
                 self._terminal_audit()
                 raise RuntimeError(public_error(exc)) from exc
+
+    def stop_motion(self):
+        result = super().stop_motion()
+        if result['operation_stopping']:
+            return result
+        # Releasing the Python task lock is not proof that a previously rejected
+        # controller trajectory stopped. Read cache only; never reconnect here.
+        feedback = failure_feedback(self.driver)
+        confirmed = (feedback.get('feedback_fresh') is True
+            and feedback.get('controller_motion_status') == 0
+            and feedback.get('controller_status', '').startswith('NORMAL')
+            and feedback.get('error_code') == 0 and not feedback.get('motor_faults'))
+        result['controller_idle_confirmed'] = confirmed
+        if not confirmed:
+            result.update(state='stop_unconfirmed',
+                message='No driver task is running, but healthy stationary controller feedback is not confirmed. '
+                        'Check Get status. Stop does not clear controller faults.',
+                feedback=feedback)
+        return result
 
     def read_monitor_snapshot(self):
         snapshot = super().read_monitor_snapshot()

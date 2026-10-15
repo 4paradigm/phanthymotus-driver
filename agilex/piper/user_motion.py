@@ -8,7 +8,57 @@ import json
 import math
 import time
 
-from agilex.piper.intent_motion import EndPose, checked_state, end_pose, fresh
+from agilex.piper.intent_motion import (EndPose, DirectionUnavailable, JointLimitViolation,
+                                       checked_state, cartesian_start_check, end_pose, fresh)
+
+
+JOINT_ARRIVAL_TOLERANCE_DEG = .5
+BOUNDARY_SETTLE_SECONDS = .5
+
+
+def failure_feedback(driver):
+    """Best-effort cache reads only; never connect, clear a fault or submit."""
+    result = {}
+    if driver is None:
+        return {'feedback_available': False}
+    try:
+        state = driver.get_state()
+        result.update(controller_status=state.arm_status, error_code=state.error_code,
+            joints_deg=list(state.joints_deg), joint_feedback_time=state.feedback_time,
+            feedback_fresh=fresh(state.feedback_time), joint_limits_deg=driver.joint_bounds_deg(),
+            control_mode=state.control_mode, enabled=list(state.enabled), motor_faults=list(state.motor_faults))
+    except Exception as exc:
+        result['joint_read_error'] = str(exc)
+    try:
+        status = _status(driver)
+        result['controller_motion_status'] = int(status.arm_status.motion_status)
+    except Exception as exc:
+        result['status_read_error'] = str(exc)
+    try:
+        measured = end_pose(driver)
+        result.update(position_mm=measured.position_mm, orientation_deg=measured.orientation_deg)
+    except Exception as exc:
+        result['pose_read_error'] = str(exc)
+    return result
+
+
+def require_controller_idle(driver):
+    if int(_status(driver).arm_status.motion_status) != 0:
+        error = RuntimeError('The controller still reports motion from a previous trajectory. '
+                             'Wait for stationary feedback before starting another action; no new command was sent.')
+        error.failure_code = 'controller_still_moving'
+        raise error
+
+
+def _boundary_can_settle(error, target):
+    """Observe only: command and successful-arrival limits remain strict."""
+    feedback = error.feedback or {}
+    violations = feedback.get('violations', [])
+    return bool(violations) and all(
+        (target[v['joint'] - 1] == v['limits_deg'][0] and v['actual_deg'] < v['limits_deg'][0]
+         or target[v['joint'] - 1] == v['limits_deg'][1] and v['actual_deg'] > v['limits_deg'][1])
+        and abs(v['actual_deg'] - target[v['joint'] - 1]) <= JOINT_ARRIVAL_TOLERANCE_DEG
+        for v in violations)
 
 
 def vector(value, size, name, *, allow_null=False):
@@ -177,7 +227,8 @@ def _status(driver):
 
 
 def send_target(driver, target, speed, kind, require_permission, *, hold=False,
-                motion_mode='linear', require_path_permission=None, on_submission=lambda: None):
+                motion_mode='linear', require_path_permission=None, on_submission=lambda: None,
+                on_target_submission=lambda: None):
     """Stop and the final cancellation check share the same submission lock."""
     if motion_mode not in {'linear', 'point_to_point'} or kind != 'pose' and motion_mode != 'linear':
         raise ValueError('Invalid motion path.')
@@ -185,7 +236,9 @@ def send_target(driver, target, speed, kind, require_permission, *, hold=False,
         if not hold:
             driver._check_cancelled()
         require_permission()
-        checked_state(driver, ready=True)
+        ready_state = checked_state(driver, ready=True)
+        if kind == 'pose' and not hold:
+            cartesian_start_check(driver, ready_state)
         _status(driver)
         if not hold and motion_mode == 'point_to_point':
             if not callable(require_path_permission):
@@ -208,19 +261,23 @@ def send_target(driver, target, speed, kind, require_permission, *, hold=False,
         require_permission()
         if not hold:
             driver._check_cancelled()
-        checked_state(driver, ready=True)
+        final_state = checked_state(driver, ready=True)
+        if kind == 'pose' and not hold:
+            cartesian_start_check(driver, final_state)
         if not hold and motion_mode == 'point_to_point':
             require_path_permission()
         if kind == 'pose':
+            on_target_submission()
             driver.arm.EndPoseCtrl(*raw)
         else:
+            on_target_submission()
             driver.arm.JointCtrl(*raw)
         return sent_at
 
 
 def execute_target(driver, target, speed, kind, *, require_permission, report=lambda data: None,
                    tcp_offset=None, tip_goal=None, clock=time.monotonic, sleep=time.sleep,
-                   motion_mode='linear', require_path_permission=None):
+                   motion_mode='linear', require_path_permission=None, boundary_settling=False):
     """Submit one SDK trajectory; require fresh post-submission stable arrival."""
     checked_state(driver, ready=True)
     if kind == 'pose':
@@ -230,23 +287,49 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
     report({'stage': 'target', 'target': values, 'target_kind': kind, 'speed_percent': speed,
             'motion_mode': path})
     attempted = False
+    target_attempted = False
+    target_submitted = False
+    boundary_since = None
     held = False
     def submitted():
         nonlocal attempted
         attempted = True
+    def target_started():
+        nonlocal target_attempted
+        target_attempted = True
     try:
         driver._check_cancelled()
         require_permission()
         sent_at = send_target(driver, target, speed, kind, require_permission,
                              motion_mode=motion_mode, require_path_permission=require_path_permission,
-                             on_submission=submitted)
+                             on_submission=submitted, on_target_submission=target_started)
+        target_submitted = True
         deadline, stable_since = clock()+30, None
         while clock() < deadline:
             driver._check_cancelled()
             require_permission()
             if motion_mode == 'point_to_point':
                 require_path_permission()
-            state, status = checked_state(driver, ready=True), _status(driver)
+            try:
+                state = checked_state(driver, ready=True)
+            except JointLimitViolation as exc:
+                # The controller owns the one already submitted zero trajectory.
+                # Brief endpoint excursions can settle without issuing ANY new
+                # command. Never call them in-range or count them as arrival.
+                _status(driver)
+                if (boundary_settling and kind == 'joints' and _boundary_can_settle(exc, target)):
+                    if boundary_since is None:
+                        boundary_since = clock()
+                        report({'stage': 'boundary_settling', 'feedback': exc.feedback,
+                                'observation_seconds': BOUNDARY_SETTLE_SECONDS,
+                                'additional_commands_sent': 0})
+                    if clock() - boundary_since < BOUNDARY_SETTLE_SECONDS:
+                        stable_since = None
+                        sleep(.05)
+                        continue
+                    exc.failure_code = 'boundary_feedback_did_not_settle'
+                raise
+            status = _status(driver)
             if kind == 'pose':
                 measured = end_pose(driver)
                 actual = (*measured.position_mm, *measured.orientation_deg)
@@ -258,7 +341,7 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
                 feedback_time = min(measured.feedback_time, state.feedback_time)
             else:
                 actual, feedback_time = state.joints_deg, state.feedback_time
-                near = max(abs(q-t) for q, t in zip(actual, target)) <= .5
+                near = max(abs(q-t) for q, t in zip(actual, target)) <= JOINT_ARRIVAL_TOLERANCE_DEG
             arrived = (near and feedback_time > sent_at and status.time_stamp > sent_at
                        and int(status.arm_status.motion_status) == 0)
             if arrived:
@@ -277,7 +360,21 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
             sleep(.05)
         raise RuntimeError('Movement timed out after 30 seconds; arrival was not confirmed.')
     except BaseException as exc:
-        if attempted:
+        first_feedback = getattr(exc, 'feedback', None)
+        failure_code = getattr(exc, 'failure_code', 'motion_failed')
+        if isinstance(exc, DirectionUnavailable):
+            failure_code = ('target_rejected_after_submission' if target_attempted else
+                            'controller_rejected_during_setup' if attempted else 'controller_report_already_active')
+            if first_feedback and first_feedback.get('controller_status', '').startswith('TARGET_POS_EXCEEDS_LIMIT'):
+                if target_attempted:
+                    exc.args = ('The controller rejected the submitted movement target as outside its limits. '
+                        'Movement may be partial. Recover the controller before retrying. No reset or retry was sent.',)
+                elif attempted:
+                    exc.args = ('The controller reported a target outside its limits during motion setup; '
+                        'the requested target was not submitted. Recover the controller before retrying.',)
+        suppress_hold = (isinstance(exc, (JointLimitViolation, DirectionUnavailable))
+                         or getattr(exc, 'failure_code', None) == 'cartesian_start_at_joint_limit')
+        if attempted and not suppress_hold:
             try:
                 measured = end_pose(driver) if kind == 'pose' else checked_state(driver, ready=True).joints_deg
                 send_target(driver, measured, speed, kind, require_permission, hold=True)
@@ -285,7 +382,15 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
             except Exception:
                 pass
         try:
-            report({'stage': 'interrupted', 'error': str(exc), 'measured_hold_sent': held})
+            report({'stage': 'interrupted', 'error': str(exc), 'failure_code': failure_code,
+                    'control_attempted': attempted, 'target_attempted': target_attempted,
+                    'target_submitted': target_submitted, 'requested_target': values,
+                    'target_kind': kind, 'motion_mode': path, 'first_error_feedback': first_feedback,
+                    'measured_hold_sent': held,
+                    'hold_unconfirmed_reason': (None if held else
+                        'No follow-up target after a controller rejection, measured-limit violation or boundary refusal.' if suppress_hold else
+                        'Feedback or permission did not allow a verified hold.'),
+                    'actual_feedback': failure_feedback(driver)})
         except Exception:
             pass
         raise

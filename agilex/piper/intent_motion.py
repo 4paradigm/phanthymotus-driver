@@ -19,10 +19,19 @@ class DirectionUnavailable(RuntimeError):
         self.feedback = None
 
 
+class JointLimitViolation(RuntimeError):
+    """Strict measured-limit failure with the original, unclamped feedback."""
+    def __init__(self, message, feedback=None):
+        super().__init__(message)
+        self.feedback = feedback
+        self.failure_code = 'measured_joint_limit'
+
+
 def controller_error(status):
     if status.startswith('TARGET_POS_EXCEEDS_LIMIT'):
         return DirectionUnavailable('The controller rejected a movement target as outside its limits. '
-            'The target-limit report is still active; check the robot state before retrying. No reset was sent.')
+            'A previous target-limit report is still active; no new target was sent. '
+            'Recover the controller before retrying. Reset returns joint angles and does not clear faults.')
     if status.startswith(('NO_SOLUTION', 'SINGULARITY_POINT')):
         return DirectionUnavailable('The controller cannot follow this direction from the current pose '
             'while keeping the gripper orientation. Check the robot state before retrying. No reset was sent.')
@@ -79,11 +88,43 @@ def checked_state(driver, *, ready=False, allow_teaching=False):
     modes = ('STANDBY', 'CAN_CTRL', 'TEACHING_MODE') if allow_teaching else ('STANDBY', 'CAN_CTRL')
     if not state.control_mode.startswith(modes):
         raise RuntimeError('The arm is in an unsupported mode: ' + state.control_mode)
-    for i, (q, bounds) in enumerate(zip(state.joints_deg, driver.joint_bounds_deg()), 1):
-        if not bounds[0] <= q <= bounds[1]:
-            raise RuntimeError(f'Joint {i} is outside its effective limits; reposition the arm first.')
     if ready and (not state.control_mode.startswith('CAN_CTRL') or not all(state.enabled)):
         raise RuntimeError('The arm lost its ready state; the action was cancelled.')
+    bounds = driver.joint_bounds_deg()
+    if len(bounds) != 6:
+        raise RuntimeError('All six effective joint limits are required.')
+    violations = [dict(joint=i, actual_deg=q, limits_deg=list(limit))
+                  for i, (q, limit) in enumerate(zip(state.joints_deg, bounds), 1)
+                  if not limit[0] <= q <= limit[1]]
+    if violations:
+        first = violations[0]
+        raise JointLimitViolation(
+            f'Joint {first["joint"]} is outside its effective limits: '
+            f'{first["actual_deg"]:g} deg, allowed [{first["limits_deg"][0]:g}, '
+            f'{first["limits_deg"][1]:g}] deg. No out-of-range hold target will be sent.',
+            {'controller_status': state.arm_status, 'error_code': state.error_code,
+             'joints_deg': list(state.joints_deg), 'joint_limits_deg': [list(b) for b in bounds],
+             'feedback_time': state.feedback_time, 'violations': violations})
+    return state
+
+
+def cartesian_start_check(driver, state=None):
+    """Conservative start guard, not an IK/reachability claim or an arm move."""
+    state = state or checked_state(driver, allow_teaching=True)
+    bounds = driver.joint_bounds_deg()
+    endpoints = [dict(joint=i, actual_deg=q, limits_deg=list(limit))
+                 for i, (q, limit) in enumerate(zip(state.joints_deg, bounds), 1)
+                 if q <= limit[0] or q >= limit[1]]
+    if endpoints:
+        names = ', '.join('J' + str(item['joint']) for item in endpoints)
+        error = RuntimeError('Cartesian movement is unavailable at a joint limit (' + names + '). '
+            'Use Set joints to select an in-range working posture first. No Cartesian target was sent. '
+            'Reset is a zero-angle return, not a working posture or fault recovery.')
+        error.failure_code = 'cartesian_start_at_joint_limit'
+        error.feedback = {'joints_deg': list(state.joints_deg),
+            'joint_limits_deg': [list(b) for b in bounds], 'boundary_joints': endpoints,
+            'controller_status': state.arm_status, 'feedback_time': state.feedback_time}
+        raise error
     return state
 
 
