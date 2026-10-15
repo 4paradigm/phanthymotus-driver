@@ -159,7 +159,9 @@ def test_direction_json_preserves_precision_and_capture_window(monkeypatch):
     payload = json.loads(card._node.published[-1].data)
     assert payload == {
         'state': 'fresh', 'trigger': 'sound_activity', 'angle': -30,
-        'angle_deg': -29.678, 'unit': 'deg', 'timestamp_ms': 1700000000040,
+        'angle_deg': -29.678, 'unit': 'deg',
+        'angle_convention': 'robot_front_0_left_positive_ccw',
+        'timestamp_ms': 1700000000040,
         'audio_window_start_us': 1700000000000000,
         'audio_window_end_us': 1700000000020000,
     }

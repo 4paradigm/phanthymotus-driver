@@ -15,7 +15,8 @@ front 0°, **left positive** (counter-clockwise, REP-103 — the same sign as
 the locomotion `vyaw` command), right negative, rear ±180°. A source at
 front-left reads about +45 and passes straight to a `vyaw` turn with no
 negation. The observation reports `state: "fresh"`, an integer `angle` for display,
-and the exact `angle_deg` for ASR, with `audio_window_start_us`,
+and the exact `angle_deg` for ASR, with
+`angle_convention: "robot_front_0_left_positive_ccw"`, `audio_window_start_us`,
 `audio_window_end_us`, `timestamp_ms`, and `unit: "deg"`.
 After activity stops it publishes `state: "no_event"`; if updates disappear,
 the driver publishes `state: "stale"` after two seconds. Latest-mode viewers
