@@ -9,8 +9,7 @@ The transport in `modbus_client.py` implements the frames emitted by the
 official LinkerHand C++ SDK: function `0x04` reads ten 16-bit registers and
 `0x10` writes ten registers. Position, torque and speed start at registers
 `0x0000`, `0x000A` and `0x0014` respectively. Every value is `0..255` in the
-low byte of a register. The separate `can_client.py` and `device.py` files are
-the previous CAN draft; `main.py` now imports `modbus_device.py` instead.
+low byte of a register. `main.py` uses `modbus_device.py` for the hand card.
 
 Configure `serial_port` and `side` in `config.yaml`. The driver never moves the
 hand on startup; only explicit MCP `hand` actions do. Every `open`, `close`
@@ -59,7 +58,7 @@ stage still scans only one configured serial port.
 The canvas card name remains `hand`; its `info` result describes the detected
 left/right side, but the card header does not live-rename on USB hot-plug.
 
-For local tests without hardware:
+For local tests without hardware, run this command from the repository root:
 
 ```bash
 python3 -m pytest tests/test_linkerhand_l20_lite_modbus.py -q
@@ -108,5 +107,6 @@ All three motion actions accept `speed_ratio` from `1.0x` to
 `3.0x` and `hold_torque`. By default `hold_torque=true` preserves the existing
 driver behavior; choose `false` to release torque after reaching the target.
 Invalid options are rejected before serial access. Every motion still needs
-`confirm_motion=true`, and all actions still detect the sole responding hand
-on the configured serial port before touching hardware.
+`confirm_motion=true`. With automatic detection enabled, each motion action
+checks for the sole responding hand on the configured serial port before
+sending a motion command.
