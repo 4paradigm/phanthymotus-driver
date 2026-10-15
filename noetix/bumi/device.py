@@ -146,6 +146,10 @@ _ROTATE_PULSE_VYAW = 0.5               # creep 点动幅值（高于 0.4 stictio
 _ROTATE_PULSE_S_PER_DEG = 0.025
 _ROTATE_PULSE_MIN_S = 0.12
 _ROTATE_PULSE_MAX_S = 0.30
+_ROTATE_OBSERVE_S = 0.30
+_ROTATE_OBSERVE_SPREAD_DEG = 0.5
+_ROTATE_MIN_PROGRESS_DEG = 0.1
+_ROTATE_NO_PROGRESS_LIMIT = 3
 _ROTATE_VYAW_SIGN = 1.0
 _ROTATE_ANGLE_LIMIT_DEG = 360.0
 
@@ -166,12 +170,11 @@ def _yaw_deg_from_quat(ori) -> float:
                                    1.0 - 2.0 * (y * y + z * z)))
 
 
-def _pulse_duration_s(err_deg: float, halvings: int = 0) -> float:
-    """Creep pulse width: clamp(0.025*|err|, 0.12, 0.30), halved once per past
-    overshoot and never below the 0.06 s floor (no chatter below that)."""
-    base = min(_ROTATE_PULSE_MAX_S,
-               max(_ROTATE_PULSE_MIN_S, _ROTATE_PULSE_S_PER_DEG * abs(err_deg)))
-    return max(0.06, base * 0.5 ** halvings)
+def _pulse_duration_s(err_deg: float, measured_rate: float | None = None) -> float:
+    """Use the last settled pulse response, with margin against overshoot."""
+    duration = (0.7 * abs(err_deg) / measured_rate if measured_rate is not None
+                else _ROTATE_PULSE_S_PER_DEG * abs(err_deg))
+    return min(_ROTATE_PULSE_MAX_S, max(_ROTATE_PULSE_MIN_S, duration))
 
 
 def _rotate_timeout_s(angle_deg: float) -> float:
@@ -867,7 +870,12 @@ class LocoPlugin:
             coast_end = 0.0
             pulse_cmd = 0.0             # latched sign * PULSE_VYAW for a pulse
             err_at_pulse = 0.0
-            halvings = 0                # overshoots seen within this segment
+            turned_at_pulse = 0.0
+            pulse_started = 0.0
+            pulse_duration = 0.0
+            measured_rate = None
+            no_progress = 0
+            observed_errors = []
             still = 0
             while True:
                 if self._rotate_stop_event.is_set():
@@ -893,7 +901,6 @@ class LocoPlugin:
                     seg_target = start_yaw + cumulative_angle
                     stage = "cruise"
                     pulse_phase = None
-                    halvings = 0
                     still = 0
                     continue
                 if time.monotonic() >= deadline:
@@ -901,9 +908,6 @@ class LocoPlugin:
                     break
                 if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
                     still += 1
-                    if still >= _ROTATE_SETTLE_TICKS:
-                        result_state = "done"
-                        break
                 else:
                     still = 0
                 if stage == "cruise" and abs(err) > _ROTATE_CRUISE_EXIT_DEG:
@@ -926,43 +930,68 @@ class LocoPlugin:
                         if (abs(wz) <= _ROTATE_WZ_STILL_RAD_S
                                 or time.monotonic() - brake_started >= 0.5):
                             stage = "creep"
-                            pulse_phase = None
-                    elif abs(err) <= _ROTATE_TOL_DEG:
-                        # In tolerance but not yet confirmed still: coast with
-                        # zero cmd (settle counter above tracks it).
-                        pulse_phase = None
-                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
-                    elif pulse_phase is None:
-                        # Start one creep pulse above the stiction deadband;
-                        # latch its sign so a mid-pulse err flip cannot reverse
-                        # thrust. Width = clamp(0.025*|err|, 0.12, 0.30),
-                        # halved per past overshoot (floor 0.06 s).
-                        err_at_pulse = err
-                        pulse_end = time.monotonic() + _pulse_duration_s(err, halvings)
-                        pulse_cmd = (_ROTATE_VYAW_SIGN
-                                     * math.copysign(_ROTATE_PULSE_VYAW, err))
-                        pulse_phase = "pulse"
-                        self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
-                                          cancel_event=self._rotate_stop_event)
+                            pulse_phase = "coast"
+                            coast_end = time.monotonic() + _ROTATE_OBSERVE_S
                     elif pulse_phase == "pulse":
-                        if time.monotonic() < pulse_end:
+                        if (time.monotonic() < pulse_end
+                                and abs(err) > _ROTATE_TOL_DEG
+                                and err * err_at_pulse > 0):
                             self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
                                               cancel_event=self._rotate_stop_event)
                         else:
-                            # Pulse over → coast on zero cmd and re-read yaw
-                            # until still (0.3 s cap) before the next pulse.
-                            coast_end = time.monotonic() + 0.3
+                            # Reaching the band brakes early, but never skips
+                            # observation when a subsequent sample drifts out.
+                            pulse_duration = time.monotonic() - pulse_started
+                            coast_end = time.monotonic() + _ROTATE_OBSERVE_S
                             pulse_phase = "coast"
+                            observed_errors.clear()
                             self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
                     else:  # coast
-                        if (abs(wz) <= _ROTATE_WZ_STILL_RAD_S
-                                or time.monotonic() >= coast_end):
-                            # Overshoot = err flipped sign across the pulse:
-                            # all subsequent pulse widths halve (floor 0.06 s).
-                            if err * err_at_pulse < 0:
-                                halvings += 1
-                            pulse_phase = None
                         self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                        if abs(wz) > _ROTATE_WZ_STILL_RAD_S:
+                            observed_errors.clear()
+                        else:
+                            observed_errors.append(err)
+                            observed_errors = observed_errors[-_ROTATE_SETTLE_TICKS:]
+                        stable = (len(observed_errors) == _ROTATE_SETTLE_TICKS
+                                  and max(observed_errors) - min(observed_errors)
+                                  <= _ROTATE_OBSERVE_SPREAD_DEG)
+                        if time.monotonic() >= coast_end and stable:
+                            # Success still needs raw feedback within ±2° for
+                            # every settle frame; filtering never widens it.
+                            if still >= _ROTATE_SETTLE_TICKS:
+                                result_state = "done"
+                                break
+                            if pulse_duration > 0:
+                                response = math.copysign(1.0, err_at_pulse) * (
+                                    turned_deg - turned_at_pulse)
+                                if response >= _ROTATE_MIN_PROGRESS_DEG:
+                                    measured_rate = response / pulse_duration
+                                improved = abs(err_at_pulse) - abs(err)
+                                no_progress = (no_progress + 1 if improved
+                                               < _ROTATE_MIN_PROGRESS_DEG else 0)
+                                pulse_duration = 0.0
+                                if no_progress >= _ROTATE_NO_PROGRESS_LIMIT:
+                                    return {"state": "error", "error":
+                                            "rotation made no progress after 3 corrections",
+                                            "requested_angle_deg": angle_deg,
+                                            "turned_deg": turned_deg,
+                                            "final_error_deg": angle_deg - turned_deg,
+                                            "tolerance_deg": _ROTATE_TOL_DEG}
+                            # Correct only a persistent deviation on one side,
+                            # not a single noisy sample around the target.
+                            if (min(observed_errors) > _ROTATE_TOL_DEG
+                                    or max(observed_errors) < -_ROTATE_TOL_DEG):
+                                err_at_pulse = sum(observed_errors) / len(observed_errors)
+                                turned_at_pulse = turned_deg
+                                pulse_started = time.monotonic()
+                                pulse_end = pulse_started + _pulse_duration_s(
+                                    err_at_pulse, measured_rate)
+                                pulse_cmd = (_ROTATE_VYAW_SIGN * math.copysign(
+                                    _ROTATE_PULSE_VYAW, err_at_pulse))
+                                pulse_phase = "pulse"
+                                self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
+                                                  cancel_event=self._rotate_stop_event)
                 time.sleep(0.02)  # 50 Hz
         finally:
             # Every exit path — including exceptions — brakes to zero velocity.

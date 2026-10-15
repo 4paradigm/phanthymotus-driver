@@ -146,9 +146,14 @@ angle as motion, not velocity × duration. A 50 Hz closed loop reads IMU yaw
 and runs a three-phase trip (replacing the earlier P-term law): **cruise**
 drives `vyaw` at full 0.8 while more than 20° of error remains, **brake**
 commands zero velocity until the gyro settles (|wz| ≤ 0.1 rad/s, 0.5 s cap),
-then **creep** fires 0.5-amplitude pulses of 0.025 s per degree of remaining
-error (clamped to 0.12–0.30 s), coasting on zero command (0.3 s cap) between
-pulses to re-measure yaw and halving later pulse widths after an overshoot.
+then **creep** fires 0.5-amplitude pulses, initially 0.025 s per degree of
+remaining error (clamped to 0.12–0.30 s). After each pulse it holds zero for
+at least 0.3 s and waits for eight low-gyro samples whose heading errors
+span at most 0.5°. The measured turn per second of pulse sets the next
+width with a 30% margin, still bounded to 0.12–0.30 s. A transient crossing
+of the target band cannot immediately restart a pulse. Three consecutive
+corrections improving absolute error by less than 0.1° stop with `error`
+and report the actual remaining error, rather than claiming arrival.
 The gait does not move below ~0.4 vyaw — its stiction deadband — so creep
 pulses at 0.5 to break it loose, while the brake sheds the inertia that
 would carry the robot past the target; the loop drives the turn to its ±2°
@@ -181,7 +186,8 @@ measures where the robot really turned instead.
   and the final error against the requested angle.
 - Tuning constants (initial values, calibratable on the robot): cruise 0.8
   full speed above 20° error; creep pulse 0.5; pulse width 0.025 s per
-  degree clamped to 0.12–0.30 s (halved per overshoot, 0.06 s floor);
+  degree initially, then adjusted from measured response, always clamped
+  to 0.12–0.30 s; zero-command observation at least 0.3 s;
   arrival tolerance ±2°; settle |wz| ≤ 0.1 rad/s; timeout
   `min(75, 10 + |angle_deg|/5)` seconds.
 - No distance feedback: the card consumes IMU heading only and reports

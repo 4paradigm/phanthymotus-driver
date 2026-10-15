@@ -98,24 +98,14 @@ def test_yaw_deg_from_sdk_quaternion(monkeypatch):
         assert abs(module._yaw_deg_from_quat(ori) - theta) < 1e-6
 
 
-def test_pulse_law_pins(monkeypatch):
-    # 三段式 creep 脉宽公式（旧 P 律测试的唯一废除替换）：
-    # clamp(0.025*|err|, 0.12, 0.30)，过冲后逐次减半、下限 0.06s。
+def test_pulse_width_tracks_measured_turn_response(monkeypatch):
     module, _ = _load_device(monkeypatch)
     pulse = module._pulse_duration_s
-    assert pulse(60) == pytest.approx(0.30)      # 0.025*60=1.5 → 上限 0.30
-    assert pulse(12) == pytest.approx(0.30)      # 0.025*12=0.30 → 恰在上限
-    assert pulse(8) == pytest.approx(0.20)       # 段内线性
-    assert pulse(4.8) == pytest.approx(0.12)     # 0.025*4.8=0.12 → 恰在下限
-    assert pulse(1) == pytest.approx(0.12)       # 低于下限 → 0.12
-    assert pulse(0) == pytest.approx(0.12)
-    assert pulse(-60) == pytest.approx(0.30)     # 负向误差取绝对值
-    # 过冲减半：后续脉宽 ×0.5，减半后仍不得低于 0.06s 下限
-    assert pulse(60, 1) == pytest.approx(0.15)
-    assert pulse(8, 1) == pytest.approx(0.10)
-    assert pulse(4.8, 1) == pytest.approx(0.06)  # 0.12/2 = 0.06 = floor
-    assert pulse(4.8, 2) == pytest.approx(0.06)  # 再减半仍在 floor
-    assert pulse(1, 5) == pytest.approx(0.06)    # 多次减半不会跌破 floor
+    assert pulse(12) == pytest.approx(0.30)
+    assert pulse(5, measured_rate=10) == pytest.approx(0.30)
+    assert pulse(5, measured_rate=20) == pytest.approx(0.175)
+    assert pulse(-5, measured_rate=20) == pytest.approx(0.175)
+    assert pulse(5, measured_rate=50) == pytest.approx(0.12)
 
 
 def test_rotate_timeout_s_stays_under_llm_budget(monkeypatch):
@@ -933,6 +923,89 @@ def _vyaw_sign_flips(cmds):
             flips += 1
         last = z
     return flips
+
+
+def _creep_clock(module, monkeypatch):
+    clock = types.SimpleNamespace(now=0.0)
+    monkeypatch.setattr(module, 'time', types.SimpleNamespace(
+        monotonic=lambda: clock.now,
+        sleep=lambda seconds: setattr(clock, 'now', clock.now + seconds)))
+    return clock
+
+
+def test_creep_waits_out_transient_target_crossing(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    clock = _creep_clock(module, monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    first_pulse = []
+    read, publish = fake.get_imu_data, fake.publish_cmd
+
+    def publish_cmd(x, y, z, action_cmd, index=0):
+        publish(x, y, z, action_cmd, index)
+        if z != 0 and not first_pulse:
+            first_pulse.append(clock.now)
+
+    def get_imu():
+        if first_pulse:
+            elapsed = clock.now - first_pulse[0]
+            fake.yaw = 7.7 if 0.04 <= elapsed < 0.12 else 8.5
+        return read()
+
+    monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
+    monkeypatch.setattr(fake, 'get_imu_data', get_imu)
+    result = plugin._do_rotate_impl({'angle_deg': 10})
+    assert result['state'] == 'done'
+    assert abs(result['final_error_deg']) <= 2
+    assert sum(z != 0 for x, y, z in fake.cmds) == 1
+    assert clock.now - first_pulse[0] >= 0.3
+
+
+@pytest.mark.parametrize('angle, yaw0', [(10, 179), (-10, -179)])
+def test_creep_overcomes_step_startup_delay_without_tiny_retries(monkeypatch, angle, yaw0):
+    module, _ = _load_device(monkeypatch)
+    clock = _creep_clock(module, monkeypatch)
+    fake = FakeHighCtrl(yaw0=yaw0, gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    monkeypatch.setattr(module, '_rotate_timeout_s', lambda angle: 3)
+    pulses = []
+    active = []
+    publish = fake.publish_cmd
+
+    def publish_cmd(x, y, z, action_cmd, index=0):
+        publish(x, y, z, action_cmd, index)
+        if z != 0 and not active:
+            active.extend((clock.now, 1 if z > 0 else -1))
+        elif z == 0 and active:
+            duration = clock.now - active[0]
+            # A gait needs 100 ms before a burst produces effective yaw.
+            fake.yaw += active[1] * max(0, duration - 0.1) * 100
+            pulses.append(duration)
+            active.clear()
+
+    monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
+    result = plugin._do_rotate_impl({'angle_deg': angle})
+    assert result['state'] == 'done'
+    assert abs(result['final_error_deg']) <= 2 + 1e-9
+    assert all(duration >= 0.12 - 1e-6 for duration in pulses)
+    assert len(pulses) <= 4
+    assert fake.cmds[-1] == (0, 0, 0)
+
+
+def test_creep_stops_after_repeated_ineffective_pulses(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    clock = _creep_clock(module, monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin._do_rotate_impl({'angle_deg': 10})
+    bursts = sum(z != 0 and (i == 0 or fake.cmds[i - 1][2] == 0)
+                 for i, (x, y, z) in enumerate(fake.cmds))
+    assert result['state'] == 'error'
+    assert 'progress' in result['error']
+    assert result['final_error_deg'] == pytest.approx(10)
+    assert bursts == 3
+    assert clock.now < 3
+    assert fake.cmds[-1] == (0, 0, 0)
 
 
 def test_small_angle_reaches_target_despite_stiction(monkeypatch):
