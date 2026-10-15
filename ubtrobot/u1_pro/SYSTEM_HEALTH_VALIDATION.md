@@ -14,7 +14,7 @@ bash -n build.sh
 git diff --check
 ```
 
-Local results: **104 unit tests passed**, including 32 health tests;
+Local results: **110 unit tests passed**, including 38 health tests;
 **2 Dockerfile COPY checks passed**. Service validation reports **0 failures
 and 1 existing CycloneDDS known gap**. Compilation, shell syntax, and whitespace
 checks pass. The service check does not establish DDS connectivity.
@@ -22,14 +22,18 @@ checks pass. The service check does not establish DDS connectivity.
 Tests use synthetic Linux files and ROS/vendor substitutes, covering:
 
 - Metrics and thresholds, unreadable data, thermal/hwmon labels, cgroup v1/v2
-  membership and ancestor pressure, hidden limits, and container attribution.
+  membership and ancestor pressure, complete v1 root mounts, hidden limits,
+  and container attribution.
 - Existing camera frame timestamps, restart freshness, stale/error states,
   and the shared playback queue. An isolated camera or playback error makes
   `complete` false even when every other observation is normal.
 - Immediate first sampling and a real 1-second cadence without queries,
   cache-only queries and copied results, stale cache, and recovery after errors.
-- Idempotent start, stop/join and restart, blocked-read cancellation and timeout,
-  preventing overlapping collectors, and worker-start failure cleanup.
+- Idempotent start, stop/join and restart, and worker-start failure cleanup.
+- Real FIFO-blocked filesystem reads in an isolated interpreter: timeout,
+  cancellation, process reaping, recovery, and independent driver snapshots.
+  Simulated uninterruptible kernel I/O retains the reader handle, reports
+  stopping, and prevents overlapping readers rather than claiming cleanup.
 - Card registration/configuration and MCP initialize/list/call single wrapping.
   Health sampling and queries do not call robot methods or create device resources.
 

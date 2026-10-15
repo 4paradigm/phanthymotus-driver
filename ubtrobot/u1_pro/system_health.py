@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
-from common.vendor_runtime import action_schema, tool
-
-
-DEFAULTS = {"sample_interval_seconds": 1.0, "cpu_load_per_core_warn": 1.0, "memory_used_percent_warn": 90.0,
-            "disk_used_percent_warn": 90.0, "frame_stale_seconds": 5.0,
-            "playback_stale_seconds": 120.0, "temperature_warn_celsius": None}
+DEFAULTS = {
+    "sample_interval_seconds": 1.0,
+    "probe_timeout_seconds": 0.8,
+    "cpu_load_per_core_warn": 1.0,
+    "memory_used_percent_warn": 90.0,
+    "disk_used_percent_warn": 90.0,
+    "frame_stale_seconds": 5.0,
+    "playback_stale_seconds": 120.0,
+    "temperature_warn_celsius": None,
+}
 
 
 def observation(status, source, scope, value=None, reasons=(), sampled_at=None):
@@ -26,6 +33,70 @@ class SystemProbe:
 
     def __init__(self, root=Path("/")):
         self.root = Path(root)
+        self._reader_lock = threading.Lock()
+        self._reader = None
+
+    @property
+    def has_pending_read(self):
+        with self._reader_lock:
+            return self._reader is not None and self._reader.poll() is None
+
+    def collect_bounded(self, config, stop_event):
+        """Isolate all filesystem access from the long-lived driver thread.
+
+        A fresh interpreter avoids forking an initialized ROS process. Retain
+        any child stuck in uninterruptible kernel I/O, refusing a second reader.
+        """
+        with self._reader_lock:
+            if self._reader is not None and self._reader.poll() is None:
+                raise OSError("previous metric reader has not exited")
+            if stop_event.is_set():
+                raise InterruptedError("health sampling cancelled")
+            process = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--health-probe"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            self._reader = process
+        deadline = time.monotonic() + config["probe_timeout_seconds"]
+        payload = json.dumps({"root": str(self.root), "config": config})
+        try:
+            while True:
+                if stop_event.is_set():
+                    raise InterruptedError("health sampling cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("system metric reads exceeded configured timeout")
+                try:
+                    output, _stderr = process.communicate(
+                        input=payload, timeout=min(remaining, 0.05))
+                    break
+                except subprocess.TimeoutExpired:
+                    payload = None
+            if process.returncode:
+                raise OSError(f"metric reader exited with status {process.returncode}")
+            result = json.loads(output)
+            if not isinstance(result, dict):
+                raise ValueError("invalid metric reader result")
+            return result
+        finally:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                # SIGKILL cannot finish uninterruptible kernel I/O. Keep the
+                # handle so start/stop report it and never overlap readers.
+                pass
+            finally:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+                with self._reader_lock:
+                    if self._reader is process and process.poll() is not None:
+                        self._reader = None
 
     def read(self, path):
         return (self.root / path.lstrip("/")).read_text().strip()
@@ -77,7 +148,7 @@ class SystemProbe:
                     directory = directory.parent
                 # Hidden ancestors above a namespaced mount cannot be verified.
                 return {"usage_bytes": usage, "limit_bytes": min(limits) if limits else None,
-                        "sources": sources, "hierarchy_complete": mount_root == "/" and v2,
+                        "sources": sources, "hierarchy_complete": mount_root == "/",
                         "version": 2 if v2 else 1,
                         "max_hierarchy_used_percent": max(pressures) if pressures else None}
         raise OSError("memory cgroup membership/mount could not be resolved")
@@ -206,6 +277,8 @@ class SystemHealthPlugin:
         self._samples = 0
 
     def get_tool(self):
+        from common.vendor_runtime import action_schema, tool
+
         actions = {name: ([], description) for name, description in {
             "start": "Start continuous read-only sampling every configured interval.",
             "stop": "Stop and join the sampler; no robot behavior.",
@@ -218,11 +291,13 @@ class SystemHealthPlugin:
     def _state_locked(self):
         if self.running:
             return "running"
-        return "stopping" if self._worker is not None else "idle"
+        pending = isinstance(self.probe, SystemProbe) and self.probe.has_pending_read
+        return "stopping" if self._worker is not None or pending else "idle"
 
     def start(self):
         with self._lock:
-            if self._worker is not None:
+            if self._worker is not None or (
+                    isinstance(self.probe, SystemProbe) and self.probe.has_pending_read):
                 return {"state": self._state_locked()}
             self._latest = None
             self._latest_monotonic = None
@@ -247,9 +322,9 @@ class SystemHealthPlugin:
             worker = self._worker
             if self._stop_event is not None:
                 self._stop_event.set()
-        # Do not hold the snapshot lock while joining. A blocked OS read cannot
-        # be forcibly cancelled: keep its worker registered and refuse restart
-        # until it exits, rather than spawning overlapping collectors.
+        # Do not hold the snapshot lock while joining. The filesystem helper
+        # observes cancellation and is killed/reaped within a bounded wait.
+        # Retain stopping state if any worker or kernel-blocked reader remains.
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=2.0)
         with self._lock:
@@ -339,7 +414,15 @@ class SystemHealthPlugin:
         return None
 
     def _sample(self):
-        checks = dict(self.probe.collect(self.config))
+        if isinstance(self.probe, SystemProbe):
+            try:
+                checks = self.probe.collect_bounded(self.config, self._stop_event)
+            except Exception as exc:
+                checks = {"compute": observation(
+                    "unreadable", "isolated SystemProbe", "process_visible_host_unconfirmed",
+                    reasons=[str(exc)[:256]], sampled_at=time.time())}
+        else:
+            checks = dict(self.probe.collect(self.config))
         for component in (*self.cameras, self.audio):
             try:
                 item = component.health_snapshot(self.config)
@@ -360,3 +443,11 @@ class SystemHealthPlugin:
                 "overall": overall, "complete": not incomplete, "checks": checks,
                 "problems": problems, "policy": dict(self.config),
                 "summary": "all observed checks normal" if overall == "ok" else "warnings or incomplete observations; not all normal"}
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--health-probe"]:
+        raise SystemExit("this module is a read-only metric helper")
+    request = json.load(sys.stdin)
+    print(json.dumps(SystemProbe(request["root"]).collect(request["config"]),
+                     allow_nan=False))

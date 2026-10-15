@@ -14,6 +14,8 @@ plugins:
   system_health:
     enabled: true
     sample_interval_seconds: 1.0
+    # Bound all filesystem reads in an isolated helper process.
+    probe_timeout_seconds: 0.8
     # Local observation policies, not vendor safety limits.
     cpu_load_per_core_warn: 1.0
     memory_used_percent_warn: 90.0

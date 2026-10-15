@@ -1,6 +1,8 @@
 """Read-only health tests: synthetic Linux files and existing driver objects."""
 import io
 import json
+import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -95,7 +97,14 @@ class ProbeTests(unittest.TestCase):
         for directory in ("", "/work"):
             self.write("/sys/fs/cgroup" + directory + "/memory.usage_in_bytes", "200")
             self.write("/sys/fs/cgroup" + directory + "/memory.limit_in_bytes", "1000")
-        self.assertEqual(self.collect()["memory_limit"]["value"]["version"], 1)
+        item = self.collect()["memory_limit"]
+        self.assertEqual(item["value"]["version"], 1)
+        self.assertEqual(item["status"], "ok")
+        self.assertTrue(item["value"]["hierarchy_complete"])
+        with mock.patch.dict("os.environ", {"U1_PRO_HEALTH_CONTAINER": "1"}):
+            container_item = self.collect()["memory_limit"]
+        self.assertEqual(container_item["status"], "unknown")
+        self.assertFalse(container_item["value"]["hierarchy_complete"])
 
     def test_unlimited_is_explicit(self):
         self.write("/sys/fs/cgroup/work/memory.max", "max")
@@ -125,6 +134,110 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["memory"]["scope"], "container_visible")
         self.assertEqual(result["memory_limit"]["scope"], "process_cgroup")
         self.assertIn("not host disk", result["disk"]["value"]["note"])
+
+    def make_blocked_load(self):
+        path = self.root / "proc/loadavg"
+        path.unlink()
+        os.mkfifo(path)
+        return path
+
+    def test_isolated_metric_reader_returns_real_fixture_observations(self):
+        config = {**self.config, "probe_timeout_seconds": 2.0}
+        result = self.probe.collect_bounded(config, threading.Event())
+        self.assertEqual(result["cpu_load"]["status"], "ok")
+        self.assertEqual(result["memory"]["status"], "ok")
+        self.assertFalse(self.probe.has_pending_read)
+        self.assertIsNone(self.probe._reader)
+
+    def test_blocked_filesystem_read_times_out_and_recovers(self):
+        path = self.make_blocked_load()
+        config = {**self.config, "probe_timeout_seconds": 0.15}
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            self.probe.collect_bounded(config, threading.Event())
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertFalse(self.probe.has_pending_read)
+        self.assertIsNone(self.probe._reader)
+        path.unlink()
+        path.write_text("0.2 0.3 0.4")
+        config["probe_timeout_seconds"] = 2.0
+        result = self.probe.collect_bounded(config, threading.Event())
+        self.assertEqual(result["cpu_load"]["status"], "ok")
+
+    def test_stop_cancels_and_reaps_blocked_filesystem_reader(self):
+        self.make_blocked_load()
+        stop_event = threading.Event()
+        errors = []
+        def read():
+            try:
+                self.probe.collect_bounded(
+                    {**self.config, "probe_timeout_seconds": 5.0}, stop_event)
+            except InterruptedError as exc:
+                errors.append(exc)
+        worker = threading.Thread(target=read)
+        worker.start()
+        deadline = time.monotonic() + 1
+        while not self.probe.has_pending_read and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(self.probe.has_pending_read)
+        began = time.monotonic()
+        stop_event.set()
+        worker.join(1.0)
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertFalse(self.probe.has_pending_read)
+
+    def test_uninterruptible_reader_is_retained_and_prevents_overlap(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 0.01)
+        process.wait.side_effect = subprocess.TimeoutExpired("fixture", 0.2)
+        with mock.patch("system_health.subprocess.Popen", return_value=process) as launch:
+            with self.assertRaises(TimeoutError):
+                self.probe.collect_bounded(
+                    {**self.config, "probe_timeout_seconds": 0.01}, threading.Event())
+            self.assertTrue(self.probe.has_pending_read)
+            with self.assertRaisesRegex(OSError, "previous metric reader"):
+                self.probe.collect_bounded(self.config, threading.Event())
+            self.assertEqual(launch.call_count, 1)
+        process.kill.assert_called_once()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close.assert_called_once()
+        card = SystemHealthPlugin([], mock.Mock(), probe=self.probe)
+        self.assertEqual(card.start(), {"state": "stopping"})
+        self.assertEqual(card.stop(), {"state": "stopping"})
+        process.poll.return_value = 0
+        self.assertFalse(self.probe.has_pending_read)
+
+    def test_invalid_reader_response_is_reaped(self):
+        process = mock.Mock(returncode=0)
+        process.poll.return_value = 0
+        process.communicate.return_value = ("not JSON", "")
+        with mock.patch("system_health.subprocess.Popen", return_value=process):
+            with self.assertRaises(ValueError):
+                self.probe.collect_bounded(self.config, threading.Event())
+        process.wait.assert_called_once_with(timeout=0.2)
+        self.assertIsNone(self.probe._reader)
+
+    def test_timed_out_compute_does_not_hide_existing_driver_state(self):
+        self.make_blocked_load()
+        audio = types.SimpleNamespace(
+            PREFIX="tts", health_snapshot=lambda config: observation(
+                "ok", "fixture:queue", "driver", {}))
+        card = SystemHealthPlugin([], audio, {"probe_timeout_seconds": 0.15}, probe=self.probe)
+        self.addCleanup(card.stop)
+        card.start()
+        deadline = time.monotonic() + 1.5
+        while card.dispatch("info", {})["samples_collected"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        result = card.dispatch("diagnose", {})
+        self.assertEqual(result["checks"]["compute"]["status"], "unreadable")
+        self.assertEqual(result["checks"]["tts"]["status"], "ok")
+        self.assertFalse(result["complete"])
+        self.assertEqual(card.stop(), {"state": "idle"})
+        self.assertIsNone(card._worker)
+        self.assertFalse(self.probe.has_pending_read)
 
 
 class CardTests(unittest.TestCase):
