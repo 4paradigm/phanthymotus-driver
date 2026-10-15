@@ -1,38 +1,105 @@
-# PiPER user-intent control and background monitoring
+# PiPER single-card control and background monitoring
 
-Place **Arm control** (`arm_control`) on the canvas. Choose a direction to move the end-effector one small step, open/close the gripper, set its opening, or stop the current action. The driver performs necessary mode/motor preparation in supported healthy states. The top Monitor shows the measured PiPER skeleton, English parameters and an enabled live camera without separate skeleton or camera canvas cards.
+Place **Arm control** (`arm_control`) on the canvas. Its capability-aware public interface
+provides relative Cartesian increments, six-joint absolute/relative targets,
+gripper control, Stop and Get status. Calibrated tip rotation/absolute Pose and
+verified preset return are exposed only after valid configuration. The driver owns mode/motor preparation and cancellable execution.
+The measured skeleton, English parameters and enabled live camera remain
+background streams; no additional canvas nodes are required.
 
-| Action | Meaning |
+| Action | Input / meaning |
 | --- | --- |
-| Move forward / backward | +X / −X in the robot base frame |
-| Move left / right | +Y / −Y in the robot base frame |
-| Raise / Lower | +Z / −Z in the robot base frame |
-| Stop | Cancel the current preparation/action and best-effort hold; retain motor torque |
-| Open gripper / Close gripper | Move to the effective opening limit |
-| Set gripper opening | Opening in mm; SDK/deployment range intersection, normally 0–70 mm; default 20 mm adjusted to the effective range |
-| Exit teaching and hold | Explicitly leave teaching while holding measured joints; requires recognized PiPER 1.x firmware >= 1.8.5, a stationary arm and all six motors already enabled |
+| Move relative | `translation_mm=[dx,dy,dz]` in initial SDK end axes when uncalibrated; calibrated TCP axes and optional `rotation_deg=[roll,pitch,yaw]` after verification |
+| Move to pose | `pose_mm_deg=[x,y,z,roll,pitch,yaw]`, absolute gripper-tip pose in the robot base frame |
+| Set joints | `joints_deg=[J1,J2,J3,J4,J5,J6]`; `joint_mode=absolute/relative` |
+| Set position | `set_position`: guarded teaching exit/hold when needed, then save stable measured joint angles for Reset |
+| Reset | `reset`: joint-space return to the saved position or configured `preset_joints_deg`; hidden if neither is valid |
+| Stop | `stop_motion`: cancel preparation/action, best-effort measured hold, retain motor torque |
+| Open / Close gripper | Effective opening upper/lower limit |
+| Set gripper opening | `width_mm`, effective SDK/deployment intersection, normally 0–70 mm; default 20 mm adjusted to limits |
+| Get status | Actual SDK pose, calibrated tip pose, joints, limits, mode, enables, gripper, faults, freshness and task results |
 
-Directions are fixed to the robot base, independent of the camera. Each public movement requests **1 mm at 1% SDK speed**, preserving the current end orientation; option titles omit the numeric suffix. Speed percent does not specify a fixed mm/s. Default **Choose an action** executes nothing. Mode, enable/disable, permission, joint adjustment and preview management are internal/historical interfaces, excluded from the current public action list. Old action requests fail explicitly rather than being translated. No home, end rotation, teaching recording, obstacle avoidance or automatic fault reset is provided.
+Arrays accept either native JSON arrays or strict JSON-array text from the
+existing Core form. Rotation convention is `Rz(yaw) Ry(pitch) Rx(roll)`, matching
+pinned SDK forward kinematics. Relative rotation composes transforms rather
+than adding Euler angles. Move defaults to `[1,0,0]` mm with zero rotation;
+translation magnitude is at most 10 mm and each relative rotation axis is
+within ±5 degrees. Motion speed defaults to 1%, range 1–10%, and does not imply
+fixed mm/s. Pose/joint targets are required; no guessed target is substituted.
+Default Choose an action executes nothing. Declared inactive fields retained by
+older Core are ignored; unknown fields and invalid active parameters fail.
+Legacy direction, mode, enable and teaching-exit requests are explicitly rejected.
 
-The operator must explicitly enable physical control in deployment with `PIPER_MOTION_ENABLED=1`; its default is `0`. With the gate off, all direction/gripper/teaching-exit tasks fail before preparation or control commands. Start cannot open this gate, while Info, model/background monitoring, no-op selection and Stop remain available. This deployment setting does not add a request-control action to the card.
+Without TCP calibration, Move permits translation with `rotation_deg=[0,0,0]`.
+Its axes are parallel to the SDK J6/end frame; the measured orientation is
+preserved exactly. No tool length or absolute tip position is assumed. Arrival
+in this mode is checked at the SDK reference, rather than claiming calibrated
+tip-position accuracy.
 
-Normal ready CAN control executes directly. Healthy standby or all-disabled states use preparation at the measured pose; partial enable, faults, teaching and unknown modes are rejected. Gripper preparation holds measured opening before enabling. One cancellable task owns preparation through completion; busy requests are rejected, not queued. `info` reports preparing/moving/stopping/completed/cancelled/failed and actual results. Accepted/submitted is not completion. Manual Core Start calls while a task is active acknowledge busy/stopping without clearing cancellation, allowing the subsequent Stop request to reach the task.
+Before tip rotation or absolute Pose, an operator must configure and physically verify the transform
+from the SDK end-pose reference to the installed gripper tip:
+`intent_control.tcp_offset_mm_deg=[x,y,z,roll,pitch,yaw]` and `tcp_verified: true`.
+The default offset is unknown, verification is false, and tip rotation/absolute
+Pose remain blocked until calibration. Get status still exposes the raw SDK pose, and tip
+pose is unavailable. Do not treat the display URDF as a calibrated TCP.
 
-Movement uses the pinned official SDK's MOVE_L and controller end feedback. Each step target is submitted **once**, followed by feedback polling; it is not resent every 50 ms. Actual joints, end-pose component frames and status must remain fresh within 0.5 s. Completion requires controller arrival plus position error <=0.5 mm and orientation error <=1 degree, stable for 0.5 s; motion deadline 30 s. Rejected targets halt further submissions. Stop/timeout may attempt one measured Cartesian hold only while feedback remains fresh, healthy and controllable. A retained target-limit report blocks new tasks; this driver does not clear it. A small step does not guarantee reachability or physical clearance.
+`preset_joints_deg` defaults to null. Set position saves the stationary measured
+posture in `data_dir/return-preset.json`, bound to the CAN adapter/interface.
+Alternatively, configure and verify six target degrees on site. Reset is a
+planned joint movement, not SDK ResetPiper, fault clearing,
+zero calibration, or an unconditional six-zero posture. See
+[UNIFIED_CONTROL.md](UNIFIED_CONTROL.md) for exact interfaces and local acceptance.
 
-Skeleton and English parameters publish at 10 Hz from a side-effect-free shared snapshot. Stale feedback freezes the skeleton while parameters report the last valid time. `model` is the **Skeleton model** resource returning a plain `{"urdf": "..."}` dictionary. Official URDF provenance/license and the existing contour are retained. No Agent Core changes are required; use the top Monitor for correct device model addressing.
+The deployment motion gate `PIPER_MOTION_ENABLED` defaults to 0. Start and
+monitoring never open it or issue motor commands. In healthy ready CAN mode,
+control executes directly. All-disabled states use measured-pose preparation.
+A stationary teaching-mode arm with recognized PiPER 1.x firmware >=1.8.5 and
+all motors already enabled uses the existing guarded seamless exit before the
+requested action. Active teaching recording/playback, partial enable, faults,
+unknown modes, stale feedback or failed exit prevent the target from executing.
+Targets are composed once; preparation drift cancels them instead of rebasing.
+One task owns preparation and movement; busy requests fail rather than queue.
 
-For live images, set `PIPER_CAMERA_ENABLED=1` and `camera.live.enabled: true`. Arm control declares the existing namespaced `/camera/live` JPEG topic. `piper_camera_live` remains a background lifecycle/Info resource; no camera node is needed on the canvas. Acquisition, restart and camera ownership are independent of arm motion. When migrating an existing canvas, remove its live-camera node, refresh Arm control's output topics and resume the camera resource after Core's node-removal Stop. Bind the color camera by serial + USB interface 03 + video index 0. `piper_photo` remains optional; live capture and single-photo capture share camera ownership, so concurrent capture reports busy. See [CAMERA_LIVE.md](CAMERA_LIVE.md).
+Official SDK MOVE_L / MOVE_J submit one trajectory and poll actual feedback.
+Joint, end-pose component and controller frames must remain fresh within 0.5 s.
+Calibrated Cartesian completion requires actual **tip** error <=0.5 mm and rotational
+matrix error <=1 degree; joints require <=0.5 degree. Controller arrival and
+post-submission samples must remain stable for 0.5 s. Deadline is 30 s.
+Stop/failure may issue one measured hold only while fresh healthy CAN feedback
+and the operator gate permit it. It never clears target-limit errors or retries
+rejected targets. Valid numeric inputs do not establish reachability or clearance.
 
-CAN adapters are not persistently identified by device hardware yet. Recheck after cable reconnection. Two arms emitting the same IDs on a shared bus cannot be separated by this SDK; fresh timestamps alone do not prove a coherent single-device pose. The tested deployment was rebound to the isolated CAN0 slave; the shared CAN1 master/slave bus is not used by this control card. Camera binding remains separate and does not establish which arm physically carries the camera.
+`model` returns a plain `{"urdf":"..."}` object with the preserved official
+six-axis chain and existing contour. Skeleton/parameters publish at 10 Hz;
+stale poses freeze while parameters remain diagnostic. A companion minimal Core
+change passes real MCP IDs from data-stream cards, resolves topic-only owners,
+and displays model errors instead of a fallback human. Late model requests are
+isolated from switched/unmounted renderers. Both entry points require validation
+with that Core change; this driver cannot patch an older deployed frontend.
 
-[PR_ACCEPTANCE.md](PR_ACCEPTANCE.md) records current verification and remaining physical acceptance. [DIRECTION_JOG.md](DIRECTION_JOG.md) and [TEACHING_EXIT.md](TEACHING_EXIT.md) contain detailed contracts/history. Deployment is limited to arm 1, preserving arm 2, old code, configuration/backups and the original untracked smoke-test.py. Current forward/right trials passed; this is a review candidate with further physical tests pending.
+Live images retain the existing color-camera binding and background lifecycle.
+See [CAMERA_LIVE.md](CAMERA_LIVE.md). Cameras must be selected by serial, color
+interface 03 and video index 0. CAN must identify a single isolated target arm;
+two devices emitting the same feedback IDs cannot be separated by freshness.
+Jetson's validated USB-CAN binding is described in [JETSON_ARM64.md](JETSON_ARM64.md).
 
-[JETSON_ARM64.md](JETSON_ARM64.md) describes native ARM64 builds and isolated development tests. Building or testing that image does not deploy it, register with Core or access robot hardware.
+The 2026-10-15 usability candidate is deployed as a native ARM64 development
+image on Jetson, with the previously authorized manual-motion gate retained.
+The existing Core was not restarted. Read-only acceptance confirms fresh arm
+feedback and 50 skeleton/parameter/camera frames in Core over 5 seconds;
+The initial deployment passed 142 isolated ARM64 simulation tests and 354 local tests. This software
+deployment did not execute any physical movement; new hardware trials remain pending.
+Previous direction trials do not validate tip-frame control, absolute
+Pose, automatic teaching exit or the new preset. Only arm 1 is in scope.
+The subsequent Set position/Reset candidate is deployed as
+`piper-arm64-dev:preset-20261015`. For the user-authorized PR resubmission,
+368 local tests plus 317 subtests and 156 isolated native ARM64 tests passed.
+See [REVIEW_20261015.md](REVIEW_20261015.md) for current verification and remaining
+release/physical acceptance limits; earlier acceptance documents are historical.
 
-The following sections document retained historical implementations and build/photography tooling; their action contracts do not describe the current production entry point.
-
-`direct_control.py` is retained for `status_card.split_status_card` and the legacy entrypoint/direct-control regression fixtures. Production `device.build_plugins` uses `IntentControlPlugin` without installing the legacy adapter.
+Historical primitives remain for regression. `IntentControlPlugin` preserves the
+previous direction/explicit-exit implementation; production `device.build_plugins`
+uses `UnifiedControlPlugin` without the historical direct-control adapter.
 
 ## Production passive diagnosis
 
@@ -185,3 +252,71 @@ python -m pytest -q tests/test_piper_prepare.py tests/test_piper_cards.py tests/
 共享 HTTP 日志的控制字符转义/200 字符上限有独立回归；Mac 入口先安装 logsafe。
 当前软件、现场部署和历史真机记录见 [ACCEPTANCE.md](ACCEPTANCE.md)。历史五卡及已删除动作
 的验收不代表十卡已完成全部真机动作验收。
+
+
+### Capability-aware single card (2026-10-15)
+
+`move` is displayed as **Move relative** and retains a linear path. `pose` is
+**Move to pose**, a calibrated absolute base-frame tip target. Absolute
+`pose_mm_deg` and absolute `joints_deg` accept `null` components, filled once
+from fresh measured feedback at task start. At least one component must be a
+number. Relative arrays accept numbers only; use zero for no increment.
+A fully zero relative request returns `executed=false`, `No movement requested.`
+without connecting, preparing or enabling the robot.
+
+Without a verified TCP, the public schema omits Pose and the Move rotation
+field. Without a configured six-joint preset it omits Return to preset.
+Get status and the background parameters report `capabilities` and reasons.
+Refresh the device/tool definitions after restarting with changed configuration;
+old requests remain checked by the backend.
+
+Pose has `motion_mode=linear` by default. The candidate `point_to_point` mode
+uses the official pinned V2 MOVE P command (0x00 + EndPoseCtrl), never MOVE J
+with an end-pose target. It is absent until an operator-reviewed acceptance
+record matches the USB-CAN serial, observed firmware, Python driver-source
+SHA-256, and motion configuration SHA-256. That serial identifies the adapter,
+not the physical arm: replacing the arm/tool requires clearing the record and
+repeating acceptance. Firmware not yet observed on this connection keeps the
+candidate closed. No acceptance record is shipped or created automatically.
+Errors never retry or change path. Stop/error recovery uses the existing linear
+measured hold, never the candidate path. This is not obstacle avoidance.
+See `PATH_VALIDATION.md` for the acceptance requirements and current blockers.
+
+
+## Automatic teaching exit before control, 2026-10-15
+
+Every nonzero Arm control request (Move relative, Move to pose, Set joints,
+return preset and gripper actions) first checks the actual mode. In stationary
+teaching it performs the existing guarded SDK exit-and-measured-joint-hold,
+confirms CAN mode and stable feedback, and only then resolves the requested
+movement/gripper target from post-exit feedback. Failure ends the same task;
+no user target follows a failed takeover. No separate exit button is required.
+This does not clear faults, reset, home, release torque, interrupt active
+recording/playback, or bypass firmware/freshness/permission checks.
+
+Core's lifecycle Start precedes Info and Stop as well as control calls, so it
+remains passive. Status, monitoring, selection, zero relative requests and Stop
+do not take over teaching. Actual control owns preparation, exit and execution
+under one cancellable reservation. A repeated action already in CAN skips exit.
+
+
+## Set position and Reset, 2026-10-15
+
+`set_position` (**Set position**) first performs the same automatic teaching
+exit/hold as control actions, then captures the stationary six measured joint
+angles for 0.5 seconds (maximum drift 0.2 degree). It atomically replaces
+`data_dir/return-preset.json`, bound to this USB-CAN serial/interface. No return
+trajectory or gripper command is sent. Failed exit, stale/moving feedback,
+cancellation, missing adapter identity or write failure retains the old preset.
+The operator must re-save after replacing the physical arm on the same adapter.
+
+`reset` is displayed as **Reset** when a valid saved/configured target exists.
+It exits teaching/holds first, then returns all six joints via SDK MOVE_J at
+1% by default (range 1–10%). The gripper remains unchanged. This is a planned
+movement, not ResetPiper, fault clearing, zero calibration or motor disable.
+The return path is a joint-space trajectory, not a straight TCP segment.
+Effective limits, fresh feedback, cancellation, task serialization and stable
+arrival checks still apply. The saved target survives driver/container restarts.
+Invalid/mismatched stored data hides Reset and never falls back to an unrelated
+configuration preset. Get status/background parameters show the saved position.
+Refresh device/tool metadata after first save to make Reset visible in Core.

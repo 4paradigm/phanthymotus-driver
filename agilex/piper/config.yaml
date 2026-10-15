@@ -13,6 +13,17 @@ joint_limits_deg:
   - [-70, 70]
   - [-120, 120]
 gripper_limits_mm: [0, 70]
+intent_control:
+  # Transform from SDK end-pose reference to the actual gripper-tip TCP.
+  # [x,y,z,roll,pitch,yaw], mm/deg, Rz(yaw) Ry(pitch) Rx(roll).
+  # Never substitute zero for an unknown reference. Verify on the installed tool.
+  tcp_offset_mm_deg: null
+  tcp_verified: false
+  # Six measured angles, degrees. Save only an operator-approved return posture.
+  preset_joints_deg: null
+  # Default closed. Acceptance binds adapter serial, firmware, source/config hashes
+  # and an operator-reviewed evidence record. Never enable from SDK support alone.
+  point_to_point_acceptance: null
 mode:
   # Exact versions returned by this SDK, NOT a version range. Keep empty until
   # MotionCtrl_1 enter/stop/exit has been witnessed on this robot without homing,

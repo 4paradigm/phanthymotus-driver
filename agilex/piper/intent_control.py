@@ -54,6 +54,7 @@ def english_values(value):
 
 
 class IntentControlPlugin(PiperPlugin):
+    task_actions = TASK_ACTIONS
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.interface_language = 'en'
@@ -220,7 +221,7 @@ class IntentControlPlugin(PiperPlugin):
         nested = (getattr(self.worker_context, 'reserved', None) == (name, action)
                   or getattr(self.worker_context, 'owned', None) == (name, action))
         with super().operation(name, action):
-            if not nested and name == CONTROL and action in TASK_ACTIONS:
+            if not nested and name == CONTROL and action in self.task_actions:
                 # Publish preparation at reservation time, before an async
                 # worker starts; Stop cannot mistake the previous task for it.
                 self._phase('preparing', action=action, started_at=time.time(), result=None, error=None,
@@ -233,7 +234,7 @@ class IntentControlPlugin(PiperPlugin):
         previous = getattr(self.worker_context, 'operation_object', None)
         self.worker_context.operation_object = 'gripper' if 'gripper' in action else 'arm'
         try:
-            if self.config.get('async_actions', True) and (action in TASK_ACTIONS or name == 'piper_photo' and action in {'capture', 'import_photo'}):
+            if self.config.get('async_actions', True) and (action in self.task_actions or name == 'piper_photo' and action in {'capture', 'import_photo'}):
                 result = self.run_async(name, action, args)
                 if result.get('state') == 'running':
                     result['reminder'] = 'Task accepted. Check Info for actual completion or use Stop.'
@@ -263,7 +264,7 @@ class IntentControlPlugin(PiperPlugin):
             with self.task_lock:
                 task = deepcopy(self.task)
             return {'state': task['state'], 'task': task, 'snapshot': self.read_monitor_snapshot()}
-        if action not in TASK_ACTIONS:
+        if action not in self.task_actions:
             raise ValueError('Unsupported user action; refresh Arm control.')
         try:
             return self._execute_task(action, args)

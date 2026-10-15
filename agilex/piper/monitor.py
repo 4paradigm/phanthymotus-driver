@@ -329,6 +329,12 @@ def english_parameters(parameters, snapshot):
     result['End position (mm)'] = pose.get('position_mm', 'unavailable')
     result['End orientation (deg)'] = pose.get('orientation_deg', 'unavailable')
     result['Task'] = snapshot.get('task', {'state': 'unavailable'})
+    if 'tcp_verified' in snapshot:
+        result['Gripper-tip calibrated'] = snapshot['tcp_verified']
+        result['Gripper-tip pose (mm, deg)'] = snapshot.get('tip_pose_mm_deg') or 'unavailable'
+        result['Return preset configured'] = snapshot.get('return_preset_configured', False)
+        result['Capabilities'] = snapshot.get('capabilities', {})
+        result['Reset position'] = snapshot.get('return_position') or 'unavailable'
     return result
 
 

@@ -1,4 +1,7 @@
-"""Production intent interface against a recording SDK; no hardware access."""
+"""Retained intent primitives against a recording SDK; no hardware access.
+
+The replacement production bundle is covered by test_piper_unified.py.
+"""
 from copy import deepcopy
 import json
 import math
@@ -9,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from agilex.piper.device import build_plugins
+from piper_legacy_fixture import build_plugins
 from agilex.piper.intent_motion import DIRECTIONS, end_pose, move_cartesian
 from agilex.piper.intent_control import TASK_ACTIONS
 from common.vendor_runtime import DriverBundle

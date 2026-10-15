@@ -22,6 +22,7 @@ COPY main.py device.py runtime.py cards.py arm.py arm_control.py control.py mac_
 COPY monitor.py monitor_bundle.py /work/agilex/piper/
 COPY status_card.py direct_control.py /work/agilex/piper/
 COPY intent_control.py intent_motion.py intent_monitor.py intent_teaching.py /work/agilex/piper/
+COPY unified_control.py user_motion.py path_capability.py preset.py /work/agilex/piper/
 COPY camera_live.py camera_worker.py camera_owner.py /work/agilex/piper/
 COPY resource/ /work/agilex/piper/resource/
 COPY deploy/ /deploy/

@@ -1,5 +1,8 @@
 # PiPER review candidate acceptance — 2026-10-14
 
+Historical record. The current single-card array interface and ARM64
+resubmission are documented in [REVIEW_20261015.md](REVIEW_20261015.md).
+
 ## Current implementation
 
 One Arm control canvas node discovers the background skeleton, English parameters and optionally enabled camera. Public direction actions request a 1 mm base-frame translation at 1% SDK speed with fixed orientation. MOVE_L targets are submitted once, with feedback-confirmed completion. Gripper operations and Stop share cancellable preparation/execution. An explicit guarded teaching exit holds measured joints without reset/homing/torque release. Existing SDK, dependencies and Core renderer remain unchanged.

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from agilex.piper.device import build_plugins
+from piper_legacy_fixture import build_plugins
 from agilex.piper.intent_teaching import exit_teaching_and_hold, supports_seamless_exit
 from common.vendor_runtime import DriverBundle
 from test_piper_intent import IntentDriver, FastClock

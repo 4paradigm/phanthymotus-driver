@@ -281,18 +281,27 @@ class PiperDriver:
                 raise RuntimeError("使能状态已变化，已取消旧目标")
             if tuple(raw_target) != self._bounded_target(raw_target):
                 raise RuntimeError("Target exceeds SDK limits; command refused")
+            self._check_cancelled()
             self.arm.MotionCtrl_2(0x01, 0x01, speed_pct, 0x00)
+            self._check_cancelled()
             self.arm.JointCtrl(*raw_target)
 
     def _hold_on_error(self, speed_pct):
         # Cancellation still allows one fresh-pose hold. Never disable or reset.
         try:
             with self._send_lock:
+                permission = getattr(self, 'require_control_permission', None)
+                if permission is not None:
+                    permission()
                 actual, state = self._healthy()
                 bounded = self._bounded_target(actual)
                 if (state.control_mode.startswith("CAN_CTRL")
                         and all(state.enabled) and actual == bounded):
+                    if permission is not None:
+                        permission()
                     self.arm.MotionCtrl_2(0x01, 0x01, speed_pct, 0x00)
+                    if permission is not None:
+                        permission()
                     self.arm.JointCtrl(*bounded)
         except Exception:
             pass  # Feedback/CAN failure means holding cannot be guaranteed.
@@ -572,6 +581,7 @@ class PiperDriver:
             if (not math.isfinite(width) or not low <= width <= high
                     or not math.isfinite(torque) or not 0 < torque <= 1):
                 raise ValueError("夹爪开度或力矩超过限位")
+            self._check_cancelled()
             self.arm.GripperCtrl(round(width*1000), round(torque*1000), 1 if enabled else 0, 0)
 
     def hold_gripper(self, torque=.5):
@@ -602,11 +612,16 @@ class PiperDriver:
             try:
                 with self._send_lock:
                     # One measured-width hold may follow cancellation.
+                    permission = getattr(self, 'require_control_permission', None)
+                    if permission is not None:
+                        permission()
                     from agilex.piper.control import ready_to_move
                     ready_to_move(self.get_state())
                     grip = self.get_gripper()
                     low, high = self.gripper_range()
                     if grip.enabled and not grip.error_code and low <= grip.width_mm <= high:
+                        if permission is not None:
+                            permission()
                         self.arm.GripperCtrl(round(grip.width_mm*1000), round(torque*1000), 1, 0)
             except Exception:
                 pass
