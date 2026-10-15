@@ -4,6 +4,54 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## Locomotion state card
+
+`loco_state` starts with the driver and publishes JSON on
+`/{namespace}/loco/state` and the same poll as `motus.odom/1` on
+`/{namespace}/state/odom` (format `state/odom`). Its input schema is an empty
+object. The namespace comes from `ros_namespace` or the hostname.
+`nav_state` remains available with its existing map-localized pose output.
+
+The new card polls these read-only Slamware REST endpoints concurrently:
+
+| Reading | Endpoint | Meaning |
+| --- | --- | --- |
+| Pose | `/api/core/slam/v1/localization/odopose` | Odometry frame position and roll/pitch/yaw, distinct from map localization |
+| Velocity | `/api/core/motion/v1/speed` | Measured body-frame `vx`, `vy`, `omega`; unmeasured vertical velocity is null |
+| IMU | `/api/core/slam/v1/imu` | Chassis IMU; only fields enabled in `availibilityBitMap` are forwarded |
+
+`position` and `velocity` are XYZ arrays; `rpy` is roll/pitch/yaw and
+`yaw_speed` comes from `omega`. IMU quaternion order is WXYZ. IMU values retain
+the vendor units; the supplied API does not specify units for those fields.
+IMU `euler_angle` retains vendor XYZ order without assuming a roll/pitch/yaw convention.
+Its `timestamp` is chassis uptime and is exposed as `imu.uptime_ms`, separately
+from the host Unix `timestamp_ms` and per-source `sample_timestamps_ms`.
+The REST requests are separate observations, not a synchronized hardware sample.
+
+Unavailable R1 fields `mode` and `body_height` are `null`. `motion_status` is
+derived from measured speed and does not claim to be a controller operating mode.
+Failed requests produce current errors and null readings instead of reusing a
+previous successful pose or speed. `available` requires valid odometry pose and
+speed; IMU validity is reported separately in `imu.available`.
+
+`plugins.loco_state.hz` defaults to a target of 10Hz (maximum 10); HTTP latency
+can lower the actual rate. `request_timeout` defaults to 0.5 seconds per request.
+There is at most one three-request group in flight. MCP `stop` leaves this
+always-active observer running, matching R1; driver shutdown stops the worker.
+
+The standard output uses `common.odom` from the official driver repository:
+`twist = [vx, vy, null, null, null, omega]`, `frame = "body"`, SI units,
+and a host receive timestamp for the speed response. Partial speed responses
+retain each valid axis, including measured zero. Invalid or absent axes are
+null. There is one speed observation per publish, with no faster stream being
+discarded. The IMU boot-relative timestamp is never used as `stamp_ms`.
+
+`info()` includes a validated `odom_interface` with `provides = ["vx", "vy", "wz"]`,
+the target rate, and `pose_drift = "none"` because standard `pose` is null.
+Odometry position, RPY, IMU, errors, and separate request timestamps remain
+under `vendor`; no ground-contact state is inferred. This follows the upstream
+[Robot Odometry specification](https://github.com/4paradigm/phanthymotus-driver/blob/main/README_dev.md#robot-odometry-motusodom1).
+
 ## Head camera snapshot card
 
 The `vision_capture` card subscribes to `/ob_camera_head/color/image_raw` and

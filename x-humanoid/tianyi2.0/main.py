@@ -471,6 +471,12 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
+        if plugins_cfg.get("loco_state", {}).get("enabled", False):
+            from loco_state import LocoStatePlugin
+            self._plugins.append(LocoStatePlugin(
+                plugins_cfg["loco_state"], namespace, ros2, slamtec_client))
+            print("[bundle] LocoStatePlugin loaded")
+
         if plugins_cfg.get("power_board", {}).get("enabled", False):
             from device import PowerBoardStatePlugin
             self._plugins.append(PowerBoardStatePlugin(plugins_cfg["power_board"], namespace, ros2))
@@ -596,6 +602,7 @@ class TianyiDeviceBundle:
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
         'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+        'LocoStatePlugin',
     }
 
     def start_all(self) -> None:
