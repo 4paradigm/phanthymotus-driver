@@ -20,8 +20,8 @@ MOTION_ACTIONS = ("observe", "grab_to", "grab_by")
 
 CONFIG_PROPERTIES = {
     "speed_percent": {
-        "type": "integer", "minimum": 1, "maximum": 10, "default": 5,
-        "description": "全局运行速度（%），用于观察位、水平移动、抓放升降及夹爪 Rz 旋转；受 Driver safety.max_speed_percent 限制，最高 10%。",
+        "type": "integer", "minimum": 1, "maximum": 100, "default": 50,
+        "description": "本卡片运行速度（%），范围 1～100，用于观察位、水平移动、抓放升降及夹爪 Rz 旋转。",
     },
     "observation_joints_deg": {
         "type": "string", "default": "-90,0,0,90,0,90,0",
@@ -93,10 +93,6 @@ class PickPlacePlugin:
         self._ros2 = ros2
         self._inputs = inputs if inputs is not None else ObservationInputs(ros2)
         self._config_properties = copy.deepcopy(CONFIG_PROPERTIES)
-        safety = config.get("safety", {})
-        speed = self._config_properties["speed_percent"]
-        speed["maximum"] = min(int(safety.get("max_speed_percent", 10)), 10)
-        speed["default"] = min(int(safety.get("default_speed_percent", 5)), speed["maximum"])
         self._config = {name: prop["default"] for name, prop in self._config_properties.items()}
         validate_config(self._config, self._config_properties)
         self._config_lock = threading.RLock()
