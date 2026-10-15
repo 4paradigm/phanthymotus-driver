@@ -182,11 +182,12 @@ Following the standard asynchronous ACP contract (`x-completion`):
      - `motion_stalled_kept`: stalled and locked at blocked position.
      - `motion_stalled_rolled_back`: stalled and returned to start position successfully (`rollback_succeeded: true`).
      - `interrupted`: stopped during execution.
-   - `status: "failed"` with reason (e.g., feedback unavailable or lost during motion, hardware fault, timeout, `stall_keep_failed`, `rollback_command_failed`, or `rollback_failed`).
+   - `status: "failed"` with reason (e.g., feedback unavailable or lost during motion, hardware fault, timeout, `stall_keep_failed`, `rollback_command_failed`, `rollback_failed`, or `rollback_feedback_lost`).
 4. Full completion details (including `position` / `final_position`, `target` / `requested_position`, `start_position`, `blocked_position`, `stalled`, `on_stall`, `rollback_succeeded`, `force`, `mode`, `error`, `stall_timeout_seconds`, `elapsed_seconds`) are preserved in the completion payload and queryable via `gripper.info` under `last_completion`.
 
 ### Hardware fault detection and recovery limitations
 
+- Motion neutralization and terminal lock retention: before releasing the motion lock upon timeout or interruption, the driver overwrites the outstanding target with a hold command at the current measured position. If position feedback is lost post-command or holding fails, the outstanding non-blocking motion remains active on the controller; to prevent concurrent arm movements, the driver retains the motion lock and `motion_gate` in a protected state until an explicit `stop` is dispatched.
 - RM+ feedback validation: the driver inspects `sys_state` and `dof_err` from `rm_get_rm_plus_state_info`. If `sys_state != 0` or any `dof_err != 0` is reported by the controller, the driver raises an error and terminates with `status: "failed"` rather than mistaking hardware failure for a mechanical stall.
 - Continuous feedback loss: if feedback samples drop continuously for 1.0 second during motion, the action aborts immediately with `status: "failed"` and reports the last known observed position rather than inventing the target position.
 - The standard SDK provides no dedicated pre-emptive gripper cancel API; calling `stop` marks the action interrupted and waits for the ongoing command to conclude in a safe terminal state before releasing locks.

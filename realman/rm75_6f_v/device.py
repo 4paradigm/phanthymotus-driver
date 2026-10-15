@@ -742,6 +742,23 @@ class GripperPlugin:
         if action == "stop":
             self._mark_interrupted()
             self._wait_for_worker()
+            # 若之前因为未消解而保留了锁，stop 操作在终止后释放锁以允许系统恢复
+            if self._gripper_lock.locked():
+                try:
+                    curr_state = self._read_gripper_state()
+                    if curr_state is not None:
+                        curr_pos = int(round(curr_state["position"]))
+                        self._send_position_cmd(curr_pos)
+                except Exception:
+                    pass
+                try:
+                    self._gripper_lock.release()
+                except RuntimeError:
+                    pass
+                try:
+                    self.client.motion_gate.release()
+                except RuntimeError:
+                    pass
             return {"state": "idle"}
         if action != "set_position":
             return None
@@ -784,6 +801,8 @@ class GripperPlugin:
             "on_stall": on_stall,
             "stall_timeout_seconds": stall_timeout,
         }
+        motion_dispatched = False
+        motion_neutralized = False
         try:
             # 1. 优先读取起始位置并识别夹爪类型与通信状态
             # 若状态反馈不可用（例如无法读取任何开度），严禁在无反馈情况下盲目下发非阻塞运动并谎报 target_reached，
@@ -823,6 +842,7 @@ class GripperPlugin:
 
             # 4. 下发目标位置运动（依据夹爪类型分发对应协议）
             self._send_position_cmd(target_position, source=gripper_source)
+            motion_dispatched = True
 
             # 5. 状态轮询与受阻堵转检测
             start_time = time.monotonic()
@@ -840,8 +860,9 @@ class GripperPlugin:
                     curr_pos = int(round(curr_state["position"])) if curr_state is not None else last_known_pos
                     try:
                         self._send_position_cmd(curr_pos, source=gripper_source)
+                        motion_neutralized = True
                     except Exception:
-                        pass
+                        motion_neutralized = False
                     status, result = "completed", {
                         "reason": "interrupted",
                         "position": curr_pos,
@@ -862,7 +883,18 @@ class GripperPlugin:
 
                 if time.monotonic() - start_time > GRIPPER_COMPLETION_TIMEOUT:
                     curr_state = self._read_gripper_state()
-                    curr_pos = int(round(curr_state["position"])) if curr_state is not None else last_known_pos
+                    if curr_state is not None:
+                        curr_pos = int(round(curr_state["position"]))
+                        # 超时保护：下发当前测量位置作为 hold 设定点，替换掉未完成的原目标
+                        try:
+                            self._send_position_cmd(curr_pos, source=gripper_source)
+                            motion_neutralized = True
+                        except Exception as hold_exc:
+                            print(f"[rm75 gripper] failed to hold setpoint on timeout: {hold_exc}", flush=True)
+                            motion_neutralized = False
+                    else:
+                        curr_pos = last_known_pos
+                        motion_neutralized = False
                     status, result = "failed", {
                         "reason": f"motion timed out after {GRIPPER_COMPLETION_TIMEOUT}s",
                         "position": curr_pos,
@@ -897,6 +929,7 @@ class GripperPlugin:
                 # 到位判定（公差 10）
                 if dist_to_target <= GRIPPER_TARGET_TOLERANCE:
                     curr_pos = int(round(current_pos))
+                    motion_neutralized = True
                     status, result = "completed", {
                         "reason": "target_reached",
                         "position": curr_pos,
@@ -947,7 +980,8 @@ class GripperPlugin:
                             print(f"[rm75 gripper] error locking setpoint to blocked_pos: {keep_exc}", flush=True)
 
                         if not keep_ok:
-                            # 设定点重写失败：控制器仍处于原始运动状态，移走障碍物可能继续闭合，必须上报失败终态
+                            # 设定点重写失败：控制器仍处于原始运动状态，移走障碍物可能继续闭合，必须上报失败终态且不得消解
+                            motion_neutralized = False
                             status, result = "failed", {
                                 "reason": f"stall_keep_failed: {keep_err}",
                                 "position": blocked_pos,
@@ -966,6 +1000,7 @@ class GripperPlugin:
                                 "error": keep_err,
                             }
                         else:
+                            motion_neutralized = True
                             status, result = "completed", {
                                 "reason": "motion_stalled_kept",
                                 "position": blocked_pos,
@@ -1002,6 +1037,7 @@ class GripperPlugin:
                         final_pos = blocked_pos
                         rb_success = False
                         rb_interrupted = False
+                        rb_feedback_lost = False
                         consecutive_rb_missing = 0
                         if rb_cmd_ok:
                             while time.monotonic() - rb_start < rb_timeout:
@@ -1022,6 +1058,7 @@ class GripperPlugin:
                                 else:
                                     consecutive_rb_missing += 1
                                     if consecutive_rb_missing >= MAX_CONSECUTIVE_MISSING_FEEDBACK:
+                                        rb_feedback_lost = True
                                         break
 
                         rb_outcome = rb_success or (final_pos == start_position and rb_cmd_ok)
@@ -1030,18 +1067,35 @@ class GripperPlugin:
                             status = "completed"
                             reason = "interrupted"
                             err = None
+                            try:
+                                self._send_position_cmd(final_pos, source=gripper_source)
+                                motion_neutralized = True
+                            except Exception:
+                                motion_neutralized = False
                         elif not rb_cmd_ok:
                             status = "failed"
                             reason = f"rollback_command_failed: {rb_cmd_err}" if rb_cmd_err else "rollback_command_failed"
                             err = rb_cmd_err or "failed to issue rollback command"
+                            motion_neutralized = False
+                        elif rb_feedback_lost:
+                            status = "failed"
+                            reason = "rollback_feedback_lost"
+                            err = f"feedback communication lost during rollback after {consecutive_rb_missing * poll_interval:.1f}s"
+                            motion_neutralized = False
                         elif rb_outcome:
                             status = "completed"
                             reason = "motion_stalled_rolled_back"
                             err = None
+                            motion_neutralized = True
                         else:
                             status = "failed"
                             reason = "rollback_failed"
                             err = f"failed to return to start position {start_position}, ended at {final_pos}"
+                            try:
+                                self._send_position_cmd(final_pos, source=gripper_source)
+                                motion_neutralized = True
+                            except Exception:
+                                motion_neutralized = False
 
                         status, result = status, {
                             "reason": reason,
@@ -1068,6 +1122,16 @@ class GripperPlugin:
             # 捕获硬件故障异常或执行异常，如实汇报失败原因与真实位置（绝不虚构目标位置）
             status = "failed"
             current_known_pos = locals().get("last_known_pos", locals().get("start_position", target_position))
+            if motion_dispatched and not motion_neutralized:
+                try:
+                    curr_st = self._read_gripper_state()
+                    if curr_st is not None:
+                        hold_pos = int(round(curr_st["position"]))
+                        self._send_position_cmd(hold_pos, source=locals().get("gripper_source", "rm_plus"))
+                        motion_neutralized = True
+                        current_known_pos = hold_pos
+                except Exception:
+                    pass
             result = {
                 "reason": str(exc),
                 "position": current_known_pos,
@@ -1083,13 +1147,23 @@ class GripperPlugin:
                 "error": str(exc),
             }
         finally:
+            release_locks = not (motion_dispatched and not motion_neutralized)
+            if not release_locks:
+                print(f"[rm75 gripper] {action_id}: motion target remains active and unneutralized; retaining motion locks for safety", flush=True)
+
             with self._action_lock:
                 if self._active_action_id == action_id:
                     self._active_action_id = None
                 self._interrupted.discard(action_id)
-                self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
-            self._gripper_lock.release()
-            self.client.motion_gate.release()
+                self._last_completion = {
+                    "action_id": action_id,
+                    "status": status,
+                    "result": dict(result),
+                    "locks_retained": not release_locks,
+                }
+            if release_locks:
+                self._gripper_lock.release()
+                self.client.motion_gate.release()
             self._acp_callback(action_id, status, result)
 
     def _acp_callback(self, action_id, status, result):
