@@ -267,23 +267,28 @@ Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
 
-## ArUco 标记识别与分拣辅助卡片 (`aruco_zones`)
+## ArUco 标记中心点识别卡片 (`aruco_detector` / `aruco_zones`)
 
-Driver 已注册 `aruco_zones` 处理卡片（`type: processor`），用于识别 RealSense 相机画面中的 ArUco 码 ID 及位置坐标，为下游物体分拣任务提供视觉依据：
+Driver 已注册 `aruco_detector` 处理卡片（`type: processor`，同时提供 `aruco_zones` 兼容别名），专门用于识别 RealSense 相机画面中的 ArUco 码 ID 及中心点位置坐标，为下游物体分拣任务提供定位依据：
 
 1. **输入与输出**：
    - 输入：连接 `ext_camera` 的 RGB 图像流（`format: image/jpeg`）。
-   - 输出：带标记框与区域框的 JPEG 预览图（`/{namespace}/aruco_zones/overlay`）与 regions JSON 数据（`/{namespace}/aruco_zones/regions`）。
-2. **纯视觉识别与分拣查询**：
-   - 动作：支持 `start`、`info`、`detect`、`config`、`stop`。
-   - 调用 `dispatch("info", {})` 或 `dispatch("detect", {})` 即可获取当前检测到的所有码：
-     - `detected_marker_ids`: 画面中可见的 ArUco ID 列表，如 `[1, 5, 9]`。
-     - `detected_markers`: 包含每个码的详细位置列表：
-       - `id`: 标记 ID（整数）。
-       - `center_normalized`: `[x, y]`，范围 0~1 的归一化图像中心坐标。
-       - `center_px`: `[px_x, px_y]`，像素中心坐标。
-       - `corners_px`: 四个角点的像素坐标列表。
-       - `corners_normalized`: 四个角点的归一化坐标列表。
-   - 当无需预设分区时（纯识别模式），画面只要检测到有效码即可作为就绪状态（`ready: true`）。
-   - 当配置了分拣分区（`waiting_rect`、`sorting_1_rect`、`sorting_2_rect`）时，卡片还会自动按归一化矩形范围分配角色，并在三个区域均有唯一码时置 `ready: true`。
+   - 输出：带标记边框与中心点十字线标注的 JPEG 预览图（`/{namespace}/aruco_detector/overlay`）与检测结果 JSON（`/{namespace}/aruco_detector/markers`）。
+2. **纯视觉识别与中心点提取接口（可直接调用）**：
+   - 动作支持：`detect`、`get_marker_center`、`info`、`start`、`stop`。
+   - **调用 `dispatch("detect", {"marker_id": 3})` 或 `dispatch("get_marker_center", {"marker_id": 3})`**：
+     - 直接获取指定标记码的中心点坐标：
+       - `found`: `true` / `false` 是否在画面中找到该码。
+       - `center`: `[x, y]` 归一化中心坐标（范围 0.0~1.0，画面左上角为 0,0）。
+       - `center_normalized`: `[x, y]` 归一化中心坐标。
+       - `center_px`: `[px_x, px_y]` 像素中心坐标。
+       - `marker`: 包含四个角点详细坐标的对象。
+   - **调用 `dispatch("detect", {})` 或 `dispatch("info", {})`**：
+     - 获取当前画面中所有检测到的标记码列表：
+       - `detected_markers`: 画面中所有可见码列表，包含各自的 `id`、`center_normalized`、`center_px`、`corners_px` 与 `corners_normalized`。
+       - `detected_marker_ids`: 画面中可见的所有 ArUco ID 列表，如 `[1, 3, 7]`。
+       - `marker_count`: 检测到的标记总数。
+   - **纯几何中心提取**：
+     - 本卡片仅负责 ArUco 码 ID 识别与中心点位置提取，不设置待分拣区/分拣区等额外规则；下游分拣任务可直接根据获取到的中心点坐标规划机械臂抓取动作。
+
 

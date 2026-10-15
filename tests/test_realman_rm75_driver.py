@@ -179,7 +179,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn(f"output_dir: {directory}", (DRIVER / "config.yaml").read_text())
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("ros-humble-rmw-fastrtps-cpp ffmpeg", dockerfile)
-        self.assertIn("realsense.py vision_capture.py aruco_zones.py aruco_canvas.py config.yaml", dockerfile)
+        self.assertIn("realsense.py vision_capture.py aruco_detector.py aruco_zones.py aruco_canvas.py config.yaml", dockerfile)
 
     def test_pick_place_needs_no_storage_configuration_or_mount(self):
         service = (DRIVER / "deploy/service.yml").read_text()
