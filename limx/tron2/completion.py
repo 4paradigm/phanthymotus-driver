@@ -49,7 +49,7 @@ class ArmCompletion:
         for peer in peers:
             if peer.active and peer.active['state'] == 'reporting' and peer.active.get('target_opening_verified'):
                 await asyncio.shield(peer.task)
-        if any(peer.closed or peer.active or peer.recovering for peer in peers):
+        if any(peer.closed or peer.active or peer.recovering or peer.waiting for peer in peers):
             raise MoveError('Gripper action is active or uncertain; no arm motion sent', False)
         if self.closed or self.active:
             raise MoveError('Arms are busy or require operator verification; no additional motion sent', False)

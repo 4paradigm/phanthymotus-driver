@@ -15,7 +15,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.6.3'
+VERSION = '0.6.4'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -199,9 +199,11 @@ class Adapter:
                 if set(args) - {'action', 'instance_id', '_trace_id'}:
                     raise ValueError('读取状态和系统操作无需开合参数')
                 if action in ('start', 'stop'):
+                    if action == 'stop':
+                        self.grippers[name].cancel_waiting()
                     return {'state': 'ready' if action == 'start' else 'idle',
                             'motion_sent': False, 'lifecycle_only': True,
-                            'message': '仅改变卡片生命周期，不发送夹爪开合或急停指令'}
+                            'message': 'stop取消本侧未受理的等待指令；不发送夹爪开合或硬件急停'}
                 return self.grippers[name].info()
             gripper_command(action, args, GRIPPER_SIDES[name])
             return {'action': action, 'motion_sent': False, 'status': 'validated'}
@@ -304,6 +306,8 @@ class Adapter:
                         'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control'} | set(GRIPPER_SIDES)) or
                             params.get('name') in GRIPPER_SIDES and params.get('arguments', {}).get('action') not in MOTION_ACTIONS,
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
+                    if params.get('name') in self.grippers and params['name'] in self.enabled:
+                        data['gripper'] = self.grippers[params['name']].info()
                 result = {'content': [{'type': 'text', 'text': json.dumps(data,
                            ensure_ascii=False, allow_nan=False)}], 'isError': error}
             else:

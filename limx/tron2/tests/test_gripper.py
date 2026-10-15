@@ -140,7 +140,8 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_call_and_lifecycle_do_not_add_motion(self):
         await self.dispatch()
-        with self.assertRaises(MoveError): await self.dispatch()
+        second = await self.dispatch()
+        self.assertTrue(second['no_op']);self.assertFalse(second['motion_sent'])
         await self.controller.task
         adapter = Adapter(lambda *a:None, settings(enabled_cards=['gripper_left']), reader=self.reader)
         for action in ('start','stop','info'):
@@ -354,8 +355,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.reader.connected)
 
     async def asyncTearDown(self):
-        self.poll.cancel();await asyncio.gather(self.poll,return_exceptions=True)
-        await self.session.close();await self.runner.cleanup()
+        # Close loopback sockets before cancellation: Python3.9 wait_for can
+        # otherwise race a just-received frame and leave the polling task alive.
+        await self.session.close()
+        self.poll.cancel()
+        await asyncio.wait_for(asyncio.gather(self.poll,return_exceptions=True),2)
+        await self.runner.cleanup()
 
     async def test_query_and_write_use_exact_guid_title_identity_and_one_side(self):
         state=await self.reader.read_gripper();self.assertEqual(state['left_opening'],40)
@@ -577,6 +582,159 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             right.active=None
         finally:
             for owner in adapter.grippers.values():await owner.close()
+            await runner.cleanup()
+
+    async def wait_until_queued(self, owner):
+        for _ in range(100):
+            if owner.waiting:return
+            await asyncio.sleep(.001)
+        self.fail('Expected exactly one queued operation')
+
+    async def test_user_open_left_open_right_close_right_waits_for_actual_completion(self):
+        adapter,runner,call=await self.shared_http_app();gate=asyncio.Event()
+        owner=adapter.grippers['gripper_right'];original=owner.verify_target
+        async def delayed(job):
+            await gate.wait();return await original(job)
+        owner.verify_target=delayed
+        queued=None
+        try:
+            with patch.multiple('gripper',TIMEOUT=.2,POLL_SECONDS=.005,STABILITY_SECONDS=.015):
+                for side in ('left','right'):
+                    result=await call('gripper_'+side,{'action':'open','opening':70,'speed':10,'force':10})
+                    self.assertFalse(result['isError'])
+                prior=owner.task
+                queued=asyncio.create_task(call('gripper_right',{'action':'close','speed':10,'force':10}))
+                await self.wait_until_queued(owner)
+                self.assertFalse(queued.done());self.assertFalse(owner.info()['can_accept_motion'])
+                extra=await call('gripper_right',{'action':'open','opening':60,'speed':10,'force':10})
+                self.assertTrue(extra['isError']);self.assertIn('已有一条',json.loads(extra['content'][0]['text'])['error'])
+                writes=[r['data'] for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']
+                self.assertEqual(writes,[{'left_opening':70,'left_speed':10,'left_force':10},
+                                         {'right_opening':70,'right_speed':10,'right_force':10}])
+                gate.set();result=await queued
+                self.assertFalse(result['isError']);self.assertTrue(prior.done())
+                await owner.task
+                self.assertEqual(owner.last['status'],'completed');self.assertEqual(owner.last['action'],'close')
+                self.assertIsNone(owner.waiting)
+                self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),3)
+        finally:
+            gate.set()
+            if queued:await asyncio.gather(queued,return_exceptions=True)
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
+    async def test_queued_close_after_failed_open_is_not_sent_and_both_recover_order_is_independent(self):
+        self.cap=94
+        adapter,runner,call=await self.shared_http_app()
+        original=self.reader.read_gripper
+        async def bounded_positions():
+            data=await original();data['right_opening']=88;return data
+        self.reader.read_gripper=bounded_positions
+        try:
+            with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
+                                RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.015):
+                for side in ('left','right'):
+                    result=await call('gripper_'+side,{'action':'open','opening':100,'speed':10,'force':10})
+                    self.assertFalse(result['isError'])
+                result=await call('gripper_right',{'action':'close','speed':10,'force':10})
+                self.assertTrue(result['isError'])
+                details=json.loads(result['content'][0]['text'])
+                self.assertIn('目标100',details['error']);self.assertIn('88',details['error'])
+                self.assertFalse(details['motion_sent']);self.assertEqual(details['gripper']['state'],'blocked_requires_operator_check')
+                self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),2)
+                for side in ('left','right'):
+                    result=await call('gripper_'+side,{'action':'recover'})
+                    self.assertFalse(result['isError'])
+                    self.assertTrue(json.loads(result['content'][0]['text'])['recovered'])
+                self.assertTrue(all(o.info()['can_accept_motion'] for o in adapter.grippers.values()))
+                self.reader.read_gripper=original;self.cap=None;self.stationary=True
+                result=await call('gripper_left',{'action':'close','speed':10,'force':10})
+                self.assertFalse(result['isError']);await adapter.grippers['gripper_left'].task
+                self.assertEqual(adapter.grippers['gripper_left'].last['status'],'completed')
+        finally:
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
+    async def test_stop_cancels_queued_close_without_stopping_or_cancelling_active_open(self):
+        adapter,runner,call=await self.shared_http_app();gate=asyncio.Event()
+        owner=adapter.grippers['gripper_left'];original=owner.verify_target
+        async def delayed(job):
+            await gate.wait();return await original(job)
+        owner.verify_target=delayed;queued=None
+        try:
+            with patch.multiple('gripper',TIMEOUT=.2,POLL_SECONDS=.005,STABILITY_SECONDS=.015):
+                await call('gripper_left',{'action':'open','opening':70,'speed':10,'force':10})
+                original_task=owner.task
+                queued=asyncio.create_task(call('gripper_left',{'action':'close','speed':10,'force':10}))
+                await self.wait_until_queued(owner)
+                stopped=await call('gripper_left',{'action':'stop'})
+                self.assertFalse(stopped['isError'])
+                result=await queued;self.assertTrue(result['isError'])
+                self.assertIn('已取消',json.loads(result['content'][0]['text'])['error'])
+                self.assertFalse(original_task.done());self.assertIsNone(owner.waiting)
+                gate.set();await original_task
+                self.assertEqual(owner.last['status'],'completed')
+                self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),1)
+        finally:
+            gate.set()
+            if queued:await asyncio.gather(queued,return_exceptions=True)
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
+    async def test_queued_timeout_and_cancellation_do_not_cancel_the_physical_owner(self):
+        adapter,runner,call=await self.shared_http_app();gate=asyncio.Event()
+        owner=adapter.grippers['gripper_left'];original=owner.verify_target
+        async def delayed(job):
+            await gate.wait();return await original(job)
+        owner.verify_target=delayed
+        try:
+            with patch.multiple('gripper',TIMEOUT=.2,POLL_SECONDS=.005,STABILITY_SECONDS=.015,PREVIOUS_TIMEOUT=.02):
+                await owner.dispatch('open',{'opening':70,'speed':10,'force':10})
+                physical=owner.task
+                with self.assertRaises(MoveError):await owner.dispatch('close',{'speed':10,'force':10})
+                self.assertFalse(physical.done());self.assertIsNone(owner.waiting)
+                queued=asyncio.create_task(owner.dispatch('close',{'speed':10,'force':10}))
+                await self.wait_until_queued(owner);queued.cancel()
+                with self.assertRaises(asyncio.CancelledError):await queued
+                self.assertFalse(physical.done());self.assertIsNone(owner.waiting)
+                gate.set();await physical
+                self.assertEqual(owner.last['status'],'completed')
+                self.assertEqual(len([r for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']),1)
+        finally:
+            gate.set()
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
+    async def test_close_waits_for_same_side_recover_to_finish(self):
+        self.cap=94
+        adapter,runner,call=await self.shared_http_app();gate=asyncio.Event();entered=asyncio.Event()
+        owner=adapter.grippers['gripper_left'];original=self.reader.read_gripper
+        async def held_feedback():
+            if owner.recovering:
+                entered.set();await gate.wait()
+            return await original()
+        recovering=queued=None
+        try:
+            with patch.multiple('gripper',TIMEOUT=.12,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
+                                RECOVERY_TIMEOUT=.2,RECOVERY_STABILITY_SECONDS=.015):
+                await owner.dispatch('open',{'opening':100,'speed':10,'force':10});await owner.task
+                self.reader.read_gripper=held_feedback
+                recovering=asyncio.create_task(call('gripper_left',{'action':'recover'}))
+                await asyncio.wait_for(entered.wait(),1)
+                queued=asyncio.create_task(call('gripper_left',{'action':'close','speed':10,'force':10}))
+                await self.wait_until_queued(owner)
+                # Other side recovery cannot undo left-side waiting or recovery.
+                right=await call('gripper_right',{'action':'recover'})
+                self.assertFalse(right['isError']);self.assertFalse(queued.done())
+                gate.set();self.cap=None;self.stationary=True
+                result=await recovering;self.assertFalse(result['isError'])
+                result=await queued;self.assertFalse(result['isError']);await owner.task
+                self.assertEqual(owner.last['status'],'completed');self.assertEqual(owner.last['action'],'close')
+        finally:
+            gate.set()
+            for task in (recovering,queued):
+                if task:await asyncio.gather(task,return_exceptions=True)
+            for o in adapter.grippers.values():await o.close()
             await runner.cleanup()
 
 if __name__=='__main__':unittest.main()

@@ -16,6 +16,7 @@ STABILITY_SECONDS = .5
 TOLERANCE = 1
 RECOVERY_TIMEOUT = 8
 RECOVERY_STABILITY_SECONDS = 1
+PREVIOUS_TIMEOUT = 40
 LOG = logging.getLogger('tron2')
 ACTION_FIELDS = {'info': set(), 'start': set(), 'stop': set(),
                  'open': {'opening','speed','force'}, 'close': {'speed','force'},
@@ -111,6 +112,8 @@ class Gripper:
         self.closed = False
         self.peer = None
         self.recovering = False
+        self.recovery_task = None
+        self.waiting = None
 
     def info(self):
         age = None if self.sample is None else max(0, time.monotonic() - self.sample[0])
@@ -121,11 +124,15 @@ class Gripper:
         if self.active:
             motion = {**(motion or {}), **{k: self.active[k] for k in ('action_id', 'action', 'side', 'state')},
                       'target_opening': self.active['target']}
-        return {'side': self.side, 'state': self.active['state'] if self.active else 'ready' if self.reader.connected else 'offline',
+        return {'side': self.side, 'state': self.active['state'] if self.active else
+                    'recovering' if self.recovering else 'waiting_for_previous' if self.waiting else
+                    'ready' if self.reader.connected else 'offline',
                 'motion_sent': False, 'available': available,
                 'reception_age_seconds': age, 'data': self.sample[1] if available else None,
                 'motion': motion, 'recovering': self.recovering,
+                'waiting_action': self.waiting['action'] if self.waiting else None,
                 'can_accept_motion': not self.closed and not self.active and not self.recovering and
+                    not self.waiting and
                     self.reader.connected and not (self.peer and (self.peer.closed or self.peer.active)),
                 'grasp_verified': False}
 
@@ -136,6 +143,7 @@ class Gripper:
 
     async def recover(self, args):
         args = recovery_arguments(args)
+        await self.wait_previous('recover', allow_blocked=True)
         if self.closed or self.recovering or self.peer and (self.peer.closed or self.peer.active):
             raise MoveError('驱动关闭、正在恢复或机械臂任务未结束，不能恢复夹爪', False)
         job = self.active
@@ -145,6 +153,9 @@ class Gripper:
                 self.task and not self.task.done() or not self.last or self.last['action_id'] != job['action_id']:
             raise MoveError('本侧任务仍在执行或报告时不能恢复', False)
         self.recovering = True
+        # Completion belongs to this recovery operation, not its HTTP caller's
+        # lifetime (which may continue after recover returns).
+        self.recovery_task = asyncio.get_running_loop().create_future()
         try:
             ws, serial = self.reader.ws, self.reader.serial
             deadline = time.monotonic() + RECOVERY_TIMEOUT
@@ -198,17 +209,66 @@ class Gripper:
                     'message': '已恢复后续操作；原任务结果保留，未发送任何开合或急停指令'}
         finally:
             self.recovering = False
+            self.recovery_task.set_result(None)
+            self.recovery_task = None
+
+    def cancel_waiting(self):
+        # Cancels only a request not yet admitted. Never claims to stop a motor.
+        if self.waiting:
+            self.waiting['cancel'].set()
+
+    def blocked_error(self):
+        job = self.active or {}
+        last = self.last or {}
+        label = '左' if self.side == 'left' else '右'
+        return MoveError(label + '夹爪上一条' + str(job.get('action', '动作')) +
+            '结果尚未确认：目标' + str(job.get('target')) + '，最近反馈' +
+            str(last.get('reported_opening', job.get('reported_opening'))) +
+            '；后续指令未发送。现场确认静止空载后使用本侧recover', False)
+
+    async def wait_previous(self, action, allow_blocked=False):
+        if self.closed:
+            raise MoveError('夹爪驱动已关闭，后续指令未发送', False)
+        if self.waiting:
+            raise MoveError('本侧已有一条后续指令等待，请勿重复提交', False)
+        previous = self.recovery_task if self.recovering else self.task if self.active else None
+        if previous and not previous.done():
+            wait = {'action': action, 'cancel': asyncio.Event()}
+            self.waiting = wait
+            ws, serial = self.reader.ws, self.reader.serial
+            cancellation = asyncio.create_task(wait['cancel'].wait())
+            try:
+                # Wait on the real task outcome, not a fixed delay. Cancelling a
+                # queued RPC cannot cancel the already admitted physical action.
+                done, _ = await asyncio.wait({previous, cancellation}, timeout=PREVIOUS_TIMEOUT,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if self.closed or wait['cancel'].is_set():
+                    raise MoveError('已取消本侧等待中的后续指令，未发送电机命令；当前动作未被急停', False)
+                if previous not in done:
+                    raise MoveError('等待本侧上一条任务完成超时，后续指令未发送；请检查任务状态', False)
+                if not self.reader.connected or self.reader.ws is not ws or self.reader.serial != serial:
+                    raise MoveError('等待期间机器人连接变化，后续指令未发送；请重新检查', False)
+            finally:
+                cancellation.cancel()
+                await asyncio.gather(cancellation, return_exceptions=True)
+                self.waiting = None
+            # Cleanup above yields: stop or disconnect can arrive during it.
+            if self.closed or wait['cancel'].is_set():
+                raise MoveError('已取消本侧等待中的后续指令，未发送电机命令；当前动作未被急停', False)
+            if not self.reader.connected or self.reader.ws is not ws or self.reader.serial != serial:
+                raise MoveError('等待期间机器人连接变化，后续指令未发送；请重新检查', False)
+        if self.active and not allow_blocked:
+            raise self.blocked_error()
 
     async def dispatch(self, action, args):
         data = command(action, args, self.side)
-        if self.active and self.active['state'] == 'reporting' and self.active.get('target_opening_verified'):
-            await asyncio.shield(self.task)
+        await self.wait_previous(action)
         if self.peer and self.peer.active and self.peer.active['state'] == 'reporting' and self.peer.active.get('arrival_verified'):
             await asyncio.shield(self.peer.task)
         if self.peer and (self.peer.closed or self.peer.active):
             raise MoveError('机械臂动作进行中或结果尚未确认，暂不接受夹爪开合', False)
         if self.closed or self.active or self.recovering:
-            raise MoveError('夹爪忙或上次动作结果尚未确认，请先检查状态', False)
+            raise MoveError('本侧夹爪任务状态变化，后续指令未发送；请检查状态', False)
         future = asyncio.get_running_loop().create_future()
         future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
         job = {'action_id': 'tron2_gripper_' + uuid4().hex, 'action': action, 'side': self.side,
@@ -285,6 +345,8 @@ class Gripper:
                 'side': job['side'], 'target_opening': job['target'], 'state': job['state'],
                 'motion_sent': job['motion_sent'], 'no_op': job['no_op'],
                 'target_opening_verified': False, 'grasp_verified': False,
+                'can_accept_motion': False,
+                'message': '指令已受理，仍在等待目标反馈和完成回调；本侧下一条指令会等待本条确认',
                 'completion_protocol': 'acp'})
             result = await self.verify_target(job)
             status = 'completed'
@@ -324,6 +386,7 @@ class Gripper:
 
     async def close(self):
         self.closed = True
+        self.cancel_waiting()
         if self.task and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
