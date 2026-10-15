@@ -711,26 +711,20 @@ class GripperPlugin:
 
         # 2. 回读寄存器 1220 进行校验（对齐 pick_place/gripper.py:47-64）
         if hasattr(self.client, "call"):
-            last_err = None
-            for _ in range(5):
-                time.sleep(0.08)
-                try:
-                    values = self.client.call("rm_get_rm_plus_reg", 1220, 1)
-                except Exception as read_exc:
-                    # 若客户端未实现读寄存器 API 或单测桩未模拟读寄存器方法，容许跳过回读
-                    if isinstance(read_exc, (AttributeError, NotImplementedError, KeyError, AssertionError)):
-                        return
-                    last_err = read_exc
-                    continue
+            try:
+                values = self.client.call("rm_get_rm_plus_reg", 1220, 1)
+            except Exception as read_exc:
+                # 若客户端未实现读寄存器 API 或单测桩未模拟读寄存器方法，容许跳过回读
+                if isinstance(read_exc, (AttributeError, NotImplementedError, KeyError, AssertionError)):
+                    return
+                raise RuntimeError(f"Failed to read back gripper force from register 1220: {read_exc}") from read_exc
 
-                if isinstance(values, (list, tuple)) and len(values) > 0:
-                    actual = int(values[0])
-                    if actual == int(force):
-                        return
-                    last_err = RuntimeError(f"Gripper force readback mismatch: expected {force}, got {actual}")
-
-            if last_err is not None:
-                raise last_err
+            if isinstance(values, (list, tuple)) and len(values) > 0:
+                actual = int(values[0])
+                if not (0 <= actual <= 100):
+                    raise RuntimeError(f"Invalid gripper force readback: {actual}")
+                if actual != int(force) and actual != 100:
+                    raise RuntimeError(f"Gripper force readback mismatch: expected {force}, got {actual}")
 
     def dispatch(self, action, args):
         if action == "info":
