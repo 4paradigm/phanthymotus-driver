@@ -12,7 +12,8 @@ def test_only_sensor_card_and_shared_settings(monkeypatch):
     card = module.SoundDirectionPlugin({}, 'robot', types.SimpleNamespace(add_node=lambda _: None))
     assert [tool['name'] for tool in card.get_tools()] == ['sound_direction']
     tool = card.get_tool()
-    assert tool['topic_out'] == [{'topic': '/robot/sound_direction/events', 'format': 'sensor/sound-direction'}]
+    assert tool['topic_out'] == [{'topic': '/robot/sound_direction', 'format': 'sensor/sound-direction'}]
+    assert card._node.subscriptions == [('/robot/_internal/sound_direction', card._on_direction)]
     assert set(tool['configSchema']['properties']) == {'sensitivity'}
     assert set(tool['configSchema']['properties']) == set(module.DEFAULT_PARAMETERS)
     assert all(field['scope'] == 'shared' for field in tool['configSchema']['properties'].values())
@@ -91,6 +92,7 @@ def test_worker_publishes_structured_direction_message(monkeypatch, tmp_path, ti
         def __init__(self, name): pass
         def create_publisher(self, message_type, topic, qos):
             assert message_type is module.SoundDirection
+            assert topic == '/robot/_internal/sound_direction'
             return types.SimpleNamespace(publish=published.append)
 
     class Done(BaseException): pass

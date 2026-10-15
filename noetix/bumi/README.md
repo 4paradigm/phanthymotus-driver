@@ -6,7 +6,7 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 
 `mic` publishes mono PCM `AudioChunk` messages on `/<namespace>/mic/audio`.
 `sound_direction` is the only direction card. Its canvas output is
-`std_msgs/msg/String` on `/<namespace>/sound_direction/events`, declared as
+`std_msgs/msg/String` on `/<namespace>/sound_direction`, declared as
 `sensor/sound-direction`. Like `sensor/pose2d`, it has a specific canvas type
 with the standard String transport; it is not a generic `data/json` port.
 Driver owns freshness and display data; Core uses its standard text/latest
@@ -24,8 +24,9 @@ are not valid ASR observations. Driver repeats terminal states every 500 ms,
 including no-event before first activity, so late readers or a lost
 best-effort packet do not leave an old reading marked fresh.
 
-The original `audio_msgs/msg/SoundDirection` stream on
-`/<namespace>/sound_direction` remains available to existing ROS clients.
+The worker's `audio_msgs/msg/SoundDirection` stream is internal, on
+`/<namespace>/_internal/sound_direction`. Only the public observation topic
+is declared by the card, so monitoring shows one `sound_direction` window.
 
 The two capture workers use the SDK frame timestamp as their common capture
 clock only when it has a Unix-microsecond shape. `mic` stamps each chunk with
@@ -115,7 +116,7 @@ not physical direction accuracy.
 For existing canvas projects, remove the old `sound_direction_control` card,
 remove/re-add `sound_direction` and ASR, and reconnect the dedicated direction output
 to the ASR direction input (and mic to the audio input). This replaces saved
-typed ROS topics; update Driver and Perception together for the standard
+typed ROS or `/events` topics; update Driver and Perception together for the standard
 sensor transport. The canvas type remains `sensor/sound-direction`.
 Update Core once for this migration to remove its old custom ROS decoder.
 Calibration actions have been removed; update the packaged file through a reviewed change, or use
@@ -137,8 +138,8 @@ release without the local interface overlay; the ROS overlay and import-check la
 this robot's cached `ros-base:latest` and the pinned digest. The report separates
 Docker size accounting from actual disk consumption and includes raw evidence.
 
-The original `/<namespace>/sound_direction` stream still uses the bundled
-`audio_msgs/msg/SoundDirection` for existing ROS clients. The Driver itself
+The internal `/<namespace>/_internal/sound_direction` stream uses the bundled
+`audio_msgs/msg/SoundDirection`. The Driver itself
 builds that definition; the standard sensor observation is a separate topic
 so there are never two ROS types on one topic.
 

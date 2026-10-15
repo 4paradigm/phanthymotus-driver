@@ -151,7 +151,7 @@ def _direction_subprocess(namespace: str) -> None:
     time.sleep(3)
     rclpy.init()
     node = Node("bumi_sound_direction")
-    pub = node.create_publisher(SoundDirection, f"/{namespace}/sound_direction", _QOS)
+    pub = node.create_publisher(SoundDirection, f"/{namespace}/_internal/sound_direction", _QOS)
     recent_audio = deque(maxlen=8)
     recent_capture_us = deque(maxlen=8)
     parameters = load_parameters()
@@ -214,8 +214,8 @@ class SoundDirectionPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl=None):
         self._namespace = namespace
-        self._topic = f"/{namespace}/sound_direction"
-        self._output_topic = f"{self._topic}/events"
+        self._topic = f"/{namespace}/_internal/sound_direction"
+        self._output_topic = f"/{namespace}/sound_direction"
         self._media_ctrl = media_ctrl
         self._proc: subprocess.Popen | None = None
         self._process_lock = threading.RLock()
