@@ -10,6 +10,10 @@ aruco_detector:
   enabled: true
 aruco_zones:
   enabled: true
+color_detector:
+  enabled: true
+object_segmentor:
+  enabled: true
 vision_capture:
   enabled: true
   camera: external
