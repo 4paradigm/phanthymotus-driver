@@ -1,9 +1,10 @@
 # LinkerHand L20 Lite USB-RS485 driver
 
 This is the active PhanthyMotus driver for the L20 Lite connected through a
-USB-RS485 adapter. It uses Modbus RTU at 115200 baud, 8N1. The verified right
-hand uses slave address `0x27` on `/dev/ttyUSB0`; left hand uses `0x28`, but
-left-hand motion has not been hardware-tested here.
+USB-RS485 adapter. It uses Modbus RTU at 115200 baud, 8N1. The configured
+right-hand slave address is `0x27`; the left-hand address is `0x28`. The operator
+confirmed that the open/close targets below work on both hands. Automatic
+left/right switching has offline coverage but still needs a physical test.
 
 The transport in `modbus_client.py` implements the frames emitted by the
 official LinkerHand C++ SDK: function `0x04` reads ten 16-bit registers and
@@ -13,19 +14,18 @@ low byte of a register. The separate `can_client.py` and `device.py` files are
 the previous CAN draft; `main.py` now imports `modbus_device.py` instead.
 
 Configure `serial_port` and `side` in `config.yaml`. The driver never moves the
-hand on startup; only explicit MCP `hand` actions do. Every `open`, `close`,
-`set_joint` or `set_positions` request must include the boolean
+hand on startup; only explicit MCP `hand` actions do. Every `open`, `close`
+or `set_positions` request must include the boolean
 `confirm_motion: true`; missing, false or string values are rejected before
 opening the serial port. On the canvas, enter `true` in the confirmation field
 after checking that the hand and its surroundings are clear. State reads,
-speed/torque configuration and torque release do not need motion confirmation.
-The right-hand default
-`open` pose is the pose read immediately before a successful physical fist/open
-test. The configured `close` pose is the user's requested right-hand target:
-`[93,255,0,0,0,0,128,128,128,255]`. The operator confirmed successful
-close/open motions on this specific right hand. The driver requires an explicit
+torque configuration and torque release do not need motion confirmation.
+The configured `open` pose is `[254,254,254,254,254,254,127,126,127,254]`.
+The configured `close` pose is
+`[93,255,0,0,0,0,128,128,128,255]`. The operator confirmed both poses on
+their left and right hands. The driver requires an explicit
 `fist_pose` in the deployment config and refuses to start without one; this
-calibration must not be assumed safe for another hand. The official L20 Lite
+calibration must not be assumed safe for other hardware. The official L20 Lite
 example maps slots 7–10 to index sway,
 middle sway, ring sway and thumb rotation; it has no separate pinky-sway slot.
 These are 0–255 position commands, not degrees. Both
@@ -42,6 +42,18 @@ Agent Core at `/api/acp/complete`. Do not repeat an action while it is pending.
 The driver also rejects overlapping motions locally. `stop` interrupts a
 pending motion and releases torque; if completion delivery fails, the driver
 blocks further motion until it is inspected and restarted.
+
+With `auto_detect_gestures: true` (the existing setting name), `info` performs
+read-only position queries to addresses `0x27` and `0x28` on the configured
+serial port and returns `detected_sides` and the selected `side`. `get_state`,
+`open`, `close`, `set_positions`, and `release` each recheck the bus
+and target the sole responding hand. Zero or two responding hands, a bad frame,
+or a serial error prevents those actions from using an ambiguous target.
+`set_torque` only changes later command settings and never writes
+to the device immediately. The `side` setting remains a fallback when automatic
+detection is disabled. This stage still scans only one configured serial port.
+The canvas card name remains `hand`; its `info` result describes the detected
+left/right side, but the card header does not live-rename on USB hot-plug.
 
 For local tests without hardware:
 
@@ -76,8 +88,18 @@ controllers against the same port simultaneously.
 `driver.yaml` declares one actuator card, `hand`. Once the driver is deployed
 and registered, Agent Core discovers its `get_tool()` schema and the canvas
 renders the card automatically; no custom frontend component is required.
-The card title is **L20 Lite 灵巧手**. It offers `get_state`, `open`, `close`,
-`set_joint`, `set_positions`, `set_speed`, `set_torque` and `release`. The
-`set_positions` canvas field accepts ten comma-separated numbers in joint
-order; direct Python calls may still pass a ten-element list. `start` and
-`stop` are canvas lifecycle actions, with `stop` also releasing torque.
+The card title is **L20 Lite 灵巧手**. It offers read-only `info`, `get_state`,
+`open`, `close`, `set_positions`, `set_torque` and `release`. `set_positions`
+uses ten individual joint fields; fields left blank keep their current measured
+values. The former CSV `positions`, `set_joint`, and `set_speed` controls are
+not exposed or accepted. `start` and `stop` are canvas lifecycle actions, with
+`stop` also releasing torque.
+`set_torque` starts at the configured value of 100, affects later motions only,
+and returns to the configured value when the driver restarts.
+
+All three motion actions accept `speed_ratio` from `1.0x` to
+`3.0x` and `hold_torque`. By default `hold_torque=true` preserves the existing
+driver behavior; choose `false` to release torque after reaching the target.
+Invalid options are rejected before serial access. Every motion still needs
+`confirm_motion=true`, and all actions still detect the sole responding hand
+on the configured serial port before touching hardware.

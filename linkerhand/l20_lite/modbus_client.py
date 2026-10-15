@@ -136,6 +136,18 @@ class L20LiteModbusClient:
     def get_positions(self) -> list[int]:
         return self._read_registers(POSITION_REGISTER)
 
+    def probe_positions(self, side: str) -> list[int]:
+        """Read one known hand address without changing the client's target."""
+        if side not in ("left", "right"):
+            raise ValueError("side must be left or right")
+        with self._lock:
+            previous_id = self.slave_id
+            self.slave_id = RIGHT_HAND_ID if side == "right" else LEFT_HAND_ID
+            try:
+                return self.get_positions()
+            finally:
+                self.slave_id = previous_id
+
     def get_speeds(self) -> list[int]:
         return self._read_registers(SPEED_REGISTER)
 

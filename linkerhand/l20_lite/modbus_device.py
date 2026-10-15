@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-import re
 import json
 import os
 import ssl
@@ -18,7 +17,21 @@ JOINT_NAMES = [
     "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
     "pinky_root", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
 ]
-MOTION_ACTIONS = ("open", "close", "set_joint", "set_positions")
+MOTION_ACTIONS = ("open", "close", "set_positions")
+STANDARD_JOINT_NAMES = [
+    "thumb_flex", "thumb_sway", "index_flex", "middle_flex", "ring_flex",
+    "pinky_flex", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
+]
+CHINESE_JOINT_NAMES = [
+    "拇指弯曲", "拇指侧摆", "食指弯曲", "中指弯曲", "无名指弯曲",
+    "小指弯曲", "食指侧摆", "中指侧摆", "无名指侧摆", "拇指旋转",
+]
+JOINT_FIELDS = {name: index for index, name in enumerate(STANDARD_JOINT_NAMES)}
+STRUCTURED_POSITION_FIELDS = [
+    "thumb_flex", "index_flex", "middle_flex", "ring_flex", "pinky_flex",
+    "thumb_sway", "thumb_roll", "index_sway", "middle_sway", "ring_sway",
+]
+SPEED_RATIOS = {f"{ratio:.1f}x": ratio for ratio in (1.0, 1.5, 2.0, 2.5, 3.0)}
 
 # These poses were confirmed on the connected RIGHT hand. They are examples for
 # this unit, not universal defaults: close requires an explicit fist_pose in
@@ -29,16 +42,6 @@ RIGHT_FIST_POSE = [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
 
 def _named(values: list[int]) -> dict[str, int]:
     return dict(zip(JOINT_NAMES, values))
-
-
-def _positions_from_card(value) -> list[int]:
-    """Accept a 10-value list or the CSV text emitted by the canvas form."""
-    if isinstance(value, str):
-        parts = re.split(r"[\s,]+", value.strip())
-        if not parts or any(not re.fullmatch(r"\d+", part) for part in parts):
-            raise ValueError("positions must be 10 comma-separated integers in 0..255")
-        value = [int(part) for part in parts]
-    return _bytes(value)
 
 
 class L20LiteConnection:
@@ -54,14 +57,44 @@ class L20LiteConnection:
         self._client: L20LiteModbusClient | None = None
         self._lock = threading.Lock()
 
-    def get(self) -> L20LiteModbusClient:
+    def get(self, side: str | None = None) -> L20LiteModbusClient:
+        target_side = side or self.side
+        if target_side not in ("left", "right"):
+            raise ValueError("side must be left or right")
         with self._lock:
+            if self._client is not None and self._client.side != target_side:
+                self._client.close()
+                self._client = None
             if self._client is None:
                 self._client = L20LiteModbusClient(
-                    self.port, self.side, baudrate=self.baudrate,
+                    self.port, target_side, baudrate=self.baudrate,
                     timeout_s=self.timeout_s,
                 )
             return self._client
+
+    def detect_sides(self) -> list[str]:
+        """Probe only the two known slave IDs using read-only position frames."""
+        with self._lock:
+            client = self._client
+        if client is None:
+            client = self.get()
+        found = []
+        try:
+            for side in ("right", "left"):
+                try:
+                    client.probe_positions(side)
+                except TimeoutError:
+                    continue
+                found.append(side)
+        except Exception:
+            # A bad frame or disconnected adapter is not evidence of absence.
+            self.close()
+            raise
+        if not found:
+            # A USB adapter may have been unplugged and reinserted at this path.
+            # Do not keep a stale file descriptor across the next probe.
+            self.close()
+        return found
 
     def close(self) -> None:
         with self._lock:
@@ -81,8 +114,12 @@ class HandPlugin:
             raise ValueError("fist_pose must be explicitly calibrated and configured before enabling close")
         self.open_pose = _bytes(config.get("open_pose", RIGHT_OPEN_POSE))
         self.fist_pose = _bytes(config["fist_pose"])
+        self.auto_detect_gestures = config.get("auto_detect_gestures", False)
+        if not isinstance(self.auto_detect_gestures, bool):
+            raise ValueError("auto_detect_gestures must be a boolean")
         self.motion_speed = self._setting(config.get("motion_speed", 60), "motion_speed")
         self.motion_torque = self._setting(config.get("motion_torque", 100), "motion_torque")
+        self.initial_motion_torque = self.motion_torque
         self.motion_timeout_s = float(config.get("motion_timeout_s", 8.0))
         self.position_tolerance = int(config.get("position_tolerance", 6))
         self.poll_interval_s = float(config.get("poll_interval_s", 0.2))
@@ -98,6 +135,8 @@ class HandPlugin:
         self._active: dict | None = None
         self._last_result: dict | None = None
         self._completion_delivery_failed = False
+        self._detected_sides: list[str] = []
+        self._detection_error: str | None = None
 
     @staticmethod
     def _setting(value, name: str) -> int:
@@ -105,24 +144,41 @@ class HandPlugin:
             raise ValueError(f"{name} must be an integer in 1..255")
         return value
 
+    def _motion_options(self, args: dict) -> tuple[int, bool]:
+        ratio = args.get("speed_ratio", "1.0x")
+        if not isinstance(ratio, str) or ratio not in SPEED_RATIOS:
+            raise ValueError("speed_ratio must be one of 1.0x, 1.5x, 2.0x, 2.5x, 3.0x")
+        hold = args.get("hold_torque", True)
+        if isinstance(hold, str) and hold.lower() in ("true", "false"):
+            hold = hold.lower() == "true"
+        if not isinstance(hold, bool):
+            raise ValueError("hold_torque must be a boolean")
+        return min(255, max(1, round(self.motion_speed * SPEED_RATIOS[ratio]))), hold
+
     def get_tool(self) -> dict:
         schema = action_schema(
             {
+                "info": ([], "只读检测已连接的左右手及数量，不驱动手指"),
                 "get_state": ([], "读取 10 个关节位置和速度"),
-                "open": (["confirm_motion"], "展开到已验证的右手姿态；每次运动需确认"),
-                "close": (["confirm_motion"], "握拳到当前设备已校准的姿态；每次运动需确认"),
-                "set_joint": (["joint", "position", "confirm_motion"], "设置单关节位置 0..255；每次运动需确认"),
-                "set_positions": (["positions", "confirm_motion"], "按关节顺序设置 10 个位置；画布输入逗号分隔值；每次运动需确认"),
-                "set_speed": (["speed"], "配置后续动作速度，不立即驱动"),
-                "set_torque": (["torque"], "配置后续动作力矩，不立即驱动"),
+                "open": (["speed_ratio", "hold_torque", "confirm_motion"], "展开到已校准姿态；可选倍速和到位泄力；每次运动需确认"),
+                "close": (["speed_ratio", "hold_torque", "confirm_motion"], "握拳到已校准姿态；可选倍速和到位泄力；每次运动需确认"),
+                "set_positions": ([*STRUCTURED_POSITION_FIELDS, "speed_ratio", "hold_torque", "confirm_motion"], "按需填写各关节位置；留空保持原位；每次运动需确认"),
+                "set_torque": (["torque"], f"配置后续动作力矩；初始值 {self.initial_motion_torque}，重启后恢复；不立即驱动"),
                 "release": ([], "立即将所有关节力矩设为 0"),
             },
             {
-                "joint": {"type": "string", "enum": JOINT_NAMES},
-                "position": {"type": "integer", "minimum": 0, "maximum": 255},
-                "positions": {"type": "string", "description": "10 个位置，逗号分隔，如 254,254,234,254,254,254,127,126,127,254"},
-                "speed": {"type": "integer", "minimum": 1, "maximum": 255},
-                "torque": {"type": "integer", "minimum": 1, "maximum": 255},
+                **{
+                    name: {"type": "integer", "minimum": 0, "maximum": 255,
+                           "description": f"{CHINESE_JOINT_NAMES[JOINT_FIELDS[name]]}，留空保持当前位置"}
+                    for name in STRUCTURED_POSITION_FIELDS
+                },
+                "speed_ratio": {"type": "string", "enum": list(SPEED_RATIOS),
+                                "description": "相对当前设置速度的倍率，最高 255"},
+                "hold_torque": {"type": "boolean", "enum": [True, False],
+                                "description": "默认 true 保持原有行为；false 在到位后释放力矩"},
+                "torque": {"type": "integer", "minimum": 1, "maximum": 255,
+                           "default": self.initial_motion_torque,
+                           "description": f"初始值 {self.initial_motion_torque}；仅影响后续动作"},
                 "confirm_motion": {"type": "boolean", "const": True, "description": "确认手附近无人和障碍物后，每次运动显式输入 true"},
             },
         )
@@ -157,19 +213,38 @@ class HandPlugin:
         finally:
             self.connection.close()
 
-    def _move(self, target: list[int], action: str) -> dict:
+    def _detect_sides(self) -> list[str]:
+        try:
+            sides = self.connection.detect_sides()
+        except Exception as exc:
+            with self._state_lock:
+                self._detected_sides = []
+                self._detection_error = str(exc)
+            raise
+        with self._state_lock:
+            self._detected_sides = sides
+            self._detection_error = None
+        return sides
+
+    def _move(self, target: list[int], action: str, *, side: str | None = None,
+              speed: int | None = None, hold_torque: bool = True) -> dict:
         with self._motion_lock:
             if self._stop_requested.is_set():
                 raise InterruptedError("hand motion stopped")
-            client = self.connection.get()
+            client = self.connection.get(side) if side is not None else self.connection.get()
+            active_side = side or self.connection.side
+            actual_speed = self.motion_speed if speed is None else speed
             current = client.get_positions()  # fail closed if no valid reply
             if all(abs(a - b) <= self.position_tolerance for a, b in zip(current, target)):
-                return {"state": "already_at_target", "action": action, "positions": _named(current)}
+                if not hold_torque:
+                    client.set_torques([0] * JOINT_COUNT)
+                return {"state": "already_at_target", "action": action, "side": active_side,
+                        "positions": _named(current), "torque_released": not hold_torque}
             if self._stop_requested.is_set():
                 raise InterruptedError("hand motion stopped")
             energized = False
             try:
-                client.set_speeds([self.motion_speed] * JOINT_COUNT)
+                client.set_speeds([actual_speed] * JOINT_COUNT)
                 energized = True
                 client.set_torques([self.motion_torque] * JOINT_COUNT)
                 if self._stop_requested.is_set():
@@ -187,14 +262,17 @@ class HandPlugin:
                         raise InterruptedError("hand motion stopped")
                     measured = client.get_positions()
                     if all(abs(a - b) <= self.position_tolerance for a, b in zip(measured, target)):
+                        if not hold_torque:
+                            client.set_torques([0] * JOINT_COUNT)
                         return {
-                            "state": "completed", "action": action, "side": self.connection.side,
+                            "state": "completed", "action": action, "side": active_side,
                             "requested_positions": _named(target), "positions": _named(measured),
-                            "speed": self.motion_speed, "torque": self.motion_torque,
+                            "speed": actual_speed, "torque": self.motion_torque if hold_torque else 0,
+                            "torque_released": not hold_torque,
                         }
                 client.set_torques([0] * JOINT_COUNT)
                 return {
-                    "state": "released_timeout", "action": action, "side": self.connection.side,
+                    "state": "released_timeout", "action": action, "side": active_side,
                     "requested_positions": _named(target), "positions": _named(measured),
                     "torque_released": True,
                 }
@@ -237,18 +315,33 @@ class HandPlugin:
                     time.sleep(0.5)
         raise RuntimeError(f"ACP completion delivery failed: {error}")
 
+    @staticmethod
+    def _target_for_action(active: dict, client: L20LiteModbusClient) -> list[int]:
+        if active["action"] == "set_positions":
+            target = client.get_positions()
+            for index, value in active["joint_positions"].items():
+                target[index] = value
+            return target
+        return active["target"]
+
     def _run_motion(self, active: dict) -> None:
         action = active["action"]
         try:
-            if action == "set_joint":
-                with self._motion_lock:
-                    if self._stop_requested.is_set():
-                        raise InterruptedError("hand motion stopped")
-                    target = self.connection.get().get_positions()
-                    target[JOINT_NAMES.index(active["joint"])] = active["position"]
-                    result = self._move(target, action)
-            else:
-                result = self._move(active["target"], action)
+            with self._motion_lock:
+                if self._stop_requested.is_set():
+                    raise InterruptedError("hand motion stopped")
+                side = None
+                if self.auto_detect_gestures:
+                    sides = self._detect_sides()
+                    if len(sides) != 1:
+                        raise RuntimeError(f"expected exactly one hand, detected {sides}")
+                    side = sides[0]
+                if self._stop_requested.is_set():
+                    raise InterruptedError("hand motion stopped")
+                client = self.connection.get(side) if side is not None else self.connection.get()
+                target = self._target_for_action(active, client)
+                result = self._move(target, action, side=side, speed=active["speed"],
+                                    hold_torque=active["hold_torque"])
             status = "error" if result["state"] == "released_timeout" else "completed"
         except InterruptedError as exc:
             status, result = "cancelled", {"state": "cancelled", "message": str(exc)}
@@ -273,15 +366,20 @@ class HandPlugin:
 
     def _start_motion(self, action: str, args: dict) -> dict:
         # Validate all user input before accepting an ACP action or opening serial.
-        active = {"action": action, "action_id": f"hand_{action}_{uuid4().hex}"}
-        if action == "set_joint":
-            joint = args.get("joint")
-            if joint not in JOINT_NAMES:
-                raise ValueError(f"unknown joint: {joint}")
-            active["joint"] = joint
-            active["position"] = _bytes([args.get("position")], expected=1)[0]
-        elif action == "set_positions":
-            active["target"] = _positions_from_card(args.get("positions"))
+        speed, hold_torque = self._motion_options(args)
+        active = {"action": action, "action_id": f"hand_{action}_{uuid4().hex}",
+                  "speed": speed, "hold_torque": hold_torque}
+        if action == "set_positions":
+            if args.get("positions") not in (None, ""):
+                raise ValueError("positions CSV is no longer supported; use named joint fields")
+            joint_positions = {}
+            for field in STRUCTURED_POSITION_FIELDS:
+                value = args.get(field)
+                if value is not None and value != "":
+                    joint_positions[JOINT_FIELDS[field]] = _bytes([value], expected=1)[0]
+            if not joint_positions:
+                raise ValueError("at least one joint position must be specified")
+            active["joint_positions"] = joint_positions
         else:
             active["target"] = list(self.open_pose if action == "open" else self.fist_pose)
         with self._state_lock:
@@ -308,10 +406,27 @@ class HandPlugin:
         if action == "info":
             with self._state_lock:
                 active_id = self._active["action_id"] if self._active else None
+            if self.auto_detect_gestures and active_id is None:
+                try:
+                    with self._motion_lock:
+                        self._detect_sides()
+                except Exception:
+                    pass  # Surface the detection error in info; never guess a side.
+            with self._state_lock:
                 last_result = self._last_result
+                detected_sides = list(self._detected_sides)
+                detection_error = self._detection_error
+            detected_side = detected_sides[0] if len(detected_sides) == 1 else None
+            label = {"left": "左手", "right": "右手"}.get(
+                detected_side, "未检测到手" if not detected_sides else "同时检测到左右手",
+            )
             return {
-                "description": f"L20 Lite {self.connection.side} USB-RS485/Modbus 控制卡片",
-                "side": self.connection.side,
+                "description": f"L20 Lite {label} USB-RS485/Modbus 控制卡片" if self.auto_detect_gestures
+                               else f"L20 Lite {self.connection.side} USB-RS485/Modbus 控制卡片",
+                "side": detected_side if self.auto_detect_gestures else self.connection.side,
+                "detected_sides": detected_sides if self.auto_detect_gestures else [self.connection.side],
+                "detected_count": len(detected_sides) if self.auto_detect_gestures else 1,
+                "detection_error": detection_error if self.auto_detect_gestures else None,
                 "serial_port": self.connection.port,
                 "joint_names": JOINT_NAMES,
                 "active_action_id": active_id,
@@ -319,7 +434,14 @@ class HandPlugin:
             }
         if action == "get_state":
             with self._motion_lock:
-                client = self.connection.get()
+                if self.auto_detect_gestures:
+                    sides = self._detect_sides()
+                    if len(sides) != 1:
+                        raise RuntimeError(f"expected exactly one hand, detected {sides}")
+                    side = sides[0]
+                else:
+                    side = self.connection.side
+                client = self.connection.get(side)
                 positions = client.get_positions()
                 try:
                     speeds = _named(client.get_speeds())
@@ -327,7 +449,7 @@ class HandPlugin:
                     speeds = None
                     speed_error = str(exc)
             result = {
-                "state": "connected", "side": self.connection.side,
+                "state": "connected", "side": side,
                 "serial_port": self.connection.port, "positions": _named(positions),
                 "speeds": speeds, "timestamp_ms": int(time.time() * 1000),
             }
@@ -336,11 +458,6 @@ class HandPlugin:
             return result
         if action in MOTION_ACTIONS:
             return self._start_motion(action, args)
-        if action == "set_speed":
-            speed = self._setting(args.get("speed"), "speed")
-            with self._motion_lock:
-                self.motion_speed = speed
-            return {"state": "configured", "speed": speed, "applied": False}
         if action == "set_torque":
             torque = self._setting(args.get("torque"), "torque")
             with self._motion_lock:
@@ -350,12 +467,19 @@ class HandPlugin:
             self._stop_requested.set()
             with self._motion_lock:
                 # Canvas stop may arrive before the serial device was ever used.
-                client = self.connection._client
+                if action == "release" and self.auto_detect_gestures:
+                    sides = self._detect_sides()
+                    if len(sides) != 1:
+                        raise RuntimeError(f"expected exactly one hand, detected {sides}")
+                    client = self.connection.get(sides[0])
+                else:
+                    client = self.connection._client
                 if client is None:
                     return {"state": "idle" if action == "stop" else "released", "torque_released": True}
                 client.set_torques([0] * JOINT_COUNT)
                 positions = client.get_positions()
-            return {"state": "idle" if action == "stop" else "released", "positions": _named(positions), "torque_released": True}
+            return {"state": "idle" if action == "stop" else "released", "side": client.side,
+                    "positions": _named(positions), "torque_released": True}
         return None
 
 

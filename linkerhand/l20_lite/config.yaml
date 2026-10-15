@@ -6,6 +6,7 @@ ros:
   core_domain_id: 42
 
 name: "LinkerHand L20 Lite"
+# Fallback target when automatic detection is disabled.
 side: "right"
 serial_port: "/dev/ttyUSB0"
 baudrate: 115200
@@ -14,14 +15,17 @@ response_timeout_s: 0.5
 plugins:
   hand:
     enabled: true
+    # Auto-select the sole responding hand for reads, motion, and release.
+    # Keep the legacy setting name for compatibility with existing deployments.
+    auto_detect_gestures: true
     # Values used by the successful Ubuntu/USB-RS485 SDK hardware test.
     motion_speed: 60
     motion_torque: 100
     motion_timeout_s: 8.0
     position_tolerance: 6
     poll_interval_s: 0.2
-    # Calibrated on this specific right hand and confirmed by the operator with
-    # successful close/open motions. Recalibrate before deploying to another hand.
+    # The operator confirmed these open/close targets on both hands in this
+    # setup. Recalibrate before deploying to different hardware.
     # Joint order: thumb root/sway, four finger roots, index/middle/ring sway,
     # thumb roll. Values are 0..255 position units, not degrees.
     open_pose: [254, 254, 254, 254, 254, 254, 127, 126, 127, 254]
