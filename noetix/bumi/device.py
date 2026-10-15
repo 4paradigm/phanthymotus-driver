@@ -138,12 +138,14 @@ _WORKMODE_NAMES = {
 # ── loco_destination: angle math and rotate control law ──────────────────────
 
 _ROTATE_TOL_DEG = 2.0
-_ROTATE_WZ_STILL_RAD_S = 0.05
-_ROTATE_SETTLE_TICKS = 10
-_ROTATE_KP_PER_DEG = 0.05
-_ROTATE_VYAW_FULL = 0.6
-_ROTATE_VYAW_MID = 0.3
-_ROTATE_VYAW_SLOW = 0.15
+_ROTATE_WZ_STILL_RAD_S = 0.1
+_ROTATE_SETTLE_TICKS = 8
+_ROTATE_VYAW_FULL = 0.8                # cruise 满速（|err| > _ROTATE_CRUISE_EXIT_DEG）
+_ROTATE_CRUISE_EXIT_DEG = 20.0
+_ROTATE_PULSE_VYAW = 0.5               # creep 点动幅值（高于 0.4 stiction 死区）
+_ROTATE_PULSE_S_PER_DEG = 0.025
+_ROTATE_PULSE_MIN_S = 0.12
+_ROTATE_PULSE_MAX_S = 0.30
 _ROTATE_VYAW_SIGN = 1.0
 _ROTATE_ANGLE_LIMIT_DEG = 360.0
 
@@ -160,21 +162,17 @@ def _yaw_deg_from_quat(ori) -> float:
                                    1.0 - 2.0 * (y * y + z * z)))
 
 
-def _rotate_vyaw(err_deg: float) -> float:
-    """Signed vyaw for a heading error: P-term capped by segment speed."""
-    abs_err = abs(err_deg)
-    if abs_err >= 15:
-        cap = _ROTATE_VYAW_FULL
-    elif abs_err >= 5:
-        cap = _ROTATE_VYAW_MID
-    else:
-        cap = _ROTATE_VYAW_SLOW
-    return math.copysign(min(_ROTATE_KP_PER_DEG * abs_err, cap), err_deg)
+def _pulse_duration_s(err_deg: float, halvings: int = 0) -> float:
+    """Creep pulse width: clamp(0.025*|err|, 0.12, 0.30), halved once per past
+    overshoot and never below the 0.06 s floor (no chatter below that)."""
+    base = min(_ROTATE_PULSE_MAX_S,
+               max(_ROTATE_PULSE_MIN_S, _ROTATE_PULSE_S_PER_DEG * abs(err_deg)))
+    return max(0.06, base * 0.5 ** halvings)
 
 
 def _rotate_timeout_s(angle_deg: float) -> float:
-    """Rotate timeout in seconds, capped to stay under the 60s LLM budget."""
-    return min(45.0, 8.0 + abs(angle_deg) / 10.0)
+    """Whole-request rotate budget: 10 s + 1 s per 5°, capped at 75 s."""
+    return min(75.0, 10.0 + abs(angle_deg) / 5.0)
 
 
 # ── StatePlugin (sensor, multi-tool) ─────────────────────────────────────────
@@ -736,48 +734,115 @@ class LocoPlugin:
         if abs(remaining) > 1e-9:
             segments.append(remaining)
         try:
-            # 4. 50 Hz closed loop per segment on IMU yaw until settled, timed
-            # out, or stopped; each segment settles before the next starts.
+            # 4. 50 Hz three-phase closed loop (cruise → brake → creep) over
+            # chained ≤150° absolute sub-targets: cruise chains sub-targets with
+            # no settle between segments (advance at |err_sub| ≤ 2); the settle
+            # judgement runs once, on the final target.
             cumulative_angle = 0.0
-            for seg_angle in segments:
-                cumulative_angle += seg_angle
-                # Absolute sub-target: segment k aims at start_yaw + cumulative
-                # angle (the final one == the whole-request target), so each
-                # segment corrects prior settle shortfall and final_error_deg
-                # for the whole request stays within ±2°.
-                seg_target = start_yaw + cumulative_angle
-                still = 0
-                while True:
-                    imu = self._high_ctrl.get_imu_data()
-                    cur_yaw = _yaw_deg_from_quat(imu.ori)
-                    turned_deg += _wrap180(cur_yaw - prev_yaw)
-                    prev_yaw = cur_yaw
-                    end_yaw = cur_yaw
-                    err = _wrap180(seg_target - cur_yaw)
-                    wz = float(imu.angular_vel[2])
-                    if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
-                        still += 1
-                    else:
-                        still = 0
+            seg_i = 0
+            cumulative_angle += segments[seg_i]
+            # Absolute sub-target: segment k aims at start_yaw + cumulative
+            # angle (the final one == the whole-request target), so each
+            # segment corrects prior shortfall and final_error_deg for the
+            # whole request stays within ±2°.
+            seg_target = start_yaw + cumulative_angle
+            stage = "cruise"            # cruise → brake → creep, per segment
+            brake_started = 0.0
+            pulse_phase = None          # None | "pulse" | "coast"
+            pulse_end = 0.0
+            coast_end = 0.0
+            pulse_cmd = 0.0             # latched sign * PULSE_VYAW for a pulse
+            err_at_pulse = 0.0
+            halvings = 0                # overshoots seen within this segment
+            still = 0
+            while True:
+                imu = self._high_ctrl.get_imu_data()
+                cur_yaw = _yaw_deg_from_quat(imu.ori)
+                turned_deg += _wrap180(cur_yaw - prev_yaw)
+                prev_yaw = cur_yaw
+                end_yaw = cur_yaw
+                err = _wrap180(seg_target - cur_yaw)
+                wz = float(imu.angular_vel[2])
+                # Sub-target advance: |err_sub| ≤ 2 jumps straight to the next
+                # sub-target — no settle between segments; settle below runs
+                # only against the final target.
+                if seg_i + 1 < len(segments) and abs(err) <= _ROTATE_TOL_DEG:
+                    seg_i += 1
+                    cumulative_angle += segments[seg_i]
+                    seg_target = start_yaw + cumulative_angle
+                    stage = "cruise"
+                    pulse_phase = None
+                    halvings = 0
+                    still = 0
+                    continue
+                if time.monotonic() >= deadline:
+                    result_state = "timeout"
+                    break
+                if self._rotate_stop_event.is_set():
+                    result_state = "stopped"
+                    break
+                if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
+                    still += 1
                     if still >= _ROTATE_SETTLE_TICKS:
                         result_state = "done"
                         break
-                    if time.monotonic() >= deadline:
-                        result_state = "timeout"
-                        break
-                    if self._rotate_stop_event.is_set():
-                        result_state = "stopped"
-                        break
-                    if abs(err) <= _ROTATE_TOL_DEG:
-                        # Angle reached but not yet confirmed still: coast with zero cmd.
+                else:
+                    still = 0
+                if stage == "cruise" and abs(err) > _ROTATE_CRUISE_EXIT_DEG:
+                    # Cruise: full speed toward the sub-target (err signs the
+                    # direction; _ROTATE_VYAW_SIGN stays the axis calibration).
+                    self._publish_cmd(0.0, 0.0,
+                                      _ROTATE_VYAW_SIGN
+                                      * math.copysign(_ROTATE_VYAW_FULL, err),
+                                      default_cmd, 0)
+                else:
+                    if stage == "cruise":
+                        stage = "brake"
+                        brake_started = time.monotonic()
+                        pulse_phase = None
+                    if stage == "brake":
+                        # Brake: zero cmd until truly still (0.5 s cap) so
+                        # inertia is shed before creeping, without stalling.
                         self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
-                    else:
-                        self._publish_cmd(0.0, 0.0,
-                                          _ROTATE_VYAW_SIGN * _rotate_vyaw(err),
-                                          default_cmd, 0)
-                    time.sleep(0.02)  # 50 Hz
-                if result_state != "done":
-                    break  # timeout/stopped abort the remaining segments
+                        if (abs(wz) <= _ROTATE_WZ_STILL_RAD_S
+                                or time.monotonic() - brake_started >= 0.5):
+                            stage = "creep"
+                            pulse_phase = None
+                    elif abs(err) <= _ROTATE_TOL_DEG:
+                        # In tolerance but not yet confirmed still: coast with
+                        # zero cmd (settle counter above tracks it).
+                        pulse_phase = None
+                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                    elif pulse_phase is None:
+                        # Start one creep pulse above the stiction deadband;
+                        # latch its sign so a mid-pulse err flip cannot reverse
+                        # thrust. Width = clamp(0.025*|err|, 0.12, 0.30),
+                        # halved per past overshoot (floor 0.06 s).
+                        err_at_pulse = err
+                        pulse_end = time.monotonic() + _pulse_duration_s(err, halvings)
+                        pulse_cmd = (_ROTATE_VYAW_SIGN
+                                     * math.copysign(_ROTATE_PULSE_VYAW, err))
+                        pulse_phase = "pulse"
+                        self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0)
+                    elif pulse_phase == "pulse":
+                        if time.monotonic() < pulse_end:
+                            self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0)
+                        else:
+                            # Pulse over → coast on zero cmd and re-read yaw
+                            # until still (0.3 s cap) before the next pulse.
+                            coast_end = time.monotonic() + 0.3
+                            pulse_phase = "coast"
+                            self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                    else:  # coast
+                        if (abs(wz) <= _ROTATE_WZ_STILL_RAD_S
+                                or time.monotonic() >= coast_end):
+                            # Overshoot = err flipped sign across the pulse:
+                            # all subsequent pulse widths halve (floor 0.06 s).
+                            if err * err_at_pulse < 0:
+                                halvings += 1
+                            pulse_phase = None
+                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                time.sleep(0.02)  # 50 Hz
         finally:
             # Every exit path — including exceptions — brakes to zero velocity.
             self._publish_cmd(0, 0, 0, default_cmd, 0)

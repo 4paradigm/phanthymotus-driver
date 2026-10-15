@@ -83,20 +83,31 @@ def test_yaw_deg_from_sdk_quaternion(monkeypatch):
         assert abs(module._yaw_deg_from_quat(ori) - theta) < 1e-6
 
 
-def test_rotate_vyaw_uses_three_segment_profile(monkeypatch):
+def test_pulse_law_pins(monkeypatch):
+    # 三段式 creep 脉宽公式（旧 P 律测试的唯一废除替换）：
+    # clamp(0.025*|err|, 0.12, 0.30)，过冲后逐次减半、下限 0.06s。
     module, _ = _load_device(monkeypatch)
-    assert module._rotate_vyaw(60) == 0.6
-    assert module._rotate_vyaw(-30) == -0.6
-    assert module._rotate_vyaw(10) == 0.3        # P 段被段速封顶
-    assert abs(module._rotate_vyaw(3) - 0.15) < 1e-9   # min(0.15, 0.15)
-    assert abs(module._rotate_vyaw(-2.5) + 0.125) < 1e-9  # P 段未触顶
+    pulse = module._pulse_duration_s
+    assert pulse(60) == pytest.approx(0.30)      # 0.025*60=1.5 → 上限 0.30
+    assert pulse(12) == pytest.approx(0.30)      # 0.025*12=0.30 → 恰在上限
+    assert pulse(8) == pytest.approx(0.20)       # 段内线性
+    assert pulse(4.8) == pytest.approx(0.12)     # 0.025*4.8=0.12 → 恰在下限
+    assert pulse(1) == pytest.approx(0.12)       # 低于下限 → 0.12
+    assert pulse(0) == pytest.approx(0.12)
+    assert pulse(-60) == pytest.approx(0.30)     # 负向误差取绝对值
+    # 过冲减半：后续脉宽 ×0.5，减半后仍不得低于 0.06s 下限
+    assert pulse(60, 1) == pytest.approx(0.15)
+    assert pulse(8, 1) == pytest.approx(0.10)
+    assert pulse(4.8, 1) == pytest.approx(0.06)  # 0.12/2 = 0.06 = floor
+    assert pulse(4.8, 2) == pytest.approx(0.06)  # 再减半仍在 floor
+    assert pulse(1, 5) == pytest.approx(0.06)    # 多次减半不会跌破 floor
 
 
 def test_rotate_timeout_s_stays_under_llm_budget(monkeypatch):
     module, _ = _load_device(monkeypatch)
-    assert module._rotate_timeout_s(60) == 14.0
-    assert module._rotate_timeout_s(360) == 44.0
-    assert all(module._rotate_timeout_s(a) <= 45.0 for a in (0.5, 60, 180, 360))  # < agent-core 60s
+    assert module._rotate_timeout_s(60) == 22.0
+    assert module._rotate_timeout_s(360) == 75.0
+    assert all(module._rotate_timeout_s(a) <= 75.0 for a in (0.5, 60, 180, 360))  # 封顶 75s
 
 
 class FakeHighCtrl:
@@ -513,6 +524,59 @@ def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):
     result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': -60})
     assert result['state'] == 'done'
     assert -66 <= result['turned_deg'] <= -54
+    assert abs(result['final_error_deg']) <= 2.0
+    assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
+
+
+# ── realistic 植物症状回归：stiction 小角度 / 极限环 / 整圈契约 ───────────────
+
+def _vyaw_sign_flips(cmds):
+    """vyaw 非零命令序列的变号次数：零速滑行帧排除、不打断变号判定。"""
+    flips, last = 0, 0.0
+    for _, _, z in cmds:
+        if z == 0:
+            continue
+        if last and (z > 0) != (last > 0):
+            flips += 1
+        last = z
+    return flips
+
+
+def test_small_angle_reaches_target_despite_stiction(monkeypatch):
+    # 10° 在 realistic 植物上：旧 P 律给 |err|=10 → 0.3（<0.4 死区）→ 永不动、
+    # 超时收场；三段式 creep 发 0.5 点动必须推过 stiction 并收敛到 ±2° 内。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(plant="realistic")
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 10})
+    assert result['state'] == 'done'
+    assert abs(result['final_error_deg']) <= 2.0
+    assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
+
+
+def test_no_limit_cycle_on_20_and_90(monkeypatch):
+    # 20°/90° 在 realistic 植物上：旧 P 律进 |err|<15 段给 0.3 死区卡住，叠加
+    # 一阶迟滞惯性即真机的极限环抖动；三段式必须收敛且 vyaw 非零命令变号 ≤ 2。
+    module, _ = _load_device(monkeypatch)
+    for angle in (20, 90):
+        fake = FakeHighCtrl(plant="realistic")
+        plugin = _rotate_plugin(module, monkeypatch, fake)
+        result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': angle})
+        assert result['state'] == 'done', f"{angle}°: {result}"
+        assert abs(result['final_error_deg']) <= 2.0, f"{angle}°: {result}"
+        flips = _vyaw_sign_flips(fake.cmds)
+        assert flips <= 2, f"{angle}° 极限环：vyaw 非零命令变号 {flips} 次"
+
+
+def test_realistic_plant_full_turn_contract(monkeypatch):
+    # 360° 整圈在 realistic 植物上沿用既有契约：done、实际转过 ∈ [354,366]、
+    # 整请求残差 ±2°（stiction/迟滞下旧 P 律在首段即卡死 → 超时）。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(plant="realistic")
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 360})
+    assert result['state'] == 'done'
+    assert 354 <= result['turned_deg'] <= 366
     assert abs(result['final_error_deg']) <= 2.0
     assert fake.cmds[-1] == (0, 0, 0)                   # 退出必零速
 
