@@ -14,7 +14,7 @@ plugins:
   loco:
     enabled: true
   loco_relative_move:
-    enabled: false  # Experimental direct chassis control; explicitly opt in after validation.
+    enabled: true
     # Closed-loop speed caps; requires the loco_state and IMU publishers below.
     translation_speed: 0.3
     min_translation_speed: 0.2  # Minimum nonzero component per active body axis.
