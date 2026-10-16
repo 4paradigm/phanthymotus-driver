@@ -58,6 +58,7 @@ COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY av_recording.py /work/av_recording.py
 COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py
 COPY servo_eef.py /work/servo_eef.py
