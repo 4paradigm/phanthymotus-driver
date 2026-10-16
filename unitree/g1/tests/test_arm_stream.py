@@ -384,6 +384,32 @@ def test_raw_motor_telemetry_does_not_gate_arm_but_invalid_sample_does(tmp_path)
     with pytest.raises(ValueError,match='arm_feedback_invalid'): arm._fresh()
 
 
+def test_normal_arm_substate_changes_preserve_authorization_epoch(tmp_path):
+    arm, _, _, advance, _, _ = rig(tmp_path, claim=False)
+    arm._on_fsm(SimpleNamespace(fsm_id=801, fsm_mode=0))
+    epoch = arm.feedback_epoch
+    for mode in (3, 0, 3):
+        advance(10)
+        arm._on_fsm(SimpleNamespace(fsm_id=801, fsm_mode=mode))
+        assert arm.feedback_epoch == epoch
+        assert arm._fsm['fsm_mode'] == mode
+    advance(101)
+    arm._on_fsm(SimpleNamespace(fsm_id=801, fsm_mode=0))
+    assert arm.feedback_epoch == epoch + 1
+
+
+@pytest.mark.parametrize('before,after', [
+    ((801, 0), (801, 1)), ((801, 3), (500, 3)),
+    ((500, 0), (500, 3)), ((801, 1), (801, 0)),
+])
+def test_other_fsm_changes_revoke_authorization_epoch(tmp_path, before, after):
+    arm, *_ = rig(tmp_path, claim=False)
+    arm._on_fsm(SimpleNamespace(fsm_id=before[0], fsm_mode=before[1]))
+    epoch = arm.feedback_epoch
+    arm._on_fsm(SimpleNamespace(fsm_id=after[0], fsm_mode=after[1]))
+    assert arm.feedback_epoch == epoch + 1
+
+
 def test_duplicate_stop_while_confirming_handback_does_not_invent_vendor_action(tmp_path):
     arm,_,ch,advance,_,sdk=rig(tmp_path)
     arm.dispatch('stop',{})

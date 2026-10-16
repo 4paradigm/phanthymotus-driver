@@ -202,10 +202,18 @@ class ArmStreamExecutor:
     def _on_fsm(self, msg):
         with self.lock:
             now = self.clock()
+            previous = (self._fsm.get('fsm_id'), self._fsm.get('fsm_mode'))
+            current = (int(msg.fsm_id), int(msg.fsm_mode))
+            # Unitree supports arm actions in both 801 substates 0 and 3.
+            # Normal arm takeover crosses between them without changing the
+            # operator's motion mode. Other transitions still revoke grants.
+            arm_substates = {(801, 0), (801, 3)}
+            mode_changed = previous != current and not (
+                previous in arm_substates and current in arm_substates)
             if self._fsm['arm_ns'] and (now-self._fsm['arm_ns'] > 100_000_000 or
-                    (self._fsm.get('fsm_id'), self._fsm.get('fsm_mode')) != (int(msg.fsm_id), int(msg.fsm_mode))):
+                    mode_changed):
                 self.feedback_epoch += 1
-            self._fsm = {'arm_ns':now,'fsm_id':int(msg.fsm_id),'fsm_mode':int(msg.fsm_mode)}
+            self._fsm = {'arm_ns':now,'fsm_id':current[0],'fsm_mode':current[1]}
 
     def _snapshot(self):
         return copy.deepcopy(self._snapshot_provider() if self._snapshot_provider else self._feedback)
