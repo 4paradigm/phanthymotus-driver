@@ -139,6 +139,60 @@ play-teach mode and confirms the return to walking.
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
 unexposed.
 
+### `loco_destination`
+
+A motion card on the `loco` plugin: turn in place by the requested angle —
+angle as motion, not velocity × duration. A 50 Hz closed loop reads IMU yaw
+and runs a three-phase trip (replacing the earlier P-term law): **cruise**
+drives `vyaw` at full 0.8 while more than 20° of error remains, **brake**
+commands zero velocity until the gyro settles (|wz| ≤ 0.1 rad/s, 0.5 s cap),
+then **creep** fires 0.5-amplitude pulses, initially 0.025 s per degree of
+remaining error (clamped to 0.12–0.30 s). After each pulse it holds zero for
+at least 0.3 s and waits for eight low-gyro samples whose heading errors
+span at most 0.5°. The measured turn per second of pulse sets the next
+width with a 30% margin, still bounded to 0.12–0.30 s. A transient crossing
+of the target band cannot immediately restart a pulse. Three consecutive
+corrections improving absolute error by less than 0.1° stop with `error`
+and report the actual remaining error, rather than claiming arrival.
+The gait does not move below ~0.4 vyaw — its stiction deadband — so creep
+pulses at 0.5 to break it loose, while the brake sheds the inertia that
+would carry the robot past the target; the loop drives the turn to its ±2°
+arrival tolerance despite both. That is the closed-loop answer to `loco`'s
+open-loop `move`, where velocity × duration leaves the actual turn to
+ground slip and payload and reports nothing back: `loco_destination`
+measures where the robot really turned instead.
+
+- Actions and parameters: `rotate angle_deg` returns immediately with
+  `state: running`, an `action_id` and `expected_duration_s`; the motion
+  runs on a background thread and its terminal result (`done` → completed,
+  `stopped` → cancelled, `timeout` → error, `error` → error) is posted
+  exactly once to `AGENT_CORE_URL/api/acp/complete`, which is how Agent
+  Core releases the waiting LLM barrier (a delivery failure is logged, not
+  retried). `expected_duration_s` is the whole-request timeout budget, not
+  a completion promise. Validation, workmode and busy refusals return
+  synchronously as `error` with no `action_id`. `angle_deg` spans −360 to
+  360 degrees (positive = counter-clockwise/left) and requires walking
+  mode, flat non-slip ground and at least 1 m clearance. `stop_move`
+  brakes an active rotation immediately (also the `on_interrupt_motion`
+  hook). `status` reports `idle`/`running` plus `last_result`, the full
+  result of the most recent completed rotation. As with the vision card, a
+  canvas-UI invocation registers no ACP barrier (Agent Core behavior), so
+  nothing blocks on its completion.
+- Tolerance: `done` requires the angle error inside ±2° while yaw is nearly
+  still (|wz| ≤ 0.1 rad/s for 8 consecutive frames); a request beyond 150°
+  is split into chained ≤150° absolute sub-targets so the turn goes the
+  requested way and the whole request keeps its ±2° accuracy. Timeout and
+  stopped exits brake first and still report the actually turned degrees
+  and the final error against the requested angle.
+- Tuning constants (initial values, calibratable on the robot): cruise 0.8
+  full speed above 20° error; creep pulse 0.5; pulse width 0.025 s per
+  degree initially, then adjusted from measured response, always clamped
+  to 0.12–0.30 s; zero-command observation at least 0.3 s;
+  arrival tolerance ±2°; settle |wz| ≤ 0.1 rad/s; timeout
+  `min(75, 10 + |angle_deg|/5)` seconds.
+- No distance feedback: the card consumes IMU heading only and reports
+  angles, never meters. Distance feedback is not part of this card today.
+
 ## `speaker`
 
 Plays the PCM audio of its connected input topic (`audio_msgs/AudioChunk`, mono

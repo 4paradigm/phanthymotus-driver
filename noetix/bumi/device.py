@@ -135,6 +135,52 @@ _WORKMODE_NAMES = {
     29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2", 33: "tear",
 }
 
+# ── loco_destination: angle math and rotate control law ──────────────────────
+
+_ROTATE_TOL_DEG = 2.0
+_ROTATE_WZ_STILL_RAD_S = 0.1
+_ROTATE_SETTLE_TICKS = 8
+_ROTATE_VYAW_FULL = 0.8                # cruise 满速（|err| > _ROTATE_CRUISE_EXIT_DEG）
+_ROTATE_CRUISE_EXIT_DEG = 20.0
+_ROTATE_PULSE_VYAW = 0.5               # creep 点动幅值（高于 0.4 stiction 死区）
+_ROTATE_PULSE_S_PER_DEG = 0.025
+_ROTATE_PULSE_MIN_S = 0.12
+_ROTATE_PULSE_MAX_S = 0.30
+_ROTATE_OBSERVE_S = 0.30
+_ROTATE_OBSERVE_SPREAD_DEG = 0.5
+_ROTATE_MIN_PROGRESS_DEG = 0.1
+_ROTATE_NO_PROGRESS_LIMIT = 3
+_ROTATE_VYAW_SIGN = 1.0
+_ROTATE_ANGLE_LIMIT_DEG = 360.0
+
+
+def _wrap180(deg: float) -> float:
+    """Normalize an angle in degrees to [-180, 180)."""
+    return ((deg + 180) % 360) - 180
+
+
+def _yaw_deg_from_quat(ori) -> float:
+    """Yaw in degrees from an SDK-order [x, y, z, w] quaternion, in (-180, 180]."""
+    x, y, z, w = ori
+    norm = math.hypot(x, y, z, w)
+    if not math.isfinite(norm) or norm == 0:
+        raise ValueError("IMU quaternion must be finite and nonzero")
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return math.degrees(math.atan2(2.0 * (w * z + x * y),
+                                   1.0 - 2.0 * (y * y + z * z)))
+
+
+def _pulse_duration_s(err_deg: float, measured_rate: float | None = None) -> float:
+    """Use the last settled pulse response, with margin against overshoot."""
+    duration = (0.7 * abs(err_deg) / measured_rate if measured_rate is not None
+                else _ROTATE_PULSE_S_PER_DEG * abs(err_deg))
+    return min(_ROTATE_PULSE_MAX_S, max(_ROTATE_PULSE_MIN_S, duration))
+
+
+def _rotate_timeout_s(angle_deg: float) -> float:
+    """Whole-request rotate budget: 10 s + 1 s per 5°, capped at 75 s."""
+    return min(75.0, 10.0 + abs(angle_deg) / 5.0)
+
 
 # ── StatePlugin (sensor, multi-tool) ─────────────────────────────────────────
 
@@ -314,10 +360,19 @@ class LocoPlugin:
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
+        # loco_destination rotate bookkeeping, read by _rotate_status.
+        self._rotate_lock = threading.Lock()
+        self._rotate_stop_event = threading.Event()
+        self._rotate_state: dict = {"state": "idle", "last_result": None}
+        # ACP async completion for rotate: worker thread + the single active
+        # action whose terminal callback fires exactly once.
+        self._rotate_worker: threading.Thread | None = None
+        self._active_action_id: str | None = None
 
     def get_tools(self) -> list:
         return [
             self._loco_tool(),
+            self._loco_destination_tool(),
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
@@ -368,6 +423,32 @@ class LocoPlugin:
                         "description": "Stop all movement immediately.",
                     },
                 },
+            },
+            "topic_out": [],
+        }
+
+    def _loco_destination_tool(self) -> dict:
+        return {
+            "name": "loco_destination", "type": "actuator", "multiInstance": False,
+            "description": "Bumi 有目标的转角运动——IMU 航向闭环原地转过指定角度后自动刹停。执行前确认机器人已处于行走模式、地面平坦防滑，旋转范围内留出至少 1m 半径无人无障碍空间。到达有 ±2° 容差；超时会刹停并返回实际转角。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["rotate", "stop_move", "status"]},
+                    "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
+                                  "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
+                    "stop_move": {"params": [], "description": "立即停止当前转角动作并刹停。"},
+                    "status": {"params": [], "description": "查询当前转角动作状态。"},
+                },
+                "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
+                # rotate 经后台线程异步完成，终态由 Agent Core 的 /api/acp/complete
+                # 回调上报；90 = _rotate_timeout_s(360) + 15。
+                "x-completion": {"actions": ["rotate"],
+                                 "timeout": _rotate_timeout_s(360) + 15},
             },
             "topic_out": [],
         }
@@ -463,7 +544,29 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
+        # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
+        # stop event ends the running rotate as "stopped", and the worker's
+        # own completion fires the ACP "cancelled" callback — joining here
+        # completes the ACP action before Agent Core is left holding a
+        # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
+        # Cover the dispatch-acceptance window: stop may land after the
+        # reservation (state=running) but before the worker thread exists
+        # (mid-preflight, or between assigning _rotate_worker and start()).
+        # Loop until the worker shows up, then join it; if the reservation
+        # resolves to a sync refusal (state flips idle, no worker), no ACP
+        # action was ever opened and there is nothing to join.
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            with self._rotate_lock:
+                state_running = self._rotate_state["state"] == "running"
+                worker = self._rotate_worker
+            if not state_running:
+                return
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+                return
+            time.sleep(0.01)   # accepted but worker not yet started
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -478,6 +581,12 @@ class LocoPlugin:
             return self._do_move(args)
         if tool_name == "loco" and action == "stop_move":
             return self._stop_move()
+        if tool_name == "loco_destination" and action == "rotate":
+            return self._do_rotate(args)
+        if tool_name == "loco_destination" and action == "stop_move":
+            return self._stop_move()
+        if tool_name == "loco_destination" and action == "status":
+            return self._rotate_status()
         if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
             return self._do_posture_action(action, args)
         if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
@@ -486,17 +595,36 @@ class LocoPlugin:
             return self._do_teaching_action(action, args)
         return None
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
+                     *, cancel_event: threading.Event | None = None):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
             if elapsed < 0.002:
                 time.sleep(0.002 - elapsed)
+            # Recheck after taking the brake's publish lock, including any
+            # rate-limit wait: a cancelled rotation must not restart motion.
+            if cancel_event is not None and cancel_event.is_set():
+                return
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
 
     def _do_move(self, args: dict) -> dict:
+        # Reserve move startup until its worker exists, so rotate cannot
+        # enter between the busy check and launching the move thread.
+        with self._rotate_lock:
+            if self._rotate_state["state"] == "running":
+                return {
+                    "state": "error",
+                    "error": (
+                        "loco_destination rotate in progress; wait for it to "
+                        "finish or call stop_move first"
+                    ),
+                }
+            return self._do_move_impl(args)
+
+    def _do_move_impl(self, args: dict) -> dict:
         # Check if in walking mode
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
@@ -551,12 +679,344 @@ class LocoPlugin:
             return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
 
     def _stop_move(self) -> dict:
+        self._rotate_stop_event.set()
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
         if self._high_ctrl is not None:
             self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
         return {"state": "stopped"}
+
+    def _do_rotate(self, args: dict) -> dict:
+        # Sync entry: reserve one rotation atomically (busy-guard + clear
+        # cancellation) before exposing running status, then run the
+        # pre-flight checks. Validation/mode refusals complete here, before
+        # any motion starts, so they return synchronously WITHOUT an
+        # action_id (never ACP-wrapped). Anything that will move is handed
+        # to the bumi_rotate daemon thread, which records idle + the full
+        # result and fires the ACP terminal exactly once.
+        with self._rotate_lock:
+            if self._rotate_state["state"] == "running":
+                return {
+                    "state": "error",
+                    "error": (
+                        "loco_destination rotate in progress; wait for it to "
+                        "finish or call stop_move first"
+                    ),
+                }
+            self._rotate_stop_event.clear()
+            self._rotate_state["state"] = "running"
+        try:
+            angle_deg, terminal = self._rotate_preflight(args)
+            if terminal is None:
+                expected_duration_s = _rotate_timeout_s(angle_deg)
+                action_id = f"bumi_loco_destination_{time.time_ns()}"
+                worker = threading.Thread(target=self._do_rotate_worker,
+                                          args=(args, action_id),
+                                          daemon=True, name="bumi_rotate")
+                with self._rotate_lock:
+                    self._active_action_id = action_id
+                    self._rotate_worker = worker
+                worker.start()
+                return {"state": "running", "action_id": action_id,
+                        "expected_duration_s": expected_duration_s,
+                        "requested_angle_deg": angle_deg}
+        except Exception as exc:
+            terminal = {"state": "error",
+                        "error": f"{type(exc).__name__}: {exc}"}
+        # No worker accepted the action: release its reservation so a
+        # transient SDK or thread-start failure does not leave the card busy.
+        with self._rotate_lock:
+            self._active_action_id = None
+            self._rotate_worker = None
+            self._rotate_state["state"] = "idle"
+            self._rotate_state["last_result"] = terminal
+        return terminal
+
+    def _do_rotate_worker(self, args: dict, action_id: str) -> dict | None:
+        # bumi_rotate thread body: run the impl, then publish exactly one
+        # ACP terminal. The active action is claimed (cleared) under the
+        # lock BEFORE notifying — a duplicate completion is structurally
+        # impossible — and idle becomes visible only after the notify
+        # returns, so wait_rotate observing idle implies the callback fired.
+        result = None
+        try:
+            result = self._do_rotate_impl(args)
+            return result
+        except Exception as exc:
+            result = {"state": "error",
+                      "error": f"{type(exc).__name__}: {exc}"}
+            return result
+        finally:
+            with self._rotate_lock:
+                claimed = self._active_action_id == action_id
+                if claimed:
+                    self._active_action_id = None
+            if claimed:
+                status = {"done": "completed", "stopped": "cancelled",
+                          "timeout": "error"}.get(
+                              result.get("state") if result else None,
+                              "error")
+                _acp_notify(action_id, status, result, "loco_destination")
+            with self._rotate_lock:
+                self._rotate_state["state"] = "idle"
+                if result is not None:
+                    self._rotate_state["last_result"] = result
+
+    def _rotate_preflight(self, args: dict) -> tuple[float | None, dict | None]:
+        # Synchronous pre-motion checks (Task 2 impl steps 1–2), shared by
+        # the dispatch path and the worker. Returns (angle_deg, None) when
+        # rotation may start, else (None, terminal) — a done/error dict the
+        # caller records and returns as-is. Zero-turn skips the workmode
+        # check: it is a deliberate no-op that succeeds in any mode.
+        raw_angle = args.get("angle_deg")
+        try:
+            angle_deg = float(raw_angle)
+        except (TypeError, ValueError):
+            return None, {"state": "error",
+                          "error": f"angle_deg must be a number, got {raw_angle!r}"}
+        if not math.isfinite(angle_deg) or abs(angle_deg) > _ROTATE_ANGLE_LIMIT_DEG:
+            return None, {"state": "error",
+                          "error": (f"angle_deg must be a finite number within "
+                                    f"±{_ROTATE_ANGLE_LIMIT_DEG:g} degrees, got {angle_deg}")}
+        if abs(angle_deg) < 0.05:
+            return angle_deg, None
+        return angle_deg, self._rotate_mode_error()
+
+    def _rotate_mode_error(self) -> dict | None:
+        mode = int(self._high_ctrl.get_mode())
+        if mode == 26:
+            return {"state": "error", "error": "Robot in protection mode, cannot move"}
+        if mode != 2:
+            return {
+                "state": "error",
+                "error": (
+                    f"movement requires workmode=2 (walking); current mode is "
+                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
+                    "Use switch_mode switch=walk first."
+                ),
+            }
+        return None
+
+    def _read_rotate_imu(self) -> tuple[float, float]:
+        imu = self._high_ctrl.get_imu_data()
+        yaw = _yaw_deg_from_quat(imu.ori)
+        wz = float(imu.angular_vel[2])
+        if not math.isfinite(wz):
+            raise ValueError("IMU yaw rate must be finite")
+        return yaw, wz
+
+    def _do_rotate_impl(self, args: dict) -> dict:
+        # 1. Pre-flight (validation + workmode) — shared with the sync
+        # dispatch path so refusals there return before any action_id exists.
+        angle_deg, terminal = self._rotate_preflight(args)
+        if terminal is not None:
+            return terminal
+        # 0° is a deliberate no-op: it succeeds in any workmode and returns
+        # before the mutex preamble, so it never cancels a running move.
+        if abs(angle_deg) < 0.05:  # zero-turn: instant done, no motion commanded
+            yaw, _ = self._read_rotate_imu()
+            return {"state": "done", "requested_angle_deg": angle_deg,
+                    "start_yaw_deg": yaw, "end_yaw_deg": yaw, "turned_deg": 0.0,
+                    "final_error_deg": 0.0, "elapsed_s": 0.0,
+                    "tolerance_deg": _ROTATE_TOL_DEG}
+
+        # (Mode checks live in _rotate_preflight, shared with the sync
+        # dispatch path so refusals return before any action_id exists.)
+
+        # 3. Stop any existing move thread (mutex preamble as in _do_move).
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+        self._move_stop_event.clear()
+
+        default_cmd = _get_default_cmd()
+        start_yaw, _ = self._read_rotate_imu()
+        start_time = time.monotonic()
+        # Timeout budget covers the whole request, every segment included.
+        deadline = start_time + _rotate_timeout_s(angle_deg)
+        prev_yaw = start_yaw
+        turned_deg = 0.0
+        end_yaw = start_yaw
+        result_state = "timeout"
+        # Angle-as-motion: |angle| > 150 is split into chained ≤150° sub-rotations
+        # so the wrapped error can never shortcut the requested direction
+        # (a single ±360 request would otherwise wrap to err=0 and never move).
+        segments = []
+        remaining = angle_deg
+        while abs(remaining) > 150.0:
+            step = math.copysign(150.0, remaining)
+            segments.append(step)
+            remaining -= step
+        if abs(remaining) > 1e-9:
+            segments.append(remaining)
+        try:
+            # 4. 50 Hz three-phase closed loop (cruise → brake → creep) over
+            # chained ≤150° absolute sub-targets: cruise chains sub-targets with
+            # no intermediate brake/creep (advance at |err_sub| ≤ cruise band);
+            # the settle judgement runs once, on the final target.
+            cumulative_angle = 0.0
+            seg_i = 0
+            cumulative_angle += segments[seg_i]
+            # Absolute sub-target: segment k aims at start_yaw + cumulative
+            # angle (the final one == the whole-request target), so each
+            # segment corrects prior shortfall and final_error_deg for the
+            # whole request stays within ±2°.
+            seg_target = start_yaw + cumulative_angle
+            stage = "cruise"            # cruise → brake → creep, per segment
+            brake_started = 0.0
+            pulse_phase = None          # None | "pulse" | "coast"
+            pulse_end = 0.0
+            coast_end = 0.0
+            pulse_cmd = 0.0             # latched sign * PULSE_VYAW for a pulse
+            err_at_pulse = 0.0
+            turned_at_pulse = 0.0
+            pulse_started = 0.0
+            pulse_duration = 0.0
+            measured_rate = None
+            no_progress = 0
+            observed_errors = []
+            still = 0
+            while True:
+                if self._rotate_stop_event.is_set():
+                    result_state = "stopped"
+                    break
+                mode_error = self._rotate_mode_error()
+                if mode_error is not None:
+                    return mode_error
+                cur_yaw, wz = self._read_rotate_imu()
+                turned_deg += _wrap180(cur_yaw - prev_yaw)
+                prev_yaw = cur_yaw
+                end_yaw = cur_yaw
+                err = _wrap180(seg_target - cur_yaw)
+                # Sub-target advance: inside the cruise-exit band (≤20°) jumps
+                # straight to the next sub-target, so non-final segments never
+                # brake or creep — one continuous cruise, one creep at the end.
+                # Wrap safety: non-final segments are exactly 150° and we
+                # advance within 20° of one, so err to the next stays in
+                # [130, 170] < 180 — wrap180 cannot shortcut the direction.
+                if seg_i + 1 < len(segments) and abs(err) <= _ROTATE_CRUISE_EXIT_DEG:
+                    seg_i += 1
+                    cumulative_angle += segments[seg_i]
+                    seg_target = start_yaw + cumulative_angle
+                    stage = "cruise"
+                    pulse_phase = None
+                    still = 0
+                    continue
+                if time.monotonic() >= deadline:
+                    result_state = "timeout"
+                    break
+                if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
+                    still += 1
+                else:
+                    still = 0
+                if stage == "cruise" and abs(err) > _ROTATE_CRUISE_EXIT_DEG:
+                    # Cruise: full speed toward the sub-target (err signs the
+                    # direction; _ROTATE_VYAW_SIGN stays the axis calibration).
+                    self._publish_cmd(0.0, 0.0,
+                                      _ROTATE_VYAW_SIGN
+                                      * math.copysign(_ROTATE_VYAW_FULL, err),
+                                      default_cmd, 0,
+                                      cancel_event=self._rotate_stop_event)
+                else:
+                    if stage == "cruise":
+                        stage = "brake"
+                        brake_started = time.monotonic()
+                        pulse_phase = None
+                    if stage == "brake":
+                        # Brake: zero cmd until truly still (0.5 s cap) so
+                        # inertia is shed before creeping, without stalling.
+                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                        if (abs(wz) <= _ROTATE_WZ_STILL_RAD_S
+                                or time.monotonic() - brake_started >= 0.5):
+                            stage = "creep"
+                            pulse_phase = "coast"
+                            coast_end = time.monotonic() + _ROTATE_OBSERVE_S
+                    elif pulse_phase == "pulse":
+                        if (time.monotonic() < pulse_end
+                                and abs(err) > _ROTATE_TOL_DEG
+                                and err * err_at_pulse > 0):
+                            self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
+                                              cancel_event=self._rotate_stop_event)
+                        else:
+                            # Reaching the band brakes early, but never skips
+                            # observation when a subsequent sample drifts out.
+                            pulse_duration = time.monotonic() - pulse_started
+                            coast_end = time.monotonic() + _ROTATE_OBSERVE_S
+                            pulse_phase = "coast"
+                            observed_errors.clear()
+                            self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                    else:  # coast
+                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                        if abs(wz) > _ROTATE_WZ_STILL_RAD_S:
+                            observed_errors.clear()
+                        else:
+                            observed_errors.append(err)
+                            observed_errors = observed_errors[-_ROTATE_SETTLE_TICKS:]
+                        stable = (len(observed_errors) == _ROTATE_SETTLE_TICKS
+                                  and max(observed_errors) - min(observed_errors)
+                                  <= _ROTATE_OBSERVE_SPREAD_DEG)
+                        if time.monotonic() >= coast_end and stable:
+                            # Success still needs raw feedback within ±2° for
+                            # every settle frame; filtering never widens it.
+                            if still >= _ROTATE_SETTLE_TICKS:
+                                result_state = "done"
+                                break
+                            if pulse_duration > 0:
+                                response = math.copysign(1.0, err_at_pulse) * (
+                                    turned_deg - turned_at_pulse)
+                                if response >= _ROTATE_MIN_PROGRESS_DEG:
+                                    measured_rate = response / pulse_duration
+                                improved = abs(err_at_pulse) - abs(err)
+                                no_progress = (no_progress + 1 if improved
+                                               < _ROTATE_MIN_PROGRESS_DEG else 0)
+                                pulse_duration = 0.0
+                                if no_progress >= _ROTATE_NO_PROGRESS_LIMIT:
+                                    return {"state": "error", "error":
+                                            "rotation made no progress after 3 corrections",
+                                            "requested_angle_deg": angle_deg,
+                                            "turned_deg": turned_deg,
+                                            "final_error_deg": angle_deg - turned_deg,
+                                            "tolerance_deg": _ROTATE_TOL_DEG}
+                            # Correct only a persistent deviation on one side,
+                            # not a single noisy sample around the target.
+                            if (min(observed_errors) > _ROTATE_TOL_DEG
+                                    or max(observed_errors) < -_ROTATE_TOL_DEG):
+                                err_at_pulse = sum(observed_errors) / len(observed_errors)
+                                turned_at_pulse = turned_deg
+                                pulse_started = time.monotonic()
+                                pulse_end = pulse_started + _pulse_duration_s(
+                                    err_at_pulse, measured_rate)
+                                pulse_cmd = (_ROTATE_VYAW_SIGN * math.copysign(
+                                    _ROTATE_PULSE_VYAW, err_at_pulse))
+                                pulse_phase = "pulse"
+                                self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
+                                                  cancel_event=self._rotate_stop_event)
+                time.sleep(0.02)  # 50 Hz
+        finally:
+            # Every exit path — including exceptions — brakes to zero velocity.
+            self._publish_cmd(0, 0, 0, default_cmd, 0)
+
+        # 5. Report actual motion: per-frame yaw deltas, plus the unwrapped
+        # shortfall/overshoot of the REQUEST (angle_deg - turned_deg): positive
+        # = less turned than asked, negative = overshot. A wrap180 residual
+        # would fold a 360° shortfall to 0 and multi-wrap residuals to the
+        # wrong sign, so early exits (timeout/stopped) must not use it.
+        return {
+            "state": result_state,
+            "requested_angle_deg": angle_deg,
+            "start_yaw_deg": start_yaw,
+            "end_yaw_deg": end_yaw,
+            "turned_deg": turned_deg,
+            "final_error_deg": angle_deg - turned_deg,
+            "elapsed_s": time.monotonic() - start_time,
+            "tolerance_deg": _ROTATE_TOL_DEG,
+        }
+
+    def _rotate_status(self) -> dict:
+        with self._rotate_lock:
+            return {"state": self._rotate_state["state"],
+                    "last_result": self._rotate_state["last_result"]}
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
@@ -743,6 +1203,22 @@ class LocoPlugin:
 
     def _prepare_workmode(self, target_mode: int, requested_action: str) -> dict:
         """Automatically reach ready(1) or walking(2) through documented steps."""
+        # I-A: a posture/semantic/teaching change cancels an in-flight
+        # loco_destination rotate the same way this path already stops move —
+        # worker exits "stopped" → ACP "cancelled" → zero brake, instead of
+        # workmode edges racing a bumi_rotate still streaming vyaw. The set
+        # takes _rotate_lock so it cannot land inside a concurrent dispatch's
+        # reservation window (busy-check → clear) and be wiped by that clear;
+        # the join runs after the lock is released (the worker's finally
+        # needs it) and waits out the brake, so no two command streams
+        # overlap. The 1s cap mirrors move: even if the ACP notify is slow,
+        # the motion has already braked to zero by then.
+        with self._rotate_lock:
+            self._rotate_stop_event.set()
+            worker = self._rotate_worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1)
+
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
@@ -1980,17 +2456,20 @@ CARD = "vision_capture"
 _FIRST_FRAME_TIMEOUT_S = 5.0
 
 
-def _vision_acp_notify(action_id, status, result, tool):
+def _acp_notify(action_id, status, result, tool):
     """Report the asynchronous terminal result using the same ACP API as Q5."""
-    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-    payload = json.dumps({"action_id": action_id, "status": status,
-                          "result": result, "tool": tool, "ts": time.time()}).encode()
-    request = urllib.request.Request(
-        f"{url}/api/acp/complete", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
-    # The local Agent Core endpoint uses a self-signed certificate.
-    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    # Build the payload inside the try: json.dumps or the env lookup raising
+    # must not escape the rotate worker's finally (it would skip the idle
+    # flip and wedge the busy-guard forever).
     try:
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        payload = json.dumps({"action_id": action_id, "status": status,
+                              "result": result, "tool": tool, "ts": time.time()}).encode()
+        request = urllib.request.Request(
+            f"{url}/api/acp/complete", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        # The local Agent Core endpoint uses a self-signed certificate.
+        context = ssl._create_unverified_context() if url.startswith("https://") else None
         with urllib.request.urlopen(request, timeout=5, context=context) as response:
             response.read()
     except Exception as exc:
@@ -2121,7 +2600,7 @@ class VisionCapturePlugin:
             if self._active_recording is active:
                 self._active_recording = None
             action_id = active["action_id"]
-        _vision_acp_notify(action_id, status, result, CARD)
+        _acp_notify(action_id, status, result, CARD)
         return True
 
     @staticmethod
