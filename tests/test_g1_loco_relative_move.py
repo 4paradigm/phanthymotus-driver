@@ -47,6 +47,38 @@ def pose(x=0., y=0., yaw=0., odom_yaw=0., now=0., speed=0., rate=0.):
 
 
 class TestPoseFeedback(unittest.TestCase):
+    def test_invalid_imu_clears_unwrap_and_recovery_invalidates_old_task(self):
+        now = [10.]
+        feedback = PoseFeedback(clock=lambda: now[0])
+        feedback.update_odom(dict(position=[0, 0], velocity=[0, 0], imu=dict(rpy=[0, 0, 0])))
+        feedback.update_imu(dict(rpy=[0, 0, 3.1], gyroscope=[0, 0, 0]))
+        feedback.update_imu(dict(rpy=[0, 0, -3.1], gyroscope=[0, 0, 0]))
+        initial = feedback.snapshot()
+        self.assertGreater(initial['yaw'], math.pi)
+        safety = MotionSafety(.3, .5)
+        safety.check(initial, now[0])
+        feedback.update_imu({})
+        self.assertIsNone(feedback.imu)
+        self.assertIsNone(feedback.last_yaw)
+        self.assertEqual(feedback.unwrapped, 0.)
+        feedback.update_imu(dict(rpy=[0, 0, -1.], gyroscope=[0, 0, 0]))
+        recovered = feedback.snapshot()
+        self.assertAlmostEqual(recovered['yaw'], -1.)
+        self.assertGreater(recovered['imu_generation'], initial['imu_generation'])
+        with self.assertRaises(SafetyViolation) as caught:
+            safety.check(recovered, now[0])
+        self.assertEqual(caught.exception.reason, 'imu_reset')
+        MotionSafety(.3, .5).check(recovered, now[0])  # New task takes the new reference.
+
+    def test_valid_imu_after_gap_also_rebaselines(self):
+        now = [0.]
+        feedback = PoseFeedback(clock=lambda: now[0])
+        feedback.update_imu(dict(rpy=[0, 0, 3.], gyroscope=[0, 0, 0]))
+        now[0] = 1.
+        feedback.update_imu(dict(rpy=[0, 0, -2.], gyroscope=[0, 0, 0]))
+        self.assertEqual(feedback.imu_generation, 1)
+        self.assertAlmostEqual(feedback.imu['yaw'], -2.)
+
     def test_freshness_validation_alignment_and_yaw_unwrap(self):
         now = [10.]
         feedback = PoseFeedback(clock=lambda: now[0])
@@ -70,6 +102,23 @@ class TestPoseFeedback(unittest.TestCase):
 
 
 class TestRelativeController(unittest.TestCase):
+    def test_rotation_is_not_interrupted_by_small_reported_linear_velocity(self):
+        for direction in (1, -1):
+            controller = RelativeController(pose(), dict(x=0, y=0, yaw=direction * math.pi/2), .3, .5, 0.)
+            safety = MotionSafety(.3, .5)
+            for step, speed in enumerate((0., .04, .08, .02, .06)):
+                now = step * .1
+                sample = pose(yaw=direction * step * .04, speed=speed, rate=direction * .4, now=now)
+                safety.check(sample, now)
+                command, done = controller.step(sample, now)
+                self.assertEqual(command[:2], (0., 0.))
+                self.assertGreater(command[2] * direction, 0.)
+                self.assertFalse(done)
+            # Reaching the angle must still stop; drift must not qualify as settled.
+            sample = pose(yaw=direction * math.pi/2, speed=.06, now=1.)
+            self.assertEqual(controller.step(sample, 1.), ((0., 0., 0.), False))
+            self.assertEqual(controller.phase, 'rotate')
+
     def test_rotation_floor_handles_both_directions_and_stops_within_tolerance(self):
         for direction in (1, -1):
             for remaining in (6.2, 12.75, 90):
@@ -293,6 +342,18 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertIn('error', card.dispatch('move', dict(x=.3)))
         self.assertEqual(backend.calls, [])
 
+    def test_zero_target_returns_noop_without_feedback_or_completion(self):
+        card, backend, notices, _ = self.card()
+        backend.failure = 'no feedback'
+        card.can_start = lambda: self.fail('No-op must not query ownership')
+        for args in ({}, dict(x=0, y=0, angle=0), dict(x='0', y='0', angle='0')):
+            reply = card.dispatch('move', args)
+            self.assertEqual(reply, {'ret': 0, 'state': 'idle', 'noop': True})
+            self.assertNotIn('action_id', reply)
+        self.assertIsNone(card.active)
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(notices, [])
+
     def test_feedback_completion_not_rpc_ack(self):
         card, backend, notices, done = self.card()
         backend.arrive = True
@@ -503,6 +564,7 @@ class TestLocalMotionSafety(unittest.TestCase):
             ('tilt', {'roll': math.radians(40)}),
             ('position_jump', {'x': 1.}),
             ('attitude_jump', {'yaw': 1.}),
+            ('imu_reset', {'imu_generation': 1}),
             ('linear_overspeed', {'speed': .7}),
             ('angular_overspeed', {'angular_speed': 1.1}),
             ('feedback_stale', None),

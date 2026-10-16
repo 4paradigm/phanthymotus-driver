@@ -157,6 +157,8 @@ class LocoRelativeMovePlugin:
                 return {"error": "Previous stop was not confirmed; retry stop_move first"}
             if self.busy:
                 return {"error": "loco_relative_move is already running"}
+            if target['x'] == 0 and target['y'] == 0 and target['yaw'] == 0:
+                return {"ret": 0, "state": "idle", "noop": True}
             if self.can_start:
                 try:
                     ownership = self.can_start()

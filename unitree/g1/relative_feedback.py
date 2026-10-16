@@ -70,6 +70,8 @@ class MotionSafety:
             self._fail('tilt', f'Severe body tilt: {tilt:.1f} degrees')
         previous = self.previous
         if previous:
+            if pose.get('imu_generation', 0) != previous.get('imu_generation', 0):
+                self._fail('imu_reset', 'IMU reference was reinitialized during the active task')
             dt = pose['odom_stamp'] - previous['odom_stamp']
             da = pose['imu_stamp'] - previous['imu_stamp']
             if dt < 0 or da < 0:
@@ -96,6 +98,15 @@ class PoseFeedback:
         self.odom = self.imu = None
         self.last_yaw = None
         self.unwrapped = 0.
+        self.imu_generation = 0
+
+    def _reset_imu(self):
+        # Caller holds lock. A new generation invalidates every active target
+        # even if invalid and recovered samples arrive between control ticks.
+        self.imu = None
+        self.last_yaw = None
+        self.unwrapped = 0.
+        self.imu_generation += 1
 
     def update_odom(self, data):
         try:
@@ -118,13 +129,17 @@ class PoseFeedback:
                 raise ValueError('Nonfinite IMU')
         except (ValueError, TypeError, KeyError, IndexError):
             with self.lock:
-                self.imu = None
+                self._reset_imu()
             return
         with self.lock:
+            now = self.clock()
+            if self.imu and now - self.imu['imu_stamp'] > self.timeout:
+                self._reset_imu()
             self.unwrapped += wrap(yaw - self.last_yaw) if self.last_yaw is not None else yaw
             self.last_yaw = yaw
             self.imu = dict(yaw=self.unwrapped, yaw_rate=rate, roll=roll, pitch=pitch,
-                            angular_speed=math.sqrt(gx*gx + gy*gy + rate*rate), imu_stamp=self.clock())
+                            angular_speed=math.sqrt(gx*gx + gy*gy + rate*rate), imu_stamp=now,
+                            imu_generation=self.imu_generation)
 
     def snapshot(self):
         with self.lock:
@@ -196,9 +211,6 @@ class RelativeController:
                     self._transition('translate', now)
                 return (0., 0., 0.), False
             self.settle_since = None
-            # Never begin rotation while residual translation is still observed.
-            if pose['speed'] > self.STOP_SPEED:
-                return (0., 0., 0.), False
             rotation = math.copysign(min(self.yaw_speed, max(self.min_yaw_speed, 1.2 * abs(ea))), ea)
             return (0., 0., rotation), False
         if abs(ea) > self.ANGLE_TOLERANCE:
