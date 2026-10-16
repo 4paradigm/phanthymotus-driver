@@ -70,7 +70,7 @@ COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
-COPY squat_count.py squat_counter.py /work/
+COPY squat_count.py squat_counter.py bicep_curl_count.py bicep_curl_counter.py /work/
 # Add SDK DDS libs + pybind modules to paths
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build

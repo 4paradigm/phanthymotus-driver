@@ -18,6 +18,12 @@ plugins:
     hold_s: 0.15
     lost_s: 2.0
     min_confidence: 0.3
+  bicep_curl_counter:
+    enabled: true
+    lift_px: 40.0
+    hold_s: 0.15
+    lost_s: 2.0
+    min_confidence: 0.3
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.

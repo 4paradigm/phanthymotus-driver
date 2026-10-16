@@ -127,6 +127,12 @@ class BumiDeviceBundle:
                 plugins_cfg["squat_counter"], namespace, executor))
             print("[bundle] SquatCounterPlugin loaded")
 
+        if plugins_cfg.get("bicep_curl_counter", {}).get("enabled", False):
+            from bicep_curl_counter import BicepCurlCounterPlugin
+            self._plugins.append(BicepCurlCounterPlugin(
+                plugins_cfg["bicep_curl_counter"], namespace, executor))
+            print("[bundle] BicepCurlCounterPlugin loaded")
+
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
             state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
