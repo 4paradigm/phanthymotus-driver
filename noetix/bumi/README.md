@@ -1,6 +1,162 @@
 # Noetix Bumi driver
 
-The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+
+## `mic` and `sound_direction`
+
+`mic` publishes mono PCM `AudioChunk` messages on `/<namespace>/mic/audio`.
+`sound_direction` is the only direction card. Its canvas output is
+`std_msgs/msg/String` on `/<namespace>/sound_direction`, declared as
+`sensor/sound-direction`. Like `sensor/pose2d`, it has a specific canvas type
+with the standard String transport; it is not a generic `data/json` port.
+**The `/<namespace>/sound_direction` topic name is the contract ASR uses to
+find its direction input — renaming it disconnects wake direction.** The
+monitor shows the observation as plain data. The angle uses the robot frame:
+front 0°, **left positive** (counter-clockwise, REP-103 — the same sign as
+the locomotion `vyaw` command), right negative, rear ±180°. A source at
+front-left reads about +45 and passes straight to a `vyaw` turn with no
+negation. The observation reports `state: "fresh"` and the exact `angle_deg`
+for ASR and display, with
+`angle_convention: "robot_front_0_left_positive_ccw"`, `audio_window_start_us`,
+`audio_window_end_us`, and `timestamp_ms`.
+After activity stops it publishes `state: "no_event"`; if updates disappear,
+the driver publishes `state: "stale"` after two seconds. Latest-mode viewers
+retain the previous reading with that explicit state. No-event/stale messages
+are not valid ASR observations. Driver repeats terminal states every 500 ms,
+including no-event before first activity, so late readers or a lost
+best-effort packet do not leave an old reading marked fresh.
+
+The worker's `audio_msgs/msg/SoundDirection` stream is internal, on
+`/<namespace>/_internal/sound_direction`. Only the public observation topic
+is declared by the card, so monitoring shows one `sound_direction` window.
+
+The two capture workers use the SDK frame timestamp as their common capture
+clock only when it has a Unix-microsecond shape. `mic` stamps each chunk with
+the first frame's time; the direction window ends after the final frame's last
+sample. Invalid timestamps leave the audio stamp unset and direction window
+at zero, so ASR cannot mistake publication time for capture time. The SDK
+clock's meaning still requires verification on Bumi. Simultaneous readers were
+verified on Bumi with commit cc2c1e2; this capture topology is unchanged.
+
+Lifecycle follows the same contract as the other sensor cards: the driver
+spawns the direction worker at boot and tears it down on driver shutdown,
+a config save, or a failed worker start. The canvas `start`/`stop` actions
+are status replies — they never spawn or kill the worker — so stopping
+intelligent control leaves both direction streams running. No special canvas
+start call is required to view the sensor.
+
+A worker that dies mid-session is **not** revived by `start`/`stop`/`info`;
+restart the driver to bring the stream back. A config save restarts the
+worker only while it is running; on a dead worker it just writes the
+settings.
+
+Set the one shared parameter from the direction card's left-list gear.
+Saving it restarts a running direction worker and waits for it to become ready.
+If stopping the worker times out, the previous settings file is restored and
+no replacement worker is spawned. If settings recovery also fails, the error
+reports the file and running parameters separately.
+
+| Parameter | Default | Effect |
+| --- | --- | --- |
+| `sensitivity` | `normal` | How loud a sound must be to count as someone speaking |
+
+Environment presets:
+
+- **普通环境** (`normal`, default) — 日常室内使用，优先识别正常音量说话。
+- **嘈杂环境** (`noisy`) — 风扇或环境噪声较大时使用，需要更靠近或更大声说话。
+
+The publish throttle is fixed at 100 ms (about 10 updates per second) and
+is no longer operator-adjustable. Gate thresholds per preset live in the
+engineer appendix below.
+
+### 旧 settings.json 迁移
+
+The legacy 5-key file at `/opt/phanthy-motus/data/bumi/sound_direction_settings.json`
+(`onset_level` / `onset_ratio` / `burst_level` / `burst_ratio` /
+`update_interval_ms`) is still read after upgrade: it maps **in memory** to
+an environment preset (`onset_ratio` <2.25→normal, otherwise noisy) and is never rewritten — the file keeps its old shape until
+the operator saves the config once. `update_interval_ms` is dropped; the
+throttle stays at 100 ms regardless of any hand-tuned 50/300 value.
+
+旧三档值 `high` / `normal` 映射为 `normal`，`low` 映射为 `noisy`，
+读取设置文件和接收配置请求时都会兼容转换。读取不回写，保存会写入新值。
+升级后请在齿轮面板重新选择并保存一次，将画布保留的旧值更新为新值。
+
+Rolling back to an older image: before the first config save the old image
+reads the legacy file as before; after a save the old key-set check falls
+back to defaults silently. Legacy key names sent to `config` are rejected
+(`invalid_parameters`). Keys saved in a canvas config are dropped by the
+platform, not migrated.
+
+### 工程师附录：门限映射表
+
+```
+SENSITIVITY_GATE_PARAMS = {
+    "normal": {"onset_level": 10.0, "onset_ratio": 2.0, "burst_level": 15.0, "burst_ratio": 4.0},
+    "noisy":  {"onset_level": 20.0, "onset_ratio": 3.0, "burst_level": 30.0, "burst_ratio": 6.0},
+}
+UPDATE_INTERVAL_MS = 100
+```
+
+Preset meaning is defined by this table, not by the panel wording. The
+noisy preset doubles both absolute level floors and raises both background
+ratios by 50% compared with normal. Sensitivity
+only adjusts how easily sounds trigger; it does **not** remove fan-noise
+false angles (known, unfixed).
+
+The card first loads a complete, valid per-robot calibration from
+`/opt/phanthy-motus/data/bumi/sound_direction_calibration.json`, then tries the
+packaged `resource/sound_direction_calibration.json`. Each file must contain
+`front` and `right`, each with three finite values of magnitude at most 24.
+Each vector must also have a norm of at least 0.5 samples, matching the
+estimator's minimum meaningful delay signature; a near-zero override falls
+back to the packaged calibration. The existing condition-number limit still
+rejects nearly collinear vectors.
+The two files are never mixed. The packaged file was copied unchanged from
+the calibrated Bumi host `ubuntu` on 2026-10-14, at the per-robot path above.
+Its SHA-256 is `89813968f99881310d5f49ca748d48303dfadfd27e550893d27f1023e5fc660a`.
+The direction card is registered by default; without
+a valid file, `start` and `info` report it unavailable instead of starting a
+silent worker. On 2026-10-14, the operator confirmed that this calibration
+can be shared between Bumi robots. This portability confirmation is supplied
+by the operator; the repository's tests validate file geometry and loading,
+not physical direction accuracy.
+
+For existing canvas projects, remove the old `sound_direction_control` card,
+remove/re-add `sound_direction` and ASR, and reconnect the dedicated direction output
+to the ASR direction input (and mic to the audio input). This replaces saved
+typed ROS or `/events` topics; update Driver and Perception together for the standard
+sensor transport. The canvas type remains `sensor/sound-direction`.
+Update Core once for this migration to remove its old custom ROS decoder.
+Calibration actions have been removed; update the packaged file through a reviewed change, or use
+the per-robot override as an emergency measure. The previous
+`/<namespace>/mic/sound_direction` stream is no longer produced.
+
+Run local tests from the repository root with
+`python -m pytest noetix/bumi/tests -q`.
+The driver image builds its bundled `audio_msgs` definitions, including
+`SoundDirection`, over a pinned ROS base image. It does not require a new
+`ros-base` release from the main repository. The canvas/ASR path does not require
+`SoundDirection` in Agent Core or Perception. Legacy typed consumers still
+need the matching message definition.
+
+The published-image [size measurement](review-evidence/image-size-2026-10-14.md)
+records a 2,088,960-byte increase in summed history-layer size over the earlier
+release without the local interface overlay; the ROS overlay and import-check layers account for
+1,146,880 bytes. Both measured images use the same ordered base layers, matching
+this robot's cached `ros-base:latest` and the pinned digest. The report separates
+Docker size accounting from actual disk consumption and includes raw evidence.
+
+The internal `/<namespace>/_internal/sound_direction` stream uses the bundled
+`audio_msgs/msg/SoundDirection`. The Driver itself
+builds that definition; the standard sensor observation is a separate topic
+so there are never two ROS types on one topic.
+
+For the migration release, record the immutable image digests for Bumi,
+Perception, and the compatible Core.
+Confirm a direction event reaches the ASR input and the canvas viewer on the
+target robot, including no-event/stale states. Keep the release check open
+until those published-image and robot checks pass.
 
 ## App 图传与 Phanthy Camera Card
 

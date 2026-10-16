@@ -1,7 +1,14 @@
-ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
 ARG PYPI_MIRROR=https://pypi.org/simple/
+FROM ${ROS_BASE_IMAGE} AS audio_msgs_builder
+COPY audio_msgs/ /bumi_ros_ws/src/audio_msgs/
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release && source install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
+
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+# Keep only the generated interface; source and build artifacts stay in the builder.
+COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
+RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
 
 WORKDIR /work
 
@@ -62,12 +69,13 @@ RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
 # ROS2 domain isolation
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY sound_direction.py /work/sound_direction.py
+COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
@@ -75,8 +83,11 @@ COPY deploy/     /deploy/
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
 ENV PYTHONUNBUFFERED=1
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# Use SDK's DDS config for peer discovery (unicast to motion control board 192.168.55.102)
+# Vendor HighController/MediaController use CycloneDDS to discover the motion
+# board (192.168.55.102). This driver's ROS 2 bridge to Agent Core uses
+# rmw_fastrtps_cpp and the mounted FASTRTPS_DEFAULT_PROFILES_FILE instead.
 ENV CYCLONEDDS_URI='file:///work/noetix_sdk_bumi/config/dds.xml'
 
 EXPOSE 15704
@@ -97,4 +108,4 @@ EXPOSE 15704
 # systemd unit, because `jetson_clocks` is not persistent across a reboot while
 # `nvpmodel` is — so a rebooted machine and a fresh one would otherwise run at
 # different speeds with nothing anywhere saying why.
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 /work/main.py"]

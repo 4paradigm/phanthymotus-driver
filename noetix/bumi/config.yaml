@@ -8,6 +8,8 @@ plugins:
     enabled: true
   mic:
     enabled: true
+  sound_direction:
+    enabled: true
   speaker:
     enabled: true
   camera:
