@@ -24,10 +24,17 @@ ARM_UPPER = (2.6005, 3.1940, 1.4835, .2618, 1.3963, .7854, 1.5708,
              2.6005, .2618, 3.6652, .2618, 1.7453, .7854, 1.5708)
 
 
+# SDK MoveH 3.6.2 and this robot's vendor UI both declare these radians.
+# The mechanical manual rounds them to -45..60 / -90..90 degrees; sending
+# those degree endpoints exactly would exceed the documented protocol limits.
+HEAD_RAD_LIMITS = ((-.78, 1.04), (-1.57, 1.57))
+# Whole hundredths of a degree strictly inside the documented radian interval.
+HEAD_DEG_LIMITS = ((-44.69, 59.58), (-89.95, 89.95))
+
+
 def validate_moveh(joint, duration):
-    # Operator's DACH TRON2A manual and official URDF: pitch -45..60deg,
-    # yaw -90..90deg. Protocol order is pitch,yaw (NOT URDF traversal order).
-    limits = ((-math.pi/4, math.pi/3), (-math.pi/2, math.pi/2))
+    # Protocol order is pitch,yaw (NOT URDF traversal order). Never clamp.
+    limits = HEAD_RAD_LIMITS
     if not isinstance(joint, list) or len(joint) != 2:
         raise ValueError('MoveH requires exactly pitch,yaw in radians')
     for value, (low, high) in zip(joint, limits):
@@ -38,7 +45,7 @@ def validate_moveh(joint, duration):
         except OverflowError:
             valid = False
         if not valid:
-            raise ValueError('Head angle exceeds the DACH manual limit')
+            raise ValueError('Head angle exceeds the vendor MoveH radian limit')
     # Reuse strict duration validation, without forwarding any arm target.
     validate_movej([0]*14, duration)
     return list(joint), duration

@@ -17,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.7.1'
+VERSION = '0.7.2'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -142,7 +142,8 @@ class Adapter:
         if 'arm_control' in self.enabled:
             tools.append(self._arm_control_tool())
         if 'move_head' in self.enabled:
-            tools.append(head_tool(metadata_properties()))
+            # Core may still inject metadata internally; it is not customer input.
+            tools.append(head_tool())
         for name, side in GRIPPER_SIDES.items():
             if name in self.enabled:
                 tools.append(gripper_tool(metadata_properties(), side))

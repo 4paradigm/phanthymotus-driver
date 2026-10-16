@@ -14,22 +14,32 @@ from head import HeadCompletion, arguments, tool
 from device import Adapter
 from skeleton import JOINT_NAMES
 from state import joint_state
-from vendor import MoveError, RobotReader, validate_moveh
+from vendor import MoveError, RobotReader, validate_moveh, HEAD_RAD_LIMITS
 
 
 class HeadValidationTests(unittest.TestCase):
     def test_manual_degrees_convert_to_only_two_radians(self):
-        for pitch,yaw in ((-45,-90),(60,90),(0,0),(12,-20)):
+        for pitch,yaw in ((-44.69,-89.95),(59.58,89.95),(0,0),(12,-20)):
             target,duration=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             self.assertEqual(target,[math.radians(pitch),math.radians(yaw)])
             self.assertEqual(duration,5)
-        props=tool({})['inputSchema']
-        self.assertEqual(props['properties']['pitch_deg']['maximum'],60)
-        self.assertEqual(props['properties']['yaw_deg']['minimum'],-90)
+        props=tool()['inputSchema']
+        self.assertEqual(set(props['properties']),{'pitch_deg','yaw_deg','time'})
+        self.assertEqual(props['properties']['pitch_deg']['maximum'],59.58)
+        self.assertEqual(props['properties']['yaw_deg']['minimum'],-89.95)
         self.assertEqual(props['required'],['pitch_deg','yaw_deg'])
         self.assertNotIn('action',props['properties'])
         self.assertNotIn('x-action-params',props)
         self.assertEqual(props['x-completion'],{'timeout':120})
+
+    def test_mechanical_degree_endpoints_rejected_before_motor_write_not_clamped(self):
+        for pitch,yaw in ((60,0),(-45,0),(0,90),(0,-90),(60,90)):
+            with self.subTest(pitch=pitch,yaw=yaw),self.assertRaisesRegex(ValueError,'MoveH'):
+                arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
+            with self.assertRaises(ValueError):validate_moveh([math.radians(pitch),math.radians(yaw)],5)
+        for pitch,yaw in ((-44.69,-89.95),(59.58,89.95),(5,0)):
+            target,_=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
+            self.assertTrue(all(low<=v<=high for v,(low,high) in zip(target,HEAD_RAD_LIMITS)))
 
     def test_missing_bad_and_out_of_range_values_never_validate(self):
         for key in ('pitch_deg','yaw_deg'):

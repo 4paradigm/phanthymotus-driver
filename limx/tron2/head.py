@@ -6,12 +6,12 @@ import time
 import completion
 from completion import ArmCompletion
 from skeleton import skeleton_stream
-from vendor import validate_moveh, MoveError
+from vendor import validate_moveh, MoveError, HEAD_DEG_LIMITS
 
 
 def arguments(args):
     values = []
-    for key, low, high in (('pitch_deg', -45, 60), ('yaw_deg', -90, 90)):
+    for key, (low, high) in zip(('pitch_deg','yaw_deg'), HEAD_DEG_LIMITS):
         value = args.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(key + '须填写角度数值（°）')
@@ -20,21 +20,20 @@ def arguments(args):
         except OverflowError:
             valid = False
         if not valid:
-            raise ValueError(key + '超出手册限位：' + str(low) + '至' + str(high) + '°')
+            raise ValueError(key + '超出厂家MoveH可发送范围：' + str(low) + '至' + str(high) + '°；未发送转动指令')
         values.append(math.radians(value))
     target, duration = validate_moveh(values, args.get('time', 5))
     return target, duration
 
 
-def tool(metadata):
+def tool():
     return {'name':'move_head','type':'actuator','multiInstance':False,
         'description':'TRON2头部转动：填写俯仰/偏航绝对角度（°）和时间（秒）。仅控制头部两轴，不移动双臂或开合夹爪；连续新反馈确认到位后通过ACP通知完成。正负方向按厂家坐标系。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'pitch_deg':{'type':'number','minimum':-45,'maximum':60,'title':'俯仰角度（°）','description':'头部上下俯仰绝对目标，-45至60°；必须明确填写'},
-                'yaw_deg':{'type':'number','minimum':-90,'maximum':90,'title':'偏航角度（°）','description':'头部左右转动绝对目标，-90至90°；必须明确填写'},
-                'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'},
-                **metadata},
+                'pitch_deg':{'type':'number','minimum':HEAD_DEG_LIMITS[0][0],'maximum':HEAD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上下俯仰绝对目标，-44.69至59.58°；按厂家MoveH弧度限位收窄，必须明确填写'},
+                'yaw_deg':{'type':'number','minimum':HEAD_DEG_LIMITS[1][0],'maximum':HEAD_DEG_LIMITS[1][1],'title':'偏航角度（°）','description':'左右转动绝对目标，-89.95至89.95°；按厂家MoveH弧度限位收窄，必须明确填写'},
+                'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'}},
             'required':['pitch_deg','yaw_deg'],
             'x-resource':['head','arm_l','arm_r'],
             # No action filter: calls without an action still register ACP.
