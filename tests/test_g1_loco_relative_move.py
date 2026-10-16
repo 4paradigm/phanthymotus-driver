@@ -385,6 +385,54 @@ class TestPoseFeedback(unittest.TestCase):
 
 
 class TestRelativeController(unittest.TestCase):
+    def test_each_active_translation_axis_exceeds_dead_zone_and_respects_cap(self):
+        for x, y in ((.06, 0), (-.06, 0), (0, .06), (0, -.06), (.04, .04), (1, -.04), (.04, -1)):
+            for cap in (.2, .25, .3, 1.):
+                with self.subTest(x=x, y=y, cap=cap):
+                    controller = RelativeController(pose(), dict(x=x, y=y, yaw=0), cap, .5, 0.)
+                    (vx, vy, _), done = controller.step(pose(), 0.)
+                    self.assertFalse(done)
+                    self.assertTrue(vx or vy)
+                    self.assertLessEqual(math.hypot(vx, vy), cap + 1e-9)
+                    for command, error in ((vx, x), (vy, y)):
+                        if command:
+                            self.assertGreaterEqual(abs(command), .2 - 1e-9)
+                            self.assertGreater(command * error, 0)
+
+    def test_translation_stops_inside_position_tolerance_even_while_turning(self):
+        controller = RelativeController(pose(), dict(x=.03, y=.03, yaw=1.), .3, .5, 0.)
+        command, done = controller.step(pose(), 0.)
+        self.assertEqual(command[:2], (0., 0.))
+        self.assertGreater(command[2], 0.)
+        self.assertFalse(done)
+        with self.assertRaises(ValueError):
+            RelativeController(pose(), dict(x=1, y=0, yaw=0), .1, .5, 0.)
+
+    def test_wrap_boundary_half_turn_keeps_requested_direction(self):
+        for start in (math.pi - .02, -math.pi + .02):
+            for direction in (1, -1):
+                with self.subTest(start=start, direction=direction):
+                    controller = RelativeController(pose(yaw=start),
+                        dict(x=0, y=0, yaw=direction * math.pi), .3, .5, 0.)
+                    command, _ = controller.step(pose(yaw=start), 0.)
+                    self.assertGreater(command[2] * direction, 0)
+                    # A wrapped sample on either side of the boundary must not
+                    # turn the remaining ~169 degrees into almost a full turn.
+                    current = wrap(start + direction * .2)
+                    command, _ = controller.step(pose(yaw=current, now=.1), .1)
+                    self.assertGreater(command[2] * direction, 0)
+                    self.assertAlmostEqual(controller.error['angle_error_deg'], direction * math.degrees(math.pi - .2))
+                    current = wrap(start + direction * (math.pi - .01))
+                    controller.step(pose(yaw=current, now=.2), .2)
+                    self.assertLess(abs(controller.error['angle_error_deg']), 1.)
+
+    def test_half_turn_tie_ignores_small_opposite_startup_drift(self):
+        for direction in (1, -1):
+            controller = RelativeController(pose(yaw=3.1),
+                dict(x=0, y=0, yaw=direction * math.pi), .3, .5, 0.)
+            command, _ = controller.step(pose(yaw=wrap(3.1 - direction * .01), now=.1), .1)
+            self.assertGreater(command[2] * direction, 0)
+
     def test_simulated_slip_and_rotation_drift_converge_to_pose(self):
         for angle in (0, math.pi, -math.pi, math.pi / 2):
             with self.subTest(angle=angle):
@@ -621,6 +669,14 @@ class TestClosedLoopWiring(unittest.TestCase):
             cfg['state']['enabled'] = False
             with self.assertRaisesRegex(ValueError, 'publishers'):
                 exec(code, env)
+            for override in ({}, {'loco_relative_move': {}},
+                             {'loco_relative_move': {'enabled': False}}):
+                calls.clear()
+                fresh = SimpleNamespace(_plugins=[])
+                env.update(self=fresh, plugins_cfg=override)
+                exec(code, env)
+                self.assertEqual(calls, [])
+                self.assertEqual(fresh._plugins, [])
 
 
 class TestLocalMotionSafety(unittest.TestCase):

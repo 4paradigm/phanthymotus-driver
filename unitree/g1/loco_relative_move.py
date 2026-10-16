@@ -26,9 +26,12 @@ class LocoRelativeMovePlugin:
         self.closed = False
         self.speed = float(config.get("translation_speed", 0.3))
         self.yaw_speed = float(config.get("rotation_speed", 0.5))
+        self.min_speed = float(config.get("min_translation_speed", 0.2))
         if not (math.isfinite(self.speed) and 0 < self.speed <= 1 and
                 math.isfinite(self.yaw_speed) and 0 < self.yaw_speed <= 2):
             raise ValueError("loco_relative_move speeds must be finite: translation (0,1], rotation (0,2]")
+        if not math.isfinite(self.min_speed) or not 0 < self.min_speed <= self.speed:
+            raise ValueError('Minimum translation speed must be positive and no higher than translation_speed')
         self.safety_config = dict(config.get('safety', {}))
         MotionSafety(self.speed, self.yaw_speed, self.safety_config)  # Validate settings at startup.
 
@@ -44,7 +47,8 @@ class LocoRelativeMovePlugin:
                            "Calls SDK directly without SmartMotion sensor safety checks. "
                            "Local checks stop and latch on stale feedback, pose jumps, tilt and overspeed. "
                            "Targets use the starting body frame. Completion requires position within "
-                           "5 cm and heading within 3 degrees, stable after stopping.",
+                           "5 cm and heading within 3 degrees, stable after stopping. "
+                           "Nonzero translation components have a configurable minimum (default 0.2 m/s).",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
@@ -223,7 +227,8 @@ class LocoRelativeMovePlugin:
 
     def _run(self, job, target):
         status, result = "error", {}
-        controller = RelativeController(job['initial'], target, self.speed, self.yaw_speed, time.monotonic())
+        controller = RelativeController(job['initial'], target, self.speed, self.yaw_speed,
+                                        time.monotonic(), min_speed=self.min_speed)
         try:
             while True:
                 with self.command_lock:

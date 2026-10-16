@@ -133,7 +133,7 @@ class G1DeviceBundle:
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
-        if plugins_cfg.get("loco_relative_move", {}).get("enabled", True):
+        if plugins_cfg.get("loco_relative_move", {}).get("enabled", False):
             if not (plugins_cfg.get("loco", {}).get("enabled", False)
                     and plugins_cfg.get("state", {}).get("enabled", False)):
                 raise ValueError("loco_relative_move requires loco_state and IMU publishers (enable loco and state)")

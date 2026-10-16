@@ -147,20 +147,31 @@ class RelativeController:
     STOP_YAW_RATE = .03
     STALL_SECONDS = 10.
 
-    def __init__(self, initial, target, speed, yaw_speed, now):
+    def __init__(self, initial, target, speed, yaw_speed, now, min_speed=.2):
+        if not math.isfinite(min_speed) or not 0 < min_speed <= speed:
+            raise ValueError('Minimum translation speed must be positive and no higher than the speed cap')
         self.initial = initial
         c, s = math.cos(initial['odom_yaw']), math.sin(initial['odom_yaw'])
         self.x = initial['x'] + c * target['x'] - s * target['y']
         self.y = initial['y'] + s * target['x'] + c * target['y']
         self.yaw = initial['yaw'] + target['yaw']
+        self.requested_turn = target['yaw']
         self.speed, self.yaw_speed = speed, yaw_speed
+        self.min_speed = min_speed
         self.settle_since = None
         self.best = float('inf')
         self.progress_time = now
         self.error = {}
 
     def step(self, pose, now):
-        ex, ey, ea = self.x - pose['x'], self.y - pose['y'], self.yaw - pose['yaw']
+        ex, ey = self.x - pose['x'], self.y - pose['y']
+        ea = wrap(self.yaw - pose['yaw'])
+        # At a half-turn both directions describe the same heading. Preserve the
+        # requested direction around that tie, including small startup noise.
+        if (abs(abs(self.requested_turn) - math.pi) < 1e-9
+                and abs(abs(ea) - math.pi) <= self.ANGLE_TOLERANCE
+                and ea * self.requested_turn < 0):
+            ea = math.copysign(2 * math.pi - abs(ea), self.requested_turn)
         distance = math.hypot(ex, ey)
         self.error = dict(position_error_m=distance, angle_error_deg=math.degrees(ea))
         inside = distance <= self.POSITION_TOLERANCE and abs(ea) <= self.ANGLE_TOLERANCE
@@ -183,10 +194,22 @@ class RelativeController:
             raise RuntimeError('No progress toward target')
         heading = self.initial['odom_yaw'] + pose['yaw'] - self.initial['yaw']
         c, s = math.cos(heading), math.sin(heading)
-        vx, vy = .8 * (c * ex + s * ey), .8 * (-s * ex + c * ey)
-        norm = math.hypot(vx, vy)
-        if norm > self.speed:
-            vx, vy = vx * self.speed / norm, vy * self.speed / norm
+        errors = [c * ex + s * ey, -s * ex + c * ey]
+        velocity = [0., 0.]
+        if distance > self.POSITION_TOLERANCE:
+            # Per-axis deadband keeps the combined position error within the
+            # circular tolerance, without commanding ineffective small components.
+            active = [i for i in range(2) if abs(errors[i]) > self.POSITION_TOLERANCE / math.sqrt(2)]
+            if len(active) == 2 and self.speed < math.sqrt(2) * self.min_speed:
+                active = [max(active, key=lambda i: abs(errors[i]))]
+            magnitudes = [max(self.min_speed, .8 * abs(errors[i])) for i in active]
+            base = len(active) * self.min_speed ** 2
+            extra = sum(value ** 2 - self.min_speed ** 2 for value in magnitudes)
+            scale = min(1., max(0., self.speed ** 2 - base) / extra) if extra > 0 else 1.
+            for i, value in zip(active, magnitudes):
+                bounded = math.sqrt(self.min_speed ** 2 + scale * (value ** 2 - self.min_speed ** 2))
+                velocity[i] = math.copysign(bounded, errors[i])
+        vx, vy = velocity
         vyaw = max(-self.yaw_speed, min(self.yaw_speed, 1.2 * ea))
         return (vx, vy, vyaw), False
 
