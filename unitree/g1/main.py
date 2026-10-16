@@ -144,7 +144,9 @@ class G1DeviceBundle:
             relative_client = LocoClient()
             relative_client.SetTimeout(0.05)  # Bound local DDS writes; never await RPC responses.
             relative_client.Init()
-            feedback = PoseFeedback()
+            safety_cfg = plugins_cfg.get("loco_relative_move", {}).get("safety", {})
+            feedback = PoseFeedback(timeout=safety_cfg.get("feedback_timeout_s", .5),
+                                    skew=safety_cfg.get("feedback_skew_s", .25))
             feedback_node = create_feedback_node(namespace, feedback)
             executor.add_node(feedback_node)
             def close_relative_feedback():

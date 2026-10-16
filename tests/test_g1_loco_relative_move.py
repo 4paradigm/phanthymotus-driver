@@ -10,7 +10,7 @@ import math
 import threading
 import unittest
 from unitree.g1.loco_relative_move import LocoRelativeMovePlugin, PointBackend
-from unitree.g1.relative_feedback import PoseFeedback, RelativeController, wrap
+from unitree.g1.relative_feedback import PoseFeedback, RelativeController, MotionSafety, SafetyViolation, wrap
 from unitree.g1.point_motion import PointMotion
 from unitree.g1.point_rpc import PointRpc
 
@@ -357,7 +357,7 @@ class TestSmartMotionPointIntegration(unittest.TestCase):
 
 
 def pose(x=0., y=0., yaw=0., odom_yaw=0., now=0., speed=0., rate=0.):
-    return dict(x=x, y=y, yaw=yaw, odom_yaw=odom_yaw, speed=speed, yaw_rate=rate,
+    return dict(x=x, y=y, yaw=yaw, roll=0., pitch=0., angular_speed=abs(rate), odom_yaw=odom_yaw, speed=speed, yaw_rate=rate,
                 odom_stamp=now, imu_stamp=now)
 
 
@@ -407,6 +407,7 @@ class TestRelativeController(unittest.TestCase):
                     rate = .85 * w - .015 * abs(vx)
                     current['yaw'] += rate * .05
                     current['speed'], current['yaw_rate'] = math.hypot(bx, by), rate
+                    current['angular_speed'] = abs(rate)
                 self.assertTrue(done)
                 self.assertLessEqual(controller.error['position_error_m'], .05)
                 self.assertLessEqual(abs(controller.error['angle_error_deg']), 3.)
@@ -430,9 +431,11 @@ class TestRelativeController(unittest.TestCase):
             controller.step(pose(now=11), 11)
 
     def test_reset_is_an_error(self):
-        controller = RelativeController(pose(), dict(x=1, y=0, yaw=0), .3, .5, 0)
-        with self.assertRaisesRegex(RuntimeError, 'discontinuity'):
-            controller.step(pose(x=2, now=.1), .1)
+        safety = MotionSafety(.3, .5)
+        safety.check(pose(), 0)
+        with self.assertRaises(SafetyViolation) as caught:
+            safety.check(pose(x=2, now=.1), .1)
+        self.assertEqual(caught.exception.reason, 'position_jump')
 
 
 class FeedbackBackend:
@@ -446,6 +449,8 @@ class FeedbackBackend:
 
     def snapshot(self):
         if self.failure:
+            if isinstance(self.failure, Exception):
+                raise self.failure
             raise RuntimeError(self.failure)
         return {**self.position, 'odom_stamp': time.monotonic(), 'imu_stamp': time.monotonic()}
 
@@ -454,7 +459,7 @@ class FeedbackBackend:
         if any(velocity):
             self.sent.set()
             if self.arrive:
-                self.position = pose(x=.3)
+                self.position = pose(x=min(.3, self.position['x'] + .03))
         return self.send_ret
 
 
@@ -616,3 +621,109 @@ class TestClosedLoopWiring(unittest.TestCase):
             cfg['state']['enabled'] = False
             with self.assertRaisesRegex(ValueError, 'publishers'):
                 exec(code, env)
+
+
+class TestLocalMotionSafety(unittest.TestCase):
+    def test_stale_skew_invalid_and_jumps_latch(self):
+        cases = [
+            ('feedback_stale', pose(now=0), .6),
+            ('feedback_skew', {**pose(now=.3), 'odom_stamp': 0.}, .3),
+            ('feedback_invalid', {**pose(now=.1), 'roll': float('nan')}, .1),
+            ('position_jump', pose(x=.3, now=.1), .1),
+            ('attitude_jump', pose(yaw=.4, now=.1), .1),
+            ('attitude_jump', {**pose(now=.1), 'pitch': .4}, .1),
+        ]
+        for reason, sample, now in cases:
+            with self.subTest(reason=reason):
+                safety = MotionSafety(.3, .5)
+                safety.check(pose(), 0.)
+                with self.assertRaises(SafetyViolation) as caught:
+                    safety.check(sample, now)
+                self.assertEqual(caught.exception.reason, reason)
+                with self.assertRaises(SafetyViolation):
+                    safety.check(pose(now=now), now)
+
+    def test_tilt_debounce_and_severe_threshold(self):
+        safety = MotionSafety(.3, .5)
+        tilted = lambda stamp: {**pose(now=stamp), 'roll': math.radians(26)}
+        safety.check(tilted(0), 0)
+        safety.check(tilted(.1), .1)
+        with self.assertRaises(SafetyViolation) as caught:
+            safety.check(tilted(.15), .15)
+        self.assertEqual(caught.exception.reason, 'tilt')
+        with self.assertRaises(SafetyViolation):
+            MotionSafety(.3, .5).check({**pose(), 'pitch': math.radians(35)}, 0)
+        # A brief excursion does not accumulate after a below-threshold sample.
+        safety = MotionSafety(.3, .5)
+        safety.check(tilted(0), 0)
+        safety.check({**pose(now=.1), 'roll': math.radians(24)}, .1)
+        safety.check(tilted(.2), .2)
+        safety.check(tilted(.3), .3)
+
+    def test_overspeed_debounce_uses_distinct_sensor_samples(self):
+        for reason, extra in [('linear_overspeed', {'speed': .6}),
+                              ('angular_overspeed', {'angular_speed': 1.})]:
+            with self.subTest(reason=reason):
+                safety = MotionSafety(.3, .5)
+                initial = {**pose(), **extra}
+                safety.check(initial, 0)
+                safety.check(initial, .2)  # Re-reading a held sample cannot prove persistence.
+                safety.check({**pose(now=.1), **extra}, .2)
+                with self.assertRaises(SafetyViolation) as caught:
+                    safety.check({**pose(now=.2), **extra}, .2)
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_normal_motion_and_yaw_boundary_do_not_trigger(self):
+        safety = MotionSafety(.3, .5)
+        for step in range(20):
+            sample = pose(x=.03 * step, yaw=3.1 + .04 * step, now=.1 * step, speed=.3, rate=.4)
+            safety.check(sample, .1 * step)
+        for config in ({'tilt_stop_deg': -1}, {'tilt_stop_deg': 20}, {'speed_factor': float('nan')}, {'unknown': 1}):
+            with self.assertRaises(ValueError):
+                MotionSafety(.3, .5, config)
+
+    def test_active_job_stops_latches_and_never_resumes_after_each_safety_event(self):
+        cases = [
+            ('tilt', {'roll': math.radians(40)}),
+            ('position_jump', {'x': 1.}),
+            ('attitude_jump', {'yaw': 1.}),
+            ('linear_overspeed', {'speed': .7}),
+            ('angular_overspeed', {'angular_speed': 1.1}),
+            ('feedback_stale', None),
+        ]
+        for reason, changed in cases:
+            with self.subTest(reason=reason):
+                backend = FeedbackBackend()
+                original_command = backend.command
+                def command(*velocity):
+                    ret = original_command(*velocity)
+                    if not any(velocity):
+                        backend.position = pose()  # Simulated plant stops after receiving zero.
+                    return ret
+                backend.command = command
+                done, notices = threading.Event(), []
+                def notify(action, status, result, **kwargs):
+                    notices.append((status, result))
+                    done.set()
+                card = LocoRelativeMovePlugin({}, backend, notify)
+                card.dispatch('move', dict(x=1, y=1, angle=90))
+                self.assertTrue(backend.sent.wait(1))
+                # Mutating feedback happens between commands; subsequent commands must all be zero.
+                with card.command_lock:
+                    boundary = len(backend.calls)
+                    if changed is None:
+                        backend.failure = SafetyViolation('feedback_stale', 'feedback stale')
+                    else:
+                        backend.position.update(changed)
+                self.assertTrue(done.wait(5))
+                self.assertEqual(notices[0][0], 'error')
+                self.assertEqual(notices[0][1]['safety_reason'], reason)
+                after_event = backend.calls[boundary:]
+                stopped_at = next(i for i, command in enumerate(after_event) if not any(command))
+                self.assertTrue(all(not any(command) for command in after_event[stopped_at:]))
+                self.assertTrue(card.faulted)
+                backend.failure = None
+                backend.position = pose()
+                self.assertIn('error', card.dispatch('move', dict(x=.3)))
+                self.assertEqual(card.dispatch('stop_move', {})['state'], 'idle')
+                self.assertFalse(card.faulted)

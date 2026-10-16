@@ -5,9 +5,9 @@ import time
 from uuid import uuid4
 
 try:
-    from .relative_feedback import RelativeController
+    from .relative_feedback import RelativeController, MotionSafety, SafetyViolation
 except ImportError:
-    from relative_feedback import RelativeController
+    from relative_feedback import RelativeController, MotionSafety, SafetyViolation
 
 
 class LocoRelativeMovePlugin:
@@ -29,6 +29,8 @@ class LocoRelativeMovePlugin:
         if not (math.isfinite(self.speed) and 0 < self.speed <= 1 and
                 math.isfinite(self.yaw_speed) and 0 < self.yaw_speed <= 2):
             raise ValueError("loco_relative_move speeds must be finite: translation (0,1], rotation (0,2]")
+        self.safety_config = dict(config.get('safety', {}))
+        MotionSafety(self.speed, self.yaw_speed, self.safety_config)  # Validate settings at startup.
 
     @property
     def busy(self):
@@ -40,6 +42,7 @@ class LocoRelativeMovePlugin:
             "description": "Closed-loop relative position and heading control using odometry and IMU. "
                            "Translation and rotation run simultaneously; the path may curve. "
                            "Calls SDK directly without SmartMotion sensor safety checks. "
+                           "Local checks stop and latch on stale feedback, pose jumps, tilt and overspeed. "
                            "Targets use the starting body frame. Completion requires position within "
                            "5 cm and heading within 3 degrees, stable after stopping.",
             "inputSchema": {
@@ -133,11 +136,15 @@ class LocoRelativeMovePlugin:
                 return {"error": "loco_relative_move is already running"}
             try:
                 initial = self.loco.snapshot()
+                safety = MotionSafety(self.speed, self.yaw_speed, self.safety_config)
+                safety.check(initial, time.monotonic())
+            except SafetyViolation as exc:
+                return {"error": str(exc), "safety_reason": exc.reason}
             except Exception as exc:
                 return {"error": str(exc)}
             job = dict(id=f"g1_point_{uuid4().hex[:8]}", cancel=threading.Event(),
                        deadline=time.monotonic() + self.MAX_MOTION_SECONDS,
-                       initial=initial)
+                       initial=initial, safety=safety)
             self.active = job
             try:
                 job["worker"] = threading.Thread(target=self._run, args=(job, target), daemon=True)
@@ -170,6 +177,15 @@ class LocoRelativeMovePlugin:
             result = self._send_stop()
             if not job:
                 stopped = result['ret'] == 0 and self._confirm_stop()
+                if stopped:
+                    try:
+                        pose = self.loco.snapshot()
+                        safety = MotionSafety(self.speed, self.yaw_speed, self.safety_config)
+                        safety.check(pose, time.monotonic())
+                        if max(abs(pose['roll']), abs(pose['pitch'])) >= math.radians(safety.config['tilt_threshold_deg']):
+                            stopped = False
+                    except Exception:
+                        stopped = False
                 self.faulted = not stopped
                 result.update(state='idle' if stopped else 'stop_failed',
                               stop_confirmed_by_feedback=stopped)
@@ -195,7 +211,7 @@ class LocoRelativeMovePlugin:
                 pose = self.loco.snapshot()
             except Exception:
                 return False
-            if pose['speed'] <= .03 and abs(pose['yaw_rate']) <= .03:
+            if pose['speed'] <= .03 and pose['angular_speed'] <= .03:
                 if stable is None:
                     stable = time.monotonic()
                 if min(pose['odom_stamp'], pose['imu_stamp']) - stable >= .5:
@@ -217,6 +233,7 @@ class LocoRelativeMovePlugin:
                     if now >= job['deadline']:
                         raise TimeoutError('Relative movement deadline expired')
                     pose = self.loco.snapshot()
+                    job['safety'].check(pose, time.monotonic())
                     velocity, done = controller.step(pose, now)
                     ret = self.loco.command(*velocity)
                     if ret != 0:
@@ -229,6 +246,9 @@ class LocoRelativeMovePlugin:
                 status = 'cancelled'
         except Exception as exc:
             result['error'] = str(exc)
+            job['cancel'].set()
+            if isinstance(exc, SafetyViolation):
+                result['safety_reason'] = exc.reason
         finally:
             if status != 'completed':
                 stopped = self._confirm_stop()
@@ -241,7 +261,7 @@ class LocoRelativeMovePlugin:
             result['stop_confirmed_by_feedback'] = stopped
             result['target'] = dict(x=controller.x, y=controller.y, yaw=controller.yaw)
             with self.command_lock:
-                self.faulted = not stopped
+                self.faulted = not stopped or 'safety_reason' in result
                 if self.active is job:
                     self.active = None
             self.notify(job['id'], status, result, tool=self.PREFIX)
