@@ -1,0 +1,6 @@
+mcp_port: 15794
+robot:
+  url: ws://10.192.1.2:5000
+  # Blank binds to the first valid DACH_TRON2A identity for this process.
+  serial: ""
+position_scale: 0.5

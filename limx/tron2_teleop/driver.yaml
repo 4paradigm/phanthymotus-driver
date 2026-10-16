@@ -1,0 +1,13 @@
+id: limx-tron2-teleop
+name: LimX TRON2 Teleoperation
+category: driver
+hardware_provider: limx
+hardware_model: tron2_teleop
+image_name: limx-tron2-teleop
+port: 15794
+mcp_url: "http://localhost:15794/mcp"
+description: "TRON2 双臂 VR 遥操：独立 IK、直连厂家 ServoJ、输入失效停止发送及实时状态；仅双臂，不含夹爪或录制回放"
+build_context_extras:
+  - ../../common
+cards:
+  - {name: teleop_control, type: actuator}

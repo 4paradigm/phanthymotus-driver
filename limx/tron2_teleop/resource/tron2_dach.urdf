@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- display_hand_gripper_*: fixed, closed schematic outlines only; no gripper opening feedback. -->
+<robot name="robot_description/tron2/DACH_TRON2A">
+  <link name="base_Link">
+    </link>
+  <link name="base_imu">
+    </link>
+  <joint name="base_imu_Joint" type="fixed">
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="base_imu" />
+  </joint>
+  <link name="base_2_Link">
+    </link>
+  <joint name="base_2_Joint" type="fixed">
+    <origin xyz="0.00056 -9e-05 -0.07285" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="base_2_Link" />
+  </joint>
+  <link name="base_3_Link">
+    </link>
+  <joint name="base_3_Joint" type="fixed">
+    <origin xyz="0.0 0.0 -0.9295" rpy="0.0 0.0 0.0" />
+    <parent link="base_2_Link" />
+    <child link="base_3_Link" />
+  </joint>
+  <link name="head_base_Link">
+    </link>
+  <joint name="head_base_Joint" type="fixed">
+    <origin xyz="0.04656 9e-05 0.26115" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="head_base_Link" />
+  </joint>
+  <link name="head_yaw_Link">
+    </link>
+  <joint name="head_yaw_Joint" type="revolute">
+    <origin xyz="0.0 0.0 0.008" rpy="0.0 0.0 0.0" />
+    <parent link="head_base_Link" />
+    <child link="head_yaw_Link" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit lower="-1.5707963267948966" upper="1.5707963267948966" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="head_pitch_Link">
+    </link>
+  <joint name="head_pitch_Joint" type="revolute">
+    <origin xyz="0.051 0.03 0.097" rpy="0.0 0.0 0.0" />
+    <parent link="head_yaw_Link" />
+    <child link="head_pitch_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-0.7853981633974483" upper="1.0471975511965976" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="proximal_pitch_L_Link">
+    </link>
+  <joint name="proximal_pitch_L_Joint" type="revolute">
+    <origin xyz="-0.00044 0.09178 0.05474" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="proximal_pitch_L_Link" />
+    <axis xyz="0.0 0.9961947268929313 -0.0871554135479712" />
+    <limit lower="-3.141592653589793" upper="2.600540585471551" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_roll_L_Link">
+    </link>
+  <joint name="proximal_roll_L_Joint" type="revolute">
+    <origin xyz="-0.032 0.0758 -0.00663" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_pitch_L_Link" />
+    <child link="proximal_roll_L_Link" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit lower="-0.2617993877991494" upper="3.193952531149623" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_yaw_L_Link">
+    </link>
+  <joint name="proximal_yaw_L_Joint" type="revolute">
+    <origin xyz="0.032 0.0 -0.1374" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_roll_L_Link" />
+    <child link="proximal_yaw_L_Link" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit lower="-3.6651914291880923" upper="1.4835298641951802" effort="60.0" velocity="22.52" />
+  </joint>
+  <link name="elbow_L_Link">
+    </link>
+  <joint name="elbow_L_Joint" type="revolute">
+    <origin xyz="0.004 0.02972 -0.2126" rpy="0.0 0.0 0.0" />
+    <parent link="proximal_yaw_L_Link" />
+    <child link="elbow_L_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-2.6179938779914944" upper="0.5235987755982988" effort="70.0" velocity="22.52" />
+  </joint>
+  <link name="wrist_yaw_L_Link">
+    </link>
+  <joint name="wrist_yaw_L_Joint" type="revolute">
+    <origin xyz="-0.004 -0.02972 -0.0685" rpy="0.0 0.0 0.0" />
+    <parent link="elbow_L_Link" />
+    <child link="wrist_yaw_L_Link" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit lower="-1.7453292519943295" upper="1.3962634015954636" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="wrist_pitch_L_Link">
+    </link>
+  <joint name="wrist_pitch_L_Joint" type="revolute">
+    <origin xyz="0.0 0.0367 -0.1743" rpy="0.0 0.0 0.0" />
+    <parent link="wrist_yaw_L_Link" />
+    <child link="wrist_pitch_L_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-0.7853981633974483" upper="0.7853981633974483" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="wrist_roll_L_Link">
+    </link>
+  <joint name="wrist_roll_L_Joint" type="revolute">
+    <origin xyz="0.0317 -0.0367 0.0" rpy="0.0 0.0 0.0" />
+    <parent link="wrist_pitch_L_Link" />
+    <child link="wrist_roll_L_Link" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit lower="-1.5707963267948966" upper="1.5707963267948966" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="grasper_L_Link">
+    </link>
+  <joint name="grasper_L_Joint" type="fixed">
+    <origin xyz="-0.0317 0.0 -0.0812" rpy="0.0 0.0 0.0" />
+    <parent link="wrist_roll_L_Link" />
+    <child link="grasper_L_Link" />
+  </joint>
+  <link name="proximal_pitch_R_Link">
+    </link>
+  <joint name="proximal_pitch_R_Joint" type="revolute">
+    <origin xyz="-0.00044 -0.09178 0.05474" rpy="0.0 0.0 0.0" />
+    <parent link="base_Link" />
+    <child link="proximal_pitch_R_Link" />
+    <axis xyz="0.0 0.9961947268929313 0.0871554135479712" />
+    <limit lower="-3.141592653589793" upper="2.600540585471551" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_roll_R_Link">
+    </link>
+  <joint name="proximal_roll_R_Joint" type="revolute">
+    <origin xyz="-0.032 -0.0758 -0.00663" rpy="-0.0 0.0 -0.0" />
+    <parent link="proximal_pitch_R_Link" />
+    <child link="proximal_roll_R_Link" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit lower="-3.193952531149623" upper="0.2617993877991494" effort="150.0" velocity="18.3" />
+  </joint>
+  <link name="proximal_yaw_R_Link">
+    </link>
+  <joint name="proximal_yaw_R_Joint" type="revolute">
+    <origin xyz="0.032 -0.0 -0.1374" rpy="-0.0 0.0 -0.0" />
+    <parent link="proximal_roll_R_Link" />
+    <child link="proximal_yaw_R_Link" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit lower="-1.4835298641951802" upper="3.6651914291880923" effort="60.0" velocity="22.52" />
+  </joint>
+  <link name="elbow_R_Link">
+    </link>
+  <joint name="elbow_R_Joint" type="revolute">
+    <origin xyz="0.004 -0.02972 -0.2126" rpy="-0.0 0.0 -0.0" />
+    <parent link="proximal_yaw_R_Link" />
+    <child link="elbow_R_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-2.6179938779914944" upper="0.5235987755982988" effort="70.0" velocity="22.52" />
+  </joint>
+  <link name="wrist_yaw_R_Link">
+    </link>
+  <joint name="wrist_yaw_R_Joint" type="revolute">
+    <origin xyz="-0.004 0.02972 -0.0685" rpy="-0.0 0.0 -0.0" />
+    <parent link="elbow_R_Link" />
+    <child link="wrist_yaw_R_Link" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit lower="-1.3962634015954636" upper="1.7453292519943295" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="wrist_pitch_R_Link">
+    </link>
+  <joint name="wrist_pitch_R_Joint" type="revolute">
+    <origin xyz="0.0 -0.0367 -0.1743" rpy="-0.0 0.0 -0.0" />
+    <parent link="wrist_yaw_R_Link" />
+    <child link="wrist_pitch_R_Link" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit lower="-0.7853981633974483" upper="0.7853981633974483" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="wrist_roll_R_Link">
+    </link>
+  <joint name="wrist_roll_R_Joint" type="revolute">
+    <origin xyz="0.0317 0.0367 0.0" rpy="-0.0 0.0 -0.0" />
+    <parent link="wrist_pitch_R_Link" />
+    <child link="wrist_roll_R_Link" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit lower="-1.5707963267948966" upper="1.5707963267948966" effort="20.0" velocity="17.8" />
+  </joint>
+  <link name="grasper_R_Link">
+    </link>
+  <joint name="grasper_R_Joint" type="fixed">
+    <origin xyz="-0.0317 -0.0 -0.0812" rpy="-0.0 0.0 -0.0" />
+    <parent link="wrist_roll_R_Link" />
+    <child link="grasper_R_Link" />
+  </joint>
+  <link name="d435_Link">
+    </link>
+  <joint name="d435_Joint" type="fixed">
+    <origin xyz="0.0968 0.01759 -0.00409" rpy="0 2.7227 0" />
+    <parent link="base_Link" />
+    <child link="d435_Link" />
+  </joint>
+  <link name="d435_optical_frame">
+    </link>
+  <joint name="d435_optical_Joint" type="fixed">
+    <origin rpy="-1.5707963267948966 0 -1.5707963267948966" xyz="0 0 0" />
+    <parent link="d435_Link" />
+    <child link="d435_optical_frame" />
+  </joint>
+  <link name="display_hand_gripper_L_a_base_Link" />
+  <joint name="display_hand_gripper_L_a_base_Joint" type="fixed">
+    <origin xyz="0 0.004 0" rpy="0 0 0" />
+    <parent link="grasper_L_Link" />
+    <child link="display_hand_gripper_L_a_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_L_a_tip_Link" />
+  <joint name="display_hand_gripper_L_a_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_L_a_base_Link" />
+    <child link="display_hand_gripper_L_a_tip_Link" />
+  </joint>
+  <link name="display_hand_gripper_L_b_base_Link" />
+  <joint name="display_hand_gripper_L_b_base_Joint" type="fixed">
+    <origin xyz="0 -0.004 0" rpy="0 0 0" />
+    <parent link="grasper_L_Link" />
+    <child link="display_hand_gripper_L_b_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_L_b_tip_Link" />
+  <joint name="display_hand_gripper_L_b_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_L_b_base_Link" />
+    <child link="display_hand_gripper_L_b_tip_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_a_base_Link" />
+  <joint name="display_hand_gripper_R_a_base_Joint" type="fixed">
+    <origin xyz="0 0.004 0" rpy="0 0 0" />
+    <parent link="grasper_R_Link" />
+    <child link="display_hand_gripper_R_a_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_a_tip_Link" />
+  <joint name="display_hand_gripper_R_a_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_R_a_base_Link" />
+    <child link="display_hand_gripper_R_a_tip_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_b_base_Link" />
+  <joint name="display_hand_gripper_R_b_base_Joint" type="fixed">
+    <origin xyz="0 -0.004 0" rpy="0 0 0" />
+    <parent link="grasper_R_Link" />
+    <child link="display_hand_gripper_R_b_base_Link" />
+  </joint>
+  <link name="display_hand_gripper_R_b_tip_Link" />
+  <joint name="display_hand_gripper_R_b_tip_Joint" type="fixed">
+    <origin xyz="0 0 -0.065" rpy="0 0 0" />
+    <parent link="display_hand_gripper_R_b_base_Link" />
+    <child link="display_hand_gripper_R_b_tip_Link" />
+  </joint>
+</robot>
