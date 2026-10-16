@@ -122,9 +122,10 @@ class BumiDeviceBundle:
         camera_plugin = None
 
         if plugins_cfg.get("squat_counter", {}).get("enabled", False):
-            from squat_counter import SquatCounterPlugin
-            self._plugins.append(SquatCounterPlugin(
-                plugins_cfg["squat_counter"], namespace, executor))
+            import squat_counter as squat_counter_mod
+            squat_plugin = squat_counter_mod.make_plugin(
+                plugins_cfg["squat_counter"], namespace, executor, None)
+            self._plugins.append(squat_plugin)
             print("[bundle] SquatCounterPlugin loaded")
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:

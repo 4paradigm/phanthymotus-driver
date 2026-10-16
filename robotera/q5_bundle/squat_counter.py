@@ -1,4 +1,8 @@
-"""Q5 processor card consuming Perception's lean pose JSON stream for squat counting."""
+"""Q5 processor card consuming Perception's lean pose JSON stream for squat counting.
+
+Maintains pose history and exposes 'analyze' action for LLM/skill to make
+squat detection decisions based on structured frame summaries.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,7 @@ import json
 import threading
 import time
 
-from squat_count import SquatCounter
+from squat_llm_count import SquatHistoryCounter
 
 try:
     from rclpy.node import Node
@@ -19,7 +23,7 @@ except Exception:
 
 CARD = "squat_counter"
 TYPE = "processor"
-DESC = "基于 pose 姿态数据计数的深蹲计数器"
+DESC = "基于 pose 姿态数据计数的深蹲计数器（维护历史数据供 LLM 分析）"
 
 
 class Plugin:
@@ -28,12 +32,9 @@ class Plugin:
         self._lock = threading.RLock()
         self._namespace = namespace
         self._output_topic = f"/{namespace}/squat/count"
-        self._counter = SquatCounter(
-            height_drop_px=plugin_config.get("height_drop_px", 60.0),
-            height_rise_px=plugin_config.get("height_rise_px", 40.0),
-            hold_s=plugin_config.get("hold_s", 0.15),
+        self._counter = SquatHistoryCounter(
+            history_frames=plugin_config.get("history_frames", 10),
             lost_s=plugin_config.get("lost_s", 4.0),
-            min_confidence=plugin_config.get("min_confidence", 0.3),
         )
         self._subscription = None
         self._input_topic = ""
@@ -63,7 +64,7 @@ class Plugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "info", "reset"],
+                        "enum": ["start", "stop", "info", "reset", "analyze"],
                     },
                     "input_topic": {
                         "type": "string",
@@ -88,6 +89,10 @@ class Plugin:
                         "params": [],
                         "description": "Reset the count",
                     },
+                    "analyze": {
+                        "params": [],
+                        "description": "Return structured pose history summary for LLM analysis",
+                    },
                 },
             },
             "topic_in": [{"format": "data/json", "desc": "pose postures"}],
@@ -109,7 +114,7 @@ class Plugin:
             "state": "running" if self._subscription else "idle",
             "count": self._counter.count,
             "track_id": self._counter.track_id,
-            "phase": self._counter.current_phase,
+            "frame_count": len(self._counter.history),
             "topic_in": (
                 [{"topic": topic, "format": "data/json"}] if topic else []
             ),
@@ -171,6 +176,8 @@ class Plugin:
             if action == "reset":
                 self._counter.reset()
                 return self._info()
+            if action == "analyze":
+                return self._counter.get_summary()
         return None
 
     def _on_pose(self, msg):
@@ -181,14 +188,11 @@ class Plugin:
             with self._lock:
                 if self._subscription is None:
                     return
-                event = self._counter.update(
-                    payload.get("persons"), time.monotonic()
-                )
-                if event is not None:
-                    event["timestamp"] = time.time()
-                    output = String()
-                    output.data = json.dumps(event, ensure_ascii=False)
-                    self._publisher.publish(output)
+                persons = payload.get("persons", [])
+                now = time.monotonic()
+                for person in persons:
+                    if isinstance(person, dict):
+                        self._counter.add_frame(person, now)
         except (ValueError, TypeError, KeyError, IndexError) as exc:
             now = time.monotonic()
             if now - self._last_warn >= 1.0 and self._node:

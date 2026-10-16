@@ -14,11 +14,8 @@ plugins:
     enabled: true
   squat_counter:
     enabled: true
-    height_drop_px: 60.0
-    height_rise_px: 40.0
-    hold_s: 0.15
+    history_frames: 10
     lost_s: 4.0
-    min_confidence: 0.3
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.
