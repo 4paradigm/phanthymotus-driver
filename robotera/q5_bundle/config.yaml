@@ -148,7 +148,7 @@ plugins:
     enabled: true
   squat_counter:
     enabled: true
-    window_s: 1.5
-    down_ratio: 0.3
-    lost_s: 3.0
-    min_confidence: 0.4
+    window_s: 0.8
+    down_ratio: 0.2
+    lost_s: 4.0
+    min_confidence: 0.3
