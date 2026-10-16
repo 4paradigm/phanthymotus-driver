@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.7.3'
+VERSION = '0.7.4'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -138,8 +138,8 @@ def run_check(timeout=20, camera=False):
         schema = head_tool['inputSchema']; props = schema['properties']
         if set(props) != {'pitch_deg','yaw_deg','time'} or schema.get('x-completion') != {'timeout':120} or \
                 schema.get('x-resource') != ['head','arm_l','arm_r'] or \
-                (props['pitch_deg'].get('minimum'),props['pitch_deg'].get('maximum')) != (-45,60) or \
-                (props['yaw_deg'].get('minimum'),props['yaw_deg'].get('maximum')) != (-89.95,89.95):
+                (props['pitch_deg'].get('minimum'),props['pitch_deg'].get('maximum')) != (-60,45) or \
+                (props['yaw_deg'].get('minimum'),props['yaw_deg'].get('maximum')) != (-90,90):
             raise ValueError('Head limits, schema or ACP tracking differ from the reviewed card')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):

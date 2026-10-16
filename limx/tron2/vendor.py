@@ -24,11 +24,11 @@ ARM_UPPER = (2.6005, 3.1940, 1.4835, .2618, 1.3963, .7854, 1.5708,
              2.6005, .2618, 3.6652, .2618, 1.7453, .7854, 1.5708)
 
 
-# Operator-authorized pitch trial using the DACH manual's exact -45..60deg.
-# This intentionally differs from the SDK/UI's rounded -.78..1.04 radians;
-# controller acceptance is NOT established. Yaw keeps the reviewed 0.7.2 bounds.
-HEAD_RAD_LIMITS = ((math.radians(-45), math.radians(60)), (-1.57, 1.57))
-HEAD_DEG_LIMITS = ((-45, 60), (-89.95, 89.95))
+# Operator requests the DACH manual/URDF limits for both axes. Pitch motion
+# was reported working on 0.7.3; yaw endpoints are not yet field-verified.
+# Preserve native vendor signs and exact degree-to-radian conversion.
+HEAD_RAD_LIMITS = ((math.radians(-45), math.radians(60)), (-math.pi/2, math.pi/2))
+HEAD_DEG_LIMITS = ((-45, 60), (-90, 90))
 
 
 def validate_moveh(joint, duration):

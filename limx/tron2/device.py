@@ -12,12 +12,12 @@ from vendor import RobotReader, validate_movej, reject_constant, motion_readines
 from reset import ResetPose
 from skeleton import skeleton_stream, model
 from completion import ArmCompletion, MotionPeers, ACP_TIMEOUT
-from head import HeadCompletion, tool as head_tool, arguments as head_arguments
+from head import HeadCompletion, tool as head_tool, arguments as head_arguments, card_degrees, COORDINATE_CONVENTION
 from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.7.3'
+VERSION = '0.7.4'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -209,8 +209,10 @@ class Adapter:
                     raise ValueError('头部状态与生命周期操作不接受运动参数')
                 if action == 'info':
                     _, q, dq = self.head.feedback()
+                    pitch,yaw=card_degrees(q)
                     return {'read_only':True,'motion_sent':False,
-                        'pitch_deg':math.degrees(q[0]),'yaw_deg':math.degrees(q[1]),
+                        'pitch_deg':pitch,'yaw_deg':yaw,'vendor_joint_rad':q,
+                        'coordinate_convention':COORDINATE_CONVENTION,
                         'velocity_raw':dq,'motion':self.head.summary(),
                         'state':self.head.active['state'] if self.head.active else 'ready'}
                 return {'motion_sent':False,'lifecycle_only':True,

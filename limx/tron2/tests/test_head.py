@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import aiohttp
 from aiohttp import web
 from test_sensors import settings, info, joints
-from head import HeadCompletion, arguments, tool
+from head import HeadCompletion, arguments, tool, card_degrees, COORDINATE_CONVENTION
 from device import Adapter
 from skeleton import JOINT_NAMES
 from state import joint_state
@@ -19,28 +19,31 @@ from vendor import MoveError, RobotReader, validate_moveh, HEAD_RAD_LIMITS
 
 class HeadValidationTests(unittest.TestCase):
     def test_manual_degrees_convert_to_only_two_radians(self):
-        for pitch,yaw in ((-45,-89.95),(60,89.95),(0,0),(12,-20)):
+        for pitch,yaw in ((-60,-90),(45,90),(0,0),(12,-20)):
             target,duration=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
-            self.assertEqual(target,[math.radians(pitch),math.radians(yaw)])
+            self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
+            for actual,expected in zip(card_degrees(target),(pitch,yaw)):
+                self.assertAlmostEqual(actual,expected)
             self.assertEqual(duration,5)
         props=tool()['inputSchema']
         self.assertEqual(set(props['properties']),{'pitch_deg','yaw_deg','time'})
-        self.assertEqual(props['properties']['pitch_deg']['minimum'],-45)
-        self.assertEqual(props['properties']['pitch_deg']['maximum'],60)
-        self.assertEqual(props['properties']['yaw_deg']['minimum'],-89.95)
+        self.assertEqual(props['properties']['pitch_deg']['minimum'],-60)
+        self.assertEqual(props['properties']['pitch_deg']['maximum'],45)
+        self.assertEqual(props['properties']['yaw_deg']['minimum'],-90)
+        self.assertEqual(props['properties']['yaw_deg']['maximum'],90)
         self.assertEqual(props['required'],['pitch_deg','yaw_deg'])
         self.assertNotIn('action',props['properties'])
         self.assertNotIn('x-action-params',props)
         self.assertEqual(props['x-completion'],{'timeout':120})
 
-    def test_authorized_pitch_trial_keeps_exact_endpoints_and_original_yaw_bounds(self):
-        for pitch,yaw in ((60.001,0),(-45.001,0),(0,90),(0,-90),(60,90)):
+    def test_customer_endpoints_preserve_native_physical_limits_without_clamping(self):
+        for pitch,yaw in ((45.001,0),(-60.001,0),(0,90.001),(0,-90.001),(45,90.001)):
             with self.subTest(pitch=pitch,yaw=yaw),self.assertRaisesRegex(ValueError,'头部角度范围'):
                 arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
-            with self.assertRaises(ValueError):validate_moveh([math.radians(pitch),math.radians(yaw)],5)
-        for pitch,yaw in ((-45,-89.95),(60,89.95),(5,0)):
+            with self.assertRaises(ValueError):validate_moveh([math.radians(-pitch),math.radians(yaw)],5)
+        for pitch,yaw in ((-60,-90),(45,90),(5,0),(0,-90),(0,90),(-12,20)):
             target,_=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
-            self.assertEqual(target,[math.radians(pitch),math.radians(yaw)])
+            self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
             self.assertTrue(all(low<=v<=high for v,(low,high) in zip(target,HEAD_RAD_LIMITS)))
 
     def test_missing_bad_and_out_of_range_values_never_validate(self):
@@ -117,13 +120,26 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary['callback_delivered'])
         self.assertFalse(summary['arrival_verified'])
         self.assertEqual(summary['state'],'blocked_requires_operator_check')
-        self.assertAlmostEqual(summary['target_pitch_deg'],math.degrees(.1))
+        self.assertAlmostEqual(summary['target_pitch_deg'],-math.degrees(.1))
         self.assertEqual(summary['current_pitch_deg'],0)
         with self.assertRaisesRegex(MoveError,'头部未确认到位') as caught:await self.dispatch()
         self.assertEqual(caught.exception.code,'head_requires_operator_check')
         self.reader.send_moveh.assert_awaited_once()
         self.reader.joints_at-=100
         self.assertFalse(self.owner.summary()['feedback_available'])
+
+    async def test_failed_task_reports_customer_signs_without_changing_raw_joint_feedback(self):
+        await self.dispatch();self.pump([0]*14+[.05,-.02]);await self.owner.task
+        summary=self.owner.summary()
+        self.assertEqual(summary['status'],'error')
+        self.assertAlmostEqual(summary['target_pitch_deg'],-math.degrees(.1))
+        self.assertAlmostEqual(summary['current_pitch_deg'],-math.degrees(.05))
+        self.assertAlmostEqual(summary['current_yaw_deg'],math.degrees(-.02))
+        self.assertEqual(summary['target_vendor_rad'],[.1,-.1])
+        self.assertEqual(summary['current_vendor_rad'],[.05,-.02])
+        self.assertEqual(self.reader.sample('joint_state')['data']['q'][14:],[.05,-.02])
+        self.assertIn('俯仰-5.73°',summary['error'])
+        self.assertIn('俯仰-2.86°',summary['error'])
 
     async def test_moving_velocity_or_wrong_target_cannot_complete(self):
         await self.dispatch();self.pump([0]*14+[.1,-.1],dq=[0]*14+[1,0])
@@ -218,15 +234,15 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                                       'working_mode':'developer_mode','working_mode_valid':True})
         app=web.Application();app.router.add_get('/robot',robot);app.router.add_post('/api/acp/complete',complete)
         app.router.add_get('/get_robot_info',control_status)
-        runner=web.AppRunner(app);await runner.setup()
+        runner=web.AppRunner(app,shutdown_timeout=.2);await runner.setup()
         site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
         port=site._server.sockets[0].getsockname()[1]
         api_patch=patch('vendor.HEAD_API_PORT',port);api_patch.start()
-        async with aiohttp.ClientSession(trust_env=False) as session:
-            reader=RobotReader(settings(url='ws://127.0.0.1:'+str(port)+'/robot',poll_interval_seconds=.01,response_timeout_seconds=.12))
+        async with aiohttp.ClientSession(trust_env=False,timeout=aiohttp.ClientTimeout(total=5)) as session:
+            reader=RobotReader(settings(url='ws://127.0.0.1:'+str(port)+'/robot',poll_interval_seconds=.01,response_timeout_seconds=.3))
             adapter=Adapter(lambda *a:None,settings(enabled_cards=['joint_state','move_head']),reader=reader,session=session)
             app2=web.Application();app2.router.add_post('/mcp',adapter.rpc)
-            run2=web.AppRunner(app2);await run2.setup();site2=web.TCPSite(run2,'127.0.0.1',0);await site2.start()
+            run2=web.AppRunner(app2,shutdown_timeout=.2);await run2.setup();site2=web.TCPSite(run2,'127.0.0.1',0);await site2.start()
             task=asyncio.create_task(reader.run(session))
             try:
                 for _ in range(100):
@@ -238,17 +254,24 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                 with patch.dict('os.environ',{'AGENT_CORE_URL':'http://127.0.0.1:'+str(port)}),patch('completion.STABILITY_SECONDS',.05):
                     async with session.post('http://127.0.0.1:'+str(site2._server.sockets[0].getsockname()[1])+'/mcp',json={
                         'jsonrpc':'2.0','id':7,'method':'tools/call','params':{'name':'move_head','arguments':{
-                            'pitch_deg':10,'yaw_deg':-12,'time':.1,'_trace_id':'trace','instance_id':'card'}}}) as response:
+                            'pitch_deg':10,'yaw_deg':12,'time':.1,'_trace_id':'trace','instance_id':'card'}}}) as response:
                         result=(await response.json())['result'];self.assertFalse(result['isError'])
                         admitted=json.loads(result['content'][0]['text']);self.assertFalse(admitted['arrival_verified'])
                     await asyncio.wait_for(adapter.head.task,2)
                 writes=[p for p in requests if p['title']!='request_get_joint_state']
                 self.assertEqual(len(writes),1);self.assertEqual(writes[0]['title'],'request_moveh')
-                self.assertEqual(writes[0]['data'],{'joint':[math.radians(10),math.radians(-12)],'time':.1})
+                self.assertEqual(writes[0]['data'],{'joint':[math.radians(-10),math.radians(12)],'time':.1})
                 self.assertNotIn('_trace_id',writes[0]);self.assertNotIn('instance_id',writes[0])
                 self.assertEqual(completions[0]['tool'],'move_head');self.assertEqual(completions[0]['status'],'completed')
                 self.assertEqual(completions[0]['action_id'],admitted['action_id'])
                 self.assertTrue(completions[0]['result']['head_target_verified'])
+                self.assertEqual(completions[0]['result']['coordinate_convention'],COORDINATE_CONVENTION)
+                self.assertEqual(completions[0]['result']['target_pitch_deg'],10)
+                self.assertEqual(completions[0]['result']['reported_pitch_deg'],10)
+                self.assertAlmostEqual(completions[0]['result']['reported_yaw_deg'],12)
+                feedback=adapter.call('move_head',{'action':'info'})
+                self.assertEqual(feedback['pitch_deg'],10)
+                self.assertEqual(feedback['vendor_joint_rad'],[math.radians(-10),math.radians(12)])
                 self.assertIsNone(adapter.head.active)
                 vr_follow[0]=True
                 before=len([p for p in requests if p['title']=='request_moveh'])
@@ -265,7 +288,9 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(MoveError,'unconfirmed'):await reader.send_moveh([0,0],1)
                 self.assertIsNone(reader.head_pending)
             finally:
-                await adapter.head.close();task.cancel();await asyncio.gather(task,return_exceptions=True)
+                await adapter.head.close()
+                if reader.ws is not None:await reader.ws.close()
+                task.cancel();await asyncio.wait_for(asyncio.gather(task,return_exceptions=True),2)
                 await run2.cleanup()
                 api_patch.stop()
         await runner.cleanup()
