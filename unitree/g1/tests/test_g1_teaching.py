@@ -25,7 +25,9 @@ def wait_for(predicate, timeout=8):
 
 
 @pytest.fixture
-def g1_teaching(tmp_path):
+def g1_teaching(tmp_path, monkeypatch):
+    monkeypatch.setattr('common.teaching.service.read_execution_policy',
+                        lambda *args, **kwargs: {'enabled': False, 'device_enabled': False, 'source': 'manual'})
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     service = teaching_plugin(card)
     frame = copy.deepcopy(card._latest)

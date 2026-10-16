@@ -71,3 +71,22 @@ def test_stop_racing_authorized_execution_cannot_reuse_grant(g1_teaching, monkey
     with pytest.raises(ValueError, match='session_authorization_expired'):
         call(service, 'run', **preview['execution_arguments'])
     assert len(channel.positions) == before and asset not in service.grants
+
+
+def test_config_arguments_cannot_grant_but_core_policy_can(g1_teaching, monkeypatch):
+    service, _, _, _, channel, _ = g1_teaching
+    _, saved, _ = save(service)
+    asset = saved['asset_id']; before = len(channel.positions)
+    call(service, 'config', auto_execute_verified=True)
+    assert call(service, 'preview', asset_id=asset)['confirmation_required']
+    binding = call(service, 'execution_binding', asset_id=asset)
+    def policy(tool, instance_id, **actual):
+        assert tool == 'g1_teaching' and actual == binding
+        return {'enabled': True, 'device_enabled': True, 'source': 'card'}
+    monkeypatch.setattr('common.teaching.service.read_execution_policy', policy)
+    preview = call(service, 'preview', asset_id=asset)
+    assert not preview['confirmation_required'] and 'workspace_clear' not in preview['execution_arguments']
+    assert len(channel.positions) == before
+    # An ordinary stop revokes transient grants, not the saved Core setting.
+    call(service, 'stop')
+    assert not call(service, 'preview', asset_id=asset)['confirmation_required']

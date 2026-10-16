@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
 from .package import Transfers, pack, SCHEMA as PACKAGE_SCHEMA
-from .authorization import consume_approval
+from .authorization import consume_approval, read_execution_policy
 
 PROTOCOL = "motus.workbench/1"
 ASSET_SCHEMA = "motus.teaching.asset/1"
@@ -58,7 +58,8 @@ class TeachingPlugin:
             "draft_id": {"type": "string", "description": "当前示教草稿 ID"},
             "filename": {"type": "string", "description": "已有完整录制文件"},
             "asset_id": {"type": "string", "description": "技能指令中的资产 ID；预览和正式执行都必须传同一个 ID"},
-            "execute": {"type": "boolean", "default": False, "description": "正式执行必须为 true；先 preview 并取得用户本次确认"},
+            "execute": {"type": "boolean", "default": False, "description": "正式执行必须为 true；先 preview，按 confirmation_required 判断是否需要人工确认"},
+            "auto_execute_verified": {"type": "boolean", "x-ui-hidden": True},
             "preview_id": {"type": "string", "description": "本次 preview 返回的完整编号，正式执行必填；不得省略或自行编造"},
             "workspace_clear": {"type": "boolean", "description": "用户确认本次活动空间已清空"},
             "take_control": {"type": "boolean", "description": "用户确认本次接管机器人"},
@@ -84,8 +85,8 @@ class TeachingPlugin:
             "inspect": (["draft_id"], "预览录制并比较当前姿态与回放起点"),
             "trial": (["draft_id", *confirmation], "预览或确认试运行当前录制"),
             "save": (["draft_id", "name", "description", "conditions", "phrase", "effect_confirmed"], "试运行成功且用户确认效果后保存技能"),
-            "run": (["asset_id", *confirmation], "执行已保存技能；先 preview。有网页会话授权时无需重复询问，否则须取得本次确认。running 不是完成"),
-            "preview": (["asset_id"], "只读预览并检查网页会话授权；confirmation_required=false 时用户已授权，可按返回参数执行，无需再询问"),
+            "run": (["asset_id", *confirmation], "执行已保存技能；先 preview。confirmation_required=false 时直接执行，否则检查本次用户确认。running 不是完成"),
+            "preview": (["asset_id"], "只读预览并检查卡片和技能的自动执行设置；confirmation_required=false 时直接按返回参数执行，不再询问"),
             "stop": ([], "请求原控制器停止，读取 info 确认完成结果"),
         }
         if hasattr(self.adapter, "compatibility"):
@@ -102,6 +103,10 @@ class TeachingPlugin:
                             "session_challenge": (["asset_id"], "为网页授权生成一次性核验请求，不授予权限"),
                             "session_authorize": (["asset_id", "approval_id"], "核验 Core 网页一次性授权凭据"),
                             "session_revoke": (["asset_id"], "撤销本次调用权限，不触发动作")})
+        persistent = hasattr(self.adapter, 'execution_binding')
+        if persistent:
+            actions.update({'config': (['auto_execute_verified'], '应用网页保存的卡片配置'),
+                            'execution_binding': (['asset_id'], '读取设备及已验证动作的绑定，不执行动作')})
         schema = action_schema(actions, fields)
         schema["additionalProperties"] = False
         schema["x-resource"] = getattr(self.adapter, "resources", "arm")
@@ -111,7 +116,8 @@ class TeachingPlugin:
                                  "title": "录制技能 · " + self.adapter.title, "entry": "ui", "actions": list(actions)}
         if hasattr(self.adapter, "compatibility"):
             schema["x-skill-package"] = {"schema": PACKAGE_SCHEMA, "pending": True,
-                                        "session_authorization": hasattr(self.adapter, 'authorization_context')}
+                                        "session_authorization": hasattr(self.adapter, 'authorization_context'),
+                                        "persistent_execution": persistent}
         schema["properties"]["action"]["oneOf"] = [
             {"const": a, "title": {"ui": "录制技能", "run": "运行技能"}.get(a, a)} for a in actions]
         # The full wire contract includes authoring. Only execution/lifecycle are
@@ -119,7 +125,13 @@ class TeachingPlugin:
         schema["x-action-params"] = {a: schema["x-action-params"][a] for a in ("start", "info", "preview", "run", "stop")}
         schema["x-action-params"]["preview"]["required"] = ["asset_id"]
         schema["x-action-params"]["run"]["required"] = ["asset_id", "execute", "preview_id"]
-        return [tool(self.name, "actuator", self.adapter.title + "：基于已验证示教录制的技能；保留原有速度、标定和设备绑定。", schema)]
+        definition = tool(self.name, "actuator", self.adapter.title + "：基于已验证示教录制的技能；保留原有速度、标定和设备绑定。", schema)
+        if persistent:
+            definition['configSchema'] = {'type': 'object', 'additionalProperties': False, 'properties': {
+                'auto_execute_verified': {'type': 'boolean', 'default': False, 'scope': 'instance', 'x-widget': 'checkbox',
+                    'title': '本设备所有已验证技能自动执行',
+                    'description': '开启后，已有及以后验证通过的示教技能无需逐次确认。长期保存；每次仍检查设备、起点和控制权。'}}}
+        return [definition]
 
     def _validate(self, action, args):
         schema = self.get_tools()[0]["inputSchema"]
@@ -143,6 +155,25 @@ class TeachingPlugin:
     def _idle(self):
         if self.pending or self.adapter.info()["busy"]:
             raise RuntimeError("robot_busy_wait_for_completion")
+
+    def _execution_binding(self, asset_id=''):
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        result = {'device_binding': digest(self.adapter.execution_binding())}
+        if asset_id:
+            asset, recording = self._read_asset(asset_id)
+            if not asset.get('effect_confirmed') or asset.get('trial', {}).get('status') != 'completed':
+                raise ValueError('successful_trial_required')
+            result.update(asset_id=asset_id, asset_binding=digest({
+                'sha256': recording['sha256'], 'binding': recording['binding'], 'metadata': asset['metadata']}))
+        return result
+
+    def _execution_policy(self, args):
+        if not hasattr(self.adapter, 'execution_binding'):
+            return {'enabled': False, 'device_enabled': False, 'supported': False}
+        binding = self._execution_binding(args.get('asset_id', ''))
+        policy = read_execution_policy(self.name, args.get('instance_id', ''), **binding)
+        return {**policy, 'supported': True}
 
     def _grant(self, asset_id, recording):
         grant = self.grants.get(asset_id)
@@ -294,11 +325,16 @@ class TeachingPlugin:
         if not args.get("asset_id"):
             raise ValueError("missing_asset_id: 预览和正式执行均须传技能指令中的 asset_id；没有执行动作")
         _, recording = self._read_asset(args["asset_id"])
+        policy = self._execution_policy(args)
+        automatic = policy.get('enabled') is True
         grant = self._grant(args['asset_id'], recording) if hasattr(self.adapter, 'authorization_context') else None
         if args.get("execute") is True:
             if not args.get("preview_id"):
                 raise ValueError("missing_preview_id: 请保留 asset_id 并补齐本次预览的 preview_id；没有执行动作")
-            if grant:
+            if automatic:
+                args = dict(args, workspace_clear=True, take_control=True,
+                            _authorized_context=self.adapter.authorization_context())
+            elif grant:
                 args = dict(args, workspace_clear=True, take_control=True, _authorized_context=list(grant['context']))
             elif args.get("workspace_clear") is not True or args.get("take_control") is not True:
                 raise ValueError("user_confirmation_required: 请先询问用户本次路径、环境和双臂接管；不得自行将确认字段设为 true")
@@ -310,11 +346,13 @@ class TeachingPlugin:
         if grant and result.get('state') == 'running':
             grant['context'] = result.pop('_authorization_context')
         if result.get("executed") is False:
-            result.update(asset_id=args["asset_id"], confirmation_required=not bool(grant),
-                          next_step=("网页会话授权有效，按 execution_arguments 执行，无需重复询问；预览不是动作完成" if grant else
-                                     "询问用户本次活动空间、使用条件及双臂接管，得到确认后再执行；也可在技能详情授权本次会话"),
+            authorized = automatic or bool(grant)
+            result.update(asset_id=args["asset_id"], confirmation_required=not authorized,
+                          execution_policy=policy,
+                          next_step=("已允许自动执行，按 execution_arguments 执行，无需重复询问；预览不是动作完成" if authorized else
+                                     "询问用户本次活动空间、使用条件及双臂接管，得到确认后再执行；也可在技能详情设置自动执行"),
                           execution_arguments={"asset_id": args["asset_id"], "execute": True,
-                              "preview_id": result["preview_id"], **({} if grant else {"workspace_clear": False, "take_control": False})})
+                              "preview_id": result["preview_id"], **({} if authorized else {"workspace_clear": False, "take_control": False})})
         result.pop('_authorization_context', None)
         return result
 
@@ -384,12 +422,12 @@ class TeachingPlugin:
                 f"这是 {self.adapter.title} 的已示教录制技能，资产 ID：{asset_id}。\n"
                 f"用户描述：{metadata['description']}\n使用条件：{metadata['conditions']}\n"
                 f"1. 调用当前设备的 {self.name}.preview，参数：" + json.dumps({"asset_id": asset_id}) + "。\n"
-                "2. 预览成功没有执行动作。若 confirmation_required=false，驱动已核验网页授予的本次会话授权，"
-                "用户要求执行时直接使用返回的 execution_arguments，不再追问。若为 true，表示没有网页会话授权，不表示用户尚未在对话中确认。"
+                "2. 预览成功没有执行动作。若 confirmation_required=false，驱动已核验卡片/技能自动执行设置或有效会话授权，"
+                "用户要求执行时直接使用返回的 execution_arguments，不再追问。若为 true，表示没有自动执行权限，不表示用户尚未在对话中确认。"
                 "先检查当前尚未执行的同一次请求：用户若已明确确认本次使用条件、移动路径、活动空间和双臂接管，不再重复询问；缺少确认时只询问缺少的条件并等待答复。"
-                "也可提示用户在技能详情授权本次会话。不得调用 session_challenge/session_authorize 自行授予权限。"
-                "用户只说技能名称或‘抬手’不等于已确认环境与接管。未取得确认不得填写 true；已经明确确认时应据实填写 true，不得原样照抄预览中的 false。未执行不得播报动作已完成。\n"
-                f"3. 会话授权有效时直接调用 {self.name}.run 并原样传入 execution_arguments。仅当需要逐次确认时，取得确认后必须一次传齐：" + json.dumps({"asset_id": asset_id,
+                "用户可在示教保存、技能详情或卡片配置设置自动执行，持久设置在停止项目和重启后仍保留。不得自行修改配置或调用 session_challenge/session_authorize 授予权限。"
+                "仅在 confirmation_required=true 时，用户只说技能名称或‘抬手’不等于已确认环境与接管。未取得确认不得填写 true；已经明确确认时应据实填写 true，不得原样照抄预览中的 false。未执行不得播报动作已完成。\n"
+                f"3. confirmation_required=false 时直接调用 {self.name}.run 并原样传入 execution_arguments。仅当需要逐次确认时，取得确认后必须一次传齐：" + json.dumps({"asset_id": asset_id,
                     "execute": True, "preview_id": "替换为本次预览返回的完整 preview_id", "workspace_clear": True,
                     "take_control": True}, ensure_ascii=False) + "。每次都带 asset_id，不能只传 preview_id。\n"
                 "4. 缺少参数只补齐该参数，不得换动作或猜测起点；等待用户答复导致预览过期时重新预览。重新预览不会抹掉用户对同一次尚未执行请求的明确确认。"
@@ -416,6 +454,12 @@ class TeachingPlugin:
         if action == "ui":
             return {"protocol": PROTOCOL, "html": Path(__file__).with_name("workbench.html").read_text(encoding="utf-8")}
         with self.lock:
+            if action == 'config':
+                # Authority comes from authenticated Core settings, never an
+                # MCP argument (including a replayed config or model call).
+                return {'state': 'ready', 'adapter_ok': True}
+            if action == 'execution_binding':
+                return self._execution_binding(args.get('asset_id', ''))
             if action.startswith('session_'):
                 return self._session(action, args)
             if action == 'draft_list':
@@ -469,6 +513,11 @@ class TeachingPlugin:
                 return {"draft": copy.deepcopy(self.draft), "requires_local_trial": True, "installed": False}
             if action == "info":
                 status = self.adapter.info()
+                try:
+                    execution_policy = self._execution_policy({'instance_id': args.get('instance_id', '')})
+                except (ValueError, OSError, RuntimeError) as exc:
+                    execution_policy = {'supported': hasattr(self.adapter, 'execution_binding'),
+                                        'enabled': False, 'device_enabled': False, 'unavailable': str(exc)}
                 compatibility = None
                 if hasattr(self.adapter, "compatibility"):
                     try:
@@ -480,6 +529,7 @@ class TeachingPlugin:
                 if (status.get("recording") or {}).get("recording") and self.record_started is not None:
                     status["recording"]["elapsed_seconds"] = max(0, time.monotonic() - self.record_started)
                 return {**status, "title": self.adapter.title,
+                        "execution_policy": execution_policy,
                         "presentation": copy.deepcopy(self.adapter.presentation),
                         "compatibility": compatibility,
                         "busy": bool(self.pending) or status["busy"],

@@ -233,6 +233,13 @@ class G1TeachingAdapter:
         return [self.arm.boot_id, self.epoch, self.control._generation,
                 self.arm.feedback_epoch, self.arm.profile_sha256]
 
+    def execution_binding(self):
+        if not self.arm.profile_sha256:
+            raise ValueError('calibration_required')
+        binding = self.trajectory.binding()
+        return {key: binding[key] for key in ('device_id', 'model_sha256', 'geometry_sha256')} | {
+            'calibration_sha256': self.arm.profile_sha256}
+
     def inspect(self, filename):
         recording = self._call("inspect", filename=filename)
         return {**recording, "preview": [

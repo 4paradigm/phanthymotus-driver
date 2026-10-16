@@ -43,10 +43,10 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
       <div class="panel"><h2 class="section-title">试运行检查</h2><div class="check-row"><span>录制完整性</span><span id="clip-check" class="check-result">待检查</span></div><div class="check-row"><span>起点状态</span><span id="start-hint" class="check-result">待检查</span></div><div class="check-row"><span>物体布置与本次接管</span><span class="check-result">执行前确认</span></div><div class="trial-actions"><button id="inspect-btn">检查起点</button><button id="trial-btn" class="primary" disabled>开始试运行</button></div></div>
       <details id="motion-details" class="details-card"><summary>动作详情</summary><div class="chart"><div class="row between"><small>关节变化 · 相对起点</small><small id="cursor-time">0.00 s</small></div><svg id="plot" viewBox="0 0 620 210" role="img" aria-label="双臂目标关节相对起点的变化曲线"></svg><div class="legend"><span><i style="background:#C4673A"></i>左臂</span><span><i style="background:#78716C"></i>右臂</span><span>单位 °</span></div><input id="scrub" type="range" min="0" max="100" value="0" aria-label="浏览录制时间"></div><div id="frame-values" class="table-wrap"></div><div id="start-values" class="table-wrap"></div></details>
       <button id="again-btn" class="link" style="font-size:12px;margin-top:12px">重新录制</button>
-    </div><aside class="panel soft"><h3 id="trial-status" class="outcome" role="status">等待试运行</h3><p id="trial-help" class="note">先检查起点，再按录制速度运行。</p><div id="import-summary" hidden><h3 id="import-name"></h3><p id="import-conditions" class="note"></p><p class="note">点击“开始试运行”即确认本次路径与活动空间畅通、其他控制已停止，并允许接管双臂。</p><p class="note">可关闭页面稍后验证，在技能列表点击“继续验证”。</p></div><label id="effect-label" class="effect"><input id="effect" type="checkbox" disabled><span>已观察真机，动作效果符合预期</span></label></aside>
+    </div><aside class="panel soft"><h3 id="trial-status" class="outcome" role="status">等待试运行</h3><p id="trial-help" class="note">先检查起点，再按录制速度运行。</p><div id="import-summary" hidden><h3 id="import-name"></h3><label id="import-auto-row" class="effect" hidden><input id="import-auto-execute" type="checkbox"><span>启用后允许自动执行</span></label><p id="import-auto-hint" class="note" hidden></p><p id="import-conditions" class="note"></p><p class="note">点击“开始试运行”即确认本次路径与活动空间畅通、其他控制已停止，并允许接管双臂。</p><p class="note">可关闭页面稍后验证，在技能列表点击“继续验证”。</p></div><label id="effect-label" class="effect"><input id="effect" type="checkbox" disabled><span>已观察真机，动作效果符合预期</span></label></aside>
   </section>
   <section id="save" hidden>
-    <div id="skill-form" class="layout"><div class="panel"><h2 class="section-title">保存为技能</h2><label class="field"><span>技能名称</span><input id="skill-name" maxlength="100" placeholder="例如：零件放入托盘"></label><label class="field" style="margin-bottom:0"><span>使用条件</span><textarea id="skill-conditions" maxlength="1000" placeholder="例如：零件和托盘位置固定，双臂已恢复录制起点。"></textarea></label></div><aside class="panel soft"><div class="aside-block"><h3 class="success">✓ 试运行与效果已确认</h3></div><div id="compatibility-panel" class="aside-block" hidden><h3>适用设备</h3><p id="compatibility-label"></p><p class="note">型号与完整动作会一起保存在动作包中。</p></div><div class="aside-block"><h3>以后可以这样说</h3><span id="phrase-preview" class="phrase">填写技能名称</span><p class="note">保存后加入现有技能库。</p></div></aside></div>
+    <div id="skill-form" class="layout"><div class="panel"><h2 class="section-title">保存为技能</h2><label class="field"><span>技能名称</span><input id="skill-name" maxlength="100" placeholder="例如：零件放入托盘"></label><label class="field" style="margin-bottom:0"><span>使用条件</span><textarea id="skill-conditions" maxlength="1000" placeholder="例如：零件和托盘位置固定，双臂已恢复录制起点。"></textarea></label></div><aside class="panel soft"><div class="aside-block"><h3 class="success">✓ 试运行与效果已确认</h3></div><div id="compatibility-panel" class="aside-block" hidden><h3>适用设备</h3><p id="compatibility-label"></p><p class="note">型号与完整动作会一起保存在动作包中。</p></div><div id="save-auto-row" class="aside-block" hidden><label class="effect"><input id="save-auto-execute" type="checkbox"><span>保存后允许自动执行</span></label><p id="save-auto-hint" class="note"></p></div><div class="aside-block"><h3>以后可以这样说</h3><span id="phrase-preview" class="phrase">填写技能名称</span><p class="note">保存后加入现有技能库。</p></div></aside></div>
     <div id="confirmation-result" class="panel saved" role="status" hidden><div class="saved-mark">✓</div><h2>技能已保存</h2><p id="saved-hint" class="muted"></p><span id="saved-phrase" class="phrase"></span><p class="note">可在现有技能列表中查看和管理。</p></div>
   </section>
       <details id="existing" class="details-card"><summary>使用已有录制</summary><div class="load"><select id="recordings" aria-label="选择已有录制"><option value="">选择完整录制…</option></select><button id="load-btn">载入</button></div></details>
@@ -59,7 +59,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   const $ = id => document.getElementById(id);
   let port, serial=0, pending=new Map(), status={}, draft={}, stage=0, busy=false, online=false, initialized=false;
   let preview, plotData, plottedId, inspection, checks, checkedAt=0, installed=false, approvedTrial, refreshVersion=0;
-  let inspectedImport;
+  let inspectedImport, autoExecuteChoice=false;
   const errors={replay_start_mismatch_no_automatic_return:'起点不匹配，请手动恢复双臂与夹爪后重试。',robot_busy_wait_for_completion:'请等待当前动作结束。',successful_trial_required:'请先完成试运行。',complete_recording_required:'尚无完整录制，请结束录制或重新录制。',paired_preview_required:'确认已失效，请重新预览。',teaching_draft_changed_reload:'草稿已在其他页面更改，请重新操作。',teaching_preview_expired:'预览已失效，请重新检查并确认。',live_mapped_teleop_required:'请确认 VR 输入有效，并松握、长按 X+A 建立基准。',live_mapped_teleop_input_required:'请等待有效 VR 输入，并松开双手握键完成映射。',input_timeout_restart_required:'未收到 VR 输入，请检查头显后重新进入遥操。',input_stale_restart_required:'VR 输入已中断，请检查头显后重新进入遥操。',tracking_lost_restart_required:'跟踪已丢失，请恢复跟踪后重新进入遥操。'};
   const readable = value => errors[value] || value;
   const presentation = () => status.presentation || {};
@@ -145,6 +145,14 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('next-hint').textContent=presentation().next_hint || '';
     $('trial-hint').textContent=presentation().trial_hint || '';
     $('skill-conditions').placeholder=presentation().conditions_placeholder || '';
+    const execution=status.execution_policy || {};
+    for(const prefix of ['save','import']){
+      $(prefix+'-auto-row').hidden=!execution.supported;
+      $(prefix+'-auto-execute').checked=!!execution.device_enabled || autoExecuteChoice;
+      $(prefix+'-auto-execute').disabled=locked || moving || installed || !!execution.device_enabled;
+      $(prefix+'-auto-hint').hidden=!execution.supported;
+      $(prefix+'-auto-hint').textContent=execution.device_enabled?'已按卡片设置允许自动执行。':'仅对此技能生效，设置保存在本设备，重启后保留。';
+    }
     const compatible=status.compatibility;
     $('compatibility-panel').hidden=!compatible;
     $('compatibility-label').textContent=compatible?[compatible.variant || compatible.model,presentation().recording_label,compatible.end_effectors==='fixed_hand'?'固定手':compatible.end_effectors].filter(Boolean).join(' · '):'';
@@ -190,7 +198,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     for(const key of ['name','conditions'])$('skill-'+key).readOnly=!!status.saved;
     $('footer-hint').textContent=installed?'已加入本机技能库':moving?'请留意机器人，必要时停止动作。':['检查不会启动机器人动作。','结束录制后进入试运行。','按录制速度执行。','保存后沿用现有技能调用流程。'][stage];
   }
-  function reset(next) {draft=next;installed=false;preview=null;plottedId=null;plotData=null;inspection=null;inspectedImport=null;checks=null;checkedAt=0;approvedTrial=null;$('effect').checked=false;$('confirm').hidden=true;$('motion-details').open=false;$('start-values').replaceChildren();}
+  function reset(next) {draft=next;autoExecuteChoice=false;installed=false;preview=null;plottedId=null;plotData=null;inspection=null;inspectedImport=null;checks=null;checkedAt=0;approvedTrial=null;$('effect').checked=false;$('confirm').hidden=true;$('motion-details').open=false;$('start-values').replaceChildren();}
   async function refresh() {
     const version=++refreshVersion;
     try {
@@ -226,6 +234,8 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('confirm-binding').textContent=preview.binding_label || `左臂 ${preview.binding?.arms?.left || ''} · 右臂 ${preview.binding?.arms?.right || ''} · 标定 ${preview.binding?.calibration_id || ''}`;
     $('confirm-control').checked=false;$('confirm-go').disabled=true;$('confirm').hidden=false;$('confirm-control').focus();
   }
+  const automaticArgs=()=>status.execution_policy?.supported?{auto_execute:autoExecuteChoice}:{};
+  for(const prefix of ['save','import'])$(prefix+'-auto-execute').onchange=e=>{autoExecuteChoice=e.target.checked;render();};
   $('check-btn').onclick=()=>act(runChecks);
   $('next-btn').onclick=()=>act(async()=>{if(!await runChecks())return;if(!draft.id)reset(await call('new'));setStage(1);});
   $('begin-btn').onclick=()=>act(async()=>{if(!await runChecks()){setStage(0);return;}if(!draft.id)reset(await call('new'));await preflight('begin');});
@@ -243,7 +253,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     inspection=null;
   });
   $('import-enable-btn').onclick=()=>act(async()=>{
-    const result=await request('save',{draft_id:draft.id,effect_confirmed:true,...draft.imported.metadata});
+    const result=await request('save',{draft_id:draft.id,effect_confirmed:true,...draft.imported.metadata,...automaticArgs()});
     installed=true;stage=3;showContext(result.context);
     $('saved-hint').textContent=result.context?.conversation_ready?'现在可以在对话里说：':'连接执行卡后，即可对话调用：';
     $('saved-phrase').textContent=`“${draft.imported.metadata.name}”`;
@@ -258,7 +268,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   $('stop-btn').onclick=async()=>{preview=null;$('confirm').hidden=true;try{await call('stop');await refresh();}catch(error){fail(error);}};
   function updatePhrase() {$('phrase-preview').textContent=$('skill-name').value.trim()?`“${$('skill-name').value.trim()}”`:'填写技能名称';}
   $('skill-name').oninput=updatePhrase;
-  $('save-btn').onclick=()=>act(async()=>{const args={draft_id:draft.id,effect_confirmed:$('effect').checked};for(const key of ['name','conditions']){args[key]=$('skill-'+key).value.trim();if(!args[key])throw new Error('请填写技能名称和使用条件。');}const result=await request('save',args);installed=true;showContext(result.context);$('saved-hint').textContent=result.context?.conversation_ready?'现在可以在对话里说：':'连接执行卡后，即可在对话里说：';$('saved-phrase').textContent=`“${args.name}”`;});
+  $('save-btn').onclick=()=>act(async()=>{const args={draft_id:draft.id,effect_confirmed:$('effect').checked,...automaticArgs()};for(const key of ['name','conditions']){args[key]=$('skill-'+key).value.trim();if(!args[key])throw new Error('请填写技能名称和使用条件。');}const result=await request('save',args);installed=true;showContext(result.context);$('saved-hint').textContent=result.context?.conversation_ready?'现在可以在对话里说：':'连接执行卡后，即可在对话里说：';$('saved-phrase').textContent=`“${args.name}”`;});
   function showContext(context) {$('chat-hint').hidden=!!context?.conversation_ready;$('chat-hint').textContent=`对话调用待连接：将 ${context?.tool || '此执行卡'} 连接到决策核心，仅需配置一次。`;}
   window.addEventListener('message',async event=>{
     if(port || event.source!==parent || event.data?.protocol!=='motus.workbench/1' || !event.ports[0])return;

@@ -15,6 +15,8 @@ from teaching_browser_support import workbench_site, browser_page, confirm_in_br
 
 @pytest.fixture
 def site(g1_teaching, monkeypatch, tmp_path):
+    from common.teaching.authorization import read_execution_policy
+    monkeypatch.setattr('common.teaching.service.read_execution_policy', read_execution_policy)
     service, card, *_ = g1_teaching
     with workbench_site(service, [card, service], monkeypatch, tmp_path,
                         "test-g1", "宇树 G1（模拟 SDK）") as value:
@@ -104,15 +106,18 @@ def test_g1_record_trial_save_and_agent_call(site, browser_page, g1_teaching, tm
     expect(page.locator('#skill-installed-list')).to_contain_text('固定手')
     page.locator('#skill-package-refresh').click()
     expect(page.locator('#skill-package-export-status')).to_contain_text('调用说明与型号信息已更新')
-    # Real browser auth -> Core one-use receipt -> Driver loopback verification.
+    # Browser settings persist in Core; Driver reads them on each preview.
     before = len(channel.positions)
-    page.locator('#skill-session-confirm').check()
-    page.locator('#skill-session-toggle').click()
-    expect(page.locator('#skill-session')).to_contain_text('本次已允许直接执行')
+    with page.expect_response(lambda r: '/api/skills/package/execution/' in r.url and r.request.method == 'POST') as response:
+        page.locator('#skill-auto-execute').check()
+    assert response.value.ok
+    expect(page.locator('#skill-auto-execute')).to_be_enabled()
     preview = call(service, 'preview', asset_id=service.draft['id'])
     assert preview['confirmation_required'] is False and len(channel.positions) == before
-    page.locator('#skill-session-toggle').click()
-    expect(page.locator('#skill-session-confirm')).to_be_visible()
+    with page.expect_response(lambda r: '/api/skills/package/execution/' in r.url and r.request.method == 'POST') as response:
+        page.locator('#skill-auto-execute').uncheck()
+    assert response.value.ok
+    expect(page.locator('#skill-auto-execute')).to_be_enabled()
     assert call(service, 'preview', asset_id=service.draft['id'])['confirmation_required']
     import os
     if directory := os.environ.get('TEACHING_SCREENSHOT_DIR'):
