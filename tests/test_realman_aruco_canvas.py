@@ -54,14 +54,16 @@ class ArucoDetectorCardTests(unittest.TestCase):
         self.assertEqual(markers[0]["center_px"], [350.0, 250.0])
         self.assertEqual(markers[0]["position"], [0.0938, 0.0417])
         self.assertEqual(markers[0]["center"], markers[0]["position"])
-        self.assertEqual(markers[0]["center_normalized"], [round(350.0 / 640, 4), round(250.0 / 480, 4)])
+        self.assertEqual(markers[0]["center_normalized"], markers[0]["position"])
+        self.assertEqual(markers[0]["topleft_ratio_uv"], [round(350.0 / 640, 4), round(250.0 / 480, 4)])
         self.assertEqual(len(markers[0]["corners_px"]), 4)
 
         self.assertEqual(markers[1]["id"], 5)
         self.assertEqual(markers[1]["center_px"], [150.0, 150.0])
         self.assertEqual(markers[1]["position"], [-0.5312, -0.375])
         self.assertEqual(markers[1]["center"], markers[1]["position"])
-        self.assertEqual(markers[1]["center_normalized"], [round(150.0 / 640, 4), round(150.0 / 480, 4)])
+        self.assertEqual(markers[1]["center_normalized"], markers[1]["position"])
+        self.assertEqual(markers[1]["topleft_ratio_uv"], [round(150.0 / 640, 4), round(150.0 / 480, 4)])
 
     def test_extract_markers_from_empty_returns_empty_list(self):
         mod = _load_aruco_module()
@@ -126,7 +128,8 @@ class ArucoDetectorCardTests(unittest.TestCase):
                     "position": [-0.3, -0.1],
                     "compensated_position": [-0.25, -0.2],
                     "center": [-0.3, -0.1],
-                    "center_normalized": [0.35, 0.45],
+                    "center_normalized": [-0.3, -0.1],
+                    "topleft_ratio_uv": [0.35, 0.45],
                     "center_px": [224.0, 216.0],
                     "compensated_center_px": [240.0, 192.0],
                     "corners_px": [[210, 200], [238, 200], [238, 232], [210, 232]],
@@ -137,7 +140,8 @@ class ArucoDetectorCardTests(unittest.TestCase):
                     "position": [0.5, 0.6],
                     "compensated_position": [0.55, 0.5],
                     "center": [0.5, 0.6],
-                    "center_normalized": [0.75, 0.80],
+                    "center_normalized": [0.5, 0.6],
+                    "topleft_ratio_uv": [0.75, 0.80],
                     "center_px": [480.0, 384.0],
                     "compensated_center_px": [496.0, 360.0],
                     "corners_px": [[460, 360], [500, 360], [500, 408], [460, 408]],
@@ -159,7 +163,7 @@ class ArucoDetectorCardTests(unittest.TestCase):
             self.assertEqual(res_all["detected_marker_ids"], [3, 7])
             self.assertEqual(len(res_all["detected_markers"]), 2)
             self.assertEqual(res_all["detected_markers"][0]["id"], 3)
-            self.assertEqual(res_all["detected_markers"][0]["center_normalized"], [0.35, 0.45])
+            self.assertEqual(res_all["detected_markers"][0]["center_normalized"], [-0.3, -0.1])
 
             # 2. 调用 detect（传入存在的 marker_id=3）：直接返回目标码中心点
             res_target = plugin.dispatch("detect", {"marker_id": 3})
@@ -168,7 +172,7 @@ class ArucoDetectorCardTests(unittest.TestCase):
             self.assertEqual(res_target["marker_id"], 3)
             self.assertEqual(res_target["position"], [-0.3, -0.1])
             self.assertEqual(res_target["center"], [-0.3, -0.1])
-            self.assertEqual(res_target["center_normalized"], [0.35, 0.45])
+            self.assertEqual(res_target["center_normalized"], [-0.3, -0.1])
             self.assertEqual(res_target["center_px"], [224.0, 216.0])
 
             # 3. 调用 get_marker_center 别名动作

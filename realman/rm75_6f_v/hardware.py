@@ -98,6 +98,10 @@ class RM75SDKClient:
             handle = robot.rm_create_robot_arm(self.ip, self.port)
             if handle is None or int(getattr(handle, "id", -1)) < 0:
                 bad_id = getattr(handle, "id", None)
+                try:
+                    robot.rm_delete_robot_arm()
+                except Exception:
+                    pass
                 self._handle = None
                 self._robot = None
                 self._last_connection_error = (
