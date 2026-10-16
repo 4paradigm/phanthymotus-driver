@@ -68,6 +68,12 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+# Siblings of device.py. Both are deliberately outside it so they can be tested
+# without rclpy, and both fail late if missing: the chassis card would not
+# register at all, and every camera `info()` would raise on its first call.
+COPY loco_servo.py /work/loco_servo.py
+COPY camera_specs.py /work/camera_specs.py
+COPY odom_spec.py /work/odom_spec.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
