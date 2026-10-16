@@ -29,10 +29,9 @@ class Plugin:
         self._namespace = namespace
         self._output_topic = f"/{namespace}/squat/count"
         self._counter = SquatCounter(
-            window_s=plugin_config.get("window_s", 2.0),
-            down_ratio=plugin_config.get("down_ratio", 0.5),
-            lost_s=plugin_config.get("lost_s", 3.0),
-            min_confidence=plugin_config.get("min_confidence", 0.5),
+            min_interval_s=plugin_config.get("min_interval_s", 0.8),
+            lost_s=plugin_config.get("lost_s", 4.0),
+            min_confidence=plugin_config.get("min_confidence", 0.3),
         )
         self._subscription = None
         self._input_topic = ""
@@ -108,7 +107,7 @@ class Plugin:
             "state": "running" if self._subscription else "idle",
             "count": self._counter.count,
             "track_id": self._counter.track_id,
-            "in_squat": self._counter.in_squat,
+            "phase": self._counter.current_phase,
             "topic_in": (
                 [{"topic": topic, "format": "data/json"}] if topic else []
             ),

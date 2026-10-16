@@ -1,17 +1,12 @@
-"""Squat counter based on posture-label trend detection.
+"""Squat counter based on posture state transition detection.
 
-Instead of requiring strict frame-by-frame transitions or a simple set
-collection, this counter maintains a sliding window of recent posture
-observations for each tracked person.  A squat is counted when:
-
-1. The window shows a sustained "down" phase (down-posture ratio ≥ threshold)
-2. This is followed by an "up" phase (standing posture)
-
-This is robust to transient misclassifications during fast transitions.
+Counts a repetition when the tracked person transitions from a 'down' posture
+(sitting or crouching) to an 'up' posture (standing), with a minimum time
+interval since the last counted squat to prevent double-counting.
 """
 
 import math
-from collections import deque
+
 
 # Configurable posture labels
 POSTURES_DOWN = {"sitting", "crouching"}
@@ -19,18 +14,14 @@ POSTURES_UP = {"standing"}
 
 
 class SquatCounter:
-    def __init__(self, window_s=2.0, down_ratio=0.5, lost_s=3.0,
-                 min_confidence=0.5):
+    def __init__(self, min_interval_s=0.8, lost_s=4.0, min_confidence=0.3):
         """
         Args:
-            window_s: sliding window duration in seconds.
-            down_ratio: minimum fraction of window occupied by down postures
-                        to consider the person as "in a squat".
+            min_interval_s: minimum seconds between consecutive squats.
             lost_s: seconds without tracked person before reset.
             min_confidence: minimum posture_confidence to accept a label.
         """
-        self.window_s = float(window_s)
-        self.down_ratio = float(down_ratio)
+        self.min_interval_s = float(min_interval_s)
         self.lost_s = float(lost_s)
         self.min_confidence = float(min_confidence)
         self.reset()
@@ -38,31 +29,16 @@ class SquatCounter:
     def reset(self):
         self.count = 0
         self.track_id = None
-        # Sliding window: list of (timestamp, is_down) tuples
-        self.window = deque()
-        self.in_squat = False
-        self.since_down = 0.0  # timestamp when down_ratio threshold was first met
+        # Track current posture phase to detect transitions
+        self.current_phase = None  # "up" or "down"
+        self.last_squat_time = 0.0
         self.last_seen = None
 
     def _drop_track(self):
         self.track_id = None
-        self.window.clear()
-        self.in_squat = False
-        self.since_down = 0.0
+        self.current_phase = None
+        self.last_squat_time = 0.0
         self.last_seen = None
-
-    def _prune_window(self, now):
-        """Remove entries older than window_s."""
-        cutoff = now - self.window_s
-        while self.window and self.window[0][0] < cutoff:
-            self.window.popleft()
-
-    def _down_fraction(self):
-        """Return fraction of window occupied by down postures."""
-        if not self.window:
-            return 0.0
-        down_count = sum(1 for _, is_down in self.window if is_down)
-        return down_count / len(self.window)
 
     def update(self, persons, now):
         """Return a completion event dict or None."""
@@ -101,37 +77,31 @@ class SquatCounter:
             return None
 
         self.last_seen = now
+
+        # Determine phase
         is_down = posture in POSTURES_DOWN
+        new_phase = "down" if is_down else "up"
 
-        # Add observation to sliding window
-        self._prune_window(now)
-        self.window.append((now, is_down))
-
-        # ── Trend-based state machine ───────────────────────────────────
-        frac = self._down_fraction()
-
-        if not self.in_squat:
-            # Phase 1: waiting for sustained down posture
-            if frac >= self.down_ratio and self.since_down == 0.0:
-                self.since_down = now
-            if self.since_down > 0.0:
-                # Require minimum sustained down time (0.3s) to enter squat state
-                if now - self.since_down >= 0.3:
-                    self.in_squat = True
-        else:
-            # Phase 2: in squat, waiting for up posture to complete
-            if posture in POSTURES_UP:
+        # ── State transition detection ──────────────────────────────────
+        if self.current_phase is None:
+            # First valid frame: initialize phase
+            self.current_phase = new_phase
+        elif self.current_phase == "down" and new_phase == "up":
+            # Transition: down → up (crouching/sitting → standing)
+            if now - self.last_squat_time >= self.min_interval_s:
                 self.count += 1
-                self.in_squat = False
-                self.since_down = 0.0
-                self.window.clear()
+                self.last_squat_time = now
+                self.current_phase = "up"
                 return {
                     "type": "squat_completed",
                     "priority": 1,
                     "track_id": self.track_id,
                     "count": self.count,
                 }
+            # else: too soon after last squat, ignore
+        # else: same phase or up → down (waiting for next down phase)
 
+        self.current_phase = new_phase
         return None
 
     def _valid_posture(self, posture, confidence):
