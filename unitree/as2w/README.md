@@ -35,6 +35,25 @@ any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Special motions should only
 be invoked with a clear area and appropriate operator approval.
 
+`loco_servo` is the streamed counterpart to `loco`: it consumes
+`motus.control/1` `control/velocity` messages and maps `vx`, `vy`, and `wz`
+to the As2W SportClient's `Move(vx, vy, vyaw)`. Connect ActuCore `navi`'s
+`control/velocity` output to this card's input. Unsupported twist axes are
+pinned to zero in the descriptor, so a producer asking for them is rejected
+instead of silently losing part of its command. The initial speed envelope
+(`vx=0.4 m/s`, `vy=0.25 m/s`, `wz=0.5 rad/s`) is intentionally conservative
+but has not been measured on hardware; it is not a claim about the robot's
+maximum or deadband.
+
+The card is enabled in `config.yaml` with `dry_run: true`: the first connected
+stream is validated and logged but cannot move the robot. Review the reported
+commands in `info`; only then explicitly set `dry_run` to false for supervised
+hardware validation. It stops through `StopMove` on stream watchdog, pause,
+shutdown, or an explicit `loco`/`special_motion` command. It refuses to start
+while either discrete locomotion or a special motion is active. Do not run this
+card and `controlled_spatial` navigation simultaneously; those are separate
+SportClient command paths.
+
 The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs

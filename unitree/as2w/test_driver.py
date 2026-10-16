@@ -612,6 +612,70 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(["mic"], created)
         self.assertEqual(1, len(ready.plugins))
 
+    def test_bundle_registers_enabled_loco_servo_after_loco(self):
+        created = []
+
+        class FakeLoco:
+            def __init__(self, *_args):
+                created.append("loco")
+
+            def attach_servo(self, servo):
+                self.servo = servo
+
+            def is_moving(self):
+                return False
+
+        class FakeSpecial:
+            def __init__(self, *_args):
+                created.append("special_motion")
+
+            def attach_servo(self, servo):
+                self.servo = servo
+
+            def is_running(self):
+                return False
+
+        class FakeServo:
+            def __init__(self, *_args, **kwargs):
+                created.append("loco_servo")
+                self.loco_plugin = kwargs["loco_plugin"]
+                self.special_motion_plugin = kwargs["special_motion_plugin"]
+
+        device = types.ModuleType("device")
+        device.StatePlugin = device.LedPlugin = object
+        device.LocoPlugin = FakeLoco
+        device.SpecialMotionPlugin = FakeSpecial
+        multimedia = types.ModuleType("multimedia")
+        multimedia.CameraPlugin = multimedia.SpeakerPlugin = multimedia.MicPlugin = object
+        lidar = types.ModuleType("lidar")
+        lidar.LidarPlugin = object
+        spatial = types.ModuleType("controlled_spatial")
+        spatial.ControlledSpatialPlugin = object
+        mapping = types.ModuleType("slam_mapping")
+        mapping.SlamMappingPlugin = object
+        servo_module = types.ModuleType("loco_servo")
+        servo_module.LocoServoPlugin = FakeServo
+        config = {"plugins": {
+            "loco": {"enabled": True},
+            "special_motion": {"enabled": True},
+            "loco_servo": {"enabled": True},
+            "mic": {"enabled": False}, "speaker": {"enabled": False},
+            "led": {"enabled": False}, "camera": {"enabled": False},
+            "lidar": {"enabled": False}, "controlled_spatial": {"enabled": False},
+            "slam_mapping": {"enabled": False},
+        }}
+        with patch.dict(sys.modules, {
+            "device": device, "multimedia": multimedia, "lidar": lidar,
+            "controlled_spatial": spatial, "slam_mapping": mapping,
+            "loco_servo": servo_module,
+        }):
+            bundle = self.main.Bundle(
+                config, "test", object(), object(), None, dds_ready=False)
+        self.assertEqual(["loco", "special_motion", "loco_servo"], created)
+        self.assertEqual(3, len(bundle.plugins))
+        self.assertIs(bundle.plugins[0], bundle.plugins[2].loco_plugin)
+        self.assertIs(bundle.plugins[1], bundle.plugins[2].special_motion_plugin)
+
     def test_camera_start_returns_running_with_async_readiness(self):
         plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
         plugin._topic = "/test/camera/front"
@@ -1549,6 +1613,144 @@ class TestDriverContracts(unittest.TestCase):
         self.assertAlmostEqual(0.9945, x, places=3)
         self.assertAlmostEqual(-0.1045, y, places=3)
         self.assertAlmostEqual(0.0, z, places=3)
+
+
+class TestLocoServoContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        _install_device_stubs()
+        cls.device = _load("as2w_device_servo_test", ROOT / "device.py")
+        cls.servo = _load("as2w_loco_servo_test", ROOT / "loco_servo.py")
+
+    class Executor:
+        def __init__(self):
+            self.nodes = []
+
+        def add_node(self, node):
+            self.nodes.append(node)
+
+        def remove_node(self, node):
+            self.nodes.remove(node)
+
+    class Node:
+        def __init__(self, *_args, **_kwargs):
+            self.callback = None
+            self.timer_callback = None
+
+        def create_subscription(self, _type, _topic, callback, _depth):
+            self.callback = callback
+
+        def create_timer(self, _period, callback):
+            self.timer_callback = callback
+            return callback
+
+        def destroy_timer(self, _timer):
+            pass
+
+        def destroy_node(self):
+            pass
+
+    def _card(self, *, dry_run=True, loco=None, special_motion=None):
+        executor = self.Executor()
+        proxy = _Proxy()
+        card = self.servo.LocoServoPlugin(
+            {"dry_run": dry_run}, "test", executor, proxy,
+            loco_plugin=loco, special_motion_plugin=special_motion)
+        return card, proxy, executor
+
+    @staticmethod
+    def _message(*, seq=1, values=None, obs_age_ms=0):
+        import json
+        import time
+        now = int(time.time() * 1000)
+        return types.SimpleNamespace(data=json.dumps({
+            "schema": "motus.control/1",
+            "seq": seq,
+            "stamp_ms": now,
+            "obs_stamp_ms": now - obs_age_ms,
+            "ttl_ms": 250,
+            "source": "test-navi",
+            "priority": 50,
+            "mode": "twist",
+            "dof": 6,
+            "values": values if values is not None else
+                      [0.1, 0.0, 0.0, 0.0, 0.0, 0.1],
+        }))
+
+    def _start(self, card):
+        import rclpy.node
+        with patch.object(rclpy.node, "Node", self.Node):
+            result = card.dispatch("start", {"input_topic": "/navi/cmd"})
+        self.assertEqual("running", result["state"])
+        return card._node
+
+    def test_descriptor_is_twist_with_as2w_supported_axes_and_safe_dry_run_default(self):
+        card, _proxy, _executor = self._card()
+        descriptor = card._interface()
+        self.assertEqual("twist", descriptor["mode"])
+        self.assertEqual(["vx", "vy", "vz", "wx", "wy", "wz"],
+                         descriptor["joint_names"])
+        self.assertEqual([0.4, 0.25, 0.0, 0.0, 0.0, 0.5],
+                         descriptor["limits"]["upper"])
+        self.assertTrue(descriptor["dry_run"])
+        self.assertTrue(card.get_tool()["inputSchema"]["x-is-dangerous"])
+
+    def test_stream_is_dry_run_until_explicitly_enabled_then_maps_twist_to_move(self):
+        card, proxy, _executor = self._card()
+        node = self._start(card)
+        node.callback(self._message())
+        self.assertEqual([], proxy.moves)
+        self.assertTrue(card.dispatch("config", {"dry_run": False})["dry_run"] is False)
+        node.callback(self._message(seq=2))
+        self.assertEqual([(0.1, 0.0, 0.1)], proxy.moves)
+
+    def test_rejects_stale_observation_and_unsupported_axes(self):
+        card, proxy, _executor = self._card(dry_run=False)
+        node = self._start(card)
+        node.callback(self._message(obs_age_ms=1000))
+        self.assertEqual([], proxy.moves)
+        node.callback(self._message(seq=2, values=[0.1, 0.0, 0.1, 0.0, 0.0, 0.0]))
+        self.assertEqual([], proxy.moves)
+        self.assertIn(card._last_command["verdict"], {"REJECTED", "DROPPED"})
+
+    def test_watchdog_stops_live_motion_and_loco_command_pauses_the_stream(self):
+        card, proxy, _executor = self._card(dry_run=False)
+        node = self._start(card)
+        node.callback(self._message())
+        sink = card._sink
+        sink._clock = lambda: 10000
+        sink._last_apply_ms = 10000
+        sink._clock = lambda: 10000 + self.servo.WATCHDOG_MS + 1
+        card._tick()
+        self.assertGreaterEqual(proxy.stops, 1)
+
+        card.dispatch("resume", {})
+        loco = self.device.LocoPlugin({}, "test", None, proxy)
+        loco.attach_servo(card)
+        result = loco.dispatch("move", {"vx": 0.1, "vy": 0.0,
+                                        "vyaw": 0.0})
+        self.assertEqual(0, result["ret"])
+        self.assertTrue(card._paused)
+        self.assertTrue(loco.is_moving())
+
+    def test_refuses_start_while_loco_or_special_motion_is_active(self):
+        loco = self.device.LocoPlugin({}, "test", None, _Proxy())
+        loco._moving = True
+        card, _proxy, _executor = self._card(loco=loco)
+        result = card.dispatch("start", {"input_topic": "/navi/cmd"})
+        self.assertEqual("error", result["state"])
+        self.assertIn("loco", result["message"])
+
+        special_motion = self.device.SpecialMotionPlugin(
+            {}, "test", None, _Proxy())
+        special_motion._motion_lock.acquire()
+        try:
+            card, _proxy, _executor = self._card(special_motion=special_motion)
+            result = card.dispatch("start", {"input_topic": "/navi/cmd"})
+        finally:
+            special_motion._motion_lock.release()
+        self.assertEqual("error", result["state"])
+        self.assertIn("special_motion", result["message"])
 
 
 if __name__ == "__main__":

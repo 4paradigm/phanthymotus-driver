@@ -283,6 +283,26 @@ class LocoPlugin:
         self._lock = threading.Lock()
         self._stop = None
         self._transition_stop = None
+        self._moving = False
+        self._servo = None
+
+    def attach_servo(self, servo):
+        self._servo = servo
+
+    def is_moving(self):
+        with self._lock:
+            return (self._moving or self._stop is not None
+                    or self._transition_stop is not None)
+
+    def servo_stopped(self):
+        with self._lock:
+            if self._stop is None and self._transition_stop is None:
+                self._moving = False
+
+    def _preempt_servo(self, reason):
+        if self._servo is None:
+            return False
+        return bool(self._servo.pause_for_explicit_command(reason))
 
     _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
                  "AI_STAND_UP", "AI_BALANCE_STAND", "AI_RECOVERY_STAND"}
@@ -444,7 +464,10 @@ class LocoPlugin:
                     stop_event.wait(0.1)
             finally:
                 try:
-                    self.proxy.StopMove()
+                    stop_ret = self.proxy.StopMove()
+                    if stop_ret == 0:
+                        with self._lock:
+                            self._moving = False
                 except Exception:
                     pass
                 with self._lock:
@@ -493,7 +516,10 @@ class LocoPlugin:
                         return
         finally:
             try:
-                self.proxy.StopMove()
+                stop_ret = self.proxy.StopMove()
+                if stop_ret == 0:
+                    with self._lock:
+                        self._moving = False
             finally:
                 self._finish_transition(stop_event)
         _acp_notify(action_id, "completed",
@@ -587,10 +613,21 @@ class LocoPlugin:
                     "observed_state": state})
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
+        if action in {
+            "stop", "move", "stop_move", "stand_up", "stand_down",
+            "balance_stand", "recovery_stand", "damp", "euler",
+            "speed_level", "body_height", "body_position",
+            "switch_joystick", "left_side_gait", "right_side_gait",
+            "auto_recovery",
+        }:
+            self._preempt_servo(f"loco.{action}")
         if action == "stop":
             self._cancel_transition()
             self._stop_continuous()
-            return {"state": "idle", "ret": self.proxy.StopMove()}
+            ret = self.proxy.StopMove()
+            with self._lock:
+                self._moving = ret != 0
+            return {"state": "idle", "ret": ret}
         if action == "move":
             vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
             duration = args.get("duration")
@@ -615,6 +652,8 @@ class LocoPlugin:
             if duration is None:
                 self._stop_continuous()
                 ret = self.proxy.Move(vx, vy, yaw)
+                with self._lock:
+                    self._moving = ret == 0
                 return {"ret": ret, "accepted": ret == 0, "action": "move",
                         "current_state": state_name, "vx": vx, "vy": vy, "vyaw": yaw,
                         **({} if ret == 0 else {"error": "Sport controller rejected Move",
@@ -642,6 +681,8 @@ class LocoPlugin:
                             "error": "Continuous Move was rejected",
                             "reason": "The sport controller refused the velocity command",
                             "suggested_actions": ["get_state", "stop_move"]}
+                with self._lock:
+                    self._moving = True
                 threading.Thread(target=self._run_continuous_move,
                                  args=(action_id, vx, vy, yaw, stop_event),
                                  daemon=True, name="as2w-loco-continuous-move").start()
@@ -661,6 +702,8 @@ class LocoPlugin:
                         "error": "Timed Move was rejected",
                         "reason": "The sport controller refused the velocity command",
                         "suggested_actions": ["get_state", "stop_move"]}
+            with self._lock:
+                self._moving = True
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             stop_event = threading.Event()
             with self._lock:
@@ -768,10 +811,12 @@ class LocoPlugin:
                                         stop_event, move_already_sent=True)
 
     def _run_continuous_move(self, action_id, vx, vy, yaw, stop_event):
+        move_failed = False
         try:
             while not stop_event.wait(0.1):
                 ret = self.proxy.Move(vx, vy, yaw)
                 if ret != 0:
+                    move_failed = True
                     _acp_notify(action_id, "error", {
                         "action": "move", "ret": ret, "rpc_ret": ret,
                         "error": "Continuous Move failed",
@@ -779,6 +824,13 @@ class LocoPlugin:
                         "suggested_actions": ["get_state", "stop_move"]})
                     return
         finally:
+            if move_failed:
+                try:
+                    if self.proxy.StopMove() == 0:
+                        with self._lock:
+                            self._moving = False
+                except Exception:
+                    pass
             with self._lock:
                 if self._stop is stop_event:
                     self._stop = None
@@ -799,6 +851,8 @@ class LocoPlugin:
                 return
             last_state = name
             if not self._is_moving(name):
+                with self._lock:
+                    self._moving = False
                 _acp_notify(action_id, "completed", {
                     "action": "stop_move", "ret": 0,
                     "state": state, "reason": "controller left walking state"})
@@ -840,6 +894,18 @@ class SpecialMotionPlugin:
         self._state_lock = threading.Lock()
         self._motion_lock = threading.Lock()
         self._motion_generation = 0
+        self._servo = None
+
+    def attach_servo(self, servo):
+        self._servo = servo
+
+    def is_running(self):
+        return self._motion_lock.locked()
+
+    def _preempt_servo(self, reason):
+        if self._servo is None:
+            return False
+        return bool(self._servo.pause_for_explicit_command(reason))
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
@@ -1013,6 +1079,7 @@ class SpecialMotionPlugin:
                 action, bool(args.get("enter", True)))
             if state_error is not None:
                 return state_error
+            self._preempt_servo(f"special_motion.{action}")
             return self._start_motion(action, args)
         return None
 
