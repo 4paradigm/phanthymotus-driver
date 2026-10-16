@@ -1,0 +1,11 @@
+id: g1-award-ceremony
+name: G1 Award Ceremony
+category: driver
+hardware_provider: unitree
+hardware_model: "g1"
+image_name: g1-award-ceremony
+port: 15799
+mcp_url: "http://localhost:15799/mcp"
+description: "G1 颁奖典礼流程卡片：开场挥手，随后每个奖项按 念名字→(表扬词)→转身面向获奖者→鼓掌→转回正前方 固定执行。"
+cards:
+  - { name: award_ceremony, type: actuator }
