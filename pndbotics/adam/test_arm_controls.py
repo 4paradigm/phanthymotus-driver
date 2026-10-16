@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
@@ -266,8 +268,14 @@ class ArmControlTests(unittest.TestCase):
 
         # Retarget to a new pose: the new segment starts from current output,
         # not from the original hold or previous target.
+        previous_start = plugin._seg_start[shoulder]
+        previous_time = plugin._seg_started_at
+        previous_span = plugin._seg_span
         plugin._set_targets({"shoulderPitch_Left": 0.5})
-        self.assertAlmostEqual(plugin._seg_start[shoulder], mid)
+        elapsed = (plugin._seg_started_at - previous_time) / previous_span
+        expected = previous_start + (-1.0 - previous_start) * plugin._ease(elapsed)
+        self.assertAlmostEqual(plugin._seg_start[shoulder], expected)
+        self.assertLess(plugin._seg_start[shoulder], mid)
         self.assertEqual(plugin._target_q[shoulder], 0.5)
 
         # At the end of the segment the output equals the newest target.
@@ -282,6 +290,26 @@ class ArmControlTests(unittest.TestCase):
             else:
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
         self.assertAlmostEqual(publisher.commands[-1].motor_cmd[shoulder].q, 0.5)
+
+    def test_retarget_samples_inflight_pose_without_an_intervening_write(self):
+        plugin = _prime_arm_plugin(_FakePublisher())
+        shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
+        elbow = ADAM_PRO_JOINTS.index("elbow_Left")
+        plugin._set_targets({"shoulderPitch_Left": -1.0,
+                             "elbow_Left": -0.5})
+        plugin._seg_started_at = time.monotonic() - plugin._seg_span / 2
+        expected = plugin._seg_start[shoulder] + (
+            -1.0 - plugin._seg_start[shoulder]) * plugin._ease(0.5)
+        previous_write = plugin._seg_current[shoulder]
+
+        plugin._set_targets({"shoulderPitch_Left": 0.5})
+        self.assertAlmostEqual(expected, plugin._seg_start[shoulder], places=3)
+        self.assertNotAlmostEqual(previous_write, plugin._seg_start[shoulder])
+        self.assertEqual(-0.5, plugin._target_q[elbow])
+        self.assertGreater(plugin._seg_span, plugin._EASE_PEAK_RATE *
+                           abs(0.5 - expected) / plugin._MAX_VELOCITY_RAD_S - 1e-3)
+        self.assertAlmostEqual(plugin._seg_start[shoulder],
+                               plugin._sample_segment(plugin._seg_started_at)[shoulder])
 
     def test_easing_endpoints_have_zero_slope(self):
         ease = ArmControlPlugin._ease
@@ -302,11 +330,12 @@ class ArmControlTests(unittest.TestCase):
         for distance in (0.2, 0.5, 1.0, 2.0):
             plugin._set_targets({"shoulderPitch_Left": hold - distance})
             span = plugin._seg_span
+            actual_distance = abs(plugin._target_q[shoulder] - plugin._seg_start[shoulder])
             peak = 0.0
             previous = ease(0.0)
             for step in range(1, samples + 1):
                 current = ease(step / samples)
-                peak = max(peak, (current - previous) * distance * samples / span)
+                peak = max(peak, (current - previous) * actual_distance * samples / span)
                 previous = current
             # The ease peaks at 1.875 / span, so sampling the profile is the
             # honest check: duration / distance alone lets a 1 rad move reach
@@ -394,6 +423,72 @@ class GestureLifecycleTests(unittest.TestCase):
 
 
 class HandSmoothTests(unittest.TestCase):
+    def test_converged_hand_refreshes_until_stopped(self):
+        pub = _FakePublisher()
+        plugin = HandPlugin({"control_rate_hz": 100}, "", None,
+                            dds_hand_pub=pub)
+        plugin._active = True
+        plugin._target_positions = [200] * 12
+        plugin._command_positions = [200] * 12
+        stop = plugin._control_stop_event = threading.Event()
+        with patch.object(device, "HAS_PND_SDK", True), patch.object(
+                device, "pnd_adam_msg_dds__HandCmd_",
+                lambda: types.SimpleNamespace(position=[0] * 12), create=True):
+            worker = threading.Thread(
+                target=plugin._control_loop, args=(stop,))
+            worker.start()
+            try:
+                deadline = time.monotonic() + 0.5
+                while len(pub.commands) < 3 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                self.assertGreaterEqual(len(pub.commands), 3)
+                self.assertTrue(plugin._active)
+                self.assertTrue(all(cmd.position == [200] * 12
+                                    for cmd in pub.commands))
+            finally:
+                stop.set()
+                plugin._wake_event.set()
+                worker.join(1.0)
+            count = len(pub.commands)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(count, len(pub.commands))
+
+    def test_hand_retarget_ramps_from_last_command(self):
+        pub = _FakePublisher()
+        plugin = HandPlugin({"control_rate_hz": 100,
+                             "transition_seconds": 0.1}, "", None,
+                            dds_hand_pub=pub)
+        plugin._active = True
+        plugin._target_positions = [200] * 12
+        plugin._command_positions = [200] * 12
+        stop = threading.Event()
+        with patch.object(device, "HAS_PND_SDK", True), patch.object(
+                device, "pnd_adam_msg_dds__HandCmd_",
+                lambda: types.SimpleNamespace(position=[0] * 12), create=True):
+            def write_then_stop(command, **kwargs):
+                pub.commands.append(command)
+                stop.set()
+            with patch.object(pub, "Write", side_effect=write_then_stop):
+                plugin._target_positions = [500] * 12
+                plugin._control_loop(stop)
+        self.assertEqual([300] * 12, list(pub.commands[0].position))
+        self.assertEqual([300.0] * 12, plugin._command_positions)
+
+    def test_hand_write_failure_does_not_advance_command(self):
+        plugin = HandPlugin({"control_rate_hz": 100}, "", None,
+                            dds_hand_pub=_FakePublisher())
+        plugin._active = True
+        plugin._target_positions = [0] * 12
+        plugin._command_positions = [500] * 12
+        stop = threading.Event()
+        def fail(positions):
+            stop.set()
+            return False
+        with patch.object(plugin, "_send_hand_cmd", side_effect=fail):
+            plugin._control_loop(stop)
+        self.assertEqual(plugin._command_positions, [500] * 12)
+        self.assertTrue(plugin._active)
+
     def test_hand_ramps_toward_target_and_converges(self):
         old_flag = getattr(device, "HAS_PND_SDK", False)
         old_factory = getattr(device, "pnd_adam_msg_dds__HandCmd_", None)
