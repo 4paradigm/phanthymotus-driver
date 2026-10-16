@@ -2115,4 +2115,6 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
+    from qr_scan import QrScanPlugin
+    plugins.append(QrScanPlugin(nodes, config.get("plugins", {}).get("qr_scan", {}), tts_plugin=audio))
     return plugins
