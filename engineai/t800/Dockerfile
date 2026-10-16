@@ -73,6 +73,7 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
 
 COPY common/ /work/common/
 COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
+COPY teleop.py teleop_control.py teleop_kinematics.py /work/
 # 与 unitree/g1 一致：开机音作为小型规范资源随 driver 构建上下文打包，
 # 不依赖运行时或镜像构建时的外部网络。
 COPY resource/ /work/resource/
@@ -88,7 +89,7 @@ RUN . /opt/ros/humble/setup.sh && \
     command -v pactl >/dev/null && \
     command -v parec >/dev/null && \
     ros2 pkg prefix rmw_cyclonedds_cpp >/dev/null && \
-    python3 -c "import main; from audio_msgs.msg import AudioChunk; import lcm, numpy, yaml; print('T800 runtime imports ok')"
+    python3 -c "import main, teleop; from teleop_kinematics import DualArmModel; DualArmModel(); from audio_msgs.msg import AudioChunk; import lcm, numpy, yaml; print('T800 runtime imports ok')"
 
 ENV T800_PREFERRED_RMW=rmw_cyclonedds_cpp
 ENV ROS_LOCALHOST_ONLY=0
@@ -98,4 +99,4 @@ ENV PYTHONPATH=/work
 
 EXPOSE 15708
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /t800_ws/install/setup.bash && if [ -n \"${RMW_IMPLEMENTATION:-}\" ] && ! ros2 pkg prefix \"${RMW_IMPLEMENTATION}\" >/dev/null 2>&1; then echo \"[t800] ignoring unavailable RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}\"; unset RMW_IMPLEMENTATION; fi && if [ -n \"${T800_PREFERRED_RMW:-}\" ] && ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && if [ -z \"${CYCLONEDDS_URI:-}\" ]; then export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth1}'/></Interfaces></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>\"; fi && exec python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /t800_ws/install/setup.bash && if [ -n \"${RMW_IMPLEMENTATION:-}\" ] && ! ros2 pkg prefix \"${RMW_IMPLEMENTATION}\" >/dev/null 2>&1; then echo \"[t800] ignoring unavailable RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}\"; unset RMW_IMPLEMENTATION; fi && if [ -n \"${T800_PREFERRED_RMW:-}\" ] && ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && exec python3 /work/main.py"]
