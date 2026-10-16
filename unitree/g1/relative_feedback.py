@@ -158,6 +158,9 @@ class RelativeController:
         self.requested_turn = target['yaw']
         self.speed, self.yaw_speed = speed, yaw_speed
         self.min_speed = min_speed
+        has_translation = target['x'] != 0 or target['y'] != 0
+        self.final_turn_started = not has_translation or target['yaw'] == 0
+        self.phase = 'rotate' if not has_translation and target['yaw'] != 0 else 'translate'
         self.settle_since = None
         self.best = float('inf')
         self.progress_time = now
@@ -165,7 +168,8 @@ class RelativeController:
 
     def step(self, pose, now):
         ex, ey = self.x - pose['x'], self.y - pose['y']
-        ea = wrap(self.yaw - pose['yaw'])
+        heading_target = self.yaw if self.final_turn_started else self.initial['yaw']
+        ea = wrap(heading_target - pose['yaw'])
         # At a half-turn both directions describe the same heading. Preserve the
         # requested direction around that tie, including small startup noise.
         if (abs(abs(self.requested_turn) - math.pi) < 1e-9
@@ -173,25 +177,38 @@ class RelativeController:
                 and ea * self.requested_turn < 0):
             ea = math.copysign(2 * math.pi - abs(ea), self.requested_turn)
         distance = math.hypot(ex, ey)
-        self.error = dict(position_error_m=distance, angle_error_deg=math.degrees(ea))
-        inside = distance <= self.POSITION_TOLERANCE and abs(ea) <= self.ANGLE_TOLERANCE
-        if inside:
-            if self.settle_since is None:
-                self.settle_since = now
-            stationary = pose['speed'] <= self.STOP_SPEED and pose['angular_speed'] <= self.STOP_YAW_RATE
-            fresh_until = min(pose['odom_stamp'], pose['imu_stamp'])
-            done = stationary and fresh_until - self.settle_since >= self.SETTLE_SECONDS
-            if not stationary:
-                self.settle_since = now
-            if now - self.progress_time > self.STALL_SECONDS:
-                raise RuntimeError('Could not settle at target')
-            return (0., 0., 0.), done
+        self.error = dict(position_error_m=distance,
+                          angle_error_deg=math.degrees(wrap(self.yaw - pose['yaw'])),
+                          heading_error_deg=math.degrees(ea), phase=self.phase)
+        if self.phase == 'brake':
+            if self._settled(pose, now):
+                self._transition('rotate', now)
+            elif now - self.progress_time > self.STALL_SECONDS:
+                raise RuntimeError('Could not stop before heading correction')
+            return (0., 0., 0.), False
+        if self.phase == 'rotate':
+            self._progress(.2 * abs(ea), now)
+            if abs(ea) <= self.ANGLE_TOLERANCE:
+                if self._settled(pose, now):
+                    self._transition('translate', now)
+                return (0., 0., 0.), False
+            self.settle_since = None
+            # Never begin rotation while residual translation is still observed.
+            if pose['speed'] > self.STOP_SPEED:
+                return (0., 0., 0.), False
+            return (0., 0., max(-self.yaw_speed, min(self.yaw_speed, 1.2 * ea))), False
+        if abs(ea) > self.ANGLE_TOLERANCE:
+            self._transition('brake', now)
+            return (0., 0., 0.), False
+        self._progress(distance, now)
+        if distance <= self.POSITION_TOLERANCE:
+            settled = self._settled(pose, now)
+            if settled and not self.final_turn_started:
+                self.final_turn_started = True
+                self._transition('rotate', now)
+                return (0., 0., 0.), False
+            return (0., 0., 0.), settled
         self.settle_since = None
-        score = distance + .2 * abs(ea)
-        if score < self.best - .005:
-            self.best, self.progress_time = score, now
-        if now - self.progress_time > self.STALL_SECONDS:
-            raise RuntimeError('No progress toward target')
         heading = self.initial['odom_yaw'] + pose['yaw'] - self.initial['yaw']
         c, s = math.cos(heading), math.sin(heading)
         errors = [c * ex + s * ey, -s * ex + c * ey]
@@ -210,8 +227,27 @@ class RelativeController:
                 bounded = math.sqrt(self.min_speed ** 2 + scale * (value ** 2 - self.min_speed ** 2))
                 velocity[i] = math.copysign(bounded, errors[i])
         vx, vy = velocity
-        vyaw = max(-self.yaw_speed, min(self.yaw_speed, 1.2 * ea))
-        return (vx, vy, vyaw), False
+        return (vx, vy, 0.), False
+
+    def _transition(self, phase, now):
+        self.phase = phase
+        self.error['phase'] = phase
+        self.settle_since = None
+        self.best, self.progress_time = float('inf'), now
+
+    def _progress(self, score, now):
+        if score < self.best - .005:
+            self.best, self.progress_time = score, now
+        if now - self.progress_time > self.STALL_SECONDS:
+            raise RuntimeError(f'No progress in {self.phase} phase')
+
+    def _settled(self, pose, now):
+        if pose['speed'] > self.STOP_SPEED or pose['angular_speed'] > self.STOP_YAW_RATE:
+            self.settle_since = None
+            return False
+        if self.settle_since is None:
+            self.settle_since = now
+        return min(pose['odom_stamp'], pose['imu_stamp']) - self.settle_since >= self.SETTLE_SECONDS
 
 
 def create_feedback_node(namespace, feedback):

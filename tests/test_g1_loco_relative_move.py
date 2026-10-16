@@ -88,8 +88,10 @@ class TestRelativeController(unittest.TestCase):
         controller = RelativeController(pose(), dict(x=.03, y=.03, yaw=1.), .3, .5, 0.)
         command, done = controller.step(pose(), 0.)
         self.assertEqual(command[:2], (0., 0.))
-        self.assertGreater(command[2], 0.)
+        self.assertEqual(command[2], 0.)
         self.assertFalse(done)
+        controller.step(pose(now=.6), .6)
+        self.assertGreater(controller.step(pose(now=.7), .7)[0][2], 0.)
         with self.assertRaises(ValueError):
             RelativeController(pose(), dict(x=1, y=0, yaw=0), .1, .5, 0.)
 
@@ -128,6 +130,7 @@ class TestRelativeController(unittest.TestCase):
                     now = step * .05
                     current['odom_stamp'] = current['imu_stamp'] = now
                     (vx, vy, w), done = controller.step(current, now)
+                    self.assertFalse((vx or vy) and w, 'Rotation and translation must never be commanded together')
                     self.assertLessEqual(math.hypot(vx, vy), .300001)
                     self.assertLessEqual(abs(w), .500001)
                     if done:
@@ -149,10 +152,47 @@ class TestRelativeController(unittest.TestCase):
         initial = pose()
         controller = RelativeController(initial, dict(x=0, y=0, yaw=math.pi/2), .3, .5, 0)
         velocity, done = controller.step(pose(x=.1, y=-.1, yaw=.2, now=.1), .1)
-        self.assertLess(velocity[0], 0)
-        self.assertGreater(velocity[1], 0)
+        self.assertEqual(velocity[:2], (0., 0.))
         self.assertGreater(velocity[2], 0)
         self.assertFalse(done)
+        for now in (.2, .8):
+            velocity, done = controller.step(pose(x=.1, y=-.1, yaw=math.pi/2, now=now), now)
+            self.assertEqual(velocity, (0., 0., 0.))
+            self.assertFalse(done)
+        velocity, _ = controller.step(pose(x=.1, y=-.1, yaw=math.pi/2, now=.9), .9)
+        # In the rotated body frame both corrections are positive.
+        self.assertGreater(velocity[0], 0)
+        self.assertGreater(velocity[1], 0)
+        self.assertEqual(velocity[2], 0.)
+        self.assertFalse(controller.step(pose(yaw=math.pi/2, now=1.), 1.)[1])
+        self.assertTrue(controller.step(pose(yaw=math.pi/2, now=1.6), 1.6)[1])
+
+    def test_nonzero_goal_translates_then_turns_and_corrects_drift_separately(self):
+        controller = RelativeController(pose(), dict(x=1, y=1, yaw=math.pi/2), .3, .5, 0)
+        command, _ = controller.step(pose(), 0.)
+        self.assertTrue(command[0] or command[1])
+        self.assertEqual(command[2], 0.)
+        for now in (.1, .7):
+            command, done = controller.step(pose(x=1, y=1, now=now), now)
+            self.assertEqual(command, (0., 0., 0.))
+            self.assertFalse(done)
+        command, _ = controller.step(pose(x=1, y=1, now=.8), .8)
+        self.assertEqual(command[:2], (0., 0.))
+        self.assertGreater(command[2], 0.)
+        for now in (.9, 1.5):
+            command, _ = controller.step(pose(x=1.1, y=.9, yaw=math.pi/2, now=now), now)
+            self.assertEqual(command, (0., 0., 0.))
+        command, _ = controller.step(pose(x=1.1, y=.9, yaw=math.pi/2, now=1.6), 1.6)
+        self.assertTrue(command[0] or command[1])
+        self.assertEqual(command[2], 0.)
+        drifting = pose(x=1.1, y=.9, yaw=math.pi/2 + .1, now=1.7, speed=.2, rate=.1)
+        self.assertEqual(controller.step(drifting, 1.7)[0], (0., 0., 0.))
+        self.assertEqual(controller.phase, 'brake')
+        for now in (1.8, 2.4):
+            self.assertEqual(controller.step(pose(x=1.1, y=.9, yaw=math.pi/2 + .1, now=now), now)[0], (0., 0., 0.))
+        command, _ = controller.step(pose(x=1.1, y=.9, yaw=math.pi/2 + .1, now=2.5), 2.5)
+        self.assertEqual(command[:2], (0., 0.))
+        self.assertLess(command[2], 0.)
 
     def test_frozen_feedback_never_completes_and_no_progress_times_out(self):
         controller = RelativeController(pose(), dict(x=0, y=0, yaw=0), .3, .5, 0)
@@ -450,9 +490,12 @@ class TestLocalMotionSafety(unittest.TestCase):
             with self.subTest(reason=reason):
                 backend = FeedbackBackend()
                 original_command = backend.command
+                cancelled_stop = []
                 def command(*velocity):
                     ret = original_command(*velocity)
-                    if not any(velocity):
+                    if not any(velocity) and card.active and card.active['cancel'].is_set():
+                        if not cancelled_stop:
+                            cancelled_stop.append(len(backend.calls) - 1)
                         backend.position = pose()  # Simulated plant stops after receiving zero.
                     return ret
                 backend.command = command
@@ -473,9 +516,8 @@ class TestLocalMotionSafety(unittest.TestCase):
                 self.assertTrue(done.wait(5))
                 self.assertEqual(notices[0][0], 'error')
                 self.assertEqual(notices[0][1]['safety_reason'], reason)
-                after_event = backend.calls[boundary:]
-                stopped_at = next(i for i, command in enumerate(after_event) if not any(command))
-                self.assertTrue(all(not any(command) for command in after_event[stopped_at:]))
+                self.assertTrue(cancelled_stop)
+                self.assertTrue(all(not any(command) for command in backend.calls[cancelled_stop[0]:]))
                 self.assertTrue(card.faulted)
                 backend.failure = None
                 backend.position = pose()
