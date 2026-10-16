@@ -19,7 +19,7 @@ from vendor import MoveError, RobotReader, validate_moveh, HEAD_RAD_LIMITS
 
 class HeadValidationTests(unittest.TestCase):
     def test_manual_degrees_convert_to_only_two_radians(self):
-        for pitch,yaw in ((-59.58,-89.95),(44.69,89.95),(0,0),(12,-20)):
+        for pitch,yaw in ((-60,-90),(45,90),(0,0),(12,-20)):
             target,duration=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
             for actual,expected in zip(card_degrees(target),(pitch,yaw)):
@@ -27,10 +27,10 @@ class HeadValidationTests(unittest.TestCase):
             self.assertEqual(duration,5)
         props=tool()['inputSchema']
         self.assertEqual(set(props['properties']),{'pitch_deg','yaw_deg','time'})
-        self.assertEqual(props['properties']['pitch_deg']['minimum'],-59.58)
-        self.assertEqual(props['properties']['pitch_deg']['maximum'],44.69)
-        self.assertEqual(props['properties']['yaw_deg']['minimum'],-89.95)
-        self.assertEqual(props['properties']['yaw_deg']['maximum'],89.95)
+        self.assertEqual(props['properties']['pitch_deg']['minimum'],-60)
+        self.assertEqual(props['properties']['pitch_deg']['maximum'],45)
+        self.assertEqual(props['properties']['yaw_deg']['minimum'],-90)
+        self.assertEqual(props['properties']['yaw_deg']['maximum'],90)
         self.assertEqual(props['required'],['pitch_deg','yaw_deg'])
         self.assertNotIn('action',props['properties'])
         self.assertNotIn('x-action-params',props)
@@ -41,19 +41,10 @@ class HeadValidationTests(unittest.TestCase):
             with self.subTest(pitch=pitch,yaw=yaw),self.assertRaisesRegex(ValueError,'头部角度范围'):
                 arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             with self.assertRaises(ValueError):validate_moveh([math.radians(-pitch),math.radians(yaw)],5)
-        for pitch,yaw in ((-59.58,-89.95),(44.69,89.95),(5,0),(0,-89.95),(0,89.95),(-12,20)):
+        for pitch,yaw in ((-60,-90),(45,90),(5,0),(0,-90),(0,90),(-12,20)):
             target,_=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
             self.assertTrue(all(low<=v<=high for v,(low,high) in zip(target,HEAD_RAD_LIMITS)))
-
-    def test_protocol_boundary_rejects_previously_accepted_manual_endpoints(self):
-        for pitch,yaw in ((45,0),(-60,0),(0,90),(0,-90),(45,90)):
-            with self.subTest(pitch=pitch,yaw=yaw):
-                with self.assertRaises(ValueError):arguments({'pitch_deg':pitch,'yaw_deg':yaw})
-                with self.assertRaises(MoveError) as error:
-                    validate_moveh([math.radians(-pitch),math.radians(yaw)],10)
-                self.assertFalse(error.exception.motion_sent)
-                self.assertEqual(error.exception.code,'head_command_out_of_range')
 
     def test_missing_bad_and_out_of_range_values_never_validate(self):
         for key in ('pitch_deg','yaw_deg'):
@@ -73,11 +64,12 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.reader=RobotReader(settings());self.reader.accept_info(info())
         self.reader.ws=types.SimpleNamespace(closed=False)
         self.reader.send_moveh=AsyncMock(return_value={'status':'accepted','motion_sent':True})
+        self.reader.head_control_status=AsyncMock(return_value={'vr_head_follow':False})
         self.reader.send_movej=AsyncMock(return_value={'status':'accepted','motion_sent':True})
         self.report=AsyncMock(return_value=True)
         self.owner=HeadCompletion(self.reader,self.report)
         self.tick=100;self.feedback([0]*16)
-        self.patches=[patch('completion.ARRIVAL_GRACE',.22),patch('completion.STABILITY_SECONDS',.04)]
+        self.patches=[patch('completion.ARRIVAL_GRACE',.22),patch('completion.STABILITY_SECONDS',.04),patch('head.RECOVERY_TIMEOUT',.25)]
         for p in self.patches:p.start()
         self.pump_task=None
 
@@ -116,13 +108,88 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.owner.last['callback_delivered']);self.assertIsNone(self.owner.active)
 
     async def test_invalid_target_never_owns_head_and_valid_next_request_is_admitted(self):
-        for target,duration in (([-math.pi/4,math.pi/2],10),([0,0],float('nan')),([0,0],0)):
+        for target,duration in (([-math.pi/4-.01,math.pi/2],10),([0,0],float('nan')),([0,0],0)):
             with self.assertRaises(ValueError):await self.owner.dispatch('move',target,duration,{})
             self.assertIsNone(self.owner.active);self.assertIsNone(self.owner.task)
             self.assertIsNone(self.owner.last)
         self.reader.send_moveh.assert_not_called();self.report.assert_not_called()
         await self.dispatch();self.pump([0]*14+[.1,-.1]);await self.owner.task
         self.assertEqual(self.owner.last['status'],'completed')
+
+    async def test_moving_or_out_of_range_feedback_rejects_without_lock_and_can_retry(self):
+        for q,dq,code in (([0]*14+[0,0],[0]*14+[.2,0],'head_not_stationary'),
+                          ([0]*14+[2,0],[0]*16,'head_feedback_out_of_range')):
+            self.feedback(q,dq)
+            with self.assertRaises(MoveError) as caught:await self.dispatch()
+            self.assertEqual(caught.exception.code,code);self.assertFalse(caught.exception.motion_sent)
+            self.assertIsNone(self.owner.active);self.assertIsNone(self.owner.task)
+            self.reader.send_moveh.assert_not_called()
+        self.feedback([0]*16)
+        await self.dispatch();self.pump([0]*14+[.1,-.1]);await self.owner.task
+        self.assertEqual(self.owner.last['status'],'completed')
+
+    async def test_feedback_change_between_admission_and_send_does_not_latch(self):
+        original=self.owner.validate_admission_feedback;calls=[]
+        def check():
+            calls.append(1)
+            if len(calls)==2:self.feedback([0]*16,[0]*14+[.2,0])
+            original()
+        with patch.object(self.owner,'validate_admission_feedback',side_effect=check):
+            with self.assertRaises(MoveError):await self.dispatch()
+        self.reader.send_moveh.assert_not_called();self.report.assert_not_called()
+        self.assertIsNone(self.owner.active)
+
+    async def blocked(self):
+        q=[0]*16
+        await self.dispatch();self.pump(q);await self.owner.task
+        self.assertEqual(self.owner.last['error_code'],'target_not_reached')
+        return q
+
+    async def test_new_valid_goal_recovers_stationary_target_miss_and_preserves_error(self):
+        q=await self.blocked();old=self.owner.last['action_id']
+        admitted=await self.owner.dispatch('move',[.02,0],.1,{})
+        previous=admitted['previous_action_error']
+        self.assertEqual(previous['action_id'],old);self.assertEqual(previous['status'],'error')
+        self.assertFalse(previous['arrival_verified']);self.assertFalse(previous['recovery']['motion_sent'])
+        self.assertGreaterEqual(previous['recovery']['verified_samples'],3)
+        q[14:]=[.02,0];await self.owner.task
+        self.assertEqual(self.owner.last['status'],'completed')
+        self.assertNotEqual(self.owner.last['action_id'],old)
+        self.assertEqual(self.reader.send_moveh.await_count,2)
+
+    async def test_unknown_ack_callback_or_connection_never_auto_recovers(self):
+        await self.blocked();original=dict(self.owner.last);ws=self.reader.ws
+        for change in ('ack','callback','connection','peer'):
+            self.owner.last=dict(original);self.reader.ws=ws;self.owner.peers=[]
+            if change=='ack':self.owner.last['vendor_acknowledged']=False
+            elif change=='callback':self.owner.last['callback_delivered']=False
+            elif change=='connection':self.reader.ws=types.SimpleNamespace(closed=False)
+            else:self.owner.peers=[types.SimpleNamespace(closed=False,active={'state':'moving'})]
+            with self.assertRaises(MoveError):await self.owner.dispatch('move',[0,0],.1,{})
+            self.assertIsNotNone(self.owner.active);self.assertFalse(self.owner.recovering)
+        self.reader.send_moveh.assert_awaited_once()
+
+    async def test_recovery_requires_advancing_frames_and_stationary_arms_too(self):
+        await self.blocked();self.pump_task.cancel();await asyncio.gather(self.pump_task,return_exceptions=True)
+        self.feedback([0]*16)
+        with self.assertRaises(MoveError) as caught:await self.owner.dispatch('move',[0,0],.1,{})
+        self.assertEqual(caught.exception.code,'head_recovery_timeout')
+        self.feedback([0]*16,[.2]+[0]*15)
+        with self.assertRaises(MoveError) as caught:await self.owner.dispatch('move',[0,0],.1,{})
+        self.assertEqual(caught.exception.code,'head_recovery_not_stationary')
+        self.reader.send_moveh.assert_awaited_once();self.assertIsNotNone(self.owner.active)
+
+    async def test_concurrent_recovery_and_stop_cannot_clear_or_send(self):
+        await self.blocked();entered=asyncio.Event();release=asyncio.Event()
+        async def check():entered.set();await release.wait()
+        self.reader.head_control_status=check
+        pending=asyncio.create_task(self.owner.dispatch('move',[0,0],.1,{}))
+        await entered.wait()
+        with self.assertRaises(MoveError) as caught:await self.owner.dispatch('move',[0,0],.1,{})
+        self.assertEqual(caught.exception.code,'head_admission_busy')
+        await self.owner.close();release.set()
+        with self.assertRaises(MoveError):await pending
+        self.reader.send_moveh.assert_awaited_once();self.assertIsNotNone(self.owner.active)
 
     async def test_duplicate_vendor_timestamp_cannot_complete(self):
         await self.dispatch();self.pump([0]*14+[.1,-.1],advance=False)
@@ -140,8 +207,8 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary['state'],'blocked_requires_operator_check')
         self.assertAlmostEqual(summary['target_pitch_deg'],-math.degrees(.1))
         self.assertEqual(summary['current_pitch_deg'],0)
-        with self.assertRaisesRegex(MoveError,'头部未确认到位') as caught:await self.dispatch()
-        self.assertEqual(caught.exception.code,'head_requires_operator_check')
+        with self.assertRaises(ValueError):await self.owner.dispatch('move',[5,0],1,{})
+        self.assertEqual(self.owner.active['action_id'],summary['action_id'])
         self.reader.send_moveh.assert_awaited_once()
         self.reader.joints_at-=100
         self.assertFalse(self.owner.summary()['feedback_available'])
@@ -271,7 +338,7 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(adapter.call('move_head',{'action':action})['motion_sent'])
                 # Real MCP admission: invalid input never sends WS, creates an ACP task,
                 # or acquires ownership. The following valid call must still complete.
-                bad_inputs=[{'pitch_deg':45,'yaw_deg':90,'time':10},
+                bad_inputs=[{'pitch_deg':46,'yaw_deg':90,'time':10},
                     {'pitch_deg':'5','yaw_deg':0}, {'pitch_deg':True,'yaw_deg':0},
                     {'pitch_deg':0}, {'pitch_deg':0,'yaw_deg':0,'time':0},
                     {'pitch_deg':0,'yaw_deg':0,'unexpected':1}]

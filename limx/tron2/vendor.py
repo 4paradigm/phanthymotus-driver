@@ -24,13 +24,11 @@ ARM_UPPER = (2.6005, 3.1940, 1.4835, .2618, 1.3963, .7854, 1.5708,
              2.6005, .2618, 3.6652, .2618, 1.7453, .7854, 1.5708)
 
 
-# Physical limits from the DACH manual/URDF; retain native coordinates.
-# Command admission also requires the documented protocol limits below.
+# Operator requests the DACH manual/URDF limits for both axes. Pitch motion
+# was reported working on 0.7.3; yaw endpoints are not yet field-verified.
+# Preserve native vendor signs and exact degree-to-radian conversion.
 HEAD_RAD_LIMITS = ((math.radians(-45), math.radians(60)), (-math.pi/2, math.pi/2))
 HEAD_DEG_LIMITS = ((-45, 60), (-90, 90))
-# SDK 3.6.2 documents narrower command bounds than the mechanical manual.
-# Validate both before allocating a task and again immediately before WS send.
-HEAD_PROTOCOL_RAD_LIMITS = ((-.78, 1.04), (-1.57, 1.57))
 
 
 def validate_moveh(joint, duration):
@@ -47,8 +45,6 @@ def validate_moveh(joint, duration):
             valid = False
         if not valid:
             raise ValueError('Head angle exceeds the configured head joint limit')
-    if any(not low <= value <= high for value, (low, high) in zip(joint, HEAD_PROTOCOL_RAD_LIMITS)):
-        raise MoveError('目标超出厂家MoveH接口范围；未发送转动指令', False, 'head_command_out_of_range')
     # Reuse strict duration validation, without forwarding any arm target.
     validate_movej([0]*14, duration)
     return list(joint), duration

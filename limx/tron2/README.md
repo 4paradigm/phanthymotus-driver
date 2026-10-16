@@ -10,7 +10,7 @@
 | `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
-| `move_head` | actuator | 俯仰-59.58～44.69°（上正）、偏航-89.95～89.95°（自身左正）绝对目标；ACP确认到位 | 无 |
+| `move_head` | actuator | 俯仰-60～45°（上正）、偏航-90～90°（自身左正）绝对目标；ACP确认到位 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
 夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。操作顺序为open、close、recover；open明确填写opening_mm（0至85mm）、speed、force；驱动按底层值=毫米数×94/85自动换算。两侧独立任务，无SIDE或CONFIRM_STOPPED。未填写有效开合参数、系统启动/停止均不会发送夹爪开合。

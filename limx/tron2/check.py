@@ -138,8 +138,8 @@ def run_check(timeout=20, camera=False):
         schema = head_tool['inputSchema']; props = schema['properties']
         if set(props) != {'pitch_deg','yaw_deg','time'} or schema.get('x-completion') != {'timeout':120} or \
                 schema.get('x-resource') != ['head','arm_l','arm_r'] or \
-                (props['pitch_deg'].get('minimum'),props['pitch_deg'].get('maximum')) != (-59.58,44.69) or \
-                (props['yaw_deg'].get('minimum'),props['yaw_deg'].get('maximum')) != (-89.95,89.95):
+                (props['pitch_deg'].get('minimum'),props['pitch_deg'].get('maximum')) != (-60,45) or \
+                (props['yaw_deg'].get('minimum'),props['yaw_deg'].get('maximum')) != (-90,90):
             raise ValueError('Head limits, schema or ACP tracking differ from the reviewed card')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):

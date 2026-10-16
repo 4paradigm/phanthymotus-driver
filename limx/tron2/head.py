@@ -6,12 +6,11 @@ import time
 import completion
 from completion import ArmCompletion
 from skeleton import skeleton_stream
-from vendor import validate_moveh, MoveError
+from vendor import validate_moveh, MoveError, HEAD_DEG_LIMITS, HEAD_RAD_LIMITS, motion_readiness
 
+RECOVERY_TIMEOUT = 3
 COORDINATE_CONVENTION = 'pitch_up_positive_yaw_robot_left_positive'
-# Rounded inward to 0.01 degree within the documented MoveH protocol limits.
-# Mechanical limits remain unchanged; input is never clamped.
-CARD_DEG_LIMITS = ((-59.58, 44.69), (-89.95, 89.95))
+CARD_DEG_LIMITS = ((-HEAD_DEG_LIMITS[0][1], -HEAD_DEG_LIMITS[0][0]), HEAD_DEG_LIMITS[1])
 
 
 def card_degrees(vendor_radians):
@@ -41,8 +40,8 @@ def tool():
         'description':'转到指定头部角度（相对零位），到位后通知完成。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'pitch_deg':{'type':'number','minimum':CARD_DEG_LIMITS[0][0],'maximum':CARD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上正下负；-59.58～44.69°'},
-                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'左右角度（°）','description':'自身左正右负；-89.95～89.95°'},
+                'pitch_deg':{'type':'number','minimum':CARD_DEG_LIMITS[0][0],'maximum':CARD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上正下负；-60～45°'},
+                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'左右角度（°）','description':'自身左正右负；-90～90°'},
                 'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'}},
             'required':['pitch_deg','yaw_deg'],
             'x-resource':['head','arm_l','arm_r'],
@@ -56,12 +55,88 @@ class HeadCompletion(ArmCompletion):
     action_prefix = 'tron2_head_'
     require_ack = True
 
+    def __init__(self, reader, report):
+        super().__init__(reader, report)
+        self.admission_lock = asyncio.Lock()
+        self.recovering = False
+
     async def dispatch(self, action, target, duration, details):
+        # Invalid new input must never clear a previous task.
         target,duration=self.validate(target,duration)
-        pitch,yaw=card_degrees(target)
-        return await super().dispatch(action,target,duration,{**details,
-            'target_pitch_deg':pitch,'target_yaw_deg':yaw,
-            'target_vendor_rad':list(target),'coordinate_convention':COORDINATE_CONVENTION})
+        if self.admission_lock.locked():
+            raise MoveError('头部正在审核另一条指令，请稍后再试',False,'head_admission_busy')
+        async with self.admission_lock:
+            recovered = await self.recover_stationary_failure()
+            if not self.active:
+                self.validate_admission_feedback()
+            pitch,yaw=card_degrees(target)
+            return await super().dispatch(action,target,duration,{**details,
+                **({'previous_action_error':recovered} if recovered else {}),
+                'target_pitch_deg':pitch,'target_yaw_deg':yaw,
+                'target_vendor_rad':list(target),'coordinate_convention':COORDINATE_CONVENTION})
+
+    def recovery_identity(self, job):
+        peers = self.peers + ([self.peer] if self.peer else [])
+        if self.closed or self.active is not job or not self.reader.connected or \
+                self.reader.ws is not job['ws'] or self.reader.serial != job['serial']:
+            raise MoveError('头部任务或连接已改变，不能自动解除旧任务',False,'head_recovery_changed')
+        if any(peer.closed or peer.active or getattr(peer,'recovering',False) or getattr(peer,'waiting',None) for peer in peers):
+            raise MoveError('其他运动任务尚未解除，未发送头部指令',False,'head_recovery_peer_busy')
+        status = self.reader.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready']:
+            raise MoveError('机器人运行状态未通过审核，旧任务保持保护',False,'head_recovery_not_ready')
+
+    async def recover_stationary_failure(self):
+        job, last = self.active, self.last or {}
+        if not job or job['state'] != 'blocked_requires_operator_check':
+            return None
+        # Only a delivered, acknowledged target-miss is recoverable. Unknown ACK,
+        # connection changes, reporting failures and ongoing tasks remain protected.
+        if last.get('action_id') != job['action_id'] or last.get('status') != 'error' or \
+                last.get('error_code') != 'target_not_reached' or last.get('vendor_acknowledged') is not True or \
+                last.get('callback_delivered') is not True or last.get('motion_sent') is not True or \
+                last.get('arrival_verified') is not False or not self.task or not self.task.done():
+            raise self.blocked_error()
+        self.recovering = True
+        try:
+            self.recovery_identity(job)
+            start_sample, _, _ = self.feedback()
+            start_stamp = start_sample['data']['robot_timestamp']
+            await self.reader.head_control_status()  # Read-only fresh VR/mode check.
+            self.recovery_identity(job)
+            deadline=time.monotonic()+RECOVERY_TIMEOUT; window=[]; stamp=start_stamp
+            while time.monotonic()<deadline:
+                self.recovery_identity(job)
+                self.validate_admission_feedback()
+                sample=self.reader.sample('joint_state'); packet=skeleton_stream(sample)
+                if not packet['status']['available'] or len(packet['joints'])!=16:
+                    raise MoveError('缺少新鲜完整关节反馈，旧任务保持保护',False,'head_recovery_feedback')
+                q=[j['q'] for j in packet['joints']]; dq=[j.get('dq') for j in packet['joints']]
+                current=sample['data']['robot_timestamp']; now=time.monotonic()
+                if any(type(v) not in (int,float) or not math.isfinite(v) or abs(v)>completion.VELOCITY_RAW_TOLERANCE for v in dq):
+                    raise MoveError('关节仍在运动，旧头部任务保持保护',False,'head_recovery_not_stationary')
+                if stamp is not None and current<stamp:
+                    raise MoveError('反馈时间戳回退，旧任务保持保护',False,'head_recovery_feedback')
+                if stamp is None or current>stamp:
+                    stamp=current
+                    if window and max(abs(math.degrees(a-b)) for a,b in zip(q,window[0][1]))>completion.STABILITY_DEG:
+                        raise MoveError('关节位置仍在变化，旧任务保持保护',False,'head_recovery_not_stationary')
+                    window.append((now,q))
+                    if len(window)>=3 and now-window[0][0]>=completion.STABILITY_SECONDS:
+                        self.recovery_identity(job)
+                        record={key:last[key] for key in ('action_id','action','status','error','error_code',
+                            'target_pitch_deg','target_yaw_deg','arrival_verified','callback_delivered') if key in last}
+                        record['recovery']={'reason':'fresh_stationary_feedback_before_new_command',
+                            'verified_samples':len(window),'observed_seconds':now-window[0][0],
+                            'vendor_timestamp':current,'motion_sent':False}
+                        # Preserve the failed result, never report it as completed.
+                        self.last={**last,'recovery':record['recovery']}
+                        self.active=None
+                        return record
+                await asyncio.sleep(.05)
+            raise MoveError('未取得连续静止新反馈，旧任务保持保护',False,'head_recovery_timeout')
+        finally:
+            self.recovering=False
 
     def summary(self):
         result = dict(self.last or {})
@@ -75,6 +150,7 @@ class HeadCompletion(ArmCompletion):
             result['time'] = job['duration']
         if not result:
             return None
+        result['recovering'] = self.recovering
         try:
             sample, q, dq = self.feedback()
             pitch,yaw=card_degrees(q)
@@ -115,7 +191,19 @@ class HeadCompletion(ArmCompletion):
             raise ValueError('Head feedback timestamp is required')
         return sample, q, dq
 
+    def validate_admission_feedback(self):
+        # A fresh, stationary observation is an admission gate, not arrival proof.
+        # Refusal occurs before task allocation (and is repeated before send).
+        _, q, dq = self.feedback()
+        tolerance = math.radians(completion.TOLERANCE_DEG)
+        if any(not low-tolerance <= value <= high+tolerance
+               for value, (low, high) in zip(q, HEAD_RAD_LIMITS)):
+            raise MoveError('头部反馈超出机械范围，未发送转动指令',False,'head_feedback_out_of_range')
+        if any(abs(value)>completion.VELOCITY_RAW_TOLERANCE for value in dq):
+            raise MoveError('头部仍在运动，请静止后再执行；未发送转动指令',False,'head_not_stationary')
+
     async def send(self, target, duration):
+        self.validate_admission_feedback()
         return await self.reader.send_moveh(target, duration)
 
     async def wait_for_arrival(self, job):
