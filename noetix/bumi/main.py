@@ -127,6 +127,12 @@ class BumiDeviceBundle:
             self._plugins.append(demo_plugin)
             print("[bundle] DemoEchoPlugin loaded")
 
+        if plugins_cfg.get("squat_counter", {}).get("enabled", False):
+            from squat_counter import SquatCounterPlugin
+            self._plugins.append(SquatCounterPlugin(
+                plugins_cfg["squat_counter"], namespace, executor))
+            print("[bundle] SquatCounterPlugin loaded")
+
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
             state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)

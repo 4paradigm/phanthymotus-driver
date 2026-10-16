@@ -28,3 +28,4 @@ cards:
   - { name: motion_state,      type: sensor }
   - { name: vision_capture,    type: actuator }
   - { name: demo_echo,    type: processor }
+  - { name: squat_counter, type: processor }

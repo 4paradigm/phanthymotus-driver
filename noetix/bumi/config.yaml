@@ -20,6 +20,11 @@ plugins:
     #   systemctl disable --now noetix-video-capture.service
     # Set false only when official App video transfer must retain the camera.
     disable_vendor_capture_service: true
+  squat_counter:
+    enabled: true
+    hold_s: 0.2
+    lost_s: 1.0
+    min_confidence: 0.5
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.
