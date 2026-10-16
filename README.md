@@ -72,6 +72,10 @@ python main.py
 3. Agent Core discovers the driver's tools via MCP `initialize` and `tools/list`
 4. Tools become available to the LLM agent and appear in the Web Dashboard
 5. The LLM agent can invoke tools via MCP `tools/call`
+6. A tool that takes a file declares `format: file` + `uploadTo: "mcp"`; the bytes
+   reach this container via `POST /file/upload` (`common/file_intake.py`), and the
+   reply names the path *inside* the container — no shared mount. See
+   [README_dev.md § File Arguments](README_dev.md#file-arguments-format-file-and-post-fileupload).
 
 ## Writing a New Driver
 

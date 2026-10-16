@@ -65,6 +65,9 @@ python main.py
 3. Agent Core 通过 MCP `initialize` 和 `tools/list` 发现驱动的工具
 4. 工具对 LLM Agent 可用，并显示在 Web Dashboard 中
 5. LLM Agent 通过 MCP `tools/call` 调用工具
+6. 需要文件的工具声明 `format: file` + `uploadTo: "mcp"`，字节经 `POST /file/upload`
+   进到本容器（`common/file_intake.py`），回包给出的是**容器内部**的绝对路径 ——
+   不需要任何共享挂载。详见 [README_dev.md 的 File Arguments 一节](README_dev.md#file-arguments-format-file-and-post-fileupload)。
 
 ## 开发新驱动
 
