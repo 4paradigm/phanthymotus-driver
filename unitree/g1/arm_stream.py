@@ -412,6 +412,9 @@ class ArmStreamExecutor:
             if self._legacy_busy(): raise ValueError('external_control_owned')
             self._fresh()
             self.hold('release_requested',release=True)
+            # Handback now owns the actuator. The finished replay must not
+            # overwrite a release failure with its expired 100 ms watchdog.
+            self.replay_deadline_ns = None
             self._prepared=False
             ident = ident or secrets.token_hex(16)
             self._operation = {'operation_id':ident,'state':'holding','started_ns':self.clock(),
@@ -594,7 +597,9 @@ class ArmStreamExecutor:
         now=self.clock()
         if op.get('operator_reset') and op['state']=='sdk_pending':return
         if now-op['started_ns']>10_000_000_000:
-            op.update(state='unknown',reason='release_timeout');return
+            op.update(timed_out_state=op['state'],state='unknown',reason='release_timeout')
+            self._settle=None
+            return
         if op['state']=='holding':
             if self._channel_open:
                 self._write(q,None,self._weight)
@@ -629,7 +634,10 @@ class ArmStreamExecutor:
                 op['state']='sdk_pending'
                 self._rpc_thread=threading.Thread(target=self._invoke99,args=(op,),name='g1-arm-release',daemon=True)
                 self._rpc_thread.start()
-            else:op['state']='awaiting_feedback';op['sdk_returned_ns']=now;self._settle=None
+            else:
+                # No vendor action follows a plain stop. The fresh stationary
+                # sample above already confirms the zero-weight handback.
+                self._complete_release(op, physical_confirmed=not op.get('operator_reset'))
             return
         if op['state']=='awaiting_feedback':
             if op.get('operator_reset'):
@@ -656,6 +664,18 @@ class ArmStreamExecutor:
             if not self.session_id and not (self._operation and self._operation['state'] not in ('completed','failed','unknown')):return
             try:
                 s,q,dq=self._fresh()
+                op=self._operation
+                if (op and op['state']=='unknown' and op.get('reason')=='release_timeout'
+                        and op.get('action_id') is None and not op.get('request_sent')
+                        and op.get('zero_writes',0)>=5 and self._weight==0
+                        and (op.get('handback_confirmed') or op.get('timed_out_state')=='confirming_handback')
+                        and not (self._rpc_thread and self._rpc_thread.is_alive())):
+                    # A completed zero-weight stop can receive late physical
+                    # confirmation. Never retry an SDK call or replay targets.
+                    if self._stationary(s,q,dq,op['zero_confirmed_ns']):
+                        op['handback_confirmed']=True
+                        self._complete_release(op,physical_confirmed=True)
+                    return
                 if self._operation and self._operation['state'] not in ('completed','failed','unknown'):
                     self._release_tick(s,q,dq);return
                 if self.state=='fault':return

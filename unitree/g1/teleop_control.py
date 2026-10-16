@@ -556,7 +556,8 @@ class TeleopControl:
                 if confirmed:self.executor.confirm_operator_reset()
                 time.sleep(.02)
             state = self.executor.status()
-            if state['ownership_held']: raise ValueError(state['reason'] or 'stop_unconfirmed')
+            if state['ownership_held']:
+                raise ValueError((state.get('release') or {}).get('reason') or state['reason'] or 'stop_unconfirmed')
             result = {'state': 'idle', 'authority_released': True, 'return_required': False}
         with self._lock:
             self._reset_operation = None
