@@ -211,3 +211,11 @@ class TimedMotion:
             action = self.actions.get(action_id)
             return self._outcome(action) if action else {"action_id": action_id, "status": "error",
                                                        "result": {"error": "Unknown motion action"}}
+
+    def is_idle(self):
+        """No owned motion, pending acknowledgement, update or live timer."""
+        with self.lock:
+            action = self.active
+            return action is None or bool(action['status'] is not None
+                and action['move_done'] and action['stop_done'] and action['stop_ret'] == 0
+                and not action['updates_pending'])

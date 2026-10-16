@@ -211,6 +211,17 @@ class TestSDKSplitCall(unittest.TestCase):
         self.assertEqual(loco._BeginCall(9999, '{}')(), (3103, None))
         self.assertEqual(sent, [])
 
+    def test_no_reply_velocity_stream_creates_no_futures_and_never_waits(self):
+        loco, sent, waits, removed = self.sdk()
+        stub = loco._ClientBase__stub
+        stub.SendRequest = lambda *args: self.fail('No-reply writes must not allocate request futures')
+        stub.Send = lambda request, timeout: sent.append(request) or True
+        for index in range(100):
+            self.assertEqual(loco._CallNoReply(7105, json.dumps({'velocity': [.1, 0, 0], 'duration': .3})), 0)
+        self.assertEqual(len(sent), 100)
+        self.assertEqual(waits, [])
+        self.assertEqual(removed, [])
+
     def test_future_cleanup_removes_correct_request(self):
         cls = extract_class(ROOT / 'unitree_sdk2py/rpc/request_future.py', 'RequestFutureQueue',
                             dict(Lock=threading.Lock, RequestFuture=object))
