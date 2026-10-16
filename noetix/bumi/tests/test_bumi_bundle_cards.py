@@ -41,7 +41,7 @@ def test_enabled_card_files_exist():
     # Cards like state/loco/mic/speaker/camera/motion_state/vision_capture
     # are implemented inside device.py and should NOT be checked here.
     standalone_cards = [c for c in enabled_cards if c in (
-        "squat_counter", "demo_echo",
+        "squat_counter",
     )]
 
     missing = []

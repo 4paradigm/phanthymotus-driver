@@ -121,12 +121,6 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
 
-        if plugins_cfg.get("demo_echo", {}).get("enabled", False):
-            from demo_echo import DemoEchoPlugin
-            demo_plugin = DemoEchoPlugin(plugins_cfg["demo_echo"], namespace, executor)
-            self._plugins.append(demo_plugin)
-            print("[bundle] DemoEchoPlugin loaded")
-
         if plugins_cfg.get("squat_counter", {}).get("enabled", False):
             from squat_counter import SquatCounterPlugin
             self._plugins.append(SquatCounterPlugin(
