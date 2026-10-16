@@ -27,4 +27,5 @@ cards:
   - { name: depth,             type: sensor }
   - { name: motion_state,      type: sensor }
   - { name: vision_capture,    type: actuator }
-  - { name: squat_counter, type: processor }
+  - { name: squat_counter,     type: processor }
+  - { name: bicep_curl_counter, type: processor }

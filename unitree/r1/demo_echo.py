@@ -49,15 +49,14 @@ class DemoEchoPlugin:
     def dispatch(self, action: str, args: dict) -> Optional[dict]:
         if action == "start":
             self.start()
-            return {"state": "Plugin started."}
+            return {"state": "running"}
         if action == "stop":
             self.stop()
-            return {"state": "Plugin stopped."}
+            return {"state": "idle"}
         if action == "info":
             return {
-                "state": "Plugin started." if self.enabled else "Plugin stopped.",
+                "state": "running" if self.enabled else "idle",
                 "hardware": "false",
-                
                 }
         if action == "run":
             if not self.enabled:

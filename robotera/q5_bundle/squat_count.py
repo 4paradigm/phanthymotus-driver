@@ -41,12 +41,14 @@ class SquatCounter:
         # Sliding window: list of (timestamp, is_down) tuples
         self.window = deque()
         self.in_squat = False
+        self.since_down = 0.0  # timestamp when down_ratio threshold was first met
         self.last_seen = None
 
     def _drop_track(self):
         self.track_id = None
         self.window.clear()
         self.in_squat = False
+        self.since_down = 0.0
         self.last_seen = None
 
     def _prune_window(self, now):
@@ -110,13 +112,18 @@ class SquatCounter:
 
         if not self.in_squat:
             # Phase 1: waiting for sustained down posture
-            if frac >= self.down_ratio:
-                self.in_squat = True
+            if frac >= self.down_ratio and self.since_down == 0.0:
+                self.since_down = now
+            if self.since_down > 0.0:
+                # Require minimum sustained down time (0.3s) to enter squat state
+                if now - self.since_down >= 0.3:
+                    self.in_squat = True
         else:
             # Phase 2: in squat, waiting for up posture to complete
             if posture in POSTURES_UP:
                 self.count += 1
                 self.in_squat = False
+                self.since_down = 0.0
                 self.window.clear()
                 return {
                     "type": "squat_completed",

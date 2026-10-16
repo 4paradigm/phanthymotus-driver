@@ -90,8 +90,8 @@ class BicepCurlCounter:
 
             if (math.isfinite(sh_x) and math.isfinite(sh_y)
                     and math.isfinite(wr_x) and math.isfinite(wr_y)
-                    and isinstance(sh_conf, (int, float)) and sh_conf >= 0.3
-                    and isinstance(wr_conf, (int, float)) and wr_conf >= 0.3):
+                    and isinstance(sh_conf, (int, float)) and sh_conf >= self.min_confidence
+                    and isinstance(wr_conf, (int, float)) and wr_conf >= self.min_confidence):
                 score = sh_conf + wr_conf
                 if score > best_score:
                     best_score = score
