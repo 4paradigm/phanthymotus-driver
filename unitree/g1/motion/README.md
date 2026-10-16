@@ -48,7 +48,7 @@ PICO 继续使用既有 `left/right.controls.buttons` 的 `available`、`pressed
 | 模块 | 职责 |
 |---|---|
 | `../teleop_control.py`、`../teleop_bus.py` | 设备输入、相对映射、会话与 ROS 订阅 |
-| `../motion_control.py`、`../motion_bus.py` | 数值协调、最新目标与运动卡传输 |
+| `../motion_control.py` | 内部数值协调与最新目标；不再注册独立运动卡 |
 | `worker.py`、`../../../common/motion/worker.py` | G1 求解器入口与独立进程 IPC |
 | `kinematics.py`、`ik.py` | 固定关节、FK 与 CasADi IK |
 | `profile.py`、`body23_fixed_hand.json` | 机型几何及每轮实测基准 |

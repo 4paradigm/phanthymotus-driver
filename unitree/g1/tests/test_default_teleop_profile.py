@@ -23,6 +23,7 @@ def sample(now=1_000_000_000):
 
 def test_default_registration_and_packaged_geometry_are_complete():
     config = yaml.safe_load((DRIVER/'config.yaml').read_text())
+    assert 'motion_control' not in config
     assert config['teleop_control']['enabled'] is True
     assert config['teleop_control']['calibration_path'] == '/work/motion/body23_fixed_hand.json'
     market = yaml.safe_load((DRIVER/'driver.yaml').read_text())
@@ -82,7 +83,8 @@ def test_no_guessed_posture_when_feedback_unavailable(change, error):
         session_profile(PROFILE, feedback, 1_000_000_000)
 
 
-def test_bundle_can_register_teleop_with_servo_cards(monkeypatch):
+@pytest.mark.parametrize('legacy,teleop', [(False, True), (True, True), (True, False)])
+def test_bundle_can_register_teleop_with_servo_cards(monkeypatch, legacy, teleop):
     import ast
     tree = ast.parse((DRIVER/'main.py').read_text())
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'G1DeviceBundle')
@@ -97,7 +99,6 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch):
         'device': {'ArmActionPlugin': Arm, '_loco_acp_notify': lambda *a, **k: None},
         'arm_stream': {'ArmStreamExecutor': Stub},
         'motion_control': {'MotionControl': Stub},
-        'motion_bus': {'MotionBus': Stub},
         'teleop_control': {'TeleopControl': Stub},
         'teleop_bus': {'TeleopBus': Stub},
         'servo': {'G1ServoPlugin': Stub},
@@ -105,8 +106,12 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch):
     }.items():
         monkeypatch.setitem(sys.modules, name, SimpleNamespace(**attrs))
     config = {'plugins': {name: {'enabled': True} for name in ('arm','servo','servo_eef')},
-              'teleop_control': {'enabled': True}}
+              'teleop_control': {'enabled': teleop}, 'motion_control': {'enabled': legacy}}
     config['plugins']['smart_motion'] = {'enabled': False}
+    if legacy:
+        with pytest.raises(ValueError, match='motion_control is removed; use teleop_control'):
+            namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None, None)
+        return
     bundle = namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None, None)
     assert len(bundle._plugins) == 4
     assert bundle._plugins[0]._teleop_control is bundle._plugins[1]

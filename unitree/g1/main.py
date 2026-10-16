@@ -141,37 +141,30 @@ class G1DeviceBundle:
             print("[bundle] ArmActionPlugin loaded")
 
         self._motion_bus = None
-        motion_cfg = cfg.get('motion_control', {})
+        if cfg.get('motion_control', {}).get('enabled', False):
+            raise ValueError('motion_control is removed; use teleop_control')
         control_cfg = cfg.get('teleop_control', {})
-        control_enabled = control_cfg.get('enabled', False)
-        if control_enabled and motion_cfg.get('enabled', False):
-            raise ValueError('select teleop_control or legacy motion_control')
-        if control_enabled or motion_cfg.get('enabled', False):
+        if control_cfg.get('enabled', False):
             from arm_stream import ArmStreamExecutor
             from motion_control import MotionControl
-            from motion_bus import MotionBus
+            from teleop_control import TeleopControl
+            from teleop_bus import TeleopBus
+            from device import _loco_acp_notify
             arm = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'arm'), None)
             if arm is None:
-                raise ValueError('motion_control requires arm plugin')
-            effective = dict(control_cfg if control_enabled else motion_cfg)
-            effective['servo_position'] = control_enabled
+                raise ValueError('teleop_control requires arm plugin')
+            effective = dict(control_cfg)
+            effective['servo_position'] = True
             stream = ArmStreamExecutor(effective, namespace, arm_client)
             motion = MotionControl(dict(effective), stream)
             stream.motion_control = motion
             arm._stream = stream
-            if control_enabled:
-                from teleop_control import TeleopControl
-                from teleop_bus import TeleopBus
-                from device import _loco_acp_notify
-                control = TeleopControl(dict(control_cfg), motion,
-                    notify=lambda ident, status, result: _loco_acp_notify(ident, status, result, tool='teleop_control'))
-                arm._teleop_control = control
-                stream.public_motion_topics = False
-                self._motion_bus = TeleopBus(executor, control)
-                self._plugins.append(control)
-            else:
-                self._motion_bus = MotionBus(namespace, executor, motion, stream)
-                self._plugins.append(motion)
+            control = TeleopControl(dict(control_cfg), motion,
+                notify=lambda ident, status, result: _loco_acp_notify(ident, status, result, tool='teleop_control'))
+            arm._teleop_control = control
+            stream.public_motion_topics = False
+            self._motion_bus = TeleopBus(executor, control)
+            self._plugins.append(control)
 
         # servo 默认**关闭**，和 arm 不同。arm 放的是厂商预设手势，经过内置控制器；
         # servo 直接往 rt/arm_sdk 写关节指令，是这个驱动第一次驱动电机本身。
