@@ -70,6 +70,27 @@ class TestPoseFeedback(unittest.TestCase):
 
 
 class TestRelativeController(unittest.TestCase):
+    def test_rotation_floor_handles_both_directions_and_stops_within_tolerance(self):
+        for direction in (1, -1):
+            for remaining in (6.2, 12.75, 90):
+                with self.subTest(direction=direction, remaining=remaining):
+                    controller = RelativeController(pose(),
+                        dict(x=0, y=0, yaw=direction * math.pi/2), .3, .5, 0.)
+                    current = direction * math.radians(90 - remaining)
+                    command, _ = controller.step(pose(yaw=current), 0.)
+                    self.assertEqual(command[:2], (0., 0.))
+                    self.assertGreaterEqual(abs(command[2]), .3)
+                    self.assertLessEqual(abs(command[2]), .5)
+                    self.assertGreater(command[2] * direction, 0)
+                    if remaining < 13:
+                        self.assertAlmostEqual(abs(command[2]), .3)
+                    command, done = controller.step(pose(yaw=direction * math.radians(88), now=.1), .1)
+                    self.assertEqual(command, (0., 0., 0.))
+                    self.assertFalse(done)
+        for value in (0, -.1, .6, float('nan')):
+            with self.assertRaises(ValueError):
+                RelativeController(pose(), dict(x=0, y=0, yaw=1), .3, .5, 0., min_yaw_speed=value)
+
     def test_each_active_translation_axis_exceeds_dead_zone_and_respects_cap(self):
         for x, y in ((.06, 0), (-.06, 0), (0, .06), (0, -.06), (.04, .04), (1, -.04), (.04, -1)):
             for cap in (.2, .25, .3, 1.):

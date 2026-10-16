@@ -147,9 +147,11 @@ class RelativeController:
     STOP_YAW_RATE = .03
     STALL_SECONDS = 10.
 
-    def __init__(self, initial, target, speed, yaw_speed, now, min_speed=.2):
+    def __init__(self, initial, target, speed, yaw_speed, now, min_speed=.2, min_yaw_speed=.3):
         if not math.isfinite(min_speed) or not 0 < min_speed <= speed:
             raise ValueError('Minimum translation speed must be positive and no higher than the speed cap')
+        if not math.isfinite(min_yaw_speed) or not 0 < min_yaw_speed <= yaw_speed:
+            raise ValueError('Minimum rotation speed must be positive and no higher than the angular speed cap')
         self.initial = initial
         c, s = math.cos(initial['odom_yaw']), math.sin(initial['odom_yaw'])
         self.x = initial['x'] + c * target['x'] - s * target['y']
@@ -158,6 +160,7 @@ class RelativeController:
         self.requested_turn = target['yaw']
         self.speed, self.yaw_speed = speed, yaw_speed
         self.min_speed = min_speed
+        self.min_yaw_speed = min_yaw_speed
         has_translation = target['x'] != 0 or target['y'] != 0
         self.final_turn_started = not has_translation or target['yaw'] == 0
         self.phase = 'rotate' if not has_translation and target['yaw'] != 0 else 'translate'
@@ -196,7 +199,8 @@ class RelativeController:
             # Never begin rotation while residual translation is still observed.
             if pose['speed'] > self.STOP_SPEED:
                 return (0., 0., 0.), False
-            return (0., 0., max(-self.yaw_speed, min(self.yaw_speed, 1.2 * ea))), False
+            rotation = math.copysign(min(self.yaw_speed, max(self.min_yaw_speed, 1.2 * abs(ea))), ea)
+            return (0., 0., rotation), False
         if abs(ea) > self.ANGLE_TOLERANCE:
             self._transition('brake', now)
             return (0., 0., 0.), False
