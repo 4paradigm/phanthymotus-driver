@@ -12,12 +12,13 @@ official LinkerHand C++ SDK: function `0x04` reads ten 16-bit registers and
 low byte of a register. `main.py` uses `modbus_device.py` for the hand card.
 
 Configure `serial_port` and `side` in `config.yaml`. The driver never moves the
-hand on startup; only explicit MCP `hand` actions do. Every `open`, `close`
-or `set_positions` request must include the boolean
+hand on startup; only explicit MCP `hand` actions do. Every `open`, `close`,
+`reset` or `set_positions` request must include the boolean
 `confirm_motion: true`; missing, false or string values are rejected before
 opening the serial port. On the canvas, enter `true` in the confirmation field
-after checking that the hand and its surroundings are clear. State reads,
-torque configuration and torque release do not need motion confirmation.
+after checking that the hand and its surroundings are clear. State reads do
+not need motion confirmation. The lifecycle `stop` action remains available
+to interrupt movement and release torque without commanding a new pose.
 The configured right-hand `open_pose` is
 `[254,254,254,254,254,254,127,126,127,254]`; `fist_pose` is
 `[93,255,0,0,0,0,128,128,128,255]`. The operator confirmed both poses on
@@ -28,11 +29,13 @@ including `set_positions`, if that side lacks explicit calibration. Detection
 and state reads remain available. These calibrations must not be assumed safe
 for other hardware. The official L20 Lite
 example maps slots 7–10 to index sway,
-middle sway, ring sway and thumb rotation; it has no separate pinky-sway slot.
-These are 0–255 position commands, not degrees. Both
-actions first read position, set speed/torque to the tested 60/100 values,
-command a halfway pose, then command and poll the final pose. They leave the
-configured torque enabled after success so the hand holds its position.
+ring sway, pinky sway and thumb rotation; it has no middle-sway slot.
+These are 0–255 position commands, not degrees. `open`, `close` and `reset`
+first read position, set speed/torque, command a halfway pose, then command
+and poll the final pose. `open` and `close` accept a per-call `set_torque` of
+1..255 (default 100); it does not change later actions. They retain that
+torque setting after reaching the target. `reset` opens to the calibrated pose
+and then sets all joint torques to 0, including when already open.
 `stop` writes zero torque to all ten registers; shutdown does this if connected.
 If a move times out or raises after a position command, the driver attempts to
 release torque.
@@ -44,19 +47,23 @@ The driver also rejects overlapping motions locally. `stop` interrupts a
 pending motion and releases torque; if completion delivery fails, the driver
 blocks further motion until it is inspected and restarted.
 
-With `auto_detect_gestures: true` (the existing setting name), `info` performs
-read-only position queries to addresses `0x27` and `0x28` on the configured
-serial port and returns `detected_sides` and the selected `side`. `get_state`,
-`open`, `close`, `set_positions`, and `release` each recheck the bus
-and target the sole responding hand. Zero or two responding hands, a bad frame,
-or a serial error prevents those actions from using an ambiguous target.
-`set_torque` only changes later command settings and never writes
-to the device immediately. The `side` setting remains a fallback when automatic
-detection is disabled. The legacy `open_pose`/`fist_pose` keys calibrate the
-right hand; `left_open_pose`/`left_fist_pose` calibrate the left hand. This
-stage still scans only one configured serial port.
-The canvas card name remains `hand`; its `info` result describes the detected
-left/right side, but the card header does not live-rename on USB hot-plug.
+The tool is multi-instance: drag `hand` onto the canvas once per physical hand,
+then open each card's instance configuration and select `bound_side: left` or
+`right`. Do not bind two cards to the same side. The driver scans the configured
+serial port plus connected `/dev/ttyUSB*` and `/dev/serial/by-path/*` devices,
+deduplicates their paths, and probes `0x27` and `0x28` with read-only frames.
+Each bound card follows its selected side even if USB port numbering changes;
+it refuses movement when that side is missing or detection is ambiguous. Before
+writing a motion command it probes the selected slave again. `info` reports the
+bound side, detected sides, count, and current serial port; the canvas card
+header itself does not live-rename.
+
+An existing single card without instance configuration retains the previous
+one-port behavior: with `auto_detect_gestures: true`, actions require exactly
+one responding hand on `serial_port`. Once any card is explicitly bound, an
+unbound card cannot move or read state until it is also bound. The legacy
+`open_pose`/`fist_pose` keys calibrate the right hand;
+`left_open_pose`/`left_fist_pose` calibrate the left hand.
 
 For local tests without hardware, run this command from the repository root:
 
@@ -91,22 +98,36 @@ controllers against the same port simultaneously.
 
 ## Canvas card
 
-`driver.yaml` declares one actuator card, `hand`. Once the driver is deployed
-and registered, Agent Core discovers its `get_tool()` schema and the canvas
-renders the card automatically; no custom frontend component is required.
+`driver.yaml` declares one actuator tool, `hand`, which can have two canvas
+instances. Once the driver is deployed and registered, Agent Core discovers its
+`get_tool()` schema; no custom frontend component is required. Open each
+card's instance configuration (gear icon) and select its hand before starting
+the project. A saved binding is replayed by Agent Core on start and action
+calls. Saving a binding does not move the hand.
 The card title is **L20 Lite 灵巧手**. It offers read-only `info`, `get_state`,
-`open`, `close`, `set_positions`, `set_torque` and `release`. `set_positions`
-uses ten individual joint fields; fields left blank keep their current measured
-values. The former CSV `positions`, `set_joint`, and `set_speed` controls are
-not exposed or accepted. `start` and `stop` are canvas lifecycle actions, with
+`open`, `close`, `reset` and `set_positions`. `set_positions`
+uses ten individual joint fields; each accepts an integer 0–255 protocol
+position value (not degrees), and fields left blank keep their current
+measured values. The range is a wire-level limit, not a guarantee that every
+target is physically safe. Values outside 0–255 (or non-integers) are rejected
+before any serial command is sent. Slots 8 and 9 are `ring_sway` and `pinky_sway` per
+the official L20 Lite map; older canvas workflows using `middle_sway` or the
+previous `ring_sway` slot must be reviewed before reuse. The former CSV
+`positions` field and the `set_joint`, `set_speed`, standalone `set_torque`
+and `release` actions are not exposed or accepted. `start` and
+`stop` are canvas lifecycle actions, with
 `stop` also releasing torque.
-`set_torque` starts at the configured value of 100, affects later motions only,
-and returns to the configured value when the driver restarts.
-
-All three motion actions accept `speed_ratio` from `1.0x` to
-`3.0x` and `hold_torque`. By default `hold_torque=true` preserves the existing
-driver behavior; choose `false` to release torque after reaching the target.
-Invalid options are rejected before serial access. Every motion still needs
-`confirm_motion=true`. With automatic detection enabled, each motion action
+`open` and `close` accept a per-action `set_torque` integer in 1–255 (default
+100), a raw torque limit rather than a lock or a value in N·m. They and
+`set_positions` accept `speed_ratio` from `1.0x` to `3.0x`. All three retain
+the commanded torque after reaching the target, including when already at
+the target. `reset` uses the calibrated open pose and always releases torque
+at the target. The former `hold_torque` parameter is no longer accepted;
+update saved canvas workflows that pass it. `stop` releases torque immediately.
+Invalid options are rejected before serial access. Every motion request must
+carry the boolean `confirm_motion=true` (not the string `"true"`); otherwise no
+motion is accepted. If the canvas preserves a previous true value, the operator
+must still recheck that the hand and its surroundings are safe before running
+another motion. With automatic detection enabled, each motion action
 checks for the sole responding hand on the configured serial port before
 sending a motion command.

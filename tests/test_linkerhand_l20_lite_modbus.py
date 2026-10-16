@@ -209,7 +209,7 @@ def completed_motion(plugin, action, args, events, done):
 def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
     assert JOINT_NAMES == [
         "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
-        "pinky_root", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
+        "pinky_root", "index_sway", "ring_sway", "pinky_sway", "thumb_roll",
     ]
     assert RIGHT_FIST_POSE == [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
     connection = FakeConnection()
@@ -230,6 +230,144 @@ def test_card_starts_without_motion_and_closes_then_opens(monkeypatch):
     assert connection.client.get_torques() == [0] * 10
     plugin.stop()
     assert connection.transport.closed
+
+
+def test_open_close_torque_is_per_action_and_reset_opens_then_releases(monkeypatch):
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, calibrated_config(poll_interval_s=0.02))
+    events, done = capture_completions(plugin)
+    monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
+
+    closed = completed_motion(plugin, "close", {
+        "set_torque": 80, "torque": 100, "confirm_motion": True,
+    }, events, done)
+    assert closed["torque"] == 80
+    assert connection.client.get_torques() == [80] * 10
+    opened = completed_motion(plugin, "open", {
+        "set_torque": 120, "confirm_motion": True,
+    }, events, done)
+    assert opened["torque"] == 120
+    assert connection.client.get_torques() == [120] * 10
+    closed_again = completed_motion(plugin, "close", {
+        "confirm_motion": True,
+    }, events, done)
+    assert closed_again["torque"] == 100
+    assert connection.client.get_torques() == [100] * 10
+
+    reset = completed_motion(plugin, "reset", {
+        "confirm_motion": True, "torque": 80, "set_torque": 200,
+    }, events, done)
+    assert reset["action"] == "reset"
+    assert reset["requested_positions"] == dict(zip(JOINT_NAMES, RIGHT_OPEN_POSE))
+    assert reset["torque"] == 0 and reset["torque_released"] is True
+    assert connection.client.get_positions() == RIGHT_OPEN_POSE
+    assert connection.client.get_torques() == [0] * 10
+    position_writes = [i for i, frame in enumerate(connection.transport.sent)
+                       if frame[1] == 0x10 and frame[2:4] == b"\x00\x00"]
+    zero_torque_writes = [i for i, frame in enumerate(connection.transport.sent)
+                          if frame[1] == 0x10 and frame[2:4] == b"\x00\x0a"
+                          and frame[7:-2] == bytes(20)]
+    assert position_writes[-1] < zero_torque_writes[-1]
+
+
+def test_reset_already_open_releases_torque_without_position_write():
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, calibrated_config())
+    events, done = capture_completions(plugin)
+    reset = completed_motion(plugin, "reset", {"confirm_motion": True}, events, done)
+    assert reset["state"] == "already_at_target"
+    assert reset["torque_released"] is True
+    assert connection.client.get_torques() == [0] * 10
+    assert not any(frame[1] == 0x10 and frame[2:4] == b"\x00\x00"
+                   for frame in connection.transport.sent)
+
+
+def test_open_already_at_target_restores_default_or_explicit_torque():
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, calibrated_config())
+    events, done = capture_completions(plugin)
+    released = completed_motion(plugin, "reset", {"confirm_motion": True}, events, done)
+    assert released["state"] == "already_at_target"
+    assert connection.client.get_torques() == [0] * 10
+
+    opened = completed_motion(plugin, "open", {"confirm_motion": True}, events, done)
+    assert opened["state"] == "already_at_target"
+    assert opened["torque"] == 100 and opened["torque_released"] is False
+    assert connection.client.get_torques() == [100] * 10
+    assert not any(frame[1] == 0x10 and frame[2:4] == b"\x00\x00"
+                   for frame in connection.transport.sent)
+
+    opened = completed_motion(plugin, "open", {
+        "set_torque": None, "confirm_motion": True,
+    }, events, done)
+    assert opened["state"] == "already_at_target"
+    assert connection.client.get_torques() == [100] * 10
+    assert not any(frame[1] == 0x10 and frame[2:4] == b"\x00\x00"
+                   for frame in connection.transport.sent)
+
+    opened = completed_motion(plugin, "open", {
+        "set_torque": 85, "confirm_motion": True,
+    }, events, done)
+    assert opened["state"] == "already_at_target"
+    assert opened["torque"] == 85
+    assert connection.client.get_torques() == [85] * 10
+    assert not any(frame[1] == 0x10 and frame[2:4] == b"\x00\x00"
+                   for frame in connection.transport.sent)
+
+
+def test_close_already_at_target_restores_torque_after_stop(monkeypatch):
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, calibrated_config(poll_interval_s=0.02))
+    events, done = capture_completions(plugin)
+    monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
+    completed_motion(plugin, "close", {"confirm_motion": True}, events, done)
+    assert plugin.dispatch("stop", {})["torque_released"] is True
+    assert connection.client.get_torques() == [0] * 10
+    closed = completed_motion(plugin, "close", {"confirm_motion": True}, events, done)
+    assert closed["state"] == "already_at_target"
+    assert closed["torque"] == 100 and closed["torque_released"] is False
+    assert connection.client.get_torques() == [100] * 10
+
+
+def test_per_action_torque_validation_rejects_bad_values_before_serial():
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, calibrated_config())
+    for action in ("open", "close"):
+        for torque in (0, 256, True, "80"):
+            with pytest.raises(ValueError, match="set_torque"):
+                plugin.dispatch(action, {"set_torque": torque, "confirm_motion": True})
+    with pytest.raises(ValueError, match="confirm_motion"):
+        plugin.dispatch("reset", {})
+    assert connection.transport.sent == []
+
+
+@pytest.mark.parametrize("action,arguments", [
+    ("open", {}), ("close", {}),
+    ("set_positions", {"index_flex": 220}),
+])
+def test_removed_hold_torque_is_rejected_before_serial(action, arguments):
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, calibrated_config())
+    with pytest.raises(ValueError, match="hold_torque is no longer supported"):
+        plugin.dispatch(action, {**arguments, "hold_torque": False, "confirm_motion": True})
+    assert connection._client is None
+    assert connection.transport.sent == []
+
+
+def test_set_positions_uses_official_ring_and_pinky_sway_slots(monkeypatch):
+    assert modbus_device.JOINT_FIELDS["ring_sway"] == 7
+    assert modbus_device.JOINT_FIELDS["pinky_sway"] == 8
+    assert "middle_sway" not in modbus_device.JOINT_FIELDS
+    connection = FakeConnection()
+    plugin = HandPlugin(connection, calibrated_config(poll_interval_s=0.02))
+    events, done = capture_completions(plugin)
+    monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
+    result = completed_motion(plugin, "set_positions", {
+        "ring_sway": 200, "pinky_sway": 30, "confirm_motion": True,
+    }, events, done)
+    assert result["positions"]["ring_sway"] == 200
+    assert result["positions"]["pinky_sway"] == 30
+    assert connection.client.get_positions()[7:9] == [200, 30]
 
 
 @pytest.mark.parametrize("side,slave_id", [("right", 0x27), ("left", 0x28)])
@@ -261,11 +399,10 @@ def test_auto_detected_hand_receives_all_device_actions(monkeypatch, side, slave
     assert positions["side"] == side
     assert positions["positions"]["index_root"] == 220
     assert positions["positions"]["middle_root"] == RIGHT_OPEN_POSE[3]
-    before_settings = sum(len(transport.sent) for transport in transports)
-    assert plugin.dispatch("set_torque", {"torque": 80})["applied"] is False
-    assert sum(len(transport.sent) for transport in transports) == before_settings
-    released = plugin.dispatch("release", {})
-    assert released["side"] == side and released["torque_released"] is True
+    reset = completed_motion(plugin, "reset", {"confirm_motion": True}, events, done)
+    assert reset["side"] == side and reset["torque_released"] is True
+    assert connection._client.get_positions() == RIGHT_OPEN_POSE
+    assert connection._client.get_torques() == [0] * 10
     writes = [frame for transport in transports for frame in transport.sent if frame[1] == 0x10]
     assert writes and all(frame[0] == slave_id for frame in writes)
 
@@ -282,8 +419,8 @@ def test_auto_actions_refuse_zero_or_two_hands(monkeypatch, responding_ids, expe
     assert info["detected_count"] == len(expected_sides)
     with pytest.raises(RuntimeError, match="expected exactly one hand"):
         plugin.dispatch("get_state", {})
-    with pytest.raises(RuntimeError, match="expected exactly one hand"):
-        plugin.dispatch("release", {})
+    with pytest.raises(ValueError, match="confirm_motion"):
+        plugin.dispatch("reset", {})
     accepted = plugin.dispatch("close", {"confirm_motion": True})
     assert accepted["state"] == "running"
     assert done.wait(2)
@@ -295,6 +432,15 @@ def test_auto_actions_refuse_zero_or_two_hands(monkeypatch, responding_ids, expe
             break
         threading.Event().wait(0.001)
     accepted = plugin.dispatch("set_positions", {"index_flex": 234, "confirm_motion": True})
+    assert accepted["state"] == "running" and done.wait(2)
+    assert events[-1][1] == "error"
+    assert "expected exactly one hand" in events[-1][2]["message"]
+    done.clear()
+    for _ in range(100):
+        if plugin._active is None:
+            break
+        threading.Event().wait(0.001)
+    accepted = plugin.dispatch("reset", {"confirm_motion": True})
     assert accepted["state"] == "running" and done.wait(2)
     assert events[-1][1] == "error"
     assert "expected exactly one hand" in events[-1][2]["message"]
@@ -342,12 +488,13 @@ def test_hardware_smoke_read_only_detects_left_without_writes(monkeypatch, capsy
     assert all(frame[1] == 0x04 for transport in transports for frame in transport.sent)
 
 
-def test_card_rejects_bad_structured_position_without_serial_access():
+@pytest.mark.parametrize("value", [-1, 256, 1.5, True, "256"])
+def test_card_rejects_bad_structured_position_without_serial_access(value):
     connection = FakeConnection()
     plugin = HandPlugin(connection, calibrated_config())
-    with pytest.raises(ValueError, match="expected 1 integer"):
-        plugin.dispatch("set_positions", {"index_flex": 256, "confirm_motion": True})
-    assert connection.transport.sent == []
+    with pytest.raises(ValueError, match=r"index_flex must be an integer in 0\.\.255"):
+        plugin.dispatch("set_positions", {"index_flex": value, "confirm_motion": True})
+    assert connection.transport.sent == [] and connection._client is None
 
 
 @pytest.mark.parametrize("side,slave_id", [("right", 0x27), ("left", 0x28)])
@@ -358,27 +505,25 @@ def test_colleague_card_actions_keep_auto_detection_and_confirmation(monkeypatch
     monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
 
     with pytest.raises(ValueError, match="confirm_motion"):
-        plugin.dispatch("set_positions", {"index_flex": 220, "hold_torque": False})
+        plugin.dispatch("set_positions", {"index_flex": 220})
     assert all(frame[1] == 0x04 for transport in transports for frame in transport.sent)
 
     result = completed_motion(plugin, "set_positions", {
-        "index_flex": 234, "speed_ratio": "1.5x",
-        "hold_torque": False, "confirm_motion": True,
+        "index_flex": 234, "speed_ratio": "1.5x", "confirm_motion": True,
     }, events, done)
     assert result["side"] == side
     assert result["positions"]["index_root"] == 234
     assert result["speed"] == 90
-    assert result["torque_released"] is True
+    assert result["torque_released"] is False
 
     result = completed_motion(plugin, "set_positions", {
-        "thumb_flex": 220, "index_flex": 210, "speed_ratio": "2.0x",
-        "hold_torque": False, "confirm_motion": True,
+        "thumb_flex": 220, "index_flex": 210, "speed_ratio": "2.0x", "confirm_motion": True,
     }, events, done)
     assert result["side"] == side
     assert result["positions"]["thumb_root"] == 220
     assert result["positions"]["index_root"] == 210
     assert result["positions"]["middle_root"] == RIGHT_OPEN_POSE[3]
-    assert result["speed"] == 120 and result["torque_released"] is True
+    assert result["speed"] == 120 and result["torque_released"] is False
     assert all(frame[0] == slave_id for transport in transports for frame in transport.sent if frame[1] == 0x10)
 
 
@@ -386,7 +531,7 @@ def test_csv_and_invalid_options_fail_before_serial(monkeypatch):
     connection = FakeConnection()
     plugin = HandPlugin(connection, calibrated_config(poll_interval_s=0.02))
     for arguments in (
-        {"speed_ratio": "4.0x"}, {"hold_torque": "maybe"},
+        {"speed_ratio": "4.0x"}, {"hold_torque": False},
         {"positions": ""}, {"index_flex": 256},
         {"positions": ",".join(map(str, RIGHT_OPEN_POSE)), "index_flex": 220},
     ):
@@ -412,7 +557,8 @@ def test_left_hand_needs_explicit_side_specific_poses():
 
 
 @pytest.mark.parametrize("action,args", [
-    ("open", {}), ("close", {}), ("set_positions", {"index_flex": 220}),
+    ("open", {}), ("close", {}), ("reset", {}),
+    ("set_positions", {"index_flex": 220}),
 ])
 @pytest.mark.parametrize("left_pose_config", [
     {}, {"left_open_pose": list(RIGHT_OPEN_POSE)},
@@ -473,6 +619,195 @@ def test_bundled_right_hand_config_explicitly_sets_calibrated_fist_pose():
     assert config["plugins"]["hand"]["auto_detect_gestures"] is True
 
 
+def make_two_port_plugin(monkeypatch):
+    responders = {"/dev/ttyUSB0": {0x27}, "/dev/ttyUSB1": {0x28}}
+    transports = []
+
+    def client_factory(port, side, **kwargs):
+        transport = SelectiveFakeSerial(responders[port])
+        transports.append((port, transport))
+        return L20LiteModbusClient(port, side, baudrate=kwargs["baudrate"],
+                                   timeout_s=kwargs["timeout_s"],
+                                   serial_factory=lambda **_: transport)
+
+    monkeypatch.setattr(modbus_device, "L20LiteModbusClient", client_factory)
+    plugin = modbus_device.MultiHandPlugin(
+        {"serial_port": "/dev/ttyUSB0", "side": "right", "baudrate": 115200},
+        both_sides_config(auto_detect_gestures=True, poll_interval_s=0.02),
+    )
+    monkeypatch.setattr(plugin, "_ports", lambda: list(responders))
+    monkeypatch.setattr("modbus_device.time.sleep", lambda _: None)
+    return plugin, responders, transports
+
+
+def test_two_cards_bind_distinct_hands_and_route_motion(monkeypatch):
+    plugin, _, transports = make_two_port_plugin(monkeypatch)
+    card = plugin.get_tool()
+    assert card["multiInstance"] is True
+    assert card["configSchema"]["properties"]["bound_side"]["scope"] == "instance"
+    assert card["configSchema"]["properties"]["bound_side"]["enum"] == ["left", "right"]
+    unbound_info = plugin.dispatch("info", {"instance_id": "card-left"})
+    assert unbound_info["detected_count"] == 2
+    assert unbound_info["side"] is None
+    assert set(unbound_info["detected_sides"]) == {"left", "right"}
+    assert plugin.dispatch("config", {"instance_id": "card-left", "bound_side": "left"})["state"] == "configured"
+    assert plugin.dispatch("config", {"instance_id": "card-right", "bound_side": "right"})["state"] == "configured"
+    assert all(frame[1] == 0x04 for _, transport in transports for frame in transport.sent)
+    with pytest.raises(ValueError, match="already bound"):
+        plugin.dispatch("config", {"instance_id": "card-third", "bound_side": "left"})
+    for instance_id, side, port in (("card-left", "left", "/dev/ttyUSB1"),
+                                     ("card-right", "right", "/dev/ttyUSB0")):
+        info = plugin.dispatch("info", {"instance_id": instance_id})
+        assert info["bound_side"] == side
+        assert info["serial_port"] == port
+        assert info["detected_count"] == 2
+        controller = plugin._controllers[instance_id]
+        events, done = capture_completions(controller)
+        accepted = plugin.dispatch("close", {"instance_id": instance_id,
+                                             "confirm_motion": True})
+        assert accepted["state"] == "running" and done.wait(2)
+        assert events[-1][1] == "completed"
+        writes = [(path, frame) for path, transport in transports
+                  for frame in transport.sent if frame[1] == 0x10]
+        assert all(frame[0] == (0x28 if path == "/dev/ttyUSB1" else 0x27)
+                   for path, frame in writes)
+    assert any(path == "/dev/ttyUSB0" and frame[1] == 0x10
+               for path, transport in transports for frame in transport.sent)
+    assert any(path == "/dev/ttyUSB1" and frame[1] == 0x10
+               for path, transport in transports for frame in transport.sent)
+    plugin.stop()
+
+
+def test_bound_card_refuses_missing_hand_and_unbound_card_cannot_move(monkeypatch):
+    plugin, responders, transports = make_two_port_plugin(monkeypatch)
+    plugin.dispatch("config", {"instance_id": "left-card", "bound_side": "left"})
+    with pytest.raises(RuntimeError, match="not bound"):
+        plugin.dispatch("open", {"instance_id": "other-card", "confirm_motion": True})
+    responders["/dev/ttyUSB1"].clear()
+    assert plugin.dispatch("info", {"instance_id": "left-card"})["state"] == "offline"
+    with pytest.raises(RuntimeError, match="not connected"):
+        plugin.dispatch("close", {"instance_id": "left-card", "confirm_motion": True})
+    assert all(frame[1] == 0x04 for _, transport in transports for frame in transport.sent)
+
+
+def test_stopped_card_can_be_replaced_without_duplicate_side_control(monkeypatch):
+    plugin, _, _ = make_two_port_plugin(monkeypatch)
+    plugin.dispatch("config", {"instance_id": "old", "bound_side": "left"})
+    assert plugin.dispatch("get_state", {"instance_id": "old"})["side"] == "left"
+    with pytest.raises(ValueError, match="already bound"):
+        plugin.dispatch("config", {"instance_id": "new", "bound_side": "left"})
+    assert plugin.dispatch("stop", {"instance_id": "old"})["state"] == "idle"
+    assert plugin.dispatch("config", {"instance_id": "new", "bound_side": "left"})["state"] == "configured"
+    with pytest.raises(RuntimeError, match="not bound"):
+        plugin.dispatch("get_state", {"instance_id": "old"})
+    assert plugin.dispatch("get_state", {"instance_id": "new"})["side"] == "left"
+
+
+def test_removed_offline_card_without_controller_releases_its_binding(monkeypatch):
+    plugin, responders, transports = make_two_port_plugin(monkeypatch)
+    plugin.dispatch("config", {"instance_id": "old", "bound_side": "left"})
+    responders["/dev/ttyUSB1"].clear()
+    with pytest.raises(RuntimeError, match="not connected"):
+        plugin.dispatch("start", {"instance_id": "old"})
+    assert "old" not in plugin._controllers
+    with pytest.raises(ValueError, match="already bound"):
+        plugin.dispatch("config", {"instance_id": "new", "bound_side": "left"})
+    # Canvas removal sends stop even though startup never created a client.
+    assert plugin.dispatch("stop", {"instance_id": "old"})["state"] == "idle"
+    assert plugin.dispatch("config", {"instance_id": "new", "bound_side": "left"})["state"] == "configured"
+    responders["/dev/ttyUSB1"].add(0x28)
+    assert plugin.dispatch("get_state", {"instance_id": "new"})["side"] == "left"
+    assert all(frame[1] == 0x04 for _, transport in transports for frame in transport.sent)
+
+
+def test_stopped_binding_reactivated_by_same_card_cannot_be_stolen(monkeypatch):
+    plugin, _, _ = make_two_port_plugin(monkeypatch)
+    plugin.dispatch("config", {"instance_id": "left", "bound_side": "left"})
+    plugin.dispatch("stop", {"instance_id": "left"})
+    assert plugin.dispatch("start", {"instance_id": "left"})["state"] == "ready"
+    with pytest.raises(ValueError, match="already bound"):
+        plugin.dispatch("config", {"instance_id": "other", "bound_side": "left"})
+
+
+def test_bound_card_follows_side_after_usb_port_swap(monkeypatch):
+    plugin, responders, transports = make_two_port_plugin(monkeypatch)
+    plugin.dispatch("config", {"instance_id": "left-card", "bound_side": "left"})
+    first = plugin.dispatch("info", {"instance_id": "left-card"})
+    assert first["serial_port"] == "/dev/ttyUSB1"
+    # Exercise a previously opened client, not merely a cached info result.
+    assert plugin.dispatch("get_state", {"instance_id": "left-card"})["side"] == "left"
+    responders["/dev/ttyUSB0"].clear()
+    responders["/dev/ttyUSB0"].add(0x28)
+    responders["/dev/ttyUSB1"].clear()
+    responders["/dev/ttyUSB1"].add(0x27)
+    second = plugin.dispatch("info", {"instance_id": "left-card"})
+    assert second["serial_port"] == "/dev/ttyUSB0"
+    controller = plugin._controllers["left-card"]
+    events, done = capture_completions(controller)
+    accepted = plugin.dispatch("open", {"instance_id": "left-card", "confirm_motion": True})
+    assert accepted["state"] == "running" and done.wait(2)
+    assert events[-1][1] == "completed"
+    assert all(path == "/dev/ttyUSB0" and frame[0] == 0x28
+               for path, transport in transports for frame in transport.sent
+               if frame[1] == 0x10)
+
+
+def test_bound_motion_rechecks_slave_before_any_write(monkeypatch):
+    plugin, responders, transports = make_two_port_plugin(monkeypatch)
+    plugin.dispatch("config", {"instance_id": "left-card", "bound_side": "left"})
+    assert plugin.dispatch("info", {"instance_id": "left-card"})["serial_port"] == "/dev/ttyUSB1"
+    controller = plugin._controllers["left-card"]
+    events, done = capture_completions(controller)
+    # Simulate unplug/replug after read-only discovery but before worker read.
+    real_controller = plugin._controller
+
+    def swapped_after_selection(instance_id, side, port):
+        selected = real_controller(instance_id, side, port)
+        responders[port].clear()
+        responders[port].add(0x27)
+        return selected
+
+    monkeypatch.setattr(plugin, "_controller", swapped_after_selection)
+    accepted = plugin.dispatch("close", {"instance_id": "left-card", "confirm_motion": True})
+    assert accepted["state"] == "running" and done.wait(2)
+    assert events[-1][1] == "error"
+    assert all(frame[1] == 0x04 for _, transport in transports for frame in transport.sent)
+
+
+def test_unbound_legacy_card_still_works_but_second_unbound_card_is_rejected(monkeypatch):
+    connection, transports = make_detecting_connection(monkeypatch, {0x27})
+    plugin = modbus_device.MultiHandPlugin(
+        {"serial_port": "/dev/fake", "side": "right"},
+        both_sides_config(auto_detect_gestures=True),
+    )
+    # The legacy path uses the same configured serial port and old sole-hand
+    # auto-detection; a second canvas instance cannot silently share it.
+    assert plugin.dispatch("start", {"instance_id": "first"}) == {"state": "ready"}
+    assert plugin.dispatch("get_state", {"instance_id": "first"})["side"] == "right"
+    events, done = capture_completions(plugin._legacy)
+    accepted = plugin.dispatch("open", {"instance_id": "first", "confirm_motion": True})
+    assert accepted["state"] == "running" and done.wait(2)
+    assert events[-1][1] == "completed"
+    with pytest.raises(RuntimeError, match="another unbound card"):
+        plugin.dispatch("start", {"instance_id": "second"})
+    with pytest.raises(RuntimeError, match="another unbound card"):
+        plugin.dispatch("close", {"instance_id": "second", "confirm_motion": True})
+    assert all(frame[0] == 0x27 for transport in transports for frame in transport.sent
+               if frame[1] == 0x10)
+    assert plugin.dispatch("stop", {"instance_id": "first"})["state"] == "idle"
+    assert plugin.dispatch("start", {"instance_id": "second"}) == {"state": "ready"}
+
+
+def test_build_plugins_exposes_one_multi_instance_hand_tool():
+    config = load_config(str(DRIVER / "main.py"))
+    plugins = modbus_device.build_plugins(config, "", None)
+    assert len(plugins) == 1
+    tools = DriverBundle(plugins).get_all_tools()
+    assert len(tools) == 1
+    assert tools[0]["name"] == "hand"
+    assert tools[0]["multiInstance"] is True
+
+
 def test_canvas_stop_before_connection_does_not_open_serial():
     connection = FakeConnection()
     plugin = HandPlugin(connection, calibrated_config())
@@ -487,26 +822,51 @@ def test_canvas_card_schema_and_structured_positions(monkeypatch):
     actions = card["inputSchema"]["properties"]["action"]["enum"]
     assert card["title"] == "L20 Lite 灵巧手"
     assert card["type"] == "actuator"
-    assert "info" in actions and "release" in actions and "set_positions" in actions
+    assert "info" in actions and "reset" in actions and "set_positions" in actions
     assert "set_speed" not in actions and "set_joint" not in actions
-    assert card["inputSchema"]["properties"]["torque"]["default"] == 100
-    assert "初始值 100" in card["inputSchema"]["properties"]["torque"]["description"]
-    assert "初始值 100" in card["inputSchema"]["x-action-params"]["set_torque"]["description"]
+    assert "set_torque" not in actions and "release" not in actions
+    assert card["inputSchema"]["properties"]["set_torque"]["default"] == 100
+    assert card["inputSchema"]["properties"]["set_torque"]["title"] == "SET_TORQUE"
+    assert (card["inputSchema"]["properties"]["set_torque"]["minimum"],
+            card["inputSchema"]["properties"]["set_torque"]["maximum"]) == (1, 255)
+    assert "整数 1–255" in card["inputSchema"]["properties"]["set_torque"]["description"]
+    assert "本次 open 或 close 运动的 10 个关节扭矩上限" in card["inputSchema"]["properties"]["set_torque"]["description"]
+    assert "torque" not in card["inputSchema"]["properties"]
+    assert "hold_torque" not in card["inputSchema"]["properties"]
+    assert "到位后保留本次力矩" in card["inputSchema"]["x-action-params"]["open"]["description"]
+    assert "到位后保留本次力矩" in card["inputSchema"]["x-action-params"]["close"]["description"]
+    for action in ("open", "close", "set_positions"):
+        assert "hold_torque" not in card["inputSchema"]["x-action-params"][action]["params"]
+    assert "set_torque" in card["inputSchema"]["x-action-params"]["open"]["params"]
+    assert "set_torque" in card["inputSchema"]["x-action-params"]["close"]["params"]
+    assert "set_torque" not in card["inputSchema"]["x-action-params"]["set_positions"]["params"]
+    assert "越界会报错且不发送动作" in card["inputSchema"]["x-action-params"]["set_positions"]["description"]
+    assert "布尔值 confirm_motion=true" in card["inputSchema"]["x-action-params"]["set_positions"]["description"]
+    assert card["inputSchema"]["x-action-params"]["reset"]["params"] == ["confirm_motion"]
     assert card["inputSchema"]["x-action-params"]["info"]["params"] == []
     assert "positions" not in card["inputSchema"]["properties"]
     assert "positions" not in card["inputSchema"]["x-action-params"]["set_positions"]["params"]
     assert card["inputSchema"]["properties"]["index_flex"]["type"] == "integer"
+    assert len(modbus_device.STRUCTURED_POSITION_FIELDS) == 10
+    for field in modbus_device.STRUCTURED_POSITION_FIELDS:
+        property_schema = card["inputSchema"]["properties"][field]
+        assert property_schema["type"] == "integer"
+        assert (property_schema["minimum"], property_schema["maximum"]) == (0, 255)
+        assert "0–255" in property_schema["description"]
+    assert "无名指侧摆" in card["inputSchema"]["properties"]["ring_sway"]["description"]
+    assert "小指侧摆" in card["inputSchema"]["properties"]["pinky_sway"]["description"]
+    assert "middle_sway" not in card["inputSchema"]["properties"]
     assert card["inputSchema"]["properties"]["confirm_motion"] == {
         "type": "boolean", "const": True,
-        "description": "确认手附近无人和障碍物后，每次运动显式输入 true",
+        "description": "确认手附近无人和障碍物后，每次请求传入布尔值 true（不是字符串）；若画布保留上次勾选，执行前仍须重新检查",
     }
     assert card["inputSchema"]["x-is-dangerous"] is True
     assert plugin.PREFIX == "hand"
-    assert card["inputSchema"]["x-completion"]["actions"] == ["open", "close", "set_positions"]
+    assert card["inputSchema"]["x-completion"]["actions"] == ["open", "close", "reset", "set_positions"]
     assert card["inputSchema"]["allOf"][0]["then"]["required"] == ["confirm_motion"]
-    for action in ("open", "close", "set_positions"):
+    for action in ("open", "close", "reset", "set_positions"):
         assert card["inputSchema"]["x-action-params"][action]["params"][-1] == "confirm_motion"
-    for action in ("info", "get_state", "set_torque", "release"):
+    for action in ("info", "get_state"):
         assert "confirm_motion" not in card["inputSchema"]["x-action-params"][action]["params"]
     assert plugin.dispatch("info", {})["serial_port"] == "/dev/fake"
     events, done = capture_completions(plugin)
@@ -515,7 +875,12 @@ def test_canvas_card_schema_and_structured_positions(monkeypatch):
     result = completed_motion(plugin, "set_positions", {"index_flex": 234, "confirm_motion": True}, events, done)
     assert result["state"] == "completed"
     assert connection.client.get_positions() == pose
-    assert plugin.dispatch("release", {})["state"] == "released"
+    reset = completed_motion(plugin, "reset", {"confirm_motion": True}, events, done)
+    assert reset["state"] == "completed" and reset["torque_released"] is True
+    assert connection.client.get_positions() == RIGHT_OPEN_POSE
+    assert connection.client.get_torques() == [0] * 10
+    assert plugin.dispatch("release", {}) is None
+    assert plugin.dispatch("set_torque", {"torque": 80}) is None
     with pytest.raises(ValueError, match="CSV is no longer supported"):
         plugin.dispatch("set_positions", {"positions": "1,2,3", "confirm_motion": True})
     assert plugin.dispatch("set_speed", {"speed": 50}) is None

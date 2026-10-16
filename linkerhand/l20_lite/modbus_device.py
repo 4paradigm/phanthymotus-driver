@@ -6,6 +6,7 @@ import threading
 import time
 import json
 import os
+import glob
 import ssl
 import urllib.request
 from uuid import uuid4
@@ -15,21 +16,21 @@ from modbus_client import JOINT_COUNT, L20LiteModbusClient, _bytes
 
 JOINT_NAMES = [
     "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
-    "pinky_root", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
+    "pinky_root", "index_sway", "ring_sway", "pinky_sway", "thumb_roll",
 ]
-MOTION_ACTIONS = ("open", "close", "set_positions")
+MOTION_ACTIONS = ("open", "close", "reset", "set_positions")
 STANDARD_JOINT_NAMES = [
     "thumb_flex", "thumb_sway", "index_flex", "middle_flex", "ring_flex",
-    "pinky_flex", "index_sway", "middle_sway", "ring_sway", "thumb_roll",
+    "pinky_flex", "index_sway", "ring_sway", "pinky_sway", "thumb_roll",
 ]
 CHINESE_JOINT_NAMES = [
     "拇指弯曲", "拇指侧摆", "食指弯曲", "中指弯曲", "无名指弯曲",
-    "小指弯曲", "食指侧摆", "中指侧摆", "无名指侧摆", "拇指旋转",
+    "小指弯曲", "食指侧摆", "无名指侧摆", "小指侧摆", "拇指旋转",
 ]
 JOINT_FIELDS = {name: index for index, name in enumerate(STANDARD_JOINT_NAMES)}
 STRUCTURED_POSITION_FIELDS = [
     "thumb_flex", "index_flex", "middle_flex", "ring_flex", "pinky_flex",
-    "thumb_sway", "thumb_roll", "index_sway", "middle_sway", "ring_sway",
+    "thumb_sway", "thumb_roll", "index_sway", "ring_sway", "pinky_sway",
 ]
 SPEED_RATIOS = {f"{ratio:.1f}x": ratio for ratio in (1.0, 1.5, 2.0, 2.5, 3.0)}
 
@@ -106,7 +107,8 @@ class L20LiteConnection:
 class HandPlugin:
     PREFIX = "hand"
 
-    def __init__(self, connection: L20LiteConnection, config: dict):
+    def __init__(self, connection: L20LiteConnection, config: dict,
+                 motion_lock: threading.RLock | None = None):
         self.connection = connection
         if connection.side == "right" and "fist_pose" not in config:
             raise ValueError("fist_pose must be explicitly calibrated and configured before enabling close")
@@ -130,7 +132,6 @@ class HandPlugin:
             raise ValueError("auto_detect_gestures must be a boolean")
         self.motion_speed = self._setting(config.get("motion_speed", 60), "motion_speed")
         self.motion_torque = self._setting(config.get("motion_torque", 100), "motion_torque")
-        self.initial_motion_torque = self.motion_torque
         self.motion_timeout_s = float(config.get("motion_timeout_s", 8.0))
         self.position_tolerance = int(config.get("position_tolerance", 6))
         self.poll_interval_s = float(config.get("poll_interval_s", 0.2))
@@ -140,7 +141,7 @@ class HandPlugin:
             raise ValueError("position_tolerance must be in 0..20")
         if not 0.02 <= self.poll_interval_s <= 1:
             raise ValueError("poll_interval_s must be in 0.02..1 seconds")
-        self._motion_lock = threading.RLock()
+        self._motion_lock = motion_lock if motion_lock is not None else threading.RLock()
         self._stop_requested = threading.Event()
         self._state_lock = threading.Lock()
         self._active: dict | None = None
@@ -155,42 +156,48 @@ class HandPlugin:
             raise ValueError(f"{name} must be an integer in 1..255")
         return value
 
-    def _motion_options(self, args: dict) -> tuple[int, bool]:
+    def _motion_options(self, action: str, args: dict) -> tuple[int, int]:
+        # Reset is always a calibrated open followed by torque release; stray
+        # defaults from a stale/shared card schema must not alter that behavior.
+        if action == "reset":
+            return self.motion_speed, self.motion_torque
+        if "hold_torque" in args:
+            raise ValueError("hold_torque is no longer supported; use reset to open and release torque, or stop to release immediately")
         ratio = args.get("speed_ratio", "1.0x")
         if not isinstance(ratio, str) or ratio not in SPEED_RATIOS:
             raise ValueError("speed_ratio must be one of 1.0x, 1.5x, 2.0x, 2.5x, 3.0x")
-        hold = args.get("hold_torque", True)
-        if isinstance(hold, str) and hold.lower() in ("true", "false"):
-            hold = hold.lower() == "true"
-        if not isinstance(hold, bool):
-            raise ValueError("hold_torque must be a boolean")
-        return min(255, max(1, round(self.motion_speed * SPEED_RATIOS[ratio]))), hold
+        requested_torque = None
+        if action in ("open", "close"):
+            requested_torque = args.get("set_torque")
+            old_torque = args.get("torque")
+            if requested_torque in (None, ""):
+                requested_torque = old_torque
+        torque = self.motion_torque if requested_torque in (None, "") else self._setting(requested_torque, "set_torque")
+        return min(255, max(1, round(self.motion_speed * SPEED_RATIOS[ratio]))), torque
 
     def get_tool(self) -> dict:
         schema = action_schema(
             {
                 "info": ([], "只读检测已连接的左右手及数量，不驱动手指"),
                 "get_state": ([], "读取 10 个关节位置和速度"),
-                "open": (["speed_ratio", "hold_torque", "confirm_motion"], "展开到已校准姿态；可选倍速和到位泄力；每次运动需确认"),
-                "close": (["speed_ratio", "hold_torque", "confirm_motion"], "握拳到已校准姿态；可选倍速和到位泄力；每次运动需确认"),
-                "set_positions": ([*STRUCTURED_POSITION_FIELDS, "speed_ratio", "hold_torque", "confirm_motion"], "按需填写各关节位置；留空保持原位；每次运动需确认"),
-                "set_torque": (["torque"], f"配置后续动作力矩；初始值 {self.initial_motion_torque}，重启后恢复；不立即驱动"),
-                "release": ([], "立即将所有关节力矩设为 0"),
+                "open": (["speed_ratio", "set_torque", "confirm_motion"], "展开到已校准姿态，到位后保留本次力矩；set_torque 仅设置本次张手力矩；每次运动需确认"),
+                "close": (["speed_ratio", "set_torque", "confirm_motion"], "握拳到已校准姿态，到位后保留本次力矩；set_torque 仅设置本次握拳力矩；每次运动需确认"),
+                "reset": (["confirm_motion"], "张开到当前手已校准姿态，到位后将所有关节力矩设为 0；每次运动需确认"),
+                "set_positions": ([*STRUCTURED_POSITION_FIELDS, "speed_ratio", "confirm_motion"], "按需填写各关节位置原始值，每项为 0–255 的整数（非角度），留空保持原位，到位后保留力矩。协议范围不等于机械安全范围；越界会报错且不发送动作。每次请求必须携带布尔值 confirm_motion=true；执行前确认手附近安全"),
             },
             {
                 **{
                     name: {"type": "integer", "minimum": 0, "maximum": 255,
-                           "description": f"{CHINESE_JOINT_NAMES[JOINT_FIELDS[name]]}，留空保持当前位置"}
+                           "description": f"{CHINESE_JOINT_NAMES[JOINT_FIELDS[name]]}：位置原始值 0–255（非角度）；留空保持当前位置"}
                     for name in STRUCTURED_POSITION_FIELDS
                 },
                 "speed_ratio": {"type": "string", "enum": list(SPEED_RATIOS),
                                 "description": "相对当前设置速度的倍率，最高 255"},
-                "hold_torque": {"type": "boolean", "enum": [True, False],
-                                "description": "默认 true 保持原有行为；false 在到位后释放力矩"},
-                "torque": {"type": "integer", "minimum": 1, "maximum": 255,
-                           "default": self.initial_motion_torque,
-                           "description": f"初始值 {self.initial_motion_torque}；仅影响后续动作"},
-                "confirm_motion": {"type": "boolean", "const": True, "description": "确认手附近无人和障碍物后，每次运动显式输入 true"},
+                "set_torque": {"type": "integer", "minimum": 1, "maximum": 255,
+                           "title": "SET_TORQUE",
+                           "default": self.motion_torque,
+                           "description": f"本次 open 或 close 运动的 10 个关节扭矩上限：整数 1–255（设备原始值，非 N·m）；默认 {self.motion_torque}，下一次动作会重新设置"},
+                "confirm_motion": {"type": "boolean", "const": True, "description": "确认手附近无人和障碍物后，每次请求传入布尔值 true（不是字符串）；若画布保留上次勾选，执行前仍须重新检查"},
             },
         )
         schema["allOf"] = [{
@@ -238,26 +245,32 @@ class HandPlugin:
         return sides
 
     def _move(self, target: list[int], action: str, *, side: str | None = None,
-              speed: int | None = None, hold_torque: bool = True) -> dict:
+              speed: int | None = None, torque: int | None = None,
+              release_torque: bool = False) -> dict:
         with self._motion_lock:
             if self._stop_requested.is_set():
                 raise InterruptedError("hand motion stopped")
             client = self.connection.get(side) if side is not None else self.connection.get()
             active_side = side or self.connection.side
             actual_speed = self.motion_speed if speed is None else speed
+            actual_torque = self.motion_torque if torque is None else torque
             current = client.get_positions()  # fail closed if no valid reply
             if all(abs(a - b) <= self.position_tolerance for a, b in zip(current, target)):
-                if not hold_torque:
+                if release_torque:
                     client.set_torques([0] * JOINT_COUNT)
-                return {"state": "already_at_target", "action": action, "side": active_side,
-                        "positions": _named(current), "torque_released": not hold_torque}
+                else:
+                    client.set_torques([actual_torque] * JOINT_COUNT)
+                result = {"state": "already_at_target", "action": action, "side": active_side,
+                          "positions": _named(current), "torque_released": release_torque,
+                          "torque": 0 if release_torque else actual_torque}
+                return result
             if self._stop_requested.is_set():
                 raise InterruptedError("hand motion stopped")
             energized = False
             try:
                 client.set_speeds([actual_speed] * JOINT_COUNT)
                 energized = True
-                client.set_torques([self.motion_torque] * JOINT_COUNT)
+                client.set_torques([actual_torque] * JOINT_COUNT)
                 if self._stop_requested.is_set():
                     raise InterruptedError("hand motion stopped")
                 halfway = [(a + b) // 2 for a, b in zip(current, target)]
@@ -273,13 +286,13 @@ class HandPlugin:
                         raise InterruptedError("hand motion stopped")
                     measured = client.get_positions()
                     if all(abs(a - b) <= self.position_tolerance for a, b in zip(measured, target)):
-                        if not hold_torque:
+                        if release_torque:
                             client.set_torques([0] * JOINT_COUNT)
                         return {
                             "state": "completed", "action": action, "side": active_side,
                             "requested_positions": _named(target), "positions": _named(measured),
-                            "speed": actual_speed, "torque": self.motion_torque if hold_torque else 0,
-                            "torque_released": not hold_torque,
+                            "speed": actual_speed, "torque": 0 if release_torque else actual_torque,
+                            "torque_released": release_torque,
                         }
                 client.set_torques([0] * JOINT_COUNT)
                 return {
@@ -333,7 +346,8 @@ class HandPlugin:
             for index, value in active["joint_positions"].items():
                 target[index] = value
             return target
-        return list(self.poses_by_side[side][active["action"]])
+        pose_action = "open" if active["action"] == "reset" else active["action"]
+        return list(self.poses_by_side[side][pose_action])
 
     def _run_motion(self, active: dict) -> None:
         action = active["action"]
@@ -353,9 +367,14 @@ class HandPlugin:
                 if active_side not in self.poses_by_side:
                     raise RuntimeError(f"{active_side}-hand motion requires explicit calibrated open and fist poses")
                 client = self.connection.get(side) if side is not None else self.connection.get()
+                # Verify the selected slave on this port immediately before any
+                # speed, torque or position write. A USB replug after discovery
+                # must never turn a read-only selection into a wrong-hand move.
+                client.probe_positions(active_side)
                 target = self._target_for_action(active, client, active_side)
                 result = self._move(target, action, side=side, speed=active["speed"],
-                                    hold_torque=active["hold_torque"])
+                                    torque=active["torque"],
+                                    release_torque=action == "reset")
             status = "error" if result["state"] == "released_timeout" else "completed"
         except InterruptedError as exc:
             status, result = "cancelled", {"state": "cancelled", "message": str(exc)}
@@ -380,9 +399,9 @@ class HandPlugin:
 
     def _start_motion(self, action: str, args: dict) -> dict:
         # Validate all user input before accepting an ACP action or opening serial.
-        speed, hold_torque = self._motion_options(args)
+        speed, torque = self._motion_options(action, args)
         active = {"action": action, "action_id": f"hand_{action}_{uuid4().hex}",
-                  "speed": speed, "hold_torque": hold_torque}
+                  "speed": speed, "torque": torque}
         if action == "set_positions":
             if args.get("positions") not in (None, ""):
                 raise ValueError("positions CSV is no longer supported; use named joint fields")
@@ -390,7 +409,10 @@ class HandPlugin:
             for field in STRUCTURED_POSITION_FIELDS:
                 value = args.get(field)
                 if value is not None and value != "":
-                    joint_positions[JOINT_FIELDS[field]] = _bytes([value], expected=1)[0]
+                    try:
+                        joint_positions[JOINT_FIELDS[field]] = _bytes([value], expected=1)[0]
+                    except ValueError as exc:
+                        raise ValueError(f"{field} must be an integer in 0..255 (raw position)") from exc
             if not joint_positions:
                 raise ValueError("at least one joint position must be specified")
             active["joint_positions"] = joint_positions
@@ -470,32 +492,246 @@ class HandPlugin:
             return result
         if action in MOTION_ACTIONS:
             return self._start_motion(action, args)
-        if action == "set_torque":
-            torque = self._setting(args.get("torque"), "torque")
-            with self._motion_lock:
-                self.motion_torque = torque
-            return {"state": "configured", "torque": torque, "applied": False}
-        if action in ("stop", "release"):
+        if action == "stop":
             self._stop_requested.set()
             with self._motion_lock:
                 # Canvas stop may arrive before the serial device was ever used.
-                if action == "release" and self.auto_detect_gestures:
-                    sides = self._detect_sides()
-                    if len(sides) != 1:
-                        raise RuntimeError(f"expected exactly one hand, detected {sides}")
-                    client = self.connection.get(sides[0])
-                else:
-                    client = self.connection._client
+                client = self.connection._client
                 if client is None:
-                    return {"state": "idle" if action == "stop" else "released", "torque_released": True}
+                    return {"state": "idle", "torque_released": True}
                 client.set_torques([0] * JOINT_COUNT)
                 positions = client.get_positions()
-            return {"state": "idle" if action == "stop" else "released", "side": client.side,
+            return {"state": "idle", "side": client.side,
                     "positions": _named(positions), "torque_released": True}
         return None
 
 
 def build_plugins(config: dict, _namespace: str, _ros2) -> list:
-    connection = L20LiteConnection(config)
     hand_config = config.get("plugins", {}).get("hand", {})
-    return [HandPlugin(connection, hand_config)] if hand_config.get("enabled", True) else []
+    return [MultiHandPlugin(config, hand_config)] if hand_config.get("enabled", True) else []
+
+
+class MultiHandPlugin:
+    """One MCP tool, with a separate hand controller for each canvas card."""
+
+    PREFIX = "hand"
+
+    def __init__(self, config: dict, hand_config: dict):
+        self.config = config
+        self.hand_config = hand_config
+        self._lock = threading.RLock()
+        # Serial discovery and motion never overlap. Two cards may be queued,
+        # but no second controller may open/probe a moving RS-485 port.
+        self._bus_lock = threading.RLock()
+        self._bindings: dict[str, str] = {}
+        self._controllers: dict[str, HandPlugin] = {}
+        self._stopped_instances: set[str] = set()
+        self._legacy_owner: str | None = None
+        self._legacy = HandPlugin(L20LiteConnection(config), hand_config,
+                                  motion_lock=self._bus_lock)
+
+    def get_tool(self) -> dict:
+        definition = self._legacy.get_tool()
+        definition["multiInstance"] = True
+        definition["configSchema"] = {
+            "type": "object",
+            "properties": {
+                "bound_side": {
+                    "type": "string", "enum": ["left", "right"],
+                    "scope": "instance", "title": "绑定灵巧手",
+                    "description": "每张卡片选择左手或右手；驱动会在每次动作前重新核对 USB-RS485 设备",
+                },
+            },
+        }
+        # The canvas hides config from the action picker but Core calls it
+        # when a card's instance-scoped setting is saved or replayed.
+        schema = definition["inputSchema"]
+        schema["properties"]["action"]["enum"].append("config")
+        schema["properties"]["bound_side"] = {"type": "string", "enum": ["left", "right"]}
+        schema["properties"]["instance_id"] = {"type": "string"}
+        schema["x-action-params"]["config"] = {
+            "params": ["bound_side"], "description": "将当前卡片绑定到左手或右手",
+        }
+        return definition
+
+    def start(self) -> None:
+        self._legacy.start()
+
+    def stop(self) -> None:
+        with self._bus_lock:
+            for controller in self._controllers.values():
+                controller.stop()
+            self._legacy.stop()
+
+    def _ports(self) -> list[str]:
+        candidates = [self.config.get("serial_port", "/dev/ttyUSB0")]
+        candidates += glob.glob("/dev/serial/by-path/*")
+        candidates += glob.glob("/dev/ttyUSB*")
+        seen = set()
+        ports = []
+        for candidate in candidates:
+            if not os.path.exists(candidate):
+                continue
+            path = os.path.realpath(candidate)
+            if path not in seen:
+                seen.add(path)
+                ports.append(path)
+        return ports
+
+    def _discover(self) -> dict[str, str]:
+        """Read only: side -> serial path. Duplicate side is never guessed."""
+        with self._bus_lock:
+            found: dict[str, str] = {}
+            for port in self._ports():
+                existing = next((controller.connection for controller in
+                                 [self._legacy, *self._controllers.values()]
+                                 if controller.connection._client is not None
+                                 and os.path.realpath(controller.connection.port) == port), None)
+                connection = existing or L20LiteConnection({**self.config, "serial_port": port})
+                try:
+                    sides = connection.detect_sides()
+                except (OSError, TimeoutError):
+                    sides = []
+                finally:
+                    if existing is None:
+                        connection.close()
+                if len(sides) > 1:
+                    raise RuntimeError(f"ambiguous hands on {port}: {sides}")
+                for side in sides:
+                    if side in found:
+                        raise RuntimeError(f"duplicate {side} hands on {found[side]} and {port}")
+                    found[side] = port
+            return found
+
+    def _controller(self, instance_id: str, side: str, port: str) -> HandPlugin:
+        with self._lock:
+            controller = self._controllers.get(instance_id)
+            if controller is not None and controller.connection.port == port:
+                return controller
+            if controller is not None:
+                if controller._active is not None:
+                    raise RuntimeError("cannot change hand port during motion")
+                # The old path may now point at a different device. Do not
+                # write even zero torque through an unverified stale port.
+                controller.connection.close()
+            connection = L20LiteConnection({**self.config, "side": side, "serial_port": port})
+            single_config = {**self.hand_config, "auto_detect_gestures": False}
+            controller = HandPlugin(connection, single_config, motion_lock=self._bus_lock)
+            self._controllers[instance_id] = controller
+            return controller
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        instance_id = args.get("instance_id") or ""
+        if action == "config":
+            side = args.get("bound_side")
+            if not isinstance(instance_id, str) or not instance_id or side not in ("left", "right"):
+                raise ValueError("instance_id and bound_side (left/right) are required")
+            with self._lock:
+                previous_owner = next((other for other, value in self._bindings.items()
+                                       if other != instance_id and value == side), None)
+                if previous_owner is not None:
+                    previous = self._controllers.get(previous_owner)
+                    # Removing a canvas card sends stop. Its old instance may
+                    # then be replaced, but a live or pending card may not be
+                    # silently stolen by another card.
+                    if (previous_owner not in self._stopped_instances
+                            or (previous is not None and previous._active is not None)):
+                        raise ValueError(f"{side} hand is already bound to another card")
+                    if previous is not None:
+                        previous.connection.close()
+                        del self._controllers[previous_owner]
+                    del self._bindings[previous_owner]
+                    self._stopped_instances.discard(previous_owner)
+                if not self._bindings and self._legacy.connection._client is not None:
+                    if self._legacy._active is not None:
+                        raise RuntimeError("cannot enable bound cards during legacy motion")
+                    # Hand ownership changes from the old single card to
+                    # instance cards. Close the old descriptor without any
+                    # physical command; configuration must be read-only.
+                    self._legacy.connection.close()
+                if not self._bindings:
+                    self._legacy_owner = None
+                old = self._bindings.get(instance_id)
+                if old != side and instance_id in self._controllers:
+                    controller = self._controllers[instance_id]
+                    if controller._active is not None:
+                        raise RuntimeError("cannot change binding during motion")
+                    controller.connection.close()
+                    del self._controllers[instance_id]
+                self._bindings[instance_id] = side
+                self._stopped_instances.discard(instance_id)
+            return {"state": "configured", "instance_id": instance_id, "bound_side": side}
+
+        with self._lock:
+            side = self._bindings.get(instance_id)
+            has_bindings = bool(self._bindings)
+        if not side:
+            if has_bindings and action in (*MOTION_ACTIONS, "get_state", "start"):
+                raise RuntimeError("this card is not bound; select left or right in instance config")
+            if has_bindings and action == "stop":
+                return {"state": "idle", "torque_released": True}
+            if has_bindings and action == "info":
+                return {"description": "未绑定灵巧手；请在卡片实例配置中选择左手或右手",
+                        "bound_side": None, "detected_sides": list(self._discover())}
+            if action == "info":
+                result = self._legacy.dispatch(action, args)
+                try:
+                    found = self._discover()
+                except Exception as exc:
+                    result.update(side=None, detected_sides=[], detected_count=0,
+                                  detection_error=str(exc))
+                else:
+                    result.update(side=next(iter(found)) if len(found) == 1 else None,
+                                  detected_sides=list(found), detected_count=len(found),
+                                  detection_error=None)
+                    if len(found) == 2:
+                        result["description"] = "L20 Lite 同时检测到左右手；请为每张卡片绑定一只手"
+                return result
+            if instance_id and action in ("start", "get_state", "stop", *MOTION_ACTIONS):
+                with self._lock:
+                    if self._legacy_owner not in (None, instance_id):
+                        raise RuntimeError("another unbound card already owns the single-hand controller; bind both cards")
+                    if action != "stop":
+                        self._legacy_owner = instance_id
+                    else:
+                        result = self._legacy.dispatch(action, args)
+                        self._legacy_owner = None
+                        return result
+            return self._legacy.dispatch(action, args)
+
+        if action not in ("info", "get_state", "start", "stop", *MOTION_ACTIONS):
+            return None
+        # Stop must still reach the original controller after an unplug; it
+        # must not open a new port just to release a hand that is absent.
+        if action == "stop":
+            controller = self._controllers.get(instance_id)
+            if controller is None:
+                with self._lock:
+                    self._stopped_instances.add(instance_id)
+                return {"state": "idle", "bound_side": side, "torque_released": True}
+            result = controller.dispatch("stop", {})
+            controller.connection.close()
+            with self._lock:
+                self._stopped_instances.add(instance_id)
+            return result
+        if action in MOTION_ACTIONS and args.get("confirm_motion") is not True:
+            raise ValueError("confirm_motion must be true for every movement request")
+        found = self._discover()
+        port = found.get(side)
+        if action == "info" and port is None:
+            return {"description": f"L20 Lite {side} 未连接", "bound_side": side,
+                    "side": side, "detected_sides": list(found),
+                    "detected_count": len(found), "serial_port": None,
+                    "state": "offline"}
+        if port is None:
+            raise RuntimeError(f"bound {side} hand is not connected")
+        if action in ("start", "get_state", *MOTION_ACTIONS):
+            with self._lock:
+                self._stopped_instances.discard(instance_id)
+        controller = self._controller(instance_id, side, port)
+        if action == "info":
+            result = controller.dispatch("info", args)
+            result.update(bound_side=side, detected_sides=list(found),
+                          detected_count=len(found), state="connected")
+            return result
+        return controller.dispatch(action, args)
