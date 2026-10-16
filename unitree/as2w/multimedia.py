@@ -1552,6 +1552,7 @@ class CameraPlugin:
         if backend != "videohub":
             raise ValueError("As2W camera backend must be videohub")
         self._topic = "/{}/camera/front".format(namespace)
+        self._camera_info_config = dict(config.get("camera_info") or {})
         self._node = _CameraNode(
             self._topic,
             network_iface,
@@ -1589,6 +1590,15 @@ class CameraPlugin:
             "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
         }
 
+    def _camera_info(self):
+        """Declare the optics for this output, even before the first frame."""
+        from camera_specs import declare
+
+        return declare(
+            self._topic, "image/jpeg",
+            getattr(self, "_camera_info_config", {}),
+        )
+
     def start(self):
         return self._node.start_capture()
 
@@ -1605,6 +1615,7 @@ class CameraPlugin:
             result["state"] = logical_state
         result["topic_out"] = [
             {"topic": self._topic, "format": "image/jpeg"}]
+        result["camera_info"] = self._camera_info()
         return result
 
     def dispatch(self, action, args):

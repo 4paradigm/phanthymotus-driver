@@ -129,6 +129,7 @@ class TestDriverContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _install_device_stubs()
+        cls.camera_specs = _load("camera_specs", ROOT / "camera_specs.py")
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
         cls.multimedia = _load("as2w_multimedia_under_test", ROOT / "multimedia.py")
         cls.vision = _load("as2w_vision_capture_under_test", ROOT / "vision_capture.py")
@@ -618,6 +619,28 @@ class TestDriverContracts(unittest.TestCase):
         camera_actions = camera.get_tool()["inputSchema"]["x-action-descriptions"]
         self.assertIn("publication continues", camera_actions["stop"])
 
+    def test_camera_declares_resolution_without_guessing_lens_geometry(self):
+        declaration = self.camera_specs.declare(
+            "/test/camera/front", "image/jpeg")[0]
+        parsed = __import__("common.camera_info", fromlist=["parse"]).parse(
+            declaration)
+        self.assertEqual("unitree/as2w/camera_front", parsed.id)
+        self.assertEqual((1920, 1080), (parsed.width, parsed.height))
+        self.assertIsNone(parsed.half_fov_rad)
+        self.assertEqual("unknown", parsed.source)
+
+    def test_camera_accepts_a_measured_half_fov(self):
+        declaration = self.camera_specs.declare(
+            "/test/camera/front", "image/jpeg", {
+                "half_fov_rad": 0.75,
+                "source": "measured",
+                "measured_on": "as2w-test, 2026-10-16",
+            })[0]
+        parsed = __import__("common.camera_info", fromlist=["parse"]).parse(
+            declaration)
+        self.assertAlmostEqual(0.75, parsed.half_fov_rad)
+        self.assertEqual("measured", parsed.source)
+
     def test_degraded_bundle_omits_microphone_card(self):
         created = []
 
@@ -678,6 +701,7 @@ class TestDriverContracts(unittest.TestCase):
     def test_camera_start_returns_running_with_async_readiness(self):
         plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
         plugin._topic = "/test/camera/front"
+        plugin._camera_info_config = {}
         node = types.SimpleNamespace(state="idle")
 
         def start_capture():
@@ -702,6 +726,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("starting", info["state"])
         self.assertEqual("starting", info["stream_state"])
         self.assertTrue(info["always_on"])
+        self.assertEqual(1920, info["camera_info"][0]["width"])
+        self.assertEqual(1080, info["camera_info"][0]["height"])
 
     def test_camera_start_preserves_backend_failure(self):
         plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
@@ -1487,6 +1513,13 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("loco_servo", tool["name"])
         self.assertEqual("control/velocity", tool["topic_in"][0]["format"])
         self.assertEqual(["base"], tool["inputSchema"]["x-resource"])
+        footprint = descriptor["footprint"]
+        self.assertEqual("box", footprint["shape"])
+        self.assertEqual("vendor-spec", footprint["source"])
+        self.assertAlmostEqual(0.2465, footprint["half_width"])
+        self.assertAlmostEqual(0.3605, footprint["front"])
+        self.assertAlmostEqual(0.3605, footprint["rear"])
+        self.assertAlmostEqual(0.521, footprint["height"])
 
     def test_loco_servo_applies_twist_and_explicit_loco_preempts_it(self):
         proxy = _Proxy()
@@ -1689,6 +1722,7 @@ class TestDriverContracts(unittest.TestCase):
 
     def test_loco_servo_is_packaged_and_listed(self):
         self.assertIn("loco_servo.py", (ROOT / "Dockerfile").read_text())
+        self.assertIn("camera_specs.py", (ROOT / "Dockerfile").read_text())
         self.assertIn("name: loco_servo", (ROOT / "driver.yaml").read_text())
         self.assertIn("loco_servo:", (ROOT / "config.yaml").read_text())
 

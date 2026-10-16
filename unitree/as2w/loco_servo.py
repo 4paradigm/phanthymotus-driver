@@ -31,6 +31,16 @@ VY_STEP = 0.15
 WZ_STEP = 0.30
 PINNED_STEP = 1e-6
 
+# Unitree's AS2-W specification lists the standing envelope as
+# 721 x 493 x 521 mm (length x width x height). Navigation needs the static
+# envelope, not a pre-inflated clearance: navi adds its own margin for wheel-leg
+# motion. Front/rear are symmetric because the public specification does not
+# locate the rotation centre more precisely than the chassis centre.
+FOOTPRINT_HALF_WIDTH = 0.493 / 2.0
+FOOTPRINT_FRONT = 0.721 / 2.0
+FOOTPRINT_REAR = 0.721 / 2.0
+FOOTPRINT_HEIGHT = 0.521
+
 DEFAULT_EXPECTED_HZ = 10.0
 MAX_HZ = 20.0
 WATCHDOG_MS = 300
@@ -73,6 +83,14 @@ def build_descriptor(expected_hz=DEFAULT_EXPECTED_HZ):
             "max_obs_age_ms": MAX_OBS_AGE_MS,
         },
         "force_torque": None,
+        "footprint": {
+            "shape": "box",
+            "half_width": FOOTPRINT_HALF_WIDTH,
+            "front": FOOTPRINT_FRONT,
+            "rear": FOOTPRINT_REAR,
+            "height": FOOTPRINT_HEIGHT,
+            "source": "vendor-spec",
+        },
     }
 
 

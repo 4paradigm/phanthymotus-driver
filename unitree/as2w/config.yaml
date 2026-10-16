@@ -29,6 +29,16 @@ plugins:
   camera:
     enabled: true
     backend: videohub
+    camera_info:
+      # The videohub JPEG stream resolution. Keep these aligned with the frame
+      # this card actually publishes so vop can normalise its pixel boxes.
+      width: 1920
+      height: 1080
+      # Measured on the AS2-W with a centred 0.34 m target at 0.254 m.
+      # This is the horizontal half-angle; full horizontal FOV is about 122.8°.
+      half_fov_rad: 1.072
+      source: measured
+      measured_on: "nvidia_desktop, 2026-10-16"
     # Capture often, but publish only fresh frames at a rate Jetson consumers can sustain.
     fps: 10
     publish_fps: 8

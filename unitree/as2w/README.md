@@ -57,8 +57,10 @@ runtime `config` for `dry_run`, `rotate_only` and `require_standing`.
 Explicit `loco.move` and `loco.stop_move` pause the policy stream before
 sending their commands. Servo start/resume refuses while loco owns a movement;
 stopping a preempted servo does not stop that manual movement. After stopping
-loco, explicitly resume the policy. AS2 speed deadbands and footprint dimensions
-have not been measured, so the descriptor does not copy R1's hardware values.
+loco, explicitly resume the policy. AS2 speed deadbands have not been measured,
+so the descriptor does not copy R1's gait thresholds. The navigation footprint
+uses Unitree's published AS2-W standing envelope (721 x 493 x 521 mm): the
+descriptor declares a 0.2465 m half-width and navi adds its own motion margin.
 The velocity frame and physical stop behavior still need verification on AS2W.
 
 The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
@@ -111,6 +113,18 @@ frames returned by the Go2-compatible `videohub` service. `mic` listens for the
 official A2 multicast stream at `239.168.123.161:5555`; when the robot's voice
 assistant / wake-up conversation mode is disabled, the card remains in a
 diagnostic `waiting` state and automatically recovers when packets appear.
+
+The camera `info` response also declares `motus.camera/1` for
+`/<namespace>/camera/front`. Its hardware-verified 1920x1080 dimensions let
+`vop` preserve and normalise pixel bounding boxes through navigation. The
+resolution was confirmed from the relationship between VOP's pixel `bbox` and
+normalised `position` on the deployed AS2-W stream. The horizontal half-field
+of view was measured on `nvidia_desktop` with a centred 0.34 m target at
+0.254 m: `half_fov_rad=1.072`, or about 122.8 degrees full horizontal FOV.
+The value lives in `plugins.camera.camera_info`, alongside its `measured`
+provenance, so navi adopts the camera geometry instead of its conservative
+fallback.
+
 Speaker ROS subscription, jitter buffering, and the A2 audio client now live in
 one spawned process. PCM therefore stays in a thread-local queue instead of
 being copied through a multiprocessing queue, and a busy main ROS executor
