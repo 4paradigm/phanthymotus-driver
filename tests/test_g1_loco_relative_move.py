@@ -1,5 +1,6 @@
 """Closed-loop relative movement and existing locomotion regressions (no hardware)."""
 import ast
+import tempfile
 from pathlib import Path
 import time
 import json
@@ -315,6 +316,35 @@ class TestClosedLoopCard(unittest.TestCase):
             done.set()
         return LocoRelativeMovePlugin({}, backend, notify), backend, notifications, done
 
+    def test_local_diagnostics_preserve_full_history_and_compact_callback(self):
+        card, _, _, _ = self.card()
+        trace = MotionTrace(pose(), {}, {})
+        for i in range(450):
+            trace.add('control', index=i)
+        with tempfile.TemporaryDirectory() as directory:
+            card.diagnostics_dir = Path(directory)
+            original = dict(error='No progress in rotate phase', motion_trace=trace.export(full=True),
+                            stop_confirmed_by_feedback=False)
+            with patch('builtins.print'):
+                summary = card._save_diagnostics('g1_point_test', 'error', original)
+            self.assertLess(len(json.dumps(summary, ensure_ascii=True)), 600)
+            saved = json.loads(Path(summary['diagnostics_file']).read_text())
+            self.assertEqual(saved['result'], original)
+            self.assertEqual(len(saved['result']['motion_trace']['records']), 450)
+            self.assertEqual(saved['result']['motion_trace']['dropped_records'], 0)
+            self.assertFalse(list(Path(directory).glob('*.tmp')))
+
+    def test_diagnostics_disk_failure_has_reconstructable_log_fallback(self):
+        card, _, _, _ = self.card()
+        original = dict(error='test', data='abc' * 1000)
+        with patch.object(Path, 'mkdir', side_effect=OSError('disk full')), patch('builtins.print') as output:
+            summary = card._save_diagnostics('g1_point_test', 'error', original)
+        self.assertIn('diagnostics_error', summary)
+        self.assertLess(len(json.dumps(summary, ensure_ascii=True)), 600)
+        chunks = [call.args[0].split(' ', 3)[3] for call in output.call_args_list
+                  if call.args[0].startswith('[RelativeMotionData]')]
+        self.assertEqual(json.loads(''.join(chunks))['result'], original)
+
     def test_trace_is_bounded_serializable_and_marks_missing_source_time(self):
         trace = MotionTrace(pose(), {'yaw': 1.}, {})
         for i in range(450):
@@ -339,6 +369,8 @@ class TestClosedLoopCard(unittest.TestCase):
         args, _ = notices[0]
         self.assertEqual(args[1], 'error')
         result = args[2]
+        self.assertLess(len(json.dumps(result, ensure_ascii=True)), 600)
+        result = json.loads(Path(result['diagnostics_file']).read_text())['result']
         trace = result['motion_trace']
         events = [r['event'] for r in trace['records']]
         for event in ('start', 'control', 'exception', 'stop_send', 'stop_feedback', 'terminal'):
@@ -369,6 +401,7 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertEqual(args[1], 'error')
         result = args[2]
         self.assertEqual(result['safety_reason'], 'attitude_jump')
+        result = json.loads(Path(result['diagnostics_file']).read_text())['result']
         self.assertAlmostEqual(result['angle_error_deg'], 180 - math.degrees(1.))
         self.assertEqual(result['error_sample']['basis'], 'safety_trigger_feedback_not_final_pose')
         control = [r for r in result['motion_trace']['records'] if r['event'] == 'control']

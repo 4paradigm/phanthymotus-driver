@@ -1,5 +1,8 @@
 """Closed-loop relative pose movement through a direct, no-reply SDK client."""
 import math
+import json
+import os
+from pathlib import Path
 from collections import deque
 import threading
 import time
@@ -12,22 +15,24 @@ except ImportError:
 
 
 class MotionTrace:
-    """Bounded per-task diagnostics; never emit a continuous stdout stream."""
+    """Recent preview plus full history for the time-limited task; no per-tick stdout."""
     def __init__(self, initial, target, settings):
         self.started = time.monotonic()
         self.wall_time = time.time()
         self.records = deque(maxlen=400)
         self.total = 0
+        self.all_records = []
         self.initial, self.target, self.settings = dict(initial), dict(target), settings
 
     def add(self, event, **fields):
         now = time.monotonic()
         record = dict(event=event, elapsed_s=now - self.started, **fields)
         self.records.append(record)
+        self.all_records.append(record)
         self.total += 1
         return record
 
-    def export(self):
+    def export(self, full=False):
         def clean(value):
             if isinstance(value, float) and not math.isfinite(value):
                 return None
@@ -40,8 +45,8 @@ class MotionTrace:
                           started_monotonic_s=self.started,
                           time_basis='local_callback_receive; source_capture_time_unavailable',
                           initial=self.initial, requested_target=self.target, settings=self.settings,
-                          record_count=self.total, dropped_records=max(0, self.total - len(self.records)),
-                          records=self.records))
+                          record_count=self.total, dropped_records=0 if full else max(0, self.total - len(self.records)),
+                          records=self.all_records if full else self.records))
 
 
 class LocoRelativeMovePlugin:
@@ -56,6 +61,7 @@ class LocoRelativeMovePlugin:
         self.loco = loco
         self.notify = notify
         self.can_start = can_start
+        self.diagnostics_dir = Path(config.get('diagnostics_dir', '/tmp/g1-relative-motion'))
         self.command_lock = threading.RLock()
         # Serialize callers across the entire handoff, including the feedback
         # wait. The worker only takes command_lock and can therefore finish.
@@ -281,6 +287,49 @@ class LocoRelativeMovePlugin:
                               error=None if stopped else 'Cancelled motion did not release the base with a confirmed stop')
         return result
 
+    def _save_diagnostics(self, action_id, status, result):
+        """Keep the complete result locally and keep ACP below its 600-char cap."""
+        payload = json.dumps(dict(action_id=action_id, status=status, result=result),
+                             ensure_ascii=True, allow_nan=False)
+        summary = {key: result[key] for key in (
+            'safety_reason', 'stop_confirmed_by_feedback') if key in result}
+        if 'error' in result:
+            summary['error'] = str(result['error'])[:120]
+        for key in ('position_error_m', 'angle_error_deg', 'phase'):
+            if key in result:
+                value = result[key]
+                summary[key] = round(value, 4) if isinstance(value, float) else value
+        temporary = None
+        try:
+            self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            destination = self.diagnostics_dir / (action_id + '.json')
+            temporary = destination.with_suffix('.' + uuid4().hex + '.tmp')
+            with temporary.open('x', encoding='utf-8') as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            summary['diagnostics_file'] = str(destination)
+            # An unusually long configured path must not break the ACP limit.
+            if len(json.dumps(summary, ensure_ascii=True)) > 560:
+                summary = dict(diagnostics_file=str(destination))
+            if len(json.dumps(summary, ensure_ascii=True)) > 560:
+                summary = dict(diagnostics='See container log for file path', action_id=action_id)
+            print(f'[RelativeMotion] action_id={action_id} status={status} summary={json.dumps(summary, ensure_ascii=True)} diagnostics_file={destination}', flush=True)
+        except Exception as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            # Numbered, small records allow recovery via docker logs on disk failure.
+            chunks = [payload[i:i+700] for i in range(0, len(payload), 700)]
+            print(f'[RelativeMotion] action_id={action_id} diagnostics_write_failed={str(exc)[:160]} chunks={len(chunks)}', flush=True)
+            for index, chunk in enumerate(chunks):
+                print(f'[RelativeMotionData] {action_id} {index+1}/{len(chunks)} {chunk}', flush=True)
+            summary['diagnostics_error'] = 'File write failed; full numbered data in docker logs'
+        return summary
+
     def _send_stop(self):
         trace = self.active.get('trace') if self.active else None
         record = trace.add('stop_send', command=[0., 0., 0.]) if trace else None
@@ -407,7 +456,7 @@ class LocoRelativeMovePlugin:
             result.update(controller.error)
             result['stop_confirmed_by_feedback'] = stopped
             trace.add('terminal', status=status, stop_confirmed_by_feedback=stopped, error=result.get('error'))
-            result['motion_trace'] = trace.export()
+            result['motion_trace'] = trace.export(full=True)
             result['target'] = dict(x=controller.x, y=controller.y, yaw=controller.yaw)
             with self.command_lock:
                 self.faulted = not stopped or 'safety_reason' in result
@@ -415,7 +464,8 @@ class LocoRelativeMovePlugin:
                 if self.active is job:
                     self.active = None
                 job['motion_done'].set()
-            self.notify(job['id'], status, result, tool=self.PREFIX)
+            summary = self._save_diagnostics(job['id'], status, result)
+            self.notify(job['id'], status, summary, tool=self.PREFIX)
 
 
 class PointBackend:
