@@ -246,12 +246,16 @@ class LocoStatePlugin:
                 self._stop_event.wait(max(0, 1 / self._hz - (time.monotonic() - started)))
 
     def dispatch(self, action, args):
+        if action == "stop":
+            # Canvas lifecycle acknowledgement. The always-active observer keeps
+            # polling until driver shutdown calls stop().
+            return {"state": "idle"}
         if action == "start":
             self.start()
         if action in ("read", "get"):
             with self._lock:
                 return copy.deepcopy(self._latest)
-        if action in ("start", "stop", "info"):
+        if action in ("start", "info"):
             running = (self._thread is not None and self._thread.is_alive()
                        and not self._stop_event.is_set())
             with self._lock:
@@ -267,4 +271,4 @@ class LocoStatePlugin:
                     "available": latest["available"], "samples": samples,
                     "last_sample_ago_ms": int(time.time() * 1000) - stamp if stamp else None,
                     "errors": latest["errors"]}
-        return {"error": f"Unknown action: {action}"}
+        return None

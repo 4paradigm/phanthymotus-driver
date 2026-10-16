@@ -196,6 +196,8 @@ class PluginTests(unittest.TestCase):
         self.assertEqual("none", interface.pose_drift)
         self.assertTrue(interface.usable_for_control)
         self.assertFalse(info["available"])
+        self.assertEqual({"state": "idle"}, state.dispatch("stop", {}))
+        self.assertIsNone(state.dispatch("unsupported", {}))
 
     def test_concurrent_read_only_requests(self):
         client = Client(threading.Barrier(3))
@@ -223,7 +225,10 @@ class PluginTests(unittest.TestCase):
             self.assertIsNone(state._pub.messages[-1]["position"])
             client.failed = False
             wait_for(lambda: state._odom_pub.messages[-1]["twist"][0] == 0.3)
-            self.assertEqual("running", state.dispatch("stop", {})["state"])
+            count = len(state._odom_pub.messages)
+            self.assertEqual({"state": "idle"}, state.dispatch("stop", {}))
+            self.assertTrue(worker.is_alive())
+            wait_for(lambda: len(state._odom_pub.messages) > count)
         finally:
             state.stop()
         self.assertFalse(state._thread.is_alive())
@@ -262,6 +267,10 @@ class PluginTests(unittest.TestCase):
             bundle.start_all()
             wait_for(lambda: bundle._plugins[0]._odom_pub.messages)
             self.assertEqual(2, len(bundle.dispatch("loco_state", {"action": "info"})["topic_out"]))
+            self.assertEqual({"state": "idle"}, bundle.dispatch("loco_state", {"action": "stop"}))
+            self.assertEqual(
+                {"state": "error", "error": "Unknown action: unsupported (tool=loco_state)"},
+                bundle.dispatch("loco_state", {"action": "unsupported"}))
         finally:
             bundle.stop_all()
 

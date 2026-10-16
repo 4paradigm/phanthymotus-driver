@@ -38,8 +38,9 @@ speed; IMU validity is reported separately in `imu.available`.
 
 `plugins.loco_state.hz` defaults to a target of 10Hz (maximum 10); HTTP latency
 can lower the actual rate. `request_timeout` defaults to 0.5 seconds per request.
-There is at most one three-request group in flight. MCP `stop` leaves this
-always-active observer running, matching R1; driver shutdown stops the worker.
+There is at most one three-request group in flight. MCP `stop` returns the
+canvas lifecycle marker `{"state": "idle"}` while leaving this always-active
+observer running, matching R1; driver shutdown stops the worker.
 
 The standard output uses `common.odom` from the official driver repository:
 `twist = [vx, vy, null, null, null, omega]`, `frame = "body"`, SI units,
