@@ -10,6 +10,10 @@ DIRECTIONS = {'forward': (1, 0, 0), 'backward': (-1, 0, 0),
 POSE_FIELDS = ('X_axis', 'Y_axis', 'Z_axis', 'RX_axis', 'RY_axis', 'RZ_axis')
 SMALL_STEP_MM = 1
 JOG_SPEED_PERCENT = 1
+# Conservative software start exclusion, not the firmware's singularity
+# threshold. In the pinned official FK, J4/J6 align at J5=0 (zero J5 offset,
+# zero wrist link lengths and opposite pi/2 twists).
+WRIST_ALIGNMENT_GUARD_DEG = 1.0
 
 
 class DirectionUnavailable(RuntimeError):
@@ -33,8 +37,11 @@ def controller_error(status):
             'A previous target-limit report is still active; no new target was sent. '
             'Recover the controller before retrying. Reset returns joint angles and does not clear faults.')
     if status.startswith(('NO_SOLUTION', 'SINGULARITY_POINT')):
-        return DirectionUnavailable('The controller cannot follow this direction from the current pose '
-            'while keeping the gripper orientation. Check the robot state before retrying. No reset was sent.')
+        reason = 'no kinematic solution' if status.startswith('NO_SOLUTION') else 'a singularity'
+        return DirectionUnavailable(f'The controller reports {status} ({reason}). '
+            'Control requests are blocked while this report remains active. '
+            'Controller recovery requires operator supervision because SDK reset releases motor torque. '
+            'The card Reset only returns joint angles. No fault clear was sent.')
     return RuntimeError('The arm reports a fault: ' + status)
 
 
@@ -124,6 +131,17 @@ def cartesian_start_check(driver, state=None):
         error.feedback = {'joints_deg': list(state.joints_deg),
             'joint_limits_deg': [list(b) for b in bounds], 'boundary_joints': endpoints,
             'controller_status': state.arm_status, 'feedback_time': state.feedback_time}
+        raise error
+    if abs(state.joints_deg[4]) <= WRIST_ALIGNMENT_GUARD_DEG:
+        error = RuntimeError(
+            f'Cartesian movement is blocked near wrist alignment: J5={state.joints_deg[4]:g} deg '
+            f'is inside the software +/-{WRIST_ALIGNMENT_GUARD_DEG:g} deg start guard. '
+            'Use Set joints to choose a non-aligned working posture while the controller is healthy. '
+            'This guard does not guarantee path reachability. No Cartesian target was sent.')
+        error.failure_code = 'cartesian_start_near_wrist_alignment'
+        error.feedback = {'joints_deg': list(state.joints_deg),
+            'controller_status': state.arm_status, 'feedback_time': state.feedback_time,
+            'wrist_alignment_guard_deg': WRIST_ALIGNMENT_GUARD_DEG}
         raise error
     return state
 

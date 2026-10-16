@@ -372,8 +372,18 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
                 elif attempted:
                     exc.args = ('The controller reported a target outside its limits during motion setup; '
                         'the requested target was not submitted. Recover the controller before retrying.',)
+            elif first_feedback:
+                status = first_feedback.get('controller_status', 'an unknown report')
+                if target_attempted:
+                    exc.args = (f'The controller reported {status} after the {kind} target submission attempt. '
+                        'Movement may be partial. Operator-supervised controller recovery is required; '
+                        'SDK reset releases motor torque. No fault clear or retry was sent.',)
+                elif attempted:
+                    exc.args = (f'The controller reported {status} during motion setup. '
+                        'The requested target was not submitted. No fault clear was sent.',)
         suppress_hold = (isinstance(exc, (JointLimitViolation, DirectionUnavailable))
-                         or getattr(exc, 'failure_code', None) == 'cartesian_start_at_joint_limit')
+                         or getattr(exc, 'failure_code', None) in {
+                             'cartesian_start_at_joint_limit', 'cartesian_start_near_wrist_alignment'})
         if attempted and not suppress_hold:
             try:
                 measured = end_pose(driver) if kind == 'pose' else checked_state(driver, ready=True).joints_deg

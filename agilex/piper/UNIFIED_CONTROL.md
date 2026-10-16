@@ -26,9 +26,13 @@ only declared inactive fields and still validates active values strictly.
 
 Only one gripper action is public: Set gripper, using millimetres, normally 0–70.
 Open/Close and Set position are absent from schema, descriptions and completion
-metadata. Direct legacy requests fail before taking control. Reset always uses
-the official six-zero joint target, never a saved file or legacy configured
-preset. Saved files remain untouched. Reset is a guarded joint trajectory with
+metadata. Direct legacy requests fail before taking control. Reset uses an
+explicitly recorded `intent_control.reset_joints_deg` target when configured;
+otherwise it retains the official six-zero default. `reset_reference` records
+the capture identity/time. The legacy saved file and `preset_joints_deg` are
+still ignored and preserved. The full Reset target/source appears in its action
+description and Get status. Invalid recorded values fail rather than falling
+back to zero. Reset is a guarded joint trajectory with
 unchanged gripper, not firmware reset, zero calibration or error clearing.
 All actual control actions retain automatic stationary-teaching exit/hold before
 target resolution; read-only operations and Stop do not take over teaching.
@@ -95,6 +99,21 @@ deduplication and manual-canvas registration. The operator's current Core is
 release.261015.5440953; it is unchanged by the driver-only local fix below.
 
 ## Boundary handling and rejection diagnostics
+
+The 2026-10-16 follow-up adds a conservative Cartesian start guard at J5 within
++/-1 degree of zero. The pinned SDK FK's wrist chain aligns J4/J6 at J5=0;
+one degree is a software exclusion band, not a claimed firmware threshold.
+Checks run before takeover/preparation and under the mode/target submission
+lock. Healthy joint moves and Reset can still leave or enter that posture.
+The guard is not full IK, collision avoidance or proof that a path is reachable.
+
+NO_SOLUTION and SINGULARITY_POINT messages identify the actual controller report
+and distinguish pre-existing reports from failures after target submission.
+Set joints no longer inherits a message claiming it must preserve tool orientation.
+Get status exposes controller recovery guidance separately from historical task
+failure. Recovery is never automatic: the pinned SDK's ResetPiper explicitly
+releases motor torque. Any one-shot maintenance recovery needs an on-site
+operator to support the arm; it must not resume the rejected target or auto-enable.
 
 - Cartesian Move/Pose require an interior joint posture. An exact effective
   joint endpoint is rejected before takeover/preparation; posture is rechecked

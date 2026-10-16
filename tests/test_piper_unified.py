@@ -173,6 +173,57 @@ class UnifiedTests(unittest.TestCase):
                 self.call('reset')
         self.assertEqual(self.sdk.calls, [])
 
+    def test_recorded_reset_uses_captured_angles_and_preserves_current_gripper(self):
+        target = [1.045, 10.621, -9.278, .975, 19.075, 0.]
+        self.runtime.config['intent_control']['reset_joints_deg'] = target
+        self.runtime.config['intent_control']['reset_reference'] = 'Operator capture 2026-10-16'
+        self.sdk.width = 31.2
+        result = self.call('reset')
+        self.assertEqual(result['target'], tuple(target))
+        self.assertEqual(self.targets('joints'), [(1045, 10621, -9278, 975, 19075, 0)])
+        self.assertEqual(result['return_position']['source'], 'operator_recorded')
+        self.assertEqual(self.sdk.width, 31.2)
+        self.assertFalse(any(c[0] in {'gripper', 'reset', 'enable_arm'} for c in self.sdk.calls))
+        definition = self.runtime.get_tools()[0]
+        self.assertIn('recorded joint position', json.dumps(definition))
+        self.assertNotIn('official zero-angle posture', definition['description'])
+
+    def test_recorded_reset_survives_config_reload(self):
+        import yaml
+        target = [1.045, 10.621, -9.278, .975, 19.075, 0.]
+        self.config['intent_control']['reset_joints_deg'] = target
+        restored = yaml.safe_load(yaml.safe_dump(self.config))
+        plugins = build_plugins(restored, 'piper_arm1', None)
+        try:
+            self.assertEqual(plugins[0].return_preset()['joints_deg'], target)
+        finally:
+            for plugin in plugins: plugin.stop()
+
+    def test_invalid_recorded_reset_never_silently_returns_to_zero(self):
+        for target in ([0]*5, [None]*6, [0, 0, 0, 0, float('nan'), 0], None):
+            with self.subTest(target=target):
+                self.runtime.config['intent_control']['reset_joints_deg'] = target
+                with self.assertRaises(ValueError):
+                    self.call('reset')
+                self.assertEqual(self.sdk.calls, [])
+
+    def test_recorded_reset_still_checks_sdk_limits_before_any_commands(self):
+        self.runtime.config['intent_control']['reset_joints_deg'] = [1, 10, -10, 0, 71, 0]
+        with self.assertRaisesRegex(RuntimeError, 'within'):
+            self.call('reset')
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_recorded_reset_keeps_stationary_teaching_exit_before_target(self):
+        target = [1.045, 10.621, -9.278, .975, 19.075, 0.]
+        self.runtime.config['intent_control']['reset_joints_deg'] = target
+        self.sdk.mode = 'TEACHING_MODE(0x2)'
+        original = tuple(self.sdk.raw)
+        result = self.call('reset')
+        self.assertEqual(result['target'], tuple(target))
+        self.assertTrue(all(q == original for q in self.targets('joints')[:-1]))
+        self.assertEqual(self.targets('joints')[-1], (1045, 10621, -9278, 975, 19075, 0))
+        self.assertFalse(any(c[0] in {'gripper', 'reset'} for c in self.sdk.calls))
+
     def test_legacy_capture_helper_is_retained_without_a_public_action(self):
         record = fast_capture(self.driver, interface='can0', serial='fake-arm1')
         self.assertEqual(record['joints_deg'], tuple(q / 1000 for q in self.sdk.raw))

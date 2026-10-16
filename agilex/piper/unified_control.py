@@ -51,8 +51,17 @@ class UnifiedControlPlugin(IntentControlPlugin):
         self.completions.wait()
 
     def return_preset(self):
-        # Fixed SDK go-zero target. Never load, modify or delete the operator's
-        # legacy return-preset.json. Robot path acceptance is still separate.
+        # Only an explicitly recorded new preset overrides the SDK zero target.
+        # Do not silently load the old Set-position file or preset_joints_deg.
+        cfg = self.config.get('intent_control', {})
+        if 'reset_joints_deg' in cfg:
+            target = vector(cfg['reset_joints_deg'], 6, 'reset_joints_deg')
+            limits = self.config.get('joint_limits_deg')
+            if limits is not None and any(not lo <= q <= hi for q, (lo, hi) in zip(target, limits)):
+                raise ValueError('The recorded Reset position exceeds configured joint limits.')
+            return {'joints_deg': list(target), 'source': 'operator_recorded',
+                    'reference': cfg.get('reset_reference', 'Explicitly configured joint position'),
+                    'physical_acceptance': 'pending'}
         return {'joints_deg': list(OFFICIAL_ZERO_JOINTS), 'source': 'official_zero',
                 'reference': 'piper_sdk@8d4dc29/demo/V2/piper_ctrl_go_zero.py',
                 'physical_acceptance': 'pending'}
@@ -94,10 +103,12 @@ class UnifiedControlPlugin(IntentControlPlugin):
         actions = {
             'select_action': ([], 'Choose an action'),
             'move': (['translation_mm', 'rotation_deg', 'speed_percent'],
-                     'Relative tool-frame motion. Select an in-range joint working posture first. Without TCP calibration: SDK end axes, translation only, unchanged orientation.'),
+                     'Relative tool-frame motion. Select an in-range working posture with J5 outside +/-1 deg first. Without TCP calibration: SDK end axes, translation only, unchanged orientation.'),
             'pose': (['pose_mm_deg', 'motion_mode', 'speed_percent'], 'Absolute base-frame gripper-tip target; null keeps the measured component.'),
             'set_joints': (['joints_deg', 'joint_mode', 'speed_percent'], 'Six joint angles in degrees. Absolute: null keeps measured angle. Relative: 0 keeps angle.'),
-            'reset': (['speed_percent'], 'Return to official [0,0,0,0,0,0] deg. Not a working posture or fault clear. Verify the return path on site. Gripper unchanged.'),
+            'reset': (['speed_percent'],
+                      'Return to ' + ('recorded joint position ' if self.return_preset()['source'] == 'operator_recorded' else 'official zero position ')
+                      + str(self.return_preset()['joints_deg']) + ' deg. This does not clear controller faults. Verify the return path on site. Gripper unchanged.'),
             'stop_motion': ([], 'Cancel preparation or motion; keep motor torque.'),
             'set_gripper_opening': (['width_mm'], 'Set gripper opening in millimetres.'),
             'get_status': ([], 'Read actual pose, joints, limits, mode, faults and the task result; no control commands.'),
@@ -120,7 +131,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
         if not calibrated:
             actions.pop('pose')
             actions['move'] = (['translation_mm', 'speed_percent'],
-                               'Relative translation along SDK end axes; keep orientation. Use an in-range joint working posture first. 0 means no displacement.')
+                               'Relative translation along SDK end axes; keep orientation. Use an in-range working posture with J5 outside +/-1 deg first. 0 means no displacement.')
             props.pop('rotation_deg')
             props.pop('pose_mm_deg')
         else:
@@ -149,7 +160,7 @@ class UnifiedControlPlugin(IntentControlPlugin):
                               'Relative Move uses a linear path. 0 means no increment. '
                               + ('Calibrated tip-relative rotation and absolute base-frame Move to pose are available. '
                                  if calibrated else 'Uncalibrated Move translates along SDK end axes with unchanged orientation. ')
-                              + 'Reset moves six joints to the official zero-angle posture, with the gripper unchanged. '
+                              + 'Reset returns to the joint position reported in Get status and its action description, with the gripper unchanged. '
                               + 'Set gripper uses the opening width in millimetres. '
                               + 'Keep the workspace clear; a numeric target may still be unreachable.')
         return tools
@@ -354,6 +365,9 @@ class UnifiedControlPlugin(IntentControlPlugin):
                     code = getattr(exc, 'failure_code', 'preflight_failed')
                     if isinstance(exc, DirectionUnavailable):
                         code = 'controller_report_already_active'
+                        label = {'set_joints': 'Set joints', 'reset': 'Reset', 'move': 'Move',
+                                 'pose': 'Move to pose', 'set_gripper_opening': 'Set gripper'}[action]
+                        exc.args = (f'{label} target was not submitted. {exc}',)
                     setup_control_attempted = setup_control_attempted or (existing or {}).get('stage') == 'exiting_teaching'
                     detail = {**(existing or {}), 'stage': 'rejected_before_submission', 'failure_code': code,
                         'control_attempted': setup_control_attempted,
@@ -400,6 +414,13 @@ class UnifiedControlPlugin(IntentControlPlugin):
         snapshot['capabilities'] = self.capabilities()
         snapshot['return_preset_configured'] = snapshot['capabilities']['return_preset']['available']
         snapshot['tcp_verified'] = snapshot['capabilities']['pose']['available']
+        status = snapshot.get('faults', {}).get('arm_status', '')
+        snapshot['controller_recovery'] = {
+            'required': status.startswith(('NO_SOLUTION', 'SINGULARITY_POINT', 'TARGET_POS_EXCEEDS_LIMIT')),
+            'controller_status': status, 'automatic': False,
+            'guidance': 'Stop automated control. SDK controller reset releases motor torque; '
+                        'the arm must be supported by an on-site operator before recovery. '
+                        'Card Reset returns joint angles and does not clear controller reports.'}
         try:
             snapshot['return_position'] = self.return_preset()
         except ValueError:

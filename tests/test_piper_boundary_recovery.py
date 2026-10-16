@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from agilex.piper.device import build_plugins
-from agilex.piper.intent_motion import checked_state, end_pose
+from agilex.piper.intent_motion import checked_state, end_pose, cartesian_start_check
 from agilex.piper.user_motion import execute_target, send_target
 from common.vendor_runtime import DriverBundle
 from test_piper_intent import FastClock, IntentDriver
@@ -396,6 +396,137 @@ class CartesianBoundaryPreflightTests(unittest.TestCase):
         self.assertEqual(diagnostics['failure_code'], 'controller_still_moving')
         self.assertFalse(diagnostics['control_attempted'])
         self.assertFalse(diagnostics['target_attempted'])
+
+
+class SingularityRegressionTests(unittest.TestCase):
+    setUp = CartesianBoundaryPreflightTests.setUp
+    call = CartesianBoundaryPreflightTests.call
+
+    def set_posture(self, wrist=0):
+        # Recorded at the 2026-10-16 incident, before any software recovery.
+        self.sdk.raw = (1167, 24553, -43734, 7125, wrist, 0)
+
+    def fast_call(self, action, **kwargs):
+        clock = FastClock()
+        def execute(*args, **options):
+            return execute_target(*args, **options, clock=clock.now, sleep=clock.sleep)
+        with patch('agilex.piper.unified_control.execute_target', side_effect=execute):
+            return self.call(action, **kwargs)
+
+    def test_recorded_posture_is_refused_before_move_can_trigger_firmware(self):
+        self.set_posture()
+        with self.assertRaisesRegex(RuntimeError, 'wrist alignment.*J5=0'):
+            self.call('move', translation_mm=[1, 0, 0], speed_percent=5)
+        self.assertEqual(self.sdk.calls, [])
+        self.assertEqual(self.runtime.task['diagnostics']['failure_code'],
+                         'cartesian_start_near_wrist_alignment')
+
+    def test_alignment_guard_precedes_teaching_exit_and_motor_preparation(self):
+        for mode, enabled in [('TEACHING_MODE(0x2)', True), ('STANDBY(0x0)', False)]:
+            with self.subTest(mode=mode):
+                self.set_posture()
+                self.sdk.mode, self.sdk.enabled = mode, (enabled,) * 6
+                with self.assertRaisesRegex(RuntimeError, 'wrist alignment'):
+                    self.call('move', translation_mm=[1, 0, 0])
+                self.assertEqual(self.sdk.calls, [])
+
+    def test_guard_band_is_symmetric_and_not_a_firmware_error(self):
+        for raw in (-1000, -1, 0, 1, 1000):
+            with self.subTest(raw=raw):
+                self.set_posture(raw)
+                with self.assertRaisesRegex(RuntimeError, 'software'):
+                    cartesian_start_check(self.driver)
+                self.assertEqual(self.sdk.status, 'NORMAL(0x0)')
+        for raw in (-1001, 1001):
+            self.set_posture(raw)
+            cartesian_start_check(self.driver)
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_healthy_joint_motion_can_leave_alignment_without_cartesian_motion(self):
+        self.set_posture()
+        result = self.fast_call('set_joints', joint_mode='absolute',
+                               joints_deg=[None, None, None, None, 10, None])
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(self.sdk.calls, [('mode', 1, 1, 1, 0),
+                         ('joints', (1167, 24553, -43734, 7125, 10000, 0))])
+
+    def test_reset_still_can_target_zero_and_zero_move_remains_passive(self):
+        self.set_posture()
+        self.assertFalse(self.call('move', translation_mm=[0, 0, 0])['executed'])
+        self.assertEqual(self.sdk.calls, [])
+        result = self.fast_call('reset')
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(self.sdk.calls[-1], ('joints', (0,) * 6))
+
+    def test_active_reports_do_not_blame_new_joint_target_or_clear_faults(self):
+        self.set_posture()
+        for status in ('SINGULARITY_POINT(0x3)', 'NO_SOLUTION(0x2)'):
+            with self.subTest(status=status):
+                self.sdk.status = status
+                with self.assertRaises(RuntimeError) as caught:
+                    self.call('set_joints', joints_deg=[10, 0, 0, 0, 0, 0])
+                self.assertIn('Set joints target was not submitted', str(caught.exception))
+                self.assertIn(status, str(caught.exception))
+                self.assertNotIn('keeping the gripper orientation', str(caught.exception))
+                self.assertIn('releases motor torque', str(caught.exception))
+                detail = self.runtime.task['diagnostics']
+                self.assertFalse(detail['control_attempted'])
+                self.assertFalse(detail['target_submitted'])
+                self.assertEqual(detail['first_error_feedback']['controller_status'], status)
+                self.assertEqual(self.sdk.calls, [])
+
+    def test_get_status_reports_recovery_separately_from_last_task_error(self):
+        self.sdk.status = 'SINGULARITY_POINT(0x3)'
+        with self.assertRaises(RuntimeError):
+            self.call('set_joints', joints_deg=[None, None, None, None, 10, None])
+        failed = self.call('get_status')
+        self.assertTrue(failed['snapshot']['controller_recovery']['required'])
+        self.sdk.status = 'NORMAL(0x0)'  # External recovery, not a driver command.
+        recovered = self.call('get_status')
+        self.assertFalse(recovered['snapshot']['controller_recovery']['required'])
+        self.assertEqual(recovered['task']['state'], 'failed')
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_alignment_reached_during_preparation_blocks_original_target(self):
+        self.set_posture(1100)
+        self.sdk.mode, self.sdk.enabled = 'STANDBY(0x0)', (False,) * 6
+        prepare = self.driver.prepare_control
+        def drift(**kwargs):
+            result = prepare(**kwargs)
+            self.set_posture(900)
+            return result
+        self.driver.prepare_control = drift
+        with self.assertRaisesRegex(RuntimeError, 'wrist alignment'):
+            self.call('move', translation_mm=[1, 0, 0])
+        self.assertEqual([c[0] for c in self.sdk.calls], ['prepare'])
+        self.assertFalse(self.runtime.task['diagnostics']['target_submitted'])
+
+    def test_alignment_reached_after_mode_sends_no_target_or_recovery_hold(self):
+        self.set_posture(10000)
+        mode = self.sdk.MotionCtrl_2
+        def drift(*args):
+            mode(*args)
+            self.set_posture()
+        self.sdk.MotionCtrl_2 = drift
+        with self.assertRaisesRegex(RuntimeError, 'wrist alignment'):
+            self.fast_call('move', translation_mm=[1, 0, 0])
+        self.assertEqual(self.sdk.calls, [('mode', 1, 2, 1, 0)])
+        self.assertFalse(self.runtime.task['diagnostics']['measured_hold_sent'])
+
+    def test_new_controller_rejection_keeps_submission_stage_and_no_followup(self):
+        self.set_posture(10000)
+        submit = self.sdk.EndPoseCtrl
+        def reject(*args):
+            submit(*args)
+            self.sdk.status = 'SINGULARITY_POINT(0x3)'
+        self.sdk.EndPoseCtrl = reject
+        with self.assertRaisesRegex(RuntimeError, 'SINGULARITY_POINT.*after the pose target submission'):
+            self.fast_call('move', translation_mm=[1, 0, 0])
+        detail = self.runtime.task['diagnostics']
+        self.assertTrue(detail['target_submitted'])
+        self.assertFalse(detail['measured_hold_sent'])
+        self.assertEqual(detail['failure_code'], 'target_rejected_after_submission')
+        self.assertEqual([c[0] for c in self.sdk.calls], ['mode', 'end_pose'])
 
 
 if __name__ == '__main__':

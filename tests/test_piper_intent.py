@@ -504,7 +504,8 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(self.sdk.calls, [])
 
     def test_cached_reached_flag_and_orientation_error_do_not_report_completion(self):
-        self.sdk.GetArmStatus = lambda:SimpleNamespace(time_stamp=time.time() - .1,
+        cached_stamp = time.time() - .1
+        self.sdk.GetArmStatus = lambda:SimpleNamespace(time_stamp=cached_stamp,
             arm_status=SimpleNamespace(motion_status=0))
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
             self.call('move_up')
