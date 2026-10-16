@@ -26,8 +26,10 @@ class HeadValidationTests(unittest.TestCase):
         props=tool({})['inputSchema']
         self.assertEqual(props['properties']['pitch_deg']['maximum'],60)
         self.assertEqual(props['properties']['yaw_deg']['minimum'],-90)
-        self.assertEqual(props['required'],['action','pitch_deg','yaw_deg'])
-        self.assertEqual(props['x-completion']['actions'],['move'])
+        self.assertEqual(props['required'],['pitch_deg','yaw_deg'])
+        self.assertNotIn('action',props['properties'])
+        self.assertNotIn('x-action-params',props)
+        self.assertEqual(props['x-completion'],{'timeout':120})
 
     def test_missing_bad_and_out_of_range_values_never_validate(self):
         for key in ('pitch_deg','yaw_deg'):
@@ -93,6 +95,23 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
         await self.dispatch();self.pump([0]*14+[.1,-.1],advance=False)
         await self.owner.task
         self.assertEqual(self.owner.last['status'],'error');self.assertIsNotNone(self.owner.active)
+
+    async def test_head_not_moving_keeps_real_error_and_targets_in_health_and_next_rejection(self):
+        await self.dispatch();self.pump([0]*16);await self.owner.task
+        summary=self.owner.summary()
+        self.assertEqual(summary['status'],'error')
+        self.assertEqual(summary['error_code'],'target_not_reached')
+        self.assertTrue(summary['vendor_acknowledged'])
+        self.assertTrue(summary['callback_delivered'])
+        self.assertFalse(summary['arrival_verified'])
+        self.assertEqual(summary['state'],'blocked_requires_operator_check')
+        self.assertAlmostEqual(summary['target_pitch_deg'],math.degrees(.1))
+        self.assertEqual(summary['current_pitch_deg'],0)
+        with self.assertRaisesRegex(MoveError,'头部未确认到位') as caught:await self.dispatch()
+        self.assertEqual(caught.exception.code,'head_requires_operator_check')
+        self.reader.send_moveh.assert_awaited_once()
+        self.reader.joints_at-=100
+        self.assertFalse(self.owner.summary()['feedback_available'])
 
     async def test_moving_velocity_or_wrong_target_cannot_complete(self):
         await self.dispatch();self.pump([0]*14+[.1,-.1],dq=[0]*14+[1,0])
@@ -160,7 +179,7 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
 
 class HeadWireTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_mcp_websocket_and_acp_use_head_only_and_exact_correlation(self):
-        requests=[];ack_mode=['success'];stamp=[100];head_q=[0.0,0.0];completions=[]
+        requests=[];ack_mode=['success'];stamp=[100];head_q=[0.0,0.0];completions=[];vr_follow=[False]
         async def robot(request):
             ws=web.WebSocketResponse();await ws.prepare(request);await ws.send_json(info())
             async for msg in ws:
@@ -182,10 +201,15 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
         async def complete(request):
             payload=await request.json();completions.append(payload)
             return web.json_response({'ok':True,'action_id':payload['action_id']})
+        async def control_status(request):
+            return web.json_response({'enable_vr_follow_head':vr_follow[0],'enable_vr_follow_head_valid':True,
+                                      'working_mode':'developer_mode','working_mode_valid':True})
         app=web.Application();app.router.add_get('/robot',robot);app.router.add_post('/api/acp/complete',complete)
+        app.router.add_get('/get_robot_info',control_status)
         runner=web.AppRunner(app);await runner.setup()
         site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
         port=site._server.sockets[0].getsockname()[1]
+        api_patch=patch('vendor.HEAD_API_PORT',port);api_patch.start()
         async with aiohttp.ClientSession(trust_env=False) as session:
             reader=RobotReader(settings(url='ws://127.0.0.1:'+str(port)+'/robot',poll_interval_seconds=.01,response_timeout_seconds=.12))
             adapter=Adapter(lambda *a:None,settings(enabled_cards=['joint_state','move_head']),reader=reader,session=session)
@@ -202,7 +226,7 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                 with patch.dict('os.environ',{'AGENT_CORE_URL':'http://127.0.0.1:'+str(port)}),patch('completion.STABILITY_SECONDS',.05):
                     async with session.post('http://127.0.0.1:'+str(site2._server.sockets[0].getsockname()[1])+'/mcp',json={
                         'jsonrpc':'2.0','id':7,'method':'tools/call','params':{'name':'move_head','arguments':{
-                            'action':'move','pitch_deg':10,'yaw_deg':-12,'time':.1,'_trace_id':'trace','instance_id':'card'}}}) as response:
+                            'pitch_deg':10,'yaw_deg':-12,'time':.1,'_trace_id':'trace','instance_id':'card'}}}) as response:
                         result=(await response.json())['result'];self.assertFalse(result['isError'])
                         admitted=json.loads(result['content'][0]['text']);self.assertFalse(admitted['arrival_verified'])
                     await asyncio.wait_for(adapter.head.task,2)
@@ -214,6 +238,15 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(completions[0]['action_id'],admitted['action_id'])
                 self.assertTrue(completions[0]['result']['head_target_verified'])
                 self.assertIsNone(adapter.head.active)
+                vr_follow[0]=True
+                before=len([p for p in requests if p['title']=='request_moveh'])
+                with self.assertRaises(MoveError) as caught:
+                    await adapter.head.dispatch('move',[0,0],1,{})
+                self.assertEqual(caught.exception.code,'head_vr_follow_enabled')
+                self.assertFalse(caught.exception.motion_sent)
+                self.assertIsNone(adapter.head.active)
+                self.assertEqual(before,len([p for p in requests if p['title']=='request_moveh']))
+                vr_follow[0]=False
                 ack_mode[0]='reject'
                 with self.assertRaisesRegex(MoveError,'rejected'):await reader.send_moveh([0,0],1)
                 ack_mode[0]='timeout'
@@ -222,7 +255,49 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await adapter.head.close();task.cancel();await asyncio.gather(task,return_exceptions=True)
                 await run2.cleanup()
+                api_patch.stop()
         await runner.cleanup()
+
+    async def test_unverified_follow_state_blocks_without_any_motor_write(self):
+        mode=[{'enable_vr_follow_head':True,'enable_vr_follow_head_valid':True,
+               'working_mode':'developer_mode','working_mode_valid':True}]
+        async def status(request):return web.json_response(mode[0])
+        app=web.Application();app.router.add_get('/get_robot_info',status)
+        runner=web.AppRunner(app);await runner.setup();site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        reader=RobotReader(settings());reader.accept_info(info())
+        reader.ws=types.SimpleNamespace(closed=False,send_json=AsyncMock())
+        try:
+            with patch('vendor.HEAD_API_PORT',site._server.sockets[0].getsockname()[1]):
+                for state,code in ((mode[0],'head_vr_follow_enabled'),
+                                   ({},'head_control_status_unavailable'),
+                                   ({**mode[0],'enable_vr_follow_head':False,'working_mode':'controller_mode'},'vendor_not_ready')):
+                    mode[0]=state
+                    with self.assertRaises(MoveError) as caught:await reader.send_moveh([0,0],1)
+                    self.assertEqual(caught.exception.code,code)
+                    self.assertFalse(caught.exception.motion_sent)
+            reader.ws.send_json.assert_not_called()
+        finally:await runner.cleanup()
+
+    async def test_head_mode_query_handles_chunked_body_and_rejects_redirects_or_oversize(self):
+        variant=['chunked']
+        async def status(request):
+            if variant[0]=='redirect':raise web.HTTPFound('/unexpected')
+            if variant[0]=='large':return web.Response(body=b' '*131073)
+            response=web.StreamResponse();await response.prepare(request)
+            raw=json.dumps({'enable_vr_follow_head':False,'enable_vr_follow_head_valid':True,
+                            'working_mode':'developer_mode','working_mode_valid':True}).encode()
+            await response.write(raw[:20]);await asyncio.sleep(.01)
+            await response.write(raw[20:]);await response.write_eof();return response
+        app=web.Application();app.router.add_get('/get_robot_info',status)
+        runner=web.AppRunner(app);await runner.setup();site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        reader=RobotReader(settings())
+        try:
+            with patch('vendor.HEAD_API_PORT',site._server.sockets[0].getsockname()[1]):
+                self.assertEqual(await reader.head_control_status(),{'vr_head_follow':False,'source':'fresh_vendor_get_robot_info'})
+                for value in ('redirect','large'):
+                    variant[0]=value
+                    with self.assertRaises(MoveError):await reader.head_control_status()
+        finally:await runner.cleanup()
 
     async def test_transport_preconditions_never_send_or_toggle_modes(self):
         reader=RobotReader(settings());reader.accept_info(info())

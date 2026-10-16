@@ -17,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.7.0'
+VERSION = '0.7.1'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -196,7 +196,8 @@ class Adapter:
             if 'action' in args:
                 raise ValueError('Model has no action')
             return model()
-        action = args.get('action', 'info' if name in TOPICS or name in CAMERA_SOURCES else None)
+        action = args.get('action', 'move' if name == 'move_head' else
+                          'info' if name in TOPICS or name in CAMERA_SOURCES else None)
         if not isinstance(action, str):
             raise ValueError('An action string is required')
         if name not in self.enabled:
@@ -341,6 +342,9 @@ class Adapter:
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
                     if params.get('name') in self.grippers and params['name'] in self.enabled:
                         data['gripper'] = self.grippers[params['name']].info()
+                    if params.get('name') == 'move_head' and 'move_head' in self.enabled:
+                        data['error_code'] = getattr(exc,'code',None)
+                        data['head_motion'] = self.head.summary()
                 result = {'content': [{'type': 'text', 'text': json.dumps(data,
                            ensure_ascii=False, allow_nan=False)}], 'isError': error}
             else:

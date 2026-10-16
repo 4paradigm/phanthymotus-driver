@@ -6,7 +6,7 @@ import time
 import completion
 from completion import ArmCompletion
 from skeleton import skeleton_stream
-from vendor import validate_moveh
+from vendor import validate_moveh, MoveError
 
 
 def arguments(args):
@@ -31,21 +31,55 @@ def tool(metadata):
         'description':'TRON2头部转动：填写俯仰/偏航绝对角度（°）和时间（秒）。仅控制头部两轴，不移动双臂或开合夹爪；连续新反馈确认到位后通过ACP通知完成。正负方向按厂家坐标系。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'action':{'type':'string','enum':['move']},
                 'pitch_deg':{'type':'number','minimum':-45,'maximum':60,'title':'俯仰角度（°）','description':'头部上下俯仰绝对目标，-45至60°；必须明确填写'},
                 'yaw_deg':{'type':'number','minimum':-90,'maximum':90,'title':'偏航角度（°）','description':'头部左右转动绝对目标，-90至90°；必须明确填写'},
                 'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'},
                 **metadata},
-            'required':['action','pitch_deg','yaw_deg'],
-            'x-action-params':{'move':{'params':['pitch_deg','yaw_deg','time'],'description':'转到指定俯仰/偏航角度，反馈确认到位后完成'}},
+            'required':['pitch_deg','yaw_deg'],
             'x-resource':['head','arm_l','arm_r'],
-            'x-completion':{'actions':['move'],'timeout':completion.ACP_TIMEOUT}}}
+            # No action filter: calls without an action still register ACP.
+            # Lifecycle/info responses never carry action_id and create no pending task.
+            'x-completion':{'timeout':completion.ACP_TIMEOUT}}}
 
 
 class HeadCompletion(ArmCompletion):
     joint_count = 2
     action_prefix = 'tron2_head_'
     require_ack = True
+
+    def summary(self):
+        result = dict(self.last or {})
+        if self.active:
+            job = self.active
+            if result.get('action_id') != job['action_id']:
+                result = {}
+            result.update({key:job[key] for key in ('action_id','action','state')})
+            result.update(job['details'])
+            result['target_pitch_deg'] = math.degrees(job['target'][0])
+            result['target_yaw_deg'] = math.degrees(job['target'][1])
+            result['time'] = job['duration']
+        if not result:
+            return None
+        try:
+            sample, q, dq = self.feedback()
+            result.update(current_pitch_deg=math.degrees(q[0]),current_yaw_deg=math.degrees(q[1]),
+                          current_velocity_raw=dq,feedback_available=True,
+                          reception_age_seconds=sample['reception_age_seconds'])
+        except ValueError:
+            result['feedback_available'] = False
+        peers = self.peers + ([self.peer] if self.peer else [])
+        result['can_accept_motion'] = not self.closed and not self.active and not any(
+            peer.closed or peer.active or getattr(peer,'recovering',False) or getattr(peer,'waiting',None)
+            for peer in peers)
+        return result
+
+    def blocked_error(self):
+        summary = self.summary() or {}
+        if self.closed:
+            return MoveError('头部驱动已停止，未发送新的转动指令',False,'head_closed')
+        reason = summary.get('error') or '上一条头部任务仍在执行或等待完成确认'
+        return MoveError('头部上一条任务尚未解除：'+reason+'；未发送新的转动指令',
+                         False,'head_requires_operator_check' if summary.get('state')=='blocked_requires_operator_check' else 'head_busy')
 
     def validate(self, target, duration):
         return validate_moveh(target, duration)
@@ -74,10 +108,12 @@ class HeadCompletion(ArmCompletion):
         not_before = time.monotonic() + job['duration']
         deadline = not_before + completion.ARRIVAL_GRACE
         window = []
+        observed = None
         while time.monotonic() < deadline:
             if not self.reader.connected or self.reader.ws is not job['ws'] or self.reader.serial != job['serial']:
                 raise ValueError('Head connection changed during movement; result unknown')
             sample, q, dq = self.feedback()
+            observed = [math.degrees(value) for value in q]
             current = sample['data']['robot_timestamp']
             now = time.monotonic()
             if current > stamp:
@@ -99,4 +135,6 @@ class HeadCompletion(ArmCompletion):
                 if current < stamp:
                     raise ValueError('Head feedback timestamp regressed')
             await asyncio.sleep(.05)
-        raise ValueError('Head arrival not confirmed; motion owner retained for operator check')
+        current = ('无有效反馈' if observed is None else '俯仰%.2f°、偏航%.2f°'%tuple(observed))
+        target = '俯仰%.2f°、偏航%.2f°'%tuple(math.degrees(value) for value in job['target'])
+        raise MoveError('头部未确认到位：目标'+target+'，最近反馈'+current+'；保持保护，请检查实物与控制器',True,'target_not_reached')

@@ -1,6 +1,6 @@
 # 头部转动 move_head
 
-在 Motus 中添加 `move_head` 卡片，选择 `move`，填写两个绝对目标角度和运动时间：
+在 Motus 中添加 `move_head` 卡片，直接填写两个绝对目标角度和运动时间，无需选择 action：
 
 | 参数 | 含义 | 范围 |
 | --- | --- | --- |
@@ -37,5 +37,17 @@ ACP 报告 `completed`、`arrival_verified: true`、`head_target_verified: true`
 
 `start`/`stop` 仅为平台生命周期，不转动头部；`stop` 不是硬件急停。
 驱动启动、注册、镜像验证、部署检查不会自动执行头部运动。
+
+0.7.1起，卡片仅显示pitch_deg、yaw_deg、time，后端缺省执行move。ACP声明不设
+action过滤，因而没有action字段的正常转动仍建立异步完成跟踪。info/start/stop
+仍供平台内部生命周期使用，这些返回不含action_id，不会建立虚假的待完成任务。
+发生失败时，health.head_motion和后续拒绝结果会保留原任务错误、成功回执标志、
+目标角度与当前反馈；不会仅给出泛化的机械臂忙提示，也不会自动解除保护。
+
+每次发送MoveH前，驱动从同一机器人主机的厂家HTTP8888 `/get_robot_info` 读取
+新鲜头部跟随状态。必须有有效的 `enable_vr_follow_head=false` 和上层开发模式；
+VR跟随开启、状态缺失或读取失败时，在发送前拒绝，不产生新的运动任务保护锁。
+驱动不会自动关闭VR跟随、切换模式或绕过它改用其他运动接口。VR头部跟随是
+机器人全局设置，改变前需协调正在使用该功能的开发者。
 
 参考：[厂家 SDK 3.6.2 MoveH](https://www.limxdynamics.com/zh/documents/847884267345285120)。

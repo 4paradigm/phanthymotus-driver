@@ -47,6 +47,9 @@ class ArmCompletion:
     async def send(self, target, duration):
         return await self.reader.send_movej(target, duration)
 
+    def blocked_error(self):
+        return MoveError('Arms are busy or require operator verification; no additional motion sent', False)
+
     def summary(self):
         return ({key: self.active[key] for key in ('action_id', 'action', 'state')}
                 if self.active else self.last)
@@ -65,7 +68,7 @@ class ArmCompletion:
         if any(peer.closed or peer.active or getattr(peer, 'recovering', False) or getattr(peer, 'waiting', None) for peer in peers):
             raise MoveError('Gripper or other motion is active or uncertain; no additional motion sent', False)
         if self.closed or self.active:
-            raise MoveError('Arms are busy or require operator verification; no additional motion sent', False)
+            raise self.blocked_error()
         target, duration = self.validate(target, duration)
         self.feedback()
         future = asyncio.get_running_loop().create_future()
@@ -75,7 +78,7 @@ class ArmCompletion:
         job = {'action_id': self.action_prefix + uuid4().hex, 'action': action,
                'state': 'awaiting_ack', 'target': list(target), 'duration': duration,
                'details': details, 'admission': future, 'ws': self.reader.ws,
-               'serial': self.reader.serial}
+                'serial': self.reader.serial, 'motion_sent': None, 'vendor_acknowledged': False}
         self.active = job
         self.task = asyncio.create_task(self._run(job))
         return await asyncio.shield(future)
@@ -129,6 +132,8 @@ class ArmCompletion:
                 reply = {'status': 'ack_unverified', 'motion_sent': exc.motion_sent,
                          'arrival_verified': False, 'message': str(exc)}
             job['state'] = 'moving'
+            job['motion_sent'] = reply.get('motion_sent')
+            job['vendor_acknowledged'] = reply.get('status') != 'ack_unverified'
             admitted = True
             job['admission'].set_result({**reply, **job['details'], 'action': job['action'],
                 'action_id': job['action_id'], 'state': 'moving', 'joint_count': self.joint_count,
@@ -142,7 +147,7 @@ class ArmCompletion:
         except asyncio.CancelledError:
             result = {'arrival_verified': False, 'error': 'Driver stopping; motion may continue'}
         except (ValueError, OSError) as exc:
-            result = {'arrival_verified': False, 'error': str(exc)}
+            result = {'arrival_verified': False, 'error': str(exc), 'error_code':getattr(exc,'code',None)}
         finally:
             if self.active is not job:
                 return
@@ -150,6 +155,7 @@ class ArmCompletion:
                 job['admission'].set_exception(MoveError('Motion result unknown; driver stopping', None))
             result.update(job['details'])
             result.update(action=job['action'], joint_count=self.joint_count, completion_protocol='acp')
+            result.update(motion_sent=job['motion_sent'],vendor_acknowledged=job['vendor_acknowledged'])
             if job['action'] == 'reset':
                 # The dispatched reset target came from the validated home file.
                 # Verify it using the same multi-frame, post-duration feedback;

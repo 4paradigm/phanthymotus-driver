@@ -5,9 +5,12 @@ import math
 import re
 import time
 import uuid
+from urllib.parse import urlparse
 
 import aiohttp
 from state import joint_state, select_fields, STATUS_FIELDS
+
+HEAD_API_PORT = 8888  # Read-only vendor UI endpoint, on the same robot host.
 
 
 def reject_constant(value):
@@ -241,6 +244,36 @@ class RobotReader:
             elif not future.cancelled():
                 future.exception()  # retrieve a disconnect exception even if send failed
 
+    async def head_control_status(self):
+        """Do not compete with VR tracking; never toggle a robot setting here."""
+        host = urlparse(self.settings['url']).hostname
+        if not host:
+            raise MoveError('无法核对厂家头部控制状态，未发送转动指令',False,'head_control_status_unavailable')
+        host = '['+host+']' if ':' in host else host
+        url = 'http://'+host+':'+str(HEAD_API_PORT)+'/get_robot_info'
+        try:
+            async with aiohttp.ClientSession(trust_env=False,timeout=aiohttp.ClientTimeout(total=3)) as session:
+                async with session.get(url,allow_redirects=False) as response:
+                    if response.status != 200:
+                        raise ValueError('Unexpected vendor status HTTP response')
+                    raw = bytearray()
+                    async for chunk in response.content.iter_chunked(16384):
+                        raw.extend(chunk)
+                        if len(raw)>128*1024:
+                            raise ValueError('Vendor status response too large')
+                    body = json.loads(raw,parse_constant=reject_constant)
+            data = body.get('data',body)
+            if not isinstance(data,dict) or data.get('enable_vr_follow_head_valid') is not True or \
+                    type(data.get('enable_vr_follow_head')) is not bool:
+                raise ValueError('Head follow-state validity missing')
+        except (ValueError,TypeError,AttributeError,OSError,aiohttp.ClientError,asyncio.TimeoutError) as exc:
+            raise MoveError('无法获得有效的厂家头部跟随状态，未发送转动指令',False,'head_control_status_unavailable') from exc
+        if data['enable_vr_follow_head']:
+            raise MoveError('机器人VR头部跟随已开启；请明确关闭厂家头部跟随后再使用手动转动卡片。驱动不会自动切换，未发送转动指令',False,'head_vr_follow_enabled')
+        if data.get('working_mode') != 'developer_mode' or data.get('working_mode_valid') is not True:
+            raise MoveError('厂家当前不是有效的上层开发模式，未发送头部转动指令',False,'vendor_not_ready')
+        return {'vr_head_follow':False,'source':'fresh_vendor_get_robot_info'}
+
     async def send_moveh(self, q, move_time):
         """Only a two-axis MoveH; one send and exact identity/GUID/title ACK."""
         q, move_time = validate_moveh(q, move_time)
@@ -252,6 +285,12 @@ class RobotReader:
         if self.head_pending or self.move_pending:
             raise MoveError('Another arm/head acknowledgement is pending; no head motion sent', False)
         ws, serial = self.ws, self.serial
+        control = await self.head_control_status()
+        if self.ws is not ws or self.serial != serial or not self.connected or ws.closed:
+            raise MoveError('核对头部模式期间机器人连接改变，未发送转动指令',False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready'] or self.head_pending or self.move_pending:
+            raise MoveError('核对头部模式期间运动状态改变，未发送转动指令',False)
         guid = str(uuid.uuid4()); future = asyncio.get_running_loop().create_future()
         self.head_pending = (guid, future)
         sent = False
@@ -268,7 +307,7 @@ class RobotReader:
                 raise MoveError('Head connection changed; result unknown', True)
             if not isinstance(reply, dict) or reply.get('result') != 'success':
                 raise MoveError('Vendor rejected MoveH; no arrival confirmed', True, 'vendor_rejected')
-            return {'status':'accepted','motion_sent':True,'arrival_verified':False}
+            return {'status':'accepted','motion_sent':True,'arrival_verified':False,'head_control':control}
         finally:
             self.head_pending = None
             if not future.done():

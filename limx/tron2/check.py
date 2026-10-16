@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.7.0'
+VERSION = '0.7.1'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -136,7 +136,7 @@ def run_check(timeout=20, camera=False):
     head_tool = next((tool for tool in tools if tool['name'] == 'move_head'), None)
     if head_tool:
         schema = head_tool['inputSchema']; props = schema['properties']
-        if props['action']['enum'] != ['move'] or schema.get('x-completion') != {'actions':['move'],'timeout':120} or \
+        if 'action' in props or schema.get('x-completion') != {'timeout':120} or \
                 schema.get('x-resource') != ['head','arm_l','arm_r'] or \
                 (props['pitch_deg'].get('minimum'),props['pitch_deg'].get('maximum')) != (-45,60) or \
                 (props['yaw_deg'].get('minimum'),props['yaw_deg'].get('maximum')) != (-90,90):
