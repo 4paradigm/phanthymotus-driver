@@ -1704,6 +1704,22 @@ class TestLocoServoContracts(unittest.TestCase):
         node.callback(self._message(seq=2))
         self.assertEqual([(0.1, 0.0, 0.1)], proxy.moves)
 
+    def test_dry_run_logs_first_and_every_hundredth_command_only(self):
+        import io
+        from contextlib import redirect_stdout
+
+        card, _proxy, _executor = self._card()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            for _ in range(201):
+                card._apply((0.1, 0.0, 0.0, 0.0, 0.0, 0.1))
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(3, len(lines))
+        self.assertIn("#1", lines[0])
+        self.assertIn("#100", lines[1])
+        self.assertIn("#200", lines[2])
+
     def test_rejects_stale_observation_and_unsupported_axes(self):
         card, proxy, _executor = self._card(dry_run=False)
         node = self._start(card)

@@ -292,8 +292,10 @@ class LocoServoPlugin:
             vx, vy, vyaw = float(values[0]), float(values[1]), float(values[5])
             self._applied += 1
             if self._dry_run:
-                print(f"[loco_servo] DRY RUN Move(vx={vx:+.3f}, vy={vy:+.3f}, "
-                      f"vyaw={vyaw:+.3f})", flush=True)
+                if self._applied == 1 or self._applied % 100 == 0:
+                    print(f"[loco_servo] DRY RUN Move #{self._applied} "
+                          f"(vx={vx:+.3f}, vy={vy:+.3f}, "
+                          f"vyaw={vyaw:+.3f})", flush=True)
                 return
             try:
                 ret = self._proxy.Move(vx, vy, vyaw)
