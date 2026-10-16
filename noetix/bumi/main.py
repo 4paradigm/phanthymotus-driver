@@ -121,6 +121,12 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
 
+        if plugins_cfg.get("demo_echo", {}).get("enabled", False):
+            from demo_echo import DemoEchoPlugin
+            demo_plugin = DemoEchoPlugin(plugins_cfg["demo_echo"], namespace, executor)
+            self._plugins.append(demo_plugin)
+            print("[bundle] DemoEchoPlugin loaded")
+
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
             state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
