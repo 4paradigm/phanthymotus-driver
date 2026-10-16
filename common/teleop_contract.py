@@ -84,9 +84,8 @@ def _wire(value):
         raise ValueError("message_too_large")
 
 
-def _identity(value, *, instance_id, clock_id):
-    if canonical_instance(value.get("instance_id")) != canonical_instance(instance_id):
-        raise ValueError("input_binding_mismatch")
+def _identity(value, *, clock_id):
+    _text(value.get("instance_id"), "instance_id")
     _text(value.get("device_id"), "device_id")
     if value.get("clock_id") != clock_id:
         raise ValueError("input_clock_mismatch")
@@ -163,11 +162,14 @@ def validate_controls(value):
     return value
 
 
-def validate_input(value, *, instance_id, clock_id, now_ns, max_age_ns=MAX_INPUT_AGE_NS):
+def validate_input(value, *, clock_id, now_ns, instance_id=None, max_age_ns=MAX_INPUT_AGE_NS):
     _wire(value)
     if value.get("schema") != COMMAND_SCHEMA or value.get("kind") != "input":
         raise ValueError("invalid_input_schema")
-    _identity(value, instance_id=instance_id, clock_id=clock_id)
+    # G1 binds the source from admitted input; already-bound callers still match it.
+    if instance_id is not None and canonical_instance(value.get("instance_id")) != canonical_instance(instance_id):
+        raise ValueError("input_binding_mismatch")
+    _identity(value, clock_id=clock_id)
     _integer(value.get("source_monotonic_ns"), "source_monotonic_ns")
     _fresh(value["received_monotonic_ns"], now_ns, max_age_ns)
     if value.get("tracking_frame") != TRACKING_FRAME:
@@ -194,7 +196,9 @@ def validate_operation(value, *, instance_id, clock_id, now_ns,
     _wire(value)
     if value.get("schema") != COMMAND_SCHEMA or value.get("kind") != "operation":
         raise ValueError("invalid_operation_schema")
-    _identity(value, instance_id=instance_id, clock_id=clock_id)
+    if canonical_instance(value.get("instance_id")) != canonical_instance(instance_id):
+        raise ValueError("input_binding_mismatch")
+    _identity(value, clock_id=clock_id)
     _text(value.get("request_id"), "request_id", maximum=128)
     if value.get("action") not in ACTIONS:
         raise ValueError("unsupported_operation")

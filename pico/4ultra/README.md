@@ -2,6 +2,8 @@
 
 独立设备卡 `teleop_device`，通过标准DDS输入连接机器人 `teleop_control`。Agent Core与ActuCore无需改代码、增加专用代理或启用旧teleop插件；机器人URDF、IK和执行均由机器人Driver承担，消息格式见 [输入契约](#输入契约)。
 
+G1 流程依赖 [PR #330](https://github.com/4paradigm/phanthymotus-driver/pull/330) 的 `teleop_control`。先合入配套消费者，再合入本设备 Driver；只安装 PICO Driver 不能执行 G1 遥操。两端使用同一份共享契约源码，合入前运行双向联合测试。
+
 ## 用户流程
 
 1. 用普通部署入口部署PICO与机器人Driver，添加两张卡并连接 `teleop_device → teleop_control`。
@@ -67,6 +69,8 @@ Canvas 连接 `teleop_device` 输出到机器人 `teleop_control` 输入。设�
 输入 Driver 不做滤波，设备采集到的有效帧直接转换坐标并输出。动作平滑与执行属于机器人控制端。
 
 未跟踪对象的位姿为 null。消费者校验格式、有限值、身份、代次、序号和时效；默认输入年龄上限为 300 ms。转发、心跳和滤波不得把旧采样时间刷新为当前时间。完整字段验证见 `common/teleop_contract.py` 的 `validate_input`。
+
+`validate_input` 兼容两端既有调用：传入 `instance_id` 时检查来源匹配；G1 未绑定来源时可省略该参数，从有效消息取得来源，再由控制器检查代次、序号及来源切换。操作和反馈仍要求匹配指定实例。
 
 ### 生命周期与显示
 
@@ -144,7 +148,7 @@ PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs CHROME_BINARY=/path/to/chrome no
 
 普通Core兼容性可用 `tests/verify_pico_core_upstream.py <只读源码导出目录> --core-sha <SHA> --evidence <JSON>` 重跑，需要Core的Python依赖、`PLAYWRIGHT_MODULE`和`CHROME_BINARY`指向已有浏览器测试环境。该脚本只创建临时SQLite与loopback服务，使用真实Core模块和Driver MCP；DDS使用sink，不能替代真实通信测试。
 
-当前输出固定为 `/teleop/command`，JSON 仍携带设备、实例、空间/连接代次和序号。当前单机器人单设备源；没有反向反馈订阅。`/teleop/state` 是机器人控制卡的监控输出，不接回本卡。PICO只显示配对连接与握把提示，不显示机器人动作结果，不提供开始/结束/停止按钮。
+当前输出固定为 `/teleop/command`，JSON 仍携带设备、实例、空间/连接代次和序号。当前单机器人单设备源；PICO 只读订阅机器人控制卡已有的 `/teleop/state`，显示骨架与控制状态，不增加反向 Canvas 连线，也不提供开始/结束/停止按钮。
 
 
 ## 局域网发现
@@ -154,3 +158,5 @@ App 使用 Android NsdManager 发现 `_motus-teleop._tcp` DNS-SD/mDNS 服务，�
 App 图标使用 PhanthyMotus [官方 Logo](https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/embodied_logo.svg)，按 Android 图标密度导出。
 
 真实反馈链路测试须在无外网、无机器人设备的 ROS 容器中运行：加载 ROS Humble 与本目录 `dds-local.xml`，执行 `PYTHONPATH=.:tests python3 -m pytest tests/test_pico_feedback_dds.py`。该项覆盖真实 DDS、TLS WSS、启停失效；不等同于头显显示或机器人动作验收。
+
+同一测试文件中的双向联合用例需要源码同时包含 PICO 和配套 G1。它使用真实 `DeviceRuntime`、`RosTransport`、`TeleopBus`、`TeleopControl` 和 `RobotFeedback`，仅替换硬件执行器；覆盖首帧前不发布、反馈身份匹配、过期输入拒绝和来源切换。缺少 G1 源码时该用例会跳过，不能将跳过结果作为联合验收通过。

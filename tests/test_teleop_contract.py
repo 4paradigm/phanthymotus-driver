@@ -81,6 +81,18 @@ def test_input_rejects_wrong_identity_clock_or_stale_data(key, value):
     with pytest.raises(ValueError): validate_input(frame, **OPTIONS)
 
 
+def test_input_can_bind_source_from_message_without_changing_explicit_binding():
+    frame = input_frame()
+    options = dict(clock_id=OPTIONS["clock_id"], now_ns=NOW)
+    assert validate_input(frame, **options) == frame
+    for change in ({"instance_id": ""}, {"instance_id": None},
+                   {"clock_id": "other-boot"}, {"received_monotonic_ns": NOW-300_000_001}):
+        with pytest.raises(ValueError):
+            validate_input(dict(frame, **change), **options)
+    with pytest.raises(ValueError, match="input_binding_mismatch"):
+        validate_input(frame, instance_id="another_card", **options)
+
+
 @pytest.mark.parametrize("key,value", [("grip", float("nan")), ("trigger", 1.1),
     ("position", [0, 1, float("inf")]), ("orientation_xyzw", [0, 0, 0, 0]),
     ("tracked", "true")])
