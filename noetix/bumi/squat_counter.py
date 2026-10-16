@@ -26,7 +26,9 @@ class SquatCounterPlugin:
         self._input_topic = ""
         self._last_warn = 0.0
         self._counter = SquatCounter(
-            min_interval_s=cfg.get("min_interval_s", 0.8),
+            height_drop_px=cfg.get("height_drop_px", 60.0),
+            height_rise_px=cfg.get("height_rise_px", 40.0),
+            hold_s=cfg.get("hold_s", 0.15),
             lost_s=cfg.get("lost_s", 4.0),
             min_confidence=cfg.get("min_confidence", 0.3),
         )

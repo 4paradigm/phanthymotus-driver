@@ -148,6 +148,8 @@ plugins:
     enabled: true
   squat_counter:
     enabled: true
-    min_interval_s: 0.8
+    height_drop_px: 60.0
+    height_rise_px: 40.0
+    hold_s: 0.15
     lost_s: 4.0
     min_confidence: 0.3

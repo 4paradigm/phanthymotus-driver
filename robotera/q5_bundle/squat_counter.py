@@ -29,7 +29,9 @@ class Plugin:
         self._namespace = namespace
         self._output_topic = f"/{namespace}/squat/count"
         self._counter = SquatCounter(
-            min_interval_s=plugin_config.get("min_interval_s", 0.8),
+            height_drop_px=plugin_config.get("height_drop_px", 60.0),
+            height_rise_px=plugin_config.get("height_rise_px", 40.0),
+            hold_s=plugin_config.get("hold_s", 0.15),
             lost_s=plugin_config.get("lost_s", 4.0),
             min_confidence=plugin_config.get("min_confidence", 0.3),
         )
