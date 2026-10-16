@@ -1,5 +1,6 @@
 """Closed-loop relative pose movement through a direct, no-reply SDK client."""
 import math
+from collections import deque
 import threading
 import time
 from uuid import uuid4
@@ -8,6 +9,39 @@ try:
     from .relative_feedback import RelativeController, MotionSafety, SafetyViolation
 except ImportError:
     from relative_feedback import RelativeController, MotionSafety, SafetyViolation
+
+
+class MotionTrace:
+    """Bounded per-task diagnostics; never emit a continuous stdout stream."""
+    def __init__(self, initial, target, settings):
+        self.started = time.monotonic()
+        self.wall_time = time.time()
+        self.records = deque(maxlen=400)
+        self.total = 0
+        self.initial, self.target, self.settings = dict(initial), dict(target), settings
+
+    def add(self, event, **fields):
+        now = time.monotonic()
+        record = dict(event=event, elapsed_s=now - self.started, **fields)
+        self.records.append(record)
+        self.total += 1
+        return record
+
+    def export(self):
+        def clean(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {key: clean(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple, deque)):
+                return [clean(item) for item in value]
+            return value
+        return clean(dict(version=1, started_unix_s=self.wall_time,
+                          started_monotonic_s=self.started,
+                          time_basis='local_callback_receive; source_capture_time_unavailable',
+                          initial=self.initial, requested_target=self.target, settings=self.settings,
+                          record_count=self.total, dropped_records=max(0, self.total - len(self.records)),
+                          records=self.records))
 
 
 class LocoRelativeMovePlugin:
@@ -248,11 +282,18 @@ class LocoRelativeMovePlugin:
         return result
 
     def _send_stop(self):
+        trace = self.active.get('trace') if self.active else None
+        record = trace.add('stop_send', command=[0., 0., 0.]) if trace else None
+        started = time.monotonic()
         try:
             ret = self.loco.command(0., 0., 0.)
+            if record is not None:
+                record.update(send_ret=ret, send_elapsed_s=time.monotonic() - started)
             return {"ret": ret, "state": "stop_pending" if ret == 0 else "stop_failed",
                     "stop_acknowledged": False, "error": None if ret == 0 else f"Stop send failed: {ret}"}
         except Exception as exc:
+            if record is not None:
+                record.update(send_error=str(exc), send_elapsed_s=time.monotonic() - started)
             return {"ret": None, "state": "stop_failed", "error": str(exc), "stop_acknowledged": False}
 
     def _confirm_stop(self):
@@ -263,8 +304,12 @@ class LocoRelativeMovePlugin:
                     return False
             try:
                 pose = self.loco.snapshot()
-            except Exception:
+            except Exception as exc:
+                if self.active and self.active.get('trace'):
+                    self.active['trace'].add('stop_feedback_error', error=str(exc))
                 return False
+            if self.active and self.active.get('trace'):
+                self.active['trace'].add('stop_feedback', pose=dict(pose), stable_since_monotonic_s=stable)
             if pose['speed'] <= .03 and pose['angular_speed'] <= .03:
                 if stable is None:
                     stable = time.monotonic()
@@ -279,6 +324,14 @@ class LocoRelativeMovePlugin:
         status, result = "error", {}
         controller = RelativeController(job['initial'], target, self.speed, self.yaw_speed,
                                         time.monotonic(), min_speed=self.min_speed, min_yaw_speed=self.min_yaw_speed)
+        trace = MotionTrace(job['initial'], target, dict(
+            translation_speed=self.speed, rotation_speed=self.yaw_speed,
+            min_translation_speed=self.min_speed, min_rotation_speed=self.min_yaw_speed,
+            safety=dict(job['safety'].config), deadline_monotonic_s=job['deadline'],
+            command_duration_s=getattr(self.loco, 'COMMAND_DURATION', None)))
+        job['trace'] = trace
+        trace.add('start', absolute_target=dict(x=controller.x, y=controller.y, yaw=controller.yaw))
+        tick, previous_tick = None, None
         last_velocity = (0., 0., 0.)
         try:
             while True:
@@ -286,9 +339,23 @@ class LocoRelativeMovePlugin:
                     if job['cancel'].is_set():
                         break
                     now = time.monotonic()
+                    tick = trace.add('control', phase=controller.phase,
+                                     loop_interval_s=None if previous_tick is None else now - previous_tick,
+                                     previous_command=list(last_velocity))
+                    previous_tick = now
                     if now >= job['deadline']:
                         raise TimeoutError('Relative movement deadline expired')
+                    snapshot_started = time.monotonic()
                     pose = self.loco.snapshot()
+                    observed = time.monotonic()
+                    tick.update(pose=dict(pose), snapshot_elapsed_s=observed - snapshot_started,
+                                imu_age_s=observed - pose['imu_stamp'], odom_age_s=observed - pose['odom_stamp'],
+                                feedback_skew_s=pose['imu_stamp'] - pose['odom_stamp'])
+                    if all(math.isfinite(pose.get(key, float('nan'))) for key in ('x', 'y', 'yaw')):
+                        controller.update_error(pose)
+                        tick['error'] = dict(controller.error)
+                        result['error_sample'] = dict(basis='latest_control_feedback_not_final_pose',
+                            imu_receive_monotonic_s=pose['imu_stamp'], odom_receive_monotonic_s=pose['odom_stamp'])
                     try:
                         job['safety'].check(pose, time.monotonic())
                     except SafetyViolation as exc:
@@ -301,7 +368,14 @@ class LocoRelativeMovePlugin:
                             }
                         raise
                     velocity, done = controller.step(pose, now)
-                    ret = self.loco.command(*velocity)
+                    tick.update(command=list(velocity), phase_after_step=controller.phase,
+                                error=dict(controller.error), done=done)
+                    send_started = time.monotonic()
+                    try:
+                        ret = self.loco.command(*velocity)
+                        tick['send_ret'] = ret
+                    finally:
+                        tick['send_elapsed_s'] = time.monotonic() - send_started
                     last_velocity = velocity
                     if ret != 0:
                         raise RuntimeError(f'Velocity send failed: {ret}')
@@ -312,6 +386,9 @@ class LocoRelativeMovePlugin:
             if job['cancel'].is_set():
                 status = 'cancelled'
         except Exception as exc:
+            trace.add('exception', error=str(exc), exception_type=type(exc).__name__)
+            if tick is not None:
+                tick['exception'] = str(exc)
             result['error'] = str(exc)
             job['cancel'].set()
             if isinstance(exc, SafetyViolation):
@@ -329,6 +406,8 @@ class LocoRelativeMovePlugin:
                 stopped = True  # Controller already observed stable zero-speed feedback.
             result.update(controller.error)
             result['stop_confirmed_by_feedback'] = stopped
+            trace.add('terminal', status=status, stop_confirmed_by_feedback=stopped, error=result.get('error'))
+            result['motion_trace'] = trace.export()
             result['target'] = dict(x=controller.x, y=controller.y, yaw=controller.yaw)
             with self.command_lock:
                 self.faulted = not stopped or 'safety_reason' in result

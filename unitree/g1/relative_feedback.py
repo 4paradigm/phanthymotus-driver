@@ -130,7 +130,7 @@ class PoseFeedback:
             yaw = float(data['imu']['rpy'][2])
             if not all(math.isfinite(v) for v in (x, y, vx, vy, yaw)):
                 raise ValueError('Nonfinite odometry')
-            value = dict(x=x, y=y, speed=math.hypot(vx, vy), odom_yaw=yaw, odom_stamp=self.clock())
+            value = dict(x=x, y=y, vx=vx, vy=vy, speed=math.hypot(vx, vy), odom_yaw=yaw, odom_stamp=self.clock())
         except (ValueError, TypeError, KeyError, IndexError):
             value = None
         with self.lock:
@@ -153,6 +153,8 @@ class PoseFeedback:
             self.unwrapped += wrap(yaw - self.last_yaw) if self.last_yaw is not None else yaw
             self.last_yaw = yaw
             self.imu = dict(yaw=self.unwrapped, raw_yaw=yaw, yaw_rate=rate, roll=roll, pitch=pitch,
+                            gyroscope=[gx, gy, rate], quaternion=data.get('quaternion'),
+                            accelerometer=data.get('accelerometer'), temperature=data.get('temperature'),
                             angular_speed=math.sqrt(gx*gx + gy*gy + rate*rate), imu_stamp=now,
                             imu_generation=self.imu_generation)
 

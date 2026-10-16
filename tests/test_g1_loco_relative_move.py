@@ -9,7 +9,7 @@ from unittest.mock import patch
 import math
 import threading
 import unittest
-from unitree.g1.loco_relative_move import LocoRelativeMovePlugin, PointBackend
+from unitree.g1.loco_relative_move import LocoRelativeMovePlugin, PointBackend, MotionTrace
 from unitree.g1.relative_feedback import PoseFeedback, RelativeController, MotionSafety, SafetyViolation, wrap
 
 class TestBundleShutdown(unittest.TestCase):
@@ -315,6 +315,44 @@ class TestClosedLoopCard(unittest.TestCase):
             done.set()
         return LocoRelativeMovePlugin({}, backend, notify), backend, notifications, done
 
+    def test_trace_is_bounded_serializable_and_marks_missing_source_time(self):
+        trace = MotionTrace(pose(), {'yaw': 1.}, {})
+        for i in range(450):
+            trace.add('control', sequence=i, invalid=float('nan'))
+        result = trace.export()
+        self.assertEqual(result['record_count'], 450)
+        self.assertEqual(result['dropped_records'], 50)
+        self.assertEqual(len(result['records']), 400)
+        self.assertEqual(result['records'][0]['sequence'], 50)
+        self.assertIsNone(result['records'][0]['invalid'])
+        self.assertIn('source_capture_time_unavailable', result['time_basis'])
+        json.dumps(result, allow_nan=False)
+
+    def test_no_progress_trace_contains_current_feedback_and_stop_attempts(self):
+        card, backend, notices, done = self.card()
+        def fail_step(controller, sample, now):
+            controller.update_error(sample)
+            raise RuntimeError('No progress in rotate phase')
+        with patch.object(RelativeController, 'step', fail_step):
+            card.dispatch('move', dict(angle=60))
+            self.assertTrue(done.wait(3))
+        args, _ = notices[0]
+        self.assertEqual(args[1], 'error')
+        result = args[2]
+        trace = result['motion_trace']
+        events = [r['event'] for r in trace['records']]
+        for event in ('start', 'control', 'exception', 'stop_send', 'stop_feedback', 'terminal'):
+            self.assertIn(event, events)
+        control = next(r for r in trace['records'] if r['event'] == 'control')
+        self.assertIn('imu_age_s', control)
+        self.assertIn('pose', control)
+        self.assertIn('error', control)
+        self.assertIn('exception', control)
+        self.assertNotIn('command', control)  # Failure occurred before any velocity send.
+        self.assertAlmostEqual(result['angle_error_deg'], 60.)
+        self.assertEqual(trace['records'][-1]['status'], 'error')
+        json.dumps(result, allow_nan=False)
+
     def test_heading_jump_callback_reports_trigger_error_and_last_command(self):
         card, backend, notices, done = self.card()
         original_command = backend.command
@@ -333,6 +371,11 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertEqual(result['safety_reason'], 'attitude_jump')
         self.assertAlmostEqual(result['angle_error_deg'], 180 - math.degrees(1.))
         self.assertEqual(result['error_sample']['basis'], 'safety_trigger_feedback_not_final_pose')
+        control = [r for r in result['motion_trace']['records'] if r['event'] == 'control']
+        self.assertEqual(control[0]['command'], [0., 0., .5])
+        self.assertEqual(control[0]['send_ret'], 0)
+        self.assertIn('send_elapsed_s', control[0])
+        self.assertIn('exception', control[-1])
         jump = result['imu_jump']
         self.assertAlmostEqual(jump['actual_change_deg'], math.degrees(1.))
         self.assertGreater(jump['actual_change_deg'], jump['allowed_change_deg'])
