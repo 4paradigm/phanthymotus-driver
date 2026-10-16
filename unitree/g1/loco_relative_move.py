@@ -279,6 +279,7 @@ class LocoRelativeMovePlugin:
         status, result = "error", {}
         controller = RelativeController(job['initial'], target, self.speed, self.yaw_speed,
                                         time.monotonic(), min_speed=self.min_speed, min_yaw_speed=self.min_yaw_speed)
+        last_velocity = (0., 0., 0.)
         try:
             while True:
                 with self.command_lock:
@@ -288,9 +289,20 @@ class LocoRelativeMovePlugin:
                     if now >= job['deadline']:
                         raise TimeoutError('Relative movement deadline expired')
                     pose = self.loco.snapshot()
-                    job['safety'].check(pose, time.monotonic())
+                    try:
+                        job['safety'].check(pose, time.monotonic())
+                    except SafetyViolation as exc:
+                        if exc.reason == 'attitude_jump':
+                            controller.update_error(pose)
+                            result['error_sample'] = {
+                                'basis': 'safety_trigger_feedback_not_final_pose',
+                                'imu_receive_monotonic_s': pose['imu_stamp'],
+                                'odom_receive_monotonic_s': pose['odom_stamp'],
+                            }
+                        raise
                     velocity, done = controller.step(pose, now)
                     ret = self.loco.command(*velocity)
+                    last_velocity = velocity
                     if ret != 0:
                         raise RuntimeError(f'Velocity send failed: {ret}')
                     if done:
@@ -304,6 +316,9 @@ class LocoRelativeMovePlugin:
             job['cancel'].set()
             if isinstance(exc, SafetyViolation):
                 result['safety_reason'] = exc.reason
+                result.update(exc.details)
+                if 'imu_jump' in result:
+                    result['imu_jump']['commanded_vyaw_rad_s'] = last_velocity[2]
         finally:
             if status != 'completed':
                 stopped = self._confirm_stop()

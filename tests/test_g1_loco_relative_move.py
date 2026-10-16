@@ -315,6 +315,31 @@ class TestClosedLoopCard(unittest.TestCase):
             done.set()
         return LocoRelativeMovePlugin({}, backend, notify), backend, notifications, done
 
+    def test_heading_jump_callback_reports_trigger_error_and_last_command(self):
+        card, backend, notices, done = self.card()
+        original_command = backend.command
+        def command(*velocity):
+            ret = original_command(*velocity)
+            if any(velocity):
+                backend.position.update(yaw=1., raw_yaw=1., yaw_rate=.4)
+            return ret
+        backend.command = command
+        with patch.object(card, '_confirm_stop', return_value=True):
+            card.dispatch('move', dict(angle=180))
+            self.assertTrue(done.wait(2))
+        args, _ = notices[0]
+        self.assertEqual(args[1], 'error')
+        result = args[2]
+        self.assertEqual(result['safety_reason'], 'attitude_jump')
+        self.assertAlmostEqual(result['angle_error_deg'], 180 - math.degrees(1.))
+        self.assertEqual(result['error_sample']['basis'], 'safety_trigger_feedback_not_final_pose')
+        jump = result['imu_jump']
+        self.assertAlmostEqual(jump['actual_change_deg'], math.degrees(1.))
+        self.assertGreater(jump['actual_change_deg'], jump['allowed_change_deg'])
+        self.assertEqual(jump['commanded_vyaw_rad_s'], .5)
+        self.assertEqual(jump['gyro_z_rad_s'], .4)
+        json.dumps(result, allow_nan=False)
+
     def test_validation_schema_and_relative_target_without_calibration(self):
         card, _, _, _ = self.card()
         for axis in ('x', 'y'):
@@ -549,6 +574,30 @@ class TestLocalMotionSafety(unittest.TestCase):
                 with self.assertRaises(SafetyViolation) as caught:
                     safety.check({**pose(now=.2), **extra}, .2)
                 self.assertEqual(caught.exception.reason, reason)
+
+    def test_raw_yaw_wrap_is_continuous_and_jump_details_use_receive_interval(self):
+        now = [1.]
+        feedback = PoseFeedback(clock=lambda: now[0])
+        def update(yaw):
+            feedback.update_odom(dict(position=[0, 0], velocity=[0, 0], imu=dict(rpy=[0, 0, 0])))
+            feedback.update_imu(dict(rpy=[0, 0, yaw], gyroscope=[0, 0, .5]))
+            return feedback.snapshot()
+        safety = MotionSafety(.3, .5)
+        safety.check(update(3.13), now[0])
+        now[0] += .05
+        sample = update(-3.13)
+        self.assertEqual(sample['raw_yaw'], -3.13)
+        self.assertGreater(sample['yaw'], math.pi)
+        safety.check(sample, now[0])
+        now[0] += .05
+        with self.assertRaises(SafetyViolation) as caught:
+            safety.check(update(-2.5), now[0])
+        detail = caught.exception.details['imu_jump']
+        self.assertAlmostEqual(detail['sample_interval_s'], .05)
+        self.assertAlmostEqual(detail['actual_change_deg'], math.degrees(.63))
+        self.assertAlmostEqual(detail['allowed_change_deg'], 10 + math.degrees(.95 * .05))
+        self.assertAlmostEqual(detail['previous_raw_yaw_deg'], math.degrees(-3.13))
+        self.assertEqual(detail['time_basis'], 'local_callback_receive')
 
     def test_normal_motion_and_yaw_boundary_do_not_trigger(self):
         safety = MotionSafety(.3, .5)

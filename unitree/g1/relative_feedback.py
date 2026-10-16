@@ -10,9 +10,10 @@ def wrap(angle):
 
 
 class SafetyViolation(RuntimeError):
-    def __init__(self, reason, message):
+    def __init__(self, reason, message, details=None):
         super().__init__(message)
         self.reason = reason
+        self.details = details or {}
 
 
 class MotionSafety:
@@ -37,8 +38,8 @@ class MotionSafety:
         self.last_stamp = {}
         self.violation = None
 
-    def _fail(self, reason, message):
-        self.violation = SafetyViolation(reason, message)
+    def _fail(self, reason, message, details=None):
+        self.violation = SafetyViolation(reason, message, details)
         raise self.violation
 
     def _sustained(self, name, exceeded, stamp, duration):
@@ -79,7 +80,21 @@ class MotionSafety:
             if math.hypot(pose['x'] - previous['x'], pose['y'] - previous['y']) > self.speed_limit * dt + c['position_jump_slack_m']:
                 self._fail('position_jump', 'Odometry position changed beyond the sample-time limit')
             if abs(pose['yaw'] - previous['yaw']) > self.angular_limit * da + math.radians(c['angle_jump_slack_deg']):
-                self._fail('attitude_jump', 'IMU heading changed beyond the sample-time limit')
+                self._fail('attitude_jump', 'IMU heading changed beyond the sample-time limit', {
+                    'imu_jump': {
+                        'previous_raw_yaw_deg': math.degrees(previous['raw_yaw']) if 'raw_yaw' in previous else None,
+                        'current_raw_yaw_deg': math.degrees(pose['raw_yaw']) if 'raw_yaw' in pose else None,
+                        'previous_unwrapped_yaw_deg': math.degrees(previous['yaw']),
+                        'current_unwrapped_yaw_deg': math.degrees(pose['yaw']),
+                        'previous_receive_monotonic_s': previous['imu_stamp'],
+                        'current_receive_monotonic_s': pose['imu_stamp'],
+                        'sample_interval_s': da,
+                        'actual_change_deg': math.degrees(abs(pose['yaw'] - previous['yaw'])),
+                        'allowed_change_deg': math.degrees(self.angular_limit * da) + c['angle_jump_slack_deg'],
+                        'gyro_z_rad_s': pose['yaw_rate'],
+                        'angular_speed_rad_s': pose['angular_speed'],
+                        'time_basis': 'local_callback_receive',
+                    }})
             if max(abs(pose['roll'] - previous['roll']), abs(pose['pitch'] - previous['pitch'])) > self.angular_limit * da + math.radians(c['angle_jump_slack_deg']):
                 self._fail('attitude_jump', 'IMU roll/pitch changed beyond the sample-time limit')
         self.previous = dict(pose)
@@ -137,7 +152,7 @@ class PoseFeedback:
                 self._reset_imu()
             self.unwrapped += wrap(yaw - self.last_yaw) if self.last_yaw is not None else yaw
             self.last_yaw = yaw
-            self.imu = dict(yaw=self.unwrapped, yaw_rate=rate, roll=roll, pitch=pitch,
+            self.imu = dict(yaw=self.unwrapped, raw_yaw=yaw, yaw_rate=rate, roll=roll, pitch=pitch,
                             angular_speed=math.sqrt(gx*gx + gy*gy + rate*rate), imu_stamp=now,
                             imu_generation=self.imu_generation)
 
@@ -184,7 +199,8 @@ class RelativeController:
         self.progress_time = now
         self.error = {}
 
-    def step(self, pose, now):
+    def update_error(self, pose):
+        """Observe errors without advancing phases or generating commands."""
         ex, ey = self.x - pose['x'], self.y - pose['y']
         heading_target = self.yaw if self.final_turn_started else self.initial['yaw']
         ea = wrap(heading_target - pose['yaw'])
@@ -198,6 +214,10 @@ class RelativeController:
         self.error = dict(position_error_m=distance,
                           angle_error_deg=math.degrees(wrap(self.yaw - pose['yaw'])),
                           heading_error_deg=math.degrees(ea), phase=self.phase)
+        return ex, ey, ea, distance
+
+    def step(self, pose, now):
+        ex, ey, ea, distance = self.update_error(pose)
         if self.phase == 'brake':
             if self._settled(pose, now):
                 self._transition('rotate', now)
