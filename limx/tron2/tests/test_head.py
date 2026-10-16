@@ -1,0 +1,235 @@
+"""Head limits, exclusive ownership, and real loopback MoveH/ACP; no hardware."""
+import asyncio
+import json
+import math
+import time
+import types
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import aiohttp
+from aiohttp import web
+from test_sensors import settings, info, joints
+from head import HeadCompletion, arguments, tool
+from device import Adapter
+from skeleton import JOINT_NAMES
+from state import joint_state
+from vendor import MoveError, RobotReader, validate_moveh
+
+
+class HeadValidationTests(unittest.TestCase):
+    def test_manual_degrees_convert_to_only_two_radians(self):
+        for pitch,yaw in ((-45,-90),(60,90),(0,0),(12,-20)):
+            target,duration=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
+            self.assertEqual(target,[math.radians(pitch),math.radians(yaw)])
+            self.assertEqual(duration,5)
+        props=tool({})['inputSchema']
+        self.assertEqual(props['properties']['pitch_deg']['maximum'],60)
+        self.assertEqual(props['properties']['yaw_deg']['minimum'],-90)
+        self.assertEqual(props['required'],['action','pitch_deg','yaw_deg'])
+        self.assertEqual(props['x-completion']['actions'],['move'])
+
+    def test_missing_bad_and_out_of_range_values_never_validate(self):
+        for key in ('pitch_deg','yaw_deg'):
+            for value in (None,True,'1',float('nan'),float('inf'),10**1000,-100,100):
+                with self.subTest(key=key,value=type(value).__name__),self.assertRaises(ValueError):
+                    arguments({**{'pitch_deg':0,'yaw_deg':0},key:value})
+        for args in ({'pitch_deg':0},{'yaw_deg':0},{}):
+            with self.assertRaises(ValueError):arguments(args)
+        for duration in (True,0,61,float('nan'),'5'):
+            with self.assertRaises(ValueError):arguments({'pitch_deg':0,'yaw_deg':0,'time':duration})
+        for target in ([0]*14,[0],[-math.pi/4-.001,0],[0,math.pi/2+.001]):
+            with self.assertRaises(ValueError):validate_moveh(target,5)
+
+
+class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.reader=RobotReader(settings());self.reader.accept_info(info())
+        self.reader.ws=types.SimpleNamespace(closed=False)
+        self.reader.send_moveh=AsyncMock(return_value={'status':'accepted','motion_sent':True})
+        self.reader.send_movej=AsyncMock(return_value={'status':'accepted','motion_sent':True})
+        self.report=AsyncMock(return_value=True)
+        self.owner=HeadCompletion(self.reader,self.report)
+        self.tick=100;self.feedback([0]*16)
+        self.patches=[patch('completion.ARRIVAL_GRACE',.22),patch('completion.STABILITY_SECONDS',.04)]
+        for p in self.patches:p.start()
+        self.pump_task=None
+
+    def feedback(self,q,dq=None,names=None,advance=True):
+        if advance:self.tick+=1
+        self.reader.joints=joint_state(joints(q=q,dq=[0]*16 if dq is None else dq,
+            names=[] if names is None else names,timestamp=self.tick))
+        self.reader.joints_at=time.monotonic();self.reader.joints_received=time.time()
+
+    def pump(self,q,dq=None,advance=True,names=None):
+        async def loop():
+            while True:
+                self.feedback(q,dq,names,advance);await asyncio.sleep(.015)
+        self.pump_task=asyncio.create_task(loop())
+
+    async def asyncTearDown(self):
+        if self.pump_task:
+            self.pump_task.cancel();await asyncio.gather(self.pump_task,return_exceptions=True)
+        await self.owner.close()
+        for p in reversed(self.patches):p.stop()
+
+    async def dispatch(self):
+        return await self.owner.dispatch('move',[.1,-.1],.1,{'target_pitch_deg':math.degrees(.1),'target_yaw_deg':math.degrees(-.1)})
+
+    async def test_ack_not_arrival_then_fresh_head_feedback_completes_and_releases(self):
+        accepted=await self.dispatch()
+        self.assertTrue(accepted['action_id'].startswith('tron2_head_'))
+        self.assertFalse(accepted['arrival_verified']);self.report.assert_not_called()
+        self.pump([.7]*14+[.1,-.1])  # Unrelated arm positions do not affect head arrival.
+        await self.owner.task
+        self.reader.send_moveh.assert_awaited_once_with([.1,-.1],.1)
+        self.reader.send_movej.assert_not_called()
+        self.assertEqual(self.owner.last['status'],'completed')
+        self.assertTrue(self.owner.last['head_target_verified'])
+        self.assertEqual(self.owner.last['joint_count'],2)
+        self.assertTrue(self.owner.last['callback_delivered']);self.assertIsNone(self.owner.active)
+
+    async def test_duplicate_vendor_timestamp_cannot_complete(self):
+        await self.dispatch();self.pump([0]*14+[.1,-.1],advance=False)
+        await self.owner.task
+        self.assertEqual(self.owner.last['status'],'error');self.assertIsNotNone(self.owner.active)
+
+    async def test_moving_velocity_or_wrong_target_cannot_complete(self):
+        await self.dispatch();self.pump([0]*14+[.1,-.1],dq=[0]*14+[1,0])
+        await self.owner.task
+        self.assertFalse(self.owner.last['arrival_verified'])
+
+    async def test_named_feedback_maps_head_correctly(self):
+        names=list(reversed(JOINT_NAMES))
+        self.feedback(list(reversed([0]*14+[.1,-.1])),names=names)
+        self.assertEqual(self.owner.feedback()[1],[.1,-.1])
+
+    async def test_missing_velocity_stale_feedback_and_bad_names_reject_before_send(self):
+        for change in ('missing_dq','stale','bad_names'):
+            self.feedback([0]*16)
+            if change=='missing_dq':self.reader.joints['dq']=[]
+            elif change=='stale':self.reader.joints_at-=100
+            else:self.reader.joints['names']=['j'+str(i) for i in range(16)]
+            with self.assertRaises(ValueError):await self.dispatch()
+        self.reader.send_moveh.assert_not_called()
+
+    async def test_unknown_ack_is_not_retried_or_declared_complete_by_position(self):
+        self.reader.send_moveh.side_effect=MoveError('unknown ACK',True)
+        result=await self.dispatch();self.pump([0]*14+[.1,-.1]);await self.owner.task
+        self.assertEqual(result['status'],'ack_unverified')
+        self.assertEqual(self.owner.last['status'],'error')
+        self.reader.send_moveh.assert_awaited_once();self.assertIsNotNone(self.owner.active)
+
+    async def test_vendor_rejection_does_not_latch_or_report_success(self):
+        self.reader.send_moveh.side_effect=MoveError('reject',True,'vendor_rejected')
+        with self.assertRaises(MoveError):await self.dispatch()
+        self.assertIsNone(self.owner.active);self.report.assert_not_called()
+
+    async def test_callback_failure_or_reconnect_retains_owner(self):
+        self.report.return_value=False
+        await self.dispatch();self.pump([0]*14+[.1,-.1]);await self.owner.task
+        self.assertEqual(self.owner.last['status'],'completed')
+        self.assertFalse(self.owner.last['callback_delivered']);self.assertIsNotNone(self.owner.active)
+
+    async def test_connection_replacement_cannot_confirm(self):
+        await self.dispatch();self.reader.ws=types.SimpleNamespace(closed=False)
+        self.pump([0]*14+[.1,-.1]);await self.owner.task
+        self.assertFalse(self.owner.last['arrival_verified'])
+
+    async def test_head_arm_and_grippers_are_mutually_exclusive(self):
+        adapter=Adapter(lambda *a:None,settings(enabled_cards=['joint_state','arm_control','move_head','gripper_left','gripper_right']),reader=self.reader)
+        adapter.head.report=self.report
+        await adapter.head.dispatch('move',[.1,-.1],.1,{})
+        try:
+            with self.assertRaises(MoveError):await adapter.motion.dispatch('move',[0]*14,.1,{})
+            for owner in adapter.grippers.values():
+                with self.assertRaises(MoveError):await owner.dispatch('open',{'opening_mm':20,'speed':10,'force':10})
+            self.reader.send_movej.assert_not_called()
+            await adapter.head.close()
+            adapter.head.closed=False;adapter.head.active=None
+            adapter.motion.active={'state':'moving'}
+            with self.assertRaises(MoveError):await adapter.head.dispatch('move',[.1,-.1],.1,{})
+            adapter.motion.active=None
+            for gripper in adapter.grippers.values():
+                gripper.recovering=True
+                with self.assertRaises(MoveError):await adapter.head.dispatch('move',[.1,-.1],.1,{})
+                gripper.recovering=False
+        finally:
+            await adapter.head.close()
+
+
+class HeadWireTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_mcp_websocket_and_acp_use_head_only_and_exact_correlation(self):
+        requests=[];ack_mode=['success'];stamp=[100];head_q=[0.0,0.0];completions=[]
+        async def robot(request):
+            ws=web.WebSocketResponse();await ws.prepare(request);await ws.send_json(info())
+            async for msg in ws:
+                body=json.loads(msg.data);requests.append(body)
+                if body['title']=='request_get_joint_state':
+                    stamp[0]+=1
+                    await ws.send_json({'title':'response_get_joint_state','accid':'TEST_TRON2A','guid':body['guid'],
+                        'data':joints(q=[0]*14+head_q,timestamp=stamp[0])})
+                elif body['title']=='request_moveh':
+                    ack={'title':'response_moveh','accid':'TEST_TRON2A','guid':body['guid'],'data':{'result':'success'}}
+                    await ws.send_json({**ack,'guid':'wrong'})
+                    await ws.send_json({**ack,'accid':'wrong'})
+                    await ws.send_json({**ack,'title':'response_movej'})
+                    if ack_mode[0]=='success':
+                        head_q[:]=body['data']['joint'];await ws.send_json(ack)
+                    elif ack_mode[0]=='reject':
+                        await ws.send_json({**ack,'data':{'result':'fail_motor'}})
+            return ws
+        async def complete(request):
+            payload=await request.json();completions.append(payload)
+            return web.json_response({'ok':True,'action_id':payload['action_id']})
+        app=web.Application();app.router.add_get('/robot',robot);app.router.add_post('/api/acp/complete',complete)
+        runner=web.AppRunner(app);await runner.setup()
+        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        port=site._server.sockets[0].getsockname()[1]
+        async with aiohttp.ClientSession(trust_env=False) as session:
+            reader=RobotReader(settings(url='ws://127.0.0.1:'+str(port)+'/robot',poll_interval_seconds=.01,response_timeout_seconds=.12))
+            adapter=Adapter(lambda *a:None,settings(enabled_cards=['joint_state','move_head']),reader=reader,session=session)
+            app2=web.Application();app2.router.add_post('/mcp',adapter.rpc)
+            run2=web.AppRunner(app2);await run2.setup();site2=web.TCPSite(run2,'127.0.0.1',0);await site2.start()
+            task=asyncio.create_task(reader.run(session))
+            try:
+                for _ in range(100):
+                    if reader.sample('joint_state')['available']:break
+                    await asyncio.sleep(.01)
+                self.assertFalse(any(p['title']=='request_moveh' for p in requests))
+                for action in ('info','start','stop'):
+                    self.assertFalse(adapter.call('move_head',{'action':action})['motion_sent'])
+                with patch.dict('os.environ',{'AGENT_CORE_URL':'http://127.0.0.1:'+str(port)}),patch('completion.STABILITY_SECONDS',.05):
+                    async with session.post('http://127.0.0.1:'+str(site2._server.sockets[0].getsockname()[1])+'/mcp',json={
+                        'jsonrpc':'2.0','id':7,'method':'tools/call','params':{'name':'move_head','arguments':{
+                            'action':'move','pitch_deg':10,'yaw_deg':-12,'time':.1,'_trace_id':'trace','instance_id':'card'}}}) as response:
+                        result=(await response.json())['result'];self.assertFalse(result['isError'])
+                        admitted=json.loads(result['content'][0]['text']);self.assertFalse(admitted['arrival_verified'])
+                    await asyncio.wait_for(adapter.head.task,2)
+                writes=[p for p in requests if p['title']!='request_get_joint_state']
+                self.assertEqual(len(writes),1);self.assertEqual(writes[0]['title'],'request_moveh')
+                self.assertEqual(writes[0]['data'],{'joint':[math.radians(10),math.radians(-12)],'time':.1})
+                self.assertNotIn('_trace_id',writes[0]);self.assertNotIn('instance_id',writes[0])
+                self.assertEqual(completions[0]['tool'],'move_head');self.assertEqual(completions[0]['status'],'completed')
+                self.assertEqual(completions[0]['action_id'],admitted['action_id'])
+                self.assertTrue(completions[0]['result']['head_target_verified'])
+                self.assertIsNone(adapter.head.active)
+                ack_mode[0]='reject'
+                with self.assertRaisesRegex(MoveError,'rejected'):await reader.send_moveh([0,0],1)
+                ack_mode[0]='timeout'
+                with self.assertRaisesRegex(MoveError,'unconfirmed'):await reader.send_moveh([0,0],1)
+                self.assertIsNone(reader.head_pending)
+            finally:
+                await adapter.head.close();task.cancel();await asyncio.gather(task,return_exceptions=True)
+                await run2.cleanup()
+        await runner.cleanup()
+
+    async def test_transport_preconditions_never_send_or_toggle_modes(self):
+        reader=RobotReader(settings());reader.accept_info(info())
+        reader.ws=types.SimpleNamespace(closed=False,send_json=AsyncMock())
+        for key,value in (('working_mode','idle'),('collision_enable',False),('compliant_enable',True)):
+            reader.accept_info(info());reader.info[key]=value
+            with self.assertRaises(MoveError):await reader.send_moveh([0,0],1)
+        reader.accept_info(info());reader.info_at-=100
+        with self.assertRaises(MoveError):await reader.send_moveh([0,0],1)
+        reader.ws.send_json.assert_not_called()

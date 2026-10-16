@@ -21,6 +21,26 @@ ARM_UPPER = (2.6005, 3.1940, 1.4835, .2618, 1.3963, .7854, 1.5708,
              2.6005, .2618, 3.6652, .2618, 1.7453, .7854, 1.5708)
 
 
+def validate_moveh(joint, duration):
+    # Operator's DACH TRON2A manual and official URDF: pitch -45..60deg,
+    # yaw -90..90deg. Protocol order is pitch,yaw (NOT URDF traversal order).
+    limits = ((-math.pi/4, math.pi/3), (-math.pi/2, math.pi/2))
+    if not isinstance(joint, list) or len(joint) != 2:
+        raise ValueError('MoveH requires exactly pitch,yaw in radians')
+    for value, (low, high) in zip(joint, limits):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError('Head angles must be finite numbers')
+        try:
+            valid = math.isfinite(value) and low <= value <= high
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError('Head angle exceeds the DACH manual limit')
+    # Reuse strict duration validation, without forwarding any arm target.
+    validate_movej([0]*14, duration)
+    return list(joint), duration
+
+
 def validate_movej(joint, duration):
     if not isinstance(joint, list) or len(joint) != 14:
         raise ValueError('MoveJ requires 14 arm angles in rad, excluding the 2 head joints')
@@ -83,6 +103,7 @@ class RobotReader:
         self.last_round_trip = None
         self.ws = None
         self.move_pending = None
+        self.head_pending = None
         self.gripper_pending = {}
 
     def disconnect(self, reason):
@@ -95,6 +116,10 @@ class RobotReader:
             future = self.move_pending[1]
             if not future.done():
                 future.set_exception(MoveError('Disconnected after send; result unknown, do not automatically retry', None))
+        if self.head_pending:
+            future = self.head_pending[1]
+            if not future.done():
+                future.set_exception(MoveError('Head connection lost; result unknown, do not retry', None))
         self.info = self.joints = None
         self.info_at = self.joints_at = None
         self.info_received = self.joints_received = None
@@ -143,6 +168,12 @@ class RobotReader:
                 future.set_result(body.get('data'))
             elif not future.done() and body.get('title') == 'notify_invalid_request':
                 future.set_result({'result': 'fail_invalid_cmd'})
+        if self.head_pending and body.get('guid') == self.head_pending[0] and body.get('accid') == self.serial:
+            future = self.head_pending[1]
+            if not future.done() and body.get('title') == 'response_moveh':
+                future.set_result(body.get('data'))
+            elif not future.done() and body.get('title') == 'notify_invalid_request':
+                future.set_result({'result': 'fail_invalid_cmd'})
         if body.get('title') == 'notify_robot_info':
             self.accept_info(body)
         return body
@@ -183,7 +214,7 @@ class RobotReader:
         readiness=motion_readiness(status['data'])
         if not readiness['ready']:
             raise MoveError(readiness['reason'] + '; no motion command sent', False, 'vendor_not_ready')
-        if self.move_pending:
+        if self.move_pending or self.head_pending:
             raise MoveError('A MoveJ reply is pending; no additional command sent', False)
         guid = str(uuid.uuid4())
         future = asyncio.get_running_loop().create_future()
@@ -209,6 +240,41 @@ class RobotReader:
                 future.cancel()
             elif not future.cancelled():
                 future.exception()  # retrieve a disconnect exception even if send failed
+
+    async def send_moveh(self, q, move_time):
+        """Only a two-axis MoveH; one send and exact identity/GUID/title ACK."""
+        q, move_time = validate_moveh(q, move_time)
+        if not self.connected or self.ws is None or self.ws.closed or not self.serial:
+            raise MoveError('Robot disconnected; no head motion sent', False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready']:
+            raise MoveError('Fresh developer mode, collision protection and compliance-off required; no head motion sent', False)
+        if self.head_pending or self.move_pending:
+            raise MoveError('Another arm/head acknowledgement is pending; no head motion sent', False)
+        ws, serial = self.ws, self.serial
+        guid = str(uuid.uuid4()); future = asyncio.get_running_loop().create_future()
+        self.head_pending = (guid, future)
+        sent = False
+        try:
+            try:
+                await asyncio.wait_for(ws.send_json({'title':'request_moveh','accid':serial,
+                    'guid':guid,'timestamp':int(time.time()*1000),
+                    'data':{'joint':q,'time':move_time}}), 5)
+                sent = True
+                reply = await asyncio.wait_for(future, self.settings['response_timeout_seconds'])
+            except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise MoveError('Head send/ACK unconfirmed; no automatic retry', True if sent else None) from exc
+            if self.ws is not ws or self.serial != serial or not self.connected:
+                raise MoveError('Head connection changed; result unknown', True)
+            if not isinstance(reply, dict) or reply.get('result') != 'success':
+                raise MoveError('Vendor rejected MoveH; no arrival confirmed', True, 'vendor_rejected')
+            return {'status':'accepted','motion_sent':True,'arrival_verified':False}
+        finally:
+            self.head_pending = None
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def _gripper_request(self, title, data, motion):
         if (motion is True and title != 'request_set_limx_2fclaw_cmd') or \

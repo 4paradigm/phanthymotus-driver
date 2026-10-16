@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.6.7'
+VERSION = '0.7.0'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -99,7 +99,7 @@ def run_check(timeout=20, camera=False):
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'gripper_left': 'actuator', 'gripper_right': 'actuator', 'model': 'resource'}
+    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'move_head': 'actuator', 'gripper_left': 'actuator', 'gripper_right': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
         raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
@@ -133,6 +133,14 @@ def run_check(timeout=20, camera=False):
             or arm_tool['inputSchema']['properties']['action']['enum'] != ['move', 'reset']
             or set(arm_tool['inputSchema']['x-action-params']) != {'move', 'reset'}):
         raise ValueError('Arm completion tracking or physical resources are missing')
+    head_tool = next((tool for tool in tools if tool['name'] == 'move_head'), None)
+    if head_tool:
+        schema = head_tool['inputSchema']; props = schema['properties']
+        if props['action']['enum'] != ['move'] or schema.get('x-completion') != {'actions':['move'],'timeout':120} or \
+                schema.get('x-resource') != ['head','arm_l','arm_r'] or \
+                (props['pitch_deg'].get('minimum'),props['pitch_deg'].get('maximum')) != (-45,60) or \
+                (props['yaw_deg'].get('minimum'),props['yaw_deg'].get('maximum')) != (-90,90):
+            raise ValueError('Head limits, schema or ACP tracking differ from the reviewed card')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,
@@ -141,7 +149,7 @@ def run_check(timeout=20, camera=False):
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
     motion_readiness = None
-    for name in names & {'arm_control', 'gripper_left', 'gripper_right'}:
+    for name in names & {'arm_control', 'move_head', 'gripper_left', 'gripper_right'}:
         for action in ('info', 'start', 'stop'):
             reply = rpc('tools/call', {'name': name, 'arguments': {'action': action,
                 '_trace_id': 'readonly-check-trace', 'instance_id': 'readonly-check'}})

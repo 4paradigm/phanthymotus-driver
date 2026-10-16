@@ -9,6 +9,7 @@ robot:
 plugins:
   joint_state: {enabled: true}
   arm_control: {enabled: true}
+  move_head: {enabled: true}
   gripper_left: {enabled: true}
   gripper_right: {enabled: true}
   camera: {enabled: true}

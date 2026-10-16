@@ -16,7 +16,7 @@ RUN set -eu; missing=""; \
 COPY requirements.txt /tmp/tron2-requirements.txt
 RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/tron2-requirements.txt
 COPY common/ /work/common/
-COPY main.py device.py vendor.py state.py reset.py skeleton.py completion.py gripper.py camera.py ros2.py check.py config.yaml driver.yaml /work/
+COPY main.py device.py vendor.py state.py reset.py skeleton.py completion.py head.py gripper.py camera.py ros2.py check.py config.yaml driver.yaml /work/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 ENV PYTHONUNBUFFERED=1
