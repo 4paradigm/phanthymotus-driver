@@ -402,10 +402,11 @@ class ArmStreamExecutor:
                     # gesture after an explicit stop cancelled its pending work.
                     op['action_id']=None
                 else:
-                    # ExecuteAction has no cancel/status API. Once 99 was sent,
-                    # a local stop cannot honestly report the vendor action as
-                    # cancelled or acquire its control back silently.
-                    op.update(state='unknown',reason='release_action_stop_unconfirmed')
+                    # 99 already owns the handback. Stop cannot cancel that
+                    # RPC, but must not discard its eventual receipt either.
+                    # Keep waiting on this same operation and fresh rest;
+                    # neither another RPC nor an early success is warranted.
+                    op['stop_pending_vendor_action'] = True
                 return copy.deepcopy(op)
             if ident in self._operations: return copy.deepcopy(self._operations[ident])
             if self._operation and self._operation['state'] not in ('completed','failed','unknown'):
@@ -588,12 +589,22 @@ class ArmStreamExecutor:
                 op['sdk_return'],op['sdk_returned_ns']=ret,self.clock()
                 success=type(ret) is int and ret==0
                 if op.get('operator_reset'): op['request_sent'] = success
-                if op['state']=='unknown':return  # Stop cannot retract an in-flight request.
+                # A late receipt belongs only to this operation. A local
+                # deadline while the RPC was pending is recoverable on an
+                # actual success; a feedback fault/operator reset is not.
+                late = (op['state']=='unknown' and op.get('reason')=='release_timeout'
+                        and op.get('timed_out_state')=='sdk_pending')
+                if op is not self._operation or (op['state']!='sdk_pending' and not late):return
                 if success and op.get('operator_reset'):
                     self._complete_release(op, physical_confirmed=False)
                     return
-                op['state']='awaiting_feedback' if success else 'failed'
-                if not success:op['reason']='release_sdk_error'
+                if success:
+                    op['state']='awaiting_feedback'
+                    op.pop('reason',None)
+                else:
+                    # 3104 is an unknown RPC outcome, never a stopped robot.
+                    op.update(state='unknown' if ret==3104 else 'failed',
+                              reason='release_sdk_timeout' if ret==3104 else 'release_sdk_error')
                 self._settle=None
         except Exception as exc:
             with self.lock:op.update(state='failed' if op.get('operator_reset') else 'unknown',
@@ -604,7 +615,11 @@ class ArmStreamExecutor:
         if op is None or op['state'] in ('completed','failed','unknown'):return
         now=self.clock()
         if op.get('operator_reset') and op['state']=='sdk_pending':return
-        if now-op['started_ns']>10_000_000_000:
+        # The receipt and physical settling are separate phases. A late
+        # successful RPC must still get fresh feedback, not inherit an already
+        # expired RPC deadline and immediately become unknown again.
+        phase_start = op['sdk_returned_ns'] if op['state']=='awaiting_feedback' else op['started_ns']
+        if now-phase_start>10_000_000_000:
             op.update(timed_out_state=op['state'],state='unknown',reason='release_timeout')
             self._settle=None
             return
@@ -766,7 +781,10 @@ class ArmStreamExecutor:
 
     def status(self):
         with self.lock:
-            return {'state':self.state,'reason':self.reason,'boot_id':self.boot_id,'session_id':self.session_id,
+            release_reason = (self._operation.get('reason') if self._operation
+                              and self._operation['state'] in ('unknown','failed') else None)
+            return {'state':self.state,'reason':release_reason or self.reason,
+                'boot_id':self.boot_id,'session_id':self.session_id,
                 'sequence':self.seq,'applied_sequence':self.applied_seq,'feedback':self._snapshot(),
                 'commanded_q':copy.deepcopy(self.last_q),'ownership_held':bool(self.session_id or self._opening or self._legacy_pending
                     or self._operation and self._operation['state']!='completed'),

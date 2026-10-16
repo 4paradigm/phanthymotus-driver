@@ -24,6 +24,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
 <main class="shell">
   <ol class="steps" aria-label="进度"><li class="current"><b>1</b>设备检查</li><li><b>2</b>录制</li><li><b>3</b>试运行</li><li><b>4</b>保存</li></ol>
   <div id="error" class="error" role="alert" hidden></div>
+  <div id="control-recovery" class="error" role="status" hidden></div>
   <section id="prepare" class="layout">
     <div class="panel"><div class="row between section-title"><h2>设备与前置条件</h2><span class="status"><i id="connection-dot" class="dot"></i><span id="connection">连接中</span></span></div><div id="checks"></div>
       <div class="check-row"><span>实时跟踪与握键</span><span class="check-result"><i class="pill">·</i>进入遥操后确认</span></div>
@@ -137,6 +138,9 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   }
   function render() {
     const rec=status.recording || {},clip=!!draft.recording,trial=draft.trial,moving=!!status.busy,locked=busy || !online;
+    const recovery=status.control_recovery;
+    $('control-recovery').hidden=!recovery;
+    $('control-recovery').textContent=recovery ? `${recovery.hint}${recovery.sdk_code != null ? ' SDK '+recovery.sdk_code : ''}` : '';
     const canPrepare=status.can_prepare ?? !moving,external=presentation().session_start==='controller';
     $('next-hint').textContent=presentation().next_hint || '';
     $('trial-hint').textContent=presentation().trial_hint || '';

@@ -137,6 +137,11 @@ class G1TeachingAdapter:
         replay = value.get("replay_active", False)
         can_prepare = not (writing or replay or self.arm.opening or self.control._reset_operation)
         active = bool(value.get("operator_session_id") or arm["ownership_held"])
+        release = arm.get('release') or {}
+        recovery = None
+        if release.get('state') in ('unknown', 'failed'):
+            recovery = {'reason': release.get('reason'), 'sdk_code': release.get('sdk_return'),
+                        'hint': '控制权释放未确认。现场确认双臂已停止后，在原遥操松握、长按 X+A 重新建立基准；不要重复回放。'}
         running = bool(value.get("binding") and not self.control._closed.is_set())
         reason = value.get("reason")
         hints = {
@@ -156,14 +161,22 @@ class G1TeachingAdapter:
                 "input_fresh": value["input_fresh"], "mapped": value["mapped"],
                 "can_record": value["can_record"], "recording": recording,
                 "teleop_hint": hint, "last_action": value.get("last_action"),
+                "control_recovery": recovery,
                 "checks": [{"id": k, "label": label, "ok": None} for k, label, _ in self.checks],
                 "recordings": self._call("recordings")["recordings"]}
 
     def check(self):
+        control_help = None
         def control():
+            nonlocal control_help
             if not self.control.live:
                 raise ValueError("live_teleop_required")
-            if not self.info()["can_prepare"] or self.arm.state == "fault":
+            status = self.info()
+            recovery = status.get('control_recovery')
+            if recovery:
+                control_help = recovery['hint']
+                raise ValueError(control_help)
+            if not status["can_prepare"] or self.arm.state == "fault":
                 raise ValueError("motion_busy_or_fault")
 
         def transport():
@@ -180,7 +193,7 @@ class G1TeachingAdapter:
                 checks.append({"id": key, "label": label, "ok": True})
             except Exception as exc:
                 checks.append({"id": key, "label": label, "ok": False,
-                               "reason": str(exc), "help": help_text})
+                               "reason": str(exc), "help": control_help if key == 'control' and control_help else help_text})
         return {"ready": all(c["ok"] for c in checks), "checks": checks}
 
     def begin(self, args):
