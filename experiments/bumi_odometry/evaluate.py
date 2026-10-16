@@ -79,6 +79,9 @@ def evaluate_trial(samples, truth):
             (truth[k] for k in ("forward_m", "lateral_m", "uncertainty_m")), 3)
         if uncertainty < 0:
             raise ValueError("negative measurement uncertainty")
+        if any(row.get("status") == "lost" for row in samples):
+            # One recording is one trial. Late diagnostics can invalidate earlier predictions.
+            raise ValueError("fault recorded in trial, including late diagnostics")
         previous = None
         normalized = []
         for row in samples:
@@ -139,6 +142,7 @@ def summarize(trials):
         max_absolute_error_m=max(map(abs, errors)) if errors else None,
         acceptance_passed=(len(acceptance) >= 20 and len(set(ids)) == len(ids)
                            and all(t["status"] == "passed" for t in acceptance)
+                           and all(0.9 <= t["measured_forward_m"] <= 1.1 for t in acceptance)
                            and len({t.get("scene") for t in acceptance if t.get("scene")}) >= 2
                            and all(t.get("split") in ("development", "acceptance") for t in trials)),
     )

@@ -1,5 +1,6 @@
 """Quality gates must prevent stale predictions being counted as displacement."""
 import json
+import csv
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from experiments.bumi_odometry.preflight import inspect_device
-from experiments.bumi_odometry.quality import TrackingQuality
+from experiments.bumi_odometry.quality import TrackingQuality, TrialCSV
 from experiments.bumi_odometry.configuration import load_calibration, pipeline_settings, validate_mode
 
 
@@ -112,3 +113,15 @@ def test_replay_cannot_open_camera_or_republish_recorded_mount():
     with pytest.raises(ValueError): validate_mode(False, True, True)
     validate_mode(False, True, False)
     validate_mode(False, False, True)
+
+
+def test_fault_is_persisted_without_another_filtered_pose(tmp_path):
+    path = tmp_path / "trial.csv"
+    with path.open("w", newline="") as stream:
+        output = TrialCSV(stream, "trial")
+        output.pose(1_000_000_000, [1, 0, 0, 0, 0, 0, 1], "tracking")
+        output.fault(1_100_000_000, 900_000_000)
+        # Read before closing: late diagnostics must be flushed immediately.
+        rows = list(csv.DictReader(path.open()))
+        assert rows[-1]["status"] == "lost"
+        assert rows[-1]["fault_stamp_ns"] == "900000000"

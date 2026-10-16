@@ -4,11 +4,16 @@
 
 ## 已执行
 
-- `python3 -m pytest -q tests/test_bumi_odometry_evaluate.py tests/test_bumi_odometry_pipeline.py`：35 项通过。
+- `python3 -m pytest -q tests/test_bumi_odometry_evaluate.py tests/test_bumi_odometry_pipeline.py`：40 项通过；另加入 `tests/test_odom_format.py` 后共 58 项通过。
 - `python3 -m compileall -q experiments/bumi_odometry`：通过，仅证明语法可编译。
 - 评估 CLI 由测试以子进程运行：合成轨迹与独立手算结果一致，缺失试次保留为 invalid，synthetic 来源不能输出实测精度通过。
 - 本地预检入口运行后返回 `ready: false` 和缺少 pyrealsense2；这是环境缺项，不是传感器枚举成功。
 - 全库 `python3 -m pytest -q` 已运行：3 skipped，33 个收集错误，未进入完整测试执行。错误包括缺少厂商 SDK、重复测试模块名及 Python 3.9 不支持部分既有类型注解；不得宣称全库测试通过。
+
+## 独立代码审查后的修复
+
+- 一米验收限制真实前向位移在 0.9–1.1 米：新增 0 米、0.5 米、2 米回归案例，修复前均错误通过，修复后不再作为一米验收通过的依据。
+- 晚到故障使整次记录失效：复现源时间 0.9 秒的失跟诊断在终点 1.0 秒之后、1.1 秒才到达的情况；现在立即持久化故障行，离线评估拒绝整份试验。即使没有新的滤波位姿，故障也刷盘保存。相应回归测试先失败、修复后通过。
 
 ## 未执行 / 完成前提
 

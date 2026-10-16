@@ -91,6 +91,21 @@ def test_acceptance_needs_twenty_trials_and_keeps_failures():
     assert summary["valid_fraction"] == pytest.approx(0.95)
 
 
+@pytest.mark.parametrize("distance", [0.0, 0.5, 2.0])
+def test_other_distances_cannot_establish_one_meter_accuracy(distance):
+    reference = dict(truth(), forward_m=distance)
+    result = evaluate_trial(trajectory(distance), reference)
+    trials = [dict(result, trial_id=str(i), scene=str(i % 2)) for i in range(20)]
+    assert summarize(trials)["acceptance_passed"] is False
+
+
+def test_late_fault_after_endpoint_invalidates_entire_recording():
+    rows = trajectory(1)
+    rows.append(dict(stamp_ns=1_100_000_000, status="lost", segment_id="one",
+                     fault_stamp_ns=900_000_000))
+    assert evaluate_trial(rows, truth())["status"] == "invalid"
+
+
 def test_cli_missing_trial_stays_in_report_and_synthetic_is_not_measurement(tmp_path):
     rows = trajectory()
     with (tmp_path / "a.csv").open("w") as stream:

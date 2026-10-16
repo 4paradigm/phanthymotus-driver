@@ -47,6 +47,25 @@ class TrackingQuality:
         return "tracking" if len(self.samples) == 2 else "initializing"
 
 
+class TrialCSV:
+    """One file is one trial; late faults invalidate it even without more EKF output."""
+    def __init__(self, stream, segment):
+        self.stream, self.segment = stream, segment
+        self.writer = csv.writer(stream)
+        self.fault_written = False
+        self.writer.writerow(["stamp_ns", "x", "y", "z", "qx", "qy", "qz", "qw",
+                              "status", "segment_id", "fault_stamp_ns"])
+
+    def pose(self, stamp_ns, pose, status):
+        self.writer.writerow([stamp_ns] + list(pose) + [status, self.segment, ""])
+
+    def fault(self, received_ns, source_ns):
+        if not self.fault_written:
+            self.writer.writerow([received_ns] + [""]*7 + ["lost", self.segment, source_ns])
+            self.stream.flush()
+            self.fault_written = True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
@@ -82,8 +101,7 @@ def main():
             self.info = None
             self.info_distance = None
             self.filtered_stamp = None
-            self.writer = csv.writer(stream)
-            self.writer.writerow(["stamp_ns", "x", "y", "z", "qx", "qy", "qz", "qw", "status", "segment_id"])
+            self.output = TrialCSV(stream, self.segment)
             self.stream = stream
             self.publisher = self.create_publisher(String, "status", 10)
             for msg_type, topic, callback in (
@@ -97,6 +115,7 @@ def main():
 
         def visual(self, msg):
             self.guard.update("visual", stamp(msg), self.now(), self.segment, pose_valid(msg))
+            self.record_fault(stamp(msg))
 
         def visual_info(self, msg):
             now, source = self.now(), stamp(msg)
@@ -107,6 +126,7 @@ def main():
                 self.guard.invalidate("visual tracking lost, reset, or unsynchronized")
             self.info = source, now
             self.info_distance = msg.distance_travelled
+            self.record_fault(source)
 
         def imu(self, msg):
             w, cov = msg.angular_velocity, msg.angular_velocity_covariance
@@ -114,6 +134,7 @@ def main():
                      all(math.isfinite(v) for v in (w.x, w.y, w.z)) and
                      all(math.isfinite(cov[i]) and cov[i] > 0 for i in (0, 4, 8)))
             self.guard.update("imu", stamp(msg), self.now(), self.segment, valid)
+            self.record_fault(stamp(msg))
 
         def status(self):
             now = self.now()
@@ -124,9 +145,15 @@ def main():
                 self.guard.invalidate("visual diagnostics stale")
             return self.guard.state(now)
 
+        def record_fault(self, source_ns):
+            status = self.status()
+            if status == "lost":
+                self.output.fault(self.now(), source_ns)
+            return status
+
         def publish_status(self):
             msg = String()
-            msg.data = json.dumps(dict(status=self.status(), reason=self.guard.reason,
+            msg.data = json.dumps(dict(status=self.record_fault(self.now()), reason=self.guard.reason,
                                        segment_id=self.segment, stamp_ns=self.now()))
             self.publisher.publish(msg)
             self.stream.flush()
@@ -138,7 +165,7 @@ def main():
                 self.guard.invalidate("invalid filtered pose")
             self.filtered_stamp = source
             p, q = msg.pose.pose.position, msg.pose.pose.orientation
-            self.writer.writerow([source, p.x, p.y, p.z, q.x, q.y, q.z, q.w, self.status(), self.segment])
+            self.output.pose(source, [p.x, p.y, p.z, q.x, q.y, q.z, q.w], self.record_fault(source))
 
     # Exclusive creation prevents a second process from truncating an active trial.
     with args.output.open("x", newline="") as stream:
