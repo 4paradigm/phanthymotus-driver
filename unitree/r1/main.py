@@ -77,6 +77,11 @@ class R1DeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        if plugins_cfg.get("demo_echo", {}).get("enabled", False):
+            from demo_echo import DemoEchoPlugin
+            self._plugins.append(DemoEchoPlugin(plugins_cfg["demo_echo"], namespace, executor))
+            print("[bundle] DemoEchoPlugin loaded")
+
         if plugins_cfg.get("mic", {}).get("enabled", False):
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor))
