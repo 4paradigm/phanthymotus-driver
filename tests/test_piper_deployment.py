@@ -40,7 +40,25 @@ class PiperDeploymentTests(unittest.TestCase):
         violations, _ = check(str(SERVICE), "agilex/piper")
         self.assertEqual(violations, [])
         self.assertEqual(self.environment["PIPER_MOTION_ENABLED"], "${PIPER_MOTION_ENABLED:-0}")
-        self.assertEqual(self.environment["PIPER_CAMERA_ENABLED"], "${PIPER_CAMERA_ENABLED:-0}")
+        self.assertEqual(self.environment["PIPER_CAMERA_ENABLED"], "0")
+
+    def test_can_service_exposes_no_host_devices_or_elevated_capabilities(self):
+        self.assertFalse(self.service.get('privileged', False))
+        self.assertEqual(self.service['cap_drop'], ['ALL'])
+        self.assertFalse(self.service.get('cap_add'))
+        self.assertFalse(self.service.get('devices'))
+        self.assertFalse(self.service.get('device_cgroup_rules'))
+        self.assertFalse(any(str(v).split(':', 1)[0] == '/dev' for v in self.service['volumes']))
+        self.assertIn('no-new-privileges:true', self.service['security_opt'])
+
+    def test_optional_camera_maps_only_an_explicit_color_device(self):
+        override = yaml.safe_load((SERVICE.parent / 'camera.compose.yml').read_text())['services']['agilex-piper']
+        self.assertEqual(set(override), {'devices', 'environment'})
+        self.assertEqual(len(override['devices']), 1)
+        self.assertEqual(override['devices'][0],
+                         '${PIPER_CAMERA_DEVICE:?Set the explicit color V4L2 path}:'
+                         '${PIPER_CAMERA_DEVICE:?Set the explicit color V4L2 path}:rw')
+        self.assertEqual(env_map(override['environment'])['PIPER_CAMERA_ENABLED'], '1')
 
 
 class PiperDiagnosticTests(unittest.TestCase):

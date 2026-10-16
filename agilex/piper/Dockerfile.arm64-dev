@@ -1,6 +1,7 @@
-# Offline source-layer rebuild over the verified ARM64 Bot dependency image.
-# Development candidate only; this does not replace a clean release build.
-ARG PIPER_DEV_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/agilex/piper:release.261014.4f9cd06
+# Operator-only offline source overlay over release.261016.cde468d (ARM64).
+# This immutable dependency snapshot is not the clean release Dockerfile.
+# See IMAGE_ACCOUNTING.md for the verified digest, sizes and limitations.
+ARG PIPER_DEV_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/agilex/piper@sha256:37a0ea3553fe8e2e14f615cc36b80823265af93651bd038a5cc990a49236d680
 FROM ${PIPER_DEV_BASE_IMAGE}
 ARG PIPER_SOURCE_REV=uncommitted
 COPY common/ /work/common/

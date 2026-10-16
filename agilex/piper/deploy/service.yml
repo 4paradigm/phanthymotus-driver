@@ -1,11 +1,14 @@
 agilex-piper:
   container_name: embodied-agilex-piper
   image: __IMAGE__
-  # Required for SocketCAN and the loopback-only DDS profile, including PR deployments.
+  # Use host SocketCAN/loopback DDS. Host CAN setup is an operator task; the
+  # driver does not need device mounts, NET_ADMIN or privileged mode for it.
   network_mode: host
-  privileged: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
   volumes:
-    - /dev:/dev
     - /opt/phanthy-motus/data/piper:/opt/phanthy-motus/data/piper
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
@@ -16,7 +19,8 @@ agilex-piper:
     - PYTHONUNBUFFERED=1
     - AGENT_CORE_URL=https://localhost:15678
     - PIPER_MOTION_ENABLED=${PIPER_MOTION_ENABLED:-0}
-    - PIPER_CAMERA_ENABLED=${PIPER_CAMERA_ENABLED:-0}
+    # Add camera.compose.yml only when an explicit color V4L2 device is selected.
+    - PIPER_CAMERA_ENABLED=0
   logging:
     driver: local
     options:

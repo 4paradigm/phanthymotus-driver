@@ -1,12 +1,21 @@
-# Official ROS image supports amd64 (tested controller) and arm64.
-ARG ROS_BASE_IMAGE=ros:humble-ros-base@sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19
+# Reuse the project's verified ARM64 ROS/Python dependencies by immutable digest.
+# build-local.sh selects the pinned official multiarch base for amd64 builds.
+ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG PIPER_SDK_URL=https://github.com/agilexrobotics/piper_sdk/archive/8d4dc29bd6e753066dedee235c008e90ecb2ab4a.zip
 ARG PIPER_SDK_SHA256=89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e41305c29
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip ros-humble-rmw-fastrtps-cpp ros-humble-sensor-msgs \
-    && rm -rf /var/lib/apt/lists/*
+# The project base already contains these packages. Only an explicit alternate
+# base (for example amd64) needs to install missing packages.
+RUN missing=""; \
+    for package in python3-pip ros-humble-rmw-fastrtps-cpp ros-humble-sensor-msgs; do \
+        dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed' \
+            || missing="$missing $package"; \
+    done; \
+    if [ -n "$missing" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends $missing \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 WORKDIR /work
 COPY requirements.txt /work/agilex/piper/requirements.txt
 # COS publication/access dependency and exact pinned artifact: SDK_ARTIFACT.md.
