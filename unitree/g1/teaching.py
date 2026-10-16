@@ -1,0 +1,313 @@
+"""Adapt G1's existing trajectory owner to the shared skill workbench."""
+import math
+import hashlib
+import os
+from pathlib import Path
+import secrets
+import tempfile
+import time
+
+from common.teaching import TeachingPlugin
+from common.teaching.package import SCHEMA as PACKAGE_SCHEMA
+from trajectory import SCHEMA as RECORDING_SCHEMA, UNITS, encode, read_recording
+
+
+class G1TeachingAdapter:
+    title = "宇树 G1 · 双臂"
+    resources = ["arm_l", "arm_r"]
+    # Includes the original clip, transition to its start, and SDK handback.
+    completion_timeout = 750
+    presentation = {
+        "session_start": "controller",
+        "joint_groups": [{"label": "左臂", "count": 5}, {"label": "右臂", "count": 5}],
+        "grippers": False,
+        "recording_label": "双臂 · 10 关节",
+        "prepare_hint": "检查本体反馈、机型、设备身份和遥操通道。",
+        "next_hint": "在画布启动遥操，双方双臂下垂，松握并长按 X+A 建立基准。",
+        "trial_hint": "恢复物体布置。试运行会先低速移动到录制起点，再按原时间回放。",
+        "conditions_placeholder": "例如：物体位置与示教时一致，双臂到录制起点的路径畅通。",
+    }
+    replay_instruction = (
+        "执行时由 G1 原控制器先低速移动到录制起点，再按原时间回放；"
+        "本次确认须包含移向起点的路径和录制动作的活动空间。"
+        "起点差异仅供显示，不要求 PiPER 的关节或夹爪容差。"
+        "不得额外发回零、切模式、换设备或改速度指令。"
+        "completed 表示轨迹发送及停止交权完成，实际动作效果仍需现场确认。"
+    )
+    checks = (
+        ("feedback", "本体反馈与模式", "请启动 G1 驱动并在原控制卡检查反馈和本体模式。"),
+        ("model", "机型与设备身份", "请检查 G1_23 模型及持久化设备身份挂载。"),
+        ("control", "控制状态", "请结束回放、复位或其他控制动作，再重新检查。"),
+        ("transport", "VR 通道", "请连接 VR 输入 → G1 遥操卡，并启动画布项目。"),
+    )
+
+    def __init__(self, control):
+        self.control = control
+        self.trajectory = control.trajectory
+        self.arm = control.executor
+        self.preview = None
+        self.epoch = 0
+        self.recording_session = None
+
+    def _call(self, action, **args):
+        result = self.control.dispatch(action, args)
+        if result.get("error") or result.get("state") == "error":
+            raise ValueError(result.get("code") or result.get("error") or "g1_control_error")
+        return result
+
+    def compatibility(self):
+        profile = self.arm.profile or {}
+        if profile.get("profile_id") != "unitree_g1_23_dual_arm_relative_v1":
+            raise ValueError("unsupported_g1_package_profile")
+        binding = self.trajectory.binding()
+        return {"manufacturer": "unitree", "model": "G1", "variant": "G1_23",
+                "scope": "dual_arm", "end_effectors": "fixed_hand",
+                "joint_names": list(profile["arm_joint_names"]),
+                "model_sha256": binding["model_sha256"], "geometry_sha256": binding["geometry_sha256"],
+                "profile_id": profile["profile_id"], "profile_version": profile["version"],
+                "driver": "unitree/g1", "tool": "g1_teaching", "package_api": PACKAGE_SCHEMA,
+                "recording_schema": RECORDING_SCHEMA,
+                "driver_version": os.environ.get("IMAGE_TAG", "unknown"),
+                "requires_local_trial": True}
+
+    @staticmethod
+    def _portable_bytes(recording, binding):
+        header = {"type": "header", "schema": RECORDING_SCHEMA, "units": UNITS,
+                  "binding": binding, "joint_names": recording["joint_names"]}
+        data = bytearray(encode(header))
+        for frame in recording["frames"]:
+            # A controller session from the source robot has no authority here.
+            data.extend(encode(dict(frame, session_id="portable")))
+        digest = hashlib.sha256(data)
+        digest.update(str(recording["duration_ns"]).encode())
+        data.extend(encode({"type": "complete", "frames": len(recording["frames"]),
+                            "sha256": digest.hexdigest(), "duration_ns": recording["duration_ns"]}))
+        return bytes(data)
+
+    def export_recording(self, recording):
+        value = read_recording(self.trajectory.directory, recording["filename"], self.arm.limits)
+        self.trajectory._check_binding(value)
+        if value["sha256"] != recording["sha256"]:
+            raise ValueError("recording_changed_record_again")
+        return self._portable_bytes(value, {**value["binding"], "device_id": "requires_local_binding"})
+
+    def import_recording(self, manifest, data):
+        self.trajectory._idle()
+        current, required = self.compatibility(), manifest["compatibility"]
+        if set(required) != set(current):
+            raise ValueError("invalid_package_compatibility")
+        # Build labels are informative. Capability, geometry and joint order
+        # are the compatibility contract, never a loose substring of "G1".
+        for key in current.keys() - {"driver_version"}:
+            if current[key] != required[key]:
+                raise ValueError("incompatible_robot_" + key)
+        if manifest["recording"]["schema"] != RECORDING_SCHEMA:
+            raise ValueError("incompatible_recording_schema")
+        with tempfile.TemporaryDirectory(prefix="g1-package-check-") as directory:
+            (Path(directory)/"trajectory.jsonl").write_bytes(data)
+            recording = read_recording(directory, "trajectory.jsonl", self.arm.limits)
+        if recording["joint_names"] != current["joint_names"]:
+            raise ValueError("recording_joint_order")
+        for key in ("model_sha256", "geometry_sha256"):
+            if recording["binding"].get(key) != current[key]:
+                raise ValueError("incompatible_recording_" + key)
+        if recording["binding"].get("device_id") != "requires_local_binding":
+            raise ValueError("package_contains_device_binding")
+        if recording["frames"][0]["kind"] != "target":
+            raise ValueError("recording_initial_target_missing")
+        local = self._portable_bytes(recording, self.trajectory.binding())
+        directory = self.trajectory.directory
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        filename = "g1-import-" + secrets.token_hex(16) + ".jsonl"
+        path = directory / filename
+        try:
+            with path.open("xb") as stream:
+                os.chmod(path, 0o600)
+                stream.write(local); stream.flush(); os.fsync(stream.fileno())
+            return self.inspect(filename)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+
+    def info(self):
+        value = self._call("info")
+        arm = self.arm.status()
+        recording = value.get("recording") or {}
+        writing = bool(recording.get("recording") or recording.get("stopping"))
+        replay = value.get("replay_active", False)
+        can_prepare = not (writing or replay or self.arm.opening or self.control._reset_operation)
+        active = bool(value.get("operator_session_id") or arm["ownership_held"])
+        release = arm.get('release') or {}
+        recovery = None
+        if release.get('state') in ('unknown', 'failed'):
+            recovery = {'reason': release.get('reason'), 'sdk_code': release.get('sdk_return'),
+                        'hint': '控制权释放未确认。现场确认双臂已停止后，在原遥操松握、长按 X+A 重新建立基准；不要重复回放。'}
+        running = bool(value.get("binding") and not self.control._closed.is_set())
+        reason = value.get("reason")
+        hints = {
+            "waiting_baseline_confirmation": "双方双臂下垂，松开握把，长按 X+A 直到基准建立。",
+            "release_buttons_then_regrip": "基准已建立。松开 X+A，开始录制后双握操作。",
+            "regrip_required": "松开双握把，再次双握后继续示范。",
+            "resetting": "正在发送原厂复位请求，请现场确认结果后重新建立基准。",
+        }
+        hint = hints.get(reason) or value.get("input_status", {}).get("hint")
+        if not running:
+            hint = "请在画布启动 G1 遥操，再松握并长按 X+A 建立基准。"
+        elif value["can_record"]:
+            hint = "可以开始录制。按住双握把示范，松握暂停。"
+        return {"state": "teleop" if running else value["state"], "reason": reason,
+                "busy": active or writing or replay or not can_prepare,
+                "can_prepare": can_prepare, "session_id": value.get("operator_session_id"),
+                "input_fresh": value["input_fresh"], "mapped": value["mapped"],
+                "can_record": value["can_record"], "recording": recording,
+                "teleop_hint": hint, "last_action": value.get("last_action"),
+                "release": {k: release.get(k) for k in (
+                    'operation_id', 'state', 'physical_confirmed', 'authority_released')},
+                "control_recovery": recovery,
+                "checks": [{"id": k, "label": label, "ok": None} for k, label, _ in self.checks],
+                "recordings": self._call("recordings")["recordings"]}
+
+    def check(self):
+        control_help = None
+        def control():
+            nonlocal control_help
+            if not self.control.live:
+                raise ValueError("live_teleop_required")
+            status = self.info()
+            recovery = status.get('control_recovery')
+            if recovery:
+                control_help = recovery['hint']
+                raise ValueError(control_help)
+            if not status["can_prepare"] or self.arm.state == "fault":
+                raise ValueError("motion_busy_or_fault")
+
+        def transport():
+            state = self.control.input_status()
+            if state["state"] in ("waiting_binding", "stopped", "transport_error"):
+                raise ValueError(state.get("hint") or state["state"])
+
+        operations = {"feedback": self.arm._fresh, "model": self.trajectory.binding,
+                      "control": control, "transport": transport}
+        checks = []
+        for key, label, help_text in self.checks:
+            try:
+                operations[key]()
+                checks.append({"id": key, "label": label, "ok": True})
+            except Exception as exc:
+                checks.append({"id": key, "label": label, "ok": False,
+                               "reason": str(exc), "help": control_help if key == 'control' and control_help else help_text})
+        return {"ready": all(c["ok"] for c in checks), "checks": checks}
+
+    def begin(self, args):
+        # G1's operator creates the mapping with X+A; opening a page never does.
+        raise ValueError("请从画布启动遥操，并在头显松握、长按 X+A 建立基准")
+
+    def record(self):
+        with self.control._lock:
+            if not self.control.can_record():
+                raise ValueError("live_mapped_teleop_required")
+            session = self.control._operator
+        result = self._call("record_start")
+        if self.control._operator != session:
+            self._call("record_stop")
+            raise ValueError("teaching_session_changed")
+        self.recording_session = session
+        return result
+
+    def finish(self):
+        current = self.control._operator
+        if current and self.recording_session and current != self.recording_session:
+            raise ValueError("示教会话已改变，请先停止当前遥操")
+        result = self._call("record_stop")
+        if result.get("complete"):
+            stopped = self._call("stop")
+            if not stopped.get("authority_released"):
+                raise ValueError("stop_unconfirmed")
+            return {**result, "stop": stopped}
+        return result
+
+    def stop(self):
+        self.epoch += 1
+        self.preview = None
+        return self._call("stop")
+
+    def authorization_context(self):
+        return [self.arm.boot_id, self.epoch, self.control._generation,
+                self.arm.feedback_epoch, self.arm.profile_sha256]
+
+    def execution_binding(self):
+        if not self.arm.profile_sha256:
+            raise ValueError('calibration_required')
+        binding = self.trajectory.binding()
+        return {key: binding[key] for key in ('device_id', 'model_sha256', 'geometry_sha256')} | {
+            'calibration_sha256': self.arm.profile_sha256}
+
+    def inspect(self, filename):
+        recording = self._call("inspect", filename=filename)
+        return {**recording, "preview": [
+            {"t": f["t"], "kind": f["kind"],
+             "joints": [math.degrees(q) for q in f["target_q"]],
+             "feedback_joints": [math.degrees(q) for q in f["feedback_q"]]}
+            for f in recording["preview"]]}
+
+    def start_difference(self, filename):
+        try:
+            result = self._call("start_difference", filename=filename)
+            return {"ready": result["ready"], "can_trial": True, "mode": "move_to_start",
+                    "message": "将先低速移动到录制起点，请确认移动路径畅通。",
+                    "target_joints_deg": [math.degrees(q) for q in result["target_q"]],
+                    "joint_delta_deg": [math.degrees(q) for q in result["joint_delta_rad"]]}
+        except Exception as exc:
+            return {"ready": False, "can_trial": False, "error": str(exc)}
+
+    def play(self, filename, args):
+        # Reject malformed execution before consuming the one-use preview.
+        if args.get("execute") is True and not args.get("preview_id"):
+            raise ValueError("missing_preview_id: 请补齐本次预览编号，没有执行动作")
+        if args.get("execute") is True and (args.get("workspace_clear") is not True or args.get("take_control") is not True):
+            raise ValueError("user_confirmation_required: 请取得用户本次路径与双臂接管确认")
+        epoch, generation = self.epoch, self.control._generation
+        context = self.authorization_context()
+        if ('_authorized_context' in args and
+                args['_authorized_context'] != context):
+            raise ValueError('session_authorization_expired')
+        self.trajectory._idle()
+        recording = self.inspect(filename)
+        start = self.start_difference(filename)
+        if not start["can_trial"]:
+            raise ValueError(start["error"])
+        if epoch != self.epoch or generation != self.control._generation or context != self.authorization_context():
+            raise ValueError("replay_cancelled")
+        signature = (filename, recording["sha256"], recording["binding"], generation, epoch)
+        if not args.get("execute"):
+            ident = secrets.token_hex(16)
+            self.preview = (ident, time.monotonic()+60, signature)
+            return {"preview_id": ident, "executed": False,
+                    "duration_seconds": recording["duration_seconds"], "binding": recording["binding"],
+                    "binding_label": "G1 · " + recording["binding"]["device_id"][:12],
+                    "description": self.presentation["trial_hint"]}
+        preview = self.preview
+        if not preview or time.monotonic() >= preview[1] or preview[2] != signature:
+            self.preview = None
+            raise ValueError("teaching_preview_expired")
+        if preview[0] != args["preview_id"]:
+            raise ValueError("teaching_preview_mismatch: 请使用本次预览返回的完整编号，没有执行动作")
+        self.preview = None
+        result = self._call("play", filename=filename, expected_generation=generation,
+                            expected_sha256=recording["sha256"])
+        return {**result, "state": result["status"],
+                '_authorization_context': [context[0], epoch, generation+1, *context[3:]]}
+
+    def wait(self, action_id):
+        deadline = time.monotonic()+self.completion_timeout
+        while time.monotonic() < deadline:
+            result = self._call("action_status", action_id=action_id)
+            if result["status"] in {"completed", "cancelled", "error"}:
+                return result
+            time.sleep(.05)
+        self.stop()
+        return {"action_id": action_id, "status": "error", "result": {"reason": "completion_timeout"}}
+
+
+def teaching_plugin(control):
+    return TeachingPlugin(G1TeachingAdapter(control), control.trajectory.directory.parent / "skills", "g1_teaching")
