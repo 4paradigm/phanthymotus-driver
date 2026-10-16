@@ -9,8 +9,9 @@ The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and ind
 `std_msgs/msg/String` on `/<namespace>/sound_direction`, declared as
 `sensor/sound-direction`. Like `sensor/pose2d`, it has a specific canvas type
 with the standard String transport; it is not a generic `data/json` port.
-Driver owns freshness and display data; Core uses its standard text/latest
-viewers. The angle uses the robot frame:
+**The `/<namespace>/sound_direction` topic name is the contract ASR uses to
+find its direction input — renaming it disconnects wake direction.** The
+monitor shows the observation as plain data. The angle uses the robot frame:
 front 0°, **left positive** (counter-clockwise, REP-103 — the same sign as
 the locomotion `vyaw` command), right negative, rear ±180°. A source at
 front-left reads about +45 and passes straight to a `vyaw` turn with no
