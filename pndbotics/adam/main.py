@@ -37,6 +37,8 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -62,6 +64,90 @@ def _resolve_namespace(cfg: dict) -> str:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle = None
+
+
+class _LatestSampleReader:
+    """Poll DDS directly while retaining diagnostics and a fake-sample hook."""
+
+    def __init__(self, channel=None):
+        self._channel = channel
+        self._condition = threading.Condition()
+        self._samples = deque(maxlen=1)
+        self._closed = False
+        self._received = 0
+        self._last_sample_at = None
+        self._last_motor_count = None
+
+    def Init(self):
+        if self._channel is None:
+            raise RuntimeError("DDS channel is not configured")
+        with self._condition:
+            self._closed = False
+        self._channel.Init()
+
+    def Close(self):
+        if self._channel is not None:
+            self._channel.Close()
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def _record(self, sample):
+        self._received += 1
+        self._last_sample_at = time.monotonic()
+        motors = getattr(sample, "motor_state", None)
+        self._last_motor_count = len(motors) if motors is not None else None
+
+    def put(self, sample):
+        with self._condition:
+            self._samples.append(sample)
+            self._record(sample)
+            self._condition.notify()
+
+    def Read(self, timeout=None):
+        with self._condition:
+            if self._samples:
+                return self._samples.popleft()
+            if self._closed:
+                return None
+            if self._channel is None:
+                self._condition.wait(timeout)
+                return self._samples.popleft() if self._samples else None
+
+        sample = self._channel.Read(timeout=timeout)
+        if sample is not None:
+            with self._condition:
+                self._record(sample)
+        return sample
+
+    def diagnostics(self):
+        with self._condition:
+            sample_age = (
+                time.monotonic() - self._last_sample_at
+                if self._last_sample_at is not None else None
+            )
+            return {
+                "received": self._received,
+                "last_motor_count": self._last_motor_count,
+                "last_sample_age_s": sample_age,
+                "has_sample": bool(self._samples),
+                "closed": self._closed,
+            }
+
+
+def _json_native(value):
+    """Recursively materialize protobuf/DDS containers for JSON responses."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_native(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_native(item) for item in value]
+    if isinstance(value, (bytes, bytearray)):
+        return list(value)
+    if hasattr(value, "__iter__"):
+        return [_json_native(item) for item in value]
+    raise TypeError(f"Unsupported MCP result type: {type(value).__name__}")
 
 
 def make_handler():
@@ -143,7 +229,10 @@ def make_handler():
                 return
 
             def ok(result):
-                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}))
+                self._send(200, json.dumps({
+                    "jsonrpc": "2.0", "id": rid,
+                    "result": _json_native(result),
+                }))
 
             def err(code, msg):
                 self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid,
@@ -251,7 +340,7 @@ def main():
     # participant conflicts. One shared rt/handstate reader feeds the hand
     # card's get_state action and its partial-command logic.
     dds_lowstate_sub = None
-    dds_arm_lowstate_sub = None
+    dds_arm_lowstate_reader = None
     dds_handstate_sub = None
     dds_hand_pub = None
     dds_lowcmd_pub = None
@@ -267,11 +356,14 @@ def main():
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
         from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, LowCmd_, HandState_, HandCmd_
 
-        def _init_channel(label, factory):
+        def _init_channel(label, factory, init=None):
             channel = None
             try:
                 channel = factory()
-                channel.Init()
+                if init is None:
+                    channel.Init()
+                else:
+                    init(channel)
                 print(f"[adam] DDS channel ready: {label}")
                 return channel
             except Exception as exc:
@@ -290,11 +382,23 @@ def main():
             )
         # Separate reader: DDS readers consume samples independently, and the
         # arm controller must retain its own startup state for full-body hold.
+        # Poll through the same SDK path used by the working state card while
+        # retaining receive diagnostics for LOWSTATE_UNAVAILABLE responses.
         if need_arm:
-            dds_arm_lowstate_sub = _init_channel(
-                "rt/lowstate arm reader",
-                lambda: ChannelSubscriber("rt/lowstate", LowState_),
-            )
+            dds_arm_lowstate_reader = _LatestSampleReader(
+                ChannelSubscriber("rt/lowstate", LowState_))
+            try:
+                dds_arm_lowstate_reader.Init()
+                print("[adam] DDS channel ready: rt/lowstate arm reader")
+            except Exception as exc:
+                try:
+                    dds_arm_lowstate_reader.Close()
+                except Exception:
+                    pass
+                dds_arm_lowstate_reader = None
+                print(
+                    "[adam] WARNING: DDS channel unavailable "
+                    f"(rt/lowstate arm reader): {exc}")
             dds_lowcmd_pub = _init_channel(
                 "rt/lowcmd writer",
                 lambda: ChannelPublisher("rt/lowcmd", LowCmd_),
@@ -352,7 +456,7 @@ def main():
     from device import AdamDeviceBundle
     _bundle = AdamDeviceBundle(cfg, namespace, executor, grpc_client,
                                dds_lowstate_sub=dds_lowstate_sub,
-                               dds_arm_lowstate_sub=dds_arm_lowstate_sub,
+                               dds_arm_lowstate_sub=dds_arm_lowstate_reader,
                                dds_handstate_sub=dds_handstate_sub,
                                dds_hand_pub=dds_hand_pub,
                                dds_lowcmd_pub=dds_lowcmd_pub,
@@ -393,7 +497,7 @@ def main():
         _bundle.close_all()
         for label, channel in (
             ("rt/lowstate reader", dds_lowstate_sub),
-            ("rt/lowstate arm reader", dds_arm_lowstate_sub),
+            ("rt/lowstate arm reader", dds_arm_lowstate_reader),
             ("rt/lowcmd writer", dds_lowcmd_pub),
             ("rt/handcmd writer", dds_hand_pub),
         ):
