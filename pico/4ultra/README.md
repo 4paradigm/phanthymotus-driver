@@ -110,6 +110,10 @@ PICO 保留透视画面，只读订阅机器人卡已有的 `/teleop/state` 并�
 
 ### 镜像依赖与体积
 
+Dockerfile 默认固定现有 `ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f`，不再随 `latest` 变化。2026-10-16 从 registry 核对：该摘要的 15 个基础层与本轮成功构建 `release.261016.2840e1a` 的基础层完全一致，config digest 也与历史测量一致。该镜像压缩层共 304.76 MiB，基础层 249.46 MiB，本卡增加 55.29 MiB。固定摘要不更换基础内容、不增加镜像层；源码和 APK 更新可使本卡增量变化。
+
+`common/teleop_contract.py` 必须由 PICO 发布器与 G1 消费者共用，以一致校验来源、代次、序号和时效。本轮仅兼容 G1 既有的未绑定实例调用，同时保留 PICO 指定实例校验与固定 topic；不改变消息字段或其他 Driver 的构建。它按需复制进本卡和 G1 镜像，不加入共享基础镜像。两端源码一致并通过真实 DDS 联合测试，#330 先合入。
+
 PICO 是独立进程，复用 `ros-base` 提供的 ROS/Python，不依赖另一个服务容器的 Python 包。普通 `pip install` 不使用 `--upgrade` 或 `--force-reinstall`：已满足锁定版本的包会复用；基础镜像中版本不满足锁定版本的包才补充。基础镜像并未声明提供本卡所需的完整 WebRTC 依赖组合。
 
 | 依赖 | 本卡用途 |
