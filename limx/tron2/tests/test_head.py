@@ -19,7 +19,7 @@ from vendor import MoveError, RobotReader, validate_moveh, HEAD_RAD_LIMITS
 
 class HeadValidationTests(unittest.TestCase):
     def test_manual_degrees_convert_to_only_two_radians(self):
-        for pitch,yaw in ((-60,-90),(45,90),(0,0),(12,-20)):
+        for pitch,yaw in ((-59.58,-89.95),(44.69,89.95),(0,0),(12,-20)):
             target,duration=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
             for actual,expected in zip(card_degrees(target),(pitch,yaw)):
@@ -27,10 +27,10 @@ class HeadValidationTests(unittest.TestCase):
             self.assertEqual(duration,5)
         props=tool()['inputSchema']
         self.assertEqual(set(props['properties']),{'pitch_deg','yaw_deg','time'})
-        self.assertEqual(props['properties']['pitch_deg']['minimum'],-60)
-        self.assertEqual(props['properties']['pitch_deg']['maximum'],45)
-        self.assertEqual(props['properties']['yaw_deg']['minimum'],-90)
-        self.assertEqual(props['properties']['yaw_deg']['maximum'],90)
+        self.assertEqual(props['properties']['pitch_deg']['minimum'],-59.58)
+        self.assertEqual(props['properties']['pitch_deg']['maximum'],44.69)
+        self.assertEqual(props['properties']['yaw_deg']['minimum'],-89.95)
+        self.assertEqual(props['properties']['yaw_deg']['maximum'],89.95)
         self.assertEqual(props['required'],['pitch_deg','yaw_deg'])
         self.assertNotIn('action',props['properties'])
         self.assertNotIn('x-action-params',props)
@@ -41,10 +41,19 @@ class HeadValidationTests(unittest.TestCase):
             with self.subTest(pitch=pitch,yaw=yaw),self.assertRaisesRegex(ValueError,'头部角度范围'):
                 arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             with self.assertRaises(ValueError):validate_moveh([math.radians(-pitch),math.radians(yaw)],5)
-        for pitch,yaw in ((-60,-90),(45,90),(5,0),(0,-90),(0,90),(-12,20)):
+        for pitch,yaw in ((-59.58,-89.95),(44.69,89.95),(5,0),(0,-89.95),(0,89.95),(-12,20)):
             target,_=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
             self.assertTrue(all(low<=v<=high for v,(low,high) in zip(target,HEAD_RAD_LIMITS)))
+
+    def test_protocol_boundary_rejects_previously_accepted_manual_endpoints(self):
+        for pitch,yaw in ((45,0),(-60,0),(0,90),(0,-90),(45,90)):
+            with self.subTest(pitch=pitch,yaw=yaw):
+                with self.assertRaises(ValueError):arguments({'pitch_deg':pitch,'yaw_deg':yaw})
+                with self.assertRaises(MoveError) as error:
+                    validate_moveh([math.radians(-pitch),math.radians(yaw)],10)
+                self.assertFalse(error.exception.motion_sent)
+                self.assertEqual(error.exception.code,'head_command_out_of_range')
 
     def test_missing_bad_and_out_of_range_values_never_validate(self):
         for key in ('pitch_deg','yaw_deg'):
@@ -105,6 +114,15 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.owner.last['head_target_verified'])
         self.assertEqual(self.owner.last['joint_count'],2)
         self.assertTrue(self.owner.last['callback_delivered']);self.assertIsNone(self.owner.active)
+
+    async def test_invalid_target_never_owns_head_and_valid_next_request_is_admitted(self):
+        for target,duration in (([-math.pi/4,math.pi/2],10),([0,0],float('nan')),([0,0],0)):
+            with self.assertRaises(ValueError):await self.owner.dispatch('move',target,duration,{})
+            self.assertIsNone(self.owner.active);self.assertIsNone(self.owner.task)
+            self.assertIsNone(self.owner.last)
+        self.reader.send_moveh.assert_not_called();self.report.assert_not_called()
+        await self.dispatch();self.pump([0]*14+[.1,-.1]);await self.owner.task
+        self.assertEqual(self.owner.last['status'],'completed')
 
     async def test_duplicate_vendor_timestamp_cannot_complete(self):
         await self.dispatch();self.pump([0]*14+[.1,-.1],advance=False)
@@ -251,6 +269,21 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any(p['title']=='request_moveh' for p in requests))
                 for action in ('info','start','stop'):
                     self.assertFalse(adapter.call('move_head',{'action':action})['motion_sent'])
+                # Real MCP admission: invalid input never sends WS, creates an ACP task,
+                # or acquires ownership. The following valid call must still complete.
+                bad_inputs=[{'pitch_deg':45,'yaw_deg':90,'time':10},
+                    {'pitch_deg':'5','yaw_deg':0}, {'pitch_deg':True,'yaw_deg':0},
+                    {'pitch_deg':0}, {'pitch_deg':0,'yaw_deg':0,'time':0},
+                    {'pitch_deg':0,'yaw_deg':0,'unexpected':1}]
+                for bad in bad_inputs:
+                    async with session.post('http://127.0.0.1:'+str(site2._server.sockets[0].getsockname()[1])+'/mcp',json={
+                        'jsonrpc':'2.0','id':6,'method':'tools/call','params':{'name':'move_head','arguments':bad}}) as response:
+                        invalid=(await response.json())['result'];self.assertTrue(invalid['isError'])
+                        rejection=json.loads(invalid['content'][0]['text'])
+                        self.assertFalse(rejection['motion_sent']);self.assertNotIn('action_id',rejection)
+                    self.assertIsNone(adapter.head.active);self.assertIsNone(adapter.head.task)
+                    self.assertEqual(completions,[])
+                self.assertFalse(any(p['title']=='request_moveh' for p in requests))
                 with patch.dict('os.environ',{'AGENT_CORE_URL':'http://127.0.0.1:'+str(port)}),patch('completion.STABILITY_SECONDS',.05):
                     async with session.post('http://127.0.0.1:'+str(site2._server.sockets[0].getsockname()[1])+'/mcp',json={
                         'jsonrpc':'2.0','id':7,'method':'tools/call','params':{'name':'move_head','arguments':{

@@ -8,7 +8,7 @@ import time
 
 import aiohttp
 from aiohttp import web
-from vendor import RobotReader, validate_movej, reject_constant, motion_readiness
+from vendor import MoveError, RobotReader, validate_movej, reject_constant, motion_readiness
 from reset import ResetPose
 from skeleton import skeleton_stream, model
 from completion import ArmCompletion, MotionPeers, ACP_TIMEOUT
@@ -17,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.7.4'
+VERSION = '0.7.5'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -220,7 +220,10 @@ class Adapter:
                         'message':'生命周期操作不转动头部，也不构成硬件急停'}
             if action != 'move':
                 raise ValueError('Unsupported head action')
-            target, duration = head_arguments(args)
+            try:
+                target, duration = head_arguments(args)
+            except (ValueError, TypeError) as exc:
+                raise MoveError(str(exc), False, 'head_invalid_command') from exc
             return {'action':'move','joint':target,'time':duration,
                     'target_pitch_deg':args['pitch_deg'],'target_yaw_deg':args['yaw_deg'],
                     'motion_sent':False,'status':'validated'}

@@ -6,10 +6,12 @@ import time
 import completion
 from completion import ArmCompletion
 from skeleton import skeleton_stream
-from vendor import validate_moveh, MoveError, HEAD_DEG_LIMITS
+from vendor import validate_moveh, MoveError
 
 COORDINATE_CONVENTION = 'pitch_up_positive_yaw_robot_left_positive'
-CARD_DEG_LIMITS = ((-HEAD_DEG_LIMITS[0][1], -HEAD_DEG_LIMITS[0][0]), HEAD_DEG_LIMITS[1])
+# Rounded inward to 0.01 degree within the documented MoveH protocol limits.
+# Mechanical limits remain unchanged; input is never clamped.
+CARD_DEG_LIMITS = ((-59.58, 44.69), (-89.95, 89.95))
 
 
 def card_degrees(vendor_radians):
@@ -36,11 +38,11 @@ def arguments(args):
 
 def tool():
     return {'name':'move_head','type':'actuator','multiInstance':False,
-        'description':'TRON2头部转动：填写绝对角度（°）和时间（秒）。以机器人自身视角，抬头为正、低头为负；左转为正、右转为负。仅控制头部两轴；连续新反馈确认到位后通过ACP通知完成。',
+        'description':'转到指定头部角度（相对零位），到位后通知完成。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'pitch_deg':{'type':'number','minimum':CARD_DEG_LIMITS[0][0],'maximum':CARD_DEG_LIMITS[0][1],'title':'俯仰角度（°，抬头为正）','description':'抬头为正、低头为负；绝对目标-60至45°，保持厂家物理范围，必须明确填写'},
-                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'偏航角度（°，自身左转为正）','description':'以机器人自身视角，左转为正、右转为负；绝对目标-90至90°，必须明确填写'},
+                'pitch_deg':{'type':'number','minimum':CARD_DEG_LIMITS[0][0],'maximum':CARD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上正下负；-59.58～44.69°'},
+                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'左右角度（°）','description':'自身左正右负；-89.95～89.95°'},
                 'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'}},
             'required':['pitch_deg','yaw_deg'],
             'x-resource':['head','arm_l','arm_r'],
