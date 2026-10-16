@@ -146,3 +146,8 @@ plugins:
     enabled: true
   robot_status:
     enabled: true
+  squat_counter:
+    enabled: true
+    hold_s: 0.2
+    lost_s: 1.0
+    min_confidence: 0.5
