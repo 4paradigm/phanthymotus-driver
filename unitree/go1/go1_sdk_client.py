@@ -309,6 +309,8 @@ class Go1HighSdkClient:
             wr = _g(s, "wirelessRemote", None)
             out["wireless_remote"] = _to_bytes40(wr) if wr is not None else None
             out["battery"] = parse_battery(_g(s, "bms", None))
+            # 中文说明：仅在成功解析完整 HighState 后记录时间，供运动卡判断反馈是否过期。
+            out["observed_monotonic"] = time.monotonic()
             with self._lock:
                 self._snapshot = out
         except Exception as e:
