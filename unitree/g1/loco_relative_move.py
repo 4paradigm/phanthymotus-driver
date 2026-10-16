@@ -92,7 +92,7 @@ class LocoRelativeMovePlugin:
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": "Closed-loop relative position and heading control using odometry only. "
                            "Translate to the target and settle first, then rotate and correct position drift. "
-                           "Never command rotation and translation together. "
+                           "Do not interrupt translation for ordinary heading error; correct heading at the endpoint. Never command rotation and translation together. "
                            "Pure turns correct their position drift only after rotation. "
                            "Calls SDK directly without SmartMotion sensor safety checks. "
                            "Local checks stop and latch on stale feedback, pose jumps, tilt and overspeed. "
@@ -119,7 +119,7 @@ class LocoRelativeMovePlugin:
                 },
                 "x-action-params": {
                     "move": {"params": ["x", "y", "angle", "direction"],
-                             "description": "Translate to relative x/y, stop, then rotate and correct drift. Pure turns rotate directly. Stop before any heading correction. Maximum execution time 120 seconds."},
+                             "description": "Translate to relative x/y, stop, then rotate and correct drift. Pure turns rotate directly. Correct heading only at the position endpoint after settling. Maximum execution time 120 seconds."},
                     "stop_move": {"params": [], "description": "Cancel the entire pose goal and stop movement."},
                 },
                 "x-resource": "base",

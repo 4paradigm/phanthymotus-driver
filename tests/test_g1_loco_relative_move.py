@@ -259,13 +259,42 @@ class TestRelativeController(unittest.TestCase):
         self.assertTrue(command[0] or command[1])
         self.assertEqual(command[2], 0.)
         drifting = pose(x=1.1, y=.9, yaw=math.pi/2 + .1, now=1.7, speed=.2, rate=.1)
-        self.assertEqual(controller.step(drifting, 1.7)[0], (0., 0., 0.))
-        self.assertEqual(controller.phase, 'brake')
+        command, done = controller.step(drifting, 1.7)
+        self.assertTrue(command[0] or command[1])
+        self.assertEqual(command[2], 0.)
+        self.assertFalse(done)
+        self.assertEqual(controller.phase, 'translate')
         for now in (1.8, 2.4):
-            self.assertEqual(controller.step(pose(x=1.1, y=.9, yaw=math.pi/2 + .1, now=now), now)[0], (0., 0., 0.))
-        command, _ = controller.step(pose(x=1.1, y=.9, yaw=math.pi/2 + .1, now=2.5), 2.5)
+            command, done = controller.step(pose(x=1, y=1, yaw=math.pi/2 + .1, now=now), now)
+            self.assertEqual(command, (0., 0., 0.))
+            self.assertFalse(done)
+        command, _ = controller.step(pose(x=1, y=1, yaw=math.pi/2 + .1, now=2.5), 2.5)
         self.assertEqual(command[:2], (0., 0.))
         self.assertLess(command[2], 0.)
+
+    def test_straight_goal_defers_heading_correction_until_endpoint_and_stop(self):
+        for turn in (0., math.pi / 2):
+            controller = RelativeController(pose(), dict(x=1, y=0, yaw=turn), .3, .5, 0)
+            for i, x in enumerate((0., .3, .6, .9)):
+                sample = pose(x=x, yaw=math.radians(15), now=i*.1, speed=.2)
+                command, done = controller.step(sample, i*.1)
+                self.assertGreater(command[0], 0.)
+                self.assertEqual(command[2], 0.)
+                self.assertFalse(done)
+                self.assertEqual(controller.phase, 'translate')
+                self.assertEqual((controller.x, controller.y), (1., 0.))
+            # At the endpoint residual movement must not trigger rotation yet.
+            command, _ = controller.step(pose(x=1, yaw=math.radians(15), speed=.1, now=.5), .5)
+            self.assertEqual(command, (0., 0., 0.))
+            self.assertEqual(controller.phase, 'translate')
+            for now in (.6, 1.2):
+                command, done = controller.step(pose(x=1, yaw=math.radians(15), now=now), now)
+                self.assertEqual(command, (0., 0., 0.))
+                self.assertFalse(done)
+            self.assertEqual(controller.phase, 'rotate')
+            command, _ = controller.step(pose(x=1, yaw=math.radians(15), now=1.3), 1.3)
+            self.assertEqual(command[:2], (0., 0.))
+            self.assertGreater(command[2] * (1 if turn else -1), 0.)
 
     def test_frozen_feedback_never_completes_and_no_progress_times_out(self):
         controller = RelativeController(pose(), dict(x=0, y=0, yaw=0), .3, .5, 0)

@@ -175,7 +175,7 @@ class RelativeController:
         self.min_speed = min_speed
         self.min_yaw_speed = min_yaw_speed
         has_translation = target['x'] != 0 or target['y'] != 0
-        self.final_turn_started = not has_translation or target['yaw'] == 0
+        self.final_turn_started = not has_translation
         self.phase = 'rotate' if not has_translation and target['yaw'] != 0 else 'translate'
         self.settle_since = None
         self.best = float('inf')
@@ -201,12 +201,6 @@ class RelativeController:
 
     def step(self, pose, now):
         ex, ey, ea, distance = self.update_error(pose)
-        if self.phase == 'brake':
-            if self._settled(pose, now):
-                self._transition('rotate', now)
-            elif now - self.progress_time > self.STALL_SECONDS:
-                raise RuntimeError('Could not stop before heading correction')
-            return (0., 0., 0.), False
         if self.phase == 'rotate':
             self._progress(.2 * abs(ea), now)
             if abs(ea) <= self.ANGLE_TOLERANCE:
@@ -216,13 +210,11 @@ class RelativeController:
             self.settle_since = None
             rotation = math.copysign(min(self.yaw_speed, max(self.min_yaw_speed, 1.2 * abs(ea))), ea)
             return (0., 0., rotation), False
-        if abs(ea) > self.ANGLE_TOLERANCE:
-            self._transition('brake', now)
-            return (0., 0., 0.), False
         self._progress(distance, now)
         if distance <= self.POSITION_TOLERANCE:
             settled = self._settled(pose, now)
-            if settled and not self.final_turn_started:
+            # Correct heading only after reaching and settling at the position.
+            if settled and (not self.final_turn_started or abs(ea) > self.ANGLE_TOLERANCE):
                 self.final_turn_started = True
                 self._transition('rotate', now)
                 return (0., 0., 0.), False
