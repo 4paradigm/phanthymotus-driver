@@ -16,6 +16,8 @@ COMMAND_SCHEMA = "motus.teleop.command/1"
 FEEDBACK_SCHEMA = "motus.teleop.feedback/1"
 COMMAND_FORMAT = "data/teleop-cmd"
 FEEDBACK_FORMAT = "data/teleop-state"
+COMMAND_TOPIC = "/teleop/command"
+STATE_TOPIC = "/teleop/state"
 TRACKING_FRAME = "tracking_x_forward_y_left_z_up"
 MAX_INPUT_AGE_NS = 300_000_000
 MAX_OPERATION_AGE_NS = 5_000_000_000
@@ -51,6 +53,24 @@ def canonical_instance(value):
     if not _TOKEN.fullmatch(normalized):
         raise ValueError("invalid_instance_id")
     return normalized
+
+
+def topics(namespace=None, instance_id=None):
+    """Fixed single-source topics; legacy arguments never select a destination.
+
+    State is the robot card's monitor output, also read by the PICO display.
+    Device identity belongs in the message, independently of these topic names.
+    """
+    return COMMAND_TOPIC, STATE_TOPIC
+
+
+def binding_from_topic(input_topic):
+    value = _text(input_topic, "input_topic", maximum=512)
+    if value != COMMAND_TOPIC:
+        raise ValueError("invalid_input_topic")
+    # Keep the consumer tuple shape without inventing an identity from a topic.
+    # The consumer must bind/validate the source from the received message.
+    return "", None
 
 
 def _wire(value):
@@ -142,10 +162,13 @@ def validate_controls(value):
     return value
 
 
-def validate_input(value, *, clock_id, now_ns, max_age_ns=MAX_INPUT_AGE_NS):
+def validate_input(value, *, clock_id, now_ns, instance_id=None, max_age_ns=MAX_INPUT_AGE_NS):
     _wire(value)
     if value.get("schema") != COMMAND_SCHEMA or value.get("kind") != "input":
         raise ValueError("invalid_input_schema")
+    # G1 binds the source from admitted input; already-bound callers still match it.
+    if instance_id is not None and canonical_instance(value.get("instance_id")) != canonical_instance(instance_id):
+        raise ValueError("input_binding_mismatch")
     _identity(value, clock_id=clock_id)
     _integer(value.get("source_monotonic_ns"), "source_monotonic_ns")
     _fresh(value["received_monotonic_ns"], now_ns, max_age_ns)
