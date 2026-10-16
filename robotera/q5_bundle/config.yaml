@@ -148,6 +148,7 @@ plugins:
     enabled: true
   squat_counter:
     enabled: true
-    hold_s: 0.2
-    lost_s: 1.0
-    min_confidence: 0.5
+    depth_cm: 15.0
+    hold_s: 0.15
+    lost_s: 2.0
+    min_confidence: 0.3
