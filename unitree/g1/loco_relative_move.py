@@ -126,7 +126,7 @@ class LocoRelativeMovePlugin:
         if action == "stop_move":
             return self.cancel_and_stop()
         if action != "move":
-            return {"error": f"Unknown loco_relative_move action: {action}"}
+            return None
         try:
             target = self.plan(args)
         except (ValueError, TypeError, OverflowError) as exc:

@@ -534,6 +534,13 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertEqual(tool['inputSchema']['x-resource'], 'base')
         self.assertIn('正向左', tool['inputSchema']['properties']['y']['title'])
 
+    def test_unknown_action_is_declined_without_sending_motion(self):
+        card, backend, notices, _ = self.card()
+        self.assertIsNone(card.dispatch('unsupported_action', {}))
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(notices, [])
+        self.assertFalse(card.busy)
+
     def test_no_feedback_rejects_before_sending(self):
         card, backend, _, _ = self.card()
         backend.failure = 'stale feedback'
