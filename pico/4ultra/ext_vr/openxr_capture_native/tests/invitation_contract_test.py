@@ -1,6 +1,7 @@
 """JVM production parser/TLS + real Python enrollment, on localhost only.
 
-Requires JDK 17, Android compile stubs and a test-only org.json runtime jar.
+Requires JDK 17, Android compile stubs, built PICO release resources and a
+test-only org.json runtime jar.
 Only Android Base64 is adapted to the JDK; no Android Activity/UI is executed.
 This is not PICO installation, permission, browser deep-link or XR acceptance.
 The jar is supplied explicitly; this test never downloads or installs tools.
@@ -34,7 +35,8 @@ async def main():
     android = Path(os.environ['MOTUS_ANDROID_JAR']).resolve()
     json_jar = Path(os.environ['MOTUS_JAVA_JSON_JAR']).resolve()
     java = Path(os.environ['JAVA_HOME']) / 'bin'
-    for path in (android, json_jar, java/'java', java/'javac'):
+    resources = ROOT/'app/build/intermediates/compile_and_runtime_not_namespaced_r_class_jar/picoRelease/processPicoReleaseResources/R.jar'
+    for path in (android, json_jar, resources, java/'java', java/'javac'):
         assert path.is_file(), path
     # This test fixture's JSON runtime is fixed; it is not an APK dependency.
     assert hashlib.sha256(json_jar.read_bytes()).hexdigest() == os.environ['MOTUS_JAVA_JSON_SHA256']
@@ -54,7 +56,7 @@ public final class Base64 {
  }
 }''')
         source = ROOT/'app/src/main/java/com/phanthymotus/capture'
-        classpath = os.pathsep.join(map(str, (temp, json_jar, android)))
+        classpath = os.pathsep.join(map(str, (temp, json_jar, android, resources)))
         subprocess.run([str(java/'javac'), '-encoding', 'UTF-8', '-cp', classpath, '-d', str(temp), str(shim),
             str(source/'ConnectionInvitation.java'), str(source/'ConnectionActivity.java'),
             str(ROOT/'tests/InvitationContract.java')], check=True)

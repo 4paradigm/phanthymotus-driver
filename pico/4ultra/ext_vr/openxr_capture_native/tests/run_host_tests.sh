@@ -34,6 +34,10 @@ if grep -F 'gradle_home="$tool_cache/gradle-$gradle_version"' "$build_script" >/
 fi
 
 "$project_dir/tests/launch_capture_test.sh"
+"${CXX:-clang++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
+  -I"$project_dir/app/src/main/cpp" "$project_dir/tests/overlay_text_test.cpp" \
+  -o "$build_dir/overlay_text_test"
+"$build_dir/overlay_text_test"
 
 for headset in meta pico; do
   case "$headset" in

@@ -1,6 +1,7 @@
 package com.phanthymotus.capture;
 
 import android.app.Activity;
+import com.phanthymotus.picocapture.R;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -40,32 +41,53 @@ public final class ConnectionActivity extends Activity {
 
     private SharedPreferences credentials() { return getSharedPreferences("motus_capture", MODE_PRIVATE); }
     private void message(String value) { runOnUiThread(() -> status.setText(value)); }
+    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+    private LinearLayout card(LinearLayout parent, String heading) {
+        LinearLayout card = new LinearLayout(this); card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(20), dp(16), dp(20), dp(16));
+        card.setBackgroundResource(R.drawable.connection_card);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2); params.topMargin = dp(16);
+        parent.addView(card, params);
+        TextView title = new TextView(this); title.setText(heading); title.setTextSize(20);
+        title.setTypeface(null, android.graphics.Typeface.BOLD); card.addView(title);
+        return card;
+    }
     private Button button(LinearLayout parent, String label, Runnable action) {
         Button button = new Button(this); button.setText(label);
-        button.setOnClickListener(v -> action.run()); parent.addView(button); return button;
+        button.setAllCaps(false); button.setTextSize(16); button.setMinHeight(dp(48));
+        button.setPadding(dp(16), dp(10), dp(16), dp(10));
+        boolean secondary = label.equals("刷新局域网机器人") || label.equals("取消 / 断开");
+        button.setBackgroundResource(R.drawable.connection_button);
+        button.setTextColor(getResources().getColorStateList(secondary ? R.color.connection_secondary_text : R.color.connection_button_text, getTheme()));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2); params.topMargin = dp(10);
+        button.setOnClickListener(v -> action.run()); parent.addView(button, params); return button;
     }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         ScrollView scroll = new ScrollView(this);
         LinearLayout layout = new LinearLayout(this); layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(32, 24, 32, 24); scroll.addView(layout); setContentView(scroll);
+        layout.setPadding(dp(24), dp(24), dp(24), dp(24)); scroll.setFillViewport(true); scroll.addView(layout); setContentView(scroll);
         TextView title = new TextView(this); title.setText("PhanthyMotus · 连接机器人"); title.setTextSize(24); layout.addView(title);
         TextView legend = new TextView(this);
-        legend.setText("首次连接：在 PICO 浏览器打开机器人下载页，安装后点击打开 App 并连接。\n已配对后会自动重连；进入透视采集，按住双握把开始遥操。执行状态请查看 Canvas 监控。");
+        legend.setText("首次连接：在 PICO 浏览器打开机器人下载页，安装后点击打开 App 并连接。\n已配对后会自动重连。G1：松开双握把，确认双臂自然下垂，长按 X+A 一秒建立基准；松键后重新双握接通，松开任一握把暂停。Reset：松开双握把，长按 Y+B 一秒，现场确认复位后重新建立基准。");
         legend.setTextSize(16); layout.addView(legend);
-        status = new TextView(this); status.setTextSize(18); layout.addView(status);
-        devices = new LinearLayout(this); devices.setOrientation(LinearLayout.VERTICAL); layout.addView(devices);
-        button(layout, "刷新局域网机器人", this::discover);
-        address = new EditText(this); address.setSingleLine(true); address.setHint("备用地址，例如 robot.local:15741"); layout.addView(address);
-        button(layout, "连接当前机器人", () -> { if (invitation != null) redeemInvitation(); else begin(address.getText().toString().trim()); });
-        confirm = button(layout, "指纹一致，在头显确认", () -> { confirmed = true; confirm.setEnabled(false); });
+        LinearLayout connection = card(layout, "连接与确认");
+        status = new TextView(this); status.setTextSize(16); status.setPadding(0, dp(12), 0, dp(12));
+        status.setAccessibilityLiveRegion(android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE); connection.addView(status);
+        devices = new LinearLayout(this); devices.setOrientation(LinearLayout.VERTICAL); connection.addView(devices);
+        button(connection, "刷新局域网机器人", this::discover).setBackgroundResource(R.drawable.connection_secondary);
+        LinearLayout manual = card(layout, "备用地址与配对");
+        address = new EditText(this); address.setSingleLine(true); address.setHint("备用地址，例如 robot.local:15741"); address.setMinHeight(dp(48)); address.setTextSize(16); address.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI); manual.addView(address);
+        button(manual, "连接当前机器人", () -> { if (invitation != null) redeemInvitation(); else begin(address.getText().toString().trim()); });
+        confirm = button(manual, "指纹一致，在头显确认", () -> { confirmed = true; confirm.setEnabled(false); });
         confirm.setEnabled(false);
-        button(layout, "连接已配对机器人", () -> launch(null));
-        button(layout, "取消 / 断开", () -> { cancelled = true; confirmed = false; confirm.setEnabled(false); message("已取消连接；运动不会自动恢复"); });
-        button(layout, "忘记设备", () -> new AlertDialog.Builder(this).setMessage("忘记本机凭据？机器人卡片内也需撤销旧配对，才能重新申请。")
+        button(connection, "连接已配对机器人", () -> launch(null));
+        LinearLayout management = card(layout, "连接管理");
+        button(management, "取消 / 断开", () -> { cancelled = true; confirmed = false; confirm.setEnabled(false); message("已取消连接；运动不会自动恢复"); }).setBackgroundResource(R.drawable.connection_secondary);
+        button(management, "忘记设备", () -> new AlertDialog.Builder(this).setMessage("忘记本机凭据？机器人卡片内也需撤销旧配对，才能重新申请。")
             .setPositiveButton("忘记", (d,w) -> { cancelled = true; credentials().edit().clear().commit(); message("已忘记设备"); })
-            .setNegativeButton("取消", null).show());
+            .setNegativeButton("取消", null).show()).setBackgroundResource(R.drawable.connection_danger);
         discover();
         // Cold launch reconnects only to the persisted, certificate-pinned identity.
         // Returning from XR does not auto-launch again; connection management stays reachable.

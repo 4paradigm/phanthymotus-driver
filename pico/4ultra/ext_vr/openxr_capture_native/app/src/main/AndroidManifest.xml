@@ -41,7 +41,8 @@
             </intent-filter>
         </activity>
         <activity android:name="com.phanthymotus.capture.ConnectionActivity"
-            android:exported="true" android:launchMode="singleTop" android:screenOrientation="landscape">
+            android:exported="true" android:launchMode="singleTop" android:screenOrientation="landscape"
+            android:theme="@style/ConnectionTheme" android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

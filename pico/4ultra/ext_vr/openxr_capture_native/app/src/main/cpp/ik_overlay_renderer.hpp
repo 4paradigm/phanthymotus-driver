@@ -1,11 +1,9 @@
 #pragma once
 #include "ik_visualization.hpp"
-#include "operator_labels.hpp"
+#include "overlay_text.hpp"
 #include <GLES3/gl3.h>
 #include <openxr/openxr.h>
 #include <algorithm>
-#include <cctype>
-#include <map>
 #include <cstdio>
 
 namespace motus::openxr_capture {
@@ -20,7 +18,8 @@ class IkOverlayRenderer {
   }
   void Draw(const IkVisualization& value,const XrView& eye,const XrPosef& center,bool connected,bool show_model=false) {
     if(!program_) Initialize();
-    std::vector<float> vertices;
+    std::vector<float> vertices, text_outline, text_fill;
+    auto* destination=&vertices;
     auto rotate=[](XrQuaternionf q,IkPoint p){
       IkPoint u{q.x,q.y,q.z};
       auto cross=[](IkPoint a,IkPoint b){return IkPoint{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]};};
@@ -39,35 +38,32 @@ class IkOverlayRenderer {
       const float left=std::tan(eye.fov.angleLeft),right=std::tan(eye.fov.angleRight);
       const float down=std::tan(eye.fov.angleDown),up=std::tan(eye.fov.angleUp);
       float depth=-view[2];
-      vertices.insert(vertices.end(),{2*view[0]/(right-left)-(right+left)/(right-left)*depth,
+      destination->insert(destination->end(),{2*view[0]/(right-left)-(right+left)/(right-left)*depth,
                                      2*view[1]/(up-down)-(up+down)/(up-down)*depth,0,depth,
                                      color[0],color[1],color[2],alpha});
     };
     auto line=[&](IkPoint a,IkPoint b,IkPoint color){vertex(a,color);vertex(b,color);};
-    const IkPoint green{.25f,1.f,.65f},orange{1.f,.65f,.2f},pink{1.f,.35f,.85f},gray{.55f,.6f,.65f};
+    const IkPoint green{.25f,1.f,.65f},orange{1.f,.65f,.2f},pink{1.f,.35f,.85f},gray{.94f,.95f,.96f};
     auto model=[&](IkPoint p){p[2]+=.29178f-value.shoulder_height;return IkOperatorViewPoint(p);};
-    // Small bitmap text as line segments, in the same stereo plane as the model.
-    auto text=[&](std::string s,float x,float y,IkPoint color){
-      static const std::map<char,std::array<int,7>> font{
-        {'A',{14,17,17,31,17,17,17}},{'B',{30,17,17,30,17,17,30}},{'C',{14,17,16,16,16,17,14}},
-        {'D',{30,17,17,17,17,17,30}},{'E',{31,16,16,30,16,16,31}},{'F',{31,16,16,30,16,16,16}},
-        {'G',{14,17,16,23,17,17,15}},{'H',{17,17,17,31,17,17,17}},{'I',{31,4,4,4,4,4,31}},
-        {'J',{7,2,2,2,18,18,12}},{'K',{17,18,20,24,20,18,17}},{'L',{16,16,16,16,16,16,31}},
-        {'M',{17,27,21,21,17,17,17}},{'N',{17,25,25,21,19,19,17}},{'O',{14,17,17,17,17,17,14}},
-        {'P',{30,17,17,30,16,16,16}},{'Q',{14,17,17,17,21,18,13}},{'R',{30,17,17,30,20,18,17}},
-        {'S',{15,16,16,14,1,1,30}},{'T',{31,4,4,4,4,4,4}},{'U',{17,17,17,17,17,17,14}},
-        {'V',{17,17,17,17,17,10,4}},{'W',{17,17,17,21,21,21,10}},{'X',{17,17,10,4,10,17,17}},
-        {'Y',{17,17,10,4,4,4,4}},{'Z',{31,1,2,4,8,16,31}},{'_',{0,0,0,0,0,0,31}},
-        {'0',{14,17,19,21,25,17,14}},{'1',{4,12,4,4,4,4,14}},{'2',{14,17,1,2,4,8,31}},
-        {'3',{30,1,1,14,1,1,30}},{'4',{2,6,10,18,31,2,2}},{'5',{31,16,16,30,1,1,30}},
-        {'6',{14,16,16,30,17,17,14}},{'7',{31,1,2,4,8,8,8}},{'8',{14,17,17,14,17,17,14}},
-        {'9',{14,17,17,15,1,1,14}},{':',{0,4,4,0,4,4,0}},{'-',{0,0,0,31,0,0,0}}};
-      for(char c:s.substr(0,54)){
-        auto it=font.find(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-        if(it!=font.end())for(int row=0;row<7;++row)for(int col=0;col<5;++col)if(it->second[row]&(1<<(4-col)))
-          line({x+col*.0028f,y-row*.0028f,-1.3f},{x+(col+.85f)*.0028f,y-row*.0028f,-1.3f},color);
-        x+=.017f;
-      }
+    auto quad=[&](float left,float top,float right,float bottom,IkPoint color){
+      vertex({left,top,-1.3f},color);vertex({left,bottom,-1.3f},color);vertex({right,top,-1.3f},color);
+      vertex({right,top,-1.3f},color);vertex({left,bottom,-1.3f},color);vertex({right,bottom,-1.3f},color);
+    };
+    auto text=[&](const std::string& s,float x,float y,IkPoint color,int lines=1){
+      constexpr float pixel=.0012f, outline=.0012f;
+      LayoutOverlayText(s,566,lines,[&](const OverlayGlyph& glyph,int gx,int gy){
+        for(int row=0;row<24;++row)for(int col=0;col<32;) {
+          if(!(glyph.rows[row] & (1u<<col))) { ++col; continue; }
+          int start=col++;
+          while(col<32 && (glyph.rows[row] & (1u<<col)))++col;
+          float left=x+(gx+start)*pixel,right=x+(gx+col)*pixel,top=y-(gy+row)*pixel;
+          destination=&text_outline;
+          quad(left-outline,top+outline,right+outline,top-pixel-outline,{.035f,.04f,.045f});
+          destination=&text_fill;
+          quad(left,top,right,top-pixel,color);
+        }
+      });
+      destination=&vertices;
     };
     if(!show_model){
       for(const auto& pixel:kOperatorLabelPixels){
@@ -81,8 +77,9 @@ class IkOverlayRenderer {
     std::size_t measured_begin=0,measured_count=0;
     if(show_model) {
     if(value.teleop || !value.available){
-      text(value.control_label(),-.34f,.39f,value.control_fresh() && value.state=="active"?green:pink);
-      text(value.control_hint(),-.34f,.55f,gray);
+      text(value.control_label(),-.34f,.39f,value.control_fresh() && value.state=="active"?green:
+        value.control_fresh() && value.state!="fault" && value.state!="error"?orange:pink);
+      text(value.control_hint(),-.34f,.62f,gray,3);
       if(value.fresh() && value.feedback_fresh && value.alignment_state!="unavailable"){
         for(int i=0;i<2;++i){
           char error[48];std::snprintf(error,sizeof(error),"%s %d MM  %d DEG",i==0?"L":"R",
@@ -149,10 +146,13 @@ class IkOverlayRenderer {
         if(!value.tianyi)draw(value.ik,orange);
         for(auto p:value.targets){auto t=model(p);line({t[0]-.009f,t[1],t[2]},{t[0]+.009f,t[1],t[2]},pink);line({t[0],t[1]-.009f,t[2]},{t[0],t[1]+.009f,t[2]},pink);}
       }else text("TARGET STALE",-.34f,-.43f,pink);
-      if(!value.reason.empty())text(value.reason,-.34f,-.51f,pink);
+      if(!value.reason.empty())text(value.reason,-.34f,-.60f,pink,2);
       if(value.measured.size()==2)line(model(value.measured[0][0]),model(value.measured[1][0]),gray);
     }
     }
+    const auto line_count=vertices.size()/8;
+    vertices.insert(vertices.end(),text_outline.begin(),text_outline.end());
+    vertices.insert(vertices.end(),text_fill.begin(),text_fill.end());
     glUseProgram(program_);glBindVertexArray(vao_);glBindBuffer(GL_ARRAY_BUFFER,buffer_);
     glBufferData(GL_ARRAY_BUFFER,vertices.size()*sizeof(float),vertices.data(),GL_STREAM_DRAW);
     glEnableVertexAttribArray(0);glVertexAttribPointer(0,4,GL_FLOAT,GL_FALSE,8*sizeof(float),nullptr);
@@ -164,7 +164,9 @@ class IkOverlayRenderer {
       glDrawArrays(GL_LINES,static_cast<GLint>(measured_begin),static_cast<GLsizei>(measured_count));
     }
     glLineWidth(2);
-    glDrawArrays(GL_LINES,0,static_cast<GLsizei>(vertices.size()/8));
+    glDrawArrays(GL_LINES,0,static_cast<GLsizei>(line_count));
+    glDrawArrays(GL_TRIANGLES,static_cast<GLint>(line_count),
+      static_cast<GLsizei>((text_outline.size()+text_fill.size())/8));
     glDisable(GL_BLEND);
     glBindVertexArray(0);glBindBuffer(GL_ARRAY_BUFFER,0);glUseProgram(0);
   }
