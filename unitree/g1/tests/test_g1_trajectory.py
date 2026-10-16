@@ -109,6 +109,29 @@ def test_replay_sends_saved_target_and_rejects_stale_feedback(tmp_path):
     assert not channel.positions
 
 
+@pytest.mark.parametrize('delay_ms', [99, 100, 101, 120])
+def test_replay_rejects_snapshot_that_expires_during_read(tmp_path, delay_ms):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    command = packet(arm, target=.1)
+    arm.replay_deadline_ns = arm.clock()+200_000_000
+    delayed = False
+    def snapshot():
+        nonlocal delayed
+        value = copy.deepcopy(sample)
+        if not delayed:
+            delayed = True
+            advance(delay_ms, fresh=False)
+        return value
+    arm._snapshot_provider = snapshot
+    if delay_ms <= 100:
+        arm.write_replay(command)
+        assert channel.positions[-1][0] == pytest.approx([.1]*10)
+    else:
+        with pytest.raises(ValueError, match='arm_feedback_stale'):
+            arm.write_replay(command)
+        assert not channel.positions
+
+
 def api_rig(tmp_path):
     import threading
     from motion_control import MotionControl
@@ -330,13 +353,30 @@ def test_start_difference_reports_offset_without_position_gate(tmp_path, degrees
     assert not trajectory._difference({'frames': [{'target_q': [0.]*10}]})['ready']
 
 
-def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_path):
-    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+def clocked_api_rig(tmp_path, monkeypatch):
+    rig = api_rig(tmp_path)
+    card, arm, _, _, _, done, ticker = rig
+    done.set(); ticker.join(1)
+    now = [arm.clock()]
+    arm.clock = card.clock = lambda: now[0]
+    def advance(seconds):
+        now[0] += round(seconds*1e9)
+        arm.tick()
+        time.sleep(0)  # Let the SDK-release substitute thread finish.
+        return False
+    # Keep the real wait loop and stop state machine independent of host jitter.
+    monkeypatch.setattr(card.trajectory.cancel, 'wait', advance)
+    monkeypatch.setattr('teleop_control.time', SimpleNamespace(monotonic=time.monotonic, sleep=advance))
+    return (*rig, advance)
+
+
+def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_path, monkeypatch):
+    card, arm, sample, channel, receipts, done, ticker, advance = clocked_api_rig(tmp_path, monkeypatch)
     writes = []
     try:
         card.dispatch('record_start', {})
         for seq in (1, 2, 3):
-            arm.accept_control(packet(arm, seq, target=.01*seq)); time.sleep(.06)
+            arm.accept_control(packet(arm, seq, target=.01*seq)); advance(.06)
         name = card.dispatch('record_stop', {})['filename']
         recording = read_recording(card.trajectory.directory, name, arm.limits)
         card.stop(); channel.positions.clear()
@@ -367,8 +407,8 @@ def test_replay_moves_to_start_at_point_one_then_preserves_recorded_timing(tmp_p
         card.trajectory.stop(); done.set(); ticker.join(1)
 
 
-@pytest.mark.parametrize('failure', ['cancel', 'stale_feedback'])
-def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path, failure):
+@pytest.mark.parametrize('failure', [None, 'cancel', 'stale_feedback'])
+def test_start_transition_completion_and_errors_with_real_threads(tmp_path, failure):
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     writes = []
     try:
@@ -392,8 +432,14 @@ def test_start_transition_errors_stop_and_position_offset_does_not_gate(tmp_path
         result = card.dispatch('play', {'filename': name})
         card.trajectory.thread.join(9)
         outcome = card.dispatch('action_status', {'action_id': result['action_id']})
-        assert outcome['status'] in ('cancelled', 'error'), outcome
-        assert 'replaying' not in writes
+        assert 'moving_to_start' in writes
+        if failure is None:
+            assert outcome['status'] == 'completed', outcome
+            assert 'replaying' in writes
+            assert outcome['result']['stop']['authority_released'] and not arm.session_id
+        else:
+            assert outcome['status'] == ('cancelled' if failure == 'cancel' else 'error'), outcome
+            assert 'replaying' not in writes
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
 
@@ -469,8 +515,8 @@ def test_close_pause_frame_tolerates_scheduler_jitter(tmp_path, delay):
                        dict(frame, kind='hold', t_ns=64_000_000),
                        dict(frame, t_ns=150_000_000, source_sequence=2)]}
         original = card.trajectory._send_frame
-        def send(frame, seq, due):
-            original(frame, seq, due)
+        def send(frame, seq):
+            original(frame, seq)
             if seq == 0: time.sleep(delay)
         card.trajectory._send_frame = send
         card.trajectory.cancel.clear()
@@ -510,8 +556,9 @@ def test_live_and_replay_use_same_execution_failure_handling(tmp_path, replay, f
     assert arm.state == ('fault' if failure == 'sdk' else 'hold')
 
 
-def test_delayed_replay_skips_obsolete_targets_but_keeps_pause(tmp_path):
-    card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
+@pytest.mark.parametrize('delay_at', ['before_wait', 'after_send', 'during_wait'])
+def test_delayed_replay_skips_obsolete_targets_but_keeps_pause(tmp_path, monkeypatch, delay_at):
+    card, arm, sample, channel, receipts, done, ticker, advance = clocked_api_rig(tmp_path, monkeypatch)
     try:
         card.stop()
         target = list(sample['q'])
@@ -525,17 +572,29 @@ def test_delayed_replay_skips_obsolete_targets_but_keeps_pause(tmp_path):
         sent = []; holds = []
         send = card.trajectory._send_frame
         hold = arm.hold
-        def delayed(frame, seq, due):
-            send(frame, seq, due); sent.append(frame['source_sequence'])
-            if len(sent) == 1: time.sleep(.055)
+        def delayed(frame, seq):
+            send(frame, seq); sent.append(frame['source_sequence'])
+            if delay_at == 'after_send' and len(sent) == 1: advance(.055)
+        wait = card.trajectory._wait_until
+        delayed_once = False
+        def late_wait(due):
+            nonlocal delayed_once
+            if delay_at == 'before_wait' and not delayed_once:
+                delayed_once = True
+                advance(.09)
+            wait(due)
+            if delay_at == 'during_wait' and not delayed_once:
+                delayed_once = True
+                advance(.055)
         def pause(reason, **kwargs):
             holds.append(reason); return hold(reason, **kwargs)
         card.trajectory._send_frame = delayed; arm.hold = pause
+        card.trajectory._wait_until = late_wait
         card.trajectory.cancel.clear()
         card.trajectory.last_action = {'phase': 'moving_to_start'}
         card.trajectory._run('latest', recording)
         assert card.trajectory.last_action['status'] == 'completed', card.trajectory.last_action
-        assert sent == [1, 4, 6]
+        assert sent == ([1, 4, 6] if delay_at == 'after_send' else [4, 6])
         assert 'replay_pause' in holds
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)

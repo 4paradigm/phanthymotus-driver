@@ -155,8 +155,7 @@ class TrajectoryControl:
             if remaining <= 0: return
             self.cancel.wait(min(.02, remaining))
 
-    def _send_frame(self, frame, seq, due):
-        self._wait_until(due)
+    def _send_frame(self, frame, seq):
         now = self.control.clock()
         command = envelope(dict(boot_id=self.arm.boot_id, session_id=self.arm.session_id, secret=self.arm.secret),
             seq=seq, source_seq=frame['source_sequence'], mapping_epoch=frame['mapping_epoch'],
@@ -175,7 +174,7 @@ class TrajectoryControl:
             step = self.START_SPEED*dt
             values = [t if abs(t-p) <= step else p+math.copysign(step, t-p)
                       for p,t in zip(self.arm.last_q, target)]
-            self._send_frame(dict(first, target_q=values), seq, self.control.clock())
+            self._send_frame(dict(first, target_q=values), seq)
             seq += 1
         return seq
 
@@ -194,22 +193,20 @@ class TrajectoryControl:
             frames = recording['frames']
             for index, frame in enumerate(frames):
                 seq = next_seq+index
-                # Match live input: keep the latest due target, preserving pauses.
+                self._wait_until(start+frame['t_ns'])
+                if frame['kind'] == 'hold':
+                    self.arm.hold('replay_pause')
+                    continue
+                if self.arm.state == 'hold':
+                    self.arm.tick()
+                    resumed = self.arm.dispatch('resume', {k: claimed[k] for k in ('session_id', 'secret')})
+                    if resumed.get('error'): raise ValueError(resumed['error'])
+                # Recheck after waiting: a late wakeup must not send obsolete targets.
                 if (frame['kind'] == 'target' and index+1 < len(frames)
                         and frames[index+1]['kind'] == 'target'
                         and start+frames[index+1]['t_ns'] <= self.control.clock()):
                     continue
-                due = start+frame['t_ns']
-                if frame['kind'] == 'hold':
-                    self._wait_until(due)
-                    self.arm.hold('replay_pause')
-                    continue
-                if self.arm.state == 'hold':
-                    self._wait_until(due)
-                    self.arm.tick()
-                    resumed = self.arm.dispatch('resume', {k: claimed[k] for k in ('session_id', 'secret')})
-                    if resumed.get('error'): raise ValueError(resumed['error'])
-                self._send_frame(frame, seq, due)
+                self._send_frame(frame, seq)
             self._wait_until(start+recording['duration_ns'])
             status = 'completed'
             result = {'filename': recording['filename'], 'sha256': recording['sha256'], 'frames': len(recording['frames'])}
