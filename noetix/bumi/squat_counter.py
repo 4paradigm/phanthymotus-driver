@@ -25,9 +25,12 @@ class SquatCounterPlugin:
         self._subscription = None
         self._input_topic = ""
         self._last_warn = 0.0
-        self._counter = SquatCounter(cfg.get("hold_s", 0.2),
-                                     cfg.get("lost_s", 1.0),
-                                     cfg.get("min_confidence", 0.5))
+        self._counter = SquatCounter(
+            window_s=cfg.get("window_s", 2.0),
+            down_ratio=cfg.get("down_ratio", 0.5),
+            lost_s=cfg.get("lost_s", 3.0),
+            min_confidence=cfg.get("min_confidence", 0.5),
+        )
 
     def get_tool(self):
         return {
@@ -57,7 +60,7 @@ class SquatCounterPlugin:
         return {
             "state": "running" if self._subscription else "idle",
             "count": self._counter.count, "track_id": self._counter.track_id,
-            "phase": self._counter.phase,
+            "in_squat": self._counter.in_squat,
             "topic_in": ([{"topic": topic, "format": "data/json"}] if topic else []),
             "topic_out": [{"topic": self._output_topic, "format": "data/json"}],
         }
