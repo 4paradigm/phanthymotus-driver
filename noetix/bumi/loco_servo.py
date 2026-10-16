@@ -645,7 +645,10 @@ class LocoServoPlugin:
             except Exception:                                 # noqa: BLE001
                 pass
         del sink
-        return {"state": "stopped"}
+        # Actuator lifecycle: a successfully torn-down stream is idle and may
+        # be started again.  ``stopped`` is not a lifecycle state understood by
+        # the canvas/framework and leaves the card looking non-restartable.
+        return {"state": "idle"}
 
     def _info(self):
         with self._lock:

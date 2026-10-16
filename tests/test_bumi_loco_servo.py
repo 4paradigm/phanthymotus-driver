@@ -298,6 +298,14 @@ def test_dry_run_is_on_by_default_until_the_full_pipeline_is_validated():
     assert card.get_tool()["configSchema"]["properties"]["dry_run"]["default"] is True
 
 
+def test_stop_returns_idle_after_tearing_down_the_stream():
+    """A stopped actuator must re-enter the framework's restartable idle state."""
+    card = _card(loco=FakeLoco())
+    card._running = True
+    assert card.dispatch("stop", {}) == {"state": "idle"}
+    assert card._info()["state"] == "idle"
+
+
 # ── holding is an action, and it is a repeated one ───────────────────────────
 
 def test_hold_commands_zero_rather_than_doing_nothing():
