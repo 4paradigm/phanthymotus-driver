@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>G1 颁奖仪式 · 主持卡片</title>
+<style>
+:root{color-scheme:dark;--gold:#e9c47c;--muted:#b4bac9}*{box-sizing:border-box}body{margin:0;background:#101522;color:#f5f2eb;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:48px 20px}main{max-width:860px;margin:auto;border:1px solid #625238;border-radius:24px;overflow:hidden;background:linear-gradient(145deg,#252c3b,#151b29);box-shadow:0 24px 80px #0005}header{padding:44px 42px 30px;background:radial-gradient(ellipse at top right,#b78a382c,transparent 70%)}.eyebrow{font-size:12px;letter-spacing:3px;color:var(--gold)}h1{font-size:40px;letter-spacing:3px;margin:17px 0 12px}p{line-height:1.8;margin:8px 0}.subtitle{color:var(--muted)}.tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}.tags span{border:1px solid #ffffff24;border-radius:20px;padding:6px 13px;font-size:12px;color:var(--gold)}section{padding:24px 42px;border-top:1px solid #ffffff12}h2{font-size:15px;color:var(--gold);margin:0 0 16px;letter-spacing:1px}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.step{padding:18px 12px;background:#ffffff05;border:1px solid #ffffff14;border-radius:12px}.step b{display:block;font-size:17px;margin:10px 0}.step small{color:var(--muted);line-height:1.6}.num{font-size:12px;color:var(--gold)}blockquote{margin:0;padding-left:16px;border-left:2px solid var(--gold);font-size:16px;line-height:1.9}.label{font-size:12px;color:var(--muted);margin-bottom:8px}.script+.script{margin-top:22px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit;font-size:14px;line-height:1.9;background:#0c111d;padding:18px;border-radius:10px;margin:0}.note{font-size:13px;color:var(--muted)}footer{padding:20px 42px;font-size:12px;line-height:1.8;color:var(--muted);border-top:1px solid #ffffff12}@media(max-width:600px){body{padding:18px 12px}header,section{padding:26px 22px}h1{font-size:30px}.flow{grid-template-columns:repeat(2,1fr)}footer{padding:20px 22px}}@media print{body{background:white;padding:0}main{box-shadow:none}main,header,section,footer{break-inside:avoid}body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="eyebrow">G1 · AWARD CEREMONY</div>
+<h1>让每一份出色，被郑重喝彩</h1>
+<p class="subtitle">G1 机器人颁奖典礼主持卡片</p>
+<p>以声音揭晓荣耀，以转身致意获奖者，以掌声点亮属于他们的时刻。</p>
+<div class="tags"><span>一键整场</span><span>奖项数量不限</span><span>逐项揭晓 · 逐位致意</span></div>
+</header>
+<section>
+<h2>仪式流程</h2>
+<p class="label">开场 → 按输入顺序逐项颁奖 → 谢幕；每个奖项完成以下流程后，进入下一项。</p>
+<div class="flow">
+<div class="step"><span class="num">01 / 揭晓</span><b>念名字</b><small>播报奖项与获奖者，可先倒计时三、二、一。</small></div>
+<div class="step"><span class="num">02 / 致意</span><b>转身</b><small>经现场动作确认后，转向获奖者一侧。</small></div>
+<div class="step"><span class="num">03 / 庆祝</span><b>鼓掌</b><small>为当前获奖者鼓掌一次。</small></div>
+<div class="step"><span class="num">04 / 衔接</span><b>转回</b><small>转回正前方，准备揭晓下一项。</small></div>
+</div>
+</section>
+<section>
+<h2>主持台词</h2>
+<div class="script"><div class="label">开场</div><blockquote>颁奖典礼现在开始，请嘉宾就座，我们即将揭晓各个奖项。</blockquote></div>
+<div class="script"><div class="label">逐项揭晓 · 替换方括号内的内容</div><blockquote>三、二、一！[奖项名称] 的获得者是 [获奖人姓名]。</blockquote></div>
+<div class="script"><div class="label">谢幕</div><blockquote>颁奖典礼到此结束，感谢大家，明年再见。</blockquote></div>
+</section>
+<section>
+<h2>一键颁奖指令</h2>
+<p class="label">在画布文字输入中发送；下列奖项与姓名仅为示例，使用前替换为实际名单。</p>
+<pre>一键颁奖：最佳创意奖=张三；最佳团队奖=李四；最佳新人奖=王五</pre>
+<p class="note">需要转身时，由现场操作员确认实际条件后，在本轮明确输入：“机器人已稳定站立、周围无遮挡，可以动作”。依照现有技能定义，未确认时只念名字与鼓掌，跳过转身和转回。卡片中的文字展示不代表已完成现场确认。</p>
+</section>
+<footer>主持范围：念词、揭晓、致意与庆祝；实物奖品由现场工作人员递送。<br>依据项目内 g1-award-ceremony.skill.json（v2.1.0）及 README.md 整理。本卡片为展示与操作参考，打开文件不会触发机器人动作。</footer>
+</main>
+</body>
+</html>

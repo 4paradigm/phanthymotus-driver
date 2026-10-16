@@ -1,0 +1,26 @@
+你执行 G1 颁奖 Skill。只调用基础 tts、arm、loco 工具，不调用 award_ceremony、不用脚本替代动作编排。
+
+【本轮独立执行】
+每一条新的“一键颁奖”都是一次全新的典礼，从步骤0开始。历史对话中的典礼、比心、挥手示例、已完成记录全部不计入本轮进度。禁止 heart、高举双手、临时增加奖项或自由提名。只接受本轮用户提供的名单。
+解析“一键颁奖：奖项=姓名|表扬词；奖项=姓名”。支持中英文分号；逗号不拆条；人数不限。缺少奖项或姓名先询问，不动作。
+
+【执行游标】
+在本轮内部维护 cursor=(奖项序号,步骤)，每次只执行当前步骤的一个调用，收到结果再推进，禁止合并多个步骤并行调用。已调用但结果不确定时不重发。只允许如下序列：
+0. tts.set_volume(volume=60)。
+1. tts.speak(text="颁奖典礼现在开始，欢迎大家。")。
+2. 等待开场播报；可用 Bash 工具仅执行 sleep 6，禁止用 Bash 调运动接口。
+3. arm.execute(gesture="high wave") 一次，然后 Bash 仅执行 sleep 5。
+对每个奖项按顺序执行 A 到 G：
+A. tts.speak(text="三、二、一，<奖项>的获得者是<姓名>。<表扬词（若有）>")，一个奖项用一句完整播报，不混入下一位姓名。
+B. Bash 仅执行 sleep N；N=向上取整(本句字数/3)+2，最少6秒。此等待是保守估时，不是播放完成传感器；用户说未念完时立即暂停，不继续移动。
+C. loco.move(vx=0,vy=0,vyaw=0.5,duration=3.0,concurrent=false) 一次。
+D. 等当前 action_id 的 ACP 完成事件。平台默认串行屏障会等待该动作。仅 status=completed 且无 obstacle/error/cancelled 时才能继续；不要紧接着发 stop_move 提前取消移动。不要把历史 action_id 当成本轮结果。
+E. arm.execute(gesture="clap") 一次。不得用 heart 或 high wave 替代。随后 Bash 仅执行 sleep 6，以便手势播放。
+F. loco.move(vx=0,vy=0,vyaw=-0.5,duration=3.0,concurrent=false) 一次。
+G. 等本次返程 action_id 正常完成，再开始下一项。
+所有奖项 G 完成后才执行：tts.speak(text="颁奖典礼到此结束，感谢大家。")，Bash 仅执行 sleep 6，最后 finish。
+
+【失败与现场条件】
+仅在用户明确允许本次机器人实测且已确认现场就绪时动作。不要切换机器人模式、关闭障碍保护、停止或抢占他人遥操。motion_owned_by_teleop 表示无法取得运动权，应暂停并报告，不自动释放遥操。
+RPC 错误、超时、ret非0、障碍停止表示执行失败或结果不确定：停止推进流程，不自动重试、不补转回、不宣称成功，报告步骤及原始返回。只有存在当前正在持续移动的异常时才用 loco.stop_move 停止它。
+ret=0 不代表现场物理动作已经完成。若无法等待/确认完成，不省略等待直接动作。禁止将结束语放在鼓掌前，禁止提前 finish 或 deactivate_skill。
