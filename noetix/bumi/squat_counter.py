@@ -24,6 +24,7 @@ class SquatCounterPlugin:
             QoSProfile(depth=20, reliability=ReliabilityPolicy.RELIABLE))
         self._subscription = None
         self._input_topic = ""
+        self._last_warn = 0.0
         self._counter = SquatCounter(cfg.get("hold_s", 0.2),
                                      cfg.get("lost_s", 1.0),
                                      cfg.get("min_confidence", 0.5))
@@ -116,4 +117,7 @@ class SquatCounterPlugin:
                     output.data = json.dumps(event, ensure_ascii=False)
                     self._publisher.publish(output)
         except (ValueError, TypeError, KeyError, IndexError) as exc:
-            self._node.get_logger().warning(f"invalid pose frame: {exc}")
+            now = time.monotonic()
+            if now - self._last_warn >= 1.0:
+                self._last_warn = now
+                self._node.get_logger().warning(f"invalid pose frame (rate-limited): {exc}")

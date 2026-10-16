@@ -37,6 +37,7 @@ class Plugin:
         self._input_topic = ""
         self._node = None
         self._publisher = None
+        self._last_warn = 0.0
         if _HAS_ROS2:
             try:
                 self._node = Node(f"{namespace}_squat_counter")
@@ -126,6 +127,11 @@ class Plugin:
                 "state": "error",
                 "error": "Connect the pose data/json output before starting",
             }
+        if self._node is None:
+            return {
+                "state": "error",
+                "error": "ROS2 node unavailable — cannot subscribe to pose stream",
+            }
         with self._lock:
             if self._subscription is not None and self._input_topic != input_topic:
                 self.stop()
@@ -182,8 +188,10 @@ class Plugin:
                     output.data = json.dumps(event, ensure_ascii=False)
                     self._publisher.publish(output)
         except (ValueError, TypeError, KeyError, IndexError) as exc:
-            if self._node:
-                self._node.get_logger().warning(f"invalid pose frame: {exc}")
+            now = time.monotonic()
+            if now - self._last_warn >= 1.0 and self._node:
+                self._last_warn = now
+                self._node.get_logger().warning(f"invalid pose frame (rate-limited): {exc}")
 
     def start_all(self):
         """No-op: squat_counter is triggered via MCP start(action=input_topic)."""

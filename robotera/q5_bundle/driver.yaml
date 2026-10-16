@@ -35,4 +35,5 @@ cards:
   - { name: odom,              type: sensor }
   - { name: teleop_state,      type: sensor }
   - { name: robot_status,      type: sensor }
+  - { name: squat_counter,     type: processor }
   - { name: model,             type: resource }
