@@ -385,13 +385,15 @@ class TeachingPlugin:
                 f"用户描述：{metadata['description']}\n使用条件：{metadata['conditions']}\n"
                 f"1. 调用当前设备的 {self.name}.preview，参数：" + json.dumps({"asset_id": asset_id}) + "。\n"
                 "2. 预览成功没有执行动作。若 confirmation_required=false，驱动已核验网页授予的本次会话授权，"
-                "用户要求执行时直接使用返回的 execution_arguments，不再追问。若为 true，向用户询问本次使用条件、移动路径和双臂接管并等待答复；"
+                "用户要求执行时直接使用返回的 execution_arguments，不再追问。若为 true，表示没有网页会话授权，不表示用户尚未在对话中确认。"
+                "先检查当前尚未执行的同一次请求：用户若已明确确认本次使用条件、移动路径、活动空间和双臂接管，不再重复询问；缺少确认时只询问缺少的条件并等待答复。"
                 "也可提示用户在技能详情授权本次会话。不得调用 session_challenge/session_authorize 自行授予权限。"
-                "用户只说技能名称或‘抬手’不等于已确认环境与接管。不得自己填写确认或播报动作已完成。\n"
+                "用户只说技能名称或‘抬手’不等于已确认环境与接管。未取得确认不得填写 true；已经明确确认时应据实填写 true，不得原样照抄预览中的 false。未执行不得播报动作已完成。\n"
                 f"3. 会话授权有效时直接调用 {self.name}.run 并原样传入 execution_arguments。仅当需要逐次确认时，取得确认后必须一次传齐：" + json.dumps({"asset_id": asset_id,
                     "execute": True, "preview_id": "替换为本次预览返回的完整 preview_id", "workspace_clear": True,
                     "take_control": True}, ensure_ascii=False) + "。每次都带 asset_id，不能只传 preview_id。\n"
-                "4. 缺少参数只补齐该参数，不得换动作或猜测起点；预览过期时重新预览，以新的 confirmation_required 为准。会话授权失效后不得复用旧确认。\n"
+                "4. 缺少参数只补齐该参数，不得换动作或猜测起点；等待用户答复导致预览过期时重新预览。重新预览不会抹掉用户对同一次尚未执行请求的明确确认。"
+                "若动作已执行、停止/重启、模式/标定/环境改变或授权被撤销，不得复用此前确认。user_confirmation_required 表示当前调用参数未确认；先核对用户答复和实际参数，不要重复发送两个 false。\n"
                 "预览不通过时报告原因，不得改录制或绕过检查。"
                 + self.adapter.replay_instruction +
                 "设备/标定绑定由驱动强制检查。running 只表示已提交，等待 ACP 完成或通过 info 核对相同 action_id 的终态。"
