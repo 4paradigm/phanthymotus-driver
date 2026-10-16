@@ -1,0 +1,2 @@
+# Lightweight MCP server. Heavy simulation packages belong in a separate venv.
+PyYAML==6.0.3
