@@ -11,8 +11,6 @@ import threading
 import unittest
 from unitree.g1.loco_relative_move import LocoRelativeMovePlugin, PointBackend
 from unitree.g1.relative_feedback import PoseFeedback, RelativeController, MotionSafety, SafetyViolation, wrap
-from unitree.g1.point_motion import PointMotion
-from unitree.g1.point_rpc import PointRpc
 
 class TestBundleShutdown(unittest.TestCase):
     def test_cards_stop_before_safety_peer_even_when_card_cleanup_fails(self):
@@ -41,319 +39,6 @@ class TestBundleShutdown(unittest.TestCase):
                 else:
                     exec(cleanup, namespace)
                 self.assertEqual(calls, ['cards', 'safety', 'rpc', 'executor', 'ros'])
-
-
-class TestPointMotion(unittest.TestCase):
-    def test_stop_without_start_sends_zero_velocity(self):
-        calls = []
-        class Client:
-            def BeginStopMove(self):
-                calls.append('stop')
-                return lambda: 0
-        controller = PointMotion(Client())
-        self.assertEqual(controller.stop()['ret'], 0)
-        self.assertEqual(calls, ['stop'])
-
-    def test_deadline_stop_is_independent_of_move_response(self):
-        sent, stopped, release = threading.Event(), threading.Event(), threading.Event()
-        class Client:
-            def BeginMove(self, *args):
-                sent.set()
-                def wait():
-                    if not release.wait(2):
-                        raise TimeoutError('test release missing')
-                    return 0
-                return wait
-            def BeginStopMove(self):
-                stopped.set()
-                return lambda: 0
-        controller = PointMotion(Client())
-        result = []
-        thread = threading.Thread(target=lambda: result.append(controller.start(0.3, 0, 0, .05, 'step')))
-        thread.start()
-        try:
-            self.assertTrue(sent.wait(1))
-            self.assertTrue(stopped.wait(1))
-            self.assertTrue(thread.is_alive())
-            self.assertEqual(controller.get_result('step')['status'], 'pending')
-        finally:
-            release.set()
-            thread.join(2)
-        self.assertEqual(controller.get_result('step')['status'], 'completed')
-
-    def test_stop_timeout_recovers_before_terminal_outcome(self):
-        replies, stops = iter([3104, 0]), []
-        class Client:
-            def BeginMove(self, *args):
-                return lambda: 0
-            def BeginStopMove(self):
-                stops.append('stop')
-                return lambda: next(replies)
-        class Timer:
-            def __init__(self, *args, **kwargs): pass
-            def start(self): pass
-            def cancel(self): pass
-        controller = PointMotion(Client(), timer_factory=Timer)
-        controller.start(.3, 0, 0, 1, 'step')
-        controller._expire('step', 1)
-        outcome = controller.get_result('step')
-        self.assertEqual(len(stops), 2)
-        self.assertEqual(outcome['status'], 'completed')
-        self.assertTrue(outcome['result']['stop_acknowledged'])
-        self.assertIsNone(outcome['result']['error'])
-
-    def test_stop_timeout_retries_are_bounded_and_fail_closed(self):
-        stops = []
-        class Client:
-            def BeginStopMove(self):
-                stops.append('stop')
-                return lambda: 3104
-        controller = PointMotion(Client())
-        self.assertEqual(controller.stop()['ret'], 3104)
-        self.assertEqual(len(stops), 3)
-
-    def test_old_stop_timeout_does_not_send_retry_after_replacement(self):
-        stops, controller = [], None
-        class Timer:
-            def __init__(self, *args, **kwargs): pass
-            def start(self): pass
-            def cancel(self): pass
-        class Client:
-            def BeginMove(self, *args):
-                return lambda: 0
-            def BeginStopMove(self):
-                stops.append('stop')
-                def wait():
-                    controller.start(.3, 0, 0, 1, 'new')
-                    return 3104
-                return wait
-        controller = PointMotion(Client(), timer_factory=Timer)
-        controller.start(.3, 0, 0, 1, 'old')
-        controller._expire('old', 1)
-        self.assertEqual(len(stops), 1)
-        self.assertEqual(controller.get_result('new')['status'], 'pending')
-
-    def test_move_failure_is_not_reported_completed(self):
-        class Client:
-            def BeginMove(self, *args):
-                return lambda: 3104
-            def BeginStopMove(self):
-                return lambda: 0
-        controller = PointMotion(Client())
-        self.assertEqual(controller.start(.3, 0, 0, 1, 'failed')['ret'], 3104)
-        self.assertEqual(controller.get_result('failed')['status'], 'error')
-
-
-class TestPointRpc(unittest.TestCase):
-    def test_transport_preserves_velocity_codes_and_cleans_pending(self):
-        def module(name, **attrs):
-            result = types.ModuleType(name)
-            result.__dict__.update(attrs)
-            return result
-        class Future:
-            def SetRequestId(self, request_id):
-                self.id = request_id
-            def Ready(self, response):
-                self.response = response
-            def GetResult(self, timeout):
-                if hasattr(self, 'response'):
-                    return SimpleNamespace(code=0, value=self.response)
-                return SimpleNamespace(code=1)
-        stubs = {
-            'unitree_sdk2py.idl.unitree_api.msg.dds_': module('idl',
-                Request_=lambda header, parameter, binary: SimpleNamespace(header=header, parameter=parameter),
-                RequestHeader_=lambda identity, lease, policy: SimpleNamespace(identity=identity),
-                RequestIdentity_=lambda request_id, api: SimpleNamespace(id=request_id, api_id=api),
-                RequestLease_=lambda value: value, RequestPolicy_=lambda *args: args),
-            'unitree_sdk2py.g1.loco.g1_loco_api': module('api', ROBOT_API_ID_LOCO_SET_VELOCITY=7105),
-            'unitree_sdk2py.rpc.request_future': module('future', RequestFuture=Future),
-            'unitree_sdk2py.utils.future': module('results',
-                FutureResult=SimpleNamespace(FUTURE_SUCC=0, FUTUTE_ERR_TIMEOUT=1)),
-            'unitree_sdk2py.rpc.internal': module('codes', RPC_ERR_CLIENT_SEND=3102,
-                RPC_ERR_CLIENT_API_TIMEOUT=3104, RPC_ERR_CLIENT_API_NOT_MATCH=3105, RPC_ERR_UNKNOWN=3001),
-        }
-        for case, expected in [('success', 0), ('server', 3104), ('send', 3102), ('timeout', 3104), ('api', 3105)]:
-            with self.subTest(case=case), patch.dict('sys.modules', stubs):
-                rpc = PointRpc.__new__(PointRpc)
-                rpc.lock, rpc.pending = threading.Lock(), {}
-                requests = []
-                def write(request, timeout):
-                    requests.append(request)
-                    if case == 'send':
-                        return False
-                    if case != 'timeout':
-                        identity = SimpleNamespace(id=request.header.identity.id,
-                                                   api_id=999 if case == 'api' else 7105)
-                        rpc._receive(SimpleNamespace(header=SimpleNamespace(identity=identity,
-                            status=SimpleNamespace(code=3104 if case == 'server' else 0))))
-                    return True
-                rpc.writer = SimpleNamespace(Write=write)
-                wait = rpc.BeginMove(.3, -.2, .5, True)
-                self.assertEqual(json.loads(requests[0].parameter),
-                                 {'velocity': [.3, -.2, .5], 'duration': 864000.})
-                self.assertEqual(wait(), expected)
-                self.assertEqual(rpc.pending, {})
-
-    def test_close_fails_pending_waiters_and_closes_channels_once(self):
-        rpc = PointRpc.__new__(PointRpc)
-        rpc.lock, rpc.closed = threading.Lock(), False
-        failures, closes = [], []
-        rpc.pending = {1: SimpleNamespace(Fail=failures.append)}
-        rpc.reader = SimpleNamespace(Close=lambda: closes.append('reader'))
-        rpc.writer = SimpleNamespace(Close=lambda: closes.append('writer'))
-        rpc.close()
-        rpc.close()
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(closes, ['reader', 'writer'])
-        self.assertEqual(rpc.pending, {})
-
-
-class TestSmartMotionPointIntegration(unittest.TestCase):
-    def harness(self):
-        source = (Path(__file__).resolve().parents[1] / 'unitree/g1/safety_harness.py').read_text()
-        process = next(n for n in ast.parse(source).body
-                       if isinstance(n, ast.FunctionDef) and n.name == '_run_smart_motion_process')
-        selected = ('cancel_point', 'point_stopped', 'do_stop', 'emergency_stop',
-                    'handle_point_move', 'handle_point_result', 'update_velocity')
-        functions = [n for n in process.body if isinstance(n, ast.FunctionDef) and n.name in selected]
-        calls, events = [], []
-        class Client:
-            def BeginMove(self, *args):
-                calls.append(('move', args))
-                return lambda: 0
-            def BeginStopMove(self):
-                calls.append(('stop', ()))
-                return lambda: 0
-            def StopMove(self):
-                calls.append(('legacy_stop', ()))
-                return 0
-            def SetFsmId(self, value):
-                calls.append(('fsm', value))
-        class Timer:
-            def __init__(self, *args, **kwargs):
-                pass
-            def start(self):
-                pass
-            def cancel(self):
-                pass
-        class Thread:
-            def __init__(self, target, **kwargs):
-                self.target = target
-            def start(self):
-                self.target()
-        client = Client()
-        namespace = dict(time=time, threading=SimpleNamespace(Thread=Thread),
-            MotionState=SimpleNamespace(IDLE='idle', MOVING='moving', NAVIGATING='nav', NAV_PAUSED='paused'),
-            SpeedZone=SimpleNamespace(NORMAL='normal', STOPPED='stopped'),
-            clamp=lambda vx, vy, vyaw, zone: (vx, vy, vyaw),
-            publish_event=lambda kind, data: events.append((kind, data)), loco_client=client)
-        text = """def factory():
-    point_motion = None
-    point_sequence = None
-    point_cancelled = {}
-    state = MotionState.IDLE
-    current_cmd = None
-    speed_zone = SpeedZone.NORMAL
-    stop_repeat_count = 0
-    move_timer = None
-    tilt_triggered = False
-    process_safety_checks = lambda: None
-"""
-        for node in functions:
-            text += '\n'.join('    ' + line for line in ast.get_source_segment(source, node).splitlines()) + '\n'
-        text += """    def snapshot():
-        return point_motion, point_sequence, state, point_cancelled
-    return locals()
-"""
-        exec(text, namespace)
-        env = namespace['factory']()
-        modules = {
-            'point_motion': SimpleNamespace(PointMotion=lambda c, **kw: PointMotion(c, timer_factory=Timer, **kw)),
-            'point_rpc': SimpleNamespace(PointRpc=lambda: client),
-        }
-        return env, calls, events, modules
-
-    def command(self, index=0):
-        return dict(vx=.3, vy=0., vyaw=0., duration=1.,
-                    action_id=f'point_job_{index}', sequence_id='point_job')
-
-    def test_emergency_interrupt_cancels_sequence_and_rejects_next_step(self):
-        for reason in ('tilt', 'foot_airborne', 'comm_timeout', 'joint_overheat'):
-            with self.subTest(reason=reason):
-                env, calls, events, modules = self.harness()
-                with patch.dict('sys.modules', modules):
-                    self.assertEqual(env['handle_point_move'](self.command())['ret'], 0)
-                    env['emergency_stop'](reason)
-                    result = env['handle_point_result'](self.command())
-                    self.assertEqual(result['status'], 'cancelled')
-                    self.assertTrue(result['result']['stop_acknowledged'])
-                    self.assertIn('error', env['handle_point_move'](self.command(1)))
-                self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
-                self.assertTrue(any(kind == 'safety_stop' for kind, _ in events))
-
-    def test_safety_interrupt_between_steps_latches_entire_sequence(self):
-        env, calls, _, modules = self.harness()
-        with patch.dict('sys.modules', modules):
-            env['handle_point_move'](self.command())
-            motion = env['snapshot']()[0]
-            motion._expire('point_job_0', 1.)
-            self.assertEqual(motion.get_result('point_job_0')['status'], 'completed')
-            env['emergency_stop']('tilt')
-            self.assertIn('error', env['handle_point_move'](self.command(1)))
-            self.assertEqual(env['handle_point_result'](self.command())['status'], 'cancelled')
-        self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
-
-    def test_obstacle_stop_is_tracked_and_speed_updates_use_same_owner(self):
-        env, calls, _, modules = self.harness()
-        with patch.dict('sys.modules', modules):
-            env['handle_point_move'](self.command())
-            env['update_velocity'](.1, 0, 0)
-            self.assertEqual(calls[-1][1][:3], (.1, 0, 0))
-            self.assertEqual(env['do_stop']('obstacle')['ret'], 0)
-            self.assertEqual(env['handle_point_result'](self.command())['status'], 'cancelled')
-            self.assertIn('error', env['handle_point_move'](self.command(1)))
-
-    def test_deadline_stop_retry_recovers_harness_state(self):
-        env, calls, _, modules = self.harness()
-        with patch.dict('sys.modules', modules):
-            env['handle_point_move'](self.command())
-            motion = env['snapshot']()[0]
-            replies = iter([3104, 0])
-            attempts = []
-            def begin_stop():
-                attempts.append(1)
-                return lambda: next(replies)
-            motion.client.BeginStopMove = begin_stop
-            motion._expire('point_job_0', 1.)
-            self.assertEqual(len(attempts), 2)
-            self.assertEqual(env['snapshot']()[2], 'idle')
-            self.assertEqual(env['handle_point_result'](self.command())['status'], 'completed')
-
-    def test_safety_stop_retry_never_resumes_sequence(self):
-        env, calls, _, modules = self.harness()
-        with patch.dict('sys.modules', modules):
-            env['handle_point_move'](self.command())
-            motion = env['snapshot']()[0]
-            replies = iter([3104, 0])
-            motion.client.BeginStopMove = lambda: (lambda: next(replies))
-            self.assertEqual(env['do_stop']('obstacle')['ret'], 0)
-            self.assertEqual(env['handle_point_result'](self.command())['status'], 'cancelled')
-            self.assertIn('error', env['handle_point_move'](self.command(1)))
-        self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
-
-    def test_failed_safety_stop_reports_error_and_still_rejects_next_step(self):
-        env, calls, _, modules = self.harness()
-        with patch.dict('sys.modules', modules):
-            env['handle_point_move'](self.command())
-            motion = env['snapshot']()[0]
-            motion.client.BeginStopMove = lambda: (lambda: 3104)
-            self.assertEqual(env['do_stop']('obstacle')['ret'], 3104)
-            result = env['handle_point_result'](self.command())
-            self.assertEqual(result['status'], 'error')
-            self.assertFalse(result['result']['stop_acknowledged'])
-            self.assertIn('error', env['handle_point_move'](self.command(1)))
-        self.assertEqual(len([c for c in calls if c[0] == 'move']), 1)
-
 
 
 def pose(x=0., y=0., yaw=0., odom_yaw=0., now=0., speed=0., rate=0.):
@@ -667,10 +352,17 @@ class TestClosedLoopWiring(unittest.TestCase):
         }
         instance = SimpleNamespace(_plugins=[])
         cfg = {key: {'enabled': True} for key in ('loco', 'state', 'loco_relative_move')}
-        env = dict(self=instance, plugins_cfg=cfg, executor=executor, namespace='g1', print=lambda *args: None)
+        env = dict(self=instance, plugins_cfg=cfg, executor=executor, namespace='g1', print=lambda *args: None,
+                   smart_motion=SimpleNamespace(get_state=lambda: {'state': 'idle', 'base_available': False}))
         with patch.dict('sys.modules', modules):
             exec(code, env)
             self.assertEqual(calls[:3], [('timeout', .05), ('init',), ('add', node)])
+            self.assertFalse(instance._point_card.can_start()['available'])
+            env['smart_motion'] = SimpleNamespace(get_state=lambda: {'state': 'idle', 'base_available': True})
+            self.assertTrue(instance._point_card.can_start()['available'])
+            env['smart_motion'] = None
+            env['loco_client'] = SimpleNamespace(MotionIdle=lambda: {'available': False})
+            self.assertFalse(instance._point_card.can_start()['available'])
             instance._point_card.stop()
             self.assertEqual(calls[-2:], [('remove', node), ('destroy',)])
             cfg['state']['enabled'] = False
@@ -790,3 +482,102 @@ class TestLocalMotionSafety(unittest.TestCase):
                 self.assertIn('error', card.dispatch('move', dict(x=.3)))
                 self.assertEqual(card.dispatch('stop_move', {})['state'], 'idle')
                 self.assertFalse(card.faulted)
+
+
+class TestBaseOwnership(unittest.TestCase):
+    def test_existing_loco_timed_and_continuous_motion_block_direct_goal(self):
+        from test_g1_loco_timing import World, ROOT, extract_class
+        from test_g1_loco_contract import card_namespace
+        for duration in (0, 1):
+            with self.subTest(duration=duration):
+                world = World()
+                namespace = card_namespace()
+                original_class = extract_class(ROOT / 'device.py', 'LocoPlugin', namespace)
+                original = original_class.__new__(original_class)
+                original._smart_motion = None
+                original._fallback_motion = world.controller
+                original._client = original._slam_client = None
+                backend = FeedbackBackend()
+                done = threading.Event()
+                card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: done.set(),
+                    can_start=lambda: {'available': world.controller.is_idle()})
+                original.dispatch('move', dict(vx=.3, duration=duration))
+                self.assertIn('error', card.dispatch('move', dict(x=.3)))
+                self.assertEqual(backend.calls, [])
+                self.assertIsNone(card.active)
+                original.dispatch('stop_move', {})
+                backend.arrive = True
+                self.assertEqual(card.dispatch('move', dict(x=.3))['ret'], 0)
+                self.assertTrue(done.wait(3))
+                self.assertTrue(backend.calls)
+
+    def test_ownership_timeout_or_failed_stop_does_not_start_direct_writes(self):
+        for state in ({'available': False}, {'error': 'timeout'}, None):
+            backend = FeedbackBackend()
+            card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None, can_start=lambda: state)
+            self.assertIn('error', card.dispatch('move', dict(x=.3)))
+            self.assertEqual(backend.calls, [])
+
+    def test_pending_stop_ack_and_updates_do_not_release_owner(self):
+        from test_g1_loco_timing import World
+        world = World()
+        self.assertTrue(world.controller.is_idle())
+        world.start()
+        self.assertFalse(world.controller.is_idle())
+        world.controller.stop()
+        self.assertTrue(world.controller.is_idle())
+        with world.controller.lock:
+            world.controller.active['updates_pending'] = 1
+        self.assertFalse(world.controller.is_idle())
+        with world.controller.lock:
+            world.controller.active['updates_pending'] = 0
+            world.controller.active['stop_done'] = False
+        self.assertFalse(world.controller.is_idle())
+
+    def test_base_submission_and_relative_start_are_serialized(self):
+        backend = FeedbackBackend()
+        entered, release = threading.Event(), threading.Event()
+        owner = {'available': True}
+        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None,
+                                      can_start=lambda: dict(owner))
+        def legacy_move(action, args):
+            entered.set()
+            release.wait(2)
+            owner['available'] = False
+            return {'ret': 0}
+        legacy = threading.Thread(target=lambda: card.dispatch_base(SimpleNamespace(dispatch=legacy_move), 'move', {}))
+        legacy.start()
+        self.assertTrue(entered.wait(1))
+        result = []
+        direct = threading.Thread(target=lambda: result.append(card.dispatch('move', dict(x=.3))))
+        direct.start()
+        self.assertEqual(backend.calls, [])
+        release.set()
+        legacy.join(2)
+        direct.join(2)
+        self.assertEqual(len(result), 1)
+        self.assertIn('error', result[0])
+        self.assertEqual(backend.calls, [])
+
+    def test_safety_owner_reports_unavailable_until_stop_repeats_are_drained(self):
+        from test_g1_loco_timing import World
+        path = Path(__file__).resolve().parents[1] / 'unitree/g1/safety_harness.py'
+        tree = ast.parse(path.read_text())
+        worker = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_run_smart_motion_process')
+        method = next(n for n in worker.body if isinstance(n, ast.FunctionDef) and n.name == 'handle_get_state')
+        idle = SimpleNamespace(value='idle')
+        world = World()
+        namespace = dict(state=idle, MotionState=SimpleNamespace(IDLE=idle, MOVING=object(),
+            NAVIGATING=object(), NAV_PAUSED=object()), speed_zone=SimpleNamespace(value='normal'),
+            current_cmd=None, nav_cmd=None, stop_repeat_count=0, motion=world.controller,
+            obstacle_lock=threading.Lock(), obstacle_dist=float('inf'), lateral_obstacle=False)
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
+        get_state = namespace['handle_get_state']
+        self.assertTrue(get_state()['base_available'])
+        world.start()
+        self.assertFalse(get_state()['base_available'])
+        world.controller.stop()
+        namespace['stop_repeat_count'] = 3
+        self.assertFalse(get_state()['base_available'])
+        namespace['stop_repeat_count'] = 0
+        self.assertTrue(get_state()['base_available'])

@@ -306,7 +306,6 @@ class TestSafetyHarnessIntegration(unittest.TestCase):
     stop_repeat_count = 0
     stop_repeat_action_id = None
     motion = controller
-    point_sequence = None
 '''
         for name in names:
             factory += '\n'.join('    ' + line for line in ast.get_source_segment(source, nodes[name]).splitlines()) + '\n'

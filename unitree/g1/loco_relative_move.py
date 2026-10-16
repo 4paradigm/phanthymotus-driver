@@ -17,9 +17,10 @@ class LocoRelativeMovePlugin:
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
 
-    def __init__(self, config, loco, notify):
+    def __init__(self, config, loco, notify, can_start=None):
         self.loco = loco
         self.notify = notify
+        self.can_start = can_start
         self.command_lock = threading.RLock()
         self.active = None
         self.faulted = False
@@ -138,6 +139,14 @@ class LocoRelativeMovePlugin:
                 return {"error": "Previous stop was not confirmed; retry stop_move first"}
             if self.busy:
                 return {"error": "loco_relative_move is already running"}
+            if self.can_start:
+                try:
+                    ownership = self.can_start()
+                except Exception as exc:
+                    return {"error": f"Could not verify base ownership: {exc}"}
+                if not isinstance(ownership, dict) or ownership.get('available') is not True:
+                    return {"error": "Base is busy or unconfirmed; stop existing loco/navigation movement first",
+                            "owner_state": ownership}
             try:
                 initial = self.loco.snapshot()
                 safety = MotionSafety(self.speed, self.yaw_speed, self.safety_config)

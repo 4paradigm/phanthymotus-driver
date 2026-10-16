@@ -152,9 +152,15 @@ class G1DeviceBundle:
             def close_relative_feedback():
                 executor.remove_node(feedback_node)
                 feedback_node.destroy_node()
+            def relative_base_available():
+                if smart_motion is not None:
+                    current = smart_motion.get_state()
+                    return {**current, "available": current.get("base_available") is True}
+                return loco_client.MotionIdle()
             self._point_card = LocoRelativeMovePlugin(
                 plugins_cfg.get("loco_relative_move", {}),
-                PointBackend(relative_client, feedback, close_relative_feedback), _loco_acp_notify)
+                PointBackend(relative_client, feedback, close_relative_feedback), _loco_acp_notify,
+                can_start=relative_base_available)
             self._plugins.append(self._point_card)
             print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
 
@@ -276,7 +282,7 @@ class G1DeviceBundle:
             p for p in self._plugins if getattr(p, "PREFIX", "") == "vision_capture"]
         other_plugins = [
             p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
-        # Cancel the point sequence before shutting down its prepare/stop peer.
+        # Stop the direct closed-loop task before other base plugins.
         point_plugins = [p for p in other_plugins if getattr(p, "PREFIX", "") == "loco_relative_move"]
         remaining_plugins = [p for p in other_plugins if p not in point_plugins]
         for p in capture_plugins + point_plugins + remaining_plugins:

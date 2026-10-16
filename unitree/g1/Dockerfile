@@ -54,8 +54,6 @@ COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
 COPY loco_relative_move.py /work/loco_relative_move.py
 COPY relative_feedback.py /work/relative_feedback.py
-COPY point_motion.py /work/point_motion.py
-COPY point_rpc.py /work/point_rpc.py
 COPY timed_motion.py /work/timed_motion.py
 COPY sport_mode_state.py /work/sport_mode_state.py
 COPY scan_context.py /work/scan_context.py
