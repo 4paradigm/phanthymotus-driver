@@ -401,6 +401,11 @@ class ArmStreamExecutor:
                     # Continue the safe SDK handback, but do not start a vendor
                     # gesture after an explicit stop cancelled its pending work.
                     op['action_id']=None
+                elif op.get('operator_reset'):
+                    # Reset has only a no-reply transport acknowledgement.
+                    # An explicit stop must still wait for the operator's
+                    # baseline confirmation, not treat a DDS write as release.
+                    op.update(state='unknown',reason='release_action_stop_unconfirmed')
                 else:
                     # 99 already owns the handback. Stop cannot cancel that
                     # RPC, but must not discard its eventual receipt either.
