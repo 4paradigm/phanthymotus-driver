@@ -1,0 +1,360 @@
+"""Independent PICO sensor card: ordinary MCP lifecycle and one local DDS input topic."""
+
+from __future__ import annotations
+import asyncio
+import json
+import os
+import secrets
+import threading
+import tempfile
+from pathlib import Path
+from urllib.parse import urlsplit
+from common.teleop_contract import COMMAND_TOPIC, canonical_instance
+from .runtime import DeviceRuntime
+from .feedback import RobotFeedback
+
+
+class ExtVrPlugin:
+    PREFIX = "teleop_device"
+
+    def __init__(self, config, namespace, ros2=None, *, transport_factory=None):
+        self.config, self.namespace, self.ros2 = dict(config), namespace, ros2
+        self.transport_factory = transport_factory
+        self.instances = {}
+        self._lock = threading.RLock()
+        self._instance_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(
+            target=self.loop.run_forever, name="pico-device", daemon=True
+        )
+        self.thread.start()
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.close()
+
+    def get_tools(self):
+        return [self.get_tool()]
+
+    def get_tool(self):
+        return {
+            "name": self.PREFIX,
+            "type": "sensor",
+            "description": (
+                "PICO 设备安装步骤：1. 部署 PICO 和机器人遥操 Driver；"
+                "2. 首次设置四位管理 PIN 并保存配置；下载 App 无需 PIN；"
+                "3. 扫码或复制二维码旁的链接下载 App 并在网页配对，连接 teleop_control 后开启项目。"
+                "G1 按键操作：松开双 Grip（握把），确认机器人和操作者双臂自然下垂，长按 X+A 一秒建立或重建基准；松键后重新按下双 Grip 接通，松开任一 Grip 暂停。"
+                "复位时松开双 Grip，长按 Y+B 一秒；现场确认复位完成、双臂下垂后，再按 X+A 建立下一轮基准。"
+                "两组组合键均可在已有遥操或错误状态下使用，仍需松开双 Grip 并长按一秒；不会自动恢复遥操。"
+                "佩戴头显查看双骨架及误差；误差仅供参考，不作为 G1 接通条件。"
+                "本卡只采集输入，不直接执行机器人动作。"
+            ),
+            "multiInstance": False,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["info", "config", "start", "stop"],
+                    },
+                    "instance_id": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+            "configSchema": {
+                "type": "object",
+                "description": "扫码或复制二维码旁的链接打开 App 下载与配对页。配对不会启动机器人。",
+                "properties": {
+                    "install": {
+                        "type": "string", "format": "qr", "scope": "instance",
+                        "description": "扫码打开 PICO App 下载与配对页",
+                        "x-qr-options": [{
+                            "label": "下载与配对",
+                            "url": f"https://{{host}}:{self.config.get('port', 15741)}/onboarding",
+                        }],
+                    },
+                    "management_pin": {
+                        "type": "string", "title": "管理 PIN（四位数字）",
+                        "description": "首次自行设置，之后固定保存；留空保留已有 PIN。仅用于网页配对管理，下载和已配对设备重连无需输入。",
+                        "format": "password", "x-sensitive": True,
+                        "pattern": "^([0-9]{4})?$", "maxLength": 4,
+                        # Ordinary Canvas gear renders instance-scoped fields.
+                        # Storage remains global to this single-device Driver.
+                        "scope": "instance",
+                    }
+                },
+            },
+            "topic_out": [
+                {
+                    "port_id": "command",
+                    "format": "data/teleop-cmd",
+                    "schema": "motus.teleop.command/1",
+                }
+            ],
+        }
+
+    def dispatch(self, action, args):
+        if action not in ("info", "config", "start", "stop"):
+            return None
+        return asyncio.run_coroutine_threadsafe(
+            self.call(action, args), self.loop
+        ).result(timeout=15)
+
+    def _installation_url(self):
+        return self.config.get("public_wss_url", "").replace("wss://", "https://").split("/ws/")[0] + "/onboarding"
+
+    def _defaults(self):
+        return {
+            "display_name": self.config.get("display_name", "PICO 4 Ultra"),
+            "driver_installed": True,
+        }
+
+    def _read_config(self, instance_id):
+        path = Path(self.config["state_dir"]) / (instance_id + ".config.json")
+        value = json.loads(path.read_text()) if path.exists() else self._defaults()
+        value.pop("input_filter_ms", None)  # Ignore obsolete saved input filtering.
+        if set(value) != {"display_name", "driver_installed"}:
+            raise ValueError("device_config_invalid")
+        self._validate_config(value)
+        return value
+
+    @staticmethod
+    def _validate_config(value):
+        if (
+            not isinstance(value["display_name"], str)
+            or not 1 <= len(value["display_name"]) <= 64
+        ):
+            raise ValueError("invalid_display_name")
+        if type(value["driver_installed"]) is not bool:
+            raise ValueError("invalid_installation_confirmation")
+
+    async def _instance(self, instance_id):
+        async with self._instance_lock:
+            if instance_id in self.instances:
+                return self.instances[instance_id]
+            if self.instances:
+                raise ValueError("headset_instance_already_owned")
+            from .capture import CaptureManager
+            from .capture_server import CaptureWssServer, capture_certificate_base64
+            from .protocol import TicketCodec, TicketVerifier
+            from .rtc import RtcManager
+
+            state = Path(self.config["state_dir"])
+            state.mkdir(parents=True, exist_ok=True, mode=0o700)
+            config = self._read_config(instance_id)
+            runtime = DeviceRuntime(instance_id)
+            codec = TicketCodec(secrets.token_bytes(32))
+            rtc = RtcManager(runtime, TicketVerifier(codec))
+            manager = CaptureManager(
+                runtime,
+                rtc,
+                codec,
+                state_file=state / (instance_id + ".json"),
+                public_wss_url=self.config["public_wss_url"],
+                ca_certificate_base64=capture_certificate_base64(self.config),
+            )
+            feedback = RobotFeedback(runtime)
+            manager.visualization_provider = feedback.snapshot
+            server = CaptureWssServer(manager, self.config)
+            item = {
+                "runtime": runtime,
+                "manager": manager,
+                "rtc": rtc,
+                "server": server,
+                "config": config,
+                "config_file": state / (instance_id + ".config.json"),
+                "feedback": feedback,
+                "transport": None,
+                "task": None,
+            }
+
+            await server.start()
+            self.instances[instance_id] = item
+            return item
+
+    async def _publish(self, item):
+        while item["runtime"].running:
+            latest = item["runtime"].take_latest()
+            if latest is not None:
+                try:
+                    # The transport owns an isolated, bounded DDS writer, so
+                    # reliable publication never blocks this capture loop.
+                    item["transport"].publish(latest)
+                except Exception:
+                    item["runtime"].record_protocol_error("input_publish_failed")
+            await asyncio.sleep(0.005)
+
+    async def call(self, action, args):
+        if action == "info":
+            return await self._call(action, args)
+        # Ordinary Core immediately pushes gear saves, then reapplies them on
+        # start. Serialize independent config/lifecycle requests, not input reception.
+        async with self._lifecycle_lock:
+            return await self._call(action, args)
+
+    async def _call(self, action, args):
+        instance = args.get("instance_id", "default")
+        canonical_instance(instance)
+        if len(instance) > 64 or "/" in instance:
+            raise ValueError("invalid_instance_id")
+        # One physical input source, regardless of the Canvas card's identity.
+        # Retain the old per-card pairing file when upgrading to single-instance.
+        if self.instances:
+            instance = next(iter(self.instances))
+        else:
+            state = Path(self.config["state_dir"])
+            saved = {p.name.removesuffix(".config.json") for p in state.glob("*.config.json")}
+            # Older start-without-config flows still persisted headset credentials.
+            from .capture import read_private_state
+            for path in state.glob("*.json"):
+                if path.name.endswith(".config.json") or path.name in {"management-pin.json", "pairing-admin.json"}:
+                    continue
+                value = read_private_state(path)
+                if isinstance(value, dict) and set(value) == {"schema_version", "capture"}:
+                    saved.add(path.stem)
+            if len(saved) > 1:
+                raise ValueError("multiple_saved_device_instances")
+            if saved:
+                instance = next(iter(saved))
+                canonical_instance(instance)
+        command = COMMAND_TOPIC
+        ports = {
+            "topic_out": [
+                {
+                    "port_id": "command",
+                    "topic": command,
+                    "format": "data/teleop-cmd",
+                    "schema": "motus.teleop.command/1",
+                }
+            ],
+        }
+        if action == "info" and instance not in self.instances:
+            return {
+                "state": "idle",
+                "instance_id": instance,
+                "configured": False,
+                "config": self._read_config(instance),
+                "actuation_enabled": False,
+                "installation_url": self._installation_url(),
+                **ports,
+            }
+        item = await self._instance(instance)
+        runtime = item["runtime"]
+        if action == "info":
+            return {
+                "instance_id": instance,
+                **runtime.status(),
+                "config": dict(item["config"]),
+                "configured": True,
+                "pairing_password_required": False,
+                "management_pin_configured": item["server"].management_pin.configured,
+                "installation": item["server"].installation_info(),
+                "capture": await item["manager"].status(),
+                **ports,
+            }
+        if action == "config":
+            values = args.get(
+                "config",
+                {
+                    k: v
+                    for k, v in args.items()
+                    if k not in ("action", "instance_id", "_tool_name")
+                },
+            )
+            if not isinstance(values, dict) or set(values) - {
+                "display_name",
+                "driver_installed",
+                "input_filter_ms",
+                "pairing_admin_password",
+                "installation_url",
+                "usage_guide",
+                "management_pin",
+            }:
+                raise ValueError("unsupported_device_config")
+            if runtime.running:
+                raise ValueError("collection_running")
+            # Ignore obsolete UI URL values; the endpoint is always driver-owned.
+            # Accept old saved field names for migration, but use driver presets.
+            candidate = self._defaults()
+            self._validate_config(candidate)
+            pin = values.get("management_pin", "")
+            if pin != "":
+                changed = await asyncio.to_thread(item["server"].management_pin.configure, pin)
+                if changed:
+                    enrollment = item["server"].enrollment
+                    enrollment.revoke_invitation()
+                    enrollment.pending = None
+                    enrollment.deadline = 0
+            # Legacy saved passwords are ignored and never persisted or used.
+            fd, name = tempfile.mkstemp(prefix=".device-config-", suffix=".tmp", dir=item["config_file"].parent)
+            temporary = Path(name)
+            try:
+                with os.fdopen(fd, "w") as stream:
+                    json.dump(candidate, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, item["config_file"])
+            finally:
+                temporary.unlink(missing_ok=True)
+            confirmed = self._read_config(instance)
+            if confirmed != candidate:
+                raise ValueError("configuration_readback_mismatch")
+            item["config"] = confirmed
+            return {
+                "state": "configured",
+                "confirmed": True,
+                "config": dict(confirmed),
+                "pairing_password_required": False,
+                "management_pin_configured": item["server"].management_pin.configured,
+            }
+        if action == "start":
+            if not runtime.running:
+                if self.transport_factory:
+                    item["transport"] = self.transport_factory(
+                        self.namespace, instance, item["feedback"].accept
+                    )
+                else:
+                    from .transport import RosTransport
+
+                    item["transport"] = RosTransport(
+                        self.ros2,
+                        self.namespace,
+                        instance,
+                        item["feedback"].accept,
+                    )
+                runtime.start()
+                item["task"] = asyncio.create_task(self._publish(item))
+                await item["manager"].issue_assignment_if_connected()
+            return {**runtime.status(), **ports}
+        if action == "stop":
+            runtime.stop()
+            await item["manager"].revoke_assignment("collection_stopped")
+            await item["rtc"].close_all()
+            if item["task"]:
+                item["task"].cancel()
+                await asyncio.gather(item["task"], return_exceptions=True)
+                item["task"] = None
+            if item["transport"]:
+                item["transport"].close()
+                item["transport"] = None
+            return runtime.status()
+        return None
+
+    def close(self):
+        if self.loop.is_closed():
+            return
+
+        async def cleanup():
+            for instance, item in list(self.instances.items()):
+                await self.call("stop", {"instance_id": instance})
+                await item["server"].close()
+
+        asyncio.run_coroutine_threadsafe(cleanup(), self.loop).result(timeout=15)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+        if not self.thread.is_alive():
+            self.loop.close()
