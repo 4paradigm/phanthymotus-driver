@@ -87,6 +87,8 @@ COPY deploy/     /deploy/
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
 ENV PYTHONUNBUFFERED=1
+# rclpy logs bypass the Python stdout guard; keep container logs plain text.
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
 # Use SDK's DDS config for peer discovery (unicast to motion control board 192.168.55.102)
 ENV CYCLONEDDS_URI='file:///work/noetix_sdk_bumi/config/dds.xml'
