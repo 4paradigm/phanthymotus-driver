@@ -20,7 +20,7 @@ def arguments(args):
         except OverflowError:
             valid = False
         if not valid:
-            raise ValueError(key + '超出厂家MoveH可发送范围：' + str(low) + '至' + str(high) + '°；未发送转动指令')
+            raise ValueError(key + '超出当前头部角度范围：' + str(low) + '至' + str(high) + '°；未发送转动指令')
         values.append(math.radians(value))
     target, duration = validate_moveh(values, args.get('time', 5))
     return target, duration
@@ -31,7 +31,7 @@ def tool():
         'description':'TRON2头部转动：填写俯仰/偏航绝对角度（°）和时间（秒）。仅控制头部两轴，不移动双臂或开合夹爪；连续新反馈确认到位后通过ACP通知完成。正负方向按厂家坐标系。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'pitch_deg':{'type':'number','minimum':HEAD_DEG_LIMITS[0][0],'maximum':HEAD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上下俯仰绝对目标，-44.69至59.58°；按厂家MoveH弧度限位收窄，必须明确填写'},
+                'pitch_deg':{'type':'number','minimum':HEAD_DEG_LIMITS[0][0],'maximum':HEAD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上下俯仰绝对目标，-45至60°；必须明确填写'},
                 'yaw_deg':{'type':'number','minimum':HEAD_DEG_LIMITS[1][0],'maximum':HEAD_DEG_LIMITS[1][1],'title':'偏航角度（°）','description':'左右转动绝对目标，-89.95至89.95°；按厂家MoveH弧度限位收窄，必须明确填写'},
                 'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'}},
             'required':['pitch_deg','yaw_deg'],
