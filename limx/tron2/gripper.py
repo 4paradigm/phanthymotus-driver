@@ -135,6 +135,35 @@ def tool(metadata, side):
                 'x-completion': {'actions': list(MOTION_ACTIONS), 'timeout': ACP_TIMEOUT}}}
 
 
+def combined_tool():
+    """One customer entry; side selection never changes the two motion owners."""
+    return {'name':'gripper','type':'actuator','multiInstance':False,
+        'description':'设置所选夹爪开口：0mm闭合，85mm最大目标。毫米为名义线性换算，实际间距待标定；力为相对档位，不是牛顿。到位不代表抓取成功。',
+        'inputSchema':{'type':'object','additionalProperties':False,
+            'properties':{
+                'side':{'type':'string','enum':['left','right'],'title':'左右爪','description':'left左爪；right右爪'},
+                'opening_mm':{'type':'number','minimum':0,'maximum':85,'title':'开口大小（mm）','description':'0至85mm；0为闭合'},
+                'speed':{'type':'number','exclusiveMinimum':0,'maximum':100,'description':'速度档位：大于0至100'},
+                'force':{'type':'number','minimum':0,'maximum':100,'description':'力档位：0至100，并非牛顿'}},
+            'required':['side','opening_mm','speed','force'],
+            # Core currently supports static resource declarations only.
+            'x-resource':['arm_l','arm_r'], 'x-completion':{'timeout':ACP_TIMEOUT}}}
+
+
+def combined_arguments(args):
+    """Validate everything before waiting, recovery, ownership or hardware I/O."""
+    if not isinstance(args,dict) or set(args)-{'side','opening_mm','speed','force','instance_id','_trace_id'}:
+        raise ValueError('请刷新夹爪卡片；只接受左右爪、开口大小、速度和力档位')
+    side=args.get('side')
+    if side not in ('left','right'):
+        raise ValueError('请选择left左爪或right右爪')
+    values={k:v for k,v in args.items() if k!='side'}
+    command('open',values,side)
+    # Zero millimetres retains the existing guarded close handover internally.
+    action='close' if args['opening_mm']==0 else 'open'
+    return side,action,normalize_arguments(action,values)
+
+
 class Gripper:
     def __init__(self, reader, report, side):
         if side not in ('left', 'right'):
@@ -291,7 +320,7 @@ class Gripper:
         return MoveError(label + '夹爪上一条' + str(job.get('action', '动作')) +
             '结果尚未确认：目标' + position_text(job.get('target')) + '，最近反馈' +
             position_text(last.get('reported_opening', job.get('reported_opening'))) +
-            '；后续指令未发送。现场确认静止空载后使用本侧recover', False)
+            '；后续指令未发送。请检查实物与控制器，保留失败记录后联系维护人员恢复', False)
 
     async def wait_previous(self, action, allow_blocked=False):
         if self.closed:
@@ -424,7 +453,7 @@ class Gripper:
                 replacement = None; stationary_start = None; stationary_samples = 0; stationary_opening = None
             await asyncio.sleep(POLL_SECONDS)
         raise MoveError('未确认达到目标开口'+position_text(job['target'])+'，最近反馈'+position_text(job.get('reported_opening'))+
-                        '；检查实物停止后可使用recover恢复。未确认抓取成功',
+                        '；请检查实物与控制器并联系维护人员恢复。未确认抓取成功',
                         job['motion_sent'], 'target_not_reached')
 
     async def _run(self, job, data):

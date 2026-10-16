@@ -16,6 +16,5 @@ cards:
   - {name: camera_right, type: sensor}
   - {name: arm_control, type: actuator}
   - {name: move_head, type: actuator}
-  - {name: gripper_left, type: actuator}
-  - {name: gripper_right, type: actuator}
+  - {name: gripper, type: actuator}
   - {name: model, type: resource}

@@ -858,7 +858,7 @@ class PackagingTests(unittest.TestCase):
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.7.6"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.7.7"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -898,7 +898,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'gripper_left', 'gripper_right', 'camera', 'camera_left', 'camera_right'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'gripper', 'camera', 'camera_left', 'camera_right'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')

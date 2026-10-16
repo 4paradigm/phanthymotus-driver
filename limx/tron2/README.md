@@ -1,11 +1,11 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片和左、右夹爪两张控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.7.6`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.7.7`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架，附随腕运动的左右夹爪示意；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
-| `gripper_left` / `gripper_right` | actuator | 固定左/右夹爪，独立设置开口、闭合、恢复 | 无；详情显示本侧厂家反馈 |
+| `gripper` | actuator | 选择左/右夹爪并设置目标开口，0mm闭合 | 无；详情显示所选侧反馈 |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
 | `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
@@ -13,7 +13,7 @@
 | `move_head` | actuator | 俯仰-60～45°（上正）、偏航-88～88°（自身左正）绝对目标；ACP确认到位 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
 
-夹爪卡片的操作步骤、参数含义和状态说明见 [夹爪卡片使用说明](GRIPPER.md)。操作顺序为open、close、recover；open明确填写opening_mm（0至85mm）、speed、force；驱动按底层值=毫米数×94/85自动换算。两侧独立任务，无SIDE或CONFIRM_STOPPED。未填写有效开合参数、系统启动/停止均不会发送夹爪开合。
+夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
 
 头部卡片使用步骤、坐标系和完成判定见 [头部控制说明](HEAD.md)。pitch_deg和yaw_deg均须明确填写，单位为度；驱动仅在显式move时发送两轴MoveH。头部与双臂/夹爪互斥，不改变原arm_control的14项目标或自然垂下home。
 

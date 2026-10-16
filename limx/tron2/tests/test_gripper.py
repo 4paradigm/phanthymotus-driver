@@ -580,6 +580,84 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 return (await resp.json())['result']
         return adapter,runner,call
 
+    async def test_combined_card_rejects_invalid_inputs_before_any_task_or_write(self):
+        adapter,runner,call=await self.shared_http_app()
+        adapter.enabled=['joint_state','arm_control','gripper']
+        valid={'side':'right','opening_mm':40,'speed':10,'force':10}
+        try:
+            tools=adapter.tools();schema=next(t for t in tools if t['name']=='gripper')['inputSchema']
+            self.assertFalse({'gripper_left','gripper_right'} & {t['name'] for t in tools})
+            self.assertEqual(set(schema['properties']),set(valid))
+            self.assertEqual(set(schema['required']),set(valid))
+            self.assertEqual(schema['x-completion'],{'timeout':40})
+            bad=[{**valid,k:v} for k,values in {
+                'side':['both','LEFT',None,True,[]],
+                'opening_mm':[-1,85.01,None,True,'40',float('nan'),float('inf')],
+                'speed':[0,-1,101,None,True,'10'], 'force':[-1,101,None,True,'10']}.items() for v in values]
+            bad += [{k:v for k,v in valid.items() if k!=missing} for missing in valid]
+            bad += [{**valid,'action':a} for a in ('open','close','recover')]
+            bad += [{**valid,'opening':40},None,[], 'invalid']
+            for args in bad:
+                result=await call('gripper',args)
+                self.assertTrue(result['isError'],args)
+                self.assertFalse(json.loads(result['content'][0]['text'])['motion_sent'])
+                self.assertTrue(all(o.active is None and o.task is None for o in adapter.grippers.values()))
+            for old in ('gripper_left','gripper_right'):
+                self.assertTrue((await call(old,{'action':'recover'}))['isError'])
+            self.assertFalse(any('2fclaw' in r['title'] for r in self.requests))
+        finally:
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
+    async def test_combined_left_right_open_and_zero_close_route_and_complete_independently(self):
+        self.stationary=True
+        adapter,runner,call=await self.shared_http_app()
+        adapter.enabled=['joint_state','arm_control','gripper']
+        try:
+            with patch.multiple('gripper',TIMEOUT=.4,POLL_SECONDS=.005,STABILITY_SECONDS=.015):
+                for width in (85,0):
+                    replies=await asyncio.gather(*[call('gripper',{'side':side,'opening_mm':width,'speed':10,'force':10,
+                        'instance_id':'combined-card','_trace_id':'combined-test'}) for side in ('left','right')])
+                    for reply in replies:self.assertFalse(reply['isError'],reply)
+                    await asyncio.gather(*(o.task for o in adapter.grippers.values()))
+                    for o in adapter.grippers.values():
+                        self.assertIsNone(o.active);self.assertEqual(o.last['status'],'completed')
+                        self.assertEqual(o.last['target_opening_mm'],width)
+                        self.assertTrue(o.last['callback_delivered'])
+                callbacks=adapter._report_completion.call_args_list
+                self.assertEqual(len(callbacks),4)
+                self.assertEqual({c.args[0] for c in callbacks},{'gripper'})
+                self.assertEqual(len({c.args[1] for c in callbacks}),4)
+                self.assertEqual({c.args[3]['side'] for c in callbacks},{'left','right'})
+                writes=[r['data'] for r in self.requests if r['title']=='request_set_limx_2fclaw_cmd']
+                self.assertEqual(len(writes),4)
+                for side in ('left','right'):
+                    self.assertEqual([w[side+'_opening'] for w in writes if side+'_opening' in w],[94,0])
+                for w in writes:self.assertEqual(len(w),3)
+        finally:
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
+    async def test_combined_invalid_request_does_not_clear_failed_owner(self):
+        self.cap=88;self.stationary=True
+        adapter,runner,call=await self.shared_http_app();adapter.enabled=['gripper']
+        try:
+            with patch.multiple('gripper',TIMEOUT=.08,POLL_SECONDS=.005,STABILITY_SECONDS=.015,
+                    RECOVERY_STABILITY_SECONDS=.015):
+                await call('gripper',{'side':'left','opening_mm':85,'speed':10,'force':10})
+                owner=adapter.grippers['gripper_left'];await owner.task;failed=owner.active
+                self.assertIsNotNone(failed)
+                result=await call('gripper',{'side':'left','opening_mm':0,'speed':0,'force':10})
+                self.assertTrue(result['isError']);self.assertIs(owner.active,failed)
+                # Only an explicit valid zero target retains the existing stationary close handover.
+                result=await call('gripper',{'side':'left','opening_mm':0,'speed':10,'force':10})
+                self.assertFalse(result['isError'],result);await owner.task
+                self.assertEqual(owner.last['status'],'completed')
+                self.assertEqual(owner.last['previous_action_error']['status'],'error')
+        finally:
+            for o in adapter.grippers.values():await o.close()
+            await runner.cleanup()
+
     async def test_dashboard_action_switch_and_closed_right_close_over_actual_http(self):
         self.stationary=True;self.right_opening=0
         adapter,runner,call=await self.shared_http_app()

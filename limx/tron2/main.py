@@ -63,7 +63,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'arm_control', 'move_head', 'gripper_left', 'gripper_right'} | set(CAMERA_SOURCES)
+    allowed = {'joint_state', 'arm_control', 'move_head', 'gripper', 'gripper_left', 'gripper_right'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
