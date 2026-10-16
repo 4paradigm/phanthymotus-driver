@@ -30,3 +30,24 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  face_whitelist:
+    enabled: true
+    # Each direct child directory is one person. Keep biometric data on the
+    # robot host; never copy enrollment photos into the image or Git.
+    whitelist_dir: /opt/phanthy-motus/data/face_whitelist
+    # LBPH uses a distance: lower is more similar. Start strict and validate
+    # the threshold on the actual camera before using the result in a workflow.
+    distance_threshold: 60
+    min_face_size: 80
+    max_images_per_person: 20
+  auto_guard:
+    enabled: true
+    # The canvas must connect camera -> auto_guard -> tts -> speaker and
+    # start the project. Driver boot alone never arms this speech-only card.
+    sample_interval_s: 0.5
+    confirm_frames: 3
+    rearm_no_face_frames: 3
+    cooldown_s: 30
+    max_frame_age_s: 2
+    # Must equal the dedicated Perception TTS card ID installed on the canvas.
+    tts_instance_id: bumi-guard-tts

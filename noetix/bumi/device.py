@@ -1367,6 +1367,15 @@ class SpeakerPlugin:
     def stop(self) -> None:
         self._stop_playback()
 
+    def is_subscribed_to(self, topic: str) -> bool:
+        """Cheap, nonblocking readiness check for the automatic guard."""
+        if not self._control_lock.acquire(blocking=False):
+            return False
+        try:
+            return self._playing and self._sub is not None and self._input_topic == topic
+        finally:
+            self._control_lock.release()
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         args.pop('_tool_name', None)
 
