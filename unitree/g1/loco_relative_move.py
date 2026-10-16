@@ -16,12 +16,16 @@ class LocoRelativeMovePlugin:
     MAX_MOTION_SECONDS = 120
     MIN_DISTANCE = 0.3
     MAX_DISTANCE = 5.
+    HANDOFF_TIMEOUT = 4.
 
     def __init__(self, config, loco, notify, can_start=None):
         self.loco = loco
         self.notify = notify
         self.can_start = can_start
         self.command_lock = threading.RLock()
+        # Serialize callers across the entire handoff, including the feedback
+        # wait. The worker only takes command_lock and can therefore finish.
+        self.handoff_lock = threading.RLock()
         self.active = None
         self.faulted = False
         self.closed = False
@@ -104,6 +108,10 @@ class LocoRelativeMovePlugin:
         pass
 
     def stop(self):
+        with self.handoff_lock:
+            self._stop()
+
+    def _stop(self):
         self.closed = True
         job = self.active
         if job or self.faulted:
@@ -117,6 +125,10 @@ class LocoRelativeMovePlugin:
             close()
 
     def dispatch(self, action, args):
+        with self.handoff_lock:
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -156,6 +168,7 @@ class LocoRelativeMovePlugin:
             except Exception as exc:
                 return {"error": str(exc)}
             job = dict(id=f"g1_point_{uuid4().hex[:8]}", cancel=threading.Event(),
+                       motion_done=threading.Event(), stop_confirmed=False,
                        deadline=time.monotonic() + self.MAX_MOTION_SECONDS,
                        initial=initial, safety=safety)
             self.active = job
@@ -168,6 +181,10 @@ class LocoRelativeMovePlugin:
         return {"ret": 0, "state": "moving", "action_id": job["id"], "target": target, "control": "closed_loop"}
 
     def dispatch_base(self, plugin, action, args):
+        with self.handoff_lock:
+            return self._dispatch_base(plugin, action, args)
+
+    def _dispatch_base(self, plugin, action, args):
         stopping = action in ("stop_move", "emergency_stop", "stop", "interrupt_motion") or (
             action == "switch_mode" and args.get("mode") == "emergency_stop")
         cancelled = None
@@ -183,6 +200,10 @@ class LocoRelativeMovePlugin:
             return result
 
     def cancel_and_stop(self):
+        with self.handoff_lock:
+            return self._cancel_and_stop()
+
+    def _cancel_and_stop(self):
         with self.command_lock:
             job = self.active
             if job:
@@ -204,7 +225,19 @@ class LocoRelativeMovePlugin:
                               stop_confirmed_by_feedback=stopped)
                 if not stopped:
                     result.update(ret=None, error='Stop could not be confirmed from fresh feedback')
-            return result
+        if job:
+            # Never wait under command_lock: the worker needs it to send zero
+            # and publish its final result. motion_done means no more SDK writes.
+            finished = job['motion_done'].wait(self.HANDOFF_TIMEOUT)
+            with self.command_lock:
+                stopped = finished and job['stop_confirmed'] and not self.faulted
+                if not stopped:
+                    self.faulted = True
+                result.update(ret=0 if stopped else None,
+                              state='idle' if stopped else 'stop_failed',
+                              stop_confirmed_by_feedback=bool(finished and job['stop_confirmed']),
+                              error=None if stopped else 'Cancelled motion did not release the base with a confirmed stop')
+        return result
 
     def _send_stop(self):
         try:
@@ -276,8 +309,10 @@ class LocoRelativeMovePlugin:
             result['target'] = dict(x=controller.x, y=controller.y, yaw=controller.yaw)
             with self.command_lock:
                 self.faulted = not stopped or 'safety_reason' in result
+                job['stop_confirmed'] = stopped
                 if self.active is job:
                     self.active = None
+                job['motion_done'].set()
             self.notify(job['id'], status, result, tool=self.PREFIX)
 
 

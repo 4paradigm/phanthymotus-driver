@@ -581,3 +581,85 @@ class TestBaseOwnership(unittest.TestCase):
         self.assertFalse(get_state()['base_available'])
         namespace['stop_repeat_count'] = 0
         self.assertTrue(get_state()['base_available'])
+
+
+class TestCancelledHandoff(unittest.TestCase):
+    def test_peer_move_waits_for_old_worker_and_receives_no_late_zero(self):
+        backend = FeedbackBackend()
+        finished = threading.Event()
+        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: finished.set())
+        confirming, release = threading.Event(), threading.Event()
+        def confirm():
+            confirming.set()
+            if not release.wait(2):
+                return False
+            with card.command_lock:
+                backend.command(0., 0., 0.)
+            return True
+        card._confirm_stop = confirm
+        card.dispatch('move', dict(x=1))
+        self.assertTrue(backend.sent.wait(1))
+        job = card.active
+        results = []
+        def peer_dispatch(action, args):
+            self.assertTrue(job['motion_done'].is_set())
+            self.assertTrue(job['stop_confirmed'])
+            if action == 'move':
+                backend.calls.append('peer_move')
+            return {'ret': 0}
+        peer = SimpleNamespace(dispatch=peer_dispatch)
+        interrupt = threading.Thread(target=lambda: results.append(card.dispatch_base(peer, 'interrupt_motion', {})))
+        interrupt.start()
+        self.assertTrue(confirming.wait(1))
+        requested = threading.Event()
+        def move():
+            requested.set()
+            results.append(card.dispatch_base(peer, 'move', {}))
+        next_move = threading.Thread(target=move)
+        next_move.start()
+        self.assertTrue(requested.wait(1))
+        self.assertEqual(results, [])
+        self.assertNotIn('peer_move', backend.calls)
+        release.set()
+        interrupt.join(2)
+        next_move.join(2)
+        job['worker'].join(2)
+        self.assertFalse(interrupt.is_alive())
+        self.assertFalse(next_move.is_alive())
+        self.assertEqual([reply['ret'] for reply in results], [0, 0])
+        index = backend.calls.index('peer_move')
+        self.assertEqual(backend.calls[index + 1:], [])
+        self.assertTrue(finished.is_set())
+
+    def test_unconfirmed_stop_rejects_following_motion(self):
+        backend = FeedbackBackend()
+        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None)
+        card._confirm_stop = lambda: False
+        card.dispatch('move', dict(x=1))
+        self.assertTrue(backend.sent.wait(1))
+        peer_calls = []
+        peer = SimpleNamespace(dispatch=lambda action, args: peer_calls.append(action) or {'ret': 0})
+        stopped = card.dispatch_base(peer, 'interrupt_motion', {})
+        self.assertNotEqual(stopped['ret'], 0)
+        self.assertTrue(card.faulted)
+        self.assertIn('error', card.dispatch_base(peer, 'move', {}))
+        self.assertEqual(peer_calls, ['interrupt_motion'])
+
+    def test_handoff_timeout_does_not_release_running_worker(self):
+        backend = FeedbackBackend()
+        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None)
+        card.HANDOFF_TIMEOUT = .05
+        release = threading.Event()
+        card._confirm_stop = lambda: release.wait(2)
+        card.dispatch('move', dict(x=1))
+        self.assertTrue(backend.sent.wait(1))
+        job = card.active
+        try:
+            result = card.dispatch('stop_move', {})
+            self.assertNotEqual(result['ret'], 0)
+            self.assertFalse(job['motion_done'].is_set())
+            peer = SimpleNamespace(dispatch=lambda *args: self.fail('Unconfirmed handoff must reject peer motion'))
+            self.assertIn('error', card.dispatch_base(peer, 'move', {}))
+        finally:
+            release.set()
+            job['worker'].join(2)
