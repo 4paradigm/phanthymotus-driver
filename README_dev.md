@@ -1187,6 +1187,115 @@ def _nav_poll_thread(self, action_id, target, stall_timeout=60):
 
 ---
 
+## File Arguments (`format: file`) and `POST /file/upload`
+
+A tool that needs a file — a trajectory to replay, an audio clip to play, a photo
+to enrol — cannot be handed a path. agent-core serves the browser and holds the
+canvas; this driver runs in a **different container**, and they share no
+filesystem: agent-core mounts `/opt/phanthy-motus`, every bundle's WORKDIR is
+`/work`, and each container's `/tmp` is its own. A path minted on one side means
+nothing on the other.
+
+### Declaring the parameter
+
+Mark it in the tool's `inputSchema`:
+
+```python
+"trajectory": {
+    "type": "string",
+    "format": "file",          # → the canvas renders a file picker
+    "accept": ".jsonl,.zip",   # → picker filter
+    "uploadTo": "mcp",         # → route the upload to *this* service
+    "description": "...",
+},
+```
+
+`uploadTo: "mcp"` is the important one. Omit it and the browser uploads into
+agent-core's own `/tmp/uploads`, which is correct only for a tool agent-core
+serves itself and invisible here.
+
+### Receiving it
+
+`common/file_intake.py` implements the whole endpoint. Wiring is the first thing
+in `do_POST`:
+
+```python
+def do_POST(self):
+    try:
+        from common import file_intake as _file_intake
+    except ImportError:
+        _file_intake = None
+    if _file_intake is not None and _file_intake.serve_upload(self):
+        return
+    ...the bundle's existing JSON-RPC handling...
+```
+
+All 15 HTTP bundles carry exactly this. Four properties of that snippet are
+load-bearing, and `tests/test_file_upload_endpoint.py` asserts each one across
+every bundle:
+
+| Property | Why |
+| --- | --- |
+| **Before `self.rfile.read(...)`** | that read consumes the stream the upload needs, and the upload then sees an empty body |
+| **Before any `self.path not in ("/mcp", ...)` check** | five bundles check the path first and would 404 the upload before recognising it |
+| **Imported inside `do_POST`, not at module level** | several tests lift `make_handler` out of `main.py` by AST and exec only the selected definitions, so a module global is undefined there — and the symptom is a `NameError` on *every* POST, ordinary JSON-RPC included |
+| **`serve_upload` writes its own response** | the 15 bundles spell "send a response" three different ways (`_send`, `_send_json`, raw `send_response`); the glue must not know which |
+
+`serve_upload` is also inert rather than fatal on a handler that has no `.path`:
+this repo's tests construct handlers with `cls.__new__(cls)` and set only the
+attributes a case needs, so a `BaseHTTPRequestHandler` invariant does not hold
+there — and this code runs ahead of every POST.
+
+### The contract
+
+```
+POST /file/upload
+  multipart/form-data: file=<the file>, subdir=<optional>
+  header: X-Access-Token: <ACCESS_TOKEN>   (when the bundle has one)
+→ 200 {"ok": true, "path": "/work/uploads/2026-10-16/trajectory.jsonl", "bytes": N}
+→ 4xx {"ok": false, "error": "..."}
+```
+
+`path` is absolute **inside this container**, and that is the entire point: the
+caller passes it back verbatim as the tool argument. agent-core resolves this
+service's address from the MCP registry (every bundle reports `url` when it
+registers, so the port is already known) and rewrites the argument after the
+upload — see `mcp_client._transfer_file_args` there.
+
+Defaults: 64 MiB per upload, landing under `/work/uploads` (override with
+`FILE_INTAKE_DIR`), pruned after 7 days. The uploader controls the filename, so
+it is sanitised and confined — it decides nothing about *where* the file goes.
+
+`ACCESS_TOKEN` is read from the environment, else from `/opt/phanthy-motus/.env`
+or `/work/.env`. Empty disables the check, mirroring agent-core's own behaviour,
+so a development deployment works untouched. A write-anything endpoint on a
+host-network container is worth gating even though the `tools/call` next to it is
+not: an MCP call is bounded by the tool schema, an upload only by the disk.
+
+### Why not the alternatives
+
+- **base64 through the tool call.** Tried, and it failed in production: a 43,800
+  character string does not survive an LLM's context, and what arrived was
+  truncated.
+- **A shared host mount.** Works, but needs every participating container
+  recreated (Docker fixes mount type at creation), one host directory per
+  pairing, and leaves the path ambiguous.
+- **A bespoke chunked transfer over `tools/call`.** This is what the skill-package
+  work in agent-core had to do *because this endpoint did not exist in any
+  driver yet*: `package_begin` / `package_write` / `package_finish`, 24 KiB of
+  base64 per call, with its own offset and checksum bookkeeping on both sides.
+  It works, but it is a second transport for the same job. Prefer
+  `format: file`; reach for a chunked protocol only when the device genuinely
+  needs to address the artifact by its own handle afterwards.
+
+`common/file_intake.py` is a deliberate copy of
+`phanthymotus/perception/utils/file_intake.py`. Both repos implement the same
+wire contract against this document rather than sharing a package — the same
+rule as `motus.vla/1`. The module was written stdlib-only *so* the drivers could
+use it; this change is the drivers finally doing so.
+
+---
+
 ## Physical Resources (`x-resource`)
 
 The ACP barrier is scoped by **physical channel**, not by tool type. Declare which

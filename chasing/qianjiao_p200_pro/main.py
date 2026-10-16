@@ -67,6 +67,25 @@ class Handler(BaseHTTPRequestHandler):
                 return {**result, "topic_out": definition["topic_out"]}
         return result
     def do_POST(self):
+        # Receive a file into this container: `POST /file/upload`, the way a
+        # `format: file` tool argument reaches a service that shares no
+        # filesystem with agent-core. See common/file_intake.py.
+        #
+        # Two ordering requirements, both silent when violated: this must
+        # precede `self.rfile.read(...)`, which would consume the body the
+        # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+        # would 404 the upload before it is recognised.
+        #
+        # Imported here rather than at module level on purpose: several tests
+        # lift this handler out of main.py by AST and exec only the selected
+        # definitions, so a module global would be undefined there -- a
+        # NameError on every POST, including ordinary JSON-RPC.
+        try:
+            from common import file_intake as _file_intake
+        except ImportError:  # a checkout without common/ on the path
+            _file_intake = None
+        if _file_intake is not None and _file_intake.serve_upload(self):
+            return
         if urlparse(self.path).path != "/mcp": self._send(404, {}); return
         try: rpc = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         except Exception: self._send(400, {"jsonrpc":"2.0","id":None,"error":{"code":-32700,"message":"Parse error"}}); return
