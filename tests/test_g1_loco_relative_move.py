@@ -44,62 +44,64 @@ class TestBundleShutdown(unittest.TestCase):
 
 def pose(x=0., y=0., yaw=0., odom_yaw=0., now=0., speed=0., rate=0.):
     return dict(x=x, y=y, yaw=yaw, roll=0., pitch=0., angular_speed=abs(rate), odom_yaw=odom_yaw, speed=speed, yaw_rate=rate,
-                odom_stamp=now, imu_stamp=now)
+                odom_stamp=now)
+
+
+def odom_data(yaw=0., rate=0., x=0., y=0.):
+    return dict(position=[x, y, 0], velocity=[0, 0, 0], yaw_speed=rate,
+                imu=dict(rpy=[0, 0, yaw], gyroscope=[0, 0, rate]))
 
 
 class TestPoseFeedback(unittest.TestCase):
-    def test_invalid_imu_clears_unwrap_and_recovery_invalidates_old_task(self):
+    def test_invalid_odom_recovery_invalidates_old_task(self):
         now = [10.]
         feedback = PoseFeedback(clock=lambda: now[0])
-        feedback.update_odom(dict(position=[0, 0], velocity=[0, 0], imu=dict(rpy=[0, 0, 0])))
-        feedback.update_imu(dict(rpy=[0, 0, 3.1], gyroscope=[0, 0, 0]))
-        feedback.update_imu(dict(rpy=[0, 0, -3.1], gyroscope=[0, 0, 0]))
+        feedback.update_odom(odom_data(3.1))
+        feedback.update_odom(odom_data(-3.1))
         initial = feedback.snapshot()
         self.assertGreater(initial['yaw'], math.pi)
         safety = MotionSafety(.3, .5)
         safety.check(initial, now[0])
-        feedback.update_imu({})
-        self.assertIsNone(feedback.imu)
+        feedback.update_odom({})
+        self.assertIsNone(feedback.odom)
         self.assertIsNone(feedback.last_yaw)
-        self.assertEqual(feedback.unwrapped, 0.)
-        feedback.update_imu(dict(rpy=[0, 0, -1.], gyroscope=[0, 0, 0]))
+        feedback.update_odom(odom_data(-1.))
         recovered = feedback.snapshot()
         self.assertAlmostEqual(recovered['yaw'], -1.)
-        self.assertGreater(recovered['imu_generation'], initial['imu_generation'])
         with self.assertRaises(SafetyViolation) as caught:
             safety.check(recovered, now[0])
-        self.assertEqual(caught.exception.reason, 'imu_reset')
-        MotionSafety(.3, .5).check(recovered, now[0])  # New task takes the new reference.
+        self.assertEqual(caught.exception.reason, 'odom_reset')
+        MotionSafety(.3, .5).check(recovered, now[0])
 
-    def test_valid_imu_after_gap_also_rebaselines(self):
+    def test_valid_odom_after_gap_also_rebaselines(self):
         now = [0.]
         feedback = PoseFeedback(clock=lambda: now[0])
-        feedback.update_imu(dict(rpy=[0, 0, 3.], gyroscope=[0, 0, 0]))
+        feedback.update_odom(odom_data(3.))
         now[0] = 1.
-        feedback.update_imu(dict(rpy=[0, 0, -2.], gyroscope=[0, 0, 0]))
-        self.assertEqual(feedback.imu_generation, 1)
-        self.assertAlmostEqual(feedback.imu['yaw'], -2.)
+        feedback.update_odom(odom_data(-2.))
+        self.assertEqual(feedback.odom_generation, 1)
+        self.assertAlmostEqual(feedback.snapshot()['yaw'], -2.)
 
-    def test_freshness_validation_alignment_and_yaw_unwrap(self):
+    def test_odometry_alone_supplies_heading_rate_and_freshness(self):
         now = [10.]
         feedback = PoseFeedback(clock=lambda: now[0])
         with self.assertRaises(RuntimeError):
             feedback.snapshot()
-        odom = dict(position=[1, 2, 0], velocity=[0, 0, 0], imu=dict(rpy=[0, 0, .2]))
-        feedback.update_odom(odom)
-        feedback.update_imu(dict(rpy=[0, 0, 3.1], gyroscope=[0, 0, 0]))
-        feedback.update_imu(dict(rpy=[0, 0, -3.1], gyroscope=[0, 0, 0]))
-        self.assertGreater(feedback.snapshot()['yaw'], math.pi)
-        now[0] += .3
-        feedback.update_imu(dict(rpy=[0, 0, -3.], gyroscope=[0, 0, 0]))
-        with self.assertRaisesRegex(RuntimeError, 'synchronized'):
-            feedback.snapshot()
-        now[0] += .3
+        feedback.update_odom(odom_data(3.1, .4))
+        now[0] += .1
+        feedback.update_odom(odom_data(-3.1, .4))
+        sample = feedback.snapshot()
+        self.assertGreater(sample['yaw'], math.pi)
+        self.assertEqual(sample['yaw_rate'], .4)
+        self.assertEqual(sample['angular_speed'], .4)
+        self.assertNotIn('imu_stamp', sample)
+        now[0] += .6
         with self.assertRaisesRegex(RuntimeError, 'stale'):
             feedback.snapshot()
-        feedback.update_odom(dict(position=[float('nan'), 0], velocity=[0, 0], imu=dict(rpy=[0, 0, 0])))
-        with self.assertRaises(RuntimeError):
-            feedback.snapshot()
+        for bad in (dict(yaw_speed=float('nan')), dict(imu={}), dict(position=[float('nan'), 0])):
+            feedback.update_odom({**odom_data(), **bad})
+            with self.assertRaises(RuntimeError):
+                feedback.snapshot()
 
 
 class TestRelativeController(unittest.TestCase):
@@ -199,7 +201,7 @@ class TestRelativeController(unittest.TestCase):
                 current = dict(initial)
                 for step in range(2400):
                     now = step * .05
-                    current['odom_stamp'] = current['imu_stamp'] = now
+                    current['odom_stamp'] = now
                     (vx, vy, w), done = controller.step(current, now)
                     self.assertFalse((vx or vy) and w, 'Rotation and translation must never be commanded together')
                     self.assertLessEqual(math.hypot(vx, vy), .300001)
@@ -296,7 +298,7 @@ class FeedbackBackend:
             if isinstance(self.failure, Exception):
                 raise self.failure
             raise RuntimeError(self.failure)
-        return {**self.position, 'odom_stamp': time.monotonic(), 'imu_stamp': time.monotonic()}
+        return {**self.position, 'odom_stamp': time.monotonic()}
 
     def command(self, *velocity):
         self.calls.append(velocity)
@@ -345,6 +347,31 @@ class TestClosedLoopCard(unittest.TestCase):
                   if call.args[0].startswith('[RelativeMotionData]')]
         self.assertEqual(json.loads(''.join(chunks))['result'], original)
 
+    def test_rotation_completes_with_only_odometry_samples(self):
+        # Exercise actual cache + safety + controller + stop without an IMU callback.
+        feedback = PoseFeedback()
+        feedback.update_odom(odom_data())
+        class OdomBackend:
+            COMMAND_DURATION = .3
+            def __init__(self):
+                self.yaw = 0.
+                self.calls = []
+            def snapshot(self):
+                return feedback.snapshot()
+            def command(self, vx, vy, rate):
+                self.calls.append((vx, vy, rate))
+                self.yaw += rate * .05
+                feedback.update_odom(odom_data(wrap(self.yaw), rate))
+                return 0
+        backend = OdomBackend()
+        card, _, notices, done = self.card(backend)
+        card.dispatch('move', dict(angle=30))
+        self.assertTrue(done.wait(5))
+        self.assertEqual(notices[0][0][1], 'completed')
+        self.assertTrue(notices[0][0][2]['stop_confirmed_by_feedback'])
+        self.assertLessEqual(abs(backend.yaw - math.pi / 6), math.radians(3))
+        self.assertEqual(backend.calls[-1], (0., 0., 0.))
+
     def test_trace_is_bounded_serializable_and_marks_missing_source_time(self):
         trace = MotionTrace(pose(), {'yaw': 1.}, {})
         for i in range(450):
@@ -376,7 +403,7 @@ class TestClosedLoopCard(unittest.TestCase):
         for event in ('start', 'control', 'exception', 'stop_send', 'stop_feedback', 'terminal'):
             self.assertIn(event, events)
         control = next(r for r in trace['records'] if r['event'] == 'control')
-        self.assertIn('imu_age_s', control)
+        self.assertIn('odom_age_s', control)
         self.assertIn('pose', control)
         self.assertIn('error', control)
         self.assertIn('exception', control)
@@ -409,11 +436,11 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertEqual(control[0]['send_ret'], 0)
         self.assertIn('send_elapsed_s', control[0])
         self.assertIn('exception', control[-1])
-        jump = result['imu_jump']
+        jump = result['odom_heading_jump']
         self.assertAlmostEqual(jump['actual_change_deg'], math.degrees(1.))
         self.assertGreater(jump['actual_change_deg'], jump['allowed_change_deg'])
         self.assertEqual(jump['commanded_vyaw_rad_s'], .5)
-        self.assertEqual(jump['gyro_z_rad_s'], .4)
+        self.assertEqual(jump['yaw_speed_rad_s'], .4)
         json.dumps(result, allow_nan=False)
 
     def test_validation_schema_and_relative_target_without_calibration(self):
@@ -544,12 +571,11 @@ class TestClosedLoopWiring(unittest.TestCase):
         with patch.dict('sys.modules', modules):
             create_feedback_node('g1', feedback)
         subscriptions['/g1/loco/state'](SimpleNamespace(data=json.dumps(dict(
-            position=[1, 2, 0], velocity=[0, 0, 0], imu=dict(rpy=[0, 0, .2])))))
-        subscriptions['/g1/state/imu'](SimpleNamespace(data=json.dumps(dict(
-            rpy=[0, 0, .4], gyroscope=[0, 0, 0]))))
+            position=[1, 2, 0], velocity=[0, 0, 0], yaw_speed=0., imu=dict(rpy=[0, 0, .2])))))
+        self.assertEqual(list(subscriptions), ['/g1/loco/state'])
         self.assertEqual(feedback.snapshot()['x'], 1)
-        self.assertEqual(feedback.snapshot()['yaw'], .4)
-        subscriptions['/g1/state/imu'](SimpleNamespace(data='invalid json'))
+        self.assertEqual(feedback.snapshot()['yaw'], .2)
+        subscriptions['/g1/loco/state'](SimpleNamespace(data='invalid json'))
         with self.assertRaises(RuntimeError):
             feedback.snapshot()
 
@@ -589,7 +615,9 @@ class TestClosedLoopWiring(unittest.TestCase):
             instance._point_card.stop()
             self.assertEqual(calls[-2:], [('remove', node), ('destroy',)])
             cfg['state']['enabled'] = False
-            with self.assertRaisesRegex(ValueError, 'publishers'):
+            exec(code, env)  # Independent IMU publisher is no longer required.
+            cfg['loco']['enabled'] = False
+            with self.assertRaisesRegex(ValueError, 'publisher'):
                 exec(code, env)
             for override in ({}, {'loco_relative_move': {}},
                              {'loco_relative_move': {'enabled': False}}):
@@ -605,7 +633,6 @@ class TestLocalMotionSafety(unittest.TestCase):
     def test_stale_skew_invalid_and_jumps_latch(self):
         cases = [
             ('feedback_stale', pose(now=0), .6),
-            ('feedback_skew', {**pose(now=.3), 'odom_stamp': 0.}, .3),
             ('feedback_invalid', {**pose(now=.1), 'roll': float('nan')}, .1),
             ('position_jump', pose(x=.3, now=.1), .1),
             ('attitude_jump', pose(yaw=.4, now=.1), .1),
@@ -655,8 +682,7 @@ class TestLocalMotionSafety(unittest.TestCase):
         now = [1.]
         feedback = PoseFeedback(clock=lambda: now[0])
         def update(yaw):
-            feedback.update_odom(dict(position=[0, 0], velocity=[0, 0], imu=dict(rpy=[0, 0, 0])))
-            feedback.update_imu(dict(rpy=[0, 0, yaw], gyroscope=[0, 0, .5]))
+            feedback.update_odom(odom_data(yaw, .5))
             return feedback.snapshot()
         safety = MotionSafety(.3, .5)
         safety.check(update(3.13), now[0])
@@ -668,7 +694,7 @@ class TestLocalMotionSafety(unittest.TestCase):
         now[0] += .05
         with self.assertRaises(SafetyViolation) as caught:
             safety.check(update(-2.5), now[0])
-        detail = caught.exception.details['imu_jump']
+        detail = caught.exception.details['odom_heading_jump']
         self.assertAlmostEqual(detail['sample_interval_s'], .05)
         self.assertAlmostEqual(detail['actual_change_deg'], math.degrees(.63))
         self.assertAlmostEqual(detail['allowed_change_deg'], 10 + math.degrees(.95 * .05))
@@ -689,7 +715,7 @@ class TestLocalMotionSafety(unittest.TestCase):
             ('tilt', {'roll': math.radians(40)}),
             ('position_jump', {'x': 1.}),
             ('attitude_jump', {'yaw': 1.}),
-            ('imu_reset', {'imu_generation': 1}),
+            ('odom_reset', {'odom_generation': 1}),
             ('linear_overspeed', {'speed': .7}),
             ('angular_overspeed', {'angular_speed': 1.1}),
             ('feedback_stale', None),

@@ -134,9 +134,8 @@ class G1DeviceBundle:
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
         if plugins_cfg.get("loco_relative_move", {}).get("enabled", False):
-            if not (plugins_cfg.get("loco", {}).get("enabled", False)
-                    and plugins_cfg.get("state", {}).get("enabled", False)):
-                raise ValueError("loco_relative_move requires loco_state and IMU publishers (enable loco and state)")
+            if not plugins_cfg.get("loco", {}).get("enabled", False):
+                raise ValueError("loco_relative_move requires the loco_state publisher (enable loco)")
             from loco_relative_move import LocoRelativeMovePlugin, PointBackend
             from relative_feedback import PoseFeedback, create_feedback_node
             from device import _loco_acp_notify
@@ -145,8 +144,7 @@ class G1DeviceBundle:
             relative_client.SetTimeout(0.05)  # Bound local DDS writes; never await RPC responses.
             relative_client.Init()
             safety_cfg = plugins_cfg.get("loco_relative_move", {}).get("safety", {})
-            feedback = PoseFeedback(timeout=safety_cfg.get("feedback_timeout_s", .5),
-                                    skew=safety_cfg.get("feedback_skew_s", .25))
+            feedback = PoseFeedback(timeout=safety_cfg.get("feedback_timeout_s", .5))
             feedback_node = create_feedback_node(namespace, feedback)
             executor.add_node(feedback_node)
             def close_relative_feedback():

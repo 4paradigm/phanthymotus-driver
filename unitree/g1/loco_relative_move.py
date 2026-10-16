@@ -90,7 +90,7 @@ class LocoRelativeMovePlugin:
     def get_tools(self):
         return [{
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": "Closed-loop relative position and heading control using odometry and IMU. "
+            "description": "Closed-loop relative position and heading control using odometry only. "
                            "Translate to the target and settle first, then rotate and correct position drift. "
                            "Never command rotation and translation together. "
                            "Pure turns correct their position drift only after rotation. "
@@ -362,7 +362,7 @@ class LocoRelativeMovePlugin:
             if pose['speed'] <= .03 and pose['angular_speed'] <= .03:
                 if stable is None:
                     stable = time.monotonic()
-                if min(pose['odom_stamp'], pose['imu_stamp']) - stable >= .5:
+                if pose['odom_stamp'] - stable >= .5:
                     return True
             else:
                 stable = None
@@ -398,13 +398,12 @@ class LocoRelativeMovePlugin:
                     pose = self.loco.snapshot()
                     observed = time.monotonic()
                     tick.update(pose=dict(pose), snapshot_elapsed_s=observed - snapshot_started,
-                                imu_age_s=observed - pose['imu_stamp'], odom_age_s=observed - pose['odom_stamp'],
-                                feedback_skew_s=pose['imu_stamp'] - pose['odom_stamp'])
+                                odom_age_s=observed - pose['odom_stamp'], feedback_source='loco/state')
                     if all(math.isfinite(pose.get(key, float('nan'))) for key in ('x', 'y', 'yaw')):
                         controller.update_error(pose)
                         tick['error'] = dict(controller.error)
                         result['error_sample'] = dict(basis='latest_control_feedback_not_final_pose',
-                            imu_receive_monotonic_s=pose['imu_stamp'], odom_receive_monotonic_s=pose['odom_stamp'])
+                            odom_receive_monotonic_s=pose['odom_stamp'])
                     try:
                         job['safety'].check(pose, time.monotonic())
                     except SafetyViolation as exc:
@@ -412,7 +411,6 @@ class LocoRelativeMovePlugin:
                             controller.update_error(pose)
                             result['error_sample'] = {
                                 'basis': 'safety_trigger_feedback_not_final_pose',
-                                'imu_receive_monotonic_s': pose['imu_stamp'],
                                 'odom_receive_monotonic_s': pose['odom_stamp'],
                             }
                         raise
@@ -443,8 +441,8 @@ class LocoRelativeMovePlugin:
             if isinstance(exc, SafetyViolation):
                 result['safety_reason'] = exc.reason
                 result.update(exc.details)
-                if 'imu_jump' in result:
-                    result['imu_jump']['commanded_vyaw_rad_s'] = last_velocity[2]
+                if 'odom_heading_jump' in result:
+                    result['odom_heading_jump']['commanded_vyaw_rad_s'] = last_velocity[2]
         finally:
             if status != 'completed':
                 stopped = self._confirm_stop()

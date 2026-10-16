@@ -18,13 +18,14 @@ class SafetyViolation(RuntimeError):
 
 class MotionSafety:
     """Latched per-job checks; persistence uses new sensor samples, not loop ticks."""
-    DEFAULTS = dict(feedback_timeout_s=.5, feedback_skew_s=.25,
+    DEFAULTS = dict(feedback_timeout_s=.5,
                     tilt_threshold_deg=25., tilt_stop_deg=35., tilt_hold_s=.15,
                     speed_factor=1.5, speed_margin_m_s=.1, yaw_margin_rad_s=.2,
                     overspeed_hold_s=.2, position_jump_slack_m=.1, angle_jump_slack_deg=10.)
 
     def __init__(self, speed, yaw_speed, config=None):
         self.config = {**self.DEFAULTS, **(config or {})}
+        self.config.pop('feedback_skew_s', None)  # Legacy dual-stream setting; now one stream.
         for key, value in self.config.items():
             if key not in self.DEFAULTS or isinstance(value, bool) or not math.isfinite(float(value)) or float(value) <= 0:
                 raise ValueError(f'Invalid motion safety setting: {key}')
@@ -57,117 +58,97 @@ class MotionSafety:
         if self.violation:
             raise self.violation
         c = self.config
-        keys = ('x', 'y', 'yaw', 'roll', 'pitch', 'speed', 'yaw_rate', 'angular_speed', 'odom_stamp', 'imu_stamp')
+        keys = ('x', 'y', 'yaw', 'roll', 'pitch', 'speed', 'yaw_rate', 'angular_speed', 'odom_stamp')
         if any(key not in pose or not math.isfinite(pose[key]) for key in keys):
             self._fail('feedback_invalid', 'Missing or nonfinite safety feedback')
-        if min(now - pose['odom_stamp'], now - pose['imu_stamp']) < -1e-6:
+        if now - pose['odom_stamp'] < -1e-6:
             self._fail('feedback_invalid', 'Feedback timestamp is in the future')
-        if now - min(pose['odom_stamp'], pose['imu_stamp']) > c['feedback_timeout_s']:
-            self._fail('feedback_stale', 'IMU or odometry feedback is stale')
-        if abs(pose['odom_stamp'] - pose['imu_stamp']) > c['feedback_skew_s']:
-            self._fail('feedback_skew', 'IMU and odometry feedback are not synchronized')
+        if now - pose['odom_stamp'] > c['feedback_timeout_s']:
+            self._fail('feedback_stale', 'Odometry feedback is stale')
         tilt = math.degrees(max(abs(pose['roll']), abs(pose['pitch'])))
         if tilt >= c['tilt_stop_deg']:
             self._fail('tilt', f'Severe body tilt: {tilt:.1f} degrees')
         previous = self.previous
         if previous:
-            if pose.get('imu_generation', 0) != previous.get('imu_generation', 0):
-                self._fail('imu_reset', 'IMU reference was reinitialized during the active task')
+            if pose.get('odom_generation', 0) != previous.get('odom_generation', 0):
+                self._fail('odom_reset', 'Odometry reference was reinitialized during the active task')
             dt = pose['odom_stamp'] - previous['odom_stamp']
-            da = pose['imu_stamp'] - previous['imu_stamp']
-            if dt < 0 or da < 0:
+            if dt < 0:
                 self._fail('feedback_invalid', 'Feedback timestamps moved backwards')
             if math.hypot(pose['x'] - previous['x'], pose['y'] - previous['y']) > self.speed_limit * dt + c['position_jump_slack_m']:
                 self._fail('position_jump', 'Odometry position changed beyond the sample-time limit')
-            if abs(pose['yaw'] - previous['yaw']) > self.angular_limit * da + math.radians(c['angle_jump_slack_deg']):
-                self._fail('attitude_jump', 'IMU heading changed beyond the sample-time limit', {
-                    'imu_jump': {
+            if abs(pose['yaw'] - previous['yaw']) > self.angular_limit * dt + math.radians(c['angle_jump_slack_deg']):
+                self._fail('attitude_jump', 'Odometry heading changed beyond the sample-time limit', {
+                    'odom_heading_jump': {
                         'previous_raw_yaw_deg': math.degrees(previous['raw_yaw']) if 'raw_yaw' in previous else None,
                         'current_raw_yaw_deg': math.degrees(pose['raw_yaw']) if 'raw_yaw' in pose else None,
                         'previous_unwrapped_yaw_deg': math.degrees(previous['yaw']),
                         'current_unwrapped_yaw_deg': math.degrees(pose['yaw']),
-                        'previous_receive_monotonic_s': previous['imu_stamp'],
-                        'current_receive_monotonic_s': pose['imu_stamp'],
-                        'sample_interval_s': da,
+                        'previous_receive_monotonic_s': previous['odom_stamp'],
+                        'current_receive_monotonic_s': pose['odom_stamp'],
+                        'sample_interval_s': dt,
                         'actual_change_deg': math.degrees(abs(pose['yaw'] - previous['yaw'])),
-                        'allowed_change_deg': math.degrees(self.angular_limit * da) + c['angle_jump_slack_deg'],
-                        'gyro_z_rad_s': pose['yaw_rate'],
+                        'allowed_change_deg': math.degrees(self.angular_limit * dt) + c['angle_jump_slack_deg'],
+                        'yaw_speed_rad_s': pose['yaw_rate'],
                         'angular_speed_rad_s': pose['angular_speed'],
                         'time_basis': 'local_callback_receive',
                     }})
-            if max(abs(pose['roll'] - previous['roll']), abs(pose['pitch'] - previous['pitch'])) > self.angular_limit * da + math.radians(c['angle_jump_slack_deg']):
-                self._fail('attitude_jump', 'IMU roll/pitch changed beyond the sample-time limit')
+            if max(abs(pose['roll'] - previous['roll']), abs(pose['pitch'] - previous['pitch'])) > self.angular_limit * dt + math.radians(c['angle_jump_slack_deg']):
+                self._fail('attitude_jump', 'Odometry roll/pitch changed beyond the sample-time limit')
         self.previous = dict(pose)
-        self._sustained('tilt', tilt >= c['tilt_threshold_deg'], pose['imu_stamp'], c['tilt_hold_s'])
+        self._sustained('tilt', tilt >= c['tilt_threshold_deg'], pose['odom_stamp'], c['tilt_hold_s'])
         self._sustained('linear_overspeed', pose['speed'] > self.speed_limit,
                         pose['odom_stamp'], c['overspeed_hold_s'])
         self._sustained('angular_overspeed', pose['angular_speed'] > self.angular_limit,
-                        pose['imu_stamp'], c['overspeed_hold_s'])
+                        pose['odom_stamp'], c['overspeed_hold_s'])
 
 
 class PoseFeedback:
-    def __init__(self, clock=time.monotonic, timeout=.5, skew=.25):
-        self.clock = clock
-        self.timeout, self.skew = float(timeout), float(skew)
+    """All control feedback comes from a single loco/state odometry sample."""
+    def __init__(self, clock=time.monotonic, timeout=.5):
+        self.clock, self.timeout = clock, float(timeout)
         self.lock = threading.Lock()
-        self.odom = self.imu = None
+        self.odom = None
         self.last_yaw = None
         self.unwrapped = 0.
-        self.imu_generation = 0
+        self.odom_generation = 0
 
-    def _reset_imu(self):
-        # Caller holds lock. A new generation invalidates every active target
-        # even if invalid and recovered samples arrive between control ticks.
-        self.imu = None
-        self.last_yaw = None
-        self.unwrapped = 0.
-        self.imu_generation += 1
+    def _reset(self):
+        self.odom, self.last_yaw, self.unwrapped = None, None, 0.
+        self.odom_generation += 1
 
     def update_odom(self, data):
         try:
             x, y = map(float, data['position'][:2])
             vx, vy = map(float, data['velocity'][:2])
-            yaw = float(data['imu']['rpy'][2])
-            if not all(math.isfinite(v) for v in (x, y, vx, vy, yaw)):
+            roll, pitch, yaw = map(float, data['imu']['rpy'][:3])
+            rate = float(data['yaw_speed'])
+            if not all(math.isfinite(v) for v in (x, y, vx, vy, roll, pitch, yaw, rate)):
                 raise ValueError('Nonfinite odometry')
-            value = dict(x=x, y=y, vx=vx, vy=vy, speed=math.hypot(vx, vy), odom_yaw=yaw, odom_stamp=self.clock())
-        except (ValueError, TypeError, KeyError, IndexError):
-            value = None
-        with self.lock:
-            self.odom = value
-
-    def update_imu(self, data):
-        try:
-            roll, pitch, yaw = map(float, data['rpy'][:3])
-            gx, gy, rate = map(float, data['gyroscope'][:3])
-            if not all(math.isfinite(v) for v in (roll, pitch, yaw, gx, gy, rate)):
-                raise ValueError('Nonfinite IMU')
         except (ValueError, TypeError, KeyError, IndexError):
             with self.lock:
-                self._reset_imu()
+                self._reset()
             return
         with self.lock:
             now = self.clock()
-            if self.imu and now - self.imu['imu_stamp'] > self.timeout:
-                self._reset_imu()
+            if self.odom and now - self.odom['odom_stamp'] > self.timeout:
+                self._reset()
             self.unwrapped += wrap(yaw - self.last_yaw) if self.last_yaw is not None else yaw
             self.last_yaw = yaw
-            self.imu = dict(yaw=self.unwrapped, raw_yaw=yaw, yaw_rate=rate, roll=roll, pitch=pitch,
-                            gyroscope=[gx, gy, rate], quaternion=data.get('quaternion'),
-                            accelerometer=data.get('accelerometer'), temperature=data.get('temperature'),
-                            angular_speed=math.sqrt(gx*gx + gy*gy + rate*rate), imu_stamp=now,
-                            imu_generation=self.imu_generation)
+            self.odom = dict(x=x, y=y, vx=vx, vy=vy, speed=math.hypot(vx, vy),
+                odom_yaw=yaw, yaw=self.unwrapped, raw_yaw=yaw, roll=roll, pitch=pitch,
+                yaw_rate=rate, angular_speed=abs(rate), odom_stamp=now,
+                odom_generation=self.odom_generation, feedback_source='loco/state',
+                gyroscope=data['imu'].get('gyroscope'), quaternion=data['imu'].get('quaternion'),
+                accelerometer=data['imu'].get('accelerometer'))
 
     def snapshot(self):
         with self.lock:
-            if self.odom is None or self.imu is None:
-                raise SafetyViolation('feedback_missing', 'IMU and odometry feedback are required')
-            result = {**self.odom, **self.imu}
-        now = self.clock()
-        if now - min(result['odom_stamp'], result['imu_stamp']) > self.timeout:
-            raise SafetyViolation('feedback_stale', 'IMU or odometry feedback is stale')
-        if abs(result['odom_stamp'] - result['imu_stamp']) > self.skew:
-            raise SafetyViolation('feedback_skew', 'IMU and odometry feedback are not synchronized')
+            if self.odom is None:
+                raise SafetyViolation('feedback_missing', 'Odometry feedback is required')
+            result = dict(self.odom)
+        if self.clock() - result['odom_stamp'] > self.timeout:
+            raise SafetyViolation('feedback_stale', 'Odometry feedback is stale')
         return result
 
 
@@ -285,7 +266,7 @@ class RelativeController:
             return False
         if self.settle_since is None:
             self.settle_since = now
-        return min(pose['odom_stamp'], pose['imu_stamp']) - self.settle_since >= self.SETTLE_SECONDS
+        return pose['odom_stamp'] - self.settle_since >= self.SETTLE_SECONDS
 
 
 def create_feedback_node(namespace, feedback):
@@ -301,5 +282,4 @@ def create_feedback_node(namespace, feedback):
             data = {}
         update(data)
     node.create_subscription(String, f'/{namespace}/loco/state', lambda msg: receive(feedback.update_odom, msg), qos)
-    node.create_subscription(String, f'/{namespace}/state/imu', lambda msg: receive(feedback.update_imu, msg), qos)
     return node
