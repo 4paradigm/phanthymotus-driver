@@ -1,6 +1,7 @@
 """Unitree As2W driver plugins (official AS2 SDK SportClient)."""
 import json
 import math
+import struct
 import threading
 import time
 from uuid import uuid4
@@ -26,6 +27,71 @@ except ImportError:
 
 
 _STATE_PUBLISH_HZ = 60.0
+_REMOTE_PUBLISH_HZ = 10.0
+_REMOTE_FRESH_S = 0.5
+_REMOTE_DEADZONE = 0.1
+_REMOTE_FRAME_HEADER = b"\x55\x51"
+
+
+def _unavailable_remote():
+    return {"available": False, "fresh": False,
+            "control_level": "LOWLEVEL"}
+
+
+def _parse_wireless_remote(raw):
+    """Decode Unitree's little-endian 24-byte controller prefix."""
+    try:
+        data = bytes(raw)
+    except (TypeError, ValueError):
+        return _unavailable_remote()
+    if len(data) < 24:
+        return _unavailable_remote()
+    # A connected AS2W controller produces Unitree frames beginning 55 51,
+    # including the neutral frame whose buttons and axes are all zero. Some
+    # firmware paths expose a correctly sized but entirely zero-filled array
+    # when no controller payload is available; length alone must not report
+    # that placeholder as an online remote.
+    if data[:2] != _REMOTE_FRAME_HEADER:
+        return _unavailable_remote()
+    try:
+        buttons = {
+            "LT": bool(data[2] & (1 << 5)),
+            "RT": bool(data[2] & (1 << 4)),
+            "start": bool(data[2] & (1 << 2)),
+            "LB": bool(data[2] & (1 << 1)),
+            "RB": bool(data[2] & (1 << 0)),
+            "left": bool(data[3] & (1 << 7)),
+            "down": bool(data[3] & (1 << 6)),
+            "right": bool(data[3] & (1 << 5)),
+            "up": bool(data[3] & (1 << 4)),
+            "Y": bool(data[3] & (1 << 3)),
+            "X": bool(data[3] & (1 << 2)),
+            "B": bool(data[3] & (1 << 1)),
+            "A": bool(data[3] & (1 << 0)),
+        }
+        axes = {
+            "lx": round(struct.unpack("<f", data[4:8])[0], 4),
+            "rx": round(struct.unpack("<f", data[8:12])[0], 4),
+            "ry": round(struct.unpack("<f", data[12:16])[0], 4),
+            "ly": round(struct.unpack("<f", data[20:24])[0], 4),
+        }
+    except (IndexError, struct.error):
+        return _unavailable_remote()
+    if not all(math.isfinite(value) for value in axes.values()):
+        return _unavailable_remote()
+    # float32(0.1) is slightly greater than Python's binary64 0.1. Keep the
+    # configured boundary itself inside the deadzone despite that conversion.
+    active = any(buttons.values()) or any(
+        abs(value) > _REMOTE_DEADZONE + 1e-6 for value in axes.values())
+    return {
+        "available": True,
+        "fresh": True,
+        "control_level": "LOWLEVEL",
+        "buttons": buttons,
+        "axes": axes,
+        "active": active,
+        "timestamp_ms": int(time.time() * 1000),
+    }
 
 
 def _number(value, default=0.0):
@@ -33,6 +99,41 @@ def _number(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _invalid_argument(message, field=None):
+    """Return the card-level rejection expected by direct MCP callers."""
+    result = {
+        "ok": False,
+        "ret": -1,
+        "accepted": False,
+        "code": "INVALID_ARGUMENT",
+        "error": message,
+    }
+    if field:
+        result["field"] = field
+    return result
+
+
+def _finite_argument(args, name, default=0.0):
+    """Read one JSON number without accepting booleans, strings, NaN, or inf."""
+    value = args.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, _invalid_argument(
+            f"{name} must be a finite number", name)
+    number = float(value)
+    if not math.isfinite(number):
+        return None, _invalid_argument(
+            f"{name} must be a finite number", name)
+    return number, None
+
+
+def _boolean_argument(args, name, default=True):
+    """Read one literal JSON boolean instead of relying on Python truthiness."""
+    value = args.get(name, default)
+    if value is not True and value is not False:
+        return None, _invalid_argument(f"{name} must be a boolean", name)
+    return value, None
 
 
 def _values(value):
@@ -67,6 +168,9 @@ class _StateNode:
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", _LOW_LAT_QOS or 1)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", _LOW_LAT_QOS or 1)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", _LOW_LAT_QOS or 1)
+        self.odom = self.node.create_publisher(String, f"/{namespace}/state/odom", _LOW_LAT_QOS or 1)
+        self.remote = self.node.create_publisher(
+            String, f"/{namespace}/state/remote_controller", _LOW_LAT_QOS or 1)
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
@@ -86,6 +190,11 @@ class _StateNode:
         self._published_low_generation = -1
         self._published_bms_generation = -1
         self._published_sport_generation = -1
+        self._remote_lock = threading.Lock()
+        self._remote = _unavailable_remote()
+        self._remote_received_mono = None
+        self._remote_enabled = True
+        self._remote_last_publish_mono = 0.0
         self._stop_event = threading.Event()
         self._publisher_thread = threading.Thread(
             target=self._publish_loop, daemon=True, name="as2w-state-publish")
@@ -138,6 +247,7 @@ class _StateNode:
             if sport is not None and sport_generation != self._published_sport_generation:
                 self._publish_sport(sport)
                 self._published_sport_generation = sport_generation
+            self._maybe_publish_remote()
             self._stop_event.wait(wait_for)
 
     def _on_low(self, msg):
@@ -154,6 +264,8 @@ class _StateNode:
             self._publish_low(msg)
 
     def _publish_low(self, msg):
+        if hasattr(self, "remote"):
+            self._cache_remote(getattr(msg, "wireless_remote", None))
         imu = getattr(msg, "imu_state", getattr(msg, "imu", None))
         if imu is not None:
             imu_data = {}
@@ -185,6 +297,40 @@ class _StateNode:
         # expects these two top-level fields and does not consume joint_count.
         self._publish(self.joints, {"joints": skeleton,
                                     "imu_quat": list(getattr(imu, "quaternion", [])) if imu else []})
+
+    def _cache_remote(self, raw):
+        parsed = _parse_wireless_remote(raw)
+        with self._remote_lock:
+            self._remote = parsed
+            self._remote_received_mono = (
+                time.monotonic() if parsed.get("available") else None)
+
+    def remote_snapshot(self):
+        with self._remote_lock:
+            snapshot = dict(self._remote)
+            received = self._remote_received_mono
+        snapshot["fresh"] = bool(
+            snapshot.get("available") and received is not None
+            and time.monotonic() - received <= _REMOTE_FRESH_S)
+        return snapshot
+
+    def set_remote_enabled(self, enabled):
+        with self._remote_lock:
+            self._remote_enabled = bool(enabled)
+
+    def remote_enabled(self):
+        with self._remote_lock:
+            return self._remote_enabled
+
+    def _maybe_publish_remote(self):
+        now = time.monotonic()
+        with self._remote_lock:
+            if (not self._remote_enabled
+                    or now - self._remote_last_publish_mono
+                    < 1.0 / _REMOTE_PUBLISH_HZ):
+                return
+            self._remote_last_publish_mono = now
+        self._publish(self.remote, self.remote_snapshot())
 
     def _on_bms(self, bms):
         latest_lock = getattr(self, "_latest_lock", None)
@@ -220,13 +366,43 @@ class _StateNode:
     def _publish_sport(self, msg):
         loco = {"mode": int(getattr(msg, "mode", 0)),
                 "body_height": _number(getattr(msg, "body_height", 0))}
-        loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
+        velocity = list(getattr(msg, "velocity", []))
+        loco.update(self._flat("velocity", velocity))
         loco.update(self._flat("position", getattr(msg, "position", [])))
         self._publish(self.loco, loco)
+        # Keep the established vendor-shaped stream above, and publish the same
+        # measurement on a second, standard port for motion consumers such as
+        # ActuCore's visual-navigation card.  The SportModeState velocity is in
+        # the robot body frame; AS2 exposes vx/vy and yaw speed, but not vz/wx/wy.
+        from common.odom import build_sample
+
+        def measured(value):
+            value = _number(value, None)
+            return value if value is not None and math.isfinite(value) else None
+
+        sample = build_sample(
+            stamp_ms=int(time.time() * 1000),
+            twist=[
+                measured(velocity[0]) if len(velocity) > 0 else None,
+                measured(velocity[1]) if len(velocity) > 1 else None,
+                None,
+                None,
+                None,
+                measured(getattr(msg, "yaw_speed", None)),
+            ],
+            vendor={
+                "mode": int(getattr(msg, "mode", 0)),
+                "gait_type": int(getattr(msg, "gait_type", 0)),
+                "body_height": _number(getattr(msg, "body_height", 0)),
+            },
+        )
+        if hasattr(self, "odom"):
+            self._publish(self.odom, sample)
 
 
 class StatePlugin:
     PREFIX = "state"
+    ODOM_AXES = ("vx", "vy", "wz")
     def __init__(self, config, namespace, executor):
         self._namespace = namespace
         self._executor = executor
@@ -236,11 +412,51 @@ class StatePlugin:
                  ("joints", "state/joints", "sensor/skeleton", "As2W 12-joint leg skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
-        return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
-                 "inputSchema": {"type": "object", "properties": {}},
-                 "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
-                for name, path, fmt, desc in specs]
+                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"),
+                 ("remote_controller", "state/remote_controller", "data/json",
+                  "Read-only Unitree remote buttons and joystick state"))
+        tools = [{"name": name, "type": "sensor", "multiInstance": False,
+                  "description": desc,
+                  "inputSchema": {"type": "object", "properties": {}},
+                  "topic_out": [{"topic": f"/{self._namespace}/{path}",
+                                 "format": fmt}]}
+                 for name, path, fmt, desc in specs]
+        loco_state = next(tool for tool in tools if tool["name"] == "loco_state")
+        loco_state["description"] = (
+            "As2W high-level locomotion state. Keeps the vendor-shaped JSON "
+            "stream and also publishes motus.odom/1 for navigation.")
+        loco_state["topic_out"] = self._loco_state_topics()
+        remote = next(tool for tool in tools
+                      if tool["name"] == "remote_controller")
+        remote["inputSchema"] = {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": [
+                    "start", "stop", "info", "read"]},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        }
+        return tools
+
+    def _loco_state_topics(self):
+        return [
+            {"topic": f"/{self._namespace}/loco/state", "format": "data/json"},
+            {"topic": f"/{self._namespace}/state/odom", "format": "state/odom"},
+        ]
+
+    @staticmethod
+    def _odom_interface():
+        from common.odom import build_interface
+
+        return build_interface(
+            provides=StatePlugin.ODOM_AXES,
+            rate_hz=_STATE_PUBLISH_HZ,
+            # SportModeState contains velocity but its world pose is not used by
+            # this port.  Consumers must not accumulate the vendor position as
+            # bounded localisation.
+            pose_drift="none",
+        )
     def start(self):
         # Sensor cards share one LowState subscription.  Recreate it when a
         # dashboard stopped the card instead of claiming a dead stream is live.
@@ -252,25 +468,63 @@ class StatePlugin:
             self._state.close()
             self._state = None
     def dispatch(self, action, args):
+        name = args.get("_tool_name")
+        if name == "remote_controller":
+            if action == "start":
+                if self._state is None:
+                    self.start()
+                self._state.set_remote_enabled(True)
+                return {"state": "running"}
+            if action == "stop":
+                # The LowState subscriber is shared with IMU/joints/battery.
+                # Only disable this card's ROS publication.
+                if self._state is not None:
+                    self._state.set_remote_enabled(False)
+                return {"state": "idle"}
+            if action == "read":
+                return (self._state.remote_snapshot() if self._state is not None
+                        else _unavailable_remote())
+            if action == "info":
+                running = (self._state is not None
+                           and self._state.remote_enabled())
+                return {
+                    "state": "running" if running else "idle",
+                    "topic_out": [{
+                        "topic": f"/{self._namespace}/state/remote_controller",
+                        "format": "data/json",
+                    }],
+                }
         if action == "start":
             self.start()
+            if name == "loco_state":
+                return {"state": "running",
+                        "topic_out": self._loco_state_topics(),
+                        "odom_interface": self._odom_interface()}
             return {"state": "running"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
         if action == "info":
-            name = args.get("_tool_name")
             paths = {"imu": ("state/imu", "data/json"),
                      "joints": ("state/joints", "sensor/skeleton"),
                      "joint_state": ("state/joint_state", "data/json"),
                      "battery": ("state/battery", "data/json"),
-                     "loco_state": ("loco/state", "data/json")}
+                     "loco_state": ("loco/state", "data/json"),
+                     "remote_controller": ("state/remote_controller", "data/json")}
             if name in paths:
                 path, fmt = paths[name]
+                if name == "loco_state":
+                    return {"state": "running",
+                            "topic_out": self._loco_state_topics(),
+                            "odom_interface": self._odom_interface()}
                 return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
             return {"state": "running"}
-        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
-            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
+        if action in ("imu", "joints", "joint_state", "battery", "loco_state", "remote_controller"):
+            if action == "loco_state":
+                return {"state": "running",
+                        "topic_out": self._loco_state_topics(),
+                        "odom_interface": self._odom_interface()}
+            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state", "remote_controller": "state/remote_controller"}[action]
             fmt = "sensor/skeleton" if action == "joints" else "data/json"
             return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
         return {"state": "running"} if action == "info" else None
@@ -281,8 +535,27 @@ class LocoPlugin:
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
         self._lock = threading.Lock()
+        self.motion_lock = threading.RLock()
         self._stop = None
         self._transition_stop = None
+        self._servo = None
+        self._moving = False
+        self._moving_owner = None
+
+    def attach_servo(self, servo):
+        """Attach the continuous command card that shares this chassis."""
+        self._servo = servo
+
+    def is_moving(self):
+        """Whether this call-shaped card currently owns an ongoing movement."""
+        with self._lock:
+            return (self._moving or self._stop is not None
+                    or self._transition_stop is not None)
+
+    def _preempt_servo(self, reason):
+        if self._servo is None:
+            return False
+        return bool(self._servo.pause_for_explicit_command(reason))
 
     _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
                  "AI_STAND_UP", "AI_BALANCE_STAND", "AI_RECOVERY_STAND"}
@@ -350,6 +623,32 @@ class LocoPlugin:
             if self._transition_stop is stop_event:
                 self._transition_stop = None
 
+    def _worker_move(self, stop_event, vx, vy, yaw):
+        with self.motion_lock:
+            if stop_event.is_set() or self._moving_owner is not stop_event:
+                return 0
+            return self.proxy.Move(vx, vy, yaw)
+
+    def _release_move(self, stop_event, stop=False):
+        # A replaced worker may finish after the next command has started.
+        # Only the current owner may stop or release that command.
+        with self.motion_lock:
+            if self._moving_owner is not stop_event:
+                return
+            try:
+                if stop:
+                    self.proxy.StopMove()
+            except Exception:
+                pass
+            finally:
+                self._moving = False
+                self._moving_owner = None
+                with self._lock:
+                    if self._stop is stop_event:
+                        self._stop = None
+                    if self._transition_stop is stop_event:
+                        self._transition_stop = None
+
     def _transition_to_balance_and_move(self, action_id, vx, vy, yaw, duration, stop_event):
         deadline = time.monotonic() + 12.0
         last_state = "UNKNOWN"
@@ -357,6 +656,7 @@ class LocoPlugin:
         while time.monotonic() < deadline:
             if stop_event.is_set():
                 self._finish_transition(stop_event)
+                self._release_move(stop_event)
                 _acp_notify(action_id, "cancelled", {
                     "action": "move", "reason": "move transition was cancelled"})
                 return
@@ -366,13 +666,14 @@ class LocoPlugin:
                 return self._run_move_after_transition(action_id, vx, vy, yaw, duration, stop_event)
             if error:
                 self._finish_transition(stop_event)
+                self._release_move(stop_event)
                 _acp_notify(action_id, "error", error)
                 return
             # Some AS2 firmware keeps GetState at PASSIVE for a short time
             # after BalanceStand.  Do not wait forever for a state label that
             # is lagging behind the command path: probe Move in the worker and
             # continue as soon as the sport service accepts it.
-            last_move_ret = self.proxy.Move(vx, vy, yaw)
+            last_move_ret = self._worker_move(stop_event, vx, vy, yaw)
             if last_move_ret == 0:
                 return self._run_move_after_transition(
                     action_id, vx, vy, yaw, duration, stop_event,
@@ -383,10 +684,12 @@ class LocoPlugin:
             "The automatic balance-stand transition did not reach a state that accepts Move",
             ["get_state", "balance_stand", "stand_up", "stop_move"]))
         self._finish_transition(stop_event)
+        self._release_move(stop_event)
 
     def _start_balance_move(self, state_name, vx, vy, yaw, duration):
         """Start the hidden AS2 balance transition and return an ACP action."""
         self._cancel_transition()
+        self._stop_continuous()
         balance_ret = self.proxy.BalanceStand()
         if balance_ret != 0:
             return None, self._rpc_rejected(
@@ -397,6 +700,8 @@ class LocoPlugin:
         transition_stop = threading.Event()
         with self._lock:
             self._transition_stop = transition_stop
+            self._moving = True
+            self._moving_owner = transition_stop
         threading.Thread(
             target=self._transition_to_balance_and_move,
             args=(action_id, vx, vy, yaw, duration, transition_stop),
@@ -410,12 +715,14 @@ class LocoPlugin:
                                    stop_event, move_already_sent=False):
         if stop_event.is_set():
             self._finish_transition(stop_event)
+            self._release_move(stop_event)
             _acp_notify(action_id, "cancelled", {
                 "action": "move", "reason": "move transition was cancelled"})
             return
-        ret = 0 if move_already_sent else self.proxy.Move(vx, vy, yaw)
+        ret = 0 if move_already_sent else self._worker_move(stop_event, vx, vy, yaw)
         if ret != 0:
             self._finish_transition(stop_event)
+            self._release_move(stop_event)
             _acp_notify(action_id, "error", {"ret": ret, "accepted": False,
                 "action": "move", "current_state": "BALANCE_STAND",
                 "error": "Move was rejected after balance stand",
@@ -428,14 +735,19 @@ class LocoPlugin:
                 "action": "move", "ret": 0, "current_state": "BALANCE_STAND"})
             return
         if duration == -1:
-            with self._lock:
-                self._stop = stop_event
+            with self.motion_lock:
+                if stop_event.is_set() or self._moving_owner is not stop_event:
+                    _acp_notify(action_id, "cancelled", {
+                        "action": "move", "reason": "Move was replaced before continuous execution"})
+                    return
+                with self._lock:
+                    self._stop = stop_event
             move_ret = 0
             move_error = None
             try:
                 while not stop_event.is_set():
                     try:
-                        move_ret = self.proxy.Move(vx, vy, yaw)
+                        move_ret = self._worker_move(stop_event, vx, vy, yaw)
                     except Exception as exc:
                         move_ret = 3104
                         move_error = f"{type(exc).__name__}: {str(exc)[:160]}"
@@ -443,14 +755,7 @@ class LocoPlugin:
                         break
                     stop_event.wait(0.1)
             finally:
-                try:
-                    self.proxy.StopMove()
-                except Exception:
-                    pass
-                with self._lock:
-                    if self._stop is stop_event:
-                        self._stop = None
-                self._finish_transition(stop_event)
+                self._release_move(stop_event, stop=True)
             if move_ret != 0 and not stop_event.is_set():
                 result = {
                     "action": "move",
@@ -482,7 +787,7 @@ class LocoPlugin:
                         "reason": "Timed move stopped by stop_move or card shutdown"})
                     return
                 if time.monotonic() < deadline:
-                    ret = self.proxy.Move(vx, vy, yaw)
+                    ret = self._worker_move(stop_event, vx, vy, yaw)
                     if ret != 0:
                         _acp_notify(action_id, "error", {
                             "action": "move", "ret": ret, "rpc_ret": ret,
@@ -492,10 +797,7 @@ class LocoPlugin:
                             "suggested_actions": ["get_state", "stop_move"]})
                         return
         finally:
-            try:
-                self.proxy.StopMove()
-            finally:
-                self._finish_transition(stop_event)
+            self._release_move(stop_event, stop=True)
         _acp_notify(action_id, "completed",
                     {"action": "move", "ret": 0, "duration": duration,
                      "reason": "requested duration elapsed"})
@@ -529,9 +831,13 @@ class LocoPlugin:
                     "get_state": {"params": [], "description": "Read sport state."}}}}
     def start(self): pass
     def stop(self):
-        self._cancel_transition()
-        self._stop_continuous()
-        self.proxy.StopMove()
+        with self.motion_lock:
+            self._preempt_servo("loco.shutdown")
+            self._cancel_transition()
+            self._stop_continuous()
+            self.proxy.StopMove()
+            self._moving = False
+            self._moving_owner = None
     def _stop_continuous(self):
         event = self._stop
         self._stop = None
@@ -586,22 +892,46 @@ class LocoPlugin:
                     "suggested_actions": ["get_state", "stop_move", "recovery_stand"],
                     "observed_state": state})
     def dispatch(self, action, args):
+        with self.motion_lock:
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
+            self._preempt_servo("loco.stop")
             self._cancel_transition()
             self._stop_continuous()
-            return {"state": "idle", "ret": self.proxy.StopMove()}
+            ret = self.proxy.StopMove()
+            self._moving = False
+            self._moving_owner = None
+            return {"state": "idle", "ret": ret}
         if action == "move":
-            vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
+            values = {}
+            for name in ("vx", "vy", "vyaw"):
+                values[name], error = _finite_argument(args, name)
+                if error:
+                    return error
+            vx = max(-1.5, min(1.5, values["vx"]))
+            vy = max(-1.0, min(1.0, values["vy"]))
+            yaw = max(-2.0, min(2.0, values["vyaw"]))
             duration = args.get("duration")
-            if duration == 0:
-                duration = None
             if duration is not None:
-                duration = float(duration)
-                if not math.isfinite(duration) or duration > 30:
-                    return {"ret": -1, "error": "duration must be at most 30 seconds"}
+                duration, error = _finite_argument(args, "duration")
+                if error:
+                    return error
+                if duration == 0:
+                    duration = None
+            if duration is not None:
+                if duration > 30:
+                    return _invalid_argument(
+                        "duration must be at most 30 seconds", "duration")
                 if duration < 0 and duration != -1:
-                    return {"ret": -1, "error": "duration must be -1, 0, or positive"}
+                    return _invalid_argument(
+                        "duration must be -1, 0, or positive", "duration")
+            # Validation comes first: a malformed request must not pause a
+            # healthy navigation stream.  Once accepted, the explicit command
+            # wins before either writer touches the chassis.
+            preempted_servo = self._preempt_servo("loco.move")
             state_name, state, state_error = self._read_state()
             if state_error:
                 return {**state_error, "action": "move"}
@@ -615,12 +945,14 @@ class LocoPlugin:
             if duration is None:
                 self._stop_continuous()
                 ret = self.proxy.Move(vx, vy, yaw)
+                self._moving = ret == 0
+                self._moving_owner = object() if ret == 0 else None
                 return {"ret": ret, "accepted": ret == 0, "action": "move",
                         "current_state": state_name, "vx": vx, "vy": vy, "vyaw": yaw,
+                        **({"preempted_loco_servo": True} if preempted_servo else {}),
                         **({} if ret == 0 else {"error": "Sport controller rejected Move",
                           "reason": "The robot is standing but the velocity command was refused",
                           "suggested_actions": ["get_state", "stop_move"]})}
-            duration = float(duration)
             if duration == -1:
                 self._cancel_transition()
                 self._stop_continuous()
@@ -642,13 +974,17 @@ class LocoPlugin:
                             "error": "Continuous Move was rejected",
                             "reason": "The sport controller refused the velocity command",
                             "suggested_actions": ["get_state", "stop_move"]}
+                self._moving = True
+                self._moving_owner = stop_event
                 threading.Thread(target=self._run_continuous_move,
                                  args=(action_id, vx, vy, yaw, stop_event),
                                  daemon=True, name="as2w-loco-continuous-move").start()
                 return {"ret": 0, "accepted": True, "status": "running",
                         "action": "move", "action_id": action_id,
                         "current_state": state_name, "duration": -1}
-            if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
+            if duration < 0:
+                return _invalid_argument(
+                    "duration must be -1, 0, or positive", "duration")
             self._stop_continuous()
             ret = self.proxy.Move(vx, vy, yaw)
             if ret != 0:
@@ -661,10 +997,12 @@ class LocoPlugin:
                         "error": "Timed Move was rejected",
                         "reason": "The sport controller refused the velocity command",
                         "suggested_actions": ["get_state", "stop_move"]}
+            self._moving = True
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             stop_event = threading.Event()
             with self._lock:
                 self._transition_stop = stop_event
+                self._moving_owner = stop_event
             threading.Thread(target=self._run_timed_move,
                              args=(action_id, vx, vy, yaw, duration, stop_event),
                              daemon=True, name="as2w-loco-timed-move").start()
@@ -672,14 +1010,19 @@ class LocoPlugin:
                     "action": "move", "action_id": action_id,
                     "current_state": state_name, "duration": duration}
         if action == "stop_move":
+            preempted_servo = self._preempt_servo("loco.stop_move")
             self._cancel_transition()
             self._stop_continuous()
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
+            self._moving = True
+            self._moving_owner = action_id
             threading.Thread(target=self._stop_move_worker,
-                             args=(action_id,), daemon=True,
+                             args=(action_id, action_id), daemon=True,
                              name="as2w-loco-stop-move").start()
             return {"ret": 0, "accepted": True, "status": "stopping",
-                    "action": action, "action_id": action_id}
+                    "action": action, "action_id": action_id,
+                    **({"preempted_loco_servo": True}
+                       if preempted_servo else {})}
         methods = {"stand_up": ("StandUp", "STAND_UP"), "stand_down": ("StandDown", "STAND_DOWN"), "balance_stand": ("BalanceStand", "BALANCE_STAND"), "recovery_stand": ("RecoveryStand", "RECOVERY_STAND")}
         if action in methods:
             self._cancel_transition()
@@ -741,17 +1084,43 @@ class LocoPlugin:
                       "reason": "The controller refused damping from the current posture",
                       "suggested_actions": ["get_state", "stop_move", "recovery_stand"],
                       "rpc_ret": ret})}
-        if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
+        if action == "euler":
+            values = {}
+            for name in ("roll", "pitch", "yaw"):
+                values[name], error = _finite_argument(args, name)
+                if error:
+                    return error
+            return {"ret": self.proxy.Euler(
+                values["roll"], values["pitch"], values["yaw"])}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
             if preset not in {"slow", "normal", "fast"}: return {"ret": -1, "error": "speed_preset must be slow, normal, or fast"}
             return {"ret": self.proxy.SpeedLevel({"slow": -1, "normal": 0, "fast": 1}[preset]), "speed_preset": preset}
-        if action == "body_height": return {"ret": self.proxy.BodyHeight(float(args.get("height", 0)))}
-        if action == "body_position": return {"ret": self.proxy.BodyPosition(float(args.get("x", 0)), float(args.get("y", 0)), float(args.get("z", 0)), float(args.get("yaw", 0)))}
-        if action == "auto_recovery": return {"ret": self.proxy.SetAutoRecovery(1 if args.get("flag", True) else 0)}
-        if action == "switch_joystick": return {"ret": self.proxy.SwitchJoystick(1 if args.get("flag", True) else 0)}
-        if action == "left_side_gait": return {"ret": self.proxy.LeftSideGait(1 if args.get("flag", True) else 0)}
-        if action == "right_side_gait": return {"ret": self.proxy.RightSideGait(1 if args.get("flag", True) else 0)}
+        if action == "body_height":
+            height, error = _finite_argument(args, "height")
+            if error:
+                return error
+            return {"ret": self.proxy.BodyHeight(height)}
+        if action == "body_position":
+            values = {}
+            for name in ("x", "y", "z", "yaw"):
+                values[name], error = _finite_argument(args, name)
+                if error:
+                    return error
+            return {"ret": self.proxy.BodyPosition(
+                values["x"], values["y"], values["z"], values["yaw"])}
+        flag_methods = {
+            "auto_recovery": "SetAutoRecovery",
+            "switch_joystick": "SwitchJoystick",
+            "left_side_gait": "LeftSideGait",
+            "right_side_gait": "RightSideGait",
+        }
+        if action in flag_methods:
+            flag, error = _boolean_argument(args, "flag")
+            if error:
+                return error
+            return {"ret": getattr(self.proxy, flag_methods[action])(
+                1 if flag else 0)}
         if action == "get_state":
             result = self.proxy.GetState()
             if isinstance(result, tuple) and len(result) == 2:
@@ -770,7 +1139,7 @@ class LocoPlugin:
     def _run_continuous_move(self, action_id, vx, vy, yaw, stop_event):
         try:
             while not stop_event.wait(0.1):
-                ret = self.proxy.Move(vx, vy, yaw)
+                ret = self._worker_move(stop_event, vx, vy, yaw)
                 if ret != 0:
                     _acp_notify(action_id, "error", {
                         "action": "move", "ret": ret, "rpc_ret": ret,
@@ -779,10 +1148,7 @@ class LocoPlugin:
                         "suggested_actions": ["get_state", "stop_move"]})
                     return
         finally:
-            with self._lock:
-                if self._stop is stop_event:
-                    self._stop = None
-            self._finish_transition(stop_event)
+            self._release_move(stop_event, stop=True)
         _acp_notify(action_id, "cancelled", {
             "action": "move", "ret": 0, "duration": -1,
             "reason": "Continuous move stopped by stop_move or card shutdown"})
@@ -810,9 +1176,17 @@ class LocoPlugin:
             "reason": "The controller has not left AI_FREE_WALK within 5 seconds",
             "suggested_actions": ["get_state", "retry_stop"]})
 
-    def _stop_move_worker(self, action_id):
+    def _stop_move_worker(self, action_id, owner=None):
         try:
-            ret = self.proxy.StopMove()
+            with self.motion_lock:
+                if owner is not None and self._moving_owner != owner:
+                    _acp_notify(action_id, "cancelled", {
+                        "action": "stop_move", "reason": "Replaced by a newer loco command"})
+                    return
+                ret = self.proxy.StopMove()
+                if ret == 0:
+                    self._moving = False
+                    self._moving_owner = None
         except Exception as exc:
             _acp_notify(action_id, "error", {
                 "action": "stop_move", "ret": 3104,

@@ -9,7 +9,9 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `FrontFlip`, `BackFlip`, `HandStand`, and `BipedStand`.
 
 The driver accepts an explicit robot interface from a command-line argument or
-`NETWORK_INTERFACE`, for example `NETWORK_INTERFACE=eno1`. Command-line values
+`NETWORK_INTERFACE`, for example `NETWORK_INTERFACE=eno1`. The shipped service
+declares `${NETWORK_INTERFACE:-auto}`, so deployments on another subnet can set
+the value before Compose renders the service instead of editing driver code. Command-line values
 take priority over the environment, followed by `robot_interface` in
 `config.yaml`. An empty value or `auto` enables safe discovery: the driver
 selects a unique, UP, wired, non-virtual interface on Unitree's
@@ -34,6 +36,32 @@ runtime dependencies and are required on both amd64 and aarch64.
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Special motions should only
 be invoked with a clear area and appropriate operator approval.
+
+`loco_state` retains its `data/json` output at `/<namespace>/loco/state`
+and also publishes `state/odom` at `/<namespace>/state/odom` for visual
+navigation. The new JSON stream uses `motus.odom/1`: body-frame twist ordered
+as `[vx, vy, vz, wx, wy, wz]`, with unmeasured axes represented by `null`.
+It reports vx, vy and yaw speed; no pose is declared. `start` and `info`
+return both output ports and the `odom_interface` declaration.
+
+`loco_servo` consumes a wired `control/velocity` topic carrying
+`motus.control/1` twist commands. Bundle startup is inert; canvas `start`
+requires `input_topic` (or `input_topics`). It uses the shared ControlSink for
+contract validation, freshness, source arbitration, speed limits and command
+step limits, and calls the AS2 three-argument `Move(vx, vy, vyaw)` API.
+Unsupported vz/wx/wy axes are pinned to zero. Stream silence triggers
+`StopMove` after 300 ms, checked by a 150 ms timer. Invalid posture or a failed
+Move RPC also stops motion. The card supports `pause`, `resume`, `info` and
+runtime `config` for `dry_run`, `rotate_only` and `require_standing`.
+
+Explicit `loco.move` and `loco.stop_move` pause the policy stream before
+sending their commands. Servo start/resume refuses while loco owns a movement;
+stopping a preempted servo does not stop that manual movement. After stopping
+loco, explicitly resume the policy. AS2 speed deadbands have not been measured,
+so the descriptor does not copy R1's gait thresholds. The navigation footprint
+uses Unitree's published AS2-W standing envelope (721 x 493 x 521 mm): the
+descriptor declares a 0.2465 m half-width and navi adds its own motion margin.
+The velocity frame and physical stop behavior still need verification on AS2W.
 
 The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
@@ -85,6 +113,18 @@ frames returned by the Go2-compatible `videohub` service. `mic` listens for the
 official A2 multicast stream at `239.168.123.161:5555`; when the robot's voice
 assistant / wake-up conversation mode is disabled, the card remains in a
 diagnostic `waiting` state and automatically recovers when packets appear.
+
+The camera `info` response also declares `motus.camera/1` for
+`/<namespace>/camera/front`. Its hardware-verified 1920x1080 dimensions let
+`vop` preserve and normalise pixel bounding boxes through navigation. The
+resolution was confirmed from the relationship between VOP's pixel `bbox` and
+normalised `position` on the deployed AS2-W stream. The horizontal half-field
+of view was measured on `nvidia_desktop` with a centred 0.34 m target at
+0.254 m: `half_fov_rad=1.072`, or about 122.8 degrees full horizontal FOV.
+The value lives in `plugins.camera.camera_info`, alongside its `measured`
+provenance, so navi adopts the camera geometry instead of its conservative
+fallback.
+
 Speaker ROS subscription, jitter buffering, and the A2 audio client now live in
 one spawned process. PCM therefore stays in a thread-local queue instead of
 being copied through a multiprocessing queue, and a busy main ROS executor
@@ -115,12 +155,72 @@ or expired frames, and both child process states/PIDs. Like G1
 `camera_rgb`, it is an always-on state source: canvas lifecycle `stop` detaches
 intelligent control but does not stop publication. The child processes are
 physically closed only when the driver bundle shuts down; repeated canvas starts
-reuse the live stream without resetting frame counters.
+reuse the live stream without resetting frame counters. Every `start`, `info`,
+and `stop` response makes that split explicit with `always_on=true`,
+`lifecycle=logical`, `stop_behavior=detach_only`, the independent
+`stream_state`, and `physical_shutdown=driver_bundle_stop`.
+
+`vision_capture` subscribes to that existing
+`/<namespace>/camera/front` JPEG stream; it never creates another Unitree
+`VideoClient` or calls `videohub` itself. `capture_photo` waits for a frame
+that arrived after the request and stores it under
+`/opt/phanthy-motus/data/vision_capture/photos`. `record_video` returns an
+action ID and destination path immediately, then uses FFmpeg at the configured
+8 FPS to create a silent H.264 MP4 under the sibling `videos` directory. Only
+one recording can run at a time. Completion, cancellation, and encoding errors
+are reported through ACP; failed or cancelled files are removed. `stop`
+cancels the active recording, while `info` reports camera freshness, encoder
+availability, and the latest recording result. The runtime image installs both
+`ffmpeg` and its companion `ffprobe`; completed files are checked for one H.264
+video track, no audio track, requested duration, and expected frame count.
+The existing `/opt/phanthy-motus/data` deployment mount persists both folders.
+
+`remote_controller` is a read-only LowState view. The existing shared
+`rt/lowstate` subscriber decodes the 13 documented buttons and four
+little-endian float32 joystick axes, applies a 0.1 activity deadzone, caches the
+latest sample, and publishes JSON on
+`/<namespace>/state/remote_controller` at no more than 10 Hz. `read` returns
+the cached snapshot; `fresh` becomes false after 0.5 seconds without new data.
+The AS2W's observed `55 51` wireless-frame header distinguishes a valid neutral
+controller frame from a 40-byte zero-filled placeholder; the latter is reported
+as unavailable instead of as an online but idle controller.
+Stopping this card only disables its logical ROS output and does not close the
+shared IMU, joint, or battery subscription. `active` is an observation for
+future operator-takeover logic; this driver does not turn it into a motion
+command.
+
+For a no-hardware check, run `python3 test_driver.py` in `as2w`. In a built
+container, verify the media tools with `ffmpeg -version` and
+`ffprobe -version`. On an AS2W host, inspect the shared inputs and outputs with
+`ros2 topic hz /<namespace>/camera/front`,
+`ros2 topic echo /<namespace>/state/remote_controller --once`, and the MCP
+`info`/`capture_photo`/`record_video` actions. These checks do not replace
+opening the JPG and MP4 or exercising every physical remote control on robot.
+
+FFmpeg is not installed only for validation: `record_video` pipes the live JPEG
+frames into the `ffmpeg` executable to produce H.264 MP4, and rejects the action
+when it is absent. `ffprobe` then verifies that the completed file has an H.264
+video stream, no audio stream, and plausible duration/frame count. The image
+uses the distro package with `--no-install-recommends`, removes APT caches, and
+prints `FFmpeg runtime filesystem increase: ... bytes` during each target-
+architecture build. This is the uncompressed final-filesystem delta; registry
+transfer size can be checked from the resulting compressed layer or
+`docker image inspect` and will vary by architecture and base-image cache.
+
 The component vendors the three-field `audio_msgs/AudioChunk` interface used by
 the perception audio bus and builds it in a dedicated Docker stage. The runtime
 image receives only the generated `/as2w_ws/install` overlay and validates an
 `AudioChunk` import during the build; it does not depend on an undocumented
-`/ros_ws` artifact in the shared ROS base image.
+`/ros_ws` artifact in the shared ROS base image. The vendored source is about
+12 KiB; colcon, ROS generators, and `python3-dev` exist only in the discarded
+audio builder stage, so they do not increase the final image. The runtime's
+CMake/build-essential packages are required to build the pinned CycloneDDS C
+library and matching Python extension against this base image. The downloaded
+0.10.5 archive is restricted to HTTPS/TLS 1.2 or newer and verified with its
+pinned SHA-256 before extraction. Both Docker stages print the generated
+`audio_msgs` overlay size in their build logs, so image-growth reviews can use
+the actual architecture-specific artifact size rather than treating the
+builder toolchain as runtime content.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, RPC correlation, and full-size
