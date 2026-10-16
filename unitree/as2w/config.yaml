@@ -3,6 +3,19 @@ robot_interface: auto
 ros_namespace: ""
 plugins:
   loco: {enabled: true}
+  loco_servo:
+    enabled: true
+    # Stream commands are validated and logged, but do not move the chassis
+    # until an operator explicitly turns dry_run off after reviewing them.
+    dry_run: true
+    expected_hz: 10
+    max_vx: 0.4
+    max_vy: 0.25
+    max_wz: 0.5
+    accel_vx: 0.15
+    accel_vy: 0.1
+    accel_wz: 0.2
+    require_standing: true
   special_motion: {enabled: true}
   mic:
     enabled: true
