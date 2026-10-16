@@ -5,9 +5,12 @@ import math
 import re
 import time
 import uuid
+from urllib.parse import urlparse
 
 import aiohttp
 from state import joint_state, select_fields, STATUS_FIELDS
+
+HEAD_API_PORT = 8888  # Read-only vendor UI endpoint, on the same robot host.
 
 
 def reject_constant(value):
@@ -19,6 +22,37 @@ ARM_LOWER = (-3.1416, -.2618, -3.6652, -2.6180, -1.7453, -.7854, -1.5708,
              -3.1416, -3.1940, -1.4835, -2.6180, -1.3963, -.7854, -1.5708)
 ARM_UPPER = (2.6005, 3.1940, 1.4835, .2618, 1.3963, .7854, 1.5708,
              2.6005, .2618, 3.6652, .2618, 1.7453, .7854, 1.5708)
+
+
+# Operator requests the DACH manual/URDF limits for both axes. Pitch motion
+# was reported working on 0.7.3; yaw endpoints are not yet field-verified.
+# Preserve native vendor signs and exact degree-to-radian conversion.
+HEAD_RAD_LIMITS = ((math.radians(-45), math.radians(60)), (-math.pi/2, math.pi/2))
+HEAD_DEG_LIMITS = ((-45, 60), (-90, 90))
+# Temporary command margin after +90deg stopped at +88.94deg in field feedback.
+# This is not a measured mechanical limit; negative endpoint remains unverified.
+HEAD_YAW_COMMAND_LIMIT_DEG = 88
+
+
+def validate_moveh(joint, duration):
+    # Protocol order is pitch,yaw (NOT URDF traversal order). Never clamp.
+    limits = HEAD_RAD_LIMITS
+    if not isinstance(joint, list) or len(joint) != 2:
+        raise ValueError('MoveH requires exactly pitch,yaw in radians')
+    for value, (low, high) in zip(joint, limits):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError('Head angles must be finite numbers')
+        try:
+            valid = math.isfinite(value) and low <= value <= high
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError('Head angle exceeds the configured head joint limit')
+    if abs(joint[1]) > math.radians(HEAD_YAW_COMMAND_LIMIT_DEG):
+        raise MoveError('左右目标超出当前调试范围：-88至88°；未发送转动指令',False,'head_yaw_out_of_range')
+    # Reuse strict duration validation, without forwarding any arm target.
+    validate_movej([0]*14, duration)
+    return list(joint), duration
 
 
 def validate_movej(joint, duration):
@@ -83,14 +117,23 @@ class RobotReader:
         self.last_round_trip = None
         self.ws = None
         self.move_pending = None
+        self.head_pending = None
+        self.gripper_pending = {}
 
     def disconnect(self, reason):
         self.connected = False
         self.ws = None
+        for _, future in self.gripper_pending.values():
+            if not future.done():
+                future.set_exception(MoveError('夹爪连接中断，结果未确认；不会自动重发', None))
         if self.move_pending:
             future = self.move_pending[1]
             if not future.done():
                 future.set_exception(MoveError('Disconnected after send; result unknown, do not automatically retry', None))
+        if self.head_pending:
+            future = self.head_pending[1]
+            if not future.done():
+                future.set_exception(MoveError('Head connection lost; result unknown, do not retry', None))
         self.info = self.joints = None
         self.info_at = self.joints_at = None
         self.info_received = self.joints_received = None
@@ -125,10 +168,23 @@ class RobotReader:
         body = json.loads(msg.data, parse_constant=reject_constant)
         if not isinstance(body, dict):
             raise ValueError('Expected robot JSON object')
+        pending = self.gripper_pending.get(body.get('guid'))
+        if pending and body.get('accid') == self.serial:
+            expected, future = pending
+            if not future.done() and body.get('title') == expected:
+                future.set_result(body.get('data'))
+            elif not future.done() and body.get('title') == 'notify_invalid_request':
+                future.set_result({'result': 'fail_invalid_cmd'})
         if self.move_pending and body.get('guid') == self.move_pending[0] \
                 and body.get('accid') == self.serial:
             future = self.move_pending[1]
             if not future.done() and body.get('title') == 'response_movej':
+                future.set_result(body.get('data'))
+            elif not future.done() and body.get('title') == 'notify_invalid_request':
+                future.set_result({'result': 'fail_invalid_cmd'})
+        if self.head_pending and body.get('guid') == self.head_pending[0] and body.get('accid') == self.serial:
+            future = self.head_pending[1]
+            if not future.done() and body.get('title') == 'response_moveh':
                 future.set_result(body.get('data'))
             elif not future.done() and body.get('title') == 'notify_invalid_request':
                 future.set_result({'result': 'fail_invalid_cmd'})
@@ -172,7 +228,7 @@ class RobotReader:
         readiness=motion_readiness(status['data'])
         if not readiness['ready']:
             raise MoveError(readiness['reason'] + '; no motion command sent', False, 'vendor_not_ready')
-        if self.move_pending:
+        if self.move_pending or self.head_pending:
             raise MoveError('A MoveJ reply is pending; no additional command sent', False)
         guid = str(uuid.uuid4())
         future = asyncio.get_running_loop().create_future()
@@ -198,6 +254,128 @@ class RobotReader:
                 future.cancel()
             elif not future.cancelled():
                 future.exception()  # retrieve a disconnect exception even if send failed
+
+    async def head_control_status(self):
+        """Do not compete with VR tracking; never toggle a robot setting here."""
+        host = urlparse(self.settings['url']).hostname
+        if not host:
+            raise MoveError('无法核对厂家头部控制状态，未发送转动指令',False,'head_control_status_unavailable')
+        host = '['+host+']' if ':' in host else host
+        url = 'http://'+host+':'+str(HEAD_API_PORT)+'/get_robot_info'
+        try:
+            async with aiohttp.ClientSession(trust_env=False,timeout=aiohttp.ClientTimeout(total=3)) as session:
+                async with session.get(url,allow_redirects=False) as response:
+                    if response.status != 200:
+                        raise ValueError('Unexpected vendor status HTTP response')
+                    raw = bytearray()
+                    async for chunk in response.content.iter_chunked(16384):
+                        raw.extend(chunk)
+                        if len(raw)>128*1024:
+                            raise ValueError('Vendor status response too large')
+                    body = json.loads(raw,parse_constant=reject_constant)
+            data = body.get('data',body)
+            if not isinstance(data,dict) or data.get('enable_vr_follow_head_valid') is not True or \
+                    type(data.get('enable_vr_follow_head')) is not bool:
+                raise ValueError('Head follow-state validity missing')
+        except (ValueError,TypeError,AttributeError,OSError,aiohttp.ClientError,asyncio.TimeoutError) as exc:
+            raise MoveError('无法获得有效的厂家头部跟随状态，未发送转动指令',False,'head_control_status_unavailable') from exc
+        if data['enable_vr_follow_head']:
+            raise MoveError('机器人VR头部跟随已开启；请明确关闭厂家头部跟随后再使用手动转动卡片。驱动不会自动切换，未发送转动指令',False,'head_vr_follow_enabled')
+        if data.get('working_mode') != 'developer_mode' or data.get('working_mode_valid') is not True:
+            raise MoveError('厂家当前不是有效的上层开发模式，未发送头部转动指令',False,'vendor_not_ready')
+        return {'vr_head_follow':False,'source':'fresh_vendor_get_robot_info'}
+
+    async def send_moveh(self, q, move_time):
+        """Only a two-axis MoveH; one send and exact identity/GUID/title ACK."""
+        q, move_time = validate_moveh(q, move_time)
+        if not self.connected or self.ws is None or self.ws.closed or not self.serial:
+            raise MoveError('Robot disconnected; no head motion sent', False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready']:
+            raise MoveError('Fresh developer mode, collision protection and compliance-off required; no head motion sent', False)
+        if self.head_pending or self.move_pending:
+            raise MoveError('Another arm/head acknowledgement is pending; no head motion sent', False)
+        ws, serial = self.ws, self.serial
+        control = await self.head_control_status()
+        if self.ws is not ws or self.serial != serial or not self.connected or ws.closed:
+            raise MoveError('核对头部模式期间机器人连接改变，未发送转动指令',False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready'] or self.head_pending or self.move_pending:
+            raise MoveError('核对头部模式期间运动状态改变，未发送转动指令',False)
+        guid = str(uuid.uuid4()); future = asyncio.get_running_loop().create_future()
+        self.head_pending = (guid, future)
+        sent = False
+        try:
+            try:
+                await asyncio.wait_for(ws.send_json({'title':'request_moveh','accid':serial,
+                    'guid':guid,'timestamp':int(time.time()*1000),
+                    'data':{'joint':q,'time':move_time}}), 5)
+                sent = True
+                reply = await asyncio.wait_for(future, self.settings['response_timeout_seconds'])
+            except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise MoveError('Head send/ACK unconfirmed; no automatic retry', True if sent else None) from exc
+            if self.ws is not ws or self.serial != serial or not self.connected:
+                raise MoveError('Head connection changed; result unknown', True)
+            if not isinstance(reply, dict) or reply.get('result') != 'success':
+                raise MoveError('Vendor rejected MoveH; no arrival confirmed', True, 'vendor_rejected')
+            return {'status':'accepted','motion_sent':True,'arrival_verified':False,'head_control':control}
+        finally:
+            self.head_pending = None
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
+
+    async def _gripper_request(self, title, data, motion):
+        if (motion is True and title != 'request_set_limx_2fclaw_cmd') or \
+                (motion is False and (title != 'request_get_limx_2fclaw_state' or data != {})) or type(motion) is not bool:
+            raise MoveError('不支持的夹爪协议请求', False)
+        if not self.connected or self.ws is None or self.ws.closed or not self.serial:
+            raise MoveError('机器人未连接，未发送夹爪指令', False)
+        ws, serial = self.ws, self.serial
+        guid = str(uuid.uuid4())
+        future = asyncio.get_running_loop().create_future()
+        self.gripper_pending[guid] = (title.replace('request_', 'response_', 1), future)
+        sent = False
+        try:
+            try:
+                await asyncio.wait_for(ws.send_json({'title': title, 'accid': serial, 'guid': guid,
+                    'timestamp': int(time.time() * 1000), 'data': data}), 5)
+                sent = True
+                reply = await asyncio.wait_for(future, self.settings['response_timeout_seconds'])
+            except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise MoveError('夹爪请求结果未确认；不会自动重发', (True if sent else None) if motion else False) from exc
+            if self.ws is not ws or self.serial != serial or not self.connected:
+                raise MoveError('机器人连接已改变，夹爪结果未确认', True if motion else False)
+            if not isinstance(reply, dict) or reply.get('result') != 'success':
+                raise MoveError('厂家拒绝夹爪请求或报告电机故障', True if motion else False, 'vendor_rejected')
+            return reply
+        finally:
+            self.gripper_pending.pop(guid, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
+
+    async def read_gripper(self):
+        return await self._gripper_request('request_get_limx_2fclaw_state', {}, False)
+
+    async def send_gripper(self, data):
+        # This private transport accepts exactly one validated side, never a generic vendor command.
+        from gripper import percentage, opening_target
+        keys = set(data) if isinstance(data, dict) else set()
+        sides = [side for side in ('left', 'right') if keys == {side + '_' + key for key in ('opening', 'speed', 'force')}]
+        if len(sides) != 1:
+            raise MoveError('夹爪参数必须只包含所选侧', False)
+        for key, value in data.items():
+            percentage(value, key)
+        opening_target(data[sides[0] + '_opening'])
+        if data[sides[0] + '_speed'] == 0:
+            raise MoveError('开合速度须大于0', False)
+        status = self.sample('robot_status')
+        if not status['available'] or status['data'].get('working_mode') != 'developer_mode' or status['data'].get('working_mode_valid') is not True:
+            raise MoveError('需要机器人处于上层开发模式且状态反馈有效，未发送夹爪指令', False)
+        return await self._gripper_request('request_set_limx_2fclaw_cmd', data, True)
 
     def sample(self, name):
         if name not in ('joint_state', 'robot_status'):

@@ -27,10 +27,28 @@ def arm_feedback(reader):
 
 
 class ArmCompletion:
+    joint_count = 14
+    action_prefix = 'tron2_arm_'
+    require_ack = False  # Preserve the existing MoveJ completion behavior.
+
     def __init__(self, reader, report):
         self.reader, self.report = reader, report
         self.active = self.last = self.task = None
         self.closed = False
+        self.peer = None
+        self.peers = []
+
+    def validate(self, target, duration):
+        return validate_movej(target, duration)
+
+    def feedback(self):
+        return arm_feedback(self.reader)
+
+    async def send(self, target, duration):
+        return await self.reader.send_movej(target, duration)
+
+    def blocked_error(self):
+        return MoveError('Arms are busy or require operator verification; no additional motion sent', False)
 
     def summary(self):
         return ({key: self.active[key] for key in ('action_id', 'action', 'state')}
@@ -43,18 +61,24 @@ class ArmCompletion:
         if self.active and self.active['state'] == 'reporting' \
                 and self.active.get('arrival_verified'):
             await asyncio.shield(self.task)
+        peers = self.peers + ([self.peer] if self.peer else [])
+        for peer in peers:
+            if peer.active and peer.active['state'] == 'reporting' and (peer.active.get('target_opening_verified') or peer.active.get('arrival_verified')):
+                await asyncio.shield(peer.task)
+        if any(peer.closed or peer.active or getattr(peer, 'recovering', False) or getattr(peer, 'waiting', None) for peer in peers):
+            raise MoveError('Gripper or other motion is active or uncertain; no additional motion sent', False)
         if self.closed or self.active:
-            raise MoveError('Arms are busy or require operator verification; no additional motion sent', False)
-        target, duration = validate_movej(target, duration)
-        arm_feedback(self.reader)
+            raise self.blocked_error()
+        target, duration = self.validate(target, duration)
+        self.feedback()
         future = asyncio.get_running_loop().create_future()
         # A disconnected RPC caller must not cancel the one physical send or
         # abandon its owner. Retrieve a late admission error without hiding it.
         future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
-        job = {'action_id': 'tron2_arm_' + uuid4().hex, 'action': action,
+        job = {'action_id': self.action_prefix + uuid4().hex, 'action': action,
                'state': 'awaiting_ack', 'target': list(target), 'duration': duration,
                'details': details, 'admission': future, 'ws': self.reader.ws,
-               'serial': self.reader.serial}
+                'serial': self.reader.serial, 'motion_sent': None, 'vendor_acknowledged': False}
         self.active = job
         self.task = asyncio.create_task(self._run(job))
         return await asyncio.shield(future)
@@ -71,7 +95,7 @@ class ArmCompletion:
             if not self.reader.connected or self.reader.ws is not job['ws'] \
                     or self.reader.serial != job['serial']:
                 raise ValueError('Robot disconnected or connection changed during motion')
-            sample, q, dq = arm_feedback(self.reader)
+            sample, q, dq = self.feedback()
             at = self.reader.joints_at
             if at != last_at:
                 last_at = at
@@ -97,7 +121,7 @@ class ArmCompletion:
         status = 'error'
         try:
             try:
-                reply = await self.reader.send_movej(job['target'], job['duration'])
+                reply = await self.send(job['target'], job['duration'])
             except MoveError as exc:
                 if exc.motion_sent is False or exc.code == 'vendor_rejected':
                     self.active = None
@@ -108,25 +132,30 @@ class ArmCompletion:
                 reply = {'status': 'ack_unverified', 'motion_sent': exc.motion_sent,
                          'arrival_verified': False, 'message': str(exc)}
             job['state'] = 'moving'
+            job['motion_sent'] = reply.get('motion_sent')
+            job['vendor_acknowledged'] = reply.get('status') != 'ack_unverified'
             admitted = True
             job['admission'].set_result({**reply, **job['details'], 'action': job['action'],
-                'action_id': job['action_id'], 'state': 'moving', 'joint_count': 14,
+                'action_id': job['action_id'], 'state': 'moving', 'joint_count': self.joint_count,
                 'time': job['duration'], 'arrival_verified': False,
                 'completion_protocol': 'acp',
                 **({'reset_verified': False, 'at_home': None} if job['action'] == 'reset' else {})})
+            if self.require_ack and reply.get('status') == 'ack_unverified':
+                raise ValueError('Head acknowledgement unknown; position alone cannot confirm this command')
             result = await self.wait_for_arrival(job)
             status = 'completed'
         except asyncio.CancelledError:
             result = {'arrival_verified': False, 'error': 'Driver stopping; motion may continue'}
         except (ValueError, OSError) as exc:
-            result = {'arrival_verified': False, 'error': str(exc)}
+            result = {'arrival_verified': False, 'error': str(exc), 'error_code':getattr(exc,'code',None)}
         finally:
             if self.active is not job:
                 return
             if not admitted and not job['admission'].done():
                 job['admission'].set_exception(MoveError('Motion result unknown; driver stopping', None))
             result.update(job['details'])
-            result.update(action=job['action'], joint_count=14, completion_protocol='acp')
+            result.update(action=job['action'], joint_count=self.joint_count, completion_protocol='acp')
+            result.update(motion_sent=job['motion_sent'],vendor_acknowledged=job['vendor_acknowledged'])
             if job['action'] == 'reset':
                 # The dispatched reset target came from the validated home file.
                 # Verify it using the same multi-frame, post-duration feedback;
@@ -159,3 +188,21 @@ class ArmCompletion:
         if self.active and not self.active['admission'].done():
             self.active['admission'].set_exception(MoveError('Driver stopped before dispatch', False))
             self.active = None
+
+
+class MotionPeers:
+    """Present the arm/head owners as one peer to existing gripper guards."""
+    def __init__(self, *owners):
+        self.owners = owners
+
+    @property
+    def active(self):
+        return next((owner.active for owner in self.owners if owner.active), None)
+
+    @property
+    def task(self):
+        return next((owner.task for owner in self.owners if owner.active), None)
+
+    @property
+    def closed(self):
+        return any(owner.closed for owner in self.owners)
