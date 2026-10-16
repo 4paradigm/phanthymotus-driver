@@ -26,6 +26,8 @@ python main.py
 
 ### Building Docker Images
 
+G1 uses its [Dockerfile](unitree/g1/Dockerfile) to install dependencies on the ROS base image, then copy the driver source. Dependency layers precede source copies so normal builds can reuse the Docker cache. See the [G1 build instructions](unitree/g1/README.md#构建) for the base image, build arguments and a local ARM64 build without pushing.
+
 ```bash
 cp .env.example .env  # Configure registry settings
 
