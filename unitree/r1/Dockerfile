@@ -69,6 +69,7 @@ COPY camera_specs.py /work/camera_specs.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY loco_servo.py /work/loco_servo.py
+COPY demo_echo.py /work/demo_echo.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

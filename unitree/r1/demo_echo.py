@@ -1,3 +1,5 @@
+from typing import Optional
+
 class DemoEchoPlugin:
 
     PREFIX = "demo_echo"
@@ -13,10 +15,10 @@ class DemoEchoPlugin:
     def get_tool(self) -> dict:
         return {
             "name": self.PREFIX,
-            "description": "processor",
+            "type": "processor",
             "multiInstance": False,
             "description": "A plugin that echoes back the input text.",
-            "inputschema": {
+            "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
@@ -24,17 +26,14 @@ class DemoEchoPlugin:
                         "enum": ["run"],
                         "description": "The action to perform. Must be 'run'.",
                     },
-
-
                     "text": {
                         "type": "string",
                         "description": "The text to echo back.",
                     },
                 },
                 "required": ["action"],
-                "x_action-params": {
-                    "run":{
-
+                "x-action-params": {
+                    "run": {
                         "params": ["text"],
                         "description": "Echoes back the provided text.",
                     }
@@ -47,7 +46,7 @@ class DemoEchoPlugin:
     def stop(self) -> None:
         self.enabled = False
 
-    def dispatch(self, action: str, args: dict) -> dict | None:
+    def dispatch(self, action: str, args: dict) -> Optional[dict]:
         if action == "start":
             self.start()
             return {"state": "Plugin started."}
@@ -63,18 +62,19 @@ class DemoEchoPlugin:
         if action == "run":
             if not self.enabled:
                 return {
-                "states": "falled",
-                "error": "Plugin is not enabled. Please start the plugin before running actions."
+                    "state": "error",
+                    "error": "Plugin is not enabled. Please start the plugin before running actions."
                 }
 
+            text = args.get("text", "")
             if not text:
                 return {
-                    "states": "falled",
-                    "error": "Missing required parameter: 'text'. Please provide the text to echo back."
+                    "state": "error",
+                    "error": "Input text cannot be empty."
                 }
             return {
-                "states": "success",
-                "input":text,
-                "output":f"收到：{text}"
+                "state": "completed",
+                "input": text,
+                "output": f"received:{text}"
             }
         return None

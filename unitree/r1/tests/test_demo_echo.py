@@ -8,7 +8,7 @@ sys.path.insert(0, str(R1_DIR))
 from demo_echo import DemoEchoPlugin
 
 def make_plugin():
-    return DemoEchoPlugin(plugin_config={"enabled": True}, namespace="test")
+    return DemoEchoPlugin(plugin_config={"enabled": True}, namespace="test", executor=None)
 
 
 def test_tool_schema():
