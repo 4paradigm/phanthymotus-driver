@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -32,12 +33,19 @@ class Publisher:
 
 class Node:
     def __init__(self, *args, **kwargs):
+        self.context = kwargs.get("context")
         self.publishers = []
 
     def create_publisher(self, message_type, topic, qos):
         publisher = Publisher()
         self.publishers.append(publisher)
         return publisher
+
+    def create_subscription(self, *args, **kwargs):
+        return object()
+
+    def destroy_node(self):
+        return None
 
 
 def load_state():
@@ -68,8 +76,9 @@ IMU = {"availibilityBitMap": 7, "timestamp": 1234,
 def snapshot(speed=None, imu=None):
     return STATE.locomotion_snapshot(
         {"pose": copy.deepcopy(POSE), "speed": copy.deepcopy(SPEED if speed is None else speed),
-         "imu": copy.deepcopy(IMU if imu is None else imu)},
-        {"pose": 1_792_052_530_000, "speed": 1_792_052_530_010, "imu": 1_792_052_530_050})
+         "imu": copy.deepcopy(IMU if imu is None else imu), "length": {"length": 123.4}},
+        {"pose": 1_792_052_530_000, "speed": 1_792_052_530_010,
+         "imu": 1_792_052_530_050, "length": 1_792_052_530_060})
 
 
 class Client:
@@ -92,6 +101,9 @@ class Client:
 
     def get_imu(self, *, timeout):
         return self._read("imu", IMU, timeout)
+
+    def get_total_odometry(self, *, timeout):
+        return self._read("length", {"length": 123.4}, timeout)
 
 
 def plugin(client=None):
@@ -117,6 +129,9 @@ class StateContractTests(unittest.TestCase):
         self.assertEqual([1.2, -2, 0.1], state["position"])
         self.assertEqual([0.3, 0, None], state["velocity"])
         self.assertEqual(-0.4, state["yaw_speed"])
+        self.assertEqual(0.3, state["v"])
+        self.assertEqual(-0.4, state["w"])
+        self.assertEqual(123.4, state["length"])
         self.assertEqual("moving", state["motion_status"])
         self.assertIsNone(state["mode"])
         self.assertIsNone(state["body_height"])
@@ -130,7 +145,12 @@ class StateContractTests(unittest.TestCase):
         self.assertEqual({"linear": "m/s", "angular": "rad/s", "length": "m"}, sample["units"])
         self.assertEqual(1_792_052_530_010, sample["stamp_ms"])
         self.assertEqual("received", sample["vendor"]["stamp_source"])
-        self.assertIsNone(sample["pose"])
+        self.assertEqual({"x": 1.2, "y": -2, "z": 0.1}, sample["pose"]["position"])
+        self.assertEqual("odom", sample["pose"]["frame_id"])
+        self.assertEqual("base_link", sample["pose"]["child_frame_id"])
+        self.assertEqual(1_792_052_530_000, sample["pose"]["stamp_ms"])
+        self.assertAlmostEqual(math.sin(1.57 / 2), sample["pose"]["orientation"]["z"])
+        self.assertAlmostEqual(math.cos(1.57 / 2), sample["pose"]["orientation"]["w"])
         self.assertNotIn("contact", sample)
         self.assertEqual([1.2, -2, 0.1], sample["vendor"]["position"])
         self.assertTrue(is_fresh(sample, 1_792_052_530_050, 100))
@@ -158,6 +178,7 @@ class StateContractTests(unittest.TestCase):
         state = STATE.locomotion_snapshot({"pose": {}, "speed": SPEED}, {"speed": 12345})
         self.assertIsNone(state["position"])
         self.assertFalse(state["available"])
+        self.assertIsNone(STATE.odometry_sample(state)["pose"])
         self.assertEqual(0.3, axis(STATE.odometry_sample(state), "vx"))
 
     def test_imu_bitmap_excludes_fields_even_when_vendor_includes_zeroes(self):
@@ -182,6 +203,72 @@ class StateContractTests(unittest.TestCase):
         self.assertEqual([1, 2, 3], state["imu"]["euler_angle"])
         self.assertNotIn("rpy", state["imu"])
 
+    def test_pose_remains_available_when_speed_request_fails(self):
+        sample = STATE.odometry_sample(snapshot(speed={"error": "offline"}))
+        self.assertIsNotNone(sample["pose"])
+        self.assertEqual([None] * 6, sample["twist"])
+
+    def test_quaternion_is_normalized_and_reconstructs_reported_rpy(self):
+        for roll, pitch, yaw in ((0, 0, 0), (0, 0, math.pi / 2), (0.2, -0.3, 1.2)):
+            state = snapshot()
+            state["rpy"] = [roll, pitch, yaw]
+            q = STATE.odometry_sample(state)["pose"]["orientation"]
+            x, y, z, w = (q[axis] for axis in "xyzw")
+            self.assertAlmostEqual(1, sum(value * value for value in q.values()))
+            self.assertAlmostEqual(roll, math.atan2(2 * (w*x + y*z), 1 - 2 * (x*x + y*y)))
+            self.assertAlmostEqual(pitch, math.asin(2 * (w*y - z*x)))
+            self.assertAlmostEqual(yaw, math.atan2(2 * (w*z + x*y), 1 - 2 * (y*y + z*z)))
+
+    def test_invalid_pose_stays_unknown_instead_of_zero(self):
+        for key in POSE:
+            for invalid in (None, True, float("nan"), float("inf")):
+                with self.subTest(key=key, value=invalid):
+                    pose = dict(POSE, **{key: invalid})
+                    state = STATE.locomotion_snapshot({"pose": pose, "speed": SPEED}, {})
+                    self.assertIsNone(STATE.odometry_sample(state)["pose"])
+                    json.dumps(state, allow_nan=False)
+
+
+class DisplacementTests(unittest.TestCase):
+    def test_relative_translation_is_not_total_mileage(self):
+        tracker = STATE._DisplacementTracker()
+        first = tracker.update(snapshot())
+        self.assertEqual(0, first["displacement"]["distance"])
+        second = snapshot()
+        second["position"] = [4.2, 2, 0.1]
+        second["length"] = 130
+        second = tracker.update(second)
+        self.assertEqual({"x": 3, "y": 4, "z": 0}, second["displacement"]["translation"])
+        self.assertEqual(5, second["displacement"]["distance"])
+        self.assertEqual(130, second["length"])
+        returned = tracker.update(snapshot())
+        self.assertEqual(0, returned["displacement"]["distance"])
+
+    def test_missing_pose_does_not_set_or_replace_origin(self):
+        tracker = STATE._DisplacementTracker()
+        invalid = STATE.locomotion_snapshot({"pose": {"error": "offline"}, "speed": SPEED}, {})
+        self.assertIsNone(tracker.update(invalid)["displacement"])
+        self.assertIsNone(tracker._origin)
+        tracker.update(snapshot())
+        origin = copy.deepcopy(tracker._origin)
+        self.assertIsNone(tracker.update(copy.deepcopy(invalid))["displacement"])
+        self.assertEqual(origin, tracker._origin)
+        recovered = snapshot()
+        recovered["position"][0] += 1
+        self.assertAlmostEqual(1, tracker.update(recovered)["displacement"]["distance"])
+
+    def test_heading_wrap_and_pose_observation_timestamp(self):
+        tracker = STATE._DisplacementTracker()
+        first = snapshot()
+        first["rpy"][2] = math.pi - 0.1
+        tracker.update(first)
+        current = snapshot()
+        current["rpy"][2] = -math.pi + 0.1
+        displacement = tracker.update(current)["displacement"]
+        self.assertAlmostEqual(0.2, displacement["yaw"])
+        self.assertEqual(current["sample_timestamps_ms"]["pose"], displacement["stamp_ms"])
+        self.assertEqual("odom", displacement["frame_id"])
+
 
 class PluginTests(unittest.TestCase):
     def test_both_ports_and_declaration_before_first_sample(self):
@@ -193,19 +280,20 @@ class PluginTests(unittest.TestCase):
         info = state.dispatch("info", {})
         interface = parse_interface(info["odom_interface"])
         self.assertEqual(("vx", "vy", "wz"), interface.provides)
-        self.assertEqual("none", interface.pose_drift)
+        self.assertEqual("unbounded", interface.pose_drift)
         self.assertTrue(interface.usable_for_control)
         self.assertFalse(info["available"])
         self.assertEqual({"state": "idle"}, state.dispatch("stop", {}))
         self.assertIsNone(state.dispatch("unsupported", {}))
 
     def test_concurrent_read_only_requests(self):
-        client = Client(threading.Barrier(3))
+        client = Client(threading.Barrier(4))
         state = plugin(client)
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             result = state._poll_once(pool)
         self.assertTrue(result["available"])
-        self.assertEqual({("odopose", 0.05), ("speed", 0.05), ("imu", 0.05)}, set(client.calls))
+        self.assertEqual({("odopose", 0.05), ("speed", 0.05), ("imu", 0.05),
+                          ("length", 0.05)}, set(client.calls))
 
     def test_publish_failure_recovery_and_repeated_start(self):
         client = Client()
@@ -219,6 +307,8 @@ class PluginTests(unittest.TestCase):
             raw, odom = state._pub.messages[0], state._odom_pub.messages[0]
             self.assertEqual(raw, {key: value for key, value in odom["vendor"].items()
                                    if key in raw})
+            self.assertEqual(raw["position"], list(odom["pose"]["position"].values()))
+            self.assertEqual(0, raw["displacement"]["distance"])
             client.failed = True
             wait_for(lambda: state._odom_pub.messages[-1]["twist"] == [None] * 6)
             self.assertEqual("error", state.dispatch("info", {})["state"])
@@ -284,6 +374,44 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(namespace["should_use_bridge"]("/robot/state/odom"))
         self.assertFalse(namespace["should_use_bridge"]("/arm/command"))
 
+    def test_both_outputs_are_bridged_when_core_publishers_are_created(self):
+        source = ast.parse((ROOT / "bridged_publisher.py").read_text())
+        predicate = next(item for item in source.body if isinstance(item, ast.FunctionDef)
+                         and item.name == "should_use_bridge")
+        scope = {}
+        exec(compile(ast.Module(body=[predicate], type_ignores=[]), "bridge", "exec"), scope)
+        bridged = []
+        transport = types.ModuleType("bridged_publisher")
+
+        def create_publisher(node, message_type, topic, qos):
+            bridged.append((node.context, topic))
+            return Publisher()
+
+        transport.create_bridged_publisher = create_publisher
+        transport.create_bridged_subscription = lambda *args: None
+        transport.should_use_bridge = scope["should_use_bridge"]
+        transport.should_bridge_subscription = lambda topic: True
+        node_module = types.ModuleType("rclpy.node")
+        node_module.Node = Node
+        qos_module = types.ModuleType("rclpy.qos")
+        qos_module.QoSProfile = dict
+        spec = importlib.util.spec_from_file_location("tianyi_bridge_integration_test",
+                                                     ROOT / "bridge_integration.py")
+        integration = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"rclpy.node": node_module, "rclpy.qos": qos_module,
+                                      "bridged_publisher": transport}):
+            spec.loader.exec_module(integration)
+            core = object()
+            ros = types.SimpleNamespace(ctx_core=core, executor_core=types.SimpleNamespace(add_node=lambda _: None))
+            integration.enable(core)
+            try:
+                STATE.LocoStatePlugin({}, "robot", ros, "http://chassis")
+                self.assertEqual([(core, "/robot/loco/state"), (core, "/robot/state/odom")], bridged)
+                Node(context=object()).create_publisher(object, "/robot/state/odom", {})
+                self.assertEqual(2, len(bridged))
+            finally:
+                integration.disable()
+
 
 class ClientTests(unittest.TestCase):
     def test_api_paths_methods_and_request_deadlines(self):
@@ -311,6 +439,19 @@ class ClientTests(unittest.TestCase):
                     self.assertIn("error", client.get_speed(timeout=0.2))
             urlopen.side_effect = TimeoutError("timed out")
             self.assertEqual({"error": "timed out"}, client.get_speed(timeout=0.2))
+
+    def test_total_odometry_uses_the_documented_scalar_endpoint(self):
+        client = STATE._LocoStateClient("http://chassis")
+        with patch.object(STATE.urllib.request, "urlopen") as urlopen:
+            response = urlopen.return_value.__enter__.return_value
+            response.read.return_value = b"123.4"
+            self.assertEqual({"length": 123.4}, client.get_total_odometry(timeout=0.2))
+            self.assertEqual("http://chassis/api/core/statistics/v1/odometry",
+                             urlopen.call_args.args[0].full_url)
+            self.assertEqual("GET", urlopen.call_args.args[0].get_method())
+            for body in (b"null", b"false", b"-1", b"NaN", b"[]", b"{}"):
+                response.read.return_value = body
+                self.assertIn("error", client.get_total_odometry(timeout=0.2))
 
     def test_existing_navigation_client_still_has_its_original_contract(self):
         spec = importlib.util.spec_from_file_location("tianyi_nav_test", ROOT / "nav_client.py")

@@ -21,9 +21,13 @@ The new card uses its own read-only HTTP client in `loco_state.py`, leaving
 | Pose | `/api/core/slam/v1/localization/odopose` | Odometry frame position and roll/pitch/yaw, distinct from map localization |
 | Velocity | `/api/core/motion/v1/speed` | Measured body-frame `vx`, `vy`, `omega`; unmeasured vertical velocity is null |
 | IMU | `/api/core/slam/v1/imu` | Chassis IMU; only fields enabled in `availibilityBitMap` are forwarded |
+| Total mileage | `/api/core/statistics/v1/odometry` | Vendor-reported total travelled distance in metres; not displacement from a task origin |
 
 `position` and `velocity` are XYZ arrays; `rpy` is roll/pitch/yaw and
-`yaw_speed` comes from `omega`. IMU quaternion order is WXYZ. IMU values retain
+`yaw_speed` comes from `omega`. `v` is the signed measured forward speed `vx`,
+`w` is measured `omega`, and `length` is the chassis total mileage. These
+aliases and units are also available under `vendor` on the standard port.
+IMU quaternion order is WXYZ. IMU values retain
 the vendor units; the supplied API does not specify units for those fields.
 IMU `euler_angle` retains vendor XYZ order without assuming a roll/pitch/yaw convention.
 Its `timestamp` is chassis uptime and is exposed as `imu.uptime_ms`, separately
@@ -35,10 +39,12 @@ derived from measured speed and does not claim to be a controller operating mode
 Failed requests produce current errors and null readings instead of reusing a
 previous successful pose or speed. `available` requires valid odometry pose and
 speed; IMU validity is reported separately in `imu.available`.
+Mileage validity is independent too: a missing mileage endpoint sets `length`
+to null and reports `errors.length`, while valid pose and twist remain usable.
 
 `plugins.loco_state.hz` defaults to a target of 10Hz (maximum 10); HTTP latency
 can lower the actual rate. `request_timeout` defaults to 0.5 seconds per request.
-There is at most one three-request group in flight. MCP `stop` returns the
+There is at most one four-request group in flight. MCP `stop` returns the
 canvas lifecycle marker `{"state": "idle"}` while leaving this always-active
 observer running, matching R1; driver shutdown stops the worker.
 
@@ -50,9 +56,44 @@ null. There is one speed observation per publish, with no faster stream being
 discarded. The IMU boot-relative timestamp is never used as `stamp_ms`.
 
 `info()` includes a validated `odom_interface` with `provides = ["vx", "vy", "wz"]`,
-the target rate, and `pose_drift = "none"` because standard `pose` is null.
-Odometry position, RPY, IMU, errors, and separate request timestamps remain
-under `vendor`; no ground-contact state is inferred. This follows the upstream
+the target rate, and `pose_drift = "unbounded"`: the source is uncorrected wheel
+odometry, not map localization. Standard `pose` now contains measured position
+and an orientation quaternion derived from the same endpoint's roll/pitch/yaw:
+
+```json
+{
+  "stamp_ms": 1792052530000,
+  "frame_id": "odom",
+  "child_frame_id": "base_link",
+  "position": {"x": 1.2, "y": -2.0, "z": 0.1},
+  "orientation": {"x": 0.0, "y": 0.0, "z": 0.70710678, "w": 0.70710678}
+}
+```
+
+This is the `pose` member of the existing JSON `motus.odom/1` message, not a
+ROS `nav_msgs/Odometry` message. Its frame is explicit: standard `frame = body`
+still describes the twist, whereas `pose.frame_id = odom` describes position.
+Quaternion components are named to avoid XYZW/WXYZ ambiguity. `pose.stamp_ms`
+is the host receive time of the pose reply; the message's top-level stamp is
+the independently received speed reply. Missing or malformed position or RPY
+produces `pose = null`, never a fabricated identity pose. No pose covariance,
+ground contact, or unmeasured velocity axes are invented.
+
+`displacement` is calculated from the first valid odometry pose during this
+driver instance. It contains `origin`, XYZ `translation` in the odom frame,
+`distance` (Euclidean translation from that origin, metres), and `yaw` (heading
+change wrapped to [-pi, pi], radians). Standard consumers find it under
+`vendor.displacement`. Returning to the origin makes `distance` approach zero;
+the vendor's total `length` still counts the path travelled. Neither value is
+computed by integrating velocity. On a pose failure displacement is null and
+the original reference is retained for recovery. Canvas start/stop does not
+reset that reference; restarting the driver creates a new one. If the chassis
+itself resets its odometry frame, restart the driver to establish a new origin.
+
+Odometry position, RPY, IMU, mileage, displacement, errors, and separate request
+timestamps remain under `vendor` too. Short-distance displacement and pose
+scale/drift need hardware validation against a measured distance before they
+can be used as a precision target. This follows the upstream
 [Robot Odometry specification](https://github.com/4paradigm/phanthymotus-driver/blob/main/README_dev.md#robot-odometry-motusodom1).
 
 ## Head camera snapshot card

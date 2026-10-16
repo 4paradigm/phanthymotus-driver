@@ -25,11 +25,16 @@ class _LocoStateClient:
     def __init__(self, base_url):
         self._base = base_url.rstrip("/")
 
-    def _get(self, path, *, timeout):
+    def _get(self, path, *, timeout, scalar_key=None):
         request = urllib.request.Request(self._base + path, method="GET")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 result = json.loads(response.read())
+            if scalar_key is not None:
+                value = _number(result)
+                if value is None or value < 0:
+                    return {"error": "invalid_total_odometry"}
+                return {scalar_key: value}
             if not isinstance(result, dict):
                 return {"error": "invalid_response_type"}
             return result
@@ -44,6 +49,10 @@ class _LocoStateClient:
 
     def get_imu(self, *, timeout):
         return self._get("/api/core/slam/v1/imu", timeout=timeout)
+
+    def get_total_odometry(self, *, timeout):
+        return self._get("/api/core/statistics/v1/odometry", timeout=timeout,
+                         scalar_key="length")
 
 
 def _number(value):
@@ -105,6 +114,10 @@ def locomotion_snapshot(readings, timestamps):
     imu = _imu_state(readings.get("imu"))
     if not imu["available"]:
         errors.setdefault("imu", "no_valid_chassis_imu_fields")
+    length = _number(readings.get("length", {}).get("length"))
+    if length is None or length < 0:
+        length = None
+        errors.setdefault("length", "missing_or_invalid_total_odometry")
     return {
         "timestamp_ms": max(timestamps.values()) if timestamps else int(time.time() * 1000),
         "sample_timestamps_ms": dict(timestamps),
@@ -113,10 +126,15 @@ def locomotion_snapshot(readings, timestamps):
         "pose_source": "/api/core/slam/v1/localization/odopose",
         "frame_id": "odom",
         "child_frame_id": "base_link",
+        "units": {"linear": "m/s", "angular": "rad/s", "length": "m"},
         "position": position,
         "rpy": rpy,
         "velocity": [motion[0], motion[1], None],  # No vertical speed sensor.
         "yaw_speed": motion[2],
+        "v": motion[0],
+        "w": motion[2],
+        "length": length,
+        "displacement": None,
         "motion_status": ("moving" if any(abs(v) > 0.001 for v in motion) else "stationary")
                          if speed_available else "unknown",
         "mode": None,
@@ -127,8 +145,57 @@ def locomotion_snapshot(readings, timestamps):
     }
 
 
+def _pose(snapshot):
+    """Measured odometry pose; twist's body frame does not relabel its position."""
+    position = snapshot["position"]
+    rpy = snapshot["rpy"]
+    if position is None or rpy is None:
+        return None
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    return {
+        "stamp_ms": snapshot["sample_timestamps_ms"].get("pose", snapshot["timestamp_ms"]),
+        "frame_id": "odom", "child_frame_id": "base_link",
+        "position": dict(zip("xyz", position)),
+        "orientation": {"x": sr * cp * cy - cr * sp * sy,
+                        "y": cr * sp * cy + sr * cp * sy,
+                        "z": cr * cp * sy - sr * sp * cy,
+                        "w": cr * cp * cy + sr * sp * sy},
+    }
+
+
+class _DisplacementTracker:
+    """Translation from the first valid pose, not integrated speed or path length."""
+
+    def __init__(self):
+        self._origin = None
+
+    def update(self, snapshot):
+        snapshot["displacement"] = None
+        pose = _pose(snapshot)
+        if pose is None:
+            return snapshot
+        if self._origin is None:
+            self._origin = {"stamp_ms": pose["stamp_ms"],
+                            "position": dict(pose["position"]),
+                            "yaw": snapshot["rpy"][2]}
+        delta = {axis: pose["position"][axis] - self._origin["position"][axis]
+                 for axis in "xyz"}
+        yaw_delta = snapshot["rpy"][2] - self._origin["yaw"]
+        snapshot["displacement"] = {
+            "stamp_ms": pose["stamp_ms"], "frame_id": "odom",
+            "origin": copy.deepcopy(self._origin),
+            "translation": delta,
+            "distance": math.hypot(*delta.values()),
+            "yaw": math.atan2(math.sin(yaw_delta), math.cos(yaw_delta)),
+        }
+        return snapshot
+
+
 def odometry_sample(snapshot):
-    """The same poll in motus.odom/1; pose remains in the vendor block.
+    """The same poll in motus.odom/1, including measured pose in the odom frame.
 
     The REST speed endpoint has no measurement timestamp. Stamp the reply's
     arrival, without confusing the IMU uptime with a wall-clock observation.
@@ -142,6 +209,7 @@ def odometry_sample(snapshot):
         stamp_ms=stamp,
         twist=mean_twist([[velocity[0], velocity[1], None, None, None,
                            snapshot["yaw_speed"]]]),
+        pose=_pose(snapshot),
         vendor={**copy.deepcopy(snapshot), **provenance,
                 "samples": int(any(value is not None for value in
                                    (velocity[0], velocity[1], snapshot["yaw_speed"])))},
@@ -162,7 +230,7 @@ class LocoStatePlugin:
         self._topic = f"/{namespace}/loco/state"
         self._odom_topic = f"/{namespace}/state/odom"
         self._odom_interface = build_interface(
-            provides=["vx", "vy", "wz"], rate_hz=self._hz, pose_drift="none")
+            provides=["vx", "vy", "wz"], rate_hz=self._hz, pose_drift="unbounded")
         self._node = Node("tianyi2_loco_state_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._node)
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -175,6 +243,7 @@ class LocoStatePlugin:
         self._stop_event = threading.Event()
         self._thread = None
         self._latest = locomotion_snapshot({}, {})
+        self._displacement = _DisplacementTracker()
         self._samples = 0
 
     def get_tool(self):
@@ -182,7 +251,8 @@ class LocoStatePlugin:
             "name": "loco_state", "type": "sensor", "multiInstance": False,
             "description": (
                 "天轶2.0 locomotion state (always active) — odometry position, "
-                "measured velocity and chassis IMU; mode/body_height unavailable. "
+                "measured velocity, displacement, total mileage and chassis IMU; "
+                "mode/body_height unavailable. "
                 f"Target {self._hz:g}Hz (HTTP latency dependent) to {self._topic}, "
                 f"and the same reading as motus.odom/1 to {self._odom_topic}"),
             "inputSchema": {"type": "object", "properties": {}},
@@ -220,6 +290,7 @@ class LocoStatePlugin:
             ("pose", self._client.get_odometry_pose),
             ("speed", self._client.get_speed),
             ("imu", self._client.get_imu),
+            ("length", self._client.get_total_odometry),
         )}
         readings, timestamps = {}, {}
         for key, future in futures.items():
@@ -227,13 +298,14 @@ class LocoStatePlugin:
         return locomotion_snapshot(readings, timestamps)
 
     def _poll_loop(self):
-        # One bounded group in flight, even when the chassis cannot sustain 10Hz.
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        # One bounded request group in flight, even when HTTP cannot sustain 10Hz.
+        with ThreadPoolExecutor(max_workers=4) as pool:
             while not self._stop_event.is_set():
                 started = time.monotonic()
                 snapshot = self._poll_once(pool)
                 if self._stop_event.is_set():
                     break
+                snapshot = self._displacement.update(snapshot)
                 with self._lock:
                     self._latest = snapshot
                     self._samples += 1
