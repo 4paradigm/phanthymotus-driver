@@ -148,13 +148,7 @@ plugins:
     enabled: true
   squat_counter:
     enabled: true
-    depth_cm: 15.0
-    hold_s: 0.15
-    lost_s: 2.0
-    min_confidence: 0.3
-  bicep_curl_counter:
-    enabled: true
-    lift_px: 40.0
-    hold_s: 0.15
-    lost_s: 2.0
-    min_confidence: 0.3
+    window_s: 2.0
+    down_ratio: 0.5
+    lost_s: 3.0
+    min_confidence: 0.5

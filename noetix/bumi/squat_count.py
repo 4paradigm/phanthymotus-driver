@@ -1,90 +1,66 @@
-"""Squat counter based on knee joint Y-position (vertical height).
+"""Squat counter based on posture-label trend detection.
 
-Uses COCO-17 keypoints: left_knee=11, right_knee=12.
-Counts a repetition when tracked person's average knee height goes:
-  down (depth reached) → back up (above threshold).
+Instead of requiring strict frame-by-frame transitions or a simple set
+collection, this counter maintains a sliding window of recent posture
+observations for each tracked person.  A squat is counted when:
 
-Advantages over posture classification:
-- Continuous signal, less sensitive to discrete classification gaps
-- Knee coords are reliably detected even in partial squat transitions
-- No need for initial "standing" label to start tracking
+1. The window shows a sustained "down" phase (down-posture ratio ≥ threshold)
+2. This is followed by an "up" phase (standing posture)
+
+This is robust to transient misclassifications during fast transitions.
 """
 
 import math
+from collections import deque
 
-
-# COCO-17 keypoint indices
-_LEFT_HIP = 11
-_LEFT_KNEE = 13
-_RIGHT_HIP = 12
-_RIGHT_KNEE = 14
+# Configurable posture labels
+POSTURES_DOWN = {"sitting", "crouching"}
+POSTURES_UP = {"standing"}
 
 
 class SquatCounter:
-    def __init__(self, depth_cm=15.0, hold_s=0.15, lost_s=2.0,
-                 min_confidence=0.3, min_visibility=2):
+    def __init__(self, window_s=2.0, down_ratio=0.5, lost_s=3.0,
+                 min_confidence=0.5):
         """
         Args:
-            depth_cm: minimum knee-drop in cm to count as a squat.
-            hold_s: minimum time at bottom before rebound is accepted.
+            window_s: sliding window duration in seconds.
+            down_ratio: minimum fraction of window occupied by down postures
+                        to consider the person as "in a squat".
             lost_s: seconds without tracked person before reset.
-            min_confidence: minimum keypoint confidence to be used.
-            min_visibility: minimum number of visible knee keypoints required.
+            min_confidence: minimum posture_confidence to accept a label.
         """
-        self.depth_cm = float(depth_cm)
-        self.hold_s = float(hold_s)
+        self.window_s = float(window_s)
+        self.down_ratio = float(down_ratio)
         self.lost_s = float(lost_s)
         self.min_confidence = float(min_confidence)
-        self.min_visibility = int(min_visibility)
         self.reset()
 
     def reset(self):
         self.count = 0
         self.track_id = None
-        # Phase: "up" (near standing) → "down" (at bottom) → "up" (count++)
-        self.phase = "up"
-        self.bottom_since = 0.0
-        self.bottom_knee_y = None
-        self.ref_knee_y = None  # standing reference height
+        # Sliding window: list of (timestamp, is_down) tuples
+        self.window = deque()
+        self.in_squat = False
         self.last_seen = None
 
     def _drop_track(self):
         self.track_id = None
-        self.phase = "up"
-        self.bottom_since = 0.0
-        self.bottom_knee_y = None
-        self.ref_knee_y = None
+        self.window.clear()
+        self.in_squat = False
         self.last_seen = None
 
-    @staticmethod
-    def _knee_y(person):
-        """Return average Y of left/right knee, or None if not visible.
+    def _prune_window(self, now):
+        """Remove entries older than window_s."""
+        cutoff = now - self.window_s
+        while self.window and self.window[0][0] < cutoff:
+            self.window.popleft()
 
-        Returns (avg_y, visible_count):
-            avg_y: mean Y coordinate (larger = lower in image).
-            visible_count: number of knee keypoints that passed confidence check.
-        """
-        keypoints = person.get("keypoints")
-        if not isinstance(keypoints, list) or len(keypoints) < 17 * 3:
-            return None, 0
-
-        ys = []
-        for idx in (_LEFT_KNEE, _RIGHT_KNEE):
-            x = keypoints[idx * 3]
-            y = keypoints[idx * 3 + 1]
-            conf = keypoints[idx * 3 + 2]
-            if (math.isfinite(x) and math.isfinite(y)
-                    and isinstance(conf, (int, float))
-                    and conf >= SquatCounter._MIN_CONF_DYN
-                    and conf >= person.get("min_confidence", 0.3)):
-                ys.append(y)
-
-        if len(ys) < 1:
-            return None, 0
-        return sum(ys) / len(ys), len(ys)
-
-    # Dynamic min confidence for keypoint checks (also used outside class)
-    _MIN_CONF_DYN = 0.3
+    def _down_fraction(self):
+        """Return fraction of window occupied by down postures."""
+        if not self.window:
+            return 0.0
+        down_count = sum(1 for _, is_down in self.window if is_down)
+        return down_count / len(self.window)
 
     def update(self, persons, now):
         """Return a completion event dict or None."""
@@ -102,13 +78,13 @@ class SquatCounter:
             None,
         )
 
-        # Acquire a new track from the first person with visible knees
+        # Acquire a new track from the first person with any valid posture
         if self.track_id is None:
             person = next(
                 (p for p in persons
                  if isinstance(p, dict)
                  and isinstance(p.get("id"), int)
-                 and self._knee_y(p)[0] is not None),
+                 and self._valid_posture(p.get("posture"), p.get("posture_confidence"))),
                 None,
             )
             if person is None:
@@ -118,59 +94,42 @@ class SquatCounter:
         if person is None:
             return None
 
-        knee_y, vis = self._knee_y(person)
-        if knee_y is None:
+        posture = person.get("posture")
+        if not self._valid_posture(posture, person.get("posture_confidence")):
             return None
 
         self.last_seen = now
+        is_down = posture in POSTURES_DOWN
 
-        # ── Height-based state machine ──────────────────────────────────
-        # Y increases downward in image coords.  Smaller Y = higher (standing).
-        # Knee drop = current_knee_y - ref_knee_y (positive = knees lower).
+        # Add observation to sliding window
+        self._prune_window(now)
+        self.window.append((now, is_down))
 
-        if self.ref_knee_y is None:
-            # First frame: establish standing reference.
-            self.ref_knee_y = knee_y
-            self.phase = "up"
+        # ── Trend-based state machine ───────────────────────────────────
+        frac = self._down_fraction()
 
-        knee_drop_px = knee_y - self.ref_knee_y  # > 0 means knees went down
-
-        if self.phase == "up":
-            if knee_drop_px > 0.5:  # small hysteresis
-                self.phase = "down"
-
-        elif self.phase == "down":
-            if knee_drop_px >= self.depth_cm:
-                # Reached squat depth.
-                if self.bottom_knee_y is None or knee_y > self.bottom_knee_y:
-                    self.bottom_knee_y = knee_y
-                if self.bottom_since == 0.0:
-                    self.bottom_since = now
-                elif now - self.bottom_since >= self.hold_s:
-                    # Hold time met — start looking for rebound.
-                    self.phase = "rebound"
-            else:
-                # Didn't reach depth — reset bottom timer so a prior
-                # bottom_since from a previous cycle can't falsely trigger.
-                self.bottom_since = 0.0
-                self.bottom_knee_y = None
-
-        elif self.phase == "rebound":
-            if knee_drop_px < self.depth_cm * 0.3:
-                # Knees rose back above 30% of depth → complete squat.
+        if not self.in_squat:
+            # Phase 1: waiting for sustained down posture
+            if frac >= self.down_ratio:
+                self.in_squat = True
+        else:
+            # Phase 2: in squat, waiting for up posture to complete
+            if posture in POSTURES_UP:
                 self.count += 1
-                self.ref_knee_y = knee_y  # update reference to new standing height
-                self.bottom_since = 0.0
-                self.bottom_knee_y = None
-                self.phase = "up"
+                self.in_squat = False
+                self.window.clear()
                 return {
                     "type": "squat_completed",
                     "priority": 1,
                     "track_id": self.track_id,
                     "count": self.count,
                 }
-            else:
-                # Didn't rise enough — stay in rebound, keep waiting.
-                pass
 
         return None
+
+    def _valid_posture(self, posture, confidence):
+        if posture not in POSTURES_UP | POSTURES_DOWN:
+            return False
+        if not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
+            return False
+        return confidence >= self.min_confidence
