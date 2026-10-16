@@ -75,11 +75,33 @@ def test_mismatched_robot_and_pending_draft_rejected_without_motion(g1_teaching)
             upload(service, changed)
         assert service.draft["saved"]["id"] == saved["asset_id"]
     # An empty workbench draft is safe to replace; an unsaved recording is not.
-    call(service, "new")
-    imported = upload(service, data)["draft"]
+    call(service, "new", filename=service.draft['recording']['filename'])
     with pytest.raises(ValueError, match="current_draft"):
         upload(service, data)
-    assert service.draft["id"] == imported["id"]
+    assert len(channel.positions) == before
+
+
+def test_same_device_reuses_only_saved_validation_and_pending_survives_restart(g1_teaching):
+    from common.teaching import TeachingPlugin
+    service, card, _, _, channel, _ = g1_teaching
+    _, saved, _ = save(service)
+    data = export(service, saved['asset_id'])
+    before = len(channel.positions)
+    result = upload(service, data)
+    assert result['reused'] and result['asset_id'] == saved['asset_id']
+    assert not result['requires_local_trial'] and not call(service, 'draft_list')['drafts']
+    card.cfg['trajectory_device_id'] = 'fresh-target-device'
+    imported = upload(service, data)['draft']
+    other = upload(service, data)['draft']
+    assert other['id'] != imported['id']
+    assert len(call(service, 'draft_list')['drafts']) == 2
+    restarted = TeachingPlugin(service.adapter, service.directory, service.name)
+    reopened = call(restarted, 'draft_open', draft_id=imported['id'])['draft']
+    assert reopened['trial'] is None and reopened['imported']['metadata']['name']
+    assert reopened['recording']['binding'] == card.trajectory.binding()
+    with pytest.raises(ValueError, match='successful_trial_required'):
+        call(restarted, 'save', draft_id=imported['id'], effect_confirmed=True,
+             **reopened['imported']['metadata'])
     assert len(channel.positions) == before
 
 

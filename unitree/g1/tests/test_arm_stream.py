@@ -336,15 +336,21 @@ def test_raw_motor_telemetry_does_not_gate_arm_but_invalid_sample_does(tmp_path)
     motors[12].q=-.02193
     msg=SimpleNamespace(tick=1,motor_state=motors,wireless_remote=[0]*40,mode_machine=4)
     arm._on_state(msg)
+    epoch=arm.feedback_epoch
+    msg.tick=2;arm._on_state(msg)
+    assert arm.feedback_epoch==epoch
+    arm._feedback['arm_ns']-=101_000_000
+    msg.tick=3;arm._on_state(msg)
+    assert arm.feedback_epoch==epoch+1
     state,_,_=arm._fresh()
     assert 'fault' not in state
     assert state['motor_telemetry'][0]['motorstate']==0
-    motors[15].motorstate=5;msg.tick=2;arm._on_state(msg)
+    motors[15].motorstate=5;msg.tick=4;arm._on_state(msg)
     assert arm._fresh()[0]['motor_telemetry'][0]['motorstate']==5
     motors[15].mode=0;motors[15].vol=0;motors[15].temperature=[150,150]
-    msg.tick=3;arm._on_state(msg)
+    msg.tick=5;arm._on_state(msg)
     assert arm._fresh()[0]['motor_telemetry'][0]['temperature']==[150,150]
-    msg.tick=4;msg.motor_state=[];arm._on_state(msg)
+    msg.tick=6;msg.motor_state=[];arm._on_state(msg)
     with pytest.raises(ValueError,match='arm_feedback_invalid'): arm._fresh()
 
 

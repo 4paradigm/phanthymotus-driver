@@ -216,6 +216,10 @@ class G1TeachingAdapter:
         self.preview = None
         return self._call("stop")
 
+    def authorization_context(self):
+        return [self.arm.boot_id, self.epoch, self.control._generation,
+                self.arm.feedback_epoch, self.arm.profile_sha256]
+
     def inspect(self, filename):
         recording = self._call("inspect", filename=filename)
         return {**recording, "preview": [
@@ -241,12 +245,16 @@ class G1TeachingAdapter:
         if args.get("execute") is True and (args.get("workspace_clear") is not True or args.get("take_control") is not True):
             raise ValueError("user_confirmation_required: 请取得用户本次路径与双臂接管确认")
         epoch, generation = self.epoch, self.control._generation
+        context = self.authorization_context()
+        if ('_authorized_context' in args and
+                args['_authorized_context'] != context):
+            raise ValueError('session_authorization_expired')
         self.trajectory._idle()
         recording = self.inspect(filename)
         start = self.start_difference(filename)
         if not start["can_trial"]:
             raise ValueError(start["error"])
-        if epoch != self.epoch or generation != self.control._generation:
+        if epoch != self.epoch or generation != self.control._generation or context != self.authorization_context():
             raise ValueError("replay_cancelled")
         signature = (filename, recording["sha256"], recording["binding"], generation, epoch)
         if not args.get("execute"):
@@ -265,7 +273,8 @@ class G1TeachingAdapter:
         self.preview = None
         result = self._call("play", filename=filename, expected_generation=generation,
                             expected_sha256=recording["sha256"])
-        return {**result, "state": result["status"]}
+        return {**result, "state": result["status"],
+                '_authorization_context': [context[0], epoch, generation+1, *context[3:]]}
 
     def wait(self, action_id):
         deadline = time.monotonic()+self.completion_timeout

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
 from .package import Transfers, pack, SCHEMA as PACKAGE_SCHEMA
+from .authorization import consume_approval
 
 PROTOCOL = "motus.workbench/1"
 ASSET_SCHEMA = "motus.teaching.asset/1"
@@ -34,12 +36,17 @@ class TeachingPlugin:
         self.observer = None
         self.record_started = None
         self.transfers = Transfers()
+        self.grants = {}
+        self.challenges = {}
+        self.boot_id = uuid4().hex
 
     def start(self):
         self.closed = False
 
     def stop(self):
         self.closed = True
+        self.grants.clear()
+        self.challenges.clear()
         self.adapter.stop()
         if self.observer:
             self.observer.join(4)
@@ -61,6 +68,7 @@ class TeachingPlugin:
             "bytes": {"type": "integer", "x-ui-hidden": True},
             "sha256": {"type": "string", "x-ui-hidden": True},
             "data": {"type": "string", "x-ui-hidden": True},
+            "approval_id": {"type": "string", "x-ui-hidden": True},
             **{key: {"type": "string"} for key in ("name", "description", "conditions", "phrase")},
         }
         confirmation = ["execute", "preview_id", "workspace_clear", "take_control"]
@@ -76,8 +84,8 @@ class TeachingPlugin:
             "inspect": (["draft_id"], "预览录制并比较当前姿态与回放起点"),
             "trial": (["draft_id", *confirmation], "预览或确认试运行当前录制"),
             "save": (["draft_id", "name", "description", "conditions", "phrase", "effect_confirmed"], "试运行成功且用户确认效果后保存技能"),
-            "run": (["asset_id", *confirmation], "执行已保存的技能；先预览，再取得用户本次确认，最后提交执行。running 不是完成"),
-            "preview": (["asset_id"], "只读预览已保存的技能，返回正式执行所需的完整参数；不移动机器人。之后必须询问用户本次接管与路径确认"),
+            "run": (["asset_id", *confirmation], "执行已保存技能；先 preview。有网页会话授权时无需重复询问，否则须取得本次确认。running 不是完成"),
+            "preview": (["asset_id"], "只读预览并检查网页会话授权；confirmation_required=false 时用户已授权，可按返回参数执行，无需再询问"),
             "stop": ([], "请求原控制器停止，读取 info 确认完成结果"),
         }
         if hasattr(self.adapter, "compatibility"):
@@ -87,6 +95,13 @@ class TeachingPlugin:
                             "package_begin": (["bytes", "sha256"], "开始上传动作技能包"),
                             "package_write": (["transfer_id", "offset", "data"], "写入技能包分块"),
                             "package_finish": (["transfer_id"], "检查型号并安装为待试运行的草稿，不启用技能")})
+            actions.update({"draft_list": ([], "列出本机待验证导入"),
+                            "draft_open": (["draft_id"], "继续验证导入草稿，不执行动作")})
+        if hasattr(self.adapter, 'authorization_context'):
+            actions.update({"session_status": (["asset_id"], "读取网页授予的本次调用权限"),
+                            "session_challenge": (["asset_id"], "为网页授权生成一次性核验请求，不授予权限"),
+                            "session_authorize": (["asset_id", "approval_id"], "核验 Core 网页一次性授权凭据"),
+                            "session_revoke": (["asset_id"], "撤销本次调用权限，不触发动作")})
         schema = action_schema(actions, fields)
         schema["additionalProperties"] = False
         schema["x-resource"] = getattr(self.adapter, "resources", "arm")
@@ -95,14 +110,15 @@ class TeachingPlugin:
         schema["x-workbench"] = {"protocol": PROTOCOL, "kind": "skill-authoring",
                                  "title": "录制技能 · " + self.adapter.title, "entry": "ui", "actions": list(actions)}
         if hasattr(self.adapter, "compatibility"):
-            schema["x-skill-package"] = {"schema": PACKAGE_SCHEMA}
+            schema["x-skill-package"] = {"schema": PACKAGE_SCHEMA, "pending": True,
+                                        "session_authorization": hasattr(self.adapter, 'authorization_context')}
         schema["properties"]["action"]["oneOf"] = [
             {"const": a, "title": {"ui": "录制技能", "run": "运行技能"}.get(a, a)} for a in actions]
         # The full wire contract includes authoring. Only execution/lifecycle are
         # useful as LLM/canvas actions; authoring is handled by the workbench.
         schema["x-action-params"] = {a: schema["x-action-params"][a] for a in ("start", "info", "preview", "run", "stop")}
         schema["x-action-params"]["preview"]["required"] = ["asset_id"]
-        schema["x-action-params"]["run"]["required"] = ["asset_id", *confirmation]
+        schema["x-action-params"]["run"]["required"] = ["asset_id", "execute", "preview_id"]
         return [tool(self.name, "actuator", self.adapter.title + "：基于已验证示教录制的技能；保留原有速度、标定和设备绑定。", schema)]
 
     def _validate(self, action, args):
@@ -128,6 +144,103 @@ class TeachingPlugin:
         if self.pending or self.adapter.info()["busy"]:
             raise RuntimeError("robot_busy_wait_for_completion")
 
+    def _grant(self, asset_id, recording):
+        grant = self.grants.get(asset_id)
+        if grant and (time.monotonic() >= grant['expires'] or grant['sha256'] != recording['sha256']
+                      or grant['binding'] != recording['binding']
+                      or grant['context'] != self.adapter.authorization_context()):
+            self.grants.pop(asset_id, None)
+            grant = None
+        return grant
+
+    def _session(self, action, args):
+        asset_id = args.get('asset_id')
+        asset, recording = self._read_asset(asset_id)
+        if action == 'session_revoke':
+            self.grants.pop(asset_id, None)
+            self.challenges.pop(asset_id, None)
+            return {'active': False}
+        if action == 'session_challenge':
+            self._idle()
+            if not asset.get('effect_confirmed') or asset.get('trial', {}).get('status') != 'completed':
+                raise ValueError('successful_trial_required')
+            self.adapter.play(recording['filename'], {'execute': False})
+            nonce = secrets.token_hex(32)
+            self.challenges[asset_id] = {'nonce': nonce, 'expires': time.monotonic()+30,
+                'context': self.adapter.authorization_context(), 'sha256': recording['sha256'],
+                'binding': recording['binding'], 'instance_id': args.get('instance_id', '')}
+            return {'nonce': nonce}
+        if action == 'session_authorize':
+            self._idle()
+            challenge = self.challenges.pop(asset_id, None)
+            if (not challenge or time.monotonic() >= challenge['expires']
+                    or challenge['sha256'] != recording['sha256'] or challenge['binding'] != recording['binding']
+                    or challenge['context'] != self.adapter.authorization_context()
+                    or challenge['instance_id'] != args.get('instance_id', '')):
+                raise ValueError('session_approval_expired')
+            receipt = consume_approval(args.get('approval_id'))
+            expected = {'nonce': challenge['nonce'], 'asset_id': asset_id, 'tool': self.name,
+                        'instance_id': challenge['instance_id'], 'seconds': 1800}
+            if receipt != expected:
+                raise ValueError('session_approval_scope_mismatch')
+            self.grants[asset_id] = {**challenge, 'expires': time.monotonic()+1800}
+        grant = self._grant(asset_id, recording)
+        return {'active': bool(grant), 'remaining_seconds': max(0, int(grant['expires']-time.monotonic())) if grant else 0,
+                'conditions': asset['metadata']['conditions'], 'name': asset['metadata']['name']}
+
+    def _persist_draft(self):
+        if not self.draft or not self.draft.get('imported'):
+            return
+        directory = self.directory / 'drafts'
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = directory / (self.draft['id']+'.json')
+        if self.draft.get('saved'):
+            path.unlink(missing_ok=True)
+            return
+        value = copy.deepcopy(self.draft)
+        value['recording'] = {k: value['recording'][k] for k in ('filename', 'sha256', 'binding')}
+        value['boot_id'] = self.boot_id
+        fd, temp = tempfile.mkstemp(prefix='.draft-', dir=directory)
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(value, stream, ensure_ascii=False, allow_nan=False)
+                stream.flush(); os.fsync(stream.fileno())
+            os.replace(temp, path)
+        finally:
+            if os.path.exists(temp): os.unlink(temp)
+
+    def _load_draft(self, ident):
+        if not isinstance(ident, str) or not re.fullmatch('[a-f0-9]{32}', ident):
+            raise ValueError('invalid_draft_id')
+        path = self.directory / 'drafts' / (ident+'.json')
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 32768:
+                raise ValueError('invalid_import_draft')
+            draft = json.load(stream)
+        if draft.get('id') != ident or not draft.get('imported'):
+            raise ValueError('invalid_import_draft')
+        if draft.get('boot_id') != self.boot_id or (draft.get('trial') or {}).get('status') == 'running':
+            draft['trial'] = None
+        return draft
+
+    def _validated_package(self, manifest, data):
+        # Only this device's saved, effect-confirmed receipt can skip a trial.
+        # Imported claims never carry validation authority.
+        for path in self.directory.glob('*.json'):
+            try:
+                asset, recording = self._read_asset(path.stem)
+                if (asset.get('effect_confirmed') and asset.get('trial', {}).get('status') == 'completed'
+                        and asset['metadata'] == manifest['skill']
+                        and self.adapter.export_recording(recording) == data
+                        and {k:v for k,v in self.adapter.compatibility().items() if k != 'driver_version'} ==
+                            {k:v for k,v in manifest['compatibility'].items() if k != 'driver_version'}):
+                    return {'skill': self._skill_definition(asset['id'], asset['metadata']),
+                            'asset_id': asset['id'], 'reused': True, 'requires_local_trial': False}
+            except (ValueError, OSError, KeyError):
+                continue
+
     def _recording(self, draft):
         if not draft.get("recording"):
             raise ValueError("complete_recording_required")
@@ -151,9 +264,16 @@ class TeachingPlugin:
         with self.lock:
             if purpose == "trial" and self.draft and self.draft["id"] == draft_id:
                 self.draft["trial"] = outcome
+                try:
+                    self._persist_draft()
+                except OSError as exc:
+                    self.draft['trial'] = {'action_id': action_id, 'status': 'error',
+                                           'result': {'reason': 'draft_persistence_failed: '+str(exc)}}
             elif purpose == "run":
                 self.last_run = outcome
             self.pending = None
+            if outcome.get('status') != 'completed':
+                self.grants.clear()
         # The adapter's motion owner delivers ACP for this same action_id. Do
         # not send a second event; Core correlates by ID, not by card name.
 
@@ -173,18 +293,29 @@ class TeachingPlugin:
     def _run(self, args):
         if not args.get("asset_id"):
             raise ValueError("missing_asset_id: 预览和正式执行均须传技能指令中的 asset_id；没有执行动作")
+        _, recording = self._read_asset(args["asset_id"])
+        grant = self._grant(args['asset_id'], recording) if hasattr(self.adapter, 'authorization_context') else None
         if args.get("execute") is True:
             if not args.get("preview_id"):
                 raise ValueError("missing_preview_id: 请保留 asset_id 并补齐本次预览的 preview_id；没有执行动作")
-            if args.get("workspace_clear") is not True or args.get("take_control") is not True:
+            if grant:
+                args = dict(args, workspace_clear=True, take_control=True, _authorized_context=list(grant['context']))
+            elif args.get("workspace_clear") is not True or args.get("take_control") is not True:
                 raise ValueError("user_confirmation_required: 请先询问用户本次路径、环境和双臂接管；不得自行将确认字段设为 true")
-        _, recording = self._read_asset(args["asset_id"])
-        result = self._play(recording, args, "run")
+        try:
+            result = self._play(recording, args, "run")
+        except Exception:
+            self.grants.pop(args['asset_id'], None)
+            raise
+        if grant and result.get('state') == 'running':
+            grant['context'] = result.pop('_authorization_context')
         if result.get("executed") is False:
-            result.update(asset_id=args["asset_id"], confirmation_required=True,
-                          next_step="询问用户本次活动空间、使用条件及双臂接管，得到确认后再执行；预览成功不表示动作已完成",
+            result.update(asset_id=args["asset_id"], confirmation_required=not bool(grant),
+                          next_step=("网页会话授权有效，按 execution_arguments 执行，无需重复询问；预览不是动作完成" if grant else
+                                     "询问用户本次活动空间、使用条件及双臂接管，得到确认后再执行；也可在技能详情授权本次会话"),
                           execution_arguments={"asset_id": args["asset_id"], "execute": True,
-                              "preview_id": result["preview_id"], "workspace_clear": False, "take_control": False})
+                              "preview_id": result["preview_id"], **({} if grant else {"workspace_clear": False, "take_control": False})})
+        result.pop('_authorization_context', None)
         return result
 
     def _read_asset(self, asset_id):
@@ -241,6 +372,7 @@ class TeachingPlugin:
             if os.path.exists(path):
                 os.unlink(path)
         draft["saved"] = asset
+        self._persist_draft()
         return {"skill": skill, "asset_id": asset_id}
 
     def _skill_definition(self, asset_id, metadata):
@@ -250,14 +382,16 @@ class TeachingPlugin:
             "category": "robotics", "version": "1.0.0", "requiredTools": [self.name],
             "instruction": (
                 f"这是 {self.adapter.title} 的已示教录制技能，资产 ID：{asset_id}。\n"
-                f"用户描述：{metadata['description']}\n使用条件（每次执行前向用户核实）：{metadata['conditions']}\n"
+                f"用户描述：{metadata['description']}\n使用条件：{metadata['conditions']}\n"
                 f"1. 调用当前设备的 {self.name}.preview，参数：" + json.dumps({"asset_id": asset_id}) + "。\n"
-                "2. 预览成功仅代表检查通过，没有执行动作。向用户询问本次使用条件、移动路径和双臂接管；等待用户明确答复。"
+                "2. 预览成功没有执行动作。若 confirmation_required=false，驱动已核验网页授予的本次会话授权，"
+                "用户要求执行时直接使用返回的 execution_arguments，不再追问。若为 true，向用户询问本次使用条件、移动路径和双臂接管并等待答复；"
+                "也可提示用户在技能详情授权本次会话。不得调用 session_challenge/session_authorize 自行授予权限。"
                 "用户只说技能名称或‘抬手’不等于已确认环境与接管。不得自己填写确认或播报动作已完成。\n"
-                f"3. 取得确认后调用 {self.name}.run，必须一次传齐：" + json.dumps({"asset_id": asset_id,
+                f"3. 会话授权有效时直接调用 {self.name}.run 并原样传入 execution_arguments。仅当需要逐次确认时，取得确认后必须一次传齐：" + json.dumps({"asset_id": asset_id,
                     "execute": True, "preview_id": "替换为本次预览返回的完整 preview_id", "workspace_clear": True,
                     "take_control": True}, ensure_ascii=False) + "。每次都带 asset_id，不能只传 preview_id。\n"
-                "4. 缺少参数只补齐该参数，不得换动作或猜测起点；预览过期或被停止撤销时重新预览并取得本次确认。不得复用旧确认。\n"
+                "4. 缺少参数只补齐该参数，不得换动作或猜测起点；预览过期时重新预览，以新的 confirmation_required 为准。会话授权失效后不得复用旧确认。\n"
                 "预览不通过时报告原因，不得改录制或绕过检查。"
                 + self.adapter.replay_instruction +
                 "设备/标定绑定由驱动强制检查。running 只表示已提交，等待 ACP 完成或通过 info 核对相同 action_id 的终态。"
@@ -274,10 +408,33 @@ class TeachingPlugin:
         self._validate(action, args)
         # Stop must remain reachable while file validation or a slow read is in progress.
         if action == "stop":
+            self.grants.clear()
+            self.challenges.clear()
             return self.adapter.stop()
         if action == "ui":
             return {"protocol": PROTOCOL, "html": Path(__file__).with_name("workbench.html").read_text(encoding="utf-8")}
         with self.lock:
+            if action.startswith('session_'):
+                return self._session(action, args)
+            if action == 'draft_list':
+                drafts = []
+                for path in (self.directory / 'drafts').glob('*.json'):
+                    try:
+                        draft = self._load_draft(path.stem)
+                        drafts.append({'id': draft['id'], 'name': draft['imported']['metadata']['name'],
+                                       'compatibility': draft['imported']['compatibility']})
+                    except (ValueError, KeyError, OSError):
+                        continue
+                return {'drafts': drafts}
+            if action == 'draft_open':
+                self._idle()
+                if self.draft and self.draft.get('recording') and not self.draft.get('saved') and not self.draft.get('imported'):
+                    raise ValueError('finish_or_discard_current_draft_before_import')
+                self._persist_draft()
+                draft = self._load_draft(args.get('draft_id'))
+                draft['recording'] = self._recording(draft)
+                self.draft = draft
+                return {'draft': copy.deepcopy(draft)}
             if action == "package_definition":
                 asset, _ = self._read_asset(args.get("asset_id"))
                 return {"skill": self._skill_definition(asset["id"], asset["metadata"])}
@@ -295,13 +452,18 @@ class TeachingPlugin:
                 return self.transfers.write(args.get("transfer_id"), args.get("offset"), args.get("data"))
             if action == "package_finish":
                 self._idle()
-                if self.draft and self.draft.get("recording") and not self.draft.get("saved"):
+                if self.draft and self.draft.get("recording") and not self.draft.get("saved") and not self.draft.get('imported'):
                     raise ValueError("finish_or_discard_current_draft_before_import")
                 manifest, data = self.transfers.finish(args.get("transfer_id"))
+                reused = self._validated_package(manifest, data)
+                if reused:
+                    return reused
+                self._persist_draft()
                 recording = self.adapter.import_recording(manifest, data)
                 self.draft = {"id": uuid4().hex, "recording": recording, "trial": None,
                               "imported": {"metadata": manifest["skill"], "compatibility": manifest["compatibility"]}}
                 self.record_started = None
+                self._persist_draft()
                 return {"draft": copy.deepcopy(self.draft), "requires_local_trial": True, "installed": False}
             if action == "info":
                 status = self.adapter.info()
@@ -336,6 +498,7 @@ class TeachingPlugin:
                     if self.pending or not status.get("can_prepare", not status["busy"]):
                         raise RuntimeError("robot_busy_wait_for_completion")
                 recording = self.adapter.inspect(args["filename"]) if args.get("filename") else None
+                self._persist_draft()
                 self.draft = {"id": uuid4().hex, "recording": recording, "trial": None}
                 self.record_started = None
                 return copy.deepcopy(self.draft)

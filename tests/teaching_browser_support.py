@@ -34,6 +34,8 @@ def workbench_site(teaching, plugins, monkeypatch, tmp_path, mcp_id, name):
     monkeypatch.setenv('DB_PATH', str(tmp_path / 'core.db'))
     import config
     from api import skills, mcp_manage, canvas
+    import auth
+    monkeypatch.setattr(auth, '_token', 'test-only-token')
     monkeypatch.setattr(canvas, '_editor_session', None)
 
     # Core's real SQLite path is isolated from any running user installation.
@@ -55,6 +57,7 @@ def workbench_site(teaching, plugins, monkeypatch, tmp_path, mcp_id, name):
     app.mount('/', StaticFiles(directory=Path(CORE) / 'agent-core/web', html=True))
     sock = socket.socket(); sock.bind(('127.0.0.1', 0)); sock.listen(128)
     port = sock.getsockname()[1]
+    monkeypatch.setenv('AGENT_CORE_URL', f'http://127.0.0.1:{port}')
     server = uvicorn.Server(uvicorn.Config(app, log_level='error', lifespan='off'))
     thread = threading.Thread(target=server.run, kwargs={'sockets': [sock]}, daemon=True); thread.start()
     wait_for(lambda: server.started)

@@ -74,6 +74,7 @@ class ArmStreamExecutor:
         self._gravity_override, self._gravity = gravity, gravity
         self._feedback = {'q': [], 'dq': [], 'arm_ns': 0, 'fault': True}
         self._source_tick = None
+        self.feedback_epoch = 0
         self._subscriber = None
         self._fsm_subscriber = self._arm_observer = None
         self._fsm = {'arm_ns': 0}
@@ -186,8 +187,11 @@ class ArmStreamExecutor:
                           'voltage':float(motors[i].vol),
                           'temperature':list(motors[i].temperature)} for i in MOTOR_IDS]
             with self.lock:
+                now = self.clock()
+                if self._feedback['arm_ns'] and now-self._feedback['arm_ns'] > 100_000_000:
+                    self.feedback_epoch += 1
                 self._source_tick = tick
-                self._feedback = {'q':q,'dq':dq,'arm_ns':self.clock(),
+                self._feedback = {'q':q,'dq':dq,'arm_ns':now,
                     'source_tick':tick, 'motor_telemetry':telemetry,
                     'locked_joints': dict(zip(LOCKED_NAMES,
                         vector([float(motors[i].q) for i in LOCKED_MOTOR_IDS], 13, 'body_q')))}
@@ -197,7 +201,11 @@ class ArmStreamExecutor:
 
     def _on_fsm(self, msg):
         with self.lock:
-            self._fsm = {'arm_ns':self.clock(),'fsm_id':int(msg.fsm_id),'fsm_mode':int(msg.fsm_mode)}
+            now = self.clock()
+            if self._fsm['arm_ns'] and (now-self._fsm['arm_ns'] > 100_000_000 or
+                    (self._fsm.get('fsm_id'), self._fsm.get('fsm_mode')) != (int(msg.fsm_id), int(msg.fsm_mode))):
+                self.feedback_epoch += 1
+            self._fsm = {'arm_ns':now,'fsm_id':int(msg.fsm_id),'fsm_mode':int(msg.fsm_mode)}
 
     def _snapshot(self):
         return copy.deepcopy(self._snapshot_provider() if self._snapshot_provider else self._feedback)

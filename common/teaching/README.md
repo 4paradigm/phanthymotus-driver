@@ -12,7 +12,7 @@
 4. 人和机器人双臂下垂，松开握把，长按 X+A 至少一秒建立原遥操基准。页面复用原会话；实时输入和映射有效后才能录制。按住双握把示范，松握暂停，记录成功下发的关节参考、反馈及暂停时间。
 5. 结束录制并等待完整文件和原控制器停止交权。页面显示 G1_23 的双臂 10 关节、固定假手，不显示夹爪。恢复物体布置、检查起点差异并确认本次路径和接管后试运行。原控制器以 0.1 rad/s 参考变化率先移到起点，再按录制时间轴回放，不重新运行 IK。
 6. 等待相同 `action_id` 的真实完成回执，观察动作效果，填写名称和使用条件后保存。`completed` 表示轨迹发送和停止交权完成，不保证物体操作成功。
-7. 普通 Skill 加入当前 Core 的 `skills.installed` 并启用；下一次对话可发现，经已有 `activate_skill` 加载后调用 `g1_teaching.run`。每次执行仍要新预览和确认。回放不依赖 PICO 跟踪，未连接 VR 时也可载入已有完整录制重新试运行。
+7. 普通 Skill 加入当前 Core 的 `skills.installed` 并启用；下一次对话可发现，经已有 `activate_skill` 加载后调用 `g1_teaching.run`。每次执行仍要新预览；可在技能详情确认条件并「允许本次直接调用」，最长 30 分钟内无需逐次确认。未授权或授权失效时仍需本次确认。回放不依赖 PICO 跟踪，未连接 VR 时也可载入已有完整录制重新试运行。
 
 实际网页截图见 [G1 界面验收](../../docs/teaching/g1.md)。
 
@@ -40,7 +40,7 @@
 
 G1 预览 60 秒内单次有效。回放入口核对预期 SHA 和停止代次，拒绝预览后文件变化、停止后旧请求再启动；原只传 filename 的接口保持兼容。
 
-保存到 Driver 后由工作台宿主导入 Core 现有 Skill 格式，失败可幂等重试。不上传资源中心，不改变未来动作的确认要求。一个活动草稿；页面刷新恢复，Driver 重启后载入完整录制重新验证，已保存资产可直接请求运行。
+保存到 Driver 后由工作台宿主导入 Core 现有 Skill 格式，失败可幂等重试。不上传资源中心。一个活动草稿；导入草稿另存于 `skills/drafts/`，可在技能列表「待验证 → 继续验证」恢复多个待验证导入。Driver 重启后导入草稿保留，但未保存的试运行回执作废；已保存资产可直接请求运行。
 
 G1 新定义记录来源 MCP/卡片，动作包导出和调用说明更新严格使用该来源；这不是 Agent 多设备自主路由的强制限制，多台同名 G1 的 Agent 选择仍待完善。网页没有新增聊天框，Agent 使用已有语音/消息渠道；网页「运行技能」仍是资产 ID 参数表单，按名称选择运行的便捷页面尚未实现。
 
@@ -62,8 +62,14 @@ uv run --python 3.12 --no-project --with pytest --with numpy --with scipy --with
 
 适配器实现 `compatibility()`、`export_recording(recording)` 和 `import_recording(manifest, data)` 后，工具声明 `inputSchema.x-skill-package.schema=motus.teaching.package/1`。未实现的机器人不暴露此能力。G1 当前支持 G1_23 双臂 10 关节固定手，兼容性与重新绑定由 G1 适配器执行。
 
-`package_export` / `package_read` 下载完整包；`package_begin` / `package_write` / `package_finish` 上传并创建未批准草稿。它们不暴露给 LLM，不移动机器人。必须重新试运行和确认效果后通过原 `save` 流程安装新的本机 Skill。`package_definition` 为原已保存资产生成当前调用说明，供用户显式更新旧 Skill。
+`package_export` / `package_read` 下载完整包；`package_begin` / `package_write` / `package_finish` 上传并创建未批准草稿。它们不暴露给 LLM，不移动机器人。新导入会自动检查，点击「开始试运行」确认本次路径与接管，成功后点击「效果符合预期，启用技能」，通过原 `save` 流程安装。只有目标设备已有相同轨迹、元数据、兼容声明及成功验证资产时复用该资产，不信任包内的验证声明。复用不改变已安装 Skill 的可见性或用户编辑内容。`package_definition` 为原已保存资产生成当前调用说明，供用户显式更新旧 Skill。
 
-预览使用 `preview(asset_id)`，返回完整 `execution_arguments`，确认字段为 false。执行 `run` 的 per-action required 声明要求 asset_id、execute、preview_id、workspace_clear、take_control；用户明确确认后再填写 true。执行仍由适配器校验，不依赖 LLM schema 作为安全门。旧 `run(execute=false)` 线接口兼容保留。
+预览使用 `preview(asset_id)`，返回 `confirmation_required` 和完整 `execution_arguments`。执行 `run` 必填 asset_id、execute、preview_id；无有效会话授权时还要求 workspace_clear、take_control 为 true，用户明确确认后才可填写。会话授权有效时不再传这两个字段，由 Driver 校验并注入。执行仍由适配器校验，不依赖 LLM schema 作为安全门。旧 `run(execute=false)` 线接口兼容保留。
+
+## 网页会话授权
+
+适配器可选提供 `authorization_context()`；G1 返回驱动启动、控制代次、反馈重连和标定摘要。Driver 绑定本机资产 SHA、设备身份与该上下文，停止、驱动重启、反馈中断恢复、模式或标定变化、资产变化、回放异常以及 30 分钟到期均撤销权限。每次执行仍进行新预览、设备检查、互斥、看门狗和真实完成回执检查。
+
+授权只能由已登录 Core 网页创建。Core 生成 30 秒一次性凭据，Driver 通过 `common/teaching/authorization.py` 向同机 Core 回环地址消费核验；凭据绑定工具、卡片实例、资产和挑战随机数。隐藏 MCP 动作本身不能产生授权，LLM 不能自行设置会话授权。此方案适用于现有 host-network 同机部署；远程 Core 地址拒绝核验。授权只存内存，不写入动作包；授权成功时 Core 自动更新该旧 Skill 的调用说明。
 
 资源中心的附件发布尚未接通；不要把仅含资产 ID 的文字 Skill 当作能在别的设备安装使用的动作包。文件格式、界面和资源中心调查边界见 [G1 文档](../../docs/teaching/g1.md)。
