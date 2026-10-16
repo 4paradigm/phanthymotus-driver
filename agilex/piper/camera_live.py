@@ -1,4 +1,4 @@
-"""Passive live-color resource; camera lifecycle is independent of arm control."""
+"""Passive live-color sensor/resource; lifecycle is independent of arm control."""
 import math
 from pathlib import Path
 import threading
@@ -103,6 +103,13 @@ class PiperCameraLive:
         self._publisher = None
 
     def get_tools(self):
+        if getattr(self, 'sensor_card', False):
+            definition = tool('piper_camera_live', 'sensor',
+                'Live bound color camera. Independent of Arm control and Joints; no robot commands.',
+                {'type': 'object', 'properties': {}, 'additionalProperties': False},
+                topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
+            definition['title'] = 'On camera'
+            return [definition]
         schema = action_schema({'start': ([], '自动开始实时监控'), 'stop': ([], '停止采集并释放相机'),
                                 'info': ([], '查看相机状态')}, {})
         schema['additionalProperties'] = False
@@ -169,7 +176,10 @@ class PiperCameraLive:
 
     def dispatch(self, action, args):
         english = getattr(self.runtime, 'interface_language', None) == 'en'
-        if set(args) - {'action', 'instance_id', '_tool_name'}:
+        allowed = {'action', 'instance_id', '_tool_name'}
+        if getattr(self, 'sensor_card', False) and args.get('input_topic') == '':
+            allowed.add('input_topic')
+        if set(args) - allowed:
             raise ValueError('Live camera accepts lifecycle arguments only.' if english else '实时相机卡不接受控制或拍照参数')
         action = args.get('action', 'info' if action == 'piper_camera_live' else action)
         if action not in ('start', 'stop', 'info'):
@@ -280,7 +290,7 @@ class PiperCameraLive:
                         self._state = 'idle'
 
 
-def add_camera_live(plugins, config, ros2):
+def add_camera_live(plugins, config, ros2, *, sensor_card=False):
     plugins = list(plugins)
     runtime = next(p for p in plugins if hasattr(p, 'camera_enabled') and hasattr(p, 'capture'))
     if any(t['name'] == 'piper_camera_live' for p in plugins for t in p.get_tools()):
@@ -291,4 +301,6 @@ def add_camera_live(plugins, config, ros2):
         with CameraOwner(runtime.data_dir, device):
             return original_capture(args)
     runtime.capture = capture
-    return [*plugins, PiperCameraLive(runtime, ros2)]
+    camera = PiperCameraLive(runtime, ros2)
+    camera.sensor_card = sensor_card
+    return [*plugins, camera]

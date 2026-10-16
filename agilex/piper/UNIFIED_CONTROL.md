@@ -1,8 +1,53 @@
+## 2026-10-16: fixed 60-second movement wait
+
+Move, Pose, Set joints and Reset share a 60-second post-submission arrival deadline.
+Stable-arrival checks, cancellation, feedback freshness and failure handling remain unchanged.
+ACP receipt timeout is 90 seconds to allow preparation and completion delivery; it does not extend movement execution.
+Get status remains a synchronous read. The canvas logs a `trigger` completion for the query after receiving a status snapshot, independently of the previous movement result.
+This update has not been run through automated or physical tests, at the user’s request; manual acceptance is pending.
+
+# October 16 review follow-up
+
+The default canvas bundle is now Arm control + Joints + On camera. The camera
+keeps the `piper_camera_live` interface and existing JPEG topic, but is a sensor
+with an empty user-parameter schema, just like Joints. Core supplies its lifecycle
+and view controls. Arm control declares no output stream. Legacy camera bundles
+retain their resource schema. Parameters remains absent; optional photo/model
+interfaces are unchanged. No CAN or robot-control path was added to the camera.
+
+Read-only examination of the October 16 review actions found acknowledged ACP
+callbacks for Move, Set joints and Reset, and matching Core action_complete logs.
+The missing visible terminal was the manual Canvas result: it displayed only the
+initial running response. The separately authorized Core display change reads
+ACP records by action_id without dispatching a device request. It preserves actual
+completion payloads after barrier cleanup and shows completed/failed/cancelled;
+missing records or display timeouts are unconfirmed, never success. A newer card
+call prevents older results from overwriting its result box, while the older
+action may still add its completion activity entry. Removing the card ends its
+display watcher. Canvas polling and collector notifications share action-ID
+deduplication so each terminal action has one trigger entry when either source
+is available. Synchronous status reads retain their own query-completion entry.
+
+The driver retains unique action IDs, terminal callbacks and bounded delivery
+retries. It now records Core receipt state (matched/cached/duplicate/legacy
+received) in action_completions and makes the immediate-return reminder explicit.
+Fast synchronous/no-op results still do not create false pending work.
+
+Deployment must refresh tool definitions, remove stale Arm control topicOut
+from the saved canvas and add the piper_camera_live sensor card. Do not overwrite
+unrelated cards, settings or the recorded Reset configuration. Existing saved
+layout output ports take precedence over new static tool definitions in Core.
+On October 16 the operator authorized a local ARM64 acceptance deployment on
+Jetson arm 1. No commit/PR update was made. Live image/skeleton and passive checks
+passed; real action-display acceptance remains an operator test.
+
+---
+
 # Arm control + Joints contract — review remediation, 2026-10-15
 
 This document supersedes the previous single-card/saved-position contract.
-The canvas has Arm control and Joints. Camera capture resources and `model`
-remain available for explicit use; the live camera needs no canvas node.
+The current canvas has Arm control, Joints and On camera. Camera capture
+resources and `model` remain available for explicit use.
 
 ## Public interface
 
@@ -46,7 +91,7 @@ Starting only Joints connects a read receiver and sends no control command.
 Stopping Arm control leaves the receiver, Joints and live camera available.
 The whole driver owns final shutdown. Namespaces remain isolated per device.
 
-`arm_control.topic_out` contains only the existing live image topic when enabled.
+`arm_control.topic_out` is empty; the independent On camera sensor owns the live image topic.
 No public tool in the new bundle declares `state/parameters` or a JSON stream;
 the new monitor does not publish one. Internal snapshots/Info and Get status keep
 faults, mode, enable state, gripper width, limits, freshness and task results.

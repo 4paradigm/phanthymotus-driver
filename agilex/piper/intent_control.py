@@ -237,7 +237,7 @@ class IntentControlPlugin(PiperPlugin):
             if self.config.get('async_actions', True) and (action in self.task_actions or name == 'piper_photo' and action in {'capture', 'import_photo'}):
                 result = self.run_async(name, action, args)
                 if result.get('state') == 'running':
-                    result['reminder'] = 'Task accepted. Check Info for actual completion or use Stop.'
+                    result['reminder'] = 'Task accepted, not completed. ACP will report the final outcome; Get status also shows progress.'
                 return english_values(result)
             return self.dispatch_sync(action, args)
         except (ValueError, RuntimeError, OSError) as exc:

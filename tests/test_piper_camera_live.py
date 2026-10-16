@@ -113,6 +113,25 @@ class LiveCameraTests(unittest.TestCase):
         self.assertEqual(self.sessions[0].disposed, 1)
         self.assertEqual(self.transports[0].closed, 1)
 
+    def test_sensor_card_like_joints_has_no_action_menu_and_accepts_core_lifecycle(self):
+        self.runtime.interface_language = 'en'
+        plugin = self.make()
+        plugin.sensor_card = True
+        definition = plugin.get_tools()[0]
+        self.assertEqual((definition['title'], definition['type']), ('On camera', 'sensor'))
+        self.assertEqual(definition['inputSchema']['properties'], {})
+        bundle = DriverBundle([plugin])
+        bundle.dispatch('piper_camera_live', {'action': 'start'})
+        self.wait(lambda: plugin.info()['frames'] >= 2)
+        info = bundle.dispatch('piper_camera_live', {'action': 'info', 'input_topic': ''})
+        self.assertEqual(info['state'], 'running')
+        self.assertGreaterEqual(info['frames'], 2)
+        self.assertEqual(bundle.dispatch('piper_camera_live', {'action': 'stop'})['state'], 'idle')
+        self.assertEqual(len(self.sessions), 1)
+        for args in ({'action': 'capture'}, {'action': 'info', 'input_topic': '/another/camera'},
+                     {'action': 'info', 'width_mm': 20}):
+            with self.assertRaises(ValueError): bundle.dispatch('piper_camera_live', args)
+
     def test_stale_frame_is_not_replayed_offline_is_jpeg_and_recovery_is_new_session(self):
         plugin = self.make(lambda cfg: Session(cfg, frozen=not self.sessions))
         plugin.STALE_SECONDS = .12

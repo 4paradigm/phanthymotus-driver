@@ -90,7 +90,7 @@ class ActionCompletions:
             self.update(action_id, delivery='sending', attempts=attempt)
             try:
                 # Use the existing hook so offline SDK tests can record delivery.
-                self.runtime.acp_complete(action_id, status, deepcopy(result), tool)
+                ack = self.runtime.acp_complete(action_id, status, deepcopy(result), tool)
             except Exception as exc:
                 error = str(exc).replace('\n', ' ')[:240] or type(exc).__name__
                 self.update(action_id, delivery='failed' if attempt == self.ATTEMPTS else 'retrying',
@@ -99,7 +99,8 @@ class ActionCompletions:
                 if attempt < self.ATTEMPTS:
                     time.sleep(self.RETRY_DELAYS[attempt - 1])
             else:
-                self.update(action_id, delivery='acknowledged', delivery_error=None, delivered_at=time.time())
+                self.update(action_id, delivery='acknowledged', delivery_error=None, delivered_at=time.time(),
+                            core_receipt=ack.get('state', 'received') if isinstance(ack, dict) else 'received')
                 print(f'[piper ACP] {action_id} {status}: acknowledged attempt={attempt}', flush=True)
                 return
 

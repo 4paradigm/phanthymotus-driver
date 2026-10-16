@@ -12,6 +12,7 @@ from agilex.piper.intent_motion import (EndPose, DirectionUnavailable, JointLimi
                                        checked_state, cartesian_start_check, end_pose, fresh)
 
 
+MOVEMENT_TIMEOUT_SECONDS = 60
 JOINT_ARRIVAL_TOLERANCE_DEG = .5
 BOUNDARY_SETTLE_SECONDS = .5
 
@@ -285,7 +286,7 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
     values = (*target.position_mm, *target.orientation_deg) if kind == 'pose' else target
     path = motion_mode if kind == 'pose' else 'joint'
     report({'stage': 'target', 'target': values, 'target_kind': kind, 'speed_percent': speed,
-            'motion_mode': path})
+            'motion_mode': path, 'timeout_seconds': MOVEMENT_TIMEOUT_SECONDS})
     attempted = False
     target_attempted = False
     target_submitted = False
@@ -304,7 +305,7 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
                              motion_mode=motion_mode, require_path_permission=require_path_permission,
                              on_submission=submitted, on_target_submission=target_started)
         target_submitted = True
-        deadline, stable_since = clock()+30, None
+        deadline, stable_since = clock()+MOVEMENT_TIMEOUT_SECONDS, None
         while clock() < deadline:
             driver._check_cancelled()
             require_permission()
@@ -358,7 +359,7 @@ def execute_target(driver, target, speed, kind, *, require_permission, report=la
             else:
                 stable_since = None
             sleep(.05)
-        raise RuntimeError('Movement timed out after 30 seconds; arrival was not confirmed.')
+        raise RuntimeError(f'Movement timed out after {MOVEMENT_TIMEOUT_SECONDS} seconds; arrival was not confirmed.')
     except BaseException as exc:
         first_feedback = getattr(exc, 'feedback', None)
         failure_code = getattr(exc, 'failure_code', 'motion_failed')

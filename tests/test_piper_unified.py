@@ -1,4 +1,4 @@
-"""Public two-card acceptance using a recording SDK; no robot access."""
+"""Public three-card acceptance using a recording SDK; no robot access."""
 import json
 import math
 import tempfile
@@ -67,7 +67,8 @@ class UnifiedTests(unittest.TestCase):
     def targets(self, kind='end_pose'):
         return [call[1] for call in self.sdk.calls if call[0] == kind]
 
-    def test_two_card_schema_topics_and_legacy_request_rejection(self):
+    def test_three_card_schema_topics_and_legacy_request_rejection(self):
+        self.config['camera'] = {'live': {'enabled': True}}
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
         self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
         arm = tools['arm_control']
@@ -76,6 +77,10 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(schema['x-completion']['actions'], sorted(self.runtime.task_actions))
         self.assertNotRegex(json.dumps(tools, ensure_ascii=False), r'[\u3400-\u9fff]')
         self.assertEqual(arm['topic_out'], [])
+        self.assertEqual(tools['piper_camera_live']['type'], 'sensor')
+        self.assertEqual(tools['piper_camera_live']['title'], 'On camera')
+        self.assertEqual(tools['piper_camera_live']['inputSchema']['properties'], {})
+        self.assertEqual(tools['piper_camera_live']['topic_out'][0]['format'], 'image/jpeg')
         self.assertEqual(tools['joints']['topic_out'][0]['format'], 'sensor/skeleton')
         self.assertEqual(tools['joints']['title'], 'Joints')
         self.assertEqual(tools['joints']['type'], 'sensor')

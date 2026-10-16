@@ -184,6 +184,31 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(server.bodies, [])
         self.assertEqual(self.sdk.calls, [])
 
+    def test_every_public_motion_action_returns_id_then_reports_its_own_result(self):
+        server = self.start_callback(lambda body: {'ok': True, 'action_id': body['action_id'], 'state': 'matched'})
+        self.runtime.config['async_actions'] = True
+        requests = [('move', {}), ('pose', {'pose_mm_deg': [10, 20, 30, 0, 0, 0]}),
+                    ('set_joints', {'joints_deg': [1, 10, -10, 0, 20, 0]}),
+                    ('reset', {}), ('set_gripper_opening', {'width_mm': 20})]
+        ids = []
+        for action, args in requests:
+            release = threading.Event()
+            def execute(*unused):
+                release.wait(2)
+                return {'state': 'completed', 'tested_action': action}
+            with self.subTest(action=action), patch.object(self.runtime, 'dispatch_sync', side_effect=execute):
+                accepted = self.call(action, **args)
+                self.assertEqual(accepted['state'], 'running')
+                self.assertIn('ACP', accepted['reminder'])
+                ids.append(accepted['action_id'])
+                release.set()
+                eventually(self, lambda: self.runtime.completions.snapshot()[-1]['delivery'] == 'acknowledged')
+                self.assertEqual(server.bodies[-1]['action_id'], accepted['action_id'])
+                self.assertEqual(server.bodies[-1]['result']['tested_action'], action)
+                self.assertEqual(self.runtime.completions.snapshot()[-1]['core_receipt'], 'matched')
+        self.assertEqual(len(set(ids)), len(requests))
+        self.assertEqual(self.sdk.calls, [])
+
     def test_worker_start_failure_releases_reservation_without_a_robot_command(self):
         self.runtime.config['async_actions'] = True
         with patch('agilex.piper.completion.threading.Thread.start', side_effect=RuntimeError('Thread unavailable')):

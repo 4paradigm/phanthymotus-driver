@@ -148,12 +148,11 @@ class UnifiedControlPlugin(IntentControlPlugin):
         schema.update({'additionalProperties': False, 'x-manual-execution': True, 'x-resource': 'arm',
                        'x-is-dangerous': True, 'x-hooks': {h: {'action': 'stop_motion'}
                             for h in ('on_interrupt_motion', 'on_interrupt_all')},
-                       'x-completion': {'actions': sorted(USER_TASKS.intersection(actions)), 'timeout': 60}})
+                       'x-completion': {'actions': sorted(USER_TASKS.intersection(actions)), 'timeout': 90}})
         schema['x-action-params'].pop('select_action')
         arm['inputSchema'] = schema
-        # Joints owns skeleton discovery; no Parameters topic is public in this
-        # bundle. The independent background camera keeps its existing output.
-        arm['topic_out'] = [t for t in arm.get('topic_out', []) if t['format'] == 'image/jpeg']
+        # Each sensor card owns its own stream; Arm control has no data output.
+        arm['topic_out'] = []
         arm['description'] = ('One arm: tool-relative Move, absolute/relative joint targets, gripper, Stop and Get status. '
                               'Every control action first exits stationary teaching and holds measured joints when supported, '
                               'then computes and executes the requested target. Failed takeover cancels the action. '
