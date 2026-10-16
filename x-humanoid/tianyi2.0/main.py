@@ -471,6 +471,14 @@ class TianyiDeviceBundle:
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
             print("[bundle] NavStatePlugin loaded")
 
+        if plugins_cfg.get("loco_state", {}).get("enabled", False):
+            from loco_state import LocoStatePlugin
+            loco_state_url = os.environ.get("SLAMTEC_URL", cfg.get("slamtec", {}).get(
+                "base_url", "http://192.168.11.1:1448"))
+            self._plugins.append(LocoStatePlugin(
+                plugins_cfg["loco_state"], namespace, ros2, loco_state_url))
+            print("[bundle] LocoStatePlugin loaded")
+
         if plugins_cfg.get("power_board", {}).get("enabled", False):
             from device import PowerBoardStatePlugin
             self._plugins.append(PowerBoardStatePlugin(plugins_cfg["power_board"], namespace, ros2))
@@ -596,6 +604,7 @@ class TianyiDeviceBundle:
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
         'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+        'LocoStatePlugin',
     }
 
     def start_all(self) -> None:

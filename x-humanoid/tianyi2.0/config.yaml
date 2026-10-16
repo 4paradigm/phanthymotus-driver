@@ -54,6 +54,10 @@ plugins:
     enabled: true
   nav_state:
     enabled: true
+  loco_state:
+    enabled: true
+    hz: 10  # Target rate; actual refresh depends on chassis HTTP latency.
+    request_timeout: 0.5
   power_board:
     enabled: true
   motors:
