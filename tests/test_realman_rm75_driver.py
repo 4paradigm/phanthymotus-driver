@@ -21,6 +21,11 @@ def load_device():
     # The driver directory goes on sys.path the way main.py puts it there at
     # runtime: build_plugins imports its siblings by bare name (`camera`,
     # `servo`), so a loader that skips this tests a module the driver never runs.
+    if "numpy" not in sys.modules:
+        try:
+            import numpy
+        except ImportError:
+            sys.modules["numpy"] = mock.MagicMock()
     if str(DRIVER) not in sys.path:
         sys.path.insert(0, str(DRIVER))
     spec = importlib.util.spec_from_file_location("realman_rm75_device", DRIVER / "device.py")
@@ -54,9 +59,10 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("||", dockerfile)
         self.assertIn("pyrealsense2==2.56.5.9235", dockerfile)
         self.assertIn("numpy==1.23.5", dockerfile)
-        self.assertIn("opencv-python-headless==4.11.0.86", dockerfile)
+        self.assertIn("opencv-contrib-python-headless==4.11.0.86", dockerfile)
         self.assertIn("--only-binary=:all:", dockerfile)
         self.assertIn("COPY main.py device.py hardware.py servo.py camera.py realsense.py", dockerfile)
+        self.assertIn("aruco_canvas.py", dockerfile)
         camera = (DRIVER / "camera.py").read_text()
         self.assertNotIn("v4l2-ctl", camera)
         self.assertNotIn("import subprocess", camera)
@@ -173,7 +179,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn(f"output_dir: {directory}", (DRIVER / "config.yaml").read_text())
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("ros-humble-rmw-fastrtps-cpp ffmpeg", dockerfile)
-        self.assertIn("realsense.py vision_capture.py config.yaml", dockerfile)
+        self.assertIn("realsense.py vision_capture.py aruco_detector.py aruco_zones.py aruco_canvas.py config.yaml", dockerfile)
 
     def test_pick_place_needs_no_storage_configuration_or_mount(self):
         service = (DRIVER / "deploy/service.yml").read_text()
@@ -229,29 +235,261 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertEqual("arm", tools[0]["inputSchema"]["x-resource"])
         self.assertIn("confirm_motion", tools[0]["inputSchema"]["properties"])
         self.assertIn("confirm_motion", tools[0]["inputSchema"]["x-action-params"]["set_position"]["params"])
+        # P2 契约校验：Agent Core 依赖 x-action-params 暴露动作参数，stall_timeout_seconds 必须包含其中
+        self.assertIn("stall_timeout_seconds", tools[0]["inputSchema"]["x-action-params"]["set_position"]["params"])
         completion = tools[0]["inputSchema"]["x-completion"]
         self.assertEqual(["set_position"], completion["actions"])
         self.assertGreater(completion["timeout"], 0)
 
-    def test_set_position_returns_action_id_and_calls_two_finger_api(self):
+    def test_set_position_fails_safe_when_feedback_is_unavailable(self):
+        """P1 契约校验：当客户端无法提供状态反馈（无 call 方法或反馈为空）时，
+        不得盲目下发非阻塞运动或谎报 target_reached，必须安全报错 failed 并释放锁。"""
         result = self.plugin.dispatch(
             "set_position", {"position": 500, "confirm_motion": True}
         )
 
         self.assertEqual("running", result["state"])
         self.assertTrue(result["action_id"].startswith("rm75_gripper_"))
-        # SDK 阻塞调用在 worker 线程里发生
-        self.assertTrue(self._wait_for(lambda: len(self.client.calls) == 1))
-        self.assertEqual(
-            [("rm_set_gripper_position", (500, True, self.device.GRIPPER_COMPLETION_TIMEOUT))],
-            self.client.calls,
-        )
-        # 完成后 ACP 上报 completed
+        # 验证未盲目下发运动指令
+        self.assertEqual([], self.client.calls)
+        # ACP 上报 failed
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         action_id, status, payload = self.acp_events[0]
         self.assertEqual(result["action_id"], action_id)
+        self.assertEqual("failed", status)
+        self.assertIn("feedback is unavailable", payload["reason"])
+        # 验证锁已安全释放
+        self.assertFalse(self.plugin._gripper_lock.locked())
+        self.assertFalse(self.client.motion_gate.locked())
+
+    def test_force_and_stall_parameter_validation(self):
+        tools = self.plugin.get_tools()
+        props = tools[0]["inputSchema"]["properties"]
+        self.assertIn("force", props)
+        self.assertEqual(10, props["force"]["minimum"])
+        self.assertEqual(100, props["force"]["maximum"])
+        self.assertEqual(20, props["force"]["default"])
+        self.assertIn("on_stall", props)
+        self.assertEqual(["keep", "rollback"], props["on_stall"]["enum"])
+        self.assertEqual("keep", props["on_stall"]["default"])
+
+        # P2 契约校验：stall_timeout_seconds schema 范围 [0.5, 30.0]，默认 3.0
+        self.assertIn("stall_timeout_seconds", props)
+        self.assertEqual(0.5, props["stall_timeout_seconds"]["minimum"])
+        self.assertEqual(30.0, props["stall_timeout_seconds"]["maximum"])
+        self.assertEqual(3.0, props["stall_timeout_seconds"]["default"])
+
+        # Invalid force (below 10, above 100, or non-finite/non-numeric)
+        for invalid_force in (0, -1, 5, 8, 9, 101, "abc", float("nan"), float("inf")):
+            with self.subTest(force=invalid_force):
+                with self.assertRaises(ValueError):
+                    self.plugin.dispatch("set_position", {
+                        "position": 500, "force": invalid_force, "confirm_motion": True,
+                    })
+
+        # Invalid on_stall
+        with self.assertRaises(ValueError):
+            self.plugin.dispatch("set_position", {
+                "position": 500, "on_stall": "invalid_policy", "confirm_motion": True,
+            })
+
+        # P2 边界校验：stall_timeout_seconds 超出 [0.5, 30.0] 必须在 dispatch 阶段被拒绝
+        for invalid_timeout in (0, -1, 0.49, 0.01, 30.1, 100, "abc", float("nan"), float("inf")):
+            with self.subTest(stall_timeout=invalid_timeout):
+                with self.assertRaises(ValueError):
+                    self.plugin.dispatch("set_position", {
+                        "position": 500, "stall_timeout_seconds": invalid_timeout, "confirm_motion": True,
+                    })
+
+        # 合法边界值允许通过参数校验函数
+        self.assertEqual(0.5, self.device._gripper_stall_timeout(0.5))
+        self.assertEqual(30.0, self.device._gripper_stall_timeout(30.0))
+
+    def test_gripper_motion_with_rm_plus_feedback_target_reached(self):
+        class RMPlusFeedbackClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                if method == "rm_set_hand_follow_pos":
+                    self.pos = args[0][0]
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2],
+                        "force": [15.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = RMPlusFeedbackClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1))
+        _, status, payload = events[0]
         self.assertEqual("completed", status)
         self.assertEqual("target_reached", payload["reason"])
+        self.assertEqual(500, payload["position"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+    def test_gripper_stall_keep_overwrites_setpoint(self):
+        class StalledKeepClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                # 初始处于 1000 开度，运动后受阻在 750
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if self.step > 1:
+                        self.pos = 750  # 遇阻停在 750
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2 if self.step > 2 else 1],
+                        "force": [25.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StalledKeepClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "keep", "force": 30, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual("motion_stalled_kept", payload["reason"])
+        self.assertEqual(750, payload["position"])
+        self.assertTrue(payload["stalled"])
+        self.assertEqual("keep", payload["on_stall"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+        # 验证向控制器下发了重设设定点到 750 的指令
+        self.assertIn(("rm_set_hand_follow_pos", ([750, 0, 0, 0, 0, 0], False)), client.calls)
+
+        # 验证锁完全释放，后续动作可以正常执行
+        next_res = plugin.dispatch("set_position", {"position": 1000, "confirm_motion": True})
+        self.assertEqual("running", next_res["state"])
+        plugin.dispatch("stop", {})
+
+    def test_gripper_stall_rollback_returns_to_start_position(self):
+        class StalledRollbackClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.rolled_back = False
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                if method == "rm_set_hand_follow_pos" and args[0][0] == 1000 and self.pos == 750:
+                    self.rolled_back = True
+                    self.pos = 1000
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    if not self.rolled_back and len(self.calls) >= 2:
+                        self.pos = 750
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2],
+                        "force": [25.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StalledRollbackClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "rollback", "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual("motion_stalled_rolled_back", payload["reason"])
+        self.assertEqual(1000, payload["position"])
+        self.assertEqual(750, payload["blocked_position"])
+        self.assertTrue(payload["stalled"])
+        self.assertEqual("rollback", payload["on_stall"])
+        self.assertTrue(payload["rollback_succeeded"])
+        self.assertTrue(payload["rollback_success"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+        # 验证触发了回滚到起始位 1000
+        self.assertIn(("rm_set_hand_follow_pos", ([1000, 0, 0, 0, 0, 0], False)), client.calls)
+
+        # 验证锁完全释放，后续动作可以正常执行
+        next_res = plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
+        self.assertEqual("running", next_res["state"])
+        plugin.dispatch("stop", {})
+
+    def test_info_reports_rm_plus_state(self):
+        class RMPlusInfoClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [680],
+                        "speed": [0.0],
+                        "dof_state": [2],
+                        "force": [18.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = RMPlusInfoClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        info = plugin.dispatch("info", {})
+        self.assertEqual("connected", info["state"])
+        self.assertIn("gripper_state", info)
+        self.assertEqual(680.0, info["gripper_state"]["position"])
+        self.assertEqual("rm_plus", info["gripper_state"]["source"])
 
     def test_out_of_range_position_is_rejected(self):
         for value in (-1, 0, 1001, float("nan"), float("inf")):
@@ -296,6 +534,18 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
                 released.wait(5.0)
                 return 0
 
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [1000],
+                        "speed": [0.0],
+                        "dof_state": [1],
+                        "force": [20.0],
+                    }
+                return None
+
         plugin = self.device.GripperPlugin(BlockingClient(), {}, namespace="rm75")
         plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
             (action_id, status, result)
@@ -328,6 +578,18 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
                 released.wait(5.0)
                 return 0
 
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [1000],
+                        "speed": [0.0],
+                        "dof_state": [1],
+                        "force": [20.0],
+                    }
+                return None
+
         plugin = self.device.GripperPlugin(BlockingClient(), {}, namespace="rm75")
         plugin._acp_callback = lambda action_id, status, result: None
         plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
@@ -350,6 +612,849 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
 
     def test_unknown_action_returns_none(self):
         self.assertIsNone(self.plugin.dispatch("something_else", {}))
+
+    def test_acp_complete_serializes_real_gripper_stalled_result(self):
+        """P1 验证：真实受阻保持结果通过 ACP 回调上报时，序列化请求保留真实结果字段而不是被覆盖成 target_reached。"""
+        captured_requests = []
+
+        def fake_urlopen(req, timeout=None, context=None):
+            # 仅捕获 ACP 回调请求并返回 ACK 响应（避免后台 registration 守护线程并发请求影响）
+            if req.full_url.endswith("/api/acp/complete"):
+                body = json.loads(req.data.decode("utf-8"))
+                captured_requests.append((req, body))
+
+                class AckResponse:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc_val, exc_tb):
+                        pass
+
+                    def read(self):
+                        return json.dumps({"ok": True, "action_id": body["action_id"]}).encode()
+
+                return AckResponse()
+
+            class OtherResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc_val, exc_tb):
+                    pass
+
+                def read(self):
+                    return b'{"ok": true}'
+
+            return OtherResponse()
+
+        # 构造受阻在 750 的 client
+        class StalledClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if self.step > 1:
+                        self.pos = 750
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2 if self.step > 2 else 1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StalledClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        # 端到端测试真实 _acp_callback -> _acp_complete 链路，观察真实 POST 请求体
+        with mock.patch.dict(os.environ, {
+            "AGENT_CORE_CA_CERT": "/tmp/dummy_ca.pem",
+            "AGENT_CORE_URL": "https://localhost:15678",
+        }), mock.patch("ssl.create_default_context"), mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = plugin.dispatch("set_position", {
+                "position": 100, "on_stall": "keep", "confirm_motion": True,
+            })
+            self.assertEqual("running", res["state"])
+            action_id = res["action_id"]
+
+            plugin._worker_thread.join(timeout=3.0)
+            target_requests = [item for item in captured_requests if item[1].get("action_id") == action_id]
+            self.assertEqual(1, len(target_requests))
+            req, body = target_requests[0]
+            self.assertEqual("POST", req.method)
+            self.assertTrue(req.full_url.endswith("/api/acp/complete"))
+
+            self.assertEqual(action_id, body["action_id"])
+            self.assertEqual("completed", body["status"])
+            self.assertEqual("gripper", body["tool"])
+            # 关键断言：序列化后的 result 中保留了真实受阻 keep 细节，未被覆盖为 target_reached
+            self.assertEqual("motion_stalled_kept", body["result"]["reason"])
+            self.assertEqual(750, body["result"]["position"])
+            self.assertEqual(750, body["result"]["blocked_position"])
+            self.assertEqual(100, body["result"]["target"])
+            self.assertEqual(1000, body["result"]["start_position"])
+            self.assertTrue(body["result"]["stalled"])
+            self.assertEqual("keep", body["result"]["on_stall"])
+            self.assertEqual(100, body["result"]["requested_position"])
+            self.assertEqual(750, body["result"]["final_position"])
+            self.assertEqual(20, body["result"]["force"])
+            self.assertEqual("rm_plus", body["result"]["mode"])
+            self.assertIsNone(body["result"]["error"])
+            self.assertIn("elapsed_seconds", body["result"])
+            self.assertIn("stall_timeout_seconds", body["result"])
+
+    def test_info_reports_last_completion_after_stalled_action(self):
+        """P2 验证：info 查询在动作完成后返回包含详细结果的 last_completion 副本。"""
+        class StalledKeepClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if self.step > 1:
+                        self.pos = 750
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2 if self.step > 2 else 1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StalledKeepClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        plugin._acp_callback = lambda a, s, r: None
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "keep", "confirm_motion": True,
+        })
+        action_id = res["action_id"]
+        plugin._worker_thread.join(timeout=3.0)
+
+        # 动作完成后，通过 info 能够获取到 last_completion
+        info = plugin.dispatch("info", {})
+        self.assertIsNotNone(info.get("last_completion"))
+        last = info["last_completion"]
+        self.assertEqual(action_id, last["action_id"])
+        self.assertEqual("completed", last["status"])
+        self.assertEqual("motion_stalled_kept", last["result"]["reason"])
+        self.assertEqual(750, last["result"]["position"])
+        self.assertEqual(750, last["result"]["blocked_position"])
+        self.assertTrue(last["result"]["stalled"])
+
+    def test_gripper_reports_hardware_fault_on_bad_sys_state_or_dof_err(self):
+        """P2 验证：RM+ 反馈故障（sys_state!=0 或 dof_err!=0）不得当作正常受阻完成，必须报告 failed。"""
+        class FaultedClient:
+            def __init__(self, sys_state=0, dof_err=None):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.sys_state = sys_state
+                self.dof_err = dof_err or [0]
+
+            def command(self, method, *args):
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    return {
+                        "sys_state": self.sys_state,
+                        "dof_err": self.dof_err,
+                        "pos": [500],
+                        "speed": [0.0],
+                        "dof_state": [2],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        # 1. 验证 sys_state 故障（如掉电或系统错误）
+        fault_client = FaultedClient(sys_state=1, dof_err=[0])
+        plugin = self.device.GripperPlugin(fault_client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        with self.assertRaises(RuntimeError):
+            plugin._read_gripper_state()
+
+        res = plugin.dispatch("set_position", {"position": 100, "confirm_motion": True})
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=2.0))
+        _, status, payload = events[0]
+        self.assertEqual("failed", status)
+        self.assertIn("Gripper feedback is faulted", payload["reason"])
+
+        # 2. 验证 dof_err 故障（如过流、堵转硬件报警等非零 dof 错误码）
+        fault_client2 = FaultedClient(sys_state=0, dof_err=[2])
+        plugin2 = self.device.GripperPlugin(fault_client2, {}, namespace="rm75")
+        events2 = []
+        plugin2._acp_callback = lambda a, s, r: events2.append((a, s, r))
+
+        res2 = plugin2.dispatch("set_position", {"position": 100, "confirm_motion": True})
+        self.assertTrue(self._wait_for(lambda: len(events2) == 1, timeout=2.0))
+        _, status2, payload2 = events2[0]
+        self.assertEqual("failed", status2)
+        self.assertIn("Gripper feedback is faulted", payload2["reason"])
+
+    def test_rm_plus_force_write_failure_propagates_and_fails_action(self):
+        """P1 契约校验：知行 RM+ 夹爪写力矩寄存器 1220 失败时不得静默吞噬，必须报错并将动作置为 failed。"""
+        class ForceWriteErrorClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+
+            def command(self, method, *args):
+                if method == "rm_set_rm_plus_reg":
+                    raise RuntimeError("Communication error on register 1220")
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [1000],
+                        "speed": [0.0],
+                        "dof_state": [1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = ForceWriteErrorClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {"position": 500, "force": 30, "confirm_motion": True})
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=2.0))
+        _, status, payload = events[0]
+        self.assertEqual("failed", status)
+        self.assertIn("Communication error on register 1220", payload["reason"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+    def test_rm_plus_force_readback_mismatch_fails_action(self):
+        """P1 契约校验：知行 RM+ 夹爪力矩回读值与期望设定值不符时，必须报错并将动作置为 failed。"""
+        class ForceMismatchClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+
+            def command(self, method, *args):
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [1000],
+                        "speed": [0.0],
+                        "dof_state": [1],
+                        "force": [20.0],
+                    }
+                if method == "rm_get_rm_plus_reg":
+                    # 回读值为 50，与请求的 30 不匹配
+                    return [50]
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = ForceMismatchClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {"position": 500, "force": 30, "confirm_motion": True})
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=2.0))
+        _, status, payload = events[0]
+        self.assertEqual("failed", status)
+        self.assertIn("Gripper force readback mismatch", payload["reason"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+    def test_standard_gripper_omits_force_write(self):
+        """P1 契约校验：标准夹爪路径显式省略向 RM+ 寄存器 1220 写入力矩，并使用 rm_set_gripper_position 指令。"""
+        class StandardGripperClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                if method == "rm_set_gripper_position":
+                    self.pos = args[0]
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    # 非 RM+ 夹爪返回异常或 None
+                    raise RuntimeError("not an RM+ gripper")
+                if method == "rm_get_gripper_state":
+                    return {
+                        "actpos": self.pos,
+                        "current_force": 0.0,
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StandardGripperClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=2.0))
+        _, status, payload = events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual("target_reached", payload["reason"])
+        self.assertEqual(500, payload["position"])
+
+        # 核心断言：未调用 rm_set_rm_plus_reg，且使用 rm_set_gripper_position 派发指令
+        method_names = [call[0] for call in client.calls]
+        self.assertNotIn("rm_set_rm_plus_reg", method_names)
+        self.assertNotIn("rm_set_hand_follow_pos", method_names)
+        self.assertIn("rm_set_gripper_position", method_names)
+        self.assertIn(("rm_set_gripper_position", (500, False, 30)), client.calls)
+
+    def test_standard_gripper_stall_keep_overwrites_setpoint(self):
+        """建议项校验：标准夹爪在受阻时，keep 策略必须通过 rm_set_gripper_position 重设设定点。"""
+        class StandardStalledKeepClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    raise RuntimeError("not an RM+ gripper")
+                if method == "rm_get_gripper_state":
+                    self.step += 1
+                    if self.step > 1:
+                        self.pos = 750
+                    return {
+                        "actpos": self.pos,
+                        "current_force": 10.0,
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StandardStalledKeepClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "keep", "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual("motion_stalled_kept", payload["reason"])
+        self.assertEqual(750, payload["position"])
+        self.assertTrue(payload["stalled"])
+        self.assertEqual("keep", payload["on_stall"])
+
+        # 核心断言：通过 rm_set_gripper_position 将受阻位置 750 重写为设定点
+        self.assertIn(("rm_set_gripper_position", (750, False, 30)), client.calls)
+
+    def test_standard_gripper_stall_rollback(self):
+        """建议项校验：标准夹爪在受阻时，rollback 策略必须通过 rm_set_gripper_position 回滚至起始位置。"""
+        class StandardStalledRollbackClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+                self.rolled_back = False
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                if method == "rm_set_gripper_position" and args[0] == 1000 and self.pos == 750:
+                    self.rolled_back = True
+                    self.pos = 1000
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_state_info":
+                    raise RuntimeError("not an RM+ gripper")
+                if method == "rm_get_gripper_state":
+                    self.step += 1
+                    if not self.rolled_back and self.step > 1:
+                        self.pos = 750
+                    return {
+                        "actpos": self.pos,
+                        "current_force": 10.0,
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StandardStalledRollbackClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "rollback", "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual("motion_stalled_rolled_back", payload["reason"])
+        self.assertEqual(1000, payload["position"])
+        self.assertEqual(750, payload["blocked_position"])
+        self.assertTrue(payload["rollback_succeeded"])
+        self.assertTrue(payload["rollback_success"])
+
+        # 核心断言：通过 rm_set_gripper_position 回滚到起始位置 1000
+        self.assertIn(("rm_set_gripper_position", (1000, False, 30)), client.calls)
+
+    def test_gripper_stall_keep_command_failure_fails_action(self):
+        """High 校验：受阻 keep 策略在下发受阻保持设定点失败时，必须将动作置为 failed 终态并如实报错。"""
+        class StalledKeepFailClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                # 第一次初始下发 target=100 成功；第二次受阻重写 blocked_pos=750 失败
+                if (method == "rm_set_hand_follow_pos" and args[0][0] == 750) or (
+                    method == "rm_set_gripper_position" and args[0] == 750
+                ):
+                    raise RuntimeError("controller communication dropped")
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_reg":
+                    return [20]
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if self.step > 1:
+                        self.pos = 750
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2 if self.step > 2 else 1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StalledKeepFailClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "keep", "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        # 核心断言：状态必须为 failed，而不是误报 completed / motion_stalled_kept
+        self.assertEqual("failed", status)
+        self.assertTrue(payload["reason"].startswith("stall_keep_failed"))
+        self.assertEqual(750, payload["blocked_position"])
+        self.assertEqual(750, payload["position"])
+        self.assertTrue(payload["stalled"])
+        self.assertEqual("keep", payload["on_stall"])
+        self.assertIn("controller communication dropped", payload["error"])
+        # 核心断言：由于重设设定点失败，原目标仍处于活跃状态未被消解，必须锁定资源防止并发
+        self.assertTrue(plugin._gripper_lock.locked())
+        self.assertTrue(client.motion_gate.locked())
+        plugin.dispatch("stop", {})
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+    def test_gripper_stall_rollback_command_failure_fails_action(self):
+        """High 校验：受阻 rollback 策略在下发回滚指令失败时，必须上报 failed 且 rollback_succeeded 为 False。"""
+        class StalledRollbackCmdFailClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                # 初始下发 target=100 成功，下发回滚到 1000 失败
+                if (method == "rm_set_hand_follow_pos" and args[0][0] == 1000 and self.step > 1) or (
+                    method == "rm_set_gripper_position" and args[0] == 1000 and self.step > 1
+                ):
+                    raise RuntimeError("rollback bus error")
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_reg":
+                    return [20]
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if self.step > 1:
+                        self.pos = 750
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2 if self.step > 2 else 1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StalledRollbackCmdFailClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "rollback", "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        self.assertEqual("failed", status)
+        self.assertTrue(payload["reason"].startswith("rollback_command_failed"))
+        self.assertFalse(payload["rollback_succeeded"])
+        self.assertFalse(payload["rollback_success"])
+        self.assertEqual(750, payload["blocked_position"])
+        # 核心断言：回滚指令未成功下发，原目标未消解，锁必须保持
+        self.assertTrue(plugin._gripper_lock.locked())
+        self.assertTrue(client.motion_gate.locked())
+        plugin.dispatch("stop", {})
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+    def test_gripper_stall_rollback_incomplete_fails_action(self):
+        """High 校验：受阻 rollback 策略在回滚后未能到达起始位置（如卡死在中间）时，必须上报 failed。"""
+        class StalledRollbackStuckClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+                self.rolling_back = False
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                if (method == "rm_set_hand_follow_pos" and args[0][0] == 1000) or (
+                    method == "rm_set_gripper_position" and args[0] == 1000
+                ):
+                    self.rolling_back = True
+                    self.pos = 800
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_reg":
+                    return [20]
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if not self.rolling_back:
+                        if self.step > 1:
+                            self.pos = 750
+                    else:
+                        self.pos = 800
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [0.0],
+                        "dof_state": [2 if self.step >= 2 else 1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = StalledRollbackStuckClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "rollback", "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        # 核心断言：未能回滚到 1000，必须失败
+        self.assertEqual("failed", status)
+        self.assertEqual("rollback_failed", payload["reason"])
+        self.assertFalse(payload["rollback_succeeded"])
+        self.assertFalse(payload["rollback_success"])
+        self.assertEqual(800, payload["position"])
+        self.assertEqual(750, payload["blocked_position"])
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+    def test_gripper_feedback_lost_during_motion_fails_action(self):
+        """建议项校验：运动过程中若夹爪位置反馈连续丢失，必须立即判定为 failed 终态且保持锁保护。"""
+        class FeedbackLostClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_reg":
+                    return [20]
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    # 第一次初始读取正常（1000），下发运动后反馈完全丢失
+                    if self.step == 1:
+                        return {
+                            "sys_state": 0,
+                            "dof_err": [0],
+                            "pos": [1000],
+                            "speed": [0.0],
+                            "dof_state": [1],
+                            "force": [20.0],
+                        }
+                    return None
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = FeedbackLostClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        self.assertEqual("failed", status)
+        self.assertIn("Gripper position feedback lost", payload["reason"])
+        # 绝不虚构目标位置 100，如实报告最后已知真实位置 1000
+        self.assertEqual(1000, payload["position"])
+        self.assertEqual(100, payload["target"])
+        # 核心断言：由于原运动目标未被消解，严禁释放锁，必须保护资源
+        self.assertTrue(plugin._gripper_lock.locked())
+        self.assertTrue(client.motion_gate.locked())
+        # 调用 stop 后安全释放
+        plugin.dispatch("stop", {})
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
+
+    def test_gripper_timeout_neutralizes_with_hold_and_releases_lock(self):
+        """High 校验：动作超时时若反馈可用，通过下发当前测量位置作为 hold 设定点消解运动并释放锁。"""
+        class TimeoutNeutralizeClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_reg":
+                    return [20]
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    # 运动到 500 后保持低速持续运行但不达 100
+                    if self.step > 1:
+                        self.pos = 500
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [5.0],
+                        "dof_state": [1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = TimeoutNeutralizeClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        with mock.patch.object(self.device, "GRIPPER_COMPLETION_TIMEOUT", 0.2):
+            res = plugin.dispatch("set_position", {"position": 100, "stall_timeout_seconds": 5.0, "confirm_motion": True})
+            self.assertEqual("running", res["state"])
+            self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+            _, status, payload = events[0]
+            self.assertEqual("failed", status)
+            self.assertIn("motion timed out", payload["reason"])
+            self.assertEqual(500, payload["position"])
+            # 核心断言：超时时成功下发当前位置 500 作为 hold 设定点顶替原目标 100
+            self.assertIn(("rm_set_hand_follow_pos", ([500, 0, 0, 0, 0, 0], False)), client.calls)
+            # 运动已消解，锁可以安全释放
+            self.assertFalse(plugin._gripper_lock.locked())
+            self.assertFalse(client.motion_gate.locked())
+
+    def test_gripper_timeout_without_neutralization_retains_lock(self):
+        """High 校验：动作超时时若无法消解原目标（如读取当前位置失败或 hold 指令失败），必须保持锁锁定。"""
+        class TimeoutNoNeutralizeClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                # 超时下发的 hold 设定点指令失败（同时拒绝 RM+ 与标准指令回退）
+                if (method == "rm_set_hand_follow_pos" and args[0][0] != 100) or (
+                    method == "rm_set_gripper_position" and args[0] != 100
+                ):
+                    raise RuntimeError("hold command rejected")
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_reg":
+                    return [20]
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if self.step > 1:
+                        self.pos = 500
+                    return {
+                        "sys_state": 0,
+                        "dof_err": [0],
+                        "pos": [self.pos],
+                        "speed": [5.0],
+                        "dof_state": [1],
+                        "force": [20.0],
+                    }
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = TimeoutNoNeutralizeClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        with mock.patch.object(self.device, "GRIPPER_COMPLETION_TIMEOUT", 0.2):
+            res = plugin.dispatch("set_position", {"position": 100, "stall_timeout_seconds": 5.0, "confirm_motion": True})
+            self.assertEqual("running", res["state"])
+            self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+            _, status, payload = events[0]
+            self.assertEqual("failed", status)
+            self.assertIn("motion timed out", payload["reason"])
+            # 核心断言：hold 命令失败，原目标仍活跃，严禁释放锁
+            self.assertTrue(plugin._gripper_lock.locked())
+            self.assertTrue(client.motion_gate.locked())
+            plugin.dispatch("stop", {})
+            self.assertFalse(plugin._gripper_lock.locked())
+            self.assertFalse(client.motion_gate.locked())
+
+    def test_gripper_stall_rollback_feedback_lost_fails_action(self):
+        """建议项校验：回滚过程中若反馈断开，必须上报 rollback_feedback_lost 并保留锁。"""
+        class RollbackFeedbackLostClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+                self.motion_enabled = True
+                self.motion_gate = threading.Lock()
+                self.pos = 1000
+                self.step = 0
+                self.rolling_back = False
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                if (method == "rm_set_hand_follow_pos" and args[0][0] == 1000) or (
+                    method == "rm_set_gripper_position" and args[0] == 1000
+                ):
+                    self.rolling_back = True
+                return 0
+
+            def call(self, method, *args):
+                if method == "rm_get_rm_plus_reg":
+                    return [20]
+                if method == "rm_get_rm_plus_state_info":
+                    self.step += 1
+                    if not self.rolling_back:
+                        if self.step > 1:
+                            self.pos = 750
+                        return {
+                            "sys_state": 0,
+                            "dof_err": [0],
+                            "pos": [self.pos],
+                            "speed": [0.0],
+                            "dof_state": [2 if self.step > 2 else 1],
+                            "force": [20.0],
+                        }
+                    # 回滚开始后反馈丢失
+                    return None
+                raise AssertionError(f"unexpected call: {method}")
+
+        client = RollbackFeedbackLostClient()
+        plugin = self.device.GripperPlugin(client, {}, namespace="rm75")
+        events = []
+        plugin._acp_callback = lambda a, s, r: events.append((a, s, r))
+
+        res = plugin.dispatch("set_position", {
+            "position": 100, "on_stall": "rollback", "stall_timeout_seconds": 0.5, "confirm_motion": True,
+        })
+        self.assertEqual("running", res["state"])
+        self.assertTrue(self._wait_for(lambda: len(events) == 1, timeout=3.0))
+        _, status, payload = events[0]
+        self.assertEqual("failed", status)
+        self.assertEqual("rollback_feedback_lost", payload["reason"])
+        self.assertFalse(payload["rollback_succeeded"])
+        self.assertTrue(plugin._gripper_lock.locked())
+        self.assertTrue(client.motion_gate.locked())
+        plugin.dispatch("stop", {})
+        self.assertFalse(plugin._gripper_lock.locked())
+        self.assertFalse(client.motion_gate.locked())
 
     def test_gripper_card_is_advertised(self):
         manifest = (DRIVER / "driver.yaml").read_text()
