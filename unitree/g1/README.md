@@ -22,7 +22,7 @@
 | 本体状态 | `loco_state`、`loco_motion_state`、`motion_events`、`posture`、`imu`、`battery`、`joints`、`mainboard`、`model` | 启用；运动状态、姿态、电池、关节和模型数据 |
 | 外接设备 | `ext_mic`、`ext_camera` | 启用；外接麦克风和相机 |
 
-旧 `slam` 插件和独立 `motion_control` 入口默认关闭。通常使用空间服务卡片和 `teleop_control`；不要同时启用 `motion_control` 与 `teleop_control`。
+旧 `slam` 插件默认关闭。独立 `motion_control` 卡片入口已移除；双臂遥操使用 `teleop_control`。旧配置显式启用 `motion_control` 时，驱动会报迁移错误。
 
 ## 构建
 
