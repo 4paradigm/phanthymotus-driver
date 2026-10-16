@@ -435,6 +435,9 @@ class TeachingPlugin:
                 "预览不通过时报告原因，不得改录制或绕过检查。"
                 + self.adapter.replay_instruction +
                 "设备/标定绑定由驱动强制检查。running 只表示已提交，等待 ACP 完成或通过 info 核对相同 action_id 的终态。"
+                "若 trajectory_completed=true 且 stop_error 存在，录制轨迹已结束，但停止交权当时未确认；"
+                "调用 info 核对同一 action_id 和 stop.operation_id 对应的 release，按实际状态报告，不得自动重放。"
+                "只报告回执给出的错误原因，不得猜测碰撞、遮挡或障碍物；交权未确认不等于轨迹没有执行。"
                 "停止使用 stop 并等待完成结果。动作完成不等于任务效果成功，按需让用户确认。"
                 "本技能保持录制时环境和物体布置，不具有视觉泛化或物体定位能力。"
             ),

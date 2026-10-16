@@ -30,6 +30,52 @@ def reset_rig(tmp_path, client=None):
     return card, arm, sample, advance, sdk, feed
 
 
+@pytest.mark.parametrize('case, expected_time, error', [
+    ('late_rest', 14.6, None),
+    ('ordinary_stop', 12., 'release_timeout'),
+    ('never_still', 30., 'release_timeout'),
+    ('vendor_pending', 12., 'release_sdk_timeout'),
+    ('zero_write_missing', 12., 'release_timeout'),
+    ('operation_changed', 13., 'release_operation_changed'),
+    ('feedback_lost', 12., 'arm_feedback_stale'),
+    ('unconfirmed_completion', 14.6, 'release_not_physically_confirmed'),
+])
+def test_replay_waits_only_for_same_zero_weight_handback(monkeypatch, case, expected_time, error):
+    import teleop_control
+    now, calls = [0.], []
+    def sleep(seconds): now[0] += seconds
+    monkeypatch.setattr(teleop_control, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    def status():
+        completed = now[0] >= 14.6 and case not in ('never_still', 'vendor_pending', 'zero_write_missing')
+        release = {'operation_id': 'same-stop', 'state': 'completed' if completed else 'unknown' if now[0] >= 10 else 'confirming_handback',
+            'reason': 'release_sdk_timeout' if case == 'vendor_pending' else 'release_timeout',
+            'timed_out_state': 'confirming_handback', 'action_id': 99 if case == 'vendor_pending' else None,
+            'zero_writes': 4 if case == 'zero_write_missing' else 5, 'operator_reset': False,
+            'physical_confirmed': completed and case != 'unconfirmed_completion', 'authority_released': completed}
+        if case == 'operation_changed' and now[0] >= 13: release['operation_id'] = 'another-stop'
+        return {'state': 'idle' if completed else 'hold', 'reason': 'release_requested',
+                'ownership_held': not completed, 'output_active': False, 'weight': 0, 'release': release}
+    def fresh():
+        if case == 'feedback_lost': raise ValueError('arm_feedback_stale')
+    def dispatch(action, args):
+        calls.append(action); return {'operation_id': 'same-stop'}
+    executor = SimpleNamespace(status=status, dispatch=dispatch, opening=False,
+        cancel_preparation=lambda: None, _rpc_thread=None, _fresh=fresh)
+    card = TeleopControl.__new__(TeleopControl)
+    card.executor = executor
+    card.motion = SimpleNamespace(cancel_pending=lambda: None, _lock=threading.RLock())
+    card._lock = threading.RLock(); card._reset_operation = None
+    if error:
+        with pytest.raises(ValueError, match=error):
+            card._stop_motion(replay_completion=case != 'ordinary_stop')
+    else:
+        result = card._stop_motion(replay_completion=True)
+        assert result['physical_confirmed'] and result['settled_after_timeout']
+        assert result['operation_id'] == 'same-stop' and result['authority_released']
+    assert now[0] == pytest.approx(expected_time, abs=.03)
+    assert calls == ['stop']  # Observation never retries stop, reset or replay.
+
+
 def test_explicit_confirmation_no_first_frame_or_held_grip_calibration(tmp_path):
     card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
     begun = []

@@ -161,6 +161,8 @@ class G1TeachingAdapter:
                 "input_fresh": value["input_fresh"], "mapped": value["mapped"],
                 "can_record": value["can_record"], "recording": recording,
                 "teleop_hint": hint, "last_action": value.get("last_action"),
+                "release": {k: release.get(k) for k in (
+                    'operation_id', 'state', 'physical_confirmed', 'authority_released')},
                 "control_recovery": recovery,
                 "checks": [{"id": k, "label": label, "ok": None} for k, label, _ in self.checks],
                 "recordings": self._call("recordings")["recordings"]}
