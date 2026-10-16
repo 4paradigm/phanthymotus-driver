@@ -1,0 +1,9 @@
+# CPU numerical ABI migrated from the tested Tianyi ActuCore bundle.
+numpy==2.2.6
+scipy==1.15.3
+pin==3.7.0
+cmeel-urdfdom==4.0.1
+cmeel-tinyxml2==10.0.0
+# Preserve transitive build/runtime packaging versions from the source bundle.
+cmeel==0.53.3
+tomli==2.0.2

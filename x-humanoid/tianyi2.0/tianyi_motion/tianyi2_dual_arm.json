@@ -1,0 +1,171 @@
+{
+  "schema": "motus.tianyi-calibration.v1",
+  "urdf_sha256": "a7e742ad600c7f1e9eeecdd04046dea4cd5f81cccb6dde73f290968b345e4b20",
+  "arm_joint_names": [
+    "shoulder_pitch_l_joint",
+    "shoulder_roll_l_joint",
+    "shoulder_yaw_l_joint",
+    "elbow_pitch_l_joint",
+    "elbow_yaw_l_joint",
+    "wrist_pitch_l_joint",
+    "wrist_roll_l_joint",
+    "shoulder_pitch_r_joint",
+    "shoulder_roll_r_joint",
+    "shoulder_yaw_r_joint",
+    "elbow_pitch_r_joint",
+    "elbow_yaw_r_joint",
+    "wrist_pitch_r_joint",
+    "wrist_roll_r_joint"
+  ],
+  "torso_frame": "waist_yaw_link",
+  "palm_frames": {
+    "left": {
+      "position": [
+        0.0,
+        3.5454e-05,
+        -0.084799
+      ],
+      "orientation": [
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    "right": {
+      "position": [
+        0.0,
+        -3.5405e-05,
+        -0.084799
+      ],
+      "orientation": [
+        0,
+        0,
+        0,
+        1
+      ]
+    }
+  },
+  "workspace": {
+    "torso_spheres": [
+      {
+        "center_m": [
+          0,
+          0,
+          0.15
+        ],
+        "radius_m": 0.16
+      },
+      {
+        "center_m": [
+          0,
+          0,
+          0.23
+        ],
+        "radius_m": 0.16
+      },
+      {
+        "center_m": [
+          0,
+          0,
+          0.3
+        ],
+        "radius_m": 0.16
+      }
+    ],
+    "left": [
+      [
+        -1,
+        -1,
+        -1
+      ],
+      [
+        1,
+        1,
+        1
+      ]
+    ],
+    "right": [
+      [
+        -1,
+        -1,
+        -1
+      ],
+      [
+        1,
+        1,
+        1
+      ]
+    ],
+    "capsules": [
+      {
+        "from": "shoulder_roll_l_link",
+        "to": "elbow_pitch_l_link",
+        "radius_m": 0.05,
+        "group": "left"
+      },
+      {
+        "from": "elbow_pitch_l_link",
+        "to": "wrist_roll_l_link",
+        "radius_m": 0.05,
+        "group": "left"
+      },
+      {
+        "from": "wrist_roll_l_link",
+        "to": "left_tcp_link",
+        "radius_m": 0.05,
+        "group": "left"
+      },
+      {
+        "from": "shoulder_roll_r_link",
+        "to": "elbow_pitch_r_link",
+        "radius_m": 0.05,
+        "group": "right"
+      },
+      {
+        "from": "elbow_pitch_r_link",
+        "to": "wrist_roll_r_link",
+        "radius_m": 0.05,
+        "group": "right"
+      },
+      {
+        "from": "wrist_roll_r_link",
+        "to": "right_tcp_link",
+        "radius_m": 0.05,
+        "group": "right"
+      }
+    ]
+  },
+  "controller_to_palm": {
+    "left": {
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "orientation": [
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    "right": {
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "orientation": [
+        0,
+        0,
+        0,
+        1
+      ]
+    }
+  },
+  "hands_enabled": false,
+  "version": "tianyi2-dual-arm-v1",
+  "urdf_path": "models/tianyi2-official.urdf",
+  "joint_velocity_rad_s": 1.0
+}
