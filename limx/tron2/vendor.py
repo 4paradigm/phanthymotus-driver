@@ -29,6 +29,9 @@ ARM_UPPER = (2.6005, 3.1940, 1.4835, .2618, 1.3963, .7854, 1.5708,
 # Preserve native vendor signs and exact degree-to-radian conversion.
 HEAD_RAD_LIMITS = ((math.radians(-45), math.radians(60)), (-math.pi/2, math.pi/2))
 HEAD_DEG_LIMITS = ((-45, 60), (-90, 90))
+# Temporary command margin after +90deg stopped at +88.94deg in field feedback.
+# This is not a measured mechanical limit; negative endpoint remains unverified.
+HEAD_YAW_COMMAND_LIMIT_DEG = 88
 
 
 def validate_moveh(joint, duration):
@@ -45,6 +48,8 @@ def validate_moveh(joint, duration):
             valid = False
         if not valid:
             raise ValueError('Head angle exceeds the configured head joint limit')
+    if abs(joint[1]) > math.radians(HEAD_YAW_COMMAND_LIMIT_DEG):
+        raise MoveError('左右目标超出当前调试范围：-88至88°；未发送转动指令',False,'head_yaw_out_of_range')
     # Reuse strict duration validation, without forwarding any arm target.
     validate_movej([0]*14, duration)
     return list(joint), duration

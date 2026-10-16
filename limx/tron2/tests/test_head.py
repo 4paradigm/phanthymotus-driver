@@ -19,7 +19,7 @@ from vendor import MoveError, RobotReader, validate_moveh, HEAD_RAD_LIMITS
 
 class HeadValidationTests(unittest.TestCase):
     def test_manual_degrees_convert_to_only_two_radians(self):
-        for pitch,yaw in ((-60,-90),(45,90),(0,0),(12,-20)):
+        for pitch,yaw in ((-60,-88),(45,88),(0,0),(12,-20)):
             target,duration=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
             for actual,expected in zip(card_degrees(target),(pitch,yaw)):
@@ -29,8 +29,8 @@ class HeadValidationTests(unittest.TestCase):
         self.assertEqual(set(props['properties']),{'pitch_deg','yaw_deg','time'})
         self.assertEqual(props['properties']['pitch_deg']['minimum'],-60)
         self.assertEqual(props['properties']['pitch_deg']['maximum'],45)
-        self.assertEqual(props['properties']['yaw_deg']['minimum'],-90)
-        self.assertEqual(props['properties']['yaw_deg']['maximum'],90)
+        self.assertEqual(props['properties']['yaw_deg']['minimum'],-88)
+        self.assertEqual(props['properties']['yaw_deg']['maximum'],88)
         self.assertEqual(props['required'],['pitch_deg','yaw_deg'])
         self.assertNotIn('action',props['properties'])
         self.assertNotIn('x-action-params',props)
@@ -41,10 +41,24 @@ class HeadValidationTests(unittest.TestCase):
             with self.subTest(pitch=pitch,yaw=yaw),self.assertRaisesRegex(ValueError,'头部角度范围'):
                 arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             with self.assertRaises(ValueError):validate_moveh([math.radians(-pitch),math.radians(yaw)],5)
-        for pitch,yaw in ((-60,-90),(45,90),(5,0),(0,-90),(0,90),(-12,20)):
+        for pitch,yaw in ((-60,-88),(45,88),(5,0),(0,-88),(0,88),(-12,20)):
             target,_=arguments({'pitch_deg':pitch,'yaw_deg':yaw,'time':5})
             self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
             self.assertTrue(all(low<=v<=high for v,(low,high) in zip(target,HEAD_RAD_LIMITS)))
+
+    def test_yaw_margin_rejects_old_endpoints_without_clamping_or_pitch_change(self):
+        for yaw in (-90,-89,-88.001,88.001,89,90):
+            with self.subTest(yaw=yaw):
+                with self.assertRaises(ValueError):arguments({'pitch_deg':0,'yaw_deg':yaw})
+                with self.assertRaises(MoveError) as caught:validate_moveh([0,math.radians(yaw)],5)
+                self.assertFalse(caught.exception.motion_sent)
+                self.assertEqual(caught.exception.code,'head_yaw_out_of_range')
+        for pitch in (-60,45):
+            for yaw in (-88,88):
+                target,_=arguments({'pitch_deg':pitch,'yaw_deg':yaw})
+                self.assertEqual(target,[math.radians(-pitch),math.radians(yaw)])
+        # Feedback plausibility still follows the mechanical range, not command margin.
+        self.assertEqual(HEAD_RAD_LIMITS[1],(-math.pi/2,math.pi/2))
 
     def test_missing_bad_and_out_of_range_values_never_validate(self):
         for key in ('pitch_deg','yaw_deg'):
@@ -108,7 +122,7 @@ class HeadCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.owner.last['callback_delivered']);self.assertIsNone(self.owner.active)
 
     async def test_invalid_target_never_owns_head_and_valid_next_request_is_admitted(self):
-        for target,duration in (([-math.pi/4-.01,math.pi/2],10),([0,0],float('nan')),([0,0],0)):
+        for target,duration in (([0,math.pi/2],10),([-math.pi/4-.01,0],10),([0,0],float('nan')),([0,0],0)):
             with self.assertRaises(ValueError):await self.owner.dispatch('move',target,duration,{})
             self.assertIsNone(self.owner.active);self.assertIsNone(self.owner.task)
             self.assertIsNone(self.owner.last)
@@ -338,7 +352,9 @@ class HeadWireTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(adapter.call('move_head',{'action':action})['motion_sent'])
                 # Real MCP admission: invalid input never sends WS, creates an ACP task,
                 # or acquires ownership. The following valid call must still complete.
-                bad_inputs=[{'pitch_deg':46,'yaw_deg':90,'time':10},
+                bad_inputs=[{'pitch_deg':0,'yaw_deg':90,'time':10},
+                    {'pitch_deg':0,'yaw_deg':-90,'time':10},
+                    {'pitch_deg':46,'yaw_deg':0,'time':10},
                     {'pitch_deg':'5','yaw_deg':0}, {'pitch_deg':True,'yaw_deg':0},
                     {'pitch_deg':0}, {'pitch_deg':0,'yaw_deg':0,'time':0},
                     {'pitch_deg':0,'yaw_deg':0,'unexpected':1}]

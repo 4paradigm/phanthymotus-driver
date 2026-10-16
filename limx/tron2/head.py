@@ -6,11 +6,11 @@ import time
 import completion
 from completion import ArmCompletion
 from skeleton import skeleton_stream
-from vendor import validate_moveh, MoveError, HEAD_DEG_LIMITS, HEAD_RAD_LIMITS, motion_readiness
+from vendor import validate_moveh, MoveError, HEAD_DEG_LIMITS, HEAD_RAD_LIMITS, HEAD_YAW_COMMAND_LIMIT_DEG, motion_readiness
 
 RECOVERY_TIMEOUT = 3
 COORDINATE_CONVENTION = 'pitch_up_positive_yaw_robot_left_positive'
-CARD_DEG_LIMITS = ((-HEAD_DEG_LIMITS[0][1], -HEAD_DEG_LIMITS[0][0]), HEAD_DEG_LIMITS[1])
+CARD_DEG_LIMITS = ((-HEAD_DEG_LIMITS[0][1], -HEAD_DEG_LIMITS[0][0]), (-HEAD_YAW_COMMAND_LIMIT_DEG, HEAD_YAW_COMMAND_LIMIT_DEG))
 
 
 def card_degrees(vendor_radians):
@@ -41,7 +41,7 @@ def tool():
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
                 'pitch_deg':{'type':'number','minimum':CARD_DEG_LIMITS[0][0],'maximum':CARD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上正下负；-60～45°'},
-                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'左右角度（°）','description':'自身左正右负；-90～90°'},
+                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'左右角度（°）','description':'自身左正右负；-88～88°'},
                 'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'}},
             'required':['pitch_deg','yaw_deg'],
             'x-resource':['head','arm_l','arm_r'],
