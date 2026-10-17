@@ -27,6 +27,8 @@ half of the format is available here.
 """
 from __future__ import annotations
 
+import math
+
 # Which of the six axes this robot genuinely measures. Absent rather than
 # listed-and-null so a consumer can decide **at start** whether it can do its
 # job, instead of discovering it one sample at a time at 10 Hz.
@@ -54,8 +56,11 @@ def reading(angular_vel) -> list:
     zeros: the caller drops the reading, and a window with nothing in it
     publishes all-`None`, which is the honest answer.
     """
-    return [None, None, None,
-            float(angular_vel[0]), float(angular_vel[1]), float(angular_vel[2])]
+    angular = [float(angular_vel[0]), float(angular_vel[1]),
+               float(angular_vel[2])]
+    if not all(math.isfinite(value) for value in angular):
+        raise ValueError("IMU angular velocity must be finite")
+    return [None, None, None, *angular]
 
 
 def interface() -> dict:

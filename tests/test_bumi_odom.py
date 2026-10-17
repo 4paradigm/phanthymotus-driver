@@ -16,6 +16,7 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_bumi_odom.py 
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 import time
 from pathlib import Path
@@ -98,6 +99,17 @@ def test_a_reading_leaves_the_translational_axes_none():
     row = odom_spec.reading([0.1, -0.2, 0.3])
     assert row[:3] == [None, None, None]
     assert row[3:] == [0.1, -0.2, 0.3]
+
+
+@pytest.mark.parametrize("invalid", [math.nan, math.inf, -math.inf])
+def test_non_finite_imu_reading_is_dropped_from_the_window(invalid):
+    """A vendor glitch must not become non-standard JSON in motus.odom/1."""
+    with pytest.raises(ValueError, match="finite"):
+        odom_spec.reading([0.1, invalid, 0.3])
+
+    sample = odom_spec.sample([], received_ms=NOW_MS)
+    assert sample["twist"] == [None] * len(AXES)
+    assert sample["vendor"]["samples"] == 0
 
 
 def test_the_axis_order_is_the_control_order():
