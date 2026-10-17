@@ -472,6 +472,11 @@ class LocoServoPlugin:
                         "description": "要求机器人处于 workmode=2（walking）才执行"
                                        "指令。关掉它只在没有接腿的台架上有意义",
                     },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "仅在关闭空跑或关闭姿态保护时传 true，确认允许"
+                                       "真实底盘输出或移除姿态门",
+                    },
                 },
             },
         }
@@ -518,6 +523,16 @@ class LocoServoPlugin:
         """
         changed = {}
         with self._lock:
+            dangerous_transition = (
+                ("dry_run" in args and self._dry_run and not bool(args["dry_run"]))
+                or ("require_standing" in args and self._require_standing
+                    and not bool(args["require_standing"]))
+            )
+            if dangerous_transition and args.get("confirm") is not True:
+                state = ("running" if self._running and not self._paused else
+                         "paused" if self._running else "idle")
+                return {"ok": False, "state": state,
+                        "error": "关闭空跑或姿态保护需要 confirm=true"}
             for key in self._TOGGLES:
                 if key not in args:
                     continue

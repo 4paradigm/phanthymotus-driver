@@ -588,7 +588,7 @@ def test_pause_for_explicit_command_reports_whether_it_did_anything():
 
 def test_the_three_toggles_are_declared_in_the_config_schema():
     schema = _card().get_tool()["configSchema"]["properties"]
-    assert set(schema) == {"dry_run", "rotate_only", "require_standing"}
+    assert set(schema) == {"dry_run", "rotate_only", "require_standing", "confirm"}
     assert all(field["type"] == "boolean" for field in schema.values())
 
 
@@ -602,13 +602,32 @@ def test_config_takes_effect_while_the_card_is_streaming():
     assert loco.published == []
 
 
+def test_dangerous_config_transitions_require_explicit_confirmation():
+    card = _card(loco=FakeLoco(), dry_run=True, require_standing=True)
+
+    result = card.dispatch("config", {"dry_run": False})
+    assert result["ok"] is False
+    assert card._dry_run is True
+
+    result = card.dispatch("config", {"require_standing": False, "confirm": 1})
+    assert result["ok"] is False
+    assert card._require_standing is True
+
+    result = card.dispatch("config", {
+        "dry_run": False, "require_standing": False, "confirm": True,
+    })
+    assert result["ok"] is True
+    assert card._dry_run is False
+    assert card._require_standing is False
+
+
 def test_clearing_dry_run_hands_a_live_stream_to_the_motors():
     """The direction to be careful about, honoured deliberately: nothing else
     stands between this flag and the chassis once a stream is subscribed, so the
     operator's act is the authorisation."""
     loco = FakeLoco()
     card = _card(loco=loco, dry_run=True)
-    card.dispatch("config", {"dry_run": False})
+    card.dispatch("config", {"dry_run": False, "confirm": True})
     _sink(card).submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
     assert len(loco.published) == 1
 
