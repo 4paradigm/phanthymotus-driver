@@ -122,6 +122,7 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
+        loco_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -131,8 +132,21 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
             from device import LocoPlugin
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, high_ctrl))
+            loco_plugin = LocoPlugin(
+                plugins_cfg["loco"], namespace, executor, high_ctrl)
+            self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
+
+        if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
+                and high_ctrl is not None):
+            from loco_servo import LocoServoPlugin
+            self._plugins.append(LocoServoPlugin(
+                plugins_cfg["loco_servo"], namespace, executor, high_ctrl,
+                # When the call-shaped card is enabled, both paths share its
+                # lock/rate limiter and explicit actions preempt the stream.
+                loco_plugin=loco_plugin,
+            ))
+            print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
