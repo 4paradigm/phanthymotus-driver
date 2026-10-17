@@ -42,21 +42,23 @@ RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclone
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
+COPY timed_motion.py /work/timed_motion.py
 COPY sport_mode_state.py /work/sport_mode_state.py
 COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY av_recording.py /work/av_recording.py
 COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py
 COPY servo_eef.py /work/servo_eef.py

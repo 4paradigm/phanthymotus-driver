@@ -80,7 +80,9 @@ def bundle_module(monkeypatch):
     # The host test runner is Python 3.9 while the Bumi image is Python 3.10+.
     # Postponing annotations lets this test execute the unchanged bundle source
     # without weakening the production runtime requirement.
-    source = "from __future__ import annotations\n" + (BUMI / "main.py").read_text()
+    source = (BUMI / "main.py").read_text()
+    if "from __future__ import annotations" not in source:
+        source = "from __future__ import annotations\n" + source
     module = types.ModuleType("bumi_main_for_test")
     module.__file__ = str(BUMI / "main.py")
     exec(compile(source, module.__file__, "exec"), module.__dict__)

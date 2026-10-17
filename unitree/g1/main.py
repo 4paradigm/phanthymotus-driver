@@ -47,7 +47,6 @@ from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from rpc_proxy import RpcProxy
 from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
 from unitree_sdk2py.g1.slam.slam_client import SlamClient
-from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 try:
     from common import lifecycle as _lifecycle
 except ImportError:  # a checkout rather than the container image, where
@@ -81,7 +80,6 @@ class G1DeviceBundle:
                  loco_client: RpcProxy,
                  arm_client: G1ArmActionClient,
                  slam_client: SlamClient,
-                 msc_client: MotionSwitcherClient,
                  smart_motion=None,
                  network_iface: str = "eth0"):
         self._plugins: list = []
@@ -215,11 +213,6 @@ class G1DeviceBundle:
                 import traceback
                 traceback.print_exc()
 
-        if plugins_cfg.get("motion_switcher", {}).get("enabled", False):
-            from device import MotionSwitcherPlugin
-            self._plugins.append(MotionSwitcherPlugin(plugins_cfg["motion_switcher"], namespace, executor, msc_client))
-            print("[bundle] MotionSwitcherPlugin loaded")
-
         if plugins_cfg.get("ext_mic", {}).get("enabled", False):
             from ext_devices import ExtMicPlugin
             self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
@@ -330,6 +323,25 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
+            # Receive a file into this container: `POST /file/upload`, the way a
+            # `format: file` tool argument reaches a service that shares no
+            # filesystem with agent-core. See common/file_intake.py.
+            #
+            # Two ordering requirements, both silent when violated: this must
+            # precede `self.rfile.read(...)`, which would consume the body the
+            # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+            # would 404 the upload before it is recognised.
+            #
+            # Imported here rather than at module level on purpose: several tests
+            # lift this handler out of main.py by AST and exec only the selected
+            # definitions, so a module global would be undefined there -- a
+            # NameError on every POST, including ordinary JSON-RPC.
+            try:
+                from common import file_intake as _file_intake
+            except ImportError:  # a checkout without common/ on the path
+                _file_intake = None
+            if _file_intake is not None and _file_intake.serve_upload(self):
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:
@@ -461,12 +473,6 @@ def main():
     slam_client.Init()
     print("[bundle] SlamClient ready")
 
-    # MotionSwitcherClient
-    msc_client = MotionSwitcherClient()
-    msc_client.SetTimeout(5.0)
-    msc_client.Init()
-    print("[bundle] MotionSwitcherClient ready")
-
     # ROS2
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
@@ -479,7 +485,7 @@ def main():
         smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
         print("[bundle] SmartMotion safety harness active (subprocess)")
 
-    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion, network_iface=network_iface)
+    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, smart_motion=smart_motion, network_iface=network_iface)
     _bundle.start_all()
 
     def _spin():

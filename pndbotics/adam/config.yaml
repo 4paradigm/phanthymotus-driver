@@ -19,6 +19,11 @@ plugins:
   state:
     enabled: true
     publish_rate_hz: 50
+    battery_pac:
+      # Reuse the configured PAC origin; optional url overrides it.
+      # Live PAC messages arrive about once per second; tolerate brief gaps.
+      stale_after_sec: 10
+      reconnect_sec: 2
   estop:
     enabled: true
     poll_rate_hz: 2

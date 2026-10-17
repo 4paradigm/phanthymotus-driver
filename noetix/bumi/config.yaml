@@ -38,6 +38,8 @@ plugins:
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
   mic:
     enabled: true
+  sound_direction:
+    enabled: true
   speaker:
     enabled: true
   camera:

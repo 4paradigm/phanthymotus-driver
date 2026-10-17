@@ -1046,6 +1046,7 @@ def _mic_subprocess(namespace: str):
     frame_count = 0
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
+    buffer_start_us = 0
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
 
     while True:
@@ -1064,14 +1065,22 @@ def _mic_subprocess(namespace: str):
             mono = _np.clip(mono.astype(_np.int32) * 50, -32768, 32767).astype(_np.int16)
 
             # Accumulate until we have enough for a proper chunk
+            if len(buffer) == 0:
+                timestamp_us = getattr(audio, 'timestamp_us', 0)
+                buffer_start_us = (timestamp_us if type(timestamp_us) is int
+                                   and 1_000_000_000_000_000 <= timestamp_us < 10_000_000_000_000_000 else 0)
             buffer = _np.concatenate([buffer, mono])
 
             if len(buffer) >= MIN_CHUNK_SAMPLES:
                 msg = _AudioChunk()
                 msg.format = "pcm_16k_16bit_mono"
                 msg.data = buffer.tobytes()
+                if buffer_start_us:
+                    msg.header.stamp.sec = buffer_start_us // 1_000_000
+                    msg.header.stamp.nanosec = (buffer_start_us % 1_000_000) * 1000
                 pub.publish(msg)
                 buffer = _np.array([], dtype=_np.int16)
+                buffer_start_us = 0
 
                 frame_count += 1
                 if frame_count % 200 == 0:

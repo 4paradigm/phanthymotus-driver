@@ -146,6 +146,62 @@ Two formats are cleared automatically and need no marking, because their values
 only mean something on the machine they were set on: `channel-select` (a local
 channel id) and `audio-input-device` (a local sound-card device).
 
+#### Showing a QR code (`"format": "qr"`)
+
+When a plugin needs the user to do something with a phone — install a companion
+app, point an app at this robot to pair it — declare a `qr` field. The dashboard
+renders a row of options and a QR code for the selected one, inside this tool's
+own config form (the sidebar gear for `shared` scope, the card gear for
+`instance` scope).
+
+```python
+"configSchema": {
+    "type": "object",
+    "properties": {
+        "install": {
+            "type": "string",
+            "format": "qr",
+            "description": "扫码安装手机 App",
+            "x-qr-options": [
+                {"label": "iOS",     "url": "https://apps.apple.com/app/id123"},
+                {"label": "Android", "url": "{origin}/downloads/motus.apk"},
+                {"label": "配网",    "url": "motus://setup?h={host}&p={port}"},
+            ],
+        },
+    },
+}
+```
+
+**The field is display-only.** It collects nothing, never appears in the saved
+config, and does not count towards "configured" — a tool whose only field is a
+QR will not show the unconfigured warning. Do not put it in `required`.
+
+Four placeholders are substituted, and nothing else (an unrecognised `{name}` is
+left alone rather than silently emptied):
+
+| Placeholder | Becomes |
+|-------------|---------|
+| `{host}`   | This machine's LAN address, from `GET /api/network/reachable` |
+| `{port}`   | The port the dashboard is served on |
+| `{scheme}` | `http` or `https` |
+| `{origin}` | `{scheme}://{host}:{port}` |
+
+`{host}` is a **network-interface address, not `location.host`**. A browser open
+on the robot itself sees `localhost`, and over an SSH tunnel `127.0.0.1`; either
+one baked into a QR gives the phone a link it cannot dial, with no error to
+explain why. On a multi-homed robot the user gets a pill row to pick the
+interface — shown only for options that actually reference `{host}`/`{origin}`.
+
+**`{token}` is refused.** A template containing it renders an error in place of
+the code instead of the code. The access token drives motors, and `configSchema`
+is written by the driver author — it does not get to decide who receives that
+key. The one QR that carries it is the built-in 我的 → 手机接入 card, which is
+covered by default and auto-hides.
+
+Hosting the file is the driver image's own business: agent-core serves its whole
+`./web` directory at `/` with no auth, so a file the image drops there is
+reachable at `{origin}/…` with no work on the agent-core side.
+
 ---
 
 ## x-action-params Specification
@@ -556,6 +612,7 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `data/json` | Text / KV panel | `hint === 'data/json'` |
 | `text/*` | Text display | `hint.startsWith('text/')` |
 | `sensor/skeleton` | 3D Skeleton (URDF) | `hint === 'sensor/skeleton'` |
+| `sensor/pose2d` | 2D human skeleton | `hint === 'sensor/pose2d'` |
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
@@ -598,6 +655,48 @@ topic_out:
   - topic: /{namespace}/camera/depth
     format: image/depth-zlib
 ```
+
+### 2D Human Pose Rendering (`sensor/pose2d`) — Full Spec
+
+Note this is a different thing from `sensor/skeleton` above, and the names are
+close enough to pick the wrong one. `sensor/skeleton` is **the robot's own
+body**: a URDF plus joint angles, drawn in 3D. `sensor/pose2d` is **people the
+robot is looking at**: COCO-17 image-space keypoints, drawn flat over the frame.
+A quadruped publishing its legs wants `sensor/skeleton`; a camera plugin
+detecting a person wants `sensor/pose2d`.
+
+The payload is one JSON object per frame. `persons` is the only required key —
+a message without it is dropped, and an empty list is the correct way to say
+"nobody in frame" (which clears the overlay):
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `persons` | **yes** | one entry per detected person, see below |
+| `image_size` | no | `[width, height]` of the source frame. Without it the renderer infers an extent from the keypoints, which drifts as people move — send it |
+| `count` | no | defaults to `persons.length` |
+| `keypoint_names` | no | names in keypoint order; defaults to COCO-17 |
+| `skeleton` | no | bone list as index pairs; defaults to the COCO-17 skeleton |
+
+Each entry in `persons`:
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `keypoints` | **yes** | `[[x, y, v], ...]` in **pixels**, in `keypoint_names` order. `v` is visibility/confidence; `[x, y]` is accepted and counts as fully visible |
+| `id` | no | track id — keeps one person's colour stable across frames. Defaults to `0`, so omitting it on a multi-person stream makes everyone the same colour |
+| `posture` | no | the shape the body is in (`standing`, `sitting`, `lying`, ...). Everybody has one |
+| `activity` | no | what they are doing (`hand waving`, `falling down`, ...). Legitimately absent — not every frame supports a verdict |
+| `posture_confidence` | no | 0..1, shown beside the label when present |
+| `bbox` | no | `[x1, y1, x2, y2]` in pixels |
+
+Two channels rather than one label, because they answer different questions and
+degrade independently: a posture is geometric and always available, an activity
+needs a time window and may abstain. The renderer draws the activity when there
+is one and falls back to the posture, so a driver that can only do postures
+still renders correctly. `falling down` and `lying` are drawn in the alert
+colour.
+
+Do **not** clip keypoints to the frame: an off-image wrist is real information,
+and the renderer handles out-of-bounds points.
 
 ### Skeleton Rendering (`sensor/skeleton`) — Full Spec
 
@@ -1085,6 +1184,115 @@ def _nav_poll_thread(self, action_id, target, stall_timeout=60):
 - Tools without `x-resource` → treated as exclusive against **everything** (old global
   barrier behaviour). Safe, but see "Declare it on *every* acting tool" below: a
   partially-declared driver is the case that behaves worst.
+
+---
+
+## File Arguments (`format: file`) and `POST /file/upload`
+
+A tool that needs a file — a trajectory to replay, an audio clip to play, a photo
+to enrol — cannot be handed a path. agent-core serves the browser and holds the
+canvas; this driver runs in a **different container**, and they share no
+filesystem: agent-core mounts `/opt/phanthy-motus`, every bundle's WORKDIR is
+`/work`, and each container's `/tmp` is its own. A path minted on one side means
+nothing on the other.
+
+### Declaring the parameter
+
+Mark it in the tool's `inputSchema`:
+
+```python
+"trajectory": {
+    "type": "string",
+    "format": "file",          # → the canvas renders a file picker
+    "accept": ".jsonl,.zip",   # → picker filter
+    "uploadTo": "mcp",         # → route the upload to *this* service
+    "description": "...",
+},
+```
+
+`uploadTo: "mcp"` is the important one. Omit it and the browser uploads into
+agent-core's own `/tmp/uploads`, which is correct only for a tool agent-core
+serves itself and invisible here.
+
+### Receiving it
+
+`common/file_intake.py` implements the whole endpoint. Wiring is the first thing
+in `do_POST`:
+
+```python
+def do_POST(self):
+    try:
+        from common import file_intake as _file_intake
+    except ImportError:
+        _file_intake = None
+    if _file_intake is not None and _file_intake.serve_upload(self):
+        return
+    ...the bundle's existing JSON-RPC handling...
+```
+
+All 15 HTTP bundles carry exactly this. Four properties of that snippet are
+load-bearing, and `tests/test_file_upload_endpoint.py` asserts each one across
+every bundle:
+
+| Property | Why |
+| --- | --- |
+| **Before `self.rfile.read(...)`** | that read consumes the stream the upload needs, and the upload then sees an empty body |
+| **Before any `self.path not in ("/mcp", ...)` check** | five bundles check the path first and would 404 the upload before recognising it |
+| **Imported inside `do_POST`, not at module level** | several tests lift `make_handler` out of `main.py` by AST and exec only the selected definitions, so a module global is undefined there — and the symptom is a `NameError` on *every* POST, ordinary JSON-RPC included |
+| **`serve_upload` writes its own response** | the 15 bundles spell "send a response" three different ways (`_send`, `_send_json`, raw `send_response`); the glue must not know which |
+
+`serve_upload` is also inert rather than fatal on a handler that has no `.path`:
+this repo's tests construct handlers with `cls.__new__(cls)` and set only the
+attributes a case needs, so a `BaseHTTPRequestHandler` invariant does not hold
+there — and this code runs ahead of every POST.
+
+### The contract
+
+```
+POST /file/upload
+  multipart/form-data: file=<the file>, subdir=<optional>
+  header: X-Access-Token: <ACCESS_TOKEN>   (when the bundle has one)
+→ 200 {"ok": true, "path": "/work/uploads/2026-10-16/trajectory.jsonl", "bytes": N}
+→ 4xx {"ok": false, "error": "..."}
+```
+
+`path` is absolute **inside this container**, and that is the entire point: the
+caller passes it back verbatim as the tool argument. agent-core resolves this
+service's address from the MCP registry (every bundle reports `url` when it
+registers, so the port is already known) and rewrites the argument after the
+upload — see `mcp_client._transfer_file_args` there.
+
+Defaults: 64 MiB per upload, landing under `/work/uploads` (override with
+`FILE_INTAKE_DIR`), pruned after 7 days. The uploader controls the filename, so
+it is sanitised and confined — it decides nothing about *where* the file goes.
+
+`ACCESS_TOKEN` is read from the environment, else from `/opt/phanthy-motus/.env`
+or `/work/.env`. Empty disables the check, mirroring agent-core's own behaviour,
+so a development deployment works untouched. A write-anything endpoint on a
+host-network container is worth gating even though the `tools/call` next to it is
+not: an MCP call is bounded by the tool schema, an upload only by the disk.
+
+### Why not the alternatives
+
+- **base64 through the tool call.** Tried, and it failed in production: a 43,800
+  character string does not survive an LLM's context, and what arrived was
+  truncated.
+- **A shared host mount.** Works, but needs every participating container
+  recreated (Docker fixes mount type at creation), one host directory per
+  pairing, and leaves the path ambiguous.
+- **A bespoke chunked transfer over `tools/call`.** This is what the skill-package
+  work in agent-core had to do *because this endpoint did not exist in any
+  driver yet*: `package_begin` / `package_write` / `package_finish`, 24 KiB of
+  base64 per call, with its own offset and checksum bookkeeping on both sides.
+  It works, but it is a second transport for the same job. Prefer
+  `format: file`; reach for a chunked protocol only when the device genuinely
+  needs to address the artifact by its own handle afterwards.
+
+`common/file_intake.py` is a deliberate copy of
+`phanthymotus/perception/utils/file_intake.py`. Both repos implement the same
+wire contract against this document rather than sharing a package — the same
+rule as `motus.vla/1`. The module was written stdlib-only *so* the drivers could
+use it; this change is the drivers finally doing so.
 
 ---
 
