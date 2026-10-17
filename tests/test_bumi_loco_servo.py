@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -243,6 +245,9 @@ def test_a_deadband_at_or_above_its_ceiling_is_refused():
     with pytest.raises(loco_servo.CalibrationError) as excinfo:
         loco_servo.Calibration({"min_vx_mps": 0.6, "full_scale_vx_mps": 0.5})
     assert "min_vx_mps" in str(excinfo.value)
+    with pytest.raises(loco_servo.CalibrationError) as excinfo:
+        loco_servo.Calibration({"min_wz_moving_rads": 0.83})
+    assert "min_wz_moving_rads" in str(excinfo.value)
 
 
 def test_an_unknown_calibration_source_is_refused():
@@ -607,6 +612,90 @@ def test_clearing_dry_run_hands_a_live_stream_to_the_motors():
     _sink(card).submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))
     assert len(loco.published) == 1
 
+
+
+def test_enabling_dry_run_stops_the_chassis_before_disabling_output():
+    """The emergency switch must send zero while SDK output is still enabled."""
+    loco = FakeLoco()
+    card = _card(loco=loco, full_scale_vx_mps=0.5)
+    _sink(card).submit(_command([0.1, 0, 0, 0, 0, 0]))
+
+    card.dispatch("config", {"dry_run": True})
+
+    assert card._dry_run is True
+    assert card._target == (0.0, 0.0, 0.0)
+    assert loco.published[-1] == (0.0, 0.0, 0.0)
+
+
+def test_resume_refuses_while_explicit_loco_move_owns_the_chassis():
+    loco = FakeLoco(moving=True)
+    card = _card(loco=loco)
+    card._running = True
+    assert card.pause_for_explicit_command("loco.move") is True
+    assert card.set_explicit_velocity_owner(True) is True
+
+    result = card.dispatch("resume", {})
+
+    assert result["state"] == "paused"
+    assert card._paused is True
+    assert card._explicit_velocity_owner is True
+
+
+def test_stop_cancels_a_start_blocked_while_opening():
+    """A late open must not create a publisher after stop reports idle."""
+    class Executor:
+        def remove_node(self, node):
+            node.removed = True
+
+    class Node:
+        removed = False
+        destroyed = False
+
+        def destroy_node(self):
+            self.destroyed = True
+
+    card = _card(loco=FakeLoco())
+    card._executor = Executor()
+    opened, release = threading.Event(), threading.Event()
+    node = Node()
+
+    def blocked_open(_topic):
+        opened.set()
+        assert release.wait(timeout=1)
+        return node
+
+    card._open = blocked_open
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(card.dispatch("start", {"input_topic": "/nav/cmd"})))
+    worker.start()
+    assert opened.wait(timeout=1)
+    assert card.dispatch("stop", {}) == {"state": "idle"}
+    release.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert card._running is False
+    assert card._repeat_thread is None
+    assert node.removed and node.destroyed
+    assert result[0]["state"] == "idle"
+
+
+def test_infinite_calibration_values_are_rejected():
+    with pytest.raises(loco_servo.CalibrationError, match="finite"):
+        loco_servo.Calibration({"full_scale_vx_mps": math.inf})
+    with pytest.raises(loco_servo.CalibrationError, match="finite"):
+        loco_servo.Calibration({"min_wz_rads": -math.inf})
+
+
+def test_dry_run_logs_only_the_first_of_distinct_targets(capsys):
+    card = _card(loco=FakeLoco(), dry_run=True)
+    sink = _sink(card)
+    capsys.readouterr()
+    for sequence, vx in enumerate((0.1, 0.2, 0.3), start=1):
+        sink.submit(_command([vx, 0, 0, 0, 0, 0], seq=sequence))
+
+    assert capsys.readouterr().out.count("DRY RUN vx=") == 1
 
 def test_config_only_touches_keys_that_were_sent():
     """A form rendering an unchecked box for a field nobody set would otherwise

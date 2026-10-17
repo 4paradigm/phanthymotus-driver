@@ -50,6 +50,7 @@ outranks a running policy, never the other way round.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 
@@ -168,6 +169,9 @@ class Calibration:
                 value = float(raw)
             except (TypeError, ValueError):
                 raise CalibrationError(f"loco_servo.{key} must be a number, got {raw!r}")
+            if not math.isfinite(value):
+                raise CalibrationError(
+                    f"loco_servo.{key} must be finite, got {value!r}")
             if not value > 0:
                 # Zero is rejected rather than read as "no limit". A full scale
                 # of zero would divide by zero; a deadband of zero would claim
@@ -192,6 +196,7 @@ class Calibration:
             ("vx", "min_vx_mps", "full_scale_vx_mps"),
             ("vy", "min_vy_mps", "full_scale_vy_mps"),
             ("wz", "min_wz_rads", "full_scale_wz_rads"),
+            ("wz while walking", "min_wz_moving_rads", "full_scale_wz_rads"),
         ):
             if values[floor] >= values[ceiling]:
                 # A floor at or above the ceiling leaves exactly one commandable
@@ -393,6 +398,8 @@ class LocoServoPlugin:
         self._repeat_stop = threading.Event()
         self._published = 0
         self._last_dry_run_target = None
+        self._dry_run_log_count = 0
+        self._lifecycle_token = 0
 
         if loco_plugin is not None and hasattr(loco_plugin, "attach_servo"):
             # Lets every call-shaped card pause this one before it acts.
@@ -516,8 +523,18 @@ class LocoServoPlugin:
                     continue
                 new = bool(args[key])
                 attr = f"_{key}"
-                if getattr(self, attr) != new:
+                old = getattr(self, attr)
+                if old != new:
                     changed[key] = new
+                    if key == "dry_run" and new and not old:
+                        # This is an emergency transition: emit zero before
+                        # disabling SDK output, while the repeat loop is held.
+                        was_moving = self._target != (0.0, 0.0, 0.0)
+                        self._target = (0.0, 0.0, 0.0)
+                        self._last_dry_run_target = None
+                        self._dry_run_log_count = 0
+                        if was_moving:
+                            self._publish(0.0, 0.0, 0.0)
                 setattr(self, attr, new)
             state = ("running" if self._running and not self._paused else
                      "paused" if self._running else "idle")
@@ -575,17 +592,32 @@ class LocoServoPlugin:
             self._holds = 0
             self._published = 0
             self._target = (0.0, 0.0, 0.0)
-        self._set_activity("waiting", "started", "waiting for a valid command")
+            self._lifecycle_token += 1
+            token = self._lifecycle_token
 
         try:
-            self._open(topic)
+            node = self._open(topic)
         except Exception as exc:                              # noqa: BLE001
             with self._lock:
-                self._running = False
-                self._sink = None
+                if self._lifecycle_token == token:
+                    self._running = False
+                    self._sink = None
             return {"state": "error", "message": f"启动失败: {exc}"}
 
-        self._start_repeat()
+        with self._lock:
+            cancelled = not self._running or self._lifecycle_token != token
+            if not cancelled:
+                self._sub_node = node
+                # Publish-thread registration is part of startup. Holding the
+                # lock prevents stop from completing between node setup and
+                # repeat-thread setup.
+                self._start_repeat()
+                self._set_activity("waiting", "started",
+                                   "waiting for a valid command")
+        if cancelled:
+            self._destroy_node(node)
+            return {"state": "idle", "message": "启动已被 stop 取消"}
+
         print(f"[loco_servo] streaming from {topic} "
               f"(dry_run={self._dry_run}, "
               f"calibration={self._calibration.source})", flush=True)
@@ -603,6 +635,11 @@ class LocoServoPlugin:
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
+            if not halted:
+                conflict = self._chassis_conflict()
+                if conflict:
+                    return {"state": "paused", "message": conflict,
+                            "input": self._input_topic}
             self._paused = bool(halted)
             if not halted:
                 self._explicit_velocity_owner = False
@@ -624,6 +661,7 @@ class LocoServoPlugin:
                 return {"state": "idle"}
             self._running = False
             self._paused = False
+            self._lifecycle_token += 1
             sink, node = self._sink, self._sub_node
             self._sink = None
             self._sub_node = None
@@ -638,12 +676,7 @@ class LocoServoPlugin:
         # robot walking with nothing left in the process to stop it.
         self._publish_zero()
 
-        if node is not None:
-            try:
-                self._executor.remove_node(node)
-                node.destroy_node()
-            except Exception:                                 # noqa: BLE001
-                pass
+        self._destroy_node(node)
         del sink
         # Actuator lifecycle: a successfully torn-down stream is idle and may
         # be started again.  ``stopped`` is not a lifecycle state understood by
@@ -791,8 +824,16 @@ class LocoServoPlugin:
         node = Node(f"bumi_loco_servo_{abs(hash(topic)) % 100000}")
         node.create_subscription(String, topic, self._on_message, 1)
         self._executor.add_node(node)
-        with self._lock:
-            self._sub_node = node
+        return node
+
+    def _destroy_node(self, node):
+        if node is None:
+            return
+        try:
+            self._executor.remove_node(node)
+            node.destroy_node()
+        except Exception:                                     # noqa: BLE001
+            pass
 
     def _on_message(self, message):
         try:
@@ -981,13 +1022,15 @@ class LocoServoPlugin:
             if self._dry_run:
                 if target != self._last_dry_run_target:
                     self._last_dry_run_target = target
-                    print(
-                        f"[loco_servo] DRY RUN vx={vx:+.3f} m/s "
-                        f"vy={vy:+.3f} m/s wz={wz:+.3f} rad/s "
-                        f"-> publish_cmd({target[0]:+.3f}, "
-                        f"{target[1]:+.3f}, {target[2]:+.3f})",
-                        flush=True,
-                    )
+                    self._dry_run_log_count += 1
+                    if self._dry_run_log_count == 1 or self._dry_run_log_count % 100 == 0:
+                        print(
+                            f"[loco_servo] DRY RUN vx={vx:+.3f} m/s "
+                            f"vy={vy:+.3f} m/s wz={wz:+.3f} rad/s "
+                            f"-> publish_cmd({target[0]:+.3f}, "
+                            f"{target[1]:+.3f}, {target[2]:+.3f})",
+                            flush=True,
+                        )
                 return
 
             self._publish(*target)
@@ -998,6 +1041,7 @@ class LocoServoPlugin:
             self._holds += 1
             self._target = (0.0, 0.0, 0.0)
             self._last_dry_run_target = None
+            self._dry_run_log_count = 0
 
             if self._dry_run:
                 print("[loco_servo] DRY RUN hold: publish_cmd(0, 0, 0)",
