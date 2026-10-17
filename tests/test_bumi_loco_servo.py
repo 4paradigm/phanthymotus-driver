@@ -114,6 +114,20 @@ def _sink(card):
                        on_watchdog=card._hold, on_abort=card._hold)
 
 
+def test_json_nan_command_is_rejected_before_bumi_velocity_conversion():
+    """Python's JSON decoder accepts NaN, but it must not reach publish_cmd."""
+    loco = FakeLoco()
+    card = _card(loco=loco)
+    card._sink = _sink(card)
+    card._running = True
+    command = _command([float("nan"), 0, 0, 0, 0, 0])
+
+    card._on_message(SimpleNamespace(data=json.dumps(command)))
+
+    assert loco.published == []
+    assert card._last_command["verdict"] == "REJECTED"
+
+
 def _stream_submit(card, command, sink=None):
     """Deliver a command through the same path as the ROS subscription."""
     sink = sink or _sink(card)
