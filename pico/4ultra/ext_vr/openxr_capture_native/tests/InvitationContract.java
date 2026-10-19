@@ -11,7 +11,11 @@ public final class InvitationContract {
         JSONObject test = new JSONObject(new String(System.in.readAllBytes(), StandardCharsets.UTF_8));
         JSONObject invitation = ConnectionInvitation.parse(test.getString("uri"));
         if (test.getString("mode").equals("parse")) {
-            System.out.println(invitation.getString("endpoint"));
+            if (ConnectionInvitation.needsForget(invitation, "")
+                || ConnectionInvitation.needsForget(invitation, invitation.getString("device_id"))
+                || !ConnectionInvitation.needsForget(invitation, "other-robot"))
+                throw new AssertionError("replacement decision");
+            System.out.println("PARSED");
             return;
         }
         Class<?> channelClass = Class.forName("com.phanthymotus.capture.ConnectionActivity$PairChannel");

@@ -43,15 +43,7 @@ class ExtVrPlugin:
         return {
             "name": self.PREFIX,
             "type": "sensor",
-            "description": (
-                "安装与配对：部署 PICO 和机器人遥操 Driver；首次设置四位管理 PIN 并保存。"
-                "扫码或复制链接安装 App，在网页配对。下载无需 PIN；连接 teleop_control 后开启项目。\n\n"
-                "G1 基准与接通：松开双 Grip（握把），确认机器人和操作者双臂自然下垂，长按 X+A 一秒。"
-                "松键后重新双握接通，松开任一 Grip 暂停。\n\n"
-                "G1 复位：松开双 Grip，长按 Y+B 一秒；现场确认复位完成、双臂下垂后，再按 X+A 建立基准。"
-                "两组组合键在遥操和错误状态下仍可使用；不会自动恢复遥操。\n\n"
-                "显示与安全：头显显示双骨架及误差，误差不作为 G1 接通条件。本卡只采集输入，不直接执行机器人动作。"
-            ),
+            "description": "VR 遥操：捕获手柄位置和按键输入。",
             "multiInstance": False,
             "inputSchema": {
                 "type": "object",
@@ -70,7 +62,12 @@ class ExtVrPlugin:
                 "properties": {
                     "install": {
                         "type": "string", "format": "qr", "scope": "instance",
-                        "description": "扫码打开 PICO App 下载与配对页",
+                        "title": "安装与配对",
+                        "description": ("请在 PICO 浏览器打开此链接。下载安装 App 后返回网页配对；下载无需 PIN。\n"
+                                        "开始使用：连接 teleop_device → teleop_control，再启动智能控制。\n"
+                                        "松开双握把，确认双方双臂下垂，长按 X+A 一秒；松键后重新双握接通。\n"
+                                        "结束本轮：松开双握把，长按 Y+B 一秒；请求发送成功后现场确认复位。"
+                                        "保留智能控制，下次遥操再建立基准。"),
                         "x-qr-options": [{
                             "label": "下载与配对",
                             "url": f"https://{{host}}:{self.config.get('port', 15741)}/onboarding",
@@ -311,6 +308,9 @@ class ExtVrPlugin:
                 "management_pin_configured": item["server"].management_pin.configured,
             }
         if action == "start":
+            if not item["server"].management_pin.configured:
+                return {"state": "error", "code": "management_pin_not_configured",
+                        "error": "尚未完成配置，请在 teleop_device 齿轮中设置四位管理 PIN 并保存。"}
             if not runtime.running:
                 if self.transport_factory:
                     item["transport"] = self.transport_factory(

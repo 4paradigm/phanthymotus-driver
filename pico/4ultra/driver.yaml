@@ -7,7 +7,7 @@ image_name: 4ultra
 port: 15742
 mcp_port: 15742
 mcp_url: "http://localhost:15742/mcp"
-description: "PICO 设备安装、配对、双手柄采集和单向遥操输入"
+description: "VR 遥操：捕获手柄位置和按键输入。"
 build_context_extras:
   - ../../common
 cards:

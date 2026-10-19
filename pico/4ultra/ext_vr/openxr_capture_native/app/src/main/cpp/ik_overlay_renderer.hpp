@@ -16,7 +16,7 @@ class IkOverlayRenderer {
     if(vao_)glDeleteVertexArrays(1,&vao_);
     program_=buffer_=vao_=0;
   }
-  void Draw(const IkVisualization& value,const XrView& eye,const XrPosef& center,bool connected,bool show_model=false) {
+  void Draw(const IkVisualization& value,const XrView& eye,const XrPosef& center,bool connected,bool show_model=false,bool assigned=true) {
     if(!program_) Initialize();
     std::vector<float> vertices, text_outline, text_fill;
     auto* destination=&vertices;
@@ -77,25 +77,28 @@ class IkOverlayRenderer {
     std::size_t measured_begin=0,measured_count=0;
     if(show_model) {
     if(value.teleop || !value.available){
-      text(value.control_label(),-.34f,.39f,value.control_fresh() && value.state=="active"?green:
+      text(value.control_label(connected,assigned),-.34f,.39f,value.control_fresh() && value.state=="active"?green:
         value.control_fresh() && value.state!="fault" && value.state!="error"?orange:pink);
-      text(value.control_hint(),-.34f,.62f,gray,3);
-      if(value.fresh() && value.feedback_fresh && value.alignment_state!="unavailable"){
+      text(value.control_hint(connected,assigned),-.34f,.62f,gray,3);
+      if(connected && assigned && value.control_fresh() && (value.state=="hold" || value.state=="fault" || value.state=="error"))
+        text("原因："+value.control_reason,-.34f,-.60f,pink,2);
+      if(connected && assigned && value.fresh() && value.feedback_fresh && value.alignment_state!="unavailable"){
         for(int i=0;i<2;++i){
-          char error[48];std::snprintf(error,sizeof(error),"%s %d MM  %d DEG",i==0?"L":"R",
+          char error[48];std::snprintf(error,sizeof(error),"%s %d 毫米  %d 度",i==0?"左":"右",
             static_cast<int>(std::round(value.position_error_m[i]*1000)),
             static_cast<int>(std::round(value.orientation_error_rad[i]*180/3.141592653589793)));
           text(error,-.34f,.48f-i*.04f,gray);
         }
       }
     }
-    text("ROBOT REAR VIEW",-.34f,.34f,gray);
-    text("LEFT",-.23f,-.08f,gray);text("RIGHT",.16f,-.08f,gray);
-    if(!value.available || (!value.fresh() && !value.tianyi)){
-      text("NO ARM PREVIEW",-.16f,.08f,gray);
+    text(value.teleop || !value.available ? "机器人背面视角" : "ROBOT REAR VIEW",-.34f,.34f,gray);
+    text(value.teleop || !value.available ? "左臂" : "LEFT",-.23f,-.08f,gray);text(value.teleop || !value.available ? "右臂" : "RIGHT",.16f,-.08f,gray);
+    if((value.teleop && (!connected || !assigned)) || !value.available || (!value.fresh() && !value.tianyi)){
+      text(value.teleop || !value.available ? "暂无手臂预览" : "NO ARM PREVIEW",-.16f,.08f,gray);
     }else{
       if(!value.teleop)text(value.mode+" / "+value.state,-.34f,.30f,gray);
-      text("MEASURED",-.34f,.25f,green);text("MAPPED TARGET",-.10f,.25f,orange);
+      if(!value.teleop)text("MEASURED",-.34f,.25f,green);
+      text(value.teleop ? "橙色：映射目标" : "MAPPED TARGET",-.10f,.25f,orange);
       // Fixed orientation reference, not tracked torso/head feedback.
       auto body=[&](IkPoint a,IkPoint b){line(model(a),model(b),gray);};
       if(value.tianyi){
@@ -114,7 +117,7 @@ class IkOverlayRenderer {
       body({0,-.06f,.45f},{0,-.06f,.37f});
       body({0,-.06f,.37f},{0,-.045f,.34f});
       }
-      text("BODY REFERENCE",-.13f,-.36f,gray);
+      text(value.teleop ? "身体方向参照" : "BODY REFERENCE",-.13f,-.36f,gray);
       // Calibrated outer bounds are an aid, never a solid reachable volume.
       const IkPoint boundary{.25f,.45f,.5f};
       for(const auto& box:value.workspace_bounds){
@@ -125,29 +128,29 @@ class IkOverlayRenderer {
       }
       if(!value.workspace_bounds.empty())text("OUTER SAFETY BOUNDS",-.34f,-.55f,boundary);
       auto draw=[&](const IkChains& chains,IkPoint color){for(const auto& chain:chains)for(std::size_t i=1;i<chain.size();++i)line(model(chain[i-1]),model(chain[i]),color);};
-      if(value.fresh() && value.feedback_fresh){
+      if(!value.teleop && value.fresh() && value.feedback_fresh){
         measured_begin=vertices.size()/8;
         draw(value.measured,green);
         measured_count=vertices.size()/8-measured_begin;
       }
-      else text("MEASURED STALE",-.34f,-.47f,pink);
+      else if(!value.teleop)text("MEASURED STALE",-.34f,-.47f,pink);
       double age=value.intent_age_ms+std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-value.received).count();
       if(value.tianyi){
         const bool current=value.current_ik();
         // Keep geometry brightness stable across transient solve failures.
         // Explicit HELD/STALE labels distinguish history from a current result.
-        alpha=value.teleop?.45f:1.f;
+        alpha=1.f;
         draw(value.displayed_ik(),orange);
         alpha=1.f;
         if(!value.teleop && !current && !value.displayed_ik().empty())text("LAST VALID - HELD",-.34f,-.39f,orange);
-        if(!value.fresh())text("NO FRESH DATA",-.16f,.08f,pink);
+        if(!value.fresh())text(value.teleop ? "反馈已过期" : "NO FRESH DATA",-.16f,.08f,pink);
       }
-      if(value.fresh() && age<750){
+      if(value.fresh() && age<(value.teleop?300:750)){
         if(!value.tianyi)draw(value.ik,orange);
         for(auto p:value.targets){auto t=model(p);line({t[0]-.009f,t[1],t[2]},{t[0]+.009f,t[1],t[2]},pink);line({t[0],t[1]-.009f,t[2]},{t[0],t[1]+.009f,t[2]},pink);}
-      }else text("TARGET STALE",-.34f,-.43f,pink);
-      if(!value.reason.empty())text(value.reason,-.34f,-.60f,pink,2);
-      if(value.measured.size()==2)line(model(value.measured[0][0]),model(value.measured[1][0]),gray);
+      }else text(value.teleop ? "目标已过期" : "TARGET STALE",-.34f,-.43f,pink);
+      if(!value.teleop && !value.reason.empty())text(value.reason,-.34f,-.60f,pink,2);
+      if((!value.teleop || (value.fresh() && value.feedback_fresh)) && value.measured.size()==2)line(model(value.measured[0][0]),model(value.measured[1][0]),gray);
     }
     }
     const auto line_count=vertices.size()/8;

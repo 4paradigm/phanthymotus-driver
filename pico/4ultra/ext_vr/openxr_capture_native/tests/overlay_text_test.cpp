@@ -32,4 +32,17 @@ int main() {
       assert(x>=0 && x+glyph.advance<=50 && y==0);
     });
   }
+  count=0;
+  assert(LayoutOverlayText("松开双握把，长按 X+A 一秒",566,3,[&](const OverlayGlyph& glyph,int,int){
+    assert(&glyph!=&OverlayCharacter('?')); ++count;
+  }));
+  assert(count==15);
+  for(const auto& hint:{"请求已发送，请现场确认复位。下次遥操再按 X+A 建立基准",
+      "松开任一握把暂停；结束本轮时松开双握把，长按 Y+B 一秒",
+      "请查看错误原因；复位请求失败时不可视为本轮已结束"})
+    assert(LayoutOverlayText(hint,566,3,[](const OverlayGlyph& glyph,int,int){assert(&glyph!=&OverlayCharacter('?'));}));
+  for(const std::string malformed:{"\xff", "\xe4", "\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80"})
+    LayoutOverlayText(malformed,50,1,[](const OverlayGlyph& glyph,int x,int y){assert(x+glyph.advance<=50 && y==0);});
+  assert(!LayoutOverlayText("中文",1,1,[](const OverlayGlyph&,int,int){assert(false);}));
+
 }

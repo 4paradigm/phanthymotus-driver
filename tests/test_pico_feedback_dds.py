@@ -45,7 +45,8 @@ def test_dds_feedback_reaches_headset_socket_and_stop_invalidates_it(tmp_path):
     })
     plugin = ExtVrPlugin(config, "pico", ros2=executor)
     try:
-        plugin.dispatch("start", {"instance_id": "test-vr"})
+        plugin.dispatch("config", {"instance_id": "test-vr", "management_pin": "0412"})
+        assert plugin.dispatch("start", {"instance_id": "test-vr"})["state"] != "error"
         item = plugin.instances["test-vr"]
         invitation = asyncio.run_coroutine_threadsafe(item["manager"].create_pairing(), plugin.loop).result(3)
 

@@ -850,7 +850,7 @@ void OpenXrCapture::RenderProjection(
       center.position.y=(views[0].pose.position.y+views[1].pose.position.y)*.5f;
       center.position.z=(views[0].pose.position.z+views[1].pose.position.z)*.5f;
     }
-    overlay_.Draw(visualization_,views[index],center,paired_connected_,true);
+    overlay_.Draw(visualization_,views[index],center,paired_connected_,true,assigned_);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &framebuffer);
 

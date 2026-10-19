@@ -46,23 +46,39 @@ struct IkVisualization {
     return teleop && !state.empty() && feedback_age_ms + std::chrono::duration<double,std::milli>(
       std::chrono::steady_clock::now()-received).count() < 750;
   }
-  std::string control_label() const {
-    if(!control_fresh())return "NO ROBOT FEEDBACK";
-    if(control_reason=="waiting_baseline_confirmation")return "CONFIRM ARMS DOWN";
-    if(control_reason=="release_buttons_then_regrip")return "RELEASE BUTTONS";
-    if(control_reason=="regrip_required")return "GRIP TO START";
-    if(control_reason=="resetting")return "RESETTING ARMS";
-    if(state=="active")return "ACTIVE";
-    if(state=="hold" || state=="fault" || state=="error")return "STOPPED";
-    return "WAITING FOR ROBOT";
+  bool reset_request_sent{false};
+  bool reset_failed() const {
+    return control_reason.starts_with("reset_") || control_reason=="release_sdk_error"
+      || control_reason=="release_timeout" || control_reason=="release_action_stop_unconfirmed";
   }
-  std::string control_hint() const {
-    if(!control_fresh())return "";
-    if(control_reason=="waiting_baseline_confirmation")return "GRIPS OFF  HOLD X AND A 1 SEC";
-    if(control_reason=="release_buttons_then_regrip")return "THEN PRESS BOTH GRIPS";
-    if(control_reason=="resetting")return "WAIT THEN CONFIRM ARMS DOWN";
-    if(state=="hold" || state=="fault" || state=="error")return control_reason;
-    return "GRIPS OFF  HOLD Y AND B 1 SEC TO RESET";
+  std::string control_label(bool connected=true, bool assigned=true) const {
+    if(!connected)return "等待设备连接";
+    if(!assigned)return "尚未启动智能控制";
+    if(!control_fresh())return !teleop || reason=="feedback_unavailable" ? "等待机器人反馈" : "机器人反馈已失效";
+    if(control_reason=="waiting_baseline_confirmation")return reset_request_sent ? "复位请求已发送" : "准备建立基准";
+    if(control_reason=="release_buttons_then_regrip")return "请松开组合键";
+    if(control_reason=="regrip_required")return "双握把接通";
+    if(control_reason=="resetting")return "正在交权与请求复位";
+    if(reset_failed())return "交权或复位未完成";
+    if(state=="active")return "遥操已接通";
+    if(state=="hold")return "遥操已暂停";
+    if(state=="fault" || state=="error")return "遥操异常";
+    return "等待机器人就绪";
+  }
+  std::string control_hint(bool connected=true, bool assigned=true) const {
+    if(!connected)return "请返回 App 检查连接";
+    if(!assigned)return "请在 Canvas 上启动智能控制";
+    if(!control_fresh())return "反馈有效后再按提示操作；当前姿态未知";
+    if(control_reason=="waiting_baseline_confirmation")return reset_request_sent
+      ? "请求已发送，请现场确认复位。下次遥操再按 X+A 建立基准"
+      : "松开双握把，确认双方双臂下垂；长按 X+A 一秒并保持，等待基准准备完成";
+    if(control_reason=="release_buttons_then_regrip")return "松开 X+A 后，重新按下双握把接通";
+    if(control_reason=="regrip_required")return "重新按下双握把接通，松开任一握把暂停";
+    if(control_reason=="resetting")return "请保持松开双握把，等待请求结果；不要移动手臂";
+    if(reset_failed())return "本轮尚未结束；请查看错误原因，处理后松开双握把，再按 Y+B 重试";
+    if(state=="fault" || state=="error")return "请查看错误原因；复位请求失败时不可视为本轮已结束";
+    if(state=="hold")return "松开双握把；需结束本轮时长按 Y+B 一秒请求复位";
+    return "松开任一握把暂停；结束本轮时松开双握把，长按 Y+B 一秒";
   }
   bool current_ik() const {
     return fresh() && intent_age_ms + std::chrono::duration<double,std::milli>(
@@ -110,6 +126,14 @@ inline IkVisualization ParseIkVisualization(const nlohmann::json& envelope) {
     IkVisualization r;r.teleop=teleop;r.tianyi=true;r.unified=true;r.received=std::chrono::steady_clock::now();
     r.mode=envelope.value("mode",std::string("shadow"));r.state=envelope.value("state",std::string{});
     if(envelope.contains("reason") && envelope["reason"].is_string())r.control_reason=envelope["reason"].get<std::string>();
+    if(teleop && envelope.contains("execution") && envelope.at("execution").is_object()) {
+      const auto& execution=envelope.at("execution");
+      // Existing executor receipt acknowledges the request, never the physical pose.
+      r.reset_request_sent=r.state=="ready" && r.control_reason=="waiting_baseline_confirmation"
+        && execution.value("state",std::string{})=="idle"
+        && execution.contains("reason") && execution.at("reason")=="reset_requested"
+        && !execution.value("ownership_held",true) && !execution.value("output_active",true);
+    }
     r.feedback_age_ms=envelope.value("feedback_age_ms",0.0);
     if(!std::isfinite(r.feedback_age_ms)||r.feedback_age_ms<0)throw std::invalid_argument("feedback_age");
     if(!envelope.contains("visualization"))return r;

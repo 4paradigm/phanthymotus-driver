@@ -15,10 +15,18 @@ for (n,label) in labels.enumerated() {
 }
 }
 print("};")
-// Printable ASCII covers status, decimal errors and machine-readable reasons.
-print("struct OverlayGlyph { int advance; std::array<unsigned int,24> rows; };\ninline constexpr std::array<OverlayGlyph,95> kOverlayGlyphs = {{")
+// Keep ASCII diagnostics and exactly the Unicode characters used by the overlay.
+let sourceRoot=URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent()
+var codes=Set(32...126)
+for name in ["ik_visualization.hpp", "ik_overlay_renderer.hpp"] {
+ let source=try String(contentsOf:sourceRoot.appendingPathComponent("app/src/main/cpp/"+name),encoding:.utf8)
+ for scalar in source.unicodeScalars where scalar.value>126 { codes.insert(Int(scalar.value)) }
+}
+let ordered=codes.sorted()
+print("inline constexpr std::array<unsigned int,\(ordered.count)> kOverlayCodepoints = {{"+ordered.map(String.init).joined(separator:",")+"}};")
+print("struct OverlayGlyph { int advance; std::array<unsigned int,24> rows; };\ninline constexpr std::array<OverlayGlyph,\(ordered.count)> kOverlayGlyphs = {{")
 let font=NSFont.systemFont(ofSize:20, weight:.semibold)
-for code in 32...126 {
+for code in ordered {
  let label=String(UnicodeScalar(code)!) as NSString
  let rep=NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:32,pixelsHigh:24,bitsPerSample:8,samplesPerPixel:4,hasAlpha:true,isPlanar:false,colorSpaceName:.deviceRGB,bytesPerRow:128,bitsPerPixel:32)!
  NSGraphicsContext.saveGraphicsState();NSGraphicsContext.current=NSGraphicsContext(bitmapImageRep:rep)

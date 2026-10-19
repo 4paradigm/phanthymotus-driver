@@ -71,11 +71,15 @@ def test_real_mcp_configuration_and_null_error_success(device):
             return json.load(response)
 
     try:
-        started_without_checkbox = call("start")
-        assert not started_without_checkbox["result"]["isError"]
+        rejected = json.loads(call("start")["result"]["content"][0]["text"])
+        assert rejected["state"] == "error" and rejected["code"] == "management_pin_not_configured"
+        item = plugin.instances["test-vr"]
+        assert not item["runtime"].running
+        assert item["transport"] is None and item["task"] is None
         assert not call("stop")["result"]["isError"]
         configured = call(
             "config",
+            management_pin="0412",
             driver_installed=True,
             pairing_admin_password="long fixture password",
         )
@@ -177,6 +181,7 @@ def test_concurrent_core_save_and_start_reapply_are_serialized(device):
     values = {
         "instance_id": "test-vr",
         "driver_installed": True,
+        "management_pin": "0412",
         "pairing_admin_password": "long fixture password",
     }
     # Models Core's fire-and-forget save push overlapping auto-config on start.
@@ -192,6 +197,7 @@ def test_legacy_settings_do_not_override_device_presets(device):
     result = plugin.dispatch("config", {"instance_id": "test-vr", "driver_installed": False,
         "display_name": "old name", "input_filter_ms": 123, "installation_url": "https://old-host/"})
     assert result["config"] == plugin._defaults()
+    plugin.dispatch("config", {"management_pin": "0412"})
     assert plugin.dispatch("start", {"instance_id": "test-vr"})["state"] == "running"
     plugin.dispatch("stop", {"instance_id": "test-vr"})
 

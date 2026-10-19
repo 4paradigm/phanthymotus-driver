@@ -9,6 +9,10 @@ import org.json.JSONObject;
 
 /** The URI fragment is an enrollment capability, never a motion authorization. */
 final class ConnectionInvitation {
+    static boolean needsForget(JSONObject invitation, String pairedIdentity) throws Exception {
+        return !pairedIdentity.isEmpty() && !pairedIdentity.equals(invitation.getString("device_id"));
+    }
+
     static JSONObject parse(String value) throws Exception {
         if (value == null || value.length() > 4096) throw new IllegalArgumentException();
         URI uri = new URI(value);

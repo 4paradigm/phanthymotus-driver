@@ -28,7 +28,7 @@ class OpenXrCapture final {
 
   void Initialize(android_app* app);
   void PollEvents();
-  void SetDevicePanel(bool connected) { paired_connected_ = connected; }
+  void SetDevicePanel(bool connected, bool assigned) { paired_connected_ = connected; assigned_ = assigned; }
   void SetVisualization(const IkVisualization& value) { visualization_ = value; }
 
   // Drives xrWaitFrame/xrBeginFrame/xrEndFrame and returns a controller sample
@@ -70,7 +70,7 @@ class OpenXrCapture final {
 
   IkVisualization visualization_;
   IkOverlayRenderer overlay_;
-  bool paired_connected_{false};
+  bool paired_connected_{false}, assigned_{false};
   XrInstance instance_{XR_NULL_HANDLE};
   XrSystemId system_id_{XR_NULL_SYSTEM_ID};
   XrSession session_{XR_NULL_HANDLE};

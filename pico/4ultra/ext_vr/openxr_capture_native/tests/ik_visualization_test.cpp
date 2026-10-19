@@ -99,10 +99,10 @@ int main(int argc, char** argv){
  auto status_only=ParseIkVisualization(status);
  assert(status_only.control_fresh() && !status_only.available);
  assert(status_only.control_reason=="motion_feedback_stale");
- assert(status_only.control_label()=="STOPPED");
+ assert(status_only.control_label()=="遥操已暂停");
  status_only.received-=std::chrono::milliseconds(51);
  assert(!status_only.control_fresh());
- assert(status_only.control_label()=="NO ROBOT FEEDBACK" && status_only.control_hint().empty());
+ assert(status_only.control_label()=="机器人反馈已失效" && !status_only.control_hint().empty());
  status["visualization"]={{"available",false}};
  assert(ParseIkVisualization(status).control_fresh());
  status["available"]=false;
@@ -132,15 +132,15 @@ int main(int argc, char** argv){
  assert(ParseIkVisualization(feedback).alignment_label()=="NOT ALIGNED");
  feedback["state"]="ready";feedback["reason"]="regrip_required";
  auto regrip=ParseIkVisualization(feedback);
- assert(!regrip.ready() && regrip.control_label()=="GRIP TO START");
+ assert(!regrip.ready() && regrip.control_label()=="双握把接通");
  feedback["reason"]="waiting_baseline_confirmation";
- assert(ParseIkVisualization(feedback).control_label()=="CONFIRM ARMS DOWN");
+ assert(ParseIkVisualization(feedback).control_label()=="准备建立基准");
  feedback["reason"]="release_buttons_then_regrip";
- assert(ParseIkVisualization(feedback).control_label()=="RELEASE BUTTONS");
+ assert(ParseIkVisualization(feedback).control_label()=="请松开组合键");
  feedback["state"]="hold";feedback["reason"]="resetting";
- assert(ParseIkVisualization(feedback).control_label()=="RESETTING ARMS");
+ assert(ParseIkVisualization(feedback).control_label()=="正在交权与请求复位");
  feedback["state"]="active";feedback["reason"]=nullptr;
- assert(ParseIkVisualization(feedback).control_label()=="ACTIVE");
+ assert(ParseIkVisualization(feedback).control_label()=="遥操已接通");
  feedback["alignment"]["state"]="unreachable";
  feedback["visualization"]["ik"]=nlohmann::json::array();
  auto unreachable=ParseIkVisualization(feedback);
@@ -151,4 +151,29 @@ int main(int argc, char** argv){
  UpdateIkVisualization(preview,{{"schema","motus.teleop.feedback/1"},{"available",false},{"reason","feedback_stale"}});
  assert(!preview.available && !preview.ready() && preview.displayed_ik().empty());
  assert(ParseIkVisualization({{"schema","motus.teleop.feedback/1"},{"reason",nullptr}}).alignment_label()=="ALIGNMENT UNAVAILABLE");
+ // Connection and assignment precede any retained robot state.
+ assert(preview.control_label(false,true)=="等待设备连接");
+ assert(preview.control_label(true,false)=="尚未启动智能控制");
+ assert(IkVisualization{}.control_label()=="等待机器人反馈");
+ assert(ParseIkVisualization({{"schema","motus.teleop.feedback/1"},{"available",false},{"reason","feedback_unavailable"}}).control_label()=="等待机器人反馈");
+ assert(ParseIkVisualization({{"schema","motus.teleop.feedback/1"},{"available",false},{"reason","feedback_stale"}}).control_label()=="机器人反馈已失效");
+ nlohmann::json reset={{"schema","motus.teleop.feedback/1"},{"state","ready"},
+   {"reason","waiting_baseline_confirmation"},
+   {"execution",{{"state","idle"},{"reason","reset_requested"},{"ownership_held",false},{"output_active",false}}}};
+ auto journey=ParseIkVisualization(reset);
+ assert(journey.reset_request_sent && journey.control_label()=="复位请求已发送");
+ assert(journey.control_hint().find("现场确认")!=std::string::npos);
+ journey.received-=std::chrono::seconds(1);
+ assert(journey.control_label()=="机器人反馈已失效");
+ reset["execution"]["ownership_held"]=true;assert(!ParseIkVisualization(reset).reset_request_sent);
+ reset["execution"]["ownership_held"]=false;
+ reset["execution"]["output_active"]=true;assert(!ParseIkVisualization(reset).reset_request_sent);
+ reset["execution"]["output_active"]=false;
+ reset["state"]="hold";reset["reason"]="release_sdk_error";
+ assert(!ParseIkVisualization(reset).reset_request_sent);
+ assert(ParseIkVisualization(reset).control_label()=="交权或复位未完成");
+ reset["state"]="ready";reset["reason"]="waiting_baseline_confirmation";
+ reset["execution"]["reason"]="release_confirmed";assert(!ParseIkVisualization(reset).reset_request_sent);
+ reset.erase("execution");assert(!ParseIkVisualization(reset).reset_request_sent);
+
 }

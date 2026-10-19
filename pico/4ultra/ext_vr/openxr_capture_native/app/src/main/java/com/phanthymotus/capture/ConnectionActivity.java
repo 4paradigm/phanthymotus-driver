@@ -35,6 +35,7 @@ public final class ConnectionActivity extends Activity {
     private LinearLayout devices;
     private Button confirm;
     private JSONObject invitation;
+    private AlertDialog replacementDialog;
     private NsdManager nsd;
     private NsdManager.DiscoveryListener discovery;
     private WifiManager.MulticastLock multicast;
@@ -70,7 +71,7 @@ public final class ConnectionActivity extends Activity {
         layout.setPadding(dp(24), dp(24), dp(24), dp(24)); scroll.setFillViewport(true); scroll.addView(layout); setContentView(scroll);
         TextView title = new TextView(this); title.setText("PhanthyMotus · 连接机器人"); title.setTextSize(24); layout.addView(title);
         TextView legend = new TextView(this);
-        legend.setText("首次连接：在 PICO 浏览器打开机器人下载页，安装后点击打开 App 并连接。\n已配对后会自动重连。G1：松开双握把，确认双臂自然下垂，长按 X+A 一秒建立基准；松键后重新双握接通，松开任一握把暂停。Reset：松开双握把，长按 Y+B 一秒，现场确认复位后重新建立基准。");
+        legend.setText("首次连接：在 PICO 浏览器打开机器人下载页，安装后点击打开 App 并连接。\n已配对后会自动重连。G1：松开双握把，确认双臂自然下垂，长按 X+A 一秒建立基准；松键后重新双握接通，松开任一握把暂停。结束本轮：松开双握把，长按 Y+B 一秒；请求发送成功后现场确认复位。保留智能控制，下次遥操再建立基准。");
         legend.setTextSize(16); layout.addView(legend);
         LinearLayout connection = card(layout, "连接与确认");
         status = new TextView(this); status.setTextSize(16); status.setPadding(0, dp(12), 0, dp(12));
@@ -86,7 +87,7 @@ public final class ConnectionActivity extends Activity {
         LinearLayout management = card(layout, "连接管理");
         button(management, "取消 / 断开", () -> { cancelled = true; confirmed = false; confirm.setEnabled(false); message("已取消连接；运动不会自动恢复"); }).setBackgroundResource(R.drawable.connection_secondary);
         button(management, "忘记设备", () -> new AlertDialog.Builder(this).setMessage("忘记本机凭据？机器人卡片内也需撤销旧配对，才能重新申请。")
-            .setPositiveButton("忘记", (d,w) -> { cancelled = true; credentials().edit().clear().commit(); message("已忘记设备"); })
+            .setPositiveButton("忘记", (d,w) -> { cancelled = true; if (credentials().edit().clear().commit()) { invitation = null; address.setText(""); message("已忘记设备"); } else message("未能清除凭据，请重试"); })
             .setNegativeButton("取消", null).show()).setBackgroundResource(R.drawable.connection_danger);
         discover();
         // Cold launch reconnects only to the persisted, certificate-pinned identity.
@@ -258,16 +259,35 @@ public final class ConnectionActivity extends Activity {
     }
 
     private void importInvitation(Intent intent) {
-        if (pairing) { message("配对申请进行中，请先取消后重新打开邀请"); return; }
-        invitation = null;
+        if (replacementDialog != null) replacementDialog.dismiss();
         try {
-            invitation = ConnectionInvitation.parse(intent.getDataString());
-            address.setText(invitation.getString("endpoint"));
-            message("已导入机器人 " + invitation.getString("device_id").substring(0,12)
-                + " 的一次性邀请。点击连接当前机器人；连接不会使能运动。");
-        } catch (Exception e) { message("连接邀请无效，请从当前机器人 Canvas 重新打开"); }
-        // Never retain the bearer token in the Activity's reusable launch Intent.
-        intent.setData(null);
+            if (pairing) { message("配对申请进行中，请先取消后重新打开邀请"); return; }
+            final JSONObject selected = ConnectionInvitation.parse(intent.getDataString());
+            String identity = credentials().getString("capture_credential", "").isEmpty() ? "" : pairedIdentity();
+            if (ConnectionInvitation.needsForget(selected, identity)) {
+                replacementDialog = new AlertDialog.Builder(this)
+                    .setMessage("此邀请属于另一台机器人。忘记当前机器人后才能连接；原机器人网页也需撤销旧配对。")
+                    .setPositiveButton("忘记并导入", (d,w) -> {
+                        cancelled = true; confirmed = false; confirm.setEnabled(false);
+                        if (!credentials().edit().clear().commit()) { message("未能清除凭据，请重试"); return; }
+                        selectInvitation(selected);
+                    })
+                    .setNegativeButton("取消", (d,w) -> message("已取消切换，保留原机器人连接"))
+                    .create();
+                replacementDialog.show();
+            } else selectInvitation(selected);
+        } catch (Exception e) { message("连接邀请或本地身份无效，请检查当前配对后重新打开邀请"); }
+        finally {
+            // Never retain the bearer token in the Activity's reusable launch Intent.
+            intent.setData(null);
+        }
+    }
+
+    private void selectInvitation(JSONObject selected) {
+        invitation = selected;
+        address.setText(selected.optString("endpoint"));
+        message("已导入机器人 " + selected.optString("device_id").substring(0,12)
+            + " 的一次性邀请。点击连接当前机器人；连接不会使能运动。");
     }
 
     private void redeemInvitation() {
@@ -362,6 +382,6 @@ public final class ConnectionActivity extends Activity {
         super.onActivityResult(request,result,data);
         if(request==42) message("采集连接已结束。若连接失败，请检查网络；身份变化或配对被撤销时需重新配对。可点击连接重试。");
     }
-    @Override public void onPause() { cancelled=true; stopDiscovery(); super.onPause(); }
+    @Override public void onPause() { if (replacementDialog != null) replacementDialog.dismiss(); cancelled=true; stopDiscovery(); super.onPause(); }
     @Override public void onDestroy() { cancelled=true; stopDiscovery(); worker.shutdownNow(); super.onDestroy(); }
 }
