@@ -46,6 +46,11 @@ class G1ArmActionClient(Client):
         code, data = self._Call(ROBOT_API_ID_ARM_ACTION_EXECUTE_ACTION, parameter)
         return code
     
+    def RequestReset(self):
+        # Transport acknowledgement only; the operator checks the actual pose.
+        return self._CallNoReply(ROBOT_API_ID_ARM_ACTION_EXECUTE_ACTION,
+                                 json.dumps({"data": 99}))
+
     def GetActionList(self):
         p = {}
         parameter = json.dumps(p)
