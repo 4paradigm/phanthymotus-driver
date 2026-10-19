@@ -700,6 +700,43 @@ def test_stop_cancels_a_start_blocked_while_opening():
     assert result[0]["state"] == "idle"
 
 
+def test_start_rechecks_chassis_reservation_before_registration(monkeypatch):
+    loco = FakeLoco()
+    card = _card(loco=loco)
+    card._executor = object()
+    checked = threading.Event()
+    release = threading.Event()
+    conflict = card._chassis_conflict
+
+    def delayed_conflict():
+        result = conflict()
+        if not checked.is_set():
+            checked.set()
+            assert release.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(card, '_chassis_conflict', delayed_conflict)
+    monkeypatch.setattr(card, '_open', lambda topic: object())
+    monkeypatch.setattr(card, '_start_repeat', lambda: None)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(
+        card.dispatch('start', {'input_topic': '/nav/cmd'})))
+    worker.start()
+    try:
+        assert checked.wait(timeout=2)
+        loco._moving = True
+        assert card.pause_for_explicit_command('semantic_action.reset') is False
+    finally:
+        release.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert results[0]['state'] == 'error'
+    assert card._running is False
+    assert card._sink is None
+    assert loco.published == []
+
+
 def test_infinite_calibration_values_are_rejected():
     with pytest.raises(loco_servo.CalibrationError, match="finite"):
         loco_servo.Calibration({"full_scale_vx_mps": math.inf})

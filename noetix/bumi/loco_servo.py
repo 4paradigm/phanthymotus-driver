@@ -599,6 +599,10 @@ class LocoServoPlugin:
             if self._running:
                 return {"state": "error",
                         "message": f"已经在运行（{self._input_topic}）"}
+            # Serialize the final reservation check with explicit preemption.
+            conflict = self._chassis_conflict()
+            if conflict:
+                return {"state": "error", "message": conflict}
             self._sink = sink
             self._input_topic = topic
             self._running = True
