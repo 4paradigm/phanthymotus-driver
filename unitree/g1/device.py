@@ -4138,39 +4138,201 @@ class VisionCapturePlugin:
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": (
-                "Capture a G1 RGB photo or record an H.264 MP4 video "
-                "with optional microphone AAC audio (off by default). "
-                "(1–30 seconds) to persistent storage. Requires the camera "
+                "Manage saved G1 media, capture an RGB photo or record an H.264 MP4 video "
+                "with microphone AAC audio by default. "
+                "(1–30 seconds) to persistent storage. Capture requires the camera "
                 "card to remain enabled (plugins.camera.enabled=true)."),
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "start", "capture_photo", "record_video", "info", "stop"]},
-                "duration_s": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": self._max_duration_s,
-                    "default": min(5, self._max_duration_s),
-                    "description": "默认5s,最大30s",
-                },
+                    "start", "capture_photo", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "stop"]},
+                "duration": {"type": "number", "minimum": 1,
+                             "maximum": self._max_duration_s,
+                             "description": "定时录像秒数，默认 5，最大 30。"},
+                "duration_s": {"type": "integer", "minimum": 1,
+                               "maximum": self._max_duration_s,
+                               "description": "兼容旧接口；优先使用 duration。"},
+                "image_name": {"type": "string", "description": "照片名称，可省略；英文、数字、点、下划线、短横线，自动补 .jpg。"},
+                "video_name": {"type": "string", "description": "录像名称，可省略；英文、数字、点、下划线、短横线，自动补 .mp4。"},
                 "include_audio": {
-                    "type": "boolean", "default": False,
-                    "title": "录制麦克风声音",
+                    "type": "boolean", "default": True,
+                    "title": "兼容音频选项",
                     "description": (
-                        "默认关闭，保留原无声录像。开启后使用 Camera/Mic ROS 发布端时间戳"
+                        "默认有声；旧调用可显式传 false 录制无声。使用 Camera/Mic ROS 发布端时间戳"
                         "对齐 VFR 视频与 AAC 音轨；不是硬件级同步。需启用 mic；"
                         "无音频、长时间断音或只有零 PCM 时明确失败，不降级为无声录像。"),
+                },
+                "media_type": {
+                    "type": "string", "enum": ["all", "photo", "video"], "default": "all",
+                    "description": "list 可选 all/photo/video；delete 必须选择 photo 或 video。",
+                },
+                "filename": {
+                    "type": "string", "description": "删除的完整文件名，含 .jpg 或 .mp4；不接受路径。",
+                },
+                "limit": {
+                    "type": "integer", "minimum": 1, "maximum": 200, "default": 50,
+                    "description": "list 返回的最大文件数，按修改时间从新到旧排列。",
                 },
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 RGB 相机是否就绪。"},
-                    "capture_photo": {"params": [], "description": "保存当前 RGB 照片为 JPG。"},
-                    "record_video": {"params": ["duration_s", "include_audio"],
-                                     "description": "录制 RGB 视频，可选录制麦克风；默认 5 秒、无声。"},
+                    "capture_photo": {"params": ["image_name"], "description": "拍照并保存 JPG；不填名称则自动生成。"},
+                    "record_video": {"params": ["video_name", "duration"],
+                                     "description": "定时录制有声 MP4，默认 5 秒、最大 30 秒。"},
+                    "start_recording": {"params": ["video_name"], "description": "开始有声录像并立即返回，最长 30 秒后自动保存。"},
+                    "stop_recording": {"params": [], "description": "结束当前录像并保存；编码完成后异步返回文件。"},
+                    "list": {"params": ["media_type", "limit"], "description": "列出已保存的照片和视频，不含临时或生成中的文件。"},
+                    "delete": {"params": ["media_type", "filename"], "description": "删除指定媒体文件；录制或编码期间不能删除视频。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
                     "stop": {"params": [], "description": "取消录像并删除未完成文件。"},
                 },
-                "x-completion": {"actions": ["record_video"],
+                "x-completion": {"actions": ["record_video", "stop_recording"],
                                  "timeout": self._max_duration_s + 45}},
         }
+
+    @staticmethod
+    def _valid_media_name(filename, media_type):
+        import re
+        extension = "jpg" if media_type == "photo" else "mp4"
+        return (isinstance(filename, str) and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\." + extension,
+            filename, re.IGNORECASE) is not None)
+
+    def _open_media_directory(self, media_type, create=False):
+        """Pin each directory with no-follow opens, including all ancestors.
+
+        A checked Path.resolve() followed by unlink() would permit a directory
+        symlink swap between validation and deletion. Relative fd operations
+        keep access in the directory actually opened, without following links.
+        """
+        directory = self._output_dir.absolute() / (
+            "photos" if media_type == "photo" else "videos")
+        if ".." in directory.parts:
+            raise ValueError("Media output directory must not contain '..'")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open("/", flags)
+        try:
+            for component in directory.parts[1:]:
+                try:
+                    next_fd = os.open(component, flags, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    try:
+                        os.mkdir(component, 0o755, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                    next_fd = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _media_error(exc):
+        import errno
+        if isinstance(exc, FileNotFoundError):
+            code = "FILE_NOT_FOUND"
+        elif isinstance(exc, PermissionError):
+            code = "PERMISSION_DENIED"
+        elif isinstance(exc, ValueError):
+            code = "INVALID_PATH"
+        elif getattr(exc, "errno", None) in (errno.ELOOP, errno.ENOTDIR):
+            code = "UNSAFE_PATH"
+        else:
+            code = "FILE_OPERATION_FAILED"
+        return {"ok": False, "code": code, "message": str(exc)}
+
+    def _iter_media(self, media_types):
+        import stat
+        for media_type in media_types:
+            try:
+                fd = self._open_media_directory(media_type)
+            except FileNotFoundError:
+                continue
+            try:
+                for filename in os.listdir(fd):
+                    if not self._valid_media_name(filename, media_type):
+                        continue
+                    try:
+                        info = os.stat(filename, dir_fd=fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue  # An external process removed it meanwhile.
+                    if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
+                        continue
+                    path = self._output_dir / (
+                        "photos" if media_type == "photo" else "videos") / filename
+                    active = self._active_recording
+                    if (active and not active.get("finished") and active.get("path")
+                            and os.path.abspath(path) == os.path.abspath(active["path"])):
+                        continue
+                    yield {"filename": filename, "media_type": media_type,
+                           "size": info.st_size,
+                           "modified_at": datetime.fromtimestamp(
+                               info.st_mtime).astimezone().isoformat(timespec="seconds"),
+                           "file_path": str(path.absolute()),
+                           "mime": "image/jpeg" if media_type == "photo" else "video/mp4",
+                           "_mtime_ns": info.st_mtime_ns}
+            finally:
+                os.close(fd)
+
+    def _list_media(self, args):
+        import heapq
+        media_type = args.get("media_type", "all")
+        limit = args.get("limit", 50)
+        if media_type not in ("all", "photo", "video"):
+            return {"ok": False, "code": "INVALID_MEDIA_TYPE",
+                    "message": "media_type must be all, photo or video"}
+        if type(limit) is not int or not 1 <= limit <= 200:
+            return {"ok": False, "code": "INVALID_LIMIT",
+                    "message": "limit must be an integer between 1 and 200"}
+        types = ("photo", "video") if media_type == "all" else (media_type,)
+        try:
+            with self._recording_lock:
+                files = heapq.nlargest(limit + 1, self._iter_media(types),
+                                      key=lambda item: (item["_mtime_ns"], item["filename"]))
+            truncated = len(files) > limit
+            files = files[:limit]
+            for item in files:
+                item.pop("_mtime_ns")
+            return {"ok": True, "files": files, "count": len(files),
+                    "limit": limit, "truncated": truncated}
+        except (OSError, ValueError) as exc:
+            return self._media_error(exc)
+
+    def _delete_media(self, args):
+        import stat
+        media_type = args.get("media_type")
+        filename = args.get("filename")
+        if media_type not in ("photo", "video"):
+            return {"ok": False, "code": "INVALID_MEDIA_TYPE",
+                    "message": "delete requires media_type photo or video"}
+        if not self._valid_media_name(filename, media_type):
+            return {"ok": False, "code": "INVALID_FILENAME",
+                    "message": "filename must be a plain .jpg photo or .mp4 video filename"}
+        try:
+            with self._recording_lock:
+                # Be conservative even before the worker has reserved its path.
+                if media_type == "video" and self._active_recording:
+                    return {"ok": False, "code": "MEDIA_BUSY",
+                            "message": "Cannot delete videos while recording or encoding"}
+                fd = self._open_media_directory(media_type)
+                try:
+                    info = os.stat(filename, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISLNK(info.st_mode):
+                        return {"ok": False, "code": "UNSAFE_PATH",
+                                "message": "Symbolic links cannot be deleted by this card"}
+                    if not stat.S_ISREG(info.st_mode):
+                        return {"ok": False, "code": "NOT_A_FILE",
+                                "message": "Only regular media files can be deleted"}
+                    os.unlink(filename, dir_fd=fd)
+                finally:
+                    os.close(fd)
+            return {"ok": True, "state": "deleted", "media_type": media_type,
+                    "filename": filename}
+        except (OSError, ValueError) as exc:
+            return self._media_error(exc)
 
     def _camera_ready(self):
         return self._camera is not None and self._camera.is_running()
@@ -4209,7 +4371,7 @@ class VisionCapturePlugin:
                if frame else None)
         with self._recording_lock:
             active = ({key: self._active_recording.get(key) for key in (
-                "action_id", "state", "duration_s", "include_audio", "started_at", "path")}
+                "action_id", "state", "duration_s", "include_audio", "manual", "started_at", "path")}
                 if self._active_recording else None)
             last = self._last_recording
         ready = self._camera_ready() and age is not None
@@ -4235,27 +4397,76 @@ class VisionCapturePlugin:
             return {"state": "error", **self._precondition_error()}
         return {"state": "ready" if self._camera_ready() else "error"}
 
-    def _capture_photo(self):
+    def _media_filename(self, value, media_type):
+        import re
+        extension = ".jpg" if media_type == "photo" else ".mp4"
+        if value is None or value == "":
+            prefix = "IMG" if media_type == "photo" else "VID"
+            return prefix + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + extension
+        if not isinstance(value, str):
+            raise ValueError("Media name must be a string")
+        stem = value.strip()
+        if stem.lower().endswith(extension):
+            stem = stem[:-len(extension)]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", stem):
+            raise ValueError("Media name must be 1-100 ASCII letters, digits, '.', '_' or '-'; no paths")
+        return stem + extension
+
+    def _reserve_media_file(self, media_type, filename):
+        fd = self._open_media_directory(media_type, create=True)
+        try:
+            output_fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=fd)
+        finally:
+            os.close(fd)
+        path = self._output_dir.absolute() / ("photos" if media_type == "photo" else "videos") / filename
+        try:
+            return path, os.fdopen(output_fd, "wb")
+        except Exception:
+            os.close(output_fd)
+            self._remove_partial(path)
+            raise
+
+    def _media_result(self, path, media_type, state):
+        path = Path(path)
+        override = os.environ.get("PHANTHY_CHANNEL_OUTPUT_DIR")
+        try:
+            channel_path = Path("/work/resource") / path.relative_to(Path("/opt/phanthy-motus/data"))
+        except ValueError:
+            channel_path = path
+        if override:
+            channel_path = Path(override) / path.relative_to(self._output_dir.absolute())
+        return {"ok": True, "state": state, "media_type": media_type,
+                "filename": path.name, "file_path": str(path), "path": str(path),
+                "channel_reply_path": str(channel_path),
+                "mime": "image/jpeg" if media_type == "photo" else "video/mp4",
+                "size": path.stat().st_size}
+
+    def _capture_photo(self, args=None):
         if self._camera is None:
             return self._precondition_error()
         path = None
         try:
+            filename = self._media_filename((args or {}).get("image_name"), "photo")
+        except ValueError as exc:
+            return {"ok": False, "code": "INVALID_FILENAME", "message": str(exc)}
+        try:
             frame, _ = self._frame()
-            directory = self._output_dir / "photos"
-            directory.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = directory / f"IMG_{stamp}.jpg"
-            with path.open("xb") as output:
-                output.write(frame["data"])
-            return {
-                "ok": True, "media_type": "photo", "file_path": str(path),
-                "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "frame_age_s": round(
-                    time.monotonic() - frame["received_monotonic"], 3),
-            }
+            with self._recording_lock:
+                path, output = self._reserve_media_file("photo", filename)
+                try:
+                    with output:
+                        output.write(frame["data"])
+                    return {**self._media_result(path, "photo", "captured"),
+                            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                            "frame_age_s": round(time.monotonic() - frame["received_monotonic"], 3)}
+                except Exception:
+                    self._remove_partial(path)
+                    path = None
+                    raise
+        except FileExistsError:
+            return {"ok": False, "code": "FILE_EXISTS", "message": "File already exists: " + filename}
         except Exception as exc:
-            if path is not None:
-                self._remove_partial(path)
             return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
 
     @staticmethod
@@ -4309,7 +4520,7 @@ class VisionCapturePlugin:
                 pass
 
     def _record_video(self, active):
-        if active.get("include_audio", False):
+        if active.get("include_audio", False) or active.get("manual", False):
             from av_recording import record_av
             return record_av(self, active)
         process = None
@@ -4323,9 +4534,12 @@ class VisionCapturePlugin:
             directory = self._output_dir / "videos"
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = directory / f"video_{stamp}.mp4"
-            with path.open("xb"):
-                pass
+            if active.get("reserved_path"):
+                path = Path(active["reserved_path"])
+            else:
+                path = directory / f"video_{stamp}.mp4"
+                with path.open("xb"):
+                    pass
             with self._recording_lock:
                 active["path"] = str(path)
             with tempfile.TemporaryFile() as errors:
@@ -4341,7 +4555,8 @@ class VisionCapturePlugin:
                     active["process"] = process
                 frames = 0
                 deadline = time.monotonic() + active["duration_s"]
-                while time.monotonic() < deadline and not cancel.is_set():
+                while (time.monotonic() < deadline and not cancel.is_set()
+                       and not active.get("save_event", threading.Event()).is_set()):
                     tick = time.monotonic()
                     frame, sequence = self._frame(
                         sequence, max(0.25, 2.0 / self._fps))
@@ -4359,9 +4574,10 @@ class VisionCapturePlugin:
                     message = errors.read(4096).decode("utf-8", "replace")
                     raise RuntimeError(message.strip() or "ffmpeg failed to create MP4")
             completed = True
+            actual = min(active["duration_s"], frames / self._fps)
             return {
                 "ok": True, "media_type": "video", "file_path": str(path),
-                "recorded_duration_s": active["duration_s"], "frames": frames,
+                "recorded_duration_s": actual, "frames": frames, "include_audio": False,
                 "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
         except Exception as exc:
@@ -4381,72 +4597,112 @@ class VisionCapturePlugin:
         except Exception as exc:
             result = {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
         with self._recording_lock:
-            # stop() and terminal classification share this lock.  Cancellation
-            # wins until the terminal state is committed; if encoding already
-            # produced a valid file, remove it before reporting cancellation.
+            cleanup_error = None
             if active["cancel_event"].is_set():
-                cleanup_error = None
                 if result.get("ok"):
                     cleanup_error = self._remove_partial(Path(result["file_path"]))
-                result = {"ok": False, "code": "RECORD_CANCELLED",
-                          "message": "Video recording was cancelled"}
-                if cleanup_error:
-                    result["cleanup_error"] = cleanup_error
+                result = {"ok": False, "code": "RECORD_CANCELLED", "message": "Video recording was cancelled"}
+            if result.get("ok"):
+                try:
+                    result.update(self._media_result(result["file_path"], "video", "recorded"))
+                except Exception as exc:
+                    result = {"ok": False, "code": "FILE_OPERATION_FAILED", "message": str(exc)}
+            if not result.get("ok") and active.get("reserved_path"):
+                cleanup_error = self._remove_partial(Path(active["reserved_path"])) or cleanup_error
+            if cleanup_error:
+                result["cleanup_error"] = cleanup_error
             status = ("completed" if result.get("ok") else
-                      "cancelled" if result.get("code") == "RECORD_CANCELLED" else
-                      "error")
-            self._last_recording = {
-                "action_id": active["action_id"], "status": status, "result": result}
+                      "cancelled" if result.get("code") == "RECORD_CANCELLED" else "error")
+            self._last_recording = {"action_id": active["action_id"], "status": status, "result": result}
             active["state"] = status
             active["finished"] = True
+            notifications = [active["action_id"]]
+            if active.get("stop_action_id"):
+                notifications.append(active["stop_action_id"])
         try:
-            _vision_acp_notify(active["action_id"], status, result)
+            for action_id in notifications:
+                _vision_acp_notify(action_id, status, result)
         finally:
             with self._recording_lock:
                 if self._active_recording is active:
                     self._active_recording = None
 
-    def _start_video_recording(self, args):
-        requested = args.get("duration_s", min(5, self._max_duration_s))
-        if type(requested) is not int or not 1 <= requested <= self._max_duration_s:
-            return {"ok": False, "code": "INVALID_DURATION", "message":
-                    f"duration_s must be an integer between 1 and {self._max_duration_s}"}
-        include_audio = args.get("include_audio", False)
+    def _start_video_recording(self, args, manual=False):
+        import math
+        requested = self._max_duration_s if manual else args.get("duration", args.get("duration_s", min(5, self._max_duration_s)))
+        if (isinstance(requested, bool) or not isinstance(requested, (int, float))
+                or not math.isfinite(requested) or not 1 <= requested <= self._max_duration_s):
+            return {"ok": False, "code": "INVALID_DURATION",
+                    "message": f"duration must be between 1 and {self._max_duration_s} seconds"}
+        if "duration" not in args and not manual and "duration_s" in args and type(requested) is not int:
+            return {"ok": False, "code": "INVALID_DURATION", "message": "Legacy duration_s must be an integer"}
+        include_audio = args.get("include_audio", True)
         if type(include_audio) is not bool:
-            return {"ok": False, "code": "INVALID_AUDIO_OPTION",
-                    "message": "include_audio must be a boolean"}
+            return {"ok": False, "code": "INVALID_AUDIO_OPTION", "message": "include_audio must be a boolean"}
         if self._camera is None:
             return self._precondition_error()
+        try:
+            filename = self._media_filename(args.get("video_name"), "video")
+        except ValueError as exc:
+            return {"ok": False, "code": "INVALID_FILENAME", "message": str(exc)}
         if not self._camera_ready():
-            return {"ok": False, "code": "RECORD_FAILED",
-                    "message": "G1 camera_rgb worker is unavailable"}
+            return {"ok": False, "code": "RECORD_FAILED", "message": "G1 camera_rgb worker is unavailable"}
         if shutil.which("ffmpeg") is None:
-            return {"ok": False, "code": "RECORD_FAILED",
-                    "message": "ffmpeg is required"}
+            return {"ok": False, "code": "RECORD_FAILED", "message": "ffmpeg is required"}
         with self._recording_lock:
             if self._active_recording:
-                return {"ok": False, "code": "RECORD_IN_PROGRESS",
-                        "message": "A video recording is already in progress",
+                return {"ok": False, "code": "RECORD_IN_PROGRESS", "message": "A recording or encoding is already in progress",
                         "action_id": self._active_recording["action_id"]}
+            try:
+                path, reservation = self._reserve_media_file("video", filename)
+                reservation.close()
+            except FileExistsError:
+                return {"ok": False, "code": "FILE_EXISTS", "message": "File already exists: " + filename}
+            except (OSError, ValueError) as exc:
+                return self._media_error(exc)
             action_id = f"vision_capture_record_video_{uuid4().hex}"
-            active = {
-                "action_id": action_id, "state": "recording",
-                "duration_s": requested,
-                "include_audio": include_audio,
-                "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "cancel_event": threading.Event(), "process": None,
-                "path": None, "finished": False,
-            }
-            thread = threading.Thread(
-                target=self._record_video_async, args=(active,), daemon=True,
-                name="g1_vision_capture_record_video")
+            active = {"action_id": action_id, "state": "recording", "duration_s": requested,
+                      "manual": manual, "include_audio": include_audio,
+                      "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                      "cancel_event": threading.Event(), "save_event": threading.Event(),
+                      "process": None, "path": str(path), "reserved_path": str(path), "finished": False}
+            thread = threading.Thread(target=self._record_video_async, args=(active,), daemon=True,
+                                      name="g1_vision_capture_record_video")
             active["thread"] = thread
             self._active_recording = active
-            thread.start()
-        return {"ok": True, "state": "queued", "action_id": action_id,
-                "media_type": "video", "requested_duration_s": requested,
-                "include_audio": include_audio,
-                "message": "Video recording started; completion will be reported asynchronously."}
+            try:
+                thread.start()
+            except Exception as exc:
+                self._active_recording = None
+                self._remove_partial(path)
+                return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
+        result = {"ok": True, "state": "recording" if manual else "queued",
+                  "media_type": "video", "filename": filename, "file_path": str(path), "path": str(path),
+                  "mime": "video/mp4", "include_audio": include_audio,
+                  "requested_duration_s": requested, "max_duration_s": self._max_duration_s}
+        # Manual start is a completed control operation, not a pending action
+        # barrier: stop_recording must remain callable while capture is active.
+        result["recording_id" if manual else "action_id"] = action_id
+        return result
+
+    def _stop_recording(self):
+        with self._recording_lock:
+            active = self._active_recording
+            if not active:
+                return {"ok": True, "state": "idle", "message": "No active recording"}
+            if active.get("finished"):
+                return self._last_recording["result"]
+            if active["cancel_event"].is_set():
+                return {"ok": False, "code": "RECORD_CANCELLED", "message": "Recording is being cancelled"}
+            if not active.get("stop_action_id"):
+                active["stop_action_id"] = f"vision_capture_stop_recording_{uuid4().hex}"
+                active["stop_at_monotonic"] = time.monotonic()
+                active["save_event"].set()
+                if active["state"] != "encoding":
+                    active["state"] = "finishing"
+            return {"ok": True, "state": "queued", "action_id": active["stop_action_id"],
+                    "recording_id": active["action_id"], "filename": Path(active["path"]).name,
+                    "message": "Saving recording; completion will be reported asynchronously"}
 
     def stop(self):
         with self._recording_lock:
@@ -4468,10 +4724,18 @@ class VisionCapturePlugin:
             return self.start()
         if action == "info":
             return self._info()
+        if action == "list":
+            return self._list_media(args)
+        if action == "delete":
+            return self._delete_media(args)
         if action == "capture_photo":
-            return self._capture_photo()
+            return self._capture_photo(args)
         if action == "record_video":
             return self._start_video_recording(args)
+        if action == "start_recording":
+            return self._start_video_recording(args, manual=True)
+        if action == "stop_recording":
+            return self._stop_recording()
         if action == "stop":
             return self.stop()
         return None
