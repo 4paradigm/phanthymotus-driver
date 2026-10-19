@@ -88,7 +88,7 @@ this override, a read-only `/dev` can cause camera start to fail with
 This deliberately exposes host device names and permits access to all
 video/USB devices, not just one camera; the SDK selection remains serial-bound.
 
-Both Web Console and `deploy/run-pr-image.sh` use this same service fragment.
+Both the Web Console and run-pr-image.sh use this same service fragment.
 Redeploy the new image once to replace older exact-node mappings; no per-node
 environment variables or host scanning script are needed afterwards.
 

@@ -6294,7 +6294,7 @@ class VisionPlugin:
     and the calibrated ``32FC1`` depth image published by the official
     ``pcd2depth_ros2_node`` on the Orin board.  It republishes normalized
     streams on domain 42 for Agent Core and the dashboard renderers
-    (``sensor/pointcloud``, ``image/jpeg``, ``image/depth-z16``).  Topic names
+    (``sensor/pointcloud``, ``image/jpeg``, ``image/depth-zlib``).  Topic names
     follow the per-device prefix ``/{topic_prefix}/{model}/device{N}/`` and
     must be calibrated against ``ros_graph`` on the real robot.
     """
@@ -6369,9 +6369,9 @@ class VisionPlugin:
     def _depth_tool(self) -> dict:
         return sensor_tool(
             "depth",
-            f"T800-Odin2 官方标定深度图（640×480，毫米 16UC1），发布到 {self._depth_topic}",
+            f"T800-Odin2 官方标定深度图（640×480，毫米 16UC1，zlib 压缩），发布到 {self._depth_topic}",
             self._depth_topic,
-            "image/depth-z16",
+            "image/depth-zlib",
         )
 
     def start(self) -> None:
@@ -6390,13 +6390,14 @@ class VisionPlugin:
         self._running = True
         self._struct = _struct
         self._np = _np
-        self._image_type = Image
+        from sensor_msgs.msg import CompressedImage as _CI
+        self._image_type = _CI
         self._array = _array
         self._multi_type = UInt8MultiArray
         self._cloud_pub = self._pub_node.create_publisher(UInt8MultiArray, self._cloud_topic, _BEST_EFFORT)
         self._cam_left_pub = self._pub_node.create_publisher(CompressedImage, self._cam_left_topic, _BEST_EFFORT)
         self._cam_right_pub = self._pub_node.create_publisher(CompressedImage, self._cam_right_topic, _BEST_EFFORT)
-        self._depth_pub = self._pub_node.create_publisher(Image, self._depth_topic, _BEST_EFFORT)
+        self._depth_pub = self._pub_node.create_publisher(self._image_type, self._depth_topic, _BEST_EFFORT)
         self._sub_node.create_subscription(
             PointCloud2, self._topics["vision_cloud_raw"], self._on_cloud_raw, _BEST_EFFORT
         )
@@ -6535,14 +6536,15 @@ class VisionPlugin:
         cols = self._np.arange(target_width) * source_width // target_width
         depth_mm = depth_mm[rows[:, None], cols[None, :]].astype("<u2", copy=False)
 
+        # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。
+        # The crop-and-resample above already lands on 640x480, which is what
+        # the format fixes — so this driver loses nothing by dropping z16's
+        # per-message width/height.
+        import zlib as _zlib
         out = self._image_type()
         out.header = msg.header
-        out.height = target_height
-        out.width = target_width
-        out.encoding = "16UC1"
-        out.is_bigendian = False
-        out.step = target_width * 2
-        out.data = depth_mm.tobytes(order="C")
+        out.format = "16UC1; compressedDepth zlib"
+        out.data = _zlib.compress(depth_mm.tobytes(order="C"), 1)
         self._depth_pub.publish(out)
         self._record_frame("depth")
 
@@ -6586,7 +6588,7 @@ class VisionPlugin:
                 "tool": "depth",
                 "label": "Odin2 深度图",
                 "topic": self._topics["vision_depth"],
-                "format": "image/depth-z16",
+                "format": "image/depth-zlib",
             },
         }
         health = {}
@@ -6652,7 +6654,7 @@ class VisionPlugin:
                     {"topic": self._cam_left_topic, "format": "image/jpeg"},
                     {"topic": self._cam_right_topic, "format": "image/jpeg"},
                 ],
-                "depth": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+                "depth": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
             }
             selected_tools = (tool_name,) if tool_name else self._TOOL_NAMES
             topic_out = [topic for name in selected_tools for topic in topic_out_by_tool[name]]

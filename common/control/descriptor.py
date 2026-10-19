@@ -24,9 +24,28 @@ MODES = (
     "joint_position",    # absolute joint positions, descriptor.units["angle"]
     "joint_velocity",    # joint velocities
     "joint_torque",      # joint torques
-    "eef_pose",          # end-effector pose in descriptor.frame
+    "eef_pose",          # absolute end-effector pose(s), see EEF_POSE_STRIDE
     "twist",             # body twist (vx, vy, vz, wx, wy, wz)
 )
+
+# ── `eef_pose` 的布局 ───────────────────────────────────────────────────────
+#
+# 每个末端占 **7 维**：`[x, y, z, qx, qy, qz, qw]` —— 米，加一个**单位四元数**，
+# `descriptor.frame` 下的**绝对**位姿（不是增量）。一段 `eef_pose` 的 count 必须
+# 是 7 的整数倍，双臂就是 14 或者两段各 7。
+#
+# **夹爪不在这里面。** 它是自己的一段 `joint_position`，unit `normalized`。把它
+# 塞进位姿段会让这段的宽度变成 8，而 8 % 7 != 0 正是下面那条检查要抓的东西。
+#
+# **为什么是四元数，而不是 rpy 或者 R6。** 三种都是一串浮点数，接反了、轴序弄错
+# 了、旋转矩阵前两列不正交了，都不报错 —— 机械臂走到错误的地方，而日志是干净的。
+# 四元数是其中唯一**自带校验**的：单位范数。一个 rpy 三元组或者 R6 的前四个数，
+# 没有理由恰好落在单位球面上，于是 `sink._check_contract` 能把它响亮地拒掉。
+# 这条检查是选它的全部理由，见 `rotation.UNIT_TOLERANCE`。
+#
+# 顺序是 **xyzw**，和 `geometry_msgs/Quaternion`、scipy、`motus.vla/1` 一致。
+EEF_POSE_STRIDE = 7
+EEF_POSE_QUAT = slice(3, 7)   # 一段 7 维里的四元数部分
 
 
 class DescriptorError(ValueError):
@@ -53,6 +72,33 @@ class Group:
     count: int
     unit: str = ""
     resource: str = ""
+    # 这一段的动作空间。留空表示继承 `descriptor.mode` —— 每一个已有的驱动都是
+    # 单一空间，所以不写就是「和整体一样」，不是「未知」。
+    #
+    # **为什么要按段声明。** 一个末端位姿模型的输出是混的：UnifoLM-VLA 的 G1
+    # checkpoint 是 2 × [末端 xyz(3) + R6 旋转(6) + 夹爪(1)] + 腰 rpy(3) = 23 维 ——
+    # 前面那些是笛卡尔位姿，腰那三个是关节角。整个 descriptor 只有一个 mode 的话，
+    # 这种向量根本声明不出来，于是只能谎报一个，而谎报的后果是位姿被当成关节角。
+    mode: str = ""
+    # **这一段收下了但不执行。** 默认 false —— 也就是「会执行」，今天每一个驱动的
+    # 每一段都是这样。
+    #
+    # 它是一个**声明**，不是行为开关：`ControlSink` 看见它就跳过这一段的限位、步长
+    # 与速度检查（检查一个不会被执行的数没有意义，而卡死的限位会把整条指令拒掉），
+    # 驱动自己负责真的不去驱动它。
+    #
+    # 具体是为 G1 的 1 自由度腰加的：模型输出腰的三个关节角，而那台机器的腰
+    # roll/pitch 电机 mode=0。此前卡片把这两维的限位卡死在 ±0.02，于是
+    # `unifolm-vla-g1` 的每一条指令都在硬限位处被整条拒掉 —— 25 步全拒，连 IK 都
+    # 到不了。
+    #
+    # **为什么这不是「静默丢两维」**，也就是这个仓库一直拒绝的那件事：丢维要
+    # **生产者先给许可**。生产者在 `motus.vla/1` 的
+    # `capabilities.control_groups[].optional` 里声明「这一段任务不要求执行」，
+    # 两者在 `actucore/plugins/vla/negotiate.py` 相遇，规则只有一句：**驱动标了
+    # advisory 而生产者没标 optional → 拒绝协商**。两个名字故意不同，语义不对称，
+    # 同名会让一次复制粘贴把「可以不执行」变成「已经没执行」。
+    advisory: bool = False
 
     @property
     def slice(self) -> slice:
@@ -92,6 +138,39 @@ class Descriptor:
     @property
     def has_force_torque(self) -> bool:
         return self.force_torque is not None
+
+    @property
+    def eef_quat_offsets(self) -> tuple[int, ...]:
+        """Index of `qx` for every end-effector pose in the vector.
+
+        Derived from `groups` rather than from `mode`, because a mixed vector
+        is the case this exists for: G1's normalised action space is two poses,
+        two grippers and three waist joints, and only the pose segments carry
+        a quaternion. Callers should compute this once — the sink does, at
+        construction — since a descriptor cannot change under a running sink.
+        """
+        out = []
+        for group in self.groups:
+            if group.mode != "eef_pose":
+                continue
+            for start in range(group.offset, group.offset + group.count,
+                               EEF_POSE_STRIDE):
+                out.append(start + EEF_POSE_QUAT.start)
+        return tuple(out)
+
+    @property
+    def advisory_indices(self) -> frozenset:
+        """Every index the driver has declared it accepts but will not execute.
+
+        Derived once by the sink at construction, the same way
+        `eef_quat_offsets` is — a descriptor cannot change under a running
+        sink, so recomputing per command would be pure cost.
+        """
+        out: set = set()
+        for group in self.groups:
+            if group.advisory:
+                out.update(range(group.offset, group.offset + group.count))
+        return frozenset(out)
 
     @property
     def resources(self) -> tuple[str, ...]:
@@ -230,7 +309,7 @@ def parse_descriptor(raw: dict) -> Descriptor:
     if end_effector is not None and not isinstance(end_effector, dict):
         raise DescriptorError("descriptor.end_effector must be an object or absent")
 
-    groups = _parse_groups(raw.get("groups"), dof=dof)
+    groups = _parse_groups(raw.get("groups"), dof=dof, default_mode=mode)
 
     return Descriptor(
         mode=mode,
@@ -253,16 +332,19 @@ def parse_descriptor(raw: dict) -> Descriptor:
     )
 
 
-def _parse_groups(raw, *, dof: int) -> tuple:
+def _parse_groups(raw, *, dof: int, default_mode: str = "") -> tuple:
     """Validate `groups`, or default to one group covering the whole vector.
 
     Groups must tile `[0, dof)` exactly, in order and without gaps. A gap would
     leave dimensions with no declared unit and no owning channel — and since
     the whole point of a group is to say what a slice *means*, a dimension in
     no group is a dimension nobody has described.
+
+    每一段可以带自己的 `mode`；不带就继承 `default_mode`（即 `descriptor.mode`）。
+    见 `Group.mode` —— 混合空间的向量是这个字段存在的唯一理由。
     """
     if raw is None:
-        return (Group(name="all", offset=0, count=dof),)
+        return (Group(name="all", offset=0, count=dof, mode=default_mode),)
     if not isinstance(raw, (list, tuple)) or not raw:
         raise DescriptorError("descriptor.groups must be a non-empty list or absent")
 
@@ -286,9 +368,32 @@ def _parse_groups(raw, *, dof: int) -> tuple:
                 f"{expected} — groups must tile the vector in order with no gaps"
             )
         expected = offset + count
+        mode = str(entry.get("mode") or "") or default_mode
+        if mode not in MODES:
+            raise DescriptorError(
+                f"descriptor.groups[{i}] ({name}) 的 mode {mode!r} 不在 "
+                f"{', '.join(MODES)} 里"
+            )
+        # 一段位姿只能是整数个 7。宽度不对的时候，最可能的解释是旋转用了别的表示
+        # —— 6 是 rpy 配 xyz，9 是 R6 配 xyz，8 是把夹爪塞了进来 —— 而这三种都会
+        # 在运行时被逐位读成四元数，不报错。
+        if mode == "eef_pose" and count % EEF_POSE_STRIDE:
+            raise DescriptorError(
+                f"descriptor.groups[{i}] ({name}) 声明 eef_pose 但 count 是 "
+                f"{count}，不是 {EEF_POSE_STRIDE} 的整数倍 —— 一个末端位姿是 "
+                "[x, y, z, qx, qy, qz, qw]。夹爪要单独成一段 joint_position"
+            )
+        advisory = entry.get("advisory", False)
+        if not isinstance(advisory, bool):
+            # 字符串 "false" 是真值，而这个字段的方向是**放行**：填错的代价是一段
+            # 本该被限位守住的动作变成不检查。所以只收 bool。
+            raise DescriptorError(
+                f"descriptor.groups[{i}] ({name}).advisory must be true or "
+                f"false, got {advisory!r}")
         groups.append(Group(name=name, offset=offset, count=count,
                             unit=str(entry.get("unit") or ""),
-                            resource=str(entry.get("resource") or "")))
+                            resource=str(entry.get("resource") or ""),
+                            mode=mode, advisory=advisory))
 
     if expected != dof:
         raise DescriptorError(

@@ -45,7 +45,7 @@
 | `gesture` | 表演/表情 | 作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等（异步） |
 | `beep` | 头部扬声器 beep | Nano `beep_adapter.py`（:18082 /v1/beep/actions） |
 | `speaker` | 头部扬声器播放 | Nano `speaker_adapter.py`（:18083 /v1/speaker/actions）→ 播放远端音频流 |
-| `face_light` | 面部灯带颜色 | `set_color` / `preset` / `off`（经 MQTT） |
+| `face_light` | 面部灯带颜色 | `set_color` / `preset` / `off` + 逐灯接口和内部定时灯效 |
 | `system_health` | 整体健康检查 | `robot_info`：CPU/内存/磁盘/电池/MQTT 体检 |
 
 ### 资源卡（resource）

@@ -313,6 +313,15 @@ class VisionCapturePlugin:
                         raise
                 if frames < min(2, self._fps * active["duration_s"]):
                     raise RuntimeError("Not enough fresh frames to record video")
+                # The mjpeg demuxer only emits a JPEG once it has seen the
+                # start of the next one, so a single-frame recording (1 fps for
+                # 1 s) closed stdin with nothing decoded: ffmpeg wrote a 261-byte
+                # MP4 with no video stream at all, and _probe_video died on
+                # `streams[0]` with "list index out of range" — a message that
+                # says nothing about the cause. Repeating the last frame gives
+                # the demuxer its terminator; `-frames:v` caps the output, so
+                # longer recordings discard it and their duration is unchanged.
+                self._write_frame(process, frame[0], cancel)
                 process.stdin.close()
                 encode_deadline = time.monotonic() + 10
                 while process.poll() is None:

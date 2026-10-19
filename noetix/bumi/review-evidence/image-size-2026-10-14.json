@@ -1,0 +1,47 @@
+{
+  "method": "Docker Engine image inspect Size (bytes); image history Size (bytes)",
+  "images": {
+    "base_cached_latest": {
+      "reference": "bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest",
+      "id": "sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f",
+      "size_bytes": 261588847,
+      "repo_digests": [
+        "bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f"
+      ],
+      "same_base_layers": true
+    },
+    "before_json_direction": {
+      "reference": "bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/noetix/bumi:release.261010.45256ff",
+      "id": "sha256:6dd2948f59afa480f1fceb7e3cbadf8029d35f5fc36d2e9f7fc0df810195e5ce",
+      "size_bytes": 500392685,
+      "repo_digests": [
+        "bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/noetix/bumi@sha256:6dd2948f59afa480f1fceb7e3cbadf8029d35f5fc36d2e9f7fc0df810195e5ce"
+      ],
+      "same_base_layers": true,
+      "history_layer_bytes_sum": 1604796416,
+      "overlay_layers": []
+    },
+    "after_typed_direction": {
+      "reference": "bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/noetix/bumi:release.261014.b74c902",
+      "id": "sha256:18a5635f6a5421ce88fa7f0d4d97d006a349af46f796e1e70e74d61a09a35b56",
+      "size_bytes": 500827551,
+      "repo_digests": [
+        "bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/noetix/bumi@sha256:18a5635f6a5421ce88fa7f0d4d97d006a349af46f796e1e70e74d61a09a35b56"
+      ],
+      "same_base_layers": true,
+      "history_layer_bytes_sum": 1606885376,
+      "overlay_layers": [
+        {
+          "size_bytes": 4096,
+          "created_by": "RUN |1 PYPI_MIRROR=https://mirrors.tencentyun.com/pypi/simple/ /bin/sh -c /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c \"from audio_msgs.msg import AudioChunk, SoundDirection\"' # buildkit"
+        },
+        {
+          "size_bytes": 1142784,
+          "created_by": "COPY /bumi_ros_ws/install/ /bumi_ros_ws/install/ # buildkit"
+        }
+      ]
+    }
+  },
+  "delta_bytes": 434866,
+  "history_delta_bytes": 2088960
+}

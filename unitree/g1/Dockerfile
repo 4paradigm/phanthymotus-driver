@@ -42,21 +42,26 @@ RUN pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclone
 # Force FastDDS to match agent-core (which has no CycloneDDS rmw installed).
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY resource/       /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
+COPY timed_motion.py /work/timed_motion.py
 COPY sport_mode_state.py /work/sport_mode_state.py
 COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY av_recording.py /work/av_recording.py
+COPY servo.py /work/servo.py
+COPY arm_sdk.py /work/arm_sdk.py
+COPY servo_eef.py /work/servo_eef.py
 COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
@@ -72,4 +77,30 @@ ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><O
 
 EXPOSE 15701
 
-CMD ["/bin/bash", "-c", "if command -v nvpmodel >/dev/null 2>&1; then nvpmodel -m 0 2>/dev/null; jetson_clocks 2>/dev/null; echo '[init] Jetson MAXN + clocks locked'; fi && source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
+# The image deliberately does **not** try to set the Jetson power mode or lock
+# its clocks. It used to: the CMD began with
+#
+#   if command -v nvpmodel >/dev/null 2>&1; then nvpmodel -m 0; jetson_clocks; fi
+#
+# and on r1_sz that branch had never once been taken, because there is no
+# `nvpmodel` inside the container — it is part of the host's L4T tooling, and
+# both commands write host-wide state that a container has no business owning
+# anyway. The line read as "this is handled" while the GPU sat at 612 MHz of its
+# 918 MHz ceiling and the memory clock at two thirds of its own.
+#
+# It belongs to the host installer, which runs as root outside any container:
+# `resource-center/public/install.sh`, step 1.55. That one also installs a
+# systemd unit, because `jetson_clocks` is not persistent across a reboot while
+# `nvpmodel` is — so a rebooted machine and a fresh one would otherwise run at
+# different speeds with nothing anywhere saying why.
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
+
+# ── IK：pinocchio ───────────────────────────────────────────────────────────
+#
+# `servo_eef` 解逆运动学要它。**加在文件末尾**是有意的：在开头插一个 ARG 或一条
+# RUN 会让它后面的每一层都失效，整个镜像重建一遍。
+#
+# 约 200 MB。只有 servo_eef 用得到，而那张卡默认关闭 —— 但装它而不是让 import 在
+# 运行时失败：一张声明了 eef_pose 却解不了 IK 的卡片，会收下位姿然后什么都不做，
+# 而画布上它看起来是在跑的。缺了它 `ArmChain` 会拒绝启动并写出包名。
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} pin

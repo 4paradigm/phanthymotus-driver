@@ -45,13 +45,13 @@ COPY common/ /work/common/
 COPY main.py        /work/main.py
 COPY device.py      /work/device.py
 COPY estop.py       /work/estop.py
+COPY battery_status.py /work/battery_status.py
 COPY grpc_client.py /work/grpc_client.py
 COPY config.yaml    /work/config.yaml
 COPY deploy/        /deploy/
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONPATH=/work:/opt/pyzed
 ENV PYTHONUNBUFFERED=1

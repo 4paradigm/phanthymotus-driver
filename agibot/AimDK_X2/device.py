@@ -139,13 +139,21 @@ class AimdkNodes:
 
         self.streams = {}
 
-        def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None):
+        def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None, transform=None):
+            # `transform` converts the vendor message into a different core
+            # message type — depth needs it, because the vendor publishes a raw
+            # sensor_msgs/Image and every consumer in this project wants the
+            # zlib form (~614 KB/frame vs ~12 KB; raw z16 saturates ARM64 CPU
+            # on DDS serialization). Same conversion as agibot/A3's `_to_zlib`.
             core_topic = f"/{namespace}/agibot_x2/{key}"
             as_json = fmt == "data/json"
-            core_msg_type = String if as_json else msg_type
+            core_msg_type = String if as_json else (
+                self._CompressedImage if transform is not None else msg_type)
             pub = self.core.create_publisher(core_msg_type, core_topic, depth)
             self.robot.create_subscription(
-                msg_type, robot_topic, self._callback(key, pub, as_json=as_json), qos or depth,
+                msg_type, robot_topic,
+                self._callback(key, pub, as_json=as_json, transform=transform),
+                qos or depth,
             )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
@@ -165,7 +173,13 @@ class AimdkNodes:
         # info`, 30Hz). No depth topic is published anywhere on this hardware at all, so
         # camera_depth stays wired to the documented (currently inactive) topic.
         mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
-        mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
+        # Declared zlib like every other depth source. **Unverified on hardware**:
+        # the comment above still holds — no depth topic is published anywhere on
+        # this unit, so the vendor Image this mirror would convert has never
+        # arrived. `transform` is A3's `_to_zlib` shape; whoever first sees real
+        # frames here should check the step/endianness handling against them.
+        mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image",
+               "image/depth-zlib", qos=sensor_qos, transform=self._depth_to_zlib)
         mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
         mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
 
@@ -201,10 +215,48 @@ class AimdkNodes:
         self.get_mic_source = client(GetMicSourceRequest, "/aimdk_5Fmsgs/srv/GetMicSourceRequest")
         self.get_stored_map = client(GetStoredMapByName, "/aimdk_5Fmsgs/srv/GetStoredMapByName")
 
-    def _callback(self, key, publisher, *, as_json=False):
+    @property
+    def _CompressedImage(self):
+        from sensor_msgs.msg import CompressedImage
+        return CompressedImage
+
+    def _depth_to_zlib(self, msg):
+        """sensor_msgs/Image (16UC1) → CompressedImage "16UC1; compressedDepth zlib".
+
+        Same conversion as agibot/A3's `_to_zlib`. **Never run against real
+        frames**: this unit publishes no depth topic at all, so the step and
+        endianness handling here is untested — check it against real data the
+        first time any arrives.
+        """
+        import zlib
+        import numpy as np
+
+        height, width = int(msg.height), int(msg.width)
+        if str(getattr(msg, "encoding", "")) not in ("16UC1", "mono16"):
+            return None
+        if not height or not width or getattr(msg, "is_bigendian", False):
+            return None
+        raw = np.frombuffer(bytes(msg.data), np.uint8)
+        step = int(getattr(msg, "step", 0) or width * 2)
+        if step < width * 2 or raw.size < step * height:
+            return None
+        depth = raw[:step * height].reshape(height, step)[:, :width * 2]
+        depth = depth.reshape(height, width, 2).view(np.uint16).reshape(height, width)
+        out = self._CompressedImage()
+        out.header = msg.header
+        out.format = "16UC1; compressedDepth zlib"
+        out.data = zlib.compress(depth.astype("<u2", copy=False).tobytes(), 1)
+        return out
+
+    def _callback(self, key, publisher, *, as_json=False, transform=None):
         from std_msgs.msg import String
 
         def callback(msg):
+            if transform is not None:
+                converted = transform(msg)
+                if converted is not None:
+                    publisher.publish(converted)
+                return
             if as_json:
                 # only the data/json path is ever read back via snapshot(); computing this for
                 # binary streams (camera/lidar) would mean converting a JPEG/pointcloud byte
