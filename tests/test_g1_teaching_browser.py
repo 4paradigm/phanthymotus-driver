@@ -11,11 +11,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unitree/g1/tests"))
 from test_g1_teaching import g1_teaching, call, wait_for
 from teaching_browser_support import workbench_site, browser_page, confirm_in_browser, capture, pytestmark
+from common.teaching.service import read_execution_policy
 
 
 @pytest.fixture
 def site(g1_teaching, monkeypatch, tmp_path):
-    from common.teaching.authorization import read_execution_policy
     monkeypatch.setattr('common.teaching.service.read_execution_policy', read_execution_policy)
     service, card, *_ = g1_teaching
     with workbench_site(service, [card, service], monkeypatch, tmp_path,
@@ -105,7 +105,7 @@ def test_g1_record_trial_save_and_agent_call(site, browser_page, g1_teaching, tm
     expect(page.locator('#skill-installed-list')).to_contain_text('G1_23')
     expect(page.locator('#skill-installed-list')).to_contain_text('固定手')
     page.locator('#skill-package-refresh').click()
-    expect(page.locator('#skill-package-export-status')).to_contain_text('调用说明与型号信息已更新')
+    expect(page.locator('#skill-package-refresh-status')).to_contain_text('调用说明与型号信息已更新')
     # Browser settings persist in Core; Driver reads them on each preview.
     before = len(channel.positions)
     with page.expect_response(lambda r: '/api/skills/package/execution/' in r.url and r.request.method == 'POST') as response:
@@ -122,37 +122,40 @@ def test_g1_record_trial_save_and_agent_call(site, browser_page, g1_teaching, tm
     import os
     if directory := os.environ.get('TEACHING_SCREENSHOT_DIR'):
         page.locator('#skill-overlay .modal').screenshot(path=str(Path(directory) / 'g1-07-skill-detail.png'))
-    with page.expect_download() as pending_download:
-        page.locator('#skill-package-export').click()
+    # Core no longer owns an archive download/import dialog. Export produces
+    # a Driver file; this fixture copies it to stand in for an operator's file.
+    exported = call(service, 'export', asset_id=service.draft['id'])
     action_file = tmp_path / 'g1.motus-skill'
-    pending_download.value.save_as(action_file)
+    action_file.write_bytes(Path(exported['path']).read_bytes())
     assert action_file.stat().st_size > 0
-    # Exact local validated package is reused without creating a new draft.
-    page.locator('#skill-package-open').click()
-    page.locator('#skill-package-file').set_input_files(action_file)
-    expect(page.locator('#skill-package-install')).to_be_enabled()
-    page.locator('#skill-package-install').click()
-    expect(page.locator('#skill-package-export-status')).to_contain_text('已复用本机相同动作')
-    assert len(config.ConfigDB().get('skills')['installed']) == 1
-    page.locator('#skill-package-open').click()
-    page.locator('#skill-package-file').set_input_files(action_file)
-    expect(page.locator('#skill-package-summary')).to_contain_text('G1_23')
-    expect(page.locator('#skill-package-install')).to_be_enabled()
-    if directory := os.environ.get('TEACHING_SCREENSHOT_DIR'):
-        page.locator('#skill-package-overlay .modal').screenshot(path=str(Path(directory) / 'g1-06-import.png'))
+    page.locator('#skill-close').click()
+    teaching_card = page.locator('[data-card-id="teach"]')
+    action = teaching_card.locator('[data-key="action"]')
+    action.select_option('import')
+    with page.expect_file_chooser() as chooser:
+        teaching_card.locator('.canvas-file-btn').click()
+    chooser.value.set_files(action_file)
+    expect(teaching_card.locator('.canvas-file-name')).to_have_text('g1.motus-skill')
     before = len(channel.positions)
     card.cfg['trajectory_device_id'] = 'second-compatible-g1'
-    page.locator('#skill-package-install').click()
+    with page.expect_response(lambda r: r.url.endswith('/api/mcp/test-g1/call') and
+                              r.request.post_data_json.get('arguments', {}).get('action') == 'import'):
+        teaching_card.locator('.canvas-exec-btn').click()
+    assert service.draft.get('imported')
+    action.select_option('ui')
+    teaching_card.locator('.canvas-exec-btn').click()
     expect(ui.locator('#trial-status')).to_contain_text('等待本机试运行')
     assert len(config.ConfigDB().get('skills')['installed']) == 1
     assert len(channel.positions) == before
     expect(ui.locator('#trial-btn')).to_be_enabled()
-    # Closing does not lose the pending import; resume directly from Skills.
+    # Pending imports now belong to this Driver's own workbench.
     draft_id = service.draft['id']
     page.get_by_role('button', name='关闭工作台').click()
-    pending = page.locator(f'#skill-pending-list [data-draft-id="{draft_id}"]')
-    expect(pending).to_contain_text('待验证')
-    pending.get_by_role('button', name='继续验证').click()
+    teaching_card.locator('.canvas-exec-btn').click()
+    ui.locator('#pending-drafts summary').click()
+    expect(ui.locator('#drafts')).to_contain_text('G1 双臂演示')
+    ui.locator('#drafts').select_option(draft_id)
+    ui.locator('#open-draft-btn').click()
     expect(ui.locator('#trial-btn')).to_be_enabled()
     expect(ui.locator('#import-enable-btn')).to_be_disabled()
     ui.locator('#trial-btn').click()

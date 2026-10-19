@@ -33,7 +33,7 @@ def workbench_site(teaching, plugins, monkeypatch, tmp_path, mcp_id, name):
     sys.path.insert(0, str(Path(CORE) / 'agent-core/src'))
     monkeypatch.setenv('DB_PATH', str(tmp_path / 'core.db'))
     import config
-    from api import skills, mcp_manage, canvas
+    from api import skills, mcp_manage, canvas, file
     import auth
     monkeypatch.setattr(auth, '_token', 'test-only-token')
     monkeypatch.setattr(canvas, '_editor_session', None)
@@ -46,7 +46,15 @@ def workbench_site(teaching, plugins, monkeypatch, tmp_path, mcp_id, name):
         {'id': 'teach', 'mcpId': mcp_id, 'toolName': teaching.name, 'x': 390, 'y': 70}],
         'execConnections': [{'fromCardId': 'core', 'toCardId': 'teach', 'toMcpId': mcp_id, 'toToolName': teaching.name}]}
     bundle = DriverBundle(plugins)
-    driver = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(lambda: bundle, mcp_id, mcp_id))
+    from common import file_intake
+    monkeypatch.setenv('ACCESS_TOKEN', 'test-only-token')
+    monkeypatch.setenv('FILE_INTAKE_DIR', str(tmp_path / 'driver-uploads'))
+    class Handler(make_handler(lambda: bundle, mcp_id, mcp_id)):
+        def do_POST(self):
+            if file_intake.serve_upload(self):
+                return
+            super().do_POST()
+    driver = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     driver_thread = threading.Thread(target=driver.serve_forever, daemon=True); driver_thread.start()
     config.main['services'] = {'mcp': [{'id': mcp_id, 'name': name,
         'transport': 'http', 'url': f'http://127.0.0.1:{driver.server_port}/mcp', 'tools': bundle.get_all_tools()}]}
@@ -54,6 +62,7 @@ def workbench_site(teaching, plugins, monkeypatch, tmp_path, mcp_id, name):
     app.include_router(skills.router, prefix='/api')
     app.include_router(mcp_manage.router, prefix='/api')
     app.include_router(canvas.router, prefix='/api')
+    app.include_router(file.router, prefix='/api')
     app.mount('/', StaticFiles(directory=Path(CORE) / 'agent-core/web', html=True))
     sock = socket.socket(); sock.bind(('127.0.0.1', 0)); sock.listen(128)
     port = sock.getsockname()[1]

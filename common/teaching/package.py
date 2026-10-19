@@ -1,22 +1,21 @@
-"""Bounded action packages and temporary transfers; never executable content.
+"""Bounded action packages; transport belongs to the driver's file intake.
 
 Only the robot adapter can validate/rebind a trajectory. Import creates a draft,
 not an approved skill. No archive paths are extracted into the filesystem.
 """
-import base64
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
-import secrets
-import tempfile
-import time
+import stat
 import zipfile
 
 SCHEMA = "motus.teaching.package/1"
 MAX_ARCHIVE = 16 * 1024 * 1024
 MAX_RECORDING = 64 * 1024 * 1024
-CHUNK = 24 * 1024
+SKILL_FIELDS = {"name": 100, "description": 1000, "conditions": 1000, "phrase": 200}
+RECORDING_FIELDS = {"path", "bytes", "sha256", "schema"}
 
 
 def unique(pairs):
@@ -29,18 +28,17 @@ def unique(pairs):
 
 
 def validate_manifest(manifest):
-    if not isinstance(manifest, dict) or set(manifest) != {"schema", "skill", "compatibility", "recording"}:
+    if not isinstance(manifest, dict) or not {"schema", "skill", "compatibility", "recording"} <= manifest.keys():
         raise ValueError("invalid_skill_package_manifest")
     if manifest["schema"] != SCHEMA or not isinstance(manifest["compatibility"], dict):
         raise ValueError("unsupported_skill_package")
     meta = manifest["skill"]
-    limits = {"name": 100, "description": 1000, "conditions": 1000, "phrase": 200}
-    if not isinstance(meta, dict) or set(meta) != set(limits):
+    if not isinstance(meta, dict) or not SKILL_FIELDS.keys() <= meta.keys():
         raise ValueError("invalid_package_skill")
-    if any(not isinstance(meta[k], str) or not meta[k].strip() or len(meta[k]) > n for k, n in limits.items()):
+    if any(not isinstance(meta[k], str) or not meta[k].strip() or len(meta[k]) > n for k, n in SKILL_FIELDS.items()):
         raise ValueError("invalid_package_skill")
     rec = manifest["recording"]
-    if (not isinstance(rec, dict) or set(rec) != {"path", "bytes", "sha256", "schema"}
+    if (not isinstance(rec, dict) or not RECORDING_FIELDS <= rec.keys()
             or rec["path"] != "trajectory.jsonl" or type(rec["bytes"]) is not int
             or not 1 <= rec["bytes"] <= MAX_RECORDING
             or not isinstance(rec["sha256"], str) or len(rec["sha256"]) != 64
@@ -84,73 +82,23 @@ def unpack(data):
             recording = archive.read(rec)
             if hashlib.sha256(recording).hexdigest() != manifest["recording"]["sha256"]:
                 raise ValueError("package_checksum_mismatch")
+            # Unknown manifest fields may be added without changing the wire
+            # version. Do not forward them as authoring/save arguments.
+            manifest = {"schema": manifest["schema"], "compatibility": manifest["compatibility"],
+                        "skill": {k: manifest["skill"][k] for k in SKILL_FIELDS},
+                        "recording": {k: manifest["recording"][k] for k in RECORDING_FIELDS}}
             return manifest, recording
     except (zipfile.BadZipFile, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid_skill_package") from exc
 
 
-class Transfers:
-    """One upload and one download per card, bounded by size and lifetime."""
-    def __init__(self):
-        self.root = tempfile.TemporaryDirectory(prefix="motus-teaching-")
-        self.items = {}
-
-    def _purge(self, mode=None):
-        for ident, item in list(self.items.items()):
-            if item["expires"] <= time.monotonic() or item["mode"] == mode:
-                item["path"].unlink(missing_ok=True)
-                del self.items[ident]
-
-    def begin(self, size, digest, mode, data=None):
-        if type(size) is not int or not 1 <= size <= MAX_ARCHIVE:
-            raise ValueError("invalid_package_size")
-        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            raise ValueError("invalid_package_digest")
-        self._purge(mode)
-        ident = secrets.token_hex(16)
-        path = Path(self.root.name) / ident
-        path.touch(mode=0o600)
-        if data is not None:
-            path.write_bytes(data)
-        self.items[ident] = {"path": path, "size": size, "sha256": digest,
-                             "mode": mode, "expires": time.monotonic()+1800}
-        return {"transfer_id": ident, "bytes": size, "sha256": digest, "chunk_bytes": CHUNK}
-
-    def get(self, ident, mode):
-        self._purge()
-        if ident not in self.items or self.items[ident]["mode"] != mode:
-            raise ValueError("package_transfer_expired")
-        return self.items[ident]
-
-    def read(self, ident, offset):
-        item = self.get(ident, "download")
-        if type(offset) is not int or not 0 <= offset < item["size"]:
-            raise ValueError("invalid_package_offset")
-        with item["path"].open("rb") as stream:
-            stream.seek(offset)
-            data = stream.read(CHUNK)
-        return {"data": base64.b64encode(data).decode(), "next_offset": offset+len(data)}
-
-    def write(self, ident, offset, encoded):
-        item = self.get(ident, "upload")
-        if not isinstance(encoded, str) or len(encoded) > CHUNK*4//3:
-            raise ValueError("package_chunk_too_large")
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except ValueError as exc:
-            raise ValueError("invalid_package_chunk") from exc
-        if (not data or type(offset) is not int or offset != item["path"].stat().st_size
-                or offset+len(data) > item["size"]):
-            raise ValueError("invalid_package_offset")
-        with item["path"].open("ab") as stream:
-            stream.write(data)
-        return {"next_offset": offset+len(data)}
-
-    def finish(self, ident):
-        item = self.get(ident, "upload")
-        data = item["path"].read_bytes()
-        if len(data) != item["size"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
-            raise ValueError("package_transfer_incomplete_or_changed")
-        item["path"].unlink()
-        del self.items[ident]
-        return unpack(data)
+def read_package(path):
+    """Read the receiving container's path returned by POST /file/upload."""
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ValueError("请选择动作包上传，并使用设备返回的绝对路径")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or not 1 <= info.st_size <= MAX_ARCHIVE:
+            raise ValueError("invalid_skill_package_file")
+        return unpack(stream.read(MAX_ARCHIVE + 1))

@@ -61,6 +61,7 @@ class G1TeachingAdapter:
             raise ValueError("unsupported_g1_package_profile")
         binding = self.trajectory.binding()
         return {"manufacturer": "unitree", "model": "G1", "variant": "G1_23",
+                "labels": ["宇树 G1_23", "双臂", "固定手", "10 关节"],
                 "scope": "dual_arm", "end_effectors": "fixed_hand",
                 "joint_names": list(profile["arm_joint_names"]),
                 "model_sha256": binding["model_sha256"], "geometry_sha256": binding["geometry_sha256"],
@@ -94,11 +95,12 @@ class G1TeachingAdapter:
     def import_recording(self, manifest, data):
         self.trajectory._idle()
         current, required = self.compatibility(), manifest["compatibility"]
-        if set(required) != set(current):
+        fields = current.keys() - {'driver_version', 'labels'}
+        if not fields <= required.keys():
             raise ValueError("invalid_package_compatibility")
         # Build labels are informative. Capability, geometry and joint order
         # are the compatibility contract, never a loose substring of "G1".
-        for key in current.keys() - {"driver_version"}:
+        for key in fields:
             if current[key] != required[key]:
                 raise ValueError("incompatible_robot_" + key)
         if manifest["recording"]["schema"] != RECORDING_SCHEMA:
@@ -231,7 +233,7 @@ class G1TeachingAdapter:
         self.preview = None
         return self._call("stop")
 
-    def authorization_context(self):
+    def execution_context(self):
         return [self.arm.boot_id, self.epoch, self.control._generation,
                 self.arm.feedback_epoch, self.arm.profile_sha256]
 
@@ -267,16 +269,15 @@ class G1TeachingAdapter:
         if args.get("execute") is True and (args.get("workspace_clear") is not True or args.get("take_control") is not True):
             raise ValueError("user_confirmation_required: 请取得用户本次路径与双臂接管确认")
         epoch, generation = self.epoch, self.control._generation
-        context = self.authorization_context()
-        if ('_authorized_context' in args and
-                args['_authorized_context'] != context):
-            raise ValueError('session_authorization_expired')
+        context = self.execution_context()
+        if '_execution_context' in args and args['_execution_context'] != context:
+            raise ValueError('execution_context_changed')
         self.trajectory._idle()
         recording = self.inspect(filename)
         start = self.start_difference(filename)
         if not start["can_trial"]:
             raise ValueError(start["error"])
-        if epoch != self.epoch or generation != self.control._generation or context != self.authorization_context():
+        if epoch != self.epoch or generation != self.control._generation or context != self.execution_context():
             raise ValueError("replay_cancelled")
         signature = (filename, recording["sha256"], recording["binding"], generation, epoch)
         if not args.get("execute"):
@@ -295,8 +296,7 @@ class G1TeachingAdapter:
         self.preview = None
         result = self._call("play", filename=filename, expected_generation=generation,
                             expected_sha256=recording["sha256"])
-        return {**result, "state": result["status"],
-                '_authorization_context': [context[0], epoch, generation+1, *context[3:]]}
+        return {**result, "state": result["status"]}
 
     def wait(self, action_id):
         deadline = time.monotonic()+self.completion_timeout

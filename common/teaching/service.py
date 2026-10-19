@@ -6,23 +6,55 @@ motion. Each run goes through the adapter's fresh preview/confirmation gate.
 """
 import copy
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
-import secrets
+import ssl
 import stat
 import tempfile
 import threading
 import time
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 from common.vendor_runtime import action_schema, tool
-from .package import Transfers, pack, SCHEMA as PACKAGE_SCHEMA
-from .authorization import consume_approval, read_execution_policy
+from .package import pack, read_package, SCHEMA as PACKAGE_SCHEMA
 
 PROTOCOL = "motus.workbench/1"
 ASSET_SCHEMA = "motus.teaching.asset/1"
+
+
+def read_execution_policy(tool, instance_id, device_binding, asset_id, asset_binding):
+    """Read this asset's saved policy from the same-host Core; never grant it."""
+    url = urlsplit(os.environ.get('AGENT_CORE_URL', 'https://localhost:15678'))
+    if (url.hostname not in ('localhost', '127.0.0.1', '::1') or url.username or url.password
+            or url.path not in ('', '/') or url.query or url.fragment or url.scheme not in ('http', 'https')):
+        raise ValueError('execution_policy_requires_local_core')
+    kwargs = {'timeout': 3}
+    if url.scheme == 'https':
+        kwargs['context'] = ssl._create_unverified_context()  # host loopback, self-signed Core
+    cls = http.client.HTTPSConnection if url.scheme == 'https' else http.client.HTTPConnection
+    connection = cls(url.hostname, url.port, **kwargs)
+    try:
+        body = dict(tool=tool, instance_id=instance_id, device_binding=device_binding,
+                    asset_id=asset_id, asset_binding=asset_binding)
+        connection.request('POST', '/api/skills/package/execution/read', json.dumps(body),
+                           {'Content-Type': 'application/json'})
+        response = connection.getresponse()
+        raw = response.read(4097)
+        if response.status != 200 or len(raw) > 4096:
+            raise ValueError('execution_policy_unavailable')
+        payload = json.loads(raw)
+        policy = payload.get('data') if isinstance(payload, dict) else None
+        if (not isinstance(policy, dict) or type(policy.get('enabled')) is not bool
+                or policy.get('source') not in ('manual', 'skill')
+                or type(policy.get('binding_changed')) is not bool):
+            raise ValueError('invalid_execution_policy')
+        return policy
+    finally:
+        connection.close()
 
 
 class TeachingPlugin:
@@ -35,9 +67,6 @@ class TeachingPlugin:
         self.closed = False
         self.observer = None
         self.record_started = None
-        self.transfers = Transfers()
-        self.grants = {}
-        self.challenges = {}
         self.boot_id = uuid4().hex
 
     def start(self):
@@ -45,8 +74,6 @@ class TeachingPlugin:
 
     def stop(self):
         self.closed = True
-        self.grants.clear()
-        self.challenges.clear()
         self.adapter.stop()
         if self.observer:
             self.observer.join(4)
@@ -59,17 +86,12 @@ class TeachingPlugin:
             "filename": {"type": "string", "description": "已有完整录制文件"},
             "asset_id": {"type": "string", "description": "技能指令中的资产 ID；预览和正式执行都必须传同一个 ID"},
             "execute": {"type": "boolean", "default": False, "description": "正式执行必须为 true；先 preview，按 confirmation_required 判断是否需要人工确认"},
-            "auto_execute_verified": {"type": "boolean", "x-ui-hidden": True},
             "preview_id": {"type": "string", "description": "本次 preview 返回的完整编号，正式执行必填；不得省略或自行编造"},
             "workspace_clear": {"type": "boolean", "description": "用户确认本次活动空间已清空"},
             "take_control": {"type": "boolean", "description": "用户确认本次接管机器人"},
             "effect_confirmed": {"type": "boolean", "description": "用户已观察并确认本次试运行的效果"},
-            "transfer_id": {"type": "string", "x-ui-hidden": True},
-            "offset": {"type": "integer", "x-ui-hidden": True},
-            "bytes": {"type": "integer", "x-ui-hidden": True},
-            "sha256": {"type": "string", "x-ui-hidden": True},
-            "data": {"type": "string", "x-ui-hidden": True},
-            "approval_id": {"type": "string", "x-ui-hidden": True},
+            "package": {"type": "string", "format": "file", "accept": ".motus-skill,.zip",
+                        "uploadTo": "mcp", "description": "选择动作包，上传至当前设备后导入；不会执行动作"},
             **{key: {"type": "string"} for key in ("name", "description", "conditions", "phrase")},
         }
         confirmation = ["execute", "preview_id", "workspace_clear", "take_control"]
@@ -86,51 +108,43 @@ class TeachingPlugin:
             "trial": (["draft_id", *confirmation], "预览或确认试运行当前录制"),
             "save": (["draft_id", "name", "description", "conditions", "phrase", "effect_confirmed"], "试运行成功且用户确认效果后保存技能"),
             "run": (["asset_id", *confirmation], "执行已保存技能；先 preview。confirmation_required=false 时直接执行，否则检查本次用户确认。running 不是完成"),
-            "preview": (["asset_id"], "只读预览并检查卡片和技能的自动执行设置；confirmation_required=false 时直接按返回参数执行，不再询问"),
+            "preview": (["asset_id"], "只读预览并检查此技能的自动执行设置；confirmation_required=false 时直接按返回参数执行，不再询问"),
             "stop": ([], "请求原控制器停止，读取 info 确认完成结果"),
         }
         if hasattr(self.adapter, "compatibility"):
             actions.update({"package_definition": (["asset_id"], "读取当前版本的技能调用说明，不执行动作"),
-                            "package_export": (["asset_id"], "导出完整动作技能包，不执行动作"),
-                            "package_read": (["transfer_id", "offset"], "读取技能包分块"),
-                            "package_begin": (["bytes", "sha256"], "开始上传动作技能包"),
-                            "package_write": (["transfer_id", "offset", "data"], "写入技能包分块"),
-                            "package_finish": (["transfer_id"], "检查型号并安装为待试运行的草稿，不启用技能")})
+                            "export": (["asset_id"], "在设备保存完整动作包并返回文件路径，不执行动作"),
+                            "import": (["package"], "检查上传的动作包并创建待验证草稿；随后打开录制技能继续试运行")})
             actions.update({"draft_list": ([], "列出本机待验证导入"),
                             "draft_open": (["draft_id"], "继续验证导入草稿，不执行动作")})
-        if hasattr(self.adapter, 'authorization_context'):
-            actions.update({"session_status": (["asset_id"], "读取网页授予的本次调用权限"),
-                            "session_challenge": (["asset_id"], "为网页授权生成一次性核验请求，不授予权限"),
-                            "session_authorize": (["asset_id", "approval_id"], "核验 Core 网页一次性授权凭据"),
-                            "session_revoke": (["asset_id"], "撤销本次调用权限，不触发动作")})
         persistent = hasattr(self.adapter, 'execution_binding')
         if persistent:
-            actions.update({'config': (['auto_execute_verified'], '应用网页保存的卡片配置'),
-                            'execution_binding': (['asset_id'], '读取设备及已验证动作的绑定，不执行动作')})
+            actions['execution_binding'] = (['asset_id'], '读取设备及已验证动作的绑定，不执行动作')
         schema = action_schema(actions, fields)
         schema["additionalProperties"] = False
         schema["x-resource"] = getattr(self.adapter, "resources", "arm")
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
+        schema["x-stop"] = {"pending_flags": {"busy": True, "authority_released": False}}
         schema["x-completion"] = {"actions": ["run"], "timeout": getattr(self.adapter, "completion_timeout", 610)}
         schema["x-workbench"] = {"protocol": PROTOCOL, "kind": "skill-authoring",
                                  "title": "录制技能 · " + self.adapter.title, "entry": "ui", "actions": list(actions)}
         if hasattr(self.adapter, "compatibility"):
-            schema["x-skill-package"] = {"schema": PACKAGE_SCHEMA, "pending": True,
-                                        "session_authorization": hasattr(self.adapter, 'authorization_context'),
-                                        "persistent_execution": persistent}
+            schema["x-skill-package"] = {"schema": PACKAGE_SCHEMA, "persistent_execution": persistent}
         schema["properties"]["action"]["oneOf"] = [
-            {"const": a, "title": {"ui": "录制技能", "run": "运行技能"}.get(a, a)} for a in actions]
-        # The full wire contract includes authoring. Only execution/lifecycle are
-        # useful as LLM/canvas actions; authoring is handled by the workbench.
-        schema["x-action-params"] = {a: schema["x-action-params"][a] for a in ("start", "info", "preview", "run", "stop")}
+            {"const": a, "title": {"ui": "录制技能", "run": "运行技能", "import": "导入动作包",
+                                    "export": "导出动作包"}.get(a, a)} for a in actions]
+        # Recording authoring stays in the workbench; file import/export also
+        # use the ordinary canvas/LLM argument form.
+        public = ["start", "info", "preview", "run", "stop"]
+        if hasattr(self.adapter, "compatibility"):
+            public += ["import", "export"]
+        schema["x-action-params"] = {a: schema["x-action-params"][a] for a in public}
         schema["x-action-params"]["preview"]["required"] = ["asset_id"]
         schema["x-action-params"]["run"]["required"] = ["asset_id", "execute", "preview_id"]
+        if "import" in public:
+            schema["x-action-params"]["import"]["required"] = ["package"]
+            schema["x-action-params"]["export"]["required"] = ["asset_id"]
         definition = tool(self.name, "actuator", self.adapter.title + "：基于已验证示教录制的技能；保留原有速度、标定和设备绑定。", schema)
-        if persistent:
-            definition['configSchema'] = {'type': 'object', 'additionalProperties': False, 'properties': {
-                'auto_execute_verified': {'type': 'boolean', 'default': False, 'scope': 'instance', 'x-widget': 'checkbox',
-                    'title': '本设备所有已验证技能自动执行',
-                    'description': '开启后，已有及以后验证通过的示教技能无需逐次确认。长期保存；每次仍检查设备、起点和控制权。'}}}
         return [definition]
 
     def _validate(self, action, args):
@@ -141,10 +155,9 @@ class TeachingPlugin:
             if key == "_tool_name":
                 continue
             prop = schema["properties"].get(key)
-            limit = 32768 if key == "data" and action == "package_write" else 4000
             if prop is None or (prop["type"] == "boolean" and type(value) is not bool) or (
                     prop["type"] == "integer" and type(value) is not int) or (
-                    prop["type"] == "string" and (not isinstance(value, str) or len(value) > limit)):
+                    prop["type"] == "string" and (not isinstance(value, str) or len(value) > 4000)):
                 raise ValueError("invalid_teaching_argument_" + key)
 
     def _current(self, args):
@@ -170,54 +183,10 @@ class TeachingPlugin:
 
     def _execution_policy(self, args):
         if not hasattr(self.adapter, 'execution_binding'):
-            return {'enabled': False, 'device_enabled': False, 'supported': False}
+            return {'enabled': False, 'source': 'manual', 'binding_changed': False, 'supported': False}
         binding = self._execution_binding(args.get('asset_id', ''))
         policy = read_execution_policy(self.name, args.get('instance_id', ''), **binding)
         return {**policy, 'supported': True}
-
-    def _grant(self, asset_id, recording):
-        grant = self.grants.get(asset_id)
-        if grant and (time.monotonic() >= grant['expires'] or grant['sha256'] != recording['sha256']
-                      or grant['binding'] != recording['binding']
-                      or grant['context'] != self.adapter.authorization_context()):
-            self.grants.pop(asset_id, None)
-            grant = None
-        return grant
-
-    def _session(self, action, args):
-        asset_id = args.get('asset_id')
-        asset, recording = self._read_asset(asset_id)
-        if action == 'session_revoke':
-            self.grants.pop(asset_id, None)
-            self.challenges.pop(asset_id, None)
-            return {'active': False}
-        if action == 'session_challenge':
-            self._idle()
-            if not asset.get('effect_confirmed') or asset.get('trial', {}).get('status') != 'completed':
-                raise ValueError('successful_trial_required')
-            self.adapter.play(recording['filename'], {'execute': False})
-            nonce = secrets.token_hex(32)
-            self.challenges[asset_id] = {'nonce': nonce, 'expires': time.monotonic()+30,
-                'context': self.adapter.authorization_context(), 'sha256': recording['sha256'],
-                'binding': recording['binding'], 'instance_id': args.get('instance_id', '')}
-            return {'nonce': nonce}
-        if action == 'session_authorize':
-            self._idle()
-            challenge = self.challenges.pop(asset_id, None)
-            if (not challenge or time.monotonic() >= challenge['expires']
-                    or challenge['sha256'] != recording['sha256'] or challenge['binding'] != recording['binding']
-                    or challenge['context'] != self.adapter.authorization_context()
-                    or challenge['instance_id'] != args.get('instance_id', '')):
-                raise ValueError('session_approval_expired')
-            receipt = consume_approval(args.get('approval_id'))
-            expected = {'nonce': challenge['nonce'], 'asset_id': asset_id, 'tool': self.name,
-                        'instance_id': challenge['instance_id'], 'seconds': 1800}
-            if receipt != expected:
-                raise ValueError('session_approval_scope_mismatch')
-            self.grants[asset_id] = {**challenge, 'expires': time.monotonic()+1800}
-        grant = self._grant(asset_id, recording)
-        return {'active': bool(grant), 'remaining_seconds': max(0, int(grant['expires']-time.monotonic())) if grant else 0,
-                'conditions': asset['metadata']['conditions'], 'name': asset['metadata']['name']}
 
     def _persist_draft(self):
         if not self.draft or not self.draft.get('imported'):
@@ -265,8 +234,9 @@ class TeachingPlugin:
                 if (asset.get('effect_confirmed') and asset.get('trial', {}).get('status') == 'completed'
                         and asset['metadata'] == manifest['skill']
                         and self.adapter.export_recording(recording) == data
-                        and {k:v for k,v in self.adapter.compatibility().items() if k != 'driver_version'} ==
-                            {k:v for k,v in manifest['compatibility'].items() if k != 'driver_version'}):
+                        and all(manifest['compatibility'].get(k) == v
+                                for k, v in self.adapter.compatibility().items()
+                                if k not in ('driver_version', 'labels'))):
                     return {'skill': self._skill_definition(asset['id'], asset['metadata']),
                             'asset_id': asset['id'], 'reused': True, 'requires_local_trial': False}
             except (ValueError, OSError, KeyError):
@@ -303,8 +273,6 @@ class TeachingPlugin:
             elif purpose == "run":
                 self.last_run = outcome
             self.pending = None
-            if outcome.get('status') != 'completed':
-                self.grants.clear()
         # The adapter's motion owner delivers ACP for this same action_id. Do
         # not send a second event; Core correlates by ID, not by card name.
 
@@ -324,36 +292,26 @@ class TeachingPlugin:
     def _run(self, args):
         if not args.get("asset_id"):
             raise ValueError("missing_asset_id: 预览和正式执行均须传技能指令中的 asset_id；没有执行动作")
+        context = self.adapter.execution_context() if hasattr(self.adapter, 'execution_context') else None
         _, recording = self._read_asset(args["asset_id"])
         policy = self._execution_policy(args)
         automatic = policy.get('enabled') is True
-        grant = self._grant(args['asset_id'], recording) if hasattr(self.adapter, 'authorization_context') else None
         if args.get("execute") is True:
             if not args.get("preview_id"):
                 raise ValueError("missing_preview_id: 请保留 asset_id 并补齐本次预览的 preview_id；没有执行动作")
             if automatic:
                 args = dict(args, workspace_clear=True, take_control=True,
-                            _authorized_context=self.adapter.authorization_context())
-            elif grant:
-                args = dict(args, workspace_clear=True, take_control=True, _authorized_context=list(grant['context']))
+                            _execution_context=context)
             elif args.get("workspace_clear") is not True or args.get("take_control") is not True:
                 raise ValueError("user_confirmation_required: 请先询问用户本次路径、环境和双臂接管；不得自行将确认字段设为 true")
-        try:
-            result = self._play(recording, args, "run")
-        except Exception:
-            self.grants.pop(args['asset_id'], None)
-            raise
-        if grant and result.get('state') == 'running':
-            grant['context'] = result.pop('_authorization_context')
+        result = self._play(recording, args, "run")
         if result.get("executed") is False:
-            authorized = automatic or bool(grant)
-            result.update(asset_id=args["asset_id"], confirmation_required=not authorized,
+            result.update(asset_id=args["asset_id"], confirmation_required=not automatic,
                           execution_policy=policy,
-                          next_step=("已允许自动执行，按 execution_arguments 执行，无需重复询问；预览不是动作完成" if authorized else
+                          next_step=("已允许自动执行，按 execution_arguments 执行，无需重复询问；预览不是动作完成" if automatic else
                                      "询问用户本次活动空间、使用条件及双臂接管，得到确认后再执行；也可在技能详情设置自动执行"),
                           execution_arguments={"asset_id": args["asset_id"], "execute": True,
-                              "preview_id": result["preview_id"], **({} if authorized else {"workspace_clear": False, "take_control": False})})
-        result.pop('_authorization_context', None)
+                              "preview_id": result["preview_id"], **({} if automatic else {"workspace_clear": False, "take_control": False})})
         return result
 
     def _read_asset(self, asset_id):
@@ -422,10 +380,10 @@ class TeachingPlugin:
                 f"这是 {self.adapter.title} 的已示教录制技能，资产 ID：{asset_id}。\n"
                 f"用户描述：{metadata['description']}\n使用条件：{metadata['conditions']}\n"
                 f"1. 调用当前设备的 {self.name}.preview，参数：" + json.dumps({"asset_id": asset_id}) + "。\n"
-                "2. 预览成功没有执行动作。若 confirmation_required=false，驱动已核验卡片/技能自动执行设置或有效会话授权，"
+                "2. 预览成功没有执行动作。若 confirmation_required=false，驱动已核验此技能在当前卡片、设备和录制上的自动执行设置，"
                 "用户要求执行时直接使用返回的 execution_arguments，不再追问。若为 true，表示没有自动执行权限，不表示用户尚未在对话中确认。"
                 "先检查当前尚未执行的同一次请求：用户若已明确确认本次使用条件、移动路径、活动空间和双臂接管，不再重复询问；缺少确认时只询问缺少的条件并等待答复。"
-                "用户可在示教保存、技能详情或卡片配置设置自动执行，持久设置在停止项目和重启后仍保留。不得自行修改配置或调用 session_challenge/session_authorize 授予权限。"
+                "用户可在示教保存、导入启用或技能详情设置此技能的自动执行，停止项目和重启后仍保留。不得替用户修改自动执行设置。"
                 "仅在 confirmation_required=true 时，用户只说技能名称或‘抬手’不等于已确认环境与接管。未取得确认不得填写 true；已经明确确认时应据实填写 true，不得原样照抄预览中的 false。未执行不得播报动作已完成。\n"
                 f"3. confirmation_required=false 时直接调用 {self.name}.run 并原样传入 execution_arguments。仅当需要逐次确认时，取得确认后必须一次传齐：" + json.dumps({"asset_id": asset_id,
                     "execute": True, "preview_id": "替换为本次预览返回的完整 preview_id", "workspace_clear": True,
@@ -451,20 +409,12 @@ class TeachingPlugin:
         self._validate(action, args)
         # Stop must remain reachable while file validation or a slow read is in progress.
         if action == "stop":
-            self.grants.clear()
-            self.challenges.clear()
             return self.adapter.stop()
         if action == "ui":
             return {"protocol": PROTOCOL, "html": Path(__file__).with_name("workbench.html").read_text(encoding="utf-8")}
         with self.lock:
-            if action == 'config':
-                # Authority comes from authenticated Core settings, never an
-                # MCP argument (including a replayed config or model call).
-                return {'state': 'ready', 'adapter_ok': True}
             if action == 'execution_binding':
                 return self._execution_binding(args.get('asset_id', ''))
-            if action.startswith('session_'):
-                return self._session(action, args)
             if action == 'draft_list':
                 drafts = []
                 for path in (self.directory / 'drafts').glob('*.json'):
@@ -487,40 +437,50 @@ class TeachingPlugin:
             if action == "package_definition":
                 asset, _ = self._read_asset(args.get("asset_id"))
                 return {"skill": self._skill_definition(asset["id"], asset["metadata"])}
-            if action == "package_export":
+            if action == "export":
                 asset, recording = self._read_asset(args.get("asset_id"))
                 manifest, data = pack(asset["metadata"], self.adapter.compatibility(),
                                       self.adapter.export_recording(recording), self.adapter.compatibility()["recording_schema"])
-                return {**self.transfers.begin(len(data), hashlib.sha256(data).hexdigest(), "download", data),
-                        "manifest": manifest}
-            if action == "package_read":
-                return self.transfers.read(args.get("transfer_id"), args.get("offset"))
-            if action == "package_begin":
-                return self.transfers.begin(args.get("bytes"), args.get("sha256"), "upload")
-            if action == "package_write":
-                return self.transfers.write(args.get("transfer_id"), args.get("offset"), args.get("data"))
-            if action == "package_finish":
+                directory = self.directory / 'exports'
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                path = directory / (asset['id'] + '.motus-skill')
+                fd, temp = tempfile.mkstemp(prefix='.package-', dir=directory)
+                try:
+                    with os.fdopen(fd, 'wb') as stream:
+                        stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                    os.replace(temp, path)
+                finally:
+                    if os.path.exists(temp): os.unlink(temp)
+                return {'path': str(path.resolve()), 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+                        'manifest': manifest, 'executed': False,
+                        'message': '动作包已保存在设备。此路径属于设备容器，网页不会自动下载或上传技能广场。'}
+            if action == "import":
                 self._idle()
                 if self.draft and self.draft.get("recording") and not self.draft.get("saved") and not self.draft.get('imported'):
                     raise ValueError("finish_or_discard_current_draft_before_import")
-                manifest, data = self.transfers.finish(args.get("transfer_id"))
+                manifest, data = read_package(args.get("package"))
                 reused = self._validated_package(manifest, data)
                 if reused:
-                    return reused
+                    # Re-enter the same save/import path in the host. The
+                    # already-verified device asset is reused, never the
+                    # untrusted validation claimed by an incoming package.
+                    asset, recording = self._read_asset(reused['asset_id'])
+                    self._persist_draft()
+                    self.draft = {'id': asset['id'], 'recording': recording, 'trial': asset['trial'],
+                                  'saved': asset}
+                    return {**reused, 'executed': False,
+                            'next_step': '已复用本机验证记录。选择「录制技能」打开工作台，保存到当前技能库。'}
                 self._persist_draft()
                 recording = self.adapter.import_recording(manifest, data)
                 self.draft = {"id": uuid4().hex, "recording": recording, "trial": None,
                               "imported": {"metadata": manifest["skill"], "compatibility": manifest["compatibility"]}}
                 self.record_started = None
                 self._persist_draft()
-                return {"draft": copy.deepcopy(self.draft), "requires_local_trial": True, "installed": False}
+                return {"draft": copy.deepcopy(self.draft), "requires_local_trial": True, "installed": False,
+                        "executed": False, "next_step": "选择「录制技能」打开工作台，检查并试运行；导入尚未执行动作。"}
             if action == "info":
                 status = self.adapter.info()
-                try:
-                    execution_policy = self._execution_policy({'instance_id': args.get('instance_id', '')})
-                except (ValueError, OSError, RuntimeError) as exc:
-                    execution_policy = {'supported': hasattr(self.adapter, 'execution_binding'),
-                                        'enabled': False, 'device_enabled': False, 'unavailable': str(exc)}
+                execution_policy = {'supported': hasattr(self.adapter, 'execution_binding')}
                 compatibility = None
                 if hasattr(self.adapter, "compatibility"):
                     try:
