@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.7.7'
+VERSION = '0.8.0'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -32,6 +32,12 @@ def rpc(method, params=None):
 
 def read_samples():
     samples = {}
+    pose_tool = next((tool for tool in tools if tool['name']=='pose'),None)
+    if pose_tool:
+        schema=pose_tool['inputSchema']
+        if set(schema['properties'])!={'pose','side','speed'} or schema.get('x-completion')!={'timeout':300} or \
+                schema.get('x-resource')!=['arm_l','arm_r','head']:
+            raise ValueError('Pose schema or shared physical resources differ')
     for name in CARDS:
         result = rpc('tools/call', {'name': name, 'arguments': {
             'action': 'info', 'instance_id': 'readonly-check', '_trace_id': 'readonly-check-trace'}})
@@ -99,7 +105,7 @@ def run_check(timeout=20, camera=False):
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource'}
+    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
         raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
@@ -149,7 +155,7 @@ def run_check(timeout=20, camera=False):
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
     motion_readiness = None
-    for name in names & {'arm_control', 'move_head', 'gripper'}:
+    for name in names & {'arm_control', 'move_head', 'gripper', 'pose'}:
         for action in ('info', 'start', 'stop'):
             reply = rpc('tools/call', {'name': name, 'arguments': {'action': action,
                 '_trace_id': 'readonly-check-trace', 'instance_id': 'readonly-check'}})

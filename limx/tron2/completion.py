@@ -51,10 +51,12 @@ class ArmCompletion:
         return MoveError('Arms are busy or require operator verification; no additional motion sent', False)
 
     def summary(self):
-        return ({key: self.active[key] for key in ('action_id', 'action', 'state')}
+        return ({**{key:self.active[key] for key in ('action_id','action','state')},
+                 **({k:self.active[k] for k in ('stage','completed_stages')} if 'sequence' in self.active else {}),
+                 **({k:self.active['details'][k] for k in ('motion_tool','preset','stages_total')} if 'sequence' in self.active else {})}
                 if self.active else self.last)
 
-    async def dispatch(self, action, target, duration, details):
+    async def dispatch(self, action, target, duration, details, *, sequence=None, guard=None):
         # Core can wake its next action before the callback HTTP response has
         # reached us. Wait for that bounded delivery only after verified arrival;
         # reject immediately while moving or when completion is uncertain.
@@ -75,13 +77,143 @@ class ArmCompletion:
         # A disconnected RPC caller must not cancel the one physical send or
         # abandon its owner. Retrieve a late admission error without hiding it.
         future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
-        job = {'action_id': self.action_prefix + uuid4().hex, 'action': action,
+        job = {'action_id': ('tron2_pose_' if sequence is not None else self.action_prefix) + uuid4().hex, 'action': action,
                'state': 'awaiting_ack', 'target': list(target), 'duration': duration,
                'details': details, 'admission': future, 'ws': self.reader.ws,
                 'serial': self.reader.serial, 'motion_sent': None, 'vendor_acknowledged': False}
         self.active = job
-        self.task = asyncio.create_task(self._run(job))
+        if sequence is not None:
+            job.update(sequence=sequence,guard=guard,cancel_sequence=False,stage=0,completed_stages=0)
+        self.task = asyncio.create_task(self._run_sequence(job) if sequence is not None else self._run(job))
         return await asyncio.shield(future)
+
+    async def dispatch_sequence(self, plan, guard):
+        import copy
+        frames=copy.deepcopy(plan['frames'])
+        if not frames or len(frames)>10:
+            raise ValueError('Invalid pose frame count')
+        for frame in frames:
+            self.validate(frame['joint'],frame['time'])
+            if type(frame['hold']) not in (int,float) or not 0<=frame['hold']<=2:
+                raise ValueError('Invalid pose dwell')
+        # Include every arrival grace window and bounded ACP delivery budget.
+        if sum(f['time']+f['hold']+ARRIVAL_GRACE for f in frames)+10>=300:
+            raise ValueError('Pose exceeds ACP time budget; no motion sent')
+        details={k:copy.deepcopy(v) for k,v in plan.items() if k!='frames'}
+        details['stages_total']=len(frames)
+        return await self.dispatch('pose',frames[0]['joint'],frames[0]['time'],details,
+                                   sequence=frames,guard=guard)
+
+    def cancel_sequence(self):
+        if self.active and self.active.get('sequence') is not None and self.task and not self.task.done() and self.active['state'] not in ('reporting','blocked_requires_operator_check'):
+            self.active['cancel_sequence']=True
+            return True
+        return False
+
+    def _sequence_feedback(self, job, expected):
+        if self.closed or self.active is not job or not self.reader.connected or \
+                self.reader.ws is not job['ws'] or self.reader.serial!=job['serial']:
+            raise ValueError('Pose connection/owner changed; remaining frames cancelled')
+        sample,q,dq=self.feedback()
+        if job['details']['preset']!='reset':
+            packet=skeleton_stream(sample)
+            head=[j for j in packet['joints'] if j['idx']>=14]
+            if len(head)!=2 or any(abs(math.degrees(j['q']))>10 or j.get('dq') is None or abs(j['dq'])>.05 for j in head):
+                raise ValueError('Head moved outside preset admission range; remaining frames cancelled')
+        if len(dq)!=14 or any(v is None or abs(v)>.05 for v in dq) or \
+                max(abs(math.degrees(a-b)) for a,b in zip(q,expected))>1:
+            raise ValueError('Pose start/waypoint feedback changed; remaining frames cancelled')
+
+    async def _run_sequence(self, job):
+        admitted=False;status='error';safe_end=False;any_sent=False
+        result={'arrival_verified':False}
+        expected=job['details']['start_q']
+        try:
+            for index,frame in enumerate(job['sequence']):
+                # A lifecycle stop never creates another motor command.
+                if job['cancel_sequence']:
+                    self._sequence_feedback(job,expected)
+                    status='cancelled';safe_end=True
+                    break
+                await job['guard']()
+                self._sequence_feedback(job,expected)
+                if job['cancel_sequence']:
+                    status='cancelled';safe_end=True
+                    break
+                job.update(stage=index+1,target=list(frame['joint']),duration=frame['time'],
+                           state='awaiting_ack',vendor_acknowledged=False)
+                previous_sent=any_sent
+                any_sent=True if previous_sent is True else None  # Outcome unknown until exact ACK.
+                try:
+                    reply=await self.send(job['target'],job['duration'])
+                except (ValueError,OSError) as exc:
+                    if not admitted and (getattr(exc,'motion_sent',None) is False or getattr(exc,'code',None)=='vendor_rejected'):
+                        self.active=None
+                        job['admission'].set_exception(exc)
+                        return
+                    if getattr(exc,'motion_sent',None) is False:any_sent=previous_sent
+                    elif getattr(exc,'motion_sent',None) is True:any_sent=True
+                    job['motion_sent']=any_sent
+                    if not admitted:
+                        admitted=True
+                        job['admission'].set_result({'action_id':job['action_id'],'action':'pose',
+                            'preset':job['details']['preset'],'state':'blocked_requires_operator_check',
+                            'motion_sent':any_sent,'arrival_verified':False,'completion_protocol':'acp'})
+                    raise ValueError('Pose stage acknowledgement failed; remaining frames cancelled: '+str(exc)) from exc
+                any_sent=True if reply.get('motion_sent') is True or previous_sent is True else None
+                job['motion_sent']=any_sent
+                job['vendor_acknowledged']=reply.get('status')=='accepted'
+                if not job['vendor_acknowledged']:
+                    raise ValueError('Pose requires an exact positive acknowledgement for every stage')
+                job['state']='moving'
+                if not admitted:
+                    admitted=True
+                    job['admission'].set_result({**reply,'action_id':job['action_id'],'action':'pose',
+                        'preset':job['details']['preset'],'side':job['details']['side'],
+                        'state':'moving','motion_sent':any_sent,'arrival_verified':False,
+                        'stages_total':len(job['sequence']),'completion_protocol':'acp'})
+                await self.wait_for_arrival(job)
+                job['completed_stages']=index+1
+                expected=list(job['target'])
+                until=time.monotonic()+frame['hold']
+                while time.monotonic()<until and not job['cancel_sequence']:
+                    self._sequence_feedback(job,expected)
+                    await asyncio.sleep(min(.05,max(0,until-time.monotonic())))
+            else:
+                self._sequence_feedback(job,job['details']['home_q'])
+                status='completed';safe_end=True
+                result.update(arrival_verified=True,reset_verified=True,at_home=True,
+                    verification='every_stage_post_duration_stable_feedback_then_home')
+            if status=='cancelled':
+                result.update(cancelled_remaining_stages=True,segment_arrival_verified=True,
+                    message='后续动作段已取消；反馈确认停在最近已到位动作段，未自动回正')
+        except asyncio.CancelledError:
+            result['error']='Driver stopping; pose may continue; no remaining frames sent'
+        except (ValueError,OSError) as exc:
+            result.update(error=str(exc),error_code=getattr(exc,'code',None),
+                          cancelled_remaining_stages=True)
+        finally:
+            if self.active is not job:return
+            if not admitted:
+                # Pure pre-send failure creates no ACP job or sticky owner.
+                if any_sent is False:
+                    self.active=None
+                    if not job['admission'].done():job['admission'].set_exception(MoveError(result.get('error','Pose stopped before dispatch'),False))
+                    return
+                if not job['admission'].done():job['admission'].set_exception(MoveError('Pose result unknown',None))
+            result.update({k:v for k,v in job['details'].items() if k not in ('start_q','home_q')})
+            result.update(action='pose',joint_count=14,completion_protocol='acp',
+                motion_sent=any_sent,vendor_acknowledged=job['vendor_acknowledged'],
+                completed_stages=job['completed_stages'],motion_may_continue=not safe_end)
+            job['arrival_verified']=safe_end
+            job['state']='reporting'
+            delivered=False
+            try:delivered=await self.report(job['action_id'],status,result)
+            except Exception:pass
+            self.last={'action_id':job['action_id'],'action':'pose','status':status,
+                       'callback_delivered':delivered,**result}
+            if safe_end and delivered:self.active=None
+            else:job['state']='blocked_requires_operator_check'
 
     async def wait_for_arrival(self, job):
         # Wait the nominal duration AFTER ACK, then require distinct new frames
@@ -90,6 +222,7 @@ class ArmCompletion:
         not_before = started + job['duration']
         deadline = not_before + ARRIVAL_GRACE
         last_at = self.reader.joints_at
+        last_vendor = (self.reader.sample('joint_state').get('data') or {}).get('robot_timestamp')
         window = []
         while time.monotonic() < deadline:
             if not self.reader.connected or self.reader.ws is not job['ws'] \
@@ -99,9 +232,16 @@ class ArmCompletion:
             at = self.reader.joints_at
             if at != last_at:
                 last_at = at
+                if job.get('sequence') is not None:
+                    stamp=(sample.get('data') or {}).get('robot_timestamp')
+                    if type(stamp) not in (int,float) or not math.isfinite(stamp) or last_vendor is None or stamp<=last_vendor:
+                        window=[]
+                        await asyncio.sleep(.05)
+                        continue
+                    last_vendor=stamp
                 now = time.monotonic()
                 error = max(abs(math.degrees(a-b)) for a, b in zip(q, job['target']))
-                slow = all(v is None or abs(v) <= VELOCITY_RAW_TOLERANCE for v in dq)
+                slow = (len(dq)==14 and all(v is not None and abs(v)<=VELOCITY_RAW_TOLERANCE for v in dq)) if job.get('sequence') is not None else all(v is None or abs(v) <= VELOCITY_RAW_TOLERANCE for v in dq)
                 if now < not_before or error > TOLERANCE_DEG or not slow:
                     window = []
                 else:

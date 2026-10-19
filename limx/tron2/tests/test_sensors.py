@@ -852,13 +852,13 @@ class PackagingTests(unittest.TestCase):
     def test_staged_entry_imports_without_repository_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.7.7"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.8.0"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -874,7 +874,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual({p['title'].value for p in literal}, {'request_get_joint_state', 'request_movej', 'request_moveh'})
         query = next(p for p in literal if p['title'].value == 'request_get_joint_state')
         self.assertEqual(query['data'].keys, [])
-        for filename in ('motion.py','pose.py','control.py','record.py','teach.py'):
+        for filename in ('motion.py','control.py','record.py','teach.py'):
             self.assertFalse((DRIVER/filename).exists())
 
     def test_config_defaults_and_invalid_poll_or_write_plugin(self):
@@ -898,7 +898,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'gripper', 'camera', 'camera_left', 'camera_right'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')

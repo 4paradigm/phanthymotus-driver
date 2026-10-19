@@ -12,12 +12,13 @@ from vendor import MoveError, RobotReader, validate_movej, reject_constant, moti
 from reset import ResetPose
 from skeleton import skeleton_stream, model
 from completion import ArmCompletion, MotionPeers, ACP_TIMEOUT
+from pose import Pose, tool as pose_tool, arguments as pose_arguments
 from head import HeadCompletion, tool as head_tool, arguments as head_arguments, card_degrees, COORDINATE_CONVENTION
 from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.7.7'
+VERSION = '0.8.0'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -46,7 +47,7 @@ class Adapter:
         self.publish = publish
         self.settings = settings
         self.enabled = settings['enabled_cards']
-        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | ({'arm_control', 'move_head', 'gripper'} | set(GRIPPER_SIDES))):
+        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES))):
             raise ValueError('Unknown TRON2 card in configuration')
         self.reader = reader or RobotReader(settings)
         self.registered_id = None
@@ -54,6 +55,7 @@ class Adapter:
         self.session = session
         self.reset = ResetPose(settings.get('home_file', '/config/tron2/home.json'), self.reader)
         self.motion = ArmCompletion(self.reader, self.report_completion)
+        self.pose = Pose(self.reader,self.motion,self.reset)
         self.head = HeadCompletion(self.reader, self.report_head_completion)
         self.grippers = {name: Gripper(self.reader, self.report_gripper_completion, side)
                          for name, side in GRIPPER_SIDES.items()}
@@ -68,7 +70,7 @@ class Adapter:
         self.camera = self.cameras['camera']
 
     async def report_completion(self, action_id, status, result):
-        return await self._report_completion('arm_control', action_id, status, result)
+        return await self._report_completion(result.get('motion_tool','arm_control'), action_id, status, result)
 
     async def report_gripper_completion(self, action_id, status, result):
         return await self._report_completion('gripper' if 'gripper' in self.enabled else 'gripper_' + result['side'], action_id, status, result)
@@ -141,6 +143,8 @@ class Adapter:
         tools = []
         if 'arm_control' in self.enabled:
             tools.append(self._arm_control_tool())
+        if 'pose' in self.enabled:
+            tools.append(pose_tool())
         if 'move_head' in self.enabled:
             # Core may still inject metadata internally; it is not customer input.
             tools.append(head_tool())
@@ -159,7 +163,7 @@ class Adapter:
                                    **metadata_properties()}},
                 'topic_out': [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}]})
         for name in self.enabled:
-            if name in ({'arm_control', 'move_head', 'gripper'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
+            if name in ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -182,6 +186,8 @@ class Adapter:
         allowed = {'action', 'instance_id', '_trace_id'}
         if name == 'arm_control':
             allowed |= {'joint', 'time'}
+        if name == 'pose':
+            allowed |= {'pose','side','speed'}
         if name == 'move_head':
             allowed |= {'pitch_deg', 'yaw_deg', 'time'}
         if name == 'gripper':
@@ -201,6 +207,13 @@ class Adapter:
             if 'action' in args:
                 raise ValueError('Model has no action')
             return model()
+        if name == 'pose' and name in self.enabled:
+            if args.get('action') in ('info','start','stop'):
+                # Some dashboards retain declared form values on lifecycle calls.
+                # They are inactive here and must never become motor inputs.
+                return self.pose.stop() if args['action']=='stop' else self.pose.info()
+            pose_arguments({k:v for k,v in args.items()})
+            return {'status':'validated','motion_sent':False}
         if name == 'gripper' and name in self.enabled:
             if args.get('action') in ('info','start','stop'):
                 if set(args)-{'action','side','instance_id','_trace_id'}:
@@ -346,6 +359,8 @@ class Adapter:
                         duration = data['time'] if action == 'move' else data['duration_seconds']
                         details = {key: data[key] for key in ('pose_sha256',) if key in data}
                         data = await self.motion.dispatch(action, target, duration, details)
+                    if params.get('name') == 'pose' and data.get('status')=='validated':
+                        data=await self.pose.execute(params.get('arguments',{}))
                     if params.get('name') == 'move_head' and data.get('action') == 'move':
                         details = {key:data[key] for key in ('target_pitch_deg','target_yaw_deg')}
                         data = await self.head.dispatch('move',data['joint'],data['time'],details)
@@ -368,7 +383,7 @@ class Adapter:
                     error = False
                 except (ValueError, TypeError) as exc:
                     data, error = {'error': str(exc)[:240],
-                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control', 'move_head', 'gripper'} | set(GRIPPER_SIDES)) or
+                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)) or
                             params.get('name') in GRIPPER_SIDES and params.get('arguments', {}).get('action') not in MOTION_ACTIONS,
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
                     if params.get('name') == 'gripper' and 'gripper' in self.enabled:
@@ -378,6 +393,8 @@ class Adapter:
                             data['gripper']=self.grippers['gripper_'+side].info()
                     if params.get('name') in self.grippers and params['name'] in self.enabled:
                         data['gripper'] = self.grippers[params['name']].info()
+                    if params.get('name')=='pose' and 'pose' in self.enabled:
+                        data['motion']=self.motion.summary()
                     if params.get('name') == 'move_head' and 'move_head' in self.enabled:
                         data['error_code'] = getattr(exc,'code',None)
                         data['head_motion'] = self.head.summary()
@@ -397,9 +414,10 @@ class Adapter:
         cameras = {name: stream.info() for name, stream in self.cameras.items() if name in self.enabled}
         if not samples and cameras:
             ready = all(info['available'] for info in cameras.values())
-        return web.json_response({'version': VERSION, 'read_only': not set(self.enabled) & ({'arm_control', 'move_head', 'gripper'} | set(GRIPPER_SIDES)), 'ready': ready,
+        return web.json_response({'version': VERSION, 'read_only': not set(self.enabled) & ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)), 'ready': ready,
             'arm_motion': self.motion.summary(),
             'head_motion': self.head.summary(),
+            'pose_motion': self.pose.motion_summary(),
             'grippers': {name: owner.info() for name, owner in self.grippers.items() if name in self.enabled or 'gripper' in self.enabled},
             'camera': self.camera.info() if 'camera' in self.enabled else None,
             'cameras': cameras,
