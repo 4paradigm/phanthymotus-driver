@@ -16,7 +16,7 @@ plugins:
   hand_gesture:
     enabled: true
     motion_speed: 85
-    count_speed: 85
+    number_speed: 85
     thumb_speed_scaling: true
     motion_torque: 100
     motion_timeout_s: 8.0
@@ -42,7 +42,7 @@ plugins:
       6: [255, 255, 0, 0, 0, 255, 128, 128, 128, 255]
       7: [131, 32, 110, 110, 0, 0, 128, 128, 128, 218]
       8: [255, 255, 255, 0, 0, 0, 128, 128, 128, 255]
-      9: [0, 255, 142, 0, 0, 0, 128, 128, 128, 255]
+      9: [100, 81, 142, 0, 0, 0, 128, 128, 128, 172]
     left_number_poses: *number_poses
   hand:
     enabled: true

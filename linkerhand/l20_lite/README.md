@@ -135,9 +135,9 @@ sending a motion command.
 ## Separate `hand_gesture` card (local development)
 
 `driver.yaml` also registers `hand_gesture` as an independent actuator card.
-It adds the six motions from the 2026-10-19 colleague prototype without
+It adapts six motions from the 2026-10-19 colleague prototype without
 changing the existing `hand` actions: `ok_gesture`, `thumb_up_gesture`
-(the prototype named this `thumbs_up_gesture`), `v_sign_gesture`, `count`,
+(the prototype named this `thumbs_up_gesture`), `v_sign_gesture`, `number`,
 `grasp`, and `custom_grasp`. Both hands were physically checked by the
 operator, and `config.yaml` keeps an explicit pose table for each side.
 Do not use those tables on a different hand without recalibration.
@@ -151,11 +151,12 @@ clear. Missing confirmation or an uncalibrated side is rejected before a
 position command. Motion returns `state=running` and an `action_id` and reports
 completion through ACP. `stop` cancels a gesture and releases torque.
 
-`count` accepts start/end integers 0–9 (defaults 1–5) and a 0.2–5-second
-per-number hold time. `grasp` offers `soft`, `standard`, and `firm` with raw
+`number` requires selecting one integer from the 0–9 dropdown and moves to
+that number's calibrated pose; it does not run a counting sequence.
+`grasp` offers `soft`, `standard`, and `firm` with raw
 torque limits 30, 85, and 160; `custom_grasp` accepts a raw 1–255 limit.
-The optional `speed_ratio` is 1.0x–3.0x, capped at 255. Simple gestures and
-count release torque at completion unless `hold_torque=true`; grasp holds
+The optional `speed_ratio` is 1.0x–3.0x, capped at 255. The three simple
+gestures and `number` release torque at completion unless `hold_torque=true`; grasp holds
 unless `hold_torque=false`. Contact detection is inferred from position
 stall only: there is no tactile sensor or verified force measurement, so
 these options do **not** guarantee an object will not be squeezed or dropped.

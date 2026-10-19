@@ -48,9 +48,14 @@ def test_card_registered_without_changing_hand_schema():
     assert set(ACTIONS) == set(schema["x-completion"]["actions"])
     assert tools["hand_gesture"]["multiInstance"] is True
     assert all(side in plugins[1]._calibration for side in ("left", "right"))
-    assert schema["properties"]["start_num"]["description"] == "起始数字（0~9，0为握拳，默认 1）"
-    assert schema["properties"]["end_num"]["description"] == "结束数字（0~9，0为握拳，默认 5；若小于起始数字则倒数）"
-    assert schema["properties"]["hold_time_s"]["description"] == "手势停留展示时间（默认 1.0s）"
+    number_nine = [100, 81, 142, 0, 0, 0, 128, 128, 128, 172]
+    assert NUMBER_POSES[9] == number_nine
+    assert all(plugins[1]._calibration[side]["number"][9] == number_nine
+               for side in ("left", "right"))
+    assert "count" not in schema["properties"]["action"]["enum"]
+    assert schema["properties"]["number"]["enum"] == list(range(10))
+    assert "number" in schema["x-action-params"]["number"]["params"]
+    assert any(rule.get("then", {}).get("required") == ["number"] for rule in schema["allOf"])
 
 
 def test_motion_requires_confirmation_and_explicit_side_calibration():
@@ -58,6 +63,12 @@ def test_motion_requires_confirmation_and_explicit_side_calibration():
     for action in ACTIONS:
         with pytest.raises(ValueError, match="confirm_motion"):
             plugin.dispatch(action, {"instance_id": "one"})
+    for value in (None, -1, 10, "10", "05", " 5", "5.0", "５", True, 5.0):
+        with pytest.raises(ValueError, match="number"):
+            plugin.dispatch("number", {"instance_id": "one", "confirm_motion": True, "number": value})
+    for number in range(10):
+        assert plugin._prepare({"confirm_motion": True, "number": number}, "number")["number"] == number
+        assert plugin._prepare({"confirm_motion": True, "number": str(number)}, "number")["number"] == number
     with pytest.raises(ValueError, match="torque"):
         plugin.dispatch("custom_grasp", {"confirm_motion": True, "torque": 256})
     uncalibrated = GesturePlugin(FakeHand({"left": "/dev/fake"}), {
@@ -111,6 +122,9 @@ class ImmediateClient:
     def get_positions(self):
         return list(self.positions)
 
+    def probe_positions(self, side):
+        return list(self.positions)
+
     def set_positions(self, values):
         self.positions = list(values)
         self.commands.append(list(values))
@@ -122,15 +136,27 @@ class ImmediateClient:
         self.torques.append(list(values))
 
 
-def test_count_and_grasp_preserve_colleague_targets_without_hardware(monkeypatch):
+def test_number_and_grasp_preserve_colleague_targets_without_hardware(monkeypatch):
     plugin = GesturePlugin(FakeHand(), config())
     monkeypatch.setattr(plugin, "_wait", lambda seconds: None)
     client = ImmediateClient()
-    counted = plugin._count(client, plugin._calibration["right"], {
-        "speed": 85, "start_num": 2, "end_num": 0, "hold_time_s": 0.2,
-    })
-    assert counted["counted"] == [2, 1, 0]
-    assert client.commands[-1] == NUMBER_POSES[0]
+    selected = []
+    monkeypatch.setattr(plugin, "_connection", lambda *_: type("Connection", (), {
+        "get": lambda self, side: client,
+    })())
+    monkeypatch.setattr(plugin, "_acp_callback", lambda *args: None)
+    monkeypatch.setattr(plugin, "_pose", lambda client, target, speed, poses:
+                        (selected.append(list(target)), list(target))[1])
+    for number in range(10):
+        options = plugin._prepare({"confirm_motion": True, "number": number}, "number")
+        plugin._execute({"action": "number", "action_id": f"test-{number}",
+                         "instance_id": "one", "side": "right", "port": "/dev/fake",
+                         "options": options})
+        assert plugin._last_result["status"] == "completed"
+        assert plugin._last_result["result"]["number"] == number
+    assert selected == [NUMBER_POSES[number] for number in range(10)]
+    monkeypatch.undo()
+    monkeypatch.setattr(plugin, "_wait", lambda seconds: None)
     client.positions = list(NUMBER_POSES[0])
     grasped = plugin._grasp(client, plugin._calibration["left"], {
         "speed": 45, "torque": 30,

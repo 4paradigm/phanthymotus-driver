@@ -19,7 +19,7 @@ from modbus_client import JOINT_COUNT, _bytes
 from modbus_device import L20LiteConnection, SPEED_RATIOS, _named
 
 
-ACTIONS = ("ok_gesture", "thumb_up_gesture", "v_sign_gesture", "count", "grasp", "custom_grasp")
+ACTIONS = ("ok_gesture", "thumb_up_gesture", "v_sign_gesture", "number", "grasp", "custom_grasp")
 NUMBER_POSES = {
     0: [93, 255, 0, 0, 0, 0, 128, 128, 128, 255],
     1: [0, 255, 255, 0, 0, 0, 128, 128, 128, 255],
@@ -30,7 +30,7 @@ NUMBER_POSES = {
     6: [255, 255, 0, 0, 0, 255, 128, 128, 128, 255],
     7: [131, 32, 110, 110, 0, 0, 128, 128, 128, 218],
     8: [255, 255, 255, 0, 0, 0, 128, 128, 128, 255],
-    9: [0, 255, 142, 0, 0, 0, 128, 128, 128, 255],
+    9: [100, 81, 142, 0, 0, 0, 128, 128, 128, 172],
 }
 DEFAULT_POSES = {
     "ok_gesture": [132, 28, 123, 255, 255, 255, 128, 128, 128, 255],
@@ -68,9 +68,9 @@ class GesturePlugin:
                 raise ValueError(f"{side}_number_poses is required")
             if set(map(int, numbers)) != set(NUMBER_POSES):
                 raise ValueError(f"{side}_number_poses must contain 0..9")
-            self._calibration[side]["count"] = {int(n): _bytes(pose) for n, pose in numbers.items()}
+            self._calibration[side]["number"] = {int(n): _bytes(pose) for n, pose in numbers.items()}
         self.speed = self._setting(config.get("motion_speed", 85), "motion_speed")
-        self.count_speed = self._setting(config.get("count_speed", 85), "count_speed")
+        self.number_speed = self._setting(config.get("number_speed", config.get("count_speed", 85)), "number_speed")
         self.torque = self._setting(config.get("motion_torque", 100), "motion_torque")
         self.thumb_speed_scaling = config.get("thumb_speed_scaling", True)
         if not isinstance(self.thumb_speed_scaling, bool):
@@ -93,7 +93,7 @@ class GesturePlugin:
             "ok_gesture": (["speed_ratio", "hold_torque", "confirm_motion"], "OK 手势：拇指与食指捏合，其余手指伸展"),
             "thumb_up_gesture": (["speed_ratio", "hold_torque", "confirm_motion"], "点赞手势：拇指伸展，四指收拢"),
             "v_sign_gesture": (["speed_ratio", "hold_torque", "confirm_motion"], "V 字手势：食指和中指伸展"),
-            "count": (["start_num", "end_num", "hold_time_s", "speed_ratio", "hold_torque", "confirm_motion"], "从起始数字数到结束数字，支持 0–9 和倒数"),
+            "number": (["number", "speed_ratio", "hold_torque", "confirm_motion"], "选择 0–9 中的一个数字，执行对应的数字手势"),
             "grasp": (["strength", "speed_ratio", "hold_torque", "confirm_motion"], "抓握：soft/standard/firm 力矩预设；仅用位置停滞估计接触，无触觉传感器"),
             "custom_grasp": (["torque", "speed_ratio", "hold_torque", "confirm_motion"], "抓握：指定 1–255 原始力矩上限；仅用位置停滞估计接触"),
             "config": (["bound_side"], "将这张卡片绑定到左手或右手；保存配置不会运动"),
@@ -101,13 +101,9 @@ class GesturePlugin:
             "bound_side": {"type": "string", "enum": ["left", "right"]},
             "instance_id": {"type": "string"},
             "speed_ratio": {"type": "string", "enum": list(SPEED_RATIOS), "description": "速度倍率，最大 255"},
-            "hold_torque": {"type": "boolean", "description": "到位后保留力矩；手势和数数默认 false，抓握默认 true"},
-            "start_num": {"type": "integer", "minimum": 0, "maximum": 9, "default": 1,
-                          "description": "起始数字（0~9，0为握拳，默认 1）"},
-            "end_num": {"type": "integer", "minimum": 0, "maximum": 9, "default": 5,
-                        "description": "结束数字（0~9，0为握拳，默认 5；若小于起始数字则倒数）"},
-            "hold_time_s": {"type": "number", "minimum": 0.2, "maximum": 5, "default": 1,
-                            "description": "手势停留展示时间（默认 1.0s）"},
+            "hold_torque": {"type": "boolean", "description": "到位后保留力矩；手势和数字默认 false，抓握默认 true"},
+            "number": {"type": "integer", "enum": list(range(10)),
+                       "description": "选择数字 0–9，执行该数字对应的手势"},
             "strength": {"type": "string", "enum": ["soft", "standard", "firm"], "default": "standard",
                          "description": "对应原始力矩上限 30/85/160；不保证对任何物体的夹持力"},
             "torque": {"type": "integer", "minimum": 1, "maximum": 255,
@@ -115,10 +111,14 @@ class GesturePlugin:
             "confirm_motion": {"type": "boolean", "const": True,
                                "description": "确认手附近无人和障碍物后，本次请求显式传入布尔值 true"},
         })
-        schema["allOf"] = [{"if": {"properties": {"action": {"enum": list(ACTIONS)}}},
-                             "then": {"required": ["confirm_motion"]}}]
+        schema["allOf"] = [
+            {"if": {"properties": {"action": {"enum": list(ACTIONS)}}},
+             "then": {"required": ["confirm_motion"]}},
+            {"if": {"properties": {"action": {"const": "number"}}},
+             "then": {"required": ["number"]}},
+        ]
         schema["x-is-dangerous"] = True
-        # A 0..9 count can include clearance phases and ten 5-second holds.
+        # Keep a completion barrier through any thumb/index clearance phases.
         schema["x-completion"] = {"actions": list(ACTIONS), "timeout": 300}
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
         definition = tool(self.PREFIX, "actuator", "L20 Lite 独立手势卡片，动作需要安全确认", schema)
@@ -175,22 +175,21 @@ class GesturePlugin:
     def _prepare(self, args, action):
         if args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true for every movement request")
-        base = self.count_speed if action == "count" else self.speed
+        base = self.number_speed if action == "number" else self.speed
         speed = self._speed(args.get("speed_ratio", "1.0x"), base)
         hold = args.get("hold_torque", action in ("grasp", "custom_grasp"))
         if not isinstance(hold, bool):
             raise ValueError("hold_torque must be boolean")
         options = {"speed": speed, "hold": hold}
-        if action == "count":
-            for key, default in (("start_num", 1), ("end_num", 5)):
-                value = args.get(key, default)
-                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 9:
-                    raise ValueError(f"{key} must be an integer in 0..9")
-                options[key] = value
-            hold_time = args.get("hold_time_s", 1.0)
-            if isinstance(hold_time, bool) or not isinstance(hold_time, (int, float)) or not 0.2 <= hold_time <= 5:
-                raise ValueError("hold_time_s must be in 0.2..5")
-            options["hold_time_s"] = float(hold_time)
+        if action == "number":
+            number = args.get("number")
+            # The canvas renders enum values in <select>, whose .value is
+            # always a string even when the schema declares an integer.
+            if isinstance(number, str) and len(number) == 1 and number in "0123456789":
+                number = int(number)
+            if type(number) is not int or not 0 <= number <= 9:
+                raise ValueError("number must be a single digit in 0..9")
+            options["number"] = number
         if action == "grasp":
             strength = args.get("strength", "standard")
             if strength not in ("soft", "standard", "firm"):
@@ -258,19 +257,6 @@ class GesturePlugin:
         self._clearance(client, target, speed, poses)
         return self._drive_and_wait(client, target, speed)
 
-    def _count(self, client, poses, options):
-        speed = options["speed"]
-        numbers = poses["count"]
-        self._pose(client, numbers[0], speed, poses)
-        self._wait(0.5)
-        start, end = options["start_num"], options["end_num"]
-        step = 1 if start <= end else -1
-        sequence = list(range(start, end + step, step))
-        for number in sequence:
-            self._pose(client, numbers[number], speed, poses)
-            self._wait(options["hold_time_s"])
-        return {"counted": sequence, "positions": _named(client.get_positions())}
-
     def _grasp(self, client, poses, options):
         speed, torque = options["speed"], options["torque"]
         client.set_speeds(self._joint_speeds(speed))
@@ -325,8 +311,11 @@ class GesturePlugin:
                     else:
                         client.set_speeds(self._joint_speeds(options["speed"]))
                         client.set_torques([self.torque] * JOINT_COUNT)
-                        if action == "count":
-                            result = self._count(client, poses, options)
+                        if action == "number":
+                            number = options["number"]
+                            position = self._pose(client, poses["number"][number], options["speed"], poses)
+                            result = {"number": number, "positions": _named(position),
+                                      "speed": options["speed"]}
                         else:
                             position = self._pose(client, poses[action], options["speed"], poses)
                             result = {"positions": _named(position), "speed": options["speed"]}
