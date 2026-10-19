@@ -128,6 +128,22 @@ class DistanceFeedback:
                     raise ValueError('distance feedback stale or clock reset')
             return dict(self.pose, segment_id=self.quality['segment_id'])
 
+    def revalidate(self):
+        """Clear a latched fault only when the latest samples are healthy.
+
+        Called from move preflight, never mid-motion: a fault during an
+        active move must keep latching (the loop brakes on the raise), while
+        a new request revalidates so one transient bad frame does not brick
+        the card until the fusion segment restarts.
+        """
+        with self.lock:
+            if (self.reason is not None and self.pose is not None
+                    and self.quality is not None
+                    and self.quality['status'] == 'tracking'
+                    and self.monotonic() - self.pose['received'] <= 0.5
+                    and self.monotonic() - self.quality['received'] <= 0.5):
+                self.reason = None
+
 
 def run_distance(owner, distance_m):
     """50 Hz direct SDK loop. Only fresh source samples count toward settling."""

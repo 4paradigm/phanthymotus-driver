@@ -748,7 +748,8 @@ def test_concurrent_move_is_refused_while_rotate_runs(monkeypatch):
 
     refused = plugin.dispatch('move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 3})
     assert refused['state'] == 'error'
-    assert 'rotate in progress' in refused['error']  # 错误点名 rotate 冲突
+    # 文案覆盖两种目标动作：占用者也可能是 distance move，不能只说 rotate。
+    assert 'rotate or distance move in progress' in refused['error']
     assert plugin._move_thread is None               # 拒绝发生在起 move 线程之前
     assert not any(c[0] != 0 or c[1] != 0 for c in fake.cmds)  # 无 move 帧混入
     status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
@@ -1066,6 +1067,51 @@ def test_creep_overcomes_step_startup_delay_without_tiny_retries(monkeypatch, an
     assert all(duration >= startup_s for duration in pulses)
     assert len(pulses) <= 4
     assert fake.cmds[-1] == (0, 0, 0)
+
+
+def test_measured_rate_excludes_startup_dead_time(monkeypatch):
+    # 复核 Important#1：measured_rate 的分母必须是"同向进展开始后"的有效脉冲
+    # 时间，不含启动死区。植物：每脉冲前 0.35s 不动，随后 25°/s。目标 20°：
+    # 首脉有效 0.30s 转 7.5° → 真实速率 25°/s；若分母含启动墙钟（0.65s），
+    # 速率被稀释到 ~11.5°/s。脉宽差异常被 0.30s 夹紧与入带早刹掩盖，故直接
+    # 钉住第二脉规划时收到的 measured_rate——它必须来自有效时间而非墙钟。
+    module, _ = _load_device(monkeypatch)
+    clock = _creep_clock(module, monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    startup_s, rate = 0.35, 25.0
+    seen_rates = []
+    pulse = module._pulse_duration_s
+
+    def spy(err_deg, measured_rate=None):
+        seen_rates.append(measured_rate)
+        return pulse(err_deg, measured_rate)
+
+    monkeypatch.setattr(module, '_pulse_duration_s', spy)
+    active = []
+    publish = fake.publish_cmd
+    read = fake.get_imu_data
+
+    def get_imu():
+        if active and clock.now - active[0] >= startup_s:
+            fake.yaw += active[1] * rate * 0.02
+        return read()
+
+    def publish_cmd(x, y, z, action_cmd, index=0):
+        publish(x, y, z, action_cmd, index)
+        if z != 0 and not active:
+            active.extend((clock.now, 1 if z > 0 else -1))
+        elif z == 0 and active:
+            active.clear()
+
+    monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
+    monkeypatch.setattr(fake, 'get_imu_data', get_imu)
+    result = plugin._do_rotate_impl({'angle_deg': 20})
+    assert result['state'] == 'done'
+    # 前两次调用属首脉（尚无测得速率）；第三次是第二脉规划，收到的
+    # measured_rate 必须 ≈ 25（有效时间），而非被启动死区稀释的 ~11.5。
+    assert seen_rates[:2] == [None, None]
+    assert seen_rates[2] == pytest.approx(rate, abs=2)
 
 
 def test_creep_stops_after_repeated_ineffective_pulses(monkeypatch):

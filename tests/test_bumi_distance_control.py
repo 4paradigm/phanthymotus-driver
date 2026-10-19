@@ -190,3 +190,77 @@ def test_overshoot_is_reported_after_braking(monkeypatch):
     result = run_distance(plant, 1)
     assert result['state'] == 'error'
     assert plant.commands[-1] == 0
+
+
+def test_distance_timeout_brakes_and_reports(monkeypatch):
+    # 规格"范围与验证"点名超时：唯一兜底，必须刹停并报错而非挂死或误报完成。
+    import distance_control as module
+    plant = Plant(monkeypatch, module, speed=0)
+    monkeypatch.setattr(module, 'distance_timeout', lambda d: 0.05)
+    result = run_distance(plant, 1)
+    assert result['state'] == 'error'
+    assert 'timed out' in result['error']
+    assert plant.commands[-1] == 0
+
+
+def test_distance_timestamp_going_backwards_brakes(monkeypatch):
+    # 规格"时间倒退"：源时间回拨（dt<0）必须刹停报错，不得当作正常样本继续。
+    import distance_control as module
+    plant = Plant(monkeypatch, module)
+    sample = plant.sample
+
+    def rewinding():
+        data = sample()
+        if plant.forward > 0.3:
+            data = dict(data, stamp_ns=data['stamp_ns'] - 10**9)
+        return data
+    plant._read_distance_feedback = rewinding
+    result = run_distance(plant, 1)
+    assert result['state'] == 'error'
+    assert 'reset' in result['error']
+    assert plant.commands[-1] == 0
+
+
+def test_latched_fault_clears_only_on_healthy_revalidation(feedback):
+    # 复核 Important#3：单帧坏消息锁存 reason 后，运动中必须持续拒绝（刹停
+    # 契约）；仅当同 segment 最新 pose+status 均健康时，preflight 的 revalidate
+    # 才清除锁存，让下一次 move 重试可用——无需重启融合进程。
+    result, clock = feedback
+    clock.ns += 50_000_000
+    bad = pose(stamp=clock.ns)
+    bad.pose.pose.position.x = float('nan')
+    result.update_pose(bad)
+    with pytest.raises(ValueError):
+        result.snapshot()
+    clock.ns += 50_000_000
+    result.update_pose(pose(stamp=clock.ns))
+    result.update_status({'status': 'tracking', 'segment_id': 'trial', 'stamp_ns': clock.ns})
+    with pytest.raises(ValueError):
+        result.snapshot()          # 锁存保持：流恢复不自动放行（运动中止契约）
+    result.revalidate()
+    assert result.snapshot()['segment_id'] == 'trial'
+
+
+def test_revalidate_keeps_fault_while_stream_unhealthy(feedback):
+    result, clock = feedback
+    # 单帧坏消息锁存
+    clock.ns += 50_000_000
+    bad = pose(stamp=clock.ns)
+    bad.pose.pose.position.x = float('nan')
+    result.update_pose(bad)
+    with pytest.raises(ValueError):
+        result.snapshot()
+    # 流恢复 tracking 但接收时效已过期：revalidate 的健康门不得放行
+    clock.ns += 50_000_000
+    result.update_pose(pose(stamp=clock.ns))
+    result.update_status({'status': 'tracking', 'segment_id': 'trial', 'stamp_ns': clock.ns})
+    clock.mono += 1.0
+    result.revalidate()
+    with pytest.raises(ValueError):
+        result.snapshot()          # 锁存仍在：过期样本不算健康
+    # 新鲜的 tracking 样本到位后才放行
+    clock.ns += 50_000_000
+    result.update_pose(pose(stamp=clock.ns))
+    result.update_status({'status': 'tracking', 'segment_id': 'trial', 'stamp_ns': clock.ns})
+    result.revalidate()
+    assert result.snapshot()['segment_id'] == 'trial'

@@ -726,8 +726,8 @@ class LocoPlugin:
                 return {
                     "state": "error",
                     "error": (
-                        "loco_destination rotate in progress; wait for it to "
-                        "finish or call stop_move first"
+                        "loco_destination rotate or distance move in progress; "
+                        "wait for it to finish or call stop_move first"
                     ),
                 }
             return self._do_move_impl(args)
@@ -962,6 +962,9 @@ class LocoPlugin:
         if problem is not None:
             return None, problem
         self._get_distance_feedback().start()
+        # A latched fault from an earlier attempt clears only here, and only
+        # if the latest same-segment pose+quality are healthy again.
+        self._get_distance_feedback().revalidate()
         self._read_distance_feedback()
         return distance, None
 
@@ -1060,6 +1063,8 @@ class LocoPlugin:
             pulse_started = 0.0
             pulse_duration = 0.0
             pulse_motion_started = False
+            motion_started_at = 0.0     # first measurable same-direction progress
+            turned_at_motion = 0.0      # turned_deg latched at that moment
             measured_rate = None
             no_progress = 0
             observed_errors = []
@@ -1138,6 +1143,8 @@ class LocoPlugin:
                         progress = math.copysign(1.0, err_at_pulse) * (turned_deg - turned_at_pulse)
                         if not pulse_motion_started and progress >= _ROTATE_MIN_PROGRESS_DEG:
                             pulse_motion_started = True
+                            motion_started_at = now
+                            turned_at_motion = turned_deg
                             pulse_end = now + _pulse_duration_s(err, measured_rate)
                         if (not pulse_motion_started
                                 and now - pulse_started >= _ROTATE_STARTUP_TIMEOUT_S
@@ -1154,7 +1161,11 @@ class LocoPlugin:
                         else:
                             # Reaching the band brakes early, but never skips
                             # observation when a subsequent sample drifts out.
-                            pulse_duration = time.monotonic() - pulse_started
+                            # Rate calibration uses only the effective motion
+                            # window — startup dead time would dilute it and
+                            # bias every subsequent pulse width long.
+                            pulse_duration = (time.monotonic() - motion_started_at
+                                              if pulse_motion_started else 0.0)
                             coast_end = time.monotonic() + _ROTATE_OBSERVE_S
                             pulse_phase = "coast"
                             observed_errors.clear()
@@ -1177,7 +1188,7 @@ class LocoPlugin:
                                 break
                             if pulse_duration > 0:
                                 response = math.copysign(1.0, err_at_pulse) * (
-                                    turned_deg - turned_at_pulse)
+                                    turned_deg - turned_at_motion)
                                 if response >= _ROTATE_MIN_PROGRESS_DEG:
                                     measured_rate = response / pulse_duration
                                 improved = abs(err_at_pulse) - abs(err)
