@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -32,12 +32,6 @@ def rpc(method, params=None):
 
 def read_samples():
     samples = {}
-    pose_tool = next((tool for tool in tools if tool['name']=='pose'),None)
-    if pose_tool:
-        schema=pose_tool['inputSchema']
-        if set(schema['properties'])!={'pose','side','speed'} or schema.get('x-completion')!={'timeout':300} or \
-                schema.get('x-resource')!=['arm_l','arm_r','head']:
-            raise ValueError('Pose schema or shared physical resources differ')
     for name in CARDS:
         result = rpc('tools/call', {'name': name, 'arguments': {
             'action': 'info', 'instance_id': 'readonly-check', '_trace_id': 'readonly-check-trace'}})
@@ -104,6 +98,12 @@ def run_check(timeout=20, camera=False):
     else:
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
+    pose_tool = next((tool for tool in tools if tool['name']=='pose'),None)
+    if pose_tool:
+        schema=pose_tool['inputSchema']
+        if set(schema['properties'])!={'pose'} or schema.get('x-completion')!={'timeout':300} or \
+                schema.get('x-resource')!=['arm_l','arm_r','head']:
+            raise ValueError('Pose schema or shared physical resources differ')
     names = {tool['name'] for tool in tools}
     expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):

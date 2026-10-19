@@ -14,15 +14,13 @@ VERSION = 1
 ACP_TIMEOUT = 300
 TELEOP_HEALTH_URL = 'http://127.0.0.1:15794/health'
 LABELS = {'salute':'敬礼', 'wave':'挥手打招呼', 'welcome':'欢迎', 'reset':'自然垂下回正'}
-SPEEDS = {'slow':4., 'normal':6.}  # Planned maximum joint travel / duration, deg/s.
+PLANNED_DEG_PER_SECOND = 12.  # Unified planned travel/duration; not measured velocity.
 # Designed against TRON2 FK, not borrowed joint values from another robot.
 LEFT_FRAMES = {
-    'fold': [0, 0, 84.5, -45, 0, 0, 0],
-    'prepare': [-25, 25, 65, -70, 0, 0, 0],
     'salute': [-75, 25, 0, -120, 0, 0, 0],
     'wave': [-65, 25, 0, -100, 0, 0, 0],
-    'wave_out': [-65, 40, 0, -100, 0, 0, 0],
-    'wave_in': [-65, 20, 0, -100, 0, 0, 0],
+    'wave_out': [-65, 50, 0, -100, 0, 0, 0],
+    'wave_in': [-65, 10, 0, -100, 0, 0, 0],
     'welcome': [-35, 45, 40, -65, 0, 0, 0],
 }
 NOMINAL_HOME = [0,0,84.5,0,0,0,0, 0,0,-84.5,0,0,0,0]
@@ -32,28 +30,22 @@ HEAD_KEEP_OUT = .20  # Skeletal keep-out heuristic, not a collision CAD model.
 
 def tool():
     return {'name':'pose','type':'actuator','multiInstance':False,
-        'description':'TRON2预设双臂动作：敬礼、挥手、欢迎及自然垂下回正。完成动作后回原home；保持头部和夹爪开口。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
+        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎及自然垂下回正，统一速度。完成动作后回原home；保持头部和夹爪开口。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
                 'pose':{'type':'string','enum':list(LABELS), 'title':'预设动作',
-                    'oneOf':[{'const':key,'title':label} for key,label in LABELS.items()]},
-                'side':{'type':'string','enum':['left','right','both'],'default':'right','title':'手臂',
-                    'description':'敬礼、挥手选left左臂或right右臂；欢迎、回正固定双臂'},
-                'speed':{'type':'string','enum':['slow','normal'],'default':'slow','title':'速度',
-                    'description':'slow慢速；normal标准。仅决定计划时长，不代表已测得物理速度'}},
+                    'oneOf':[{'const':key,'title':label} for key,label in LABELS.items()]}},
             'required':['pose'], 'x-resource':['arm_l','arm_r','head'],
             'x-completion':{'timeout':ACP_TIMEOUT}}}
 
 
 def arguments(args):
-    if not isinstance(args,dict) or set(args)-{'pose','side','speed','instance_id','_trace_id'}:
-        raise ValueError('pose只接受预设动作、手臂和速度；不接受自定义关节或action参数')
-    name,side,speed=args.get('pose'),args.get('side','right'),args.get('speed','slow')
-    if name not in LABELS or side not in ('left','right','both') or speed not in SPEEDS:
-        raise ValueError('请选择有效的预设动作、手臂和速度')
-    if name in ('salute','wave') and side=='both':
-        raise ValueError('敬礼和挥手只支持单臂；请选择left或right')
-    return name, 'both' if name in ('welcome','reset') else side, speed
+    if not isinstance(args,dict) or set(args)-{'pose','instance_id','_trace_id'}:
+        raise ValueError('pose只接受预设动作；手臂和速度由动作统一设定')
+    name=args.get('pose')
+    if not isinstance(name,str) or name not in LABELS:
+        raise ValueError('请选择有效的预设动作')
+    return name, 'both' if name in ('welcome','reset') else 'right'
 
 
 def _mm(a,b):
@@ -135,12 +127,12 @@ class Pose:
 
     def info(self):
         return {'read_only':True,'motion_sent':False,'catalog':LABELS,
-            'speed_options':list(SPEEDS),'motion':self.motion.summary(),
+            'planned_deg_per_second':PLANNED_DEG_PER_SECOND,'motion':self.motion.summary(),
             'home':self.reset.call('info'),'returns_to_home':True,'collision_checked':False,
             'physical_presets_verified':False}
 
     def plan(self,args):
-        name,side,speed=arguments(args)
+        name,side=arguments(args)
         home=self.reset.call('execute')  # Validates original file, identity and firmware.
         target_home=home['target_q']
         sample,current,velocities=arm_feedback(self.reader)
@@ -162,29 +154,38 @@ class Pose:
             if set(head)!={14,15} or any(abs(math.degrees(j['q']))>10 or
                     j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
                 raise ValueError('预设动作要求头部静止且俯仰、偏航均在正前方±10°以内')
-        names=[]
+        targets=[]
         if name!='reset':
-            names=['fold','prepare',name]
-            if name=='wave':names+=['wave_out','wave_in','wave_out','wave_in']
-            names+=['prepare','fold']
+            # Raise/rotate shoulders with the elbow and wrists unchanged, THEN
+            # bend the elbow. Return by extending the elbow before lowering.
+            goal=list(LEFT_FRAMES[name]);shoulder=goal[:3]+[0,0,0,0]
+            targets=[('shoulder',shoulder),(name,goal)]
+            if name=='wave':
+                targets += [(label,list(LEFT_FRAMES[label])) for label in
+                            ('wave_out','wave_in','wave_out','wave_in')]
+            targets.append(('extend',targets[-1][1][:3]+[0,0,0,0]))
         frames=[];previous=list(current)
-        for frame_name in names:
+        for frame_name,values in targets:
             q=list(current)
             for label,offset in (('left',0),('right',7)):
                 if side not in (label,'both'):continue
-                values=LEFT_FRAMES[frame_name]
-                if label=='right':values=[-v if i in (1,2,4,6) else v for i,v in enumerate(values)]
-                q[offset:offset+7]=list(map(math.radians,values))
-            duration=max(2.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(q,previous))/SPEEDS[speed]*10)/10)
+                angles=values if label=='left' else [-v if i in (1,2,4,6) else v for i,v in enumerate(values)]
+                q[offset:offset+7]=list(map(math.radians,angles))
+                if frame_name in ('shoulder','extend'):
+                    reference=current if frame_name=='shoulder' else target_home
+                    q[offset+3:offset+7]=reference[offset+3:offset+7]
+            duration=max(1.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(q,previous))/PLANNED_DEG_PER_SECOND*10)/10)
             validate_movej(q,duration)
-            hold=.8 if frame_name==name and name!='wave' else 0
+            hold=.4 if frame_name==name and name!='wave' else 0
             frames.append({'label':frame_name,'joint':q,'time':duration,'hold':hold});previous=q
-        duration=max(8.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(previous,target_home))/SPEEDS[speed]*10)/10)
-        validate_movej(target_home,duration)
-        frames.append({'label':'home','joint':list(target_home),'time':duration,'hold':0})
+        final_target=list(target_home)
+        if side=='right':final_target[:7]=current[:7]  # No idle-left correction during right-only gestures.
+        duration=max(2.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(previous,final_target))/PLANNED_DEG_PER_SECOND*10)/10)
+        validate_movej(final_target,duration)
+        frames.append({'label':'home','joint':final_target,'time':duration,'hold':0})
         screening=self.geometry.validate_path(current,frames) if name!='reset' else {
             'screening':'existing_home_reset_only','collision_checked':False}
-        return {'frames':frames,'start_q':list(current),'preset':name,'side':side,'speed':speed,
+        return {'frames':frames,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
             'home_q':list(target_home),'pose_sha256':home['pose_sha256'],'motion_tool':'pose',
             'head_policy':'unchanged','gripper_policy':'unchanged','returns_to_home':True,
             'physical_presets_verified':False,

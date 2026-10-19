@@ -40,7 +40,6 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_movej=AsyncMock(side_effect=self.fake_send)
         self.waiter=patch.object(self.adapter.motion,'wait_for_arrival',new=self.fast_arrival);self.waiter.start();self.addCleanup(self.waiter.stop)
         self.frames=[];self.arrivals=[];self.fail_at=None;self.block=None
-        self.shrink=patch('pose.SPEEDS',{'slow':4.,'normal':6.});self.shrink.start();self.addCleanup(self.shrink.stop)
 
     async def asyncTearDown(self):
         await self.adapter.motion.close();await self.adapter.head.close()
@@ -64,36 +63,67 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.arrivals.append(job['stage']);self.accept_feedback()
         return {'arrival_verified':True,'verified_samples':3}
 
-    def compact_plan(self,name='wave',side='left'):
-        plan=self.adapter.pose.plan({'pose':name,'side':side})
+    def compact_plan(self,name='wave',side=None):
+        plan=self.adapter.pose.plan({'pose':name})
         for f in plan['frames']:f.update(time=.1,hold=0)
         return plan
 
-    def test_public_schema_has_only_pose_side_speed_and_actionless_acp(self):
+    def test_public_schema_has_only_pose_and_actionless_acp(self):
         t=pose.tool();s=t['inputSchema']
-        self.assertEqual(t['name'],'pose');self.assertEqual(set(s['properties']),{'pose','side','speed'})
+        self.assertEqual(t['name'],'pose');self.assertEqual(set(s['properties']),{'pose'})
         self.assertEqual(s['x-completion'],{'timeout':300});self.assertEqual(s['x-resource'],['arm_l','arm_r','head'])
         self.assertEqual(list(s['properties']['pose']['enum']),['salute','wave','welcome','reset'])
 
-    def test_all_preset_sides_fit_vendor_bounds_and_sampled_model_exclusions(self):
+    def test_fixed_sides_speed_fit_vendor_bounds_and_sampled_model_exclusions(self):
         digest=hashlib.sha256(self.file.read_bytes()).hexdigest()
-        for name,sides in [('salute',['left','right']),('wave',['left','right']),('welcome',['both']),('reset',['both'])]:
-            for side in sides:
-                for speed in ('slow','normal'):
-                    p=self.adapter.pose.plan({'pose':name,'side':side,'speed':speed})
-                    self.assertEqual(p['frames'][-1]['joint'],HOME)
-                    self.assertEqual(p['pose_sha256'],digest);self.assertFalse(p['collision_checked'])
-                    self.assertLess(sum(f['time']+f['hold']+10 for f in p['frames'])+10,300)
-                    if name!='reset':self.assertGreaterEqual(p['minimum_head_reference_distance_m'],.2)
-                    for f in p['frames']:
-                        completion.validate_movej(f['joint'],f['time'])
-                        if name!='reset' and side!='both':
-                            inactive=slice(7,14) if side=='left' else slice(0,7)
-                            self.assertEqual(f['joint'][inactive],HOME[inactive])
+        for name in pose.LABELS:
+            p=self.adapter.pose.plan({'pose':name})
+            self.assertEqual(p['side'],'right' if name in ('salute','wave') else 'both')
+            self.assertEqual(p['planned_deg_per_second'],12)
+            self.assertEqual(p['frames'][-1]['joint'],HOME)
+            self.assertEqual(p['pose_sha256'],digest);self.assertFalse(p['collision_checked'])
+            self.assertLess(sum(f['time']+f['hold']+10 for f in p['frames'])+10,300)
+            if name!='reset':self.assertGreaterEqual(p['minimum_head_reference_distance_m'],.2)
+            for f in p['frames']:
+                completion.validate_movej(f['joint'],f['time'])
+                if name in ('salute','wave'):self.assertEqual(f['joint'][:7],HOME[:7])
         self.assertEqual(hashlib.sha256(self.file.read_bytes()).hexdigest(),digest)
 
+    def test_shoulders_move_first_then_elbows_and_return_in_reverse_order(self):
+        for name in ('salute','wave','welcome'):
+            p=self.adapter.pose.plan({'pose':name});frames=p['frames']
+            self.assertEqual([f['label'] for f in frames[:2]],['shoulder',name])
+            for offset in ([7] if name!='welcome' else [0,7]):
+                self.assertEqual(frames[0]['joint'][offset+3:offset+7],HOME[offset+3:offset+7])
+                self.assertNotEqual(frames[0]['joint'][offset:offset+3],HOME[offset:offset+3])
+                self.assertEqual(frames[1]['joint'][offset:offset+3],frames[0]['joint'][offset:offset+3])
+                self.assertLess(frames[1]['joint'][offset+3],-1.)
+                self.assertEqual(frames[-2]['label'],'extend')
+                self.assertEqual(frames[-2]['joint'][offset+3:offset+7],HOME[offset+3:offset+7])
+                self.assertEqual(frames[-2]['joint'][offset:offset+3],frames[-3]['joint'][offset:offset+3])
+            self.assertLess(p['planned_motion_seconds'],50)
+
+    def test_right_only_preserves_actual_left_and_first_shoulder_preserves_actual_elbow(self):
+        actual=list(HOME);actual[3]-=.005;actual[10]-=.005
+        self.accept_feedback(actual+[0,0])
+        for name in ('salute','wave'):
+            plan=self.adapter.pose.plan({'pose':name})
+            self.assertTrue(all(f['joint'][:7]==actual[:7] for f in plan['frames']))
+            self.assertEqual(plan['frames'][0]['joint'][10:14],actual[10:14])
+            self.assertEqual(plan['frames'][-1]['joint'][7:],HOME[7:])
+            self.assertEqual(plan['home_q'],HOME)
+
+    def test_wave_has_two_wider40_degree_swings_and_no_extra_dwell(self):
+        p=self.adapter.pose.plan({'pose':'wave'});frames=p['frames']
+        swings=[f for f in frames if f['label'] in ('wave_out','wave_in')]
+        self.assertEqual([f['label'] for f in swings],['wave_out','wave_in']*2)
+        rolls=[math.degrees(f['joint'][8]) for f in swings]
+        self.assertAlmostEqual(max(rolls)-min(rolls),40)
+        self.assertTrue(all(f['hold']==0 for f in frames))
+        self.assertEqual(len(frames),8)
+
     async def test_invalid_arguments_do_not_query_modes_or_create_owner(self):
-        for args in ({},{'pose':'other'},{'pose':True},{'pose':'wave','side':'both'},
+        for args in ({},{'pose':'other'},{'pose':True},{'pose':'wave','side':'both'}, {'pose':'wave','side':'right'}, {'pose':'wave','speed':'slow'},
                      {'pose':'wave','side':'LEFT'},{'pose':'salute','speed':True},
                      {'pose':'wave','action':'move'},{'pose':'wave','joint':[0]*14}):
             with self.assertRaises((ValueError,TypeError)):await self.adapter.pose.execute(args)
@@ -188,6 +218,49 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.adapter.motion.last['status'],'completed')
         finally:task.cancel();await asyncio.gather(task,return_exceptions=True)
 
+    async def test_post_ack_window_overlaps_duration_but_never_completes_early(self):
+        plan=self.compact_plan('reset');plan['frames'][0]['time']=.3;self.waiter.stop()
+        async def pump():
+            while True:self.accept_feedback();await asyncio.sleep(.01)
+        task=asyncio.create_task(pump())
+        try:
+            with patch('completion.STABILITY_SECONDS',.2),patch('completion.ARRIVAL_GRACE',.4):
+                started=time.monotonic()
+                await self.adapter.motion.dispatch_sequence(plan,self.adapter.pose.guard)
+                await asyncio.sleep(.22)
+                self.assertFalse(self.adapter.motion.task.done())
+                await self.adapter.motion.task
+                elapsed=time.monotonic()-started
+            self.assertGreaterEqual(elapsed,.3);self.assertLess(elapsed,.46)
+            self.assertEqual(self.adapter.motion.last['status'],'completed')
+        finally:task.cancel();await asyncio.gather(task,return_exceptions=True)
+
+    async def test_late_arrival_still_requires_full_stable_feedback_window(self):
+        plan=self.compact_plan('reset');plan['frames'][0]['time']=.15;self.waiter.stop()
+        self.reader.send_movej.side_effect=None
+        self.reader.send_movej.return_value={'status':'accepted','motion_sent':True}
+        off=list(HOME);off[3]-=.1
+        self.accept_feedback(off+[0,0])
+        # Exercise the verifier directly, keeping the plan's target and connection.
+        job={'duration':.15,'target':HOME,'ws':self.reader.ws,'serial':self.reader.serial,'sequence':[{}]}
+        async def pump():
+            started=time.monotonic()
+            while True:
+                self.accept_feedback((HOME if time.monotonic()-started>=.15 else off)+[0,0])
+                await asyncio.sleep(.01)
+        task=asyncio.create_task(pump())
+        try:
+            with patch('completion.STABILITY_SECONDS',.15),patch('completion.ARRIVAL_GRACE',.4):
+                started=time.monotonic();result=await self.adapter.motion.wait_for_arrival(job)
+            self.assertGreaterEqual(time.monotonic()-started,.3);self.assertTrue(result['arrival_verified'])
+        finally:task.cancel();await asyncio.gather(task,return_exceptions=True)
+
+    def test_readiness_sensor_sampling_has_no_undefined_discovery_dependency(self):
+        import check
+        with patch.object(check,'rpc',return_value={'content':[{'text':json.dumps({'sample':{'available':True}})}]}) as rpc:
+            self.assertEqual(check.read_samples(),{'joint_state':{'available':True}})
+        self.assertEqual(rpc.call_args.args[1]['arguments']['action'],'info')
+
     async def test_frozen_vendor_timestamp_cannot_complete_sequence(self):
         plan=self.compact_plan('reset');self.waiter.stop()
         async def pump():
@@ -210,7 +283,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             async with ClientSession() as session:
                 with patch.object(self.adapter.pose,'plan',return_value=plan):
                     async with session.post(url,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
-                            'params':{'name':'pose','arguments':{'pose':'salute','side':'right','speed':'slow','_trace_id':'trace'}}}) as response:
+                            'params':{'name':'pose','arguments':{'pose':'salute','_trace_id':'trace'}}}) as response:
                         body=(await response.json())['result'];self.assertFalse(body['isError'],body)
                 await self.adapter.motion.task
                 self.assertEqual(self.adapter._report_completion.await_args.args[0],'pose')
@@ -348,7 +421,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lifecycle_ignores_declared_inactive_form_values_without_motion(self):
         for action in ('info','start','stop'):
-            result=self.adapter.call('pose',{'action':action,'pose':'salute','side':'right','speed':'slow'})
+            result=self.adapter.call('pose',{'action':action,'pose':'salute'})
             self.assertFalse(result['motion_sent'])
             if action in ('start','stop'):
                 self.assertEqual(result['state'],'ready' if action=='start' else 'idle')

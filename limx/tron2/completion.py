@@ -183,7 +183,7 @@ class ArmCompletion:
                 self._sequence_feedback(job,job['details']['home_q'])
                 status='completed';safe_end=True
                 result.update(arrival_verified=True,reset_verified=True,at_home=True,
-                    verification='every_stage_post_duration_stable_feedback_then_home')
+                    verification='every_stage_duration_elapsed_and_post_ack_stable_feedback_then_home')
             if status=='cancelled':
                 result.update(cancelled_remaining_stages=True,segment_arrival_verified=True,
                     message='后续动作段已取消；反馈确认停在最近已到位动作段，未自动回正')
@@ -216,8 +216,10 @@ class ArmCompletion:
             else:job['state']='blocked_requires_operator_check'
 
     async def wait_for_arrival(self, job):
-        # Wait the nominal duration AFTER ACK, then require distinct new frames
-        # over a stationary window. Cached pre-command values cannot complete it.
+        # Never finish before the nominal duration after ACK. Pose sequences can
+        # accumulate stationary post-ACK samples during that duration, avoiding
+        # an extra fixed pause at every waypoint. Other arm/head calls retain
+        # their existing strictly post-duration verification window.
         started = time.monotonic()
         not_before = started + job['duration']
         deadline = not_before + ARRIVAL_GRACE
@@ -242,16 +244,17 @@ class ArmCompletion:
                 now = time.monotonic()
                 error = max(abs(math.degrees(a-b)) for a, b in zip(q, job['target']))
                 slow = (len(dq)==14 and all(v is not None and abs(v)<=VELOCITY_RAW_TOLERANCE for v in dq)) if job.get('sequence') is not None else all(v is None or abs(v) <= VELOCITY_RAW_TOLERANCE for v in dq)
-                if now < not_before or error > TOLERANCE_DEG or not slow:
+                sequence = job.get('sequence') is not None
+                if (now < not_before and not sequence) or error > TOLERANCE_DEG or not slow:
                     window = []
                 else:
                     if window and max(abs(math.degrees(a-b)) for a,b in zip(q, window[0][1])) > STABILITY_DEG:
                         window = []
                     window.append((now, q))
-                    if len(window) >= 3 and now-window[0][0] >= STABILITY_SECONDS:
+                    if now >= not_before and len(window) >= 3 and now-window[0][0] >= STABILITY_SECONDS:
                         return {'arrival_verified': True, 'max_error_deg': error,
                                 'tolerance_deg': TOLERANCE_DEG, 'verified_samples': len(window),
-                                'verification': 'post_duration_stable_feedback'}
+                                'verification': 'duration_elapsed_and_post_ack_stable_feedback' if sequence else 'post_duration_stable_feedback'}
             await asyncio.sleep(.05)
         raise ValueError('Arrival verification timed out; motion may still be active')
 
