@@ -144,6 +144,9 @@ _ROTATE_SETTLE_TICKS = 8
 _ROTATE_VYAW_FULL = 0.8                # cruise 满速（|err| > _ROTATE_CRUISE_EXIT_DEG）
 _ROTATE_CRUISE_EXIT_DEG = 20.0
 _ROTATE_PULSE_VYAW = 0.5               # creep 点动幅值（高于 0.4 stiction 死区）
+_ROTATE_FINE_ENTRY_DEG = 5.0           # below this, creep pulses take over
+_ROTATE_VYAW_FINE_MIN = 0.45           # fine-band floor, above the ~0.4 deadband
+_ROTATE_FINE_KP_PER_DEG = 0.04         # fine-band |err|*kp, capped at full speed
 _ROTATE_PULSE_S_PER_DEG = 0.025
 _ROTATE_PULSE_MIN_S = 0.12
 _ROTATE_PULSE_MAX_S = 0.30
@@ -179,6 +182,18 @@ def _pulse_duration_s(err_deg: float, measured_rate: float | None = None) -> flo
     duration = (0.7 * abs(err_deg) / measured_rate if measured_rate is not None
                 else _ROTATE_PULSE_S_PER_DEG * abs(err_deg))
     return min(_ROTATE_PULSE_MAX_S, max(_ROTATE_PULSE_MIN_S, duration))
+
+
+def _fine_vyaw(err_deg: float) -> float:
+    """Closed-loop deceleration band speed: |err|*kp, floored above stiction.
+
+    Runs continuously between cruise exit and the creep band so the robot
+    decelerates smoothly instead of stick-slip crawling the whole final
+    stretch — the crawl's stop-start pulses are what reads as end-phase
+    jitter on the robot.
+    """
+    speed = max(_ROTATE_VYAW_FINE_MIN, abs(err_deg) * _ROTATE_FINE_KP_PER_DEG)
+    return math.copysign(min(_ROTATE_VYAW_FULL, speed), err_deg)
 
 
 def _rotate_timeout_s(angle_deg: float) -> float:
@@ -1104,7 +1119,7 @@ class LocoPlugin:
                     still += 1
                 else:
                     still = 0
-                if stage == "cruise" and abs(err) > _ROTATE_CRUISE_EXIT_DEG:
+                if stage == "cruise" and abs(err) > _ROTATE_FINE_ENTRY_DEG:
                     now = time.monotonic()
                     progress = math.copysign(1.0, angle_deg) * turned_deg
                     if (cruise_last_progress is None
@@ -1117,11 +1132,14 @@ class LocoPlugin:
                                 "final_error_deg": angle_deg - turned_deg,
                                 "elapsed_s": now - start_time,
                                 "tolerance_deg": _ROTATE_TOL_DEG}
-                    # Cruise: full speed toward the sub-target (err signs the
-                    # direction; _ROTATE_VYAW_SIGN stays the axis calibration).
+                    # Cruise full speed above the exit angle, then a continuous
+                    # proportional fine band down to the creep entry — the
+                    # alternative (point-crawling the whole final stretch) is
+                    # the stick-slip end-phase jitter seen on hardware.
+                    # _fine_vyaw caps at full speed above the exit angle and
+                    # signs with err; _ROTATE_VYAW_SIGN is the axis calibration.
                     self._publish_cmd(0.0, 0.0,
-                                      _ROTATE_VYAW_SIGN
-                                      * math.copysign(_ROTATE_VYAW_FULL, err),
+                                      _ROTATE_VYAW_SIGN * _fine_vyaw(err),
                                       default_cmd, 0,
                                       cancel_event=self._rotate_stop_event)
                 else:

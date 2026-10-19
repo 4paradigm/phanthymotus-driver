@@ -108,6 +108,19 @@ def test_pulse_width_tracks_measured_turn_response(monkeypatch):
     assert pulse(5, measured_rate=50) == pytest.approx(0.12)
 
 
+def test_fine_vyaw_ramps_above_stiction_to_full_speed(monkeypatch):
+    # 中速减速段：|err|*0.04，下限 0.45（高于 ~0.4 死区），上限满速 0.8。
+    # 20°→0.8 与巡航衔接；10°→0.45（0.4 被下限抬高）；5°→0.45 与爬行衔接。
+    module, _ = _load_device(monkeypatch)
+    fine = module._fine_vyaw
+    assert fine(20) == pytest.approx(0.8)
+    assert fine(15) == pytest.approx(0.6)
+    assert fine(10) == pytest.approx(0.45)
+    assert fine(5) == pytest.approx(0.45)
+    assert fine(-12) == pytest.approx(-0.48)
+    assert fine(30) == pytest.approx(0.8)          # 带外也封顶满速
+
+
 def test_rotate_timeout_s_stays_under_llm_budget(monkeypatch):
     module, _ = _load_device(monkeypatch)
     assert module._rotate_timeout_s(60) == 22.0
@@ -1071,15 +1084,15 @@ def test_creep_overcomes_step_startup_delay_without_tiny_retries(monkeypatch, an
 
 def test_measured_rate_excludes_startup_dead_time(monkeypatch):
     # 复核 Important#1：measured_rate 的分母必须是"同向进展开始后"的有效脉冲
-    # 时间，不含启动死区。植物：每脉冲前 0.35s 不动，随后 25°/s。目标 20°：
-    # 首脉有效 0.30s 转 7.5° → 真实速率 25°/s；若分母含启动墙钟（0.65s），
-    # 速率被稀释到 ~11.5°/s。脉宽差异常被 0.30s 夹紧与入带早刹掩盖，故直接
-    # 钉住第二脉规划时收到的 measured_rate——它必须来自有效时间而非墙钟。
+    # 时间，不含启动死区。植物：每脉冲前 0.35s 不动，随后 8°/s（慢到 creep
+    # 从 5° 带入口起需要 ≥2 个脉冲）。首脉有效 0.125s 转 1° → 真实速率 8°/s；
+    # 若分母含启动墙钟（0.475s），速率被稀释到 ~2.1°/s。脉宽差异常被夹紧与
+    # 入带早刹掩盖，故直接钉住第二脉规划时收到的 measured_rate。
     module, _ = _load_device(monkeypatch)
     clock = _creep_clock(module, monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    startup_s, rate = 0.35, 25.0
+    startup_s, rate = 0.35, 8.0
     seen_rates = []
     pulse = module._pulse_duration_s
 
@@ -1109,7 +1122,7 @@ def test_measured_rate_excludes_startup_dead_time(monkeypatch):
     result = plugin._do_rotate_impl({'angle_deg': 20})
     assert result['state'] == 'done'
     # 前两次调用属首脉（尚无测得速率）；第三次是第二脉规划，收到的
-    # measured_rate 必须 ≈ 25（有效时间），而非被启动死区稀释的 ~11.5。
+    # measured_rate 必须 ≈ 8（有效时间），而非被启动死区稀释的 ~2.1。
     assert seen_rates[:2] == [None, None]
     assert seen_rates[2] == pytest.approx(rate, abs=2)
 
@@ -1156,6 +1169,32 @@ def test_no_limit_cycle_on_20_and_90(monkeypatch):
         assert abs(result['final_error_deg']) <= 2.0, f"{angle}°: {result}"
         flips = _vyaw_sign_flips(fake.cmds)
         assert flips <= 2, f"{angle}° 极限环：vyaw 非零命令变号 {flips} 次"
+
+
+def test_fine_band_replaces_end_phase_crawl(monkeypatch):
+    # 末端抖动回归：60° 在 realistic 植物上，err 在 20°→5° 区间（yaw ∈ [40,55)
+    # ）必须全程连续非零指令——闭环减速段不插零。旧结构此区间是点动爬行
+    # （脉冲+零速观测交替，即真机可见的抖动），必然出现零速帧。
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(plant="realistic")
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    trace = []
+    publish = fake.publish_cmd
+
+    def publish_cmd(x, y, z, action_cmd, index=0):
+        publish(x, y, z, action_cmd, index)
+        trace.append((z, fake.yaw))      # 本帧推进后的 (指令, yaw)
+
+    monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
+    result = wait_rotate(plugin)
+    assert result['state'] == 'done'
+    assert abs(result['final_error_deg']) <= 2.0
+    in_band = [(z, yaw) for z, yaw in trace if 40 <= yaw < 55]
+    assert in_band, "60° 转角必须经过 20°→5° 减速区"
+    gaps = [(z, yaw) for z, yaw in in_band if z == 0]
+    assert not gaps, f"减速区内出现零速帧（蠕动复活）: {gaps[:3]}"
+    assert fake.cmds[-1] == (0, 0, 0)
 
 
 def test_realistic_plant_full_turn_contract(monkeypatch):
