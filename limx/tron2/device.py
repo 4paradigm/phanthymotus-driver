@@ -211,7 +211,12 @@ class Adapter:
             if args.get('action') in ('info','start','stop'):
                 # Some dashboards retain declared form values on lifecycle calls.
                 # They are inactive here and must never become motor inputs.
-                return self.pose.stop() if args['action']=='stop' else self.pose.info()
+                if args['action']=='stop':
+                    return self.pose.stop()
+                result=self.pose.info()
+                if args['action']=='start':
+                    result.update(state='ready',lifecycle_only=True)
+                return result
             pose_arguments({k:v for k,v in args.items()})
             return {'status':'validated','motion_sent':False}
         if name == 'gripper' and name in self.enabled:
@@ -224,8 +229,11 @@ class Adapter:
                 if args['action']=='stop':
                     for owner in self.grippers.values():
                         if side is None or owner.side==side: owner.cancel_waiting()
-                return {'read_only':True,'motion_sent':False,'lifecycle_only':True,
+                result={'read_only':True,'motion_sent':False,'lifecycle_only':True,
                         'grippers':{k:v.info() for k,v in self.grippers.items()}}
+                if args['action'] in ('start','stop'):
+                    result['state']='ready' if args['action']=='start' else 'idle'
+                return result
             side,action,values=combined_arguments(args)
             return {'action':action,'side':side,'arguments':values,'motion_sent':False,'status':'validated'}
         action = args.get('action', 'move' if name == 'move_head' else

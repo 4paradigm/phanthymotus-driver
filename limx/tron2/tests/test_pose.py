@@ -350,6 +350,9 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         for action in ('info','start','stop'):
             result=self.adapter.call('pose',{'action':action,'pose':'salute','side':'right','speed':'slow'})
             self.assertFalse(result['motion_sent'])
+            if action in ('start','stop'):
+                self.assertEqual(result['state'],'ready' if action=='start' else 'idle')
+                self.assertTrue(result['lifecycle_only'])
         with self.assertRaises(ValueError):self.adapter.call('pose',{'action':'start','joint':[0]*14})
         self.reader.send_movej.assert_not_awaited();self.assertIsNone(self.adapter.motion.active)
 

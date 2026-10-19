@@ -237,5 +237,5 @@ class Pose:
         self.generation+=1
         pending=self.lock.locked()
         requested=self.motion.cancel_sequence()
-        return {'motion_sent':False,'lifecycle_only':True,'cancel_requested':requested or pending,
+        return {'state':'idle','motion_sent':False,'lifecycle_only':True,'cancel_requested':requested or pending,
             'message':'取消尚未发送的后续动作段；已发送的实体动作不能由此急停'}

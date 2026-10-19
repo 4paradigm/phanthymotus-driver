@@ -29,6 +29,20 @@ def sample(opening=40, **updates):
     return out
 
 
+class CombinedLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_combined_lifecycle_states_preserve_owners_and_cancel_only_waiting(self):
+        reader=RobotReader(settings())
+        adapter=Adapter(lambda *a:None,settings(enabled_cards=['gripper']),reader=reader)
+        owners=list(adapter.grippers.values())
+        with patch.object(owners[0],'cancel_waiting') as left, patch.object(owners[1],'cancel_waiting') as right:
+            for action,expected in (('start','ready'),('stop','idle')):
+                result=adapter.call('gripper',{'action':action,'side':'left'})
+                self.assertEqual(result['state'],expected)
+                self.assertFalse(result['motion_sent']);self.assertTrue(result['lifecycle_only'])
+                self.assertEqual(set(result['grippers']),{'gripper_left','gripper_right'})
+            left.assert_called_once_with();right.assert_not_called()
+        self.assertTrue(all(o.active is None for o in owners))
+
 class ValidationTests(unittest.TestCase):
     def test_known_millimeter_targets_and_invalid_mm_are_unambiguous(self):
         for value,expected in ((0,0),(42.5,47),(85,94),(40,44.235294)):
