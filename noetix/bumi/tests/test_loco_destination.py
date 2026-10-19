@@ -961,16 +961,22 @@ def test_creep_waits_out_transient_target_crossing(monkeypatch):
     assert clock.now - first_pulse[0] >= 0.3
 
 
-@pytest.mark.parametrize('angle, yaw0', [(10, 179), (-10, -179)])
-def test_creep_overcomes_step_startup_delay_without_tiny_retries(monkeypatch, angle, yaw0):
+@pytest.mark.parametrize('angle, yaw0', [(3, 179), (-3, -179), (10, 0)])
+@pytest.mark.parametrize('startup_s', [0.2, 0.35])
+def test_creep_overcomes_step_startup_delay_without_tiny_retries(monkeypatch, angle, yaw0, startup_s):
     module, _ = _load_device(monkeypatch)
     clock = _creep_clock(module, monkeypatch)
     fake = FakeHighCtrl(yaw0=yaw0, gain_deg_per_tick=0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    monkeypatch.setattr(module, '_rotate_timeout_s', lambda angle: 3)
     pulses = []
     active = []
     publish = fake.publish_cmd
+    read = fake.get_imu_data
+
+    def get_imu():
+        if active and clock.now - active[0] >= startup_s:
+            fake.yaw += active[1] * 0.2
+        return read()
 
     def publish_cmd(x, y, z, action_cmd, index=0):
         publish(x, y, z, action_cmd, index)
@@ -978,16 +984,15 @@ def test_creep_overcomes_step_startup_delay_without_tiny_retries(monkeypatch, an
             active.extend((clock.now, 1 if z > 0 else -1))
         elif z == 0 and active:
             duration = clock.now - active[0]
-            # A gait needs 100 ms before a burst produces effective yaw.
-            fake.yaw += active[1] * max(0, duration - 0.1) * 100
             pulses.append(duration)
             active.clear()
 
     monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
+    monkeypatch.setattr(fake, 'get_imu_data', get_imu)
     result = plugin._do_rotate_impl({'angle_deg': angle})
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2 + 1e-9
-    assert all(duration >= 0.12 - 1e-6 for duration in pulses)
+    assert all(duration >= startup_s for duration in pulses)
     assert len(pulses) <= 4
     assert fake.cmds[-1] == (0, 0, 0)
 
@@ -1003,7 +1008,7 @@ def test_creep_stops_after_repeated_ineffective_pulses(monkeypatch):
     assert result['state'] == 'error'
     assert 'progress' in result['error']
     assert result['final_error_deg'] == pytest.approx(10)
-    assert bursts == 3
+    assert bursts == 1  # A frozen startup errors instead of retrying the same ineffective burst.
     assert clock.now < 3
     assert fake.cmds[-1] == (0, 0, 0)
 

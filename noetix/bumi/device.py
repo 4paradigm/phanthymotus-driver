@@ -147,6 +147,7 @@ _ROTATE_PULSE_VYAW = 0.5               # creep 点动幅值（高于 0.4 stictio
 _ROTATE_PULSE_S_PER_DEG = 0.025
 _ROTATE_PULSE_MIN_S = 0.12
 _ROTATE_PULSE_MAX_S = 0.30
+_ROTATE_STARTUP_TIMEOUT_S = 0.50
 _ROTATE_OBSERVE_S = 0.30
 _ROTATE_OBSERVE_SPREAD_DEG = 0.5
 _ROTATE_MIN_PROGRESS_DEG = 0.1
@@ -998,6 +999,7 @@ class LocoPlugin:
             turned_at_pulse = 0.0
             pulse_started = 0.0
             pulse_duration = 0.0
+            pulse_motion_started = False
             measured_rate = None
             no_progress = 0
             observed_errors = []
@@ -1072,7 +1074,19 @@ class LocoPlugin:
                             pulse_phase = "coast"
                             coast_end = time.monotonic() + _ROTATE_OBSERVE_S
                     elif pulse_phase == "pulse":
-                        if (time.monotonic() < pulse_end
+                        now = time.monotonic()
+                        progress = math.copysign(1.0, err_at_pulse) * (turned_deg - turned_at_pulse)
+                        if not pulse_motion_started and progress >= _ROTATE_MIN_PROGRESS_DEG:
+                            pulse_motion_started = True
+                            pulse_end = now + _pulse_duration_s(err, measured_rate)
+                        if (not pulse_motion_started
+                                and now - pulse_started >= _ROTATE_STARTUP_TIMEOUT_S
+                                and abs(err) > _ROTATE_TOL_DEG):
+                            return {"state": "error", "error": "no yaw progress during correction startup",
+                                    "requested_angle_deg": angle_deg, "turned_deg": turned_deg,
+                                    "final_error_deg": angle_deg - turned_deg,
+                                    "tolerance_deg": _ROTATE_TOL_DEG}
+                        if ((not pulse_motion_started or now < pulse_end)
                                 and abs(err) > _ROTATE_TOL_DEG
                                 and err * err_at_pulse > 0):
                             self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
@@ -1124,6 +1138,7 @@ class LocoPlugin:
                                 err_at_pulse = sum(observed_errors) / len(observed_errors)
                                 turned_at_pulse = turned_deg
                                 pulse_started = time.monotonic()
+                                pulse_motion_started = False
                                 pulse_end = pulse_started + _pulse_duration_s(
                                     err_at_pulse, measured_rate)
                                 pulse_cmd = (_ROTATE_VYAW_SIGN * math.copysign(
