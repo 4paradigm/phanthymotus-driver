@@ -296,7 +296,7 @@ def test_readonly_matched_count_migration_uses_subscription_event():
     channel=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Channel')
     reader=next(n for n in channel.body if isinstance(n,ast.ClassDef) and n.name=='__Reader')
     # Compile the actual nested class, retaining its mangled names; no DDS import.
-    ns={'DomainParticipant':object,'Topic':object,'Qos':object,'Callable':object,'DataReader':object}
+    ns={'DomainParticipant':object,'Topic':object,'Qos':object,'Callable':object,'DataReader':object,'Event':threading.Event}
     exec(compile(ast.Module(body=[reader],type_ignores=[]),str(source),'exec'),ns)
     obj=ns['__Reader']()
     assert obj.MatchedPublisherCount()==0
