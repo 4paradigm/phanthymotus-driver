@@ -24,6 +24,7 @@ Run: python3 -m pytest tests/test_control_sink.py -q
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -115,6 +116,27 @@ def make_sink(clock, apply, descriptor=None, **kwargs):
     return ControlSink(
         descriptor or descriptor_dict(), apply, clock=clock, **kwargs
     )
+
+
+@pytest.mark.parametrize("field, value", [
+    ("values", [math.nan, 0.0]),
+    ("values", [math.inf, 0.0]),
+    ("stamp_ms", math.nan),
+    ("obs_stamp_ms", math.inf),
+    ("ttl_ms", math.nan),
+    ("priority", math.inf),
+])
+def test_non_finite_control_message_fields_are_rejected(field, value):
+    """A JSON NaN/Infinity must never reach clamp or an actuator callback."""
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder)
+    command = message(clock, [0.0, 0.0])
+    command[field] = value
+
+    outcome = sink.submit(command)
+
+    assert outcome.verdict is Verdict.REJECTED
+    assert recorder.calls == []
 
 
 # ── descriptor validation ────────────────────────────────────────────────────
