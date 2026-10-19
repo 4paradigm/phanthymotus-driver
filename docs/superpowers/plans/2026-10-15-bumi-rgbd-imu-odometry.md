@@ -1,5 +1,7 @@
 # Bumi RGB-D + IMU Odometry Implementation Plan
 
+执行更新（2026-10-19）：用户指定将实验提交并入原 loco_destination PR #408，后续提交分支改为 feat/bumi-loco-destination；保留独立实验运行方式、声音分支隔离及所有真机验收前提。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 独立实现可回放的 RGB-D/IMU 里程计，用外部真值验证约 1 米移动的前向估计误差是否在 ±0.05 米内。
