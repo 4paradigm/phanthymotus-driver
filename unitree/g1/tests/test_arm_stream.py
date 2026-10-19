@@ -381,3 +381,106 @@ def test_servo_claim_starts_at_measured_position_despite_velocity_noise(tmp_path
     else:
         assert result['code'] == 'robot_not_stopped'
         assert not arm.session_id
+
+
+def low_state(tick, q=0.):
+    return SimpleNamespace(tick=tick, motor_state=[SimpleNamespace(
+        q=q, dq=0., mode=1, motorstate=0, vol=48., temperature=[20, 20]) for _ in range(29)])
+
+
+def test_delayed_source_progress_cannot_refresh_feedback_or_start_reset(tmp_path):
+    arm, _, ch, advance, _, sdk = rig(tmp_path, claim=False, servo=True)
+    arm._snapshot_provider = None
+    arm._fsm = {'arm_ns': arm.clock(), 'fsm_id': 500}
+    arm._on_state(low_state(1000))
+    first = arm._snapshot()['arm_ns']
+    advance(20_000)
+    arm._fsm['arm_ns'] = arm.clock()
+    arm._on_state(low_state(1020, .3))
+    assert arm._snapshot()['arm_ns'] == first + 20_000_000
+    with pytest.raises(ValueError, match='arm_feedback_stale'):
+        arm._fresh()
+    assert arm.dispatch('operator_reset', {})['code'] == 'arm_feedback_stale'
+    assert not ch.writes and not sdk
+    arm._on_state(low_state(21000, .1))
+    assert arm._fresh()[1] == [.1]*10
+
+
+def test_feedback_callback_does_not_wait_for_motion_lock(tmp_path):
+    arm, _, _, _, _, _ = rig(tmp_path, claim=False)
+    arm._snapshot_provider = None
+    finished = threading.Event()
+    def receive():
+        arm._on_state(low_state(1000))
+        arm._on_fsm(SimpleNamespace(fsm_id=500, fsm_mode=0))
+        finished.set()
+    with arm.lock:
+        thread = threading.Thread(target=receive)
+        thread.start()
+        completed_while_locked = finished.wait(.5)
+    thread.join(1)
+    assert completed_while_locked
+    assert arm._fresh()[1] == [0.]*10
+
+
+def test_source_tick_wrap_and_duplicates_preserve_sample_age(tmp_path):
+    arm, _, _, advance, _, _ = rig(tmp_path, claim=False)
+    arm._snapshot_provider = None
+    arm._on_state(low_state(0xfffffff0))
+    first = arm._snapshot()['arm_ns']
+    advance(32)
+    arm._on_state(low_state(16, .1))
+    assert arm._snapshot()['arm_ns'] == first + 32_000_000
+    advance(101)
+    arm._on_state(low_state(16, .2))
+    arm._on_state(low_state(15, .3))
+    assert arm._snapshot()['q'] == [.1]*10
+    with pytest.raises(ValueError, match='arm_feedback_stale'):
+        arm._fresh()
+
+
+def test_latest_feedback_real_dds_while_motion_lock_is_held():
+    import subprocess
+    result = subprocess.run([sys.executable, '-c',
+        'from test_arm_stream import check_latest_feedback_dds; check_latest_feedback_dds()'],
+        cwd=DRIVER/'tests', capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def check_latest_feedback_dds():
+    import time
+    from cyclonedds.qos import Qos, Policy
+    from unitree_sdk2py.core import channel as sdk_channel
+    from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_
+    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+    sdk_channel.ChannelConfigHasInterface = '''<CycloneDDS><Domain><General>
+      <Interfaces><NetworkInterface name="lo"/></Interfaces><AllowMulticast>false</AllowMulticast>
+      </General><Discovery><Peers><Peer Address="127.0.0.1"/></Peers></Discovery>
+      <Tracing><Verbosity>none</Verbosity></Tracing></Domain></CycloneDDS>'''
+    sdk_channel.ChannelFactoryInitialize(97, 'lo')
+    arm = ArmStreamExecutor({}, 'test', None)
+    publisher = sdk_channel.ChannelPublisher('rt/lowstate', LowState_)
+    publisher.Init()
+    arm.start()
+    try:
+        deadline = time.monotonic()+5
+        while not arm._subscriber.MatchedPublisherCount() and time.monotonic()<deadline:
+            time.sleep(.01)
+        assert arm._subscriber.MatchedPublisherCount() == 1
+        reader = arm._subscriber._ChannelSubscriber__channel._Channel__reader._Reader__reader
+        assert reader.get_qos()[Policy.History] == Policy.History.KeepLast(1)
+        msg = unitree_hg_msg_dds__LowState_()
+        with arm.lock:
+            for tick in range(1000, 1050):
+                msg.tick = tick
+                msg.motor_state[15].q = tick/1000
+                assert publisher.Write(msg)
+                time.sleep(.001)
+            deadline = time.monotonic()+2
+            while arm._snapshot().get('source_tick') != 1049 and time.monotonic()<deadline:
+                time.sleep(.005)
+            assert arm._snapshot()['source_tick'] == 1049
+            assert arm._snapshot()['q'][0] == pytest.approx(1.049)
+    finally:
+        arm.stop()
+        publisher.Close()

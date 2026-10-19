@@ -65,6 +65,7 @@ class ArmStreamExecutor:
         self.cfg, self.ns, self.arm_client = cfg, namespace, arm_client
         self.gate, self.clock = self, clock
         self.lock = threading.RLock()
+        self._feedback_lock = threading.Lock()
         self._management_lock = threading.RLock()
         self._cancelled_management = {}
         self._management_receipt = None
@@ -74,6 +75,7 @@ class ArmStreamExecutor:
         self._gravity_override, self._gravity = gravity, gravity
         self._feedback = {'q': [], 'dq': [], 'arm_ns': 0, 'fault': True}
         self._source_tick = None
+        self._source_time_ns = None
         self._subscriber = None
         self._fsm_subscriber = self._arm_observer = None
         self._fsm = {'arm_ns': 0}
@@ -174,9 +176,9 @@ class ArmStreamExecutor:
             self._prepared = False
 
     def _on_state(self, msg):
+        received_ns = self.clock()
         try:
             tick = int(msg.tick)
-            if self._source_tick is not None and not 0 < ((tick-self._source_tick) & 0xffffffff) < 0x80000000: return
             motors = msg.motor_state
             q = vector([float(motors[i].q) for i in MOTOR_IDS],10,'feedback_q')
             dq = vector([float(motors[i].dq) for i in MOTOR_IDS],10,'feedback_dq')
@@ -185,22 +187,30 @@ class ArmStreamExecutor:
                           'motorstate':int(motors[i].motorstate),
                           'voltage':float(motors[i].vol),
                           'temperature':list(motors[i].temperature)} for i in MOTOR_IDS]
-            with self.lock:
+            locked = dict(zip(LOCKED_NAMES,
+                vector([float(motors[i].q) for i in LOCKED_MOTOR_IDS], 13, 'body_q')))
+            with self._feedback_lock:
+                delta = None if self._source_tick is None else (tick-self._source_tick) & 0xffffffff
+                if delta is not None and not 0 < delta < 0x80000000: return
+                # G1 tick advances in milliseconds; late delivery cannot renew source age.
+                sampled_ns = received_ns if delta is None else min(received_ns, self._source_time_ns+delta*1_000_000)
                 self._source_tick = tick
-                self._feedback = {'q':q,'dq':dq,'arm_ns':self.clock(),
+                self._source_time_ns = sampled_ns
+                self._feedback = {'q':q,'dq':dq,'arm_ns':sampled_ns,'received_ns':received_ns,
                     'source_tick':tick, 'motor_telemetry':telemetry,
-                    'locked_joints': dict(zip(LOCKED_NAMES,
-                        vector([float(motors[i].q) for i in LOCKED_MOTOR_IDS], 13, 'body_q')))}
+                    'locked_joints':locked}
         except Exception as exc:
-            with self.lock:
+            with self._feedback_lock:
                 self._feedback = {**self._feedback,'error':type(exc).__name__}
 
     def _on_fsm(self, msg):
-        with self.lock:
-            self._fsm = {'arm_ns':self.clock(),'fsm_id':int(msg.fsm_id),'fsm_mode':int(msg.fsm_mode)}
+        received_ns = self.clock()
+        with self._feedback_lock:
+            self._fsm = {'arm_ns':received_ns,'fsm_id':int(msg.fsm_id),'fsm_mode':int(msg.fsm_mode)}
 
     def _snapshot(self):
-        return copy.deepcopy(self._snapshot_provider() if self._snapshot_provider else self._feedback)
+        if self._snapshot_provider: return copy.deepcopy(self._snapshot_provider())
+        with self._feedback_lock: return copy.deepcopy(self._feedback)
 
     def _fresh(self):
         s = self._snapshot()
@@ -224,12 +234,14 @@ class ArmStreamExecutor:
             if self._snapshot_provider is None and self._subscriber is None:
                 from unitree_sdk2py.core.channel import ChannelSubscriber
                 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+                from cyclonedds.qos import Qos, Policy
+                latest = Qos(Policy.History.KeepLast(1))
                 self._subscriber = ChannelSubscriber('rt/lowstate', LowState_)
-                self._subscriber.Init(self._on_state,1)
+                self._subscriber.Init(self._on_state,0,qos=latest)
                 from sport_mode_state import SportModeState_
                 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
                 self._fsm_subscriber = ChannelSubscriber('rt/sportmodestate', SportModeState_)
-                self._fsm_subscriber.Init(self._on_fsm,1)
+                self._fsm_subscriber.Init(self._on_fsm,0,qos=latest)
                 self._arm_observer = ChannelSubscriber('rt/arm_sdk', LowCmd_)
                 self._arm_observer.Init(lambda msg:None,0)
                 self._observer_started_ns = self.clock()
@@ -365,6 +377,8 @@ class ArmStreamExecutor:
                 return True
             op['cancel_requested'] = True
             op['action_id'] = None
+            if op['state'] in ('return_preparing', 'returning'):
+                op.update(state='holding', started_ns=self.clock())
             if op.get('handback_confirmed'):
                 self._complete_release(op, physical_confirmed=False)
             elif op['state'] in ('failed', 'unknown'):
@@ -388,11 +402,13 @@ class ArmStreamExecutor:
             if cancel_pending and self._operation and self._operation['state'] not in ('completed','failed','unknown'):
                 op=self._operation
                 op['cancel_requested']=True
-                if (op['state'] in ('holding','handback','confirming_handback')
+                if (op['state'] in ('return_preparing','returning','holding','handback','confirming_handback')
                         or op['state']=='awaiting_feedback' and op['action_id'] is None):
                     # Continue the safe SDK handback, but do not start a vendor
                     # gesture after an explicit stop cancelled its pending work.
                     op['action_id']=None
+                    if op['state'] in ('return_preparing','returning'):
+                        op.update(state='holding', started_ns=self.clock())
                 else:
                     # ExecuteAction has no cancel/status API. Once 99 was sent,
                     # a local stop cannot honestly report the vendor action as
@@ -410,7 +426,20 @@ class ArmStreamExecutor:
                 _,_,dq=self._fresh()
                 if not operator_reset and max(map(abs,dq))>.02: raise ValueError('robot_not_stopped')
             if self._legacy_busy(): raise ValueError('external_control_owned')
-            self._fresh()
+            _,q,_ = self._fresh()
+            target = None
+            if operator_reset and action99:
+                path = self.cfg.get('reset_pose_path',str(Path(__file__).parent/'motion/reset_pose.json'))
+                if not path: raise ValueError('reset_pose_missing')
+                pose = json.loads(Path(path).read_text())
+                if (not isinstance(pose,dict) or pose.get('schema') != 'motus.g1-reset-pose.v1'
+                        or pose.get('arm_joint_names') != list(JOINT_NAMES)):
+                    raise ValueError('reset_pose_schema')
+                target = vector(pose.get('q'),10,'reset_pose')
+                if len(self.limits)!=10 or any(not lo<=x<=hi for x,(lo,hi) in zip(target,self.limits)):
+                    raise ValueError('reset_pose_joint_limit')
+                if not self.session_id or not self._channel_open:
+                    raise ValueError('reset_requires_arm_control')
             self.hold('release_requested',release=True)
             self._prepared=False
             ident = ident or secrets.token_hex(16)
@@ -422,7 +451,29 @@ class ArmStreamExecutor:
             self._operations[ident]=self._operation
             while len(self._operations)>32:self._operations.popitem(last=False)
             self._settle=None
+            if target is not None:
+                self._operation.update(state='return_preparing', return_target=target,
+                    return_reference=q, return_pose_reached=False)
+                threading.Thread(target=self._prepare_reset_return, args=(self._operation,),
+                    name='g1-reset-prepare', daemon=True).start()
             return copy.deepcopy(self._operation)
+
+    def _prepare_reset_return(self, op):
+        try:
+            solver = self.motion_control.solver if self.motion_control else None
+            if solver is None: raise ValueError('reset_solver_unavailable')
+            bounds = solver.joint_envelope(op['return_reference'], op['return_reference'], op['return_target'])
+            lower,upper = (vector(bounds[k],10,'reset_envelope') for k in ('lower','upper'))
+            with self.lock:
+                if self._operation is not op or op['state']!='return_preparing': return
+                self._fresh()
+                distance=max(abs(a-b) for a,b in zip(op['return_reference'],op['return_target']))
+                op.update(state='returning', return_lower=lower, return_upper=upper,
+                    return_tick_ns=self.clock(), return_deadline_ns=self.clock()+int((distance/.1+5)*1e9))
+        except Exception as exc:
+            with self.lock:
+                if self._operation is op and op['state']=='return_preparing':
+                    op.update(state='failed', reason=str(exc))
 
     def dispatch(self, action, args):
         if action in ('stop', 'end_operator_session'):
@@ -593,8 +644,27 @@ class ArmStreamExecutor:
         if op is None or op['state'] in ('completed','failed','unknown'):return
         now=self.clock()
         if op.get('operator_reset') and op['state']=='sdk_pending':return
+        if op['state']=='returning':
+            if now>=op['return_deadline_ns']: raise ValueError('reset_return_timeout')
+            dt=max(0.,min((now-op['return_tick_ns'])/1e9,.05))
+            step=.1*dt
+            reference=[p+max(-step,min(step,t-p)) for p,t in zip(op['return_reference'],op['return_target'])]
+            if any(not lo<=x<=hi for values in (q,reference) for x,lo,hi in
+                   zip(values,op['return_lower'],op['return_upper'])):
+                raise ValueError('reset_return_envelope_exceeded')
+            tau=None if self.cfg.get('servo_position') else vector(self._gravity(reference),10,'gravity_tau')
+            if tau is not None and any(abs(t)>lim for t,lim in zip(tau,self.torque_limits)):
+                raise ValueError('gravity_torque_limit')
+            self._write(reference,tau,min(1.,self._weight+dt))
+            op.update(return_reference=reference, return_tick_ns=now)
+            reached=max(abs(a-b) for a,b in zip(q,op['return_target']))<=.02
+            if reached and reference==op['return_target'] and self._stationary(s,q,dq,op['started_ns']):
+                op.update(state='holding', started_ns=now, return_pose_reached=True)
+            elif not reached: self._settle=None
+            return
         if now-op['started_ns']>10_000_000_000:
             op.update(state='unknown',reason='release_timeout');return
+        if op['state']=='return_preparing':return
         if op['state']=='holding':
             if self._channel_open:
                 self._write(q,None,self._weight)
@@ -713,6 +783,12 @@ class ArmStreamExecutor:
                 self.applied_seq=self.latest['seq'];self.state,self.reason='active',None
             except Exception as exc:
                 if self.record_sink is not None: self.record_sink.pause()
+                if (self._operation and self._operation.get('operator_reset')
+                        and self._operation['state'] in ('return_preparing','returning','holding','handback','confirming_handback')):
+                    self._operation.update(state='failed',reason=str(exc))
+                    self.state,self.reason='fault',str(exc)
+                    self.latest=self._proof=None
+                    return
                 snapshot=self._snapshot()
                 age=self.clock()-(self._fsm.get('arm_ns',0) if str(exc)=='motion_feedback_stale' else snapshot.get('arm_ns',0))
                 if str(exc) in ('arm_feedback_stale','motion_feedback_stale') and 0 <= age <= 300_000_000 and self.state!='fault':

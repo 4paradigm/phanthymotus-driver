@@ -316,9 +316,9 @@ class ChannelSubscriber:
         self.__channel = factory.CreateChannel(name, type)
         self.__inited = False
 
-    def Init(self, handler: Callable = None, queueLen: int = 0):
+    def Init(self, handler: Callable = None, queueLen: int = 0, *, qos: Qos = None):
         if not self.__inited:
-            self.__channel.SetReader(None, handler, queueLen)
+            self.__channel.SetReader(qos, handler, queueLen)
             self.__inited = True
 
     def Close(self):
