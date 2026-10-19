@@ -373,6 +373,9 @@ class LocoPlugin:
         # action whose terminal callback fires exactly once.
         self._rotate_worker: threading.Thread | None = None
         self._active_action_id: str | None = None
+        self._destination_action = "rotate"
+        self._distance_feedback = None
+        self._executor = executor
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
@@ -487,25 +490,27 @@ class LocoPlugin:
     def _loco_destination_tool(self) -> dict:
         return {
             "name": "loco_destination", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 有目标的转角运动——IMU 航向闭环原地转过指定角度后自动刹停。执行前确认机器人已处于行走模式、地面平坦防滑，旋转范围内留出至少 1m 半径无人无障碍空间。到达有 ±2° 容差；超时会刹停并返回实际转角。",
+            "description": "Bumi 目标运动：按融合里程计前进指定距离，或按 IMU 航向原地旋转指定角度，到达后刹停。距离移动需运行 RGB-D/IMU 融合并保持 tracking；旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。距离精度待真机验证。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["rotate", "stop_move", "status"]},
+                    "action": {"type": "string", "enum": ["move", "rotate", "stop_move", "status"]},
+                    "distance_m": {"type": "number", "minimum": 0.1, "maximum": 3,
+                                   "description": "沿起点朝向前进的目标距离（米），需有效融合里程计。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
+                    "move": {"params": ["distance_m"], "description": "按位置反馈前进 distance_m 米后停稳；里程计失效立即刹停报错。"},
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
-                    "stop_move": {"params": [], "description": "立即停止当前转角动作并刹停。"},
-                    "status": {"params": [], "description": "查询当前转角动作状态。"},
+                    "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
+                    "status": {"params": [], "description": "查询当前目标动作与实际位移/转角结果。"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
-                # rotate 经后台线程异步完成，终态由 Agent Core 的 /api/acp/complete
-                # 回调上报；90 = _rotate_timeout_s(360) + 15。
-                "x-completion": {"actions": ["rotate"],
-                                 "timeout": _rotate_timeout_s(360) + 15},
+                # Both actions complete asynchronously through ACP; longest
+                # distance budget is 105 s plus 15 s for delivery.
+                "x-completion": {"actions": ["move", "rotate"], "timeout": 120},
             },
             "topic_out": [],
         }
@@ -598,7 +603,11 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        pass
+        try:
+            self._get_distance_feedback().start()
+        except Exception as exc:
+            # Fusion is optional; rotation and the existing cards stay usable.
+            print(f"[loco_destination] distance feedback unavailable: {exc}", flush=True)
 
     def stop(self) -> None:
         # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
@@ -607,7 +616,8 @@ class LocoPlugin:
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
-        self._wait_for_rotate_idle()
+        if self._wait_for_rotate_idle() and self._distance_feedback is not None:
+            self._distance_feedback.stop()
 
     def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
         # Cover the dispatch-acceptance window: stop may land after the
@@ -648,6 +658,8 @@ class LocoPlugin:
             handler = lambda: self._do_move(args)
         elif tool_name == "loco_destination" and action == "rotate":
             return self._do_rotate(args)
+        elif tool_name == "loco_destination" and action == "move":
+            return self._do_destination(args, "move")
         elif tool_name == "loco_destination" and action == "status":
             return self._rotate_status()
         elif tool_name == "loco_destination" and action == "stop_move":
@@ -799,6 +811,9 @@ class LocoPlugin:
         return {"state": "stopped"}
 
     def _do_rotate(self, args: dict) -> dict:
+        return self._do_destination(args, "rotate")
+
+    def _do_destination(self, args: dict, action: str) -> dict:
         # Sync entry: reserve one rotation atomically (busy-guard + clear
         # cancellation) before exposing running status, then run the
         # pre-flight checks. Validation/mode refusals complete here, before
@@ -813,27 +828,33 @@ class LocoPlugin:
                 return {
                     "state": "error",
                     "error": (
-                        "loco_destination rotate in progress; wait for it to "
+                        "loco_destination rotate or distance move in progress; wait for it to "
                         "finish or call stop_move first"
                     ),
                 }
             self._rotate_stop_event.clear()
             self._rotate_state["state"] = "running"
+            self._destination_action = action
         try:
-            angle_deg, terminal = self._rotate_preflight(args)
+            value, terminal = (self._rotate_preflight(args) if action == "rotate"
+                               else self._distance_preflight(args))
             if terminal is None:
-                expected_duration_s = _rotate_timeout_s(angle_deg)
+                if action == "rotate":
+                    expected_duration_s = _rotate_timeout_s(value)
+                else:
+                    from distance_control import distance_timeout
+                    expected_duration_s = distance_timeout(value)
                 action_id = f"bumi_loco_destination_{uuid.uuid4().hex}"
                 worker = threading.Thread(target=self._do_rotate_worker,
-                                          args=(args, action_id),
-                                          daemon=True, name="bumi_rotate")
+                                          args=(args, action_id, action),
+                                          daemon=True, name=f"bumi_{action}")
                 with self._rotate_lock:
                     self._active_action_id = action_id
                     self._rotate_worker = worker
                 worker.start()
                 return {"state": "running", "action_id": action_id,
                         "expected_duration_s": expected_duration_s,
-                        "requested_angle_deg": angle_deg}
+                        ("requested_angle_deg" if action == "rotate" else "requested_distance_m"): value}
         except Exception as exc:
             terminal = {"state": "error",
                         "error": f"{type(exc).__name__}: {exc}"}
@@ -846,7 +867,7 @@ class LocoPlugin:
             self._rotate_state["last_result"] = terminal
         return terminal
 
-    def _do_rotate_worker(self, args: dict, action_id: str) -> dict | None:
+    def _do_rotate_worker(self, args: dict, action_id: str, action: str = "rotate") -> dict | None:
         # bumi_rotate thread body: run the impl, then publish exactly one
         # ACP terminal. The active action is claimed (cleared) under the
         # lock BEFORE notifying — a duplicate completion is structurally
@@ -855,12 +876,13 @@ class LocoPlugin:
         result = None
         owns_velocity = False
         try:
-            if abs(float(args["angle_deg"])) >= 0.05:
+            if action == "move" or abs(float(args["angle_deg"])) >= 0.05:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
-                self._preempt_servo("loco_destination.rotate")
+                self._preempt_servo(f"loco_destination.{action}")
                 owns_velocity = True
-            result = self._do_rotate_impl(args)
+            result = self._do_rotate_impl(args) if action == "rotate" else self._do_distance_impl(args)
+            result["action"] = action
             return result
         except Exception as exc:
             result = {"state": "error",
@@ -918,6 +940,44 @@ class LocoPlugin:
                 ),
             }
         return None
+
+    def _get_distance_feedback(self):
+        if self._distance_feedback is None:
+            from distance_control import DistanceFeedback
+            self._distance_feedback = DistanceFeedback(self._executor)
+        return self._distance_feedback
+
+    def _read_distance_feedback(self):
+        return self._get_distance_feedback().snapshot()
+
+    def _distance_preflight(self, args):
+        raw = args.get("distance_m")
+        try:
+            distance = float(raw)
+        except (TypeError, ValueError):
+            distance = float("nan")
+        if isinstance(raw, bool) or not math.isfinite(distance) or not 0.1 <= distance <= 3.0:
+            return None, {"state": "error", "error": "distance_m must be a finite number from 0.1 to 3 metres"}
+        problem = self._rotate_mode_error()
+        if problem is not None:
+            return None, problem
+        self._get_distance_feedback().start()
+        self._read_distance_feedback()
+        return distance, None
+
+    def _distance_publish(self, vx):
+        self._publish_cmd(vx, 0, 0, _get_default_cmd(), 0,
+                          cancel_event=self._rotate_stop_event if vx else None)
+
+    def _do_distance_impl(self, args):
+        from distance_control import run_distance
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+            if self._move_thread.is_alive():
+                return {"state": "error", "error": "previous move has not stopped"}
+        self._set_servo_velocity_owner(True)
+        return run_distance(self, float(args["distance_m"]))
 
     def _read_rotate_imu(self) -> tuple[float, float]:
         imu = self._high_ctrl.get_imu_data()
@@ -1170,7 +1230,8 @@ class LocoPlugin:
     def _rotate_status(self) -> dict:
         with self._rotate_lock:
             return {"state": self._rotate_state["state"],
-                    "last_result": self._rotate_state["last_result"]}
+                    "last_result": self._rotate_state["last_result"],
+                    **({"action": self._destination_action} if self._rotate_state["state"] == "running" else {})}
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)

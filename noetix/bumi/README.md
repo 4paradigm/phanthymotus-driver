@@ -413,8 +413,9 @@ unexposed.
 
 ### `loco_destination`
 
-A motion card on the `loco` plugin: turn in place by the requested angle —
-angle as motion, not velocity × duration. A 50 Hz closed loop reads IMU yaw
+A motion card on the `loco` plugin: turn in place by the requested angle, or
+drive forward a requested distance — target as motion, not velocity ×
+duration. The rotate path is a 50 Hz closed loop that reads IMU yaw
 and runs a three-phase trip (replacing the earlier P-term law): **cruise**
 drives `vyaw` at full 0.8 while more than 20° of error remains, **brake**
 commands zero velocity until the gyro settles (|wz| ≤ 0.1 rad/s, 0.5 s cap),
@@ -434,22 +435,26 @@ open-loop `move`, where velocity × duration leaves the actual turn to
 ground slip and payload and reports nothing back: `loco_destination`
 measures where the robot really turned instead.
 
-- Actions and parameters: `rotate angle_deg` returns immediately with
-  `state: running`, an `action_id` and `expected_duration_s`; the motion
-  runs on a background thread and its terminal result (`done` → completed,
-  `stopped` → cancelled, `timeout` → error, `error` → error) is posted
-  exactly once to `AGENT_CORE_URL/api/acp/complete`, which is how Agent
-  Core releases the waiting LLM barrier (a delivery failure is logged, not
-  retried). `expected_duration_s` is the whole-request timeout budget, not
-  a completion promise. Validation, workmode and busy refusals return
+- Actions and parameters: `rotate angle_deg` and `move distance_m` each
+  return immediately with `state: running`, an `action_id` and
+  `expected_duration_s`; the motion runs on a background thread and its
+  terminal result (`done` → completed, `stopped` → cancelled, `timeout` →
+  error, `error` → error) is posted exactly once to
+  `AGENT_CORE_URL/api/acp/complete`, which is how Agent Core releases the
+  waiting LLM barrier (a delivery failure is logged, not retried).
+  `expected_duration_s` is the whole-request timeout budget, not a
+  completion promise. Validation, workmode and busy refusals return
   synchronously as `error` with no `action_id`. `angle_deg` spans −360 to
   360 degrees (positive = counter-clockwise/left) and requires walking
-  mode, flat non-slip ground and at least 1 m clearance. `stop_move`
-  brakes an active rotation immediately (also the `on_interrupt_motion`
-  hook). `status` reports `idle`/`running` plus `last_result`, the full
-  result of the most recent completed rotation. As with the vision card, a
-  canvas-UI invocation registers no ACP barrier (Agent Core behavior), so
-  nothing blocks on its completion.
+  mode, flat non-slip ground and at least 1 m clearance. `distance_m`
+  spans 0.1 to 3 metres forward only (no reverse, strafe or path
+  planning) and additionally requires live fused odometry (see below).
+  `stop_move` brakes an active rotation or distance move immediately
+  (also the `on_interrupt_motion` hook). `status` reports `idle`/
+  `running` (plus which `action` is running) and `last_result`, the full
+  result of the most recent completed target action. As with the vision
+  card, a canvas-UI invocation registers no ACP barrier (Agent Core
+  behavior), so nothing blocks on its completion.
 - Tolerance: `done` requires the angle error inside ±2° while yaw is nearly
   still (|wz| ≤ 0.1 rad/s for 8 consecutive frames); a request beyond 150°
   is split into chained ≤150° absolute sub-targets so the turn goes the
@@ -464,8 +469,23 @@ measures where the robot really turned instead.
   `min(75, 10 + |angle_deg|/5)` seconds. Cruise additionally requires at least 1° of measured progress in the requested direction every 2 seconds; otherwise it brakes and returns an error (feedback loss or a stalled chassis).
 
 Posture, semantic and teaching requests reserve the chassis across preparation, command dispatch and confirmation. They cancel an existing rotation and wait for its reservation/worker to resolve before changing modes; a new move or rotate is refused during that reservation. Failure to stop rotation within 6 seconds rejects the competing action without sending it.
-- No distance feedback: the card consumes IMU heading only and reports
-  angles, never meters. Distance feedback is not part of this card today.
+- Distance feedback for `move`: the card subscribes (read-only) to the
+  independent experiment's `/bumi_odom/filtered` (nav_msgs/Odometry) and
+  `/bumi_odom/status` (std_msgs/String) topics — it never starts the
+  camera or the fusion pipeline itself, and both topics must be in the
+  driver's ROS domain (experiments launched in a separate domain need an
+  explicit domain adjustment). Feedback must be a valid
+  `bumi_odom_odom → bumi_odom_base_link` pose with fresh source and
+  receipt timestamps (≤0.5 s), positive finite covariance, a `tracking`
+  quality status and a stable segment; motion validates the same checks
+  every tick and brakes with an error on loss, jumps, segment change,
+  heading/lateral deviation, no progress or timeout. Progress is the
+  projection onto the starting heading — not path length. The SDK `vx` is
+  a normalised command, not metres per second. Completion requires the
+  stop to settle (≥0.5 s of stable feedback) within ±0.05 m of the
+  requested distance; overshoot beyond tolerance is an error, never an
+  automatic reverse correction. Software tests do not prove real-world
+  ±5 cm accuracy — that remains a hardware verification item.
 
 ## `speaker`
 

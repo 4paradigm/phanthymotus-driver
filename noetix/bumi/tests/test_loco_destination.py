@@ -236,12 +236,83 @@ def test_loco_destination_tool_schema_contract(monkeypatch):
     tool = [t for t in plugin.get_tools() if t['name'] == 'loco_destination'][0]
     assert tool['type'] == 'actuator' and tool['multiInstance'] is False
     props = tool['inputSchema']['properties']
-    assert set(props['action']['enum']) == {'rotate', 'stop_move', 'status'}
+    assert set(props['action']['enum']) == {'move', 'rotate', 'stop_move', 'status'}
+    assert props['distance_m']['minimum'] == 0.1 and props['distance_m']['maximum'] == 3
     assert props['angle_deg']['minimum'] == -360 and props['angle_deg']['maximum'] == 360
     assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
-    assert tool['inputSchema']['x-completion'] == {'actions': ['rotate'], 'timeout': 90}
-    assert set(tool['inputSchema']['x-action-params']) == {'rotate', 'stop_move', 'status'}
+    assert tool['inputSchema']['x-completion'] == {'actions': ['move', 'rotate'], 'timeout': 120}
+    assert set(tool['inputSchema']['x-action-params']) == {'move', 'rotate', 'stop_move', 'status'}
+    assert tool['inputSchema']['x-action-params']['move']['params'] == ['distance_m']
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
+
+
+@pytest.mark.parametrize('distance', [None, 0, -1, 0.09, 3.01, float('nan'), True])
+def test_distance_invalid_requests_do_not_send_commands(monkeypatch, distance):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('move', {'_tool_name': 'loco_destination', 'distance_m': distance})
+    assert result['state'] == 'error'
+    assert 'distance_m' in result['error']
+    assert 'action_id' not in result
+    assert fake.cmds == []
+
+
+def test_distance_refuses_missing_fusion_before_acceptance(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    result = plugin.dispatch('move', {'_tool_name': 'loco_destination', 'distance_m': 1})
+    assert result['state'] == 'error'
+    assert 'action_id' not in result
+    assert plugin._rotate_status()['state'] == 'idle'
+    assert fake.cmds == []
+
+
+def test_distance_dispatch_reserves_chassis_and_completes_once(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
+    monkeypatch.setattr(plugin, '_distance_preflight', lambda args: (1.0, None))
+
+    def run(args):
+        entered.set()
+        assert release.wait(timeout=2)
+        return {'state': 'stopped' if plugin._rotate_stop_event.is_set() else 'done',
+                'requested_distance_m': 1, 'moved_m': 0.98, 'final_error_m': 0.02}
+    monkeypatch.setattr(plugin, '_do_distance_impl', run)
+    started = plugin.dispatch('move', {'_tool_name': 'loco_destination', 'distance_m': 1})
+    try:
+        assert started['state'] == 'running'
+        assert started['requested_distance_m'] == 1
+        assert entered.wait(timeout=1)
+        assert plugin.dispatch('status', {'_tool_name': 'loco_destination'})['action'] == 'move'
+        for tool, action, args in [('loco_destination', 'rotate', {'angle_deg': 10}),
+                                   ('loco_destination', 'move', {'distance_m': 1}),
+                                   ('loco', 'move', {'vx': 0.5})]:
+            assert plugin.dispatch(action, dict(args, _tool_name=tool))['state'] == 'error'
+        plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+    finally:
+        release.set()
+        plugin._rotate_worker.join(timeout=2)
+    assert len(calls) == 1
+    assert calls[0][0] == started['action_id']
+    assert calls[0][1] == 'cancelled'
+    assert calls[0][2]['action'] == 'move'
+    assert plugin._rotate_status()['state'] == 'idle'
+
+
+def test_distance_nonzero_publication_obeys_atomic_stop(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    plugin._stop_move()
+    plugin._distance_publish(0.5)
+    assert fake.cmds == [(0, 0, 0)]
 
 
 def test_rotate_dispatch_returns_immediately_with_action_id(monkeypatch):
@@ -707,7 +778,7 @@ def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
     refused = plugin.dispatch(
         'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 60})
     assert refused['state'] == 'error'
-    assert 'rotate in progress' in refused['error']  # 错误点名 rotate 冲突
+    assert 'rotate or distance move in progress' in refused['error']  # 错误点名目标动作冲突
     status = plugin.dispatch('status', {'_tool_name': 'loco_destination'})
     assert status['state'] == 'running'              # 重入拒绝不得清掉 running
 
