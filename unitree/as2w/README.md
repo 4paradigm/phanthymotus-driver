@@ -166,8 +166,8 @@ publisher assigns `CompressedImage.data` through a buffer-compatible byte array,
 avoiding slow per-byte conversion. A busy FastDDS publisher therefore cannot
 hold the videohub client's Python GIL, while a slow publisher drops stale frame
 sequences instead of increasing end-to-end latency. Capture and publication
-have separate limits: the default 10 Hz capture continuously refreshes the
-shared slot, while the default 8 Hz publisher reads only the newest slot. This
+have separate limits: the configured 15 Hz capture continuously refreshes the
+shared slot, while the configured 12 Hz publisher reads only the newest slot. This
 keeps the state-card preview responsive without filling Agent Core's deeper
 subscriber queue with every redundant 300 KB frame. Frames already older than
 the configured 300 ms limit are discarded before DDS publication. Camera

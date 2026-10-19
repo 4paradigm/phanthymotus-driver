@@ -41,9 +41,10 @@ plugins:
       half_fov_rad: 1.072
       source: measured
       measured_on: "nvidia_desktop, 2026-10-16"
-    # Capture often, but publish only fresh frames at a rate Jetson consumers can sustain.
-    fps: 10
-    publish_fps: 8
+    # Moderate 15/12 Hz limits improve navigation responsiveness without jumping
+    # straight to the substantially heavier 20-30 Hz range on the Jetson.
+    fps: 15
+    publish_fps: 12
     max_frame_age_ms: 300
     # Two latest-frame shared-memory slots; increase only if videohub JPEGs exceed 4 MiB.
     max_frame_bytes: 4194304
