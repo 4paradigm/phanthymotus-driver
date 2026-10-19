@@ -1,11 +1,11 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.8.3`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.8.4`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架，附随腕运动的左右夹爪示意；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
-| `pose` | actuator | 中文敬礼、挥手、欢迎；挥手含右夹爪两次开合；整套ACP完成 | 无；详情显示共享双臂任务 |
+| `pose` | actuator | 中文敬礼、挥手、欢迎；挥手含右夹爪一次开合；整套ACP完成 | 无；详情显示共享双臂任务 |
 | `gripper` | actuator | 选择左/右夹爪并设置目标开口，0mm闭合 | 无；详情显示所选侧反馈 |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
 | `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
@@ -24,7 +24,7 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head仅在显式move调用时发送一次request_moveh；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择中文动作后执行预设段；挥手在右肩旋转三轮后保持手臂、右夹爪开合两次，再回原home。没有模式切换、拖动示教或自动演示循环。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head仅在显式move调用时发送一次request_moveh；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择中文动作后执行预设段；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。

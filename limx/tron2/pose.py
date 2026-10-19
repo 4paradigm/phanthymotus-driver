@@ -31,7 +31,7 @@ HEAD_KEEP_OUT = .20  # Skeletal keep-out heuristic, not a collision CAD model.
 
 def tool():
     return {'name':'pose','type':'actuator','multiInstance':False,
-        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎，固定速度。挥手加快旋转右肩三轮后保持手臂、右夹爪开合两次，再回原home；敬礼和欢迎停留1秒。头部及左夹爪保持不变。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
+        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎，固定速度。挥手加快旋转右肩三轮后保持手臂、右夹爪开合一次，再回原home；敬礼和欢迎停留1秒。头部及左夹爪保持不变。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
                 'pose':{'type':'string','enum':list(LABELS.values()), 'title':'预设动作',
@@ -182,12 +182,11 @@ class Pose:
             hold=1. if frame_name==name and name!='wave' else 0
             frames.append({'label':frame_name,'joint':q,'time':duration,'hold':hold});previous=q
             if name=='wave' and target_index==len(targets)-2:
-                # The last yaw waypoint is held through the four gripper steps.
-                for cycle in (1,2):
-                    for action,opening in (('open',85),('close',0)):
-                        frames.append({'kind':'gripper','label':'gripper_'+action+'_'+str(cycle),
-                            'joint':list(q),'time':0,'hold':0,
-                            'gripper':{'side':'right','opening_mm':opening,'speed':10,'force':10}})
+                # Hold the last yaw waypoint for one open/close cycle only.
+                for action,opening in (('open',85),('close',0)):
+                    frames.append({'kind':'gripper','label':'gripper_'+action+'_1',
+                        'joint':list(q),'time':0,'hold':0,
+                        'gripper':{'side':'right','opening_mm':opening,'speed':10,'force':10}})
         final_target=list(target_home)
         if side=='right':final_target[:7]=current[:7]  # No idle-left correction during right-only gestures.
         duration=max(2.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(previous,final_target))/PLANNED_DEG_PER_SECOND*10)/10)
@@ -197,7 +196,7 @@ class Pose:
         return {'frames':frames,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
             'wave_planned_deg_per_second':WAVE_DEG_PER_SECOND if name=='wave' else None,
             'home_q':list(target_home),'pose_sha256':home['pose_sha256'],'motion_tool':'pose',
-            'head_policy':'unchanged','gripper_policy':'right_open_close_twice_ends_closed' if name=='wave' else 'unchanged','returns_to_home':True,
+            'head_policy':'unchanged','gripper_policy':'right_open_close_once_ends_closed' if name=='wave' else 'unchanged','returns_to_home':True,
             'physical_presets_verified':False,
             'planned_motion_seconds':round(sum(f['time']+f['hold'] for f in frames),1),
             'planned_motion_seconds_excludes_gripper_waits':name=='wave',**screening}

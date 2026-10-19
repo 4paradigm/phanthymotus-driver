@@ -95,7 +95,7 @@ class ArmCompletion:
     async def dispatch_sequence(self, plan, guard):
         import copy
         frames=copy.deepcopy(plan['frames'])
-        if not frames or len(frames)>14 or frames[0].get('kind','arm')!='arm':
+        if not frames or len(frames)>12 or frames[0].get('kind','arm')!='arm':
             raise ValueError('Invalid pose frame count or first stage')
         from gripper import command as gripper_command
         budget=float(POSE_ADMISSION_AND_REPORT_BUDGET)

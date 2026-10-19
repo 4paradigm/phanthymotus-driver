@@ -131,7 +131,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plan['frames'][-1]['joint'][7:],HOME[7:])
             self.assertEqual(plan['home_q'],HOME)
 
-    def test_wave_rotates_joint9_three_times_then_claw_twice_before_return(self):
+    def test_wave_rotates_joint9_three_times_then_claw_once_before_return(self):
         p=self.adapter.pose.plan({'pose':'挥手'});frames=p['frames']
         swings=[f for f in frames if f['label'] in ('wave_out','wave_in')]
         self.assertEqual([f['label'] for f in swings],['wave_out','wave_in']*3)
@@ -139,10 +139,11 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(max(yaws)-min(yaws),40)
         self.assertTrue(all(abs(math.degrees(f['joint'][8])+25)<1e-6 for f in swings))
         grip=[f for f in frames if f.get('kind')=='gripper']
-        self.assertEqual([f['gripper']['opening_mm'] for f in grip],[85,0,85,0])
+        self.assertEqual([f['gripper']['opening_mm'] for f in grip],[85,0])
+        self.assertEqual(p['gripper_policy'],'right_open_close_once_ends_closed')
         self.assertTrue(all(f['joint']==swings[-1]['joint'] for f in grip))
         self.assertEqual([f['label'] for f in frames[-2:]],['extend','home'])
-        self.assertEqual(len(frames),14);self.assertTrue(all(f['hold']==0 for f in frames))
+        self.assertEqual(len(frames),12);self.assertTrue(all(f['hold']==0 for f in frames))
 
     def test_salute_more_lateral_and_presentation_holds_one_second(self):
         for name in ('salute','welcome'):
@@ -230,7 +231,8 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_full_mixed_sequence_timeout_budget_rejected_before_motion(self):
         plan=self.adapter.pose.plan({'pose':'挥手'})
-        self.reader.settings['response_timeout_seconds']=10
+        for frame in plan['frames']:
+            if frame.get('kind','arm')=='arm':frame['time']=60
         with self.assertRaisesRegex(ValueError,'budget'):
             await self.adapter.motion.dispatch_sequence(plan,self.adapter.pose.guard)
         self.reader.send_movej.assert_not_awaited();self.reader.send_gripper.assert_not_awaited()
@@ -386,8 +388,8 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(callback[:3],('pose',received['action_id'],'completed'))
         arm_stages=[i for i,f in enumerate(plan['frames'],1) if f.get('kind')!='gripper']
         self.assertEqual(len(self.frames),len(arm_stages));self.assertEqual(self.arrivals,arm_stages)
-        self.assertEqual([v['right_opening'] for v in self.claw_writes],[94,0,94,0])
-        self.assertEqual(len(callback[3]['gripper_steps']),4)
+        self.assertEqual([v['right_opening'] for v in self.claw_writes],[94,0])
+        self.assertEqual(len(callback[3]['gripper_steps']),2)
         self.assertEqual(self.frames[-1],HOME);self.assertTrue(callback[3]['at_home']);self.assertIsNone(self.adapter.motion.active)
         self.assertEqual(self.adapter._report_completion.await_count,1)
 
@@ -628,8 +630,8 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                         accepted=json.loads(result['content'][0]['text'])
                     await asyncio.wait_for(asyncio.shield(adapter.motion.task),6)
                 self.assertEqual(len(writes),10);self.assertEqual(set(writes[0]),{'joint','time'})
-                self.assertEqual(events,['arm']*8+['claw']*4+['arm']*2)
-                self.assertEqual([v['right_opening'] for v in grip_writes],[94,0,94,0])
+                self.assertEqual(events,['arm']*8+['claw']*2+['arm']*2)
+                self.assertEqual([v['right_opening'] for v in grip_writes],[94,0])
                 self.assertTrue(all(set(v)=={'right_opening','right_speed','right_force'} for v in grip_writes))
                 self.assertEqual(len(writes[0]['joint']),14);self.assertEqual(len(callbacks),1)
                 self.assertEqual(callbacks[0]['action_id'],accepted['action_id']);self.assertEqual(callbacks[0]['tool'],'pose')
