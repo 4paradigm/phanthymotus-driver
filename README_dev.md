@@ -606,7 +606,6 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `audio/*` (e.g. `audio/pcm-16k`) | Audio waveform | `hint.startsWith('audio/')` |
 | `video/*` (e.g. `video/mjpeg`) | Video stream | `hint.startsWith('video/')` |
 | `image/jpeg` | Camera image | `hint === 'image/jpeg'` |
-| `image/depth-z16` | Depth colormap (raw) | `hint === 'image/depth-z16'` |
 | `image/depth-zlib` | Depth colormap (zlib compressed) | `hint === 'image/depth-zlib'` |
 | `image` | Generic image | `hint === 'image'` |
 | `data/json` | Text / KV panel | `hint === 'data/json'` |
@@ -626,11 +625,11 @@ format is what a *consumer* matches on when wiring a canvas — the renderer is
 incidental. `control/*` is an **input** port on a driver command card;
 `state/odom` is an output.
 
-### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`
+### Depth Rendering — `image/depth-zlib`
 
 Two depth formats are supported:
 
-- **`image/depth-z16`**: Raw uint16 buffer (640×480 = 614KB/frame). Uses `sensor_msgs/Image`. Simple but high bandwidth — causes CPU saturation on ARM64 due to DDS serialization of large messages.
+- **`image/depth-z16` is gone.** It was the raw uint16 buffer (640×480 = 614 KB/frame) on `sensor_msgs/Image`, and it saturated ARM64 CPU on DDS serialization. Every driver that published it — G1, T800, Tianyi 2.0, AgiBot X2 — was already producing exactly 640×480 little-endian 16UC1, i.e. the zlib form's fixed contract, so the per-message `width`/`height`/`step`/`is_bigendian` it carried were used by nobody. They now compress in the driver, as go2, realman, A3 and Bumi already did. A future camera whose native depth is not 640×480 resizes in its own driver (and must rescale its `camera_info` K to match) rather than widening this contract.
 
 - **`image/depth-zlib`** (recommended): Zlib-compressed uint16 buffer (~10-15KB/frame). Uses `sensor_msgs/CompressedImage` with `format="16UC1; compressedDepth zlib"`. 47× smaller, negligible publish overhead. Dashboard decompresses in browser using native `DecompressionStream`.
 

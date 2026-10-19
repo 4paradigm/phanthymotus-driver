@@ -3799,9 +3799,9 @@ class RealSensePlugin:
             "name": "camera_depth",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 (z16, mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
+            "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 zlib (mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
         }
 
     def _dist_tool(self) -> dict:
@@ -3869,7 +3869,7 @@ class RealSensePlugin:
         if action == "info":
             tool_name = args.get('_tool_name', '')
             if tool_name == 'camera_depth':
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
+                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
             if tool_name == 'camera_distance':
                 return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
             return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
@@ -3910,7 +3910,8 @@ def run_realsense_process(namespace: str) -> None:
         def __init__(self, color_topic, depth_topic, dist_topic):
             super().__init__("g1_realsense")
             self._color_pub = self.create_publisher(CompressedImage, color_topic, _QOS)
-            self._depth_pub = self.create_publisher(Image, depth_topic, _QOS)
+            from sensor_msgs.msg import CompressedImage as _CI
+            self._depth_pub = self.create_publisher(_CI, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
 
             self._pipeline = None
@@ -3978,15 +3979,18 @@ def run_realsense_process(namespace: str) -> None:
                 except queue.Empty:
                     continue
                 try:
-                    msg = Image()
+                    # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
+                    import zlib as _zlib
+                    from sensor_msgs.msg import CompressedImage as _CI
+                    msg = _CI()
                     msg.header.stamp = stamp
                     msg.header.frame_id = "camera_depth_optical_frame"
-                    msg.height = depth_np.shape[0]
-                    msg.width  = depth_np.shape[1]
-                    msg.encoding = "16UC1"
-                    msg.is_bigendian = 0
-                    msg.step = depth_np.shape[1] * 2
-                    msg.data = depth_np.tobytes()
+                    msg.format = "16UC1; compressedDepth zlib"
+                    # The size is the format's contract (640x480 little-endian
+                    # uint16 mm), not a field on the wire — the RealSense is
+                    # configured at exactly that, see RS_DEPTH_W/RS_DEPTH_H.
+                    msg.data = _zlib.compress(
+                        depth_np.astype("<u2", copy=False).tobytes(), 1)
                     self._depth_pub.publish(msg)
                 except Exception as e:
                     self.get_logger().error(f"[realsense] depth publish error: {e}")

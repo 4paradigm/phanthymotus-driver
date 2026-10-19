@@ -51,7 +51,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `speaker` | actuator | 订阅画布连接的 `audio/pcm-16k` 流，经官方 ALSA `aplay` 接口播放到机器人喇叭；音量经官方 `pactl` 接口控制 |
 | `pointcloud` | sensor | Odin2 原始/SLAM 点云转发（`sensor/pointcloud` 二进制渲染流） |
 | `camera` | sensor | Odin2 双目 JPEG 图像转发（左/右目 `image/jpeg` 流） |
-| `depth` | sensor | Odin2 官方标定深度图转 640×480 毫米 16UC1（`image/depth-z16`） |
+| `depth` | sensor | Odin2 官方标定深度图转 640×480 毫米 16UC1、zlib 压缩（`image/depth-zlib`） |
 | `motor_power` | actuator | 电机 enable/disable 服务 |
 | `native_node_control` | actuator | Native SDK 已注册 LogicNode 的动态 start/stop |
 | `virtual_gamepad` | actuator | Native SDK LCM 虚拟手柄：12 按键、6 模拟量和 7 种官方组合键 |
