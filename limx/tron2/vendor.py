@@ -5,12 +5,14 @@ import math
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import aiohttp
 from state import joint_state, select_fields, STATUS_FIELDS
 
 HEAD_API_PORT = 8888  # Read-only vendor UI endpoint, on the same robot host.
+POSE_JOINT_POLL_SECONDS = .1
 
 
 def reject_constant(value):
@@ -119,6 +121,41 @@ class RobotReader:
         self.move_pending = None
         self.head_pending = None
         self.gripper_pending = {}
+        self._pose_feedback_leases = set()
+        self._joint_poll_wake = None  # Create on the reader's running loop.
+
+    @contextmanager
+    def pose_feedback(self):
+        """Temporarily sample faster, using the existing single WS reader only.
+
+        Keep the same arrival tolerances, sample count and stable-time window.
+        A lease changes read-only query cadence, never a motor command or mode.
+        """
+        lease = object()
+        self._pose_feedback_leases.add(lease)
+        if self._joint_poll_wake is not None:
+            self._joint_poll_wake.set()
+        try:
+            yield
+        finally:
+            self._pose_feedback_leases.discard(lease)
+            if self._joint_poll_wake is not None:
+                self._joint_poll_wake.set()
+
+    def joint_poll_interval(self):
+        normal = self.settings['poll_interval_seconds']
+        return min(normal, POSE_JOINT_POLL_SECONDS) if self._pose_feedback_leases else normal
+
+    async def _wait_for_joint_poll(self, started):
+        if self._joint_poll_wake is None:
+            self._joint_poll_wake = asyncio.Event()
+        self._joint_poll_wake.clear()
+        delay = max(0, self.joint_poll_interval() - (time.monotonic() - started))
+        if delay:
+            try:
+                await asyncio.wait_for(self._joint_poll_wake.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
 
     def disconnect(self, reason):
         self.connected = False
@@ -414,8 +451,7 @@ class RobotReader:
                     while True:
                         started = time.monotonic()
                         await self.read_joints(ws)
-                        await asyncio.sleep(max(0, self.settings['poll_interval_seconds']
-                                                - (time.monotonic() - started)))
+                        await self._wait_for_joint_poll(started)
             except (OSError, ValueError, TypeError, aiohttp.ClientError,
                     asyncio.TimeoutError) as exc:
                 self.disconnect(type(exc).__name__)

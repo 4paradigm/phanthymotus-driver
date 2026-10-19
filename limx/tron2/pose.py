@@ -15,9 +15,10 @@ ACP_TIMEOUT = POSE_ACP_TIMEOUT
 TELEOP_HEALTH_URL = 'http://127.0.0.1:15794/health'
 LABELS = {'salute':'敬礼', 'wave':'挥手', 'welcome':'欢迎'}
 PLANNED_DEG_PER_SECOND = 12.  # Unified planned travel/duration; not measured velocity.
+WAVE_DEG_PER_SECOND = 24.  # Faster yaw-only swings; raising/returning stay at 12.
 # Designed against TRON2 FK, not borrowed joint values from another robot.
 LEFT_FRAMES = {
-    'salute': [-75, 40, 0, -120, 0, 0, 0],
+    'salute': [-75, 60, 0, -120, 0, 0, 0],
     'wave': [-65, 25, 0, -100, 0, 0, 0],
     'wave_out': [-65, 25, 20, -100, 0, 0, 0],
     'wave_in': [-65, 25, -20, -100, 0, 0, 0],
@@ -30,7 +31,7 @@ HEAD_KEEP_OUT = .20  # Skeletal keep-out heuristic, not a collision CAD model.
 
 def tool():
     return {'name':'pose','type':'actuator','multiInstance':False,
-        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎，统一速度。挥手旋转右肩三轮后保持手臂、右夹爪开合两次，再回原home；敬礼和欢迎停留1秒。头部及左夹爪保持不变。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
+        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎，固定速度。挥手加快旋转右肩三轮后保持手臂、右夹爪开合两次，再回原home；敬礼和欢迎停留1秒。头部及左夹爪保持不变。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
                 'pose':{'type':'string','enum':list(LABELS.values()), 'title':'预设动作',
@@ -129,7 +130,8 @@ class Pose:
 
     def info(self):
         return {'read_only':True,'motion_sent':False,'catalog':LABELS,
-            'planned_deg_per_second':PLANNED_DEG_PER_SECOND,'motion':self.motion.summary(),
+            'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
+            'wave_planned_deg_per_second':WAVE_DEG_PER_SECOND,'motion':self.motion.summary(),
             'home':self.reset.call('info'),'returns_to_home':True,'collision_checked':False,
             'physical_presets_verified':False}
 
@@ -174,7 +176,8 @@ class Pose:
                 if frame_name in ('shoulder','extend'):
                     reference=current if frame_name=='shoulder' else target_home
                     q[offset+3:offset+7]=reference[offset+3:offset+7]
-            duration=max(1.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(q,previous))/PLANNED_DEG_PER_SECOND*10)/10)
+            rate=WAVE_DEG_PER_SECOND if frame_name in ('wave_out','wave_in') else PLANNED_DEG_PER_SECOND
+            duration=max(1.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(q,previous))/rate*10)/10)
             validate_movej(q,duration)
             hold=1. if frame_name==name and name!='wave' else 0
             frames.append({'label':frame_name,'joint':q,'time':duration,'hold':hold});previous=q
@@ -192,6 +195,7 @@ class Pose:
         frames.append({'label':'home','joint':final_target,'time':duration,'hold':0})
         screening=self.geometry.validate_path(current,frames)
         return {'frames':frames,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
+            'wave_planned_deg_per_second':WAVE_DEG_PER_SECOND if name=='wave' else None,
             'home_q':list(target_home),'pose_sha256':home['pose_sha256'],'motion_tool':'pose',
             'head_policy':'unchanged','gripper_policy':'right_open_close_twice_ends_closed' if name=='wave' else 'unchanged','returns_to_home':True,
             'physical_presets_verified':False,

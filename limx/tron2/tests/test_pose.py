@@ -149,7 +149,84 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             plan=self.adapter.pose.plan({'pose':pose.LABELS[name]})
             displayed=next(f for f in plan['frames'] if f['label']==name)
             self.assertEqual(displayed['hold'],1)
-            if name=='salute':self.assertAlmostEqual(math.degrees(displayed['joint'][8]),-40)
+            if name=='salute':self.assertAlmostEqual(math.degrees(displayed['joint'][8]),-60)
+
+    def test_faster_wave_only_changes_swing_durations_not_lift_return_or_targets(self):
+        plan=self.adapter.pose.plan({'pose':'挥手'})
+        normal=plan['planned_motion_seconds']
+        with patch('pose.WAVE_DEG_PER_SECOND',12):
+            old=self.adapter.pose.plan({'pose':'挥手'})
+        for current,prior in zip(plan['frames'],old['frames']):
+            self.assertEqual(current['joint'],prior['joint'])
+            self.assertEqual(current.get('gripper'),prior.get('gripper'))
+            if current['label'] in ('wave_out','wave_in'):
+                self.assertLess(current['time'],prior['time'])
+            else:self.assertEqual(current,prior)
+        self.assertGreater(old['planned_motion_seconds']-normal,8)
+        self.assertEqual(plan['wave_planned_deg_per_second'],24)
+
+    async def test_pose_feedback_rate_lease_released_after_success_error_cancel_and_report_failure(self):
+        for outcome in ('success','error','cancel','callback_failure'):
+            self.adapter.motion.active=None;self.frames.clear();self.fail_at=None
+            self.accept_feedback(HOME+[0,0]);plan=self.compact_plan('reset')
+            if outcome=='cancel':plan['frames'].append(dict(plan['frames'][0]))
+            entered=asyncio.Event();release=asyncio.Event()
+            async def arrival(job):
+                entered.set();await release.wait()
+                if outcome=='error':raise ValueError('feedback failed')
+                return {'arrival_verified':True}
+            self.adapter._report_completion.return_value=outcome!='callback_failure'
+            with patch.object(self.adapter.motion,'wait_for_arrival',side_effect=arrival):
+                await self.adapter.motion.dispatch_sequence(plan,self.adapter.pose.guard)
+                await asyncio.wait_for(entered.wait(),1)
+                self.assertEqual(self.reader.joint_poll_interval(),.1)
+                if outcome=='cancel':self.adapter.pose.stop()
+                release.set();await self.adapter.motion.task
+            self.assertEqual(self.reader.joint_poll_interval(),.5)
+            self.assertEqual(self.reader._pose_feedback_leases,set())
+            self.assertEqual(self.adapter.motion.last['status'],
+                             'error' if outcome=='error' else 'cancelled' if outcome=='cancel' else 'completed')
+            if outcome in ('error','callback_failure'):self.assertIsNotNone(self.adapter.motion.active)
+
+    async def test_pose_read_only_polling_wakes_single_reader_and_restores_idle_cadence(self):
+        times=[];connections=[]
+        async def robot(request):
+            ws=web.WebSocketResponse();await ws.prepare(request);connections.append(ws)
+            await ws.send_json(info())
+            async for msg in ws:
+                body=json.loads(msg.data);self.assertEqual(body['title'],'request_get_joint_state')
+                self.assertEqual(body['data'],{});times.append(time.monotonic())
+                await ws.send_json({'title':'response_get_joint_state','accid':body['accid'],
+                    'guid':body['guid'],'data':joints(timestamp=len(times))})
+            return ws
+        app=web.Application();app.router.add_get('/ws',robot)
+        runner=web.AppRunner(app,shutdown_timeout=.2);await runner.setup()
+        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        port=site._server.sockets[0].getsockname()[1]
+        reader=RobotReader(settings(url='ws://127.0.0.1:'+str(port)+'/ws'))
+        try:
+            async with ClientSession(trust_env=False) as session:
+                task=asyncio.create_task(reader.run(session))
+                try:
+                    for _ in range(100):
+                        if reader.sample('joint_state')['available']:break
+                        await asyncio.sleep(.01)
+                    await asyncio.sleep(.03);before=len(times);started=time.monotonic()
+                    with reader.pose_feedback():
+                        # The first fast request wakes the existing .5s wait.
+                        await asyncio.sleep(.36)
+                        self.assertGreaterEqual(len(times)-before,4)
+                        self.assertLess(times[before]-started,.15)
+                        with reader.pose_feedback():self.assertEqual(reader.joint_poll_interval(),.1)
+                        self.assertEqual(reader.joint_poll_interval(),.1)
+                    await asyncio.sleep(.05);idle=len(times)
+                    await asyncio.sleep(.25);self.assertEqual(len(times),idle)
+                    self.assertEqual(reader.joint_poll_interval(),.5)
+                    self.assertEqual(len(connections),1)
+                    self.assertEqual(reader.settings['poll_interval_seconds'],.5)
+                finally:
+                    task.cancel();await asyncio.gather(task,return_exceptions=True)
+        finally:await runner.cleanup()
 
     async def test_full_mixed_sequence_timeout_budget_rejected_before_motion(self):
         plan=self.adapter.pose.plan({'pose':'挥手'})
@@ -523,7 +600,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         runner=web.AppRunner(app,shutdown_timeout=.2);await runner.setup()
         site=web.TCPSite(runner,'127.0.0.1',0);await site.start();port=site._server.sockets[0].getsockname()[1]
         root='http://127.0.0.1:'+str(port)
-        reader=RobotReader(settings(url='ws://127.0.0.1:'+str(port)+'/ws',poll_interval_seconds=.01,response_timeout_seconds=.3))
+        reader=RobotReader(settings(url='ws://127.0.0.1:'+str(port)+'/ws',poll_interval_seconds=.5,response_timeout_seconds=1))
         async with ClientSession() as session:
             task=asyncio.create_task(reader.run(session));adapter=None;rpc_runner=None
             try:
@@ -543,7 +620,8 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                 endpoint='http://127.0.0.1:'+str(rpc_site._server.sockets[0].getsockname()[1])+'/mcp'
                 with patch('vendor.HEAD_API_PORT',port),patch('pose.TELEOP_HEALTH_URL',root+'/teleop-health'), \
                      patch.dict(os.environ,AGENT_CORE_URL=root),patch('completion.STABILITY_SECONDS',.03), \
-                     patch('completion.ARRIVAL_GRACE',.5),patch.object(adapter.pose,'plan',side_effect=short):
+                     patch('completion.ARRIVAL_GRACE',.5),patch('vendor.POSE_JOINT_POLL_SECONDS',.02), \
+                     patch.object(adapter.pose,'plan',side_effect=short):
                     async with session.post(endpoint,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
                         'params':{'name':'pose','arguments':{'pose':'挥手','_trace_id':'real-wire'}}}) as response:
                         result=(await response.json())['result'];self.assertFalse(result['isError'],result)
@@ -556,6 +634,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(writes[0]['joint']),14);self.assertEqual(len(callbacks),1)
                 self.assertEqual(callbacks[0]['action_id'],accepted['action_id']);self.assertEqual(callbacks[0]['tool'],'pose')
                 self.assertEqual(callbacks[0]['status'],'completed');self.assertTrue(callbacks[0]['result']['at_home'])
+                self.assertEqual(reader.joint_poll_interval(),.5)
             finally:
                 if adapter:await adapter.motion.close();await adapter.head.close()
                 if rpc_runner:await rpc_runner.cleanup()

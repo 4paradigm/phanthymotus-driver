@@ -148,6 +148,13 @@ class ArmCompletion:
             raise ValueError('Pose start/waypoint feedback changed; remaining frames cancelled')
 
     async def _run_sequence(self, job):
+        # Faster *read-only* feedback reduces sampling quantization between
+        # waypoints. Never shorten the .5s stationary window or overlap MoveJ.
+        # Restore normal cadence even after failure, stop or callback failure.
+        with self.reader.pose_feedback():
+            await self._run_sequence_owned(job)
+
+    async def _run_sequence_owned(self, job):
         admitted=False;status='error';safe_end=False;any_sent=False
         result={'arrival_verified':False}
         expected=job['details']['start_q']
