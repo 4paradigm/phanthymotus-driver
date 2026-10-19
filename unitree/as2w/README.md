@@ -44,6 +44,18 @@ as `[vx, vy, vz, wx, wy, wz]`, with unmeasured axes represented by `null`.
 It reports vx, vy and yaw speed; no pose is declared. `start` and `info`
 return both output ports and the `odom_interface` declaration.
 
+The vendor-shaped `loco/state` JSON names its vectors explicitly as
+`velocity_x/y/z` and `position_x/y/z`; numeric suffixes are not published.
+Its planar velocity and position retain the firmware's odometry-world axes.
+For navigation, `state/odom` rotates each velocity reading by its own IMU yaw
+into the standard body convention: positive X is forward, positive Y is left,
+and positive Z is up. Its yaw rate comes from `imu_state.gyroscope[2]`, because
+the deployed firmware's `yaw_speed` remains zero during measured rotation.
+On the deployed AS2-W firmware the dedicated `SportModeState.body_height`
+field remains zero, while `position_z` carries the measured body height.
+Accordingly, `body_height` mirrors `position_z`; its observed range is
+approximately 0 to 0.4 m, where 0 means lying down and 0.4 means standing.
+
 `loco_servo` consumes a wired `control/velocity` topic carrying
 `motus.control/1` twist commands. Bundle startup is inert; canvas `start`
 requires `input_topic` (or `input_topics`). It uses the shared ControlSink for
@@ -53,6 +65,16 @@ Unsupported vz/wx/wy axes are pinned to zero. Stream silence triggers
 `StopMove` after 300 ms, checked by a 150 ms timer. Invalid posture or a failed
 Move RPC also stops motion. The card supports `pause`, `resume`, `info` and
 runtime `config` for `dry_run`, `rotate_only` and `require_standing`.
+It starts in `dry_run`; changing to live control requires an explicit
+`confirm=true`. The driver also prevents it from running concurrently with
+manual `loco`, `special_motion`, or vendor `controlled_spatial` navigation.
+
+Until AS2-W motion response is measured, `loco_servo` uses an initial indoor
+envelope of vx +/-0.30 m/s, vy +/-0.10 m/s and yaw +/-0.40 rad/s. At the
+default 10 Hz, command changes are limited to 0.03 m/s forward, 0.02 m/s
+lateral and 0.05 rad/s yaw per tick. These are commissioning limits, not
+vendor performance claims; raise them only after direction, deadband, stopping
+distance and lateral support have been verified on the deployed firmware.
 
 Explicit `loco.move` and `loco.stop_move` pause the policy stream before
 sending their commands. Servo start/resume refuses while loco owns a movement;

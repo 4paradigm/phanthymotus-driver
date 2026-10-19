@@ -1480,22 +1480,96 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("motus.odom/1", info["odom_interface"]["schema"])
         self.assertEqual(["vx", "vy", "wz"],
                          info["odom_interface"]["provides"])
+        self.assertEqual(10, info["odom_interface"]["rate_hz"])
+        self.assertEqual("unbounded", info["odom_interface"]["pose_drift"])
 
-    def test_sport_state_publishes_both_payload_shapes(self):
+    @staticmethod
+    def _odom_node(published):
+        node = TestDriverContracts.device._StateNode.__new__(
+            TestDriverContracts.device._StateNode)
+        node.odom = types.SimpleNamespace(
+            publish=lambda message: published.append(json.loads(message.data)))
+        node.loco = types.SimpleNamespace(publish=lambda message: None)
+        node._odom_lock = threading.Lock()
+        node._odom_burst = []
+        node._odom_burst_size = 0
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 0.0
+        node._latest_lock = threading.Lock()
+        node._latest_sport = None
+        return node
+
+    @staticmethod
+    def _imu(yaw_deg=0.0, gyro_z=0.0):
+        math = __import__("math")
+        half = math.radians(yaw_deg) / 2.0
+        return types.SimpleNamespace(
+            quaternion=[math.cos(half), 0.0, 0.0, math.sin(half)],
+            gyroscope=[0.0, 0.0, gyro_z])
+
+    def test_sport_state_keeps_named_vendor_world_axes(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
-        vendor, odom = [], []
+        vendor = []
         node.loco = types.SimpleNamespace(
             publish=lambda message: vendor.append(json.loads(message.data)))
-        node.odom = types.SimpleNamespace(
-            publish=lambda message: odom.append(json.loads(message.data)))
         node._publish_sport(types.SimpleNamespace(
             mode=2, gait_type=3, velocity=[0.4, -0.2, 0.0],
-            yaw_speed=0.6, position=[1, 2, 3], body_height=0.25))
-        self.assertEqual(0.4, vendor[0]["velocity_0"])
-        self.assertEqual("motus.odom/1", odom[0]["schema"])
-        self.assertEqual([0.4, -0.2, None, None, None, 0.6],
-                         odom[0]["twist"])
-        self.assertIsNone(odom[0]["pose"])
+            yaw_speed=0.6, position=[0.291, 0.216, 0.3], body_height=0.0))
+        self.assertEqual({
+            "mode": 2,
+            "body_height": 0.3,
+            "velocity_x": 0.4,
+            "velocity_y": -0.2,
+            "velocity_z": 0.0,
+            "position_x": 0.291,
+            "position_y": 0.216,
+            "position_z": 0.3,
+        }, vendor[0])
+        self.assertNotIn("velocity_0", vendor[0])
+        self.assertNotIn("position_2", vendor[0])
+
+    def test_standard_odom_matches_measured_body_frame_and_gyro(self):
+        samples = []
+        node = self._odom_node(samples)
+        msg = types.SimpleNamespace(
+            mode=2, gait_type=3, velocity=[0.1818, 0.2839, 0.0],
+            yaw_speed=123.0, position=[0.291, 0.216, 0.3],
+            imu_state=self._imu(yaw_deg=57.5, gyro_z=-0.88), stamp=None)
+        node._accumulate_odom(msg)
+        node._publish_odom(msg)
+        self.assertEqual("motus.odom/1", samples[0]["schema"])
+        vx, vy, vz, wx, wy, wz = samples[0]["twist"]
+        self.assertAlmostEqual(0.336, vx, places=2)
+        self.assertAlmostEqual(0.0, vy, places=2)
+        self.assertEqual([None, None, None], [vz, wx, wy])
+        self.assertAlmostEqual(-0.88, wz)
+        self.assertEqual(0.3, samples[0]["vendor"]["body_height"])
+        self.assertIsNone(samples[0]["pose"])
+
+    def test_sport_state_body_height_tracks_position_z_boundaries(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.loco = types.SimpleNamespace(
+            publish=lambda message: published.append(json.loads(message.data)))
+        for height in (0.0, 0.4):
+            node._publish_sport(types.SimpleNamespace(
+                mode=2, velocity=[0.0, 0.0, 0.0], yaw_speed=0.0,
+                position=[0.0, 0.0, height], body_height=0.0))
+        self.assertEqual([0.0, 0.4], [
+            item["body_height"] for item in published])
+        self.assertEqual(0.0, published[0]["velocity_x"])
+        self.assertEqual(0.0, published[0]["velocity_y"])
+
+    def test_loco_state_card_documents_normalised_axes_and_height(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        tool = next(item for item in plugin.get_tools()
+                    if item["name"] == "loco_state")
+        description = tool["description"]
+        for phrase in ("+X is forward", "+Y is left", "+Z is up",
+                       "odometry-world", "0 m", "0.4 m"):
+            self.assertIn(phrase, description)
 
     def test_loco_servo_descriptor_and_card_contract(self):
         descriptor = self.loco_servo.build_descriptor()
@@ -1507,12 +1581,27 @@ class TestDriverContracts(unittest.TestCase):
             descriptor["limits"]["upper"][3],
             descriptor["limits"]["upper"][4],
         ])
+        self.assertEqual(
+            [-0.30, -0.10, 0.0, 0.0, 0.0, -0.40],
+            descriptor["limits"]["lower"],
+        )
+        self.assertEqual(
+            [0.30, 0.10, 0.0, 0.0, 0.0, 0.40],
+            descriptor["limits"]["upper"],
+        )
+        self.assertEqual(
+            [0.03, 0.02, self.loco_servo.PINNED_STEP,
+             self.loco_servo.PINNED_STEP, self.loco_servo.PINNED_STEP, 0.05],
+            descriptor["limits"]["max_delta_per_step"],
+        )
         plugin = self.loco_servo.LocoServoPlugin(
             {}, "test", None, _Proxy())
         tool = plugin.get_tool()
         self.assertEqual("loco_servo", tool["name"])
         self.assertEqual("control/velocity", tool["topic_in"][0]["format"])
         self.assertEqual(["base"], tool["inputSchema"]["x-resource"])
+        self.assertTrue(plugin._dry_run)
+        self.assertIn("confirm", tool["inputSchema"]["properties"])
         footprint = descriptor["footprint"]
         self.assertEqual("box", footprint["shape"])
         self.assertEqual("vendor-spec", footprint["source"])
@@ -1525,7 +1614,7 @@ class TestDriverContracts(unittest.TestCase):
         proxy = _Proxy()
         loco = self.device.LocoPlugin({}, "test", None, proxy)
         servo = self.loco_servo.LocoServoPlugin(
-            {}, "test", None, proxy, loco_plugin=loco)
+            {"dry_run": False}, "test", None, proxy, loco_plugin=loco)
         servo._running = True
         servo._apply([0.2, -0.1, 0, 0, 0, 0.3])
         self.assertEqual((0.2, -0.1, 0.3), proxy.moves[-1])
@@ -1535,10 +1624,11 @@ class TestDriverContracts(unittest.TestCase):
         self.assertTrue(servo._paused)
         self.assertGreaterEqual(proxy.stops, 1)
 
-    def _started_servo(self, proxy=None, loco=None):
+    def _started_servo(self, proxy=None, loco=None, **plugins):
         proxy = proxy or _Proxy()
         servo = self.loco_servo.LocoServoPlugin(
-            {}, "test", object(), proxy, loco_plugin=loco)
+            {"dry_run": False}, "test", object(), proxy,
+            loco_plugin=loco, **plugins)
         with patch.object(servo, "_open"):
             result = servo.dispatch("start", {"input_topic": "/test/velocity"})
         self.assertEqual("running", result["state"])
@@ -1562,6 +1652,37 @@ class TestDriverContracts(unittest.TestCase):
                 "start", {"input_topic": "/velocity"})["state"])
         self.assertIsNone(servo._sink)
         self.assertFalse(servo._running)
+
+    def test_loco_servo_live_control_requires_literal_confirmation(self):
+        servo = self.loco_servo.LocoServoPlugin(
+            {}, "test", object(), _Proxy())
+        for confirm in (None, False, "true", 1):
+            with self.subTest(confirm=confirm):
+                result = servo.dispatch(
+                    "config", {"dry_run": False, "confirm": confirm})
+                self.assertEqual("CONFIRM_REQUIRED", result["code"])
+                self.assertTrue(servo._dry_run)
+        result = servo.dispatch(
+            "config", {"dry_run": False, "confirm": True})
+        self.assertTrue(result["ok"])
+        self.assertFalse(servo._dry_run)
+
+    def test_loco_servo_refuses_other_chassis_owners(self):
+        special = types.SimpleNamespace(is_running=lambda: True)
+        spatial = types.SimpleNamespace(is_navigating=lambda: False)
+        servo = self.loco_servo.LocoServoPlugin(
+            {"dry_run": False}, "test", object(), _Proxy(),
+            special_motion_plugin=special,
+            controlled_spatial_plugin=spatial)
+        result = servo.dispatch("start", {"input_topic": "/velocity"})
+        self.assertEqual("error", result["state"])
+        self.assertIn("special_motion", result["message"])
+
+        special.is_running = lambda: False
+        spatial.is_navigating = lambda: True
+        result = servo.dispatch("start", {"input_topic": "/velocity"})
+        self.assertEqual("error", result["state"])
+        self.assertIn("controlled_spatial", result["message"])
 
     def test_loco_servo_watchdog_stops_after_stream_silence(self):
         servo, proxy = self._started_servo()
@@ -1622,7 +1743,11 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(1, proxy.stops)
         servo._on_message(self._velocity_message(seq=2))
         self.assertEqual(1, len(proxy.moves))
-        servo.dispatch("config", {"dry_run": False, "rotate_only": True})
+        denied = servo.dispatch("config", {"dry_run": False,
+                                             "rotate_only": True})
+        self.assertEqual("CONFIRM_REQUIRED", denied["code"])
+        servo.dispatch("config", {"dry_run": False, "rotate_only": True,
+                                  "confirm": True})
         servo._on_message(self._velocity_message(seq=3))
         self.assertEqual((0.0, 0.0), proxy.moves[-1][:2])
         self.assertGreater(proxy.moves[-1][2], 0)
@@ -1659,13 +1784,120 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(1, proxy.stops)
 
     def test_standard_odom_reports_missing_or_invalid_axes_as_null(self):
-        node = self.device._StateNode.__new__(self.device._StateNode)
-        node.loco = types.SimpleNamespace(publish=lambda message: None)
         samples = []
-        node.odom = types.SimpleNamespace(
-            publish=lambda message: samples.append(json.loads(message.data)))
-        node._publish_sport(types.SimpleNamespace(velocity=[float("nan")]))
+        node = self._odom_node(samples)
+        msg = types.SimpleNamespace(
+            velocity=[float("nan")], position=[], imu_state=None, stamp=None)
+        node._accumulate_odom(msg)
+        node._publish_odom(msg)
         self.assertEqual([None] * 6, samples[0]["twist"])
+
+    def test_standard_odom_uses_fixed_10_hz_due_times(self):
+        samples = []
+        node = self._odom_node(samples)
+        msg = types.SimpleNamespace(
+            mode=2, gait_type=0, velocity=[0.1, 0.0, 0.0],
+            position=[0.0, 0.0, 0.3], imu_state=self._imu(), stamp=None)
+        node._latest_sport = msg
+        node._accumulate_odom(msg)
+        clock = {"now": 1000.0}
+        with patch.object(self.device.time, "monotonic",
+                          side_effect=lambda: clock["now"]):
+            node._maybe_publish_odom()
+            self.assertEqual(1, len(samples))
+            clock["now"] = 1000.05
+            node._maybe_publish_odom()
+            self.assertEqual(1, len(samples))
+            clock["now"] = 1000.1187
+            node._maybe_publish_odom()
+            self.assertEqual(2, len(samples))
+        self.assertAlmostEqual(1000.1, node._last_odom_time)
+
+    def test_odom_failure_does_not_stop_vendor_loco_state(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        vendor = []
+        node.loco = types.SimpleNamespace(
+            publish=lambda message: vendor.append(json.loads(message.data)))
+        node.odom = types.SimpleNamespace(
+            publish=lambda _message: (_ for _ in ()).throw(RuntimeError("bad odom")))
+        node._odom_lock = None
+        msg = types.SimpleNamespace(
+            mode=2, velocity=[0.1, 0.0, 0.0], position=[0.0, 0.0, 0.3],
+            imu_state=self._imu(), stamp=None)
+        node._on_sport(msg)
+        self.assertEqual(1, len(vendor))
+        self.assertEqual(0.3, vendor[0]["body_height"])
+
+    def test_special_and_vendor_navigation_preempt_loco_servo(self):
+        proxy = _Proxy()
+        servo, _ = self._started_servo(proxy)
+        special = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        special.attach_servo(servo)
+        servo.attach_special_motion(special)
+        with patch.object(special, "_start_motion",
+                          return_value={"accepted": True}):
+            result = special.dispatch("front_flip", {"confirm": True})
+        self.assertTrue(result["accepted"])
+        self.assertTrue(servo._paused)
+        self.assertEqual(1, proxy.stops)
+
+        servo._paused = False
+        spatial = self.spatial.ControlledSpatialPlugin.__new__(
+            self.spatial.ControlledSpatialPlugin)
+        spatial._client = types.SimpleNamespace(
+            call=lambda *_args: {"code": 0, "response": "{}"})
+        spatial._nav_done = threading.Event()
+        spatial._nav_result = None
+        spatial._nav_action_id = None
+        spatial._navigation_active = False
+        spatial._nav_lock = threading.Lock()
+        spatial._servo = servo
+        servo.attach_controlled_spatial(spatial)
+        with patch.object(self.spatial.threading, "Thread"):
+            result = spatial.dispatch("navigate_to", {"x": 1, "y": 2})
+        self.assertEqual("navigating", result["status"])
+        self.assertTrue(servo._paused)
+        self.assertTrue(spatial.is_navigating())
+        self.assertEqual(2, proxy.stops)
+        self.assertEqual("error", servo.dispatch("resume", {})["state"])
+
+    def test_all_non_servo_chassis_owners_are_mutually_exclusive(self):
+        proxy = _Proxy()
+        loco = self.device.LocoPlugin({}, "test", None, proxy)
+        special_busy = types.SimpleNamespace(is_running=lambda: True)
+        spatial_idle = types.SimpleNamespace(is_navigating=lambda: False)
+        loco.attach_special_motion(special_busy)
+        loco.attach_controlled_spatial(spatial_idle)
+        result = loco.dispatch(
+            "move", {"vx": 0.1, "vy": 0.0, "vyaw": 0.0})
+        self.assertFalse(result["accepted"])
+        self.assertIn("special_motion", result["reason"])
+        self.assertEqual([], proxy.moves)
+
+        special = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        special.attach_loco(types.SimpleNamespace(
+            is_moving=lambda: True, motion_lock=threading.RLock()))
+        result = special.dispatch("front_flip", {"confirm": True})
+        self.assertFalse(result["accepted"])
+        self.assertIn("loco", result["reason"])
+
+        spatial = self.spatial.ControlledSpatialPlugin.__new__(
+            self.spatial.ControlledSpatialPlugin)
+        called = []
+        spatial._client = types.SimpleNamespace(
+            call=lambda *args: called.append(args) or {"code": 0, "response": "{}"})
+        spatial._nav_done = threading.Event()
+        spatial._nav_result = None
+        spatial._nav_action_id = None
+        spatial._navigation_active = False
+        spatial._nav_lock = threading.Lock()
+        spatial._servo = None
+        spatial._loco = types.SimpleNamespace(is_moving=lambda: True)
+        spatial._special_motion = None
+        result = spatial.dispatch("navigate_to", {"x": 1, "y": 2})
+        self.assertEqual(-1, result["ret"])
+        self.assertIn("loco", result["reason"])
+        self.assertEqual([], called)
 
     def test_old_loco_worker_cannot_stop_or_release_new_motion(self):
         proxy = _Proxy()

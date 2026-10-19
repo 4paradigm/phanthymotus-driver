@@ -126,15 +126,27 @@ class Bundle:
         self.plugins = []
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         loco = None
+        loco_servo = None
+        special_motion = None
         if p.get("loco", {}).get("enabled", True):
             loco = LocoPlugin(p.get("loco", {}), namespace, executor, proxy)
             self.plugins.append(loco)
         if p.get("loco_servo", {}).get("enabled", False):
             from loco_servo import LocoServoPlugin
-            self.plugins.append(LocoServoPlugin(
+            loco_servo = LocoServoPlugin(
                 p.get("loco_servo", {}), namespace, executor, proxy,
-                loco_plugin=loco))
-        if p.get("special_motion", {}).get("enabled", True): self.plugins.append(SpecialMotionPlugin(p.get("special_motion", {}), namespace, executor, proxy))
+                loco_plugin=loco)
+            self.plugins.append(loco_servo)
+        if p.get("special_motion", {}).get("enabled", True):
+            special_motion = SpecialMotionPlugin(
+                p.get("special_motion", {}), namespace, executor, proxy)
+            self.plugins.append(special_motion)
+            if loco is not None:
+                loco.attach_special_motion(special_motion)
+                special_motion.attach_loco(loco)
+            if loco_servo is not None:
+                special_motion.attach_servo(loco_servo)
+                loco_servo.attach_special_motion(special_motion)
         if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
         if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
@@ -144,7 +156,19 @@ class Bundle:
             self.plugins.append(VisionCapturePlugin(
                 p.get("vision_capture", {}), namespace, executor))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
-        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True):
+            controlled_spatial = ControlledSpatialPlugin(
+                p.get("controlled_spatial", {}), namespace, executor, interface)
+            self.plugins.append(controlled_spatial)
+            if loco is not None:
+                loco.attach_controlled_spatial(controlled_spatial)
+                controlled_spatial.attach_loco(loco)
+            if special_motion is not None:
+                special_motion.attach_controlled_spatial(controlled_spatial)
+                controlled_spatial.attach_special_motion(special_motion)
+            if loco_servo is not None:
+                controlled_spatial.attach_servo(loco_servo)
+                loco_servo.attach_controlled_spatial(controlled_spatial)
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
     def start_all(self):
         for plugin in self.plugins: plugin.start()

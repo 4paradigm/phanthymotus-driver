@@ -9,7 +9,9 @@ plugins:
   loco_servo:
     enabled: true
     expected_hz: 10
-    dry_run: false
+    # Keep real chassis output disabled until an operator explicitly confirms
+    # the transition through loco_servo.config.
+    dry_run: true
     rotate_only: false
     require_standing: true
   special_motion: {enabled: true}

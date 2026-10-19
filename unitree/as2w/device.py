@@ -101,6 +101,43 @@ def _number(value, default=0.0):
         return default
 
 
+def _finite(value):
+    """Return one finite measured value, otherwise ``None``."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _timespec_ms(stamp):
+    """Convert Unitree's TimeSpec to epoch milliseconds when usable."""
+    try:
+        sec = int(stamp.sec)
+        nanosec = int(stamp.nanosec)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if sec <= 0 and nanosec <= 0:
+        return None
+    return sec * 1000 + nanosec // 1_000_000
+
+
+def _quaternion_yaw(quaternion):
+    """Return yaw from Unitree's ``[w, x, y, z]`` quaternion."""
+    try:
+        w, x, y, z = (float(value) for value in quaternion)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (w, x, y, z)):
+        return None
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 1e-9:
+        return None
+    w, x, y, z = w / norm, x / norm, y / norm, z / norm
+    return math.atan2(2.0 * (w * z + x * y),
+                      1.0 - 2.0 * (y * y + z * z))
+
+
 def _invalid_argument(message, field=None):
     """Return the card-level rejection expected by direct MCP callers."""
     result = {
@@ -160,6 +197,8 @@ def _acp_notify(action_id, status, result, tool="loco"):
 
 
 class _StateNode:
+    _ODOM_INTERVAL = 0.1
+
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
@@ -169,6 +208,12 @@ class _StateNode:
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", _LOW_LAT_QOS or 1)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", _LOW_LAT_QOS or 1)
         self.odom = self.node.create_publisher(String, f"/{namespace}/state/odom", _LOW_LAT_QOS or 1)
+        self._odom_lock = threading.Lock()
+        self._odom_burst = []
+        self._odom_burst_size = 0
+        self._odom_stamp_ms = 0
+        self._odom_stamp_provenance = {}
+        self._last_odom_time = 0.0
         self.remote = self.node.create_publisher(
             String, f"/{namespace}/state/remote_controller", _LOW_LAT_QOS or 1)
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
@@ -228,6 +273,22 @@ class _StateNode:
     def _flat(prefix, values):
         return {f"{prefix}_{i}": float(value) for i, value in enumerate(values)}
 
+    @staticmethod
+    def _xyz(prefix, values, invert_xy=False):
+        """Name a three-vector and optionally normalise the planar signs."""
+        values = list(values or [])
+        result = {}
+        for index, axis in enumerate(("x", "y", "z")):
+            value = (_number(values[index], None)
+                     if index < len(values) else None)
+            if invert_xy and index < 2 and value is not None:
+                value = -value
+                # Do not expose negative zero after changing coordinate signs.
+                if value == 0.0:
+                    value = 0.0
+            result[f"{prefix}_{axis}"] = value
+        return result
+
     def _publish_loop(self):
         wait_for = 1.0 / _STATE_PUBLISH_HZ
         while not self._stop_event.is_set():
@@ -247,6 +308,7 @@ class _StateNode:
             if sport is not None and sport_generation != self._published_sport_generation:
                 self._publish_sport(sport)
                 self._published_sport_generation = sport_generation
+            self._maybe_publish_odom()
             self._maybe_publish_remote()
             self._stop_event.wait(wait_for)
 
@@ -353,6 +415,12 @@ class _StateNode:
         self._publish(self.battery, battery)
 
     def _on_sport(self, msg):
+        # Accumulate every vendor reading before the latest-value cache drops
+        # older samples. Odom failures are isolated from the legacy state path.
+        try:
+            self._accumulate_odom(msg)
+        except Exception:
+            pass
         latest_lock = getattr(self, "_latest_lock", None)
         if latest_lock is None:
             self._publish_sport(msg)
@@ -364,40 +432,117 @@ class _StateNode:
             self._publish_sport(msg)
 
     def _publish_sport(self, msg):
-        loco = {"mode": int(getattr(msg, "mode", 0)),
-                "body_height": _number(getattr(msg, "body_height", 0))}
         velocity = list(getattr(msg, "velocity", []))
-        loco.update(self._flat("velocity", velocity))
-        loco.update(self._flat("position", getattr(msg, "position", [])))
+        position = list(getattr(msg, "position", []))
+        # These vendor vectors are in the odometry world frame. Keep their
+        # measured signs here; state/odom below performs the body conversion.
+        velocity_xyz = self._xyz("velocity", velocity)
+        position_xyz = self._xyz("position", position)
+        # AS2-W firmware leaves SportModeState.body_height at zero. Hardware
+        # observation shows the actual body height in position.z, spanning
+        # approximately [0, 0.4] m, so publish that single source consistently.
+        body_height = position_xyz["position_z"]
+        loco = {
+            "mode": int(getattr(msg, "mode", 0)),
+            "body_height": body_height,
+        }
+        loco.update(velocity_xyz)
+        loco.update(position_xyz)
         self._publish(self.loco, loco)
-        # Keep the established vendor-shaped stream above, and publish the same
-        # measurement on a second, standard port for motion consumers such as
-        # ActuCore's visual-navigation card.  The SportModeState velocity is in
-        # the robot body frame; AS2 exposes vx/vy and yaw speed, but not vz/wx/wy.
-        from common.odom import build_sample
 
-        def measured(value):
-            value = _number(value, None)
-            return value if value is not None and math.isfinite(value) else None
+    def _maybe_publish_odom(self):
+        """Drain the measurement window on fixed 10 Hz due times."""
+        if getattr(self, "odom", None) is None:
+            return
+        try:
+            now = time.monotonic()
+            due = self._last_odom_time + self._ODOM_INTERVAL
+            if now < due:
+                return
+            self._last_odom_time = (
+                due if now - due < self._ODOM_INTERVAL else now)
+            with self._latest_lock:
+                sport = self._latest_sport
+            if sport is not None:
+                self._publish_odom(sport)
+        except Exception:
+            # The original loco/state output must remain available even if the
+            # standard odometry adapter sees a malformed vendor message.
+            pass
 
+    def _accumulate_odom(self, msg):
+        """Convert one world-frame vendor reading into body-frame twist."""
+        if getattr(self, "odom", None) is None:
+            return
+        from common.odom import resolve_stamp_ms
+
+        velocity = list(getattr(msg, "velocity", []) or [])
+        vx_world = _finite(velocity[0]) if len(velocity) > 0 else None
+        vy_world = _finite(velocity[1]) if len(velocity) > 1 else None
+        imu = getattr(msg, "imu_state", None)
+        yaw = _quaternion_yaw(getattr(imu, "quaternion", None))
+        if yaw is None or vx_world is None or vy_world is None:
+            vx_body = vy_body = None
+        else:
+            cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+            vx_body = _finite(cos_yaw * vx_world + sin_yaw * vy_world)
+            vy_body = _finite(-sin_yaw * vx_world + cos_yaw * vy_world)
+        gyroscope = list(getattr(imu, "gyroscope", []) or [])
+        row = [
+            vx_body, vy_body,
+            None, None, None,
+            _finite(gyroscope[2]) if len(gyroscope) > 2 else None,
+        ]
+        stamp_ms, provenance = resolve_stamp_ms(
+            vendor_ms=_timespec_ms(getattr(msg, "stamp", None)),
+            received_ms=int(time.time() * 1000),
+        )
+        with self._odom_lock:
+            self._odom_burst.append(row)
+            self._odom_stamp_ms = stamp_ms
+            self._odom_stamp_provenance = provenance
+
+    def _publish_odom(self, msg):
+        """Publish the finite per-axis mean without inventing measurements."""
+        from common.odom import build_sample, mean_twist
+
+        with self._odom_lock:
+            burst, self._odom_burst = self._odom_burst, []
+            self._odom_burst_size = len(burst)
+            stamp_ms = self._odom_stamp_ms
+            provenance = self._odom_stamp_provenance
+        if not burst:
+            stamp_ms = int(time.time() * 1000)
+            provenance = {
+                "stamp_source": "published",
+                "stamp_reason": "no readable vendor reading in window",
+            }
+        twist = [_finite(value) for value in mean_twist(burst)]
+        position = list(getattr(msg, "position", []) or [])
+        body_height = (_finite(position[2]) if len(position) > 2 else None)
         sample = build_sample(
-            stamp_ms=int(time.time() * 1000),
-            twist=[
-                measured(velocity[0]) if len(velocity) > 0 else None,
-                measured(velocity[1]) if len(velocity) > 1 else None,
-                None,
-                None,
-                None,
-                measured(getattr(msg, "yaw_speed", None)),
-            ],
+            stamp_ms=stamp_ms,
+            twist=twist,
             vendor={
                 "mode": int(getattr(msg, "mode", 0)),
                 "gait_type": int(getattr(msg, "gait_type", 0)),
-                "body_height": _number(getattr(msg, "body_height", 0)),
+                "body_height": body_height,
+                "samples": len(burst),
+                **provenance,
             },
         )
-        if hasattr(self, "odom"):
-            self._publish(self.odom, sample)
+        self._publish(self.odom, sample)
+
+    def odom_health(self):
+        with self._odom_lock:
+            return {
+                "odom_burst_samples": self._odom_burst_size,
+                "odom_measured": (
+                    "SportModeState velocity is odometry-world frame and is "
+                    "rotated into body frame with each reading's quaternion; "
+                    "wz comes from imu_state.gyroscope[2]."),
+                **self._odom_stamp_provenance,
+            }
 
 
 class StatePlugin:
@@ -423,8 +568,11 @@ class StatePlugin:
                  for name, path, fmt, desc in specs]
         loco_state = next(tool for tool in tools if tool["name"] == "loco_state")
         loco_state["description"] = (
-            "As2W high-level locomotion state. Keeps the vendor-shaped JSON "
-            "stream and also publishes motus.odom/1 for navigation.")
+            "As2W high-level locomotion state. velocity_x/y and position_x/y "
+            "retain the vendor odometry-world axes; +Z is up. position_z and "
+            "body_height are 0 m when lying down and approximately 0.4 m when "
+            "standing. The state/odom output converts velocity to body frame, "
+            "where +X is forward and +Y is left, for navigation.")
         loco_state["topic_out"] = self._loco_state_topics()
         remote = next(tool for tool in tools
                       if tool["name"] == "remote_controller")
@@ -451,12 +599,25 @@ class StatePlugin:
 
         return build_interface(
             provides=StatePlugin.ODOM_AXES,
-            rate_hz=_STATE_PUBLISH_HZ,
-            # SportModeState contains velocity but its world pose is not used by
-            # this port.  Consumers must not accumulate the vendor position as
-            # bounded localisation.
-            pose_drift="none",
+            rate_hz=10,
+            # Wheel/leg dead reckoning is useful as measured velocity but not as
+            # an absolute pose source.
+            pose_drift="unbounded",
         )
+
+    def _loco_state_info(self):
+        result = {
+            "state": "running",
+            "topic_out": self._loco_state_topics(),
+            "odom_interface": self._odom_interface(),
+        }
+        state = getattr(self, "_state", None)
+        if state is not None:
+            try:
+                result.update(state.odom_health())
+            except Exception:
+                pass
+        return result
     def start(self):
         # Sensor cards share one LowState subscription.  Recreate it when a
         # dashboard stopped the card instead of claiming a dead stream is live.
@@ -497,9 +658,7 @@ class StatePlugin:
         if action == "start":
             self.start()
             if name == "loco_state":
-                return {"state": "running",
-                        "topic_out": self._loco_state_topics(),
-                        "odom_interface": self._odom_interface()}
+                return self._loco_state_info()
             return {"state": "running"}
         if action == "stop":
             self.stop()
@@ -514,16 +673,12 @@ class StatePlugin:
             if name in paths:
                 path, fmt = paths[name]
                 if name == "loco_state":
-                    return {"state": "running",
-                            "topic_out": self._loco_state_topics(),
-                            "odom_interface": self._odom_interface()}
+                    return self._loco_state_info()
                 return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
             return {"state": "running"}
         if action in ("imu", "joints", "joint_state", "battery", "loco_state", "remote_controller"):
             if action == "loco_state":
-                return {"state": "running",
-                        "topic_out": self._loco_state_topics(),
-                        "odom_interface": self._odom_interface()}
+                return self._loco_state_info()
             path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state", "remote_controller": "state/remote_controller"}[action]
             fmt = "sensor/skeleton" if action == "joints" else "data/json"
             return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
@@ -539,12 +694,29 @@ class LocoPlugin:
         self._stop = None
         self._transition_stop = None
         self._servo = None
+        self._special_motion = None
+        self._controlled_spatial = None
         self._moving = False
         self._moving_owner = None
 
     def attach_servo(self, servo):
         """Attach the continuous command card that shares this chassis."""
         self._servo = servo
+
+    def attach_special_motion(self, plugin):
+        self._special_motion = plugin
+
+    def attach_controlled_spatial(self, plugin):
+        self._controlled_spatial = plugin
+
+    def _other_chassis_owner(self):
+        if (self._special_motion is not None
+                and self._special_motion.is_running()):
+            return "special_motion"
+        if (self._controlled_spatial is not None
+                and self._controlled_spatial.is_navigating()):
+            return "controlled_spatial"
+        return ""
 
     def is_moving(self):
         """Whether this call-shaped card currently owns an ongoing movement."""
@@ -905,6 +1077,13 @@ class LocoPlugin:
             self._moving = False
             self._moving_owner = None
             return {"state": "idle", "ret": ret}
+        if action != "get_state":
+            owner = self._other_chassis_owner()
+            if owner:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": "Chassis is owned by another controller",
+                        "reason": f"{owner} 正在占用底盘",
+                        "suggested_actions": ["get_state"]}
         if action == "move":
             values = {}
             for name in ("vx", "vy", "vyaw"):
@@ -1214,6 +1393,40 @@ class SpecialMotionPlugin:
         self._state_lock = threading.Lock()
         self._motion_lock = threading.Lock()
         self._motion_generation = 0
+        self._servo = None
+        self._loco = None
+        self._controlled_spatial = None
+        self._chassis_lock = threading.RLock()
+
+    def attach_servo(self, servo):
+        self._servo = servo
+        if self._loco is None:
+            self._chassis_lock = servo._lock
+
+    def attach_loco(self, loco):
+        self._loco = loco
+        self._chassis_lock = loco.motion_lock
+
+    def attach_controlled_spatial(self, plugin):
+        self._controlled_spatial = plugin
+
+    def is_running(self):
+        with self._state_lock:
+            active_posture = self._active_posture is not None
+        return self._motion_lock.locked() or active_posture
+
+    def _other_chassis_owner(self):
+        if self._loco is not None and self._loco.is_moving():
+            return "loco"
+        if (self._controlled_spatial is not None
+                and self._controlled_spatial.is_navigating()):
+            return "controlled_spatial"
+        return ""
+
+    def _preempt_servo(self, reason):
+        if self._servo is None:
+            return False
+        return bool(self._servo.pause_for_explicit_command(reason))
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
@@ -1387,7 +1600,16 @@ class SpecialMotionPlugin:
                 action, bool(args.get("enter", True)))
             if state_error is not None:
                 return state_error
-            return self._start_motion(action, args)
+            with self._chassis_lock:
+                owner = self._other_chassis_owner()
+                if owner:
+                    return {"ret": -1, "accepted": False, "action": action,
+                            "error": "Chassis is owned by another controller",
+                            "reason": f"{owner} 正在占用底盘"}
+                # Reserve the shared handover while stopping the stream and
+                # acquiring this card's own motion slot.
+                self._preempt_servo(f"special_motion.{action}")
+                return self._start_motion(action, args)
         return None
 
 

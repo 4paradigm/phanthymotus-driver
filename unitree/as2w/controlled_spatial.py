@@ -112,7 +112,12 @@ class ControlledSpatialPlugin:
         self._nav_done = threading.Event()
         self._nav_result = None
         self._nav_action_id = None
+        self._navigation_active = False
         self._nav_lock = threading.Lock()
+        self._servo = None
+        self._loco = None
+        self._special_motion = None
+        self._chassis_lock = threading.RLock()
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
@@ -121,6 +126,40 @@ class ControlledSpatialPlugin:
         except Exception as exc:
             self._nav_sub = None
             print(f"[controlled_spatial] SLAM completion topic unavailable: {exc}", flush=True)
+
+    def attach_servo(self, servo):
+        self._servo = servo
+        if self._loco is None:
+            self._chassis_lock = servo._lock
+
+    def attach_loco(self, loco):
+        self._loco = loco
+        self._chassis_lock = loco.motion_lock
+
+    def attach_special_motion(self, plugin):
+        self._special_motion = plugin
+
+    def _other_chassis_owner(self):
+        loco = getattr(self, "_loco", None)
+        special_motion = getattr(self, "_special_motion", None)
+        if loco is not None and loco.is_moving():
+            return "loco"
+        if special_motion is not None and special_motion.is_running():
+            return "special_motion"
+        return ""
+
+    def is_navigating(self):
+        lock = getattr(self, "_nav_lock", None)
+        if lock is None:
+            return bool(getattr(self, "_navigation_active", False))
+        with lock:
+            return bool(getattr(self, "_navigation_active", False))
+
+    def _preempt_servo(self, reason):
+        servo = getattr(self, "_servo", None)
+        if servo is None:
+            return False
+        return bool(servo.pause_for_explicit_command(reason))
 
     def get_tool(self):
         return {"name": "controlled_spatial", "type": "actuator", "multiInstance": False,
@@ -146,6 +185,7 @@ class ControlledSpatialPlugin:
     def stop(self):
         with self._nav_lock:
             action_id, self._nav_action_id = self._nav_action_id, None
+            self._navigation_active = False
         if action_id:
             self._client.call("pause_navigation", {})
             _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
@@ -181,6 +221,7 @@ class ControlledSpatialPlugin:
         with self._nav_lock:
             if self._nav_action_id == action_id:
                 self._nav_action_id = None
+                self._navigation_active = False
 
     @staticmethod
     def _pose(args):
@@ -203,29 +244,52 @@ class ControlledSpatialPlugin:
         else: data = {}
         action_id = None
         previous = None
-        if action == "navigate_to":
-            # Arm completion state before the RPC. The vendor can publish a very
-            # fast task_result before _Call returns, so clearing the event after
-            # the call loses that completion and leaves ACP waiting for 180s.
-            with self._nav_lock:
-                previous = self._nav_action_id
-                action_id = f"as2w_nav_{uuid4().hex[:8]}"
-                self._nav_action_id = action_id
-                self._nav_done.clear()
-                self._nav_result = None
+        if action in ("navigate_to", "resume_navigation"):
+            chassis_lock = getattr(self, "_chassis_lock", None)
+            if chassis_lock is None:
+                chassis_lock = threading.RLock()
+            with chassis_lock:
+                owner = self._other_chassis_owner()
+                if owner:
+                    return {"ret": -1,
+                            "error": "Chassis is owned by another controller",
+                            "reason": f"{owner} 正在占用底盘"}
+                # Reserve vendor navigation before releasing the shared lock,
+                # so another controller cannot enter during the service RPC.
+                with self._nav_lock:
+                    self._navigation_active = True
+                    if action == "navigate_to":
+                        previous = self._nav_action_id
+                        action_id = f"as2w_nav_{uuid4().hex[:8]}"
+                        self._nav_action_id = action_id
+                        self._nav_done.clear()
+                        self._nav_result = None
+                self._preempt_servo(f"controlled_spatial.{action}")
             if previous:
-                _acp_notify(previous, "cancelled", {"reason": "superseded by new navigation request"})
+                _acp_notify(previous, "cancelled", {
+                    "reason": "superseded by new navigation request"})
 
         result = self._client.call(action, data)
         response = result["response"]
         try: response = json.loads(response) if isinstance(response, str) else response
         except json.JSONDecodeError: pass
-        if action != "navigate_to" or result["code"] != 0:
-            if action == "navigate_to":
+        if result["code"] != 0:
+            if action in ("navigate_to", "resume_navigation"):
                 with self._nav_lock:
-                    if self._nav_action_id == action_id:
+                    if action == "resume_navigation":
+                        self._navigation_active = False
+                    elif self._nav_action_id == action_id:
                         self._nav_action_id = None
+                        self._navigation_active = False
                         self._nav_done.clear()
+            return {"ret": result["code"], "response": response}
+        if action == "pause_navigation" and result["code"] == 0:
+            with self._nav_lock:
+                self._navigation_active = False
+        elif action == "resume_navigation" and result["code"] == 0:
+            with self._nav_lock:
+                self._navigation_active = True
+        if action != "navigate_to":
             return {"ret": result["code"], "response": response}
         threading.Thread(target=self._wait_for_navigation,
                          args=(action_id, data["targetPose"]), daemon=True).start()

@@ -18,17 +18,20 @@ import time
 from common.control import ControlSink, parse_descriptor
 
 
-VX_LIMIT = 1.5
-VY_LIMIT = 1.0
-WZ_LIMIT = 2.0
+# Initial indoor visual-navigation envelope. These are deliberately far below
+# the product's headline speed: AS2-W command scale, lateral support, deadbands
+# and stopping distance still need to be measured on this chassis/firmware.
+VX_LIMIT = 0.30
+VY_LIMIT = 0.10
+WZ_LIMIT = 0.40
 
 # Conservative command-step limits.  For twist these are acceleration limits,
 # not joint velocity limits.  AS2W's actual no-motion thresholds have not been
 # measured, so no ``min_magnitude`` is declared yet; copying R1's foot-gait
 # thresholds onto a wheel-legged chassis would be a false hardware claim.
-VX_STEP = 0.15
-VY_STEP = 0.15
-WZ_STEP = 0.30
+VX_STEP = 0.03
+VY_STEP = 0.02
+WZ_STEP = 0.05
 PINNED_STEP = 1e-6
 
 # Unitree's AS2-W specification lists the standing envelope as
@@ -100,19 +103,22 @@ class LocoServoPlugin:
     PREFIX = "locoservo"
 
     def __init__(self, plugin_config, namespace, executor, proxy,
-                 loco_plugin=None):
+                 loco_plugin=None, special_motion_plugin=None,
+                 controlled_spatial_plugin=None):
         config = plugin_config or {}
         self._namespace = namespace
         self._executor = executor
         self._proxy = proxy
         self._loco = loco_plugin
+        self._special_motion = special_motion_plugin
+        self._controlled_spatial = controlled_spatial_plugin
         self._expected_hz = float(
             config.get("expected_hz", DEFAULT_EXPECTED_HZ))
         if not 0 < self._expected_hz <= MAX_HZ:
             raise ValueError(
                 f"loco_servo.expected_hz must be in (0, {MAX_HZ}]")
 
-        self._dry_run = bool(config.get("dry_run", False))
+        self._dry_run = bool(config.get("dry_run", True))
         self._rotate_only = bool(config.get("rotate_only", False))
         self._require_standing = bool(config.get("require_standing", True))
         self._descriptor_raw = build_descriptor(self._expected_hz)
@@ -138,6 +144,12 @@ class LocoServoPlugin:
         if loco_plugin is not None:
             loco_plugin.attach_servo(self)
 
+    def attach_special_motion(self, plugin):
+        self._special_motion = plugin
+
+    def attach_controlled_spatial(self, plugin):
+        self._controlled_spatial = plugin
+
     def get_tool(self):
         return {
             "name": "loco_servo",
@@ -152,11 +164,20 @@ class LocoServoPlugin:
                     "action": {"type": "string", "enum": [
                         "start", "stop", "pause", "resume", "info", "config"]},
                     "input_topic": {"type": "string"},
+                    "dry_run": {"type": "boolean"},
+                    "rotate_only": {"type": "boolean"},
+                    "require_standing": {"type": "boolean"},
+                    "confirm": {"type": "boolean",
+                                "description": "Required true when enabling live control"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "pause": {"params": [], "description": "Stop and pause"},
                     "resume": {"params": [], "description": "Resume input"},
+                    "config": {
+                        "params": ["dry_run", "rotate_only", "require_standing", "confirm"],
+                        "description": "Changing dry_run from true to false requires confirm=true",
+                    },
                 },
                 "x-hooks": {
                     "on_interrupt_motion": {"action": "pause"},
@@ -168,7 +189,7 @@ class LocoServoPlugin:
             "configSchema": {
                 "type": "object",
                 "properties": {
-                    "dry_run": {"type": "boolean", "default": False,
+                    "dry_run": {"type": "boolean", "default": True,
                                 "description": "Validate commands without moving"},
                     "rotate_only": {"type": "boolean", "default": False,
                                     "description": "Suppress vx/vy; keep yaw"},
@@ -228,6 +249,10 @@ class LocoServoPlugin:
         if self._loco is not None and self._loco.is_moving():
             return {"state": "error", "message":
                     "loco 正在占用底盘，请先调用 stop_move"}
+        owner = self._other_owner()
+        if owner:
+            return {"state": "error", "message":
+                    f"{owner} 正在占用底盘，无法启动 loco_servo"}
         if self._executor is None:
             return {"state": "error", "message": "没有 ROS 上下文，无法订阅"}
 
@@ -285,6 +310,11 @@ class LocoServoPlugin:
             if not paused and self._loco is not None and self._loco.is_moving():
                 return {"state": "error", "message":
                         "loco 正在占用底盘，请先调用 stop_move"}
+            if not paused:
+                owner = self._other_owner()
+                if owner:
+                    return {"state": "error", "message":
+                            f"{owner} 正在占用底盘，无法恢复 loco_servo"}
             self._paused = bool(paused)
             if paused:
                 self._hold()
@@ -303,6 +333,19 @@ class LocoServoPlugin:
         return True
 
     def _config(self, args):
+        if (args.get("dry_run") is False and self._dry_run
+                and args.get("confirm") is not True):
+            return {
+                "ok": False,
+                "state": ("paused" if self._running and self._paused else
+                          "running" if self._running else "idle"),
+                "code": "CONFIRM_REQUIRED",
+                "message": "关闭 dry_run 会启用真实底盘运动，必须提供 confirm=true",
+            }
+        for name in ("dry_run", "rotate_only", "require_standing"):
+            if name in args and args[name] is not True and args[name] is not False:
+                return {"ok": False, "code": "INVALID_ARGUMENT",
+                        "message": f"{name} must be a boolean"}
         with self._lock:
             if (args.get("dry_run") is True and not self._dry_run
                     and self._running and not self._paused):
@@ -317,6 +360,15 @@ class LocoServoPlugin:
                 "dry_run": self._dry_run,
                 "rotate_only": self._rotate_only,
                 "require_standing": self._require_standing}
+
+    def _other_owner(self):
+        if (self._special_motion is not None
+                and self._special_motion.is_running()):
+            return "special_motion"
+        if (self._controlled_spatial is not None
+                and self._controlled_spatial.is_navigating()):
+            return "controlled_spatial"
+        return ""
 
     def _info(self):
         with self._lock:
