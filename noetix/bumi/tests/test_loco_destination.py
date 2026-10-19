@@ -1144,3 +1144,91 @@ def test_bundle_exposes_loco_destination_card(monkeypatch, tmp_path):
     driver = yaml.safe_load(
         (Path(__file__).resolve().parents[1] / 'driver.yaml').read_text())
     assert {'name': 'loco_destination', 'type': 'actuator'} in driver['cards']
+
+
+def test_servo_sees_reserved_rotation_as_busy(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = module.LocoPlugin({}, 'robot', None, FakeHighCtrl())
+    plugin._rotate_state['state'] = 'running'
+    assert plugin.is_moving() is True
+
+
+def test_rotate_waits_for_previous_move_handoff_and_releases_on_error(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setattr(module, '_get_default_cmd', lambda: 'walk')
+    plugin = module.LocoPlugin({}, 'robot', None, FakeHighCtrl())
+
+    class Servo:
+        paused = False
+        owned = False
+        owners = []
+
+        def pause_for_explicit_command(self, reason):
+            self.paused = True
+            return True
+
+        def set_explicit_velocity_owner(self, owned):
+            self.owned = owned
+            self.owners.append(owned)
+
+    servo = Servo()
+    plugin.attach_servo(servo)
+    previous_move_alive = [True]
+
+    def finish_previous_move(timeout):
+        servo.set_explicit_velocity_owner(False)
+        previous_move_alive[0] = False
+
+    plugin._move_thread = types.SimpleNamespace(
+        is_alive=lambda: previous_move_alive[0], join=finish_previous_move)
+    plugin._active_action_id = 'rotation'
+    plugin._rotate_state['state'] = 'running'
+
+    def read_imu():
+        assert servo.paused and servo.owned
+        raise RuntimeError('simulated IMU failure')
+
+    monkeypatch.setattr(plugin, '_read_rotate_imu', read_imu)
+    result = plugin._do_rotate_worker({'angle_deg': 30}, 'rotation')
+    assert 'simulated IMU failure' in result['error']
+    assert servo.owners == [False, True, False]
+    assert servo.owned is False
+
+
+def test_rotate_status_and_zero_do_not_pause_streaming_servo(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = module.LocoPlugin({}, 'robot', None, FakeHighCtrl())
+
+    def refuse_pause(reason):
+        raise AssertionError('read-only status and zero turn must not pause servo')
+
+    plugin.attach_servo(types.SimpleNamespace(pause_for_explicit_command=refuse_pause))
+    assert plugin.dispatch('status', {'_tool_name': 'loco_destination'})['state'] == 'idle'
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 0})
+    assert wait_rotate(plugin)['state'] == 'done'
+
+
+def test_rotation_refuses_if_previous_move_did_not_stop(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setattr(module, '_get_default_cmd', lambda: 'walk')
+    controller = FakeHighCtrl()
+    plugin = module.LocoPlugin({}, 'robot', None, controller)
+    plugin._move_thread = types.SimpleNamespace(is_alive=lambda: True, join=lambda timeout: None)
+    plugin._active_action_id = 'rotation'
+    plugin._rotate_state['state'] = 'running'
+    result = plugin._do_rotate_worker({'angle_deg': 30}, 'rotation')
+    assert result['state'] == 'error'
+    assert 'previous move' in result['error']
+    assert plugin._move_stop_event.is_set()
+    assert controller.cmds == []
+
+
+def test_rotation_action_ids_stay_unique_with_frozen_wall_clock(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setattr(module.time, 'time_ns', lambda: 12345)
+    plugin = module.LocoPlugin({}, 'robot', None, FakeHighCtrl())
+    first = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 0})
+    wait_rotate(plugin)
+    second = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 0})
+    wait_rotate(plugin)
+    assert first['action_id'] != second['action_id']

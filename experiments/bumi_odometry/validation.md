@@ -70,3 +70,63 @@ unitree/r1/unitree_sdk2py/test/rpc/test_server_example.py
 ```
 
 当前没有实测精度结论。距离反馈控制尚未接入。
+
+
+## 2026-10-19：合入现有 PR 并同步 main
+
+按用户要求把实验合入原 loco_destination PR #408；同步上游 main 3ef6ee77，保留上游的 loco_servo、相机和声源方向实现。只推送 loco_destination 分支。loco_destination 自身闭环线程直接下发 SDK，不通过 loco_servo 执行；只与其共享底盘互斥保护。
+
+- 合并后的 Bumi、loco_servo、相机规格、里程计及 ControlSink 测试：**362 passed in 58.28s**。
+- 旋转预留状态阻止伺服 start/resume；状态查询和零角度请求不暂停伺服。
+- 新回归复现并修复：前一 move 线程退出时会清除发布权，旋转必须等它退出后才接管；如果 join 超时仍未停止，拒绝启动旋转并保留停止信号。
+- ACP action_id 改用 UUID4；固定 time.time_ns 后重复请求的回归测试先复现 ID 重复，修复后通过。独立合并复核未发现剩余阻塞问题。
+- 相对合入的 main 检查，本 PR 不修改生产 Dockerfile、requirements、sound_direction.py 或 direction_card.py；实验仍未部署。
+- 全库 pytest 重新执行，**45 个收集错误、3 skipped**，未宣称全库通过。当前失败路径如下：
+
+```text
+agibot/AimDK_X2/tests/test_device.py
+brainco/revo2/tests/test_device.py
+chasing/qianjiao_p200_pro/test_device.py
+limx/tron2/tests/test_camera.py
+limx/tron2/tests/test_completion.py
+limx/tron2/tests/test_gripper_display.py
+limx/tron2/tests/test_motion_readiness.py
+limx/tron2/tests/test_sensors.py
+noetix/bumi/noetix_sdk_bumi/examples_py/test_high.py
+noetix/bumi/noetix_sdk_bumi/examples_py/test_low.py
+noetix/bumi/noetix_sdk_bumi/examples_py/test_media.py
+noetix/bumi/noetix_sdk_bumi/examples_py/test_policy.py
+pndbotics/adam/test_arm_controls.py
+pndbotics/adam/test_battery.py
+pndbotics/adam/test_battery_status.py
+pndbotics/adam/test_loco_contract.py
+pndbotics/adam/test_state_flattening.py
+pndbotics/adam/test_upper_body_cards.py
+pndbotics/adam/test_vision_capture.py
+robotera/q5_bundle/test_basic_sensors.py
+tests/test_franka_discovery.py
+tests/test_franka_driver.py
+tests/test_piper_camera_live.py
+tests/test_tianyi_bridge.py
+ubtrobot/u1_pro/test_device.py
+unitree/as2w/unitree_sdk2py/test/crc/test_crc.py
+unitree/as2w/unitree_sdk2py/test/rpc/test_client_example.py
+unitree/as2w/unitree_sdk2py/test/rpc/test_server_example.py
+unitree/g1/test_slam_rpc.py
+unitree/g1/tests/test_fsm_posture.py
+unitree/g1/tests/test_speaker_pacing.py
+unitree/g1/unitree_sdk2py/test/crc/test_crc.py
+unitree/g1/unitree_sdk2py/test/rpc/test_api.py
+unitree/g1/unitree_sdk2py/test/rpc/test_client_example.py
+unitree/g1/unitree_sdk2py/test/rpc/test_server_example.py
+unitree/go1/tests/test_vision_capture.py
+unitree/go2/unitree_sdk2py/test/crc/test_crc.py
+unitree/go2/unitree_sdk2py/test/rpc/test_api.py
+unitree/go2/unitree_sdk2py/test/rpc/test_client_example.py
+unitree/go2/unitree_sdk2py/test/rpc/test_server_example.py
+unitree/r1/tests/test_switch_mode_acp.py
+unitree/r1/unitree_sdk2py/test/crc/test_crc.py
+unitree/r1/unitree_sdk2py/test/rpc/test_api.py
+unitree/r1/unitree_sdk2py/test/rpc/test_client_example.py
+unitree/r1/unitree_sdk2py/test/rpc/test_server_example.py
+```

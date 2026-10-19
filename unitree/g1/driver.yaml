@@ -40,7 +40,6 @@ cards:
   - { name: lidar_cloud,            type: sensor }
   - { name: controlled_spatial,     type: actuator }
   - { name: controlled_spatial_map, type: sensor }
-  - { name: motion_switcher,        type: actuator }
   - { name: ext_mic,                type: sensor }
   - { name: ext_camera,             type: sensor }
   - { name: smart_motion,           type: actuator }
