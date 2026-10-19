@@ -17,10 +17,11 @@ def test_waits_for_both_sources_and_uses_ros_time_for_replay_pause():
     q = TrackingQuality()
     assert q.state(0) == "initializing"
     assert q.update("visual", 100, 100, "a", True) == "initializing"
-    assert q.update("imu", 101, 101, "a", True) == "tracking"
-    assert q.state(101) == "tracking"  # Paused /clock doesn't age the data.
-    assert q.state(500_000_102) == "lost"
-    assert q.update("visual", 500_000_103, 500_000_103, "a", True) == "lost"
+    assert q.update("imu", 101, 101, "a", True) == "initializing"
+    assert q.update("filtered", 102, 102, "a", True) == "tracking"
+    assert q.state(102) == "tracking"  # Paused /clock doesn't age the data.
+    assert q.state(500_000_103) == "lost"
+    assert q.update("visual", 500_000_104, 500_000_104, "a", True) == "lost"
 
 
 @pytest.mark.parametrize("kind,stamp,received,segment,valid", [
@@ -35,6 +36,7 @@ def test_faults_latch_until_new_trial(kind, stamp, received, segment, valid):
     q = TrackingQuality()
     q.update("visual", 100, 100, "a", True)
     q.update("imu", 100, 100, "a", True)
+    q.update("filtered", 100, 100, "a", True)
     assert q.update(kind, stamp, received, segment, valid) == "lost"
     assert q.update("visual", 200, 200, "a", True) == "lost"
 
@@ -46,6 +48,7 @@ def test_clock_backwards_and_missing_second_stream_cannot_track():
     q = TrackingQuality()
     q.update("visual", 100, 100, "a", True)
     q.update("imu", 100, 100, "a", True)
+    q.update("filtered", 100, 100, "a", True)
     assert q.state(99) == "lost"
 
 
@@ -125,3 +128,22 @@ def test_fault_is_persisted_without_another_filtered_pose(tmp_path):
         rows = list(csv.DictReader(path.open()))
         assert rows[-1]["status"] == "lost"
         assert rows[-1]["fault_stamp_ns"] == "900000000"
+
+
+def test_ekf_dropout_latches_loss_while_other_inputs_continue(tmp_path):
+    q = TrackingQuality()
+    for kind in ("visual", "imu", "filtered"):
+        q.update(kind, 1_000_000_000, 1_000_000_000, "trial", True)
+    assert q.state(1_000_000_000) == "tracking"
+    path = tmp_path / "trial.csv"
+    with path.open("w", newline="") as stream:
+        output = TrialCSV(stream, "trial")
+        output.pose(1_000_000_000, [1, 0, 0, 0, 0, 0, 1], "tracking")
+        for now in (1_200_000_000, 1_400_000_000, 1_600_000_000):
+            q.update("visual", now, now, "trial", True)
+            q.update("imu", now, now, "trial", True)
+        assert q.state(1_600_000_000) == "lost"
+        output.fault(1_600_000_000, 1_000_000_000)
+        assert list(csv.DictReader(path.open()))[-1]["status"] == "lost"
+        q.update("filtered", 1_600_000_000, 1_600_000_000, "trial", True)
+        assert q.state(1_600_000_000) == "lost"

@@ -11,7 +11,7 @@ python3 -m pytest -q tests/test_bumi_odometry_evaluate.py
 python3 experiments/bumi_odometry/evaluate.py --manifest /path/to/trials.json --output /path/to/report.json
 ```
 
-manifest 示例（相对路径以 manifest 所在目录为基准）：
+manifest 示例（相对路径以 manifest 所在目录为基准）：同一 CSV 只能出现一次；解析后的路径重复（包括相对路径及符号链接别名）会保留为 invalid 尝试，不能靠改 trial_id 或 scene 重复计数。
 
 ```json
 {"data_source":"measured","trials":[{"trial_id":"room-01","samples":"room-01.csv","truth":"room-01.json"}]}
@@ -24,10 +24,10 @@ CSV 位姿列：`stamp_ns,x,y,z,qx,qy,qz,qw,status,segment_id`，导出器还写
 真值 JSON 示例：
 
 ```json
-{"trial_id":"room-01","start_ns":[1000000000,1200000000],"end_ns":[11000000000,11200000000],"forward_m":1.003,"lateral_m":0.012,"uncertainty_m":0.005,"scene":"room","speed_m_s":0.1,"split":"acceptance"}
+{"trial_id":"room-01","start_ns":[1000000000,1500000000],"end_ns":[11000000000,11500000000],"forward_m":1.003,"lateral_m":0.012,"uncertainty_m":0.005,"scene":"room","speed_m_s":0.1,"split":"acceptance"}
 ```
 
-起终点窗口必须静稳（位置各轴跨度不超过 2 厘米），且处于同一 tracking 段。取位置均值，以起始窗口第一帧机身 X 轴的水平投影定义前向；报告前向、横向及水平向量误差。时间倒退、段重置、失跟、采样间隙超过 0.5 秒、无有效窗口均判为无效，不从报告中剔除。**一个 CSV 对应一次试验**，任何时刻记录的 lost 都使整份记录无效，包括终点之后才到达的诊断；不能截掉故障尾部或将同一 CSV 拆成多次验收。
+起终点窗口必须各有至少 5 个样本、实际采样跨度至少 0.5 秒；位置各轴跨度不超过 2 厘米，首末样本各轴平均漂移速度不超过 0.01 米/秒，且处于同一 tracking 段。单点或零宽窗口不能证明静稳。取位置均值，以起始窗口第一帧机身 X 轴的水平投影定义前向；报告前向、横向及水平向量误差。时间倒退、段重置、失跟、采样间隙超过 0.5 秒、无有效窗口均判为无效，不从报告中剔除。**一个 CSV 对应一次试验**，任何时刻记录的 lost 都使整份记录无效，包括终点之后才到达的诊断；不能截掉故障尾部或将同一 CSV 拆成多次验收。
 
 验收需至少 20 次独立验收试次、至少两个场景，每次真实前向位移在 0.9–1.1 米范围，全部有效且 `abs(前向误差)+测量不确定度 ≤0.05m`。其他距离仍可评估，但不作为一米精度通过的依据。误差区间跨边界则为 inconclusive。还须人工核查真实测量、独立留出数据、不同朝向及拟使用速度覆盖；JSON 中的 measured 是来源声明，不是对实测真实性的自动认证。该报告不验证自动行走的制动精度。
 
@@ -66,7 +66,7 @@ ros2 launch /absolute/path/to/experiments/bumi_odometry/pipeline.launch.py \
 
 RTAB-Map 不使用 IMU，输出 6D 位姿；EKF 融合视觉位姿和三轴角速度，禁用线加速度积分。RGB/深度按源时间近似配对，上限 20 毫秒，须实测配对延迟；图像订阅采用 best effort，兼容传感器 QoS。TF frame 使用 `bumi_odom_` 前缀，实验又以 DDS 域隔离。
 
-`quality.py` 对原始视觉位姿、视觉诊断、IMU 及滤波位姿检查时间/有效性。消息超时 0.5 秒、时钟倒退、视觉失跟、距离累计量回退等使 lost 状态锁存，并立即刷盘一条带故障源时间的 lost 行，不依赖 EKF 是否继续输出。每次试验必须重新启动质量进程并使用新 CSV，不允许在同次试验中恢复为 tracking。输出文件使用独占创建，拒绝覆盖既有数据。终点静稳后继续记录至少 1 秒，并确认视觉位姿和诊断均已覆盖所选终点时刻后再结束采集；异常退出或未收齐诊断的录包不能作为有效验收数据。
+`quality.py` 对原始视觉位姿、视觉诊断、IMU 及滤波位姿检查时间/有效性。视觉、IMU、滤波位姿或诊断消息超时 0.5 秒、时钟倒退、视觉失跟、距离累计量回退等使 lost 状态锁存，并立即刷盘一条带故障源时间的 lost 行，不依赖 EKF 是否继续输出。每次试验必须重新启动质量进程并使用新 CSV，不允许在同次试验中恢复为 tracking。输出文件使用独占创建，拒绝覆盖既有数据。终点静稳后继续记录至少 1 秒，并确认视觉位姿和诊断均已覆盖所选终点时刻后再结束采集；异常退出或未收齐诊断的录包不能作为有效验收数据。
 
 ## 录包与回放（ROS 集成尚待验证）
 

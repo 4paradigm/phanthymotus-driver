@@ -1232,3 +1232,102 @@ def test_rotation_action_ids_stay_unique_with_frozen_wall_clock(monkeypatch):
     second = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 0})
     wait_rotate(plugin)
     assert first['action_id'] != second['action_id']
+
+
+@pytest.mark.parametrize('angle,gyro', [(360, 0.0), (-360, 0.5)])
+def test_frozen_cruise_feedback_brakes_before_request_timeout(monkeypatch, angle, gyro):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl(gain_deg_per_tick=0)
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    clock = [0.0]
+    monkeypatch.setattr(module, 'time', types.SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+    monkeypatch.setattr(plugin, '_read_rotate_imu', lambda: (0.0, gyro))
+    result = plugin._do_rotate_impl({'angle_deg': angle})
+    assert result['state'] == 'error'
+    assert 'progress' in result['error']
+    assert result['elapsed_s'] < 3.0
+    assert fake.cmds[-1] == (0, 0, 0)
+    assert any(cmd[2] != 0 for cmd in fake.cmds)
+
+
+@pytest.mark.parametrize('tool,action,method', [
+    ('stand_up_lie_prone', 'lie_prone', '_do_posture_action'),
+    ('semantic_action', 'reset', '_do_preset_action'),
+    ('action_recording', 'start_recording', '_do_teaching_action'),
+])
+def test_competing_action_reserves_chassis_until_handler_returns(monkeypatch, tool, action, method):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    entered, release = threading.Event(), threading.Event()
+
+    def handler(*args):
+        entered.set()
+        assert release.wait(3)
+        return {'state': 'completed'}
+
+    monkeypatch.setattr(plugin, method, handler)
+    worker = threading.Thread(target=lambda: plugin.dispatch(action, {'_tool_name': tool}))
+    worker.start()
+    try:
+        assert entered.wait(2)
+        result = plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 30})
+        assert result['state'] == 'error'
+        assert 'action_id' not in result
+        assert plugin.is_moving()
+        assert fake.cmds == []
+    finally:
+        release.set()
+        worker.join(3)
+        plugin._stop_move()
+        plugin.stop()
+
+
+def test_competing_action_waits_for_unpublished_rotation_worker(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    accepted, release, body_entered, command_sent = (threading.Event() for _ in range(4))
+    preflight = plugin._rotate_preflight
+
+    def blocked_preflight(args):
+        accepted.set()
+        assert release.wait(3)
+        return preflight(args)
+
+    monkeypatch.setattr(plugin, '_rotate_preflight', blocked_preflight)
+    monkeypatch.setattr(plugin, '_preempt_servo', lambda reason: body_entered.set() or False)
+    monkeypatch.setattr(plugin, '_do_preset_action', lambda action: command_sent.set() or {'state': 'completed'})
+    rotate = threading.Thread(target=lambda: plugin.dispatch(
+        'rotate', {'_tool_name': 'loco_destination', 'angle_deg': 30}))
+    body = threading.Thread(target=lambda: plugin.dispatch('reset', {'_tool_name': 'semantic_action'}))
+    rotate.start()
+    try:
+        assert accepted.wait(2)
+        body.start()
+        assert body_entered.wait(2)
+        assert not command_sent.wait(0.05)
+        assert plugin._rotate_stop_event.is_set()
+    finally:
+        release.set()
+        rotate.join(3)
+        if body.ident is not None:
+            body.join(3)
+        plugin.stop()
+    assert command_sent.is_set()
+    assert all(cmd == (0, 0, 0) for cmd in fake.cmds)
+
+
+def test_competing_action_reservation_released_after_exception(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+
+    def failure(action):
+        raise RuntimeError('action failure')
+
+    monkeypatch.setattr(plugin, '_do_preset_action', failure)
+    with pytest.raises(RuntimeError, match='action failure'):
+        plugin.dispatch('reset', {'_tool_name': 'semantic_action'})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_destination', 'angle_deg': 0})
+    assert wait_rotate(plugin)['state'] == 'done'

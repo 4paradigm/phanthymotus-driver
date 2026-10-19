@@ -92,7 +92,7 @@ ros2 topic hz /bumi_odom/visual
 
 ## 5. 生成误差报告
 
-CSV 第一列是 ROS 纳秒时间。按预先约定的静稳窗口选取规则，分别填写起点、终点窗口的 `[开始纳秒,结束纳秒]`；不是从程序启动起算的秒数。不要挑选误差最小的窗口。可用文本/表格查看 CSV 的 tracking 段来确定窗口；每轴位置跨度超过 2 厘米会被拒绝。
+CSV 第一列是 ROS 纳秒时间。按预先约定的静稳窗口选取规则，分别填写起点、终点窗口的 `[开始纳秒,结束纳秒]`；不是从程序启动起算的秒数。不要挑选误差最小的窗口。可用文本/表格查看 CSV 的 tracking 段来确定窗口；每个窗口至少 5 个样本、实际采样跨度至少 0.5 秒；每轴位置跨度超过 2 厘米或首末样本平均漂移速度超过 0.01 米/秒会被拒绝。不能选单点/零宽窗口。
 
 在 measurements 中为每次试验保存 `trial-001.json`，格式见 [README 真值示例](README.md#本地距离评估)。其中 trial_id 与 manifest 一致，forward_m/lateral_m 填独立测量，scene 填场景，speed_m_s 填所用速度并注明来源，调参阶段 split 为 development，冻结参数后的留出试次为 acceptance。
 
@@ -102,7 +102,7 @@ CSV 第一列是 ROS 纳秒时间。按预先约定的静稳窗口选取规则�
 {"data_source":"measured","trials":[{"trial_id":"trial-001","samples":"trial-001.csv","truth":"trial-001.json"}]}
 ```
 
-每做一次都把该次加入 trials，包括失败试次；不能只录入成功数据。随后运行：
+每做一次都把该次加入 trials，包括失败试次；不能只录入成功数据，也不能用不同编号/场景重复引用同一个 CSV（包括链接或相对路径别名）。随后运行：
 
 ```sh
 python3 experiments/bumi_odometry/evaluate.py \

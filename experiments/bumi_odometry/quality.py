@@ -23,7 +23,7 @@ class TrackingQuality:
         self.reason = self.reason or reason
 
     def update(self, kind, stamp_ns, received_ns, segment_id, valid):
-        if kind not in ("visual", "imu"):
+        if kind not in ("visual", "imu", "filtered"):
             raise ValueError("unknown source")
         previous = self.samples.get(kind)
         if (not valid or not segment_id or
@@ -44,7 +44,7 @@ class TrackingQuality:
             self.invalidate("sensor stream stale")
         if self.reason:
             return "lost"
-        return "tracking" if len(self.samples) == 2 else "initializing"
+        return "tracking" if len(self.samples) == 3 else "initializing"
 
 
 class TrialCSV:
@@ -100,7 +100,6 @@ def main():
             self.segment = uuid.uuid4().hex
             self.info = None
             self.info_distance = None
-            self.filtered_stamp = None
             self.output = TrialCSV(stream, self.segment)
             self.stream = stream
             self.publisher = self.create_publisher(String, "status", 10)
@@ -160,10 +159,7 @@ def main():
 
         def filtered(self, msg):
             now, source = self.now(), stamp(msg)
-            if (not pose_valid(msg) or now - source > 500_000_000 or source - now > 50_000_000 or
-                    (self.filtered_stamp is not None and source <= self.filtered_stamp)):
-                self.guard.invalidate("invalid filtered pose")
-            self.filtered_stamp = source
+            self.guard.update("filtered", source, now, self.segment, pose_valid(msg))
             p, q = msg.pose.pose.position, msg.pose.pose.orientation
             self.output.pose(source, [p.x, p.y, p.z, q.x, q.y, q.z, q.w], self.record_fault(source))
 

@@ -461,7 +461,9 @@ measures where the robot really turned instead.
   degree initially, then adjusted from measured response, always clamped
   to 0.12–0.30 s; zero-command observation at least 0.3 s;
   arrival tolerance ±2°; settle |wz| ≤ 0.1 rad/s; timeout
-  `min(75, 10 + |angle_deg|/5)` seconds.
+  `min(75, 10 + |angle_deg|/5)` seconds. Cruise additionally requires at least 1° of measured progress in the requested direction every 2 seconds; otherwise it brakes and returns an error (feedback loss or a stalled chassis).
+
+Posture, semantic and teaching requests reserve the chassis across preparation, command dispatch and confirmation. They cancel an existing rotation and wait for its reservation/worker to resolve before changing modes; a new move or rotate is refused during that reservation. Failure to stop rotation within 6 seconds rejects the competing action without sending it.
 - No distance feedback: the card consumes IMU heading only and reports
   angles, never meters. Distance feedback is not part of this card today.
 

@@ -151,6 +151,8 @@ _ROTATE_OBSERVE_S = 0.30
 _ROTATE_OBSERVE_SPREAD_DEG = 0.5
 _ROTATE_MIN_PROGRESS_DEG = 0.1
 _ROTATE_NO_PROGRESS_LIMIT = 3
+_ROTATE_CRUISE_PROGRESS_DEG = 1.0
+_ROTATE_CRUISE_PROGRESS_TIMEOUT_S = 2.0
 _ROTATE_VYAW_SIGN = 1.0
 _ROTATE_ANGLE_LIMIT_DEG = 360.0
 
@@ -365,6 +367,7 @@ class LocoPlugin:
         self._rotate_lock = threading.Lock()
         self._rotate_stop_event = threading.Event()
         self._rotate_state: dict = {"state": "idle", "last_result": None}
+        self._body_action: str | None = None
         # ACP async completion for rotate: worker thread + the single active
         # action whose terminal callback fires exactly once.
         self._rotate_worker: threading.Thread | None = None
@@ -387,7 +390,7 @@ class LocoPlugin:
         """
         thread = self._move_thread
         return bool((thread is not None and thread.is_alive())
-                    or self._rotate_state["state"] == "running")
+                    or self._rotate_state["state"] == "running" or self._body_action)
 
     def publish_velocity(self, x: float, y: float, z: float) -> None:
         """One normalised velocity command, through this plugin's rate limiter.
@@ -603,23 +606,27 @@ class LocoPlugin:
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
+        self._wait_for_rotate_idle()
+
+    def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
         # Cover the dispatch-acceptance window: stop may land after the
         # reservation (state=running) but before the worker thread exists
         # (mid-preflight, or between assigning _rotate_worker and start()).
         # Loop until the worker shows up, then join it; if the reservation
         # resolves to a sync refusal (state flips idle, no worker), no ACP
         # action was ever opened and there is nothing to join.
-        deadline = time.monotonic() + 6
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             with self._rotate_lock:
                 state_running = self._rotate_state["state"] == "running"
                 worker = self._rotate_worker
             if not state_running:
-                return
+                return True
             if worker is not None and worker.is_alive():
-                worker.join(timeout=max(0.0, deadline - time.monotonic()))
-                return
-            time.sleep(0.01)   # accepted but worker not yet started
+                worker.join(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+            else:
+                time.sleep(0.01)   # accepted but worker not yet started
+        return False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -659,11 +666,27 @@ class LocoPlugin:
         # policy's next one race, and which one the robot ends up obeying
         # depends on timing nobody controls. Every action reachable from here
         # moves the body, so every one of them preempts.
-        preempted = self._preempt_servo(f"{tool_name}.{action}")
-        result = handler()
-        if preempted and isinstance(result, dict):
-            result["preempted_loco_servo"] = True
-        return result
+        body_action = tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording")
+        if body_action:
+            with self._rotate_lock:
+                if self._body_action:
+                    return {"state": "error", "command_sent": False,
+                            "error": f"chassis reserved by {self._body_action}"}
+                self._body_action = f"{tool_name}.{action}"
+                self._rotate_stop_event.set()
+        try:
+            preempted = self._preempt_servo(f"{tool_name}.{action}")
+            if body_action and not self._wait_for_rotate_idle():
+                return {"state": "error", "command_sent": False,
+                        "error": "rotation has not stopped; competing action was not sent"}
+            result = handler()
+            if preempted and isinstance(result, dict):
+                result["preempted_loco_servo"] = True
+            return result
+        finally:
+            if body_action:
+                with self._rotate_lock:
+                    self._body_action = None
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
                      *, cancel_event: threading.Event | None = None):
@@ -684,6 +707,8 @@ class LocoPlugin:
         # Reserve move startup until its worker exists, so rotate cannot
         # enter between the busy check and launching the move thread.
         with self._rotate_lock:
+            if self._body_action:
+                return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
             if self._rotate_state["state"] == "running":
                 return {
                     "state": "error",
@@ -781,6 +806,8 @@ class LocoPlugin:
         # to the bumi_rotate daemon thread, which records idle + the full
         # result and fires the ACP terminal exactly once.
         with self._rotate_lock:
+            if self._body_action:
+                return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
             if self._rotate_state["state"] == "running":
                 return {
                     "state": "error",
@@ -975,6 +1002,8 @@ class LocoPlugin:
             no_progress = 0
             observed_errors = []
             still = 0
+            cruise_last_progress = None
+            cruise_progress_deg = 0.0
             while True:
                 if self._rotate_stop_event.is_set():
                     result_state = "stopped"
@@ -1009,6 +1038,18 @@ class LocoPlugin:
                 else:
                     still = 0
                 if stage == "cruise" and abs(err) > _ROTATE_CRUISE_EXIT_DEG:
+                    now = time.monotonic()
+                    progress = math.copysign(1.0, angle_deg) * turned_deg
+                    if (cruise_last_progress is None
+                            or progress - cruise_progress_deg >= _ROTATE_CRUISE_PROGRESS_DEG):
+                        cruise_last_progress, cruise_progress_deg = now, progress
+                    elif now - cruise_last_progress >= _ROTATE_CRUISE_PROGRESS_TIMEOUT_S:
+                        return {"state": "error", "error":
+                                "no yaw progress during cruise; feedback lost or chassis stalled",
+                                "requested_angle_deg": angle_deg, "turned_deg": turned_deg,
+                                "final_error_deg": angle_deg - turned_deg,
+                                "elapsed_s": now - start_time,
+                                "tolerance_deg": _ROTATE_TOL_DEG}
                     # Cruise: full speed toward the sub-target (err signs the
                     # direction; _ROTATE_VYAW_SIGN stays the axis calibration).
                     self._publish_cmd(0.0, 0.0,
@@ -1301,21 +1342,13 @@ class LocoPlugin:
 
     def _prepare_workmode(self, target_mode: int, requested_action: str) -> dict:
         """Automatically reach ready(1) or walking(2) through documented steps."""
-        # I-A: a posture/semantic/teaching change cancels an in-flight
-        # loco_destination rotate the same way this path already stops move —
-        # worker exits "stopped" → ACP "cancelled" → zero brake, instead of
-        # workmode edges racing a bumi_rotate still streaming vyaw. The set
-        # takes _rotate_lock so it cannot land inside a concurrent dispatch's
-        # reservation window (busy-check → clear) and be wiped by that clear;
-        # the join runs after the lock is released (the worker's finally
-        # needs it) and waits out the brake, so no two command streams
-        # overlap. The 1s cap mirrors move: even if the ACP notify is slow,
-        # the motion has already braked to zero by then.
+        # Public dispatch owns the chassis until its action handler returns.
+        # Also wait through a rotation's acceptance window before mode edges.
         with self._rotate_lock:
             self._rotate_stop_event.set()
-            worker = self._rotate_worker
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=1)
+        if not self._wait_for_rotate_idle():
+            return {"state": "error", "command_sent": False,
+                    "error": "rotation has not stopped; workmode was not changed"}
 
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():

@@ -8,6 +8,9 @@ from statistics import mean
 
 TOLERANCE_M = 0.05
 MAX_GAP_NS = 500_000_000
+ENDPOINT_MIN_SAMPLES = 5
+ENDPOINT_MIN_SPAN_NS = 500_000_000
+ENDPOINT_MAX_DRIFT_MPS = 0.01
 
 
 def _finite(values, size):
@@ -61,11 +64,17 @@ def _window(samples, bounds):
     rows = [row for row in samples if bounds[0] <= row["stamp_ns"] <= bounds[1]]
     if not rows:
         raise ValueError("empty endpoint window")
+    span_ns = rows[-1]["stamp_ns"] - rows[0]["stamp_ns"]
+    if len(rows) < ENDPOINT_MIN_SAMPLES or span_ns < ENDPOINT_MIN_SPAN_NS:
+        raise ValueError("endpoint needs at least 5 samples spanning 0.5 seconds")
     # Endpoint samples must be stable; averaging a moving window biases the reference.
     positions = [_position(row) for row in rows]
     if any(max(p[i] for p in positions) - min(p[i] for p in positions) > 0.02
            for i in range(3)):
         raise ValueError("endpoint window is not stationary")
+    if any(abs(positions[-1][i] - positions[0][i]) / (span_ns / 1e9)
+           > ENDPOINT_MAX_DRIFT_MPS + 1e-12 for i in range(3)):
+        raise ValueError("endpoint window is moving")
     return tuple(mean(p[i] for p in positions) for i in range(3)), _quaternion(rows[0])
 
 
@@ -152,12 +161,17 @@ def evaluate_manifest(path):
     path = Path(path)
     manifest = json.loads(path.read_text())
     trials = []
+    recordings = set()
     for item in manifest["trials"]:
         try:
+            recording = (path.parent / item["samples"]).resolve()
+            if recording in recordings:
+                raise ValueError("duplicate sample recording")
+            recordings.add(recording)
             reference = json.loads((path.parent / item["truth"]).read_text())
             if reference["trial_id"] != item["trial_id"]:
                 raise ValueError("manifest and truth trial_id differ")
-            with (path.parent / item["samples"]).open(newline="") as stream:
+            with recording.open(newline="") as stream:
                 rows = list(csv.DictReader(stream))
             trials.append(evaluate_trial(rows, reference))
         except (OSError, ValueError, KeyError, TypeError) as exc:
