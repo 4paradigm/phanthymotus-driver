@@ -13,6 +13,37 @@ baudrate: 115200
 response_timeout_s: 0.5
 
 plugins:
+  hand_gesture:
+    enabled: true
+    motion_speed: 85
+    count_speed: 85
+    thumb_speed_scaling: true
+    motion_torque: 100
+    motion_timeout_s: 8.0
+    position_tolerance: 6
+    poll_interval_s: 0.2
+    # Both hands were checked by the operator. Recalibrate on other hardware.
+    # Order: thumb root/sway, index/middle/ring/pinky root,
+    # index/ring/pinky sway, thumb roll. Raw values 0..255, not angles.
+    right_poses: &gesture_poses
+      ok_gesture: [132, 28, 123, 255, 255, 255, 128, 128, 128, 255]
+      thumb_up_gesture: [255, 255, 0, 0, 0, 0, 128, 128, 128, 255]
+      v_sign_gesture: [0, 255, 255, 255, 0, 0, 128, 128, 128, 255]
+      grasp_prep: [255, 0, 255, 255, 255, 255, 128, 128, 128, 255]
+      grasp_target: [0, 0, 0, 0, 0, 0, 128, 128, 128, 255]
+    left_poses: *gesture_poses
+    right_number_poses: &number_poses
+      0: [93, 255, 0, 0, 0, 0, 128, 128, 128, 255]
+      1: [0, 255, 255, 0, 0, 0, 128, 128, 128, 255]
+      2: [0, 255, 255, 255, 0, 0, 128, 128, 128, 255]
+      3: [0, 255, 255, 255, 255, 0, 128, 128, 128, 255]
+      4: [0, 255, 255, 255, 255, 255, 128, 128, 128, 255]
+      5: [255, 255, 255, 255, 255, 255, 128, 128, 128, 255]
+      6: [255, 255, 0, 0, 0, 255, 128, 128, 128, 255]
+      7: [131, 32, 110, 110, 0, 0, 128, 128, 128, 218]
+      8: [255, 255, 255, 0, 0, 0, 128, 128, 128, 255]
+      9: [0, 255, 142, 0, 0, 0, 128, 128, 128, 255]
+    left_number_poses: *number_poses
   hand:
     enabled: true
     # Legacy unbound single-card mode: auto-select the sole hand on serial_port.

@@ -12,6 +12,7 @@ COPY common/       /work/common/
 COPY main.py       /work/main.py
 COPY modbus_client.py /work/modbus_client.py
 COPY modbus_device.py /work/modbus_device.py
+COPY gesture_device.py /work/gesture_device.py
 COPY config.yaml   /work/config.yaml
 COPY deploy/       /deploy/
 

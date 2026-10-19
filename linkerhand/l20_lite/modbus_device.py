@@ -508,7 +508,13 @@ class HandPlugin:
 
 def build_plugins(config: dict, _namespace: str, _ros2) -> list:
     hand_config = config.get("plugins", {}).get("hand", {})
-    return [MultiHandPlugin(config, hand_config)] if hand_config.get("enabled", True) else []
+    hand = MultiHandPlugin(config, hand_config)
+    plugins = [hand] if hand_config.get("enabled", True) else []
+    gesture_config = config.get("plugins", {}).get("hand_gesture", {})
+    if gesture_config.get("enabled", False):
+        from gesture_device import GesturePlugin
+        plugins.append(GesturePlugin(hand, gesture_config))
+    return plugins
 
 
 class MultiHandPlugin:

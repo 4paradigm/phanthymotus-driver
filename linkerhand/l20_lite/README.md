@@ -131,3 +131,38 @@ must still recheck that the hand and its surroundings are safe before running
 another motion. With automatic detection enabled, each motion action
 checks for the sole responding hand on the configured serial port before
 sending a motion command.
+
+## Separate `hand_gesture` card (local development)
+
+`driver.yaml` also registers `hand_gesture` as an independent actuator card.
+It adds the six motions from the 2026-10-19 colleague prototype without
+changing the existing `hand` actions: `ok_gesture`, `thumb_up_gesture`
+(the prototype named this `thumbs_up_gesture`), `v_sign_gesture`, `count`,
+`grasp`, and `custom_grasp`. Both hands were physically checked by the
+operator, and `config.yaml` keeps an explicit pose table for each side.
+Do not use those tables on a different hand without recalibration.
+
+Drag `hand_gesture` onto the canvas, choose `bound_side` in its instance
+configuration, and use `info` to verify the detected hand and USB path.
+With only one connected hand, an unbound card can auto-select it; with zero
+or two hands it requires a binding. Each motion request requires the boolean
+`confirm_motion: true` after checking that the hand and its surroundings are
+clear. Missing confirmation or an uncalibrated side is rejected before a
+position command. Motion returns `state=running` and an `action_id` and reports
+completion through ACP. `stop` cancels a gesture and releases torque.
+
+`count` accepts start/end integers 0–9 (defaults 1–5) and a 0.2–5-second
+per-number hold time. `grasp` offers `soft`, `standard`, and `firm` with raw
+torque limits 30, 85, and 160; `custom_grasp` accepts a raw 1–255 limit.
+The optional `speed_ratio` is 1.0x–3.0x, capped at 255. Simple gestures and
+count release torque at completion unless `hold_torque=true`; grasp holds
+unless `hold_torque=false`. Contact detection is inferred from position
+stall only: there is no tactile sensor or verified force measurement, so
+these options do **not** guarantee an object will not be squeezed or dropped.
+
+The new gesture implementation lives in `gesture_device.py` and shares the
+existing driver's USB discovery and serial bus lock. The hand card's
+`modbus_device.py` implementation and its original configuration remain
+unchanged apart from loading this additional plugin. Run offline checks with
+`python3 -m pytest tests/test_linkerhand_l20_lite_gesture.py -q`; these checks
+do not move hardware.

@@ -11,3 +11,4 @@ build_context_extras:
   - ../../common
 cards:
   - { name: hand, type: actuator }
+  - { name: hand_gesture, type: actuator }
