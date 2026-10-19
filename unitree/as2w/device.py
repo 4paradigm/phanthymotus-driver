@@ -316,6 +316,14 @@ class _StateNode:
         100.2 ms = 9.998 Hz with about two readings per window, which is what
         the interface declares.
 
+        The next due time is the previous *due* time plus the interval, not
+        "now + interval": the worker only wakes every 16.7 ms, so restarting the
+        clock from the moment of publishing added that lateness to every period
+        and measured 8.97 Hz on the robot (2026-10-15, release a1ae60f, 255
+        intervals). Only when the worker has fallen more than one interval
+        behind does the schedule restart from now, so a stall is not repaid with
+        a burst of samples.
+
         Runs on the publisher worker, after loco/state has already gone out, so
         an odom failure can never reach the other port.
         """
@@ -323,9 +331,10 @@ class _StateNode:
             return
         try:
             now = time.monotonic()
-            if now - self._last_odom_time < self._ODOM_INTERVAL:
+            due = self._last_odom_time + self._ODOM_INTERVAL
+            if now < due:
                 return
-            self._last_odom_time = now
+            self._last_odom_time = due if now - due < self._ODOM_INTERVAL else now
             with self._latest_lock:
                 sport = self._latest_sport
             if sport is None:

@@ -1673,6 +1673,34 @@ class TestDriverContracts(unittest.TestCase):
             node._maybe_publish_odom()
         self.assertEqual(2, len(published))
 
+    def test_odom_rate_does_not_drift_below_10_hz_on_a_60_hz_worker(self):
+        """Measured 8.97 Hz when the clock restarted from each publish."""
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        clock = {"now": 1000.0}
+        with patch.object(self.device.time, "monotonic", lambda: clock["now"]):
+            node._maybe_publish_odom()           # first sample, schedule starts
+            published.clear()
+            for _ in range(int(10.0 / 0.0187)):  # 16.7 ms tick + 2 ms loop cost
+                clock["now"] += 0.0187
+                node._maybe_publish_odom()
+        self.assertGreaterEqual(len(published), 97)
+        self.assertLessEqual(len(published), 101)
+
+    def test_odom_stall_is_not_repaid_with_a_burst(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        clock = {"now": 1000.0}
+        with patch.object(self.device.time, "monotonic", lambda: clock["now"]):
+            node._maybe_publish_odom()
+            published.clear()
+            clock["now"] += 5.0                  # the worker was stalled
+            for _ in range(3):
+                node._maybe_publish_odom()       # same instant: one sample only
+        self.assertEqual(1, len(published))
+
     def test_quaternion_yaw_reads_wxyz_and_rejects_junk(self):
         math = __import__("math")
         one_rad = [math.cos(0.5), 0.0, 0.0, math.sin(0.5)]
