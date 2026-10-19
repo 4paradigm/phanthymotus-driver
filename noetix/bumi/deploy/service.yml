@@ -8,6 +8,8 @@ noetix-bumi:
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
+    # librealsense needs host udev metadata to enumerate the D435i HID IMU.
+    - /run/udev:/run/udev:ro
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
     - ROS_DOMAIN_ID=42

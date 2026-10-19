@@ -7,6 +7,7 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
+ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
 RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
@@ -34,6 +35,21 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         libssl-dev \
         libeigen3-dev \
         libboost-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Distance control's runtime is part of the reviewed image, not an optional
+# manual install. No GUI tools or recommended packages are required.
+RUN curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        -o /usr/share/keyrings/ros2-runtime.gpg && \
+    printf 'deb [arch=%s signed-by=/usr/share/keyrings/ros2-runtime.gpg] %s jammy main\n' \
+        "$(dpkg --print-architecture)" "${ROS_APT_MIRROR}" > /etc/apt/sources.list.d/ros2-runtime.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ros-humble-realsense2-camera \
+        ros-humble-rtabmap-odom \
+        ros-humble-robot-localization \
+        ros-humble-tf2-ros && \
+    dpkg-query -W 'ros-humble-realsense2*' 'ros-humble-rtabmap*' \
+        'ros-humble-robot-localization' > /work/fusion-package-versions.txt && \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
@@ -84,12 +100,17 @@ COPY device.py /work/device.py
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
 COPY distance_control.py /work/distance_control.py
+COPY camera_runtime.py fusion_runtime.py /work/
 COPY camera_specs.py /work/camera_specs.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
+
+# Missing binaries, message modules, or runtime imports must fail the build.
+# This check never opens the camera or starts ROS nodes.
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 /work/fusion_runtime.py --check-dependencies'
 
 # Add SDK DDS libs + pybind modules to paths
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}

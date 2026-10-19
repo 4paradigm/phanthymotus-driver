@@ -1,6 +1,8 @@
 # 自行真机验证：固定相机、约一米前进
 
-本说明针对 PR #408 的 `feat/bumi-loco-destination` 分支。里程计是独立实验，不会因部署 `loco_destination` 卡片就自动运行；相机与融合进程仍需按本说明单独启动。`loco_destination` 的 `move` 动作现已只读订阅 `/bumi_odom/filtered` 与 `/bumi_odom/status`：驱动与融合进程必须处于同一 ROS domain（本实验默认 `ROS_DOMAIN_ID=185`，驱动部署 domain 不同的须显式对齐，否则 `move` 同步报"反馈不可用"）。菜单中的新 `move` 参数在驱动重新部署后需刷新/重新添加卡片才会显示。ROS 链路尚未真机验证，软件测试不代表达到 ±5 cm 实际精度；先做环境检查，不直接进行二十次行走。
+本说明针对 PR #408 的 `feat/bumi-loco-destination` 分支。审核镜像现在默认打包并自动启动共享相机和融合，继承驱动 ROS domain 42；正常使用距离移动不需要执行下面的独立实验安装/启动步骤，也不要再启动第二个相机 pipeline。默认距离参考点为固定相机原点，初始静止一秒用于重力初始化；`initializing` 状态会说明等待原因，进入 `tracking` 后可在卡片选择 `move`、`distance_m=1`。保留旧卡片时若菜单缓存未更新，刷新/重新添加卡片。软件测试不代表达到 ±5cm 物理精度。
+
+下面的独立实验仍用于离线采集、重放和指定机身 P 点的外参测量，默认隔离域185。只有明确停用受管融合、协调相机使用后才运行实验采集；生产使用不需要测量或填写本实验的 mount.json。两个模式不要同时发布同名融合话题。审核镜像的受管流程及状态见 [Bumi README](../../noetix/bumi/README.md#loco_destination)。
 
 `loco_destination` 使用自己的闭环线程直接发送 SDK 运动指令，不通过 `loco_servo` 执行，也不依赖它启用。旋转与距离 `move` 仅共享底盘互斥保护：任一目标动作运行时暂停已有流式控制并拒绝并发目标动作，避免同时写速度。
 

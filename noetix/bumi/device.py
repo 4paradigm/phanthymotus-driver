@@ -2222,158 +2222,6 @@ class SpeakerPlugin:
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
 
-def _camera_subprocess(namespace: str):
-    """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
-    # Match the Q5 camera worker's child-process logging protection.
-    # Idempotent when the launcher has already installed it before importing device.
-    from common import logsafe
-    logsafe.install(check_fd=False)
-
-    import time as _time
-    import numpy as _np
-
-    import rclpy as _rclpy
-    from rclpy.node import Node as _Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from sensor_msgs.msg import CompressedImage as _CompressedImage
-    from sensor_msgs.msg import Image as _SensorImage
-
-    _QOS = QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=1,
-        durability=DurabilityPolicy.VOLATILE,
-    )
-
-    import pyrealsense2 as rs
-    import cv2
-
-    # Try turbojpeg for faster encoding, fallback to cv2
-    try:
-        from turbojpeg import TurboJPEG, TJPF_BGR
-        _tj = TurboJPEG()
-        def encode_jpeg(bgr_image):
-            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
-        print("[camera_subprocess] using TurboJPEG encoder", flush=True)
-    except Exception:
-        def encode_jpeg(bgr_image):
-            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            return buf.tobytes()
-        print("[camera_subprocess] using cv2 JPEG encoder", flush=True)
-
-    _rclpy.init()
-    node = _Node("bumi_camera_sub")
-    color_topic = f"/{namespace}/camera/color"
-    depth_topic = f"/{namespace}/camera/depth"
-    color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
-    depth_pub = node.create_publisher(_CompressedImage, depth_topic, _QOS)
-
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-
-    try:
-        pipeline.start(config)
-    except Exception as e:
-        print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
-        return
-
-    # VOP detects objects in the RGB image, while navi samples the depth map at
-    # those RGB pixel coordinates.  D435i color and depth come from different
-    # lenses, so equal resolutions alone do not make their pixels correspond.
-    # Register every depth frame onto the color optical plane before publishing
-    # it; the resulting depth image consequently uses the color intrinsics and
-    # camera identity declared by camera_specs.py.
-    align_to_color = rs.align(rs.stream.color)
-
-    print(f"[camera_subprocess] publishing color→{color_topic} "
-          f"depth-aligned-to-color→{depth_topic}", flush=True)
-
-    # **The camera knows its own optics; say so out loud.** navi's avoidance
-    # corridor is metric, so every frame it converts its half-width back into a
-    # range of image columns using the horizontal field of view — and a wrong
-    # value there does not raise anything, it makes the robot refuse doorways
-    # while the depth map reports clear ahead. The D435i reports real intrinsics
-    # for the exact profile that was negotiated, which is the only source that
-    # accounts for the 4:3 crop this driver asks the 16:9 RGB sensor for.
-    #
-    # Sent over stdout because the parent already forwards it: no second pipe,
-    # no file, and the line stays in `docker logs` where somebody debugging a
-    # wrong field of view will look first. See `camera_specs.INTRINSICS_MARKER`.
-    try:
-        import json as _json
-        _streams = {}
-        for _name, _stream in (("color", rs.stream.color),
-                               ("depth_sensor", rs.stream.depth)):
-            _intr = (pipeline.get_active_profile()
-                     .get_stream(_stream).as_video_stream_profile().intrinsics)
-            _streams[_name] = {
-                "width": _intr.width, "height": _intr.height,
-                "fx": _intr.fx, "fy": _intr.fy,
-                "ppx": _intr.ppx, "ppy": _intr.ppy,
-                "model": str(_intr.model).rsplit(".", 1)[-1],
-                "coeffs": list(_intr.coeffs),
-            }
-        # rs.align projects the depth samples onto the color image plane.  Its
-        # output grid therefore has the color profile's geometry, not the raw
-        # depth sensor's geometry.  Keep the latter in the diagnostic payload
-        # under depth_sensor, but advertise the actual published output here.
-        _streams["depth"] = dict(_streams["color"])
-        print("[camera_subprocess] INTRINSICS " + _json.dumps(_streams), flush=True)
-    except Exception as _e:
-        # Not fatal: the cards fall back to the datasheet-derived declaration in
-        # `camera_specs.SPECS` and say `source` accordingly. Losing the camera
-        # over a failed introspection call would be the worse trade.
-        print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
-
-    frame_count = 0
-    t_start = _time.monotonic()
-    try:
-        while True:
-            t0 = _time.monotonic()
-            frames = pipeline.wait_for_frames(timeout_ms=1000)
-            t_wait = _time.monotonic() - t0
-
-            frames = align_to_color.process(frames)
-
-            color_frame = frames.get_color_frame()
-            if color_frame:
-                color_image = _np.asanyarray(color_frame.get_data())
-                t1 = _time.monotonic()
-                jpeg_bytes = encode_jpeg(color_image)
-                t_enc = _time.monotonic() - t1
-                msg = _CompressedImage()
-                msg.header.stamp = node.get_clock().now().to_msg()
-                msg.format = "jpeg"
-                msg.data = jpeg_bytes
-                color_pub.publish(msg)
-
-            depth_frame = frames.get_depth_frame()
-            if depth_frame:
-                depth_image = _np.asanyarray(depth_frame.get_data())
-                import zlib as _zlib
-                compressed = _zlib.compress(depth_image.tobytes(), 1)
-                msg = _CompressedImage()
-                msg.header.stamp = node.get_clock().now().to_msg()
-                msg.format = "16UC1; compressedDepth zlib"
-                msg.data = compressed
-                depth_pub.publish(msg)
-
-            frame_count += 1
-            # Log every 300 frames (~15s at 20fps)
-            if frame_count % 300 == 0:
-                elapsed = _time.monotonic() - t_start
-                fps = frame_count / elapsed
-                print(f"[camera_subprocess] {frame_count} frames, {fps:.1f} fps, last: wait={t_wait*1000:.1f}ms enc={t_enc*1000:.1f}ms", flush=True)
-
-            _time.sleep(0.001)  # yield CPU
-    except Exception as e:
-        print(f"[camera_subprocess] error: {e}", flush=True)
-    finally:
-        pipeline.stop()
-
-
 class _CameraFrameNode(Node):
     """Caches the existing color JPEG stream for persistent vision capture."""
 
@@ -2436,7 +2284,8 @@ class CameraPlugin:
         self._namespace = namespace
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
-        self._proc: subprocess.Popen | None = None
+        self._runtime = None
+        self._fusion_enabled = bool(plugin_config.get("fusion_enabled", True))
         self._frame_node = _CameraFrameNode(self._color_topic)
         executor.add_node(self._frame_node)
         # What the RealSense reported about itself, keyed by stream name. Filled
@@ -2488,39 +2337,25 @@ class CameraPlugin:
         ]
 
     def start(self) -> None:
-        import sys
-        self._proc = subprocess.Popen(
-            [sys.executable, "-c",
-             # Protect import-time output as well as the child entry point.
-             "import sys; sys.path.insert(0, '/work'); "
-             "from common import logsafe; logsafe.install(check_fd=False); "
-             f"from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        def _fwd():
-            from camera_specs import parse_intrinsics_line
+        from camera_runtime import CameraRuntime
+        from camera_specs import parse_intrinsics_line
 
-            for line in self._proc.stdout:
-                text = line.decode(errors='replace').rstrip()
-                # Printed either way: the declaration is what the cards serve,
-                # but the line itself is what somebody debugging a wrong field
-                # of view will grep for in `docker logs`.
-                print(text, flush=True)
-                payload = parse_intrinsics_line(text)
-                if payload:
-                    with self._intrinsics_lock:
-                        self._intrinsics = payload
-                    print("[camera] adopted RealSense intrinsics for "
-                          + ", ".join(sorted(payload)), flush=True)
-        threading.Thread(target=_fwd, daemon=True).start()
+        def on_line(text):
+            print(text, flush=True)
+            payload = parse_intrinsics_line(text)
+            if payload:
+                with self._intrinsics_lock:
+                    self._intrinsics = payload
+        if self._runtime is None:
+            self._runtime = CameraRuntime(self._namespace, on_line, self._fusion_enabled)
+        self._runtime.start()
 
     def stop(self) -> None:
-        if self._proc:
-            self._proc.terminate()
-            self._proc = None
+        if self._runtime is not None:
+            self._runtime.stop()
 
     def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        return self._runtime is not None and self._runtime.is_running()
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
         return self._frame_node.wait_for_frame(after_sequence, timeout_s)

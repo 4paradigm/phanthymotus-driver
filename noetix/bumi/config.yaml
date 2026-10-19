@@ -44,6 +44,9 @@ plugins:
     enabled: true
   camera:
     enabled: true
+    # One capture node supplies the existing camera/depth cards and managed
+    # RGB-D/IMU distance feedback. Fusion failures do not stop camera output.
+    fusion_enabled: true
     # Bumi supports either official App video transfer or Phanthy's direct
     # camera/depth Cards. To use these Cards, the Bumi deployment enters the
     # host mount namespace and runs:

@@ -1,6 +1,6 @@
 # Bumi RGB-D / IMU 里程计实验
 
-独立实验，不发送运动命令。生产驱动镜像、旋转控制和声音识别实现无需因本实验修改。2026-10-19 起，`loco_destination` 的 `move` 动作会只读订阅本实验的 `/bumi_odom/filtered` 与 `/bumi_odom/status`：订阅是驱动侧集成，实验本身仍不启动相机/融合、不发送运动命令，且驱动与实验终端须处于同一 ROS domain。
+本目录保留独立采集/回放/评估工具，本身不发送运动命令。正常部署审核镜像时，生产驱动已默认管理共享相机与融合，无需运行本目录的实验 launcher；它输出卡片使用的 `/bumi_odom/filtered` 和 `/bumi_odom/status`，继承生产 domain 42。请勿同时启动独立相机或在同一域重复发布融合输出。生产入口见 [Bumi README](../../noetix/bumi/README.md#loco_destination)。本实验默认独立域185，仅在协调相机占用后用于离线验证。
 
 2026-10-19 按用户要求随原有 loco_destination PR #408 提交，实验运行仍保持独立。自行操作请先读 [真机测量与验证步骤](HARDWARE_TEST.md)。
 

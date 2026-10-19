@@ -475,12 +475,27 @@ measures where the robot really turned instead.
   `min(75, 10 + |angle_deg|/5)` seconds. Cruise/fine require at least 1° of measured progress in the requested direction every 2 seconds; otherwise they brake and return an error (feedback loss or a stalled chassis).
 
 Posture, semantic and teaching requests reserve the chassis across preparation, command dispatch and confirmation. They cancel an existing rotation and wait for its reservation/worker to resolve before changing modes; a new move or rotate is refused during that reservation. Failure to stop rotation within 6 seconds rejects the competing action without sending it.
-- Distance feedback for `move`: the card subscribes (read-only) to the
-  independent experiment's `/bumi_odom/filtered` (nav_msgs/Odometry) and
-  `/bumi_odom/status` (std_msgs/String) topics — it never starts the
-  camera or the fusion pipeline itself, and both topics must be in the
-  driver's ROS domain (experiments launched in a separate domain need an
-  explicit domain adjustment). Feedback must be a valid
+- Distance feedback for `move`: the reviewed driver image installs the
+  RealSense ROS, RTAB-Map and robot_localization dependencies and checks
+  their binaries/imports during the build. With `camera.enabled` and
+  `camera.fusion_enabled` (both default true), CameraPlugin starts one
+  RealSense owner, a compatibility bridge and an independently supervised
+  fusion process in the driver's ROS domain (42 by default). No manual
+  package install, experimental launcher or extrinsics JSON is needed.
+  Existing camera/depth topics, formats, source timestamps and frame cache
+  remain available to perception, photos and videos. Fusion failures do not
+  restart camera capture; it runs at 10 Hz, low priority, on at most two
+  available CPUs. The read-only `/run/udev` deployment mount supplies HID
+  enumeration metadata. The startup status explains which input is missing;
+  keep the fixed camera still for an initial one-second gravity window.
+  The default position reference is the fixed camera origin, with its initial
+  forward axis projected onto the gravity-level plane. This is a defined
+  camera reference, not a guessed camera-to-body calibration. Camera-internal
+  IMU/optical transforms come from the RealSense factory calibration.
+  RTAB-Map uses RGB-D only after gravity initialization; the EKF fuses its
+  pose with camera gyro rates, without integrating linear acceleration.
+  `/bumi_odom/filtered` (nav_msgs/Odometry) and `/bumi_odom/status`
+  (std_msgs/String) are the card's read-only inputs. Feedback must be a valid
   `bumi_odom_odom → bumi_odom_base_link` pose with fresh source and
   receipt timestamps (≤0.5 s), positive finite covariance, a `tracking`
   quality status and a stable segment; motion validates the same checks

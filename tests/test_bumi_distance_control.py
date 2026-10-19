@@ -42,6 +42,15 @@ def test_feedback_accepts_pose_and_quality(feedback):
     assert sample['segment_id'] == 'trial'
 
 
+def test_managed_fusion_wait_reason_is_reported(feedback):
+    result, clock = feedback
+    clock.ns += 10_000_000
+    result.update_status({'status': 'initializing', 'segment_id': 'trial',
+                          'stamp_ns': clock.ns, 'reason': 'waiting for stationary camera IMU'})
+    with pytest.raises(ValueError, match='waiting for stationary camera IMU'):
+        result.snapshot()
+
+
 @pytest.mark.parametrize('kind', ['source', 'receipt', 'quality'])
 def test_stale_feedback_is_rejected(feedback, kind):
     result, clock = feedback

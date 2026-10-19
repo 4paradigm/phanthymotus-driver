@@ -110,7 +110,7 @@ class DistanceFeedback:
                     elif stamp <= self.quality['stamp_ns']:
                         raise ValueError('quality timestamp reset')
                 self.quality = dict(segment_id=segment, stamp_ns=stamp,
-                                    status=data['status'], received=self.monotonic())
+                                    status=data['status'], reason=data.get('reason'), received=self.monotonic())
                 if data['status'] != 'tracking':
                     self.reason = self.reason or 'odometry quality is not tracking'
             except (ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -118,10 +118,13 @@ class DistanceFeedback:
 
     def snapshot(self):
         with self.lock:
+            if self.quality is not None and self.quality['status'] != 'tracking':
+                raise ValueError('distance feedback '+str(self.quality['status'])+': '
+                                 +str(self.quality['reason'] or 'waiting for fused camera odometry'))
             if self.reason:
                 raise ValueError(self.reason)
             if self.pose is None or self.quality is None:
-                raise ValueError('distance feedback unavailable: start RGB-D/IMU fusion in the driver ROS domain')
+                raise ValueError('distance feedback unavailable: managed camera/fusion is starting or failed; check driver logs')
             for sample in (self.pose, self.quality):
                 age = self.monotonic() - sample['received']
                 if age < 0 or age > 0.5 or not self._stamp_valid(sample['stamp_ns']):
