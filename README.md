@@ -134,7 +134,6 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `audio/pcm-16k` | Audio waveform | PCM audio visualizer with playback |
 | `video/mjpeg` | Video stream | Motion JPEG video display |
 | `image/jpeg` | Image | Static JPEG image |
-| `image/depth-z16` | Depth colormap | 16-bit depth image with color mapping |
 | `data/json` | Text / KV panel | JSON key-value display |
 | `text/*` | Text | Plain text display |
 | `sensor/skeleton` | 3D Skeleton | URDF-based 3D skeleton with joint rotation |
