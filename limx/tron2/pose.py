@@ -210,14 +210,23 @@ class Pose:
         if self.lock.locked():raise MoveError('正在审核另一条预设动作',False)
         async with self.lock:
             ticket=self.generation
+            ws,serial=self.reader.ws,self.reader.serial
+            def same_connection():
+                if not self.reader.connected or self.reader.ws is not ws or self.reader.serial!=serial:
+                    raise MoveError('预设审核期间连接已改变；请重新发起请求',False)
+            same_connection()
             await self.guard()
+            same_connection()
             if ticket!=self.generation:raise MoveError('预设审核已被停止请求取消',False)
             plan=await asyncio.to_thread(self.plan,dict(args))
+            same_connection()
             if ticket!=self.generation:raise MoveError('预设规划已被停止请求取消',False)
             async def stage_guard():
+                same_connection()
                 if ticket!=self.generation and (self.motion.active or {}).get('stage',0)==0:
                     raise MoveError('停止请求已取消预设首段',False)
                 await self.guard()
+                same_connection()
                 if ticket!=self.generation and (self.motion.active or {}).get('stage',0)==0:
                     raise MoveError('停止请求已取消预设首段',False)
                 if self.reset.load()[2]!=plan['pose_sha256']:

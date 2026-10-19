@@ -352,3 +352,16 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result['motion_sent'])
         with self.assertRaises(ValueError):self.adapter.call('pose',{'action':'start','joint':[0]*14})
         self.reader.send_movej.assert_not_awaited();self.assertIsNone(self.adapter.motion.active)
+
+    async def test_reconnection_during_admission_does_not_send_old_request_on_new_socket(self):
+        async def changed():self.reader.ws=types.SimpleNamespace(closed=False)
+        self.adapter.pose.guard.side_effect=changed
+        with self.assertRaises(MoveError):await self.adapter.pose.execute({'pose':'reset'})
+        self.reader.send_movej.assert_not_awaited();self.assertIsNone(self.adapter.motion.active)
+
+    async def test_reconnection_during_planning_does_not_replay_pending_request(self):
+        plan=self.compact_plan('reset')
+        def changed(args):self.reader.ws=types.SimpleNamespace(closed=False);return plan
+        with patch.object(self.adapter.pose,'plan',side_effect=changed):
+            with self.assertRaises(MoveError):await self.adapter.pose.execute({'pose':'reset'})
+        self.reader.send_movej.assert_not_awaited();self.assertIsNone(self.adapter.motion.active)
