@@ -8,6 +8,10 @@ from skeleton import skeleton_stream
 from vendor import MoveError, validate_movej
 
 ACP_TIMEOUT = 120
+POSE_ACP_TIMEOUT = 480
+POSE_GRIPPER_TIMEOUT = 30
+POSE_GUARD_BUDGET = 5
+POSE_ADMISSION_AND_REPORT_BUDGET = 32
 ARRIVAL_GRACE = 10
 TOLERANCE_DEG = 1
 STABILITY_DEG = .2
@@ -37,6 +41,7 @@ class ArmCompletion:
         self.closed = False
         self.peer = None
         self.peers = []
+        self.gripper_step = None
 
     def validate(self, target, duration):
         return validate_movej(target, duration)
@@ -52,7 +57,7 @@ class ArmCompletion:
 
     def summary(self):
         return ({**{key:self.active[key] for key in ('action_id','action','state')},
-                 **({k:self.active[k] for k in ('stage','completed_stages')} if 'sequence' in self.active else {}),
+                 **({k:self.active[k] for k in ('stage','completed_stages','stage_label','stage_kind')} if 'sequence' in self.active else {}),
                  **({k:self.active['details'][k] for k in ('motion_tool','preset','stages_total')} if 'sequence' in self.active else {})}
                 if self.active else self.last)
 
@@ -67,7 +72,7 @@ class ArmCompletion:
         for peer in peers:
             if peer.active and peer.active['state'] == 'reporting' and (peer.active.get('target_opening_verified') or peer.active.get('arrival_verified')):
                 await asyncio.shield(peer.task)
-        if any(peer.closed or peer.active or getattr(peer, 'recovering', False) or getattr(peer, 'waiting', None) for peer in peers):
+        if any(peer.closed or peer.active or getattr(peer,'pose_step',None) or getattr(peer, 'recovering', False) or getattr(peer, 'waiting', None) for peer in peers):
             raise MoveError('Gripper or other motion is active or uncertain; no additional motion sent', False)
         if self.closed or self.active:
             raise self.blocked_error()
@@ -83,24 +88,43 @@ class ArmCompletion:
                 'serial': self.reader.serial, 'motion_sent': None, 'vendor_acknowledged': False}
         self.active = job
         if sequence is not None:
-            job.update(sequence=sequence,guard=guard,cancel_sequence=False,stage=0,completed_stages=0)
+            job.update(sequence=sequence,guard=guard,cancel_sequence=False,stage=0,completed_stages=0,stage_label=None,stage_kind=None)
         self.task = asyncio.create_task(self._run_sequence(job) if sequence is not None else self._run(job))
         return await asyncio.shield(future)
 
     async def dispatch_sequence(self, plan, guard):
         import copy
         frames=copy.deepcopy(plan['frames'])
-        if not frames or len(frames)>10:
-            raise ValueError('Invalid pose frame count')
+        if not frames or len(frames)>14 or frames[0].get('kind','arm')!='arm':
+            raise ValueError('Invalid pose frame count or first stage')
+        from gripper import command as gripper_command
+        budget=float(POSE_ADMISSION_AND_REPORT_BUDGET)
+        previous=plan['start_q']
         for frame in frames:
-            self.validate(frame['joint'],frame['time'])
+            kind=frame.get('kind','arm')
+            if kind=='arm':
+                self.validate(frame['joint'],frame['time'])
+                budget+=frame['time']+ARRIVAL_GRACE+5+self.reader.settings['response_timeout_seconds']
+            elif kind=='gripper':
+                values=frame.get('gripper')
+                if (plan.get('preset')!='wave' or self.gripper_step is None or not isinstance(values,dict) or values not in (
+                        {'side':'right','opening_mm':85,'speed':10,'force':10},
+                        {'side':'right','opening_mm':0,'speed':10,'force':10}) or
+                        frame['joint']!=previous or frame['time']!=0 or frame['hold']!=0):
+                    raise ValueError('Invalid owned pose gripper stage')
+                gripper_command('open',{k:v for k,v in values.items() if k!='side'},'right')
+                budget+=POSE_GRIPPER_TIMEOUT
+            else:
+                raise ValueError('Unsupported pose stage')
             if type(frame['hold']) not in (int,float) or not 0<=frame['hold']<=2:
                 raise ValueError('Invalid pose dwell')
-        # Include every arrival grace window and bounded ACP delivery budget.
-        if sum(f['time']+f['hold']+ARRIVAL_GRACE for f in frames)+10>=300:
+            budget+=frame['hold']+POSE_GUARD_BUDGET
+            previous=frame['joint']
+        if budget>=POSE_ACP_TIMEOUT:
             raise ValueError('Pose exceeds ACP time budget; no motion sent')
         details={k:copy.deepcopy(v) for k,v in plan.items() if k!='frames'}
         details['stages_total']=len(frames)
+        details['worst_case_budget_seconds']=round(budget,1)
         return await self.dispatch('pose',frames[0]['joint'],frames[0]['time'],details,
                                    sequence=frames,guard=guard)
 
@@ -115,11 +139,10 @@ class ArmCompletion:
                 self.reader.ws is not job['ws'] or self.reader.serial!=job['serial']:
             raise ValueError('Pose connection/owner changed; remaining frames cancelled')
         sample,q,dq=self.feedback()
-        if job['details']['preset']!='reset':
-            packet=skeleton_stream(sample)
-            head=[j for j in packet['joints'] if j['idx']>=14]
-            if len(head)!=2 or any(abs(math.degrees(j['q']))>10 or j.get('dq') is None or abs(j['dq'])>.05 for j in head):
-                raise ValueError('Head moved outside preset admission range; remaining frames cancelled')
+        packet=skeleton_stream(sample)
+        head=[j for j in packet['joints'] if j['idx']>=14]
+        if len(head)!=2 or any(abs(math.degrees(j['q']))>10 or j.get('dq') is None or abs(j['dq'])>.05 for j in head):
+            raise ValueError('Head moved outside preset admission range; remaining frames cancelled')
         if len(dq)!=14 or any(v is None or abs(v)>.05 for v in dq) or \
                 max(abs(math.degrees(a-b)) for a,b in zip(q,expected))>1:
             raise ValueError('Pose start/waypoint feedback changed; remaining frames cancelled')
@@ -140,39 +163,56 @@ class ArmCompletion:
                 if job['cancel_sequence']:
                     status='cancelled';safe_end=True
                     break
-                job.update(stage=index+1,target=list(frame['joint']),duration=frame['time'],
+                kind=frame.get('kind','arm')
+                job.update(stage=index+1,stage_label=frame['label'],stage_kind=kind,
+                           target=list(frame['joint']),duration=frame['time'],
                            state='awaiting_ack',vendor_acknowledged=False)
-                previous_sent=any_sent
-                any_sent=True if previous_sent is True else None  # Outcome unknown until exact ACK.
-                try:
-                    reply=await self.send(job['target'],job['duration'])
-                except (ValueError,OSError) as exc:
-                    if not admitted and (getattr(exc,'motion_sent',None) is False or getattr(exc,'code',None)=='vendor_rejected'):
-                        self.active=None
-                        job['admission'].set_exception(exc)
-                        return
-                    if getattr(exc,'motion_sent',None) is False:any_sent=previous_sent
-                    elif getattr(exc,'motion_sent',None) is True:any_sent=True
+                if kind=='gripper':
+                    job['state']='gripper_step'
+                    try:
+                        step=await asyncio.wait_for(self.gripper_step(self,job,frame,
+                            lambda:self._sequence_feedback(job,expected)),POSE_GRIPPER_TIMEOUT)
+                    except asyncio.TimeoutError as exc:
+                        raise ValueError('Pose gripper step timed out; no following gripper or arm motion sent') from exc
+                    if step.get('cancelled_before_send'):
+                        status='cancelled';safe_end=True
+                        break
+                    if step.get('target_opening_verified') is not True:
+                        raise ValueError('Pose gripper target not verified; remaining stages cancelled')
+                    job['vendor_acknowledged']=step.get('vendor_acknowledged',False)
+                    job.setdefault('gripper_results',[]).append(step)
+                else:
+                    previous_sent=any_sent
+                    any_sent=True if previous_sent is True else None  # Outcome unknown until exact ACK.
+                    try:
+                        reply=await self.send(job['target'],job['duration'])
+                    except (ValueError,OSError) as exc:
+                        if not admitted and (getattr(exc,'motion_sent',None) is False or getattr(exc,'code',None)=='vendor_rejected'):
+                            self.active=None
+                            job['admission'].set_exception(exc)
+                            return
+                        if getattr(exc,'motion_sent',None) is False:any_sent=previous_sent
+                        elif getattr(exc,'motion_sent',None) is True:any_sent=True
+                        job['motion_sent']=any_sent
+                        if not admitted:
+                            admitted=True
+                            job['admission'].set_result({'action_id':job['action_id'],'action':'pose',
+                                'preset':job['details']['preset'],'state':'blocked_requires_operator_check',
+                                'motion_sent':any_sent,'arrival_verified':False,'completion_protocol':'acp'})
+                        raise ValueError('Pose stage acknowledgement failed; remaining frames cancelled: '+str(exc)) from exc
+                    any_sent=True if reply.get('motion_sent') is True or previous_sent is True else None
                     job['motion_sent']=any_sent
+                    job['vendor_acknowledged']=reply.get('status')=='accepted'
+                    if not job['vendor_acknowledged']:
+                        raise ValueError('Pose requires an exact positive acknowledgement for every stage')
+                    job['state']='moving'
                     if not admitted:
                         admitted=True
-                        job['admission'].set_result({'action_id':job['action_id'],'action':'pose',
-                            'preset':job['details']['preset'],'state':'blocked_requires_operator_check',
-                            'motion_sent':any_sent,'arrival_verified':False,'completion_protocol':'acp'})
-                    raise ValueError('Pose stage acknowledgement failed; remaining frames cancelled: '+str(exc)) from exc
-                any_sent=True if reply.get('motion_sent') is True or previous_sent is True else None
-                job['motion_sent']=any_sent
-                job['vendor_acknowledged']=reply.get('status')=='accepted'
-                if not job['vendor_acknowledged']:
-                    raise ValueError('Pose requires an exact positive acknowledgement for every stage')
-                job['state']='moving'
-                if not admitted:
-                    admitted=True
-                    job['admission'].set_result({**reply,'action_id':job['action_id'],'action':'pose',
-                        'preset':job['details']['preset'],'side':job['details']['side'],
-                        'state':'moving','motion_sent':any_sent,'arrival_verified':False,
-                        'stages_total':len(job['sequence']),'completion_protocol':'acp'})
-                await self.wait_for_arrival(job)
+                        job['admission'].set_result({**reply,'action_id':job['action_id'],'action':'pose',
+                            'preset':job['details']['preset'],'side':job['details']['side'],
+                            'state':'moving','motion_sent':any_sent,'arrival_verified':False,
+                            'stages_total':len(job['sequence']),'completion_protocol':'acp'})
+                    await self.wait_for_arrival(job)
                 job['completed_stages']=index+1
                 expected=list(job['target'])
                 until=time.monotonic()+frame['hold']
@@ -203,6 +243,9 @@ class ArmCompletion:
                 if not job['admission'].done():job['admission'].set_exception(MoveError('Pose result unknown',None))
             result.update({k:v for k,v in job['details'].items() if k not in ('start_q','home_q')})
             result.update(action='pose',joint_count=14,completion_protocol='acp',
+                stage_label=job.get('stage_label'),stage_kind=job.get('stage_kind'),
+                gripper_steps=job.get('gripper_results',[]),
+                **({'gripper_step_error':job['gripper_step_error']} if 'gripper_step_error' in job else {}),
                 motion_sent=any_sent,vendor_acknowledged=job['vendor_acknowledged'],
                 completed_stages=job['completed_stages'],motion_may_continue=not safe_end)
             job['arrival_verified']=safe_end

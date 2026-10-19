@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.8.1'
+VERSION = '0.8.2'
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -101,7 +101,8 @@ def run_check(timeout=20, camera=False):
     pose_tool = next((tool for tool in tools if tool['name']=='pose'),None)
     if pose_tool:
         schema=pose_tool['inputSchema']
-        if set(schema['properties'])!={'pose'} or schema.get('x-completion')!={'timeout':300} or \
+        if set(schema['properties'])!={'pose'} or schema['properties']['pose'].get('enum')!=['敬礼','挥手','欢迎'] or \
+                schema.get('x-completion')!={'timeout':480} or \
                 schema.get('x-resource')!=['arm_l','arm_r','head']:
             raise ValueError('Pose schema or shared physical resources differ')
     names = {tool['name'] for tool in tools}

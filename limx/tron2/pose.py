@@ -5,22 +5,22 @@ import math
 import xml.etree.ElementTree as ET
 
 import aiohttp
-from completion import arm_feedback
+from completion import arm_feedback, POSE_ACP_TIMEOUT
 from reset import ARM_NAMES
 from skeleton import MODEL_PATH, skeleton_stream
 from vendor import MoveError, motion_readiness, validate_movej
 
 VERSION = 1
-ACP_TIMEOUT = 300
+ACP_TIMEOUT = POSE_ACP_TIMEOUT
 TELEOP_HEALTH_URL = 'http://127.0.0.1:15794/health'
-LABELS = {'salute':'敬礼', 'wave':'挥手打招呼', 'welcome':'欢迎', 'reset':'自然垂下回正'}
+LABELS = {'salute':'敬礼', 'wave':'挥手', 'welcome':'欢迎'}
 PLANNED_DEG_PER_SECOND = 12.  # Unified planned travel/duration; not measured velocity.
 # Designed against TRON2 FK, not borrowed joint values from another robot.
 LEFT_FRAMES = {
-    'salute': [-75, 25, 0, -120, 0, 0, 0],
+    'salute': [-75, 40, 0, -120, 0, 0, 0],
     'wave': [-65, 25, 0, -100, 0, 0, 0],
-    'wave_out': [-65, 50, 0, -100, 0, 0, 0],
-    'wave_in': [-65, 10, 0, -100, 0, 0, 0],
+    'wave_out': [-65, 25, 20, -100, 0, 0, 0],
+    'wave_in': [-65, 25, -20, -100, 0, 0, 0],
     'welcome': [-35, 45, 40, -65, 0, 0, 0],
 }
 NOMINAL_HOME = [0,0,84.5,0,0,0,0, 0,0,-84.5,0,0,0,0]
@@ -30,11 +30,11 @@ HEAD_KEEP_OUT = .20  # Skeletal keep-out heuristic, not a collision CAD model.
 
 def tool():
     return {'name':'pose','type':'actuator','multiInstance':False,
-        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎及自然垂下回正，统一速度。完成动作后回原home；保持头部和夹爪开口。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
+        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎，统一速度。挥手旋转右肩三轮后保持手臂、右夹爪开合两次，再回原home；敬礼和欢迎停留1秒。头部及左夹爪保持不变。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'pose':{'type':'string','enum':list(LABELS), 'title':'预设动作',
-                    'oneOf':[{'const':key,'title':label} for key,label in LABELS.items()]}},
+                'pose':{'type':'string','enum':list(LABELS.values()), 'title':'预设动作',
+                    'oneOf':[{'const':label,'title':label} for key,label in LABELS.items()]}},
             'required':['pose'], 'x-resource':['arm_l','arm_r','head'],
             'x-completion':{'timeout':ACP_TIMEOUT}}}
 
@@ -42,10 +42,11 @@ def tool():
 def arguments(args):
     if not isinstance(args,dict) or set(args)-{'pose','instance_id','_trace_id'}:
         raise ValueError('pose只接受预设动作；手臂和速度由动作统一设定')
-    name=args.get('pose')
-    if not isinstance(name,str) or name not in LABELS:
+    label=args.get('pose')
+    if not isinstance(label,str) or label not in LABELS.values():
         raise ValueError('请选择有效的预设动作')
-    return name, 'both' if name in ('welcome','reset') else 'right'
+    name=next(key for key,value in LABELS.items() if value==label)
+    return name, 'both' if name=='welcome' else 'right'
 
 
 def _mm(a,b):
@@ -120,6 +121,7 @@ class Pose:
         self.geometry=Geometry()
         self.lock=asyncio.Lock()
         self.generation=0
+        self.gripper_prepare=None
 
     def motion_summary(self):
         summary=self.motion.summary()
@@ -144,28 +146,26 @@ class Pose:
         if not motion_readiness(self.reader.sample('robot_status')['data'] or {})['ready']:
             raise ValueError('机器人未处于可用的上层开发状态')
         nominal=list(map(math.radians,NOMINAL_HOME))
-        if name!='reset':
-            if max(abs(math.degrees(a-b)) for a,b in zip(target_home,nominal))>3:
-                raise ValueError('当前home不符合本套TRON2动作基准；保持原home，不自动改写')
-            if max(abs(math.degrees(a-b)) for a,b in zip(current,target_home))>1:
-                raise ValueError('请先使用回正回到自然垂下home，再执行预设动作')
-            packet=skeleton_stream(self.reader.sample('joint_state'))
-            head={j['idx']:j for j in packet['joints'] if j['idx']>=14}
-            if set(head)!={14,15} or any(abs(math.degrees(j['q']))>10 or
-                    j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
-                raise ValueError('预设动作要求头部静止且俯仰、偏航均在正前方±10°以内')
+        if max(abs(math.degrees(a-b)) for a,b in zip(target_home,nominal))>3:
+            raise ValueError('当前home不符合本套TRON2动作基准；保持原home，不自动改写')
+        if max(abs(math.degrees(a-b)) for a,b in zip(current,target_home))>1:
+            raise ValueError('请先使用arm_control的reset回到自然垂下home，再执行预设动作')
+        packet=skeleton_stream(self.reader.sample('joint_state'))
+        head={j['idx']:j for j in packet['joints'] if j['idx']>=14}
+        if set(head)!={14,15} or any(abs(math.degrees(j['q']))>10 or
+                j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
+            raise ValueError('预设动作要求头部静止且俯仰、偏航均在正前方±10°以内')
         targets=[]
-        if name!='reset':
-            # Raise/rotate shoulders with the elbow and wrists unchanged, THEN
-            # bend the elbow. Return by extending the elbow before lowering.
-            goal=list(LEFT_FRAMES[name]);shoulder=goal[:3]+[0,0,0,0]
-            targets=[('shoulder',shoulder),(name,goal)]
-            if name=='wave':
-                targets += [(label,list(LEFT_FRAMES[label])) for label in
-                            ('wave_out','wave_in','wave_out','wave_in')]
-            targets.append(('extend',targets[-1][1][:3]+[0,0,0,0]))
+        # Raise/rotate shoulders with the elbow and wrists unchanged, THEN
+        # bend the elbow. Return by extending the elbow before lowering.
+        goal=list(LEFT_FRAMES[name]);shoulder=goal[:3]+[0,0,0,0]
+        targets=[('shoulder',shoulder),(name,goal)]
+        if name=='wave':
+            targets += [(label,list(LEFT_FRAMES[label])) for label in
+                        ('wave_out','wave_in')*3]
+        targets.append(('extend',targets[-1][1][:3]+[0,0,0,0]))
         frames=[];previous=list(current)
-        for frame_name,values in targets:
+        for target_index,(frame_name,values) in enumerate(targets):
             q=list(current)
             for label,offset in (('left',0),('right',7)):
                 if side not in (label,'both'):continue
@@ -176,20 +176,27 @@ class Pose:
                     q[offset+3:offset+7]=reference[offset+3:offset+7]
             duration=max(1.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(q,previous))/PLANNED_DEG_PER_SECOND*10)/10)
             validate_movej(q,duration)
-            hold=.4 if frame_name==name and name!='wave' else 0
+            hold=1. if frame_name==name and name!='wave' else 0
             frames.append({'label':frame_name,'joint':q,'time':duration,'hold':hold});previous=q
+            if name=='wave' and target_index==len(targets)-2:
+                # The last yaw waypoint is held through the four gripper steps.
+                for cycle in (1,2):
+                    for action,opening in (('open',85),('close',0)):
+                        frames.append({'kind':'gripper','label':'gripper_'+action+'_'+str(cycle),
+                            'joint':list(q),'time':0,'hold':0,
+                            'gripper':{'side':'right','opening_mm':opening,'speed':10,'force':10}})
         final_target=list(target_home)
         if side=='right':final_target[:7]=current[:7]  # No idle-left correction during right-only gestures.
         duration=max(2.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(previous,final_target))/PLANNED_DEG_PER_SECOND*10)/10)
         validate_movej(final_target,duration)
         frames.append({'label':'home','joint':final_target,'time':duration,'hold':0})
-        screening=self.geometry.validate_path(current,frames) if name!='reset' else {
-            'screening':'existing_home_reset_only','collision_checked':False}
+        screening=self.geometry.validate_path(current,frames)
         return {'frames':frames,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
             'home_q':list(target_home),'pose_sha256':home['pose_sha256'],'motion_tool':'pose',
-            'head_policy':'unchanged','gripper_policy':'unchanged','returns_to_home':True,
+            'head_policy':'unchanged','gripper_policy':'right_open_close_twice_ends_closed' if name=='wave' else 'unchanged','returns_to_home':True,
             'physical_presets_verified':False,
-            'planned_motion_seconds':round(sum(f['time']+f['hold'] for f in frames),1),**screening}
+            'planned_motion_seconds':round(sum(f['time']+f['hold'] for f in frames),1),
+            'planned_motion_seconds_excludes_gripper_waits':name=='wave',**screening}
 
     async def guard(self):
         # Local known teleop source must be inactive; never toggle its lifecycle.
@@ -222,6 +229,11 @@ class Pose:
             plan=await asyncio.to_thread(self.plan,dict(args))
             same_connection()
             if ticket!=self.generation:raise MoveError('预设规划已被停止请求取消',False)
+            if plan['preset']=='wave':
+                if self.gripper_prepare is None:raise MoveError('挥手夹爪步骤未配置，未发送动作',False)
+                await self.gripper_prepare()
+                same_connection()
+                if ticket!=self.generation:raise MoveError('夹爪审核已被停止请求取消',False)
             async def stage_guard():
                 same_connection()
                 if ticket!=self.generation and (self.motion.active or {}).get('stage',0)==0:

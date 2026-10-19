@@ -177,18 +177,21 @@ class Gripper:
         self.recovery_task = None
         self.waiting = None
         self.handover_cancel = None
+        self.pose_owner = None
+        self.pose_step = self.pose_last = None
 
     def info(self):
+        active=self.active or self.pose_step
         age = None if self.sample is None else max(0, time.monotonic() - self.sample[0])
         available = self.reader.connected and age is not None and age <= self.reader.settings['stale_after_seconds'] \
             and self.reader.ws is self.sample[2] and self.reader.serial == self.sample[3]
-        motion = dict(self.last) if self.last and (not self.active or
-                    self.last['action_id'] == self.active['action_id']) else None
-        if self.active:
-            motion = {**(motion or {}), **{k: self.active[k] for k in ('action_id', 'action', 'side', 'state')},
-                      'target_opening': self.active['target'], 'target_opening_raw': self.active['target'],
-                      'target_opening_mm': self.active['target_mm']}
-        return {'side': self.side, 'state': self.active['state'] if self.active else
+        motion = dict(self.last) if self.last and (not active or
+                    self.last['action_id'] == active['action_id']) else None
+        if active:
+            motion = {**(motion or {}), **{k: active[k] for k in ('action_id', 'action', 'side', 'state')},
+                      'target_opening': active['target'], 'target_opening_raw': active['target'],
+                      'target_opening_mm': active['target_mm']}
+        return {'side': self.side, 'state': active['state'] if active else
                     'recovering' if self.recovering else 'waiting_for_previous' if self.waiting else
                     'ready' if self.reader.connected else 'offline',
                 'motion_sent': False, 'available': available,
@@ -196,15 +199,87 @@ class Gripper:
                 'motion': motion, 'recovering': self.recovering,
                 'waiting_action': self.waiting['action'] if self.waiting else
                     'close' if self.handover_cancel else None,
-                'can_accept_motion': not self.closed and not self.active and not self.recovering and
+                'can_accept_motion': not self.closed and not active and not self.recovering and
                     not self.waiting and
                     self.reader.connected and not (self.peer and (self.peer.closed or self.peer.active)),
-                'grasp_verified': False}
+                'pose_step_result':self.pose_last,'grasp_verified': False}
 
     async def read_state(self):
         data = state_data(await self.reader.read_gripper(), self.side)
         self.sample = (time.monotonic(), data, self.reader.ws, self.reader.serial)
         return {**self.info(), 'read_only': True}
+
+    async def prepare_pose(self):
+        """Read-only admission for the fixed right-jaw part of a pose."""
+        def idle():
+            if (self.side!='right' or self.closed or self.active or self.pose_step or self.recovering or
+                    self.waiting or self.handover_cancel or self.pose_owner is None or
+                    self.peer and (self.peer.closed or self.peer.active)):
+                raise MoveError('挥手需要右夹爪及其他运动任务均已结束',False)
+        idle();ws,serial=self.reader.ws,self.reader.serial
+        state=(await self.read_state())['data'];idle()
+        if (self.reader.ws is not ws or self.reader.serial!=serial or not self.reader.connected or
+                state['vendor_timestamp_ms'] is None or state['right']['speed']!=0):
+            raise MoveError('右夹爪反馈不完整或未静止；未开始挥手',False)
+
+    async def execute_pose_step(self,parent,owner,frame,checkpoint):
+        """Private child operation under the exact live arm/pose owner; no nested ACP."""
+        def owned():
+            if (self.pose_owner is not parent or parent.active is not owner or parent.closed or
+                    owner.get('details',{}).get('motion_tool')!='pose' or
+                    owner.get('details',{}).get('preset')!='wave' or owner.get('stage_kind')!='gripper' or
+                    self.side!='right' or self.closed or self.active or self.recovering or self.waiting or self.handover_cancel):
+                raise MoveError('夹爪步骤不属于当前挥手任务；未发送开合',False)
+            checkpoint()
+        owned()
+        if self.pose_step is not None:raise MoveError('已有未确认的姿态夹爪步骤',False)
+        values=frame['gripper'];data=command('open',{k:v for k,v in values.items() if k!='side'},self.side)
+        step={'action_id':owner['action_id'],'parent_action_id':owner['action_id'],
+            'action':'close' if values['opening_mm']==0 else 'open','side':self.side,
+            'target':data['right_opening'],'target_mm':values['opening_mm'],
+            'ws':owner['ws'],'serial':owner['serial'],'motion_sent':False,
+            'vendor_acknowledged':False,'state':'checking'}
+        self.pose_step=step;status='error'
+        try:
+            before=(await self.read_state())['data'];owned();self.same_session(step)
+            step['before_timestamp']=before['vendor_timestamp_ms']
+            if step['before_timestamp'] is None or before['right']['speed']!=0:
+                raise MoveError('夹爪步骤前状态未确认静止；未发送新的开合',False)
+            if owner['cancel_sequence']:
+                status='cancelled'
+                return {'motion_sent':False,'cancelled_before_send':True}
+            step['no_op']=abs(before['right']['opening']-step['target'])<=TOLERANCE
+            if not step['no_op']:
+                step.update(state='awaiting_ack',motion_sent=None)
+                reply=await self.reader.send_gripper(data)
+                step['motion_sent']=True
+                if not isinstance(reply,dict) or reply.get('result')!='success':
+                    raise MoveError('挥手夹爪步骤回执不明；不执行后续步骤',True)
+                step['vendor_acknowledged']=True
+            step['state']='verifying_existing_target' if step['no_op'] else 'moving'
+            # Lifecycle stop waits for THIS sent operation to settle; it never
+            # creates the next close/open or forces an arm return.
+            result=await self.verify_target(step,checkpoint=owned)
+            owned();status='completed'
+            result.update(action=step['action'],side=self.side,target_opening_mm=step['target_mm'],
+                target_opening_raw=step['target'],reported_speed=step.get('reported_speed'),
+                motion_sent=step['motion_sent'],vendor_acknowledged=step['vendor_acknowledged'],
+                parent_action_id=owner['action_id'],completion_owner='pose')
+            self.pose_last=result
+            return result
+        except (Exception,asyncio.CancelledError) as exc:
+            if isinstance(exc,MoveError):step['motion_sent']=exc.motion_sent
+            step['state']='blocked_requires_operator_check'
+            self.pose_last={'parent_action_id':owner['action_id'],'status':'error',
+                'motion_sent':step['motion_sent'],'target_opening_verified':False,
+                'target_opening_mm':step['target_mm'],'completion_owner':'pose',
+                'error':str(exc) or 'Pose gripper step cancelled/timed out',
+                'error_code':getattr(exc,'code',None)}
+            owner['gripper_step_error']=dict(self.pose_last)
+            raise
+        finally:
+            if status in ('completed','cancelled') or step['motion_sent'] is False:
+                self.pose_step=None
 
     def check_close_handover(self, job):
         last = self.last or {}
@@ -312,6 +387,9 @@ class Gripper:
             self.waiting['cancel'].set()
         if self.handover_cancel:
             self.handover_cancel.set()
+        if self.pose_step and self.pose_owner and self.pose_owner.active and \
+                self.pose_step['parent_action_id']==self.pose_owner.active['action_id']:
+            self.pose_owner.cancel_sequence()
 
     def blocked_error(self):
         job = self.active or {}
@@ -323,6 +401,8 @@ class Gripper:
             '；后续指令未发送。请检查实物与控制器，保留失败记录后联系维护人员恢复', False)
 
     async def wait_previous(self, action, allow_blocked=False):
+        if self.pose_step is not None:
+            raise MoveError('当前夹爪步骤属于姿态任务或结果未确认，不能由单独开合/恢复接替',False)
         if self.closed:
             raise MoveError('夹爪驱动已关闭，后续指令未发送', False)
         if self.waiting or self.handover_cancel:
@@ -396,15 +476,17 @@ class Gripper:
         if not self.reader.connected or self.reader.ws is not job['ws'] or self.reader.serial != job['serial']:
             raise ValueError('机器人连接已改变，动作结果尚未确认')
 
-    async def verify_target(self, job):
+    async def verify_target(self, job, checkpoint=None):
         start = None; matches = 0
         replacement = None; stationary_start = None; stationary_samples = 0; stationary_opening = None
         last_stamp = job['before_timestamp']
         deadline = time.monotonic() + TIMEOUT
         while time.monotonic() < deadline:
             self.same_session(job)
+            if checkpoint is not None:checkpoint()
             result = await self.read_state()  # Each sample is a new correlated query.
             self.same_session(job)
+            if checkpoint is not None:checkpoint()
             actual = result['data'][job['side']]['opening']
             job['reported_opening'] = actual
             job['reported_speed'] = result['data'][job['side']]['speed']
@@ -417,7 +499,7 @@ class Gripper:
                 continue
             last_stamp = stamp
             if abs(actual - job['target']) <= TOLERANCE and \
-                    (not job.get('no_op') or job['reported_speed'] == 0):
+                    (not (job.get('no_op') or job.get('parent_action_id')) or job['reported_speed'] == 0):
                 start = now if start is None else start
                 matches += 1
                 if matches >= 3 and now - start >= STABILITY_SECONDS:

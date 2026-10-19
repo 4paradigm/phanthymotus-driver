@@ -40,6 +40,11 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.reader.send_movej=AsyncMock(side_effect=self.fake_send)
         self.waiter=patch.object(self.adapter.motion,'wait_for_arrival',new=self.fast_arrival);self.waiter.start();self.addCleanup(self.waiter.stop)
         self.frames=[];self.arrivals=[];self.fail_at=None;self.block=None
+        self.gripper_opening=0;self.gripper_stamp=1000;self.claw_writes=[]
+        self.reader.read_gripper=AsyncMock(side_effect=self.fake_gripper_state)
+        self.reader.send_gripper=AsyncMock(side_effect=self.fake_gripper_send)
+        self.gripper_timing=patch.multiple('gripper',POLL_SECONDS=.001,STABILITY_SECONDS=.005)
+        self.gripper_timing.start();self.addCleanup(self.gripper_timing.stop)
 
     async def asyncTearDown(self):
         await self.adapter.motion.close();await self.adapter.head.close()
@@ -63,35 +68,48 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.arrivals.append(job['stage']);self.accept_feedback()
         return {'arrival_verified':True,'verified_samples':3}
 
+    async def fake_gripper_state(self):
+        self.gripper_stamp+=1;self.accept_feedback()
+        return {'result':'success','timestamp':self.gripper_stamp,
+            'left_opening':0,'left_speed':0,'left_force':0,
+            'right_opening':self.gripper_opening,'right_speed':0,'right_force':0}
+
+    async def fake_gripper_send(self,payload):
+        self.claw_writes.append(dict(payload));self.gripper_opening=payload['right_opening']
+        return {'result':'success'}
+
     def compact_plan(self,name='wave',side=None):
-        plan=self.adapter.pose.plan({'pose':name})
-        for f in plan['frames']:f.update(time=.1,hold=0)
+        # Internal single-home verifier fixture; reset is no longer public.
+        plan=self.adapter.pose.plan({'pose':pose.LABELS['welcome' if name=='reset' else name]})
+        if name=='reset':plan['frames']=plan['frames'][-1:]
+        for f in plan['frames']:
+            if f.get('kind')!='gripper':f.update(time=.1,hold=0)
         return plan
 
     def test_public_schema_has_only_pose_and_actionless_acp(self):
         t=pose.tool();s=t['inputSchema']
         self.assertEqual(t['name'],'pose');self.assertEqual(set(s['properties']),{'pose'})
-        self.assertEqual(s['x-completion'],{'timeout':300});self.assertEqual(s['x-resource'],['arm_l','arm_r','head'])
-        self.assertEqual(list(s['properties']['pose']['enum']),['salute','wave','welcome','reset'])
+        self.assertEqual(s['x-completion'],{'timeout':480});self.assertEqual(s['x-resource'],['arm_l','arm_r','head'])
+        self.assertEqual(list(s['properties']['pose']['enum']),['敬礼','挥手','欢迎'])
 
     def test_fixed_sides_speed_fit_vendor_bounds_and_sampled_model_exclusions(self):
         digest=hashlib.sha256(self.file.read_bytes()).hexdigest()
         for name in pose.LABELS:
-            p=self.adapter.pose.plan({'pose':name})
+            p=self.adapter.pose.plan({'pose':pose.LABELS[name]})
             self.assertEqual(p['side'],'right' if name in ('salute','wave') else 'both')
             self.assertEqual(p['planned_deg_per_second'],12)
             self.assertEqual(p['frames'][-1]['joint'],HOME)
             self.assertEqual(p['pose_sha256'],digest);self.assertFalse(p['collision_checked'])
-            self.assertLess(sum(f['time']+f['hold']+10 for f in p['frames'])+10,300)
+            self.assertLess(sum(f['time']+f['hold']+10 for f in p['frames'])+130,480)
             if name!='reset':self.assertGreaterEqual(p['minimum_head_reference_distance_m'],.2)
             for f in p['frames']:
-                completion.validate_movej(f['joint'],f['time'])
+                completion.validate_movej(f['joint'],max(1,f['time']))
                 if name in ('salute','wave'):self.assertEqual(f['joint'][:7],HOME[:7])
         self.assertEqual(hashlib.sha256(self.file.read_bytes()).hexdigest(),digest)
 
     def test_shoulders_move_first_then_elbows_and_return_in_reverse_order(self):
         for name in ('salute','wave','welcome'):
-            p=self.adapter.pose.plan({'pose':name});frames=p['frames']
+            p=self.adapter.pose.plan({'pose':pose.LABELS[name]});frames=p['frames']
             self.assertEqual([f['label'] for f in frames[:2]],['shoulder',name])
             for offset in ([7] if name!='welcome' else [0,7]):
                 self.assertEqual(frames[0]['joint'][offset+3:offset+7],HOME[offset+3:offset+7])
@@ -101,31 +119,166 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(frames[-2]['label'],'extend')
                 self.assertEqual(frames[-2]['joint'][offset+3:offset+7],HOME[offset+3:offset+7])
                 self.assertEqual(frames[-2]['joint'][offset:offset+3],frames[-3]['joint'][offset:offset+3])
-            self.assertLess(p['planned_motion_seconds'],50)
+            self.assertLess(p['planned_motion_seconds'],55)
 
     def test_right_only_preserves_actual_left_and_first_shoulder_preserves_actual_elbow(self):
         actual=list(HOME);actual[3]-=.005;actual[10]-=.005
         self.accept_feedback(actual+[0,0])
         for name in ('salute','wave'):
-            plan=self.adapter.pose.plan({'pose':name})
+            plan=self.adapter.pose.plan({'pose':pose.LABELS[name]})
             self.assertTrue(all(f['joint'][:7]==actual[:7] for f in plan['frames']))
             self.assertEqual(plan['frames'][0]['joint'][10:14],actual[10:14])
             self.assertEqual(plan['frames'][-1]['joint'][7:],HOME[7:])
             self.assertEqual(plan['home_q'],HOME)
 
-    def test_wave_has_two_wider40_degree_swings_and_no_extra_dwell(self):
-        p=self.adapter.pose.plan({'pose':'wave'});frames=p['frames']
+    def test_wave_rotates_joint9_three_times_then_claw_twice_before_return(self):
+        p=self.adapter.pose.plan({'pose':'挥手'});frames=p['frames']
         swings=[f for f in frames if f['label'] in ('wave_out','wave_in')]
-        self.assertEqual([f['label'] for f in swings],['wave_out','wave_in']*2)
-        rolls=[math.degrees(f['joint'][8]) for f in swings]
-        self.assertAlmostEqual(max(rolls)-min(rolls),40)
-        self.assertTrue(all(f['hold']==0 for f in frames))
-        self.assertEqual(len(frames),8)
+        self.assertEqual([f['label'] for f in swings],['wave_out','wave_in']*3)
+        yaws=[math.degrees(f['joint'][9]) for f in swings]
+        self.assertAlmostEqual(max(yaws)-min(yaws),40)
+        self.assertTrue(all(abs(math.degrees(f['joint'][8])+25)<1e-6 for f in swings))
+        grip=[f for f in frames if f.get('kind')=='gripper']
+        self.assertEqual([f['gripper']['opening_mm'] for f in grip],[85,0,85,0])
+        self.assertTrue(all(f['joint']==swings[-1]['joint'] for f in grip))
+        self.assertEqual([f['label'] for f in frames[-2:]],['extend','home'])
+        self.assertEqual(len(frames),14);self.assertTrue(all(f['hold']==0 for f in frames))
+
+    def test_salute_more_lateral_and_presentation_holds_one_second(self):
+        for name in ('salute','welcome'):
+            plan=self.adapter.pose.plan({'pose':pose.LABELS[name]})
+            displayed=next(f for f in plan['frames'] if f['label']==name)
+            self.assertEqual(displayed['hold'],1)
+            if name=='salute':self.assertAlmostEqual(math.degrees(displayed['joint'][8]),-40)
+
+    async def test_full_mixed_sequence_timeout_budget_rejected_before_motion(self):
+        plan=self.adapter.pose.plan({'pose':'挥手'})
+        self.reader.settings['response_timeout_seconds']=10
+        with self.assertRaisesRegex(ValueError,'budget'):
+            await self.adapter.motion.dispatch_sequence(plan,self.adapter.pose.guard)
+        self.reader.send_movej.assert_not_awaited();self.reader.send_gripper.assert_not_awaited()
+        self.assertIsNone(self.adapter.motion.active)
+
+    async def test_gripper_unknown_ack_cancels_return_and_preserves_parent_owner(self):
+        async def uncertain(data):
+            self.claw_writes.append(data)
+            raise MoveError('unknown claw ACK',True)
+        self.reader.send_gripper.side_effect=uncertain
+        received=await self.adapter.motion.dispatch_sequence(self.compact_plan(),self.adapter.pose.guard)
+        await self.adapter.motion.task
+        self.assertEqual(len(self.frames),8);self.assertEqual(len(self.claw_writes),1)
+        self.assertEqual(self.adapter.motion.last['status'],'error')
+        self.assertEqual(self.adapter.motion.last['gripper_step_error']['parent_action_id'],received['action_id'])
+        self.assertTrue(self.adapter.motion.last['motion_may_continue'])
+        self.assertIsNotNone(self.adapter.motion.active)
+        self.assertEqual(self.adapter._report_completion.await_count,1)
+
+    async def test_gripper_target_miss_and_nonzero_speed_never_continue_to_close_or_home(self):
+        import gripper
+        for kind in ('miss','speed'):
+            self.claw_writes.clear();self.frames.clear();self.gripper_opening=0
+            self.accept_feedback(HOME+[0,0])
+            async def send(data):
+                self.claw_writes.append(data)
+                if kind=='speed':self.gripper_opening=data['right_opening']
+                return {'result':'success'}
+            async def state():
+                result=await self.fake_gripper_state()
+                if kind=='speed' and self.claw_writes:result['right_speed']=1
+                return result
+            self.reader.send_gripper.side_effect=send;self.reader.read_gripper.side_effect=state
+            with patch.object(gripper,'TIMEOUT',.03):
+                await self.adapter.motion.dispatch_sequence(self.compact_plan(),self.adapter.pose.guard)
+                await self.adapter.motion.task
+            self.assertEqual(len(self.frames),8);self.assertEqual(len(self.claw_writes),1)
+            self.assertEqual(self.adapter.motion.last['status'],'error')
+            # Only clear offline fixture owners between the two independent cases.
+            self.adapter.motion.active=None;self.adapter.grippers['gripper_right'].pose_step=None
+
+    async def test_stop_during_gripper_ack_verifies_current_step_but_no_more_commands(self):
+        entered=asyncio.Event();release=asyncio.Event()
+        async def send(data):
+            self.claw_writes.append(data);self.gripper_opening=data['right_opening']
+            entered.set();await release.wait();return {'result':'success'}
+        self.reader.send_gripper.side_effect=send
+        await self.adapter.motion.dispatch_sequence(self.compact_plan(),self.adapter.pose.guard)
+        await asyncio.wait_for(entered.wait(),2)
+        self.assertTrue(self.adapter.pose.stop()['cancel_requested']);release.set()
+        await self.adapter.motion.task
+        self.assertEqual(self.adapter.motion.last['status'],'cancelled')
+        self.assertEqual(len(self.frames),8);self.assertEqual(len(self.claw_writes),1)
+        self.assertEqual(len(self.adapter.motion.last['gripper_steps']),1)
+        self.assertIsNone(self.adapter.motion.active)
+
+    async def test_stop_during_child_pre_read_prevents_any_gripper_write(self):
+        entered=asyncio.Event();release=asyncio.Event()
+        async def state():
+            entered.set();await release.wait();return await self.fake_gripper_state()
+        self.reader.read_gripper.side_effect=state
+        await self.adapter.motion.dispatch_sequence(self.compact_plan(),self.adapter.pose.guard)
+        await asyncio.wait_for(entered.wait(),2);self.adapter.pose.stop();release.set()
+        await self.adapter.motion.task
+        self.reader.send_gripper.assert_not_awaited()
+        self.assertEqual(self.adapter.motion.last['status'],'cancelled');self.assertEqual(len(self.frames),8)
+
+    async def test_other_tools_remain_blocked_while_owned_gripper_moves(self):
+        entered=asyncio.Event();release=asyncio.Event()
+        async def send(data):
+            self.claw_writes.append(data);self.gripper_opening=data['right_opening']
+            entered.set();await release.wait();return {'result':'success'}
+        self.reader.send_gripper.side_effect=send
+        await self.adapter.motion.dispatch_sequence(self.compact_plan(),self.adapter.pose.guard)
+        await asyncio.wait_for(entered.wait(),2)
+        self.assertEqual(self.adapter.motion.summary()['stage_kind'],'gripper')
+        self.assertFalse(self.adapter.grippers['gripper_right'].info()['can_accept_motion'])
+        for owner in self.adapter.grippers.values():
+            with self.assertRaises(MoveError):await owner.dispatch('open',{'opening_mm':20,'speed':10,'force':10})
+        with self.assertRaises(MoveError):await self.adapter.motion.dispatch('move',HOME,8,{})
+        with self.assertRaises(MoveError):await self.adapter.head.dispatch('move',[0,0],5,{})
+        self.adapter.pose.stop();release.set();await self.adapter.motion.task
+        self.assertEqual(len(self.claw_writes),1)
+
+    async def test_arm_drift_during_gripper_verification_cancels_remaining_stages(self):
+        async def state():
+            result=await self.fake_gripper_state()
+            if self.claw_writes:
+                changed=list(self.position);changed[10]+=.1;self.accept_feedback(changed)
+            return result
+        self.reader.read_gripper.side_effect=state
+        await self.adapter.motion.dispatch_sequence(self.compact_plan(),self.adapter.pose.guard)
+        await self.adapter.motion.task
+        self.assertEqual(len(self.frames),8);self.assertEqual(len(self.claw_writes),1)
+        self.assertEqual(self.adapter.motion.last['status'],'error');self.assertIsNotNone(self.adapter.motion.active)
+
+    async def test_orphaned_uncertain_child_cannot_be_bypassed_by_public_tools(self):
+        owner=self.adapter.grippers['gripper_right']
+        owner.pose_step={'parent_action_id':'old','state':'blocked_requires_operator_check'}
+        with self.assertRaises(MoveError):await owner.dispatch('open',{'opening_mm':20,'speed':10,'force':10})
+        with self.assertRaises(MoveError):await owner.recover({})
+        with self.assertRaises(MoveError):await self.adapter.motion.dispatch('move',HOME,8,{})
+        with self.assertRaises(MoveError):await self.adapter.head.dispatch('move',[0,0],5,{})
+        self.reader.send_gripper.assert_not_awaited();self.reader.send_movej.assert_not_awaited()
+        owner.pose_step=None
+
+    async def test_private_gripper_cannot_run_without_exact_live_parent(self):
+        plan=self.compact_plan();frame=next(f for f in plan['frames'] if f.get('kind')=='gripper')
+        with self.assertRaises(MoveError):
+            await self.adapter.grippers['gripper_right'].execute_pose_step(self.adapter.motion,{},frame,lambda:None)
+        self.reader.send_gripper.assert_not_awaited();self.reader.read_gripper.assert_not_awaited()
+        frame['gripper']['side']='left'
+        with self.assertRaises(ValueError):await self.adapter.motion.dispatch_sequence(plan,self.adapter.pose.guard)
+        self.reader.send_movej.assert_not_awaited()
+
+    async def test_failed_wave_admission_gripper_read_is_readonly_and_has_no_motion_owner(self):
+        self.reader.read_gripper.side_effect=MoveError('vendor fault',False)
+        with self.assertRaises(MoveError):await self.adapter.pose.execute({'pose':'挥手'})
+        self.reader.send_movej.assert_not_awaited();self.reader.send_gripper.assert_not_awaited()
+        self.assertIsNone(self.adapter.motion.active)
 
     async def test_invalid_arguments_do_not_query_modes_or_create_owner(self):
-        for args in ({},{'pose':'other'},{'pose':True},{'pose':'wave','side':'both'}, {'pose':'wave','side':'right'}, {'pose':'wave','speed':'slow'},
-                     {'pose':'wave','side':'LEFT'},{'pose':'salute','speed':True},
-                     {'pose':'wave','action':'move'},{'pose':'wave','joint':[0]*14}):
+        for args in ({},{'pose':'reset'},{'pose':'salute'},{'pose':'wave'},{'pose':'welcome'},{'pose':'other'},{'pose':True},{'pose':'挥手','side':'both'}, {'pose':'挥手','side':'right'}, {'pose':'挥手','speed':'slow'},
+                     {'pose':'挥手','side':'LEFT'},{'pose':'敬礼','speed':True},
+                     {'pose':'挥手','action':'move'},{'pose':'挥手','joint':[0]*14}):
             with self.assertRaises((ValueError,TypeError)):await self.adapter.pose.execute(args)
         self.adapter.pose.guard.assert_not_awaited();self.reader.send_movej.assert_not_awaited()
         self.assertIsNone(self.adapter.motion.active)
@@ -136,10 +289,10 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             q=HOME+[changes.get('head',0),0]
             q[3]+=changes.get('arm',0)
             self.accept_feedback(q,dq=[changes.get('moving',0)]*16)
-            with self.assertRaises(ValueError):self.adapter.pose.plan({'pose':'salute'})
+            with self.assertRaises(ValueError):self.adapter.pose.plan({'pose':'敬礼'})
         self.accept_feedback(HOME+[0,0]);data=json.loads(original);data['target_q'][2]=0
         self.file.write_text(json.dumps(data))
-        with self.assertRaises(ValueError):self.adapter.pose.plan({'pose':'wave'})
+        with self.assertRaises(ValueError):self.adapter.pose.plan({'pose':'挥手'})
         self.assertEqual(json.loads(self.file.read_text()),data)
         self.reader.send_movej.assert_not_awaited()
 
@@ -154,7 +307,10 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         gate.set();await self.adapter.motion.task
         callback=self.adapter._report_completion.await_args.args
         self.assertEqual(callback[:3],('pose',received['action_id'],'completed'))
-        self.assertEqual(len(self.frames),len(plan['frames']));self.assertEqual(self.arrivals,list(range(1,len(self.frames)+1)))
+        arm_stages=[i for i,f in enumerate(plan['frames'],1) if f.get('kind')!='gripper']
+        self.assertEqual(len(self.frames),len(arm_stages));self.assertEqual(self.arrivals,arm_stages)
+        self.assertEqual([v['right_opening'] for v in self.claw_writes],[94,0,94,0])
+        self.assertEqual(len(callback[3]['gripper_steps']),4)
         self.assertEqual(self.frames[-1],HOME);self.assertTrue(callback[3]['at_home']);self.assertIsNone(self.adapter.motion.active)
         self.assertEqual(self.adapter._report_completion.await_count,1)
 
@@ -283,12 +439,12 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             async with ClientSession() as session:
                 with patch.object(self.adapter.pose,'plan',return_value=plan):
                     async with session.post(url,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
-                            'params':{'name':'pose','arguments':{'pose':'salute','_trace_id':'trace'}}}) as response:
+                            'params':{'name':'pose','arguments':{'pose':'敬礼','_trace_id':'trace'}}}) as response:
                         body=(await response.json())['result'];self.assertFalse(body['isError'],body)
                 await self.adapter.motion.task
                 self.assertEqual(self.adapter._report_completion.await_args.args[0],'pose')
                 async with session.post(url,json={'jsonrpc':'2.0','id':2,'method':'tools/call',
-                        'params':{'name':'pose','arguments':{'pose':'salute','side':'both'}}}) as response:
+                        'params':{'name':'pose','arguments':{'pose':'敬礼','side':'both'}}}) as response:
                     body=(await response.json())['result'];self.assertTrue(body['isError'])
         finally:await runner.cleanup()
 
@@ -336,9 +492,9 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_websocket_mcp_and_acp_round_trip_for_actionless_pose(self):
         import os
-        feedback=HOME+[0,0];stamp=100;writes=[];callbacks=[]
+        feedback=HOME+[0,0];stamp=100;writes=[];callbacks=[];claw=0;grip_writes=[];events=[]
         async def ws_handler(request):
-            nonlocal stamp,feedback
+            nonlocal stamp,feedback,claw
             ws=web.WebSocketResponse();await ws.prepare(request)
             packet=info();packet['data']['sw_version']='test-fw';await ws.send_json(packet)
             async for message in ws:
@@ -346,7 +502,12 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                 if title=='request_get_joint_state':
                     stamp+=1;data=joints(q=feedback,timestamp=stamp)
                 elif title=='request_movej':
-                    writes.append(body['data']);feedback=list(body['data']['joint'])+[0,0];data={'result':'success'}
+                    writes.append(body['data']);events.append('arm');feedback=list(body['data']['joint'])+[0,0];data={'result':'success'}
+                elif title=='request_get_limx_2fclaw_state':
+                    stamp+=1;data={'result':'success','timestamp':stamp,'left_opening':0,'left_speed':0,'left_force':0,
+                        'right_opening':claw,'right_speed':0,'right_force':0}
+                elif title=='request_set_limx_2fclaw_cmd':
+                    grip_writes.append(body['data']);events.append('claw');claw=body['data']['right_opening'];data={'result':'success'}
                 else:raise AssertionError(title)
                 await ws.send_json({'accid':body['accid'],'guid':body['guid'],
                     'title':title.replace('request_','response_'),'data':data})
@@ -373,7 +534,8 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                 original=adapter.pose.plan
                 def short(args):
                     plan=original(args)
-                    for f in plan['frames']:f.update(time=.1,hold=0)
+                    for f in plan['frames']:
+                        if f.get('kind')!='gripper':f.update(time=.1,hold=0)
                     return plan
                 rpc_app=web.Application();rpc_app.router.add_post('/mcp',adapter.rpc)
                 rpc_runner=web.AppRunner(rpc_app,shutdown_timeout=.2);await rpc_runner.setup()
@@ -383,11 +545,14 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                      patch.dict(os.environ,AGENT_CORE_URL=root),patch('completion.STABILITY_SECONDS',.03), \
                      patch('completion.ARRIVAL_GRACE',.5),patch.object(adapter.pose,'plan',side_effect=short):
                     async with session.post(endpoint,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
-                        'params':{'name':'pose','arguments':{'pose':'reset','_trace_id':'real-wire'}}}) as response:
+                        'params':{'name':'pose','arguments':{'pose':'挥手','_trace_id':'real-wire'}}}) as response:
                         result=(await response.json())['result'];self.assertFalse(result['isError'],result)
                         accepted=json.loads(result['content'][0]['text'])
-                    await asyncio.wait_for(asyncio.shield(adapter.motion.task),3)
-                self.assertEqual(len(writes),1);self.assertEqual(set(writes[0]),{'joint','time'})
+                    await asyncio.wait_for(asyncio.shield(adapter.motion.task),6)
+                self.assertEqual(len(writes),10);self.assertEqual(set(writes[0]),{'joint','time'})
+                self.assertEqual(events,['arm']*8+['claw']*4+['arm']*2)
+                self.assertEqual([v['right_opening'] for v in grip_writes],[94,0,94,0])
+                self.assertTrue(all(set(v)=={'right_opening','right_speed','right_force'} for v in grip_writes))
                 self.assertEqual(len(writes[0]['joint']),14);self.assertEqual(len(callbacks),1)
                 self.assertEqual(callbacks[0]['action_id'],accepted['action_id']);self.assertEqual(callbacks[0]['tool'],'pose')
                 self.assertEqual(callbacks[0]['status'],'completed');self.assertTrue(callbacks[0]['result']['at_home'])
@@ -401,7 +566,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         entered=asyncio.Event();gate=asyncio.Event()
         async def guard():entered.set();await gate.wait()
         self.adapter.pose.guard.side_effect=guard
-        task=asyncio.create_task(self.adapter.pose.execute({'pose':'salute'}))
+        task=asyncio.create_task(self.adapter.pose.execute({'pose':'敬礼'}))
         await entered.wait();self.assertTrue(self.adapter.pose.stop()['cancel_requested']);gate.set()
         with self.assertRaises(MoveError):await task
         self.assertIsNone(self.adapter.motion.active);self.reader.send_movej.assert_not_awaited()
@@ -411,7 +576,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         entered=threading.Event();gate=threading.Event();plan=self.compact_plan('reset')
         def slow(args):entered.set();gate.wait(2);return plan
         with patch.object(self.adapter.pose,'plan',side_effect=slow):
-            task=asyncio.create_task(self.adapter.pose.execute({'pose':'reset'}))
+            task=asyncio.create_task(self.adapter.pose.execute({'pose':'欢迎'}))
             for _ in range(100):
                 if entered.is_set():break
                 await asyncio.sleep(.005)
@@ -432,12 +597,12 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
     async def test_reconnection_during_admission_does_not_send_old_request_on_new_socket(self):
         async def changed():self.reader.ws=types.SimpleNamespace(closed=False)
         self.adapter.pose.guard.side_effect=changed
-        with self.assertRaises(MoveError):await self.adapter.pose.execute({'pose':'reset'})
+        with self.assertRaises(MoveError):await self.adapter.pose.execute({'pose':'欢迎'})
         self.reader.send_movej.assert_not_awaited();self.assertIsNone(self.adapter.motion.active)
 
     async def test_reconnection_during_planning_does_not_replay_pending_request(self):
         plan=self.compact_plan('reset')
         def changed(args):self.reader.ws=types.SimpleNamespace(closed=False);return plan
         with patch.object(self.adapter.pose,'plan',side_effect=changed):
-            with self.assertRaises(MoveError):await self.adapter.pose.execute({'pose':'reset'})
+            with self.assertRaises(MoveError):await self.adapter.pose.execute({'pose':'欢迎'})
         self.reader.send_movej.assert_not_awaited();self.assertIsNone(self.adapter.motion.active)
