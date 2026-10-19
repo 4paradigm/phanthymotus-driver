@@ -96,6 +96,85 @@ scale/drift need hardware validation against a measured distance before they
 can be used as a precision target. This follows the upstream
 [Robot Odometry specification](https://github.com/4paradigm/phanthymotus-driver/blob/main/README_dev.md#robot-odometry-motusodom1).
 
+## Locomotion servo card
+
+`loco_servo` is a separate actuator for an incoming `control/velocity` stream.
+It defaults to `/actucore/navi/cmd` on agent-core's domain 42 and accepts JSON
+`std_msgs/String` messages using the shared `motus.control/1` twist contract:
+
+```json
+{
+  "schema": "motus.control/1", "mode": "twist", "dof": 6,
+  "values": [0.1, 0, 0, 0, 0, 0.2],
+  "source": "navi", "seq": 1, "priority": 0,
+  "stamp_ms": 1792370000000,
+  "obs_stamp_ms": 1792370000000,
+  "ttl_ms": 200
+}
+```
+
+The timestamps above are examples: producers must supply current Unix
+milliseconds and increasing sequence numbers. The six values are body-frame
+`[vx, vy, vz, wx, wy, wz]` in m/s and rad/s. This implementation supports `vx`
+and `wz` only; lateral, vertical and roll/pitch commands must be zero. This
+restriction does not claim lateral motion has been validated on the chassis.
+Configured operating caps default to 0.3 m/s and 0.6 rad/s, not vendor maximum
+ratings. Non-finite values, unsupported axes and out-of-range commands are
+rejected. `ControlSink` checks the schema, TTL, observation age, sequence and
+source priority. Rejected/stale messages never feed the watchdog.
+
+The domain-42 input uses the existing socket subscription bridge. Output is
+`geometry_msgs/Twist` on `/cmd_vel` in the robot's domain 0, the direct velocity
+channel already used by `NavPlugin`. It does not translate velocities into
+discrete REST direction actions, which cannot represent simultaneous forward
+and angular speed. Actual `/cmd_vel` consumption must be verified on hardware.
+
+Bundle startup is inert. MCP/canvas `start` subscribes to the default input,
+or to an explicitly provided `input_topic` / first `input_topics` entry.
+`info` returns the control descriptor, input/output topics, requested and shaped
+output values, counts, dry-run state and refusal reasons. `published` means a
+ROS publish call succeeded, not that physical motion was measured; use the
+`loco_state` odometry feedback to verify that. The output acceleration caps
+default to 0.3 m/s² and 0.6 rad/s², including the first command and resumption.
+Explicit zero commands, pause, stop and watchdog stop bypass acceleration
+limiting. No valid command for 300ms triggers a zero within the next 50ms timer
+tick while the driver/executor is running. A crash-proof stop additionally
+requires a verified chassis-side `/cmd_vel` timeout; this driver cannot provide
+that guarantee after its own process has exited. Raw velocity streaming does
+not add navigation obstacle avoidance.
+
+Configure loco_servo exposes three live boolean settings via `action: config`:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `dry_run` | false | Parse, validate, shape and count commands without publishing any velocity; enabling it while driving first sends one real zero to stop the previous motion |
+| `rotate_only` | false | Suppress translation and preserve yaw rate; unsupported axes are still rejected |
+| `require_standing` | false | Require a fresh true sample from the configured domain-0 `std_msgs/Bool` `standing_topic`; missing, stale or false samples stop/refuse motion |
+
+Tianyi has no verified native equivalent of R1's standing FSM in the supplied
+API. `standing_topic` is an integration point for a trusted posture signal,
+not an invented native topic. Do not enable this gate until such a signal has
+been mapped and verified; when enabled without a source it clearly reports
+the reason and refuses nonzero commands. Feedback expires after
+`standing_timeout` (default 1 second). These standing-source parameters live
+in `plugins.loco_servo` in the deployment YAML. Empty config requests preserve
+existing toggles; non-boolean toggle values are rejected.
+
+`pause` stops but retains the subscription; `resume` accepts newly generated
+commands. Start/resume/config changes drop commands generated before that
+transition. A cancelled subscription's delayed callbacks cannot drive a new
+session. `stop` returns idle and releases the ROS nodes; start after stop works.
+
+At the bundle dispatch boundary, explicit `nav` motion/cancel, `home.go_home`
+or cancel, and `chassis_raw` motion/brake pause this stream and send a zero
+before the other card executes. After this handover the stream emits nothing,
+including no stop/timer/config zeros that could disturb its new owner.
+Starting/resuming the stream after a call-shaped motion requires an explicit
+`nav.cancel`, `home.cancel` or `chassis_raw.brake` first, even if the motion may
+have completed. This ownership is conservative across ambiguous REST results.
+The existing card implementations and `nav_client.py` remain unchanged.
+External controllers that bypass this bundle must be coordinated separately.
+
 ## Head camera snapshot card
 
 The `vision_capture` card subscribes to `/ob_camera_head/color/image_raw` and

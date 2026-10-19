@@ -58,6 +58,20 @@ plugins:
     enabled: true
     hz: 10  # Target rate; actual refresh depends on chassis HTTP latency.
     request_timeout: 0.5
+  loco_servo:
+    enabled: true  # Present but inert until canvas/MCP start.
+    expected_hz: 10
+    max_vx: 0.3  # Operational speed cap, not a vendor hardware maximum.
+    max_wz: 0.6
+    linear_acceleration: 0.3  # m/s^2; explicit zero stops immediately.
+    angular_acceleration: 0.6  # rad/s^2
+    dry_run: false
+    rotate_only: false
+    # No verified native standing FSM is available for this wheeled platform.
+    # To require standing, configure a trusted domain-0 std_msgs/Bool source.
+    require_standing: false
+    standing_topic: ""
+    standing_timeout: 1.0
   power_board:
     enabled: true
   motors:
