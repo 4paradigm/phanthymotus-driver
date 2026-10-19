@@ -10,7 +10,6 @@ from reset import ARM_NAMES
 from skeleton import MODEL_PATH, skeleton_stream
 from vendor import MoveError, motion_readiness, validate_movej
 
-VERSION = 1
 ACP_TIMEOUT = POSE_ACP_TIMEOUT
 TELEOP_HEALTH_URL = 'http://127.0.0.1:15794/health'
 LABELS = {'salute':'敬礼', 'wave':'挥手', 'welcome':'欢迎'}
@@ -35,7 +34,7 @@ def tool():
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
                 'pose':{'type':'string','enum':list(LABELS.values()), 'title':'预设动作',
-                    'oneOf':[{'const':label,'title':label} for key,label in LABELS.items()]}},
+                    'oneOf':[{'const':label,'title':label} for label in LABELS.values()]}},
             'required':['pose'], 'x-resource':['arm_l','arm_r','head'],
             'x-completion':{'timeout':ACP_TIMEOUT}}}
 
@@ -157,7 +156,6 @@ class Pose:
         if set(head)!={14,15} or any(abs(math.degrees(j['q']))>10 or
                 j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
             raise ValueError('预设动作要求头部静止且俯仰、偏航均在正前方±10°以内')
-        targets=[]
         # Raise/rotate shoulders with the elbow and wrists unchanged, THEN
         # bend the elbow. Return by extending the elbow before lowering.
         goal=list(LEFT_FRAMES[name]);shoulder=goal[:3]+[0,0,0,0]

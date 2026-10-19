@@ -1,8 +1,7 @@
-"""MCP discovery, sensor publication and explicit arm MoveJ calls."""
+"""MCP discovery, sensor publication and guarded TRON2 motion calls."""
 import asyncio
 import json
 import logging
-import math
 import os
 import time
 
@@ -18,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.8.4'
+VERSION = '0.8.5'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in

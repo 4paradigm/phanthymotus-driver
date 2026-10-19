@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LimX TRON2 sensors and explicit arm MoveJ control."""
+"""TRON2 sensors and guarded arm, head, gripper and preset motion control."""
 from pathlib import Path
 import sys
 
