@@ -83,13 +83,14 @@ class FusionHealth:
         self.started_ns = started_ns
         self.samples = {}
         self.reason = None
-        self.tracked = False
         self.last_clock = None
 
     def observe(self, kind, stamp, now, valid):
         if stamp < self.started_ns:
             return  # DDS may still deliver queued samples from the old EKF.
         previous = self.samples.get(kind)
+        if previous is None and not valid:
+            return  # RTAB/EKF startup may publish an uninitialized estimate.
         if (not valid or stamp <= 0 or not -50_000_000 <= now-stamp <= 500_000_000
                 or (previous is not None and stamp <= previous)):
             self.reason = self.reason or f'invalid or reset {kind} feedback'
@@ -109,7 +110,6 @@ class FusionHealth:
             state = 'initializing'
         else:
             state = 'tracking'
-            self.tracked = True
         return dict(status=state, reason=self.reason or ('waiting for '+', '.join(missing) if missing else None),
                     segment_id=self.segment, stamp_ns=now,
                     reference='fixed camera origin; gravity-level initial forward axis')

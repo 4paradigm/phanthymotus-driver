@@ -6,7 +6,7 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon
 
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
-ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
+ARG UBUNTU_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
 ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/

@@ -165,6 +165,24 @@ def test_new_health_session_uses_new_segment_and_waits_for_all_inputs():
     assert second.status(10**9)['status'] == 'initializing'
 
 
+def test_queued_previous_session_samples_cannot_initialize_new_segment():
+    health = FusionHealth(started_ns=2*10**9)
+    for kind in health.kinds:
+        health.observe(kind, 1_900_000_000, 2*10**9, True)
+    assert health.samples == {}
+    assert health.status(2*10**9)['status'] == 'initializing'
+
+
+def test_uninitialized_first_pose_waits_for_valid_estimate_without_certifying_it():
+    health = FusionHealth()
+    health.observe('visual', 10**9, 10**9, False)
+    assert health.status(10**9)['status'] == 'initializing'
+    assert 'visual' not in health.samples
+    for kind in health.kinds:
+        health.observe(kind, 1_100_000_000, 1_100_000_000, True)
+    assert health.status(1_100_000_000)['status'] == 'tracking'
+
+
 def test_missing_required_dependency_is_a_build_error(tmp_path):
     def missing(package):
         raise LookupError(package)
