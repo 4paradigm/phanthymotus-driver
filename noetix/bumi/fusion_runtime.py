@@ -14,6 +14,11 @@ import uuid
 
 from camera_runtime import CAMERA
 
+# SDK body IMU bridged by the driver (device.py _BODY_IMU_TOPIC). The host
+# kernel lacks CONFIG_HID_SENSOR_HUB, so librealsense cannot see the camera
+# IMU on this generation of robots — keep in sync with device.py.
+BODY_IMU = '/bumi_odom/body_imu'
+
 
 def check_dependencies(prefix_lookup=None):
     if prefix_lookup is None:
@@ -45,7 +50,7 @@ def fusion_parameters(roll, pitch):
                base_link_frame='bumi_odom_base_link', world_frame='bumi_odom_odom',
                odom0='/bumi_odom/visual', odom0_config=[True]*6+[False]*9,
                odom0_differential=False, odom0_relative=False, odom0_queue_size=10,
-               imu0=CAMERA+'/imu', imu0_config=[False]*9+[True]*3+[False]*3,
+               imu0=BODY_IMU, imu0_config=[False]*9+[True]*3+[False]*3,
                imu0_differential=False, imu0_remove_gravitational_acceleration=False,
                imu0_queue_size=50)
     return visual, ekf
@@ -112,19 +117,7 @@ class FusionHealth:
             state = 'tracking'
         return dict(status=state, reason=self.reason or ('waiting for '+', '.join(missing) if missing else None),
                     segment_id=self.segment, stamp_ns=now,
-                    reference='fixed camera origin; gravity-level initial forward axis')
-
-
-def rotate_vector(q, v):
-    x, y, z, w = q.x, q.y, q.z, q.w
-    norm = math.hypot(x, y, z, w)
-    if not math.isfinite(norm) or norm < 1e-6:
-        raise ValueError('invalid factory IMU transform')
-    x, y, z, w = (a/norm for a in (x, y, z, w))
-    vx, vy, vz = v
-    return ((1-2*(y*y+z*z))*vx+2*(x*y-z*w)*vy+2*(x*z+y*w)*vz,
-            2*(x*y+z*w)*vx+(1-2*(x*x+z*z))*vy+2*(y*z-x*w)*vz,
-            2*(x*z-y*w)*vx+2*(y*z+x*w)*vy+(1-2*(x*x+y*y))*vz)
+                    reference='body origin; gravity-level initial forward axis')
 
 
 def pose_valid(msg):
@@ -139,9 +132,8 @@ def run():
     import yaml
     import rclpy
     from rclpy.node import Node
-    from rclpy.time import Time
     from rclpy.qos import qos_profile_sensor_data
-    from tf2_ros import Buffer, TransformListener, StaticTransformBroadcaster, TransformException
+    from tf2_ros import StaticTransformBroadcaster
     from geometry_msgs.msg import TransformStamped
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Imu
@@ -156,8 +148,6 @@ def run():
     rclpy.init()
     node = Node('bumi_managed_fusion', namespace='bumi_odom')
     health, gravity = FusionHealth(node.get_clock().now().nanoseconds), GravityWindow()
-    tf = Buffer()
-    listener = TransformListener(tf, node)
     mount = StaticTransformBroadcaster(node)
     transform = TransformStamped()
     transform.header.stamp = node.get_clock().now().to_msg()
@@ -180,12 +170,10 @@ def run():
                          and msg.angular_velocity_covariance[i] > 0 for i in (0, 4, 8)))
         health.observe('imu', stamp(msg), now(), valid)
         if initial is None and valid:
-            try:
-                rotation = tf.lookup_transform('bumi_odom_base_link', msg.header.frame_id, Time()).transform.rotation
-                initial = gravity.observe(stamp(msg)/1e9, rotate_vector(rotation, (a.x, a.y, a.z)),
-                                          rotate_vector(rotation, (w.x, w.y, w.z)))
-            except (TransformException, ValueError):
-                pass  # Wait for the driver's factory static transforms.
+            # Body-frame samples: no camera-mount lookup, gravity window
+            # settles roll/pitch directly.
+            initial = gravity.observe(stamp(msg)/1e9, (a.x, a.y, a.z),
+                                      (w.x, w.y, w.z))
 
     def visual(msg):
         if children:
@@ -205,7 +193,7 @@ def run():
         previous_distance = value
         health.observe('diagnostic', stamp(msg), now(), valid)
 
-    for cls, topic, callback in ((Imu, CAMERA+'/imu', imu), (Odometry, '/bumi_odom/visual', visual),
+    for cls, topic, callback in ((Imu, BODY_IMU, imu), (Odometry, '/bumi_odom/visual', visual),
                                   (Odometry, '/bumi_odom/filtered', filtered),
                                   (OdomInfo, '/bumi_odom/visual_info', diagnostic)):
         node.create_subscription(cls, topic, callback, qos_profile_sensor_data)

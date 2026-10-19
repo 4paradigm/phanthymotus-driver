@@ -487,13 +487,15 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   restart camera capture; it runs at 10 Hz, low priority, on at most two
   available CPUs. The read-only `/run/udev` deployment mount supplies HID
   enumeration metadata. The startup status explains which input is missing;
-  keep the fixed camera still for an initial one-second gravity window.
-  The default position reference is the fixed camera origin, with its initial
-  forward axis projected onto the gravity-level plane. This is a defined
-  camera reference, not a guessed camera-to-body calibration. Camera-internal
-  IMU/optical transforms come from the RealSense factory calibration.
-  RTAB-Map uses RGB-D only after gravity initialization; the EKF fuses its
-  pose with camera gyro rates, without integrating linear acceleration.
+  keep the robot stationary for an initial one-second gravity window.
+  Angular rate and gravity come from the SDK body IMU, bridged by the
+  driver as `sensor_msgs/Imu` on `/bumi_odom/body_imu` in the base_link
+  frame — this fleet's host kernels lack `CONFIG_HID_SENSOR_HUB`, so
+  librealsense cannot observe the camera IMU, and the body IMU needs no
+  mount calibration. The initial forward axis is the body axis projected
+  onto the gravity-level plane. RTAB-Map uses RGB-D only after gravity
+  initialization; the EKF fuses its pose with body gyro rates, without
+  integrating linear acceleration.
   `/bumi_odom/filtered` (nav_msgs/Odometry) and `/bumi_odom/status`
   (std_msgs/String) are the card's read-only inputs. Feedback must be a valid
   `bumi_odom_odom → bumi_odom_base_link` pose with fresh source and

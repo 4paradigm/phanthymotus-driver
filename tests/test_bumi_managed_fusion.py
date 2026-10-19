@@ -129,6 +129,8 @@ def test_initial_gravity_corrects_camera_pitch_without_inventing_body_mount():
     visual, ekf = fusion_parameters(*result)
     assert visual['frame_id'] == 'bumi_odom_base_link'
     assert visual['wait_imu_to_init'] is False
+    # 宿主机内核无 HID_SENSOR_HUB → 相机 IMU 不可用；EKF 吃驱动桥接的本体 IMU。
+    assert ekf['imu0'] == '/bumi_odom/body_imu'
     assert ekf['imu0_config'] == [False]*9 + [True]*3 + [False]*3
     assert visual['max_update_rate'] == 10.0
     assert visual['publish_tf'] is False

@@ -36,6 +36,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 from audio_msgs.msg import AudioChunk
 from sensor_msgs.msg import CompressedImage, Image as SensorImage
+from sensor_msgs.msg import Imu
 
 
 _LOW_LAT_QOS = QoSProfile(
@@ -201,6 +202,44 @@ def _rotate_timeout_s(angle_deg: float) -> float:
     return min(75.0, 10.0 + abs(angle_deg) / 5.0)
 
 
+# Body IMU bridge topic; the host kernel lacks CONFIG_HID_SENSOR_HUB so the
+# camera IMU is invisible to librealsense — managed fusion consumes the
+# SDK body IMU instead. Keep in sync with fusion_runtime.BODY_IMU.
+_BODY_IMU_TOPIC = '/bumi_odom/body_imu'
+
+
+def _body_imu_msg(imu, now_ns):
+    """sensor_msgs/Imu from SDK IMU data; None when any field is non-finite.
+
+    Frames: SDK accel/gyro are body-frame, so the message is stamped
+    base_link directly — no camera mount transform needed downstream.
+    """
+    ori = [float(imu.ori[i]) for i in range(4)]
+    ang = [float(imu.angular_vel[i]) for i in range(3)]
+    acc = [float(imu.linear_acc[i]) for i in range(3)]
+    if not all(math.isfinite(v) for v in (*ori, *ang, *acc)):
+        return None
+    msg = Imu()
+    msg.header.stamp.sec = now_ns // 10**9
+    msg.header.stamp.nanosec = now_ns % 10**9
+    msg.header.frame_id = 'bumi_odom_base_link'
+    msg.orientation.x, msg.orientation.y = ori[0], ori[1]
+    msg.orientation.z, msg.orientation.w = ori[2], ori[3]
+    msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z = ang
+    msg.linear_acceleration.x = acc[0]
+    msg.linear_acceleration.y, msg.linear_acceleration.z = acc[1], acc[2]
+    # robot_localization rejects zero covariances; modest positive diagonals.
+    msg.orientation_covariance[0] = msg.orientation_covariance[4] = 0.05
+    msg.orientation_covariance[8] = 0.05
+    msg.angular_velocity_covariance[0] = 0.02
+    msg.angular_velocity_covariance[4] = 0.02
+    msg.angular_velocity_covariance[8] = 0.02
+    msg.linear_acceleration_covariance[0] = 0.1
+    msg.linear_acceleration_covariance[4] = 0.1
+    msg.linear_acceleration_covariance[8] = 0.1
+    return msg
+
+
 # ── StatePlugin (sensor, multi-tool) ─────────────────────────────────────────
 
 class _BumiStateNode(Node):
@@ -220,6 +259,7 @@ class _BumiStateNode(Node):
         self._imu_pub     = self.create_publisher(String, self._imu_topic,     _LOW_LAT_QOS)
         self._battery_pub = self.create_publisher(String, self._battery_topic, _LOW_LAT_QOS)
         self._joints_pub  = self.create_publisher(String, self._joints_topic,  _LOW_LAT_QOS)
+        self._body_imu_pub = self.create_publisher(Imu, _BODY_IMU_TOPIC, _LOW_LAT_QOS)
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -253,6 +293,12 @@ class _BumiStateNode(Node):
                     msg = String()
                     msg.data = json.dumps(imu_data)
                     self._imu_pub.publish(msg)
+                    # Body IMU for managed fusion (camera IMU is unavailable
+                    # on kernels without CONFIG_HID_SENSOR_HUB).
+                    body = _body_imu_msg(
+                        imu, self.get_clock().now().nanoseconds)
+                    if body is not None:
+                        self._body_imu_pub.publish(body)
 
                 # Joints: 10 Hz
                 if now - last_joints_time >= self._JOINTS_INTERVAL:

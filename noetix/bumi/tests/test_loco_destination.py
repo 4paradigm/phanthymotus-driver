@@ -18,11 +18,13 @@ def _load_device(monkeypatch):
         def __init__(self, name):
             self.subscriptions = []
             self.published = []
+            self.published_topics = []
 
         def create_subscription(self, message_type, topic, callback, qos):
             self.subscriptions.append((topic, callback))
 
         def create_publisher(self, message_type, topic, qos):
+            self.published_topics.append(topic)
             return types.SimpleNamespace(publish=self.published.append)
 
     class String:
@@ -56,6 +58,19 @@ def _load_device(monkeypatch):
     modules["audio_msgs.msg"].AudioChunk = AudioChunk
     modules["sensor_msgs.msg"].CompressedImage = type("CompressedImage", (), {})
     modules["sensor_msgs.msg"].Image = type("Image", (), {})
+
+    class Imu:
+        def __init__(self):
+            self.header = types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id="")
+            self.orientation = types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+            self.angular_velocity = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.linear_acceleration = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.orientation_covariance = [0.0] * 9
+            self.angular_velocity_covariance = [0.0] * 9
+            self.linear_acceleration_covariance = [0.0] * 9
+
+    modules["sensor_msgs.msg"].Imu = Imu
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     path = Path(__file__).resolve().parents[1] / "device.py"
@@ -1169,6 +1184,35 @@ def test_no_limit_cycle_on_20_and_90(monkeypatch):
         assert abs(result['final_error_deg']) <= 2.0, f"{angle}°: {result}"
         flips = _vyaw_sign_flips(fake.cmds)
         assert flips <= 2, f"{angle}° 极限环：vyaw 非零命令变号 {flips} 次"
+
+
+def test_body_imu_bridge_maps_sdk_fields(monkeypatch):
+    # 宿主机内核无 HID_SENSOR_HUB，相机 IMU 在 librealsense 侧不可用；
+    # 融合改用本体 IMU：驱动把 SDK 数据桥成 sensor_msgs/Imu（base_link 系）。
+    module, _ = _load_device(monkeypatch)
+    imu = types.SimpleNamespace(ori=[0.1, 0.2, 0.3, 0.9],
+                                angular_vel=[0.01, 0.02, 0.03],
+                                linear_acc=[0.1, 0.2, 9.7])
+    msg = module._body_imu_msg(imu, 123_456_789)
+    assert msg.header.frame_id == 'bumi_odom_base_link'
+    assert (msg.header.stamp.sec, msg.header.stamp.nanosec) == (0, 123_456_789)
+    assert (msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w) \
+        == (0.1, 0.2, 0.3, 0.9)
+    assert (msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z) \
+        == (0.01, 0.02, 0.03)
+    assert msg.linear_acceleration.z == 9.7
+    # EKF 拒绝零协方差：角速度对角必须为正
+    assert msg.angular_velocity_covariance[4] > 0
+    bad = types.SimpleNamespace(ori=[float('nan')] * 3 + [1.0],
+                                angular_vel=[0.0] * 3, linear_acc=[0.0] * 3)
+    assert module._body_imu_msg(bad, 1) is None      # 非有限值不发布
+
+
+def test_state_node_wires_body_imu_publisher(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    fake_ctrl = types.SimpleNamespace(get_imu_data=lambda: None)
+    node = module._BumiStateNode('ubuntu', fake_ctrl)
+    assert '/bumi_odom/body_imu' in node.published_topics
 
 
 def test_fine_band_replaces_end_phase_crawl(monkeypatch):

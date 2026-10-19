@@ -63,6 +63,19 @@ def _load_device(monkeypatch):
     modules["audio_msgs.msg"].SoundDirection = SoundDirection
     modules["sensor_msgs.msg"].CompressedImage = type("CompressedImage", (), {})
     modules["sensor_msgs.msg"].Image = type("Image", (), {})
+
+    class Imu:
+        def __init__(self):
+            self.header = types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id="")
+            self.orientation = types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+            self.angular_velocity = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.linear_acceleration = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.orientation_covariance = [0.0] * 9
+            self.angular_velocity_covariance = [0.0] * 9
+            self.linear_acceleration_covariance = [0.0] * 9
+
+    modules["sensor_msgs.msg"].Imu = Imu
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     path = Path(__file__).resolve().parents[1] / "device.py"
