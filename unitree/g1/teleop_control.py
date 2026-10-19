@@ -170,7 +170,9 @@ class TeleopControl:
     def start(self, args=None):
         args = args or {}
         if not args.get('input_topic'):
-            return {**self.info(), 'state': 'waiting_binding', 'reason': 'input_topic_required'}
+            return {**self.info(), 'state': 'error', 'reason': 'input_topic_required',
+                    'code': 'input_topic_required',
+                    'error': '没有有效输入 topic，请连接 teleop_device → teleop_control'}
         binding = {'command_topic': args['input_topic'], 'feedback_topic': '/teleop/state'}
         with self._lock:
             same_topics = bool(self.binding and all(self.binding.get(k) == binding[k]

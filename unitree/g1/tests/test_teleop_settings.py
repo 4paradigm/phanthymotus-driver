@@ -30,6 +30,20 @@ def test_internal_shadow_is_still_supported(tmp_path):
     assert not card.live and not card.executor.cfg['live_enabled']
 
 
+@pytest.mark.parametrize('args', [{}, {'input_topic': None}, {'input_topic': ''}])
+def test_start_without_input_topic_reports_error_without_starting_motion(args):
+    motion = SimpleNamespace(executor=SimpleNamespace(cfg={}), clock_id='offline')
+    card = TeleopControl({}, motion)
+    before = card.dispatch('info', {})
+    result = card.dispatch('start', args)
+    assert result['state'] == 'error'
+    assert result['code'] == result['reason'] == 'input_topic_required'
+    assert result['error'] == '没有有效输入 topic，请连接 teleop_device → teleop_control'
+    assert card.dispatch('info', {}) == before
+    assert before['input_status']['state'] == 'waiting_binding'
+    assert card.binding is None and card._thread is None and card._operator is None
+
+
 def input_card(tmp_path):
     motion = SimpleNamespace(executor=SimpleNamespace(cfg={}), clock_id='offline')
     card = TeleopControl({'state_path': str(tmp_path / 'none'), 'mode': 'shadow'}, motion, clock=lambda: 1_000_000_000)
