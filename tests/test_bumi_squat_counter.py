@@ -324,6 +324,92 @@ def test_one_bad_leg_frame_at_bottom_must_rearm_at_standing():
     assert [event["count_total"] for event in sequence.reps()] == [1]
 
 
+def test_degenerate_joint_frame_recovers_without_reset():
+    sequence = Sequence()
+    sequence.hold(0, 27)
+    session = sequence.counter.snapshot()["session_id"]
+    bad = person()
+    for hip_index, knee_index in ((11, 13), (12, 14)):
+        bad["keypoints"][knee_index][:2] = bad["keypoints"][hip_index][:2]
+    sequence.frame(bad)
+    assert sequence.counter.diagnostics()["reason"] == "target_joint_unreadable"
+    assert sequence.counter.snapshot()["state"] == "rearming"
+
+    sequence.hold(0, 5)
+    sequence.rep()
+    assert sequence.counter.snapshot()["session_id"] == session
+    assert sequence.counter.snapshot()["count_total"] == 1
+
+
+def test_stable_new_standing_position_reanchors_without_clearing_count():
+    sequence = Sequence()
+    sequence.hold(0, 27)
+    sequence.rep()
+    session = sequence.counter.snapshot()["session_id"]
+
+    sequence.hold(0, 16, anchor_x=560)
+    assert sequence.counter.snapshot()["session_id"] == session
+    assert sequence.counter.snapshot()["count_total"] == 1
+    assert sequence.counter.snapshot()["state"] == "top"
+    assert [event.get("reanchored") for event in sequence.events
+            if event["type"] == "ready_to_squat"] == [None, True]
+
+    sequence.rep(anchor_x=560)
+    assert sequence.counter.snapshot()["count_total"] == 2
+
+
+def test_initial_shallow_stance_is_replaced_after_a_full_stand():
+    sequence = Sequence()
+    sequence.hold(0.2, 27)
+    old_baseline = sequence.counter.diagnostics()["measurements"]["baseline"]
+    session = sequence.counter.snapshot()["session_id"]
+
+    sequence.hold(0, 12)
+    new_baseline = sequence.counter.diagnostics()["measurements"]["baseline"]
+    assert sequence.counter.snapshot()["session_id"] == session
+    assert sequence.counter.snapshot()["count_total"] == 0
+    assert new_baseline["knee_angle_deg"] > old_baseline["knee_angle_deg"]
+    assert new_baseline["hip_y_px"] < old_baseline["hip_y_px"]
+
+    sequence.rep()
+    assert sequence.counter.snapshot()["count_total"] == 1
+
+
+def test_reanchor_waits_for_standing_and_discards_shifted_partial():
+    sequence = Sequence()
+    sequence.hold(0, 27)
+    sequence.rep()
+
+    sequence.hold(1, 12, anchor_x=560)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    assert len([event for event in sequence.events
+                if event["type"] == "ready_to_squat"]) == 1
+
+    sequence.hold(0, 16, anchor_x=560)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    sequence.rep(anchor_x=560)
+    assert sequence.counter.snapshot()["count_total"] == 2
+
+
+def test_baseline_moves_only_after_a_completed_rep():
+    sequence = Sequence()
+    sequence.hold(0, 27)
+    original = sequence.counter.diagnostics()["measurements"]["baseline"]
+    original_ankle_x = original["ankle_x_px"]
+
+    for depth in (0.2, 0.4, 0.7, 1, 1, 1, 1):
+        sequence.frame(person(depth=depth, anchor_x=460))
+    assert sequence.counter.diagnostics()["measurements"]["baseline"] == original
+
+    for depth in (0.8, 0.6, 0.4, 0.2, 0, 0, 0, 0, 0):
+        sequence.frame(person(depth=depth, anchor_x=460))
+    assert sequence.counter.snapshot()["count_total"] == 1
+    assert (sequence.counter.diagnostics()["measurements"]["baseline"]["hip_y_px"]
+            == original["hip_y_px"])
+    assert (sequence.counter.diagnostics()["measurements"]["baseline"]["ankle_x_px"]
+            > original_ankle_x)
+
+
 def test_short_occlusion_keeps_session_but_discards_interrupted_half_rep():
     sequence = Sequence()
     sequence.hold(0, 27)

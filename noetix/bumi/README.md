@@ -336,6 +336,11 @@ session and total. If that person returns in another part of the image, it
 recalibrates standing pose before counting again. During a stall, check
 `status.input_stale` and the Chinese debug fields `判定原因` and `目标状态`;
 `reset` clears the total but cannot restore a stopped pose or ASR stream.
+The standing baseline now follows verified top poses slightly after completed
+reps. If a shifted person or camera makes the old reference unusable, a stable
+upright pose for about 0.8 s updates the baseline without clearing the total;
+the interrupted rep is discarded. A frame with invalid leg geometry also
+requires standing again instead of leaving the card permanently paused.
 To install the instruction in `fitness_squat_skill.md`, create a skill under
 Resource Center → My Skills with slug `bumi-squat-coach`, category `utility`,
 and required tools `squat_counter, tts`; paste the file's instruction body,

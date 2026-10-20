@@ -21,6 +21,7 @@
 
 - 只消费 `squat_counter` 的 `.../fitness/squat/events`，不要把每帧骨架或状态话题送进大模型。
 - 收到 `ready_to_squat` 时调用 `squat_counter.status`。仅当事件与状态的 `session_id`、`seq` 都相同，且状态显示 `calibrated=true`、`phase=top`、`target_state=tracking`、`input_stale=false` 时才调用 TTS `speak`：本组尚未计数则说“已站稳，可以开始深蹲了”，已有次数则说“站姿已重新确认，可以继续深蹲”。如果查询时已经下蹲、目标丢失或输入过期，不播报过时的开始提示。同一个事件 `seq` 不重复播报；`session_started` 和 `target_changed` 本身不表示已校准。
+- 用户问为什么停止计数时，查询 `status` 和 `debug`；若判定原因显示正在自动更新站姿基线，提示其站稳等待，不要把重新校准当成清零。
 - 收到 `rep_completed` 时先调用 `squat_counter.status`，以其 `session_id` 与 `count_total` 为准。若事件属于旧会话，或查询总数不大于当前会话的 `last_spoken_count`，不播报。
 - 总数增加后调用绑定的 TTS `speak`，每次只说最新累计数，例如“四次”；提交播报后更新 `last_spoken_count`。一次模型思考期间可能完成多次动作，应合并播报最新总数，不补念过时的数字。不要在每次计数后追加鼓励、总结或再次播报。
 - 收到 `target_lost` 时，先查询最新 `status`；目标仍丢失才简短提醒“请回到画面并站稳”。收到 `target_reacquired` 时等重新站稳，不另行播报；收到 `target_changed` 时说明已换目标、开启新会话，记录新 `session_id` 并把 `last_spoken_count` 设为 0。可用 `previous_count_total` 报告上一会话的次数，不要把两人的次数相加。

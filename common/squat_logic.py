@@ -32,6 +32,9 @@ DEFAULT_CONFIG = {
     "baseline_hip_min_deg": 140.0,
     "baseline_angle_jitter_deg": 12.0,
     "baseline_position_jitter_ratio": 0.08,
+    "reanchor_dwell_s": 0.8,
+    "reanchor_knee_min_deg": 150.0,
+    "reanchor_hip_min_deg": 150.0,
     "start_knee_drop_deg": 12.0,
     "start_hip_drop_deg": 8.0,
     "start_hip_drop_ratio": 0.025,
@@ -162,6 +165,7 @@ class SquatCounter:
         self._side = None
         self._baseline: _Sample | None = None
         self._baseline_samples: list[tuple[float, _Sample]] = []
+        self._reanchor_samples: list[tuple[float, _Sample]] = []
         self._recent: deque[_Sample] = deque(maxlen=self.config["smoothing_frames"])
         self._state = "waiting_target"
         self._target_state = "none"
@@ -213,6 +217,8 @@ class SquatCounter:
                 "knee_angle_deg": value.knee,
                 "hip_angle_deg": value.hip,
                 "hip_y_px": value.hip_y,
+                "ankle_x_px": value.ankle_x,
+                "ankle_y_px": value.ankle_y,
                 "leg_scale_px": value.leg_scale,
             }
 
@@ -297,7 +303,8 @@ class SquatCounter:
             "measurements": {
                 **(sample_view(sample) or {
                     "knee_angle_deg": None, "hip_angle_deg": None,
-                    "hip_y_px": None, "leg_scale_px": None,
+                    "hip_y_px": None, "ankle_x_px": None,
+                    "ankle_y_px": None, "leg_scale_px": None,
                 }),
                 "baseline": sample_view(base),
                 "baseline_knee_angle_deg": base.knee if base is not None else None,
@@ -314,6 +321,9 @@ class SquatCounter:
                 "calibration_elapsed_s": elapsed(self._baseline_samples[0][0])
                 if self._baseline_samples else None,
                 "calibration_samples": len(self._baseline_samples),
+                "reanchor_elapsed_s": elapsed(self._reanchor_samples[0][0])
+                if self._reanchor_samples else None,
+                "reanchor_samples": len(self._reanchor_samples),
                 "motion_elapsed_s": elapsed(self._motion_started),
                 "bottom_dwell_elapsed_s": elapsed(self._bottom_since),
                 "top_dwell_elapsed_s": elapsed(self._top_since),
@@ -341,6 +351,7 @@ class SquatCounter:
             self._cancel_partial(require_stand=True)
             self._recent.clear()
             self._baseline_samples.clear()
+            self._reanchor_samples.clear()
 
         candidates = self._candidates(payload)
         self._debug_candidates = [_candidate_summary(candidate) for candidate in
@@ -367,6 +378,7 @@ class SquatCounter:
         self._cancel_partial(require_stand=True)
         self._recent.clear()
         self._baseline_samples.clear()
+        self._reanchor_samples.clear()
         self._target_state = "missing"
         self._state = "paused"
         self._debug_reason = ("target_unreadable" if matched is not None
@@ -398,6 +410,7 @@ class SquatCounter:
                 # while out of view. Relearn standing pose but retain the count.
                 self._baseline = None
                 self._baseline_samples.clear()
+                self._reanchor_samples.clear()
                 self._recent.clear()
                 self._side = None
                 self._needs_rearm = False
@@ -439,6 +452,7 @@ class SquatCounter:
         self._side = None
         self._baseline = None
         self._baseline_samples.clear()
+        self._reanchor_samples.clear()
         self._recent.clear()
         self._state = "calibrating"
         self._target_state = "tracking"
@@ -599,14 +613,18 @@ class SquatCounter:
             other = "right" if self._side == "left" else "left"
             sample = self._measure(candidate, other)
             if sample is None:
-                self._cancel_partial()
-                self._state = "paused"
+                self._cancel_partial(require_stand=True)
+                self._recent.clear()
+                self._baseline_samples.clear()
+                self._reanchor_samples.clear()
+                self._state = "rearming" if self._baseline is not None else "calibrating"
                 self._debug_reason = "target_joint_unreadable"
                 return
             # Do not compare one leg against the other leg's baseline.
             self._side = other
             self._baseline = None
             self._baseline_samples.clear()
+            self._reanchor_samples.clear()
             self._recent.clear()
             self._cancel_partial()
             self._state = "calibrating"
@@ -677,6 +695,56 @@ class SquatCounter:
         if self._baseline is not None and self._state in ("descent", "bottom", "ascent"):
             self._state = "top"
 
+    def _try_reanchor(self, sample: _Sample, timestamp: float,
+                      events: list[dict] | None) -> bool:
+        """Recover a stale position baseline from a stable, upright subject.
+
+        This only runs outside a valid repetition or after a moved ankle has
+        canceled one. The existing total and session are kept.
+        """
+        cfg = self.config
+        if (sample.knee < cfg["reanchor_knee_min_deg"]
+                or sample.hip < cfg["reanchor_hip_min_deg"]
+                or sample.hip_y >= sample.ankle_y):
+            self._reanchor_samples.clear()
+            return False
+        self._reanchor_samples.append((timestamp, sample))
+        samples = [item for _, item in self._reanchor_samples]
+        scale = max(1.0, median(item.leg_scale for item in samples))
+        position_limit = cfg["baseline_position_jitter_ratio"] * scale
+        if (max(item.knee for item in samples) - min(item.knee for item in samples)
+                > cfg["baseline_angle_jitter_deg"]
+                or max(item.hip for item in samples) - min(item.hip for item in samples)
+                > cfg["baseline_angle_jitter_deg"]
+                or max(item.hip_y for item in samples) - min(item.hip_y for item in samples)
+                > position_limit
+                or math.dist(
+                    (max(item.ankle_x for item in samples),
+                     max(item.ankle_y for item in samples)),
+                    (min(item.ankle_x for item in samples),
+                     min(item.ankle_y for item in samples)),
+                ) > position_limit):
+            self._reanchor_samples[:] = self._reanchor_samples[-1:]
+            self._debug_reason = "reanchor_waiting_still"
+            return False
+        if (len(samples) < 3 or
+                timestamp - self._reanchor_samples[0][0] < cfg["reanchor_dwell_s"]):
+            self._debug_reason = "reanchor_collecting"
+            return False
+        self._baseline = _Sample(*(median(getattr(item, field) for item in samples)
+                                   for field in _Sample.__dataclass_fields__))
+        self._reanchor_samples.clear()
+        self._recent.clear()
+        self._recent.append(sample)
+        self._cancel_partial()
+        self._needs_rearm = False
+        self._state = "top"
+        self._debug_reason = "baseline_reanchored"
+        if events is not None:
+            events.append(self._emit("ready_to_squat", timestamp,
+                                     calibrated=True, reanchored=True))
+        return True
+
     def _step(self, sample: _Sample, timestamp: float,
               events: list[dict] | None) -> None:
         base = self._baseline
@@ -686,6 +754,7 @@ class SquatCounter:
         if ankle_motion > self.config["ankle_motion_max_ratio"]:
             self._cancel_partial(require_stand=True)
             self._debug_reason = "ankle_motion_exceeded"
+            self._try_reanchor(sample, timestamp, events)
             return
         knee_drop = base.knee - sample.knee
         hip_drop = base.hip - sample.hip
@@ -704,7 +773,9 @@ class SquatCounter:
             if not top:
                 self._top_since = None
                 self._debug_reason = "waiting_for_top_to_rearm"
+                self._try_reanchor(sample, timestamp, events)
                 return
+            self._reanchor_samples.clear()
             if self._top_since is None:
                 self._top_since = timestamp
             if timestamp - self._top_since >= self.config["top_dwell_s"]:
@@ -717,12 +788,17 @@ class SquatCounter:
             return
         if self._state == "top":
             if moving_down:
+                self._reanchor_samples.clear()
                 self._state = "descent"
                 self._motion_started = timestamp
                 self._bottom_since = timestamp if bottom else None
                 self._debug_reason = "descent_started"
             else:
                 self._debug_reason = "waiting_for_descent"
+                if not top:
+                    self._try_reanchor(sample, timestamp, events)
+                else:
+                    self._reanchor_samples.clear()
             return
         if self._state == "descent":
             if top:
@@ -766,6 +842,14 @@ class SquatCounter:
                 self.count_total += 1
                 self._state = "top"
                 self._cancel_partial()
+                self._reanchor_samples.clear()
+                if (sample.knee >= self.config["reanchor_knee_min_deg"]
+                        and sample.hip >= self.config["reanchor_hip_min_deg"]):
+                    # Follow small changes in the verified top pose. Freeze
+                    # the baseline throughout the down/up part of each rep.
+                    self._baseline = _Sample(*(
+                        0.8 * getattr(base, field) + 0.2 * getattr(sample, field)
+                        for field in _Sample.__dataclass_fields__))
                 self._debug_reason = "rep_completed"
                 if events is not None:
                     events.append(self._emit("rep_completed", timestamp))
