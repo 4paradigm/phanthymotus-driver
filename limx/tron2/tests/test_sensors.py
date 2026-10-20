@@ -850,6 +850,7 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(self.function('common_root')('/work/main.py'), Path('/work'))
 
     def test_staged_entry_imports_without_repository_layout(self):
+        from device import VERSION
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
@@ -858,7 +859,7 @@ class PackagingTests(unittest.TestCase):
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.9.1"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == '+repr(VERSION)+'; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)

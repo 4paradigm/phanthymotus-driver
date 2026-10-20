@@ -15,7 +15,8 @@ ACP_TIMEOUT = POSE_ACP_TIMEOUT
 TELEOP_HEALTH_URL = 'http://127.0.0.1:15794/health'
 LABELS = {'salute':'salute', 'wave':'wave', 'welcome':'welcome'}
 PLANNED_DEG_PER_SECOND = 12.  # Unified planned travel/duration; not measured velocity.
-WAVE_DEG_PER_SECOND = 24.  # Faster yaw-only swings; raising/returning stay at 12.
+WAVE_DEG_PER_SECOND = 24.  # Baseline travel/duration before preset time scaling.
+MOTION_SCALES = {'salute':1.2, 'wave':1.2, 'welcome':1.}
 # Designed against TRON2 FK, not borrowed joint values from another robot.
 LEFT_FRAMES = {
     'salute': [-75, 60, 0, -120, 0, 0, 0],
@@ -140,6 +141,9 @@ class Pose:
             'execution':'time_indexed_quintic_servoj','head_policy':'center_before_arm_trajectory',
             'servo_target_hz':300,'hard_realtime_guaranteed':False,
             'trajectory_peak_deg_per_second':{'arm':22.5,'wave_yaw':45.},
+            'preset_motion_scales':dict(MOTION_SCALES),
+            'preset_peak_deg_per_second':{'salute':27.,'wave':{'arm':27.,'yaw':54.},'welcome':22.5},
+            'preset_peak_acceleration_deg_per_second_squared':{'salute':86.4,'wave':86.4,'welcome':60.},
             'physical_presets_verified':False}
 
     def plan(self,args):
@@ -204,7 +208,8 @@ class Pose:
         validate_movej(final_target,duration)
         frames.append({'label':'home','joint':final_target,'time':duration,'hold':0})
         waypoints=frames
-        frames=blocks(current,waypoints)
+        motion_scale=MOTION_SCALES[name]
+        frames=blocks(current,waypoints,motion_scale)
         screening_frames=[]
         for frame in frames:
             screening_frames.extend(frame['path'].screening_frames() if frame.get('kind')=='trajectory' else [frame])
@@ -215,8 +220,9 @@ class Pose:
             duration=max(2.,max(abs(math.degrees(q)) for q in head_start)/12.)
             frames.insert(0,{'kind':'head','label':'center_head','joint':list(current),
                 'head_joint':[0.,0.],'time':duration,'hold':0})
-        return {'frames':frames,'waypoints':waypoints,'start_head_q':head_start,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
-            'wave_planned_deg_per_second':WAVE_DEG_PER_SECOND if name=='wave' else None,
+        return {'frames':frames,'waypoints':waypoints,'start_head_q':head_start,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':round(PLANNED_DEG_PER_SECOND*motion_scale,2),
+            'motion_scale':motion_scale,
+            'wave_planned_deg_per_second':round(WAVE_DEG_PER_SECOND*motion_scale,2) if name=='wave' else None,
             'home_q':list(target_home),'pose_sha256':home['pose_sha256'],'motion_tool':'pose',
             'execution':'time_indexed_quintic_servoj','head_policy':'center_before_arm_trajectory','gripper_policy':'right_open_close_once_ends_closed' if name=='wave' else 'unchanged','returns_to_home':True,
             'physical_presets_verified':False,

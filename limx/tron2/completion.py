@@ -57,10 +57,20 @@ class ArmCompletion:
         return MoveError('Arms are busy or require operator verification; no additional motion sent', False)
 
     def summary(self):
-        return ({**{key:self.active[key] for key in ('action_id','action','state')},
-                 **({k:self.active[k] for k in ('stage','completed_stages','stage_label','stage_kind')} if 'sequence' in self.active else {}),
-                 **({k:self.active['details'][k] for k in ('motion_tool','preset','stages_total')} if 'sequence' in self.active else {})}
-                if self.active else self.last)
+        if not self.active:
+            return self.last
+        result={key:self.active[key] for key in ('action_id','action','state')}
+        if 'sequence' in self.active:
+            result.update({k:self.active[k] for k in ('stage','completed_stages','stage_label','stage_kind')})
+            result.update({k:self.active['details'][k] for k in ('motion_tool','preset','stages_total')})
+        # Keep ownership visibly blocked while exposing this task's terminal
+        # error. Never merge an earlier action's outcome into a current task.
+        if self.last and self.last.get('action_id')==self.active['action_id']:
+            for key in ('status','error','error_code','arrival_verified','callback_delivered',
+                        'motion_sent','motion_may_continue','trajectory_samples_sent','trajectory_diagnostics'):
+                if key in self.last:
+                    result[key]=self.last[key]
+        return result
 
     async def dispatch(self, action, target, duration, details, *, sequence=None, guard=None):
         # Core can wake its next action before the callback HTTP response has
@@ -301,6 +311,7 @@ class ArmCompletion:
             result.update(action='pose',joint_count=14,completion_protocol='acp',
                 head_center_verified=job.get('head_center_verified',False) or status=='completed',
                 trajectory_samples_sent=job.get('trajectory_samples_sent',0),
+                trajectory_diagnostics=job.get('trajectory_diagnostics',[]),
                 stage_label=job.get('stage_label'),stage_kind=job.get('stage_kind'),
                 gripper_steps=job.get('gripper_results',[]),
                 **({'gripper_step_error':job['gripper_step_error']} if 'gripper_step_error' in job else {}),

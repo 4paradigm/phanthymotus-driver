@@ -32,7 +32,10 @@ class Path:
     waiting for a stationary feedback window at every reversal. No overshoot:
     overlapping ramps affect disjoint joints and smooth() is monotonic.
     """
-    def __init__(self, start, frames):
+    def __init__(self, start, frames, motion_scale=1.):
+        if type(motion_scale) not in (int,float) or not math.isfinite(motion_scale) or not 1.<=motion_scale<=1.2:
+            raise ValueError('Preset motion scale must be between 1 and 1.2')
+        self.motion_scale = motion_scale
         self.start = list(start)
         self.ramps = []
         self.holds = []
@@ -48,6 +51,10 @@ class Path:
             travel = max(abs(math.degrees(v)) for v in delta)
             # Quintic peak acceleration is 10/sqrt(3) * travel / duration^2.
             duration = max(duration, math.sqrt((10/math.sqrt(3))*travel/MAX_ACCEL_DEG))
+            # Scale the complete ramp, including acceleration-limited swings.
+            # Presentation holds retain their requested duration. Peak speed
+            # scales linearly; peak acceleration scales by motion_scale^2.
+            duration /= motion_scale
             overlap = (.25*min(previous_duration,duration)
                        if previous_axes and axes and not axes & previous_axes and previous_hold==0 else 0.)
             begins = end-overlap
@@ -80,7 +87,7 @@ class Path:
         return [{'joint':self.at(self.duration*i/count)} for i in range(count+1)]
 
 
-def blocks(start, frames):
+def blocks(start, frames, motion_scale=1.):
     """Keep gripper barriers; continuous arm output between those barriers."""
     result = []
     pending = []
@@ -88,7 +95,7 @@ def blocks(start, frames):
     def flush():
         nonlocal pending,current
         if pending:
-            path = Path(current,pending)
+            path = Path(current,pending,motion_scale)
             result.append({'kind':'trajectory','label':'trajectory_'+pending[-1]['label'],
                 'joint':list(path.target),'time':path.duration,'hold':0,'path':path})
             current = list(path.target)
@@ -117,10 +124,16 @@ async def run(owner, job, frame, admitted):
     guard_task = None
     next_guard = started+CONTROL_GUARD_INTERVAL
     sent = 0
+    diagnostics = {'stage_label':frame['label'],'target_hz':OUTPUT_HZ,
+        'samples_sent':0,'max_output_gap_seconds':0.,'max_socket_send_seconds':0.,
+        'max_feedback_age_seconds':0.,'max_tracking_error_deg':0.}
+    job.setdefault('trajectory_diagnostics',[]).append(diagnostics)
     try:
         with reader.pose_servo(job) as token:
             while True:
                 now = time.monotonic()
+                if not first:
+                    diagnostics['max_output_gap_seconds']=max(diagnostics['max_output_gap_seconds'],now-last_output)
                 if owner.closed or owner.active is not job or job['cancel_sequence']:
                     raise MoveError('Trajectory output cancelled; stationary stop is not yet verified',bool(sent),'trajectory_cancelled')
                 if reader.ws is not job['ws'] or reader.serial!=job['serial'] or not reader.connected:
@@ -140,6 +153,8 @@ async def run(owner, job, frame, admitted):
                     stamp = current
                     advanced_at = now
                 age = sample.get('reception_age_seconds')
+                if type(age) in (int,float) and math.isfinite(age):
+                    diagnostics['max_feedback_age_seconds']=max(diagnostics['max_feedback_age_seconds'],age)
                 if age is None or age>MAX_FEEDBACK_AGE or now-advanced_at>MAX_FEEDBACK_AGE:
                     raise MoveError('Trajectory feedback stale/frozen',bool(sent),'trajectory_feedback')
                 status = reader.sample('robot_status')
@@ -150,7 +165,9 @@ async def run(owner, job, frame, admitted):
                 # Feedback lag is bounded by the same freshness gate. Compare to
                 # the commanded history at receipt age, not only a future target.
                 reference = path.at(max(0.,elapsed-age))
-                if max(abs(math.degrees(a-b)) for a,b in zip(q,reference))>TRACKING_DEG:
+                tracking_error = max(abs(math.degrees(a-b)) for a,b in zip(q,reference))
+                diagnostics['max_tracking_error_deg']=max(diagnostics['max_tracking_error_deg'],tracking_error)
+                if tracking_error>TRACKING_DEG:
                     raise MoveError('Trajectory tracking error exceeds 8 degrees',bool(sent),'trajectory_tracking')
                 for index,(begins,dwell,goal) in enumerate(path.holds):
                     if index in verified_holds or elapsed<begins:
@@ -179,7 +196,11 @@ async def run(owner, job, frame, admitted):
                 # Always hold native head axes at zero in the 16D protocol.
                 # Pure 14D arm validation also runs in the transport per sample.
                 job['motion_sent'] = True if sent else None
-                await reader.send_pose_servoj(target+[0.,0.],token)
+                send_started=time.monotonic()
+                try:
+                    await reader.send_pose_servoj(target+[0.,0.],token)
+                finally:
+                    diagnostics['max_socket_send_seconds']=max(diagnostics['max_socket_send_seconds'],time.monotonic()-send_started)
                 sent += 1
                 last_output = now  # Include time spent blocked in submission.
                 if first:
@@ -208,6 +229,8 @@ async def run(owner, job, frame, admitted):
                 # Rebase to actual completion: late ticks never create a burst.
                 await asyncio.sleep(max(0.,1/OUTPUT_HZ-(time.monotonic()-now)))
     finally:
+        diagnostics.update(samples_sent=sent,elapsed_seconds=time.monotonic()-started)
+        diagnostics['average_output_hz']=sent/diagnostics['elapsed_seconds'] if diagnostics['elapsed_seconds'] else 0.
         if guard_task and not guard_task.done():
             guard_task.cancel()
             await asyncio.gather(guard_task,return_exceptions=True)

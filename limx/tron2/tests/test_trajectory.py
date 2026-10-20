@@ -85,6 +85,35 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([f['kind'] for f in p['frames']],['trajectory','gripper','gripper','trajectory'])
         self.assertEqual([f['gripper']['opening_mm'] for f in p['frames'] if f['kind']=='gripper'],[85,0])
 
+    def test_speedup_scales_every_salute_wave_ramp_but_not_holds_targets_or_welcome(self):
+        for name in pose.LABELS:
+            fast=self.adapter.pose.plan({'pose':name})
+            with patch.dict(pose.MOTION_SCALES,salute=1.,wave=1.,welcome=1.):
+                baseline=self.adapter.pose.plan({'pose':name})
+            scale=1. if name=='welcome' else 1.2
+            for current,prior in zip(fast['frames'],baseline['frames']):
+                if current['kind']!='trajectory':
+                    self.assertEqual(current,prior)
+                    continue
+                a,b=current['path'],prior['path']
+                self.assertEqual(a.start,b.start);self.assertEqual(a.target,b.target)
+                for ramp,old in zip(a.ramps,b.ramps):
+                    self.assertAlmostEqual(ramp[1]*scale,old[1])
+                    self.assertEqual(ramp[2:],old[2:])
+                self.assertEqual([h[1:] for h in a.holds],[h[1:] for h in b.holds])
+                # Ramp maxima remain analytically bounded, including yaw swings.
+                for _,duration,delta,_ in a.ramps:
+                    travel=max(abs(math.degrees(v)) for v in delta)
+                    self.assertLessEqual(10/math.sqrt(3)*travel/duration**2,60*scale**2+1e-8)
+            self.assertEqual(fast['motion_scale'],scale)
+            if name=='welcome':self.assertEqual(fast['planned_motion_seconds'],baseline['planned_motion_seconds'])
+            else:self.assertLess(fast['planned_motion_seconds'],baseline['planned_motion_seconds'])
+
+    def test_unbounded_or_nonfinite_motion_scale_is_rejected(self):
+        frame={'joint':list(HOME),'time':1,'hold':0,'label':'home'}
+        for scale in (True,False,0,.9,1.200001,math.nan,math.inf,'1.2',None):
+            with self.assertRaises(ValueError):Path(HOME,[frame],scale)
+
     def test_head_not_centered_is_planned_before_arms_without_any_write(self):
         self.accept_feedback(HOME+[math.radians(30),math.radians(40)])
         p=self.adapter.pose.plan({'pose':'salute'})
@@ -103,6 +132,11 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(last['vendor_acknowledged'])
         self.assertIsNone(self.reader._pose_servo);self.assertIsNone(self.adapter.motion.active)
         self.assertEqual(self.adapter._report_completion.await_count,1)
+        diag=last['trajectory_diagnostics'][0]
+        self.assertEqual(diag['samples_sent'],len(self.servo_writes))
+        self.assertGreater(diag['average_output_hz'],0)
+        self.assertGreater(diag['max_output_gap_seconds'],0)
+        self.assertGreaterEqual(diag['max_tracking_error_deg'],0)
 
     async def test_center_ack_and_arrival_precede_first_servo_and_no_child_acp(self):
         self.accept_feedback(HOME+[.2,.3]);events=[]
@@ -161,6 +195,19 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.adapter.motion.last['status'],'error')
             self.reader.send_gripper.assert_not_awaited()
             self.assertIsNotNone(self.adapter.motion.active)
+            summary=self.adapter.motion.summary()
+            self.assertEqual(summary['action_id'],self.adapter.motion.last['action_id'])
+            self.assertEqual(summary['error_code'],self.adapter.motion.last['error_code'])
+            self.assertEqual(summary['state'],'blocked_requires_operator_check')
+            self.assertTrue(summary['motion_may_continue'])
+            self.assertTrue(summary['trajectory_diagnostics'])
+
+    async def test_active_summary_never_borrows_previous_task_error(self):
+        motion=self.adapter.motion
+        motion.last={'action_id':'old','error':'old failure','error_code':'old_code'}
+        motion.active={'action_id':'current','action':'move','state':'moving'}
+        self.assertEqual(motion.summary(),motion.active)
+        motion.active=None
 
     async def test_stop_stops_future_stream_writes_and_retains_uncertain_owner(self):
         writes=[]
