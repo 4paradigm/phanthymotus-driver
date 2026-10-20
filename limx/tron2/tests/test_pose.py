@@ -393,6 +393,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         arm_stages=[i for i,f in enumerate(plan['frames'],1) if f.get('kind')!='gripper']
         self.assertEqual(len(self.frames),len(arm_stages));self.assertEqual(self.arrivals,arm_stages)
         self.assertEqual([v['right_opening'] for v in self.claw_writes],[94,0])
+        self.assertTrue(all(v['right_speed']==100 and v['right_force']==10 for v in self.claw_writes))
         self.assertEqual(len(callback[3]['gripper_steps']),2)
         self.assertEqual(self.frames[-1],HOME);self.assertTrue(callback[3]['at_home']);self.assertIsNone(self.adapter.motion.active)
         self.assertEqual(self.adapter._report_completion.await_count,1)
@@ -636,6 +637,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(writes),10);self.assertEqual(set(writes[0]),{'joint','time'})
                 self.assertEqual(events,['arm']*8+['claw']*2+['arm']*2)
                 self.assertEqual([v['right_opening'] for v in grip_writes],[94,0])
+                self.assertTrue(all(v['right_speed']==100 and v['right_force']==10 for v in grip_writes))
                 self.assertTrue(all(set(v)=={'right_opening','right_speed','right_force'} for v in grip_writes))
                 self.assertEqual(len(writes[0]['joint']),14);self.assertEqual(len(callbacks),1)
                 self.assertEqual(callbacks[0]['action_id'],accepted['action_id']);self.assertEqual(callbacks[0]['tool'],'pose')

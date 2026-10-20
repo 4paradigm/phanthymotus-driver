@@ -207,7 +207,7 @@ class Pose:
                 for action,opening in (('open',85),('close',0)):
                     frames.append({'kind':'gripper','label':'gripper_'+action+'_1',
                         'joint':list(q),'time':0,'hold':0,
-                        'gripper':{'side':'right','opening_mm':opening,'speed':10,'force':10}})
+                        'gripper':{'side':'right','opening_mm':opening,'speed':100,'force':10}})
         final_target=list(target_home)
         if side=='right':final_target[:7]=current[:7]  # No idle-left correction during right-only gestures.
         duration=max(2.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(previous,final_target))/PLANNED_DEG_PER_SECOND*10)/10)

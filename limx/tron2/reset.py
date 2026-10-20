@@ -12,6 +12,16 @@ ARM_NAMES = ['proximal_pitch_L_Joint', 'proximal_roll_L_Joint', 'proximal_yaw_L_
              'elbow_R_Joint', 'wrist_yaw_R_Joint', 'wrist_pitch_R_Joint', 'wrist_roll_R_Joint']
 
 
+RESET_SPEED_SCALE = 1.2
+
+
+def duration_for_change(delta_degrees):
+    """Shared pose-preparation/arm reset timing;20% faster than the old rule."""
+    if type(delta_degrees) not in (int,float) or not math.isfinite(delta_degrees) or delta_degrees<0:
+        raise ValueError('Reset requires a finite non-negative joint change; no motion sent')
+    return max(8,math.ceil(delta_degrees/5))/RESET_SPEED_SCALE
+
+
 
 class ResetPose:
     def __init__(self, path, reader):
@@ -64,8 +74,8 @@ class ResetPose:
                 raise ValueError('Unsupported named arm feedback; no motion sent')
             current = [current[names.index(name)] for name in ARM_NAMES]
         delta = max(abs(math.degrees(a-b)) for a, b in zip(current[:14], target))
-        # At least eight seconds; retain a conservative duration for larger changes.
-        duration = max(8, math.ceil(delta / 5))
+        # Share the same20% faster timing with automatic pose preparation.
+        duration = duration_for_change(delta)
         validate_movej(target, duration)
         result = {'action': action, 'motion_sent': False, 'target_q': target,
                   'duration_seconds': duration, 'max_joint_change_deg': delta,

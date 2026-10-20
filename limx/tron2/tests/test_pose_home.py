@@ -32,7 +32,7 @@ class HomePreparationTests(unittest.IsolatedAsyncioTestCase):
             plan=self.adapter.pose.plan({'pose':preset})
             self.assertEqual([f['kind'] for f in plan['frames'][:3]],['home','head','trajectory'])
             home=plan['frames'][0]
-            self.assertEqual(home['joint'],HOME);self.assertEqual(home['time'],16)
+            self.assertEqual(home['joint'],HOME);self.assertAlmostEqual(home['time'],16/1.2)
             self.assertEqual(plan['start_q'],start);self.assertEqual(plan['frames'][2]['path'].start,HOME)
             self.assertTrue(plan['home_preparation_required'])
             self.assertFalse(plan['collision_checked']);self.assertEqual(plan['home_policy'],'verify_then_reset_if_needed')
@@ -104,7 +104,7 @@ class HomePreparationTests(unittest.IsolatedAsyncioTestCase):
         self.away(head=True);events=[]
         plan=self.adapter.pose.plan({'pose':'salute'})
         async def home(q,duration):
-            events.append('home');self.assertEqual(q,HOME);self.assertEqual(duration,16)
+            events.append('home');self.assertEqual(q,HOME);self.assertAlmostEqual(duration,16/1.2)
             self.accept_feedback(q+self.position[14:]);return {'status':'accepted','motion_sent':True}
         async def home_arrival(job):
             events.append('home_verified');self.accept_feedback()

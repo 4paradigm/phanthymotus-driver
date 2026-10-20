@@ -33,7 +33,7 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
         frames=[{'kind':'trajectory','path':path,'joint':current,'time':path.duration,'hold':0,'label':'test_trajectory'}]
         if grip:
             frames += [{'kind':'gripper','label':'gripper_'+action,'joint':current,'time':0,'hold':0,
-                        'gripper':{'side':'right','opening_mm':value,'speed':10,'force':10}}
+                        'gripper':{'side':'right','opening_mm':value,'speed':100,'force':10}}
                        for action,value in (('open',85),('close',0))]
         if head:
             frames.insert(0,{'kind':'head','head_joint':[0.,0.],'joint':current,'time':.1,'hold':0,'label':'center_head'})
@@ -298,7 +298,7 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                     continue  # Deliberately no positive response exists.
                 if title=='request_movej':
                     events.append('home');self.assertEqual(body['data']['joint'],HOME)
-                    self.assertEqual(body['data']['time'],8)
+                    self.assertAlmostEqual(body['data']['time'],8/1.2)
                     feedback[:14]=body['data']['joint'];data={'result':'success'}
                 elif title=='request_moveh':
                     events.append('head');feedback[14:]=body['data']['joint'];data={'result':'success'}
@@ -309,7 +309,9 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                     stamp+=1;data={'result':'success','timestamp':stamp,'left_opening':0,
                         'left_speed':0,'left_force':0,'right_opening':claw,'right_speed':0,'right_force':0}
                 elif title=='request_set_limx_2fclaw_cmd':
-                    events.append('claw');claw=body['data']['right_opening'];data={'result':'success'}
+                    events.append('claw');self.assertEqual(body['data']['right_speed'],100)
+                    self.assertEqual(body['data']['right_force'],10)
+                    claw=body['data']['right_opening'];data={'result':'success'}
                 else:raise AssertionError(title)
                 await ws.send_json({'accid':body['accid'],'guid':body['guid'],
                     'title':title.replace('request_','response_'),'data':data})
@@ -336,7 +338,7 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                 adapter=Adapter(lambda *a:None,settings(home_file=str(self.file),enabled_cards=['pose']),reader,session)
                 plan=self.short_plan(head=True,grip=True);plan['start_head_q']=[.2,.3]
                 plan.update(start_q=start,home_preparation_required=True,home_policy='verify_then_reset_if_needed')
-                plan['frames'].insert(0,{'kind':'home','label':'prepare_home','joint':list(HOME),'time':8,'hold':0})
+                plan['frames'].insert(0,{'kind':'home','label':'prepare_home','joint':list(HOME),'time':8/1.2,'hold':0})
                 rpc=web.Application();rpc.router.add_post('/mcp',adapter.rpc)
                 rpc_runner=web.AppRunner(rpc,shutdown_timeout=.2);await rpc_runner.setup()
                 rpc_site=web.TCPSite(rpc_runner,'127.0.0.1',0);await rpc_site.start()

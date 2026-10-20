@@ -696,7 +696,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         for name in ('arm_control',):
             for action in ('info', 'start', 'stop'):
                 self.assertNotIn(action, tools[name]['inputSchema']['properties']['action']['enum'])
-                kwargs = {'joint': [.1]*14, 'time': 8} if name == 'arm_control' else {}
+                kwargs = {'joint': [.1]*14, 'time': 8/1.2} if name == 'arm_control' else {}
                 error, result = await self.call(name, action=action,
                     instance_id='canvas', _trace_id='valid', **kwargs)
                 self.assertFalse(error)
@@ -771,7 +771,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result['status'], 'accepted')
             self.assertFalse(result['arrival_verified'])
             self.assertEqual(len(sent), 1)
-            self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 8})
+            self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 8/1.2})
             await self.adapter.motion.task
             self.assertEqual(self.adapter.motion.report.await_args.args[:2],
                              (result['action_id'], 'completed'))
@@ -792,7 +792,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             terminal = self.adapter.motion.report.await_args.args[2]
             self.assertTrue(terminal['at_home'])
             self.assertTrue(terminal['reset_verified'])
-            self.adapter.reader.send_movej.assert_awaited_once_with([.1]*14, 8)
+            self.adapter.reader.send_movej.assert_awaited_once_with([.1]*14, 8/1.2)
 
     async def test_json_rpc_notification_and_parse_errors(self):
         async with self.session.post(self.url+'/mcp', json={

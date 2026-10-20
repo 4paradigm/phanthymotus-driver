@@ -5,6 +5,7 @@ import time
 from uuid import uuid4
 
 from skeleton import skeleton_stream
+from reset import duration_for_change
 from vendor import MoveError, validate_movej, motion_readiness
 
 ACP_TIMEOUT = 120
@@ -122,7 +123,7 @@ class ArmCompletion:
             if kind in ('arm','home'):
                 if kind=='home' and (index!=0 or frame['joint']!=plan['home_q'] or
                         frame['label']!='prepare_home' or frame['hold']!=0 or
-                        frame['time']!=max(8,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(plan['start_q'],plan['home_q']))/5))):
+                        frame['time']!=duration_for_change(max(abs(math.degrees(a-b)) for a,b in zip(plan['start_q'],plan['home_q'])))):
                     raise ValueError('Invalid original-home preparation stage')
                 self.validate(frame['joint'],frame['time'])
                 budget+=frame['time']+ARRIVAL_GRACE+5+self.reader.settings['response_timeout_seconds']
@@ -141,8 +142,8 @@ class ArmCompletion:
             elif kind=='gripper':
                 values=frame.get('gripper')
                 if (plan.get('preset')!='wave' or self.gripper_step is None or not isinstance(values,dict) or values not in (
-                        {'side':'right','opening_mm':85,'speed':10,'force':10},
-                        {'side':'right','opening_mm':0,'speed':10,'force':10}) or
+                        {'side':'right','opening_mm':85,'speed':100,'force':10},
+                        {'side':'right','opening_mm':0,'speed':100,'force':10}) or
                         frame['joint']!=previous or frame['time']!=0 or frame['hold']!=0):
                     raise ValueError('Invalid owned pose gripper stage')
                 gripper_command('open',{k:v for k,v in values.items() if k!='side'},'right')

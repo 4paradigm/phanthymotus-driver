@@ -1,6 +1,6 @@
 # LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.9.4`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.9.5`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
@@ -116,7 +116,7 @@ reset使用现有`/config/tron2/home.json`（宿主`/opt/phanthy-motus/data/tron
 
 发送任何move/reset前，除连接、近期状态、目标身份/限位与互斥检查外，还要求厂家SDK 3.1要求的上层developer_mode、working_mode_valid=true、collision_enable_valid=true且collision_enable=true、compliant_enable_valid=true且compliant_enable=false。compliant_enable表示柔顺/拖动状态，本驱动不在该状态下发位置MoveJ；不是要求把柔顺模式开启。字段缺失、无效、非严格布尔值或其他模式全部拒绝，返回motion_sent=false。*_valid作为厂家字段可用性/有效性门槛，不被当作独立安全认证。驱动只拒绝不合适的运动，不自动切换模式、开启保护或关闭拖动；内部info.motion_readiness给出拒绝原因。模式要求见[厂家SDK 3.1](https://www.limxdynamics.com/zh/documents/847884267345285120)，controller_mode等其他模式拒绝，不宣称穷举厂家所有可执行模式。
 
-reset时长至少max(8,ceil(最大关节变化度数/5))秒，超过60秒拒绝。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
+pose执行前自动回home和arm_control.reset共用时长max(8,ceil(最大关节变化度数/5))/1.2秒，相比旧复位规则提速20%，最短约6.67秒，超过60秒拒绝。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
 
 ACTION仅公开move、reset。info/start/stop由平台内部生命周期和诊断使用，不显示为可选动作；start返回ready，stop返回idle，均不发送运动，也不是机器人急停。pose/pose_name/preview/list/verify_at_home已删除，旧调用会拒绝。只有显式move/reset发送一次request_movej并等待GUID/序列号匹配的ACK；初始accepted响应不表示到达，arrival_verified为false，并提供唯一action_id。两个动作声明x-completion（120秒上限）和共享资源arm_l/arm_r；动作完成由后台反馈验证和ACP回调跟踪，不以ACK代替完成。
 
