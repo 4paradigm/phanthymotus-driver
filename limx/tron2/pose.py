@@ -9,10 +9,11 @@ from completion import arm_feedback, POSE_ACP_TIMEOUT
 from reset import ARM_NAMES
 from skeleton import MODEL_PATH, skeleton_stream
 from vendor import MoveError, motion_readiness, validate_movej
+from trajectory import blocks
 
 ACP_TIMEOUT = POSE_ACP_TIMEOUT
 TELEOP_HEALTH_URL = 'http://127.0.0.1:15794/health'
-LABELS = {'salute':'敬礼', 'wave':'挥手', 'welcome':'欢迎'}
+LABELS = {'salute':'salute', 'wave':'wave', 'welcome':'welcome'}
 PLANNED_DEG_PER_SECOND = 12.  # Unified planned travel/duration; not measured velocity.
 WAVE_DEG_PER_SECOND = 24.  # Faster yaw-only swings; raising/returning stay at 12.
 # Designed against TRON2 FK, not borrowed joint values from another robot.
@@ -30,7 +31,7 @@ HEAD_KEEP_OUT = .20  # Skeletal keep-out heuristic, not a collision CAD model.
 
 def tool():
     return {'name':'pose','type':'actuator','multiInstance':False,
-        'description':'TRON2预设动作：右臂敬礼、右臂挥手、双臂欢迎，固定速度。挥手加快旋转右肩三轮后保持手臂、右夹爪开合一次，再回原home；敬礼和欢迎停留1秒。头部及左夹爪保持不变。执行前双臂需在home附近、头部朝正前方，运动范围无人或障碍。',
+        'description':'TRON2预设轨迹：salute右臂敬礼、wave右臂挥手、welcome双臂欢迎。自检后自动将头部回正至pitch0/yaw0并确认到位，再执行平滑轨迹。挥手后右夹爪开合一次；敬礼、欢迎保持1秒，最后回原home。双臂须在home附近，区域清空。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
                 'pose':{'type':'string','enum':list(LABELS.values()), 'title':'预设动作',
@@ -68,24 +69,28 @@ def _rot(axis,t):
 class Geometry:
     """Pure FK and sampled skeletal exclusions; no environment/collision model."""
     def __init__(self):
-        self.joints=ET.parse(MODEL_PATH).getroot().findall('joint')
+        self.joints=[]
+        for joint in ET.parse(MODEL_PATH).getroot().findall('joint'):
+            origin=joint.find('origin')
+            xyz=list(map(float,origin.get('xyz','0 0 0').split()))
+            roll,pitch,yaw=map(float,origin.get('rpy','0 0 0').split())
+            rotation=_mm(_mm(_rot([0,0,1],yaw),_rot([0,1,0],pitch)),_rot([1,0,0],roll))
+            axis=(list(map(float,joint.find('axis').get('xyz').split()))
+                  if joint.get('type')!='fixed' else None)
+            self.joints.append((joint.get('name'),joint.find('parent').get('link'),
+                joint.find('child').get('link'),xyz,rotation,axis))
 
     def positions(self,q):
         angles=dict(zip(ARM_NAMES,q))
         eye=[[1.,0,0],[0,1.,0],[0,0,1.]]
         world={'base_Link':(eye,[0.,0,0])}
-        for joint in self.joints:
-            rotation,base=world[joint.find('parent').get('link')]
-            origin=joint.find('origin')
-            xyz=list(map(float,origin.get('xyz','0 0 0').split()))
-            roll,pitch,yaw=map(float,origin.get('rpy','0 0 0').split())
+        for name,parent,child,xyz,local,axis in self.joints:
+            rotation,base=world[parent]
             position=[a+b for a,b in zip(base,_mv(rotation,xyz))]
-            local=_mm(_mm(_rot([0,0,1],yaw),_rot([0,1,0],pitch)),_rot([1,0,0],roll))
             rotation=_mm(rotation,local)
-            if joint.get('type')!='fixed':
-                axis=list(map(float,joint.find('axis').get('xyz').split()))
-                rotation=_mm(rotation,_rot(axis,angles.get(joint.get('name'),0)))
-            world[joint.find('child').get('link')]=(rotation,position)
+            if axis is not None:
+                rotation=_mm(rotation,_rot(axis,angles.get(name,0)))
+            world[child]=(rotation,position)
         return {key:value[1] for key,value in world.items()}
 
     def validate_path(self,first,frames):
@@ -93,7 +98,7 @@ class Geometry:
         for frame in frames:
             target=frame['joint']
             count=max(1,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(last,target))/2))
-            for i in range(count+1):
+            for i in range(0 if samples==0 else 1,count+1):
                 q=[a+(b-a)*i/count for a,b in zip(last,target)]
                 points=self.positions(q);samples+=1
                 for suffix,sign in (('L',1),('R',-1)):
@@ -132,6 +137,9 @@ class Pose:
             'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
             'wave_planned_deg_per_second':WAVE_DEG_PER_SECOND,'motion':self.motion.summary(),
             'home':self.reset.call('info'),'returns_to_home':True,'collision_checked':False,
+            'execution':'time_indexed_quintic_servoj','head_policy':'center_before_arm_trajectory',
+            'servo_target_hz':300,'hard_realtime_guaranteed':False,
+            'trajectory_peak_deg_per_second':{'arm':22.5,'wave_yaw':45.},
             'physical_presets_verified':False}
 
     def plan(self,args):
@@ -144,7 +152,8 @@ class Pose:
             raise ValueError('预设动作需要有效的厂家反馈时间戳')
         if any(v is None or abs(v)>.05 for v in velocities) or len(velocities)!=14:
             raise ValueError('预设动作要求新鲜、完整且静止的双臂反馈')
-        if not motion_readiness(self.reader.sample('robot_status')['data'] or {})['ready']:
+        status=self.reader.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'] or {})['ready'] or status['data'].get('motor')!='OK':
             raise ValueError('机器人未处于可用的上层开发状态')
         nominal=list(map(math.radians,NOMINAL_HOME))
         if max(abs(math.degrees(a-b)) for a,b in zip(target_home,nominal))>3:
@@ -153,9 +162,13 @@ class Pose:
             raise ValueError('请先使用arm_control的reset回到自然垂下home，再执行预设动作')
         packet=skeleton_stream(self.reader.sample('joint_state'))
         head={j['idx']:j for j in packet['joints'] if j['idx']>=14}
-        if set(head)!={14,15} or any(abs(math.degrees(j['q']))>10 or
-                j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
-            raise ValueError('预设动作要求头部静止且俯仰、偏航均在正前方±10°以内')
+        if set(head)!={14,15} or any(j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
+            raise ValueError('预设动作要求新鲜且静止的头部反馈')
+        from vendor import HEAD_RAD_LIMITS
+        head_start=[head[i]['q'] for i in (14,15)]
+        if any(not lo-math.radians(1)<=q<=hi+math.radians(1)
+               for q,(lo,hi) in zip(head_start,HEAD_RAD_LIMITS)):
+            raise ValueError('头部反馈超出机械范围，未发送预设动作')
         # Raise/rotate shoulders with the elbow and wrists unchanged, THEN
         # bend the elbow. Return by extending the elbow before lowering.
         goal=list(LEFT_FRAMES[name]);shoulder=goal[:3]+[0,0,0,0]
@@ -190,11 +203,22 @@ class Pose:
         duration=max(2.,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(previous,final_target))/PLANNED_DEG_PER_SECOND*10)/10)
         validate_movej(final_target,duration)
         frames.append({'label':'home','joint':final_target,'time':duration,'hold':0})
-        screening=self.geometry.validate_path(current,frames)
-        return {'frames':frames,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
+        waypoints=frames
+        frames=blocks(current,waypoints)
+        screening_frames=[]
+        for frame in frames:
+            screening_frames.extend(frame['path'].screening_frames() if frame.get('kind')=='trajectory' else [frame])
+        screening=self.geometry.validate_path(current,screening_frames)
+        # A known centered head stays untouched. Otherwise center it inside the
+        # same parent pose owner, before any arm/gripper command is possible.
+        if any(abs(math.degrees(q))>1 for q in head_start):
+            duration=max(2.,max(abs(math.degrees(q)) for q in head_start)/12.)
+            frames.insert(0,{'kind':'head','label':'center_head','joint':list(current),
+                'head_joint':[0.,0.],'time':duration,'hold':0})
+        return {'frames':frames,'waypoints':waypoints,'start_head_q':head_start,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
             'wave_planned_deg_per_second':WAVE_DEG_PER_SECOND if name=='wave' else None,
             'home_q':list(target_home),'pose_sha256':home['pose_sha256'],'motion_tool':'pose',
-            'head_policy':'unchanged','gripper_policy':'right_open_close_once_ends_closed' if name=='wave' else 'unchanged','returns_to_home':True,
+            'execution':'time_indexed_quintic_servoj','head_policy':'center_before_arm_trajectory','gripper_policy':'right_open_close_once_ends_closed' if name=='wave' else 'unchanged','returns_to_home':True,
             'physical_presets_verified':False,
             'planned_motion_seconds':round(sum(f['time']+f['hold'] for f in frames),1),
             'planned_motion_seconds_excludes_gripper_waits':name=='wave',**screening}

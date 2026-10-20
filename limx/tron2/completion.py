@@ -42,6 +42,7 @@ class ArmCompletion:
         self.peer = None
         self.peers = []
         self.gripper_step = None
+        self.pose_head = None
 
     def validate(self, target, duration):
         return validate_movej(target, duration)
@@ -95,7 +96,7 @@ class ArmCompletion:
     async def dispatch_sequence(self, plan, guard):
         import copy
         frames=copy.deepcopy(plan['frames'])
-        if not frames or len(frames)>12 or frames[0].get('kind','arm')!='arm':
+        if not frames or len(frames)>12 or frames[0].get('kind','arm') not in ('arm','head','trajectory'):
             raise ValueError('Invalid pose frame count or first stage')
         from gripper import command as gripper_command
         budget=float(POSE_ADMISSION_AND_REPORT_BUDGET)
@@ -105,6 +106,18 @@ class ArmCompletion:
             if kind=='arm':
                 self.validate(frame['joint'],frame['time'])
                 budget+=frame['time']+ARRIVAL_GRACE+5+self.reader.settings['response_timeout_seconds']
+            elif kind=='head':
+                if frame is not frames[0] or self.pose_head is None or frame['head_joint']!=[0.,0.] or frame['joint']!=previous:
+                    raise ValueError('Invalid pose head centering stage')
+                self.pose_head.validate(frame['head_joint'],frame['time'])
+                budget+=frame['time']+ARRIVAL_GRACE+5+self.reader.settings['response_timeout_seconds']
+            elif kind=='trajectory':
+                from trajectory import Path
+                path=frame.get('path')
+                if not isinstance(path,Path) or path.start!=previous or path.target!=frame['joint'] or path.duration!=frame['time']:
+                    raise ValueError('Invalid preset trajectory block')
+                self.validate(frame['joint'],min(60,frame['time']))
+                budget+=frame['time']+ARRIVAL_GRACE+5
             elif kind=='gripper':
                 values=frame.get('gripper')
                 if (plan.get('preset')!='wave' or self.gripper_step is None or not isinstance(values,dict) or values not in (
@@ -122,10 +135,10 @@ class ArmCompletion:
             previous=frame['joint']
         if budget>=POSE_ACP_TIMEOUT:
             raise ValueError('Pose exceeds ACP time budget; no motion sent')
-        details={k:copy.deepcopy(v) for k,v in plan.items() if k!='frames'}
+        details={k:copy.deepcopy(v) for k,v in plan.items() if k not in ('frames','waypoints')}
         details['stages_total']=len(frames)
         details['worst_case_budget_seconds']=round(budget,1)
-        return await self.dispatch('pose',frames[0]['joint'],frames[0]['time'],details,
+        return await self.dispatch('pose',plan['start_q'],min(60,frames[0]['time']),details,
                                    sequence=frames,guard=guard)
 
     def cancel_sequence(self):
@@ -134,23 +147,24 @@ class ArmCompletion:
             return True
         return False
 
-    def _sequence_feedback(self, job, expected):
+    def _sequence_feedback(self, job, expected, *, centering=False):
         if self.closed or self.active is not job or not self.reader.connected or \
                 self.reader.ws is not job['ws'] or self.reader.serial!=job['serial']:
             raise ValueError('Pose connection/owner changed; remaining frames cancelled')
         sample,q,dq=self.feedback()
         packet=skeleton_stream(sample)
         head=[j for j in packet['joints'] if j['idx']>=14]
-        if len(head)!=2 or any(abs(math.degrees(j['q']))>10 or j.get('dq') is None or abs(j['dq'])>.05 for j in head):
+        expected_head = job['details'].get('start_head_q',[0.,0.]) if centering else [0.,0.]
+        if len(head)!=2 or any(abs(math.degrees(j['q']-target))>TOLERANCE_DEG or j.get('dq') is None or abs(j['dq'])>.05
+                              for j,target in zip(head,expected_head)):
             raise ValueError('Head moved outside preset admission range; remaining frames cancelled')
         if len(dq)!=14 or any(v is None or abs(v)>.05 for v in dq) or \
                 max(abs(math.degrees(a-b)) for a,b in zip(q,expected))>1:
             raise ValueError('Pose start/waypoint feedback changed; remaining frames cancelled')
 
     async def _run_sequence(self, job):
-        # Faster *read-only* feedback reduces sampling quantization between
-        # waypoints. Never shorten the .5s stationary window or overlap MoveJ.
-        # Restore normal cadence even after failure, stop or callback failure.
+        # One read-only feedback lease covers head centering, continuous output
+        # and gripper barriers; restore cadence on all terminal paths.
         with self.reader.pose_feedback():
             await self._run_sequence_owned(job)
 
@@ -160,17 +174,17 @@ class ArmCompletion:
         expected=job['details']['start_q']
         try:
             for index,frame in enumerate(job['sequence']):
+                kind=frame.get('kind','arm')
                 # A lifecycle stop never creates another motor command.
                 if job['cancel_sequence']:
-                    self._sequence_feedback(job,expected)
+                    self._sequence_feedback(job,expected,centering=kind=='head')
                     status='cancelled';safe_end=True
                     break
                 await job['guard']()
-                self._sequence_feedback(job,expected)
+                self._sequence_feedback(job,expected,centering=kind=='head')
                 if job['cancel_sequence']:
                     status='cancelled';safe_end=True
                     break
-                kind=frame.get('kind','arm')
                 job.update(stage=index+1,stage_label=frame['label'],stage_kind=kind,
                            target=list(frame['joint']),duration=frame['time'],
                            state='awaiting_ack',vendor_acknowledged=False)
@@ -188,11 +202,31 @@ class ArmCompletion:
                         raise ValueError('Pose gripper target not verified; remaining stages cancelled')
                     job['vendor_acknowledged']=step.get('vendor_acknowledged',False)
                     job.setdefault('gripper_results',[]).append(step)
+                elif kind=='trajectory':
+                    from trajectory import run
+                    job['motion_sent']=False
+                    def on_submission(reply):
+                        nonlocal admitted,any_sent
+                        any_sent=True
+                        job['motion_sent']=True
+                        job['state']='moving'
+                        if not admitted:
+                            admitted=True
+                            job['admission'].set_result({**reply,'action_id':job['action_id'],'action':'pose',
+                                'preset':job['details']['preset'],'side':job['details']['side'],
+                                'state':'moving','arrival_verified':False,'stages_total':len(job['sequence']),
+                                'completion_protocol':'acp'})
+                    try:
+                        await run(self,job,frame,on_submission)
+                    finally:
+                        if job['motion_sent'] is not False:
+                            any_sent=True if any_sent is True or job['motion_sent'] is True else None
                 else:
                     previous_sent=any_sent
                     any_sent=True if previous_sent is True else None  # Outcome unknown until exact ACK.
                     try:
-                        reply=await self.send(job['target'],job['duration'])
+                        reply=(await self.pose_head.send(frame['head_joint'],job['duration']) if kind=='head'
+                               else await self.send(job['target'],job['duration']))
                     except (ValueError,OSError) as exc:
                         if not admitted and (getattr(exc,'motion_sent',None) is False or getattr(exc,'code',None)=='vendor_rejected'):
                             self.active=None
@@ -219,7 +253,14 @@ class ArmCompletion:
                             'preset':job['details']['preset'],'side':job['details']['side'],
                             'state':'moving','motion_sent':any_sent,'arrival_verified':False,
                             'stages_total':len(job['sequence']),'completion_protocol':'acp'})
-                    await self.wait_for_arrival(job)
+                    if kind=='head':
+                        head_job={**job,'target':list(frame['head_joint'])}
+                        await self.pose_head.wait_for_arrival(head_job)
+                        # Arms must still match the pre-centering observation.
+                        self._sequence_feedback(job,expected)
+                        job['head_center_verified']=True
+                    else:
+                        await self.wait_for_arrival(job)
                 job['completed_stages']=index+1
                 expected=list(job['target'])
                 until=time.monotonic()+frame['hold']
@@ -230,7 +271,9 @@ class ArmCompletion:
                 self._sequence_feedback(job,job['details']['home_q'])
                 status='completed';safe_end=True
                 result.update(arrival_verified=True,reset_verified=True,at_home=True,
-                    verification='every_stage_duration_elapsed_and_post_ack_stable_feedback_then_home')
+                    verification=('trajectory_terminal_advancing_stationary_feedback_then_home'
+                        if job['details'].get('execution')=='time_indexed_quintic_servoj' else
+                        'every_stage_duration_elapsed_and_post_ack_stable_feedback_then_home'))
             if status=='cancelled':
                 result.update(cancelled_remaining_stages=True,segment_arrival_verified=True,
                     message='后续动作段已取消；反馈确认停在最近已到位动作段，未自动回正')
@@ -239,6 +282,8 @@ class ArmCompletion:
         except (ValueError,OSError) as exc:
             result.update(error=str(exc),error_code=getattr(exc,'code',None),
                           cancelled_remaining_stages=True)
+            if getattr(exc,'code',None)=='trajectory_cancelled':
+                status='cancelled'  # Output stopped; safe_end intentionally remains false.
         finally:
             if self.active is not job:return
             if not admitted:
@@ -247,9 +292,15 @@ class ArmCompletion:
                     self.active=None
                     if not job['admission'].done():job['admission'].set_exception(MoveError(result.get('error','Pose stopped before dispatch'),False))
                     return
-                if not job['admission'].done():job['admission'].set_exception(MoveError('Pose result unknown',None))
+                if not job['admission'].done():
+                    admitted=True
+                    job['admission'].set_result({'action_id':job['action_id'],'action':'pose',
+                        'preset':job['details']['preset'],'state':'blocked_requires_operator_check',
+                        'motion_sent':any_sent,'arrival_verified':False,'completion_protocol':'acp'})
             result.update({k:v for k,v in job['details'].items() if k not in ('start_q','home_q')})
             result.update(action='pose',joint_count=14,completion_protocol='acp',
+                head_center_verified=job.get('head_center_verified',False) or status=='completed',
+                trajectory_samples_sent=job.get('trajectory_samples_sent',0),
                 stage_label=job.get('stage_label'),stage_kind=job.get('stage_kind'),
                 gripper_steps=job.get('gripper_results',[]),
                 **({'gripper_step_error':job['gripper_step_error']} if 'gripper_step_error' in job else {}),

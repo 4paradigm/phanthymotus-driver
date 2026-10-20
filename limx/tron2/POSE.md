@@ -1,47 +1,41 @@
-# TRON2 pose预设动作
+# TRON2 pose presets
 
-0.8.5的`pose`卡片只显示一个动作下拉框，值为`敬礼`、`挥手`、`欢迎`。没有reset、side、speed、自定义关节、action或内部追踪字段；旧英文动作请求也会在运动前拒绝。单独回正继续使用arm_control的reset。
+0.9.0 exposes one `pose` field: `salute`, `wave`, `welcome`. Chinese preset values, reset, side, speed, action and custom joints are not public options. Use arm_control.reset for a separate return to the original natural-arms-down home.
 
-| 中文动作 | 固定手臂 | 顺序 |
+| Preset | Arms | Absolute native joint targets and order |
 |---|---|---|
-| 敬礼 | 右臂 | 肩部前摆-75°、侧摆-60°、旋转0°，再屈肘-120°，展示1秒，先伸肘再放肩回原home |
-| 挥手 | 右臂及右夹爪 | 肩部-65°/-25°/0°，屈肘-100°；只让9号右肩旋转关节在-20°/+20°往返三轮；保持最后姿态，右夹爪85→0mm；确认开合后先伸肘再放肩回原home |
-| 欢迎 | 双臂 | 左肩-35°/+45°/+40°、右肩-35°/-45°/-40°，再同时屈肘-65°，展示1秒，先伸肘再放肩回原home |
+| salute | Right | Shoulder pitch -75°, roll -60°, yaw 0° leads elbow -120°; hold 1s; extend elbow then lower shoulders to original home |
+| wave | Right | Shoulder -65°/-25°/0° leads elbow -100°; joint9 yaw -20°/+20° three cycles; verify stationary arm, right gripper 85→0mm once, verify closure; extend then return home |
+| welcome | Both | Left shoulder -35°/+45°/+40°, right -35°/-45°/-40° lead elbows -65°; hold 1s; extend then return home |
 
-上述是机械臂原生坐标下的绝对目标度数。先动肩时保持实际肘腕位置；屈肘时腕部三个关节归0°；伸肘恢复原home肘腕值。敬礼/挥手左臂全程保持实际原位；头部和左夹爪不动。敬礼/欢迎不发夹爪开合。挥手结束右夹爪闭合，不恢复之前开口。
+Right-only presets preserve the actual left arm. Wrists become zero while bending; extension restores original home elbow/wrist values. Left gripper is unchanged. Only wave commands the right gripper, using speed/force grades10/10 (not Newtons); reported opening does not prove grasp. Millimetres retain the nominal, uncalibrated 0..85mm to 0..94raw mapping.
 
 ```json
-{"pose":"挥手"}
+{"pose":"wave"}
 ```
 
-抬臂、屈肘、伸肘及回正按最大关节行程12度/秒计算计划时长；挥手的六个肩旋转摆动段改为24度/秒。每段至少1秒，最终回正至少2秒；厂家插补曲线未标定，这不是实测速度保证。挥手旋转跨度40°，不额外停留；首个20°摆动计划1秒，之后40°摆动各1.7秒（此前分别1.7秒、3.4秒）。每次只执行一套，不自动循环。
+## Admission and automatic head centering
 
-挥手夹爪固定使用85mm最大目标（名义线性映射到底层94）与0mm闭合，速度档位10、力档位10；力档位不是牛顿。若某一步已经到目标，只查询新鲜稳定反馈，不重复发送电机指令。到位不代表抓取成功。挥手应空载使用，运动区域清空。
+Validate the request, original home identity/firmware, all targets, generated path screening and complete ACP budget before the first command. Arms must be within1° of original home with complete fresh stationary feedback. Head feedback must be valid, stationary and within its mechanical range. Native VR head following must already be off, and known local teleop must be inactive; no robot mode or global setting is changed. Wave also checks the right gripper before sending head or arm motion.
 
-## 审核与控制权
+If either native head axis is more than1° from zero, first send one MoveH to pitch0/yaw0 under the same parent pose owner. Require the exact positive ACK and advancing stationary target feedback before any arm or gripper command. Unknown ACK or missed head target aborts the preset and retains protection. Head centering is a real movement explicitly caused by executing pose, never by startup, discovery, info, planning or deployment. Invalid requests cannot initiate it. Already-centered heads receive no MoveH. ServoJ subsequently holds both head targets at zero.
 
-三种动作都要求原home身份/固件匹配且接近DACH_TRON2A自然垂下基准，双臂实际在home误差1度内、反馈完整且静止；头部静止且俯仰/偏航均在正前方±10度内。必要时先用arm_control.reset与move_head调整。挥手开始前额外读取右夹爪厂家状态；故障、缺时间戳、非零速度或已有未完成任务会在首个手臂动作前拒绝。
+The pose owns arm_l/arm_r/head throughout centering, trajectory, gripper and home. It shares ArmCompletion with arm_control and excludes other head/gripper calls. There is one parent action_id and one terminal tool=pose ACP callback. Gripper steps are private children of this exact owner, without independent ACP. This local ownership plus control-source checks does not establish a cross-process hardware arbiter; other motion sources must remain stopped.
 
-pose与arm_control共用同一ArmCompletion owner。整套序列只有一个action_id和一次终态ACP，tool=pose；抬臂、旋转、夹爪开合和回正之间都不释放owner。右夹爪子步骤必须属于该精确父任务，不走公开夹爪入口，不创建独立ACP，也不放宽公开夹爪对其他运动的互斥。其他机械臂、头部、夹爪请求在整套任务期间仍被拦住。
+## Continuous preset trajectory
 
-所有关节目标、夹爪参数、阶段类型和最坏预算在第一段发送前验证。最多12段；每段控制源审核预算5秒，手臂发送预算5秒加厂家回执超时、到位宽限10秒，每个夹爪子步骤总上限30秒，加上计划时长、展示停留及32秒首段审核/完成回执预算，须低于480秒ACP上限。不是固定等待480秒，也不等超时才允许正常完成。规划在工作线程运行，不阻塞反馈。
+The planner generates time-indexed C2 quintic joint ramps, with zero endpoint velocity/acceleration. Disjoint shoulder/elbow ramps overlap by25% while the shoulder starts first; same-joint reversals do not overlap or overshoot. There is no stationary-feedback dwell at each arm waypoint. Salute/welcome still include their requested1s hold. Wave retains stationary verification before its gripper barrier and at final home, then streams the return trajectory only after the gripper is verified.
 
-每段前核对原连接/序列号、原home未变、新鲜静止反馈和上一段目标；VR头部跟随须已关闭，本机15794遥操active/output_active均关闭。厂家开关只读，不自动切换模式。已知遥操端口明确拒绝连接可判定该服务未监听；超时、未知或异常状态拒绝。这不等于跨进程硬件控制权协议，其他运动来源仍需现场停用。
+Segment travel/duration planning remains12deg/s for raising/bending/return and24deg/s for wave yaw. With quintic easing, commanded peak speed is bounded by22.5deg/s and45deg/s respectively, and peak acceleration by60deg/s². Durations may extend to satisfy acceleration bounds. These are planned setpoints, not measured motor or Cartesian velocity guarantees. arm_control itself still accepts its joint/time pair; it has no global fixed joint speed.
 
-## 到位、停止与失败
+The transport uses documented request_servoj with16native radians (14arm+2centered head), filter_ratio1.0, target cadence300Hz. Python/Jetson/WebSocket scheduling is not hard real time; delayed sends are never replayed in a catch-up burst. A gap over50ms cancels further output. Joint sampling uses the original single WebSocket reader at up to10Hz during pose and restores its idle cadence on every exit. Receipt age and advancing vendor timestamps must remain within350ms; regressions, frozen timestamps, non-ready robot status, vendor failure notification, head drift or arm tracking error above8° stop subsequent commands. Control-source/home checks repeat asynchronously during the stream. This supervision is not collision avoidance or a hardware stop guarantee.
 
-手臂每段必须收到精确成功ACK，等计划时长结束且收到推进时间戳、至少3次稳定到位反馈（误差≤1°，稳定窗口≥0.5秒、完整近零速度）才能继续。稳定窗口可与计划时长重叠，避免额外固定等待；原arm_control/move_head后时长确认规则不变。整套pose使用同一个WebSocket读取循环，临时把只读关节查询间隔降到min(原设置,0.1秒)，降低原0.5秒查询造成的三次采样等待；完成、失败、取消或回调失败后均恢复原查询频率，不修改配置、模式或限位。至少3个推进时间戳样本和0.5秒稳定窗口保持不变，单次查询仍受原超时限制，不并发读取同一WebSocket。
+ServoJ has **no positive ACK**. A `submitted` reply proves only socket submission and has arrival_verified=false, vendor_acknowledged=false. Terminal arrival requires at least3advancing samples over0.5s, error≤1°, positional stability≤0.2° and complete near-zero velocity feedback. Only verified final home and successful parent ACP delivery release ownership. Separate arm_control and move_head completion behavior is preserved.
 
-这些动作仍逐段使用MoveJ；换段前必须停稳确认，抬肩与屈肘、摆动换向处仍会减速，不能保证连续轨迹或消除全部停顿。10Hz是查询上限目标，实际受厂家响应速度影响。厂家SDK的MoveJ只提供joint/time，本版没有改用写入头部等其他维度的ServoJ，也不通过抢发下一段绕过到位检查。
+## Failure, stop and verification scope
 
-夹爪每步先读状态，再仅向右侧发送一次；之后需相关查询返回推进时间戳、至少3次目标开口反馈（底层误差≤1，窗口≥0.5秒）且速度为0。开合期间持续核对手臂仍停在最后摆手位置、头部未偏离、连接和父owner未变。两步均通过后才发伸肘和回home。最终同时确认原home后才报告completed；反馈不代表抓取成功。
+A lifecycle stop halts further ServoJ output; it does not prove physical standstill, so the parent retains protection until operator verification. It is not a hardware emergency stop. During a gripper step, stop finishes verification of the already-sent step and cancels later writes. Unknown sends, head centering failure, stale feedback, tracking/owner/source changes, gripper error and callback delivery failure do not trigger retries, forced home or replay.
 
-回执不明、断连、手臂漂移、夹爪故障/未到位或子步骤超时会取消其余开合和回home，保留父任务保护及失败记录，不重发、不强行回正。完成回执失败也保留owner。子步骤可在health里关联同一个父action_id。
+The generated quintic/overlap path is sampled against the pinned TRON2 URDF and the existing joint-linear skeletal exclusion checks. The model lacks full collision geometry; collision_checked=false and physical_presets_verified=false remain explicit. Offline tests exercise paths, real local transport/ACP, head-first sequencing, invalid requests, source/feedback faults and owner retention. Deployment executes no gestures; actual tracking, scheduling and motion quality require separate field acceptance.
 
-生命周期stop取消未发送的后续动作；当前已发送的手臂/夹爪一步仍需确认到位后才报告cancelled。若stop发生在夹爪状态查询中，返回后不发送开合。它不构成硬件急停，停止进程或丢反馈也不能声称实体停止。启动、部署、发现、info及生命周期不会自动执行动作。
-
-## 验证范围
-
-依据固定TRON2官方URDF检查原生关节限位和每不超过2度的关节线性参考路径，远端骨架保持各自侧方，并避开头部参考中心0.20m禁入球。URDF没有真实碰撞几何，此筛查不是完整自碰撞、环境障碍或厂家实际插补轨迹验证；始终collision_checked=false、physical_presets_verified=false。
-
-本地覆盖中文三选项、原home保护、肩先肘后、9号关节三轮旋转、右侧一轮开合、共享控制权、实际回环MCP/WebSocket/ACP、非法输入不发运动，以及停止/断线/回执/反馈/回调失败。部署不执行任何实体动作，物理动作效果须现场另行验收。
+Manufacturer protocol: https://www.limxdynamics.com/en/documents/856848486581276672, sections3.6.2 and3.6.4.

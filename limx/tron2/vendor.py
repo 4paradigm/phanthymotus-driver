@@ -121,6 +121,7 @@ class RobotReader:
         self.move_pending = None
         self.head_pending = None
         self.gripper_pending = {}
+        self._pose_servo = None
         self._pose_feedback_leases = set()
         self._joint_poll_wake = None  # Create on the reader's running loop.
 
@@ -158,6 +159,8 @@ class RobotReader:
                 pass
 
     def disconnect(self, reason):
+        if self._pose_servo is not None:
+            self._pose_servo['error'] = 'Robot disconnected during ServoJ'
         self.connected = False
         self.ws = None
         for _, future in self.gripper_pending.values():
@@ -205,6 +208,11 @@ class RobotReader:
         body = json.loads(msg.data, parse_constant=reject_constant)
         if not isinstance(body, dict):
             raise ValueError('Expected robot JSON object')
+        if self._pose_servo is not None and body.get('accid') == self.serial and body.get('title') in (
+                'notify_servoJ','notify_servoj','notify_invalid_request'):
+            # ServoJ has no success response. Treat any vendor failure during
+            # this owned output session as a fault, never silently ignore it.
+            self._pose_servo['error'] = 'Vendor ServoJ failure notification'
         pending = self.gripper_pending.get(body.get('guid'))
         if pending and body.get('accid') == self.serial:
             expected, future = pending
@@ -265,7 +273,7 @@ class RobotReader:
         readiness=motion_readiness(status['data'])
         if not readiness['ready']:
             raise MoveError(readiness['reason'] + '; no motion command sent', False, 'vendor_not_ready')
-        if self.move_pending or self.head_pending:
+        if self.move_pending or self.head_pending or self._pose_servo is not None:
             raise MoveError('A MoveJ reply is pending; no additional command sent', False)
         guid = str(uuid.uuid4())
         future = asyncio.get_running_loop().create_future()
@@ -330,7 +338,7 @@ class RobotReader:
         status = self.sample('robot_status')
         if not status['available'] or not motion_readiness(status['data'])['ready']:
             raise MoveError('Fresh developer mode, collision protection and compliance-off required; no head motion sent', False)
-        if self.head_pending or self.move_pending:
+        if self.head_pending or self.move_pending or self._pose_servo is not None:
             raise MoveError('Another arm/head acknowledgement is pending; no head motion sent', False)
         ws, serial = self.ws, self.serial
         control = await self.head_control_status()
@@ -362,6 +370,37 @@ class RobotReader:
                 future.cancel()
             elif not future.cancelled():
                 future.exception()
+
+    @contextmanager
+    def pose_servo(self, job):
+        """Private exclusive writer for an already admitted parent pose job."""
+        if self._pose_servo is not None or self.move_pending or self.head_pending:
+            raise MoveError('Another motion transport is active',False)
+        token = {'job':job,'ws':self.ws,'serial':self.serial,'error':None}
+        self._pose_servo = token
+        try:
+            yield token
+        finally:
+            if self._pose_servo is token:
+                self._pose_servo = None
+
+    async def send_pose_servoj(self, q, token):
+        if token is not self._pose_servo or token.get('error'):
+            raise MoveError((token or {}).get('error') or 'Pose ServoJ owner changed',False,'trajectory_vendor_fault')
+        if not isinstance(q,list) or len(q)!=16 or q[14:]!=[0.,0.]:
+            raise MoveError('Pose ServoJ requires 14 arm joints and centered head',False)
+        validate_movej(q[:14],.1)
+        if not self.connected or self.ws is not token['ws'] or self.serial!=token['serial'] or self.ws.closed:
+            raise MoveError('Pose ServoJ connection changed',False)
+        status = self.sample('robot_status')
+        if not status['available'] or not motion_readiness(status['data'])['ready'] or status['data'].get('motor')!='OK':
+            raise MoveError('Pose ServoJ robot status not ready',False)
+        try:
+            await asyncio.wait_for(self.ws.send_json({'title':'request_servoj','accid':self.serial,
+                'guid':str(uuid.uuid4()),'timestamp':int(time.time()*1000),
+                'data':{'q':q,'filter_ratio':1.0}}),.02)
+        except (OSError,aiohttp.ClientError,asyncio.TimeoutError) as exc:
+            raise MoveError('ServoJ socket submission uncertain; no retry',None,'trajectory_send_unknown') from exc
 
     async def _gripper_request(self, title, data, motion):
         if (motion is True and title != 'request_set_limx_2fclaw_cmd') or \

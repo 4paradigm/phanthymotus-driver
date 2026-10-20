@@ -17,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.8.5'
+VERSION = '0.9.0'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -56,6 +56,7 @@ class Adapter:
         self.motion = ArmCompletion(self.reader, self.report_completion)
         self.pose = Pose(self.reader,self.motion,self.reset)
         self.head = HeadCompletion(self.reader, self.report_head_completion)
+        self.motion.pose_head = self.head
         self.grippers = {name: Gripper(self.reader, self.report_gripper_completion, side)
                          for name, side in GRIPPER_SIDES.items()}
         self.motion.peers = list(self.grippers.values()) + [self.head]

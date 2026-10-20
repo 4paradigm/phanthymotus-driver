@@ -852,13 +852,13 @@ class PackagingTests(unittest.TestCase):
     def test_staged_entry_imports_without_repository_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.8.5"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == "0.9.0"; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
@@ -868,10 +868,10 @@ class PackagingTests(unittest.TestCase):
         source = ast.parse((DRIVER/'vendor.py').read_text())
         calls = [n for n in ast.walk(source) if isinstance(n,ast.Call)
                  and isinstance(n.func,ast.Attribute) and n.func.attr == 'send_json']
-        self.assertEqual(len(calls),4)
+        self.assertEqual(len(calls),5)
         payloads = [{k.value:v for k,v in zip(c.args[0].keys,c.args[0].values)} for c in calls]
         literal = [p for p in payloads if isinstance(p['title'], ast.Constant)]
-        self.assertEqual({p['title'].value for p in literal}, {'request_get_joint_state', 'request_movej', 'request_moveh'})
+        self.assertEqual({p['title'].value for p in literal}, {'request_get_joint_state', 'request_movej', 'request_moveh', 'request_servoj'})
         query = next(p for p in literal if p['title'].value == 'request_get_joint_state')
         self.assertEqual(query['data'].keys, [])
         for filename in ('motion.py','control.py','record.py','teach.py'):
