@@ -199,6 +199,11 @@ class SquatCounter:
             "last_seen_time": self._last_seen_time,
         }
 
+    @property
+    def last_frame_time(self) -> float | None:
+        """Timestamp of the last pose frame accepted by the counter."""
+        return self._last_frame_time
+
     def diagnostics(self) -> dict:
         """Return a JSON-safe, read-only view of the latest pose decision.
 

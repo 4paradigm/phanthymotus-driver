@@ -101,8 +101,17 @@ plugins:
     enabled: true
     # Domain 42 pose skeleton; measurements and event logic are shared with Bumi.
     debug_interval_s: 0.5
+    status_interval_s: 0.2
+    # Local counting and set completion are immediate; coach mode sends only
+    # first/midpoint progress to avoid Decision Core queuing every repetition.
+    # Faster initial stand confirmation; bottom/top validation remains unchanged.
+    baseline_dwell_s: 1.2
     # Only an explicit begin/reset action starts counting, independent of canvas start.
     require_explicit_workout_start: true
+    coach_mode: true
+    default_sets: 2
+    default_reps_per_set: 8
+    default_rest_s: 90
     # A short occlusion is not departure; require fresh pose frames and no people.
     auto_finish_absence_s: 6.0
   arm_control:

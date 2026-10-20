@@ -45,7 +45,12 @@ _PHASE_ZH = {
     "finished": "本组已结束",
 }
 _WORKOUT_STATE_ZH = {
-    "waiting_start": "等待语音开始", "active": "训练中", "finished": "本组已结束",
+    "waiting_start": "等待语音开始", "active": "训练中", "finished": "训练已结束",
+}
+_SET_STATE_ZH = {
+    "preparing": "等待站稳开始本组", "in_set": "本组计数中",
+    "resting": "组间休息", "ready_next": "等待下一组口令",
+    "finished": "训练计划完成",
 }
 _TARGET_STATE_ZH = {
     "none": "尚未锁定", "tracking": "跟踪中", "missing": "目标丢失",
@@ -196,7 +201,13 @@ def _debug_zh(raw: dict) -> dict:
         "训练状态": _WORKOUT_STATE_ZH[raw["workout_state"]],
         "训练已持续（秒）": raw["workout_elapsed_s"],
         "离画面已持续（秒）": raw["absence_elapsed_s"],
-        "本组总结": raw["summary"],
+        "训练总结": raw["summary"],
+        "训练计划": raw["plan"],
+        "组间阶段": _SET_STATE_ZH.get(raw["set_state"], "未设置"),
+        "当前组": raw["set_index"],
+        "当前组已完成": raw["set_count"],
+        "当前组目标": raw["set_target"],
+        "剩余休息（秒）": raw["rest_remaining_s"],
         "会话ID": raw["session_id"], "事件序号": raw["seq"],
         "目标ID": raw["target_id"],
         "目标状态": _TARGET_STATE_ZH.get(raw["target_state"], "未知状态"),
@@ -239,6 +250,12 @@ def _nonnegative_interval(config: dict, name: str, default: float) -> float:
     return float(value)
 
 
+def _plan_integer(value: object, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
 class SquatCounterPlugin:
     """One local squat session, independent of the model's response speed."""
 
@@ -260,6 +277,18 @@ class SquatCounterPlugin:
         if not isinstance(explicit_start, bool):
             raise ValueError("require_explicit_workout_start must be a boolean")
         self._require_explicit_workout_start = explicit_start
+        coach_mode = plugin_config.get("coach_mode", False)
+        if not isinstance(coach_mode, bool):
+            raise ValueError("coach_mode must be a boolean")
+        self._coach_mode = coach_mode
+        self._default_plan = {
+            "sets": _plan_integer(plugin_config.get("default_sets", 2),
+                                  "default_sets", 1, 5),
+            "reps_per_set": _plan_integer(plugin_config.get("default_reps_per_set", 8),
+                                          "default_reps_per_set", 1, 20),
+            "rest_s": _plan_integer(plugin_config.get("default_rest_s", 90),
+                                    "default_rest_s", 15, 180),
+        }
         self._auto_finish_absence_s = _nonnegative_interval(
             plugin_config, "auto_finish_absence_s", 6.0)
         self._event_topic = f"/{namespace}/fitness/squat/events"
@@ -294,6 +323,15 @@ class SquatCounterPlugin:
         self._rep_duration_count = 0
         self._rep_duration_min: float | None = None
         self._rep_duration_max: float | None = None
+        self._coach_plan: dict | None = None
+        self._set_state: str | None = None
+        self._set_index = 0
+        self._set_count = 0
+        self._workout_total = 0
+        self._set_results: list[dict] = []
+        self._set_started_at: float | None = None
+        self._rest_until: float | None = None
+        self._ready_since: float | None = None
         self._node.create_timer(0.2, self._tick)
 
     def get_tool(self) -> dict:
@@ -320,9 +358,11 @@ class SquatCounterPlugin:
                 self._stop_locked()
                 return self._status_locked()
             if action == "reset":
-                return self._begin_workout_locked(force=True)
+                return self._begin_workout_locked(force=True, plan_args={})
             if action == "begin":
-                return self._begin_workout_locked(force=False)
+                return self._begin_workout_locked(force=False, plan_args=args)
+            if action == "next_set":
+                return self._next_set_locked()
             if action == "finish":
                 self._finish_workout_locked("voice")
                 return self._status_locked()
@@ -368,6 +408,7 @@ class SquatCounterPlugin:
         self._subject_seen = False
         self._final_summary = None
         self._reset_rep_metrics_locked()
+        self._clear_coach_locked()
         if not self._require_explicit_workout_start:
             self._workout_state = "active"
             self._workout_started_at = time.monotonic()
@@ -403,7 +444,18 @@ class SquatCounterPlugin:
         self._rep_duration_min = None
         self._rep_duration_max = None
 
-    def _begin_workout_locked(self, *, force: bool) -> dict:
+    def _clear_coach_locked(self) -> None:
+        self._coach_plan = None
+        self._set_state = None
+        self._set_index = 0
+        self._set_count = 0
+        self._workout_total = 0
+        self._set_results = []
+        self._set_started_at = None
+        self._rest_until = None
+        self._ready_since = None
+
+    def _begin_workout_locked(self, *, force: bool, plan_args: dict) -> dict:
         if self._subscription is None:
             if not force:
                 return {"state": "error", "error": "start the squat card on the canvas first"}
@@ -417,9 +469,25 @@ class SquatCounterPlugin:
             self._pending_rep = None
             self._last_rep_published_at = None
             self._reset_rep_metrics_locked()
+            self._clear_coach_locked()
             return self._status_locked()
         if self._workout_state == "active" and not force:
             return self._status_locked()
+        if self._coach_mode:
+            base = (self._coach_plan if force and self._coach_plan is not None
+                    else self._default_plan)
+            try:
+                plan = {
+                    "sets": _plan_integer(plan_args.get("sets", base["sets"]),
+                                          "sets", 1, 5),
+                    "reps_per_set": _plan_integer(
+                        plan_args.get("reps_per_set", base["reps_per_set"]),
+                        "reps_per_set", 1, 20),
+                    "rest_s": _plan_integer(plan_args.get("rest_s", base["rest_s"]),
+                                            "rest_s", 15, 180),
+                }
+            except ValueError as exc:
+                return {"state": "error", "error": str(exc)}
         self._counter.reset()
         self._pending_rep = None
         self._last_rep_published_at = None
@@ -429,9 +497,149 @@ class SquatCounterPlugin:
         self._subject_seen = False
         self._final_summary = None
         self._reset_rep_metrics_locked()
+        self._clear_coach_locked()
+        if self._coach_mode:
+            self._coach_plan = plan
+            self._set_state = "preparing"
+            self._set_index = 1
         self._publish_status_locked(force=True)
         self._publish_debug_locked(force=True)
         return self._status_locked()
+
+    def _next_set_locked(self) -> dict:
+        if not self._coach_mode:
+            return {"state": "error", "error": "next_set requires coach_mode"}
+        if self._workout_state != "active":
+            return {"state": "error", "error": "no active workout"}
+        if self._set_state == "resting":
+            # A voice command may arrive just after the deadline but before
+            # the 200 ms timer callback. Accept it without a stale prompt.
+            if self._rest_remaining_locked() != 0:
+                return {"state": "error", "error": "rest period has not finished",
+                        "rest_remaining_s": self._rest_remaining_locked()}
+            self._set_state = "ready_next"
+            self._rest_until = None
+        if self._set_state != "ready_next":
+            return self._status_locked() if self._set_index > 1 else {
+                "state": "error", "error": "next set is not ready"}
+        self._set_index += 1
+        self._set_count = 0
+        self._set_state = "preparing"
+        self._set_started_at = None
+        self._ready_since = None
+        self._pending_rep = None
+        self._last_rep_published_at = None
+        self._publish_status_locked(force=True)
+        self._publish_debug_locked(force=True)
+        return self._status_locked()
+
+    def _rest_remaining_locked(self, now: float | None = None) -> int | None:
+        if self._rest_until is None:
+            return None
+        now = time.monotonic() if now is None else now
+        return max(0, math.ceil(self._rest_until - now))
+
+    def _advance_rest_locked(self, now: float) -> None:
+        if (not self._coach_mode or self._workout_state != "active"
+                or self._set_state != "resting" or self._rest_until is None
+                or now < self._rest_until):
+            return
+        self._set_state = "ready_next"
+        self._rest_until = None
+        self._publish_event_locked({
+            "type": "rest_finished", "session_id": self._counter.session_id,
+            "set_index": self._set_index, "next_set_index": self._set_index + 1,
+            "count_total": self._workout_total,
+        })
+        self._publish_status_locked(force=True)
+        self._publish_debug_locked(force=True)
+
+    def _coach_maybe_ready_locked(self, now: float) -> None:
+        if (not self._coach_mode or self._workout_state != "active"
+                or self._set_state != "preparing"):
+            return
+        snapshot = self._counter.snapshot()
+        if (snapshot["target_state"] != "tracking" or not snapshot["calibrated"]
+                or snapshot["state"] != "top"):
+            self._ready_since = None
+            return
+        if self._ready_since is None:
+            self._ready_since = now
+            return
+        if now - self._ready_since < 0.4:
+            return
+        self._set_state = "in_set"
+        self._set_started_at = now
+        self._ready_since = None
+        self._publish_event_locked({
+            "type": "set_ready", "session_id": snapshot["session_id"],
+            "seq": snapshot["seq"], "set_index": self._set_index,
+            "sets": self._coach_plan["sets"],
+            "set_target": self._coach_plan["reps_per_set"],
+            "count_total": self._workout_total,
+        })
+
+    def _coach_handle_event_locked(self, event: dict, now: float) -> None:
+        kind = event.get("type")
+        if kind == "rep_completed":
+            if self._set_state != "in_set":
+                return
+            self._set_count += 1
+            self._workout_total += 1
+            self._record_rep_duration_locked(event)
+            progress = {
+                **event, "count_total": self._workout_total,
+                "set_index": self._set_index, "set_count": self._set_count,
+                "set_target": self._coach_plan["reps_per_set"],
+                "sets": self._coach_plan["sets"],
+            }
+            if self._set_count < self._coach_plan["reps_per_set"]:
+                # One or two spoken progress milestones per set keep a slow
+                # Decision Core from queuing obsolete count announcements.
+                midpoint = math.ceil(self._coach_plan["reps_per_set"] / 2)
+                if self._set_count in (1, midpoint):
+                    self._publish_event_locked(progress)
+                return
+            self._set_results.append({
+                "set_index": self._set_index,
+                "target": self._coach_plan["reps_per_set"],
+                "count": self._set_count,
+                "duration_s": round(max(0.0, now - self._set_started_at), 1),
+            })
+            self._pending_rep = None
+            if self._set_index == self._coach_plan["sets"]:
+                self._finish_workout_locked("plan_completed", announce=True)
+                return
+            self._set_state = "resting"
+            self._rest_until = now + self._coach_plan["rest_s"]
+            self._publish_event_locked({
+                **progress, "type": "set_completed",
+                "rest_s": self._coach_plan["rest_s"],
+                "next_set_index": self._set_index + 1,
+            })
+            return
+        if kind in ("target_lost", "target_reacquired"):
+            self._publish_event_locked({
+                **event, "set_index": self._set_index,
+                "set_state": self._set_state,
+                "count_total": self._workout_total,
+            })
+        elif kind == "ready_to_squat" and self._set_state == "in_set":
+            self._publish_event_locked({
+                **event, "set_index": self._set_index,
+                "set_state": self._set_state,
+                "count_total": self._workout_total,
+            })
+
+    def _record_rep_duration_locked(self, event: dict) -> None:
+        duration = event.get("rep_duration_s")
+        if isinstance(duration, (int, float)) and math.isfinite(duration):
+            self._rep_duration_sum += duration
+            self._rep_duration_count += 1
+            self._rep_duration_min = (duration if self._rep_duration_min is None
+                                      else min(self._rep_duration_min, duration))
+            self._rep_duration_max = (duration if self._rep_duration_max is None
+                                      else max(self._rep_duration_max, duration))
 
     def _finish_workout_locked(self, reason: str, *,
                                previous_session: dict | None = None,
@@ -440,7 +648,8 @@ class SquatCounterPlugin:
             return
         now = time.monotonic()
         counter = previous_session or self._counter.snapshot()
-        count = counter["count_total"]
+        count = (self._workout_total if self._coach_mode and self._coach_plan
+                 else counter["count_total"])
         summary = {
             "session_id": counter["session_id"],
             "target_id": counter["target_id"],
@@ -455,8 +664,20 @@ class SquatCounterPlugin:
             "slowest_rep_s": (round(self._rep_duration_max, 2)
                               if self._rep_duration_max is not None else None),
         }
+        if self._coach_mode and self._coach_plan is not None:
+            summary.update({
+                "plan": dict(self._coach_plan),
+                "completed_sets": len(self._set_results),
+                "set_results": [dict(item) for item in self._set_results],
+                "current_set_index": self._set_index,
+                "current_set_count": self._set_count,
+                "goal_reached": reason == "plan_completed",
+            })
         self._final_summary = summary
         self._workout_state = "finished"
+        if self._coach_mode:
+            self._set_state = "finished"
+            self._rest_until = None
         self._absence_started_at = None
         self._pending_rep = None
         self._counter.reset()
@@ -493,8 +714,11 @@ class SquatCounterPlugin:
                 payload = json.loads(message.data)
                 if not isinstance(payload, dict):
                     raise ValueError("姿态数据必须是 JSON 对象")
+                previous_frame_time = self._counter.last_frame_time
                 events = (self._counter.process(payload)
                           if self._workout_state == "active" else [])
+                fresh_frame = (self._workout_state != "active"
+                               or self._counter.last_frame_time != previous_frame_time)
                 self._frames_parsed += 1
             except (ValueError, TypeError, KeyError) as exc:
                 self._invalid_frames += 1
@@ -509,9 +733,10 @@ class SquatCounterPlugin:
                 self._node.get_logger().error(f"Squat counter frame error: {exc}")
                 return
             now = time.monotonic()
-            self._last_input_at = now
+            if fresh_frame:
+                self._last_input_at = now
             self._last_error = None
-            if self._workout_state == "active":
+            if self._workout_state == "active" and fresh_frame:
                 snapshot = self._counter.snapshot()
                 target_state = snapshot["target_state"]
                 if target_state == "tracking":
@@ -533,21 +758,19 @@ class SquatCounterPlugin:
                     }, announce=True)
                     break
                 self._handle_event_locked(event, now)
+            if fresh_frame:
+                self._coach_maybe_ready_locked(now)
             self._check_auto_finish_locked(now)
             self._publish_status_locked(now)
             self._publish_debug_locked(now)
 
     def _handle_event_locked(self, event: dict, now: float) -> None:
+        if self._coach_mode:
+            self._coach_handle_event_locked(event, now)
+            return
         kind = event.get("type")
         if kind == "rep_completed":
-            duration = event.get("rep_duration_s")
-            if isinstance(duration, (int, float)) and math.isfinite(duration):
-                self._rep_duration_sum += duration
-                self._rep_duration_count += 1
-                self._rep_duration_min = (duration if self._rep_duration_min is None
-                                          else min(self._rep_duration_min, duration))
-                self._rep_duration_max = (duration if self._rep_duration_max is None
-                                          else max(self._rep_duration_max, duration))
+            self._record_rep_duration_locked(event)
             if (self._last_rep_published_at is None
                     or now - self._last_rep_published_at
                     >= self._min_rep_event_interval_s):
@@ -573,6 +796,8 @@ class SquatCounterPlugin:
 
     def _status_locked(self) -> dict:
         counter = self._counter.snapshot()
+        if self._coach_mode and self._workout_state == "active":
+            counter["count_total"] = self._workout_total
         if self._final_summary is not None:
             counter.update({
                 "session_id": self._final_summary["session_id"],
@@ -599,6 +824,14 @@ class SquatCounterPlugin:
                 round(max(0.0, now - self._absence_started_at), 1)
                 if self._absence_started_at is not None else None),
             "summary": dict(self._final_summary) if self._final_summary else None,
+            "plan": dict(self._coach_plan) if self._coach_plan else None,
+            "set_state": self._set_state,
+            "set_index": self._set_index if self._coach_plan else None,
+            "set_count": self._set_count if self._coach_plan else None,
+            "set_target": (self._coach_plan["reps_per_set"]
+                           if self._coach_plan else None),
+            "completed_sets": len(self._set_results) if self._coach_plan else None,
+            "rest_remaining_s": self._rest_remaining_locked(now),
             "input_topic": self._input_topic or None,
             "last_frame_age_s": None if age is None else round(age, 3),
             "input_stale": (self._subscription is not None and age is not None
@@ -644,6 +877,7 @@ class SquatCounterPlugin:
         with self._lock:
             now = time.monotonic()
             self._check_auto_finish_locked(now)
+            self._advance_rest_locked(now)
             if (self._pending_rep is not None
                     and (self._last_rep_published_at is None
                          or now - self._last_rep_published_at

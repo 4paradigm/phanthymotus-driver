@@ -34,7 +34,13 @@ def tool_definition(namespace: str) -> dict:
             "properties": {
                 "action": {"type": "string", "enum": [
                     "start", "stop", "info", "status", "debug", "reset",
-                    "begin", "finish"]},
+                    "begin", "next_set", "finish"]},
+                "sets": {"type": "integer", "minimum": 1, "maximum": 5,
+                         "description": "Number of planned squat sets (default: 2)"},
+                "reps_per_set": {"type": "integer", "minimum": 1, "maximum": 20,
+                                 "description": "Full squats required per set (default: 8)"},
+                "rest_s": {"type": "integer", "minimum": 15, "maximum": 180,
+                           "description": "Rest seconds between sets (default: 90)"},
                 "input_topic": {
                     "type": "string",
                     "description": "Full pose /poses/skeleton ROS topic from the canvas connection",
@@ -49,8 +55,10 @@ def tool_definition(namespace: str) -> dict:
                 "status": {"params": [], "description": "Read the authoritative current total"},
                 "debug": {"params": [], "description": "查看中文姿态测量与计数判定"},
                 "reset": {"params": [], "description": "Clear the count and start a new session"},
-                "begin": {"params": [], "description":
-                          "Begin a voice-controlled workout; repeated calls keep the current count"},
+                "begin": {"params": ["sets", "reps_per_set", "rest_s"],
+                          "description": "Start a squat workout plan; repeated calls keep the current set"},
+                "next_set": {"params": [], "description":
+                             "Start the next set after the rest timer has finished"},
                 "finish": {"params": [], "description":
                            "Freeze the workout and return its final summary"},
             },

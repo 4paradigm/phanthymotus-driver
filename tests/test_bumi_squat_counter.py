@@ -1027,3 +1027,236 @@ def test_explicit_workout_target_switch_finishes_original_subject(plugin_factory
     _plugin_standing(subscription, clock)
     _plugin_rep(subscription, clock)
     assert card.dispatch("status", {})["summary"] == finished["summary"]
+
+
+def _start_coach_workout(plugin_factory, *, sets=2, reps_per_set=1,
+                         rest_s=15, min_rep_event_interval_s=3.0):
+    card, clock, node = plugin_factory({
+        "require_explicit_workout_start": True,
+        "coach_mode": True,
+        "auto_finish_absence_s": 6.0,
+        "min_rep_event_interval_s": min_rep_event_interval_s,
+    })
+    event_topic = card.get_tool()["topic_out"][0]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    started = card.dispatch("begin", {
+        "sets": sets, "reps_per_set": reps_per_set, "rest_s": rest_s,
+    })
+    return card, clock, node, subscription, event_topic, started
+
+
+def _events(node, topic, kind):
+    return [event for event in node.publishers[topic].payloads
+            if event["type"] == kind]
+
+
+def test_coach_begin_records_plan_and_repeated_begin_keeps_progress(plugin_factory):
+    card, clock, node, subscription, topic, started = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=2, rest_s=15)
+
+    assert started["plan"] == {"sets": 2, "reps_per_set": 2, "rest_s": 15}
+    assert started["set_index"] == 1
+    assert started["set_count"] == 0
+    assert started["set_state"] == "preparing"
+    _plugin_standing(subscription, clock)
+    assert card.dispatch("status", {})["set_state"] == "in_set"
+    _plugin_rep(subscription, clock)
+
+    repeated = card.dispatch("begin", {
+        "sets": 3, "reps_per_set": 5, "rest_s": 30,
+    })
+    assert repeated["session_id"] == started["session_id"]
+    assert repeated["plan"] == started["plan"]
+    assert repeated["set_index"] == 1
+    assert repeated["set_count"] == repeated["count_total"] == 1
+
+
+def test_coach_set_goal_is_immediate_despite_rep_throttle_and_rest_ignores_reps(
+        plugin_factory):
+    card, clock, node, subscription, topic, _ = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=2, rest_s=15,
+        min_rep_event_interval_s=10.0)
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["set_count"] == 1
+    _plugin_rep(subscription, clock)
+
+    status = card.dispatch("status", {})
+    assert status["set_state"] == "resting"
+    assert status["set_count"] == status["count_total"] == 2
+    completed = _events(node, topic, "set_completed")
+    assert len(completed) == 1
+    assert completed[0]["set_index"] == 1
+    assert completed[0]["set_count"] == 2
+
+    # Further motions during the break do not become counted repetitions.
+    _plugin_rep(subscription, clock)
+    status = card.dispatch("status", {})
+    assert status["set_state"] == "resting"
+    assert status["set_count"] == status["count_total"] == 2
+    assert len(_events(node, topic, "set_completed")) == 1
+
+
+def test_coach_rest_requires_next_set_and_finishes_after_final_goal(plugin_factory):
+    card, clock, node, subscription, topic, started = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=1, rest_s=15)
+    _plugin_standing(subscription, clock)
+    assert len(_events(node, topic, "set_ready")) == 1
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["set_state"] == "resting"
+
+    # The original begin command is idempotent even while resting.
+    assert card.dispatch("begin", {})["set_state"] == "resting"
+    clock.advance(15.1)
+    node.timers[0]()
+    assert card.dispatch("status", {})["set_state"] == "ready_next"
+    assert len(_events(node, topic, "rest_finished")) == 1
+    node.timers[0]()
+    assert len(_events(node, topic, "rest_finished")) == 1
+
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["count_total"] == 1
+
+    next_set = card.dispatch("next_set", {})
+    assert next_set["set_index"] == 2
+    assert next_set["set_count"] == 0
+    assert next_set["count_total"] == 1
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+
+    finished = card.dispatch("status", {})
+    assert finished["workout_state"] == "finished"
+    assert finished["set_state"] == "finished"
+    assert finished["count_total"] == 2
+    assert finished["summary"]["count_total"] == 2
+    assert len(_events(node, topic, "workout_finished")) == 1
+    assert _events(node, topic, "workout_finished")[0]["summary"] == finished["summary"]
+    assert card.dispatch("finish", {})["summary"] == finished["summary"]
+
+
+def test_coach_voice_finish_during_rest_freezes_partial_plan(plugin_factory):
+    card, clock, node, subscription, topic, started = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=1, rest_s=15)
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["set_state"] == "resting"
+
+    finished = card.dispatch("finish", {})
+    assert finished["workout_state"] == "finished"
+    assert finished["set_state"] == "finished"
+    assert finished["summary"]["session_id"] == started["session_id"]
+    assert finished["summary"]["count_total"] == 1
+    assert finished["summary"]["end_reason"] == "voice"
+    clock.advance(20)
+    node.timers[0]()
+    assert not _events(node, topic, "rest_finished")
+    assert card.dispatch("finish", {})["summary"] == finished["summary"]
+
+
+def test_coach_sustained_absence_during_rest_finishes_workout(plugin_factory):
+    card, clock, node, subscription, topic, _ = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=1, rest_s=15)
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["set_state"] == "resting"
+
+    for _ in range(64):
+        _send_pose(subscription, clock)
+    finished = card.dispatch("status", {})
+    assert finished["set_state"] == "finished"
+    assert finished["summary"]["count_total"] == 1
+    assert finished["summary"]["end_reason"] == "left_frame"
+    assert len(_events(node, topic, "workout_finished")) == 1
+
+
+def test_coach_target_change_during_rest_finishes_original_subject(plugin_factory):
+    card, clock, node, subscription, topic, started = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=1, rest_s=15)
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["set_state"] == "resting"
+
+    for _ in range(12):
+        _send_pose(subscription, clock)
+    _send_pose(subscription, clock, person(track_id=2, anchor_x=730))
+    finished = card.dispatch("status", {})
+    assert finished["set_state"] == "finished"
+    assert finished["summary"]["session_id"] == started["session_id"]
+    assert finished["summary"]["count_total"] == 1
+    assert finished["summary"]["end_reason"] == "target_changed"
+    assert len(_events(node, topic, "workout_finished")) == 1
+
+
+def test_coach_rejects_invalid_plan_without_starting_or_mutating_session(plugin_factory):
+    card, clock, node = plugin_factory({
+        "require_explicit_workout_start": True, "coach_mode": True,
+    })
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    original = card.dispatch("status", {})
+    for invalid in ({"sets": True}, {"sets": 6}, {"reps_per_set": 0},
+                    {"rest_s": 15.5}):
+        assert card.dispatch("begin", invalid)["state"] == "error"
+        status = card.dispatch("status", {})
+        assert status["workout_state"] == "waiting_start"
+        assert status["session_id"] == original["session_id"]
+        assert status["plan"] is None
+    assert card.dispatch("begin", {})["plan"] == {
+        "sets": 2, "reps_per_set": 8, "rest_s": 90,
+    }
+
+
+def test_coach_announces_only_milestones_and_goal_without_old_pending_reps(
+        plugin_factory):
+    card, clock, node, subscription, topic, _ = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=5, rest_s=15)
+    _plugin_standing(subscription, clock)
+    for _ in range(5):
+        _plugin_rep(subscription, clock)
+
+    assert card.dispatch("status", {})["count_total"] == 5
+    assert [event["set_count"] for event in _events(node, topic, "rep_completed")] == [1, 3]
+    assert [event["set_count"] for event in _events(node, topic, "set_completed")] == [5]
+    clock.advance(1.0)
+    node.timers[0]()
+    assert [event["set_count"] for event in _events(node, topic, "rep_completed")] == [1, 3]
+
+
+def test_coach_next_set_accepts_expired_rest_without_timer_and_ignores_waiting_reps(
+        plugin_factory):
+    card, clock, node, subscription, topic, _ = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=1, rest_s=15)
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("next_set", {})["state"] == "error"
+    clock.advance(15.1)
+    # The voice tool call may beat the 200 ms rest timer callback.
+    next_set = card.dispatch("next_set", {})
+    assert next_set["set_index"] == 2
+    assert next_set["set_state"] == "preparing"
+    assert next_set["count_total"] == 1
+    assert not _events(node, topic, "rest_finished")
+    node.timers[0]()
+    assert not _events(node, topic, "rest_finished")
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["summary"]["count_total"] == 2
+
+
+def test_repeated_pose_timestamp_cannot_make_coach_ready_or_appear_fresh(
+        plugin_factory):
+    card, clock, node, subscription, topic, _ = _start_coach_workout(
+        plugin_factory, sets=1, reps_per_set=1, rest_s=15)
+    # Reach the calibrated top pose, then replay a frozen frame.
+    _plugin_standing(subscription, clock, frames=22)
+    assert card.dispatch("status", {})["set_state"] == "preparing"
+    frozen = _String(json.dumps(skeleton_payload(clock.now, [person()])))
+    for _ in range(10):
+        clock.advance(0.1)
+        subscription.callback(frozen)
+    assert card.dispatch("status", {})["set_state"] == "preparing"
+    assert card.dispatch("status", {})["input_stale"] is False
+    clock.advance(1.6)
+    subscription.callback(frozen)
+    assert card.dispatch("status", {})["input_stale"] is True
+    assert not _events(node, topic, "set_ready")
