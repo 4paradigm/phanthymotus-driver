@@ -37,6 +37,16 @@ any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Special motions should only
 be invoked with a clear area and appropriate operator approval.
 
+The call-shaped `loco.move` card follows the AS2 convention used by PR #308:
+public `vyaw` is degrees per second in the range +/-120 and is converted once
+to radians per second at the Unitree SDK boundary. `body_height` is an absolute
+AS2 target in the tested 0.17-0.50 m range and is accepted only from a standing,
+non-walking state. This command target is separate from `loco_state.body_height`,
+whose observed telemetry range is approximately 0-0.4 m. `Damp` and `Euler`
+remain available inside the vendor SDK but are intentionally not exposed as
+card actions. After `StopMove`, the driver uses `BalanceStand` to normalize
+firmware that continues reporting the stale `AI_FREE_WALK` label.
+
 `loco_state` retains its `data/json` output at `/<namespace>/loco/state`
 and also publishes `state/odom` at `/<namespace>/state/odom` for visual
 navigation. The new JSON stream uses `motus.odom/1`: body-frame twist ordered
@@ -89,7 +99,9 @@ The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
 the kinematic chain for the `joints` skeleton card, avoiding large binary
-assets in the repository. As2W has 16 movable joints (12 leg joints plus 4
+assets in the repository. Its simple calf boxes use the official-model visual
+offsets (-0.16915 m front, -0.18449 m rear), so they extend down from their
+joint frames instead of being centered on them. As2W has 16 movable joints (12 leg joints plus 4
 continuous wheel-foot joints) and the fixed JT128 sensor mount. The live
 `joints`/`joint_state` cards intentionally publish the 12 populated leg-motor
 slots from LowState; the remaining vendor array slots are reserved zeros.
@@ -100,6 +112,9 @@ SDK does not package a model-specific SLAM client, so the driver implements the
 documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
+Navigation shares the chassis with `loco`, `loco_servo`, and `special_motion`;
+the driver serializes those owners and pauses the servo stream before starting
+vendor navigation rather than allowing two command sources to drive together.
 
 `slam_mapping` is the matching read-only visualization card. It listens to the
 vendor mapping and relocation point-cloud topics plus `rt/slam_info`, keeps a
@@ -111,7 +126,9 @@ does not interrupt mapping or navigation.
 `special_motion` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card. Dangerous motions validate the current FSM
-state before dispatch, while the existing asynchronous completion and
+state and require the literal boolean `confirm=true` before dispatch. Flips
+are one-shot; handstand and biped stand are sustained postures for which
+`enter=false` exits. The existing asynchronous completion and
 cancellation behavior is retained. Timed and continuous locomotion actions
 return action IDs and report completion, cancellation, or RPC failure through
 ACP; `stop_move` also returns immediately and completes through ACP so a slow
@@ -127,7 +144,8 @@ queue. It probes for an already-installed CuPy CUDA runtime without downloading
 one: CPU fallback is capped at 2,000 latest points, while CUDA may use the
 configured 12,000-point budget. `led` controls the AS2 RGB LED through a
 separate audio-service worker, so its keepalive cannot delay locomotion or
-speaker PCM.
+speaker PCM. The keepalive also refreshes black after `off`, because otherwise
+the AS2 firmware may time out the command and restore its default LED state.
 
 The multimedia cards use transports verified on As2W hardware. `speaker`
 streams PCM-16k through the A2 `voice` service, while `camera` publishes JPEG

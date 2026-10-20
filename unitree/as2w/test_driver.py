@@ -99,6 +99,7 @@ class _Proxy:
         self.stops = 0
         self.state = "AI_STAND_UP"
         self.balance_stands = 0
+        self.body_heights = []
 
     def GetState(self):
         return 0, {"fsm_name": self.state}
@@ -115,6 +116,14 @@ class _Proxy:
     def BalanceStand(self):
         self.balance_stands += 1
         self.state = "AI_BALANCE_STAND"
+        return 0
+
+    def StandDown(self):
+        self.state = "AI_STAND_DOWN"
+        return 0
+
+    def BodyHeight(self, height):
+        self.body_heights.append(height)
         return 0
 
     def Damp(self):
@@ -238,7 +247,6 @@ class TestDriverContracts(unittest.TestCase):
             ("move", {"vy": float("inf")}, "vy"),
             ("move", {"duration": "1"}, "duration"),
             ("move", {"duration": False}, "duration"),
-            ("euler", {"roll": None}, "roll"),
             ("body_height", {"height": True}, "height"),
             ("body_position", {"z": float("-inf")}, "z"),
         ]
@@ -290,6 +298,35 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("AI_STAND_UP", result["current_state"])
         self.assertEqual(0, proxy.balance_stands)
         self.assertEqual([(0.2, 0, 0)], proxy.moves)
+
+    def test_loco_converts_public_yaw_degrees_to_sdk_radians(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch(
+            "move", {"vx": 0, "vy": 0, "vyaw": 90})
+        self.assertEqual(90, result["vyaw"])
+        self.assertAlmostEqual(__import__("math").pi / 2,
+                               result["vyaw_sdk_rad"])
+        self.assertAlmostEqual(__import__("math").pi / 2,
+                               proxy.moves[-1][2])
+
+    def test_loco_body_height_is_absolute_and_requires_standing(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+
+        result = plugin.dispatch("body_height", {"height": 0.35})
+        self.assertTrue(result["accepted"])
+        self.assertEqual(0.35, result["sdk_height_m"])
+        self.assertEqual([0.35], proxy.body_heights)
+
+        for height in (0.16, 0.51):
+            with self.subTest(height=height):
+                rejected = plugin.dispatch("body_height", {"height": height})
+                self.assertFalse(rejected["accepted"])
+        proxy.state = "AI_STAND_DOWN"
+        rejected = plugin.dispatch("body_height", {"height": 0.3})
+        self.assertFalse(rejected["accepted"])
+        self.assertEqual([0.35], proxy.body_heights)
 
     def test_loco_retries_move_after_stand_up_rejects_first_velocity(self):
         class _NeedsBalanceProxy(_Proxy):
@@ -347,9 +384,20 @@ class TestDriverContracts(unittest.TestCase):
         proxy = _Proxy()
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
         proxy.state = "AI_FREE_WALK"
-        walking = plugin.dispatch("stand_down", {})
-        self.assertFalse(walking["accepted"])
-        self.assertIn("stop_move", walking["suggested_actions"])
+        with patch.object(self.device, "_acp_notify") as notify:
+            walking = plugin.dispatch("stand_down", {})
+            for _ in range(100):
+                if notify.called:
+                    break
+                __import__("time").sleep(0.01)
+        self.assertTrue(walking["accepted"])
+        self.assertEqual("stop_move_then_stand_down", walking["transition"])
+        self.assertGreaterEqual(proxy.stops, 1)
+        self.assertEqual("AI_STAND_DOWN", proxy.state)
+        self.assertTrue(any(
+            call.args[0] == walking["action_id"] and
+            call.args[1] == "completed"
+            for call in notify.call_args_list))
         proxy.state = "AI_STAND_DOWN"
         down = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
         self.assertEqual(-1, down["ret"])
@@ -409,6 +457,18 @@ class TestDriverContracts(unittest.TestCase):
             "set_color", {"red": 300, "green": -2, "blue": 18})
         self.assertEqual([255, 0, 18], result["color"])
         self.assertIn((255, 0, 18), calls)
+        plugin.stop()
+
+    def test_led_off_keeps_refreshing_black(self):
+        calls = []
+        proxy = types.SimpleNamespace(
+            Audio_LedControl=lambda *args: calls.append(args) or 0)
+        plugin = self.device.LedPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("off", {})
+        self.assertEqual([0, 0, 0], result["color"])
+        self.assertIn((0, 0, 0), calls)
+        self.assertIsNotNone(plugin._keepalive_thread)
+        self.assertTrue(plugin._keepalive_thread.is_alive())
         plugin.stop()
 
     def test_rpc_channel_ignores_late_timed_out_results(self):
@@ -1455,6 +1515,10 @@ class TestDriverContracts(unittest.TestCase):
         urdf = (ROOT / "resource" / "as2w.urdf").read_text()
         self.assertIn('<robot name="As2W">', urdf)
         self.assertNotIn("meshes/", urdf)
+        self.assertEqual(2, urdf.count(
+            '<visual><origin xyz="0 0 -0.16915" rpy="0 0 0"/>'))
+        self.assertEqual(2, urdf.count(
+            '<visual><origin xyz="0 0 -0.18449" rpy="0 0 0"/>'))
         for name in ("FL_foot", "FR_foot", "RL_foot", "RR_foot"):
             self.assertIn(f'<joint name="{name}_joint" type="continuous">', urdf)
 

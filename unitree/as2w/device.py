@@ -31,6 +31,8 @@ _REMOTE_PUBLISH_HZ = 10.0
 _REMOTE_FRESH_S = 0.5
 _REMOTE_DEADZONE = 0.1
 _REMOTE_FRAME_HEADER = b"\x55\x51"
+_BODY_HEIGHT_MIN_M = 0.17
+_BODY_HEIGHT_MAX_M = 0.50
 
 
 def _unavailable_remote():
@@ -698,6 +700,12 @@ class LocoPlugin:
         self._controlled_spatial = None
         self._moving = False
         self._moving_owner = None
+        self._state_override = None
+        self._state_override_until = 0.0
+        # Some AS2 firmware keeps reporting AI_FREE_WALK after both StopMove
+        # and BalanceStand have succeeded. Preserve that accepted posture as a
+        # posture anchor until a later motion or posture command supersedes it.
+        self._state_hint = None
 
     def attach_servo(self, servo):
         """Attach the continuous command card that shares this chassis."""
@@ -761,7 +769,17 @@ class LocoPlugin:
                 "error": "Unable to read robot locomotion state",
                 "reason": "SportClient.GetState failed; refusing an unsafe transition",
                 "suggested_actions": ["get_state"]}
-        name = str(state.get("fsm_name", "")).strip().upper()
+        raw_name = str(state.get("fsm_name", "")).strip().upper()
+        name = raw_name
+        if (raw_name in {"AI_FREE_WALK", "FREE_WALK"} and
+                (self._state_hint == "BALANCE_STAND" or
+                 (self._state_override == "BALANCE_STAND" and
+                  time.monotonic() < self._state_override_until))):
+            state = dict(state)
+            state["raw_fsm_name"] = raw_name
+            state["fsm_name"] = "BALANCE_STAND"
+            state["state_source"] = "stop_move_balance_stand_confirmation"
+            name = "BALANCE_STAND"
         if not name:
             return None, state, {
                 "ret": -1, "current_state": "UNKNOWN",
@@ -983,20 +1001,19 @@ class LocoPlugin:
             "The robot is in a transition, special motion, or fault state",
             ["stop_move", "recovery_stand", "get_state"])
     def get_tool(self):
-        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
+        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation rad/s, and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; damp releases motor torque; recovery_stand is for fallen/down posture; speed_level accepts slow/normal/fast; body_height/body_position/euler are direct controller offsets. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity rad/s [-2, 2]"},
-                    "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
-                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
+                "description": "As2W locomotion. move uses signed vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; recovery_stand is for fallen/down posture; body_height is an absolute AS2 target height in meters. Damp and Euler remain internal SDK operations and are not exposed by this card.", "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity in degrees/s [-120, 120]; converted to radians/s for Unitree SDK"},
+                    "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "yaw": {"type": "number", "description": "Body yaw radians"},
+                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "minimum": 0.17, "maximum": 0.50, "description": "Absolute AS2 body height in meters"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
                 "x-completion": {"actions": ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 45},
                 "x-action-params": {
                     "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
                     "stop_move": {"params": [], "description": "Stop movement."},
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
-                    "damp": {"params": [], "description": "Damp motors."}, "euler": {"params": ["roll", "pitch", "yaw"], "description": "Set body attitude."},
-                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set body height offset."},
+                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set the absolute AS2 body height target in meters (0.17-0.50)."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
                     "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
                     "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
@@ -1092,7 +1109,10 @@ class LocoPlugin:
                     return error
             vx = max(-1.5, min(1.5, values["vx"]))
             vy = max(-1.0, min(1.0, values["vy"]))
-            yaw = max(-2.0, min(2.0, values["vyaw"]))
+            # PR #308 keeps the call-shaped loco API in degrees/s. The
+            # continuous navigation card remains motus.control/1 radians/s.
+            vyaw_deg = max(-120.0, min(120.0, values["vyaw"]))
+            yaw = math.radians(vyaw_deg)
             duration = args.get("duration")
             if duration is not None:
                 duration, error = _finite_argument(args, "duration")
@@ -1121,13 +1141,17 @@ class LocoPlugin:
             if state_name not in self._STANDING and not self._is_moving(state_name):
                 return self._move_error_for_state(state_name)
             self._cancel_transition()
+            self._state_override = None
+            self._state_override_until = 0.0
+            self._state_hint = None
             if duration is None:
                 self._stop_continuous()
                 ret = self.proxy.Move(vx, vy, yaw)
                 self._moving = ret == 0
                 self._moving_owner = object() if ret == 0 else None
                 return {"ret": ret, "accepted": ret == 0, "action": "move",
-                        "current_state": state_name, "vx": vx, "vy": vy, "vyaw": yaw,
+                        "current_state": state_name, "vx": vx, "vy": vy,
+                        "vyaw": vyaw_deg, "vyaw_sdk_rad": yaw,
                         **({"preempted_loco_servo": True} if preempted_servo else {}),
                         **({} if ret == 0 else {"error": "Sport controller rejected Move",
                           "reason": "The robot is standing but the velocity command was refused",
@@ -1217,9 +1241,18 @@ class LocoPlugin:
                     "The robot is already standing; use balance_stand or move",
                     ["balance_stand", "move", "stand_down"])
             if action == "stand_down" and self._is_moving(state_name):
-                return self._not_allowed(action, state_name,
-                    "StandDown cannot be issued while the robot is walking",
-                    ["stop_move", "stand_down"])
+                action_id = f"as2w_loco_{uuid4().hex[:8]}"
+                method, expected_name = methods[action]
+                threading.Thread(
+                    target=self._stop_then_posture,
+                    args=(action_id, action, method, expected_name, state_name),
+                    daemon=True,
+                    name="as2w-loco-stop-then-stand-down",
+                ).start()
+                return {"ret": 0, "accepted": True, "status": "running",
+                        "action": action, "action_id": action_id,
+                        "current_state": state_name,
+                        "transition": "stop_move_then_stand_down"}
             if action == "stand_down" and state_name in self._DOWN:
                 return self._not_allowed(action, state_name,
                     "The robot is already down or damping",
@@ -1233,7 +1266,7 @@ class LocoPlugin:
                     "AI_FALL", "AI_FALLEN", "AI_STAND_DOWN", "AI_DAMPING"}:
                 return self._not_allowed(action, state_name,
                     "RecoveryStand is only valid from a fallen or down posture",
-                    ["stand_down", "damp", "recovery_stand"])
+                    ["stand_down", "recovery_stand"])
             if action in {"balance_stand", "recovery_stand"} and self._is_moving(state_name):
                 return self._not_allowed(action, state_name,
                     "Posture transition cannot be issued while the robot is moving",
@@ -1247,39 +1280,43 @@ class LocoPlugin:
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             threading.Thread(target=self._await_posture, args=(action_id, action, expected_name), daemon=True).start()
             return {"ret": 0, "accepted": True, "status": "running", "action": action, "action_id": action_id}
-        if action == "damp":
-            self._cancel_transition()
-            state_name, state, state_error = self._read_state()
-            if state_error:
-                return {**state_error, "action": action}
-            if self._is_moving(state_name):
-                return self._not_allowed(action, state_name,
-                    "Damp is refused while the robot is walking or running",
-                    ["stop_move", "damp"])
-            ret = self.proxy.Damp()
-            return {"ret": ret, "accepted": ret == 0, "action": action,
-                    "current_state": state_name,
-                    **({} if ret == 0 else {"error": "SportClient rejected the action",
-                      "reason": "The controller refused damping from the current posture",
-                      "suggested_actions": ["get_state", "stop_move", "recovery_stand"],
-                      "rpc_ret": ret})}
-        if action == "euler":
-            values = {}
-            for name in ("roll", "pitch", "yaw"):
-                values[name], error = _finite_argument(args, name)
-                if error:
-                    return error
-            return {"ret": self.proxy.Euler(
-                values["roll"], values["pitch"], values["yaw"])}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
             if preset not in {"slow", "normal", "fast"}: return {"ret": -1, "error": "speed_preset must be slow, normal, or fast"}
             return {"ret": self.proxy.SpeedLevel({"slow": -1, "normal": 0, "fast": 1}[preset]), "speed_preset": preset}
         if action == "body_height":
+            if "height" not in args:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": "height is required",
+                        "reason": "BodyHeight needs an absolute target in meters",
+                        "suggested_actions": ["stand_up", "balance_stand"]}
             height, error = _finite_argument(args, "height")
             if error:
                 return error
-            return {"ret": self.proxy.BodyHeight(height)}
+            if not _BODY_HEIGHT_MIN_M <= height <= _BODY_HEIGHT_MAX_M:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": (
+                            f"height must be between {_BODY_HEIGHT_MIN_M:.2f} "
+                            f"and {_BODY_HEIGHT_MAX_M:.2f} meters"),
+                        "suggested_actions": ["get_state"]}
+            state_name, state, state_error = self._read_state()
+            if state_error:
+                return {**state_error, "action": action, "height_m": height}
+            if state_name in self._DOWN or self._is_moving(state_name):
+                return self._not_allowed(
+                    action, state_name,
+                    "BodyHeight requires a standing, non-walking posture",
+                    ["stand_up", "balance_stand", "stop_move"])
+            ret = self.proxy.BodyHeight(height)
+            result = {"ret": ret, "accepted": ret == 0, "action": action,
+                      "height_m": height, "sdk_height_m": height,
+                      "current_state": state_name}
+            if ret != 0:
+                result.update({"rpc_ret": ret,
+                               "error": "SportClient rejected BodyHeight",
+                               "reason": "The controller did not accept the target height",
+                               "suggested_actions": ["balance_stand", "get_state"]})
+            return result
         if action == "body_position":
             values = {}
             for name in ("x", "y", "z", "yaw"):
@@ -1301,14 +1338,12 @@ class LocoPlugin:
             return {"ret": getattr(self.proxy, flag_methods[action])(
                 1 if flag else 0)}
         if action == "get_state":
-            result = self.proxy.GetState()
-            if isinstance(result, tuple) and len(result) == 2:
-                code, state = result
-                return {"ret": code, "state": state}
-            return {"ret": result if isinstance(result, int) else 3104,
-                    "state": {}, "error": "Unable to read robot locomotion state",
-                    "reason": "SportClient.GetState did not return a state",
-                    "suggested_actions": ["retry", "recovery_stand"]}
+            state_name, state, state_error = self._read_state()
+            if state_error:
+                return {**state_error, "action": action, "state": state or {}}
+            return {"ret": 0, "state": state, "current_state": state_name,
+                    "state_source": state.get(
+                        "state_source", "sport_client.get_state")}
         return None
 
     def _run_timed_move(self, action_id, vx, vy, yaw, duration, stop_event):
@@ -1332,28 +1367,114 @@ class LocoPlugin:
             "action": "move", "ret": 0, "duration": -1,
             "reason": "Continuous move stopped by stop_move or card shutdown"})
 
-    def _await_stopped(self, action_id):
-        deadline = time.monotonic() + 5.0
+    def _await_stopped(self, action_id, completed_action="stop_move",
+                       completion_extra=None):
+        """Normalize AS2's stale walking label after an accepted stop."""
+        deadline = time.monotonic() + 2.0
         last_state = "UNKNOWN"
+        balance_requested = False
+        balance_ret = None
         while time.monotonic() < deadline:
             name, state, error = self._read_state()
             if error:
                 _acp_notify(action_id, "error", {
-                    **error, "action": "stop_move",
+                    **error, "action": completed_action,
                     "reason": "StopMove was accepted, but state confirmation failed"})
                 return
             last_state = name
             if not self._is_moving(name):
-                _acp_notify(action_id, "completed", {
-                    "action": "stop_move", "ret": 0,
-                    "state": state, "reason": "controller left walking state"})
+                result = {"action": completed_action, "ret": 0,
+                          "state": state,
+                          "reason": "controller left walking state"}
+                if completion_extra:
+                    result.update(completion_extra)
+                _acp_notify(action_id, "completed", result)
                 return
+            if not balance_requested:
+                balance_requested = True
+                balance_ret = self.proxy.BalanceStand()
+                print(
+                    f"[loco] stop stabilization action_id={action_id} "
+                    f"state={name} BalanceStand ret={balance_ret}",
+                    flush=True,
+                )
+                if balance_ret != 0:
+                    break
+                self._state_override = "BALANCE_STAND"
+                self._state_override_until = time.monotonic() + 10.0
+                self._state_hint = "BALANCE_STAND"
             time.sleep(0.1)
+        if balance_ret == 0:
+            result = {"action": completed_action, "ret": 0,
+                      "current_state": last_state, "balance_ret": 0,
+                      "state_stale": True,
+                      "reason": (
+                          "StopMove and BalanceStand were accepted; AS2 "
+                          "GetState still reports a stale walking label")}
+            if completion_extra:
+                result.update(completion_extra)
+            _acp_notify(action_id, "completed", result)
+            return
         _acp_notify(action_id, "error", {
-            "action": "stop_move", "ret": 0, "current_state": last_state,
-            "error": "StopMove was accepted but robot still reports walking",
-            "reason": "The controller has not left AI_FREE_WALK within 5 seconds",
-            "suggested_actions": ["get_state", "retry_stop"]})
+            "action": completed_action, "ret": 0,
+            "current_state": last_state, "balance_ret": balance_ret,
+            "error": "StopMove was accepted but balance normalization failed",
+            "reason": (
+                "The controller did not accept BalanceStand after StopMove"),
+            "suggested_actions": [
+                "get_state", "retry_stop", "balance_stand"]})
+
+    def _stop_then_posture(self, action_id, action, method, expected_name,
+                           state_name):
+        """Serialize StopMove before a posture command from a walking FSM."""
+        try:
+            with self.motion_lock:
+                self._cancel_transition()
+                self._stop_continuous()
+                stop_ret = self.proxy.StopMove()
+                if stop_ret == 0:
+                    self._moving = False
+                    self._moving_owner = None
+        except Exception as exc:
+            _acp_notify(action_id, "error", {
+                "action": action, "ret": 3104,
+                "current_state": state_name,
+                "error": "StopMove RPC failed before posture transition",
+                "reason": (
+                    "Could not stop the active velocity command: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"),
+                "suggested_actions": ["get_state", "retry_stop"]})
+            return
+        if stop_ret != 0:
+            _acp_notify(action_id, "error", self._rpc_rejected(
+                action, state_name, stop_ret,
+                "StopMove was rejected, so the posture transition was not sent",
+                ["get_state", "stop_move", action]))
+            return
+        time.sleep(0.2)
+        try:
+            with self.motion_lock:
+                ret = getattr(self.proxy, method)()
+        except Exception as exc:
+            _acp_notify(action_id, "error", {
+                "action": action, "ret": 3104,
+                "current_state": state_name, "stop_ret": stop_ret,
+                "error": "Posture RPC failed after StopMove",
+                "reason": (
+                    f"{method} could not reach the sport controller: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"),
+                "suggested_actions": ["get_state", "retry_stop", action]})
+            return
+        if ret != 0:
+            _acp_notify(action_id, "error", self._rpc_rejected(
+                action, state_name, ret,
+                f"{method} was rejected after StopMove",
+                ["get_state", "retry_stop", "balance_stand", action]))
+            return
+        self._state_hint = None
+        self._state_override = None
+        self._state_override_until = 0.0
+        self._await_posture(action_id, action, expected_name)
 
     def _stop_move_worker(self, action_id, owner=None):
         try:
@@ -1431,19 +1552,19 @@ class SpecialMotionPlugin:
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
         return {"name": "special_motion", "type": "actuator", "multiInstance": False,
-                "description": "As2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
+                "description": "As2W discrete acrobatic motions via the official SportClient. The robot must be standing and balanced, the area must be clear, and confirm must be the literal boolean true. Flips are one-shot actions; handstand and biped_stand are sustained postures that support enter=false to exit.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
-                    "enter": {"type": "boolean", "description": "Enter or exit a sustained posture."},
-                    "confirm": {"type": "boolean", "description": "Required true for hazardous motions."}},
+                    "enter": {"type": "boolean", "description": "For handstand/biped_stand: true enters and false exits the sustained posture."},
+                    "confirm": {"type": "boolean", "description": "Must be the literal boolean true for every hazardous motion."}},
                     "required": ["action"],
                     "x-is-dangerous": True,
                     "x-completion": {"actions": actions, "timeout": 45},
                     "x-action-params": {
                         "front_flip": {"params": ["confirm"], "description": "DANGEROUS forward flip; requires confirm=true."},
                         "back_flip": {"params": ["confirm"], "description": "DANGEROUS backward flip; requires confirm=true."},
-                        "handstand": {"params": ["enter", "confirm"], "description": "DANGEROUS handstand; requires confirm=true."},
-                        "biped_stand": {"params": ["enter", "confirm"], "description": "DANGEROUS biped stand; requires confirm=true."}}}}
+                        "handstand": {"params": ["enter", "confirm"], "description": "DANGEROUS sustained handstand; confirm=true is required and enter=false exits."},
+                        "biped_stand": {"params": ["enter", "confirm"], "description": "DANGEROUS sustained biped stand; confirm=true is required and enter=false exits."}}}}
 
     def start(self): pass
     def stop(self):
@@ -1640,17 +1761,19 @@ class LedPlugin:
                 "description": "AS2 RGB LED. The selected color is refreshed periodically because AS2 firmware may time out LED state.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["set_color", "off", "info"]},
-                    "red": {"type": "integer", "minimum": 0, "maximum": 255},
-                    "green": {"type": "integer", "minimum": 0, "maximum": 255},
-                    "blue": {"type": "integer", "minimum": 0, "maximum": 255}},
+                    "red": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Red channel 0-255."},
+                    "green": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Green channel 0-255."},
+                    "blue": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Blue channel 0-255."}},
                     "required": ["action"],
                     "x-action-params": {
                         "set_color": {"params": ["red", "green", "blue"], "description": "Set RGB color."},
                         "off": {"params": [], "description": "Turn the LED off."},
                         "info": {"params": [], "description": "Read the selected color."}}}}
 
-    def start(self):
-        if not any(self._color):
+    def start(self, allow_black=False):
+        # Avoid occupying the audio RPC worker with black refreshes during
+        # bundle startup. Explicit off is different: it must keep black alive.
+        if not allow_black and not any(self._color):
             return
         self._keepalive_stop.clear()
         if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
@@ -1666,8 +1789,9 @@ class LedPlugin:
 
     def _keepalive(self):
         while not self._keepalive_stop.is_set():
+            color = tuple(self._color)
             try:
-                self._proxy.Audio_LedControl(*tuple(self._color))
+                self._proxy.Audio_LedControl(*color)
             except Exception as exc:
                 now = time.monotonic()
                 previous = getattr(self, "_last_error", 0.0)
@@ -1677,7 +1801,10 @@ class LedPlugin:
             self._keepalive_stop.wait(0.7)
 
     def dispatch(self, action, args):
-        if action in ("start", "info"):
+        if action == "start":
+            self.start()
+            return {"state": "ready", "color": list(self._color)}
+        if action == "info":
             return {"state": "ready", "color": list(self._color)}
         if action == "stop":
             self.stop()
@@ -1690,9 +1817,9 @@ class LedPlugin:
         else:
             return None
         self._color = list(color)
-        if action == "off":
-            self.stop()
         result = self._proxy.Audio_LedControl(*color)
-        if action != "off" and result == 0:
-            self.start()
+        if result == 0:
+            # AS2 firmware can restore its default LED after a timeout. Black
+            # therefore needs the same refresh loop as visible colors.
+            self.start(allow_black=action == "off")
         return {"ret": result, "color": list(color)}

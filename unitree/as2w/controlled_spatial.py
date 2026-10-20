@@ -163,7 +163,7 @@ class ControlledSpatialPlugin:
 
     def get_tool(self):
         return {"name": "controlled_spatial", "type": "actuator", "multiInstance": False,
-                "description": "As2W SLAM map, relocalization, and point-goal navigation. Requires the vendor unitree_slam service already running.",
+                "description": "As2W SLAM map, relocalization, and point-goal navigation. Requires the vendor unitree_slam service already running. Navigation is mutually exclusive with loco, loco_servo, and special_motion chassis control.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": list(_APIS)},
                     "address": {"type": "string", "description": "Absolute PCD path for stop_mapping or init_pose."},
