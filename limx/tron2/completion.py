@@ -5,7 +5,7 @@ import time
 from uuid import uuid4
 
 from skeleton import skeleton_stream
-from vendor import MoveError, validate_movej
+from vendor import MoveError, validate_movej, motion_readiness
 
 ACP_TIMEOUT = 120
 POSE_ACP_TIMEOUT = 480
@@ -16,6 +16,7 @@ ARRIVAL_GRACE = 10
 TOLERANCE_DEG = 1
 STABILITY_DEG = .2
 STABILITY_SECONDS = .5
+POSE_PREPARATION_TIMEOUT = 3
 # Vendor dq is preserved without a verified unit definition. This is an
 # additional raw near-zero gate; stationary position is checked from q itself.
 VELOCITY_RAW_TOLERANCE = .05
@@ -72,7 +73,7 @@ class ArmCompletion:
                     result[key]=self.last[key]
         return result
 
-    async def dispatch(self, action, target, duration, details, *, sequence=None, guard=None):
+    async def ensure_available(self):
         # Core can wake its next action before the callback HTTP response has
         # reached us. Wait for that bounded delivery only after verified arrival;
         # reject immediately while moving or when completion is uncertain.
@@ -87,6 +88,9 @@ class ArmCompletion:
             raise MoveError('Gripper or other motion is active or uncertain; no additional motion sent', False)
         if self.closed or self.active:
             raise self.blocked_error()
+
+    async def dispatch(self, action, target, duration, details, *, sequence=None, guard=None):
+        await self.ensure_available()
         target, duration = self.validate(target, duration)
         self.feedback()
         future = asyncio.get_running_loop().create_future()
@@ -106,18 +110,24 @@ class ArmCompletion:
     async def dispatch_sequence(self, plan, guard):
         import copy
         frames=copy.deepcopy(plan['frames'])
-        if not frames or len(frames)>12 or frames[0].get('kind','arm') not in ('arm','head','trajectory'):
+        if not frames or len(frames)>12 or frames[0].get('kind','arm') not in ('arm','home','head','trajectory'):
             raise ValueError('Invalid pose frame count or first stage')
+        if plan.get('home_preparation_required',False) is not (frames[0].get('kind')=='home'):
+            raise ValueError('Pose home preparation stage missing or unexpected')
         from gripper import command as gripper_command
         budget=float(POSE_ADMISSION_AND_REPORT_BUDGET)
         previous=plan['start_q']
-        for frame in frames:
+        for index,frame in enumerate(frames):
             kind=frame.get('kind','arm')
-            if kind=='arm':
+            if kind in ('arm','home'):
+                if kind=='home' and (index!=0 or frame['joint']!=plan['home_q'] or
+                        frame['label']!='prepare_home' or frame['hold']!=0 or
+                        frame['time']!=max(8,math.ceil(max(abs(math.degrees(a-b)) for a,b in zip(plan['start_q'],plan['home_q']))/5))):
+                    raise ValueError('Invalid original-home preparation stage')
                 self.validate(frame['joint'],frame['time'])
                 budget+=frame['time']+ARRIVAL_GRACE+5+self.reader.settings['response_timeout_seconds']
             elif kind=='head':
-                if frame is not frames[0] or self.pose_head is None or frame['head_joint']!=[0.,0.] or frame['joint']!=previous:
+                if (index!=0 and not (index==1 and frames[0].get('kind')=='home')) or self.pose_head is None or frame['head_joint']!=[0.,0.] or frame['joint']!=previous:
                     raise ValueError('Invalid pose head centering stage')
                 self.pose_head.validate(frame['head_joint'],frame['time'])
                 budget+=frame['time']+ARRIVAL_GRACE+5+self.reader.settings['response_timeout_seconds']
@@ -178,20 +188,48 @@ class ArmCompletion:
         with self.reader.pose_feedback():
             await self._run_sequence_owned(job)
 
+    async def verify_pose_start(self,job):
+        """Read-only stationary start verification under the pose owner before motion."""
+        until=time.monotonic()+POSE_PREPARATION_TIMEOUT
+        stamp=None;window=[]
+        while time.monotonic()<until:
+            if job['cancel_sequence']:
+                raise MoveError('Pose cancelled before home verification; no motion sent',False,'pose_preparation_cancelled')
+            self._sequence_feedback(job,job['details']['start_q'],centering=True)
+            sample,q,dq=arm_feedback(self.reader)
+            current=sample['data'].get('robot_timestamp');age=sample.get('reception_age_seconds')
+            if type(current) not in (int,float) or not math.isfinite(current) or stamp is not None and current<stamp:
+                raise ValueError('Home verification timestamp invalid or regressed')
+            status=self.reader.sample('robot_status')
+            if not status['available'] or not motion_readiness(status['data'])['ready'] or status['data'].get('motor')!='OK':
+                raise ValueError('Robot no longer ready before pose preparation')
+            if not job['details'].get('home_preparation_required',False) and max(abs(math.degrees(a-b)) for a,b in zip(q,job['details']['home_q']))>TOLERANCE_DEG:
+                raise ValueError('Arms left home before pose; no motion sent')
+            if (stamp is None or current>stamp) and type(age) in (int,float) and 0<=age<=.35:
+                if window and max(abs(math.degrees(a-b)) for a,b in zip(q,window[0][1]))>STABILITY_DEG:
+                    window=[]
+                window.append((time.monotonic(),q));stamp=current
+                if len(window)>=3 and window[-1][0]-window[0][0]>=STABILITY_SECONDS:return
+            await asyncio.sleep(.02)
+        raise ValueError('Advancing stationary home feedback not verified; no pose motion sent')
+
     async def _run_sequence_owned(self, job):
         admitted=False;status='error';safe_end=False;any_sent=False
         result={'arrival_verified':False}
         expected=job['details']['start_q']
         try:
+            await self.verify_pose_start(job)
+            if not job['details'].get('home_preparation_required',False):
+                result['preparation_home_verified']=True
             for index,frame in enumerate(job['sequence']):
                 kind=frame.get('kind','arm')
                 # A lifecycle stop never creates another motor command.
                 if job['cancel_sequence']:
-                    self._sequence_feedback(job,expected,centering=kind=='head')
+                    self._sequence_feedback(job,expected,centering=kind in ('home','head'))
                     status='cancelled';safe_end=True
                     break
                 await job['guard']()
-                self._sequence_feedback(job,expected,centering=kind=='head')
+                self._sequence_feedback(job,expected,centering=kind in ('home','head'))
                 if job['cancel_sequence']:
                     status='cancelled';safe_end=True
                     break
@@ -271,6 +309,9 @@ class ArmCompletion:
                         job['head_center_verified']=True
                     else:
                         await self.wait_for_arrival(job)
+                        if kind=='home':
+                            self._sequence_feedback(job,job['target'],centering=True)
+                            result['preparation_home_verified']=True
                 job['completed_stages']=index+1
                 expected=list(job['target'])
                 until=time.monotonic()+frame['hold']

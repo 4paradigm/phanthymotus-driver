@@ -166,8 +166,15 @@ async def run(owner, job, frame, admitted):
                 # Feedback lag is bounded by the same freshness gate. Compare to
                 # the commanded history at receipt age, not only a future target.
                 reference = path.at(max(0.,elapsed-age))
-                tracking_error = max(abs(math.degrees(a-b)) for a,b in zip(q,reference))
-                diagnostics['max_tracking_error_deg']=max(diagnostics['max_tracking_error_deg'],tracking_error)
+                errors = [abs(math.degrees(a-b)) for a,b in zip(q,reference)]
+                worst = max(range(len(errors)),key=errors.__getitem__)
+                tracking_error = errors[worst]
+                if tracking_error>=diagnostics['max_tracking_error_deg']:
+                    diagnostics.update(max_tracking_error_deg=tracking_error,
+                        worst_tracking_joint_index=worst,
+                        worst_tracking_actual_deg=math.degrees(q[worst]),
+                        worst_tracking_reference_deg=math.degrees(reference[worst]),
+                        worst_tracking_command_deg=math.degrees(target[worst]))
                 if tracking_error>TRACKING_DEG:
                     raise MoveError('Trajectory tracking error exceeds 8 degrees',bool(sent),'trajectory_tracking')
                 for index,(begins,dwell,goal) in enumerate(path.holds):

@@ -32,7 +32,7 @@ HEAD_KEEP_OUT = .20  # Skeletal keep-out heuristic, not a collision CAD model.
 
 def tool():
     return {'name':'pose','type':'actuator','multiInstance':False,
-        'description':'TRON2预设轨迹：salute右臂敬礼、wave右臂挥手、welcome双臂欢迎。自检后自动将头部回正至pitch0/yaw0并确认到位，再执行平滑轨迹。挥手后右夹爪开合一次；敬礼、欢迎保持1秒，最后回原home。双臂须在home附近，区域清空。',
+        'description':'TRON2预设轨迹：salute右臂敬礼、wave右臂挥手、welcome双臂欢迎。自检后先确认双臂在原自然下垂home，未到home则自动回位并确认；再将头部回正至pitch0/yaw0并执行轨迹。挥手后右夹爪开合一次；敬礼、欢迎保持1秒，最后回原home。执行前保持静止、空载，区域清空。',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
                 'pose':{'type':'string','enum':list(LABELS.values()), 'title':'预设动作',
@@ -137,7 +137,7 @@ class Pose:
         return {'read_only':True,'motion_sent':False,'catalog':LABELS,
             'planned_deg_per_second':PLANNED_DEG_PER_SECOND,
             'wave_planned_deg_per_second':WAVE_DEG_PER_SECOND,'motion':self.motion.summary(),
-            'home':self.reset.call('info'),'returns_to_home':True,'collision_checked':False,
+            'home':self.reset.call('info'),'home_policy':'verify_then_reset_if_needed','returns_to_home':True,'collision_checked':False,
             'execution':'time_indexed_quintic_servoj','head_policy':'center_before_arm_trajectory',
             'servo_target_hz':300,'hard_realtime_guaranteed':False,
             'trajectory_peak_deg_per_second':{'arm':22.5,'wave_yaw':45.},
@@ -166,8 +166,10 @@ class Pose:
         nominal=list(map(math.radians,NOMINAL_HOME))
         if max(abs(math.degrees(a-b)) for a,b in zip(target_home,nominal))>3:
             raise ValueError('当前home不符合本套TRON2动作基准；保持原home，不自动改写')
-        if max(abs(math.degrees(a-b)) for a,b in zip(current,target_home))>1:
-            raise ValueError('请先使用arm_control的reset回到自然垂下home，再执行预设动作')
+        prepare_home=max(abs(math.degrees(a-b)) for a,b in zip(current,target_home))>1
+        observed_start=list(current)
+        if prepare_home:
+            current=list(target_home)
         packet=skeleton_stream(self.reader.sample('joint_state'))
         head={j['idx']:j for j in packet['joints'] if j['idx']>=14}
         if set(head)!={14,15} or any(j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
@@ -215,16 +217,21 @@ class Pose:
         motion_scale=MOTION_SCALES[name]
         frames=blocks(current,waypoints,motion_scale)
         screening_frames=[]
+        if prepare_home:screening_frames.append({'joint':list(target_home)})
         for frame in frames:
             screening_frames.extend(frame['path'].screening_frames() if frame.get('kind')=='trajectory' else [frame])
-        screening=self.geometry.validate_path(current,screening_frames)
+        screening=self.geometry.validate_path(observed_start,screening_frames)
         # A known centered head stays untouched. Otherwise center it inside the
-        # same parent pose owner, before any arm/gripper command is possible.
+        # same parent pose owner, after any required original-home preparation.
         if any(abs(math.degrees(q))>1 for q in head_start):
             duration=max(2.,max(abs(math.degrees(q)) for q in head_start)/12.)
             frames.insert(0,{'kind':'head','label':'center_head','joint':list(current),
                 'head_joint':[0.,0.],'time':duration,'hold':0})
-        return {'frames':frames,'waypoints':waypoints,'start_head_q':head_start,'start_q':list(current),'preset':name,'side':side,'planned_deg_per_second':round(PLANNED_DEG_PER_SECOND*motion_scale,2),
+        if prepare_home:
+            frames.insert(0,{'kind':'home','label':'prepare_home','joint':list(target_home),
+                'time':home['duration_seconds'],'hold':0})
+        return {'frames':frames,'waypoints':waypoints,'start_head_q':head_start,'start_q':observed_start,'preset':name,'side':side,'planned_deg_per_second':round(PLANNED_DEG_PER_SECOND*motion_scale,2),
+            'home_preparation_required':prepare_home,'home_policy':'verify_then_reset_if_needed',
             'motion_scale':motion_scale,
             'wave_planned_deg_per_second':round(WAVE_DEG_PER_SECOND*motion_scale,2) if name=='wave' else None,
             'home_q':list(target_home),'pose_sha256':home['pose_sha256'],'motion_tool':'pose',
@@ -258,6 +265,7 @@ class Pose:
                 if not self.reader.connected or self.reader.ws is not ws or self.reader.serial!=serial:
                     raise MoveError('预设审核期间连接已改变；请重新发起请求',False)
             same_connection()
+            await self.motion.ensure_available()
             await self.guard()
             same_connection()
             if ticket!=self.generation:raise MoveError('预设审核已被停止请求取消',False)

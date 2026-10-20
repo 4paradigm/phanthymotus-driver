@@ -202,6 +202,11 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary['state'],'blocked_requires_operator_check')
             self.assertTrue(summary['motion_may_continue'])
             self.assertTrue(summary['trajectory_diagnostics'])
+            if kind=='tracking':
+                diag=summary['trajectory_diagnostics'][0]
+                self.assertEqual(diag['worst_tracking_joint_index'],7)
+                self.assertGreater(diag['max_tracking_error_deg'],8)
+                self.assertAlmostEqual(abs(diag['worst_tracking_actual_deg']-diag['worst_tracking_reference_deg']),diag['max_tracking_error_deg'])
 
     async def test_active_summary_never_borrows_previous_task_error(self):
         motion=self.adapter.motion
@@ -276,10 +281,11 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(MoveError):await self.reader.send_pose_servoj(q,token)
             with self.assertRaises(MoveError):await fixture.RobotReader.send_movej(self.reader,HOME,1)
 
-    async def test_real_websocket_head_first_servo_without_ack_and_parent_acp(self):
+    async def test_real_websocket_home_then_head_then_servo_without_ack_and_parent_acp(self):
         from device import Adapter
         from test_sensors import settings, info, joints
-        events=[];callbacks=[];feedback=list(HOME)+[.2,.3];stamp=1000;claw=0
+        events=[];callbacks=[];start=list(HOME);start[7]-=.03
+        feedback=start+[.2,.3];stamp=1000;claw=0
         async def robot(request):
             nonlocal feedback,stamp,claw
             ws=web.WebSocketResponse();await ws.prepare(request)
@@ -290,7 +296,11 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                     events.append('servo');feedback=list(body['data']['q'])
                     self.assertEqual(len(feedback),16);self.assertEqual(feedback[14:],[0,0])
                     continue  # Deliberately no positive response exists.
-                if title=='request_moveh':
+                if title=='request_movej':
+                    events.append('home');self.assertEqual(body['data']['joint'],HOME)
+                    self.assertEqual(body['data']['time'],8)
+                    feedback[:14]=body['data']['joint'];data={'result':'success'}
+                elif title=='request_moveh':
                     events.append('head');feedback[14:]=body['data']['joint'];data={'result':'success'}
                 elif title=='request_get_joint_state':
                     stamp+=1;data=joints(q=feedback,timestamp=stamp)
@@ -325,6 +335,8 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(.01)
                 adapter=Adapter(lambda *a:None,settings(home_file=str(self.file),enabled_cards=['pose']),reader,session)
                 plan=self.short_plan(head=True,grip=True);plan['start_head_q']=[.2,.3]
+                plan.update(start_q=start,home_preparation_required=True,home_policy='verify_then_reset_if_needed')
+                plan['frames'].insert(0,{'kind':'home','label':'prepare_home','joint':list(HOME),'time':8,'hold':0})
                 rpc=web.Application();rpc.router.add_post('/mcp',adapter.rpc)
                 rpc_runner=web.AppRunner(rpc,shutdown_timeout=.2);await rpc_runner.setup()
                 rpc_site=web.TCPSite(rpc_runner,'127.0.0.1',0);await rpc_site.start()
@@ -339,8 +351,9 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                         async with session.post(endpoint,json={'jsonrpc':'2.0','id':1,'method':'tools/call',
                             'params':{'name':'pose','arguments':{'pose':'wave'}}}) as response:
                             result=(await response.json())['result'];self.assertFalse(result['isError'],result)
-                        await asyncio.wait_for(asyncio.shield(adapter.motion.task),3)
-                    self.assertEqual(events[0],'head');self.assertGreater(events.count('servo'),15)
+                        await asyncio.wait_for(asyncio.shield(adapter.motion.task),12)
+                    self.assertEqual(events[:2],['home','head']);self.assertGreater(events.count('servo'),15)
+                    self.assertTrue(callbacks[0]['result']['preparation_home_verified'])
                     self.assertEqual(events.count('claw'),2)
                     self.assertEqual(len(callbacks),1);self.assertEqual(callbacks[0]['status'],'completed')
                     self.assertTrue(callbacks[0]['result']['head_center_verified'])

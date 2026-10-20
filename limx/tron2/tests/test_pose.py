@@ -39,6 +39,8 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
         self.reader.head_control_status=AsyncMock(return_value={'vr_head_follow':False})
         self.reader.send_movej=AsyncMock(side_effect=self.fake_send)
         self.waiter=patch.object(self.adapter.motion,'wait_for_arrival',new=self.fast_arrival);self.waiter.start();self.addCleanup(self.waiter.stop)
+        self.start_verifier=patch.object(self.adapter.motion,'verify_pose_start',new=AsyncMock())
+        self.start_verifier.start();self.addCleanup(self.start_verifier.stop)
         self.frames=[];self.arrivals=[];self.fail_at=None;self.block=None
         self.gripper_opening=0;self.gripper_stamp=1000;self.claw_writes=[]
         self.reader.read_gripper=AsyncMock(side_effect=self.fake_gripper_state)
@@ -366,7 +368,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
 
     def test_changed_home_or_start_or_head_is_rejected_without_rewriting(self):
         original=self.file.read_bytes()
-        for changes in ({'head':math.radians(70)},{'arm':.1},{'moving':1}):
+        for changes in ({'head':math.radians(70)},{'moving':1}):
             q=HOME+[changes.get('head',0),0]
             q[3]+=changes.get('arm',0)
             self.accept_feedback(q,dq=[changes.get('moving',0)]*16)
