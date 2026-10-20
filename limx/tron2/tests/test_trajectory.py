@@ -308,3 +308,29 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(task.done())
                 await asyncio.gather(task,return_exceptions=True)
         await runner.cleanup()
+
+    async def test_complete_readonly_checker_accepts_current_version_and_english_catalog(self):
+        import check
+        from device import VERSION
+        self.assertEqual(check.VERSION,VERSION)
+        self.adapter.registered_id='offline-registered'
+        self.reader.send_moveh=AsyncMock()
+        self.reader.send_pose_servoj=AsyncMock()
+        app=web.Application();app.router.add_get('/health',self.adapter.health)
+        app.router.add_post('/mcp',self.adapter.rpc)
+        runner=web.AppRunner(app,shutdown_timeout=.2);await runner.setup()
+        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        url='http://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])
+        async def feedback():
+            while True:
+                self.accept_feedback();await asyncio.sleep(.02)
+        pump=asyncio.create_task(feedback())
+        try:
+            with patch.object(check,'BASE',url):
+                await asyncio.wait_for(asyncio.to_thread(check.run_check,3,False),6)
+            self.reader.send_movej.assert_not_awaited();self.reader.send_moveh.assert_not_awaited()
+            self.reader.send_pose_servoj.assert_not_awaited();self.reader.send_gripper.assert_not_awaited()
+            self.assertIsNone(self.adapter.motion.active);self.assertIsNone(self.adapter.head.active)
+        finally:
+            pump.cancel();await asyncio.gather(pump,return_exceptions=True)
+            await runner.cleanup()

@@ -1,6 +1,6 @@
 # TRON2 pose presets
 
-0.9.0 exposes one `pose` field: `salute`, `wave`, `welcome`. Chinese preset values, reset, side, speed, action and custom joints are not public options. Use arm_control.reset for a separate return to the original natural-arms-down home.
+0.9.1 exposes one `pose` field: `salute`, `wave`, `welcome`. Chinese preset values, reset, side, speed, action and custom joints are not public options. Use arm_control.reset for a separate return to the original natural-arms-down home.
 
 | Preset | Arms | Absolute native joint targets and order |
 |---|---|---|
