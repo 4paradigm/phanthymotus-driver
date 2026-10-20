@@ -1,16 +1,18 @@
-# Q5 深蹲计数卡片
+# Q5 深蹲教练
 
-在固定机位、手动选择深蹲的场景下，连接画布：
+固定机位、单人、手动选择深蹲。画布接线：
 
 1. Q5 `camera_rgb`（`image/jpeg`）→ perception `pose`。
-2. `pose` 的 **完整骨架**输出 `.../poses/skeleton`（`sensor/pose2d`，通常为输出口 1）→ Q5 `squat_counter`；不要接缺少关节的精简 `/poses` 输出。
-3. `squat_counter` 输出口 0 `.../fitness/squat/events` → `decision_core`。输出口 1 `status` 与输出口 2 `debug` 只接 Dashboard，不送大模型。
-4. TTS 的 PCM 输出 → Q5 `speaker`。语音清零另接 Q5 `mic` → ASR 正常识别输出 → `decision_core`。
+2. `pose` 的**完整骨架**输出 `.../poses/skeleton`（`sensor/pose2d`，通常为输出口 1）→ Q5 `squat_counter`；精简 `/poses` 缺少所需关节。
+3. `squat_counter` 输出口 0 `.../fitness/squat/events` → `decision_core`。输出口 1 `status` 和输出口 2 `debug` 只接 Dashboard；同时把 `squat_counter` 工具绑定给 `decision_core`。
+4. Q5 `mic` → perception `asr` 的**正常识别输出** → `decision_core`；TTS 的 PCM 输出 → Q5 `speaker`，并绑定 TTS 工具。想直接说“我要开始深蹲了”“结束训练”，将 ASR `trigger_mode` 设为 `vad`；默认 `asr_kws` 要先说唤醒词。不要把 `/asr_background` 接作控制输入。
 
-Q5 主驱动使用 ROS Domain 211，`camera_rgb` 已由媒体桥送进 Agent Core 的 Domain 42。`pose` 与深蹲处理进程都运行在 Domain 42；`squat_counter` 的 MCP 操作通过 Q5 主驱动代理到该进程。若子进程启动失败，卡片的 `start`/`status` 返回错误，不会假装正在计数。
+Q5 主驱动使用 ROS Domain 211，`camera_rgb` 已由媒体桥送进 Agent Core 的 Domain 42。`pose` 与深蹲处理进程都运行在 Domain 42；`squat_counter` 的 MCP 操作由 Q5 主驱动代理。子进程启动失败时 `start`/`status` 返回错误。
 
-检测状态机和默认阈值位于 `common/squat_logic.py`，与 Bumi 共用：先站稳 2 秒建立基线，再检测下蹲、蹲底、起身和站稳。基线只在完整动作结束时小幅跟随新的站姿；可见状态下挪步或镜头位置变化使旧基线失效时，卡片会取消未完成动作，等待约 0.8 秒清晰、稳定的站姿并自动重建基线，保留已计次数。目标丢失后在远处重新出现或跟踪侧切换仍需重新完成约 2 秒站姿校准。换人会开启新会话；同一人短暂离开再回来会保留次数。阈值可通过 `config.yaml` 的 `plugins.squat_counter` 调整，务必结合 Q5 镜头实际画面校准。建议让被检测者全身入画，采用略偏侧面的固定视角。Q5 镜头若无法完整看到被检测者，应使用能接入 `pose` 的外部固定相机。
+`config.yaml` 中 Q5 的 `plugins.squat_counter.require_explicit_workout_start: true`：卡片随画布启动后保持 `waiting_start`，听到明确开始指令后由 `decision_core` 调用 `begin` 才计数。`begin` 幂等；`reset` 清零并重新开始一组；`finish` 冻结结果。用户结束、画面连续 6 秒无人且姿态流正常，或跟踪目标换人时，训练结束。自动结束发出 `workout_finished` 事件；姿态流断开或过期不会被当作人离开。`status.workout_state` 为 `waiting_start`、`active` 或 `finished`，`status.summary` 保存本组 `count_total`、`duration_s`、动作平均/最短/最长用时及 `end_reason`。结束后需再次说开始，不能靠重新入画自动计数。
 
-`status` 返回实时累计数、`input_stale`、接收/解析帧数；`debug` 返回中文角度、脚踝坐标、阈值判定、自动更新基线进度和未计数原因。初次排查先确认 `frames_received` 持续增长、`input_stale=false`，再看 `判定原因`。`reset` 只清零计数，不能修复中断的 pose 或 ASR 流。
+检测状态机和阈值在 `common/squat_logic.py`，与 Bumi 共用：先站稳约 2 秒建立基线，再确认下蹲、蹲底、起身和站稳。可见状态下站姿位置变化时会自动更新基线并保留次数。建议全身入画、镜头固定且略偏侧面；若 Q5 镜头看不完整人体，可使用接入 `pose` 的外部相机。阈值须结合真机画面校准。
 
-技能指令模板见 `fitness_squat_skill.md`。将其安装到 Resource Center，绑定 `squat_counter` 和 TTS 工具；修改本文件不会自动更新已安装的技能。使用 `pytest tests/test_bumi_squat_counter.py robotera/q5_bundle/test_q5_squat_counter.py -q` 做本地回归。真机视角、ROS 跨进程通信和语音延迟仍需在 Q5 上验证。
+`status` 可查实时累计数、`input_stale` 和接收/解析帧数；`debug` 给出中文角度、阈值判断及未计数原因。排查时先确认 `frames_received` 持续增长且 `input_stale=false`。`reset` 无法修复中断的 pose 或 ASR 流。
+
+技能指令模板见 `fitness_squat_skill.md`。**须将它安装到 Resource Center 并激活**；修改此文件不会自动更新已安装的技能。运行 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_bumi_squat_counter.py robotera/q5_bundle/test_q5_squat_counter.py -q` 做本地回归。真机视角、跨 ROS 域通信和语音延迟仍需在 Q5 上验证。

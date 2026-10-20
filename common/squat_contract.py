@@ -33,7 +33,8 @@ def tool_definition(namespace: str) -> dict:
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": [
-                    "start", "stop", "info", "status", "debug", "reset"]},
+                    "start", "stop", "info", "status", "debug", "reset",
+                    "begin", "finish"]},
                 "input_topic": {
                     "type": "string",
                     "description": "Full pose /poses/skeleton ROS topic from the canvas connection",
@@ -48,6 +49,10 @@ def tool_definition(namespace: str) -> dict:
                 "status": {"params": [], "description": "Read the authoritative current total"},
                 "debug": {"params": [], "description": "查看中文姿态测量与计数判定"},
                 "reset": {"params": [], "description": "Clear the count and start a new session"},
+                "begin": {"params": [], "description":
+                          "Begin a voice-controlled workout; repeated calls keep the current count"},
+                "finish": {"params": [], "description":
+                           "Freeze the workout and return its final summary"},
             },
         },
         "topic_in": [{

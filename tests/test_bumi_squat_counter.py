@@ -130,6 +130,23 @@ def test_a_full_down_and_up_counts_once_and_reports_absolute_total():
     assert sequence.reps()[1]["seq"] > sequence.reps()[0]["seq"]
 
 
+def test_rep_duration_starts_with_descent_and_excludes_standing_wait():
+    sequence = Sequence()
+    sequence.hold(0, 127)
+    descent_started_at = None
+    for depth in (0.15, 0.3, 0.5, 0.7, 0.9, 1, 1, 1, 1,
+                  0.8, 0.6, 0.4, 0.2, 0, 0, 0, 0, 0):
+        sequence.frame(person(depth=depth))
+        if descent_started_at is None and sequence.counter.snapshot()["state"] == "descent":
+            descent_started_at = round(sequence.time, 3)
+
+    assert descent_started_at is not None
+    (rep,) = sequence.reps()
+    assert rep["rep_duration_s"] == pytest.approx(
+        rep["event_time"] - descent_started_at)
+    assert 0.6 <= rep["rep_duration_s"] <= 1.8
+
+
 def test_standing_calibration_accepts_irregular_pose_intervals():
     sequence = Sequence()
     for _ in range(7):
@@ -859,3 +876,154 @@ def test_debug_reports_stale_camera_without_new_pose_frames(plugin_factory):
     assert latest["输入已过期"] == "是"
     assert latest["距上一帧（秒）"] >= 1.0
     assert latest["输入话题"] == "/camera/poses/skeleton"
+
+
+def test_explicit_workout_waits_for_voice_begin_and_begin_is_idempotent(plugin_factory):
+    card, clock, node = plugin_factory({"require_explicit_workout_start": True})
+    event_topic = card.get_tool()["topic_out"][0]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    waiting = card.dispatch("status", {})
+    assert waiting["workout_state"] == "waiting_start"
+    assert waiting["count_total"] == 0
+    assert _published_reps(node, event_topic) == []
+
+    started = card.dispatch("begin", {})
+    repeated = card.dispatch("begin", {})
+    assert started["workout_state"] == repeated["workout_state"] == "active"
+    assert started["session_id"] == repeated["session_id"]
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["count_total"] == 1
+
+
+def test_explicit_finish_freezes_count_and_summary_with_rep_timing(plugin_factory):
+    card, clock, node = plugin_factory({"require_explicit_workout_start": True})
+    event_topic = card.get_tool()["topic_out"][0]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    started = card.dispatch("begin", {})
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    (rep,) = _published_reps(node, event_topic)
+
+    finished = card.dispatch("finish", {})
+    summary = finished["summary"]
+    assert finished["workout_state"] == "finished"
+    assert summary["session_id"] == started["session_id"]
+    assert summary["count_total"] == finished["count_total"] == 1
+    assert summary["end_reason"] == "voice"
+    assert summary["duration_s"] == pytest.approx(clock.now - 100.0, abs=0.1)
+    assert summary["mean_rep_duration_s"] == pytest.approx(rep["rep_duration_s"], abs=0.01)
+    assert summary["fastest_rep_s"] == pytest.approx(rep["rep_duration_s"], abs=0.01)
+    assert summary["slowest_rep_s"] == pytest.approx(rep["rep_duration_s"], abs=0.01)
+
+    assert card.dispatch("finish", {})["summary"] == summary
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["summary"] == summary
+    assert len(_published_reps(node, event_topic)) == 1
+
+
+def test_explicit_workout_brief_loss_recovers_but_sustained_absence_finishes(plugin_factory):
+    card, clock, node = plugin_factory({
+        "require_explicit_workout_start": True,
+        "auto_finish_absence_s": 6.0,
+    })
+    event_topic = card.get_tool()["topic_out"][0]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    card.dispatch("begin", {})
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+
+    for _ in range(10):
+        _send_pose(subscription, clock)
+    assert card.dispatch("status", {})["workout_state"] == "active"
+    _plugin_standing(subscription, clock)
+    assert card.dispatch("status", {})["workout_state"] == "active"
+
+    for _ in range(64):
+        _send_pose(subscription, clock)
+    finished = card.dispatch("status", {})
+    assert finished["workout_state"] == "finished"
+    assert finished["summary"]["count_total"] == 1
+    assert finished["summary"]["end_reason"] == "left_frame"
+    events = [e for e in node.publishers[event_topic].payloads
+              if e["type"] == "workout_finished"]
+    assert len(events) == 1
+    assert events[0]["summary"] == finished["summary"]
+
+
+def test_explicit_workout_camera_stale_is_not_absence(plugin_factory):
+    card, clock, node = plugin_factory({
+        "require_explicit_workout_start": True,
+        "auto_finish_absence_s": 6.0,
+        "input_stale_after_s": 1.0,
+    })
+    event_topic = card.get_tool()["topic_out"][0]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    card.dispatch("begin", {})
+    _plugin_standing(subscription, clock)
+    for _ in range(8):
+        _send_pose(subscription, clock)
+
+    clock.advance(8.0)
+    node.timers[0]()
+    status = card.dispatch("status", {})
+    assert status["input_stale"] is True
+    assert status["workout_state"] == "active"
+    assert status["summary"] is None
+
+
+def test_explicit_workout_visible_but_unreadable_person_is_not_departure(plugin_factory):
+    card, clock, node = plugin_factory({
+        "require_explicit_workout_start": True,
+        "auto_finish_absence_s": 6.0,
+    })
+    event_topic = card.get_tool()["topic_out"][0]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    card.dispatch("begin", {})
+    _plugin_standing(subscription, clock)
+
+    for _ in range(70):
+        _send_pose(subscription, clock, person(missing_legs=True))
+
+    status = card.dispatch("status", {})
+    assert status["target_state"] == "missing"
+    assert status["candidate_count"] == 1
+    assert status["workout_state"] == "active"
+    assert status["summary"] is None
+    assert not [e for e in node.publishers[event_topic].payloads
+                if e["type"] == "workout_finished"]
+
+
+def test_explicit_workout_target_switch_finishes_original_subject(plugin_factory):
+    card, clock, node = plugin_factory({"require_explicit_workout_start": True})
+    event_topic = card.get_tool()["topic_out"][0]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    started = card.dispatch("begin", {})
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+
+    for _ in range(12):
+        _send_pose(subscription, clock)
+    _send_pose(subscription, clock, person(track_id=2, anchor_x=730))
+    finished = card.dispatch("status", {})
+    assert finished["workout_state"] == "finished"
+    assert finished["summary"]["session_id"] == started["session_id"]
+    assert finished["summary"]["target_id"] == 1
+    assert finished["summary"]["count_total"] == 1
+    assert finished["summary"]["end_reason"] == "target_changed"
+    assert [e["summary"]["session_id"] for e in node.publishers[event_topic].payloads
+            if e["type"] == "workout_finished"] == [started["session_id"]]
+
+    _plugin_standing(subscription, clock)
+    _plugin_rep(subscription, clock)
+    assert card.dispatch("status", {})["summary"] == finished["summary"]

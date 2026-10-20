@@ -192,6 +192,7 @@ class SquatCounter:
             "count_total": self.count_total,
             "target_id": self.target_id,
             "target_state": self._target_state,
+            "candidate_count": len(self._debug_candidates),
             "state": self._state,
             "side": self._side,
             "calibrated": self._baseline is not None,
@@ -839,6 +840,7 @@ class SquatCounter:
             if (timestamp - self._top_since >= self.config["top_dwell_s"]
                     and self._motion_started is not None
                     and timestamp - self._motion_started >= self.config["min_rep_s"]):
+                rep_duration_s = timestamp - self._motion_started
                 self.count_total += 1
                 self._state = "top"
                 self._cancel_partial()
@@ -852,7 +854,8 @@ class SquatCounter:
                         for field in _Sample.__dataclass_fields__))
                 self._debug_reason = "rep_completed"
                 if events is not None:
-                    events.append(self._emit("rep_completed", timestamp))
+                    events.append(self._emit("rep_completed", timestamp,
+                                             rep_duration_s=rep_duration_s))
             elif timestamp - self._top_since < self.config["top_dwell_s"]:
                 self._debug_reason = "waiting_for_top_dwell"
             else:

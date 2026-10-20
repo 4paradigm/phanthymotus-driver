@@ -20,6 +20,7 @@ def test_q5_bundle_registers_squat_processor():
     config = yaml.safe_load((bundle / "config.yaml").read_text())
     catalog = yaml.safe_load((bundle / "driver.yaml").read_text())
     assert config["plugins"]["squat_counter"]["enabled"] is True
+    assert config["plugins"]["squat_counter"]["require_explicit_workout_start"] is True
     assert {"name": "squat_counter", "type": "processor"} in catalog["cards"]
     assert "COPY squat_counter.py /work/squat_counter.py" in (bundle / "Dockerfile").read_text()
 
@@ -28,6 +29,7 @@ def test_proxy_contract_and_action_forwarding():
     card = squat_counter.Plugin({}, "q5_test", None, None)
     tool = card.get_tool()
     assert tool["type"] == "processor"
+    assert {"begin", "finish"} <= set(tool["inputSchema"]["properties"]["action"]["enum"])
     assert tool["topic_in"][0]["format"] == "sensor/pose2d"
     assert [port["topic"] for port in tool["topic_out"]] == [
         "/q5_test/fitness/squat/events",
@@ -42,7 +44,9 @@ def test_proxy_contract_and_action_forwarding():
         recv=lambda: {"count_total": 2, "session_id": "active"},
     )
     assert card.dispatch("reset", {})["count_total"] == 2
-    assert requests == [("reset", {})]
+    assert card.dispatch("begin", {})["count_total"] == 2
+    assert card.dispatch("finish", {})["count_total"] == 2
+    assert requests == [("reset", {}), ("begin", {}), ("finish", {})]
 
 
 def test_dead_processor_is_reported_instead_of_returning_stale_count():

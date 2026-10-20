@@ -101,6 +101,10 @@ plugins:
     enabled: true
     # Domain 42 pose skeleton; measurements and event logic are shared with Bumi.
     debug_interval_s: 0.5
+    # Only an explicit begin/reset action starts counting, independent of canvas start.
+    require_explicit_workout_start: true
+    # A short occlusion is not departure; require fresh pose frames and no people.
+    auto_finish_absence_s: 6.0
   arm_control:
     enabled: true
     hardware_enable: true
