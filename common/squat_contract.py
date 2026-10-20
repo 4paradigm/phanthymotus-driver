@@ -18,7 +18,15 @@ def topic_out(namespace: str) -> list[dict]:
     ]
 
 
-def tool_definition(namespace: str) -> dict:
+def tool_definition(namespace: str, *, coach_mode: bool = False) -> dict:
+    begin_description = (
+        "When the user asks to start squat training, choose a plan and call "
+        "this action before counting. Use 2 sets of 8 reps with 90 seconds "
+        "of rest unless the user specifies another valid plan. A repeated "
+        "call keeps the active session and count. Read the returned plan "
+        "before announcing it with TTS"
+        if coach_mode else "Start a squat workout; repeated calls keep the active session"
+    )
     return {
         "name": "squat_counter",
         "type": "processor",
@@ -36,11 +44,11 @@ def tool_definition(namespace: str) -> dict:
                     "start", "stop", "info", "status", "debug", "reset",
                     "begin", "next_set", "finish"]},
                 "sets": {"type": "integer", "minimum": 1, "maximum": 5,
-                         "description": "Number of planned squat sets (default: 2)"},
+                         "description": "Number of planned squat sets in coach mode (default: 2)"},
                 "reps_per_set": {"type": "integer", "minimum": 1, "maximum": 20,
-                                 "description": "Full squats required per set (default: 8)"},
+                                 "description": "Full squats required per set in coach mode (default: 8)"},
                 "rest_s": {"type": "integer", "minimum": 15, "maximum": 180,
-                           "description": "Rest seconds between sets (default: 90)"},
+                           "description": "Rest seconds between sets in coach mode (default: 90)"},
                 "input_topic": {
                     "type": "string",
                     "description": "Full pose /poses/skeleton ROS topic from the canvas connection",
@@ -56,7 +64,7 @@ def tool_definition(namespace: str) -> dict:
                 "debug": {"params": [], "description": "查看中文姿态测量与计数判定"},
                 "reset": {"params": [], "description": "Clear the count and start a new session"},
                 "begin": {"params": ["sets", "reps_per_set", "rest_s"],
-                          "description": "Start a squat workout plan; repeated calls keep the current set"},
+                          "description": begin_description},
                 "next_set": {"params": [], "description":
                              "Start the next set after the rest timer has finished"},
                 "finish": {"params": [], "description":

@@ -71,7 +71,8 @@ class Plugin:
         self._error = "Q5 squat processor has not started"
 
     def get_tool(self) -> dict:
-        return tool_definition(self._namespace)
+        return tool_definition(self._namespace,
+                               coach_mode=self._config.get("coach_mode", False))
 
     def start(self) -> None:
         with self._lock:

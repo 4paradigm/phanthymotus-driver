@@ -53,6 +53,13 @@ def test_proxy_contract_and_action_forwarding():
     assert requests == [("reset", {}), ("begin", {}), ("next_set", {}), ("finish", {})]
 
 
+def test_coach_tool_exposes_default_plan_to_decision_core():
+    card = squat_counter.Plugin({"coach_mode": True}, "q5_test", None, None)
+    begin = card.get_tool()["inputSchema"]["x-action-params"]["begin"]
+    assert "2 sets of 8 reps" in begin["description"]
+    assert "90 seconds" in begin["description"]
+
+
 def test_dead_processor_is_reported_instead_of_returning_stale_count():
     card = squat_counter.Plugin({}, "q5_test", None, None)
     card._proc = types.SimpleNamespace(is_alive=lambda: False)

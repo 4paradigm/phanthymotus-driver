@@ -1072,6 +1072,23 @@ def test_coach_begin_records_plan_and_repeated_begin_keeps_progress(plugin_facto
     assert repeated["set_count"] == repeated["count_total"] == 1
 
 
+def test_coach_target_lost_event_identifies_pose_pause_not_card_pause(plugin_factory):
+    card, clock, node, subscription, topic, started = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=8, rest_s=90)
+    assert started["state"] == "running"
+    assert started["coach_mode"] is True
+    _plugin_standing(subscription, clock)
+
+    for _ in range(10):
+        _send_pose(subscription, clock)
+
+    lost = _events(node, topic, "target_lost")[-1]
+    assert lost["state"] == "paused"
+    assert lost["card_state"] == "running"
+    assert lost["workout_state"] == "active"
+    assert lost["set_state"] == "in_set"
+
+
 def test_coach_set_goal_is_immediate_despite_rep_throttle_and_rest_ignores_reps(
         plugin_factory):
     card, clock, node, subscription, topic, _ = _start_coach_workout(

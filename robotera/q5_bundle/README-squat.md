@@ -19,8 +19,12 @@ Q5 主驱动在 ROS Domain 211；媒体桥把 `camera_rgb` 送到 Agent Core 的
 
 动作判定在 `common/squat_logic.py`：Q5 先站稳约 1.2 秒建立基线，再保持站姿约 0.4 秒进入本组计数，随后识别下蹲、蹲底、起身和站稳。站姿位置变化时可自动更新基线并保留次数。建议镜头固定、全身入画且略偏侧面；Q5 镜头无法拍全身时，可把外部相机接入 `pose`。阈值须结合真机画面校准。
 
-`status` 可查看训练阶段、计划、当前组次数、累计次数、`input_stale` 和帧数；`debug` 给出中文角度、阈值判断及未计数原因。排查时先确认 `frames_received` 持续增长且 `input_stale=false`。`reset` 不能修复中断的 pose 或 ASR 流。
+`status` 可查看训练阶段、计划、当前组次数、累计次数、`input_stale` 和帧数；`debug` 给出中文角度、阈值判断及未计数原因。排查时先确认 `frames_received` 持续增长且 `input_stale=false`。`reset` 不能修复中断的 pose 或 ASR 流。`status.phase=paused` 或 `target_lost` 事件里的 `state=paused` 表示已锁定的人体暂时丢失或关节不可读，**不代表卡片没有启动**；新版事件另有 `card_state` 和 `workout_state`。结合工具 `status` 的 `state`、`coach_mode`、`workout_state`、`target_state` 和 `debug` 的“判定原因”查看原因。
 
 ## 技能和验证
 
-技能指令模板在 `fitness_squat_skill.md`。**须在 Resource Center 安装并激活更新后的模板**；修改仓库文件不会自动更新已安装的技能。运行 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_bumi_squat_counter.py robotera/q5_bundle/test_q5_squat_counter.py -q` 做本地回归。真机语音、相机视角和播报延迟仍需在 Q5 上验证。
+技能指令模板在 `fitness_squat_skill.md`。在 Resource Center → My Skills 创建技能，建议 slug 为 `q5-squat-coach`、分类 `utility`、所需工具为 `squat_counter, tts`；简介写明“用户说开始深蹲训练时，制定组数、次数和休息时间并调用计数卡片带练”。将模板正文粘贴为 instruction，安装到运行中的 Agent Core 并在技能界面启用。**仅启用还不够**：模型须调用 `activate_skill("q5-squat-coach")` 才能读到完整指令；Agent Core 重启后需要重新激活。已安装的同名技能不会随仓库或 Resource Center 更新，检查 `/api/skills/q5-squat-coach` 的 `instruction` 是否包含“2 组、每组 8 次、组间休息 90 秒”，旧版本用技能界面或 `/api/skills/update` 更新。
+
+若 ASR 已输出而训练未开始，先调用计数卡片 `status`：`state=idle` 表示画布未把骨架输入启动到卡片，核对 `pose` 的完整骨架输出口和项目启动报错；`state=running, workout_state=waiting_start` 表示等待 `begin`，核对 Decision Core 的执行器连接、技能运行时激活状态（`/api/skills/active`）和工具调用记录；`state=running, workout_state=active, phase=paused` 表示训练已启动但目标不可读，查看 `frames_received`、`candidate_count`、`target_state` 和中文 `判定原因`。新版教练模式的 `status.coach_mode` 应为 `true`，`target_lost` 事件也应带 `set_index`、`set_state`；若缺失，检查 Q5 驱动镜像是否包含训练组数版本、运行中的配置是否开启 `coach_mode`。训练计划应在成功调用 `begin` 且返回 `plan` 后通过 TTS 播报。
+
+运行 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_bumi_squat_counter.py robotera/q5_bundle/test_q5_squat_counter.py -q` 做本地回归。真机语音、相机视角和播报延迟仍需在 Q5 上验证。

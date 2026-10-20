@@ -41,7 +41,7 @@ _DEBUG_QOS = QoSProfile(
 _PHASE_ZH = {
     "waiting_target": "等待识别人体", "calibrating": "校准站姿",
     "top": "站立", "descent": "下蹲中", "bottom": "蹲底",
-    "ascent": "起身中", "paused": "暂停", "rearming": "等待重新站稳",
+    "ascent": "起身中", "paused": "目标暂不可读，等待重新识别", "rearming": "等待重新站稳",
     "finished": "本组已结束",
 }
 _WORKOUT_STATE_ZH = {
@@ -203,6 +203,7 @@ def _debug_zh(raw: dict) -> dict:
         "离画面已持续（秒）": raw["absence_elapsed_s"],
         "训练总结": raw["summary"],
         "训练计划": raw["plan"],
+        "教练模式已启用": _yes_no(raw["coach_mode"]),
         "组间阶段": _SET_STATE_ZH.get(raw["set_state"], "未设置"),
         "当前组": raw["set_index"],
         "当前组已完成": raw["set_count"],
@@ -335,7 +336,7 @@ class SquatCounterPlugin:
         self._node.create_timer(0.2, self._tick)
 
     def get_tool(self) -> dict:
-        return tool_definition(self._namespace)
+        return tool_definition(self._namespace, coach_mode=self._coach_mode)
 
     def _topic_out(self) -> list[dict]:
         return topic_out(self._namespace)
@@ -789,7 +790,12 @@ class SquatCounterPlugin:
 
     def _publish_event_locked(self, event: dict) -> None:
         payload = {"source": "squat_counter", "exercise": "squat",
-                   "priority": 1, **event}
+                   "priority": 1, **event,
+                   # A pose event's legacy `state` is the motion phase. Make
+                   # the card and workout states explicit so `state=paused`
+                   # on target_lost is not mistaken for a stopped processor.
+                   "card_state": "running" if self._subscription is not None else "idle",
+                   "workout_state": self._workout_state}
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         self._event_pub.publish(message)
@@ -815,6 +821,7 @@ class SquatCounterPlugin:
             "state": "running" if self._subscription is not None else "idle",
             "phase": counter.pop("state"),
             **counter,
+            "coach_mode": self._coach_mode,
             "workout_state": self._workout_state,
             "workout_elapsed_s": (
                 round(max(0.0, now - self._workout_started_at), 1)
