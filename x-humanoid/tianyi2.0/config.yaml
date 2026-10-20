@@ -65,7 +65,12 @@ plugins:
     max_wz: 0.6
     linear_acceleration: 0.3  # m/s^2; explicit zero stops immediately.
     angular_acceleration: 0.6  # rad/s^2
-    dry_run: false
+    dry_run: true  # First deployment must inspect commands before enabling real motion.
+    # Official Slamware SDK TCP endpoint, distinct from HTTP :1448.
+    sdk_host: "192.168.11.1"
+    sdk_port: 1445
+    sdk_connect_timeout_ms: 1500
+    sdk_reply_timeout: 0.25
     rotate_only: false
     # No verified native standing FSM is available for this wheeled platform.
     # To require standing, configure a trusted domain-0 std_msgs/Bool source.

@@ -34,16 +34,36 @@ class Twist:
         self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
 
 
-class Publisher:
-    def __init__(self):
+class FakeBackend:
+    def __init__(self, config=None):
         self.messages = []
         self.fail = False
+        self.connect_fail = False
+        self.connected = False
+        self.deadlines = []
 
-    def publish(self, msg):
+    def connect(self):
+        if self.connect_fail:
+            raise RuntimeError("connection failed")
+        self.connected = True
+
+    def write(self, values, deadline):
         if self.fail:
             raise RuntimeError("transport failed")
-        self.messages.append([msg.linear.x, msg.linear.y, msg.linear.z,
-                              msg.angular.x, msg.angular.y, msg.angular.z])
+        self.deadlines.append(deadline)
+        self.messages.append(list(values))
+
+    def stop(self):
+        if self.fail:
+            raise RuntimeError("stop failed")
+        if self.connected:
+            self.messages.append([0] * 6)
+
+    def close(self):
+        self.connected = False
+
+    def info(self):
+        return {"type": "slamware_sdk", "connected": self.connected}
 
 
 class Node:
@@ -57,9 +77,7 @@ class Node:
         return object()
 
     def create_publisher(self, kind, topic, qos):
-        pub = Publisher()
-        self.publishers.append((kind, topic, pub, qos))
-        return pub
+        raise AssertionError("loco_servo must not publish to /cmd_vel")
 
     def create_timer(self, period, callback):
         self.timers.append((period, callback))
@@ -96,6 +114,9 @@ def setup(monkeypatch):
     modules["geometry_msgs.msg"].Twist = Twist
     for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)
+    backend_mod = types.ModuleType("slamtec_velocity")
+    backend_mod.SlamtecVelocityBackend = FakeBackend
+    monkeypatch.setitem(sys.modules, "slamtec_velocity", backend_mod)
     spec = importlib.util.spec_from_file_location("tianyi_loco_servo_test", DRIVER / "loco_servo.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -110,6 +131,7 @@ def setup(monkeypatch):
     plugins = []
 
     def create(**config):
+        config.setdefault("dry_run", False)
         plugin = module.LocoServoPlugin(config, "ubuntu", ros)
         plugins.append(plugin)
         return plugin
@@ -145,30 +167,31 @@ def test_startup_is_inert_and_domain_routing_is_correct(setup):
     assert not setup.ros.executor_tianyi.nodes
     assert plugin.dispatch("info", {})["state"] == "idle"
     assert plugin.dispatch("start", {})["state"] == "running"
-    core, body = setup.ros.executor_core.nodes[0], setup.ros.executor_tianyi.nodes[0]
+    core = setup.ros.executor_core.nodes[0]
     assert core.context is setup.ros.ctx_core
     assert core.subscriptions[0][1] == "/actucore/navi/cmd"
     assert core.subscriptions[0][3].depth == 1
-    assert body.context is setup.ros.ctx_tianyi
-    assert body.publishers[0][1] == "/cmd_vel"
-    assert not plugin._pub.messages
+    assert not setup.ros.executor_tianyi.nodes
+    assert plugin._backend.connected
+    assert plugin._info()["output_topic"] is None
+    assert not plugin._backend.messages
     assert "LocoServoPlugin" not in (DRIVER / "main.py").read_text().split("_ALWAYS_START =", 1)[1].split("}", 1)[0]
 
 
 def test_command_maps_body_axes_and_ramps_from_zero(setup):
     plugin = start(setup)
     send(plugin, command(setup))
-    output = plugin._pub.messages[-1]
+    output = plugin._backend.messages[-1]
     assert output == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
     setup.clock.advance()
     send(plugin, command(setup, seq=2))
-    assert plugin._pub.messages[-1] == pytest.approx([0.06, 0, 0, 0, 0, 0.12])
+    assert plugin._backend.messages[-1] == pytest.approx([0.06, 0, 0, 0, 0, 0.12])
     # A burst cannot accelerate faster just because callbacks run faster.
     send(plugin, command(setup, seq=3))
-    assert plugin._pub.messages[-1] == pytest.approx([0.06, 0, 0, 0, 0, 0.12])
+    assert plugin._backend.messages[-1] == pytest.approx([0.06, 0, 0, 0, 0, 0.12])
     setup.clock.advance()
     send(plugin, command(setup, [0] * 6, seq=4))
-    assert plugin._pub.messages[-1] == [0] * 6
+    assert plugin._backend.messages[-1] == [0] * 6
 
 
 @pytest.mark.parametrize("extra", [
@@ -188,7 +211,7 @@ def test_command_maps_body_axes_and_ramps_from_zero(setup):
 def test_invalid_commands_never_reach_body(setup, extra):
     plugin = start(setup)
     send(plugin, command(setup, **extra))
-    assert not plugin._pub.messages
+    assert not plugin._backend.messages
     assert plugin._counts["accepted"] == 0
 
 
@@ -196,23 +219,23 @@ def test_replayed_stale_and_invalid_frames_do_not_feed_watchdog(setup):
     plugin = start(setup)
     original = command(setup)
     send(plugin, original)
-    count = len(plugin._pub.messages)
+    count = len(plugin._backend.messages)
     send(plugin, original)
-    assert len(plugin._pub.messages) == count
+    assert len(plugin._backend.messages) == count
     setup.clock.advance(0.31)
     send(plugin, command(setup, seq=2, stamp_ms=int(setup.clock.time() * 1000) - 250))
     plugin._on_message(types.SimpleNamespace(data="bad json"))
     plugin._tick()
-    assert plugin._pub.messages[-1] == [0] * 6
+    assert plugin._backend.messages[-1] == [0] * 6
     assert plugin._counts["accepted"] == 1
     setup.clock.advance()
     send(plugin, command(setup, seq=3))
-    assert plugin._pub.messages[-1] == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
+    assert plugin._backend.messages[-1] == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
 
 
 def test_dry_run_never_publishes_but_checks_and_counts(setup):
     plugin = start(setup, dry_run=True)
-    pub = plugin._pub
+    pub = plugin._backend
     send(plugin, command(setup))
     assert plugin._counts["accepted"] == 1
     assert plugin._counts["dry_run_commands"] == 1
@@ -231,15 +254,15 @@ def test_runtime_toggles_stop_old_motion_then_apply_to_fresh_commands(setup):
     send(plugin, command(setup))
     result = plugin.dispatch("config", {"dry_run": True})
     assert result["dry_run"] is True
-    assert plugin._pub.messages[-1] == [0] * 6
-    count = len(plugin._pub.messages)
+    assert plugin._backend.messages[-1] == [0] * 6
+    count = len(plugin._backend.messages)
     setup.clock.advance()
     send(plugin, command(setup, seq=2))
-    assert len(plugin._pub.messages) == count
+    assert len(plugin._backend.messages) == count
     plugin.dispatch("config", {"dry_run": False, "rotate_only": True})
     setup.clock.advance()
     send(plugin, command(setup, seq=3))
-    assert plugin._pub.messages[-1] == pytest.approx([0, 0, 0, 0, 0, 0.06])
+    assert plugin._backend.messages[-1] == pytest.approx([0, 0, 0, 0, 0, 0.06])
     result = plugin.dispatch("config", {"rotate_only": "false", "dry_run": True})
     assert result["state"] == "error"
     assert plugin._settings == {"dry_run": False, "rotate_only": True, "require_standing": False}
@@ -250,16 +273,16 @@ def test_pause_resume_and_restart_drop_queued_callbacks_and_preserve_replay_prot
     send(plugin, command(setup))
     queued = command(setup, seq=2)
     plugin.dispatch("pause", {})
-    count = len(plugin._pub.messages)
+    count = len(plugin._backend.messages)
     setup.clock.advance()
     send(plugin, command(setup, seq=3))
-    assert len(plugin._pub.messages) == count
+    assert len(plugin._backend.messages) == count
     plugin.dispatch("resume", {})
     send(plugin, queued)
-    assert plugin._pub.messages[-1] == [0] * 6
+    assert plugin._backend.messages[-1] == [0] * 6
     setup.clock.advance()
     send(plugin, command(setup, seq=4))
-    assert plugin._pub.messages[-1][0] > 0
+    assert plugin._backend.messages[-1][0] > 0
     old_node = setup.ros.executor_core.nodes[0]
     old_callback = old_node.subscriptions[0][2]
     plugin.dispatch("stop", {})
@@ -269,16 +292,16 @@ def test_pause_resume_and_restart_drop_queued_callbacks_and_preserve_replay_prot
     plugin.dispatch("start", {})
     setup.clock.advance()
     old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=5))))
-    assert not plugin._pub.messages
+    assert not plugin._backend.messages
     send(plugin, command(setup, seq=1))
-    assert plugin._pub.messages[-1][0] > 0
+    assert plugin._backend.messages[-1][0] > 0
     assert plugin.dispatch("unsupported", {}) is None
 
 
 def test_standing_gate_needs_fresh_true_feedback_and_stops_on_loss(setup):
     plugin = start(setup, require_standing=True, standing_topic="/verified/standing")
     send(plugin, command(setup))
-    assert plugin._pub.messages[-1] == [0] * 6
+    assert plugin._backend.messages[-1] == [0] * 6
     assert plugin._counts["accepted"] == 0
     plugin._on_standing(types.SimpleNamespace(data=False), plugin._generation)
     send(plugin, command(setup, seq=2))
@@ -288,7 +311,7 @@ def test_standing_gate_needs_fresh_true_feedback_and_stops_on_loss(setup):
     assert plugin._counts["accepted"] == 1
     setup.clock.advance(1.1)
     plugin._tick()
-    assert plugin._pub.messages[-1] == [0] * 6
+    assert plugin._backend.messages[-1] == [0] * 6
     assert "stale" in plugin._info()["posture_problem"]
     plugin._on_standing(types.SimpleNamespace(data=True), plugin._generation)
     setup.clock.advance()
@@ -305,22 +328,22 @@ def test_standing_option_without_source_reports_reason_not_a_fake_r1_fsm(setup):
 
 def test_publish_error_is_visible_and_pauses_instead_of_counting_success(setup):
     plugin = start(setup)
-    plugin._pub.fail = True
+    plugin._backend.fail = True
     send(plugin, command(setup))
     info = plugin._info()
     assert info["state"] == "paused"
     assert info["counts"]["accepted"] == 0
     assert info["counts"]["publish_errors"] > 0
-    plugin._pub.fail = False
+    plugin._backend.fail = False
     plugin._tick()
-    assert plugin._pub.messages[-1] == [0] * 6
+    assert plugin._backend.messages[-1] == [0] * 6
 
 
 def test_partial_open_failure_cleans_nodes(setup, monkeypatch):
     plugin = setup.create()
     def fail(*args):
         raise RuntimeError("publisher unavailable")
-    monkeypatch.setattr(Node, "create_publisher", fail)
+    monkeypatch.setattr(FakeBackend, "connect", fail)
     assert plugin.dispatch("start", {})["state"] == "error"
     assert not plugin._nodes
     assert not setup.ros.executor_core.nodes
@@ -332,7 +355,7 @@ def test_input_subscription_really_passes_through_bridge_patch(setup, monkeypatc
     transport = types.ModuleType("bridged_publisher")
     transport.should_bridge_subscription = lambda topic: True
     transport.should_use_bridge = lambda topic: "/state/" in topic
-    transport.create_bridged_publisher = lambda *a: pytest.fail("/cmd_vel must stay on domain 0")
+    transport.create_bridged_publisher = lambda *a: pytest.fail("SDK backend must not create a ROS publisher")
     transport.create_bridged_subscription = lambda *a: bridged.append(a)
     monkeypatch.setitem(sys.modules, "bridged_publisher", transport)
     spec = importlib.util.spec_from_file_location("tianyi_loco_bridge_test", DRIVER / "bridge_integration.py")
@@ -345,7 +368,7 @@ def test_input_subscription_really_passes_through_bridge_patch(setup, monkeypatc
         assert bridged[0][0].context is setup.ros.ctx_core
         assert bridged[0][2] == "/actucore/navi/cmd"
         bridged[0][3](types.SimpleNamespace(data=json.dumps(command(setup))))
-        assert plugin._pub.messages[-1][0] > 0
+        assert plugin._backend.messages[-1][0] > 0
         plugin.stop()
     finally:
         bridge.disable()
@@ -362,7 +385,7 @@ def load_bundle():
 
 def test_bundle_hands_control_to_explicit_card_and_requires_cancel_before_resume(setup, monkeypatch):
     monkeypatch.setitem(sys.modules, "loco_servo", setup.module)
-    bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True}}}, "ubuntu", setup.ros, None)
+    bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     class Nav:
         def start(self):
             pass
@@ -371,7 +394,7 @@ def test_bundle_hands_control_to_explicit_card_and_requires_cancel_before_resume
         def dispatch(self, action, args):
             if action == "move_to":
                 assert bundle._loco_servo._paused
-                assert bundle._loco_servo._pub.messages[-1] == [0] * 6
+                assert bundle._loco_servo._backend.messages[-1] == [0] * 6
                 return {"state": "navigating"}
             return {"state": "stopped", "api_result": {}}
     bundle._plugins.append(Nav())
@@ -393,7 +416,7 @@ def test_bundle_hands_control_to_explicit_card_and_requires_cancel_before_resume
 def test_yielded_stream_writes_nothing_including_zeros_during_other_motion(setup):
     plugin = start(setup)
     send(plugin, command(setup))
-    pub = plugin._pub
+    pub = plugin._backend
     plugin.pause_for_explicit_command("nav.move_to")
     assert pub.messages[-1] == [0] * 6
     count = len(pub.messages)
@@ -420,7 +443,7 @@ def test_zero_bypasses_rate_limit_and_rate_drops_do_not_extend_watchdog(setup):
     assert plugin._last["reason"] == "command rate exceeds 20 Hz"
     assert plugin._counts["accepted"] == 1
     send(plugin, command(setup, [0] * 6, seq=3))
-    assert plugin._pub.messages[-1] == [0] * 6
+    assert plugin._backend.messages[-1] == [0] * 6
 
 
 def test_custom_input_and_idempotent_start_keep_one_subscription(setup):
@@ -433,7 +456,7 @@ def test_custom_input_and_idempotent_start_keep_one_subscription(setup):
 
 def test_unknown_tool_cannot_steal_base_ownership(setup, monkeypatch):
     monkeypatch.setitem(sys.modules, "loco_servo", setup.module)
-    bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True}}}, "ubuntu", setup.ros, None)
+    bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     bundle.start_all()
     try:
         assert bundle.dispatch("nav", {"action": "move_to"}) is None
@@ -448,3 +471,76 @@ def test_unknown_tool_cannot_steal_base_ownership(setup, monkeypatch):
 def test_invalid_config_is_rejected(setup, config):
     with pytest.raises(ValueError):
         setup.create(**config)
+
+
+def test_new_card_defaults_to_dry_run_without_connecting_to_sdk(setup):
+    plugin = setup.module.LocoServoPlugin({}, "ubuntu", setup.ros)
+    try:
+        assert plugin.dispatch("start", {})["dry_run"] is True
+        assert not plugin._backend.connected
+        setup.clock.advance()
+        send(plugin, command(setup))
+        assert plugin._info()["counts"]["dry_run_commands"] == 1
+        assert plugin._backend.messages == []
+    finally:
+        plugin.stop()
+
+
+def test_disabling_dry_run_requires_successful_readonly_sdk_connect(setup):
+    plugin = start(setup, dry_run=True)
+    plugin._backend.connect_fail = True
+    result = plugin.dispatch("config", {"dry_run": False})
+    assert result["state"] == "error"
+    assert plugin._info()["dry_run"] is True
+    assert not plugin._backend.messages
+
+
+def test_sdk_lease_preserves_input_ttl_and_observation_deadline(setup):
+    plugin = start(setup)
+    cmd = command(setup, ttl_ms=150)
+    send(plugin, cmd)
+    assert plugin._backend.deadlines[-1] == cmd["stamp_ms"] + 150
+    setup.clock.advance()
+    cmd = command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 450)
+    send(plugin, cmd)
+    assert plugin._backend.deadlines[-1] == cmd["obs_stamp_ms"] + 500
+
+
+def test_unconfirmed_stop_refuses_stop_resume_config_and_handover(setup):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    plugin._backend.fail = True
+    assert plugin.pause_for_explicit_command("home.go_home") is False
+    assert not plugin._yielded
+    assert plugin.dispatch("stop", {})["state"] == "error"
+    assert plugin.dispatch("resume", {})["state"] == "error"
+    assert plugin.dispatch("config", {"dry_run": True})["state"] == "error"
+    assert not plugin._settings["dry_run"]
+    plugin._backend.fail = False
+    assert plugin.dispatch("stop", {})["state"] == "idle"
+
+
+def test_bundle_does_not_start_other_motion_when_sdk_stop_fails(setup, monkeypatch):
+    monkeypatch.setitem(sys.modules, "loco_servo", setup.module)
+    bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
+    calls = []
+    class Home:
+        def get_tool(self):
+            return {"name": "home", "type": "actuator"}
+        def start(self):
+            pass
+        def dispatch(self, action, args):
+            calls.append(action)
+            return {"state": "going_home"}
+    bundle._plugins.append(Home())
+    bundle.start_all()
+    bundle.dispatch("loco_servo", {"action": "start"})
+    servo = bundle._loco_servo
+    setup.clock.advance()
+    send(servo, command(setup))
+    servo._backend.fail = True
+    assert bundle.dispatch("home", {"action": "go_home"})["state"] == "error"
+    assert calls == []
+    assert bundle._base_owner == ""
+    servo._backend.fail = False
+    servo.stop()

@@ -674,7 +674,10 @@ class TianyiDeviceBundle:
         if servo is not None and (tool_name == "loco_servo" or base_action):
             with self._base_command_lock:
                 if base_action:
-                    servo.pause_for_explicit_command(f"{tool_name}.{action}")
+                    released = servo.pause_for_explicit_command(f"{tool_name}.{action}")
+                    if released is False:
+                        return {"state": "error", "error":
+                                "loco_servo SDK stop unconfirmed; retry after firmware heartbeat expiry"}
                     if action in motions.get(tool_name, set()):
                         # Retain ownership even after an ambiguous timeout.
                         # Cancel/brake explicitly releases it, never an inferred

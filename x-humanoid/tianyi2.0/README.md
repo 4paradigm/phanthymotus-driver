@@ -123,57 +123,104 @@ ratings. Non-finite values, unsupported axes and out-of-range commands are
 rejected. `ControlSink` checks the schema, TTL, observation age, sequence and
 source priority. Rejected/stale messages never feed the watchdog.
 
-The domain-42 input uses the existing socket subscription bridge. Output is
-`geometry_msgs/Twist` on `/cmd_vel` in the robot's domain 0, the direct velocity
-channel already used by `NavPlugin`. It does not translate velocities into
-discrete REST direction actions, which cannot represent simultaneous forward
-and angular speed. Actual `/cmd_vel` consumption must be verified on hardware.
+The domain-42 input uses the existing socket subscription bridge. Output now
+uses the official Slamware C++ SDK, **not ROS `/cmd_vel`**: the Tianyi hardware
+check found zero subscribers on that topic. `nav.move_to` and `chassis_raw`
+use REST actions; their existence does not establish a `/cmd_vel` receiver.
+Discrete REST direction actions cannot preserve arbitrary simultaneous vx/wz.
+
+A private `tianyi-loco-sdk` worker connects to `sdk_host:sdk_port` (defaults
+`192.168.11.1:1445`, distinct from HTTP port 1448). It calls
+`SlamwareCorePlatform::velocityControl()` with the official localization-quality
+monitor enabled, then `VelocityControlMoveAction::setVelocity(vx, 0, wz)`.
+It does not use `NotMonitored` or change global speed/brake/emergency-stop
+parameters. `native/build_sdk.sh` pins the official ROS2 SDK 5.1.1 GCC11 package
+and SHA256 for ARM64 and AMD64; it compiles only this private C++ worker, not
+the vendor ROS server. Third-party license notices are installed in
+`/usr/share/doc/tianyi-loco-sdk/`.
 
 Bundle startup is inert. MCP/canvas `start` subscribes to the default input,
-or to an explicitly provided `input_topic` / first `input_topics` entry.
-`info` returns the control descriptor, input/output topics, requested and shaped
-output values, counts, dry-run state and refusal reasons. `published` means a
-ROS publish call succeeded, not that physical motion was measured; use the
-`loco_state` odometry feedback to verify that. The output acceleration caps
-default to 0.3 m/s² and 0.6 rad/s², including the first command and resumption.
-Explicit zero commands, pause, stop and watchdog stop bypass acceleration
-limiting. No valid command for 300ms triggers a zero within the next 50ms timer
-tick while the driver/executor is running. A crash-proof stop additionally
-requires a verified chassis-side `/cmd_vel` timeout; this driver cannot provide
-that guarantee after its own process has exited. Raw velocity streaming does
-not add navigation obstacle avoidance.
+or an explicitly provided `input_topic` / first `input_topics` entry. **New
+cards default to dry-run.** Dry-run does not launch/connect the SDK worker or
+create a chassis action. Turning dry-run off while running first requires a
+successful read-only SDK connection. Connection alone creates no motion action.
+An incompatible SDK/firmware, a disconnected SDK endpoint, or low localization
+quality is reported as an error; no direction-action fallback is attempted.
+The endpoint and actual firmware velocity/heartbeat behavior still require
+hardware validation with the new image.
+
+`info` returns the control descriptor, counts, last verdict/output, settings,
+and `backend` (type, host/port, connection status, last acknowledged action ID,
+error and heartbeat handover wait). `output_topic` is null: there is no ROS
+velocity publisher to inspect. `published` is retained for clients, but now
+counts acknowledged SDK velocity/stop operations, not measured physical motion.
+The backend state/action ID describe the last acknowledgement, not a substitute
+for odometry feedback; verify physical motion with `loco_state`.
+
+The Python and native layers enforce the input TTL/observation-age deadline,
+capped at 300ms. The native worker independently stops when that lease expires
+(with a 20ms polling interval while SDK calls are responsive), even if ROS stops
+spinning. It never holds a queue of old velocity commands or reconnects/replays
+a failed request. A blocked SDK reply times out (default 250ms), kills the worker
+and pauses the card. While the worker owns a motion action it enables the
+firmware's one-second heartbeat and refreshes it only within a live command
+lease. This is a **seconds-resolution backup**, not a claim of a 300ms stop
+after a process crash or network failure. Firmware heartbeat behavior must be
+checked on hardware. On an ambiguous failure, handover waits 1.5 seconds for
+that firmware lease before another card is permitted to act. A faulted worker
+requires explicit stop/start; it does not automatically regain control.
+
+Acceleration caps remain 0.3 m/s² and 0.6 rad/s². Explicit zero, pause, stop,
+lease expiration and watchdog stop bypass the ramp. Cancelling an SDK action
+addresses only this worker's held action handle. Before beginning or updating
+motion, the worker checks for another active action or replacement of its own
+handle; it refuses to overwrite that action. Raw velocity streaming does not
+add obstacle avoidance.
 
 Configure loco_servo exposes three live boolean settings via `action: config`:
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `dry_run` | false | Parse, validate, shape and count commands without publishing any velocity; enabling it while driving first sends one real zero to stop the previous motion |
-| `rotate_only` | false | Suppress translation and preserve yaw rate; unsupported axes are still rejected |
-| `require_standing` | false | Require a fresh true sample from the configured domain-0 `std_msgs/Bool` `standing_topic`; missing, stale or false samples stop/refuse motion |
+| `dry_run` | true | Validate, shape and count commands without SDK motion; enabling it during real execution first stops/cancels the old SDK action |
+| `rotate_only` | false | Suppress translation and preserve yaw rate; unsupported axes remain rejected |
+| `require_standing` | false | Require fresh true feedback from a configured domain-0 Bool source; missing/stale/false feedback stops/refuses motion |
 
-Tianyi has no verified native equivalent of R1's standing FSM in the supplied
-API. `standing_topic` is an integration point for a trusted posture signal,
-not an invented native topic. Do not enable this gate until such a signal has
-been mapped and verified; when enabled without a source it clearly reports
-the reason and refuses nonzero commands. Feedback expires after
-`standing_timeout` (default 1 second). These standing-source parameters live
-in `plugins.loco_servo` in the deployment YAML. Empty config requests preserve
-existing toggles; non-boolean toggle values are rejected.
+Tianyi has no verified native standing FSM in the supplied API. Do not enable
+`require_standing` without a verified `standing_topic`. Feedback expires after
+`standing_timeout` (default one second). These source parameters and SDK endpoint
+parameters live in `plugins.loco_servo` in the deployment YAML.
 
 `pause` stops but retains the subscription; `resume` accepts newly generated
-commands. Start/resume/config changes drop commands generated before that
-transition. A cancelled subscription's delayed callbacks cannot drive a new
-session. `stop` returns idle and releases the ROS nodes; start after stop works.
+commands. Start/resume/config changes drop pre-transition commands. `stop`
+returns idle and releases nodes/worker only once the stop is confirmed (or the
+failed worker's firmware lease wait has elapsed); otherwise it reports an error
+and remains paused. Starting after stop creates a new worker with no replay.
 
-At the bundle dispatch boundary, explicit `nav` motion/cancel, `home.go_home`
-or cancel, and `chassis_raw` motion/brake pause this stream and send a zero
-before the other card executes. After this handover the stream emits nothing,
-including no stop/timer/config zeros that could disturb its new owner.
-Starting/resuming the stream after a call-shaped motion requires an explicit
-`nav.cancel`, `home.cancel` or `chassis_raw.brake` first, even if the motion may
-have completed. This ownership is conservative across ambiguous REST results.
-The existing card implementations and `nav_client.py` remain unchanged.
-External controllers that bypass this bundle must be coordinated separately.
+At the bundle dispatch boundary, explicit `nav`, `home` and `chassis_raw`
+motion/cancel actions pause this stream before executing. An unconfirmed SDK
+stop blocks the handover. Successful handover cancels the owned velocity action
+and disables its heartbeat before the new owner runs; the yielded stream emits
+no more motion, zero or heartbeat writes. Starting/resuming after call-shaped
+motion still requires explicit `nav.cancel`, `home.cancel` or
+`chassis_raw.brake`. Existing card implementations, `nav_client.py` and
+`loco_state` are unchanged. Controllers bypassing the bundle need separate
+coordination; the SDK firmware heartbeat is global, with only one active token.
+
+### First deployment checks
+
+1. Keep **空跑 = Yes**, start the canvas and issue a navi goal. `received`,
+   `accepted` and `dry_run_commands` should increase; `published` stays zero.
+   Navi's blocked detector can fire because dry-run intentionally causes no motion.
+2. In a controlled hardware test, turning dry-run off must report
+   `backend.type = slamware_sdk`, `connected = true`, and no backend error.
+   Check odometry against small vx-only, wz-only and combined commands.
+3. Test zero, pause, stop, input loss, worker loss, low localization quality,
+   and transfer to/from nav/home before using unattended navigation. Read the
+   actual stop result, not just the UI button state.
+
+Official references: [platform and heartbeat API](https://developer.slamtec.com/docs/slamware/cpp-sdk-en/4.6.2_rtm/slamware_core_platform/),
+[velocity action](https://developer.slamtec.com/docs/slamware/cpp-sdk-en/2.8.2_rtm/VelocityControlMoveAction/),
+[SDK downloads](https://www.slamtec.com/en/support).
 
 ## Head camera snapshot card
 

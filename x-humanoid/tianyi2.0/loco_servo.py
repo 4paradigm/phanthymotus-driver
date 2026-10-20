@@ -1,4 +1,4 @@
-"""Tianyi body-frame velocity stream: domain 42 JSON -> domain 0 /cmd_vel.
+"""Tianyi body-frame velocity stream: domain 42 JSON -> Slamware SDK.
 
 No motion on bundle startup. Only MCP start attaches the input. No REST
 MoveByAction conversion: it cannot represent a simultaneous vx/wz command.
@@ -13,10 +13,11 @@ import threading
 import time
 
 from common.control import ControlSink, parse_descriptor
+from slamtec_velocity import SlamtecVelocityBackend
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 300
-TOGGLES = {"dry_run": False, "rotate_only": False, "require_standing": False}
+TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 
 
 def build_descriptor(hz=10.0, max_vx=0.3, max_wz=0.6):
@@ -38,6 +39,7 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=0.6):
 class LocoServoPlugin:
     def __init__(self, config, namespace, ros2, conflict=None):
         self._ros2 = ros2
+        self._backend_config = dict(config)
         self._conflict = conflict or (lambda: "")
         self._lock = threading.RLock()
         self._hz = self._positive(config, "expected_hz", 10.0)
@@ -60,7 +62,7 @@ class LocoServoPlugin:
         self._standing = None
         self._standing_at = None
         self._nodes = []
-        self._pub = None
+        self._backend = None
         self._sink = None
         self._running = self._paused = False
         self._yielded = False
@@ -70,6 +72,8 @@ class LocoServoPlugin:
         self._last_output = [0.0] * 6
         self._last_output_at = None
         self._last_valid_at = None
+        self._command_deadline_ms = 0
+        self._lease_expiry_ms = 0
         self._zero_pending = False
         self._last = None
         self._counts = {key: 0 for key in
@@ -88,7 +92,7 @@ class LocoServoPlugin:
     def get_tool(self):
         return {
             "name": "loco_servo", "type": "actuator", "multiInstance": False,
-            "description": "天轶底盘连续速度控制：motus.control/1 twist → /cmd_vel；支持 vx/wz。",
+            "description": "天轶底盘连续速度控制：接收 navi 的速度流，通过思岚 SDK 执行 vx/wz；默认空跑。",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
@@ -104,8 +108,8 @@ class LocoServoPlugin:
             "topic_in": [{"topic": INPUT_TOPIC, "format": "control/velocity",
                           "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}],
             "configSchema": {"type": "object", "properties": {
-                "dry_run": {"type": "boolean", "default": False,
-                            "description": "空跑：照常接收、检查、计数，但不向底盘发布速度。第一次在真机上试一个新策略时先打开它，看它想发什么。"},
+                "dry_run": {"type": "boolean", "default": True,
+                            "description": "空跑：照常接收、检查、计数，但不创建 SDK 运动动作。第一次上机先保持开启，检查它想发什么。"},
                 "rotate_only": {"type": "boolean", "default": False,
                                 "description": "只转不走：vx / vy 在到达底盘前被清零，保留 vyaw。"},
                 "require_standing": {"type": "boolean", "default": False,
@@ -117,13 +121,17 @@ class LocoServoPlugin:
 
     def stop(self):
         with self._lock:
+            self._paused = True
+            self._hold()
+            if self._zero_pending:
+                return {"state": "error", "error": "SDK stop unconfirmed; card remains paused"}
             self._running = False
             self._paused = False
             self._generation += 1
-            self._hold()
             self._sink = None
             self._close()
             self._yielded = False
+            return {"state": "idle"}
 
     def dispatch(self, action, args):
         with self._lock:
@@ -132,8 +140,7 @@ class LocoServoPlugin:
             if action == "config":
                 return self._configure(args)
             if action == "stop":
-                self.stop()
-                return {"state": "idle"}
+                return self.stop()
             if action == "start":
                 return self._start(args)
             if action in ("pause", "resume"):
@@ -146,6 +153,15 @@ class LocoServoPlugin:
                     self._yielded = False
                 self._paused = action == "pause"
                 self._hold()
+                if self._zero_pending:
+                    self._paused = True
+                    return {"state": "error", "error": "SDK stop unconfirmed; card remains paused"}
+                if action == "resume" and not self._settings["dry_run"]:
+                    try:
+                        self._backend.connect()
+                    except Exception as exc:
+                        self._paused = True
+                        return {"state": "error", "error": str(exc)}
                 self._barrier_ms = int(time.time() * 1000)
                 return self._info()
         return None
@@ -185,7 +201,6 @@ class LocoServoPlugin:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
         from std_msgs.msg import String, Bool
-        from geometry_msgs.msg import Twist
 
         # Node identity/context is what bridge_integration uses for domain 42.
         core = Node("tianyi2_loco_servo_in", context=self._ros2.ctx_core)
@@ -196,18 +211,21 @@ class LocoServoPlugin:
                                  lambda msg: self._on_message(msg, generation), qos)
         core.create_timer(0.05, lambda: self._tick(generation))
         self._ros2.executor_core.add_node(core)
-        body = Node("tianyi2_loco_servo_out", context=self._ros2.ctx_tianyi)
-        self._nodes.append((body, self._ros2.executor_tianyi))
-        self._pub = body.create_publisher(
-            Twist, "/cmd_vel", QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                                          durability=DurabilityPolicy.VOLATILE))
+        self._backend = SlamtecVelocityBackend(self._backend_config)
+        if not self._settings["dry_run"]:
+            self._backend.connect()  # Read-only: no action or heartbeat until a valid nonzero command.
         if self._standing_topic:
+            body = Node("tianyi2_loco_servo_standing", context=self._ros2.ctx_tianyi)
+            self._nodes.append((body, self._ros2.executor_tianyi))
             body.create_subscription(
                 Bool, self._standing_topic,
                 lambda msg: self._on_standing(msg, generation), qos)
-        self._ros2.executor_tianyi.add_node(body)
+            self._ros2.executor_tianyi.add_node(body)
 
     def _close(self):
+        if self._backend is not None:
+            self._backend.close()
+            self._backend = None
         for node, executor in reversed(self._nodes):
             try:
                 executor.remove_node(node)
@@ -218,7 +236,6 @@ class LocoServoPlugin:
             except Exception as exc:
                 self._record("ERROR", f"node teardown failed: {exc}")
         self._nodes.clear()
-        self._pub = None
         self._standing = self._standing_at = None
 
     def _on_standing(self, message, generation):
@@ -263,16 +280,25 @@ class LocoServoPlugin:
                     self._record("DROPPED", "command rate exceeds 20 Hz")
                     return
                 if any(command["values"]):
+                    if self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms:
+                        self._hold()  # Native lease may already have stopped the chassis.
+                        if self._zero_pending:
+                            raise RuntimeError("SDK stop unconfirmed")
                     problem = self._standing_problem()
                     if problem:
                         self._hold()
                         self._counts["rejected"] += 1
                         self._record("REFUSED", problem)
                         return
+                self._command_deadline_ms = min(
+                    command["stamp_ms"] + command.get("ttl_ms", 0),
+                    command.get("obs_stamp_ms", command["stamp_ms"]) + 500,
+                    int(time.time() * 1000) + WATCHDOG_MS)
                 outcome = self._sink.submit(command)
                 if outcome.applied:
                     self._counts["accepted"] += 1
                     self._last_valid_at = time.monotonic()
+                    self._lease_expiry_ms = self._command_deadline_ms
                     self._record(outcome.verdict.name, outcome.reason,
                                  requested=list(command["values"]),
                                  output=list(self._last_output),
@@ -338,23 +364,22 @@ class LocoServoPlugin:
         self._zero_pending = False
 
     def _publish(self, values):
-        from geometry_msgs.msg import Twist
-        if self._pub is None:
-            raise RuntimeError("/cmd_vel publisher unavailable")
-        message = Twist()
-        message.linear.x, message.linear.y, message.linear.z = values[:3]
-        message.angular.x, message.angular.y, message.angular.z = values[3:]
+        if self._backend is None:
+            raise RuntimeError("Slamware SDK backend unavailable")
         try:
-            self._pub.publish(message)
+            if any(values):
+                self._backend.write(values, self._command_deadline_ms)
+            else:
+                self._backend.stop()
         except Exception as exc:
-            raise RuntimeError(f"/cmd_vel publish failed: {exc}") from exc
+            raise RuntimeError(f"Slamware SDK write failed: {exc}") from exc
         self._counts["published"] += 1
 
     def _hold(self, *_args):
         self._counts["holds"] += 1
         if self._yielded:
             self._zero_pending = False
-        elif self._pub is not None and not self._settings["dry_run"]:
+        elif self._backend is not None and not self._settings["dry_run"]:
             try:
                 self._publish([0.0] * 6)
                 self._zero_pending = False
@@ -365,6 +390,7 @@ class LocoServoPlugin:
         self._last_output = [0.0] * 6
         self._last_output_at = None
         self._last_valid_at = None
+        self._lease_expiry_ms = 0
 
     def _tick(self, generation=None):
         with self._lock:
@@ -377,6 +403,9 @@ class LocoServoPlugin:
             if self._standing_problem() and any(self._last_output):
                 self._hold()
                 self._record("REFUSED", self._standing_problem())
+            if self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms:
+                self._hold()
+                self._record("HOLD", "command TTL or observation lease expired")
             if self._last_valid_at is not None and time.monotonic() - self._last_valid_at >= WATCHDOG_MS / 1000:
                 self._hold()
                 self._record("HOLD", "no valid command for 300 ms")
@@ -390,6 +419,14 @@ class LocoServoPlugin:
             # Stop under the OLD mode, especially before enabling dry_run.
             if self._running:
                 self._hold()
+                if self._zero_pending:
+                    self._paused = True
+                    return {"state": "error", "error": "SDK stop unconfirmed; settings unchanged"}
+                if not updates.get("dry_run", self._settings["dry_run"]):
+                    try:
+                        self._backend.connect()
+                    except Exception as exc:
+                        return {"state": "error", "error": str(exc), "dry_run": self._settings["dry_run"]}
             self._settings.update(updates)
             self._barrier_ms = int(time.time() * 1000)
         return {"ok": True, **self._info()}
@@ -399,10 +436,13 @@ class LocoServoPlugin:
             if self._running:
                 self._paused = True
                 self._hold()
+                if self._zero_pending:
+                    return False
                 # After the handover even zero commands could interrupt the
                 # new owner. Stop/config/timers must cease all base writes.
                 self._yielded = True
                 self._record("PAUSED", reason)
+            return True
 
     def _info(self):
         interface = copy.deepcopy(self._descriptor)
@@ -413,7 +453,9 @@ class LocoServoPlugin:
             "yielded_to_explicit_command": self._yielded,
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
-            "output": list(self._last_output), "output_topic": "/cmd_vel",
+            "output": list(self._last_output), "output_topic": None,
+            "backend": self._backend.info() if self._backend is not None else
+                       {"type": "slamware_sdk", "connected": False, "state": "disconnected"},
             "standing_topic": self._standing_topic,
             "posture_problem": self._standing_problem(),
             "acceleration_limits": {"linear_m_s2": self._accel[0],
