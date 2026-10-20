@@ -16,7 +16,7 @@ TELEOP_HEALTH_URL = 'http://127.0.0.1:15794/health'
 LABELS = {'salute':'salute', 'wave':'wave', 'welcome':'welcome'}
 PLANNED_DEG_PER_SECOND = 12.  # Unified planned travel/duration; not measured velocity.
 WAVE_DEG_PER_SECOND = 24.  # Baseline travel/duration before preset time scaling.
-MOTION_SCALES = {'salute':1.2, 'wave':1.2, 'welcome':1.}
+MOTION_SCALES = {'salute':1.44, 'wave':1.44, 'welcome':1.2}
 # Designed against TRON2 FK, not borrowed joint values from another robot.
 LEFT_FRAMES = {
     'salute': [-75, 60, 0, -120, 0, 0, 0],
@@ -142,8 +142,12 @@ class Pose:
             'servo_target_hz':300,'hard_realtime_guaranteed':False,
             'trajectory_peak_deg_per_second':{'arm':22.5,'wave_yaw':45.},
             'preset_motion_scales':dict(MOTION_SCALES),
-            'preset_peak_deg_per_second':{'salute':27.,'wave':{'arm':27.,'yaw':54.},'welcome':22.5},
-            'preset_peak_acceleration_deg_per_second_squared':{'salute':86.4,'wave':86.4,'welcome':60.},
+            'preset_peak_deg_per_second':{
+                'salute':round(22.5*MOTION_SCALES['salute'],3),
+                'wave':{'arm':round(22.5*MOTION_SCALES['wave'],3),'yaw':round(45*MOTION_SCALES['wave'],3)},
+                'welcome':round(22.5*MOTION_SCALES['welcome'],3)},
+            'preset_peak_acceleration_deg_per_second_squared':{
+                name:round(60*scale**2,3) for name,scale in MOTION_SCALES.items()},
             'physical_presets_verified':False}
 
     def plan(self,args):

@@ -85,12 +85,12 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([f['kind'] for f in p['frames']],['trajectory','gripper','gripper','trajectory'])
         self.assertEqual([f['gripper']['opening_mm'] for f in p['frames'] if f['kind']=='gripper'],[85,0])
 
-    def test_speedup_scales_every_salute_wave_ramp_but_not_holds_targets_or_welcome(self):
+    def test_all_three_presets_are_twenty_percent_faster_than092_with_unchanged_holds_and_targets(self):
         for name in pose.LABELS:
             fast=self.adapter.pose.plan({'pose':name})
-            with patch.dict(pose.MOTION_SCALES,salute=1.,wave=1.,welcome=1.):
+            with patch.dict(pose.MOTION_SCALES,salute=1.2,wave=1.2,welcome=1.):
                 baseline=self.adapter.pose.plan({'pose':name})
-            scale=1. if name=='welcome' else 1.2
+            scale=1.2 if name=='welcome' else 1.44
             for current,prior in zip(fast['frames'],baseline['frames']):
                 if current['kind']!='trajectory':
                     self.assertEqual(current,prior)
@@ -98,7 +98,7 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                 a,b=current['path'],prior['path']
                 self.assertEqual(a.start,b.start);self.assertEqual(a.target,b.target)
                 for ramp,old in zip(a.ramps,b.ramps):
-                    self.assertAlmostEqual(ramp[1]*scale,old[1])
+                    self.assertAlmostEqual(ramp[1]*1.2,old[1])
                     self.assertEqual(ramp[2:],old[2:])
                 self.assertEqual([h[1:] for h in a.holds],[h[1:] for h in b.holds])
                 # Ramp maxima remain analytically bounded, including yaw swings.
@@ -106,12 +106,13 @@ class TrajectoryTests(unittest.IsolatedAsyncioTestCase):
                     travel=max(abs(math.degrees(v)) for v in delta)
                     self.assertLessEqual(10/math.sqrt(3)*travel/duration**2,60*scale**2+1e-8)
             self.assertEqual(fast['motion_scale'],scale)
-            if name=='welcome':self.assertEqual(fast['planned_motion_seconds'],baseline['planned_motion_seconds'])
-            else:self.assertLess(fast['planned_motion_seconds'],baseline['planned_motion_seconds'])
+            self.assertLess(fast['planned_motion_seconds'],baseline['planned_motion_seconds'])
+            info=self.adapter.pose.info()
+            self.assertEqual(info['preset_peak_acceleration_deg_per_second_squared'][name],round(60*scale**2,3))
 
     def test_unbounded_or_nonfinite_motion_scale_is_rejected(self):
         frame={'joint':list(HOME),'time':1,'hold':0,'label':'home'}
-        for scale in (True,False,0,.9,1.200001,math.nan,math.inf,'1.2',None):
+        for scale in (True,False,0,.9,1.440001,math.nan,math.inf,'1.44',None):
             with self.assertRaises(ValueError):Path(HOME,[frame],scale)
 
     def test_head_not_centered_is_planned_before_arms_without_any_write(self):

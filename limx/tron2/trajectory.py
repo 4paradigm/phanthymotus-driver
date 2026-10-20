@@ -16,6 +16,7 @@ MAX_OUTPUT_GAP = .05
 MAX_FEEDBACK_AGE = .35
 TRACKING_DEG = 8.
 MAX_ACCEL_DEG = 60.
+MAX_MOTION_SCALE = 1.44
 FINAL_TIMEOUT = 10.
 CONTROL_GUARD_INTERVAL = 1.
 
@@ -33,8 +34,8 @@ class Path:
     overlapping ramps affect disjoint joints and smooth() is monotonic.
     """
     def __init__(self, start, frames, motion_scale=1.):
-        if type(motion_scale) not in (int,float) or not math.isfinite(motion_scale) or not 1.<=motion_scale<=1.2:
-            raise ValueError('Preset motion scale must be between 1 and 1.2')
+        if type(motion_scale) not in (int,float) or not math.isfinite(motion_scale) or not 1.<=motion_scale<=MAX_MOTION_SCALE:
+            raise ValueError('Preset motion scale must be between 1 and 1.44')
         self.motion_scale = motion_scale
         self.start = list(start)
         self.ramps = []

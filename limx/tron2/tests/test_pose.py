@@ -98,7 +98,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
             self.accept_feedback()
             p=self.adapter.pose.plan({'pose':pose.LABELS[name]})
             self.assertEqual(p['side'],'right' if name in ('salute','wave') else 'both')
-            self.assertEqual(p['planned_deg_per_second'],12 if name=='welcome' else 14.4)
+            self.assertEqual(p['planned_deg_per_second'],14.4 if name=='welcome' else 17.28)
             self.assertEqual(p['waypoints'][-1]['joint'],HOME)
             self.assertEqual(p['pose_sha256'],digest);self.assertFalse(p['collision_checked'])
             self.assertLess(sum(f['time']+f['hold']+10 for f in p['waypoints'])+130,480)
@@ -166,7 +166,7 @@ class PoseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(current['time'],prior['time'])
             else:self.assertEqual(current,prior)
         self.assertGreater(old['planned_motion_seconds']-normal,7/plan['motion_scale'])
-        self.assertEqual(plan['wave_planned_deg_per_second'],28.8)
+        self.assertEqual(plan['wave_planned_deg_per_second'],34.56)
 
     async def test_pose_feedback_rate_lease_released_after_success_error_cancel_and_report_failure(self):
         for outcome in ('success','error','cancel','callback_failure'):
