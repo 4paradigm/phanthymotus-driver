@@ -611,6 +611,9 @@ class SpeakerPlugin:
             self.stop()
             try:
                 self._prepare_xos_route()
+                # The self-check must obey the requested volume too; setting
+                # XOS volume only after it played made startup unexpectedly loud.
+                self._set_system_volume(self._volume)
                 self._play_startup_sound()
                 self._start_playback(requested)
                 print(f"[SpeakerPlugin] playback subscribed <- {self._topic}", flush=True)
@@ -623,7 +626,7 @@ class SpeakerPlugin:
         path = Path(__file__).parent / "resource" / "startup_beep.pcm"
         proc = None
         try:
-            pcm = path.read_bytes()
+            pcm = self._scale_pcm(path.read_bytes())
             command = _q5_alsa_speaker_command(self._device, self._output_rate, self._output_channels)
             # Use the exact tagged shell used by the live speaker. The bare
             # helper exited before SSH's stdin pipe was ready on Q5.
@@ -651,6 +654,11 @@ class SpeakerPlugin:
                 except Exception:
                     pass
             print(f"[SpeakerPlugin] startup self-check failed: {exc}{': ' + detail if detail else ''}", flush=True)
+
+    def _scale_pcm(self, pcm: bytes) -> bytes:
+        """Apply the same user volume and source gain to startup and live PCM."""
+        gain = (self._volume / 100.0) * self._input_gain
+        return pcm if gain == 1.0 else audioop.mul(pcm, 2, gain)
 
     def _prepare_xos_route(self):
         """Release XOS chat's route before taking ownership with live ALSA."""
@@ -695,7 +703,6 @@ class SpeakerPlugin:
 
     def _start_playback(self, requested: str) -> None:
         self._topic = requested
-        self._set_system_volume(self._volume)
         _stop_remote_speaker_playback()
         command = _q5_alsa_speaker_command(
             self._device, self._output_rate, self._output_channels)
@@ -744,9 +751,7 @@ class SpeakerPlugin:
                 # The input stream is commonly quieter than Q5 stored audio.
                 # Keep the user-facing 0-100 control linear, then apply a
                 # bounded source-gain calibration. audioop clips PCM safely.
-                gain = (self._volume / 100.0) * self._input_gain
-                if gain != 1.0:
-                    chunk = audioop.mul(chunk, 2, gain)
+                chunk = self._scale_pcm(chunk)
                 self._process.stdin.write(chunk)
                 self._process.stdin.flush()
                 self._frames_written += 1
