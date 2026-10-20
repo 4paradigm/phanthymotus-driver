@@ -105,6 +105,27 @@ class TestPoseFeedback(unittest.TestCase):
 
 
 class TestRelativeController(unittest.TestCase):
+    def test_relaxed_stop_limits_require_half_second_and_both_speeds(self):
+        controller = RelativeController(pose(), dict(x=0, y=0, yaw=0), .3, .5, 0)
+        self.assertEqual(controller.STOP_SPEED, .05)
+        self.assertEqual(controller.STOP_YAW_RATE, .05)
+        for now, speed, rate, expected in ((0., .04, .04, False), (.3, .04, .04, False),
+                (.4, .051, .04, False), (.5, .04, .051, False),
+                (.6, .04, .04, False), (1.2, .04, .04, True)):
+            self.assertEqual(controller.step(pose(now=now, speed=speed, rate=rate), now)[1], expected)
+
+    def test_relaxed_final_tolerances_still_require_stable_feedback(self):
+        self.assertEqual(RelativeController.POSITION_TOLERANCE, .08)
+        self.assertEqual(RelativeController.ANGLE_TOLERANCE, math.radians(5))
+        controller = RelativeController(pose(), dict(x=0, y=0, yaw=0), .3, .5, 0)
+        # Inside the relaxed window, but moving: cannot complete.
+        self.assertFalse(controller.step(pose(x=.07, yaw=math.radians(4), speed=.1, now=0), 0)[1])
+        self.assertFalse(controller.step(pose(x=.07, yaw=math.radians(4), now=.1), .1)[1])
+        self.assertTrue(controller.step(pose(x=.07, yaw=math.radians(4), now=.7), .7)[1])
+        for sample in (pose(x=.081), pose(yaw=math.radians(5.1))):
+            controller = RelativeController(pose(), dict(x=0, y=0, yaw=0), .3, .5, 0)
+            self.assertFalse(controller.step(sample, 0)[1])
+
     def test_rotation_is_not_interrupted_by_small_reported_linear_velocity(self):
         for direction in (1, -1):
             controller = RelativeController(pose(), dict(x=0, y=0, yaw=direction * math.pi/2), .3, .5, 0.)
@@ -144,7 +165,7 @@ class TestRelativeController(unittest.TestCase):
                 RelativeController(pose(), dict(x=0, y=0, yaw=1), .3, .5, 0., min_yaw_speed=value)
 
     def test_each_active_translation_axis_exceeds_dead_zone_and_respects_cap(self):
-        for x, y in ((.06, 0), (-.06, 0), (0, .06), (0, -.06), (.04, .04), (1, -.04), (.04, -1)):
+        for x, y in ((.09, 0), (-.09, 0), (0, .09), (0, -.09), (.06, .06), (1, -.06), (.06, -1)):
             for cap in (.2, .25, .3, 1.):
                 with self.subTest(x=x, y=y, cap=cap):
                     controller = RelativeController(pose(), dict(x=x, y=y, yaw=0), cap, .5, 0.)
@@ -218,8 +239,8 @@ class TestRelativeController(unittest.TestCase):
                     current['speed'], current['yaw_rate'] = math.hypot(bx, by), rate
                     current['angular_speed'] = abs(rate)
                 self.assertTrue(done)
-                self.assertLessEqual(controller.error['position_error_m'], .05)
-                self.assertLessEqual(abs(controller.error['angle_error_deg']), 3.)
+                self.assertLessEqual(controller.error['position_error_m'], RelativeController.POSITION_TOLERANCE)
+                self.assertLessEqual(abs(controller.error['angle_error_deg']), math.degrees(RelativeController.ANGLE_TOLERANCE))
 
     def test_pure_rotation_corrects_position_drift(self):
         initial = pose()
@@ -296,6 +317,21 @@ class TestRelativeController(unittest.TestCase):
             self.assertEqual(command[:2], (0., 0.))
             self.assertGreater(command[2] * (1 if turn else -1), 0.)
 
+    def test_rotation_timeout_distinguishes_settling_from_angle_progress(self):
+        for speed, rate in ((.06, 0.), (0., .06), (0., 0.)):
+            controller = RelativeController(pose(), dict(x=0, y=0, yaw=math.pi/2), .3, .5, 0)
+            sample = pose(yaw=math.pi/2, speed=speed, rate=rate)
+            controller.step(sample, 0.)
+            # Unchanged deadline behavior, including frozen-feedback settle failure.
+            with self.assertRaisesRegex(RuntimeError, 'Rotation settling timed out') as caught:
+                controller.step(sample, 10.1)
+            self.assertIn('speed=', str(caught.exception))
+            self.assertIn('angular_speed=', str(caught.exception))
+        controller = RelativeController(pose(), dict(x=0, y=0, yaw=math.pi/2), .3, .5, 0)
+        controller.step(pose(), 0.)
+        with self.assertRaisesRegex(RuntimeError, 'No progress in rotate phase'):
+            controller.step(pose(now=10.1), 10.1)
+
     def test_frozen_feedback_never_completes_and_no_progress_times_out(self):
         controller = RelativeController(pose(), dict(x=0, y=0, yaw=0), .3, .5, 0)
         for now in (0., .6, 1.):
@@ -346,6 +382,19 @@ class TestClosedLoopCard(unittest.TestCase):
             notifications.append((args, kwargs))
             done.set()
         return LocoRelativeMovePlugin({}, backend, notify, admission=lambda: {'admitted': True}), backend, notifications, done
+
+    def test_normal_diagnostics_save_only_summary_without_container_noise(self):
+        card, _, _, _ = self.card()
+        with tempfile.TemporaryDirectory() as directory:
+            card.diagnostics_dir = Path(directory)
+            with patch('builtins.print') as output:
+                summary = card._save_diagnostics('g1_point_success', 'completed', {
+                    'position_error_m': .07, 'angle_error_deg': 4.,
+                    'stop_confirmed_by_feedback': True, 'motion_trace': {'records': ['verbose']}})
+            output.assert_not_called()
+            saved = json.loads(Path(summary['diagnostics_file']).read_text())
+            self.assertNotIn('motion_trace', saved['result'])
+            self.assertEqual(saved['result']['position_error_m'], .07)
 
     def test_local_diagnostics_preserve_full_history_and_compact_callback(self):
         card, _, _, _ = self.card()
@@ -398,7 +447,7 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertTrue(done.wait(5))
         self.assertEqual(notices[0][0][1], 'completed')
         self.assertTrue(notices[0][0][2]['stop_confirmed_by_feedback'])
-        self.assertLessEqual(abs(backend.yaw - math.pi / 6), math.radians(3))
+        self.assertLessEqual(abs(backend.yaw - math.pi / 6), RelativeController.ANGLE_TOLERANCE)
         self.assertEqual(backend.calls[-1], (0., 0., 0.))
 
     def test_missing_or_failing_admission_never_sends_or_starts_worker(self):
@@ -510,7 +559,8 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertAlmostEqual(card.plan(dict(angle='180', direction='right'))['yaw'], -math.pi)
         tool = card.get_tools()[0]
         self.assertEqual(tool['inputSchema']['x-resource'], 'base')
-        self.assertIn('正向左', tool['inputSchema']['properties']['y']['title'])
+        self.assertIn('+left / -right', tool['inputSchema']['properties']['y']['title'])
+        self.assertFalse(any('\u4e00' <= ch <= '\u9fff' for ch in json.dumps(tool, ensure_ascii=False)))
 
     def test_unknown_action_is_declined_without_sending_motion(self):
         card, backend, notices, _ = self.card()

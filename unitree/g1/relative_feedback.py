@@ -153,11 +153,11 @@ class PoseFeedback:
 
 
 class RelativeController:
-    POSITION_TOLERANCE = .05
-    ANGLE_TOLERANCE = math.radians(3)
+    POSITION_TOLERANCE = .08
+    ANGLE_TOLERANCE = math.radians(5)
     SETTLE_SECONDS = .5
-    STOP_SPEED = .03
-    STOP_YAW_RATE = .03
+    STOP_SPEED = .05
+    STOP_YAW_RATE = .05
     STALL_SECONDS = 10.
 
     def __init__(self, initial, target, speed, yaw_speed, now, min_speed=.2, min_yaw_speed=.3):
@@ -202,7 +202,12 @@ class RelativeController:
     def step(self, pose, now):
         ex, ey, ea, distance = self.update_error(pose)
         if self.phase == 'rotate':
-            self._progress(.2 * abs(ea), now)
+            settling_error = None
+            if abs(ea) <= self.ANGLE_TOLERANCE:
+                settling_error = ('Rotation settling timed out: angle within tolerance, '
+                                  f'speed={pose["speed"]:.3f} m/s, '
+                                  f'angular_speed={pose["angular_speed"]:.3f} rad/s')
+            self._progress(.2 * abs(ea), now, settling_error)
             if abs(ea) <= self.ANGLE_TOLERANCE:
                 if self._settled(pose, now):
                     self._transition('translate', now)
@@ -246,11 +251,11 @@ class RelativeController:
         self.settle_since = None
         self.best, self.progress_time = float('inf'), now
 
-    def _progress(self, score, now):
+    def _progress(self, score, now, stalled_message=None):
         if score < self.best - .005:
             self.best, self.progress_time = score, now
         if now - self.progress_time > self.STALL_SECONDS:
-            raise RuntimeError(f'No progress in {self.phase} phase')
+            raise RuntimeError(stalled_message or f'No progress in {self.phase} phase')
 
     def _settled(self, pose, now):
         if pose['speed'] > self.STOP_SPEED or pose['angular_speed'] > self.STOP_YAW_RATE:

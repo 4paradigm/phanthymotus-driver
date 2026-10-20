@@ -98,7 +98,7 @@ class LocoRelativeMovePlugin:
                            "Calls SDK directly without SmartMotion sensor safety checks. "
                            "Local checks stop and latch on stale feedback, pose jumps, tilt and overspeed. "
                            "Targets use the starting body frame. Completion requires position within "
-                           "5 cm and heading within 3 degrees, stable after stopping. "
+                           "8 cm and heading within 5 degrees, stable after stopping. "
                            "Nonzero translation components have a configurable minimum (default 0.2 m/s); "
                            "rotation has a configurable minimum (default 0.3 rad/s).",
             "inputSchema": {
@@ -109,10 +109,10 @@ class LocoRelativeMovePlugin:
                           "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
                           "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
                           "description": "Relative longitudinal distance (m): 0 requests no displacement on this axis; otherwise absolute value must be 0.3–5 m. Positive forward, negative backward (same as loco vx)."},
-                    "y": {"type": "number", "title": "Y (m，正向左 / 负向右)", "default": 0,
+                    "y": {"type": "number", "title": "Y (m, +left / -right)", "default": 0,
                           "minimum": -self.MAX_DISTANCE, "maximum": self.MAX_DISTANCE,
                           "anyOf": [{"const": 0}, {"minimum": self.MIN_DISTANCE}, {"maximum": -self.MIN_DISTANCE}],
-                          "description": "横移距离（m）：相对于机器人运动开始时的朝向，正值向左、负值向右（同 loco vy）；0 表示该轴目标位移为零，非零绝对值为 0.3–5 m。"},
+                          "description": "Lateral displacement (m) in the starting body frame: positive left, negative right (same as loco vy). Zero requests no displacement on this axis; nonzero absolute values must be 0.3–5 m."},
                     "angle": {"type": "integer", "title": "Angle (°)", "enum": [0, 30, 60, 90, 180], "default": 0,
                               "description": "Final heading change from the starting heading (degrees); 0 holds starting heading."},
                     "direction": {"type": "string", "enum": ["left", "right"], "default": "left",
@@ -305,6 +305,8 @@ class LocoRelativeMovePlugin:
 
     def _save_diagnostics(self, action_id, status, result):
         """Keep the complete result locally and keep ACP below its 600-char cap."""
+        if status != 'error' and not result.get('error'):
+            result = {key: value for key, value in result.items() if key != 'motion_trace'}
         payload = json.dumps(dict(action_id=action_id, status=status, result=result),
                              ensure_ascii=True, allow_nan=False)
         summary = {key: result[key] for key in (
@@ -331,7 +333,8 @@ class LocoRelativeMovePlugin:
                 summary = dict(diagnostics_file=str(destination))
             if len(json.dumps(summary, ensure_ascii=True)) > 560:
                 summary = dict(diagnostics='See container log for file path', action_id=action_id)
-            print(f'[RelativeMotion] action_id={action_id} status={status} summary={json.dumps(summary, ensure_ascii=True)} diagnostics_file={destination}', flush=True)
+            if status == 'error' or result.get('error'):
+                print(f'[RelativeMotion] action_id={action_id} status={status} error={summary.get("error")} diagnostics_file={destination}', flush=True)
         except Exception as exc:
             if temporary is not None:
                 try:
@@ -375,7 +378,8 @@ class LocoRelativeMovePlugin:
                 return False
             if self.active and self.active.get('trace'):
                 self.active['trace'].add('stop_feedback', pose=dict(pose), stable_since_monotonic_s=stable)
-            if pose['speed'] <= .03 and pose['angular_speed'] <= .03:
+            if (pose['speed'] <= RelativeController.STOP_SPEED
+                    and pose['angular_speed'] <= RelativeController.STOP_YAW_RATE):
                 if stable is None:
                     stable = time.monotonic()
                 if pose['odom_stamp'] - stable >= .5:
@@ -472,7 +476,8 @@ class LocoRelativeMovePlugin:
             result.update(controller.error)
             result['stop_confirmed_by_feedback'] = stopped
             trace.add('terminal', status=status, stop_confirmed_by_feedback=stopped, error=result.get('error'))
-            result['motion_trace'] = trace.export(full=True)
+            if status == 'error' or result.get('error'):
+                result['motion_trace'] = trace.export(full=True)
             result['target'] = dict(x=controller.x, y=controller.y, yaw=controller.yaw)
             with self.command_lock:
                 self.faulted = not stopped or 'safety_reason' in result
