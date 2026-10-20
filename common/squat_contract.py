@@ -1,0 +1,59 @@
+"""ROS-independent canvas contract shared by Bumi and Q5 squat cards."""
+
+from __future__ import annotations
+
+
+def topic_out(namespace: str) -> list[dict]:
+    prefix = f"/{namespace}/fitness/squat"
+    return [
+        {"topic": f"{prefix}/events", "format": "data/json",
+         "message_type": "std_msgs/msg/String",
+         "desc": "Sparse session, target, and rep events for Decision Core"},
+        {"topic": f"{prefix}/status", "format": "data/json",
+         "message_type": "std_msgs/msg/String",
+         "desc": "Current count for a dashboard; do not connect to Decision Core"},
+        {"topic": f"{prefix}/debug", "format": "data/json",
+         "message_type": "std_msgs/msg/String",
+         "desc": "供 Dashboard 查看中文姿态测量与阈值判定"},
+    ]
+
+
+def tool_definition(namespace: str) -> dict:
+    return {
+        "name": "squat_counter",
+        "type": "processor",
+        "multiInstance": False,
+        "description": (
+            "Count one selected person's complete squats from the full pose "
+            "skeleton stream. Use status for the current total; connect only "
+            "the sparse events output to Decision Core. Status and debug "
+            "outputs are for the dashboard."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": [
+                    "start", "stop", "info", "status", "debug", "reset"]},
+                "input_topic": {
+                    "type": "string",
+                    "description": "Full pose /poses/skeleton ROS topic from the canvas connection",
+                },
+            },
+            "required": ["action"],
+            "x-action-params": {
+                "start": {"params": ["input_topic"],
+                          "description": "Subscribe to skeleton frames and start a new count"},
+                "stop": {"params": [], "description": "Stop subscribing; retain final total"},
+                "info": {"params": [], "description": "Show card ports and status"},
+                "status": {"params": [], "description": "Read the authoritative current total"},
+                "debug": {"params": [], "description": "查看中文姿态测量与计数判定"},
+                "reset": {"params": [], "description": "Clear the count and start a new session"},
+            },
+        },
+        "topic_in": [{
+            "format": "sensor/pose2d",
+            "message_type": "std_msgs/msg/String",
+            "desc": "Full pose /poses/skeleton JSON with COCO keypoints",
+        }],
+        "topic_out": topic_out(namespace),
+    }

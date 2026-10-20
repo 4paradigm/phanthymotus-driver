@@ -518,7 +518,8 @@ def plugin_factory(monkeypatch):
 
     def build(config=None):
         clock = _Clock()
-        monkeypatch.setattr(module, "time", types.SimpleNamespace(
+        card_module = sys.modules[module.SquatCounterPlugin.__module__]
+        monkeypatch.setattr(card_module, "time", types.SimpleNamespace(
             monotonic=lambda: clock.now))
         executor = types.SimpleNamespace(add_node=lambda node: None)
         card = module.SquatCounterPlugin(config or {}, "test_bumi", executor)
