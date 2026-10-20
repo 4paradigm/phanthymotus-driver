@@ -109,6 +109,8 @@ plugins:
     # Only an explicit begin/reset action starts counting, independent of canvas start.
     require_explicit_workout_start: true
     coach_mode: true
+    # Send short milestone prompts straight to TTS; plan and summary stay with Decision Core.
+    local_milestone_voice: true
     default_sets: 2
     default_reps_per_set: 8
     default_rest_s: 90

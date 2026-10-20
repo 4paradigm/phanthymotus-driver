@@ -10,6 +10,7 @@ import json
 import math
 import threading
 import time
+from time import time as wall_time
 
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -204,6 +205,15 @@ def _debug_zh(raw: dict) -> dict:
         "训练总结": raw["summary"],
         "训练计划": raw["plan"],
         "教练模式已启用": _yes_no(raw["coach_mode"]),
+        "本地关键节点播报已启用": _yes_no(raw["local_milestone_voice"]),
+        "最近本地提示": ({
+            "类型": raw["last_voice"]["type"],
+            "内容": raw["last_voice"]["text"],
+            "发送时间": raw["last_voice"]["sent_at"],
+            "过期时间": raw["last_voice"]["expires_at"],
+            "组号": raw["last_voice"]["set_index"],
+            "本组次数": raw["last_voice"]["set_count"],
+        } if raw["last_voice"] else None),
         "组间阶段": _SET_STATE_ZH.get(raw["set_state"], "未设置"),
         "当前组": raw["set_index"],
         "当前组已完成": raw["set_count"],
@@ -282,6 +292,10 @@ class SquatCounterPlugin:
         if not isinstance(coach_mode, bool):
             raise ValueError("coach_mode must be a boolean")
         self._coach_mode = coach_mode
+        local_voice = plugin_config.get("local_milestone_voice", False)
+        if not isinstance(local_voice, bool):
+            raise ValueError("local_milestone_voice must be a boolean")
+        self._local_milestone_voice = coach_mode and local_voice
         self._default_plan = {
             "sets": _plan_integer(plugin_config.get("default_sets", 2),
                                   "default_sets", 1, 5),
@@ -295,6 +309,7 @@ class SquatCounterPlugin:
         self._event_topic = f"/{namespace}/fitness/squat/events"
         self._status_topic = f"/{namespace}/fitness/squat/status"
         self._debug_topic = f"/{namespace}/fitness/squat/debug"
+        self._voice_topic = f"/{namespace}/fitness/squat/voice"
         self._node = Node(node_name)
         executor.add_node(self._node)
         self._event_pub = self._node.create_publisher(
@@ -303,6 +318,9 @@ class SquatCounterPlugin:
             String, self._status_topic, _OUTPUT_QOS)
         self._debug_pub = self._node.create_publisher(
             String, self._debug_topic, _DEBUG_QOS)
+        self._voice_pub = (self._node.create_publisher(
+            String, self._voice_topic, _OUTPUT_QOS)
+            if self._local_milestone_voice else None)
         self._subscription = None
         self._input_topic = ""
         self._lock = threading.RLock()
@@ -315,6 +333,7 @@ class SquatCounterPlugin:
         self._frames_parsed = 0
         self._invalid_frames = 0
         self._last_error: str | None = None
+        self._last_voice: dict | None = None
         self._workout_state = "waiting_start"
         self._workout_started_at: float | None = None
         self._absence_started_at: float | None = None
@@ -336,10 +355,12 @@ class SquatCounterPlugin:
         self._node.create_timer(0.2, self._tick)
 
     def get_tool(self) -> dict:
-        return tool_definition(self._namespace, coach_mode=self._coach_mode)
+        return tool_definition(self._namespace, coach_mode=self._coach_mode,
+                               local_milestone_voice=self._local_milestone_voice)
 
     def _topic_out(self) -> list[dict]:
-        return topic_out(self._namespace)
+        return topic_out(self._namespace,
+                         local_milestone_voice=self._local_milestone_voice)
 
     def start(self) -> None:
         # Bundle startup registers the card; the canvas supplies input_topic
@@ -420,6 +441,7 @@ class SquatCounterPlugin:
         self._frames_parsed = 0
         self._invalid_frames = 0
         self._last_error = None
+        self._last_voice = None
         self._publish_status_locked(force=True)
         self._publish_debug_locked(force=True)
         return self._status_locked()
@@ -492,6 +514,7 @@ class SquatCounterPlugin:
         self._counter.reset()
         self._pending_rep = None
         self._last_rep_published_at = None
+        self._last_voice = None
         self._workout_state = "active"
         self._workout_started_at = time.monotonic()
         self._absence_started_at = None
@@ -547,11 +570,14 @@ class SquatCounterPlugin:
             return
         self._set_state = "ready_next"
         self._rest_until = None
-        self._publish_event_locked({
-            "type": "rest_finished", "session_id": self._counter.session_id,
-            "set_index": self._set_index, "next_set_index": self._set_index + 1,
-            "count_total": self._workout_total,
-        })
+        if not self._local_milestone_voice:
+            self._publish_event_locked({
+                "type": "rest_finished", "session_id": self._counter.session_id,
+                "set_index": self._set_index, "next_set_index": self._set_index + 1,
+                "count_total": self._workout_total,
+            })
+        self._publish_voice_locked("rest_finished", "休息结束，请说开始下一组。",
+                                   ttl_s=6.0)
         self._publish_status_locked(force=True)
         self._publish_debug_locked(force=True)
 
@@ -572,13 +598,15 @@ class SquatCounterPlugin:
         self._set_state = "in_set"
         self._set_started_at = now
         self._ready_since = None
-        self._publish_event_locked({
-            "type": "set_ready", "session_id": snapshot["session_id"],
-            "seq": snapshot["seq"], "set_index": self._set_index,
-            "sets": self._coach_plan["sets"],
-            "set_target": self._coach_plan["reps_per_set"],
-            "count_total": self._workout_total,
-        })
+        if not self._local_milestone_voice:
+            self._publish_event_locked({
+                "type": "set_ready", "session_id": snapshot["session_id"],
+                "seq": snapshot["seq"], "set_index": self._set_index,
+                "sets": self._coach_plan["sets"],
+                "set_target": self._coach_plan["reps_per_set"],
+                "count_total": self._workout_total,
+            })
+        self._publish_voice_locked("set_ready", "站稳了，开始深蹲。", ttl_s=4.0)
 
     def _coach_handle_event_locked(self, event: dict, now: float) -> None:
         kind = event.get("type")
@@ -599,7 +627,12 @@ class SquatCounterPlugin:
                 # Decision Core from queuing obsolete count announcements.
                 midpoint = math.ceil(self._coach_plan["reps_per_set"] / 2)
                 if self._set_count in (1, midpoint):
-                    self._publish_event_locked(progress)
+                    if self._local_milestone_voice:
+                        self._publish_voice_locked("rep_completed",
+                                                   f"{self._set_count}次。",
+                                                   ttl_s=2.5)
+                    else:
+                        self._publish_event_locked(progress)
                 return
             self._set_results.append({
                 "set_index": self._set_index,
@@ -609,6 +642,9 @@ class SquatCounterPlugin:
             })
             self._pending_rep = None
             if self._set_index == self._coach_plan["sets"]:
+                self._publish_voice_locked("workout_finished",
+                                           f"{self._set_count}次，训练完成。",
+                                           ttl_s=5.0)
                 self._finish_workout_locked("plan_completed", announce=True)
                 return
             self._set_state = "resting"
@@ -618,14 +654,20 @@ class SquatCounterPlugin:
                 "rest_s": self._coach_plan["rest_s"],
                 "next_set_index": self._set_index + 1,
             })
+            self._publish_voice_locked(
+                "set_completed",
+                f"{self._set_count}次，本组完成。休息{self._coach_plan['rest_s']}秒。",
+                ttl_s=5.0)
             return
-        if kind in ("target_lost", "target_reacquired"):
+        if kind == "target_lost" or (kind == "target_reacquired"
+                                      and not self._local_milestone_voice):
             self._publish_event_locked({
                 **event, "set_index": self._set_index,
                 "set_state": self._set_state,
                 "count_total": self._workout_total,
             })
-        elif kind == "ready_to_squat" and self._set_state == "in_set":
+        elif (kind == "ready_to_squat" and self._set_state == "in_set"
+              and not self._local_milestone_voice):
             self._publish_event_locked({
                 **event, "set_index": self._set_index,
                 "set_state": self._set_state,
@@ -800,6 +842,25 @@ class SquatCounterPlugin:
         message.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         self._event_pub.publish(message)
 
+    def _publish_voice_locked(self, kind: str, prompt: str, *, ttl_s: float) -> None:
+        if self._voice_pub is None:
+            return
+        sent_at = wall_time()
+        payload = {
+            "text": prompt, "expires_at": sent_at + ttl_s,
+            "source": "squat_counter", "type": kind,
+            "session_id": self._counter.session_id,
+            "set_index": self._set_index, "set_count": self._set_count,
+        }
+        message = String()
+        message.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        self._voice_pub.publish(message)
+        self._last_voice = {"type": kind, "text": prompt,
+                            "sent_at": round(sent_at, 3),
+                            "expires_at": round(payload["expires_at"], 3),
+                            "set_index": self._set_index,
+                            "set_count": self._set_count}
+
     def _status_locked(self) -> dict:
         counter = self._counter.snapshot()
         if self._coach_mode and self._workout_state == "active":
@@ -822,6 +883,8 @@ class SquatCounterPlugin:
             "phase": counter.pop("state"),
             **counter,
             "coach_mode": self._coach_mode,
+            "local_milestone_voice": self._local_milestone_voice,
+            "last_voice": dict(self._last_voice) if self._last_voice else None,
             "workout_state": self._workout_state,
             "workout_elapsed_s": (
                 round(max(0.0, now - self._workout_started_at), 1)

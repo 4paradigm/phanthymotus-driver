@@ -1030,12 +1030,14 @@ def test_explicit_workout_target_switch_finishes_original_subject(plugin_factory
 
 
 def _start_coach_workout(plugin_factory, *, sets=2, reps_per_set=1,
-                         rest_s=15, min_rep_event_interval_s=3.0):
+                         rest_s=15, min_rep_event_interval_s=3.0,
+                         local_milestone_voice=False):
     card, clock, node = plugin_factory({
         "require_explicit_workout_start": True,
         "coach_mode": True,
         "auto_finish_absence_s": 6.0,
         "min_rep_event_interval_s": min_rep_event_interval_s,
+        "local_milestone_voice": local_milestone_voice,
     })
     event_topic = card.get_tool()["topic_out"][0]["topic"]
     card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
@@ -1237,6 +1239,42 @@ def test_coach_announces_only_milestones_and_goal_without_old_pending_reps(
     clock.advance(1.0)
     node.timers[0]()
     assert [event["set_count"] for event in _events(node, topic, "rep_completed")] == [1, 3]
+
+
+def test_coach_local_milestones_bypass_model_and_expire(plugin_factory):
+    card, clock, node, subscription, event_topic, _ = _start_coach_workout(
+        plugin_factory, sets=2, reps_per_set=5, rest_s=15,
+        local_milestone_voice=True)
+    voice_topic = card.get_tool()["topic_out"][3]["topic"]
+    assert voice_topic.endswith("/fitness/squat/voice")
+    _plugin_standing(subscription, clock)
+    for _ in range(5):
+        _plugin_rep(subscription, clock)
+
+    assert _events(node, event_topic, "rep_completed") == []
+    assert _events(node, event_topic, "set_ready") == []
+    assert len(_events(node, event_topic, "set_completed")) == 1
+    prompts = node.publishers[voice_topic].payloads
+    assert [(p["type"], p["set_count"]) for p in prompts] == [
+        ("set_ready", 0), ("rep_completed", 1),
+        ("rep_completed", 3), ("set_completed", 5),
+    ]
+    assert prompts[-1]["text"] == "5次，本组完成。休息15秒。"
+    assert all(p["expires_at"] > 0 for p in prompts)
+    status = card.dispatch("status", {})
+    assert status["local_milestone_voice"] is True
+    assert status["last_voice"]["type"] == "set_completed"
+
+    clock.advance(15.1)
+    node.timers[0]()
+    assert _events(node, event_topic, "rest_finished") == []
+    assert node.publishers[voice_topic].payloads[-1]["type"] == "rest_finished"
+    card.dispatch("next_set", {})
+    _plugin_standing(subscription, clock)
+    for _ in range(5):
+        _plugin_rep(subscription, clock)
+    assert node.publishers[voice_topic].payloads[-1]["type"] == "workout_finished"
+    assert len(_events(node, event_topic, "workout_finished")) == 1
 
 
 def test_coach_next_set_accepts_expired_rest_without_timer_and_ignores_waiting_reps(

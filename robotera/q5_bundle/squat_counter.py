@@ -72,7 +72,10 @@ class Plugin:
 
     def get_tool(self) -> dict:
         return tool_definition(self._namespace,
-                               coach_mode=self._config.get("coach_mode", False))
+                               coach_mode=self._config.get("coach_mode", False),
+                               local_milestone_voice=(
+                                   self._config.get("coach_mode", False)
+                                   and self._config.get("local_milestone_voice", False)))
 
     def start(self) -> None:
         with self._lock:

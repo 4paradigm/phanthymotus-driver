@@ -22,6 +22,7 @@ def test_q5_bundle_registers_squat_processor():
     assert config["plugins"]["squat_counter"]["enabled"] is True
     assert config["plugins"]["squat_counter"]["require_explicit_workout_start"] is True
     assert config["plugins"]["squat_counter"]["coach_mode"] is True
+    assert config["plugins"]["squat_counter"]["local_milestone_voice"] is True
     assert config["plugins"]["squat_counter"]["default_sets"] == 2
     assert config["plugins"]["squat_counter"]["default_reps_per_set"] == 8
     assert {"name": "squat_counter", "type": "processor"} in catalog["cards"]
@@ -54,10 +55,12 @@ def test_proxy_contract_and_action_forwarding():
 
 
 def test_coach_tool_exposes_default_plan_to_decision_core():
-    card = squat_counter.Plugin({"coach_mode": True}, "q5_test", None, None)
+    card = squat_counter.Plugin({"coach_mode": True, "local_milestone_voice": True},
+                                "q5_test", None, None)
     begin = card.get_tool()["inputSchema"]["x-action-params"]["begin"]
     assert "2 sets of 8 reps" in begin["description"]
     assert "90 seconds" in begin["description"]
+    assert card.get_tool()["topic_out"][3]["topic"] == "/q5_test/fitness/squat/voice"
 
 
 def test_dead_processor_is_reported_instead_of_returning_stale_count():

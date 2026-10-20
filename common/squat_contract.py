@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 
-def topic_out(namespace: str) -> list[dict]:
+def topic_out(namespace: str, *, local_milestone_voice: bool = False) -> list[dict]:
     prefix = f"/{namespace}/fitness/squat"
-    return [
+    ports = [
         {"topic": f"{prefix}/events", "format": "data/json",
          "message_type": "std_msgs/msg/String",
          "desc": "Sparse session, target, and rep events for Decision Core"},
@@ -16,9 +16,17 @@ def topic_out(namespace: str) -> list[dict]:
          "message_type": "std_msgs/msg/String",
          "desc": "供 Dashboard 查看中文姿态测量与阈值判定"},
     ]
+    if local_milestone_voice:
+        ports.append({
+            "topic": f"{prefix}/voice", "format": "data/json",
+            "message_type": "std_msgs/msg/String",
+            "desc": "Short, expiring coach prompts; connect directly to perception TTS",
+        })
+    return ports
 
 
-def tool_definition(namespace: str, *, coach_mode: bool = False) -> dict:
+def tool_definition(namespace: str, *, coach_mode: bool = False,
+                    local_milestone_voice: bool = False) -> dict:
     begin_description = (
         "When the user asks to start squat training, choose a plan and call "
         "this action before counting. Use 2 sets of 8 reps with 90 seconds "
@@ -76,5 +84,6 @@ def tool_definition(namespace: str, *, coach_mode: bool = False) -> dict:
             "message_type": "std_msgs/msg/String",
             "desc": "Full pose /poses/skeleton JSON with COCO keypoints",
         }],
-        "topic_out": topic_out(namespace),
+        "topic_out": topic_out(namespace,
+                               local_milestone_voice=local_milestone_voice),
     }
