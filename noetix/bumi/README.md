@@ -1,6 +1,7 @@
 # Noetix Bumi driver
 
-The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state,
+independent sound-direction and software emergency-stop cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
 
@@ -439,6 +440,36 @@ Two behaviours verified on hardware and worth not re-deriving:
 Likewise `frames_submitted` in `info` counts frames handed to the SDK, not
 frames heard: `publish_external_audio_playback_stream` is fire-and-forget, so a
 rising count proves the subscription works and nothing more.
+
+## `estop` card (software latch)
+
+The vendor SDK exposes no emergency-stop state, so this card is a **driver-level
+software latch**, not a replacement for the robot's physical E-stop button.
+
+- `trigger` sets the latch, immediately sends one zero velocity, pauses
+  `loco_servo` and ends any `loco.move` thread.
+- While latched, every non-zero velocity is dropped in `LocoPlugin._publish_cmd`
+  before it reaches the SDK. `loco_servo` forwards through
+  `loco.publish_velocity`, so the call-shaped and the streaming path are gated
+  by the same rule. Zero is always allowed — a stop is not the thing an
+  emergency stop should prevent.
+- `loco.move`, posture, preset and teaching actions return
+  `code: ESTOP_ACTIVE`. Only `loco.stop_move`, `semantic_action.reset` and
+  `action_recording.stop_playback` stay callable, because they reduce motion.
+- `reset` requires `confirm: true`; stopping the card (`stop` action) or the
+  bundle does **not** release the latch.
+- The latch lives in process memory, so a driver restart releases it. Do not
+  describe it as surviving a restart.
+- `auto_trigger_on_protection` (default off) latches on workmode 26. It is off
+  by default because a latched driver also refuses `stand_up`, which is the
+  documented way out of protection — enabling it is an operator decision.
+
+State is published on `/<namespace>/state/estop` as `data/json` at
+`publish_hz` (default 10). Verify from the host with:
+
+```bash
+ros2 topic echo /<robot_namespace>/state/estop
+```
 
 Useful observations while the driver is running:
 

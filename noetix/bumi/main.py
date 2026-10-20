@@ -124,6 +124,12 @@ class BumiDeviceBundle:
         camera_plugin = None
         loco_plugin = None
 
+        # One latch shared by `loco`, `loco_servo` and the `estop` card. It is
+        # created unconditionally so the motion gate has something to read even
+        # when the `estop` card itself is disabled.
+        from estop import EmergencyStopLatch
+        estop_latch = EmergencyStopLatch()
+
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
             state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
@@ -134,6 +140,7 @@ class BumiDeviceBundle:
             from device import LocoPlugin
             loco_plugin = LocoPlugin(
                 plugins_cfg["loco"], namespace, executor, high_ctrl)
+            loco_plugin.attach_estop(estop_latch)
             self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
 
@@ -145,8 +152,15 @@ class BumiDeviceBundle:
                 # When the call-shaped card is enabled, both paths share its
                 # lock/rate limiter and explicit actions preempt the stream.
                 loco_plugin=loco_plugin,
+                estop=estop_latch,
             ))
             print("[bundle] LocoServoPlugin loaded")
+
+        if plugins_cfg.get("estop", {}).get("enabled", False):
+            from estop import EstopPlugin
+            self._plugins.append(EstopPlugin(
+                plugins_cfg["estop"], namespace, executor, estop_latch, high_ctrl))
+            print("[bundle] EstopPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin

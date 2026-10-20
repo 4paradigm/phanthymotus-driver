@@ -317,10 +317,61 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        # Set by the bundle right after construction; see `attach_estop`.
+        self._estop = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def attach_estop(self, estop) -> None:
+        """Wire the bundle's shared emergency-stop latch.
+
+        Registered as an on-latch callback rather than polled, so a `trigger`
+        has already zeroed the chassis before it returns to its caller: the
+        card must not report "latched" while a move thread is still publishing.
+        """
+        self._estop = estop
+        if estop is not None and hasattr(estop, "add_on_latch"):
+            estop.add_on_latch(self._on_estop_latched)
+
+    def estop_latched(self) -> bool:
+        return bool(self._estop is not None and self._estop.latched)
+
+    def _on_estop_latched(self, source: str, reason: str) -> None:
+        self.emergency_stop(reason=f"{source}: {reason}" if reason else source)
+
+    def emergency_stop(self, reason: str = "") -> dict:
+        """Stop every motion path this plugin owns. Safe to call while latched."""
+        self._preempt_servo("estop")
+        self._move_stop_event.set()
+        thread = self._move_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        if self._high_ctrl is not None:
+            # Zero is allowed through the latch gate; it is what stops the robot.
+            self._publish_cmd(0.0, 0.0, 0.0, _get_default_cmd(), 0)
+        self._set_servo_velocity_owner(False)
+        print(f"[loco] emergency stop ({reason or 'no reason'})", flush=True)
+        return {"state": "stopped", "reason": reason}
+
+    @staticmethod
+    def _allowed_while_latched(tool_name: str, action: str) -> bool:
+        """Actions that reduce motion and must stay callable during a latch."""
+        return (tool_name, action) in {
+            ("loco", "stop_move"),
+            ("semantic_action", "reset"),
+            ("action_recording", "stop_playback"),
+        }
+
+    def _estop_refusal(self, tool_name: str, action: str) -> dict:
+        return {
+            "state": "error",
+            "code": "ESTOP_ACTIVE",
+            "error": "紧急停止已锁存：先调用 estop.reset(confirm=true) 再运动",
+            "estop": self._estop.snapshot() if self._estop is not None else {},
+            "requested": f"{tool_name}.{action}",
+        }
 
     def is_moving(self) -> bool:
         """Whether a `move` thread is still publishing velocities.
@@ -544,6 +595,12 @@ class LocoPlugin:
         if handler is None:
             return None
 
+        # A latched emergency stop refuses every action that moves the body,
+        # including posture and teaching actions: they change `workmode` under
+        # a walking robot just as surely as a velocity command does.
+        if self.estop_latched() and not self._allowed_while_latched(tool_name, action):
+            return self._estop_refusal(tool_name, action)
+
         # Before touching the robot, not after: otherwise this command and the
         # policy's next one race, and which one the robot ends up obeying
         # depends on timing nobody controls. Every action reachable from here
@@ -555,7 +612,14 @@ class LocoPlugin:
         return result
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
-        """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
+        """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum.
+
+        This is the single choke point for both cards: `loco_servo` forwards
+        through `publish_velocity`, so gating here covers the call-shaped and
+        the streaming path with one copy of the rule.
+        """
+        if self._estop is not None and self._estop.refuses(x, y, z):
+            return False
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
@@ -563,6 +627,7 @@ class LocoPlugin:
                 time.sleep(0.002 - elapsed)
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
+        return True
 
     def _do_move(self, args: dict) -> dict:
         # Check if in walking mode

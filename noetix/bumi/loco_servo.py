@@ -332,11 +332,15 @@ class LocoServoPlugin:
     PREFIX = "locoservo"      # no underscore — dispatch routes on partition("_")
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 high_ctrl, loco_plugin=None):
+                 high_ctrl, loco_plugin=None, estop=None):
         self._ns = namespace
         self._executor = executor
         self._high_ctrl = high_ctrl
         self._loco = loco_plugin
+        # Shared bundle latch. `loco` already gates the shared path, but the
+        # fallback below publishes straight at the SDK when `loco` is disabled;
+        # this keeps the emergency stop honest in that configuration too.
+        self._estop = estop
         config = plugin_config or {}
 
         self._expected_hz = float(config.get("expected_hz", DEFAULT_EXPECTED_HZ))
@@ -588,6 +592,10 @@ class LocoServoPlugin:
         conflict = self._chassis_conflict()
         if conflict:
             return {"state": "error", "message": conflict}
+
+        if self._estop is not None and self._estop.latched:
+            return {"state": "error", "code": "ESTOP_ACTIVE",
+                    "message": "紧急停止已锁存：先调用 estop.reset(confirm=true)"}
 
         if self._executor is None:
             return {"state": "error", "message": "没有 ROS 上下文，无法订阅"}
@@ -984,6 +992,8 @@ class LocoServoPlugin:
         separate limiters can interleave inside a single publish, and the SDK
         has no way to tell us that happened.
         """
+        if self._estop is not None and self._estop.refuses(nx, ny, nz):
+            return
         try:
             if self._loco is not None and hasattr(self._loco, "publish_velocity"):
                 self._loco.publish_velocity(nx, ny, nz)
