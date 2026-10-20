@@ -16,7 +16,7 @@ def session_profile(path, feedback, now_ns):
     if profile.get('runtime_baseline') != 'fresh_low_state':
         return str(source), None
     stamp = feedback.get('arm_ns')
-    if type(stamp) is not int or not 0 <= now_ns-stamp <= 100_000_000:
+    if type(stamp) is not int or not 0 <= now_ns-stamp <= 200_000_000:
         raise ValueError('arm_feedback_stale')
     names = profile['locked_joint_names']
     measured = feedback.get('locked_joints')

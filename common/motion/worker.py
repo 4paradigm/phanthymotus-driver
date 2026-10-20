@@ -231,13 +231,15 @@ def serve(sock, solver_module, solver_class, visualization_module):
                 result = solver.motion_envelope(data['measured'], data['previous'], data['target'], budget)
             elif op == 'render':
                 from scipy.spatial.transform import Rotation
-                snapshot = importlib.import_module(visualization_module).snapshot
+                visualization = importlib.import_module(visualization_module)
+                snapshot = visualization.snapshot
+                feedback_max_age_ns = getattr(visualization, 'FEEDBACK_MAX_AGE_NS', 100_000_000)
                 if key and key[-1] != identity['generation']:
                     solver.visualization_sample = solver.last_valid_visualization = None
                     key = None
                 state = data['state']
                 feedback = state['feedback']
-                fresh = 0 <= time.monotonic_ns()-feedback.get('arm_ns', 0) <= 100_000_000
+                fresh = 0 <= time.monotonic_ns()-feedback.get('arm_ns', 0) <= feedback_max_age_ns
                 poses = [t[:3, 3].tolist()+Rotation.from_matrix(t[:3, :3]).as_quat().tolist()
                          for t in solver.palms(feedback['q'])] if fresh else None
                 adapter = SimpleNamespace(solver=solver, link=SimpleNamespace(feedback=lambda: state),

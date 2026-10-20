@@ -215,12 +215,12 @@ class ArmStreamExecutor:
     def _fresh(self):
         s = self._snapshot()
         q, dq = vector(s.get('q'),10,'feedback_q'), vector(s.get('dq'),10,'feedback_dq')
-        if type(s.get('arm_ns')) is not int or not 0 <= self.clock()-s['arm_ns'] <= 100_000_000:
+        if type(s.get('arm_ns')) is not int or not 0 <= self.clock()-s['arm_ns'] <= 200_000_000:
             raise ValueError('arm_feedback_stale')
         if s.get('error'): raise ValueError('arm_feedback_invalid')
         if s.get('external_control') is True: raise ValueError('external_control_owned')
         if self._snapshot_provider is None:
-            if not 0 <= self.clock()-self._fsm['arm_ns'] <= 100_000_000:
+            if not 0 <= self.clock()-self._fsm['arm_ns'] <= 200_000_000:
                 raise ValueError('motion_feedback_stale')
             safety = (self.profile or {}).get('safety', {})
             if self._fsm.get('fsm_id') not in safety.get('allowed_fsm_ids', [safety.get('fsm_id')]):

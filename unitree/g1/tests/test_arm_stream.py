@@ -125,7 +125,7 @@ def test_compensation_or_sdk_failure_is_not_zero_torque_or_success(tmp_path,fail
 def test_transient_feedback_loss_holds_then_fresh_frame_can_resume_without_restart(tmp_path):
     arm,s,ch,advance,_,_=rig(tmp_path)
     arm.accept_control(packet(arm));advance(10);arm.tick()
-    advance(101,fresh=False);arm.tick();assert arm.state=='hold' and len(ch.writes)==1
+    advance(201,fresh=False);arm.tick();assert arm.state=='hold' and len(ch.writes)==1
     advance(10);arm.tick();advance(10);arm.tick()
     assert arm.status()['continuation_ready']
     arm.accept_control(packet(arm,2));advance(10);arm.tick();assert arm.state=='active'
@@ -310,7 +310,7 @@ def test_prepare_requires_fresh_feedback_without_hardware_writes(tmp_path):
     assert arm.dispatch('prepare_operator_session', {}) == {'state': 'ready', 'prepared': True}
     assert not channel.writes and arm.session_id is None
     arm._prepared = False
-    advance(101, fresh=False)
+    advance(201, fresh=False)
     assert arm.dispatch('prepare_operator_session', {})['code'] == 'arm_feedback_stale'
     assert not arm._prepared and not channel.writes
 
@@ -431,7 +431,7 @@ def test_source_tick_wrap_and_duplicates_preserve_sample_age(tmp_path):
     advance(32)
     arm._on_state(low_state(16, .1))
     assert arm._snapshot()['arm_ns'] == first + 32_000_000
-    advance(101)
+    advance(201)
     arm._on_state(low_state(16, .2))
     arm._on_state(low_state(15, .3))
     assert arm._snapshot()['q'] == [.1]*10

@@ -114,7 +114,7 @@ class MotionControl:
         feedback = state['feedback']
         q = vector(feedback.get('q'), 10, 'q')
         vector(feedback.get('dq'), 10, 'dq')
-        if not 0 <= self.gate.clock()-feedback.get('arm_ns', 0) <= 100_000_000:
+        if not 0 <= self.gate.clock()-feedback.get('arm_ns', 0) <= 200_000_000:
             raise ValueError('arm_feedback_stale')
         return state, q
 

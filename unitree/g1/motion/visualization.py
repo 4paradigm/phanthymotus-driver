@@ -3,6 +3,8 @@ import math
 import time
 import numpy as np
 
+FEEDBACK_MAX_AGE_NS = 200_000_000
+
 
 def chains(solver, q):
     q = np.asarray(q, dtype=float)
@@ -27,7 +29,7 @@ def snapshot(adapter):
         feedback = state.get('feedback', {})
         now = time.monotonic_ns()
         age = (now-feedback.get('arm_ns',0))/1e6
-        fresh = 0 <= age <= getattr(adapter.link,'feedback_max_age_ns',100_000_000)/1e6
+        fresh = 0 <= age <= getattr(adapter.link,'feedback_max_age_ns',FEEDBACK_MAX_AGE_NS)/1e6
         preview = solver.visualization_sample
         intent_age = (now-preview['monotonic_ns'])/1e6 if preview else None
         alignment = {'state': 'unavailable', 'ready': False}

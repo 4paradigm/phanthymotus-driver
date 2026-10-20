@@ -355,7 +355,7 @@ def test_return_failure_never_sends_native_reset(tmp_path,failure):
     _,arm,sample,advance,sdk,_=reset_rig(tmp_path)
     sample['q']=[.1]*10
     start_return(arm)
-    if failure=='stale': advance(101,fresh=False); arm.tick()
+    if failure=='stale': advance(201,fresh=False); arm.tick()
     elif failure=='out_of_envelope': sample['q']=[.5]*10; arm.tick()
     else:
         if failure=='moving': sample['dq']=[.1]*10

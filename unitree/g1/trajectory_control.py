@@ -142,7 +142,7 @@ class TrajectoryControl:
                         self.arm.state == 'hold' and self.arm.reason != 'replay_pause'):
                     raise ValueError('replay_interrupted')
                 self.arm._fresh()
-                self.arm.replay_deadline_ns = now+100_000_000
+                self.arm.replay_deadline_ns = now+200_000_000
             remaining = (deadline-now)/1e9
             if remaining <= 0: return
             self.cancel.wait(min(.02, remaining))
@@ -151,7 +151,7 @@ class TrajectoryControl:
         now = self.control.clock()
         command = envelope(dict(boot_id=self.arm.boot_id, session_id=self.arm.session_id, secret=self.arm.secret),
             seq=seq, source_seq=frame['source_sequence'], mapping_epoch=frame['mapping_epoch'],
-            generated_ns=now, valid_until_ns=now+100_000_000, mode='joint_position', dof=10,
+            generated_ns=now, valid_until_ns=now+200_000_000, mode='joint_position', dof=10,
             values=frame['target_q'], **self.arm.versions)
         if self.cancel.is_set(): raise ValueError('replay_cancelled')
         self.arm.write_replay(command)

@@ -85,10 +85,10 @@ def test_corrupt_or_unsafe_file_rejected(tmp_path, change):
 def test_exact_replay_reference_bypasses_filter_but_not_execution_gate(tmp_path):
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     command = packet(arm, target=.02)
-    advance(50); arm.replay_deadline_ns = arm.clock()+100_000_000
+    advance(50); arm.replay_deadline_ns = arm.clock()+200_000_000
     arm.write_replay(command)
     assert channel.positions[-1][0] == [.02]*10
-    advance(101); arm.tick()
+    advance(201); arm.tick()
     assert arm.state == 'hold' and arm.reason == 'replay_watchdog'
     before = len(channel.positions)
     with pytest.raises(ValueError): arm.write_replay(command)
@@ -98,22 +98,22 @@ def test_exact_replay_reference_bypasses_filter_but_not_execution_gate(tmp_path)
 def test_replay_sends_saved_target_and_rejects_stale_feedback(tmp_path):
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     command = packet(arm, target=.1)
-    advance(10); arm.replay_deadline_ns = arm.clock()+200_000_000
+    advance(10); arm.replay_deadline_ns = arm.clock()+300_000_000
     arm.write_replay(command)
     assert channel.positions[-1][0] == pytest.approx([.1]*10)
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
-    arm.replay_deadline_ns = arm.clock()+200_000_000
+    arm.replay_deadline_ns = arm.clock()+300_000_000
     command = packet(arm, seq=2, target=.1)
-    advance(101, fresh=False)
+    advance(201, fresh=False)
     with pytest.raises(ValueError, match='feedback'): arm.write_replay(command)
     assert not channel.positions
 
 
-@pytest.mark.parametrize('delay_ms', [99, 100, 101, 120])
+@pytest.mark.parametrize('delay_ms', [150, 199, 200, 201])
 def test_replay_rejects_snapshot_that_expires_during_read(tmp_path, delay_ms):
     arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
     command = packet(arm, target=.1)
-    arm.replay_deadline_ns = arm.clock()+200_000_000
+    arm.replay_deadline_ns = arm.clock()+300_000_000
     delayed = False
     def snapshot():
         nonlocal delayed
@@ -123,12 +123,38 @@ def test_replay_rejects_snapshot_that_expires_during_read(tmp_path, delay_ms):
             advance(delay_ms, fresh=False)
         return value
     arm._snapshot_provider = snapshot
-    if delay_ms <= 100:
+    if delay_ms <= 200:
         arm.write_replay(command)
         assert channel.positions[-1][0] == pytest.approx([.1]*10)
     else:
         with pytest.raises(ValueError, match='arm_feedback_stale'):
             arm.write_replay(command)
+        assert not channel.positions
+
+
+
+@pytest.mark.parametrize('delay_ms', [150, 199, 200, 201])
+@pytest.mark.parametrize('guard', ['watchdog', 'command'])
+def test_replay_200ms_deadlines_use_real_producer_and_execution_gate(tmp_path, delay_ms, guard):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    trajectory = TrajectoryControl(SimpleNamespace(cfg={}, motion=None, executor=arm, clock=arm.clock))
+    trajectory._wait_until(arm.clock())
+    frame = {'target_q': [.01]*10, 'source_sequence': 1, 'mapping_epoch': 1}
+    if guard == 'watchdog':
+        advance(delay_ms)
+    else:
+        write = arm.write_replay
+        def delayed(command):
+            advance(delay_ms)
+            trajectory._wait_until(arm.clock())  # Keep the watchdog fresh to isolate command expiry.
+            write(command)
+        arm.write_replay = delayed
+    if delay_ms < 200:
+        trajectory._send_frame(frame, 1)
+        assert channel.positions[-1][0] == [.01]*10
+    else:
+        with pytest.raises(ValueError, match='replay_watchdog' if guard == 'watchdog' else 'expir|timeout'):
+            trajectory._send_frame(frame, 1)
         assert not channel.positions
 
 
@@ -312,7 +338,7 @@ def test_execution_failure_keeps_recording_valid_prefix(tmp_path, failure):
         advance(50); arm.accept_control(packet(arm, 2, target=.04)); arm.tick()
         assert arm.state == 'fault'
     else:
-        advance(101, fresh=False); arm.tick()
+        advance(201, fresh=False); arm.tick()
         assert arm.state == 'hold'
     for _ in range(3): advance(10, fresh=False); arm.tick()
     assert recorder.status()['recording'] and recorder.error is None
@@ -561,7 +587,7 @@ def test_live_and_replay_use_same_execution_failure_handling(tmp_path, replay, f
     arm.install_motion_envelope(proof)
     arm.accept_control(command)
     if replay:
-        arm.replay_deadline_ns = arm.clock()+100_000_000
+        arm.replay_deadline_ns = arm.clock()+200_000_000
     advance(2)
     arm.tick()
     if replay and failure == 'envelope':

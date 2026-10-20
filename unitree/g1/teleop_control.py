@@ -286,7 +286,7 @@ class TeleopControl:
                     raise ValueError('baseline_confirmation_released')
                 self.executor._fresh()
                 snap = copy.deepcopy(self.motion._snapshot)
-                if not snap or not 0 <= self.clock()-snap['monotonic_ns'] <= 100_000_000:
+                if not snap or not 0 <= self.clock()-snap['monotonic_ns'] <= 200_000_000:
                     raise ValueError('arm_feedback_stale')
                 self.mapping.set_controller_offsets(self.motion.solver.profile.get('controller_to_palm', {}))
                 self.mapping.calibrate(frame, snap['poses'])
@@ -517,7 +517,7 @@ class TeleopControl:
             valid = (not self._closed.is_set() and not self._needs_calibration
                 and not self._input_changed
                 and visual.get('mapping_epoch') == self.mapping.epoch
-                and 0 <= now-visual.get('sampled_ns', 0) <= 100_000_000
+                and 0 <= now-visual.get('sampled_ns', 0) <= 200_000_000
                 and now < visual.get('valid_until_ns', 0))
         except ValueError:
             valid = False
