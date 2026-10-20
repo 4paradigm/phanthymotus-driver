@@ -141,6 +141,33 @@ def test_standing_calibration_accepts_irregular_pose_intervals():
     assert sequence.counter.snapshot()["count_total"] == 1
 
 
+def test_ready_event_follows_stable_calibration_once_per_baseline():
+    sequence = Sequence()
+    sequence.hold(0, 20)
+    assert not [event for event in sequence.events
+                if event["type"] == "ready_to_squat"]
+
+    sequence.hold(0, 7)
+    ready = [event for event in sequence.events
+             if event["type"] == "ready_to_squat"]
+    assert len(ready) == 1
+    assert ready[0]["state"] == "top"
+    assert ready[0]["calibrated"] is True
+    assert ready[0]["count_total"] == 0
+    assert ready[0]["session_id"] == sequence.counter.snapshot()["session_id"]
+
+    sequence.hold(0, 20)
+    assert len([event for event in sequence.events
+                if event["type"] == "ready_to_squat"]) == 1
+
+    sequence.counter.reset()
+    sequence.hold(0, 27)
+    ready = [event for event in sequence.events
+             if event["type"] == "ready_to_squat"]
+    assert len(ready) == 2
+    assert ready[1]["session_id"] != ready[0]["session_id"]
+
+
 def test_a_rep_is_not_announced_at_the_bottom_or_during_ascent():
     sequence = Sequence()
     sequence.hold(0, 27)
@@ -222,6 +249,9 @@ def test_sustained_target_switch_starts_a_new_session_without_mixing_counts():
     changes = [event for event in sequence.events if event["type"] == "target_changed"]
     assert len(changes) == 1
     assert changes[0]["previous_session_id"] == previous_session
+    ready_sessions = [event["session_id"] for event in sequence.events
+                      if event["type"] == "ready_to_squat"]
+    assert ready_sessions == [previous_session, status["session_id"]]
 
     sequence.rep(track_id=2, anchor_x=730, scale=0.9)
     assert sequence.counter.snapshot()["count_total"] == 1
@@ -507,6 +537,11 @@ def test_plugin_consumes_skeleton_and_publishes_priority_absolute_count(plugin_f
     _plugin_standing(subscription, clock)
     _plugin_rep(subscription, clock)
 
+    (ready,) = [event for event in node.publishers[event_topic].payloads
+                if event["type"] == "ready_to_squat"]
+    assert ready["priority"] == 1
+    assert ready["calibrated"] is True
+    assert ready["session_id"] == card.dispatch("status", {})["session_id"]
     (rep,) = _published_reps(node, event_topic)
     assert rep["priority"] == 1
     assert rep["source"] == "squat_counter"

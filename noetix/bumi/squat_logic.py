@@ -350,7 +350,7 @@ class SquatCounter:
             best = self._best_readable(candidates)
             if best is not None:
                 events.append(self._begin_session(best, timestamp, changed=False))
-                self._advance_person(best, timestamp)
+                self._advance_person(best, timestamp, events)
             return events
 
         matched = self._match_target(candidates, timestamp)
@@ -565,7 +565,7 @@ class SquatCounter:
                        max(1.0, math.dist(hip[:2], ankle[:2])))
 
     def _advance_person(self, candidate: _Candidate, timestamp: float,
-                        events: list[dict] | None = None) -> None:
+                        events: list[dict]) -> None:
         self._last_seen_time = timestamp
         self._target_box = candidate.bbox
         self._debug_selected_candidate = _candidate_summary(candidate)
@@ -600,11 +600,12 @@ class SquatCounter:
                            for field in _Sample.__dataclass_fields__))
         self._debug_sample = smooth
         if self._baseline is None:
-            self._calibrate(smooth, timestamp)
+            self._calibrate(smooth, timestamp, events)
             return
         self._step(smooth, timestamp, events)
 
-    def _calibrate(self, sample: _Sample, timestamp: float) -> None:
+    def _calibrate(self, sample: _Sample, timestamp: float,
+                   events: list[dict]) -> None:
         self._state = "calibrating"
         if (sample.knee < self.config["baseline_knee_min_deg"]
                 or sample.hip < self.config["baseline_hip_min_deg"]
@@ -648,6 +649,7 @@ class SquatCounter:
         self._needs_rearm = False
         self._state = "top"
         self._debug_reason = "baseline_ready"
+        events.append(self._emit("ready_to_squat", timestamp, calibrated=True))
 
     def _cancel_partial(self, *, require_stand: bool = False) -> None:
         self._motion_started = None

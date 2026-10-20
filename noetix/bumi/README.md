@@ -285,7 +285,7 @@ The card publishes:
 
 | Topic | Use |
 | --- | --- |
-| `/<namespace>/fitness/squat/events` | Sparse `session_started`, `rep_completed`, `target_lost`, `target_reacquired`, and `target_changed` events for `decision_core`. |
+| `/<namespace>/fitness/squat/events` | Sparse `session_started`, `ready_to_squat`, `rep_completed`, `target_lost`, `target_reacquired`, and `target_changed` events for `decision_core`. |
 | `/<namespace>/fitness/squat/status` | Current state and count for the dashboard; **do not** connect its frequent updates to `decision_core`. |
 | `/<namespace>/fitness/squat/debug` | 中文目标选择、膝髋角度、基线与变化量、阈值判定和计数原因；仅供 Dashboard 查看。 |
 
@@ -304,7 +304,11 @@ least 0.10 standing leg lengths, followed by a stable return to standing.
 These are relative 2D image measurements, not joint angles measured by a
 depth sensor. Adjust the keys in `squat_logic.DEFAULT_CONFIG` under
 `plugins.squat_counter` in `config.yaml` after checking Bumi footage. The
-wrapper publishes dashboard status and debug data every 0.5 s and coalesces
+card emits one `ready_to_squat` event when a standing baseline becomes valid.
+The skill checks the latest `status` before telling the user “已站稳，可以开始深蹲了”
+and skips the cue if the event is already stale. After `reset` or a target
+change, wait for the next ready event before squatting.
+The wrapper publishes dashboard status and debug data every 0.5 s and coalesces
 quick rep events within 3 s (`status_interval_s`, `debug_interval_s`,
 `min_rep_event_interval_s`). The debug action and topic use Chinese JSON keys
 and Chinese state, check, and reason text; status and event keys remain stable.
@@ -335,6 +339,17 @@ install the draft, and mark it active. Then let `decision_core` call
 `speak` and connect its PCM output to Bumi `speaker`. The driver has no local
 skill loader. The model can call `status` and `reset`; the canvas owns `start`
 and `stop`.
+
+For voice commands, connect Bumi `mic` to perception `asr`, then connect ASR's
+normal recognition output to `decision_core`. With ASR's `asr_kws` mode, say the
+configured wake word before commands such as “重新计数” or “现在做了几次”. The skill
+maps those commands to `squat_counter.reset` and `status`, then calls TTS
+`speak` for a spoken confirmation. Do not use ASR's background-speech output
+for control. The current skill supports voice reset and count queries.
+Pause/resume that preserves the count, or a configured target repetition count,
+needs additional card state and actions. If only explicit count announcements
+are wanted, turn off `decision_core`'s `auto_narration`; it controls separate
+framework progress speech and does not disable explicit TTS `speak` calls.
 
 ### `motion_state`
 
