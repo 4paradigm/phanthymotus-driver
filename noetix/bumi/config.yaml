@@ -30,3 +30,7 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  squat_counter:
+    enabled: true
+    # Dashboard-only diagnostics, capped at 2 Hz; never connect to decision_core.
+    debug_interval_s: 0.5

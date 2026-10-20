@@ -1,6 +1,6 @@
 # Noetix Bumi driver
 
-The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio and camera cards, a motion-state card, and a pose-driven squat counter. Hardware card implementations are in `device.py`; the squat counter is in `squat_counter.py` and `squat_logic.py`.
 
 ## App 图传与 Phanthy Camera Card
 
@@ -77,6 +77,74 @@ image to install the new FFmpeg dependency. All runtime implementation remains
 in `device.py`; no extra runtime Python file is required.
 
 ## New cards
+
+### `squat_counter`
+
+Fixed-camera squat counting from the **full** `pose` skeleton stream. Connect
+`/<namespace>/camera/color` to the perception `pose` card, then connect its
+`/<namespace>/camera/color/poses/skeleton` output (`sensor/pose2d`) to
+`squat_counter`. On the canvas this is pose output port **1**; port 0 is the
+lean `/poses` output and lacks the joints needed for counting.
+Keep the user fully visible, with shoulder, hip, knee and ankle in frame through
+the whole movement; start with a roughly 45-degree oblique view and calibrate
+against footage from Bumi's final position.
+
+Start the counter with the skeleton `input_topic`. `status` returns its latest
+session and authoritative `count_total`; `debug` returns the latest measurements
+and checks; `reset` starts a fresh count; `stop` ends the current subscription.
+The card publishes:
+
+| Topic | Use |
+| --- | --- |
+| `/<namespace>/fitness/squat/events` | Sparse `session_started`, `rep_completed`, `target_lost`, `target_reacquired`, and `target_changed` events for `decision_core`. |
+| `/<namespace>/fitness/squat/status` | Current state and count for the dashboard; **do not** connect its frequent updates to `decision_core`. |
+| `/<namespace>/fitness/squat/debug` | Latest target choice, smoothed knee/hip angles, baseline and deltas, threshold checks, and rejection reason; dashboard only. |
+
+The counter locks onto the person with the clearest usable full-body skeleton
+and ignores other people. It keeps that target through brief occlusions. A
+confirmed target change abandons an unfinished repetition and starts a new
+session, so counts from different people are not silently combined. A
+repetition is recorded only after a qualified descent and a stable return to
+standing. The geometric and timing thresholds are **provisional**; validate
+them with complete squats, partial squats, bends, occlusions, and crossings
+recorded from the intended camera position.
+
+The default calibration needs 2 s of stable standing. A rep then needs knee
+flexion of at least 40°, hip flexion of at least 25°, and hip descent of at
+least 0.10 standing leg lengths, followed by a stable return to standing.
+These are relative 2D image measurements, not joint angles measured by a
+depth sensor. Adjust the keys in `squat_logic.DEFAULT_CONFIG` under
+`plugins.squat_counter` in `config.yaml` after checking Bumi footage. The
+wrapper publishes dashboard status and debug data every 0.5 s and coalesces
+quick rep events within 3 s (`status_interval_s`, `debug_interval_s`,
+`min_rep_event_interval_s`). The debug stream contains no raw skeleton; when
+pose input stops, inspect `input_stale`, `last_frame_age_s`,
+`frames_received`, `frames_parsed`, and `last_error`. For missed reps, compare
+`measurements.knee_drop_deg`, `measurements.hip_descent_ratio`,
+`checks.bottom`, `timing.bottom_dwell_elapsed_s`, and `reason`; inspect
+`frame_gap_exceeded` for pose stalls.
+In dashboard **Monitor** mode, open `/fitness/squat/debug` in Latest or Log
+view. The card's `debug` action returns the same snapshot on demand.
+
+Connect `squat_counter` output port **0** (events) to `decision_core`, and bind
+its `status` action for readback. Leave output ports **1** (status) and **2**
+(debug) off the model's input. Each event includes a top-level `priority: 1`,
+`session_id`, `seq`, `count_total`, and `event_time`. Treat the card's total as
+the source of truth: a model turn and TTS playback can outlast several squats.
+Before speaking, read `status` and announce only the latest total for the
+current session; discard stale event numbers. This path gives best-effort
+progress narration, not a guarantee that every number is spoken immediately.
+On `target_changed`, `previous_count_total` preserves the prior session's
+final total. `status.input_stale` flags a pose stream that has stopped sending
+frames; it does not infer that a missing frame contains a person.
+To install the instruction in `fitness_squat_skill.md`, create a skill under
+Resource Center → My Skills with slug `bumi-squat-coach`, category `utility`,
+and required tools `squat_counter, tts`; paste the file's instruction body,
+install the draft, and mark it active. Then let `decision_core` call
+`activate_skill("bumi-squat-coach")` when the user chooses squat. Bind TTS
+`speak` and connect its PCM output to Bumi `speaker`. The driver has no local
+skill loader. The model can call `status` and `reset`; the canvas owns `start`
+and `stop`.
 
 ### `motion_state`
 
