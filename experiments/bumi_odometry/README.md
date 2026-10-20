@@ -1,8 +1,10 @@
-# Bumi RGB-D / IMU 里程计实验
+# Bumi RGB-D / IMU 里程计实验（独立历史实验）
 
-本目录保留独立采集/回放/评估工具，本身不发送运动命令。正常部署审核镜像时，生产驱动已默认管理共享相机与融合，无需运行本目录的实验 launcher；它输出卡片使用的 `/bumi_odom/filtered` 和 `/bumi_odom/status`，继承生产 domain 42。请勿同时启动独立相机或在同一域重复发布融合输出。生产入口见 [Bumi README](../../noetix/bumi/README.md#loco_destination)。本实验默认独立域185，仅在协调相机占用后用于离线验证。
+**本目录完全独立，不是当前生产驱动的运行说明。** 当前生产镜像只启动直接 `pyrealsense2` 相机采集，不运行视觉融合，不安装 ROS 相机/RTAB-Map/EKF 依赖，也不由融合进程产生 `/bumi_odom/filtered`、`/bumi_odom/status`。`loco_destination` 的距离实验读取机身 IMU，不订阅这些融合输出；入口见 [Bumi README](../../noetix/bumi/README.md#loco_destination)。
 
-2026-10-19 按用户要求随原有 loco_destination PR #408 提交，实验运行仍保持独立。自行操作请先读 [真机测量与验证步骤](HARDWARE_TEST.md)。
+本目录工具保留用于独立采集/回放/评估，本身不发送运动命令。实验使用独立 DDS 域185；只有手动启动实验并有有效输入时，才会在该域产生上述融合输出。生产的 JPEG/Z16 压缩话题不等于本实验需要的原始图像、CameraInfo 和 IMU 输入，不会自动接入本实验。DDS 域隔离不解决 USB 相机占用：打开实验相机前必须协调并释放生产采集，不能同时运行两个采集者。
+
+本目录原始 launcher 使用**相机 IMU**拓扑，缺少相机 gyro/accel 时不能进入正常融合；不会自动改用生产机身 IMU。此前托管版本的机身 IMU 融合源码另存于 [managed](managed/README.md)，同样不进入生产镜像。各版本均没有完成此处所述的真机精度验收。自行操作先读 [真机测量与验证步骤](HARDWARE_TEST.md)。
 
 ## 本地距离评估
 
@@ -50,7 +52,16 @@ python3 experiments/bumi_odometry/preflight.py > /path/to/preflight.json
 
 ## 融合进程
 
-需要 Humble 的 realsense2_camera、rtabmap_odom、robot_localization、tf2_ros、rclpy、rtabmap_msgs。配置集中在 `configuration.py`，避免 YAML 与启动参数重复维护。当前尚无已实际运行验证的版本锁文件。
+仅在**已安装 ROS 2 Humble、已配置其 apt 软件源的独立 Ubuntu 22.04 实验环境**中准备依赖，不在生产驱动容器中执行：
+
+```sh
+sudo apt-get update
+sudo apt-get install --no-install-recommends \
+  ros-humble-realsense2-camera ros-humble-rtabmap-odom \
+  ros-humble-robot-localization ros-humble-tf2-ros
+```
+
+这些包提供实验使用的相机节点、RTAB-Map/EKF、rclpy 和 rtabmap_msgs 等依赖。安装不是运行验证；当前尚无已实际运行验证的版本锁文件。配置集中在 `configuration.py`。
 
 所有实验终端使用同一独立 DDS 域，先确认该域没有其他任务占用：
 
