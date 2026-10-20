@@ -1709,8 +1709,8 @@ class DepthCameraPlugin:
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
     def get_tool(self):
-        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 头部深度图（Z16）",
-                "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 头部深度图（zlib 压缩 16UC1）",
+                "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}]}
     def start(self):
         from sensor_msgs.msg import Image
         import cv2
@@ -1723,7 +1723,8 @@ class DepthCameraPlugin:
                                  history=HistoryPolicy.KEEP_LAST, depth=1,
                                  durability=DurabilityPolicy.VOLATILE)
         self._running = True
-        self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
+        from sensor_msgs.msg import CompressedImage as _CI
+        self._pub = self._pub_node.create_publisher(_CI, self._topic, latest_qos)
         self._subscription = self._sub_node.create_subscription(
             Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
         self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
@@ -1749,11 +1750,16 @@ class DepthCameraPlugin:
         dashboard = self._to_dashboard_depth(msg)
         if dashboard is None:
             return
-        from sensor_msgs.msg import Image
-        out = Image()
+        # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
+        import zlib as _zlib
+        from sensor_msgs.msg import CompressedImage
+        out = CompressedImage()
         out.header = msg.header
-        out.height, out.width, out.encoding = 480, 640, "16UC1"
-        out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
+        out.format = "16UC1; compressedDepth zlib"
+        # `_to_dashboard_depth` has already produced exactly 640x480 uint16 mm,
+        # which is what the format fixes; it also rejects big-endian input, so
+        # nothing here relied on z16's is_bigendian field.
+        out.data = _zlib.compress(dashboard.astype("<u2", copy=False).tobytes(), 1)
         self._pub.publish(out)
         self._last_published_at = time.monotonic()
         self._forwarded_frames += 1
@@ -1781,7 +1787,7 @@ class DepthCameraPlugin:
             depth = depth[top:top + crop_height, :]
         return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
     def dispatch(self, action, args):
-        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}]}
 
 
 class PointCloudPlugin:

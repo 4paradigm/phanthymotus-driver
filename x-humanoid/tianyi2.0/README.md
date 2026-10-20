@@ -4,6 +4,32 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## Hardware depth for visual navigation
+
+`camera_depth` forwards the newest Orbbec frame from
+`/ob_camera_head/depth/image_raw` on domain 0 to
+`/{namespace}/camera/head/depth` on domain 42. Following upstream driver
+PR #419, its output is `image/depth-zlib` on `sensor_msgs/CompressedImage`,
+with `format = "16UC1; compressedDepth zlib"`. The payload is a plain zlib
+stream containing exactly 640x480 little-endian uint16 millimetres; zero
+remains invalid depth. Compression preserves the original depth values and
+source header. This replaces the previous raw `image/depth-z16` output and
+requires a consumer/bridge that supports `image/depth-zlib`.
+
+On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
+`navi`'s depth input, `loco_state` to its odometry input, and `navi` to
+`loco_servo`. Disconnect the `visual_depth` depth input when selecting hardware
+depth. After redeploying, refresh the card's port metadata and reconnect the
+depth wire so it declares `image/depth-zlib`.
+
+This conversion does not register raw depth to RGB or change the existing
+centre-crop/nearest-neighbour resize to 640x480. RGB/depth correspondence,
+camera intrinsics, and the vendor's millimetre scale still require hardware
+verification. Keep the servo paused while checking reported target distance
+against lens-to-target tape measurements at 1, 1.5, and 2 metres, both centrally
+and off-centre, before testing approach/stop behaviour. The software tests
+verify the wire payload, not distance accuracy or navigation safety on hardware.
+
 ## Locomotion state card
 
 `loco_state` starts with the driver and publishes JSON on
