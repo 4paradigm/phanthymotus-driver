@@ -516,13 +516,24 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   their original contracts and do not start claiming measured translation.
   See [IMU experiment testing](IMU_DISTANCE_TEST.md) for independent physical
   measurement and result interpretation.
-- `camera.fusion_enabled` now defaults to false. Shared RealSense capture,
-  JPEG/depth topics and frame cache remain available for camera, depth,
-  perception, photos and videos. The image keeps the camera ROS dependency
-  but no longer installs RTAB-Map or robot_localization for distance moves.
-  The legacy RGB-D fusion source and offline experiment remain for comparison;
-  enabling that old pipeline requires its separate dependencies. It is not
-  used by this version of the distance card.
+- Camera capture is restored to a single direct `pyrealsense2` worker:
+  color BGR8 and depth Z16 at 640×480/30 Hz, depth aligned to the RGB grid,
+  JPEG quality 80 and zlib-compressed Z16 on the existing topics. Runtime
+  color/aligned-depth intrinsics and the photo/video frame cache are retained.
+  The supervisor still reaps a failed capture process group before restart
+  and refuses a duplicate USB owner. Microphone, sound-direction, speaker,
+  state and movement interfaces are unchanged.
+- The production image no longer adds ROS RealSense, RTAB-Map, EKF or their
+  ROS apt source/key. Apt/pip install commands match the pre-fusion image;
+  existing camera Python SDK, audio libraries and SDK build dependencies
+  remain. The fusion-only `/run/udev` mount is removed. This removes the
+  extra fusion installation step, but build duration still needs verification.
+- Legacy visual fusion/controller sources are archived under
+  [experiments/bumi_odometry/managed](../../experiments/bumi_odometry/managed/)
+  and are not copied into the image. The old `camera.fusion_enabled` key
+  is no longer used, including when present in an older custom config.
+  Running the archived experiment requires its own dependencies and an
+  explicitly coordinated camera window; it is independent of this card.
 
 ## `speaker`
 

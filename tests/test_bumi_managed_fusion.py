@@ -1,19 +1,14 @@
 """Deployment/runtime contracts exercised without USB or a production ROS graph."""
-import importlib.util
 import math
 import os
-from pathlib import Path
 import signal
-import sys
 from types import SimpleNamespace as NS
 import zlib
 
 import pytest
 
-BUMI = Path(__file__).resolve().parents[1] / 'noetix' / 'bumi'
-sys.path.insert(0, str(BUMI))
-from camera_runtime import CameraRuntime, packed_image, compressed_depth, camera_arguments
-from fusion_runtime import FusionHealth, GravityWindow, fusion_parameters, check_dependencies
+from experiments.bumi_odometry.managed.camera_runtime import CameraRuntime, packed_image, compressed_depth, camera_arguments
+from experiments.bumi_odometry.managed.fusion_runtime import FusionHealth, GravityWindow, fusion_parameters, check_dependencies
 
 
 def image(encoding='16UC1', endian=False):
@@ -62,7 +57,7 @@ class Process:
 
 
 def test_fusion_crash_restarts_only_fusion_and_inherits_domain(monkeypatch):
-    import camera_runtime as module
+    from experiments.bumi_odometry.managed import camera_runtime as module
     opened, signals = [], []
     def popen(args, **kwargs):
         proc = Process(len(opened)+100)
@@ -94,7 +89,7 @@ def test_fusion_crash_restarts_only_fusion_and_inherits_domain(monkeypatch):
 
 
 def test_dead_launch_leader_still_has_its_children_reaped(monkeypatch):
-    import camera_runtime as module
+    from experiments.bumi_odometry.managed import camera_runtime as module
     signals = []
     proc = Process(1234)
     proc.code = 1
@@ -110,7 +105,7 @@ def test_unreapable_group_does_not_kill_camera_supervision(monkeypatch):
     # 线程未兜住直接死——安全互斥正常（无双采集）但相机从此无人重启。监督
     # 必须在单个进程组回收失败时存活：报错走 on_line，下个 tick 重试该名字，
     # 其余名字照常处理。
-    import camera_runtime as module
+    from experiments.bumi_odometry.managed import camera_runtime as module
     opened, lines = [], []
     def popen(args, **kwargs):
         proc = Process(len(opened) + 100)
@@ -219,39 +214,3 @@ def test_missing_required_dependency_is_a_build_error(tmp_path):
         raise LookupError(package)
     with pytest.raises(RuntimeError, match='realsense2_camera'):
         check_dependencies(prefix_lookup=missing)
-
-
-@pytest.mark.parametrize('fusion_enabled', [False, True])
-def test_camera_card_starts_shared_runtime_and_keeps_frame_cache(monkeypatch, fusion_enabled):
-    spec = importlib.util.spec_from_file_location('bumi_camera_device_stubs',
-                                                BUMI/'tests/test_loco_destination.py')
-    fixture = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, fixture)
-    spec.loader.exec_module(fixture)
-    device, _ = fixture._load_device(monkeypatch)
-    import camera_runtime
-    instances = []
-    class Runtime:
-        def __init__(self, namespace, callback, enabled):
-            self.namespace, self.callback, self.enabled = namespace, callback, enabled
-            self.running = False
-            instances.append(self)
-        def start(self): self.running = True
-        def stop(self): self.running = False
-        def is_running(self): return self.running
-    monkeypatch.setattr(camera_runtime, 'CameraRuntime', Runtime)
-    nodes = []
-    config = {'fusion_enabled': True} if fusion_enabled else {}
-    camera = device.CameraPlugin(config, 'robot', NS(add_node=nodes.append))
-    cache = camera._frame_node
-    camera.start()
-    camera.start()
-    assert len(instances) == 1
-    assert instances[0].enabled is fusion_enabled
-    assert instances[0].namespace == 'robot'
-    assert camera.is_running()
-    assert camera._frame_node is cache
-    assert [t['topic_out'][0]['topic'] for t in camera.get_tools()] == [
-        '/robot/camera/color', '/robot/camera/depth']
-    camera.stop()
-    assert not camera.is_running()

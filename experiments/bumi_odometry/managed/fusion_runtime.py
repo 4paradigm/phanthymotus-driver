@@ -12,7 +12,7 @@ import sys
 import tempfile
 import uuid
 
-from camera_runtime import CAMERA
+CAMERA = '/bumi_odom/bumi_odom_camera'
 
 # SDK body IMU bridged by the driver (device.py _BODY_IMU_TOPIC). The host
 # kernel lacks CONFIG_HID_SENSOR_HUB, so librealsense cannot see the camera

@@ -44,9 +44,8 @@ plugins:
     enabled: true
   camera:
     enabled: true
-    # Distance movement now uses the SDK body IMU experiment. Camera/depth
-    # capture remains shared; the legacy RGB-D fusion is not started.
-    fusion_enabled: false
+    # A single pyrealsense2 capture supplies camera/depth and photo/video.
+    # Distance movement reads the SDK body IMU independently.
     # Bumi supports either official App video transfer or Phanthy's direct
     # camera/depth Cards. To use these Cards, the Bumi deployment enters the
     # host mount namespace and runs:

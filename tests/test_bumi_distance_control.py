@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'noetix' / 'bumi'))
-from distance_control import DistanceFeedback, run_distance
+from experiments.bumi_odometry.managed.distance_control import DistanceFeedback, run_distance
 
 
 def pose(stamp=1_000_000_000, x=0, y=0, yaw=0):
@@ -145,7 +145,7 @@ class Plant:
 
 @pytest.mark.parametrize('heading', [0, math.pi/2, -math.pi+0.01])
 def test_distance_projects_onto_start_heading_and_settles(monkeypatch, heading):
-    import distance_control as module
+    from experiments.bumi_odometry.managed import distance_control as module
     plant = Plant(monkeypatch, module, heading=heading)
     result = run_distance(plant, 1.0)
     assert result['state'] == 'done'
@@ -157,7 +157,7 @@ def test_distance_projects_onto_start_heading_and_settles(monkeypatch, heading):
 
 @pytest.mark.parametrize('failure', ['lost', 'segment', 'frozen', 'stuck', 'mode', 'cancel', 'jump', 'lateral', 'heading'])
 def test_distance_faults_brake_and_never_complete(monkeypatch, failure):
-    import distance_control as module
+    from experiments.bumi_odometry.managed import distance_control as module
     plant = Plant(monkeypatch, module, speed=0 if failure == 'stuck' else 0.3)
     original = plant.advance
 
@@ -188,7 +188,7 @@ def test_distance_faults_brake_and_never_complete(monkeypatch, failure):
 
 
 def test_overshoot_is_reported_after_braking(monkeypatch):
-    import distance_control as module
+    from experiments.bumi_odometry.managed import distance_control as module
     plant = Plant(monkeypatch, module)
     original = plant.advance
     def advance(duration):
@@ -203,7 +203,7 @@ def test_overshoot_is_reported_after_braking(monkeypatch):
 
 def test_distance_timeout_brakes_and_reports(monkeypatch):
     # 规格"范围与验证"点名超时：唯一兜底，必须刹停并报错而非挂死或误报完成。
-    import distance_control as module
+    from experiments.bumi_odometry.managed import distance_control as module
     plant = Plant(monkeypatch, module, speed=0)
     monkeypatch.setattr(module, 'distance_timeout', lambda d: 0.05)
     result = run_distance(plant, 1)
@@ -214,7 +214,7 @@ def test_distance_timeout_brakes_and_reports(monkeypatch):
 
 def test_distance_timestamp_going_backwards_brakes(monkeypatch):
     # 规格"时间倒退"：源时间回拨（dt<0）必须刹停报错，不得当作正常样本继续。
-    import distance_control as module
+    from experiments.bumi_odometry.managed import distance_control as module
     plant = Plant(monkeypatch, module)
     sample = plant.sample
 

@@ -8,10 +8,6 @@ noetix-bumi:
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
-    # Host udev metadata for device enumeration; fusion uses the SDK body
-    # IMU (host kernels lack CONFIG_HID_SENSOR_HUB, so the camera IMU is
-    # invisible to librealsense on this fleet).
-    - /run/udev:/run/udev:ro
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
     - ROS_DOMAIN_ID=42

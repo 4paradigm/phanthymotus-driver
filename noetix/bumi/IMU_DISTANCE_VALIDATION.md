@@ -1,8 +1,19 @@
 # 纯 IMU 距离实验验证记录
 
-日期：2026-10-20。基线提交：5d6352ce；本次为 PR #408 的纯 IMU 实验改动。
+日期：2026-10-20。本次相机恢复以 0e90880a 为基线，仍提交到 PR #408。
 
-## 本地验证
+## 本次相机恢复与依赖撤回
+
+- Bumi/历史实验/打包回归：**441 passed in 59.76s**。命令为下方初版命令再加入 `tests/test_bumi_camera_capture.py`。
+- 公共生命周期、控制输入和子进程日志回归：**96 passed in 0.13s**，运行 `tests/test_common_lifecycle.py tests/test_control_sink.py tests/test_go2_logsafe_children.py`。
+- 直接采集新增 8 项测试：原彩色/深度流规格、深度对齐、JPEG/Z16 格式与时间戳、内参、相机失败及 SIGTERM 清理、单采集者启停/恢复，以及真实拍照消费者复用缓存。边界以 SDK/ROS/编码器替身验证，未连接相机。
+- 独立复核与融合改造前 cf8155cf^ 的采集实现对照，未发现明确的重要回归；Python 编译及差异检查通过。
+- 当前 Dockerfile 的全部 apt/pip 安装指令与 cf8155cf^ **完全一致**，仅保留原有依赖。融合新增的 ROS 相机/RTAB-Map/EKF/显式 tf2 安装步骤、ROS apt 源/签名密钥及独立 udev 挂载均已撤回。
+- 历史 ROS 采集/融合/距离反馈源码移入 `experiments/bumi_odometry/managed`，不在生产 COPY 清单中；旧 fusion_enabled 配置不能再启动融合。
+- 本次完整 pytest 再次运行，仍为 **45 个收集错误、3 skipped**；错误路径见文末。
+- 无 Docker/ROS 本地运行环境，远端 SSH 认证前断开；尚未执行 ARM64 镜像构建、相机实机回归或运动测试。不能宣称实际构建耗时或最终镜像包数量已经验证。
+
+## 初版纯 IMU 本地验证（历史，基线 5d6352ce）
 
 - 下述 Bumi 相关回归：**435 passed in 63.80s**，包括转角、距离、底盘互斥、相机、麦克风、声源方向、原视觉实验及打包路径检查。
 - 新 IMU 模块：26 项测试，覆盖已知加速度轨迹、重力姿态补偿、匀速不清零、采样抖动、无效数据、取消、故障与制动。

@@ -2314,7 +2314,6 @@ class CameraPlugin:
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._runtime = None
-        self._fusion_enabled = bool(plugin_config.get("fusion_enabled", False))
         self._frame_node = _CameraFrameNode(self._color_topic)
         executor.add_node(self._frame_node)
         # What the RealSense reported about itself, keyed by stream name. Filled
@@ -2376,7 +2375,7 @@ class CameraPlugin:
                 with self._intrinsics_lock:
                     self._intrinsics = payload
         if self._runtime is None:
-            self._runtime = CameraRuntime(self._namespace, on_line, self._fusion_enabled)
+            self._runtime = CameraRuntime(self._namespace, on_line)
         self._runtime.start()
 
     def stop(self) -> None:

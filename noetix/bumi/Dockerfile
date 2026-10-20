@@ -7,7 +7,6 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG UBUNTU_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
-ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
 RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
@@ -35,17 +34,6 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         libssl-dev \
         libeigen3-dev \
         libboost-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-# Preserve the shared camera/depth capture. The pure-IMU distance experiment
-# needs no RTAB-Map or robot_localization (and their large development closure).
-RUN curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-        -o /usr/share/keyrings/ros2-runtime.gpg && \
-    printf 'deb [arch=%s signed-by=/usr/share/keyrings/ros2-runtime.gpg] %s jammy main\n' \
-        "$(dpkg --print-architecture)" "${ROS_APT_MIRROR}" > /etc/apt/sources.list.d/ros2-runtime.list && \
-    apt-get update && apt-get install -y --no-install-recommends \
-        ros-humble-realsense2-camera && \
-    dpkg-query -W 'ros-humble-realsense2*' > /work/camera-package-versions.txt && \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
@@ -95,9 +83,8 @@ COPY main.py   /work/main.py
 COPY device.py /work/device.py
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
-COPY distance_control.py /work/distance_control.py
 COPY imu_distance_control.py /work/imu_distance_control.py
-COPY camera_runtime.py fusion_runtime.py /work/
+COPY camera_runtime.py /work/camera_runtime.py
 COPY camera_specs.py /work/camera_specs.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
@@ -105,9 +92,9 @@ COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
-# Resolve the unchanged camera launch description without opening USB or
-# starting nodes. The inertial distance module has only stdlib dependencies.
-RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && ros2 launch realsense2_camera rs_launch.py --show-args && python3 -c "import imu_distance_control, cv2, numpy, yaml; from sensor_msgs.msg import Imu"'
+# Check direct capture imports without opening USB or starting ROS nodes.
+# No extra ROS camera, RTAB-Map or EKF packages are needed.
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "import camera_runtime, imu_distance_control, cv2, numpy, pyrealsense2, yaml; from sensor_msgs.msg import CompressedImage, Imu"'
 
 # Add SDK DDS libs + pybind modules to paths
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}

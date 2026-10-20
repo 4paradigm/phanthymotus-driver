@@ -26,10 +26,11 @@ def main():
 
     if os.environ.get('ROS_DOMAIN_ID') != '242':
         raise SystemExit('Probe requires isolated ROS_DOMAIN_ID=242')
-    from camera_runtime import CAMERA, stop_process
-    root = Path(__file__).resolve().parent.parent/'noetix/bumi'
+    root = Path(__file__).resolve().parent.parent/'experiments/bumi_odometry/managed'
     if not root.exists():
-        root = Path('/work')
+        raise SystemExit('The legacy fusion probe requires the experiment source checkout')
+    sys.path.insert(0, str(root))
+    from camera_runtime import CAMERA, stop_process
     processes = [subprocess.Popen([sys.executable, str(root/'camera_runtime.py'), 'bridge', 'smoke'],
                                   start_new_session=True),
                  subprocess.Popen([sys.executable, str(root/'fusion_runtime.py')], start_new_session=True)]
