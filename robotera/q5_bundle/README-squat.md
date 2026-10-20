@@ -6,8 +6,8 @@
 
 1. Q5 `camera_rgb`（`image/jpeg`）→ perception `pose`。
 2. `pose` 的**完整骨架** `.../poses/skeleton`（`sensor/pose2d`）→ Q5 `squat_counter`；精简 `/poses` 缺少所需关节。
-3. `squat_counter` 输出口 0 `.../fitness/squat/events` → `decision_core`；输出口 1 `status`、2 `debug` 留给 Dashboard；**输出口 3 `.../fitness/squat/voice` → perception `tts` 的文本输入**。把 `squat_counter` 工具绑定给 `decision_core`。
-4. Q5 `mic` → perception `asr` 的正常识别输出 → `decision_core`；同一张 TTS 卡片的 PCM → Q5 `speaker`，`decision_core` 的 TTS 执行器也必须绑定这张卡片。默认 `asr_kws` 模式的唤醒词是“小范小范”，例如“小范小范，我要开始深蹲锻炼了”。不要把 `/asr_background` 接作控制输入。
+3. `squat_counter` 画布第 1 个输出 `events` → `decision_core`；第 2 个 `status`、第 3 个 `debug` 留给 Dashboard；**第 4 个 `.../fitness/squat/voice` → perception `tts` 的文本输入**。代码中的索引依次是 0、1、2、3。把 `squat_counter` 工具绑定给 `decision_core`。
+4. Q5 `mic` → perception `asr` 的正常识别输出 → `decision_core`；同一张 TTS 卡片的 PCM → Q5 `speaker`，`decision_core` 的 TTS 执行器也必须绑定这张卡片。TTS 接入 `voice` 后，其 PCM 输出变为 `<voice 话题>/tts`；改线后重新连接 TTS → speaker 并重启画布。默认 `asr_kws` 模式的唤醒词是“小范小范”，例如“小范小范，我要开始深蹲锻炼了”。不要把 `/asr_background` 接作控制输入。
 
 Q5 主驱动在 ROS Domain 211；媒体桥把 `camera_rgb` 送到 Agent Core 的 Domain 42，`pose` 和深蹲处理进程在 Domain 42。`squat_counter` 的 MCP 操作由 Q5 主驱动代理。子进程未启动时 `start`/`status` 会返回错误。
 
@@ -22,6 +22,8 @@ Q5 主驱动在 ROS Domain 211；媒体桥把 `camera_rgb` 送到 Agent Core 的
 `status` 可查看训练阶段、计划、当前组次数、累计次数、`input_stale` 和帧数；`debug` 给出中文角度、阈值判断及未计数原因。排查时先确认 `frames_received` 持续增长且 `input_stale=false`。`reset` 不能修复中断的 pose 或 ASR 流。`status.phase=paused` 或 `target_lost` 事件里的 `state=paused` 表示已锁定的人体暂时丢失或关节不可读，**不代表卡片没有启动**；新版事件另有 `card_state` 和 `workout_state`。结合工具 `status` 的 `state`、`coach_mode`、`workout_state`、`target_state` 和 `debug` 的“判定原因”查看原因。
 
 播报仍慢时，先看 `status.last_voice.sent_at`：若卡片已及时发送而没听到，检查 TTS 输入是否接在 `voice` 输出、speaker 是否接同一 TTS 实例的 PCM，以及 TTS 日志是否出现 `discarded expired topic cue`。短提示过期会跳过，避免训练结束后补念旧数字；若常被丢弃，测量 TTS 首帧延迟并确认 Q5 与 perception 的系统时钟同步。Dashboard 状态仍慢时，对比工具 `status.set_count` 与画布显示，并检查 `frames_received` 和 `last_frame_age_s`。
+
+若机器人完全无声，先运行 `speaker.info`：`state=idle` 表示还没开始播放，检查画布中的 TTS PCM → speaker 连线，并对比 `topic_in[0].topic` 与 TTS `info.topic_out[0].topic`；输入话题为空也可能是音频路由在绑定前启动失败，需看启动记录。新版 speaker 会以 `state=error` 和 `startup_error` 报告启动失败，以 `self_check_error` 报告自检音失败。旧版只能在 Q5 driver 日志中找 `playback unavailable` 或 `startup self-check failed`。改线后停止项目，等 `project_stop_done` 再启动，以免旧停止任务关掉新实例。`state=running` 且 `frames_received`、`frames_written` 增长但听不到时，再临时把 speaker 音量从当前默认 `2` 提高测试；测试完调回合适音量。
 
 ## 技能和验证
 

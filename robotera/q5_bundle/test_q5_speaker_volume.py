@@ -40,11 +40,22 @@ def test_speaker_sets_system_volume_before_startup_check():
     speaker._volume = 2
     speaker._running = False
     speaker._topic = ""
+    speaker._process = None
+    speaker._thread = None
     speaker.stop = lambda: calls.append("stop")
     speaker._prepare_xos_route = lambda: calls.append("route")
     speaker._set_system_volume = lambda value: calls.append(("volume", value))
     speaker._play_startup_sound = lambda: calls.append("self_check")
-    speaker._start_playback = lambda topic: calls.append(("playback", topic))
+
+    def playback(topic):
+        calls.append(("playback", topic))
+        speaker._running = True
+        speaker._topic = topic
+        speaker._process = types.SimpleNamespace(
+            poll=lambda: None, stdin=types.SimpleNamespace(closed=False))
+        speaker._thread = types.SimpleNamespace(is_alive=lambda: True)
+
+    speaker._start_playback = playback
 
     speaker._start_for_topic("/tts/audio")
     assert calls == ["stop", "route", ("volume", 2), "self_check",
@@ -54,6 +65,38 @@ def test_speaker_sets_system_volume_before_startup_check():
     speaker._topic = "/tts/audio"
     speaker._start_for_topic("/tts/audio")
     assert len(calls) == 5
+
+
+def test_speaker_restarts_same_topic_when_playback_or_pump_has_died():
+    speaker_type = _speaker_methods("_start_for_topic")
+    speaker = _speaker_for_status(speaker_type)
+    speaker._running = True
+    speaker._topic = "/tts/audio"
+    speaker._process = types.SimpleNamespace(
+        poll=lambda: 1, stdin=types.SimpleNamespace(closed=False))
+    speaker._thread = types.SimpleNamespace(is_alive=lambda: True)
+    calls = []
+    speaker.stop = lambda: calls.append("stop")
+    speaker._prepare_xos_route = lambda: None
+    speaker._set_system_volume = lambda value: None
+    speaker._play_startup_sound = lambda: None
+
+    def playback(topic):
+        calls.append(("playback", topic))
+        speaker._running = True
+        speaker._topic = topic
+        speaker._process = types.SimpleNamespace(
+            poll=lambda: None, stdin=types.SimpleNamespace(closed=False))
+        speaker._thread = types.SimpleNamespace(is_alive=lambda: True)
+
+    speaker._start_playback = playback
+    speaker._start_for_topic("/tts/audio")
+    assert calls == ["stop", ("playback", "/tts/audio")]
+
+    speaker._thread = types.SimpleNamespace(is_alive=lambda: False)
+    speaker._start_for_topic("/tts/audio")
+    assert calls == ["stop", ("playback", "/tts/audio"),
+                     "stop", ("playback", "/tts/audio")]
 
 
 def test_speaker_scales_startup_pcm_like_live_pcm():
@@ -100,3 +143,79 @@ def test_speaker_scales_startup_pcm_like_live_pcm():
 
     assert bytes(written) == audioop.mul(original, 2, 0.12)
     assert written != original
+
+
+def _speaker_for_status(speaker_type):
+    speaker = speaker_type()
+    speaker._running = False
+    speaker._topic = ""
+    speaker._volume = 2
+    speaker._input_gain = 6.0
+    speaker._device = "hw:2,0"
+    speaker._output_rate = 44100
+    speaker._output_channels = 2
+    speaker._system_volume = None
+    speaker._frames_received = 0
+    speaker._frames_written = 0
+    speaker._startup_error = None
+    speaker._self_check_error = None
+    speaker._process = None
+    speaker._thread = None
+    speaker.stop = lambda: setattr(speaker, "_running", False)
+    return speaker
+
+
+def test_speaker_start_failure_is_reported_and_retry_clears_it():
+    speaker_type = _speaker_methods("_start_for_topic", "dispatch")
+    speaker = _speaker_for_status(speaker_type)
+
+    def unavailable():
+        raise RuntimeError("XOS playback route is still occupied")
+
+    speaker._prepare_xos_route = unavailable
+    result = speaker.dispatch("start", {"input_topic": "/q5/fitness/squat/voice/tts"})
+    assert result["state"] == "error"
+    assert result["startup_error"] == "XOS playback route is still occupied"
+    assert speaker.dispatch("info", {})["message"] == result["startup_error"]
+
+    speaker._prepare_xos_route = lambda: None
+    speaker._set_system_volume = lambda value: None
+    speaker._play_startup_sound = lambda: None
+
+    def playback(topic):
+        speaker._topic = topic
+        speaker._running = True
+
+    speaker._start_playback = playback
+    result = speaker.dispatch("start", {"input_topic": "/q5/fitness/squat/voice/tts"})
+    assert result["state"] == "running"
+    assert "startup_error" not in result
+    assert result["topic_in"][0]["topic"] == "/q5/fitness/squat/voice/tts"
+
+
+def test_speaker_self_check_failure_is_visible_without_failing_live_playback():
+    speaker_type = _speaker_methods(
+        "_start_for_topic", "_play_startup_sound", "dispatch",
+        subprocess=types.SimpleNamespace(
+            Popen=lambda *args, **kwargs: (_ for _ in ()).throw(OSError("SSH unavailable")),
+            PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL),
+        _q5_alsa_speaker_command=lambda *args: "alsa",
+        _q5_speaker_playback_shell=lambda command: command,
+        _q5_ssh_args=lambda command: [command],
+    )
+    speaker = _speaker_for_status(speaker_type)
+    speaker._prepare_xos_route = lambda: None
+    speaker._set_system_volume = lambda value: None
+    speaker._scale_pcm = lambda pcm: pcm
+
+    def playback(topic):
+        speaker._topic = topic
+        speaker._running = True
+
+    speaker._start_playback = playback
+    with patch.object(Path, "read_bytes", return_value=b"pcm"):
+        result = speaker.dispatch("start", {"input_topic": "/tts/audio"})
+
+    assert result["state"] == "running"
+    assert result["self_check_error"] == "SSH unavailable"
+    assert speaker.dispatch("info", {})["self_check_error"] == "SSH unavailable"

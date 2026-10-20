@@ -571,6 +571,8 @@ class SpeakerPlugin:
         self._running = False
         self._frames_received = 0
         self._frames_written = 0
+        self._startup_error = None
+        self._self_check_error = None
         _Q5_SPEAKER_PLUGIN = self
         if self._rate != 16000 or self._channels != 1:
             raise ValueError("Q5 speaker only supports the shared 16 kHz mono PCM contract")
@@ -606,9 +608,16 @@ class SpeakerPlugin:
 
     def _start_for_topic(self, requested: str) -> None:
         with _Q5_XOS_CHAT_LOCK:
-            if self._running and requested == self._topic:
+            process = self._process
+            thread = self._thread
+            if (self._running and requested == self._topic
+                    and process is not None and process.poll() is None
+                    and process.stdin is not None and not process.stdin.closed
+                    and thread is not None and thread.is_alive()):
                 return
             self.stop()
+            self._startup_error = None
+            self._self_check_error = None
             try:
                 self._prepare_xos_route()
                 # The self-check must obey the requested volume too; setting
@@ -619,10 +628,12 @@ class SpeakerPlugin:
                 print(f"[SpeakerPlugin] playback subscribed <- {self._topic}", flush=True)
             except Exception as exc:
                 self.stop()
+                self._startup_error = str(exc)
                 print(f"[SpeakerPlugin] playback unavailable: {exc}", flush=True)
 
     def _play_startup_sound(self) -> None:
         """Play a short PCM self-check before subscribing to the live stream."""
+        self._self_check_error = None
         path = Path(__file__).parent / "resource" / "startup_beep.pcm"
         proc = None
         try:
@@ -653,7 +664,8 @@ class SpeakerPlugin:
                     detail = proc.stderr.read().decode(errors="replace").strip()
                 except Exception:
                     pass
-            print(f"[SpeakerPlugin] startup self-check failed: {exc}{': ' + detail if detail else ''}", flush=True)
+            self._self_check_error = f"{exc}{': ' + detail if detail else ''}"
+            print(f"[SpeakerPlugin] startup self-check failed: {self._self_check_error}", flush=True)
 
     def _scale_pcm(self, pcm: bytes) -> bytes:
         """Apply the same user volume and source gain to startup and live PCM."""
@@ -826,13 +838,16 @@ class SpeakerPlugin:
             self._volume = value
             self._set_system_volume(value)
         elif action == "get_volume":
-            return {"state": "running" if self._running else "idle",
+            return {"state": ("running" if self._running else
+                              "error" if self._startup_error else "idle"),
                     "volume": self._volume, "input_gain": self._input_gain,
                     "system_volume": self._system_volume}
         elif action == "stop":
             self.stop()
+            self._startup_error = None
         if action in ("start", "set_volume", "stop", "info"):
-            return {"state": "running" if self._running else "idle",
+            result = {"state": ("running" if self._running else
+                                "error" if self._startup_error else "idle"),
                     "topic_in": ([{"topic": self._topic, "format": "audio/pcm-16k"}]
                                  if self._topic else [{"format": "audio/pcm-16k"}]),
                     "playback": {"device": self._device, "sample_rate_hz": self._output_rate,
@@ -840,7 +855,12 @@ class SpeakerPlugin:
                                  "input_gain": self._input_gain,
                                  "system_volume": self._system_volume},
                     "frames_received": self._frames_received,
-                    "frames_written": self._frames_written}
+                    "frames_written": self._frames_written,
+                    "self_check_error": self._self_check_error}
+            if self._startup_error:
+                result["message"] = self._startup_error
+                result["startup_error"] = self._startup_error
+            return result
         return None
 
 

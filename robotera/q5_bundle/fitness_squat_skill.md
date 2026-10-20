@@ -4,7 +4,7 @@
 
 ## 接线与唤醒
 
-- Q5 `camera_rgb` → perception `pose` 的 `.../poses/skeleton` → Q5 `squat_counter`。仅把输出口 0 `.../fitness/squat/events` 接到 `decision_core`；输出口 1 `status`、2 `debug` 留给 Dashboard；**输出口 3 `.../fitness/squat/voice` 接 perception TTS 的文本输入**。
+- Q5 `camera_rgb` → perception `pose` 的 `.../poses/skeleton` → Q5 `squat_counter`。画布第 1 个输出 `events` 接 `decision_core`；第 2 个 `status`、第 3 个 `debug` 留给 Dashboard；**第 4 个 `.../fitness/squat/voice` 接 perception TTS 的文本输入**。
 - Q5 `mic` → perception `asr` 的正常识别输出 → `decision_core`；上述同一张 TTS 卡片的 PCM → Q5 `speaker`。把 `squat_counter` 和这张 TTS 卡片都绑定到 `decision_core`。ASR 默认 `asr_kws`，唤醒词为“小范小范”；例如“小范小范，我要开始深蹲锻炼了”。不要把 `/asr_background` 接作训练控制输入。
 - 画布启动卡片后仅订阅姿态；`start`/`stop` 是卡片生命周期动作。正常开练调用 `begin`，明确“重新计数”时才调用 `reset`。需要发声时调用 TTS `speak`，单纯生成文字不会播报。
 
