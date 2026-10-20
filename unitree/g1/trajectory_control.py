@@ -29,25 +29,17 @@ class TrajectoryControl:
         return self.thread is not None and self.thread.is_alive()
 
     def binding(self):
-        machine = self.control.cfg.get('trajectory_device_id')
-        if not machine:
-            path = Path('/run/g1-machine-id')
-            if not path.is_file(): raise ValueError('trajectory_device_id_missing')
-            machine = path.read_text().strip()
-        if not isinstance(machine, str) or not machine or len(machine) > 256:
-            raise ValueError('trajectory_device_id_invalid')
         profile = copy.deepcopy(self.arm.profile)
         if not profile: raise ValueError('calibration_missing')
         locked = profile.pop('locked_joints', {})
         for key in ('baseline_sample_ns', 'urdf_path'): profile.pop(key, None)
-        return {'device_id': hashlib.sha256(machine.encode()).hexdigest(),
-                'model_sha256': profile['urdf_sha256'],
+        return {'model_sha256': profile['urdf_sha256'],
                 'geometry_sha256': hashlib.sha256(json.dumps(profile, sort_keys=True, allow_nan=False).encode()).hexdigest(),
                 'locked_joints': locked}
 
     def _check_binding(self, recording):
         current, stored = self.binding(), recording['binding']
-        if any(current[k] != stored.get(k) for k in ('device_id', 'model_sha256', 'geometry_sha256')):
+        if any(current[k] != stored.get(k) for k in ('model_sha256', 'geometry_sha256')):
             raise ValueError('recording_binding_mismatch')
         if recording['joint_names'] != self.arm.profile['arm_joint_names']:
             raise ValueError('recording_joint_order')

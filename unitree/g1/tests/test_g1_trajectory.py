@@ -155,7 +155,7 @@ def api_rig(tmp_path):
         interrupt=lambda: None, close=lambda: None,
         joint_envelope=lambda measured, previous, target: {'lower': [-1.]*10, 'upper': [1.]*10})
     receipts = []
-    card = TeleopControl({'mode': 'live', 'data_dir': str(tmp_path), 'trajectory_device_id': 'synthetic-g1'},
+    card = TeleopControl({'mode': 'live', 'data_dir': str(tmp_path)},
                         motion, notify=lambda *args: receipts.append(args))
     _, frame = input_card(tmp_path)
     card.clock_id = 'offline'; card._operator = 'test-session'; card._state = 'active'
@@ -181,6 +181,8 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         name = recorded['filename']
         asset = card.dispatch('inspect', {'filename': name})
         assert asset['complete'] and asset['frames'] == 3
+        assert 'device_id' not in asset['binding']
+        card.cfg['trajectory_device_id'] = 'different-robot'  # Obsolete identity cannot restrict replay.
         assert card.dispatch('play', {'filename': name})['code'] == 'stop_teleop_before_replay'
         assert card.stop()['authority_released']
         # The operator, represented by this plant substitute, restores the start.
@@ -207,10 +209,26 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         assert rejected['status'] == 'running'
         card.trajectory.thread.join(6)
         assert card.trajectory.last_action['status'] == 'error'  # Hardware gates still apply.
-        card.cfg['trajectory_device_id'] = 'different-robot'
-        assert card.dispatch('inspect', {'filename': name})['code'] == 'recording_binding_mismatch'
+        assert card.dispatch('inspect', {'filename': name})['complete']
     finally:
         card.trajectory.stop(); done.set(); ticker.join(1)
+
+
+@pytest.mark.parametrize('change', ['legacy_device', 'model', 'geometry', 'joint_order'])
+def test_recording_compatibility_ignores_machine_but_checks_model(tmp_path, change):
+    arm, _, _, _, _, _ = setup_servo(tmp_path)
+    control = SimpleNamespace(cfg={}, motion=None, executor=arm)
+    trajectory = TrajectoryControl(control)
+    recording = {'binding': trajectory.binding(), 'joint_names': list(arm.profile['arm_joint_names'])}
+    if change == 'legacy_device':
+        recording['binding']['device_id'] = 'another-machine'
+        trajectory._check_binding(recording)
+        assert 'device_id' not in trajectory.binding()
+    else:
+        if change == 'joint_order': recording['joint_names'].reverse()
+        else: recording['binding'][change+'_sha256'] = 'incompatible'
+        with pytest.raises(ValueError, match='recording_joint_order' if change=='joint_order' else 'recording_binding_mismatch'):
+            trajectory._check_binding(recording)
 
 
 def test_replay_stop_is_not_blocked_by_file_verification(tmp_path, monkeypatch):
