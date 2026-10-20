@@ -1,0 +1,5 @@
+.env
+*.pem
+__pycache__/
+*.pyc
+home.json

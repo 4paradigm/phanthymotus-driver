@@ -43,7 +43,7 @@ from common.vendor_runtime import action_schema, tool
 # appear in a `topic_out` — see the module docstring.
 BUS_RENDERABLE_FORMATS = frozenset({
     "data/json", "text/plain", "text/markdown",
-    "image/jpeg", "image/depth-zlib", "image/depth-z16",
+    "image/jpeg", "image/depth-zlib",
     "audio/pcm-16k",
     "sensor/mapping", "sensor/pointcloud", "sensor/skeleton",
 })

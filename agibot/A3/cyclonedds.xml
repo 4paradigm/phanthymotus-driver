@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <!-- ADU Thor's robot link is exposed as mgbe0_0. Selecting it explicitly
+           avoids CycloneDDS matching the same interface twice. -->
+      <Interfaces>
+        <NetworkInterface name="mgbe0_0" priority="default" multicast="true" />
+      </Interfaces>
+      <MaxMessageSize>16MB</MaxMessageSize>
+      <AllowMulticast>spdp</AllowMulticast>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>

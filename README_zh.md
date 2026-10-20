@@ -14,6 +14,7 @@
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
 | `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
 | `chasing/qianjiao_p200_pro` | 潜行科技潜鲛 P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF 运动控制、锁定/解锁、心跳和连接状态 |
+| [`limx/tron2`](limx/tron2/README.md) | 逐际动力 TRON2 双臂机器人 | 15791 | 头部/左右腕RGB摄像头、关节骨架与夹爪示意、双臂 MoveJ及自动验证复位 |
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
@@ -64,6 +65,9 @@ python main.py
 3. Agent Core 通过 MCP `initialize` 和 `tools/list` 发现驱动的工具
 4. 工具对 LLM Agent 可用，并显示在 Web Dashboard 中
 5. LLM Agent 通过 MCP `tools/call` 调用工具
+6. 需要文件的工具声明 `format: file` + `uploadTo: "mcp"`，字节经 `POST /file/upload`
+   进到本容器（`common/file_intake.py`），回包给出的是**容器内部**的绝对路径 ——
+   不需要任何共享挂载。详见 [README_dev.md 的 File Arguments 一节](README_dev.md#file-arguments-format-file-and-post-fileupload)。
 
 ## 开发新驱动
 

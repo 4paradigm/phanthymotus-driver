@@ -1,0 +1,18 @@
+id: limx-tron2-driver
+name: LimX TRON2 Sensors and Arm Control
+category: driver
+hardware_provider: limx
+hardware_model: tron2
+image_name: limx-tron2
+port: 15791
+mcp_url: "http://localhost:15791/mcp"
+description: "TRON2 头部/左右腕RGB相机、实时骨架与默认闭合夹爪示意、双臂MoveJ与自动验证复位；含骨架URDF资源"
+build_context_extras:
+  - ../../common
+cards:
+  - {name: joint_state, type: sensor}
+  - {name: camera, type: sensor}
+  - {name: camera_left, type: sensor}
+  - {name: camera_right, type: sensor}
+  - {name: arm_control, type: actuator}
+  - {name: model, type: resource}

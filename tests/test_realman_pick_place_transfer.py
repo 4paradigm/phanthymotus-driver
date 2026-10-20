@@ -107,22 +107,25 @@ class TransferTests(unittest.TestCase):
     def moves(self):
         return [args[0] for method, args in self.commands if method == "rm_movel"]
 
-    def test_both_grabs_rotation_and_return_obey_lower_driver_speed_limit(self):
+    def test_both_grabs_rotation_and_return_use_default_and_full_speed(self):
         from pick_place import PickPlacePlugin
-        self.plugin = PickPlacePlugin(self.client, {"safety": {"max_speed_percent": 3}}, inputs=self.camera)
+        self.plugin = PickPlacePlugin(self.client, {"safety": {"max_speed_percent": 3,
+                                                             "default_speed_percent": 2}}, inputs=self.camera)
         self.assertTrue(self.plugin.dispatch("config", {"observe_after_transfer": True})["ok"])
-        self.assertEqual(self.plugin.dispatch("config", {"speed_percent": 4})["code"], "INVALID_CONFIG")
-        for action in (self.transfer, self.grab_by):
-            with self.subTest(action=action.__name__):
-                self.commands.clear()
-                self.make_photo()
-                result = action(rotation_deg=30)
-                self.assertEqual(result["state"], "completed", result)
-                self.assertTrue(result["result"]["rotation_completed"])
-                self.assertTrue(result["result"]["observation"]["ok"])
-                moves = [(name, args) for name, args in self.commands if name in ("rm_movej", "rm_movel")]
-                self.assertEqual([name for name, _ in moves], ["rm_movel"] * 7 + ["rm_movej"])
-                self.assertTrue(all(args[1] == 3 for _, args in moves))
+        for speed in (50, 100):
+            if speed == 100:
+                self.assertTrue(self.plugin.dispatch("config", {"speed_percent": speed})["ok"])
+            for action in (self.transfer, self.grab_by):
+                with self.subTest(speed=speed, action=action.__name__):
+                    self.commands.clear()
+                    self.make_photo()
+                    result = action(rotation_deg=30)
+                    self.assertEqual(result["state"], "completed", result)
+                    self.assertTrue(result["result"]["rotation_completed"])
+                    self.assertTrue(result["result"]["observation"]["ok"])
+                    moves = [(name, args) for name, args in self.commands if name in ("rm_movej", "rm_movel")]
+                    self.assertEqual([name for name, _ in moves], ["rm_movel"] * 7 + ["rm_movej"])
+                    self.assertTrue(all(args[1] == speed for _, args in moves))
 
     def test_grab_uses_memory_snapshot_without_reading_or_writing_files(self):
         from pathlib import Path
@@ -159,7 +162,7 @@ class TransferTests(unittest.TestCase):
                     self.assertTrue(result["result"]["release_completed"])
                     self.assertTrue(result["result"]["return_completed"])
                     self.assertEqual(self.pose, self.photo_pose)
-                    self.assertTrue(all(args[1] == 5 for name, args in self.commands if name == "rm_movel"))
+                    self.assertTrue(all(args[1] == 50 for name, args in self.commands if name == "rm_movel"))
 
     def test_rotation_is_relative_to_gripper_with_rotated_work_frame(self):
         for work_angles, angle in (([.2, -.1, .3], 35), ([0, math.pi / 2, 0], 180)):
@@ -289,7 +292,7 @@ class TransferTests(unittest.TestCase):
         result = self.transfer()
         self.assertEqual(result["state"], "completed", result)
         np.testing.assert_allclose(np.array(self.moves())[:, 2], [.3, .209, .3, .3, .24, .3])
-        self.assertTrue(all(args[1] == 5 for name, args in self.commands if name == "rm_movel"))
+        self.assertTrue(all(args[1] == 50 for name, args in self.commands if name == "rm_movel"))
         self.assertIn(("rm_set_rm_plus_reg", (1220, 1, [15])), self.commands)
 
     def test_both_transfers_consume_old_photo_and_replace_it_after_observing(self):

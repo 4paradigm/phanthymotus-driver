@@ -12,6 +12,8 @@ drivers/noetix/bumi/main.py — Noetix Bumi-EDU 设备 bundle 统一入口。
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+from __future__ import annotations
+
 # Make every log line one atomic, control-character-free write, so concurrent
 # writers cannot tear a Docker log record. Must run before anything prints.
 try:
@@ -120,6 +122,7 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
+        loco_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -129,13 +132,32 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
             from device import LocoPlugin
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, high_ctrl))
+            loco_plugin = LocoPlugin(
+                plugins_cfg["loco"], namespace, executor, high_ctrl)
+            self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
+
+        if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
+                and high_ctrl is not None):
+            from loco_servo import LocoServoPlugin
+            self._plugins.append(LocoServoPlugin(
+                plugins_cfg["loco_servo"], namespace, executor, high_ctrl,
+                # When the call-shaped card is enabled, both paths share its
+                # lock/rate limiter and explicit actions preempt the stream.
+                loco_plugin=loco_plugin,
+            ))
+            print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))
             print("[bundle] MicPlugin loaded")
+
+        if plugins_cfg.get("sound_direction", {}).get("enabled", False) and media_ctrl is not None:
+            from direction_card import SoundDirectionPlugin
+            self._plugins.append(SoundDirectionPlugin(
+                plugins_cfg["sound_direction"], namespace, executor, media_ctrl))
+            print("[bundle] SoundDirectionPlugin loaded")
 
         if plugins_cfg.get("speaker", {}).get("enabled", False) and media_ctrl is not None:
             from device import SpeakerPlugin
@@ -168,14 +190,21 @@ class BumiDeviceBundle:
             print("[bundle] SquatCounterPlugin loaded")
 
     def start_all(self) -> None:
+        failed = 0
         for i, p in enumerate(self._plugins):
             try:
-                p.start()
+                if p.start() is False:
+                    failed += 1
+                    print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: returned False", flush=True)
             except Exception as e:
+                failed += 1
                 print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
-        print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
+        if failed:
+            print(f"[bundle] {len(self._plugins) - failed}/{len(self._plugins)} plugins started", flush=True)
+        else:
+            print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
         # Stop media consumers before tearing down the camera producer.
@@ -246,6 +275,25 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
+            # Receive a file into this container: `POST /file/upload`, the way a
+            # `format: file` tool argument reaches a service that shares no
+            # filesystem with agent-core. See common/file_intake.py.
+            #
+            # Two ordering requirements, both silent when violated: this must
+            # precede `self.rfile.read(...)`, which would consume the body the
+            # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+            # would 404 the upload before it is recognised.
+            #
+            # Imported here rather than at module level on purpose: several tests
+            # lift this handler out of main.py by AST and exec only the selected
+            # definitions, so a module global would be undefined there -- a
+            # NameError on every POST, including ordinary JSON-RPC.
+            try:
+                from common import file_intake as _file_intake
+            except ImportError:  # a checkout without common/ on the path
+                _file_intake = None
+            if _file_intake is not None and _file_intake.serve_upload(self):
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:

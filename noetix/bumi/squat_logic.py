@@ -756,4 +756,3 @@ class SquatCounter:
                 self._debug_reason = "waiting_for_top_dwell"
             else:
                 self._debug_reason = "rep_too_fast"
-

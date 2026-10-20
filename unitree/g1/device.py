@@ -1343,7 +1343,9 @@ class LocoPlugin:
         self._slam_client = slam_client
         self._smart_motion = smart_motion
         self._namespace = namespace
-        self._move_timer: threading.Timer | None = None
+        # Direct clients and the subprocess fallback share the same deadline logic.
+        from timed_motion import TimedMotion
+        self._fallback_motion = TimedMotion(loco_client) if hasattr(loco_client, "BeginMove") else None
         # _LocoStateNode — authoritative fsm_id/fsm_mode from rt/sportmodestate.
         self._state_node = state_node
         # _LowStateNode — joint-derived posture, needed to tell lying from squatting
@@ -1530,26 +1532,30 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
-        if self._move_timer:
-            self._move_timer.cancel()
-            self._move_timer = None
-        self._client.StopMove()
+        if self._smart_motion:
+            self._smart_motion.stop(reason="shutdown")
+        elif self._fallback_motion:
+            self._fallback_motion.stop("shutdown")
+        else:
+            self._client.StopMove()
 
-    def _auto_stop(self):
-        """Timer 回调：自动停止运动"""
-        self._move_timer = None
-        self._client.StopMove()
-
-    def _auto_stop_acp(self, action_id: str):
-        """Timer 回调：自动停止运动 + fire ACP callback."""
-        self._move_timer = None
-        self._client.StopMove()
-        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
-
-    def _acp_wait_move(self, action_id: str, duration: float):
-        """Wait for SmartMotion timed move to complete, then fire ACP callback."""
-        time.sleep(duration + 0.5)  # SmartMotion auto-stops after duration; small buffer
-        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
+    def _acp_wait_move(self, action_id: str):
+        """Notify from this action's recorded stop outcome, never a fixed sleep."""
+        while True:
+            if self._smart_motion:
+                outcome = self._smart_motion.get_motion_result(action_id)
+            elif self._fallback_motion:
+                outcome = self._fallback_motion.get_result(action_id)
+            else:
+                outcome = self._client.GetMotionResult(action_id)
+            if outcome.get("error"):
+                _loco_acp_notify(action_id, "error", {"error": outcome["error"]}, tool="loco")
+                return
+            status = outcome.get("status")
+            if status in ("completed", "cancelled", "error"):
+                _loco_acp_notify(action_id, status, outcome.get("result", {}), tool="loco")
+                return
+            time.sleep(0.1)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -1563,64 +1569,48 @@ class LocoPlugin:
                 return {"state": "running", "topic_out": [{"topic": topic, "format": "data/json"}]}
             return None
         if action == "move":
-            vx   = float(args.get("vx",   0))
-            vy   = float(args.get("vy",   0))
+            from uuid import uuid4
+            vx = float(args.get("vx", 0))
+            vy = float(args.get("vy", 0))
             vyaw = float(args.get("vyaw", 0))
             duration = float(args.get("duration", 0))
-
-            # Route through SmartMotion safety harness
+            if not all(math.isfinite(v) for v in (vx, vy, vyaw, duration)):
+                return {"error": "Motion parameters must be finite"}
+            action_id = f"g1_move_{uuid4().hex[:8]}"
             if self._smart_motion:
-                result = self._smart_motion.move(vx, vy, vyaw, duration)
-                if duration > 0:
-                    from uuid import uuid4
-                    action_id = f"g1_move_{uuid4().hex[:8]}"
-                    result["action_id"] = action_id
-                    # SmartMotion handles auto-stop internally; spawn thread to wait and notify
-                    threading.Thread(
-                        target=self._acp_wait_move,
-                        args=(action_id, duration),
-                        daemon=True,
-                    ).start()
-                return result
-
-            # Fallback: direct control (no safety harness)
-            vx   = max(-1.0, min(1.0, vx))
-            vy   = max(-1.0, min(1.0, vy))
-            vyaw = max(-2.0, min(2.0, vyaw))
-
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
-
-            if duration > 0:
-                from uuid import uuid4
-                action_id = f"g1_move_{uuid4().hex[:8]}"
-                # G1 SetVelocity duration has known bugs — use Timer fallback
-                ret = self._client.Move(vx, vy, vyaw, True)
-                self._move_timer = threading.Timer(duration, self._auto_stop_acp, args=[action_id])
-                self._move_timer.start()
-                return {"status": "moving", "action_id": action_id,
-                        "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+                result = self._smart_motion.move(vx, vy, vyaw, duration, action_id=action_id)
             else:
-                # Continuous move until explicit stop
-                ret = self._client.Move(vx, vy, vyaw, True)
-                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+                vx = max(-1.0, min(1.0, vx))
+                vy = max(-1.0, min(1.0, vy))
+                vyaw = max(-2.0, min(2.0, vyaw))
+                if self._fallback_motion:
+                    result = self._fallback_motion.start(vx, vy, vyaw, duration, action_id)
+                else:
+                    result = self._client.TimedMove(vx, vy, vyaw, duration, action_id)
+            if duration <= 0:
+                # Continuous moves enter a state; keep identity internal so ACP
+                # does not register an unbounded pending completion.
+                return {key: value for key, value in result.items() if key != "action_id"}
+            if duration > 0 and result.get("action_id") == action_id:
+                threading.Thread(target=self._acp_wait_move, args=(action_id,), daemon=True).start()
+            return result
         elif action == "stop_move":
-            # Route through SmartMotion safety harness
             if self._smart_motion:
                 return self._smart_motion.stop()
-
-            # Fallback: direct control
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
+            # Send the movement stop before waiting for navigation RPCs.
+            if self._fallback_motion:
+                result = self._fallback_motion.stop()
+            else:
+                ret = self._client.StopMove()
+                result = {"ret": ret, "state": "idle" if ret == 0 else "stop_failed"}
+                if ret != 0:
+                    result["error"] = f"StopMove failed or unconfirmed: code={ret}"
             if self._slam_client:
                 try:
                     self._slam_client.PauseNav()
                 except Exception:
                     pass
-            ret = self._client.StopMove()
-            return {"ret": ret}
+            return result
         elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
                         "squat2standup", "emergency_stop", "get_current_mode"):
             # x-action-params split: action is the mode directly
@@ -3809,9 +3799,9 @@ class RealSensePlugin:
             "name": "camera_depth",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 (z16, mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
+            "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 zlib (mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
         }
 
     def _dist_tool(self) -> dict:
@@ -3879,7 +3869,7 @@ class RealSensePlugin:
         if action == "info":
             tool_name = args.get('_tool_name', '')
             if tool_name == 'camera_depth':
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
+                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
             if tool_name == 'camera_distance':
                 return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
             return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
@@ -3920,7 +3910,8 @@ def run_realsense_process(namespace: str) -> None:
         def __init__(self, color_topic, depth_topic, dist_topic):
             super().__init__("g1_realsense")
             self._color_pub = self.create_publisher(CompressedImage, color_topic, _QOS)
-            self._depth_pub = self.create_publisher(Image, depth_topic, _QOS)
+            from sensor_msgs.msg import CompressedImage as _CI
+            self._depth_pub = self.create_publisher(_CI, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
 
             self._pipeline = None
@@ -3988,15 +3979,18 @@ def run_realsense_process(namespace: str) -> None:
                 except queue.Empty:
                     continue
                 try:
-                    msg = Image()
+                    # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
+                    import zlib as _zlib
+                    from sensor_msgs.msg import CompressedImage as _CI
+                    msg = _CI()
                     msg.header.stamp = stamp
                     msg.header.frame_id = "camera_depth_optical_frame"
-                    msg.height = depth_np.shape[0]
-                    msg.width  = depth_np.shape[1]
-                    msg.encoding = "16UC1"
-                    msg.is_bigendian = 0
-                    msg.step = depth_np.shape[1] * 2
-                    msg.data = depth_np.tobytes()
+                    msg.format = "16UC1; compressedDepth zlib"
+                    # The size is the format's contract (640x480 little-endian
+                    # uint16 mm), not a field on the wire — the RealSense is
+                    # configured at exactly that, see RS_DEPTH_W/RS_DEPTH_H.
+                    msg.data = _zlib.compress(
+                        depth_np.astype("<u2", copy=False).tobytes(), 1)
                     self._depth_pub.publish(msg)
                 except Exception as e:
                     self.get_logger().error(f"[realsense] depth publish error: {e}")
@@ -4128,7 +4122,8 @@ class VisionCapturePlugin:
     PREFIX = "vision_capture"
 
     def __init__(self, plugin_config, namespace, executor, camera_plugin=None):
-        del namespace, executor
+        self._executor = executor
+        self._audio_topic = f"/{namespace}/mic/audio"
         self._camera = camera_plugin
         self._output_dir = Path(str(plugin_config.get(
             "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
@@ -4143,7 +4138,8 @@ class VisionCapturePlugin:
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": (
-                "Capture a G1 RGB photo or record a silent H.264 MP4 video "
+                "Capture a G1 RGB photo or record an H.264 MP4 video "
+                "with optional microphone AAC audio (off by default). "
                 "(1–30 seconds) to persistent storage. Requires the camera "
                 "card to remain enabled (plugins.camera.enabled=true)."),
             "inputSchema": {"type": "object", "properties": {
@@ -4155,17 +4151,25 @@ class VisionCapturePlugin:
                     "default": min(5, self._max_duration_s),
                     "description": "默认5s,最大30s",
                 },
+                "include_audio": {
+                    "type": "boolean", "default": False,
+                    "title": "录制麦克风声音",
+                    "description": (
+                        "默认关闭，保留原无声录像。开启后使用 Camera/Mic ROS 发布端时间戳"
+                        "对齐 VFR 视频与 AAC 音轨；不是硬件级同步。需启用 mic；"
+                        "无音频、长时间断音或只有零 PCM 时明确失败，不降级为无声录像。"),
+                },
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 RGB 相机是否就绪。"},
                     "capture_photo": {"params": [], "description": "保存当前 RGB 照片为 JPG。"},
-                    "record_video": {"params": ["duration_s"],
-                                     "description": "录制 RGB 视频，默认 5 秒。"},
+                    "record_video": {"params": ["duration_s", "include_audio"],
+                                     "description": "录制 RGB 视频，可选录制麦克风；默认 5 秒、无声。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
                     "stop": {"params": [], "description": "取消录像并删除未完成文件。"},
                 },
                 "x-completion": {"actions": ["record_video"],
-                                 "timeout": self._max_duration_s + 15}},
+                                 "timeout": self._max_duration_s + 45}},
         }
 
     def _camera_ready(self):
@@ -4205,7 +4209,7 @@ class VisionCapturePlugin:
                if frame else None)
         with self._recording_lock:
             active = ({key: self._active_recording.get(key) for key in (
-                "action_id", "state", "duration_s", "started_at", "path")}
+                "action_id", "state", "duration_s", "include_audio", "started_at", "path")}
                 if self._active_recording else None)
             last = self._last_recording
         ready = self._camera_ready() and age is not None
@@ -4305,6 +4309,9 @@ class VisionCapturePlugin:
                 pass
 
     def _record_video(self, active):
+        if active.get("include_audio", False):
+            from av_recording import record_av
+            return record_av(self, active)
         process = None
         path = None
         completed = False
@@ -4404,6 +4411,10 @@ class VisionCapturePlugin:
         if type(requested) is not int or not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION", "message":
                     f"duration_s must be an integer between 1 and {self._max_duration_s}"}
+        include_audio = args.get("include_audio", False)
+        if type(include_audio) is not bool:
+            return {"ok": False, "code": "INVALID_AUDIO_OPTION",
+                    "message": "include_audio must be a boolean"}
         if self._camera is None:
             return self._precondition_error()
         if not self._camera_ready():
@@ -4421,6 +4432,7 @@ class VisionCapturePlugin:
             active = {
                 "action_id": action_id, "state": "recording",
                 "duration_s": requested,
+                "include_audio": include_audio,
                 "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "cancel_event": threading.Event(), "process": None,
                 "path": None, "finished": False,
@@ -4433,6 +4445,7 @@ class VisionCapturePlugin:
             thread.start()
         return {"ok": True, "state": "queued", "action_id": action_id,
                 "media_type": "video", "requested_duration_s": requested,
+                "include_audio": include_audio,
                 "message": "Video recording started; completion will be reported asynchronously."}
 
     def stop(self):
