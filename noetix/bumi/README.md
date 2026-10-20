@@ -331,6 +331,11 @@ progress narration, not a guarantee that every number is spoken immediately.
 On `target_changed`, `previous_count_total` preserves the prior session's
 final total. `status.input_stale` flags a pose stream that has stopped sending
 frames; it does not infer that a missing frame contains a person.
+After a single tracked person is lost and returns, the counter preserves the
+session and total. If that person returns in another part of the image, it
+recalibrates standing pose before counting again. During a stall, check
+`status.input_stale` and the Chinese debug fields `判定原因` and `目标状态`;
+`reset` clears the total but cannot restore a stopped pose or ASR stream.
 To install the instruction in `fitness_squat_skill.md`, create a skill under
 Resource Center → My Skills with slug `bumi-squat-coach`, category `utility`,
 and required tools `squat_counter, tts`; paste the file's instruction body,
@@ -339,6 +344,10 @@ install the draft, and mark it active. Then let `decision_core` call
 `speak` and connect its PCM output to Bumi `speaker`. The driver has no local
 skill loader. The model can call `status` and `reset`; the canvas owns `start`
 and `stop`.
+Changes to this template do not update a skill already installed in Resource
+Center; replace its instruction body and publish the updated skill. Keep count
+utterances to a single number to limit TTS queueing. Model turns and TTS
+playback still add delay, so this design is not frame-synchronous speech.
 
 For voice commands, connect Bumi `mic` to perception `asr`, then connect ASR's
 normal recognition output to `decision_core`. With ASR's `asr_kws` mode, say the
@@ -346,6 +355,11 @@ configured wake word before commands such as “重新计数” or “现在做�
 maps those commands to `squat_counter.reset` and `status`, then calls TTS
 `speak` for a spoken confirmation. Do not use ASR's background-speech output
 for control. The current skill supports voice reset and count queries.
+When reset seems ineffective, first confirm that the normal ASR output contains
+the request, then look for a `squat_counter.reset` action and a new `session_id`
+in `status`. If no reset action appears, changing counting thresholds will not
+fix voice control. If the action appears but pose frames stop, inspect
+`status.input_stale` and the card's received/parsed frame counts.
 Pause/resume that preserves the count, or a configured target repetition count,
 needs additional card state and actions. If only explicit count announcements
 are wanted, turn off `decision_core`'s `auto_narration`; it controls separate

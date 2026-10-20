@@ -260,6 +260,30 @@ def test_sustained_target_switch_starts_a_new_session_without_mixing_counts():
                                                (status["session_id"], 1)]
 
 
+@pytest.mark.parametrize("start_x,return_x", [(450, 450), (180, 780)])
+def test_same_single_person_returns_after_long_loss_without_reset(start_x, return_x):
+    sequence = Sequence()
+    sequence.hold(0, 27, anchor_x=start_x)
+    sequence.rep(anchor_x=start_x)
+    old_session = sequence.counter.snapshot()["session_id"]
+
+    for _ in range(20):
+        sequence.frame()
+    assert sequence.counter.snapshot()["target_state"] == "missing"
+
+    sequence.hold(0, 27, anchor_x=return_x)
+    status = sequence.counter.snapshot()
+    assert status["session_id"] == old_session
+    assert status["count_total"] == 1
+    assert status["target_state"] == "tracking"
+    assert [event["type"] for event in sequence.events].count("target_reacquired") == 1
+    assert not [event for event in sequence.events
+                if event["type"] == "target_changed"]
+
+    sequence.rep(anchor_x=return_x)
+    assert sequence.counter.snapshot()["count_total"] == 2
+
+
 def test_lost_leg_keypoints_or_frame_gap_cannot_finish_an_old_half_rep():
     sequence = Sequence()
     sequence.hold(0, 27)

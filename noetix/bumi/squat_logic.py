@@ -357,21 +357,7 @@ class SquatCounter:
         self._debug_selected_candidate = (_candidate_summary(matched)
                                           if matched is not None else None)
         if matched is not None and matched.readable:
-            if (self._loss_since is not None
-                    and timestamp - self._loss_since >= self.config["switch_after_s"]):
-                events.append(self._begin_session(matched, timestamp, changed=True))
-            else:
-                if self._loss_since is not None:
-                    self._target_state = "tracking"
-                    self._state = ("calibrating" if self._baseline is None else
-                                   "rearming" if self._needs_rearm else "top")
-                self.target_id = matched.person_id
-                self._target_box = matched.bbox
-                self._target_state = "tracking"
-                if self._loss_reported:
-                    events.append(self._emit("target_reacquired", timestamp))
-                self._loss_since = None
-                self._loss_reported = False
+            self._reacquire(matched, timestamp, events)
             self._advance_person(matched, timestamp, events)
             return events
 
@@ -392,9 +378,38 @@ class SquatCounter:
         if timestamp - self._loss_since >= self.config["switch_after_s"]:
             best = self._best_readable(candidates)
             if best is not None:
-                events.append(self._begin_session(best, timestamp, changed=True))
+                if best.person_id == self.target_id:
+                    # A subject can move beyond the old box while missing.
+                    # The same tracked ID must not start a new count session.
+                    self._reacquire(best, timestamp, events)
+                else:
+                    events.append(self._begin_session(best, timestamp, changed=True))
                 self._advance_person(best, timestamp, events)
         return events
+
+    def _reacquire(self, candidate: _Candidate, timestamp: float,
+                   events: list[dict]) -> None:
+        if self._loss_since is not None:
+            if (self._baseline is not None and self._target_box is not None
+                    and math.dist(_center(candidate.bbox),
+                                  _center(self._target_box)) >
+                    self.config["ankle_motion_max_ratio"] * self._baseline.leg_scale):
+                # The old ankle position cannot validate a subject who moved
+                # while out of view. Relearn standing pose but retain the count.
+                self._baseline = None
+                self._baseline_samples.clear()
+                self._recent.clear()
+                self._side = None
+                self._needs_rearm = False
+            self._state = ("calibrating" if self._baseline is None else
+                           "rearming" if self._needs_rearm else "top")
+        self.target_id = candidate.person_id
+        self._target_box = candidate.bbox
+        self._target_state = "tracking"
+        if self._loss_reported:
+            events.append(self._emit("target_reacquired", timestamp))
+        self._loss_since = None
+        self._loss_reported = False
 
     def _emit(self, kind: str, timestamp: float, **extra: Any) -> dict:
         self.seq += 1
