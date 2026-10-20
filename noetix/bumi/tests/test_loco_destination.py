@@ -286,11 +286,23 @@ def test_distance_invalid_requests_do_not_send_commands(monkeypatch, distance):
     assert fake.cmds == []
 
 
-def test_distance_refuses_missing_fusion_before_acceptance(monkeypatch):
+def test_distance_preflight_uses_sdk_imu_without_a_fusion_executor(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl()
     plugin = _rotate_plugin(module, monkeypatch, fake)
+    assert plugin._distance_preflight({'distance_m': 1}) == (1, None)
+    assert fake.cmds == []
+
+
+def test_distance_refuses_invalid_sdk_imu_before_acceptance(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    raw = fake.get_imu_data()
+    raw.ori = [0, 0, 0, 0]
+    monkeypatch.setattr(fake, 'get_imu_data', lambda: raw)
     result = plugin.dispatch('move', {'_tool_name': 'loco_destination', 'distance_m': 1})
     assert result['state'] == 'error'
     assert 'action_id' not in result
@@ -340,7 +352,26 @@ def test_distance_nonzero_publication_obeys_atomic_stop(monkeypatch):
     plugin = _rotate_plugin(module, monkeypatch, fake)
     plugin._stop_move()
     plugin._distance_publish(0.5)
+    plugin._distance_publish(0, 0.3)
     assert fake.cmds == [(0, 0, 0)]
+
+
+def test_real_imu_distance_worker_accepts_without_ros_and_cancels_during_calibration(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    calls = []
+    monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
+    started = plugin.dispatch('move', {'_tool_name': 'loco_destination', 'distance_m': 1})
+    assert started['state'] == 'running'
+    plugin.dispatch('stop_move', {'_tool_name': 'loco_destination'})
+    plugin._rotate_worker.join(timeout=2)
+    assert not plugin._rotate_worker.is_alive()
+    assert len(calls) == 1 and calls[0][1] == 'cancelled'
+    assert calls[0][2]['feedback_source'] == 'imu_integrated_experimental'
+    assert calls[0][2]['accuracy_validated'] is False
+    assert fake.cmds and all(cmd == (0, 0, 0) for cmd in fake.cmds)
 
 
 def test_rotate_dispatch_returns_immediately_with_action_id(monkeypatch):

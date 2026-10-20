@@ -55,7 +55,7 @@ def stop_process(proc):
 
 
 class CameraRuntime:
-    def __init__(self, namespace, on_line, fusion_enabled=True):
+    def __init__(self, namespace, on_line, fusion_enabled=False):
         root = Path(__file__).resolve().parent
         self.commands = {'camera': camera_arguments(),
                          'bridge': [sys.executable, str(root/'camera_runtime.py'), 'bridge', namespace]}

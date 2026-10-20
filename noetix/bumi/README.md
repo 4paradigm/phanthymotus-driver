@@ -453,7 +453,8 @@ measures where the robot really turned instead.
   360 degrees (positive = counter-clockwise/left) and requires walking
   mode, flat non-slip ground and at least 1 m clearance. `distance_m`
   spans 0.1 to 3 metres forward only (no reverse, strafe or path
-  planning) and additionally requires live fused odometry (see below).
+  planning). The experimental IMU estimator requires the robot to be
+  stationary before starting (see below).
   `stop_move` brakes an active rotation or distance move immediately
   (also the `on_interrupt_motion` hook). `status` reports `idle`/
   `running` (plus which `action` is running) and `last_result`, the full
@@ -475,40 +476,53 @@ measures where the robot really turned instead.
   `min(75, 10 + |angle_deg|/5)` seconds. Cruise/fine require at least 1° of measured progress in the requested direction every 2 seconds; otherwise they brake and return an error (feedback loss or a stalled chassis).
 
 Posture, semantic and teaching requests reserve the chassis across preparation, command dispatch and confirmation. They cancel an existing rotation and wait for its reservation/worker to resolve before changing modes; a new move or rotate is refused during that reservation. Failure to stop rotation within 6 seconds rejects the competing action without sending it.
-- Distance feedback for `move`: the reviewed driver image installs the
-  RealSense ROS, RTAB-Map and robot_localization dependencies and checks
-  their binaries/imports during the build. With `camera.enabled` and
-  `camera.fusion_enabled` (both default true), CameraPlugin starts one
-  RealSense owner, a compatibility bridge and an independently supervised
-  fusion process in the driver's ROS domain (42 by default). No manual
-  package install, experimental launcher or extrinsics JSON is needed.
-  Existing camera/depth topics, formats, source timestamps and frame cache
-  remain available to perception, photos and videos. Fusion failures do not
-  restart camera capture; it runs at 10 Hz, low priority, on at most two
-  available CPUs. The read-only `/run/udev` deployment mount supplies HID
-  enumeration metadata. The startup status explains which input is missing;
-  keep the robot stationary for an initial one-second gravity window.
-  Angular rate and gravity come from the SDK body IMU, bridged by the
-  driver as `sensor_msgs/Imu` on `/bumi_odom/body_imu` in the base_link
-  frame — this fleet's host kernels lack `CONFIG_HID_SENSOR_HUB`, so
-  librealsense cannot observe the camera IMU, and the body IMU needs no
-  mount calibration. The initial forward axis is the body axis projected
-  onto the gravity-level plane. RTAB-Map uses RGB-D only after gravity
-  initialization; the EKF fuses its pose with body gyro rates, without
-  integrating linear acceleration.
-  `/bumi_odom/filtered` (nav_msgs/Odometry) and `/bumi_odom/status`
-  (std_msgs/String) are the card's read-only inputs. Feedback must be a valid
-  `bumi_odom_odom → bumi_odom_base_link` pose with fresh source and
-  receipt timestamps (≤0.5 s), positive finite covariance, a `tracking`
-  quality status and a stable segment; motion validates the same checks
-  every tick and brakes with an error on loss, jumps, segment change,
-  heading/lateral deviation, no progress or timeout. Progress is the
-  projection onto the starting heading — not path length. The SDK `vx` is
-  a normalised command, not metres per second. Completion requires the
-  stop to settle (≥0.5 s of stable feedback) within ±0.05 m of the
-  requested distance; overshoot beyond tolerance is an error, never an
-  automatic reverse correction. Software tests do not prove real-world
-  ±5 cm accuracy — that remains a hardware verification item.
+- Distance feedback for `move` is now a **pure body-IMU experiment**, independent
+  of camera/depth capture, RTAB-Map, EKF and `loco_servo` execution. The SDK
+  supplies xyzw orientation, acceleration and angular rate directly. The
+  assumed contract is gravity-inclusive acceleration in m/s² and angular
+  rate in rad/s; startup rejects acceleration inconsistent with gravity or
+  attitude instead of guessing units. This contract still needs verification
+  on the deployed robot. Keep the robot physically stationary before calling:
+  quiet IMU readings alone cannot distinguish rest from uniform motion.
+- Before sending nonzero velocity the worker holds zero and collects a
+  continuous two-second quiet calibration window (six-second limit). It
+  rotates acceleration into the world frame, subtracts the stationary
+  gravity/offset baseline and integrates acceleration/velocity at 50 Hz.
+  Forward displacement is projected onto the starting heading; proportional
+  IMU yaw correction uses direct SDK commands. The existing shared-chassis
+  reservation, atomic cancellation and exactly-once ACP completion remain.
+- The controller never performs a zero-velocity update during commanded
+  movement. It slows before the estimated target and brakes with a speed-based
+  lead. After at least one second of zero command, low estimated speed plus
+  0.8 seconds of quiet IMU data permit an **assumed** stationary endpoint and
+  zero the estimated velocity. This does not retrospectively fix position
+  drift or independently prove that the robot stopped. `done` means the
+  estimated endpoint lies within 0.05 m of the requested target, **not** that
+  the actual physical error is within 5 cm. There is no automatic reverse or
+  repeated tiny correction at the endpoint.
+- Invalid readings, polling gaps over 0.1 s, unchanged IMU fields for over
+  0.5 s during movement, heading/tilt over 20°, estimated lateral deviation
+  over 0.15 m, excessive estimated speed, no estimated progress for three
+  seconds, or the bounded motion/settling time limits cause zero command
+  and `error`. `stop_move` cancels calibration as well as motion. The SDK
+  has no source timestamp: changed fields and poll timing are only loss
+  heuristics, not proof of source freshness. A truly constant input can
+  conservatively trip the unchanged-data guard.
+- Results explicitly contain `feedback_source: imu_integrated_experimental`,
+  `accuracy_validated: false`, `source_timestamp_available: false`,
+  `estimated_distance_m`, `estimated_error_m`, `estimated_position_m`,
+  `estimated_velocity_mps` and `stationary_assumed`. Only the distance worker
+  performs this estimation; the existing IMU/odometry telemetry cards keep
+  their original contracts and do not start claiming measured translation.
+  See [IMU experiment testing](IMU_DISTANCE_TEST.md) for independent physical
+  measurement and result interpretation.
+- `camera.fusion_enabled` now defaults to false. Shared RealSense capture,
+  JPEG/depth topics and frame cache remain available for camera, depth,
+  perception, photos and videos. The image keeps the camera ROS dependency
+  but no longer installs RTAB-Map or robot_localization for distance moves.
+  The legacy RGB-D fusion source and offline experiment remain for comparison;
+  enabling that old pipeline requires its separate dependencies. It is not
+  used by this version of the distance card.
 
 ## `speaker`
 

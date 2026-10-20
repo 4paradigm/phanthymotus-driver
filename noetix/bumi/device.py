@@ -435,8 +435,6 @@ class LocoPlugin:
         self._rotate_worker: threading.Thread | None = None
         self._active_action_id: str | None = None
         self._destination_action = "rotate"
-        self._distance_feedback = None
-        self._executor = executor
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
@@ -551,26 +549,25 @@ class LocoPlugin:
     def _loco_destination_tool(self) -> dict:
         return {
             "name": "loco_destination", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：按融合里程计前进指定距离，或按 IMU 航向原地旋转指定角度，到达后刹停。距离移动需运行 RGB-D/IMU 融合并保持 tracking；旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。距离精度待真机验证。",
+            "description": "Bumi 目标运动：纯机身 IMU 实验版按积分估计距离前进，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move", "rotate", "stop_move", "status"]},
                     "distance_m": {"type": "number", "minimum": 0.1, "maximum": 3,
-                                   "description": "沿起点朝向前进的目标距离（米），需有效融合里程计。"},
+                                   "description": "沿起点朝向前进的目标距离（米）；纯 IMU 积分实验估计，非经验证的实际距离。启动前保持静止。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["distance_m"], "description": "按位置反馈前进 distance_m 米后停稳；里程计失效立即刹停报错。"},
+                    "move": {"params": ["distance_m"], "description": "静止标定后按 IMU 估计距离前进并刹停；数据异常或无进展时停车报错。实验版精度待实测。"},
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
                     "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
-                    "status": {"params": [], "description": "查询当前目标动作与实际位移/转角结果。"},
+                    "status": {"params": [], "description": "查询当前目标动作、IMU 估计位移或转角结果。"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
-                # Both actions complete asynchronously through ACP; longest
-                # distance budget is 105 s plus 15 s for delivery.
+                # Both actions retain the existing asynchronous ACP contract.
                 "x-completion": {"actions": ["move", "rotate"], "timeout": 120},
             },
             "topic_out": [],
@@ -664,11 +661,7 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        try:
-            self._get_distance_feedback().start()
-        except Exception as exc:
-            # Fusion is optional; rotation and the existing cards stay usable.
-            print(f"[loco_destination] distance feedback unavailable: {exc}", flush=True)
+        pass  # The experimental distance worker reads the SDK IMU directly.
 
     def stop(self) -> None:
         # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
@@ -677,8 +670,7 @@ class LocoPlugin:
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
-        if self._wait_for_rotate_idle() and self._distance_feedback is not None:
-            self._distance_feedback.stop()
+        self._wait_for_rotate_idle()
 
     def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
         # Cover the dispatch-acceptance window: stop may land after the
@@ -903,7 +895,7 @@ class LocoPlugin:
                 if action == "rotate":
                     expected_duration_s = _rotate_timeout_s(value)
                 else:
-                    from distance_control import distance_timeout
+                    from imu_distance_control import distance_timeout
                     expected_duration_s = distance_timeout(value)
                 action_id = f"bumi_loco_destination_{uuid.uuid4().hex}"
                 worker = threading.Thread(target=self._do_rotate_worker,
@@ -1002,14 +994,8 @@ class LocoPlugin:
             }
         return None
 
-    def _get_distance_feedback(self):
-        if self._distance_feedback is None:
-            from distance_control import DistanceFeedback
-            self._distance_feedback = DistanceFeedback(self._executor)
-        return self._distance_feedback
-
-    def _read_distance_feedback(self):
-        return self._get_distance_feedback().snapshot()
+    def _read_distance_imu(self):
+        return self._high_ctrl.get_imu_data()
 
     def _distance_preflight(self, args):
         raw = args.get("distance_m")
@@ -1022,19 +1008,16 @@ class LocoPlugin:
         problem = self._rotate_mode_error()
         if problem is not None:
             return None, problem
-        self._get_distance_feedback().start()
-        # A latched fault from an earlier attempt clears only here, and only
-        # if the latest same-segment pose+quality are healthy again.
-        self._get_distance_feedback().revalidate()
-        self._read_distance_feedback()
+        from imu_distance_control import decode_imu
+        decode_imu(self._read_distance_imu())
         return distance, None
 
-    def _distance_publish(self, vx):
-        self._publish_cmd(vx, 0, 0, _get_default_cmd(), 0,
-                          cancel_event=self._rotate_stop_event if vx else None)
+    def _distance_publish(self, vx, vyaw=0):
+        self._publish_cmd(vx, 0, vyaw, _get_default_cmd(), 0,
+                          cancel_event=self._rotate_stop_event if vx or vyaw else None)
 
     def _do_distance_impl(self, args):
-        from distance_control import run_distance
+        from imu_distance_control import run_distance
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
@@ -2331,7 +2314,7 @@ class CameraPlugin:
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._runtime = None
-        self._fusion_enabled = bool(plugin_config.get("fusion_enabled", True))
+        self._fusion_enabled = bool(plugin_config.get("fusion_enabled", False))
         self._frame_node = _CameraFrameNode(self._color_topic)
         executor.add_node(self._frame_node)
         # What the RealSense reported about itself, keyed by stream name. Filled

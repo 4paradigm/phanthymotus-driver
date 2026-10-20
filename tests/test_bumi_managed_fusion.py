@@ -72,7 +72,7 @@ def test_fusion_crash_restarts_only_fusion_and_inherits_domain(monkeypatch):
     monkeypatch.setattr(module.subprocess, 'Popen', popen)
     monkeypatch.setattr(module.os, 'killpg', lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(module, '_group_alive', lambda pid: False, raising=False)
-    runtime = CameraRuntime('ubuntu', lambda line: None)
+    runtime = CameraRuntime('ubuntu', lambda line: None, fusion_enabled=True)
     runtime.tick(0)
     assert len(opened) == 3
     assert sum('realsense2_camera' in args for args, _, _ in opened) == 1
@@ -117,7 +117,7 @@ def test_unreapable_group_does_not_kill_camera_supervision(monkeypatch):
         opened.append((args, kwargs, proc))
         return proc
     monkeypatch.setattr(module.subprocess, 'Popen', popen)
-    runtime = CameraRuntime('ubuntu', lines.append)
+    runtime = CameraRuntime('ubuntu', lines.append, fusion_enabled=True)
     runtime.tick(0)
     assert len(opened) == 3
     runtime.processes['fusion'].code = 1          # fusion 挂了
@@ -221,7 +221,8 @@ def test_missing_required_dependency_is_a_build_error(tmp_path):
         check_dependencies(prefix_lookup=missing)
 
 
-def test_camera_card_starts_shared_runtime_and_keeps_frame_cache(monkeypatch):
+@pytest.mark.parametrize('fusion_enabled', [False, True])
+def test_camera_card_starts_shared_runtime_and_keeps_frame_cache(monkeypatch, fusion_enabled):
     spec = importlib.util.spec_from_file_location('bumi_camera_device_stubs',
                                                 BUMI/'tests/test_loco_destination.py')
     fixture = importlib.util.module_from_spec(spec)
@@ -240,12 +241,13 @@ def test_camera_card_starts_shared_runtime_and_keeps_frame_cache(monkeypatch):
         def is_running(self): return self.running
     monkeypatch.setattr(camera_runtime, 'CameraRuntime', Runtime)
     nodes = []
-    camera = device.CameraPlugin({}, 'robot', NS(add_node=nodes.append))
+    config = {'fusion_enabled': True} if fusion_enabled else {}
+    camera = device.CameraPlugin(config, 'robot', NS(add_node=nodes.append))
     cache = camera._frame_node
     camera.start()
     camera.start()
     assert len(instances) == 1
-    assert instances[0].enabled is True
+    assert instances[0].enabled is fusion_enabled
     assert instances[0].namespace == 'robot'
     assert camera.is_running()
     assert camera._frame_node is cache
