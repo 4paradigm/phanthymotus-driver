@@ -345,7 +345,7 @@ class TestClosedLoopCard(unittest.TestCase):
         def notify(*args, **kwargs):
             notifications.append((args, kwargs))
             done.set()
-        return LocoRelativeMovePlugin({}, backend, notify), backend, notifications, done
+        return LocoRelativeMovePlugin({}, backend, notify, admission=lambda: {'admitted': True}), backend, notifications, done
 
     def test_local_diagnostics_preserve_full_history_and_compact_callback(self):
         card, _, _, _ = self.card()
@@ -400,6 +400,32 @@ class TestClosedLoopCard(unittest.TestCase):
         self.assertTrue(notices[0][0][2]['stop_confirmed_by_feedback'])
         self.assertLessEqual(abs(backend.yaw - math.pi / 6), math.radians(3))
         self.assertEqual(backend.calls[-1], (0., 0., 0.))
+
+    def test_missing_or_failing_admission_never_sends_or_starts_worker(self):
+        for admission in (None, lambda: {}, lambda: (_ for _ in ()).throw(RuntimeError('offline'))):
+            backend = FeedbackBackend()
+            card = LocoRelativeMovePlugin({}, backend, lambda *a, **k: None, admission=admission)
+            with patch('threading.Thread') as worker:
+                reply = card.dispatch('move', {'x': 1})
+                self.assertEqual(reply['safety_reason'], 'locomotion_not_ready')
+                self.assertEqual(backend.calls, [])
+                worker.assert_not_called()
+
+    def test_loss_of_locomotion_admission_cancels_active_job_and_only_stops(self):
+        card, backend, notices, done = self.card()
+        state = {'admitted': True}
+        card.admission = lambda: dict(state)
+        card.dispatch('move', {'x': 1})
+        self.assertTrue(backend.sent.wait(1))
+        with card.command_lock:
+            state['admitted'] = False
+            boundary = len(backend.calls)
+        self.assertTrue(done.wait(3))
+        self.assertEqual(notices[0][0][1], 'error')
+        self.assertEqual(notices[0][0][2]['safety_reason'], 'locomotion_not_ready')
+        self.assertTrue(backend.calls[boundary:])
+        self.assertTrue(all(not any(command) for command in backend.calls[boundary:]))
+        self.assertTrue(card.faulted)
 
     def test_trace_is_bounded_serializable_and_marks_missing_source_time(self):
         trace = MotionTrace(pose(), {'yaw': 1.}, {})
@@ -626,11 +652,14 @@ class TestClosedLoopWiring(unittest.TestCase):
             'loco_relative_move': SimpleNamespace(LocoRelativeMovePlugin=LocoRelativeMovePlugin, PointBackend=PointBackend),
             'relative_feedback': SimpleNamespace(PoseFeedback=PoseFeedback, create_feedback_node=lambda ns, fb: node),
             'device': SimpleNamespace(_loco_acp_notify=lambda *args, **kwargs: None),
+            'sport_mode_state': SimpleNamespace(LOCO_STATES=frozenset({500, 501, 801, 802})),
             'unitree_sdk2py.g1.loco.g1_loco_client': SimpleNamespace(LocoClient=lambda: client),
         }
         instance = SimpleNamespace(_plugins=[])
         cfg = {key: {'enabled': True} for key in ('loco', 'state', 'loco_relative_move')}
         env = dict(self=instance, plugins_cfg=cfg, executor=executor, namespace='g1', print=lambda *args: None,
+                   math=math, time=time, loco_state=SimpleNamespace(node=SimpleNamespace(
+                       get_fsm=lambda: {'fsm_id': 500, 'ts': time.time()})),
                    smart_motion=SimpleNamespace(get_state=lambda: {'state': 'idle', 'base_available': False}))
         with patch.dict('sys.modules', modules):
             exec(code, env)
@@ -641,6 +670,25 @@ class TestClosedLoopWiring(unittest.TestCase):
             env['smart_motion'] = None
             env['loco_client'] = SimpleNamespace(MotionIdle=lambda: {'available': False})
             self.assertFalse(instance._point_card.can_start()['available'])
+            # Run the real main.py admission callback with idle base ownership.
+            for fsm_id in (500, 501, 801, 802):
+                env['loco_state'].node.get_fsm = lambda ident=fsm_id: {'fsm_id': ident, 'ts': time.time()}
+                self.assertTrue(instance._point_card._check_admission()['admitted'])
+            invalid_states = [{}, {'fsm_id': 500}, {'fsm_id': 500, 'ts': time.time()-2},
+                              {'fsm_id': 500, 'ts': time.time()+10}, {'fsm_id': 500, 'ts': float('nan')}]
+            invalid_states += [{'fsm_id': ident, 'ts': time.time()} for ident in
+                               (0, 1, 2, 3, 4, 702, 706, 999, None, '500', True)]
+            env['loco_client'] = SimpleNamespace(MotionIdle=lambda: {'available': True})
+            for state in invalid_states:
+                with self.subTest(state=state):
+                    env['loco_state'].node.get_fsm = lambda value=state: value
+                    with patch('threading.Thread') as worker, patch.object(client, '_CallNoReply', create=True) as send:
+                        reply = instance._point_card.dispatch('move', {'x': 1})
+                        self.assertEqual(reply['safety_reason'], 'locomotion_not_ready')
+                        self.assertNotIn('action_id', reply)
+                        self.assertIsNone(instance._point_card.active)
+                        worker.assert_not_called()
+                        send.assert_not_called()
             instance._point_card.stop()
             self.assertEqual(calls[-2:], [('remove', node), ('destroy',)])
             cfg['state']['enabled'] = False
@@ -766,7 +814,7 @@ class TestLocalMotionSafety(unittest.TestCase):
                 def notify(action, status, result, **kwargs):
                     notices.append((status, result))
                     done.set()
-                card = LocoRelativeMovePlugin({}, backend, notify)
+                card = LocoRelativeMovePlugin({}, backend, notify, admission=lambda: {'admitted': True})
                 card.dispatch('move', dict(x=1, y=1, angle=90))
                 self.assertTrue(backend.sent.wait(1))
                 # Mutating feedback happens between commands; subsequent commands must all be zero.
@@ -805,7 +853,7 @@ class TestBaseOwnership(unittest.TestCase):
                 backend = FeedbackBackend()
                 done = threading.Event()
                 card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: done.set(),
-                    can_start=lambda: {'available': world.controller.is_idle()})
+                    can_start=lambda: {'available': world.controller.is_idle()}, admission=lambda: {'admitted': True})
                 original.dispatch('move', dict(vx=.3, duration=duration))
                 self.assertIn('error', card.dispatch('move', dict(x=.3)))
                 self.assertEqual(backend.calls, [])
@@ -819,7 +867,7 @@ class TestBaseOwnership(unittest.TestCase):
     def test_ownership_timeout_or_failed_stop_does_not_start_direct_writes(self):
         for state in ({'available': False}, {'error': 'timeout'}, None):
             backend = FeedbackBackend()
-            card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None, can_start=lambda: state)
+            card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None, can_start=lambda: state, admission=lambda: {'admitted': True})
             self.assertIn('error', card.dispatch('move', dict(x=.3)))
             self.assertEqual(backend.calls, [])
 
@@ -844,7 +892,7 @@ class TestBaseOwnership(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         owner = {'available': True}
         card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None,
-                                      can_start=lambda: dict(owner))
+                                      can_start=lambda: dict(owner), admission=lambda: {'admitted': True})
         def legacy_move(action, args):
             entered.set()
             release.wait(2)
@@ -892,7 +940,7 @@ class TestCancelledHandoff(unittest.TestCase):
     def test_peer_move_waits_for_old_worker_and_receives_no_late_zero(self):
         backend = FeedbackBackend()
         finished = threading.Event()
-        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: finished.set())
+        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: finished.set(), admission=lambda: {'admitted': True})
         confirming, release = threading.Event(), threading.Event()
         def confirm():
             confirming.set()
@@ -938,7 +986,7 @@ class TestCancelledHandoff(unittest.TestCase):
 
     def test_unconfirmed_stop_rejects_following_motion(self):
         backend = FeedbackBackend()
-        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None)
+        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None, admission=lambda: {'admitted': True})
         card._confirm_stop = lambda: False
         card.dispatch('move', dict(x=1))
         self.assertTrue(backend.sent.wait(1))
@@ -952,7 +1000,7 @@ class TestCancelledHandoff(unittest.TestCase):
 
     def test_handoff_timeout_does_not_release_running_worker(self):
         backend = FeedbackBackend()
-        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None)
+        card = LocoRelativeMovePlugin({}, backend, lambda *args, **kwargs: None, admission=lambda: {'admitted': True})
         card.HANDOFF_TIMEOUT = .05
         release = threading.Event()
         card._confirm_stop = lambda: release.wait(2)

@@ -57,10 +57,11 @@ class LocoRelativeMovePlugin:
     MAX_DISTANCE = 5.
     HANDOFF_TIMEOUT = 4.
 
-    def __init__(self, config, loco, notify, can_start=None):
+    def __init__(self, config, loco, notify, can_start=None, admission=None):
         self.loco = loco
         self.notify = notify
         self.can_start = can_start
+        self.admission = admission
         self.diagnostics_dir = Path(config.get('diagnostics_dir', '/tmp/g1-relative-motion'))
         self.command_lock = threading.RLock()
         # Serialize callers across the entire handoff, including the feedback
@@ -208,6 +209,10 @@ class LocoRelativeMovePlugin:
                     return {"error": "Base is busy or unconfirmed; stop existing loco/navigation movement first",
                             "owner_state": ownership}
             try:
+                admission = self._check_admission()
+            except SafetyViolation as exc:
+                return {'error': str(exc), 'safety_reason': exc.reason, **exc.details}
+            try:
                 initial = self.loco.snapshot()
                 safety = MotionSafety(self.speed, self.yaw_speed, self.safety_config)
                 safety.check(initial, time.monotonic())
@@ -218,7 +223,7 @@ class LocoRelativeMovePlugin:
             job = dict(id=f"g1_point_{uuid4().hex[:8]}", cancel=threading.Event(),
                        motion_done=threading.Event(), stop_confirmed=False,
                        deadline=time.monotonic() + self.MAX_MOTION_SECONDS,
-                       initial=initial, safety=safety)
+                       initial=initial, safety=safety, admission=admission)
             self.active = job
             try:
                 job["worker"] = threading.Thread(target=self._run, args=(job, target), daemon=True)
@@ -227,6 +232,17 @@ class LocoRelativeMovePlugin:
                 self.active = None
                 raise
         return {"ret": 0, "state": "moving", "action_id": job["id"], "target": target, "control": "closed_loop"}
+
+    def _check_admission(self):
+        try:
+            state = self.admission() if self.admission else None
+        except Exception as exc:
+            raise SafetyViolation('locomotion_not_ready', f'Could not verify locomotion FSM: {exc}') from exc
+        if not isinstance(state, dict) or state.get('admitted') is not True:
+            raise SafetyViolation('locomotion_not_ready',
+                'Fresh upright balanced locomotion FSM required; stand up before moving',
+                {'locomotion_admission': state})
+        return state
 
     def dispatch_base(self, plugin, action, args):
         with self.handoff_lock:
@@ -379,7 +395,8 @@ class LocoRelativeMovePlugin:
             safety=dict(job['safety'].config), deadline_monotonic_s=job['deadline'],
             command_duration_s=getattr(self.loco, 'COMMAND_DURATION', None)))
         job['trace'] = trace
-        trace.add('start', absolute_target=dict(x=controller.x, y=controller.y, yaw=controller.yaw))
+        trace.add('start', absolute_target=dict(x=controller.x, y=controller.y, yaw=controller.yaw),
+                  locomotion_admission=job['admission'])
         tick, previous_tick = None, None
         last_velocity = (0., 0., 0.)
         try:
@@ -394,6 +411,7 @@ class LocoRelativeMovePlugin:
                     previous_tick = now
                     if now >= job['deadline']:
                         raise TimeoutError('Relative movement deadline expired')
+                    tick['locomotion_admission'] = self._check_admission()
                     snapshot_started = time.monotonic()
                     pose = self.loco.snapshot()
                     observed = time.monotonic()

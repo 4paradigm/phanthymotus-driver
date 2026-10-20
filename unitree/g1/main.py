@@ -28,6 +28,8 @@ except ImportError as _e:  # running outside the container image
     _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
 
 import json
+import math
+import time
 import os
 import re
 import signal
@@ -150,6 +152,18 @@ class G1DeviceBundle:
             def close_relative_feedback():
                 executor.remove_node(feedback_node)
                 feedback_node.destroy_node()
+            from sport_mode_state import LOCO_STATES
+            def relative_locomotion_admission():
+                # rt/sportmodestate is authoritative: idle ownership is not posture admission.
+                fsm = loco_state.node.get_fsm()
+                stamp = fsm.get('ts')
+                valid_stamp = (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                               and math.isfinite(stamp))
+                age = time.time() - stamp if valid_stamp else None
+                admitted = (age is not None and 0 <= age < 1.0
+                            and type(fsm.get('fsm_id')) is int and fsm['fsm_id'] in LOCO_STATES)
+                return dict(admitted=admitted, fsm=fsm, age_s=age,
+                            source='rt/sportmodestate', max_age_s=1.0)
             def relative_base_available():
                 if smart_motion is not None:
                     current = smart_motion.get_state()
@@ -158,7 +172,7 @@ class G1DeviceBundle:
             self._point_card = LocoRelativeMovePlugin(
                 plugins_cfg.get("loco_relative_move", {}),
                 PointBackend(relative_client, feedback, close_relative_feedback), _loco_acp_notify,
-                can_start=relative_base_available)
+                can_start=relative_base_available, admission=relative_locomotion_admission)
             self._plugins.append(self._point_card)
             print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
 
