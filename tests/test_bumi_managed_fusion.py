@@ -105,6 +105,35 @@ def test_dead_launch_leader_still_has_its_children_reaped(monkeypatch):
     assert proc.waited
 
 
+def test_unreapable_group_does_not_kill_camera_supervision(monkeypatch):
+    # 真机复盘：pkill 后进程组残留僵尸，stop_process 抛 RuntimeError，watch
+    # 线程未兜住直接死——安全互斥正常（无双采集）但相机从此无人重启。监督
+    # 必须在单个进程组回收失败时存活：报错走 on_line，下个 tick 重试该名字，
+    # 其余名字照常处理。
+    import camera_runtime as module
+    opened, lines = [], []
+    def popen(args, **kwargs):
+        proc = Process(len(opened) + 100)
+        opened.append((args, kwargs, proc))
+        return proc
+    monkeypatch.setattr(module.subprocess, 'Popen', popen)
+    runtime = CameraRuntime('ubuntu', lines.append)
+    runtime.tick(0)
+    assert len(opened) == 3
+    runtime.processes['fusion'].code = 1          # fusion 挂了
+    real_stop = module.stop_process
+    monkeypatch.setattr(module, 'stop_process',
+                        lambda proc: (_ for _ in ()).throw(RuntimeError(
+                            'camera/fusion process group did not exit; refusing a duplicate owner')))
+    runtime.tick(6)                               # 不得抛出
+    assert any('did not exit' in line for line in lines)
+    assert runtime.processes['camera'] is opened[0][2]   # 其余进程未受牵连
+    monkeypatch.setattr(module, 'stop_process', real_stop)
+    runtime.tick(12)                              # 组可回收后 fusion 重启
+    assert len(opened) == 4
+    assert 'fusion_runtime.py' in ' '.join(opened[-1][0])
+
+
 def test_camera_runtime_can_leave_fusion_disabled():
     runtime = CameraRuntime('robot', print, fusion_enabled=False)
     assert set(runtime.commands) == {'camera', 'bridge'}

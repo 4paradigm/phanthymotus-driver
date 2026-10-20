@@ -79,7 +79,16 @@ class CameraRuntime:
                 if now < self.retry_at.get(name, 0):
                     continue
                 if proc is not None:
-                    stop_process(proc)
+                    try:
+                        stop_process(proc)
+                    except RuntimeError as exc:
+                        # A group holding zombies may never reap (hardware
+                        # case: pkill left a defunct leader). The duplicate-
+                        # owner guard must stay, but supervision has to
+                        # survive: report, leave the name for the next tick.
+                        self.on_line(f'[camera/{name}] {exc}')
+                        self.retry_at[name] = now+5
+                        continue
                 env = dict(os.environ)
                 if name == 'fusion':
                     env.update(OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
