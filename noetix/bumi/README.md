@@ -287,7 +287,7 @@ The card publishes:
 | --- | --- |
 | `/<namespace>/fitness/squat/events` | Sparse `session_started`, `rep_completed`, `target_lost`, `target_reacquired`, and `target_changed` events for `decision_core`. |
 | `/<namespace>/fitness/squat/status` | Current state and count for the dashboard; **do not** connect its frequent updates to `decision_core`. |
-| `/<namespace>/fitness/squat/debug` | Latest target choice, smoothed knee/hip angles, baseline and deltas, threshold checks, and rejection reason; dashboard only. |
+| `/<namespace>/fitness/squat/debug` | 中文目标选择、膝髋角度、基线与变化量、阈值判定和计数原因；仅供 Dashboard 查看。 |
 
 The counter locks onto the person with the clearest usable full-body skeleton
 and ignores other people. It keeps that target through brief occlusions. A
@@ -306,12 +306,13 @@ depth sensor. Adjust the keys in `squat_logic.DEFAULT_CONFIG` under
 `plugins.squat_counter` in `config.yaml` after checking Bumi footage. The
 wrapper publishes dashboard status and debug data every 0.5 s and coalesces
 quick rep events within 3 s (`status_interval_s`, `debug_interval_s`,
-`min_rep_event_interval_s`). The debug stream contains no raw skeleton; when
-pose input stops, inspect `input_stale`, `last_frame_age_s`,
-`frames_received`, `frames_parsed`, and `last_error`. For missed reps, compare
-`measurements.knee_drop_deg`, `measurements.hip_descent_ratio`,
-`checks.bottom`, `timing.bottom_dwell_elapsed_s`, and `reason`; inspect
-`frame_gap_exceeded` for pose stalls.
+`min_rep_event_interval_s`). The debug action and topic use Chinese JSON keys
+and Chinese state, check, and reason text; status and event keys remain stable.
+The debug stream contains no raw skeleton. If pose input stops, inspect
+`输入已过期`, `距上一帧（秒）`, `接收帧数`, `解析帧数`, and `最近错误`.
+For missed reps, compare `测量值.膝角相对站姿减小（度）`,
+`测量值.髋部下降／站姿腿长`, `判定项.蹲底条件全部达标`,
+`计时.蹲底已保持（秒）`, and `判定原因`; inspect `帧间隔超限` for pose stalls.
 In dashboard **Monitor** mode, open `/fitness/squat/debug` in Latest or Log
 view. The card's `debug` action returns the same snapshot on demand.
 

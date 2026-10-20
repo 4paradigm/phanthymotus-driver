@@ -598,6 +598,16 @@ def _contains_raw_pose(value):
     return False
 
 
+def test_debug_is_chinese_before_a_session_starts(plugin_factory):
+    card, _, _ = plugin_factory()
+    debug = card.dispatch("debug", {})
+    assert debug["运行状态"] == "未运行"
+    assert debug["动作阶段"] == "等待识别人体"
+    assert debug["判定原因"] == "等待画面中出现关节清晰的人体"
+    assert debug["判定项"]["蹲底条件全部达标"] == "暂无数据"
+    assert debug["测量值"]["站姿基线"] is None
+
+
 def test_debug_is_a_separate_dashboard_port_with_bounded_publish_rate(plugin_factory):
     card, clock, node = plugin_factory({"debug_interval_s": 0.5})
     ports = card.get_tool()["topic_out"]
@@ -618,8 +628,8 @@ def test_debug_is_a_separate_dashboard_port_with_bounded_publish_rate(plugin_fac
     _plugin_standing(subscription, clock)
     debug = _published_debug(node, card)
     assert initial + 3 <= len(debug) <= initial + 8
-    assert all(item["source"] == "squat_counter" for item in debug)
-    assert all(item["exercise"] == "squat" for item in debug)
+    assert all(item["卡片"] == "深蹲计数" for item in debug)
+    assert all(item["动作"] == "深蹲" for item in debug)
     assert all("priority" not in item for item in debug)
     assert all(not _contains_raw_pose(item) for item in debug)
 
@@ -631,37 +641,41 @@ def test_debug_action_exposes_current_phase_and_counting_checks(plugin_factory):
     _plugin_standing(subscription, clock)
 
     standing = card.dispatch("debug", {})
-    assert standing["state"] == "running"
-    assert standing["phase"] == "top"
-    assert standing["count_total"] == 0
-    assert standing["selected_target"]["id"] == 1
-    assert standing["measurements"]["baseline"] is not None
-    assert (standing["measurements"]["baseline_knee_angle_deg"]
-            == standing["measurements"]["baseline"]["knee_angle_deg"])
-    assert standing["checks"]["top"] is True
+    assert standing["运行状态"] == "运行中"
+    assert standing["动作阶段"] == "站立"
+    assert standing["累计次数"] == 0
+    assert standing["当前目标"]["人体ID"] == 1
+    assert standing["测量值"]["站姿基线"] is not None
+    assert (standing["测量值"]["站姿基线膝角（度）"]
+            == standing["测量值"]["站姿基线"]["当前膝角（度）"])
+    assert standing["判定项"]["站立条件全部达标"] == "通过"
+    assert standing["阈值"]["蹲底膝角最小变化（度）"] == 40
 
     for depth in (0.2, 0.4, 0.6, 0.8, 1, 1, 1, 1):
         _send_pose(subscription, clock, person(depth=depth))
     bottom = card.dispatch("debug", {})
-    assert bottom["phase"] == "bottom"
-    assert bottom["count_total"] == 0
-    assert bottom["checks"]["bottom"] is True
-    assert bottom["measurements"]["knee_drop_deg"] >= 40
-    assert bottom["selected_target"]["quality"] > 0
+    assert bottom["动作阶段"] == "蹲底"
+    assert bottom["累计次数"] == 0
+    assert bottom["判定项"]["蹲底条件全部达标"] == "通过"
+    assert bottom["测量值"]["膝角相对站姿减小（度）"] >= 40
+    assert bottom["当前目标"]["质量分"] > 0
     assert not _contains_raw_pose(bottom)
 
     for depth in (0.7, 0.5, 0.3, 0.2, 0.1):
         _send_pose(subscription, clock, person(depth=depth))
     ascent = card.dispatch("debug", {})
-    assert ascent["phase"] == "ascent"
-    assert ascent["checks"]["bottom"] is False
-    assert ascent["checks"]["top"] is False
+    assert ascent["动作阶段"] == "起身中"
+    assert ascent["判定项"]["蹲底条件全部达标"] == "未通过"
+    assert ascent["判定项"]["站立条件全部达标"] == "未通过"
 
+    reasons = []
     for _ in range(7):
         _send_pose(subscription, clock, person())
+        reasons.append(card.dispatch("debug", {})["判定原因"])
     completed = card.dispatch("debug", {})
-    assert completed["count_total"] == 1
-    assert completed["phase"] == "top"
+    assert completed["累计次数"] == 1
+    assert completed["动作阶段"] == "站立"
+    assert "完成一次深蹲，计数加一" in reasons
 
 
 def test_debug_tracks_bad_input_without_polluting_decision_events(plugin_factory):
@@ -676,9 +690,9 @@ def test_debug_tracks_bad_input_without_polluting_decision_events(plugin_factory
     clock.advance(0.6)
     node.timers[0]()
     debug = _published_debug(node, card)[-1]
-    assert debug["invalid_frames"] == 1
-    assert debug["frames_received"] == debug["frames_parsed"] + 1
-    assert debug["last_error"]
+    assert debug["无效帧数"] == 1
+    assert debug["接收帧数"] == debug["解析帧数"] + 1
+    assert debug["最近错误"] == "姿态输入不是有效 JSON"
     assert len(node.publishers[event_topic].payloads) == before_events
     assert not _contains_raw_pose(debug)
 
@@ -689,13 +703,13 @@ def test_debug_reports_stale_camera_without_new_pose_frames(plugin_factory):
     card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
     subscription = node.subscriptions[-1]
     _send_pose(subscription, clock, person())
-    assert card.dispatch("debug", {})["input_stale"] is False
+    assert card.dispatch("debug", {})["输入已过期"] == "否"
 
     before = len(_published_debug(node, card))
     clock.advance(1.1)
     node.timers[0]()
     latest = _published_debug(node, card)[-1]
     assert len(_published_debug(node, card)) == before + 1
-    assert latest["input_stale"] is True
-    assert latest["last_frame_age_s"] >= 1.0
-    assert latest["input_topic"] == "/camera/poses/skeleton"
+    assert latest["输入已过期"] == "是"
+    assert latest["距上一帧（秒）"] >= 1.0
+    assert latest["输入话题"] == "/camera/poses/skeleton"
