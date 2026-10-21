@@ -84,6 +84,8 @@ COPY device.py /work/device.py
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
+COPY odometry_inputs.py /work/odometry_inputs.py
+COPY odometry_feedback.py /work/odometry_feedback.py
 COPY camera_runtime.py /work/camera_runtime.py
 COPY camera_specs.py /work/camera_specs.py
 COPY odom_spec.py /work/odom_spec.py
@@ -94,7 +96,7 @@ COPY deploy/     /deploy/
 
 # Check direct capture imports without opening USB or starting ROS nodes.
 # No extra ROS camera, RTAB-Map or EKF packages are needed.
-RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "import camera_runtime, imu_distance_control, cv2, numpy, pyrealsense2, yaml; from sensor_msgs.msg import CompressedImage, Imu"'
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "import camera_runtime, imu_distance_control, odometry_inputs, odometry_feedback, cv2, numpy, pyrealsense2, yaml; from sensor_msgs.msg import CompressedImage, Imu"'
 
 # Add SDK DDS libs + pybind modules to paths
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}

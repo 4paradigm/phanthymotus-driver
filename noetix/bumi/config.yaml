@@ -2,10 +2,16 @@ mcp_port: 15704
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  # Read-only body SDK bridge for the optional standalone fusion service.
+  odometry_inputs:
+    enabled: true
   state:
     enabled: true
   loco:
     enabled: true
+    # Standalone IMU works without the optional sensor/platform extension.
+    # Receiving a saved binding (including an empty one) enables lease checks.
+    require_feedback_binding: false
   # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
   # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
   # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——
@@ -45,7 +51,8 @@ plugins:
   camera:
     enabled: true
     # A single pyrealsense2 capture supplies camera/depth and photo/video.
-    # Distance movement reads the SDK body IMU independently.
+    # Optional standalone odometry consumes the shared raw branch; unconnected
+    # distance moves retain the SDK body-IMU experiment.
     # Bumi supports either official App video transfer or Phanthy's direct
     # camera/depth Cards. To use these Cards, the Bumi deployment enters the
     # host mount namespace and runs:

@@ -319,7 +319,6 @@ def test_distance_dispatch_reserves_chassis_and_completes_once(monkeypatch):
     entered, release = threading.Event(), threading.Event()
     calls = []
     monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
-    monkeypatch.setattr(plugin, '_distance_preflight', lambda args: (1.0, None))
 
     def run(args):
         entered.set()

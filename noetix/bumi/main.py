@@ -123,6 +123,13 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        self._odometry_bridge = None
+        if plugins_cfg.get('odometry_inputs', {}).get('enabled', False) and high_ctrl is not None:
+            try:
+                from odometry_inputs import BodyImuBridge
+                self._odometry_bridge = BodyImuBridge(namespace, executor, high_ctrl)
+            except Exception as exc:
+                print(f'[odometry_input] IMU bridge unavailable: {exc}', flush=True)
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -184,6 +191,11 @@ class BumiDeviceBundle:
             print("[bundle] VisionCapturePlugin loaded")
 
     def start_all(self) -> None:
+        if self._odometry_bridge is not None:
+            try:
+                self._odometry_bridge.start()
+            except Exception as exc:
+                print(f'[odometry_input] IMU bridge start failed: {exc}', flush=True)
         failed = 0
         for i, p in enumerate(self._plugins):
             try:
@@ -201,6 +213,12 @@ class BumiDeviceBundle:
             print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
+        if self._odometry_bridge is not None:
+            try:
+                self._odometry_bridge.stop()
+            except Exception as exc:
+                print(f'[odometry_input] IMU bridge stop failed: {exc}', flush=True)
+            self._odometry_bridge = None
         # Stop media consumers before tearing down the camera producer.
         for p in reversed(self._plugins):
             p.stop()

@@ -414,7 +414,7 @@ unexposed.
 ### `loco_destination`
 
 A motion card on the `loco` plugin: turn in place by the requested angle, or
-drive forward a requested distance — target as motion, not velocity ×
+drive along the selected starting body axis for a requested distance — target as motion, not velocity ×
 duration. The rotate path is a 50 Hz closed loop that reads IMU yaw
 and runs a staged trip (replacing the earlier P-term law): **cruise**
 drives `vyaw` at full 0.8 while more than 20° of error remains, then a
@@ -479,7 +479,18 @@ measures where the robot really turned instead.
   `min(75, 10 + |angle_deg|/5)` seconds. Cruise/fine require at least 1° of measured progress in the requested direction every 2 seconds; otherwise they brake and return an error (feedback loss or a stalled chassis).
 
 Posture, semantic and teaching requests reserve the chassis across preparation, command dispatch and confirmation. They cancel an existing rotation and wait for its reservation/worker to resolve before changing modes; a new move or rotate is refused during that reservation. Failure to stop rotation within 6 seconds rejects the competing action without sending it.
-- Distance feedback for `move` is now a **pure body-IMU experiment**, independent
+- Optional fusion feedback: connect the independent `rgbd_imu_odometry` sensor
+  from PR #425 to this card's `state/odom` input, using the companion platform
+  saved-graph patch. A discovered topic alone cannot bind motion. Acceptance
+  fixes the source, connection revision, coordinate segment, calibration and
+  relative starting pose. Initializing/unavailable feedback refuses acceptance;
+  loss, stale estimates, coordinate reset, rewire or expired lease brakes and
+  errors with no IMU fallback. Both paths preserve all four directions.
+  The default configuration also permits the unconnected IMU experiment without
+  the sensor or platform extension. Once a binding is received, even an empty
+  binding requires renewal; restart the driver to leave managed mode.
+  See [integration contract and merge order](../../integration/bumi_odometry/README.md).
+- With no odometry connection, distance feedback for `move` is a **pure body-IMU experiment**, independent
   of camera/depth capture, RTAB-Map, EKF and `loco_servo` execution. The SDK
   supplies xyzw orientation, acceleration and angular rate directly. The
   assumed contract is gravity-inclusive acceleration in m/s² and angular

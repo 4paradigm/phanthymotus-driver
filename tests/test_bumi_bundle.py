@@ -170,3 +170,25 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
 
+
+
+@pytest.mark.parametrize('phase', ['construct', 'start', 'stop'])
+def test_optional_imu_bridge_failure_does_not_block_other_cards(bundle_module, monkeypatch, phase):
+    import sys
+    from types import SimpleNamespace
+    class Bridge:
+        def __init__(self, *args):
+            if phase == 'construct': raise RuntimeError('IMU bridge unavailable')
+        def start(self):
+            if phase == 'start': raise RuntimeError('IMU bridge unavailable')
+        def stop(self):
+            if phase == 'stop': raise RuntimeError('IMU bridge unavailable')
+    monkeypatch.setitem(sys.modules, 'odometry_inputs', SimpleNamespace(BodyImuBridge=Bridge))
+    config = _config()
+    config['plugins']['odometry_inputs'] = {'enabled': True}
+    bundle = bundle_module.BumiDeviceBundle(config, 'robot', object(), FakeHighCtrl(), None)
+    loco, _ = bundle._plugins
+    bundle.start_all()
+    assert loco.started
+    bundle.stop_all()
+    assert loco.stopped
