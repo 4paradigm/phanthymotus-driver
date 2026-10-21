@@ -65,7 +65,7 @@ def test_invalid_or_unverified_acceleration_units_cannot_calibrate(bad):
 
 
 @pytest.mark.parametrize('sample,message', [
-    (imu(acc=(31, 0, 0)), 'IMU acceleration norm 31.000 exceeds experimental limit 30'),
+    (imu(acc=(51, 0, 0)), 'IMU acceleration norm 51.000 exceeds experimental limit 50'),
     (NS(ori=(0, 0, 0, 0), linear_acc=(0, 0, 9.81), angular_vel=(0, 0, 0)),
      'IMU quaternion norm 0.000 outside experimental range'),
 ])
@@ -177,7 +177,7 @@ def test_acceleration_limit_during_motion_brakes_and_retains_rejected_sample(mon
     plant = Plant(monkeypatch)
     read = plant._read_distance_imu
     def shock():
-        return imu(acc=(31, 0, 9.81)) if plant.distance > 0.1 else read()
+        return imu(acc=(51, 0, 9.81)) if plant.distance > 0.1 else read()
     monkeypatch.setattr(plant, '_read_distance_imu', shock)
     result = module.run_distance(plant, 0.5)
     assert result['state'] == 'error'
@@ -185,7 +185,7 @@ def test_acceleration_limit_during_motion_brakes_and_retains_rejected_sample(mon
     assert not result['stationary_assumed']
     assert plant.commands[-1][1:] == (0, 0)
     trace = json.loads(Path(result['imu_trace_path']).read_text())
-    assert trace['samples'][-1]['linear_acceleration_mps2'] == [31, 0, 9.81]
+    assert trace['samples'][-1]['linear_acceleration_mps2'] == [51, 0, 9.81]
     assert trace['result']['state'] == 'error'
 
 
@@ -338,31 +338,29 @@ def test_lateral_limit_scales_with_the_requested_distance():
     assert module.lateral_limit(3.0) == pytest.approx(1.50)
 
 
-def test_lagging_imu_switches_to_the_calibrated_travel_estimate(monkeypatch):
-    """The IMU cannot see the motion; the worker must fall back to the command
-    integration and still finish the requested move instead of stopping."""
+def test_lagging_imu_stops_with_an_error_instead_of_dead_reckoning(monkeypatch):
+    """The IMU cannot see the motion; a command-speed model cannot observe the
+    real displacement either, so the worker must brake and report a fault."""
     plant = Plant(monkeypatch)
     def quiet():
         plant.samples += 1
         return imu(acc=(0, 0, 9.81+1e-7*math.sin(plant.samples)))
     monkeypatch.setattr(plant, '_read_distance_imu', quiet)
     result = module.run_distance(plant, 0.5)
-    assert result['state'] == 'done', result
-    assert result['distance_source'] == 'dead_reckoned_fallback'
-    assert result['fallback_reason']
+    assert result['state'] == 'error', result
+    assert 'dead-reckoned travel' in result['error']
+    assert result['dead_reckoned_m'] > 0.1
     assert result['estimated_distance_m'] == pytest.approx(0.0, abs=0.01)
-    assert result['control_distance_m'] == pytest.approx(0.4, abs=0.05)
-    assert abs(0.5-result['control_distance_m']) <= 0.15
+    assert result['accuracy_validated'] is False
     assert plant.commands[-1][1:] == (0, 0)
     trace = json.loads(Path(result['imu_trace_path']).read_text())
     assert any('dead_reckoned_m' in sample for sample in trace['samples'])
-    assert trace['result']['distance_source'] == 'dead_reckoned_fallback'
+    assert trace['result']['state'] == 'error'
 
 
-def test_imu_under_reporting_switches_to_the_calibrated_travel_estimate(monkeypatch):
+def test_imu_under_reporting_stops_with_an_error(monkeypatch):
     """An IMU that sees only a fraction of the motion still progresses, so the
-    no-progress check cannot catch it; the cross-check must switch the loop to
-    the command integration and finish."""
+    no-progress check cannot catch it; the cross-check must brake and fault."""
     plant = Plant(monkeypatch)
     def weak():
         plant.samples += 1
@@ -370,8 +368,7 @@ def test_imu_under_reporting_switches_to_the_calibrated_travel_estimate(monkeypa
                         9.81+1e-7*math.sin(plant.samples)))
     monkeypatch.setattr(plant, '_read_distance_imu', weak)
     result = module.run_distance(plant, 1.)
-    assert result['state'] == 'done', result
-    assert result['distance_source'] == 'dead_reckoned_fallback'
+    assert result['state'] == 'error', result
+    assert 'dead-reckoned travel' in result['error']
     assert result['dead_reckoned_m'] > result['estimated_distance_m']
-    assert abs(1.-result['control_distance_m']) <= 0.15
     assert plant.commands[-1][1:] == (0, 0)
