@@ -4,7 +4,7 @@
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
-| `tron2_teaching` | actuator | 原厂 VR 只读录制与 LeRobot v3 导出；实体回放受独占门禁限制 | 工作台，不发布控制 topic |
+| `tron2_teaching` | actuator | 原厂 VR 只读录制与 LeRobot v3 导出；实体回放由人工逐次确认独占 | 工作台，不发布控制 topic |
 | `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架，附随腕运动的左右夹爪示意；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
 | `pose` | actuator | salute/wave/welcome预设轨迹；挥手含右夹爪一次开合；整套ACP完成 | 无；详情显示共享双臂任务 |
 | `gripper` | actuator | 选择左/右夹爪并设置目标开口，0mm闭合 | 无；详情显示所选侧反馈 |
@@ -172,4 +172,4 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 
 ## 原厂 VR 示教与 VLA 数据
 
-新增 `tron2_teaching` 工作台，保存双臂、头部、双夹爪和三路 RGB episode，支持 LeRobot v3 导出。录制不接管原厂 VR。实体回放当前因独占控制接口未验证而阻塞。完整数据结构、接口证据、操作和验收边界见 [录制与回放说明](TEACHING.md)。
+新增 `tron2_teaching` 工作台，保存双臂、头部、双夹爪和三路 RGB episode，支持 LeRobot v3 导出。录制不接管原厂 VR。实体回放前由操作者确认原厂 VR 和其他控制程序已停止，并保持独占。完整数据结构、接口证据、操作和验收边界见 [录制与回放说明](TEACHING.md)。

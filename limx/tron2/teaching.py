@@ -24,14 +24,14 @@ class TronTeachingAdapter:
         joint_groups=[{'label':'左臂','count':7},{'label':'右臂','count':7}], grippers=False,
         recording_label='实测双臂与夹爪', prepare_hint='只读检查反馈和存储；不接管原厂 VR。',
         next_hint='使用原厂 VR 示范。录制器只读取关节、夹爪与三路图像。',
-        trial_hint='训练数据可直接导出。实体回放需可靠的独占控制证明；当前厂家接口尚未提供该证明。',
+        trial_hint='训练数据可直接导出。回放前由操作者确认原厂 VR 和其他控制程序已停止，并保持控制独占。',
         conditions_placeholder='固定底座、相同物体布置、原厂 VR 已退出、控制来源独占。')
-    replay_instruction='TRON2 不自动回起点或切换模式。夹爪回放须明确 gripper_speed 和 gripper_force（厂家档位）。停止发送不等于物理停止。'
+    replay_instruction='TRON2 不自动回起点或切换模式。每次执行须由操作者确认原厂 VR 和其他控制程序已停止，并明确填写 exclusive_control_confirmed=true；软件不能检测跨进程控制独占。夹爪回放须明确 gripper_speed 和 gripper_force（厂家档位）。停止发送不等于物理停止。'
 
     def __init__(self, owner, loop, root):
         self.owner,self.loop,self.root=owner,loop,Path(root)
         self.capture=Capture(owner.reader, owner.session, owner.settings['camera_urls'], self.root/'episodes')
-        self.replay=Replay(owner.reader,self.exclusive_control,self.peers_idle)
+        self.replay=Replay(owner.reader,None,self.peers_idle)
         from completion import MotionPeers
         owner.motion.peers.append(self.replay)
         owner.head.peers.append(self.replay)
@@ -44,10 +44,6 @@ class TronTeachingAdapter:
     def peers_idle(self):
         owners=[self.owner.motion,self.owner.head,*self.owner.grippers.values()]
         return all(not owner.active and not getattr(owner,'recovering',False) and not getattr(owner,'pose_step',None) for owner in owners)
-
-    async def exclusive_control(self):
-        # tele_operation=OK is health, not a lease or proof that original VR exited.
-        return False
 
     def compatibility(self):
         binding=self.capture.binding()
@@ -73,7 +69,7 @@ class TronTeachingAdapter:
         return dict(state='recording' if rec['recording'] else 'idle',busy=busy,can_prepare=not busy,
             can_record=not busy and self.owner.reader.sample('joint_state')['available'],recording=rec,
             recordings=self.recordings(),teleop_hint='录制器不发送运动命令。停止录制不停止原厂 VR。',
-            replay_available=False,replay_blocker='exclusive_control_unverified',last_action=self.replay.outcome)
+            replay_available=True,control_confirmation='operator_per_execution',last_action=self.replay.outcome)
 
     def check(self):
         checks=[]
@@ -90,7 +86,7 @@ class TronTeachingAdapter:
         checks.extend(self.sync(self.capture.probe()))
         return dict(ready=ready,training_ready=all(c['ok'] for c in checks),checks=checks,read_only=True,motion_sent=False,
             camera_and_gripper_validation='每帧录制时检查；缺失不能成为完整训练 episode',
-            replay_blocker='exclusive_control_unverified')
+            control_confirmation='operator_per_execution')
 
     def _storage(self):
         self.root.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -144,12 +140,12 @@ class TronTeachingAdapter:
     def start_difference(self,filename):
         try:
             raw,_=self.raw(filename)
-            _,frames=read_trajectory(raw,self.capture.binding())
+            frames,_=self.sync(self.replay.preflight(raw,self.capture.binding()))
             feedback=self.owner.reader.sample('joint_state')
             if not feedback['available']:raise ValueError('replay_feedback_stale')
             delta=[a-b for a,b in zip(feedback['data']['q'][:14],frames[0]['q'])]
-            return dict(ready=False,can_trial=False,error='exclusive_control_unverified',
-                message='尚无可靠的原厂 VR 退出与独占控制证明；禁止实体回放。训练数据可直接导出。',
+            return dict(ready=True,can_trial=True,
+                message='起点与设备预检通过；执行前须人工确认原厂 VR 已退出、其他控制程序已停止。',
                 joint_delta_deg=[math.degrees(v) for v in delta],
                 target_joints_deg=[math.degrees(v) for v in frames[0]['q']],tolerance_label='2°；不自动回起点')
         except (ValueError,OSError) as exc:
@@ -198,6 +194,7 @@ class TronTeachingPlugin(TeachingPlugin):
         tools=super().get_tools();schema=tools[0]['inputSchema']
         schema['properties'].update({k:{'type':'string'} for k in ('task','outcome','notes','episode_id')})
         schema['properties'].update({k:{'type':'number','minimum':0,'maximum':100} for k in ('gripper_speed','gripper_force')})
+        schema['properties']['exclusive_control_confirmed']={'type':'boolean','description':'操作者明确确认本次原厂 VR 及其他控制程序已停止，并在回放期间保持独占；不得自行填写 true'}
         extra={'episode_list':([], '列出完整及诊断录制'),
             'episode_details':(['episode_id'],'查看数据质量'),
             'annotate':(['episode_id','task','outcome','notes'],'更新任务、结果和备注'),
@@ -208,9 +205,9 @@ class TronTeachingPlugin(TeachingPlugin):
             schema['properties']['action']['oneOf'].append({'const':action,'title':description})
             schema['x-action-params'][action]={'params':fields,'description':description}
             schema['x-workbench']['actions'].append(action)
-        schema['x-action-params']['run']['params'] += ['gripper_speed','gripper_force']
+        schema['x-action-params']['run']['params'] += ['gripper_speed','gripper_force','exclusive_control_confirmed']
         schema['x-workbench']['title']='TRON2 录制与回放'
-        tools[0]['description']='原厂 VR 只读数据录制、实测轨迹回放和 LeRobot v3 训练导出。回放须独占控制；当前独占接口未验证。'
+        tools[0]['description']='原厂 VR 只读数据录制、实测轨迹回放和 LeRobot v3 训练导出。回放每次须由操作者确认控制独占。'
         return tools
 
     def dispatch(self,action,args):
@@ -242,7 +239,12 @@ class TronTeachingPlugin(TeachingPlugin):
                 self.export_job={'state':'running','episode_id':ident,'path':str(destination)}
                 threading.Thread(target=self._export,args=(ident,destination),name='tron2-vla-export',daemon=True).start()
                 return {'export':self.export_job}
-        return super().dispatch(action,args)
+        result=super().dispatch(action,args)
+        if action in ('preview','run') and result.get('executed') is False:
+            result['execution_arguments'].update(exclusive_control_confirmed=False,
+                gripper_speed=args.get('gripper_speed'),gripper_force=args.get('gripper_force'))
+            result['next_step']='请操作者确认原厂 VR 和其他控制程序已停止、活动空间已清空，并明确夹爪速度和力档位。确认后补齐 execution_arguments，再执行。'
+        return result
 
     def _export(self,ident,destination):
         try:

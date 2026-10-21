@@ -1,7 +1,7 @@
 """Strict measured trajectories and cancellable, feedback-checked replay.
 
-The caller must supply a live exclusive-control guard. The current vendor API
-has no verified lease; production cannot execute until that guard is available.
+Without a vendor control guard, each execution requires operator confirmation.
+This confirmation is not a hardware lease or detection of other processes.
 """
 import asyncio
 import hashlib
@@ -96,7 +96,7 @@ class Replay:
         return None
 
     async def guard(self):
-        if await self.exclusive_guard() is not True:
+        if self.exclusive_guard is not None and await self.exclusive_guard() is not True:
             raise ValueError('exclusive_control_unverified')
         if not self.peers_idle():
             raise ValueError('other_motion_active')
@@ -141,6 +141,8 @@ class Replay:
             raise ValueError('paired_preview_required')
         if args.get('workspace_clear') is not True or args.get('take_control') is not True:
             raise ValueError('user_confirmation_required')
+        if self.exclusive_guard is None and args.get('exclusive_control_confirmed') is not True:
+            raise ValueError('operator_exclusive_confirmation_required')
         # Measured feedback is not a command speed/force. Require explicit settings.
         from gripper import percentage
         speed=percentage(args.get('gripper_speed'),'gripper_speed')

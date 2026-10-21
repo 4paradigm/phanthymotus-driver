@@ -120,6 +120,30 @@ def test_unverified_control_never_sends():
     asyncio.run(run())
 
 
+def test_manual_exclusive_confirmation_is_required_for_each_execution():
+    async def run():
+        reader=Reader();replay=Replay(reader,None,lambda:True);raw=recording()
+        for confirmation in (None,False,'true'):
+            preview=await replay.play(raw,BINDING,{})
+            with pytest.raises(ValueError,match='operator_exclusive_confirmation_required'):
+                await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
+                    workspace_clear=True,take_control=True,exclusive_control_confirmed=confirmation,
+                    gripper_speed=30,gripper_force=20))
+            assert reader.commands==[]
+        preview=await replay.play(raw,BINDING,{})
+        result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
+            workspace_clear=True,take_control=True,exclusive_control_confirmed=True,
+            gripper_speed=30,gripper_force=20))
+        assert (await replay.wait(result['action_id']))['status']=='completed'
+        reader.q=[0]*14+[.2,.3];reader.grip=[0,20]
+        count=len(reader.commands);preview=await replay.play(raw,BINDING,{})
+        with pytest.raises(ValueError,match='operator_exclusive_confirmation_required'):
+            await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
+                workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
+        assert len(reader.commands)==count
+    asyncio.run(run())
+
+
 def test_capture_original_mjpeg_and_no_motion(tmp_path):
     async def run():
         reader=Reader();raw=jpeg()
@@ -175,7 +199,7 @@ def test_shared_service_packages_and_skill_gate(tmp_path):
         with pytest.raises(ValueError,match='successful_trial_required'):
             await asyncio.to_thread(plugin.dispatch,'save',{'draft_id':draft['id'],'effect_confirmed':True,'name':'test','conditions':'test'})
         inspected=await asyncio.to_thread(plugin.dispatch,'inspect',{'draft_id':draft['id']})
-        assert not inspected['start']['can_trial']
+        assert inspected['start']['can_trial']
         raw=adapter.export_recording(draft['recording'])
         manifest,archive=pack(dict(name='test',description='test',conditions='test',phrase='test'),adapter.compatibility(),raw,'motus.tron2.trajectory/1')
         parsed,raw=unpack(archive)
