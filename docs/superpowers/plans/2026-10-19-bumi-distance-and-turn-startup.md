@@ -1,5 +1,7 @@
 # Bumi distance and turn startup Implementation Plan
 
+> **历史方案（2026-10-21）：** 本文记录早期 RGB-D/IMU 融合设计，不是当前生产镜像的安装或部署指南。生产驱动使用直接 `pyrealsense2` 采集与实验性机身 IMU 测距，不打包或启动 RTAB-Map/EKF。当前行为以 [`noetix/bumi/README.md`](../../../noetix/bumi/README.md) 为准；独立视觉融合实验见 [`experiments/bumi_odometry/README.md`](../../../experiments/bumi_odometry/README.md)。
+
 > **For agentic workers:** Use superpowers:executing-plans inline. Steps use checkbox syntax.
 
 **Goal:** 接入前进距离反馈控制并修复末段点动不能启动步态。

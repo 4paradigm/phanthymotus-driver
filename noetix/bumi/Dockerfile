@@ -6,7 +6,7 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon
 
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
-ARG UBUNTU_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
+ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
 RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
@@ -15,7 +15,7 @@ WORKDIR /work
 
 # The shared ROS base image points apt at Tencent's private mirror, which is
 # unavailable on ordinary networks and on the Bumi host. Replace it with the
-# public HTTPS mirror before the first apt invocation; packages remain signed
+# official Ubuntu HTTPS archive before the first apt invocation; packages remain signed
 # and subject to apt's normal verification.
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         -exec sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_MIRROR}|g" {} + && \
