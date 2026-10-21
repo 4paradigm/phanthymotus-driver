@@ -1001,7 +1001,12 @@ class SpeakerPlugin:
         if not self._running:
             return False
         if metadata.tracked and self._telemetry_enabled:
+            previous = self._telemetry.get_recent_events(metadata.speech_id, 1)
             if not self._telemetry.receive_chunk(metadata, len(pcm) // (self._channels * 2)):
+                recent = self._telemetry.get_recent_events(metadata.speech_id, 1)
+                if (recent != previous and recent
+                        and recent[-1].get("event") == "failed"):
+                    self._publish_terminal_events(recent)
                 return False
         self._process.stdin.write(encode_packet(metadata, pcm))
         self._process.stdin.flush()
@@ -1098,6 +1103,21 @@ class SpeakerPlugin:
 
     def _pump(self):
         while self._running and self._process and self._process.stdin:
+            failure_getter = getattr(self._client, "pop_speaker_failure", None)
+            if callable(failure_getter) and self._telemetry_enabled:
+                # Bound each drain pass so PCM processing is not starved.
+                for _ in range(64):
+                    failure = failure_getter()
+                    if failure is None:
+                        break
+                    if not isinstance(failure, dict) or not failure.get("speech_id"):
+                        continue
+                    events = self._telemetry.fail_or_reject_events(
+                        str(failure["speech_id"]),
+                        "SPEAKER_QUEUE_OVERFLOW",
+                        "tracked speaker chunk dropped because the queue is full",
+                    )
+                    self._publish_terminal_events(events)
             getter = getattr(self._client, "pop_speaker_chunk", None)
             item = getter() if callable(getter) else None
             if item is None:

@@ -487,7 +487,7 @@ def test_speaker_tool_declares_telemetry_actions(monkeypatch):
             "get_capabilities"}.issubset(actions)
 
 
-def test_bridge_subscription_callback_accepts_tracked_audio():
+def test_bridge_subscription_callback_accepts_tracked_audio(monkeypatch):
     """Exercise the actual nested subscription callback, including its format gate."""
     import ast
     import hashlib
@@ -507,7 +507,7 @@ def test_bridge_subscription_callback_accepts_tracked_audio():
     callback_source = "".join(lines[callback.lineno - 1:callback.end_lineno])
 
     wrapper = (
-        "def build_callback(node, speaker_q):\n"
+        "def build_callback(node, speaker_q, speaker_fail_q):\n"
         "    speaker_frames_received = 0\n"
         "    speaker_duplicate_frames_dropped = 0\n"
         "    last_speaker_digest = b''\n"
@@ -523,6 +523,7 @@ def test_bridge_subscription_callback_accepts_tracked_audio():
         "speaker_chunk_from_message": speaker_chunk_from_message,
         "hashlib": hashlib,
         "time": types.SimpleNamespace(monotonic=lambda: fake_clock[0]),
+        "queue": queue,
     }
     exec(compile(wrapper, str(source_path), "exec"), scope)
 
@@ -533,7 +534,8 @@ def test_bridge_subscription_callback_accepts_tracked_audio():
     )
     node = types.SimpleNamespace(get_logger=lambda: logger)
     speaker_q = queue.Queue()
-    on_speaker = scope["build_callback"](node, speaker_q)
+    speaker_fail_q = queue.Queue()
+    on_speaker = scope["build_callback"](node, speaker_q, speaker_fail_q)
 
     # Identical PCM with different sequence values must both survive.
     for sequence in (0, 1):
@@ -571,6 +573,64 @@ def test_bridge_subscription_callback_accepts_tracked_audio():
     on_speaker(_Message(bad_format))
     assert len(warnings) == 2
     assert "101 chunks" in warnings[-1]
+
+    # Force overflow without using the real robot.
+    full_q = queue.Queue(maxsize=1)
+    full_q.put_nowait({"pcm": b"occupied"})
+    overflow_callback = scope["build_callback"](
+        node, full_q, speaker_fail_q)
+
+    plugin = _plugin(_load_legacy_device(monkeypatch))
+
+    # Case 1: sequence 0 never reaches the Driver.
+    overflow_callback(_Message(
+        "audio/pcm-16k;speech_id=overflow_new;sequence=0;eof=0",
+        b"\x00\x00" * 160,
+    ))
+
+    # Case 2: sequence 0 was accepted, but EOF overflows.
+    first = speaker_chunk_from_message(_Message(
+        "audio/pcm-16k;speech_id=overflow_eof;sequence=0;eof=0",
+        b"\x00\x00" * 160,
+    ))
+    assert plugin._write_speaker_chunk(first)
+
+    for _ in range(2):
+        overflow_callback(_Message(
+            "audio/pcm-16k;speech_id=overflow_eof;sequence=1;eof=1",
+            b"\x00\x00" * 160,
+        ))
+
+    assert speaker_fail_q.qsize() == 3
+    assert full_q.qsize() == 1
+
+    # Consume Bridge failure notifications through the actual pump.
+    def pop_failure():
+        if speaker_fail_q.empty():
+            return None
+        return speaker_fail_q.get_nowait()
+
+    def stop_after_failures():
+        plugin._running = False
+        return None
+
+    plugin._client.pop_speaker_failure = pop_failure
+    plugin._client.pop_speaker_chunk = stop_after_failures
+    plugin._pump()
+
+    for speech_id in ("overflow_new", "overflow_eof"):
+        status = plugin._telemetry.get_status(speech_id)
+        assert status["state"] == "FAILED"
+        assert status["error_code"] == "SPEAKER_QUEUE_OVERFLOW"
+
+        failures = [
+            event for event in plugin._published_events
+            if event.get("speech_id") == speech_id
+            and event.get("event") == "failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["state"] == "FAILED"
+        assert failures[0]["error_code"] == "SPEAKER_QUEUE_OVERFLOW"
 
 
 @pytest.mark.parametrize("cause,expected_state", [
@@ -700,3 +760,89 @@ def test_generated_player_rejects_forward_sequence_gap(monkeypatch):
         for event in events
     )
     assert fake.write_calls == 1
+
+
+def test_tracker_sequence_rejection_publishes_terminal_event_once(monkeypatch):
+    module = _load_legacy_device(monkeypatch)
+    plugin = _plugin(module)
+
+    published = []
+    plugin._client.publish_speaker_event = published.append
+
+    cases = [
+        ("first_gap", [1]),
+        ("middle_gap", [0, 2]),
+    ]
+
+    for speech_id, sequences in cases:
+        for index, sequence in enumerate(sequences):
+            item = speaker_chunk_from_message(_Message(
+                f"audio/pcm-16k;speech_id={speech_id};"
+                f"sequence={sequence};eof={int(index == len(sequences) - 1)}",
+                b"\x00\x00" * 160,
+            ))
+            result = plugin._write_speaker_chunk(item)
+            if index == len(sequences) - 1:
+                assert result is False
+
+        status = plugin._telemetry.get_status(speech_id)
+        assert status["state"] == "FAILED"
+        assert status["error_code"] == "CHUNK_SEQUENCE_ERROR"
+
+        failures = [
+            event for event in published
+            if event.get("speech_id") == speech_id
+            and event.get("event") == "failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["state"] == "FAILED"
+
+        # Rejected duplicate input must not publish a second failure.
+        assert plugin._write_speaker_chunk(item) is False
+        assert len([
+            event for event in published
+            if event.get("speech_id") == speech_id
+            and event.get("event") == "failed"
+        ]) == 1
+
+
+def _send_speaker_failure_from_child(failure_q):
+    failure_q.put({
+        "speech_id": "mp_overflow_test",
+        "code": "SPEAKER_QUEUE_OVERFLOW",
+        "message": "tracked speaker chunk dropped because the queue is full",
+    })
+
+
+def test_bridge_speaker_failure_crosses_process_boundary():
+    import time
+
+    bridge = BridgeWorker("q5")
+    process = bridge._ctx.Process(
+        target=_send_speaker_failure_from_child,
+        args=(bridge._speaker_fail_q,),
+    )
+
+    try:
+        process.start()
+
+        deadline = time.monotonic() + 5
+        failure = None
+        while failure is None and time.monotonic() < deadline:
+            failure = bridge.pop_speaker_failure()
+            if failure is None:
+                time.sleep(0.01)
+
+        assert failure is not None
+        assert failure["speech_id"] == "mp_overflow_test"
+        assert failure["code"] == "SPEAKER_QUEUE_OVERFLOW"
+        assert bridge.pop_speaker_failure() is None
+
+        process.join(timeout=3)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3)
+        bridge._speaker_fail_q.close()
+        bridge._speaker_fail_q.join_thread()

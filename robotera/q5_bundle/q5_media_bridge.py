@@ -65,6 +65,7 @@ class BridgeWorker:
         self._media_lock = threading.Lock()
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
+        self._speaker_fail_q = self._ctx.Queue()
         self._proc = None
         self._debug = debug
         self._namespace = namespace
@@ -74,7 +75,7 @@ class BridgeWorker:
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
             args=(self._cmd_q, self._sensor_q, self._media_qs, self._audio_q, self._speaker_q,
-                  self._debug, self._namespace),
+                  self._speaker_fail_q, self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
         self._proc.start()
@@ -130,6 +131,12 @@ class BridgeWorker:
         except Exception:
             pass
 
+    def pop_speaker_failure(self):
+        try:
+            return self._speaker_fail_q.get_nowait()
+        except queue.Empty:
+            return None
+
     def pop_speaker_chunk(self):
         try:
             return self._speaker_q.get_nowait()
@@ -150,7 +157,8 @@ class BridgeWorker:
 
 
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
-                           audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
+                           audio_q: mp.Queue, speaker_q: mp.Queue,
+                          speaker_fail_q: mp.Queue, debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     try:
         from common import logsafe
@@ -264,7 +272,17 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                     return
                 last_speaker_digest = digest
                 last_speaker_frame_at = now
-            speaker_q.put_nowait(item)
+            try:
+                speaker_q.put_nowait(item)
+            except queue.Full:
+                # Do not lose tracked EOF or other tracked chunks silently.
+                if item["metadata"].tracked:
+                    speaker_fail_q.put_nowait({
+                        "speech_id": item["metadata"].speech_id,
+                        "code": "SPEAKER_QUEUE_OVERFLOW",
+                        "message": "tracked speaker chunk dropped because the queue is full",
+                    })
+                return
             speaker_frames_received += 1
             if speaker_frames_received == 1:
                 node.get_logger().info("speaker received first PCM frame")

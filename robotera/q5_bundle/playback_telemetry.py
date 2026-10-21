@@ -349,9 +349,30 @@ class PlaybackTracker:
             speech.state = state
             speech.error_code = code
             speech.error_message = message
-            self._emit(speech, state.lower(), details_message=message)
+            self._emit(speech, state.lower(), error_code=code,
+                       details_message=message)
             self._condition.notify_all()
             return True
+
+    def fail_or_reject_events(self, speech_id: str, code: str,
+                              message: str) -> List[dict]:
+        """Fail a tracked speech even if its first PCM chunk never arrived.
+
+        Return only newly emitted terminal events for external publication.
+        """
+        if not speech_id:
+            return []
+        with self._condition:
+            if speech_id in self._rejections:
+                return []
+            speech = self._speeches.get(speech_id)
+            if speech is None:
+                self._reject_new_speech(speech_id, code, message)
+            elif speech.state in _TERMINAL_STATES:
+                return []
+            else:
+                self.fail(speech_id, code, message)
+            return [dict(self._events[-1])]
 
     def fail_active_events(self, code: str, message: str,
                            state: str = "FAILED") -> List[dict]:
