@@ -6,6 +6,15 @@ ros_namespace: ""
 joint_state_position_unit: "radians"
 
 plugins:
+  wooden_man:
+    enabled: true
+    cue_seconds: 3.0
+    settle_seconds: 0.5
+    watch_seconds: 3.0
+    motion_threshold: 0.07
+    moving_frames: 3
+    pose_timeout: 1.5
+    confidence: 0.5
   base_drive:
     enabled: true
     # Match the vendor SDK's direct base-drive contract, not the remote-control stream.
