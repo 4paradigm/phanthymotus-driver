@@ -16,6 +16,8 @@ def validate_display(value):
     if visual is not None:
         if not isinstance(visual, dict) or type(visual.get("available")) is not bool:
             raise ValueError("invalid_visualization")
+        if "stale" in visual and type(visual["stale"]) is not bool:
+            raise ValueError("invalid_visualization_stale")
         if visual["available"]:
             if type(visual.get("feedback_fresh")) is not bool:
                 raise ValueError("invalid_feedback_fresh")
@@ -50,7 +52,7 @@ def validate_display(value):
                                    ("position_tolerance_m", 8), ("orientation_tolerance_rad", math.pi)):
                     number(arm.get(key), upper)
         if alignment["ready"] and (not visual or not visual.get("available")
-                or not visual.get("feedback_fresh") or len(visual.get("measured", [])) != 2
+                or visual.get("stale", False) or not visual.get("feedback_fresh") or len(visual.get("measured", [])) != 2
                 or len(visual.get("ik", [])) != 2):
             raise ValueError("alignment_without_current_skeletons")
 
@@ -115,7 +117,7 @@ class RobotFeedback:
                 return unavailable
             age_ms = (self.runtime.clock_ns() - self.value["emitted_monotonic_ns"]) / 1e6
             status = self.runtime.status()
-            if age_ms < 0 or age_ms >= 750 or not status["input_fresh"] or not status["tracking"] or not all(status["tracking"].values()):
+            if age_ms < 0 or not status["input_fresh"] or not status["tracking"] or not all(status["tracking"].values()):
                 return {**unavailable, "reason": "feedback_stale"}
             value = copy.deepcopy(self.value)
             value["feedback_age_ms"] = age_ms
@@ -123,8 +125,9 @@ class RobotFeedback:
             if visual is not None and visual.get("available"):
                 visual["intent_age_ms"] += age_ms
                 visual["feedback_age_ms"] = age_ms
-                if visual["intent_age_ms"] >= 300:
-                    visual["ik"] = []
+                if age_ms >= 750 or visual["intent_age_ms"] >= 300 or visual.get("stale", False):
+                    visual["stale"] = True
+                    visual["feedback_fresh"] = False
                     value["alignment"] = {"state": "unavailable", "ready": False}
             value.setdefault("alignment", {"state": "unavailable", "ready": False})
             return value

@@ -18,7 +18,7 @@ inline IkPoint IkOperatorViewPoint(IkPoint p) {
 }
 
 struct IkVisualization {
-  bool available{false}, feedback_fresh{false};
+  bool available{false}, feedback_fresh{false}, stale{false};
   std::string mode, state, reason, control_reason;
   double intent_age_ms{1e9};
   IkChains measured, ik, command, body, held_ik;
@@ -85,12 +85,12 @@ struct IkVisualization {
       std::chrono::steady_clock::now()-received).count() < (teleop ? 300 : 750) && !ik.empty();
   }
   const IkChains& displayed_ik() const {
-    if(teleop && !current_ik()) { static const IkChains empty; return empty; }
+    if(teleop) return ik; // Historical display never restores freshness or readiness.
     return current_ik() || !tianyi ? ik : (held_ik.empty() ? ik : held_ik);
   }
   bool fresh() const {
     const auto age=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-received).count();
-    return available && age + (teleop ? feedback_age_ms : 0) < 750;
+    return available && !stale && age + (teleop ? feedback_age_ms : 0) < 750;
   }
 };
 inline IkPoint ParseIkPoint(const nlohmann::json& value) {
@@ -140,6 +140,7 @@ inline IkVisualization ParseIkVisualization(const nlohmann::json& envelope) {
     const auto& v=envelope.at("visualization");
     r.feedback_age_ms=v.value("feedback_age_ms",r.feedback_age_ms);
     if(!std::isfinite(r.feedback_age_ms)||r.feedback_age_ms<0)throw std::invalid_argument("feedback_age");
+    r.stale=v.value("stale",false);
     r.available=v.value("available",false);r.reason=v.value("reason",std::string{});
     if(!r.available)return r;
     r.feedback_fresh=v.value("feedback_fresh",false);

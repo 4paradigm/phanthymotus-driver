@@ -11,7 +11,7 @@ int main(int argc, char** argv){
      assert(preview.ready()==wire.at("alignment").at("ready").get<bool>());
      if(preview.ready()){assert(preview.displayed_ik().size()==2);++ready;}
      preview.received-=std::chrono::seconds(1);
-     assert(!preview.ready() && preview.displayed_ik().empty());
+     assert(!preview.ready() && preview.displayed_ik()==preview.ik);
      ++frames;
    }
    assert(frames>=2 && ready>0 && ready<frames);
@@ -121,8 +121,12 @@ int main(int argc, char** argv){
  assert(preview.ready() && preview.alignment_label()=="READY");
  assert(preview.position_error_m[0]==.01 && preview.displayed_ik().size()==2);
  preview.received-=std::chrono::milliseconds(301);
- assert(!preview.ready() && preview.displayed_ik().empty());
+ assert(!preview.ready() && preview.displayed_ik()==preview.ik);
  assert(preview.alignment_label()=="ALIGNMENT UNAVAILABLE");
+ feedback["visualization"]["stale"]=true;
+ auto stale_preview=ParseIkVisualization(feedback);
+ assert(!stale_preview.fresh() && !stale_preview.ready() && stale_preview.displayed_ik().size()==2);
+ feedback["visualization"].erase("stale");
  feedback["visualization"]["feedback_age_ms"]=751;
  assert(!ParseIkVisualization(feedback).ready());
  feedback["visualization"]["feedback_age_ms"]=0;

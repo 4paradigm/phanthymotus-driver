@@ -88,7 +88,7 @@ PICO 保留透视画面，只读订阅机器人卡已有的 `/teleop/state` 并�
 
 | 对象 | 字段与约束 |
 |---|---|
-| `visualization` | `available`、`feedback_fresh`、`intent_age_ms`；`measured` 和 `ik` 各为左右两条关节位置链；可选 `torso`、`targets`、`shoulder_height` |
+| `visualization` | `available`（可绘制）、`stale`（历史骨架）、`feedback_fresh`、`intent_age_ms`；`measured` 和 `ik` 各为左右两条关节位置链；可选 `torso`、`targets`、`shoulder_height` |
 | `alignment` | `state` 为 `unaligned/ready/active/unreachable/unavailable`；仅 `ready` 状态的 `ready` 为 true |
 | `alignment.left/right` | `position_error_m`、`orientation_error_rad`、`position_tolerance_m`、`orientation_tolerance_rad`；除 unavailable 外均提供有限非负值 |
 
@@ -104,7 +104,7 @@ PICO 保留透视画面，只读订阅机器人卡已有的 `/teleop/state` 并�
 }
 ```
 
-示例数值不是默认阈值；机器人端决定诊断阈值、身体标定和接通规则。PICO 只校验并显示数据，界面误差换算为毫米与度。PICO 转发时在顶层附加 `feedback_age_ms`，无骨架时也保留反馈原始年龄；反馈超过 750 ms 后撤销控制提示。目标输入超过 300 ms 时隐藏旧 IK；跟踪丢失或代次改变时清除旧反馈。无效消息立即清除当前显示，来源冲突保持不可用，重新启动采集后重新绑定；旧来源不能覆盖新会话。
+示例数值不是默认阈值；机器人端决定诊断阈值、身体标定和接通规则。PICO 只校验并显示数据，界面误差换算为毫米与度。PICO 转发时在顶层附加 `feedback_age_ms`，无骨架时也保留反馈原始年龄；反馈超过 750 ms 后撤销控制提示。目标输入超过 300 ms 或反馈超过 750 ms 时保留旧 IK，标记 `visualization.stale=true`、`feedback_fresh=false` 和对齐不可用；历史骨架不能恢复控制提示或接通资格。跟踪丢失或代次改变时清除旧反馈。无效消息立即清除当前显示，来源冲突保持不可用，重新启动采集后重新绑定；旧来源不能覆盖新会话。
 
 真实骨架用绿色实线，映射目标用橙色半透明线，并附图例。顶层 `state/reason` 驱动 `CONFIRM ARMS DOWN / RELEASE BUTTONS / GRIP TO START / RESETTING ARMS / ACTIVE / STOPPED` 提示。`alignment.ready` 仅表示几何诊断，不代表运动接通。初始化尚无骨架时仍显示控制提示；缺失或过期状态显示 `NO ROBOT FEEDBACK`。Y+B 发出复位请求后，由操作员现场确认双臂下垂，再按 X+A 建立下一轮基准；自动复位结果检查不阻塞此确认流程，请求发送失败仍显示错误。
 

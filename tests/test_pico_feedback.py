@@ -55,6 +55,8 @@ def test_feedback_is_latest_read_only_and_ages_without_refresh(preview):
     lambda v: v.update(visualization=None),
     lambda v: v["visualization"].update(feedback_fresh=False),
     lambda v: v["visualization"].update(ik=[]),
+    lambda v: v["visualization"].update(stale=True),
+    lambda v: v["visualization"].update(stale="true"),
     lambda v: v["visualization"]["measured"][0][0].__setitem__(0, float("nan")),
     lambda v: v["alignment"].update(state="unaligned"),
     lambda v: v["alignment"]["left"].update(position_error_m=-1),
@@ -127,3 +129,24 @@ def test_control_status_keeps_age_without_an_ik_preview(preview):
     assert result["feedback_age_ms"] == 100
     assert not result["alignment"]["ready"]
     assert "feedback_age_ms" not in candidate
+
+
+def test_expired_feedback_keeps_geometry_without_refreshing_identity(preview):
+    runtime, cache, now = preview
+    original = display_feedback(runtime)
+    cache.accept(original)
+    for sequence, age in ((2, 301), (3, 800), (4, 1200)):
+        now[0] = original["emitted_monotonic_ns"] + age * 1_000_000
+        runtime.submit_rtc_frame(frame(sequence), authority=runtime._binding,
+                                 rtc_generation=runtime.generation)
+        result = cache.snapshot()
+        assert result["visualization"]["ik"] == original["visualization"]["ik"]
+        assert result["visualization"]["stale"]
+        assert not result["visualization"]["feedback_fresh"]
+        assert result["alignment"] == {"state": "unavailable", "ready": False}
+        assert result["feedback_age_ms"] == age
+        for key in ("sequence", "source_sequence", "emitted_monotonic_ns", "mapping_epoch"):
+            assert result[key] == original[key]
+    assert "stale" not in cache.value["visualization"]
+    cache.accept(display_feedback(runtime, 2))
+    assert cache.snapshot()["alignment"]["ready"]
