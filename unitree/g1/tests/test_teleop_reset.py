@@ -426,3 +426,23 @@ def test_long_return_has_its_own_deadline(tmp_path):
     assert arm._operation['state']=='returning' and not sdk
     for _ in range(1200): advance(10); arm.tick(); time.sleep(.0001)
     assert arm._operation['return_pose_reached'] and sdk==[99]
+
+
+@pytest.mark.parametrize('buttons', ['xa', 'yb'])
+def test_batched_button_release_restarts_long_press(tmp_path, buttons):
+    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
+    events = []
+    card._begin = lambda *a: events.append('confirm')
+    card._start_reset = lambda: events.append('reset')
+    for _ in range(8): frame = feed(buttons)
+    released = copy.deepcopy(frame)
+    advance(10)
+    released.update(sequence=frame['sequence']+1, received_monotonic_ns=arm.clock())
+    for side in ('left', 'right'):
+        for button in released[side]['controls']['buttons'].values(): button['pressed'] = False
+    assert card.receive(released)
+    frame['sequence'] += 1
+    for _ in range(4): feed(buttons)
+    assert not events and not sdk
+    for _ in range(7): feed(buttons)
+    assert events == ['confirm' if buttons == 'xa' else 'reset']

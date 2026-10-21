@@ -44,7 +44,7 @@ def bus_stub():
     bus=TeleopBus.__new__(TeleopBus)
     bus.binding=bus.sub=bus.pub=None
     bus.subscription_generation=0
-    bus.String=object;bus.qos=object()
+    bus.String=object;bus.qos=SimpleNamespace(depth=16)
     events=[]; callbacks=[]
     def sub(*args):
         events.append('create_sub');callbacks.append(args[2]);return object()
@@ -56,7 +56,7 @@ def bus_stub():
     bus.receive_error=bus.publish_error=None
     bus.last_received_sequence=bus.last_accepted_sequence=None
     bus.last_received_ns=bus.last_accepted_ns=None
-    bus.rejected_count=0
+    bus.rejected_count=0;bus._receive_count=0
     return bus,events,callbacks
 
 
@@ -155,7 +155,7 @@ def test_feedback_publishes_at_thirty_hz_without_catchup(monkeypatch, input_hz, 
         spins[0] += 1
         now[0] = min(now[0]+timeout_sec, next_input[0])
         if now[0] >= next_input[0]:
-            received[0] += 1; next_input[0] += 1/input_hz
+            received[0] += 1; next_input[0] += 1/input_hz; bus._receive_count += 1
         if not input_hz and not known_source and now[0] >= 1.: bus.closed.set()
         if spins[0] == 10 and stall:
             now[0] += stall
@@ -179,4 +179,38 @@ def test_feedback_publishes_at_thirty_hz_without_catchup(monkeypatch, input_hz, 
     if stall: assert max(intervals) >= stall
     else: assert intervals == pytest.approx([1/30]*30)
     if input_hz: assert published[-1][1] >= 70
+    assert not bus.health.status()['fatal']
+
+
+@pytest.mark.parametrize('continuous', [False, True])
+def test_feedback_sees_drained_input_and_flood_cannot_starve_close(monkeypatch, continuous):
+    from collections import deque
+    bus, _, _ = bus_stub()
+    monkeypatch.setitem(sys.modules, 'rclpy.impl.implementation_singleton',
+        SimpleNamespace(rclpy_implementation=SimpleNamespace(InvalidHandle=InvalidHandle)))
+    monkeypatch.setitem(sys.modules, 'rclpy.executors',
+        SimpleNamespace(ExternalShutdownException=type('ExternalShutdownException', (Exception,), {}),
+                        ShutdownException=type('ShutdownException', (Exception,), {})))
+    bus.closed = threading.Event(); bus.String = SimpleNamespace
+    bus._bind = lambda binding: None
+    pending = deque(range(1, 17)); received = []; spins = []; published = []
+    bus.control = SimpleNamespace(_lock=threading.RLock(), binding={})
+    def spin(timeout_sec):
+        spins.append(timeout_sec)
+        # Humble may finish the prior zero-timeout iterator without a callback.
+        if len(spins) % 2 and (pending or continuous):
+            received.append(pending.popleft() if pending else received[-1]+1)
+            bus._receive_count += 1
+    def feedback():
+        assert received[-1] == 16
+        assert len(spins) <= 2*bus.qos.depth
+        bus.closed.set()
+        return {'instance_id': 'source', 'source_sequence': received[-1]}
+    bus.control.feedback = feedback
+    bus.pub = SimpleNamespace(publish=lambda message: published.append(json.loads(message.data)))
+    bus.executor = SimpleNamespace(context=SimpleNamespace(ok=lambda: True), spin_once=spin,
+                                   remove_node=lambda node: None, shutdown=lambda: None)
+    bus.node.destroy_node = lambda: None
+    bus._run()
+    assert len(published) == 1 and published[0]['source_sequence'] == 16
     assert not bus.health.status()['fatal']

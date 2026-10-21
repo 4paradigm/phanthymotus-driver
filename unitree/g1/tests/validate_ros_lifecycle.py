@@ -5,6 +5,7 @@ import types
 import json
 import time
 import threading
+import statistics
 from pathlib import Path
 if os.environ.get('G1_TELEOP_ISOLATED_TEST') != '1':
     raise SystemExit('Use --network none --read-only, then set G1_TELEOP_ISOLATED_TEST=1')
@@ -24,11 +25,17 @@ class Control:
  def __init__(self):
   self._lock=threading.RLock();self.binding={'command_topic':'/test/a','feedback_topic':'/test/state'}
   self.executor=types.SimpleNamespace(set_joint_publisher=lambda cb:None,accept_control=lambda *a:None)
-  self.received=[]
+  self.received=[];self.latest=None;self.delay=0.;self.input_ages=[];self.sequence_lags=[]
  def receive(self,value):
   with self._lock:
-   self.received.append(value['sequence']);return True
- def feedback(self):return {'instance_id':'isolated-source' if self.received else '', 'count':len(self.received)}
+   self.received.append(value['sequence']);self.latest=value;return True
+ def feedback(self):
+  if self.delay:
+   if self.latest and 'sent_ns' in self.latest:
+    self.input_ages.append((time.monotonic_ns()-self.latest['sent_ns'])/1e6)
+    self.sequence_lags.append(seq-self.latest['sequence'])
+   time.sleep(self.delay)
+  return {'instance_id':'isolated-source' if self.received else '', 'count':len(self.received)}
 control=Control();bus=TeleopBus(shared,control)
 node=Node('isolated_input_test',context=ctx)
 qos=QoSProfile(depth=16,reliability=ReliabilityPolicy.RELIABLE,history=HistoryPolicy.KEEP_LAST)
@@ -81,7 +88,28 @@ try:
  error=bus.status()['receive_error'];assert error,bus.status()
  time.sleep(.3);assert bus.status()['receive_error']==error
  send(.5);assert bus.status()['receive_error'] is None
- print(json.dumps({'result':'ROS ISOLATED PASS','received':len(control.received),'subscription_generation':bus.subscription_generation,'invalid_handle_count':3,'lifecycle_owner':sorted(set(x[1] for x in owner_events)),'feedback_hz_active':round(active_hz,2),'feedback_hz_idle':round(idle_hz,2),'hardware_output':False}))
+ # Independent 90 Hz source plus slow feedback reproduces the old FIFO backlog.
+ control.delay=.045
+ sending=threading.Event()
+ def produce():
+  global seq
+  while not sending.is_set():
+   seq+=1;message=String();message.data=json.dumps({'sequence':seq,'sent_ns':time.monotonic_ns()})
+   pubs['/test/a'].publish(message);sending.wait(1/90)
+ producer=threading.Thread(target=produce);producer.start()
+ try:
+  deadline=time.monotonic()+2.5
+  while time.monotonic()<deadline:shared.spin_once(timeout_sec=.01)
+ finally:
+  sending.set();producer.join(1)
+ assert len(control.input_ages)>25,control.input_ages
+ median_age=statistics.median(control.input_ages)
+ p95_age=sorted(control.input_ages)[int(.95*(len(control.input_ages)-1))]
+ median_lag=statistics.median(control.sequence_lags)
+ assert median_age<50 and p95_age<90 and median_lag<=3,(median_age,p95_age,median_lag)
+ control.delay=0.
+ print(json.dumps({'result':'ROS ISOLATED PASS','slow_feedback_input_median_ms':round(median_age,2),
+ 'slow_feedback_input_p95_ms':round(p95_age,2),'slow_feedback_sequence_lag_median':median_lag,'received':len(control.received),'subscription_generation':bus.subscription_generation,'invalid_handle_count':3,'lifecycle_owner':sorted(set(x[1] for x in owner_events)),'feedback_hz_active':round(active_hz,2),'feedback_hz_idle':round(idle_hz,2),'hardware_output':False}))
 finally:
  bus.close();assert not bus.thread.is_alive()
  shared.remove_node(node);node.destroy_node();shared.shutdown();ctx.shutdown()

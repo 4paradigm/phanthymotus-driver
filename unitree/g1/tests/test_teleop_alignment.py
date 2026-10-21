@@ -129,3 +129,65 @@ def test_alignment_error_does_not_block_successful_ik(tmp_path):
     feed(3, True)
     assert card._enabled and len(outputs) == 1
     assert card.display_feedback()['alignment']['left']['position_error_m'] == .1
+
+
+@pytest.mark.parametrize('event', ['release', 'tracking', 'button', 'gap'])
+def test_batched_input_cannot_hide_pause_or_auto_resume(tmp_path, event):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2); last = feed(3, True)
+    assert card._enabled
+    before = len(outputs)
+    lost = copy.deepcopy(last)
+    lost.update(sequence=4, received_monotonic_ns=time.monotonic_ns())
+    if event == 'release': lost['left']['grip'] = 0.
+    if event == 'tracking': lost['left'].update(tracked=False, position=None, orientation_xyzw=None)
+    if event == 'button':
+        for side, name in [('left', 'x'), ('right', 'a')]:
+            lost[side]['controls'] = {'buttons': {name: {'available': True, 'pressed': True}}}
+    if event == 'gap':
+        # Source timestamps show a real input outage, not just a skipped sequence.
+        card._latest['received_monotonic_ns'] -= 301_000_000
+    assert card.receive(lost)
+    recovered = copy.deepcopy(last)
+    recovered.update(sequence=5, received_monotonic_ns=time.monotonic_ns())
+    assert card.receive(recovered)  # No control step between the two callbacks.
+    card.step(); motion.process_latest(); card.step()
+    assert not card._enabled and len(outputs) == before
+    feed(6, True)
+    assert not card._enabled and len(outputs) == before
+    feed(7, False); feed(8, True)
+    assert card._enabled and len(outputs) > before
+
+
+def test_normal_source_coalescing_does_not_pause_active_control(tmp_path):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2); feed(3, True)
+    # Observed producer sequence deltas include 2 and 3 during latest-value publish.
+    for seq in (5, 8, 9, 11):
+        feed(seq, True)
+        assert card._enabled and card._state == 'active'
+    assert len(outputs) == 5
+
+
+def test_release_while_resuming_cannot_submit_the_prior_target(tmp_path):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2); last = feed(3, True)
+    before = len(outputs)
+    motion.gate.state = 'hold'
+    original = card.executor.dispatch
+    def resume(action, args):
+        result = original(action, args)
+        if action == 'resume':
+            released = copy.deepcopy(last)
+            released.update(sequence=5, received_monotonic_ns=time.monotonic_ns())
+            released['left']['grip'] = 0.
+            card.receive(released)
+            recovered = copy.deepcopy(last)
+            recovered.update(sequence=6, received_monotonic_ns=time.monotonic_ns())
+            card.receive(recovered)
+        return result
+    card.executor.dispatch = resume
+    feed(4, True)
+    assert not card._enabled and len(outputs) == before
+    feed(7, True)
+    assert not card._enabled and len(outputs) == before

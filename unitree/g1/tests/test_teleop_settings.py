@@ -121,3 +121,20 @@ def test_config_action_does_not_reset_active_mapping():
     assert result['operator_session_id'] == 'active-session'
     assert card.mapping.anchor is anchor and card.mapping.scale == 1.
     assert card.live
+
+
+def test_admitted_input_is_owned_and_freshness_is_rechecked(tmp_path):
+    card, frame = input_card(tmp_path)
+    assert card.receive(frame)
+    frame['left']['position'][0] = float('nan')
+    assert card._latest_fresh()['left']['position'] == [0., 0., 1.]
+    card.clock = lambda: 1_300_000_000
+    assert card._latest_fresh()['sequence'] == 1
+    card.clock = lambda: 1_300_000_001
+    with pytest.raises(ValueError, match='input_stale'): card._latest_fresh()
+    card.clock = lambda: 999_999_999
+    with pytest.raises(ValueError, match='input_stale'): card._latest_fresh()
+    card.clock = lambda: 1_000_000_000
+    frame['sequence'] = 2
+    with pytest.raises(ValueError): card.receive(frame)
+    assert card._input_sequence == 1

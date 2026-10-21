@@ -32,6 +32,7 @@ class TeleopBus:
         self.last_received_sequence = self.last_accepted_sequence = None
         self.last_received_ns = self.last_accepted_ns = None
         self.rejected_count = 0
+        self._receive_count = 0
         control.executor.set_joint_publisher(control.executor.accept_control)
         control.transport_status = self.status
         self.executor.add_node(self.node)
@@ -54,6 +55,7 @@ class TeleopBus:
     def receive(self, message, generation=None):
         if generation is not None and generation != self.subscription_generation:
             return
+        self._receive_count += 1
         try:
             if len(message.data.encode('utf-8')) > 65536:
                 raise ValueError('packet_too_large')
@@ -132,7 +134,15 @@ class TeleopBus:
                         binding = copy.deepcopy(self.control.binding)
                     self._bind(binding)
                     timeout = min(.02, max(0., next_publish-time.monotonic())) if self.pub else .02
-                    self.executor.spin_once(timeout_sec=timeout)
+                    # Drain the bounded input queue before spending time on feedback.
+                    idle = 0
+                    for index in range(2*self.qos.depth):
+                        received = self._receive_count
+                        self.executor.spin_once(timeout_sec=timeout if index == 0 else 0.)
+                        # A zero-timeout spin can finish the previous ready iterator.
+                        idle = idle+1 if self._receive_count == received else 0
+                        if self.closed.is_set() or idle == 2:
+                            break
                     self.health.beat()
                     if self.pub and time.monotonic() >= next_publish:
                         next_publish = time.monotonic()+1/30

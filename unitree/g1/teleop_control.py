@@ -14,7 +14,7 @@ import secrets
 import threading
 import time
 
-from common.teleop_contract import validate_input, FEEDBACK_SCHEMA
+from common.teleop_contract import validate_input, FEEDBACK_SCHEMA, MAX_INPUT_AGE_NS
 from common.motion.protocol import envelope
 from trajectory_control import TrajectoryControl
 
@@ -119,6 +119,7 @@ class TeleopControl:
         self.executor.cfg['operator_session_enabled'] = self.live
         self.trajectory = TrajectoryControl(self, notify)
         self._input_changed = False
+        self._input_pause = None
         self._buttons = {}
         self._reset_operation = None
 
@@ -189,6 +190,7 @@ class TeleopControl:
             self.binding = binding
             self.instance_id = args.get('instance_id') or 'teleop_control'
             self._closed.clear()
+            self._input_pause = None
             self._buttons.clear()
             self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
         self.motion.start()
@@ -215,6 +217,20 @@ class TeleopControl:
             if old and identity[0] == old[0] and (identity[1] < old[1] or identity[2] < old[2]):
                 raise ValueError('old_input_generation')
             if identity == old and frame['sequence'] <= self._input_sequence: return False
+            # Preserve safety edges even when several frames arrive before step().
+            gap = (self._latest is not None and identity == old and
+                   frame['received_monotonic_ns']-self._latest['received_monotonic_ns'] > MAX_INPUT_AGE_NS)
+            tracked = all(frame[k]['tracked'] for k in ('head_reference', 'left', 'right'))
+            held = all(frame[k]['grip'] >= .5 for k in ('left', 'right'))
+            released = all(frame[k]['grip'] < .5 for k in ('left', 'right'))
+            confirm, reset = self._pressed(frame, 'x', 'a'), self._pressed(frame, 'y', 'b')
+            if gap or not tracked:
+                self._buttons.clear()
+                self._input_pause = 'input_stale' if gap else 'tracking_lost'
+            if not (released and confirm and not reset): self._buttons.pop('confirm', None)
+            if not (released and reset and not confirm): self._buttons.pop('reset', None)
+            if (self._enabled or self._engage_sequence is not None) and (not held or confirm or reset):
+                self._input_pause = self._input_pause or 'operator_pause'
             self._input_identity, self._input_sequence = identity, frame['sequence']
             source_changed = self._latest and self._latest['instance_id'] != frame['instance_id']
             self._latest = frame
@@ -232,10 +248,12 @@ class TeleopControl:
         if generation != self._generation or self._closed.is_set(): raise ValueError('operation_cancelled')
 
     def _latest_fresh(self):
-        frame = copy.deepcopy(self._latest)
+        # receive() validates and owns this copy; consumers only read it.
+        frame = self._latest
         if frame is None: raise ValueError('input_missing')
-        frame = validate_input(frame, clock_id=self.clock_id,
-                                now_ns=self.clock())
+        if frame['clock_id'] != self.clock_id: raise ValueError('input_clock_mismatch')
+        if not 0 <= self.clock()-frame['received_monotonic_ns'] <= MAX_INPUT_AGE_NS:
+            raise ValueError('input_stale')
         if not all(frame[k]['tracked'] for k in ('head_reference','left','right')):
             raise ValueError('tracking_lost')
         return frame
@@ -387,6 +405,11 @@ class TeleopControl:
             with self._lock:
                 if self._closed.is_set() or not self.binding: return
                 generation = self._generation
+                if self._input_pause:
+                    reason, self._input_pause = self._input_pause, None
+                    if reason != 'operator_pause' and (self._operator or self._reset_operation):
+                        raise ValueError(reason)
+                    if self._operator: self._hold(reason, grip=True)
                 frame = self._latest_fresh()
                 if self._input_changed:
                     self._input_changed = False
@@ -499,6 +522,7 @@ class TeleopControl:
             self._hold(code, grip=True)
 
     def _submit(self, frame, *, preview):
+        if not preview and self._input_pause: raise ValueError(self._input_pause)
         now = self.clock()
         self._sequence += 1
         command = envelope(self.motion._lease(), seq=self._sequence,
