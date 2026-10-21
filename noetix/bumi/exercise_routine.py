@@ -1,8 +1,9 @@
-"""Bumi routine scheduler. No ROS/SDK imports; physical completion is manual.
+"""Bumi routine scheduler and single-card workbench; no ROS/SDK imports.
 
-The SDK's workmode is not a trajectory-completion or freshness signal. Only
-operator confirmation authorizes a real clip to finish. Simulated timing never
-runs on the physical backend. A shared action lock serializes the routine with
+The SDK has no reliable physical-completion signal. Operator mode waits for
+explicit confirmation. Timed-exit mode executes a user-chosen playback window,
+then exits; it never claims the recording physically finished. Simulation timing
+never runs on the physical backend. A shared action lock serializes the routine with
 all call-shaped body commands; streaming velocity is suppressed while reserved.
 """
 from __future__ import annotations
@@ -79,6 +80,18 @@ def _canvas_boolean(value, field, default):
     raise RoutineError(f"{field} 必须是 true 或 false（不要加引号），留空使用默认值")
 
 
+def _canvas_number(value, field, *, default, integer=False):
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return default
+        try:
+            value = int(value) if integer else float(value)
+        except ValueError as exc:
+            raise RoutineError(f"{field} 需要{'整数' if integer else '数字'}") from exc
+    return value
+
+
 def normalize_canvas_args(action, args):
     """Normalize the canvas text boxes at the public boundary only.
 
@@ -86,9 +99,9 @@ def normalize_canvas_args(action, args):
     Blank optional fields default to simulation and no confirmation.
     """
     result = dict(args)
-    if action in {"validate", "run"}:
+    if action in {"validate", "run", "validate_plan", "run_plan"}:
         plan = result.get("plan")
-        if isinstance(plan, str):
+        if isinstance(plan, str) and plan.strip():
             if len(plan) > 65536:
                 raise RoutineError("plan JSON 文本不能超过 65536 个字符")
             try:
@@ -98,6 +111,20 @@ def normalize_canvas_args(action, args):
             if not isinstance(plan, dict):
                 raise RoutineError("plan JSON 必须是对象，不能是列表、字符串或空值")
             result["plan"] = plan
+        if plan is None or (isinstance(plan, str) and not plan.strip()):
+            if action.endswith("_plan"):
+                raise RoutineError("高级入口需要 plan；普通运行请在动作列表中选择")
+            def number(key, default, integer=False):
+                return _canvas_number(result.get(key, default), key, default=default, integer=integer)
+            motion = result.get("motion")
+            if isinstance(motion, str):
+                motion = motion.strip()
+            step = {"motion": motion, "play_count": number("play_count", 1, True),
+                    "rest_s": number("rest_s", 0)}
+            if result.get("completion_strategy", "operator") == "timed_exit":
+                step["playback_s"] = number("playback_s", None)
+            result["plan"] = {"rounds": number("rounds", 1, True),
+                              "round_rest_s": number("round_rest_s", 0), "steps": [step]}
         result["dry_run"] = _canvas_boolean(result.get("dry_run", True), "dry_run", True)
         result["confirm"] = _canvas_boolean(result.get("confirm", False), "confirm", False)
     if action == "continue":
@@ -127,8 +154,10 @@ def load_library(path):
     return motions
 
 
-def check_plan(plan, library, *, dry_run, robot_id):
+def check_plan(plan, library, *, dry_run, robot_id, completion_strategy="operator"):
     """Return a detached, bounded plan and preview; never touch a controller."""
+    if completion_strategy not in ("operator", "timed_exit"):
+        raise RoutineError("completion_strategy 只支持 operator 或 timed_exit")
     if type(dry_run) is not bool:
         raise RoutineError("dry_run 必须是布尔值")
     if not isinstance(plan, dict) or set(plan) - {"rounds", "round_rest_s", "steps"}:
@@ -142,14 +171,19 @@ def check_plan(plan, library, *, dry_run, robot_id):
     duration_per_round, upper_per_round = 0.0, 0.0
     durations_known = True
     for index, step in enumerate(steps):
-        if not isinstance(step, dict) or set(step) - {"motion", "play_count", "rest_s"}:
-            raise RoutineError("步骤只允许 motion、play_count、rest_s")
+        if not isinstance(step, dict) or set(step) - {"motion", "play_count", "rest_s", "playback_s"}:
+            raise RoutineError("步骤只允许 motion、play_count、rest_s、playback_s")
         key = step.get("motion")
         if not isinstance(key, str) or key not in library:
             raise RoutineError(f"未知动作：{key!r}")
         item = copy.deepcopy(library[key])
         count = _integer(step.get("play_count", 1), "play_count", 1, 20)
         rest = _seconds(step.get("rest_s", 0), "rest_s")
+        window = None
+        if completion_strategy == "timed_exit":
+            window = _seconds(step.get("playback_s"), f"{key}.playback_s", positive=True)
+        elif "playback_s" in step:
+            raise RoutineError("playback_s 仅用于 timed_exit 定时退出模式")
         issues = []
         if item.get("verified") is not True:
             issues.append("素材尚未真机验证")
@@ -180,10 +214,11 @@ def check_plan(plan, library, *, dry_run, robot_id):
         if issues:
             warnings.append({"motion": key, "issues": issues})
         item.update(timeout_s=timeout, duration_s=duration)
-        normalized.append({"motion": key, "play_count": count, "rest_s": rest, "asset": item})
+        normalized.append({"motion": key, "play_count": count, "rest_s": rest,
+                           "playback_s": window, "asset": item})
         plays_per_round += count
         rest_per_round += rest * (count - 1 + (index < len(steps) - 1))
-        upper_per_round += (timeout + 6) * count
+        upper_per_round += ((window if window is not None else timeout) + 6) * count
         if duration is None or item.get("verified") is not True:
             durations_known = False
         else:
@@ -195,18 +230,23 @@ def check_plan(plan, library, *, dry_run, robot_id):
     budget = rounds * upper_per_round + rest_total
     if budget > MAX_TASK_S:
         raise RoutineError(f"按片段超时计算的流程上限不能超过 {MAX_TASK_S} 秒")
-    normalized_plan = {"rounds": rounds, "round_rest_s": round_rest, "steps": normalized}
+    normalized_plan = {"rounds": rounds, "round_rest_s": round_rest, "steps": normalized,
+                       "completion_strategy": completion_strategy}
     preview = {
         "ok": True, "state": "validated", "dry_run": dry_run,
-        "completion_strategy": "simulated" if dry_run else "operator",
+        "completion_strategy": "simulated" if dry_run else completion_strategy,
         "rounds": rounds, "total_steps": len(steps), "total_plays": total,
         "total_rest_s": round(rest_total, 6), "timeout_budget_s": round(budget, 6),
         "estimated_duration_s": (round(rounds * duration_per_round + rest_total, 3)
                                  if durations_known else None),
         "estimate_note": "仅按已验证实测素材时长估算；不含启动、退出及操作员确认等待，不是承诺时长。",
         "warnings": warnings,
+        "execution_note": ("按设定窗口退出回放并重播；流程完成不证明录制动作完整播放。"
+                           if completion_strategy == "timed_exit" else "每段完整结束后由现场人员确认，程序退出回放。"),
+        "scheduled_duration_s": (round(rounds * sum(s["playback_s"] * s["play_count"] for s in normalized)
+                                       + rest_total, 3) if completion_strategy == "timed_exit" else None),
         "steps": [{"motion": s["motion"], "name": s["asset"]["name"],
-                   "play_count": s["play_count"], "rest_s": s["rest_s"],
+                   "play_count": s["play_count"], "rest_s": s["rest_s"], "playback_s": s["playback_s"],
                    "recording_id": s["asset"].get("recording_id"),
                    "verified": s["asset"].get("verified") is True,
                    "internal_repetitions": s["asset"].get("internal_repetitions")}
@@ -336,74 +376,75 @@ class ExerciseRoutinePlugin:
             self._library_error = str(exc)
 
     def get_tool(self):
-        step = {"type": "object", "additionalProperties": False,
-                "properties": {"motion": {"type": "string", "enum": list(self._library)},
-                               "play_count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1},
-                               "rest_s": {"type": "number", "minimum": 0, "maximum": 600, "default": 0}},
-                "required": ["motion"]}
-        if not self._library:
-            step["properties"]["motion"].pop("enum")
+        choices = [{"const": key, "title": item["name"] +
+                    (f"（{item['recording_id']}）" if type(item.get("recording_id")) is int else "（未绑定）")}
+                   for key, item in self._library.items()]
+        actions = {"ui": "打开动作编排面板", "validate": "预检单个动作", "run": "运行单个动作",
+                   "status": "查看进度", "cancel": "停止当前流程",
+                   "validate_plan": "高级：预检多动作计划", "run_plan": "高级：运行多动作计划"}
+        simple = ["motion", "rounds", "play_count", "rest_s", "round_rest_s",
+                  "completion_strategy", "playback_s", "dry_run"]
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": "Bumi 动作编排：配置顺序、片段播放次数、轮数和间歇。默认 dry-run；真机逐段等待现场操作员确认结束，不测量人的动作。",
+            "description": "Bumi 动作编排：打开面板选择动作、滑动设置轮数/次数/间歇，查询、确认结束和停止均在同一面板。定时退出模式自动退出并重播，不证明物理动作已完整结束。",
             "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["validate", "run", "info"]},
+                "type": "object", "properties": {
+                    "action": {"type": "string", "enum": list(actions),
+                               "oneOf": [{"const": k, "title": v} for k, v in actions.items()]},
+                    "motion": {"type": "string", "description": "选择动作库中的素材",
+                               **({"enum": list(self._library), "oneOf": choices} if choices else {})},
+                    "rounds": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1,
+                               "description": "整套轮数，1–20"},
+                    "play_count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1,
+                                   "description": "每轮本动作播放次数，1–20"},
+                    "rest_s": {"type": "number", "minimum": 0, "maximum": 600, "default": 0,
+                               "description": "片段之间休息秒数，0–600"},
+                    "round_rest_s": {"type": "number", "minimum": 0, "maximum": 600, "default": 0,
+                                     "description": "轮间休息秒数，0–600"},
+                    "completion_strategy": {"type": "string", "enum": ["operator", "timed_exit"],
+                                            "oneOf": [{"const": "operator", "title": "人工确认完整结束"},
+                                                      {"const": "timed_exit", "title": "按设定秒数退出并重播"}],
+                                            "default": "operator"},
+                    "playback_s": {"type": "number", "minimum": 0.1, "maximum": 600,
+                                   "description": "定时模式必填；现场核准的播放窗口，到时退出，可能截断动作"},
                     "plan": {"type": "object", "additionalProperties": False,
-                             "properties": {"rounds": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1},
-                                            "round_rest_s": {"type": "number", "minimum": 0, "maximum": 600, "default": 0},
-                                            "steps": {"type": "array", "items": step, "minItems": 1, "maxItems": 20}},
-                             "required": ["steps"]},
-                    "dry_run": {"type": "boolean", "default": True},
-                    "confirm": {"type": "boolean", "default": False,
-                                "description": "真机启动：确认现场稳定站立及空间；continue：确认当前片段已完整结束。"},
-                    "job_id": {"type": "string"},
-                    "confirmation_token": {"type": "string"},
+                             "properties": {"rounds": {"type": "integer", "minimum": 1, "maximum": 20},
+                                            "round_rest_s": {"type": "number", "minimum": 0, "maximum": 600},
+                                            "steps": {"type": "array", "minItems": 1, "maxItems": 20,
+                                                      "items": {"type": "object", "additionalProperties": False,
+                                                                "properties": {"motion": {"type": "string"},
+                                                                               "play_count": {"type": "integer", "minimum": 1, "maximum": 20},
+                                                                               "rest_s": {"type": "number", "minimum": 0, "maximum": 600},
+                                                                               "playback_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 600}},
+                                                                "required": ["motion"]}}}, "required": ["steps"]},
+                    "dry_run": {"type": "boolean", "enum": [True, False], "default": True,
+                                "description": "true=模拟，false=真机"},
+                    "confirm": {"type": "boolean", "enum": [False, True], "default": False,
+                                "description": "现场确认站稳及空间；定时模式同时确认所填窗口可能截断动作"},
                 }, "required": ["action"],
                 "x-action-params": {
-                    "validate": {"params": ["plan", "dry_run"], "description": "检查并预览；不发送运动指令。"},
-                    "run": {"params": ["plan", "dry_run", "confirm"], "description": "异步启动；默认模拟。真机须 confirm=true，且素材已验证。"},
-                    "info": {"params": [], "description": "查看动作库、限制及当前状态。"},
+                    "ui": {"params": [], "description": "打开含滑块和控制按钮的面板；不发送动作。"},
+                    "validate": {"params": simple, "required": ["motion"], "description": "表单预检；不发送运动指令。"},
+                    "run": {"params": simple + ["confirm"], "required": ["motion"], "description": "按表单启动；默认模拟。"},
+                    "status": {"params": [], "description": "查询当前任务。"},
+                    "cancel": {"params": [], "description": "停止后续调度并退出本流程回放。"},
+                    "validate_plan": {"params": ["plan", "completion_strategy", "dry_run"], "required": ["plan"],
+                                      "description": "高级多动作计划预检；普通使用请打开面板。"},
+                    "run_plan": {"params": ["plan", "completion_strategy", "dry_run", "confirm"], "required": ["plan"],
+                                 "description": "高级多动作计划；人工确认请使用面板按钮。"},
                 },
-                "x-completion": {"actions": ["run"], "timeout": MAX_TASK_S + 15},
-                "x-hooks": {"on_interrupt_motion": {"action": "stop"},
-                            "on_interrupt_all": {"action": "stop"}},
-                "x-is-dangerous": True,
-                "x-resource": ["base", "leg", "arm_l", "arm_r"],
-            }, "topic_out": [],
-        }
-
-    def _control_tool(self):
-        # This channel controls an ALREADY leased task. It cannot start a plan
-        # or issue raw SDK commands; the routine retains all body resources.
-        # A separate actuator control surface keeps operator replies/cancel
-        # reachable without disguising mutation as a read-only sensor/resource.
-        return {
-            "name": "exercise_routine_control", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 编排控制：查询现有任务、现场确认当前片段结束或停止。不能启动计划或任意回放；等待编排期间请使用此入口。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["status", "continue", "stop", "info"]},
-                    "job_id": {"type": "string"},
-                    "confirmation_token": {"type": "string"},
-                    "confirm": {"type": "boolean", "default": False,
-                                "description": "continue 必须由现场人员确认本片段完整结束后设为 true。"},
-                }, "required": ["action"],
-                "x-action-params": {
-                    "status": {"params": ["job_id"], "description": "查询当前流程和片段确认令牌。"},
-                    "continue": {"params": ["job_id", "confirmation_token", "confirm"], "description": "只确认当前任务的当前片段，不新建运动或抢占身体。"},
-                    "stop": {"params": [], "description": "阻断后续调度并退出本任务回放；非硬件急停。"},
-                    "info": {"params": [], "description": "查询动作库、运行方式和当前状态。"},
-                },
-                "x-is-dangerous": True,
-                "x-resource": ["bumi_routine_operator"],
+                "x-workbench": {"protocol": "motus.workbench/1", "kind": "routine",
+                                "title": "Bumi 动作编排", "entry": "ui",
+                                "actions": ["ui", "info", "validate_plan", "run_plan", "continue", "stop"]},
+                "x-completion": {"actions": ["run", "run_plan"], "timeout": MAX_TASK_S + 15},
+                "x-hooks": {"on_interrupt_motion": {"action": "stop"}, "on_interrupt_all": {"action": "stop"}},
+                "x-stop": {"pending_flags": {"control_reserved": True}},
+                "x-is-dangerous": True, "x-resource": ["base", "leg", "arm_l", "arm_r"],
             }, "topic_out": [],
         }
 
     def get_tools(self):
-        return [self.get_tool(), self._control_tool()]
+        return [self.get_tool()]
 
     def start(self):
         return {"state": "ready"}
@@ -426,6 +467,9 @@ class ExerciseRoutinePlugin:
             return {"ok": False, "state": "error", "error": str(exc)}
         if action == "start":
             return {"state": "ready" if not self._closed else "error"}
+        if action == "ui":
+            return {"protocol": "motus.workbench/1",
+                    "html": (Path(__file__).with_name("resource") / "exercise_routine.html").read_text(encoding="utf-8")}
         if action == "info":
             return {"state": "ready" if not self._closed else "closed",
                     "library_path": str(self._library_path), "library_error": self._library_error,
@@ -433,21 +477,23 @@ class ExerciseRoutinePlugin:
                     "completion_strategy": "operator", "automatic_physical_completion": False,
                     "sdk_data_freshness": "unverifiable", "progress_source": "scheduler",
                     "task_protocol": "acp_with_operator_control",
-                    "control_tool": "exercise_routine_control", "current": self._status()}
+                    "control_tool": "exercise_routine", "busy": self._busy(), "current": self._status(),
+                    "available_completion_strategies": ["operator", "timed_exit"]}
         if action == "status":
             return self._status(args.get("job_id"))
-        if action == "stop":
+        if action in {"stop", "cancel"}:
             return self._request_stop()
         if action == "continue":
             return self._confirm(args)
-        if action in {"validate", "run"}:
+        if action in {"validate", "run", "validate_plan", "run_plan"}:
             try:
                 if self._library_error:
                     raise RoutineError(f"动作库读取失败：{self._library_error}")
                 dry = args.get("dry_run", True)
                 plan, preview = check_plan(args.get("plan"), self._library,
-                                           dry_run=dry, robot_id=self._robot_id)
-                if action == "validate":
+                                           dry_run=dry, robot_id=self._robot_id,
+                                           completion_strategy=args.get("completion_strategy", "operator"))
+                if action in {"validate", "validate_plan"}:
                     return preview
                 if not dry and args.get("confirm") is not True:
                     raise RoutineError("真机启动需要现场确认稳定站立与周围空间，并传入 confirm=true")
@@ -456,6 +502,12 @@ class ExerciseRoutinePlugin:
             except (ValueError, TypeError) as exc:
                 return {"ok": False, "state": "error", "error": str(exc)}
         return None
+
+    def _busy(self):
+        with self._lock:
+            job = self._job
+            return bool(job and (not job["finished"] or not job["notification_done"].is_set()
+                                 or (job["backend"] and job["backend"].owns())))
 
     def _status(self, job_id=None):
         with self._lock:
@@ -495,10 +547,11 @@ class ExerciseRoutinePlugin:
                    "await_publication": await_publication, "published_at": None, "notify": True,
                    "backend": None if dry else LocoRoutineBackend(self._loco, cancel),
                    "status": {"ok": True, "job_id": job_id, "action_id": job_id, "state": "running", "dry_run": dry,
-                              "completion_strategy": "simulated" if dry else "operator",
+                              "completion_strategy": "simulated" if dry else plan["completion_strategy"],
+                              "execution_note": preview["execution_note"], "full_playback_confirmed": False,
                               "round": 0, "total_rounds": plan["rounds"], "step": 0,
                               "total_steps": len(plan["steps"]), "play_index": 0,
-                              "play_count": 0, "completed_plays": 0, "total_plays": preview["total_plays"],
+                              "play_count": 0, "completed_plays": 0, "exited_plays": 0, "total_plays": preview["total_plays"],
                               "confirmation_token": None, "error": None,
                               "progress_source": "scheduler", "sdk_data_freshness": "unverifiable"}}
             if not await_publication:
@@ -601,13 +654,30 @@ class ExerciseRoutinePlugin:
             with self._lock:
                 job["rest_until"] = 0.0
 
-    def _play(self, job, asset):
+    def _play(self, job, step):
+        asset = step["asset"]
         self._update(job, state="running", confirmation_token=None)
         if job["dry"]:
             self._wait(job, self._sim_clip_s)
             return
         backend = job["backend"]
         backend.play(asset)
+        if job["plan"]["completion_strategy"] == "timed_exit":
+            # A commanded window is not evidence of physical completion.
+            self._update(job, state="playing_window", playback_s=step["playback_s"])
+            until = time.monotonic() + step["playback_s"]
+            while True:
+                self._guard(job, playing=True)
+                remaining = until - time.monotonic()
+                self._update(job, playback_remaining_s=round(max(0.0, remaining), 3))
+                if remaining <= 0:
+                    break
+                job["cancel"].wait(min(POLL_S, remaining))
+            self._guard(job, playing=True)
+            self._update(job, state="exiting_playback", playback_remaining_s=0)
+            backend.exit()
+            self._guard(job)
+            return
         token = uuid4().hex
         with self._lock:
             if job["cancel"].is_set():
@@ -638,9 +708,11 @@ class ExerciseRoutinePlugin:
                         self._guard(job)
                         self._update(job, round=r, step=i, motion=step["motion"],
                                      motion_name=step["asset"]["name"], play_index=p, play_count=step["play_count"])
-                        self._play(job, step["asset"])
+                        self._play(job, step)
                         with self._lock:
-                            job["status"]["completed_plays"] += 1
+                            job["status"]["exited_plays"] += 1
+                            if job["dry"] or plan["completion_strategy"] == "operator":
+                                job["status"]["completed_plays"] += 1
                         if p < step["play_count"] or i < len(plan["steps"]):
                             self._update(job, state="resting", rest_kind="between_plays_or_steps")
                             self._wait(job, step["rest_s"], resting=True)
@@ -668,7 +740,9 @@ class ExerciseRoutinePlugin:
                     job["status"]["cancel_reason"] = backend.preempt_reason
                 job["rest_until"] = 0.0
                 job["status"].update(state=final_state, ok=final_state == "completed",
-                                      error=error, confirmation_token=None)
+                                      error=error, confirmation_token=None,
+                                      full_playback_confirmed=(not job["dry"] and final_state == "completed"
+                                                               and job["plan"]["completion_strategy"] == "operator"))
                 job["finished"] = True
                 result = self._status()
             # Fast completion must not race ahead of the HTTP run response.

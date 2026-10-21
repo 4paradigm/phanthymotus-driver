@@ -400,19 +400,20 @@ def test_invalid_library_fails_closed(tmp_path):
     assert c.dispatch("run", {"plan": plan()})["state"] == "error"
 
 
-def test_interactive_task_schema_does_not_block_its_own_confirmation(card):
+def test_single_card_workbench_has_controls_and_body_resources(card):
     schema = card.get_tool()
     assert schema["type"] == "actuator" and not schema["multiInstance"]
-    assert schema["inputSchema"]["x-completion"] == {"actions": ["run"], "timeout": 3615}
-    control = card.get_tools()[1]
-    assert control["name"] == "exercise_routine_control"
-    assert control["type"] == "actuator"
-    assert not (set(control["inputSchema"]["x-resource"]) & set(schema["inputSchema"]["x-resource"]))
-    assert "run" not in control["inputSchema"]["properties"]["action"]["enum"]
-    assert "x-completion" not in control["inputSchema"]
+    assert len(card.get_tools()) == 1
+    spec = schema["inputSchema"]["x-workbench"]
+    assert spec["protocol"] == "motus.workbench/1" and spec["entry"] == "ui"
+    assert {"continue", "stop", "info", "run_plan"} <= set(spec["actions"])
+    assert schema["inputSchema"]["x-completion"] == {"actions": ["run", "run_plan"], "timeout": 3615}
+    assert set(schema["inputSchema"]["x-resource"]) == {"base", "leg", "arm_l", "arm_r"}
     assert schema["inputSchema"]["x-is-dangerous"] is True
     assert schema["inputSchema"]["properties"]["dry_run"]["default"] is True
+    assert "plan" not in schema["inputSchema"]["x-action-params"]["run"]["params"]
     assert card.dispatch("start", {})["state"] == "ready"
+    assert card.dispatch("ui", {})["protocol"] == spec["protocol"]
 
 
 @pytest.mark.parametrize("field", ["rest_s", "round_rest_s"])
@@ -667,7 +668,8 @@ def test_acp_tls_exception_is_only_for_exact_local_default(monkeypatch, url, loc
 
 
 @pytest.mark.parametrize("canvas_text", [False, True])
-def test_http_fast_completion_waits_for_run_response_and_pending_registration(card, monkeypatch, canvas_text):
+@pytest.mark.parametrize("action", ["run", "run_plan"])
+def test_http_fast_completion_waits_for_run_response_and_pending_registration(card, monkeypatch, canvas_text, action):
     """Force completion while the *real* MCP socket response write is blocked."""
     import ast
     import urllib.request
@@ -718,7 +720,7 @@ def test_http_fast_completion_waits_for_run_response_and_pending_registration(ca
     request = urllib.request.Request(f"http://127.0.0.1:{mcp.server_port}/mcp",
         data=json.dumps({"jsonrpc": "2.0", "id": "fast-run", "method": "tools/call",
                          "params": {"name": "exercise_routine", "arguments": {
-                             "action": "run", "dry_run": "true" if canvas_text else True,
+                             "action": action, "dry_run": "true" if canvas_text else True,
                              "confirm": "false" if canvas_text else False,
                              "plan": json.dumps(plan()) if canvas_text else plan()}}}).encode(),
         headers={"Content-Type": "application/json"})
@@ -831,3 +833,154 @@ def test_blank_optional_canvas_job_id_queries_current_task(card):
     run(card)
     status = wait_for(card, "awaiting_confirmation")
     assert card.dispatch("status", {"job_id": ""})["job_id"] == status["job_id"]
+
+
+def test_flat_form_parameters_need_no_plan_and_validate_without_hardware(card, hardware):
+    result = card.dispatch('validate', {'motion': 'chest_expand', 'rounds': '2',
+        'play_count': '3', 'rest_s': '0.5', 'round_rest_s': '1', 'dry_run': 'false'})
+    assert result['ok'] and result['rounds'] == 2 and result['total_plays'] == 6
+    assert result['total_rest_s'] == 3
+    assert not hardware[0].calls and hardware[0].reads == 0
+    card.dispatch('run', {'motion': 'chest_expand', 'rounds': '2', 'dry_run': 'true'})
+    assert finish(card)['exited_plays'] == 2
+    assert not hardware[0].calls
+
+
+@pytest.mark.parametrize('key,value', [('rounds', '1.5'), ('rounds', True), ('rounds', '21'),
+    ('play_count', 0), ('play_count', 'false'), ('rest_s', 'NaN'), ('rest_s', True),
+    ('rest_s', '-1'), ('round_rest_s', 'Infinity'), ('rounds', []), ('rest_s', {})])
+def test_flat_form_rejects_invalid_numbers(card, hardware, key, value):
+    result = card.dispatch('run', {'motion': 'chest_expand', key: value})
+    assert result['state'] == 'error'
+    assert not hardware[0].calls
+
+
+def timed_plan(**kwargs):
+    result = plan(**kwargs)
+    for step in result['steps']:
+        step['playback_s'] = 0.035
+    return result
+
+
+def test_timed_two_rounds_exit_each_clip_before_next_and_do_not_claim_physical_completion(card, hardware):
+    preview = card.dispatch('validate_plan', {'plan': timed_plan(rounds=2, count=2, rest=0.01, round_rest=0.01),
+                                             'completion_strategy': 'timed_exit', 'dry_run': False})
+    assert preview['ok'] and preview['completion_strategy'] == 'timed_exit'
+    assert preview['scheduled_duration_s'] == pytest.approx(0.17)
+    result = run(card, timed_plan(rounds=2, count=2, rest=0.01, round_rest=0.01), completion_strategy='timed_exit')
+    assert result['ok']
+    # No human confirms a clip in this test: rounds advance using explicit windows.
+    result = wait_for(card, 'completed')
+    card._job['thread'].join(timeout=1)
+    commands = [(c[0], c[1]) for c in hardware[0].calls if c[0] != 'DEFAULT']
+    assert commands == [('PLAYTEACH', 41), ('WALK', 0)] * 4
+    assert result['exited_plays'] == 4 and result['completed_plays'] == 0
+    assert result['full_playback_confirmed'] is False
+    assert result['playback_exit_confirmed'] is True and not result['control_reserved']
+    assert len(card.terminal) == 1 and card.terminal[0][1] == 'completed'
+
+
+def test_timed_mixed_sequence_uses_each_steps_window(card, hardware):
+    p = timed_plan(rounds=2, motions=('chest_expand', 'arms_up'))
+    p['steps'][1]['playback_s'] = 0.06
+    run(card, p, completion_strategy='timed_exit')
+    result = wait_for(card, 'completed')
+    assert result['exited_plays'] == 4
+    assert [c[1] for c in hardware[0].calls if c[0] == 'PLAYTEACH'] == [41, 42, 41, 42]
+    assert [c[0] for c in hardware[0].calls if c[0] != 'DEFAULT'] == ['PLAYTEACH', 'WALK'] * 4
+
+
+@pytest.mark.parametrize('value', [None, 0, -1, True, '10', float('nan'), float('inf'), 601])
+def test_timed_window_requires_explicit_positive_finite_seconds(card, hardware, value):
+    p = timed_plan()
+    p['steps'][0]['playback_s'] = value
+    result = run(card, p, completion_strategy='timed_exit')
+    assert result['state'] == 'error' and not hardware[0].calls
+
+
+def test_reported_ten_seconds_is_never_inferred_as_playback_window(card, hardware):
+    card._library['chest_expand'].update(duration_s=None, reported_duration_s=10)
+    result = run(card, completion_strategy='timed_exit')
+    assert result['state'] == 'error' and 'playback_s' in result['error']
+    assert not hardware[0].calls
+
+
+def test_timed_mode_keeps_asset_validation_and_explicit_start_confirmation(card, hardware):
+    card._library['chest_expand']['verified'] = False
+    assert run(card, timed_plan(), completion_strategy='timed_exit')['state'] == 'error'
+    card._library['chest_expand']['verified'] = True
+    assert run(card, timed_plan(), completion_strategy='timed_exit', confirm='false')['state'] == 'error'
+    assert not hardware[0].calls
+
+
+@pytest.mark.parametrize('value', ['timer', 'auto', '', None, [], {}])
+def test_unknown_completion_strategies_fail_without_motion(card, hardware, value):
+    assert run(card, completion_strategy=value)['state'] == 'error'
+    assert not hardware[0].calls
+
+
+def test_flat_timed_form_parses_window_but_keeps_real_run_manual_confirmation(card, hardware):
+    result = card.dispatch('run', {'motion': 'chest_expand', 'rounds': '2',
+        'completion_strategy': 'timed_exit', 'playback_s': '0.1', 'dry_run': 'false', 'confirm': 'true'})
+    assert result['ok'] and wait_for(card, 'completed')['exited_plays'] == 2
+    assert [c[0] for c in hardware[0].calls if c[0] != 'DEFAULT'] == ['PLAYTEACH', 'WALK'] * 2
+
+
+@pytest.mark.parametrize('phase', ['playing_window', 'resting'])
+def test_stop_during_timed_window_or_rest_prevents_all_following_plays(card, hardware, phase):
+    p = timed_plan(count=3, rest=3)
+    if phase == 'playing_window':
+        p['steps'][0]['playback_s'] = 3
+    run(card, p, completion_strategy='timed_exit')
+    wait_for(card, phase)
+    assert card.dispatch('info', {})['busy'] is True
+    card.dispatch('cancel', {})
+    result = wait_for(card, 'cancelled')
+    assert len([c for c in hardware[0].calls if c[0] == 'PLAYTEACH']) == 1
+    assert not result['control_reserved']
+    assert result['full_playback_confirmed'] is False
+
+
+def test_failed_timed_exit_blocks_replay_and_preserves_ownership_for_stop_retry(card, hardware):
+    hardware[0].exit_ok = False
+    run(card, timed_plan(rounds=2), completion_strategy='timed_exit')
+    result = wait_for(card, 'error')
+    assert result['exited_plays'] == 0 and result['control_reserved'] is True
+    assert card.dispatch('info', {})['busy'] is True
+    assert len([c for c in hardware[0].calls if c[0] == 'PLAYTEACH']) == 1
+    assert not result['full_playback_confirmed']
+    hardware[0].exit_ok = True
+    assert card.dispatch('stop', {})['control_reserved'] is False
+
+
+def test_protection_during_timed_window_never_forces_walk_or_starts_another_round(card, hardware):
+    p = timed_plan(rounds=2)
+    p['steps'][0]['playback_s'] = 3
+    run(card, p, completion_strategy='timed_exit')
+    wait_for(card, 'playing_window')
+    hardware[0].mode = 26
+    assert wait_for(card, 'error')['exited_plays'] == 0
+    assert [c[0] for c in hardware[0].calls if c[0] != 'DEFAULT'] == ['PLAYTEACH']
+
+
+def test_workbench_entry_and_polling_have_no_hardware_side_effects(card, hardware):
+    result = card.dispatch('ui', {})
+    assert len(result['html']) < 250000 and '<input' in result['html'] and 'type="range"' in result['html']
+    assert card.dispatch('info', {})['busy'] is False
+    assert not hardware[0].calls and hardware[0].reads == 0
+
+
+def test_same_card_can_query_and_confirm_each_round_without_manual_stop_calls(card, hardware):
+    run(card, plan(rounds=2))
+    for expected_round in [1, 2]:
+        status = wait_for(card, 'awaiting_confirmation')
+        assert status['round'] == expected_round
+        assert card.dispatch('info', {})['current']['job_id'] == status['job_id']
+        assert confirm(card)['ok']
+        if expected_round == 1:
+            deadline = time.monotonic() + 1
+            while card.dispatch('status', {})['round'] != 2 and time.monotonic() < deadline:
+                time.sleep(0.002)
+    result = wait_for(card, 'completed')
+    assert result['completed_plays'] == 2 and result['full_playback_confirmed'] is True
+    assert [c[0] for c in hardware[0].calls if c[0] != 'DEFAULT'] == ['PLAYTEACH', 'WALK'] * 2

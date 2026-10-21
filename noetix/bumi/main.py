@@ -235,6 +235,12 @@ class BumiDeviceBundle:
                 callback(action_id, delivered)
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        # Accept old control-card API calls without advertising a second card.
+        if tool_name == "exercise_routine_control":
+            for plugin in self._plugins:
+                if getattr(plugin, "PREFIX", None) == "exercise_routine":
+                    action = args.pop("action", "status")
+                    return plugin.dispatch(action, {**args, "_tool_name": tool_name})
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
@@ -344,7 +350,7 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
-                    routine_run = name == "exercise_routine" and args.get("action") == "run"
+                    routine_run = name == "exercise_routine" and args.get("action") in {"run", "run_plan"}
                     if routine_run:
                         # Internal transport flag, always set by the server.
                         args["_await_response_publication"] = True
