@@ -92,9 +92,9 @@ class RM75Plugin:
             return {f"J{i}": round(float(value), digits) or 0.0
                     for i, value in enumerate(values, 1)}
         return {
-            "时间": captured.isoformat(sep=" ", timespec="milliseconds"),
-            "关节弧度(rad)": readable(state["position"], 6),
-            "关节角度(°)": readable(state["raw_degree"], 3),
+            "time": captured.isoformat(sep=" ", timespec="milliseconds"),
+            "joint_radians": readable(state["position"], 6),
+            "joint_degrees": readable(state["raw_degree"], 3),
         }
 
     def get_tools(self):
