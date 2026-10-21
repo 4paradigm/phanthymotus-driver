@@ -87,6 +87,43 @@ def test_streaming_progress_is_unknown_until_eof_and_write_is_not_completion():
     assert tracker.get_status("speech_A")["state"] == "COMPLETED"
 
 
+def test_playing_state_does_not_regress_when_more_pcm_is_submitted():
+    tracker = PlaybackTracker()
+    tracker.receive_chunk(tracked("A", 0), input_samples=100)
+    tracker.record_submitted("A", 275, generation=1, remote_timestamp_ns=10)
+    tracker.record_device_progress(
+        "A", 100, 1, 20, evidence="snd_pcm_delay")
+    assert tracker.get_status("A")["state"] == "PLAYING"
+
+    tracker.receive_chunk(tracked("A", 1, True), input_samples=100)
+    tracker.record_submitted("A", 550, 550, 1, 30)
+
+    assert tracker.get_status("A")["state"] == "PLAYING"
+
+
+def test_duplicate_submission_fact_is_not_emitted_twice():
+    tracker = PlaybackTracker()
+    tracker.receive_chunk(tracked("A", 0), input_samples=100)
+    assert tracker.record_submitted("A", 275, generation=1,
+                                    remote_timestamp_ns=10)
+    event_count = len(tracker.get_recent_events("A"))
+
+    assert tracker.record_submitted("A", 275, generation=1,
+                                    remote_timestamp_ns=11) is False
+    assert len(tracker.get_recent_events("A")) == event_count
+
+
+def test_xrun_tail_is_trusted_only_when_it_reaches_known_eof_total():
+    tracker = PlaybackTracker()
+    tracker.receive_chunk(tracked("A", 0, True), input_samples=100)
+    tracker.record_submitted("A", 275, 275, 1, 10)
+
+    tracker.record_device_progress(
+        "A", 275, 1, 20, evidence="snd_pcm_xrun_tail")
+
+    assert tracker.get_status("A")["state"] == "COMPLETED"
+
+
 def test_completion_requires_eof_known_total_and_trusted_device_evidence():
     tracker = PlaybackTracker(clock_ns=lambda: 1000)
     tracker.receive_chunk(tracked("missing_eof"), input_samples=100)

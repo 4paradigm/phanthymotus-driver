@@ -157,6 +157,7 @@ class PlaybackTracker:
         self._rejections: Dict[str, _Speech] = {}
         self._events: List[dict] = []
         self._generation: Optional[int] = None
+        self._unknown_failure: Optional[Tuple[str, str]] = None
 
     def _reject_new_speech(self, speech_id: str, code: str, message: str) -> bool:
         speech = _Speech(speech_id, state="FAILED", error_code=code,
@@ -250,6 +251,8 @@ class PlaybackTracker:
             speech.generation = generation
             if device_sample_rate_hz is not None:
                 speech.device_sample_rate_hz = int(device_sample_rate_hz)
+            previous_submitted = speech.submitted_frames
+            previous_total = speech.total_output_frames
             speech.submitted_frames = max(speech.submitted_frames, int(submitted_frames))
             if total_output_frames is not None and speech.eof_received:
                 speech.total_output_frames = max(0, int(total_output_frames))
@@ -262,7 +265,11 @@ class PlaybackTracker:
                            details_message=speech.error_message)
                 self._condition.notify_all()
                 return True
-            speech.state = "PCM_SUBMITTED"
+            if (speech.submitted_frames == previous_submitted
+                    and speech.total_output_frames == previous_total):
+                return False
+            if speech.state != "PLAYING":
+                speech.state = "PCM_SUBMITTED"
             self._emit(speech, "pcm_submitted", remote_timestamp_ns,
                        "q5_audio_host_monotonic",
                        submitted_frames=speech.submitted_frames,
@@ -306,7 +313,7 @@ class PlaybackTracker:
                 max(0, int(consumed_frames)), speech.submitted_frames)
             speech.consumed_frames = max(
                 speech.consumed_frames, observed_consumed)
-            if evidence in {"snd_pcm_delay", "snd_pcm_drain"}:
+            if evidence in {"snd_pcm_delay", "snd_pcm_drain", "snd_pcm_xrun_tail"}:
                 speech.device_progress_trusted = True
                 speech.trusted_consumed_frames = max(
                     speech.trusted_consumed_frames, observed_consumed)
@@ -390,6 +397,12 @@ class PlaybackTracker:
                     state: str = "FAILED") -> int:
         return len(self.fail_active_events(code, message, state))
 
+    def mark_unknown_failed(self, code: str, message: str) -> None:
+        """Conservatively terminate IDs lost during bounded queue overload."""
+        with self._condition:
+            self._unknown_failure = (str(code), str(message))
+            self._condition.notify_all()
+
     def backend_reset_events(self, new_generation: int,
                              reason: str) -> List[dict]:
         with self._condition:
@@ -405,6 +418,15 @@ class PlaybackTracker:
             if speech is None:
                 speech = self._rejections.get(speech_id)
             if speech is None:
+                if self._unknown_failure is not None:
+                    code, message = self._unknown_failure
+                    return {
+                        "speech_id": speech_id,
+                        "state": "FAILED",
+                        "progress": None,
+                        "error_code": code,
+                        "error_message": message,
+                    }
                 return {"speech_id": speech_id, "state": "UNKNOWN", "progress": None}
             result = asdict(speech)
             total = speech.total_output_frames
@@ -439,6 +461,18 @@ class PlaybackTracker:
                 if speech is None:
                     speech = self._rejections.get(speech_id)
                 if speech is None:
+                    if self._unknown_failure is not None:
+                        code, message = self._unknown_failure
+                        return {
+                            "speech_id": speech_id,
+                            "result": "failed",
+                            "completion_level": None,
+                            "playback_finished_at_ns": None,
+                            "clock_id": None,
+                            "timestamp_quality": None,
+                            "error_code": code,
+                            "error_message": message,
+                        }
                     return {"speech_id": speech_id, "result": "unknown"}
                 if speech.state in _TERMINAL_STATES:
                     return {
@@ -465,7 +499,7 @@ class PlaybackTracker:
             "legacy_playback": True,
             "per_speech_tracking_requires_metadata": True,
             "submission_observed": True,
-            "device_progress": "snd_pcm_delay",
+            "device_progress": ["snd_pcm_delay", "snd_pcm_xrun_tail"],
             "device_completion": "alsa_device_consumption",
             "acoustic_completion": False,
             "remote_clock_id": "q5_audio_host_monotonic",

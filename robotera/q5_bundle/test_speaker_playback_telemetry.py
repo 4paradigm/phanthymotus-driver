@@ -10,6 +10,7 @@ import threading
 import types
 
 import pytest
+import q5_media_bridge
 
 from playback_telemetry import (
     PlaybackTracker,
@@ -449,6 +450,75 @@ def test_generated_player_xrun_fails_buffered_tasks_without_waiting(monkeypatch)
                    and event.get("event") == "device_progress" for event in events)
 
 
+def test_generated_player_eof_tail_xrun_completes_with_exact_evidence(monkeypatch):
+    module = _load_legacy_device(monkeypatch)
+    fake = _FakeAlsa(state_results=[3, 4], delay_results=[484])
+    command = module._q5_alsa_speaker_command("hw:2,0", 44100, 2)
+    eof_packet = encode_packet(parse_audio_format(
+        "audio/pcm-16k;speech_id=A;sequence=0;eof=1"), b"\x00\x00" * 16000)
+    legacy_tick = encode_packet(
+        parse_audio_format("audio/pcm-16k"), b"")
+
+    events = _run_remote_player(
+        monkeypatch, command, fake, [eof_packet, legacy_tick])
+
+    assert not any(event.get("speech_id") == "A"
+                   and event.get("event") in {"failed", "underrun"}
+                   for event in events)
+    completions = [
+        event for event in events
+        if event.get("speech_id") == "A"
+        and event.get("evidence") == "snd_pcm_xrun_tail"
+    ]
+    assert len(completions) == 1
+    submitted = [event for event in events
+                 if event.get("speech_id") == "A"
+                 and event.get("event") == "pcm_submitted"]
+    delay_progress = [
+        event for event in events
+        if event.get("speech_id") == "A"
+        and event.get("evidence") == "snd_pcm_delay"
+    ]
+    assert delay_progress[-1]["consumed_frames"] == (
+        submitted[-1]["total_output_frames"] - 484)
+    assert completions[0]["consumed_frames"] == submitted[-1]["total_output_frames"]
+
+
+def test_generated_player_emits_one_submission_fact_per_chunk(monkeypatch):
+    module = _load_legacy_device(monkeypatch)
+    fake = _FakeAlsa()
+    command = module._q5_alsa_speaker_command("hw:2,0", 44100, 2)
+
+    events = _run_remote_player(monkeypatch, command, fake, [
+        _packet("A", 0, False),
+        _packet("A", 1, True),
+    ])
+
+    submitted = [event for event in events
+                 if event.get("speech_id") == "A"
+                 and event.get("event") == "pcm_submitted"]
+    assert len(submitted) == 2
+    assert submitted[0]["total_output_frames"] is None
+    assert submitted[1]["total_output_frames"] == submitted[1]["submitted_frames"]
+
+
+def test_generated_player_xrun_emits_tail_evidence_when_frames_were_already_reported(monkeypatch):
+    module = _load_legacy_device(monkeypatch)
+    fake = _FakeAlsa(state_results=[3, 4], delay_results=[0])
+    command = module._q5_alsa_speaker_command("hw:2,0", 44100, 2)
+    first = _packet("A", 0, False)
+    empty_eof = encode_packet(parse_audio_format(
+        "audio/pcm-16k;speech_id=A;sequence=1;eof=1"), b"")
+
+    events = _run_remote_player(
+        monkeypatch, command, fake, [first, empty_eof])
+
+    tail = [event for event in events
+            if event.get("speech_id") == "A"
+            and event.get("evidence") == "snd_pcm_xrun_tail"]
+    assert len(tail) == 1
+
+
 def test_generated_player_drain_failure_never_emits_completion_evidence(monkeypatch):
     module = _load_legacy_device(monkeypatch)
     fake = _FakeAlsa(delay_results=[1000], drain_result=-5)
@@ -514,6 +584,9 @@ def test_bridge_subscription_callback_accepts_tracked_audio(monkeypatch):
         "    last_speaker_frame_at = 0.0\n"
         "    invalid_format_count = 0\n"
         "    last_invalid_format_warning_at = None\n"
+        "    speaker_failed_ids = {}\n"
+        "    speaker_epoch = 0\n"
+        "    speaker_fail_epoch = None\n"
         + callback_source
         + "    return _on_speaker\n"
     )
@@ -524,6 +597,8 @@ def test_bridge_subscription_callback_accepts_tracked_audio(monkeypatch):
         "hashlib": hashlib,
         "time": types.SimpleNamespace(monotonic=lambda: fake_clock[0]),
         "queue": queue,
+        "_queue_speaker_failure": getattr(
+            q5_media_bridge, "_queue_speaker_failure", None),
     }
     exec(compile(wrapper, str(source_path), "exec"), scope)
 
@@ -601,7 +676,7 @@ def test_bridge_subscription_callback_accepts_tracked_audio(monkeypatch):
             b"\x00\x00" * 160,
         ))
 
-    assert speaker_fail_q.qsize() == 3
+    assert speaker_fail_q.qsize() == 2
     assert full_q.qsize() == 1
 
     # Consume Bridge failure notifications through the actual pump.
@@ -631,6 +706,130 @@ def test_bridge_subscription_callback_accepts_tracked_audio(monkeypatch):
         assert len(failures) == 1
         assert failures[0]["state"] == "FAILED"
         assert failures[0]["error_code"] == "SPEAKER_QUEUE_OVERFLOW"
+
+
+def test_speaker_failure_queue_is_bounded_nonblocking_and_conservative():
+    import queue
+
+    failure_q = queue.Queue(maxsize=1)
+    seen = {}
+    queue_failure = getattr(q5_media_bridge, "_queue_speaker_failure", None)
+    assert callable(queue_failure)
+
+    queue_failure(failure_q, {
+        "speech_id": "old",
+        "code": "SPEAKER_QUEUE_OVERFLOW",
+        "message": "old overflow",
+    }, seen)
+    for index in range(1000):
+        queue_failure(failure_q, {
+            "speech_id": f"new_{index % 8}",
+            "code": "SPEAKER_QUEUE_OVERFLOW",
+            "message": "new overflow",
+        }, seen)
+
+    assert failure_q.qsize() <= 1
+    marker = failure_q.get_nowait()
+    assert marker["fail_all"] is True
+    assert marker["speech_ids"]
+    assert len(seen) <= 256
+
+
+def test_speaker_failure_overload_marker_terminates_active_and_named_tasks(monkeypatch):
+    module = _load_legacy_device(monkeypatch)
+    plugin = _plugin(module)
+    active = parse_audio_format(
+        "audio/pcm-16k;speech_id=active;sequence=0;eof=0")
+    assert plugin._telemetry.receive_chunk(active, 160)
+
+    failures = [{
+        "fail_all": True,
+        "speech_id": "new",
+        "speech_ids": ["old", "new"],
+        "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+        "message": "failure notification queue overloaded",
+    }]
+    plugin._client.pop_speaker_failure = (
+        lambda: failures.pop(0) if failures else None)
+    plugin._client.pop_speaker_chunk = lambda: setattr(
+        plugin, "_running", False)
+    plugin._pump()
+
+    for speech_id in ("active", "old", "new", "unlisted_dropped"):
+        assert plugin._telemetry.get_status(speech_id)["state"] == "FAILED"
+
+
+def test_speaker_failure_overload_rejects_late_chunks_from_failed_epoch(monkeypatch):
+    module = _load_legacy_device(monkeypatch)
+    plugin = _plugin(module)
+    failures = [{
+        "fail_all": True,
+        "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+        "message": "failure notification queue overloaded",
+    }]
+    queued = [
+        {
+            "speaker_epoch": 3,
+            "pcm": b"\x00\x00" * 160,
+            "metadata": parse_audio_format(
+                "audio/pcm-16k;speech_id=late;sequence=0;eof=0"),
+        },
+        {
+            "speaker_epoch": 4,
+            "pcm": b"\x00\x00" * 160,
+            "metadata": parse_audio_format(
+                "audio/pcm-16k;speech_id=fresh;sequence=0;eof=1"),
+        },
+    ]
+    failures[0]["through_epoch"] = 3
+    calls = 0
+    plugin._client.pop_speaker_failure = (
+        lambda: failures.pop(0) if failures else None)
+    def pop_chunk():
+        nonlocal calls
+        calls += 1
+        # multiprocessing.Queue may transiently report empty before a feeder
+        # thread makes an already-enqueued item visible.
+        if calls == 1:
+            return None
+        if queued:
+            return queued.pop(0)
+        plugin._running = False
+        return None
+    plugin._client.pop_speaker_chunk = pop_chunk
+
+    plugin._frames_received = 0
+    plugin._frames_written = 0
+    plugin._timing = types.SimpleNamespace(
+        mark_received=lambda _size: None,
+        mark_write_completed=lambda _size: None)
+    plugin._topic = "/q5/speaker/test"
+    plugin._volume = 100
+    plugin._input_gain = 1.0
+    plugin._running = True
+    plugin._pump()
+
+    assert plugin._telemetry.get_status("late")["state"] == "FAILED"
+    assert plugin._telemetry.get_status("fresh")["state"] == "SPEAKER_RECEIVED"
+    assert plugin._frames_received == 1
+
+
+def test_bridge_failure_epoch_produces_global_nonblocking_marker():
+    bridge = BridgeWorker("q5")
+    try:
+        assert bridge._speaker_fail_q._maxsize == 64
+        with bridge._speaker_fail_epoch.get_lock():
+            bridge._speaker_fail_epoch.value = 3
+
+        marker = bridge.pop_speaker_failure()
+
+        assert marker["fail_all"] is True
+        assert marker["through_epoch"] == 3
+        assert marker["code"] == "SPEAKER_FAILURE_QUEUE_OVERFLOW"
+        assert bridge.pop_speaker_failure() is None
+    finally:
+        bridge._speaker_fail_q.close()
+        bridge._speaker_fail_q.join_thread()
 
 
 @pytest.mark.parametrize("cause,expected_state", [

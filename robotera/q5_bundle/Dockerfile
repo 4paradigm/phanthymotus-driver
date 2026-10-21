@@ -100,7 +100,7 @@ COPY deploy/ /deploy/
 
 ENV PYTHONPATH=/work
 
-RUN python3 -c "import audio_timing, playback_telemetry"
+RUN PYTHONDONTWRITEBYTECODE=1 python3 -c "import audio_timing, playback_telemetry"
 
 RUN chmod +x /work/q5_bundle_entrypoint.sh
 

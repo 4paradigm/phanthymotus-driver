@@ -35,6 +35,59 @@ from playback_telemetry import parse_audio_format
 
 
 _SUPPORTED_SPEAKER_FORMATS = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
+_SPEAKER_FAILURE_DEDUPE_LIMIT = 256
+_SPEAKER_FAILURE_MERGE_LIMIT = 64
+
+
+def _queue_speaker_failure(failure_q, failure: dict, seen_ids: dict,
+                           overflow_epoch=None) -> bool:
+    """Offer one failure without blocking; coalesce overload conservatively."""
+    speech_id = str(failure.get("speech_id") or "")
+    if not speech_id or speech_id in seen_ids:
+        return False
+
+    item = dict(failure)
+    try:
+        failure_q.put_nowait(item)
+    except queue.Full:
+        failed_epoch = int(item.get("speaker_epoch", -1))
+        if overflow_epoch is not None:
+            lock = overflow_epoch.get_lock()
+            with lock:
+                overflow_epoch.value = max(
+                    int(overflow_epoch.value), failed_epoch)
+        evicted = None
+        try:
+            evicted = failure_q.get_nowait()
+        except queue.Empty:
+            pass
+        speech_ids = []
+        for candidate in (evicted or {}).get("speech_ids", []):
+            if str(candidate) not in speech_ids:
+                speech_ids.append(str(candidate))
+        for candidate in ((evicted or {}).get("speech_id"), speech_id):
+            if candidate and str(candidate) not in speech_ids:
+                speech_ids.append(str(candidate))
+        item = {
+            "fail_all": True,
+            "speech_id": speech_id,
+            "speech_ids": speech_ids[-_SPEAKER_FAILURE_MERGE_LIMIT:],
+            "through_epoch": failed_epoch,
+            "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+            "message": "speaker failure notification queue overloaded",
+        }
+        seen_ids[speech_id] = None
+        while len(seen_ids) > _SPEAKER_FAILURE_DEDUPE_LIMIT:
+            del seen_ids[next(iter(seen_ids))]
+        try:
+            failure_q.put_nowait(item)
+        except queue.Full:
+            return False
+    else:
+        seen_ids[speech_id] = None
+        while len(seen_ids) > _SPEAKER_FAILURE_DEDUPE_LIMIT:
+            del seen_ids[next(iter(seen_ids))]
+    return True
 
 
 def speaker_chunk_from_message(msg) -> dict:
@@ -65,7 +118,9 @@ class BridgeWorker:
         self._media_lock = threading.Lock()
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
-        self._speaker_fail_q = self._ctx.Queue()
+        self._speaker_fail_q = self._ctx.Queue(maxsize=64)
+        self._speaker_fail_epoch = self._ctx.Value("q", -1)
+        self._speaker_seen_fail_epoch = -1
         self._proc = None
         self._debug = debug
         self._namespace = namespace
@@ -75,7 +130,8 @@ class BridgeWorker:
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
             args=(self._cmd_q, self._sensor_q, self._media_qs, self._audio_q, self._speaker_q,
-                  self._speaker_fail_q, self._debug, self._namespace),
+                  self._speaker_fail_q, self._speaker_fail_epoch,
+                  self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
         self._proc.start()
@@ -132,6 +188,16 @@ class BridgeWorker:
             pass
 
     def pop_speaker_failure(self):
+        with self._speaker_fail_epoch.get_lock():
+            failed_epoch = int(self._speaker_fail_epoch.value)
+        if failed_epoch > self._speaker_seen_fail_epoch:
+            self._speaker_seen_fail_epoch = failed_epoch
+            return {
+                "fail_all": True,
+                "through_epoch": failed_epoch,
+                "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+                "message": "speaker failure notification queue overloaded",
+            }
         try:
             return self._speaker_fail_q.get_nowait()
         except queue.Empty:
@@ -158,7 +224,8 @@ class BridgeWorker:
 
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
                            audio_q: mp.Queue, speaker_q: mp.Queue,
-                          speaker_fail_q: mp.Queue, debug: bool, namespace: str):
+                          speaker_fail_q: mp.Queue, speaker_fail_epoch,
+                          debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     try:
         from common import logsafe
@@ -247,15 +314,22 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     last_speaker_frame_at = 0.0
     invalid_format_count = 0
     last_invalid_format_warning_at = None
+    speaker_failed_ids = {}
+    speaker_epoch = int(speaker_fail_epoch.value) + 1
 
     def _on_speaker(msg):
         nonlocal speaker_frames_received, speaker_duplicate_frames_dropped
         nonlocal last_speaker_digest, last_speaker_frame_at
         nonlocal invalid_format_count, last_invalid_format_warning_at
+        nonlocal speaker_epoch
         # Agent Core's remote microphone uses pcm_16k_16bit_mono while
         # perception TTS uses audio/pcm-16k. Both carry S16_LE, 16 kHz mono.
         try:
             item = speaker_chunk_from_message(msg)
+            if (item["metadata"].tracked
+                    and item["metadata"].speech_id in speaker_failed_ids):
+                return
+            item["speaker_epoch"] = speaker_epoch
             pcm = item["pcm"]
             # Two phanthy_bus_bridge publishers were observed on connected
             # browser-mic topics.  They can relay the exact same packet within
@@ -277,11 +351,13 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
             except queue.Full:
                 # Do not lose tracked EOF or other tracked chunks silently.
                 if item["metadata"].tracked:
-                    speaker_fail_q.put_nowait({
+                    _queue_speaker_failure(speaker_fail_q, {
                         "speech_id": item["metadata"].speech_id,
+                        "speaker_epoch": speaker_epoch,
                         "code": "SPEAKER_QUEUE_OVERFLOW",
                         "message": "tracked speaker chunk dropped because the queue is full",
-                    })
+                    }, speaker_failed_ids, speaker_fail_epoch)
+                    speaker_epoch += 1
                 return
             speaker_frames_received += 1
             if speaker_frames_received == 1:

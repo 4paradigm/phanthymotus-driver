@@ -462,13 +462,30 @@ def check_progress_timeouts():
         and item['reported_consumed'] < item['total']
         and now - item['last_progress_ns'] >= PROGRESS_TIMEOUT_NS):
       fail_record(item, 'ALSA_PROGRESS_TIMEOUT', 'device consumption made no bounded progress')
+def handle_xrun_state():
+  global consumed_global, progress_observed
+  consumed_global = submitted_global
+  progress_observed = True
+  for record in list(record_order):
+    if record['terminal']: continue
+    if record['total'] is not None and record['submitted'] >= record['total']:
+      consumed = record['submitted']
+      record['reported_consumed'] = consumed
+      record['last_progress_ns'] = time.monotonic_ns()
+      emit('device_progress', speech_id=record['speech_id'], consumed_frames=consumed,
+           generation=generation, device_delay_frames=0,
+           evidence='snd_pcm_xrun_tail')
+      record['terminal'] = True
+    else:
+      fail_record(record, 'ALSA_UNDERRUN', 'ALSA entered XRUN before speech EOF', 'underrun')
+  prepared = int(alsa.snd_pcm_prepare(pcm))
+  if prepared < 0:
+    fail_active('ALSA_PREPARE_FAILED', 'snd_pcm_prepare failed: %d' % prepared)
 def update_progress():
   global consumed_global, delay_failures, progress_observed
   pcm_state = int(alsa.snd_pcm_state(pcm))
   if pcm_state == 4:
-    fail_buffered('ALSA_UNDERRUN', 'ALSA entered XRUN state', event='underrun')
-    alsa.snd_pcm_prepare(pcm)
-    consumed_global = submitted_global
+    handle_xrun_state()
     return
   if pcm_state not in (3, 5):
     check_progress_timeouts()
@@ -593,9 +610,6 @@ try:
           record['segments'][-1][1] = submitted_global
         else:
           record['segments'].append([start, submitted_global])
-        emit('pcm_submitted', speech_id=speech_id, submitted_frames=record['submitted'],
-             total_output_frames=None, generation=generation,
-             device_sample_rate_hz=__RATE__)
     if record is not None and not record['terminal'] and header.get('eof') is True:
       record['total'] = record['submitted']
     if record is not None and not record['terminal']:
@@ -1102,7 +1116,9 @@ class SpeakerPlugin:
                 publish(recent[-1])
 
     def _pump(self):
+        failed_speaker_epoch = -1
         while self._running and self._process and self._process.stdin:
+            getter = getattr(self._client, "pop_speaker_chunk", None)
             failure_getter = getattr(self._client, "pop_speaker_failure", None)
             if callable(failure_getter) and self._telemetry_enabled:
                 # Bound each drain pass so PCM processing is not starved.
@@ -1110,18 +1126,39 @@ class SpeakerPlugin:
                     failure = failure_getter()
                     if failure is None:
                         break
-                    if not isinstance(failure, dict) or not failure.get("speech_id"):
+                    if not isinstance(failure, dict):
                         continue
-                    events = self._telemetry.fail_or_reject_events(
-                        str(failure["speech_id"]),
-                        "SPEAKER_QUEUE_OVERFLOW",
-                        "tracked speaker chunk dropped because the queue is full",
-                    )
-                    self._publish_terminal_events(events)
-            getter = getattr(self._client, "pop_speaker_chunk", None)
+                    code = str(failure.get("code") or "SPEAKER_QUEUE_OVERFLOW")
+                    message = str(failure.get("message") or
+                                  "tracked speaker chunk dropped because the queue is full")
+                    if failure.get("fail_all") is True:
+                        self._telemetry.mark_unknown_failed(code, message)
+                        self._fail_active_and_publish(code, message)
+                        failed_speaker_epoch = max(
+                            failed_speaker_epoch,
+                            int(failure.get("through_epoch", 0)))
+                    speech_ids = list(failure.get("speech_ids") or [])
+                    if failure.get("speech_id"):
+                        speech_ids.append(failure["speech_id"])
+                    for speech_id in dict.fromkeys(
+                            str(item) for item in speech_ids if item):
+                        events = self._telemetry.fail_or_reject_events(
+                            speech_id, code, message)
+                        self._publish_terminal_events(events)
             item = getter() if callable(getter) else None
             if item is None:
                 time.sleep(0.005)
+                continue
+            if (isinstance(item, dict)
+                    and int(item.get("speaker_epoch", failed_speaker_epoch + 1))
+                    <= failed_speaker_epoch):
+                metadata = item.get("metadata")
+                speech_id = getattr(metadata, "speech_id", None)
+                if getattr(metadata, "tracked", False) and speech_id:
+                    events = self._telemetry.fail_or_reject_events(
+                        str(speech_id), "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+                        "speaker chunk belongs to a failed queue epoch")
+                    self._publish_terminal_events(events)
                 continue
             chunk = bytes(item.get("pcm", b"")) if isinstance(item, dict) else bytes(item)
             self._frames_received += 1
