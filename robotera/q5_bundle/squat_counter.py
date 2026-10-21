@@ -12,10 +12,13 @@ import multiprocessing as mp
 import os
 import threading
 
+from common import logsafe
 from common.squat_contract import tool_definition
 
 
 def _run_worker(conn, config: dict, namespace: str) -> None:
+    # Spawn starts a fresh interpreter and does not inherit the parent's writer.
+    logsafe.install(check_fd=False)
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ.pop("CYCLONEDDS_URI", None)

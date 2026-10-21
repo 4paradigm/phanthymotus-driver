@@ -332,6 +332,7 @@ class SquatCounterPlugin:
         self._frames_received = 0
         self._frames_parsed = 0
         self._invalid_frames = 0
+        self._unexpected_frame_error_logged = False
         self._last_error: str | None = None
         self._last_voice: dict | None = None
         self._workout_state = "waiting_start"
@@ -440,6 +441,7 @@ class SquatCounterPlugin:
         self._frames_received = 0
         self._frames_parsed = 0
         self._invalid_frames = 0
+        self._unexpected_frame_error_logged = False
         self._last_error = None
         self._last_voice = None
         self._publish_status_locked(force=True)
@@ -773,7 +775,13 @@ class SquatCounterPlugin:
             except Exception as exc:
                 self._invalid_frames += 1
                 self._last_error = str(exc)
-                self._node.get_logger().error(f"Squat counter frame error: {exc}")
+                if (not self._unexpected_frame_error_logged
+                        or self._invalid_frames == 1
+                        or self._invalid_frames % 100 == 0):
+                    self._node.get_logger().error(
+                        f"Squat counter frame error after "
+                        f"{self._invalid_frames} invalid frame(s): {exc}")
+                self._unexpected_frame_error_logged = True
                 return
             now = time.monotonic()
             if fresh_frame:

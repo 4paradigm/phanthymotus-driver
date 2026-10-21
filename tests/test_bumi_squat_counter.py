@@ -17,7 +17,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from noetix.bumi.squat_logic import SquatCounter  # noqa: E402
+from common.squat_logic import SquatCounter  # noqa: E402
 
 
 KEYPOINT_NAMES = [
@@ -858,6 +858,50 @@ def test_debug_tracks_bad_input_without_polluting_decision_events(plugin_factory
     assert debug["最近错误"] == "姿态输入不是有效 JSON"
     assert len(node.publishers[event_topic].payloads) == before_events
     assert not _contains_raw_pose(debug)
+
+
+def test_unexpected_pose_errors_are_sampled_without_losing_diagnostics(
+        plugin_factory, monkeypatch):
+    card, clock, node = plugin_factory()
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    errors = []
+    monkeypatch.setattr(node, "get_logger", lambda: types.SimpleNamespace(
+        warn=lambda message: None, error=errors.append))
+
+    def fail(_payload):
+        raise RuntimeError("unsupported skeleton")
+
+    monkeypatch.setattr(card._counter, "process", fail)
+    for _ in range(101):
+        _send_pose(subscription, clock, person())
+
+    assert len(errors) == 2
+    assert "1 invalid frame(s)" in errors[0]
+    assert "100 invalid frame(s)" in errors[1]
+    debug = card.dispatch("debug", {})
+    assert debug["无效帧数"] == 101
+    assert "unsupported skeleton" in debug["最近错误"]
+
+
+def test_first_unexpected_error_is_logged_after_malformed_pose(plugin_factory,
+                                                               monkeypatch):
+    card, clock, node = plugin_factory()
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    subscription = node.subscriptions[-1]
+    warnings, errors = [], []
+    monkeypatch.setattr(node, "get_logger", lambda: types.SimpleNamespace(
+        warn=warnings.append, error=errors.append))
+    subscription.callback(_String("{bad json"))
+
+    def fail(_payload):
+        raise RuntimeError("unsupported skeleton")
+
+    monkeypatch.setattr(card._counter, "process", fail)
+    _send_pose(subscription, clock, person())
+    assert len(warnings) == 1
+    assert len(errors) == 1
+    assert "unsupported skeleton" in errors[0]
 
 
 def test_debug_reports_stale_camera_without_new_pose_frames(plugin_factory):

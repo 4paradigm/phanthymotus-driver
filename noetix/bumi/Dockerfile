@@ -81,7 +81,6 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
-COPY squat_logic.py /work/squat_logic.py
 COPY squat_counter.py /work/squat_counter.py
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from common import logsafe
 from robotera.q5_bundle import squat_counter
 
 
@@ -70,8 +71,43 @@ def test_dead_processor_is_reported_instead_of_returning_stale_count():
     assert result["state"] == "error"
 
 
+def test_worker_installs_logsafe_before_fastdds_configuration(monkeypatch):
+    calls = []
+    monkeypatch.setattr(logsafe, "install", lambda **kwargs: calls.append(("logsafe", kwargs)))
+    monkeypatch.setenv("ROS_DOMAIN_ID", "211")
+    monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+    monkeypatch.setenv("CYCLONEDDS_URI", "test-profile")
+
+    def configure():
+        calls.append(("fastdds", None))
+        raise RuntimeError("stop before ROS startup")
+
+    fake_transport = types.ModuleType("fastdds_transport")
+    fake_transport.configure_fastdds_transport = configure
+    monkeypatch.setitem(sys.modules, "fastdds_transport", fake_transport)
+
+    class FakeConnection:
+        def __init__(self):
+            self.reply = None
+            self.closed = False
+
+        def send(self, reply):
+            self.reply = reply
+
+        def close(self):
+            self.closed = True
+
+    conn = FakeConnection()
+    squat_counter._run_worker(conn, {}, "q5_test")
+
+    assert calls == [("logsafe", {"check_fd": False}), ("fastdds", None)]
+    assert conn.reply == {"ready": False, "error": "stop before ROS startup"}
+    assert conn.closed
+
+
 def test_worker_uses_pose_domain_and_handles_actions(monkeypatch):
     seen = {}
+    monkeypatch.setattr(logsafe, "install", lambda **kwargs: seen.update(logsafe=kwargs))
 
     class FakeExecutor:
         def spin_once(self, timeout_sec):
@@ -101,7 +137,11 @@ def test_worker_uses_pose_domain_and_handles_actions(monkeypatch):
     fake_executors.SingleThreadedExecutor = FakeExecutor
     fake_rclpy.executors = fake_executors
     fake_transport = types.ModuleType("fastdds_transport")
-    fake_transport.configure_fastdds_transport = lambda: seen.update(profile=True)
+    def configure():
+        assert seen["logsafe"] == {"check_fd": False}
+        seen["profile"] = True
+
+    fake_transport.configure_fastdds_transport = configure
     fake_card_module = types.ModuleType("common.squat_counter_card")
     fake_card_module.SquatCounterPlugin = FakeCard
     for name, module in (("rclpy", fake_rclpy), ("rclpy.executors", fake_executors),
@@ -109,6 +149,8 @@ def test_worker_uses_pose_domain_and_handles_actions(monkeypatch):
                          ("common.squat_counter_card", fake_card_module)):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setenv("ROS_DOMAIN_ID", "211")
+    monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+    monkeypatch.setenv("CYCLONEDDS_URI", "test-profile")
     parent, child = mp.Pipe()
     worker = threading.Thread(target=squat_counter._run_worker,
                               args=(child, {"debug_interval_s": 0.5}, "q5_test"))

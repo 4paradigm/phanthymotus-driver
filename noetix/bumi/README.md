@@ -2,8 +2,9 @@
 
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state,
 independent sound-direction, and pose-driven squat counter cards. The direction
-card is in `direction_card.py`; the squat counter is in `squat_counter.py` and
-`squat_logic.py`. Hardware cards are in `device.py` and `loco_servo.py`.
+card is in `direction_card.py`; the squat card is in `squat_counter.py`, with
+shared logic in `common/squat_logic.py`. Hardware cards are in `device.py` and
+`loco_servo.py`.
 
 ## `mic` and `sound_direction`
 
