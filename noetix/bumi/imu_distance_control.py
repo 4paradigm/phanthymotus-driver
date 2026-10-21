@@ -290,8 +290,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
                 motion_started = progress_at = changed_at = now
                 last_command_at = now
                 if leg is not None:
-                    # Calibration-phase leg noise must not move the start point.
-                    leg.reset_position()
+                    # Calibration-phase leg samples must not become the motion
+                    # baseline: the first motion sample starts a fresh window.
+                    leg.reset_baseline()
                 origin_yaw = estimator.yaw
                 cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
                 c, s = cy*body_x-sy*body_y, sy*body_x+cy*body_y

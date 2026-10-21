@@ -189,6 +189,21 @@ class LegOdometry:
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
 
+    def reset_baseline(self):
+        """Start a fresh motion baseline: zero position and drop the last sample.
+
+        The worker observes the legs during the two-second IMU calibration, so
+        without this the first motion sample would integrate against a
+        calibration sample whose age and spacing are unrelated to the motion
+        loop. Keeping `_feet` is right for a mid-walk position reset; it is
+        wrong across calibration -> motion.
+        """
+        self.position = [0.0, 0.0, 0.0]
+        self.velocity = [0.0, 0.0, 0.0]
+        self._feet = None
+        self._rotation = None
+        self._time = None
+
     def observe(self, joint_positions, quaternion, now, frozen=False):
         """One SDK joint-state + orientation sample.
 

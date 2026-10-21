@@ -57,6 +57,23 @@ def test_reset_position_keeps_the_previous_foot_for_the_next_step():
     assert estimator.position == pytest.approx([0.005, 0.0, 0.0], abs=1e-9)
 
 
+def test_reset_baseline_drops_the_calibration_sample():
+    """Calibration feet must not become the first motion sample's baseline."""
+    estimator = module.LegOdometry(slip_scale=1.0)
+    feet = stand_feet()
+    estimator.observe_feet(feet, IDENTITY, 0.0)
+    estimator.observe_feet([[f[0]-0.005, f[1], f[2]] for f in feet], IDENTITY, 0.02)
+    assert estimator.position[0] > 0
+    estimator.reset_baseline()
+    assert estimator.position == pytest.approx([0.0, 0.0, 0.0])
+    # First sample after a long gap: only establishes the baseline.
+    first = [[f[0]-0.03, f[1], f[2]] for f in feet]
+    estimator.observe_feet(first, IDENTITY, 1.5)
+    assert estimator.position == pytest.approx([0.0, 0.0, 0.0], abs=1e-12)
+    estimator.observe_feet([[f[0]-0.005, f[1], f[2]] for f in first], IDENTITY, 1.52)
+    assert estimator.position[0] == pytest.approx(0.005, abs=1e-6)
+
+
 def test_forward_translation_from_both_stance_feet():
     estimator = module.LegOdometry(slip_scale=1.0)
     feet = stand_feet()

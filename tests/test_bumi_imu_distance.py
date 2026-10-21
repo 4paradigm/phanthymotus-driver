@@ -311,6 +311,10 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
         def reset_position(self):
             self.position = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
         def observe(self, joints, quaternion, now, frozen=False):
             if frozen:
                 self.velocity = [0.0, 0.0, 0.0]
@@ -347,6 +351,10 @@ def _phase_leg(plant, parallel_after_m):
         def reset_position(self):
             self.position = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
         def observe(self, joints, quaternion, now, frozen=False):
             if frozen:
                 self.velocity = [0.0, 0.0, 0.0]
