@@ -200,10 +200,9 @@ class TronTeachingPlugin(TeachingPlugin):
             'annotate':(['episode_id','task','outcome','notes'],'更新任务、结果和备注'),
             'training_export':(['episode_id'],'异步导出 LeRobot v3；不要求回放'),
             'training_info':([], '读取训练导出结果')}
-        for action,(fields,description) in extra.items():
+        for action,(_,description) in extra.items():
             schema['properties']['action']['enum'].append(action)
             schema['properties']['action']['oneOf'].append({'const':action,'title':description})
-            schema['x-action-params'][action]={'params':fields,'description':description}
             schema['x-workbench']['actions'].append(action)
         schema['x-action-params']['run']['params'] += ['gripper_speed','gripper_force','exclusive_control_confirmed']
         schema['x-workbench']['title']='TRON2 录制与回放'

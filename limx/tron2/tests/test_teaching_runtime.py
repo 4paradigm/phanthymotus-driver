@@ -194,6 +194,12 @@ def test_shared_service_packages_and_skill_gate(tmp_path):
         adapter.capture.binding=lambda:BINDING
         writer=episode(tmp_path/'episodes')
         plugin=owner.teaching
+        schema=plugin.get_tools()[0]['inputSchema']
+        assert set(schema['x-action-params'])=={'start','info','preview','run','stop','import','export'}
+        for action in ('episode_list','episode_details','annotate','training_export','training_info'):
+            assert action in schema['x-workbench']['actions']
+            plugin._validate(action,{})
+        assert plugin.dispatch('episode_list',{})['episodes']
         draft=await asyncio.to_thread(plugin.dispatch,'new',{'filename':writer.ident})
         assert draft['recording']['training_complete']
         with pytest.raises(ValueError,match='successful_trial_required'):
