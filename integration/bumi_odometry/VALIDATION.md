@@ -37,6 +37,11 @@ Saved-graph tests execute the real graph resolver and driver binding consumer,
 including renewal/ACK handling, using transport replacements; they are not a
 complete running backend/browser test.
 
+The destination test file was also run independently: **94 passed in 62.27s**.
+An earlier independent invocation exposed eight import failures because its loader
+relied on another test adding the sibling-module directory to sys.path. The fixture
+now supplies that path explicitly; this changes no runtime behavior.
+
 ## Full repository collection
 
 `python3 -m pytest -q` stopped during collection: **45 errors, 3 skipped**.

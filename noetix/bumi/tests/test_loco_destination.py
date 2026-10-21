@@ -14,6 +14,7 @@ import yaml
 
 def _load_device(monkeypatch):
     """Load device.py with ROS message stubs (scaffold as in test_mic_card)."""
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     class Node:
         def __init__(self, name):
             self.subscriptions = []
