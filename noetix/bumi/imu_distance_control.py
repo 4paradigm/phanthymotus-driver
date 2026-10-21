@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 import time
 
-from leg_odometry import LegOdometry
+from leg_odometry import LegOdometry, joint_angles
 
 
 def decode_imu(sample):
@@ -196,6 +196,8 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
     moved = 0.0
     source_position, source_velocity = estimator.position, estimator.velocity
     dead_reckoned_m = 0.0
+    last_joints = None
+    joint_updates = 0
     last_command, last_command_at = 0.0, None
     samples, commands = [], []
     def publish(vx, vyaw=0, *, vy=0):
@@ -230,6 +232,12 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
             estimator.observe(raw, now)
             if leg is not None:
                 leg.observe(joints, raw.ori, now)
+                values = joint_angles(joints)
+                if values != last_joints:
+                    last_joints, joint_updates = values, joint_updates+1
+                samples[-1]['leg_joint_positions'] = [round(v, 6) for v in values]
+                feet = getattr(leg, 'feet', None) or []
+                samples[-1]['leg_feet'] = [[round(v, 6) for v in foot] for foot in feet]
             source_position = leg.position if leg is not None else estimator.position
             source_velocity = leg.velocity if leg is not None else estimator.velocity
             samples[-1].update(phase='calibration' if not estimator.ready else
@@ -330,6 +338,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                   imu_position_m=estimator.position, imu_velocity_mps=estimator.velocity,
                   distance_source='leg_odometry' if leg is not None else 'imu_integrated',
                   dead_reckoned_m=dead_reckoned_m,
+                  leg_samples=(getattr(leg, 'samples', None) if leg is not None else None),
+                  leg_stance_samples=(getattr(leg, 'stance_samples', None) if leg is not None else None),
+                  leg_joint_updates=(joint_updates if leg is not None else None),
                   elapsed_s=time.monotonic()-started)
     try:
         _write_trace(samples, commands, result)

@@ -12,21 +12,32 @@ import leg_odometry as module
 LEFT = module.LEG_CHAINS['left']
 RIGHT = module.LEG_CHAINS['right']
 IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-STANDING_LEFT = [0.0017, 0.0995, -0.4802]
-STANDING_RIGHT = [0.0017, -0.0995, -0.4802]
+STANDING_LEFT = [0.0301, 0.0995, -0.4802]
+STANDING_RIGHT = [0.0301, -0.0995, -0.4802]
 
 
 def stand_feet():
     return [list(STANDING_LEFT), list(STANDING_RIGHT)]
 
 
-def test_standing_pose_puts_the_sole_under_the_ankle():
+def test_standing_pose_puts_the_contact_at_the_sole_centre():
     left = module.foot_position([0.0]*6, LEFT)
     right = module.foot_position([0.0]*6, RIGHT)
     assert left == pytest.approx(STANDING_LEFT, abs=1e-3)
     assert right == pytest.approx(STANDING_RIGHT, abs=1e-3)
     # The ankle-roll link origin is the foot at z=0; the sole is 5.11 cm below.
     assert left[2] == pytest.approx(-0.4802, abs=1e-3)
+
+
+def test_contact_point_follows_the_foot_roll_to_the_heel_or_toe():
+    flat = module.foot_position([0.0]*6, LEFT)
+    toe_down = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.3, 0.0], LEFT)
+    heel_down = module.foot_position([0.0, 0.0, 0.0, 0.0, -0.3, 0.0], LEFT)
+    assert flat[0] == pytest.approx(0.0301, abs=1e-3)
+    # Rolling the foot moves the lowest sole corner by the foot length; a fixed
+    # point under the ankle would not capture that.
+    assert toe_down[0] > flat[0]+0.05
+    assert heel_down[0] < flat[0]-0.05
 
 
 def test_forward_translation_from_both_stance_feet():

@@ -45,7 +45,15 @@
   仍保留实验入口标识 `imu_integrated_experimental`。
 - 保留：SDK 四元数用于姿态和偏航/倾角检查；加速度/四元数/新鲜度/反向/超走/横向/
   速度/超时保护；加速度合理性上限 50 m/s²；指令积分只作交叉校验故障界限。
-- 新增测试：`tests/test_bumi_leg_odometry.py` 8 项（站立脚位、平移积分、摆动脚不参与、
+- 真机首测（2026-10-21 18:50，请求 0.5 m）：终态 done、`distance_source=leg_odometry`、
+  `estimated_distance_m=0.462 m`，操作者实测约 0.7 m；腿式估计的竖直分量漂到 −0.105 m，
+  同次 IMU 积分前向 0.478 m、指令积分 0.32 m。首测说明腿式估计偏小约三成，竖直漂移
+  指向脚底接触点/脚掌滚动模型，而不是简单的比例误差。
+- 修正：接触点不再固定取踝关节投影，而是取当前脚姿态下鞋底最低角点/边的平均
+  （脚跟着地取脚跟、脚尖离地取脚尖）；轨迹新增 12 个腿关节角、两侧接触点，终态新增
+  `leg_samples`、`leg_stance_samples`、`leg_joint_updates`（用于判断 `get_joint_state()`
+  的实际更新率）。
+- 新增测试：`tests/test_bumi_leg_odometry.py` 9 项（站立脚位、平移积分、摆动脚不参与、
   偏航投影、SDK MotorState 兼容、异常步长丢弃、采样/关节数校验、四元数校验）；
   `tests/test_bumi_imu_distance.py` 增加 1 项“有关节接口时使用 leg_odometry”与
   `distance_source` 断言。

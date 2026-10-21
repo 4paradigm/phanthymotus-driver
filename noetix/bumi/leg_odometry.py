@@ -52,8 +52,13 @@ JOINT_ORDER = (
 )
 JOINT_INDEX = {name: index for index, name in enumerate(JOINT_ORDER)}
 
-# Ankle-roll link origin -> sole, from the ankle_roll_link mesh bounding box.
-FOOT_OFFSET = (0.0, 0.0, -0.0511)
+# Sole corners in the ankle-roll link frame, from the ankle_roll_link mesh
+# bounding box (x: heel -0.0689 .. toe 0.1258, y: +-0.0413, sole z: -0.0511).
+SOLE_CORNERS = (
+    (-0.0689, -0.0413, -0.0511), (0.1258, -0.0413, -0.0511),
+    (-0.0689, 0.0413, -0.0511), (0.1258, 0.0413, -0.0511),
+)
+CONTACT_HEIGHT_M = 0.005
 
 # The largest plausible body step per sample at ~50 Hz (2.5 m/s).
 MAX_STEP_M = 0.05
@@ -111,15 +116,26 @@ def joint_angles(joint_positions):
 
 
 def foot_position(angles, chain):
-    """Foot contact point in the body frame for one leg's six joint angles."""
+    """Foot contact point in the body frame for one leg's six joint angles.
+
+    The contact is the lowest part of the sole given the foot orientation: when
+    the foot rolls, the heel or the toe becomes the contact instead of a fixed
+    point under the ankle. This matters because the stance foot rotates about
+    the true contact, so the ankle itself is not a stationary point.
+    """
     position = [0.0, 0.0, 0.0]
     rotation = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     for (_, origin, axis), angle in zip(chain, angles):
         offset = _apply(rotation, origin)
         position = [position[i]+offset[i] for i in range(3)]
         rotation = _matrix_multiply(rotation, _axis_rotation(axis, angle))
-    contact = _apply(rotation, FOOT_OFFSET)
-    return [position[i]+contact[i] for i in range(3)]
+    corners = []
+    for corner in SOLE_CORNERS:
+        offset = _apply(rotation, corner)
+        corners.append([position[i]+offset[i] for i in range(3)])
+    lowest = min(corner[2] for corner in corners)
+    contacts = [corner for corner in corners if corner[2] <= lowest+CONTACT_HEIGHT_M]
+    return [sum(corner[i] for corner in contacts)/len(contacts) for i in range(3)]
 
 
 class LegOdometry:
@@ -130,6 +146,7 @@ class LegOdometry:
         self.velocity = [0.0, 0.0, 0.0]
         self.samples = 0
         self.stance_samples = 0
+        self.feet = None
         self._feet = None
         self._rotation = None
         self._time = None
@@ -172,5 +189,6 @@ class LegOdometry:
                 self.stance_samples += 1
             else:
                 self.velocity = [0.0, 0.0, 0.0]
+        self.feet = feet
         self._feet, self._rotation, self._time = feet, rotation, now
         self.samples += 1
