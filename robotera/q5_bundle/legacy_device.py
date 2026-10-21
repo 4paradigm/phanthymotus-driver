@@ -1016,11 +1016,30 @@ class SpeakerPlugin:
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError,
                     ValueError, OverflowError) as exc:
                 print(f"[SpeakerPlugin] invalid remote telemetry: {exc}", flush=True)
-                self._telemetry.fail_active(
+                self._fail_active_and_publish(
                     "REMOTE_TELEMETRY_INVALID", "invalid remote telemetry")
         if process is self._process and self._running:
-            self._telemetry.fail_active(
+            self._fail_active_and_publish(
                 "REMOTE_TELEMETRY_ENDED", "remote telemetry stream ended")
+
+    def _publish_terminal_events(self, events):
+        publish = getattr(self._client, "publish_speaker_event", None)
+        if not callable(publish):
+            return
+        for event in events:
+            try:
+                publish(event)
+            except Exception as exc:
+                print(f"[SpeakerPlugin] publish event failed: {exc}", flush=True)
+
+    def _fail_active_and_publish(self, code, message, state="FAILED"):
+        events = self._telemetry.fail_active_events(code, message, state)
+        self._publish_terminal_events(events)
+        return len(events)
+
+    def _backend_reset_and_publish(self, generation, reason):
+        events = self._telemetry.backend_reset_events(generation, reason)
+        self._publish_terminal_events(events)
 
     def _handle_remote_event(self, event: dict) -> None:
         kind = event.get("event")
@@ -1031,7 +1050,7 @@ class SpeakerPlugin:
         if kind == "backend_ready":
             if (self._telemetry_enabled
                     and generation != getattr(self, "_remote_generation", None)):
-                self._telemetry.backend_reset(
+                self._backend_reset_and_publish(
                     generation, "remote ALSA backend generation changed")
             self._remote_generation = generation
             if hasattr(self, "_backend_ready"):
@@ -1060,9 +1079,10 @@ class SpeakerPlugin:
                 str(speech_id), str(event.get("code", "REMOTE_PLAYBACK_FAILED")),
                 str(event.get("message", "remote playback failed")))
         elif kind == "transport_failed":
-            handled = bool(self._telemetry.fail_active(
+            self._fail_active_and_publish(
                 str(event.get("code", "REMOTE_TRANSPORT_FAILED")),
-                str(event.get("message", "remote playback transport failed"))))
+                str(event.get("message", "remote playback transport failed")))
+            return
         if handled:
             recent = self._telemetry.get_recent_events(
                 str(speech_id) if speech_id else None, 1)
@@ -1109,7 +1129,7 @@ class SpeakerPlugin:
                     except Exception:
                         pass
                 print(f"[SpeakerPlugin] remote playback stream ended: {detail}", flush=True)
-                self._telemetry.fail_active(
+                self._fail_active_and_publish(
                     "REMOTE_STREAM_ENDED", detail or "remote playback stream ended")
                 self._running = False
                 break
@@ -1151,7 +1171,7 @@ class SpeakerPlugin:
         if hasattr(self, "_backend_ready"):
             self._backend_ready.clear()
         if hasattr(self, "_telemetry"):
-            self._telemetry.fail_active(
+            self._fail_active_and_publish(
                 "PLAYBACK_STOPPED", "speaker playback was stopped", "INTERRUPTED")
         process = self._process
         if process is not None:

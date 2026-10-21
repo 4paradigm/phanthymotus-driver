@@ -353,16 +353,30 @@ class PlaybackTracker:
             self._condition.notify_all()
             return True
 
-    def fail_active(self, code: str, message: str, state: str = "FAILED") -> int:
+    def fail_active_events(self, code: str, message: str,
+                           state: str = "FAILED") -> List[dict]:
+        """Atomically terminate active speeches and return only new events."""
         with self._condition:
             active = [item.speech_id for item in self._speeches.values()
                       if item.state not in _TERMINAL_STATES]
-        return sum(self.fail(speech_id, code, message, state) for speech_id in active)
+            emitted = []
+            for speech_id in active:
+                if self.fail(speech_id, code, message, state):
+                    emitted.append(dict(self._events[-1]))
+            return emitted
 
-    def backend_reset(self, new_generation: int, reason: str) -> None:
+    def fail_active(self, code: str, message: str,
+                    state: str = "FAILED") -> int:
+        return len(self.fail_active_events(code, message, state))
+
+    def backend_reset_events(self, new_generation: int,
+                             reason: str) -> List[dict]:
         with self._condition:
             self._generation = int(new_generation)
-        self.fail_active("BACKEND_RESET", reason)
+            return self.fail_active_events("BACKEND_RESET", reason)
+
+    def backend_reset(self, new_generation: int, reason: str) -> None:
+        self.backend_reset_events(new_generation, reason)
 
     def get_status(self, speech_id: str) -> dict:
         with self._condition:

@@ -238,17 +238,11 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     last_speaker_digest = b""
     last_speaker_frame_at = 0.0
 
-    supported_audio_formats = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
-
     def _on_speaker(msg):
         nonlocal speaker_frames_received, speaker_duplicate_frames_dropped
         nonlocal last_speaker_digest, last_speaker_frame_at
         # Agent Core's remote microphone uses pcm_16k_16bit_mono while
         # perception TTS uses audio/pcm-16k. Both carry S16_LE, 16 kHz mono.
-        if msg.format not in supported_audio_formats:
-            node.get_logger().warning(
-                f"speaker ignored unsupported audio format: {msg.format!r}")
-            return
         try:
             item = speaker_chunk_from_message(msg)
             pcm = item["pcm"]
@@ -274,6 +268,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
             elif speaker_duplicate_frames_dropped and speaker_frames_received % 100 == 0:
                 node.get_logger().info(
                     f"speaker dropped {speaker_duplicate_frames_dropped} duplicate PCM frames")
+        except ValueError as exc:
+            node.get_logger().warning(
+                f"speaker ignored invalid audio format: {exc}")
         except Exception:
             pass
 

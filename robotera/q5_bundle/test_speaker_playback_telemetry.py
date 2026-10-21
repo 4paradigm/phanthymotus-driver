@@ -485,3 +485,159 @@ def test_speaker_tool_declares_telemetry_actions(monkeypatch):
     actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
     assert {"get_playback_status", "get_recent_events", "wait_for_completion",
             "get_capabilities"}.issubset(actions)
+
+
+def test_bridge_subscription_callback_accepts_tracked_audio():
+    """Exercise the actual nested subscription callback, including its format gate."""
+    import ast
+    import hashlib
+    import queue
+    import time
+
+    source_path = Path(__file__).with_name("q5_media_bridge.py")
+    source = source_path.read_text()
+    matches = [
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_on_speaker"
+    ]
+    assert len(matches) == 1
+
+    callback = matches[0]
+    lines = source.splitlines(keepends=True)
+    callback_source = "".join(lines[callback.lineno - 1:callback.end_lineno])
+
+    wrapper = (
+        "def build_callback(node, speaker_q):\n"
+        "    speaker_frames_received = 0\n"
+        "    speaker_duplicate_frames_dropped = 0\n"
+        "    last_speaker_digest = b''\n"
+        "    last_speaker_frame_at = 0.0\n"
+        + callback_source
+        + "    return _on_speaker\n"
+    )
+
+    scope = {
+        "speaker_chunk_from_message": speaker_chunk_from_message,
+        "hashlib": hashlib,
+        "time": time,
+    }
+    exec(compile(wrapper, str(source_path), "exec"), scope)
+
+    warnings = []
+    logger = types.SimpleNamespace(
+        info=lambda message: None,
+        warning=lambda message: warnings.append(message),
+    )
+    node = types.SimpleNamespace(get_logger=lambda: logger)
+    speaker_q = queue.Queue()
+    on_speaker = scope["build_callback"](node, speaker_q)
+
+    # Identical PCM with different sequence values must both survive.
+    for sequence in (0, 1):
+        on_speaker(_Message(
+            f"audio/pcm-16k;speech_id=speech_001;sequence={sequence};eof={sequence}",
+            b"\x00\x01",
+        ))
+
+    first = speaker_q.get_nowait()
+    second = speaker_q.get_nowait()
+
+    assert first["metadata"].speech_id == "speech_001"
+    assert first["metadata"].sequence == 0
+    assert second["metadata"].sequence == 1
+    assert second["metadata"].eof is True
+    assert speaker_q.empty()
+
+    # Unsupported formats must not enter the speaker queue.
+    on_speaker(_Message("audio/wav", b"invalid"))
+    assert speaker_q.empty()
+    assert any("unsupported audio format" in msg for msg in warnings)
+
+
+@pytest.mark.parametrize("cause,expected_state", [
+    ("stop", "INTERRUPTED"),
+    ("transport_failed", "FAILED"),
+    ("backend_reset", "FAILED"),
+])
+def test_speaker_terminal_events_published_for_every_speech(
+        monkeypatch, cause, expected_state):
+    module = _load_legacy_device(monkeypatch)
+    speaker = object.__new__(module.SpeakerPlugin)
+    published = []
+
+    speaker._client = types.SimpleNamespace(
+        publish_speaker_event=published.append)
+    speaker._telemetry = PlaybackTracker()
+    speaker._telemetry_enabled = True
+    speaker._remote_generation = None
+    speaker._backend_ready = threading.Event()
+    speaker._running = True
+    speaker._process = None
+    speaker._event_thread = None
+
+    monkeypatch.setattr(
+        module, "_stop_remote_speaker_playback", lambda: None)
+
+    for speech_id in ("speech_A", "speech_B"):
+        metadata = parse_audio_format(
+            f"audio/pcm-16k;speech_id={speech_id};sequence=0;eof=0")
+        assert speaker._telemetry.receive_chunk(metadata, 160)
+
+    if cause == "stop":
+        speaker.stop()
+    elif cause == "transport_failed":
+        speaker._handle_remote_event({
+            "event": "transport_failed",
+            "code": "SSH_BROKEN",
+            "message": "remote stream lost",
+        })
+    else:
+        speaker._handle_remote_event({
+            "event": "backend_ready",
+            "generation": 2,
+        })
+
+    assert len(published) == 2
+    assert {event["speech_id"] for event in published} == {
+        "speech_A", "speech_B"}
+    assert all(event["state"] == expected_state for event in published)
+
+    # Already-terminal speeches must not generate duplicate events.
+    assert speaker._telemetry.fail_active_events(
+        "SECOND_FAILURE", "duplicate failure") == []
+    assert len(published) == 2
+
+
+def test_speaker_remote_telemetry_eof_publishes_all_failures(monkeypatch):
+    """SSH stdout EOF must publish one FAILED event per active utterance."""
+    module = _load_legacy_device(monkeypatch)
+    speaker = object.__new__(module.SpeakerPlugin)
+    published = []
+
+    speaker._client = types.SimpleNamespace(
+        publish_speaker_event=published.append)
+    speaker._telemetry = PlaybackTracker()
+    speaker._running = True
+    speaker._process = types.SimpleNamespace(stdout=io.BytesIO(b""))
+
+    for speech_id in ("speech_A", "speech_B"):
+        metadata = parse_audio_format(
+            f"audio/pcm-16k;speech_id={speech_id};sequence=0;eof=0")
+        assert speaker._telemetry.receive_chunk(metadata, 160)
+
+    # Simulate the remote SSH telemetry stream closing.
+    speaker._read_remote_events(speaker._process)
+
+    assert len(published) == 2
+    assert {event["speech_id"] for event in published} == {
+        "speech_A", "speech_B"}
+    assert all(event["state"] == "FAILED" for event in published)
+
+    for speech_id in ("speech_A", "speech_B"):
+        status = speaker._telemetry.get_status(speech_id)
+        assert status["state"] == "FAILED"
+        assert status["error_code"] == "REMOTE_TELEMETRY_ENDED"
+
+    # A second EOF must not publish duplicate terminal events.
+    speaker._read_remote_events(speaker._process)
+    assert len(published) == 2
