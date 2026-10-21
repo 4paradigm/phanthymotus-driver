@@ -19,6 +19,11 @@ DEFAULTS = dict(cue_seconds=3.0, settle_seconds=0.5, watch_seconds=3.0,
                 confidence=0.5)
 
 
+def encode_speech(words):
+    """Motus TTS consumes std_msgs/String(JSON), with a top-level text field."""
+    return json.dumps({"text": words}, ensure_ascii=False)
+
+
 class Game:
     """Clock-injected game logic, independent of ROS and robot hardware."""
 
@@ -166,7 +171,7 @@ def _worker(topics, output, status_topic, config, commands, statuses):
 
         def say(words):
             msg = String()
-            msg.data = words
+            msg.data = encode_speech(words)
             pub.publish(msg)
 
         game = Game(say, config)
@@ -252,9 +257,12 @@ class WoodenManPlugin:
                                     "stop": {"params": [], "description": "停止游戏并释放订阅"},
                                     "info": {"params": [], "description": "查看轮次和游戏状态"},
                                     "reset": {"params": [], "description": "回到等待口令，不直接开始游戏"}}},
-                "topic_in": [{"format": "text/plain"}, {"format": "sensor/pose2d"}],
-                "topic_out": [{"topic": self.prefix + "/speech", "format": "text/plain"},
-                              {"topic": self.prefix + "/status", "format": "data/json"}],
+                "topic_in": [{"format": "data/json", "desc": "ASR识别文字（asr或asr_background）"},
+                             {"format": "sensor/pose2d", "desc": "Pose人体骨架（COCO-17）"}],
+                "topic_out": [{"topic": self.prefix + "/speech", "format": "data/json",
+                               "desc": "游戏播报 speech → TTS（text字段）"},
+                              {"topic": self.prefix + "/status", "format": "data/json",
+                               "desc": "游戏状态 status（仅监视，不接TTS）"}],
                 "configSchema": {"type": "object", "properties": {
                     "asr_topic": {"type": "string", "description": "可选：画布ASR输出topic"},
                     "pose_topic": {"type": "string", "description": "可选：画布Pose输出topic"},

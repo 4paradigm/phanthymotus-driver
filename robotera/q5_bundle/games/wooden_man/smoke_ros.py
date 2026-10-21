@@ -24,8 +24,14 @@ def main():
     asr = node.create_publisher(String, "/wooden_man_test/asr", 10)
     pose = node.create_publisher(String, "/wooden_man_test/pose", 10)
     words = []
-    sub = node.create_subscription(String, "/smoke/wooden_man/speech",
-                                   lambda msg: words.append(msg.data), 10)
+    def receive_tts(msg):
+        # Match perception/plugins/tts.py:_text_cb, rather than accepting raw
+        # text as the previous smoke test did. An invalid JSON wire fails here.
+        payload = json.loads(msg.data)
+        assert isinstance(payload, dict) and isinstance(payload.get("text"), str), payload
+        words.append(payload["text"])
+
+    sub = node.create_subscription(String, "/smoke/wooden_man/speech", receive_tts, 10)
     plugin = WoodenManPlugin({}, "smoke")
 
     def pump(seconds, dx=0, publish_pose=False):
@@ -42,7 +48,9 @@ def main():
 
     def speak(text):
         msg = String()
-        msg.data = json.dumps({"text": text, "is_final": True}, ensure_ascii=False)
+        msg.data = json.dumps({"text": text, "background": True, "priority": 0,
+                               "log_type": True, "audio_start_ts": time.time(),
+                               "audio_end_ts": time.time(), "audio_duration_ms": 1200}, ensure_ascii=False)
         asr.publish(msg)
 
     def await_phase(phase, seconds, publish_pose=False):

@@ -7,13 +7,13 @@
 在已部署的 Motus 中添加 Q5 驱动以及提供 ASR / Pose / TTS 的感知服务，然后新建项目，添加以下卡片：
 
 ```text
-Q5 mic ──audio/pcm-16k──> ASR ──text/plain───────────┐
+Q5 mic ──audio/pcm-16k──> ASR ──data/json────────────┐
                                                   v
                                           一二三木头人 wooden_man
                                                   ^
 Q5 camera_rgb ──image/jpeg──> Pose ──sensor/pose2d────┘
 
-wooden_man 的 speech ──text/plain──> TTS ──audio/pcm-16k──> Q5 speaker
+wooden_man 的 speech ──data/json──> TTS ──audio/pcm-16k──> Q5 speaker
 wooden_man 的 status ──data/json──> 画布状态显示（无需接 TTS）
 ```
 
@@ -25,9 +25,13 @@ Pose 必须输出 **人体 COCO-17 二维关键点**，不能连接机器人自�
 
 上例只展示结构；真实帧需有 17 个关键点，坐标为像素，建议输出至少 5 Hz。只支持单玩家，肩和髋必须清晰可见，身体至少八个关键点有效。多人、遮挡或丢帧持续超过 1.5 秒，会播报没有看清并结束，不会判为过关。
 
-ASR 输入支持纯文本或 `{"text":"游戏开始","is_final":true}` / `{"transcript":"游戏开始","final":true}`。中间结果标记为 false 时忽略。去除空格和标点后，整句必须是“游戏开始”。游戏中重复口令不重启。结束后再喊一次可重新玩。
+ASR 两路输出 `asr`、`asr_background` 都是 `data/json`，选择其中一路连接到木头人的 ASR 输入。**默认唤醒词模式下，直接喊“游戏开始”通常走 `asr_background`**，需开启 ASR 的 `publish_background`；若 ASR 设置为 `trigger_mode=vad`，则接 `asr`。不要为本游戏连接 decision_core。ASR 输入支持 `{"text":"游戏开始","background":true,"priority":0}`，也兼容带 `is_final` / `final` 的文字消息。中间结果标记为 false 时忽略。去除空格和标点后，整句必须是“游戏开始”。游戏中重复口令不重启。结束后再喊一次可重新玩。
+
+播报端口 `speech` 的 ROS 消息为 `std_msgs/String`，内容是 `{"text":"一，二，三，木头人！"}` 这样的 JSON 对象，与真实 TTS 的 `data/json` 输入及顶层 `text` 字段一致。`status` 同样是 JSON，但只用于监视状态，不接入 TTS。
 
 启动整个画布项目，规则卡 `start` 仅进入等待口令；不会自行开始游戏。画布通过 `input_topics` 传入两条上游 topic。若当前 Motus 版本只传入单个 `input_topic`，把 ASR 和 Pose 的真实输出 topic 分别填入规则卡配置的 `asr_topic`、`pose_topic`。从上游卡 `info.topic_out` 复制，不能猜名字。规则卡输出固定为 `/<机器人命名空间>/wooden_man/speech` 和 `/status`。
+
+当前画布把 `start` / `stop` / `info` 作为生命周期动作隐藏，不显示在 ACTION 下拉框：木头人只显示 `reset`，Pose 显示照片/URL识别，Speaker 显示音量动作，这不代表它们不支持实时流。连好线后，通过顶部“开启智能控制”启动整个项目，由画布自动调用各卡的 `start`。无需在 Pose 下拉框寻找“实时模式”，也不要执行照片识别来启动流处理。
 
 ## 游戏时序和判定
 
@@ -66,3 +70,11 @@ docker run --rm --platform linux/arm64 --entrypoint bash IMAGE -lc 'source /opt/
 ```
 
 真实摄像头 Pose 推理精度、ASR 识别与 TTS 播放延迟仍需在机器人接好画布后验收。部署脚本生成 `docker-compose.wooden-man.yml`；之后手工运行 compose 时也要带上这个 override，避免基础 compose 中的旧镜像覆盖新版本。
+
+可进一步针对实际感知服务源码运行协议检查（不启动模型）。源码目录应包含 `asr.py`、`tts.py`、`pose.py`：
+
+```bash
+PYTHONPATH=robotera/q5_bundle python robotera/q5_bundle/games/wooden_man/check_perception_contract.py /path/to/perception/plugins
+```
+
+该检查读取真实卡片端口定义，并运行真实 ASR 后台消息发布函数和真实 TTS 文字回调，验证 `ASR JSON -> 游戏 -> TTS JSON`，避免只用自造的接口做模拟。

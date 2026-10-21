@@ -1,5 +1,6 @@
 """Behavioral tests: player speech, three rounds, movement and loss of vision."""
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -160,10 +161,33 @@ def test_plugin_registration_lifecycle_and_input_validation_without_hardware():
     assert p.process is None
     tool = p.get_tool()
     assert tool["type"] == "processor"
-    assert {v["format"] for v in tool["topic_in"]} == {"sensor/pose2d", "text/plain"}
+    assert {v["format"] for v in tool["topic_in"]} == {"sensor/pose2d", "data/json"}
     assert p.dispatch("start", {})["state"] == "error"
     assert p.dispatch("start", {"input_topics": ["/asr", "/pose"], "moving_frames": 1.2})["state"] == "error"
     assert p.dispatch("start", {"input_topics": ["/asr", "/pose"], "cue_seconds": float("nan")})["state"] == "error"
     assert p.dispatch("stop", {})["state"] == "idle"
     assert p.dispatch("info", {})["topic_out"][0]["topic"] == "/q5/wooden_man/speech"
     assert p.dispatch("reset", {})["state"] == "error"
+
+
+def test_asr_background_json_triggers_and_speech_is_tts_json():
+    wire = []
+    game = module.Game(lambda words: wire.append(module.encode_speech(words)), clock=lambda: 0)
+    game.text({"text": "游戏开始", "background": True, "priority": 0,
+               "log_type": True, "audio_start_ts": 1000, "audio_end_ts": 1001,
+               "audio_duration_ms": 1000})
+    assert game.phase == "countdown"
+    assert json.loads(wire[0]) == {"text": "游戏开始，五秒后开始。"}
+
+
+def test_canvas_ports_match_real_perception_formats():
+    tool = module.make_plugin({}, "q5", None, None).get_tool()
+    asr_outputs = [{"topic": "/mic/audio/asr", "format": "data/json"},
+                   {"topic": "/mic/audio/asr_background", "format": "data/json"}]
+    tts_inputs = [{"format": "data/json"}]
+    for output in asr_outputs:
+        assert any(p["format"] == output["format"] for p in tool["topic_in"])
+    speech = next(p for p in tool["topic_out"] if p["topic"].endswith("/speech"))
+    assert speech["format"] == tts_inputs[0]["format"]
+    assert "TTS" in speech["desc"]
+    assert "status" in tool["topic_out"][1]["desc"]

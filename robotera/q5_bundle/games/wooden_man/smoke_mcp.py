@@ -33,7 +33,7 @@ def run():
         result = call("tools/call", {"name": "wooden_man", "arguments": {"action": "info"}})
         payload = json.loads(result["content"][0]["text"])
         assert isinstance(payload, dict) and payload["state"] == "idle", payload
-        assert payload["topic_out"][0]["format"] == "text/plain", payload
+        assert payload["topic_out"][0]["format"] == "data/json", payload
         result = call("tools/call", {"name": "wooden_man", "arguments": {"action": "start"}})
         assert json.loads(result["content"][0]["text"])["state"] == "error"
         print("PASS: actual bundle registration, HTTP tools/list, plain-dict MCP wrapping and missing-input error")
