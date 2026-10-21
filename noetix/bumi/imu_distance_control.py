@@ -10,6 +10,8 @@ from pathlib import Path
 import tempfile
 import time
 
+from leg_odometry import LegOdometry
+
 
 def decode_imu(sample):
     """SDK xyzw attitude, body specific force in m/s², gyro in rad/s."""
@@ -182,12 +184,17 @@ def _write_trace(samples, commands, result):
 def run_distance(owner, distance_m, direction='', full_scale=None):
     direction, body_x, body_y = movement_direction(direction)
     estimator = ImuOdometry()
+    # The production LocoPlugin exposes the 21 SDK joint positions; those drive
+    # the distance estimate. Owners without joint access (unit-test plants,
+    # older bundles) keep the integrated-IMU path.
+    leg = LegOdometry() if hasattr(owner, '_read_distance_joints') else None
     started = time.monotonic()
     motion_started = brake_started = quiet_since = None
     last_signature = None
     changed_at = started
     progress_at, last_progress = started, 0.0
     moved = 0.0
+    source_position, source_velocity = estimator.position, estimator.velocity
     dead_reckoned_m = 0.0
     last_command, last_command_at = 0.0, None
     samples, commands = [], []
@@ -212,6 +219,7 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                 raise ValueError(problem['error'])
             read_started = time.monotonic()
             raw = owner._read_distance_imu()
+            joints = owner._read_distance_joints() if leg is not None else None
             now = time.monotonic()
             samples.append(dict(received_mono_s=now, read_duration_s=now-read_started,
                                 orientation_xyzw=[float(raw.ori[i]) for i in range(4)],
@@ -220,10 +228,15 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
             if now-started >= distance_timeout(distance_m):
                 raise ValueError('IMU distance movement timed out')
             estimator.observe(raw, now)
+            if leg is not None:
+                leg.observe(joints, raw.ori, now)
+            source_position = leg.position if leg is not None else estimator.position
+            source_velocity = leg.velocity if leg is not None else estimator.velocity
             samples[-1].update(phase='calibration' if not estimator.ready else
                               ('braking' if brake_started is not None else 'driving'),
-                              position_m=estimator.position, velocity_mps=estimator.velocity,
-                              acceleration_mps2=estimator.acceleration)
+                              position_m=source_position, velocity_mps=source_velocity,
+                              acceleration_mps2=estimator.acceleration,
+                              imu_position_m=estimator.position)
             if not estimator.ready:
                 publish(0)
                 time.sleep(0.02)
@@ -241,9 +254,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                 changed_at, last_signature = now, estimator.signature
             if brake_started is None and now-changed_at > 0.5:
                 raise ValueError('IMU data unchanged during motion; source freshness cannot be verified')
-            x, y, _ = estimator.position
+            x, y, _ = source_position
             moved = x*c+y*s
-            speed = estimator.velocity[0]*c+estimator.velocity[1]*s
+            speed = source_velocity[0]*c+source_velocity[1]*s
             yaw_error = angle_delta(origin_yaw, estimator.yaw)
             lateral = abs(-x*s+y*c)
             if brake_started is None:
@@ -265,7 +278,7 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
             if moved < -0.05:
                 raise ValueError('IMU estimated progress is opposite to requested direction by more than 0.05 m')
             if (lateral > lateral_limit(distance_m) or abs(yaw_error) > math.radians(20)
-                    or math.hypot(*estimator.velocity) > 1.2):
+                    or math.hypot(*source_velocity) > 1.2):
                 raise ValueError('IMU estimated motion exceeds direction or speed limits')
             if remaining < -0.05:
                 raise ValueError('IMU estimated overshoot exceeds 0.05 m')
@@ -290,7 +303,7 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                 # A quiet accelerometer alone cannot distinguish rest from
                 # uniform motion. Require zero command dwell AND low estimated
                 # speed; even this is an assumption, not a measured stop.
-                quiet = (now-brake_started >= 1.0 and math.hypot(*estimator.velocity) <= 0.10
+                quiet = (now-brake_started >= 1.0 and math.hypot(*source_velocity) <= 0.10
                          and max(abs(v) for v in estimator.acceleration) <= 0.2
                          and math.hypot(*estimator.gyro) <= 0.08)
                 if not quiet:
@@ -298,7 +311,7 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                 elif quiet_since is None:
                     quiet_since = now
                 elif now-quiet_since >= 0.8:
-                    result['pre_zero_velocity_mps'] = estimator.velocity
+                    result['pre_zero_velocity_mps'] = source_velocity
                     estimator.velocity = (0.0, 0.0, 0.0)
                     result['stationary_assumed'] = True
                     if abs(remaining) > 0.05:
@@ -313,7 +326,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
     finally:
         publish(0)
     result.update(estimated_distance_m=moved, estimated_error_m=distance_m-moved,
-                  estimated_position_m=estimator.position, estimated_velocity_mps=estimator.velocity,
+                  estimated_position_m=source_position, estimated_velocity_mps=source_velocity,
+                  imu_position_m=estimator.position, imu_velocity_mps=estimator.velocity,
+                  distance_source='leg_odometry' if leg is not None else 'imu_integrated',
                   dead_reckoned_m=dead_reckoned_m,
                   elapsed_s=time.monotonic()-started)
     try:

@@ -517,23 +517,40 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   estimated endpoint lies within 0.05 m of the requested target, **not** that
   the actual physical error is within 5 cm. There is no automatic reverse or
   repeated tiny correction at the endpoint.
+- **The distance estimate is leg odometry.** The worker reads the 21 SDK joint
+  positions and runs forward kinematics on the two leg chains from the vendor
+  `BUMI_V3.0_260119.urdf` (base_link body frame). The stance foot is stationary
+  in the world, so each sample moves the body by
+  `R_prev*p_prev - R_cur*p_cur`, with the SDK orientation quaternion supplying
+  `R`; the foot with the smaller implied step is the stance foot. No camera, no
+  external calibration and no camera-IMU extrinsics are involved. The foot
+  contact point is the ankle-roll origin projected onto the sole
+  (z = -0.0511 m from the mesh); foot roll/slip and the unknown IMU-to-base_link
+  mounting rotation are approximations, so `accuracy_validated` stays false.
+- The SDK IMU still supplies orientation and the existing fault checks. Owners
+  without joint access (unit-test plants, older bundles) keep the integrated-IMU
+  path; the production `LocoPlugin` always exposes `get_joint_state()`.
 - Invalid readings, polling gaps over 0.1 s, unchanged IMU fields for over
   0.5 s during movement, heading/tilt over 20°, estimated lateral deviation
-  over 0.15 m, estimated progress opposite to the requested direction by over
-  0.05 m, excessive estimated speed, no estimated progress for three
+  over `max(0.15, 0.5*distance)` m, estimated progress opposite to the requested
+  direction by over 0.05 m, excessive estimated speed, a dead-reckoned command
+  travel far ahead of the estimate, no estimated progress for three
   seconds, or the bounded motion/settling time limits cause zero command
   and `error`. `stop_move` cancels calibration as well as motion. The SDK
   has no source timestamp: changed fields and poll timing are only loss
   heuristics, not proof of source freshness. A truly constant input can
   conservatively trip the unchanged-data guard.
-- Results explicitly contain `feedback_source: imu_integrated_experimental`,
+- Results explicitly contain `feedback_source: imu_integrated_experimental`
+  (the retained binding/source id for the unconnected standalone experiment),
+  `distance_source: leg_odometry` (or `imu_integrated` for a joint-less owner),
   `accuracy_validated: false`, `source_timestamp_available: false`,
   `estimated_distance_m`, `estimated_error_m`, `estimated_position_m`,
-  `estimated_velocity_mps` and `stationary_assumed`. Only the distance worker
-  performs this estimation; the existing IMU/odometry telemetry cards keep
-  their original contracts and do not start claiming measured translation.
-  See [IMU experiment testing](IMU_DISTANCE_TEST.md) for independent physical
-  measurement and result interpretation.
+  `estimated_velocity_mps`, `imu_position_m`, `imu_velocity_mps`,
+  `dead_reckoned_m` and `stationary_assumed`. Only the distance worker performs
+  this estimation; the existing IMU/odometry telemetry cards keep their
+  original contracts and do not start claiming measured translation.
+  See [leg odometry testing](IMU_DISTANCE_TEST.md) for the independent
+  measurement procedure and result interpretation.
 - Each IMU distance attempt records the raw control-loop IMU reads, monotonic
   receipt/read timing, estimated state, requested velocity commands and terminal
   result. The result's `imu_trace_path` identifies a JSON file inside the driver

@@ -1070,6 +1070,10 @@ class LocoPlugin:
             self._distance_feedback.validate(context)
         return self._high_ctrl.get_imu_data()
 
+    def _read_distance_joints(self):
+        """The 21 SDK joint positions used by the leg-odometry distance estimate."""
+        return self._high_ctrl.get_joint_state()
+
     def _distance_preflight(self, args):
         from imu_distance_control import movement_direction
         movement_direction(args.get('direction', ''))

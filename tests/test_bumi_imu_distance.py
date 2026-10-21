@@ -143,6 +143,7 @@ def test_move_calibrates_then_brakes_and_reports_an_estimate(monkeypatch, yaw):
     result = module.run_distance(plant, 1)
     assert result['state'] == 'done', result
     assert result['feedback_source'] == 'imu_integrated_experimental'
+    assert result['distance_source'] == 'imu_integrated'
     assert result['accuracy_validated'] is False
     assert result['estimated_distance_m'] == pytest.approx(plant.distance, abs=0.005)
     assert abs(result['estimated_error_m']) <= 0.05
@@ -292,6 +293,34 @@ def test_direction_moves_along_requested_body_axis_and_brakes(monkeypatch, direc
         assert (vy if expected[0] else vx) == 0
         assert turn == pytest.approx(0.)
     assert plant.commands[-1][1:] == (0, 0, 0)
+
+
+def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypatch):
+    """Production LocoPlugin exposes get_joint_state(); the displacement must
+    then come from the leg estimate, not from the integrated IMU."""
+    plant = Plant(monkeypatch)
+    class FakeLeg:
+        def __init__(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
+        def observe(self, joints, quaternion, now):
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            step = 0.16*dt if plant.command else 0.0
+            self.position = [self.position[0]+step, self.position[1], self.position[2]]
+            self.velocity = [step/dt, 0.0, 0.0]
+    monkeypatch.setattr(module, 'LegOdometry', FakeLeg)
+    monkeypatch.setattr(plant, '_read_distance_joints', lambda: [0.0]*21, raising=False)
+    result = module.run_distance(plant, 1.0)
+    assert result['state'] == 'done', result
+    assert result['distance_source'] == 'leg_odometry'
+    assert result['estimated_distance_m'] == pytest.approx(1.0, abs=0.06)
+    assert 'imu_position_m' in result
+    assert plant.commands[-1][1:] == (0, 0)
 
 
 def test_distance_trace_keeps_raw_control_samples_commands_and_terminal_error(monkeypatch):

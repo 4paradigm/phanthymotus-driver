@@ -27,6 +27,34 @@
 - 仍应暂停纯 IMU 距离试验，直到用同一机身标记点取得新的实测值并确认交叉校验的
   触发点符合预期。
 
+## 2026-10-21 腿式里程计（第三轮）
+
+真机数据说明纯 IMU 不可用：退级版 0.8 m 动作实际约 1.05 m，IMU 估计只有 0.075 m；
+同一 0.6 指令的指令积分在两次动作间给出 0.2–0.35 m/s 的不同速度。按操作者要求，
+把 #408 独立距离动作的距离来源改为**腿式里程计**。
+
+- 新增 `noetix/bumi/leg_odometry.py`：从 `BUMI_V3.0_260119.urdf` 提取左右腿各 6 个
+  关节的原点与轴，对 SDK 的 21 个关节位置做正运动学；脚底接触点取踝滚转关节原点
+  投影到鞋底（z = −0.0511 m，来自 ankle_roll_link 网格包围盒）。
+- 积分：支撑脚在世界中不动，因此每个采样机身位移 =
+  `R_prev·p_prev − R_cur·p_cur`（p 为机体系脚位，R 来自 SDK 四元数）；两条腿隐含
+  步长较小的是支撑脚，两者接近时按双支撑取平均；单步超过 0.05 m 视为噪声丢弃。
+- `run_distance` 在 owner 暴露 `_read_distance_joints()` 时使用腿式里程计（生产的
+  `LocoPlugin` 总是暴露），否则退回原 IMU 积分（单元测试用的 plant、旧 bundle）。
+  结果新增 `distance_source`、`imu_position_m`、`imu_velocity_mps`；`feedback_source`
+  仍保留实验入口标识 `imu_integrated_experimental`。
+- 保留：SDK 四元数用于姿态和偏航/倾角检查；加速度/四元数/新鲜度/反向/超走/横向/
+  速度/超时保护；加速度合理性上限 50 m/s²；指令积分只作交叉校验故障界限。
+- 新增测试：`tests/test_bumi_leg_odometry.py` 8 项（站立脚位、平移积分、摆动脚不参与、
+  偏航投影、SDK MotorState 兼容、异常步长丢弃、采样/关节数校验、四元数校验）；
+  `tests/test_bumi_imu_distance.py` 增加 1 项“有关节接口时使用 leg_odometry”与
+  `distance_source` 断言。
+- 回归：IMU/腿式/广域 Bumi/实验/打包 **597 passed**；`noetix/bumi/tests` 96 passed
+  （计入 597）。Python 编译与 whitespace 检查通过。
+- **未做**：真机构建/部署/运动验证。需要确认：关节符号与 URDF 一致（走错方向先查符号，
+  不要用系数补偿）、脚底接触点/双支撑阈值在真实步态下的表现、四元数 IMU 与 base_link
+  的安装对齐。`accuracy_validated` 仍为 false。
+
 ## 2026-10-21 真机复测（第二轮，含审核修正）
 
 操作者部署 `release.261021.30cf9db`（上一轮交叉校验）后先实测 5 次，再部署

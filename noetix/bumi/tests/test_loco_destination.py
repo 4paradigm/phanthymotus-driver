@@ -156,6 +156,13 @@ class FakeHighCtrl:
         self.cmds = []          # (x, y, z) 每次 publish_cmd 记录
         self.wz_dps = 0.0       # realistic 内部速度状态（°/s）；ideal 恒 0
     def get_mode(self): return self.mode
+    def get_joint_state(self):
+        # 21 SDK motor states; all joints at zero is the standing pose. The
+        # distance worker's leg odometry needs the full sequence even when a
+        # test only exercises the rotate/refusal paths.
+        return [types.SimpleNamespace(pos=0.0, vel=0.0, tau=0.0,
+                                      motor_id=index, error=0, temperature=25)
+                for index in range(21)]
     def get_imu_data(self):
         import math
         half = math.radians(self.yaw) / 2
