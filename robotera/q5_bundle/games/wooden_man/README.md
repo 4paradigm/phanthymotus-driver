@@ -33,6 +33,8 @@ ASR 两路输出 `asr`、`asr_background` 都是 `data/json`，选择其中一�
 
 当前画布把 `start` / `stop` / `info` 作为生命周期动作隐藏，不显示在 ACTION 下拉框：木头人只显示 `reset`，Pose 显示照片/URL识别，Speaker 显示音量动作，这不代表它们不支持实时流。连好线后，通过顶部“开启智能控制”启动整个项目，由画布自动调用各卡的 `start`。无需在 Pose 下拉框寻找“实时模式”，也不要执行照片识别来启动流处理。
 
+Core 会先通过隐藏的 `config` 动作下发保存的参数，再调用 `start`。本卡显式处理 `config`，校验并保存参数，但不启动游戏；相同参数重复下发不会重启正在运行的游戏。无效参数通过 MCP 错误返回，且不会覆盖上一次有效配置。修改运行中的参数会先停止本卡，由下次显式 `start` 使用新配置。
+
 ## 游戏时序和判定
 
 1. 玩家说“游戏开始”，播报“游戏开始，五秒后开始”，从发出播报起计时 5 秒。
@@ -77,4 +79,4 @@ docker run --rm --platform linux/arm64 --entrypoint bash IMAGE -lc 'source /opt/
 PYTHONPATH=robotera/q5_bundle python robotera/q5_bundle/games/wooden_man/check_perception_contract.py /path/to/perception/plugins
 ```
 
-该检查读取真实卡片端口定义，并运行真实 ASR 后台消息发布函数和真实 TTS 文字回调，验证 `ASR JSON -> 游戏 -> TTS JSON`，避免只用自造的接口做模拟。
+该检查读取真实卡片端口定义，并运行真实 ASR 后台消息发布函数和真实 TTS 文字回调，验证 `ASR JSON -> 游戏 -> TTS JSON`。目录同时含 `agent-core_src_tool_config.py` 时，还会运行 Core 实际的配置计划函数。镜像内 `smoke_ros.py` 通过真实 HTTP MCP 执行 `config -> start -> info -> reset -> stop`，同时验证 DDS 游戏链路，避免只绕过控制面直接调用规则类。

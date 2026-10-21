@@ -302,6 +302,29 @@ class WoodenManPlugin:
         with self.lock:
             return self._dispatch(action, args)
 
+    def _settings(self, args):
+        """Validate a candidate atomically; config is sent before canvas start."""
+        config, topics = dict(self.config), dict(self.configured_topics)
+        supplied = args.get("config") or {}
+        if not isinstance(supplied, dict):
+            raise ValueError("config须为对象")
+        for key in DEFAULTS:
+            value = args.get(key, supplied.get(key, config[key]))
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"无效参数: {key}")
+            config[key] = value
+        if config["moving_frames"] != int(config["moving_frames"]) or config["confidence"] > 1 or config["watch_seconds"] <= config["pose_timeout"]:
+            raise ValueError("moving_frames须为整数，confidence≤1，watch_seconds须大于pose_timeout")
+        for key in topics:
+            value = args.get(key, supplied.get(key, topics[key]))
+            if not isinstance(value, str):
+                raise ValueError(f"{key}须为topic字符串")
+            value = value.strip()
+            if value and (not value.startswith("/") or any(c.isspace() for c in value)):
+                raise ValueError(f"{key}须为绝对ROS topic或留空")
+            topics[key] = value
+        return config, topics
+
     def _dispatch(self, action, args):
         if action == "info":
             return self.info()
@@ -313,25 +336,32 @@ class WoodenManPlugin:
                 return {"state": "error", "message": "请先启动画布"}
             self.commands.put("reset")
             return {"state": "running", "message": "已请求回到等待口令"}
-        if action != "start":
+        if action not in ("config", "start"):
             return None
-        config = dict(self.config)
+        try:
+            config, configured_topics = self._settings(args)
+        except ValueError as exc:
+            if action == "config":
+                # Core's auto-config path checks JSON-RPC errors before start;
+                # a mere {state:error} config reply is otherwise ignored there.
+                raise
+            return {"state": "error", "message": str(exc)}
+        if action == "config":
+            changed = config != self.config or configured_topics != self.configured_topics
+            if changed and self.process is not None:
+                self.stop()  # Apply on the next explicit canvas start, never auto-start a game.
+            self.config, self.configured_topics = config, configured_topics
+            running = self.process is not None and self.process.is_alive()
+            return {"status": "configured", "adapter_ok": True,
+                    "state": "running" if running else "idle", "config": dict(self.config),
+                    **self.configured_topics}
         supplied = args.get("config") or {}
-        if not isinstance(supplied, dict):
-            return {"state": "error", "message": "config须为对象"}
-        for key, default in DEFAULTS.items():
-            value = args.get(key, supplied.get(key, config[key]))
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                return {"state": "error", "message": f"无效参数: {key}"}
-            config[key] = value
-        if config["moving_frames"] != int(config["moving_frames"]) or config["confidence"] > 1 or config["watch_seconds"] <= config["pose_timeout"]:
-            return {"state": "error", "message": "moving_frames须为整数，confidence≤1，watch_seconds须大于pose_timeout"}
         topics = args.get("input_topics") or []
         if not isinstance(topics, list) or any(not isinstance(t, str) for t in topics):
             return {"state": "error", "message": "input_topics须为topic字符串数组"}
         topics = list(topics)
         for key in ("input_topic", "asr_topic", "pose_topic"):
-            value = args.get(key) or supplied.get(key) or self.configured_topics.get(key)
+            value = (args.get(key) or supplied.get(key)) if key == "input_topic" else configured_topics[key]
             if value:
                 topics.append(value)
         if any(not isinstance(t, str) or not t.startswith("/") or any(c.isspace() for c in t) for t in topics):
@@ -342,7 +372,7 @@ class WoodenManPlugin:
         if self.process is not None and self.process.is_alive() and topics == self.topics and config == self.config:
             return self.info()
         self.stop()
-        self.config, self.topics = config, topics
+        self.config, self.configured_topics, self.topics = config, configured_topics, topics
         ctx = mp.get_context("spawn")
         self.commands, self.statuses = ctx.Queue(), ctx.Queue(maxsize=64)
         self.process = ctx.Process(target=_worker, args=(topics, self.prefix + "/speech",

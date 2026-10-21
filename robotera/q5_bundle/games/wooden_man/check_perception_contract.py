@@ -29,7 +29,7 @@ def source(root, name):
     return ast.parse(path.read_text(encoding="utf-8"))
 
 
-def callback(tree, name):
+def callback(tree, name, extra=None):
     node = copy.deepcopy(next(n for n in ast.walk(tree)
                               if isinstance(n, ast.FunctionDef) and n.name == name))
     node.decorator_list = []
@@ -37,6 +37,7 @@ def callback(tree, name):
     for arg in node.args.args + node.args.kwonlyargs:
         arg.annotation = None
     namespace = {"json": json, "String": String, "log": logging.getLogger("contract")}
+    namespace.update(extra or {})
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
                  "<actual-perception-callback>", "exec"), namespace)
     return namespace[name]
@@ -86,6 +87,21 @@ def main():
     assert text_queue.get_nowait()[0] == "游戏开始，五秒后开始。"
     print("PASS: actual ASR/Pose/TTS port declarations match the game card")
     print("PASS: actual ASR background publisher -> game -> actual TTS callback queue")
+
+    core_path = args.perception_plugins / "agent-core_src_tool_config.py"
+    if core_path.exists():
+        core = ast.parse(core_path.read_text(encoding="utf-8"))
+        split = callback(core, "split_config_by_scope")
+        plan = callback(core, "plan_config_calls", {"split_config_by_scope": split})
+        plugin = WoodenManPlugin({}, "contract")
+        saved = {"cue_seconds": 4, "asr_topic": "", "pose_topic": ""}
+        calls = plan(plugin.get_tool(), saved, {}, "card-contract")
+        assert calls
+        for body, extra in calls:
+            result = plugin.dispatch("config", {**body, **extra})
+            assert result["status"] == "configured", result
+        assert plugin.config["cue_seconds"] == 4 and plugin.process is None
+        print("PASS: actual Core plan_config_calls -> game config -> info, no premature game start")
 
 
 if __name__ == "__main__":

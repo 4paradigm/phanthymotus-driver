@@ -191,3 +191,35 @@ def test_canvas_ports_match_real_perception_formats():
     assert speech["format"] == tts_inputs[0]["format"]
     assert "TTS" in speech["desc"]
     assert "status" in tool["topic_out"][1]["desc"]
+
+
+def test_canvas_config_is_handled_before_start_without_starting_game():
+    p = module.make_plugin({}, "q5", None, None)
+    result = p.dispatch("config", {"instance_id": "card-1", "cue_seconds": 4,
+                                  "asr_topic": "/mic/asr_background", "pose_topic": "/camera/pose/skeleton"})
+    assert result["status"] == "configured" and result["adapter_ok"]
+    assert p.process is None and p.info()["phase"] == "waiting"
+    assert p.config["cue_seconds"] == 4
+    assert p.configured_topics["asr_topic"] == "/mic/asr_background"
+    assert p.dispatch("config", {"asr_topic": "", "pose_topic": ""})["status"] == "configured"
+    assert p.configured_topics == {"asr_topic": "", "pose_topic": ""}
+
+
+def test_invalid_config_is_atomic_and_raises_to_the_mcp_error_handler():
+    p = module.make_plugin({}, "q5", None, None)
+    before = dict(p.config)
+    with pytest.raises(ValueError, match="confidence"):
+        p.dispatch("config", {"cue_seconds": 6, "confidence": -1})
+    assert p.config == before and p.process is None
+    with pytest.raises(ValueError, match="asr_topic"):
+        p.dispatch("config", {"asr_topic": "not/a/ROS/topic"})
+    assert p.configured_topics["asr_topic"] == ""
+
+
+def test_reapplying_saved_config_does_not_stop_running_worker():
+    from types import SimpleNamespace
+    p = module.make_plugin({}, "q5", None, None)
+    sentinel = SimpleNamespace(is_alive=lambda: True)
+    p.process = sentinel
+    assert p.dispatch("config", dict(module.DEFAULTS))["state"] == "running"
+    assert p.process is sentinel

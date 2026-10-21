@@ -6,6 +6,9 @@ python3 /work/games/wooden_man/smoke_ros.py
 import json
 import os
 import time
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
 
 
 def main():
@@ -17,7 +20,8 @@ def main():
     import rclpy
     from rclpy.node import Node
     from std_msgs.msg import String
-    from wooden_man import WoodenManPlugin
+    from wooden_man import DEFAULTS
+    import main as driver
 
     rclpy.init()
     node = Node("wooden_man_smoke")
@@ -32,7 +36,24 @@ def main():
         words.append(payload["text"])
 
     sub = node.create_subscription(String, "/smoke/wooden_man/speech", receive_tts, 10)
-    plugin = WoodenManPlugin({}, "smoke")
+    driver._bundle = driver.Q5Bundle({"plugins": {"wooden_man": {"enabled": True}}},
+                                    "smoke", None, None)
+    plugin = driver._bundle._plugins[0]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), driver.make_handler())
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def control(action, args=None):
+        arguments = {"action": action, "instance_id": "card-smoke", **(args or {})}
+        req = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/mcp",
+                                     data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                                      "method": "tools/call", "params": {
+                                                          "name": "wooden_man", "arguments": arguments}}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with opener.open(req, timeout=15) as response:
+            reply = json.load(response)
+        assert "error" not in reply, reply
+        return json.loads(reply["result"]["content"][0]["text"])
 
     def pump(seconds, dx=0, publish_pose=False):
         deadline = time.monotonic() + seconds
@@ -57,13 +78,19 @@ def main():
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             pump(0.1, publish_pose=publish_pose)
-            if plugin.dispatch("info", {}).get("phase") == phase:
+            if control("info").get("phase") == phase:
                 return
         raise AssertionError((phase, plugin.info(), words))
 
     try:
-        result = plugin.dispatch("start", {"input_topics": ["/wooden_man_test/asr", "/wooden_man_test/pose"]})
+        saved = {**DEFAULTS, "asr_topic": "", "pose_topic": ""}
+        assert control("config", saved)["status"] == "configured"
+        result = control("start", {"input_topic": "/wooden_man_test/asr",
+                                   "input_topics": ["/wooden_man_test/asr", "/wooden_man_test/pose"]})
         assert result["state"] == "running", result
+        worker_pid = plugin.process.pid
+        assert control("config", saved)["state"] == "running"
+        assert plugin.process.pid == worker_pid, "Repeated auto-config restarted the game"
         pump(2)
         assert not words and plugin.info()["phase"] == "waiting"
         speak("不要游戏开始")
@@ -83,13 +110,16 @@ def main():
         assert words[-1] == "你动了，游戏结束。", words
         print("PASS: DDS Pose movement -> loss speech", flush=True)
 
-        plugin.dispatch("reset", {})
+        control("config", saved)
+        control("reset")
         await_phase("waiting", 2)
-        plugin.dispatch("stop", {})
+        control("stop")
         assert plugin.info()["state"] == "idle" and plugin.process is None
-        print("PASS: reset and stop release worker", flush=True)
+        print("PASS: real HTTP config -> start -> info -> reset -> stop, repeated config keeps worker", flush=True)
     finally:
         plugin.stop()
+        server.shutdown()
+        server.server_close()
         node.destroy_node()
         rclpy.shutdown()
 
