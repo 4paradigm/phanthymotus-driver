@@ -532,8 +532,14 @@ try:
         record_order.append(record)
       if record['terminal']:
         continue
-      if sequence != record['next_sequence'] or record['total'] is not None:
-        fail_record(record, 'CHUNK_SEQUENCE_ERROR', 'duplicate or out-of-order chunk')
+      if sequence < record['next_sequence']:
+        # An already accepted sequence is an idempotent duplicate.
+        continue
+      if sequence > record['next_sequence']:
+        fail_record(record, 'CHUNK_SEQUENCE_ERROR', 'missing or out-of-order chunk')
+        continue
+      if record['total'] is not None:
+        fail_record(record, 'CHUNK_SEQUENCE_ERROR', 'new chunk after EOF')
         continue
       record['next_sequence'] += 1
     if len(raw) % 2:
@@ -837,7 +843,7 @@ class SpeakerPlugin:
             }},
             # Leave the topic unresolved until canvas supplies input_topic.
             "topic_in": [{"format": "audio/pcm-16k"}],
-            "topic_out": [{"topic": self._event_topic, "format": "application/json"}],
+            "topic_out": [{"topic": self._event_topic, "format": "data/json"}],
         }
 
     def start(self, input_topic=None):

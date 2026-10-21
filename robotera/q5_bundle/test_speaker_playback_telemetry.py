@@ -512,14 +512,17 @@ def test_bridge_subscription_callback_accepts_tracked_audio():
         "    speaker_duplicate_frames_dropped = 0\n"
         "    last_speaker_digest = b''\n"
         "    last_speaker_frame_at = 0.0\n"
+        "    invalid_format_count = 0\n"
+        "    last_invalid_format_warning_at = None\n"
         + callback_source
         + "    return _on_speaker\n"
     )
 
+    fake_clock = [1000.0]
     scope = {
         "speaker_chunk_from_message": speaker_chunk_from_message,
         "hashlib": hashlib,
-        "time": time,
+        "time": types.SimpleNamespace(monotonic=lambda: fake_clock[0]),
     }
     exec(compile(wrapper, str(source_path), "exec"), scope)
 
@@ -552,6 +555,22 @@ def test_bridge_subscription_callback_accepts_tracked_audio():
     on_speaker(_Message("audio/wav", b"invalid"))
     assert speaker_q.empty()
     assert any("unsupported audio format" in msg for msg in warnings)
+
+    # Malformed DDS formats must not flood or inject into logs.
+    bad_format = "audio/\\x1b[31m" + "X" * 512
+    for _ in range(100):
+        on_speaker(_Message(bad_format))
+
+    assert len(warnings) == 1
+    assert "\\x1b" not in warnings[0]
+    assert "X" * 40 not in warnings[0]
+    assert speaker_q.empty()
+
+    # One summarized warning after the five-second interval.
+    fake_clock[0] += 5.1
+    on_speaker(_Message(bad_format))
+    assert len(warnings) == 2
+    assert "101 chunks" in warnings[-1]
 
 
 @pytest.mark.parametrize("cause,expected_state", [
@@ -641,3 +660,43 @@ def test_speaker_remote_telemetry_eof_publishes_all_failures(monkeypatch):
     # A second EOF must not publish duplicate terminal events.
     speaker._read_remote_events(speaker._process)
     assert len(published) == 2
+
+
+def test_generated_player_drops_duplicate_sequence_and_continues(monkeypatch):
+    """0 -> 0 -> 1: duplicate must not fail or reach ALSA twice."""
+    module = _load_legacy_device(monkeypatch)
+    fake = _FakeAlsa()
+    command = module._q5_alsa_speaker_command("hw:2,0", 44100, 2)
+
+    events = _run_remote_player(monkeypatch, command, fake, [
+        _packet("A", 0, False),
+        _packet("A", 0, False),  # duplicate
+        _packet("A", 1, True),
+    ])
+
+    assert not any(
+        event.get("speech_id") == "A"
+        and event.get("event") in {"failed", "underrun"}
+        for event in events
+    )
+    assert fake.write_calls == 2
+
+
+def test_generated_player_rejects_forward_sequence_gap(monkeypatch):
+    """0 -> 2: missing sequence 1 must fail the utterance."""
+    module = _load_legacy_device(monkeypatch)
+    fake = _FakeAlsa()
+    command = module._q5_alsa_speaker_command("hw:2,0", 44100, 2)
+
+    events = _run_remote_player(monkeypatch, command, fake, [
+        _packet("A", 0, False),
+        _packet("A", 2, True),
+    ])
+
+    assert any(
+        event.get("speech_id") == "A"
+        and event.get("event") == "failed"
+        and event.get("code") == "CHUNK_SEQUENCE_ERROR"
+        for event in events
+    )
+    assert fake.write_calls == 1
