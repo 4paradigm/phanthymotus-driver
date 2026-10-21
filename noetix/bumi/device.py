@@ -336,6 +336,8 @@ class LocoPlugin:
         return bool(thread is not None and thread.is_alive())
 
     def is_motion_reserved(self) -> bool:
+        # Advisory admission check. Publication enforces this under _lock,
+        # which is also held for every routine ownership transition.
         return self._routine_owner is not None
 
     def publish_velocity(self, x: float, y: float, z: float) -> None:
@@ -348,7 +350,9 @@ class LocoPlugin:
         """
         # Never acquire _action_lock here: servo holds its own lock, while
         # explicit actions acquire _action_lock before pausing the servo.
-        # The check under the SDK write lock closes the check/publish race.
+        # Routine owner writes share the SDK write lock with this check and
+        # publication. Claim/release drops that lock before pausing the servo,
+        # preserving servo -> publisher ordering without an action-lock cycle.
         self._publish_cmd(x, y, z, _get_default_cmd(), 0, streaming=True)
 
     def _preempt_servo(self, reason: str) -> bool:

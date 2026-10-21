@@ -987,3 +987,126 @@ def test_same_card_can_query_and_confirm_each_round_without_manual_stop_calls(ca
     result = wait_for(card, 'completed')
     assert result['completed_plays'] == 2 and result['full_playback_confirmed'] is True
     assert [c[0] for c in hardware[0].calls if c[0] != 'DEFAULT'] == ['PLAYTEACH', 'WALK'] * 2
+
+
+def test_routine_claim_waits_for_inflight_stream_publication(card, hardware, monkeypatch):
+    """Force the stream past its owner check before a concurrent routine claim.
+
+    The ownership transition must wait for that same SDK write lock; otherwise
+    the already-approved velocity publishes after the routine owns the body.
+    Queue events make the interleaving deterministic, without scheduler sleeps.
+    """
+    import queue
+    high, loco = hardware
+    entered, release = threading.Event(), threading.Event()
+    events = queue.Queue()
+    errors, published_while_reserved = [], []
+    original_lock, original_publish = loco._lock, high.publish_cmd
+
+    class ObservedWriteLock:
+        def __enter__(self):
+            if threading.current_thread().name == 'claim-routine':
+                events.put('owner_write_lock')
+            return original_lock.__enter__()
+
+        def __exit__(self, *args):
+            return original_lock.__exit__(*args)
+
+    def publish(x, y, z, command, index):
+        if x == 0.25:
+            entered.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError('test did not release in-flight SDK publish')
+            published_while_reserved.append(loco.is_motion_reserved())
+        return original_publish(x, y, z, command, index)
+
+    monkeypatch.setattr(loco, '_lock', ObservedWriteLock())
+    monkeypatch.setattr(high, 'publish_cmd', publish)
+
+    def stream():
+        try:
+            loco.publish_velocity(0.25, 0, 0)
+        except Exception as exc:
+            errors.append(exc)
+
+    def claim():
+        try:
+            result = run(card)
+            events.put('run_returned' if result.get('ok') else result)
+        except Exception as exc:
+            errors.append(exc)
+            events.put('run_error')
+
+    streaming = threading.Thread(target=stream, daemon=True)
+    claiming = threading.Thread(target=claim, name='claim-routine', daemon=True)
+    try:
+        streaming.start()
+        assert entered.wait(timeout=1)
+        claiming.start()
+        assert events.get(timeout=1) == 'owner_write_lock'
+        assert not loco.is_motion_reserved()
+        release.set()
+        streaming.join(timeout=1)
+        claiming.join(timeout=1)
+        assert not streaming.is_alive() and not claiming.is_alive()
+        assert not errors and published_while_reserved == [False]
+        wait_for(card, 'awaiting_confirmation')
+        # Once reservation wins, both stale motion and zero refresh are blocked.
+        before = list(high.calls)
+        loco.publish_velocity(0.25, 0, 0)
+        loco.publish_velocity(0, 0, 0)
+        assert high.calls == before
+        assert finish(card)['state'] == 'completed'
+    finally:
+        release.set()
+        streaming.join(timeout=2)
+        if claiming.ident is not None:
+            claiming.join(timeout=2)
+        card.stop()
+
+
+def test_claim_drops_publisher_lock_before_waiting_for_servo_lock(card, hardware):
+    """Servo -> publisher and action -> servo must never form a lock cycle."""
+    _, loco = hardware
+    servo_lock = threading.Lock()
+    servo_ready, pausing = threading.Event(), threading.Event()
+    errors, results = [], []
+
+    class Servo:
+        def pause_for_explicit_command(self, _reason):
+            pausing.set()
+            with servo_lock:
+                return True
+
+    loco.attach_servo(Servo())
+
+    def stream():
+        try:
+            with servo_lock:
+                servo_ready.set()
+                if not pausing.wait(timeout=1):
+                    raise RuntimeError('routine did not reach servo pause')
+                loco.publish_velocity(0.25, 0, 0)
+        except Exception as exc:
+            errors.append(exc)
+
+    def claim():
+        try:
+            results.append(run(card))
+        except Exception as exc:
+            errors.append(exc)
+
+    streaming = threading.Thread(target=stream, daemon=True)
+    claiming = threading.Thread(target=claim, daemon=True)
+    try:
+        streaming.start()
+        assert servo_ready.wait(timeout=1)
+        claiming.start()
+        streaming.join(timeout=1)
+        claiming.join(timeout=1)
+        assert not streaming.is_alive() and not claiming.is_alive(), 'publisher/servo lock cycle'
+        assert not errors and results[0]['ok']
+        assert not [c for c in hardware[0].calls if c[2] == 0.25]
+        assert finish(card)['state'] == 'completed'
+    finally:
+        loco.attach_servo(None)

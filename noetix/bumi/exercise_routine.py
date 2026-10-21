@@ -298,6 +298,10 @@ class LocoRoutineBackend:
 
     The lock is reentrant because explicit dispatch invokes preempt_locked while
     holding it. No worker join or plugin-state lock is taken inside this lease.
+    Owner writes additionally take loco._lock, the SDK publisher lock, so a
+    stream's reservation check and publication precede or follow the transfer
+    atomically. Order: action -> publisher; drop publisher before pausing servo.
+    Servo code may hold its own lock -> publisher, never publisher -> servo.
     """
     def __init__(self, loco, cancel):
         self.loco = loco
@@ -319,11 +323,13 @@ class LocoRoutineBackend:
             if self.loco._routine_owner is not None or self.loco.is_moving():
                 raise RoutineError("机器人已有编排或移动任务，请先停止")
             self._mode({WALKING_MODE})
-            self.loco._routine_owner = self
+            with self.loco._lock:
+                self.loco._routine_owner = self
             try:
                 self.loco._preempt_servo("exercise_routine.run")
             except Exception as exc:
-                self.loco._routine_owner = None
+                with self.loco._lock:
+                    self.loco._routine_owner = None
                 raise RoutineError(f"无法暂停流式控制：{exc}") from exc
         finally:
             self.loco._action_lock.release()
@@ -377,7 +383,8 @@ class LocoRoutineBackend:
             # Keep the lease on failed exit: explicit stop/recovery must resolve
             # it before another job can acquire the body.
             if self.owns() and not self.playback_pending:
-                self.loco._routine_owner = None
+                with self.loco._lock:
+                    self.loco._routine_owner = None
 
     def preempt_locked(self, reason):
         """External direct command invalidates this job even in the same mode."""
