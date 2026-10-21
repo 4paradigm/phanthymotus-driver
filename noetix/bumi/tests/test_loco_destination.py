@@ -359,6 +359,18 @@ def test_distance_nonzero_publication_obeys_atomic_stop(monkeypatch):
     assert fake.cmds == [(0, 0, 0)]
 
 
+def test_distance_full_scale_comes_from_the_attached_servo_card(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    # Without the servo card the worker falls back to its documented values.
+    assert plugin._distance_full_scale() is None
+    plugin.attach_servo(types.SimpleNamespace(
+        distance_full_scale=lambda: {'forward': 0.7, 'backward': 0.7,
+                                     'left': 0.3, 'right': 0.3}))
+    assert plugin._distance_full_scale() == {'forward': 0.7, 'backward': 0.7,
+                                             'left': 0.3, 'right': 0.3}
+
+
 def test_distance_imu_failure_reaches_acp_as_error_once(monkeypatch):
     module, _ = _load_device(monkeypatch)
     plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())

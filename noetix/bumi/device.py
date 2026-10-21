@@ -449,6 +449,15 @@ class LocoPlugin:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
 
+    def _distance_full_scale(self):
+        """Measured normalised-command-to-m/s calibration from the servo card.
+
+        The pure-IMU distance worker uses it for an independent travel bound;
+        without the servo card it falls back to the module's documented values.
+        """
+        getter = getattr(self._servo, 'distance_full_scale', None)
+        return getter() if getter is not None else None
+
     def is_moving(self) -> bool:
         """Whether a move thread or reserved destination turn owns the chassis.
 
@@ -1104,7 +1113,8 @@ class LocoPlugin:
         if context is not None and context['source'] == 'rgbd_imu_ekf':
             from odometry_feedback import run_fused_distance
             return run_fused_distance(self, float(args['distance_m']), context, direction=args.get('direction', ''))
-        result = run_distance(self, float(args["distance_m"]), direction=args.get('direction', ''))
+        result = run_distance(self, float(args["distance_m"]), direction=args.get('direction', ''),
+                              full_scale=self._distance_full_scale())
         result['estimated_quality'] = 'experimental_unvalidated'
         result['binding_revision'] = context['revision'] if context else None
         if self._distance_fault:

@@ -109,6 +109,42 @@ def movement_direction(value=''):
     return name, *axes[name]
 
 
+# Normalised `publish_cmd()` argument -> chassis speed in m/s, measured on this
+# Bumi on 2026-10-09 (README.md, "标定 loco_servo"): vx=1.0 -> 0.55 m/s and
+# |vy|=1.0 -> 0.20 m/s. The distance worker commands normalised values, so this
+# table turns its own command history into a travel estimate that is
+# independent of the IMU integration.
+#
+# The integration below remains the measured feedback path. This table is the
+# feed-forward cross-check: it cannot observe slip or a surface slower than the
+# calibration, but it also cannot inherit the SDK's timestamp-free sampling
+# error. `run_distance` compares the two and stops instead of driving on when
+# they contradict each other.
+FULL_SCALE_MPS = {'forward': 0.55, 'backward': 0.55, 'left': 0.20, 'right': 0.20}
+
+
+def travel_scale(direction, full_scale=None):
+    """m/s per unit of the normalised command along one travel direction."""
+    table = FULL_SCALE_MPS if full_scale is None else full_scale
+    try:
+        value = float(table[direction])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f'no calibrated full-scale speed for direction {direction!r}')
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f'calibrated full-scale speed for {direction!r} must be positive and finite')
+    return value
+
+
+def travel_tolerance(distance_m):
+    """Allowance before the command integration counts as a fault.
+
+    The command integration over-estimates travel whenever the chassis walks
+    slower than its calibrated full-scale speed, so the allowance grows with
+    the requested move instead of being a flat distance.
+    """
+    return max(0.18, 0.15*distance_m+0.10)
+
+
 def _write_trace(samples, commands, result):
     # Write only after the final brake, never do disk I/O in the control loop.
     folder = Path(tempfile.gettempdir()) / 'bumi-imu-distance'
@@ -120,8 +156,9 @@ def _write_trace(samples, commands, result):
         old.unlink()
 
 
-def run_distance(owner, distance_m, direction=''):
+def run_distance(owner, distance_m, direction='', full_scale=None):
     direction, body_x, body_y = movement_direction(direction)
+    scale = travel_scale(direction, full_scale)
     estimator = ImuOdometry()
     started = time.monotonic()
     motion_started = brake_started = quiet_since = None
@@ -129,6 +166,8 @@ def run_distance(owner, distance_m, direction=''):
     changed_at = started
     progress_at, last_progress = started, 0.0
     moved = 0.0
+    dead_reckoned_m = 0.0
+    last_command, last_command_at = 0.0, None
     samples, commands = [], []
     def publish(vx, vyaw=0, *, vy=0):
         if vy:
@@ -169,6 +208,7 @@ def run_distance(owner, distance_m, direction=''):
                 continue
             if motion_started is None:
                 motion_started = progress_at = changed_at = now
+                last_command_at = now
                 origin_yaw = estimator.yaw
                 cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
                 c, s = cy*body_x-sy*body_y, sy*body_x+cy*body_y
@@ -192,6 +232,23 @@ def run_distance(owner, distance_m, direction=''):
             if remaining < -0.05:
                 raise ValueError('IMU estimated overshoot exceeds 0.05 m')
             if brake_started is None:
+                # Independent feed-forward travel estimate: the command history
+                # times the calibrated full-scale speed. It does not share the
+                # IMU integration's sampling error, so a large disagreement
+                # stops the motion instead of driving on.
+                dead_reckoned_m += last_command*scale*(now-last_command_at)
+                last_command_at = now
+                samples[-1]['dead_reckoned_m'] = dead_reckoned_m
+                tolerance = travel_tolerance(distance_m)
+                # The command integration leads the integrated estimate when the
+                # IMU is missing motion, which is the direction that drives the
+                # robot past the target. (An estimate that runs ahead of the
+                # commands brakes early or trips the overshoot guard instead.)
+                if dead_reckoned_m-moved > tolerance:
+                    raise ValueError(
+                        f'dead-reckoned travel {dead_reckoned_m:.3f} m leads the IMU '
+                        f'estimate {moved:.3f} m by more than {tolerance:.3f} m for a '
+                        f'{distance_m:.3f} m request')
                 if now-motion_started > min(20.0, 5.0+10.0*distance_m):
                     raise ValueError('IMU motion time limit reached')
                 if moved-last_progress >= 0.01:
@@ -205,6 +262,7 @@ def run_distance(owner, distance_m, direction=''):
                     # Sideways gait has a larger deadband than forward gait.
                     command = 0.65 if body_y else (0.6 if remaining > 0.2 else 0.5)
                     publish(command*body_x, turn, vy=command*body_y)
+                    last_command, last_command_at = command, now
             if brake_started is not None:
                 publish(0)
                 # A quiet accelerometer alone cannot distinguish rest from
@@ -234,6 +292,7 @@ def run_distance(owner, distance_m, direction=''):
         publish(0)
     result.update(estimated_distance_m=moved, estimated_error_m=distance_m-moved,
                   estimated_position_m=estimator.position, estimated_velocity_mps=estimator.velocity,
+                  dead_reckoned_m=dead_reckoned_m,
                   elapsed_s=time.monotonic()-started)
     try:
         _write_trace(samples, commands, result)

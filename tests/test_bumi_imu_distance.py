@@ -307,3 +307,50 @@ def test_distance_trace_keeps_raw_control_samples_commands_and_terminal_error(mo
     assert all(b['received_mono_s'] > a['received_mono_s']
                for a, b in zip(trace['samples'], trace['samples'][1:]))
     assert trace['command_requests'][-1]['velocity'] == [0, 0, 0]
+
+
+def test_travel_scale_uses_the_measured_chassis_calibration():
+    # README.md "标定 loco_servo": normalised 1.0 is 0.55 m/s forward and
+    # 0.20 m/s sideways on this chassis.
+    assert module.travel_scale('forward') == pytest.approx(0.55)
+    assert module.travel_scale('backward') == pytest.approx(0.55)
+    assert module.travel_scale('left') == pytest.approx(0.20)
+    assert module.travel_scale('right', {'right': 0.3}) == pytest.approx(0.3)
+    for bad in ({}, {'forward': 0}, {'forward': float('nan')}, {'forward': 'x'}):
+        with pytest.raises(ValueError, match='calibrated|positive|finite'):
+            module.travel_scale('forward', bad)
+
+
+def test_travel_bound_stops_a_lagging_imu_estimate_before_runaway(monkeypatch):
+    """The IMU cannot see the motion; only the command integration bounds travel."""
+    plant = Plant(monkeypatch)
+    def quiet():
+        plant.samples += 1
+        return imu(acc=(0, 0, 9.81+1e-7*math.sin(plant.samples)))
+    monkeypatch.setattr(plant, '_read_distance_imu', quiet)
+    result = module.run_distance(plant, 0.5)
+    assert result['state'] == 'error', result
+    assert 'dead-reckoned travel' in result['error']
+    assert result['dead_reckoned_m'] > 0.1
+    assert result['estimated_distance_m'] == pytest.approx(0.0, abs=0.01)
+    assert plant.clock < 6
+    assert plant.commands[-1][1:] == (0, 0)
+    trace = json.loads(Path(result['imu_trace_path']).read_text())
+    assert any('dead_reckoned_m' in sample for sample in trace['samples'])
+
+
+def test_imu_estimate_contradicting_dead_reckoned_travel_aborts(monkeypatch):
+    """Half the plant acceleration still progresses, so the no-progress check
+    cannot be what stops it: the independent command integration must."""
+    plant = Plant(monkeypatch)
+    def half():
+        plant.samples += 1
+        return imu(acc=(0.5*plant.acceleration, 0,
+                        9.81+1e-7*math.sin(plant.samples)))
+    monkeypatch.setattr(plant, '_read_distance_imu', half)
+    result = module.run_distance(plant, 1.)
+    assert result['state'] == 'error', result
+    assert 'dead-reckoned travel' in result['error']
+    assert result['dead_reckoned_m'] > result['estimated_distance_m']
+    assert plant.clock < 6
+    assert plant.commands[-1][1:] == (0, 0)
