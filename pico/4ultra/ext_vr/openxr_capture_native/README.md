@@ -1,6 +1,6 @@
 # PICO 原生遥操 App
 
-此模块由独立PICO Driver维护，复用原生Android OpenXR、现场透视、WSS配对与WebRTC采集。当前 `versionCode=34`，`0.4.10-pico-ui`。G1 透视中显示橙色映射目标、目标点、方向参照及左右末端误差，不绘制绿色实测骨架。App不求解IK、不发送机器人关节命令；末端映射与执行由机器人 `teleop_control` 承担。
+此模块由独立PICO Driver维护，复用原生Android OpenXR、现场透视、WSS配对与WebRTC采集。当前 `versionCode=35`，`0.4.11-pico-stale-hold`。G1 透视中显示橙色映射目标、目标点、方向参照及左右末端误差，不绘制绿色实测骨架。App不求解IK、不发送机器人关节命令；末端映射与执行由机器人 `teleop_control` 承担。
 
 ## 安装、连接与使用
 
