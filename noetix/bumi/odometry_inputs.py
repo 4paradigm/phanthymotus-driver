@@ -86,11 +86,14 @@ class RawCameraPublisher:
                 if key == 'rgb':
                     intr = color.profile.as_video_stream_profile().intrinsics
                     model = str(intr.model).rsplit('.', 1)[-1]
+                    coefficients = finite(list(intr.coeffs), 5)
+                    if model == 'inverse_brown_conrady' and not any(coefficients):
+                        model = 'none'  # zero coefficients are exactly the pinhole model
                     if model not in ('none', 'brown_conrady'):
                         raise ValueError('unsupported color distortion model: '+model)
                     info = self.Info(); info.header = msg.header
                     info.width, info.height = msg.width, msg.height
-                    info.distortion_model = 'plumb_bob'; info.d = list(intr.coeffs)
+                    info.distortion_model = 'plumb_bob'; info.d = coefficients
                     info.k = [intr.fx,0.,intr.ppx,0.,intr.fy,intr.ppy,0.,0.,1.]
                     info.r = [1.,0.,0.,0.,1.,0.,0.,0.,1.]
                     info.p = [intr.fx,0.,intr.ppx,0.,0.,intr.fy,intr.ppy,0.,0.,0.,1.,0.]
