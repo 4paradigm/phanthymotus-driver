@@ -321,36 +321,57 @@ def test_travel_scale_uses_the_measured_chassis_calibration():
             module.travel_scale('forward', bad)
 
 
-def test_travel_bound_stops_a_lagging_imu_estimate_before_runaway(monkeypatch):
-    """The IMU cannot see the motion; only the command integration bounds travel."""
+def test_travel_speed_respects_the_measured_deadband():
+    # The legs do nothing below the normalised deadband; between the deadband
+    # and 1.0 the speed rises linearly to the full scale.
+    assert module.travel_speed(0.45, 'forward') == pytest.approx(0.0)
+    assert module.travel_speed(0.30, 'forward') == pytest.approx(0.0)
+    assert module.travel_speed(1.0, 'forward') == pytest.approx(0.55)
+    assert module.travel_speed(0.60, 'forward') == pytest.approx(0.15)
+    assert module.travel_speed(0.60, 'left') == pytest.approx(0.0)
+    assert module.travel_speed(0.65, 'left') == pytest.approx(0.025)
+
+
+def test_lateral_limit_scales_with_the_requested_distance():
+    assert module.lateral_limit(0.2) == pytest.approx(0.15)
+    assert module.lateral_limit(0.8) == pytest.approx(0.40)
+    assert module.lateral_limit(3.0) == pytest.approx(1.50)
+
+
+def test_lagging_imu_switches_to_the_calibrated_travel_estimate(monkeypatch):
+    """The IMU cannot see the motion; the worker must fall back to the command
+    integration and still finish the requested move instead of stopping."""
     plant = Plant(monkeypatch)
     def quiet():
         plant.samples += 1
         return imu(acc=(0, 0, 9.81+1e-7*math.sin(plant.samples)))
     monkeypatch.setattr(plant, '_read_distance_imu', quiet)
     result = module.run_distance(plant, 0.5)
-    assert result['state'] == 'error', result
-    assert 'dead-reckoned travel' in result['error']
-    assert result['dead_reckoned_m'] > 0.1
+    assert result['state'] == 'done', result
+    assert result['distance_source'] == 'dead_reckoned_fallback'
+    assert result['fallback_reason']
     assert result['estimated_distance_m'] == pytest.approx(0.0, abs=0.01)
-    assert plant.clock < 6
+    assert result['control_distance_m'] == pytest.approx(0.4, abs=0.05)
+    assert abs(0.5-result['control_distance_m']) <= 0.15
     assert plant.commands[-1][1:] == (0, 0)
     trace = json.loads(Path(result['imu_trace_path']).read_text())
     assert any('dead_reckoned_m' in sample for sample in trace['samples'])
+    assert trace['result']['distance_source'] == 'dead_reckoned_fallback'
 
 
-def test_imu_estimate_contradicting_dead_reckoned_travel_aborts(monkeypatch):
-    """Half the plant acceleration still progresses, so the no-progress check
-    cannot be what stops it: the independent command integration must."""
+def test_imu_under_reporting_switches_to_the_calibrated_travel_estimate(monkeypatch):
+    """An IMU that sees only a fraction of the motion still progresses, so the
+    no-progress check cannot catch it; the cross-check must switch the loop to
+    the command integration and finish."""
     plant = Plant(monkeypatch)
-    def half():
+    def weak():
         plant.samples += 1
-        return imu(acc=(0.5*plant.acceleration, 0,
+        return imu(acc=(0.2*plant.acceleration, 0,
                         9.81+1e-7*math.sin(plant.samples)))
-    monkeypatch.setattr(plant, '_read_distance_imu', half)
+    monkeypatch.setattr(plant, '_read_distance_imu', weak)
     result = module.run_distance(plant, 1.)
-    assert result['state'] == 'error', result
-    assert 'dead-reckoned travel' in result['error']
+    assert result['state'] == 'done', result
+    assert result['distance_source'] == 'dead_reckoned_fallback'
     assert result['dead_reckoned_m'] > result['estimated_distance_m']
-    assert plant.clock < 6
+    assert abs(1.-result['control_distance_m']) <= 0.15
     assert plant.commands[-1][1:] == (0, 0)
