@@ -290,6 +290,7 @@ def main():
         client.publish_media = bridge.push_media
         client.configure_speaker = bridge.configure_speaker
         client.pop_speaker_chunk = bridge.pop_speaker_chunk
+        client.publish_speaker_event = bridge.publish_speaker_event
         print("[bundle] Q5 media/audio bridge started (Domain 42/FastDDS)", flush=True)
     except Exception as exc:
         print(f"[bundle] media/audio bridge unavailable: {exc}", flush=True)

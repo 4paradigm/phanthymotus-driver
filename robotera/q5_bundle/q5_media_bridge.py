@@ -31,6 +31,20 @@ import threading
 import time
 
 from fastdds_transport import configure_bundled_fastdds_transport
+from playback_telemetry import parse_audio_format
+
+
+_SUPPORTED_SPEAKER_FORMATS = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
+
+
+def speaker_chunk_from_message(msg) -> dict:
+    """Validate an AudioChunk and retain optional utterance metadata."""
+    metadata = parse_audio_format(str(msg.format))
+    if metadata.base_format not in _SUPPORTED_SPEAKER_FORMATS:
+        raise ValueError(f"unsupported audio format: {metadata.base_format!r}")
+    if not metadata.valid:
+        raise ValueError(metadata.error or "invalid playback metadata")
+    return {"pcm": bytes(msg.data), "metadata": metadata}
 
 
 class BridgeWorker:
@@ -107,6 +121,12 @@ class BridgeWorker:
     def configure_speaker(self, topic: str):
         try:
             self._cmd_q.put_nowait({"kind": "speaker_config", "topic": topic})
+        except Exception:
+            pass
+
+    def publish_speaker_event(self, event: dict):
+        try:
+            self._cmd_q.put_nowait({"kind": "speaker_event", "event": dict(event)})
         except Exception:
             pass
 
@@ -205,6 +225,8 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
     pub_pointcloud = node.create_publisher(UInt8MultiArray, f"{prefix}/camera/pointcloud", QOS_MEDIA)
+    pub_speaker_events = node.create_publisher(
+        String, f"{prefix}/speaker/playback_events", QOS_MEDIA)
     # Audio is a live lossy stream. Match the audio cards used by the other
     # drivers so Agent Core/FastDDS subscribers can request BEST_EFFORT without
     # a reliability negotiation mismatch or unnecessary retransmission delay.
@@ -228,22 +250,24 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                 f"speaker ignored unsupported audio format: {msg.format!r}")
             return
         try:
-            pcm = bytes(msg.data)
+            item = speaker_chunk_from_message(msg)
+            pcm = item["pcm"]
             # Two phanthy_bus_bridge publishers were observed on connected
             # browser-mic topics.  They can relay the exact same packet within
             # milliseconds; submitting both makes live speech garbled.  Do not
             # collapse regular repeated samples (such as silence), only an
             # identical packet that arrives in this short duplicate window.
-            now = time.monotonic()
-            digest = hashlib.blake2s(pcm, digest_size=8).digest()
-            browser_frame = msg.header.stamp.sec == 0 and msg.header.stamp.nanosec == 0
-            if (browser_frame and digest == last_speaker_digest
-                    and now - last_speaker_frame_at < 0.02):
-                speaker_duplicate_frames_dropped += 1
-                return
-            last_speaker_digest = digest
-            last_speaker_frame_at = now
-            speaker_q.put_nowait(pcm)
+            if not item["metadata"].tracked:
+                now = time.monotonic()
+                digest = hashlib.blake2s(pcm, digest_size=8).digest()
+                browser_frame = msg.header.stamp.sec == 0 and msg.header.stamp.nanosec == 0
+                if (browser_frame and digest == last_speaker_digest
+                        and now - last_speaker_frame_at < 0.02):
+                    speaker_duplicate_frames_dropped += 1
+                    return
+                last_speaker_digest = digest
+                last_speaker_frame_at = now
+            speaker_q.put_nowait(item)
             speaker_frames_received += 1
             if speaker_frames_received == 1:
                 node.get_logger().info("speaker received first PCM frame")
@@ -392,6 +416,8 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                     AudioChunk, str(cmd["topic"]), _on_speaker, QOS_AUDIO)
                 node.get_logger().info(
                     f"speaker subscribed to {cmd['topic']} (BEST_EFFORT)")
+            elif isinstance(cmd, dict) and cmd.get("kind") == "speaker_event":
+                _publish_json(pub_speaker_events, cmd.get("event") or {})
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:
