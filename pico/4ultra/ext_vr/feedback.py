@@ -22,6 +22,7 @@ def validate_display(value):
             if type(visual.get("feedback_fresh")) is not bool:
                 raise ValueError("invalid_feedback_fresh")
             number(visual.get("intent_age_ms"), 1e12)
+            number(visual.get("feedback_age_ms", 0), 1e12)
             for key, count in (("measured", 2), ("ik", 2), ("torso", 16)):
                 paths = visual.get(key, [])
                 if not isinstance(paths, list) or len(paths) > count:
@@ -124,8 +125,8 @@ class RobotFeedback:
             visual = value.get("visualization")
             if visual is not None and visual.get("available"):
                 visual["intent_age_ms"] += age_ms
-                visual["feedback_age_ms"] = age_ms
-                if age_ms >= 750 or visual["intent_age_ms"] >= 300 or visual.get("stale", False):
+                visual["feedback_age_ms"] = visual.get("feedback_age_ms", 0) + age_ms
+                if visual["feedback_age_ms"] >= 750 or visual["intent_age_ms"] >= 300 or visual.get("stale", False):
                     visual["stale"] = True
                     visual["feedback_fresh"] = False
                     value["alignment"] = {"state": "unavailable", "ready": False}

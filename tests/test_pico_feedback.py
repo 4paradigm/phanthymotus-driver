@@ -57,6 +57,7 @@ def test_feedback_is_latest_read_only_and_ages_without_refresh(preview):
     lambda v: v["visualization"].update(ik=[]),
     lambda v: v["visualization"].update(stale=True),
     lambda v: v["visualization"].update(stale="true"),
+    lambda v: v["visualization"].update(feedback_age_ms=-1),
     lambda v: v["visualization"]["measured"][0][0].__setitem__(0, float("nan")),
     lambda v: v["alignment"].update(state="unaligned"),
     lambda v: v["alignment"]["left"].update(position_error_m=-1),
@@ -150,3 +151,17 @@ def test_expired_feedback_keeps_geometry_without_refreshing_identity(preview):
     assert "stale" not in cache.value["visualization"]
     cache.accept(display_feedback(runtime, 2))
     assert cache.snapshot()["alignment"]["ready"]
+
+
+def test_robot_stale_age_is_preserved_during_forwarding(preview):
+    runtime, cache, now = preview
+    candidate = display_feedback(runtime)
+    candidate["visualization"].update(stale=True, feedback_fresh=False, feedback_age_ms=900)
+    candidate["alignment"] = {"state": "unavailable", "ready": False}
+    cache.accept(candidate)
+    now[0] += 100_000_000
+    result = cache.snapshot()
+    assert result["feedback_age_ms"] == 100
+    assert result["visualization"]["feedback_age_ms"] == 1000
+    assert result["visualization"]["ik"] == candidate["visualization"]["ik"]
+    assert result["visualization"]["stale"] and not result["alignment"]["ready"]
