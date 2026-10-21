@@ -18,6 +18,8 @@ G1 流程依赖 [PR #330](https://github.com/4paradigm/phanthymotus-driver/pull/
 
 Core 使用 `4paradigm/phanthymotus` 的 main，集成基线为 `6df601f612818716bb0dc7b180a9467e2c43172c`，无需修改 Core。配套 G1 缺输入时返回 `state: error`、`input_topic_required`，Core 使用已有逐卡错误与回滚流程。
 
+设备状态中的 `error` 保留最近一次采集错误。`idle` 或 `running` 状态不因该历史字段被标为 MCP 调用失败；真正的启动失败和停止异常仍返回错误。停止后保留诊断信息，不因重试而清除历史错误。
+
 二维码通过 `configSchema` 的 `format: "qr"`、`scope: "instance"` 显示，只打开现有安装页，不携带管理 PIN、邀请或访问 token，也不保存为配置。普通Core的实际齿轮保存、项目启动/停止和输入文字监控已在隔离浏览器验证；PICO浏览器安装与证书首次信任仍待设备验收。研发APK安装不能代替这条普通用户流程。
 
 ## 配置与生命周期

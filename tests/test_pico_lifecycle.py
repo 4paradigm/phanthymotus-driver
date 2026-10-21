@@ -71,7 +71,9 @@ def test_real_mcp_configuration_and_null_error_success(device):
             return json.load(response)
 
     try:
-        rejected = json.loads(call("start")["result"]["content"][0]["text"])
+        rejected_call = call("start")
+        assert rejected_call["result"]["isError"]
+        rejected = json.loads(rejected_call["result"]["content"][0]["text"])
         assert rejected["state"] == "error" and rejected["code"] == "management_pin_not_configured"
         item = plugin.instances["test-vr"]
         assert not item["runtime"].running
@@ -89,6 +91,26 @@ def test_real_mcp_configuration_and_null_error_success(device):
         assert not started["result"]["isError"]
         assert json.loads(started["result"]["content"][0]["text"])["error"] is None
         assert not call("info")["result"]["isError"]
+        item["runtime"].record_protocol_error("capture_xr_ended")
+        stopped = call("stop")["result"]
+        assert not stopped["isError"]
+        status = json.loads(stopped["content"][0]["text"])
+        assert status["state"] == "idle" and status["error"] == "capture_xr_ended"
+        assert item["transport"] is None and item["task"] is None
+        assert not call("info")["result"]["isError"]
+        restarted = call("start")["result"]
+        assert not restarted["isError"]
+        assert json.loads(restarted["content"][0]["text"])["state"] == "running"
+        close = item["transport"].close
+
+        def fail_close():
+            raise RuntimeError("transport_close_failed")
+
+        item["transport"].close = fail_close
+        try:
+            assert call("stop")["error"]["message"] == "transport_close_failed"
+        finally:
+            item["transport"].close = close
         assert not call("stop")["result"]["isError"]
         assert not call("info")["result"]["isError"]
     finally:

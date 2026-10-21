@@ -73,7 +73,10 @@ def make_handler(plugin):
                                 ),
                             }
                         ],
-                        "isError": bool(value.get("error")),
+                        # Runtime status retains the last capture error after a successful stop.
+                        "isError": value.get("state") == "error" or (
+                            bool(value.get("error")) and value.get("state") not in ("idle", "running")
+                        ),
                     }
                 elif method == "notifications/initialized":
                     self.send_json(200, {})
