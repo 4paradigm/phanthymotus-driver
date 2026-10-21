@@ -1,3 +1,15 @@
+## Zero-distortion camera input follow-up
+
+Synced PR408's minimal camera input fix: inverse_brown_conrady is accepted only
+when all five finite coefficients are exactly zero (equivalent to a pinhole
+model). Nonzero inverse distortion remains rejected; calibration and timing gates
+are unchanged. Parameterized regressions cover both acceptance and rejection.
+
+- PR408 motion/media/packaging/binding regressions: 583 passed, 1 skipped.
+- Combined PR425 fusion/packaging/deployment-policy regressions: 144 passed.
+- No image build, full fusion ROS launch, platform integration or motion accuracy
+  validation was performed for this fix. Private static telemetry is not included.
+
 ## Card rename follow-up
 
 Synced PR408 commit bf2272ba: the advertised card/tool identifier is now
