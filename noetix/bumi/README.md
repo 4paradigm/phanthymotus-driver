@@ -519,7 +519,8 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   repeated tiny correction at the endpoint.
 - Invalid readings, polling gaps over 0.1 s, unchanged IMU fields for over
   0.5 s during movement, heading/tilt over 20°, estimated lateral deviation
-  over 0.15 m, excessive estimated speed, no estimated progress for three
+  over 0.15 m, estimated progress opposite to the requested direction by over
+  0.05 m, excessive estimated speed, no estimated progress for three
   seconds, or the bounded motion/settling time limits cause zero command
   and `error`. `stop_move` cancels calibration as well as motion. The SDK
   has no source timestamp: changed fields and poll timing are only loss
