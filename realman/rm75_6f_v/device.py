@@ -44,12 +44,14 @@ class RM75Plugin:
         self.client = client
         self._ros2 = ros2
         self._skeleton_topic = f"/{namespace.strip('/') or 'rm75'}/state/joints"
+        self._joint_state_topic = f"/{namespace.strip('/') or 'rm75'}/state/joint_state"
         ros_config = config.get("ros", {})
         self._skeleton_publish_hz = float(ros_config.get("skeleton_publish_hz", 10.0))
         if not math.isfinite(self._skeleton_publish_hz) or self._skeleton_publish_hz <= 0:
             raise ValueError("ros.skeleton_publish_hz must be a positive finite number")
         self._skeleton_node = None
         self._skeleton_pub = None
+        self._joint_state_pub = None
         self._skeleton_message_type = None
         self._last_skeleton_error = None
         self._skeleton_retry_at = 0.0
@@ -77,15 +79,25 @@ class RM75Plugin:
     def _skeleton_topic_out(self):
         return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
 
+    def _joint_state_topic_out(self):
+        return [{"topic": self._joint_state_topic, "format": "data/json"}]
+
+    def _joint_state_payload(self, state=None, timestamp_ms=None):
+        return {"timestamp_ms": timestamp_ms if timestamp_ms is not None else int(time.time() * 1000),
+                **(self.client.joint_states() if state is None else state)}
+
     def get_tools(self):
         definitions = [
             tool("connection", "sensor", "RM75 SDK connection status; never initiates motion"),
             tool(
-                "joint_states",
+                "joints",
                 "sensor",
                 f"Read and publish seven RM75 joint angles in radians at {self._skeleton_publish_hz:g} Hz",
                 topic_out=self._skeleton_topic_out(),
             ),
+            tool("joint_state", "sensor",
+                 f"Publish current seven joint angles in radians and degrees at {self._skeleton_publish_hz:g} Hz",
+                 topic_out=self._joint_state_topic_out()),
             tool("model", "resource", "RM75-6F-V URDF for skeleton rendering"),
         ]
         definitions.extend(tool(name, "sensor", f"Read-only RealMan API2 call: {method}") for name, method in self.METHODS.items())
@@ -154,6 +166,7 @@ class RM75Plugin:
         node = Node("rm75_skeleton", context=self._ros2.ctx_core)
         self._skeleton_message_type = String
         self._skeleton_pub = node.create_publisher(String, self._skeleton_topic, qos)
+        self._joint_state_pub = node.create_publisher(String, self._joint_state_topic, qos)
         node.create_timer(1.0 / self._skeleton_publish_hz, self._publish_skeleton)
         self._ros2.executor_core.add_node(node)
         self._skeleton_node = node
@@ -161,6 +174,7 @@ class RM75Plugin:
     def _stop_skeleton_publisher(self):
         node, self._skeleton_node = self._skeleton_node, None
         self._skeleton_pub = None
+        self._joint_state_pub = None
         self._skeleton_message_type = None
         if node is None:
             return
@@ -169,10 +183,10 @@ class RM75Plugin:
         finally:
             node.destroy_node()
 
-    def _skeleton_payload(self):
-        state = self.client.joint_states()
+    def _skeleton_payload(self, state=None, timestamp_ms=None):
+        state = self.client.joint_states() if state is None else state
         return {
-            "timestamp_ms": int(time.time() * 1000),
+            "timestamp_ms": timestamp_ms if timestamp_ms is not None else int(time.time() * 1000),
             "format": "sensor/skeleton",
             "position_unit": "rad",
             "angle_unit": "deg",
@@ -204,9 +218,15 @@ class RM75Plugin:
             return
         try:
             message = message_type()
-            skeleton = self._skeleton_payload()
+            state = self.client.joint_states()
+            timestamp_ms = int(time.time() * 1000)
+            skeleton = self._skeleton_payload(state, timestamp_ms)
             message.data = json.dumps(skeleton, ensure_ascii=False)
             publisher.publish(message)
+            if self._joint_state_pub is not None:
+                joint_message = message_type()
+                joint_message.data = json.dumps(self._joint_state_payload(state, timestamp_ms), ensure_ascii=False)
+                self._joint_state_pub.publish(joint_message)
             self._last_skeleton_error = None
             self._skeleton_retry_at = 0.0
         except Exception as exc:
@@ -433,11 +453,12 @@ class RM75Plugin:
                 self._stop_motion()
             return {"state": "idle"}
         if action == "info":
-            topic_out = self._skeleton_topic_out() if name == "joint_states" else []
+            topic_out = (self._skeleton_topic_out() if name == "joints" else
+                         self._joint_state_topic_out() if name == "joint_state" else [])
             return {**self._motion_status(), "topic_out": topic_out}
         if name == "connection":
             return self.client.status()
-        if name == "joint_states":
+        if name == "joints":
             return self.client.joint_states()
         if name == "model":
             path = Path(__file__).with_name("resource") / "rm75_6f_v.urdf"

@@ -2025,7 +2025,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         plugin = self.device.RM75Plugin(client, {}, namespace="test_robot")
         tools = plugin.get_tools()
         self.assertEqual(
-            {"connection", "joint_states", "model", "robot_info", "software_info", "arm_all_state", "controller_state", "joint_control"},
+            {"connection", "joints", "joint_state", "model", "robot_info", "software_info", "arm_all_state", "controller_state", "joint_control"},
             {item["name"].split(".")[-1] for item in tools},
         )
         joint_control = next(item for item in tools if item["name"] == "joint_control")
@@ -2040,14 +2040,18 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
         self.assertNotIn("timeout_seconds", joint_control["inputSchema"]["properties"])
         self.assertEqual(305, joint_control["inputSchema"]["x-completion"]["timeout"])
-        joint_states = next(item for item in tools if item["name"] == "joint_states")
+        joint_state = next(item for item in tools if item["name"] == "joint_state")
+        self.assertEqual([{"topic": "/test_robot/state/joint_state", "format": "data/json"}], joint_state["topic_out"])
+        self.assertEqual("sensor", joint_state["type"])
+        self.assertEqual({}, joint_state["inputSchema"]["properties"])
+        joint_states = next(item for item in tools if item["name"] == "joints")
         expected_topic_out = [
             {"topic": "/test_robot/state/joints", "format": "sensor/skeleton"}
         ]
         self.assertEqual(expected_topic_out, joint_states["topic_out"])
         self.assertEqual(
             expected_topic_out,
-            plugin.dispatch("info", {"_tool_name": "joint_states"})["topic_out"],
+            plugin.dispatch("info", {"_tool_name": "joints"})["topic_out"],
         )
         descriptions = {
             name: joint_control["inputSchema"]["properties"][name]["description"]
@@ -2271,7 +2275,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
         plugin = self.device.RM75Plugin(client, {})
-        self.assertEqual({"state": "running"}, plugin.dispatch("start", {"_tool_name": "joint_states"}))
+        self.assertEqual({"state": "running"}, plugin.dispatch("start", {"_tool_name": "joints"}))
         self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "joint_control"}))
         self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "model"}))
 
@@ -2321,12 +2325,18 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         client._robot = Robot()
         plugin = self.device.RM75Plugin(client, {}, namespace="test_robot")
         plugin._skeleton_pub = mock.Mock()
+        plugin._joint_state_pub = mock.Mock()
         plugin._skeleton_message_type = StringMessage
 
         plugin._publish_skeleton()
 
         message = plugin._skeleton_pub.publish.call_args.args[0]
         payload = json.loads(message.data)
+        joint_payload = json.loads(plugin._joint_state_pub.publish.call_args.args[0].data)
+        self.assertEqual(payload["timestamp_ms"], joint_payload["timestamp_ms"])
+        self.assertEqual([0, 90, -90, 45, -45, 180, -180], joint_payload["raw_degree"])
+        self.assertEqual(joint_payload["position"], [j["q"] for j in payload["joints"]])
+        self.assertIsNone(plugin.dispatch("read", {"_tool_name": "joint_state"}))
         self.assertEqual("sensor/skeleton", payload["format"])
         self.assertEqual("rad", payload["position_unit"])
         self.assertEqual(7, payload["joint_count"])
@@ -2562,7 +2572,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         robot.rm_set_arm_slow_stop = lambda: 9
         with self.assertRaisesRegex(RuntimeError, "SDK code 9"):
             plugin.dispatch("stop", {"_tool_name": "joint_control"})
-        self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {"_tool_name": "joint_states"}))
+        self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {"_tool_name": "joints"}))
 
     def test_skeleton_outage_backoff_and_recovery(self):
         plugin, robot = self._motion_plugin()

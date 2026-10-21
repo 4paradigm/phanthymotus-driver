@@ -20,12 +20,12 @@ confirm_motion=true
 Available tools are:
 
 - `connection`: SDK connection state.
-- `joint_states`: seven joint angles in radians, plus raw SDK degrees; also
+- `joints`: seven joint angles in radians, plus raw SDK degrees; also
   publishes a 10 Hz `sensor/skeleton` stream for the Canvas URDF renderer.
 - `robot_info`, `software_info`, `arm_all_state`, `controller_state`: read-only
   API2 queries.
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
-  movable joint names exactly match the `joint_states` skeleton stream.
+  movable joint names exactly match the `joints` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
 - `abs_move`: `move` reads the current TCP as A and moves to
   the requested base-frame B using
@@ -226,3 +226,17 @@ RealSense enumeration and capture, as described above.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
+
+## Joint state cards
+
+`joints` replaces the former `joint_states` card and retains the unchanged
+`sensor/skeleton` output at `/{namespace}/state/joints` for URDF visualization.
+Existing projects must replace the old card with `joints` and reconnect it.
+
+`joint_state` publishes `data/json` at `/{namespace}/state/joint_state`, using
+the same SDK sample and timestamp as the skeleton stream (default 10 Hz,
+configured by `ros.skeleton_publish_hz`). Payload fields are `timestamp_ms`,
+`name` (joint_1 through joint_7), `position` (radians), `position_unit` (`rad`),
+and `raw_degree` (degrees). Array entries correspond by index. This sensor
+provides a continuous stream without a `read` action. Both streams omit
+samples during disconnection or SDK contention rather than repeating stale data.
