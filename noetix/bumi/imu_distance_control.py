@@ -231,7 +231,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                 raise ValueError('IMU distance movement timed out')
             estimator.observe(raw, now)
             if leg is not None:
-                leg.observe(joints, raw.ori, now)
+                # Once braking starts the stance foot rolls/slips; keep the
+                # estimate that requested the brake instead of integrating noise.
+                leg.observe(joints, raw.ori, now, frozen=brake_started is not None)
                 values = joint_angles(joints)
                 if values != last_joints:
                     last_joints, joint_updates = values, joint_updates+1
@@ -325,7 +327,8 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                     result['pre_zero_velocity_mps'] = source_velocity
                     estimator.velocity = (0.0, 0.0, 0.0)
                     result['stationary_assumed'] = True
-                    if abs(remaining) > 0.05:
+                    band = 0.10 if leg is not None else 0.05
+                    if abs(remaining) > band:
                         raise ValueError('stopped outside the estimated target band')
                     result['state'] = 'done'
                     break

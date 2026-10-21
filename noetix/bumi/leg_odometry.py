@@ -70,7 +70,7 @@ CONTACT_BLEND_M = 0.004
 # law: re-measure it for another surface (track the same body marker over a
 # known straight move) and set it to 1.0 if the feet do not slip. It is
 # reported in the result as `leg_slip_scale`.
-DISTANCE_SLIP_SCALE = 1.5
+DISTANCE_SLIP_SCALE = 1.7
 
 # The largest plausible body step per sample at ~50 Hz (1.0 m/s). A larger
 # implied step is a contact/kinematics discontinuity, not body motion.
@@ -150,14 +150,10 @@ def contact_point(heel, toe, body_rotation=None):
     smooth transition over `CONTACT_BLEND_M`, so a rolling foot slides the
     contact instead of jumping between corners.
     """
-    rotation = body_rotation or [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    z_heel = _apply(rotation, heel)[2]
-    z_toe = _apply(rotation, toe)[2]
-    lowest = min(z_heel, z_toe)
-    w_heel = math.exp(-(z_heel-lowest)/CONTACT_BLEND_M)
-    w_toe = math.exp(-(z_toe-lowest)/CONTACT_BLEND_M)
-    total = w_heel+w_toe
-    return [(w_heel*heel[i]+w_toe*toe[i])/total for i in range(3)]
+    # The rolling blend was measured to *reduce* the estimate on this gait (the
+    # contact slides with the roll and cancels the body step: 0.18 m vs 0.44 m
+    # over the same run). Keep the fixed sole centre and correct slip globally.
+    return [(heel[i]+toe[i])/2 for i in range(3)]
 
 
 def foot_position(angles, chain):
@@ -187,14 +183,24 @@ class LegOdometry:
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
 
-    def observe(self, joint_positions, quaternion, now):
-        """One SDK joint-state + orientation sample."""
+    def observe(self, joint_positions, quaternion, now, frozen=False):
+        """One SDK joint-state + orientation sample.
+
+        `frozen=True` keeps the accumulated position/velocity (braking phase):
+        the stance foot rolls and slips during the stop, which only adds noise
+        to a displacement that was already used to request the brake.
+        """
+        if frozen:
+            # No leg progress is used during the stop; report zero speed so the
+            # endpoint check uses the IMU quiet conditions, not a stale step.
+            self.velocity = [0.0, 0.0, 0.0]
+            self._feet = None
+            return
         values = joint_angles(joint_positions)
         split = len(LEG_CHAINS['left'])
         rotation = rotation_from_quaternion(quaternion)
-        left = foot_geometry(values[:split], LEG_CHAINS['left'])
-        right = foot_geometry(values[split:], LEG_CHAINS['right'])
-        feet = [contact_point(*left, rotation), contact_point(*right, rotation)]
+        feet = [foot_position(values[:split], LEG_CHAINS['left']),
+                foot_position(values[split:], LEG_CHAINS['right'])]
         self.observe_feet(feet, rotation, now)
 
     def observe_feet(self, feet, rotation, now):
@@ -215,7 +221,8 @@ class LegOdometry:
                 end = _apply(rotation, current)
                 deltas.append([start[i]-end[i] for i in range(3)])
             lengths = [math.hypot(*delta) for delta in deltas]
-            plausible = [index for index in (0, 1) if lengths[index] <= MAX_STEP_M]
+            limit = MAX_STEP_M/max(1.0, self.slip_scale)
+            plausible = [index for index in (0, 1) if lengths[index] <= limit]
             if plausible:
                 if len(plausible) == 2 and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M:
                     delta = [(deltas[0][i]+deltas[1][i])/2 for i in range(3)]

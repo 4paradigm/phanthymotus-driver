@@ -29,17 +29,16 @@ def test_standing_pose_puts_the_contact_at_the_sole_centre():
     assert left[2] == pytest.approx(-0.4802, abs=1e-3)
 
 
-def test_contact_point_slides_continuously_from_heel_to_toe():
+def test_contact_point_is_the_fixed_sole_centre():
     flat = module.foot_position([0.0]*6, LEFT)
-    toe_a = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.29, 0.0], LEFT)
-    toe_b = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.30, 0.0], LEFT)
-    heel = module.foot_position([0.0, 0.0, 0.0, 0.0, -0.30, 0.0], LEFT)
+    a = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.29, 0.0], LEFT)
+    b = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.30, 0.0], LEFT)
     assert flat[0] == pytest.approx(0.0301, abs=1e-3)
-    assert toe_a[0] > flat[0]+0.05 and toe_b[0] > flat[0]+0.05
-    # Continuous: a 0.01 rad change must not jump the contact between corners
-    # (the corner model produced 2.6 cm jumps and a false fault on the robot).
-    assert abs(toe_b[0]-toe_a[0]) < 0.01
-    assert heel[0] < flat[0]-0.05
+    # A fixed point in the foot frame: pitching the foot moves it only by the
+    # small rotation about the ankle, never by the foot length (that jump was
+    # the rejected rolling model's failure mode).
+    assert abs(a[0]-flat[0]) < 0.03 and abs(b[0]-flat[0]) < 0.03
+    assert abs(b[0]-a[0]) < 0.005
 
 
 def test_reset_position_keeps_the_previous_foot_for_the_next_step():

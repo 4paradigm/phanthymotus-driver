@@ -307,7 +307,10 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
         def reset_position(self):
             self.position = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
-        def observe(self, joints, quaternion, now):
+        def observe(self, joints, quaternion, now, frozen=False):
+            if frozen:
+                self.velocity = [0.0, 0.0, 0.0]
+                return
             if self._last is None:
                 self._last = now
                 return
@@ -319,7 +322,7 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
     monkeypatch.setattr(module, 'LegOdometry', FakeLeg)
     monkeypatch.setattr(plant, '_read_distance_joints', lambda: [0.0]*21, raising=False)
     result = module.run_distance(plant, 1.0)
-    assert result['state'] == 'done', result
+    assert result['state'] == 'done', result.get('error')
     assert result['distance_source'] == 'leg_odometry'
     assert result['estimated_distance_m'] == pytest.approx(1.0, abs=0.06)
     assert 'imu_position_m' in result
