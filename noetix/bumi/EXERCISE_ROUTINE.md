@@ -2,7 +2,7 @@
 
 ## 交付范围与真实状态
 
-新增 `exercise_routine`（显示说明为 Bumi 动作编排），注册于现有 Bumi Bundle，
+新增 `exercise_routine`（Bumi 动作编排）和 `exercise_routine_control`（编排控制），注册于现有 Bumi Bundle，
 复用同一 `LocoPlugin` / `HighController`。支持顺序、片段播放次数、整套轮数、
 片段间歇、轮间休息、异步任务、预览、状态、停止及异常处理，无需新前端。
 
@@ -37,7 +37,7 @@ python3 -m pytest tests/test_bumi_exercise_routine.py tests/test_bumi_bundle.py 
 ## 卡片接口
 
 卡片参数由现有 inputSchema / x-action-params 提供；`start` 只返回 ready。
-默认 `dry_run: true`。计划例子：
+默认 `dry_run: true`。运行返回用于 ACP 的 action_id 和用于查询/确认的 job_id（当前值相同）。计划例子：
 
 ```json
 {
@@ -51,21 +51,22 @@ python3 -m pytest tests/test_bumi_exercise_routine.py tests/test_bumi_bundle.py 
 }
 ```
 
-通过 MCP 调用 tool `exercise_routine`，arguments 分别为：
+开始与预检通过 MCP tool `exercise_routine`；执行期间的查询、确认和停止使用
+`exercise_routine_control`，避免被运行中的身体 ACP 等待阻塞。arguments 分别为：
 
 - 预览：`{"action":"validate","plan":上述对象,"dry_run":true}`。
-- 模拟：`{"action":"run","plan":上述对象,"dry_run":true}`，返回 `job_id`。
+- 模拟：`{"action":"run","plan":上述对象,"dry_run":true}`，返回 `action_id` 和 `job_id`。
 - 真机预检：相同 validate 参数但 `dry_run:false`；任何素材未验证、编号未绑定、
   机器人不匹配或缺少验证记录时拒绝。validate 不读取或控制机器人。
 - 真机启动：`{"action":"run","plan":上述对象,"dry_run":false,"confirm":true}`。
   只允许已处于 walking 且没有 loco.move 或其他编排占用。confirm 表示现场人员已
   确认机器人稳定站立、空间及素材适用；walking 仅是模式名称，不代表正在向前走。
-- 查询：`{"action":"status"}` 或加 `job_id`。仅保留最近一项任务，旧 id 明确报错。
-- 片段结束确认：当状态为 `awaiting_confirmation`，现场人员观察完整播放结束后，
+- 查询（exercise_routine_control）：`{"action":"status"}` 或加 `job_id`。仅保留最近一项任务，旧 id 明确报错。
+- 片段结束确认（exercise_routine_control）：当状态为 `awaiting_confirmation`，现场人员观察完整播放结束后，
   将 status 的 `job_id`、`confirmation_token` 原样填入
   `{"action":"continue","job_id":"当前id","confirmation_token":"当前令牌","confirm":true}`。
   每段令牌不同，提前、重复或旧令牌会拒绝。禁止让 LLM 按预计时长自行发送确认。
-- 停止：`{"action":"stop"}`。先阻断后续调度，再由后台退出本卡回放；继续查 status
+- 停止（exercise_routine_control）：`{"action":"stop"}`。先阻断后续调度，再由后台退出本卡回放；继续查 status
   直到 cancelled/error。停止不是硬件急停，不承诺毫秒级物理制动。
 - 动作库及限制：`{"action":"info"}`。
 
@@ -106,11 +107,22 @@ LocoPlugin 的动作入口使用同一可重入动作锁。编排在返回 run �
 `sdk_data_freshness: unverifiable`。需要真机核查掉线行为，当前没有底层新鲜度保证。
 
 驱动 stop 会取消并等待工作线程，关闭后不能再 run；重部署不恢复旧计划。
-单任务重复 run 返回 busy；每个工作线程只发布一次内部终态。
-本版是交互式后台 job，**不注册 ACP pending**，只返回 job_id 而非 action_id，
-也不声明 x-completion。原因是 ACP 会阻塞同一 actuator 的 continue/status/stop，
-导致人工确认无法完成。这里采用 README_dev.md 中持续状态不持有 ACP barrier 的模式，
-用身体控制权做实际仲裁。未来自动完成版接 ACP 时须同时解决确认/停止入口和一次性终态。
+单任务重复 run 返回 busy；每个工作线程只发布一次终态。
+`run` 声明 `x-completion`，返回唯一 action_id，以 `/api/acp/complete` 向 Agent Core
+回报 completed/cancelled/error，ACP 等待期限为整套一小时上限加退出和回调余量。
+使用默认 AGENT_CORE_URL；回调失败记日志，不伪造动作结果或重复上报。Agent Core 不可用时
+平台依赖 ACP 超时释放等待，现场仍可直接停止。单机 --demo 不发送 ACP 网络回调。
+
+身体动作入口持有 base/leg/arm_l/arm_r 资源；新增的 `exercise_routine_control` 是
+独立 operator 控制通道，只能查询、确认或取消已经持有身体控制权的任务。它没有 run、
+plan 或 recording_id 入口，不能启动独立动作；确认必须匹配当前任务和片段令牌。
+它仍是 actuator，未将可写操作伪装成 sensor/resource。逻辑控制通道与身体资源不相交，
+因此运行期间可以通过正常工具调用处理确认/停止，而其他身体动作仍受 ACP 顺序约束。
+真实 SDK 指令和下一片段始终在原任务的身体控制权下执行。两张卡均声明平台运动标记。
+
+主卡声明 on_interrupt_motion/on_interrupt_all → stop hooks，支持平台按文档直接触发
+取消，不等待身体 ACP barrier；此停止仍不等价于物理急停。工作线程启动失败不返回
+可注册的 action_id；正常任务即使很快结束，也只回报一次对应 action_id 的终态。
 
 ## 制作第一个真实素材：现场逐步操作
 
@@ -155,6 +167,7 @@ Dockerfile 已复制新模块，动作库随现有 resource/ 进入镜像；conf
 说明：Bumi 目前只能逐次播放示教录制。本变更新增 exercise_routine 卡，用受控动作库
 管理顺序、片段播放次数、整套轮数和间歇，提供预览、后台任务、状态、逐片段确认和停止。
 复用 LocoPlugin 并增加跨卡控制权，外部动作取消旧编排，退出未确认时阻止后续运动。
+run 接入 ACP 一次性终态回报，独立编排控制卡用于运行期间的查询、人工确认和停止。
 三个候选素材默认未绑定、未验证，真实运行拒绝使用；本地 dry-run 不连接硬件。
 SDK 没有物理完成信号，本版明确采用现场人工确认，不宣称全自动编排或真机验收通过。
 
@@ -169,10 +182,11 @@ SDK 没有物理完成信号，本版明确采用现场人工确认，不宣称�
 python3 -m pytest tests/test_bumi_exercise_routine.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py tests/test_bumi_camera_specs.py tests/test_bumi_odom.py noetix/bumi/tests -q -p no:cacheprovider
 ```
 
-结果：**246 passed in 3.08s**。覆盖新状态机、输入和素材校验、真实 LocoPlugin 的
+结果：**253 passed in 3.98s**。覆盖新状态机、输入和素材校验、真实 LocoPlugin 的
 mock SDK 调用路径、顺序/重复/轮数/休息、人工确认令牌、启动/退出未确认、
 停止竞态、同模式外部回放替换、各显式动作入口、流式控制冲突、保护/状态读取异常、
 线程启动失败、驱动关闭与缺少控制器的兼容性，以及既有 Bumi 相关回归。
+新增 ACP action_id/终态单次回报、默认 HTTP 回调、回调失败、独立控制入口和中断 hook 覆盖。
 
 `python3 noetix/bumi/exercise_routine.py --demo` 实际完成两轮、8 次模拟片段播放，
 终态 completed，completed_plays=8，控制权未保留，物理退出确认为 null。

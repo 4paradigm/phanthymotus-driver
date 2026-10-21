@@ -141,7 +141,7 @@ def test_validate_never_reads_or_commands_hardware(card, hardware):
 
 
 def test_pending_candidates_can_be_previewed_and_simulated_without_hardware():
-    c = routine.ExerciseRoutinePlugin({"dry_run_clip_s": 0.001}, None)
+    c = routine.ExerciseRoutinePlugin({"dry_run_clip_s": 0.001}, None, on_terminal=lambda *_args: None)
     preview = c.dispatch("validate", {"plan": plan()})
     assert preview["ok"] and preview["warnings"]
     assert preview["estimated_duration_s"] is None
@@ -402,7 +402,13 @@ def test_invalid_library_fails_closed(tmp_path):
 def test_interactive_task_schema_does_not_block_its_own_confirmation(card):
     schema = card.get_tool()
     assert schema["type"] == "actuator" and not schema["multiInstance"]
-    assert "x-completion" not in schema["inputSchema"]
+    assert schema["inputSchema"]["x-completion"] == {"actions": ["run"], "timeout": 3615}
+    control = card.get_tools()[1]
+    assert control["name"] == "exercise_routine_control"
+    assert control["type"] == "actuator"
+    assert not (set(control["inputSchema"]["x-resource"]) & set(schema["inputSchema"]["x-resource"]))
+    assert "run" not in control["inputSchema"]["properties"]["action"]["enum"]
+    assert "x-completion" not in control["inputSchema"]
     assert schema["inputSchema"]["x-is-dangerous"] is True
     assert schema["inputSchema"]["properties"]["dry_run"]["default"] is True
     assert card.dispatch("start", {})["state"] == "ready"
@@ -490,6 +496,7 @@ def test_thread_start_failure_releases_body_and_shutdown_is_safe(card, hardware,
     monkeypatch.setattr(threading.Thread, "start", fail)
     result = run(card)
     assert result["state"] == "error" and "线程" in result["error"]
+    assert "action_id" not in result
     assert not hardware[1].is_motion_reserved()
     assert card.stop()["state"] == "error"
 
@@ -546,3 +553,87 @@ def test_stop_state_cannot_be_overwritten_by_a_late_worker_update(card):
             card._update(card._job, state="running")
             assert card.dispatch("status", {})["state"] == "stopping"
     assert wait_for(card, routine.TERMINAL)["state"] == "cancelled"
+
+
+
+@pytest.mark.parametrize("outcome", ["completed", "cancelled", "error"])
+def test_acp_action_id_and_exactly_one_terminal_result(card, hardware, outcome):
+    response = run(card)
+    assert response["action_id"] == response["job_id"]
+    wait_for(card, "awaiting_confirmation")
+    if outcome == "completed":
+        result = finish(card)
+    elif outcome == "cancelled":
+        card.dispatch("stop", {"_tool_name": "exercise_routine_control"})
+        result = wait_for(card, "cancelled")
+    else:
+        hardware[0].mode = 26
+        result = wait_for(card, "error")
+    card._job["thread"].join(timeout=1)
+    assert result["state"] == outcome
+    assert len(card.terminal) == 1
+    action_id, state, terminal = card.terminal[0]
+    assert action_id == response["action_id"] and state == outcome
+    assert terminal["action_id"] == action_id and terminal["state"] == outcome
+    hardware[0].mode = 2
+    card.dispatch("stop", {"_tool_name": "exercise_routine_control"})
+    assert len(card.terminal) == 1
+
+
+def test_operator_surface_cannot_start_new_motion_but_can_complete_lease(card, hardware):
+    response = card.dispatch("run", {"_tool_name": "exercise_routine_control", "plan": plan(), "confirm": True})
+    assert response["state"] == "error" and not hardware[0].calls
+    response = run(card)
+    status = wait_for(card, "awaiting_confirmation")
+    control_status = card.dispatch("status", {"_tool_name": "exercise_routine_control"})
+    assert control_status["action_id"] == response["action_id"]
+    confirmed = card.dispatch("continue", {"_tool_name": "exercise_routine_control",
+        "job_id": status["job_id"], "confirmation_token": status["confirmation_token"], "confirm": True})
+    assert confirmed["ok"] and wait_for(card, "completed")["completed_plays"] == 1
+    card._job["thread"].join(timeout=1)
+
+
+def test_declared_interrupt_hook_cancels_pending_body_action(card):
+    run(card, plan(count=2))
+    wait_for(card, "awaiting_confirmation")
+    hooks = card.get_tool()["inputSchema"]["x-hooks"]
+    assert hooks["on_interrupt_motion"]["action"] == "stop"
+    assert hooks["on_interrupt_all"]["action"] == "stop"
+    card.dispatch(hooks["on_interrupt_motion"]["action"], {"_tool_name": "exercise_routine"})
+    assert wait_for(card, "cancelled")["completed_plays"] == 0
+
+
+def test_production_acp_transport_posts_correlated_terminal_once(card, monkeypatch):
+    import io
+    import urllib.request
+    captured = []
+    monkeypatch.setenv("AGENT_CORE_URL", "http://mock-agent-core.invalid:15678/")
+    def urlopen(request, **kwargs):
+        captured.append((request, kwargs))
+        return io.BytesIO(b'{}')
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    card._on_terminal = routine.notify_completion
+    response = run(card)
+    assert finish(card)["state"] == "completed"
+    assert len(captured) == 1
+    request, options = captured[0]
+    payload = json.loads(request.data)
+    assert request.full_url == "http://mock-agent-core.invalid:15678/api/acp/complete"
+    assert request.method == "POST" and options["timeout"] == 5
+    assert payload["action_id"] == response["action_id"]
+    assert payload["status"] == "completed" and payload["tool"] == "exercise_routine"
+    assert payload["result"]["completed_plays"] == 1
+
+
+def test_acp_transport_failure_does_not_rewrite_terminal_or_retry(card, monkeypatch, capsys):
+    import urllib.request
+    attempts = []
+    def unavailable(*args, **kwargs):
+        attempts.append(1)
+        raise OSError("mock Agent Core unavailable")
+    monkeypatch.setattr(urllib.request, "urlopen", unavailable)
+    card._on_terminal = routine.notify_completion
+    run(card)
+    assert finish(card)["state"] == "completed"
+    assert attempts == [1]
+    assert "ACP callback failed" in capsys.readouterr().out

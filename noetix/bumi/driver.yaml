@@ -23,6 +23,7 @@ cards:
   - { name: semantic_action,   type: actuator }
   - { name: action_recording,  type: actuator }
   - { name: exercise_routine,  type: actuator }
+  - { name: exercise_routine_control, type: actuator }
   - { name: mic,               type: sensor }
   - { name: sound_direction,   type: sensor }
   - { name: speaker,           type: actuator }

@@ -24,6 +24,26 @@ POLL_S = 0.05
 TERMINAL = {"completed", "cancelled", "error"}
 
 
+def notify_completion(action_id, state, result):
+    """One ACP terminal POST, using the same endpoint as other Bumi actions."""
+    import os as _os
+    import ssl
+    import urllib.request
+    url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({"action_id": action_id, "status": state,
+                          "result": result, "tool": "exercise_routine",
+                          "ts": time.time()}).encode()
+    request = urllib.request.Request(
+        url + "/api/acp/complete", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    try:
+        with urllib.request.urlopen(request, timeout=5, context=context) as response:
+            response.read()
+    except Exception as exc:
+        print(f"[exercise_routine] ACP callback failed for {action_id}: {exc}", flush=True)
+
+
 class RoutineError(ValueError):
     pass
 
@@ -263,7 +283,7 @@ class ExerciseRoutinePlugin:
         self._lock = threading.RLock()
         self._job = None
         self._closed = False
-        self._on_terminal = on_terminal
+        self._on_terminal = on_terminal if on_terminal is not None else notify_completion
         self._library_error = None
         try:
             self._library = load_library(self._library_path)
@@ -285,7 +305,7 @@ class ExerciseRoutinePlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["validate", "run", "status", "stop", "continue", "info"]},
+                    "action": {"type": "string", "enum": ["validate", "run", "info"]},
                     "plan": {"type": "object", "additionalProperties": False,
                              "properties": {"rounds": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1},
                                             "round_rest_s": {"type": "number", "minimum": 0, "maximum": 600, "default": 0},
@@ -300,20 +320,46 @@ class ExerciseRoutinePlugin:
                 "x-action-params": {
                     "validate": {"params": ["plan", "dry_run"], "description": "检查并预览；不发送运动指令。"},
                     "run": {"params": ["plan", "dry_run", "confirm"], "description": "异步启动；默认模拟。真机须 confirm=true，且素材已验证。"},
-                    "status": {"params": ["job_id"], "description": "查询流程状态和当前确认令牌。"},
-                    "continue": {"params": ["job_id", "confirmation_token", "confirm"], "description": "仅在现场确认当前片段完整结束后提交；不是轨迹暂停续播。"},
-                    "stop": {"params": [], "description": "立即取消后续调度，异步退出本卡回放；随后查询 status。不是硬件急停。"},
                     "info": {"params": [], "description": "查看动作库、限制及当前状态。"},
                 },
-                # Interactive operator confirmation must remain callable. No ACP
-                # pending/barrier is held; job_id is deliberately not action_id.
+                "x-completion": {"actions": ["run"], "timeout": MAX_TASK_S + 15},
+                "x-hooks": {"on_interrupt_motion": {"action": "stop"},
+                            "on_interrupt_all": {"action": "stop"}},
                 "x-is-dangerous": True,
                 "x-resource": ["base", "leg", "arm_l", "arm_r"],
             }, "topic_out": [],
         }
 
+    def _control_tool(self):
+        # This channel controls an ALREADY leased task. It cannot start a plan
+        # or issue raw SDK commands; the routine retains all body resources.
+        # A separate actuator control surface keeps operator replies/cancel
+        # reachable without disguising mutation as a read-only sensor/resource.
+        return {
+            "name": "exercise_routine_control", "type": "actuator", "multiInstance": False,
+            "description": "Bumi 编排控制：查询现有任务、现场确认当前片段结束或停止。不能启动计划或任意回放；等待编排期间请使用此入口。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "continue", "stop", "info"]},
+                    "job_id": {"type": "string"},
+                    "confirmation_token": {"type": "string"},
+                    "confirm": {"type": "boolean", "default": False,
+                                "description": "continue 必须由现场人员确认本片段完整结束后设为 true。"},
+                }, "required": ["action"],
+                "x-action-params": {
+                    "status": {"params": ["job_id"], "description": "查询当前流程和片段确认令牌。"},
+                    "continue": {"params": ["job_id", "confirmation_token", "confirm"], "description": "只确认当前任务的当前片段，不新建运动或抢占身体。"},
+                    "stop": {"params": [], "description": "阻断后续调度并退出本任务回放；非硬件急停。"},
+                    "info": {"params": [], "description": "查询动作库、运行方式和当前状态。"},
+                },
+                "x-is-dangerous": True,
+                "x-resource": ["bumi_routine_operator"],
+            }, "topic_out": [],
+        }
+
     def get_tools(self):
-        return [self.get_tool()]
+        return [self.get_tool(), self._control_tool()]
 
     def start(self):
         return {"state": "ready"}
@@ -323,10 +369,13 @@ class ExerciseRoutinePlugin:
         with self._lock:
             job = self._job
         if job and job["thread"].ident is not None and job["thread"] is not threading.current_thread():
-            job["thread"].join(timeout=4)
+            job["thread"].join(timeout=9)
         return self._status() if job else result
 
     def dispatch(self, action, args):
+        if args.get("_tool_name") == "exercise_routine_control" and action not in {
+                "start", "stop", "status", "continue", "info"}:
+            return {"ok": False, "state": "error", "error": "编排控制入口不能启动新计划或任意动作"}
         if action == "start":
             return {"state": "ready" if not self._closed else "error"}
         if action == "info":
@@ -335,7 +384,8 @@ class ExerciseRoutinePlugin:
                     "robot_id": self._robot_id, "motions": copy.deepcopy(list(self._library.values())),
                     "completion_strategy": "operator", "automatic_physical_completion": False,
                     "sdk_data_freshness": "unverifiable", "progress_source": "scheduler",
-                    "task_protocol": "interactive_job_no_acp_barrier", "current": self._status()}
+                    "task_protocol": "acp_with_operator_control",
+                    "control_tool": "exercise_routine_control", "current": self._status()}
         if action == "status":
             return self._status(args.get("job_id"))
         if action == "stop":
@@ -392,7 +442,7 @@ class ExerciseRoutinePlugin:
             job = {"id": job_id, "dry": dry, "cancel": cancel, "ack": threading.Event(),
                    "finished": False, "plan": plan, "rest_until": 0.0,
                    "backend": None if dry else LocoRoutineBackend(self._loco, cancel),
-                   "status": {"ok": True, "job_id": job_id, "state": "running", "dry_run": dry,
+                   "status": {"ok": True, "job_id": job_id, "action_id": job_id, "state": "running", "dry_run": dry,
                               "completion_strategy": "simulated" if dry else "operator",
                               "round": 0, "total_rounds": plan["rounds"], "step": 0,
                               "total_steps": len(plan["steps"]), "play_index": 0,
@@ -413,7 +463,10 @@ class ExerciseRoutinePlugin:
                 job["status"].update(state="error", ok=False, error=f"无法启动编排线程：{exc}")
                 if job["backend"]:
                     job["backend"].release()
-                return self._status()
+                result = self._status()
+                # No worker was started, so do not register an ACP pending.
+                result.pop("action_id", None)
+                return result
             return self._status()
 
     def _request_stop(self, close=False):
@@ -565,7 +618,8 @@ if __name__ == "__main__":
         "steps": [{"motion": "chest_expand", "play_count": 2, "rest_s": 0.1},
                   {"motion": "arms_up", "play_count": 1, "rest_s": 0.1},
                   {"motion": "arms_forward_push", "play_count": 1, "rest_s": 0}]}
-    plugin = ExerciseRoutinePlugin({}, None)
+    # Standalone simulation has no Agent Core; disable only the transport.
+    plugin = ExerciseRoutinePlugin({}, None, on_terminal=lambda *_args: None)
     preview = plugin.dispatch("validate", {"plan": plan, "dry_run": True})
     print(json.dumps(preview, ensure_ascii=False, indent=2))
     if not preview.get("ok"):

@@ -176,11 +176,13 @@ def test_exercise_routine_registers_with_existing_loco_and_is_inert(bundle_modul
     config = _config(loco_servo=False)
     config["plugins"]["exercise_routine"] = {"enabled": True}
     bundle = bundle_module.BumiDeviceBundle(config, "bumi_test", object(), FakeHighCtrl(), None)
-    assert [tool["name"] for tool in bundle.get_all_tools()] == ["loco", "exercise_routine"]
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["loco", "exercise_routine", "exercise_routine_control"]
     card = bundle._plugins[1]
     assert card._loco is bundle._plugins[0]
     bundle.start_all()
     assert bundle.dispatch("exercise_routine", {"action": "status"})["state"] == "idle"
+    assert bundle.dispatch("exercise_routine_control", {"action": "status"})["state"] == "idle"
+    assert bundle.dispatch("exercise_routine_control", {"action": "run", "plan": {}})["state"] == "error"
     info = bundle.dispatch("exercise_routine", {"action": "info"})
     assert info["automatic_physical_completion"] is False
     assert all(m["verified"] is False for m in info["motions"])
