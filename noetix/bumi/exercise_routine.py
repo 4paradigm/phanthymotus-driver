@@ -426,7 +426,8 @@ class ExerciseRoutinePlugin:
                     (f"（{item['recording_id']}）" if type(item.get("recording_id")) is int else "（未绑定）")}
                    for key, item in self._library.items()]
         actions = {"ui": "打开动作编排面板（需要Core工作台支持）", "validate": "预检顺序编排", "run": "运行顺序编排",
-                   "status": "查看进度", "cancel": "停止当前流程",
+                   "status": "查看进度", "info": "查看动作库和当前进度",
+                   "cancel": "停止当前流程", "stop": "停止当前流程（中断接口）",
                    "register_recordings": "加入101–107（保留现有绑定，新素材需逐个测时验证）",
                    "calibrate": "播放一个动作并开始测时", "finish_calibration": "确认本次动作完整结束并保存测时",
                    "continue": "确认当前片段完整结束",
@@ -483,7 +484,9 @@ class ExerciseRoutinePlugin:
                     "validate": {"params": simple, "required": ["motion"], "description": "表单预检；不发送运动指令。"},
                     "run": {"params": simple + ["confirm"], "required": ["motion"], "description": "按表单启动；默认模拟。"},
                     "status": {"params": [], "description": "查询当前任务。"},
+                    "info": {"params": [], "description": "只读查询动作库、忙闲及当前任务；工作台启动和轮询使用。"},
                     "cancel": {"params": [], "description": "停止后续调度并退出本流程回放。"},
+                    "stop": {"params": [], "description": "cancel的同义入口；供工作台和中断hooks调用。"},
                     "register_recordings": {"params": [], "description": "注册当前机器人101–107；不播放、不覆盖已有绑定或测时。随后刷新服务能力列表。"},
                     "calibrate": {"params": ["motion", "dry_run", "confirm"], "required": ["motion"],
                                   "description": "一次只测试一个动作。dry_run=false且confirm=true启动，完整结束后finish_calibration。"},

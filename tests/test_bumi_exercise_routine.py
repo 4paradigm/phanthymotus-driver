@@ -973,6 +973,39 @@ def test_workbench_entry_and_polling_have_no_hardware_side_effects(card, hardwar
     assert not hardware[0].calls and hardware[0].reads == 0
 
 
+def test_workbench_hooks_and_completion_actions_pass_public_schema_validation(card):
+    import jsonschema
+    schema = card.get_tool()['inputSchema']
+    referenced = set(schema['x-workbench']['actions'])
+    referenced.update(hook['action'] for hook in schema['x-hooks'].values())
+    referenced.update(schema['x-completion']['actions'])
+    referenced.add(schema['x-workbench']['entry'])
+    for action in referenced:
+        jsonschema.validate({'action': action}, schema)
+        assert action in schema['x-action-params']
+
+
+@pytest.mark.parametrize('action', ['stop', 'cancel'])
+def test_publicly_validated_stop_aliases_cancel_playback_and_prevent_next_round(card, hardware, action):
+    import jsonschema
+    args = {'action': action}
+    # This must happen before dispatch, just as a validating Core would do.
+    jsonschema.validate(args, card.get_tool()['inputSchema'])
+    run(card, plan(rounds=2, count=2))
+    wait_for(card, 'awaiting_confirmation')
+    card.dispatch(args['action'], {})
+    result = wait_for(card, 'cancelled')
+    assert result['playback_exit_confirmed'] and not result['control_reserved']
+    assert [c[1] for c in hardware[0].calls if c[0] == 'PLAYTEACH'] == [41]
+
+
+def test_workbench_info_passes_public_validation_without_hardware_access(card, hardware):
+    import jsonschema
+    jsonschema.validate({'action': 'info'}, card.get_tool()['inputSchema'])
+    assert card.dispatch('info', {})['state'] == 'ready'
+    assert not hardware[0].calls and hardware[0].reads == 0
+
+
 def test_same_card_can_query_and_confirm_each_round_without_manual_stop_calls(card, hardware):
     run(card, plan(rounds=2))
     for expected_round in [1, 2]:
