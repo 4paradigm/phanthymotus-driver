@@ -1,6 +1,9 @@
-"""ROS-independent canvas contract shared by Bumi and Q5 squat cards."""
+"""ROS-independent canvas contract shared by Bumi and Q5 fitness cards."""
 
 from __future__ import annotations
+
+
+EXERCISES = ("squat", "dumbbell_curl", "lateral_raise")
 
 
 def topic_out(namespace: str, *, local_milestone_voice: bool = False) -> list[dict]:
@@ -28,19 +31,21 @@ def topic_out(namespace: str, *, local_milestone_voice: bool = False) -> list[di
 def tool_definition(namespace: str, *, coach_mode: bool = False,
                     local_milestone_voice: bool = False) -> dict:
     begin_description = (
-        "When the user asks to start squat training, choose a plan and call "
+        "When the user asks to start training, choose the exercise and plan, then call "
         "this action before counting. Use 2 sets of 8 reps with 90 seconds "
         "of rest unless the user specifies another valid plan. A repeated "
-        "call keeps the active session and count. Read the returned plan "
-        "before announcing it with TTS"
-        if coach_mode else "Start a squat workout; repeated calls keep the active session"
+        "call for the same exercise keeps the active session and count. "
+        "Finish an active workout before changing exercises. Read the returned "
+        "plan before announcing it with TTS"
+        if coach_mode else "Start a workout; repeated calls keep the active session"
     )
     return {
         "name": "squat_counter",
         "type": "processor",
         "multiInstance": False,
         "description": (
-            "Count one selected person's complete squats from the full pose "
+            "Count one selected person's squats, dumbbell curls, or lateral "
+            "raises from the full pose "
             "skeleton stream. Use status for the current total; connect only "
             "the sparse events output to Decision Core. Status and debug "
             "outputs are for the dashboard."
@@ -51,10 +56,12 @@ def tool_definition(namespace: str, *, coach_mode: bool = False,
                 "action": {"type": "string", "enum": [
                     "start", "stop", "info", "status", "debug", "reset",
                     "begin", "next_set", "finish"]},
+                "exercise": {"type": "string", "enum": list(EXERCISES),
+                             "description": "Exercise to begin or reset; defaults to the current exercise (initially squat)"},
                 "sets": {"type": "integer", "minimum": 1, "maximum": 5,
-                         "description": "Number of planned squat sets in coach mode (default: 2)"},
+                         "description": "Number of planned sets in coach mode (default: 2)"},
                 "reps_per_set": {"type": "integer", "minimum": 1, "maximum": 20,
-                                 "description": "Full squats required per set in coach mode (default: 8)"},
+                                 "description": "Complete repetitions required per set in coach mode (default: 8)"},
                 "rest_s": {"type": "integer", "minimum": 15, "maximum": 180,
                            "description": "Rest seconds between sets in coach mode (default: 90)"},
                 "input_topic": {
@@ -70,8 +77,8 @@ def tool_definition(namespace: str, *, coach_mode: bool = False,
                 "info": {"params": [], "description": "Show card ports and status"},
                 "status": {"params": [], "description": "Read the authoritative current total"},
                 "debug": {"params": [], "description": "查看中文姿态测量与计数判定"},
-                "reset": {"params": [], "description": "Clear the count and start a new session"},
-                "begin": {"params": ["sets", "reps_per_set", "rest_s"],
+                "reset": {"params": ["exercise"], "description": "Clear the count and start a new session, optionally selecting an exercise"},
+                "begin": {"params": ["exercise", "sets", "reps_per_set", "rest_s"],
                           "description": begin_description},
                 "next_set": {"params": [], "description":
                              "Start the next set after the rest timer has finished"},

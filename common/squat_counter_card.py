@@ -1,4 +1,4 @@
-"""Shared ROS squat processor for Bumi and Q5 pose skeleton frames.
+"""Shared ROS exercise processor for Bumi and Q5 pose skeleton frames.
 
 The counter runs at camera speed in this driver. Decision Core receives only
 sparse progress events and can read the authoritative total with ``status``.
@@ -16,7 +16,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-from common.squat_contract import tool_definition, topic_out
+from common.arm_exercise_logic import ArmExerciseCounter
+from common.squat_contract import EXERCISES, tool_definition, topic_out
 from common.squat_logic import DEFAULT_CONFIG, SquatCounter
 
 
@@ -44,6 +45,19 @@ _PHASE_ZH = {
     "top": "站立", "descent": "下蹲中", "bottom": "蹲底",
     "ascent": "起身中", "paused": "目标暂不可读，等待重新识别", "rearming": "等待重新站稳",
     "finished": "本组已结束",
+    "ready": "准备姿态", "moving": "动作进行中", "peak": "动作顶点",
+    "returning": "返回起始姿态中",
+}
+_ARM_PHASE_ZH = {
+    "calibrating": "确认手臂起始姿态", "rearming": "等待手臂回到起始姿态",
+}
+_EXERCISE_ZH = {
+    "squat": "深蹲", "dumbbell_curl": "哑铃弯举", "lateral_raise": "哑铃侧平举",
+}
+_START_PROMPT = {
+    "squat": "站稳了，开始深蹲。",
+    "dumbbell_curl": "手臂伸直，开始弯举。",
+    "lateral_raise": "双臂放下，开始侧平举。",
 }
 _WORKOUT_STATE_ZH = {
     "waiting_start": "等待语音开始", "active": "训练中", "finished": "训练已结束",
@@ -94,6 +108,25 @@ _REASON_ZH = {
     "rep_completed": "完成一次深蹲，计数加一",
     "waiting_for_top_dwell": "已站直，等待保持足够时间后计数",
     "rep_too_fast": "动作时间过短，不计数",
+    "waiting_for_rest_to_rearm": "等待手臂回到起始姿态后恢复计数",
+    "movement_started": "检测到手臂开始动作",
+    "waiting_for_movement": "等待开始动作",
+    "movement_timeout": "动作持续过久，丢弃本次并等待重新准备",
+    "incomplete_returned_to_rest": "未到动作顶点就返回起始姿态，不计数",
+    "peak_confirmed": "动作顶点已确认",
+    "waiting_for_peak_dwell": "动作到达顶点，等待短暂保持",
+    "waiting_for_peak": "等待达到动作顶点",
+    "return_started": "检测到开始返回起始姿态",
+    "peak_held": "保持动作顶点姿态",
+    "returned_to_peak": "返回途中重新到达顶点",
+    "waiting_for_full_return": "等待完全回到起始姿态",
+    "waiting_for_return_dwell": "已回到起始姿态，等待稳定后计数",
+}
+_ARM_REASON_ZH = {
+    "calibration_pose_invalid": "手臂起始姿态不符合要求",
+    "calibration_waiting_still": "等待手臂稳定以完成准备",
+    "baseline_ready": "手臂起始姿态已就绪",
+    "rearmed": "手臂起始姿态已重新确认",
 }
 _MEASUREMENT_ZH = {
     "knee_angle_deg": "当前膝角（度）", "hip_angle_deg": "当前髋角（度）",
@@ -107,6 +140,17 @@ _MEASUREMENT_ZH = {
     "hip_drop_deg": "髋角相对站姿减小（度）",
     "hip_descent_ratio": "髋部下降／站姿腿长",
     "ankle_motion_ratio": "脚踝位移／站姿腿长",
+    "elbow_angle_deg": "所选手臂肘角（度）",
+    "upper_arm_vertical_ratio": "上臂竖直程度",
+    "elbow_shift_ratio": "肘部横移／躯干长",
+    "wrist_rise_ratio": "腕部高于肘部／前臂长",
+    "left_elbow_angle_deg": "左臂肘角（度）",
+    "right_elbow_angle_deg": "右臂肘角（度）",
+    "left_wrist_drop_ratio": "左腕低于肩／臂长",
+    "right_wrist_drop_ratio": "右腕低于肩／臂长",
+    "left_outward_reach_ratio": "左腕向外伸展／臂长",
+    "right_outward_reach_ratio": "右腕向外伸展／臂长",
+    "shoulder_span_ratio": "双肩间距／躯干长",
 }
 _CHECK_ZH = {
     "baseline_pose": "站姿可用于校准",
@@ -123,6 +167,15 @@ _CHECK_ZH = {
     "top_height_restored": "站起：髋部高度恢复",
     "top": "站立条件全部达标",
     "ankle_stable": "脚踝位置稳定",
+    "arm_stable": "上臂位置稳定",
+    "rest": "起始姿态成立",
+    "start": "动作已启动",
+    "peak": "动作顶点成立",
+    "bilateral_visible": "双臂关键关节可读",
+    "arms_extended": "双臂伸展",
+    "front_view": "正面视角足够清晰",
+    "left_raised": "左臂达到目标高度和幅度",
+    "right_raised": "右臂达到目标高度和幅度",
 }
 _TIMING_ZH = {
     "calibration_elapsed_s": "校准已持续（秒）",
@@ -132,6 +185,8 @@ _TIMING_ZH = {
     "motion_elapsed_s": "本次动作已持续（秒）",
     "bottom_dwell_elapsed_s": "蹲底已保持（秒）",
     "top_dwell_elapsed_s": "站立已保持（秒）",
+    "peak_dwell_elapsed_s": "动作顶点已保持（秒）",
+    "return_dwell_elapsed_s": "返回起始姿态已保持（秒）",
 }
 _THRESHOLD_ZH = {
     "min_visibility": "关节最低可见度",
@@ -159,11 +214,29 @@ _THRESHOLD_ZH = {
     "max_frame_gap_s": "最大帧间隔（秒）",
     "lost_grace_s": "目标丢失宽限（秒）",
     "switch_after_s": "切换目标等待（秒）",
+    "initial_dwell_s": "手臂起始姿态保持（秒）",
+    "peak_dwell_s": "动作顶点最短保持（秒）",
+    "return_dwell_s": "返回起始姿态最短保持（秒）",
+    "max_rep_s": "单次动作最长时长（秒）",
+    "curl_rest_min_deg": "弯举起始肘角下限（度）",
+    "curl_start_max_deg": "弯举启动肘角上限（度）",
+    "curl_peak_max_deg": "弯举顶点肘角上限（度）",
+    "curl_upper_arm_vertical_min_ratio": "弯举上臂竖直程度下限",
+    "curl_elbow_shift_max_ratio": "弯举肘部横移上限／躯干长",
+    "curl_rest_wrist_drop_min_ratio": "弯举起始腕低于肘下限／前臂长",
+    "curl_peak_wrist_rise_min_ratio": "弯举顶点腕高于肘下限／前臂长",
+    "lateral_shoulder_span_min_ratio": "侧平举双肩间距下限／躯干长",
+    "lateral_elbow_min_deg": "侧平举肘角下限（度）",
+    "lateral_rest_wrist_drop_min_ratio": "侧平举起始腕低于肩下限／臂长",
+    "lateral_start_wrist_drop_max_ratio": "侧平举启动腕低于肩上限／臂长",
+    "lateral_peak_wrist_level_max_ratio": "侧平举顶点腕肩高度差上限／臂长",
+    "lateral_start_reach_min_ratio": "侧平举启动向外伸展下限／臂长",
+    "lateral_peak_reach_min_ratio": "侧平举顶点向外伸展下限／臂长",
 }
 
 
 def _labeled(values: dict, labels: dict[str, str]) -> dict:
-    return {labels[key]: value for key, value in values.items()}
+    return {labels.get(key, key): value for key, value in values.items()}
 
 
 def _yes_no(value: bool | None) -> str:
@@ -185,8 +258,10 @@ def _candidate_zh(candidate: dict) -> dict:
 
 def _debug_zh(raw: dict) -> dict:
     """Localize dashboard diagnostics; status and Decision Core events stay stable."""
+    exercise = raw.get("exercise", "squat")
+    is_squat = exercise == "squat"
     measurements = raw["measurements"]
-    baseline = measurements["baseline"]
+    baseline = measurements.get("baseline")
     checks = raw["checks"]
     last_error = raw["last_error"]
     if last_error and last_error != "姿态数据必须是 JSON 对象":
@@ -194,10 +269,17 @@ def _debug_zh(raw: dict) -> dict:
                       "Expecting" in last_error else
                       "姿态输入处理失败：" + last_error)
     return {
-        "卡片": "深蹲计数", "动作": "深蹲",
+        "卡片": "深蹲计数" if is_squat else "健身动作计数",
+        "动作": _EXERCISE_ZH.get(exercise, exercise),
         "运行状态": "运行中" if raw["state"] == "running" else "未运行",
-        "动作阶段": _PHASE_ZH.get(raw["phase"], "未知阶段"),
-        "判定原因": _REASON_ZH.get(raw["reason"], "未知判定原因"),
+        "动作阶段": (_ARM_PHASE_ZH.get(raw["phase"],
+                    _PHASE_ZH.get(raw["phase"], "未知阶段"))
+                 if not is_squat else
+                 _PHASE_ZH.get(raw["phase"], "未知阶段")),
+        "判定原因": (_ARM_REASON_ZH.get(raw["reason"],
+                    _REASON_ZH.get(raw["reason"], raw["reason"]))
+                 if not is_squat else
+                 _REASON_ZH.get(raw["reason"], raw["reason"])),
         "累计次数": raw["count_total"],
         "训练状态": _WORKOUT_STATE_ZH[raw["workout_state"]],
         "训练已持续（秒）": raw["workout_elapsed_s"],
@@ -222,9 +304,12 @@ def _debug_zh(raw: dict) -> dict:
         "会话ID": raw["session_id"], "事件序号": raw["seq"],
         "目标ID": raw["target_id"],
         "目标状态": _TARGET_STATE_ZH.get(raw["target_state"], "未知状态"),
-        "跟踪侧": _SIDE_ZH.get(raw["side"], "未确定"),
-        "站姿基线已建立": _yes_no(raw["calibrated"]),
-        "需要重新站稳": _yes_no(raw["needs_rearm"]),
+        "跟踪侧": ("双侧" if exercise == "lateral_raise"
+                 else _SIDE_ZH.get(raw["side"], "未确定")),
+        ("站姿基线已建立" if is_squat else "准备姿态已确认"):
+            _yes_no(raw["calibrated"]),
+        ("需要重新站稳" if is_squat else "需要重新准备"):
+            _yes_no(raw["needs_rearm"]),
         "目标上次出现时间": raw["last_seen_time"],
         "输入话题": raw["input_topic"],
         "距上一帧（秒）": raw["last_frame_age_s"],
@@ -236,16 +321,18 @@ def _debug_zh(raw: dict) -> dict:
         "当前帧时间": raw["frame_time"],
         "帧间隔（秒）": raw["frame_gap_s"],
         "帧间隔超限": _yes_no(raw["frame_gap_exceeded"]),
-        "当前目标": _candidate_zh(raw["selected_target"]),
+        "当前目标": (_candidate_zh(raw["selected_target"])
+                 if raw["selected_target"] is not None else None),
         "候选人数": raw["candidate_count"],
         "候选人体": [_candidate_zh(item) for item in raw["candidates"]],
         "测量值": {
             **_labeled({key: value for key, value in measurements.items()
                         if key != "baseline"}, _MEASUREMENT_ZH),
-            "站姿基线": (_labeled(baseline, _MEASUREMENT_ZH)
-                     if baseline is not None else None),
+            ("站姿基线" if is_squat else "准备姿态基线"):
+                (_labeled(baseline, _MEASUREMENT_ZH)
+                 if baseline is not None else None),
         },
-        "判定项": {_CHECK_ZH[key]: ("暂无数据" if value is None else
+        "判定项": {_CHECK_ZH.get(key, key): ("暂无数据" if value is None else
                               "通过" if value else "未通过")
                 for key, value in checks.items()},
         "计时": _labeled(raw["timing"], _TIMING_ZH),
@@ -268,14 +355,22 @@ def _plan_integer(value: object, name: str, minimum: int, maximum: int) -> int:
 
 
 class SquatCounterPlugin:
-    """One local squat session, independent of the model's response speed."""
+    """One local exercise session, independent of the model's response speed."""
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  *, node_name: str = "bumi_squat_counter"):
         self._namespace = namespace
-        self._counter = SquatCounter({
+        self._squat_config = {
             key: value for key, value in plugin_config.items() if key in DEFAULT_CONFIG
-        })
+        }
+        arm_configs = plugin_config.get("arm_exercises", {})
+        if not isinstance(arm_configs, dict) or any(
+                key not in EXERCISES[1:] or not isinstance(value, dict)
+                for key, value in arm_configs.items()):
+            raise ValueError("arm_exercises must map arm exercises to config objects")
+        self._arm_configs = arm_configs
+        self._exercise = "squat"
+        self._counter = SquatCounter(self._squat_config)
         self._status_interval_s = _nonnegative_interval(
             plugin_config, "status_interval_s", 0.5)
         self._debug_interval_s = _nonnegative_interval(
@@ -355,6 +450,11 @@ class SquatCounterPlugin:
         self._ready_since: float | None = None
         self._node.create_timer(0.2, self._tick)
 
+    def _new_counter(self, exercise: str):
+        if exercise == "squat":
+            return SquatCounter(self._squat_config)
+        return ArmExerciseCounter(exercise, self._arm_configs.get(exercise))
+
     def get_tool(self) -> dict:
         return tool_definition(self._namespace, coach_mode=self._coach_mode,
                                local_milestone_voice=self._local_milestone_voice)
@@ -381,7 +481,7 @@ class SquatCounterPlugin:
                 self._stop_locked()
                 return self._status_locked()
             if action == "reset":
-                return self._begin_workout_locked(force=True, plan_args={})
+                return self._begin_workout_locked(force=True, plan_args=args)
             if action == "begin":
                 return self._begin_workout_locked(force=False, plan_args=args)
             if action == "next_set":
@@ -481,10 +581,25 @@ class SquatCounterPlugin:
         self._ready_since = None
 
     def _begin_workout_locked(self, *, force: bool, plan_args: dict) -> dict:
+        exercise = plan_args.get("exercise", self._exercise)
+        if exercise not in EXERCISES:
+            return {"state": "error", "error": f"unsupported exercise: {exercise}"}
+        if self._workout_state == "active" and not force:
+            if exercise != self._exercise:
+                return {"state": "error", "error": "finish the current workout before changing exercise"}
+            return self._status_locked()
+        try:
+            new_counter = (self._new_counter(exercise)
+                           if exercise != self._exercise else None)
+        except ValueError as exc:
+            return {"state": "error", "error": str(exc)}
         if self._subscription is None:
             if not force:
-                return {"state": "error", "error": "start the squat card on the canvas first"}
+                return {"state": "error", "error": "start the counter card on the canvas first"}
             # Preserve the existing reset API while the canvas card is stopped.
+            if new_counter is not None:
+                self._counter = new_counter
+                self._exercise = exercise
             self._counter.reset()
             self._workout_state = "waiting_start"
             self._workout_started_at = None
@@ -495,8 +610,6 @@ class SquatCounterPlugin:
             self._last_rep_published_at = None
             self._reset_rep_metrics_locked()
             self._clear_coach_locked()
-            return self._status_locked()
-        if self._workout_state == "active" and not force:
             return self._status_locked()
         if self._coach_mode:
             base = (self._coach_plan if force and self._coach_plan is not None
@@ -513,7 +626,11 @@ class SquatCounterPlugin:
                 }
             except ValueError as exc:
                 return {"state": "error", "error": str(exc)}
-        self._counter.reset()
+        if new_counter is not None:
+            self._counter = new_counter
+            self._exercise = exercise
+        else:
+            self._counter.reset()
         self._pending_rep = None
         self._last_rep_published_at = None
         self._last_voice = None
@@ -588,8 +705,9 @@ class SquatCounterPlugin:
                 or self._set_state != "preparing"):
             return
         snapshot = self._counter.snapshot()
+        ready_phase = "top" if self._exercise == "squat" else "ready"
         if (snapshot["target_state"] != "tracking" or not snapshot["calibrated"]
-                or snapshot["state"] != "top"):
+                or snapshot["state"] != ready_phase):
             self._ready_since = None
             return
         if self._ready_since is None:
@@ -608,7 +726,8 @@ class SquatCounterPlugin:
                 "set_target": self._coach_plan["reps_per_set"],
                 "count_total": self._workout_total,
             })
-        self._publish_voice_locked("set_ready", "站稳了，开始深蹲。", ttl_s=4.0)
+        self._publish_voice_locked("set_ready", _START_PROMPT[self._exercise],
+                                   ttl_s=4.0)
 
     def _coach_handle_event_locked(self, event: dict, now: float) -> None:
         kind = event.get("type")
@@ -668,7 +787,8 @@ class SquatCounterPlugin:
                 "set_state": self._set_state,
                 "count_total": self._workout_total,
             })
-        elif (kind == "ready_to_squat" and self._set_state == "in_set"
+        elif (kind in ("ready_to_squat", "ready_to_exercise")
+              and self._set_state == "in_set"
               and not self._local_milestone_voice):
             self._publish_event_locked({
                 **event, "set_index": self._set_index,
@@ -697,6 +817,7 @@ class SquatCounterPlugin:
                  else counter["count_total"])
         summary = {
             "session_id": counter["session_id"],
+            "exercise": self._exercise,
             "target_id": counter["target_id"],
             "count_total": count,
             "duration_s": round(max(0.0, now - self._workout_started_at), 1),
@@ -839,8 +960,8 @@ class SquatCounterPlugin:
         self._publish_event_locked(event)
 
     def _publish_event_locked(self, event: dict) -> None:
-        payload = {"source": "squat_counter", "exercise": "squat",
-                   "priority": 1, **event,
+        payload = {"source": "squat_counter", "priority": 1, **event,
+                   "exercise": self._exercise,
                    # A pose event's legacy `state` is the motion phase. Make
                    # the card and workout states explicit so `state=paused`
                    # on target_lost is not mistaken for a stopped processor.
@@ -857,6 +978,7 @@ class SquatCounterPlugin:
         payload = {
             "text": prompt, "expires_at": sent_at + ttl_s,
             "source": "squat_counter", "type": kind,
+            "exercise": self._exercise,
             "session_id": self._counter.session_id,
             "set_index": self._set_index, "set_count": self._set_count,
         }
@@ -886,7 +1008,7 @@ class SquatCounterPlugin:
         now = time.monotonic()
         return {
             "source": "squat_counter",
-            "exercise": "squat",
+            "exercise": self._exercise,
             "state": "running" if self._subscription is not None else "idle",
             "phase": counter.pop("state"),
             **counter,

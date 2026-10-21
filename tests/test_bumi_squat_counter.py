@@ -636,6 +636,27 @@ def _send_pose(subscription, clock, *people, dt=0.1):
     subscription.callback(_String(json.dumps(skeleton_payload(clock.now, people))))
 
 
+def _arm_person(*, curl=False, lateral_raise=False):
+    joints = [[450, 200, 0.95] for _ in KEYPOINT_NAMES]
+    positions = {
+        "left_shoulder": (490, 220), "right_shoulder": (410, 220),
+        "left_hip": (475, 350), "right_hip": (425, 350),
+        "left_elbow": (492, 280), "left_wrist": (494, 345),
+        "right_elbow": (408, 280), "right_wrist": (406, 345),
+    }
+    if curl:
+        positions["left_wrist"] = (548, 250)
+    if lateral_raise:
+        positions.update({
+            "left_elbow": (540, 220), "left_wrist": (595, 220),
+            "right_elbow": (360, 220), "right_wrist": (305, 220),
+        })
+    for name, (x, y) in positions.items():
+        joints[KEYPOINT_NAMES.index(name)] = [x, y, 0.95]
+    return {"id": 1, "score": 0.95, "bbox": [280, 170, 620, 580],
+            "keypoints": joints}
+
+
 def _plugin_standing(subscription, clock, frames=27):
     for _ in range(frames):
         _send_pose(subscription, clock, person())
@@ -719,6 +740,74 @@ def test_plugin_stop_preserves_total_and_reset_clears_it(plugin_factory):
     _plugin_standing(new_subscription, clock)
     _plugin_rep(new_subscription, clock)
     assert card.dispatch("status", {})["count_total"] == 1
+
+
+def test_plugin_selects_arm_exercise_and_requires_finish_before_switch(plugin_factory):
+    card, _clock, node = plugin_factory({
+        "require_explicit_workout_start": True, "coach_mode": True,
+        "local_milestone_voice": True,
+        "arm_exercises": {"dumbbell_curl": {"curl_peak_max_deg": 90.0}},
+    })
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    first = card.dispatch("begin", {
+        "exercise": "dumbbell_curl", "sets": 1,
+        "reps_per_set": 2, "rest_s": 15,
+    })
+    assert first["exercise"] == "dumbbell_curl"
+    assert first["workout_state"] == "active"
+    assert first["count_total"] == 0
+    assert card.dispatch("info", {})["config"]["curl_peak_max_deg"] == 90.0
+    assert card.dispatch("debug", {})["动作"] == "哑铃弯举"
+    repeated = card.dispatch("begin", {"exercise": "dumbbell_curl"})
+    assert repeated["session_id"] == first["session_id"]
+    rejected = card.dispatch("begin", {"exercise": "lateral_raise"})
+    assert rejected["state"] == "error"
+    assert card.dispatch("status", {})["exercise"] == "dumbbell_curl"
+
+    finished = card.dispatch("finish", {})
+    assert finished["summary"]["exercise"] == "dumbbell_curl"
+    second = card.dispatch("begin", {"exercise": "lateral_raise"})
+    assert second["exercise"] == "lateral_raise"
+    assert second["session_id"] != first["session_id"]
+    assert second["count_total"] == 0
+    assert card.dispatch("debug", {})["动作"] == "哑铃侧平举"
+    assert len(node.subscriptions) == 1
+
+
+@pytest.mark.parametrize("exercise,motion", [
+    ("dumbbell_curl", {"curl": True}),
+    ("lateral_raise", {"lateral_raise": True}),
+])
+def test_arm_pose_reaches_coach_plan_and_voice_milestone(
+        plugin_factory, exercise, motion):
+    card, clock, node = plugin_factory({
+        "require_explicit_workout_start": True, "coach_mode": True,
+        "local_milestone_voice": True,
+    })
+    tool = card.get_tool()
+    event_topic = tool["topic_out"][0]["topic"]
+    voice_topic = tool["topic_out"][3]["topic"]
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    card.dispatch("begin", {"exercise": exercise, "sets": 1,
+                            "reps_per_set": 1, "rest_s": 15})
+    subscription = node.subscriptions[-1]
+    for _ in range(11):
+        _send_pose(subscription, clock, _arm_person())
+    assert card.dispatch("status", {})["set_state"] == "in_set"
+    for _ in range(6):
+        _send_pose(subscription, clock, _arm_person(**motion))
+    for _ in range(6):
+        _send_pose(subscription, clock, _arm_person())
+
+    status = card.dispatch("status", {})
+    assert status["exercise"] == exercise
+    assert status["count_total"] == 1
+    assert status["summary"]["exercise"] == exercise
+    assert status["summary"]["goal_reached"] is True
+    assert [event["type"] for event in node.publishers[event_topic].payloads
+            if event["exercise"] == exercise].count("workout_finished") == 1
+    assert any(payload["type"] == "set_ready" and payload["exercise"] == exercise
+               for payload in node.publishers[voice_topic].payloads)
 
 
 def test_stale_callback_after_topic_switch_cannot_change_new_session(plugin_factory):

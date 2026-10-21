@@ -268,39 +268,49 @@ in `device.py`; no extra runtime Python file is required.
 
 ## New cards
 
-### `squat_counter`
+### `squat_counter` fitness coach
 
-Fixed-camera squat counting from the **full** `pose` skeleton stream. Connect
+Fixed-camera counting for squats, dumbbell curls, and lateral raises from the
+**full** `pose` skeleton stream. Connect
 `/<namespace>/camera/color` to the perception `pose` card, then connect its
 `/<namespace>/camera/color/poses/skeleton` output (`sensor/pose2d`) to
 `squat_counter`. On the canvas this is pose output port **1**; port 0 is the
 lean `/poses` output and lacks the joints needed for counting.
-Keep the user fully visible, with shoulder, hip, knee and ankle in frame through
-the whole movement; start with a roughly 45-degree oblique view and calibrate
-against footage from Bumi's final position.
+For squats, keep the full body visible, including shoulder, hip, knee and ankle;
+start with a roughly 45-degree oblique view. For curls, use a front or slight
+oblique view with the upper body, elbows, and wrists visible. For lateral raises,
+use a front view with both arms visible even at shoulder height. Calibrate
+against footage from Bumi's final position. The pose stream cannot confirm
+that a dumbbell is present or measure its weight.
 
-Start the counter with the skeleton `input_topic`. `status` returns its latest
-session and authoritative `count_total`; `debug` returns the latest measurements
-and checks; `reset` starts a fresh count; `stop` ends the current subscription.
+Start the counter with the skeleton `input_topic`. Select an action with
+`reset(exercise=...)`: `squat` (the initial default), `dumbbell_curl`,
+or `lateral_raise`. `status.exercise` and `status.count_total` are authoritative;
+`debug` returns measurements and checks, and `stop` ends the subscription.
+To change actions, report the old total and call `reset` with the new action;
+this creates a new session and clears the count. The card and `/fitness/squat/`
+topic names remain unchanged for existing canvas wiring.
 The card publishes:
 
 | Topic | Use |
 | --- | --- |
-| `/<namespace>/fitness/squat/events` | Sparse `session_started`, `ready_to_squat`, `rep_completed`, `target_lost`, `target_reacquired`, and `target_changed` events for `decision_core`. |
+| `/<namespace>/fitness/squat/events` | Sparse `session_started`, squat `ready_to_squat`, arm-action `ready_to_exercise`, `rep_completed`, and target events for `decision_core`; events include `exercise`. |
 | `/<namespace>/fitness/squat/status` | Current state and count for the dashboard; **do not** connect its frequent updates to `decision_core`. |
-| `/<namespace>/fitness/squat/debug` | 中文目标选择、膝髋角度、基线与变化量、阈值判定和计数原因；仅供 Dashboard 查看。 |
+| `/<namespace>/fitness/squat/debug` | 中文目标选择、所选动作的角度和阈值判定、未计数原因；仅供 Dashboard 查看。 |
 
-The counter locks onto the person with the clearest usable full-body skeleton
+The counter locks onto the person with the clearest usable skeleton
 and ignores other people. It keeps that target through brief occlusions. A
 confirmed target change abandons an unfinished repetition and starts a new
-session, so counts from different people are not silently combined. A
-repetition is recorded only after a qualified descent and a stable return to
-standing. The geometric and timing thresholds are **provisional**; validate
-them with complete squats, partial squats, bends, occlusions, and crossings
-recorded from the intended camera position.
+session, so counts from different people are not silently combined. A squat
+rep requires a qualified descent and stable return to standing. A curl uses
+one locked, clearer arm and a full extended–flexed–extended cycle; simultaneous
+two-arm curls count once. A lateral raise requires both arms to move from down
+to shoulder height and back down. Geometric and timing thresholds are
+**provisional**; validate complete and partial motions, occlusions, and
+crossings from the intended camera position.
 
-The default calibration needs 2 s of stable standing. A rep then needs knee
-flexion of at least 40°, hip flexion of at least 25°, and hip descent of at
+For squats, the default calibration needs 2 s of stable standing. A rep then
+needs knee flexion of at least 40°, hip flexion of at least 25°, and hip descent of at
 least 0.10 standing leg lengths, followed by a stable return to standing.
 These are relative 2D image measurements, not joint angles measured by a
 depth sensor. Adjust the keys in `squat_logic.DEFAULT_CONFIG` under
@@ -308,14 +318,18 @@ depth sensor. Adjust the keys in `squat_logic.DEFAULT_CONFIG` under
 card emits one `ready_to_squat` event when a standing baseline becomes valid.
 The skill checks the latest `status` before telling the user “已站稳，可以开始深蹲了”
 and skips the cue if the event is already stale. After `reset` or a target
-change, wait for the next ready event before squatting.
+change, wait for the next ready event before squatting. Arm actions emit
+`ready_to_exercise` after their own preparation check.
+Arm thresholds can be overridden under
+`plugins.squat_counter.arm_exercises.<exercise>` in `config.yaml`; use the keys
+from `common/arm_exercise_logic.py` and validate against camera footage.
 The wrapper publishes dashboard status and debug data every 0.5 s and coalesces
 quick rep events within 3 s (`status_interval_s`, `debug_interval_s`,
 `min_rep_event_interval_s`). The debug action and topic use Chinese JSON keys
 and Chinese state, check, and reason text; status and event keys remain stable.
 The debug stream contains no raw skeleton. If pose input stops, inspect
 `输入已过期`, `距上一帧（秒）`, `接收帧数`, `解析帧数`, and `最近错误`.
-For missed reps, compare `测量值.膝角相对站姿减小（度）`,
+For missed squats, compare `测量值.膝角相对站姿减小（度）`,
 `测量值.髋部下降／站姿腿长`, `判定项.蹲底条件全部达标`,
 `计时.蹲底已保持（秒）`, and `判定原因`; inspect `帧间隔超限` for pose stalls.
 In dashboard **Monitor** mode, open `/fitness/squat/debug` in Latest or Log
@@ -325,7 +339,7 @@ Connect `squat_counter` output port **0** (events) to `decision_core`, and bind
 its `status` action for readback. Leave output ports **1** (status) and **2**
 (debug) off the model's input. Each event includes a top-level `priority: 1`,
 `session_id`, `seq`, `count_total`, and `event_time`. Treat the card's total as
-the source of truth: a model turn and TTS playback can outlast several squats.
+the source of truth: a model turn and TTS playback can outlast several reps.
 Before speaking, read `status` and announce only the latest total for the
 current session; discard stale event numbers. This path gives best-effort
 progress narration, not a guarantee that every number is spoken immediately.
@@ -334,19 +348,21 @@ final total. `status.input_stale` flags a pose stream that has stopped sending
 frames; it does not infer that a missing frame contains a person.
 After a single tracked person is lost and returns, the counter preserves the
 session and total. If that person returns in another part of the image, it
-recalibrates standing pose before counting again. During a stall, check
+recalibrates the selected action's preparation pose before counting again.
+During a stall, check
 `status.input_stale` and the Chinese debug fields `判定原因` and `目标状态`;
 `reset` clears the total but cannot restore a stopped pose or ASR stream.
-The standing baseline now follows verified top poses slightly after completed
-reps. If a shifted person or camera makes the old reference unusable, a stable
+For squats, the standing baseline follows verified top poses slightly after
+completed reps. If a shifted person or camera makes the old reference unusable, a stable
 upright pose for about 0.8 s updates the baseline without clearing the total;
 the interrupted rep is discarded. A frame with invalid leg geometry also
 requires standing again instead of leaving the card permanently paused.
-To install the instruction in `fitness_squat_skill.md`, create a skill under
+To install the instruction in `fitness_squat_skill.md`, create or update a skill under
 Resource Center → My Skills with slug `bumi-squat-coach`, category `utility`,
-and required tools `squat_counter, tts`; paste the file's instruction body,
+and required tools `squat_counter, tts`; describe all three actions and paste
+the file's instruction body,
 install the draft, and mark it active. Then let `decision_core` call
-`activate_skill("bumi-squat-coach")` when the user chooses squat. Bind TTS
+`activate_skill("bumi-squat-coach")` when the user chooses an action. Bind TTS
 `speak` and connect its PCM output to Bumi `speaker`. The driver has no local
 skill loader. The model can call `status` and `reset`; the canvas owns `start`
 and `stop`.
@@ -358,9 +374,9 @@ playback still add delay, so this design is not frame-synchronous speech.
 For voice commands, connect Bumi `mic` to perception `asr`, then connect ASR's
 normal recognition output to `decision_core`. With ASR's `asr_kws` mode, say the
 configured wake word before commands such as “重新计数” or “现在做了几次”. The skill
-maps those commands to `squat_counter.reset` and `status`, then calls TTS
+maps those commands to `squat_counter.reset(exercise=...)` and `status`, then calls TTS
 `speak` for a spoken confirmation. Do not use ASR's background-speech output
-for control. The current skill supports voice reset and count queries.
+for control. The skill supports explicit action selection, voice reset, and count queries.
 When reset seems ineffective, first confirm that the normal ASR output contains
 the request, then look for a `squat_counter.reset` action and a new `session_id`
 in `status`. If no reset action appears, changing counting thresholds will not

@@ -35,6 +35,9 @@ def test_proxy_contract_and_action_forwarding():
     tool = card.get_tool()
     assert tool["type"] == "processor"
     assert {"begin", "next_set", "finish"} <= set(tool["inputSchema"]["properties"]["action"]["enum"])
+    assert tool["inputSchema"]["properties"]["exercise"]["enum"] == [
+        "squat", "dumbbell_curl", "lateral_raise"]
+    assert "exercise" in tool["inputSchema"]["x-action-params"]["begin"]["params"]
     assert tool["topic_in"][0]["format"] == "sensor/pose2d"
     assert [port["topic"] for port in tool["topic_out"]] == [
         "/q5_test/fitness/squat/events",
@@ -49,10 +52,11 @@ def test_proxy_contract_and_action_forwarding():
         recv=lambda: {"count_total": 2, "session_id": "active"},
     )
     assert card.dispatch("reset", {})["count_total"] == 2
-    assert card.dispatch("begin", {})["count_total"] == 2
+    assert card.dispatch("begin", {"exercise": "dumbbell_curl"})["count_total"] == 2
     assert card.dispatch("next_set", {})["count_total"] == 2
     assert card.dispatch("finish", {})["count_total"] == 2
-    assert requests == [("reset", {}), ("begin", {}), ("next_set", {}), ("finish", {})]
+    assert requests == [("reset", {}), ("begin", {"exercise": "dumbbell_curl"}),
+                        ("next_set", {}), ("finish", {})]
 
 
 def test_coach_tool_exposes_default_plan_to_decision_core():
