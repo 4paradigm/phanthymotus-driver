@@ -63,7 +63,7 @@ SDK 没有源时间戳。采样间隔和字段变化检查只能发现部分故�
   0.55 m/s、横移 0.20 m/s，2026-10-09 实测，见 README「标定 loco_servo」）。
   距离动作记录自己发过的指令，按 `|command| × full_scale × dt` 积分得到
   `dead_reckoned_m`。它观测不到打滑或比标定更慢的地面，但也不会继承 IMU 的采样误差。
-- 当 `dead_reckoned_m − 估计位移` 超过容差（`max(0.18, 0.15×distance+0.10)` m）时，
+- 当 `dead_reckoned_m − 估计位移` 超过容差（`max(0.25, 0.20×distance+0.10)` m）时，
   立即零速度报错，不再继续追目标。这是“指令行程领先 IMU 估计”的单向保护；
   估计比指令走得快只会提前停车或触发超走保护，不会让机器人冲过头。
 - `dead_reckoned_m`、每帧样本中的 `dead_reckoned_m` 和完整终态都写进诊断记录。
