@@ -18,7 +18,7 @@ cards:
   - { name: joints,            type: sensor }
   - { name: model,             type: resource }
   - { name: loco,              type: actuator }
-  - { name: loco_destination,  type: actuator }
+  - { name: loco_target,       type: actuator }
   - { name: loco_servo,        type: actuator }
   - { name: stand_up_lie_prone, type: actuator }
   - { name: semantic_action,   type: actuator }

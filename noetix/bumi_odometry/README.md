@@ -1,7 +1,7 @@
 # Bumi 独立 RGB-D＋机身 IMU 融合里程计
 
 实现提供 RTAB-Map `rgbd_odometry`、robot_localization EKF、只读 sensor
-`rgbd_imu_odometry`，以及 loco_destination 的连接选择。**代码与无硬件验证交付，
+`rgbd_imu_odometry`，以及 loco_target 的连接选择。**代码与无硬件验证交付，
 尚未构建 ARM64 镜像、运行真实 ROS 融合、部署或完成真机精度验收。**
 外参/IMU 约定/读时同步资格尚待标定；新卡默认 initializing，不允许以其反馈开始移动。
 纯 IMU 实验入口保留，不宣称一米 ±5cm 已达成。
@@ -18,7 +18,7 @@
    补丁基线为 phanthymotus main `6df601f612818716bb0dc7b180a9467e2c43172c`。
    本分支只交付补丁，没有改动其他平台工作区。应用前在独立平台分支执行
    `git apply --check`，通过后 `git apply`；版本不同必须解决适配后重跑平台测试。
-4. 在画布中添加 sensor 并连 `state/odom` 到 `loco_destination`。无连线用纯 IMU
+4. 在画布中添加 sensor 并连 `state/odom` 到 `loco_target`。无连线用纯 IMU
    实验；连线后未就绪同步拒绝动作。旋转沿用既有算法和 ACP、急停、底盘互斥，
    距离控制直接调用 SDK，不经 loco_servo。
 

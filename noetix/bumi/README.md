@@ -411,7 +411,10 @@ play-teach mode and confirms the return to walking.
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
 unexposed.
 
-### `loco_destination`
+### `loco_target`
+
+Renamed from `loco_destination`. Refresh tool metadata and recreate existing canvas
+cards using the new tool identifier; saved platform layouts are not migrated here.
 
 A motion card on the `loco` plugin: turn in place by the requested angle, or
 drive along the selected starting body axis for a requested distance — target as motion, not velocity ×
@@ -437,7 +440,7 @@ pulses at 0.5 to break it loose, while the brake sheds the inertia that
 would carry the robot past the target; the loop drives the turn to its ±2°
 arrival tolerance despite both. That is the closed-loop answer to `loco`'s
 open-loop `move`, where velocity × duration leaves the actual turn to
-ground slip and payload and reports nothing back: `loco_destination`
+ground slip and payload and reports nothing back: `loco_target`
 measures where the robot really turned instead.
 
 - Actions and parameters: `rotate angle_deg` and `move distance_m` each

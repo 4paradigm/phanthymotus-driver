@@ -10,7 +10,7 @@ graph=importlib.util.module_from_spec(spec);spec.loader.exec_module(graph)
 
 def layout():
     return {'cards':[{'id':'sensor','mcpId':'sensor-mcp','toolName':'rgbd_imu_odometry','topicOut':[{'topic':'/odometry','format':'state/odom'}]},
-                     {'id':'destination','mcpId':'bumi-mcp','toolName':'loco_destination'}],
+                     {'id':'destination','mcpId':'bumi-mcp','toolName':'loco_target'}],
             'connections':[{'id':'edge','fromCardId':'sensor','fromPortIdx':0,'toCardId':'destination','toPortIdx':0,'format':'state/odom'}]}
 
 
@@ -63,7 +63,7 @@ def test_backend_renewal_delivers_saved_connection_and_receives_ack(monkeypatch)
     monkeypatch.setattr(f,'_subscribe',lambda topic:None)
     cfg=ModuleType('config');cfg.main={'canvas_layout':layout_data,'core':{'project_running':True}}
     tc=ModuleType('tool_config')
-    tc.find_tool=lambda mcp,tool:({'inputSchema':{'x-feedback-binding':1}} if tool=='loco_destination'
+    tc.find_tool=lambda mcp,tool:({'inputSchema':{'x-feedback-binding':1}} if tool=='loco_target'
                                 else {'topic_out':[{'topic':'/odometry','format':'state/odom'}]})
     api=ModuleType('api');api.__path__=[];manage=ModuleType('api.mcp_manage')
     async def call(mcp,req,timeout_s):
@@ -87,7 +87,7 @@ def test_renewal_requires_exact_lease_and_stops_on_bad_ack(monkeypatch,bad_ack):
     from types import ModuleType,SimpleNamespace as NS
     calls=[]
     cfg=ModuleType('config');cfg.main={'canvas_layout':layout(),'core':{'project_running':True}}
-    tc=ModuleType('tool_config');tc.find_tool=lambda mcp,tool:({'inputSchema':{'x-feedback-binding':1}} if tool=='loco_destination' else {'topic_out':[{'topic':'/odometry','format':'state/odom'}]})
+    tc=ModuleType('tool_config');tc.find_tool=lambda mcp,tool:({'inputSchema':{'x-feedback-binding':1}} if tool=='loco_target' else {'topic_out':[{'topic':'/odometry','format':'state/odom'}]})
     api=ModuleType('api');api.__path__=[];manage=ModuleType('api.mcp_manage')
     async def call(mcp,req,timeout_s):
         calls.append(req.arguments['action'])

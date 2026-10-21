@@ -1,12 +1,12 @@
 # 纯 IMU 距离移动实验
 
-未连接融合 sensor 时，`loco_destination.move` 使用机身 IMU 积分估计位移，不依赖深度相机或融合进程。
+未连接融合 sensor 时，`loco_target.move` 使用机身 IMU 积分估计位移，不依赖深度相机或融合进程。
 实际精度未经验证，不承诺前进 1 米误差在 ±5 厘米以内。
 所有距离结果都是估计；停车后的零速度修正不会自动消除之前的位移误差。
 
 ## 部署与首次试验
 
-1. 部署 PR #408 本次提交对应的审核镜像。刷新或重新添加 `loco_destination` 卡片，
+1. 部署 PR #408 本次提交对应的审核镜像。刷新或重新添加 `loco_target` 卡片，
    确认未连接 `rgbd_imu_odometry`，结果来源为 `imu_integrated_experimental`。相机、语音及其他卡片使用原有接口。
    相机恢复为单个 pyrealsense2 采集进程；旧配置中的 `camera.fusion_enabled`
    已忽略，不会启动视觉融合，未连线距离移动独立读取机身 IMU。

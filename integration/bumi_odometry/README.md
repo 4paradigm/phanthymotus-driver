@@ -43,7 +43,7 @@ keeps it initializing. Its stop/reset/crash cannot stop the Bumi camera or audio
   Atomic `vendor` status is `initializing/tracking/lost`, with `segment_id`,
   `calibration_id`, publication time and matched visual-evidence time. The older
   motion-state gyro-only `state/odom` output is **not** a fusion source.
-- `loco_destination` declares one `state/odom` input and `x-feedback-binding: 1`.
+- `loco_target` declares one `state/odom` input and `x-feedback-binding: 1`.
   Platform bindings carry version, source/edge-derived revision, resolved flag,
   input topic, issued/expiry nanoseconds. Empty saved edges explicitly select
   IMU; unresolved/multiple/stale edges reject. Live source declaration must match

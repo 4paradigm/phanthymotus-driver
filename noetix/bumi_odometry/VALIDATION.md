@@ -1,3 +1,17 @@
+## Card rename follow-up
+
+Synced PR408 commit bf2272ba: the advertised card/tool identifier is now
+loco_target. Tool dispatch, asynchronous ACP identity, manifest and current
+user documentation use the new name. The control algorithms are unchanged.
+Saved graph fixtures also use loco_target; the binding issuer is capability-based
+and needs no platform patch change. Existing canvas cards must be recreated after
+refreshing tool metadata; saved platform layouts are not edited by this change.
+
+- PR408 motion/media/packaging/binding regressions: 581 passed, 1 skipped in 61.05s.
+- Combined PR425 fusion/packaging/deployment-policy regressions: 142 passed in 1.06s.
+- Shared runtime files checked identical to the renamed PR408 commit.
+- No image build, ROS launch, deployment or hardware validation was performed.
+
 ## Deployment fragment packaging follow-up
 
 Confirmed the driver deployer reads /deploy/service.yml from the image. The
