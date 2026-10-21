@@ -4,7 +4,7 @@
 
 公共服务负责草稿、试运行结果、效果确认、Skill 定义和两文件动作包。机器人适配器负责设备绑定、录制、预检、运动、停止和真实完成回执。页面通过 `motus.workbench/1` 返回 HTML，由 Core 工作台承载；不增加业务 Web 服务。
 
-TRON2 适配器显式声明 `presentation.passive_recording=true`。只有该分支允许直接调用 `record(args)`，隐藏“进入遥操”，并显示任务标签和训练导出。其他适配器继续使用原有 `record()`、遥操会话检查及试运行保存流程。
+TRON2 适配器显式声明 `presentation.passive_recording=true`。只有该分支允许直接调用 `record(args)`，隐藏“进入遥操”，并在开始录制时要求填写任务描述。训练数据入口位于试运行页的折叠区，打开后进入独立页面。四步主流程仍是设备检查、录制、试运行、保存。其他适配器继续使用原有 `record()`、遥操会话检查及试运行保存流程。
 
 - 保存 Skill 必须有成功试运行和 `effect_confirmed=true`。
 - 训练 episode 和 LeRobot 数据保存不经过 Skill 保存门禁。

@@ -20,19 +20,18 @@ details {font-size:12px;color:var(--muted)} summary {cursor:pointer;list-style:n
 footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 28px;border-top:1px solid var(--line);background:var(--card);z-index:2} footer .row {gap:10px} footer small {max-width:340px} .stop {background:transparent;color:#9b5143;border-color:#dfc4ba}.footer-buttons {display:flex;gap:10px}
 .confirm-overlay {position:fixed;inset:0;display:grid;place-items:center;padding:22px;background:#1c191755;z-index:3;backdrop-filter:blur(3px)}.confirm-box {width:440px;max-width:100%;background:var(--card);border-radius:10px;padding:25px;box-shadow:0 12px 40px #0002}.confirm-box h2 {margin-bottom:12px}.confirm-box p {font-size:13px;line-height:1.8}.confirm-box label {display:flex;align-items:start;gap:8px;margin:20px 0;font-size:13px}.confirm-box .row {justify-content:flex-end}
 @media(max-width:680px) {.shell {padding:18px 16px 125px}.layout {grid-template-columns:1fr;gap:16px}.steps li {font-size:11px}.steps b {display:grid;margin:0 auto 6px}.panel {padding:16px}.duration {font-size:36px} footer {padding:12px 16px;align-items:flex-end;gap:10px} footer>.row {display:block} footer small {display:block;font-size:11px;max-width:160px;margin-top:6px}.footer-buttons {flex-wrap:wrap;justify-content:flex-end}.check-row {grid-template-columns:1fr 1fr}}
+
+body[data-passive] .confirm-overlay {grid-template-columns:minmax(0,1fr);overflow:auto}
+body[data-passive] .confirm-box {min-width:0;max-height:calc(100vh - 44px);overflow:auto}
+body[data-passive] .confirm-box label.field {display:block;margin:0 0 14px}
+body[data-passive] .confirm-box .field input,body[data-passive] .confirm-box .field textarea {font-size:13px}
+body[data-passive] .confirm-box .field textarea {min-height:76px}
+body[data-passive] .confirm-box .error {margin:12px 0 0}
+#training .stack>*+* {margin-top:16px}
 </style></head><body>
 <main class="shell">
   <ol class="steps" aria-label="进度"><li class="current"><b>1</b>设备检查</li><li><b>2</b>录制</li><li><b>3</b>试运行</li><li><b>4</b>保存</li></ol>
   <div id="error" class="error" role="alert" hidden></div>
-  <section id="dataset-fields" class="panel" hidden style="margin-bottom:18px">
-    <h2>任务与训练数据</h2><details id="dataset-annotations" open style="margin:12px 0"><summary>任务、结果与备注</summary>
-    <label class="field"><span>任务描述</span><input id="dataset-task" maxlength="2000" placeholder="例如：把红色方块放入托盘"></label>
-    <label class="field"><span>结果标签</span><select id="dataset-outcome"><option value="unlabelled">未标注</option><option value="success">成功</option><option value="failure">失败</option></select></label>
-    <label class="field"><span>备注</span><textarea id="dataset-notes" maxlength="4000" style="min-height:48px"></textarea></label>
-    </details><div class="row"><button id="annotate-btn">保存标签</button><button id="training-export-btn">导出 LeRobot v3</button></div>
-    <p id="data-quality" class="note"></p><p id="training-export-state" class="note" role="status"></p>
-    <p class="note">训练数据不要求先回放。关节使用 rad，夹爪使用厂家无量纲开口值。图像时间为接收时间，不是曝光时间。</p>
-  </section>
   <div id="control-recovery" class="error" role="status" hidden></div>
   <section id="prepare" class="layout">
     <div class="panel"><div class="row between section-title"><h2>设备与前置条件</h2><span class="status"><i id="connection-dot" class="dot"></i><span id="connection">连接中</span></span></div><div id="checks"></div>
@@ -51,6 +50,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     <div><div class="record-summary"><span class="record-symbol" aria-hidden="true">◉</span><div><h3>当前录制</h3><small id="duration"></small></div></div>
       <div class="panel"><h2 id="review-title" class="section-title">试运行检查</h2><div class="check-row"><span>录制完整性</span><span id="clip-check" class="check-result">待检查</span></div><div class="check-row"><span>起点状态</span><span id="start-hint" class="check-result">待检查</span></div><div class="check-row"><span>物体布置与本次接管</span><span class="check-result">执行前确认</span></div><div class="trial-actions"><button id="inspect-btn">检查起点</button><button id="trial-btn" class="primary" disabled>开始试运行</button></div></div>
       <details id="motion-details" class="details-card"><summary>动作详情</summary><div class="chart"><div class="row between"><small>关节变化 · 相对起点</small><small id="cursor-time">0.00 s</small></div><svg id="plot" viewBox="0 0 620 210" role="img" aria-label="双臂目标关节相对起点的变化曲线"></svg><div class="legend"><span><i style="background:#C4673A"></i>左臂</span><span><i style="background:#78716C"></i>右臂</span><span>单位 °</span></div><input id="scrub" type="range" min="0" max="100" value="0" aria-label="浏览录制时间"></div><div id="frame-values" class="table-wrap"></div><div id="start-values" class="table-wrap"></div></details>
+      <details id="training-entry" class="details-card" hidden><summary><span>训练数据 · <span id="training-entry-state"></span></span></summary><p id="training-entry-hint" class="note"></p><div class="load"><button id="open-training-btn">打开训练数据 →</button></div></details>
       <button id="again-btn" class="link" style="font-size:12px;margin-top:12px">重新录制</button>
     </div><aside class="panel soft"><h3 id="trial-status" class="outcome" role="status">等待试运行</h3><p id="trial-help" class="note">先检查起点，再按录制速度运行。</p><div id="import-summary" hidden><h3 id="import-name"></h3><label id="import-auto-row" class="effect" hidden><input id="import-auto-execute" type="checkbox"><span>启用后允许自动执行</span></label><p id="import-auto-hint" class="note" hidden></p><p id="import-conditions" class="note"></p><p id="import-confirmation-hint" class="note">点击“开始试运行”即确认本次路径与活动空间畅通、其他控制已停止，并允许接管双臂。</p><p class="note">可关闭页面稍后验证。回到本卡的“录制技能”，展开“待验证动作”继续验证。</p></div><label id="effect-label" class="effect"><input id="effect" type="checkbox" disabled><span>已观察真机，动作效果符合预期</span></label></aside>
   </section>
@@ -58,26 +58,56 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     <div id="skill-form" class="layout"><div class="panel"><h2 class="section-title">保存为技能</h2><label class="field"><span>技能名称</span><input id="skill-name" maxlength="100" placeholder="例如：零件放入托盘"></label><label class="field" style="margin-bottom:0"><span>使用条件</span><textarea id="skill-conditions" maxlength="1000" placeholder="例如：零件和托盘位置固定，双臂已恢复录制起点。"></textarea></label></div><aside class="panel soft"><div class="aside-block"><h3 class="success">✓ 试运行与效果已确认</h3></div><div id="compatibility-panel" class="aside-block" hidden><h3>适用设备</h3><p id="compatibility-label"></p><p class="note">型号与完整动作会一起保存在动作包中。</p></div><div id="save-auto-row" class="aside-block" hidden><label class="effect"><input id="save-auto-execute" type="checkbox"><span>保存后允许自动执行</span></label><p id="save-auto-hint" class="note"></p></div><div class="aside-block"><h3>以后可以这样说</h3><span id="phrase-preview" class="phrase">填写技能名称</span><p class="note">保存后加入现有技能库。</p></div></aside></div>
     <div id="confirmation-result" class="panel saved" role="status" hidden><div class="saved-mark">✓</div><h2>技能已保存</h2><p id="saved-hint" class="muted"></p><span id="saved-phrase" class="phrase"></span><p class="note">可在现有技能列表中查看和管理。</p></div>
   </section>
+  <section id="training" hidden aria-labelledby="training-title">
+    <button id="training-back-top" class="link" style="font-size:13px;margin-bottom:12px">← 返回</button>
+    <div class="layout">
+      <div class="stack">
+        <div class="record-summary" style="margin-bottom:0"><span class="record-symbol" aria-hidden="true">◉</span><div><h3 id="training-title">训练数据</h3><small id="training-summary"></small></div></div>
+        <div class="panel"><h2 class="section-title">任务与结果</h2>
+          <label class="field"><span>任务描述</span><input id="dataset-task" maxlength="2000" placeholder="例如：把红色方块放入托盘"></label>
+          <label class="field"><span>结果标签</span><select id="dataset-outcome" style="display:block;width:100%;padding:11px 12px"><option value="unlabelled">未标注</option><option value="success">成功</option><option value="failure">失败</option></select></label>
+          <label class="field"><span>备注</span><textarea id="dataset-notes" maxlength="4000" style="min-height:60px" placeholder="例如：第二次抓取时方块滑落"></textarea></label>
+          <div class="row" style="flex-wrap:wrap"><button id="annotate-btn">保存标签</button><small id="annotate-state" role="status"></small></div>
+        </div>
+        <div class="panel"><h2 class="section-title">数据质量</h2><div id="quality-rows"></div>
+          <details class="details-card"><summary>时间与单位</summary><p class="note">关节为 rad；夹爪为厂家 0–100 无量纲开口，不换算毫米。图像时间是本机接收时间，不是曝光时间，不声称硬件同步。缺失或断流的数据保留为诊断，不自动删除。</p></details>
+        </div>
+      </div>
+      <aside class="panel soft">
+        <div class="aside-block"><h3>导出 LeRobot v3</h3><p>不要求先试运行，也不替代试运行。导出后用官方读取接口逐帧校验。</p></div>
+        <div class="aside-block"><h3 id="export-status" class="outcome" role="status">尚未导出</h3><p id="export-help" class="note"></p><div class="trial-actions"><button id="export-btn" class="primary">导出训练数据</button></div></div>
+        <details class="details-card"><summary>导出内容</summary><p class="note">状态与动作各 16 项：左臂 7、右臂 7、左夹爪、右夹爪。训练帧 10 Hz，动作取下一时刻实测状态。三路图像选最近过去帧，误差不超过 50 ms；关节缺口两侧拆成独立片段。已有导出目录不覆盖，失败目录保留。</p></details>
+      </aside>
+    </div>
+  </section>
       <details id="existing" class="details-card"><summary>使用已有录制</summary><div class="load"><select id="recordings" aria-label="选择已有录制"><option value="">选择完整录制…</option></select><button id="load-btn">载入</button></div></details>
       <details id="pending-drafts" class="details-card"><summary>待验证动作</summary><div class="load"><select id="drafts" aria-label="选择待验证动作"><option value="">暂无待验证动作</option></select><button id="open-draft-btn" disabled>继续验证</button></div></details>
-  <details id="episode-history" class="details-card" hidden><summary>全部录制与失败诊断</summary><div class="load"><select id="episodes" aria-label="选择诊断录制"></select><button id="episode-details-btn">查看数据质量</button></div><pre id="episode-details" class="technical"></pre></details>
+  <details id="episode-history" class="details-card" hidden><summary>全部录制与失败诊断</summary><div class="load"><select id="episodes" aria-label="选择诊断录制"></select><button id="episode-details-btn">查看数据质量</button></div></details>
   <p id="chat-hint" class="note" hidden></p>
 </main>
 <footer><div class="row"><button id="stop-btn" class="stop" disabled>■ 停止动作</button><small id="footer-hint">检查不会启动机器人动作。</small></div><div class="footer-buttons"><button id="back-btn" hidden>上一步</button><button id="check-btn" class="primary">检查设备</button><button id="next-btn" disabled>进入录制 →</button><button id="to-save-btn" class="primary" hidden disabled>下一步：保存 →</button><button id="import-enable-btn" class="primary" hidden disabled>效果符合预期，启用技能</button><button id="save-btn" class="primary" hidden disabled>保存技能</button></div></footer>
-<section id="confirm" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">确认本次接管</h2><p id="confirm-description"></p><details class="details-card"><summary>设备绑定</summary><p id="confirm-binding" class="note"></p></details><div id="gripper-replay-fields" hidden><label class="field">夹爪速度档位（0–100，不含 0）<input id="replay-gripper-speed" type="number" min="1" max="100"></label><label class="field">夹爪力档位（0–100）<input id="replay-gripper-force" type="number" min="0" max="100"></label></div><label><input type="checkbox" id="confirm-control"><span id="confirm-control-label">已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。</span></label><div class="row"><button id="confirm-cancel">取消</button><button id="confirm-go" class="primary" disabled>确认并执行</button></div></div></section>
+<section id="confirm" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">确认本次接管</h2><p id="confirm-description"></p><details class="details-card"><summary>设备绑定</summary><p id="confirm-binding" class="note"></p></details><div id="gripper-replay-fields" hidden style="margin-top:16px"><label class="field"><span>夹爪速度档位（1–100）</span><input id="replay-gripper-speed" type="number" min="1" max="100" step="1" inputmode="numeric" placeholder="必填，例如 50"></label><label class="field"><span>夹爪力档位（0–100）</span><input id="replay-gripper-force" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="必填，例如 30"></label></div><label><input type="checkbox" id="confirm-control"><span id="confirm-control-label">已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。</span></label><div id="confirm-error" class="error" role="alert" hidden></div><div class="row"><button id="confirm-cancel">取消</button><button id="confirm-go" class="primary" disabled>确认并执行</button></div></div></section>
+<!-- TRON2 新增：录制前任务描述（同确认框风格），不推挤录制页布局 -->
+<section id="record-start" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="record-start-title"><h2 id="record-start-title">开始只读录制</h2><p>录制只读取双臂关节、双夹爪和三路图像，不接管控制，也不进入或退出原厂 VR。</p><label class="field" style="margin-top:16px"><span>任务描述（必填）</span><textarea id="record-task" maxlength="2000" placeholder="例如：把红色方块放入托盘"></textarea></label><div id="record-task-error" class="error" role="alert" hidden>请填写任务描述，最多 2000 字。</div><div class="row" style="margin-top:16px"><button id="record-start-cancel">取消</button><button id="record-start-go" class="primary">开始录制</button></div></div></section>
+
 <script>
 (() => {
   const $ = id => document.getElementById(id);
   let port, serial=0, pending=new Map(), status={}, draft={}, stage=0, busy=false, online=false, initialized=false;
   let preview, plotData, plottedId, inspection, checks, checkedAt=0, installed=false, approvedTrial, refreshVersion=0;
   let inspectedImport, autoExecuteChoice=null;
+  let training=null, dialogFocus;
+
   const errors={operator_exclusive_confirmation_required:'请确认原厂 VR 和其他控制程序已停止，并保持回放期间独占。',task_required_max_2000:'请填写任务描述，最多 2000 字。',trajectory_time_gap:'录制存在超过 100 ms 的关节缺口，禁止连续回放。训练导出会排除缺口。',trajectory_speed_limit:'录制速度超过 0.8 rad/s，禁止回放；不会自动减速。',exclusive_control_unverified:'尚未确认原厂 VR 已退出及控制独占，禁止回放。',complete_three_camera_gripper_episode_required:'三路图像或双夹爪数据不齐全，不能导出完整训练数据。',export_destination_exists:'此录制已有导出目录，已保留原结果。',replay_start_mismatch_no_automatic_return:'起点不匹配，请手动恢复双臂与夹爪后重试。',robot_busy_wait_for_completion:'请等待当前动作结束。',successful_trial_required:'请先完成试运行。',complete_recording_required:'尚无完整录制，请结束录制或重新录制。',paired_preview_required:'确认已失效，请重新预览。',teaching_draft_changed_reload:'草稿已在其他页面更改，请重新操作。',teaching_preview_expired:'预览已失效，请重新检查并确认。',live_mapped_teleop_required:'请确认 VR 输入有效，并松握、长按 X+A 建立基准。',live_mapped_teleop_input_required:'请等待有效 VR 输入，并松开双手握键完成映射。',input_timeout_restart_required:'未收到 VR 输入，请检查头显后重新进入遥操。',input_stale_restart_required:'VR 输入已中断，请检查头显后重新进入遥操。',tracking_lost_restart_required:'跟踪已丢失，请恢复跟踪后重新进入遥操。'};
   const readable = value => errors[value] || value;
   const presentation = () => status.presentation || {};
   const groups = () => presentation().joint_groups || [];
   const canTrial = () => inspection && (inspection.start.can_trial ?? inspection.start.ready);
   function jointLabel(index) {for(const group of groups()){if(index<group.count)return `${group.label} J${index+1} / °`;index-=group.count;}return '关节';}
-  function fail(error) { $('error').textContent=readable(error.message);$('error').hidden=false; }
+  function fail(error) {
+    const id=presentation().passive_recording && !$('confirm').hidden?'confirm-error':!$('record-start').hidden?'record-task-error':'error';
+    $(id).textContent=readable(error.message);$(id).hidden=false;
+  }
   function request(method,args) {
     if(!port) return Promise.reject(new Error('连接尚未建立'));
     const id=String(++serial);
@@ -116,8 +146,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   function table(container,headers,rows) {const table=document.createElement('table');[headers,...rows].forEach((values,i)=>{const tr=document.createElement('tr');values.forEach(v=>{const el=document.createElement(i?'td':'th');el.textContent=v;tr.append(el);});table.append(tr);});container.replaceChildren(table);}
   function plot(recording) {
     plotData=recording.preview || [];plottedId=draft.id;
-    if(presentation().passive_recording){$('dataset-annotations').open=false;for(const key of ['task','notes','outcome'])$('dataset-'+key).value=recording[key] || (key==='outcome'?'unlabelled':'');}
-    $('duration').textContent=`${recording.duration_seconds.toFixed(2)} 秒 · ${presentation().recording_label || '动作录制'}`;
+    $('duration').textContent=`${recording.duration_seconds.toFixed(2)} 秒 · ${presentation().recording_label || '动作录制'}${presentation().passive_recording && recording.task?' · '+recording.task:''}`;
     const svg=$('plot');svg.replaceChildren();
     const add=(tag,attrs)=>{const el=document.createElementNS('http://www.w3.org/2000/svg',tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));svg.append(el);return el;};
     [35,105,175].forEach(y=>add('line',{x1:35,y1:y,x2:607,y2:y,stroke:'#ded7ca','stroke-dasharray':'4 5'}));
@@ -154,6 +183,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('control-recovery').hidden=!recovery;
     $('control-recovery').textContent=recovery ? `${recovery.hint}${recovery.sdk_code != null ? ' SDK '+recovery.sdk_code : ''}` : '';
     const passive=!!presentation().passive_recording;
+    document.body.toggleAttribute('data-passive',passive);
     const canPrepare=status.can_prepare ?? !moving,external=passive || presentation().session_start==='controller';
     $('next-hint').textContent=presentation().next_hint || '';
     $('trial-hint').textContent=presentation().trial_hint || '';
@@ -212,34 +242,47 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('skill-form').hidden=installed;$('confirmation-result').hidden=!installed;
     for(const key of ['name','conditions'])$('skill-'+key).readOnly=!!status.saved;
     $('footer-hint').textContent=installed?'已加入本机技能库':moving?'请留意机器人，必要时停止动作。':['检查不会启动机器人动作。','结束录制后进入试运行。','按录制速度执行。','保存后沿用现有技能调用流程。'][stage];
-    if(passive){document.querySelectorAll('.steps li')[2].lastChild.textContent='检查数据';document.querySelectorAll('.steps li')[3].lastChild.textContent='保存技能';}
-    $('dataset-fields').hidden=!passive || imported || ![1,2].includes(stage);
-    $('episode-history').hidden=!passive;
+    $('training-entry').hidden=!passive || imported || !clip;
+    $('training-entry-state').textContent=draft.recording?.training_complete?'三路图像与双夹爪齐全':'数据不齐全';
+    $('training-entry-hint').textContent='查看任务、结果与数据质量；训练导出不要求先试运行。';
+    $('open-training-btn').disabled=locked || moving;
+    $('episode-history').hidden=!passive || moving;
+    $('episode-details-btn').disabled=locked || moving || !$('episodes').value;
     $('tracking-check').hidden=passive;
-    $('annotate-btn').hidden=!clip;
-    $('annotate-btn').disabled=locked || moving;
-    $('training-export-btn').hidden=!clip;
-    $('training-export-btn').disabled=locked || moving || !draft.recording?.training_complete || status.training_export?.state==='running';
     if(passive){
       $('import-confirmation-hint').textContent='点击“开始试运行”后，填写夹爪参数，并在弹窗确认原厂 VR 已退出及本次控制独占。';
-      if(stage===1 && !rec.recording)$('dataset-annotations').open=true;
       $('record-instruction').textContent='使用原厂 VR 示范。录制只读取数据，不接管控制。';
-      $('after-record-title').textContent='下一步：检查数据';
-      $('review-title').textContent='数据与回放检查';
       $('motion-state').textContent=rec.error?'录制失败，数据已保留':rec.recording?'正在只读录制':'准备只读录制';
       $('finish-btn').textContent=rec.error?'结束并保留诊断':'结束录制';
       $('input-state').textContent='原厂 VR 控制';$('mapping-state').textContent='录制器无控制权';
-      $('teleop-hint').textContent=rec.error || '停止录制只停止写文件，不停止原厂 VR 或机器人。';
+      $('teleop-hint').textContent=readable(rec.error) || '停止录制只停止写文件，不停止原厂 VR 或机器人。';
       $('stop-btn').textContent=rec.recording?'■ 停止录制':'■ 停止回放发送';
-      $('stop-btn').disabled=locked && !rec.recording || (!rec.recording && !moving);
+      $('stop-btn').disabled=online && !rec.recording && !moving && !busy;
       $('footer-hint').textContent='停止录制不停止机器人；停止发送不等于物理停止。';
-      $('data-quality').textContent=clip?(draft.recording.training_complete?'三路图像和夹爪齐全，可导出训练数据。':'数据不齐全；保留诊断，禁止导出完整训练数据。'):'缺失图像或夹爪时，仅保留诊断数据。';
-      const job=status.training_export;
-      $('training-export-state').textContent=!job?'':job.state==='running'?'正在导出并用官方加载器验证…':job.state==='error'?'导出失败：'+job.error:`已导出 ${job.frames} 帧，${job.episodes} 个片段；排除 ${job.excluded} 个采样点。设备内目录：${job.path}。已通过官方读取，尚未训练策略。`;
+      $('record-start-go').disabled=locked || moving || !status.can_record;
+      $('record-start-cancel').disabled=busy;
+    }
+    $('training').hidden=!training;
+    $('back-btn').textContent='上一步';
+    if(training){
+      for(const id of ['prepare','record','review','save','existing','pending-drafts','episode-history','chat-hint'])$(id).hidden=true;
+      for(const id of ['check-btn','next-btn','to-save-btn','save-btn','import-enable-btn'])$(id).hidden=true;
+      document.querySelector('.steps').hidden=true;
+      $('back-btn').hidden=false;$('back-btn').textContent=stage===2?'← 返回试运行':stage===1?'← 返回录制':'← 返回设备检查';
+      $('training-back-top').textContent=$('back-btn').textContent;
+      $('training-back-top').disabled=busy;
+      const episode=training.episode,job=status.training_export?.episode_id===training.id?status.training_export:null;
+      const exporting=status.training_export?.state==='running';
+      $('annotate-btn').disabled=locked || moving || exporting || !episode.complete;
+      for(const key of ['task','outcome','notes'])$('dataset-'+key).disabled=locked || moving || exporting || !episode.complete;
+      $('export-btn').disabled=locked || moving || exporting || !episode.training_complete || !!job;
+      $('export-status').textContent=!job?'尚未导出':job.state==='running'?'正在导出…':job.state==='completed'?'✓ 已导出':'导出失败';
+      $('export-status').classList.toggle('success',job?.state==='completed');
+      $('export-help').textContent=!job?(episode.training_complete?'可直接导出，无需先试运行。':'数据不齐全，保留诊断，禁止导出完整训练数据。'):job.state==='running'?'正在导出并用官方读取接口验证…':job.state==='error'?`导出失败：${readable(job.error)}。已有目录保留，不覆盖。`:`已导出 ${job.frames} 帧、${job.episodes} 个片段，排除 ${job.excluded} 个采样点。设备内目录：${job.path}。${job.official_reader_verified?'已通过官方读取；尚未训练策略。':''}`;
     }
 
   }
-  function reset(next) {draft=next;autoExecuteChoice=null;installed=false;preview=null;plottedId=null;plotData=null;inspection=null;inspectedImport=null;checks=null;checkedAt=0;approvedTrial=null;$('effect').checked=false;$('confirm').hidden=true;$('motion-details').open=false;$('start-values').replaceChildren();}
+  function reset(next) {training=null;$('record-start').hidden=true;draft=next;autoExecuteChoice=null;installed=false;preview=null;plottedId=null;plotData=null;inspection=null;inspectedImport=null;checks=null;checkedAt=0;approvedTrial=null;$('effect').checked=false;$('confirm').hidden=true;$('motion-details').open=false;$('start-values').replaceChildren();}
   async function refresh() {
     const version=++refreshVersion;
     try {
@@ -249,7 +292,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
       if(changed)reset(status.draft || {});
       draft=status.draft || {};
       if(!initialized || changed){
-        stage=draft.recording?2:draft.teleop_id?1:0;initialized=true;
+        stage=draft.recording?2:draft.teleop_id || (presentation().passive_recording && (status.recording?.recording || status.recording?.error))?1:0;initialized=true;
         if(draft.imported){for(const key of ['name','conditions'])$('skill-'+key).value=draft.imported.metadata[key] || '';updatePhrase();}
       }
       if(draft.recording && stage===1)stage=2;
@@ -279,6 +322,7 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('confirm-description').textContent=preview.description || (action==='begin'?'准备进入双臂 VR 遥操。':`按录制速度试运行 ${preview.duration_seconds?.toFixed(2) || ''} 秒，请先恢复物体布置。`);
     $('confirm-binding').textContent=preview.binding_label || `左臂 ${preview.binding?.arms?.left || ''} · 右臂 ${preview.binding?.arms?.right || ''} · 标定 ${preview.binding?.calibration_id || ''}`;
     $('gripper-replay-fields').hidden=!presentation().passive_recording;
+    if(presentation().passive_recording){$('replay-gripper-speed').value='';$('replay-gripper-force').value='';$('confirm-error').hidden=true;dialogFocus=document.activeElement;}
     $('confirm-control-label').textContent=presentation().passive_recording?'已核对起点、物体和活动空间；原厂 VR 与其他控制程序已停止，我确认并保持本次回放期间控制独占。':'已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。';
     if(presentation().passive_recording)$('confirm-binding').textContent=`设备 ${preview.binding?.serial || ''} · 型号 ${preview.binding?.model || ''}`;
     $('confirm-control').checked=false;$('confirm-go').disabled=true;$('confirm').hidden=false;$('confirm-control').focus();
@@ -290,10 +334,46 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
       ...result.drafts.map(d=>new Option(d.name,d.id)));
     $('drafts').value=old;render();
   }
-  function datasetFields(){return {task:$('dataset-task').value.trim(),outcome:$('dataset-outcome').value,notes:$('dataset-notes').value};}
-  $('annotate-btn').onclick=()=>act(()=>call('annotate',{episode_id:draft.recording.filename,...datasetFields()}));
-  $('training-export-btn').onclick=()=>act(()=>call('training_export',{episode_id:draft.recording.filename}));
-  $('episode-details-btn').onclick=()=>act(async()=>{const r=await call('episode_details',{episode_id:$('episodes').value});$('episode-details').textContent=JSON.stringify({complete:r.episode.complete,training_complete:r.episode.training_complete,error:r.episode.error,quality:r.episode.quality},null,2);});
+  async function openTraining(id) {
+    if(!id)throw new Error('请选择录制');
+    const result=await call('episode_details',{episode_id:id});
+    training={id,episode:result.episode};
+    const episode=result.episode,quality=episode.quality || {},counts=quality.counts || {};
+    for(const key of ['task','outcome','notes'])$('dataset-'+key).value=episode[key] || (key==='outcome'?'unlabelled':'');
+    $('annotate-state').textContent='';
+    $('training-summary').textContent=`${id} · ${episode.complete?'录制完整':'录制未完成，已保留'}`;
+    const rows=[['关节采样',counts.state>=2,`${counts.state || 0} 帧`],
+      ...[['head','头部 RGB'],['left_wrist','左腕 RGB'],['right_wrist','右腕 RGB']].map(([key,label])=>[label,counts[key]>=2,`${counts[key] || 0} 帧`]),
+      ['双夹爪',counts.state>=2 && quality.gripper_samples===counts.state,`${quality.gripper_samples || 0} / ${counts.state || 0} 帧`],
+      ['关节缺口',quality.state_gaps_over_100ms===0,`${quality.state_gaps_over_100ms ?? '未知'} 处超过 100 ms；导出时分段`]];
+    if(episode.error)rows.push(['录制结果',false,readable(episode.error)]);
+    $('quality-rows').replaceChildren();
+    for(const [label,ok,note] of rows){
+      const row=document.createElement('div');row.className='check-row';
+      const name=document.createElement('span');name.textContent=label;
+      const value=document.createElement('span');value.className='check-result '+(ok?'ok':'fail');value.textContent=(ok?'✓ ':'! ')+note;
+      row.append(name,value);$('quality-rows').append(row);
+    }
+    render();window.scrollTo(0,0);
+  }
+  function closeTraining(){training=null;$('error').hidden=true;render();window.scrollTo(0,0);}
+  $('training-back-top').onclick=closeTraining;
+  $('open-training-btn').onclick=()=>act(()=>openTraining(draft.recording?.filename));
+  $('episode-details-btn').onclick=()=>act(()=>openTraining($('episodes').value));
+  $('episodes').onchange=render;
+  $('annotate-btn').onclick=()=>act(async()=>{
+    const task=$('dataset-task').value.trim();if(!task)throw new Error('task_required_max_2000');
+    const result=await call('annotate',{episode_id:training.id,task,outcome:$('dataset-outcome').value,notes:$('dataset-notes').value});
+    training.episode=result.episode;$('annotate-state').textContent='标签已保存';
+  });
+  $('export-btn').onclick=()=>act(async()=>{const result=await call('training_export',{episode_id:training.id});status.training_export=result.export;});
+  function closeRecordDialog(){$('record-start').hidden=true;dialogFocus?.focus();}
+  $('record-start-cancel').onclick=closeRecordDialog;
+  $('record-start-go').onclick=()=>{
+    const task=$('record-task').value.trim();
+    if(!task || task.length>2000){$('record-task-error').textContent='请填写任务描述，最多 2000 字。';$('record-task-error').hidden=false;$('record-task').focus();return;}
+    act(async()=>{await call('record',{draft_id:draft.id,task});closeRecordDialog();});
+  };
   $('pending-drafts').ontoggle=()=>{if($('pending-drafts').open)refreshDrafts().catch(fail);};
   $('drafts').onchange=render;
   $('open-draft-btn').onclick=()=>act(async()=>{
@@ -304,8 +384,11 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
   $('check-btn').onclick=()=>act(runChecks);
   $('next-btn').onclick=()=>act(async()=>{if(!await runChecks())return;if(!draft.id)reset(await call('new'));setStage(1);});
   $('begin-btn').onclick=()=>act(async()=>{if(!await runChecks()){setStage(0);return;}if(!draft.id)reset(await call('new'));await preflight('begin');});
-  $('record-btn').onclick=()=>act(()=>call('record',{draft_id:draft.id,...(presentation().passive_recording?datasetFields():{})}));
-  $('finish-btn').onclick=()=>act(async()=>{const result=await call('finish',{draft_id:draft.id});if(!result.complete)throw new Error(result.error || '录制尚未完整落盘，请重试结束。');await refresh();setStage(2);await inspect();});
+  $('record-btn').onclick=()=>{
+    if(!presentation().passive_recording){act(()=>call('record',{draft_id:draft.id}));return;}
+    dialogFocus=document.activeElement;$('record-task-error').hidden=true;$('record-start').hidden=false;$('record-task').focus();
+  };
+  $('finish-btn').onclick=()=>act(async()=>{const result=await call('finish',{draft_id:draft.id});if(!result.complete){if(presentation().passive_recording && result.filename){await openTraining(result.filename);return;}throw new Error(result.error || '录制尚未完整落盘，请重试结束。');}await refresh();setStage(2);await inspect();});
   $('load-btn').onclick=()=>act(async()=>{if(!$('recordings').value)throw new Error('请选择完整录制');reset(await call('new',{filename:$('recordings').value}));setStage(2);await inspect();});
   $('inspect-btn').onclick=()=>act(inspect);
   $('trial-btn').onclick=()=>act(async()=>{
@@ -324,13 +407,25 @@ footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;j
     $('saved-phrase').textContent=`“${draft.imported.metadata.name}”`;
   });
   $('again-btn').onclick=()=>act(async()=>{reset(await call('new'));setStage(0);showChecks();});
-  $('back-btn').onclick=()=>{setStage(stage===3?2:0);if(stage===0)showChecks();};
+  $('back-btn').onclick=()=>{if(training){closeTraining();return;}setStage(stage===3?2:0);if(stage===0)showChecks();};
   $('effect').onchange=()=>{approvedTrial=$('effect').checked?draft.trial?.action_id:null;render();};
   $('to-save-btn').onclick=()=>setStage(3);$('scrub').oninput=scrub;
   $('confirm-control').onchange=()=>{$('confirm-go').disabled=!$('confirm-control').checked;};
-  $('confirm-cancel').onclick=()=>{preview=null;$('confirm').hidden=true;};
-  $('confirm-go').onclick=()=>act(async()=>{if(!preview || Date.now()-preview.created>60000)throw new Error('预览已过期，请取消后重试。');if(presentation().passive_recording && ['replay-gripper-speed','replay-gripper-force'].some(id=>$(id).value==='' || !$(id).checkValidity()))throw new Error('请填写有效的夹爪速度和力档位。');const p=preview;preview=null;$('confirm').hidden=true;await call(p.action,{draft_id:draft.id,execute:true,preview_id:p.preview_id,workspace_clear:true,take_control:true,...(presentation().passive_recording?{exclusive_control_confirmed:true,gripper_speed:Number($('replay-gripper-speed').value),gripper_force:Number($('replay-gripper-force').value)}:{})});if(p.action==='trial' && inspection)inspection.start={ready:false,can_trial:false,error:'再次试运行前需复查'};});
+  $('confirm-cancel').onclick=()=>{preview=null;$('confirm').hidden=true;if(presentation().passive_recording)dialogFocus?.focus();};
+  $('confirm-go').onclick=()=>act(async()=>{if(!$('confirm-control').checked)throw new Error('请确认本次接管');if(!preview || Date.now()-preview.created>60000)throw new Error('预览已过期，请取消后重试。');if(presentation().passive_recording && ['replay-gripper-speed','replay-gripper-force'].some(id=>$(id).value==='' || !$(id).checkValidity()))throw new Error('请填写有效的夹爪速度和力档位。');const p=preview;preview=null;$('confirm').hidden=true;await call(p.action,{draft_id:draft.id,execute:true,preview_id:p.preview_id,workspace_clear:true,take_control:true,...(presentation().passive_recording?{exclusive_control_confirmed:true,gripper_speed:Number($('replay-gripper-speed').value),gripper_force:Number($('replay-gripper-force').value)}:{})});if(p.action==='trial' && inspection)inspection.start={ready:false,can_trial:false,error:'再次试运行前需复查'};});
   $('stop-btn').onclick=async()=>{preview=null;$('confirm').hidden=true;try{await call('stop');await refresh();}catch(error){fail(error);}};
+  document.addEventListener('keydown',event=>{
+    if(!presentation().passive_recording)return;
+    const dialog=!$('record-start').hidden?$('record-start'):!$('confirm').hidden?$('confirm'):null;
+    if(!dialog)return;
+    if(event.key==='Escape' && !busy){event.preventDefault();$(dialog.id==='confirm'?'confirm-cancel':'record-start-cancel').click();}
+    if(event.key==='Tab'){
+      const items=[...dialog.querySelectorAll('button,input,textarea,summary')].filter(el=>!el.disabled && el.getClientRects().length);
+      const first=items[0],last=items.at(-1);
+      if(event.shiftKey && document.activeElement===first){event.preventDefault();last.focus();}
+      else if(!event.shiftKey && document.activeElement===last){event.preventDefault();first.focus();}
+    }
+  });
   function updatePhrase() {$('phrase-preview').textContent=$('skill-name').value.trim()?`“${$('skill-name').value.trim()}”`:'填写技能名称';}
   $('skill-name').oninput=updatePhrase;
   $('save-btn').onclick=()=>act(async()=>{const args={draft_id:draft.id,effect_confirmed:$('effect').checked,...automaticArgs()};for(const key of ['name','conditions']){args[key]=$('skill-'+key).value.trim();if(!args[key])throw new Error('请填写技能名称和使用条件。');}const result=await request('save',args);installed=true;showContext(result.context);$('saved-hint').textContent=result.context?.conversation_ready?'现在可以在对话里说：':'连接执行卡后，即可在对话里说：';$('saved-phrase').textContent=`“${args.name}”`;});
