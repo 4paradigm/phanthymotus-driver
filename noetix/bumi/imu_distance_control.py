@@ -183,6 +183,8 @@ def run_distance(owner, distance_m, direction=''):
             moved = x*c+y*s
             speed = estimator.velocity[0]*c+estimator.velocity[1]*s
             yaw_error = angle_delta(origin_yaw, estimator.yaw)
+            if moved < -0.05:
+                raise ValueError('IMU estimated progress is opposite to requested direction by more than 0.05 m')
             if (abs(-x*s+y*c) > 0.15 or abs(yaw_error) > math.radians(20)
                     or math.hypot(*estimator.velocity) > 1.2):
                 raise ValueError('IMU estimated motion exceeds direction or speed limits')

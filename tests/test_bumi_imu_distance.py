@@ -189,6 +189,28 @@ def test_acceleration_limit_during_motion_brakes_and_retains_rejected_sample(mon
     assert trace['result']['state'] == 'error'
 
 
+@pytest.mark.parametrize('direction', ['forward', 'backward', 'left', 'right'])
+def test_estimated_reverse_progress_aborts_instead_of_continuing_command(monkeypatch, direction):
+    plant = Plant(monkeypatch)
+    _, x, y = module.movement_direction(direction)
+    def reversed_feedback():
+        plant.samples += 1
+        acceleration = -1 if plant.command else 0
+        return imu(acc=(acceleration*x, acceleration*y, 9.81+1e-7*math.sin(plant.samples)))
+    monkeypatch.setattr(plant, '_read_distance_imu', reversed_feedback)
+    # This fake checks commands and the estimator only, not physical accuracy.
+    def publish(vx, vyaw=0, *, vy=0):
+        plant.command = abs(vx)+abs(vy)
+        plant.commands.append((plant.clock, vx, vy, vyaw))
+    monkeypatch.setattr(plant, '_distance_publish', publish)
+    result = module.run_distance(plant, 0.5, direction)
+    assert result['state'] == 'error'
+    assert 'opposite to requested direction' in result['error']
+    assert result['estimated_distance_m'] < -0.05
+    assert plant.clock < 3
+    assert plant.commands[-1][1:] == (0, 0, 0)
+
+
 def test_cancel_during_calibration_never_starts_motion(monkeypatch):
     plant = Plant(monkeypatch)
     plant._rotate_stop_event.set()
