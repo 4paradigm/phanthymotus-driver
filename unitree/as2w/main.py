@@ -124,9 +124,25 @@ class Bundle:
         from slam_mapping import SlamMappingPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
+        loco_plugin = None
+        special_motion_plugin = None
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
-        if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_motion", {}).get("enabled", True): self.plugins.append(SpecialMotionPlugin(p.get("special_motion", {}), namespace, executor, proxy))
+        if p.get("loco", {}).get("enabled", True):
+            loco_plugin = LocoPlugin(p.get("loco", {}), namespace, executor, proxy)
+            self.plugins.append(loco_plugin)
+        if p.get("special_motion", {}).get("enabled", True):
+            special_motion_plugin = SpecialMotionPlugin(
+                p.get("special_motion", {}), namespace, executor, proxy)
+            self.plugins.append(special_motion_plugin)
+        if p.get("loco_servo", {}).get("enabled", False):
+            from loco_servo import LocoServoPlugin
+            loco_servo_plugin = LocoServoPlugin(
+                p.get("loco_servo", {}), namespace, executor, proxy,
+                loco_plugin=loco_plugin,
+                special_motion_plugin=special_motion_plugin)
+            self.plugins.append(loco_servo_plugin)
+            if special_motion_plugin is not None:
+                special_motion_plugin.attach_servo(loco_servo_plugin)
         if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
         if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
