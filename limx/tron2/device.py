@@ -17,7 +17,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.9.5'
+VERSION = '0.11.0'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -46,7 +46,7 @@ class Adapter:
         self.publish = publish
         self.settings = settings
         self.enabled = settings['enabled_cards']
-        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES))):
+        if set(self.enabled) - (set(TOPICS) | set(CAMERA_SOURCES) | ({'arm_control', 'move_head', 'gripper', 'pose', 'tron2_teaching'} | set(GRIPPER_SIDES))):
             raise ValueError('Unknown TRON2 card in configuration')
         self.reader = reader or RobotReader(settings)
         self.registered_id = None
@@ -71,6 +71,10 @@ class Adapter:
                                           publish, session, topic=source[0])
                         for name, source in CAMERA_SOURCES.items()}
         self.camera = self.cameras['camera']
+        self.teaching = None
+        if 'tron2_teaching' in self.enabled:
+            from teaching import TronTeachingAdapter, TronTeachingPlugin
+            self.teaching = TronTeachingPlugin(TronTeachingAdapter(self, asyncio.get_running_loop(), settings['teaching_directory']))
 
     async def report_completion(self, action_id, status, result):
         return await self._report_completion(result.get('motion_tool','arm_control'), action_id, status, result)
@@ -144,6 +148,8 @@ class Adapter:
 
     def tools(self):
         tools = []
+        if self.teaching is not None:
+            tools.extend(self.teaching.get_tools())
         if 'arm_control' in self.enabled:
             tools.append(self._arm_control_tool())
         if 'pose' in self.enabled:
@@ -166,7 +172,7 @@ class Adapter:
                                    **metadata_properties()}},
                 'topic_out': [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}]})
         for name in self.enabled:
-            if name in ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
+            if name in ({'arm_control', 'move_head', 'gripper', 'pose', 'tron2_teaching'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -335,6 +341,8 @@ class Adapter:
             await asyncio.sleep(self.settings['poll_interval_seconds'])
 
     async def rpc(self, request):
+        if request.content_length is not None and request.content_length > 16 * 1024:
+            raise web.HTTPRequestEntityTooLarge(max_size=16*1024, actual_size=request.content_length)
         try:
             body = await request.json()
         except (ValueError, UnicodeError):
@@ -361,7 +369,13 @@ class Adapter:
                 result = {}
             elif method == 'tools/call':
                 try:
-                    data = self.call(params.get('name'), params.get('arguments', {}))
+                    if params.get('name') == 'tron2_teaching' and self.teaching is not None:
+                        args = params.get('arguments', {})
+                        if not isinstance(args, dict):
+                            raise ValueError('Teaching arguments must be an object')
+                        data = await asyncio.to_thread(self.teaching.dispatch, args.get('action','info'), args)
+                    else:
+                        data = self.call(params.get('name'), params.get('arguments', {}))
                     if params.get('name') in CAMERA_SOURCES:
                         data = await self.cameras[params['name']].call(params.get('arguments', {}).get('action', 'info'))
                     if params.get('name') == 'arm_control' and data.get('action') in ('move', 'reset'):
@@ -392,9 +406,9 @@ class Adapter:
                         elif action in MOTION_ACTIONS:
                             data = await owner.dispatch(action, params['arguments'])
                     error = False
-                except (ValueError, TypeError) as exc:
+                except (ValueError, TypeError, OSError, RuntimeError) as exc:
                     data, error = {'error': str(exc)[:240],
-                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)) or
+                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'arm_control', 'move_head', 'gripper', 'pose', 'tron2_teaching'} | set(GRIPPER_SIDES)) or
                             params.get('name') in GRIPPER_SIDES and params.get('arguments', {}).get('action') not in MOTION_ACTIONS,
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
                     if params.get('name') == 'gripper' and 'gripper' in self.enabled:
@@ -418,6 +432,14 @@ class Adapter:
         except (ValueError, TypeError) as exc:
             return web.json_response({'jsonrpc': '2.0', 'id': rid,
                 'error': {'code': -32602, 'message': str(exc)[:240]}})
+
+    async def teaching_upload(self, request):
+        from common.file_intake import access_token, handle_upload
+        body = await request.read()
+        status, payload = await asyncio.to_thread(handle_upload, request.headers, body,
+            str(self.teaching.adapter.root/'uploads'), access_token(), request.headers.get('X-Access-Token'),
+            16*1024*1024, 0)
+        return web.json_response(payload, status=status)
 
     async def health(self, request):
         samples = self.snapshot()

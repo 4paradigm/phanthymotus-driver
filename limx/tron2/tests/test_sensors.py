@@ -899,7 +899,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right', 'tron2_teaching'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')

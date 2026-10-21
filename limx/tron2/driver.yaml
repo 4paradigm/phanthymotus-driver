@@ -10,6 +10,7 @@ description: "TRON2 三路RGB相机、实时骨架、双臂移动与自然垂下
 build_context_extras:
   - ../../common
 cards:
+  - {name: tron2_teaching, type: actuator}
   - {name: joint_state, type: sensor}
   - {name: camera, type: sensor}
   - {name: camera_left, type: sensor}
