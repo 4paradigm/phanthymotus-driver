@@ -1,3 +1,17 @@
+## IMU fault diagnosis follow-up
+
+Synced PR408's diagnostic-only IMU limit change: quaternion norm failures and
+acceleration norm failures now report the rejected quantity and value separately.
+The existing limits and brake behavior are unchanged. This is not a distance
+accuracy fix, and no compensation or calibration bypass is introduced.
+
+- PR408 IMU control and loco_target regressions: 152 passed.
+- Combined PR425 fusion/IMU/packaging/deployment-policy regressions: 201 passed.
+- New synthetic fault regressions verify braking, preservation of the rejected
+  read in the trace, and exactly one ACP error terminal with the failure reason.
+- Private robot telemetry remains outside the PR. No new image build or runtime
+  deployment was performed for this diagnostic change.
+
 ## Zero-distortion camera input follow-up
 
 Synced PR408's minimal camera input fix: inverse_brown_conrady is accepted only
