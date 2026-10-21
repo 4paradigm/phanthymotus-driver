@@ -306,9 +306,15 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                 if remaining <= brake_gap:
                     brake_started = now
                 else:
-                    turn = max(-0.4, min(0.4, 1.5*yaw_error-0.1*estimator.gyro[2]))
-                    # Sideways gait has a larger deadband than forward gait.
-                    command = 0.65 if body_y else (0.6 if remaining > 0.2 else 0.5)
+                    # Sideways gait: the robot's own step yaws the body away from
+                    # the strafe direction (right strafe turned left by 8-17 deg
+                    # in the 2026-10-21 runs). Feed that disturbance forward and
+                    # give the correction more authority than the forward gait.
+                    # The lateral deadband is 0.60 normalised, so 0.9 is needed
+                    # to actually side-step; 0.65 barely moved.
+                    turn = max(-0.5, min(0.5, 1.5*yaw_error-0.1*estimator.gyro[2]
+                                          + 0.12*body_y))
+                    command = 0.9 if body_y else (0.6 if remaining > 0.2 else 0.5)
                     publish(command*body_x, turn, vy=command*body_y)
                     last_command, last_command_at = command, now
             if brake_started is not None:

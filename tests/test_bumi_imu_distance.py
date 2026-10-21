@@ -291,7 +291,14 @@ def test_direction_moves_along_requested_body_axis_and_brakes(monkeypatch, direc
     for _, vx, vy, turn in plant.commands:
         assert vx*expected[0] >= 0 and vy*expected[1] >= 0
         assert (vy if expected[0] else vx) == 0
-        assert turn == pytest.approx(0.)
+        if not (vx or vy):
+            continue
+        if expected[1]:
+            # Lateral gait yaws the body away from the step; the worker feeds
+            # that forward as a fixed counter-turn.
+            assert turn == pytest.approx(0.12*expected[1], abs=0.01)
+        else:
+            assert turn == pytest.approx(0.)
     assert plant.commands[-1][1:] == (0, 0, 0)
 
 
