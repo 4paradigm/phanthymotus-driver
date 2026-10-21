@@ -291,14 +291,8 @@ def test_direction_moves_along_requested_body_axis_and_brakes(monkeypatch, direc
     for _, vx, vy, turn in plant.commands:
         assert vx*expected[0] >= 0 and vy*expected[1] >= 0
         assert (vy if expected[0] else vx) == 0
-        if not (vx or vy):
-            continue
-        if expected[1]:
-            # Lateral gait yaws the body away from the step; the worker feeds
-            # that forward as a fixed counter-turn.
-            assert turn == pytest.approx(0.12*expected[1], abs=0.01)
-        else:
-            assert turn == pytest.approx(0.)
+        # The fake plant does not yaw, so there is no heading error to correct.
+        assert turn == pytest.approx(0.)
     assert plant.commands[-1][1:] == (0, 0, 0)
 
 
@@ -391,6 +385,20 @@ def test_distance_phase_finish_times_out_instead_of_walking_forever(monkeypatch)
     assert result['finish_phase'] == 'timeout'
     assert result['final_foot_gap_m'] == pytest.approx(0.12)
     assert result['finish_overshoot_m'] <= 0.0
+
+
+def test_heading_error_uses_a_pulse_above_the_walking_deadband(monkeypatch):
+    """-0.25 normalised turned the robot only ~3 deg (walking yaw deadband);
+    the correction must be a strong pulse, not a small proportional value."""
+    plant = Plant(monkeypatch)
+    def drifting():
+        plant.yaw = 0.15 if plant.clock > 2.2 else 0.0   # ~8.6 deg left
+        return imu(acc=(plant.acceleration, 0, 9.81), yaw=plant.yaw)
+    monkeypatch.setattr(plant, '_read_distance_imu', drifting)
+    result = module.run_distance(plant, 0.5)
+    turns = [command[2] for command in plant.commands if command[1] or command[2]]
+    assert any(turn == pytest.approx(-module.HEADING_PULSE) for turn in turns), turns
+    assert all(abs(turn) in (0.0, module.HEADING_PULSE) for turn in turns)
 
 
 def test_distance_trace_keeps_raw_control_samples_commands_and_terminal_error(monkeypatch):

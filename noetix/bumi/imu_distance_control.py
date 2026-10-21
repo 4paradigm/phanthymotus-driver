@@ -170,6 +170,14 @@ def lateral_limit(distance_m):
 # the same velocity until the two contacts are fore-aft aligned in double
 # support, then request zero. The controller finishes the current step after
 # zero, so the exact final stance still needs a lead time measured on hardware.
+# The walking controller ignores yaw commands below about 0.30 normalised: a
+# constant -0.25 command turned the robot by only ~3 deg over 2.5 s (gait sway),
+# while -0.5 turned it ~29 deg in 1.5 s. A proportional correction of a few
+# degrees therefore does nothing; hold heading with strong pulses once the
+# error leaves a small band.
+HEADING_BAND_DEG = 1.5
+HEADING_PULSE = 0.5
+
 PARALLEL_FINISH_TOLERANCE_M = 0.04
 PARALLEL_FINISH_TIMEOUT_S = 1.0
 PARALLEL_FINISH_ALLOWANCE_M = 0.35
@@ -331,14 +339,19 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                         finish_overshoot = distance_m-moved
                         brake_started, finishing = now, False
                 if brake_started is None:
-                    # Sideways gait: the robot's own step yaws the body away from
-                    # the strafe direction (right strafe turned left by 8-17 deg
-                    # in the 2026-10-21 runs). Feed that disturbance forward and
-                    # give the correction more authority than the forward gait.
+                    # Heading hold with pulses above the walking deadband. The
+                    # gait drifts left while walking forward; small proportional
+                    # corrections never reach the controller, so a pulse is sent
+                    # whenever the error leaves the band and zero inside it.
+                    error_deg = math.degrees(yaw_error)
+                    if error_deg < -HEADING_BAND_DEG:
+                        turn = -HEADING_PULSE
+                    elif error_deg > HEADING_BAND_DEG:
+                        turn = HEADING_PULSE
+                    else:
+                        turn = 0.0
                     # The lateral deadband is 0.60 normalised, so 0.9 is needed
                     # to actually side-step; 0.65 barely moved.
-                    turn = max(-0.5, min(0.5, 1.5*yaw_error-0.1*estimator.gyro[2]
-                                          + 0.12*body_y))
                     command = 0.9 if body_y else (0.6 if remaining > 0.2 else 0.5)
                     publish(command*body_x, turn, vy=command*body_y)
                     last_command, last_command_at = command, now
