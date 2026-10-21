@@ -943,7 +943,10 @@ class TestDriverContracts(unittest.TestCase):
     def test_network_interface_candidates_do_not_assume_eth0_or_wifi(self):
         network = _load("as2w_network_under_test", ROOT / "network.py")
         with patch.object(network.socket, "if_nameindex", return_value=[
-                (1, "lo"), (2, "wlan0"), (3, "enx001122"), (4, "eth1")]):
+                (1, "lo"), (2, "wlan0"), (3, "enx001122"), (4, "eth1")]), \
+             patch.object(network, "_interface_up", return_value=True), \
+             patch.object(network, "_interface_ipv4", side_effect=lambda name: {
+                 "enx001122": "192.168.123.20", "eth1": "192.168.123.21"}[name]):
             self.assertEqual(["enx001122", "eth1"],
                              network.interface_candidates("", ""))
         self.assertEqual(["enp5s0"],
@@ -959,6 +962,16 @@ class TestDriverContracts(unittest.TestCase):
              patch.object(network, "_interface_ipv4", side_effect=lambda name: {
                  "eno1": "192.168.123.100", "enp2s0": "10.100.129.146"}[name]):
             self.assertEqual(["eno1"], network.interface_candidates("", ""))
+
+    def test_network_auto_detection_rejects_wired_interfaces_outside_as2_subnet(self):
+        network = _load("as2w_network_no_subnet_match_test", ROOT / "network.py")
+        with patch.object(network.socket, "if_nameindex", return_value=[
+                (2, "eno1"), (3, "enp2s0")]), \
+             patch.object(network, "_interface_up", return_value=True), \
+             patch.object(network, "_interface_ipv4", side_effect=lambda name: {
+                 "eno1": "10.100.129.146", "enp2s0": "172.16.1.20"}[name]):
+            self.assertEqual([], network.interface_candidates("", ""))
+            self.assertEqual(["eno1"], network.interface_candidates("eno1", ""))
 
     def test_network_auto_detection_has_no_empty_wifi_fallback(self):
         network = _load("as2w_network_no_wired_test", ROOT / "network.py")

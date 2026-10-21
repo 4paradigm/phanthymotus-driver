@@ -42,12 +42,11 @@ def interface_candidates(requested="", configured="", robot_subnet="192.168.123.
         network = ipaddress.ip_network(robot_subnet, strict=False) if robot_subnet else None
     except ValueError:
         network = None
-    if network:
-        robot_candidates = [name for name in candidates
-                            if (address := _interface_ipv4(name)) and
-                            ipaddress.ip_address(address) in network]
-        if robot_candidates:
-            candidates = robot_candidates
+    if network is None:
+        return []
+    candidates = [name for name in candidates
+                  if (address := _interface_ipv4(name)) and
+                  ipaddress.ip_address(address) in network]
     # Never return an empty sentinel here.  Passing ``None``/``""`` to
     # ChannelFactoryInitialize lets CycloneDDS choose its own interface and
     # can silently bind the robot participant to Wi-Fi.  The caller must keep
