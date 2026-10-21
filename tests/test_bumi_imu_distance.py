@@ -304,6 +304,9 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
             self.position = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
             self._last = None
+        def reset_position(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
         def observe(self, joints, quaternion, now):
             if self._last is None:
                 self._last = now

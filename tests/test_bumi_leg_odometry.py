@@ -29,15 +29,30 @@ def test_standing_pose_puts_the_contact_at_the_sole_centre():
     assert left[2] == pytest.approx(-0.4802, abs=1e-3)
 
 
-def test_contact_point_follows_the_foot_roll_to_the_heel_or_toe():
+def test_contact_point_is_continuous_in_the_foot_pitch():
     flat = module.foot_position([0.0]*6, LEFT)
     toe_down = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.3, 0.0], LEFT)
     heel_down = module.foot_position([0.0, 0.0, 0.0, 0.0, -0.3, 0.0], LEFT)
-    assert flat[0] == pytest.approx(0.0301, abs=1e-3)
-    # Rolling the foot moves the lowest sole corner by the foot length; a fixed
-    # point under the ankle would not capture that.
-    assert toe_down[0] > flat[0]+0.05
-    assert heel_down[0] < flat[0]-0.05
+    # A fixed point in the foot frame: rolling the foot must not jump the
+    # contact between corners (that produced a false fault on the robot).
+    for other in (toe_down, heel_down):
+        assert other[0] == pytest.approx(flat[0] + (other[2]-flat[2])*0.0, abs=0.06)
+
+
+def test_reset_position_keeps_the_previous_foot_for_the_next_step():
+    estimator = module.LegOdometry()
+    feet = stand_feet()
+    estimator.observe_feet(feet, IDENTITY, 0.0)
+    estimator.observe_feet([[foot[0]-0.005, foot[1], foot[2]] for foot in feet],
+                           IDENTITY, 0.02)
+    assert estimator.position != [0.0, 0.0, 0.0]
+    estimator.reset_position()
+    assert estimator.position == [0.0, 0.0, 0.0]
+    assert estimator.velocity == [0.0, 0.0, 0.0]
+    # The stored previous feet still allow the next real step to integrate.
+    estimator.observe_feet([[foot[0]-0.010, foot[1], foot[2]] for foot in feet],
+                           IDENTITY, 0.04)
+    assert estimator.position == pytest.approx([0.005, 0.0, 0.0], abs=1e-9)
 
 
 def test_forward_translation_from_both_stance_feet():

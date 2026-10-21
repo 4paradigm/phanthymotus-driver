@@ -52,16 +52,17 @@ JOINT_ORDER = (
 )
 JOINT_INDEX = {name: index for index, name in enumerate(JOINT_ORDER)}
 
-# Sole corners in the ankle-roll link frame, from the ankle_roll_link mesh
+# Sole centre in the ankle-roll link frame, from the ankle_roll_link mesh
 # bounding box (x: heel -0.0689 .. toe 0.1258, y: +-0.0413, sole z: -0.0511).
-SOLE_CORNERS = (
-    (-0.0689, -0.0413, -0.0511), (0.1258, -0.0413, -0.0511),
-    (-0.0689, 0.0413, -0.0511), (0.1258, 0.0413, -0.0511),
-)
-CONTACT_HEIGHT_M = 0.005
+# A fixed point in the foot frame is continuous. The previous "lowest sole
+# corner" model followed the heel-to-toe roll but jumped between corners on a
+# single sample, which showed up as a 2.6 cm step and -1.33 m/s at the first
+# step of the 2026-10-21 18:58 run; that is a false fault, not motion.
+SOLE_CENTRE = (0.02845, 0.0, -0.0511)
 
-# The largest plausible body step per sample at ~50 Hz (2.5 m/s).
-MAX_STEP_M = 0.05
+# The largest plausible body step per sample at ~50 Hz (1.0 m/s). A larger
+# implied step is a contact/kinematics discontinuity, not body motion.
+MAX_STEP_M = 0.02
 # Two implied steps this close are treated as double support and averaged.
 DOUBLE_SUPPORT_M = 0.01
 
@@ -118,10 +119,10 @@ def joint_angles(joint_positions):
 def foot_position(angles, chain):
     """Foot contact point in the body frame for one leg's six joint angles.
 
-    The contact is the lowest part of the sole given the foot orientation: when
-    the foot rolls, the heel or the toe becomes the contact instead of a fixed
-    point under the ankle. This matters because the stance foot rotates about
-    the true contact, so the ankle itself is not a stationary point.
+    The contact is the sole centre, a fixed point in the foot frame: continuous
+    in the joint angles, which the stance-foot integration relies on. The real
+    centre of pressure moves as the foot rolls; that residual is one of the
+    approximations this estimate carries.
     """
     position = [0.0, 0.0, 0.0]
     rotation = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -129,13 +130,8 @@ def foot_position(angles, chain):
         offset = _apply(rotation, origin)
         position = [position[i]+offset[i] for i in range(3)]
         rotation = _matrix_multiply(rotation, _axis_rotation(axis, angle))
-    corners = []
-    for corner in SOLE_CORNERS:
-        offset = _apply(rotation, corner)
-        corners.append([position[i]+offset[i] for i in range(3)])
-    lowest = min(corner[2] for corner in corners)
-    contacts = [corner for corner in corners if corner[2] <= lowest+CONTACT_HEIGHT_M]
-    return [sum(corner[i] for corner in contacts)/len(contacts) for i in range(3)]
+    contact = _apply(rotation, SOLE_CENTRE)
+    return [position[i]+contact[i] for i in range(3)]
 
 
 class LegOdometry:
@@ -150,6 +146,11 @@ class LegOdometry:
         self._feet = None
         self._rotation = None
         self._time = None
+
+    def reset_position(self):
+        """Zero the accumulated position/velocity, keeping the previous feet."""
+        self.position = [0.0, 0.0, 0.0]
+        self.velocity = [0.0, 0.0, 0.0]
 
     def observe(self, joint_positions, quaternion, now):
         """One SDK joint-state + orientation sample."""
