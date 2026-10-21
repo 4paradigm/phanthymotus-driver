@@ -553,7 +553,7 @@ class SpeakerPlugin:
         self._channels = int(plugin_config.get("channels", 1))
         self._output_rate = int(plugin_config.get("output_sample_rate_hz", 44100))
         self._output_channels = int(plugin_config.get("output_channels", 2))
-        self._volume = max(0, min(100, int(plugin_config.get("volume", 100))))
+        self._volume = max(0, min(100, int(plugin_config.get("volume", 5))))
         # Live PCM from remote_mic/TTS is substantially quieter than XOS's
         # stored-audio route. This is a source calibration, while `volume`
         # remains the user-facing 0-100 control.

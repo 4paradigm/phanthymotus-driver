@@ -45,7 +45,7 @@ plugins:
     # The verified Q5 amplifier route is S16_LE stereo at 44.1 kHz.
     output_sample_rate_hz: 44100
     output_channels: 2
-    volume: 2
+    volume: 5
     input_gain: 6.0
     xos_http_base: "http://192.168.8.100:1888"
   audio:

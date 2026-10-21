@@ -23,7 +23,7 @@ Q5 主驱动在 ROS Domain 211；媒体桥把 `camera_rgb` 送到 Agent Core 的
 
 播报仍慢时，先看 `status.last_voice.sent_at`：若卡片已及时发送而没听到，检查 TTS 输入是否接在 `voice` 输出、speaker 是否接同一 TTS 实例的 PCM，以及 TTS 日志是否出现 `discarded expired topic cue`。短提示过期会跳过，避免训练结束后补念旧数字；若常被丢弃，测量 TTS 首帧延迟并确认 Q5 与 perception 的系统时钟同步。Dashboard 状态仍慢时，对比工具 `status.set_count` 与画布显示，并检查 `frames_received` 和 `last_frame_age_s`。
 
-若机器人完全无声，先运行 `speaker.info`：`state=idle` 表示还没开始播放，检查画布中的 TTS PCM → speaker 连线，并对比 `topic_in[0].topic` 与 TTS `info.topic_out[0].topic`；输入话题为空也可能是音频路由在绑定前启动失败，需看启动记录。新版 speaker 会以 `state=error` 和 `startup_error` 报告启动失败，以 `self_check_error` 报告自检音失败。旧版只能在 Q5 driver 日志中找 `playback unavailable` 或 `startup self-check failed`。改线后停止项目，等 `project_stop_done` 再启动，以免旧停止任务关掉新实例。`state=running` 且 `frames_received`、`frames_written` 增长但听不到时，再临时把 speaker 音量从当前默认 `2` 提高测试；测试完调回合适音量。
+若机器人完全无声，先运行 `speaker.info`：`state=idle` 表示还没开始播放，检查画布中的 TTS PCM → speaker 连线，并对比 `topic_in[0].topic` 与 TTS `info.topic_out[0].topic`；输入话题为空也可能是音频路由在绑定前启动失败，需看启动记录。新版 speaker 会以 `state=error` 和 `startup_error` 报告启动失败，以 `self_check_error` 报告自检音失败。旧版只能在 Q5 driver 日志中找 `playback unavailable` 或 `startup self-check failed`。改线后停止项目，等 `project_stop_done` 再启动，以免旧停止任务关掉新实例。`state=running` 且 `frames_received`、`frames_written` 增长但听不到时，可用 `speaker.set_volume` 临时微调，当前默认值为 `5`。
 
 ## 技能和验证
 
