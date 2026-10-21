@@ -165,6 +165,16 @@ def lateral_limit(distance_m):
     return max(0.15, 0.5*distance_m)
 
 
+# Gait-phase finish. The walking controller stops mid-gait: one foot can end
+# in front of the other. Once the distance target is reached, keep commanding
+# the same velocity until the two contacts are fore-aft aligned in double
+# support, then request zero. The controller finishes the current step after
+# zero, so the exact final stance still needs a lead time measured on hardware.
+PARALLEL_FINISH_TOLERANCE_M = 0.04
+PARALLEL_FINISH_TIMEOUT_S = 1.0
+PARALLEL_FINISH_ALLOWANCE_M = 0.35
+
+
 def travel_tolerance(distance_m):
     """Allowance before the command integration counts as a fault."""
     return max(0.25, 0.20*distance_m+0.10)
@@ -200,6 +210,10 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
     last_joints = None
     joint_updates = 0
     last_command, last_command_at = 0.0, None
+    finishing = False
+    finish_started = None
+    finish_phase = 'immediate'
+    finish_overshoot = 0.0
     samples, commands = [], []
     def publish(vx, vyaw=0, *, vy=0):
         if vy:
@@ -294,7 +308,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
             if (lateral > lateral_limit(distance_m) or abs(yaw_error) > math.radians(20)
                     or math.hypot(*source_velocity) > 1.2):
                 raise ValueError('IMU estimated motion exceeds direction or speed limits')
-            if remaining < -0.05:
+            phase_active = leg is not None and (finishing or finish_phase in ('parallel', 'timeout'))
+            overshoot_limit = PARALLEL_FINISH_ALLOWANCE_M if phase_active else 0.05
+            if remaining < -overshoot_limit:
                 raise ValueError('IMU estimated overshoot exceeds 0.05 m')
             if brake_started is None:
                 if now-motion_started > min(20.0, 5.0+10.0*distance_m):
@@ -304,9 +320,17 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                 elif now-progress_at > 3:
                     raise ValueError('IMU estimated distance made no progress')
                 brake_gap = max(0.025, min(0.10, max(0, speed)*0.15))
-                if remaining <= brake_gap:
-                    brake_started = now
-                else:
+                if finishing or remaining <= brake_gap:
+                    if not finishing:
+                        finishing, finish_started = True, now
+                    parallel = (leg is not None and getattr(leg, 'double_support', False)
+                                and abs(getattr(leg, 'foot_gap', 1.0)) <= PARALLEL_FINISH_TOLERANCE_M)
+                    if leg is None or parallel or now-finish_started >= PARALLEL_FINISH_TIMEOUT_S:
+                        finish_phase = ('immediate' if leg is None else
+                                        ('parallel' if parallel else 'timeout'))
+                        finish_overshoot = distance_m-moved
+                        brake_started, finishing = now, False
+                if brake_started is None:
                     # Sideways gait: the robot's own step yaws the body away from
                     # the strafe direction (right strafe turned left by 8-17 deg
                     # in the 2026-10-21 runs). Feed that disturbance forward and
@@ -334,8 +358,10 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                     result['pre_zero_velocity_mps'] = source_velocity
                     estimator.velocity = (0.0, 0.0, 0.0)
                     result['stationary_assumed'] = True
-                    band = 0.10 if leg is not None else 0.05
-                    if abs(remaining) > band:
+                    if leg is not None:
+                        if remaining > 0.10 or remaining < -PARALLEL_FINISH_ALLOWANCE_M:
+                            raise ValueError('stopped outside the estimated target band')
+                    elif abs(remaining) > 0.05:
                         raise ValueError('stopped outside the estimated target band')
                     result['state'] = 'done'
                     break
@@ -355,6 +381,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                   leg_stance_samples=(getattr(leg, 'stance_samples', None) if leg is not None else None),
                   leg_joint_updates=(joint_updates if leg is not None else None),
                   leg_slip_scale=(getattr(leg, 'slip_scale', None) if leg is not None else None),
+                  finish_phase=finish_phase,
+                  finish_overshoot_m=finish_overshoot,
+                  final_foot_gap_m=(getattr(leg, 'foot_gap', None) if leg is not None else None),
                   elapsed_s=time.monotonic()-started)
     try:
         _write_trace(samples, commands, result)

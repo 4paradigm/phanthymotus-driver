@@ -311,6 +311,8 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
             self.slip_scale = slip_scale
             self.position = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
+            self.foot_gap = 0.0
+            self.double_support = True
             self._last = None
         def reset_position(self):
             self.position = [0.0, 0.0, 0.0]
@@ -332,9 +334,63 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
     result = module.run_distance(plant, 1.0)
     assert result['state'] == 'done', result.get('error')
     assert result['distance_source'] == 'leg_odometry'
+    assert result['finish_phase'] == 'parallel'
+    assert result['final_foot_gap_m'] == pytest.approx(0.0)
     assert result['estimated_distance_m'] == pytest.approx(1.0, abs=0.06)
     assert 'imu_position_m' in result
     assert plant.commands[-1][1:] == (0, 0)
+
+
+def _phase_leg(plant, parallel_after_m):
+    class PhaseLeg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.foot_gap = 0.12
+            self.double_support = True
+            self._last = None
+        def reset_position(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+        def observe(self, joints, quaternion, now, frozen=False):
+            if frozen:
+                self.velocity = [0.0, 0.0, 0.0]
+                return
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            step = 0.16*dt if plant.command else 0.0
+            self.position = [self.position[0]+step, 0.0, 0.0]
+            self.velocity = [step/dt, 0.0, 0.0]
+            self.foot_gap = 0.12 if self.position[0] < parallel_after_m else 0.0
+    return PhaseLeg
+
+
+def test_distance_waits_for_parallel_feet_before_braking(monkeypatch):
+    plant = Plant(monkeypatch)
+    monkeypatch.setattr(module, 'LegOdometry', _phase_leg(plant, 0.50))
+    monkeypatch.setattr(plant, '_read_distance_joints', lambda: [0.0]*21, raising=False)
+    result = module.run_distance(plant, 0.5)
+    assert result['state'] == 'done', result.get('error')
+    assert result['finish_phase'] == 'parallel'
+    assert result['final_foot_gap_m'] == pytest.approx(0.0)
+    # Walking on until the feet are level costs distance past the target.
+    assert result['finish_overshoot_m'] <= 0.0
+    assert result['estimated_distance_m'] >= 0.5
+
+
+def test_distance_phase_finish_times_out_instead_of_walking_forever(monkeypatch):
+    plant = Plant(monkeypatch)
+    monkeypatch.setattr(module, 'LegOdometry', _phase_leg(plant, 99.0))
+    monkeypatch.setattr(plant, '_read_distance_joints', lambda: [0.0]*21, raising=False)
+    result = module.run_distance(plant, 0.5)
+    assert result['state'] == 'done', result.get('error')
+    assert result['finish_phase'] == 'timeout'
+    assert result['final_foot_gap_m'] == pytest.approx(0.12)
+    assert result['finish_overshoot_m'] <= 0.0
 
 
 def test_distance_trace_keeps_raw_control_samples_commands_and_terminal_error(monkeypatch):

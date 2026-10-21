@@ -142,3 +142,13 @@ def test_measured_slip_scale_is_applied_by_default():
     assert estimator.slip_scale == pytest.approx(module.DISTANCE_SLIP_SCALE)
     assert estimator.position == pytest.approx([0.005*module.DISTANCE_SLIP_SCALE, 0.0, 0.0],
                                                abs=1e-9)
+
+
+def test_foot_gap_and_double_support_are_exposed_for_the_phase_finish():
+    estimator = module.LegOdometry(slip_scale=1.0)
+    feet = [[0.06, 0.1, -0.48], [0.08, -0.1, -0.48]]
+    estimator.observe_feet(feet, IDENTITY, 0.0)
+    estimator.observe_feet([[foot[0]-0.005, foot[1], foot[2]] for foot in feet],
+                           IDENTITY, 0.02)
+    assert estimator.foot_gap == pytest.approx(-0.02)
+    assert estimator.double_support is True

@@ -177,6 +177,8 @@ class LegOdometry:
         self.samples = 0
         self.stance_samples = 0
         self.feet = None
+        self.foot_gap = None          # fore-aft distance between the contacts
+        self.double_support = False   # both feet moving with the body
         self._feet = None
         self._rotation = None
         self._time = None
@@ -226,6 +228,9 @@ class LegOdometry:
             lengths = [math.hypot(*delta) for delta in deltas]
             limit = MAX_STEP_M/max(1.0, self.slip_scale)
             plausible = [index for index in (0, 1) if lengths[index] <= limit]
+            self.foot_gap = feet[0][0]-feet[1][0]
+            self.double_support = (len(plausible) == 2
+                                   and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M)
             if plausible:
                 if len(plausible) == 2 and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M:
                     delta = [(deltas[0][i]+deltas[1][i])/2 for i in range(3)]
