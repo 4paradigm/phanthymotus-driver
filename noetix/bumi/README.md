@@ -452,8 +452,11 @@ measures where the robot really turned instead.
   synchronously as `error` with no `action_id`. `angle_deg` spans −360 to
   360 degrees (positive = counter-clockwise/left) and requires walking
   mode, flat non-slip ground and at least 1 m clearance. `distance_m`
-  spans 0.1 to 3 metres forward only (no reverse, strafe or path
-  planning). The experimental IMU estimator requires the robot to be
+  spans 0.1 to 3 positive metres. The `move` action adds a plain-text
+  `direction` input: `前进`/`forward`, `后退`/`backward`, `左移`/`left`,
+  or `右移`/`right`. Missing or blank direction preserves forward movement.
+  Left/right means sideways translation while retaining the starting heading;
+  the existing action menu is unchanged. The experimental IMU estimator requires the robot to be
   stationary before starting (see below).
   `stop_move` brakes an active rotation or distance move immediately
   (also the `on_interrupt_motion` hook). `status` reports `idle`/
@@ -488,7 +491,7 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   continuous two-second quiet calibration window (six-second limit). It
   rotates acceleration into the world frame, subtracts the stationary
   gravity/offset baseline and integrates acceleration/velocity at 50 Hz.
-  Forward displacement is projected onto the starting heading; proportional
+  Displacement is projected onto the selected starting body axis; proportional
   IMU yaw correction uses direct SDK commands. The existing shared-chassis
   reservation, atomic cancellation and exactly-once ACP completion remain.
 - The controller never performs a zero-velocity update during commanded
@@ -516,6 +519,13 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   their original contracts and do not start claiming measured translation.
   See [IMU experiment testing](IMU_DISTANCE_TEST.md) for independent physical
   measurement and result interpretation.
+- Each IMU distance attempt records the raw control-loop IMU reads, monotonic
+  receipt/read timing, estimated state, requested velocity commands and terminal
+  result. The result's `imu_trace_path` identifies a JSON file inside the driver
+  container under `/tmp/bumi-imu-distance/`. Only the latest five traces are
+  retained; files are written after the final brake. This captures the control
+  samples directly instead of reconstructing them from the slower state topic.
+  These diagnostics do not correct drift or certify actual distance accuracy.
 - Camera capture is restored to a single direct `pyrealsense2` worker:
   color BGR8 and depth Z16 at 640×480/30 Hz, depth aligned to the RGB grid,
   JPEG quality 80 and zlib-compressed Z16 on the existing topics. Runtime

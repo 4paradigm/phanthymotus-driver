@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import sys
 import threading
+import json
 from types import SimpleNamespace as NS
 
 import pytest
@@ -193,3 +194,68 @@ def test_whole_request_timeout_brakes_even_before_calibration(monkeypatch):
     assert result['state'] == 'error'
     assert 'timed out' in result['error']
     assert all(vx == vyaw == 0 for _, vx, vyaw in plant.commands)
+
+
+class DirectionalPlant(Plant):
+    """Two independent body axes with bounded acceleration, no yaw actuation."""
+    def __init__(self, monkeypatch, yaw):
+        super().__init__(monkeypatch, yaw)
+        self.body_velocity = [0., 0.]
+        self.body_acceleration = [0., 0.]
+        self.body_position = [0., 0.]
+        self.command = (0., 0.)
+
+    def advance(self, dt):
+        self.clock += dt
+        for axis in (0, 1):
+            old = self.body_velocity[axis]
+            target = math.copysign(.3, self.command[axis]) if self.command[axis] else 0.
+            new = old + max(-dt, min(dt, target-old))
+            self.body_velocity[axis] = new
+            self.body_acceleration[axis] = (new-old)/dt
+            self.body_position[axis] += (old+new)*dt/2
+
+    def _read_distance_imu(self):
+        self.samples += 1
+        ax, ay = self.body_acceleration
+        return imu(acc=(ax, ay, 9.81+1e-7*math.sin(self.samples)), yaw=self.yaw)
+
+    def _distance_publish(self, vx, vyaw=0, *, vy=0):
+        if (vx or vy or vyaw) and self._rotate_stop_event.is_set():
+            return
+        self.command = (vx, vy)
+        self.commands.append((self.clock, vx, vy, vyaw))
+
+
+@pytest.mark.parametrize('direction,expected', [
+    ('前进', (1, 0)), ('后退', (-1, 0)), ('左移', (0, 1)), ('右移', (0, -1)),
+    ('forward', (1, 0)), ('backward', (-1, 0)), ('left', (0, 1)), ('right', (0, -1)),
+    ('', (1, 0)),
+])
+@pytest.mark.parametrize('yaw', [0., 1.2, -2.8])
+def test_direction_moves_along_requested_body_axis_and_brakes(monkeypatch, direction, expected, yaw):
+    plant = DirectionalPlant(monkeypatch, yaw)
+    result = module.run_distance(plant, 1., direction=direction)
+    assert result['state'] == 'done', result
+    assert result['estimated_distance_m'] == pytest.approx(1., abs=.05)
+    assert plant.body_position == pytest.approx([expected[0], expected[1]], abs=.05)
+    for _, vx, vy, turn in plant.commands:
+        assert vx*expected[0] >= 0 and vy*expected[1] >= 0
+        assert (vy if expected[0] else vx) == 0
+        assert turn == pytest.approx(0.)
+    assert plant.commands[-1][1:] == (0, 0, 0)
+
+
+def test_distance_trace_keeps_raw_control_samples_commands_and_terminal_error(monkeypatch):
+    plant = Plant(monkeypatch)
+    plant.fault = 'frozen'
+    result = module.run_distance(plant, 1.)
+    assert result['state'] == 'error'
+    trace = json.loads(Path(result['imu_trace_path']).read_text())
+    assert trace['result']['error'] == result['error']
+    assert trace['samples'][0]['orientation_xyzw'] == [0, 0, 0, 1]
+    assert trace['samples'][0]['linear_acceleration_mps2'] == [0, 0, 9.81]
+    assert trace['samples'][0]['angular_velocity_rad_s'] == [0, 0, 0]
+    assert all(b['received_mono_s'] > a['received_mono_s']
+               for a, b in zip(trace['samples'], trace['samples'][1:]))
+    assert trace['command_requests'][-1]['velocity'] == [0, 0, 0]

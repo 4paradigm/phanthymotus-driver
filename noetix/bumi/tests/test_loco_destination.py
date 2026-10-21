@@ -270,7 +270,9 @@ def test_loco_destination_tool_schema_contract(monkeypatch):
     assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
     assert tool['inputSchema']['x-completion'] == {'actions': ['move', 'rotate'], 'timeout': 120}
     assert set(tool['inputSchema']['x-action-params']) == {'move', 'rotate', 'stop_move', 'status'}
-    assert tool['inputSchema']['x-action-params']['move']['params'] == ['distance_m']
+    assert tool['inputSchema']['x-action-params']['move']['params'] == ['direction', 'distance_m']
+    assert props['direction']['type'] == 'string'
+    assert 'enum' not in props['direction']  # plain input, not another dropdown
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
 
 
@@ -353,7 +355,22 @@ def test_distance_nonzero_publication_obeys_atomic_stop(monkeypatch):
     plugin._stop_move()
     plugin._distance_publish(0.5)
     plugin._distance_publish(0, 0.3)
+    plugin._distance_publish(0, vy=0.65)
     assert fake.cmds == [(0, 0, 0)]
+
+
+@pytest.mark.parametrize('direction', ['north', None, True, 2, ['left']])
+def test_distance_bad_direction_is_rejected_before_motion(monkeypatch, direction):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    module, _ = _load_device(monkeypatch)
+    fake = FakeHighCtrl()
+    plugin = _rotate_plugin(module, monkeypatch, fake)
+    result = plugin.dispatch('move', {'_tool_name': 'loco_destination', 'distance_m': .3,
+                                      'direction': direction})
+    assert result['state'] == 'error'
+    assert 'direction' in result['error']
+    assert 'action_id' not in result
+    assert fake.cmds == []
 
 
 def test_real_imu_distance_worker_accepts_without_ros_and_cancels_during_calibration(monkeypatch):

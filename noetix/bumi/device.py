@@ -549,19 +549,21 @@ class LocoPlugin:
     def _loco_destination_tool(self) -> dict:
         return {
             "name": "loco_destination", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：纯机身 IMU 实验版按积分估计距离前进，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动：纯机身 IMU 实验版按积分估计距离前进、后退或左右侧移，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move", "rotate", "stop_move", "status"]},
+                    "direction": {"type": "string", "default": "前进",
+                                  "description": "移动方向：前进、后退、左移、右移（也支持 forward/backward/left/right）；留空为前进。左右为保持机身朝向的侧移。"},
                     "distance_m": {"type": "number", "minimum": 0.1, "maximum": 3,
-                                   "description": "沿起点朝向前进的目标距离（米）；纯 IMU 积分实验估计，非经验证的实际距离。启动前保持静止。"},
+                                   "description": "沿指定起点方向移动的正数距离（米）；纯 IMU 积分实验估计，非经验证的实际距离。启动前保持静止。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["distance_m"], "description": "静止标定后按 IMU 估计距离前进并刹停；数据异常或无进展时停车报错。实验版精度待实测。"},
+                    "move": {"params": ["direction", "distance_m"], "description": "静止标定后沿指定方向移动正数距离并刹停；默认前进，左右为侧移。数据异常或无进展时停车报错。实验版精度待实测。"},
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
                     "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
                     "status": {"params": [], "description": "查询当前目标动作、IMU 估计位移或转角结果。"},
@@ -998,6 +1000,8 @@ class LocoPlugin:
         return self._high_ctrl.get_imu_data()
 
     def _distance_preflight(self, args):
+        from imu_distance_control import movement_direction
+        movement_direction(args.get('direction', ''))
         raw = args.get("distance_m")
         try:
             distance = float(raw)
@@ -1012,9 +1016,9 @@ class LocoPlugin:
         decode_imu(self._read_distance_imu())
         return distance, None
 
-    def _distance_publish(self, vx, vyaw=0):
-        self._publish_cmd(vx, 0, vyaw, _get_default_cmd(), 0,
-                          cancel_event=self._rotate_stop_event if vx or vyaw else None)
+    def _distance_publish(self, vx, vyaw=0, *, vy=0):
+        self._publish_cmd(vx, vy, vyaw, _get_default_cmd(), 0,
+                          cancel_event=self._rotate_stop_event if vx or vy or vyaw else None)
 
     def _do_distance_impl(self, args):
         from imu_distance_control import run_distance
@@ -1024,7 +1028,7 @@ class LocoPlugin:
             if self._move_thread.is_alive():
                 return {"state": "error", "error": "previous move has not stopped"}
         self._set_servo_velocity_owner(True)
-        return run_distance(self, float(args["distance_m"]))
+        return run_distance(self, float(args["distance_m"]), direction=args.get('direction', ''))
 
     def _read_rotate_imu(self) -> tuple[float, float]:
         imu = self._high_ctrl.get_imu_data()
