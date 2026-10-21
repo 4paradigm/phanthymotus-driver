@@ -83,3 +83,48 @@ def test_reapplying_same_saved_configuration_does_not_reset_an_active_segment(ru
     r=runtime;r.config['calibration']=calibration();r.start();old=r.segment
     r.configure({'calibration':calibration()})
     assert r.segment==old and r.active
+
+
+def test_launch_tf_maps_nonidentity_sensor_coordinates_into_body(runtime,monkeypatch):
+    """TF parent B / child S stores T_B_S: p_B = R_B_S p_S + t_B_S.
+
+    Expected points/axes below are literal +90 degree examples, independent of
+    the production geometry helpers. Inverting either mount must fail.
+    """
+    import math
+    import numpy as np
+    emitted=[]
+    class TransformStamped:
+        def __init__(self):
+            self.header=NS(frame_id='',stamp=None); self.child_frame_id=''
+            self.transform=NS(translation=NS(x=0.,y=0.,z=0.),rotation=NS(x=0.,y=0.,z=0.,w=1.))
+    class Broadcaster:
+        def __init__(self,node): pass
+        def sendTransform(self,transforms): emitted.extend(transforms)
+    for name,attrs in [('sensor_msgs.msg',{'Image':object,'CameraInfo':object,'Imu':object}),
+                       ('nav_msgs.msg',{'Odometry':object}),('rtabmap_msgs.msg',{'OdomInfo':object}),
+                       ('geometry_msgs.msg',{'TransformStamped':TransformStamped}),
+                       ('tf2_ros',{'StaticTransformBroadcaster':Broadcaster})]:
+        mod=ModuleType(name);mod.__dict__.update(attrs);monkeypatch.setitem(sys.modules,name,mod)
+    r=runtime; c=calibration(); h=math.sqrt(.5)
+    c['camera_to_body']=dict(translation=[.4,0,.2],quaternion=[0,0,h,h])  # +90 Z
+    c['imu_to_body']=dict(translation=[-.1,.3,.2],quaternion=[h,0,0,h])  # +90 X
+    r.config['calibration']=c; r.start(); r.initial=(0.,0.)
+    monkeypatch.setattr(r.node,'get_clock',lambda:NS(now=lambda:NS(nanoseconds=10**10,to_msg=lambda:NS(sec=10,nanosec=0))))
+    monkeypatch.setattr(r.node,'create_subscription',lambda *args:NS(),raising=False)
+    monkeypatch.setattr(r.children,'start',lambda *args:None)  # only the external process boundary
+    r.launch()
+    assert {t.child_frame_id for t in emitted}=={r.segment+'_optical',r.segment+'_imu'}
+    camera,imu=emitted
+    assert camera.header.frame_id==imu.header.frame_id==r.segment+'_base'
+    def apply(t,point,*,vector=False):
+        q=t.transform.rotation; xyz=np.array([q.x,q.y,q.z]); p=np.array(point,dtype=float)
+        # Standard quaternion vector action; translation only applies to points.
+        uv=2*np.cross(xyz,p)
+        out=p+q.w*uv+np.cross(xyz,uv)
+        v=t.transform.translation
+        return out if vector else out+np.array([v.x,v.y,v.z])
+    assert apply(camera,[0,0,0])==pytest.approx([.4,0,.2])
+    assert apply(camera,[1,0,0])==pytest.approx([.4,1,.2])
+    assert apply(imu,[0,0,0])==pytest.approx([-.1,.3,.2])
+    assert apply(imu,[0,1,0],vector=True)==pytest.approx([0,0,1])

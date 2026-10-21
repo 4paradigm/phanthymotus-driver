@@ -289,6 +289,9 @@ class FusionRuntime:
         for key,child in (('camera_to_body','optical'),('imu_to_body','imu')):
             t=TransformStamped(); t.header.frame_id=self.segment+'_base'; t.child_frame_id=self.segment+'_'+child
             t.header.stamp=self.node.get_clock().now().to_msg()
+            # T_B_S maps sensor coordinates into body: p_B = R_B_S p_S + t_B_S.
+            # A TF with parent B / child S stores this sensor pose in B directly.
+            # Inverting it would instead map body coordinates into the sensor.
             v=self.calibration.data[key]
             t.transform.translation.x,t.transform.translation.y,t.transform.translation.z=v['translation']
             t.transform.rotation.x,t.transform.rotation.y,t.transform.rotation.z,t.transform.rotation.w=v['quaternion']

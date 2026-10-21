@@ -1,3 +1,26 @@
+## TF review follow-up
+
+The proposed inversion is inconsistent with the data transform contract. A TF
+parent B / child S stores the sensor pose T_B_S, mapping p_S to p_B. The launch
+implementation is retained; its inline comment and README now state the equation
+and distinguish frame-tree edges from data transforms. ROS Humble's official
+PointStamped and Vector3Stamped doTransform implementations apply the supplied
+transform and set the output frame to header.frame_id.
+
+The new runtime launch regression inspects the emitted static TF messages using
+nonzero translations and +90 degree camera/IMU rotations. It checks sensor-origin
+positions, a transformed camera point and IMU gyro vector direction. Temporarily
+inverting the runtime transforms makes this test fail; restoring them passes.
+This mutation check uses only temporary local edits, restored before committing.
+
+- Fusion tests: **83 passed**.
+- Relevant regressions: **623 passed, 1 skipped** (see original command below).
+- Full pytest: **45 collection errors, 3 skipped**, unchanged environment limits.
+- Python compilation and Git whitespace checks pass.
+- No dependencies, image layers, launch processes or production transform values
+  changed. Image size/digest measurements and real ROS TF-buffer/robot validation
+  remain unperformed. No image is published by this follow-up.
+
 # PR408 compatibility integration update (2026-10-21)
 
 - Syncs #408 commits `782255e8`, `b60b3d92`, `c27c2687` in an isolated worktree.

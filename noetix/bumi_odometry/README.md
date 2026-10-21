@@ -95,6 +95,17 @@ RTAB-Map 输出机身参考点的三维局部位姿；同 stamp 的 OdomInfo 合
   corrected_stamp=读取区间中点-offset_s；当前不确定性上限 50ms、max_age 上限 0.5s。
   这两个上限是拒绝条件，**不是在此上限内就能达到 5cm 的保证**。
 
+这里“sensor 到 body”明确指坐标数据变换：`p_B = R_B_S p_S + t_B_S`，
+即 `T_B_S`；translation 是传感器原点在 B 中的位置，quaternion 将 S 中向量旋转到 B。
+`header.frame_id=B`、`child_frame_id=S` 的 TF 直接存储这个值，不求逆。
+TF 树的父子边方向不要与坐标数据变换方向混同；只有将 B 中数据转换到 S 时才使用
+`T_S_B = inverse(T_B_S)`。例如相机绕 B 的 Z 轴 +90°、原点位于 `[0.4,0,0.2]`，
+则 C 中点 `[1,0,0]` 在 B 中为 `[0.4,1,0.2]`。IMU gyro 是向量，只旋转、不加平移。
+[ROS 2 Humble 的实际 PointStamped/Vector3Stamped 变换实现](https://github.com/ros2/geometry2/blob/humble/tf2_geometry_msgs/include/tf2_geometry_msgs/tf2_geometry_msgs.hpp)
+将消息中的变换直接作用于数据，并将输出 frame 设为 header.frame_id。
+`test_launch_tf_maps_nonidentity_sensor_coordinates_into_body` 检查 launch 发出的实际 TF；
+这仍是替换 ROS 传输和子进程的无硬件回归，未代替真实 TF buffer/ROS 启动验证。
+
 固定头部还不够：现有 URDF 有 waist_yaw_joint，却未给出真实相机/IMU 安装链。
 现场必须明确 B 的实物参考点，确认是否跨可动腰关节。没有有效动态 TF 时须保持对应
 关节固定；不能把骨架渲染模型当实测外参。
