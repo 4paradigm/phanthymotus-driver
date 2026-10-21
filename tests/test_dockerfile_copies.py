@@ -151,3 +151,16 @@ def test_every_imported_sibling_is_copied(dockerfile):
         f'{dockerfile.relative_to(ROOT)} does not copy modules the driver '
         f'imports: ' + '; '.join(missing)
     )
+
+
+def test_bumi_odometry_runtime_embeds_deploy_fragment():
+    """Both runtime and release must supply the normal deployer's service file."""
+    dockerfile = ROOT / 'noetix/bumi_odometry/Dockerfile'
+    runtime = dockerfile.read_text().split('FROM dependencies AS runtime\n', 1)[1]
+    runtime = runtime.split('\nFROM ', 1)[0]
+    copies = [line.split() for line in runtime.splitlines()
+              if line.strip().startswith('COPY ')]
+    assert any('deploy/' in parts[1:-1] and parts[-1].rstrip('/') == '/deploy'
+               for parts in copies), 'runtime must embed deploy/service.yml at /deploy/service.yml'
+    assert (dockerfile.parent / 'deploy/service.yml').is_file()
+    assert re.search(r'^FROM runtime AS release$', dockerfile.read_text(), re.M)

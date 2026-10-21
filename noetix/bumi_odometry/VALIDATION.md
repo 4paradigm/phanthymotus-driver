@@ -1,3 +1,22 @@
+## Deployment fragment packaging follow-up
+
+Confirmed the driver deployer reads /deploy/service.yml from the image. The
+sidecar runtime stage now copies deploy/ to /deploy/; release inherits runtime.
+A new Dockerfile regression checks that mapping and release inheritance. It failed
+before the COPY was added and passed afterward. Existing source-path tests also
+verify deploy/service.yml exists. This is offline recipe validation, not inspection
+of a built image.
+
+- Packaging, deployment policy and fusion tests: **142 passed in 1.06s**.
+- Both Bumi and odometry service.yml deployment contract checks passed.
+- Build script shell syntax and Git whitespace checks passed.
+- Full pytest remains **45 collection errors, 3 skipped**.
+- No apt/pip dependencies or base image changed; only the small deployment YAML
+  and Docker layer metadata are added. Image size/digest measurement, verified
+  release base digest, Docker builds, ROS launch and deployment remain pending.
+- The ordinary Bumi mirror comment remains aligned with PR408's actual official
+  Ubuntu archive change; it is not changed by this follow-up. PR408 is unchanged.
+
 ## TF review follow-up
 
 The proposed inversion is inconsistent with the data transform contract. A TF

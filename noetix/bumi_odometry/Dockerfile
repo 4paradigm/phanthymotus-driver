@@ -19,6 +19,7 @@ FROM dependencies AS runtime
 WORKDIR /work
 COPY common/ /work/common/
 COPY pipeline.py runtime.py service.py ros_probe.py timing.py bag_export.py /work/
+COPY deploy/ /deploy/
 ENV ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_fastrtps_cpp PYTHONPATH=/work \
     PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15714
