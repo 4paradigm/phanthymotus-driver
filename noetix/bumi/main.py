@@ -350,7 +350,7 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
-                    routine_run = name == "exercise_routine" and args.get("action") in {"run", "run_plan"}
+                    routine_run = name == "exercise_routine" and args.get("action") in {"run", "run_plan", "calibrate"}
                     if routine_run:
                         # Internal transport flag, always set by the server.
                         args["_await_response_publication"] = True

@@ -407,7 +407,7 @@ def test_single_card_workbench_has_controls_and_body_resources(card):
     spec = schema["inputSchema"]["x-workbench"]
     assert spec["protocol"] == "motus.workbench/1" and spec["entry"] == "ui"
     assert {"continue", "stop", "info", "run_plan"} <= set(spec["actions"])
-    assert schema["inputSchema"]["x-completion"] == {"actions": ["run", "run_plan"], "timeout": 3615}
+    assert schema["inputSchema"]["x-completion"] == {"actions": ["run", "run_plan", "calibrate"], "timeout": 3615}
     assert set(schema["inputSchema"]["x-resource"]) == {"base", "leg", "arm_l", "arm_r"}
     assert schema["inputSchema"]["x-is-dangerous"] is True
     assert schema["inputSchema"]["properties"]["dry_run"]["default"] is True
@@ -668,7 +668,7 @@ def test_acp_tls_exception_is_only_for_exact_local_default(monkeypatch, url, loc
 
 
 @pytest.mark.parametrize("canvas_text", [False, True])
-@pytest.mark.parametrize("action", ["run", "run_plan"])
+@pytest.mark.parametrize("action", ["run", "run_plan", "calibrate"])
 def test_http_fast_completion_waits_for_run_response_and_pending_registration(card, monkeypatch, canvas_text, action):
     """Force completion while the *real* MCP socket response write is blocked."""
     import ast
@@ -720,8 +720,9 @@ def test_http_fast_completion_waits_for_run_response_and_pending_registration(ca
     request = urllib.request.Request(f"http://127.0.0.1:{mcp.server_port}/mcp",
         data=json.dumps({"jsonrpc": "2.0", "id": "fast-run", "method": "tools/call",
                          "params": {"name": "exercise_routine", "arguments": {
-                             "action": action, "dry_run": "true" if canvas_text else True,
-                             "confirm": "false" if canvas_text else False,
+                             "action": action, "motion": "chest_expand",
+                             "dry_run": str(action != "calibrate").lower() if canvas_text else action != "calibrate",
+                             "confirm": str(action == "calibrate").lower() if canvas_text else action == "calibrate",
                              "plan": json.dumps(plan()) if canvas_text else plan()}}}).encode(),
         headers={"Content-Type": "application/json"})
     def call():
@@ -737,6 +738,8 @@ def test_http_fast_completion_waits_for_run_response_and_pending_registration(ca
     try:
         client.start()
         assert blocked.wait(timeout=2)
+        if action == "calibrate":
+            assert confirm(card)["ok"]
         wait_for(card, "completed")
         assert not received  # Completion occurred before HTTP response; no ACP yet.
         assert not card._job["notification_done"].is_set()

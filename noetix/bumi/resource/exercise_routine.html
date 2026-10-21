@@ -232,7 +232,7 @@ footer #message {
 <label>每段结束方式<select id="strategy" class="setting"><option value="operator">人工确认完整结束</option><option value="timed_exit">按设定秒数退出并重播</option></select></label>
 <label>整套轮数<div class="meter"><input class="setting" id="rounds-range" aria-label="整套轮数滑块" type="range" min="1" max="20" value="1"><input class="setting" id="rounds" aria-label="整套轮数" type="number" min="1" max="20" step="1" value="1"></div></label>
 <label>轮间休息（秒）<div class="meter"><input class="setting" id="round-rest-range" aria-label="轮间休息滑块" type="range" min="0" max="600" value="0"><input class="setting" id="round-rest" aria-label="轮间休息" type="number" min="0" max="600" step="1" value="0"></div></label>
-</div><p class="warning">定时模式会在设定时间到达后退出回放，再开始下一段。时间太短可能截断动作；请在现场核准每段播放窗口。请逐段填写，不会自动推测播放时长。</p></section>
+</div><p class="warning">定时模式到达窗口后退出回放，再开始下一段。窗口留空时使用该动作已保存的测时记录，也可手动覆盖。时间太短可能截断动作；测时不代表机器人自动识别结束。</p></section>
 <section><div class="bar"><h2 class="grow">动作顺序</h2><button id="add" class="setting" disabled>＋ 添加动作</button></div><div id="steps"></div><p class="muted">播放次数是录制片段的播放次数。最后一次播放后不额外休息。</p></section>
 <section><h2>当前进度</h2><progress id="progress" max="1" value="0"></progress><div id="progress-text" aria-live="polite">尚未运行</div><p id="progress-note">人工确认模式：看到当前动作完整结束后，点击“继续”；程序会自行退出回放。</p><details><summary>查看运行详情</summary><pre id="detail"></pre></details></section>
 <footer class="controls"><div id="live-summary" role="status">尚未运行</div><label class="confirm"><input id="confirm" class="setting" type="checkbox"> 我已确认机器人站稳、周围空间充足；定时模式下已核准所填播放窗口。</label>
@@ -341,7 +341,7 @@ function number(input, min, max, integer = false) {
 function addStep() {
   const el = document.createElement('div');
   el.className = 'motion';
-  el.innerHTML = '<div class="row"><span class="order"></span><select class="setting asset" aria-label="动作素材"></select><button class="setting mini up" aria-label="向前移动">↑</button><button class="setting mini down" aria-label="向后移动">↓</button><button class="setting mini remove">移除</button></div><div class="grid"><label>每轮播放次数<div class="meter"><input class="setting count-range" aria-label="播放次数滑块" type="range" min="1" max="20" value="1"><input class="setting count" aria-label="播放次数" type="number" min="1" max="20" step="1" value="1"></div></label><label>片段间休息（秒）<div class="meter"><input class="setting rest-range" aria-label="片段间休息滑块" type="range" min="0" max="600" value="0"><input class="setting rest" aria-label="片段间休息" type="number" min="0" max="600" step="1" value="0"></div></label><label class="window">本段播放窗口（秒，必填）<input class="setting window-value wide" aria-label="本段播放窗口" type="number" min="0.1" max="600" step="0.1" placeholder="现场核准后填写"></label></div>';
+  el.innerHTML = '<div class="row"><span class="order"></span><select class="setting asset" aria-label="动作素材"></select><button class="setting mini up" aria-label="向前移动">↑</button><button class="setting mini down" aria-label="向后移动">↓</button><button class="setting mini remove">移除</button></div><div class="grid"><label>每轮播放次数<div class="meter"><input class="setting count-range" aria-label="播放次数滑块" type="range" min="1" max="20" value="1"><input class="setting count" aria-label="播放次数" type="number" min="1" max="20" step="1" value="1"></div></label><label>片段间休息（秒）<div class="meter"><input class="setting rest-range" aria-label="片段间休息滑块" type="range" min="0" max="600" value="0"><input class="setting rest" aria-label="片段间休息" type="number" min="0" max="600" step="1" value="0"></div></label><label class="window">本段播放窗口（秒，留空使用测时记录）<input class="setting window-value wide" aria-label="本段播放窗口" type="number" min="0.1" max="600" step="0.1" placeholder="已测时可留空，否则填写核准窗口"></label></div>';
   const select = el.querySelector('.asset');
   motions.forEach(m => {
     const option = document.createElement('option');
@@ -383,7 +383,9 @@ function args(action) {
       play_count: number(el.querySelector('.count'), 1, 20, true),
       rest_s: number(el.querySelector('.rest'), 0, 600)
     };
-    if (timed) step.playback_s = number(el.querySelector('.window-value'), 0.1, 600);
+    if (timed && el.querySelector('.window-value').value.trim() !== '') {
+      step.playback_s = number(el.querySelector('.window-value'), 0.1, 600);
+    }
     return step;
   });
   if (!steps.length) throw Error('动作库为空，请先检查动作绑定');

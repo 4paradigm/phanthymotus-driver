@@ -450,8 +450,12 @@ docker logs -f embodied-noetix-bumi
 
 ## Bumi 动作编排（exercise_routine）
 
-在 `exercise_routine` 卡选择“打开动作编排面板”并执行，即可下拉选择动作、用滑块设置次数/轮数/间歇、调整顺序，并在同一面板查看进度、确认结束或停止；普通使用无需编辑 PLAN JSON。
+普通 `exercise_routine` 卡使用 `MOTION`、`MOTION_2` … `MOTION_7` 按顺序联排，支持次数、轮数和间歇，不用填写 PLAN JSON。
+`register_recordings` 补齐当前机器人101–107，保留已有101绑定；新增动作需逐个测时验证。
+每个动作执行一次 `calibrate`，完整结束后用同一任务的 `finish_calibration` 确认，成功退出后保存播放窗口。
 
-默认模拟和人工确认结束。选择“按设定秒数退出并重播”后，须逐段填写现场核准的播放窗口，程序每次自行退出回放、确认 walking 后才启动下一段/轮。窗口不是 SDK 完成信号，可能截断动作，定时流程完成不代表录制已完整播放。三个默认候选仍未验证，不自动起身。
+默认模拟和人工确认结束。`timed_exit` 下 `PLAYBACK_S` 留空会逐段使用已保存的测时窗口；可显式覆盖。
+每次退出回放、确认 walking 后才启动下一段/轮。窗口不是 SDK 完成信号，定时流程完成不代表录制已完整播放。
+SDK没有可靠的录制进度/完成事件；本轮不把关节静止当作完成。三个默认候选仍未验证，不自动起身。
 
-参见 [动作编排开发与真机验证指南](EXERCISE_ROUTINE.md)。面板使用平台已有的 `motus.workbench/1`；尚不支持工作台的 Core 可用普通卡片的动作下拉和独立数字参数。
+参见 [动作编排开发与真机验证指南](EXERCISE_ROUTINE.md)。滑块面板需要宿主支持 `motus.workbench/1`；现场 Core `release.261015.6453ff3` 缺少该入口，`ui` 只返回源码，应使用上述普通表单。

@@ -1,7 +1,8 @@
 """Bumi routine scheduler and single-card workbench; no ROS/SDK imports.
 
 The SDK has no reliable physical-completion signal. Operator mode waits for
-explicit confirmation. Timed-exit mode executes a user-chosen playback window,
+explicit confirmation. Timed-exit mode executes an explicit or previously
+operator-calibrated playback window,
 then exits; it never claims the recording physically finished. Simulation timing
 never runs on the physical backend. A shared action lock serializes the routine with
 all call-shaped body commands; streaming velocity is suppressed while reserved.
@@ -11,7 +12,10 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+import tempfile
 import threading
 import time
 from uuid import uuid4
@@ -123,15 +127,26 @@ def normalize_canvas_args(action, args):
                     "rest_s": number("rest_s", 0)}
             if result.get("completion_strategy", "operator") == "timed_exit":
                 step["playback_s"] = number("playback_s", None)
+            steps = [step]
+            for slot in range(2, 8):
+                selected = result.get(f"motion_{slot}")
+                if isinstance(selected, str):
+                    selected = selected.strip()
+                if selected not in (None, ""):
+                    steps.append({**step, "motion": selected})
             result["plan"] = {"rounds": number("rounds", 1, True),
-                              "round_rest_s": number("round_rest_s", 0), "steps": [step]}
+                              "round_rest_s": number("round_rest_s", 0), "steps": steps}
         result["dry_run"] = _canvas_boolean(result.get("dry_run", True), "dry_run", True)
         result["confirm"] = _canvas_boolean(result.get("confirm", False), "confirm", False)
-    if action == "continue":
+    if action in {"continue", "calibrate", "finish_calibration"}:
         result["confirm"] = _canvas_boolean(result.get("confirm", False), "confirm", False)
         for key in ("job_id", "confirmation_token"):
             if isinstance(result.get(key), str):
                 result[key] = result[key].strip()
+    if action == "calibrate":
+        result["dry_run"] = _canvas_boolean(result.get("dry_run", True), "dry_run", True)
+        if isinstance(result.get("motion"), str):
+            result["motion"] = result["motion"].strip()
     if action == "status" and isinstance(result.get("job_id"), str):
         result["job_id"] = result["job_id"].strip() or None
     return result
@@ -154,7 +169,19 @@ def load_library(path):
     return motions
 
 
-def check_plan(plan, library, *, dry_run, robot_id, completion_strategy="operator"):
+def saved_playback_window(item, robot_id):
+    """A reusable operator-measured window, never an SDK completion event."""
+    evidence = item.get("playback_window")
+    if (not isinstance(evidence, dict)
+            or evidence.get("source") != "operator_confirmation"
+            or evidence.get("robot_id") != robot_id
+            or evidence.get("recording_id") != item.get("recording_id")
+            or not evidence.get("confirmed_at")):
+        raise RoutineError(f"{item['name']}: 缺少当前素材的测时记录；请先 calibrate，或显式填写 playback_s")
+    return _seconds(evidence.get("seconds"), f"{item['id']}.playback_window.seconds", positive=True)
+
+
+def check_plan(plan, library, *, dry_run, robot_id, completion_strategy="operator", calibration=False):
     """Return a detached, bounded plan and preview; never touch a controller."""
     if completion_strategy not in ("operator", "timed_exit"):
         raise RoutineError("completion_strategy 只支持 operator 或 timed_exit")
@@ -167,6 +194,9 @@ def check_plan(plan, library, *, dry_run, robot_id, completion_strategy="operato
     steps = plan.get("steps")
     if not isinstance(steps, list) or not 1 <= len(steps) <= 20:
         raise RoutineError("steps 必须包含 1–20 个步骤")
+    if calibration and (completion_strategy != "operator" or rounds != 1 or len(steps) != 1
+                        or not isinstance(steps[0], dict) or steps[0].get("play_count", 1) != 1):
+        raise RoutineError("测时只允许 operator 模式单动作、单次、单轮")
     normalized, warnings, plays_per_round, rest_per_round = [], [], 0, 0.0
     duration_per_round, upper_per_round = 0.0, 0.0
     durations_known = True
@@ -180,19 +210,26 @@ def check_plan(plan, library, *, dry_run, robot_id, completion_strategy="operato
         count = _integer(step.get("play_count", 1), "play_count", 1, 20)
         rest = _seconds(step.get("rest_s", 0), "rest_s")
         window = None
+        window_source = None
         if completion_strategy == "timed_exit":
-            window = _seconds(step.get("playback_s"), f"{key}.playback_s", positive=True)
+            if "playback_s" in step and step["playback_s"] is not None:
+                window = _seconds(step["playback_s"], f"{key}.playback_s", positive=True)
+                window_source = "explicit"
+            else:
+                window = saved_playback_window(item, robot_id)
+                window_source = "operator_calibration"
         elif "playback_s" in step:
             raise RoutineError("playback_s 仅用于 timed_exit 定时退出模式")
         issues = []
-        if item.get("verified") is not True:
+        if item.get("verified") is not True and not calibration:
             issues.append("素材尚未真机验证")
         rid = item.get("recording_id")
         if type(rid) is not int or not 0 <= rid <= 65535:
             issues.append("未绑定有效 recording_id")
         if not isinstance(robot_id, str) or not robot_id.strip() or item.get("robot_id") != robot_id:
             issues.append("未绑定当前机器人 robot_id")
-        if not isinstance(item.get("verification_notes"), str) or not item["verification_notes"].strip():
+        if (not calibration and
+                (not isinstance(item.get("verification_notes"), str) or not item["verification_notes"].strip())):
             issues.append("缺少回放验证记录")
         if item.get("completion_strategy") != "operator":
             issues.append("当前只支持 operator 人工确认；自动物理完成策略待验证")
@@ -215,7 +252,7 @@ def check_plan(plan, library, *, dry_run, robot_id, completion_strategy="operato
             warnings.append({"motion": key, "issues": issues})
         item.update(timeout_s=timeout, duration_s=duration)
         normalized.append({"motion": key, "play_count": count, "rest_s": rest,
-                           "playback_s": window, "asset": item})
+                           "playback_s": window, "playback_window_source": window_source, "asset": item})
         plays_per_round += count
         rest_per_round += rest * (count - 1 + (index < len(steps) - 1))
         upper_per_round += ((window if window is not None else timeout) + 6) * count
@@ -247,6 +284,7 @@ def check_plan(plan, library, *, dry_run, robot_id, completion_strategy="operato
                                        + rest_total, 3) if completion_strategy == "timed_exit" else None),
         "steps": [{"motion": s["motion"], "name": s["asset"]["name"],
                    "play_count": s["play_count"], "rest_s": s["rest_s"], "playback_s": s["playback_s"],
+                   "playback_window_source": s["playback_window_source"],
                    "recording_id": s["asset"].get("recording_id"),
                    "verified": s["asset"].get("verified") is True,
                    "internal_repetitions": s["asset"].get("internal_repetitions")}
@@ -362,6 +400,7 @@ class ExerciseRoutinePlugin:
         self._robot_id = plugin_config.get("robot_id", "")
         self._library_path = Path(plugin_config.get("library_path") or
                                   Path(__file__).with_name("resource") / "exercise_motions.json")
+        self._persistent_library = bool(plugin_config.get("library_path"))
         self._sim_clip_s = _seconds(plugin_config.get("dry_run_clip_s", 0.05),
                                     "dry_run_clip_s", maximum=5, positive=True)
         self._lock = threading.RLock()
@@ -379,10 +418,14 @@ class ExerciseRoutinePlugin:
         choices = [{"const": key, "title": item["name"] +
                     (f"（{item['recording_id']}）" if type(item.get("recording_id")) is int else "（未绑定）")}
                    for key, item in self._library.items()]
-        actions = {"ui": "打开动作编排面板", "validate": "预检单个动作", "run": "运行单个动作",
+        actions = {"ui": "打开动作编排面板（需要Core工作台支持）", "validate": "预检顺序编排", "run": "运行顺序编排",
                    "status": "查看进度", "cancel": "停止当前流程",
+                   "register_recordings": "加入101–107（保留现有绑定，新素材需逐个测时验证）",
+                   "calibrate": "播放一个动作并开始测时", "finish_calibration": "确认本次动作完整结束并保存测时",
+                   "continue": "确认当前片段完整结束",
                    "validate_plan": "高级：预检多动作计划", "run_plan": "高级：运行多动作计划"}
-        simple = ["motion", "rounds", "play_count", "rest_s", "round_rest_s",
+        slots = [f"motion_{slot}" for slot in range(2, 8)]
+        simple = ["motion", *slots, "rounds", "play_count", "rest_s", "round_rest_s",
                   "completion_strategy", "playback_s", "dry_run"]
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
@@ -393,10 +436,14 @@ class ExerciseRoutinePlugin:
                                "oneOf": [{"const": k, "title": v} for k, v in actions.items()]},
                     "motion": {"type": "string", "description": "选择动作库中的素材",
                                **({"enum": list(self._library), "oneOf": choices} if choices else {})},
+                    **{key: {"type": "string", "default": "", "description": f"第{index}个动作；留空跳过，按槽位顺序执行",
+                             "enum": ["", *self._library],
+                             "oneOf": [{"const": "", "title": "不添加"}, *choices]}
+                       for index, key in enumerate(slots, 2)},
                     "rounds": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1,
                                "description": "整套轮数，1–20"},
                     "play_count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1,
-                                   "description": "每轮本动作播放次数，1–20"},
+                                   "description": "每轮每个所选动作的播放次数，1–20"},
                     "rest_s": {"type": "number", "minimum": 0, "maximum": 600, "default": 0,
                                "description": "片段之间休息秒数，0–600"},
                     "round_rest_s": {"type": "number", "minimum": 0, "maximum": 600, "default": 0,
@@ -406,7 +453,9 @@ class ExerciseRoutinePlugin:
                                                       {"const": "timed_exit", "title": "按设定秒数退出并重播"}],
                                             "default": "operator"},
                     "playback_s": {"type": "number", "minimum": 0.1, "maximum": 600,
-                                   "description": "定时模式必填；现场核准的播放窗口，到时退出，可能截断动作"},
+                                   "description": "留空自动使用每个动作保存的测时窗口；填写则覆盖所有所选动作，可能截断动作"},
+                    "job_id": {"type": "string", "description": "当前任务的job_id（由开始测时或status返回）"},
+                    "confirmation_token": {"type": "string", "description": "status返回的当前片段确认令牌"},
                     "plan": {"type": "object", "additionalProperties": False,
                              "properties": {"rounds": {"type": "integer", "minimum": 1, "maximum": 20},
                                             "round_rest_s": {"type": "number", "minimum": 0, "maximum": 600},
@@ -428,6 +477,13 @@ class ExerciseRoutinePlugin:
                     "run": {"params": simple + ["confirm"], "required": ["motion"], "description": "按表单启动；默认模拟。"},
                     "status": {"params": [], "description": "查询当前任务。"},
                     "cancel": {"params": [], "description": "停止后续调度并退出本流程回放。"},
+                    "register_recordings": {"params": [], "description": "注册当前机器人101–107；不播放、不覆盖已有绑定或测时。随后刷新服务能力列表。"},
+                    "calibrate": {"params": ["motion", "dry_run", "confirm"], "required": ["motion"],
+                                  "description": "一次只测试一个动作。dry_run=false且confirm=true启动，完整结束后finish_calibration。"},
+                    "finish_calibration": {"params": ["job_id", "confirm"], "required": ["job_id"],
+                                           "description": "只确认指定测时任务；confirm=true表示现场已看到完整结束。成功退出后才保存。"},
+                    "continue": {"params": ["job_id", "confirmation_token", "confirm"],
+                                 "required": ["job_id", "confirmation_token"], "description": "确认当前任务和片段。"},
                     "validate_plan": {"params": ["plan", "completion_strategy", "dry_run"], "required": ["plan"],
                                       "description": "高级多动作计划预检；普通使用请打开面板。"},
                     "run_plan": {"params": ["plan", "completion_strategy", "dry_run", "confirm"], "required": ["plan"],
@@ -436,7 +492,7 @@ class ExerciseRoutinePlugin:
                 "x-workbench": {"protocol": "motus.workbench/1", "kind": "routine",
                                 "title": "Bumi 动作编排", "entry": "ui",
                                 "actions": ["ui", "info", "validate_plan", "run_plan", "continue", "stop"]},
-                "x-completion": {"actions": ["run", "run_plan"], "timeout": MAX_TASK_S + 15},
+                "x-completion": {"actions": ["run", "run_plan", "calibrate"], "timeout": MAX_TASK_S + 15},
                 "x-hooks": {"on_interrupt_motion": {"action": "stop"}, "on_interrupt_all": {"action": "stop"}},
                 "x-stop": {"pending_flags": {"control_reserved": True}},
                 "x-is-dangerous": True, "x-resource": ["base", "leg", "arm_l", "arm_r"],
@@ -485,6 +541,25 @@ class ExerciseRoutinePlugin:
             return self._request_stop()
         if action == "continue":
             return self._confirm(args)
+        if action == "finish_calibration":
+            with self._lock:
+                if not self._job or not self._job.get("calibration") or args.get("job_id") != self._job["id"]:
+                    return {"ok": False, "state": "error", "error": "需要当前单动作测时任务的job_id"}
+                return self._confirm({**args, "confirmation_token": self._job["status"]["confirmation_token"]})
+        if action in {"register_recordings", "calibrate"}:
+            try:
+                self._require_persistent_library()
+                if action == "register_recordings":
+                    return self._register_recordings()
+                if args.get("dry_run") is not False or args.get("confirm") is not True:
+                    raise RoutineError("测时需现场确认：dry_run=false、confirm=true；会真实播放一个动作")
+                p = {"rounds": 1, "steps": [{"motion": args.get("motion")}]}
+                plan, preview = check_plan(p, self._library, dry_run=False, robot_id=self._robot_id,
+                                           calibration=True)
+                return self._run(plan, preview, False, calibration=True,
+                                 await_publication=args.get("_await_response_publication") is True)
+            except (ValueError, TypeError, OSError) as exc:
+                return {"ok": False, "state": "error", "error": str(exc)}
         if action in {"validate", "run", "validate_plan", "run_plan"}:
             try:
                 if self._library_error:
@@ -530,7 +605,86 @@ class ExerciseRoutinePlugin:
                 values["state"] = "stopping"
             job["status"].update(values)
 
-    def _run(self, plan, preview, dry, *, await_publication=False):
+    def _require_persistent_library(self):
+        if self._library_error:
+            raise RoutineError(f"动作库读取失败：{self._library_error}")
+        if not self._persistent_library or not isinstance(self._robot_id, str) or not self._robot_id.strip():
+            raise RoutineError("请先配置当前机器人的robot_id和持久library_path；不会修改默认候选库")
+
+    def _persist_library(self, motions):
+        """Called under _lock; back up and atomically replace only this robot's library."""
+        self._require_persistent_library()
+        if load_library(self._library_path) != self._library:
+            raise RoutineError("磁盘动作库已被外部修改，请重启Driver加载后再操作；未覆盖")
+        data = json.loads(self._library_path.read_text(encoding="utf-8"))
+        data["motions"] = list(motions.values())
+        backup = self._library_path.with_name(self._library_path.name + f".{time.time_ns()}.bak")
+        shutil.copy2(self._library_path, backup)
+        staged = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._library_path.parent,
+                                             prefix=".bumi-library-", delete=False) as output:
+                staged = Path(output.name)
+                json.dump(data, output, ensure_ascii=False, indent=2, allow_nan=False)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(staged, self._library_path)
+        finally:
+            if staged is not None and staged.exists():
+                staged.unlink()
+        self._library = copy.deepcopy(motions)
+        return str(backup)
+
+    def _register_recordings(self):
+        with self._lock:
+            if self._closed or self._busy():
+                raise RoutineError("请先停止编排并确认已退出回放，再注册动作")
+            motions = copy.deepcopy(self._library)
+            added, existing = [], []
+            for recording_id in range(101, 108):
+                matches = [m for m in motions.values() if type(m.get("recording_id")) is int
+                           and m["recording_id"] == recording_id]
+                if len(matches) > 1:
+                    raise RoutineError(f"录制{recording_id}有多个绑定，请先核对素材库")
+                if matches:
+                    existing.append(matches[0]["id"])
+                    continue
+                key = f"recording_{recording_id}"
+                if key in motions:
+                    raise RoutineError(f"素材键{key}已占用，未覆盖")
+                motions[key] = {"id": key, "name": f"动作{recording_id}", "recording_id": recording_id,
+                                "robot_id": self._robot_id, "verified": False,
+                                "verification_notes": "", "duration_s": None, "timeout_s": 120,
+                                "completion_strategy": "operator"}
+                added.append(key)
+            backup = self._persist_library(motions) if added else None
+            return {"ok": True, "state": "registered", "added": added, "existing": existing,
+                    "backup": backup, "motion_sent": False,
+                    "note": "新动作需逐个calibrate验证；重新检测服务能力列表后显示新选项"}
+
+    def _save_calibration(self, job):
+        with self._lock:
+            if job["cancel"].is_set():
+                raise Cancelled()
+            step = job["plan"]["steps"][0]
+            key, asset = step["motion"], step["asset"]
+            seconds = _seconds(job["measured_window_s"], "测时窗口", positive=True)
+            updated = copy.deepcopy(self._library)
+            if (updated[key].get("robot_id") != asset["robot_id"]
+                    or updated[key].get("recording_id") != asset["recording_id"]):
+                raise RoutineError("测时期间素材绑定发生变化，未保存")
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            evidence = {"seconds": seconds, "source": "operator_confirmation", "confirmed_at": stamp,
+                        "robot_id": self._robot_id, "recording_id": asset["recording_id"]}
+            updated[key].update(verified=True, playback_window=evidence)
+            previous_notes = updated[key].get("verification_notes", "")
+            updated[key]["verification_notes"] = (previous_notes + "\n" if previous_notes else "") + (
+                f"{stamp} 现场确认完整回放且退出成功；窗口{seconds:.3f}秒含人工反应时间，非SDK自动完成事件。")
+            backup = self._persist_library(updated)
+            job["status"].update(calibration_saved=True, calibrated_window=evidence, library_backup=backup)
+
+    def _run(self, plan, preview, dry, *, await_publication=False, calibration=False):
         with self._lock:
             if self._closed:
                 return {"ok": False, "state": "error", "error": "驱动正在关闭"}
@@ -542,6 +696,7 @@ class ExerciseRoutinePlugin:
             job_id = "bumi_routine_" + uuid4().hex
             cancel = threading.Event()
             job = {"id": job_id, "dry": dry, "cancel": cancel, "ack": threading.Event(),
+                   "calibration": calibration,
                    "finished": False, "plan": plan, "rest_until": 0.0,
                    "publication": threading.Event(), "notification_done": threading.Event(),
                    "await_publication": await_publication, "published_at": None, "notify": True,
@@ -553,6 +708,7 @@ class ExerciseRoutinePlugin:
                               "total_steps": len(plan["steps"]), "play_index": 0,
                               "play_count": 0, "completed_plays": 0, "exited_plays": 0, "total_plays": preview["total_plays"],
                               "confirmation_token": None, "error": None,
+                              "calibration": calibration, "calibration_saved": False,
                               "progress_source": "scheduler", "sdk_data_freshness": "unverifiable"}}
             if not await_publication:
                 job["publication"].set()
@@ -629,6 +785,7 @@ class ExerciseRoutinePlugin:
                     or job["ack"].is_set()):
                 return {"ok": False, "state": "error", "error": "需要当前任务、当前片段令牌及 confirm=true；不能提前或重复确认"}
             job["ack"].set()
+            job["acknowledged_at"] = time.monotonic()
             return {"ok": True, "state": "confirmation_received", "job_id": job["id"]}
 
     def _guard(self, job, playing=False):
@@ -662,9 +819,11 @@ class ExerciseRoutinePlugin:
             return
         backend = job["backend"]
         backend.play(asset)
+        started_at = time.monotonic()
         if job["plan"]["completion_strategy"] == "timed_exit":
             # A commanded window is not evidence of physical completion.
-            self._update(job, state="playing_window", playback_s=step["playback_s"])
+            self._update(job, state="playing_window", playback_s=step["playback_s"],
+                         playback_window_source=step["playback_window_source"])
             until = time.monotonic() + step["playback_s"]
             while True:
                 self._guard(job, playing=True)
@@ -695,6 +854,10 @@ class ExerciseRoutinePlugin:
         self._update(job, state="running", confirmation_token=None)
         backend.exit()  # Only after explicit confirmation; mode alone never completes.
         self._guard(job)
+        if job["calibration"]:
+            # Capture the acknowledgement time, not SDK-exit latency. A small
+            # upward rounding avoids shortening the observed window on reuse.
+            job["measured_window_s"] = math.ceil((job["acknowledged_at"] - started_at) * 1000) / 1000
 
     def _worker(self, job):
         final_state, error = "completed", None
@@ -720,6 +883,8 @@ class ExerciseRoutinePlugin:
                     self._update(job, state="resting", rest_kind="between_rounds")
                     self._wait(job, plan["round_rest_s"], resting=True)
             self._guard(job)
+            if job["calibration"]:
+                self._save_calibration(job)
         except Cancelled:
             final_state = "cancelled"
         except Exception as exc:

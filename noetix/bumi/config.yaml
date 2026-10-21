@@ -42,6 +42,9 @@ plugins:
     robot_id: ""
     # Default library: resource/exercise_motions.json (all candidates unverified).
     # library_path: /opt/phanthy-motus/data/bumi/exercise_motions.json
+    # With robot_id/library_path configured, register_recordings adds 101–107.
+    # calibrate + finish_calibration saves each clip's operator-measured window
+    # to that library; timed_exit can then omit playback_s, including mixed plans.
     # Explicit simulation time only; never used to end a real clip.
     dry_run_clip_s: 0.05
   mic:
