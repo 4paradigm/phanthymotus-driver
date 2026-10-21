@@ -2333,9 +2333,17 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         message = plugin._skeleton_pub.publish.call_args.args[0]
         payload = json.loads(message.data)
         joint_payload = json.loads(plugin._joint_state_pub.publish.call_args.args[0].data)
-        self.assertEqual(payload["timestamp_ms"], joint_payload["timestamp_ms"])
-        self.assertEqual([0, 90, -90, 45, -45, 180, -180], joint_payload["raw_degree"])
-        self.assertEqual(joint_payload["position"], [j["q"] for j in payload["joints"]])
+        from datetime import datetime
+        self.assertEqual(payload["timestamp_ms"], round(datetime.fromisoformat(joint_payload["时间"]).timestamp() * 1000))
+        self.assertTrue(joint_payload["时间"].endswith("+08:00"))
+        self.assertNotIn("timestamp_ms", joint_payload)
+        self.assertEqual([f"J{i}" for i in range(1, 8)], list(joint_payload["关节角度(°)"]))
+        self.assertEqual([0, 90, -90, 45, -45, 180, -180], list(joint_payload["关节角度(°)"].values()))
+        for actual, joint in zip(joint_payload["关节弧度(rad)"].values(), payload["joints"]):
+            self.assertAlmostEqual(actual, joint["q"], places=6)
+        sample = plugin._joint_state_payload({"position": [-0.00000001] * 7, "raw_degree": [-0.00001] * 7}, 0)
+        self.assertEqual("1970-01-01 08:00:00.000+08:00", sample["时间"])
+        self.assertNotIn("-0.0", json.dumps(sample))
         self.assertIsNone(plugin.dispatch("read", {"_tool_name": "joint_state"}))
         self.assertEqual("sensor/skeleton", payload["format"])
         self.assertEqual("rad", payload["position_unit"])

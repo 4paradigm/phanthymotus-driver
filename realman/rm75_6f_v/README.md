@@ -235,8 +235,9 @@ Existing projects must replace the old card with `joints` and reconnect it.
 
 `joint_state` publishes `data/json` at `/{namespace}/state/joint_state`, using
 the same SDK sample and timestamp as the skeleton stream (default 10 Hz,
-configured by `ros.skeleton_publish_hz`). Payload fields are `timestamp_ms`,
-`name` (joint_1 through joint_7), `position` (radians), `position_unit` (`rad`),
-and `raw_degree` (degrees). Array entries correspond by index. This sensor
+configured by `ros.skeleton_publish_hz`). Payload fields are `时间` (readable date/time with milliseconds and explicit
+UTC+08:00 offset), `关节弧度(rad)` and `关节角度(°)`. Both angle maps use
+keys `J1` through `J7`; radians retain six decimals and degrees three, with
+rounded negative zero normalized to zero. Skeleton timestamps are unchanged. This sensor
 provides a continuous stream without a `read` action. Both streams omit
 samples during disconnection or SDK contention rather than repeating stale data.

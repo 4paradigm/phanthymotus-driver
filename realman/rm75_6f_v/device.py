@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 import math
 import os
 import sys
@@ -83,8 +84,18 @@ class RM75Plugin:
         return [{"topic": self._joint_state_topic, "format": "data/json"}]
 
     def _joint_state_payload(self, state=None, timestamp_ms=None):
-        return {"timestamp_ms": timestamp_ms if timestamp_ms is not None else int(time.time() * 1000),
-                **(self.client.joint_states() if state is None else state)}
+        state = self.client.joint_states() if state is None else state
+        stamp = timestamp_ms / 1000 if timestamp_ms is not None else time.time()
+        # Explicit UTC+08:00: container timezone settings must not change display time.
+        captured = datetime.fromtimestamp(stamp, timezone(timedelta(hours=8)))
+        def readable(values, digits):
+            return {f"J{i}": round(float(value), digits) or 0.0
+                    for i, value in enumerate(values, 1)}
+        return {
+            "时间": captured.isoformat(sep=" ", timespec="milliseconds"),
+            "关节弧度(rad)": readable(state["position"], 6),
+            "关节角度(°)": readable(state["raw_degree"], 3),
+        }
 
     def get_tools(self):
         definitions = [
