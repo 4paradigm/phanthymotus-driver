@@ -447,3 +447,7 @@ ros2 topic echo /<robot_namespace>/motion/state
 ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
+
+## Bumi 动作编排（exercise_routine）
+
+参见 [动作编排开发与真机验证指南](EXERCISE_ROUTINE.md)。默认模拟；三个候选动作均未绑定硬件编号、未验证。真实执行采用逐片段人工确认，无 SDK 物理完成事件，不自动起身。

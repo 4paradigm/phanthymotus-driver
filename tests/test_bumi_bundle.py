@@ -170,3 +170,29 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
 
+
+
+def test_exercise_routine_registers_with_existing_loco_and_is_inert(bundle_module):
+    config = _config(loco_servo=False)
+    config["plugins"]["exercise_routine"] = {"enabled": True}
+    bundle = bundle_module.BumiDeviceBundle(config, "bumi_test", object(), FakeHighCtrl(), None)
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["loco", "exercise_routine"]
+    card = bundle._plugins[1]
+    assert card._loco is bundle._plugins[0]
+    bundle.start_all()
+    assert bundle.dispatch("exercise_routine", {"action": "status"})["state"] == "idle"
+    info = bundle.dispatch("exercise_routine", {"action": "info"})
+    assert info["automatic_physical_completion"] is False
+    assert all(m["verified"] is False for m in info["motions"])
+    bundle.stop_all()
+
+
+@pytest.mark.parametrize("loco,high_ctrl", [(False, FakeHighCtrl()), (True, None)])
+def test_missing_routine_dependency_preserves_other_cards(bundle_module, loco, high_ctrl):
+    config = _config(loco=loco, loco_servo=False)
+    config["plugins"]["exercise_routine"] = {"enabled": True}
+    config["plugins"]["speaker"] = {"enabled": True}
+    bundle = bundle_module.BumiDeviceBundle(config, "bumi", object(), high_ctrl, object())
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["speaker"]
+    bundle.start_all()
+    bundle.stop_all()

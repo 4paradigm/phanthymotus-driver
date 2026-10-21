@@ -36,6 +36,14 @@ plugins:
     min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
     # 已经在走的时候的偏航死区。
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
+  exercise_routine:
+    enabled: true
+    # Fill the target robot identifier only after verifying its recorded clips.
+    robot_id: ""
+    # Default library: resource/exercise_motions.json (all candidates unverified).
+    # library_path: /opt/phanthy-motus/data/bumi/exercise_motions.json
+    # Explicit simulation time only; never used to end a real clip.
+    dry_run_clip_s: 0.05
   mic:
     enabled: true
   sound_direction:

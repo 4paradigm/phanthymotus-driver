@@ -148,6 +148,17 @@ class BumiDeviceBundle:
             ))
             print("[bundle] LocoServoPlugin loaded")
 
+        if plugins_cfg.get("exercise_routine", {}).get("enabled", False):
+            if loco_plugin is None:
+                # Match the existing bundle's graceful degradation: loss of the
+                # body controller must not prevent camera/audio registration.
+                print("[bundle] ExerciseRoutinePlugin skipped: requires loco and HighController")
+            else:
+                from exercise_routine import ExerciseRoutinePlugin
+                self._plugins.append(ExerciseRoutinePlugin(
+                    plugins_cfg["exercise_routine"], loco_plugin))
+                print("[bundle] ExerciseRoutinePlugin loaded")
+
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))
