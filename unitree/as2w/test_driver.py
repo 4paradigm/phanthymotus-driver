@@ -4,6 +4,7 @@ Run with: python3 -m unittest unitree/as2w/test_driver.py
 """
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -112,6 +113,58 @@ class TestDriverContracts(unittest.TestCase):
         self.assertTrue(schema["x-is-dangerous"])
         self.assertIn("confirm", schema["x-action-params"]["front_flip"]["params"])
         self.assertIn("error", plugin.dispatch("front_flip", {}))
+
+    def test_special_action_returns_before_rpc_and_notifies_correct_tool(self):
+        proxy = _Proxy()
+        rpc_returned = threading.Event()
+        notified = threading.Event()
+
+        def quick_flip():
+            rpc_returned.set()
+            return 0
+
+        proxy.FrontFlip = quick_flip
+        plugin = self.device.SpecialActionPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify",
+                          side_effect=lambda *args, **kwargs: notified.set()) as notify:
+            result = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("running", result["status"])
+            self.assertTrue(result["queued"])
+            self.assertIn("action_id", result)
+            self.assertTrue(rpc_returned.wait(1))
+            __import__("time").sleep(0.02)
+            notify.assert_not_called()
+
+            plugin.response_sent(result["action_id"])
+            self.assertTrue(notified.wait(1))
+
+        notify.assert_called_once()
+        self.assertEqual(result["action_id"], notify.call_args.args[0])
+        self.assertEqual("completed", notify.call_args.args[1])
+        self.assertEqual("special_motion", notify.call_args.kwargs["tool"])
+
+    def test_special_action_blocking_rpc_does_not_block_dispatch(self):
+        proxy = _Proxy()
+        rpc_started = threading.Event()
+        release_rpc = threading.Event()
+        notified = threading.Event()
+
+        def blocking_flip():
+            rpc_started.set()
+            self.assertTrue(release_rpc.wait(2))
+            return 0
+
+        proxy.FrontFlip = blocking_flip
+        plugin = self.device.SpecialActionPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify",
+                          side_effect=lambda *args, **kwargs: notified.set()):
+            result = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(result["accepted"])
+            self.assertTrue(rpc_started.wait(1))
+            plugin.response_sent(result["action_id"])
+            release_rpc.set()
+            self.assertTrue(notified.wait(1))
 
     def test_navigation_declares_completion(self):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)

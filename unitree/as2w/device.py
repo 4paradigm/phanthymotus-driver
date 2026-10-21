@@ -72,18 +72,18 @@ def _values(value):
         return [value]
 
 
-def _acp_notify(action_id, status, result):
+def _acp_notify(action_id, status, result, tool="loco"):
     import os, ssl, urllib.request
     endpoint = f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete"
     payload = json.dumps({"action_id": action_id, "status": status,
-                          "result": result, "tool": "loco", "ts": time.time()}).encode()
+                          "result": result, "tool": tool, "ts": time.time()}).encode()
     try:
         request = urllib.request.Request(endpoint,
             data=payload, headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(request, timeout=5, context=ssl._create_unverified_context()) as response:
-            print(f"[loco] ACP complete action_id={action_id} status={status} http={response.status}", flush=True)
+            print(f"[{tool}] ACP complete action_id={action_id} status={status} http={response.status}", flush=True)
     except Exception as exc:
-        print(f"[loco] ACP callback failed action_id={action_id} status={status} endpoint={endpoint} error={str(exc)[:180]}", flush=True)
+        print(f"[{tool}] ACP callback failed action_id={action_id} status={status} endpoint={endpoint} error={str(exc)[:180]}", flush=True)
 
 
 class _StateNode:
@@ -1078,6 +1078,8 @@ class SpecialActionPlugin:
 
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
+        self._response_events = {}
+        self._response_lock = threading.Lock()
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
@@ -1098,6 +1100,40 @@ class SpecialActionPlugin:
 
     def start(self): pass
     def stop(self): pass
+
+    def _run_action(self, action_id, action, current_state, method, response_event):
+        try:
+            ret = method()
+        except Exception as exc:
+            result = {"ret": 3104, "accepted": False, "action": action,
+                      "current_state": current_state,
+                      "error": "SportClient special-action RPC failed",
+                      "rpc_error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                      "suggested_actions": ["get_state", "recovery_stand"]}
+            response_event.wait()
+            _acp_notify(action_id, "error", result, tool=self.PREFIX)
+            return
+
+        response_event.wait()
+        if ret == 0:
+            _acp_notify(action_id, "completed", {
+                "action": action, "ret": 0, "current_state": current_state,
+                "completion_scope": "sport_client_rpc_accepted",
+            }, tool=self.PREFIX)
+        else:
+            _acp_notify(action_id, "error", {
+                "ret": ret, "accepted": False, "action": action,
+                "current_state": current_state,
+                "error": "SportClient rejected the special action",
+                "reason": "The controller refused the special motion from the current posture",
+                "suggested_actions": ["get_state", "recovery_stand"],
+            }, tool=self.PREFIX)
+
+    def response_sent(self, action_id):
+        with self._response_lock:
+            response_event = self._response_events.pop(action_id, None)
+        if response_event is not None:
+            response_event.set()
 
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
@@ -1133,29 +1169,19 @@ class SpecialActionPlugin:
                         "reason": "The robot must be standing and balanced before a special motion",
                         "suggested_actions": ["stand_up", "balance_stand", "recovery_stand"]}
             action_id = f"as2w_special_{uuid4().hex[:8]}"
-            try:
-                ret = methods[action]()
-            except Exception as exc:
-                ret = 3104
-                error = f"{type(exc).__name__}: {str(exc)[:160]}"
-            else:
-                error = None
-            result = {"ret": ret, "accepted": ret == 0, "action": action,
-                      "current_state": state_name, "action_id": action_id}
-            if ret == 0:
-                # SportClient's special-motion calls are synchronous from the
-                # SDK's perspective.  Still publish a terminal ACP event so
-                # callers do not wait forever merely because this is a
-                # one-shot action.
-                _acp_notify(action_id, "completed", {"action": action,
-                             "ret": 0, "current_state": state_name})
-            else:
-                result.update({"error": "SportClient rejected the special action",
-                    "reason": "The controller refused the special motion from the current posture",
-                    "suggested_actions": ["get_state", "recovery_stand"],
-                    **({"rpc_error": error} if error else {})})
-                _acp_notify(action_id, "error", result)
-            return result
+            response_event = threading.Event()
+            with self._response_lock:
+                self._response_events[action_id] = response_event
+            worker = threading.Thread(
+                target=self._run_action,
+                args=(action_id, action, state_name, methods[action], response_event),
+                daemon=True,
+                name=f"as2w-special-{action}",
+            )
+            worker.start()
+            return {"ret": 0, "accepted": True, "status": "running",
+                    "queued": True, "action": action,
+                    "current_state": state_name, "action_id": action_id}
         return None
 
 

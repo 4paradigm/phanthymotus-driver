@@ -82,6 +82,12 @@ class Bundle:
                 return plugin.dispatch(args.pop("action", name), {**args, "_tool_name": name})
         return None
 
+    def action_response_sent(self, action_id):
+        for plugin in self.plugins:
+            mark_sent = getattr(plugin, "response_sent", None)
+            if mark_sent is not None:
+                mark_sent(action_id)
+
 def handler(bundle):
     sse_sessions, sse_lock = {}, threading.Lock()
     class Handler(BaseHTTPRequestHandler):
@@ -159,10 +165,17 @@ def handler(bundle):
             if method == "initialize": result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "as2w-driver", "version": "1.0"}}
             elif method == "tools/list": result = {"tools": bundle.tools()}
             elif method == "tools/call":
-                result = {"content": [{"type": "text", "text": json.dumps(bundle.call(params.get("name", ""), params.get("arguments") or {}))}]}
+                tool_result = bundle.call(params.get("name", ""), params.get("arguments") or {})
+                result = {"content": [{"type": "text", "text": json.dumps(tool_result)}]}
             else:
                 respond({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Method not found: {method}"}}); return
-            respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            try:
+                respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            finally:
+                if method == "tools/call" and isinstance(tool_result, dict):
+                    action_id = tool_result.get("action_id")
+                    if action_id:
+                        bundle.action_response_sent(action_id)
     return Handler
 
 
