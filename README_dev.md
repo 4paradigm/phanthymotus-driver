@@ -53,6 +53,47 @@ Each tool returns a dict containing the following fields:
 | `topic_out` | array | No | List of output ROS2 DDS topics `[{topic, format}]` |
 | `topic_in` | array | No | List of input ROS2 DDS topics `[{format}]` |
 
+### Downloadable file capability (`x-file-download`)
+
+A file-producing tool can expose saved files to Agent Core's independent
+`file_download` card by declaring a read-only listing action inside `inputSchema`:
+
+```json
+"x-file-download": {"protocol": "motus.files/1", "action": "list_files"}
+```
+
+The action name is configurable by the provider; include it in the action schema
+and dispatch it normally. Agent Core discovers the declaration through `tools/list`,
+automatically renders a file output port, and calls the declared action when a
+connected download card is browsed. Multi-instance tools receive the source card's
+`instance_id`. The listing action is hidden from the normal action selector.
+Return a normal MCP text JSON result (or a direct JSON object):
+
+```json
+{"ok": true, "files": [{"name": "example.jpg", "path": "/opt/phanthy-motus/data/photos/example.jpg", "size": 12345, "mime_type": "image/jpeg"}]}
+```
+
+List persistent, completed, nonempty files only; do not start a camera or recording.
+Use an absolute path with a matching basename, and a byte count for `size`.
+`mime_type` defaults to `application/octet-stream` if omitted; image/video filters
+use its prefix. A missing history directory can return an empty list; failures
+return `{"ok": false, "message": "reason"}`. The source is responsible for excluding
+files still being written and refreshing deleted files.
+
+File-reference connections use `format: file/reference` and port index `files`.
+They bind a source to a browser download UI; they are not DDS streams or startup
+dependencies. File bytes use the existing authenticated `/api/file/download`
+endpoint. Driver and Agent Core must mount the shared files at the same absolute
+path; the declaration does not transfer files across container filesystems.
+Existing tools without the declaration keep their behavior and have no file port.
+
+Bumi `vision_capture` implements this with `list_files`, reading its existing
+`photos/*.jpg` and `videos/*.mp4` directories without requiring the camera to be
+running. Photo writes and history scans are synchronized to avoid exposing partial
+JPGs. Empty files, symlinks and the active recording are excluded. Read failures
+are reported as errors. This does
+not validate leftover MP4 integrity after a process crash.
+
 ### Tool Types
 
 - **sensor**: Data stream tool, cannot be called directly. Controlled via `start`/`stop` system actions, data is pushed through ROS2 topics
