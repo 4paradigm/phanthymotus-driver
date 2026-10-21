@@ -64,6 +64,16 @@ def test_invalid_or_unverified_acceleration_units_cannot_calibrate(bad):
     assert not estimator.ready
 
 
+@pytest.mark.parametrize('sample,message', [
+    (imu(acc=(31, 0, 0)), 'IMU acceleration norm 31.000 exceeds experimental limit 30'),
+    (NS(ori=(0, 0, 0, 0), linear_acc=(0, 0, 9.81), angular_vel=(0, 0, 0)),
+     'IMU quaternion norm 0.000 outside experimental range'),
+])
+def test_imu_limit_error_identifies_the_rejected_quantity(sample, message):
+    with pytest.raises(ValueError, match=message):
+        module.decode_imu(sample)
+
+
 def test_calibration_requires_a_continuous_quiet_window():
     estimator = module.ImuOdometry()
     for index in range(200):
@@ -161,6 +171,22 @@ def test_fault_and_cancel_paths_finish_with_brake(monkeypatch, fault):
     assert result['state'] == ('stopped' if fault == 'cancel' else 'error'), result
     assert plant.commands[-1][1:] == (0, 0)
     assert plant.clock < 10
+
+
+def test_acceleration_limit_during_motion_brakes_and_retains_rejected_sample(monkeypatch):
+    plant = Plant(monkeypatch)
+    read = plant._read_distance_imu
+    def shock():
+        return imu(acc=(31, 0, 9.81)) if plant.distance > 0.1 else read()
+    monkeypatch.setattr(plant, '_read_distance_imu', shock)
+    result = module.run_distance(plant, 0.5)
+    assert result['state'] == 'error'
+    assert 'IMU acceleration norm' in result['error']
+    assert not result['stationary_assumed']
+    assert plant.commands[-1][1:] == (0, 0)
+    trace = json.loads(Path(result['imu_trace_path']).read_text())
+    assert trace['samples'][-1]['linear_acceleration_mps2'] == [31, 0, 9.81]
+    assert trace['result']['state'] == 'error'
 
 
 def test_cancel_during_calibration_never_starts_motion(monkeypatch):
