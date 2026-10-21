@@ -1,3 +1,19 @@
+## Reverse-progress protection follow-up
+
+Synced PR408's pure-IMU fault guard: projected progress below -0.05 m in the
+requested starting direction now sends zero velocity and returns error. It
+prevents continuing to chase a positive target using reversed estimated progress;
+it does not establish actual position or a physical stopping-distance bound.
+All four movement directions have synthetic regressions. Existing acceleration,
+heading, lateral, speed, cancellation and source-binding checks remain.
+
+- PR408 IMU/control/card regressions: 156 passed.
+- Combined PR425 fusion/IMU/packaging/deployment-policy regressions: 205 passed.
+- An offline private recorded-read replay verifies earlier fault termination;
+  it is not a robot dynamics simulation or motion accuracy validation.
+- No image build or deployment of this guard was performed. The independent
+  IMU path remains experimental and requires verified input conventions.
+
 ## IMU fault diagnosis follow-up
 
 Synced PR408's diagnostic-only IMU limit change: quaternion norm failures and
