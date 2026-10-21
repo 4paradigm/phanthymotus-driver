@@ -30,7 +30,12 @@ def test_imu_does_not_invent_source_timestamp_or_confidence():
     with pytest.raises(ValueError): imu_reading(sdk,100,200,8,'session')
 
 
-def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(monkeypatch):
+@pytest.mark.parametrize('model,coefficients,accepted', [
+    ('brown_conrady',[0.]*5,True),
+    ('inverse_brown_conrady',[0.]*5,True),
+    ('inverse_brown_conrady',[.01,0.,0.,0.,0.],False),
+])
+def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(monkeypatch,model,coefficients,accepted):
     import sys
     import numpy as np
     from noetix.bumi.odometry_inputs import RawCameraPublisher
@@ -42,7 +47,7 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(monkeypat
     node=NS(create_publisher=lambda cls,topic,qos:NS(publish=messages.setdefault(topic,[]).append))
     monkeypatch.setitem(sys.modules,'sensor_msgs.msg',NS(Image=Image,CameraInfo=Image))
     monkeypatch.setitem(sys.modules,'std_msgs.msg',NS(String=String))
-    intr=NS(fx=100.,fy=101.,ppx=1.,ppy=1.,model='distortion.brown_conrady',coeffs=[0.]*5)
+    intr=NS(fx=100.,fy=101.,ppx=1.,ppy=1.,model='distortion.'+model,coeffs=coefficients)
     color=frame(1000);color.get_data=lambda:np.zeros((2,3,3),dtype='u1')
     color.profile=NS(as_video_stream_profile=lambda:NS(intrinsics=intr))
     depth=frame(1010);depth.get_data=lambda:np.full((2,3),500,dtype='<u2')
@@ -50,6 +55,10 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(monkeypat
     pipeline=NS(get_active_profile=lambda:NS(get_device=lambda:NS(first_depth_sensor=lambda:NS(get_depth_scale=lambda:.002))))
     publisher=RawCameraPublisher(node,'robot',pipeline,object())
     publisher.publish(frames,frames)
+    if not accepted:
+        assert not messages['/robot/odometry_input/info']
+        assert not messages['/robot/odometry_input/camera_meta']
+        return
     raw=messages['/robot/odometry_input/depth'][0]
     assert raw.encoding=='32FC1' and raw.step==12
     assert np.frombuffer(raw.data,dtype='<f4').tolist()==pytest.approx([1.]*6)
