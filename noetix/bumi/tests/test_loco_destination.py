@@ -359,6 +359,25 @@ def test_distance_nonzero_publication_obeys_atomic_stop(monkeypatch):
     assert fake.cmds == [(0, 0, 0)]
 
 
+def test_distance_imu_failure_reaches_acp_as_error_once(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    calls = []
+    monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
+    error = {'state': 'error', 'error': 'IMU acceleration norm exceeds experimental limit',
+             'feedback_source': 'imu_integrated_experimental', 'estimated_distance_m': 0.26}
+    monkeypatch.setattr(plugin, '_do_distance_impl', lambda args: dict(error))
+    started = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': 0.5})
+    plugin._rotate_worker.join(timeout=2)
+    assert not plugin._rotate_worker.is_alive()
+    assert len(calls) == 1
+    assert calls[0][0] == started['action_id']
+    assert calls[0][1] == 'error'
+    assert calls[0][2]['error'] == error['error']
+    assert calls[0][3] == 'loco_target'
+    assert plugin._rotate_status()['last_result']['state'] == 'error'
+
+
 @pytest.mark.parametrize('direction', ['north', None, True, 2, ['left']])
 def test_distance_bad_direction_is_rejected_before_motion(monkeypatch, direction):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))

@@ -19,8 +19,11 @@ def decode_imu(sample):
     if not all(math.isfinite(v) for v in (*q, *acc, *gyro)):
         raise ValueError('IMU contains non-finite data')
     norm = math.hypot(*q)
-    if not 0.8 <= norm <= 1.2 or math.hypot(*acc) > 30:
-        raise ValueError('invalid IMU quaternion or acceleration')
+    if not 0.8 <= norm <= 1.2:
+        raise ValueError(f'IMU quaternion norm {norm:.3f} outside experimental range [0.8, 1.2]')
+    acceleration_norm = math.hypot(*acc)
+    if acceleration_norm > 30:
+        raise ValueError(f'IMU acceleration norm {acceleration_norm:.3f} exceeds experimental limit 30')
     x, y, z, w = (v/norm for v in q)
     ax, ay, az = acc
     tx, ty, tz = 2*(y*az-z*ay), 2*(z*ax-x*az), 2*(x*ay-y*ax)
