@@ -810,6 +810,34 @@ def test_arm_pose_reaches_coach_plan_and_voice_milestone(
                for payload in node.publishers[voice_topic].payloads)
 
 
+@pytest.mark.parametrize("exercise,motion", [
+    ("dumbbell_curl", {"curl": True}),
+    ("lateral_raise", {"lateral_raise": True}),
+])
+def test_arm_coach_accepts_first_rep_immediately_after_ready(
+        plugin_factory, exercise, motion):
+    card, clock, node = plugin_factory({
+        "require_explicit_workout_start": True, "coach_mode": True,
+        "local_milestone_voice": True,
+    })
+    card.dispatch("start", {"input_topic": "/camera/poses/skeleton"})
+    card.dispatch("begin", {"exercise": exercise, "sets": 1,
+                            "reps_per_set": 1, "rest_s": 15})
+    subscription = node.subscriptions[-1]
+    for _ in range(7):
+        _send_pose(subscription, clock, _arm_person())
+        if card._counter.snapshot()["state"] == "ready":
+            break
+    else:
+        pytest.fail("arm counter did not become ready")
+    assert card.dispatch("status", {})["set_state"] == "in_set"
+    for _ in range(5):
+        _send_pose(subscription, clock, _arm_person(**motion))
+    for _ in range(5):
+        _send_pose(subscription, clock, _arm_person())
+    assert card.dispatch("status", {})["count_total"] == 1
+
+
 def test_stale_callback_after_topic_switch_cannot_change_new_session(plugin_factory):
     card, clock, node = plugin_factory()
     card.dispatch("start", {"input_topic": "/camera/a/poses/skeleton"})

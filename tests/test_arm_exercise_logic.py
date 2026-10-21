@@ -10,7 +10,10 @@ INDEX = {name: index for index, name in enumerate(COCO_NAMES)}
 
 
 def person(*, person_id=1, x_offset=0, visibility=0.95,
-           left_visibility=None, curl=False, swing=False,
+           left_visibility=None, right_visibility=None, hip_visibility=None,
+           curl=False, right_curl=False, projected_curl=False,
+           partial_curl=False,
+           right_partial_curl=False, swing=False,
            left_raise=False, right_raise=False, mirrored=False):
     """Front-view synthetic COCO joints; anatomical left is image-right."""
     points = [[450 + x_offset, 200, visibility] for _ in COCO_NAMES]
@@ -24,6 +27,14 @@ def person(*, person_id=1, x_offset=0, visibility=0.95,
     }
     if curl:
         arms.update({"left_elbow": (492, 280), "left_wrist": (548, 250)})
+    if right_curl:
+        arms.update({"right_elbow": (408, 280), "right_wrist": (352, 250)})
+    if projected_curl:
+        arms["left_wrist"] = (556, 291)
+    if partial_curl:
+        arms["left_wrist"] = (525, 302)
+    if right_partial_curl:
+        arms["right_wrist"] = (375, 302)
     if swing:
         arms.update({"left_elbow": (550, 223), "left_wrist": (610, 226)})
     if left_raise:
@@ -34,7 +45,11 @@ def person(*, person_id=1, x_offset=0, visibility=0.95,
         if mirrored:
             x = 900 - x
         side_visibility = (left_visibility if name.startswith("left_") and
-                           left_visibility is not None else visibility)
+                           left_visibility is not None else
+                           right_visibility if name.startswith("right_") and
+                           right_visibility is not None else visibility)
+        if name.endswith("_hip") and hip_visibility is not None:
+            side_visibility = hip_visibility
         points[INDEX[name]] = [x + x_offset, y, side_visibility]
     for name, coordinates in {
         "left_knee": (475, 455), "right_knee": (425, 455),
@@ -66,9 +81,9 @@ class Sequence:
         self.events.extend(events)
         return events
 
-    def hold(self, frames=7, **kwargs):
+    def hold(self, frames=7, dt=0.1, **kwargs):
         for _ in range(frames):
-            self.frame(person(**kwargs))
+            self.frame(person(**kwargs), dt=dt)
 
     def reps(self):
         return [event for event in self.events
@@ -97,19 +112,45 @@ def test_curl_counts_complete_selected_arm_cycle_and_keeps_absolute_total():
     assert [event["count_total"] for event in sequence.reps()] == [1, 2]
 
 
-def test_curl_does_not_switch_to_other_arm_or_count_straight_arm_swing():
+def test_curl_chooses_moving_arm_and_can_alternate_without_double_counting():
     sequence = Sequence("dumbbell_curl")
     sequence.hold(left_visibility=0.99)
-    for _ in range(7):
-        other = person(left_visibility=0.99)
-        other["keypoints"][INDEX["right_wrist"]] = [355, 250, 0.95]
-        sequence.frame(other)
+    assert sequence.counter.snapshot()["side"] == "left"
+    sequence.hold(5, left_visibility=0.99, right_curl=True)
+    assert sequence.counter.snapshot()["side"] == "right"
     sequence.hold(5, left_visibility=0.99)
+    sequence.hold(5, left_visibility=0.99, curl=True)
+    assert sequence.counter.snapshot()["side"] == "left"
+    sequence.hold(5, left_visibility=0.99)
+    assert sequence.counter.snapshot()["count_total"] == 2
+    assert [event["count_total"] for event in sequence.reps()] == [1, 2]
+
+
+def test_curl_does_not_count_straight_arm_swing_or_double_count_both_arms():
+    sequence = Sequence("dumbbell_curl")
+    sequence.hold(left_visibility=0.99)
     sequence.hold(6, left_visibility=0.99, swing=True)
     sequence.hold(5, left_visibility=0.99)
     assert sequence.reps() == []
+    sequence.hold(5, left_visibility=0.99, curl=True, right_curl=True)
+    sequence.hold(5, left_visibility=0.99)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    assert len(sequence.reps()) == 1
+
+
+def test_held_other_arm_cannot_be_reused_as_a_second_curl():
+    sequence = Sequence("dumbbell_curl")
+    sequence.hold()
+    sequence.hold(5, curl=True, right_curl=True)
     assert sequence.counter.snapshot()["side"] == "left"
-    assert sequence.counter.snapshot()["count_total"] == 0
+    sequence.hold(5, right_curl=True)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    sequence.hold(5, right_curl=True)
+    sequence.hold(5)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    sequence.hold(5, right_curl=True)
+    sequence.hold(5)
+    assert sequence.counter.snapshot()["count_total"] == 2
 
 
 def test_curl_frame_gap_cancels_partial_repetition_and_rearms():
@@ -125,20 +166,24 @@ def test_curl_frame_gap_cancels_partial_repetition_and_rearms():
     assert sequence.counter.snapshot()["count_total"] == 1
 
 
-def test_curl_missing_selected_arm_does_not_reacquire_via_other_arm():
+def test_curl_long_occlusion_of_active_arm_requires_rearm():
     sequence = Sequence("dumbbell_curl")
     sequence.hold(left_visibility=0.99)
+    sequence.hold(5, left_visibility=0.99, curl=True)
     sequence.hold(15, left_visibility=0.05)
-    assert sequence.counter.snapshot()["target_state"] == "missing"
-    assert sequence.counter.snapshot()["state"] == "paused"
     assert [event["type"] for event in sequence.events].count("target_lost") == 1
-    assert not any(event["type"] == "target_reacquired"
-                   for event in sequence.events)
-    sequence.hold(6, left_visibility=0.99)
+    # The clear right arm may rearm after the grace period, but the interrupted
+    # left-arm repetition must never be counted on the next return to rest.
     assert [event["type"] for event in sequence.events].count(
         "target_reacquired") == 1
     assert sequence.counter.snapshot()["state"] == "ready"
     assert sequence.counter.snapshot()["count_total"] == 0
+    sequence.hold(6, left_visibility=0.99)
+    assert sequence.counter.snapshot()["state"] == "ready"
+    assert sequence.counter.snapshot()["count_total"] == 0
+    sequence.hold(5, right_curl=True)
+    sequence.hold(5)
+    assert sequence.counter.snapshot()["count_total"] == 1
 
 
 def test_lateral_raise_requires_both_arms_and_counts_after_full_return():
@@ -164,6 +209,161 @@ def test_lateral_raise_recognizes_mirrored_camera_orientation():
     sequence.hold(5, mirrored=True)
     assert sequence.counter.snapshot()["count_total"] == 1
     assert len(sequence.reps()) == 1
+
+
+def test_curl_two_frame_peak_and_short_return_at_pose_frame_rate():
+    sequence = Sequence("dumbbell_curl")
+    dt = 1 / 12
+    sequence.hold(8, dt=dt, left_visibility=0.99)
+    sequence.hold(4, dt=dt, left_visibility=0.99, partial_curl=True)
+    sequence.hold(2, dt=dt, left_visibility=0.99, curl=True)
+    sequence.hold(2, dt=dt, left_visibility=0.99, partial_curl=True)
+    sequence.hold(2, dt=dt, left_visibility=0.99)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    assert len(sequence.reps()) == 1
+
+
+def test_continuous_curls_count_with_only_two_low_frames_between_reps():
+    sequence = Sequence("dumbbell_curl")
+    dt = 1 / 12
+    sequence.hold(8, dt=dt)
+    for _ in range(3):
+        sequence.hold(6, dt=dt, curl=True)
+        sequence.hold(2, dt=dt)
+    assert [event["count_total"] for event in sequence.reps()] == [1, 2, 3]
+
+
+def test_projected_curl_near_100_degrees_counts_but_swing_does_not():
+    sequence = Sequence("dumbbell_curl")
+    sequence.hold()
+    sequence.hold(5, projected_curl=True)
+    assert 95 <= sequence.counter.diagnostics()["measurements"]["elbow_angle_deg"] <= 105
+    sequence.hold(5)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    sequence.hold(5, swing=True)
+    sequence.hold(5)
+    assert sequence.counter.snapshot()["count_total"] == 1
+
+
+def test_one_unreadable_wrist_or_missing_person_preserves_observed_peak():
+    for missing_person in (False, True):
+        sequence = Sequence("dumbbell_curl")
+        dt = 1 / 12
+        sequence.hold(8, dt=dt, left_visibility=0.99)
+        sequence.hold(5, dt=dt, left_visibility=0.99, curl=True)
+        if missing_person:
+            sequence.frame(dt=dt)
+        else:
+            sequence.frame(person(left_visibility=0.05), dt=dt)
+        assert sequence.counter.snapshot()["state"] == "paused"
+        sequence.hold(2, dt=dt, left_visibility=0.99)
+        assert sequence.counter.snapshot()["count_total"] == 1
+        sequence.hold(5, dt=dt, left_visibility=0.99)
+        assert len(sequence.reps()) == 1
+
+
+def test_missing_frame_restarts_initial_rest_dwell():
+    sequence = Sequence("dumbbell_curl")
+    dt = 1 / 12
+    sequence.hold(3, dt=dt)
+    sequence.frame(dt=dt)
+    sequence.hold(3, dt=dt)
+    assert sequence.counter.snapshot()["state"] == "calibrating"
+    assert sequence.counter.snapshot()["calibrated"] is False
+    sequence.hold(3, dt=dt)
+    assert sequence.counter.snapshot()["state"] == "ready"
+
+
+def test_single_noisy_peak_or_return_frame_cannot_complete_curl():
+    sequence = Sequence("dumbbell_curl")
+    dt = 1 / 12
+    sequence.hold(8, dt=dt)
+    sequence.hold(4, dt=dt, partial_curl=True)
+    sequence.hold(1, dt=dt, curl=True)
+    sequence.hold(4, dt=dt)
+    assert sequence.counter.snapshot()["count_total"] == 0
+    sequence.hold(5, dt=dt, curl=True)
+    sequence.hold(1, dt=dt)
+    sequence.hold(3, dt=dt, curl=True)
+    sequence.hold(3, dt=dt)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    assert len(sequence.reps()) == 1
+
+
+def test_lateral_raise_allows_staggered_peaks_but_not_one_arm():
+    sequence = Sequence("lateral_raise")
+    dt = 1 / 12
+    sequence.hold(8, dt=dt)
+    sequence.hold(3, dt=dt, left_raise=True)
+    sequence.hold(3, dt=dt, right_raise=True)
+    sequence.hold(2, dt=dt)
+    assert sequence.counter.snapshot()["count_total"] == 1
+    sequence.hold(6, dt=dt, left_raise=True)
+    sequence.hold(4, dt=dt)
+    assert sequence.counter.snapshot()["count_total"] == 1
+
+
+def test_lateral_raise_single_wrist_dropout_keeps_confirmed_peak():
+    sequence = Sequence("lateral_raise")
+    dt = 1 / 12
+    sequence.hold(8, dt=dt)
+    sequence.hold(5, dt=dt, left_raise=True, right_raise=True)
+    obscured = person(left_raise=True, right_raise=True)
+    obscured["keypoints"][INDEX["left_wrist"]][2] = 0.05
+    sequence.frame(obscured, dt=dt)
+    assert sequence.counter.snapshot()["state"] == "paused"
+    sequence.hold(2, dt=dt)
+    assert sequence.counter.snapshot()["count_total"] == 1
+
+
+def test_lateral_raise_missing_frame_cannot_complete_unconfirmed_peak():
+    sequence = Sequence("lateral_raise")
+    dt = 1 / 12
+    sequence.hold(8, dt=dt)
+    sequence.frame(person(left_raise=True, right_raise=True), dt=dt)
+    sequence.frame(dt=dt)
+    sequence.frame(person(left_raise=True, right_raise=True), dt=dt)
+    for _ in range(3):
+        lowering = person(left_raise=True, right_raise=True)
+        lowering["keypoints"][INDEX["left_wrist"]][1] = 265
+        lowering["keypoints"][INDEX["right_wrist"]][1] = 265
+        sequence.frame(lowering, dt=dt)
+    sequence.hold(2, dt=dt)
+    assert sequence.counter.snapshot()["count_total"] == 0
+
+
+def test_lateral_raise_accepts_slight_overshoot_but_rejects_overhead():
+    sequence = Sequence("lateral_raise")
+    sequence.hold()
+    for _ in range(5):
+        raised = person(left_raise=True, right_raise=True)
+        raised["keypoints"][INDEX["left_wrist"]][1] = 150
+        raised["keypoints"][INDEX["right_wrist"]][1] = 150
+        sequence.frame(raised)
+    sequence.hold(5)
+    assert sequence.counter.snapshot()["count_total"] == 1
+
+    overhead = Sequence("lateral_raise")
+    overhead.hold()
+    for _ in range(5):
+        raised = person(left_raise=True, right_raise=True)
+        raised["keypoints"][INDEX["left_wrist"]][1] = 80
+        raised["keypoints"][INDEX["right_wrist"]][1] = 80
+        overhead.frame(raised)
+    overhead.hold(5)
+    assert overhead.counter.snapshot()["count_total"] == 0
+
+
+def test_missing_hips_use_upper_arm_scale_for_both_exercises():
+    for exercise, raised in (("dumbbell_curl", {"curl": True}),
+                             ("lateral_raise", {"left_raise": True,
+                                                "right_raise": True})):
+        sequence = Sequence(exercise)
+        sequence.hold(7, hip_visibility=0.05)
+        assert sequence.counter.snapshot()["state"] == "ready"
+        sequence.hold(5, hip_visibility=0.05, **raised)
+        sequence.hold(5, hip_visibility=0.05)
+        assert sequence.counter.snapshot()["count_total"] == 1
 
 
 def test_target_lock_prefers_clearest_person_and_switch_creates_new_session():

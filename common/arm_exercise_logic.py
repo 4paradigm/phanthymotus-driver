@@ -24,28 +24,30 @@ EXERCISES = ("dumbbell_curl", "lateral_raise")
 DEFAULT_CONFIG = {
     "min_visibility": 0.30,
     "initial_dwell_s": 0.35,
-    "peak_dwell_s": 0.12,
-    "return_dwell_s": 0.18,
-    "min_rep_s": 0.55,
+    "peak_dwell_s": 0.07,
+    "return_dwell_s": 0.07,
+    "min_rep_s": 0.45,
     "max_rep_s": 12.0,
-    "smoothing_frames": 3,
+    "smoothing_frames": 1,
     "max_frame_gap_s": 0.50,
     "lost_grace_s": 0.50,
     "switch_after_s": 1.0,
     "curl_rest_min_deg": 145.0,
     "curl_start_max_deg": 130.0,
-    "curl_peak_max_deg": 82.0,
+    "curl_peak_max_deg": 105.0,
     "curl_upper_arm_vertical_min_ratio": 0.45,
     "curl_elbow_shift_max_ratio": 0.65,
     "curl_rest_wrist_drop_min_ratio": 0.35,
-    "curl_peak_wrist_rise_min_ratio": 0.05,
+    "curl_peak_wrist_drop_max_ratio": 0.20,
     "lateral_shoulder_span_min_ratio": 0.45,
     "lateral_elbow_min_deg": 125.0,
     "lateral_rest_wrist_drop_min_ratio": 0.60,
     "lateral_start_wrist_drop_max_ratio": 0.45,
     "lateral_peak_wrist_level_max_ratio": 0.35,
+    "lateral_peak_wrist_above_max_ratio": 0.55,
     "lateral_start_reach_min_ratio": 0.25,
     "lateral_peak_reach_min_ratio": 0.63,
+    "lateral_peak_window_s": 0.60,
 }
 
 
@@ -110,11 +112,29 @@ def _summary(candidate: _Candidate) -> dict:
             "readable": candidate.readable, "side": candidate.preferred_side}
 
 
+def _torso_scale(points: dict[str, tuple[float, float, float]], side: str,
+                 min_visibility: float) -> float | None:
+    shoulder = points.get(f"{side}_shoulder")
+    elbow = points.get(f"{side}_elbow")
+    if (shoulder is None or elbow is None or
+            min(shoulder[2], elbow[2]) < min_visibility):
+        return None
+    upper_arm = _distance(shoulder, elbow)
+    if upper_arm < 1:
+        return None
+    hip = points.get(f"{side}_hip")
+    if hip is not None and hip[2] >= min_visibility:
+        torso = _distance(shoulder, hip)
+        if torso >= 1:
+            return torso
+    return 2.0 * upper_arm
+
+
 class ArmExerciseCounter:
     """Count complete upper-body movement cycles for one locked person.
 
-    ``dumbbell_curl`` follows the clearer arm selected on target lock and never
-    changes arms within the session. ``lateral_raise`` requires both arms.
+    ``dumbbell_curl`` chooses the arm that begins moving and holds it for one
+    repetition. ``lateral_raise`` requires both arms.
     ``snapshot`` is authoritative; events contain sparse absolute totals.
     """
 
@@ -158,12 +178,22 @@ class ArmExerciseCounter:
         self._loss_since: float | None = None
         self._loss_reported = False
         self._needs_rearm = False
+        self._paused_state: str | None = None
         self._rest_since: float | None = None
         self._peak_since: float | None = None
         self._return_since: float | None = None
         self._motion_started: float | None = None
         self._recent: deque[dict[str, float]] = deque(
             maxlen=self.config["smoothing_frames"])
+        self._recent_by_side = {
+            side: deque(maxlen=self.config["smoothing_frames"])
+            for side in ("left", "right")
+        }
+        self._rest_ready_sides: set[str] = set()
+        self._lateral_peak_since: dict[str, float | None] = {
+            "left": None, "right": None}
+        self._lateral_peak_confirmed: dict[str, float | None] = {
+            "left": None, "right": None}
         self._debug_sample: dict[str, float] | None = None
         self._debug_selected: dict | None = None
         self._debug_candidates: list[dict] = []
@@ -201,6 +231,8 @@ class ArmExerciseCounter:
                                    if self._debug_frame_gap_s is not None else None),
             "state": self._state, "target_state": self._target_state,
             "needs_rearm": self._needs_rearm,
+            "paused_state": self._paused_state,
+            "rest_ready_sides": sorted(self._rest_ready_sides),
             "selected_target": {
                 "id": _safe_id(self.target_id),
                 "bbox": (list(selected["bbox"]) if selected is not None else
@@ -221,6 +253,7 @@ class ArmExerciseCounter:
                 "peak_dwell_elapsed_s": elapsed(self._peak_since),
                 "return_dwell_elapsed_s": elapsed(self._return_since),
             },
+            "lateral_peak_confirmed": dict(self._lateral_peak_confirmed),
             "thresholds": dict(self.config), "reason": self._debug_reason,
         }
 
@@ -249,7 +282,7 @@ class ArmExerciseCounter:
             peak = (arm_stable and
                     sample["elbow_angle_deg"] <= cfg["curl_peak_max_deg"] and
                     sample["wrist_rise_ratio"] >=
-                    cfg["curl_peak_wrist_rise_min_ratio"])
+                    -cfg["curl_peak_wrist_drop_max_ratio"])
             return {"arm_stable": arm_stable, "rest": rest,
                     "start": start, "peak": peak}
         bilateral = all(
@@ -268,7 +301,8 @@ class ArmExerciseCounter:
                 cfg["lateral_start_reach_min_ratio"]
             for side in ("left", "right")))
         raised = [
-            abs(sample[f"{side}_wrist_drop_ratio"]) <=
+            -cfg["lateral_peak_wrist_above_max_ratio"] <=
+                sample[f"{side}_wrist_drop_ratio"] <=
                 cfg["lateral_peak_wrist_level_max_ratio"] and
             sample[f"{side}_outward_reach_ratio"] >=
                 cfg["lateral_peak_reach_min_ratio"]
@@ -294,6 +328,9 @@ class ArmExerciseCounter:
         if gap > self.config["max_frame_gap_s"]:
             self._cancel_partial(require_rearm=True)
             self._recent.clear()
+            for recent in self._recent_by_side.values():
+                recent.clear()
+            self._paused_state = None
         candidates = self._candidates(payload)
         self._debug_candidates = [_summary(candidate) for candidate in candidates]
         events: list[dict] = []
@@ -316,8 +353,20 @@ class ArmExerciseCounter:
         if self._loss_since is None:
             self._loss_since = (self._last_seen_time if self._last_seen_time is not None
                                 else timestamp)
-        self._cancel_partial(require_rearm=True)
-        self._recent.clear()
+            self._paused_state = self._state
+            # Dwell needs consecutive observed poses; missing time must not
+            # confirm an unseen calibration, peak, or return.
+            self._rest_since = None
+            self._peak_since = None
+            self._return_since = None
+            for side in ("left", "right"):
+                self._lateral_peak_since[side] = None
+            self._recent.clear()
+            for recent in self._recent_by_side.values():
+                recent.clear()
+        if timestamp - self._loss_since >= self.config["lost_grace_s"]:
+            self._cancel_partial(require_rearm=True)
+            self._paused_state = None
         self._target_state = "missing"
         self._state = "paused"
         self._debug_reason = "target_unreadable" if matched else "target_missing"
@@ -326,8 +375,8 @@ class ArmExerciseCounter:
             self._loss_reported = True
             events.append(self._emit("target_lost", timestamp))
         if timestamp - self._loss_since >= self.config["switch_after_s"]:
-            # A curl may still see the opposite arm after its selected arm is
-            # occluded. That cannot reacquire this session or change arms.
+            # Keep the same person when its detector ID survives; any partial
+            # curl was already cancelled before another arm can rearm.
             best = self._best([
                 candidate for candidate in candidates
                 if candidate.person_id != self.target_id or self._usable(candidate)
@@ -388,24 +437,26 @@ class ArmExerciseCounter:
             side_quality = {}
             for side in ("left", "right"):
                 confidence = [points.get(f"{side}_{joint}", (0, 0, 0))[2]
-                              for joint in ("shoulder", "elbow", "wrist", "hip")]
+                              for joint in ("shoulder", "elbow", "wrist")]
                 if min(confidence) >= self.config["min_visibility"]:
-                    side_quality[side] = sum(confidence) / 4
+                    side_quality[side] = sum(confidence) / 3
             preferred = max(side_quality, key=side_quality.get) if side_quality else None
             readable = (bool(side_quality) if self.exercise == "dumbbell_curl"
                         else len(side_quality) == 2)
             if readable and self.exercise == "lateral_raise":
                 left_shoulder = points["left_shoulder"]
                 right_shoulder = points["right_shoulder"]
-                torso = median((_distance(points["left_shoulder"],
-                                          points["left_hip"]),
-                                _distance(points["right_shoulder"],
-                                          points["right_hip"])))
+                scales = [_torso_scale(points, side, self.config["min_visibility"])
+                          for side in ("left", "right")]
+                valid_scales = [scale for scale in scales if scale is not None]
+                torso = median(valid_scales) if len(valid_scales) == 2 else 0
                 readable = (torso >= 1 and
                             abs(left_shoulder[0] - right_shoulder[0]) / torso >=
                             self.config["lateral_shoulder_span_min_ratio"])
-            coverage = sum(1 for point in points.values()
-                           if point[2] >= self.config["min_visibility"]) / 8
+            coverage = sum(1 for side in ("left", "right")
+                           for joint in ("shoulder", "elbow", "wrist")
+                           if points.get(f"{side}_{joint}", (0, 0, 0))[2] >=
+                           self.config["min_visibility"]) / 6
             area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             size = min(1.0, math.sqrt(area / max(width * height, 1.0)) * 2)
             cx, cy = _center(bbox)
@@ -432,7 +483,15 @@ class ArmExerciseCounter:
         if not candidate.readable:
             return False
         if self.exercise == "dumbbell_curl":
-            return self._side is not None and self._measure_curl(candidate, self._side) is not None
+            active_side = (self._state in ("moving", "peak", "returning") or
+                           self._state == "paused" and
+                           self._paused_state in ("moving", "peak", "returning")
+                           and not self._needs_rearm)
+            if active_side:
+                return (self._side is not None and
+                        self._measure_curl(candidate, self._side) is not None)
+            return any(self._measure_curl(candidate, side) is not None
+                       for side in ("left", "right"))
         return self._measure_lateral(candidate) is not None
 
     def _match(self, candidates: list[_Candidate], timestamp: float) -> _Candidate | None:
@@ -484,8 +543,12 @@ class ArmExerciseCounter:
         self._loss_since = None
         self._loss_reported = False
         self._needs_rearm = False
+        self._paused_state = None
         self._rest_since = None
         self._recent.clear()
+        for recent in self._recent_by_side.values():
+            recent.clear()
+        self._rest_ready_sides.clear()
         self._debug_selected = _summary(candidate)
         self._cancel_partial()
         self._debug_reason = "target_changed" if changed else "target_locked"
@@ -502,10 +565,19 @@ class ArmExerciseCounter:
         self._target_box = candidate.bbox
         self._target_state = "tracking"
         if was_missing:
-            self._state = "rearming" if self._calibrated else "calibrating"
-            self._needs_rearm = self._calibrated
-            self._rest_since = None
-            self._recent.clear()
+            short_loss = (timestamp - self._loss_since < self.config["lost_grace_s"]
+                          and self._paused_state is not None and not self._needs_rearm)
+            if short_loss:
+                self._state = self._paused_state
+            else:
+                self._state = "rearming" if self._calibrated else "calibrating"
+                self._needs_rearm = self._calibrated
+                self._rest_since = None
+                self._recent.clear()
+                for recent in self._recent_by_side.values():
+                    recent.clear()
+                self._rest_ready_sides.clear()
+            self._paused_state = None
         if self._loss_reported:
             events.append(self._emit("target_reacquired", timestamp))
         self._loss_since = None
@@ -514,17 +586,18 @@ class ArmExerciseCounter:
     def _measure_curl(self, candidate: _Candidate,
                       side: str) -> dict[str, float] | None:
         points = [candidate.points.get(f"{side}_{joint}")
-                  for joint in ("shoulder", "elbow", "wrist", "hip")]
+                  for joint in ("shoulder", "elbow", "wrist")]
         if any(point is None or point[2] < self.config["min_visibility"]
                for point in points):
             return None
-        shoulder, elbow, wrist, hip = points
+        shoulder, elbow, wrist = points
         elbow_angle = _angle(shoulder, elbow, wrist)
         upper_length = _distance(shoulder, elbow)
         forearm_length = _distance(elbow, wrist)
-        torso_length = _distance(shoulder, hip)
+        torso_length = _torso_scale(candidate.points, side,
+                                    self.config["min_visibility"])
         if (elbow_angle is None or min(upper_length, forearm_length,
-                                     torso_length) < 1):
+                                     torso_length or 0) < 1):
             return None
         return {
             "elbow_angle_deg": elbow_angle,
@@ -540,15 +613,16 @@ class ArmExerciseCounter:
         arm_positions: dict[str, tuple[tuple, tuple, float]] = {}
         for side in ("left", "right"):
             points = [candidate.points.get(f"{side}_{joint}")
-                      for joint in ("shoulder", "elbow", "wrist", "hip")]
+                      for joint in ("shoulder", "elbow", "wrist")]
             if any(point is None or point[2] < self.config["min_visibility"]
                    for point in points):
                 return None
-            shoulder, elbow, wrist, hip = points
+            shoulder, elbow, wrist = points
             elbow_angle = _angle(shoulder, elbow, wrist)
             arm_length = _distance(shoulder, elbow) + _distance(elbow, wrist)
-            torso_length = _distance(shoulder, hip)
-            if elbow_angle is None or min(arm_length, torso_length) < 1:
+            torso_length = _torso_scale(candidate.points, side,
+                                        self.config["min_visibility"])
+            if elbow_angle is None or min(arm_length, torso_length or 0) < 1:
                 return None
             shoulder_points[side] = shoulder
             torso_lengths.append(torso_length)
@@ -572,19 +646,87 @@ class ArmExerciseCounter:
         self._last_seen_time = timestamp
         self._target_box = candidate.bbox
         self._debug_selected = _summary(candidate)
-        sample = (self._measure_curl(candidate, self._side)
-                  if self.exercise == "dumbbell_curl" else
-                  self._measure_lateral(candidate))
+        if self.exercise == "dumbbell_curl":
+            samples: dict[str, dict[str, float]] = {}
+            active_rep = self._state in ("moving", "peak", "returning")
+            for side in ("left", "right"):
+                measured = self._measure_curl(candidate, side)
+                recent = self._recent_by_side[side]
+                if measured is None:
+                    recent.clear()
+                    if active_rep and side != self._side:
+                        self._rest_ready_sides.discard(side)
+                    continue
+                recent.append(measured)
+                samples[side] = {key: median(item[key] for item in recent)
+                                 for key in measured}
+                if self._checks(samples[side])["rest"]:
+                    self._rest_ready_sides.add(side)
+                elif active_rep and side != self._side:
+                    # The other arm must still be at rest during this rep to
+                    # be eligible for the next one. An old rest observation
+                    # cannot turn a held curl into a second repetition.
+                    self._rest_ready_sides.discard(side)
+            if self._state == "ready":
+                started = [side for side, value in samples.items()
+                           if side in self._rest_ready_sides and
+                           self._checks(value)["start"]]
+                if started:
+                    # A clearer idle arm is not necessarily the arm being
+                    # curled. Choose from observed motion, then hold that arm
+                    # until the repetition returns to rest.
+                    self._side = min(started,
+                                     key=lambda side: samples[side]["elbow_angle_deg"])
+                    self._debug_sample = samples[self._side]
+                    self._step(self._debug_sample, timestamp, events)
+                else:
+                    display_side = (self._side if self._side in samples else
+                                    candidate.preferred_side)
+                    self._debug_sample = samples.get(display_side)
+                    self._debug_reason = "waiting_for_movement"
+                return
+            if self._state in ("calibrating", "rearming"):
+                rest_sides = [side for side, value in samples.items()
+                              if self._checks(value)["rest"]]
+                if rest_sides:
+                    self._side = (candidate.preferred_side
+                                  if candidate.preferred_side in rest_sides else
+                                  rest_sides[0])
+                elif self._side not in samples:
+                    self._side = (candidate.preferred_side
+                                  if candidate.preferred_side in samples else
+                                  next(iter(samples), None))
+            sample = samples.get(self._side)
+        else:
+            sample = self._measure_lateral(candidate)
         if sample is None:
             self._cancel_partial(require_rearm=True)
             self._state = "rearming" if self._calibrated else "calibrating"
             self._debug_reason = "target_geometry_invalid"
             return
-        self._recent.append(sample)
-        smoothed = {key: median(item[key] for item in self._recent)
-                    for key in sample}
-        self._debug_sample = smoothed
-        self._step(smoothed, timestamp, events)
+        if self.exercise == "lateral_raise":
+            self._recent.append(sample)
+            sample = {key: median(item[key] for item in self._recent)
+                      for key in sample}
+        self._debug_sample = sample
+        self._step(sample, timestamp, events)
+
+    def _track_lateral_peaks(self, checks: dict[str, bool], timestamp: float) -> bool:
+        for side in ("left", "right"):
+            raised = (checks["arms_extended"] and checks["front_view"] and
+                      checks[f"{side}_raised"])
+            if not raised:
+                self._lateral_peak_since[side] = None
+                continue
+            if self._lateral_peak_since[side] is None:
+                self._lateral_peak_since[side] = timestamp
+            if timestamp - self._lateral_peak_since[side] >= self.config["peak_dwell_s"]:
+                self._lateral_peak_confirmed[side] = timestamp
+        left = self._lateral_peak_confirmed["left"]
+        right = self._lateral_peak_confirmed["right"]
+        return (left is not None and right is not None and
+                abs(left - right) <= self.config["lateral_peak_window_s"] and
+                timestamp - min(left, right) <= self.config["lateral_peak_window_s"])
 
     def _step(self, sample: dict[str, float], timestamp: float,
               events: list[dict]) -> None:
@@ -612,9 +754,14 @@ class ArmExerciseCounter:
             return
         if self._state == "ready":
             if start:
+                self._clear_lateral_peaks()
                 self._state = "moving"
                 self._motion_started = timestamp
-                self._peak_since = timestamp if peak else None
+                if self.exercise == "lateral_raise":
+                    self._track_lateral_peaks(checks, timestamp)
+                    self._peak_since = None
+                else:
+                    self._peak_since = timestamp if peak else None
                 self._debug_reason = "movement_started"
             else:
                 self._debug_reason = "waiting_for_movement"
@@ -626,11 +773,17 @@ class ArmExerciseCounter:
             self._debug_reason = "movement_timeout"
             return
         if self._state == "moving":
+            peak_reached = (self._track_lateral_peaks(checks, timestamp)
+                            if self.exercise == "lateral_raise" else peak)
             if rest:
                 self._cancel_partial()
                 self._state = "ready"
                 self._debug_reason = "incomplete_returned_to_rest"
-            elif peak:
+            elif peak_reached:
+                if self.exercise == "lateral_raise":
+                    self._state = "peak"
+                    self._debug_reason = "peak_confirmed"
+                    return
                 if self._peak_since is None:
                     self._peak_since = timestamp
                 if timestamp - self._peak_since >= self.config["peak_dwell_s"]:
@@ -681,7 +834,15 @@ class ArmExerciseCounter:
         self._motion_started = None
         self._peak_since = None
         self._return_since = None
-        if require_rearm and self._calibrated:
-            self._needs_rearm = True
-            self._rest_since = None
-            self._state = "rearming"
+        self._clear_lateral_peaks()
+        if require_rearm:
+            self._rest_ready_sides.clear()
+            if self._calibrated:
+                self._needs_rearm = True
+                self._rest_since = None
+                self._state = "rearming"
+
+    def _clear_lateral_peaks(self) -> None:
+        for side in ("left", "right"):
+            self._lateral_peak_since[side] = None
+            self._lateral_peak_confirmed[side] = None

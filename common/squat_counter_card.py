@@ -123,10 +123,12 @@ _REASON_ZH = {
     "waiting_for_return_dwell": "已回到起始姿态，等待稳定后计数",
 }
 _ARM_REASON_ZH = {
+    "target_locked": "已锁定目标，等待手臂起始姿态",
     "calibration_pose_invalid": "手臂起始姿态不符合要求",
     "calibration_waiting_still": "等待手臂稳定以完成准备",
     "baseline_ready": "手臂起始姿态已就绪",
     "rearmed": "手臂起始姿态已重新确认",
+    "rep_completed": "完成一次动作，计数加一",
 }
 _MEASUREMENT_ZH = {
     "knee_angle_deg": "当前膝角（度）", "hip_angle_deg": "当前髋角（度）",
@@ -224,14 +226,16 @@ _THRESHOLD_ZH = {
     "curl_upper_arm_vertical_min_ratio": "弯举上臂竖直程度下限",
     "curl_elbow_shift_max_ratio": "弯举肘部横移上限／躯干长",
     "curl_rest_wrist_drop_min_ratio": "弯举起始腕低于肘下限／前臂长",
-    "curl_peak_wrist_rise_min_ratio": "弯举顶点腕高于肘下限／前臂长",
+    "curl_peak_wrist_drop_max_ratio": "弯举顶点腕低于肘上限／前臂长",
     "lateral_shoulder_span_min_ratio": "侧平举双肩间距下限／躯干长",
     "lateral_elbow_min_deg": "侧平举肘角下限（度）",
     "lateral_rest_wrist_drop_min_ratio": "侧平举起始腕低于肩下限／臂长",
     "lateral_start_wrist_drop_max_ratio": "侧平举启动腕低于肩上限／臂长",
-    "lateral_peak_wrist_level_max_ratio": "侧平举顶点腕肩高度差上限／臂长",
+    "lateral_peak_wrist_level_max_ratio": "侧平举顶点腕低于肩上限／臂长",
+    "lateral_peak_wrist_above_max_ratio": "侧平举顶点腕高于肩上限／臂长",
     "lateral_start_reach_min_ratio": "侧平举启动向外伸展下限／臂长",
     "lateral_peak_reach_min_ratio": "侧平举顶点向外伸展下限／臂长",
+    "lateral_peak_window_s": "双臂到达顶点最大间隔（秒）",
 }
 
 
@@ -276,6 +280,9 @@ def _debug_zh(raw: dict) -> dict:
                     _PHASE_ZH.get(raw["phase"], "未知阶段"))
                  if not is_squat else
                  _PHASE_ZH.get(raw["phase"], "未知阶段")),
+        "暂时丢点前阶段": (_ARM_PHASE_ZH.get(raw.get("paused_state"),
+                          _PHASE_ZH.get(raw.get("paused_state"), "无"))
+                     if not is_squat else None),
         "判定原因": (_ARM_REASON_ZH.get(raw["reason"],
                     _REASON_ZH.get(raw["reason"], raw["reason"]))
                  if not is_squat else
@@ -336,6 +343,8 @@ def _debug_zh(raw: dict) -> dict:
                               "通过" if value else "未通过")
                 for key, value in checks.items()},
         "计时": _labeled(raw["timing"], _TIMING_ZH),
+        "双臂顶点确认时间": (raw.get("lateral_peak_confirmed")
+                       if exercise == "lateral_raise" else None),
         "阈值": _labeled(raw["thresholds"], _THRESHOLD_ZH),
     }
 
@@ -712,8 +721,9 @@ class SquatCounterPlugin:
             return
         if self._ready_since is None:
             self._ready_since = now
-            return
-        if now - self._ready_since < 0.4:
+        # Arm counters already require a stable starting pose. Waiting again
+        # after their ready transition can silently discard the first rep.
+        if now - self._ready_since < (0.4 if self._exercise == "squat" else 0.0):
             return
         self._set_state = "in_set"
         self._set_started_at = now
