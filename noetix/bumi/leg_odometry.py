@@ -63,14 +63,17 @@ TOE = (0.1258, 0.0, -0.0511)
 # Height difference over which the contact slides from heel to toe.
 CONTACT_BLEND_M = 0.004
 
-# Empirical slip correction. On the 2026-10-21 lab runs the feet lifted only
-# ~1 cm and slid: the body moved ~0.70 m and ~0.75 m while the stance-foot
-# kinematics accounted for ~0.46 m and ~0.48 m, i.e. a consistent factor of
-# about 1.5. This is a measured correction for that floor/gait, not a physical
-# law: re-measure it for another surface (track the same body marker over a
-# known straight move) and set it to 1.0 if the feet do not slip. It is
-# reported in the result as `leg_slip_scale`.
-DISTANCE_SLIP_SCALE = 1.7
+# Empirical slip corrections, measured on the 2026-10-21 lab floor. The feet
+# lift only ~1 cm and slide; forward/backward kinematics accounted for ~0.44 m
+# of a ~0.75 m body move (factor 1.7), while the sideways gait slides much more:
+# 0.3 m requests moved 0.4-0.5 m with a raw leg estimate of only ~0.12 m
+# (factor ~4.4). These are measured corrections for that floor/gait, not a
+# physical law: re-measure for another surface (same body marker, known move)
+# and set the factor to 1.0 if the feet stop slipping. Reported in the result
+# as `leg_slip_scale`. `DISTANCE_SLIP_SCALE` keeps the forward value for code
+# that constructs LegOdometry() without a direction.
+LEG_SLIP_SCALE = {'forward': 1.7, 'backward': 1.7, 'left': 4.4, 'right': 4.4}
+DISTANCE_SLIP_SCALE = LEG_SLIP_SCALE['forward']
 
 # The largest plausible body step per sample at ~50 Hz (1.0 m/s). A larger
 # implied step is a contact/kinematics discontinuity, not body motion.

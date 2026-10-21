@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 import time
 
-from leg_odometry import LegOdometry, joint_angles
+from leg_odometry import LEG_SLIP_SCALE, LegOdometry, joint_angles
 
 
 def decode_imu(sample):
@@ -187,7 +187,8 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
     # The production LocoPlugin exposes the 21 SDK joint positions; those drive
     # the distance estimate. Owners without joint access (unit-test plants,
     # older bundles) keep the integrated-IMU path.
-    leg = LegOdometry() if hasattr(owner, '_read_distance_joints') else None
+    leg = (LegOdometry(slip_scale=LEG_SLIP_SCALE[direction])
+           if hasattr(owner, '_read_distance_joints') else None)
     started = time.monotonic()
     motion_started = brake_started = quiet_since = None
     last_signature = None

@@ -307,7 +307,8 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
     then come from the leg estimate, not from the integrated IMU."""
     plant = Plant(monkeypatch)
     class FakeLeg:
-        def __init__(self):
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
             self.position = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
             self._last = None
