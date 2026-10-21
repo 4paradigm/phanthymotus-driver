@@ -414,7 +414,7 @@ unexposed.
 ### `loco_destination`
 
 A motion card on the `loco` plugin: turn in place by the requested angle, or
-drive forward a requested distance — target as motion, not velocity ×
+drive along the selected starting body axis for a requested distance — target as motion, not velocity ×
 duration. The rotate path is a 50 Hz closed loop that reads IMU yaw
 and runs a staged trip (replacing the earlier P-term law): **cruise**
 drives `vyaw` at full 0.8 while more than 20° of error remains, then a
@@ -452,8 +452,11 @@ measures where the robot really turned instead.
   synchronously as `error` with no `action_id`. `angle_deg` spans −360 to
   360 degrees (positive = counter-clockwise/left) and requires walking
   mode, flat non-slip ground and at least 1 m clearance. `distance_m`
-  spans 0.1 to 3 metres forward only (no reverse, strafe or path
-  planning). The experimental IMU estimator requires the robot to be
+  spans 0.1 to 3 positive metres. The `move` action adds a plain-text
+  `direction` input: `前进`/`forward`, `后退`/`backward`, `左移`/`left`,
+  or `右移`/`right`. Missing or blank direction preserves forward movement.
+  Left/right means sideways translation while retaining the starting heading;
+  the existing action menu is unchanged. The experimental IMU estimator requires the robot to be
   stationary before starting (see below).
   `stop_move` brakes an active rotation or distance move immediately
   (also the `on_interrupt_motion` hook). `status` reports `idle`/
@@ -476,7 +479,18 @@ measures where the robot really turned instead.
   `min(75, 10 + |angle_deg|/5)` seconds. Cruise/fine require at least 1° of measured progress in the requested direction every 2 seconds; otherwise they brake and return an error (feedback loss or a stalled chassis).
 
 Posture, semantic and teaching requests reserve the chassis across preparation, command dispatch and confirmation. They cancel an existing rotation and wait for its reservation/worker to resolve before changing modes; a new move or rotate is refused during that reservation. Failure to stop rotation within 6 seconds rejects the competing action without sending it.
-- Distance feedback for `move` is now a **pure body-IMU experiment**, independent
+- Optional fusion feedback: connect the independent `rgbd_imu_odometry` sensor
+  from PR #425 to this card's `state/odom` input, using the companion platform
+  saved-graph patch. A discovered topic alone cannot bind motion. Acceptance
+  fixes the source, connection revision, coordinate segment, calibration and
+  relative starting pose. Initializing/unavailable feedback refuses acceptance;
+  loss, stale estimates, coordinate reset, rewire or expired lease brakes and
+  errors with no IMU fallback. Both paths preserve all four directions.
+  The default configuration also permits the unconnected IMU experiment without
+  the sensor or platform extension. Once a binding is received, even an empty
+  binding requires renewal; restart the driver to leave managed mode.
+  See [integration contract and merge order](../../integration/bumi_odometry/README.md).
+- With no odometry connection, distance feedback for `move` is a **pure body-IMU experiment**, independent
   of camera/depth capture, RTAB-Map, EKF and `loco_servo` execution. The SDK
   supplies xyzw orientation, acceleration and angular rate directly. The
   assumed contract is gravity-inclusive acceleration in m/s² and angular
@@ -488,7 +502,7 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   continuous two-second quiet calibration window (six-second limit). It
   rotates acceleration into the world frame, subtracts the stationary
   gravity/offset baseline and integrates acceleration/velocity at 50 Hz.
-  Forward displacement is projected onto the starting heading; proportional
+  Displacement is projected onto the selected starting body axis; proportional
   IMU yaw correction uses direct SDK commands. The existing shared-chassis
   reservation, atomic cancellation and exactly-once ACP completion remain.
 - The controller never performs a zero-velocity update during commanded
@@ -516,6 +530,13 @@ Posture, semantic and teaching requests reserve the chassis across preparation, 
   their original contracts and do not start claiming measured translation.
   See [IMU experiment testing](IMU_DISTANCE_TEST.md) for independent physical
   measurement and result interpretation.
+- Each IMU distance attempt records the raw control-loop IMU reads, monotonic
+  receipt/read timing, estimated state, requested velocity commands and terminal
+  result. The result's `imu_trace_path` identifies a JSON file inside the driver
+  container under `/tmp/bumi-imu-distance/`. Only the latest five traces are
+  retained; files are written after the final brake. This captures the control
+  samples directly instead of reconstructing them from the slower state topic.
+  These diagnostics do not correct drift or certify actual distance accuracy.
 - Camera capture is restored to a single direct `pyrealsense2` worker:
   color BGR8 and depth Z16 at 640×480/30 Hz, depth aligned to the RGB grid,
   JPEG quality 80 and zlib-compressed Z16 on the existing topics. Runtime
@@ -571,15 +592,3 @@ ros2 topic echo /<robot_namespace>/motion/state
 ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
-
-
-### Optional standalone RGB-D/body-IMU odometry
-
-The new `rgbd_imu_odometry` sensor is delivered as an independent driver image,
-with RTAB-Map/EKF dependencies kept out of this bundle. See
-[installation, calibration, platform companion patch and validation](../bumi_odometry/README.md).
-Connecting its `state/odom` port to `loco_destination` selects fused distance
-feedback. Unconnected distance moves retain the pure IMU experiment above.
-Connected but invalid/reset/stale feedback stops and errors without switching
-sources. Real ROS integration and physical accuracy remain unverified; measured
-mount/IMU/timing calibration is required before the sensor can track.

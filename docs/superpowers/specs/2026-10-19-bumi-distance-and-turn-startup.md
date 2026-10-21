@@ -1,5 +1,7 @@
 # Bumi 按距离移动与旋转启动修复
 
+> **历史方案（2026-10-21）：** 本文记录早期 RGB-D/IMU 融合设计，不是当前生产镜像的安装或部署指南。生产驱动使用直接 `pyrealsense2` 采集与实验性机身 IMU 测距，不打包或启动 RTAB-Map/EKF。当前行为以 [`noetix/bumi/README.md`](../../../noetix/bumi/README.md) 为准；独立视觉融合实验见 [`experiments/bumi_odometry/README.md`](../../../experiments/bumi_odometry/README.md)。
+
 用户要求直接接入距离控制，取消“先通过真机里程计验收才可接入”的前提。基线 93164457；沿用当前工作树、PR #408 和直接实施方式。软件测试不代表已达到真机 ±5cm。
 
 ## 行为

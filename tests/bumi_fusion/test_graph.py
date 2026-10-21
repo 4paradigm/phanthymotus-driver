@@ -68,7 +68,7 @@ def test_backend_renewal_delivers_saved_connection_and_receives_ack(monkeypatch)
     api=ModuleType('api');api.__path__=[];manage=ModuleType('api.mcp_manage')
     async def call(mcp,req,timeout_s):
         assert mcp=='bumi-mcp'
-        answer=f.apply(req.arguments['feedback_binding'])
+        answer={'state':'ready',**f.apply(req.arguments['feedback_binding'])}
         return {'code':200,'data':{'result':{'content':[{'type':'text','text':__import__('json').dumps(answer)}]}}}
     manage.mcp_call_tool=call;manage.MCPCallRequest=lambda **kw:NS(**kw)
     for key,value in [('config',cfg),('tool_config',tc),('api',api),('api.mcp_manage',manage)]:monkeypatch.setitem(sys.modules,key,value)
@@ -78,3 +78,35 @@ def test_backend_renewal_delivers_saved_connection_and_receives_ack(monkeypatch)
     layout_data['connections']=[];clock[0]+=1
     asyncio.run(graph.refresh(force=True))
     assert f.freeze()['source']=='imu_integrated_experimental'
+
+
+@pytest.mark.parametrize('bad_ack',['old-lease','wrong-topic','error'])
+def test_renewal_requires_exact_lease_and_stops_on_bad_ack(monkeypatch,bad_ack):
+    import asyncio
+    import sys
+    from types import ModuleType,SimpleNamespace as NS
+    calls=[]
+    cfg=ModuleType('config');cfg.main={'canvas_layout':layout(),'core':{'project_running':True}}
+    tc=ModuleType('tool_config');tc.find_tool=lambda mcp,tool:({'inputSchema':{'x-feedback-binding':1}} if tool=='loco_destination' else {'topic_out':[{'topic':'/odometry','format':'state/odom'}]})
+    api=ModuleType('api');api.__path__=[];manage=ModuleType('api.mcp_manage')
+    async def call(mcp,req,timeout_s):
+        calls.append(req.arguments['action'])
+        if calls[-1]=='stop': return {'data':{'state':'stopped'}}
+        accepted=dict(req.arguments['feedback_binding'])
+        if bad_ack=='old-lease': accepted['issued_ns']-=1
+        return {'data':{'state':'error' if bad_ack=='error' else 'ready','feedback_binding':accepted,
+                        'topic_in':[{'topic':'/wrong' if bad_ack=='wrong-topic' else '/odometry'}]}}
+    manage.mcp_call_tool=call;manage.MCPCallRequest=lambda **kw:NS(**kw)
+    for key,value in [('config',cfg),('tool_config',tc),('api',api),('api.mcp_manage',manage)]:monkeypatch.setitem(sys.modules,key,value)
+    monkeypatch.setattr(graph,'_failures',{})
+    asyncio.run(graph.refresh())
+    assert calls==['config','stop']
+    assert graph._failures
+
+
+@pytest.mark.parametrize('live_ports',[[],[{'topic':'/odometry','format':'other'}]])
+def test_saved_port_cannot_replace_missing_or_changed_live_sensor_contract(live_ports):
+    data=layout()
+    b=graph.binding_for(data,data['cards'][1],now_ns=1,
+                        find_tool=lambda *args:{'topic_out':live_ports})
+    assert b['resolved'] is False

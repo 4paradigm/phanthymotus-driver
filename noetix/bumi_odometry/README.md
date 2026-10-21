@@ -122,9 +122,10 @@ watchdog 监控。正常换线派发立即撤销旧动作；派发/平台失联�
 每个非零距离命令都在同一绑定锁下重新检查来源/取消，已派发的旧订阅回调带 generation，
 不能填入替换连接。每次动作固定 revision、source、segment、calibration 和相对起点。
 
-随本分支交付的 config.yaml 将 loco.require_feedback_binding=true，即使无连线也须由平台
-确认空输入，防止驱动重启后误用尚未同步的画布状态。旧 custom config 缺少该键时
-保留原直接纯 IMU 实验兼容；该兼容模式不提供保存图保证。给 start 手传一个 input_topic 不构成受支持
+随本分支交付的 config.yaml 默认 loco.require_feedback_binding=false，未连接时无需
+本 sensor 或平台补丁即可使用纯 IMU 实验闭环。也可显式设 true，要求平台先确认空输入。
+一旦收到保存图绑定（包括空输入）即启用租约；未托管模式不提供保存图保证。
+给 start 手传一个 input_topic 不构成受支持
 的连接选择，会拒绝。**新 sensor 距离反馈需要配套平台补丁**。已经进入托管连接模式
 以后，缺绑定/失联会拒绝动作，不能偷偷退回旧模式。
 
@@ -177,3 +178,22 @@ ROS_DOMAIN_ID=239 python3 /work/ros_probe.py --output /data/rendered-probe.json
 
 任何未执行的项目均保持未验证，不将历史数学测试、启动成功或渲染探针通过写成硬件
 精度达标。需要回滚时停用 sensor 连线并停止独立服务，保留原 IMU 实验；不修改相机所有者。
+
+
+## Compatibility sync with PR #408 (2026-10-21)
+
+This branch incorporates #408 commit `782255e8` and its predecessor direction/trace
+and official-Ubuntu-archive changes, resolving shared files to the #408 superset.
+Merge #408 first, then this PR; no #425 implementation was merged into #408.
+The sensor stays independently startable without any destination card. The Bumi
+bundle stays independently usable for unconnected experimental IMU distance.
+Receiving a saved binding activates lease requirements; legacy topic-only
+connections are rejected rather than silently selecting IMU.
+
+The full platform patch/overlay here now includes the exact-lease/topic ACK,
+config-time saved-graph resolution, live-port validation and failed-ACK stop
+changes. Apply this full patch alone; the #408 supplemental patch is only for the
+older #425 `c48692f8` artifact. Neither platform patch has been deployed.
+See [shared interfaces and ownership](../../integration/bumi_odometry/README.md)
+and [validation](../../integration/bumi_odometry/VALIDATION.md). Calibration gates,
+RTAB-Map/EKF parameters and source-timestamp limitations are unchanged.

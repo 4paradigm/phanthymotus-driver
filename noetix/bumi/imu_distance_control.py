@@ -4,7 +4,10 @@ SDK reads have no source timestamp. Poll timing and unchanged-data checks are
 only fault heuristics, not proof of fresh measurements or physical accuracy.
 """
 from collections import deque
+import json
 import math
+from pathlib import Path
+import tempfile
 import time
 
 
@@ -91,7 +94,31 @@ def distance_timeout(distance_m):
     return 10.0+min(20.0, 5.0+10.0*distance_m)
 
 
-def run_distance(owner, distance_m):
+def movement_direction(value=''):
+    """Positive requested distance along a starting body axis."""
+    if not isinstance(value, str):
+        raise ValueError('direction must be 前进/后退/左移/右移 or forward/backward/left/right')
+    name = value.strip().lower() or 'forward'
+    name = {'前进': 'forward', '后退': 'backward', '左移': 'left', '右移': 'right'}.get(name, name)
+    axes = {'forward': (1, 0), 'backward': (-1, 0), 'left': (0, 1), 'right': (0, -1)}
+    if name not in axes:
+        raise ValueError('direction must be 前进/后退/左移/右移 or forward/backward/left/right')
+    return name, *axes[name]
+
+
+def _write_trace(samples, commands, result):
+    # Write only after the final brake, never do disk I/O in the control loop.
+    folder = Path(tempfile.gettempdir()) / 'bumi-imu-distance'
+    folder.mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=folder, prefix='imu-', suffix='.json', delete=False) as stream:
+        result['imu_trace_path'] = stream.name
+        json.dump(dict(samples=samples, command_requests=commands, result=result), stream)
+    for old in sorted(folder.glob('imu-*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[5:]:
+        old.unlink()
+
+
+def run_distance(owner, distance_m, direction=''):
+    direction, body_x, body_y = movement_direction(direction)
     estimator = ImuOdometry()
     started = time.monotonic()
     motion_started = brake_started = quiet_since = None
@@ -99,11 +126,19 @@ def run_distance(owner, distance_m):
     changed_at = started
     progress_at, last_progress = started, 0.0
     moved = 0.0
-    result = dict(state='error', requested_distance_m=distance_m,
+    samples, commands = [], []
+    def publish(vx, vyaw=0, *, vy=0):
+        if vy:
+            owner._distance_publish(vx, vyaw, vy=vy)
+        else:
+            owner._distance_publish(vx, vyaw)
+        commands.append(dict(received_mono_s=time.monotonic(), velocity=[vx, vy, vyaw]))
+
+    result = dict(state='error', requested_distance_m=distance_m, requested_direction=direction,
                   feedback_source='imu_integrated_experimental', accuracy_validated=False,
                   source_timestamp_available=False, stationary_assumed=False)
     try:
-        owner._distance_publish(0)
+        publish(0)
         while True:
             if owner._rotate_stop_event.is_set():
                 result['state'] = 'stopped'
@@ -111,19 +146,30 @@ def run_distance(owner, distance_m):
             problem = owner._rotate_mode_error()
             if problem:
                 raise ValueError(problem['error'])
+            read_started = time.monotonic()
             raw = owner._read_distance_imu()
             now = time.monotonic()
+            samples.append(dict(received_mono_s=now, read_duration_s=now-read_started,
+                                orientation_xyzw=[float(raw.ori[i]) for i in range(4)],
+                                linear_acceleration_mps2=[float(raw.linear_acc[i]) for i in range(3)],
+                                angular_velocity_rad_s=[float(raw.angular_vel[i]) for i in range(3)]))
             if now-started >= distance_timeout(distance_m):
                 raise ValueError('IMU distance movement timed out')
             estimator.observe(raw, now)
+            samples[-1].update(phase='calibration' if not estimator.ready else
+                              ('braking' if brake_started is not None else 'driving'),
+                              position_m=estimator.position, velocity_mps=estimator.velocity,
+                              acceleration_mps2=estimator.acceleration)
             if not estimator.ready:
-                owner._distance_publish(0)
+                publish(0)
                 time.sleep(0.02)
                 continue
             if motion_started is None:
                 motion_started = progress_at = changed_at = now
                 origin_yaw = estimator.yaw
-                c, s = math.cos(origin_yaw), math.sin(origin_yaw)
+                cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
+                c, s = cy*body_x-sy*body_y, sy*body_x+cy*body_y
+                result['start_yaw_deg'] = math.degrees(origin_yaw)
                 result['stationary_world_acceleration_mps2'] = estimator.baseline
                 print('[loco_destination] IMU experimental calibration complete; distance is an estimate', flush=True)
             if estimator.signature != last_signature:
@@ -151,9 +197,11 @@ def run_distance(owner, distance_m):
                     brake_started = now
                 else:
                     turn = max(-0.4, min(0.4, 1.5*yaw_error-0.1*estimator.gyro[2]))
-                    owner._distance_publish(0.6 if remaining > 0.2 else 0.5, turn)
+                    # Sideways gait has a larger deadband than forward gait.
+                    command = 0.65 if body_y else (0.6 if remaining > 0.2 else 0.5)
+                    publish(command*body_x, turn, vy=command*body_y)
             if brake_started is not None:
-                owner._distance_publish(0)
+                publish(0)
                 # A quiet accelerometer alone cannot distinguish rest from
                 # uniform motion. Require zero command dwell AND low estimated
                 # speed; even this is an assumption, not a measured stop.
@@ -178,8 +226,12 @@ def run_distance(owner, distance_m):
     except Exception as exc:
         result['error'] = f'{type(exc).__name__}: {exc}'
     finally:
-        owner._distance_publish(0)
+        publish(0)
     result.update(estimated_distance_m=moved, estimated_error_m=distance_m-moved,
                   estimated_position_m=estimator.position, estimated_velocity_mps=estimator.velocity,
                   elapsed_s=time.monotonic()-started)
+    try:
+        _write_trace(samples, commands, result)
+    except OSError as exc:
+        result['imu_trace_error'] = str(exc)
     return result

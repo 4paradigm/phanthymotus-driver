@@ -1,5 +1,7 @@
 # Bumi 审核镜像内的共享相机与自动融合
 
+> **历史方案（2026-10-21）：** 本文记录早期 RGB-D/IMU 融合设计，不是当前生产镜像的安装或部署指南。生产驱动使用直接 `pyrealsense2` 采集与实验性机身 IMU 测距，不打包或启动 RTAB-Map/EKF。当前行为以 [`noetix/bumi/README.md`](../../../noetix/bumi/README.md) 为准；独立视觉融合实验见 [`experiments/bumi_odometry/README.md`](../../../experiments/bumi_odometry/README.md)。
+
 基线13f61cb7。用户明确要求直接补齐、推送原PR408，部署审核镜像即可使用距离移动，不影响其他卡片。沿用直接实施，不再要求设计/计划确认。取消先里程计精度验收的门槛，不取消真实反馈就绪检查。
 
 ## 数据与兼容

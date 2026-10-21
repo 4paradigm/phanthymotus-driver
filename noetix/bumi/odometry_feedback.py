@@ -63,6 +63,8 @@ class DistanceFeedback:
                 if not isinstance(topic,str) or (topic and not topic.startswith('/')):
                     raise ValueError('invalid saved odometry topic')
                 previous=self.binding
+                if previous is not None and self.monotonic()>=self.deadline:
+                    self.on_fault('feedback binding lease expired')
                 changed=previous is not None and (previous['revision']!=binding['revision'] or topic!=self.topic)
                 if changed:
                     self.on_fault('feedback connection changed')
@@ -127,7 +129,7 @@ class DistanceFeedback:
                          segment=None,calibration_id=None)
             if self.topic and self.sample:
                 context.update(segment=self.sample['vendor']['segment_id'],calibration_id=self.sample['vendor']['calibration_id'])
-            self.validate(context)
+            context['origin']=self.validate(context)
             return context
 
     def validate(self,context):
@@ -151,14 +153,18 @@ class DistanceFeedback:
                 return deepcopy(self.sample)
             return None
 
-    def start_watchdog(self,context_provider):
+    def start_watchdog(self,context_provider,on_fault=None):
         if self.thread is not None: return
         def loop():
             while not self.stopped.wait(.02):
                 context=context_provider()
                 if context is not None:
                     try: self.validate(context)
-                    except Exception as exc: self.on_fault(str(exc))
+                    except Exception as exc:
+                        with self.lock:
+                            if context_provider() is context:
+                                if on_fault: on_fault(str(exc),context)
+                                else: self.on_fault(str(exc))
         self.thread=threading.Thread(target=loop,daemon=True,name='bumi_feedback_watchdog'); self.thread.start()
 
     def invalidate(self,reason):
@@ -173,17 +179,22 @@ class DistanceFeedback:
         with self.lock: self._unsubscribe()
 
 
-def run_fused_distance(owner,distance,context):
+def run_fused_distance(owner,distance,context,direction=''):
     """Direct SDK control; errors, cancellation and lease expiry always brake."""
+    try: from .imu_distance_control import movement_direction
+    except ImportError: from imu_distance_control import movement_direction
+    direction,body_x,body_y=movement_direction(direction)
     started=time.monotonic(); moved=0.; brake=None; quiet=deque()
     result=dict(state='error',feedback_source='rgbd_imu_ekf',accuracy_validated=False,
-                requested_distance_m=distance,segment_id=context['segment'],binding_revision=context['revision'])
+                requested_distance_m=distance,requested_direction=direction,segment_id=context['segment'],binding_revision=context['revision'])
     try:
-        origin=owner._distance_feedback.validate(context)
+        sample=owner._distance_feedback.validate(context)
+        origin=context['origin']
         p0=origin['pose']['position']; q=origin['pose']['quaternion']; r=quat_matrix(q)
         norm=math.hypot(r[0][0],r[1][0])
         if norm<.9: raise ValueError('starting body forward axis is not approximately horizontal')
-        c,s=r[0][0]/norm,r[1][0]/norm
+        cy,sy=r[0][0]/norm,r[1][0]/norm
+        c,s=cy*body_x-sy*body_y,sy*body_x+cy*body_y
         previous=origin; last_progress=0.; progress_at=started
         while True:
             now=time.monotonic()
@@ -197,7 +208,7 @@ def run_fused_distance(owner,distance,context):
             p=sample['pose']['position']; dx,dy=p[0]-p0[0],p[1]-p0[1]
             moved=dx*c+dy*s
             rb=quat_matrix(sample['pose']['quaternion']); yaw=math.atan2(rb[1][0],rb[0][0])
-            yaw0=math.atan2(s,c); error=math.atan2(math.sin(yaw0-yaw),math.cos(yaw0-yaw))
+            yaw0=math.atan2(sy,cy); error=math.atan2(math.sin(yaw0-yaw),math.cos(yaw0-yaw))
             if abs(-dx*s+dy*c)>.15 or abs(error)>math.radians(20): raise ValueError('distance trajectory deviated')
             if dt>0:
                 speed=math.dist(p,previous['pose']['position'])/dt
@@ -210,9 +221,13 @@ def run_fused_distance(owner,distance,context):
             if brake is None:
                 if moved-last_progress>=.01: last_progress,progress_at=moved,now
                 elif now-progress_at>3: raise ValueError('no odometry progress')
-                vx=max(0.,sample['twist'][0])
+                vx=max(0.,sample['twist'][0]*body_x+sample['twist'][1]*body_y)
                 if remaining<=max(.025,min(.10,vx*.15)): brake=now
-                else: owner._distance_publish(.6 if remaining>.2 else .5,max(-.4,min(.4,1.5*error-.1*sample['twist'][5])))
+                else:
+                    turn=max(-.4,min(.4,1.5*error-.1*sample['twist'][5]))
+                    command=.65 if body_y else (.6 if remaining>.2 else .5)
+                    if body_y: owner._distance_publish(0,turn,vy=command*body_y)
+                    else: owner._distance_publish(command*body_x,turn)
             if brake is not None:
                 owner._distance_publish(0)
                 while len(quiet)>1 and quiet[-1][0]-quiet[1][0]>=600: quiet.popleft()

@@ -196,7 +196,11 @@ def capture(namespace):
                 msg.data = zlib.compress(np.asanyarray(depth.get_data()).tobytes(), 1)
                 depth_pub.publish(msg)
             if raw_publisher is not None:
-                raw_publisher.publish(source_frames, frames)
+                try:
+                    raw_publisher.publish(source_frames, frames)
+                except Exception as exc:
+                    print(f'[odometry_input] disabling failed raw branch: {exc}', flush=True)
+                    raw_publisher = None
             count += 1
             if count % 300 == 0:
                 print(f'[camera_subprocess] {count} frames, {count/(time.monotonic()-started):.1f} fps',

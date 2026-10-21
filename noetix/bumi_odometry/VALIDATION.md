@@ -1,3 +1,24 @@
+# PR408 compatibility integration update (2026-10-21)
+
+- Syncs #408 commits `782255e8`, `b60b3d92`, `c27c2687` in an isolated worktree.
+- Actual merge conflicts resolved to the #408 shared runtime superset; independent
+  sensor implementation remains from #425.
+- Relevant regressions: **622 passed, 1 skipped in 65.72s**. Fusion tests:
+  **82 passed**, included in that count.
+- Cross-interface tests feed actual RawCameraPublisher/imu_reading products into
+  FusionRuntime and the actual make_sample output into DistanceFeedback.
+- Full repository pytest: **45 collection errors, 3 skipped**.
+- Both deploy/service.yml checks, COPY-path regressions, shell syntax and Python
+  compile checks pass. Revised full platform patch applies and compiles at the
+  fixed platform baseline; neither platform workspace nor deployment was changed.
+- #408 standalone IMU needs no sensor/platform extension. This sensor needs no
+  destination card, and remains initializing without measured calibration.
+- Merge #408 first, then this synchronized PR. No PR was merged by this session.
+- No image build, ROS launch, full platform integration, deployment or hardware
+  validation was performed. The hardware/accuracy limits below still apply.
+
+## Historical c48692f8 validation
+
 # 本轮验证记录（2026-10-21）
 
 功能代码基于 #408 最新 head 40ae7fe8，在 feat/bumi-rgbd-imu-odometry-sensor 开发。

@@ -97,7 +97,7 @@ def capture(monkeypatch):
             if state.frame_error: raise RuntimeError('camera disconnected')
             if getattr(state, 'terminate', False):
                 signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
-            if state.iterations > 1: raise KeyboardInterrupt
+            if state.iterations > getattr(state, 'frame_limit', 1): raise KeyboardInterrupt
             return Frames()
         def stop(self): state.stopped = True
     def align(target):
@@ -198,3 +198,17 @@ def test_camera_plugin_ignores_old_fusion_flag_and_keeps_photo_frame_cache(captu
     result = vision.dispatch('capture_photo', {})
     assert result['ok'] and Path(result['file_path']).read_bytes() == b'JPEG'
     assert len(opened) == 1  # Photo capture consumes the same cache/USB owner.
+
+
+
+def test_optional_raw_branch_crash_does_not_stop_camera_media(capture, monkeypatch):
+    _,state,_=capture
+    state.frame_limit=2
+    class BrokenRawPublisher:
+        def __init__(self,*args): pass
+        def publish(self,*args): raise RuntimeError('optional raw branch crashed')
+    monkeypatch.setitem(sys.modules,'odometry_inputs',NS(RawCameraPublisher=BrokenRawPublisher))
+    module.capture('robot')
+    assert len(state.published['/robot/camera/color'])==2
+    assert len(state.published['/robot/camera/depth'])==2
+    assert state.stopped and state.destroyed

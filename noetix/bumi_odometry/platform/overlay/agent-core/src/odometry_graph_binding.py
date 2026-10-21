@@ -28,6 +28,10 @@ def binding_for(layout,card,*,now_ns=None,find_tool=None):
             current=find_tool(source.get('mcpId',''),source.get('toolName','')) or {}
             live=current.get('topic_out') or []
             if 0<=index<len(live): declaration=live[index]
+            if (not declaration or declaration.get('format')!='state/odom'
+                    or declaration.get('message_type','std_msgs/msg/String')!='std_msgs/msg/String'
+                    or not declaration.get('topic')):
+                valid=False
         saved=ports[index] if 0<=index<len(ports) else {}
         topic=edge.get('fromTopic') or saved.get('topic') or (declaration or {}).get('topic') or ''
         fmt=edge.get('format') or saved.get('format') or (declaration or {}).get('format')
@@ -79,16 +83,28 @@ async def refresh(force=False):
         key=(card['mcpId'],card['toolName'],card['id'])
         try:
             binding=saved_binding(*key)
-            response=await mcp_call_tool(key[0],MCPCallRequest(tool=key[1],arguments={
-                'action':'config','instance_id':key[2],'feedback_binding':binding}),timeout_s=.2)
+            request=MCPCallRequest(tool=key[1],arguments={
+                'action':'config','instance_id':key[2],'feedback_binding':binding})
+            response=await mcp_call_tool(key[0],request,timeout_s=.2)
+            # The authoritative MCP handler may replace the supplied lease.
+            binding=request.arguments['feedback_binding']
             answer=payload(response)
-            if answer.get('state')=='error' or (answer.get('feedback_binding') or {}).get('revision')!=binding['revision']:
+            ports=answer.get('topic_in') or []
+            confirmed_topic=ports[0].get('topic','') if len(ports)==1 else None
+            if (answer.get('state')!='ready' or answer.get('feedback_binding')!=binding
+                    or confirmed_topic!=binding['input_topic']):
                 raise RuntimeError('consumer did not acknowledge saved connection')
             _failures.pop(key,None)
         except Exception as exc:
             if key not in _failures: print('[feedback-binding] '+str(key)+': '+str(exc))
             _failures[key]=str(exc)
-            # Do not renew on failure. The driver's monotonic watchdog brakes.
+            # A lost ACK can still mean the driver accepted the lease. Revoke
+            # it before retrying; an unreachable driver expires its lease.
+            try:
+                await mcp_call_tool(key[0],MCPCallRequest(tool=key[1],arguments={
+                    'action':'stop','instance_id':key[2]}),timeout_s=.2)
+            except Exception:
+                pass
     await asyncio.gather(*(deliver(c) for c in targets))
 
 

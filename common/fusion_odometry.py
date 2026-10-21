@@ -1,5 +1,8 @@
 """ROS-free contracts for the Bumi RGB-D/body-IMU sidecar.
 
+Shared prerequisite of PR #408 (input/feedback adapters) and PR #425 (sensor).
+It imports no ROS or vendor SDK and is not used by unrelated drivers.
+
 motus.odom/1 stays unchanged. Fusion-specific quality and clock provenance live
 in vendor. A host SDK read is never represented as a source sampling timestamp.
 """
