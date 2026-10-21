@@ -1,15 +1,22 @@
-# LimX TRON2 参数与双臂控制驱动
+# LimX TRON2 传感器、双臂、头部与夹爪控制驱动
 
-为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片和一张双臂控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.5.12`；MCP仅监听`127.0.0.1:15791`。
+为 Phanthy Motus 提供关节骨架及头部/左右腕RGB摄像头四张传感器卡片、双臂/头部控制卡片、预设pose动作卡片和一张可选择左右的夹爪控制卡片，另有骨架渲染必需的model资源。适用于通过以太网连接DACH_TRON2A双臂/头部主控制器的Jetson / ARM64主机。驱动版本：`0.9.5`；MCP仅监听`127.0.0.1:15791`。
 
 | 卡片 | 类型 | 内容 | 数据流 |
 | --- | --- | --- | --- |
 | `joint_state` | sensor | 左右臂及头部16关节URDF实时骨架，附随腕运动的左右夹爪示意；info保留原始rad/deg、dq/tau | `/limx_tron2/joint_state`（sensor/skeleton） |
+| `pose` | actuator | salute/wave/welcome预设轨迹；挥手含右夹爪一次开合；整套ACP完成 | 无；详情显示共享双臂任务 |
+| `gripper` | actuator | 选择左/右夹爪并设置目标开口，0mm闭合 | 无；详情显示所选侧反馈 |
 | `camera` | sensor | 按需读取头部RGB，原始JPEG限10fps发布，不录像 | `/limx_tron2/camera`（image/jpeg） |
 | `camera_left` | sensor | 左腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_left`（image/jpeg） |
 | `camera_right` | sensor | 右腕RGB校正图像，独立启停，限10fps | `/limx_tron2/camera_right`（image/jpeg） |
 | `arm_control` | actuator | move自定义目标、reset复位并自动校验；ACP完成通知 | 无 |
+| `move_head` | actuator | 俯仰-60～45°（上正）、偏航-88～88°（自身左正）绝对目标；ACP确认到位 | 无 |
 | `model` | resource | 厂家DACH_TRON2A骨架URDF，供平台自动加载 | 无 |
+
+夹爪卡片说明见 [夹爪卡片使用说明](GRIPPER.md)。只填写side（left/right）、opening_mm（0至85mm）、speed、force；没有action/close/recover选项。驱动按底层值=毫米数×94/85名义换算，0mm闭合。非法输入在占用任务和发送前拒绝，两侧独立管理；合法指令仍保留未到位或断连保护。
+
+头部卡片使用步骤、坐标系和完成判定见 [头部控制说明](HEAD.md)。pitch_deg和yaw_deg均须明确填写，单位为度；驱动仅在显式move时发送两轴MoveH。头部与双臂/夹爪互斥，不改变原arm_control的14项目标或自然垂下home。
 
 传感器通过Motus本机ROS2总线发布JSON：joint_state声明sensor/skeleton。默认每0.5秒查询关节并发布缓存，实际频率受厂家响应影响。robot_status不再作为卡片或ROS2 topic公开，但通知中的连接、固件、模式等仍供内部运动校验；值不变不表示这些信息没有用途。
 
@@ -17,11 +24,11 @@ battery_state卡片、配置、topic和电池计算/显示代码已从本版本�
 
 ## 读取边界与字段说明
 
-传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；没有模式切换、拖动示教或自动演示循环。
+传感器后台仅发送request_get_joint_state。arm_control仅在显式move/reset调用时发送一次request_movej；move_head仅在显式move调用时发送一次request_moveh；夹爪卡片仅在显式读取状态或跟踪开合动作时查询夹爪，显式开合只发送一次所选侧的指令。pose仅在显式选择英文动作后自检、必要时先回原home并确认，再回正头部，以ServoJ执行预设轨迹；挥手在右肩旋转三轮后保持手臂、右夹爪开合一次，再回原home。没有模式切换、拖动示教或自动演示循环。
 
 - 名称由机器人返回。`names` 缺失或为空时，`labels` 使用 `joint_index_0` 等索引，`labels_are_indices: true`；不推测关节名称及身体部位对应关系。
 - `q` 按厂家关节接口的弧度值保留；`positions_deg` 仅进行弧度到度的换算。`dq` / `tau` 原样保留，缺失时为 `[]`。
-- 左右夹爪通过安装点上的固定双指轮廓显示，跟随对应手腕运动。默认显示闭合，状态是静态示意，不表示当前实际夹持状态；没有夹爪开合反馈时不伪造角度或开合动画。附加display_hand_gripper_*节点只供渲染，全部fixed，不增加16关节反馈数量，不改变原始运动学、控制限位或夹爪命令。显示间距/指长为示意尺寸，不是标定的实物外形、TCP或碰撞模型。
+- 左右夹爪通过安装点上的固定双指轮廓显示，跟随对应手腕运动。默认显示闭合，状态是静态示意，不表示当前实际夹持状态；夹爪卡片查询的相对开口度未接入骨架动画。附加display_hand_gripper_*节点只供渲染，全部fixed，不增加16关节反馈数量，不改变原始运动学或控制限位。显示间距/指长为示意尺寸，不是标定的实物外形、TCP或碰撞模型。
 - 骨架使用Motus既有joints协议和model资源。名称缺失时按官方SDK索引顺序映射到URDF：左臂0–6、右臂7–13、头部俯仰14/偏航15；URDF文本中头部关节顺序相反，不使用文件遍历顺序。若厂家提供名称则按名称匹配，不支持的关节数或名称返回空骨架和不可用诊断。没有可用IMU姿态时省略可选imu_quat；不能发送空数组，因为平台会将其解构成四个undefined值、破坏根节点旋转。模型来源和Apache-2.0归属见resource/SOURCE.md；只保留厂家运动学，不包含网格资产。
 - 厂家的 `UNKNOW` 等状态字符串原样保留；缺失字段为 `null`。
 - 厂家关节时间戳的时钟及单位尚未验证，因此 `robot_timestamp` 仅作为原始值保留，`measurement_time_verified` 为 `false`。接收年龄不能证明测量数据的真实年龄。
@@ -59,7 +66,7 @@ PR 构建完成后，使用机器人评论给出的新镜像 / Try it 链接部�
 部署前确认：
 
 1. 主机已能通过机器人网口访问厂家 WebSocket；保留机器人原有主控制器。
-2. `/opt/phanthy-motus/dds-local.xml` 是 Core 生成的实际文件，不是目录。驱动挂载该文件，使用 domain 42、FastDDS 和 loopback 数据总线；文件缺失则拒绝创建 participant。
+2. 挂载当前Core生成的实际DDS文件，不能把缺失文件误挂为目录。驱动使用FastDDS和loopback数据总线，默认只接受ROS_DOMAIN_ID=42。已有Core采用非标准域的专用现场，部署须先核对实际Core，再显式设置相同的ROS_DOMAIN_ID及TRON2_CORE_DOMAIN_ID（0至232）；只修改ROS_DOMAIN_ID会被拒绝。文件缺失或域号不匹配则拒绝创建participant。
 3. Core 信任证书是实际文件。HTTPS 保持证书及主机名验证；`TRON2_AGENT_CORE_URL` 的主机名必须与证书 SAN 匹配。需要时使用证书包含的主机名，并相应调整 Compose 的 `extra_hosts`；不要关闭 TLS 验证。
 4. MCP 端口 15791 未被其他本地原型占用。
 
@@ -109,7 +116,7 @@ reset使用现有`/config/tron2/home.json`（宿主`/opt/phanthy-motus/data/tron
 
 发送任何move/reset前，除连接、近期状态、目标身份/限位与互斥检查外，还要求厂家SDK 3.1要求的上层developer_mode、working_mode_valid=true、collision_enable_valid=true且collision_enable=true、compliant_enable_valid=true且compliant_enable=false。compliant_enable表示柔顺/拖动状态，本驱动不在该状态下发位置MoveJ；不是要求把柔顺模式开启。字段缺失、无效、非严格布尔值或其他模式全部拒绝，返回motion_sent=false。*_valid作为厂家字段可用性/有效性门槛，不被当作独立安全认证。驱动只拒绝不合适的运动，不自动切换模式、开启保护或关闭拖动；内部info.motion_readiness给出拒绝原因。模式要求见[厂家SDK 3.1](https://www.limxdynamics.com/zh/documents/847884267345285120)，controller_mode等其他模式拒绝，不宣称穷举厂家所有可执行模式。
 
-reset时长至少max(8,ceil(最大关节变化度数/5))秒，超过60秒拒绝。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
+pose执行前自动回home和arm_control.reset共用时长max(8,ceil(最大关节变化度数/5))/1.2秒，相比旧复位规则提速20%，最短约6.67秒，超过60秒拒绝。所有目标仍校验[厂家SDK限位](https://www.limxdynamics.com/zh/documents/847884267345285120)。头部、夹爪不发命令，不进行路径碰撞规划。
 
 ACTION仅公开move、reset。info/start/stop由平台内部生命周期和诊断使用，不显示为可选动作；start返回ready，stop返回idle，均不发送运动，也不是机器人急停。pose/pose_name/preview/list/verify_at_home已删除，旧调用会拒绝。只有显式move/reset发送一次request_movej并等待GUID/序列号匹配的ACK；初始accepted响应不表示到达，arrival_verified为false，并提供唯一action_id。两个动作声明x-completion（120秒上限）和共享资源arm_l/arm_r；动作完成由后台反馈验证和ACP回调跟踪，不以ACK代替完成。
 
@@ -159,3 +166,5 @@ sudo docker exec embodied-limx-tron2 /bin/bash -c 'source /opt/ros/humble/setup.
 检查每路计数持续增长，并用实际本机DDS订阅逐topic收到至少两帧合法JPEG（每topic只缓存两帧，整体限5秒），打印各路名称/尺寸，保留连接供平台查看；不保存图像或发送运动。完成后停止对应卡片/画布释放连接。Mac诊断SSH隧道仅用于开发读取，不是Jetson平台正常视频链路的一部分。
 
 测试使用合成MJPEG，覆盖启停/并发/中断等待、断流清空/重连、无效响应/畸形/截断/超限/停滞帧、RPC元数据与禁止运动；左右腕分开输出/独立停止、失败不影响其他源/JSON就绪，以及三路CompressedImage原始二进制、独立frame_id/单帧队列。只读隧道现场诊断确认三路同时连续视频，左停止后头部/右继续发布；实际图像/现场标识不进入仓库或公开PR。源/中继测试不能代替新镜像部署后的DDS/Core/平台验收。
+
+预设动作卡片的使用、起始姿态、停止与验证范围见 [POSE.md](POSE.md)。pose与arm_control复用同一双臂执行器；不扩展arm_control的公开动作，不更改原始home。

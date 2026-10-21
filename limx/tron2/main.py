@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LimX TRON2 sensors and explicit arm MoveJ control."""
+"""TRON2 sensors and guarded arm, head, gripper and preset motion control."""
 from pathlib import Path
 import sys
 
@@ -63,9 +63,9 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'arm_control'} | set(CAMERA_SOURCES)
+    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
-        raise ValueError('Only TRON2 sensor and arm_control plugins may be configured')
+        raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
     for name, value in plugins.items():
         if not isinstance(value, dict) or type(value.get('enabled')) is not bool:
@@ -124,6 +124,9 @@ async def run():
             finally:
                 await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
                 await adapter.motion.close()
+                await adapter.head.close()
+                for owner in adapter.grippers.values():
+                    await owner.close()
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)

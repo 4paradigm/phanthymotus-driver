@@ -696,7 +696,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         for name in ('arm_control',):
             for action in ('info', 'start', 'stop'):
                 self.assertNotIn(action, tools[name]['inputSchema']['properties']['action']['enum'])
-                kwargs = {'joint': [.1]*14, 'time': 8} if name == 'arm_control' else {}
+                kwargs = {'joint': [.1]*14, 'time': 8/1.2} if name == 'arm_control' else {}
                 error, result = await self.call(name, action=action,
                     instance_id='canvas', _trace_id='valid', **kwargs)
                 self.assertFalse(error)
@@ -771,7 +771,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result['status'], 'accepted')
             self.assertFalse(result['arrival_verified'])
             self.assertEqual(len(sent), 1)
-            self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 8})
+            self.assertEqual(sent[0]['data'], {'joint': [.1]*14, 'time': 8/1.2})
             await self.adapter.motion.task
             self.assertEqual(self.adapter.motion.report.await_args.args[:2],
                              (result['action_id'], 'completed'))
@@ -792,7 +792,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             terminal = self.adapter.motion.report.await_args.args[2]
             self.assertTrue(terminal['at_home'])
             self.assertTrue(terminal['reset_verified'])
-            self.adapter.reader.send_movej.assert_awaited_once_with([.1]*14, 8)
+            self.adapter.reader.send_movej.assert_awaited_once_with([.1]*14, 8/1.2)
 
     async def test_json_rpc_notification_and_parse_errors(self):
         async with self.session.post(self.url+'/mcp', json={
@@ -850,30 +850,32 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(self.function('common_root')('/work/main.py'), Path('/work'))
 
     def test_staged_entry_imports_without_repository_layout(self):
+        from device import VERSION
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','camera.py','ros2.py','config.yaml'):
+            for name in ('main.py','device.py','vendor.py','state.py','reset.py','skeleton.py','completion.py','trajectory.py','pose.py','head.py','gripper.py','camera.py','ros2.py','config.yaml'):
                 shutil.copyfile(DRIVER/name, root/name)
             shutil.copytree(DRIVER/'resource', root/'resource')
             shutil.copytree(DRIVER.parents[1]/'common', root/'common')
             script = ('from pathlib import Path; import main, device, vendor, state, ros2, common, skeleton; '
                 'assert "<robot" in skeleton.model()["urdf"]; '
-                'assert device.VERSION == "0.5.12"; assert Path(common.__file__).parent.resolve() == Path('+
+                'assert device.VERSION == '+repr(VERSION)+'; assert Path(common.__file__).parent.resolve() == Path('+
                 repr(str(root/'common'))+').resolve()')
             result = subprocess.run([sys.executable,'-c',script], cwd=temp,
                 env={**os.environ,'PYTHONPATH':temp}, text=True, capture_output=True, timeout=8)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_only_read_query_exists_in_wire_send_ast(self):
+    def test_wire_commands_are_limited_to_joint_head_and_gripper_protocols(self):
         source = ast.parse((DRIVER/'vendor.py').read_text())
         calls = [n for n in ast.walk(source) if isinstance(n,ast.Call)
                  and isinstance(n.func,ast.Attribute) and n.func.attr == 'send_json']
-        self.assertEqual(len(calls),2)
+        self.assertEqual(len(calls),5)
         payloads = [{k.value:v for k,v in zip(c.args[0].keys,c.args[0].values)} for c in calls]
-        self.assertEqual({p['title'].value for p in payloads}, {'request_get_joint_state', 'request_movej'})
-        query = next(p for p in payloads if p['title'].value == 'request_get_joint_state')
+        literal = [p for p in payloads if isinstance(p['title'], ast.Constant)]
+        self.assertEqual({p['title'].value for p in literal}, {'request_get_joint_state', 'request_movej', 'request_moveh', 'request_servoj'})
+        query = next(p for p in literal if p['title'].value == 'request_get_joint_state')
         self.assertEqual(query['data'].keys, [])
-        for filename in ('motion.py','pose.py','control.py','record.py','teach.py'):
+        for filename in ('motion.py','control.py','record.py','teach.py'):
             self.assertFalse((DRIVER/filename).exists())
 
     def test_config_defaults_and_invalid_poll_or_write_plugin(self):
@@ -897,7 +899,7 @@ class PackagingTests(unittest.TestCase):
                 with patch.dict(os.environ,CONFIG_PATH=str(path)), self.assertRaisesRegex(ValueError, 'read-only sensor'): load()
                 path.write_text(yaml.safe_dump(config))
                 with patch.dict(os.environ,CONFIG_PATH=str(path)):
-                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'camera', 'camera_left', 'camera_right'})
+                    self.assertEqual(set(load()['enabled_cards']),set(TOPICS) | {'arm_control', 'move_head', 'pose', 'gripper', 'camera', 'camera_left', 'camera_right'})
 
     def test_camera_only_and_fixed_source_configuration(self):
         load = self.function('load_settings')
@@ -915,6 +917,22 @@ class PackagingTests(unittest.TestCase):
     def test_missing_dds_profile_refuses_participant_creation(self):
         with patch.dict(os.environ,FASTRTPS_DEFAULT_PROFILES_FILE='/missing/tron2-dds.xml'):
             with self.assertRaisesRegex(ValueError,'DDS profile'):
+                ros2.JsonPublisher(TOPICS.values())
+
+    def test_invalid_dds_domains_are_rejected_before_ros_import(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp)/'dds.xml';profile.write_text('<profiles/>')
+            for domain in ('', '-1', '233', '999999', '43x', '04', '42.0'):
+                with self.subTest(domain=domain), patch.dict(os.environ, {
+                        'FASTRTPS_DEFAULT_PROFILES_FILE':str(profile),'ROS_DOMAIN_ID':domain,
+                        'RMW_IMPLEMENTATION':'rmw_fastrtps_cpp','TRON2_CORE_DOMAIN_ID':'42'}), self.assertRaises(ValueError):
+                    ros2.JsonPublisher(TOPICS.values())
+
+    def test_nonstandard_dds_domain_without_explicit_core_binding_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp)/'dds.xml';profile.write_text('<profiles/>')
+            with patch.dict(os.environ,{'FASTRTPS_DEFAULT_PROFILES_FILE':str(profile),
+                    'ROS_DOMAIN_ID':'43','RMW_IMPLEMENTATION':'rmw_fastrtps_cpp','TRON2_CORE_DOMAIN_ID':'42'}), self.assertRaises(ValueError):
                 ros2.JsonPublisher(TOPICS.values())
 
     def test_ros2_publisher_serializes_each_topic_and_closes_participant(self):
@@ -939,7 +957,8 @@ class PackagingTests(unittest.TestCase):
             profile = Path(temp)/'dds.xml'
             profile.write_text('<profiles/>')
             with patch.dict(sys.modules, modules), patch.dict(os.environ, {
-                    'FASTRTPS_DEFAULT_PROFILES_FILE': str(profile), 'ROS_DOMAIN_ID': '42',
+                    'FASTRTPS_DEFAULT_PROFILES_FILE': str(profile), 'ROS_DOMAIN_ID': '43',
+                    'TRON2_CORE_DOMAIN_ID': '43',
                     'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp', 'FASTDDS_BUILTIN_TRANSPORTS': 'UDPv4'}):
                 publisher = ros2.JsonPublisher(TOPICS.values())
                 self.assertNotIn('FASTDDS_BUILTIN_TRANSPORTS', os.environ)
