@@ -823,7 +823,9 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return {"status": "resumed"} if code == 0 else {"error": f"ResumeNav failed, code={code}"}
 
     def handle_get_state():
-        result = {"state": state.value, "speed_zone": speed_zone.value}
+        result = {"state": state.value, "speed_zone": speed_zone.value,
+                  "base_available": state == MotionState.IDLE and current_cmd is None
+                                    and stop_repeat_count == 0 and motion.is_idle()}
         if current_cmd and state == MotionState.MOVING:
             result["motion"] = current_cmd.copy()
         if nav_cmd and state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
@@ -834,6 +836,12 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return result
 
     # ── Safety checks (inline in main loop) ──
+    def update_velocity(vx, vy, vyaw):
+        cmd = current_cmd
+        if cmd:
+            return motion.update(cmd["action_id"], vx, vy, vyaw)
+        return None
+
     def process_safety_checks():
         nonlocal state, speed_zone
 
@@ -857,7 +865,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     cmd = current_cmd
                     if cmd:
                         dvx, dvy, dvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.DECELERATED)
-                        motion.update(cmd["action_id"], dvx, dvy, dvyaw)
+                        update_velocity(dvx, dvy, dvyaw)
                         publish_event("joint_overheat", {
                             "max_temp": round(temp, 1),
                             "action": "decelerate",
@@ -883,7 +891,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     print(f"[SmartMotion:obstacle] DECEL — dist={dist:.2f}m angle={math.degrees(obstacle_angle):.1f}° lateral={lateral}", flush=True)
                     if cmd:
                         dvx, dvy, dvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.DECELERATED)
-                        motion.update(cmd["action_id"], dvx, dvy, dvyaw)
+                        update_velocity(dvx, dvy, dvyaw)
                         with obstacle_lock:
                             od = obstacle_dist
                             oa = obstacle_angle
@@ -898,7 +906,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     speed_zone = SpeedZone.NORMAL
                     if cmd:
                         cvx, cvy, cvyaw = clamp(cmd["vx"], cmd["vy"], cmd["vyaw"], SpeedZone.NORMAL)
-                        motion.update(cmd["action_id"], cvx, cvy, cvyaw)
+                        update_velocity(cvx, cvy, cvyaw)
                         publish_event("motion_resume", {"speed": {"vx": cvx, "vy": cvy, "vyaw": cvyaw}})
 
         elif state == MotionState.NAVIGATING:
