@@ -403,6 +403,7 @@ def test_interactive_task_schema_does_not_block_its_own_confirmation(card):
     schema = card.get_tool()
     assert schema["type"] == "actuator" and not schema["multiInstance"]
     assert "x-completion" not in schema["inputSchema"]
+    assert schema["inputSchema"]["x-is-dangerous"] is True
     assert schema["inputSchema"]["properties"]["dry_run"]["default"] is True
     assert card.dispatch("start", {})["state"] == "ready"
 

@@ -307,6 +307,7 @@ class ExerciseRoutinePlugin:
                 },
                 # Interactive operator confirmation must remain callable. No ACP
                 # pending/barrier is held; job_id is deliberately not action_id.
+                "x-is-dangerous": True,
                 "x-resource": ["base", "leg", "arm_l", "arm_r"],
             }, "topic_out": [],
         }
