@@ -36,7 +36,7 @@ def notify_completion(action_id, state, result):
     request = urllib.request.Request(
         url + "/api/acp/complete", data=payload,
         headers={"Content-Type": "application/json"}, method="POST")
-    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    context = ssl._create_unverified_context() if url == "https://localhost:15678" else None
     try:
         with urllib.request.urlopen(request, timeout=5, context=context) as response:
             response.read()
@@ -403,7 +403,8 @@ class ExerciseRoutinePlugin:
                     return preview
                 if not dry and args.get("confirm") is not True:
                     raise RoutineError("真机启动需要现场确认稳定站立与周围空间，并传入 confirm=true")
-                return self._run(plan, preview, dry)
+                return self._run(plan, preview, dry,
+                                 await_publication=args.get("_await_response_publication") is True)
             except (ValueError, TypeError) as exc:
                 return {"ok": False, "state": "error", "error": str(exc)}
         return None
@@ -429,11 +430,12 @@ class ExerciseRoutinePlugin:
                 values["state"] = "stopping"
             job["status"].update(values)
 
-    def _run(self, plan, preview, dry):
+    def _run(self, plan, preview, dry, *, await_publication=False):
         with self._lock:
             if self._closed:
                 return {"ok": False, "state": "error", "error": "驱动正在关闭"}
-            if self._job and not self._job["finished"]:
+            if self._job and (not self._job["finished"]
+                              or not self._job["notification_done"].is_set()):
                 return {"ok": False, "state": "busy", "job_id": self._job["id"]}
             if not dry and self._loco is None:
                 raise RoutineError("动作编排依赖已启用的 loco 插件")
@@ -441,6 +443,8 @@ class ExerciseRoutinePlugin:
             cancel = threading.Event()
             job = {"id": job_id, "dry": dry, "cancel": cancel, "ack": threading.Event(),
                    "finished": False, "plan": plan, "rest_until": 0.0,
+                   "publication": threading.Event(), "notification_done": threading.Event(),
+                   "await_publication": await_publication, "published_at": None, "notify": True,
                    "backend": None if dry else LocoRoutineBackend(self._loco, cancel),
                    "status": {"ok": True, "job_id": job_id, "action_id": job_id, "state": "running", "dry_run": dry,
                               "completion_strategy": "simulated" if dry else "operator",
@@ -449,6 +453,8 @@ class ExerciseRoutinePlugin:
                               "play_count": 0, "completed_plays": 0, "total_plays": preview["total_plays"],
                               "confirmation_token": None, "error": None,
                               "progress_source": "scheduler", "sdk_data_freshness": "unverifiable"}}
+            if not await_publication:
+                job["publication"].set()
             job["thread"] = threading.Thread(target=self._worker, args=(job,),
                                               name="bumi_exercise_routine", daemon=True)
             # Reserve before returning run: an external command arriving before
@@ -463,11 +469,27 @@ class ExerciseRoutinePlugin:
                 job["status"].update(state="error", ok=False, error=f"无法启动编排线程：{exc}")
                 if job["backend"]:
                     job["backend"].release()
+                job["notification_done"].set()
                 result = self._status()
                 # No worker was started, so do not register an ACP pending.
                 result.pop("action_id", None)
                 return result
             return self._status()
+
+    def response_published(self, action_id, delivered=True):
+        """Called by the MCP HTTP handler only after write+flush, or on failure."""
+        with self._lock:
+            job = self._job
+            if not job or action_id != job["id"] or not job["await_publication"]:
+                return
+            if job["publication"].is_set():
+                return
+            job["published_at"] = time.monotonic() if delivered else None
+            job["notify"] = bool(delivered)
+            if not delivered:
+                job["cancel"].set()
+                job["status"]["cancel_reason"] = "MCP run response was not delivered"
+            job["publication"].set()
 
     def _request_stop(self, close=False):
         with self._lock:
@@ -477,6 +499,11 @@ class ExerciseRoutinePlugin:
             if not job:
                 return {"state": "idle"}
             job["cancel"].set()  # Before cleanup/locks: no next clip may start.
+            if close and not job["publication"].is_set():
+                # No response/action_id was delivered; do not strand a daemon
+                # waiting for a client while shutting down the driver.
+                job["notify"] = False
+                job["publication"].set()
             if not job["finished"]:
                 job["status"]["state"] = "stopping"
                 return self._status()
@@ -596,13 +623,23 @@ class ExerciseRoutinePlugin:
                                       error=error, confirmation_token=None)
                 job["finished"] = True
                 result = self._status()
-            # One worker, one terminal publication. Callback failures never
-            # rewrite a physical outcome or publish a second terminal result.
-            if self._on_terminal:
-                try:
+            # Fast completion must not race ahead of the HTTP run response.
+            # Keep this job addressable/busy until publication and notification
+            # finish, even if its physical/simulated state is already terminal.
+            try:
+                job["publication"].wait()
+                if job["notify"]:
+                    if job["await_publication"] and job["published_at"] is not None:
+                        # Match the existing Piper ACP registration grace, but
+                        # start it after the actual HTTP write+flush handshake.
+                        delay = job["published_at"] + 0.1 - time.monotonic()
+                        if delay > 0:
+                            time.sleep(delay)
                     self._on_terminal(job["id"], final_state, result)
-                except Exception as exc:
-                    print(f"[exercise_routine] terminal observer failed: {exc}", flush=True)
+            except Exception as exc:
+                print(f"[exercise_routine] terminal observer failed: {exc}", flush=True)
+            finally:
+                job["notification_done"].set()
 
 
 if __name__ == "__main__":

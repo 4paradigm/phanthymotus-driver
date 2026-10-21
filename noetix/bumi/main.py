@@ -226,6 +226,14 @@ class BumiDeviceBundle:
                 tools.append(p.get_tool())
         return tools
 
+    def response_published(self, action_id: str, delivered: bool = True) -> None:
+        if not action_id:
+            return
+        for plugin in self._plugins:
+            callback = getattr(plugin, "response_published", None)
+            if callback is not None:
+                callback(action_id, delivered)
+
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
@@ -336,11 +344,24 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    routine_run = name == "exercise_routine" and args.get("action") == "run"
+                    if routine_run:
+                        # Internal transport flag, always set by the server.
+                        args["_await_response_publication"] = True
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        try:
+                            ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                            self.wfile.flush()
+                        except Exception:
+                            if routine_run:
+                                _bundle.response_published(result.get("action_id"), delivered=False)
+                            raise
+                        else:
+                            if routine_run:
+                                _bundle.response_published(result.get("action_id"), delivered=True)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:

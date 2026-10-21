@@ -637,3 +637,136 @@ def test_acp_transport_failure_does_not_rewrite_terminal_or_retry(card, monkeypa
     assert finish(card)["state"] == "completed"
     assert attempts == [1]
     assert "ACP callback failed" in capsys.readouterr().out
+
+
+
+@pytest.mark.parametrize("url,local_exception", [
+    ("https://localhost:15678", True),
+    ("https://localhost:15678/", True),
+    ("https://core.example.invalid:15678", False),
+    ("https://localhost:15679", False),
+    ("https://localhost:15678/other", False),
+    ("https://localhost.example.invalid:15678", False),
+    ("http://localhost:15678", False),
+])
+def test_acp_tls_exception_is_only_for_exact_local_default(monkeypatch, url, local_exception):
+    import io
+    import ssl
+    import urllib.request
+    contexts = []
+    exception_context = object()
+    monkeypatch.setenv("AGENT_CORE_URL", url)
+    monkeypatch.setattr(ssl, "_create_unverified_context", lambda: exception_context)
+    def urlopen(_request, **options):
+        contexts.append(options["context"])
+        return io.BytesIO(b'{}')
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    routine.notify_completion("tls-test", "completed", {})
+    assert contexts == [exception_context if local_exception else None]
+
+
+def test_http_fast_completion_waits_for_run_response_and_pending_registration(card, monkeypatch):
+    """Force completion while the *real* MCP socket response write is blocked."""
+    import ast
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    source = ast.parse((BUMI / "main.py").read_text())
+    selected = [node for node in source.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                and node.name in {"BumiDeviceBundle", "make_handler"}]
+    namespace = {"BaseHTTPRequestHandler": BaseHTTPRequestHandler, "json": json}
+    tree = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)] + selected,
+                      type_ignores=[])
+    exec(compile(ast.fix_missing_locations(tree), str(BUMI / "main.py"), "exec"), namespace)
+    bundle = object.__new__(namespace["BumiDeviceBundle"])
+    bundle._plugins = [card]
+    namespace["_bundle"] = bundle
+    blocked, release = threading.Event(), threading.Event()
+    pending, received, client_results, client_errors = set(), [], [], []
+
+    class CoreHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            registered = payload["action_id"] in pending
+            received.append((payload, registered))
+            self.send_response(200 if registered else 409)
+            self.end_headers()
+            self.wfile.write(b'{}')
+
+    class GatedHandler(namespace["make_handler"]()):
+        def log_message(self, *_args):
+            pass
+        def _send(self, status, body):
+            if json.loads(body).get("id") == "fast-run":
+                blocked.set()
+                if not release.wait(timeout=3):
+                    raise OSError("test did not release response")
+            super()._send(status, body)
+
+    core = ThreadingHTTPServer(("127.0.0.1", 0), CoreHandler)
+    mcp = ThreadingHTTPServer(("127.0.0.1", 0), GatedHandler)
+    servers = [core, mcp]
+    threads = [threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True) for s in servers]
+    for thread in threads:
+        thread.start()
+    monkeypatch.setenv("AGENT_CORE_URL", f"http://127.0.0.1:{core.server_port}")
+    card._on_terminal = routine.notify_completion
+    card._sim_clip_s = 0.001
+    request = urllib.request.Request(f"http://127.0.0.1:{mcp.server_port}/mcp",
+        data=json.dumps({"jsonrpc": "2.0", "id": "fast-run", "method": "tools/call",
+                         "params": {"name": "exercise_routine", "arguments": {
+                             "action": "run", "dry_run": True, "plan": plan()}}}).encode(),
+        headers={"Content-Type": "application/json"})
+    def call():
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                message = json.loads(response.read())
+            result = json.loads(message["result"]["content"][0]["text"])
+            pending.add(result["action_id"])
+            client_results.append(result)
+        except Exception as exc:
+            client_errors.append(exc)
+    client = threading.Thread(target=call, daemon=True)
+    try:
+        client.start()
+        assert blocked.wait(timeout=2)
+        wait_for(card, "completed")
+        assert not received  # Completion occurred before HTTP response; no ACP yet.
+        assert not card._job["notification_done"].is_set()
+        assert run(card)["state"] == "busy"  # Old publication cannot be orphaned by another job.
+        release.set()
+        client.join(timeout=2)
+        assert not client_errors and len(client_results) == 1
+        card._job["thread"].join(timeout=2)
+        assert len(received) == 1 and received[0][1] is True
+        assert received[0][0]["action_id"] == client_results[0]["action_id"]
+        assert received[0][0]["status"] == "completed"
+    finally:
+        release.set()
+        client.join(timeout=2)
+        card.stop()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=1)
+
+
+def test_failed_response_cancels_task_without_sending_unregistered_acp(card):
+    response = card.dispatch("run", {"plan": plan(count=2), "dry_run": False,
+                                    "confirm": True, "_await_response_publication": True})
+    wait_for(card, "awaiting_confirmation")
+    card.response_published(response["action_id"], delivered=False)
+    assert wait_for(card, "cancelled")["completed_plays"] == 0
+    card._job["thread"].join(timeout=1)
+    assert card.terminal == [] and card._job["notification_done"].is_set()
+
+
+def test_shutdown_releases_worker_waiting_for_unpublished_http_response(card):
+    card.dispatch("run", {"plan": plan(), "dry_run": True, "_await_response_publication": True})
+    wait_for(card, "completed")
+    assert not card._job["notification_done"].is_set()
+    card.stop()
+    assert not card._job["thread"].is_alive()
+    assert card._job["notification_done"].is_set() and card.terminal == []

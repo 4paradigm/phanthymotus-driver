@@ -110,6 +110,10 @@ LocoPlugin 的动作入口使用同一可重入动作锁。编排在返回 run �
 单任务重复 run 返回 busy；每个工作线程只发布一次终态。
 `run` 声明 `x-completion`，返回唯一 action_id，以 `/api/acp/complete` 向 Agent Core
 回报 completed/cancelled/error，ACP 等待期限为整套一小时上限加退出和回调余量。
+HTTP run 响应写入并 flush 后才开放终态回报，并留出 Agent Core 登记 pending 的短窗口；
+快速模拟提前结束也不能抢先回调。响应发送失败会取消任务、不上报未登记的 ACP；
+驱动关闭会释放等待响应发布的线程。只有默认 https://localhost:15678 允许本机自签证书，
+其他 HTTPS Agent Core 地址保留标准证书验证。
 使用默认 AGENT_CORE_URL；回调失败记日志，不伪造动作结果或重复上报。Agent Core 不可用时
 平台依赖 ACP 超时释放等待，现场仍可直接停止。单机 --demo 不发送 ACP 网络回调。
 
@@ -179,14 +183,16 @@ SDK 没有物理完成信号，本版明确采用现场人工确认，不宣称�
 实际执行：
 
 ```bash
-python3 -m pytest tests/test_bumi_exercise_routine.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py tests/test_bumi_camera_specs.py tests/test_bumi_odom.py noetix/bumi/tests -q -p no:cacheprovider
+python3 -m pytest tests/test_bumi_exercise_routine.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py tests/test_bumi_camera_specs.py tests/test_bumi_odom.py noetix/bumi/tests tests/test_file_upload_endpoint.py -q -p no:cacheprovider
 ```
 
-结果：**253 passed in 3.98s**。覆盖新状态机、输入和素材校验、真实 LocoPlugin 的
+结果：**313 passed, 1 warning in 13.57s**。覆盖新状态机、输入和素材校验、真实 LocoPlugin 的
 mock SDK 调用路径、顺序/重复/轮数/休息、人工确认令牌、启动/退出未确认、
 停止竞态、同模式外部回放替换、各显式动作入口、流式控制冲突、保护/状态读取异常、
 线程启动失败、驱动关闭与缺少控制器的兼容性，以及既有 Bumi 相关回归。
 新增 ACP action_id/终态单次回报、默认 HTTP 回调、回调失败、独立控制入口和中断 hook 覆盖。
+另覆盖真实 HTTP 快速完成与响应发布竞态、响应失败/关闭清理、TLS 例外范围及原有上传端点。
+一条 warning 为既有 common/file_intake.py 的 cgi 弃用提示。
 
 `python3 noetix/bumi/exercise_routine.py --demo` 实际完成两轮、8 次模拟片段播放，
 终态 completed，completed_plays=8，控制权未保留，物理退出确认为 null。
