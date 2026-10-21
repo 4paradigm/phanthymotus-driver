@@ -37,6 +37,10 @@ python3 -m pytest tests/test_bumi_exercise_routine.py tests/test_bumi_bundle.py 
 ## 卡片接口
 
 卡片参数由现有 inputSchema / x-action-params 提供；`start` 只返回 ready。
+画布的 PLAN 文本框可以直接粘贴 JSON 对象，驱动在入口解析；原生 JSON 对象仍支持。
+DRY_RUN/CONFIRM 文本框填写 true 或 false（不加引号）；留空分别默认 true/false。
+不接受 yes、0 等隐式布尔转换；解析后的计划仍严格检查字段、类型和范围。
+控制卡查询 status 时，留空 JOB_ID 表示查询当前任务。
 默认 `dry_run: true`。运行返回用于 ACP 的 action_id 和用于查询/确认的 job_id（当前值相同）。计划例子：
 
 ```json
@@ -186,12 +190,14 @@ SDK 没有物理完成信号，本版明确采用现场人工确认，不宣称�
 python3 -m pytest tests/test_bumi_exercise_routine.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py tests/test_bumi_camera_specs.py tests/test_bumi_odom.py noetix/bumi/tests tests/test_file_upload_endpoint.py -q -p no:cacheprovider
 ```
 
-结果：**313 passed, 1 warning in 13.57s**。覆盖新状态机、输入和素材校验、真实 LocoPlugin 的
+结果：**333 passed, 1 warning in 14.63s**。覆盖新状态机、输入和素材校验、真实 LocoPlugin 的
 mock SDK 调用路径、顺序/重复/轮数/休息、人工确认令牌、启动/退出未确认、
 停止竞态、同模式外部回放替换、各显式动作入口、流式控制冲突、保护/状态读取异常、
 线程启动失败、驱动关闭与缺少控制器的兼容性，以及既有 Bumi 相关回归。
 新增 ACP action_id/终态单次回报、默认 HTTP 回调、回调失败、独立控制入口和中断 hook 覆盖。
 另覆盖真实 HTTP 快速完成与响应发布竞态、响应失败/关闭清理、TLS 例外范围及原有上传端点。
+画布 PLAN JSON 文本、布尔文本、空参数默认值、非法输入与原生对象均有覆盖；
+HTTP 回归同时发送原生参数和画布文本参数，确认文本 false 不会变成真实运动许可。
 一条 warning 为既有 common/file_intake.py 的 cgi 弃用提示。
 
 `python3 noetix/bumi/exercise_routine.py --demo` 实际完成两轮、8 次模拟片段播放，

@@ -66,6 +66,50 @@ def _seconds(value, field, maximum=600, positive=False):
     return float(value)
 
 
+def _canvas_boolean(value, field, default):
+    """Accept booleans or explicit form text, never Python string truthiness."""
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return default
+        if text in {"true", "false"}:
+            return text == "true"
+    raise RoutineError(f"{field} 必须是 true 或 false（不要加引号），留空使用默认值")
+
+
+def normalize_canvas_args(action, args):
+    """Normalize the canvas text boxes at the public boundary only.
+
+    The plan's nested counts/types and physical-motion guards stay strict.
+    Blank optional fields default to simulation and no confirmation.
+    """
+    result = dict(args)
+    if action in {"validate", "run"}:
+        plan = result.get("plan")
+        if isinstance(plan, str):
+            if len(plan) > 65536:
+                raise RoutineError("plan JSON 文本不能超过 65536 个字符")
+            try:
+                plan = json.loads(plan)
+            except ValueError as exc:
+                raise RoutineError(f"plan 需要合法 JSON 对象，请仅粘贴花括号内的完整计划：{exc}") from exc
+            if not isinstance(plan, dict):
+                raise RoutineError("plan JSON 必须是对象，不能是列表、字符串或空值")
+            result["plan"] = plan
+        result["dry_run"] = _canvas_boolean(result.get("dry_run", True), "dry_run", True)
+        result["confirm"] = _canvas_boolean(result.get("confirm", False), "confirm", False)
+    if action == "continue":
+        result["confirm"] = _canvas_boolean(result.get("confirm", False), "confirm", False)
+        for key in ("job_id", "confirmation_token"):
+            if isinstance(result.get(key), str):
+                result[key] = result[key].strip()
+    if action == "status" and isinstance(result.get("job_id"), str):
+        result["job_id"] = result["job_id"].strip() or None
+    return result
+
+
 def load_library(path):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema_version") != 1:
@@ -376,6 +420,10 @@ class ExerciseRoutinePlugin:
         if args.get("_tool_name") == "exercise_routine_control" and action not in {
                 "start", "stop", "status", "continue", "info"}:
             return {"ok": False, "state": "error", "error": "编排控制入口不能启动新计划或任意动作"}
+        try:
+            args = normalize_canvas_args(action, args)
+        except (ValueError, TypeError) as exc:
+            return {"ok": False, "state": "error", "error": str(exc)}
         if action == "start":
             return {"state": "ready" if not self._closed else "error"}
         if action == "info":

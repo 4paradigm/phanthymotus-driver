@@ -173,8 +173,9 @@ def test_invalid_plan_shapes(card, bad):
     assert card.dispatch("validate", {"plan": bad})["state"] == "error"
 
 
-def test_non_boolean_dry_run_is_rejected(card):
-    assert card.dispatch("validate", {"plan": plan(), "dry_run": "false"})["state"] == "error"
+@pytest.mark.parametrize("value", ["yes", "0", 1, None, {}])
+def test_non_boolean_dry_run_is_rejected(card, value):
+    assert card.dispatch("validate", {"plan": plan(), "dry_run": value})["state"] == "error"
 
 
 def test_play_and_time_limits(card):
@@ -665,7 +666,8 @@ def test_acp_tls_exception_is_only_for_exact_local_default(monkeypatch, url, loc
     assert contexts == [exception_context if local_exception else None]
 
 
-def test_http_fast_completion_waits_for_run_response_and_pending_registration(card, monkeypatch):
+@pytest.mark.parametrize("canvas_text", [False, True])
+def test_http_fast_completion_waits_for_run_response_and_pending_registration(card, monkeypatch, canvas_text):
     """Force completion while the *real* MCP socket response write is blocked."""
     import ast
     import urllib.request
@@ -716,7 +718,9 @@ def test_http_fast_completion_waits_for_run_response_and_pending_registration(ca
     request = urllib.request.Request(f"http://127.0.0.1:{mcp.server_port}/mcp",
         data=json.dumps({"jsonrpc": "2.0", "id": "fast-run", "method": "tools/call",
                          "params": {"name": "exercise_routine", "arguments": {
-                             "action": "run", "dry_run": True, "plan": plan()}}}).encode(),
+                             "action": "run", "dry_run": "true" if canvas_text else True,
+                             "confirm": "false" if canvas_text else False,
+                             "plan": json.dumps(plan()) if canvas_text else plan()}}}).encode(),
         headers={"Content-Type": "application/json"})
     def call():
         try:
@@ -770,3 +774,60 @@ def test_shutdown_releases_worker_waiting_for_unpublished_http_response(card):
     card.stop()
     assert not card._job["thread"].is_alive()
     assert card._job["notification_done"].is_set() and card.terminal == []
+
+
+
+@pytest.mark.parametrize("text", ["true", " true ", "TRUE"])
+def test_canvas_json_plan_and_boolean_text_validate(card, hardware, text):
+    result = card.dispatch("validate", {"plan": json.dumps(plan()), "dry_run": text, "confirm": "false"})
+    assert result["state"] == "validated" and result["dry_run"] is True
+    assert hardware[0].calls == [] and hardware[0].reads == 0
+
+
+def test_canvas_text_dry_run_executes_without_hardware(card, hardware):
+    result = card.dispatch("run", {"plan": json.dumps(plan(rounds=2)), "dry_run": "true", "confirm": "false"})
+    assert result["dry_run"] is True
+    assert finish(card)["completed_plays"] == 2
+    assert hardware[0].calls == [] and hardware[0].reads == 0
+
+
+def test_blank_canvas_flags_default_to_dry_run_without_confirmation(card, hardware):
+    result = card.dispatch("run", {"plan": json.dumps(plan()), "dry_run": " ", "confirm": ""})
+    assert result["dry_run"] is True and finish(card)["state"] == "completed"
+    assert not hardware[0].calls
+
+
+def test_false_string_is_false_and_never_confirms_physical_motion(card, hardware):
+    preview = card.dispatch("validate", {"plan": json.dumps(plan()), "dry_run": "false", "confirm": "false"})
+    assert preview["ok"] and preview["dry_run"] is False
+    result = card.dispatch("run", {"plan": json.dumps(plan()), "dry_run": "false", "confirm": "false"})
+    assert result["state"] == "error" and not hardware[0].calls
+
+
+@pytest.mark.parametrize("text", ["garbage", "[]", '"text"', "null", '{"rounds":1,}', "x" * 65537])
+def test_bad_canvas_plan_text_is_rejected_before_hardware(card, hardware, text):
+    result = card.dispatch("run", {"plan": text, "dry_run": "false", "confirm": "true"})
+    assert result["state"] == "error" and not hardware[0].calls
+
+
+def test_decoded_plan_still_rejects_unknown_keys_and_nested_wrong_types(card):
+    for p in ({**plan(), "typo": 1}, plan(rounds="1"), plan(count=True)):
+        assert not card.dispatch("validate", {"plan": json.dumps(p), "dry_run": "true"})["ok"]
+
+
+def test_canvas_true_confirmation_only_applies_to_current_clip(card):
+    run(card)
+    status = wait_for(card, "awaiting_confirmation")
+    args = {"_tool_name": "exercise_routine_control", "job_id": status["job_id"],
+            "confirmation_token": status["confirmation_token"], "confirm": "false"}
+    assert not card.dispatch("continue", args)["ok"]
+    assert card.dispatch("continue", {**args, "confirm": "true"})["ok"]
+    wait_for(card, "completed")
+    card._job["thread"].join(timeout=1)
+
+
+def test_blank_optional_canvas_job_id_queries_current_task(card):
+    assert card.dispatch("status", {"job_id": " "})["state"] == "idle"
+    run(card)
+    status = wait_for(card, "awaiting_confirmation")
+    assert card.dispatch("status", {"job_id": ""})["job_id"] == status["job_id"]
