@@ -1,0 +1,198 @@
+{
+  "nominal": {
+    "data_source": "synthetic_control_model",
+    "fusion_algorithm_executed": false,
+    "target_m": 1.0,
+    "truth_m": 0.9998869877560617,
+    "estimated_m": 1.000413364805682,
+    "estimation_error_m": 0.0005263770496204412,
+    "control_error_m": -0.00011301224393833742,
+    "result": {
+      "state": "done",
+      "feedback_source": "rgbd_imu_ekf",
+      "accuracy_validated": false,
+      "requested_distance_m": 1.0,
+      "segment_id": "fixture",
+      "binding_revision": "fixture",
+      "estimated_quality": {
+        "status": "tracking",
+        "segment_id": "fixture",
+        "calibration_id": "fixture",
+        "feedback_source": "rgbd_imu_ekf",
+        "published_ns": 13959999999,
+        "visual_stamp_ns": 13959999999,
+        "accuracy_validated": false
+      },
+      "estimated_distance_m": 1.000413364805682,
+      "estimated_error_m": -0.00041336480568210376,
+      "elapsed_s": 3.9599999999999156
+    },
+    "final_command": 0
+  },
+  "scale_error": {
+    "data_source": "synthetic_control_model",
+    "fusion_algorithm_executed": false,
+    "target_m": 1.0,
+    "truth_m": 0.8645774910449481,
+    "estimated_m": 0.9935660141236774,
+    "estimation_error_m": 0.12898852307872932,
+    "control_error_m": -0.13542250895505192,
+    "result": {
+      "state": "done",
+      "feedback_source": "rgbd_imu_ekf",
+      "accuracy_validated": false,
+      "requested_distance_m": 1.0,
+      "segment_id": "fixture",
+      "binding_revision": "fixture",
+      "estimated_quality": {
+        "status": "tracking",
+        "segment_id": "fixture",
+        "calibration_id": "fixture",
+        "feedback_source": "rgbd_imu_ekf",
+        "published_ns": 13479999999,
+        "visual_stamp_ns": 13479999999,
+        "accuracy_validated": false
+      },
+      "estimated_distance_m": 0.9935660141236774,
+      "estimated_error_m": 0.006433985876322601,
+      "elapsed_s": 3.479999999999926
+    },
+    "final_command": 0
+  },
+  "faults": {
+    "lost": {
+      "data_source": "synthetic_control_model",
+      "fusion_algorithm_executed": false,
+      "target_m": 1.0,
+      "truth_m": 0.30360302183252585,
+      "estimated_m": 0.28422827712374743,
+      "estimation_error_m": -0.019374744708778424,
+      "control_error_m": -0.6963969781674741,
+      "result": {
+        "state": "error",
+        "feedback_source": "rgbd_imu_ekf",
+        "accuracy_validated": false,
+        "requested_distance_m": 1.0,
+        "segment_id": "fixture",
+        "binding_revision": "fixture",
+        "error": "odometry lost: None",
+        "estimated_quality": {
+          "status": "lost",
+          "reason": "odometry lost: None"
+        },
+        "estimated_distance_m": 0.28422827712374743,
+        "estimated_error_m": 0.7157717228762526,
+        "elapsed_s": 1.0199999999999783
+      },
+      "final_command": 0
+    },
+    "stale": {
+      "data_source": "synthetic_control_model",
+      "fusion_algorithm_executed": false,
+      "target_m": 1.0,
+      "truth_m": 0.4554000456143755,
+      "estimated_m": 0.28422827712374743,
+      "estimation_error_m": -0.1711717684906281,
+      "control_error_m": -0.5445999543856245,
+      "result": {
+        "state": "error",
+        "feedback_source": "rgbd_imu_ekf",
+        "accuracy_validated": false,
+        "requested_distance_m": 1.0,
+        "segment_id": "fixture",
+        "binding_revision": "fixture",
+        "error": "odometry feedback stale",
+        "estimated_quality": {
+          "status": "lost",
+          "reason": "odometry feedback stale"
+        },
+        "estimated_distance_m": 0.28422827712374743,
+        "estimated_error_m": 0.7157717228762526,
+        "elapsed_s": 1.4799999999999685
+      },
+      "final_command": 0
+    },
+    "reset": {
+      "data_source": "synthetic_control_model",
+      "fusion_algorithm_executed": false,
+      "target_m": 1.0,
+      "truth_m": 0.30360302183252585,
+      "estimated_m": 0.28422827712374743,
+      "estimation_error_m": -0.019374744708778424,
+      "control_error_m": -0.6963969781674741,
+      "result": {
+        "state": "error",
+        "feedback_source": "rgbd_imu_ekf",
+        "accuracy_validated": false,
+        "requested_distance_m": 1.0,
+        "segment_id": "fixture",
+        "binding_revision": "fixture",
+        "error": "odometry segment or calibration changed",
+        "estimated_quality": {
+          "status": "lost",
+          "reason": "odometry segment or calibration changed"
+        },
+        "estimated_distance_m": 0.28422827712374743,
+        "estimated_error_m": 0.7157717228762526,
+        "elapsed_s": 1.0199999999999783
+      },
+      "final_command": 0
+    },
+    "connection": {
+      "data_source": "synthetic_control_model",
+      "fusion_algorithm_executed": false,
+      "target_m": 1.0,
+      "truth_m": 0.3300014572880623,
+      "estimated_m": 0.3243588464713951,
+      "estimation_error_m": -0.005642610816667171,
+      "control_error_m": -0.6699985427119377,
+      "result": {
+        "state": "error",
+        "feedback_source": "rgbd_imu_ekf",
+        "accuracy_validated": false,
+        "requested_distance_m": 1.0,
+        "segment_id": "fixture",
+        "binding_revision": "fixture",
+        "error": "feedback connection changed",
+        "estimated_quality": {
+          "status": "lost",
+          "reason": "feedback connection changed"
+        },
+        "estimated_distance_m": 0.3243588464713951,
+        "estimated_error_m": 0.6756411535286049,
+        "elapsed_s": 1.0999999999999766
+      },
+      "final_command": 0
+    },
+    "cancel": {
+      "data_source": "synthetic_control_model",
+      "fusion_algorithm_executed": false,
+      "target_m": 1.0,
+      "truth_m": 0.30360302183252585,
+      "estimated_m": 0.28422827712374743,
+      "estimation_error_m": -0.019374744708778424,
+      "control_error_m": -0.6963969781674741,
+      "result": {
+        "state": "stopped",
+        "feedback_source": "rgbd_imu_ekf",
+        "accuracy_validated": false,
+        "requested_distance_m": 1.0,
+        "segment_id": "fixture",
+        "binding_revision": "fixture",
+        "estimated_quality": {
+          "status": "tracking",
+          "segment_id": "fixture",
+          "calibration_id": "fixture",
+          "feedback_source": "rgbd_imu_ekf",
+          "published_ns": 10959999999,
+          "visual_stamp_ns": 10959999999,
+          "accuracy_validated": false
+        },
+        "estimated_distance_m": 0.28422827712374743,
+        "estimated_error_m": 0.7157717228762526,
+        "elapsed_s": 1.0199999999999783
+      },
+      "final_command": 0
+    }
+  }
+}

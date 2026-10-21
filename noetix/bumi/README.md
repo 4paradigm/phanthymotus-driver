@@ -571,3 +571,15 @@ ros2 topic echo /<robot_namespace>/motion/state
 ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
+
+
+### Optional standalone RGB-D/body-IMU odometry
+
+The new `rgbd_imu_odometry` sensor is delivered as an independent driver image,
+with RTAB-Map/EKF dependencies kept out of this bundle. See
+[installation, calibration, platform companion patch and validation](../bumi_odometry/README.md).
+Connecting its `state/odom` port to `loco_destination` selects fused distance
+feedback. Unconnected distance moves retain the pure IMU experiment above.
+Connected but invalid/reset/stale feedback stops and errors without switching
+sources. Real ROS integration and physical accuracy remain unverified; measured
+mount/IMU/timing calibration is required before the sensor can track.

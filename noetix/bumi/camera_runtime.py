@@ -171,9 +171,17 @@ def capture(namespace):
         except Exception as exc:
             print(f'[camera_subprocess] intrinsics unavailable: {exc}', flush=True)
 
+        # Optional extra publishers share this pipeline; fusion never owns USB.
+        raw_publisher = None
+        try:
+            from odometry_inputs import RawCameraPublisher
+            raw_publisher = RawCameraPublisher(node, namespace, pipeline, qos)
+        except Exception as exc:
+            print(f'[odometry_input] raw branch unavailable: {exc}', flush=True)
         count, started = 0, time.monotonic()
         while rclpy.ok():
-            frames = align.process(pipeline.wait_for_frames(timeout_ms=1000))
+            source_frames = pipeline.wait_for_frames(timeout_ms=1000)
+            frames = align.process(source_frames)
             color = frames.get_color_frame()
             if color:
                 msg = CompressedImage()
@@ -187,6 +195,8 @@ def capture(namespace):
                 msg.format = '16UC1; compressedDepth zlib'
                 msg.data = zlib.compress(np.asanyarray(depth.get_data()).tobytes(), 1)
                 depth_pub.publish(msg)
+            if raw_publisher is not None:
+                raw_publisher.publish(source_frames, frames)
             count += 1
             if count % 300 == 0:
                 print(f'[camera_subprocess] {count} frames, {count/(time.monotonic()-started):.1f} fps',

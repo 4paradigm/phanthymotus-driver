@@ -435,6 +435,12 @@ class LocoPlugin:
         self._rotate_worker: threading.Thread | None = None
         self._active_action_id: str | None = None
         self._destination_action = "rotate"
+        from odometry_feedback import DistanceFeedback
+        self._distance_context = None
+        self._distance_fault = None
+        self._distance_feedback = DistanceFeedback(executor, on_fault=self._abort_distance)
+        self._distance_feedback.managed = bool(plugin_config.get('require_feedback_binding', False))
+
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
@@ -549,27 +555,29 @@ class LocoPlugin:
     def _loco_destination_tool(self) -> dict:
         return {
             "name": "loco_destination", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：纯机身 IMU 实验版按积分估计距离前进，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动：连接 rgbd_imu_odometry 时使用融合位姿距离反馈；未连接时保留纯机身 IMU 积分实验，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
+                "x-feedback-binding": 1,
                 "properties": {
                     "action": {"type": "string", "enum": ["move", "rotate", "stop_move", "status"]},
                     "distance_m": {"type": "number", "minimum": 0.1, "maximum": 3,
-                                   "description": "沿起点朝向前进的目标距离（米）；纯 IMU 积分实验估计，非经验证的实际距离。启动前保持静止。"},
+                                   "description": "沿起点朝向前进的目标距离（米）；按已保存连线固定反馈来源；实际精度待实测。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["distance_m"], "description": "静止标定后按 IMU 估计距离前进并刹停；数据异常或无进展时停车报错。实验版精度待实测。"},
+                    "move": {"params": ["distance_m"], "description": "按画布绑定的融合位姿或未连线的纯 IMU 实验估计距离前进；数据、连线或坐标段异常时停车报错，精度待实测。"},
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
                     "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
-                    "status": {"params": [], "description": "查询当前目标动作、IMU 估计位移或转角结果。"},
+                    "status": {"params": [], "description": "查询当前目标动作、距离反馈来源及估计位移或转角结果。"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
                 # Both actions retain the existing asynchronous ACP contract.
                 "x-completion": {"actions": ["move", "rotate"], "timeout": 120},
             },
+            "topic_in": [{"format": "state/odom", "message_type": "std_msgs/msg/String"}],
             "topic_out": [],
         }
 
@@ -671,6 +679,7 @@ class LocoPlugin:
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
         self._wait_for_rotate_idle()
+        self._distance_feedback.close()
 
     def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
         # Cover the dispatch-acceptance window: stop may land after the
@@ -693,6 +702,23 @@ class LocoPlugin:
         return False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if args.get('_tool_name') == 'loco_destination':
+            if action in ('start', 'config'):
+                try:
+                    binding = args.get('feedback_binding')
+                    if binding is not None:
+                        self._distance_feedback.apply(binding)
+                        self._distance_feedback.start_watchdog(self._active_distance_context)
+                    elif args.get('input_topic') or args.get('input_topics') or self._distance_feedback.managed:
+                        raise ValueError('platform saved-graph feedback binding is required')
+                    return {'state': 'ready', **self._distance_feedback.info()}
+                except Exception as exc:
+                    self._abort_distance(str(exc))
+                    return {'state': 'error', 'error': str(exc)}
+            if action == 'info':
+                return {'state': 'ready', **self._distance_feedback.info()}
+            if action == 'stop':
+                self._distance_feedback.invalidate('feedback card stopped or disconnected')
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -888,6 +914,9 @@ class LocoPlugin:
             self._rotate_stop_event.clear()
             self._rotate_state["state"] = "running"
             self._destination_action = action
+            if action == 'move':
+                self._distance_fault = None
+                self._distance_context = None
         try:
             value, terminal = (self._rotate_preflight(args) if action == "rotate"
                                else self._distance_preflight(args))
@@ -897,6 +926,7 @@ class LocoPlugin:
                 else:
                     from imu_distance_control import distance_timeout
                     expected_duration_s = distance_timeout(value)
+                feedback_context = self._distance_context
                 action_id = f"bumi_loco_destination_{uuid.uuid4().hex}"
                 worker = threading.Thread(target=self._do_rotate_worker,
                                           args=(args, action_id, action),
@@ -907,10 +937,16 @@ class LocoPlugin:
                 worker.start()
                 return {"state": "running", "action_id": action_id,
                         "expected_duration_s": expected_duration_s,
-                        ("requested_angle_deg" if action == "rotate" else "requested_distance_m"): value}
+                        ("requested_angle_deg" if action == "rotate" else "requested_distance_m"): value,
+                        **({'feedback_source': feedback_context['source'],
+                            'binding_revision': feedback_context['revision'],
+                            'segment_id': feedback_context['segment'],
+                            'accuracy_validated': False} if action == 'move' else {})}
         except Exception as exc:
             terminal = {"state": "error",
-                        "error": f"{type(exc).__name__}: {exc}"}
+                        "error": f"{type(exc).__name__}: {exc}",
+                        **({'feedback_source': 'rgbd_imu_ekf' if self._distance_feedback.topic else 'imu_integrated_experimental',
+                            'estimated_quality': 'unavailable', 'accuracy_validated': False} if action == 'move' else {})}
         # No worker accepted the action: release its reservation so a
         # transient SDK or thread-start failure does not leave the card busy.
         with self._rotate_lock:
@@ -936,6 +972,10 @@ class LocoPlugin:
                 owns_velocity = True
             result = self._do_rotate_impl(args) if action == "rotate" else self._do_distance_impl(args)
             result["action"] = action
+            if action == 'move':
+                result.setdefault('feedback_source', self._distance_context['source'] if self._distance_context else 'unavailable')
+                result.setdefault('estimated_quality', 'unavailable')
+                result.setdefault('accuracy_validated', False)
             return result
         except Exception as exc:
             result = {"state": "error",
@@ -994,7 +1034,23 @@ class LocoPlugin:
             }
         return None
 
+    def _active_distance_context(self):
+        if self._destination_action == 'move' and self._rotate_state['state'] == 'running':
+            return self._distance_context
+        return None
+
+    def _abort_distance(self, reason):
+        if self._destination_action == 'move' and self._rotate_state['state'] == 'running':
+            self._distance_fault = self._distance_fault or reason
+            self._rotate_stop_event.set()
+            self._distance_publish(0)
+
     def _read_distance_imu(self):
+        context = self._active_distance_context()
+        if context is not None:
+            if self._distance_fault:
+                raise ValueError(self._distance_fault)
+            self._distance_feedback.validate(context)
         return self._high_ctrl.get_imu_data()
 
     def _distance_preflight(self, args):
@@ -1008,13 +1064,23 @@ class LocoPlugin:
         problem = self._rotate_mode_error()
         if problem is not None:
             return None, problem
-        from imu_distance_control import decode_imu
-        decode_imu(self._read_distance_imu())
+        with self._distance_feedback.lock:
+            self._distance_context = self._distance_feedback.freeze()
+        if self._distance_context['source'] == 'imu_integrated_experimental':
+            from imu_distance_control import decode_imu
+            decode_imu(self._read_distance_imu())
         return distance, None
 
     def _distance_publish(self, vx, vyaw=0):
-        self._publish_cmd(vx, 0, vyaw, _get_default_cmd(), 0,
-                          cancel_event=self._rotate_stop_event if vx or vyaw else None)
+        with self._distance_feedback.lock:
+            if vx or vyaw:
+                if self._distance_fault:
+                    raise ValueError(self._distance_fault)
+                context = self._active_distance_context()
+                if context is not None:
+                    self._distance_feedback.validate(context)
+            self._publish_cmd(vx, 0, vyaw, _get_default_cmd(), 0,
+                              cancel_event=self._rotate_stop_event if vx or vyaw else None)
 
     def _do_distance_impl(self, args):
         from imu_distance_control import run_distance
@@ -1024,7 +1090,16 @@ class LocoPlugin:
             if self._move_thread.is_alive():
                 return {"state": "error", "error": "previous move has not stopped"}
         self._set_servo_velocity_owner(True)
-        return run_distance(self, float(args["distance_m"]))
+        context = self._distance_context
+        if context is not None and context['source'] == 'rgbd_imu_ekf':
+            from odometry_feedback import run_fused_distance
+            return run_fused_distance(self, float(args['distance_m']), context)
+        result = run_distance(self, float(args["distance_m"]))
+        result['estimated_quality'] = 'experimental_unvalidated'
+        result['binding_revision'] = context['revision'] if context else None
+        if self._distance_fault:
+            result.update(state='error', error=self._distance_fault)
+        return result
 
     def _read_rotate_imu(self) -> tuple[float, float]:
         imu = self._high_ctrl.get_imu_data()

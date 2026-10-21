@@ -74,6 +74,7 @@ def _load_device(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     path = Path(__file__).resolve().parents[1] / "device.py"
+    monkeypatch.syspath_prepend(str(path.parent))
     spec = importlib.util.spec_from_file_location("bumi_loco_destination_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -317,7 +318,10 @@ def test_distance_dispatch_reserves_chassis_and_completes_once(monkeypatch):
     entered, release = threading.Event(), threading.Event()
     calls = []
     monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
-    monkeypatch.setattr(plugin, '_distance_preflight', lambda args: (1.0, None))
+    def preflight(args):
+        plugin._distance_context = plugin._distance_feedback.freeze()
+        return 1.0, None
+    monkeypatch.setattr(plugin, '_distance_preflight', preflight)
 
     def run(args):
         entered.set()

@@ -84,6 +84,8 @@ COPY device.py /work/device.py
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
+COPY odometry_inputs.py /work/odometry_inputs.py
+COPY odometry_feedback.py /work/odometry_feedback.py
 COPY camera_runtime.py /work/camera_runtime.py
 COPY camera_specs.py /work/camera_specs.py
 COPY odom_spec.py /work/odom_spec.py

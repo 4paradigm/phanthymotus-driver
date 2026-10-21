@@ -1,0 +1,13 @@
+id: bumi-odometry-driver
+name: Bumi RGB-D IMU Odometry
+category: driver
+hardware_provider: noetix
+hardware_model: bumi
+image_name: noetix-bumi-odometry
+port: 15714
+mcp_url: "http://localhost:15714/mcp"
+description: "独立只读 RGB-D＋机身 IMU/EKF 里程计；复用 Bumi 相机，需安装外参与时间标定"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: rgbd_imu_odometry, type: sensor }
