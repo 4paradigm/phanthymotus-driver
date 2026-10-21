@@ -344,6 +344,7 @@ def run_distance(owner, distance_m, direction='', full_scale=None):
                   leg_samples=(getattr(leg, 'samples', None) if leg is not None else None),
                   leg_stance_samples=(getattr(leg, 'stance_samples', None) if leg is not None else None),
                   leg_joint_updates=(joint_updates if leg is not None else None),
+                  leg_slip_scale=(getattr(leg, 'slip_scale', None) if leg is not None else None),
                   elapsed_s=time.monotonic()-started)
     try:
         _write_trace(samples, commands, result)

@@ -29,18 +29,21 @@ def test_standing_pose_puts_the_contact_at_the_sole_centre():
     assert left[2] == pytest.approx(-0.4802, abs=1e-3)
 
 
-def test_contact_point_is_continuous_in_the_foot_pitch():
+def test_contact_point_slides_continuously_from_heel_to_toe():
     flat = module.foot_position([0.0]*6, LEFT)
-    toe_down = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.3, 0.0], LEFT)
-    heel_down = module.foot_position([0.0, 0.0, 0.0, 0.0, -0.3, 0.0], LEFT)
-    # A fixed point in the foot frame: rolling the foot must not jump the
-    # contact between corners (that produced a false fault on the robot).
-    for other in (toe_down, heel_down):
-        assert other[0] == pytest.approx(flat[0] + (other[2]-flat[2])*0.0, abs=0.06)
+    toe_a = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.29, 0.0], LEFT)
+    toe_b = module.foot_position([0.0, 0.0, 0.0, 0.0, 0.30, 0.0], LEFT)
+    heel = module.foot_position([0.0, 0.0, 0.0, 0.0, -0.30, 0.0], LEFT)
+    assert flat[0] == pytest.approx(0.0301, abs=1e-3)
+    assert toe_a[0] > flat[0]+0.05 and toe_b[0] > flat[0]+0.05
+    # Continuous: a 0.01 rad change must not jump the contact between corners
+    # (the corner model produced 2.6 cm jumps and a false fault on the robot).
+    assert abs(toe_b[0]-toe_a[0]) < 0.01
+    assert heel[0] < flat[0]-0.05
 
 
 def test_reset_position_keeps_the_previous_foot_for_the_next_step():
-    estimator = module.LegOdometry()
+    estimator = module.LegOdometry(slip_scale=1.0)
     feet = stand_feet()
     estimator.observe_feet(feet, IDENTITY, 0.0)
     estimator.observe_feet([[foot[0]-0.005, foot[1], foot[2]] for foot in feet],
@@ -56,7 +59,7 @@ def test_reset_position_keeps_the_previous_foot_for_the_next_step():
 
 
 def test_forward_translation_from_both_stance_feet():
-    estimator = module.LegOdometry()
+    estimator = module.LegOdometry(slip_scale=1.0)
     feet = stand_feet()
     estimator.observe_feet(feet, IDENTITY, 0.0)
     estimator.observe_feet([[foot[0]-0.005, foot[1], foot[2]] for foot in feet],
@@ -67,7 +70,7 @@ def test_forward_translation_from_both_stance_feet():
 
 
 def test_the_swing_foot_is_not_used_for_the_body_step():
-    estimator = module.LegOdometry()
+    estimator = module.LegOdometry(slip_scale=1.0)
     feet = stand_feet()
     estimator.observe_feet(feet, IDENTITY, 0.0)
     # Left foot is planted: it implies a 5 mm body step. Right foot swings
@@ -79,7 +82,7 @@ def test_the_swing_foot_is_not_used_for_the_body_step():
 
 
 def test_yaw_is_applied_when_projecting_the_step_into_the_start_frame():
-    estimator = module.LegOdometry()
+    estimator = module.LegOdometry(slip_scale=1.0)
     feet = stand_feet()
     estimator.observe_feet(feet, IDENTITY, 0.0)
     yaw = math.radians(90)
@@ -97,7 +100,7 @@ def test_sdk_motor_state_objects_are_accepted():
     motors = [NS(pos=0.0) for _ in range(21)]
     angles = module.joint_angles(motors)
     assert angles == [0.0]*12
-    estimator = module.LegOdometry()
+    estimator = module.LegOdometry(slip_scale=1.0)
     estimator.observe(motors, (0.0, 0.0, 0.0, 1.0), 0.0)
     estimator.observe(motors, (0.0, 0.0, 0.0, 1.0), 0.02)
     assert estimator.position == pytest.approx([0.0, 0.0, 0.0], abs=1e-9)
@@ -105,7 +108,7 @@ def test_sdk_motor_state_objects_are_accepted():
 
 
 def test_implausible_steps_are_ignored_instead_of_integrating_noise():
-    estimator = module.LegOdometry()
+    estimator = module.LegOdometry(slip_scale=1.0)
     feet = stand_feet()
     estimator.observe_feet(feet, IDENTITY, 0.0)
     # 10 cm in 20 ms is 5 m/s: not a body step, discard.
@@ -116,7 +119,7 @@ def test_implausible_steps_are_ignored_instead_of_integrating_noise():
 
 
 def test_invalid_sampling_interval_and_joint_count_are_rejected():
-    estimator = module.LegOdometry()
+    estimator = module.LegOdometry(slip_scale=1.0)
     estimator.observe_feet(stand_feet(), IDENTITY, 0.0)
     with pytest.raises(ValueError, match='sampling interval'):
         estimator.observe_feet(stand_feet(), IDENTITY, 0.2)
@@ -129,3 +132,14 @@ def test_quaternion_rotation_requires_a_finite_normalized_value():
     assert rotation[0][0] == pytest.approx(math.cos(0.2), abs=1e-9)
     with pytest.raises(ValueError, match='quaternion'):
         module.rotation_from_quaternion((0.0, 0.0, 0.0, 0.0))
+
+
+def test_measured_slip_scale_is_applied_by_default():
+    estimator = module.LegOdometry()
+    feet = stand_feet()
+    estimator.observe_feet(feet, IDENTITY, 0.0)
+    estimator.observe_feet([[foot[0]-0.005, foot[1], foot[2]] for foot in feet],
+                           IDENTITY, 0.02)
+    assert estimator.slip_scale == pytest.approx(module.DISTANCE_SLIP_SCALE)
+    assert estimator.position == pytest.approx([0.005*module.DISTANCE_SLIP_SCALE, 0.0, 0.0],
+                                               abs=1e-9)

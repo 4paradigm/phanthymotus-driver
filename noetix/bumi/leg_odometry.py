@@ -52,13 +52,25 @@ JOINT_ORDER = (
 )
 JOINT_INDEX = {name: index for index, name in enumerate(JOINT_ORDER)}
 
-# Sole centre in the ankle-roll link frame, from the ankle_roll_link mesh
-# bounding box (x: heel -0.0689 .. toe 0.1258, y: +-0.0413, sole z: -0.0511).
-# A fixed point in the foot frame is continuous. The previous "lowest sole
-# corner" model followed the heel-to-toe roll but jumped between corners on a
-# single sample, which showed up as a 2.6 cm step and -1.33 m/s at the first
-# step of the 2026-10-21 18:58 run; that is a false fault, not motion.
-SOLE_CENTRE = (0.02845, 0.0, -0.0511)
+# Heel and toe of the sole in the ankle-roll link frame, from the
+# ankle_roll_link mesh bounding box (x: heel -0.0689 .. toe 0.1258, sole
+# z: -0.0511, mid-line y = 0). The contact point is a continuous blend between
+# them weighted by their height above the ground: a hard "lowest corner" jumps
+# from one corner to the other in a single sample (2.6 cm / -1.33 m/s in the
+# 2026-10-21 18:58 run), while a fixed sole centre cannot follow the roll.
+HEEL = (-0.0689, 0.0, -0.0511)
+TOE = (0.1258, 0.0, -0.0511)
+# Height difference over which the contact slides from heel to toe.
+CONTACT_BLEND_M = 0.004
+
+# Empirical slip correction. On the 2026-10-21 lab runs the feet lifted only
+# ~1 cm and slid: the body moved ~0.70 m and ~0.75 m while the stance-foot
+# kinematics accounted for ~0.46 m and ~0.48 m, i.e. a consistent factor of
+# about 1.5. This is a measured correction for that floor/gait, not a physical
+# law: re-measure it for another surface (track the same body marker over a
+# known straight move) and set it to 1.0 if the feet do not slip. It is
+# reported in the result as `leg_slip_scale`.
+DISTANCE_SLIP_SCALE = 1.5
 
 # The largest plausible body step per sample at ~50 Hz (1.0 m/s). A larger
 # implied step is a contact/kinematics discontinuity, not body motion.
@@ -116,28 +128,51 @@ def joint_angles(joint_positions):
     return values
 
 
-def foot_position(angles, chain):
-    """Foot contact point in the body frame for one leg's six joint angles.
-
-    The contact is the sole centre, a fixed point in the foot frame: continuous
-    in the joint angles, which the stance-foot integration relies on. The real
-    centre of pressure moves as the foot rolls; that residual is one of the
-    approximations this estimate carries.
-    """
+def foot_geometry(angles, chain):
+    """Body-frame heel and toe points for one leg's six joint angles."""
     position = [0.0, 0.0, 0.0]
     rotation = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     for (_, origin, axis), angle in zip(chain, angles):
         offset = _apply(rotation, origin)
         position = [position[i]+offset[i] for i in range(3)]
         rotation = _matrix_multiply(rotation, _axis_rotation(axis, angle))
-    contact = _apply(rotation, SOLE_CENTRE)
-    return [position[i]+contact[i] for i in range(3)]
+    heel = _apply(rotation, HEEL)
+    toe = _apply(rotation, TOE)
+    return ([position[i]+heel[i] for i in range(3)],
+            [position[i]+toe[i] for i in range(3)])
+
+
+def contact_point(heel, toe, body_rotation=None):
+    """Continuous contact between the heel and toe of one foot.
+
+    The blend weight uses the height of each point in the body frame (or in the
+    world frame when `body_rotation` is supplied): the lower point wins, with a
+    smooth transition over `CONTACT_BLEND_M`, so a rolling foot slides the
+    contact instead of jumping between corners.
+    """
+    rotation = body_rotation or [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    z_heel = _apply(rotation, heel)[2]
+    z_toe = _apply(rotation, toe)[2]
+    lowest = min(z_heel, z_toe)
+    w_heel = math.exp(-(z_heel-lowest)/CONTACT_BLEND_M)
+    w_toe = math.exp(-(z_toe-lowest)/CONTACT_BLEND_M)
+    total = w_heel+w_toe
+    return [(w_heel*heel[i]+w_toe*toe[i])/total for i in range(3)]
+
+
+def foot_position(angles, chain):
+    """Foot contact point in the body frame for one leg's six joint angles."""
+    heel, toe = foot_geometry(angles, chain)
+    return contact_point(heel, toe)
 
 
 class LegOdometry:
     """Integrate body displacement from successive foot positions."""
 
-    def __init__(self):
+    def __init__(self, slip_scale=None):
+        self.slip_scale = DISTANCE_SLIP_SCALE if slip_scale is None else float(slip_scale)
+        if not math.isfinite(self.slip_scale) or self.slip_scale <= 0:
+            raise ValueError('leg slip scale must be positive and finite')
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
         self.samples = 0
@@ -156,9 +191,11 @@ class LegOdometry:
         """One SDK joint-state + orientation sample."""
         values = joint_angles(joint_positions)
         split = len(LEG_CHAINS['left'])
-        feet = [foot_position(values[:split], LEG_CHAINS['left']),
-                foot_position(values[split:], LEG_CHAINS['right'])]
-        self.observe_feet(feet, rotation_from_quaternion(quaternion), now)
+        rotation = rotation_from_quaternion(quaternion)
+        left = foot_geometry(values[:split], LEG_CHAINS['left'])
+        right = foot_geometry(values[split:], LEG_CHAINS['right'])
+        feet = [contact_point(*left, rotation), contact_point(*right, rotation)]
+        self.observe_feet(feet, rotation, now)
 
     def observe_feet(self, feet, rotation, now):
         """One already-computed (left, right) body-frame foot sample."""
@@ -185,6 +222,7 @@ class LegOdometry:
                 else:
                     best = min(plausible, key=lambda index: lengths[index])
                     delta = deltas[best]
+                delta = [value*self.slip_scale for value in delta]
                 self.position = [self.position[i]+delta[i] for i in range(3)]
                 self.velocity = [value/dt for value in delta]
                 self.stance_samples += 1
