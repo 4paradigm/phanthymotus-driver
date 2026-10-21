@@ -1,6 +1,7 @@
 --- a/agent-core/src/api/mcp_manage.py
 +++ b/agent-core/src/api/mcp_manage.py
-@@ -1041,7 +1041,7 @@
+@@ -1040,9 +1040,9 @@
+     所以超时是**调用方按用途给**的，不在这里定一个对两种用途都不对的默认值。
      """
      # Opt-in feedback consumers bind to the authoritative saved graph, including
      # browser lifecycle calls. Tool arguments cannot choose a discovery topic.
@@ -9,9 +10,11 @@
          import odometry_graph_binding as _feedback_graph
          if _feedback_graph.opted_in(mcp_id, req.tool):
              req.arguments['feedback_binding'] = _feedback_graph.saved_binding(
+                 mcp_id, req.tool, req.arguments.get('instance_id', ''))
 --- a/agent-core/src/odometry_graph_binding.py
 +++ b/agent-core/src/odometry_graph_binding.py
-@@ -28,6 +28,10 @@
+@@ -27,8 +27,12 @@
+         if find_tool and source:
              current=find_tool(source.get('mcpId',''),source.get('toolName','')) or {}
              live=current.get('topic_out') or []
              if 0<=index<len(live): declaration=live[index]
@@ -22,7 +25,9 @@
          saved=ports[index] if 0<=index<len(ports) else {}
          topic=edge.get('fromTopic') or saved.get('topic') or (declaration or {}).get('topic') or ''
          fmt=edge.get('format') or saved.get('format') or (declaration or {}).get('format')
-@@ -79,16 +83,28 @@
+         valid=valid and source.get('toolName')=='rgbd_imu_odometry' and destination==0 and index>=0
+@@ -78,18 +82,30 @@
+     async def deliver(card):
          key=(card['mcpId'],card['toolName'],card['id'])
          try:
              binding=saved_binding(*key)
@@ -53,5 +58,6 @@
 +            except Exception:
 +                pass
      await asyncio.gather(*(deliver(c) for c in targets))
+
  
- 
+ def start():
