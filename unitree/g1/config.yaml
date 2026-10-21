@@ -13,6 +13,24 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  loco_relative_move:
+    enabled: true
+    # Closed-loop speed caps; requires only the loco_state publisher.
+    translation_speed: 0.3
+    min_translation_speed: 0.2  # Minimum nonzero component per active body axis.
+    rotation_speed: 0.5
+    min_rotation_speed: 0.3  # Minimum nonzero angular velocity (rad/s).
+    safety:
+      feedback_timeout_s: 0.5
+      tilt_threshold_deg: 25
+      tilt_stop_deg: 35  # Same severe tilt threshold as SmartMotion.
+      tilt_hold_s: 0.15
+      speed_factor: 1.5
+      speed_margin_m_s: 0.1
+      yaw_margin_rad_s: 0.2
+      overspeed_hold_s: 0.2
+      position_jump_slack_m: 0.1
+      angle_jump_slack_deg: 10
   arm:
     enabled: true
   # 双臂 + 双夹爪的连续控制（motus.control/1，16 维）。给执行模型用。
@@ -92,8 +110,6 @@ plugins:
   controlled_spatial_map:
     enabled: true
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
-  motion_switcher:
-    enabled: true
   ext_mic:
     enabled: true
   ext_camera:

@@ -1,0 +1,21 @@
+franka-fr3:
+  container_name: embodied-franka-fr3
+  image: __IMAGE__
+  # FCI connects directly to the configured robot IPs; local DDS reaches Core.
+  network_mode: host
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOCALHOST_ONLY=0
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - AGENT_CORE_URL=${FRANKA_AGENT_CORE_URL:-https://localhost:15678}
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

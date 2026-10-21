@@ -110,8 +110,34 @@ def test_bundle_can_register_teleop_with_servo_cards(monkeypatch, legacy, teleop
     config['plugins']['smart_motion'] = {'enabled': False}
     if legacy:
         with pytest.raises(ValueError, match='motion_control is removed; use teleop_control'):
-            namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None, None)
+            namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None)
         return
-    bundle = namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None, None)
+    bundle = namespace['G1DeviceBundle'](config, 'offline', None, None, None, None, None)
     assert len(bundle._plugins) == 4
     assert bundle._plugins[0]._teleop_control is bundle._plugins[1]
+
+
+@pytest.mark.parametrize('failure', [None, 'cards', 'bus', 'safety', 'loco', 'executor'])
+def test_bundle_shutdown_cleans_all_owners_even_after_failure(failure):
+    import ast
+    tree = ast.parse((DRIVER/'main.py').read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
+    cleanup = main.body[-1].finalbody
+    calls = []
+    def close(name):
+        def run():
+            calls.append(name)
+            if failure == name: raise RuntimeError(name)
+        return run
+    executor = SimpleNamespace(shutdown=close('executor'))
+    bus = SimpleNamespace(shared_executor=executor, close=close('bus'))
+    namespace = {'_bundle': SimpleNamespace(stop_all=close('cards'), _motion_bus=bus),
+                 'smart_motion': SimpleNamespace(shutdown=close('safety')),
+                 'loco_client': SimpleNamespace(stop=close('loco')),
+                 'executor': executor, 'rclpy': SimpleNamespace(shutdown=close('ros'))}
+    code = compile(ast.Module(body=cleanup, type_ignores=[]), str(DRIVER/'main.py'), 'exec')
+    if failure:
+        with pytest.raises(RuntimeError, match=failure): exec(code, namespace)
+    else:
+        exec(code, namespace)
+    assert calls == ['cards', 'bus', 'safety', 'loco', 'executor', 'ros']

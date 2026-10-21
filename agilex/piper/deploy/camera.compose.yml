@@ -1,0 +1,9 @@
+# Optional override for the existing site compose file. The selected color V4L2
+# path must match camera.device in the driver's configuration. SocketCAN itself
+# uses the host network and needs no /dev exposure.
+services:
+  agilex-piper:
+    devices:
+      - "${PIPER_CAMERA_DEVICE:?Set the explicit color V4L2 path}:${PIPER_CAMERA_DEVICE:?Set the explicit color V4L2 path}:rw"
+    environment:
+      - PIPER_CAMERA_ENABLED=1

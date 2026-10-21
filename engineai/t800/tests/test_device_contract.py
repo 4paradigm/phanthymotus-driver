@@ -5,6 +5,7 @@ import math
 import os
 import ssl
 import struct
+import zlib
 import sys
 import tempfile
 import threading
@@ -3161,17 +3162,21 @@ class DevicePluginContractTests(unittest.TestCase):
         )
         plugin._on_depth(depth)
         out = plugin._depth_pub.messages[-1]
-        self.assertEqual("16UC1", out.encoding)
-        self.assertEqual((640, 480, 1280), (out.width, out.height, out.step))
-        self.assertEqual(640 * 480 * 2, len(out.data))
+        # zlib now, not raw z16. The size is the format's contract rather than
+        # a field on the wire, so it is asserted on the decompressed payload —
+        # which is also the only thing that proves the compression is lossless
+        # and little-endian, the two properties every consumer depends on.
+        self.assertEqual("16UC1; compressedDepth zlib", out.format)
         self.assertEqual("source-stamp", out.header.stamp)
         self.assertEqual("camera", out.header.frame_id)
-        row = struct.unpack("<640H", bytes(out.data[:1280]))
+        raw = zlib.decompress(bytes(out.data))
+        self.assertEqual(640 * 480 * 2, len(raw))
+        row = struct.unpack("<640H", raw[:1280])
         self.assertEqual((2000, 0, 0, 65535), (row[0], row[160], row[320], row[480]))
         tools = {tool["name"]: tool for tool in plugin.get_tools()}
         self.assertEqual("image/jpeg", tools["camera"]["topic_out"][0]["format"])
         self.assertEqual(2, len(tools["camera"]["topic_out"]))
-        self.assertEqual("image/depth-z16", tools["depth"]["topic_out"][0]["format"])
+        self.assertEqual("image/depth-zlib", tools["depth"]["topic_out"][0]["format"])
 
     def test_head_declares_lifecycle_and_completion_schema(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)

@@ -60,6 +60,9 @@ OWN_PROFILE = {
                             'BridgeROS2 in joints_bridge.py); runs the vendor profile '
                             '/work/dds_profile.xml process-wide, whose whitelist excludes the '
                             'office LAN. Setting the fleet profile here cuts the body link.',
+    'agibot/A3': 'main.py generates a constrained robot+loopback FastDDS profile; the '
+                 'robot-domain-232 context must reach 10.42.10.x while the isolated '
+                 'domain-42 bridge uses loopback.',
 }
 
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,

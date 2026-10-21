@@ -78,6 +78,7 @@ fake clock on a laptop. See tests/test_control_sink.py.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -134,6 +135,16 @@ def _wall_ms() -> int:
     NTP 跳变影响 —— 两件事两个时钟，不是一个疏忽。
     """
     return int(time.time() * 1000)
+
+
+def _finite_number(value) -> bool:
+    """Whether a wire value is numeric and safe for comparisons/clamping."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 class ControlSink:
@@ -430,8 +441,9 @@ class ControlSink:
                 f"values has {len(values)} entries but dof is {self.descriptor.dof}",
             )
         for i, value in enumerate(values):
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return Outcome(Verdict.REJECTED, f"values[{i}] is not a number: {value!r}")
+            if not _finite_number(value):
+                return Outcome(Verdict.REJECTED,
+                               f"values[{i}] is not a finite number: {value!r}")
 
         # Every `eef_pose` segment's quaternion must be unit length. This is
         # the one check in the whole chain that can catch a *different rotation
@@ -463,10 +475,11 @@ class ControlSink:
         """
         stamp = message.get("stamp_ms")
         ttl = message.get("ttl_ms")
-        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
-            return Outcome(Verdict.REJECTED, "stamp_ms is required")
-        if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
-            return Outcome(Verdict.REJECTED, "ttl_ms is required and must be positive")
+        if not _finite_number(stamp):
+            return Outcome(Verdict.REJECTED, "stamp_ms is required and must be finite")
+        if not _finite_number(ttl) or ttl <= 0:
+            return Outcome(Verdict.REJECTED,
+                           "ttl_ms is required, finite, and must be positive")
 
         age = now - stamp
         if age > ttl:
@@ -474,6 +487,8 @@ class ControlSink:
 
         max_obs_age = self.descriptor.max_obs_age_ms
         obs_stamp = message.get("obs_stamp_ms")
+        if obs_stamp is not None and not _finite_number(obs_stamp):
+            return Outcome(Verdict.REJECTED, "obs_stamp_ms must be finite")
         if max_obs_age is not None and isinstance(obs_stamp, (int, float)):
             obs_age = now - obs_stamp
             if obs_age > max_obs_age:
@@ -501,8 +516,9 @@ class ControlSink:
         """
         source = message["source"]
         priority = message.get("priority", 0)
-        if isinstance(priority, bool) or not isinstance(priority, (int, float)):
-            return Outcome(Verdict.REJECTED, f"priority is not a number: {priority!r}")
+        if not _finite_number(priority):
+            return Outcome(Verdict.REJECTED,
+                           f"priority is not a finite number: {priority!r}")
         priority = int(priority)
 
         holder_stale = (
