@@ -39,6 +39,7 @@ class RoundSnapshot:
     frames: Tuple[PoseFrame, ...]
     complete: bool
     playback_result: Optional[dict] = None
+    completion_observed_monotonic_ns: Optional[int] = None
 
     def as_dict(self) -> dict:
         return {
@@ -48,6 +49,8 @@ class RoundSnapshot:
             "ended_monotonic_ns": self.ended_monotonic_ns,
             "complete": self.complete,
             "playback_result": deepcopy(self.playback_result),
+            "completion_observed_monotonic_ns": (
+                self.completion_observed_monotonic_ns),
             "frames": [frame.as_dict() for frame in self.frames],
         }
 
@@ -210,7 +213,9 @@ class PoseRecorder:
                 complete = False
             snapshot = RoundSnapshot(
                 str(round_id), outcome, started_ns, ended_ns, tuple(frames),
-                complete, deepcopy(playback_result))
+                complete, deepcopy(playback_result),
+                (int(completion_observed_monotonic_ns)
+                 if completion_observed_monotonic_ns is not None else None))
             if len(self._rounds) >= self._max_rounds:
                 self._rounds.popitem(last=False)
                 self._counters["frozen_round_evictions"] += 1
@@ -238,3 +243,59 @@ class PoseRecorder:
                 "bridge_transport_drops": max(0, int(bridge_transport_drops)),
                 **self._counters,
             }
+
+
+class PoseRoundController:
+    """Orchestrate a round while Pose ingestion runs on an independent path."""
+
+    def __init__(self, recorder: PoseRecorder, submit_tts, wait_for_playback,
+                 clock_ns: Callable[[], int] = time.monotonic_ns,
+                 wait_post_window=time.sleep):
+        self._recorder = recorder
+        self._submit_tts = submit_tts
+        self._wait_for_playback = wait_for_playback
+        self._clock_ns = clock_ns
+        self._wait_post_window = wait_post_window
+
+    def run_round(self, round_id: str, instruction: str,
+                  timeout_seconds: float) -> dict:
+        self._recorder.start_round(round_id, int(self._clock_ns()))
+        try:
+            speech_id = self._submit_tts(instruction)
+        except Exception as exc:
+            return self._finish_error(
+                round_id, "SUBMIT_FAILED", "TTS_SUBMIT_FAILED", exc)
+        try:
+            playback_result = self._wait_for_playback(
+                speech_id, float(timeout_seconds))
+        except TimeoutError as exc:
+            return self._finish_error(
+                round_id, "TIMEOUT", "PLAYBACK_TIMEOUT", exc)
+        except Exception as exc:
+            return self._finish_error(
+                round_id, "PLAYBACK_FAILED", "PLAYBACK_WAIT_FAILED", exc)
+
+        if not self._recorder._trusted_completion(playback_result):
+            result = playback_result.get("result") if isinstance(
+                playback_result, dict) else None
+            outcome = {
+                "failed": "PLAYBACK_FAILED",
+                "interrupted": "MANUAL_TERMINATED",
+                "timeout": "TIMEOUT",
+            }.get(result, "UNTRUSTED_COMPLETION")
+            return self._recorder.finish_round(
+                round_id, outcome, int(self._clock_ns()), playback_result)
+        observed_ns = int(self._clock_ns())
+        self._wait_post_window(3.0)
+        return self._recorder.finish_round(
+            round_id, "COMPLETED", int(self._clock_ns()), playback_result,
+            observed_ns)
+
+    def _finish_error(self, round_id: str, outcome: str, error_code: str,
+                      error: Exception) -> dict:
+        return self._recorder.finish_round(
+            round_id, outcome, int(self._clock_ns()), {
+                "result": "timeout" if outcome == "TIMEOUT" else "failed",
+                "error_code": error_code,
+                "error_message": str(error),
+            })
