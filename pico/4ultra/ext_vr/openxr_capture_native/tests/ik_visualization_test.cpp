@@ -142,7 +142,7 @@ int main(int argc, char** argv){
  feedback["reason"]="release_buttons_then_regrip";
  assert(ParseIkVisualization(feedback).control_label()=="请松开组合键");
  feedback["state"]="hold";feedback["reason"]="resetting";
- assert(ParseIkVisualization(feedback).control_label()=="正在交权与请求复位");
+ assert(ParseIkVisualization(feedback).control_label()=="正在交还控制权");
  feedback["state"]="active";feedback["reason"]=nullptr;
  assert(ParseIkVisualization(feedback).control_label()=="遥操已接通");
  feedback["alignment"]["state"]="unreachable";
@@ -163,21 +163,21 @@ int main(int argc, char** argv){
  assert(ParseIkVisualization({{"schema","motus.teleop.feedback/1"},{"available",false},{"reason","feedback_stale"}}).control_label()=="机器人反馈已失效");
  nlohmann::json reset={{"schema","motus.teleop.feedback/1"},{"state","ready"},
    {"reason","waiting_baseline_confirmation"},
-   {"execution",{{"state","idle"},{"reason","reset_requested"},{"ownership_held",false},{"output_active",false}}}};
+   {"execution",{{"state","idle"},{"reason","release_confirmed"},{"ownership_held",false},{"output_active",false}}}};
  auto journey=ParseIkVisualization(reset);
- assert(journey.reset_request_sent && journey.control_label()=="复位请求已发送");
- assert(journey.control_hint().find("现场确认")!=std::string::npos);
+ assert(journey.control_released && journey.control_label()=="控制权已交还");
+ assert(journey.control_hint().find("重新确认基准")!=std::string::npos);
  journey.received-=std::chrono::seconds(1);
  assert(journey.control_label()=="机器人反馈已失效");
- reset["execution"]["ownership_held"]=true;assert(!ParseIkVisualization(reset).reset_request_sent);
+ reset["execution"]["ownership_held"]=true;assert(!ParseIkVisualization(reset).control_released);
  reset["execution"]["ownership_held"]=false;
- reset["execution"]["output_active"]=true;assert(!ParseIkVisualization(reset).reset_request_sent);
+ reset["execution"]["output_active"]=true;assert(!ParseIkVisualization(reset).control_released);
  reset["execution"]["output_active"]=false;
  reset["state"]="hold";reset["reason"]="release_sdk_error";
- assert(!ParseIkVisualization(reset).reset_request_sent);
- assert(ParseIkVisualization(reset).control_label()=="交权或复位未完成");
+ assert(!ParseIkVisualization(reset).control_released);
+ assert(ParseIkVisualization(reset).control_label()=="交权未完成");
  reset["state"]="ready";reset["reason"]="waiting_baseline_confirmation";
- reset["execution"]["reason"]="release_confirmed";assert(!ParseIkVisualization(reset).reset_request_sent);
- reset.erase("execution");assert(!ParseIkVisualization(reset).reset_request_sent);
+ reset["execution"]["reason"]="reset_requested";assert(!ParseIkVisualization(reset).control_released);
+ reset.erase("execution");assert(!ParseIkVisualization(reset).control_released);
 
 }

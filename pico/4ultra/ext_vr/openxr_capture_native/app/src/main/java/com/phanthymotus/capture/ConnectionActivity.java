@@ -71,7 +71,7 @@ public final class ConnectionActivity extends Activity {
         layout.setPadding(dp(24), dp(24), dp(24), dp(24)); scroll.setFillViewport(true); scroll.addView(layout); setContentView(scroll);
         TextView title = new TextView(this); title.setText("PhanthyMotus · 连接机器人"); title.setTextSize(24); layout.addView(title);
         TextView legend = new TextView(this);
-        legend.setText("首次连接：在 PICO 浏览器打开机器人下载页，安装后点击打开 App 并连接。\n已配对后会自动重连。G1：松开双握把，确认双臂自然下垂，长按 X+A 一秒建立基准；松键后重新双握接通，松开任一握把暂停。结束本轮：松开双握把，长按 Y+B 一秒；请求发送成功后现场确认复位。保留智能控制，下次遥操再建立基准。");
+        legend.setText("首次连接：在 PICO 浏览器打开机器人下载页，安装后点击打开 App 并连接。\n已配对后会自动重连。G1：松开双握把，确认双臂自然下垂，长按 X+A 一秒建立基准；松键后重新双握接通，松开任一握把暂停。结束本轮：松开双握把，长按 Y+B 一秒；等待控制权交还确认。设备保持运行，下次遥操按 X+A 重新确认基准。");
         legend.setTextSize(16); layout.addView(legend);
         LinearLayout connection = card(layout, "连接与确认");
         status = new TextView(this); status.setTextSize(16); status.setPadding(0, dp(12), 0, dp(12));

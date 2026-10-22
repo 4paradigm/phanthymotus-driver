@@ -66,8 +66,8 @@ class ExtVrPlugin:
                         "description": ("请在 PICO 浏览器打开此链接。下载安装 App 后返回网页配对；下载无需 PIN。\n"
                                         "开始使用：连接 teleop_device → teleop_control，再启动智能控制。\n"
                                         "松开双握把，确认双方双臂下垂，长按 X+A 一秒；松键后重新双握接通。\n"
-                                        "结束本轮：松开双握把，长按 Y+B 一秒；请求发送成功后现场确认复位。"
-                                        "保留智能控制，下次遥操再建立基准。"),
+                                        "结束本轮：松开双握把，长按 Y+B 一秒；等待控制权交还确认。"
+                                        "设备保持运行，下次遥操按 X+A 重新确认基准。"),
                         "x-qr-options": [{
                             "label": "下载与配对",
                             "url": f"https://{{host}}:{self.config.get('port', 15741)}/onboarding",
