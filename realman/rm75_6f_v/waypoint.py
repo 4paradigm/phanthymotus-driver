@@ -246,7 +246,8 @@ class WaypointPlugin(RM75Plugin):
         if action in ('stop', 'cancel'):
             # Serialize with validation/submission as well as active monitoring.
             with self._operation_lock:
-                return self._stop_motion()
+                result = self._stop_motion()
+            return {'state': 'idle'} if action == 'stop' else result
         if action == 'info':
             with self._action_lock:
                 return {'state': 'running' if self._active_action_id else 'ready',

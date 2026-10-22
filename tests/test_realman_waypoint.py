@@ -148,6 +148,16 @@ class WaypointTests(unittest.TestCase):
         self.assertFalse(self.sdk.motion_gate.locked())
         self.assertIn(('rm_set_arm_slow_stop', ()), self.sdk.commands)
 
+    def test_active_lifecycle_stop_returns_idle_and_cancels(self):
+        self.save()
+        self.sdk.reach = False
+        self.sdk.joints = [0.] * 7
+        self.move()
+        self.assertEqual({'state': 'idle'}, self.plugin.dispatch('stop', {}))
+        self.wait()
+        self.assertEqual('cancelled', self.events[0][1])
+        self.assertFalse(self.sdk.motion_gate.locked())
+
     def test_joint_stop_cancels_waypoint_and_cartesian_invalidates(self):
         CartesianPlugin(self.sdk, {}, arm_plugin=self.arm)
         self.save()
