@@ -12,12 +12,13 @@ from uuid import uuid4
 
 from episode import TRAJECTORY_SCHEMA, STATE_NAMES, UNITS, MAX_TRAJECTORY, encode
 from state import vector
-from vendor import validate_movej, motion_readiness
+from vendor import ARM_LOWER, ARM_UPPER, validate_movej, motion_readiness
 from gripper import state_data, MAX_OPENING
 
 MAX_GAP_NS = 100_000_000
 START_RAD = math.radians(2)
 GRIP_TOLERANCE = 3
+RECORDING_LIMIT_TOLERANCE = math.radians(5)
 
 
 def pack_trajectory(binding, states):
@@ -56,7 +57,10 @@ def read_trajectory(raw, binding=None):
     for frame in frames:
         if frame.get('type')!='frame' or type(frame.get('t_ns')) is not int or not 0<=frame['t_ns']<=1800_000_000_000:
             raise ValueError('trajectory_frame')
-        validate_movej(frame.get('q'), .1)
+        q=vector(frame.get('q'),14,'q')
+        for index,(value,low,high) in enumerate(zip(q,ARM_LOWER,ARM_UPPER)):
+            if not low-RECORDING_LIMIT_TOLERANCE<=value<=high+RECORDING_LIMIT_TOLERANCE:
+                raise ValueError('Recorded joint angle exceeds 5 degree tolerance at index '+str(index))
         vector(frame.get('gripper'),2,'gripper')
         if any(not 0<=v<=MAX_OPENING for v in frame['gripper']):
             raise ValueError('gripper_replay_limit')
@@ -129,6 +133,10 @@ class Replay:
         if self.active:
             raise ValueError('replay_busy')
         _,frames=read_trajectory(raw,binding)
+        # Clamp only execution targets; package import/export retains measured values.
+        for frame in frames:
+            frame['q']=[min(high,max(low,value)) for value,low,high in zip(frame['q'],ARM_LOWER,ARM_UPPER)]
+            validate_movej(frame['q'],.1)
         # Idle polling is slower than the replay freshness limit; wake the sole reader.
         with self.reader.pose_feedback():
             grip=state_data(await self.reader.read_gripper())

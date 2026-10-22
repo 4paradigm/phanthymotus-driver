@@ -1,6 +1,7 @@
 """Fake vendor capture and replay boundaries; never connect to hardware."""
 import asyncio
 import json
+import math
 from contextlib import contextmanager
 from pathlib import Path
 import sys
@@ -17,6 +18,7 @@ from teaching_replay import Replay, pack_trajectory, read_trajectory
 from test_teaching_episode import BINDING, jpeg, state
 from skeleton import JOINT_NAMES
 from episode import load_episode
+from vendor import ARM_LOWER, ARM_UPPER, validate_movej
 
 
 class Reader:
@@ -133,6 +135,43 @@ def test_replay_above_old_speed_limit_preserves_frames_and_timing():
         assert outcome['status']=='completed',outcome
         assert [q[:14] for kind,q in reader.commands if kind=='arm']==[s['q'][:14] for s in states]
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('direction',[-1,1])
+def test_recording_tolerance_clamps_commands_only(direction):
+    async def run():
+        limits=ARM_UPPER if direction==1 else ARM_LOWER
+        states=[state(i) for i in range(6)]
+        for i,s in enumerate(states):
+            s['q'][:14]=[v+direction*math.radians(5)*i/5 for v in limits]
+            s['gripper']=[0,20]
+        raw=pack_trajectory(BINDING,states)
+        _,frames=read_trajectory(raw,BINDING)
+        assert [f['q'] for f in frames]==[s['q'][:14] for s in states]
+        reader=Reader();reader.q[:14]=limits
+        replay=Replay(reader,allowed,lambda:True)
+        preview=await replay.play(raw,BINDING,{})
+        result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
+            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
+        outcome=await replay.wait(result['action_id'])
+        assert outcome['status']=='completed',outcome
+        commands=[q[:14] for kind,q in reader.commands if kind=='arm']
+        assert commands==[list(limits)]*len(states)
+        for q in commands:validate_movej(q,.1)
+        assert pack_trajectory(BINDING,states)==raw
+        assert read_trajectory(raw,BINDING)[1]==frames
+        states[-1]['q'][11]+=direction*math.radians(.001)
+        with pytest.raises(ValueError,match='5 degree tolerance at index 11'):
+            read_trajectory(pack_trajectory(BINDING,states),BINDING)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('value',[True,'1',None,float('nan'),float('inf')])
+def test_recording_tolerance_rejects_invalid_numbers(value):
+    states=[state(i) for i in range(2)]
+    states[0]['q'][11]=value
+    with pytest.raises(ValueError):
+        read_trajectory(pack_trajectory(BINDING,states),BINDING)
 
 
 def test_replay_hold_head_grippers_and_terminal_feedback():
