@@ -84,6 +84,17 @@ def _offer_pose(pose_q, item: dict, transport_drops) -> bool:
         return False
 
 
+def _offer_pose_barrier(pose_q, item: dict, transport_drops=None,
+                        timeout_seconds: float = 0.25) -> bool:
+    """Boundedly wait for a barrier slot without evicting a Pose frame."""
+    del transport_drops
+    try:
+        pose_q.put(dict(item), timeout=max(0.0, float(timeout_seconds)))
+        return True
+    except queue.Full:
+        return False
+
+
 def _queue_speaker_failure(failure_q, failure: dict, seen_ids: dict,
                            overflow_epoch=None) -> bool:
     """Offer one failure without blocking; coalesce overload conservatively."""
@@ -605,7 +616,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                         String, topic, _on_pose, QOS_SENSOR)
                     node.get_logger().info(f"pose subscribed to {topic} (BEST_EFFORT)")
             elif isinstance(cmd, dict) and cmd.get("kind") == "pose_barrier":
-                _offer_pose(
+                _offer_pose_barrier(
                     pose_q,
                     pose_barrier_item(str(cmd.get("token") or "")),
                     pose_transport_drops)

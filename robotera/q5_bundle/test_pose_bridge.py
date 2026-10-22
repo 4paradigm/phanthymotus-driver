@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import queue
+import threading
+import time
 from pathlib import Path
 
 import q5_media_bridge
@@ -57,6 +59,33 @@ def test_pose_barrier_uses_same_ordered_lane_as_prior_pose_messages():
 
     assert [pose_q.get_nowait()["kind"] for _ in range(3)] == [
         "pose", "pose", "barrier"]
+    assert drops.value == 0
+
+
+def test_full_pose_lane_barrier_waits_for_space_without_evicting_pose():
+    pose_q = queue.Queue(maxsize=2)
+    drops = FakeCounter()
+    pose_q.put_nowait({"kind": "pose", "sequence": 1})
+    pose_q.put_nowait({"kind": "pose", "sequence": 2})
+    removed = []
+
+    def consume_one():
+        time.sleep(0.01)
+        removed.append(pose_q.get_nowait())
+
+    consumer = threading.Thread(target=consume_one)
+    consumer.start()
+    assert q5_media_bridge._offer_pose_barrier(
+        pose_q, q5_media_bridge.pose_barrier_item("freeze", lambda: 3),
+        drops, timeout_seconds=0.2)
+    consumer.join(1)
+
+    assert removed == [{"kind": "pose", "sequence": 1}]
+    assert [pose_q.get_nowait() for _ in range(2)] == [
+        {"kind": "pose", "sequence": 2},
+        {"kind": "barrier", "token": "freeze",
+         "bridge_received_monotonic_ns": 3},
+    ]
     assert drops.value == 0
 
 

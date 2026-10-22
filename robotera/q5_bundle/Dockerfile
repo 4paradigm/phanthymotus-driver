@@ -86,6 +86,8 @@ COPY vision_capture.py /work/vision_capture.py
 COPY legacy_device.py /work/legacy_device.py
 COPY audio_timing.py /work/audio_timing.py
 COPY playback_telemetry.py /work/playback_telemetry.py
+COPY pose_recorder.py /work/pose_recorder.py
+COPY pose_game.py /work/pose_game.py
 COPY legacy_direct_control.py /work/legacy_direct_control.py
 COPY q5_media_bridge.py /work/q5_media_bridge.py
 COPY q5_camera_worker.py /work/q5_camera_worker.py
