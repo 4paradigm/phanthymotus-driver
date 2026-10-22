@@ -70,13 +70,33 @@ class _LatestControlInbox:
                 self._motion = entry
             return True
 
-    def take(self, allow_motion=True):
+    def take(self, allow_motion=True, *, newer_than=None):
         with self._lock:
             if not self._active:
                 return None
             if self._zero is not None:
                 entry, self._zero = self._zero, None
             elif allow_motion:
+                if newer_than is not None and self._motion is not None:
+                    # A confirmed stop may have blocked long enough for a new
+                    # frame to supersede the selected motion. Compare and pop
+                    # atomically; leave other streams/sequences for the sink's
+                    # normal arbitration. A pending zero always takes priority.
+                    try:
+                        candidate = json.loads(self._motion[0].data)
+                        source = newer_than.get("source")
+                        priority = candidate.get("priority", 0)
+                        seq, previous_seq = candidate.get("seq"), newer_than.get("seq")
+                        if not (isinstance(source, str) and source and
+                                candidate.get("source") == source and
+                                isinstance(priority, (int, float)) and not isinstance(priority, bool) and
+                                priority == newer_than.get("priority", 0) and
+                                isinstance(seq, int) and not isinstance(seq, bool) and
+                                isinstance(previous_seq, int) and not isinstance(previous_seq, bool) and
+                                seq > previous_seq):
+                            return None
+                    except (ValueError, TypeError, AttributeError):
+                        return None
                 entry, self._motion = self._motion, None
             else:
                 return None
@@ -160,7 +180,7 @@ class LocoServoPlugin:
         self._last_timing = None
         self._counts = {key: 0 for key in
                         ("received", "accepted", "published", "dry_run_commands",
-                         "rejected", "dropped", "holds", "publish_errors")}
+                         "rejected", "dropped", "holds", "publish_errors", "refreshed_after_stop")}
         self._inbox = _LatestControlInbox()
 
     @staticmethod
@@ -454,6 +474,15 @@ class LocoServoPlugin:
                         self._hold()  # Native lease may already have stopped the chassis.
                         if self._zero_pending:
                             raise RuntimeError("SDK stop unconfirmed")
+                        pending = self._inbox.take(newer_than=command)
+                        if pending is not None:
+                            self._counts["dropped"] += 1
+                            self._counts["refreshed_after_stop"] += 1
+                            # Revalidate the replacement, including the original
+                            # TTL, observation age, seq and source arbitration.
+                            # _hold cleared the lease, so this refresh is once.
+                            self._process_message(*pending)
+                            return
                     problem = self._standing_problem()
                     if problem:
                         self._hold()

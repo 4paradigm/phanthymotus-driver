@@ -858,6 +858,125 @@ def test_publish_error_is_visible_and_pauses_instead_of_counting_success(setup):
     assert plugin._backend.messages[-1] == [0] * 6
 
 
+def queue_during_stop(setup, plugin, monkeypatch, make_command):
+    original_stop = plugin._backend.stop
+    latest = {}
+    def stop_with_new_input():
+        original_stop()
+        if latest:  # Inject once, including when the replacement is zero.
+            return
+        setup.clock.advance(0.08)
+        latest.update(make_command())
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(latest)))
+    monkeypatch.setattr(plugin._backend, "stop", stop_with_new_input)
+    return latest
+
+
+def test_newer_motion_arriving_during_stop_replaces_selected_aging_frame(setup, monkeypatch):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    now = int(setup.clock.time() * 1000)
+    aging = command(setup, seq=2, stamp_ms=now - 150)
+    latest = queue_during_stop(setup, plugin, monkeypatch, lambda: command(
+        setup, [0.1, 0, 0, 0, 0, 0.2], seq=3))
+    send(plugin, aging)
+    assert plugin._counts["accepted"] == 2
+    assert plugin._last["requested"] == latest["values"]
+    assert plugin._backend.deadlines[-1] == latest["stamp_ms"] + latest["ttl_ms"]
+    assert plugin._counts["received"] == 3
+    assert plugin._counts["dropped"] == plugin._counts["refreshed_after_stop"] == 1
+    assert plugin._inbox.info()["processed"] == 3
+    assert plugin._inbox.info()["pending"] == 0
+
+
+def test_zero_arriving_during_stop_prevents_selected_motion_from_resuming(setup, monkeypatch):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    latest = queue_during_stop(setup, plugin, monkeypatch, lambda: command(setup, [0] * 6, seq=3))
+    send(plugin, command(setup, seq=2))
+    assert plugin._last["requested"] == latest["values"] == [0] * 6
+    assert plugin._counts["accepted"] == 2
+    assert len(plugin._backend.deadlines) == 1  # No selected motion was written.
+    assert plugin._inbox.info()["pending"] == 0
+
+
+@pytest.mark.parametrize("extra, verdict", [
+    ({"ttl_ms": 0}, "REJECTED"),
+    ({"stamp_age_ms": 201}, "DROPPED"),
+    ({"obs_stamp_ms": 0}, "DROPPED"),
+    ({"values": [0.1, 1, 0, 0, 0, 0]}, "REJECTED"),
+    ({"schema": "wrong"}, "REJECTED"),
+])
+def test_refreshed_motion_still_requires_the_full_contract(setup, monkeypatch, extra, verdict):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    def refreshed():
+        kwargs = dict(extra)
+        age = kwargs.pop("stamp_age_ms", 0)
+        return command(setup, seq=3, stamp_ms=int(setup.clock.time() * 1000) - age, **kwargs)
+    queue_during_stop(setup, plugin, monkeypatch, refreshed)
+    send(plugin, command(setup, seq=2))
+    assert plugin._last["verdict"] == verdict
+    assert plugin._counts["accepted"] == 1
+    assert plugin._counts["refreshed_after_stop"] == 1
+    assert len(plugin._backend.deadlines) == 1
+    assert plugin._last_output == [0] * 6
+
+
+@pytest.mark.parametrize("extra", [
+    {"source": "other"}, {"source": ""}, {"priority": 1}, {"priority": False},
+    {"seq": 2}, {"seq": 1}, {"seq": True}, {"seq": 3.0},
+])
+def test_unrelated_or_unordered_motion_stays_queued_after_stop(setup, monkeypatch, extra):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    queue_during_stop(setup, plugin, monkeypatch, lambda: command(setup, seq=3) | extra)
+    send(plugin, command(setup, seq=2))
+    assert plugin._last["requested"] == [0.2, 0, 0, 0, 0, 0.4]
+    assert plugin._counts["accepted"] == 2
+    assert plugin._counts["refreshed_after_stop"] == 0
+    assert plugin._inbox.info()["pending"] == 1
+    assert plugin._inbox.info()["processed"] == 2
+
+
+def test_refresh_cannot_bypass_source_arbitration_for_a_pending_zero(setup, monkeypatch):
+    plugin = start(setup)
+    send(plugin, command(setup, source="owner", priority=10))
+    setup.clock.advance(0.21)
+    queue_during_stop(setup, plugin, monkeypatch, lambda: command(
+        setup, [0] * 6, seq=3, source="other", priority=0))
+    send(plugin, command(setup, seq=2, source="owner", priority=10))
+    assert plugin._last["verdict"] == "DROPPED"
+    assert "outranked" in plugin._last["reason"]
+    assert plugin._counts["accepted"] == 1
+    assert plugin._last_output == [0] * 6
+    assert len(plugin._backend.deadlines) == 1
+
+
+def test_unconfirmed_stop_does_not_consume_a_new_motion_for_refresh(setup, monkeypatch):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    queued = []
+    def failed_stop():
+        if not queued:
+            latest = command(setup, seq=3)
+            plugin._on_message(types.SimpleNamespace(data=json.dumps(latest)))
+            queued.append(latest)
+        raise RuntimeError("stop unconfirmed")
+    with monkeypatch.context() as patch:
+        patch.setattr(plugin._backend, "stop", failed_stop)
+        send(plugin, command(setup, seq=2))
+    assert plugin._paused and plugin._zero_pending
+    assert plugin._counts["refreshed_after_stop"] == 0
+    assert plugin._inbox.info()["processed"] == 2
+    assert len(plugin._backend.deadlines) == 1
+
+
 def test_native_expiry_stops_without_latching_and_accepts_only_a_fresh_command(setup, monkeypatch):
     plugin = start(setup)
     send(plugin, command(setup))

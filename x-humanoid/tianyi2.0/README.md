@@ -246,12 +246,22 @@ resources. A join timeout blocks restart instead of stacking another worker.
 A fully paused thread sleeps until resume/stop; unexpected control-loop errors
 hold the chassis, mark the worker failed and require explicit stop/start.
 
+If the previous motion lease has expired, the controller confirms the stop
+before applying another motion. After that synchronous stop, it checks the inbox
+once more: a pending zero takes priority, or a newer motion from the same source
+and priority replaces the selected aging frame. The replacement passes all
+normal validation and arbitration with its original timestamps; no lease is
+extended and no old motion is replayed. Other sources, priorities and duplicate
+or regressing sequence numbers stay queued for normal processing.
+
 `input_queue` reports bridge-delivered `received`, control-selected `processed`,
 `coalesced`, lifecycle-`cleared`, `pending`, the latest receive gap and inbox
 wait in milliseconds. Existing `counts.received/accepted/dropped` describe the
 selected frames examined by the control sink, not intermediate coalesced
 frames. `holds` counts calls to stop paths, including repeated watchdog stops
 after navigation has ended; it is not a count of distinct physical stops.
+`counts.refreshed_after_stop` counts selected frames replaced after a confirmed
+stop; each replaced frame is also counted once as dropped.
 `dispatch.mode=dedicated_worker`, `worker_alive` and `worker_failed` identify the
 independent controller and expose its health. `last_command_timing`
 reports the selected command sequence/TTL, command and observation ages,
