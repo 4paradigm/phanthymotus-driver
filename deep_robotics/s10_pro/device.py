@@ -32,7 +32,7 @@ SOURCE_TOPICS = {
 MOTION_CAPABILITY = {
     "supported": False,
     "status": "requires_vendor_contract",
-    "description": "本驱动只读；运动控制需要本机版本对应的厂家接口约定。",
+    "description": "motion 基础动作卡尚未开放真机执行；需要核实本机控制接口、控制权与停止约定。",
 }
 
 

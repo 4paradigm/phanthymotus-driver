@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S10 Pro state cards: platform DDS and vendor subscriptions in separate processes."""
+"""S10 Pro sensor cards and a fail-closed, separately gated motion card."""
 from __future__ import annotations
 
 import json
@@ -14,6 +14,20 @@ import xml.etree.ElementTree as ET
 from common.vendor_runtime import DriverBundle, load_config, make_handler, resolve_namespace, start_registration
 from bridge import ReaderBridge
 from device import build_plugins
+from motion import MotionPlugin
+
+
+def build_runtime_plugins(config, namespace, bridge, publish):
+    """Build sensors and the motion UI without opening a control connection.
+
+    The motion backend stays unsupported until this robot's complete control
+    contract and an explicit process-level execution authorization are bound.
+    Canvas configuration cannot grant that authorization.
+    """
+    plugins = build_plugins(config, namespace, bridge, publish)
+    plugins.append(MotionPlugin(config.get("motion", {}), namespace,
+                                publish=publish, execution_authorized=False))
+    return plugins
 
 
 def validate_platform_profile(path):
@@ -95,10 +109,10 @@ def main():
     namespace = resolve_namespace(config)
     bus = PlatformBus(domain)
     bridge = ReaderBridge(config, config_path)
-    bundle = DriverBundle(build_plugins(config, namespace, bridge, bus.publish))
+    bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish))
     port = int(os.environ.get("MCP_PORT", config["mcp_port"]))
     server = ThreadingHTTPServer((str(config.get("bind_host", "127.0.0.1")), port),
-                                 make_handler(lambda: bundle, "s10-pro-readonly-bundle", "deep-robotics-s10-pro-driver"))
+                                 make_handler(lambda: bundle, "s10-pro-bundle", "deep-robotics-s10-pro-driver"))
     server.daemon_threads = True
     stop = threading.Event()
 
@@ -113,10 +127,13 @@ def main():
     if config.get("register", True):
         start_registration(port, config, "deep-robotics-s10-pro-driver")
     try:
-        logging.info("S10 Pro five read-only cards; namespace=%s port=%d domain=%d", namespace, port, domain)
+        logging.info("S10 Pro five sensors and gated motion; namespace=%s port=%d domain=%d motion_authorized=false", namespace, port, domain)
         server.serve_forever()
     finally:
         bundle.stop_all()
+        for plugin in bundle.plugins:
+            if hasattr(plugin, "close"):
+                plugin.close()
         bridge.close()
         server.server_close()
         bus.close()

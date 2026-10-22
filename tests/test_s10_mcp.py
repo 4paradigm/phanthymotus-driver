@@ -108,3 +108,43 @@ def test_profile_validation_rejects_unconfined_transport(tmp_path):
     profile.write_text(profile.read_text().replace("127.0.0.1", "0.0.0.0"))
     with pytest.raises(ValueError):
         module.validate_platform_profile(profile)
+
+
+def test_runtime_has_six_tools_and_motion_start_config_cannot_unlock_execution():
+    path = ROOT / 'deep_robotics/s10_pro/main.py'
+    spec = importlib.util.spec_from_file_location('s10_motion_runtime_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    bridge, published = NoRobot(), []
+    plugins = module.build_runtime_plugins({}, 'contract', bridge, lambda *args: published.append(args))
+    bundle = DriverBundle(plugins)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(lambda: bundle, 's10-runtime-test', 's10-runtime-test'))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    def rpc(method, params=None):
+        request = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/mcp',
+            json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params or {}}).encode(),
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.load(response)
+    def action(name, action, **args):
+        value = rpc('tools/call', {'name': name, 'arguments': {'action': action, **args}})
+        return json.loads(value['result']['content'][0]['text'])
+    try:
+        tools = rpc('tools/list')['result']['tools']
+        assert {t['name'] for t in tools} == {'state', 'joints', 'imu', 'odometry', 'lidar', 'motion'}
+        assert sum(t['type'] == 'sensor' for t in tools) == 5
+        assert next(t for t in tools if t['name'] == 'motion')['type'] == 'actuator'
+        action('motion', 'config', enabled=True)
+        assert not action('motion', 'start')['execution_available']
+        for name in ['stand', 'lie', 'velocity']:
+            result = action('motion', name)
+            assert result['state'] == 'unavailable' and not result['completed']
+        assert action('imu', 'start')['state'] == 'running'
+        action('motion', 'stop')
+        assert 'imu' in bridge.active
+        assert not action('motion', 'info')['execution_authorized']
+    finally:
+        bundle.stop_all()
+        plugins[-1].close()
+        server.shutdown(); server.server_close(); thread.join(2)

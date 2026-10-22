@@ -7,6 +7,8 @@ core_domain_id: 42
 reader:
   domain_id: 0
   vendor_profile: ""
+motion:
+  enabled: false
 topics:
   battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"

@@ -3,8 +3,11 @@ deep-robotics-s10-pro:
   container_name: embodied-deep-robotics-s10-pro
   network_mode: host
   # Domain-0 child uses UDP; platform domain 42 is loopback-only.
+  # Host IPC is unnecessary. Set the mounted config's reader.vendor_profile to
+  # /opt/phanthy-motus/s10-reader-udp.xml before starting this service.
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/s10-reader-udp.xml:/opt/phanthy-motus/s10-reader-udp.xml:ro
     - /opt/phanthy-motus/s10-pro/config.yaml:/work/deep_robotics/s10_pro/config.yaml:ro
   environment:
     - ROS_DOMAIN_ID=42
