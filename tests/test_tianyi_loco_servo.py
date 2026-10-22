@@ -199,6 +199,52 @@ def test_command_maps_body_axes_and_ramps_from_zero(setup):
     assert plugin._backend.messages[-1] == [0] * 6
 
 
+@pytest.mark.parametrize("sdk_delay", [0.0, 0.04, 0.07, 0.09])
+def test_regular_10hz_stream_is_not_throttled_by_sdk_reply_latency(setup, monkeypatch, sdk_delay):
+    plugin = start(setup)
+    backend = plugin._backend
+    original_write = backend.write
+
+    def delayed_write(values, deadline):
+        setup.clock.advance(sdk_delay)
+        original_write(values, deadline)
+
+    monkeypatch.setattr(backend, "write", delayed_write)
+    stream_started = setup.clock.monotonic()
+    for sequence in range(1, 13):
+        # The producer runs at 10Hz even if a prior callback was dropped and
+        # therefore did not call the (delayed) SDK at all.
+        setup.clock.advance(stream_started + (sequence - 1) * 0.1 - setup.clock.monotonic())
+        cmd = command(setup, seq=sequence)
+        send(plugin, cmd)
+        plugin._tick()
+
+    assert plugin._counts["accepted"] == 12
+    assert plugin._counts["dropped"] == 0
+    assert plugin._counts["holds"] == 0
+    assert plugin._last_output == pytest.approx([0.2, 0, 0, 0, 0, 0.4])
+    assert len(backend.messages) == 12
+
+
+def test_sdk_latency_does_not_allow_apply_starts_above_20hz(setup, monkeypatch):
+    plugin = start(setup)
+    original_write = plugin._backend.write
+
+    def delayed_write(values, deadline):
+        setup.clock.advance(0.03)
+        original_write(values, deadline)
+
+    monkeypatch.setattr(plugin._backend, "write", delayed_write)
+    send(plugin, command(setup))
+    setup.clock.advance(0.005)  # 35ms between starts: still above the 20Hz cap.
+    send(plugin, command(setup, seq=2))
+    assert plugin._counts["accepted"] == 1
+    assert plugin._counts["dropped"] == 1
+    assert plugin._last["reason"] == "command rate exceeds 20 Hz"
+    send(plugin, command(setup, [0] * 6, seq=3))
+    assert plugin._backend.messages[-1] == [0] * 6
+
+
 @pytest.mark.parametrize("extra", [
     {"schema": "bad"}, {"mode": "joint_position"}, {"dof": 3},
     {"frame": "world"},

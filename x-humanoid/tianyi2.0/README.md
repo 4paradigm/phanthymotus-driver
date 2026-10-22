@@ -208,6 +208,12 @@ write round-trip time. These timings diagnose latency; they do not establish
 the physical stopping time. Expiry and excessive-lease errors are now separate,
 with remaining milliseconds reported for the native ingress check.
 
+The 20Hz command cap compares the starts of SDK applications, not the time
+since the previous SDK acknowledgement. A regular 10Hz stream must not lose
+every other command just because a vendor call took 70ms of its 100ms period.
+True bursts above 20Hz are still dropped, and explicit zero always bypasses
+that limiter. TTL, observation-age and watchdog limits are unchanged.
+
 Acceleration caps remain 0.3 m/s² and 0.6 rad/s². Explicit zero, pause, stop,
 lease expiration and watchdog stop bypass the ramp. Cancelling an SDK action
 addresses only this worker's held action handle. Before beginning or updating

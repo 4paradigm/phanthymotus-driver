@@ -274,8 +274,11 @@ class LocoServoPlugin:
                     self._counts["dropped"] += 1
                     self._record("DROPPED", "command predates start/resume/config")
                     return
-                if any(command["values"]) and self._last_valid_at is not None and (
-                        time.monotonic() - self._last_valid_at < 1 / 20):
+                # Limit SDK apply STARTS, not time since its last reply. At
+                # 10Hz a 70ms SDK call leaves only 30ms after acknowledgement;
+                # treating that as a >20Hz stream drops every other command.
+                if any(command["values"]) and self._last_output_at is not None and (
+                        time.monotonic() - self._last_output_at < 1 / 20):
                     self._counts["dropped"] += 1
                     self._record("DROPPED", "command rate exceeds 20 Hz")
                     return
