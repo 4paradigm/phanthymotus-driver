@@ -3,6 +3,7 @@ import asyncio
 import json
 import math
 from contextlib import contextmanager
+from collections import deque
 from pathlib import Path
 import sys
 import time
@@ -13,6 +14,7 @@ from aiohttp import web
 import pytest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import teaching_replay
 from teaching_capture import Capture
 from teaching_replay import Replay, pack_trajectory, read_trajectory, movej_start_target
 from test_teaching_episode import BINDING, jpeg, state
@@ -44,12 +46,24 @@ class Reader:
     def __init__(self):
         self.serial='test-device';self.connected=True;self.teaching_observer=None;self._joint_poll_wake=None
         self.q=[0]*14+[.2,.3];self.grip=[0,20];self.count=0;self.commands=[]
+        self.replaying=False;self.replay_sends=[];self.expected_sends=None;self.feedback_source=None
+
+    def now(self):
+        return teaching_replay.time.monotonic()
 
     def sample(self,name):
+        now=self.now()
+        if name=='joint_state' and self.replaying and self.feedback_source is not None:
+            q,dq,stamp,started,received=self.feedback_source(now)
+        else:
+            q,dq,stamp,started,received=self.q[:],[0]*16,self.count,now,now
         data=dict(working_mode='developer_mode',working_mode_valid=True,collision_enable_valid=True,
-            compliant_enable_valid=True,collision_enable=True,compliant_enable=False,motor='OK',sw_version='test') if name=='robot_status' else dict(q=self.q[:],dq=[0]*16,robot_timestamp=self.count)
+            compliant_enable_valid=True,collision_enable=True,compliant_enable=False,motor='OK',sw_version='test') if name=='robot_status' else dict(q=q,dq=dq,robot_timestamp=stamp)
         self.count+=1
-        return dict(available=self.connected,reception_age_seconds=0,data=data)
+        return dict(available=self.connected,reception_age_seconds=0 if received is None else max(0,now-received),
+            received_monotonic=received,query_started_monotonic=started,
+            query_round_trip_seconds=None if started is None or received is None else max(0,received-started),
+            measurement_time_verified=False,data=data)
 
     async def read_gripper(self):
         self.count+=1
@@ -66,9 +80,14 @@ class Reader:
 
     @contextmanager
     def pose_servo(self,job):
-        yield {'job':job}
+        self.replaying=True
+        try:
+            yield {'job':job}
+        finally:
+            self.replaying=False
 
     async def send_pose_servoj(self,q,token):
+        self.replay_sends.append((self.now(),q[:]))
         self.q=q[:];self.commands.append(('arm',q[:]))
 
     async def send_movej(self,q,duration):
@@ -129,6 +148,41 @@ def recording(count=6):
     return pack_trajectory(BINDING,frames)
 
 
+def fast_recording(count=10,step=.06):
+    frames=[state(i) for i in range(count)]
+    for i,s in enumerate(frames):
+        s['q'][0]=i*step
+        s['gripper']=[0,20]
+    return frames
+
+
+def release_replay(reader):
+    replay=Replay(reader,allowed,lambda:True)
+    replay.outcome={'action_id':'failed','status':'error',
+        'result':{'reason':'replay_tracking_error','physical_stop_verified':False,'motion_may_continue':True}}
+    replay.motion_sent=True;replay.movej_acknowledged=True;replay.movej_not_before=0
+    replay.connection=(getattr(reader,'ws',None),reader.serial)
+    return replay
+
+
+def tracking_replay():
+    replay=Replay(Reader(),allowed,lambda:True)
+    replay.send_history=deque([
+        {'index':0,'t_ns':0,'sent_at':.5,'q':[0.]*14,'baseline':True},
+        {'index':1,'t_ns':20_000_000,'sent_at':.86,'q':[0.]*14},
+        {'index':2,'t_ns':40_000_000,'sent_at':.99,'q':[0.]*14},
+    ],maxlen=teaching_replay.SEND_HISTORY_LIMIT)
+    return replay
+
+
+def feedback_at(query_start,received,age,round_trip=None,value=0.):
+    q=[0.]*16;q[0]=value
+    return dict(q=q,dq=[0.]*16,robot_timestamp=1,
+        feedback_query_started=query_start,feedback_received_at=received,
+        feedback_age_seconds=age,
+        feedback_query_round_trip_seconds=received-query_start if round_trip is None else round_trip)
+
+
 def test_replay_binding_corruption_and_offset_preview():
     async def run():
         reader=Reader();replay=Replay(reader,allowed,lambda:True)
@@ -165,6 +219,242 @@ def test_replay_moves_arms_then_grippers_before_recorded_frames(replay_clock):
         assert reader.commands[1][1]=={'left_opening':0,'left_speed':30,'left_force':20}
         assert reader.commands[2][1]=={'right_opening':20,'right_speed':30,'right_force':20}
         assert sum(kind=='movej' for kind,_ in reader.commands)==1
+    asyncio.run(run())
+
+
+def test_replay_tracking_uses_feedback_query_interval_not_previous_frame(replay_clock):
+    async def run():
+        states=fast_recording();raw=pack_trajectory(BINDING,states)
+        reader=Reader();reader.expected_sends=len(states)
+        def source(now):
+            if len(reader.replay_sends)>=reader.expected_sends:
+                return reader.q[:],[0]*16,reader.count+10000,now,now
+            if not reader.replay_sends:
+                return reader.q[:],[0]*16,reader.count+10000,now,now
+            index=max(0,len(reader.replay_sends)-4)
+            sent_at,q=reader.replay_sends[index]
+            return q[:],[0]*16,reader.count+10000,sent_at,sent_at+.01
+        reader.feedback_source=source
+        replay=Replay(reader,allowed,lambda:True)
+        frames,head=await replay.preflight(raw,BINDING)
+        await replay._run('aligned-feedback',frames,head,30,20)
+        assert replay.outcome['status']=='completed',replay.outcome
+        assert sum(kind=='arm' for kind,_ in reader.commands)==len(states)
+        # The four-send cache delay exceeds 8 degrees against the previous
+        # frame target, but is inside the sample's host-monotonic query window.
+        assert max(abs(a-b) for a,b in zip(states[3]['q'][:14],states[0]['q'][:14]))>math.radians(8)
+    asyncio.run(run())
+
+
+def test_replay_rejects_query_older_than_feedback_limit_even_when_target_matches(replay_clock):
+    replay_clock[0]=1.0
+    replay=tracking_replay()
+    # A 140 ms round trip plus a newly received sample. Every retained target
+    # has q[0]=0, so a nearest-history comparison would incorrectly pass.
+    feedback=feedback_at(.85,.99,.01)
+    with pytest.raises(ValueError,match='replay_feedback_time_invalid'):
+        replay._check_tracking(3,feedback)
+    assert replay.tracking_diagnostic['reason']=='replay_feedback_time_invalid'
+
+
+@pytest.mark.parametrize('case',['future','nan','inf','negative_age','inconsistent_age',
+    'inconsistent_round_trip','lo_after_hi'])
+def test_replay_rejects_invalid_feedback_time_metadata(case,replay_clock):
+    replay_clock[0]=1.0
+    replay=tracking_replay()
+    feedback=feedback_at(.98,.99,.01)
+    if case=='future':
+        feedback['feedback_received_at']=1.01
+        feedback['feedback_query_round_trip_seconds']=.03
+    elif case=='nan':feedback['feedback_query_started']=float('nan')
+    elif case=='inf':feedback['feedback_received_at']=float('inf')
+    elif case=='negative_age':feedback['feedback_age_seconds']=-.001
+    elif case=='inconsistent_age':feedback['feedback_age_seconds']=.05
+    elif case=='inconsistent_round_trip':feedback['feedback_query_round_trip_seconds']=.05
+    else:feedback['feedback_query_started']=.995
+    with pytest.raises(ValueError,match='replay_feedback_time_invalid'):
+        replay._check_tracking(3,feedback)
+    assert replay.tracking_diagnostic['reason']=='replay_feedback_time_invalid'
+
+
+def test_replay_accepts_short_bounded_query_and_rejects_persistent_error(replay_clock):
+    replay_clock[0]=1.0
+    replay=tracking_replay()
+    feedback=feedback_at(.984,.986,.012)
+    replay._check_tracking(3,feedback)
+    bad=feedback_at(.984,.986,.012,value=math.radians(20))
+    with pytest.raises(ValueError,match='replay_tracking_error'):
+        replay._check_tracking(3,bad)
+    diagnostic=replay.tracking_diagnostic
+    assert diagnostic['difference_deg']>8
+    assert diagnostic['selected_target_index'] in diagnostic['candidate_target_indices']
+    assert diagnostic['measurement_time_verified'] is False
+
+
+def test_tracking_history_gap_never_treats_ordinary_history_as_baseline(replay_clock):
+    replay_clock[0]=1.0
+    replay=tracking_replay()
+    replay.send_history=deque([
+        {'index':2,'t_ns':40_000_000,'sent_at':.99,'q':[0.]*14},
+    ],maxlen=teaching_replay.SEND_HISTORY_LIMIT)
+    feedback=feedback_at(.98,.985,.01)
+    with pytest.raises(ValueError,match='replay_feedback_history_gap'):
+        replay._check_tracking(3,feedback)
+    assert replay.tracking_diagnostic['reason']=='replay_feedback_history_gap'
+
+
+def test_tracking_only_verified_start_baseline_may_predate_replay_start(replay_clock):
+    replay_clock[0]=.5
+    replay=tracking_replay()
+    replay.send_history=deque([
+        {'index':0,'t_ns':0,'sent_at':.5,'q':[0.]*14,'baseline':True},
+    ],maxlen=teaching_replay.SEND_HISTORY_LIMIT)
+    # The first sample predates the replay start; only the explicit baseline
+    # (established by MoveJ/start checks) is eligible.
+    feedback=feedback_at(.45,.48,.02)
+    replay._check_tracking(0,feedback)
+
+
+def test_replay_persistent_tracking_error_reports_alignment_diagnostic(replay_clock):
+    async def run():
+        states=fast_recording();raw=pack_trajectory(BINDING,states)
+        reader=Reader();reader.expected_sends=len(states)
+        def source(now):
+            if not reader.replay_sends:
+                return reader.q[:],[0]*16,reader.count+10000,now,now
+            index=max(0,len(reader.replay_sends)-4)
+            sent_at,q=reader.replay_sends[index]
+            q=q[:]
+            if len(reader.replay_sends)>=2:q[0]+=math.radians(30)
+            return q,[0]*16,reader.count+10000,sent_at,sent_at+.01
+        reader.feedback_source=source
+        replay=Replay(reader,allowed,lambda:True)
+        frames,head=await replay.preflight(raw,BINDING)
+        await replay._run('persistent-error',frames,head,30,20)
+        if replay.release_task:await replay.release_task
+        assert replay.outcome['status']=='error'
+        assert replay.outcome['result']['reason']=='replay_tracking_error'
+        diagnostic=replay.outcome['result']['tracking_diagnostic']
+        assert diagnostic['joint_index']==0
+        assert diagnostic['difference_deg']>8
+        assert diagnostic['selected_target_index'] in diagnostic['candidate_target_indices']
+        assert diagnostic['feedback_value_deg']>diagnostic['target_value_deg']
+        assert diagnostic['feedback_age_seconds'] is not None
+        assert diagnostic['query_round_trip_seconds']>=0
+        assert diagnostic['measurement_time_verified'] is False
+        assert diagnostic['reference']
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failure,reason',[
+    ('invalid_time','replay_feedback_time_invalid'),
+    ('frozen','replay_feedback_timestamp_frozen'),
+    ('reconnect','replay_start_connection_changed')])
+def test_replay_invalid_frozen_or_reconnected_feedback_stays_rejected(failure,reason,replay_clock):
+    async def run():
+        states=fast_recording();raw=pack_trajectory(BINDING,states)
+        reader=Reader();reader.expected_sends=len(states)
+        def source(now):
+            if not reader.replay_sends:
+                return reader.q[:],[0]*16,1 if failure=='frozen' else reader.count+10000,now,now
+            index=max(0,len(reader.replay_sends)-4)
+            sent_at,q=reader.replay_sends[index]
+            if failure=='frozen':
+                return q[:],[0]*16,1,sent_at,sent_at+.01
+            if failure=='invalid_time' and len(reader.replay_sends)>=2:
+                return q[:],[0]*16,reader.count+10000,None,sent_at+.01
+            return q[:],[0]*16,reader.count+10000,sent_at,sent_at+.01
+        reader.feedback_source=source
+        if failure=='reconnect':
+            original=reader.send_pose_servoj
+            async def send(q,token):
+                await original(q,token)
+                if len(reader.replay_sends)>=2:reader.ws=object()
+            reader.send_pose_servoj=send
+        replay=Replay(reader,allowed,lambda:True)
+        frames,head=await replay.preflight(raw,BINDING)
+        await replay._run(failure,frames,head,30,20)
+        if replay.release_task:await replay.release_task
+        assert replay.outcome['status']=='error'
+        assert replay.outcome['result']['reason']==reason,replay.outcome
+    asyncio.run(run())
+
+
+def test_unknown_servoj_submission_keeps_automatic_release_blocked(replay_clock):
+    from vendor import MoveError
+    async def run():
+        states=fast_recording(4);raw=pack_trajectory(BINDING,states)
+        reader=Reader()
+        async def send(q,token):
+            reader.replay_sends.append((reader.now(),q[:]))
+            if len(reader.replay_sends)>=2:
+                raise MoveError('ServoJ socket submission uncertain',None,'trajectory_send_unknown')
+            reader.q=q[:]
+        reader.send_pose_servoj=send
+        replay=Replay(reader,allowed,lambda:True)
+        frames,head=await replay.preflight(raw,BINDING)
+        await replay._run('unknown-send',frames,head,30,20)
+        assert replay.outcome['status']=='error'
+        assert replay.outcome['result']['reason']=='ServoJ socket submission uncertain'
+        assert replay.release_task is None
+        assert replay.active
+    asyncio.run(run())
+
+
+def test_automatic_release_accepts_settling_past_initial_snapshot(replay_clock):
+    async def run():
+        reader=Reader();replay=release_replay(reader)
+        reader.q=[0]*14+[.2,.3]
+        moved=[False];original=reader.sample
+        def sample(name):
+            if name=='joint_state' and not moved[0] and replay_clock[0]>=.2:
+                reader.q[0]=math.radians(4);moved[0]=True
+            return original(name)
+        reader.sample=sample
+        await replay._release_after_motion()
+        result=replay.outcome['result']
+        assert result['physical_stop_verified'] and not result['motion_may_continue']
+        assert result['release_method']=='automatic_stable_feedback'
+        assert result.get('release_error') is None
+        assert reader.commands==[]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failure',['moving','gripper_moving','gripper_drift','frozen','disconnect'])
+def test_release_keeps_lock_without_continuous_stationary_feedback(failure,replay_clock):
+    async def run():
+        reader=Reader();replay=release_replay(reader)
+        if failure=='moving':
+            original=reader.sample
+            def sample(name):
+                result=original(name)
+                if name=='joint_state':result['data']['dq'][0]=math.radians(2)
+                return result
+            reader.sample=sample
+        elif failure in ('gripper_moving','gripper_drift'):
+            original=reader.read_gripper
+            async def read_gripper():
+                result=await original()
+                if failure=='gripper_moving':result['left_speed']=1
+                else:result['left_opening']=(reader.count%10)*4
+                return result
+            reader.read_gripper=read_gripper
+        elif failure=='frozen':
+            original=reader.sample
+            def sample(name):
+                result=original(name)
+                if name=='joint_state':result['data']['robot_timestamp']=1
+                return result
+            reader.sample=sample
+        else:
+            reader.connected=False
+        await replay._release_after_motion()
+        result=replay.outcome['result']
+        assert result.get('physical_stop_verified',False) is False
+        assert result['motion_may_continue']
+        assert result.get('release_error'),result
+        assert replay.active
+        assert reader.commands==[]
     asyncio.run(run())
 
 
