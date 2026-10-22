@@ -28,6 +28,8 @@ except ImportError as _e:  # running outside the container image
     _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
 
 import json
+import math
+import time
 import os
 import re
 import signal
@@ -132,6 +134,47 @@ class G1DeviceBundle:
                                             state_node=loco_state.node,
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+
+        if plugins_cfg.get("loco_relative_move", {}).get("enabled", False):
+            if not plugins_cfg.get("loco", {}).get("enabled", False):
+                raise ValueError("loco_relative_move requires the loco_state publisher (enable loco)")
+            from loco_relative_move import LocoRelativeMovePlugin, PointBackend
+            from relative_feedback import PoseFeedback, create_feedback_node
+            from device import _loco_acp_notify
+            from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+            relative_client = LocoClient()
+            relative_client.SetTimeout(0.05)  # Bound local DDS writes; never await RPC responses.
+            relative_client.Init()
+            safety_cfg = plugins_cfg.get("loco_relative_move", {}).get("safety", {})
+            feedback = PoseFeedback(timeout=safety_cfg.get("feedback_timeout_s", .5))
+            feedback_node = create_feedback_node(namespace, feedback)
+            executor.add_node(feedback_node)
+            def close_relative_feedback():
+                executor.remove_node(feedback_node)
+                feedback_node.destroy_node()
+            from sport_mode_state import LOCO_STATES
+            def relative_locomotion_admission():
+                # rt/sportmodestate is authoritative: idle ownership is not posture admission.
+                fsm = loco_state.node.get_fsm()
+                stamp = fsm.get('ts')
+                valid_stamp = (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                               and math.isfinite(stamp))
+                age = time.time() - stamp if valid_stamp else None
+                admitted = (age is not None and 0 <= age < 1.0
+                            and type(fsm.get('fsm_id')) is int and fsm['fsm_id'] in LOCO_STATES)
+                return dict(admitted=admitted, fsm=fsm, age_s=age,
+                            source='rt/sportmodestate', max_age_s=1.0)
+            def relative_base_available():
+                if smart_motion is not None:
+                    current = smart_motion.get_state()
+                    return {**current, "available": current.get("base_available") is True}
+                return loco_client.MotionIdle()
+            self._point_card = LocoRelativeMovePlugin(
+                plugins_cfg.get("loco_relative_move", {}),
+                PointBackend(relative_client, feedback, close_relative_feedback), _loco_acp_notify,
+                can_start=relative_base_available, admission=relative_locomotion_admission)
+            self._plugins.append(self._point_card)
+            print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
@@ -251,7 +294,10 @@ class G1DeviceBundle:
             p for p in self._plugins if getattr(p, "PREFIX", "") == "vision_capture"]
         other_plugins = [
             p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
-        for p in capture_plugins + other_plugins:
+        # Stop the direct closed-loop task before other base plugins.
+        point_plugins = [p for p in other_plugins if getattr(p, "PREFIX", "") == "loco_relative_move"]
+        remaining_plugins = [p for p in other_plugins if p not in point_plugins]
+        for p in capture_plugins + point_plugins + remaining_plugins:
             p.stop()
         print("[bundle] All plugins stopped")
 
@@ -273,7 +319,15 @@ class G1DeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
-                    result = p.dispatch(action, args)
+                    point = getattr(self, "_point_card", None)
+                    resource = tool_def.get("inputSchema", {}).get("x-resource")
+                    is_base = (resource == "base" or isinstance(resource, list) and "base" in resource
+                               or tool_name in ("loco", "switch_mode", "switch_mode_expert", "spatial"))
+                    interrupts_motion = tool_name == "smart_motion" and action == "interrupt_motion"
+                    if point and tool_name != "loco_relative_move" and (is_base or interrupts_motion) and tool_def["type"] == "actuator":
+                        result = point.dispatch_base(p, action, args)
+                    else:
+                        result = p.dispatch(action, args)
                     # A plugin that only knows its own verbs declines these
                     # rather than failing at them — see common/lifecycle.py.
                     if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
@@ -323,6 +377,25 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
+            # Receive a file into this container: `POST /file/upload`, the way a
+            # `format: file` tool argument reaches a service that shares no
+            # filesystem with agent-core. See common/file_intake.py.
+            #
+            # Two ordering requirements, both silent when violated: this must
+            # precede `self.rfile.read(...)`, which would consume the body the
+            # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+            # would 404 the upload before it is recognised.
+            #
+            # Imported here rather than at module level on purpose: several tests
+            # lift this handler out of main.py by AST and exec only the selected
+            # definitions, so a module global would be undefined there -- a
+            # NameError on every POST, including ordinary JSON-RPC.
+            try:
+                from common import file_intake as _file_intake
+            except ImportError:  # a checkout without common/ on the path
+                _file_intake = None
+            if _file_intake is not None and _file_intake.serve_upload(self):
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:
@@ -483,10 +556,6 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
-        if smart_motion:
-            smart_motion.shutdown()
-        _bundle.stop_all()
-        loco_client.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -495,9 +564,22 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop_all()
-        executor.shutdown()
-        rclpy.shutdown()
+        # Keep the safety peer alive while cards cancel and release sequences.
+        # Perform cleanup once, including after a signal-triggered server exit.
+        try:
+            _bundle.stop_all()
+        finally:
+            try:
+                if smart_motion:
+                    smart_motion.shutdown()
+            finally:
+                try:
+                    loco_client.stop()
+                finally:
+                    try:
+                        executor.shutdown()
+                    finally:
+                        rclpy.shutdown()
 
 
 if __name__ == "__main__":

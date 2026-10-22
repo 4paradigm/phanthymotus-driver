@@ -12,17 +12,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /audio_ws
 COPY vendor/audio_msgs/ /audio_ws/src/audio_msgs/
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
-    colcon build --packages-select audio_msgs'
+    colcon build --packages-select audio_msgs && \
+    echo "Generated audio_msgs overlay size:" && du -sh /audio_ws/install'
 
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+# FFmpeg is a runtime dependency of record_video, not a test-only tool. Measure
+# its architecture-specific uncompressed filesystem delta while installing the
+# smallest distro-supported package set; the build log makes the cost visible.
+RUN set -eux; \
+    before_bytes="$(du -sx -B1 / | cut -f1)"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ffmpeg; \
+    command -v ffmpeg; \
+    command -v ffprobe; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*; \
+    after_bytes="$(du -sx -B1 / | cut -f1)"; \
+    echo "FFmpeg runtime filesystem increase: $((after_bytes - before_bytes)) bytes"
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
-RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
+ARG CYCLONEDDS_SHA256=ec3ec898c52b02f939a969cd1a276e219420e5e8419b21cea276db35b4821848
+RUN curl --proto '=https' --tlsv1.2 -fsSL ${CYCLONEDDS_URL} -o /tmp/cyclonedds-0.10.5.tar.gz && \
+    echo "${CYCLONEDDS_SHA256}  /tmp/cyclonedds-0.10.5.tar.gz" | sha256sum -c - && \
+    tar xzf /tmp/cyclonedds-0.10.5.tar.gz -C /tmp && \
     cmake -S /tmp/cyclonedds-0.10.5 -B /tmp/cyclonedds-0.10.5/build -DCMAKE_INSTALL_PREFIX=/opt/cyclonedds && \
     cmake --build /tmp/cyclonedds-0.10.5/build --parallel --target install && \
-    rm -rf /tmp/cyclonedds-0.10.5
+    rm -rf /tmp/cyclonedds-0.10.5 /tmp/cyclonedds-0.10.5.tar.gz
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 COPY requirements.txt /work/requirements.txt
@@ -36,9 +55,10 @@ COPY --from=audio-interface-builder /audio_ws/install/ /as2w_ws/install/
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
     test -f /as2w_ws/install/setup.bash && \
     source /as2w_ws/install/setup.bash && \
-    python3 -c "from audio_msgs.msg import AudioChunk"'
+    python3 -c "from audio_msgs.msg import AudioChunk" && \
+    echo "Runtime audio_msgs overlay size:" && du -sh /as2w_ws/install'
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py multimedia.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
+COPY main.py device.py loco_servo.py multimedia.py camera_specs.py vision_capture.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/

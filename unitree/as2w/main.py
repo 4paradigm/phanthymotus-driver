@@ -125,14 +125,50 @@ class Bundle:
         p = cfg.get("plugins", {})
         self.plugins = []
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
-        if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_motion", {}).get("enabled", True): self.plugins.append(SpecialMotionPlugin(p.get("special_motion", {}), namespace, executor, proxy))
+        loco = None
+        loco_servo = None
+        special_motion = None
+        if p.get("loco", {}).get("enabled", True):
+            loco = LocoPlugin(p.get("loco", {}), namespace, executor, proxy)
+            self.plugins.append(loco)
+        if p.get("loco_servo", {}).get("enabled", False):
+            from loco_servo import LocoServoPlugin
+            loco_servo = LocoServoPlugin(
+                p.get("loco_servo", {}), namespace, executor, proxy,
+                loco_plugin=loco)
+            self.plugins.append(loco_servo)
+        if p.get("special_motion", {}).get("enabled", True):
+            special_motion = SpecialMotionPlugin(
+                p.get("special_motion", {}), namespace, executor, proxy)
+            self.plugins.append(special_motion)
+            if loco is not None:
+                loco.attach_special_motion(special_motion)
+                special_motion.attach_loco(loco)
+            if loco_servo is not None:
+                special_motion.attach_servo(loco_servo)
+                loco_servo.attach_special_motion(special_motion)
         if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
         if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
         if dds_ready and p.get("camera", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera", {}), namespace, executor, interface))
+        if dds_ready and p.get("vision_capture", {}).get("enabled", False):
+            from vision_capture import VisionCapturePlugin
+            self.plugins.append(VisionCapturePlugin(
+                p.get("vision_capture", {}), namespace, executor))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
-        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True):
+            controlled_spatial = ControlledSpatialPlugin(
+                p.get("controlled_spatial", {}), namespace, executor, interface)
+            self.plugins.append(controlled_spatial)
+            if loco is not None:
+                loco.attach_controlled_spatial(controlled_spatial)
+                controlled_spatial.attach_loco(loco)
+            if special_motion is not None:
+                special_motion.attach_controlled_spatial(controlled_spatial)
+                controlled_spatial.attach_special_motion(special_motion)
+            if loco_servo is not None:
+                controlled_spatial.attach_servo(loco_servo)
+                loco_servo.attach_controlled_spatial(controlled_spatial)
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
@@ -152,6 +188,19 @@ class Bundle:
             if any(item["name"] == name for item in defs):
                 return plugin.dispatch(args.pop("action", name), {**args, "_tool_name": name})
         return None
+
+    def action_response_sent(self, action_id):
+        """Tell asynchronous cards their action_id is now visible."""
+        for plugin in self.plugins:
+            response_sent = getattr(plugin, "response_sent", None)
+            if response_sent is not None:
+                response_sent(action_id)
+
+
+def _tool_call_arguments(params):
+    """Default an omitted/null argument object without hiding wrong JSON types."""
+    arguments = params.get("arguments")
+    return {} if arguments is None else arguments
 
 def handler(bundle):
     sse_sessions, sse_lock = {}, threading.Lock()
@@ -198,6 +247,25 @@ def handler(bundle):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept"); self.end_headers()
         def do_POST(self):
+            # Receive a file into this container: `POST /file/upload`, the way a
+            # `format: file` tool argument reaches a service that shares no
+            # filesystem with agent-core. See common/file_intake.py.
+            #
+            # Two ordering requirements, both silent when violated: this must
+            # precede `self.rfile.read(...)`, which would consume the body the
+            # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+            # would 404 the upload before it is recognised.
+            #
+            # Imported here rather than at module level on purpose: several tests
+            # lift this handler out of main.py by AST and exec only the selected
+            # definitions, so a module global would be undefined there -- a
+            # NameError on every POST, including ordinary JSON-RPC.
+            try:
+                from common import file_intake as _file_intake
+            except ImportError:  # a checkout without common/ on the path
+                _file_intake = None
+            if _file_intake is not None and _file_intake.serve_upload(self):
+                return
             parsed = urlparse(self.path)
             if parsed.path not in ("/mcp", "/mcp/messages"):
                 self._send_json(404, {"error": "not found"}); return
@@ -224,13 +292,50 @@ def handler(bundle):
                 self.send_response(202); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
                 if not sse_client._send_sse("message", json.dumps(payload)):
                     with sse_lock: sse_sessions.pop(session_id, None)
+            action_id = None
             if method == "initialize": result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "as2w-driver", "version": "1.0"}}
             elif method == "tools/list": result = {"tools": bundle.tools()}
             elif method == "tools/call":
-                result = {"content": [{"type": "text", "text": json.dumps(bundle.call(params.get("name", ""), params.get("arguments") or {}))}]}
+                arguments = _tool_call_arguments(params)
+                if not isinstance(arguments, dict):
+                    call_result = {
+                        "ok": False, "ret": -1, "accepted": False,
+                        "code": "INVALID_ARGUMENT",
+                        "error": "tool arguments must be an object",
+                    }
+                else:
+                    try:
+                        call_result = bundle.call(
+                            params.get("name", ""), arguments)
+                    except (TypeError, ValueError) as exc:
+                        call_result = {
+                            "ok": False, "ret": -1, "accepted": False,
+                            "code": "INVALID_ARGUMENT",
+                            "error": str(exc) or "invalid tool arguments",
+                        }
+                    except Exception as exc:
+                        print(
+                            f"[mcp] tool call failed: {type(exc).__name__}: {exc}",
+                            flush=True)
+                        respond({
+                            "jsonrpc": "2.0", "id": rid,
+                            "error": {
+                                "code": -32603,
+                                "message": "Internal error",
+                            },
+                        })
+                        return
+                result = {"content": [{
+                    "type": "text", "text": json.dumps(call_result)}]}
+                if isinstance(call_result, dict):
+                    action_id = call_result.get("action_id")
             else:
                 respond({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Method not found: {method}"}}); return
-            respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            try:
+                respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            finally:
+                if action_id:
+                    bundle.action_response_sent(action_id)
     return Handler
 
 

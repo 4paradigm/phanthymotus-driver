@@ -24,6 +24,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
 | [`limx/tron2`](limx/tron2/README.md) | LimX TRON2 dual-arm robot | 15791 | Head/wrist RGB cameras, joint skeleton with gripper outlines, arm MoveJ and verified saved-home reset |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
+| `linkerhand/l20_lite` | LinkerHand L20 Lite | 15733 | USB-RS485/Modbus 115200, 10-joint position/speed/torque control and state reads |
 
 ## Quick Start
 
@@ -72,6 +73,10 @@ python main.py
 3. Agent Core discovers the driver's tools via MCP `initialize` and `tools/list`
 4. Tools become available to the LLM agent and appear in the Web Dashboard
 5. The LLM agent can invoke tools via MCP `tools/call`
+6. A tool that takes a file declares `format: file` + `uploadTo: "mcp"`; the bytes
+   reach this container via `POST /file/upload` (`common/file_intake.py`), and the
+   reply names the path *inside* the container — no shared mount. See
+   [README_dev.md § File Arguments](README_dev.md#file-arguments-format-file-and-post-fileupload).
 
 ## Writing a New Driver
 
@@ -130,7 +135,6 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `audio/pcm-16k` | Audio waveform | PCM audio visualizer with playback |
 | `video/mjpeg` | Video stream | Motion JPEG video display |
 | `image/jpeg` | Image | Static JPEG image |
-| `image/depth-z16` | Depth colormap | 16-bit depth image with color mapping |
 | `data/json` | Text / KV panel | JSON key-value display |
 | `text/*` | Text | Plain text display |
 | `sensor/skeleton` | 3D Skeleton | URDF-based 3D skeleton with joint rotation |

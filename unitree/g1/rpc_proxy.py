@@ -104,6 +104,8 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                 result = motion.start(*args, **kwargs)
             elif method == "GetMotionResult":
                 result = motion.get_result(*args, **kwargs)
+            elif method == "MotionIdle":
+                result = {"available": motion.is_idle()}
             elif method == "StopMove":
                 result = motion.stop()["ret"]
             elif method == "Move":
@@ -247,6 +249,9 @@ class RpcProxy:
 
     def StopMove(self):
         return self._call_code("StopMove")
+
+    def MotionIdle(self):
+        return self._call("MotionIdle", timeout=2.0)
 
     def TimedMove(self, vx, vy, vyaw, duration, action_id):
         result = self._call("TimedMove", vx, vy, vyaw, duration, action_id)

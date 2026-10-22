@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:15791'
-VERSION = '0.5.12'
+from device import VERSION
 CARDS = {'joint_state'}
 from camera import CAMERA_SOURCES
 
@@ -98,8 +98,15 @@ def run_check(timeout=20, camera=False):
     else:
         raise ValueError(reason)
     tools = rpc('tools/list')['tools']
+    pose_tool = next((tool for tool in tools if tool['name']=='pose'),None)
+    if pose_tool:
+        schema=pose_tool['inputSchema']
+        if set(schema['properties'])!={'pose'} or schema['properties']['pose'].get('enum')!=['salute','wave','welcome'] or \
+                schema.get('x-completion')!={'timeout':480} or \
+                schema.get('x-resource')!=['arm_l','arm_r','head']:
+            raise ValueError('Pose schema or shared physical resources differ')
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'model': 'resource'}
+    expected = {**dict.fromkeys(CARDS | set(CAMERA_SOURCES), 'sensor'), 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource'}
     if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
         raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
@@ -133,6 +140,14 @@ def run_check(timeout=20, camera=False):
             or arm_tool['inputSchema']['properties']['action']['enum'] != ['move', 'reset']
             or set(arm_tool['inputSchema']['x-action-params']) != {'move', 'reset'}):
         raise ValueError('Arm completion tracking or physical resources are missing')
+    head_tool = next((tool for tool in tools if tool['name'] == 'move_head'), None)
+    if head_tool:
+        schema = head_tool['inputSchema']; props = schema['properties']
+        if set(props) != {'pitch_deg','yaw_deg','time'} or schema.get('x-completion') != {'timeout':120} or \
+                schema.get('x-resource') != ['head','arm_l','arm_r'] or \
+                (props['pitch_deg'].get('minimum'),props['pitch_deg'].get('maximum')) != (-60,45) or \
+                (props['yaw_deg'].get('minimum'),props['yaw_deg'].get('maximum')) != (-88,88):
+            raise ValueError('Head limits, schema or ACP tracking differ from the reviewed card')
     for name in CARDS:
         for action in ('start', 'info', 'stop'):
             result = rpc('tools/call', {'name': name,
@@ -141,14 +156,14 @@ def run_check(timeout=20, camera=False):
             if result.get('isError'):
                 raise ValueError('Sensor lifecycle failed: ' + name)
     motion_readiness = None
-    for name in names & {'arm_control'}:
+    for name in names & {'arm_control', 'move_head', 'gripper', 'pose'}:
         for action in ('info', 'start', 'stop'):
             reply = rpc('tools/call', {'name': name, 'arguments': {'action': action,
                 '_trace_id': 'readonly-check-trace', 'instance_id': 'readonly-check'}})
             if reply.get('isError'):
                 raise ValueError('Actuator lifecycle failed: ' + name)
             data = json.loads(reply['content'][0]['text'])
-            if action == 'info':
+            if name == 'arm_control' and action == 'info':
                 motion_readiness = data.get('motion_readiness')
             if data.get('motion_sent') is not False:
                 raise ValueError('Lifecycle must not send motion')
