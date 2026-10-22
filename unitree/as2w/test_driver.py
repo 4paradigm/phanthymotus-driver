@@ -719,6 +719,45 @@ class TestDriverContracts(unittest.TestCase):
         bundle.action_response_sent("as2w_special_motion_test")
         self.assertEqual(["as2w_special_motion_test"], seen)
 
+    def test_tools_call_notifies_action_only_after_http_response(self):
+        import io
+
+        order = []
+        action_id = "vision_capture_continuous_test"
+
+        def call(name, arguments):
+            self.assertEqual("vision_capture", name)
+            self.assertEqual({"action": "start_recording"}, arguments)
+            return {"ok": True, "action_id": action_id}
+
+        def action_response_sent(received_action_id):
+            order.append(("notified", received_action_id))
+
+        bundle = types.SimpleNamespace(
+            call=call, action_response_sent=action_response_sent)
+        handler_class = self.main.handler(bundle)
+        request_body = json.dumps({
+            "jsonrpc": "2.0", "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "vision_capture",
+                "arguments": {"action": "start_recording"},
+            },
+        }).encode()
+        request_handler = handler_class.__new__(handler_class)
+        request_handler.path = "/mcp"
+        request_handler.headers = {"Content-Length": str(len(request_body))}
+        request_handler.rfile = io.BytesIO(request_body)
+        request_handler._send_json = lambda status, payload: order.append(
+            ("responded", payload["id"]))
+
+        request_handler.do_POST()
+
+        self.assertEqual([
+            ("responded", 7),
+            ("notified", action_id),
+        ], order)
+
     def test_multimedia_card_contracts_match_verified_hardware(self):
         mic = self.multimedia.MicPlugin.__new__(self.multimedia.MicPlugin)
         mic._topic = "/test/mic/audio"
