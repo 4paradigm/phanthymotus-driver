@@ -32,7 +32,8 @@ class SimulatedRouter:
         self.client, self.owner, self.writes = client, None, []
     def status(self):
         return {"ros_publisher_available": True, "endpoint_query_available": True,
-                "active_owner": self.owner, "other_publishers": [], "same_name_publisher_count": 1}
+                "active_owner": self.owner, "other_publishers": [{"node_name": "mpc_policy_node", "node_namespace": "/"}],
+                "same_name_publisher_count": 1}
     def acquire(self, owner):
         if self.owner is not None:
             return False

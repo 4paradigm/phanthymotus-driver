@@ -19,6 +19,37 @@ PASSIVE_SUFFIXES = ("arm_yaw_joint", "elbow_yaw_joint", "wrist_pitch_joint", "wr
 OWNER = "wooden_man_motion"
 
 
+def publisher_conflict(status):
+    """Q5's vendor MPC endpoint also exists after position preparation.
+
+    legacy_direct_control.ArmControlPlugin treats endpoint presence as
+    diagnostic, not proof of a competing driver. Keep a narrower exception
+    here: one root-namespace vendor MPC endpoint, not arbitrary publishers.
+    This does not establish joint-level exclusivity; vendor readiness,
+    shared-router ownership and measured arrival remain mandatory.
+    """
+    others = status.get("other_publishers", [])
+    if not isinstance(others, list):
+        return "Invalid body publisher discovery result"
+    expected = {"node_name": "mpc_policy_node", "node_namespace": "/"}
+    known_count = 0
+    unexpected = []
+    for endpoint in others:
+        if isinstance(endpoint, dict) and all(endpoint.get(k) == v for k, v in expected.items()):
+            known_count += 1
+        elif isinstance(endpoint, dict):
+            unexpected.append(f"{endpoint.get('node_namespace', '?').rstrip('/')}/{endpoint.get('node_name', '?')}")
+        else:
+            unexpected.append("unknown endpoint")
+    if unexpected:
+        return "Competing body command publisher: " + ", ".join(unexpected)
+    if known_count > 1:
+        return "Multiple /mpc_policy_node endpoints; check vendor controller instances"
+    if status.get("same_name_publisher_count", 0) > 1:
+        return "Multiple q5_body_command publishers; check duplicate Q5 drivers"
+    return None
+
+
 def trajectory(request, mirrored=False):
     """Return a coarse camera sector and small absolute arm pose in radians."""
     gesture = request.get("gesture")
@@ -127,8 +158,9 @@ class MotionRunner:
         status = self.router.status()
         if not status.get("ros_publisher_available") or not status.get("endpoint_query_available"):
             raise RuntimeError("Body command endpoint unavailable")
-        if status.get("other_publishers") or status.get("same_name_publisher_count", 0) > 1:
-            raise RuntimeError("Competing body command publisher")
+        conflict = publisher_conflict(status)
+        if conflict:
+            raise RuntimeError(conflict)
         if status.get("active_owner") not in (None, OWNER):
             raise RuntimeError("Another body card owns the command router")
         if self.client.get_lifecycle_state() != "active" or not q5_is_control_ready(self.client)[0]:

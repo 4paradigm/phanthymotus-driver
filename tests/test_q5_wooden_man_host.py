@@ -329,6 +329,42 @@ def test_measured_return_duplicate_dedup_and_bounded_interpolation(runtime):
     assert len(router.writes) == count and reports[-1]["state"] == "completed"
 
 
+def test_prepared_vendor_mpc_endpoint_does_not_block_host_gesture(runtime):
+    runner, client, router, reports, clock = runtime
+    router.other = [{"node_name": "mpc_policy_node", "node_namespace": "/"}]
+    original = dict(client.joints)
+    runner.submit(request())
+    assert reports[-1]["state"] == "completed" and router.writes
+    assert client.joints == pytest.approx(original) and router.owner is None
+
+
+@pytest.mark.parametrize("others,count", [
+    ([{"node_name": "mpc_policy_node", "node_namespace": "/"}, {"node_name": "other", "node_namespace": "/"}], 1),
+    ([{"node_name": "mpc_policy_node", "node_namespace": "/another_robot"}], 1),
+    ([{"node_name": "mpc_policy_node"}], 1),
+    ([{"node_name": "mpc_policy_node", "node_namespace": "/"}] * 2, 1),
+    ([{"node_name": "mpc_policy_node", "node_namespace": "/"}], 2),
+])
+def test_vendor_exception_does_not_hide_unknown_or_duplicate_publishers(others, count):
+    assert motion.publisher_conflict({"other_publishers": others, "same_name_publisher_count": count})
+
+
+@pytest.mark.parametrize("fault", ["unprepared", "owner", "no_arrival"])
+def test_vendor_endpoint_never_bypasses_preparation_ownership_or_arrival(runtime, fault):
+    runner, client, router, reports, clock = runtime
+    router.other = [{"node_name": "mpc_policy_node", "node_namespace": "/"}]
+    if fault == "unprepared":
+        client.q5_position_control_prepared = False
+    elif fault == "owner":
+        router.owner = "arm_control"
+    else:
+        router.follow = False
+    runner.submit(request())
+    assert reports[-1]["state"] == "error"
+    if fault != "no_arrival":
+        assert not router.writes
+
+
 @pytest.mark.parametrize("fault", ["unprepared", "stale", "competition", "lease", "cancel", "no_arrival", "excursion", "yaw", "age", "mid_stale", "owner"])
 def test_motion_failure_never_claims_completion(runtime, fault):
     runner, client, router, reports, clock = runtime
