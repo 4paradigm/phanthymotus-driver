@@ -106,7 +106,6 @@ class Game:
         self.ready_since = None
         self.ready_frames = 0
         self.ready = False
-        self.ready_announced = False
         self.last_guidance = -math.inf
         self.last_observation = None
         self.prompt_at = None
@@ -163,6 +162,8 @@ class Game:
             self.say("手臂动作没有完成，请检查动作卡和位置直控状态，再重新开始。")
 
     def preparation(self, payload):
+        if self.phase != "preparing":
+            return  # Visibility checks and guidance start only after the voice command.
         now = self.clock()
         persons = payload.get("persons")
         message = "没有看清玩家，请一个人站在镜头前。"
@@ -175,12 +176,6 @@ class Game:
                 hips = tuple((points[11][j] + points[12][j]) / 2 for j in (0, 1))
                 valid = math.dist(shoulders, hips) >= 10
             message = "请露出肩膀和双腿，让我看清你的身体。"
-            size = payload.get("image_size")
-            if valid and isinstance(size, list) and len(size) == 2 and not isinstance(size[0], bool) and isinstance(size[0], (int, float)) and math.isfinite(size[0]) and size[0] > 0:
-                center = sum(points[i][0] for i in (5, 6, 11, 12)) / 4 / size[0]
-                if not .3 <= center <= .7:
-                    valid = False
-                    message = "请往画面中央站一点。"
             if valid and self.cfg["detect_fingers"]:
                 for side in ("left", "right"):
                     indices = hand_indices(payload, side)
@@ -199,14 +194,10 @@ class Game:
                 self.ready_since = now
             self.ready_frames += 1
             self.ready = self.ready_frames >= 5 and now - self.ready_since >= .8
-            if self.ready and not self.ready_announced and self.phase == "waiting":
-                self.say("准备好了，等你的开始口令。")
-                self.ready_announced = True
             if self.ready and self.phase == "preparing" and now >= self.preparation_not_before:
                 self.action("welcome", "countdown")
         else:
             self.ready_since, self.ready_frames, self.ready = None, 0, False
-            self.ready_announced = False
             if now - self.last_guidance >= 6:
                 self.say(message)
                 self.last_guidance = now
@@ -295,7 +286,7 @@ class Game:
     def pose(self, payload):
         if not isinstance(payload, dict):
             return
-        if self.cfg["host_interaction"] and self.phase in ("waiting", "preparing"):
+        if self.cfg["host_interaction"] and self.phase == "preparing":
             self.preparation(payload)
             return
         if self.phase != "watch":

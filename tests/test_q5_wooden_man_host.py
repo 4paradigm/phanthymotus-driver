@@ -67,19 +67,46 @@ class Host:
             self.step(.1)
 
 
-def test_ready_guidance_needs_stable_visibility_and_never_auto_starts():
+def test_waiting_is_silent_and_does_not_check_players_until_start_command():
     h = Host()
     for _ in range(50):
         h.game.pose({"persons": []})
         h.step(.1)
-    assert h.words == ["没有看清玩家，请一个人站在镜头前。"]
-    assert h.game.phase == "waiting" and not h.actions
     h.ready()
-    assert h.words[-1] == "准备好了，等你的开始口令。"
-    assert h.game.phase == "waiting"
-    h.step(2)
-    h.game.pose(pose())
-    assert not h.game.ready
+    h.game.preparation({"persons": []})
+    assert h.game.phase == "waiting" and not h.words and not h.actions
+    assert not h.game.ready and h.game.ready_frames == 0 and h.game.last_observation is None
+    h.game.text("游戏开始")
+    assert h.game.phase == "preparing"
+    h.game.pose({"persons": []})
+    assert h.words[-1] == "没有看清玩家，请一个人站在镜头前。"
+    h.ready()
+    assert h.game.phase == "robot_action" and h.actions[-1]["gesture"] == "welcome"
+
+
+@pytest.mark.parametrize("dx", [-90, 150])
+def test_clear_player_near_either_edge_can_prepare_and_start(dx):
+    h = Host()
+    h.game.text("游戏开始")
+    for _ in range(17):
+        h.game.pose(pose(dx))
+        h.step(.2)
+    assert h.game.phase == "robot_action" and h.actions[-1]["gesture"] == "welcome"
+    assert all("中央" not in words for words in h.words)
+    h.complete()
+    assert h.game.phase == "countdown"
+
+
+def test_reset_returns_to_silent_waiting_even_without_a_visible_player():
+    h = Host()
+    h.game.text("游戏开始")
+    h.game.pose({"persons": []})
+    h.game.reset()
+    previous = list(h.words)
+    for _ in range(100):
+        h.game.pose({"persons": []})
+        h.step(.1)
+    assert h.game.phase == "waiting" and h.words == previous and not h.actions
 
 
 def test_preparation_never_plays_with_multiple_people_or_missing_hands():
