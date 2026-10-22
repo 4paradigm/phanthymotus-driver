@@ -1,4 +1,4 @@
-"""Real G1_23 model/solver tests. Needs the pinned CasADi-capable ABI and meshes.
+"""Real G1_23 model/solver tests. Needs the pinned CasADi-capable ABI.
 
 Calibration is deliberately synthetic and cannot be used for physical acceptance.
 """
@@ -28,10 +28,6 @@ def profile(tmp_path):
     p['locked_joints']=dict.fromkeys(p['locked_joints'],0.)
     for side in ('left','right'):
         p['palm_frames'][side]={'position':[.2,0.,0.],'orientation':[0.,0.,0.,1.]}
-    p['workspace']={'torso_box':[[-.05,-.05,-.05],[.05,.05,.05]],
-        'left':[[-1.,-1.,-1.],[1.,1.,1.]],'right':[[-1.,-1.,-1.],[1.,1.,1.]],
-        'capsules':[{'from':s+'_elbow_joint','to':s+'_wrist_roll_joint','radius_m':.025,'group':s}
-                    for s in ('left','right')]}
     path=tmp_path/'g1.json';path.write_text(json.dumps(p));return path
 
 
@@ -99,25 +95,25 @@ def test_card_configures_empty_arm_and_keeps_previous_on_invalid_candidate(tmp_p
         card.stop()
 
 
-def test_rejected_collision_cannot_contaminate_return_to_valid_target(tmp_path):
-    solver=IK(profile(tmp_path), collision_checks=True)
-    q=np.array([.2037558,.28927523,.05398893,1.03511345,-.07312774,
-                .22553113,-.3246167,.02247042,.80643052,.08557935])
-    good=solver.palms(q)
-    bad=[t.copy() for t in good]
-    bad[0][1,3]-=.3;bad[1][1,3]+=.3
+def test_rejected_joint_envelope_cannot_contaminate_next_valid_target(tmp_path, monkeypatch):
+    solver=IK(profile(tmp_path))
+    q=np.zeros(10)
+    targets=solver.palms(q)
+    envelope=solver.motion_envelope
+    def reject(*args, **kwargs):
+        raise ValueError('motion_envelope_joint_limit')
+    monkeypatch.setattr(solver, 'motion_envelope', reject)
     for _ in range(4):
-        with pytest.raises(ValueError,match='collision'):
-            solver.solve(bad,q,q,deadline_monotonic=time.monotonic()+1.)
+        with pytest.raises(ValueError,match='motion_envelope_joint_limit'):
+            solver.solve(targets,q,q,deadline_monotonic=time.monotonic()+1.)
         assert solver.ik.snapshot()['history_depth']==0
-    result=solver.solve(good,q,q,deadline_monotonic=time.monotonic()+1.)
-    assert len(result)==10
+    monkeypatch.setattr(solver, 'motion_envelope', envelope)
+    assert len(solver.solve(targets,q,q,deadline_monotonic=time.monotonic()+1.))==10
     assert solver.ik.snapshot()['history_depth']==1
 
 
-def test_default_collision_policy_does_not_block_inward_targets(tmp_path):
+def test_inward_targets_remain_valid_and_joint_limits_are_enforced(tmp_path):
     solver=IK(profile(tmp_path))
-    assert solver.collision_checks_enabled is False
     q=np.array([.2037558,.28927523,.05398893,1.03511345,-.07312774,
                 .22553113,-.3246167,.02247042,.80643052,.08557935])
     targets=[t.copy() for t in solver.palms(q)]

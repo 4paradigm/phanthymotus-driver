@@ -69,7 +69,6 @@ def snapshot(adapter):
                 'ik':chains(solver,preview['ik_q']) if valid else [],
                 'command':chains(solver,output['target_q']) if output.get('target_q') is not None else [],
                 'targets':targets,
-                'torso':torso,'shoulder_height':height,
-                'collision_reason':(solver.last_collision_rejection or {}).get('reason','')}
+                'torso':torso,'shoulder_height':height}
     except (ValueError,KeyError,TypeError):
         return {'schema':'motus.g1-visualization.v1','available':False,'reason':'feedback_unavailable'}

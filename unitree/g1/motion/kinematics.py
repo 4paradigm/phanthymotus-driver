@@ -1,19 +1,15 @@
 """Calibrated G1_23 dual-arm solver migrated from the frozen ActuCore path.
 
-Numerical subprocess only: preserve the PR152 five-DOF objective and conservative
-geometry, output complete position reference; execution interpolation and final-q
-RNEA belong to arm. See README.md#来源与迁移边界 for exact source provenance.
+Numerical subprocess only: preserve the PR152 five-DOF objective and joint limits,
+output complete position reference; hardware execution belongs to arm.
+See README.md#来源与迁移边界 for exact source provenance.
 """
-import copy
 import hashlib
-from itertools import product
 import json
 from pathlib import Path
 import time
 import numpy as np
 from .ik import PinocchioIk, ARM_JOINT_NAMES
-from .collision import Collision
-from .workspace import ArmWorkspace
 
 PROFILE_ID = 'unitree_g1_23_dual_arm_relative_v1'
 
@@ -36,9 +32,8 @@ def transform(pose):
     return result
 
 
-class IK(ArmWorkspace):
-    def __init__(self, path, *, pr152_objective=True, collision_checks=False):
-        self.collision_checks_enabled = bool(collision_checks)
+class IK:
+    def __init__(self, path, *, pr152_objective=True):
         raw = Path(path).read_bytes()
         self.profile = json.loads(raw)
         self.hands_enabled = False
@@ -62,31 +57,6 @@ class IK(ArmWorkspace):
         self.velocity = p['joint_velocity_rad_s']
         if type(self.velocity) not in (int,float) or not 0 < self.velocity <= 5.:
             raise ValueError('joint_velocity_limit')
-        if self.collision_checks_enabled:
-            if not p['workspace'].get('capsules') or not p['workspace'].get('torso_box'):
-                raise ValueError('collision_calibration_missing')
-            # Official G1_23 rubber-hand mesh bounds, rounded outwards (see VALIDATION.md).
-            # Bind these dimensions to the verified model, not an arbitrary replacement URDF.
-            if p['urdf_sha256'] not in (
-                'b1af86fb023c0b6f8e52723d224be6cad70916eaff2778e7dbe09e6f91faa9b9',
-                '2d61264aaae95eac2545497a34ef316f270b0cd3d856bf9a4941ebff2592aca2',
-            ):
-                raise ValueError('g1_hand_geometry_unverified')
-            for side, ee in (('left','L_ee'), ('right','R_ee')):
-                y = (-.042408,.029961) if side == 'left' else (-.029961,.042408)
-                corners = np.array(list(product((.000097,.253316),y,(-.041527,.064957))))
-                tip = finite(p['palm_frames'][side]['position'],(3,))
-                length2 = float(tip @ tip)
-                projection = np.zeros(8) if length2 == 0 else np.clip(corners @ tip / length2,0,1)
-                radius = float(np.max(np.linalg.norm(corners-projection[:,None]*tip,axis=1)))
-                # A capsule is convex: enclosing all box corners encloses the complete mesh.
-                p['workspace']['capsules'].append({'from':side+'_wrist_roll_joint',
-                    'to':ee,'radius_m':radius,'group':side})
-            self.transition_refinement_depth = 10
-            self.configure_workspace()
-            self.body_collision = Collision(self.pin,self.model,model_path)
-        self.last_collision_rejection = None
-        self._collision_context = None
         self.last_ms = None
         self.residual = None
         self.last_solve_at = None
@@ -94,21 +64,10 @@ class IK(ArmWorkspace):
         self.last_valid_visualization = None
         self.last_envelope = None
 
-    def _safe_configuration(self,q,excursion=None):
+    def _safe_configuration(self,q):
         q = finite(q, (10,))
         if np.any(q < self.model.lowerPositionLimit) or np.any(q > self.model.upperPositionLimit):
             raise ValueError('motion_envelope_joint_limit')
-        if not self.collision_checks_enabled: return
-        try:
-            super()._safe_configuration(q,excursion)
-            self.body_collision.check(self.data,excursion)
-        except ValueError as exc:
-            self.last_collision_rejection = {
-                'reason':str(exc), 'checked_q':np.asarray(q).tolist(),
-                'excursion_rad':None if excursion is None else np.asarray(excursion).tolist(),
-                'context':copy.deepcopy(self._collision_context),
-                'body':copy.deepcopy(self.body_collision.last_rejection) if str(exc).startswith('g1_body_collision:') else None}
-            raise
 
     def palms(self, q):
         return self.ik.current_targets(finite(q,(10,)))
@@ -131,10 +90,6 @@ class IK(ArmWorkspace):
             raise ValueError('motion_envelope_joint_limit')
         lo = np.maximum(self.model.lowerPositionLimit, lo-.002)
         hi = np.minimum(self.model.upperPositionLimit, hi+.002)
-        self._collision_context = {'measured_q': measured.tolist(), 'reference_q': previous.tolist(),
-                                   'target_q': target.tolist()}
-        if self.collision_checks_enabled:
-            self._safe_transition(lo, hi, budget)
         budget()
         return {'lower': lo.tolist(), 'upper': hi.tolist()}
 

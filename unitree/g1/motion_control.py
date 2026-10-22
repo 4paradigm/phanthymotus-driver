@@ -210,7 +210,6 @@ class MotionControl:
                 'eef_snapshot': copy.deepcopy(self._snapshot),
                 'visualization': copy.deepcopy(self._visualization),
                 'control_decision': copy.deepcopy(self._decision), 'finish': copy.deepcopy(self._finish),
-                'collision_checks_enabled': getattr(self.solver, 'collision_checks_enabled', None),
                 'preview': bool(self._preview)}
             if self._preview:
                 result.update(session_id=self._preview['session_id'], state=self._preview_state,

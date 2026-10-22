@@ -65,12 +65,6 @@
       "orientation": null
     }
   },
-  "workspace": {
-    "torso_box": null,
-    "left": null,
-    "right": null,
-    "capsules": []
-  },
   "safety": {
     "fsm_id": 500,
     "allowed_fsm_ids": [500, 801],
@@ -82,7 +76,6 @@
   },
   "acceptance": {
     "model_verified": false,
-    "workspace_verified": false,
     "stop_verified": false,
     "driver_crash_verified": false,
     "pico_verified": false,

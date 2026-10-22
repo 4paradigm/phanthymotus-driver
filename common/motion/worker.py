@@ -82,7 +82,6 @@ class NumericalWorker:
                 raise ValueError('ik_worker_calibration_changed')
             self.profile, self.profile_sha256 = data['profile'], data['profile_sha256']
             self.hands_enabled, self.velocity = data['hands_enabled'], data['velocity']
-            self.collision_checks_enabled = data.get('collision_checks_enabled')
             self.model = SimpleNamespace(velocityLimit=data['velocity_limits'])
             self.lower, self.upper = data['lower'], data['upper']
         except BaseException:
@@ -208,7 +207,6 @@ def serve(sock, solver_module, solver_class, visualization_module):
                     solver.velocity = float(velocity)
                 result = dict(profile=solver.profile, profile_sha256=solver.profile_sha256,
                     hands_enabled=solver.hands_enabled, velocity=solver.velocity,
-                    collision_checks_enabled=getattr(solver, 'collision_checks_enabled', None),
                     velocity_limits=solver.model.velocityLimit.tolist(),
                     lower=solver.model.lowerPositionLimit[solver.indices].tolist(),
                     upper=solver.model.upperPositionLimit[solver.indices].tolist())
@@ -260,7 +258,7 @@ if __name__ == '__main__':
     # importing numerical packages, whose diagnostics may include ANSI output.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common import logsafe
-    logsafe.install()
+    logsafe.install(check_fd=False)
     try:
         sys.path.insert(0, sys.argv[2])
         serve(socket.socket(fileno=int(sys.argv[1])), *sys.argv[3:6])
