@@ -464,6 +464,27 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn((255, 0, 18), calls)
         plugin.stop()
 
+    def test_led_defaults_to_zero_but_rejects_empty_color_fields(self):
+        calls = []
+        proxy = types.SimpleNamespace(
+            Audio_LedControl=lambda *args: calls.append(args) or 0)
+        plugin = self.device.LedPlugin({}, "test", None, proxy)
+        properties = plugin.get_tool()["inputSchema"]["properties"]
+        self.assertEqual(
+            [0, 0, 0],
+            [properties[key]["default"] for key in ("red", "green", "blue")])
+
+        for arguments in (
+                {},
+                {"red": "", "green": 0, "blue": 0},
+                {"red": 0, "green": None, "blue": 0}):
+            with self.subTest(arguments=arguments):
+                result = plugin.dispatch("set_color", arguments)
+                self.assertFalse(result["accepted"])
+                self.assertEqual(-1, result["ret"])
+        self.assertEqual([], calls)
+        self.assertEqual([0, 0, 0], plugin._color)
+
     def test_led_off_keeps_refreshing_black(self):
         calls = []
         proxy = types.SimpleNamespace(

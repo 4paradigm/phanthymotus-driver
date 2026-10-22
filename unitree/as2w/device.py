@@ -1783,9 +1783,9 @@ class LedPlugin:
                 "description": "AS2 RGB LED. The selected color is refreshed periodically because AS2 firmware may time out LED state.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["set_color", "off", "info"]},
-                    "red": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Red channel 0-255."},
-                    "green": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Green channel 0-255."},
-                    "blue": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Blue channel 0-255."}},
+                    "red": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0, "description": "Red channel 0-255; defaults to 0."},
+                    "green": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0, "description": "Green channel 0-255; defaults to 0."},
+                    "blue": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0, "description": "Blue channel 0-255; defaults to 0."}},
                     "required": ["action"],
                     "x-action-params": {
                         "set_color": {"params": ["red", "green", "blue"], "description": "Set RGB color."},
@@ -1834,6 +1834,16 @@ class LedPlugin:
         if action == "off":
             color = (0, 0, 0)
         elif action == "set_color":
+            missing = [key for key in ("red", "green", "blue")
+                       if key not in args or args[key] in (None, "")]
+            if missing:
+                return {
+                    "ret": -1,
+                    "accepted": False,
+                    "action": action,
+                    "error": "red, green and blue are required",
+                    "missing": missing,
+                }
             color = tuple(max(0, min(255, int(args.get(key, 0))))
                           for key in ("red", "green", "blue"))
         else:
