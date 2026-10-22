@@ -295,3 +295,14 @@ def test_closed_controller_cannot_restart_without_a_watchdog(plugin):
     assert p.start()['state'] == 'idle'
     result = p.dispatch('stand', {})
     assert result['state'] == 'unavailable' and not b.commands
+
+
+def test_future_monotonic_feedback_is_not_fresh_confirmation(plugin):
+    p, b = plugin
+    base = feedback_for(b)
+    def future(action, request_id):
+        value = base(action, request_id)
+        value['received_monotonic'] += 5
+        return value
+    p._feedback = future
+    assert not p.dispatch('stand', {})['completed']

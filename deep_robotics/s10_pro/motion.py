@@ -270,9 +270,11 @@ class MotionPlugin:
             value = self._feedback(action, request_id)
             age = value.get('age_s')
             received = value.get('received_monotonic')
+            now = self._clock()
             return (value.get('confirmed') is True and value.get('fresh') is True
                 and isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and 0 <= age <= .5
-                and isinstance(received, (int, float)) and math.isfinite(received) and received >= after
+                and isinstance(received, (int, float)) and not isinstance(received, bool) and math.isfinite(received)
+                and after <= received <= now and abs((now - received) - age) <= .1
                 and value.get('request_id') == request_id)
         except Exception:
             return False
