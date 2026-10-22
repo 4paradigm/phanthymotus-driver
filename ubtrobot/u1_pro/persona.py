@@ -242,6 +242,14 @@ class PersonaPlugin:
             "action_id": {"type": "string", "description": "可选 ACP 关联 ID。"},
         })
         schema["x-completion"] = {"actions": ["say"], "timeout": 120}
+        # Hooks bypass the ACP barrier, so a user barge-in or e-stop clears the
+        # queue even while a long reply is pending.  x-resource is intentionally
+        # NOT declared: no other U1 Pro card declares it, and a partially declared
+        # driver is worse than an undeclared one (README_dev, "Physical Resources").
+        schema["x-hooks"] = {
+            "on_interrupt_speak": {"action": "interrupt"},
+            "on_interrupt_all": {"action": "interrupt"},
+        }
         return tool(self.PREFIX, "actuator",
                     "U1 Pro 多人格陪伴：安全 > 停止 > 明确点名 > 关键词评分 路由人格；切换时由驱动先播报身份，"
                     "回复必须经 persona.say 串行播报。不生成回复内容。",
@@ -411,6 +419,7 @@ class PersonaPlugin:
                 job = self._jobs.popleft()
                 current_generation = self._generation
             if job.generation != current_generation:
+                self._drop(job)
                 continue
             try:
                 self._play(job)
@@ -421,10 +430,17 @@ class PersonaPlugin:
         with self._cond:
             return job.generation != self._generation
 
+    def _drop(self, job: _Job) -> None:
+        """Report a job that was cancelled before it reached the audio channel."""
+        if job.public:
+            self.notify(job.action_id, "cancelled", {"state": "cancelled", "action_id": job.action_id},
+                        self.PREFIX)
+
     def _play(self, job: _Job) -> None:
         deadline = time.monotonic() + self.busy_timeout
         while True:
             if self._stale(job):
+                self._drop(job)
                 return
             if self.audio.active_action_id() is None:
                 if job.kind == "play_action":

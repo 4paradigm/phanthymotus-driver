@@ -172,6 +172,32 @@ class PersonaCardTests(unittest.TestCase):
         bad = self.card.dispatch("say", {"text": "再来一句。", "expression": "angry"})
         self.assertIsNone(bad["expression"])
 
+    def test_interrupt_hooks_are_declared_and_work(self):
+        schema = self.card.get_tool()["inputSchema"]
+        self.assertEqual(schema["x-hooks"]["on_interrupt_speak"], {"action": "interrupt"})
+        self.assertEqual(schema["x-hooks"]["on_interrupt_all"], {"action": "interrupt"})
+        self.assertNotIn("x-resource", schema)  # whole driver is undeclared; stay consistent
+        self.card.dispatch("set", {"persona": "lanzong"})
+        self.card.dispatch("say", {"text": "第一步。", "action_id": "r1"})
+        self.card.dispatch("say", {"text": "第二步。", "action_id": "r2"})
+        self.assertTrue(_wait(lambda: len(self.spoken()) == 1))
+        self.card.dispatch("interrupt", {})
+        time.sleep(0.05)
+        self.assertEqual(len(self.spoken()), 1)
+        for action_id in ("r1", "r2"):
+            self.assertTrue(any(c.args[:2] == (action_id, "cancelled")
+                                for c in self.notify.call_args_list), action_id)
+
+    def test_job_cancelled_before_submit_still_reports_cancelled(self):
+        self.audio._active = {"action_id": "external", "vendor_uuid": "x", "kind": "play_action",
+                              "tool_name": "expression"}  # keeps the worker waiting to submit
+        self.card.dispatch("say", {"text": "排队中", "action_id": "waiting"})
+        time.sleep(0.05)  # worker has popped the job and is polling the busy channel
+        self.card._cancel_all(interrupt=False)
+        self.assertTrue(_wait(lambda: any(c.args[:2] == ("waiting", "cancelled")
+                                          for c in self.notify.call_args_list)))
+        self.assertEqual(self.spoken(), [])
+
     def test_busy_channel_times_out_without_claiming_success(self):
         self.audio._active = {"action_id": "external", "vendor_uuid": "x", "kind": "play_action",
                               "tool_name": "expression"}
