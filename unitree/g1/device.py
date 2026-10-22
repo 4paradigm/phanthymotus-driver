@@ -1991,14 +1991,13 @@ class ArmActionPlugin:
 # ── StatePlugin (sensor) ─────────────────────────────────────────────────────
 
 class _LowStateNode(Node):
-    """Subscribes to DDS rt/lowstate + rt/lf/bmsstate and republishes to ROS2."""
+    """Publishes shared LowState plus independent BMS/mainboard DDS telemetry."""
 
-    _JOINTS_INTERVAL = 0.1   # 10 Hz throttle for joints
     _IMU_INTERVAL    = 0.05  # 20 Hz throttle for IMU
     _BMS_INTERVAL    = 1.0   # 1 Hz throttle for BMS
     _MAINBOARD_INTERVAL = 2.0  # 0.5 Hz throttle for mainboard
 
-    def __init__(self, imu_topic: str, battery_topic: str, joints_topic: str, mainboard_topic: str):
+    def __init__(self, imu_topic: str, battery_topic: str, joints_topic: str, mainboard_topic: str, *, low_state):
         super().__init__("g1_low_state")
         self._imu_pub       = self.create_publisher(String, imu_topic,       _LOW_LAT_QOS)
         self._battery_pub   = self.create_publisher(String, battery_topic,   _LOW_LAT_QOS)
@@ -2008,19 +2007,13 @@ class _LowStateNode(Node):
         self._last_battery: dict = {}
         self._last_posture: dict = {}
         self._lock = threading.Lock()
-        self._last_joints_time:    float = 0.0
-        self._last_imu_time:       float = 0.0
+        self._low_state = low_state
+        self._last_lowstate_sample = None
+        self._state_samples = 0
         self._last_bms_time:       float = 0.0
         self._last_mainboard_time: float = 0.0
 
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-            sub = ChannelSubscriber("rt/lowstate", LowState_)
-            sub.Init(self._on_state, 10)
-            self.get_logger().info(f"LowStateNode subscribed rt/lowstate → {imu_topic}, {joints_topic}")
-        except Exception as e:
-            self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lowstate: {e}")
+        self.create_timer(self._IMU_INTERVAL, self._poll_state)
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -2040,31 +2033,33 @@ class _LowStateNode(Node):
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lf/mainboardstate: {e}")
 
+    def _poll_state(self) -> None:
+        sample = self._low_state.snapshot()
+        if (sample is None or sample is self._last_lowstate_sample
+                or not 0 <= time.monotonic_ns()-sample.sampled_ns <= 200_000_000):
+            return
+        self._last_lowstate_sample = sample
+        self._on_state(sample.message)
+
     def _on_state(self, msg) -> None:
-        now = time.monotonic()
+        imu = msg.imu_state
+        imu_data = {
+            "quaternion":    list(imu.quaternion),
+            "gyroscope":     list(imu.gyroscope),
+            "accelerometer": list(imu.accelerometer),
+            "rpy":           list(imu.rpy),
+            "temperature":   float(imu.temperature),
+        }
+        with self._lock:
+            self._last_imu = imu_data
 
-        # IMU: throttle to 20 Hz
-        if now - self._last_imu_time >= self._IMU_INTERVAL:
-            self._last_imu_time = now
-            imu = msg.imu_state
-            imu_data = {
-                "quaternion":    list(imu.quaternion),
-                "gyroscope":     list(imu.gyroscope),
-                "accelerometer": list(imu.accelerometer),
-                "rpy":           list(imu.rpy),
-                "temperature":   float(imu.temperature),
-            }
-            with self._lock:
-                self._last_imu = imu_data
+        imu_out = String()
+        imu_out.data = json.dumps(imu_data)
+        self._imu_pub.publish(imu_out)
 
-            imu_out = String()
-            imu_out.data = json.dumps(imu_data)
-            self._imu_pub.publish(imu_out)
-
-        # Joints: throttle to 10 Hz
-        now = time.monotonic()
-        if now - self._last_joints_time >= self._JOINTS_INTERVAL:
-            self._last_joints_time = now
+        # One 20 Hz timer; every second new sample publishes joints at 10 Hz.
+        self._state_samples += 1
+        if self._state_samples % 2:
             joints = []
             for i, m in enumerate(msg.motor_state):
                 joints.append({
@@ -2182,12 +2177,13 @@ class _LowStateNode(Node):
 class StatePlugin:
     PREFIX = "state"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, *, low_state):
         self._imu_topic       = f"/{namespace}/state/imu"
         self._battery_topic   = f"/{namespace}/state/battery"
         self._joints_topic    = f"/{namespace}/state/joints"
         self._mainboard_topic = f"/{namespace}/state/mainboard"
-        self._node = _LowStateNode(self._imu_topic, self._battery_topic, self._joints_topic, self._mainboard_topic)
+        self._node = _LowStateNode(self._imu_topic, self._battery_topic, self._joints_topic, self._mainboard_topic,
+                                   low_state=low_state)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:

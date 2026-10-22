@@ -1,4 +1,4 @@
-"""Explicit buttons and native reset, real executor with a synthetic SDK/plant."""
+"""Explicit buttons and Canvas-compatible handback, real executor with a synthetic SDK/plant."""
 import copy
 import json
 from types import SimpleNamespace
@@ -13,14 +13,6 @@ from teleop_control import TeleopControl
 
 def reset_rig(tmp_path, client=None):
     arm, sample, channel, advance, _, sdk = rig(tmp_path, client=client)
-    pose = tmp_path/'reset.json'
-    pose.write_text(json.dumps({'schema':'motus.g1-reset-pose.v1','arm_joint_names':list(JOINT_NAMES),'q':[0.]*10}))
-    arm.cfg['reset_pose_path'] = str(pose)
-    solver = SimpleNamespace(joint_envelope=lambda measured,previous,target:
-        {'lower':[min(a,b)-.002 for a,b in zip(measured,target)],
-         'upper':[max(a,b)+.002 for a,b in zip(measured,target)]})
-    arm.motion_control = SimpleNamespace(solver=solver)
-    if client is None: arm.arm_client.RequestReset = lambda: sdk.append(99) or 0
     motion = SimpleNamespace(executor=arm, gate=arm, clock_id='offline', _lock=threading.RLock(),
         _preview=None, _preview_state='idle', cancel_pending=lambda: None, _decision={})
     card = TeleopControl({'mode': 'live'}, motion, clock=arm.clock)
@@ -68,7 +60,7 @@ def test_interrupted_or_conflicting_confirmation_does_not_count(tmp_path):
     assert begun == [True]
 
 
-def test_reset_calls_native_99_once_then_requires_new_baseline(tmp_path):
+def test_reset_hands_back_once_then_requires_new_baseline(tmp_path):
     card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
     card._operator = 'old'; card._enabled = True
     card._hold = lambda *a, **kw: setattr(card, '_enabled', False)
@@ -77,11 +69,11 @@ def test_reset_calls_native_99_once_then_requires_new_baseline(tmp_path):
     assert card.mapping.anchor is None and card._needs_calibration
     for _ in range(60):
         feed('yb'); arm.tick(); time.sleep(.001)
-    assert sdk == [99]
+    assert sdk == []
     assert card._reset_operation is None and card._reason == 'waiting_baseline_confirmation'
     assert not card._enabled and card._operator is None
     for _ in range(15): feed('yb')
-    assert sdk == [99]  # Holding Reset after completion does not trigger again.
+    assert sdk == []  # Holding Reset after completion does not trigger again.
     begun = []
     card._begin = lambda generation, action: begun.append(action)
     feed()
@@ -89,24 +81,25 @@ def test_reset_calls_native_99_once_then_requires_new_baseline(tmp_path):
     assert begun == ['calibrate']
 
 
-def test_reset_sdk_failure_never_claims_completion(tmp_path):
-    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path, SimpleNamespace(RequestReset=lambda: 3102))
+def test_reset_write_failure_never_claims_completion(tmp_path):
+    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
+    arm._channel.success = False
     for _ in range(11): feed('yb')
     for _ in range(60):
         feed('yb'); arm.tick(); time.sleep(.001)
         if arm._operation['state'] == 'failed':
             feed('yb'); break
-    assert card._state == 'hold' and card._reason == 'release_sdk_error'
+    assert card._state == 'hold' and card._reason == 'arm_sdk_write_failed'
     assert not card._enabled and not card._operator
     assert arm._operation['physical_confirmed'] is False
     feed()
     advance(400); card.step()
     feed()
-    assert card._state == 'hold' and card._reason == 'release_sdk_error'
+    assert card._state == 'hold' and card._reason == 'arm_sdk_write_failed'
     assert not card._operator and not card._enabled
 
 
-def test_stop_fences_reset_before_native_action(tmp_path):
+def test_stop_keeps_reset_on_handback_path(tmp_path):
     card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
     for _ in range(11): feed('yb')
     card.cancel_for_arm_release()
@@ -171,17 +164,17 @@ def test_reset_interrupted_by_input_gap_stays_failed_after_recovery(tmp_path):
     assert not sdk and not card._operator and not card._enabled
 
 
-def test_operator_reset_confirms_return_before_send_and_allows_next_explicit_session(tmp_path):
+def test_operator_reset_confirms_handback_and_allows_next_explicit_session(tmp_path):
     card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
     old_session = arm.session_id
     for _ in range(11): feed('yb')
     for _ in range(40):
         feed('yb'); arm.tick(); time.sleep(.001)
     op = arm._operation
-    assert sdk == [99] and op['request_sent'] and op['state'] == 'completed'
-    assert not op['physical_confirmed'] and not op['return_completed']
-    assert op['return_pose_reached']
-    assert not arm.status()['ownership_held'] and not arm.release_requested
+    assert sdk == [] and not op['request_sent'] and op['state'] == 'completed'
+    assert op['physical_confirmed'] and op['authority_released']
+    assert op['action_id'] is None
+    assert not arm.status()['ownership_held']
     assert arm.latest is None and not arm._proofs and arm._channel.closed
     assert card._reason == 'waiting_baseline_confirmation' and not card._enabled
 
@@ -197,14 +190,14 @@ def test_operator_reset_confirms_return_before_send_and_allows_next_explicit_ses
     feed()
     for _ in range(11): feed('xa')
     assert card._operator and card.mapping.epoch == 1 and not card._enabled
-    assert not arm.status()['ownership_held'] and sdk == [99]
+    assert not arm.status()['ownership_held'] and sdk == []
     # A subsequent explicit claim uses the ordinary execution checks and a new lease.
     sample['dq'] = [0.]*10
     arm._channel.open = lambda: setattr(arm._channel, 'closed', False)
     claimed = arm.dispatch('claim', {})
     assert claimed['state'] == 'ready' and claimed['session_id'] != old_session
     arm.accept_control(packet(arm)); advance(10); arm.tick()
-    assert arm.status()['output_active'] and sdk == [99]
+    assert arm.status()['output_active'] and sdk == []
 
 
 @pytest.mark.parametrize('failure', ['none', 'unmatched', 'write'])
@@ -245,31 +238,6 @@ def _sdk_reset_check(failure):
     else: assert not writes
 
 
-def test_stop_during_reset_send_never_reports_cancelled_or_reacquires(tmp_path):
-    entered, finish = threading.Event(), threading.Event()
-    def send():
-        entered.set()
-        assert finish.wait(3)
-        return 0
-    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path, SimpleNamespace(RequestReset=send))
-    try:
-        for _ in range(11): feed('yb')
-        for _ in range(40):
-            feed('yb'); arm.tick()
-            if entered.wait(.001): break
-        assert entered.is_set()
-        result = arm.dispatch('stop', {})
-        assert result['state'] == 'unknown'
-        finish.set(); arm._rpc_thread.join(1)
-        op = arm._operation
-        assert op['request_sent'] and op['state'] == 'unknown'
-        assert not op['physical_confirmed'] and not op['authority_released']
-        assert not card._enabled and arm.status()['ownership_held']
-    finally:
-        finish.set()
-        if arm._rpc_thread: arm._rpc_thread.join(1)
-
-
 @pytest.mark.parametrize('state', ['ready', 'active', 'hold', 'fault'])
 def test_confirmation_rebuilds_existing_baseline_in_every_state(tmp_path, state):
     card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
@@ -293,7 +261,12 @@ def test_operator_can_retry_reset_or_confirm_after_error(tmp_path, outcome):
     sample['dq'] = [.03]*10
     feed('yb'); feed()
     for _ in range(11): feed('yb')
-    assert arm._operation is not op and arm._operation['state'] in ('return_preparing','returning')
+    if outcome == 'unknown':
+        assert arm._operation is op and card._reason == 'robot_not_stopped'
+        sample['dq'] = [0.]*10
+        feed()
+        for _ in range(11): feed('yb')
+    assert arm._operation is not op and arm._operation['state'] == 'holding'
     arm._operation.update(state=outcome, handback_confirmed=True)
     assert arm.confirm_operator_reset()
     assert arm._operation['state'] == 'completed'
@@ -328,106 +301,6 @@ def test_active_confirmation_hands_back_without_reset_or_stationarity(tmp_path):
     assert not sdk and not arm._operation['physical_confirmed']
 
 
-def start_return(arm):
-    result=arm.dispatch('operator_reset',{})
-    assert 'error' not in result
-    for _ in range(1000):
-        if arm._operation['state']!='return_preparing': return
-        time.sleep(.001)
-    pytest.fail('return preparation did not finish')
-
-
-def test_return_slews_then_requires_measured_arrival_before_native_reset(tmp_path):
-    _,arm,sample,advance,sdk,_=reset_rig(tmp_path)
-    sample['q']=[.1]*10
-    start_return(arm)
-    for _ in range(120): advance(10,follow=False); arm.tick()
-    assert not sdk and arm._operation['state']=='returning'
-    writes=arm._channel.writes
-    assert writes[-1][0]==pytest.approx([0.]*10)
-    assert all(max(abs(x-y) for x,y in zip(a[0],b[0]))<=.001000001 for a,b in zip(writes,writes[1:]))
-    for _ in range(250): advance(10); arm.tick(); time.sleep(.001)
-    assert sdk==[99] and arm._operation['return_pose_reached']
-
-
-@pytest.mark.parametrize('failure',['stale','not_arrived','moving','out_of_envelope'])
-def test_return_failure_never_sends_native_reset(tmp_path,failure):
-    _,arm,sample,advance,sdk,_=reset_rig(tmp_path)
-    sample['q']=[.1]*10
-    start_return(arm)
-    if failure=='stale': advance(201,fresh=False); arm.tick()
-    elif failure=='out_of_envelope': sample['q']=[.5]*10; arm.tick()
-    else:
-        if failure=='moving': sample['dq']=[.1]*10
-        for _ in range(700): advance(10,follow=failure!='not_arrived'); arm.tick()
-    assert arm._operation['state']=='failed' and not sdk
-    for _ in range(300): advance(10); arm.tick()
-    assert not sdk
-
-
-def test_stop_during_numerical_preparation_cannot_restart_return(tmp_path):
-    _,arm,sample,advance,sdk,_=reset_rig(tmp_path)
-    entered,finish=threading.Event(),threading.Event()
-    def prepare(*args):
-        entered.set(); assert finish.wait(2)
-        return {'lower':[-1.]*10,'upper':[1.]*10}
-    arm.motion_control.solver.joint_envelope=prepare
-    arm.dispatch('operator_reset',{})
-    assert entered.wait(1)
-    arm.dispatch('stop',{})
-    finish.set()
-    for _ in range(40): advance(100); arm.tick(); time.sleep(.001)
-    assert not sdk and arm._operation['action_id'] is None
-    assert arm._operation['state']=='completed'
-
-
-@pytest.mark.parametrize('failure',['missing','joint_order','nonfinite','limit','no_control','solver'])
-def test_invalid_return_setup_has_no_hardware_output(tmp_path,failure):
-    _,arm,sample,advance,sdk,_=reset_rig(tmp_path)
-    from pathlib import Path
-    path=Path(arm.cfg['reset_pose_path']); pose=json.loads(path.read_text())
-    if failure=='missing': path.unlink()
-    elif failure=='no_control': arm.session_id=None; arm._channel_open=False
-    elif failure=='solver': arm.motion_control.solver=None
-    else:
-        if failure=='joint_order': pose['arm_joint_names'].reverse()
-        else: pose['q'][0]=float('nan') if failure=='nonfinite' else 100.
-        path.write_text(json.dumps(pose))
-    result=arm.dispatch('operator_reset',{})
-    for _ in range(100):
-        if not arm._operation or arm._operation['state']=='failed': break
-        time.sleep(.001)
-    assert result.get('error') or arm._operation['state']=='failed'
-    assert not sdk and not arm._channel.writes
-
-
-@pytest.mark.parametrize('action',['stop','confirmation','write_failure'])
-def test_interrupt_running_return_never_sends_99(tmp_path,action):
-    _,arm,sample,advance,sdk,_=reset_rig(tmp_path)
-    sample['q']=[.2]*10
-    start_return(arm)
-    for _ in range(20): advance(10); arm.tick()
-    reference=arm._operation['return_reference'][:]
-    assert 0<reference[0]<.2
-    if action=='stop': arm.dispatch('stop',{})
-    elif action=='confirmation': arm.confirm_operator_reset()
-    else: arm._channel.success=False
-    for _ in range(400): advance(10); arm.tick()
-    assert not sdk
-    assert arm._operation['return_reference']==reference
-    assert arm._operation['state']==('failed' if action=='write_failure' else 'completed')
-
-
-def test_long_return_has_its_own_deadline(tmp_path):
-    _,arm,sample,advance,sdk,_=reset_rig(tmp_path)
-    sample['q'][0]=2.
-    start_return(arm)
-    for _ in range(1100): advance(10); arm.tick()
-    assert arm._operation['state']=='returning' and not sdk
-    for _ in range(1200): advance(10); arm.tick(); time.sleep(.0001)
-    assert arm._operation['return_pose_reached'] and sdk==[99]
-
-
 @pytest.mark.parametrize('buttons', ['xa', 'yb'])
 def test_batched_button_release_restarts_long_press(tmp_path, buttons):
     card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
@@ -446,3 +319,61 @@ def test_batched_button_release_restarts_long_press(tmp_path, buttons):
     assert not events and not sdk
     for _ in range(7): feed(buttons)
     assert events == ['confirm' if buttons == 'xa' else 'reset']
+
+
+@pytest.mark.parametrize('failure', ['none', 'stale', 'moving', 'write', 'idle'])
+def test_reset_matches_canvas_stop_without_pose_or_vendor_action(tmp_path, failure):
+    outcomes = []
+    for action in ('stop', 'operator_reset'):
+        path = tmp_path/action
+        path.mkdir()
+        _, arm, sample, advance, sdk, _ = reset_rig(path)
+        arm.cfg['reset_pose_path'] = str(path/'does-not-exist.json')
+        arm.arm_client.RequestReset = lambda: pytest.fail('Reset must not send 99')
+        sample['q'] = [.17]*10
+        if failure == 'idle':
+            arm.session_id = arm.secret = None
+            arm._channel_open = False
+        if failure == 'write': arm._channel.success = False
+        if failure == 'moving': sample['dq'] = [.03]*10
+        result = arm.dispatch(action, {})
+        if failure == 'stale':
+            advance(400, fresh=False); arm.tick()
+        elif failure != 'idle':
+            for _ in range(110): advance(100, follow=False); arm.tick()
+        op = arm._operation or result
+        outcomes.append((op['state'], op.get('reason'), op.get('authority_released'),
+                         arm.status()['ownership_held'], arm._channel.writes))
+        assert not sdk and op.get('action_id') is None and not op.get('request_sent')
+        assert all(q == [.17]*10 for q, _, _ in arm._channel.writes)
+        if failure in ('none', 'idle'):
+            assert op['state'] == 'completed' and op['authority_released']
+            assert not arm.status()['ownership_held']
+        else:
+            assert op['state'] in ('failed', 'unknown') and not op['authority_released']
+    assert outcomes[0] == outcomes[1]
+
+
+def test_reset_without_ownership_keeps_input_running(tmp_path):
+    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
+    arm.session_id = arm.secret = None
+    arm._channel_open = False
+    card.mapping.anchor = {'old': True}
+    for _ in range(11): feed('yb')
+    assert card._reason == 'waiting_baseline_confirmation'
+    assert card._reset_operation is None and not card._closed.is_set()
+    assert card.binding and card.mapping.anchor is None and card._needs_calibration
+    assert not sdk and not arm._channel.writes
+
+
+def test_reset_waits_for_confirmed_handback_even_after_input_recovers(tmp_path):
+    card, arm, sample, advance, sdk, feed = reset_rig(tmp_path)
+    sample['dq'] = [.03]*10
+    for _ in range(11): feed('yb')
+    for _ in range(50): feed('yb'); arm.tick()
+    assert card._reason == 'resetting'
+    assert arm.status()['ownership_held'] and not arm._operation['authority_released']
+    sample['dq'] = [0.]*10
+    for _ in range(8): feed('yb'); arm.tick()
+    assert card._reason == 'waiting_baseline_confirmation'
+    assert not arm.status()['ownership_held'] and not sdk

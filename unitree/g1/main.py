@@ -87,6 +87,10 @@ class G1DeviceBundle:
         self._plugins: list = []
         self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
+        self._low_state = None
+        if plugins_cfg.get('state', {}).get('enabled', False) or cfg.get('teleop_control', {}).get('enabled', False):
+            from low_state import LowStateSource
+            self._low_state = LowStateSource()
         camera_plugin = None
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
@@ -119,13 +123,10 @@ class G1DeviceBundle:
             from device import LocoStatePlugin, LocoPlugin, StatePlugin
             loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)
             self._plugins.append(loco_state)
-            # StatePlugin owns the rt/lowstate subscription that posture is derived
-            # from. LocoPlugin needs it to tell lying from squatting once the robot
-            # is limp (FSM 0/1), so build it first when it is enabled and reuse the
-            # same instance rather than opening a second high-rate subscription.
+            # LocoPlugin reuses StatePlugin's posture computed from the shared source.
             posture_source = None
             if plugins_cfg.get("state", {}).get("enabled", False):
-                state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor)
+                state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, low_state=self._low_state)
                 self._plugins.append(state_plugin)
                 posture_source = state_plugin.node
                 print("[bundle] StatePlugin loaded (posture source for LocoPlugin)")
@@ -196,7 +197,7 @@ class G1DeviceBundle:
                 raise ValueError('teleop_control requires arm plugin')
             effective = dict(control_cfg)
             effective['servo_position'] = True
-            stream = ArmStreamExecutor(effective, namespace, arm_client)
+            stream = ArmStreamExecutor(effective, namespace, arm_client, low_state=self._low_state)
             motion = MotionControl(dict(effective), stream)
             stream.motion_control = motion
             arm._stream = stream
@@ -233,7 +234,7 @@ class G1DeviceBundle:
             # posture source — a second instance would duplicate the rt/lowstate
             # subscription and clash on the ROS node name.
             if not any(isinstance(p, StatePlugin) for p in self._plugins):
-                self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
+                self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, low_state=self._low_state))
                 print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
@@ -305,6 +306,8 @@ class G1DeviceBundle:
             print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, loco={'yes' if loco_plugin else 'no'})")
 
     def start_all(self) -> None:
+        if self._low_state is not None:
+            self._low_state.start()
         for i, p in enumerate(self._plugins):
             try:
                 p.start()
@@ -325,6 +328,9 @@ class G1DeviceBundle:
         remaining_plugins = [p for p in other_plugins if p not in point_plugins]
         for p in capture_plugins + point_plugins + remaining_plugins:
             p.stop()
+        # Keep feedback alive until every control owner has completed its stop.
+        if self._low_state is not None:
+            self._low_state.stop()
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:

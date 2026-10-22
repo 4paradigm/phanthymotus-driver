@@ -101,6 +101,65 @@ def test_stale_and_connection_reset_cannot_reuse_ready(tmp_path):
     with pytest.raises(ValueError, match='old_input_generation'): feed(4, True, connection_epoch=1)
 
 
+def test_expired_display_keeps_geometry_and_timestamps_without_outputs(tmp_path):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2)
+    motion._visualization['valid_until_ns'] = card.clock()-1
+    before = copy.deepcopy(motion._visualization)
+    display = card.display_feedback()
+    visual = display['visualization']
+    assert visual['available'] and visual['stale'] and not visual['feedback_fresh']
+    assert display['alignment'] == {'state':'unavailable', 'ready':False}
+    for field in ('ik', 'measured', 'sampled_ns', 'valid_until_ns', 'intent_received_ns', 'source_sequence'):
+        assert visual[field] == before[field]
+    assert not outputs and motion._visualization == before
+
+
+def test_refresh_expired_preview_freezes_existing_display_only(tmp_path):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2)
+    deadline = card.clock()-1
+    motion._intent['valid_until_ns'] = motion._visualization['valid_until_ns'] = deadline
+    before = copy.deepcopy(motion._visualization)
+    motion._refresh_snapshot()
+    display = card.display_feedback()['visualization']
+    for field in ('ik', 'measured', 'sampled_ns', 'valid_until_ns', 'intent_received_ns', 'source_sequence'):
+        assert display[field] == before[field]
+    assert display['stale'] and not display['feedback_fresh'] and not outputs
+
+
+@pytest.mark.parametrize('boundary', ['closed', 'missing', 'input_stale', 'tracking', 'identity', 'calibration', 'mapping', 'cancel'])
+def test_display_does_not_retain_across_non_expiry_boundaries(tmp_path, boundary):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2)
+    motion._visualization['valid_until_ns'] = card.clock()-1
+    if boundary == 'closed': card._closed.set()
+    elif boundary == 'missing': card._latest = None
+    elif boundary == 'input_stale': card._latest['received_monotonic_ns'] -= 301_000_000
+    elif boundary == 'tracking': card._latest['left']['tracked'] = False
+    elif boundary == 'identity': card._input_changed = True
+    elif boundary == 'calibration': card._needs_calibration = True
+    elif boundary == 'mapping': card.mapping.epoch += 1
+    else: motion.cancel_pending()
+    display = card.display_feedback()
+    assert not display['visualization']['available']
+    assert all(not display['visualization'][key] for key in ('ik','measured','command','targets','torso'))
+    assert display['alignment'] == {'state':'unavailable', 'ready':False} and not outputs
+
+
+def test_unreachable_result_never_borrows_expired_ik(tmp_path):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2)
+    motion._intent['valid_until_ns'] = card.clock()-1
+    motion._decision = {'state':'error', 'reason':'ik_unreachable'}
+    unreachable = aligned_display()
+    unreachable['ik'] = []
+    unreachable['alignment'].update(state='unreachable', ready=False)
+    motion.solver.render = lambda *args: {'poses':[[0,0,0,0,0,0,1]]*2, 'visualization':unreachable}
+    motion._refresh_snapshot()
+    assert card.display_feedback()['visualization']['ik'] == [] and not outputs
+
+
 def test_g1_feedback_passes_current_pico_consumer(tmp_path):
     root = os.environ.get('PICO_DRIVER_ROOT')
     if not root: pytest.skip('set PICO_DRIVER_ROOT to the paired PR329 checkout')

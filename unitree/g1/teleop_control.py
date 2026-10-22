@@ -382,8 +382,10 @@ class TeleopControl:
         self.executor.cancel_preparation()
         result = self.executor.dispatch('operator_reset', {})
         if result.get('error'): raise ValueError(result['error'])
-        self._reset_operation = result['operation_id']
+        self._reset_operation = result.get('operation_id')
         self._state, self._reason = 'hold', 'resetting'
+        if result['state'] == 'completed':
+            self._complete_reset(result)
 
     def _poll_reset(self):
         result = self.executor.dispatch('finish_status', {'operation_id': self._reset_operation})
@@ -391,14 +393,17 @@ class TeleopControl:
             self._reset_operation = None
             raise ValueError(result.get('reason') or result.get('error') or 'reset_failed')
         if result['state'] == 'completed':
-            if not result.get('request_sent') or not result.get('authority_released'):
-                raise ValueError('reset_request_unconfirmed')
-            self._reset_operation = None
-            stamp = self._latest['received_monotonic_ns']
-            self._buttons['confirm'] = (stamp, stamp, True)
-            self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
+            self._complete_reset(result)
         else:
             self._state, self._reason = 'hold', 'resetting'
+
+    def _complete_reset(self, result):
+        if not result.get('authority_released') or self.executor.status()['ownership_held']:
+            raise ValueError('reset_release_unconfirmed')
+        self._reset_operation = None
+        stamp = self._latest['received_monotonic_ns']
+        self._buttons['confirm'] = (stamp, stamp, True)
+        self._state, self._reason = 'ready', 'waiting_baseline_confirmation'
 
     def step(self):
         try:
@@ -540,17 +545,21 @@ class TeleopControl:
             self._latest_fresh()
             valid = (not self._closed.is_set() and not self._needs_calibration
                 and not self._input_changed
-                and visual.get('mapping_epoch') == self.mapping.epoch
-                and 0 <= now-visual.get('sampled_ns', 0) <= 200_000_000
-                and now < visual.get('valid_until_ns', 0))
+                and visual.get('mapping_epoch') == self.mapping.epoch)
         except ValueError:
             valid = False
         if not valid:
-            visual.update(available=False, ik=[])
+            visual.update(available=False, stale=False, measured=[], ik=[], command=[], targets=[], torso=[])
             alignment = {'state': 'unavailable', 'ready': False}
         else:
             visual['intent_age_ms'] = max(0., (now-visual['intent_received_ns'])/1e6)
-            if self._enabled and alignment['state'] not in ('unavailable', 'unreachable'):
+            visual['stale'] = (visual.get('stale') is True or not 0 <= now-visual.get('sampled_ns', 0) <= 200_000_000
+                               or now >= visual.get('valid_until_ns', 0))
+            if visual['stale']:
+                visual['feedback_fresh'] = False
+                visual['feedback_age_ms'] = max(0., (now-visual.get('sampled_ns', 0))/1e6)
+                alignment = {'state': 'unavailable', 'ready': False}
+            elif self._enabled and alignment['state'] not in ('unavailable', 'unreachable'):
                 alignment.update(state='active', ready=False)
         return {'visualization': visual, 'alignment': alignment}
 

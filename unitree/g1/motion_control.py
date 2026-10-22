@@ -321,12 +321,25 @@ class MotionControl:
                 if not self._snapshot or self._snapshot['monotonic_ns'] != stamp: self._state_seq += 1
                 self._snapshot = {'poses':rendered['poses'],**self.versions,
                     'monotonic_ns':stamp,'state_seq':self._state_seq}
-            self._visualization = rendered['visualization']
             intent = self._intent
-            if intent and self.gate.clock() < intent['valid_until_ns']:
+            expired = intent and (self.gate.clock() >= intent['valid_until_ns'] or rendered['poses'] is None)
+            if (expired and rendered['visualization'].get('available')
+                    and rendered['visualization'].get('alignment', {}).get('state') != 'unreachable'
+                    and (self._decision.get('state') != 'error' or self._decision.get('reason') == 'command_expired')
+                    and self._visualization.get('available') and self._visualization.get('ik')
+                    and self._visualization.get('mapping_epoch') == intent['mapping_epoch']):
+                # Freeze the display sample, including its original timestamps; execution never reads it.
+                self._visualization = {**self._visualization, 'stale':True, 'feedback_fresh':False,
+                                       'alignment':{'state':'unavailable', 'ready':False}}
+                return
+            self._visualization = rendered['visualization']
+            if intent:
                 self._visualization.update(source_sequence=intent['source_seq'], mapping_epoch=intent['mapping_epoch'],
                     sampled_ns=stamp if rendered['poses'] is not None else 0,
                     intent_received_ns=intent['generated_ns'], valid_until_ns=intent['valid_until_ns'])
+                if expired:
+                    self._visualization.update(stale=True, feedback_fresh=False,
+                                               alignment={'state':'unavailable', 'ready':False})
             else:
                 self._visualization.update(ik=[], alignment={'state': 'unavailable', 'ready': False})
 

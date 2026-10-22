@@ -11,19 +11,19 @@
 3. 启动项目。确认机器人和操作者的双臂自然下垂，松开双握把，长按左 X + 右 A 一秒。保持按钮直到基准建立；模型首次准备可能需要数秒。Driver 只在这次明确确认后采集实际姿态建立映射，不在首帧自动标定。
 4. 松开按钮，再按下双握把接通。握把按下时的新目标必须通过 IK、输入时效和执行门禁。末端对齐误差仅供显示，不再作为接通条件。
 5. 松开任一握把暂停输出并继续预览。再次接通需新一次双握；沿用原映射基准。输入中断或 IK 失败后不自动恢复；设备连接或跟踪空间改变后需再次确认双方下垂姿态并长按 X+A。
-6. 需要复位时，松开双握把，长按左 Y + 右 B 一秒。每次按住只触发一次。Driver 取消旧映射和待发目标，在已有运动租约内，将关节参考目标移向通用初始姿态，参考目标变化速度不超过 0.1 rad/s。实测到位并稳定后，执行两秒权重交还和五次零权重写入，再通过 SDK 的 no-reply RPC 发送动作99。
-7. 请求写入 DDS 成功后，Driver 立即显示 `waiting_baseline_confirmation`。操作员现场判断复位结果，确认机器人与操作者双臂下垂后，长按 X+A 建立新映射，松键并重新双握。Driver 只自动确认发送99前的回位，不确认原厂 Reset 的物理完成，也不自动接通。
-8. 从 Canvas 停止项目。独立调用 `arm.release` 会取消遥操并关闭输入，之后需从 Canvas 重新启动项目。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
+6. 需要清除遥操状态时，松开双握把，长按左 Y + 右 B 一秒。每次按住只触发一次。Driver 停止接收旧目标，清除映射并停止录制，复用 Canvas 停止流程：两秒内降低 SDK 控制权重，完成五次零权重写入，并通过新鲜反馈确认交权。Reset 不主动移动到指定姿态，不读取 reset_pose.json，也不发送动作99。
+7. 交权确认后显示 `waiting_baseline_confirmation`。设备输入和 Driver 保持运行。确认机器人与操作者双臂自然下垂后，长按 X+A 建立新映射，松键并重新双握。不会自动重新接通。未持有控制权时直接清除遥操状态；反馈过期、写入失败或交权超时保留失败，不显示完成。
+8. 从 Canvas 停止项目会关闭遥操输入。独立调用 `arm.release` 也会取消遥操并关闭输入，之后需从 Canvas 重新启动项目。Driver 重启后需停止再启动项目恢复绑定，无需删线重连。
 
-Reset 使用 [宇树手臂动作接口](https://support.unitree.com/home/en/G1_developer/arm_action_interface) 的 **Recover Initial Arm Pose（99）**。`RequestReset()` 复用 SDK `_CallNoReply`，返回0只表示本地 DDS 写入成功，不表示服务端接受或物理复位成功。无匹配订阅者、DDS 写入异常等发送失败保留错误，不自动重试。服务端执行失败不会经此 no-reply 调用返回，由操作员现场判断；不自动启停厂商服务。
-
-遥操 Reset 的回执含 `operator_reset=true`、`return_pose_reached=true`、`request_sent=true`；发送阶段完成后 `state=completed`、`authority_released=true`，但 `physical_confirmed=false`、`return_completed=false`。Driver 清理旧租约、待发目标、proof 和 release_requested，关闭旧发送通道。`X+A` 只建立新基准，仍需新一次双握才申请新的运动租约。基准确认不检查静止阈值；反馈新鲜度、跟踪、IK 和接通执行检查继续生效。独立 `arm.release` 与轨迹停止仍保留原完成判据。
-
-通用初始姿态保存在 [`reset_pose.json`](reset_pose.json)，所有采用当前10关节 G1 执行器的设备共用。数值来自2026-10-19操作员指定姿态的78帧直接DDS采样中位数，不是 X+A 的遥操映射基准。默认配置 `teleop_control.reset_pose_path` 指向镜像内 `/work/motion/reset_pose.json`；未设置此字段时使用随程序打包的文件。执行器检查关节顺序、有限数值和模型限位，不把该文件当作其他型号或关节布局的适配证明。
-
-回位前，数值进程通过现有 `joint_envelope` 检查整段关节区间；几何碰撞检查沿用当前 profile 的开关。执行线程只消费该区间，不运行数值求解。回位使用新鲜反馈，确认所有关节误差不超过0.02 rad、速度不超过0.02 rad/s且位置稳定100 ms后才交权。每次积分最多使用50 ms，超时按初始最大关节距离/0.1加5秒计算。没有已有运动租约、文件错误、反馈过期、区间检查失败或回位超时均不发送99。停止或 X+A 会取消尚未发送的99并终止回位，继续原有交权流程。
+Reset 使用与 Canvas 相同的 `holding → handback → confirming_handback → awaiting_feedback → completed` 交权流程。回执 `action_id=null`、`request_sent=false`；持有控制权时，只有确认交权才返回 `authority_released=true` 和执行器 `idle/release_confirmed`。没有控制权的空操作返回 `no_op=true`，不制造新的运动租约。独立 `arm.release` 的厂商动作行为保持原样。
 
 G1 SDK的订阅使用独立读取线程和DDS WaitSet等待数据；消息读取、Python反序列化及业务回调不再占用共享DDS接收线程。现有queueLen和队列丢弃语义保持。关闭订阅时先唤醒并结束读取线程，再释放DataReader。LowState 与运动状态订阅使用 DDS `KeepLast(1)`，不进入SDK回调队列。反馈回调使用独立锁，不等待执行器锁。LowState 年龄同时依据设备 tick 的推进计算；延迟收到旧状态不会把它标记为新状态。首次样本仍以接收时间建立时钟基准，不能据此证明首次样本的绝对源时间。
+
+Bundle 通过 `LowStateSource` 为遥操和状态卡持有唯一的 `rt/lowstate` 订阅。SDK 只解码一次，缓存完整消息、设备 tick、源时间和接收时间；手臂读取这份快照，接管通道初始化也复用200 ms内的新鲜样本并保留关节使能和型号字段校验，状态卡通过现有 ROS 定时器按20 Hz发布IMU、每两份新样本按10 Hz发布关节和姿态。消费者不修改原消息，也不刷新源时间。关闭状态卡不影响手臂；停止手臂不关闭共享源。Bundle 完成各控制入口的停止后才关闭共享源，重启源时先清空旧快照。电池和主板订阅保持独立。真实手臂仍检查FSM新鲜度和允许模式，并保留外部控制观测；测试用 `snapshot=` 不能与共享源混用。
+
+预览仅因时间过期时保留同一映射内的旧骨架。`visualization.available` 表示有可绘制数据，`visualization.stale=true` 表示历史快照；此时 `feedback_fresh=false`、对齐状态为 `unavailable`，序号及原时间戳不变，反馈年龄继续增长。旧骨架不参与目标执行，也不延长命令有效期。输入断开或跟踪丢失、会话或映射变化、重新标定及明确停止仍清空预览；不可达结果不借用旧IK骨架。PICO 消费端必须区分“可绘制”和“实时可用”。
+
+`tests/validate_shared_lowstate.py` 使用独立进程发布合成1000 Hz DDS数据，检查单订阅、ROS输出频率、源年龄和关闭重建。仅在 `--network none --read-only` 且无设备映射的测试容器中运行，并设置 `G1_TELEOP_ISOLATED_TEST=1`；该检查不连接机器人，也不替代现场闪烁验收。
 
 原厂99发出后没有可靠取消接口；发送期间发生停止或输入中断时，不得声称动作已经取消。
 

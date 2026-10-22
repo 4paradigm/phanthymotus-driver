@@ -226,7 +226,8 @@ class ArmSdkChannel:
 
     def __init__(self, *, send_crc: bool = True, grippers: bool = True,
                  waist: bool = False, driven_arm_ids=None,
-                 driven_waist_names=None):
+                 driven_waist_names=None, low_state=None):
+        self._low_state = low_state
         self._send_crc = bool(send_crc)
         self._grippers = bool(grippers)
         self._waist = bool(waist)
@@ -359,42 +360,48 @@ class ArmSdkChannel:
         「用零位兜底」好，理由和这个仓库里每一条「拒绝而不是猜」一样：猜错的代价
         不是一条报错，是手臂以 kp=300 甩到一个没人要求过的位置。
         """
-        from unitree_sdk2py.core.channel import ChannelSubscriber
-        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+        if self._low_state is not None:
+            sample = self._low_state.snapshot()
+            if sample is None or not 0 <= time.monotonic_ns()-sample.sampled_ns <= 200_000_000:
+                raise RuntimeError('arm_feedback_stale')
+            frame = sample.message
+        else:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 
-        received: dict = {}
+            received: dict = {}
 
-        def _on_state(message):
-            if "m" not in received:
-                received["m"] = message
+            def _on_state(message):
+                if "m" not in received:
+                    received["m"] = message
 
-        # **只要一帧，拿到就关。** 留着它意味着一条 500 Hz 的订阅活到进程结束，
-        # 而这个仓库里「孤儿订阅」的历史是：卡片 stop 之后回调还在跑，图看着健康，
-        # 全栈订阅却在某一次 teardown 顺序错误时一起停摆。
-        subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
-        subscriber.Init(_on_state, 10)
-        try:
-            deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
-            while "m" not in received and time.monotonic() < deadline:
-                time.sleep(0.01)
-        finally:
-            # SDK 的 `Close()` 是 `del self.__reader` 然后置 None，而 DDS 的回调
-            # 可能正在飞 —— 那会在日志里留一条 `'NoneType' object has no attribute
-            # 'take'`。**这是 SDK 自己的 teardown 竞态，不是我们的错**，而且确定性地
-            # 关掉比让它被 GC 回收要好：窗口从「不确定」缩到几微秒，且只有一次。
+            # **只要一帧，拿到就关。** 留着它意味着一条 500 Hz 的订阅活到进程结束，
+            # 而这个仓库里「孤儿订阅」的历史是：卡片 stop 之后回调还在跑，图看着健康，
+            # 全栈订阅却在某一次 teardown 顺序错误时一起停摆。
+            subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
+            subscriber.Init(_on_state, 10)
             try:
-                subscriber.Close()
-            except Exception:  # noqa: BLE001 —— 关不掉也不能挡住启动
-                pass
+                deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
+                while "m" not in received and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                # SDK 的 `Close()` 是 `del self.__reader` 然后置 None，而 DDS 的回调
+                # 可能正在飞 —— 那会在日志里留一条 `'NoneType' object has no attribute
+                # 'take'`。**这是 SDK 自己的 teardown 竞态，不是我们的错**，而且确定性地
+                # 关掉比让它被 GC 回收要好：窗口从「不确定」缩到几微秒，且只有一次。
+                try:
+                    subscriber.Close()
+                except Exception:  # noqa: BLE001 —— 关不掉也不能挡住启动
+                    pass
 
-        if "m" not in received:
-            raise RuntimeError(
-                f"{self.LOW_STATE_TIMEOUT_S:g} 秒内没有收到 {LOW_STATE_TOPIC} —— "
-                "拿不到实测关节角就不能接管手臂（指令里 q 的默认值 0.0 是「去零位」，"
-                "不是「不动」）。检查 NETWORK_INTERFACE 和机器人是否上电"
-            )
+            if "m" not in received:
+                raise RuntimeError(
+                    f"{self.LOW_STATE_TIMEOUT_S:g} 秒内没有收到 {LOW_STATE_TOPIC} —— "
+                    "拿不到实测关节角就不能接管手臂（指令里 q 的默认值 0.0 是「去零位」，"
+                    "不是「不动」）。检查 NETWORK_INTERFACE 和机器人是否上电"
+                )
 
-        frame = received["m"]
+            frame = received["m"]
         # 型号握手用的两个字段，和实测角来自同一帧。
         self._mode_machine = int(getattr(frame, "mode_machine", 0))
         self._mode_pr = int(getattr(frame, "mode_pr", 0))

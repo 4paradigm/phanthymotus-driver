@@ -141,3 +141,51 @@ def test_bundle_shutdown_cleans_all_owners_even_after_failure(failure):
     else:
         exec(code, namespace)
     assert calls == ['cards', 'bus', 'safety', 'loco', 'executor', 'ros']
+
+
+@pytest.mark.parametrize('state,teleop,loco', [(s,t,l) for s in (False,True) for t in (False,True) for l in (False,True)])
+def test_bundle_owns_one_source_independent_of_display_and_arm(monkeypatch, state, teleop, loco):
+    import ast
+    tree = ast.parse((DRIVER/'main.py').read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'G1DeviceBundle')
+    namespace = {n:object for n in ('AudioClient','RpcProxy','G1ArmActionClient','SlamClient')}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(DRIVER/'main.py'), 'exec'), namespace)
+    events, sources, displays, arms = [], [], [], []
+    class Source:
+        def __init__(self): sources.append(self)
+        def start(self): events.append('source_start')
+        def stop(self): events.append('source_stop')
+    class Plugin:
+        PREFIX = 'other'
+        def __init__(self, *args, **kwargs): self.node = object()
+        def start(self): events.append('consumer_start')
+        def stop(self): events.append('consumer_stop')
+    class Arm(Plugin): PREFIX = 'arm'
+    class State(Plugin):
+        def __init__(self, *args, low_state):
+            super().__init__(); self.low_state = low_state; displays.append(self)
+    class Stream:
+        def __init__(self, *args, low_state): self.low_state = low_state; arms.append(self)
+    for name, attrs in {
+        'low_state': {'LowStateSource':Source},
+        'device': {'ArmActionPlugin':Arm, 'StatePlugin':State, 'LocoStatePlugin':Plugin,
+                   'LocoPlugin':Plugin, '_loco_acp_notify':lambda *a,**k:None},
+        'arm_stream': {'ArmStreamExecutor':Stream},
+        'motion_control': {'MotionControl':Plugin},
+        'teleop_control': {'TeleopControl':Plugin},
+        'teleop_bus': {'TeleopBus':Plugin},
+    }.items(): monkeypatch.setitem(sys.modules, name, SimpleNamespace(**attrs))
+    cfg = {'plugins':{'state':{'enabled':state}, 'loco':{'enabled':loco}, 'arm':{'enabled':teleop},
+                      'smart_motion':{'enabled':False}}, 'teleop_control':{'enabled':teleop}}
+    bundle = namespace['G1DeviceBundle'](cfg,'offline',None,None,None,None,None)
+    assert len(sources) == int(state or teleop)
+    assert len(displays) == int(state) and len(arms) == int(teleop)
+    assert all(c.low_state is bundle._low_state for c in displays+arms)
+    bundle.start_all(); bundle.stop_all()
+    if sources: assert events[0] == 'source_start' and events[-1] == 'source_stop'
+    else: assert not any(e.startswith('source') for e in events)
+    if sources and bundle._plugins:
+        events.clear()
+        bundle._plugins[-1].stop = lambda: (_ for _ in ()).throw(RuntimeError('stop_unconfirmed'))
+        with pytest.raises(RuntimeError, match='stop_unconfirmed'): bundle.stop_all()
+        assert 'source_stop' not in events

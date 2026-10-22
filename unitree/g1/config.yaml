@@ -138,5 +138,4 @@ teleop_control:
   # Internal deployment setting; Canvas users do not select an execution mode.
   mode: live
   calibration_path: /work/motion/body23_fixed_hand.json
-  reset_pose_path: /work/motion/reset_pose.json
   position_scale: 1.0
