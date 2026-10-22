@@ -314,6 +314,11 @@ class TestDriverContracts(unittest.TestCase):
         proxy = _Proxy()
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
 
+        height_schema = plugin.get_tool()["inputSchema"]["properties"]["height"]
+        self.assertEqual(0.17, height_schema["minimum"])
+        self.assertEqual(0.50, height_schema["maximum"])
+        self.assertEqual(0.01, height_schema["multipleOf"])
+
         result = plugin.dispatch("body_height", {"height": 0.35})
         self.assertTrue(result["accepted"])
         self.assertEqual(0.35, result["sdk_height_m"])
@@ -2308,17 +2313,68 @@ class TestDriverContracts(unittest.TestCase):
             data=data, format=image_format,
             header=types.SimpleNamespace(stamp=stamp))
 
-    def test_vision_capture_schema_uses_fixed_front_camera(self):
+    def test_vision_capture_schema_exposes_timed_and_continuous_recording(self):
         plugin = self._vision_plugin("/tmp/unused")
         tool = plugin.get_tool()
         self.assertEqual("actuator", tool["type"])
         self.assertEqual(
-            ["start", "capture_photo", "record_video", "info", "stop"],
+            ["capture_photo", "record_video", "start_recording",
+             "stop_recording", "list", "delete", "info", "start", "stop"],
             tool["inputSchema"]["properties"]["action"]["enum"])
         self.assertEqual(["record_video"],
                          tool["inputSchema"]["x-completion"]["actions"])
         self.assertEqual(55, tool["inputSchema"]["x-completion"]["timeout"])
         self.assertEqual("front", plugin._source()["camera"])
+
+    def test_vision_capture_named_media_list_and_delete(self):
+        with tempfile.TemporaryDirectory() as output:
+            plugin = self._vision_plugin(output)
+            photos = Path(output) / "photos"
+            videos = Path(output) / "videos"
+            photos.mkdir()
+            videos.mkdir()
+            (photos / "desk.jpg").write_bytes(b"jpeg")
+            (videos / "walk.mp4").write_bytes(b"video")
+            (photos / "ignore.txt").write_text("ignore")
+
+            listed = plugin.dispatch("list", {})
+            self.assertEqual(
+                {"desk.jpg", "walk.mp4"},
+                {item["filename"] for item in listed["files"]})
+            deleted = plugin.dispatch("delete", {"name": "desk.jpg"})
+            self.assertEqual("deleted", deleted["state"])
+            self.assertFalse((photos / "desk.jpg").exists())
+            self.assertEqual(
+                "INVALID_MEDIA_NAME",
+                plugin.dispatch("delete", {"name": "../walk.mp4"})["code"])
+
+    def test_stop_recording_finishes_instead_of_cancelling(self):
+        plugin = self._vision_plugin("/tmp/unused")
+        action_id = "continuous-1"
+
+        class FinishingThread:
+            def join(_self, timeout=None):
+                plugin._last_recording = {
+                    "action_id": action_id,
+                    "status": "completed",
+                    "result": {"ok": True, "file_path": "/tmp/video.mp4"},
+                }
+                plugin._active_recording = None
+
+        active = {
+            "action_id": action_id,
+            "notify_acp": False,
+            "finish": threading.Event(),
+            "cancel": threading.Event(),
+            "thread": FinishingThread(),
+            "state": "recording",
+        }
+        plugin._active_recording = active
+        result = plugin.dispatch("stop_recording", {})
+        self.assertTrue(active["finish"].is_set())
+        self.assertFalse(active["cancel"].is_set())
+        self.assertEqual("recorded", result["state"])
+        self.assertEqual("/tmp/video.mp4", result["file_path"])
 
     def test_vision_capture_filters_invalid_and_stale_jpegs(self):
         plugin = self._vision_plugin("/tmp/unused")

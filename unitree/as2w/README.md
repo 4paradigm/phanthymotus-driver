@@ -40,8 +40,9 @@ be invoked with a clear area and appropriate operator approval.
 The call-shaped `loco.move` card follows the AS2 convention used by PR #308:
 public `vyaw` is degrees per second in the range +/-120 and is converted once
 to radians per second at the Unitree SDK boundary. `body_height` is an absolute
-AS2 target in the tested 0.17-0.50 m range and is accepted only from a standing,
-non-walking state. This command target is separate from `loco_state.body_height`,
+AS2 target in the tested 0.17-0.50 m range, uses a 0.01 m canvas adjustment
+step, and is accepted only from a standing, non-walking state. This command
+target is separate from `loco_state.body_height`,
 whose observed telemetry range is approximately 0-0.4 m. `Damp` and `Euler`
 remain available inside the vendor SDK but are intentionally not exposed as
 card actions. After `StopMove`, the driver uses `BalanceStand` to normalize
@@ -212,15 +213,20 @@ and `stop` response makes that split explicit with `always_on=true`,
 `/<namespace>/camera/front` JPEG stream; it never creates another Unitree
 `VideoClient` or calls `videohub` itself. `capture_photo` waits for a frame
 that arrived after the request and stores it under
-`/opt/phanthy-motus/data/vision_capture/photos`. `record_video` returns an
-action ID and destination path immediately, then uses FFmpeg at the configured
-8 FPS to create a silent H.264 MP4 under the sibling `videos` directory. Only
-one recording can run at a time. Completion, cancellation, and encoding errors
-are reported through ACP; failed or cancelled files are removed. `stop`
-cancels the active recording, while `info` reports camera freshness, encoder
+`/opt/phanthy-motus/data/vision_capture/photos`. Optional `photo_name` and
+`video_name` values provide safe custom names without the extension.
+`record_video` returns an action ID and destination path immediately, then uses
+FFmpeg at the configured 8 FPS to create a fixed-duration silent H.264 MP4 under
+the sibling `videos` directory. `start_recording` begins a continuous silent
+recording and `stop_recording` finishes and preserves it; the lifecycle `stop`
+instead cancels active work and removes the incomplete file. `list` enumerates
+saved JPG/MP4 media and `delete` removes one complete filename. Only one
+recording can run at a time. Timed completion, cancellation, and encoding
+errors are reported through ACP. `info` reports camera freshness, encoder
 availability, and the latest recording result. The runtime image installs both
 `ffmpeg` and its companion `ffprobe`; completed files are checked for one H.264
-video track, no audio track, requested duration, and expected frame count.
+video track and no audio track. Fixed recordings additionally verify requested
+duration and expected frame count.
 The existing `/opt/phanthy-motus/data` deployment mount persists both folders.
 
 `remote_controller` is a read-only LowState view. The existing shared
