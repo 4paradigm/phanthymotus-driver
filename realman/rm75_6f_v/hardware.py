@@ -98,6 +98,10 @@ class RM75SDKClient:
             handle = robot.rm_create_robot_arm(self.ip, self.port)
             if handle is None or int(getattr(handle, "id", -1)) < 0:
                 bad_id = getattr(handle, "id", None)
+                try:
+                    robot.rm_delete_robot_arm()
+                except Exception:
+                    pass
                 self._handle = None
                 self._robot = None
                 self._last_connection_error = (
@@ -140,7 +144,18 @@ class RM75SDKClient:
         with self._lock:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
-            return _sdk_result(method, getattr(self._robot, method)(*args))
+            try:
+                return _sdk_result(method, getattr(self._robot, method)(*args))
+            except RuntimeError as exc:
+                if "code -2" in str(exc) and self._protected_owner is None:
+                    try:
+                        self.stop()
+                        self.ensure_connected()
+                        if self._robot is not None:
+                            return _sdk_result(method, getattr(self._robot, method)(*args))
+                    except Exception:
+                        pass
+                raise
 
     def upload_recording(self, path, speed, slot, run=False):
         self._check_owner()
@@ -204,6 +219,14 @@ class RM75SDKClient:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
             code = int(getattr(self._robot, method)(*args))
+            if code == -2 and self._protected_owner is None and _owner is None:
+                try:
+                    self.stop()
+                    self.ensure_connected()
+                    if self._robot is not None:
+                        code = int(getattr(self._robot, method)(*args))
+                except Exception:
+                    pass
             if code != 0:
                 raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
             return code
