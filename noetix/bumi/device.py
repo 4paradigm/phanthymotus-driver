@@ -617,9 +617,20 @@ class LocoPlugin:
         This is the single choke point for both cards: `loco_servo` forwards
         through `publish_velocity`, so gating here covers the call-shaped and
         the streaming path with one copy of the rule.
+
+        The latch check and the SDK write share one gate with `trigger`. A
+        check that released it before writing could be overtaken by the latch
+        and still send a non-zero command after the E-stop was set.
         """
-        if self._estop is not None and self._estop.refuses(x, y, z):
-            return False
+        estop = self._estop
+        if estop is None:
+            return self._write_cmd(x, y, z, action_cmd, index)
+        with estop.motion_gate():
+            if estop.refuses(x, y, z):
+                return False
+            return self._write_cmd(x, y, z, action_cmd, index)
+
+    def _write_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0) -> bool:
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_cmd_time

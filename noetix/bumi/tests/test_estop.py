@@ -7,6 +7,8 @@ tests drive `LocoPlugin` directly: a rule that only exists in the card's
 
 import importlib.util
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -150,6 +152,57 @@ def test_stopping_the_card_does_not_release_the_latch(estop):
     card.dispatch('trigger', {})
     assert card.dispatch('stop', {}) == {'state': 'idle'}
     assert latch.latched is True
+
+
+class _BlockingHighCtrl(_FakeHighCtrl):
+    """Parks one non-zero publish inside the SDK call, like a real write."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def publish_cmd(self, x, y, z, action_cmd, index=0):
+        if x or y or z:
+            self.entered.set()
+            if not self.release.wait(2.0):
+                raise AssertionError('test never released the in-flight publish')
+        self.commands.append((x, y, z))
+
+
+def test_latch_waits_for_the_in_flight_publish(device, estop):
+    """The check and the SDK write are one critical section.
+
+    A publisher that had already passed `refuses()` must finish before the
+    latch transition is visible; otherwise one non-zero command is sent after
+    the E-stop. Here the publish is parked inside the SDK call and `trigger`
+    must not complete until it is released.
+    """
+    latch = estop.EmergencyStopLatch()
+    high = _BlockingHighCtrl()
+    loco = device.LocoPlugin({}, 'robot', None, high)
+    loco.attach_estop(latch)
+
+    publisher = threading.Thread(
+        target=lambda: loco._publish_cmd(0.2, 0.0, 0.0, 'DEFAULT'))
+    publisher.start()
+    assert high.entered.wait(2.0), 'publisher never reached the SDK call'
+
+    trigger = threading.Thread(target=lambda: latch.trigger('estop_card', 'race'))
+    trigger.start()
+    time.sleep(0.05)
+    assert trigger.is_alive(), 'trigger overtook an in-flight publish'
+
+    high.release.set()
+    publisher.join(2.0)
+    trigger.join(2.0)
+    assert not publisher.is_alive()
+    assert not trigger.is_alive()
+
+    # The pre-latch command completed, then the latch's own zero; nothing after.
+    assert high.commands == [(0.2, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    assert latch.latched is True
+    assert loco._publish_cmd(0.2, 0.0, 0.0, 'DEFAULT') is False
 
 
 def test_actuator_start_reports_ready(estop):

@@ -1014,8 +1014,18 @@ class LocoServoPlugin:
         separate limiters can interleave inside a single publish, and the SDK
         has no way to tell us that happened.
         """
-        if self._estop is not None and self._estop.refuses(nx, ny, nz):
+        estop = self._estop
+        if estop is None:
+            self._write(nx, ny, nz)
             return
+        # Same gate as `loco`: the fallback below writes straight at the SDK,
+        # so this card's check and write must be one critical section too.
+        with estop.motion_gate():
+            if estop.refuses(nx, ny, nz):
+                return
+            self._write(nx, ny, nz)
+
+    def _write(self, nx: float, ny: float, nz: float):
         try:
             if self._loco is not None and hasattr(self._loco, "publish_velocity"):
                 self._loco.publish_velocity(nx, ny, nz)

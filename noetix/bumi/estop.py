@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from contextlib import contextmanager
 
 CARD_ESTOP = "estop"
 _TOPIC_ESTOP = "/{ns}/state/estop"
@@ -44,7 +45,12 @@ class EmergencyStopLatch:
     """
 
     def __init__(self):
-        self._lock = threading.Lock()
+        # Re-entrant: a publisher holds the gate across `refuses()` (which takes
+        # it again) and the SDK write. `trigger` takes the same lock, so the
+        # latch transition cannot land between a publisher's check and its
+        # write; either the command completes before the latch, or it is
+        # dropped.
+        self._lock = threading.RLock()
         self._latched = False
         self._source = ""
         self._reason = ""
@@ -93,6 +99,18 @@ class EmergencyStopLatch:
             self._reason = ""
             self._since_ms = None
             return True
+
+    @contextmanager
+    def motion_gate(self):
+        """Hold the latch state still across a check-and-publish pair.
+
+        A publisher that only checked `latched` and then released the lock
+        could be overtaken by `trigger` before it reached the SDK — an E-stop
+        that still let one non-zero command through. Publishers therefore wrap
+        both steps in this gate, and `trigger` takes the same lock.
+        """
+        with self._lock:
+            yield
 
     def note_blocked(self) -> None:
         with self._lock:
