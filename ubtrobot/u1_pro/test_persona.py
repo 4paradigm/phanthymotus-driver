@@ -102,6 +102,13 @@ class PersonaCardTests(unittest.TestCase):
         self.assertEqual(tool["name"], "persona")
         params = tool["inputSchema"]["x-action-params"]
         self.assertEqual(params["route"]["params"], ["text"])
+        self.assertEqual(params["start"]["params"], ["input_topic"])
+        self.assertEqual(params["say"]["params"], ["text", "expression"])
+        # every parameter an action lists must exist in the schema, or Agent Core cannot expose it
+        props = tool["inputSchema"]["properties"]
+        for name, entry in params.items():
+            for param in entry["params"]:
+                self.assertIn(param, props, f"{name}: {param}")
         self.assertIn("smile", tool["inputSchema"]["properties"]["expression"]["enum"])
 
     def test_announcement_is_spoken_before_reply_and_serially(self):

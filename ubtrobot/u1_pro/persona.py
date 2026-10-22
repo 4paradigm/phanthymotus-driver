@@ -223,10 +223,10 @@ class PersonaPlugin:
     # ------------------------------------------------------------------ schema
     def get_tool(self):
         actions = {
-            "start": ([], "启动人格卡片；可选 input_topic 连接 asr 卡片的 data/json 输出，自动路由识别结果。"),
+            "start": (["input_topic"], "启动人格卡片；可选 input_topic 连接 asr 卡片的 data/json 输出，自动路由识别结果。"),
             "route": (["text"], "把本轮 ASR 文本交给卡片判定人格。若需切换，卡片会先自行播报身份，"
                                 "之后提交的 say 一定排在播报之后。返回当前人格与风格要求。"),
-            "say": (["text"], "以当前人格播报一段回复（1-3 句），可选 expression；严格串行，不与其他播报并发。"),
+            "say": (["text", "expression"], "以当前人格播报一段回复（1-3 句），可选 expression；严格串行，不与其他播报并发。"),
             "set": (["persona"], "直接切换到指定人格并播报身份（运营/调试用）。"),
             "reset": ([], "清空队列、打断播报并退出人格，不播报。"),
             "interrupt": ([], "立即打断当前播报并清空待播队列。"),
