@@ -49,6 +49,8 @@ class VisionCapturePlugin:
         self._recording_lock = threading.Lock()
         self._active_recording = None
         self._last_recording = None
+        self._response_events = {}
+        self._response_lock = threading.Lock()
         self._executor = executor
         self._closed = False
         self._node = Node("as2w_vision_capture")
@@ -312,6 +314,28 @@ class VisionCapturePlugin:
                 except BlockingIOError:
                     pass
 
+    def response_sent(self, action_id):
+        """Release timed-recording completion after MCP exposes action_id."""
+        with self._response_lock:
+            response_event = self._response_events.pop(action_id, None)
+        if response_event is not None:
+            response_event.set()
+
+    def _video_filter(self, requested_duration):
+        filters = [
+            "scale=out_range=tv",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "setpts=PTS-STARTPTS",
+            f"fps={self._fps}",
+        ]
+        # Fixed recordings need padding to reach their declared exact duration
+        # and are bounded by -frames:v. Continuous recordings have no frame
+        # cap, so infinite tpad would prevent FFmpeg from exiting after stdin
+        # closes when stop_recording is called.
+        if requested_duration is not None:
+            filters.append("tpad=stop_mode=clone:stop=-1")
+        return ",".join(filters)
+
     def _record_video(self, active):
         cancel = active["cancel"]
         finish = active.get("finish") or threading.Event()
@@ -331,10 +355,7 @@ class VisionCapturePlugin:
                     "-framerate", str(self._fps), "-i", "pipe:0", "-an",
                     "-c:v", "libx264", "-preset", "ultrafast",
                     "-threads", "2",
-                    "-vf", ("scale=out_range=tv,"
-                            "pad=ceil(iw/2)*2:ceil(ih/2)*2,"
-                            f"setpts=PTS-STARTPTS,fps={self._fps},"
-                            "tpad=stop_mode=clone:stop=-1"),
+                    "-vf", self._video_filter(requested_duration),
                     *(["-frames:v", str(self._fps * requested_duration)]
                       if requested_duration is not None else []),
                     "-pix_fmt", "yuv420p", "-color_range", "tv",
@@ -502,6 +523,9 @@ class VisionCapturePlugin:
             active["finished"] = True
         try:
             if active.get("notify_acp", True):
+                # Agent Core can only correlate completion after the MCP result
+                # containing this action_id has been sent and registered.
+                active["response_event"].wait()
                 self._notify_complete(active["action_id"], status, result)
         finally:
             with self._recording_lock:
@@ -537,11 +561,17 @@ class VisionCapturePlugin:
                         "message": str(exc)}
             action_id = f"vision_capture_{'continuous' if continuous else 'record_video'}_{uuid4().hex}"
             queued_at = _timestamp()
+            response_event = None
+            if not continuous:
+                response_event = threading.Event()
+                with self._response_lock:
+                    self._response_events[action_id] = response_event
             active = {
                 "action_id": action_id, "state": "recording",
                 "duration_s": requested, "started_at": queued_at,
                 "cancel": threading.Event(), "finish": threading.Event(),
                 "notify_acp": not continuous, "process": None,
+                "response_event": response_event,
                 "source": self._source(), "path": path,
             }
             thread = threading.Thread(
@@ -553,6 +583,9 @@ class VisionCapturePlugin:
                 thread.start()
             except Exception:
                 self._active_recording = None
+                if response_event is not None:
+                    with self._response_lock:
+                        self._response_events.pop(action_id, None)
                 self._remove_partial(path)
                 raise
         return {

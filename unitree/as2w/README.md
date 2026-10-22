@@ -209,6 +209,10 @@ and `stop` response makes that split explicit with `always_on=true`,
 `lifecycle=logical`, `stop_behavior=detach_only`, the independent
 `stream_state`, and `physical_shutdown=driver_bundle_stop`.
 
+For `led.set_color`, omitted or blank RGB fields use the schema default `0`.
+An effective `0,0,0` request is normalized to `off`, sent to the robot, and
+kept alive as black so firmware timeout cannot restore its default LED state.
+
 `vision_capture` subscribes to that existing
 `/<namespace>/camera/front` JPEG stream; it never creates another Unitree
 `VideoClient` or calls `videohub` itself. `capture_photo` waits for a frame
@@ -226,7 +230,10 @@ errors are reported through ACP. `info` reports camera freshness, encoder
 availability, and the latest recording result. The runtime image installs both
 `ffmpeg` and its companion `ffprobe`; completed files are checked for one H.264
 video track and no audio track. Fixed recordings additionally verify requested
-duration and expected frame count.
+duration and expected frame count. Continuous recording omits FFmpeg's infinite
+last-frame padding so closing the input can finalize the MP4. Timed ACP
+completion waits until the MCP response containing its action ID has been sent,
+preventing completion from overtaking Agent Core's pending-action registration.
 The existing `/opt/phanthy-motus/data` deployment mount persists both folders.
 
 `remote_controller` is a read-only LowState view. The existing shared

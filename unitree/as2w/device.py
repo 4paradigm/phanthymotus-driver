@@ -1834,24 +1834,27 @@ class LedPlugin:
         if action == "off":
             color = (0, 0, 0)
         elif action == "set_color":
-            missing = [key for key in ("red", "green", "blue")
-                       if key not in args or args[key] in (None, "")]
-            if missing:
+            values = []
+            try:
+                for key in ("red", "green", "blue"):
+                    raw = args.get(key, 0)
+                    values.append(0 if raw in (None, "") else int(raw))
+            except (TypeError, ValueError):
                 return {
                     "ret": -1,
                     "accepted": False,
                     "action": action,
-                    "error": "red, green and blue are required",
-                    "missing": missing,
+                    "error": "red, green and blue must be integers from 0 to 255",
                 }
-            color = tuple(max(0, min(255, int(args.get(key, 0))))
-                          for key in ("red", "green", "blue"))
+            color = tuple(max(0, min(255, value)) for value in values)
         else:
             return None
+        effective_action = "off" if not any(color) else "set_color"
         self._color = list(color)
         result = self._proxy.Audio_LedControl(*color)
         if result == 0:
             # AS2 firmware can restore its default LED after a timeout. Black
             # therefore needs the same refresh loop as visible colors.
-            self.start(allow_black=action == "off")
-        return {"ret": result, "color": list(color)}
+            self.start(allow_black=effective_action == "off")
+        return {"ret": result, "action": effective_action,
+                "color": list(color)}

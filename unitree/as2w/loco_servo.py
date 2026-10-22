@@ -172,8 +172,14 @@ class LocoServoPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
+                    "start": {
+                        "params": ["input_topic"],
+                        "description": "Subscribe to a wired control/velocity topic",
+                    },
+                    "stop": {"params": [], "description": "Stop and release the input"},
                     "pause": {"params": [], "description": "Stop and pause"},
                     "resume": {"params": [], "description": "Resume input"},
+                    "info": {"params": [], "description": "Read live-control status"},
                     "config": {
                         "params": ["dry_run", "rotate_only", "require_standing", "confirm"],
                         "description": "Changing dry_run from true to false requires confirm=true",

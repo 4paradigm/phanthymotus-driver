@@ -464,7 +464,7 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn((255, 0, 18), calls)
         plugin.stop()
 
-    def test_led_defaults_to_zero_but_rejects_empty_color_fields(self):
+    def test_led_defaults_empty_color_fields_and_black_to_off(self):
         calls = []
         proxy = types.SimpleNamespace(
             Audio_LedControl=lambda *args: calls.append(args) or 0)
@@ -480,10 +480,13 @@ class TestDriverContracts(unittest.TestCase):
                 {"red": 0, "green": None, "blue": 0}):
             with self.subTest(arguments=arguments):
                 result = plugin.dispatch("set_color", arguments)
-                self.assertFalse(result["accepted"])
-                self.assertEqual(-1, result["ret"])
-        self.assertEqual([], calls)
+                self.assertEqual(0, result["ret"])
+                self.assertEqual("off", result["action"])
+                self.assertEqual([0, 0, 0], result["color"])
+        self.assertEqual([(0, 0, 0)] * 3, calls[:3])
         self.assertEqual([0, 0, 0], plugin._color)
+        self.assertIsNotNone(plugin._keepalive_thread)
+        plugin.stop()
 
     def test_led_off_keeps_refreshing_black(self):
         calls = []
@@ -1712,6 +1715,13 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("loco_servo", tool["name"])
         self.assertEqual("control/velocity", tool["topic_in"][0]["format"])
         self.assertEqual(["base"], tool["inputSchema"]["x-resource"])
+        action_params = tool["inputSchema"]["x-action-params"]
+        self.assertEqual(
+            {"start", "stop", "pause", "resume", "info", "config"},
+            set(action_params))
+        self.assertEqual(["input_topic"], action_params["start"]["params"])
+        self.assertEqual([], action_params["stop"]["params"])
+        self.assertEqual([], action_params["info"]["params"])
         self.assertTrue(plugin._dry_run)
         self.assertIn("confirm", tool["inputSchema"]["properties"])
         footprint = descriptor["footprint"]
@@ -2314,6 +2324,8 @@ class TestDriverContracts(unittest.TestCase):
         plugin._recording_lock = threading.Lock()
         plugin._active_recording = None
         plugin._last_recording = None
+        plugin._response_events = {}
+        plugin._response_lock = threading.Lock()
         plugin._executor = None
         plugin._subscription = None
         plugin._closed = False
@@ -2346,6 +2358,9 @@ class TestDriverContracts(unittest.TestCase):
                          tool["inputSchema"]["x-completion"]["actions"])
         self.assertEqual(55, tool["inputSchema"]["x-completion"]["timeout"])
         self.assertEqual("front", plugin._source()["camera"])
+        self.assertIn("tpad=stop_mode=clone:stop=-1",
+                      plugin._video_filter(5))
+        self.assertNotIn("tpad", plugin._video_filter(None))
 
     def test_vision_capture_named_media_list_and_delete(self):
         with tempfile.TemporaryDirectory() as output:
@@ -2539,7 +2554,9 @@ class TestDriverContracts(unittest.TestCase):
             active = {
                 "action_id": "action-1", "cancel": threading.Event(),
                 "path": path, "state": "recording", "process": None,
+                "response_event": threading.Event(),
             }
+            active["response_event"].set()
             plugin._active_recording = active
             success = {"ok": True, "file_path": str(path),
                        "media_type": "video"}
@@ -2553,7 +2570,9 @@ class TestDriverContracts(unittest.TestCase):
             active = {
                 "action_id": "action-2", "cancel": threading.Event(),
                 "path": path, "state": "recording", "process": None,
+                "response_event": threading.Event(),
             }
+            active["response_event"].set()
             active["cancel"].set()
             plugin._active_recording = active
             with patch.object(plugin, "_record_video", return_value=success), \
@@ -2562,6 +2581,32 @@ class TestDriverContracts(unittest.TestCase):
                 plugin._record_video_async(active)
             self.assertFalse(path.exists())
             self.assertEqual("cancelled", notifications[-1][1])
+
+    def test_video_completion_waits_until_action_response_is_sent(self):
+        plugin = self._vision_plugin("/tmp/unused")
+        completed = threading.Event()
+        response_event = threading.Event()
+        active = {
+            "action_id": "action-order", "cancel": threading.Event(),
+            "path": Path("/tmp/video.mp4"), "state": "recording",
+            "process": None, "notify_acp": True,
+            "response_event": response_event,
+        }
+        plugin._active_recording = active
+        plugin._response_events[active["action_id"]] = response_event
+        success = {"ok": True, "file_path": str(active["path"]),
+                   "media_type": "video"}
+        with patch.object(plugin, "_record_video", return_value=success), \
+                patch.object(plugin, "_notify_complete",
+                             side_effect=lambda *_args: completed.set()):
+            worker = threading.Thread(
+                target=plugin._record_video_async, args=(active,))
+            worker.start()
+            self.assertFalse(completed.wait(0.05))
+            plugin.response_sent(active["action_id"])
+            self.assertTrue(completed.wait(1))
+            worker.join(1)
+        self.assertNotIn(active["action_id"], plugin._response_events)
 
     def test_video_start_failure_removes_partial_file(self):
         with tempfile.TemporaryDirectory() as output:
