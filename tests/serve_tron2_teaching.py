@@ -1,4 +1,4 @@
-"""Local browser fixture: real teaching HTTP/recording, fake read-only vendor."""
+"""Local browser fixture: real teaching HTTP/recording, fake vendor WebSocket (no hardware)."""
 import argparse
 import asyncio
 import json
@@ -47,8 +47,28 @@ async def run(port,root):
     async with aiohttp.ClientSession() as session:
         cfg=settings(enabled_cards=['joint_state','tron2_teaching'])
         cfg.update(teaching_directory=root,camera_urls={c:f'http://127.0.0.1:{port}/camera' for c in ('camera','camera_left','camera_right')})
+        reader.settings = {'url': f'ws://127.0.0.1:{port}'}
         adapter=Adapter(lambda *a:None,cfg,reader=reader,session=session)
-        async def home(request):return web.Response(text=HOST,content_type='text/html')
+        async def home(request):
+            if request.headers.get('Upgrade', '').lower() != 'websocket':
+                return web.Response(text=HOST,content_type='text/html')
+            ws=web.WebSocketResponse();await ws.prepare(request)
+            await ws.send_json(dict(title='notify_robot_info',accid=reader.serial,data={}))
+            async for message in ws:
+                packet=json.loads(message.data);title=packet['title'];data=packet.get('data',{})
+                reply={'result':'success'}
+                if title=='request_get_joint_state':reply['q']=reader.q[:]
+                elif title=='request_get_limx_2fclaw_state':
+                    reply.update(left_opening=reader.grip[0],right_opening=reader.grip[1])
+                elif title=='request_movej':reader.q[:14]=data['joint']
+                elif title=='request_moveh':reader.q[14:]=data['joint']
+                elif title=='request_servoj':reader.q[:]=data['q']
+                elif title=='request_set_limx_2fclaw_cmd':
+                    reader.grip[:]=[data['left_opening'],data['right_opening']]
+                if not title.startswith('request_get_'):reader.commands.append(packet)
+                await ws.send_json(dict(title=title.replace('request_','response_'),accid=reader.serial,
+                    guid=packet.get('guid'),timestamp=time.monotonic(),data=reply))
+            return ws
         async def workbench(request):return web.FileResponse(ROOT/'common/teaching/workbench.html')
         app=web.Application(client_max_size=17*1024*1024)
         app.router.add_get('/',home);app.router.add_get('/workbench',workbench);app.router.add_get('/camera',camera)
@@ -63,6 +83,7 @@ async def run(port,root):
                         robot_timestamp=time.monotonic()*1000),time.monotonic_ns())
                 await asyncio.sleep(.02)
         finally:
+            await adapter.teaching.adapter.replay.stop()
             await adapter.teaching.adapter.capture.finish();await runner.cleanup()
 
 

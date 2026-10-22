@@ -19,7 +19,7 @@ RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/requirements
 RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} 'setuptools>=71,<80' && python3 -m pip check
 COPY common/ /work/common/
 COPY main.py device.py vendor.py state.py reset.py skeleton.py completion.py trajectory.py pose.py head.py gripper.py camera.py ros2.py check.py config.yaml driver.yaml /work/
-COPY episode.py teaching.py teaching_capture.py teaching_replay.py vla_export.py /work/
+COPY episode.py teaching.py teaching_capture.py teaching_replay.py teaching_sdk.py vla_export.py /work/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 ENV PYTHONUNBUFFERED=1
@@ -29,7 +29,7 @@ ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_LOG_DIR=/tmp/ros-log
 # Import from the actual /work image layout; no robot or DDS participant is opened.
-RUN /bin/bash -c "source /opt/ros/humble/setup.bash && python3 -c 'import main, device, vendor, state, ros2, rclpy, teaching; from lerobot.datasets.lerobot_dataset import LeRobotDataset; from std_msgs.msg import String; from sensor_msgs.msg import CompressedImage'"
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && python3 -c 'import main, device, vendor, state, ros2, rclpy, teaching, tron2_env; from lerobot.datasets.lerobot_dataset import LeRobotDataset; from std_msgs.msg import String; from sensor_msgs.msg import CompressedImage'"
 EXPOSE 15791
 STOPSIGNAL SIGTERM
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && exec python3 /work/main.py"]

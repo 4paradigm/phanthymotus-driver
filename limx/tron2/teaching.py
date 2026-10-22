@@ -24,9 +24,9 @@ class TronTeachingAdapter:
         joint_groups=[{'label':'左臂','count':7},{'label':'右臂','count':7}], grippers=False,
         recording_label='实测双臂与夹爪', prepare_hint='只读检查反馈和存储；不接管原厂 VR。',
         next_hint='使用原厂 VR 示范。录制器只读取关节、夹爪与三路图像。',
-        trial_hint='先低速移动双臂并调整夹爪到录制起点，再回放。请确认移向起点的路径和活动空间畅通，退出原厂 VR 并保持控制独占。停止只取消后续步骤，不能保证厂家立即停止当前运动。',
+        trial_hint='由原厂 SDK 初始化到录制起点（可能经过中间姿态并张开夹爪），再回放。请确认移向起点的路径和活动空间畅通，退出原厂 VR 并保持控制独占。停止只取消后续步骤，不能保证厂家立即停止当前运动。',
         conditions_placeholder='固定底座、相同物体布置、原厂 VR 已退出、控制来源独占。')
-    replay_instruction='TRON2 先低速移动双臂并调整夹爪到录制起点，核验到位后回放，不自动切换模式。每次执行须由操作者确认移向起点及回放的路径畅通，原厂 VR 和其他控制程序已停止，并明确填写 exclusive_control_confirmed=true；软件不能检测跨进程控制独占。夹爪须明确 gripper_speed 和 gripper_force（厂家档位）。停止只取消后续步骤，不保证厂家立即停止当前运动。'
+    replay_instruction='TRON2 由原厂 SDK 初始化到录制起点（可能经过中间姿态并张开夹爪），核验到位后回放，不自动切换模式。每次执行须由操作者确认移向起点及回放的路径畅通，原厂 VR 和其他控制程序已停止，并明确填写 exclusive_control_confirmed=true；软件不能检测跨进程控制独占。夹爪须明确 gripper_speed 和 gripper_force（厂家档位）。停止只取消后续步骤，不保证厂家立即停止当前运动。'
 
     def __init__(self, owner, loop, root):
         self.owner,self.loop,self.root=owner,loop,Path(root)
@@ -149,7 +149,7 @@ class TronTeachingAdapter:
             adjustment=max(abs(math.degrees(a-b)) for a,b in zip(target,frames[0]['q']))
             return dict(ready=True,can_trial=True,mode='move_to_start',
                 movej_target_joints_deg=[math.degrees(v) for v in target],movej_adjustment_deg=adjustment,
-                message='将先低速移动双臂并调整夹爪到录制起点，检查到位后回放；请确认路径畅通，并退出原厂 VR。'+(f'MoveJ 准备目标受厂家范围限制，与首帧最大相差 {adjustment:.2f}°（允许 2°）；回放目标不变。' if adjustment>.001 else ''),
+                message='将由原厂 SDK 初始化到录制起点（可能经过中间姿态并张开夹爪），检查到位后回放；请确认路径畅通，并退出原厂 VR。'+(f'MoveJ 准备目标受厂家范围限制，与首帧最大相差 {adjustment:.2f}°（允许 2°）；回放目标不变。' if adjustment>.001 else ''),
                 joint_delta_deg=[math.degrees(v) for v in delta],
                 target_joints_deg=[math.degrees(v) for v in frames[0]['q']],tolerance_label='移到起点后核验：双臂 2°、夹爪 3 单位')
         except (ValueError,OSError) as exc:

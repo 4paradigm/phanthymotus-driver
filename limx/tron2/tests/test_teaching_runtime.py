@@ -1,45 +1,58 @@
-"""Fake vendor capture and replay boundaries; never connect to hardware."""
 import asyncio
+
+
 import json
+
+
 import math
+
+
 from contextlib import contextmanager
+
+
 from collections import deque
+
+
 from pathlib import Path
+
+
 import sys
+
+
 import time
+
+
 from types import SimpleNamespace
 
+
 import aiohttp
+
+
 from aiohttp import web
+
+
 import pytest
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+
 import teaching_replay
+
+
 from teaching_capture import Capture
+
+
 from teaching_replay import Replay, pack_trajectory, read_trajectory, movej_start_target
+
+
 from test_teaching_episode import BINDING, jpeg, state
+
+
 from skeleton import JOINT_NAMES
+
+
 from episode import load_episode
-from vendor import ARM_LOWER, ARM_UPPER, validate_movej
 
 
-@pytest.fixture(autouse=True)
-def short_preparation(monkeypatch):
-    monkeypatch.setattr('teaching_replay.duration_for_change',lambda delta:.1)
-    monkeypatch.setattr('teaching_replay.START_STABILITY_SECONDS',.03)
-    monkeypatch.setattr('teaching_replay.START_ARRIVAL_TIMEOUT',.25)
-    monkeypatch.setattr('teaching_replay.START_GRIPPER_TIMEOUT',.25)
-
-
-@pytest.fixture
-def replay_clock(monkeypatch):
-    clock=[0.0];sleep=asyncio.sleep
-    async def advance(delay):
-        clock[0]+=max(0,delay)
-        await sleep(0)
-    monkeypatch.setattr('teaching_replay.time',SimpleNamespace(monotonic=lambda:clock[0]))
-    monkeypatch.setattr(asyncio,'sleep',advance)
-    return clock
+from vendor import ARM_LOWER, ARM_UPPER, MoveError, validate_movej
 
 
 class Reader:
@@ -95,658 +108,20 @@ class Reader:
         self.q[:14]=q;self.commands.append(('movej',q[:]))
         return {'status':'accepted','motion_sent':True}
 
-    async def send_gripper(self,data):
+    async def send_gripper(self,data,on_sent=None,expected_connection=None):
         side=0 if 'left_opening' in data else 1
         self.grip[side]=data[('left' if side==0 else 'right')+'_opening']
         self.commands.append(('gripper',dict(data)))
+        if on_sent is not None:on_sent()
 
 
 async def allowed():return True
-
-
-@pytest.mark.parametrize('refresh',[True,False])
-@pytest.mark.parametrize('stage',['preflight','execution'])
-def test_replay_refreshes_idle_feedback_before_sending(refresh,stage):
-    async def run():
-        reader=Reader();reader.fresh=False;reader.leased=False
-        original=reader.sample
-        def sample(name):
-            result=original(name)
-            if name=='joint_state' and not reader.fresh:
-                result['reception_age_seconds']=.4
-            return result
-        reader.sample=sample
-        @contextmanager
-        def lease():
-            reader.leased=True
-            timer=asyncio.get_running_loop().call_later(.03,setattr,reader,'fresh',refresh)
-            try:yield
-            finally:
-                timer.cancel();reader.leased=False
-        reader.pose_feedback=lease
-        reader.teaching_feedback=lease
-        replay=Replay(reader,allowed,lambda:True)
-        if stage=='execution':
-            _,frames=read_trajectory(recording(),BINDING)
-            await replay._run('test',frames,reader.q[14:],10,10)
-            assert replay.outcome['status']==('completed' if refresh else 'error')
-            assert not replay.outcome['result']['motion_may_continue']
-            assert bool(reader.commands)==refresh
-        elif refresh:
-            await replay.preflight(recording(),BINDING)
-        else:
-            with pytest.raises(ValueError,match='replay_feedback_stale'):
-                await replay.preflight(recording(),BINDING)
-        assert not reader.leased
-        if stage=='preflight' or not refresh:assert not reader.commands
-    asyncio.run(run())
 
 
 def recording(count=6):
     frames=[state(i) for i in range(count)]
     for i,s in enumerate(frames):s['gripper']=[i,20-i]
     return pack_trajectory(BINDING,frames)
-
-
-def fast_recording(count=10,step=.06):
-    frames=[state(i) for i in range(count)]
-    for i,s in enumerate(frames):
-        s['q'][0]=i*step
-        s['gripper']=[0,20]
-    return frames
-
-
-def release_replay(reader):
-    replay=Replay(reader,allowed,lambda:True)
-    replay.outcome={'action_id':'failed','status':'error',
-        'result':{'reason':'replay_tracking_error','physical_stop_verified':False,'motion_may_continue':True}}
-    replay.motion_sent=True;replay.movej_acknowledged=True;replay.movej_not_before=0
-    replay.connection=(getattr(reader,'ws',None),reader.serial)
-    return replay
-
-
-def tracking_replay():
-    replay=Replay(Reader(),allowed,lambda:True)
-    replay.send_history=deque([
-        {'index':0,'t_ns':0,'sent_at':.5,'q':[0.]*14,'baseline':True},
-        {'index':1,'t_ns':20_000_000,'sent_at':.86,'q':[0.]*14},
-        {'index':2,'t_ns':40_000_000,'sent_at':.99,'q':[0.]*14},
-    ],maxlen=teaching_replay.SEND_HISTORY_LIMIT)
-    return replay
-
-
-def feedback_at(query_start,received,age,round_trip=None,value=0.):
-    q=[0.]*16;q[0]=value
-    return dict(q=q,dq=[0.]*16,robot_timestamp=1,
-        feedback_query_started=query_start,feedback_received_at=received,
-        feedback_age_seconds=age,
-        feedback_query_round_trip_seconds=received-query_start if round_trip is None else round_trip)
-
-
-def test_replay_binding_corruption_and_offset_preview():
-    async def run():
-        reader=Reader();replay=Replay(reader,allowed,lambda:True)
-        reader.q[0]=.5
-        preview=await replay.play(recording(),BINDING,{})
-        assert preview['executed'] is False and '起点' in preview['description']
-        assert reader.commands==[]
-        with pytest.raises(ValueError,match='binding'):read_trajectory(recording(),dict(BINDING,serial='other'))
-        with pytest.raises(ValueError):read_trajectory(recording().replace(b'0.0001',b'0.0002'))
-    asyncio.run(run())
-
-
-def test_replay_moves_arms_then_grippers_before_recorded_frames(replay_clock):
-    async def run():
-        reader=Reader();reader.q[0]=.5;reader.grip=[94,0]
-        move=reader.send_movej;servo=reader.send_pose_servoj;not_before=[0]
-        async def timed_move(q,duration):
-            not_before[0]=replay_clock[0]+duration
-            return await move(q,duration)
-        async def timed_servo(q,token):
-            assert replay_clock[0]>=not_before[0]
-            return await servo(q,token)
-        reader.send_movej=timed_move;reader.send_pose_servoj=timed_servo
-        replay=Replay(reader,allowed,lambda:True)
-        raw=recording();preview=await replay.play(raw,BINDING,{})
-        assert not reader.commands
-        action=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
-            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
-        outcome=await replay.wait(action['action_id'])
-        assert outcome['status']=='completed',outcome
-        assert outcome['result']['start_verified']
-        assert [kind for kind,_ in reader.commands[:4]]==['movej','gripper','gripper','arm']
-        assert reader.commands[0][1]==[0]*14
-        assert reader.commands[1][1]=={'left_opening':0,'left_speed':30,'left_force':20}
-        assert reader.commands[2][1]=={'right_opening':20,'right_speed':30,'right_force':20}
-        assert sum(kind=='movej' for kind,_ in reader.commands)==1
-    asyncio.run(run())
-
-
-def test_replay_tracking_uses_feedback_query_interval_not_previous_frame(replay_clock):
-    async def run():
-        states=fast_recording();raw=pack_trajectory(BINDING,states)
-        reader=Reader();reader.expected_sends=len(states)
-        def source(now):
-            if len(reader.replay_sends)>=reader.expected_sends:
-                return reader.q[:],[0]*16,reader.count+10000,now,now
-            if not reader.replay_sends:
-                return reader.q[:],[0]*16,reader.count+10000,now,now
-            index=max(0,len(reader.replay_sends)-4)
-            sent_at,q=reader.replay_sends[index]
-            return q[:],[0]*16,reader.count+10000,sent_at,sent_at+.01
-        reader.feedback_source=source
-        replay=Replay(reader,allowed,lambda:True)
-        frames,head=await replay.preflight(raw,BINDING)
-        await replay._run('aligned-feedback',frames,head,30,20)
-        assert replay.outcome['status']=='completed',replay.outcome
-        assert sum(kind=='arm' for kind,_ in reader.commands)==len(states)
-        # The four-send cache delay exceeds 8 degrees against the previous
-        # frame target, but is inside the sample's host-monotonic query window.
-        assert max(abs(a-b) for a,b in zip(states[3]['q'][:14],states[0]['q'][:14]))>math.radians(8)
-    asyncio.run(run())
-
-
-def test_replay_rejects_query_older_than_feedback_limit_even_when_target_matches(replay_clock):
-    replay_clock[0]=1.0
-    replay=tracking_replay()
-    # A 140 ms round trip plus a newly received sample. Every retained target
-    # has q[0]=0, so a nearest-history comparison would incorrectly pass.
-    feedback=feedback_at(.85,.99,.01)
-    with pytest.raises(ValueError,match='replay_feedback_time_invalid'):
-        replay._check_tracking(3,feedback)
-    assert replay.tracking_diagnostic['reason']=='replay_feedback_time_invalid'
-
-
-@pytest.mark.parametrize('case',['future','nan','inf','negative_age','inconsistent_age',
-    'inconsistent_round_trip','lo_after_hi'])
-def test_replay_rejects_invalid_feedback_time_metadata(case,replay_clock):
-    replay_clock[0]=1.0
-    replay=tracking_replay()
-    feedback=feedback_at(.98,.99,.01)
-    if case=='future':
-        feedback['feedback_received_at']=1.01
-        feedback['feedback_query_round_trip_seconds']=.03
-    elif case=='nan':feedback['feedback_query_started']=float('nan')
-    elif case=='inf':feedback['feedback_received_at']=float('inf')
-    elif case=='negative_age':feedback['feedback_age_seconds']=-.001
-    elif case=='inconsistent_age':feedback['feedback_age_seconds']=.05
-    elif case=='inconsistent_round_trip':feedback['feedback_query_round_trip_seconds']=.05
-    else:feedback['feedback_query_started']=.995
-    with pytest.raises(ValueError,match='replay_feedback_time_invalid'):
-        replay._check_tracking(3,feedback)
-    assert replay.tracking_diagnostic['reason']=='replay_feedback_time_invalid'
-
-
-def test_replay_accepts_short_bounded_query_and_rejects_persistent_error(replay_clock):
-    replay_clock[0]=1.0
-    replay=tracking_replay()
-    feedback=feedback_at(.984,.986,.012)
-    replay._check_tracking(3,feedback)
-    bad=feedback_at(.984,.986,.012,value=math.radians(20))
-    with pytest.raises(ValueError,match='replay_tracking_error'):
-        replay._check_tracking(3,bad)
-    diagnostic=replay.tracking_diagnostic
-    assert diagnostic['difference_deg']>8
-    assert diagnostic['selected_target_index'] in diagnostic['candidate_target_indices']
-    assert diagnostic['measurement_time_verified'] is False
-
-
-def test_tracking_history_gap_never_treats_ordinary_history_as_baseline(replay_clock):
-    replay_clock[0]=1.0
-    replay=tracking_replay()
-    replay.send_history=deque([
-        {'index':2,'t_ns':40_000_000,'sent_at':.99,'q':[0.]*14},
-    ],maxlen=teaching_replay.SEND_HISTORY_LIMIT)
-    feedback=feedback_at(.98,.985,.01)
-    with pytest.raises(ValueError,match='replay_feedback_history_gap'):
-        replay._check_tracking(3,feedback)
-    assert replay.tracking_diagnostic['reason']=='replay_feedback_history_gap'
-
-
-def test_tracking_only_verified_start_baseline_may_predate_replay_start(replay_clock):
-    replay_clock[0]=.5
-    replay=tracking_replay()
-    replay.send_history=deque([
-        {'index':0,'t_ns':0,'sent_at':.5,'q':[0.]*14,'baseline':True},
-    ],maxlen=teaching_replay.SEND_HISTORY_LIMIT)
-    # The first sample predates the replay start; only the explicit baseline
-    # (established by MoveJ/start checks) is eligible.
-    feedback=feedback_at(.45,.48,.02)
-    replay._check_tracking(0,feedback)
-
-
-def test_replay_persistent_tracking_error_reports_alignment_diagnostic(replay_clock):
-    async def run():
-        states=fast_recording();raw=pack_trajectory(BINDING,states)
-        reader=Reader();reader.expected_sends=len(states)
-        def source(now):
-            if not reader.replay_sends:
-                return reader.q[:],[0]*16,reader.count+10000,now,now
-            index=max(0,len(reader.replay_sends)-4)
-            sent_at,q=reader.replay_sends[index]
-            q=q[:]
-            if len(reader.replay_sends)>=2:q[0]+=math.radians(30)
-            return q,[0]*16,reader.count+10000,sent_at,sent_at+.01
-        reader.feedback_source=source
-        replay=Replay(reader,allowed,lambda:True)
-        frames,head=await replay.preflight(raw,BINDING)
-        await replay._run('persistent-error',frames,head,30,20)
-        if replay.release_task:await replay.release_task
-        assert replay.outcome['status']=='error'
-        assert replay.outcome['result']['reason']=='replay_tracking_error'
-        diagnostic=replay.outcome['result']['tracking_diagnostic']
-        assert diagnostic['joint_index']==0
-        assert diagnostic['difference_deg']>8
-        assert diagnostic['selected_target_index'] in diagnostic['candidate_target_indices']
-        assert diagnostic['feedback_value_deg']>diagnostic['target_value_deg']
-        assert diagnostic['feedback_age_seconds'] is not None
-        assert diagnostic['query_round_trip_seconds']>=0
-        assert diagnostic['measurement_time_verified'] is False
-        assert diagnostic['reference']
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('failure,reason',[
-    ('invalid_time','replay_feedback_time_invalid'),
-    ('frozen','replay_feedback_timestamp_frozen'),
-    ('reconnect','replay_start_connection_changed')])
-def test_replay_invalid_frozen_or_reconnected_feedback_stays_rejected(failure,reason,replay_clock):
-    async def run():
-        states=fast_recording();raw=pack_trajectory(BINDING,states)
-        reader=Reader();reader.expected_sends=len(states)
-        def source(now):
-            if not reader.replay_sends:
-                return reader.q[:],[0]*16,1 if failure=='frozen' else reader.count+10000,now,now
-            index=max(0,len(reader.replay_sends)-4)
-            sent_at,q=reader.replay_sends[index]
-            if failure=='frozen':
-                return q[:],[0]*16,1,sent_at,sent_at+.01
-            if failure=='invalid_time' and len(reader.replay_sends)>=2:
-                return q[:],[0]*16,reader.count+10000,None,sent_at+.01
-            return q[:],[0]*16,reader.count+10000,sent_at,sent_at+.01
-        reader.feedback_source=source
-        if failure=='reconnect':
-            original=reader.send_pose_servoj
-            async def send(q,token):
-                await original(q,token)
-                if len(reader.replay_sends)>=2:reader.ws=object()
-            reader.send_pose_servoj=send
-        replay=Replay(reader,allowed,lambda:True)
-        frames,head=await replay.preflight(raw,BINDING)
-        await replay._run(failure,frames,head,30,20)
-        if replay.release_task:await replay.release_task
-        assert replay.outcome['status']=='error'
-        assert replay.outcome['result']['reason']==reason,replay.outcome
-    asyncio.run(run())
-
-
-def test_unknown_servoj_submission_keeps_automatic_release_blocked(replay_clock):
-    from vendor import MoveError
-    async def run():
-        states=fast_recording(4);raw=pack_trajectory(BINDING,states)
-        reader=Reader()
-        async def send(q,token):
-            reader.replay_sends.append((reader.now(),q[:]))
-            if len(reader.replay_sends)>=2:
-                raise MoveError('ServoJ socket submission uncertain',None,'trajectory_send_unknown')
-            reader.q=q[:]
-        reader.send_pose_servoj=send
-        replay=Replay(reader,allowed,lambda:True)
-        frames,head=await replay.preflight(raw,BINDING)
-        await replay._run('unknown-send',frames,head,30,20)
-        assert replay.outcome['status']=='error'
-        assert replay.outcome['result']['reason']=='ServoJ socket submission uncertain'
-        assert replay.release_task is None
-        assert replay.active
-    asyncio.run(run())
-
-
-def test_automatic_release_accepts_settling_past_initial_snapshot(replay_clock):
-    async def run():
-        reader=Reader();replay=release_replay(reader)
-        reader.q=[0]*14+[.2,.3]
-        moved=[False];original=reader.sample
-        def sample(name):
-            if name=='joint_state' and not moved[0] and replay_clock[0]>=.2:
-                reader.q[0]=math.radians(4);moved[0]=True
-            return original(name)
-        reader.sample=sample
-        await replay._release_after_motion()
-        result=replay.outcome['result']
-        assert result['physical_stop_verified'] and not result['motion_may_continue']
-        assert result['release_method']=='automatic_stable_feedback'
-        assert result.get('release_error') is None
-        assert reader.commands==[]
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('failure',['moving','gripper_moving','gripper_drift','frozen','disconnect'])
-def test_release_keeps_lock_without_continuous_stationary_feedback(failure,replay_clock):
-    async def run():
-        reader=Reader();replay=release_replay(reader)
-        if failure=='moving':
-            original=reader.sample
-            def sample(name):
-                result=original(name)
-                if name=='joint_state':result['data']['dq'][0]=math.radians(2)
-                return result
-            reader.sample=sample
-        elif failure in ('gripper_moving','gripper_drift'):
-            original=reader.read_gripper
-            async def read_gripper():
-                result=await original()
-                if failure=='gripper_moving':result['left_speed']=1
-                else:result['left_opening']=(reader.count%10)*4
-                return result
-            reader.read_gripper=read_gripper
-        elif failure=='frozen':
-            original=reader.sample
-            def sample(name):
-                result=original(name)
-                if name=='joint_state':result['data']['robot_timestamp']=1
-                return result
-            reader.sample=sample
-        else:
-            reader.connected=False
-        await replay._release_after_motion()
-        result=replay.outcome['result']
-        assert result.get('physical_stop_verified',False) is False
-        assert result['motion_may_continue']
-        assert result.get('release_error'),result
-        assert replay.active
-        assert reader.commands==[]
-    asyncio.run(run())
-
-
-def test_late_frame_after_preparation_is_not_sent(replay_clock):
-    async def run():
-        reader=Reader();original=reader.read_gripper
-        async def slow_gripper():
-            if replay.phase=='replaying':replay_clock[0]+=.051
-            return await original()
-        reader.read_gripper=slow_gripper
-        replay=Replay(reader,allowed,lambda:True)
-        frames,head=await replay.preflight(recording(),BINDING)
-        await replay._run('late-frame',frames,head,30,20)
-        assert replay.outcome['result']['reason']=='replay_deadline_missed_no_catchup'
-        assert [kind for kind,_ in reader.commands]==['movej']
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('failure',['not_sent','unknown_ack','arm_stuck','gripper_stuck','connection_changed','frozen_timestamp'])
-def test_preparation_failure_never_enters_servoj(failure):
-    from vendor import MoveError
-    async def run():
-        reader=Reader();reader.q[0]=.5;reader.grip=[94,0]
-        original_move=reader.send_movej;original_sample=reader.sample
-        async def move(q,duration):
-            if failure=='not_sent':raise MoveError('not sent',False)
-            if failure=='unknown_ack':
-                reader.commands.append(('movej',q[:]))
-                raise MoveError('ack unknown',None)
-            await original_move(q,duration)
-            if failure=='arm_stuck':reader.q[0]=.5
-            if failure=='connection_changed':reader.ws=object()
-        def sample(name):
-            result=original_sample(name)
-            if failure=='frozen_timestamp' and reader.commands and name=='joint_state':
-                result['data']['robot_timestamp']=10000
-            return result
-        async def stuck_gripper(data):reader.commands.append(('gripper',dict(data)))
-        reader.send_movej=move;reader.sample=sample
-        if failure=='gripper_stuck':reader.send_gripper=stuck_gripper
-        replay=Replay(reader,allowed,lambda:True)
-        frames,head=await replay.preflight(recording(),BINDING)
-        await replay._run('preparation-failure',frames,head,30,20)
-        assert replay.outcome['status']=='error',replay.outcome
-        assert not any(kind=='arm' for kind,_ in reader.commands)
-        assert sum(kind=='movej' for kind,_ in reader.commands)<=1
-        if replay.release_task:await replay.release_task
-        assert bool(replay.active)==(failure in ('unknown_ack','connection_changed','frozen_timestamp'))
-        if failure in ('arm_stuck','gripper_stuck'):
-            assert replay.outcome['result']['release_method']=='automatic_stable_feedback'
-            assert replay.outcome['status']=='error'
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('stage',['movej','gripper'])
-def test_stop_during_preparation_keeps_uncertain_motion_blocked(stage):
-    async def run():
-        reader=Reader();reader.grip=[94,0];entered=asyncio.Event()
-        async def blocked(*args):
-            reader.commands.append((stage,args[0]));entered.set()
-            await asyncio.Event().wait()
-        if stage=='movej':reader.send_movej=blocked
-        else:reader.send_gripper=blocked
-        replay=Replay(reader,allowed,lambda:True)
-        preview=await replay.play(recording(),BINDING,{})
-        await replay.play(recording(),BINDING,dict(execute=True,preview_id=preview['preview_id'],
-            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
-        await asyncio.wait_for(entered.wait(),2)
-        stopped=await replay.stop()
-        assert replay.outcome['status']=='cancelled'
-        assert stopped['motion_may_continue'] and not stopped['authority_released']
-        assert replay.active['state']=='blocked_requires_operator_check'
-        assert not any(kind=='arm' for kind,_ in reader.commands)
-    asyncio.run(run())
-
-
-
-def test_recorded_wrist_start_uses_controller_movej_range(replay_clock):
-    async def run():
-        reader=Reader();states=[state(i) for i in range(6)]
-        for row in states:
-            row['q'][13]=-.7837002873420715
-            row['gripper']=[0,20]
-        raw=pack_trajectory(BINDING,states)
-        original=reader.send_movej
-        async def controller_move(q,duration):
-            assert q[13]==-.7505
-            return await original(q,duration)
-        reader.send_movej=controller_move
-        replay=Replay(reader,allowed,lambda:True)
-        frames,head=await replay.preflight(raw,BINDING)
-        await replay._run('recorded-start',frames,head,30,20)
-        assert replay.outcome['status']=='completed',replay.outcome
-        assert abs(reader.commands[0][1][13]-states[0]['q'][13])<math.radians(2)
-        assert all(q[13]==states[0]['q'][13] for kind,q in reader.commands if kind=='arm')
-        assert pack_trajectory(BINDING,states)==raw
-        states[0]['q'][13]=-.80
-        with pytest.raises(ValueError,match='MoveJ.*2°'):
-            await replay.preflight(pack_trajectory(BINDING,states),BINDING)
-    asyncio.run(run())
-
-
-def test_cancelled_movej_unlocks_only_after_duration_and_stationary_feedback():
-    async def run():
-        reader=Reader();entered=asyncio.Event();original=reader.send_movej
-        async def move(q,duration):
-            result=await original(q,duration);entered.set();return result
-        reader.send_movej=move
-        replay=Replay(reader,allowed,lambda:True)
-        preview=await replay.play(recording(),BINDING,{})
-        await replay.play(recording(),BINDING,dict(execute=True,preview_id=preview['preview_id'],
-            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
-        await entered.wait()
-        stopped=await replay.stop()
-        assert not stopped['authority_released']
-        assert replay.recovering
-        assert time.monotonic()<replay.movej_not_before
-        await replay.release_task
-        assert not replay.active
-        assert replay.outcome['status']=='cancelled'
-        assert replay.outcome['result']['release_method']=='automatic_stable_feedback'
-        assert [kind for kind,_ in reader.commands]==['movej']
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('failure',[None,'confirmation','moving','frozen','disconnect','busy','duration','peer'])
-def test_manual_unlock_checks_feedback_without_sending(failure):
-    async def run():
-        reader=Reader();replay=Replay(reader,allowed,lambda:failure!='peer')
-        replay.motion_sent=True
-        replay.outcome={'action_id':'failed','status':'error','result':{'reason':'arrival_failed','motion_may_continue':True}}
-        replay.preview={'id':'old'}
-        args=dict(physical_stop_confirmed=True,exclusive_control_confirmed=True)
-        if failure=='confirmation':args['physical_stop_confirmed']=False
-        if failure=='disconnect':reader.connected=False
-        if failure=='duration':replay.movej_not_before=time.monotonic()+10
-        if failure=='busy':replay.task=asyncio.create_task(asyncio.sleep(10))
-        original=reader.sample
-        def sample(name):
-            r=original(name)
-            if name=='joint_state':
-                if failure=='moving':r['data']['dq'][0]=.1
-                if failure=='frozen':r['data']['robot_timestamp']=1
-            return r
-        reader.sample=sample
-        try:
-            if failure:
-                with pytest.raises(ValueError):await replay.unlock(args)
-                assert replay.active
-            else:
-                result=await replay.unlock(args)
-                assert result['unlocked'] and not result['motion_sent']
-                assert not replay.active and replay.preview is None
-                assert replay.outcome['status']=='error'
-                assert replay.outcome['result']['reason']=='arrival_failed'
-                assert replay.outcome['result']['release_method']=='operator_confirmed_stable_feedback'
-            assert not reader.commands
-        finally:
-            if replay.task:
-                replay.task.cancel()
-                await asyncio.gather(replay.task,return_exceptions=True)
-    asyncio.run(run())
-
-
-def test_replay_above_old_speed_limit_preserves_frames_and_timing(replay_clock):
-    async def run():
-        states=[state(i) for i in range(6)]
-        for i,s in enumerate(states):
-            s['q'][0]=i*.02
-            s['gripper']=[0,20]
-        raw=pack_trajectory(BINDING,states)
-        _,frames=read_trajectory(raw,BINDING)
-        assert (frames[1]['q'][0]-frames[0]['q'][0])*1e9/(frames[1]['t_ns']-frames[0]['t_ns'])>.8
-        assert [f['t_ns'] for f in frames]==[s['received_ns']-states[0]['received_ns'] for s in states]
-        reader=Reader();replay=Replay(reader,allowed,lambda:True)
-        preview=await replay.play(raw,BINDING,{})
-        assert preview['duration_seconds']==frames[-1]['t_ns']/1e9
-        result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
-            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
-        outcome=await replay.wait(result['action_id'])
-        assert outcome['status']=='completed',outcome
-        assert [q[:14] for kind,q in reader.commands if kind=='arm']==[s['q'][:14] for s in states]
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('direction',[-1,1])
-def test_recording_tolerance_clamps_commands_only(direction,replay_clock):
-    async def run():
-        limits=ARM_UPPER if direction==1 else ARM_LOWER
-        states=[state(i) for i in range(6)]
-        for i,s in enumerate(states):
-            s['q'][:14]=[v+direction*math.radians(5)*i/5 for v in limits]
-            s['gripper']=[0,20]
-        states[0]['q'][:14]=[0]*14
-        raw=pack_trajectory(BINDING,states)
-        _,frames=read_trajectory(raw,BINDING)
-        assert [f['q'] for f in frames]==[s['q'][:14] for s in states]
-        reader=Reader()
-        replay=Replay(reader,allowed,lambda:True)
-        preview=await replay.play(raw,BINDING,{})
-        result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
-            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
-        outcome=await replay.wait(result['action_id'])
-        assert outcome['status']=='completed',outcome
-        commands=[q[:14] for kind,q in reader.commands if kind=='arm']
-        assert commands==[[0]*14]+[list(limits)]*(len(states)-1)
-        for q in commands:validate_movej(q,.1)
-        assert pack_trajectory(BINDING,states)==raw
-        assert read_trajectory(raw,BINDING)[1]==frames
-        states[-1]['q'][11]+=direction*math.radians(.001)
-        with pytest.raises(ValueError,match='5 degree tolerance at index 11'):
-            read_trajectory(pack_trajectory(BINDING,states),BINDING)
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('value',[True,'1',None,float('nan'),float('inf')])
-def test_recording_tolerance_rejects_invalid_numbers(value):
-    states=[state(i) for i in range(2)]
-    states[0]['q'][11]=value
-    with pytest.raises(ValueError):
-        read_trajectory(pack_trajectory(BINDING,states),BINDING)
-
-
-def test_replay_hold_head_grippers_and_terminal_feedback():
-    async def run():
-        reader=Reader();replay=Replay(reader,allowed,lambda:True)
-        raw=recording();p=await replay.play(raw,BINDING,{})
-        result=await replay.play(raw,BINDING,dict(execute=True,preview_id=p['preview_id'],workspace_clear=True,
-            take_control=True,gripper_speed=30,gripper_force=20))
-        outcome=await replay.wait(result['action_id'])
-        assert outcome['status']=='completed',outcome
-        assert outcome['result']['physical_stop_verified']
-        assert all(q[14:]==[.2,.3] for kind,q in reader.commands if kind=='arm')
-        assert reader.grip==[5,15]
-        assert sum(k=='arm' for k,v in reader.commands)==6
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize('failure',['conflict','disconnect','stop'])
-def test_control_loss_and_stop_never_replay_pending_frames(failure):
-    async def run():
-        reader=Reader();exclusive=True
-        async def guard():return exclusive
-        replay=Replay(reader,guard,lambda:True);raw=recording(20)
-        p=await replay.play(raw,BINDING,{})
-        await replay.play(raw,BINDING,dict(execute=True,preview_id=p['preview_id'],workspace_clear=True,
-            take_control=True,gripper_speed=30,gripper_force=20))
-        await asyncio.sleep(.045)
-        if failure=='conflict':exclusive=False
-        elif failure=='disconnect':reader.connected=False
-        else:await replay.stop()
-        await replay.task
-        count=len(reader.commands);await asyncio.sleep(.05)
-        assert count==len(reader.commands)
-        assert replay.outcome['status'] in ('cancelled','error')
-        assert not replay.outcome['result']['physical_stop_verified']
-        assert replay.preview is None
-    asyncio.run(run())
-
-
-def test_unverified_control_never_sends():
-    async def run():
-        reader=Reader()
-        async def unknown():return False
-        replay=Replay(reader,unknown,lambda:True)
-        with pytest.raises(ValueError,match='exclusive_control'):await replay.play(recording(),BINDING,{})
-        assert not reader.commands
-    asyncio.run(run())
-
-
-def test_manual_exclusive_confirmation_is_required_for_each_execution():
-    async def run():
-        reader=Reader();replay=Replay(reader,None,lambda:True);raw=recording()
-        for confirmation in (None,False,'true'):
-            preview=await replay.play(raw,BINDING,{})
-            with pytest.raises(ValueError,match='operator_exclusive_confirmation_required'):
-                await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
-                    workspace_clear=True,take_control=True,exclusive_control_confirmed=confirmation,
-                    gripper_speed=30,gripper_force=20))
-            assert reader.commands==[]
-        preview=await replay.play(raw,BINDING,{})
-        result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
-            workspace_clear=True,take_control=True,exclusive_control_confirmed=True,
-            gripper_speed=30,gripper_force=20))
-        assert (await replay.wait(result['action_id']))['status']=='completed'
-        reader.q=[0]*14+[.2,.3];reader.grip=[0,20]
-        count=len(reader.commands);preview=await replay.play(raw,BINDING,{})
-        with pytest.raises(ValueError,match='operator_exclusive_confirmation_required'):
-            await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
-                workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
-        assert len(reader.commands)==count
-    asyncio.run(run())
 
 
 def test_capture_original_mjpeg_and_no_motion(tmp_path):
@@ -851,57 +226,3 @@ def test_teaching_poll_lease_only_changes_read_cadence():
     assert reader.joint_poll_interval()==.5 and reader.ws is None
     reader.teaching_observer=lambda *args:None
     assert reader.joint_poll_interval()==.02
-
-
-def test_static_replay_from_idle_uses_real_reader_and_websocket():
-    from vendor import RobotReader
-    from test_sensors import settings,info,joints
-    async def run():
-        commands=[]
-        async def vendor(request):
-            ws=web.WebSocketResponse();await ws.prepare(request)
-            await ws.send_json(info())
-            async for msg in ws:
-                packet=json.loads(msg.data);title=packet['title'];payload=None
-                if title=='request_get_joint_state':
-                    payload=joints(q=[0]*16,timestamp=time.monotonic())
-                elif title=='request_get_limx_2fclaw_state':
-                    payload=dict(result='success',timestamp=time.monotonic(),left_opening=0,right_opening=0,
-                        left_speed=0,right_speed=0,left_force=0,right_force=0)
-                elif title=='request_movej':
-                    commands.append(packet);payload={'result':'success'}
-                else:commands.append(packet)
-                if payload is not None:
-                    await ws.send_json(dict(title=title.replace('request_','response_'),
-                        accid=packet['accid'],guid=packet['guid'],data=payload))
-            return ws
-        app=web.Application();app.router.add_get('/',vendor)
-        runner=web.AppRunner(app);await runner.setup()
-        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
-        try:
-            async with aiohttp.ClientSession() as session:
-                reader=RobotReader(settings(url='ws://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])))
-                poll=asyncio.create_task(reader.run(session))
-                try:
-                    for _ in range(100):
-                        if reader.sample('joint_state')['available']:break
-                        await asyncio.sleep(.01)
-                    await asyncio.sleep(.2)
-                    replay=Replay(reader,None,lambda:True)
-                    frames=[state(i) for i in range(10)]
-                    for frame in frames:frame.update(q=[0]*16,gripper=[0,0])
-                    raw=pack_trajectory(BINDING,frames)
-                    preview=await replay.play(raw,BINDING,{})
-                    await asyncio.sleep(.2)
-                    result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
-                        workspace_clear=True,take_control=True,exclusive_control_confirmed=True,
-                        gripper_speed=10,gripper_force=10))
-                    outcome=await replay.wait(result['action_id'])
-                    assert outcome['status']=='completed',outcome
-                    assert commands[0]['title']=='request_movej'
-                    assert len(commands)==11 and all(p['title']=='request_servoj' for p in commands[1:])
-                    assert reader.joint_poll_interval()==.5
-                finally:
-                    poll.cancel();await asyncio.gather(poll,return_exceptions=True)
-        finally:await runner.cleanup()
-    asyncio.run(run())
