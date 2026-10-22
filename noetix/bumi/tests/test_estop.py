@@ -98,6 +98,56 @@ def test_unreadable_state_fails_closed(estop, tmp_path):
     assert latch.snapshot()['source'] == 'estop_state_unreadable'
 
 
+@pytest.mark.parametrize('record', [
+    '{}',
+    'null',
+    '[]',
+    '{"latched": 0}',
+    '{"latched": true}',                                      # missing metadata
+    '{"latched": true, "source": 1, "reason": "", "since_ms": null}',
+    '{"latched": false, "source": "", "reason": "", "since_ms": null}',
+])
+def test_schema_invalid_state_fails_closed(estop, tmp_path, record):
+    """A file that exists must never be read as permission to move."""
+    path = tmp_path / 'estop_state.json'
+    path.write_text(record)
+    latch = estop.EmergencyStopLatch(str(path))
+    assert latch.latched is True
+    assert latch.snapshot()['source'] == 'estop_state_invalid'
+
+
+def test_failed_clear_keeps_the_next_start_latched(estop, tmp_path, monkeypatch):
+    path = tmp_path / 'estop_state.json'
+    latch = estop.EmergencyStopLatch(str(path))
+    latch.trigger('estop_card')
+
+    def refuse_unlink(self, missing_ok=False):
+        raise OSError('read-only filesystem')
+
+    monkeypatch.setattr(estop.Path, 'unlink', refuse_unlink)
+    assert latch.reset() is True          # in-memory release succeeded
+    monkeypatch.undo()
+
+    # The old record is still there, so a restart must not come back unlatched.
+    assert estop.EmergencyStopLatch(str(path)).latched is True
+
+
+def test_failed_write_still_restores_latched(estop, tmp_path, monkeypatch):
+    path = tmp_path / 'estop_state.json'
+    latch = estop.EmergencyStopLatch(str(path))
+
+    def fail_fsync(fd):
+        raise OSError('disk full')
+
+    monkeypatch.setattr(estop.os, 'fsync', fail_fsync)
+    latch.trigger('estop_card')
+    monkeypatch.undo()
+
+    # The file was created before the failed write; existence alone means latched.
+    assert path.exists()
+    assert estop.EmergencyStopLatch(str(path)).latched is True
+
+
 def test_latched_loco_refuses_event_commands_inside_the_gate(device, estop):
     """`FALLTOSTAND` has zero velocity but still starts physical motion."""
     latch = estop.EmergencyStopLatch()

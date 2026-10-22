@@ -134,6 +134,10 @@ class BumiDeviceBundle:
         estop_latch = EmergencyStopLatch(
             estop_cfg.get("state_path",
                           "/opt/phanthy-motus/data/bumi/estop_state.json"))
+        if estop_latch.latched and not estop_cfg.get("enabled", False):
+            print("[bundle] WARNING: the estop latch is active but the estop "
+                  "card is disabled; motion stays blocked and cannot be reset "
+                  "over MCP until the card is enabled", flush=True)
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin

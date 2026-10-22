@@ -91,14 +91,44 @@ class EmergencyStopLatch:
                   "starting latched", flush=True)
             self._set_restored("estop_state_unreadable", str(exc))
             return
-        if not isinstance(data, dict) or not data.get("latched"):
+        if not self._valid_record(data):
+            print(f"[estop] {self._state_path} does not match the state "
+                  "schema; starting latched", flush=True)
+            self._set_restored("estop_state_invalid",
+                               "state record failed schema validation")
+            return
+        if data["latched"] is not True:
+            # This driver represents "unlatched" by removing the file. A
+            # syntactically valid record that says otherwise is stale or was
+            # edited by hand, and must not release motion.
+            print(f"[estop] {self._state_path} says unlatched, which this "
+                  "driver never writes; starting latched", flush=True)
+            self._set_restored("estop_state_invalid",
+                               "unexpected unlatched record")
             return
         since = data.get("since_ms")
         self._set_restored(
-            str(data.get("source") or "restored"),
-            str(data.get("reason") or ""),
+            str(data["source"] or "restored"),
+            str(data["reason"]),
             int(since) if isinstance(since, (int, float)) else None,
         )
+
+    @staticmethod
+    def _valid_record(data) -> bool:
+        """The full persisted schema. Anything else is fail-closed."""
+        if not isinstance(data, dict):
+            return False
+        if type(data.get("latched")) is not bool:
+            return False
+        if not isinstance(data.get("source"), str):
+            return False
+        if not isinstance(data.get("reason"), str):
+            return False
+        since = data.get("since_ms")
+        if since is not None and (isinstance(since, bool)
+                                  or not isinstance(since, (int, float))):
+            return False
+        return True
 
     def _set_restored(self, source: str, reason: str, since_ms: int | None = None) -> None:
         self._latched = True
@@ -107,25 +137,57 @@ class EmergencyStopLatch:
         self._since_ms = since_ms if since_ms is not None else _now_ms()
 
     def _persist_locked(self) -> None:
-        """Write the latch to disk. Called with `_lock` held."""
+        """Write the latch to disk. Called with `_lock` held.
+
+        Latched is represented by the file's *existence*, not only its
+        contents: the file is created before the record is written, so a
+        partial write, a full disk, or a failed fsync still leaves something
+        behind and the next start comes back latched. Unlatched is represented
+        by the absence of the file, which only `reset` creates.
+        """
         if self._state_path is None:
             return
+        try:
+            if self._latched:
+                self._write_state_locked()
+            else:
+                self._state_path.unlink(missing_ok=True)
+                self._fsync_parent()
+        except OSError as exc:
+            # Loud on purpose: the running process is already in the requested
+            # state, but the next start may differ. For a failed latch write
+            # the file-existence rule keeps it closed; for a failed reset the
+            # old latched record remains, which is also closed.
+            print(f"[estop] could not persist latch state to {self._state_path}: "
+                  f"{exc}", flush=True)
+
+    def _write_state_locked(self) -> None:
         payload = {
-            "latched": self._latched,
+            "latched": True,
             "source": self._source,
             "reason": self._reason,
             "since_ms": self._since_ms,
         }
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        # Create the marker first: if the content write below fails, an empty
+        # or truncated file is still a latched state on the next start.
+        with open(self._state_path, "a", encoding="utf-8"):
+            pass
+        with open(self._state_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._fsync_parent()
+
+    def _fsync_parent(self) -> None:
         try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._state_path.with_name(self._state_path.name + ".tmp")
-            temporary.write_text(json.dumps(payload))
-            os.replace(temporary, self._state_path)
-        except OSError as exc:
-            # Not fatal for the running process, but it must be loud: the next
-            # restart would come back unlatched.
-            print(f"[estop] could not persist latch state to {self._state_path}: "
-                  f"{exc}", flush=True)
+            directory = os.open(str(self._state_path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     @property
     def latched(self) -> bool:

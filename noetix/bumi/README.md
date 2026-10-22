@@ -460,9 +460,15 @@ software latch**, not a replacement for the robot's physical E-stop button.
   bundle does **not** release the latch.
 - The latch is written to `/opt/phanthy-motus/data/bumi/estop_state.json` and
   restored at startup, so a container restart does **not** release it. The
-  file sits on the same host mount as the other runtime data. An unreadable or
-  corrupt state file comes back **latched** (fail-closed) rather than free to
-  move, and only `reset` with `confirm: true` clears it.
+  file sits on the same host mount as the other runtime data.
+- Latched is represented by the **existence** of that file: `trigger` creates
+  it before writing the record, and `reset(confirm: true)` deletes it. A
+  partial write, a failed fsync, an unreadable file, a syntactically valid but
+  schema-invalid record, or one that claims `latched: false` all come back
+  **latched** (fail-closed) rather than free to move.
+- Disabling `plugins.estop` does **not** clear an existing latch. Motion stays
+  blocked, the bundle logs a warning at startup, and the state file must be
+  removed or the card re-enabled to reset it.
 - `auto_trigger_on_protection` (default off) latches on workmode 26. It is off
   by default because a latched driver also refuses `stand_up`, which is the
   documented way out of protection — enabling it is an operator decision.
