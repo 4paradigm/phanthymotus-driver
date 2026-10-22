@@ -1,0 +1,31 @@
+services:
+  bumi-health-check:
+    build: .
+    image: local/bumi-health-check:demo
+    container_name: bumi-health-check
+    network_mode: host
+    ipc: host
+    environment:
+      BUMI_NAMESPACE: ${BUMI_NAMESPACE:?Set the actual Bumi ROS namespace in .env}
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      FASTRTPS_DEFAULT_PROFILES_FILE: /opt/phanthy-motus/dds-local.xml
+    volumes:
+      - type: bind
+        source: /opt/phanthy-motus/dds-local.xml
+        target: /opt/phanthy-motus/dds-local.xml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config.json
+        target: /work/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
