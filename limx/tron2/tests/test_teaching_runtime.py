@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from teaching_capture import Capture
-from teaching_replay import Replay, pack_trajectory, read_trajectory
+from teaching_replay import Replay, pack_trajectory, read_trajectory, movej_start_target
 from test_teaching_episode import BINDING, jpeg, state
 from skeleton import JOINT_NAMES
 from episode import load_episode
@@ -211,7 +211,11 @@ def test_preparation_failure_never_enters_servoj(failure):
         assert replay.outcome['status']=='error',replay.outcome
         assert not any(kind=='arm' for kind,_ in reader.commands)
         assert sum(kind=='movej' for kind,_ in reader.commands)<=1
-        assert bool(replay.active)==(failure!='not_sent')
+        if replay.release_task:await replay.release_task
+        assert bool(replay.active)==(failure in ('unknown_ack','connection_changed','frozen_timestamp'))
+        if failure in ('arm_stuck','gripper_stuck'):
+            assert replay.outcome['result']['release_method']=='automatic_stable_feedback'
+            assert replay.outcome['status']=='error'
     asyncio.run(run())
 
 
@@ -234,6 +238,94 @@ def test_stop_during_preparation_keeps_uncertain_motion_blocked(stage):
         assert stopped['motion_may_continue'] and not stopped['authority_released']
         assert replay.active['state']=='blocked_requires_operator_check'
         assert not any(kind=='arm' for kind,_ in reader.commands)
+    asyncio.run(run())
+
+
+
+def test_recorded_wrist_start_uses_controller_movej_range(replay_clock):
+    async def run():
+        reader=Reader();states=[state(i) for i in range(6)]
+        for row in states:
+            row['q'][13]=-.7837002873420715
+            row['gripper']=[0,20]
+        raw=pack_trajectory(BINDING,states)
+        original=reader.send_movej
+        async def controller_move(q,duration):
+            assert q[13]==-.7505
+            return await original(q,duration)
+        reader.send_movej=controller_move
+        replay=Replay(reader,allowed,lambda:True)
+        frames,head=await replay.preflight(raw,BINDING)
+        await replay._run('recorded-start',frames,head,30,20)
+        assert replay.outcome['status']=='completed',replay.outcome
+        assert abs(reader.commands[0][1][13]-states[0]['q'][13])<math.radians(2)
+        assert all(q[13]==states[0]['q'][13] for kind,q in reader.commands if kind=='arm')
+        assert pack_trajectory(BINDING,states)==raw
+        states[0]['q'][13]=-.80
+        with pytest.raises(ValueError,match='MoveJ.*2°'):
+            await replay.preflight(pack_trajectory(BINDING,states),BINDING)
+    asyncio.run(run())
+
+
+def test_cancelled_movej_unlocks_only_after_duration_and_stationary_feedback():
+    async def run():
+        reader=Reader();entered=asyncio.Event();original=reader.send_movej
+        async def move(q,duration):
+            result=await original(q,duration);entered.set();return result
+        reader.send_movej=move
+        replay=Replay(reader,allowed,lambda:True)
+        preview=await replay.play(recording(),BINDING,{})
+        await replay.play(recording(),BINDING,dict(execute=True,preview_id=preview['preview_id'],
+            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
+        await entered.wait()
+        stopped=await replay.stop()
+        assert not stopped['authority_released']
+        assert replay.recovering
+        assert time.monotonic()<replay.movej_not_before
+        await replay.release_task
+        assert not replay.active
+        assert replay.outcome['status']=='cancelled'
+        assert replay.outcome['result']['release_method']=='automatic_stable_feedback'
+        assert [kind for kind,_ in reader.commands]==['movej']
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failure',[None,'confirmation','moving','frozen','disconnect','busy','duration','peer'])
+def test_manual_unlock_checks_feedback_without_sending(failure):
+    async def run():
+        reader=Reader();replay=Replay(reader,allowed,lambda:failure!='peer')
+        replay.motion_sent=True
+        replay.outcome={'action_id':'failed','status':'error','result':{'reason':'arrival_failed','motion_may_continue':True}}
+        replay.preview={'id':'old'}
+        args=dict(physical_stop_confirmed=True,exclusive_control_confirmed=True)
+        if failure=='confirmation':args['physical_stop_confirmed']=False
+        if failure=='disconnect':reader.connected=False
+        if failure=='duration':replay.movej_not_before=time.monotonic()+10
+        if failure=='busy':replay.task=asyncio.create_task(asyncio.sleep(10))
+        original=reader.sample
+        def sample(name):
+            r=original(name)
+            if name=='joint_state':
+                if failure=='moving':r['data']['dq'][0]=.1
+                if failure=='frozen':r['data']['robot_timestamp']=1
+            return r
+        reader.sample=sample
+        try:
+            if failure:
+                with pytest.raises(ValueError):await replay.unlock(args)
+                assert replay.active
+            else:
+                result=await replay.unlock(args)
+                assert result['unlocked'] and not result['motion_sent']
+                assert not replay.active and replay.preview is None
+                assert replay.outcome['status']=='error'
+                assert replay.outcome['result']['reason']=='arrival_failed'
+                assert replay.outcome['result']['release_method']=='operator_confirmed_stable_feedback'
+            assert not reader.commands
+        finally:
+            if replay.task:
+                replay.task.cancel()
+                await asyncio.gather(replay.task,return_exceptions=True)
     asyncio.run(run())
 
 
@@ -266,10 +358,11 @@ def test_recording_tolerance_clamps_commands_only(direction,replay_clock):
         for i,s in enumerate(states):
             s['q'][:14]=[v+direction*math.radians(5)*i/5 for v in limits]
             s['gripper']=[0,20]
+        states[0]['q'][:14]=[0]*14
         raw=pack_trajectory(BINDING,states)
         _,frames=read_trajectory(raw,BINDING)
         assert [f['q'] for f in frames]==[s['q'][:14] for s in states]
-        reader=Reader();reader.q[:14]=limits
+        reader=Reader()
         replay=Replay(reader,allowed,lambda:True)
         preview=await replay.play(raw,BINDING,{})
         result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
@@ -277,7 +370,7 @@ def test_recording_tolerance_clamps_commands_only(direction,replay_clock):
         outcome=await replay.wait(result['action_id'])
         assert outcome['status']=='completed',outcome
         commands=[q[:14] for kind,q in reader.commands if kind=='arm']
-        assert commands==[list(limits)]*len(states)
+        assert commands==[[0]*14]+[list(limits)]*(len(states)-1)
         for q in commands:validate_movej(q,.1)
         assert pack_trajectory(BINDING,states)==raw
         assert read_trajectory(raw,BINDING)[1]==frames
@@ -418,10 +511,14 @@ def test_shared_service_packages_and_skill_gate(tmp_path):
         plugin=owner.teaching
         schema=plugin.get_tools()[0]['inputSchema']
         assert set(schema['x-action-params'])=={'start','info','preview','run','stop','import','export'}
-        for action in ('episode_list','episode_details','annotate','training_export','training_info'):
+        for action in ('episode_list','episode_details','annotate','training_export','training_info','unlock'):
             assert action in schema['x-workbench']['actions']
             plugin._validate(action,{})
         assert plugin.dispatch('episode_list',{})['episodes']
+        with pytest.raises(ValueError,match='unlock_operator_confirmation_required'):
+            await asyncio.to_thread(plugin.dispatch,'unlock',{})
+        unlocked=await asyncio.to_thread(plugin.dispatch,'unlock',dict(physical_stop_confirmed=True,exclusive_control_confirmed=True))
+        assert unlocked['unlocked'] and not reader.commands
         draft=await asyncio.to_thread(plugin.dispatch,'new',{'filename':writer.ident})
         assert draft['recording']['training_complete']
         with pytest.raises(ValueError,match='successful_trial_required'):

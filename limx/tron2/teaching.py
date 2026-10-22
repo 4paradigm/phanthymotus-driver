@@ -13,14 +13,14 @@ from common.teaching.package import SCHEMA as PACKAGE_SCHEMA
 from episode import (SCHEMA, TRAJECTORY_SCHEMA, STATE_NAMES, UNITS, atomic_json, digest,
                      encode, episode_path, load_episode)
 from teaching_capture import Capture
-from teaching_replay import Replay, pack_trajectory, read_trajectory
+from teaching_replay import Replay, pack_trajectory, read_trajectory, movej_start_target
 
 
 class TronTeachingAdapter:
     title='TRON2 原厂 VR 录制与回放'
     resources=['arm_l','arm_r','head']
     completion_timeout=1980
-    presentation=dict(passive_recording=True, session_start='observer',
+    presentation=dict(passive_recording=True, manual_unlock=True, session_start='observer',
         joint_groups=[{'label':'左臂','count':7},{'label':'右臂','count':7}], grippers=False,
         recording_label='实测双臂与夹爪', prepare_hint='只读检查反馈和存储；不接管原厂 VR。',
         next_hint='使用原厂 VR 示范。录制器只读取关节、夹爪与三路图像。',
@@ -70,7 +70,7 @@ class TronTeachingAdapter:
             can_record=not busy and self.owner.reader.sample('joint_state')['available'],recording=rec,
             recordings=self.recordings(),teleop_hint='录制器不发送运动命令。停止录制不停止原厂 VR。',
             replay_available=True,control_confirmation='operator_per_execution',last_action=self.replay.outcome,
-            replay_phase=self.replay.phase)
+            replay_phase=self.replay.phase,replay_running=self.replay.busy,recovering=self.replay.recovering)
 
     def check(self):
         checks=[]
@@ -97,7 +97,7 @@ class TronTeachingAdapter:
         raise ValueError('use_original_vendor_vr_recording_does_not_take_control')
 
     def record(self,args):
-        if self.replay.busy:raise ValueError('replay_busy')
+        if self.replay.active:raise ValueError('replay_busy')
         return self.sync(self.capture.start(args.get('task',''),args.get('outcome','unlabelled'),args.get('notes','')))
 
     def finish(self):
@@ -145,8 +145,11 @@ class TronTeachingAdapter:
             feedback=self.owner.reader.sample('joint_state')
             if not feedback['available']:raise ValueError('replay_feedback_stale')
             delta=[a-b for a,b in zip(feedback['data']['q'][:14],frames[0]['q'])]
+            target=movej_start_target(frames[0]['q'])
+            adjustment=max(abs(math.degrees(a-b)) for a,b in zip(target,frames[0]['q']))
             return dict(ready=True,can_trial=True,mode='move_to_start',
-                message='将先低速移动双臂并调整夹爪到录制起点，检查到位后回放；请确认移向起点的路径畅通，并退出原厂 VR。',
+                movej_target_joints_deg=[math.degrees(v) for v in target],movej_adjustment_deg=adjustment,
+                message='将先低速移动双臂并调整夹爪到录制起点，检查到位后回放；请确认路径畅通，并退出原厂 VR。'+(f'MoveJ 准备目标受厂家范围限制，与首帧最大相差 {adjustment:.2f}°（允许 2°）；回放目标不变。' if adjustment>.001 else ''),
                 joint_delta_deg=[math.degrees(v) for v in delta],
                 target_joints_deg=[math.degrees(v) for v in frames[0]['q']],tolerance_label='移到起点后核验：双臂 2°、夹爪 3 单位')
         except (ValueError,OSError) as exc:
@@ -196,7 +199,9 @@ class TronTeachingPlugin(TeachingPlugin):
         schema['properties'].update({k:{'type':'string'} for k in ('task','outcome','notes','episode_id')})
         schema['properties'].update({k:{'type':'number','minimum':0,'maximum':100} for k in ('gripper_speed','gripper_force')})
         schema['properties']['exclusive_control_confirmed']={'type':'boolean','description':'操作者明确确认本次原厂 VR 及其他控制程序已停止，并在回放期间保持独占；不得自行填写 true'}
-        extra={'episode_list':([], '列出完整及诊断录制'),
+        schema['properties']['physical_stop_confirmed']={'type':'boolean','description':'操作者现场确认机器人已停止；不得自行填写 true'}
+        extra={'unlock':([], '现场确认后检查静止并解除回放占用，不发送运动'),
+            'episode_list':([], '列出完整及诊断录制'),
             'episode_details':(['episode_id'],'查看数据质量'),
             'annotate':(['episode_id','task','outcome','notes'],'更新任务、结果和备注'),
             'training_export':(['episode_id'],'异步导出 LeRobot v3；不要求回放'),
@@ -214,6 +219,10 @@ class TronTeachingPlugin(TeachingPlugin):
         self._validate(action,args)
         if action=='info':
             return {**super().dispatch(action,args),'training_export':self.export_job}
+        if action=='unlock':
+            with self.lock:
+                if self.adapter.capture.info()['recording']:raise ValueError('finish_recording_first')
+                return self.adapter.sync(self.adapter.replay.unlock(args))
         if action=='episode_list':return {'episodes':self.adapter.recordings()}
         if action=='training_info':return {'export':self.export_job}
         if action in ('episode_details','annotate','training_export'):

@@ -88,8 +88,9 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
   <details id="episode-history" class="details-card" hidden><summary>全部录制与失败诊断</summary><div class="load"><select id="episodes" aria-label="选择诊断录制"></select><button id="episode-details-btn">查看数据质量</button></div></details>
   <p id="chat-hint" class="note" hidden></p>
 </main>
-<footer><div class="row"><button id="stop-btn" class="stop" disabled>■ 停止动作</button><small id="footer-hint">检查不会启动机器人动作。</small></div><div class="footer-buttons"><button id="back-btn" hidden>上一步</button><button id="check-btn" class="primary">检查设备</button><button id="next-btn" disabled>进入录制 →</button><button id="to-save-btn" class="primary" hidden disabled>下一步：保存 →</button><button id="import-enable-btn" class="primary" hidden disabled>效果符合预期，启用技能</button><button id="save-btn" class="primary" hidden disabled>保存技能</button><button id="new-record-btn" class="primary" hidden>录制下一个动作</button></div></footer>
+<footer><div class="row"><button id="stop-btn" class="stop" disabled>■ 停止动作</button><button id="unlock-btn" hidden>手动解锁</button><small id="unlock-status" role="status"></small><small id="footer-hint">检查不会启动机器人动作。</small></div><div class="footer-buttons"><button id="back-btn" hidden>上一步</button><button id="check-btn" class="primary">检查设备</button><button id="next-btn" disabled>进入录制 →</button><button id="to-save-btn" class="primary" hidden disabled>下一步：保存 →</button><button id="import-enable-btn" class="primary" hidden disabled>效果符合预期，启用技能</button><button id="save-btn" class="primary" hidden disabled>保存技能</button><button id="new-record-btn" class="primary" hidden>录制下一个动作</button></div></footer>
 <section id="confirm" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">确认本次接管</h2><p id="confirm-description"></p><details class="details-card"><summary>设备绑定</summary><p id="confirm-binding" class="note"></p></details><div id="gripper-replay-fields" hidden style="margin-top:16px"><label class="field"><span>夹爪速度档位（1–100）</span><input id="replay-gripper-speed" type="number" min="1" max="100" step="1" inputmode="numeric" placeholder="必填，例如 50"></label><label class="field"><span>夹爪力档位（0–100）</span><input id="replay-gripper-force" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="必填，例如 30"></label></div><label><input type="checkbox" id="confirm-control"><span id="confirm-control-label">已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。</span></label><div id="confirm-error" class="error" role="alert" hidden></div><div class="row"><button id="confirm-cancel">取消</button><button id="confirm-go" class="primary" disabled>确认并执行</button></div></div></section>
+<section id="unlock-confirm" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="unlock-title"><h2 id="unlock-title">手动解锁</h2><p>解锁只检查反馈并解除本卡占用，不发送停止或运动命令。上次失败结果会保留，解锁后需重新检查起点。</p><label><input id="unlock-confirmed" type="checkbox"><span>我已确认机器人停止，PICO 遥操和其他控制程序已退出。</span></label><div class="row"><button id="unlock-confirm-cancel">取消</button><button id="unlock-go" class="primary" disabled>确认并检查</button></div></div></section>
 <!-- TRON2 新增：录制前任务描述（同确认框风格），不推挤录制页布局 -->
 <section id="record-start" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="record-start-title"><h2 id="record-start-title">开始只读录制</h2><p>录制只读取双臂关节、双夹爪和三路图像，不接管控制，也不进入或退出原厂 VR。</p><label class="field" style="margin-top:16px"><span>任务描述（必填）</span><textarea id="record-task" maxlength="2000" placeholder="例如：把红色方块放入托盘"></textarea></label><div id="record-task-error" class="error" role="alert" hidden>请填写任务描述，最多 2000 字。</div><div class="row" style="margin-top:16px"><button id="record-start-cancel">取消</button><button id="record-start-go" class="primary">开始录制</button></div></div></section>
 
@@ -101,7 +102,7 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
   let inspectedImport, autoExecuteChoice=null;
   let training=null, dialogFocus;
 
-  const errors={operator_exclusive_confirmation_required:'请确认原厂 VR 和其他控制程序已停止，并保持回放期间独占。',task_required_max_2000:'请填写任务描述，最多 2000 字。',trajectory_time_gap:'录制存在超过 100 ms 的关节缺口，禁止连续回放。训练导出会排除缺口。',exclusive_control_unverified:'尚未确认原厂 VR 已退出及控制独占，禁止回放。',complete_three_camera_gripper_episode_required:'三路图像或双夹爪数据不齐全，不能导出完整训练数据。',export_destination_exists:'此录制已有导出目录，已保留原结果。',replay_start_mismatch_no_automatic_return:'起点不匹配，请手动恢复双臂与夹爪后重试。',robot_busy_wait_for_completion:'请等待当前动作结束。',successful_trial_required:'请先完成试运行。',complete_recording_required:'尚无完整录制，请结束录制或重新录制。',paired_preview_required:'确认已失效，请重新预览。',teaching_draft_changed_reload:'草稿已在其他页面更改，请重新操作。',teaching_preview_expired:'预览已失效，请重新检查并确认。',live_mapped_teleop_required:'请确认 VR 输入有效，并松握、长按 X+A 建立基准。',live_mapped_teleop_input_required:'请等待有效 VR 输入，并松开双手握键完成映射。',input_timeout_restart_required:'未收到 VR 输入，请检查头显后重新进入遥操。',input_stale_restart_required:'VR 输入已中断，请检查头显后重新进入遥操。',tracking_lost_restart_required:'跟踪已丢失，请恢复跟踪后重新进入遥操。'};
+  const errors={replay_running_cannot_unlock:'动作或恢复检查正在执行，请先停止并等待结束。',unlock_operator_confirmation_required:'请确认机器人已停止，PICO 遥操和其他控制已退出。',movej_duration_not_elapsed:'厂家 MoveJ 规划时长尚未结束，请稍后再检查。',replay_start_arrival_not_verified:'未确认到达录制起点，后续回放已停止。',operator_exclusive_confirmation_required:'请确认原厂 VR 和其他控制程序已停止，并保持回放期间独占。',task_required_max_2000:'请填写任务描述，最多 2000 字。',trajectory_time_gap:'录制存在超过 100 ms 的关节缺口，禁止连续回放。训练导出会排除缺口。',exclusive_control_unverified:'尚未确认原厂 VR 已退出及控制独占，禁止回放。',complete_three_camera_gripper_episode_required:'三路图像或双夹爪数据不齐全，不能导出完整训练数据。',export_destination_exists:'此录制已有导出目录，已保留原结果。',replay_start_mismatch_no_automatic_return:'起点不匹配，请手动恢复双臂与夹爪后重试。',robot_busy_wait_for_completion:'请等待当前动作结束。',successful_trial_required:'请先完成试运行。',complete_recording_required:'尚无完整录制，请结束录制或重新录制。',paired_preview_required:'确认已失效，请重新预览。',teaching_draft_changed_reload:'草稿已在其他页面更改，请重新操作。',teaching_preview_expired:'预览已失效，请重新检查并确认。',live_mapped_teleop_required:'请确认 VR 输入有效，并松握、长按 X+A 建立基准。',live_mapped_teleop_input_required:'请等待有效 VR 输入，并松开双手握键完成映射。',input_timeout_restart_required:'未收到 VR 输入，请检查头显后重新进入遥操。',input_stale_restart_required:'VR 输入已中断，请检查头显后重新进入遥操。',tracking_lost_restart_required:'跟踪已丢失，请恢复跟踪后重新进入遥操。'};
   const readable = value => errors[value] || value;
   const presentation = () => status.presentation || {};
   const groups = () => presentation().joint_groups || [];
@@ -219,6 +220,8 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     $('next-btn').classList.toggle('primary',!!checks?.ready);$('check-btn').classList.toggle('primary',!checks?.ready);
     $('back-btn').hidden=stage===0 || stage===2 || installed;$('back-btn').disabled=locked || moving;
     $('stop-btn').disabled=online && !moving && !busy;
+    $('unlock-btn').hidden=!presentation().manual_unlock;
+    $('unlock-btn').disabled=locked || !!status.replay_running || !!status.recovering || !!rec.recording;
     $('record-dot').classList.toggle('live',!!rec.recording);
     $('motion-state').textContent=rec.recording?'正在录制':moving?'遥操中':'准备进入遥操';
     $('live-duration').textContent=timeLabel(rec.elapsed_seconds);$('frame-count').textContent=String(rec.frames || 0);
@@ -242,7 +245,8 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     $('trial-status').classList.toggle('success',trial?.status==='completed');
     $('trial-status').classList.toggle('running',trial?.status==='running');
     $('trial-help').textContent=trial?.status==='completed'?'请观察实际动作效果，确认后保存技能。':trial?.status==='error'?readable(trial.result?.reason) || '请检查设备后重试。':moving?'请观察真机，必要时停止动作。':presentation().trial_hint || '恢复物体布置，检查起点后试运行。';
-    if(trial?.result?.motion_may_continue)$('trial-help').textContent+=' 后续步骤已停止；厂家当前运动可能仍在继续，请现场检查。';
+    if(trial?.result?.motion_may_continue && moving)$('trial-help').textContent+=' 厂家当前运动可能仍在继续，请现场检查。';
+    if(trial?.result?.release_method)$('trial-help').textContent+=' 已核验静止并解除占用；重新检查起点后可再次试运行。';
     if(trial?.status!=='completed' || approvedTrial!==trial.action_id){approvedTrial=null;$('effect').checked=false;}
     $('effect').disabled=locked || moving || trial?.status!=='completed';
     $('to-save-btn').disabled=locked || moving || !$('effect').checked;
@@ -426,12 +430,21 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
   $('confirm-control').onchange=()=>{$('confirm-go').disabled=!$('confirm-control').checked;};
   $('confirm-cancel').onclick=()=>{preview=null;$('confirm').hidden=true;if(presentation().passive_recording)dialogFocus?.focus();};
   $('confirm-go').onclick=()=>act(async()=>{if(!$('confirm-control').checked)throw new Error('请确认本次接管');if(!preview || Date.now()-preview.created>60000)throw new Error('预览已过期，请取消后重试。');if(presentation().passive_recording && ['replay-gripper-speed','replay-gripper-force'].some(id=>$(id).value==='' || !$(id).checkValidity()))throw new Error('请填写有效的夹爪速度和力档位。');const p=preview;preview=null;$('confirm').hidden=true;await call(p.action,{draft_id:draft.id,execute:true,preview_id:p.preview_id,workspace_clear:true,take_control:true,...(presentation().passive_recording?{exclusive_control_confirmed:true,gripper_speed:Number($('replay-gripper-speed').value),gripper_force:Number($('replay-gripper-force').value)}:{})});if(p.action==='trial' && inspection)inspection.start={ready:false,can_trial:false,error:'再次试运行前需复查'};});
+  $('unlock-btn').onclick=()=>{dialogFocus=document.activeElement;$('unlock-confirmed').checked=false;$('unlock-go').disabled=true;$('unlock-confirm').hidden=false;$('unlock-confirmed').focus();};
+  $('unlock-confirmed').onchange=()=>{$('unlock-go').disabled=!$('unlock-confirmed').checked;};
+  $('unlock-confirm-cancel').onclick=()=>{$('unlock-confirm').hidden=true;dialogFocus?.focus();};
+  $('unlock-go').onclick=()=>act(async()=>{
+    if(!$('unlock-confirmed').checked)throw new Error('请先确认现场已停止');
+    $('unlock-confirm').hidden=true;dialogFocus?.focus();$('unlock-status').textContent='正在检查静止状态…';
+    try{await call('unlock',{physical_stop_confirmed:true,exclusive_control_confirmed:true});inspection=null;preview=null;$('confirm').hidden=true;$('unlock-status').textContent='已解锁，请重新检查起点';}
+    catch(error){$('unlock-status').textContent='检查未通过，保持占用';throw error;}
+  });
   $('stop-btn').onclick=async()=>{preview=null;$('confirm').hidden=true;try{await call('stop');await refresh();}catch(error){fail(error);}};
   document.addEventListener('keydown',event=>{
     if(!presentation().passive_recording)return;
-    const dialog=!$('record-start').hidden?$('record-start'):!$('confirm').hidden?$('confirm'):null;
+    const dialog=['record-start','confirm','unlock-confirm'].map($).find(el=>!el.hidden);
     if(!dialog)return;
-    if(event.key==='Escape' && !busy){event.preventDefault();$(dialog.id==='confirm'?'confirm-cancel':'record-start-cancel').click();}
+    if(event.key==='Escape' && !busy){event.preventDefault();$(dialog.id+'-cancel').click();}
     if(event.key==='Tab'){
       const items=[...dialog.querySelectorAll('button,input,textarea,summary')].filter(el=>!el.disabled && el.getClientRects().length);
       const first=items[0],last=items.at(-1);

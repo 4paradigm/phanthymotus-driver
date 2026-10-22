@@ -25,6 +25,23 @@ START_ARRIVAL_TIMEOUT = 10
 START_GRIPPER_TIMEOUT = 30
 
 
+# LimX tron2_manipulation_controller 482ebbc: robot_model.CONTROLLER_ARM_LIMITS.
+# MoveJ uses narrower wrist limits than the SDK's recorded/ServoJ arm range.
+MOVEJ_START_LOWER = (-3.14159,-.261799,-3.66519,-2.61799,-1.74533,-.7505,-.7505,
+                     -3.14159,-2.96706,-1.48353,-2.61799,-1.39626,-.7505,-.7505)
+MOVEJ_START_UPPER = (2.60054,2.96706,1.48353,.523599,1.39626,.7505,.7505,
+                     2.60054,.261799,3.66519,.523599,1.74533,.7505,.7505)
+
+
+def movej_start_target(q):
+    target=[min(high,sdk_high,max(low,sdk_low,value)) for value,low,high,sdk_low,sdk_high
+        in zip(q,MOVEJ_START_LOWER,MOVEJ_START_UPPER,ARM_LOWER,ARM_UPPER)]
+    for index,(value,planned) in enumerate(zip(q,target)):
+        if abs(value-planned)>START_RAD:
+            raise ValueError('录制起点超出 MoveJ 可达范围超过 2°，关节 '+str(index))
+    return target
+
+
 def pack_trajectory(binding, states):
     start = states[0]['received_ns']
     header = dict(type='header', schema=TRAJECTORY_SCHEMA, binding=binding, state_names=STATE_NAMES,
@@ -89,6 +106,11 @@ class Replay:
         self.motion_sent=False
         self.phase=None
         self.connection=None
+        self.recovering=False
+        self.movej_not_before=0
+        self.movej_acknowledged=False
+        self.command_pending=False
+        self.release_task=None
 
     @property
     def busy(self):
@@ -96,6 +118,8 @@ class Replay:
 
     @property
     def active(self):
+        if self.recovering:
+            return {'state':'checking_release'}
         if self.busy:
             return {'state':'running'}
         if self.outcome and self.outcome['result'].get('motion_may_continue'):
@@ -153,8 +177,9 @@ class Replay:
             feedback=await self.fresh_feedback()
         if max(map(abs,feedback['dq']))>=math.radians(1):
             raise ValueError('replay_start_not_stationary')
-        duration=duration_for_change(max(abs(math.degrees(a-b)) for a,b in zip(feedback['q'][:14],frames[0]['q'])))
-        validate_movej(frames[0]['q'],duration)
+        target=movej_start_target(frames[0]['q'])
+        duration=duration_for_change(max(abs(math.degrees(a-b)) for a,b in zip(feedback['q'][:14],target)))
+        validate_movej(target,duration)
         return frames,feedback['q'][14:]
 
     async def play(self, raw, binding, args):
@@ -180,6 +205,9 @@ class Replay:
         ident='tron2_teach_'+uuid4().hex
         self.outcome={'action_id':ident,'status':'running','result':{}}
         self.motion_sent=False
+        self.movej_not_before=0
+        self.movej_acknowledged=False
+        self.command_pending=False
         self.phase='checking_start'
         self.task=asyncio.create_task(self._run(ident,frames,head,speed,force))
         return {'state':'running','action_id':ident}
@@ -219,13 +247,17 @@ class Replay:
     async def _prepare_start(self, first, head, speed, force):
         feedback=await self.fresh_feedback()
         feedback=await self._wait_at_start(feedback['q'][:14],head,timeout=3)
-        duration=duration_for_change(max(abs(math.degrees(a-b)) for a,b in zip(feedback['q'][:14],first['q'])))
-        validate_movej(first['q'],duration)
+        target=movej_start_target(first['q'])
+        duration=duration_for_change(max(abs(math.degrees(a-b)) for a,b in zip(feedback['q'][:14],target)))
+        validate_movej(target,duration)
         self.phase='moving_to_start'
         # Establish the vendor position target with MoveJ before entering ServoJ.
         self.motion_sent=True
+        self.movej_not_before=time.monotonic()+duration+5+getattr(self.reader,'settings',{}).get('response_timeout_seconds',5)
         try:
-            await self.reader.send_movej(first['q'],duration)
+            await self.reader.send_movej(target,duration)
+            self.movej_acknowledged=True
+            self.movej_not_before=time.monotonic()+duration
         except MoveError as exc:
             if exc.motion_sent is False:self.motion_sent=False
             raise
@@ -235,7 +267,9 @@ class Replay:
         for side,value in zip(('left','right'),first['gripper']):
             if abs(grip[side]['opening']-value)>GRIP_TOLERANCE:
                 await self.guard()
+                self.command_pending=True
                 await self.reader.send_gripper({side+'_opening':value,side+'_speed':speed,side+'_force':force})
+                self.command_pending=False
         self.phase='verifying_start'
         await self._wait_at_start(first['q'],head,timeout=START_GRIPPER_TIMEOUT,grippers=first['gripper'])
 
@@ -275,7 +309,9 @@ class Replay:
                         sent+=1
                         for i,side in enumerate(('left','right')):
                             if frame['gripper'][i]!=last_grip[i]:
+                                self.command_pending=True
                                 await self.reader.send_gripper({side+'_opening':frame['gripper'][i],side+'_speed':speed,side+'_force':force})
+                                self.command_pending=False
                         last_grip=frame['gripper'];previous=frame
                     # Sending the final frame is not completion. Require advancing feedback.
                     deadline=time.monotonic()+5
@@ -303,19 +339,65 @@ class Replay:
         finally:
             result['phase']=self.phase
             self.phase=None
-            self.connection=None
             self.preview=None
             self.outcome={'action_id':ident,'status':status,'result':dict(result,motion_sent=self.motion_sent,
                 samples_sent=sent,output_stopped=True,motion_may_continue=self.motion_sent and not result['physical_stop_verified'])}
+            if self.motion_sent and not result['physical_stop_verified'] and self.movej_acknowledged and not self.command_pending:
+                self.recovering=True
+                self.release_task=asyncio.create_task(self._release_after_motion())
+            else:
+                self.connection=None
+
+    async def _release_after_motion(self):
+        try:
+            await asyncio.sleep(max(0,self.movej_not_before-time.monotonic()))
+            await self._verify_stopped()
+            self.outcome['result'].update(physical_stop_verified=True,motion_may_continue=False,
+                release_method='automatic_stable_feedback')
+        except (ValueError,OSError,asyncio.TimeoutError) as exc:
+            self.outcome['result']['release_error']=str(exc)
+        finally:
+            self.connection=None
+            self.recovering=False
+
+    async def _verify_stopped(self):
+        with self.reader.teaching_feedback():
+            feedback=await self.fresh_feedback()
+            grip=state_data(await self.reader.read_gripper())
+            await self._wait_at_start(feedback['q'][:14],feedback['q'][14:],timeout=3,
+                grippers=[grip[side]['opening'] for side in ('left','right')])
+
+    async def unlock(self, args):
+        if self.busy or self.recovering:
+            raise ValueError('replay_running_cannot_unlock')
+        if args.get('physical_stop_confirmed') is not True or args.get('exclusive_control_confirmed') is not True:
+            raise ValueError('unlock_operator_confirmation_required')
+        if self.motion_sent and time.monotonic()<self.movej_not_before:
+            raise ValueError('movej_duration_not_elapsed')
+        self.recovering=True
+        self.connection=(getattr(self.reader,'ws',None),self.reader.serial)
+        try:
+            await self._verify_stopped()
+            if self.outcome:
+                self.outcome['result'].update(physical_stop_verified=True,motion_may_continue=False,
+                    release_method='operator_confirmed_stable_feedback')
+            self.epoch+=1;self.preview=None
+            return dict(unlocked=True,motion_sent=False,authority_released=True)
+        finally:
+            self.connection=None
+            self.recovering=False
 
     async def stop(self):
         self.epoch+=1;self.preview=None
         if self.busy:
             self.task.cancel()
             await self.task
-        return {'output_stopped':True,'physical_stop_verified':False,'motion_may_continue':self.motion_sent,
+        result=(self.outcome or {}).get('result',{})
+        return {'output_stopped':True,'physical_stop_verified':result.get('physical_stop_verified',False),
+                'motion_may_continue':result.get('motion_may_continue',self.motion_sent),
                 'busy':bool(self.active),'authority_released':not bool(self.active),
-                'message':'已停止发送；未确认机器人已物理停止','last_action':self.outcome}
+                'message':'已停止发送；已核验反馈静止' if result.get('physical_stop_verified') else '已停止发送；未确认机器人已物理停止',
+                'last_action':self.outcome}
 
     async def wait(self, ident):
         if self.task:
