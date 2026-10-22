@@ -122,8 +122,18 @@ class Replay:
         if self.active:
             raise ValueError('replay_busy')
         _,frames=read_trajectory(raw,binding)
-        feedback=await self.guard()
-        grip=state_data(await self.reader.read_gripper())
+        # Idle polling is slower than the replay freshness limit; wake the sole reader.
+        with self.reader.pose_feedback():
+            deadline=time.monotonic()+.5
+            while True:
+                sample=self.reader.sample('joint_state')
+                if sample['available'] and sample['reception_age_seconds']<=.1:
+                    break
+                if time.monotonic()>=deadline:
+                    raise ValueError('replay_feedback_stale')
+                await asyncio.sleep(.01)
+            grip=state_data(await self.reader.read_gripper())
+            feedback=await self.guard()
         delta=[a-b for a,b in zip(feedback['q'][:14],frames[0]['q'])]
         if max(map(abs,delta))>START_RAD or any(abs(grip[s]['opening']-v)>GRIP_TOLERANCE for s,v in zip(('left','right'),frames[0]['gripper'])):
             raise ValueError('replay_start_mismatch_no_automatic_return')

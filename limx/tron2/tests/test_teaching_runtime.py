@@ -39,6 +39,10 @@ class Reader:
         yield
 
     @contextmanager
+    def pose_feedback(self):
+        yield
+
+    @contextmanager
     def pose_servo(self,job):
         yield {'job':job}
 
@@ -52,6 +56,35 @@ class Reader:
 
 
 async def allowed():return True
+
+
+@pytest.mark.parametrize('refresh',[True,False])
+def test_preflight_refreshes_idle_feedback_without_motion(refresh):
+    async def run():
+        reader=Reader();reader.fresh=False;reader.leased=False
+        original=reader.sample
+        def sample(name):
+            result=original(name)
+            if name=='joint_state' and not reader.fresh:
+                result['reception_age_seconds']=.4
+            return result
+        reader.sample=sample
+        @contextmanager
+        def lease():
+            reader.leased=True
+            timer=asyncio.get_running_loop().call_later(.03,setattr,reader,'fresh',refresh)
+            try:yield
+            finally:
+                timer.cancel();reader.leased=False
+        reader.pose_feedback=lease
+        replay=Replay(reader,allowed,lambda:True)
+        if refresh:
+            await replay.preflight(recording(),BINDING)
+        else:
+            with pytest.raises(ValueError,match='replay_feedback_stale'):
+                await replay.preflight(recording(),BINDING)
+        assert not reader.leased and not reader.commands
+    asyncio.run(run())
 
 
 def recording(count=6):
