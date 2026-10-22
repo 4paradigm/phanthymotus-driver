@@ -89,7 +89,7 @@ COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
-
+COPY squat_count.py squat_counter.py squat_llm_count.py /work/
 # Add SDK DDS libs + pybind modules to paths
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
 ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build

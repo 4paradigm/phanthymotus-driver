@@ -158,6 +158,30 @@ Confirm a direction event reaches the ASR input and the canvas viewer on the
 target robot, including no-event/stale states. Keep the release check open
 until those published-image and robot checks pass.
 
+## `squat_counter` card
+
+Connect Bumi's camera `image/jpeg` output to Perception `pose`, then connect
+pose's first `data/json` output (`/<camera-topic>/poses`) to `squat_counter`.
+Connect the counter's `data/json` output (`/<namespace>/squat/count`) to
+`decision_core` for LLM-driven speech; connect a TTS card to the speaker.
+
+The counter waits for a confidently observed standing posture, then a held
+`crouching` posture, then a held `standing` posture for the **same pose track ID**.
+It publishes only completed repetitions, for example
+`{"type":"squat_completed","priority":1,"track_id":2,"count":3,"timestamp":...}`.
+The `priority` routes this sparse event to the main Agent rather than the
+background sensor batch. The card does not speak itself; a Skill can instruct
+the Agent to call TTS with the reported count. A copy-ready instruction and
+activation steps are in [`SQUAT_SKILL.md`](SQUAT_SKILL.md).
+
+Only one person is counted per session (the first confident standing person).
+Losing that track for more than `lost_s` cancels a partial repetition; the next
+standing person can take over without resetting the total. `reset` clears the
+total, `stop` disconnects the topic and clears the session. Tune `hold_s`,
+`lost_s` and `min_confidence` in `config.yaml`; side-on full-body framing is
+necessary to distinguish crouching from sitting. A pose `track_id` is temporary,
+not a person's identity. The card starts with the canvas, not at container boot.
+
 ## App 图传与 Phanthy Camera Card
 
 Bumi 的官方 App 图传服务 `noetix-video-capture.service` 会占用 RealSense。
