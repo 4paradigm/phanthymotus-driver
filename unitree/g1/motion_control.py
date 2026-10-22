@@ -359,7 +359,9 @@ class MotionControl:
                 if not preview:
                     if current['state'] == 'hold' and (not current.get('continuation_ready') or
                             body['generated_ns'] < (current.get('continuation_after_ns') or current.get('hold_confirmed_ns') or 2**63)):
-                        raise ValueError('waiting_fresh_input_after_hold')
+                        self._decision = {'state':'rejected', 'reason':'waiting_fresh_input_after_hold',
+                            'seq':body['seq'], 'source_seq':body['source_seq'], 'monotonic_ns':now}
+                        return False
                     if current['state'] not in ('ready','active','hold'): raise ValueError('motion_not_armed')
                     self._joint_seq = max(self._joint_seq+1,self.gate.seq+1,body['seq'])
                     command = envelope(lease,seq=self._joint_seq,source_seq=body['source_seq'],

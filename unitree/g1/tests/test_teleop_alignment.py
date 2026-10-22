@@ -288,3 +288,30 @@ def test_rejected_candidate_keeps_grip_enabled_for_next_valid_target(tmp_path):
     feed(5, True)
     assert card._enabled and card._state == 'active'
     assert len(outputs) == before+1 and outputs[-1]['source_seq'] == 5
+
+
+@pytest.mark.parametrize('ready', [False, True])
+def test_continuation_wait_keeps_grips_enabled_and_preserves_stop_reason(tmp_path, ready):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2); feed(3, True)
+    before, intent = len(outputs), motion._intent
+    status, solve = motion.gate.status, motion.solver.solve_frame
+    continuation = {'continuation_ready':ready, 'continuation_after_ns':None, 'resume_ready':False}
+    motion.gate.status = lambda: dict(status(), reason='command_timeout', **continuation)
+    def hold_during_solve(*args):
+        result = solve(*args)
+        motion.gate.state = 'hold'
+        continuation['continuation_after_ns'] = time.monotonic_ns()
+        return result
+    motion.solver.solve_frame = hold_during_solve
+    feed(4, True)
+    assert card._enabled and len(outputs) == before
+    assert motion._decision['state'] == 'rejected'
+    assert motion._decision['reason'] == 'waiting_fresh_input_after_hold'
+    assert not motion.gate.holds and motion._intent is intent
+    assert motion.gate.status()['reason'] == 'command_timeout'
+    motion.solver.solve_frame = solve
+    continuation.update(continuation_ready=True, resume_ready=True)
+    feed(5, True)
+    assert card._enabled and card._state == 'active'
+    assert len(outputs) == before+1 and outputs[-1]['source_seq'] == 5

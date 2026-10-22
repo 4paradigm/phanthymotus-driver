@@ -118,3 +118,52 @@ def test_joint_reference_speed_bound_with_irregular_inputs_and_gaps(tmp_path):
         current=channel.positions[-1][0]
         assert max(abs(a-b) for a,b in zip(current,previous)) <= min(ms/1000,.05)+1e-12
         previous=current
+
+
+@pytest.mark.parametrize('ready', [False, True])
+@pytest.mark.parametrize('hold_kind', ['recoverable', 'operator_pause', 'release'])
+def test_inflight_candidate_cannot_bypass_hold_but_next_fresh_target_can_continue(tmp_path, ready, hold_kind):
+    from motion_control import MotionControl
+    from test_motion_control_contract import Worker
+    from common.motion.protocol import envelope
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.set_joint_publisher(arm.accept_control)
+    motion = MotionControl({}, arm)
+    motion.solver = Worker()
+    motion.solver.profile, motion.solver.profile_sha256 = arm.profile, arm.profile_sha256
+    motion._live_session = arm.session_id
+    def submit(seq):
+        now = arm.clock()
+        motion.receive_eef(envelope(motion._lease(), seq=seq, source_seq=seq, mapping_epoch=0,
+            generated_ns=now, valid_until_ns=now+300_000_000, mode='eef_pose',
+            values=[0,0,0,0,0,0,1]*2, **motion.versions))
+        return motion.process_latest()
+    assert submit(1)
+    advance(10); arm.tick()
+    session, applied, intent = arm.session_id, arm.applied_seq, motion._intent
+    reason = 'motion_envelope_exceeded' if hold_kind == 'recoverable' else hold_kind
+    solve = motion.solver.solve_frame
+    def hold_during_solve(*args):
+        result = solve(*args)
+        arm.hold(reason, recoverable=hold_kind == 'recoverable', release=hold_kind == 'release')
+        if ready:
+            advance(1); arm.tick()
+        return result
+    motion.solver.solve_frame = hold_during_solve
+    assert not submit(2)
+    assert arm.state == 'hold' and arm.reason == reason
+    assert arm.latest is None and arm.applied_seq == applied
+    assert motion._intent is intent and len(channel.positions) == 1
+    assert motion._decision['state'] == 'rejected'
+    advance(10); arm.tick()
+    motion.solver.solve_frame = solve
+    if hold_kind != 'recoverable':
+        assert not submit(3)
+        assert arm.state == 'hold' and arm.reason == reason
+        assert arm.applied_seq == applied and len(channel.positions) == 1
+        assert arm.release_requested == (hold_kind == 'release')
+        return
+    assert submit(3)
+    advance(10); arm.tick()
+    assert arm.session_id == session and arm.applied_seq > applied
+    assert len(channel.positions) == 2
