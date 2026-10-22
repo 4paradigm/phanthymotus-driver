@@ -76,9 +76,21 @@ class _Client:
 
 def _plugin(status):
     module = _load_device_module()
+    # The dynamically loaded device imports the shared stdlib time module.
+    # Rebind this module's reference instead of disabling sleeps process-wide;
+    # later finite-speed plant tests need real elapsed time.
+    module.time = types.SimpleNamespace(**vars(module.time))
     module.time.sleep = lambda _: None
     client = _Client(status)
     return module, module.HomePlugin({}, "", None, client), client
+
+
+def test_home_time_stub_does_not_replace_process_sleep():
+    import time
+    sleep = time.sleep
+    module, _, _ = _plugin({"action_state": 1, "result": 0})
+    assert time.sleep is sleep
+    assert module.time.sleep is not sleep
 
 
 def test_home_schema_owns_go_home():

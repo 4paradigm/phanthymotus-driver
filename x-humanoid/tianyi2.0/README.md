@@ -1,8 +1,24 @@
 # Tianyi 2.0 Pro Driver
 
+> 两卡遥操：`teleop_device` → `teleop_control`；Core / ActuCore 零改动。使用方式见 [遥操说明](TELEOP_CONTROL.md)。离线验证、镜像构建与真机验收分别记录。
+
 Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
+
+## 双 Driver 遥操
+
+Canvas 连接设备的 `data/teleop-cmd` 输出到本卡，固定 `/teleop/command`。
+状态发布 `/teleop/state` 供 Canvas 监控；不返回 PICO、不需要额外反馈边。
+模型、TCP 和速度预设随镜像提供，齿轮只显示说明；普通用户无需填写标定路径或切换 Shadow/Live。
+
+启动项目后保持双握把松开，Driver 以新鲜输入和实测 FK 建立初始映射；双握把跟随，
+松握保持、重握沿用原映射。停止项目结束遥操，不自动收臂。
+需要收臂时使用已有 `arm_gesture.reset`，选择 `both`；该入口先终止遥操，再执行原中性姿态流程。
+空间重置需停止再启动项目。恢复不会重放旧目标或自动清除硬件故障。
+
+首版仅双臂，不驱动手、腿或底盘。IK 子进程和厂商/本地 DDS 隔离保持不变。
+原 `arm`、`arm_gesture` 和 `servo` 接口保留。详见 [TELEOP_CONTROL.md](TELEOP_CONTROL.md)。
 
 ## Head camera snapshot card
 
