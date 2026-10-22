@@ -1,0 +1,17 @@
+linkerhand-l20:
+  image: bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/linkerhand/l20:latest
+  container_name: embodied-linkerhand-l20
+  privileged: true
+  network_mode: host
+  volumes:
+    - /dev:/dev
+    - /run/udev:/run/udev:ro
+  environment:
+    - PYTHONUNBUFFERED=1
+    - AGENT_CORE_URL=https://127.0.0.1:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
