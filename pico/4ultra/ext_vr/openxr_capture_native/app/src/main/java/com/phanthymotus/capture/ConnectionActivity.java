@@ -79,7 +79,7 @@ public final class ConnectionActivity extends Activity {
         devices = new LinearLayout(this); devices.setOrientation(LinearLayout.VERTICAL); connection.addView(devices);
         button(connection, "刷新局域网机器人", this::discover).setBackgroundResource(R.drawable.connection_secondary);
         LinearLayout manual = card(layout, "备用地址与配对");
-        address = new EditText(this); address.setSingleLine(true); address.setHint("备用地址，例如 robot.local:15741"); address.setMinHeight(dp(48)); address.setTextSize(16); address.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI); manual.addView(address);
+        address = new EditText(this); address.setSingleLine(true); address.setHint("备用地址，例如 robot.local:15743"); address.setMinHeight(dp(48)); address.setTextSize(16); address.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI); manual.addView(address);
         button(manual, "连接当前机器人", () -> { if (invitation != null) redeemInvitation(); else begin(address.getText().toString().trim()); });
         confirm = button(manual, "指纹一致，在头显确认", () -> { confirmed = true; confirm.setEnabled(false); });
         confirm.setEnabled(false);

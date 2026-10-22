@@ -70,7 +70,7 @@ class ExtVrPlugin:
                                         "设备保持运行，下次遥操按 X+A 重新确认基准。"),
                         "x-qr-options": [{
                             "label": "下载与配对",
-                            "url": f"https://{{host}}:{self.config.get('port', 15741)}/onboarding",
+                            "url": f"https://{{host}}:{self.config.get('port', 15743)}/onboarding",
                         }],
                     },
                     "management_pin": {

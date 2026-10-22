@@ -87,7 +87,7 @@ def capture_certificate_base64(config: dict) -> str:
 def build_capture_ssl_context(config: dict) -> ssl.SSLContext:
     """Validate SAN and load the independent Capture certificate/key pair."""
 
-    port = int(config.get("port", 15741))
+    port = int(config.get("port", 15743))
     public_wss_url = validated_capture_wss_url(
         config.get("public_wss_url"),
         expected_port=port,
@@ -549,7 +549,7 @@ class CaptureWssServer:
             site = web.TCPSite(
                 runner,
                 str(self._config.get("bind_host", "0.0.0.0")),
-                int(self._config.get("port", 15741)),
+                int(self._config.get("port", 15743)),
                 ssl_context=self._ssl_context,
             )
             await site.start()
@@ -573,7 +573,7 @@ class CaptureWssServer:
                     service_type,
                     self.enrollment.device_id[:24] + "." + service_type,
                     addresses=addresses,
-                    port=int(self._config.get("port", 15741)),
+                    port=int(self._config.get("port", 15743)),
                     properties={
                         "id": self.enrollment.device_id,
                         "name": str(self._config.get("display_name", "PICO 4 Ultra"))[

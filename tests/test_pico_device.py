@@ -164,7 +164,7 @@ def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path, p
     plugin = ExtVrPlugin(
         {
             "state_dir": str(tmp_path),
-            "public_wss_url": "wss://127.0.0.1:15741/ws/teleop-capture",
+            "public_wss_url": "wss://127.0.0.1:15743/ws/teleop-capture",
             **({"port": port} if port is not None else {}),
         },
         "pico",
@@ -180,7 +180,7 @@ def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path, p
         assert set(tool["configSchema"]["properties"]) == {"management_pin", "install"}
         qr = tool["configSchema"]["properties"]["install"]
         assert qr["format"] == "qr" and qr["scope"] == "instance"
-        assert qr["x-qr-options"] == [{"label": "下载与配对", "url": f"https://{{host}}:{port or 15741}/onboarding"}]
+        assert qr["x-qr-options"] == [{"label": "下载与配对", "url": f"https://{{host}}:{port or 15743}/onboarding"}]
         assert "install" not in tool["configSchema"].get("required", [])
         assert "install" not in info["config"]
         assert tool["configSchema"]["properties"]["management_pin"]["x-sensitive"] is True

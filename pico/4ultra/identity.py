@@ -127,6 +127,6 @@ def prepare_config(config):
         state_dir=str(root),
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
-        public_wss_url=f"wss://{hostname}:{int(result.get('port',15741))}/ws/teleop-capture",
+        public_wss_url=f"wss://{hostname}:{int(result.get('port',15743))}/ws/teleop-capture",
     )
     return result

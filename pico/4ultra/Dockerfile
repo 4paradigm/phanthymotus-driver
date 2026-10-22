@@ -16,5 +16,5 @@ COPY dds-local.xml /opt/phanthy-motus/dds-local.xml
 COPY deploy/ /deploy/
 ENV RCUTILS_COLORIZED_OUTPUT=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml ROS_LOCALHOST_ONLY=0
-EXPOSE 15741 15742
+EXPOSE 15743 15742
 CMD ["/bin/bash", "-lc", "source /opt/ros/humble/setup.bash && exec python3 /work/main.py"]

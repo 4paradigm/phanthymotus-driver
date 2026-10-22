@@ -4,7 +4,7 @@ mcp_port: 15742
 namespace: pico
 pico:
   display_name: PICO 4 Ultra
-  port: 15741
+  port: 15743
   bind_host: 0.0.0.0
   public_host: null
   state_dir: /var/lib/motus/pico

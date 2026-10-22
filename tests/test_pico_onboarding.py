@@ -57,7 +57,7 @@ def enrollment():
             Capture(),
             base64.b64encode(certificate.public_bytes(serialization.Encoding.PEM)),
             clock=lambda: clock[0],
-            public_wss_url="wss://robot.local:15741/ws/teleop-capture",
+            public_wss_url="wss://robot.local:15743/ws/teleop-capture",
         ),
         clock,
     )
