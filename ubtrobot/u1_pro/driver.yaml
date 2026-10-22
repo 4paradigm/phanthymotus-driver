@@ -16,5 +16,6 @@ cards:
   - { name: expression, type: actuator }
   - { name: head, type: actuator }
   - { name: system_controls, type: actuator }
+  - { name: persona, type: actuator }
   - { name: camera_left, type: sensor }
   - { name: camera_right, type: sensor }
