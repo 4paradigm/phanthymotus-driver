@@ -4,6 +4,31 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## ActuCore teleoperation execution
+
+The optional, disabled-by-default `teleop_executor` accepts fourteen arm joint
+targets and two calibrated hand closure values from the local ActuCore card.
+See [the execution contract](TELEOP.md) for the authenticated stream, confirmed
+hold/resume behavior, configuration and current validation limits. The arms-only
+trial configuration is deployed; the first Live trial did not visibly follow and
+latched a feedback fault. Physical following is not accepted. Latest-target
+socket draining, arms-only feedback and session baselines are deployed. The new,
+locally tested and ARM64-built continuation candidate keeps the 100 ms target deadline, permits
+fresh targets within a 300 ms continuation window after confirmed hold, and
+separates transient feedback holds from persistent faults. It also records the
+first fault and command/scheduler timing. Isolated ROS2/MCP continuation passed
+with synthetic feedback and zero hardware writes. Both new images are deployed
+with a passing zero-output calibration. The deployed startup fix then reached
+three applied targets; collision recovery exceeded its frame budget and lost a
+rotated lease reply. The Driver subsequently confirmed stop and released ownership.
+A recovery candidate separates IK validation from rearm and adds bounded,
+idempotent management receipts and cancellation. ActuCore's existing resume
+action rebuilds a faulted card session only after fresh confirmed release,
+without restarting containers. This candidate is not yet physically accepted.
+The two-service switch preserved the user's Agent Core configuration and container. See
+the execution contract for its exact limits. The existing `servo` card remains
+available, with shared actuator ownership enforced when teleoperation is enabled.
+
 ## Head camera snapshot card
 
 The `vision_capture` card subscribes to `/ob_camera_head/color/image_raw` and
