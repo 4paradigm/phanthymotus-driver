@@ -263,13 +263,23 @@ resources. A join timeout blocks restart instead of stacking another worker.
 A fully paused thread sleeps until resume/stop; unexpected control-loop errors
 hold the chassis, mark the worker failed and require explicit stop/start.
 
-If the previous motion lease has expired, the controller confirms the stop
-before applying another motion. After that synchronous stop, it checks the inbox
-once more: a pending zero takes priority, or a newer motion from the same source
-and priority replaces the selected aging frame. The replacement passes all
-normal validation and arbitration with its original timestamps; no lease is
-extended and no old motion is replayed. Other sources, priorities and duplicate
-or regressing sequence numbers stay queued for normal processing.
+When the previous motion lease has expired, a capable native worker accepts
+the next fully validated fresh motion in one `UPDATE` request. It confirms any
+expired old action's stop, rechecks the new command's original deadline, then
+starts/updates velocity before returning one ACK. Python resets the acceleration
+ramp from zero without an extra STOP/ACK round trip before this request. This
+reduces recovery delay; it does not keep expired motion alive or remove the
+physical stop required by an expired lease. A failed stop remains fatal, and a
+new deadline consumed by stopping never starts a new action. Ordinary `SET`,
+zero, pause, configuration changes and explicit handover keep their normal paths.
+
+The capability is negotiated only by a valid initial idle handshake, exposed as
+`backend.capabilities.atomic_expiry_update` and `dispatch.expiry_update=native_atomic`.
+Older workers remain on `stop_then_set`: after a synchronous confirmed stop,
+the controller checks the inbox once more for a priority zero or newer motion
+from the same source and priority. Replacement frames still pass full validation
+and arbitration with unchanged timestamps. Other sources, priorities and
+duplicate/regressing sequence numbers stay queued for normal processing.
 
 `input_queue` reports bridge-delivered `received`, control-selected `processed`,
 `coalesced`, lifecycle-`cleared`, `pending`, the latest receive gap and inbox

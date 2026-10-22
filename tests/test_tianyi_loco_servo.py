@@ -46,16 +46,19 @@ class FakeBackend:
         self.connect_fail = False
         self.connected = False
         self.deadlines = []
+        self.supports_atomic_expiry_update = (config or {}).get("atomic_expiry_update", False)
+        self.expiry_updates = []
 
     def connect(self):
         if self.connect_fail:
             raise RuntimeError("connection failed")
         self.connected = True
 
-    def write(self, values, deadline):
+    def write(self, values, deadline, *, replace_expired=False):
         if self.fail:
             raise RuntimeError("transport failed")
         self.deadlines.append(deadline)
+        self.expiry_updates.append(replace_expired)
         self.messages.append(list(values))
 
     def stop(self):
@@ -870,6 +873,90 @@ def test_publish_error_is_visible_and_pauses_instead_of_counting_success(setup):
     plugin._backend.fail = False
     plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
+
+
+@pytest.mark.parametrize("atomic", [False, True])
+def test_atomic_expiry_update_avoids_the_extra_stop_round_trip(setup, monkeypatch, atomic):
+    plugin = start(setup, atomic_expiry_update=atomic)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    backend = plugin._backend
+    original_stop = backend.stop
+    def slow_stop():
+        setup.clock.advance(0.08)
+        original_stop()
+    monkeypatch.setattr(backend, "stop", slow_stop)
+    fresh = command(setup, seq=2, stamp_ms=int(setup.clock.time() * 1000) - 150)
+    send(plugin, fresh)
+    if atomic:
+        assert plugin._counts["accepted"] == 2
+        assert plugin._counts["holds"] == 0
+        assert backend.expiry_updates == [False, True]
+        assert backend.deadlines[-1] == fresh["stamp_ms"] + fresh["ttl_ms"]
+        assert plugin._info()["last_command_timing"]["remaining_after_apply_ms"] == 50
+    else:
+        assert plugin._counts["accepted"] == 1
+        assert plugin._counts["holds"] == 1
+        assert backend.expiry_updates == [False]
+    assert plugin._info()["dispatch"]["expiry_update"] == (
+        "native_atomic" if atomic else "stop_then_set")
+
+
+def test_atomic_expiry_update_restarts_both_ramps_from_zero(setup):
+    plugin = start(setup, atomic_expiry_update=True)
+    for seq in range(1, 9):
+        send(plugin, command(setup, seq=seq))
+        setup.clock.advance(0.1)
+    assert plugin._last_output[0] > 0.15 and plugin._last_output[5] > 0.3
+    setup.clock.advance(0.21)
+    send(plugin, command(setup, seq=9))
+    assert plugin._backend.expiry_updates[-1] is True
+    assert plugin._last_output == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
+
+
+@pytest.mark.parametrize("extra", [
+    {"schema": "wrong"}, {"seq": 1}, {"obs_stamp_ms": 0},
+    {"ttl_ms": 0}, {"values": [0, 1, 0, 0, 0, 0]},
+    {"source": "other", "priority": -1},
+])
+def test_invalid_fresh_frame_cannot_use_atomic_expiry_update(setup, extra):
+    plugin = start(setup, atomic_expiry_update=True)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    send(plugin, command(setup, seq=2) | extra)
+    assert plugin._counts["accepted"] == 1
+    assert plugin._backend.expiry_updates == [False]
+    assert plugin._backend.messages[-1] == [0] * 6
+    assert plugin._last_output == [0] * 6
+
+
+def test_atomic_expiry_update_does_not_replace_zero_pause_or_handover_stops(setup):
+    plugin = start(setup, atomic_expiry_update=True)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    send(plugin, command(setup, [0] * 6, seq=2))
+    assert plugin._backend.expiry_updates == [False]
+    assert plugin._backend.messages[-1] == [0] * 6
+    assert plugin.dispatch("pause", {})["state"] == "paused"
+    setup.clock.advance(0.1)
+    assert plugin.dispatch("resume", {})["state"] == "running"
+    setup.clock.advance(0.1)
+    send(plugin, command(setup, seq=3))
+    assert plugin.pause_for_explicit_command("nav.move_to") is True
+    assert plugin._backend.expiry_updates == [False, False]
+    assert plugin._backend.messages[-1] == [0] * 6
+
+
+def test_failed_atomic_expiry_update_still_pauses_and_requires_confirmed_stop(setup):
+    plugin = start(setup, atomic_expiry_update=True)
+    send(plugin, command(setup))
+    setup.clock.advance(0.21)
+    plugin._backend.fail = True
+    send(plugin, command(setup, seq=2))
+    assert plugin._paused and plugin._zero_pending
+    assert plugin._counts["accepted"] == 1
+    assert plugin.pause_for_explicit_command("nav.move_to") is False
+    plugin._backend.fail = False
 
 
 def queue_during_stop(setup, plugin, monkeypatch, make_command):

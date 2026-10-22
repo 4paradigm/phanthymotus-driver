@@ -41,6 +41,7 @@ class SlamtecVelocityBackend:
         self._native_ack_sequence = None
         self._native_ack_status = None
         self._native_stats_error = ""
+        self._atomic_expiry_update = False
         self._timeout = float(config.get("sdk_reply_timeout", 0.25))
         if not math.isfinite(self._timeout) or not 0.05 <= self._timeout <= 0.3:
             raise ValueError("sdk_reply_timeout must be between 0.05 and 0.3 seconds")
@@ -64,6 +65,7 @@ class SlamtecVelocityBackend:
             args = [binary, self._host, str(self._port), str(self._connect_ms),
                     str(self._config.get("max_vx", 0.3)),
                     str(self._config.get("max_wz", 1.0))]
+            self._atomic_expiry_update = False
             try:
                 self._process = subprocess.Popen(
                     args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -96,6 +98,13 @@ class SlamtecVelocityBackend:
                 self._record_native_ack(sequence, fields[2], fields[5] if len(fields) > 5 else None)
                 self._action_id = int(fields[3])
                 self._state = fields[4] if len(fields) > 4 else "ready"
+                if sequence == 0:
+                    capabilities = (self._native_stats.get("capabilities")
+                                    if self._native_stats is not None else None)
+                    self._atomic_expiry_update = (
+                        self._action_id == 0 and self._state == "ready" and
+                        isinstance(capabilities, dict) and
+                        capabilities.get("atomic_expiry_update") is True)
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -138,6 +147,11 @@ class SlamtecVelocityBackend:
         except (ValueError, TypeError, OverflowError, RecursionError) as exc:
             self._native_stats_error = str(exc)
 
+    @property
+    def supports_atomic_expiry_update(self):
+        with self._lock:
+            return self._atomic_expiry_update
+
     def _request(self, command):
         if self._faulted:
             raise RuntimeError(self._error or "SDK worker is not connected")
@@ -149,7 +163,7 @@ class SlamtecVelocityBackend:
             self._process.stdin.write(data)
             self._reply(self._sequence, self._timeout)
         except CommandLeaseExpired as exc:
-            if not command.startswith("SET "):
+            if not command.startswith(("SET ", "UPDATE ")):
                 self._fail("unexpected EXPIRED reply to non-velocity request")
             # The native worker sends this only after stop/cancel succeeds.
             self._armed = False
@@ -161,7 +175,7 @@ class SlamtecVelocityBackend:
         except Exception as exc:
             self._fail(str(exc))
 
-    def write(self, values, deadline_ms):
+    def write(self, values, deadline_ms, *, replace_expired=False):
         with self._lock:
             if len(values) != 6 or any(not math.isfinite(v) for v in values):
                 raise ValueError("SDK velocity requires six finite values")
@@ -169,6 +183,8 @@ class SlamtecVelocityBackend:
                 raise ValueError("SDK adapter supports vx/wz only")
             if not any(values):
                 return self.stop()
+            if replace_expired and not self._atomic_expiry_update:
+                raise RuntimeError("SDK worker does not support atomic expiry updates")
             remaining = deadline_ms - int(time.time() * 1000)
             self._last_write = {"lease_remaining_ms": remaining, "round_trip_ms": None}
             if remaining <= 0:
@@ -179,7 +195,8 @@ class SlamtecVelocityBackend:
             self._armed = True
             started = time.monotonic()
             try:
-                self._request(f"SET {int(deadline_ms)} {values[0]:.17g} {values[5]:.17g}")
+                verb = "UPDATE" if replace_expired else "SET"
+                self._request(f"{verb} {int(deadline_ms)} {values[0]:.17g} {values[5]:.17g}")
             finally:
                 self._last_write["round_trip_ms"] = round((time.monotonic() - started) * 1000, 1)
 
@@ -233,6 +250,7 @@ class SlamtecVelocityBackend:
                     "expired_commands": self._expired_commands,
                     "last_expired_error": self._last_expired_error,
                     "last_write": dict(self._last_write) if self._last_write is not None else None,
+                    "capabilities": {"atomic_expiry_update": self._atomic_expiry_update},
                     "native": {"snapshot": "latest_ack", "sequence": self._native_ack_sequence,
                                "status": self._native_ack_status,
                                "stats": copy.deepcopy(self._native_stats),

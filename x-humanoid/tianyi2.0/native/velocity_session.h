@@ -116,6 +116,17 @@ public:
         last_set_.remaining_after_set_ms = remaining_ms();
         if (deadline_ <= Clock::now()) { stop(StopReason::LeaseExpired); throw CommandLeaseExpired("lease expired during SDK write"); }
     }
+    void update(double vx, double wz, Time deadline) {
+        // Only an explicit UPDATE requests atomic expiry recovery. Ordinary
+        // SET retains its protocol/behaviour for older Python controllers.
+        if (deadline <= Clock::now()) throw CommandLeaseExpired("command lease expired");
+        if (motion_possible_ && Clock::now() >= deadline_) {
+            stop(StopReason::LeaseExpired);
+            if (deadline <= Clock::now())
+                throw CommandLeaseExpired("command lease expired during previous action stop");
+        }
+        set(vx, wz, deadline);
+    }
     void tick(Time now) {
         if (!motion_possible_) return;
         if (now >= deadline_) { stop(StopReason::LeaseExpired); return; }

@@ -30,7 +30,10 @@ int main(int argc, char** argv) {
         SlamwareAdapter sdk(argv[1], std::stoi(argv[2]), std::stoi(argv[3]));
         using Session = VelocitySession<SlamwareAdapter>;
         Session session(sdk);
-        reply(0, true, 0, "ready"); // Connect is read-only, no velocity action.
+        // Connect is read-only. The capability applies only to this worker
+        // lifetime; older workers without it require an explicit STOP first.
+        reply(0, true, 0, "ready", "ERROR",
+              "{\"capabilities\":{\"atomic_expiry_update\":true}}");
         std::string buffer;
         try {
             while (true) {
@@ -50,7 +53,7 @@ int main(int argc, char** argv) {
                     buffer.erase(0, newline + 1);
                     std::string verb, extra;
                     if (!(in >> sequence >> verb)) throw std::runtime_error("malformed SDK request");
-                    if (verb == "SET") {
+                    if (verb == "SET" || verb == "UPDATE") {
                         long long expiry;
                         double vx, wz;
                         if (!(in >> expiry >> vx >> wz) || (in >> extra) ||
@@ -70,6 +73,7 @@ int main(int argc, char** argv) {
                             auto deadline = VelocitySession<SlamwareAdapter>::Clock::now() +
                                             std::chrono::milliseconds(lease_ms);
                             if (vx == 0 && wz == 0) session.stop();
+                            else if (verb == "UPDATE") session.update(vx, wz, deadline);
                             else session.set(vx, wz, deadline);
                         } catch (const CommandLeaseExpired& e) {
                             // Never extend/replay an expired command. A positive

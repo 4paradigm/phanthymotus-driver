@@ -60,6 +60,18 @@ def native_worker(tmp_path_factory):
     return binary
 
 
+@pytest.fixture(scope="module")
+def native_session(tmp_path_factory):
+    compiler = shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
+    if compiler is None:
+        pytest.skip("C++ compiler unavailable")
+    binary = tmp_path_factory.mktemp("atomic-session") / "session-test"
+    source = Path(__file__).with_name("tianyi_velocity_session_test.cpp")
+    subprocess.run([compiler, "-std=c++14", "-pthread", "-I", str(NATIVE), str(source),
+                    "-o", str(binary)], check=True, capture_output=True, text=True)
+    return binary
+
+
 class Reply(list):
     """Keep historical protocol assertions while exposing the optional metrics."""
 
@@ -101,7 +113,9 @@ def worker(native_worker):
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, bufsize=1)
         processes.append(process)
-        assert read_reply(process)[2:] == ["OK", "0", "ready"]
+        ready = read_reply(process)
+        assert ready[2:] == ["OK", "0", "ready"]
+        assert ready.stats == {"capabilities": {"atomic_expiry_update": True}}
         return process
 
     yield create
@@ -114,10 +128,11 @@ def worker(native_worker):
 
 
 @pytest.mark.parametrize("yaw", [-1.0, 1.0])
-def test_continuous_fresh_velocity_updates_keep_one_sdk_action(worker, yaw):
+@pytest.mark.parametrize("verb", ["SET", "UPDATE"])
+def test_continuous_fresh_velocity_updates_keep_one_sdk_action(worker, yaw, verb):
     process = worker(max_wz="1.0")
     for sequence in range(1, 9):
-        reply = request(process, sequence, f"SET {int(time.time() * 1000) + 200} 0.1 {yaw}")
+        reply = request(process, sequence, f"{verb} {int(time.time() * 1000) + 200} 0.1 {yaw}")
         assert reply[2:] == ["OK", "1", "active"]
         assert reply.stats["set_attempts"] == sequence
         assert reply.stats["action_start_attempts"] == reply.stats["action_starts"] == 1
@@ -135,11 +150,12 @@ def test_continuous_fresh_velocity_updates_keep_one_sdk_action(worker, yaw):
     assert idle.stats["stop_attempts"] == idle.stats["confirmed_stops"] == 1
 
 
-def test_expired_ingress_confirms_stop_and_waits_for_a_new_fresh_command(worker):
+@pytest.mark.parametrize("verb", ["SET", "UPDATE"])
+def test_expired_ingress_confirms_stop_and_waits_for_a_new_fresh_command(worker, verb):
     process = worker()
     pid = process.pid
     assert request(process, 1, velocity(250))[2:] == ["OK", "1", "active"]
-    expired = request(process, 2, velocity(-10))
+    expired = request(process, 2, velocity(-10).replace("SET ", f"{verb} ", 1))
     assert expired[2] == "EXPIRED"
     assert "remaining_ms=-" in bytes.fromhex(expired[3]).decode()
     assert expired.stats["stop_attempts"] == expired.stats["confirmed_stops"] == 1
@@ -156,6 +172,25 @@ def test_expired_idle_request_does_not_create_an_action(worker):
     assert request(process, 1, velocity(-10))[2] == "EXPIRED"
     assert request(process, 2, "STOP")[2:] == ["OK", "0", "ready"]
     assert request(process, 3, velocity(250))[2:] == ["OK", "1", "active"]
+
+
+def test_fresh_update_after_expiry_restarts_without_a_separate_stop_request(worker):
+    process = worker()
+    assert request(process, 1, velocity(80))[2:] == ["OK", "1", "active"]
+    time.sleep(0.12)
+    fresh = request(process, 2, velocity(250).replace("SET ", "UPDATE ", 1))
+    assert fresh[2:] == ["OK", "2", "active"]
+    assert fresh.stats["set_attempts"] == 2
+    assert fresh.stats["action_starts"] == 2
+    assert fresh.stats["confirmed_stops"] == 1
+    assert fresh.stats["stop_reason"] == "lease_expired"
+
+
+@pytest.mark.parametrize("case", ["atomic_fresh_update", "atomic_expiry_update", "atomic_stop_exhausts_new_lease",
+                                 "atomic_stop_failure"])
+def test_update_atomically_stops_old_expired_action_before_using_new_lease(native_session, case):
+    # Directly exercise Session.update without an intervening timer tick or STOP.
+    subprocess.run([str(native_session), case], check=True, timeout=3)
 
 
 @pytest.mark.parametrize("mode,reason", [

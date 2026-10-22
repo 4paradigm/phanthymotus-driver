@@ -20,24 +20,26 @@ spec.loader.exec_module(backend_module)
 @pytest.fixture
 def backend(tmp_path):
     workers = []
-    def create(mode="ok", diagnostics=None):
+    def create(mode="ok", diagnostics=None, *, initial_diagnostics=None):
         script = tmp_path / (mode + "-worker")
         script.write_text(f'''#!{sys.executable}
 import sys,time
 mode={mode!r}
 diagnostics={diagnostics!r}
+initial_diagnostics={initial_diagnostics!r}
 def emit(line):
     print(line+(" "+diagnostics if diagnostics is not None else ""),flush=True)
 print("SDK diagnostic on stdout",flush=True)
-emit("MOTUS_SDK 0 OK 0 ready")
+print("MOTUS_SDK 0 OK 0 ready"+(" "+initial_diagnostics if initial_diagnostics is not None else
+      " "+diagnostics if diagnostics is not None else ""),flush=True)
 for line in sys.stdin:
     seq,verb,*args=line.split()
-    if mode == "timeout" and verb == "SET":
+    if mode == "timeout" and verb in ("SET", "UPDATE"):
         time.sleep(30)
-    if mode == "error" and verb == "SET":
+    if mode == "error" and verb in ("SET", "UPDATE"):
         emit("MOTUS_SDK "+seq+" ERROR "+b"localization quality too low".hex())
         sys.exit(1)
-    if mode == "expired" and verb == "SET" and seq == "1":
+    if mode == "expired" and verb in ("SET", "UPDATE") and seq == "1":
         emit("MOTUS_SDK "+seq+" EXPIRED "+b"command lease expired at worker: remaining_ms=-12".hex())
         continue
     if mode == "expired_stop" and verb == "STOP":
@@ -47,12 +49,18 @@ for line in sys.stdin:
         seq=str(int(seq)+1)
     if mode == "dead":
         sys.exit(1)
+    if mode == "expect_update" and verb not in ("UPDATE", "STOP"):
+        emit("MOTUS_SDK "+seq+" ERROR "+b"expected UPDATE".hex())
+        sys.exit(1)
+    if mode == "expect_set" and verb not in ("SET", "STOP"):
+        emit("MOTUS_SDK "+seq+" ERROR "+b"expected SET".hex())
+        sys.exit(1)
     if mode == "partial":
         response="MOTUS_SDK "+seq+" OK 17 active"+(" "+diagnostics if diagnostics is not None else "")+"\\n"
         sys.stdout.write(response[:7]);sys.stdout.flush();time.sleep(.01)
         sys.stdout.write(response[7:]);sys.stdout.flush()
     else:
-        emit("MOTUS_SDK "+seq+" OK "+("17 active" if verb == "SET" else "0 ready"))
+        emit("MOTUS_SDK "+seq+" OK "+("17 active" if verb in ("SET", "UPDATE") else "0 ready"))
 ''')
         script.chmod(0o700)
         instance = backend_module.SlamtecVelocityBackend({"sdk_binary": str(script), "sdk_reply_timeout": 0.15})
@@ -201,6 +209,97 @@ def test_legacy_ack_clears_diagnostics_from_previous_ack(backend):
     write(worker)
     assert worker.info()["native"]["sequence"] == 1
     assert worker.info()["native"]["stats"] is None
+
+
+@pytest.mark.parametrize("mode", ["ok", "partial"])
+def test_atomic_expiry_update_is_negotiated_only_by_valid_initial_ready_ack(backend, mode):
+    worker = backend(mode, initial_diagnostics=json.dumps({
+        "capabilities": {"atomic_expiry_update": True}}))
+    assert worker.supports_atomic_expiry_update is False
+    worker.connect()
+    assert worker.supports_atomic_expiry_update is True
+    assert worker.info()["capabilities"] == {"atomic_expiry_update": True}
+    write(worker)  # Subsequent legacy replies cannot erase negotiated support.
+    assert worker.info()["native"]["stats"] is None
+    assert worker.supports_atomic_expiry_update is True
+
+
+@pytest.mark.parametrize("diagnostics", [
+    None, "{}", '{"capabilities":{}}', '{"capabilities":true}',
+    '{"capabilities":{"atomic_expiry_update":false}}',
+    '{"capabilities":{"atomic_expiry_update":1}}',
+    '{"capabilities":{"atomic_expiry_update":"true"}}',
+    '{"capabilities":{"atomic_expiry_update":null}}',
+    '{"capabilities":{"atomic_expiry_update":[]}}',
+    '{"capabilities":{"atomic_expiry_update":true},"duration":NaN}',
+    '{"capabilities":{"atomic_expiry_update":true}} trailing',
+])
+def test_missing_or_invalid_initial_capability_uses_legacy_path(backend, diagnostics):
+    worker = backend(initial_diagnostics=diagnostics)
+    worker.connect()
+    assert worker.supports_atomic_expiry_update is False
+    assert worker.info()["capabilities"] == {"atomic_expiry_update": False}
+
+
+def test_later_ack_cannot_upgrade_atomic_expiry_update(backend):
+    worker = backend(diagnostics=json.dumps({"capabilities": {"atomic_expiry_update": True}}),
+                     initial_diagnostics="{}")
+    worker.connect()
+    assert worker.supports_atomic_expiry_update is False
+    write(worker)
+    assert worker.info()["native"]["stats"]["capabilities"]["atomic_expiry_update"] is True
+    assert worker.supports_atomic_expiry_update is False
+
+
+@pytest.mark.parametrize("action_id,state", [(17, "ready"), (0, "active")])
+def test_nonidle_initial_ack_cannot_advertise_atomic_expiry_update(action_id, state):
+    worker = backend_module.SlamtecVelocityBackend({})
+    stats = json.dumps({"capabilities": {"atomic_expiry_update": True}})
+    worker._buffer = f"MOTUS_SDK 0 OK {action_id} {state} {stats}\n".encode("ascii")
+    worker._reply(0, 0.1)
+    assert worker.supports_atomic_expiry_update is False
+
+
+def test_advertised_atomic_expiry_update_uses_the_update_verb(backend):
+    worker = backend("expect_update", initial_diagnostics=json.dumps({
+        "capabilities": {"atomic_expiry_update": True}}))
+    worker.connect()
+    worker.write([0.05, 0, 0, 0, 0, -0.1], int(time.time() * 1000) + 200,
+                 replace_expired=True)
+    assert worker.info()["state"] == "active" and worker._sequence == 1
+
+
+def test_regular_write_keeps_set_even_when_atomic_update_is_supported(backend):
+    worker = backend("expect_set", initial_diagnostics=json.dumps({
+        "capabilities": {"atomic_expiry_update": True}}))
+    worker.connect()
+    write(worker)
+    assert worker.info()["state"] == "active" and worker._sequence == 1
+
+
+def test_atomic_update_cannot_reach_an_unadvertised_worker(backend):
+    worker = backend("expect_set")
+    worker.connect()
+    with pytest.raises(RuntimeError, match="does not support atomic expiry"):
+        worker.write([0.05, 0, 0, 0, 0, -0.1], int(time.time() * 1000) + 200,
+                     replace_expired=True)
+    assert worker._sequence == 0 and not worker._armed
+    write(worker)
+    assert worker.info()["state"] == "active"  # Legacy SET remains usable.
+
+
+def test_expired_atomic_update_remains_recoverable_after_native_confirmed_stop(backend):
+    worker = backend("expired", initial_diagnostics=json.dumps({
+        "capabilities": {"atomic_expiry_update": True}}))
+    worker.connect()
+    with pytest.raises(backend_module.CommandLeaseExpired, match="remaining_ms=-12"):
+        worker.write([0.05, 0, 0, 0, 0, -0.1], int(time.time() * 1000) + 200,
+                     replace_expired=True)
+    assert worker.info()["connected"] and worker.info()["state"] == "ready"
+    assert worker.info()["expired_commands"] == 1 and not worker._armed
+    assert worker.supports_atomic_expiry_update is True
+    write(worker)
+    assert worker.info()["state"] == "active"
 
 
 @pytest.mark.parametrize("mode,reason", [("error", "localization quality"),

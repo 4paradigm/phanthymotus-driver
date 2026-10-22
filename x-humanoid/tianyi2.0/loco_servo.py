@@ -471,7 +471,8 @@ class LocoServoPlugin:
                     self._record("DROPPED", "command rate exceeds 20 Hz")
                     return
                 if any(command["values"]):
-                    if self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms:
+                    if (self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms and
+                            not self._native_expiry_update()):
                         self._hold()  # Native lease may already have stopped the chassis.
                         if self._zero_pending:
                             raise RuntimeError("SDK stop unconfirmed")
@@ -566,10 +567,23 @@ class LocoServoPlugin:
             return "observation timestamp is in the future"
         return ""
 
+    def _native_expiry_update(self):
+        return (not self._settings["dry_run"] and
+                getattr(self._backend, "supports_atomic_expiry_update", False) is True)
+
     def _apply(self, values, _gripper=None):
         target = list(values)
         if self._settings["rotate_only"]:
             target[0] = target[1] = 0.0
+        replace_expired = bool(any(target) and self._native_expiry_update() and
+                               self._lease_expiry_ms and
+                               time.time() * 1000 >= self._lease_expiry_ms)
+        if replace_expired:
+            # The native UPDATE confirms any expired old action's stop before
+            # starting this fresh one. Restart the ramp locally, but do not
+            # spend a separate Python STOP/ACK round trip before the UPDATE.
+            self._last_output = [0.0] * 6
+            self._last_output_at = None
         now = time.monotonic()
         dt = min(1 / self._hz, max(0, now - self._last_output_at)) if self._last_output_at is not None else 1 / self._hz
         output = [0.0] * 6
@@ -582,17 +596,20 @@ class LocoServoPlugin:
         if self._settings["dry_run"]:
             self._counts["dry_run_commands"] += 1
         else:
-            self._publish(output)
+            self._publish(output, replace_expired=replace_expired)
         self._last_output = output
         self._last_output_at = now
         self._zero_pending = False
 
-    def _publish(self, values):
+    def _publish(self, values, *, replace_expired=False):
         if self._backend is None:
             raise RuntimeError("Slamware SDK backend unavailable")
         try:
             if any(values):
-                self._backend.write(values, self._command_deadline_ms)
+                if replace_expired:
+                    self._backend.write(values, self._command_deadline_ms, replace_expired=True)
+                else:
+                    self._backend.write(values, self._command_deadline_ms)
             else:
                 self._backend.stop()
         except CommandLeaseExpired:
@@ -701,6 +718,7 @@ class LocoServoPlugin:
             "input_queue": self._inbox.info(),
             "dispatch": {"mode": "dedicated_worker", "watchdog_poll_ms": 20,
                          "max_apply_hz": 20, "worker_failed": self._controller_failed,
+                         "expiry_update": "native_atomic" if self._native_expiry_update() else "stop_then_set",
                          "worker_alive": bool(
                              self._controller_thread and self._controller_thread.is_alive())},
             "last_command_timing": copy.deepcopy(self._last_timing),
