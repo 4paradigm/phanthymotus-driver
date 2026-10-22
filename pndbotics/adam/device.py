@@ -533,7 +533,8 @@ WAIST_JOINT_CONTROLS = {
 }
 
 # The ZED Mini is mounted on the head, so the neck card is effectively the
-# "camera aiming" card.  Vendor limits are ±60° for both axes.
+# "camera aiming" card. Yaw is conservatively bounded to ±60°; pitch
+# stays within the installed firmware envelope at ±50°.
 HEAD_JOINT_CONTROLS = {
     "yaw": ("头部左右转动", "neckYaw", -60.0, 60.0),
     "pitch": ("头部上下俯仰", "neckPitch", -50.0, 50.0),
