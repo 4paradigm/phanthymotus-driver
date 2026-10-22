@@ -39,6 +39,7 @@ DEFAULTS = dict(cue_seconds=3.0, settle_seconds=0.5, watch_seconds=3.0,
                 confidence=0.5, finger_threshold=0.15, finger_frames=2,
                 preparation_timeout=20.0, dialogue_timeout=20.0,
                 registration_timeout=30.0, registration_seconds=1.0,
+                registration_confidence=0.3, registration_grace=0.35,
                 recovery_timeout=20.0, max_players=5)
 
 
@@ -77,17 +78,66 @@ def body_geometry(person, confidence):
 
 def standing(geometry):
     points, shoulder, hip, scale = geometry
-    if not all(i in points for i in (13, 14, 15, 16)) or hip[1] - shoulder[1] < .65 * scale:
+    if hip[1] - shoulder[1] < .65 * scale:
         return False
+    # A relaxed stance, an occluded leg or perspective foreshortening must not
+    # require both knees to be perfectly straight. One clearly extended leg
+    # below an upright torso is sufficient; a seated bent leg is not.
     for h, k, a in ((11, 13, 15), (12, 14, 16)):
+        if not all(i in points for i in (h, a)) or points[a][1] - points[h][1] < 1.05 * scale:
+            continue
+        if k not in points:
+            if points[a][1] - points[h][1] >= 1.3 * scale:
+                return True
+            continue
         upper = (points[h][0] - points[k][0], points[h][1] - points[k][1])
         lower = (points[a][0] - points[k][0], points[a][1] - points[k][1])
         length = math.hypot(*upper) * math.hypot(*lower)
-        if length < 1 or sum(x*y for x, y in zip(upper, lower)) / length > -.65:
-            return False
-        if points[a][1] - points[h][1] < .8 * scale:
-            return False
-    return True
+        if length >= 1 and sum(x*y for x, y in zip(upper, lower)) / length <= -.4:
+            return True
+    return False
+
+
+def registration_observation(person, confidence):
+    """Return auditable per-track gates, not an opaque candidate count."""
+    report = dict(track_id=person.get("id"), posture=person.get("posture"),
+                  candidate=False, raised_side="", raise_checks={})
+    points = visible_points(person.get("keypoints"), confidence)
+    report["visible_body_joints"] = sum(5 <= i < 17 for i in points)
+    body_y = [p[1] for i,p in points.items() if 5 <= i < 17]
+    report["body_height_pixels"] = round(max(body_y)-min(body_y), 1) if body_y else 0
+    geometry = body_geometry(person, confidence)
+    reason = "body_not_clear"
+    if geometry is not None:
+        reason = "not_standing"
+        if standing(geometry):
+            reason = "hand_not_raised"
+            for side, s, e, w in (("left", 5, 7, 9), ("right", 6, 8, 10)):
+                check = dict(wrist_visible=w in points, elbow_visible=e in points)
+                report["raise_checks"][side] = check
+                if w not in points:
+                    continue
+                scale = geometry[3]
+                above_shoulder = (points[s][1] - points[w][1]) / scale
+                forearm_rise = (points[e][1] - points[w][1]) / scale if e in points else None
+                check.update(wrist_above_shoulder=round(above_shoulder, 3),
+                             wrist_above_elbow=round(forearm_rise, 3) if forearm_rise is not None else None)
+                # Accept a high hand OR a bent-up forearm with the wrist near
+                # its own shoulder. A hanging arm or horizontal T pose fails.
+                raised = above_shoulder >= .05 or (
+                    above_shoulder >= -.35 and forearm_rise is not None and forearm_rise >= .18
+                    and math.dist(points[e], points[w]) >= .22 * scale)
+                if raised and not report["raised_side"]:
+                    report["raised_side"] = side
+                    reason = "candidate"
+    identity = person.get("id")
+    if isinstance(identity, bool) or not isinstance(identity, (str, int)):
+        reason = "missing_track_id"
+    report.update(reason=reason, candidate=reason == "candidate", reason_label={
+        "body_not_clear": "肩髋或身体关键点不清楚", "not_standing": "没有确认站姿或腿部不清楚",
+        "hand_not_raised": "手腕不清楚或尚未确认举手", "missing_track_id": "缺少跟踪编号",
+        "candidate": "已确认站立举手"}[reason])
+    return geometry, report
 
 
 def dialogue_topics(topics, enabled):
@@ -178,6 +228,9 @@ class Game:
         self.moved_player = None
         self.moved_track_id = None
         self.registration_candidates = 0
+        self.registration_debug = []
+        self.registration_pending = []
+        self.registration_elapsed = 0.0
         self.observation_complete = False
         self.repeat_round = False
 
@@ -201,6 +254,8 @@ class Game:
         self.players = []
         self.registration_key = self.registration_since = self.registration_last = None
         self.registration_frames = self.registration_candidates = 0
+        self.registration_debug, self.registration_pending = [], []
+        self.registration_elapsed = 0.0
         self.ready = False
         self.phase = "registering"
         self.say(f"{self.expected_players}个人一起玩。请参加的人站到我看得到的地方，举起一只手，保持一下。")
@@ -222,43 +277,79 @@ class Game:
     def registration(self, payload):
         now = self.clock()
         candidates = []
+        observations = []
         for person in payload.get("persons", []):
-            geometry = body_geometry(person, self.cfg["confidence"])
-            if geometry is None or not standing(geometry):
+            if not isinstance(person, dict):
                 continue
-            points, shoulder, _, scale = geometry
-            if not any(i in points and points[i][1] < shoulder[1] - .15*scale for i in (9, 10)):
-                continue
-            identity = person.get("id")
-            if isinstance(identity, bool) or not isinstance(identity, (str, int)):
-                continue
-            candidates.append((identity, geometry))
+            geometry, report = registration_observation(person, self.cfg["registration_confidence"])
+            observations.append((geometry, report))
+            if report["candidate"]:
+                candidates.append((report["track_id"], geometry))
+        self.registration_debug = [report for _, report in observations]
         self.registration_candidates = len(candidates)
+        # Once a genuine hold is confirmed, it remains confirmed while those
+        # same people stay visible and standing. They need not keep an arm up
+        # for the entire (longer) enrollment speech budget.
+        if self.registration_pending:
+            current = []
+            for identity, _ in self.registration_pending:
+                matches = [g for g, r in observations if r["track_id"] == identity]
+                if len(matches) == 1 and matches[0] is not None and standing(matches[0]):
+                    current.append((identity, matches[0]))
+            if len(current) == len(self.registration_pending):
+                self.registration_pending = current
+                self.registration_last = now
+                if now >= self.listen_after:
+                    self.complete_registration(current, now)
+                return
+            if now - self.registration_last <= self.cfg["registration_grace"]:
+                return
+            self.registration_pending = []
+            self.registration_key = self.registration_since = None
+            self.registration_frames, self.registration_elapsed = 0, 0.0
         ids = [p[0] for p in candidates]
         key = frozenset(ids)
         if len(ids) != self.expected_players or len(key) != len(ids):
-            self.registration_key = self.registration_since = None
-            self.registration_frames = 0
+            if self.registration_last is None or now - self.registration_last > self.cfg["registration_grace"]:
+                self.registration_key = self.registration_since = None
+                self.registration_frames, self.registration_elapsed = 0, 0.0
             if now - self.last_guidance >= 7 and now >= self.listen_after:
-                self.say(f"看到{len(ids)}位站立举手的候选玩家，需要{self.expected_players}位。请参加的人保持举手，其他人放下手。")
+                unclear = any(r["reason"] in ("body_not_clear", "missing_track_id") for r in self.registration_debug)
+                foreground = max(self.registration_debug, key=lambda r: r["body_height_pixels"], default={})
+                if not ids and foreground.get("reason") == "not_standing":
+                    self.say("还没确认站姿，请站好，让我看清肩膀、髋部和至少一条完整的腿。")
+                elif not ids and unclear:
+                    self.say("还没看清举手的玩家，请露出肩膀、手肘和手腕，并让腿部在画面里。")
+                elif not ids:
+                    self.say("还没确认举手，请站好，把一只手举到肩旁或更高，让手腕高于手肘。")
+                else:
+                    self.say(f"看到{len(ids)}位站立举手的候选玩家，需要{self.expected_players}位。请参加的人保持举手，其他人放下手。")
                 self.last_guidance = now
             return
-        if key != self.registration_key or self.registration_last is None or now - self.registration_last > self.cfg["pose_timeout"]:
+        if key != self.registration_key or self.registration_last is None or now - self.registration_last > self.cfg["registration_grace"]:
             self.registration_key, self.registration_since, self.registration_frames = key, now, 0
+            self.registration_elapsed = 0.0
+        else:
+            self.registration_elapsed += min(now - self.registration_last, .2)
         self.registration_last = now
         self.registration_frames += 1
-        if self.registration_frames >= 5 and now - self.registration_since >= self.cfg["registration_seconds"] and now >= self.listen_after:
-            # Initial left-to-right numbering only. Subsequent frames use track
-            # identities, never detection order or a new nearest bystander.
-            candidates.sort(key=lambda c: c[1][2][0])
-            self.players = [dict(number=i+1, track_id=identity, geometry=geometry,
-                                 seen=now, detector=None, frame_index=None)
-                            for i, (identity, geometry) in enumerate(candidates)]
-            self.phase = "preparing"
-            self.say(f"找到{len(self.players)}位玩家了，按画面从左到右编号。请放下手，站好准备开始。")
-            self.preparation_not_before = self.listen_after
-            self.deadline = self.listen_after + self.cfg["preparation_timeout"]
-            self.ready_since, self.ready_frames, self.last_observation = None, 0, None
+        if self.registration_frames >= 5 and self.registration_elapsed >= self.cfg["registration_seconds"]:
+            self.registration_pending = list(candidates)
+            if now >= self.listen_after:
+                self.complete_registration(candidates, now)
+
+    def complete_registration(self, candidates, now):
+        # Initial left-to-right numbering only. Later frames use track IDs.
+        candidates = sorted(candidates, key=lambda c: c[1][2][0])
+        self.players = [dict(number=i+1, track_id=identity, geometry=geometry,
+                             seen=now, detector=None, frame_index=None)
+                        for i, (identity, geometry) in enumerate(candidates)]
+        self.registration_pending = []
+        self.phase = "preparing"
+        self.say(f"找到{len(self.players)}位玩家了，按画面从左到右编号。请放下手，站好准备开始。")
+        self.preparation_not_before = self.listen_after
+        self.deadline = self.listen_after + self.cfg["preparation_timeout"]
+        self.ready_since, self.ready_frames, self.last_observation = None, 0, None
 
     def matched_players(self, payload, now):
         matches = {}
@@ -272,7 +363,8 @@ class Game:
         found = []
         for player in self.players:
             candidates = matches.get(player["track_id"], [])
-            geometry = body_geometry(candidates[0][1], self.cfg["confidence"]) if len(candidates) == 1 else None
+            threshold = self.cfg["registration_confidence"] if self.phase in ("preparing", "paused") else self.cfg["confidence"]
+            geometry = body_geometry(candidates[0][1], threshold) if len(candidates) == 1 else None
             if geometry is None:
                 found.append(None)
                 continue
@@ -296,8 +388,12 @@ class Game:
         found = self.matched_players(payload, now)
         if self.phase in ("preparing", "paused"):
             valid = all(person is not None and standing(player["geometry"]) and
-                        all(i in player["geometry"][0] and player["geometry"][0][i][1] > player["geometry"][1][1] + .15*player["geometry"][3] for i in (9, 10)) and
-                        self.hands_clear(payload, player["geometry"][0])
+                        body_geometry(person, self.cfg["confidence"]) is not None and
+                        all(w in player["geometry"][0] and
+                            player["geometry"][0][w][1] > player["geometry"][0][s][1] + .4*player["geometry"][3] and
+                            (e not in player["geometry"][0] or player["geometry"][0][w][1] >= player["geometry"][0][e][1] - .1*player["geometry"][3])
+                            for s,e,w in ((5,7,9),(6,8,10))) and
+                        self.hands_clear(payload, visible_points(person.get("keypoints"), self.cfg["confidence"]))
                         for person, player in zip(found, self.players))
             if self.last_observation is None or now - self.last_observation > self.cfg["pose_timeout"]:
                 self.ready_since, self.ready_frames = None, 0
@@ -371,6 +467,10 @@ class Game:
                     detect_fingers=self.cfg["detect_fingers"],
                     result=self.result, ready=self.ready, expected_players=self.expected_players,
                     registered_players=len(self.players), registration_candidates=self.registration_candidates,
+                    registration_debug=list(self.registration_debug),
+                    registration_confidence=self.cfg["registration_confidence"],
+                    registration_confirmed_ids=[p[0] for p in self.registration_pending],
+                    registration_hold_seconds=round(self.registration_elapsed, 2),
                     moved_player=self.moved_player, moved_track_id=self.moved_track_id,
                     players=[dict(number=p["number"], track_id=p["track_id"],
                                   visible=self.clock() - p["seen"] <= self.cfg["pose_timeout"],
@@ -660,6 +760,8 @@ def render_highlight(payload, status, confidence=0.5):
     """JPEG skeleton view, deliberately not an unsynchronised RGB overlay."""
     from io import BytesIO
     from PIL import Image, ImageDraw, ImageFont
+    if status["phase"] == "registering":
+        confidence = status.get("registration_confidence", confidence)
     image = Image.new("RGB", (800, 600), "#101c2c")
     draw = ImageDraw.Draw(image)
     try:
@@ -693,6 +795,14 @@ def render_highlight(payload, status, confidence=0.5):
         if coords:
             x, y = coords.get(0, next(iter(coords.values())))
             label = f"P{enrolled['number']}" if enrolled else "Background"
+            if status["phase"] == "registering":
+                report = next((r for r in status.get("registration_debug", []) if r["track_id"] == person.get("id")), {})
+                reason = report.get("reason", "body_not_clear")
+                label = f"#{person.get('id', '?')} " + ("CONFIRMED" if person.get("id") in status.get("registration_confirmed_ids", []) else {
+                    "candidate": "HOLD HAND", "body_not_clear": "BODY UNCLEAR", "not_standing": "CHECK LEGS",
+                    "hand_not_raised": "RAISE HAND / SHOW WRIST", "missing_track_id": "NO TRACK ID"}.get(reason, reason))
+                if reason == "not_standing" and report.get("posture") in ("sitting", "lying"):
+                    label = f"#{person.get('id', '?')} {report['posture'].upper()} / IGNORE"
             draw.text((x, max(80, y-24)), label, fill="#ff6470" if selected else "white", font=font)
         edges = list(BODY_EDGES)
         for side in ("left", "right"):
@@ -720,6 +830,10 @@ def render_highlight(payload, status, confidence=0.5):
             label = " | ".join(f"P{p['number']} hands: " + ("READY" if all(p["hands"].get(s, {}).get("ready") for s in ("left", "right")) else "NOT READY") for p in status["players"])
     else:
         label = "Finger detection OFF | enable hands in Pose and fingers in game"
+    if status["phase"] == "registering":
+        confirmed = len(status.get("registration_confirmed_ids", []))
+        count = f"Confirmed {confirmed}" if confirmed else f"Candidates {status.get('registration_candidates', 0)}"
+        label = f"{count}/{status.get('expected_players', 0)} | Hold {status.get('registration_hold_seconds', 0):.1f}s | wrist near shoulder, above elbow"
     draw.text((20, 552), label, fill="#f9cc78", font=font)
     buffer = BytesIO()
     image.save(buffer, "JPEG", quality=85)
@@ -881,6 +995,8 @@ class WoodenManPlugin:
                                      "finger_frames": "手指连续超阈采样数", "preparation_timeout": "准备站位超时（秒）",
                                      "dialogue_timeout": "播报后等待回答（秒）", "registration_timeout": "举手登记超时（秒）",
                                      "registration_seconds": "连续举手确认（秒）", "recovery_timeout": "遮挡后恢复等待（秒）",
+                                     "registration_confidence": "登记关键点最低置信度（不影响判动）",
+                                     "registration_grace": "举手识别短暂抖动容忍（秒）",
                                      "max_players": "允许的最多玩家数"}[k],
                            "advanced": True, **({"x-show-when": {"sensitivity": ["custom"]}} if k in ("motion_threshold", "finger_threshold") else {})}
                        for k, v in DEFAULTS.items()}}}}
@@ -931,6 +1047,8 @@ class WoodenManPlugin:
             config[key] = value
         if config["max_players"] != int(config["max_players"]) or config["max_players"] > 10:
             raise ValueError("max_players须为1到10的整数")
+        if config["registration_confidence"] > 1:
+            raise ValueError("registration_confidence须在0到1之间")
         if any(config[k] != int(config[k]) for k in ("moving_frames", "finger_frames")) or config["confidence"] > 1 or config["watch_seconds"] <= config["pose_timeout"]:
             raise ValueError("moving_frames和finger_frames须为整数，confidence≤1，watch_seconds须大于pose_timeout")
         for key in OPTIONS:

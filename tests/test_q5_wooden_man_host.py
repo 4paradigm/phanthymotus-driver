@@ -318,3 +318,96 @@ def test_motion_removed_and_background_companion_topics_added_once():
     for value in (0,1.5,11,True):
         with pytest.raises(ValueError):
             plugin.dispatch("config", {"max_players": value})
+
+
+def shoulder_height_hand(identity=1, x=180):
+    """Synthetic near-shoulder bent forearm, NOT captured robot coordinates."""
+    p = person(identity, x=x)
+    p["posture"] = "standing"
+    p["keypoints"][7] = [x-35, 165, .8]
+    p["keypoints"][9] = [x-35, 130, .4]
+    # A cropped head and a less certain leg should not erase a clear gesture.
+    for i in range(5):
+        p["keypoints"][i][2] = 0
+    for i in (13,15):
+        p["keypoints"][i][2] = .4
+    return p
+
+
+def test_near_shoulder_bent_hand_registers_among_two_seated_background_people():
+    h = Host()
+    h.enrollment()
+    payload = frame(person(74,x=50,raised=True,seated=True), shoulder_height_hand(53,x=400),
+                    person(76,x=730,raised=True,seated=True))
+    h.feed(payload, h.game.listen_after-h.now+1.2)
+    assert h.game.phase == "preparing"
+    assert [p["track_id"] for p in h.game.players] == [53]
+    reports = {r["track_id"]: r for r in h.game.status()["registration_debug"]}
+    assert reports[53]["candidate"] and reports[53]["raised_side"] == "left"
+    assert reports[74]["reason"] == reports[76]["reason"] == "not_standing"
+    assert h.game.cfg["confidence"] == .5  # Gesture fix must not weaken verdicts.
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_raised_hand_uses_own_shoulder_and_allows_relaxed_other_leg(side):
+    p = person()
+    s,e,w = (5,7,9) if side == "left" else (6,8,10)
+    p["keypoints"][s][1] = 125
+    p["keypoints"][e][1] = 175
+    p["keypoints"][w][1] = 135
+    # The other leg is bent; one clearly standing leg is sufficient.
+    p["keypoints"][13][:2], p["keypoints"][15][:2] = [220,245], [235,290]
+    _, report = game_module.registration_observation(p,.3)
+    assert report["candidate"] and report["raised_side"] == side
+
+
+@pytest.mark.parametrize("kind,reason", [("hanging","hand_not_raised"), ("horizontal","hand_not_raised"),
+                                        ("seated","not_standing"), ("wrist_occluded","hand_not_raised"),
+                                        ("torso_occluded","body_not_clear"), ("no_id","missing_track_id")])
+def test_registration_debug_explains_rejected_poses_without_trusting_posture_label(kind, reason):
+    p = person(raised=kind not in ("hanging","horizontal"), seated=kind == "seated")
+    p["posture"] = "standing"  # Deliberately wrong for seated pose.
+    if kind == "horizontal":
+        p["keypoints"][7][1] = p["keypoints"][9][1] = 110
+    if kind == "wrist_occluded":
+        p["keypoints"][9][2] = .1
+    if kind == "torso_occluded":
+        p["keypoints"][5][2] = .1
+    if kind == "no_id":
+        p.pop("id")
+    _, report = game_module.registration_observation(p,.3)
+    assert not report["candidate"] and report["reason"] == reason and report["reason_label"]
+
+
+def test_brief_wrist_flicker_does_not_erase_hold_and_early_confirmation_survives_lowering():
+    h = Host()
+    h.enrollment()
+    raised = shoulder_height_hand()
+    invisible = copy.deepcopy(raised)
+    invisible["keypoints"][9][2] = .1
+    for _ in range(4):
+        h.feed(frame(raised),.3)
+        h.feed(frame(invisible),.1)
+    assert h.game.phase == "registering"  # Enrollment prompt still speaking.
+    assert h.game.status()["registration_confirmed_ids"] == [1]
+    h.feed(frame(person()),h.game.listen_after-h.now+.3)
+    assert h.game.phase == "preparing" and h.game.players[0]["track_id"] == 1
+
+
+def test_prolonged_disappearance_or_changed_person_cannot_reuse_confirmed_hold():
+    h = Host()
+    h.enrollment()
+    h.feed(frame(person(raised=True)),1.3)
+    assert h.game.registration_pending
+    h.feed(frame(person(2)),.6)
+    assert not h.game.registration_pending
+    h.feed(frame(person(2)),h.game.listen_after-h.now+.3)
+    assert h.game.phase == "registering" and not h.game.players
+
+
+def test_no_standing_legs_does_not_register_even_with_a_high_hand():
+    p = person(raised=True)
+    for i in (13,14,15,16):
+        p["keypoints"][i][2] = .1
+    _, report = game_module.registration_observation(p,.3)
+    assert not report["candidate"]

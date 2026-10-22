@@ -24,6 +24,8 @@ plugins:
     dialogue_timeout: 20.0       # Starts after the estimated speech budget.
     registration_timeout: 30.0
     registration_seconds: 1.0
+    registration_confidence: 0.3 # Registration only; motion confidence stays 0.5.
+    registration_grace: 0.35    # Tolerate brief wrist/leg visibility flicker.
     recovery_timeout: 20.0
     max_players: 5              # Also set Pose max_persons >= players + bystanders.
   base_drive:

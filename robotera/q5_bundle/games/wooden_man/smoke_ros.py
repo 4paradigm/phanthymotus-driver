@@ -78,17 +78,24 @@ def main(host_interaction=False):
                 payload = {"persons": [{"id": 1, "keypoints": points}], "image_size": [320, 320]}
                 if host_interaction:
                     people = []
-                    for identity, x in ((1,180), (2,440), (99,720)):
+                    for identity, x in ((1,180), (2,440), (99,720), (100,40)):
                         body = [[x,70,.99] for _ in range(17)]
                         for i, px, py in ((5,-20,110), (6,20,110), (7,-30,155), (8,30,155),
                                          (9,-30,200), (10,30,200), (11,-15,210), (12,15,210),
                                          (13,-15,290), (14,15,290), (15,-15,370), (16,15,370)):
                             body[i] = [x+px,py,.99]
-                        if registering and identity != 99:
-                            body[9][1] = 65
+                        if registering and identity in (1,2):
+                            # Bent forearm near its own shoulder, low-confidence
+                            # wrist/leg and cropped head: old gate found zero.
+                            body[7] = [x-35,165,.8]
+                            body[9] = [x-35,130,.4]
+                            for i in range(5):
+                                body[i][2] = 0
+                            for i in (13,15):
+                                body[i][2] = .4
                         if identity == 2:
                             body[9][0] += dx
-                        if identity == 99:
+                        if identity in (99,100):
                             # A seated, moving background person never opts in.
                             body[13][:2], body[14][:2] = [x+80,210], [x+105,210]
                             body[15][:2], body[16][:2] = [x+80,290], [x+105,290]
@@ -171,7 +178,7 @@ def main(host_interaction=False):
             await_phase("won", 36, publish_pose=True)
             assert words.count("一，二，三，木头人！") == 3
             assert plugin.info()["registered_players"] == 2
-            print("PASS: real DDS natural invitation -> background replies -> two-player registration -> three rounds; moving seated bystander ignored", flush=True)
+            print("PASS: real DDS natural invitation -> background replies -> near-shoulder bent-hand registration -> three rounds; two seated bystanders ignored", flush=True)
             wait_speech()
             # wait_speech may have received the replay prompt; wait for it too.
             pump(5, publish_pose=True)

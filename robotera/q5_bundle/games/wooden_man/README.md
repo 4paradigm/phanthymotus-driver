@@ -41,7 +41,7 @@ Pose 的 **`max_persons` 至少设置为玩家数加背景人数**，避免上�
 
 1. 启动后安静待机，不检查玩家。说“小范小范，我们来玩木头人游戏吧”或“小范小范，我们来玩一二三木头人游戏”，进入 `rules_question`，回复“好啊好啊，需要我介绍规则吗？”旧口令“游戏开始”也进入问答。否定、不想玩、询问游戏是什么或怎么玩不触发开局。
 2. 回答“需要／介绍一下”进入规则介绍；“不用／不需要／直接开始”跳过。介绍说明任何一人移动本局结束，全员坚持三轮成功。之后问“这次几个人一起玩？”接受“一个人／我一个人／两个人／我们有两个人一起玩”等。人数不清或超上限时重新问，不自行猜测。回答等待从播报预算结束后计时，默认 `dialogue_timeout=20` 秒。
-3. 进入 `registering`：请参加的人**站立举手**。肩髋、膝踝几何须满足站立条件，一只手腕举过肩，躯干至少 10 像素，且候选人数恰好等于回答人数，同一批 ID 连续至少 `registration_seconds=1` 秒且 5 帧。明显坐着、趴着、没举手的路人不登记；人数多或少时提醒，不擅自挑选。默认等待 `registration_timeout=30` 秒。无需站在画面中央，也没有固定距离条件。
+3. 进入 `registering`：请参加的人**站立举手**。肩髋与腿部几何须满足站立条件；不要求双腿笔直，一条腿清晰伸向身体下方即可。允许手举过同侧肩膀，或屈肘使手腕举到肩旁且高于手肘；不要求举过头顶。躯干至少 10 像素，候选人数须恰好等于回答人数，同一批 ID 有效举手累计至少 `registration_seconds=1` 秒且 5 帧。明显坐着、趴着、没举手的路人不登记；人数多或少时提醒，不擅自挑选。默认等待 `registration_timeout=30` 秒。无需站在画面中央，也没有固定距离条件。
 4. 登记后按**摄像头画面从左到右**编号 P1、P2……，提示放下手。等待已登记玩家放手站稳且连续清晰约 0.8 秒、5 帧；手指模式还要求每个人双手清楚。准备默认 `preparation_timeout=20` 秒。清楚后播报“游戏开始，五秒后开始”，从这句播报起等待 5 秒。
 5. 播报“一，二，三，木头人！”，默认预留 `cue_seconds=3.0` 秒播报预算及 `settle_seconds=0.5` 秒站稳，再观察 `watch_seconds=3.0` 秒。每个玩家独立保存本轮基准、身体与手指计数，全部有效且没动才过关；轮间语音后重新取基准。共三轮，无机器人动作。
 6. 任一玩家判动即结束整局，例如“2号玩家，你的左手臂动了，游戏结束”，只冻结并标红该玩家的对应部位。多处移动只播报一个，左右按玩家自身解剖侧。三轮通过播报“三轮完成，大家赢了，游戏结束”。不逐人淘汰。
@@ -51,6 +51,16 @@ Pose 的 **`max_persons` 至少设置为玩家数加背景人数**，避免上�
 支持 JSON 顶层 `text` 或 `transcript`，标记 `final=false` 或 `is_final=false` 的中间结果忽略；带 ASR 起止时间戳的重复话语去重，当前会话自身完整播报回声忽略。播报期间不消费问答，避免抢答串到下一个问题。播报使用 `std_msgs/String` 包装 JSON `{"text":"..."}`，与 TTS 的 `data/json` 协议一致。关闭 `host_interaction` 仅用于旧版单人“游戏开始”直入倒计时，不支持新问答和多人登记，正常使用请保持开启。
 
 播报预算不是 TTS 播放完成回执。对话与轮间语音按每秒约 4 个字、至少 `cue_seconds` 估计时间；实际播放较慢时调大 `cue_seconds`。等待机器人说完再回答，尽量使用现有 ASR 的回声消除。游戏是有限状态对话，不是任意闲聊理解。
+
+## 举手登记排查
+
+登记使用独立的 `registration_confidence=0.3`，接近 Pose 默认的关键点显示阈值；比赛判动仍使用 `confidence=0.5`，灵敏度设置不变。举手只用身体模型的肩、肘、腕，不需要开启手指模型。短暂关键点抖动允许 `registration_grace=0.35` 秒，长时间丢失或换 ID 清除确认，不会用路人顶替。
+
+举手约一秒确认后，在登记提示语尚未播完时也会保留结果；同一玩家仍站立可见即可，不要求一直举到播报结束。进入正式准备后仍需身体达到比赛置信度要求；手指模式额外要求双手清楚。
+
+`wooden_man → highlight` 在登记时显示每个跟踪编号的状态：`HOLD HAND`（举手中）、`CONFIRMED`（已确认）、`BODY UNCLEAR`（身体不清）、`CHECK LEGS`（站姿或腿部不清）、`RAISE HAND / SHOW WRIST`（举手未确认）。明确坐姿／卧姿的背景人物显示 `SITTING / IGNORE`、`LYING / IGNORE`。底部显示候选／确认人数和有效保持时间，不再只输出“0位候选”。
+
+`status.registration_debug` 给出每人的 `track_id`、`posture`、`reason`、中文 `reason_label`、有效身体关节数、左右手腕／手肘是否可见，以及相对同侧肩和肘的高度（按躯干长度归一化）。`registration_confirmed_ids` 是已保持足够时间、等待播报完成的 ID。若仍失败，查看该 JSON 即可区分手腕置信度、举手高度和站姿问题；截图不能代替原始关键点诊断。
 
 ## 灵敏度与判动
 
@@ -88,7 +98,7 @@ Pose 的 **`max_persons` 至少设置为玩家数加背景人数**，避免上�
 ```powershell
 cd D:\phanthymotus-driver
 git add -A robotera/q5_bundle tests/test_q5_wooden_man.py tests/test_q5_wooden_man_host.py
-git commit -m "feat(q5): add wooden man dialogue and multiplayer registration"
+git commit -m "fix(q5): accept bent raised hands and explain registration failures"
 git push origin feat/q5-wooden-man
 ```
 
