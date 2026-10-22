@@ -2832,7 +2832,11 @@ class ArmGesturePlugin:
             "description": "Adam Pro 挥手、敬礼和手臂复位。复用上肢限位和限速；完成仅表示指令轨迹结束，不代表实测到位。",
             "inputSchema": {
                 "type": "object", "required": ["action"], "additionalProperties": False,
+                "x-is-dangerous": True,
                 "properties": {
+                    "confirm": {"type": "boolean", "default": False,
+                        "title": "确认现场安全与控制交接",
+                        "description": "操作员确认开发者模式、无其他低层写入者且现场允许动作后设为 true；每次动作都需要确认。"},
                     "action": {"type": "string", "enum": [*self._GESTURES, "stop", "info"],
                         "oneOf": [{"const": k, "title": v} for k, v in (
                             ("wave", "挥手（抬手、摆动、放下）"), ("salute", "敬礼"),
@@ -2844,7 +2848,9 @@ class ArmGesturePlugin:
                         "title": "过渡时长（秒）", "description": "挥手为抬手阶段时长；敬礼、复位为目标过渡时长。实际时长会按安全限速延长，并非总动作时长。"},
                 },
                 "x-action-params": {
-                    **{k: {"params": ["side", "duration_s"], "description": v}
+                    **{k: {"params": ["side", "duration_s", "confirm"],
+                           "required": ["confirm"], "x-is-dangerous": True,
+                           "description": v + " 必须明确确认现场安全与控制交接（confirm=true）。"}
                        for k, v in (("wave", "单臂挥手，自动放下并回到启动姿态，联动张开手掌。"),
                                     ("salute", "单臂敬礼，联动并拢伸掌，结束后保持姿态。"),
                                     ("reset", "所选手臂回到本次接管时的实测姿态，保持当前手型。"))},
@@ -3040,6 +3046,9 @@ class ArmGesturePlugin:
         entry = self._GESTURES.get(action)
         if entry is None:
             return None
+        if args.get("confirm") is not True:
+            return {"success": False, "code": "CONFIRMATION_REQUIRED",
+                    "message": "执行前须由操作员确认现场安全、开发者模式和控制交接，并明确传入 confirm=true"}
         pose, symmetric, default_side = entry
         side = args.get("side", default_side)
         if side not in ("left", "right", "both"):

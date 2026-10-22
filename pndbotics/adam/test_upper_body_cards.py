@@ -197,7 +197,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
         for name in ("reset",):
             gestures = self._gesture()
             control = gestures._control
-            result = gestures.dispatch(name, {})
+            result = gestures.dispatch(name, {"confirm": True})
             self.assertTrue(result["success"], f"{name}: {result}")
             self.assertEqual("both", result["side"], name)
             joints = self._targeted_joints(control)
@@ -208,7 +208,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
         for name in ("salute",):
             gestures = self._gesture()
             control = gestures._control
-            result = gestures.dispatch(name, {})
+            result = gestures.dispatch(name, {"confirm": True})
             self.assertTrue(result["success"], f"{name}: {result}")
             self.assertEqual("right", result["side"], name)
             joints = self._targeted_joints(control)
@@ -219,9 +219,9 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
     def test_selecting_the_left_arm_uses_the_mirrored_joint_set(self):
         for name in ("salute",):
             right = self._gesture()
-            self.assertTrue(right.dispatch(name, {"side": "right"})["success"])
+            self.assertTrue(right.dispatch(name, {"confirm": True, "side": "right"})["success"])
             left = self._gesture()
-            self.assertTrue(left.dispatch(name, {"side": "left"})["success"])
+            self.assertTrue(left.dispatch(name, {"confirm": True, "side": "left"})["success"])
             self.assertNotEqual(self._targeted_joints(right._control),
                                 self._targeted_joints(left._control), name)
             self.assertEqual(
@@ -232,7 +232,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
             left._cancel_sequence()
 
     def test_one_armed_gesture_rejects_both(self):
-        result = self._gesture().dispatch("salute", {"side": "both"})
+        result = self._gesture().dispatch("salute", {"confirm": True, "side": "both"})
         self.assertFalse(result["success"])
         self.assertEqual("INVALID_ARGUMENT", result["code"])
         self.assertIn("one-armed", result["message"])
@@ -273,7 +273,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
         """duration_s may only slow a gesture; it cannot beat the 0.3 ceiling."""
         gestures = self._gesture()
         control = gestures._control
-        result = gestures.dispatch("salute", {"duration_s": 0.1})
+        result = gestures.dispatch("salute", {"confirm": True, "duration_s": 0.1})
         self.assertTrue(result["success"], result)
         span = control._seg_span
         self.assertGreaterEqual(span, 0.1)
@@ -289,7 +289,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
     def test_reset_returns_the_selected_arm_to_its_startup_pose(self):
         gestures = self._gesture()
         control = gestures._control
-        result = gestures.dispatch("reset", {"side": "left"})
+        result = gestures.dispatch("reset", {"confirm": True, "side": "left"})
         self.assertTrue(result["success"], result)
         self.assertEqual(control._target_q[ADAM_PRO_JOINTS.index("elbow_Left")],
                          control._hold_q[ADAM_PRO_JOINTS.index("elbow_Left")])
@@ -304,7 +304,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
                 continue
             for side in ("left", "right", "both"):
                 gestures = self._gesture()
-                result = gestures.dispatch(name, {"side": side})
+                result = gestures.dispatch(name, {"confirm": True, "side": side})
                 self.assertIsNotNone(result, f"{name}/{side}")
                 if result.get("success"):
                     self.assertTrue(gestures._control._target_q, f"{name}/{side}")
@@ -522,7 +522,7 @@ class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
 
     def test_a_bound_gesture_applies_its_hand_shape(self):
         _, hand, gestures = self._pair()
-        result = gestures.dispatch("salute", {"side": "right"})
+        result = gestures.dispatch("salute", {"confirm": True, "side": "right"})
         self.assertTrue(result["success"], result)
         self.assertEqual("flat_hand", result["hand_gesture"])
         # HandGesturePlugin.dispatch(action="flat_hand", {"side": "right"})
@@ -535,7 +535,7 @@ class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
 
     def test_unbound_gestures_leave_the_hand_alone(self):
         _, hand, gestures = self._pair()
-        result = gestures.dispatch("reset", {"side": "both"})
+        result = gestures.dispatch("reset", {"confirm": True, "side": "both"})
         self.assertTrue(result["success"], result)
         self.assertNotIn("hand_gesture", result)
         self.assertEqual([], hand._control.activated)
@@ -543,7 +543,7 @@ class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
     def test_the_pairing_is_optional(self):
         control = self.arm_plugin()
         gestures = ArmGesturePlugin(control)
-        result = gestures.dispatch("salute", {"side": "right"})
+        result = gestures.dispatch("salute", {"confirm": True, "side": "right"})
         self.assertTrue(result["success"], result)
         self.assertNotIn("hand_gesture", result)
 
@@ -556,7 +556,7 @@ class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
         ):
             _, hand, gestures = self._pair()
             hand._control._activate = lambda _positions, _action: failure.copy()
-            result = gestures.dispatch("salute", {"side": "right"})
+            result = gestures.dispatch("salute", {"confirm": True, "side": "right"})
             self.assertFalse(result["success"], result)
             self.assertEqual("DDS_UNAVAILABLE", result["code"])
             self.assertTrue(result["arm_accepted"])
@@ -566,7 +566,7 @@ class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
         _, hand, gestures = self._pair()
         hand._control._activate = lambda _positions, _action: {
             "success": False, "code": "DDS_UNAVAILABLE"}
-        result = gestures.dispatch("wave", {"side": "right"})
+        result = gestures.dispatch("wave", {"confirm": True, "side": "right"})
         self.assertFalse(result["success"], result)
         self.assertTrue(result["arm_accepted"])
         self.assertIsNone(gestures._sequence_id)
@@ -623,7 +623,7 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
     def test_wave_reports_completion_after_lowering_the_arm(self):
         control = self.arm_plugin()
         control._active_segment_span = lambda: 0.01
-        result = ArmGesturePlugin(control).dispatch("wave", {})
+        result = ArmGesturePlugin(control).dispatch("wave", {"confirm": True})
         self.assertTrue(result["success"], result)
         self.assertIn("action_id", result)
         self.assertTrue(result["auto_lower"])
@@ -647,7 +647,7 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         control._active_segment_span = lambda: 5.0
         gestures = ArmGesturePlugin(control)
         gestures._WAVE_SEQUENCE = (("wave_out", 5.0),)
-        result = gestures.dispatch("wave", {})
+        result = gestures.dispatch("wave", {"confirm": True})
         self.assertTrue(result["success"], result)
         time.sleep(0.05)
         gestures.dispatch("stop", {})
@@ -660,9 +660,9 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         control._active_segment_span = lambda: 0.01
         gestures = ArmGesturePlugin(control)
         gestures._WAVE_SEQUENCE = (("wave_out", 0.3), ("wave_in", 0.3))
-        first = gestures.dispatch("wave", {})
+        first = gestures.dispatch("wave", {"confirm": True})
         time.sleep(0.05)
-        second = gestures.dispatch("wave", {})
+        second = gestures.dispatch("wave", {"confirm": True})
         self.assertNotEqual(first["action_id"], second["action_id"])
         deadline = time.monotonic() + 5.0
         while len(self.calls) < 2 and time.monotonic() < deadline:
@@ -689,12 +689,12 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
             return original_targets(pose, side)
 
         gestures._targets_for = delayed_targets
-        wave = gestures.dispatch("wave", {})
+        wave = gestures.dispatch("wave", {"confirm": True})
         self.assertTrue(entered.wait(2.0))
         pose_result = []
         pose_thread = threading.Thread(
             target=lambda: pose_result.append(
-                gestures.dispatch("salute", {"side": "right"})))
+                gestures.dispatch("salute", {"confirm": True, "side": "right"})))
         pose_thread.start()
         release.set()
         pose_thread.join(2.0)
@@ -714,9 +714,9 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         control = self.arm_plugin()
         control._active_segment_span = lambda: 5.0
         gestures = ArmGesturePlugin(control)
-        wave = gestures.dispatch("wave", {})
+        wave = gestures.dispatch("wave", {"confirm": True})
         time.sleep(0.05)
-        salute = gestures.dispatch("salute", {"side": "right"})
+        salute = gestures.dispatch("salute", {"confirm": True, "side": "right"})
         self.assertTrue(salute["success"], salute)
         deadline = time.monotonic() + 5.0
         while not self.calls and time.monotonic() < deadline:

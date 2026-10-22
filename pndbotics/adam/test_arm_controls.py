@@ -429,8 +429,13 @@ class HandSmoothTests(unittest.TestCase):
             self.assertEqual(plugin._command_positions, [500] * 12)
             stop = plugin._control_stop_event
 
-            # Let the control loop run for a few periods; it should move partway.
-            time.sleep(0.05)
+            # Observe convergence rather than assuming exactly five scheduler
+            # ticks fit into 50ms on a shared development machine.
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if pub.commands and all(abs(v) <= 60 for v in pub.commands[-1].position):
+                    break
+                time.sleep(0.005)
             stop.set()
             plugin._control_thread.join(1.0)
         finally:

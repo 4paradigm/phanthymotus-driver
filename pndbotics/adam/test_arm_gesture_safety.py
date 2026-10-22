@@ -77,34 +77,34 @@ class GestureSafetyTests(unittest.TestCase):
                          set(schema['properties']['action']['enum']))
         self.assertEqual({'wave', 'salute', 'reset'}, set(schema['x-completion']['actions']))
         for action in ('wave', 'salute'):
-            self.assertEqual('INVALID_ARGUMENT', self.gesture.dispatch(action, {'side':'both'})['code'])
+            self.assertEqual('INVALID_ARGUMENT', self.gesture.dispatch(action, {"confirm": True, 'side':'both'})['code'])
         for value in (True, float('nan'), -1, 61, 'bad'):
-            self.assertEqual('INVALID_ARGUMENT', self.gesture.dispatch('reset', {'duration_s':value})['code'])
+            self.assertEqual('INVALID_ARGUMENT', self.gesture.dispatch('reset', {"confirm": True, 'duration_s':value})['code'])
         self.assertIsNone(self.gesture.dispatch('handshake', {}))
 
     def test_static_and_wave_complete_once_without_measured_arrival_claim(self):
         self.fast()
         for action in ('salute', 'reset', 'wave'):
-            accepted = self.gesture.dispatch(action, {'side':'left'})
+            accepted = self.gesture.dispatch(action, {"confirm": True, 'side':'left'})
             call = self.wait_for(accepted['action_id'])
             self.assertEqual('completed', call[1])
             self.assertEqual('commanded trajectory', call[2]['completion_basis'])
             self.assertIsNone(call[2]['measured_arrival'])
 
     def test_stop_freezes_and_restart_reacquires_feedback(self):
-        first = self.gesture.dispatch('wave', {})
+        first = self.gesture.dispatch('wave', {"confirm": True})
         result = self.gesture.dispatch('stop', {})
         self.assertTrue(result['success'])
         self.assertEqual('cancelled', self.wait_for(first['action_id'])[1])
         self.assertFalse(self.control._thread and self.control._thread.is_alive())
         self.fast()
-        second = self.gesture.dispatch('reset', {})
+        second = self.gesture.dispatch('reset', {"confirm": True})
         self.assertTrue(second['success'], second)
         self.assertEqual('completed', self.wait_for(second['action_id'])[1])
         self.assertEqual([0.1]*31, self.control._hold_q)
 
     def test_stale_feedback_fails_and_never_resumes_old_trajectory(self):
-        accepted = self.gesture.dispatch('wave', {})
+        accepted = self.gesture.dispatch('wave', {"confirm": True})
         self.feedback.live = False
         call = self.wait_for(accepted['action_id'])
         self.assertEqual('error', call[1])
@@ -112,7 +112,7 @@ class GestureSafetyTests(unittest.TestCase):
         frozen = list(self.control._last_command_q)
         time.sleep(0.1)
         self.assertEqual(frozen, self.control._last_command_q)
-        self.assertEqual('LOWSTATE_UNAVAILABLE', self.gesture.dispatch('salute', {})['code'])
+        self.assertEqual('LOWSTATE_UNAVAILABLE', self.gesture.dispatch('salute', {"confirm": True})['code'])
 
     def test_arm_waist_and_head_commands_cancel_the_gesture(self):
         for kind, action, args in (
@@ -120,14 +120,14 @@ class GestureSafetyTests(unittest.TestCase):
             (device.WaistControlPlugin, 'set_angles', {'yaw_deg':5}),
             (device.HeadControlPlugin, 'set_angles', {'yaw_deg':5}),
         ):
-            accepted = self.gesture.dispatch('wave', {})
+            accepted = self.gesture.dispatch('wave', {"confirm": True})
             result = kind(self.control).dispatch(action, args)
             self.assertIsNotNone(result)
             self.assertNotEqual(False, result.get('success'), result)
             self.assertEqual('cancelled', self.wait_for(accepted['action_id'])[1])
 
     def test_timer_cannot_report_completion_without_final_written_command(self):
-        accepted = self.gesture.dispatch('salute', {})
+        accepted = self.gesture.dispatch('salute', {"confirm": True})
         self.control._write_command = lambda dt: None
         with self.gesture._sequence_lock:
             self.gesture._sequence_deadline = time.monotonic() + 0.05
@@ -145,15 +145,15 @@ class GestureSafetyTests(unittest.TestCase):
         self.assertEqual('LOWSTATE_UNAVAILABLE', self.control._ready_error()['code'])
 
     def test_new_gesture_cancels_prior_static_pose(self):
-        first = self.gesture.dispatch('salute', {})
-        second = self.gesture.dispatch('reset', {})
+        first = self.gesture.dispatch('salute', {"confirm": True})
+        second = self.gesture.dispatch('reset', {"confirm": True})
         self.assertEqual('cancelled', self.wait_for(first['action_id'])[1])
         self.gesture.dispatch('stop', {})
         self.assertEqual('cancelled', self.wait_for(second['action_id'])[1])
 
     def test_false_writer_is_failure_and_target_is_discarded(self):
         self.control._publisher.Write = lambda *a, **k: False
-        result = self.gesture.dispatch('wave', {})
+        result = self.gesture.dispatch('wave', {"confirm": True})
         self.assertEqual('DDS_WRITE_FAILED', result['code'])
         self.assertFalse(self.control._active)
         self.assertEqual({}, self.control._target_q)
@@ -201,6 +201,41 @@ class BundleRegistrationTests(unittest.TestCase):
         vendor.dispatch.return_value = {'success':True}
         bundle.dispatch('motion', {'action':'stop'})
         self.assertIsNone(bundle._vendor_owner)
+
+
+class GestureConfirmationTests(unittest.TestCase):
+    def test_every_motion_requires_literal_true_before_any_side_effect(self):
+        for action in ('wave', 'salute', 'reset'):
+            for args in ({}, {'confirm':False}, {'confirm':None}, {'confirm':0},
+                         {'confirm':1}, {'confirm':'true'}):
+                control, hand = mock.Mock(), mock.Mock()
+                gesture = device.ArmGesturePlugin(control, hand=hand)
+                result = gesture.dispatch(action, args)
+                self.assertEqual('CONFIRMATION_REQUIRED', result['code'])
+                control.start.assert_not_called()
+                control._set_targets.assert_not_called()
+                hand.dispatch.assert_not_called()
+
+    def test_schema_exposes_confirmation_only_for_motion_actions(self):
+        schema = device.ArmGesturePlugin(mock.Mock()).get_tool()['inputSchema']
+        self.assertTrue(schema['x-is-dangerous'])
+        self.assertFalse(schema['properties']['confirm']['default'])
+        for action in ('wave','salute','reset'):
+            entry = schema['x-action-params'][action]
+            self.assertIn('confirm', entry['params'])
+            self.assertIn('confirm', entry['required'])
+            self.assertTrue(entry['x-is-dangerous'])
+        for action in ('stop','info'):
+            self.assertNotIn('confirm', schema['x-action-params'][action]['params'])
+
+    def test_stop_and_info_remain_available_without_confirmation(self):
+        for action in ('stop','info'):
+            control = mock.Mock()
+            control.dispatch.return_value = {'success':True,'state':'idle'}
+            gesture = device.ArmGesturePlugin(control)
+            self.assertTrue(gesture.dispatch(action, {})['success'])
+            control.dispatch.assert_called_once_with(action, {})
+            control.start.assert_not_called()
 
 
 if __name__ == '__main__':
