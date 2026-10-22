@@ -1,0 +1,11 @@
+mcp_port: 15717
+ros_namespace: ""
+name: "云深处山猫 S10"
+model_variant: "pro"
+navigation_task_timeout: 180
+basic_server:
+  enabled: true
+  host: "10.21.33.103"
+  tls_tcp_port: 30003
+  timeout: 2.0
+  ca_cert: ""
