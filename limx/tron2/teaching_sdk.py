@@ -62,6 +62,8 @@ class SDKReplay:
         self.sent = 0
 
     def fail(self, reason):
+        if self.closing:
+            return
         if self.reason is None:
             self.reason = str(reason)
         self.stop.set()

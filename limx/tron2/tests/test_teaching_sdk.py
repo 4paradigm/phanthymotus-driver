@@ -81,6 +81,7 @@ def test_worker_submits_all_frames_and_never_completes_on_failure(failure):
         def pause(self,timeout):closed.append('pause')
         def disconnect(self):
             closed.append('disconnect')
+            w.fail('in-flight query interrupted by expected close')
             if failure=='cleanup':raise RuntimeError('cleanup failed')
     def create():w.controller=Controller();w.motion_sent=True
     w.create_controller=create
