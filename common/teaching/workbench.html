@@ -85,7 +85,7 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
   <details id="episode-history" class="details-card" hidden><summary>全部录制与失败诊断</summary><div class="load"><select id="episodes" aria-label="选择诊断录制"></select><button id="episode-details-btn">查看数据质量</button></div></details>
   <p id="chat-hint" class="note" hidden></p>
 </main>
-<footer><div class="row"><button id="stop-btn" class="stop" disabled>■ 停止动作</button><small id="footer-hint">检查不会启动机器人动作。</small></div><div class="footer-buttons"><button id="back-btn" hidden>上一步</button><button id="check-btn" class="primary">检查设备</button><button id="next-btn" disabled>进入录制 →</button><button id="to-save-btn" class="primary" hidden disabled>下一步：保存 →</button><button id="import-enable-btn" class="primary" hidden disabled>效果符合预期，启用技能</button><button id="save-btn" class="primary" hidden disabled>保存技能</button></div></footer>
+<footer><div class="row"><button id="stop-btn" class="stop" disabled>■ 停止动作</button><small id="footer-hint">检查不会启动机器人动作。</small></div><div class="footer-buttons"><button id="back-btn" hidden>上一步</button><button id="check-btn" class="primary">检查设备</button><button id="next-btn" disabled>进入录制 →</button><button id="to-save-btn" class="primary" hidden disabled>下一步：保存 →</button><button id="import-enable-btn" class="primary" hidden disabled>效果符合预期，启用技能</button><button id="save-btn" class="primary" hidden disabled>保存技能</button><button id="new-record-btn" class="primary" hidden>录制下一个动作</button></div></footer>
 <section id="confirm" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">确认本次接管</h2><p id="confirm-description"></p><details class="details-card"><summary>设备绑定</summary><p id="confirm-binding" class="note"></p></details><div id="gripper-replay-fields" hidden style="margin-top:16px"><label class="field"><span>夹爪速度档位（1–100）</span><input id="replay-gripper-speed" type="number" min="1" max="100" step="1" inputmode="numeric" placeholder="必填，例如 50"></label><label class="field"><span>夹爪力档位（0–100）</span><input id="replay-gripper-force" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="必填，例如 30"></label></div><label><input type="checkbox" id="confirm-control"><span id="confirm-control-label">已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。</span></label><div id="confirm-error" class="error" role="alert" hidden></div><div class="row"><button id="confirm-cancel">取消</button><button id="confirm-go" class="primary" disabled>确认并执行</button></div></div></section>
 <!-- TRON2 新增：录制前任务描述（同确认框风格），不推挤录制页布局 -->
 <section id="record-start" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="record-start-title"><h2 id="record-start-title">开始只读录制</h2><p>录制只读取双臂关节、双夹爪和三路图像，不接管控制，也不进入或退出原厂 VR。</p><label class="field" style="margin-top:16px"><span>任务描述（必填）</span><textarea id="record-task" maxlength="2000" placeholder="例如：把红色方块放入托盘"></textarea></label><div id="record-task-error" class="error" role="alert" hidden>请填写任务描述，最多 2000 字。</div><div class="row" style="margin-top:16px"><button id="record-start-cancel">取消</button><button id="record-start-go" class="primary">开始录制</button></div></div></section>
@@ -202,6 +202,8 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     ['prepare','record','review','save'].forEach((id,i)=>{$(id).hidden=i!==stage;});
     document.querySelectorAll('.steps li').forEach((el,i)=>{el.classList.toggle('current',i===stage);el.classList.toggle('done',i<stage);el.querySelector('b').textContent=i<stage?'✓':String(i+1);if(i===stage)el.setAttribute('aria-current','step');else el.removeAttribute('aria-current');});
     $('check-btn').hidden=stage!==0;$('next-btn').hidden=stage!==0;$('to-save-btn').hidden=stage!==2;$('save-btn').hidden=stage!==3 || installed;
+    $('new-record-btn').hidden=training || stage!==3 || !(installed || status.saved);
+    $('new-record-btn').disabled=locked || moving || !canPrepare;
     const imported=!!draft.imported;
     document.querySelector('.steps').hidden=imported;
     $('import-summary').hidden=!imported;$('effect-label').hidden=imported;
@@ -406,7 +408,12 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     $('saved-hint').textContent=result.context?.conversation_ready?'现在可以在对话里说：':'连接执行卡后，即可对话调用：';
     $('saved-phrase').textContent=`“${draft.imported.metadata.name}”`;
   });
-  $('again-btn').onclick=()=>act(async()=>{reset(await call('new'));setStage(0);showChecks();});
+  $('again-btn').onclick=()=>act(async()=>{
+    reset(await call('new'));
+    for(const id of ['skill-name','skill-conditions','record-task'])$(id).value='';
+    updatePhrase();setStage(0);showChecks();
+  });
+  $('new-record-btn').onclick=$('again-btn').onclick;
   $('back-btn').onclick=()=>{if(training){closeTraining();return;}setStage(stage===3?2:0);if(stage===0)showChecks();};
   $('effect').onchange=()=>{approvedTrial=$('effect').checked?draft.trial?.action_id:null;render();};
   $('to-save-btn').onclick=()=>setStage(3);$('scrub').oninput=scrub;

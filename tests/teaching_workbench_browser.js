@@ -3,7 +3,7 @@
 (async () => {
   if (location.hostname !== '127.0.0.1' || document.title !== 'TRON2 teaching local fixture')
     throw new Error('This check requires the local fake-vendor fixture.');
-  const d = document.querySelector('iframe').contentDocument;
+  let d = document.querySelector('iframe').contentDocument;
   const $ = id => d.getElementById(id);
   const assert = (ok, message) => { if (!ok) throw new Error(message); };
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -50,9 +50,17 @@
   click('effect'); click('to-save-btn'); input('skill-name', '浏览器回归技能'); input('skill-conditions', '物体布置固定，手动恢复起点'); click('save-btn');
   await until(() => !$('confirmation-result').hidden, 'skill saved');
   const saved = $('saved-phrase').textContent;
-  const response = await fetch('/mcp', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({jsonrpc:'2.0', id:1, method:'tools/call', params:{name:'tron2_teaching', arguments:{action:'new'}}})});
-  assert(!(await response.json()).error, 'new fixture draft');
-  await until(() => !$('prepare').hidden, 'new draft');
+  assert($('new-record-btn') && !$('new-record-btn').hidden, 'saved skill has no next recording entry');
+  const frame = document.querySelector('iframe'), previous = d;
+  frame.contentWindow.location.reload();
+  await until(() => frame.contentDocument !== previous && frame.contentDocument.getElementById('new-record-btn'), 'reopen saved workbench');
+  d = frame.contentDocument;
+  await until(() => !$('new-record-btn').hidden && !$('new-record-btn').disabled, 'next recording after reopen');
+  click('new-record-btn');
+  await until(() => !$('prepare').hidden && !$('check-btn').disabled, 'new draft');
+  await wait(2200);
+  assert(!$('prepare').hidden, 'poll returned new draft to saved skill');
+  assert(!$('effect').checked && $('skill-name').value === '' && $('skill-conditions').value === '', 'previous skill state leaked');
   click('check-btn'); await until(() => !$('next-btn').disabled, 'checks before failure');
   click('next-btn'); await until(() => !$('record').hidden && !$('record-btn').disabled, 'second record page');
   click('record-btn'); input('record-task', '断流诊断'); click('record-start-go');

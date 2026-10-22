@@ -7,6 +7,7 @@
 TRON2 适配器显式声明 `presentation.passive_recording=true`。只有该分支允许直接调用 `record(args)`，隐藏“进入遥操”，并在开始录制时要求填写任务描述。训练数据入口位于试运行页的折叠区，打开后进入独立页面。四步主流程仍是设备检查、录制、试运行、保存。其他适配器继续使用原有 `record()`、遥操会话检查及试运行保存流程。
 
 - 保存 Skill 必须有成功试运行和 `effect_confirmed=true`。
+- 保存后或重新打开已保存草稿，可点击“录制下一个动作”回到设备检查。该入口复用 `new` 创建空草稿，保留已有技能与录制；设备忙时禁用。
 - 训练 episode 和 LeRobot 数据保存不经过 Skill 保存门禁。
 - `motus.teaching.package/1` 仍只允许 `manifest.json` 与 `trajectory.jsonl`。ZIP 上限 16 MiB，轨迹上限 64 MiB。
 - 适配器必须校验本机模型与关节顺序，并重新绑定导入资产。导入不产生试运行证明。
