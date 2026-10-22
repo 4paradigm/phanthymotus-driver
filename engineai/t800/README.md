@@ -39,6 +39,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `gait` | actuator | 基于 Native SDK motion state 的步态选择；自动适配 `rl_basic`/`walk` 版本差异 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
 | `joint_plan` | actuator | 索引/名称关节轨迹、头部/单臂姿态、当前位置保持、取消、复位和预置动作 |
+| `teleop_control` | actuator | PICO 两卡双臂遥操；5DOF 位置优先 IK、局部可达边界、平滑参考和输入/反馈门禁，默认 Shadow |
 | `motion_recorder` | actuator | 按指定采样率录制关节轨迹，手动/定时停止均自动落盘，并支持管理与回放 |
 | `head` | actuator | 头部语义控制：点头、摇头、预设视线与 rotate_to 绝对角度 |
 | `joint_plan_state` | sensor | 规划 request id、状态和进度 |
@@ -233,6 +234,66 @@ PulseAudio——这是官方「aplay 播放 + pactl 音量」模型成立的前�
 缓冲会造成明显延迟）。`aplay` 带 `--buffer-time=100000 --period-time=20000`
 压低读前缓冲；部署侧设置 `PULSE_LATENCY_MSEC=40` 控制 PulseAudio
 tsched 延迟上限（见 `deploy/service.yml`）。
+
+## PICO → T800 两卡遥操
+
+使用 PICO 设备 Driver 的 `teleop_device` 和本 Driver 的 `teleop_control`，
+将前者的 command 端口连接到后者。输入为 `/teleop/command`、
+`data/teleop-cmd`，监控输出为 `/teleop/state`、`data/teleop-state`；无需反向连线，
+也不需要增加 Core/ActuCore 卡片。PICO 输入协议对应
+[PR #329](https://github.com/4paradigm/phanthymotus-driver/pull/329)，
+`common/teleop_contract.py` 与其 `77a9fa3a` 版本完全一致，合并时保留同一份共享契约。
+
+1. PICO Driver、T800 Driver 和 Core 部署在同一台 Linux 主机（容器使用 host 网络）。
+   输入使用宿主机 boot ID 和单调时钟，不接受另一台主机的时间戳。
+   默认 CycloneDDS 配置将机器人 Domain 69 绑定本体网卡，将 Core Domain 42
+   绑定 `127.0.0.1`，与 PICO/Core 的本机 DDS 配置对接。自定义 `CYCLONEDDS_URI`
+   会覆盖默认配置，必须保留这两条通信路径；不能只配置一条全域本体网卡规则。
+2. 先按已有操作流程进入 `lower_body_balance`，确认关节规划器处于 IDLE。
+   遥操不会自动起立、切换步态、复位、收臂或移动腰腿。
+3. 默认 `plugins.teleop_control.mode: shadow`：完整执行输入校验、映射和求解，
+   在监控面板显示关节参考与位置残差，**不发布电机命令**。
+   在本机完成模型、关节方向、停止链路及通信联调后，显式设置 `mode: live`
+   并重启 Driver 才启用本体输出。`position_scale` 默认 0.5，允许 `(0, 1]`。
+   部署配置可通过现有 `CONFIG_PATH` 加载持久化 YAML；这些参数不是 PICO 端设置。
+4. 启动项目后先松开双握把，以当时真实双臂姿态和头显朝向建立相对基准。
+   双握（均 ≥0.7）使能跟随；松开任一侧保持最后参考，再握保持原映射，
+   不会每次重标定。初次握着手柄启动不会立即运动。
+5. 输入超过 300 ms、跟踪丢失、求解结果超过 150 ms，或命令循环间隔超过
+   50 ms 时，保持参考并要求双握把完全松开（均 ≤0.2）后再握。
+   仅连接代次变化且空间代次不变时保留基准；空间重置需要松握建立新基准。
+   当前 PICO Driver 重连也会递增空间代次，因此重连后需先松握重新建立基准。
+   机器人反馈过期、模式变化、规划器开始运行、腰腿偏离起点超过 0.15 rad、
+   双臂实际位置偏离命令超过 0.35 rad 时进入错误并释放覆盖，必须停止项目后重新启动。
+6. 停止项目、运动中断及 safety 动作会终止会话并释放覆盖，原生 SDK 接管。
+   这是软件释放，不能保证物理瞬时静止，也不是安全认证急停。
+   发布释放失败时保留互斥并重试，旧的求解结果不能再次启动输出。
+
+该型号全身 25 关节，遥操只写 `13..22` 的十个臂关节，使用现有
+`JointOverrideCommand` 与 T800 上肢增益。模型直接读取已随 Driver 发布的
+`serial_t800.urdf`，末端为 `LINK_WRIST_END_L/R`，目标在躯干局部坐标系中。
+每臂只有 5 个关节：位置优先，姿态仅在剩余自由度内尽量跟随，不能承诺完整 6D 跟踪。
+采用 NumPy 有界迭代，不增加 Pinocchio/CasADi 镜像依赖；现有
+`common/control/kinematics.py` 面向 Pinocchio 的完整位姿任务，未直接用于此 5DOF 策略。
+
+越界目标采用带关节限位的**局部近似投影**，监控显示 `limited` 及米制残差，
+不是求解全局最远可达点。回到可达区域无需重握；接近伸直时用初始实测构型作为
+第二求解种子，避免仅用当前种子卡在限位附近。100 Hz 输出采用二阶平滑，
+关节参考速度不超过 0.5 rad/s、正常跟随参考加速度不超过 2 rad/s²；
+停止/故障保持和限位裁剪可以立即归零速度。以上都是参考值约束，不是电机实测保证。
+数值线程不持有发布锁，命令线程不补发积压轨迹。
+
+运动期间阻止其他运动卡抢占，包括原始关节流、姿态、步态与轨迹回放；
+已在运行/等待反馈的动作也会阻止遥操启动。现有 `motion_recorder.record_start`
+包含复位准备，首版不允许与遥操并发；若需采集，使用平台订阅 `joints` 数据流的录制链路。
+本次范围不含行走、夹爪、全身重定向或自碰撞/环境避障。尚未做 T800 真机验证，
+也不把关节限位等同于碰撞安全。
+
+离线验证：`python3 -m pytest engineai/t800/tests -q`（从仓库根目录）。
+新增测试覆盖 URDF 雅可比、越界返回、PICO 原始输入 fixture、身份/时序校验、
+握把恢复、停止与延迟求解竞态、发布失败、双臂消息布局、互斥及 DDS 配置。
+ROS 测试使用已有测试替身，不代表容器 DDS 互通或真机验收。
+CycloneDDS 配置语义参考其[官方文档](https://cyclonedds.io/docs/cyclonedds/0.10.2/config/cyclonedds_specifics.html)。
 
 ## 运行
 

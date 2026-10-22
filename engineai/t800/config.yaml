@@ -103,6 +103,11 @@ plugins:
       down: {pitch_rad: 0.3, yaw_rad: 0.0}
   joint_override:
     enabled: true
+  teleop_control:
+    enabled: true
+    # First validate input, model and limits in Shadow; then opt in on the robot.
+    mode: shadow
+    position_scale: 0.5
   joint_bridge:
     enabled: true
   led:
