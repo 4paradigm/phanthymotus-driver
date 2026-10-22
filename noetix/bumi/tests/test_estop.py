@@ -125,11 +125,56 @@ def test_failed_clear_keeps_the_next_start_latched(estop, tmp_path, monkeypatch)
         raise OSError('read-only filesystem')
 
     monkeypatch.setattr(estop.Path, 'unlink', refuse_unlink)
-    assert latch.reset() is True          # in-memory release succeeded
+    # A release the next restart would undo is not a release.
+    assert latch.reset() is False
+    assert latch.latched is True
     monkeypatch.undo()
 
     # The old record is still there, so a restart must not come back unlatched.
     assert estop.EmergencyStopLatch(str(path)).latched is True
+
+
+def test_trigger_reports_when_the_marker_cannot_be_written(estop, tmp_path, monkeypatch):
+    latch = estop.EmergencyStopLatch(str(tmp_path / 'estop_state.json'))
+
+    def fail_mkdir(self, parents=False, exist_ok=False):
+        raise OSError('read-only filesystem')
+
+    monkeypatch.setattr(estop.Path, 'mkdir', fail_mkdir)
+    assert latch.trigger('estop_card') is True
+    monkeypatch.undo()
+
+    assert latch.latched is True
+    assert latch.durable is False
+
+
+def test_startup_with_unwritable_state_starts_latched(estop, tmp_path, monkeypatch):
+    def fail_mkdir(self, parents=False, exist_ok=False):
+        raise OSError('read-only filesystem')
+
+    monkeypatch.setattr(estop.Path, 'mkdir', fail_mkdir)
+    latch = estop.EmergencyStopLatch(str(tmp_path / 'estop_state.json'))
+    monkeypatch.undo()
+
+    assert latch.latched is True
+    assert latch.snapshot()['source'] == 'estop_state_unwritable'
+
+
+def test_card_reset_failure_keeps_the_latch_and_reports_it(estop, tmp_path, monkeypatch):
+    latch = estop.EmergencyStopLatch(str(tmp_path / 'estop_state.json'))
+    card = estop.EstopPlugin({}, 'robot', None, latch)
+    card.dispatch('trigger', {})
+
+    def refuse_unlink(self, missing_ok=False):
+        raise OSError('read-only filesystem')
+
+    monkeypatch.setattr(estop.Path, 'unlink', refuse_unlink)
+    result = card.dispatch('reset', {'confirm': True})
+    monkeypatch.undo()
+
+    assert result['code'] == 'ESTOP_CLEAR_FAILED'
+    assert latch.latched is True
+    assert result['estop']['latched'] is True
 
 
 def test_failed_write_still_restores_latched(estop, tmp_path, monkeypatch):
@@ -219,12 +264,16 @@ def test_card_trigger_reset_and_confirm(estop):
     latch = estop.EmergencyStopLatch()
     card = estop.EstopPlugin({}, 'robot', None, latch)
 
-    assert card.get_tool()['name'] == 'estop'
+    tool = card.get_tool()
+    assert tool['name'] == 'estop'
+    assert tool['inputSchema']['x-action-params']['reset']['x-is-dangerous'] is True
+    assert 'x-is-dangerous' not in tool['inputSchema']['x-action-params']['trigger']
     assert card.dispatch('info', {})['estop']['latched'] is False
 
     latched = card.dispatch('trigger', {'reason': 'operator'})
     assert latched['state'] == 'latched'
     assert latched['newly_latched'] is True
+    assert latched['estop']['durable'] is True
     assert latch.latched is True
 
     refused = card.dispatch('reset', {})
@@ -328,7 +377,7 @@ def test_servo_only_configuration_pauses_and_zeroes_on_latch(monkeypatch, estop)
     assert servo._halt(False)['code'] == 'ESTOP_ACTIVE'
 
 
-def test_bundle_wires_one_latch_into_loco_and_the_card(monkeypatch, device, estop):
+def test_bundle_wires_one_latch_into_loco_and_the_card(monkeypatch, tmp_path, device, estop):
     """The card alone is not the safety property: `loco` must share its latch."""
     monkeypatch.setitem(sys.modules, 'device', device)
     monkeypatch.setitem(sys.modules, 'estop', estop)
@@ -340,7 +389,9 @@ def test_bundle_wires_one_latch_into_loco_and_the_card(monkeypatch, device, esto
 
     high = _FakeHighCtrl()
     bundle = module.BumiDeviceBundle(
-        {'plugins': {'loco': {'enabled': True}, 'estop': {'enabled': True}}},
+        {'plugins': {'loco': {'enabled': True},
+                     'estop': {'enabled': True,
+                               'state_path': str(tmp_path / 'estop_state.json')}}},
         'robot', types.SimpleNamespace(add_node=lambda node: None), high, None)
 
     names = {tool['name'] for tool in bundle.get_all_tools()}

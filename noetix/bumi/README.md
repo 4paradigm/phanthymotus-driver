@@ -465,7 +465,16 @@ software latch**, not a replacement for the robot's physical E-stop button.
   it before writing the record, and `reset(confirm: true)` deletes it. A
   partial write, a failed fsync, an unreadable file, a syntactically valid but
   schema-invalid record, or one that claims `latched: false` all come back
-  **latched** (fail-closed) rather than free to move.
+  **latched** (fail-closed) rather than free to move. A state directory that
+  cannot be written at startup also comes back latched
+  (`estop_state_unwritable`).
+- `trigger` reports `durable: false` plus `code: ESTOP_NOT_DURABLE` when the
+  marker cannot be written. The latch still blocks motion in this process, but
+  the restart guarantee failed and the message says so instead of claiming a
+  clean E-stop.
+- `reset` only succeeds once the marker is gone. If the file cannot be
+  removed, the card returns `code: ESTOP_CLEAR_FAILED`, the latch stays set,
+  and motion stays blocked — a release a restart would undo is not a release.
 - Disabling `plugins.estop` does **not** clear an existing latch. Motion stays
   blocked, the bundle logs a warning at startup, and the state file must be
   removed or the card re-enabled to reset it.

@@ -62,6 +62,10 @@ class EmergencyStopLatch:
         self._blocked = 0
         self._on_latch = []
         self._state_path = Path(state_path) if state_path else None
+        # Whether the current latched state is durably recorded. False means a
+        # restart could come back unlatched; callers must surface that instead
+        # of reporting a clean E-stop.
+        self._durable = True
         self._restore()
 
     # ── restart survival ─────────────────────────────────────────────────────
@@ -78,11 +82,21 @@ class EmergencyStopLatch:
         try:
             raw = self._state_path.read_text()
         except FileNotFoundError:
+            # No record. If the directory cannot be written at all, a future
+            # `trigger` could not leave one either; start latched so a broken
+            # mount cannot look like a clean, motion-ready robot.
+            if not self._state_writable():
+                print(f"[estop] {self._state_path.parent} is not writable; "
+                      "starting latched", flush=True)
+                self._set_restored("estop_state_unwritable",
+                                   "state directory is not writable")
+                self._durable = False
             return
         except OSError as exc:
             print(f"[estop] could not read {self._state_path}: {exc}; "
                   "starting latched", flush=True)
             self._set_restored("estop_state_unreadable", str(exc))
+            self._durable = False
             return
         try:
             data = json.loads(raw)
@@ -90,12 +104,14 @@ class EmergencyStopLatch:
             print(f"[estop] {self._state_path} is not valid JSON: {exc}; "
                   "starting latched", flush=True)
             self._set_restored("estop_state_unreadable", str(exc))
+            self._durable = False
             return
         if not self._valid_record(data):
             print(f"[estop] {self._state_path} does not match the state "
                   "schema; starting latched", flush=True)
             self._set_restored("estop_state_invalid",
                                "state record failed schema validation")
+            self._durable = False
             return
         if data["latched"] is not True:
             # This driver represents "unlatched" by removing the file. A
@@ -105,6 +121,7 @@ class EmergencyStopLatch:
                   "driver never writes; starting latched", flush=True)
             self._set_restored("estop_state_invalid",
                                "unexpected unlatched record")
+            self._durable = False
             return
         since = data.get("since_ms")
         self._set_restored(
@@ -112,6 +129,20 @@ class EmergencyStopLatch:
             str(data["reason"]),
             int(since) if isinstance(since, (int, float)) else None,
         )
+
+    def _state_writable(self) -> bool:
+        """Whether this process could leave a durable latched marker at all."""
+        if self._state_path is None:
+            return True
+        probe = self._state_path.with_name(self._state_path.name + ".probe")
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(probe, "a", encoding="utf-8"):
+                pass
+            probe.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
 
     @staticmethod
     def _valid_record(data) -> bool:
@@ -136,30 +167,55 @@ class EmergencyStopLatch:
         self._reason = reason
         self._since_ms = since_ms if since_ms is not None else _now_ms()
 
-    def _persist_locked(self) -> None:
-        """Write the latch to disk. Called with `_lock` held.
+    def _persist_locked(self) -> bool:
+        """Write the latched marker. Called with `_lock` held.
 
         Latched is represented by the file's *existence*, not only its
         contents: the file is created before the record is written, so a
         partial write, a full disk, or a failed fsync still leaves something
-        behind and the next start comes back latched. Unlatched is represented
-        by the absence of the file, which only `reset` creates.
+        behind and the next start comes back latched.
+
+        Returns whether the marker is durably in place. A false result is not
+        swallowed: the running process is still latched, but the restart
+        guarantee failed and the card must say so.
         """
         if self._state_path is None:
-            return
+            return True
         try:
-            if self._latched:
-                self._write_state_locked()
-            else:
-                self._state_path.unlink(missing_ok=True)
-                self._fsync_parent()
+            self._write_state_locked()
         except OSError as exc:
-            # Loud on purpose: the running process is already in the requested
-            # state, but the next start may differ. For a failed latch write
-            # the file-existence rule keeps it closed; for a failed reset the
-            # old latched record remains, which is also closed.
-            print(f"[estop] could not persist latch state to {self._state_path}: "
-                  f"{exc}", flush=True)
+            print(f"[estop] CRITICAL: could not persist the latch to "
+                  f"{self._state_path}: {exc}", flush=True)
+            return False
+        return True
+
+    def _clear_state_locked(self) -> bool:
+        """Remove the latched marker. Called with `_lock` held.
+
+        A reset that cannot prove the marker is gone must not clear the
+        in-memory latch: otherwise the card reports "released" and the robot
+        moves while the next restart comes back latched from the old file.
+        """
+        if self._state_path is None:
+            return True
+        try:
+            self._state_path.unlink(missing_ok=True)
+            self._fsync_parent()
+        except OSError as exc:
+            print(f"[estop] could not remove {self._state_path}: {exc}; "
+                  "keeping the latch set", flush=True)
+            # The unlink may have succeeded before the fsync failed. Put the
+            # marker back so a restart cannot come up unlatched.
+            try:
+                self._write_state_locked()
+            except OSError:
+                pass
+            return False
+        if self._state_path.exists():
+            print(f"[estop] {self._state_path} still exists after reset; "
+                  "keeping the latch set", flush=True)
+            return False
+        return True
 
     def _write_state_locked(self) -> None:
         payload = {
@@ -194,6 +250,11 @@ class EmergencyStopLatch:
         with self._lock:
             return self._latched
 
+    @property
+    def durable(self) -> bool:
+        with self._lock:
+            return self._durable
+
     def add_on_latch(self, callback) -> None:
         """Register a callback invoked outside the lock on every new latch."""
         with self._lock:
@@ -212,7 +273,11 @@ class EmergencyStopLatch:
             self._source = str(source or "unknown")
             self._reason = str(reason or "")
             self._since_ms = _now_ms()
-            self._persist_locked()
+            self._durable = self._persist_locked()
+            if not self._durable:
+                print("[estop] CRITICAL: the latch is set in memory but could "
+                      "not be made durable; a restart may come back unlatched",
+                      flush=True)
             callbacks = list(self._on_latch)
         for callback in callbacks:
             try:
@@ -222,15 +287,21 @@ class EmergencyStopLatch:
         return True
 
     def reset(self) -> bool:
-        """Release the latch. Returns True only on the latched -> idle edge."""
+        """Release the latch. Returns True only on the latched -> idle edge.
+
+        Returns False and keeps the latch set when the durable marker cannot
+        be removed: a release that a restart would undo is not a release.
+        """
         with self._lock:
             if not self._latched:
+                return False
+            if not self._clear_state_locked():
                 return False
             self._latched = False
             self._source = ""
             self._reason = ""
             self._since_ms = None
-            self._persist_locked()
+            self._durable = True
             return True
 
     @contextmanager
@@ -271,6 +342,7 @@ class EmergencyStopLatch:
                 "reason": self._reason,
                 "since_ms": self._since_ms,
                 "blocked_commands": self._blocked,
+                "durable": self._durable,
             }
 
 
@@ -359,7 +431,11 @@ class EstopPlugin:
                     "trigger": {"params": ["reason"],
                                 "description": "立即停住底盘并锁存，后续运动指令一律拒绝"},
                     "reset": {"params": ["confirm"],
-                              "description": "解除锁存、恢复运动；必须传 confirm=true"},
+                              "description": "解除锁存、恢复运动；必须传 confirm=true",
+                              # Re-enabling motion is the dangerous half of this
+                              # card. Marked per action so `trigger` stays a
+                              # no-confirmation emergency action.
+                              "x-is-dangerous": True},
                     "info": {"params": [], "description": "返回锁存状态与拦截计数"},
                 },
             },
@@ -439,8 +515,14 @@ class EstopPlugin:
         if action == "trigger":
             newly = self._latch.trigger("estop_card", args.get("reason", ""))
             self._publish_now()
-            return {"state": "latched", "newly_latched": newly,
-                    "estop": self._snapshot()}
+            result = {"state": "latched", "newly_latched": newly,
+                      "estop": self._snapshot()}
+            if not self._latch.durable:
+                result["code"] = "ESTOP_NOT_DURABLE"
+                result["warning"] = (
+                    "锁存已在内存生效，但状态文件写入失败；重启后可能解除。"
+                    "请立即检查状态目录的挂载、权限和磁盘空间。")
+            return result
         if action == "reset":
             if args.get("confirm") is not True:
                 return {
@@ -451,6 +533,15 @@ class EstopPlugin:
                 }
             released = self._latch.reset()
             self._publish_now()
+            if self._latch.latched:
+                # The marker could not be removed. Reporting "released" here
+                # would let the robot move while the next restart relatches.
+                return {
+                    "state": "error",
+                    "code": "ESTOP_CLEAR_FAILED",
+                    "error": "无法删除持久化状态文件，锁存保持；请检查状态目录后重试",
+                    "estop": self._snapshot(),
+                }
             return {"state": "released", "released": released,
                     "estop": self._snapshot()}
         return None
