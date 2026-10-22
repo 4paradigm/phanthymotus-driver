@@ -183,6 +183,12 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("squat_counter", {}).get("enabled", False):
+            from squat_counter import SquatCounterPlugin
+            self._plugins.append(SquatCounterPlugin(
+                plugins_cfg["squat_counter"], namespace, executor))
+            print("[bundle] SquatCounterPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
