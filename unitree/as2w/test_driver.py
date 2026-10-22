@@ -1739,6 +1739,39 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIsNone(servo._sink)
         self.assertFalse(servo._running)
 
+    def test_loco_servo_start_fails_closed_before_opening_subscription(self):
+        proxy = _Proxy()
+        proxy.state = "AI_STAND_DOWN"
+        servo = self.loco_servo.LocoServoPlugin(
+            {}, "test", object(), proxy)
+        with patch.object(servo, "_open") as opened:
+            result = servo.dispatch(
+                "start", {"input_topic": "/test/velocity"})
+        self.assertEqual("error", result["state"])
+        self.assertIn("AI_STAND_DOWN", result["message"])
+        opened.assert_not_called()
+        self.assertFalse(servo._running)
+
+        with patch.object(proxy, "GetState",
+                          side_effect=RuntimeError("state unavailable")), \
+                patch.object(servo, "_open") as opened:
+            result = servo.dispatch(
+                "start", {"input_topic": "/test/velocity"})
+        self.assertEqual("error", result["state"])
+        self.assertIn("读不到运动状态", result["message"])
+        opened.assert_not_called()
+
+    def test_loco_servo_stop_reports_idle_and_is_restartable(self):
+        servo = self.loco_servo.LocoServoPlugin(
+            {}, "test", object(), _Proxy())
+        with patch.object(servo, "_open"):
+            self.assertEqual("running", servo.dispatch(
+                "start", {"input_topic": "/test/velocity"})["state"])
+            self.assertEqual("idle", servo.dispatch("stop", {})["state"])
+            self.assertEqual("running", servo.dispatch(
+                "start", {"input_topic": "/test/velocity"})["state"])
+        servo.dispatch("stop", {})
+
     def test_loco_servo_live_control_requires_literal_confirmation(self):
         servo = self.loco_servo.LocoServoPlugin(
             {}, "test", object(), _Proxy())
@@ -1752,6 +1785,48 @@ class TestDriverContracts(unittest.TestCase):
             "config", {"dry_run": False, "confirm": True})
         self.assertTrue(result["ok"])
         self.assertFalse(servo._dry_run)
+
+        protected = self.loco_servo.LocoServoPlugin(
+            {}, "test", object(), _Proxy())
+        result = protected.dispatch(
+            "config", {"require_standing": False})
+        self.assertEqual("CONFIRM_REQUIRED", result["code"])
+        self.assertTrue(protected._require_standing)
+        result = protected.dispatch(
+            "config", {"require_standing": False, "confirm": True})
+        self.assertTrue(result["ok"])
+        self.assertFalse(protected._require_standing)
+
+    def test_loco_servo_live_enable_and_resume_recheck_posture(self):
+        proxy = _Proxy()
+        servo = self.loco_servo.LocoServoPlugin(
+            {}, "test", object(), proxy)
+        with patch.object(servo, "_open"):
+            self.assertEqual("running", servo.dispatch(
+                "start", {"input_topic": "/test/velocity"})["state"])
+
+        proxy.state = "AI_STAND_DOWN"
+        enabled = servo.dispatch(
+            "config", {"dry_run": False, "confirm": True})
+        self.assertEqual("MOTION_GATE_REJECTED", enabled["code"])
+        self.assertTrue(servo._dry_run)
+
+        self.assertEqual("paused", servo.dispatch("pause", {})["state"])
+        with patch("builtins.print") as logged:
+            refused = servo.dispatch("resume", {})
+            self.assertEqual("paused", refused["state"])
+            logged.assert_not_called()
+
+            proxy.state = "AI_STAND_UP"
+            resumed = servo.dispatch("resume", {})
+            self.assertEqual("running", resumed["state"])
+            self.assertEqual(1, logged.call_count)
+            self.assertIn("resumed", logged.call_args.args[0])
+
+            # Calling resume on an already-running card is not a transition.
+            self.assertEqual("running", servo.dispatch("resume", {})["state"])
+            self.assertEqual(1, logged.call_count)
+        servo.dispatch("stop", {})
 
     def test_loco_servo_refuses_other_chassis_owners(self):
         special = types.SimpleNamespace(is_running=lambda: True)

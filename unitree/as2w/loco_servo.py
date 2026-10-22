@@ -253,6 +253,14 @@ class LocoServoPlugin:
         if owner:
             return {"state": "error", "message":
                     f"{owner} 正在占用底盘，无法启动 loco_servo"}
+        # Starting an actuator stream arms it to accept the next fresh policy
+        # command. Validate the vendor motion gate before opening the
+        # subscription; the per-command check remains as a defensive fallback.
+        self._posture_checked_at = float("-inf")
+        posture = self._posture_problem()
+        if posture:
+            return {"state": "error", "message":
+                    f"无法启动 loco_servo：{posture}"}
         if self._executor is None:
             return {"state": "error", "message": "没有 ROS 上下文，无法订阅"}
 
@@ -275,6 +283,9 @@ class LocoServoPlugin:
                 self._sink = None
                 self._input_topic = ""
             return {"state": "error", "message": f"启动失败: {exc}"}
+        # Do not let the start-time sample mask a posture change before the
+        # first command. The first command must perform its own fresh check.
+        self._posture_checked_at = float("-inf")
         return {"state": "running", "input": topic,
                 "control_interface": self._interface()}
 
@@ -301,9 +312,12 @@ class LocoServoPlugin:
                 node.destroy_node()
             except Exception:
                 pass
-        return {"state": "stopped"}
+        # Actuator lifecycle vocabulary: teardown leaves the card idle and
+        # restartable. ``stopped`` is not a canvas lifecycle state.
+        return {"state": "idle"}
 
     def _halt(self, paused):
+        resumed = False
         with self._lock:
             if not self._running:
                 return {"state": "idle"}
@@ -315,11 +329,22 @@ class LocoServoPlugin:
                 if owner:
                     return {"state": "error", "message":
                             f"{owner} 正在占用底盘，无法恢复 loco_servo"}
+                if self._paused:
+                    self._posture_checked_at = float("-inf")
+                    posture = self._posture_problem()
+                    if posture:
+                        return {"state": "paused", "message":
+                                f"无法恢复 loco_servo：{posture}"}
+                    resumed = True
             self._paused = bool(paused)
             if paused:
                 self._hold()
             else:
+                # Force the first post-resume command to re-check the FSM too.
                 self._posture_checked_at = float("-inf")
+        if resumed:
+            print("[loco_servo] resumed: fresh valid control commands may "
+                  "move the chassis", flush=True)
         return {"state": "paused" if paused else "running",
                 "input": self._input_topic}
 
@@ -333,20 +358,40 @@ class LocoServoPlugin:
         return True
 
     def _config(self, args):
-        if (args.get("dry_run") is False and self._dry_run
-                and args.get("confirm") is not True):
+        dangerous_transition = (
+            (args.get("dry_run") is False and self._dry_run)
+            or (args.get("require_standing") is False
+                and self._require_standing)
+        )
+        if dangerous_transition and args.get("confirm") is not True:
             return {
                 "ok": False,
                 "state": ("paused" if self._running and self._paused else
                           "running" if self._running else "idle"),
                 "code": "CONFIRM_REQUIRED",
-                "message": "关闭 dry_run 会启用真实底盘运动，必须提供 confirm=true",
+                "message": (
+                    "关闭 dry_run 或姿态保护会启用真实底盘运动或移除运动门，"
+                    "必须提供 confirm=true"),
             }
         for name in ("dry_run", "rotate_only", "require_standing"):
             if name in args and args[name] is not True and args[name] is not False:
                 return {"ok": False, "code": "INVALID_ARGUMENT",
                         "message": f"{name} must be a boolean"}
         with self._lock:
+            enabling_live = args.get("dry_run") is False and self._dry_run
+            effective_gate = bool(args.get(
+                "require_standing", self._require_standing))
+            if (enabling_live and self._running and not self._paused
+                    and effective_gate):
+                self._posture_checked_at = float("-inf")
+                posture = self._posture_problem(force=True)
+                if posture:
+                    return {
+                        "ok": False,
+                        "state": "running",
+                        "code": "MOTION_GATE_REJECTED",
+                        "message": f"无法启用实时底盘控制：{posture}",
+                    }
             if (args.get("dry_run") is True and not self._dry_run
                     and self._running and not self._paused):
                 self._hold()
@@ -440,8 +485,8 @@ class LocoServoPlugin:
             if self._sink is not None and self._running and not self._paused:
                 self._sink.tick()
 
-    def _posture_problem(self):
-        if not self._require_standing:
+    def _posture_problem(self, force=False):
+        if not self._require_standing and not force:
             return ""
         now = time.monotonic()
         if now - self._posture_checked_at < FSM_CACHE_S:

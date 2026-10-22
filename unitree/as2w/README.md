@@ -78,6 +78,10 @@ runtime `config` for `dry_run`, `rotate_only` and `require_standing`.
 It starts in `dry_run`; changing to live control requires an explicit
 `confirm=true`. The driver also prevents it from running concurrently with
 manual `loco`, `special_motion`, or vendor `controlled_spatial` navigation.
+Starting and resuming the card validate the AS2 motion posture before arming
+the stream; changing an already-running card from dry-run to live control does
+the same. Every command checks again as a defensive fallback. Failed state RPCs
+therefore fail closed before the ROS subscription is opened or motion resumes.
 
 Until AS2-W motion response is measured, `loco_servo` uses an initial indoor
 envelope of vx +/-0.30 m/s, vy +/-0.10 m/s and yaw +/-0.40 rad/s. At the
@@ -85,6 +89,10 @@ default 10 Hz, command changes are limited to 0.03 m/s forward, 0.02 m/s
 lateral and 0.05 rad/s yaw per tick. These are commissioning limits, not
 vendor performance claims; raise them only after direction, deadband, stopping
 distance and lateral support have been verified on the deployed firmware.
+The 300 ms watchdog and 500 ms maximum observation age are likewise provisional
+commissioning bounds, not measured AS2-W stopping guarantees. Keep `dry_run`
+enabled until end-to-end message latency, silence-to-StopMove time, and physical
+stopping distance have been recorded on the deployed robot and firmware.
 
 Explicit `loco.move` and `loco.stop_move` pause the policy stream before
 sending their commands. Servo start/resume refuses while loco owns a movement;
