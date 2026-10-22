@@ -1,0 +1,22 @@
+mcp_port: 15745
+bind_host: "127.0.0.1"
+ros_namespace: "s10_pro"
+name: "云深处 S10 Pro"
+register: true
+core_domain_id: 42
+reader:
+  domain_id: 0
+  vendor_profile: ""
+topics:
+  battery: "/BATTERY_DATA"
+  motion_info: "/MOTION_INFO"
+  joints: "/JOINTS_DATA_10HZ"
+  imu: "/IMU"
+  odometry: "/ODOM"
+  lidar: "/LIDAR/POINTS"
+plugins:
+  state: {enabled: true, refresh_hz: 1.0, stale_after_s: 5.0}
+  joints: {enabled: true, refresh_hz: 5.0, stale_after_s: 5.0}
+  imu: {enabled: true, refresh_hz: 5.0, stale_after_s: 5.0}
+  odometry: {enabled: true, refresh_hz: 5.0, stale_after_s: 5.0}
+  lidar: {enabled: true, refresh_hz: 2.0, stale_after_s: 5.0, max_points: 6000}

@@ -1,0 +1,17 @@
+id: deep-robotics-s10-pro-driver
+name: DEEP Robotics S10 Pro Driver
+category: driver
+hardware_provider: deep-robotics
+hardware_model: "s10-pro"
+image_name: deep-robotics-s10-pro
+port: 15745
+mcp_url: "http://localhost:15745/mcp"
+description: "S10 Pro five read-only ROS 2/drdds cards: state, joints, IMU, odometry and point cloud; no motion commands"
+build_context_extras:
+  - ../../common
+cards:
+  - {name: state, type: sensor}
+  - {name: joints, type: sensor}
+  - {name: imu, type: sensor}
+  - {name: odometry, type: sensor}
+  - {name: lidar, type: sensor}
