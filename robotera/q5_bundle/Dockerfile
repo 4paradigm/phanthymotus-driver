@@ -84,6 +84,8 @@ COPY camera_depth.py /work/camera_depth.py
 COPY camera_pointcloud.py /work/camera_pointcloud.py
 COPY vision_capture.py /work/vision_capture.py
 COPY legacy_device.py /work/legacy_device.py
+COPY audio_timing.py /work/audio_timing.py
+COPY playback_telemetry.py /work/playback_telemetry.py
 COPY legacy_direct_control.py /work/legacy_direct_control.py
 COPY q5_media_bridge.py /work/q5_media_bridge.py
 COPY q5_camera_worker.py /work/q5_camera_worker.py
@@ -97,6 +99,8 @@ COPY resource/startup_beep.pcm /work/resource/startup_beep.pcm
 COPY deploy/ /deploy/
 
 ENV PYTHONPATH=/work
+
+RUN PYTHONDONTWRITEBYTECODE=1 python3 -c "import audio_timing, playback_telemetry"
 
 RUN chmod +x /work/q5_bundle_entrypoint.sh
 
