@@ -12,13 +12,17 @@ from uuid import uuid4
 
 from episode import TRAJECTORY_SCHEMA, STATE_NAMES, UNITS, MAX_TRAJECTORY, encode
 from state import vector
-from vendor import ARM_LOWER, ARM_UPPER, validate_movej, motion_readiness
+from vendor import ARM_LOWER, ARM_UPPER, MoveError, validate_movej, motion_readiness
 from gripper import state_data, MAX_OPENING
+from reset import duration_for_change
 
 MAX_GAP_NS = 100_000_000
 START_RAD = math.radians(2)
 GRIP_TOLERANCE = 3
 RECORDING_LIMIT_TOLERANCE = math.radians(5)
+START_STABILITY_SECONDS = .5
+START_ARRIVAL_TIMEOUT = 10
+START_GRIPPER_TIMEOUT = 30
 
 
 def pack_trajectory(binding, states):
@@ -83,6 +87,8 @@ class Replay:
         self.preview=None
         self.epoch=0
         self.motion_sent=False
+        self.phase=None
+        self.connection=None
 
     @property
     def busy(self):
@@ -97,6 +103,8 @@ class Replay:
         return None
 
     async def guard(self):
+        if self.connection is not None and self.connection!=(getattr(self.reader,'ws',None),self.reader.serial):
+            raise ValueError('replay_start_connection_changed')
         if self.exclusive_guard is not None and await self.exclusive_guard() is not True:
             raise ValueError('exclusive_control_unverified')
         if not self.peers_idle():
@@ -116,6 +124,8 @@ class Replay:
         if len(names)!=16 or set(names)!=set(JOINT_NAMES):
             raise ValueError('unsupported_joint_layout')
         order=[names.index(name) for name in JOINT_NAMES]
+        vector(data['q'],16,'q')
+        vector(data.get('dq'),16,'dq')
         return {**data,'q':[data['q'][i] for i in order],
                 'dq':[data['dq'][i] for i in order] if len(data.get('dq',[]))==16 else []}
 
@@ -141,9 +151,10 @@ class Replay:
         with self.reader.pose_feedback():
             grip=state_data(await self.reader.read_gripper())
             feedback=await self.fresh_feedback()
-        delta=[a-b for a,b in zip(feedback['q'][:14],frames[0]['q'])]
-        if max(map(abs,delta))>START_RAD or any(abs(grip[s]['opening']-v)>GRIP_TOLERANCE for s,v in zip(('left','right'),frames[0]['gripper'])):
-            raise ValueError('replay_start_mismatch_no_automatic_return')
+        if max(map(abs,feedback['dq']))>=math.radians(1):
+            raise ValueError('replay_start_not_stationary')
+        duration=duration_for_change(max(abs(math.degrees(a-b)) for a,b in zip(feedback['q'][:14],frames[0]['q'])))
+        validate_movej(frames[0]['q'],duration)
         return frames,feedback['q'][14:]
 
     async def play(self, raw, binding, args):
@@ -152,7 +163,7 @@ class Replay:
         if args.get('execute') is not True:
             self.preview={'id':uuid4().hex,'sha':sha,'expires':time.monotonic()+60,'epoch':self.epoch}
             return dict(executed=False,preview_id=self.preview['id'],duration_seconds=frames[-1]['t_ns']/1e9,
-                        binding=binding,description='按原速度回放实测双臂和双夹爪轨迹；头部保持当前角度。')
+                        binding=binding,description='先低速移动双臂并调整夹爪到录制起点，确认到位后按原时间回放；头部保持当前角度。请确认移向起点的路径及回放活动空间畅通。')
         preview,self.preview=self.preview,None
         if not preview or args.get('preview_id')!=preview['id'] or preview['sha']!=sha or preview['epoch']!=self.epoch or time.monotonic()>preview['expires']:
             raise ValueError('paired_preview_required')
@@ -169,66 +180,130 @@ class Replay:
         ident='tron2_teach_'+uuid4().hex
         self.outcome={'action_id':ident,'status':'running','result':{}}
         self.motion_sent=False
+        self.phase='checking_start'
         self.task=asyncio.create_task(self._run(ident,frames,head,speed,force))
         return {'state':'running','action_id':ident}
+
+    async def _wait_at_start(self, target, head, *, minimum=0, timeout=None, grippers=None):
+        timeout=START_ARRIVAL_TIMEOUT if timeout is None else timeout
+        not_before=time.monotonic()+minimum
+        deadline=not_before+timeout
+        stamp=None;window=[]
+        while time.monotonic()<deadline:
+            feedback=await self.guard()
+            if max(abs(a-b) for a,b in zip(feedback['q'][14:],head))>START_RAD:
+                raise ValueError('replay_head_hold_error')
+            current=feedback.get('robot_timestamp')
+            if type(current) not in (int,float) or not math.isfinite(current) or stamp is not None and current<stamp:
+                raise ValueError('replay_start_timestamp_invalid')
+            at_target=max(abs(a-b) for a,b in zip(feedback['q'][:14],target))<=START_RAD
+            stationary=max(map(abs,feedback['dq']))<math.radians(1)
+            if grippers is not None:
+                grip=state_data(await self.reader.read_gripper())
+                at_target=at_target and all(abs(grip[s]['opening']-v)<=GRIP_TOLERANCE and grip[s]['speed']==0
+                    for s,v in zip(('left','right'),grippers))
+            now=time.monotonic()
+            if current!=stamp:
+                stamp=current
+                if now<not_before or not at_target or not stationary:
+                    window=[]
+                else:
+                    if window and max(abs(a-b) for a,b in zip(feedback['q'],window[0][1]))>math.radians(.2):
+                        window=[]
+                    window.append((now,feedback['q']))
+                    if len(window)>=3 and now-window[0][0]>=START_STABILITY_SECONDS:
+                        return feedback
+            await asyncio.sleep(.02)
+        raise ValueError('replay_start_arrival_not_verified')
+
+    async def _prepare_start(self, first, head, speed, force):
+        feedback=await self.fresh_feedback()
+        feedback=await self._wait_at_start(feedback['q'][:14],head,timeout=3)
+        duration=duration_for_change(max(abs(math.degrees(a-b)) for a,b in zip(feedback['q'][:14],first['q'])))
+        validate_movej(first['q'],duration)
+        self.phase='moving_to_start'
+        # Establish the vendor position target with MoveJ before entering ServoJ.
+        self.motion_sent=True
+        try:
+            await self.reader.send_movej(first['q'],duration)
+        except MoveError as exc:
+            if exc.motion_sent is False:self.motion_sent=False
+            raise
+        await self._wait_at_start(first['q'],head,minimum=duration)
+        self.phase='adjusting_grippers'
+        grip=state_data(await self.reader.read_gripper())
+        for side,value in zip(('left','right'),first['gripper']):
+            if abs(grip[side]['opening']-value)>GRIP_TOLERANCE:
+                await self.guard()
+                await self.reader.send_gripper({side+'_opening':value,side+'_speed':speed,side+'_force':force})
+        self.phase='verifying_start'
+        await self._wait_at_start(first['q'],head,timeout=START_GRIPPER_TIMEOUT,grippers=first['gripper'])
 
     async def _run(self, ident, frames, head, speed, force):
         result={'physical_stop_verified':False,'source':'measured_state','head_policy':'hold_live_start'}
         status='error'
         sent=0
+        self.connection=(getattr(self.reader,'ws',None),self.reader.serial)
         try:
-            with self.reader.teaching_feedback(), self.reader.pose_servo(ident) as token:
-                token['head_q']=head
-                await self.fresh_feedback()
-                start=time.monotonic()
-                last_grip=frames[0]['gripper']
-                previous=frames[0]
-                for frame in frames:
-                    target=start+frame['t_ns']/1e9
-                    await asyncio.sleep(max(0,target-time.monotonic()))
-                    if time.monotonic()-target>.05:
-                        raise ValueError('replay_deadline_missed_no_catchup')
-                    feedback=await self.guard()
-                    grip=state_data(await self.reader.read_gripper())
-                    if time.monotonic()-target>.05:
-                        raise ValueError('replay_deadline_missed_no_catchup')
-                    if max(abs(a-b) for a,b in zip(feedback['q'][14:],head))>START_RAD:
-                        raise ValueError('replay_head_hold_error')
-                    if any(abs(grip[side]['opening']-v)>15 for side,v in zip(('left','right'),last_grip)):
-                        raise ValueError('replay_gripper_tracking_error')
-                    if max(abs(a-b) for a,b in zip(feedback['q'][:14],previous['q']))>math.radians(8):
-                        raise ValueError('replay_tracking_error')
-                    self.motion_sent=True
-                    await self.reader.send_pose_servoj(frame['q']+head,token)
-                    sent+=1
-                    for i,side in enumerate(('left','right')):
-                        if frame['gripper'][i]!=last_grip[i]:
-                            await self.reader.send_gripper({side+'_opening':frame['gripper'][i],side+'_speed':speed,side+'_force':force})
-                    last_grip=frame['gripper'];previous=frame
-                # Sending the final frame is not completion. Require advancing feedback.
-                deadline=time.monotonic()+5
-                stable=0;last_stamp=None
-                while time.monotonic()<deadline:
-                    feedback=await self.guard()
-                    grip=state_data(await self.reader.read_gripper())
-                    at_target=max(abs(a-b) for a,b in zip(feedback['q'][:14],frames[-1]['q']))<=START_RAD
-                    stationary=len(feedback.get('dq',[]))==16 and max(map(abs,feedback['dq']))<math.radians(1)
-                    closed=all(abs(grip[s]['opening']-v)<=GRIP_TOLERANCE and grip[s]['speed']==0 for s,v in zip(('left','right'),last_grip))
-                    stamp=feedback.get('robot_timestamp')
-                    if stamp is not None and stamp!=last_stamp:
-                        stable=stable+1 if at_target and stationary and closed else 0
-                        last_stamp=stamp
-                    if stable>=3:
-                        status='completed';result['physical_stop_verified']=True
-                        break
-                    await asyncio.sleep(.02)
-                if status!='completed':
-                    raise ValueError('terminal_feedback_not_verified')
+            with self.reader.teaching_feedback():
+                await self._prepare_start(frames[0],head,speed,force)
+                result['start_verified']=True
+                self.phase='replaying'
+                with self.reader.pose_servo(ident) as token:
+                    token['head_q']=head
+                    await self.fresh_feedback()
+                    start=time.monotonic()
+                    last_grip=frames[0]['gripper']
+                    previous=frames[0]
+                    for frame in frames:
+                        target=start+frame['t_ns']/1e9
+                        await asyncio.sleep(max(0,target-time.monotonic()))
+                        if time.monotonic()-target>.05:
+                            raise ValueError('replay_deadline_missed_no_catchup')
+                        feedback=await self.guard()
+                        grip=state_data(await self.reader.read_gripper())
+                        if time.monotonic()-target>.05:
+                            raise ValueError('replay_deadline_missed_no_catchup')
+                        if max(abs(a-b) for a,b in zip(feedback['q'][14:],head))>START_RAD:
+                            raise ValueError('replay_head_hold_error')
+                        if any(abs(grip[side]['opening']-v)>15 for side,v in zip(('left','right'),last_grip)):
+                            raise ValueError('replay_gripper_tracking_error')
+                        if max(abs(a-b) for a,b in zip(feedback['q'][:14],previous['q']))>math.radians(8):
+                            raise ValueError('replay_tracking_error')
+                        self.motion_sent=True
+                        await self.reader.send_pose_servoj(frame['q']+head,token)
+                        sent+=1
+                        for i,side in enumerate(('left','right')):
+                            if frame['gripper'][i]!=last_grip[i]:
+                                await self.reader.send_gripper({side+'_opening':frame['gripper'][i],side+'_speed':speed,side+'_force':force})
+                        last_grip=frame['gripper'];previous=frame
+                    # Sending the final frame is not completion. Require advancing feedback.
+                    deadline=time.monotonic()+5
+                    stable=0;last_stamp=None
+                    while time.monotonic()<deadline:
+                        feedback=await self.guard()
+                        grip=state_data(await self.reader.read_gripper())
+                        at_target=max(abs(a-b) for a,b in zip(feedback['q'][:14],frames[-1]['q']))<=START_RAD
+                        stationary=len(feedback.get('dq',[]))==16 and max(map(abs,feedback['dq']))<math.radians(1)
+                        closed=all(abs(grip[s]['opening']-v)<=GRIP_TOLERANCE and grip[s]['speed']==0 for s,v in zip(('left','right'),last_grip))
+                        stamp=feedback.get('robot_timestamp')
+                        if stamp is not None and stamp!=last_stamp:
+                            stable=stable+1 if at_target and stationary and closed else 0
+                            last_stamp=stamp
+                        if stable>=3:
+                            status='completed';result['physical_stop_verified']=True
+                            break
+                        await asyncio.sleep(.02)
+                    if status!='completed':
+                        raise ValueError('terminal_feedback_not_verified')
         except asyncio.CancelledError:
             status='cancelled';result['reason']='operator_stop'
         except (ValueError,OSError,asyncio.TimeoutError) as exc:
             result['reason']=str(exc)
         finally:
+            result['phase']=self.phase
+            self.phase=None
+            self.connection=None
             self.preview=None
             self.outcome={'action_id':ident,'status':status,'result':dict(result,motion_sent=self.motion_sent,
                 samples_sent=sent,output_stopped=True,motion_may_continue=self.motion_sent and not result['physical_stop_verified'])}

@@ -28,6 +28,9 @@ body[data-passive] .confirm-box .field input,body[data-passive] .confirm-box .fi
 body[data-passive] .confirm-box .field textarea {min-height:76px}
 body[data-passive] .confirm-box .error {margin:12px 0 0}
 #training .stack>*+* {margin-top:16px}
+.outcome.running::before {content:"";display:inline-block;width:13px;height:13px;margin-right:8px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:replay-spin .8s linear infinite}
+@keyframes replay-spin {to {transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce) {.outcome.running::before {animation:none}}
 </style></head><body>
 <main class="shell">
   <ol class="steps" aria-label="进度"><li class="current"><b>1</b>设备检查</li><li><b>2</b>录制</li><li><b>3</b>试运行</li><li><b>4</b>保存</li></ol>
@@ -234,9 +237,12 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     $('start-hint').classList.toggle('success',!!inspection?.start.ready && inspection.start.mode!=='move_to_start');
     $('inspect-btn').disabled=locked || moving;$('trial-btn').disabled=locked || moving || !canTrial() || !!status.saved;
     $('again-btn').disabled=locked || moving;
-    $('trial-status').textContent=trial?.status==='completed'?'✓ 试运行已完成':trial?.status==='running'?'正在试运行':trial?.status==='cancelled'?'试运行已取消':trial?.status==='error'?'试运行失败':draft.imported?'导入完成 · 等待本机试运行':'等待试运行';
+    const replayPhases={checking_start:'正在检查起始状态…',moving_to_start:'正在低速移向起点…',adjusting_grippers:'正在调整夹爪起点…',verifying_start:'正在核验起点到位…',replaying:'正在回放录制动作…'};
+    $('trial-status').textContent=trial?.status==='completed'?'✓ 试运行已完成':trial?.status==='running'?(replayPhases[status.replay_phase] || '正在试运行'):trial?.status==='cancelled'?'试运行已取消':trial?.status==='error'?'试运行失败':draft.imported?'导入完成 · 等待本机试运行':'等待试运行';
     $('trial-status').classList.toggle('success',trial?.status==='completed');
+    $('trial-status').classList.toggle('running',trial?.status==='running');
     $('trial-help').textContent=trial?.status==='completed'?'请观察实际动作效果，确认后保存技能。':trial?.status==='error'?readable(trial.result?.reason) || '请检查设备后重试。':moving?'请观察真机，必要时停止动作。':presentation().trial_hint || '恢复物体布置，检查起点后试运行。';
+    if(trial?.result?.motion_may_continue)$('trial-help').textContent+=' 后续步骤已停止；厂家当前运动可能仍在继续，请现场检查。';
     if(trial?.status!=='completed' || approvedTrial!==trial.action_id){approvedTrial=null;$('effect').checked=false;}
     $('effect').disabled=locked || moving || trial?.status!=='completed';
     $('to-save-btn').disabled=locked || moving || !$('effect').checked;
@@ -325,7 +331,7 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     $('confirm-binding').textContent=preview.binding_label || `左臂 ${preview.binding?.arms?.left || ''} · 右臂 ${preview.binding?.arms?.right || ''} · 标定 ${preview.binding?.calibration_id || ''}`;
     $('gripper-replay-fields').hidden=!presentation().passive_recording;
     if(presentation().passive_recording){$('replay-gripper-speed').value='';$('replay-gripper-force').value='';$('confirm-error').hidden=true;dialogFocus=document.activeElement;}
-    $('confirm-control-label').textContent=presentation().passive_recording?'已核对起点、物体和活动空间；原厂 VR 与其他控制程序已停止，我确认并保持本次回放期间控制独占。':'已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。';
+    $('confirm-control-label').textContent=presentation().passive_recording?'已核对移向起点的路径、夹爪动作、物体和回放活动空间；原厂 VR 与其他控制程序已停止，我确认并保持本次执行期间控制独占。':'已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。';
     if(presentation().passive_recording)$('confirm-binding').textContent=`设备 ${preview.binding?.serial || ''} · 型号 ${preview.binding?.model || ''}`;
     $('confirm-control').checked=false;$('confirm-go').disabled=true;$('confirm').hidden=false;$('confirm-control').focus();
   }
@@ -441,7 +447,7 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     if(port || event.source!==parent || event.data?.protocol!=='motus.workbench/1' || !event.ports[0])return;
     port=event.ports[0];port.onmessage=event=>{const item=pending.get(event.data?.id);if(!item)return;clearTimeout(item.timeout);pending.delete(event.data.id);event.data.error?item.reject(new Error(event.data.error)):item.resolve(event.data.result);};
     await refresh();try {showContext(await request('context',{}));}catch(error){showContext(null);}
-    const poll=async()=>{if(!busy)await refresh();setTimeout(poll,1000);};setTimeout(poll,1000);
+    const poll=async()=>{if(!busy || presentation().passive_recording)await refresh();setTimeout(poll,1000);};setTimeout(poll,1000);
   });
 })();
 </script></body></html>
