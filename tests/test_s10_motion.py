@@ -273,3 +273,25 @@ def test_expired_request_before_first_send_is_not_completed(plugin):
     p._wall = lambda: time.time() + (10 if p._active else 0)
     result = p.dispatch('velocity', {'duration': .1})
     assert not result['completed'] and not b.commands
+
+
+def test_safety_configuration_change_during_validation_invalidates_request(plugin):
+    p, b = plugin
+    underlying = p._busy
+    class ChangeBeforeAcquire:
+        def acquire(self, **kwargs):
+            p.configure({'max_vx': .01})
+            return underlying.acquire(**kwargs)
+        def release(self):
+            underlying.release()
+    p._busy = ChangeBeforeAcquire()
+    result = p.dispatch('velocity', {'vx': .15, 'duration': .1})
+    assert result['state'] == 'cancelled' and not b.commands
+
+
+def test_closed_controller_cannot_restart_without_a_watchdog(plugin):
+    p, b = plugin
+    p.close()
+    assert p.start()['state'] == 'idle'
+    result = p.dispatch('stand', {})
+    assert result['state'] == 'unavailable' and not b.commands

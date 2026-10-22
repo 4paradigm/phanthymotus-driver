@@ -144,8 +144,10 @@ class MotionPlugin:
         except Exception:
             return {}
 
-    def _gate(self):
+    def _gate(self, *, for_stop=False):
         missing = []
+        if self._closed.is_set() and not for_stop:
+            missing.append('controller_closed')
         if not self._authorized:
             missing.append('execution_authorization')
         if not validate_contract(self._contract()):
@@ -192,6 +194,8 @@ class MotionPlugin:
 
     def start(self):
         with self._lock:
+            if self._closed.is_set():
+                return self.status()
             self._started = True
             self._phase = 'locked' if self._gate() or not self._settings['enabled'] else 'ready'
         return self.status()
@@ -204,8 +208,8 @@ class MotionPlugin:
         return {**self.status(), 'cancellation': result}
 
     def close(self):
-        self.stop()
         self._closed.set()
+        self.stop()
         if self._thread.ident is not None and self._thread is not threading.current_thread():
             self._thread.join(1)
 
@@ -216,14 +220,16 @@ class MotionPlugin:
         with self._lock:
             updated = self._validate({**self._settings, **options})
             active = self._active is not None
+            self._generation += 1
+            self._settings = updated
+            if active:
+                self._cancel.set()
         if active:
             self.cancel('configuration_changed')
-        with self._lock:
-            self._settings = updated
         return self.status()
 
     def _stop_backend(self, reason, *, request_id, authority_lost=False):
-        if self._gate():
+        if self._gate(for_stop=True):
             return {'accepted': False, 'confirmed': False, 'reason': 'unavailable'}
         contract = self._contract()
         if authority_lost and not contract['stop_on_authority_loss']:
