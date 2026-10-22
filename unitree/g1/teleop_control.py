@@ -489,7 +489,8 @@ class TeleopControl:
                 if self._enabled and self.motion._decision.get('state') in ('hold', 'error'):
                     self._hold(self.motion._decision.get('reason') or 'ik_unavailable', grip=True)
                 if not self._enabled:
-                    self._state, self._reason = 'ready', 'regrip_required'
+                    if self._state != 'hold':
+                        self._state, self._reason = 'ready', 'regrip_required'
                     if key != self._processed and self._engage_sequence in (None, frame['sequence']):
                         self._submit(frame, preview=True)
                     return

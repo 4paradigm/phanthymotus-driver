@@ -250,3 +250,20 @@ def test_release_while_resuming_cannot_submit_the_prior_target(tmp_path):
     assert not card._enabled and len(outputs) == before
     feed(7, True)
     assert not card._enabled and len(outputs) == before
+
+
+@pytest.mark.parametrize('reason', ['command_expired', 'arm_feedback_stale', 'motion_envelope_stale_start'])
+def test_hold_reason_survives_preview_until_explicit_regrip(tmp_path, reason):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2); feed(3, True)
+    before = len(outputs)
+    motion._decision = {'state':'hold', 'reason':reason}
+    feed(4, True)
+    assert (card._state, card._reason) == ('hold', reason)
+    assert card.feedback()['reason'] == reason
+    feed(5, True); feed(6, True)
+    assert (card._state, card._reason) == ('hold', reason)
+    assert not card._enabled and len(outputs) == before
+    feed(7, False); feed(8, True)
+    assert card._enabled and card._state == 'active' and card._reason is None
+    assert len(outputs) == before+1
