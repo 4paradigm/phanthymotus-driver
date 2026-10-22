@@ -214,6 +214,24 @@ every other command just because a vendor call took 70ms of its 100ms period.
 True bursts above 20Hz are still dropped, and explicit zero always bypasses
 that limiter. TTL, observation-age and watchdog limits are unchanged.
 
+The bridged subscription callback only updates a bounded inbox; it does not
+hold the plugin lock or wait for an SDK reply. The existing 50ms control timer
+takes the latest pending motion command. A separate priority zero slot clears
+older pending motion and cannot be overwritten by a later nonzero command;
+at most two messages are retained. Intermediate motion frames are coalesced,
+not queued in arrival order. Original timestamps/TTLs remain unchanged, so a
+frame that has expired while waiting is rejected rather than retimestamped or
+replayed. No new worker thread or periodic replay of the last command is added.
+Pause, stop, configuration changes and restart clear pending input; callbacks
+and timers from an older generation cannot deliver motion to a new session.
+
+`input_queue` reports bridge-delivered `received`, timer-selected `processed`,
+`coalesced`, lifecycle-`cleared`, `pending`, the latest receive gap and inbox
+wait in milliseconds. Existing `counts.received/accepted/dropped` describe the
+selected frames examined by the control sink, not intermediate coalesced
+frames. `holds` counts calls to stop paths, including repeated watchdog stops
+after navigation has ended; it is not a count of distinct physical stops.
+
 Acceleration caps remain 0.3 m/s² and 0.6 rad/s². Explicit zero, pause, stop,
 lease expiration and watchdog stop bypass the ramp. Cancelling an SDK action
 addresses only this worker's held action handle. Before beginning or updating

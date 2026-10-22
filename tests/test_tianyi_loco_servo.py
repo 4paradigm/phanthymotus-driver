@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import threading
 import types
 
 import pytest
@@ -163,6 +164,7 @@ def command(setup, values=None, seq=1, **extra):
 
 def send(plugin, cmd):
     plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)))
+    plugin._tick()  # Delivery is fast; the control timer performs SDK writes.
 
 
 def test_startup_is_inert_and_domain_routing_is_correct(setup):
@@ -243,6 +245,141 @@ def test_sdk_latency_does_not_allow_apply_starts_above_20hz(setup, monkeypatch):
     assert plugin._last["reason"] == "command rate exceeds 20 Hz"
     send(plugin, command(setup, [0] * 6, seq=3))
     assert plugin._backend.messages[-1] == [0] * 6
+
+
+def test_inbound_callback_remains_responsive_while_sdk_is_waiting(setup, monkeypatch):
+    plugin = start(setup)
+    entered, release, received = threading.Event(), threading.Event(), threading.Event()
+    original_write = plugin._backend.write
+
+    def blocked_write(values, deadline):
+        entered.set()
+        assert release.wait(2), "test did not release fake SDK"
+        original_write(values, deadline)
+
+    monkeypatch.setattr(plugin._backend, "write", blocked_write)
+    first = threading.Thread(target=lambda: plugin._on_message(
+        types.SimpleNamespace(data=json.dumps(command(setup)))))
+    controller = threading.Thread(target=plugin._tick)
+    def receive_next():
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=2))))
+        received.set()
+    next_frame = threading.Thread(target=receive_next)
+    try:
+        first.start()
+        first.join(0.05)
+        controller.start()
+        assert entered.wait(1)
+        next_frame.start()
+        assert received.wait(0.2), "SDK wait blocked the bridge reader from receiving the next frame"
+    finally:
+        release.set()
+        for thread in (first, controller, next_frame):
+            if thread.ident is not None:
+                thread.join(2)
+                assert not thread.is_alive()
+
+
+def test_control_timer_takes_only_latest_motion_with_original_deadline(setup):
+    plugin = start(setup)
+    for sequence in range(1, 26):
+        setup.clock.advance(0.01)
+        latest = command(setup, [sequence / 100, 0, 0, 0, 0, 0.1], seq=sequence)
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(latest)))
+    assert not plugin._backend.messages
+    before = plugin._info()["input_queue"]
+    assert before["received"] == 25 and before["coalesced"] == 24
+    assert before["pending"] == 1
+    plugin._tick()
+    assert plugin._counts["received"] == plugin._counts["accepted"] == 1
+    assert plugin._last["requested"][0] == 0.25
+    assert plugin._backend.deadlines == [latest["stamp_ms"] + latest["ttl_ms"]]
+    assert plugin._info()["input_queue"]["pending"] == 0
+    assert plugin._info()["input_queue"]["processed"] == 1
+
+
+def test_queue_wait_does_not_retimestamp_or_execute_expired_input(setup):
+    plugin = start(setup)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    setup.clock.advance(0.21)
+    plugin._tick()
+    assert not plugin._backend.messages
+    assert plugin._counts["accepted"] == 0
+    assert plugin._counts["dropped"] == 1
+    assert plugin._info()["input_queue"]["last_wait_ms"] == pytest.approx(210)
+
+
+def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):
+    plugin = start(setup)
+    for cmd in (command(setup), command(setup, [0] * 6, seq=2), command(setup, seq=3)):
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)))
+    assert plugin._info()["input_queue"]["pending"] == 2
+    assert plugin._info()["input_queue"]["coalesced"] == 1
+    plugin._tick()
+    assert plugin._backend.messages == [[0] * 6]
+    assert plugin._last["requested"] == [0] * 6
+    setup.clock.advance()
+    plugin._tick()
+    assert plugin._backend.messages[-1] == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
+    assert plugin._info()["input_queue"]["processed"] == 2
+
+
+def test_pause_config_and_restart_discard_pending_input_and_old_generation(setup):
+    plugin = start(setup)
+    old_node = setup.ros.executor_core.nodes[0]
+    old_callback = old_node.subscriptions[0][2]
+    old_timer = old_node.timers[0][1]
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    plugin.dispatch("pause", {})
+    assert plugin._info()["input_queue"]["pending"] == 0
+    assert not plugin._info()["input_queue"]["active"]
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=2))))
+    assert plugin._info()["input_queue"]["pending"] == 0
+    setup.clock.advance()
+    plugin.dispatch("resume", {})
+    setup.clock.advance()
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=3))))
+    plugin.dispatch("config", {"rotate_only": True})
+    assert plugin._info()["input_queue"]["pending"] == 0
+    assert plugin._info()["input_queue"]["active"]
+    plugin.stop()
+    plugin.dispatch("start", {})
+    setup.clock.advance()
+    old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=4))))
+    assert plugin._info()["input_queue"]["pending"] == 0
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    old_timer()
+    assert not plugin._backend.messages
+    assert plugin._info()["input_queue"]["pending"] == 1
+    plugin._tick()
+    assert plugin._backend.messages[-1][5] > 0
+
+
+def test_timer_does_not_replay_last_motion_or_extend_ttl_without_new_input(setup):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    before = list(plugin._backend.messages)
+    setup.clock.advance(0.1)
+    plugin._tick()
+    assert plugin._backend.messages == before
+    setup.clock.advance(0.11)
+    plugin._tick()
+    assert plugin._backend.messages[-1] == [0] * 6
+    assert len(plugin._backend.deadlines) == 1
+    assert plugin._info()["input_queue"]["processed"] == 1
+
+
+def test_pending_motion_cannot_run_while_a_stop_is_unconfirmed(setup, monkeypatch):
+    plugin = start(setup)
+    plugin._zero_pending = True
+    plugin._backend.fail = True
+    monkeypatch.setattr(plugin._backend, "write", lambda *args: pytest.fail("motion before confirmed stop"))
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    plugin._tick()
+    assert plugin._info()["state"] == "paused"
+    assert plugin._info()["input_queue"]["pending"] == 0
+    assert not plugin._info()["input_queue"]["active"]
+    plugin._backend.fail = False
 
 
 @pytest.mark.parametrize("extra", [
@@ -469,6 +606,7 @@ def test_input_subscription_really_passes_through_bridge_patch(setup, monkeypatc
         assert bridged[0][0].context is setup.ros.ctx_core
         assert bridged[0][2] == "/actucore/navi/cmd"
         bridged[0][3](types.SimpleNamespace(data=json.dumps(command(setup))))
+        plugin._tick()
         assert plugin._backend.messages[-1][0] > 0
         plugin.stop()
     finally:

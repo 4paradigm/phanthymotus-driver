@@ -20,6 +20,78 @@ WATCHDOG_MS = 300
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 
 
+class _LatestControlInbox:
+    """Short receiver lock, independent of the lock held during SDK requests.
+
+    Keep one latest motion and one priority zero command. The control timer
+    consumes them; the bridge reader never waits for a vendor call.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active = False
+        self._generation = 0
+        self._motion = self._zero = None
+        self._received = self._coalesced = self._cleared = self._processed = 0
+        self._last_received_at = None
+        self._last_gap_ms = self._last_wait_ms = None
+
+    def activate(self, generation, active):
+        with self._lock:
+            self._cleared += int(self._motion is not None) + int(self._zero is not None)
+            self._motion = self._zero = None
+            self._generation, self._active = generation, active
+            self._last_received_at = None
+            self._last_gap_ms = None
+
+    def put(self, message, generation):
+        try:
+            payload = json.loads(message.data)
+            values = payload.get("values") if isinstance(payload, dict) else None
+            zero = (isinstance(values, list) and len(values) == 6 and
+                    all(isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0
+                        for v in values))
+        except (ValueError, TypeError, AttributeError):
+            zero = False  # The consumer still validates/counts malformed input.
+        with self._lock:
+            if not self._active or generation is not None and generation != self._generation:
+                return
+            now = time.monotonic()
+            self._last_gap_ms = (round((now - self._last_received_at) * 1000, 1)
+                                 if self._last_received_at is not None else None)
+            self._last_received_at = now
+            self._received += 1
+            entry = (message, self._generation, now)
+            if zero:
+                self._coalesced += int(self._motion is not None) + int(self._zero is not None)
+                self._motion, self._zero = None, entry
+            else:
+                self._coalesced += int(self._motion is not None)
+                self._motion = entry
+
+    def take(self):
+        with self._lock:
+            if not self._active:
+                return None
+            if self._zero is not None:
+                entry, self._zero = self._zero, None
+            else:
+                entry, self._motion = self._motion, None
+            if entry is None:
+                return None
+            self._processed += 1
+            self._last_wait_ms = round((time.monotonic() - entry[2]) * 1000, 1)
+            return entry[:2]
+
+    def info(self):
+        with self._lock:
+            return {"active": self._active, "received": self._received,
+                    "processed": self._processed, "coalesced": self._coalesced,
+                    "cleared": self._cleared,
+                    "pending": int(self._motion is not None) + int(self._zero is not None),
+                    "last_receive_gap_ms": self._last_gap_ms, "last_wait_ms": self._last_wait_ms}
+
+
 def build_descriptor(hz=10.0, max_vx=0.3, max_wz=0.6):
     return {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
@@ -79,6 +151,7 @@ class LocoServoPlugin:
         self._counts = {key: 0 for key in
                         ("received", "accepted", "published", "dry_run_commands",
                          "rejected", "dropped", "holds", "publish_errors")}
+        self._inbox = _LatestControlInbox()
 
     @staticmethod
     def _positive(config, key, default):
@@ -121,6 +194,7 @@ class LocoServoPlugin:
 
     def stop(self):
         with self._lock:
+            self._inbox.activate(self._generation, False)
             self._paused = True
             self._hold()
             if self._zero_pending:
@@ -151,6 +225,7 @@ class LocoServoPlugin:
                     if problem:
                         return {"state": "error", "error": problem}
                     self._yielded = False
+                self._inbox.activate(self._generation, False)
                 self._paused = action == "pause"
                 self._hold()
                 if self._zero_pending:
@@ -163,6 +238,7 @@ class LocoServoPlugin:
                         self._paused = True
                         return {"state": "error", "error": str(exc)}
                 self._barrier_ms = int(time.time() * 1000)
+                self._inbox.activate(self._generation, not self._paused)
                 return self._info()
         return None
 
@@ -195,6 +271,7 @@ class LocoServoPlugin:
             return {"state": "error", "error": f"loco_servo start failed: {exc}"}
         self._running = True
         self._paused = False
+        self._inbox.activate(self._generation, True)
         return self._info()
 
     def _open(self, topic, generation):
@@ -223,6 +300,7 @@ class LocoServoPlugin:
             self._ros2.executor_tianyi.add_node(body)
 
     def _close(self):
+        self._inbox.activate(self._generation, False)
         if self._backend is not None:
             self._backend.close()
             self._backend = None
@@ -258,6 +336,11 @@ class LocoServoPlugin:
         self._last = {"verdict": verdict, "reason": reason, **extra}
 
     def _on_message(self, message, generation=None):
+        # No plugin/SDK lock here: waiting on it would block the socket reader
+        # and accumulate already-aging commands in the Unix socket buffer.
+        self._inbox.put(message, generation)
+
+    def _process_message(self, message, generation=None):
         with self._lock:
             if not self._running or self._paused or (
                     generation is not None and generation != self._generation):
@@ -410,8 +493,17 @@ class LocoServoPlugin:
                 return
             if self._zero_pending:
                 self._hold()
+                if self._zero_pending:
+                    self._paused = True
             if self._paused:
+                self._inbox.activate(self._generation, False)
                 return
+            pending = self._inbox.take()
+            if pending is not None:
+                self._process_message(*pending)
+                if self._paused:
+                    self._inbox.activate(self._generation, False)
+                    return
             if self._standing_problem() and any(self._last_output):
                 self._hold()
                 self._record("REFUSED", self._standing_problem())
@@ -428,6 +520,7 @@ class LocoServoPlugin:
         if any(not isinstance(value, bool) for value in updates.values()):
             return {"state": "error", "error": "configuration toggles must be boolean"}
         if any(self._settings[key] != value for key, value in updates.items()):
+            self._inbox.activate(self._generation, False)
             # Stop under the OLD mode, especially before enabling dry_run.
             if self._running:
                 self._hold()
@@ -438,14 +531,18 @@ class LocoServoPlugin:
                     try:
                         self._backend.connect()
                     except Exception as exc:
+                        self._inbox.activate(self._generation, not self._paused and not self._yielded)
                         return {"state": "error", "error": str(exc), "dry_run": self._settings["dry_run"]}
             self._settings.update(updates)
             self._barrier_ms = int(time.time() * 1000)
+            self._inbox.activate(self._generation,
+                                 self._running and not self._paused and not self._yielded)
         return {"ok": True, **self._info()}
 
     def pause_for_explicit_command(self, reason=""):
         with self._lock:
             if self._running:
+                self._inbox.activate(self._generation, False)
                 self._paused = True
                 self._hold()
                 if self._zero_pending:
@@ -465,6 +562,7 @@ class LocoServoPlugin:
             "yielded_to_explicit_command": self._yielded,
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
+            "input_queue": self._inbox.info(),
             "output": list(self._last_output), "output_topic": None,
             "backend": self._backend.info() if self._backend is not None else
                        {"type": "slamware_sdk", "connected": False, "state": "disconnected"},
