@@ -431,6 +431,7 @@ class TianyiDeviceBundle:
         self._cfg = cfg
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
+        aruco_zones_plugin = arm_plugin = hand_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
@@ -444,6 +445,12 @@ class TianyiDeviceBundle:
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
+
+        if plugins_cfg.get("aruco_zones", {}).get("enabled", False):
+            from aruco_zones import ArucoZonesPlugin
+            aruco_zones_plugin = ArucoZonesPlugin(plugins_cfg["aruco_zones"], namespace, ros2)
+            self._plugins.append(aruco_zones_plugin)
+            print("[bundle] ArucoZonesPlugin loaded")
 
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
             from device import CameraSnapshotPlugin
@@ -504,7 +511,8 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmPlugin
-            self._plugins.append(ArmPlugin(plugins_cfg["arm"], namespace, ros2))
+            arm_plugin = ArmPlugin(plugins_cfg["arm"], namespace, ros2)
+            self._plugins.append(arm_plugin)
             print("[bundle] ArmPlugin loaded")
 
         if plugins_cfg.get("arm_gesture", {}).get("enabled", False):
@@ -520,8 +528,17 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("hand", {}).get("enabled", False):
             from device import HandPlugin
-            self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, ros2))
+            hand_plugin = HandPlugin(plugins_cfg["hand"], namespace, ros2)
+            self._plugins.append(hand_plugin)
             print("[bundle] HandPlugin loaded")
+
+        if plugins_cfg.get("aruco_point", {}).get("enabled", False):
+            if not all((aruco_zones_plugin, arm_plugin, hand_plugin)):
+                raise ValueError("aruco_point requires aruco_zones, arm and hand")
+            from aruco_point import ArucoPointPlugin
+            self._plugins.append(ArucoPointPlugin(
+                plugins_cfg["aruco_point"], aruco_zones_plugin, arm_plugin, hand_plugin))
+            print("[bundle] ArucoPointPlugin loaded")
 
         if plugins_cfg.get("servo", {}).get("enabled", False):
             from servo import TianyiServoPlugin
