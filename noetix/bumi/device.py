@@ -143,14 +143,14 @@ _ROTATE_WZ_STILL_RAD_S = 0.1
 _ROTATE_SETTLE_TICKS = 8
 _ROTATE_VYAW_FULL = 0.8                # cruise 满速（|err| > _ROTATE_CRUISE_EXIT_DEG）
 _ROTATE_CRUISE_EXIT_DEG = 20.0
-_ROTATE_PULSE_VYAW = 0.45              # creep 点动幅值（略高于 0.4 stiction 死区）
+_ROTATE_PULSE_VYAW = 0.50              # creep 点动幅值（高于 0.4 stiction 死区）
 _ROTATE_PULSE_THRESHOLD_DEG = 2.0     # must equal the ±2 tolerance or a 2.0-2.2 dead zone times out
-_ROTATE_FINE_ENTRY_DEG = 5.0           # below this, creep pulses take over
+_ROTATE_FINE_ENTRY_DEG = 3.0           # below this, creep pulses take over
 _ROTATE_VYAW_FINE_MIN = 0.45           # fine-band floor, above the ~0.4 deadband
 _ROTATE_FINE_KP_PER_DEG = 0.04         # fine-band |err|*kp, capped at full speed
 _ROTATE_PULSE_S_PER_DEG = 0.025
 _ROTATE_PULSE_MIN_S = 0.12
-_ROTATE_PULSE_MAX_S = 0.20
+_ROTATE_PULSE_MAX_S = 0.30
 _ROTATE_STARTUP_TIMEOUT_S = 0.50
 _ROTATE_OBSERVE_S = 0.30
 _ROTATE_OBSERVE_SPREAD_DEG = 0.5
@@ -180,7 +180,7 @@ def _yaw_deg_from_quat(ori) -> float:
 
 def _pulse_duration_s(err_deg: float, measured_rate: float | None = None) -> float:
     """Use the last settled pulse response, with margin against overshoot."""
-    duration = (0.5 * abs(err_deg) / measured_rate if measured_rate is not None
+    duration = (0.7 * abs(err_deg) / measured_rate if measured_rate is not None
                 else _ROTATE_PULSE_S_PER_DEG * abs(err_deg))
     return min(_ROTATE_PULSE_MAX_S, max(_ROTATE_PULSE_MIN_S, duration))
 
@@ -1301,10 +1301,17 @@ class LocoPlugin:
                                 turned_at_pulse = turned_deg
                                 pulse_started = time.monotonic()
                                 pulse_motion_started = False
-                                pulse_end = pulse_started + _pulse_duration_s(
-                                    err_at_pulse, measured_rate)
+                                # A correction that did not move the robot means
+                                # 0.50/0.12-0.30 s was too gentle at this
+                                # residual: grow the next pulse instead of
+                                # giving up after the third one.
+                                duration = _pulse_duration_s(
+                                    err_at_pulse, measured_rate) * (1.0 + 0.6*no_progress)
+                                pulse_end = pulse_started + min(_ROTATE_PULSE_MAX_S*2.0,
+                                                                duration)
+                                amplitude = min(0.60, _ROTATE_PULSE_VYAW + 0.05*no_progress)
                                 pulse_cmd = (_ROTATE_VYAW_SIGN * math.copysign(
-                                    _ROTATE_PULSE_VYAW, err_at_pulse))
+                                    amplitude, err_at_pulse))
                                 pulse_phase = "pulse"
                                 self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
                                                   cancel_event=self._rotate_stop_event)

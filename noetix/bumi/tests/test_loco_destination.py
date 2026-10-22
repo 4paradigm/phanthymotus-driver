@@ -117,10 +117,10 @@ def test_yaw_deg_from_sdk_quaternion(monkeypatch):
 def test_pulse_width_tracks_measured_turn_response(monkeypatch):
     module, _ = _load_device(monkeypatch)
     pulse = module._pulse_duration_s
-    assert pulse(12) == pytest.approx(0.20)
-    assert pulse(5, measured_rate=10) == pytest.approx(0.20)
-    assert pulse(5, measured_rate=20) == pytest.approx(0.125)
-    assert pulse(-5, measured_rate=20) == pytest.approx(0.125)
+    assert pulse(12) == pytest.approx(0.30)
+    assert pulse(5, measured_rate=10) == pytest.approx(0.30)
+    assert pulse(5, measured_rate=20) == pytest.approx(0.175)
+    assert pulse(-5, measured_rate=20) == pytest.approx(0.175)
     assert pulse(5, measured_rate=50) == pytest.approx(0.12)
 
 
@@ -1219,15 +1219,14 @@ def test_creep_overcomes_step_startup_delay_without_tiny_retries(monkeypatch, an
 
 def test_measured_rate_excludes_startup_dead_time(monkeypatch):
     # 复核 Important#1：measured_rate 的分母必须是"同向进展开始后"的有效脉冲
-    # 时间，不含启动死区。植物：每脉冲前 0.35s 不动，随后 8°/s（慢到 creep
-    # 从 5° 带入口起需要 ≥2 个脉冲）。首脉有效 0.125s 转 1° → 真实速率 8°/s；
-    # 若分母含启动墙钟（0.475s），速率被稀释到 ~2.1°/s。脉宽差异常被夹紧与
-    # 入带早刹掩盖，故直接钉住第二脉规划时收到的 measured_rate。
+    # 时间，不含启动死区。植物：每脉冲前 0.35s 不动，随后 3°/s（慢到 creep
+    # 从 3° 带入口起需要 ≥3 个脉冲）。真实速率约 3°/s；若分母含启动墙钟，
+    # 速率会被稀释到 ~1°/s 以下。钉住第三个脉冲规划时收到的 measured_rate。
     module, _ = _load_device(monkeypatch)
     clock = _creep_clock(module, monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    startup_s, rate = 0.35, 8.0
+    startup_s, rate = 0.35, 3.0
     seen_rates = []
     pulse = module._pulse_duration_s
 
@@ -1256,8 +1255,8 @@ def test_measured_rate_excludes_startup_dead_time(monkeypatch):
     monkeypatch.setattr(fake, 'get_imu_data', get_imu)
     result = plugin._do_rotate_impl({'angle_deg': 20})
     assert result['state'] == 'done'
-    # 前两次调用属首脉（尚无测得速率）；第三次是第二脉规划，收到的
-    # measured_rate 必须 ≈ 8（有效时间），而非被启动死区稀释的 ~2.1。
+    # 前两次调用属首脉（尚无测得速率）；第三次是后续脉冲规划，收到的
+    # measured_rate 必须 ≈ 3（有效时间），而非被启动死区稀释的低值。
     assert seen_rates[:2] == [None, None]
     assert seen_rates[2] == pytest.approx(rate, abs=2)
 
