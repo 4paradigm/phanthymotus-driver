@@ -20,6 +20,7 @@ import os
 import struct
 import select
 import ssl
+import stat
 import tempfile
 import urllib.request
 import subprocess
@@ -2310,6 +2311,7 @@ class VisionCapturePlugin:
             "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
         self._fps = max(1, min(15, int(plugin_config.get("fps", 15))))
         self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
+        self._photo_lock = threading.Lock()
         self._recording_lock = threading.Lock()
         self._active_recording = None
 
@@ -2318,10 +2320,11 @@ class VisionCapturePlugin:
             "name": CARD, "type": "actuator", "multiInstance": False,
             "description": "Capture a Bumi RGB photo or record a video (1–30 seconds) to persistent storage.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
+                "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop", "list_files"]},
                 "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5,
                                "description": "默认值为5秒（可填写1–30秒）"},
             }, "required": ["action"], "additionalProperties": False,
+                "x-file-download": {"protocol": "motus.files/1", "action": "list_files"},
                 "x-action-params": {
                     "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
                     "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
@@ -2384,6 +2387,40 @@ class VisionCapturePlugin:
                 raise RuntimeError("No fresh RGB frame has arrived yet")
         return frame, sequence
 
+    def _list_files(self):
+        """Read persistent history without starting the camera or recording."""
+        try:
+            root = self._output_dir.resolve()
+            files = []
+            with self._photo_lock:
+                for folder, suffix, mime_type in (("photos", ".jpg", "image/jpeg"),
+                                                   ("videos", ".mp4", "video/mp4")):
+                    try:
+                        paths = list((root / folder).iterdir())
+                    except FileNotFoundError:
+                        continue  # history has not been created yet
+                    for path in paths:
+                        if path.suffix != suffix:
+                            continue
+                        try:
+                            if path.is_symlink():
+                                continue
+                            metadata = path.stat()
+                        except FileNotFoundError:
+                            continue  # deleted while the directory was being read
+                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size > 0:
+                            files.append({"name": path.name, "path": str(path),
+                                          "size": metadata.st_size, "mime_type": mime_type})
+            # Inspect after enumeration: a recording may have started during it.
+            with self._recording_lock:
+                active_path = (self._active_recording or {}).get("path")
+            active_path = str(Path(active_path).resolve()) if active_path else None
+            return {"ok": True, "files": sorted(
+                (file for file in files if file["path"] != active_path),
+                key=lambda file: file["name"], reverse=True)}
+        except OSError as exc:
+            return {"ok": False, "code": "LIST_FILES_FAILED", "message": str(exc)}
+
     def _capture_photo(self, args):
         try:
             frame, _ = self._frame()
@@ -2392,11 +2429,15 @@ class VisionCapturePlugin:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = directory / f"IMG_{stamp}.jpg"
             # Exclusive creation protects an existing photo from a timestamp collision.
-            with path.open("xb") as output:
+            with self._photo_lock:
+                created = False
                 try:
-                    output.write(frame["data"])
+                    with path.open("xb") as output:
+                        created = True
+                        output.write(frame["data"])
                 except Exception:
-                    path.unlink(missing_ok=True)
+                    if created:
+                        path.unlink(missing_ok=True)
                     raise
             return {"ok": True, "media_type": "photo", "file_path": str(path),
                     "captured_at": datetime.now().isoformat(timespec="seconds"),
@@ -2599,6 +2640,8 @@ class VisionCapturePlugin:
                     "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
         if action == "info":
             return self._info()
+        if action == "list_files":
+            return self._list_files()
         if action == "capture_photo":
             return self._capture_photo(args)
         if action == "record_video":
