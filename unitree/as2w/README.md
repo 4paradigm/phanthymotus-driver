@@ -153,7 +153,8 @@ queue. It probes for an already-installed CuPy CUDA runtime without downloading
 one: CPU fallback is capped at 2,000 latest points, while CUDA may use the
 configured 12,000-point budget. `led` controls the AS2 RGB LED through a
 separate audio-service worker, so its keepalive cannot delay locomotion or
-speaker PCM. The keepalive also refreshes black after `off`, because otherwise
+speaker PCM. The keepalive refreshes the selected color every 0.5 seconds and
+also refreshes black after `off`, because otherwise
 the AS2 firmware may time out the command and restore its default LED state.
 
 The multimedia cards use transports verified on As2W hardware. `speaker`

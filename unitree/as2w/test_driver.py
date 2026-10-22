@@ -500,6 +500,9 @@ class TestDriverContracts(unittest.TestCase):
         self.assertTrue(plugin._keepalive_thread.is_alive())
         plugin.stop()
 
+    def test_led_keepalive_interval_is_half_a_second(self):
+        self.assertEqual(0.5, self.device.LedPlugin.KEEPALIVE_INTERVAL_S)
+
     def test_rpc_channel_ignores_late_timed_out_results(self):
         rpc = _load("as2w_rpc_under_test", ROOT / "rpc_proxy.py")
         channel = rpc._RpcChannel.__new__(rpc._RpcChannel)

@@ -1771,6 +1771,7 @@ _AS2_JOINT_NAMES = [
 
 class LedPlugin:
     PREFIX = "led"
+    KEEPALIVE_INTERVAL_S = 0.5
 
     def __init__(self, config, namespace, executor, proxy):
         self._proxy = proxy
@@ -1820,7 +1821,7 @@ class LedPlugin:
                 if now - previous >= 10.0:
                     print(f"[led] refresh failed: {str(exc)[:160]}", flush=True)
                     self._last_error = now
-            self._keepalive_stop.wait(0.7)
+            self._keepalive_stop.wait(self.KEEPALIVE_INTERVAL_S)
 
     def dispatch(self, action, args):
         if action == "start":
