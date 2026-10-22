@@ -14,7 +14,7 @@ from pathlib import Path
 import queue
 import types
 
-from wooden_man import Game, WoodenManPlugin, encode_speech
+from wooden_man import Game, WoodenManPlugin, encode_speech, HAND_NAMES
 
 
 class String:
@@ -78,7 +78,7 @@ def main():
     def say(text):
         actual_tts_callback(tts_node, String(encode_speech(text)))
 
-    game = Game(say, clock=lambda: 0)
+    game = Game(say, {"host_interaction": False, "robot_actions": False}, clock=lambda: 0)
     asr_publisher = types.SimpleNamespace(publish=lambda msg: game.text(json.loads(msg.data)))
     asr_node = types.SimpleNamespace(_publish_background_enabled=True, _background_pub=asr_publisher)
     actual_asr_publish = callback(asr, "_publish_background")
@@ -87,6 +87,37 @@ def main():
     assert text_queue.get_nowait()[0] == "游戏开始，五秒后开始。"
     print("PASS: actual ASR/Pose/TTS port declarations match the game card")
     print("PASS: actual ASR background publisher -> game -> actual TTS callback queue")
+
+    hand_path = args.perception_plugins / "hand_runtime.py"
+    if not hand_path.exists():
+        hand_path = args.perception_plugins / "perception_plugins_hand_runtime.py"
+    if hand_path.exists():
+        import numpy as np
+        tree = ast.parse(hand_path.read_text(encoding="utf-8"))
+        names = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == "HAND_KEYPOINTS" for t in n.targets))
+        assert tuple(names) == HAND_NAMES
+        merge = callback(tree, "merge_keypoints", {"np": np, "N_HAND_KEYPOINTS": 21})
+        merge_names = callback(tree, "merged_keypoint_names", {"HAND_KEYPOINTS": names})
+        body = np.array([[100 + i * 3, 100 + (100 if i >= 11 else 0), .99] for i in range(17)])
+        hand = np.array([[140 + (i % 4) * 8, 100 - i * 2, .99] for i in range(21)])
+        hand[9, :2] = [140, 65]
+        clock = [0.0]
+        game = Game(lambda _: None, {"detect_fingers": True, "host_interaction": False, "robot_actions": False}, clock=lambda: clock[0])
+        game.text("游戏开始")
+        clock[0] = 5
+        game.tick()
+        clock[0] = 8.5
+        game.tick()
+        for delta in (0, 15, 16):
+            left = hand.copy()
+            left[8, 0] += delta
+            game.pose({"persons": [{"id": 1, "keypoints": merge(body, left, hand).tolist()}],
+                       "keypoint_names": merge_names([f"body_{i}" for i in range(17)])})
+        assert game.phase == "lost" and game.moved_part == "left_fingers", game.status()
+        print("PASS: actual hand-runtime merged keypoints and names -> finger movement judgment")
+    else:
+        print("SKIP: hand_runtime.py absent; finger wire compatibility not checked")
 
     core_path = args.perception_plugins / "agent-core_src_tool_config.py"
     if core_path.exists():

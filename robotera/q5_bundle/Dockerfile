@@ -91,6 +91,7 @@ COPY odom.py /work/odom.py
 COPY teleop_state.py /work/teleop_state.py
 COPY robot_status.py /work/robot_status.py
 COPY wooden_man.py /work/wooden_man.py
+COPY wooden_man_motion.py /work/wooden_man_motion.py
 COPY games/ /work/games/
 COPY config.yaml /work/config.yaml
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf

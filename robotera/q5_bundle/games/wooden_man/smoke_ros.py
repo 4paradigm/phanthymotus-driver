@@ -20,7 +20,8 @@ def main():
     import rclpy
     from rclpy.node import Node
     from std_msgs.msg import String
-    from wooden_man import DEFAULTS
+    from sensor_msgs.msg import CompressedImage
+    from wooden_man import DEFAULTS, HAND_NAMES
     import main as driver
 
     rclpy.init()
@@ -28,6 +29,17 @@ def main():
     asr = node.create_publisher(String, "/wooden_man_test/asr", 10)
     pose = node.create_publisher(String, "/wooden_man_test/pose", 10)
     words = []
+    images = []
+    hand_mode = False
+    finger_delta = 0
+    def receive_image(msg):
+        from io import BytesIO
+        from PIL import Image
+        assert msg.format == "jpeg"
+        with Image.open(BytesIO(bytes(msg.data))) as im:
+            assert im.size == (800, 600)
+        images.append(bytes(msg.data))
+    image_sub = node.create_subscription(CompressedImage, "/smoke/wooden_man/highlight", receive_image, 1)
     def receive_tts(msg):
         # Match perception/plugins/tts.py:_text_cb, rather than accepting raw
         # text as the previous smoke test did. An invalid JSON wire fails here.
@@ -61,8 +73,23 @@ def main():
             if publish_pose:
                 points = [[100 + i * 3 + dx, 100 + (100 if i >= 11 else 0), 0.99]
                           for i in range(17)]
+                payload = {"persons": [{"id": 1, "keypoints": points}], "image_size": [320, 320]}
+                if hand_mode:
+                    import math
+                    jitter = math.sin(time.monotonic() * 3) * 0.02
+                    names = [f"body_{i}" for i in range(17)]
+                    for side, wrist in (("left", 9), ("right", 10)):
+                        x, y = points[wrist][:2]
+                        hand = [[x + jitter, y, 0.99]]
+                        for finger in range(5):
+                            hand.extend([[x + (finger - 2) * 8 + jitter, y - 20 - joint * 9, 0.99] for joint in range(4)])
+                        if side == "left":
+                            hand[8][0] += finger_delta
+                        points.extend(hand)
+                        names.extend(f"{side}_hand_{name}" for name in HAND_NAMES)
+                    payload["keypoint_names"] = names
                 msg = String()
-                msg.data = json.dumps({"persons": [{"id": 1, "keypoints": points}]})
+                msg.data = json.dumps(payload)
                 pose.publish(msg)
             rclpy.spin_once(node, timeout_sec=0.04)
             time.sleep(0.02)
@@ -83,7 +110,7 @@ def main():
         raise AssertionError((phase, plugin.info(), words))
 
     try:
-        saved = {**DEFAULTS, "asr_topic": "", "pose_topic": ""}
+        saved = {**DEFAULTS, "asr_topic": "", "pose_topic": "", "host_interaction": False, "robot_actions": False}
         assert control("config", saved)["status"] == "configured"
         result = control("start", {"input_topic": "/wooden_man_test/asr",
                                    "input_topics": ["/wooden_man_test/asr", "/wooden_man_test/pose"]})
@@ -107,10 +134,34 @@ def main():
         pump(0.2, publish_pose=True)
         pump(0.8, dx=20, publish_pose=True)
         assert plugin.info()["phase"] == "lost", plugin.info()
-        assert words[-1] == "你动了，游戏结束。", words
+        assert words[-1].startswith("你的") and words[-1].endswith("动了，游戏结束。"), words
+        assert images and plugin.info()["moved_part"] and plugin.info()["highlight_indices"]
         print("PASS: DDS Pose movement -> loss speech", flush=True)
 
-        control("config", saved)
+        control("stop")
+        control("config", {"detect_fingers": True, "sensitivity": "standard",
+                           "cue_seconds": 0.2, "settle_seconds": 0.1, "watch_seconds": 2.4})
+        assert control("start", {"input_topics": ["/wooden_man_test/asr", "/wooden_man_test/pose"]})["state"] == "running"
+        hand_mode = True
+        # Restarted DDS endpoints can take time to rediscover, especially
+        # under ARM emulation. Retry only while still waiting for the utterance.
+        for _ in range(25):
+            speak("游戏开始")
+            pump(0.2, publish_pose=True)
+            if control("info")["phase"] != "waiting":
+                break
+        else:
+            raise AssertionError("Restarted worker did not discover ASR publisher")
+        await_phase("watch", 8, publish_pose=True)
+        pump(0.25, publish_pose=True)
+        finger_delta = 12
+        pump(0.8, publish_pose=True)
+        info = control("info")
+        assert info["phase"] == "lost" and info["moved_part"] == "left_fingers", info
+        assert words[-1] == "你的左手手指动了，游戏结束。", words
+        assert images
+        print("PASS: DDS 59-joint fingers -> anatomical speech + CompressedImage JPEG highlight", flush=True)
+
         control("reset")
         await_phase("waiting", 2)
         control("stop")

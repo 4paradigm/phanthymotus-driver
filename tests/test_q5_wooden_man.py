@@ -12,10 +12,10 @@ spec.loader.exec_module(module)
 
 
 class Rig:
-    def __init__(self):
+    def __init__(self, config=None):
         self.now = 0.0
         self.words = []
-        self.game = module.Game(self.words.append, clock=lambda: self.now)
+        self.game = module.Game(self.words.append, {"host_interaction": False, "robot_actions": False, **(config or {})}, clock=lambda: self.now)
 
     def step(self, seconds):
         self.now += seconds
@@ -82,7 +82,7 @@ def test_movement_ends_immediately_without_later_rounds(dx, dy):
         r.step(0.1)
         r.pose(dx, dy)
     assert r.game.phase == "lost"
-    assert r.words[-1] == "你动了，游戏结束。"
+    assert r.words[-1].startswith("你的") and r.words[-1].endswith("动了，游戏结束。")
     r.step(100)
     assert r.game.round == 1
 
@@ -172,7 +172,7 @@ def test_plugin_registration_lifecycle_and_input_validation_without_hardware():
 
 def test_asr_background_json_triggers_and_speech_is_tts_json():
     wire = []
-    game = module.Game(lambda words: wire.append(module.encode_speech(words)), clock=lambda: 0)
+    game = module.Game(lambda words: wire.append(module.encode_speech(words)), {"host_interaction": False, "robot_actions": False}, clock=lambda: 0)
     game.text({"text": "游戏开始", "background": True, "priority": 0,
                "log_type": True, "audio_start_ts": 1000, "audio_end_ts": 1001,
                "audio_duration_ms": 1000})
@@ -202,7 +202,7 @@ def test_canvas_config_is_handled_before_start_without_starting_game():
     assert p.config["cue_seconds"] == 4
     assert p.configured_topics["asr_topic"] == "/mic/asr_background"
     assert p.dispatch("config", {"asr_topic": "", "pose_topic": ""})["status"] == "configured"
-    assert p.configured_topics == {"asr_topic": "", "pose_topic": ""}
+    assert p.configured_topics == {"asr_topic": "", "pose_topic": "", "motion_feedback_topic": "/q5/wooden_man_motion/feedback"}
 
 
 def test_invalid_config_is_atomic_and_raises_to_the_mcp_error_handler():
@@ -223,3 +223,174 @@ def test_reapplying_saved_config_does_not_stop_running_worker():
     p.process = sentinel
     assert p.dispatch("config", dict(module.DEFAULTS))["state"] == "running"
     assert p.process is sentinel
+
+
+def hand_pose(delta=0, jitter=0, missing=None):
+    points = [[100 + i * 3, 100 + (100 if i >= 11 else 0), 0.99] for i in range(17)]
+    names = [f"body_{i}" for i in range(17)]
+    for side, wrist in (("left", 9), ("right", 10)):
+        x, y = points[wrist][:2]
+        hand = [[x + jitter, y, 0.99]]
+        for finger in range(5):
+            hand.extend([[x + (finger - 2) * 8 + jitter, y - 20 - joint * 9, 0.99] for joint in range(4)])
+        if side == "left":
+            hand[8][0] += delta
+        if side == missing:
+            hand = [[0, 0, 0]] * 21
+        points.extend(hand)
+        names.extend(f"{side}_hand_{name}" for name in module.HAND_NAMES)
+    return {"persons": [{"id": 1, "keypoints": points}], "keypoint_names": names,
+            "image_size": [320, 320]}
+
+
+@pytest.mark.parametrize("preset,dx,loses", [("relaxed", 8, False), ("standard", 8, True),
+                                             ("standard", 5, False), ("sensitive", 5, True)])
+def test_presets_change_actual_body_judgment(preset, dx, loses):
+    r = Rig({"sensitivity": preset})
+    r.start()
+    r.pose()
+    for _ in range(3):
+        r.pose(dx)
+    assert (r.game.phase == "lost") == loses
+
+
+def test_motion_must_be_consecutive_in_the_same_part():
+    r = Rig()
+    r.start()
+    r.pose()
+    for joint in [9, 15] * 5:
+        p = hand_pose()
+        p["persons"][0]["keypoints"][joint][0] += 20
+        r.game.pose(p)
+    assert r.game.phase == "watch"
+
+
+@pytest.mark.parametrize("joint,part,label", [(0, "head", "头部"), (9, "left_arm", "左手臂"),
+                                              (16, "right_leg", "右腿")])
+def test_body_part_speech_and_highlight_match(joint, part, label):
+    r = Rig()
+    r.start()
+    r.game.pose(hand_pose())
+    for _ in range(3):
+        p = hand_pose()
+        p["persons"][0]["keypoints"][joint][0] += 20
+        r.game.pose(p)
+    assert r.game.status()["moved_part"] == part
+    assert joint in r.game.status()["highlight_indices"]
+    assert r.words[-1] == f"你的{label}动了，游戏结束。"
+
+
+def test_finger_articulation_and_held_model_results():
+    r = Rig({"detect_fingers": True})
+    r.start()
+    r.game.pose(hand_pose())
+    for _ in range(10):
+        r.game.pose(hand_pose(delta=10))
+    assert r.game.phase == "watch", "Held hand results must not count as new inference observations"
+    r.game.pose(hand_pose(delta=11))
+    assert r.game.phase == "lost"
+    assert r.game.moved_part == "left_fingers"
+    assert 25 in r.game.highlight
+    assert r.words[-1] == "你的左手手指动了，游戏结束。"
+
+
+def test_disabled_fingers_and_hand_translation_do_not_report_finger_motion():
+    for config in ({}, {"detect_fingers": True}):
+        r = Rig(config)
+        r.start()
+        r.game.pose(hand_pose())
+        for i in range(1, 12):
+            r.game.pose(hand_pose(delta=30 if not config else 0, jitter=i))
+        assert r.game.phase == "watch"
+
+
+@pytest.mark.parametrize("missing", ["left", "right", "metadata", "body_only", "held"])
+def test_finger_mode_cannot_win_without_readable_both_hands(missing):
+    r = Rig({"detect_fingers": True})
+    r.start()
+    for i in range(31):
+        p = hand_pose(jitter=0 if missing == "held" else i * 0.01, missing=missing)
+        if missing == "metadata":
+            p.pop("keypoint_names")
+        if missing == "body_only":
+            p["persons"][0]["keypoints"] = p["persons"][0]["keypoints"][:17]
+        r.game.pose(p)
+        r.step(0.1)
+    assert r.game.phase == "error" and r.game.reason == "hands_unavailable"
+
+
+def test_three_rounds_with_still_hands_and_each_round_recalibrates():
+    r = Rig({"detect_fingers": True})
+    r.start()
+    for round_number in range(3):
+        for i in range(31):
+            r.game.pose(hand_pose(jitter=i * 0.01, delta=round_number * 20))
+            r.step(0.1)
+        if round_number < 2:
+            r.watch()
+    assert r.game.phase == "won"
+
+
+def test_old_held_hands_cannot_pass_even_after_three_initial_samples():
+    r = Rig({"detect_fingers": True})
+    r.start()
+    for i in range(3):
+        r.game.pose(hand_pose(jitter=i * 0.01))
+        r.step(0.1)
+    for _ in range(28):
+        r.game.pose(hand_pose(jitter=0.02))
+        r.step(0.1)
+    assert r.game.phase == "error" and r.game.reason == "hands_unavailable"
+
+
+def test_hand_names_follow_metadata_and_occlusion_recalibrates():
+    r = Rig({"detect_fingers": True})
+    r.start()
+    def permute(p):
+        points = p["persons"][0]["keypoints"]
+        points[17:] = reversed(points[17:])
+        p["keypoint_names"][17:] = reversed(p["keypoint_names"][17:])
+        return p
+    r.game.pose(permute(hand_pose()))
+    r.game.pose(permute(hand_pose(delta=12)))
+    r.game.pose(permute(hand_pose(missing="left")))
+    r.game.pose(permute(hand_pose(delta=30)))
+    assert r.game.phase == "watch"
+    r.game.pose(permute(hand_pose(delta=42)))
+    r.game.pose(permute(hand_pose(delta=43)))
+    assert r.game.phase == "lost" and r.game.moved_part == "left_fingers"
+
+
+@pytest.mark.parametrize("args", [{"sensitivity": "bogus"}, {"detect_fingers": "true"},
+                                 {"finger_frames": 1.5}, {"finger_threshold": 0}])
+def test_new_settings_validate_atomically(args):
+    p = module.WoodenManPlugin({}, "q5")
+    before = dict(p.config)
+    with pytest.raises(ValueError):
+        p.dispatch("config", args)
+    assert p.config == before
+
+
+def test_saved_numeric_thresholds_migrate_and_explicit_presets_take_precedence():
+    p = module.WoodenManPlugin({}, "q5")
+    p.dispatch("config", {"motion_threshold": 0.08})
+    assert p.config["sensitivity"] == "custom" and p.config["motion_threshold"] == 0.08
+    p.dispatch("config", {"sensitivity": "sensitive", "motion_threshold": 0.08})
+    assert p.config["motion_threshold"] == 0.04
+    assert p.get_tool()["configSchema"]["properties"]["detect_fingers"]["type"] == "boolean"
+
+
+def test_highlight_jpeg_has_red_pixels_and_handles_missing_pose():
+    from io import BytesIO
+    from PIL import Image
+    r = Rig({"detect_fingers": True})
+    r.start()
+    for delta in (0, 10, 11):
+        r.game.pose(hand_pose(delta=delta))
+    jpeg = module.render_highlight(r.game.frame, r.game.status())
+    image = Image.open(BytesIO(jpeg)).convert("RGB")
+    assert image.size == (800, 600)
+    assert sum(1 for red, green, blue in image.getdata() if red > 180 and green < 120 and blue < 140) > 100
+    r.game.reset()
+    assert module.render_highlight(None, r.game.status()).startswith(b"\xff\xd8")
+    assert module.render_highlight({"persons": None}, r.game.status()).startswith(b"\xff\xd8")

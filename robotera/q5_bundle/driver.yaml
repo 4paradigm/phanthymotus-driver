@@ -15,6 +15,7 @@ build_context_extras:
 # intentionally excluded, and joints.py's extra `model` resource tool is included.
 cards:
   - { name: wooden_man,        type: processor }
+  - { name: wooden_man_motion, type: actuator }
   - { name: base_drive,        type: actuator }
   - { name: joints,            type: sensor }
   - { name: joints_state,      type: sensor }
