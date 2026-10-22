@@ -88,6 +88,30 @@ def main():
     print("PASS: actual ASR/Pose/TTS port declarations match the game card")
     print("PASS: actual ASR background publisher -> game -> actual TTS callback queue")
 
+    # Execute the upstream skeleton serializer rather than assuming detection
+    # order is identity. Both body and merged hands stay in the same record.
+    skeleton_record = callback(pose, "_skeleton_record", {"_full_keypoints": lambda points: points})
+    pose_node = types.SimpleNamespace(_payload_keypoints=lambda person: person["keypoints"])
+    records = [skeleton_record(pose_node, {"id": identity, "score": .99,
+               "box": [0,0,100,200], "keypoints": [[identity,10,.99]]*17,
+               "verdict": {"posture": "standing", "activity": None}}) for identity in (12,7)]
+    assert [record["id"] for record in records] == [12,7]
+    assert records[1]["keypoints"][0][0] == 7
+    print("PASS: actual Pose skeleton serializer preserves per-person track IDs and keypoints")
+
+    clock = [0.]
+    dialog = Game(say, clock=lambda: clock[0])
+    dialog.text("小范小范，我们来玩木头人游戏吧")
+    assert dialog.phase == "rules_question"
+    clock[0] = dialog.listen_after+.01
+    asr_publisher.publish = lambda msg: dialog.text(json.loads(msg.data))
+    actual_asr_publish(asr_node, "不用介绍", 1002,1003,b"\0"*32000,{})
+    assert dialog.phase == "player_count"
+    clock[0] = dialog.listen_after+.01
+    actual_asr_publish(asr_node, "两个人", 1004,1005,b"\0"*32000,{})
+    assert dialog.phase == "registering" and dialog.expected_players == 2
+    print("PASS: actual ASR background replies -> rules skip -> two-player enrollment")
+
     hand_path = args.perception_plugins / "hand_runtime.py"
     if not hand_path.exists():
         hand_path = args.perception_plugins / "perception_plugins_hand_runtime.py"

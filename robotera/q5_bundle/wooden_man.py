@@ -37,7 +37,68 @@ BODY_EDGES = ((5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12),
 DEFAULTS = dict(cue_seconds=3.0, settle_seconds=0.5, watch_seconds=3.0,
                 motion_threshold=0.07, moving_frames=3, pose_timeout=1.5,
                 confidence=0.5, finger_threshold=0.15, finger_frames=2,
-                preparation_timeout=20.0)
+                preparation_timeout=20.0, dialogue_timeout=20.0,
+                registration_timeout=30.0, registration_seconds=1.0,
+                recovery_timeout=20.0, max_players=5)
+
+
+def clean_text(text):
+    return re.sub(r"[\s，。！？,.!?：:、]", "", text)
+
+
+def invite(text):
+    if any(word in text for word in ("不玩", "不要", "不想", "别玩", "不来", "取消", "什么", "怎么玩", "规则", "介绍")):
+        return False
+    return text == "游戏开始" or ("木头人" in text and
+        (any(word in text for word in ("玩", "开始", "来")) or text in ("木头人游戏", "一二三木头人游戏")))
+
+
+def player_count(text):
+    if text in ("我一个人", "只有我", "就我一个人", "就我", "只有我一个人"):
+        return 1
+    match = re.fullmatch(r"(?:小范小范)?(?:我们|这次|就|一共|总共|有|我)?(?:有|就)?([一二两三四五六七八九十]|\d{1,2})(?:个人|人|位)(?:一起)?(?:玩|参加|玩游戏)?(?:吧|呀|啊)?", text)
+    if not match:
+        return None
+    value = match[1]
+    return int(value) if value.isdigit() else 2 if value == "两" else "〇一二三四五六七八九十".index(value)
+
+
+def body_geometry(person, confidence):
+    if not isinstance(person, dict):
+        return None
+    points = visible_points(person.get("keypoints"), confidence)
+    if not all(i in points for i in (5, 6, 11, 12)) or sum(5 <= i < 17 for i in points) < 8:
+        return None
+    shoulder = tuple((points[5][j] + points[6][j]) / 2 for j in (0, 1))
+    hip = tuple((points[11][j] + points[12][j]) / 2 for j in (0, 1))
+    scale = math.dist(shoulder, hip)
+    return (points, shoulder, hip, scale) if scale >= 10 else None
+
+
+def standing(geometry):
+    points, shoulder, hip, scale = geometry
+    if not all(i in points for i in (13, 14, 15, 16)) or hip[1] - shoulder[1] < .65 * scale:
+        return False
+    for h, k, a in ((11, 13, 15), (12, 14, 16)):
+        upper = (points[h][0] - points[k][0], points[h][1] - points[k][1])
+        lower = (points[a][0] - points[k][0], points[a][1] - points[k][1])
+        length = math.hypot(*upper) * math.hypot(*lower)
+        if length < 1 or sum(x*y for x, y in zip(upper, lower)) / length > -.65:
+            return False
+        if points[a][1] - points[h][1] < .8 * scale:
+            return False
+    return True
+
+
+def dialogue_topics(topics, enabled):
+    result = list(topics)
+    if enabled:
+        for topic in topics:
+            if topic.endswith("/asr"):
+                result.append(topic + "_background")
+            elif topic.endswith("/asr_background"):
+                result.append(topic.removesuffix("_background"))
+    return list(dict.fromkeys(result))
 
 
 def effective_config(config):
@@ -77,7 +138,7 @@ class Game:
     """Clock-injected game logic, independent of ROS and robot hardware."""
 
     def __init__(self, say, config=None, clock=time.monotonic):
-        self.say, self.clock = say, clock
+        self._say, self.clock = say, clock
         self.cfg = effective_config(config)
         self.reset()
 
@@ -105,6 +166,188 @@ class Game:
         self.last_observation = None
         self.prompt_at = None
         self.replay_prompted = False
+        self.listen_after = 0.0
+        self.spoken = []
+        self.seen_utterances = []
+        self.expected_players = 0
+        self.players = []
+        self.registration_key = None
+        self.registration_since = None
+        self.registration_frames = 0
+        self.registration_last = None
+        self.moved_player = None
+        self.moved_track_id = None
+        self.registration_candidates = 0
+        self.observation_complete = False
+        self.repeat_round = False
+
+    def say(self, words):
+        self._say(words)
+        self.spoken = (self.spoken + [clean_text(words)])[-24:]
+        # Canvas supplies no speaker-finished port. A configurable conservative
+        # budget suppresses echo and starts the response timer after speech.
+        if self.cfg["host_interaction"]:
+            self.listen_after = self.clock() + max(self.cfg["cue_seconds"], len(clean_text(words)) / 4.0)
+
+    def ask(self, phase, words):
+        self.phase = phase
+        self.say(words)
+        self.deadline = self.listen_after + self.cfg["dialogue_timeout"]
+
+    def ask_count(self):
+        self.ask("player_count", "这次几个人一起玩？请告诉我人数。")
+
+    def enroll(self):
+        self.players = []
+        self.registration_key = self.registration_since = self.registration_last = None
+        self.registration_frames = self.registration_candidates = 0
+        self.ready = False
+        self.phase = "registering"
+        self.say(f"{self.expected_players}个人一起玩。请参加的人站到我看得到的地方，举起一只手，保持一下。")
+        self.deadline = self.listen_after + self.cfg["registration_timeout"]
+        self.last_guidance = self.clock()
+
+    def hands_clear(self, payload, points):
+        if not self.cfg["detect_fingers"]:
+            return True
+        for side in ("left", "right"):
+            indices = hand_indices(payload, side)
+            if len(indices) != 21 or any(i not in points for i in indices):
+                return False
+            hand = [points[i] for i in indices]
+            if max(math.dist(hand[0], hand[9]), math.dist(hand[5], hand[17])) < 12:
+                return False
+        return True
+
+    def registration(self, payload):
+        now = self.clock()
+        candidates = []
+        for person in payload.get("persons", []):
+            geometry = body_geometry(person, self.cfg["confidence"])
+            if geometry is None or not standing(geometry):
+                continue
+            points, shoulder, _, scale = geometry
+            if not any(i in points and points[i][1] < shoulder[1] - .15*scale for i in (9, 10)):
+                continue
+            identity = person.get("id")
+            if isinstance(identity, bool) or not isinstance(identity, (str, int)):
+                continue
+            candidates.append((identity, geometry))
+        self.registration_candidates = len(candidates)
+        ids = [p[0] for p in candidates]
+        key = frozenset(ids)
+        if len(ids) != self.expected_players or len(key) != len(ids):
+            self.registration_key = self.registration_since = None
+            self.registration_frames = 0
+            if now - self.last_guidance >= 7 and now >= self.listen_after:
+                self.say(f"看到{len(ids)}位站立举手的候选玩家，需要{self.expected_players}位。请参加的人保持举手，其他人放下手。")
+                self.last_guidance = now
+            return
+        if key != self.registration_key or self.registration_last is None or now - self.registration_last > self.cfg["pose_timeout"]:
+            self.registration_key, self.registration_since, self.registration_frames = key, now, 0
+        self.registration_last = now
+        self.registration_frames += 1
+        if self.registration_frames >= 5 and now - self.registration_since >= self.cfg["registration_seconds"] and now >= self.listen_after:
+            # Initial left-to-right numbering only. Subsequent frames use track
+            # identities, never detection order or a new nearest bystander.
+            candidates.sort(key=lambda c: c[1][2][0])
+            self.players = [dict(number=i+1, track_id=identity, geometry=geometry,
+                                 seen=now, detector=None, frame_index=None)
+                            for i, (identity, geometry) in enumerate(candidates)]
+            self.phase = "preparing"
+            self.say(f"找到{len(self.players)}位玩家了，按画面从左到右编号。请放下手，站好准备开始。")
+            self.preparation_not_before = self.listen_after
+            self.deadline = self.listen_after + self.cfg["preparation_timeout"]
+            self.ready_since, self.ready_frames, self.last_observation = None, 0, None
+
+    def matched_players(self, payload, now):
+        matches = {}
+        for index, person in enumerate(payload.get("persons", [])):
+            if not isinstance(person, dict):
+                continue
+            identity = person.get("id")
+            if isinstance(identity, bool) or not isinstance(identity, (int, str)):
+                continue
+            matches.setdefault(identity, []).append((index, person))
+        found = []
+        for player in self.players:
+            candidates = matches.get(player["track_id"], [])
+            geometry = body_geometry(candidates[0][1], self.cfg["confidence"]) if len(candidates) == 1 else None
+            if geometry is None:
+                found.append(None)
+                continue
+            old = player["geometry"]
+            # A recycled ID or implausible discontinuity is not proof that the
+            # participant moved: pause instead of accusing a replacement.
+            if math.dist(geometry[2], old[2]) > 2.5 * old[3] or not .45 < geometry[3]/old[3] < 2.2:
+                found.append(None)
+                continue
+            player.update(geometry=geometry, seen=now, frame_index=candidates[0][0])
+            found.append(candidates[0][1])
+        return found
+
+    def host_pose(self, payload):
+        now = self.clock()
+        if self.phase == "registering":
+            self.registration(payload)
+            return
+        if self.phase not in ("preparing", "countdown", "cue", "watch", "intermission", "paused") or not self.players:
+            return
+        found = self.matched_players(payload, now)
+        if self.phase in ("preparing", "paused"):
+            valid = all(person is not None and standing(player["geometry"]) and
+                        all(i in player["geometry"][0] and player["geometry"][0][i][1] > player["geometry"][1][1] + .15*player["geometry"][3] for i in (9, 10)) and
+                        self.hands_clear(payload, player["geometry"][0])
+                        for person, player in zip(found, self.players))
+            if self.last_observation is None or now - self.last_observation > self.cfg["pose_timeout"]:
+                self.ready_since, self.ready_frames = None, 0
+            self.last_observation = now
+            if not valid:
+                self.ready_since, self.ready_frames, self.ready = None, 0, False
+                if now - self.last_guidance >= 7 and now >= self.listen_after:
+                    self.say("请已登记的玩家放下手站好，露出肩膀和双腿。" + ("双手也要清楚可见。" if self.cfg["detect_fingers"] else ""))
+                    self.last_guidance = now
+                return
+            self.ready_since = now if self.ready_since is None else self.ready_since
+            self.ready_frames += 1
+            self.ready = self.ready_frames >= 5 and now - self.ready_since >= .8
+            if self.ready and now >= self.preparation_not_before:
+                if self.phase == "paused":
+                    self.repeat_round = True
+                    self.say("看清大家了，这一轮重新开始。")
+                    self.phase = "intermission"
+                    self.deadline = self.listen_after
+                else:
+                    self.advance("countdown")
+            return
+        if self.phase != "watch":
+            return
+        # A missing participant invalidates consecutive motion evidence.
+        self.observation_complete = all(person is not None for person in found)
+        if not self.observation_complete:
+            for player in self.players:
+                player["detector"].invalid_pose()
+            return
+        for player, person in zip(self.players, found):
+            detector = player["detector"]
+            detector.pose({**payload, "persons": [person]})
+            if detector.phase == "lost":
+                self.moved_player, self.moved_track_id = player["number"], player["track_id"]
+                self.moved_part, self.highlight, self.hands = detector.moved_part, list(detector.highlight), detector.hands
+                self.frame = payload
+                self.finish("lost", "movement", f"{player['number']}号玩家，你的{PARTS[self.moved_part][0]}动了，游戏结束。")
+                return
+        self.valid_frames = min(p["detector"].valid_frames for p in self.players)
+        self.last_pose = now
+
+    def pause(self):
+        self.phase = "paused"
+        self.ready = False
+        self.ready_since, self.ready_frames, self.last_observation = None, 0, None
+        self.say("有玩家被遮挡或没有看清，暂停一下。请原来的玩家重新站好，这一轮会重新开始。")
+        self.preparation_not_before = self.listen_after
+        self.deadline = self.listen_after + self.cfg["recovery_timeout"]
+        self.last_guidance = self.clock()
 
 
     def advance(self, phase):
@@ -120,91 +363,97 @@ class Game:
                 self.prompt_at = self.clock() + self.cfg["cue_seconds"]
 
 
-    def preparation(self, payload):
-        if self.phase != "preparing":
-            return  # Visibility checks and guidance start only after the voice command.
-        now = self.clock()
-        persons = payload.get("persons")
-        message = "没有看清玩家，请一个人站在镜头前。"
-        valid = False
-        if isinstance(persons, list) and len(persons) == 1 and isinstance(persons[0], dict):
-            points = visible_points(persons[0].get("keypoints"), self.cfg["confidence"])
-            valid = all(i in points for i in (5, 6, 11, 12, 15, 16)) and sum(5 <= i < 17 for i in points) >= 8
-            if valid:
-                shoulders = tuple((points[5][j] + points[6][j]) / 2 for j in (0, 1))
-                hips = tuple((points[11][j] + points[12][j]) / 2 for j in (0, 1))
-                valid = math.dist(shoulders, hips) >= 10
-            message = "请露出肩膀和双腿，让我看清你的身体。"
-            if valid and self.cfg["detect_fingers"]:
-                for side in ("left", "right"):
-                    indices = hand_indices(payload, side)
-                    if len(indices) != 21 or any(i not in points for i in indices):
-                        valid = False
-                        break
-                    hand = [points[i] for i in indices]
-                    if max(math.dist(hand[0], hand[9]), math.dist(hand[5], hand[17])) < 12:
-                        valid = False
-                message = "请靠近一点，并把双手完整露出来。"
-        if self.last_observation is None or now - self.last_observation > self.cfg["pose_timeout"]:
-            self.ready_since, self.ready_frames = None, 0
-        self.last_observation = now
-        if valid:
-            if self.ready_since is None:
-                self.ready_since = now
-            self.ready_frames += 1
-            self.ready = self.ready_frames >= 5 and now - self.ready_since >= .8
-            if self.ready and self.phase == "preparing" and now >= self.preparation_not_before:
-                self.advance("countdown")
-        else:
-            self.ready_since, self.ready_frames, self.ready = None, 0, False
-            if now - self.last_guidance >= 6:
-                self.say(message)
-                self.last_guidance = now
-
-
     def status(self):
         return dict(phase=self.phase, round=self.round, rounds=3, reason=self.reason,
                     valid_frames=self.valid_frames, moved_part=self.moved_part,
                     moved_part_label=PARTS[self.moved_part][0] if self.moved_part else "",
                     highlight_indices=list(self.highlight), sensitivity=self.cfg["sensitivity"],
                     detect_fingers=self.cfg["detect_fingers"],
-                    result=self.result, ready=self.ready,
+                    result=self.result, ready=self.ready, expected_players=self.expected_players,
+                    registered_players=len(self.players), registration_candidates=self.registration_candidates,
+                    moved_player=self.moved_player, moved_track_id=self.moved_track_id,
+                    players=[dict(number=p["number"], track_id=p["track_id"],
+                                  visible=self.clock() - p["seen"] <= self.cfg["pose_timeout"],
+                                  frame_index=p["frame_index"],
+                                  valid_frames=p["detector"].valid_frames if p["detector"] else 0,
+                                  hands=p["detector"].status()["hands"] if p["detector"] else {})
+                             for p in self.players],
                     hands={side: {"samples": h["samples"], "visible": h["visible"],
                                   "ready": h["visible"] and h["samples"] >= 3 and h["last"] is not None and self.clock() - h["last"] <= self.cfg["pose_timeout"]}
                            for side, h in self.hands.items()})
 
     def text(self, payload):
+        background = False
         if isinstance(payload, dict):
             if payload.get("is_final") is False or payload.get("final") is False:
                 return
+            background = payload.get("background") is True
+            if self.cfg["host_interaction"] and payload.get("audio_start_ts") is not None:
+                key = (payload.get("audio_start_ts"), payload.get("audio_end_ts"), payload.get("text", payload.get("transcript")))
+                if key in self.seen_utterances:
+                    return
+                self.seen_utterances = (self.seen_utterances + [key])[-32:]
             payload = payload.get("text", payload.get("transcript", ""))
         if not isinstance(payload, str):
             return
-        # Exact utterance avoids triggering on “不要游戏开始” or our own intro.
-        text = re.sub(r"[\s，。！？,.!?：:]", "", payload)
+        text = clean_text(payload)
+        if self.cfg["host_interaction"]:
+            self.host_text(text, background)
+            return
         restart = text == "游戏开始" or (self.phase in ("won", "lost", "error") and self.replay_prompted and text in ("好", "好的", "可以", "再来", "再来一次", "再玩一次"))
         if self.phase in ("waiting", "won", "lost", "error") and restart:
             self.reset()
-            if self.cfg["host_interaction"]:
-                self.phase = "preparing"
-                self.deadline = self.clock() + self.cfg["preparation_timeout"]
-                self.preparation_not_before = self.clock() + self.cfg["cue_seconds"]
-                self.say("好，我先确认你站好了，请面向镜头。")
-            else:
-                self.advance("countdown")
+            self.advance("countdown")
         elif self.phase in ("won", "lost", "error") and self.replay_prompted and text in ("不玩了", "不玩", "结束", "不用了"):
             self.reset()
             self.say("好的，休息一下，想玩时再叫我。")
+
+    def host_text(self, text, background):
+        text = text.removeprefix("小范小范")
+        if text in self.spoken:
+            return
+        if self.phase != "waiting" and any(word in text for word in ("取消游戏", "结束游戏", "不玩了", "停止游戏")):
+            self.reset()
+            self.say("好的，游戏已取消，想玩时再叫我。")
+            return
+        if self.clock() < self.listen_after:
+            return
+        # Background sentences may answer an open question, but may not wake
+        # an idle game. ASR remains responsible for the configured wake word.
+        if self.phase in ("waiting", "won", "lost", "error"):
+            replay = self.replay_prompted and text in ("好", "好的", "可以", "再来", "再来一次", "再玩一次")
+            if (not background and invite(text)) or replay:
+                self.reset()
+                self.ask("rules_question", "好啊好啊，需要我介绍规则吗？")
+            elif self.replay_prompted and text in ("不玩", "不用了", "结束"):
+                self.reset()
+                self.say("好的，休息一下，想玩时再叫我。")
+        elif self.phase == "rules_question":
+            if any(word in text for word in ("不用", "不需要", "不要介绍", "不想听", "别介绍", "不介绍", "直接开始", "直接玩", "跳过")) or text in ("不要", "不了"):
+                self.ask_count()
+            elif text in ("好", "好啊", "好的", "要", "需要", "是", "可以") or "介绍" in text or "规则" in text:
+                self.phase = "rules_intro"
+                self.say("我会说一二三木头人，说完以后大家保持不动。任何一位玩家动了，本局就结束。大家一起坚持三轮，就算挑战成功。")
+                self.deadline = self.listen_after
+        elif self.phase == "player_count":
+            count = player_count(text)
+            if count is not None and 1 <= count <= self.cfg["max_players"]:
+                self.expected_players = count
+                self.enroll()
+            else:
+                self.ask("player_count", f"请说一个人、两个人这样的具体人数，目前支持一到{int(self.cfg['max_players'])}人。")
 
     def finish(self, phase, reason, words):
         self.phase, self.reason = phase, reason
         self.result = phase
         self.say(words)
-        self.prompt_at = self.clock() + self.cfg["cue_seconds"]
+        self.prompt_at = self.listen_after if self.cfg["host_interaction"] else self.clock() + self.cfg["cue_seconds"]
 
 
     def cue(self):
-        self.round += 1
+        if not self.repeat_round:
+            self.round += 1
+        self.repeat_round = False
         self.phase = "cue"
         self.baseline = None
         self.track_id = None
@@ -214,6 +463,12 @@ class Game:
         self.hands = {}
         self.highlight = []
         self.moved_part = ""
+        self.moved_player = self.moved_track_id = None
+        self.observation_complete = False
+        for player in self.players:
+            detector = Game(lambda _: None, {**self.cfg, "host_interaction": False}, self.clock)
+            detector.phase = "watch"
+            player["detector"] = detector
         self.deadline = self.clock() + self.cfg["cue_seconds"] + self.cfg["settle_seconds"]
         self.say("一，二，三，木头人！")
 
@@ -225,8 +480,10 @@ class Game:
     def pose(self, payload):
         if not isinstance(payload, dict):
             return
-        if self.cfg["host_interaction"] and self.phase == "preparing":
-            self.preparation(payload)
+        if not isinstance(payload.get("persons"), list):
+            return
+        if self.cfg["host_interaction"]:
+            self.host_pose(payload)
             return
         if self.phase != "watch":
             return
@@ -319,6 +576,9 @@ class Game:
 
     def tick(self):
         now = self.clock()
+        if self.cfg["host_interaction"]:
+            self.host_tick(now)
+            return
         if self.phase == "preparing" and now >= self.deadline:
             self.finish("error", "preparation_timeout", "还没有看清你，请调整站位后重新开始。")
         elif self.phase == "intermission" and now >= self.deadline:
@@ -354,6 +614,47 @@ class Game:
             self.replay_prompted = True
             self.say("再挑战一次吗？")
 
+    def host_tick(self, now):
+        if self.phase in ("rules_question", "player_count") and now >= self.deadline:
+            self.reset()
+            self.say("暂时没有听到回答，我先等你，想玩时再叫我。")
+        elif self.phase == "rules_intro" and now >= self.deadline:
+            self.ask_count()
+        elif self.phase in ("registering", "preparing", "paused") and now >= self.deadline:
+            reason = {"registering": "registration_timeout", "preparing": "preparation_timeout", "paused": "recovery_timeout"}[self.phase]
+            self.finish("error", reason, "还没有确认所有玩家，请调整站位。重新玩时需要再次登记，游戏结束。")
+        elif self.phase == "intermission" and now >= self.deadline:
+            self.cue()
+        elif self.phase == "countdown" and now >= self.deadline:
+            self.cue()
+        elif self.phase == "cue" and now >= self.deadline:
+            self.phase = "watch"
+            self.watch_start = now
+            self.deadline = now + self.cfg["watch_seconds"]
+        elif self.phase == "watch":
+            if any(now - max(p["seen"], self.watch_start) > self.cfg["pose_timeout"] for p in self.players):
+                self.pause()
+            elif now >= self.deadline:
+                # Every enrolled player must independently pass. A short loss
+                # of vision is never evidence that nobody moved.
+                detectors = [p["detector"] for p in self.players]
+                complete = bool(detectors) and self.observation_complete and all(d.valid_frames >= 5 and d.last_pose is not None and
+                           now - d.last_pose <= self.cfg["pose_timeout"] for d in detectors)
+                if self.cfg["detect_fingers"]:
+                    complete = complete and all(all(d.status()["hands"].get(s, {}).get("ready")
+                                                     for s in ("left", "right")) for d in detectors)
+                if not complete:
+                    self.pause()
+                elif self.round == 3:
+                    self.finish("won", "three_rounds", "三轮完成，大家赢了，游戏结束！")
+                else:
+                    self.say(f"不错，第{('二' if self.round == 1 else '三')}轮来了，准备好。")
+                    self.phase = "intermission"
+                    self.deadline = self.listen_after
+        elif self.phase in ("won", "lost", "error") and self.prompt_at is not None and now >= self.prompt_at and not self.replay_prompted:
+            self.replay_prompted = True
+            self.say("再挑战一次吗？")
+
 
 def render_highlight(payload, status, confidence=0.5):
     """JPEG skeleton view, deliberately not an unsynchronised RGB overlay."""
@@ -367,7 +668,8 @@ def render_highlight(payload, status, confidence=0.5):
         font = ImageFont.load_default()
     draw.text((20, 12), f"WOODEN MAN | {status['phase'].upper()} | Round {status['round']}/3", fill="white", font=font)
     part = status.get("moved_part", "")
-    subtitle = ("MOVED: " + PARTS[part][1] + " (player's side) - verdict frozen") if part else "Pose skeleton | red = judged moving part | not RGB"
+    player_label = f"P{status['moved_player']} " if status.get("moved_player") else ""
+    subtitle = ("MOVED: " + player_label + PARTS[part][1] + " (player's side) - verdict frozen") if part else "Pose skeleton | red = judged moving part | not RGB"
     draw.text((20, 43), subtitle, fill="#ff6470" if part else "#a7c1db", font=font)
     persons = payload.get("persons", []) if isinstance(payload, dict) else []
     if not isinstance(persons, list):
@@ -380,10 +682,18 @@ def render_highlight(payload, status, confidence=0.5):
                 max((p[1] for r in records for p in r.values()), default=480) + 40)
     ratio = min(760 / size[0], 440 / size[1])
     ox, oy = (800 - size[0] * ratio) / 2, 90 + (440 - size[1] * ratio) / 2
-    for visible in records:
+    for record_index, visible in enumerate(records):
         coords = {i: (ox + x * ratio, oy + y * ratio) for i, (x, y) in visible.items()
                   if 0 <= x <= size[0] and 0 <= y <= size[1]}
-        selected = set(status.get("highlight_indices", [])) if len(records) == 1 else set()
+        person = [p for p in persons if isinstance(p, dict)][record_index]
+        enrolled = next((p for p in status.get("players", []) if p["track_id"] == person.get("id")), None)
+        selected = set(status.get("highlight_indices", [])) if (
+            status.get("moved_track_id") is not None and person.get("id") == status["moved_track_id"]
+            or status.get("moved_track_id") is None and len(records) == 1) else set()
+        if coords:
+            x, y = coords.get(0, next(iter(coords.values())))
+            label = f"P{enrolled['number']}" if enrolled else "Background"
+            draw.text((x, max(80, y-24)), label, fill="#ff6470" if selected else "white", font=font)
         edges = list(BODY_EDGES)
         for side in ("left", "right"):
             hand = hand_indices(payload, side)
@@ -393,7 +703,7 @@ def render_highlight(payload, status, confidence=0.5):
                     edges.extend(zip(chain, chain[1:]))
         for a, b in edges:
             if a in coords and b in coords:
-                draw.line((coords[a], coords[b]), fill="#ff4058" if a in selected or b in selected else "#3bbfb4", width=4)
+                draw.line((coords[a], coords[b]), fill="#ff4058" if a in selected or b in selected else "#3bbfb4" if enrolled or not status.get("players") else "#526276", width=4)
         for i, (x, y) in coords.items():
             radius = 5 if i in selected else 3
             draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill="#ff4058" if i in selected else "#b9ede7")
@@ -406,6 +716,8 @@ def render_highlight(payload, status, confidence=0.5):
         label = " | ".join(f"{s}: {'READY' if hands.get(s, {}).get('ready') else 'NOT READY'} ({hands.get(s, {}).get('samples', 0)} samples)" for s in ("left", "right"))
         if status.get("reason") == "hands_unavailable":
             label = "Hands unavailable: show both hands closer; check Pose hands ON"
+        if status.get("players"):
+            label = " | ".join(f"P{p['number']} hands: " + ("READY" if all(p["hands"].get(s, {}).get("ready") for s in ("left", "right")) else "NOT READY") for p in status["players"])
     else:
         label = "Finger detection OFF | enable hands in Pose and fingers in game"
     draw.text((20, 552), label, fill="#f9cc78", font=font)
@@ -536,10 +848,10 @@ class WoodenManPlugin:
                  "asr_topic": {"type": "string", "description": "ASR 输出 topic，画布未传递多输入时填写"},
                  "pose_topic": {"type": "string", "description": "Pose 输出 topic，画布未传递多输入时填写"}}
         return {"name": "wooden_man", "title": "一二三木头人", "type": "processor", "multiInstance": False,
-                "description": "单人三轮木头人：语音口令、准备引导、姿态与手指识别、部位播报及高亮、语音重开；机器人固定站立，不控制手臂或其他关节。",
+                "description": "单人／多人三轮木头人：自然语言邀请、规则问答、人数确认、站立举手登记、姿态与手指识别、玩家部位播报和高亮；机器人固定站立，不控制关节。",
                 "inputSchema": {"type": "object", "properties": props, "required": ["action"],
                                 "x-action-params": {
-                                    "start": {"params": ["input_topic", "input_topics", "asr_topic", "pose_topic"], "description": "连接画布，等待玩家喊游戏开始"},
+                                    "start": {"params": ["input_topic", "input_topics", "asr_topic", "pose_topic"], "description": "连接画布，等待邀请玩木头人游戏"},
                                     "stop": {"params": [], "description": "停止游戏并释放订阅"},
                                     "info": {"params": [], "description": "查看轮次和游戏状态"},
                                     "reset": {"params": [], "description": "回到等待口令，不直接开始游戏"}}},
@@ -557,15 +869,19 @@ class WoodenManPlugin:
                                     "default": "standard", "description": "relaxed 宽松 / standard 标准 / sensitive 灵敏 / custom 自定义。阈值越小越灵敏。"},
                     "detect_fingers": {"type": "boolean", "title": "检测手指动作", "default": False,
                                        "description": "需同时开启Pose的hands；双手须清晰可见，缺少手部数据不会判过关。"},
-                    "host_interaction": {"type": "boolean", "title": "准备引导和语音重开", "default": True},
+                    "host_interaction": {"type": "boolean", "title": "对话主持与多人登记", "default": True,
+                                         "description": "自然邀请→规则问答→人数→站立举手登记。关闭仅保留旧版游戏开始口令的单人直入模式。"},
                     "asr_topic": {"type": "string", "advanced": True, "description": "可选：画布ASR输出topic"},
                     "pose_topic": {"type": "string", "advanced": True, "description": "可选：画布Pose输出topic"},
-                    **{k: {"type": "integer" if k in ("moving_frames", "finger_frames") else "number", "default": v, "exclusiveMinimum": 0,
+                    **{k: {"type": "integer" if k in ("moving_frames", "finger_frames", "max_players") else "number", "default": v, "exclusiveMinimum": 0,
                            "title": {"cue_seconds": "口令播报预算（秒）", "settle_seconds": "站稳等待（秒）",
                                      "watch_seconds": "每轮观察时长（秒）", "motion_threshold": "身体位移阈值／躯干长度",
                                      "moving_frames": "身体连续超阈帧数", "pose_timeout": "感知超时（秒）",
                                      "confidence": "关键点最低置信度", "finger_threshold": "手指位移阈值／手掌长度",
-                                     "finger_frames": "手指连续超阈采样数", "preparation_timeout": "准备站位超时（秒）"}[k],
+                                     "finger_frames": "手指连续超阈采样数", "preparation_timeout": "准备站位超时（秒）",
+                                     "dialogue_timeout": "播报后等待回答（秒）", "registration_timeout": "举手登记超时（秒）",
+                                     "registration_seconds": "连续举手确认（秒）", "recovery_timeout": "遮挡后恢复等待（秒）",
+                                     "max_players": "允许的最多玩家数"}[k],
                            "advanced": True, **({"x-show-when": {"sensitivity": ["custom"]}} if k in ("motion_threshold", "finger_threshold") else {})}
                        for k, v in DEFAULTS.items()}}}}
 
@@ -613,6 +929,8 @@ class WoodenManPlugin:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"无效参数: {key}")
             config[key] = value
+        if config["max_players"] != int(config["max_players"]) or config["max_players"] > 10:
+            raise ValueError("max_players须为1到10的整数")
         if any(config[k] != int(config[k]) for k in ("moving_frames", "finger_frames")) or config["confidence"] > 1 or config["watch_seconds"] <= config["pose_timeout"]:
             raise ValueError("moving_frames和finger_frames须为整数，confidence≤1，watch_seconds须大于pose_timeout")
         for key in OPTIONS:
@@ -680,6 +998,7 @@ class WoodenManPlugin:
         topics = list(dict.fromkeys(topics))
         if len(topics) < 2:
             return {"state": "error", "message": "请连接ASR和Pose两路输入；若画布只注入一路input_topic，请在卡片配置填写asr_topic和pose_topic"}
+        topics = dialogue_topics(topics, config["host_interaction"])
         if self.process is not None and self.process.is_alive() and topics == self.topics and config == self.config:
             return self.info()
         self.stop()

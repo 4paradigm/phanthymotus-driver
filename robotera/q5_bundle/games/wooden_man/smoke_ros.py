@@ -21,17 +21,19 @@ def main(host_interaction=False):
     from rclpy.node import Node
     from std_msgs.msg import String
     from sensor_msgs.msg import CompressedImage
-    from wooden_man import DEFAULTS, HAND_NAMES
+    from wooden_man import DEFAULTS, HAND_NAMES, clean_text
     import main as driver
 
     rclpy.init()
     node = Node("wooden_man_smoke")
     asr = node.create_publisher(String, "/wooden_man_test/asr", 10)
+    background_asr = node.create_publisher(String, "/wooden_man_test/asr_background", 10)
     pose = node.create_publisher(String, "/wooden_man_test/pose", 10)
     words = []
     images = []
     hand_mode = False
     finger_delta = 0
+    registering = True
     def receive_image(msg):
         from io import BytesIO
         from PIL import Image
@@ -74,6 +76,25 @@ def main(host_interaction=False):
                 points = [[100 + i * 3 + dx, 100 + (100 if i >= 11 else 0), 0.99]
                           for i in range(17)]
                 payload = {"persons": [{"id": 1, "keypoints": points}], "image_size": [320, 320]}
+                if host_interaction:
+                    people = []
+                    for identity, x in ((1,180), (2,440), (99,720)):
+                        body = [[x,70,.99] for _ in range(17)]
+                        for i, px, py in ((5,-20,110), (6,20,110), (7,-30,155), (8,30,155),
+                                         (9,-30,200), (10,30,200), (11,-15,210), (12,15,210),
+                                         (13,-15,290), (14,15,290), (15,-15,370), (16,15,370)):
+                            body[i] = [x+px,py,.99]
+                        if registering and identity != 99:
+                            body[9][1] = 65
+                        if identity == 2:
+                            body[9][0] += dx
+                        if identity == 99:
+                            # A seated, moving background person never opts in.
+                            body[13][:2], body[14][:2] = [x+80,210], [x+105,210]
+                            body[15][:2], body[16][:2] = [x+80,290], [x+105,290]
+                            body[9][0] += int(time.monotonic()*25) % 100
+                        people.append({"id": identity, "keypoints": body})
+                    payload = {"persons": list(reversed(people)), "image_size": [1000,500]}
                 if hand_mode:
                     import math
                     jitter = math.sin(time.monotonic() * 3) * 0.02
@@ -94,12 +115,12 @@ def main(host_interaction=False):
             rclpy.spin_once(node, timeout_sec=0.04)
             time.sleep(0.02)
 
-    def speak(text):
+    def speak(text, background=False):
         msg = String()
-        msg.data = json.dumps({"text": text, "background": True, "priority": 0,
+        msg.data = json.dumps({"text": text, "background": background, "priority": 0,
                                "log_type": True, "audio_start_ts": time.time(),
                                "audio_end_ts": time.time(), "audio_duration_ms": 1200}, ensure_ascii=False)
-        asr.publish(msg)
+        (background_asr if background else asr).publish(msg)
 
     def await_phase(phase, seconds, publish_pose=False):
         deadline = time.monotonic() + seconds
@@ -121,6 +142,52 @@ def main(host_interaction=False):
         pump(2)
         assert not node.get_publishers_info_by_topic("/smoke/wooden_man/actions"), "Game must never publish robot actions"
         assert not words and plugin.info()["phase"] == "waiting"
+        if host_interaction:
+            assert "/wooden_man_test/asr_background" in plugin.info()["input_topics"]
+            speak("我们来玩木头人游戏吧", background=True)
+            pump(.3)
+            assert plugin.info()["phase"] == "waiting", "Background must not wake the game"
+
+            def wait_speech():
+                pump(max(saved["cue_seconds"], len(clean_text(words[-1]))/4)+.4, publish_pose=True)
+
+            def start_group():
+                nonlocal registering
+                registering = True
+                speak("小范小范，我们来玩一二三木头人游戏吧")
+                await_phase("rules_question", 4, publish_pose=True)
+                wait_speech()
+                speak("不需要，直接开始", background=True)
+                await_phase("player_count", 4, publish_pose=True)
+                wait_speech()
+                speak("两个人", background=True)
+                await_phase("preparing", 22, publish_pose=True)
+                assert plugin.info()["registered_players"] == 2
+                registering = False
+                await_phase("countdown", 15, publish_pose=True)
+                await_phase("watch", 12, publish_pose=True)
+
+            start_group()
+            await_phase("won", 36, publish_pose=True)
+            assert words.count("一，二，三，木头人！") == 3
+            assert plugin.info()["registered_players"] == 2
+            print("PASS: real DDS natural invitation -> background replies -> two-player registration -> three rounds; moving seated bystander ignored", flush=True)
+            wait_speech()
+            # wait_speech may have received the replay prompt; wait for it too.
+            pump(5, publish_pose=True)
+            start_group()
+            pump(.3, publish_pose=True)
+            pump(.8, dx=20, publish_pose=True)
+            info = plugin.info()
+            assert info["phase"] == "lost" and info["moved_player"] == 2 and info["moved_part"] == "left_arm", info
+            assert any("2号玩家，你的左手臂" in word for word in words)
+            assert images and not node.get_publishers_info_by_topic("/smoke/wooden_man/actions")
+            print("PASS: player 2 anatomical loss speech + multi-person JPEG highlight, no robot actions", flush=True)
+            control("reset")
+            await_phase("waiting", 2)
+            control("stop")
+            print("PASS: real HTTP multiplayer config/start/info/reset/stop", flush=True)
+            return
         speak("不要游戏开始")
         pump(0.3)
         assert plugin.info()["phase"] == "waiting"
@@ -162,13 +229,6 @@ def main(host_interaction=False):
         assert "你的左手手指动了，游戏结束。" in words, words
         assert images
         print("PASS: DDS 59-joint fingers -> anatomical speech + CompressedImage JPEG highlight", flush=True)
-
-        if host_interaction:
-            pump(.6)
-            assert "再挑战一次吗？" in words
-            speak("再来")
-            await_phase("preparing", 3, publish_pose=True)
-            print("PASS: voice-only preparation, inter-round speech and ASR replay, no motion publisher or feedback dependency", flush=True)
 
         control("reset")
         await_phase("waiting", 2)
