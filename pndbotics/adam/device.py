@@ -2671,7 +2671,7 @@ class HeadControlPlugin:
             "description": (
                 "Adam Pro 头部（左右转动/上下俯仰，2 个关节）实时位置控制，"
                 "走厂商 DDS rt/lowcmd 通道。头部装有 ZED 相机，因此本卡即"
-                "「相机指向」控制。角度单位为度(°)，限位 ±60°。可选 duration_s 放慢动作。"
+                "「相机指向」控制。角度单位为度(°)，偏航限位 ±60°、俯仰限位 ±50°。可选 duration_s 放慢动作。"
                 "前置条件：操作员已确认开发者模式、传统控制域且没有其它控制器占用低层通道。"
             ),
             "inputSchema": {
@@ -2746,11 +2746,10 @@ class ArmGesturePlugin:
 
     PREFIX = "arm_gesture"
 
-    # Semantic gestures are performances, not raw positioning: they play at a
-    # slower joint-velocity ceiling than the bare arm_control card so a salute
-    # or a welcome reads calm and deliberate instead of snapping to the pose.
-    # wave keeps the controller-wide limit (its side-to-side rhythm is meant to
-    # be quick), and a caller-chosen duration_s still clamps below this.
+    # Initial gesture transitions use 0.3 rad/s, including wave's raise.
+    # Wave's subsequent oscillation/lowering segments use the controller's
+    # 0.5 rad/s ceiling. Both paths also enforce the final per-frame bound;
+    # requesting a shorter duration cannot exceed the applicable ceiling.
     _GESTURE_VELOCITY_RAD_S = 0.3
 
     # name -> (ARM_POSES key, symmetric, default side)
