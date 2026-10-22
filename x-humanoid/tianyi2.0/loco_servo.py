@@ -13,7 +13,7 @@ import threading
 import time
 
 from common.control import ControlSink, parse_descriptor
-from slamtec_velocity import SlamtecVelocityBackend
+from slamtec_velocity import CommandLeaseExpired, SlamtecVelocityBackend
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 300
@@ -306,6 +306,13 @@ class LocoServoPlugin:
                 else:
                     self._counts["dropped" if outcome.verdict.name == "DROPPED" else "rejected"] += 1
                     self._record(outcome.verdict.name, outcome.reason)
+            except CommandLeaseExpired as exc:
+                self._counts["dropped"] += 1
+                self._hold()
+                if self._zero_pending:
+                    self._paused = True  # Preserve the stop error from _hold.
+                else:
+                    self._record("DROPPED", str(exc))
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
                 self._counts["rejected"] += 1
                 self._record("REJECTED", str(exc))
@@ -371,6 +378,8 @@ class LocoServoPlugin:
                 self._backend.write(values, self._command_deadline_ms)
             else:
                 self._backend.stop()
+        except CommandLeaseExpired:
+            raise
         except Exception as exc:
             raise RuntimeError(f"Slamware SDK write failed: {exc}") from exc
         self._counts["published"] += 1

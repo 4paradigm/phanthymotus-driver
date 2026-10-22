@@ -8,8 +8,9 @@
 #include <sstream>
 #include <string>
 
-static void reply(unsigned long seq, bool ok, unsigned long id, const std::string& text) {
-    std::cout << "MOTUS_SDK " << seq << (ok ? " OK " : " ERROR ");
+static void reply(unsigned long seq, bool ok, unsigned long id, const std::string& text,
+                  const char* failure_status = "ERROR") {
+    std::cout << "MOTUS_SDK " << seq << " " << (ok ? "OK" : failure_status) << " ";
     if (ok) std::cout << id << " " << text;
     else {
         const char* hex = "0123456789abcdef";
@@ -54,15 +55,28 @@ int main(int argc, char** argv) {
                             !std::isfinite(vx) || !std::isfinite(wz) ||
                             std::abs(vx) > max_vx || std::abs(wz) > max_wz)
                             throw std::runtime_error("invalid/out-of-range SDK velocity");
-                        auto wall = std::chrono::system_clock::now().time_since_epoch();
-                        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
-                        auto lease_ms = expiry - now_ms;
-                        if (lease_ms <= 0 || lease_ms > 300)
-                            throw std::runtime_error("expired or excessive command lease");
-                        auto deadline = VelocitySession<SlamwareAdapter>::Clock::now() +
-                                        std::chrono::milliseconds(lease_ms);
-                        if (vx == 0 && wz == 0) session.stop();
-                        else session.set(vx, wz, deadline);
+                        try {
+                            auto wall = std::chrono::system_clock::now().time_since_epoch();
+                            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
+                            auto lease_ms = expiry - now_ms;
+                            if (lease_ms <= 0)
+                                throw CommandLeaseExpired("command lease expired at worker: remaining_ms=" +
+                                                          std::to_string(lease_ms));
+                            if (lease_ms > 300)
+                                throw std::runtime_error("excessive command lease: remaining_ms=" +
+                                                         std::to_string(lease_ms) + ", limit_ms=300");
+                            auto deadline = VelocitySession<SlamwareAdapter>::Clock::now() +
+                                            std::chrono::milliseconds(lease_ms);
+                            if (vx == 0 && wz == 0) session.stop();
+                            else session.set(vx, wz, deadline);
+                        } catch (const CommandLeaseExpired& e) {
+                            // Never extend/replay an expired command. A positive
+                            // stop acknowledgement allows a later fresh command;
+                            // a failed stop escapes to the fatal path below.
+                            session.stop();
+                            reply(sequence, false, 0, e.what(), "EXPIRED");
+                            continue;
+                        }
                     } else if (verb == "STOP") {
                         if (in >> extra) throw std::runtime_error("malformed STOP");
                         session.stop();

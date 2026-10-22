@@ -3,6 +3,12 @@
 #include <chrono>
 #include <stdexcept>
 
+// Expiry is recoverable only after stop/cancel has acknowledged. Transport,
+// ownership and cancellation errors must still terminate the worker.
+struct CommandLeaseExpired : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // Independent of ROS and the SDK, so the actual lease/ownership implementation
 // can be tested with a fake chassis. The firmware heartbeat is the backup if a
 // vendor call blocks or this worker/Python dies; its resolution is seconds.
@@ -31,7 +37,7 @@ public:
         }
     }
     void set(double vx, double wz, Time deadline) {
-        if (deadline <= Clock::now()) throw std::runtime_error("command lease expired");
+        if (deadline <= Clock::now()) throw CommandLeaseExpired("command lease expired");
         deadline_ = deadline;
         if (!motion_possible_) {
             if (sdk_.busy()) throw std::runtime_error("another chassis action is active");
@@ -40,14 +46,14 @@ public:
             sdk_.start_heartbeat();
             heartbeat_ = true;
             refreshed_ = Clock::now();
-            if (deadline_ <= Clock::now()) { stop(); throw std::runtime_error("lease expired before action creation"); }
+            if (deadline_ <= Clock::now()) { stop(); throw CommandLeaseExpired("lease expired before action creation"); }
             motion_possible_ = true; // includes ambiguous begin() failures
             sdk_.begin();
         }
         sdk_.verify_owned();
-        if (deadline_ <= Clock::now()) { stop(); throw std::runtime_error("lease expired before velocity write"); }
+        if (deadline_ <= Clock::now()) { stop(); throw CommandLeaseExpired("lease expired before velocity write"); }
         sdk_.set(vx, wz);
-        if (deadline_ <= Clock::now()) { stop(); throw std::runtime_error("lease expired during SDK write"); }
+        if (deadline_ <= Clock::now()) { stop(); throw CommandLeaseExpired("lease expired during SDK write"); }
     }
     void tick(Time now) {
         if (!motion_possible_) return;

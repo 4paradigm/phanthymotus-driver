@@ -196,6 +196,18 @@ checked on hardware. On an ambiguous failure, handover waits 1.5 seconds for
 that firmware lease before another card is permitted to act. A faulted worker
 requires explicit stop/start; it does not automatically regain control.
 
+An expired command is dropped without extending its TTL or replaying it. The
+native worker reports `EXPIRED` only after its stop/cancel succeeds; in that
+case the card resets its output/ramp and can accept a subsequent fresh command
+without restarting the worker. A failed stop, transport/ownership error, or a
+lease over 300ms still follows the fatal pause/firmware-handover path. Expiry
+before IPC also requires a confirmed stop before the next motion is accepted.
+`backend.expired_commands`, `last_expired_error`, and `last_write` distinguish
+expiry from faults and expose the lease remaining before IPC and the latest
+write round-trip time. These timings diagnose latency; they do not establish
+the physical stopping time. Expiry and excessive-lease errors are now separate,
+with remaining milliseconds reported for the native ingress check.
+
 Acceleration caps remain 0.3 m/s² and 0.6 rad/s². Explicit zero, pause, stop,
 lease expiration and watchdog stop bypass the ramp. Cancelling an SDK action
 addresses only this worker's held action handle. Before beginning or updating

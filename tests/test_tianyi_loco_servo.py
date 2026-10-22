@@ -34,6 +34,10 @@ class Twist:
         self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
 
 
+class CommandLeaseExpired(ValueError):
+    pass
+
+
 class FakeBackend:
     def __init__(self, config=None):
         self.messages = []
@@ -116,6 +120,7 @@ def setup(monkeypatch):
         monkeypatch.setitem(sys.modules, name, mod)
     backend_mod = types.ModuleType("slamtec_velocity")
     backend_mod.SlamtecVelocityBackend = FakeBackend
+    backend_mod.CommandLeaseExpired = CommandLeaseExpired
     monkeypatch.setitem(sys.modules, "slamtec_velocity", backend_mod)
     spec = importlib.util.spec_from_file_location("tianyi_loco_servo_test", DRIVER / "loco_servo.py")
     module = importlib.util.module_from_spec(spec)
@@ -337,6 +342,56 @@ def test_publish_error_is_visible_and_pauses_instead_of_counting_success(setup):
     plugin._backend.fail = False
     plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
+
+
+def test_native_expiry_stops_without_latching_and_accepts_only_a_fresh_command(setup, monkeypatch):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    backend = plugin._backend
+    original_write = backend.write
+    setup.clock.advance()
+    expired = command(setup, seq=2)
+    with monkeypatch.context() as patch:
+        def expire(*args):
+            raise CommandLeaseExpired("command lease expired at worker: remaining_ms=-12")
+        patch.setattr(backend, "write", expire)
+        send(plugin, expired)
+    info = plugin._info()
+    assert info["state"] == "running"
+    assert info["counts"]["dropped"] == 1
+    assert info["counts"]["accepted"] == 1
+    assert info["counts"]["publish_errors"] == 0
+    assert info["last"]["verdict"] == "DROPPED"
+    assert "remaining_ms=-12" in info["last"]["reason"]
+    assert backend.messages[-1] == [0] * 6
+    assert info["output"] == [0] * 6
+    assert plugin._last_valid_at is None and plugin._lease_expiry_ms == 0
+    # Retrying the same sequence cannot replay the rejected motion.
+    setup.clock.advance()
+    before = len(backend.messages)
+    send(plugin, expired)
+    assert len(backend.messages) == before
+    fresh = command(setup, seq=3, ttl_ms=120)
+    send(plugin, fresh)
+    assert backend.write == original_write
+    assert backend.messages[-1] == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
+    assert backend.deadlines[-1] == fresh["stamp_ms"] + 120
+    assert plugin._counts["accepted"] == 2
+
+
+def test_expiry_with_failed_stop_still_pauses_and_refuses_handover(setup, monkeypatch):
+    plugin = start(setup)
+    def expire(*args):
+        raise CommandLeaseExpired("command lease expired")
+    monkeypatch.setattr(plugin._backend, "write", expire)
+    plugin._backend.fail = True
+    send(plugin, command(setup))
+    assert plugin._info()["state"] == "paused"
+    assert plugin._zero_pending
+    assert plugin._counts["publish_errors"] > 0
+    assert plugin.pause_for_explicit_command("home.go_home") is False
+    assert not plugin._yielded
+    plugin._backend.fail = False
 
 
 def test_partial_open_failure_cleans_nodes(setup, monkeypatch):

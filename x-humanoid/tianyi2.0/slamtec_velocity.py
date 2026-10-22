@@ -15,6 +15,10 @@ import threading
 import time
 
 
+class CommandLeaseExpired(ValueError):
+    """Stale command dropped; native EXPIRED replies confirm the session stopped."""
+
+
 class SlamtecVelocityBackend:
     def __init__(self, config):
         self._config = dict(config)
@@ -26,6 +30,9 @@ class SlamtecVelocityBackend:
         self._armed = False
         self._unsafe_until = 0.0
         self._error = ""
+        self._expired_commands = 0
+        self._last_expired_error = ""
+        self._last_write = None
         self._action_id = 0
         self._state = "disconnected"
         self._timeout = float(config.get("sdk_reply_timeout", 0.25))
@@ -73,6 +80,8 @@ class SlamtecVelocityBackend:
                     raise RuntimeError("SDK reply sequence mismatch")
                 if fields[2] != "OK":
                     message = bytes.fromhex(fields[3]).decode("utf-8", "replace")
+                    if fields[2] == "EXPIRED":
+                        raise CommandLeaseExpired(message)
                     raise RuntimeError(message)
                 self._action_id = int(fields[3])
                 self._state = fields[4] if len(fields) > 4 else "ready"
@@ -100,6 +109,16 @@ class SlamtecVelocityBackend:
             data = f"{self._sequence} {command}\n".encode("ascii")
             self._process.stdin.write(data)
             self._reply(self._sequence, self._timeout)
+        except CommandLeaseExpired as exc:
+            if not command.startswith("SET "):
+                self._fail("unexpected EXPIRED reply to non-velocity request")
+            # The native worker sends this only after stop/cancel succeeds.
+            self._armed = False
+            self._action_id = 0
+            self._state = "ready"
+            self._expired_commands += 1
+            self._last_expired_error = str(exc)
+            raise
         except Exception as exc:
             self._fail(str(exc))
 
@@ -111,11 +130,19 @@ class SlamtecVelocityBackend:
                 raise ValueError("SDK adapter supports vx/wz only")
             if not any(values):
                 return self.stop()
-            if deadline_ms <= time.time() * 1000:
-                raise ValueError("SDK command lease expired")
+            remaining = deadline_ms - int(time.time() * 1000)
+            self._last_write = {"lease_remaining_ms": remaining, "round_trip_ms": None}
+            if remaining <= 0:
+                self._expired_commands += 1
+                self._last_expired_error = f"SDK command lease expired before IPC: remaining_ms={remaining}"
+                raise CommandLeaseExpired(self._last_expired_error)
             # Even an unacknowledged first write might have reached the chassis.
             self._armed = True
-            self._request(f"SET {int(deadline_ms)} {values[0]:.17g} {values[5]:.17g}")
+            started = time.monotonic()
+            try:
+                self._request(f"SET {int(deadline_ms)} {values[0]:.17g} {values[5]:.17g}")
+            finally:
+                self._last_write["round_trip_ms"] = round((time.monotonic() - started) * 1000, 1)
 
     def stop(self):
         with self._lock:
@@ -161,5 +188,8 @@ class SlamtecVelocityBackend:
                     "connected": alive and not self._faulted,
                     "state": self._state if alive or self._faulted else "disconnected",
                     "action_id": self._action_id, "error": self._error,
+                    "expired_commands": self._expired_commands,
+                    "last_expired_error": self._last_expired_error,
+                    "last_write": dict(self._last_write) if self._last_write is not None else None,
                     "firmware_heartbeat_timeout_s": 1,
                     "handover_wait_ms": max(0, int((self._unsafe_until - time.monotonic()) * 1000))}

@@ -33,6 +33,12 @@ for line in sys.stdin:
     if mode == "error" and verb == "SET":
         print("MOTUS_SDK "+seq+" ERROR "+b"localization quality too low".hex(),flush=True)
         sys.exit(1)
+    if mode == "expired" and verb == "SET" and seq == "1":
+        print("MOTUS_SDK "+seq+" EXPIRED "+b"command lease expired at worker: remaining_ms=-12".hex(),flush=True)
+        continue
+    if mode == "expired_stop" and verb == "STOP":
+        print("MOTUS_SDK "+seq+" EXPIRED "+b"unexpected stop reply".hex(),flush=True)
+        continue
     if mode == "wrong_sequence":
         seq=str(int(seq)+1)
     if mode == "dead":
@@ -112,6 +118,37 @@ def test_blocked_sdk_call_is_killed_without_a_command_queue(backend):
     with pytest.raises(RuntimeError):
         write(worker)
     assert worker._process.pid == pid
+
+
+def test_expired_ack_preserves_connection_but_never_replays_old_velocity(backend):
+    worker = backend("expired")
+    worker.connect()
+    pid = worker._process.pid
+    with pytest.raises(backend_module.CommandLeaseExpired, match="remaining_ms=-12"):
+        write(worker)
+    info = worker.info()
+    assert info["connected"] and info["state"] == "ready"
+    assert info["error"] == "" and info["action_id"] == 0
+    assert info["expired_commands"] == 1
+    assert "remaining_ms=-12" in info["last_expired_error"]
+    assert 0 < info["last_write"]["lease_remaining_ms"] <= 200
+    assert info["last_write"]["round_trip_ms"] is not None
+    assert not worker._armed and worker._sequence == 1
+    worker.stop()
+    assert worker._sequence == 2 and worker._process.pid == pid
+    write(worker)  # Only this new call may start another velocity action.
+    assert worker.info()["action_id"] == 17
+    assert worker._sequence == 3 and worker._process.pid == pid
+
+
+def test_expired_status_cannot_be_used_as_a_stop_acknowledgement(backend):
+    worker = backend("expired_stop")
+    worker.connect()
+    write(worker)
+    with pytest.raises(RuntimeError, match="unexpected EXPIRED"):
+        worker.stop()
+    assert not worker.info()["connected"]
+    assert worker.info()["handover_wait_ms"] > 0
 
 
 def test_dead_worker_requires_firmware_lease_to_expire_before_handover(backend, monkeypatch):
