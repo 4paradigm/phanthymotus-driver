@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import types
 import unittest
+from unittest import mock
 
 
 class RepeatedScalarContainer:
@@ -34,6 +35,21 @@ class GrpcStateJsonTests(unittest.TestCase):
         self.assertEqual(['STAND_WALK', 'MULTI_AGENT'], result['switchable_states'])
         self.assertEqual(['SetMotion'], result['available_actions'])
         self.assertTrue(result['success'])
+
+
+    def test_control_state_read_uses_a_per_call_bounded_timeout(self):
+        source = ast.parse(Path(__file__).with_name('grpc_client.py').read_text())
+        cls = next(n for n in source.body if isinstance(n, ast.ClassDef)
+                   and n.name == 'AdamGrpcClient')
+        scope = {'pb2': types.SimpleNamespace(GetControlStateRequest=lambda: None)}
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), 'grpc_client.py', 'exec'), scope)
+        client = scope['AdamGrpcClient'].__new__(scope['AdamGrpcClient'])
+        client._timeout = 5
+        read = mock.Mock(return_value=types.SimpleNamespace(success=True, domain_id=0))
+        client._stub = types.SimpleNamespace(GetControlState=read)
+        self.assertEqual(0, client.get_control_state(timeout=0.2)['domain_id'])
+        read.assert_called_once_with(None, timeout=0.2)
+        self.assertEqual(5, client._timeout)
 
 
 if __name__ == '__main__':

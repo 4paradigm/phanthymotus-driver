@@ -40,10 +40,10 @@ class AdamGrpcClient:
         if self._stub is None:
             self.connect()
 
-    def _call(self, method, request):
+    def _call(self, method, request, timeout=None):
         self._ensure_connected()
         try:
-            return getattr(self._stub, method)(request, timeout=self._timeout)
+            return getattr(self._stub, method)(request, timeout=self._timeout if timeout is None else timeout)
         except grpc.RpcError as exc:
             return self._rpc_error(exc)
 
@@ -193,9 +193,9 @@ class AdamGrpcClient:
             "SetControlMode", pb2.SetControlModeRequest(domain_id=domain_id))
         return self._response(response)
 
-    def get_control_state(self) -> dict:
+    def get_control_state(self, timeout=None) -> dict:
         response = self._call(
-            "GetControlState", pb2.GetControlStateRequest())
+            "GetControlState", pb2.GetControlStateRequest(), timeout=timeout)
         result = self._response(response, ("domain_id",))
         if not result.get("success", False):
             result.setdefault("code", "CONTROL_STATE_UNAVAILABLE")

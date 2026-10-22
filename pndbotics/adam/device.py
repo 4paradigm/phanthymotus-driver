@@ -449,19 +449,21 @@ ROS2_UPPER_BODY_JOINTS = [
 ]
 
 # Human-facing Adam Pro upper-body controls. Limits come from the vendor's
-# product overview, converted from radians to degrees. The card deliberately
+# installed Adam Pro service firmware limits (2026-10-22), rounded inward.
+# The old product overview permits shoulder pitch targets below this firmware
+# limit and must not be used as the command safety envelope. The card deliberately
 # uses stable semantic ids rather than leaking ROS topic/joint names.
 ARM_JOINT_CONTROLS = {
-    "left_shoulder_pitch": ("左肩前后摆", "shoulderPitch_Left", -207.0, 117.0),
-    "right_shoulder_pitch": ("右肩前后摆", "shoulderPitch_Right", -207.0, 117.0),
-    "left_shoulder_roll": ("左肩向内/外摆", "shoulderRoll_Left", -36.0, 160.0),
-    "right_shoulder_roll": ("右肩向内/外摆", "shoulderRoll_Right", -160.0, 36.0),
-    "left_shoulder_yaw": ("左上臂旋转", "shoulderYaw_Left", -148.0, 148.0),
-    "right_shoulder_yaw": ("右上臂旋转", "shoulderYaw_Right", -148.0, 148.0),
-    "left_elbow": ("左肘弯曲", "elbow_Left", -143.0, 12.0),
-    "right_elbow": ("右肘弯曲", "elbow_Right", -143.0, 12.0),
-    "left_wrist_yaw": ("左手腕旋转", "wristYaw_Left", -153.0, 153.0),
-    "right_wrist_yaw": ("右手腕旋转", "wristYaw_Right", -153.0, 153.0),
+    "left_shoulder_pitch": ("左肩前后摆", "shoulderPitch_Left", -59.0, 116.0),
+    "right_shoulder_pitch": ("右肩前后摆", "shoulderPitch_Right", -59.0, 116.0),
+    "left_shoulder_roll": ("左肩向内/外摆", "shoulderRoll_Left", -35.0, 160.0),
+    "right_shoulder_roll": ("右肩向内/外摆", "shoulderRoll_Right", -160.0, 35.0),
+    "left_shoulder_yaw": ("左上臂旋转", "shoulderYaw_Left", -147.0, 147.0),
+    "right_shoulder_yaw": ("右上臂旋转", "shoulderYaw_Right", -147.0, 147.0),
+    "left_elbow": ("左肘弯曲", "elbow_Left", -143.0, 11.9),
+    "right_elbow": ("右肘弯曲", "elbow_Right", -143.0, 11.9),
+    "left_wrist_yaw": ("左手腕旋转", "wristYaw_Left", -152.0, 152.0),
+    "right_wrist_yaw": ("右手腕旋转", "wristYaw_Right", -152.0, 152.0),
     "left_wrist_pitch": ("左手腕俯仰", "wristPitch_Left", -55.0, 55.0),
     "right_wrist_pitch": ("右手腕俯仰", "wristPitch_Right", -55.0, 55.0),
     "left_wrist_roll": ("左手腕侧摆", "wristRoll_Left", -55.0, 55.0),
@@ -479,8 +481,8 @@ ARM_POSES = {
         "left_shoulder_roll": 35.0, "right_shoulder_roll": -35.0,
         "left_elbow": -25.0, "right_elbow": -25.0,
     }),
-    "hands_up": ("双手举起", {
-        "left_shoulder_pitch": -95.0, "right_shoulder_pitch": -95.0,
+    "hands_up": ("双臂屈肘抬起", {
+        "left_shoulder_pitch": -45.0, "right_shoulder_pitch": -45.0,
         "left_elbow": -30.0, "right_elbow": -30.0,
     }),
     # One-armed poses are written on the right side only.  A caller that asks
@@ -492,12 +494,12 @@ ARM_POSES = {
     # the head.  Keep the upper arm at ~90° forward and fold the elbow to ~90°,
     # which leaves the hand beside the temple while the elbow stays clear.
     "salute": ("单手敬礼（抬臂至额角）", {
-        "right_shoulder_pitch": -80.0, "right_shoulder_roll": -32.0,
+        "right_shoulder_pitch": -45.0, "right_shoulder_roll": -32.0,
         "right_shoulder_yaw": -28.0, "right_elbow": -88.0,
         "right_wrist_pitch": 10.0, "right_wrist_roll": -5.0,
     }),
     "arm_forward_high": ("单手肩高前伸（击掌预备）", {
-        "right_shoulder_pitch": -75.0, "right_shoulder_roll": -8.0,
+        "right_shoulder_pitch": -45.0, "right_shoulder_roll": -8.0,
         "right_elbow": -20.0, "right_wrist_pitch": 15.0,
     }),
     "handshake_ready": ("单手屈肘前伸（握手预备）", {
@@ -505,15 +507,15 @@ ARM_POSES = {
         "right_shoulder_yaw": -15.0, "right_elbow": -80.0,
     }),
     "wave_ready": ("屈肘上抬（挥手起势）", {
-        "right_shoulder_pitch": -85.0, "right_shoulder_roll": -18.0,
+        "right_shoulder_pitch": -45.0, "right_shoulder_roll": -18.0,
         "right_elbow": -55.0, "right_wrist_pitch": 10.0,
     }),
     "wave_out": ("挥手外摆", {
-        "right_shoulder_pitch": -85.0, "right_shoulder_roll": -48.0,
+        "right_shoulder_pitch": -45.0, "right_shoulder_roll": -48.0,
         "right_elbow": -45.0, "right_wrist_pitch": 10.0,
     }),
     "wave_in": ("挥手内摆", {
-        "right_shoulder_pitch": -85.0, "right_shoulder_roll": 12.0,
+        "right_shoulder_pitch": -45.0, "right_shoulder_roll": 12.0,
         "right_elbow": -65.0, "right_wrist_pitch": 10.0,
     }),
 }
@@ -525,8 +527,8 @@ ARM_ACTIONS = {f"set_{control}": control for control in ARM_JOINT_CONTROLS}
 # having to know those joints live in the arm controller.  All three cards
 # still share the single safe rt/lowcmd owner below.
 WAIST_JOINT_CONTROLS = {
-    "roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
-    "pitch": ("腰部前后俯仰", "waistPitch", -48.0, 78.0),
+    "roll": ("腰部侧倾", "waistRoll", -15.0, 15.0),
+    "pitch": ("腰部前后俯仰", "waistPitch", -37.0, 77.0),
     "yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
 }
 
@@ -534,7 +536,7 @@ WAIST_JOINT_CONTROLS = {
 # "camera aiming" card.  Vendor limits are ±60° for both axes.
 HEAD_JOINT_CONTROLS = {
     "yaw": ("头部左右转动", "neckYaw", -60.0, 60.0),
-    "pitch": ("头部上下俯仰", "neckPitch", -60.0, 60.0),
+    "pitch": ("头部上下俯仰", "neckPitch", -50.0, 50.0),
 }
 
 WAIST_ACTIONS = {f"set_{control}": control for control in WAIST_JOINT_CONTROLS}
@@ -1490,6 +1492,7 @@ class ArmControlPlugin:
     PREFIX = "arm"
     _DOF = 31
     _RATE_HZ = 50.0
+    _OWNERSHIP_TIMEOUT_S = 0.5
     _MAX_VELOCITY_RAD_S = 0.5
     _DEFAULT_TRANSITION_SECONDS = 2.0
     _RELEASE_SECONDS = 1.5
@@ -1498,7 +1501,8 @@ class ArmControlPlugin:
     # distance / _MAX_VELOCITY_RAD_S therefore passes 1.875x the configured
     # limit at its midpoint, so the duration must budget for the peak.
     _EASE_PEAK_RATE = 1.875
-    # Official arm_control_config.json gains. LowCmd owns all 31 motors, so
+    # Retain the mainline gain profile; do not substitute a different SDK's
+    # gains while diagnosing a hardware fault. LowCmd owns all 31 motors, so
     # non-arm joints must also be held with their vendor gains while an arm
     # command is active; zero gains there causes intermittent posture loss.
     _JOINT_PD = {
@@ -1521,6 +1525,11 @@ class ArmControlPlugin:
             raise ValueError(
                 "arm_control currently supports only Adam Pro's 31-DOF lowcmd layout")
         self._namespace = namespace
+        self._grpc = grpc_client
+        self._owner_thread = None
+        self._owner_checked_at = None
+        self._fault_code = "LOWSTATE_UNAVAILABLE"
+        self._segment_velocity_limit = self._MAX_VELOCITY_RAD_S
         self._publisher = dds_lowcmd_pub
         self._lowstate_sub = dds_arm_lowstate_sub
         self._rate_hz = float(plugin_config.get("control_rate_hz", self._RATE_HZ))
@@ -1656,6 +1665,7 @@ class ArmControlPlugin:
                 return
             self._feedback_error = message
             self._last_error = message
+            logging.getLogger(__name__).error("Adam upper-body feedback fault: %s", message)
             now = time.monotonic()
             if self._active or self._streaming:
                 frozen = list(self._last_command_q or self._seg_current)
@@ -1670,46 +1680,79 @@ class ArmControlPlugin:
     def _poll_feedback(self):
         if self._feedback_error is not None or self._lowstate_sub is None:
             return
+        positions = None
         try:
-            state = None
-            # Drain queued feedback so an old backlog cannot masquerade as a
-            # live stream while commands keep progressing.
+            # Drain to the newest sample, but validate every frame: a fault
+            # followed by a good sample must still latch and cancel the move.
             for _ in range(256):
-                # CycloneDDS take_iter treats timeout=0 as an infinite wait.
-                # A positive microsecond timeout keeps an empty read bounded.
-                latest = self._lowstate_sub.Read(timeout=1e-6)
-                if latest is None:
+                # CycloneDDS treats zero timeout as an infinite wait.
+                sample = self._lowstate_sub.Read(timeout=1e-6)
+                if sample is None:
                     break
-                state = latest
+                motors = getattr(sample, "motor_state", None)
+                if motors is None or len(motors) < self._DOF:
+                    self._fail_feedback("rt/lowstate has fewer than 31 motors")
+                    return
+                faults = [{"joint": ADAM_PRO_JOINTS[i], "index": i,
+                           "state": getattr(motors[i], "state", None)}
+                          for i in range(self._DOF)
+                          if getattr(motors[i], "state", 0) != 0]
+                positions = [float(m.q) for m in motors[:self._DOF]]
+                invalid = (not all(math.isfinite(q) for q in positions)
+                           or any(not math.isfinite(float(getattr(m, "dq", 0.0)))
+                                  for m in motors[:self._DOF]))
+                if faults or invalid:
+                    self._fail_feedback("rt/lowstate has invalid motor feedback: " + json.dumps(faults))
+                    return
             else:
                 self._fail_feedback("rt/lowstate backlog did not drain")
                 return
         except Exception as exc:
             self._fail_feedback(f"rt/lowstate read failed: {exc}")
             return
-        if state is not None:
-            motors = getattr(state, "motor_state", None)
-            if motors is None or len(motors) < self._DOF:
-                self._fail_feedback("rt/lowstate has fewer than 31 motors")
-                return
-            try:
-                invalid = any(
-                    getattr(motors[index], "state", 0) != 0
-                    or not math.isfinite(float(motors[index].q))
-                    or not math.isfinite(float(getattr(motors[index], "dq", 0.0)))
-                    for index in range(self._DOF))
-            except (TypeError, ValueError, AttributeError, OverflowError):
-                invalid = True
-            if invalid:
-                self._fail_feedback("rt/lowstate has invalid motor feedback")
-                return
+        if positions is not None:
             with self._lock:
+                self._current_q = positions
                 self._last_feedback_at = time.monotonic()
         with self._lock:
             last_feedback_at = self._last_feedback_at
         if (last_feedback_at is not None
                 and time.monotonic() - last_feedback_at > self._feedback_timeout_s):
             self._fail_feedback("rt/lowstate feedback timed out")
+
+    def _verify_control_ownership(self):
+        try:
+            state = (self._grpc.get_control_state(timeout=0.2)
+                     if self._grpc is not None else {})
+        except Exception:
+            state = {}
+        if not isinstance(state, dict) or not state.get("success") or state.get("domain_id") != 0:
+            return {"success": False, "code": "CONTROL_CONFLICT",
+                    "message": "未确认低层独占控制：须先由操作员退出 RL 控制并确认开发者模式，驱动不会自动切换模式"}
+        with self._lock:
+            self._owner_checked_at = time.monotonic()
+        return None
+
+    def _lose_control_ownership(self, message):
+        with self._lock:
+            self._fault_code = "CONTROL_CONFLICT"
+            self._feedback_error = self._last_error = message
+            self._command_generation += 1
+            self._active = self._streaming = False
+            self._release_started_at = None
+            self._target_q.clear()
+            self._seg_start.clear()
+        # Do not ramp gains into a new owner's stream; cease publishing.
+        logging.getLogger(__name__).error("Adam upper-body ownership fault: %s", message)
+
+    def _monitor_control_ownership(self):
+        while not self._stop_event.wait(0.1):
+            with self._lock:
+                publishing = self._active or self._streaming
+            if publishing:
+                error = self._verify_control_ownership()
+                if error:
+                    self._lose_control_ownership(error["message"])
 
     @classmethod
     def _ease(cls, progress: float) -> float:
@@ -1767,7 +1810,16 @@ class ArmControlPlugin:
             # gesture eases over several seconds — and retargeting mid-motion
             # starts from the current output rather than jumping back to the
             # old start.
+            if (self._owner_checked_at is None or
+                    now - self._owner_checked_at > self._OWNERSHIP_TIMEOUT_S):
+                self._lose_control_ownership("控制权反馈已过期，停止低层发布")
+                return
             current_q = self._sample_segment(now)
+            max_step = self._segment_velocity_limit * max(0.0, min(dt, 1.0 / self._rate_hz))
+            previous_q = self._last_command_q or self._seg_current
+            for index in targets:
+                current_q[index] = max(previous_q[index] - max_step,
+                                       min(previous_q[index] + max_step, current_q[index]))
             self._seg_current = list(current_q)
 
         try:
@@ -1857,19 +1909,14 @@ class ArmControlPlugin:
             for action, title in self._GROUP_TITLES.items()
         ]
         action_options.append({"const": "reset", "title": "回到起始手臂角度"})
-        side_ranges = {
-            side: {
-                "pitch_deg": (-207.0, 117.0, "前后摆"),
-                "roll_deg": ((-36.0, 160.0, "向内/外摆") if side == "left"
-                             else (-160.0, 36.0, "向内/外摆")),
-                "yaw_deg": (-148.0, 148.0, "上臂旋转"),
-                "bend_deg": (-143.0, 12.0, "肘部弯曲"),
-                "wrist_yaw_deg": (-153.0, 153.0, "手腕旋转"),
-                "wrist_pitch_deg": (-55.0, 55.0, "手腕俯仰"),
-                "wrist_roll_deg": (-55.0, 55.0, "手腕侧摆"),
-            }
-            for side in ("left", "right")
-        }
+        side_ranges = {"left": {}, "right": {}}
+        for side in ("left", "right"):
+            for field, kind in (("pitch_deg", "shoulder_pitch"), ("roll_deg", "shoulder_roll"),
+                                ("yaw_deg", "shoulder_yaw"), ("bend_deg", "elbow"),
+                                ("wrist_yaw_deg", "wrist_yaw"), ("wrist_pitch_deg", "wrist_pitch"),
+                                ("wrist_roll_deg", "wrist_roll")):
+                label, _, lower, upper = ARM_JOINT_CONTROLS[f"{side}_{kind}"]
+                side_ranges[side][field] = (lower, upper, label)
         side_field_kinds = {
             "shoulder_pitch": "pitch_deg", "shoulder_roll": "roll_deg",
             "shoulder_yaw": "yaw_deg",
@@ -1944,7 +1991,7 @@ class ArmControlPlugin:
                 f"关节限位见各字段 minimum/maximum。"
                 "通过 set_shoulder/set_elbow/set_wrist 选择部位，再设置该部位的一个或多个角度。"
                 "可选 duration_s 放慢动作，加速请求会被限速自动钳位。"
-                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道；"
+                "前置条件：操作员已确认开发者模式、传统控制域且没有其它控制器占用低层通道；"
                 "执行前确认手臂活动范围内无人和障碍物。stop 会先按厂商顺序释放增益再停止下发。"
             ),
             "inputSchema": {
@@ -1978,11 +2025,17 @@ class ArmControlPlugin:
                     self._lowstate_error = None
                     self._feedback_error = None
                     self._last_feedback_at = None
+                    self._fault_code = "LOWSTATE_UNAVAILABLE"
+                    self._owner_checked_at = None
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="adam_arm_lowcmd")
             self._has_started = True
             self._thread.start()
+            self._owner_thread = threading.Thread(
+                target=self._monitor_control_ownership, daemon=True,
+                name="adam_arm_ownership")
+            self._owner_thread.start()
 
     def stop(self):
         return self._stop_and_wait()
@@ -2008,6 +2061,9 @@ class ArmControlPlugin:
         if thread is not None and thread is not threading.current_thread():
             thread.join(1.0)
         self._thread = None
+        if self._owner_thread is not None and self._owner_thread is not threading.current_thread():
+            self._owner_thread.join(0.5)
+        self._owner_thread = None
         with self._lock:
             self._streaming = False
             self._active = False
@@ -2026,7 +2082,7 @@ class ArmControlPlugin:
                 and time.monotonic() - self._last_feedback_at > self._feedback_timeout_s):
             self._fail_feedback("rt/lowstate feedback timed out")
         if self._feedback_error is not None:
-            return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+            return {"success": False, "code": self._fault_code,
                     "message": self._feedback_error}
         if not self._state_ready.is_set():
             message = self._lowstate_error or "waiting for a complete rt/lowstate sample"
@@ -2061,6 +2117,17 @@ class ArmControlPlugin:
             # silent freeze to the caller.  Refuse instead.
             return {"success": False, "code": "INVALID_ARGUMENT",
                     "message": "no upper-body joints were selected"}
+        bounds = {entry[1]: (math.radians(entry[2]), math.radians(entry[3]))
+                  for table in (ARM_JOINT_CONTROLS, WAIST_JOINT_CONTROLS, HEAD_JOINT_CONTROLS)
+                  for entry in table.values()}
+        for name, value in targets.items():
+            if (name not in bounds or not math.isfinite(value)
+                    or not bounds[name][0] <= value <= bounds[name][1]):
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": f"目标超出厂商固件限位: {name}"}
+        error = self._verify_control_ownership()
+        if error:
+            return error
         with self._lock:
             if self._release_started_at is not None or self._stop_event.is_set():
                 return {"success": False, "code": "CONTROL_STOPPING",
@@ -2073,7 +2140,16 @@ class ArmControlPlugin:
                 return {"success": False, "code": "COMMAND_SUPERSEDED",
                         "message": "upper-body command was superseded"}
             now = time.monotonic()
-            self._seg_current = self._sample_segment(now)
+            if not (self._active or self._streaming):
+                # Capture a fresh full-body hold at takeover, not minutes ago
+                # when the driver was started in a different posture.
+                self._hold_q = list(self._current_q)
+                self._last_command_q = list(self._current_q)
+                self._seg_current = list(self._current_q)
+                self._target_q.clear()
+                self._seg_start.clear()
+            else:
+                self._seg_current = list(self._last_command_q or self._seg_current)
             if (expected_generation is None
                     and self._gesture_generation == self._command_generation):
                 # Cancelling a gesture freezes its previous joints; a head or
@@ -2109,7 +2185,8 @@ class ArmControlPlugin:
             # existing rhythm.
             limit = (velocity_limit if velocity_limit is not None
                      else self._MAX_VELOCITY_RAD_S)
-            peak_span = (self._EASE_PEAK_RATE * max_distance / limit)
+            self._segment_velocity_limit = min(limit, self._MAX_VELOCITY_RAD_S)
+            peak_span = (self._EASE_PEAK_RATE * max_distance / self._segment_velocity_limit)
             if preferred_span is None:
                 self._seg_span = max(
                     0.25, peak_span,
@@ -2148,7 +2225,7 @@ class ArmControlPlugin:
             with self._lock:
                 last_error = self._last_error
                 if self._feedback_error is not None:
-                    return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                    return {"success": False, "code": self._fault_code,
                             "message": self._feedback_error}
                 if last_error:
                     break
@@ -2161,7 +2238,7 @@ class ArmControlPlugin:
         with self._lock:
             last_error = self._last_error
             if self._feedback_error is not None:
-                return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                return {"success": False, "code": self._fault_code,
                         "message": self._feedback_error}
         return {"success": False, "code": "DDS_WRITE_FAILED",
                 "message": last_error or "rt/lowcmd target was not written"}
@@ -2186,6 +2263,10 @@ class ArmControlPlugin:
                 self._active = False
                 self._streaming = False
             self._command_generation += 1
+
+    def _reset_reference(self):
+        with self._lock:
+            return list(self._hold_q if self._active or self._streaming else self._current_q)
 
     def _preferred_span(self, args: dict) -> tuple[float | None, dict | None]:
         """Parse the optional ``duration_s`` request into a target span.
@@ -2305,7 +2386,7 @@ class ArmControlPlugin:
                 return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
                         "message": "No startup arm pose captured yet"}
             targets = {
-                joint: self._hold_q[self._joint_index(joint)]
+                joint: self._reset_reference()[self._joint_index(joint)]
                 for _, joint, _, _ in ARM_JOINT_CONTROLS.values()
             }
             span, span_error = self._preferred_span(args)
@@ -2392,7 +2473,7 @@ class ArmControlPlugin:
                 targets = dict(_arm_target_radians(control, degrees)
                                for control, degrees in targets_deg.items())
                 if pose == "neutral":
-                    targets = {joint: self._hold_q[self._joint_index(joint)]
+                    targets = {joint: self._reset_reference()[self._joint_index(joint)]
                                for _, joint, _, _ in ARM_JOINT_CONTROLS.values()}
             except (TypeError, ValueError) as exc:
                 return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
@@ -2474,7 +2555,7 @@ class WaistControlPlugin:
             "description": (
                 "Adam Pro 腰部（侧倾/前后俯仰/左右转动，3 个关节）实时位置控制，"
                 "走厂商 DDS rt/lowcmd 通道。角度单位为度(°)。可选 duration_s 放慢动作。"
-                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道。"
+                "前置条件：操作员已确认开发者模式、传统控制域且没有其它控制器占用低层通道。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -2501,7 +2582,7 @@ class WaistControlPlugin:
             if error:
                 return error
             targets = {
-                joint: self._control._hold_q[self._control._joint_index(joint)]
+                joint: self._control._reset_reference()[self._control._joint_index(joint)]
                 for _, joint, _, _ in WAIST_JOINT_CONTROLS.values()
             }
             span, span_error = self._control._preferred_span(args)
@@ -2591,7 +2672,7 @@ class HeadControlPlugin:
                 "Adam Pro 头部（左右转动/上下俯仰，2 个关节）实时位置控制，"
                 "走厂商 DDS rt/lowcmd 通道。头部装有 ZED 相机，因此本卡即"
                 "「相机指向」控制。角度单位为度(°)，限位 ±60°。可选 duration_s 放慢动作。"
-                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道。"
+                "前置条件：操作员已确认开发者模式、传统控制域且没有其它控制器占用低层通道。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -2618,7 +2699,7 @@ class HeadControlPlugin:
             if error:
                 return error
             targets = {
-                joint: self._control._hold_q[self._control._joint_index(joint)]
+                joint: self._control._reset_reference()[self._control._joint_index(joint)]
                 for _, joint, _, _ in HEAD_JOINT_CONTROLS.values()
             }
             span, span_error = self._control._preferred_span(args)
@@ -2726,7 +2807,7 @@ class ArmGesturePlugin:
             if self._control._hold_q is None:
                 raise ValueError("No startup arm pose captured yet")
             selected = {
-                control: self._control._hold_q[
+                control: self._control._reset_reference()[
                     self._control._joint_index(details[1])]
                 for control, details in ARM_JOINT_CONTROLS.items()
                 if side == "both" or control.startswith(f"{side}_")
@@ -2755,7 +2836,7 @@ class ArmGesturePlugin:
                     "action": {"type": "string", "enum": [*self._GESTURES, "stop", "info"],
                         "oneOf": [{"const": k, "title": v} for k, v in (
                             ("wave", "挥手（抬手、摆动、放下）"), ("salute", "敬礼"),
-                            ("reset", "回到启动时手臂姿态"), ("stop", "取消并释放上肢控制"),
+                            ("reset", "回到本次接管时手臂姿态"), ("stop", "取消并释放上肢控制"),
                             ("info", "查看状态"))]},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                         "title": "手臂", "description": "挥手、敬礼默认右臂，可选左臂；复位默认双臂，也可指定单侧。"},
@@ -2766,7 +2847,7 @@ class ArmGesturePlugin:
                     **{k: {"params": ["side", "duration_s"], "description": v}
                        for k, v in (("wave", "单臂挥手，自动放下并回到启动姿态，联动张开手掌。"),
                                     ("salute", "单臂敬礼，联动并拢伸掌，结束后保持姿态。"),
-                                    ("reset", "所选手臂回到本次启动时的实测姿态，保持当前手型。"))},
+                                    ("reset", "所选手臂回到本次接管时的实测姿态，保持当前手型。"))},
                     "stop": {"params": [], "description": "取消动作，冻结轨迹并释放上肢增益。"},
                     "info": {"params": [], "description": "查看反馈和指令轨迹状态，不判定实测到位。"},
                 },
@@ -2867,6 +2948,9 @@ class ArmGesturePlugin:
             if self._sequence_id == action_id:
                 self._sequence_id = None
                 self._sequence_deadline = None
+        logging.getLogger(__name__).warning(
+            "Adam arm_gesture terminal action_id=%s status=%s result=%s",
+            action_id, status, json.dumps(result, ensure_ascii=False))
         _notify_action_completion(action_id, status, result, self.PREFIX)
 
     def _play_static(self, action: str, side: str, action_id: str,

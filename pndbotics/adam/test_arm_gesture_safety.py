@@ -36,7 +36,8 @@ class GestureSafetyTests(unittest.TestCase):
         self.callback.start()
         self.feedback = Feedback()
         self.control = device.ArmControlPlugin({'feedback_timeout_s': 0.1}, '', None,
-            dds_lowcmd_pub=_FakePublisher(), dds_arm_lowstate_sub=self.feedback)
+            dds_lowcmd_pub=_FakePublisher(), dds_arm_lowstate_sub=self.feedback,
+            grpc_client=types.SimpleNamespace(get_control_state=lambda **kw: {'success':True,'domain_id':0}))
         self.control._RELEASE_SECONDS = 0.04
         self.control.start()
         self.assertTrue(self.control._state_ready.wait(1))
@@ -61,6 +62,7 @@ class GestureSafetyTests(unittest.TestCase):
         self.fail('No terminal ACP callback')
 
     def fast(self):
+        self.control._MAX_VELOCITY_RAD_S = 1000
         original = self.control._set_targets
         def targets(values, **kwargs):
             kwargs.update(preferred_span=0.02, velocity_limit=1000)

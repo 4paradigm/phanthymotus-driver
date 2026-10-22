@@ -34,8 +34,12 @@ def _fake_lowcmd(dof):
 
 
 def _prime_arm_plugin(publisher):
-    plugin = ArmControlPlugin({}, "", None, dds_lowcmd_pub=publisher)
+    plugin = ArmControlPlugin({}, "", None, dds_lowcmd_pub=publisher,
+                              grpc_client=types.SimpleNamespace(get_control_state=lambda **kw: {"success":True,"domain_id":0}))
     plugin._hold_q = [index / 100.0 for index in range(31)]
+    for joint in ("elbow_Left", "elbow_Right"):
+        plugin._hold_q[ADAM_PRO_JOINTS.index(joint)] *= -1
+    plugin._owner_checked_at = time.monotonic()
     plugin._current_q = plugin._hold_q.copy()
     plugin._seg_current = plugin._hold_q.copy()
     plugin._seg_start = {}
@@ -111,9 +115,9 @@ class ArmControlTests(unittest.TestCase):
             self.assertAlmostEqual(plugin._hold_q[index], plugin._target_q[index])
 
     def test_degrees_convert_to_the_ros_joint_target(self):
-        name, target = _arm_target_radians("left_shoulder_pitch", -90)
+        name, target = _arm_target_radians("left_shoulder_pitch", -45)
         self.assertEqual("shoulderPitch_Left", name)
-        self.assertAlmostEqual(-math.pi / 2, target)
+        self.assertAlmostEqual(-math.pi / 4, target)
 
     def test_each_joint_rejects_its_own_limit_violation(self):
         with self.assertRaisesRegex(ValueError, "left_shoulder_roll"):
@@ -146,7 +150,8 @@ class ArmControlTests(unittest.TestCase):
             plugin._thread.join(1.0)
             plugin._thread = None
             plugin._seg_started_at = time.monotonic() - plugin._seg_span
-            plugin._write_command(0.02)
+            for _ in range(100):
+                plugin._write_command(0.02)
         finally:
             plugin._stop_event.set()
             if plugin._thread is not None:
@@ -282,6 +287,16 @@ class ArmControlTests(unittest.TestCase):
                 del device.pnd_adam_msg_dds__LowCmd_
             else:
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
+        self.assertLess(publisher.commands[-1].motor_cmd[shoulder].q, 0.5)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            for _ in range(100):
+                plugin._write_command(0.02)
+        finally:
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
         self.assertAlmostEqual(publisher.commands[-1].motor_cmd[shoulder].q, 0.5)
 
     def test_easing_endpoints_have_zero_slope(self):
@@ -300,8 +315,9 @@ class ArmControlTests(unittest.TestCase):
         shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
         hold = plugin._hold_q[shoulder]
         samples = 400
-        for distance in (0.2, 0.5, 1.0, 2.0):
-            plugin._set_targets({"shoulderPitch_Left": hold - distance})
+        for distance in (0.2, 0.5, 1.0):
+            plugin._confirm_target_write = lambda generation: None
+            self.assertIsNone(plugin._set_targets({"shoulderPitch_Left": hold - distance}))
             span = plugin._seg_span
             peak = 0.0
             previous = ease(0.0)

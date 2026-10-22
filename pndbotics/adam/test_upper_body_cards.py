@@ -368,7 +368,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
         samples = 400
         # 0.1 is the fastest a caller may ask for; the driver still clamps the
         # 1.2 rad move up to the velocity-limited span.
-        for requested, distance in ((0.1, 1.2), (0.1, 0.05), (12.0, 0.05)):
+        for requested, distance in ((0.1, 1.0), (0.1, 0.05), (12.0, 0.05)):
             plugin = self.arm_plugin()
             hold = plugin._hold_q[shoulder]
             result = plugin.dispatch("set_joints", {
@@ -453,11 +453,11 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
     def test_compound_angle_descriptions_show_both_side_limits(self):
         properties = self.arm_plugin().get_tool()["inputSchema"]["properties"]
         expected = {
-            "pitch_deg": ("左臂范围 [-207, 117] 度", "右臂范围 [-207, 117] 度"),
-            "roll_deg": ("左臂范围 [-36, 160] 度", "右臂范围 [-160, 36] 度"),
-            "yaw_deg": ("左臂范围 [-148, 148] 度", "右臂范围 [-148, 148] 度"),
-            "bend_deg": ("左臂范围 [-143, 12] 度", "右臂范围 [-143, 12] 度"),
-            "wrist_yaw_deg": ("左臂范围 [-153, 153] 度", "右臂范围 [-153, 153] 度"),
+            "pitch_deg": ("左臂范围 [-59, 116] 度", "右臂范围 [-59, 116] 度"),
+            "roll_deg": ("左臂范围 [-35, 160] 度", "右臂范围 [-160, 35] 度"),
+            "yaw_deg": ("左臂范围 [-147, 147] 度", "右臂范围 [-147, 147] 度"),
+            "bend_deg": ("左臂范围 [-143, 11.9] 度", "右臂范围 [-143, 11.9] 度"),
+            "wrist_yaw_deg": ("左臂范围 [-152, 152] 度", "右臂范围 [-152, 152] 度"),
             "wrist_pitch_deg": ("左臂范围 [-55, 55] 度", "右臂范围 [-55, 55] 度"),
             "wrist_roll_deg": ("左臂范围 [-55, 55] 度", "右臂范围 [-55, 55] 度"),
         }
@@ -601,6 +601,7 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
 
     def arm_plugin(self):
         control = super().arm_plugin()
+        control._MAX_VELOCITY_RAD_S = 1000
         original = control._set_targets
         def fast_targets(targets, **kwargs):
             kwargs.update(preferred_span=0.01, velocity_limit=1000)
