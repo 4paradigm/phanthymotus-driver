@@ -458,8 +458,11 @@ software latch**, not a replacement for the robot's physical E-stop button.
   `action_recording.stop_playback` stay callable, because they reduce motion.
 - `reset` requires `confirm: true`; stopping the card (`stop` action) or the
   bundle does **not** release the latch.
-- The latch lives in process memory, so a driver restart releases it. Do not
-  describe it as surviving a restart.
+- The latch is written to `/opt/phanthy-motus/data/bumi/estop_state.json` and
+  restored at startup, so a container restart does **not** release it. The
+  file sits on the same host mount as the other runtime data. An unreadable or
+  corrupt state file comes back **latched** (fail-closed) rather than free to
+  move, and only `reset` with `confirm: true` clears it.
 - `auto_trigger_on_protection` (default off) latches on workmode 26. It is off
   by default because a latched driver also refuses `stand_up`, which is the
   documented way out of protection — enabling it is an operator decision.

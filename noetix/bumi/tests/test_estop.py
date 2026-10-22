@@ -31,12 +31,14 @@ class _FakeHighCtrl:
     def __init__(self, mode=2):
         self.mode = mode
         self.commands = []
+        self.action_commands = []
 
     def get_mode(self):
         return self.mode
 
     def publish_cmd(self, x, y, z, action_cmd, index=0):
         self.commands.append((x, y, z))
+        self.action_commands.append(action_cmd)
 
 
 @pytest.fixture
@@ -71,6 +73,46 @@ def test_refuses_only_non_zero_velocity(estop):
     assert latch.refuses(0.2, 0.0, 0.0) is True
     assert latch.refuses(0.0, 0.0, 0.0) is False   # a stop is always allowed
     assert latch.snapshot()['blocked_commands'] == 1
+
+
+def test_latch_survives_a_restart(estop, tmp_path):
+    path = tmp_path / 'estop_state.json'
+    latch = estop.EmergencyStopLatch(str(path))
+    assert latch.latched is False
+    latch.trigger('estop_card', 'because')
+
+    restored = estop.EmergencyStopLatch(str(path))
+    assert restored.latched is True
+    assert restored.snapshot()['source'] == 'estop_card'
+    assert restored.snapshot()['reason'] == 'because'
+
+    assert restored.reset() is True
+    assert estop.EmergencyStopLatch(str(path)).latched is False
+
+
+def test_unreadable_state_fails_closed(estop, tmp_path):
+    path = tmp_path / 'estop_state.json'
+    path.write_text('{ this is not json')
+    latch = estop.EmergencyStopLatch(str(path))
+    assert latch.latched is True
+    assert latch.snapshot()['source'] == 'estop_state_unreadable'
+
+
+def test_latched_loco_refuses_event_commands_inside_the_gate(device, estop):
+    """`FALLTOSTAND` has zero velocity but still starts physical motion."""
+    latch = estop.EmergencyStopLatch()
+    high = _FakeHighCtrl()
+    loco = device.LocoPlugin({}, 'robot', None, high)
+    loco.attach_estop(latch)
+    latch.trigger('estop_card')
+
+    with pytest.raises(device.EmergencyStopActive):
+        loco._send_edge_and_wait('FALLTOSTAND', {27})
+    assert 'FALLTOSTAND' not in high.action_commands
+
+    # The documented WALK exit stays callable while latched.
+    loco._send_edge_and_wait('WALK', {2}, allow_when_latched=True)
+    assert 'WALK' in high.action_commands
 
 
 def test_on_latch_callback_runs_once_per_trigger(estop):

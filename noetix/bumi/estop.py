@@ -12,7 +12,9 @@ Bumi 的厂商 SDK 没有暴露硬件急停状态（本仓库里没有任何 est
 两条边界要写在文档里，不要含糊：
 
 * 机器人身上的物理急停按钮仍是最终手段，这张卡管不到它。
-* 锁存只存在于驱动进程内存中，驱动重启即释放。
+* 锁存写入 `/opt/phanthy-motus/data/bumi/estop_state.json`，容器重启后仍然
+  保持锁存；只有 `reset(confirm=true)` 才解除。状态文件损坏时按锁存处理
+  （fail-closed），不会因为读不出来就放开运动。
 
 `loco` 与 `loco_servo` 的所有速度最终都经过 `LocoPlugin._publish_cmd`
 （`loco_servo` 经 `loco.publish_velocity` 转发），所以闸门放在那里就能同时
@@ -22,9 +24,11 @@ Bumi 的厂商 SDK 没有暴露硬件急停状态（本仓库里没有任何 est
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 CARD_ESTOP = "estop"
 _TOPIC_ESTOP = "/{ns}/state/estop"
@@ -44,7 +48,7 @@ class EmergencyStopLatch:
     with.
     """
 
-    def __init__(self):
+    def __init__(self, state_path: str | None = None):
         # Re-entrant: a publisher holds the gate across `refuses()` (which takes
         # it again) and the SDK write. `trigger` takes the same lock, so the
         # latch transition cannot land between a publisher's check and its
@@ -57,6 +61,71 @@ class EmergencyStopLatch:
         self._since_ms = None
         self._blocked = 0
         self._on_latch = []
+        self._state_path = Path(state_path) if state_path else None
+        self._restore()
+
+    # ── restart survival ─────────────────────────────────────────────────────
+    #
+    # `deploy/service.yml` restarts this container after a crash. A latch that
+    # lives only in memory would release an E-stop nobody reset, so the state
+    # is written beside the other Bumi runtime data and read back at startup.
+    # The file is treated as fail-closed: if it exists but cannot be parsed,
+    # the robot comes back latched rather than free to move.
+
+    def _restore(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            raw = self._state_path.read_text()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            print(f"[estop] could not read {self._state_path}: {exc}; "
+                  "starting latched", flush=True)
+            self._set_restored("estop_state_unreadable", str(exc))
+            return
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            print(f"[estop] {self._state_path} is not valid JSON: {exc}; "
+                  "starting latched", flush=True)
+            self._set_restored("estop_state_unreadable", str(exc))
+            return
+        if not isinstance(data, dict) or not data.get("latched"):
+            return
+        since = data.get("since_ms")
+        self._set_restored(
+            str(data.get("source") or "restored"),
+            str(data.get("reason") or ""),
+            int(since) if isinstance(since, (int, float)) else None,
+        )
+
+    def _set_restored(self, source: str, reason: str, since_ms: int | None = None) -> None:
+        self._latched = True
+        self._source = source
+        self._reason = reason
+        self._since_ms = since_ms if since_ms is not None else _now_ms()
+
+    def _persist_locked(self) -> None:
+        """Write the latch to disk. Called with `_lock` held."""
+        if self._state_path is None:
+            return
+        payload = {
+            "latched": self._latched,
+            "source": self._source,
+            "reason": self._reason,
+            "since_ms": self._since_ms,
+        }
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._state_path.with_name(self._state_path.name + ".tmp")
+            temporary.write_text(json.dumps(payload))
+            os.replace(temporary, self._state_path)
+        except OSError as exc:
+            # Not fatal for the running process, but it must be loud: the next
+            # restart would come back unlatched.
+            print(f"[estop] could not persist latch state to {self._state_path}: "
+                  f"{exc}", flush=True)
 
     @property
     def latched(self) -> bool:
@@ -81,6 +150,7 @@ class EmergencyStopLatch:
             self._source = str(source or "unknown")
             self._reason = str(reason or "")
             self._since_ms = _now_ms()
+            self._persist_locked()
             callbacks = list(self._on_latch)
         for callback in callbacks:
             try:
@@ -98,6 +168,7 @@ class EmergencyStopLatch:
             self._source = ""
             self._reason = ""
             self._since_ms = None
+            self._persist_locked()
             return True
 
     @contextmanager
@@ -201,7 +272,7 @@ class EstopPlugin:
             "multiInstance": False,
             "description": (
                 "Bumi 软件急停（锁存）：trigger 立即停住并拒绝所有速度指令，"
-                "直到 reset（需 confirm）。不读取物理急停状态，驱动重启即释放；"
+                "直到 reset（需 confirm）。不读取物理急停状态；锁存跨驱动重启保持，"
                 "机器人上的物理急停按钮仍是最终手段。"
             ),
             "inputSchema": {

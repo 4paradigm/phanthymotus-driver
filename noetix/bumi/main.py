@@ -126,9 +126,14 @@ class BumiDeviceBundle:
 
         # One latch shared by `loco`, `loco_servo` and the `estop` card. It is
         # created unconditionally so the motion gate has something to read even
-        # when the `estop` card itself is disabled.
+        # when the `estop` card itself is disabled. The state lives beside the
+        # other Bumi runtime data so a container restart cannot release an
+        # E-stop that nobody reset.
         from estop import EmergencyStopLatch
-        estop_latch = EmergencyStopLatch()
+        estop_cfg = plugins_cfg.get("estop") or {}
+        estop_latch = EmergencyStopLatch(
+            estop_cfg.get("state_path",
+                          "/opt/phanthy-motus/data/bumi/estop_state.json"))
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin

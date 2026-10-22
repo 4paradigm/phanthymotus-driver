@@ -127,6 +127,17 @@ def _get_default_cmd():
     """Get DEFAULT command."""
     return _get_control_cmd("DEFAULT")
 
+
+class EmergencyStopActive(RuntimeError):
+    """The latch refused an event command at the publish gate.
+
+    Raised from deep inside a posture/preset/teaching handler when the latch
+    lands after dispatch's pre-check but before the vendor command. `dispatch`
+    turns it into the same `ESTOP_ACTIVE` reply as the early check, so the
+    caller cannot tell (and does not need to tell) which one refused.
+    """
+
+
 _WORKMODE_NAMES = {
     0: "enabled", 1: "ready", 2: "walking", 5: "dance",
     8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
@@ -606,12 +617,18 @@ class LocoPlugin:
         # depends on timing nobody controls. Every action reachable from here
         # moves the body, so every one of them preempts.
         preempted = self._preempt_servo(f"{tool_name}.{action}")
-        result = handler()
+        try:
+            result = handler()
+        except EmergencyStopActive:
+            # The latch landed after the check above; the publish gate refused
+            # the event command itself. Same reply as the early refusal.
+            return self._estop_refusal(tool_name, action)
         if preempted and isinstance(result, dict):
             result["preempted_loco_servo"] = True
         return result
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
+                     allow_when_latched: bool = False):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum.
 
         This is the single choke point for both cards: `loco_servo` forwards
@@ -621,13 +638,23 @@ class LocoPlugin:
         The latch check and the SDK write share one gate with `trigger`. A
         check that released it before writing could be overtaken by the latch
         and still send a non-zero command after the E-stop was set.
+
+        Event commands (`FALLTOSTAND`, `DANCE`, `PLAYTEACH`, …) carry a zero
+        velocity but still start physical motion at the vendor controller, so
+        the latch refuses them too. `allow_when_latched` is only for the
+        documented exit path (`WALK`), which `semantic_action.reset` and
+        `stop_playback` need to stay callable during a latch.
         """
         estop = self._estop
         if estop is None:
             return self._write_cmd(x, y, z, action_cmd, index)
         with estop.motion_gate():
-            if estop.refuses(x, y, z):
-                return False
+            if not allow_when_latched and estop.latched:
+                if action_cmd != _get_default_cmd():
+                    estop.note_blocked()
+                    return False
+                if estop.refuses(x, y, z):
+                    return False
             return self._write_cmd(x, y, z, action_cmd, index)
 
     def _write_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0) -> bool:
@@ -878,8 +905,11 @@ class LocoPlugin:
         return self._send_walk_exit("stop_playback", safety)
 
     def _send_walk_exit(self, requested_action: str, safety: str) -> dict:
+        # WALK is the documented exit from a semantic action / teaching
+        # playback; it must stay callable while latched, and it reduces motion.
         observed = self._send_edge_and_wait(
-            _get_control_cmd("WALK"), {2, 26}, timeout_s=3.0)
+            _get_control_cmd("WALK"), {2, 26}, timeout_s=3.0,
+            allow_when_latched=True)
         if observed == 26:
             return self._protection_error(
                 requested_action, [], observed, safety, command_sent=True)
@@ -1064,9 +1094,14 @@ class LocoPlugin:
         return observed
 
     def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
-                            index: int = 0, timeout_s: float = 2.0) -> int:
+                            index: int = 0, timeout_s: float = 2.0,
+                            allow_when_latched: bool = False) -> int:
         """Send one event command, release with DEFAULT, then observe feedback."""
-        self._publish_cmd(0, 0, 0, cmd_enum, index)
+        sent = self._publish_cmd(0, 0, 0, cmd_enum, index,
+                                 allow_when_latched=allow_when_latched)
+        if not sent:
+            # The latch landed after `dispatch`'s pre-check. Nothing was sent.
+            raise EmergencyStopActive()
         # The vendor demo runs a 10 ms command loop. This also exceeds the
         # documented minimum 2 ms interval without repeatedly firing the event.
         time.sleep(0.01)

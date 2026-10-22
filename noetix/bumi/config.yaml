@@ -42,6 +42,9 @@ plugins:
     enabled: true
     # 状态话题发布频率（Hz），范围 (0, 50]
     publish_hz: 10
+    # 锁存状态落盘路径：容器重启后保持锁存；文件损坏时按锁存处理（fail-closed）。
+    # 该目录由 deploy/service.yml 从机器人宿主机挂载进来。
+    state_path: /opt/phanthy-motus/data/bumi/estop_state.json
     # 关闭时只有卡片上的 trigger 会锁存。打开后 workmode=26（保护模式）也会自动
     # 锁存；注意锁存同时会拒绝 stand_up（从保护模式起身的唯一路径），所以默认关闭。
     auto_trigger_on_protection: false
