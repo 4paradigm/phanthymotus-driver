@@ -37,6 +37,51 @@ from playback_telemetry import parse_audio_format
 _SUPPORTED_SPEAKER_FORMATS = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
 _SPEAKER_FAILURE_DEDUPE_LIMIT = 256
 _SPEAKER_FAILURE_MERGE_LIMIT = 64
+_POSE_QUEUE_SIZE = 256
+
+
+def pose_message_item(msg, clock_ns=time.monotonic_ns) -> dict:
+    """Convert one ROS String message without interpreting its source clock."""
+    return {
+        "kind": "pose",
+        "raw_json": str(msg.data),
+        "bridge_received_monotonic_ns": int(clock_ns()),
+    }
+
+
+def pose_barrier_item(token: str, clock_ns=time.monotonic_ns) -> dict:
+    """Create an in-band marker ordered after earlier Pose callbacks."""
+    return {
+        "kind": "barrier",
+        "token": str(token),
+        "bridge_received_monotonic_ns": int(clock_ns()),
+    }
+
+
+def _increment_shared_counter(counter, amount: int = 1):
+    with counter.get_lock():
+        counter.value += int(amount)
+
+
+def _offer_pose(pose_q, item: dict, transport_drops) -> bool:
+    """Offer without blocking, replacing the oldest item under overload."""
+    try:
+        pose_q.put_nowait(dict(item))
+        return True
+    except queue.Full:
+        pass
+    try:
+        pose_q.get_nowait()
+    except queue.Empty:
+        _increment_shared_counter(transport_drops)
+        return False
+    _increment_shared_counter(transport_drops)
+    try:
+        pose_q.put_nowait(dict(item))
+        return True
+    except queue.Full:
+        _increment_shared_counter(transport_drops)
+        return False
 
 
 def _queue_speaker_failure(failure_q, failure: dict, seen_ids: dict,
@@ -121,6 +166,8 @@ class BridgeWorker:
         self._speaker_fail_q = self._ctx.Queue(maxsize=64)
         self._speaker_fail_epoch = self._ctx.Value("q", -1)
         self._speaker_seen_fail_epoch = -1
+        self._pose_q = self._ctx.Queue(maxsize=_POSE_QUEUE_SIZE)
+        self._pose_transport_drops = self._ctx.Value("q", 0)
         self._proc = None
         self._debug = debug
         self._namespace = namespace
@@ -131,6 +178,7 @@ class BridgeWorker:
             target=_run_bridge_subprocess,
             args=(self._cmd_q, self._sensor_q, self._media_qs, self._audio_q, self._speaker_q,
                   self._speaker_fail_q, self._speaker_fail_epoch,
+                  self._pose_q, self._pose_transport_drops,
                   self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
@@ -209,6 +257,29 @@ class BridgeWorker:
         except Exception:
             return None
 
+    def configure_pose(self, topic: str):
+        try:
+            self._cmd_q.put_nowait({"kind": "pose_config", "topic": str(topic)})
+        except Exception:
+            pass
+
+    def request_pose_barrier(self, token: str):
+        try:
+            self._cmd_q.put_nowait({"kind": "pose_barrier", "token": str(token)})
+        except Exception:
+            pass
+
+    def pop_pose(self):
+        try:
+            return self._pose_q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def pose_stats(self) -> dict:
+        with self._pose_transport_drops.get_lock():
+            drops = int(self._pose_transport_drops.value)
+        return {"bridge_transport_drops": drops}
+
     def shutdown(self):
         """Gracefully stop the bridge subprocess."""
         try:
@@ -225,6 +296,7 @@ class BridgeWorker:
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
                            audio_q: mp.Queue, speaker_q: mp.Queue,
                           speaker_fail_q: mp.Queue, speaker_fail_epoch,
+                          pose_q: mp.Queue, pose_transport_drops,
                           debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     try:
@@ -307,6 +379,7 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     # a reliability negotiation mismatch or unnecessary retransmission delay.
     pub_mic = node.create_publisher(AudioChunk, f"{prefix}/mic/audio", QOS_AUDIO)
     speaker_sub = None
+    pose_sub = None
     mic_frames_published = 0
     speaker_frames_received = 0
     speaker_duplicate_frames_dropped = 0
@@ -316,6 +389,9 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     last_invalid_format_warning_at = None
     speaker_failed_ids = {}
     speaker_epoch = int(speaker_fail_epoch.value) + 1
+
+    def _on_pose(msg):
+        _offer_pose(pose_q, pose_message_item(msg), pose_transport_drops)
 
     def _on_speaker(msg):
         nonlocal speaker_frames_received, speaker_duplicate_frames_dropped
@@ -519,6 +595,20 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                     f"speaker subscribed to {cmd['topic']} (BEST_EFFORT)")
             elif isinstance(cmd, dict) and cmd.get("kind") == "speaker_event":
                 _publish_json(pub_speaker_events, cmd.get("event") or {})
+            elif isinstance(cmd, dict) and cmd.get("kind") == "pose_config":
+                if pose_sub is not None:
+                    node.destroy_subscription(pose_sub)
+                    pose_sub = None
+                topic = str(cmd.get("topic") or "")
+                if topic:
+                    pose_sub = node.create_subscription(
+                        String, topic, _on_pose, QOS_SENSOR)
+                    node.get_logger().info(f"pose subscribed to {topic} (BEST_EFFORT)")
+            elif isinstance(cmd, dict) and cmd.get("kind") == "pose_barrier":
+                _offer_pose(
+                    pose_q,
+                    pose_barrier_item(str(cmd.get("token") or "")),
+                    pose_transport_drops)
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:
