@@ -48,6 +48,8 @@
 
 ## 已部署的 Docker 运行方式
 
+最新六卡驱动镜像是 `s10-pro-motion:53e517db`，镜像 ID 为 `sha256:0f3959dd8e3bdaae184591473589dff7e9456e2551d1d4d544fe0c7c9f61db14`，运行代码提交为 `53e517db`。本地与 ARM64 Docker 内各通过 308 项测试，升级后五卡真实数据和动作 locked 状态通道均通过。生产动作授权仍为 false，未绑定控制后端。下面保留五卡阶段的构建、兼容性与传输配置记录。
+
 2026-10-22 现场采用同一 NOS 上的两个独立 Docker 容器：Agent Core 使用已有 Humble 应用镜像，driver 使用 Jazzy 镜像。应用目录为 `/userdata/phanthy-motus-s10`，画布入口为 [S10 Pro Agent Core](https://10.21.33.106:15678)。访问认证沿用该独立应用配置，仓库不保存访问凭据。
 
 已部署 driver 镜像为 `s10-pro-readonly:3a1cb138`，镜像 ID 为 `sha256:ffdaa0eb9187299028d63f2fde87de842cb2fe8e129e6c56bc10617de271dc28`。当前运行代码对应提交 `3a1cb138`；下述运输层修复通过应用配置和只读挂载生效，没有替换镜像内 Python 代码。
