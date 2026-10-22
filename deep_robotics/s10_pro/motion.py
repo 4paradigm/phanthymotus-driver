@@ -184,6 +184,12 @@ class MotionPlugin:
     def status(self):
         with self._lock:
             missing = self._gate()
+            diagnostics = {}
+            if hasattr(self._backend, 'diagnostics'):
+                try:
+                    diagnostics = self._backend.diagnostics()
+                except Exception:
+                    diagnostics = {'preflight_error': 'observation_unavailable'}
             return {'card': 'motion', 'state': 'running' if self._started else 'idle', 'phase': self._phase,
                 'execution_available': not missing and self._settings['enabled'], 'execution_authorized': self._authorized,
                 'contract_verified': validate_contract(self._contract()), 'blocked_by': missing,
@@ -191,7 +197,8 @@ class MotionPlugin:
                     'protocol_implemented': 'S10 software guide V1.0.2',
                     'production_backend': 'unbound',
                     'missing_evidence': self._contract().get('missing', []),
-                    'explanation': '需确认本机适用版本、TLS信任、控制权与失联停止规则；界面启用不会解除执行锁。'},
+                    'explanation': '需确认本机适用版本、控制权与失联停止规则；界面启用不会解除执行锁。',
+                    **diagnostics},
                 'settings': dict(self._settings), 'active_request': copy.deepcopy(self._active),
                 'last_result': copy.deepcopy(self._last), 'last_error': self._error,
                 'topic_in': [], 'topic_out': self._ports(), 'supported_actions': list(ACTIONS),
@@ -201,6 +208,8 @@ class MotionPlugin:
         with self._lock:
             if self._closed.is_set():
                 return self.status()
+            if hasattr(self._backend, 'start_observation'):
+                self._backend.start_observation()
             self._started = True
             self._phase = 'locked' if self._gate() or not self._settings['enabled'] else 'ready'
         return self.status()
@@ -210,6 +219,9 @@ class MotionPlugin:
             self._started = False
             self._phase = 'idle'
         result = self.cancel('card_stopped')
+        with self._lock:
+            if self._active is None and hasattr(self._backend, 'stop_observation'):
+                self._backend.stop_observation()
         return {**self.status(), 'cancellation': result}
 
     def close(self):
@@ -217,6 +229,8 @@ class MotionPlugin:
         self.stop()
         if self._thread.ident is not None and self._thread is not threading.current_thread():
             self._thread.join(1)
+        if hasattr(self._backend, 'close'):
+            self._backend.close()
 
     def configure(self, options):
         options = {k: v for k, v in options.items() if k not in ('instance_id', '_tool_name')}
@@ -315,6 +329,8 @@ class MotionPlugin:
             return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'busy'}
         receipt, confirmed, stop_confirmed, reason = {'accepted': None}, False, False, 'feedback_timeout'
         started = self._clock()
+        deadline = started + (duration if action == 'velocity' else self._settings['action_timeout_s'])
+        request['expires_monotonic'] = deadline
         result = None
         try:
             with self._lock:
@@ -328,7 +344,6 @@ class MotionPlugin:
                 self._last_command = started
                 self._phase = 'active'
             self._event('requested', request_id=rid, action=action)
-            deadline = started + (duration if action == 'velocity' else self._settings['action_timeout_s'])
             next_send = started
             contract = self._contract()
             refresh_interval = min(.1, (contract['robot_deadman_s'] - contract['send_timeout_s']) / 3)
@@ -367,6 +382,15 @@ class MotionPlugin:
                     if action != 'velocity':
                         reason = 'feedback_confirmed'
                         break
+                if hasattr(self._backend, 'progress') and self._clock() < deadline:
+                    with self._io_lock:
+                        if not self._cancel.is_set() and self._control_ok() and self._clock() < deadline:
+                            advanced = self._backend.progress(action, request, self._cancel)
+                            if advanced is not None:
+                                if advanced.get('accepted') is False:
+                                    reason = 'rejected'
+                                    break
+                                receipt = advanced
                 self._cancel.wait(.02)
             if action == 'velocity' and not self._cancel.is_set() and self._clock() >= deadline:
                 reason = 'duration_elapsed'
@@ -401,6 +425,10 @@ class MotionPlugin:
                 if result is not None:
                     self._last, self._phase = result, result['state'] if self._started else 'idle'
                 self._active = None
+                if hasattr(self._backend, 'finish'):
+                    self._backend.finish(rid)
+                if not self._started and hasattr(self._backend, 'stop_observation'):
+                    self._backend.stop_observation()
                 if result is not None:
                     self._event('finished', **result)
             self._busy.release()

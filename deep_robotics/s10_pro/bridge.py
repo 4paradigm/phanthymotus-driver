@@ -109,7 +109,7 @@ class ReaderBridge:
                 return {"data": None, "received_at_ms": None, "age_s": None,
                         "fresh": False, "error": error, "sequence": 0, "binary": None}
             result = copy.deepcopy(record)
-            age = max(0, self._clock() - result.pop("received_monotonic"))
+            age = max(0, self._clock() - result["received_monotonic"])
             threshold = max((float(opts.get("stale_after_s", 5)) for sources, opts in self._owners.values()
                              if source in sources), default=5)
             result.update(age_s=age, fresh=age <= threshold, error=error)

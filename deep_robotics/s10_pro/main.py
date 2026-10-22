@@ -15,6 +15,8 @@ from common.vendor_runtime import DriverBundle, load_config, make_handler, resol
 from bridge import ReaderBridge
 from device import build_plugins
 from motion import MotionPlugin
+from motion_backend import DDSMotionBackend
+from motion_process import DDSProcessTransport
 
 
 def build_runtime_plugins(config, namespace, bridge, publish):
@@ -25,8 +27,10 @@ def build_runtime_plugins(config, namespace, bridge, publish):
     Canvas configuration cannot grant that authorization.
     """
     plugins = build_plugins(config, namespace, bridge, publish)
-    plugins.append(MotionPlugin(config.get("motion", {}), namespace,
-                                publish=publish, execution_authorized=False))
+    transport = DDSProcessTransport(config, execution_enabled=False)
+    motion_backend = DDSMotionBackend(bridge, transport, execution_authorized=False)
+    plugins.append(MotionPlugin(config.get("motion", {}), namespace, backend=motion_backend,
+                                feedback=motion_backend.feedback, publish=publish, execution_authorized=False))
     return plugins
 
 

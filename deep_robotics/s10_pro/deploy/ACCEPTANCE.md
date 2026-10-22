@@ -1,158 +1,187 @@
 # Deployment and real-canvas acceptance
 
-As of 2026-10-22, a separate Agent Core and this driver are deployed as two
-Docker containers on the NOS. The five-card layout is saved and repeated
-MCP/API checks return fresh real data for all five cards. A 30-second Core
-WebSocket check, three lifecycle rounds and new-reader interruption/recovery
-checks have passed. The final uninterrupted 600.09-second Core DDS observation
-passed: 599 state, 2946 joints, 2970 IMU, 2966 odometry, 576 cloud and 1194
-lidar-info frames; every JSON frame was fresh and every cloud had 6000 points,
-without parse errors. Browser control is disabled in Work
+## Submission checkpoint, 2026-10-22
+
+The field deployment remains the locked six-card driver at source `53e517db`,
+image `s10-pro-motion:53e517db`, ID
+`sha256:0f3959dd8e3bdaae184591473589dff7e9456e2551d1d4d544fe0c7c9f61db14`.
+The new DDS high-level motion candidate in this submission has not replaced that
+running driver. Further deployment and physical testing are paused for this PR.
+
+The production constructors set all three execution gates to `False`:
+`DDSProcessTransport.execution_enabled`,
+`DDSMotionBackend.execution_authorized`, and
+`MotionPlugin.execution_authorized`. Starting the motion card acquires only a
+motion-feedback observation lease. It does not start a command worker, create a
+command publisher, change robot mode or grant control authority. Canvas settings
+cannot change these process-level gates.
+
+An ARM64 Docker candidate passed isolated real-ROS synthetic motion smoke:
+feedback-dependent state `1 → 17`, bounded velocity followed by zero and stopping
+confirmation, and lie confirmation. Host and candidate recursive definitions
+matched for the nine motion-related message types. See the PR for the submission
+check results. These checks do not establish robot motion acceptance.
+
+The persistent field application directory is `/userdata/phanthy-motus-s10` and
+the user-facing Core URL is `https://10.21.33.106:15678`. Credentials and access
+tokens stay outside this repository. Browser control remains disabled in Work
 settings; visible point-cloud rendering, screenshots and refresh persistence
-are not claimed as passed.
+have not been accepted.
 
-The persistent application directory is `/userdata/phanthy-motus-s10` and the
-user-facing Core URL is `https://10.21.33.106:15678`. Credentials and access tokens
-are kept outside this repository.
+## Historical field evidence and its version
 
-## Completed field checks
+The five-card image `s10-pro-readonly:3a1cb138`, ID
+`sha256:ffdaa0eb9187299028d63f2fde87de842cb2fe8e129e6c56bc10617de271dc28`,
+passed the following field checks before the locked motion-card upgrade:
 
-- All six Core WebSocket outputs passed a 30-second live-data check. State was
-  approximately 1 Hz; joints, IMU and odometry were approximately 4.95 Hz;
-  `lidar_info` was approximately 2 Hz. Lidar delivered 27 binary frames at
-  approximately 0.90 Hz, 6000 points each, with a maximum inter-frame gap of
-  3.01 seconds. JSON parse errors and unhealthy frames after warmup were zero.
-  This verifies the Jazzy driver to Humble Core DDS-to-WebSocket path. The
-  timestamp-free initial cloud cache was excluded. These are delivered output
-  rates, not measurements of the vendor's original sampling rates.
-- Three independent lifecycle rounds passed. Stopping each card stopped its
-  DDS output while other running cards continued. After the final card stopped,
-  the reader process count and all six reader subscriptions were zero. On each
-  restart there was one reader process and one subscription per source.
-- Suspending only the new reader child made all five cards stale. Lidar binary
-  output stopped and stale metadata continued. Resuming the child recovered
-  fresh data; terminating it triggered an automatic restart and fresh recovery.
+- All six sensor outputs passed a 30-second Core WebSocket check: state about
+  1 Hz; joints, IMU and odometry about 4.95 Hz; lidar metadata about 2 Hz. Lidar
+  delivered 27 binary frames at about 0.90 Hz, 6000 points each, maximum gap
+  3.01 seconds. JSON parsing and unhealthy-frame counts after warmup were zero.
+  The timestamp-free initial cloud cache was excluded. This verifies the Jazzy
+  driver → Humble Core → WebSocket path, not browser rendering or vendor sample
+  frequencies.
+- Three independent sensor-card lifecycle rounds passed. Stopping one card
+  stopped its output while other cards continued. After the last sensor card
+  stopped, the reader and its six source subscriptions were absent. Restarts
+  created one reader and one subscription per source. With the new motion
+  observer, the reader also remains leased while that observer is running;
+  repeat the final-owner check with the motion observer stopped.
+- Suspending only the new application reader made the five cards stale. Cloud
+  binary output stopped while stale metadata continued. Resuming it restored
+  fresh data; terminating it caused automatic reader restart and recovery.
   Vendor processes and robot networking were not interrupted.
+- An uninterrupted 600.09-second Core DDS observation received 599 state,
+  2946 joints, 2970 IMU, 2966 odometry, 576 cloud and 1194 lidar-info frames.
+  Every JSON frame was fresh, each cloud had 6000 points and parsing had no
+  errors.
 - The 21-item HTTPS API audit passed, including 401 for unauthenticated access.
-  Authentication is configured, automatic project startup is off, and the audit
-  observed `project_running=false`. These checks do not imply any browser
-  rendering or autonomous control was enabled.
+  Automatic project startup was off and `project_running=false` at audit time.
 
-Detailed working evidence is recorded outside the repository in the deployment
-artifacts `core-ws-live-verification.json` and `lifecycle.json`. The final
-600-second observation and real-browser checks remain separate acceptance items.
+The later `53e517db` six-card locked deployment passed real sensor-data and locked
+motion-status channel checks. Neither set of historical results substitutes for
+repeating acceptance on the new PR image. Working evidence is retained privately
+outside the repository; database copies and credentials are not PR artifacts.
 
-## Before applying anything
+## Before a subsequent deployment
 
-1. Confirm the robot Wi-Fi connection and NOS address before a subsequent
-   deployment. Keep the existing Franka and PiPER deployments untouched.
-2. Read current application services, free ports and writable persistent paths.
-   Preserve the independent S10 application already deployed in
-   `/userdata/phanthy-motus-s10`; do not repeat initial provisioning over its data.
-3. Save an application-only inventory and any affected Compose/config/database
-   backups privately. Do not put credentials or existing database copies in Git.
-4. Run `preflight.py --public-contract` in the native NOS Jazzy environment.
-   For a container deployment, compare its generated contract with the native
-   contract before selecting that image. A package version comparison is not
-   sufficient. The installed native message package is 1.0.23; comparison with
-   the deployed container's public message definitions returned compatible.
-   Repeat this check when replacing either message package or image.
+1. Follow the team PR/image workflow and record the generated image, source
+   commit and build result. Do not assume a locally tested candidate is the bot
+   image. Preserve the running application while waiting for that image.
+2. Confirm robot Wi-Fi and the NOS address. Read current services, free ports and
+   writable persistent paths. Preserve the independent S10 application and any
+   user edits; do not repeat initial provisioning over its data or touch the
+   separate Franka/PiPER stacks.
+3. Save an application-only container/config inventory and affected backups
+   privately. Do not put credentials or database copies in Git.
+4. Run sensor `preflight.py --public-contract` and motion
+   `motion_preflight.py --public-contract` in the native NOS Jazzy environment,
+   then compare the container's recursive message contracts. The installed
+   native message package is 1.0.23; version names alone do not establish wire
+   compatibility. Repeat whenever either message package or image changes.
+5. Verify the production execution gates remain false and that no command worker
+   or application command publisher starts during idle, sensor use, motion
+   observation, stopping or graph inspection. No action command belongs to this
+   deployment check.
 
-## Supported application topologies
+## Supported Docker topology
 
-- **Container driver and Core on the same host:** the current field deployment.
-  Core uses the existing Humble application image; the driver uses the Jazzy
-  image `s10-pro-readonly:3a1cb138`, image ID
-  `sha256:ffdaa0eb9187299028d63f2fde87de842cb2fe8e129e6c56bc10617de271dc28`.
-  Runtime code remains at `3a1cb138`; the reader transport adjustment is an
-  external configuration and read-only XML mount. Do not mount host Jazzy
-  binaries into the Humble Core container.
-- **Native NOS driver, separate Core container on the same host:** an optional
-  development/diagnostic topology using the native Jazzy/drdds packages. Install
-  only this repository's `common/` and `deep_robotics/s10_pro/` into a dedicated
-  persistent application directory. The provided systemd unit is a template:
-  review the user/path before installing it. It is not automatically installed
-  or enabled by any project command.
+Core and driver are separate containers on the same NOS. Core uses the existing
+Humble application image; the driver uses its own Jazzy image and compiled public
+message definitions. Do not mount host Jazzy binaries into the Humble container.
+The optional systemd unit is an unused diagnostic/development template, not the
+field deployment mechanism.
 
-The NOS currently has no Docker Compose plugin. The two running containers were
-created and are managed with Docker CLI commands; the application's
-`docker-compose.yml` persists the intended service configuration. Do not assume
-that `docker compose` can be invoked on this host. `service.yml` remains the
-normal platform installation template.
+The NOS currently has no Docker Compose plugin. Field containers are managed
+with Docker CLI; the application's `docker-compose.yml` records the intended
+configuration. `service.yml` is the standard platform installation template.
+Use the actual deployment tools available on the robot when applying bot output.
 
-In both cases use the actual Core loopback DDS profile, domain 42, an independent
-`s10_pro` namespace, and the free MCP port 15745. The child reader uses domain 0
-and explicitly excludes the platform DDS profile. It never executes the vendor
-`setup_ros2.sh`, changes XML, publishes robot commands or calls robot services.
+Both containers use host networking. Platform DDS uses domain 42 with the
+loopback-only `dds-local.xml`; MCP listens on 15745 and the independent namespace
+is `s10_pro`. The reader uses vendor domain 0 and explicitly excludes the
+platform profile. It never executes vendor `setup_ros2.sh`, edits XML, publishes
+commands or calls robot services. The default command worker is dormant.
 
 For the container reader, install this application's `s10-reader-udp.xml` as a
 real regular file, mount it read-only at
-`/opt/phanthy-motus/s10-reader-udp.xml`, and set the external mounted config's
-`reader.vendor_profile` to that container path. The field deployment maps
-`/userdata/phanthy-motus-s10/s10-reader-udp.xml` to this path. The repository's
-`service.yml` uses the normal `/opt/phanthy-motus` host installation prefix;
-adjust only the host side of mounts for the independent field directory.
+`/opt/phanthy-motus/s10-reader-udp.xml`, and set external
+`reader.vendor_profile` to that path. The field host source is
+`/userdata/phanthy-motus-s10/s10-reader-udp.xml`; repository `service.yml` uses the
+standard `/opt/phanthy-motus` installation prefix. Adjust only the host mount
+sources for an independent installation.
 
-The child-only XML selects UDPv4 and disables builtin transports. The original
-container configuration received drdds state but missed the local standard
-IMU/odometry/cloud streams; adding host IPC alone did not restore them. A bounded
-UDP-only container probe received all three, and this profile restored fresh
-data through the actual driver. The final configuration uses private IPC; host
-IPC is not required. Neither the vendor XML nor vendor services were changed.
-The platform parent still uses the separate domain-42 loopback-only profile.
+This child-only XML selects UDPv4 and disables builtin transports. Default
+container transport received drdds state but missed local standard IMU,
+odometry and cloud; host IPC alone did not fix this. The dedicated UDP profile
+restored all three. Private IPC is retained. Vendor XML and services remain
+unchanged, and the platform parent keeps its domain-42 loopback profile.
 
-The separate S10 Core has its own persistent database and access configuration.
-For any new installation, reuse the project's existing application image only
-after checking architecture and standard message transport. Do not clone another
-robot's live database, LLM secrets, canvas layout, switches or middleware state.
-Keep smart control and automatic project startup disabled during read-only
-acceptance. Preserve any existing application state if a platform is found.
+The S10 Core has its own persistent database and access configuration. For a new
+installation, verify architecture and standard-message transport before reusing
+an application image. Do not clone another robot's live database, secrets or
+canvas state. Keep smart control and automatic project startup disabled during
+sensor acceptance, and preserve existing application state on an occupied host.
 
-## Remaining live and real-browser acceptance
+## Repeat on the exact PR image
 
-Record the deployed source commit, config hash, image ID, Core ID/version and
-user-openable URL. Then use the real browser to:
+Record source commit, image ID, config hash, Core ID/version and user-openable
+URL. These are pending acceptance items for the new candidate:
 
-1. Inspect the saved five-card S10 Pro layout in the real browser. Confirm the
-   standard existing card layout, settings, ports and controls. Browser access
-   must be authorized before this step can be recorded as passed.
-2. Start each card individually and the full project. Verify fresh real state,
-   16 actual joint records, IMU and odometry values. Open the lidar point-cloud
-   renderer and verify visible updating geometry as well as its metadata port.
-3. Complete the separate uninterrupted ten-minute Core DDS observation; record
-   delivered stream rates, maximum gaps and source ages. The card refresh rate
-   is not the vendor sample frequency. Repeat lifecycle and interruption checks
-   above if the image or runtime code changes.
-4. Inspect point-cloud metadata alongside geometry. The renderer may retain its
-   last frame; use metadata age and freshness to distinguish it from a live
-   stream. Automated stale/recovery checks above do not inspect that display.
-5. Refresh the browser and verify that layout/settings are preserved. Save
-   screenshots and logs against the same deployment version. No motion test
-   belongs to this five-card acceptance.
-
-## Application-only rollback
-
-Stop only the current `embodied-deep-robotics-s10-pro` driver container using
-Docker CLI; do not invoke unavailable Compose tooling. If an
-optional native deployment is used later, stop only its explicitly named driver
-unit rather than a vendor service.
-Verify the parent/reader processes have exited. Restore only the backed-up S10
-application config/image and independent canvas state, checking for user edits
-before restoring any database. A newly provisioned S10 Core can be stopped on
-its own; preserve its persistent directory and previous image for recovery.
-Do not restart vendor AOS/NOS services or the existing Franka/PiPER stacks.
-
-No rollback command here disables robot motion or constitutes an emergency stop.
+1. Repeat MCP/API and Core WebSocket checks for five fresh sensor streams and
+   motion observation. Motion must report execution locked, and the command
+   worker must remain absent. No physical action is required.
+2. Repeat three independent lifecycle rounds and reader interruption/recovery.
+   Stop every sensor card and the motion observer before checking final reader
+   exit. Verify no source subscription leaks or command publications.
+3. Complete an uninterrupted ten-minute Core DDS observation and record delivered
+   rates, maximum gaps and source ages. Refresh settings are not vendor sample
+   frequencies.
+4. Once real-browser access is available, inspect the saved six-card layout,
+   settings and ports. Start sensors individually and together; verify fresh
+   state, 16 joint records, IMU and odometry. Inspect visible updating point
+   geometry together with lidar metadata, since a renderer may retain old
+   geometry after a stream stops.
+5. Refresh the browser and check layout/settings persistence. Save screenshots
+   against the same deployed version. Browser inspection must be performed
+   before it can be recorded as passed.
 
 ## Motion development boundary
 
-The sixth actuator is implemented with a fail-closed production constructor.
-Its real control backend is not bound and process authorization is false;
-canvas configuration cannot change either. Tests use an explicitly fictional
-backend and do not establish robot-side control authority or deadman behavior.
-The S10 V1.0.2 codec and TLS transport use bounded I/O and strict validation.
-The AOS endpoint was inspected without sending application frames. The reported
-handheld version v2.5.5 still requires mapping to the robot system/control-server
-version. Obtain the proper TLS trust/hostname material, authority/takeover and
-loss-of-command stopping confirmation before binding production motion. No
-stand, lie, velocity, mode switch, reset or emergency-stop command was sent.
+The high-level backend uses `/MOTION_STATE`, `/NAV_CMD` and `/MOTION_INFO` through
+an independent bounded command process. It does not require TLS. The optional
+ASDU/TLS transport remains experimental and is not selected by production;
+previous AOS TLS diagnostics sent no application frames.
+
+The handheld-reported `v2.5.5` has not been mapped to the robot system/control
+service version. Fresh motion feedback does not prove ownership, navigation
+mode, handheld takeover priority or a robot-side loss-of-command stopping
+bound. The guide's two-second heartbeat timeout concerns status reporting and
+is not evidence of a motion deadman.
+
+Before any later proposal to enable execution, establish robot identity/version
+matching, independently verifiable control authority and navigation-mode rules,
+robot-side stopping behavior, and on-site readiness/takeover conditions. The current
+backend conservatively requires ownership even to publish zero velocity; a
+contract claiming special stopping rights after authority loss does not by
+itself implement those rights. Do not bypass the publisher's ownership checks.
+
+The public `sdk_deploy` repository is a low-level control/RL path whose
+initialization can publish joint reset commands. Do not run it as a connectivity
+probe, and do not use M20 control encodings for S10. No stand, lie, velocity,
+mode-switch, reset or emergency-stop command has been sent to this robot by
+this work. Tests with fictional authority and synthetic ROS publishers are
+limited to `--network none` containers; both smoke scripts reject non-loopback
+interfaces.
+
+## Application-only rollback
+
+Stop only the current `embodied-deep-robotics-s10-pro` container with Docker CLI;
+do not invoke unavailable Compose tooling. Verify its parent/reader processes
+have exited. Restore only the backed-up S10 image/config and independent canvas
+state, checking for user edits before any database restore. Preserve the
+persistent application directory and prior image for recovery.
+
+Do not restart vendor AOS/NOS services or the Franka/PiPER stacks. Stopping or
+rolling back this application does not disable robot motion and is not an
+emergency stop.
