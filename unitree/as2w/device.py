@@ -1514,6 +1514,8 @@ class SpecialMotionPlugin:
         self._state_lock = threading.Lock()
         self._motion_lock = threading.Lock()
         self._motion_generation = 0
+        self._response_events = {}
+        self._response_lock = threading.Lock()
         self._servo = None
         self._loco = None
         self._controlled_spatial = None
@@ -1585,7 +1587,8 @@ class SpecialMotionPlugin:
                     self._active_posture = None
         return ret
 
-    def _run_motion(self, action_id, action, enter, generation):
+    def _run_motion(self, action_id, action, enter, generation,
+                    response_event):
         result = {"action": action}
         if action in ("handstand", "biped_stand"):
             result["enter"] = enter
@@ -1643,9 +1646,22 @@ class SpecialMotionPlugin:
             status = "error"
         else:
             status = "completed" if ret == 0 else "error"
+            if status == "completed":
+                result["completion_scope"] = "sport_client_rpc_accepted"
 
         self._motion_lock.release()
+        # ACP completion must not overtake the MCP response that gives the
+        # caller this action_id. The HTTP/SSE handler releases this barrier in
+        # a finally block after attempting to send that response.
+        response_event.wait()
         _acp_notify(action_id, status, result, tool="special_motion")
+
+    def response_sent(self, action_id):
+        """Release a terminal ACP event after its MCP action response."""
+        with self._response_lock:
+            response_event = self._response_events.pop(action_id, None)
+        if response_event is not None:
+            response_event.set()
 
     def _start_motion(self, action, args):
         if not self._motion_lock.acquire(blocking=False):
@@ -1655,15 +1671,21 @@ class SpecialMotionPlugin:
         with self._state_lock:
             self._motion_generation += 1
             generation = self._motion_generation
+        response_event = threading.Event()
+        with self._response_lock:
+            self._response_events[action_id] = response_event
         try:
             threading.Thread(target=self._run_motion,
-                             args=(action_id, action, enter, generation),
+                             args=(action_id, action, enter, generation,
+                                   response_event),
                              daemon=True).start()
         except Exception:
+            with self._response_lock:
+                self._response_events.pop(action_id, None)
             self._motion_lock.release()
             raise
-        return {"accepted": True, "status": "running", "action": action,
-                "action_id": action_id}
+        return {"accepted": True, "status": "running", "queued": True,
+                "action": action, "action_id": action_id}
 
     def _validate_motion_state(self, action, enter):
         # Exiting a sustained posture is a recovery operation and must remain

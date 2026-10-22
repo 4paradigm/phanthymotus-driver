@@ -527,6 +527,8 @@ class TestDriverContracts(unittest.TestCase):
                 side_effect=lambda *_args, **_kwargs: completed.set()):
             result = plugin.dispatch("front_flip", {"confirm": True})
             self.assertTrue(result["accepted"])
+            self.assertFalse(completed.wait(0.05))
+            plugin.response_sent(result["action_id"])
             self.assertTrue(completed.wait(1))
 
     def test_special_motion_stop_exits_sustained_posture(self):
@@ -541,6 +543,7 @@ class TestDriverContracts(unittest.TestCase):
         with patch.object(self.device, "_acp_notify", side_effect=lambda *_args, **_kwargs: completed.set()):
             result = plugin.dispatch("handstand", {"confirm": True, "enter": True})
             self.assertTrue(result["action_id"].startswith("as2w_special_motion_"))
+            plugin.response_sent(result["action_id"])
             self.assertTrue(completed.wait(1))
         self.assertEqual("handstand", plugin._active_posture)
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
@@ -578,6 +581,7 @@ class TestDriverContracts(unittest.TestCase):
                     result = plugin.dispatch(
                         action, {"confirm": True, "enter": True})
                     self.assertTrue(entered.wait(1))
+                    plugin.response_sent(result["action_id"])
 
                     stopped = plugin.dispatch("stop", {})
                     self.assertEqual("idle", stopped["state"])
@@ -620,11 +624,15 @@ class TestDriverContracts(unittest.TestCase):
             result = plugin.dispatch("front_flip", {"confirm": True})
             self.assertTrue(result["accepted"])
             self.assertEqual("running", result["status"])
+            self.assertTrue(result["queued"])
             self.assertTrue(result["action_id"].startswith("as2w_special_motion_"))
             self.assertTrue(entered.wait(1))
             self.assertEqual([], notified)
             self.assertIn("error", plugin.dispatch("back_flip", {"confirm": True}))
             release.set()
+            __import__("time").sleep(.05)
+            self.assertEqual([], notified)
+            plugin.response_sent(result["action_id"])
             for _ in range(100):
                 if notified:
                     break
@@ -635,6 +643,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(result["action_id"], args[0])
         self.assertEqual("completed", args[1])
         self.assertEqual(0, args[2]["ret"])
+        self.assertEqual("sport_client_rpc_accepted",
+                         args[2]["completion_scope"])
         self.assertEqual("special_motion", kwargs["tool"])
 
     def test_special_motion_exception_reports_error_and_releases_slot(self):
@@ -652,6 +662,8 @@ class TestDriverContracts(unittest.TestCase):
                 self.device, "_acp_notify",
                 side_effect=lambda *args, **kwargs: (notified.append((args, kwargs)), completed.set())):
             first = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertFalse(completed.wait(.05))
+            plugin.response_sent(first["action_id"])
             self.assertTrue(completed.wait(1))
             self.assertEqual(first["action_id"], notified[0][0][0])
             self.assertEqual("error", notified[0][0][1])
@@ -662,8 +674,18 @@ class TestDriverContracts(unittest.TestCase):
             second = plugin.dispatch("front_flip", {"confirm": True})
             self.assertTrue(second["accepted"])
             self.assertNotEqual(first["action_id"], second["action_id"])
+            plugin.response_sent(second["action_id"])
             self.assertTrue(completed.wait(1))
             self.assertEqual("completed", notified[1][0][1])
+
+    def test_bundle_forwards_action_response_to_async_plugin(self):
+        seen = []
+        plugin = types.SimpleNamespace(
+            response_sent=lambda action_id: seen.append(action_id))
+        bundle = self.main.Bundle.__new__(self.main.Bundle)
+        bundle.plugins = [object(), plugin]
+        bundle.action_response_sent("as2w_special_motion_test")
+        self.assertEqual(["as2w_special_motion_test"], seen)
 
     def test_multimedia_card_contracts_match_verified_hardware(self):
         mic = self.multimedia.MicPlugin.__new__(self.multimedia.MicPlugin)

@@ -189,6 +189,13 @@ class Bundle:
                 return plugin.dispatch(args.pop("action", name), {**args, "_tool_name": name})
         return None
 
+    def action_response_sent(self, action_id):
+        """Tell asynchronous cards their action_id is now visible."""
+        for plugin in self.plugins:
+            response_sent = getattr(plugin, "response_sent", None)
+            if response_sent is not None:
+                response_sent(action_id)
+
 
 def _tool_call_arguments(params):
     """Default an omitted/null argument object without hiding wrong JSON types."""
@@ -266,6 +273,7 @@ def handler(bundle):
                 self.send_response(202); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
                 if not sse_client._send_sse("message", json.dumps(payload)):
                     with sse_lock: sse_sessions.pop(session_id, None)
+            action_id = None
             if method == "initialize": result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "as2w-driver", "version": "1.0"}}
             elif method == "tools/list": result = {"tools": bundle.tools()}
             elif method == "tools/call":
@@ -300,9 +308,15 @@ def handler(bundle):
                         return
                 result = {"content": [{
                     "type": "text", "text": json.dumps(call_result)}]}
+                if isinstance(call_result, dict):
+                    action_id = call_result.get("action_id")
             else:
                 respond({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Method not found: {method}"}}); return
-            respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            try:
+                respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            finally:
+                if action_id:
+                    bundle.action_response_sent(action_id)
     return Handler
 
 
