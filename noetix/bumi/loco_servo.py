@@ -756,6 +756,8 @@ class LocoServoPlugin:
         """
         if self._loco is None or not getattr(self._loco, "is_moving", None):
             return ""
+        if getattr(self._loco, "is_motion_reserved", lambda: False)():
+            return "Bumi 动作编排正在占用身体，请先停止编排。"
         if self._loco.is_moving():
             return ("loco 卡片正在驱动底盘（move 未 stop_move）—— 两张卡片同时"
                     "写同一个底盘会互相打架。请先调用 loco 的 stop_move。")

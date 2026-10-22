@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bumi 动作编排</title>
+<style>
+:root {
+  color-scheme:dark;
+  font:14px/1.55 system-ui,sans-serif;
+  background:#201f1b;
+  color:#eeeae1;
+  --line:#454138;
+  --orange:#e49764
+}
+* {
+  box-sizing:border-box
+}
+body {
+  margin:0;
+  padding:22px 22px 210px
+}
+h1 {
+  font-size:22px;
+  margin:0
+}
+h2 {
+  font-size:16px;
+  margin:0 0 12px
+}
+p {
+  margin:6px 0;
+  color:#bab6ac
+}
+button,input,select {
+  font:inherit
+}
+button,select,input[type=number] {
+  border:1px solid var(--line);
+  border-radius:7px;
+  background:#302e28;
+  color:#eeeae1;
+  padding:7px 10px
+}
+button {
+  cursor:pointer
+}
+button:disabled {
+  opacity:.4;
+  cursor:default
+}
+button:hover:enabled {
+  border-color:var(--orange)
+}
+input[type=range] {
+  width:100%;
+  accent-color:var(--orange)
+}
+input[type=number] {
+  width:78px
+}
+select {
+  max-width:100%;
+  width:100%
+}
+label {
+  display:block;
+  color:#d0cabe
+}
+header,.bar,.row,.meter {
+  display:flex;
+  align-items:center;
+  gap:12px
+}
+header {
+  justify-content:space-between;
+  margin-bottom:18px
+}
+.badge {
+  border:1px solid var(--line);
+  border-radius:20px;
+  padding:3px 12px;
+  color:var(--orange)
+}
+section {
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:16px;
+  margin:12px 0
+}
+.grid {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:16px
+}
+.meter input[type=range] {
+  flex:1;
+  min-width:40px
+}
+.motion {
+  border-top:1px solid var(--line);
+  padding:14px 0
+}
+.motion:first-child {
+  border-top:0;
+  padding-top:0
+}
+.motion .row {
+  margin-bottom:10px
+}
+.motion select {
+  flex:1
+}
+.order {
+  white-space:nowrap;
+  font-weight:600
+}
+.mini {
+  padding:4px 9px
+}
+.grow {
+  flex:1
+}
+.muted {
+  font-size:12px;
+  color:#b4aea1
+}
+.window {
+  display:none
+}
+body.timed .window {
+  display:block
+}
+.warning {
+  display:none;
+  color:#f1bd81;
+  margin-top:10px
+}
+body.timed .warning {
+  display:block
+}
+.bar {
+  flex-wrap:wrap
+}
+.primary {
+  background:#b96536;
+  border-color:#b96536;
+  font-weight:600
+}
+.danger {
+  color:#ffb0a3;
+  border-color:#88574e
+}
+.confirm {
+  margin:12px 0
+}
+.confirm input {
+  accent-color:var(--orange)
+}
+#message {
+  white-space:pre-wrap;
+  margin-top:10px
+}
+#message.error {
+  color:#ffb0a3
+}
+progress {
+  width:100%;
+  height:10px;
+  accent-color:var(--orange)
+}
+#progress-text {
+  font-weight:600;
+  margin:8px 0 2px
+}
+#detail {
+  font-size:12px;
+  color:#bbb5a8;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere
+}
+.wide {
+  width:100%
+}
+@media(max-width:600px) {
+  body {
+  padding:12px
+}
+.grid {
+  grid-template-columns:1fr
+}
+header {
+  align-items:flex-start
+}
+h1 {
+  font-size:19px
+}
+.motion .row {
+  flex-wrap:wrap
+}
+.motion select {
+  flex-basis:65%
+}
+
+}
+
+footer.controls {
+  position:fixed;
+  bottom:0;
+  left:0;
+  right:0;
+  padding:10px 22px 14px;
+  background:#201f1b;
+  border-top:1px solid var(--line);
+  box-shadow:0 -8px 20px #201f1b99;
+  z-index:5
+}
+footer .confirm {
+  margin:5px 0 9px
+}
+#live-summary {
+  font-weight:600;
+  color:var(--orange);
+  margin-bottom:4px
+}
+footer #message {
+  font-size:12px;
+  margin-top:6px
+}
+
+</style></head><body>
+<header><div><h1>Bumi 动作编排</h1><p>选动作、设次数，在这里运行和停止。</p></div><span id="connection" class="badge" role="status">正在连接…</span></header>
+<section><h2>播放设置</h2><div class="grid">
+<label>运行方式<select id="mode" class="setting"><option value="dry">模拟，不控制机器人</option><option value="real">真机播放</option></select></label>
+<label>每段结束方式<select id="strategy" class="setting"><option value="operator">人工确认完整结束</option><option value="timed_exit">按设定秒数退出并重播</option></select></label>
+<label>整套轮数<div class="meter"><input class="setting" id="rounds-range" aria-label="整套轮数滑块" type="range" min="1" max="20" value="1"><input class="setting" id="rounds" aria-label="整套轮数" type="number" min="1" max="20" step="1" value="1"></div></label>
+<label>轮间休息（秒）<div class="meter"><input class="setting" id="round-rest-range" aria-label="轮间休息滑块" type="range" min="0" max="600" value="0"><input class="setting" id="round-rest" aria-label="轮间休息" type="number" min="0" max="600" step="1" value="0"></div></label>
+</div><p class="warning">定时模式到达窗口后退出回放，再开始下一段。窗口留空时使用该动作已保存的测时记录，也可手动覆盖。时间太短可能截断动作；测时不代表机器人自动识别结束。</p></section>
+<section><div class="bar"><h2 class="grow">动作顺序</h2><button id="add" class="setting" disabled>＋ 添加动作</button></div><div id="steps"></div><p class="muted">播放次数是录制片段的播放次数。最后一次播放后不额外休息。</p></section>
+<section><h2>当前进度</h2><progress id="progress" max="1" value="0"></progress><div id="progress-text" aria-live="polite">尚未运行</div><p id="progress-note">人工确认模式：看到当前动作完整结束后，点击“继续”；程序会自行退出回放。</p><details><summary>查看运行详情</summary><pre id="detail"></pre></details></section>
+<footer class="controls"><div id="live-summary" role="status">尚未运行</div><label class="confirm"><input id="confirm" class="setting" type="checkbox"> 我已确认机器人站稳、周围空间充足；定时模式下已核准所填播放窗口。</label>
+<div class="bar"><button id="validate" disabled>预检</button><button id="run" class="primary" disabled>开始模拟</button><button id="ack" class="primary" hidden disabled>本段已完整结束，继续</button><button id="stop" class="danger" disabled>停止流程</button></div>
+<div id="message" role="status" aria-live="polite">打开页面不会让机器人动作。</div>
+</footer>
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+const states = {
+  idle: '尚未运行',
+  running: '正在启动',
+  playing_window: '按设定窗口播放',
+  exiting_playback: '正在退出回放',
+  awaiting_confirmation: '等待你确认本段完整结束',
+  resting: '休息中',
+  stopping: '正在停止',
+  completed: '流程完成',
+  cancelled: '流程已停止',
+  error: '流程出错'
+};
+const terminal = new Set(['completed', 'cancelled', 'error']);
+let port = null,
+  sequence = 0,
+  pending = new Map(),
+  motions = [],
+  current = {
+    state: 'idle'
+  },
+  deviceBusy = false,
+  writing = false,
+  polling = false,
+  connected = false;
+function message(text, error = false) {
+  $('message').textContent = text;
+  $('message').classList.toggle('error', error);
+}
+function call(args) {
+  return new Promise((resolve, reject) => {
+    if (!port) {
+      reject(Error('尚未连接设备'));
+      return;
+    }
+    const id = 'bumi-' + ++sequence;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(Error('请求超时，请查询进度；需要时点击停止流程。'));
+    }, 22000);
+    pending.set(id, {
+      resolve,
+      reject,
+      timer
+    });
+    port.postMessage({
+      id,
+      method: 'call',
+      args
+    });
+  });
+}
+function pair(range, input) {
+  range.addEventListener('input', () => {
+    input.value = range.value;
+  });
+  input.addEventListener('input', () => {
+    if (input.value !== '') range.value = input.value;
+  });
+}
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => {
+  document.body.style.paddingBottom = document.querySelector('footer').offsetHeight + 24 + 'px';
+}).observe(document.querySelector('footer'));
+document.addEventListener('input', event => {
+  if (event.target.classList.contains('setting') && event.target.id !== 'confirm') $('confirm').checked = false;
+});
+pair($('rounds-range'), $('rounds'));
+pair($('round-rest-range'), $('round-rest'));
+function settings() {
+  document.querySelectorAll('.setting').forEach(el => {
+    el.disabled = !connected || deviceBusy || writing;
+  });
+  $('run').disabled = !connected || deviceBusy || writing || !motions.length;
+  $('validate').disabled = !connected || deviceBusy || writing || !motions.length;
+  $('ack').hidden = current.state !== 'awaiting_confirmation';
+  $('ack').disabled = !connected || writing || current.state !== 'awaiting_confirmation';
+  $('stop').disabled = !connected;
+  $('run').textContent = $('mode').value === 'dry' ? '开始模拟' : '开始真机播放';
+  $('add').disabled = !connected || deviceBusy || writing || $('steps').children.length >= 20;
+}
+function updateStrategy() {
+  document.body.classList.toggle('timed', $('strategy').value === 'timed_exit');
+  $('confirm').checked = false;
+  settings();
+}
+$('strategy').addEventListener('change', updateStrategy);
+$('mode').addEventListener('change', () => {
+  $('confirm').checked = false;
+  settings();
+});
+function number(input, min, max, integer = false) {
+  const raw = input.value.trim();
+  const val = raw === '' ? NaN : Number(raw);
+  if (!Number.isFinite(val) || val < min || val > max || integer && !Number.isInteger(val)) throw Error((input.getAttribute('aria-label') || '数字') + ' 需要' + min + '–' + max + (integer ? '的整数' : '之间的秒数'));
+  return val;
+}
+function addStep() {
+  const el = document.createElement('div');
+  el.className = 'motion';
+  el.innerHTML = '<div class="row"><span class="order"></span><select class="setting asset" aria-label="动作素材"></select><button class="setting mini up" aria-label="向前移动">↑</button><button class="setting mini down" aria-label="向后移动">↓</button><button class="setting mini remove">移除</button></div><div class="grid"><label>每轮播放次数<div class="meter"><input class="setting count-range" aria-label="播放次数滑块" type="range" min="1" max="20" value="1"><input class="setting count" aria-label="播放次数" type="number" min="1" max="20" step="1" value="1"></div></label><label>片段间休息（秒）<div class="meter"><input class="setting rest-range" aria-label="片段间休息滑块" type="range" min="0" max="600" value="0"><input class="setting rest" aria-label="片段间休息" type="number" min="0" max="600" step="1" value="0"></div></label><label class="window">本段播放窗口（秒，留空使用测时记录）<input class="setting window-value wide" aria-label="本段播放窗口" type="number" min="0.1" max="600" step="0.1" placeholder="已测时可留空，否则填写核准窗口"></label></div>';
+  const select = el.querySelector('.asset');
+  motions.forEach(m => {
+    const option = document.createElement('option');
+    option.value = m.id;
+    option.textContent = m.name + (Number.isInteger(m.recording_id) ? ' · ' + m.recording_id : '') + (m.verified ? '' : ' · 未验证，仅模拟');
+    select.append(option);
+  });
+  pair(el.querySelector('.count-range'), el.querySelector('.count'));
+  pair(el.querySelector('.rest-range'), el.querySelector('.rest'));
+  el.querySelector('.up').onclick = () => {
+    if (el.previousElementSibling) el.previousElementSibling.before(el);
+    renumber();
+  };
+  el.querySelector('.down').onclick = () => {
+    if (el.nextElementSibling) el.nextElementSibling.after(el);
+    renumber();
+  };
+  el.querySelector('.remove').onclick = () => {
+    if ($('steps').children.length > 1) el.remove();
+    renumber();
+  };
+  $('steps').append(el);
+  renumber();
+}
+function renumber() {
+  [...$('steps').children].forEach((el, i) => {
+    el.querySelector('.order').textContent = String(i + 1).padStart(2, '0');
+  });
+  settings();
+}
+$('add').onclick = () => {
+  if ($('steps').children.length < 20) addStep();
+};
+function args(action) {
+  const timed = $('strategy').value === 'timed_exit';
+  const steps = [...$('steps').children].map(el => {
+    const step = {
+      motion: el.querySelector('.asset').value,
+      play_count: number(el.querySelector('.count'), 1, 20, true),
+      rest_s: number(el.querySelector('.rest'), 0, 600)
+    };
+    if (timed && el.querySelector('.window-value').value.trim() !== '') {
+      step.playback_s = number(el.querySelector('.window-value'), 0.1, 600);
+    }
+    return step;
+  });
+  if (!steps.length) throw Error('动作库为空，请先检查动作绑定');
+  return {
+    action,
+    plan: {
+      rounds: number($('rounds'), 1, 20, true),
+      round_rest_s: number($('round-rest'), 0, 600),
+      steps
+    },
+    completion_strategy: $('strategy').value,
+    dry_run: $('mode').value === 'dry',
+    confirm: $('confirm').checked
+  };
+}
+function render(info) {
+  if (!info.current) return;
+  current = info.current;
+  deviceBusy = info.busy === true;
+  const done = current.exited_plays ?? current.completed_plays ?? 0;
+  const total = current.total_plays ?? 0;
+  $('progress').max = total || 1;
+  $('progress').value = done;
+  $('progress-text').textContent = (states[current.state] || current.state) + (total ? ' · 已执行 ' + done + '/' + total + ' 段' : '') + (current.round ? ' · 第 ' + current.round + '/' + current.total_rounds + ' 轮' : '') + (current.motion_name ? ' · ' + current.motion_name : '');
+  let note = current.completion_strategy === 'timed_exit' ? '按设定窗口退出；已执行段数不表示录制动作完整播放。' : current.dry_run ? '当前是模拟，机器人不会动作。' : '每段完整结束后点击继续，程序自动退出回放并进入下一段。';
+  if (current.state === 'playing_window') note += ' 剩余 ' + (current.playback_remaining_s ?? 0) + ' 秒。';
+  if (current.state === 'resting') note += ' 休息剩余 ' + current.rest_remaining_s + ' 秒。';
+  if (current.error) note += ' ' + current.error;
+  $('live-summary').textContent = $('progress-text').textContent;
+  $('progress-note').textContent = note;
+  $('detail').textContent = JSON.stringify(current, null, 2);
+  settings();
+}
+async function refresh() {
+  const info = await call({
+    action: 'info'
+  });
+  render(info);
+  return info;
+}
+async function perform(fn) {
+  if (writing) return;
+  writing = true;
+  settings();
+  try {
+    await fn();
+  } catch (err) {
+    message(err.message, true);
+  } finally {
+    writing = false;
+    settings();
+  }
+}
+$('validate').onclick = () => perform(async () => {
+  const result = await call(args('validate_plan'));
+  if (result.ok === false) throw Error(result.error);
+  message('预检通过：' + result.rounds + ' 轮，共 ' + result.total_plays + ' 次片段播放，休息共 ' + result.total_rest_s + ' 秒。' + (result.warnings?.length ? ' 部分素材未验证，仅可模拟。' : ''));
+});
+$('run').onclick = () => perform(async () => {
+  const request = args('run_plan');
+  if (!request.dry_run && !request.confirm) throw Error('真机播放前，请勾选现场确认。');
+  const result = await call(request);
+  $('confirm').checked = false;
+  if (result.ok === false || result.state === 'busy') throw Error(result.error || '已有任务运行中');
+  message(request.dry_run ? '模拟已开始。' : request.completion_strategy === 'timed_exit' ? '已开始按设定窗口播放，程序会逐段退出并继续。' : '已开始播放。看到本段完整结束后，点击“本段已完整结束，继续”。');
+  await refresh();
+});
+$('ack').onclick = () => {
+  const snapshot = {
+    ...current
+  };
+  perform(async () => {
+    if (snapshot.state !== 'awaiting_confirmation') throw Error('当前没有待确认的片段');
+    const result = await call({
+      action: 'continue',
+      job_id: snapshot.job_id,
+      confirmation_token: snapshot.confirmation_token,
+      confirm: true
+    });
+    if (result.ok === false) throw Error(result.error);
+    message('已确认。程序正在退出本段回放并继续。');
+    await refresh();
+  });
+};
+$('stop').onclick = async () => {
+  try {
+    const result = await call({
+      action: 'stop'
+    });
+    if (result.ok === false && result.control_reserved) throw Error(result.error || '退出未确认，请再次停止并检查机器人');
+    message('已发送停止请求，正在确认退出回放。');
+    await refresh();
+  } catch (err) {
+    message(err.message, true);
+  }
+};
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    await refresh();
+    $('connection').textContent = '已连接';
+  } catch (err) {
+    $('connection').textContent = '状态读取失败';
+    message(err.message, true);
+  } finally {
+    polling = false;
+    if (connected) setTimeout(poll, 500);
+  }
+}
+window.addEventListener('message', async event => {
+  if (event.source !== parent || event.data?.protocol !== 'motus.workbench/1' || !event.ports[0] || port) return;
+  port = event.ports[0];
+  port.onmessage = event => {
+    const response = event.data;
+    const item = pending.get(response?.id);
+    if (!item) return;
+    pending.delete(response.id);
+    clearTimeout(item.timer);
+    if (response.error) item.reject(Error(response.error));else item.resolve(response.result);
+  };
+  try {
+    const info = await refresh();
+    motions = (info.motions || []).sort((a, b) => Number(b.verified) - Number(a.verified));
+    connected = true;
+    if (!$('steps').children.length) addStep();
+    $('connection').textContent = '已连接';
+    if (info.library_error) message('动作库读取失败：' + info.library_error, true);
+    settings();
+    poll();
+  } catch (err) {
+    message(err.message, true);
+    $('connection').textContent = '连接失败';
+  }
+});
+</script></body></html>

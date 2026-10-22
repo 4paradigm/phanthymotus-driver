@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "motions": [
+    {
+      "id": "chest_expand",
+      "name": "扩胸",
+      "recording_id": null,
+      "verified": false,
+      "robot_id": null,
+      "description": "待现场录制和验证的双脚着地上肢动作候选素材",
+      "internal_repetitions": null,
+      "duration_s": null,
+      "timeout_s": null,
+      "completion_strategy": "operator",
+      "start_pose": null,
+      "end_pose": null,
+      "verification_notes": ""
+    },
+    {
+      "id": "arms_up",
+      "name": "双臂上举",
+      "recording_id": null,
+      "verified": false,
+      "robot_id": null,
+      "description": "待现场录制和验证的双脚着地上肢动作候选素材",
+      "internal_repetitions": null,
+      "duration_s": null,
+      "timeout_s": null,
+      "completion_strategy": "operator",
+      "start_pose": null,
+      "end_pose": null,
+      "verification_notes": ""
+    },
+    {
+      "id": "arms_forward_push",
+      "name": "双臂前推",
+      "recording_id": null,
+      "verified": false,
+      "robot_id": null,
+      "description": "待现场录制和验证的双脚着地上肢动作候选素材",
+      "internal_repetitions": null,
+      "duration_s": null,
+      "timeout_s": null,
+      "completion_strategy": "operator",
+      "start_pose": null,
+      "end_pose": null,
+      "verification_notes": ""
+    }
+  ]
+}
