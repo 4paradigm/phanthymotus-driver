@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
+from persona import PersonaPlugin
 
 
 SERVICE_TIMEOUT = 10.0
@@ -880,6 +881,15 @@ class U1Nodes:
     def add_playback_listener(self, listener) -> None:
         self._playback_listeners.append(listener)
 
+    def subscribe_core_text(self, topic: str, callback):
+        """Subscribe to a std_msgs/String topic on the Agent Core domain (e.g. asr data/json)."""
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        return self.core.create_subscription(self.String, topic, lambda msg: callback(msg.data), qos)
+
+    def unsubscribe_core(self, subscription) -> None:
+        self.core.destroy_subscription(subscription)
+
     def string_call(self, name: str, params: dict) -> dict:
         from robo_sdk.srv import StringCall
         request = StringCall.Request()
@@ -1442,6 +1452,10 @@ class AudioPlugin:
                 _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, active["tool_name"])
         self.running = False
         return result
+
+    def active_action_id(self) -> str | None:
+        with self._lock:
+            return self._active["action_id"] if self._active else None
 
     def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio") -> dict:
         with self._lock:
@@ -2110,9 +2124,24 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     catalog_available = hasattr(nodes, "motion_catalog")
     camera_left = EyeCameraPlugin(nodes, "left")
     camera_right = EyeCameraPlugin(nodes, "right")
+    expression = ExpressionPlugin(audio, motion_catalog, catalog_available)
+    persona = build_persona_plugin(audio, expression, nodes, config.get("persona"))
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
-               ExpressionPlugin(audio, motion_catalog, catalog_available),
+               expression,
                HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes),
+               persona,
                camera_left, camera_right]
     return plugins
+
+
+def build_persona_plugin(audio: AudioPlugin, expression: ExpressionPlugin, nodes: Any,
+                         persona_config: dict | None) -> PersonaPlugin:
+    """Persona card shares the tts/expression channel so playback stays serial."""
+    plugin = PersonaPlugin(
+        audio, _acp_notify, persona_config or {},
+        expression_names=list(expression.EXPRESSIONS),
+        subscribe=getattr(nodes, "subscribe_core_text", None),
+        unsubscribe=getattr(nodes, "unsubscribe_core", None))
+    plugin.expression_lookup = lambda name: (expression.EXPRESSIONS.get(name) or (None,))[0]
+    return plugin

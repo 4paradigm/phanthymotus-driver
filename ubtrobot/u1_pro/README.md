@@ -10,6 +10,7 @@
 部署服务使用 `restart: always`，用于主机或 Docker daemon 重启后自动恢复驱动；运维人员手动停止容器后，Docker 会在 daemon 重启时再次启动它。若需临时停用，应通过部署编排管理该服务，而不是依赖 `docker stop` 保持停机。
 - `tts`：通过 U1 SDK `play_text` 进行文本播报，支持打断和 ACP 异步完成回报。真机音量服务不纳入本驱动能力。
 - `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。
+- `persona`：多人格陪伴卡片（默认晴姐/安宁/岚总/清照，可在 `config.yaml` 的 `persona.personas` 覆盖）。`route(text)` 按“安全 > 停止 > 明确点名 > 关键词命中数（处理否定词，平局保持当前人格）”判定；需要切换时由驱动自行排队播报身份，之后 `say(text, expression?)` 的回复一定排在身份播报之后。卡片与 `tts`/`expression` 共用同一动作槽并串行等待完成，通道持续忙碌时以 ACP `error` 回报而不虚报成功。安全命中会打断并清空队列、退出人格、播报安全提示，此后关键词不会再拉回人格，需 `set`/`reset` 恢复。可选 `start(input_topic)` 订阅 `asr` 卡片的 `data/json` 输出自动路由（忽略 `is_final=false`，5 秒内同文本去重）。声明了 `on_interrupt_speak`/`on_interrupt_all` 钩子（绕过 ACP 屏障，直接清空队列并打断播报）；与其他 U1 Pro 卡片一致，不声明 `x-resource`。本卡不生成回复内容。
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
 
