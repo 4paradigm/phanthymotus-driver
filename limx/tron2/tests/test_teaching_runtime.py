@@ -103,7 +103,7 @@ def recording(count=6):
     return pack_trajectory(BINDING,frames)
 
 
-def test_replay_binding_speed_corruption_and_start_rejected():
+def test_replay_binding_corruption_and_start_rejected():
     async def run():
         reader=Reader();replay=Replay(reader,allowed,lambda:True)
         reader.q[0]=.5
@@ -111,8 +111,27 @@ def test_replay_binding_speed_corruption_and_start_rejected():
         assert reader.commands==[]
         with pytest.raises(ValueError,match='binding'):read_trajectory(recording(),dict(BINDING,serial='other'))
         with pytest.raises(ValueError):read_trajectory(recording().replace(b'0.0001',b'0.0002'))
-        bad=[state(0),state(1)];bad[1]['q'][0]=1
-        with pytest.raises(ValueError,match='speed'):read_trajectory(pack_trajectory(BINDING,bad))
+    asyncio.run(run())
+
+
+def test_replay_above_old_speed_limit_preserves_frames_and_timing():
+    async def run():
+        states=[state(i) for i in range(6)]
+        for i,s in enumerate(states):
+            s['q'][0]=i*.02
+            s['gripper']=[0,20]
+        raw=pack_trajectory(BINDING,states)
+        _,frames=read_trajectory(raw,BINDING)
+        assert (frames[1]['q'][0]-frames[0]['q'][0])*1e9/(frames[1]['t_ns']-frames[0]['t_ns'])>.8
+        assert [f['t_ns'] for f in frames]==[s['received_ns']-states[0]['received_ns'] for s in states]
+        reader=Reader();replay=Replay(reader,allowed,lambda:True)
+        preview=await replay.play(raw,BINDING,{})
+        assert preview['duration_seconds']==frames[-1]['t_ns']/1e9
+        result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
+            workspace_clear=True,take_control=True,gripper_speed=30,gripper_force=20))
+        outcome=await replay.wait(result['action_id'])
+        assert outcome['status']=='completed',outcome
+        assert [q[:14] for kind,q in reader.commands if kind=='arm']==[s['q'][:14] for s in states]
     asyncio.run(run())
 
 

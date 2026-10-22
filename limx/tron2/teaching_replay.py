@@ -15,7 +15,6 @@ from state import vector
 from vendor import validate_movej, motion_readiness
 from gripper import state_data, MAX_OPENING
 
-MAX_SPEED = .8  # rad/s; reject faster recordings without changing their speed.
 MAX_GAP_NS = 100_000_000
 START_RAD = math.radians(2)
 GRIP_TOLERANCE = 3
@@ -65,8 +64,6 @@ def read_trajectory(raw, binding=None):
             dt=frame['t_ns']-previous['t_ns']
             if not 0<dt<=MAX_GAP_NS:
                 raise ValueError('trajectory_time_gap')
-            if any(abs(a-b)*1e9/dt>MAX_SPEED for a,b in zip(frame['q'],previous['q'])):
-                raise ValueError('trajectory_speed_limit')
         elif frame['t_ns']!=0:
             raise ValueError('trajectory_start_time')
         previous=frame
