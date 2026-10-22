@@ -152,6 +152,37 @@ def test_stopping_the_card_does_not_release_the_latch(estop):
     assert latch.latched is True
 
 
+def test_actuator_start_reports_ready(estop):
+    latch = estop.EmergencyStopLatch()
+    card = estop.EstopPlugin({}, 'robot', None, latch)
+
+    assert card.get_tool()['type'] == 'actuator'
+    assert card.dispatch('start', {}) == {'state': 'ready'}
+
+
+def test_servo_only_configuration_pauses_and_zeroes_on_latch(monkeypatch, estop):
+    """Without `loco` there is no other listener: dropping commands is not enough."""
+    repo_root = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(repo_root))
+    monkeypatch.setitem(sys.modules, 'highcontrol_py', types.SimpleNamespace(
+        ControlCmd=types.SimpleNamespace(DEFAULT='DEFAULT')))
+    sys.modules.pop('loco_servo', None)
+    from noetix.bumi import loco_servo
+
+    high = _FakeHighCtrl()
+    latch = estop.EmergencyStopLatch()
+    servo = loco_servo.LocoServoPlugin(
+        {'dry_run': False}, 'robot', None, high,
+        loco_plugin=None, estop=latch)
+    servo._running = True
+
+    latch.trigger('estop_card', 'test')
+
+    assert servo._paused is True
+    assert high.commands[-1] == (0.0, 0.0, 0.0)
+    assert servo._halt(False)['code'] == 'ESTOP_ACTIVE'
+
+
 def test_bundle_wires_one_latch_into_loco_and_the_card(monkeypatch, device, estop):
     """The card alone is not the safety property: `loco` must share its latch."""
     monkeypatch.setitem(sys.modules, 'device', device)

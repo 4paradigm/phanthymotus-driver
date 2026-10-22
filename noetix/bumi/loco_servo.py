@@ -341,6 +341,10 @@ class LocoServoPlugin:
         # fallback below publishes straight at the SDK when `loco` is disabled;
         # this keeps the emergency stop honest in that configuration too.
         self._estop = estop
+        if estop is not None and hasattr(estop, "add_on_latch"):
+            # In a `loco_servo`-only deployment nothing else can zero an
+            # already-running stream, so this card has to be a latch listener.
+            estop.add_on_latch(self._on_estop_latched)
         config = plugin_config or {}
 
         self._expected_hz = float(config.get("expected_hz", DEFAULT_EXPECTED_HZ))
@@ -589,13 +593,13 @@ class LocoServoPlugin:
         # The gate about the *robot* comes before the one about this process. An
         # operator whose robot is mid-dance, told "没有 ROS 上下文", goes looking
         # in the wrong place entirely.
-        conflict = self._chassis_conflict()
-        if conflict:
-            return {"state": "error", "message": conflict}
-
         if self._estop is not None and self._estop.latched:
             return {"state": "error", "code": "ESTOP_ACTIVE",
                     "message": "紧急停止已锁存：先调用 estop.reset(confirm=true)"}
+
+        conflict = self._chassis_conflict()
+        if conflict:
+            return {"state": "error", "message": conflict}
 
         if self._executor is None:
             return {"state": "error", "message": "没有 ROS 上下文，无法订阅"}
@@ -659,6 +663,9 @@ class LocoServoPlugin:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             if not halted:
+                if self._estop is not None and self._estop.latched:
+                    return {"state": "error", "code": "ESTOP_ACTIVE",
+                            "message": "紧急停止已锁存：先调用 estop.reset(confirm=true)"}
                 conflict = self._chassis_conflict()
                 if conflict:
                     return {"state": "paused", "message": conflict,
@@ -804,6 +811,21 @@ class LocoServoPlugin:
             else:
                 self._posture_problem_text = ""
         return self._posture_problem_text
+
+    def _on_estop_latched(self, source: str, reason: str) -> None:
+        """Pause the stream and zero the chassis when the latch is set.
+
+        With `loco` enabled it owns the same latch and sends the zero itself.
+        This path matters in a `loco_servo`-only deployment, where the fallback
+        below publishes straight at the SDK: dropping future commands is not
+        the same as stopping a stream that is already in flight.
+        """
+        with self._lock:
+            self._paused = True
+            self._explicit_velocity_owner = False
+        self._invalidate_mode_cache()
+        self._hold()
+        print(f"[loco_servo] paused by estop ({source})", flush=True)
 
     def pause_for_explicit_command(self, reason: str = "") -> bool:
         """Called by the call-shaped cards before they move the robot themselves.

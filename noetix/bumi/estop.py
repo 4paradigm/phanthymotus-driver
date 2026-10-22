@@ -220,7 +220,9 @@ class EstopPlugin:
 
     def start(self) -> dict:
         self._stopped = False
-        return {"state": "running"}
+        # Actuator lifecycle per the driver contract: `ready`, not `running`.
+        # `running` is what a sensor card reports once it is publishing.
+        return {"state": "ready"}
 
     def stop(self) -> None:
         # Stopping the card must not release the latch: a silent release when a
