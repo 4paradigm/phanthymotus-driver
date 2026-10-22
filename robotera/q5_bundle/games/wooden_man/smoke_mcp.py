@@ -8,7 +8,7 @@ import main as driver
 
 
 def run():
-    driver._bundle = driver.Q5Bundle({"plugins": {"wooden_man": {"enabled": True}, "wooden_man_motion": {"enabled": True}}},
+    driver._bundle = driver.Q5Bundle({"plugins": {"wooden_man": {"enabled": True}}},
                                     "smoke", None, None)
     driver._bundle.start_all()
     server = ThreadingHTTPServer(("127.0.0.1", 0), driver.make_handler())
@@ -31,12 +31,8 @@ def run():
 
     try:
         tools = call("tools/list", {})["tools"]
-        assert {t["name"] for t in tools} == {"wooden_man", "wooden_man_motion"}, tools
+        assert {t["name"] for t in tools} == {"wooden_man"}, tools
         assert next(t for t in tools if t["name"] == "wooden_man")["type"] == "processor"
-        for action in ("config", "info"):
-            result = call("tools/call", {"name": "wooden_man_motion", "arguments": {"action": action}})
-            motion = json.loads(result["content"][0]["text"])
-            assert motion["state"] == "idle" and motion["topic_out"][0]["topic"] == "/smoke/wooden_man_motion/feedback"
         result = call("tools/call", {"name": "wooden_man", "arguments": {"action": "info"}})
         payload = json.loads(result["content"][0]["text"])
         assert isinstance(payload, dict) and payload["state"] == "idle", payload

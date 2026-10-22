@@ -12,11 +12,10 @@ import queue
 import re
 import threading
 import time
-import uuid
 
 PRESETS = {"relaxed": (0.10, 0.22), "standard": (0.07, 0.15),
            "sensitive": (0.04, 0.10)}
-OPTIONS = dict(sensitivity="standard", detect_fingers=False, host_interaction=True, robot_actions=True)
+OPTIONS = dict(sensitivity="standard", detect_fingers=False, host_interaction=True)
 PARTS = {
     "head": ("头部", "Head", (0, 1, 2, 3, 4)),
     "torso": ("躯干", "Torso", (5, 6, 11, 12)),
@@ -38,12 +37,12 @@ BODY_EDGES = ((5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12),
 DEFAULTS = dict(cue_seconds=3.0, settle_seconds=0.5, watch_seconds=3.0,
                 motion_threshold=0.07, moving_frames=3, pose_timeout=1.5,
                 confidence=0.5, finger_threshold=0.15, finger_frames=2,
-                robot_settle_seconds=1.0, motion_timeout=30.0, preparation_timeout=20.0)
+                preparation_timeout=20.0)
 
 
 def effective_config(config):
     cfg = dict(DEFAULTS, **OPTIONS)
-    cfg.update(config or {})
+    cfg.update({k: v for k, v in (config or {}).items() if k in DEFAULTS or k in OPTIONS})
     # Old callers that supplied raw thresholds retain their existing behavior.
     if config and "sensitivity" not in config and any(config.get(k, DEFAULTS[k]) != DEFAULTS[k] for k in ("motion_threshold", "finger_threshold")):
         cfg["sensitivity"] = "custom"
@@ -77,15 +76,12 @@ def encode_speech(words):
 class Game:
     """Clock-injected game logic, independent of ROS and robot hardware."""
 
-    def __init__(self, say, config=None, clock=time.monotonic, emit_action=None):
+    def __init__(self, say, config=None, clock=time.monotonic):
         self.say, self.clock = say, clock
-        self.emit_action = emit_action
         self.cfg = effective_config(config)
         self.reset()
 
     def reset(self):
-        self.cancel_motion()
-        self.session = uuid.uuid4().hex
         self.phase = "waiting"
         self.round = 0
         self.deadline = 0.0
@@ -101,7 +97,6 @@ class Game:
         self.part_counts = {}
         self.hands = {}
         self.frame = None
-        self.pending_motion = None
         self.result = ""
         self.ready_since = None
         self.ready_frames = 0
@@ -110,33 +105,7 @@ class Game:
         self.last_observation = None
         self.prompt_at = None
         self.replay_prompted = False
-        self.motion_stage = ""
-        self.motion_error = ""
 
-    def cancel_motion(self):
-        pending = getattr(self, "pending_motion", None)
-        if pending and self.emit_action:
-            self.emit_action({"kind": "wooden_man_motion_cancel", "request_id": pending["request_id"],
-                              "issued_at": time.time()})
-
-    def action(self, gesture, next_phase, target=None):
-        if not self.cfg["robot_actions"] or self.emit_action is None:
-            self.advance(next_phase)
-            return
-        request = {"kind": "wooden_man_motion_request", "request_id": self.session + ":" + uuid.uuid4().hex,
-                   "gesture": gesture, "issued_at": time.time()}
-        if target is not None:
-            request["target"] = target
-        self.pending_motion = request
-        self.after_motion = next_phase
-        self.motion_deadline = self.clock() + self.cfg["motion_timeout"]
-        self.motion_hard_deadline = self.clock() + self.cfg["motion_timeout"] * 4
-        self.motion_progress_seq = -1
-        self.motion_stage, self.motion_error = "queued", ""
-        self.motion_not_before = self.clock() + self.cfg["cue_seconds"]
-        self.last_motion_send = self.clock()
-        self.phase = "robot_action"
-        self.emit_action(dict(request))
 
     def advance(self, phase):
         if phase == "countdown":
@@ -150,42 +119,6 @@ class Game:
             if phase in ("lost", "won", "error"):
                 self.prompt_at = self.clock() + self.cfg["cue_seconds"]
 
-    def motion_feedback(self, payload):
-        if not isinstance(payload, dict) or payload.get("kind") != "wooden_man_motion_feedback" or not self.pending_motion:
-            return
-        if payload.get("request_id") != self.pending_motion["request_id"] or self.phase != "robot_action":
-            return
-        state = payload.get("state")
-        self.motion_stage = payload.get("stage", self.motion_stage)
-        if state == "running":
-            progress = payload.get("progress_seq")
-            if isinstance(progress, int) and not isinstance(progress, bool) and progress > self.motion_progress_seq:
-                self.motion_progress_seq = progress
-                self.motion_deadline = min(self.motion_hard_deadline, self.clock() + self.cfg["motion_timeout"])
-            return
-        if state == "completed":
-            if payload.get("home_verified") is not True:
-                self.pending_motion = None
-                self.phase, self.reason = "error", "motion_home_unverified"
-                self.prompt_at = None
-                self.motion_error = "Missing verified neutral-pose completion"
-                self.say("没有收到手臂归位确认，本轮暂停，请更新动作卡。")
-                return
-            self.pending_motion = None
-            self.phase = "robot_settle"
-            self.deadline = max(self.clock() + self.cfg["robot_settle_seconds"], self.motion_not_before)
-        elif state in ("error", "cancelled"):
-            self.pending_motion = None
-            self.phase = "error"
-            self.reason = "robot_motion_failed"
-            self.prompt_at = None
-            self.motion_error = str(payload.get("message", ""))
-            if "Prepare arm_control" in self.motion_error:
-                self.say("机器人位置直控尚未准备，游戏暂停，请先完成位置直控准备。")
-            elif str(self.motion_stage).startswith("homing"):
-                self.say("手臂自动归位没有完成，本轮暂停。")
-            else:
-                self.say("手臂动作尚未到位，本轮暂停。")
 
     def preparation(self, payload):
         if self.phase != "preparing":
@@ -221,26 +154,13 @@ class Game:
             self.ready_frames += 1
             self.ready = self.ready_frames >= 5 and now - self.ready_since >= .8
             if self.ready and self.phase == "preparing" and now >= self.preparation_not_before:
-                self.action("welcome", "countdown")
+                self.advance("countdown")
         else:
             self.ready_since, self.ready_frames, self.ready = None, 0, False
             if now - self.last_guidance >= 6:
                 self.say(message)
                 self.last_guidance = now
 
-    def point_target(self):
-        if not self.frame:
-            return None
-        size = self.frame.get("image_size")
-        if not isinstance(size, list) or len(size) != 2 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0 for v in size):
-            return None
-        points = visible_points(self.frame["persons"][0]["keypoints"], self.cfg["confidence"])
-        region = [points[i] for i in self.highlight if i in points]
-        if not region:
-            return None
-        # Centre of the highlighted region, normalised in camera image coordinates.
-        return {"x": max(0., min(1., sum(p[0] for p in region) / len(region) / size[0])),
-                "y": max(0., min(1., sum(p[1] for p in region) / len(region) / size[1]))}
 
     def status(self):
         return dict(phase=self.phase, round=self.round, rounds=3, reason=self.reason,
@@ -249,8 +169,6 @@ class Game:
                     highlight_indices=list(self.highlight), sensitivity=self.cfg["sensitivity"],
                     detect_fingers=self.cfg["detect_fingers"],
                     result=self.result, ready=self.ready,
-                    motion_stage=self.motion_stage, motion_error=self.motion_error,
-                    motion_request_id=self.pending_motion["request_id"] if self.pending_motion else None,
                     hands={side: {"samples": h["samples"], "visible": h["visible"],
                                   "ready": h["visible"] and h["samples"] >= 3 and h["last"] is not None and self.clock() - h["last"] <= self.cfg["pose_timeout"]}
                            for side, h in self.hands.items()})
@@ -273,7 +191,7 @@ class Game:
                 self.preparation_not_before = self.clock() + self.cfg["cue_seconds"]
                 self.say("好，我先确认你站好了，请面向镜头。")
             else:
-                self.action("welcome", "countdown")
+                self.advance("countdown")
         elif self.phase in ("won", "lost", "error") and self.replay_prompted and text in ("不玩了", "不玩", "结束", "不用了"):
             self.reset()
             self.say("好的，休息一下，想玩时再叫我。")
@@ -283,13 +201,7 @@ class Game:
         self.result = phase
         self.say(words)
         self.prompt_at = self.clock() + self.cfg["cue_seconds"]
-        if phase == "lost" and reason == "movement":
-            target = self.point_target()
-            self.action("point" if target else "encourage", phase, target)
-        elif phase == "won":
-            self.action("celebrate", phase)
-        elif self.cfg["host_interaction"]:
-            self.action("encourage", phase)
+
 
     def cue(self):
         self.round += 1
@@ -407,19 +319,7 @@ class Game:
 
     def tick(self):
         now = self.clock()
-        if self.phase == "robot_action":
-            if now >= self.motion_deadline:
-                self.cancel_motion()
-                self.pending_motion = None
-                self.phase, self.reason = "error", "robot_motion_timeout"
-                self.prompt_at = None
-                self.say("手臂动作长时间没有进展，游戏暂停。")
-            elif now - self.last_motion_send >= .5:
-                self.emit_action(dict(self.pending_motion))
-                self.last_motion_send = now
-        elif self.phase == "robot_settle" and now >= self.deadline:
-            self.advance(self.after_motion)
-        elif self.phase == "preparing" and now >= self.deadline:
+        if self.phase == "preparing" and now >= self.deadline:
             self.finish("error", "preparation_timeout", "还没有看清你，请调整站位后重新开始。")
         elif self.phase == "intermission" and now >= self.deadline:
             self.cue()
@@ -446,11 +346,8 @@ class Game:
                 else:
                     if self.cfg["host_interaction"]:
                         self.say(f"不错，第{('二' if self.round == 1 else '三')}轮来了，准备好。")
-                        if self.cfg["robot_actions"] and self.emit_action:
-                            self.action("round", "cue")
-                        else:
-                            self.phase = "intermission"
-                            self.deadline = now + self.cfg["cue_seconds"]
+                        self.phase = "intermission"
+                        self.deadline = now + self.cfg["cue_seconds"]
                     else:
                         self.cue()
         elif self.phase in ("won", "lost", "error") and self.cfg["host_interaction"] and self.prompt_at is not None and now >= self.prompt_at and not self.replay_prompted:
@@ -538,7 +435,6 @@ def _worker(topics, output, status_topic, config, commands, statuses):
         rclpy.init()
         node = Node("q5_wooden_man")
         pub = node.create_publisher(String, output, 10)
-        action_pub = node.create_publisher(String, status_topic.rsplit("/", 1)[0] + "/actions", 10)
         status_pub = node.create_publisher(String, status_topic, 10)
         image_pub = node.create_publisher(CompressedImage, status_topic.rsplit("/", 1)[0] + "/highlight", 1)
 
@@ -547,10 +443,7 @@ def _worker(topics, output, status_topic, config, commands, statuses):
             msg.data = encode_speech(words)
             pub.publish(msg)
 
-        def emit_action(payload):
-            action_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
-
-        game = Game(say, config, emit_action=emit_action)
+        game = Game(say, config)
         latest_frame = {}
         last_image = 0.0
         image_transition = None
@@ -566,8 +459,6 @@ def _worker(topics, output, status_topic, config, commands, statuses):
                 if not game.result:
                     latest_frame = payload
                 game.pose(payload)
-            elif isinstance(payload, dict) and payload.get("kind") == "wooden_man_motion_feedback":
-                game.motion_feedback(payload)
             else:
                 game.text(payload)
 
@@ -622,8 +513,6 @@ def _worker(topics, output, status_topic, config, commands, statuses):
         statuses.put({"state": "error", "message": str(exc)})
     finally:
         if node is not None:
-            if "game" in locals():
-                game.cancel_motion()
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
@@ -633,7 +522,6 @@ class WoodenManPlugin:
     def __init__(self, config, namespace):
         self.config = effective_config({k: v for k, v in config.items() if k in DEFAULTS or k in OPTIONS})
         self.configured_topics = {k: config.get(k, "") for k in ("asr_topic", "pose_topic")}
-        self.configured_topics["motion_feedback_topic"] = config.get("motion_feedback_topic", f"/{namespace}/wooden_man_motion/feedback")
         self.lock = threading.RLock()
         self.prefix = f"/{namespace}/wooden_man"
         self.process = None
@@ -646,13 +534,12 @@ class WoodenManPlugin:
                  "input_topics": {"type": "array", "items": {"type": "string"},
                                   "description": "画布连接的 ASR 和 Pose 输出 topic"},
                  "asr_topic": {"type": "string", "description": "ASR 输出 topic，画布未传递多输入时填写"},
-                 "pose_topic": {"type": "string", "description": "Pose 输出 topic，画布未传递多输入时填写"},
-                 "motion_feedback_topic": {"type": "string", "description": "动作卡feedback；通过配置订阅，不在画布拉回边"}}
+                 "pose_topic": {"type": "string", "description": "Pose 输出 topic，画布未传递多输入时填写"}}
         return {"name": "wooden_man", "title": "一二三木头人", "type": "processor", "multiInstance": False,
-                "description": "单人三轮木头人主持：准备引导、语音重开、部位高亮及动作事件；连接wooden_man_motion执行手势并等回位反馈，身体原地站立。",
+                "description": "单人三轮木头人：语音口令、准备引导、姿态与手指识别、部位播报及高亮、语音重开；机器人固定站立，不控制手臂或其他关节。",
                 "inputSchema": {"type": "object", "properties": props, "required": ["action"],
                                 "x-action-params": {
-                                    "start": {"params": ["input_topic", "input_topics", "asr_topic", "pose_topic", "motion_feedback_topic"], "description": "连接画布，等待玩家喊游戏开始"},
+                                    "start": {"params": ["input_topic", "input_topics", "asr_topic", "pose_topic"], "description": "连接画布，等待玩家喊游戏开始"},
                                     "stop": {"params": [], "description": "停止游戏并释放订阅"},
                                     "info": {"params": [], "description": "查看轮次和游戏状态"},
                                     "reset": {"params": [], "description": "回到等待口令，不直接开始游戏"}}},
@@ -663,9 +550,7 @@ class WoodenManPlugin:
                               {"topic": self.prefix + "/status", "format": "data/json",
                                "desc": "游戏状态 status（仅监视，不接TTS）"},
                               {"topic": self.prefix + "/highlight", "format": "image/jpeg",
-                               "desc": "判定骨架高亮（非RGB），红色为移动部位，失败时定格"},
-                              {"topic": self.prefix + "/actions", "format": "data/json",
-                               "desc": "主持动作actions → wooden_man_motion，不能接TTS"}],
+                               "desc": "判定骨架高亮（非RGB），红色为移动部位，失败时定格"}],
                 "configSchema": {"type": "object", "properties": {
                     "sensitivity": {"type": "string", "title": "灵敏度预设",
                                     "enum": ["relaxed", "standard", "sensitive", "custom"],
@@ -673,19 +558,14 @@ class WoodenManPlugin:
                     "detect_fingers": {"type": "boolean", "title": "检测手指动作", "default": False,
                                        "description": "需同时开启Pose的hands；双手须清晰可见，缺少手部数据不会判过关。"},
                     "host_interaction": {"type": "boolean", "title": "准备引导和语音重开", "default": True},
-                    "robot_actions": {"type": "boolean", "title": "机器人主持动作", "default": True,
-                                      "description": "需接wooden_man_motion动作卡，并先完成arm_control位置直控准备。"},
                     "asr_topic": {"type": "string", "advanced": True, "description": "可选：画布ASR输出topic"},
                     "pose_topic": {"type": "string", "advanced": True, "description": "可选：画布Pose输出topic"},
-                    "motion_feedback_topic": {"type": "string", "title": "动作完成反馈topic", "default": self.configured_topics["motion_feedback_topic"],
-                                              "description": "复制wooden_man_motion的feedback输出topic；同一Q5驱动已自动填写，无需反向连线。"},
                     **{k: {"type": "integer" if k in ("moving_frames", "finger_frames") else "number", "default": v, "exclusiveMinimum": 0,
                            "title": {"cue_seconds": "口令播报预算（秒）", "settle_seconds": "站稳等待（秒）",
                                      "watch_seconds": "每轮观察时长（秒）", "motion_threshold": "身体位移阈值／躯干长度",
                                      "moving_frames": "身体连续超阈帧数", "pose_timeout": "感知超时（秒）",
                                      "confidence": "关键点最低置信度", "finger_threshold": "手指位移阈值／手掌长度",
-                                     "finger_frames": "手指连续超阈采样数", "robot_settle_seconds": "动作完成后站稳等待（秒）",
-                                     "motion_timeout": "单阶段无进展超时（秒）", "preparation_timeout": "准备站位超时（秒）"}[k],
+                                     "finger_frames": "手指连续超阈采样数", "preparation_timeout": "准备站位超时（秒）"}[k],
                            "advanced": True, **({"x-show-when": {"sensitivity": ["custom"]}} if k in ("motion_threshold", "finger_threshold") else {})}
                        for k, v in DEFAULTS.items()}}}}
 
@@ -739,7 +619,7 @@ class WoodenManPlugin:
             config[key] = args.get(key, supplied.get(key, config[key]))
         if not isinstance(config["sensitivity"], str) or config["sensitivity"] not in (*PRESETS, "custom"):
             raise ValueError("无效参数: sensitivity")
-        for key in ("detect_fingers", "host_interaction", "robot_actions"):
+        for key in ("detect_fingers", "host_interaction"):
             if not isinstance(config[key], bool):
                 raise ValueError(f"{key}须为布尔值")
         if "sensitivity" not in args and "sensitivity" not in supplied and any(
@@ -800,10 +680,6 @@ class WoodenManPlugin:
         topics = list(dict.fromkeys(topics))
         if len(topics) < 2:
             return {"state": "error", "message": "请连接ASR和Pose两路输入；若画布只注入一路input_topic，请在卡片配置填写asr_topic和pose_topic"}
-        if config["robot_actions"]:
-            if not configured_topics["motion_feedback_topic"]:
-                return {"state": "error", "message": "开启主持动作时须填写motion_feedback_topic"}
-            topics = list(dict.fromkeys([*topics, configured_topics["motion_feedback_topic"]]))
         if self.process is not None and self.process.is_alive() and topics == self.topics and config == self.config:
             return self.info()
         self.stop()

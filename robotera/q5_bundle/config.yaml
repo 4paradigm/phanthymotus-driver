@@ -11,7 +11,6 @@ plugins:
     sensitivity: standard
     detect_fingers: false  # Also enable hands on the upstream Pose card to use this.
     host_interaction: true
-    robot_actions: true
     cue_seconds: 3.0
     settle_seconds: 0.5
     watch_seconds: 3.0
@@ -21,13 +20,7 @@ plugins:
     confidence: 0.5
     finger_threshold: 0.15
     finger_frames: 2
-    robot_settle_seconds: 1.0
-    motion_timeout: 30.0
     preparation_timeout: 20.0
-  wooden_man_motion:
-    enabled: true
-    image_mirrored: false
-    arrival_timeout: 8.0
   base_drive:
     enabled: true
     # Match the vendor SDK's direct base-drive contract, not the remote-control stream.

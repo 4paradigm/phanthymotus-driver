@@ -1,61 +1,38 @@
-"""Host interaction and measured/cancellable arm execution, without hardware."""
+"""Voice-only hosting: no robot actions, feedback topics or hardware readiness."""
 import importlib.util
-import math
-import threading
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1] / "robotera/q5_bundle"
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(name, ROOT / (name + ".py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-game_module = load("wooden_man")
-motion = load("wooden_man_motion")
+spec = importlib.util.spec_from_file_location("wooden_man", ROOT / "wooden_man.py")
+game_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(game_module)
 
 
 def pose(dx=0, joint=None):
-    points = [[100 + i * 3 + (dx if joint is None or i == joint else 0),
-               100 + (100 if i >= 11 else 0), .99] for i in range(17)]
-    return {"image_size": [320, 320], "persons": [{"id": 1, "keypoints": points}]}
+    return {"image_size": [320, 320], "persons": [{"id": 1, "keypoints": [
+        [100 + i * 3 + (dx if joint is None or i == joint else 0),
+         100 + (100 if i >= 11 else 0), .99] for i in range(17)]}]}
 
 
 class Host:
     def __init__(self, **config):
-        self.now = 0.
-        self.words, self.actions = [], []
-        self.game = game_module.Game(self.words.append, config, clock=lambda: self.now, emit_action=self.actions.append)
+        self.now, self.words = 0., []
+        self.game = game_module.Game(self.words.append, config, clock=lambda: self.now)
 
     def step(self, seconds):
         self.now += seconds
         self.game.tick()
 
-    def ready(self):
+    def ready(self, dx=0):
         for _ in range(17):
-            self.game.pose(pose())
+            self.game.pose(pose(dx))
             self.step(.2)
-
-    def complete(self):
-        rid = self.game.pending_motion["request_id"]
-        self.step(3.01)
-        self.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": "old-id", "state": "completed"})
-        assert self.game.phase == "robot_action"
-        self.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": rid, "state": "completed", "home_verified": True})
-        assert self.game.phase == "robot_settle"
-        self.step(1.01)
 
     def watch(self):
         self.game.text("游戏开始")
         self.ready()
-        assert self.game.phase == "robot_action" and self.actions[-1]["gesture"] == "welcome"
-        self.complete()
         assert self.game.phase == "countdown"
         self.step(5)
         self.step(3.5)
@@ -67,433 +44,100 @@ class Host:
             self.step(.1)
 
 
-def test_waiting_is_silent_and_does_not_check_players_until_start_command():
+def test_waiting_is_silent_and_never_checks_players_before_start():
     h = Host()
     for _ in range(50):
         h.game.pose({"persons": []})
         h.step(.1)
     h.ready()
     h.game.preparation({"persons": []})
-    assert h.game.phase == "waiting" and not h.words and not h.actions
+    assert h.game.phase == "waiting" and not h.words
     assert not h.game.ready and h.game.ready_frames == 0 and h.game.last_observation is None
     h.game.text("游戏开始")
-    assert h.game.phase == "preparing"
     h.game.pose({"persons": []})
     assert h.words[-1] == "没有看清玩家，请一个人站在镜头前。"
-    h.ready()
-    assert h.game.phase == "robot_action" and h.actions[-1]["gesture"] == "welcome"
 
 
 @pytest.mark.parametrize("dx", [-90, 150])
-def test_clear_player_near_either_edge_can_prepare_and_start(dx):
+def test_clear_player_at_either_edge_enters_countdown_without_arm_preparation(dx):
     h = Host()
     h.game.text("游戏开始")
-    for _ in range(17):
-        h.game.pose(pose(dx))
-        h.step(.2)
-    assert h.game.phase == "robot_action" and h.actions[-1]["gesture"] == "welcome"
-    assert all("中央" not in words for words in h.words)
-    h.complete()
+    h.ready(dx)
     assert h.game.phase == "countdown"
+    assert h.words[-1] == "游戏开始，五秒后开始。"
+    assert not any("中央" in words or "手臂" in words for words in h.words)
 
 
-def test_reset_returns_to_silent_waiting_even_without_a_visible_player():
-    h = Host()
-    h.game.text("游戏开始")
-    h.game.pose({"persons": []})
-    h.game.reset()
-    previous = list(h.words)
-    for _ in range(100):
-        h.game.pose({"persons": []})
-        h.step(.1)
-    assert h.game.phase == "waiting" and h.words == previous and not h.actions
-
-
-def test_preparation_never_plays_with_multiple_people_or_missing_hands():
+def test_preparation_failure_ends_with_speech_only():
     h = Host(detect_fingers=True)
     h.game.text("游戏开始")
-    h.ready()
-    assert h.game.phase == "preparing" and not h.actions
-    assert any("双手" in text for text in h.words)
+    h.ready()  # Body-only data cannot pass finger-mode readiness.
+    assert h.game.phase == "preparing" and any("双手" in text for text in h.words)
     h.step(21)
-    assert h.game.result == "error" and h.game.reason == "preparation_timeout"
-    # Error response may gesture but never progresses to countdown/watch.
-    h.complete()
-    assert h.game.phase == "error"
+    assert h.game.phase == "error" and h.game.reason == "preparation_timeout"
 
 
-def test_gesture_does_not_advance_until_matching_completion_and_settle():
-    h = Host()
-    h.game.text("游戏开始")
-    h.ready()
-    original = h.actions[-1]
-    h.step(2)
-    assert h.game.phase == "robot_action" and h.game.round == 0
-    assert h.actions[-1] == original
-    h.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": original["request_id"], "state": "running"})
-    assert h.game.phase == "robot_action"
-    h.complete()
-    assert h.game.phase == "countdown" and h.words[-1] == "游戏开始，五秒后开始。"
-
-
-def test_full_three_round_host_sequence_and_voice_replay():
-    h = Host()
+@pytest.mark.parametrize("legacy_flag", [False, True])
+def test_all_three_rounds_and_replay_ignore_old_robot_action_settings(legacy_flag):
+    h = Host(robot_actions=legacy_flag, motion_feedback_topic="/old/feedback", motion_timeout=.1)
     h.watch()
-    for round_number in range(1, 4):
+    for number in range(1, 4):
         h.still()
-        if round_number < 3:
-            assert h.actions[-1]["gesture"] == "round"
-            # Movement and camera shake during the arm gesture never count.
-            h.game.pose(pose(70))
-            h.complete()
-            assert h.game.phase == "cue" and h.game.round == round_number + 1
+        if number < 3:
+            assert h.game.phase == "intermission" and h.game.round == number
+            h.step(3.01)
+            assert h.game.phase == "cue" and h.game.round == number + 1
             h.step(3.5)
-        else:
-            assert h.game.result == "won" and h.actions[-1]["gesture"] == "celebrate"
-            h.complete()
-            assert h.game.phase == "won" and h.game.round == 3
+    assert h.game.phase == "won" and h.game.round == 3
+    assert h.words.count("一，二，三，木头人！") == 3
     h.step(3.01)
-    assert h.game.replay_prompted and "再挑战一次" in h.words[-1]
-    previous_session = h.game.session
+    assert h.game.replay_prompted and h.words[-1] == "再挑战一次吗？"
     h.game.text("再来")
-    assert h.game.phase == "preparing" and h.game.session != previous_session
+    assert h.game.phase == "preparing" and h.game.round == 0
 
 
-def test_part_speech_highlight_and_point_use_the_same_frozen_frame():
+def test_part_loss_keeps_highlight_and_prompts_replay_without_motion_feedback():
     h = Host()
     h.watch()
     h.game.pose(pose())
     for _ in range(3):
         h.step(.1)
         h.game.pose(pose(20, joint=9))
+    assert h.game.phase == "lost" and h.game.moved_part == "left_arm"
     assert h.words[-1] == "你的左手臂动了，游戏结束。"
-    assert h.game.result == "lost" and h.game.moved_part == "left_arm"
-    request = h.actions[-1]
-    assert request["gesture"] == "point"
-    # Highlight is left elbow/wrist (indices 7,9); use its centre, not a
-    # different person's position or an anatomical-left/right shortcut.
-    assert request["target"]["x"] == pytest.approx((121 + 147) / 2 / 320)
+    assert 9 in h.game.highlight
     frame = h.game.frame
     h.game.pose(pose(100))
     assert h.game.frame is frame
-    h.complete()
-    assert h.game.phase == "lost"
     h.step(3.1)
+    assert h.game.replay_prompted
     h.game.text("不玩了")
     assert h.game.phase == "waiting" and not h.game.moved_part
+    words = list(h.words)
+    h.game.pose({"persons": []})
+    h.step(10)
+    assert h.words == words
 
 
-def test_fault_or_timeout_never_opens_a_watch_window():
-    for state in ("error", "cancelled", "timeout"):
-        h = Host()
-        h.game.text("游戏开始")
-        h.ready()
-        rid = h.game.pending_motion["request_id"]
-        if state == "timeout":
-            h.step(31)
-            assert h.actions[-1]["kind"] == "wooden_man_motion_cancel"
-        else:
-            h.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": rid, "state": state})
-        assert h.game.phase == "error" and h.game.round == 0
-
-
-def test_reset_cancels_in_flight_request_and_rejects_late_feedback():
+def test_reset_returns_to_silent_waiting():
     h = Host()
     h.game.text("游戏开始")
-    h.ready()
-    rid = h.game.pending_motion["request_id"]
     h.game.reset()
-    assert h.actions[-1]["kind"] == "wooden_man_motion_cancel"
-    h.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": rid, "state": "completed"})
-    assert h.game.phase == "waiting"
+    words = list(h.words)
+    for _ in range(100):
+        h.game.pose({"persons": []})
+        h.step(.1)
+    assert h.game.phase == "waiting" and h.words == words
 
 
-def test_motion_ports_and_registration_are_canvas_compatible(monkeypatch):
-    monkeypatch.syspath_prepend(str(ROOT))
-    plugin = motion.make_plugin({}, "q5", None, None)
-    plugin.start()
-    assert plugin.process is None
+def test_saved_motion_config_cannot_restore_action_ports_or_settings():
+    plugin = game_module.WoodenManPlugin({"robot_actions": True}, "q5")
+    result = plugin.dispatch("config", {"robot_actions": True, "motion_feedback_topic": "/old/feedback",
+                                        "motion_timeout": .1, "robot_settle_seconds": .1})
+    assert result["status"] == "configured" and plugin.process is None
     tool = plugin.get_tool()
-    game = game_module.WoodenManPlugin({}, "q5")
-    commands = next(p for p in game.get_tool()["topic_out"] if p["topic"].endswith("/actions"))
-    assert tool["topic_in"][0]["format"] == commands["format"] == "data/json"
-    assert game.configured_topics["motion_feedback_topic"] == tool["topic_out"][0]["topic"]
-    assert plugin.dispatch("start", {})["state"] == "error"
-    assert plugin.dispatch("config", {})["status"] == "configured"
-    assert plugin.dispatch("info", {})["state"] == "idle"
-
-
-@pytest.mark.parametrize("x,side", [(.1, "left"), (.5, "right"), (.9, "right")])
-@pytest.mark.parametrize("y,row", [(.1, "upper"), (.5, "middle"), (.9, "lower")])
-def test_camera_sector_maps_to_only_arms_with_urdf_valid_targets(monkeypatch, x, side, y, row):
-    monkeypatch.syspath_prepend(str(ROOT))
-    from joint_limits import JOINT_LIMITS
-    sector, positions = motion.trajectory({"gesture": "point", "target": {"x": x, "y": y}})
-    assert sector.startswith(row) and all(k.startswith(side) for k in positions)
-    assert len(positions) == 3
-    assert all(JOINT_LIMITS[k][0] <= v <= JOINT_LIMITS[k][1] for k, v in positions.items())
-    if x != .5:
-        _, mirrored = motion.trajectory({"gesture": "point", "target": {"x": x, "y": y}}, True)
-        assert all(k.startswith("right" if side == "left" else "left") for k in mirrored)
-
-
-class FakeClient:
-    q5_position_control_prepared = True
-    fresh = True
-    def __init__(self):
-        self.joints = {f"{s}_{j}": v for s in ("left", "right") for j, v in zip(motion.JOINT_SUFFIXES, (-math.pi/6, 0, -.2))}
-        self.joints.update({f"{s}_{j}": 0. for s in ("left", "right") for j in motion.PASSIVE_SUFFIXES})
-    def snapshot(self):
-        return {"fresh": self.fresh, "age_ms": getattr(self, "age", 0),
-                "timestamp_ms": getattr(self, "stamp_override", int(self.clock.now * 1000)), "joints": dict(self.joints)}
-    def get_lifecycle_state(self):
-        return "active"
-    def sensor_snapshot(self, _):
-        return {"available": True, "fresh": True, "age_ms": 0, "state": 4}
-
-
-class FakeRouter:
-    def __init__(self, client):
-        self.client = client
-        self.owner = None
-        self.writes = []
-        self.follow = True
-        self.other = []
-    def status(self):
-        return {"ros_publisher_available": True, "endpoint_query_available": True,
-                "other_publishers": self.other, "active_owner": self.owner, "same_name_publisher_count": 1}
-    def acquire(self, owner):
-        if self.owner is not None:
-            return False
-        self.owner = owner
-        return True
-    def release(self, _):
-        self.owner = None
-    def publish(self, point):
-        self.writes.append(dict(point))
-        if self.follow:
-            self.client.joints.update(point)
-        return True
-
-
-@pytest.fixture
-def runtime(monkeypatch):
-    monkeypatch.syspath_prepend(str(ROOT))
-    clock = SimpleNamespace(now=0., renew=True, cancel_at=None, stale_at=None)
-    client = FakeClient()
-    client.clock = clock
-    router = FakeRouter(client)
-    reports = []
-    runner = motion.MotionRunner(client, router, reports.append)
-    class Event:
-        flag = False
-        def is_set(self):
-            return self.flag
-        def set(self):
-            self.flag = True
-        def wait(self, seconds):
-            clock.now += seconds
-            if clock.renew:
-                runner.lease = clock.now
-            if clock.cancel_at is not None and clock.now >= clock.cancel_at:
-                self.flag = True
-            if clock.stale_at is not None and clock.now >= clock.stale_at:
-                client.fresh = False
-            if getattr(clock, "on_wait", None):
-                clock.on_wait()
-    class Thread:
-        def __init__(self, target, args, **_):
-            self.target, self.args = target, args
-        def start(self):
-            self.target(*self.args)
-        def is_alive(self):
-            return False
-        def join(self, **_):
-            pass
-    monkeypatch.setattr(motion, "threading", SimpleNamespace(RLock=threading.RLock, Event=Event, Thread=Thread))
-    monkeypatch.setattr(motion, "time", SimpleNamespace(monotonic=lambda: clock.now, time=lambda: 1700000000 + clock.now))
-    return runner, client, router, reports, clock
-
-
-def request(**extra):
-    return {"kind": "wooden_man_motion_request", "request_id": "session:1", "issued_at": 1700000000., "gesture": "welcome", **extra}
-
-
-def test_measured_return_duplicate_dedup_and_bounded_interpolation(runtime):
-    runner, client, router, reports, clock = runtime
-    original = dict(client.joints)
-    runner.submit(request())
-    assert reports[-1]["state"] == "completed"
-    assert client.joints == pytest.approx(motion.HOME) and router.owner is None
-    assert all(set(point) == set(motion.HOME) for point in router.writes)
-    assert reports[-1]["home_verified"] is True
-    for a, b in zip(router.writes, router.writes[1:]):
-        assert all(abs(b[k] - a[k]) <= .010001 for k in b)
-    count = len(router.writes)
-    runner.submit(request())
-    assert len(router.writes) == count and reports[-1]["state"] == "completed"
-
-
-def test_prepared_vendor_mpc_endpoint_does_not_block_host_gesture(runtime):
-    runner, client, router, reports, clock = runtime
-    router.other = [{"node_name": "mpc_policy_node", "node_namespace": "/"}]
-    original = dict(client.joints)
-    runner.submit(request())
-    assert reports[-1]["state"] == "completed" and router.writes
-    assert client.joints == pytest.approx(motion.HOME) and router.owner is None
-
-
-@pytest.mark.parametrize("others,count", [
-    ([{"node_name": "mpc_policy_node", "node_namespace": "/"}, {"node_name": "other", "node_namespace": "/"}], 1),
-    ([{"node_name": "mpc_policy_node", "node_namespace": "/another_robot"}], 1),
-    ([{"node_name": "mpc_policy_node"}], 1),
-    ([{"node_name": "mpc_policy_node", "node_namespace": "/"}] * 2, 1),
-    ([{"node_name": "mpc_policy_node", "node_namespace": "/"}], 2),
-])
-def test_vendor_exception_does_not_hide_unknown_or_duplicate_publishers(others, count):
-    assert motion.publisher_conflict({"other_publishers": others, "same_name_publisher_count": count})
-
-
-@pytest.mark.parametrize("fault", ["unprepared", "owner", "no_arrival"])
-def test_vendor_endpoint_never_bypasses_preparation_ownership_or_arrival(runtime, fault):
-    runner, client, router, reports, clock = runtime
-    router.other = [{"node_name": "mpc_policy_node", "node_namespace": "/"}]
-    if fault == "unprepared":
-        client.q5_position_control_prepared = False
-    elif fault == "owner":
-        router.owner = "arm_control"
-    else:
-        router.follow = False
-    runner.submit(request())
-    assert reports[-1]["state"] == "error"
-    if fault != "no_arrival":
-        assert not router.writes
-
-
-@pytest.mark.parametrize("fault", ["unprepared", "stale", "competition", "lease", "cancel", "no_arrival", "excursion", "yaw", "age", "mid_stale", "owner"])
-def test_motion_failure_never_claims_completion(runtime, fault):
-    runner, client, router, reports, clock = runtime
-    if fault == "unprepared":
-        client.q5_position_control_prepared = False
-    elif fault == "stale":
-        client.fresh = False
-    elif fault == "competition":
-        router.other = [{"node_name": "another_controller"}]
-    elif fault == "lease":
-        clock.renew = False
-    elif fault == "cancel":
-        clock.cancel_at = .5
-    elif fault == "no_arrival":
-        router.follow = False
-    elif fault == "excursion":
-        client.joints["right_shoulder_pitch_joint"] = 2.
-    elif fault == "yaw":
-        client.joints["right_arm_yaw_joint"] = 2.2
-    elif fault == "age":
-        client.age = 501
-    elif fault == "mid_stale":
-        clock.stale_at = .5
-    elif fault == "owner":
-        router.owner = "another_card"
-    runner.submit(request())
-    assert reports[-1]["state"] in ("error", "cancelled")
-    assert router.owner == ("another_card" if fault == "owner" else None)
-    if fault in ("unprepared", "stale", "competition", "excursion", "yaw", "age", "owner"):
-        assert not router.writes
-
-
-def test_cancel_before_delivery_tombstones_request_and_invalid_commands_do_not_move(runtime):
-    runner, client, router, reports, clock = runtime
-    runner.submit({"kind": "wooden_man_motion_cancel", "request_id": "session:1"})
-    runner.submit(request())
-    assert reports[-1]["state"] == "cancelled" and not router.writes
-    runner.submit(request(request_id="invalid-target", gesture="point", target={"x": float("nan"), "y": .5}))
-    assert reports[-1]["state"] == "error" and not router.writes
-    runner.submit(request(request_id="old", issued_at=1699999900.))
-    assert reports[-1]["state"] == "error" and not router.writes
-
-
-def test_non_neutral_arms_are_automatically_homed_before_and_after_gesture(runtime):
-    runner, client, router, reports, clock = runtime
-    client.joints["right_arm_yaw_joint"] = .8
-    client.joints["left_wrist_pitch_joint"] = -.7
-    client.joints["left_shoulder_roll_joint"] = .7
-    runner.submit(request())
-    assert reports[-1]["state"] == "completed" and reports[-1]["home_verified"]
-    assert client.joints == pytest.approx(motion.HOME)
-    stages = [p.get("stage") for p in reports if p["state"] == "running"]
-    assert stages == ["queued", "homing_before", "gesture_1", "gesture_2", "gesture_3", "holding", "homing_after"]
-
-
-def test_feedback_delay_over_two_seconds_is_waited_for(runtime):
-    runner, client, router, reports, clock = runtime
-    router.follow = False
-    def follow_later():
-        if clock.now >= 3.6 and router.writes:
-            client.joints.update(router.writes[-1])
-            router.follow = True
-    clock.on_wait = follow_later
-    runner.submit(request())
-    assert reports[-1]["state"] == "completed" and reports[-1]["home_verified"]
-    assert clock.now > 3.6 and client.joints == pytest.approx(motion.HOME)
-
-
-def test_cached_feedback_cannot_verify_homing(runtime):
-    runner, client, router, reports, clock = runtime
-    client.stamp_override = 0
-    runner.submit(request())
-    assert reports[-1]["state"] == "error" and not reports[-1]["home_verified"]
-    assert reports[-1]["stage"] == "homing_before"
-
-
-def test_failed_return_never_reports_completed(runtime):
-    runner, client, router, reports, clock = runtime
-    def impede_return():
-        if runner.stage == "homing_after":
-            client.joints["right_elbow_pitch_joint"] = -.3
-    clock.on_wait = impede_return
-    runner.submit(request(gesture="round"))
-    assert reports[-1]["state"] == "error" and reports[-1]["stage"] == "homing_after"
-    assert not reports[-1]["home_verified"] and router.owner is None
-
-
-def test_next_request_at_completion_is_not_rejected_by_retiring_thread(runtime):
-    runner, client, router, reports, clock = runtime
-    def report_and_submit_next(message):
-        reports.append(message)
-        if message["state"] == "completed" and message["request_id"] == "session:1":
-            runner.submit(request(request_id="session:2", gesture="round", issued_at=motion.time.time()))
-    runner.report = report_and_submit_next
-    runner.submit(request())
-    assert runner.cache["session:1"]["state"] == runner.cache["session:2"]["state"] == "completed"
-    assert client.joints == pytest.approx(motion.HOME)
-
-
-def test_round_waits_for_verified_home_not_just_a_completed_label():
-    h = Host()
-    h.watch()
-    h.still()
-    assert h.game.phase == "robot_action" and h.game.round == 1
-    rid = h.game.pending_motion["request_id"]
-    h.step(15)
-    assert h.game.phase == "robot_action" and h.game.round == 1
-    h.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": rid,
-                            "state": "completed", "home_verified": False})
-    assert h.game.phase == "error" and h.game.round == 1
-    assert h.game.reason == "motion_home_unverified"
-
-
-def test_real_stage_progress_extends_wait_but_duplicate_heartbeats_do_not():
-    h = Host()
-    h.game.text("游戏开始")
-    h.ready()
-    rid = h.game.pending_motion["request_id"]
-    h.step(25)
-    frame = {"kind": "wooden_man_motion_feedback", "request_id": rid, "state": "running",
-             "stage": "homing_before", "progress_seq": 1}
-    h.game.motion_feedback(frame)
-    h.step(25)
-    assert h.game.phase == "robot_action"
-    h.game.motion_feedback(frame)  # Cached stage heartbeat cannot renew the deadline.
-    h.step(6)
-    assert h.game.phase == "error" and h.game.round == 0
+    assert {p["topic"] for p in tool["topic_out"]} == {"/q5/wooden_man/speech", "/q5/wooden_man/status", "/q5/wooden_man/highlight"}
+    assert plugin.configured_topics == {"asr_topic": "", "pose_topic": ""}
+    assert "robot_actions" not in plugin.config
+    assert "robot_actions" not in tool["configSchema"]["properties"]
+    assert "motion_feedback_topic" not in tool["configSchema"]["properties"]

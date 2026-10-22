@@ -15,7 +15,7 @@ class Rig:
     def __init__(self, config=None):
         self.now = 0.0
         self.words = []
-        self.game = module.Game(self.words.append, {"host_interaction": False, "robot_actions": False, **(config or {})}, clock=lambda: self.now)
+        self.game = module.Game(self.words.append, {"host_interaction": False, **(config or {})}, clock=lambda: self.now)
 
     def step(self, seconds):
         self.now += seconds
@@ -172,7 +172,7 @@ def test_plugin_registration_lifecycle_and_input_validation_without_hardware():
 
 def test_asr_background_json_triggers_and_speech_is_tts_json():
     wire = []
-    game = module.Game(lambda words: wire.append(module.encode_speech(words)), {"host_interaction": False, "robot_actions": False}, clock=lambda: 0)
+    game = module.Game(lambda words: wire.append(module.encode_speech(words)), {"host_interaction": False}, clock=lambda: 0)
     game.text({"text": "游戏开始", "background": True, "priority": 0,
                "log_type": True, "audio_start_ts": 1000, "audio_end_ts": 1001,
                "audio_duration_ms": 1000})
@@ -202,7 +202,7 @@ def test_canvas_config_is_handled_before_start_without_starting_game():
     assert p.config["cue_seconds"] == 4
     assert p.configured_topics["asr_topic"] == "/mic/asr_background"
     assert p.dispatch("config", {"asr_topic": "", "pose_topic": ""})["status"] == "configured"
-    assert p.configured_topics == {"asr_topic": "", "pose_topic": "", "motion_feedback_topic": "/q5/wooden_man_motion/feedback"}
+    assert p.configured_topics == {"asr_topic": "", "pose_topic": ""}
 
 
 def test_invalid_config_is_atomic_and_raises_to_the_mcp_error_handler():

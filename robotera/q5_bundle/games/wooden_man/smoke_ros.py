@@ -11,7 +11,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 
-def main():
+def main(host_interaction=False):
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ.pop("CYCLONEDDS_URI", None)
@@ -110,7 +110,7 @@ def main():
         raise AssertionError((phase, plugin.info(), words))
 
     try:
-        saved = {**DEFAULTS, "asr_topic": "", "pose_topic": "", "host_interaction": False, "robot_actions": False}
+        saved = {**DEFAULTS, "asr_topic": "", "pose_topic": "", "host_interaction": host_interaction}
         assert control("config", saved)["status"] == "configured"
         result = control("start", {"input_topic": "/wooden_man_test/asr",
                                    "input_topics": ["/wooden_man_test/asr", "/wooden_man_test/pose"]})
@@ -119,18 +119,19 @@ def main():
         assert control("config", saved)["state"] == "running"
         assert plugin.process.pid == worker_pid, "Repeated auto-config restarted the game"
         pump(2)
+        assert not node.get_publishers_info_by_topic("/smoke/wooden_man/actions"), "Game must never publish robot actions"
         assert not words and plugin.info()["phase"] == "waiting"
         speak("不要游戏开始")
         pump(0.3)
         assert plugin.info()["phase"] == "waiting"
         speak("游戏开始")
-        await_phase("won", 29, publish_pose=True)
+        await_phase("won", 42 if host_interaction else 29, publish_pose=True)
         assert words.count("一，二，三，木头人！") == 3, words
         assert words[-1] == "三轮完成，你赢了，游戏结束！", words
         print("PASS: DDS ASR wake, five-second wait, three stationary rounds", flush=True)
 
         speak("游戏开始")
-        await_phase("watch", 12, publish_pose=True)
+        await_phase("watch", 20 if host_interaction else 12, publish_pose=True)
         pump(0.2, publish_pose=True)
         pump(0.8, dx=20, publish_pose=True)
         assert plugin.info()["phase"] == "lost", plugin.info()
@@ -158,9 +159,16 @@ def main():
         pump(0.8, publish_pose=True)
         info = control("info")
         assert info["phase"] == "lost" and info["moved_part"] == "left_fingers", info
-        assert words[-1] == "你的左手手指动了，游戏结束。", words
+        assert "你的左手手指动了，游戏结束。" in words, words
         assert images
         print("PASS: DDS 59-joint fingers -> anatomical speech + CompressedImage JPEG highlight", flush=True)
+
+        if host_interaction:
+            pump(.6)
+            assert "再挑战一次吗？" in words
+            speak("再来")
+            await_phase("preparing", 3, publish_pose=True)
+            print("PASS: voice-only preparation, inter-round speech and ASR replay, no motion publisher or feedback dependency", flush=True)
 
         control("reset")
         await_phase("waiting", 2)

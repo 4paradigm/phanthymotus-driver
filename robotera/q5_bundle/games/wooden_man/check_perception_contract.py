@@ -78,7 +78,7 @@ def main():
     def say(text):
         actual_tts_callback(tts_node, String(encode_speech(text)))
 
-    game = Game(say, {"host_interaction": False, "robot_actions": False}, clock=lambda: 0)
+    game = Game(say, {"host_interaction": False}, clock=lambda: 0)
     asr_publisher = types.SimpleNamespace(publish=lambda msg: game.text(json.loads(msg.data)))
     asr_node = types.SimpleNamespace(_publish_background_enabled=True, _background_pub=asr_publisher)
     actual_asr_publish = callback(asr, "_publish_background")
@@ -103,7 +103,7 @@ def main():
         hand = np.array([[140 + (i % 4) * 8, 100 - i * 2, .99] for i in range(21)])
         hand[9, :2] = [140, 65]
         clock = [0.0]
-        game = Game(lambda _: None, {"detect_fingers": True, "host_interaction": False, "robot_actions": False}, clock=lambda: clock[0])
+        game = Game(lambda _: None, {"detect_fingers": True, "host_interaction": False}, clock=lambda: clock[0])
         game.text("游戏开始")
         clock[0] = 5
         game.tick()
