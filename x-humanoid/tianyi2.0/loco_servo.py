@@ -55,7 +55,7 @@ class _LatestControlInbox:
             zero = False  # The consumer still validates/counts malformed input.
         with self._lock:
             if not self._active or generation is not None and generation != self._generation:
-                return
+                return False
             now = time.monotonic()
             self._last_gap_ms = (round((now - self._last_received_at) * 1000, 1)
                                  if self._last_received_at is not None else None)
@@ -68,15 +68,18 @@ class _LatestControlInbox:
             else:
                 self._coalesced += int(self._motion is not None)
                 self._motion = entry
+            return True
 
-    def take(self):
+    def take(self, allow_motion=True):
         with self._lock:
             if not self._active:
                 return None
             if self._zero is not None:
                 entry, self._zero = self._zero, None
-            else:
+            elif allow_motion:
                 entry, self._motion = self._motion, None
+            else:
+                return None
             if entry is None:
                 return None
             self._processed += 1
@@ -92,7 +95,7 @@ class _LatestControlInbox:
                     "last_receive_gap_ms": self._last_gap_ms, "last_wait_ms": self._last_wait_ms}
 
 
-def build_descriptor(hz=10.0, max_vx=0.3, max_wz=0.6):
+def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0):
     return {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
         "joint_names": ["vx", "vy", "vz", "wx", "wy", "wz"],
@@ -119,7 +122,7 @@ class LocoServoPlugin:
             raise ValueError("loco_servo.expected_hz must be <= 20")
         self._descriptor = build_descriptor(
             self._hz, self._positive(config, "max_vx", 0.3),
-            self._positive(config, "max_wz", 0.6))
+            self._positive(config, "max_wz", 1.0))
         self._parsed_descriptor = parse_descriptor(self._descriptor)
         self._accel = (self._positive(config, "linear_acceleration", 0.3),
                        self._positive(config, "angular_acceleration", 0.6))
@@ -134,6 +137,7 @@ class LocoServoPlugin:
         self._standing = None
         self._standing_at = None
         self._nodes = []
+        self._arrival_guard = None
         self._backend = None
         self._sink = None
         self._running = self._paused = False
@@ -148,6 +152,7 @@ class LocoServoPlugin:
         self._lease_expiry_ms = 0
         self._zero_pending = False
         self._last = None
+        self._last_timing = None
         self._counts = {key: 0 for key in
                         ("received", "accepted", "published", "dry_run_commands",
                          "rejected", "dropped", "holds", "publish_errors")}
@@ -284,9 +289,12 @@ class LocoServoPlugin:
         self._nodes.append((core, self._ros2.executor_core))
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
                          durability=DurabilityPolicy.VOLATILE)
+        self._arrival_guard = core.create_guard_condition(lambda: self._tick(generation))
         core.create_subscription(String, topic,
                                  lambda msg: self._on_message(msg, generation), qos)
-        core.create_timer(0.05, lambda: self._tick(generation))
+        # Arrivals wake the executor immediately. This timer is only a bounded
+        # retry/watchdog poll, never a periodic replay of the last velocity.
+        core.create_timer(0.02, lambda: self._tick(generation))
         self._ros2.executor_core.add_node(core)
         self._backend = SlamtecVelocityBackend(self._backend_config)
         if not self._settings["dry_run"]:
@@ -301,6 +309,7 @@ class LocoServoPlugin:
 
     def _close(self):
         self._inbox.activate(self._generation, False)
+        self._arrival_guard = None
         if self._backend is not None:
             self._backend.close()
             self._backend = None
@@ -338,7 +347,15 @@ class LocoServoPlugin:
     def _on_message(self, message, generation=None):
         # No plugin/SDK lock here: waiting on it would block the socket reader
         # and accumulate already-aging commands in the Unix socket buffer.
-        self._inbox.put(message, generation)
+        if self._inbox.put(message, generation):
+            guard = self._arrival_guard
+            if guard is not None:
+                try:
+                    guard.trigger()
+                except Exception:
+                    # Concurrent stop may destroy this generation's node.
+                    # Pending input has already been invalidated by _close.
+                    pass
 
     def _process_message(self, message, generation=None):
         with self._lock:
@@ -380,7 +397,20 @@ class LocoServoPlugin:
                     command["stamp_ms"] + command.get("ttl_ms", 0),
                     command.get("obs_stamp_ms", command["stamp_ms"]) + 500,
                     int(time.time() * 1000) + WATCHDOG_MS)
-                outcome = self._sink.submit(command)
+                started = time.monotonic()
+                wall_ms = int(time.time() * 1000)
+                self._last_timing = {
+                    "seq": command.get("seq"), "ttl_ms": command.get("ttl_ms"),
+                    "command_age_ms": wall_ms - command["stamp_ms"],
+                    "observation_age_ms": wall_ms - command.get("obs_stamp_ms", command["stamp_ms"]),
+                    "remaining_before_apply_ms": self._command_deadline_ms - wall_ms,
+                }
+                try:
+                    outcome = self._sink.submit(command)
+                finally:
+                    self._last_timing.update(
+                        apply_round_trip_ms=round((time.monotonic() - started) * 1000, 1),
+                        remaining_after_apply_ms=self._command_deadline_ms - int(time.time() * 1000))
                 if outcome.applied:
                     self._counts["accepted"] += 1
                     self._last_valid_at = time.monotonic()
@@ -498,7 +528,12 @@ class LocoServoPlugin:
             if self._paused:
                 self._inbox.activate(self._generation, False)
                 return
-            pending = self._inbox.take()
+            # A burst after transport jitter is not proof that Navi computed
+            # commands above 20Hz. Keep its latest motion until the next apply
+            # slot rather than throwing it away. Zero commands never wait.
+            motion_due = self._last_output_at is None or (
+                time.monotonic() - self._last_output_at >= 1 / 20)
+            pending = self._inbox.take(allow_motion=motion_due)
             if pending is not None:
                 self._process_message(*pending)
                 if self._paused:
@@ -563,6 +598,9 @@ class LocoServoPlugin:
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
             "input_queue": self._inbox.info(),
+            "dispatch": {"mode": "arrival_guard", "watchdog_poll_ms": 20,
+                         "max_apply_hz": 20},
+            "last_command_timing": copy.deepcopy(self._last_timing),
             "output": list(self._last_output), "output_topic": None,
             "backend": self._backend.info() if self._backend is not None else
                        {"type": "slamware_sdk", "connected": False, "state": "disconnected"},

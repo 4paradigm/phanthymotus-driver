@@ -72,6 +72,7 @@ def test_connect_is_readonly_and_stop_closes_own_session(backend):
     worker.connect()
     assert worker.info()["connected"]
     assert worker.info()["action_id"] == 0
+    assert worker._process.args[-2:] == ["0.3", "1.0"]
     write(worker)
     assert worker.info()["action_id"] == 17
     worker.stop()

@@ -1697,29 +1697,49 @@ class ImuPlugin(_JsonSensor):
 class DepthCameraPlugin:
     """Bridge only the newest Orbbec Z16 frame to Agent Core."""
     def __init__(self, plugin_config, namespace, ros2):
-        self._running = False; self._topic = f"/{namespace}/camera/head/depth"
-        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
+        self._running = False
+        # Legacy Navi binds /visual_depth before consulting the ROS graph.
+        # This is still hardware depth; the suffix is a wire-role convention.
+        self._topic = f"/{namespace}/camera/head/depth/visual_depth"
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 15)), 30.0))
         self._last_published_at = 0.0
+        self._last_received_at = None
+        self._first_published_at = None
         self._forwarded_frames = 0
+        self._received_frames = self._invalid_frames = self._stale_frames = 0
         self._latest_image = None
         self._latest_image_lock = threading.Lock()
+        self._publish_lock = threading.RLock()
         self._subscription = None
         self._publish_timer = None
+        self._pub = None
         self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
     def get_tool(self):
-        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 头部深度图（zlib 压缩 16UC1）",
+        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 硬件深度：默认15Hz，米制深度图，可直接连接 navi；不使用单目估算。",
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}]}
     def start(self):
+        with self._publish_lock:
+            if self._running:
+                return
+            try:
+                self._start_stream()
+            except Exception:
+                self.stop()
+                raise
+
+    def _start_stream(self):
         from sensor_msgs.msg import Image
         import cv2
         import numpy as np
         self._cv2, self._np = cv2, np
+        self._first_published_at = self._last_received_at = None
+        self._forwarded_frames = self._received_frames = self._invalid_frames = self._stale_frames = 0
         latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST, depth=1,
                                 durability=DurabilityPolicy.VOLATILE)
-        ingress_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+        ingress_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                  history=HistoryPolicy.KEEP_LAST, depth=1,
                                  durability=DurabilityPolicy.VOLATILE)
         self._running = True
@@ -1727,28 +1747,53 @@ class DepthCameraPlugin:
         self._pub = self._pub_node.create_publisher(_CI, self._topic, latest_qos)
         self._subscription = self._sub_node.create_subscription(
             Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
-        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+        # The ROS timer sets the rate. A second elapsed-time gate after zlib
+        # compression previously skipped scheduled frames (e.g. 15Hz -> 10Hz).
+        self._publish_timer = self._pub_node.create_timer(1.0 / self._max_hz, self._publish_latest)
         print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
     def stop(self):
-        self._running = False
-        with self._latest_image_lock:
-            self._latest_image = None
+        with self._publish_lock:
+            self._running = False
+            with self._latest_image_lock:
+                self._latest_image = None
+            for node, kind, attribute in (
+                    (self._pub_node, "timer", "_publish_timer"),
+                    (self._sub_node, "subscription", "_subscription"),
+                    (self._pub_node, "publisher", "_pub")):
+                handle = getattr(self, attribute)
+                if handle is not None:
+                    getattr(node, f"destroy_{kind}")(handle)
+                    setattr(self, attribute, None)
+
     def _on_image(self, msg):
-        if not self._running or msg.encoding not in ("16UC1", "mono16"): return
         with self._latest_image_lock:
-            self._latest_image = msg
+            if not self._running:
+                return
+            self._received_frames += 1
+            if msg.encoding not in ("16UC1", "mono16"):
+                self._invalid_frames += 1
+                return
+            self._last_received_at = time.monotonic()
+            self._latest_image = (msg, self._last_received_at)
 
     def _publish_latest(self):
+        with self._publish_lock:
+            self._publish_frame()
+
+    def _publish_frame(self):
         if not self._running:
             return
         with self._latest_image_lock:
-            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
-                return
-            msg, self._latest_image = self._latest_image, None
-        if msg is None:
+            latest, self._latest_image = self._latest_image, None
+        if latest is None:
+            return
+        msg, received_at = latest
+        if time.monotonic() - received_at >= 0.5:
+            self._stale_frames += 1
             return
         dashboard = self._to_dashboard_depth(msg)
         if dashboard is None:
+            self._invalid_frames += 1
             return
         # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
         import zlib as _zlib
@@ -1760,8 +1805,13 @@ class DepthCameraPlugin:
         # which is what the format fixes; it also rejects big-endian input, so
         # nothing here relied on z16's is_bigendian field.
         out.data = _zlib.compress(dashboard.astype("<u2", copy=False).tobytes(), 1)
+        if time.monotonic() - received_at >= 0.5:
+            self._stale_frames += 1
+            return
         self._pub.publish(out)
         self._last_published_at = time.monotonic()
+        if self._first_published_at is None:
+            self._first_published_at = self._last_published_at
         self._forwarded_frames += 1
 
     def _to_dashboard_depth(self, msg):
@@ -1787,7 +1837,18 @@ class DepthCameraPlugin:
             depth = depth[top:top + crop_height, :]
         return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
     def dispatch(self, action, args):
-        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}]}
+        now = time.monotonic()
+        duration = now - self._first_published_at if self._first_published_at is not None else 0
+        return {"state": "running" if self._running else "idle",
+                "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}],
+                "input_topic": "/ob_camera_head/depth/image_raw", "target_hz": self._max_hz,
+                "received_frames": self._received_frames, "published_frames": self._forwarded_frames,
+                "invalid_frames": self._invalid_frames, "stale_frames": self._stale_frames,
+                "average_hz": round(max(0, self._forwarded_frames - 1) / duration, 2) if duration > 0 else 0,
+                "last_receive_age_ms": round((now - self._last_received_at) * 1000, 1)
+                    if self._last_received_at is not None else None,
+                "last_publish_age_ms": round((now - self._last_published_at) * 1000, 1)
+                    if self._forwarded_frames else None}
 
 
 class PointCloudPlugin:

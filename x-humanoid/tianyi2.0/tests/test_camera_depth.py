@@ -28,7 +28,17 @@ class Node:
         return callback
 
     def create_timer(self, period, callback):
+        self.timer_period = period
         return callback
+
+    def destroy_timer(self, handle):
+        pass
+
+    def destroy_subscription(self, handle):
+        pass
+
+    def destroy_publisher(self, handle):
+        pass
 
 
 @pytest.fixture
@@ -93,7 +103,7 @@ def test_lossless_depth_and_header_reach_consumer(depth_plugin, padding):
     decoded = np.frombuffer(raw, dtype="<u2").reshape(480, 640)
     np.testing.assert_array_equal(decoded, expected)
     assert decoded[1, 1] / 1000 == 1.2
-    expected_port = [{"topic": "/nvidia_desktop/camera/head/depth", "format": "image/depth-zlib"}]
+    expected_port = [{"topic": "/nvidia_desktop/camera/head/depth/visual_depth", "format": "image/depth-zlib"}]
     assert plugin.get_tool()["topic_out"] == expected_port
     assert plugin.dispatch("info", {})["topic_out"] == expected_port
 
@@ -123,9 +133,66 @@ def test_backlog_is_replaced_and_stop_suppresses_output(depth_plugin):
     assert np.frombuffer(raw, dtype="<u2")[640] == 2000
     plugin._on_image(first)
     plugin._publish_latest()
-    assert len(plugin._pub.messages) == 1  # 8 Hz rate limit
+    assert len(plugin._pub.messages) == 2
+    publisher = plugin._pub
     clock[0] += 0.2
     plugin.stop()
     plugin._publish_latest()
-    assert len(plugin._pub.messages) == 1
+    assert len(publisher.messages) == 2
     assert plugin._latest_image is None
+
+
+def test_15hz_timer_does_not_lose_frames_to_compression_time(depth_plugin):
+    plugin, clock, _ = depth_plugin
+    publisher = plugin._pub
+    assert plugin._pub_node.timer_period == pytest.approx(1 / 15)
+    beginning = clock[0]
+    for index in range(16):
+        clock[0] = beginning + index / 15
+        plugin._on_image(frame(1500)[0])
+        plugin._publish_latest()
+        clock[0] += 0.01  # Processing must not postpone the next timer slot.
+    assert len(publisher.messages) == 16
+    assert plugin.dispatch("info", {})["target_hz"] == 15
+    assert plugin.dispatch("info", {})["average_hz"] == pytest.approx(15, abs=0.2)
+
+
+def test_no_source_replay_and_old_pending_frame_is_discarded(depth_plugin):
+    plugin, clock, _ = depth_plugin
+    plugin._on_image(frame()[0])
+    clock[0] += 0.51
+    plugin._publish_latest()
+    plugin._publish_latest()
+    assert not plugin._pub.messages
+    assert plugin.dispatch("info", {})["stale_frames"] == 1
+    plugin._on_image(frame()[0])
+    plugin._publish_latest()
+    plugin._publish_latest()
+    assert len(plugin._pub.messages) == 1
+
+
+def test_repeated_start_is_idempotent_and_restart_uses_new_handles(depth_plugin):
+    plugin, _, _ = depth_plugin
+    publisher, subscription, timer = plugin._pub, plugin._subscription, plugin._publish_timer
+    plugin.start()
+    assert (plugin._pub, plugin._subscription, plugin._publish_timer) == (publisher, subscription, timer)
+    plugin.stop()
+    assert plugin._pub is plugin._subscription is plugin._publish_timer is None
+    plugin.start()
+    plugin._on_image(frame()[0])
+    plugin._publish_latest()
+    assert plugin.dispatch("info", {})["state"] == "running"
+
+
+def test_frame_that_ages_during_conversion_is_not_published(depth_plugin, monkeypatch):
+    plugin, clock, _ = depth_plugin
+    original = plugin._to_dashboard_depth
+    def delayed_conversion(message):
+        result = original(message)
+        clock[0] += 0.51
+        return result
+    monkeypatch.setattr(plugin, "_to_dashboard_depth", delayed_conversion)
+    plugin._on_image(frame()[0])
+    plugin._publish_latest()
+    assert not plugin._pub.messages
+    assert plugin.dispatch("info", {})["stale_frames"] == 1

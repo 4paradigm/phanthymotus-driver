@@ -57,7 +57,7 @@ class SlamtecVelocityBackend:
             binary = str(self._config.get("sdk_binary", "/usr/local/bin/tianyi-loco-sdk"))
             args = [binary, self._host, str(self._port), str(self._connect_ms),
                     str(self._config.get("max_vx", 0.3)),
-                    str(self._config.get("max_wz", 0.6))]
+                    str(self._config.get("max_wz", 1.0))]
             try:
                 self._process = subprocess.Popen(
                     args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

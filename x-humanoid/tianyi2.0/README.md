@@ -8,7 +8,9 @@ exposes the capabilities as MCP tools.
 
 `camera_depth` forwards the newest Orbbec frame from
 `/ob_camera_head/depth/image_raw` on domain 0 to
-`/{namespace}/camera/head/depth` on domain 42. Following upstream driver
+`/{namespace}/camera/head/depth/visual_depth` on domain 42. The `/visual_depth`
+suffix lets older Navi versions identify depth before ROS topic discovery;
+it does not mean a monocular model is involved. Following upstream driver
 PR #419, its output is `image/depth-zlib` on `sensor_msgs/CompressedImage`,
 with `format = "16UC1; compressedDepth zlib"`. The payload is a plain zlib
 stream containing exactly 640x480 little-endian uint16 millimetres; zero
@@ -16,11 +18,20 @@ remains invalid depth. Compression preserves the original depth values and
 source header. This replaces the previous raw `image/depth-z16` output and
 requires a consumer/bridge that supports `image/depth-zlib`.
 
+The default rate is 15Hz (previously 8Hz), configurable with
+`plugins.camera_depth.hz` up to 30Hz. The source camera and available CPU/network
+still determine the actual rate. Both source and output retain only the newest
+frame; a frame waiting locally for 500ms is discarded. A single ROS timer
+sets the rate, avoiding the former second rate gate that included compression
+time and skipped scheduled frames. `info` reports target/average Hz, frame
+counts and the time since the last source/output frame.
+
 On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
 `navi`'s depth input, `loco_state` to its odometry input, and `navi` to
 `loco_servo`. Disconnect the `visual_depth` depth input when selecting hardware
 depth. After redeploying, refresh the card's port metadata and reconnect the
-depth wire so it declares `image/depth-zlib`.
+depth wire to the new `/depth/visual_depth` topic with `image/depth-zlib`.
+No `lidar_depth` or `visual_depth` processing card is needed in this path.
 
 This conversion does not register raw depth to RGB or change the existing
 centre-crop/nearest-neighbour resize to 640x480. RGB/depth correspondence,
@@ -144,7 +155,7 @@ milliseconds and increasing sequence numbers. The six values are body-frame
 `[vx, vy, vz, wx, wy, wz]` in m/s and rad/s. This implementation supports `vx`
 and `wz` only; lateral, vertical and roll/pitch commands must be zero. This
 restriction does not claim lateral motion has been validated on the chassis.
-Configured operating caps default to 0.3 m/s and 0.6 rad/s, not vendor maximum
+Configured operating caps default to 0.3 m/s and 1.0 rad/s, not vendor maximum
 ratings. Non-finite values, unsupported axes and out-of-range commands are
 rejected. `ControlSink` checks the schema, TTL, observation age, sequence and
 source priority. Rejected/stale messages never feed the watchdog.
@@ -211,12 +222,16 @@ with remaining milliseconds reported for the native ingress check.
 The 20Hz command cap compares the starts of SDK applications, not the time
 since the previous SDK acknowledgement. A regular 10Hz stream must not lose
 every other command just because a vendor call took 70ms of its 100ms period.
-True bursts above 20Hz are still dropped, and explicit zero always bypasses
-that limiter. TTL, observation-age and watchdog limits are unchanged.
+When transport bunches arrivals closer than 50ms, the newest motion stays in
+the bounded inbox until the next permitted apply slot instead of being thrown
+away. Explicit zero always bypasses that pacing. TTL, observation-age and
+watchdog limits are unchanged.
 
 The bridged subscription callback only updates a bounded inbox; it does not
-hold the plugin lock or wait for an SDK reply. The existing 50ms control timer
-takes the latest pending motion command. A separate priority zero slot clears
+hold the plugin lock or wait for an SDK reply. An arrival guard condition wakes
+the ROS executor immediately to process the latest pending command; commands
+no longer wait for a fixed 50ms polling tick. A 20ms timer handles watchdogs and
+deferred apply slots without replaying old commands. A separate priority zero slot clears
 older pending motion and cannot be overwritten by a later nonzero command;
 at most two messages are retained. Intermediate motion frames are coalesced,
 not queued in arrival order. Original timestamps/TTLs remain unchanged, so a
@@ -225,12 +240,18 @@ replayed. No new worker thread or periodic replay of the last command is added.
 Pause, stop, configuration changes and restart clear pending input; callbacks
 and timers from an older generation cannot deliver motion to a new session.
 
-`input_queue` reports bridge-delivered `received`, timer-selected `processed`,
+`input_queue` reports bridge-delivered `received`, control-selected `processed`,
 `coalesced`, lifecycle-`cleared`, `pending`, the latest receive gap and inbox
 wait in milliseconds. Existing `counts.received/accepted/dropped` describe the
 selected frames examined by the control sink, not intermediate coalesced
 frames. `holds` counts calls to stop paths, including repeated watchdog stops
 after navigation has ended; it is not a count of distinct physical stops.
+`dispatch.mode=arrival_guard` identifies this version. `last_command_timing`
+reports the selected command sequence/TTL, command and observation ages,
+remaining lease before/after apply, and apply round-trip duration. Continuous
+publication alone cannot guarantee continuous motion: expired observations,
+TTL gaps, explicit zeros, invalid commands and SDK faults still stop or refuse
+motion. These timings distinguish those cases from local queue delay.
 
 Acceleration caps remain 0.3 m/s² and 0.6 rad/s². Explicit zero, pause, stop,
 lease expiration and watchdog stop bypass the ramp. Cancelling an SDK action

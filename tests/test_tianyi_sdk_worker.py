@@ -80,8 +80,8 @@ def velocity(ttl_ms):
 def worker(native_worker):
     processes = []
 
-    def create(mode="ok"):
-        process = subprocess.Popen([str(native_worker), mode, "1445", "1500", "0.3", "0.6"],
+    def create(mode="ok", max_wz="0.6"):
+        process = subprocess.Popen([str(native_worker), mode, "1445", "1500", "0.3", max_wz],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, bufsize=1)
         processes.append(process)
@@ -95,6 +95,15 @@ def worker(native_worker):
         process.wait(timeout=2)
         for stream in (process.stdin, process.stdout, process.stderr):
             stream.close()
+
+
+@pytest.mark.parametrize("yaw", [-1.0, 1.0])
+def test_continuous_fresh_velocity_updates_keep_one_sdk_action(worker, yaw):
+    process = worker(max_wz="1.0")
+    for sequence in range(1, 9):
+        reply = request(process, sequence, f"SET {int(time.time() * 1000) + 200} 0.1 {yaw}")
+        assert reply[2:] == ["OK", "1", "active"]
+    assert request(process, 9, "STOP")[2:] == ["OK", "0", "ready"]
 
 
 def test_expired_ingress_confirms_stop_and_waits_for_a_new_fresh_command(worker):

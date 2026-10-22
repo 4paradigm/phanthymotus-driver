@@ -76,6 +76,7 @@ class Node:
         self.name, self.context = name, context
         self.subscriptions, self.publishers, self.timers = [], [], []
         self.destroyed = False
+        self.guards = []
 
     def create_subscription(self, kind, topic, callback, qos):
         self.subscriptions.append((kind, topic, callback, qos))
@@ -87,6 +88,16 @@ class Node:
     def create_timer(self, period, callback):
         self.timers.append((period, callback))
         return object()
+
+    def create_guard_condition(self, callback):
+        guard = types.SimpleNamespace(callback=callback, triggered=0)
+        def trigger():
+            if self.destroyed:
+                raise RuntimeError("node destroyed")
+            guard.triggered += 1
+        guard.trigger = trigger
+        self.guards.append(guard)
+        return guard
 
     def destroy_node(self):
         self.destroyed = True
@@ -185,6 +196,33 @@ def test_startup_is_inert_and_domain_routing_is_correct(setup):
     assert "LocoServoPlugin" not in (DRIVER / "main.py").read_text().split("_ALWAYS_START =", 1)[1].split("}", 1)[0]
 
 
+@pytest.mark.parametrize("yaw", [-1.0, 1.0])
+def test_default_search_yaw_limit_reaches_sdk_with_ramp_and_rejects_excess(setup, yaw):
+    plugin = start(setup)
+    limits = plugin._info()["control_interface"]["limits"]
+    assert limits["lower"] == [-0.3, 0, 0, 0, 0, -1.0]
+    assert limits["upper"] == [0.3, 0, 0, 0, 0, 1.0]
+    for seq in range(1, 21):
+        send(plugin, command(setup, [0, 0, 0, 0, 0, yaw], seq=seq))
+        if seq == 1:
+            assert plugin._backend.messages[-1][5] == pytest.approx(yaw * 0.06)
+        setup.clock.advance()
+    assert plugin._counts["accepted"] == 20
+    assert plugin._backend.messages[-1] == pytest.approx([0, 0, 0, 0, 0, yaw])
+    writes = len(plugin._backend.messages)
+    send(plugin, command(setup, [0, 0, 0, 0, 0, yaw * 1.001], seq=21))
+    assert plugin._last["verdict"] == "REJECTED"
+    assert "axis 5" in plugin._last["reason"]
+    assert len(plugin._backend.messages) == writes
+
+
+def test_explicit_lower_yaw_cap_is_preserved(setup):
+    plugin = start(setup, max_wz=0.6)
+    send(plugin, command(setup, [0, 0, 0, 0, 0, -1.0]))
+    assert plugin._last["verdict"] == "REJECTED"
+    assert not plugin._backend.messages
+
+
 def test_command_maps_body_axes_and_ramps_from_zero(setup):
     plugin = start(setup)
     send(plugin, command(setup))
@@ -241,10 +279,54 @@ def test_sdk_latency_does_not_allow_apply_starts_above_20hz(setup, monkeypatch):
     setup.clock.advance(0.005)  # 35ms between starts: still above the 20Hz cap.
     send(plugin, command(setup, seq=2))
     assert plugin._counts["accepted"] == 1
-    assert plugin._counts["dropped"] == 1
-    assert plugin._last["reason"] == "command rate exceeds 20 Hz"
+    assert plugin._counts["dropped"] == 0
+    assert plugin._info()["input_queue"]["pending"] == 1
     send(plugin, command(setup, [0] * 6, seq=3))
     assert plugin._backend.messages[-1] == [0] * 6
+
+
+def test_arrival_guard_dispatches_continuous_stream_without_waiting_for_timer(setup, monkeypatch):
+    plugin = start(setup)
+    node = setup.ros.executor_core.nodes[0]
+    guard, = node.guards
+    assert node.timers[0][0] == 0.02
+    original_write = plugin._backend.write
+    def slow_sdk(values, deadline):
+        setup.clock.advance(0.07)
+        original_write(values, deadline)
+    monkeypatch.setattr(plugin._backend, "write", slow_sdk)
+    began = setup.clock.monotonic()
+    for seq in range(1, 21):
+        setup.clock.advance(began + (seq - 1) * 0.1 - setup.clock.monotonic())
+        node.subscriptions[0][2](types.SimpleNamespace(data=json.dumps(command(setup, seq=seq))))
+        assert guard.triggered == seq
+        guard.callback()  # Executor processes arrivals, without firing a timer.
+    assert plugin._counts["accepted"] == 20
+    assert plugin._counts["holds"] == plugin._counts["dropped"] == 0
+    assert len(plugin._backend.messages) == 20
+    timing = plugin._info()["last_command_timing"]
+    assert timing["command_age_ms"] == timing["observation_age_ms"] == 0
+    assert timing["apply_round_trip_ms"] == pytest.approx(70)
+    assert 129 <= timing["remaining_after_apply_ms"] <= 131
+
+
+def test_bunched_arrivals_keep_latest_until_next_apply_slot(setup):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    setup.clock.advance(0.02)
+    send(plugin, command(setup, [0.1, 0, 0, 0, 0, 0.2], seq=2))
+    setup.clock.advance(0.01)
+    latest = command(setup, [0.15, 0, 0, 0, 0, -0.2], seq=3)
+    send(plugin, latest)
+    assert plugin._counts["accepted"] == 1
+    assert plugin._info()["input_queue"]["pending"] == 1
+    setup.clock.advance(0.03)
+    plugin._tick()
+    assert plugin._counts["accepted"] == 2
+    assert plugin._counts["dropped"] == 0
+    assert plugin._last["requested"] == latest["values"]
+    assert plugin._backend.deadlines[-1] == latest["stamp_ms"] + 200
+    assert plugin._counts["holds"] == 0
 
 
 def test_inbound_callback_remains_responsive_while_sdk_is_waiting(setup, monkeypatch):
@@ -674,12 +756,12 @@ def test_refuses_start_when_explicit_base_owner_exists(setup):
     assert not setup.ros.executor_core.nodes
 
 
-def test_zero_bypasses_rate_limit_and_rate_drops_do_not_extend_watchdog(setup):
+def test_zero_bypasses_apply_pacing_and_discards_pending_motion(setup):
     plugin = start(setup)
     send(plugin, command(setup))
     setup.clock.advance(0.01)
     send(plugin, command(setup, seq=2))
-    assert plugin._last["reason"] == "command rate exceeds 20 Hz"
+    assert plugin._info()["input_queue"]["pending"] == 1
     assert plugin._counts["accepted"] == 1
     send(plugin, command(setup, [0] * 6, seq=3))
     assert plugin._backend.messages[-1] == [0] * 6
