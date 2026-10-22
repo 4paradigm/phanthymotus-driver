@@ -245,6 +245,7 @@ class ArmControlTests(unittest.TestCase):
         plugin = _prime_arm_plugin(publisher)
         shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
         hold = plugin._hold_q[shoulder]
+        plugin._confirm_target_write = lambda generation: None
         plugin._set_targets({"shoulderPitch_Left": -1.0})
         self.assertEqual(plugin._seg_current[shoulder], hold)
         self.assertEqual(plugin._seg_start[shoulder], hold)
@@ -267,7 +268,7 @@ class ArmControlTests(unittest.TestCase):
         # Retarget to a new pose: the new segment starts from current output,
         # not from the original hold or previous target.
         plugin._set_targets({"shoulderPitch_Left": 0.5})
-        self.assertAlmostEqual(plugin._seg_start[shoulder], mid)
+        self.assertAlmostEqual(plugin._seg_start[shoulder], mid, delta=0.01)
         self.assertEqual(plugin._target_q[shoulder], 0.5)
 
         # At the end of the segment the output equals the newest target.

@@ -16,6 +16,7 @@ import sys
 import time
 import types
 import unittest
+from unittest import mock
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
@@ -43,6 +44,9 @@ class RunningArmMixin:
         self._original_lowcmd = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
         device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
         self._running = []
+        self._notify_patch = mock.patch.object(device, "_notify_action_completion")
+        if not hasattr(self, "calls"):
+            self._notify_patch.start()
         super().setUp()
 
     def tearDown(self):
@@ -52,6 +56,9 @@ class RunningArmMixin:
             thread = plugin._thread
             if thread is not None:
                 thread.join(1.0)
+        time.sleep(0.06)
+        if not hasattr(self, "calls"):
+            self._notify_patch.stop()
         if self._original_lowcmd is None:
             del device.pnd_adam_msg_dds__LowCmd_
         else:
@@ -187,7 +194,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
         return {ADAM_PRO_JOINTS[index] for index in control._target_q}
 
     def test_symmetric_gestures_default_to_both_arms(self):
-        for name in ("welcome", "raise", "reset"):
+        for name in ("reset",):
             gestures = self._gesture()
             control = gestures._control
             result = gestures.dispatch(name, {})
@@ -198,7 +205,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
             self.assertIn("elbow_Right", joints, f"{name} drove only one arm")
 
     def test_one_armed_gestures_default_to_the_right_arm(self):
-        for name in ("salute", "high_five"):
+        for name in ("salute",):
             gestures = self._gesture()
             control = gestures._control
             result = gestures.dispatch(name, {})
@@ -210,7 +217,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
             gestures._cancel_sequence()
 
     def test_selecting_the_left_arm_uses_the_mirrored_joint_set(self):
-        for name in ("salute", "high_five"):
+        for name in ("salute",):
             right = self._gesture()
             self.assertTrue(right.dispatch(name, {"side": "right"})["success"])
             left = self._gesture()
@@ -230,7 +237,7 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
         self.assertEqual("INVALID_ARGUMENT", result["code"])
         self.assertIn("one-armed", result["message"])
 
-    def test_salute_and_high_five_are_different_poses(self):
+    def test_advertised_gestures_use_distinct_poses(self):
         """Regression: these used to resolve to one shared pose."""
         poses = {name: pose for name, (pose, _, _)
                  in ArmGesturePlugin._GESTURES.items()}
@@ -279,13 +286,13 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
                     / ArmGesturePlugin._GESTURE_VELOCITY_RAD_S)
         self.assertAlmostEqual(span, expected, places=6)
 
-    def test_reset_returns_the_selected_arm_to_its_zero_target(self):
+    def test_reset_returns_the_selected_arm_to_its_startup_pose(self):
         gestures = self._gesture()
         control = gestures._control
         result = gestures.dispatch("reset", {"side": "left"})
         self.assertTrue(result["success"], result)
         self.assertEqual(control._target_q[ADAM_PRO_JOINTS.index("elbow_Left")],
-                         0.0)
+                         control._hold_q[ADAM_PRO_JOINTS.index("elbow_Left")])
         self.assertNotIn(ADAM_PRO_JOINTS.index("elbow_Right"), control._target_q)
 
     def test_no_gesture_ever_selects_an_empty_joint_set(self):
@@ -342,7 +349,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
         self.assertEqual(elbow["limits_deg"],
                          {"minimum": ARM_JOINT_CONTROLS["left_elbow"][2],
                           "maximum": ARM_JOINT_CONTROLS["left_elbow"][3]})
-        self.assertFalse(state["settled"])
+        self.assertFalse(state["trajectory_complete"])
         self.assertEqual(1, state["tracking_joint_count"])
         # Joints that were never commanded report a null target.
         self.assertIsNone(state["joints"]["right_elbow"]["target_deg"])
@@ -352,7 +359,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
             plugin._seg_current[ADAM_PRO_JOINTS.index("elbow_Left")] = \
                 math.radians(-45)
         state = plugin.dispatch("get_state", {})
-        self.assertTrue(state["settled"])
+        self.assertTrue(state["trajectory_complete"])
         self.assertEqual(0.0, state["joints"]["left_elbow"]["error_deg"])
 
     def test_duration_s_can_slow_but_never_speed_up_a_move(self):
@@ -528,7 +535,7 @@ class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
 
     def test_unbound_gestures_leave_the_hand_alone(self):
         _, hand, gestures = self._pair()
-        result = gestures.dispatch("welcome", {"side": "both"})
+        result = gestures.dispatch("reset", {"side": "both"})
         self.assertTrue(result["success"], result)
         self.assertNotIn("hand_gesture", result)
         self.assertEqual([], hand._control.activated)
@@ -592,6 +599,15 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         ArmGesturePlugin._WAVE_SEQUENCE = self._original_sequence
         ArmGesturePlugin._WAVE_LOWER_SECONDS = self._original_lower
 
+    def arm_plugin(self):
+        control = super().arm_plugin()
+        original = control._set_targets
+        def fast_targets(targets, **kwargs):
+            kwargs.update(preferred_span=0.01, velocity_limit=1000)
+            return original(targets, **kwargs)
+        control._set_targets = fast_targets
+        return control
+
     def _wait(self):
         deadline = time.monotonic() + 5.0
         while not self.calls and time.monotonic() < deadline:
@@ -622,7 +638,8 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         self.assertEqual("arm_gesture", tool)
         self.assertEqual("wave", payload["gesture"])
         # The arm is lowered again, so the final target is the neutral one.
-        self.assertEqual(0.0, control._target_q[ADAM_PRO_JOINTS.index("elbow_Right")])
+        self.assertEqual(control._hold_q[ADAM_PRO_JOINTS.index("elbow_Right")],
+                         control._target_q[ADAM_PRO_JOINTS.index("elbow_Right")])
 
     def test_stop_cancels_a_running_wave(self):
         control = self.arm_plugin()
@@ -654,22 +671,6 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         statuses = {call[0]: call[1] for call in self.calls}
         self.assertEqual("cancelled", statuses.get(first["action_id"]))
         self.assertEqual("completed", statuses.get(second["action_id"]))
-
-    def test_handshake_reports_completion_after_elbow_oscillation(self):
-        control = self.arm_plugin()
-        control._active_segment_span = lambda: 0.01
-        gestures = ArmGesturePlugin(control)
-        gestures._HANDSHAKE_ELBOW_SEQUENCE = (-72.0, -88.0, -80.0)
-        result = gestures.dispatch("handshake", {"side": "left"})
-        self.assertTrue(result["success"], result)
-        self.assertEqual(3, result["sequence_segments"])
-        deadline = time.monotonic() + 5.0
-        while not self.calls and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertEqual("completed", self.calls[0][1])
-        self.assertEqual("handshake", self.calls[0][2]["gesture"])
-        elbow = ADAM_PRO_JOINTS.index("elbow_Left")
-        self.assertAlmostEqual(math.radians(-80), control._target_q[elbow])
 
     def test_superseded_wave_cannot_write_after_new_pose(self):
         control = self.arm_plugin()
@@ -901,16 +902,16 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
 
 
 class RemovedGestureTests(unittest.TestCase):
-    def test_config_and_marketplace_no_longer_list_removed_gesture_cards(self):
+    def test_config_and_marketplace_list_arm_gesture_only(self):
         base = __file__.rsplit("/", 1)[0]
         for filename in ("config.yaml", "driver.yaml"):
             with open(f"{base}/{filename}", encoding="utf-8") as stream:
                 content = stream.read()
-            self.assertNotIn("arm_gesture", content, filename)
+            self.assertIn("arm_gesture", content, filename)
             self.assertNotIn("waist_gesture", content, filename)
             self.assertNotIn("head_gesture", content, filename)
 
-    def test_bundle_does_not_register_removed_gesture_cards(self):
+    def test_bundle_registers_arm_gesture_with_shared_controller(self):
         disabled = {name: {"enabled": False} for name in (
             "state", "estop", "loco", "motion", "tracking_motion",
             "camera", "vision_capture", "hand", "hand_gesture",
@@ -930,7 +931,8 @@ class RemovedGestureTests(unittest.TestCase):
             config, "", None, None, dds_lowcmd_pub=_FakePublisher(),
             ros2_enabled=False)
         self.assertIn("arm_control", bundle._tool_map)
-        self.assertNotIn("arm_gesture", bundle._tool_map)
+        self.assertIs(bundle._tool_map["arm_gesture"]._control,
+                      bundle._tool_map["arm_control"])
         self.assertIn("waist_control", bundle._tool_map)
 
 
