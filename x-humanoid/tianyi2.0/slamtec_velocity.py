@@ -7,6 +7,8 @@ checks the command lease independently of ROS and of this Python process.
 
 from __future__ import annotations
 
+import copy
+import json
 import math
 import os
 import select
@@ -35,6 +37,10 @@ class SlamtecVelocityBackend:
         self._last_write = None
         self._action_id = 0
         self._state = "disconnected"
+        self._native_stats = None
+        self._native_ack_sequence = None
+        self._native_ack_status = None
+        self._native_stats_error = ""
         self._timeout = float(config.get("sdk_reply_timeout", 0.25))
         if not math.isfinite(self._timeout) or not 0.05 <= self._timeout <= 0.3:
             raise ValueError("sdk_reply_timeout must be between 0.05 and 0.3 seconds")
@@ -75,14 +81,19 @@ class SlamtecVelocityBackend:
                 line, self._buffer = self._buffer.split(b"\n", 1)
                 if not line.startswith(b"MOTUS_SDK "):
                     continue  # SDK versions may log to stdout.
-                fields = line.decode("ascii").split()
+                reply = line.decode("ascii")
+                fields = reply.split(maxsplit=3)
                 if len(fields) < 4 or int(fields[1]) != sequence:
                     raise RuntimeError("SDK reply sequence mismatch")
                 if fields[2] != "OK":
+                    fields = reply.split(maxsplit=4)
+                    self._record_native_ack(sequence, fields[2], fields[4] if len(fields) > 4 else None)
                     message = bytes.fromhex(fields[3]).decode("utf-8", "replace")
                     if fields[2] == "EXPIRED":
                         raise CommandLeaseExpired(message)
                     raise RuntimeError(message)
+                fields = reply.split(maxsplit=5)
+                self._record_native_ack(sequence, fields[2], fields[5] if len(fields) > 5 else None)
                 self._action_id = int(fields[3])
                 self._state = fields[4] if len(fields) > 4 else "ready"
                 return
@@ -98,6 +109,34 @@ class SlamtecVelocityBackend:
             self._buffer += chunk
             if len(self._buffer) > 65536:
                 raise RuntimeError("SDK worker reply exceeded size limit")
+
+    def _record_native_ack(self, sequence, status, payload):
+        # Diagnostics describe this acknowledgement, not live chassis state.
+        # Malformed optional data must not change the control reply's verdict.
+        self._native_ack_sequence, self._native_ack_status = sequence, status
+        self._native_stats = None
+        self._native_stats_error = ""
+        if payload is None:
+            return  # Older workers do not include diagnostics.
+        try:
+            stats = json.loads(payload)
+            if not isinstance(stats, dict):
+                raise ValueError("SDK diagnostics must be a JSON object")
+            pending = [(stats, 0)]
+            while pending:
+                value, depth = pending.pop()
+                if depth > 32:
+                    raise ValueError("SDK diagnostics nesting exceeds limit")
+                if isinstance(value, dict):
+                    pending.extend((item, depth + 1) for item in value.values())
+                elif isinstance(value, list):
+                    pending.extend((item, depth + 1) for item in value)
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    if not math.isfinite(value):
+                        raise ValueError("SDK diagnostics numbers must be finite")
+            self._native_stats = stats
+        except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+            self._native_stats_error = str(exc)
 
     def _request(self, command):
         if self._faulted:
@@ -154,6 +193,9 @@ class SlamtecVelocityBackend:
                 self._armed = False
                 return
             if self._process is not None:
+                if (self._process.poll() is None and not self._armed and
+                        self._state == "ready" and self._action_id == 0):
+                    return  # A previous acknowledgement already confirmed idle.
                 self._request("STOP")
             self._armed = False
 
@@ -191,5 +233,9 @@ class SlamtecVelocityBackend:
                     "expired_commands": self._expired_commands,
                     "last_expired_error": self._last_expired_error,
                     "last_write": dict(self._last_write) if self._last_write is not None else None,
+                    "native": {"snapshot": "latest_ack", "sequence": self._native_ack_sequence,
+                               "status": self._native_ack_status,
+                               "stats": copy.deepcopy(self._native_stats),
+                               "parse_error": self._native_stats_error},
                     "firmware_heartbeat_timeout_s": 1,
                     "handover_wait_ms": max(0, int((self._unsafe_until - time.monotonic()) * 1000))}

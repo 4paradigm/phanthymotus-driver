@@ -45,6 +45,7 @@ class _LatestControlInbox:
             self._last_gap_ms = None
 
     def put(self, message, generation):
+        received_at = (time.monotonic(), int(time.time() * 1000))
         try:
             payload = json.loads(message.data)
             values = payload.get("values") if isinstance(payload, dict) else None
@@ -56,12 +57,12 @@ class _LatestControlInbox:
         with self._lock:
             if not self._active or generation is not None and generation != self._generation:
                 return False
-            now = time.monotonic()
+            now = received_at[0]
             self._last_gap_ms = (round((now - self._last_received_at) * 1000, 1)
                                  if self._last_received_at is not None else None)
             self._last_received_at = now
             self._received += 1
-            entry = (message, self._generation, now)
+            entry = (message, self._generation, *received_at)
             if zero:
                 self._coalesced += int(self._motion is not None) + int(self._zero is not None)
                 self._motion, self._zero = None, entry
@@ -104,7 +105,7 @@ class _LatestControlInbox:
                 return None
             self._processed += 1
             self._last_wait_ms = round((time.monotonic() - entry[2]) * 1000, 1)
-            return entry[:2]
+            return entry[0], entry[1], entry[2:]
 
     def info(self):
         with self._lock:
@@ -444,7 +445,7 @@ class LocoServoPlugin:
         if self._inbox.put(message, generation):
             self._controller_wake.set()
 
-    def _process_message(self, message, generation=None):
+    def _process_message(self, message, generation=None, received_at=None):
         with self._lock:
             if not self._running or self._paused or (
                     generation is not None and generation != self._generation):
@@ -497,6 +498,10 @@ class LocoServoPlugin:
                 wall_ms = int(time.time() * 1000)
                 self._last_timing = {
                     "seq": command.get("seq"), "ttl_ms": command.get("ttl_ms"),
+                    "receive_age_ms": (received_at[1] - command["stamp_ms"]
+                                       if received_at is not None else None),
+                    "local_wait_ms": (round((started - received_at[0]) * 1000, 1)
+                                      if received_at is not None else None),
                     "command_age_ms": wall_ms - command["stamp_ms"],
                     "observation_age_ms": wall_ms - command.get("obs_stamp_ms", command["stamp_ms"]),
                     "remaining_before_apply_ms": self._command_deadline_ms - wall_ms,

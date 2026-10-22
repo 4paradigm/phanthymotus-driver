@@ -190,7 +190,8 @@ hardware validation with the new image.
 and `backend` (type, host/port, connection status, last acknowledged action ID,
 error and heartbeat handover wait). `output_topic` is null: there is no ROS
 velocity publisher to inspect. `published` is retained for clients, but now
-counts acknowledged SDK velocity/stop operations, not measured physical motion.
+counts successful backend velocity/stop calls (including a stop that was already
+acknowledged idle), not network RPCs or measured physical motion.
 The backend state/action ID describe the last acknowledgement, not a substitute
 for odometry feedback; verify physical motion with `loco_state`.
 
@@ -207,6 +208,12 @@ checked on hardware. On an ambiguous failure, handover waits 1.5 seconds for
 that firmware lease before another card is permitted to act. A faulted worker
 requires explicit stop/start; it does not automatically regain control.
 
+An already-confirmed idle backend does not send a second STOP RPC: this requires
+a live worker, no fault, no armed motion, state `ready` and action ID zero. Motion,
+unknown state, a dead worker and fault/firmware handover still follow the normal
+stop and error paths. Each new motion uses the same velocity action until a
+stop or failure; forward and angular speeds are submitted together.
+
 An expired command is dropped without extending its TTL or replaying it. The
 native worker reports `EXPIRED` only after its stop/cancel succeeds; in that
 case the card resets its output/ramp and can accept a subsequent fresh command
@@ -218,6 +225,16 @@ expiry from faults and expose the lease remaining before IPC and the latest
 write round-trip time. These timings diagnose latency; they do not establish
 the physical stopping time. Expiry and excessive-lease errors are now separate,
 with remaining milliseconds reported for the native ingress check.
+
+`backend.native` contains the latest ACK snapshot, not live chassis feedback:
+`sequence`, `status` and `stats`. Native `stats.last_set` separates busy checks,
+heartbeat start, action creation, ownership verification and velocity-write
+times, plus the lease remaining before/after the write. Action start and
+confirmed-stop counters, heartbeat refresh counts/times and a fixed stop reason
+help distinguish SDK delay from action restarts. Timings include the full SDK
+call and do not assume each SDK method is a network round trip. Missing or
+malformed optional diagnostics do not change ACK/ERROR handling and never
+extend the lease; older workers remain compatible.
 
 The 20Hz command cap compares the starts of SDK applications, not the time
 since the previous SDK acknowledgement. A regular 10Hz stream must not lose
@@ -265,7 +282,11 @@ stop; each replaced frame is also counted once as dropped.
 `dispatch.mode=dedicated_worker`, `worker_alive` and `worker_failed` identify the
 independent controller and expose its health. `last_command_timing`
 reports the selected command sequence/TTL, command and observation ages,
-remaining lease before/after apply, and apply round-trip duration. Continuous
+remaining lease before/after apply, and apply round-trip duration. `receive_age_ms`
+measures generation-to-driver-callback age; `local_wait_ms` measures callback-to-
+submission delay, including any synchronous stop before submission. These
+measurements are tied to that selected frame, even if a newer one has arrived.
+Continuous
 publication alone cannot guarantee continuous motion: expired observations,
 TTL gaps, explicit zeros, invalid commands and SDK faults still stop or refuse
 motion. These timings distinguish those cases from local queue delay.

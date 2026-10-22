@@ -38,14 +38,20 @@ int main(int argc, char** argv) {
     if (test == "idle") {
         session.stop(); session.tick(deadline);
         assert(chassis.writes == 0 && chassis.cancels == 0 && chassis.heartbeat_starts == 0);
+        assert(session.stats_json().find("\"stop_attempts\":0") != std::string::npos);
     } else if (test == "combined") {
         session.set(0.05, -0.1, deadline);
         assert(chassis.vx == 0.05 && chassis.wz == -0.1 && chassis.begins == 1);
         session.set(-0.03, 0.2, deadline);
         assert(chassis.vx == -0.03 && chassis.wz == 0.2 && chassis.begins == 1);
+        auto active_stats = session.stats_json();
+        assert(active_stats.find("\"action_starts\":1") != std::string::npos);
+        assert(active_stats.find("\"set_attempts\":2") != std::string::npos);
+        assert(active_stats.find("\"busy_ms\":null") != std::string::npos);
         session.stop();
         assert(chassis.vx == 0 && chassis.wz == 0 && chassis.cancels == 1);
         assert(chassis.heartbeat_stops == 1 && !session.active());
+        assert(session.stats_json().find("\"confirmed_stops\":1") != std::string::npos);
         session.tick(deadline);
         assert(chassis.refreshes == 0);
     } else if (test == "watchdog") {
@@ -55,6 +61,8 @@ int main(int argc, char** argv) {
         session.tick(deadline);
         assert(!session.active() && chassis.vx == 0 && chassis.cancels == 1);
         assert(chassis.heartbeat_stops == 1);
+        assert(session.stats_json().find("\"heartbeat_refreshes\":1") != std::string::npos);
+        assert(session.stats_json().find("\"stop_reason\":\"lease_expired\"") != std::string::npos);
         chassis.other = true; // A later home action must not see any more writes.
         session.tick(deadline + std::chrono::seconds(2)); session.stop();
         assert(chassis.cancels == 1 && chassis.writes == 2);
@@ -84,11 +92,15 @@ int main(int argc, char** argv) {
         bool threw = false;
         try { session.stop(); } catch (...) { threw = true; }
         assert(threw && chassis.heartbeat_stops == 0 && session.active());
+        assert(session.stats_json().find("\"stop_attempts\":1") != std::string::npos);
+        assert(session.stats_json().find("\"confirmed_stops\":0") != std::string::npos);
     } else if (test == "begin_failure") {
         chassis.begin_fails = true;
         bool threw = false;
         try { session.set(0.05, 0, deadline); } catch (...) { threw = true; }
         assert(threw);
+        assert(session.stats_json().find("\"action_start_attempts\":1") != std::string::npos);
+        assert(session.stats_json().find("\"action_starts\":0") != std::string::npos);
         try { session.stop(); } catch (...) {}
         assert(chassis.heartbeat_stops == 0); // keep firmware protection armed
     } else if (test == "preempted") {

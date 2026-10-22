@@ -639,6 +639,20 @@ def test_queue_wait_does_not_retimestamp_or_execute_expired_input(setup):
     assert plugin._info()["input_queue"]["last_wait_ms"] == pytest.approx(210)
 
 
+def test_timing_separates_arrival_age_from_local_wait_without_extending_ttl(setup):
+    plugin = start(setup)
+    original = command(setup, stamp_ms=int(setup.clock.time() * 1000) - 90)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(original)))
+    setup.clock.advance(0.03)
+    plugin._tick()
+    timing = plugin._info()["last_command_timing"]
+    assert timing["receive_age_ms"] == 90
+    assert timing["local_wait_ms"] == pytest.approx(30)
+    assert timing["command_age_ms"] == 120
+    assert timing["remaining_before_apply_ms"] == 80
+    assert plugin._backend.deadlines[-1] == original["stamp_ms"] + original["ttl_ms"]
+
+
 def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):
     plugin = start(setup)
     for cmd in (command(setup), command(setup, [0] * 6, seq=2), command(setup, seq=3)):

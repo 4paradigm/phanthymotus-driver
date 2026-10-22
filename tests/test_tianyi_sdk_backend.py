@@ -1,6 +1,7 @@
 """Real worker IPC and compiled lease/ownership logic, without hardware."""
 
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,36 +20,39 @@ spec.loader.exec_module(backend_module)
 @pytest.fixture
 def backend(tmp_path):
     workers = []
-    def create(mode="ok"):
+    def create(mode="ok", diagnostics=None):
         script = tmp_path / (mode + "-worker")
         script.write_text(f'''#!{sys.executable}
 import sys,time
 mode={mode!r}
+diagnostics={diagnostics!r}
+def emit(line):
+    print(line+(" "+diagnostics if diagnostics is not None else ""),flush=True)
 print("SDK diagnostic on stdout",flush=True)
-print("MOTUS_SDK 0 OK 0 ready",flush=True)
+emit("MOTUS_SDK 0 OK 0 ready")
 for line in sys.stdin:
     seq,verb,*args=line.split()
     if mode == "timeout" and verb == "SET":
         time.sleep(30)
     if mode == "error" and verb == "SET":
-        print("MOTUS_SDK "+seq+" ERROR "+b"localization quality too low".hex(),flush=True)
+        emit("MOTUS_SDK "+seq+" ERROR "+b"localization quality too low".hex())
         sys.exit(1)
     if mode == "expired" and verb == "SET" and seq == "1":
-        print("MOTUS_SDK "+seq+" EXPIRED "+b"command lease expired at worker: remaining_ms=-12".hex(),flush=True)
+        emit("MOTUS_SDK "+seq+" EXPIRED "+b"command lease expired at worker: remaining_ms=-12".hex())
         continue
     if mode == "expired_stop" and verb == "STOP":
-        print("MOTUS_SDK "+seq+" EXPIRED "+b"unexpected stop reply".hex(),flush=True)
+        emit("MOTUS_SDK "+seq+" EXPIRED "+b"unexpected stop reply".hex())
         continue
     if mode == "wrong_sequence":
         seq=str(int(seq)+1)
     if mode == "dead":
         sys.exit(1)
     if mode == "partial":
-        response="MOTUS_SDK "+seq+" OK 17 active\\n"
+        response="MOTUS_SDK "+seq+" OK 17 active"+(" "+diagnostics if diagnostics is not None else "")+"\\n"
         sys.stdout.write(response[:7]);sys.stdout.flush();time.sleep(.01)
         sys.stdout.write(response[7:]);sys.stdout.flush()
     else:
-        print("MOTUS_SDK "+seq+" OK "+("17 active" if verb == "SET" else "0 ready"),flush=True)
+        emit("MOTUS_SDK "+seq+" OK "+("17 active" if verb == "SET" else "0 ready"))
 ''')
         script.chmod(0o700)
         instance = backend_module.SlamtecVelocityBackend({"sdk_binary": str(script), "sdk_reply_timeout": 0.15})
@@ -81,12 +85,122 @@ def test_connect_is_readonly_and_stop_closes_own_session(backend):
     assert not worker.info()["connected"]
 
 
+def test_confirmed_idle_skips_repeated_stop_requests(backend):
+    worker = backend()
+    worker.connect()
+    worker.stop()
+    assert worker._sequence == 0  # The ready connection has no motion to stop.
+    write(worker)
+    worker.stop()
+    assert worker._sequence == 2 and not worker._armed
+    worker.stop()
+    worker.stop()
+    assert worker._sequence == 2
+    write(worker)
+    assert worker._sequence == 3 and worker._armed
+
+
+@pytest.mark.parametrize("armed,state,action_id", [
+    (True, "ready", 0), (False, "unknown", 0),
+    (False, "active", 0), (False, "ready", 17),
+])
+def test_stop_requires_confirmation_for_armed_or_uncertain_state(backend, armed, state, action_id):
+    worker = backend()
+    worker.connect()
+    worker._armed, worker._state, worker._action_id = armed, state, action_id
+    worker.stop()
+    assert worker._sequence == 1 and not worker._armed
+    assert worker.info()["state"] == "ready" and worker.info()["action_id"] == 0
+
+
+def test_idle_stop_does_not_hide_a_dead_worker(backend):
+    worker = backend()
+    worker.connect()
+    worker._process.kill()
+    worker._process.wait()
+    with pytest.raises(RuntimeError, match="not connected"):
+        worker.stop()
+    assert worker._faulted and not worker.info()["connected"]
+
+
+def test_faulted_idle_metadata_still_obeys_firmware_handover_wait(backend):
+    worker = backend()
+    worker.connect()
+    worker._faulted = True
+    worker._unsafe_until = time.monotonic() + 1
+    with pytest.raises(RuntimeError, match="heartbeat expiry"):
+        worker.stop()
+    assert worker._sequence == 0
+
+
 @pytest.mark.parametrize("mode", ["partial", "ok"])
 def test_buffered_protocol_handles_partial_replies_and_sdk_logs(backend, mode):
     worker = backend(mode)
     worker.connect()
     write(worker)
     assert worker.info()["action_id"] == 17
+
+
+@pytest.mark.parametrize("mode", ["ok", "partial"])
+def test_native_diagnostics_are_latest_ack_snapshots_and_preserve_json_spaces(backend, mode):
+    stats = {"action_starts": 1, "stop_reason": "none",
+             "last_set": {"verify_owned_ms": 12.5, "remaining_after_set_ms": -0.25,
+                          "busy_ms": None}, "flags": [True, False]}
+    worker = backend(mode, diagnostics=json.dumps(stats))
+    worker.connect()
+    assert worker.info()["native"]["sequence"] == 0
+    write(worker)
+    native = worker.info()["native"]
+    assert native == {"snapshot": "latest_ack", "sequence": 1, "status": "OK",
+                      "stats": stats, "parse_error": ""}
+    native["stats"]["last_set"]["verify_owned_ms"] = 999
+    assert worker.info()["native"]["stats"] == stats
+
+
+@pytest.mark.parametrize("mode,status,error", [
+    ("expired", "EXPIRED", backend_module.CommandLeaseExpired),
+    ("error", "ERROR", RuntimeError),
+])
+def test_native_diagnostics_do_not_change_error_acknowledgements(backend, mode, status, error):
+    stats = {"action_starts": 0, "last_set": {"remaining_after_set_ms": -12.0}}
+    worker = backend(mode, diagnostics=json.dumps(stats))
+    worker.connect()
+    with pytest.raises(error):
+        write(worker)
+    native = worker.info()["native"]
+    assert native["sequence"] == 1 and native["status"] == status
+    assert native["stats"] == stats
+    assert worker.info()["connected"] == (status == "EXPIRED")
+
+
+@pytest.mark.parametrize("diagnostics", [
+    "[]", "null", "{bad", '{"last_set":{"verify_owned_ms":NaN}}',
+    '{"last_set":{"verify_owned_ms":Infinity}}', '{"last_set":{"verify_owned_ms":1e400}}',
+])
+@pytest.mark.parametrize("mode", ["ok", "expired", "error"])
+def test_invalid_optional_diagnostics_cannot_override_control_ack(backend, diagnostics, mode):
+    worker = backend(mode, diagnostics=diagnostics)
+    worker.connect()
+    if mode == "ok":
+        write(worker)
+        assert worker.info()["state"] == "active"
+    else:
+        error = backend_module.CommandLeaseExpired if mode == "expired" else RuntimeError
+        reason = "remaining_ms=-12" if mode == "expired" else "localization quality"
+        with pytest.raises(error, match=reason):
+            write(worker)
+    native = worker.info()["native"]
+    assert native["stats"] is None and native["parse_error"]
+    assert native["status"] == {"ok": "OK", "expired": "EXPIRED", "error": "ERROR"}[mode]
+
+
+def test_legacy_ack_clears_diagnostics_from_previous_ack(backend):
+    worker = backend()
+    worker.connect()
+    worker._native_stats = {"action_starts": 99}
+    write(worker)
+    assert worker.info()["native"]["sequence"] == 1
+    assert worker.info()["native"]["stats"] is None
 
 
 @pytest.mark.parametrize("mode,reason", [("error", "localization quality"),
@@ -136,10 +250,10 @@ def test_expired_ack_preserves_connection_but_never_replays_old_velocity(backend
     assert info["last_write"]["round_trip_ms"] is not None
     assert not worker._armed and worker._sequence == 1
     worker.stop()
-    assert worker._sequence == 2 and worker._process.pid == pid
+    assert worker._sequence == 1 and worker._process.pid == pid
     write(worker)  # Only this new call may start another velocity action.
     assert worker.info()["action_id"] == 17
-    assert worker._sequence == 3 and worker._process.pid == pid
+    assert worker._sequence == 2 and worker._process.pid == pid
 
 
 def test_expired_status_cannot_be_used_as_a_stop_acknowledgement(backend):

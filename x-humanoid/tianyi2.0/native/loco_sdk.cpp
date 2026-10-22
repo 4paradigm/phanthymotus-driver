@@ -9,13 +9,14 @@
 #include <string>
 
 static void reply(unsigned long seq, bool ok, unsigned long id, const std::string& text,
-                  const char* failure_status = "ERROR") {
+                  const char* failure_status = "ERROR", const std::string& stats = "") {
     std::cout << "MOTUS_SDK " << seq << " " << (ok ? "OK" : failure_status) << " ";
     if (ok) std::cout << id << " " << text;
     else {
         const char* hex = "0123456789abcdef";
         for (unsigned char c : text) std::cout << hex[c >> 4] << hex[c & 15];
     }
+    if (!stats.empty()) std::cout << " " << stats;
     std::cout << std::endl;
 }
 
@@ -27,7 +28,8 @@ int main(int argc, char** argv) {
         if (!std::isfinite(max_vx) || !std::isfinite(max_wz) || max_vx <= 0 || max_wz <= 0)
             throw std::runtime_error("invalid velocity limits");
         SlamwareAdapter sdk(argv[1], std::stoi(argv[2]), std::stoi(argv[3]));
-        VelocitySession<SlamwareAdapter> session(sdk);
+        using Session = VelocitySession<SlamwareAdapter>;
+        Session session(sdk);
         reply(0, true, 0, "ready"); // Connect is read-only, no velocity action.
         std::string buffer;
         try {
@@ -39,7 +41,7 @@ int main(int argc, char** argv) {
                 if (!result) continue;
                 char chunk[1024];
                 auto count = read(STDIN_FILENO, chunk, sizeof(chunk));
-                if (count <= 0) { session.stop(); return 0; }
+                if (count <= 0) { session.stop(Session::StopReason::InputClosed); return 0; }
                 buffer.append(chunk, count);
                 if (buffer.size() > 4096) throw std::runtime_error("oversized SDK request");
                 size_t newline;
@@ -73,20 +75,26 @@ int main(int argc, char** argv) {
                             // Never extend/replay an expired command. A positive
                             // stop acknowledgement allows a later fresh command;
                             // a failed stop escapes to the fatal path below.
-                            session.stop();
-                            reply(sequence, false, 0, e.what(), "EXPIRED");
+                            session.stop(Session::StopReason::LeaseExpired);
+                            reply(sequence, false, 0, e.what(), "EXPIRED", session.stats_json());
                             continue;
                         }
                     } else if (verb == "STOP") {
                         if (in >> extra) throw std::runtime_error("malformed STOP");
                         session.stop();
                     } else throw std::runtime_error("unknown SDK request");
-                    reply(sequence, true, sdk.action_id(), session.active() ? "active" : "ready");
+                    reply(sequence, true, sdk.action_id(), session.active() ? "active" : "ready",
+                          "ERROR", session.stats_json());
                 }
             }
+        } catch (const std::exception& e) {
+            try { session.stop(Session::StopReason::SdkException); } catch (...) {}
+            reply(sequence, false, 0, e.what(), "ERROR", session.stats_json());
+            return 1; // Never reconnect/replay a failed command.
         } catch (...) {
-            try { session.stop(); } catch (...) {} // heartbeat stays armed if cancel is unconfirmed
-            throw;
+            try { session.stop(Session::StopReason::SdkException); } catch (...) {}
+            reply(sequence, false, 0, "unknown SDK exception", "ERROR", session.stats_json());
+            return 1; // Heartbeat stays armed if cancel is unconfirmed.
         }
     } catch (const std::exception& e) {
         reply(sequence, false, 0, e.what());
