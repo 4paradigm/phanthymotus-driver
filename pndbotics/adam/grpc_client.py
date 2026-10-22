@@ -145,12 +145,18 @@ class AdamGrpcClient:
 
     def get_robot_state(self) -> dict:
         response = self._call("GetRobotState", pb2.GetRobotStateRequest())
-        return self._response(response, (
+        result = self._response(response, (
             "fsm_state", "vx", "vy", "vyaw", "height",
             "current_motion_file", "motion_playing",
             "current_tracking_motion", "tracking_playing",
             "switchable_states", "available_actions",
         ))
+        # Protobuf repeated fields are iterable containers, not JSON lists.
+        # State/info must serialize before ownership/capability checks can run.
+        for field in ("switchable_states", "available_actions"):
+            if field in result:
+                result[field] = list(result[field])
+        return result
 
     def get_stand_list(self) -> dict:
         state = self.get_robot_state()

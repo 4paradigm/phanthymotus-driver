@@ -15,6 +15,8 @@ class Feedback:
         self._next = 0
 
     def Read(self, timeout=0):
+        if timeout == 0:
+            raise AssertionError("CycloneDDS zero timeout means an infinite wait")
         # Model new DDS samples, not an infinite queue of old samples.
         if self.live and time.monotonic() >= self._next:
             self._next = time.monotonic() + 0.005

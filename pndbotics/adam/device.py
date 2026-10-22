@@ -1675,7 +1675,9 @@ class ArmControlPlugin:
             # Drain queued feedback so an old backlog cannot masquerade as a
             # live stream while commands keep progressing.
             for _ in range(256):
-                latest = self._lowstate_sub.Read(timeout=0)
+                # CycloneDDS take_iter treats timeout=0 as an infinite wait.
+                # A positive microsecond timeout keeps an empty read bounded.
+                latest = self._lowstate_sub.Read(timeout=1e-6)
                 if latest is None:
                     break
                 state = latest
