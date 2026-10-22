@@ -20,7 +20,7 @@ class SimulatedClient:
                        for name, value in zip(JOINT_SUFFIXES, (-math.pi/6, 0., -.2))}
         self.joints.update({f"{side}_{name}": 0. for side in ("left", "right") for name in PASSIVE_SUFFIXES})
     def snapshot(self):
-        return {"fresh": True, "age_ms": 0, "joints": dict(self.joints)}
+        return {"fresh": True, "age_ms": 0, "timestamp_ms": int(time.time() * 1000), "joints": dict(self.joints)}
     def get_lifecycle_state(self):
         return "active"
     def sensor_snapshot(self, _):
@@ -42,7 +42,8 @@ class SimulatedRouter:
     def release(self, _):
         self.owner = None
     def publish(self, point):
-        assert all(k.startswith(("left_shoulder_", "right_shoulder_", "left_elbow_", "right_elbow_")) for k in point)
+        from wooden_man_motion import HOME
+        assert set(point) == set(HOME)
         self.writes.append(dict(point))
         self.client.joints.update(point)
         return True
@@ -119,17 +120,18 @@ def main():
         assert call("wooden_man_motion", "start", input_topic="/host_test/wooden_man/actions")["state"] == "running"
         pump(2)
         speak("游戏开始")
-        await_phase("won", 40)
+        await_phase("won", 100)
         assert game.info()["round"] == 3 and router.writes
         completed = {f["request_id"]: f for f in feedbacks if f["state"] == "completed"}
         gestures = [f["gesture"] for f in completed.values()]
         assert gestures.count("welcome") == 1 and gestures.count("round") == 2 and gestures.count("celebrate") == 1, gestures
+        assert all(f.get("home_verified") is True for f in completed.values())
         pump(.3)
         assert any("再挑战一次" in text for text in words), words
         print("PASS: HTTP/DDS preparation -> welcome -> three rounds -> measured gesture return -> celebration -> replay prompt", flush=True)
 
         speak("再来")
-        await_phase("watch", 20)
+        await_phase("watch", 35)
         pump(.2)
         pump(.4, moving=True)
         await_phase("lost", 20)

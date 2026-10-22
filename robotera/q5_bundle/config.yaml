@@ -27,6 +27,7 @@ plugins:
   wooden_man_motion:
     enabled: true
     image_mirrored: false
+    arrival_timeout: 8.0
   base_drive:
     enabled: true
     # Match the vendor SDK's direct base-drive contract, not the remote-control stream.

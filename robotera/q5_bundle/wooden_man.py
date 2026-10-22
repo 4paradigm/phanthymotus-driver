@@ -110,6 +110,8 @@ class Game:
         self.last_observation = None
         self.prompt_at = None
         self.replay_prompted = False
+        self.motion_stage = ""
+        self.motion_error = ""
 
     def cancel_motion(self):
         pending = getattr(self, "pending_motion", None)
@@ -128,6 +130,9 @@ class Game:
         self.pending_motion = request
         self.after_motion = next_phase
         self.motion_deadline = self.clock() + self.cfg["motion_timeout"]
+        self.motion_hard_deadline = self.clock() + self.cfg["motion_timeout"] * 4
+        self.motion_progress_seq = -1
+        self.motion_stage, self.motion_error = "queued", ""
         self.motion_not_before = self.clock() + self.cfg["cue_seconds"]
         self.last_motion_send = self.clock()
         self.phase = "robot_action"
@@ -151,7 +156,21 @@ class Game:
         if payload.get("request_id") != self.pending_motion["request_id"] or self.phase != "robot_action":
             return
         state = payload.get("state")
+        self.motion_stage = payload.get("stage", self.motion_stage)
+        if state == "running":
+            progress = payload.get("progress_seq")
+            if isinstance(progress, int) and not isinstance(progress, bool) and progress > self.motion_progress_seq:
+                self.motion_progress_seq = progress
+                self.motion_deadline = min(self.motion_hard_deadline, self.clock() + self.cfg["motion_timeout"])
+            return
         if state == "completed":
+            if payload.get("home_verified") is not True:
+                self.pending_motion = None
+                self.phase, self.reason = "error", "motion_home_unverified"
+                self.prompt_at = None
+                self.motion_error = "Missing verified neutral-pose completion"
+                self.say("没有收到手臂归位确认，本轮暂停，请更新动作卡。")
+                return
             self.pending_motion = None
             self.phase = "robot_settle"
             self.deadline = max(self.clock() + self.cfg["robot_settle_seconds"], self.motion_not_before)
@@ -159,7 +178,14 @@ class Game:
             self.pending_motion = None
             self.phase = "error"
             self.reason = "robot_motion_failed"
-            self.say("手臂动作没有完成，请检查动作卡和位置直控状态，再重新开始。")
+            self.prompt_at = None
+            self.motion_error = str(payload.get("message", ""))
+            if "Prepare arm_control" in self.motion_error:
+                self.say("机器人位置直控尚未准备，游戏暂停，请先完成位置直控准备。")
+            elif str(self.motion_stage).startswith("homing"):
+                self.say("手臂自动归位没有完成，本轮暂停。")
+            else:
+                self.say("手臂动作尚未到位，本轮暂停。")
 
     def preparation(self, payload):
         if self.phase != "preparing":
@@ -223,6 +249,7 @@ class Game:
                     highlight_indices=list(self.highlight), sensitivity=self.cfg["sensitivity"],
                     detect_fingers=self.cfg["detect_fingers"],
                     result=self.result, ready=self.ready,
+                    motion_stage=self.motion_stage, motion_error=self.motion_error,
                     motion_request_id=self.pending_motion["request_id"] if self.pending_motion else None,
                     hands={side: {"samples": h["samples"], "visible": h["visible"],
                                   "ready": h["visible"] and h["samples"] >= 3 and h["last"] is not None and self.clock() - h["last"] <= self.cfg["pose_timeout"]}
@@ -385,7 +412,8 @@ class Game:
                 self.cancel_motion()
                 self.pending_motion = None
                 self.phase, self.reason = "error", "robot_motion_timeout"
-                self.say("手臂动作反馈超时，游戏暂停，请检查动作卡。")
+                self.prompt_at = None
+                self.say("手臂动作长时间没有进展，游戏暂停。")
             elif now - self.last_motion_send >= .5:
                 self.emit_action(dict(self.pending_motion))
                 self.last_motion_send = now
@@ -657,7 +685,7 @@ class WoodenManPlugin:
                                      "moving_frames": "身体连续超阈帧数", "pose_timeout": "感知超时（秒）",
                                      "confidence": "关键点最低置信度", "finger_threshold": "手指位移阈值／手掌长度",
                                      "finger_frames": "手指连续超阈采样数", "robot_settle_seconds": "动作完成后站稳等待（秒）",
-                                     "motion_timeout": "动作反馈超时（秒）", "preparation_timeout": "准备站位超时（秒）"}[k],
+                                     "motion_timeout": "单阶段无进展超时（秒）", "preparation_timeout": "准备站位超时（秒）"}[k],
                            "advanced": True, **({"x-show-when": {"sensitivity": ["custom"]}} if k in ("motion_threshold", "finger_threshold") else {})}
                        for k, v in DEFAULTS.items()}}}}
 

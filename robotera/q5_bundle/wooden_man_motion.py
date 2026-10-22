@@ -17,6 +17,10 @@ GESTURES = ("welcome", "round", "point", "celebrate", "encourage")
 JOINT_SUFFIXES = ("shoulder_pitch_joint", "shoulder_roll_joint", "elbow_pitch_joint")
 PASSIVE_SUFFIXES = ("arm_yaw_joint", "elbow_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
 OWNER = "wooden_man_motion"
+ARM_SUFFIXES = ("shoulder_pitch_joint", "shoulder_roll_joint", "arm_yaw_joint", "elbow_pitch_joint",
+                "elbow_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
+HOME = {f"{side}_{suffix}": math.radians(degrees) for side in ("left", "right")
+        for suffix, degrees in zip(ARM_SUFFIXES, (-30, 0, 0, 0, 0, 0, 0))}
 
 
 def publisher_conflict(status):
@@ -89,7 +93,7 @@ def feedback(request_id, state, **extra):
 
 class MotionRunner:
     """One cancellable hardware worker; duplicate requests only refresh a lease."""
-    def __init__(self, client, router, report, mirrored=False):
+    def __init__(self, client, router, report, mirrored=False, arrival_timeout=8.0):
         self.client, self.router, self.report = client, router, report
         self.mirrored = mirrored
         self.lock = threading.RLock()
@@ -100,6 +104,16 @@ class MotionRunner:
         self.closed = False
         self.monitored = ()
         self.passive = ()
+        self.arrival_timeout = arrival_timeout
+        self.progress_seq = 0
+        self.stage = "idle"
+        self.sample_stamp = None
+
+    def _stage(self, request, sector, stage):
+        self.stage = stage
+        self.progress_seq += 1
+        self._record(feedback(request["request_id"], "running", gesture=request["gesture"], sector=sector,
+                              stage=stage, progress_seq=self.progress_seq))
 
     def _record(self, message):
         with self.lock:
@@ -142,7 +156,8 @@ class MotionRunner:
                 return
             self.cancel = threading.Event()
             self.lease = time.monotonic()
-            self._record(feedback(rid, "running", gesture=request["gesture"], sector=sector))
+            self.progress_seq, self.stage = 0, "queued"
+            self._record(feedback(rid, "running", gesture=request["gesture"], sector=sector, stage="queued", progress_seq=0))
             self.thread = threading.Thread(target=self._run, args=(request, target, sector), daemon=True,
                                            name="q5_wooden_man_arms")
             self.thread.start()
@@ -178,8 +193,10 @@ class MotionRunner:
         if not isinstance(joints, dict) or any(k not in joints or isinstance(joints[k], bool)
                 or not isinstance(joints[k], (int, float)) or not math.isfinite(joints[k]) for k in (*self.monitored, *self.passive)):
             raise RuntimeError("Required arm joint feedback unavailable")
-        if any(abs(joints[k]) > .35 for k in self.passive):
-            raise RuntimeError("Arm yaw/wrists must be near neutral; use arm_gesture reset first")
+        stamp = snapshot.get("timestamp_ms")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+            raise RuntimeError("Joint feedback receive timestamp unavailable")
+        self.sample_stamp = stamp
         return joints
 
     def _move(self, target):
@@ -195,14 +212,29 @@ class MotionRunner:
             if not self.router.publish(point):
                 raise RuntimeError("Body command publish failed")
             self.cancel.wait(duration / steps)
-        # Completion means observed arrival, not merely the final command sent.
-        until = time.monotonic() + 2.0
+        # Require several NEW feedback samples stable for >=0.5s. A single
+        # in-tolerance frame, or repeatedly reading one cached frame, is not completion.
+        until = time.monotonic() + self.arrival_timeout
+        anchor, stable_since, samples, last_stamp = None, None, 0, None
         while True:
             current = self.guard()
-            if all(k in current and math.isfinite(current[k]) and abs(current[k] - target[k]) <= .08 for k in target):
-                return
+            stamp = self.sample_stamp
+            if last_stamp is None or stamp != last_stamp:
+                if last_stamp is not None and stamp < last_stamp:
+                    anchor, stable_since, samples = None, None, 0
+                last_stamp = stamp
+                if all(abs(current[k] - target[k]) <= .08 for k in target):
+                    if anchor is None or any(abs(current[k] - anchor[k]) > .02 for k in target):
+                        anchor = {k: current[k] for k in target}
+                        stable_since, samples = time.monotonic(), 1
+                    else:
+                        samples += 1
+                        if samples >= 3 and time.monotonic() - stable_since >= .5:
+                            return
+                else:
+                    anchor, stable_since, samples = None, None, 0
             if time.monotonic() >= until:
-                raise RuntimeError("Arm did not reach target according to joint feedback")
+                raise RuntimeError("Arm did not reach and settle at target according to fresh joint feedback")
             if not self.router.publish(target):
                 raise RuntimeError("Body hold publish failed")
             self.cancel.wait(.05)
@@ -213,29 +245,47 @@ class MotionRunner:
         state, message = "error", "Motion failed"
         original = {}
         try:
-            self.monitored = tuple(target)
-            arms = {k.split("_", 1)[0] for k in target}
-            self.passive = tuple(arm + "_" + suffix for arm in arms for suffix in PASSIVE_SUFFIXES)
+            # Own and monitor both arms throughout homing and the gesture.
+            self.monitored = tuple(HOME)
+            self.passive = ()
             joints = self.guard()
             if any(k not in JOINT_LIMITS or not JOINT_LIMITS[k][0] <= v <= JOINT_LIMITS[k][1] for k, v in target.items()):
                 raise RuntimeError("Target exceeds URDF limits")
             if any(k not in joints or not isinstance(joints[k], (int, float)) or isinstance(joints[k], bool) or not math.isfinite(joints[k]) for k in target):
                 raise RuntimeError("Required arm joint feedback unavailable")
-            original = {k: joints[k] for k in target}
-            if any(not JOINT_LIMITS[k][0] <= v <= JOINT_LIMITS[k][1] or abs(v - target[k]) > .8 for k, v in original.items()):
-                raise RuntimeError("Start with relaxed arms; excursion would exceed 0.8 rad")
+            original = {k: joints[k] for k in HOME}
+            if any(not JOINT_LIMITS[k][0] <= v <= JOINT_LIMITS[k][1] or abs(v - HOME[k]) > 2.0 for k, v in original.items()):
+                raise RuntimeError("Arm pose is outside the bounded automatic homing range")
             acquired = self.router.acquire(OWNER)
             if not acquired:
                 raise RuntimeError("Body command router busy")
-            self._move(target)
+            self._stage(request, sector, "homing_before")
+            self._move(HOME)
+            frames = [{**HOME, **target}]
+            if request["gesture"] in ("welcome", "round", "celebrate"):
+                # Visible forearm pulse differentiates a host gesture from
+                # merely lifting an arm once. Every keyframe is measured.
+                pulse = dict(frames[0])
+                for k in target:
+                    if k.endswith("elbow_pitch_joint"):
+                        pulse[k] -= math.radians(15)
+                frames.extend([pulse, dict(frames[0])])
+            for i, frame in enumerate(frames, 1):
+                if any(not JOINT_LIMITS[k][0] <= v <= JOINT_LIMITS[k][1] for k, v in frame.items()):
+                    raise RuntimeError("Gesture keyframe exceeds URDF limits")
+                self._stage(request, sector, f"gesture_{i}")
+                self._move(frame)
+            self._stage(request, sector, "holding")
+            final_pose = frames[-1]
             until = time.monotonic() + .6
             while time.monotonic() < until:
                 self.guard()
-                if not self.router.publish(target):
+                if not self.router.publish(final_pose):
                     raise RuntimeError("Body hold publish failed")
                 self.cancel.wait(.05)
-            self._move(original)
-            state, message = "completed", "Gesture and measured return to initial arm pose completed"
+            self._stage(request, sector, "homing_after")
+            self._move(HOME)
+            state, message = "completed", "Gesture completed and both arms measured stable at neutral pose"
         except Exception as exc:
             state = "cancelled" if self.cancel.is_set() else "error"
             message = str(exc)
@@ -256,7 +306,13 @@ class MotionRunner:
         finally:
             if acquired:
                 self.router.release(OWNER)
-            self._record(feedback(request["request_id"], state, gesture=request["gesture"], sector=sector, message=message))
+            # Clear the worker slot before exposing completion. A new request
+            # must not be rejected because the old thread is just returning.
+            with self.lock:
+                self.thread = None
+                self._record(feedback(request["request_id"], state, gesture=request["gesture"], sector=sector,
+                                      stage="completed" if state == "completed" else self.stage,
+                                      progress_seq=self.progress_seq + 1, home_verified=state == "completed", message=message))
 
     def shutdown(self):
         with self.lock:
@@ -321,7 +377,8 @@ class Plugin:
         self.client = client
         from body_command import get_router
         self.router = get_router(client, executor) if client is not None else None
-        self.config = {"image_mirrored": config.get("image_mirrored", False)}
+        self.config = {"image_mirrored": config.get("image_mirrored", False),
+                       "arrival_timeout": config.get("arrival_timeout", 8.0)}
         self.process = self.listener = self.runner = None
         self.lock = threading.RLock()
         self.status = {"state": "idle"}
@@ -329,7 +386,7 @@ class Plugin:
 
     def get_tool(self):
         return {"name": OWNER, "title": "木头人主持动作", "type": "actuator", "multiInstance": False,
-                "description": "消费wooden_man的actions，执行手臂方位示意、轮间和胜负手势，实测回位后反馈；不自动准备位置直控。",
+                "description": "消费wooden_man的actions；自动归位、逐关键帧执行手势、双臂归位并稳定后反馈；不自动切换位置直控模式。",
                 "inputSchema": {"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "info", "cancel"]},
                     "input_topic": {"type": "string"}, "input_topics": {"type": "array", "items": {"type": "string"}}},
@@ -337,7 +394,9 @@ class Plugin:
                     "x-resource": ["arm_l", "arm_r"]},
                 "configSchema": {"type": "object", "properties": {
                     "image_mirrored": {"type": "boolean", "title": "输入画面左右镜像", "default": False,
-                                       "description": "仅在摄像头原始输出确实左右镜像时开启；不是网页预览的镜像。"}}},
+                                       "description": "仅在摄像头原始输出确实左右镜像时开启；不是网页预览的镜像。"},
+                    "arrival_timeout": {"type": "number", "title": "单个关键帧到位等待（秒）", "default": 8.0,
+                                        "minimum": 1, "maximum": 30, "advanced": True}}},
                 "topic_in": [{"format": "data/json", "desc": "只接wooden_man/actions，不能接speech或status"}],
                 "topic_out": [{"topic": self.prefix + "/feedback", "format": "data/json", "desc": "动作完成反馈；填入木头人的motion_feedback_topic，不接TTS"}]}
 
@@ -402,10 +461,14 @@ class Plugin:
             mirrored = args.get("image_mirrored", supplied.get("image_mirrored", self.config["image_mirrored"]))
             if not isinstance(mirrored, bool):
                 raise ValueError("image_mirrored须为布尔值")
+            arrival = args.get("arrival_timeout", supplied.get("arrival_timeout", self.config["arrival_timeout"]))
+            if isinstance(arrival, bool) or not isinstance(arrival, (int, float)) or not math.isfinite(arrival) or not 1 <= arrival <= 30:
+                raise ValueError("arrival_timeout须在1至30秒之间")
+            candidate = {"image_mirrored": mirrored, "arrival_timeout": arrival}
             if action == "config":
-                if mirrored != self.config["image_mirrored"]:
+                if candidate != self.config:
                     self.stop()
-                self.config = {"image_mirrored": mirrored}
+                self.config = candidate
                 return {"status": "configured", "adapter_ok": True, **self.info()}
             topics = args.get("input_topics", [])
             if not isinstance(topics, list) or any(not isinstance(t, str) for t in topics):
@@ -416,10 +479,10 @@ class Plugin:
             topics = list(dict.fromkeys([*topics, *([singular] if singular else [])]))
             if len(topics) != 1 or not isinstance(topics[0], str) or not topics[0].startswith("/") or any(c.isspace() for c in topics[0]):
                 return {"state": "error", "message": "只连接wooden_man/actions这一路输入"}
-            if self.process is not None and self.process.is_alive() and self.input_topic == topics[0] and self.config["image_mirrored"] == mirrored:
+            if self.process is not None and self.process.is_alive() and self.input_topic == topics[0] and self.config == candidate:
                 return self.info()
             self.stop()
-            self.input_topic, self.config = topics[0], {"image_mirrored": mirrored}
+            self.input_topic, self.config = topics[0], candidate
             ctx = mp.get_context("spawn")
             self.requests, self.replies, self.ready = ctx.Queue(64), ctx.Queue(64), ctx.Queue()
             self.stop_event = ctx.Event()
@@ -432,7 +495,7 @@ class Plugin:
             if state["state"] != "running":
                 self.stop()
                 return state
-            self.runner = MotionRunner(self.client, self.router, self._report, mirrored)
+            self.runner = MotionRunner(self.client, self.router, self._report, mirrored, arrival_timeout=arrival)
             self.status = state
             self.listener = threading.Thread(target=self._listen, daemon=True, name="q5_host_event_listener")
             self.listener.start()

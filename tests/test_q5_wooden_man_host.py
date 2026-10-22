@@ -47,7 +47,7 @@ class Host:
         self.step(3.01)
         self.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": "old-id", "state": "completed"})
         assert self.game.phase == "robot_action"
-        self.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": rid, "state": "completed"})
+        self.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": rid, "state": "completed", "home_verified": True})
         assert self.game.phase == "robot_settle"
         self.step(1.01)
 
@@ -244,7 +244,8 @@ class FakeClient:
         self.joints = {f"{s}_{j}": v for s in ("left", "right") for j, v in zip(motion.JOINT_SUFFIXES, (-math.pi/6, 0, -.2))}
         self.joints.update({f"{s}_{j}": 0. for s in ("left", "right") for j in motion.PASSIVE_SUFFIXES})
     def snapshot(self):
-        return {"fresh": self.fresh, "age_ms": getattr(self, "age", 0), "joints": dict(self.joints)}
+        return {"fresh": self.fresh, "age_ms": getattr(self, "age", 0),
+                "timestamp_ms": getattr(self, "stamp_override", int(self.clock.now * 1000)), "joints": dict(self.joints)}
     def get_lifecycle_state(self):
         return "active"
     def sensor_snapshot(self, _):
@@ -280,6 +281,7 @@ def runtime(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT))
     clock = SimpleNamespace(now=0., renew=True, cancel_at=None, stale_at=None)
     client = FakeClient()
+    client.clock = clock
     router = FakeRouter(client)
     reports = []
     runner = motion.MotionRunner(client, router, reports.append)
@@ -297,6 +299,8 @@ def runtime(monkeypatch):
                 self.flag = True
             if clock.stale_at is not None and clock.now >= clock.stale_at:
                 client.fresh = False
+            if getattr(clock, "on_wait", None):
+                clock.on_wait()
     class Thread:
         def __init__(self, target, args, **_):
             self.target, self.args = target, args
@@ -320,8 +324,9 @@ def test_measured_return_duplicate_dedup_and_bounded_interpolation(runtime):
     original = dict(client.joints)
     runner.submit(request())
     assert reports[-1]["state"] == "completed"
-    assert client.joints == pytest.approx(original) and router.owner is None
-    assert all(k.startswith("right_") for point in router.writes for k in point)
+    assert client.joints == pytest.approx(motion.HOME) and router.owner is None
+    assert all(set(point) == set(motion.HOME) for point in router.writes)
+    assert reports[-1]["home_verified"] is True
     for a, b in zip(router.writes, router.writes[1:]):
         assert all(abs(b[k] - a[k]) <= .010001 for k in b)
     count = len(router.writes)
@@ -335,7 +340,7 @@ def test_prepared_vendor_mpc_endpoint_does_not_block_host_gesture(runtime):
     original = dict(client.joints)
     runner.submit(request())
     assert reports[-1]["state"] == "completed" and router.writes
-    assert client.joints == pytest.approx(original) and router.owner is None
+    assert client.joints == pytest.approx(motion.HOME) and router.owner is None
 
 
 @pytest.mark.parametrize("others,count", [
@@ -383,7 +388,7 @@ def test_motion_failure_never_claims_completion(runtime, fault):
     elif fault == "excursion":
         client.joints["right_shoulder_pitch_joint"] = 2.
     elif fault == "yaw":
-        client.joints["right_arm_yaw_joint"] = 1.
+        client.joints["right_arm_yaw_joint"] = 2.2
     elif fault == "age":
         client.age = 501
     elif fault == "mid_stale":
@@ -406,3 +411,89 @@ def test_cancel_before_delivery_tombstones_request_and_invalid_commands_do_not_m
     assert reports[-1]["state"] == "error" and not router.writes
     runner.submit(request(request_id="old", issued_at=1699999900.))
     assert reports[-1]["state"] == "error" and not router.writes
+
+
+def test_non_neutral_arms_are_automatically_homed_before_and_after_gesture(runtime):
+    runner, client, router, reports, clock = runtime
+    client.joints["right_arm_yaw_joint"] = .8
+    client.joints["left_wrist_pitch_joint"] = -.7
+    client.joints["left_shoulder_roll_joint"] = .7
+    runner.submit(request())
+    assert reports[-1]["state"] == "completed" and reports[-1]["home_verified"]
+    assert client.joints == pytest.approx(motion.HOME)
+    stages = [p.get("stage") for p in reports if p["state"] == "running"]
+    assert stages == ["queued", "homing_before", "gesture_1", "gesture_2", "gesture_3", "holding", "homing_after"]
+
+
+def test_feedback_delay_over_two_seconds_is_waited_for(runtime):
+    runner, client, router, reports, clock = runtime
+    router.follow = False
+    def follow_later():
+        if clock.now >= 3.6 and router.writes:
+            client.joints.update(router.writes[-1])
+            router.follow = True
+    clock.on_wait = follow_later
+    runner.submit(request())
+    assert reports[-1]["state"] == "completed" and reports[-1]["home_verified"]
+    assert clock.now > 3.6 and client.joints == pytest.approx(motion.HOME)
+
+
+def test_cached_feedback_cannot_verify_homing(runtime):
+    runner, client, router, reports, clock = runtime
+    client.stamp_override = 0
+    runner.submit(request())
+    assert reports[-1]["state"] == "error" and not reports[-1]["home_verified"]
+    assert reports[-1]["stage"] == "homing_before"
+
+
+def test_failed_return_never_reports_completed(runtime):
+    runner, client, router, reports, clock = runtime
+    def impede_return():
+        if runner.stage == "homing_after":
+            client.joints["right_elbow_pitch_joint"] = -.3
+    clock.on_wait = impede_return
+    runner.submit(request(gesture="round"))
+    assert reports[-1]["state"] == "error" and reports[-1]["stage"] == "homing_after"
+    assert not reports[-1]["home_verified"] and router.owner is None
+
+
+def test_next_request_at_completion_is_not_rejected_by_retiring_thread(runtime):
+    runner, client, router, reports, clock = runtime
+    def report_and_submit_next(message):
+        reports.append(message)
+        if message["state"] == "completed" and message["request_id"] == "session:1":
+            runner.submit(request(request_id="session:2", gesture="round", issued_at=motion.time.time()))
+    runner.report = report_and_submit_next
+    runner.submit(request())
+    assert runner.cache["session:1"]["state"] == runner.cache["session:2"]["state"] == "completed"
+    assert client.joints == pytest.approx(motion.HOME)
+
+
+def test_round_waits_for_verified_home_not_just_a_completed_label():
+    h = Host()
+    h.watch()
+    h.still()
+    assert h.game.phase == "robot_action" and h.game.round == 1
+    rid = h.game.pending_motion["request_id"]
+    h.step(15)
+    assert h.game.phase == "robot_action" and h.game.round == 1
+    h.game.motion_feedback({"kind": "wooden_man_motion_feedback", "request_id": rid,
+                            "state": "completed", "home_verified": False})
+    assert h.game.phase == "error" and h.game.round == 1
+    assert h.game.reason == "motion_home_unverified"
+
+
+def test_real_stage_progress_extends_wait_but_duplicate_heartbeats_do_not():
+    h = Host()
+    h.game.text("游戏开始")
+    h.ready()
+    rid = h.game.pending_motion["request_id"]
+    h.step(25)
+    frame = {"kind": "wooden_man_motion_feedback", "request_id": rid, "state": "running",
+             "stage": "homing_before", "progress_seq": 1}
+    h.game.motion_feedback(frame)
+    h.step(25)
+    assert h.game.phase == "robot_action"
+    h.game.motion_feedback(frame)  # Cached stage heartbeat cannot renew the deadline.
+    h.step(6)
+    assert h.game.phase == "error" and h.game.round == 0
