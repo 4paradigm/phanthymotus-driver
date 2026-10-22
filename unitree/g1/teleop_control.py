@@ -83,6 +83,7 @@ class RelativeMapping:
 
 
 class TeleopControl:
+    PREFIX = 'teleop_control'
     CAPABILITIES = ['dual_arm']
     INPUT_HOLDS = ('input_missing', 'input_stale', 'tracking_lost')
 
