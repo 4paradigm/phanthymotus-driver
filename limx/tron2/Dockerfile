@@ -5,7 +5,7 @@ ARG PYPI_MIRROR
 WORKDIR /work
 USER root
 RUN set -eu; missing=""; \
-    for package in python3-pip ca-certificates; do \
+    for package in python3-pip ca-certificates libgl1 libglib2.0-0; do \
         if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then \
             missing="$missing $package"; \
         fi; \
@@ -13,10 +13,11 @@ RUN set -eu; missing=""; \
     if [ -n "$missing" ]; then \
         apt-get update && apt-get install -y --no-install-recommends $missing && rm -rf /var/lib/apt/lists/*; \
     fi
+# SDK uses modern pyproject metadata; keep setuptools compatible with ROS colcon.
+RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} 'pip>=24.2,<26' 'setuptools>=77,<80' 'wheel>=0.45,<1'
 COPY requirements.txt requirements-vla.txt /tmp/
 RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/requirements.txt -r /tmp/requirements-vla.txt
-# ROS colcon requires setuptools <80; LeRobot permits this shared range.
-RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} 'setuptools>=71,<80' && python3 -m pip check
+RUN python3 -m pip check
 COPY common/ /work/common/
 COPY main.py device.py vendor.py state.py reset.py skeleton.py completion.py trajectory.py pose.py head.py gripper.py camera.py ros2.py check.py config.yaml driver.yaml /work/
 COPY episode.py teaching.py teaching_capture.py teaching_replay.py teaching_sdk.py vla_export.py /work/
