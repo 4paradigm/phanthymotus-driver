@@ -1,5 +1,6 @@
 """Fake vendor capture and replay boundaries; never connect to hardware."""
 import asyncio
+import json
 from contextlib import contextmanager
 from pathlib import Path
 import sys
@@ -59,7 +60,8 @@ async def allowed():return True
 
 
 @pytest.mark.parametrize('refresh',[True,False])
-def test_preflight_refreshes_idle_feedback_without_motion(refresh):
+@pytest.mark.parametrize('stage',['preflight','execution'])
+def test_replay_refreshes_idle_feedback_before_sending(refresh,stage):
     async def run():
         reader=Reader();reader.fresh=False;reader.leased=False
         original=reader.sample
@@ -77,13 +79,21 @@ def test_preflight_refreshes_idle_feedback_without_motion(refresh):
             finally:
                 timer.cancel();reader.leased=False
         reader.pose_feedback=lease
+        reader.teaching_feedback=lease
         replay=Replay(reader,allowed,lambda:True)
-        if refresh:
+        if stage=='execution':
+            _,frames=read_trajectory(recording(),BINDING)
+            await replay._run('test',frames,reader.q[14:],10,10)
+            assert replay.outcome['status']==('completed' if refresh else 'error')
+            assert not replay.outcome['result']['motion_may_continue']
+            assert bool(reader.commands)==refresh
+        elif refresh:
             await replay.preflight(recording(),BINDING)
         else:
             with pytest.raises(ValueError,match='replay_feedback_stale'):
                 await replay.preflight(recording(),BINDING)
-        assert not reader.leased and not reader.commands
+        assert not reader.leased
+        if stage=='preflight' or not refresh:assert not reader.commands
     asyncio.run(run())
 
 
@@ -275,3 +285,54 @@ def test_teaching_poll_lease_only_changes_read_cadence():
     assert reader.joint_poll_interval()==.5 and reader.ws is None
     reader.teaching_observer=lambda *args:None
     assert reader.joint_poll_interval()==.02
+
+
+def test_static_replay_from_idle_uses_real_reader_and_websocket():
+    from vendor import RobotReader
+    from test_sensors import settings,info,joints
+    async def run():
+        commands=[]
+        async def vendor(request):
+            ws=web.WebSocketResponse();await ws.prepare(request)
+            await ws.send_json(info())
+            async for msg in ws:
+                packet=json.loads(msg.data);title=packet['title'];payload=None
+                if title=='request_get_joint_state':
+                    payload=joints(q=[0]*16,timestamp=time.monotonic())
+                elif title=='request_get_limx_2fclaw_state':
+                    payload=dict(result='success',timestamp=time.monotonic(),left_opening=0,right_opening=0,
+                        left_speed=0,right_speed=0,left_force=0,right_force=0)
+                else:commands.append(packet)
+                if payload is not None:
+                    await ws.send_json(dict(title=title.replace('request_','response_'),
+                        accid=packet['accid'],guid=packet['guid'],data=payload))
+            return ws
+        app=web.Application();app.router.add_get('/',vendor)
+        runner=web.AppRunner(app);await runner.setup()
+        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                reader=RobotReader(settings(url='ws://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])))
+                poll=asyncio.create_task(reader.run(session))
+                try:
+                    for _ in range(100):
+                        if reader.sample('joint_state')['available']:break
+                        await asyncio.sleep(.01)
+                    await asyncio.sleep(.2)
+                    replay=Replay(reader,None,lambda:True)
+                    frames=[state(i) for i in range(10)]
+                    for frame in frames:frame.update(q=[0]*16,gripper=[0,0])
+                    raw=pack_trajectory(BINDING,frames)
+                    preview=await replay.play(raw,BINDING,{})
+                    await asyncio.sleep(.2)
+                    result=await replay.play(raw,BINDING,dict(execute=True,preview_id=preview['preview_id'],
+                        workspace_clear=True,take_control=True,exclusive_control_confirmed=True,
+                        gripper_speed=10,gripper_force=10))
+                    outcome=await replay.wait(result['action_id'])
+                    assert outcome['status']=='completed',outcome
+                    assert len(commands)==10 and all(p['title']=='request_servoj' for p in commands)
+                    assert reader.joint_poll_interval()==.5
+                finally:
+                    poll.cancel();await asyncio.gather(poll,return_exceptions=True)
+        finally:await runner.cleanup()
+    asyncio.run(run())

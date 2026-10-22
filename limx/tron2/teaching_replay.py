@@ -118,22 +118,24 @@ class Replay:
         return {**data,'q':[data['q'][i] for i in order],
                 'dq':[data['dq'][i] for i in order] if len(data.get('dq',[]))==16 else []}
 
+    async def fresh_feedback(self):
+        deadline=time.monotonic()+.5
+        while True:
+            sample=self.reader.sample('joint_state')
+            if sample['available'] and sample['reception_age_seconds']<=.1:
+                return await self.guard()
+            if time.monotonic()>=deadline:
+                raise ValueError('replay_feedback_stale')
+            await asyncio.sleep(.01)
+
     async def preflight(self, raw, binding):
         if self.active:
             raise ValueError('replay_busy')
         _,frames=read_trajectory(raw,binding)
         # Idle polling is slower than the replay freshness limit; wake the sole reader.
         with self.reader.pose_feedback():
-            deadline=time.monotonic()+.5
-            while True:
-                sample=self.reader.sample('joint_state')
-                if sample['available'] and sample['reception_age_seconds']<=.1:
-                    break
-                if time.monotonic()>=deadline:
-                    raise ValueError('replay_feedback_stale')
-                await asyncio.sleep(.01)
             grip=state_data(await self.reader.read_gripper())
-            feedback=await self.guard()
+            feedback=await self.fresh_feedback()
         delta=[a-b for a,b in zip(feedback['q'][:14],frames[0]['q'])]
         if max(map(abs,delta))>START_RAD or any(abs(grip[s]['opening']-v)>GRIP_TOLERANCE for s,v in zip(('left','right'),frames[0]['gripper'])):
             raise ValueError('replay_start_mismatch_no_automatic_return')
@@ -172,6 +174,7 @@ class Replay:
         try:
             with self.reader.teaching_feedback(), self.reader.pose_servo(ident) as token:
                 token['head_q']=head
+                await self.fresh_feedback()
                 start=time.monotonic()
                 last_grip=frames[0]['gripper']
                 previous=frames[0]
@@ -223,7 +226,7 @@ class Replay:
         finally:
             self.preview=None
             self.outcome={'action_id':ident,'status':status,'result':dict(result,motion_sent=self.motion_sent,
-                samples_sent=sent,output_stopped=True,motion_may_continue=not result['physical_stop_verified'])}
+                samples_sent=sent,output_stopped=True,motion_may_continue=self.motion_sent and not result['physical_stop_verified'])}
 
     async def stop(self):
         self.epoch+=1;self.preview=None
