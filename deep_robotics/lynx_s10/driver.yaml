@@ -4,9 +4,9 @@ category: driver
 hardware_provider: deep-robotics
 hardware_model: "lynx-s10"
 image_name: deep-robotics-lynx-s10
-port: 15717
-mcp_url: "http://localhost:15717/mcp"
-description: "Lynx S10 official TLS/TCP basic_server motion, device and charging controls"
+port: 15724
+mcp_url: "http://localhost:15724/mcp"
+description: "Lynx S10 Pro TLS/TCP native state, motion, device, charging and navigation controls"
 build_context_extras:
   - ../../common
 cards:

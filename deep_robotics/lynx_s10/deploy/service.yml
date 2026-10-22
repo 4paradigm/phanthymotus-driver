@@ -1,0 +1,13 @@
+deep-robotics-lynx-s10:
+  image: __IMAGE__
+  container_name: embodied-deep-robotics-lynx-s10
+  network_mode: host
+  environment:
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
+  stop_grace_period: 30s

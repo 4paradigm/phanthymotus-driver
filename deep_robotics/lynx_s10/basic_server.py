@@ -89,7 +89,12 @@ class StreamDecoder:
             fragment["payload"].extend(chunk)
             fragment["next"] += 1
             if length < MAX_ASDU:
-                frames.append((message_id, json.loads(fragment["payload"].decode("utf-8"))))
+                try:
+                    payload = json.loads(fragment["payload"].decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self.fragments.pop(message_id, None)
+                    continue
+                frames.append((message_id, payload))
                 self.fragments.pop(message_id, None)
         return frames
 

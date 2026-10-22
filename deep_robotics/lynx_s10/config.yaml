@@ -1,4 +1,4 @@
-mcp_port: 15717
+mcp_port: 15724
 ros_namespace: ""
 name: "云深处山猫 S10"
 model_variant: "pro"

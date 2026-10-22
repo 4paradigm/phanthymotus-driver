@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """云深处山猫 S10 Driver 入口；原生协议驱动不启动 ROS。"""
 
+from common import logsafe
+
+logsafe.install()
+
 import signal
 from http.server import ThreadingHTTPServer
 from threading import Event

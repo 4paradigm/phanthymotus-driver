@@ -135,7 +135,11 @@ class S10MotionPlugin:
                     self._active = None
     def dispatch(self, action, args):
         if action == "start": return {"state": "ready"}
-        if action in ("stop", "stopmotion"):
+        if action == "stop":
+            self._stop_stream()
+            return {"state": "idle"}
+        if action == "info": return {"state": "ready"}
+        if action == "stopmotion":
             self._stop_stream(send_both=True)
             return {"state": "stopped", "sent_zero_to": ["axis", "velocity"]}
         if action in MOTION_STATES:
@@ -175,9 +179,9 @@ class S10MotionPlugin:
 
 class S10NavigationPlugin:
     ACTIONS = {
-        "goal": (["x", "y", "yaw"], "前往地图坐标系单点目标；等待任务结束后返回结果"),
+        "goal": (["x", "y", "z", "yaw", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "前往地图坐标系单点目标；等待任务结束后返回结果"),
         "cancel": ([], "取消当前导航任务"), "status": ([], "查询导航任务状态"),
-        "localize": (["x", "y", "yaw"], "按地图坐标初始化/重置定位"),
+        "localize": (["x", "y", "z", "yaw"], "按地图坐标初始化/重置定位"),
         "pose": ([], "查询机器人地图坐标和姿态"),
         "perception_status": ([], "查询定位与避障状态"),
     }
@@ -194,6 +198,8 @@ class S10NavigationPlugin:
     def stop(self): pass
     def dispatch(self, action, args):
         if action == "start": return {"state": "ready"}
+        if action == "stop": return {"state": "idle"}
+        if action == "info": return {"state": "ready"}
         if action == "status": return self.native.request(0x00100003, 0x00100001)
         if action == "cancel": return self.native.request(0x00100003, 0x00100004)
         if action == "pose": return self.native.request(0x00100003, 0x00200001)
@@ -212,7 +218,7 @@ class S10NavigationPlugin:
 
 
 class S10DevicePlugin:
-    ACTIONS = {"lights": (["head_mode", "head_color", "tail_mode", "tail_color"], "分别设置头尾灯模式、颜色和周期"),
+    ACTIONS = {"lights": (["head_mode", "head_color", "head_cycle", "tail_mode", "tail_color", "tail_cycle"], "分别设置头尾灯模式、颜色和周期"),
                "sleep": ([], "进入休眠"), "wake": ([], "唤醒"), "auto_sleep": (["minutes"], "配置心跳断联后的自动休眠等待时间"),
                "sdk_mode": (["enabled", "frequency"], "配置运动 SDK 模式及关节数据频率")}
     def __init__(self, native): self.native = native
@@ -228,6 +234,8 @@ class S10DevicePlugin:
     def stop(self): pass
     def dispatch(self, action, args):
         if action == "start": return {"state": "ready"}
+        if action == "stop": return {"state": "idle"}
+        if action == "info": return {"state": "ready"}
         if action == "lights":
             def led(prefix):
                 return {"Type": int(args.get(f"{prefix}_mode", 0)), "Color": [int(args.get(f"{prefix}_color", 1))], "Cycle": int(args.get(f"{prefix}_cycle", 1))}
@@ -249,13 +257,15 @@ class S10ChargePlugin:
     def __init__(self, native): self.native = native
     def get_tool(self):
         return tool("charging", "actuator", "山猫 S10 自主充电控制（机器人需已位于充电桩前）", action_schema(
-            {"start": ([], "开始自主充电"), "stop": ([], "停止自主充电")}, {}))
+            {"start_charging": ([], "开始自主充电"), "stop_charging": ([], "停止自主充电")}, {}))
     def start(self): pass
     def stop(self): pass
     def dispatch(self, action, args):
-        if action == "start": return self.native.request(0x00100004, 0x00100002, {"Charge": 1})
-        if action == "stop": return self.native.request(0x00100004, 0x00100002, {"Charge": 0})
-        if action in ("info",): return {"state": "ready"}
+        if action == "start": return {"state": "ready"}
+        if action == "stop": return {"state": "idle"}
+        if action == "info": return {"state": "ready"}
+        if action == "start_charging": return self.native.request(0x00100004, 0x00100002, {"Charge": 1})
+        if action == "stop_charging": return self.native.request(0x00100004, 0x00100002, {"Charge": 0})
         raise ValueError(f"unsupported S10 charging action: {action}")
 
 
