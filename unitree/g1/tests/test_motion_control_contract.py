@@ -97,3 +97,62 @@ def test_public_feedback_and_port_contract_is_single_topic():
     assert info['control_interface']['dof']==14
     joint=info['control_interfaces']['joints']
     assert joint['dof']==10 and joint['force_torque'] is None and joint['joint_names']==list(JOINT_NAMES)
+
+
+@pytest.mark.parametrize('changed', ['measured', 'commanded'])
+def test_moving_snapshot_discards_candidate_without_holding(changed):
+    c, published, proofs = controller()
+    state = c.gate.status()
+    c.gate.status = lambda: state
+    solve = c.solver.solve_frame
+    def moving_solve(*args):
+        result = solve(*args)
+        if changed == 'measured': state['feedback']['q'] = [.3]*10
+        else: state['commanded_q'] = [.3]*10
+        state['feedback']['arm_ns'] = time.monotonic_ns()
+        return result
+    c.solver.solve_frame = moving_solve
+    c.receive_eef(frame(c))
+    assert not c.process_latest()
+    assert c._decision['state'] == 'rejected'
+    assert c._decision['reason'] == 'motion_envelope_stale_start'
+    assert not published and not proofs and not c.gate.holds
+    assert c._intent is None and c.gate.state == 'ready'
+
+
+def test_rejected_candidates_do_not_renew_previous_executor_deadline(tmp_path):
+    from test_arm_stream import rig
+    arm, sample, channel, advance, _, _ = rig(tmp_path)
+    arm.set_joint_publisher(arm.accept_control)
+    c = MotionControl({}, arm)
+    c.solver = Worker()
+    c.solver.profile, c.solver.profile_sha256 = arm.profile, arm.profile_sha256
+    c._live_session = arm.session_id
+    solve = c.solver.solve_frame
+    reject = False
+    def candidate(*args):
+        solve(*args)
+        if reject: c.solver.last_envelope.update(lower=[1.]*10, upper=[2.]*10)
+        return [.1]*10
+    c.solver.solve_frame = candidate
+    def submit(seq):
+        now = arm.clock()
+        body = envelope(c._lease(), seq=seq, source_seq=seq, mapping_epoch=0,
+            generated_ns=now, valid_until_ns=now+300_000_000, mode='eef_pose',
+            values=[0,0,0,0,0,0,1]*2, **c.versions)
+        c.receive_eef(body)
+        return c.process_latest()
+    assert submit(1), c._decision
+    advance(10); arm.tick()
+    deadline, previous_seq, intent = arm.latest['valid_until_ns'], arm.seq, c._intent
+    reject = True
+    for seq in range(2, 8):
+        assert not submit(seq)
+        assert arm.latest['valid_until_ns'] == deadline and arm.seq == previous_seq
+        assert c._intent is intent and c._decision['state'] == 'rejected'
+        assert arm.state == 'active'
+        advance(50); arm.tick()
+    assert arm.clock() > deadline
+    assert arm.state == 'hold' and arm.reason == 'command_timeout'
+    assert arm.latest is None and not arm.status()['output_active']
+    assert arm.applied_seq == previous_seq

@@ -267,3 +267,24 @@ def test_hold_reason_survives_preview_until_explicit_regrip(tmp_path, reason):
     feed(7, False); feed(8, True)
     assert card._enabled and card._state == 'active' and card._reason is None
     assert len(outputs) == before+1
+
+
+
+def test_rejected_candidate_keeps_grip_enabled_for_next_valid_target(tmp_path):
+    card, motion, outputs, feed = rig(tmp_path)
+    feed(1); feed(2); feed(3, True)
+    before = len(outputs)
+    solve = motion.solver.solve_frame
+    def stale_candidate(*args):
+        result = solve(*args)
+        motion.solver.last_envelope.update(lower=[1.]*10, upper=[2.]*10)
+        return result
+    motion.solver.solve_frame = stale_candidate
+    feed(4, True)
+    assert card._enabled and card._state == 'active' and card._reason is None
+    assert len(outputs) == before and not motion.gate.holds
+    assert motion._decision['state'] == 'rejected'
+    motion.solver.solve_frame = solve
+    feed(5, True)
+    assert card._enabled and card._state == 'active'
+    assert len(outputs) == before+1 and outputs[-1]['source_seq'] == 5

@@ -370,7 +370,9 @@ class MotionControl:
                               **copy.deepcopy(self.solver.last_envelope)}
                     proof = MotionEnvelope.from_record(record,dof=10)
                     if not proof.contains(current['feedback']['q']) or not proof.contains(current.get('commanded_q') or current['feedback']['q']):
-                        raise ValueError('motion_envelope_stale_start')
+                        self._decision = {'state':'rejected', 'reason':'motion_envelope_stale_start',
+                            'seq':body['seq'], 'source_seq':body['source_seq'], 'monotonic_ns':now}
+                        return False
                     self.executor.install_motion_envelope(record)
                     self.executor.publish_joint_command(command)
                 else: self._preview_state = 'active'
