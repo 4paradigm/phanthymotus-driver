@@ -266,6 +266,7 @@ def test_verified_flag_cannot_bypass_fresh_runtime_feedback(plugin):
     b.feedback_fresh = False
     thread.join(2)
     assert not thread.is_alive() and not output[0]['completed']
+    assert b.stops  # Feedback loss is different from relinquishing authority.
 
 
 def test_expired_request_before_first_send_is_not_completed(plugin):

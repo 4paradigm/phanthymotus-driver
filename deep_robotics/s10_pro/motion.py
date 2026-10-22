@@ -156,13 +156,18 @@ class MotionPlugin:
             missing.append('fresh_feedback_adapter')
         return missing
 
-    def _control_ok(self):
+    def _authority_ok(self):
         try:
             value = self._backend.control_status()
             age = value.get('age_s')
             return (value.get('owned') is True and value.get('fresh') is True
-                and value.get('feedback_fresh') is True
                 and isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and 0 <= age <= .5)
+        except Exception:
+            return False
+
+    def _control_ok(self):
+        try:
+            return self._authority_ok() and self._backend.control_status().get('feedback_fresh') is True
         except Exception:
             return False
 
@@ -242,7 +247,7 @@ class MotionPlugin:
                     return {'accepted': False, 'confirmed': False, 'reason': 'request_replaced'}
             # Recheck ownership inside the transport critical section. Never
             # send a delayed stop over a later request or manual takeover.
-            if not self._control_ok() and not contract['stop_on_authority_loss']:
+            if not self._authority_ok() and not contract['stop_on_authority_loss']:
                 return {'accepted': None, 'confirmed': False, 'reason': 'authority_released'}
             # An already-set movement cancellation token must not cancel its own stop.
             return self._backend.stop(reason, threading.Event())
@@ -259,7 +264,7 @@ class MotionPlugin:
             active = copy.deepcopy(self._active)
         if active is None:
             return {'accepted': False, 'confirmed': False, 'completed': False, 'reason': 'no_application_motion'}
-        receipt = self._stop_backend(reason, request_id=active['request_id'], authority_lost=not self._control_ok())
+        receipt = self._stop_backend(reason, request_id=active['request_id'], authority_lost=not self._authority_ok())
         self._event('cancel_requested', request_id=active['request_id'], reason=reason,
                     stop_accepted=receipt.get('accepted'), stop_confirmed=False)
         return {'accepted': receipt.get('accepted'), 'confirmed': False, 'completed': False,
@@ -367,7 +372,7 @@ class MotionPlugin:
                 reason = 'duration_elapsed'
             if action == 'velocity' or not confirmed:
                 stop_after = self._clock()
-                stop_receipt = self._stop_backend(reason, request_id=rid, authority_lost=not self._control_ok())
+                stop_receipt = self._stop_backend(reason, request_id=rid, authority_lost=not self._authority_ok())
                 stop_deadline = self._clock() + 1.
                 next_stop = self._clock() + refresh_interval
                 while self._clock() < stop_deadline and stop_receipt.get('reason') != 'authority_released':
@@ -375,7 +380,7 @@ class MotionPlugin:
                         stop_confirmed = True
                         break
                     if self._clock() >= next_stop:
-                        stop_receipt = self._stop_backend(reason, request_id=rid, authority_lost=not self._control_ok())
+                        stop_receipt = self._stop_backend(reason, request_id=rid, authority_lost=not self._authority_ok())
                         next_stop = self._clock() + refresh_interval
                     time.sleep(.02)
                 # A cancelled posture must never be reported as successful posture.
@@ -388,7 +393,7 @@ class MotionPlugin:
                 'reason': reason, 'action': action}
         except Exception as exc:
             self._cancel.set()
-            self._stop_backend('execution_failed', request_id=rid, authority_lost=not self._control_ok())
+            self._stop_backend('execution_failed', request_id=rid, authority_lost=not self._authority_ok())
             result = {'request_id': rid, 'accepted': receipt.get('accepted'), 'confirmed': False,
                 'completed': False, 'state': 'failed', 'reason': type(exc).__name__, 'action': action}
         finally:
