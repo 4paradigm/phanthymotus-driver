@@ -23,7 +23,7 @@ TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 class _LatestControlInbox:
     """Short receiver lock, independent of the lock held during SDK requests.
 
-    Keep one latest motion and one priority zero command. The control timer
+    Keep one latest motion and one priority zero command. The control worker
     consumes them; the bridge reader never waits for a vendor call.
     """
 
@@ -117,6 +117,7 @@ class LocoServoPlugin:
         self._backend_config = dict(config)
         self._conflict = conflict or (lambda: "")
         self._lock = threading.RLock()
+        self._stop_lock = threading.Lock()
         self._hz = self._positive(config, "expected_hz", 10.0)
         if self._hz > 20:
             raise ValueError("loco_servo.expected_hz must be <= 20")
@@ -137,7 +138,11 @@ class LocoServoPlugin:
         self._standing = None
         self._standing_at = None
         self._nodes = []
-        self._arrival_guard = None
+        self._controller_thread = None
+        self._controller_stop = threading.Event()
+        self._controller_wake = threading.Event()
+        self._controller_failed = False
+        self._closing = False
         self._backend = None
         self._sink = None
         self._running = self._paused = False
@@ -198,34 +203,53 @@ class LocoServoPlugin:
         """Bundle lazy-start hook, intentionally inert."""
 
     def stop(self):
-        with self._lock:
-            self._inbox.activate(self._generation, False)
-            self._paused = True
-            self._hold()
-            if self._zero_pending:
-                return {"state": "error", "error": "SDK stop unconfirmed; card remains paused"}
-            self._running = False
-            self._paused = False
-            self._generation += 1
-            self._sink = None
-            self._close()
-            self._yielded = False
-            return {"state": "idle"}
+        # Never join under _lock: the worker may already be waiting to acquire
+        # it. _closing prevents start from replacing resources during the join.
+        with self._stop_lock:
+            with self._lock:
+                self._inbox.activate(self._generation, False)
+                self._paused = True
+                self._hold()
+                if self._zero_pending:
+                    return {"state": "error", "error": "SDK stop unconfirmed; card remains paused"}
+                self._closing = True
+                self._running = False
+                self._generation += 1
+                self._controller_stop.set()
+                self._controller_wake.set()
+                worker = self._controller_thread
+            if worker is not None:
+                if worker is threading.current_thread():
+                    return {"state": "error", "error": "control worker cannot join itself; retry stop externally"}
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    return {"state": "error", "error": "control worker has not stopped; restart blocked"}
+            with self._lock:
+                self._controller_thread = None
+                self._sink = None
+                self._close()
+                self._yielded = False
+                self._paused = False
+                self._closing = False
+                return {"state": "idle"}
 
     def dispatch(self, action, args):
+        if action == "stop":
+            return self.stop()  # In particular, do not retain an outer RLock.
         with self._lock:
             if action == "info":
                 return self._info()
             if action == "config":
                 return self._configure(args)
-            if action == "stop":
-                return self.stop()
             if action == "start":
                 return self._start(args)
             if action in ("pause", "resume"):
                 if not self._running:
                     return {"state": "idle"}
                 if action == "resume":
+                    if self._controller_failed or (
+                            self._controller_thread is not None and not self._controller_thread.is_alive()):
+                        return {"state": "error", "error": "control worker stopped; stop/start the card"}
                     problem = self._conflict()
                     if problem:
                         return {"state": "error", "error": problem}
@@ -244,10 +268,13 @@ class LocoServoPlugin:
                         return {"state": "error", "error": str(exc)}
                 self._barrier_ms = int(time.time() * 1000)
                 self._inbox.activate(self._generation, not self._paused)
+                self._controller_wake.set()
                 return self._info()
         return None
 
     def _start(self, args):
+        if self._closing:
+            return {"state": "error", "error": "previous control worker is stopping; retry stop before restart"}
         topic = args.get("input_topic")
         if not topic:
             topics = args.get("input_topics")
@@ -277,7 +304,56 @@ class LocoServoPlugin:
         self._running = True
         self._paused = False
         self._inbox.activate(self._generation, True)
+        try:
+            self._start_controller(generation)
+        except Exception as exc:
+            self._running = False
+            self._inbox.activate(self._generation, False)
+            self._controller_thread = None
+            self._close()
+            self._sink = None
+            return {"state": "error", "error": f"control worker start failed: {exc}"}
         return self._info()
+
+    def _start_controller(self, generation):
+        stop, wake = threading.Event(), threading.Event()
+        self._controller_failed = False
+        self._controller_stop, self._controller_wake = stop, wake
+        worker = threading.Thread(target=self._control_loop,
+                                  args=(generation, stop, wake),
+                                  name=f"tianyi-loco-control-{generation}", daemon=True)
+        self._controller_thread = worker
+        worker.start()
+
+    def _control_loop(self, generation, stop, wake):
+        try:
+            while not stop.is_set():
+                # Clear before processing: an arrival during a blocked SDK
+                # call stays signalled and is consumed on the very next pass.
+                wake.clear()
+                with self._lock:
+                    if not self._running or generation != self._generation:
+                        return
+                self._tick(generation)
+                if stop.is_set():
+                    return
+                with self._lock:
+                    delay = None if self._paused and not self._zero_pending else 0.02
+                    # Active watchdog/standing checks remain bounded; a fully
+                    # paused worker sleeps until resume or stop wakes it.
+                    if not self._paused and self._inbox.info()["pending"]:
+                        due_in = (self._last_output_at + 1 / 20 - time.monotonic()
+                                  if self._last_output_at is not None else 0)
+                        delay = max(0, min(delay, due_in))
+                wake.wait(delay)
+        except Exception as exc:
+            with self._lock:
+                if generation == self._generation and self._running:
+                    self._controller_failed = True
+                    self._paused = True
+                    self._inbox.activate(generation, False)
+                    self._hold()
+                    self._record("ERROR", f"control worker failed: {exc}")
 
     def _open(self, topic, generation):
         from rclpy.node import Node
@@ -289,12 +365,8 @@ class LocoServoPlugin:
         self._nodes.append((core, self._ros2.executor_core))
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
                          durability=DurabilityPolicy.VOLATILE)
-        self._arrival_guard = core.create_guard_condition(lambda: self._tick(generation))
         core.create_subscription(String, topic,
                                  lambda msg: self._on_message(msg, generation), qos)
-        # Arrivals wake the executor immediately. This timer is only a bounded
-        # retry/watchdog poll, never a periodic replay of the last velocity.
-        core.create_timer(0.02, lambda: self._tick(generation))
         self._ros2.executor_core.add_node(core)
         self._backend = SlamtecVelocityBackend(self._backend_config)
         if not self._settings["dry_run"]:
@@ -309,7 +381,8 @@ class LocoServoPlugin:
 
     def _close(self):
         self._inbox.activate(self._generation, False)
-        self._arrival_guard = None
+        self._controller_stop.set()
+        self._controller_wake.set()
         if self._backend is not None:
             self._backend.close()
             self._backend = None
@@ -331,6 +404,7 @@ class LocoServoPlugin:
                 return
             self._standing = message.data if isinstance(message.data, bool) else None
             self._standing_at = time.monotonic()
+            self._controller_wake.set()
 
     def _standing_problem(self):
         if not self._settings["require_standing"]:
@@ -348,14 +422,7 @@ class LocoServoPlugin:
         # No plugin/SDK lock here: waiting on it would block the socket reader
         # and accumulate already-aging commands in the Unix socket buffer.
         if self._inbox.put(message, generation):
-            guard = self._arrival_guard
-            if guard is not None:
-                try:
-                    guard.trigger()
-                except Exception:
-                    # Concurrent stop may destroy this generation's node.
-                    # Pending input has already been invalidated by _close.
-                    pass
+            self._controller_wake.set()
 
     def _process_message(self, message, generation=None):
         with self._lock:
@@ -592,14 +659,16 @@ class LocoServoPlugin:
         interface = copy.deepcopy(self._descriptor)
         interface.update({key: self._settings[key] for key in ("dry_run", "rotate_only")})
         return {
-            "state": "paused" if self._running and self._paused else "running" if self._running else "idle",
+            "state": "stopping" if self._closing else "paused" if self._running and self._paused else "running" if self._running else "idle",
             "input": self._input_topic, **self._settings,
             "yielded_to_explicit_command": self._yielded,
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
             "input_queue": self._inbox.info(),
-            "dispatch": {"mode": "arrival_guard", "watchdog_poll_ms": 20,
-                         "max_apply_hz": 20},
+            "dispatch": {"mode": "dedicated_worker", "watchdog_poll_ms": 20,
+                         "max_apply_hz": 20, "worker_failed": self._controller_failed,
+                         "worker_alive": bool(
+                             self._controller_thread and self._controller_thread.is_alive())},
             "last_command_timing": copy.deepcopy(self._last_timing),
             "output": list(self._last_output), "output_topic": None,
             "backend": self._backend.info() if self._backend is not None else

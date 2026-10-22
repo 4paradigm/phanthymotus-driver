@@ -227,18 +227,24 @@ the bounded inbox until the next permitted apply slot instead of being thrown
 away. Explicit zero always bypasses that pacing. TTL, observation-age and
 watchdog limits are unchanged.
 
-The bridged subscription callback only updates a bounded inbox; it does not
-hold the plugin lock or wait for an SDK reply. An arrival guard condition wakes
-the ROS executor immediately to process the latest pending command; commands
-no longer wait for a fixed 50ms polling tick. A 20ms timer handles watchdogs and
-deferred apply slots without replaying old commands. A separate priority zero slot clears
+The bridged subscription callback only updates a bounded inbox and signals an
+event; it does not hold the plugin lock or wait for an SDK reply. One dedicated
+control thread consumes the latest command and performs synchronous SDK calls.
+Velocity execution no longer waits for a ROS timer or guard-condition callback
+to be scheduled alongside camera/depth processing. The event wakes on arrivals;
+an independent maximum-20ms wait bounds watchdog, standing and deferred-apply
+checks, without periodically replaying old commands. A separate priority zero slot clears
 older pending motion and cannot be overwritten by a later nonzero command;
 at most two messages are retained. Intermediate motion frames are coalesced,
 not queued in arrival order. Original timestamps/TTLs remain unchanged, so a
 frame that has expired while waiting is rejected rather than retimestamped or
-replayed. No new worker thread or periodic replay of the last command is added.
-Pause, stop, configuration changes and restart clear pending input; callbacks
-and timers from an older generation cannot deliver motion to a new session.
+replayed. Pause, stop, configuration changes and restart clear pending input;
+old-generation receivers and workers cannot deliver motion to a new session.
+The thread starts only on card start. Stop confirms the chassis hold, signals
+termination, and joins outside the plugin state lock before closing SDK/ROS
+resources. A join timeout blocks restart instead of stacking another worker.
+A fully paused thread sleeps until resume/stop; unexpected control-loop errors
+hold the chassis, mark the worker failed and require explicit stop/start.
 
 `input_queue` reports bridge-delivered `received`, control-selected `processed`,
 `coalesced`, lifecycle-`cleared`, `pending`, the latest receive gap and inbox
@@ -246,7 +252,8 @@ wait in milliseconds. Existing `counts.received/accepted/dropped` describe the
 selected frames examined by the control sink, not intermediate coalesced
 frames. `holds` counts calls to stop paths, including repeated watchdog stops
 after navigation has ended; it is not a count of distinct physical stops.
-`dispatch.mode=arrival_guard` identifies this version. `last_command_timing`
+`dispatch.mode=dedicated_worker`, `worker_alive` and `worker_failed` identify the
+independent controller and expose its health. `last_command_timing`
 reports the selected command sequence/TTL, command and observation ages,
 remaining lease before/after apply, and apply round-trip duration. Continuous
 publication alone cannot guarantee continuous motion: expired observations,

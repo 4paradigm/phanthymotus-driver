@@ -143,6 +143,10 @@ def setup(monkeypatch):
     module.ControlSink = lambda *a, **kw: original_sink(
         *a, **kw, clock=lambda: int(clock.now * 1000),
         wall_clock=lambda: int(clock.time() * 1000))
+    # Keep fake-clock unit tests deterministic; concurrency tests below launch
+    # the real production worker explicitly and never spin a ROS executor.
+    launch_controller = module.LocoServoPlugin._start_controller
+    monkeypatch.setattr(module.LocoServoPlugin, "_start_controller", lambda *args: None)
     ros = types.SimpleNamespace(ctx_core=object(), ctx_tianyi=object(),
                                 executor_core=Executor(), executor_tianyi=Executor())
     plugins = []
@@ -153,7 +157,8 @@ def setup(monkeypatch):
         plugins.append(plugin)
         return plugin
 
-    yield types.SimpleNamespace(module=module, clock=clock, ros=ros, create=create)
+    yield types.SimpleNamespace(module=module, clock=clock, ros=ros, create=create,
+                                launch_controller=lambda plugin: launch_controller(plugin, plugin._generation))
     for plugin in plugins:
         plugin.stop()
 
@@ -175,7 +180,7 @@ def command(setup, values=None, seq=1, **extra):
 
 def send(plugin, cmd):
     plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)))
-    plugin._tick()  # Delivery is fast; the control timer performs SDK writes.
+    plugin._tick()  # One deterministic control iteration, without a live thread.
 
 
 def test_startup_is_inert_and_domain_routing_is_correct(setup):
@@ -285,22 +290,25 @@ def test_sdk_latency_does_not_allow_apply_starts_above_20hz(setup, monkeypatch):
     assert plugin._backend.messages[-1] == [0] * 6
 
 
-def test_arrival_guard_dispatches_continuous_stream_without_waiting_for_timer(setup, monkeypatch):
+def test_worker_dispatches_continuous_stream_without_spinning_ros(setup, monkeypatch):
     plugin = start(setup)
     node = setup.ros.executor_core.nodes[0]
-    guard, = node.guards
-    assert node.timers[0][0] == 0.02
+    assert not node.guards and not node.timers
+    applied = threading.Event()
     original_write = plugin._backend.write
     def slow_sdk(values, deadline):
         setup.clock.advance(0.07)
         original_write(values, deadline)
+        applied.set()
     monkeypatch.setattr(plugin._backend, "write", slow_sdk)
+    setup.launch_controller(plugin)
     began = setup.clock.monotonic()
     for seq in range(1, 21):
         setup.clock.advance(began + (seq - 1) * 0.1 - setup.clock.monotonic())
+        applied.clear()
         node.subscriptions[0][2](types.SimpleNamespace(data=json.dumps(command(setup, seq=seq))))
-        assert guard.triggered == seq
-        guard.callback()  # Executor processes arrivals, without firing a timer.
+        assert applied.wait(1), "controller waited for a ROS executor callback"
+        assert plugin.dispatch("info", {})["counts"]["accepted"] == seq
     assert plugin._counts["accepted"] == 20
     assert plugin._counts["holds"] == plugin._counts["dropped"] == 0
     assert len(plugin._backend.messages) == 20
@@ -308,6 +316,246 @@ def test_arrival_guard_dispatches_continuous_stream_without_waiting_for_timer(se
     assert timing["command_age_ms"] == timing["observation_age_ms"] == 0
     assert timing["apply_round_trip_ms"] == pytest.approx(70)
     assert 129 <= timing["remaining_after_apply_ms"] <= 131
+
+
+def test_worker_receives_latest_while_sdk_waits_and_keeps_original_deadline(setup, monkeypatch):
+    plugin = start(setup)
+    backend = plugin._backend
+    entered, release, latest_applied = threading.Event(), threading.Event(), threading.Event()
+    original_write = backend.write
+    def blocked_first(values, deadline):
+        if not backend.messages:
+            entered.set()
+            assert release.wait(2)
+        original_write(values, deadline)
+        if len(backend.messages) == 2:
+            latest_applied.set()
+    monkeypatch.setattr(backend, "write", blocked_first)
+    setup.launch_controller(plugin)
+    try:
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+        assert entered.wait(1)
+        for seq in range(2, 42):
+            setup.clock.advance(0.001)
+            newest = command(setup, [0.15, 0, 0, 0, 0, -0.2], seq=seq)
+            plugin._on_message(types.SimpleNamespace(data=json.dumps(newest)))
+        assert plugin._inbox.info()["pending"] == 1
+        assert plugin._inbox.info()["coalesced"] == 39
+        setup.clock.advance(0.03)
+        release.set()
+        assert latest_applied.wait(1)
+        info = plugin.dispatch("info", {})
+        assert info["counts"]["accepted"] == 2
+        assert info["last_command_timing"]["seq"] == 41
+        assert backend.deadlines[-1] == newest["stamp_ms"] + newest["ttl_ms"]
+        assert info["counts"]["holds"] == 0
+    finally:
+        release.set()
+
+
+def test_worker_watchdog_stops_without_ros_callbacks_and_never_replays(setup, monkeypatch):
+    plugin = start(setup)
+    backend = plugin._backend
+    applied, stopped = threading.Event(), threading.Event()
+    original_write, original_stop = backend.write, backend.stop
+    def write(values, deadline):
+        original_write(values, deadline)
+        applied.set()
+    def stop():
+        original_stop()
+        stopped.set()
+    monkeypatch.setattr(backend, "write", write)
+    monkeypatch.setattr(backend, "stop", stop)
+    setup.launch_controller(plugin)
+    cmd = command(setup)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)))
+    assert applied.wait(1)
+    plugin.dispatch("info", {})  # Wait until the accepted-state update completes.
+    setup.clock.advance(0.21)
+    plugin._controller_wake.set()
+    assert stopped.wait(1)
+    info = plugin.dispatch("info", {})
+    assert info["output"] == [0] * 6
+    assert info["last"]["verdict"] == "HOLD"
+    assert len(backend.deadlines) == 1
+    assert backend.deadlines[0] == cmd["stamp_ms"] + 200
+
+
+def test_worker_zero_command_bypasses_motion_pacing(setup, monkeypatch):
+    plugin = start(setup)
+    backend = plugin._backend
+    applied, stopped = threading.Event(), threading.Event()
+    original_write, original_stop = backend.write, backend.stop
+    def write(values, deadline):
+        original_write(values, deadline)
+        applied.set()
+    def stop():
+        original_stop()
+        stopped.set()
+    monkeypatch.setattr(backend, "write", write)
+    monkeypatch.setattr(backend, "stop", stop)
+    setup.launch_controller(plugin)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    assert applied.wait(1)
+    plugin.dispatch("info", {})
+    setup.clock.advance(0.01)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, [0] * 6, seq=2))))
+    assert stopped.wait(1)
+    info = plugin.dispatch("info", {})
+    assert info["counts"]["accepted"] == 2
+    assert info["output"] == [0] * 6
+
+
+def test_stop_joins_outside_state_lock_and_blocks_restart_until_old_worker_exits(setup, monkeypatch):
+    plugin = start(setup)
+    entered, release, stopping = threading.Event(), threading.Event(), threading.Event()
+    original_tick, original_stop = plugin._tick, plugin._backend.stop
+    def blocked_tick(generation=None):
+        entered.set()
+        assert release.wait(2)
+        original_tick(generation)
+    def confirmed_stop():
+        original_stop()
+        stopping.set()
+    monkeypatch.setattr(plugin, "_tick", blocked_tick)
+    monkeypatch.setattr(plugin._backend, "stop", confirmed_stop)
+    setup.launch_controller(plugin)
+    old_worker = plugin._controller_thread
+    result = {}
+    stopper = threading.Thread(target=lambda: result.update(plugin.dispatch("stop", {})))
+    try:
+        assert entered.wait(1)
+        stopper.start()
+        assert stopping.wait(1)
+        assert plugin.dispatch("info", {})["state"] == "stopping"
+        assert plugin.dispatch("start", {})["state"] == "error"
+        release.set()
+        stopper.join(2)
+        assert not stopper.is_alive()
+        assert result["state"] == "idle", "joining under _lock deadlocks the old worker"
+        assert not old_worker.is_alive()
+        assert plugin._controller_thread is None
+        assert not plugin._nodes
+    finally:
+        release.set()
+        if stopper.ident is not None:
+            stopper.join(2)
+
+
+def test_paused_worker_resumes_only_on_fresh_input_and_restarts_without_thread_leaks(setup, monkeypatch):
+    plugin = start(setup)
+    setup.launch_controller(plugin)
+    old_callback = setup.ros.executor_core.nodes[0].subscriptions[0][2]
+    old_worker = plugin._controller_thread
+    assert plugin.dispatch("pause", {})["state"] == "paused"
+    old_callback(types.SimpleNamespace(data=json.dumps(command(setup))))
+    assert plugin._inbox.info()["pending"] == 0
+    setup.clock.advance()
+    assert plugin.dispatch("resume", {})["state"] == "running"
+    setup.clock.advance()
+    applied = threading.Event()
+    original_write = plugin._backend.write
+    def write(values, deadline):
+        original_write(values, deadline)
+        applied.set()
+    monkeypatch.setattr(plugin._backend, "write", write)
+    old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=2))))
+    assert applied.wait(1)
+    assert plugin.dispatch("stop", {})["state"] == "idle"
+    assert not old_worker.is_alive()
+    for _ in range(3):
+        assert plugin.dispatch("start", {})["state"] == "running"
+        setup.launch_controller(plugin)
+        current = plugin._controller_thread
+        old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=3))))
+        assert plugin._inbox.info()["pending"] == 0
+        assert plugin.dispatch("stop", {})["state"] == "idle"
+        assert not current.is_alive()
+
+
+def test_join_timeout_preserves_resources_and_blocks_new_worker(setup, monkeypatch):
+    plugin = start(setup)
+    entered, release = threading.Event(), threading.Event()
+    original_tick = plugin._tick
+    def blocked_tick(generation=None):
+        entered.set()
+        assert release.wait(3)
+        original_tick(generation)
+    monkeypatch.setattr(plugin, "_tick", blocked_tick)
+    setup.launch_controller(plugin)
+    worker, backend = plugin._controller_thread, plugin._backend
+    try:
+        assert entered.wait(1)
+        assert plugin.dispatch("stop", {})["state"] == "error"
+        assert plugin.dispatch("info", {})["state"] == "stopping"
+        assert plugin.dispatch("start", {})["state"] == "error"
+        assert plugin._backend is backend and backend.connected
+        assert plugin._controller_thread is worker and worker.is_alive()
+        release.set()
+        worker.join(1)
+        assert plugin.dispatch("stop", {})["state"] == "idle"
+        assert plugin._backend is None
+    finally:
+        release.set()
+        worker.join(1)
+
+
+def test_unexpected_worker_failure_stops_motion_and_requires_explicit_restart(setup, monkeypatch):
+    plugin = start(setup)
+    stopped = threading.Event()
+    original_stop = plugin._backend.stop
+    def stop():
+        original_stop()
+        stopped.set()
+    def broken_tick(generation=None):
+        raise RuntimeError("injected control-loop failure")
+    monkeypatch.setattr(plugin._backend, "stop", stop)
+    monkeypatch.setattr(plugin, "_tick", broken_tick)
+    setup.launch_controller(plugin)
+    assert stopped.wait(1)
+    plugin._controller_thread.join(1)
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "paused"
+    assert info["last"]["verdict"] == "ERROR"
+    assert "control-loop failure" in info["last"]["reason"]
+    assert not info["dispatch"]["worker_alive"]
+    assert plugin.dispatch("resume", {})["state"] == "error"
+
+
+def test_resume_refuses_failed_worker_even_before_thread_has_exited(setup, monkeypatch):
+    plugin = start(setup)
+    failed, release = threading.Event(), threading.Event()
+    original_loop = plugin._control_loop
+    def broken_tick(generation=None):
+        raise RuntimeError("injected failure")
+    def delayed_exit(*args):
+        original_loop(*args)
+        failed.set()
+        assert release.wait(2)
+    monkeypatch.setattr(plugin, "_tick", broken_tick)
+    monkeypatch.setattr(plugin, "_control_loop", delayed_exit)
+    setup.launch_controller(plugin)
+    try:
+        assert failed.wait(1)
+        assert plugin._controller_thread.is_alive()
+        assert plugin.dispatch("info", {})["dispatch"]["worker_failed"]
+        assert plugin.dispatch("resume", {})["state"] == "error"
+    finally:
+        release.set()
+        plugin._controller_thread.join(1)
+
+
+def test_worker_start_failure_cleans_ros_and_sdk_resources(setup, monkeypatch):
+    plugin = setup.create()
+    def cannot_start(generation):
+        raise RuntimeError("thread creation denied")
+    monkeypatch.setattr(plugin, "_start_controller", cannot_start)
+    result = plugin.dispatch("start", {})
+    assert result["state"] == "error"
+    assert "thread creation denied" in result["error"]
+    assert not plugin._running and not plugin._nodes
+    assert plugin._backend is None and plugin._controller_thread is None
+    assert not plugin._inbox.info()["active"]
 
 
 def test_bunched_arrivals_keep_latest_until_next_apply_slot(setup):
@@ -410,7 +658,8 @@ def test_pause_config_and_restart_discard_pending_input_and_old_generation(setup
     plugin = start(setup)
     old_node = setup.ros.executor_core.nodes[0]
     old_callback = old_node.subscriptions[0][2]
-    old_timer = old_node.timers[0][1]
+    old_generation = plugin._generation
+    old_tick = lambda: plugin._tick(old_generation)
     plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
     plugin.dispatch("pause", {})
     assert plugin._info()["input_queue"]["pending"] == 0
@@ -430,7 +679,7 @@ def test_pause_config_and_restart_discard_pending_input_and_old_generation(setup
     old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=4))))
     assert plugin._info()["input_queue"]["pending"] == 0
     plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
-    old_timer()
+    old_tick()
     assert not plugin._backend.messages
     assert plugin._info()["input_queue"]["pending"] == 1
     plugin._tick()
