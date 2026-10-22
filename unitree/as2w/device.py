@@ -576,17 +576,6 @@ class StatePlugin:
             "standing. The state/odom output converts velocity to body frame, "
             "where +X is forward and +Y is left, for navigation.")
         loco_state["topic_out"] = self._loco_state_topics()
-        remote = next(tool for tool in tools
-                      if tool["name"] == "remote_controller")
-        remote["inputSchema"] = {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": [
-                    "start", "stop", "info", "read"]},
-            },
-            "required": ["action"],
-            "additionalProperties": False,
-        }
         return tools
 
     def _loco_state_topics(self):

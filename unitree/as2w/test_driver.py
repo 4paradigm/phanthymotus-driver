@@ -723,11 +723,12 @@ class TestDriverContracts(unittest.TestCase):
         import io
 
         order = []
-        action_id = "vision_capture_continuous_test"
+        action_id = "vision_capture_record_video_test"
 
         def call(name, arguments):
             self.assertEqual("vision_capture", name)
-            self.assertEqual({"action": "start_recording"}, arguments)
+            self.assertEqual(
+                {"action": "record_video", "duration_s": 5}, arguments)
             return {"ok": True, "action_id": action_id}
 
         def action_response_sent(received_action_id):
@@ -741,7 +742,8 @@ class TestDriverContracts(unittest.TestCase):
             "method": "tools/call",
             "params": {
                 "name": "vision_capture",
-                "arguments": {"action": "start_recording"},
+                "arguments": {
+                    "action": "record_video", "duration_s": 5},
             },
         }).encode()
         request_handler = handler_class.__new__(handler_class)
@@ -2344,9 +2346,8 @@ class TestDriverContracts(unittest.TestCase):
         tool = next(item for item in plugin.get_tools()
                     if item["name"] == "remote_controller")
         self.assertEqual("sensor", tool["type"])
-        self.assertEqual(
-            ["start", "stop", "info", "read"],
-            tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertEqual({}, tool["inputSchema"]["properties"])
+        self.assertNotIn("required", tool["inputSchema"])
         self.assertEqual(
             "/test/state/remote_controller",
             tool["topic_out"][0]["topic"])
@@ -2388,13 +2389,13 @@ class TestDriverContracts(unittest.TestCase):
             data=data, format=image_format,
             header=types.SimpleNamespace(stamp=stamp))
 
-    def test_vision_capture_schema_exposes_timed_and_continuous_recording(self):
+    def test_vision_capture_schema_exposes_timed_recording_and_lifecycle(self):
         plugin = self._vision_plugin("/tmp/unused")
         tool = plugin.get_tool()
         self.assertEqual("actuator", tool["type"])
         self.assertEqual(
-            ["capture_photo", "record_video", "start_recording",
-             "stop_recording", "list", "delete", "info", "start", "stop"],
+            ["capture_photo", "record_video", "list", "delete", "info",
+             "start", "stop"],
             tool["inputSchema"]["properties"]["action"]["enum"])
         self.assertEqual(["record_video"],
                          tool["inputSchema"]["x-completion"]["actions"])
@@ -2402,7 +2403,6 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("front", plugin._source()["camera"])
         self.assertIn("tpad=stop_mode=clone:stop=-1",
                       plugin._video_filter(5))
-        self.assertNotIn("tpad", plugin._video_filter(None))
 
     def test_vision_capture_named_media_list_and_delete(self):
         with tempfile.TemporaryDirectory() as output:
@@ -2426,33 +2426,10 @@ class TestDriverContracts(unittest.TestCase):
                 "INVALID_MEDIA_NAME",
                 plugin.dispatch("delete", {"name": "../walk.mp4"})["code"])
 
-    def test_stop_recording_finishes_instead_of_cancelling(self):
+    def test_continuous_recording_actions_are_not_dispatched(self):
         plugin = self._vision_plugin("/tmp/unused")
-        action_id = "continuous-1"
-
-        class FinishingThread:
-            def join(_self, timeout=None):
-                plugin._last_recording = {
-                    "action_id": action_id,
-                    "status": "completed",
-                    "result": {"ok": True, "file_path": "/tmp/video.mp4"},
-                }
-                plugin._active_recording = None
-
-        active = {
-            "action_id": action_id,
-            "notify_acp": False,
-            "finish": threading.Event(),
-            "cancel": threading.Event(),
-            "thread": FinishingThread(),
-            "state": "recording",
-        }
-        plugin._active_recording = active
-        result = plugin.dispatch("stop_recording", {})
-        self.assertTrue(active["finish"].is_set())
-        self.assertFalse(active["cancel"].is_set())
-        self.assertEqual("recorded", result["state"])
-        self.assertEqual("/tmp/video.mp4", result["file_path"])
+        self.assertIsNone(plugin.dispatch("start_recording", {}))
+        self.assertIsNone(plugin.dispatch("stop_recording", {}))
 
     def test_vision_capture_filters_invalid_and_stale_jpegs(self):
         plugin = self._vision_plugin("/tmp/unused")

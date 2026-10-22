@@ -222,17 +222,15 @@ that arrived after the request and stores it under
 `video_name` values provide safe custom names without the extension.
 `record_video` returns an action ID and destination path immediately, then uses
 FFmpeg at the configured 8 FPS to create a fixed-duration silent H.264 MP4 under
-the sibling `videos` directory. `start_recording` begins a continuous silent
-recording and `stop_recording` finishes and preserves it; the lifecycle `stop`
-instead cancels active work and removes the incomplete file. `list` enumerates
-saved JPG/MP4 media and `delete` removes one complete filename. Only one
+the sibling `videos` directory. The lifecycle `stop` cancels active work and
+removes the incomplete file. `list` enumerates saved JPG/MP4 media and `delete`
+removes one complete filename. Only one
 recording can run at a time. Timed completion, cancellation, and encoding
 errors are reported through ACP. `info` reports camera freshness, encoder
 availability, and the latest recording result. The runtime image installs both
 `ffmpeg` and its companion `ffprobe`; completed files are checked for one H.264
 video track and no audio track. Fixed recordings additionally verify requested
-duration and expected frame count. Continuous recording omits FFmpeg's infinite
-last-frame padding so closing the input can finalize the MP4. Timed ACP
+duration and expected frame count. Timed ACP
 completion waits until the MCP response containing its action ID has been sent,
 preventing completion from overtaking Agent Core's pending-action registration.
 The existing `/opt/phanthy-motus/data` deployment mount persists both folders.

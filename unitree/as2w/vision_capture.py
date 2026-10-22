@@ -71,9 +71,8 @@ class VisionCapturePlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": [
-                        "capture_photo", "record_video", "start_recording",
-                        "stop_recording", "list", "delete", "info",
-                        "start", "stop"]},
+                        "capture_photo", "record_video", "list", "delete",
+                        "info", "start", "stop"]},
                     "photo_name": {
                         "type": "string",
                         "description": "Optional JPG file name without .jpg",
@@ -102,14 +101,6 @@ class VisionCapturePlugin:
                     "record_video": {
                         "params": ["video_name", "duration_s"],
                         "description": "Record a silent video for a fixed duration.",
-                    },
-                    "start_recording": {
-                        "params": ["video_name"],
-                        "description": "Start silent recording until stop_recording.",
-                    },
-                    "stop_recording": {
-                        "params": [],
-                        "description": "Finish and save the active continuous recording.",
                     },
                     "list": {"params": [], "description": "List saved JPG and MP4 files."},
                     "delete": {"params": ["name"], "description": "Delete one saved media file."},
@@ -322,23 +313,16 @@ class VisionCapturePlugin:
             response_event.set()
 
     def _video_filter(self, requested_duration):
-        filters = [
+        return ",".join([
             "scale=out_range=tv",
             "pad=ceil(iw/2)*2:ceil(ih/2)*2",
             "setpts=PTS-STARTPTS",
             f"fps={self._fps}",
-        ]
-        # Fixed recordings need padding to reach their declared exact duration
-        # and are bounded by -frames:v. Continuous recordings have no frame
-        # cap, so infinite tpad would prevent FFmpeg from exiting after stdin
-        # closes when stop_recording is called.
-        if requested_duration is not None:
-            filters.append("tpad=stop_mode=clone:stop=-1")
-        return ",".join(filters)
+            "tpad=stop_mode=clone:stop=-1",
+        ])
 
     def _record_video(self, active):
         cancel = active["cancel"]
-        finish = active.get("finish") or threading.Event()
         requested_duration = active["duration_s"]
         process = None
         path = active["path"]
@@ -356,8 +340,7 @@ class VisionCapturePlugin:
                     "-c:v", "libx264", "-preset", "ultrafast",
                     "-threads", "2",
                     "-vf", self._video_filter(requested_duration),
-                    *(["-frames:v", str(self._fps * requested_duration)]
-                      if requested_duration is not None else []),
+                    "-frames:v", str(self._fps * requested_duration),
                     "-pix_fmt", "yuv420p", "-color_range", "tv",
                     "-vsync", "vfr", "-movflags", "+faststart", str(path),
                 ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -365,8 +348,7 @@ class VisionCapturePlugin:
                 os.set_blocking(process.stdin.fileno(), False)
                 with self._recording_lock:
                     active["process"] = process
-                deadline = (time.monotonic() + requested_duration
-                            if requested_duration is not None else None)
+                deadline = time.monotonic() + requested_duration
                 frames = 0
                 while True:
                     tick = time.monotonic()
@@ -374,31 +356,25 @@ class VisionCapturePlugin:
                     frames += 1
                     cancel.wait(min(
                         max(0, 1 / self._fps - (time.monotonic() - tick)),
-                        max(0, deadline - time.monotonic())
-                        if deadline is not None else 1 / self._fps))
-                    if finish.is_set():
-                        break
-                    remaining = (deadline - time.monotonic()
-                                 if deadline is not None else _MAX_FRAME_AGE_S)
-                    if deadline is not None and remaining <= 0:
+                        max(0, deadline - time.monotonic())))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         break
                     try:
                         frame = self._frame(
                             frame[2], min(remaining, _MAX_FRAME_AGE_S), cancel)
                     except RuntimeError:
-                        if (not cancel.is_set() and deadline is not None
+                        if (not cancel.is_set()
                                 and time.monotonic() >= deadline
                                 and time.monotonic() - frame[1]
                                 < _MAX_FRAME_AGE_S):
                             break
                         raise
-                minimum_frames = (min(2, self._fps * requested_duration)
-                                  if requested_duration is not None else 1)
+                minimum_frames = min(2, self._fps * requested_duration)
                 if frames < minimum_frames:
                     raise RuntimeError("Not enough fresh frames to record video")
                 # Give FFmpeg's MJPEG demuxer a following JPEG boundary. The
-                # fixed-duration path caps the encoded frame count; continuous
-                # recordings tolerate the final duplicated frame.
+                # fixed-duration path caps the encoded frame count.
                 self._write_frame(process, frame[0], cancel)
                 process.stdin.close()
                 encode_deadline = time.monotonic() + 10
@@ -460,13 +436,10 @@ class VisionCapturePlugin:
         duration = float(metadata["format"]["duration"])
         stream_duration = float(video[0]["duration"])
         frames = int(video[0]["nb_frames"])
-        if requested is None:
-            invalid_timing = duration <= 0 or stream_duration <= 0 or frames <= 0
-        else:
-            invalid_timing = (
-                abs(duration - requested) > 0.001
-                or abs(stream_duration - requested) > 0.001
-                or frames != requested * fps)
+        invalid_timing = (
+            abs(duration - requested) > 0.001
+            or abs(stream_duration - requested) > 0.001
+            or frames != requested * fps)
         if invalid_timing:
             raise RuntimeError(
                 "Invalid completed video: "
@@ -531,12 +504,10 @@ class VisionCapturePlugin:
             with self._recording_lock:
                 self._active_recording = None
 
-    def _start_video_recording(self, args, continuous=False):
-        requested = (None if continuous else
-                     args.get("duration_s", min(5, self._max_duration_s)))
-        if (not continuous
-                and (type(requested) is not int
-                     or not 1 <= requested <= self._max_duration_s)):
+    def _start_video_recording(self, args):
+        requested = args.get("duration_s", min(5, self._max_duration_s))
+        if (type(requested) is not int
+                or not 1 <= requested <= self._max_duration_s):
             return {
                 "ok": False, "code": "INVALID_DURATION",
                 "message": ("duration_s must be an integer between 1 and "
@@ -559,18 +530,16 @@ class VisionCapturePlugin:
             except (ValueError, FileExistsError) as exc:
                 return {"ok": False, "code": "INVALID_VIDEO_NAME",
                         "message": str(exc)}
-            action_id = f"vision_capture_{'continuous' if continuous else 'record_video'}_{uuid4().hex}"
+            action_id = f"vision_capture_record_video_{uuid4().hex}"
             queued_at = _timestamp()
-            response_event = None
-            if not continuous:
-                response_event = threading.Event()
-                with self._response_lock:
-                    self._response_events[action_id] = response_event
+            response_event = threading.Event()
+            with self._response_lock:
+                self._response_events[action_id] = response_event
             active = {
                 "action_id": action_id, "state": "recording",
                 "duration_s": requested, "started_at": queued_at,
-                "cancel": threading.Event(), "finish": threading.Event(),
-                "notify_acp": not continuous, "process": None,
+                "cancel": threading.Event(), "notify_acp": True,
+                "process": None,
                 "response_event": response_event,
                 "source": self._source(), "path": path,
             }
@@ -583,47 +552,17 @@ class VisionCapturePlugin:
                 thread.start()
             except Exception:
                 self._active_recording = None
-                if response_event is not None:
-                    with self._response_lock:
-                        self._response_events.pop(action_id, None)
+                with self._response_lock:
+                    self._response_events.pop(action_id, None)
                 self._remove_partial(path)
                 raise
         return {
             "ok": True, "state": "recording", "action_id": action_id,
             "media_type": "video", "requested_duration_s": requested,
-            "mode": "continuous" if continuous else "timed",
+            "mode": "timed",
             "source": self._source(), "queued_at": queued_at,
             "file_path": str(path),
         }
-
-    def _stop_continuous_recording(self):
-        with self._recording_lock:
-            active = self._active_recording
-            if active is None:
-                return {"ok": True, "state": "idle",
-                        "message": "no active recording"}
-            if active.get("notify_acp", True):
-                return {"ok": False, "code": "TIMED_RECORDING_ACTIVE",
-                        "message": "record_video is active; use stop to cancel it"}
-            active["finish"].set()
-            active["state"] = "stopping"
-            thread = active["thread"]
-            action_id = active["action_id"]
-        with self._condition:
-            self._condition.notify_all()
-        thread.join(timeout=15)
-        with self._recording_lock:
-            if self._active_recording is active:
-                return {"ok": True, "state": "stopping",
-                        "action_id": action_id}
-            last = self._last_recording
-        if last and last.get("action_id") == action_id:
-            terminal_state = ("recorded" if last["status"] == "completed"
-                              else last["status"])
-            return {**last["result"], "state": terminal_state,
-                    "action_id": action_id}
-        return {"ok": False, "state": "error", "action_id": action_id,
-                "message": "recording stopped without a terminal result"}
 
     def _cancel_recording(self):
         with self._recording_lock:
@@ -675,10 +614,6 @@ class VisionCapturePlugin:
             return self._capture_photo(args)
         if action == "record_video":
             return self._start_video_recording(args)
-        if action == "start_recording":
-            return self._start_video_recording(args, continuous=True)
-        if action == "stop_recording":
-            return self._stop_continuous_recording()
         if action == "list":
             return self._list_media()
         if action == "delete":
