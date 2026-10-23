@@ -21,9 +21,11 @@ from pathlib import Path
 try:
     from .bridge import reader_environment
     from .motion_worker import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, RPC_BUDGET_S, strict_json
+    from .motion_dds import OPERATOR_PERMIT_SCHEMA, AuthorityUnavailable, validate_operator_permit
 except ImportError:
     from bridge import reader_environment
     from motion_worker import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, RPC_BUDGET_S, strict_json
+    from motion_dds import OPERATOR_PERMIT_SCHEMA, AuthorityUnavailable, validate_operator_permit
 
 
 class MotionProcessDisabled(RuntimeError):
@@ -47,10 +49,13 @@ class MotionProcessCancelled(RuntimeError):
 
 
 class DDSProcessTransport:
-    def __init__(self, config, config_path=None, *, execution_enabled=False, rpc_budget_s=RPC_BUDGET_S,
+    def __init__(self, config, config_path=None, *, execution_enabled=False, supervised_posture=False,
+                 rpc_budget_s=RPC_BUDGET_S,
                  process_factory=subprocess.Popen, clock=time.monotonic):
         if not isinstance(execution_enabled, bool):
             raise ValueError('execution_enabled must be boolean')
+        if type(supervised_posture) is not bool:
+            raise ValueError('supervised_posture must be boolean')
         reader = config.get('reader', {})
         if int(reader.get('domain_id', 0)) != 0:
             raise ValueError('motion vendor domain must be 0')
@@ -60,6 +65,7 @@ class DDSProcessTransport:
         self._config = copy.deepcopy(config)
         self.config_path = str(config_path) if config_path is not None else None
         self._enabled = execution_enabled
+        self._supervised_posture = supervised_posture
         self._factory, self._clock = process_factory, clock
         self._state_lock, self._io_lock = threading.Lock(), threading.Lock()
         self._process = None
@@ -82,6 +88,7 @@ class DDSProcessTransport:
         with self._state_lock:
             return {'started': self._ready, 'closed': self._closed,
                     'execution_enabled': self._enabled and not self._probe_only,
+                    'supervised_posture': self._supervised_posture,
                     'worker_running': self._process is not None and self._process.poll() is None}
 
     def _abort(self):
@@ -139,6 +146,8 @@ class DDSProcessTransport:
     def start(self, *, probe_only=False, timeout_s=5.):
         if not isinstance(probe_only, bool):
             raise ValueError('probe_only must be boolean')
+        if self._supervised_posture and probe_only:
+            raise ValueError('supervised posture and read-only probe modes are distinct')
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not math.isfinite(timeout_s) or not .05 <= timeout_s <= 5:
             raise ValueError('startup timeout must be in .05..5 seconds')
         if not self._enabled and not probe_only:
@@ -156,7 +165,7 @@ class DDSProcessTransport:
                     return self.status_unlocked()
                 command = [sys.executable, '-u', str(Path(__file__).with_name('motion_worker.py'))]
                 if self._enabled and not probe_only:
-                    command.append('--allow-execution')
+                    command.append('--allow-supervised-posture' if self._supervised_posture else '--allow-execution')
                 process = self._factory(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL, env=reader_environment(self._config), start_new_session=True, bufsize=0)
                 self._process, self._probe_only = process, probe_only
@@ -179,10 +188,14 @@ class DDSProcessTransport:
     def status_unlocked(self):
         return {'started': self._ready, 'closed': self._closed,
                 'execution_enabled': self._enabled and not self._probe_only,
+                'supervised_posture': self._supervised_posture,
                 'worker_running': self._process is not None and self._process.poll() is None}
 
     def _rpc(self, operation, payload, *, authority=None, cancel_event=None):
         deadline = self._clock() + self._rpc_budget
+        if self._supervised_posture and operation != 'graph':
+            permit = validate_operator_permit(authority, now=self._clock())
+            deadline = min(deadline, permit['expires_monotonic'], permit['action_deadline_monotonic'])
         self._check_cancel(cancel_event)
         while not self._io_lock.acquire(timeout=.01):
             self._check_cancel(cancel_event)
@@ -214,6 +227,8 @@ class DDSProcessTransport:
                     except BlockingIOError:
                         pass
             reply = self._read(process, deadline, cancel_event)
+            if self._supervised_posture and self._clock() >= deadline:
+                raise TimeoutError('supervised posture response exceeded its bounded deadline')
             if (not isinstance(reply, dict) or type(reply.get('id')) is not int
                     or reply.get('id') != request_id or type(reply.get('ok')) is not bool):
                 raise ValueError('private response does not match the active request')
@@ -232,11 +247,19 @@ class DDSProcessTransport:
     def publish_state(self, state, *, authority, cancel_event=None):
         if not self._enabled or self._probe_only:
             raise MotionProcessDisabled('motion worker execution is disabled')
+        if self._supervised_posture:
+            permit = validate_operator_permit(authority, now=self._clock())
+            if type(state) is not int or state != {'stand': 1, 'lie': 4}[permit['action']]:
+                raise AuthorityUnavailable('supervised posture action does not match its state command')
+        elif isinstance(authority, dict) and authority.get('schema') == OPERATOR_PERMIT_SCHEMA:
+            raise AuthorityUnavailable('operator permits cannot enter the normal vendor-authority worker')
         return self._rpc('state', {'state': state}, authority=authority, cancel_event=cancel_event)
 
     def publish_velocity(self, vx=0., vy=0., yaw_rate=0., *, authority, cancel_event=None):
         if not self._enabled or self._probe_only:
             raise MotionProcessDisabled('motion worker execution is disabled')
+        if self._supervised_posture or (isinstance(authority, dict) and authority.get('schema') == OPERATOR_PERMIT_SCHEMA):
+            raise AuthorityUnavailable('operator permits never authorize NAV_CMD')
         return self._rpc('velocity', {'vx': vx, 'vy': vy, 'yaw_rate': yaw_rate}, authority=authority, cancel_event=cancel_event)
 
     def graph_snapshot(self):

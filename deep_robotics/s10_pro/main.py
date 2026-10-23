@@ -21,16 +21,36 @@ from motion_process import DDSProcessTransport
 from motion_tasks import MotionTasks
 from acp import ACPNotifier
 from control_runtime import load_runtime_binding
+from operator_authorization import load_operator_authorization
 
 
 def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, tasks=None,
-                          motion_bridge=None, runtime_binding=None):
+                          motion_bridge=None, runtime_binding=None, operator_authorization=None):
     """Build sensors and the motion UI without opening a control connection.
 
     The motion backend stays unsupported until a machine-specific action contract
     and protected, explicit deployment authorization have been bound.
     Canvas configuration cannot grant that authorization.
     """
+    operator = operator_authorization or load_operator_authorization(config)
+    observer_bridge = bridge if motion_bridge is None else motion_bridge
+    if operator.configured:
+        from supervised_motion import SupervisedPostureBackend, SupervisedMotionPlugin
+        if os.environ.get('S10_EXECUTION_AUTHORIZATION_FILE') or (runtime_binding is not None and runtime_binding.authorized):
+            operator.revoke('conflicting_execution_modes')
+        transport = DDSProcessTransport(config, execution_enabled=operator.authorized_now(),
+                                        supervised_posture=True)
+        backend = SupervisedPostureBackend(observer_bridge, transport, operator)
+        # This is time to observe and confirm a finite posture, not a velocity
+        # duration or a robot-side stopping guarantee. Keep the existing bound.
+        settings = {**config.get('motion', {}), 'action_timeout_s': 15.}
+        motion_plugin = SupervisedMotionPlugin(settings, namespace, backend=backend,
+            feedback=backend.feedback, publish=publish, execution_authorized=operator.authorized_now(),
+            authorization_provider=operator.authorized_now, notifier=notifier, tasks=tasks)
+        plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin,
+                                motion_bridge=observer_bridge)
+        plugins.append(motion_plugin)
+        return plugins
     binding = runtime_binding or load_runtime_binding(config)
     policies = binding.contract.get('actions', {})
     timeouts = [item['send_timeout_s'] for action, item in policies.items()
@@ -151,11 +171,14 @@ def main():
         notifier = ACPNotifier(state / "acp-outbox.sqlite3")
         cleanup.callback(notifier.close)
         notifier.start()
-        binding = load_runtime_binding(config)
-        cleanup.callback(binding.close)
+        operator = load_operator_authorization(config)
+        binding = None if operator.configured else load_runtime_binding(config)
+        if binding is not None:
+            cleanup.callback(binding.close)
         bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish,
                                                    notifier=notifier, tasks=tasks,
-                                                   motion_bridge=motion_bridge, runtime_binding=binding))
+                                                   motion_bridge=motion_bridge, runtime_binding=binding,
+                                                   operator_authorization=operator))
         for plugin in bundle.plugins:
             if hasattr(plugin, "close"):
                 cleanup.callback(plugin.close)
@@ -177,7 +200,8 @@ def main():
         # Do not start cards at process boot. The real canvas owns their lifecycle.
         if config.get("register", True):
             start_registration(port, config, "deep-robotics-s10-pro-driver")
-        logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_authorized=%s", namespace, port, domain, binding.authorized_now())
+        authorized = operator.authorized_now() if operator.configured else binding.authorized_now()
+        logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_authorized=%s", namespace, port, domain, authorized)
         server.serve_forever()
 
 

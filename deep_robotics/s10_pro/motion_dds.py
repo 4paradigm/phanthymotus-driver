@@ -28,6 +28,9 @@ STATE_VALUES = frozenset({1, 4, 17})
 VELOCITY_LIMITS = {'vx': 1.67, 'vy': .4, 'yaw_rate': 1.0}
 RECOMMENDED_NAV_RATE_HZ = 10.0
 MAX_AUTHORITY_AGE_S = .5
+OPERATOR_PERMIT_SCHEMA = 's10_pro.operator_permit/1'
+OPERATOR_PERMIT_FIELDS = frozenset({'schema', 'session_id', 'request_id', 'action',
+    'robot_session', 'issued_monotonic', 'expires_monotonic', 'action_deadline_monotonic'})
 EXPECTED_FIELDS = {
     'drdds/msg/MotionState': {'header': 'drdds/msg/MetaType', 'data': 'drdds/msg/MotionStateValue'},
     'drdds/msg/NavCmd': {'header': 'drdds/msg/MetaType', 'data': 'drdds/msg/NavCmdValue'},
@@ -112,14 +115,15 @@ class MessageCodec:
         self._classes[name] = cls
         return cls
 
-    def prepare(self):
+    def prepare(self, *, supervised_posture=False):
         """Preload class metadata before the bounded command channel is ready.
 
         This creates no message instance, DDS participant or publisher. ROS
         import latency belongs to explicit worker startup, not a live command.
         """
         with self._lock:
-            for spec in COMMAND_SPECS.values():
+            specs = [COMMAND_SPECS['state']] if supervised_posture else COMMAND_SPECS.values()
+            for spec in specs:
                 self._class(spec['type'])
 
     def _header(self, message, frame_id, stamp_ns):
@@ -165,6 +169,8 @@ def validate_authority(authority, *, now, navigation=False):
     if not isinstance(authority, Mapping):
         raise AuthorityUnavailable('explicit parent authority attestation is required')
     values = dict(authority)
+    if values.get('schema') == OPERATOR_PERMIT_SCHEMA:
+        raise AuthorityUnavailable('operator permits are not vendor control authority')
     if values.get('owned') is not True or values.get('fresh') is not True:
         raise AuthorityUnavailable('control authority is not owned and fresh')
     request_id = values.get('request_id')
@@ -184,6 +190,36 @@ def validate_authority(authority, *, now, navigation=False):
     return values
 
 
+def validate_operator_permit(permit, *, now):
+    """Validate private-pipe operator scope; never claims vendor ownership.
+
+    The parent must check its protected operator authorization before IPC. This
+    isolated worker only verifies the bounded, original session attestation and
+    its per-action deadline; it does not acquire or infer a vendor control lease.
+    """
+    if not isinstance(permit, Mapping) or set(permit) != OPERATOR_PERMIT_FIELDS:
+        raise AuthorityUnavailable('an exact supervised operator permit is required')
+    values = dict(permit)
+    if values['schema'] != OPERATOR_PERMIT_SCHEMA:
+        raise AuthorityUnavailable('invalid supervised operator permit schema')
+    for key in ('session_id', 'request_id', 'robot_session'):
+        if not isinstance(values[key], str) or not values[key].strip() or len(values[key]) > 128:
+            raise AuthorityUnavailable('invalid bounded operator permit identity')
+    if values['action'] not in ('stand', 'lie'):
+        raise AuthorityUnavailable('operator scope supports stand or lie only')
+    try:
+        issued = _finite(values['issued_monotonic'], 'issued_monotonic')
+        expires = _finite(values['expires_monotonic'], 'expires_monotonic')
+        deadline = _finite(values['action_deadline_monotonic'], 'action_deadline_monotonic')
+        observed_now = _finite(now, 'now')
+    except ValueError as exc:
+        raise AuthorityUnavailable('invalid operator permit clock values') from exc
+    if not (0 <= issued <= observed_now < expires <= issued + 3600
+            and observed_now < deadline <= expires):
+        raise AuthorityUnavailable('operator permit expired or uses a different clock')
+    return values
+
+
 class DDSCommandAdapter:
     """Publisher wrapper for an independently initialized vendor-domain node.
 
@@ -192,11 +228,17 @@ class DDSCommandAdapter:
     *every* send. This is a transport boundary, not an authority implementation,
     action state machine, scheduler, watchdog, or verified MotionBackend.
     """
-    def __init__(self, node, *, execution_enabled=False, codec=None, qos=1, clock=time.monotonic):
+    def __init__(self, node, *, execution_enabled=False, supervised_posture=False,
+                 codec=None, qos=1, clock=time.monotonic):
         if not isinstance(execution_enabled, bool):
             raise ValueError('execution_enabled must be boolean')
+        if type(supervised_posture) is not bool:
+            raise ValueError('supervised_posture must be boolean')
         self._node = node
         self._enabled = execution_enabled
+        self._supervised_posture = supervised_posture
+        self._operator_sessions = {}
+        self._operator_requests = set()
         self._codec = codec or MessageCodec()
         self._qos = qos
         self._clock = clock
@@ -211,7 +253,27 @@ class DDSCommandAdapter:
             raise MotionDDSDisabled('DDS motion execution is disabled')
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError('DDS motion request was cancelled')
+        if self._supervised_posture:
+            if navigation:
+                raise AuthorityUnavailable('supervised posture forbids every NAV_CMD')
+            return validate_operator_permit(authority, now=self._clock())
         return validate_authority(authority, now=self._clock(), navigation=navigation)
+
+    def _consume_operator_permit(self, permit):
+        session = permit['session_id']
+        original = (permit['robot_session'], permit['issued_monotonic'], permit['expires_monotonic'])
+        previous = self._operator_sessions.get(session)
+        if previous is not None and previous != original:
+            raise AuthorityUnavailable('operator session receipt or scope cannot be renewed')
+        key = (session, permit['request_id'])
+        if key in self._operator_requests:
+            raise AuthorityUnavailable('supervised posture requests must not be replayed')
+        if len(self._operator_sessions) >= 64 and session not in self._operator_sessions:
+            raise AuthorityUnavailable('operator session bound exhausted')
+        if len(self._operator_requests) >= 4096:
+            raise AuthorityUnavailable('operator request bound exhausted')
+        self._operator_sessions[session] = original
+        self._operator_requests.add(key)
 
     def _send(self, kind, message_factory, *, authority, cancel_event=None):
         with self._lock:
@@ -224,17 +286,25 @@ class DDSCommandAdapter:
             if kind not in self._publishers:
                 self._publishers[kind] = self._node.create_publisher(type(message), spec['topic'], self._qos)
             self._check(attestation, kind == 'velocity', cancel_event)
+            if self._supervised_posture:
+                self._consume_operator_permit(attestation)
             self._publishers[kind].publish(message)
             return {'sent': True, 'accepted': None, 'confirmed': False, 'completed': False,
                     'topic': spec['topic'], 'request_id': attestation['request_id'],
                     'frame_id': message.header.frame_id, 'sent_monotonic': self._clock()}
 
     def publish_state(self, state, *, authority, cancel_event=None):
+        if self._supervised_posture:
+            permit = validate_operator_permit(authority, now=self._clock())
+            if type(state) is not int or state != {'stand': 1, 'lie': 4}[permit['action']]:
+                raise AuthorityUnavailable('supervised operator action does not match state 1 or 4')
         # In particular: building 1 does not send 17. The parent must wait for a
         # new confirmed stand frame before making a separate 17 request.
         return self._send('state', lambda: self._codec.build_state(state), authority=authority, cancel_event=cancel_event)
 
     def publish_velocity(self, vx=0., vy=0., yaw_rate=0., *, authority, cancel_event=None):
+        if self._supervised_posture:
+            raise AuthorityUnavailable('supervised posture forbids every NAV_CMD, including zero')
         return self._send('velocity', lambda: self._codec.build_velocity(vx, vy, yaw_rate), authority=authority, cancel_event=cancel_event)
 
     def publish_zero_velocity(self, *, authority, cancel_event=None):

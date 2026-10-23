@@ -120,7 +120,9 @@ def serve(adapter, spin_once, *, stdin, stdout, clock=time.monotonic):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--allow-execution', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--allow-execution', action='store_true')
+    mode.add_argument('--allow-supervised-posture', action='store_true')
     args = parser.parse_args(argv)
     # The parent uses reader_environment before spawning. A second check keeps
     # accidental direct invocation from joining the platform's DDS domain.
@@ -131,9 +133,10 @@ def main(argv=None):
     rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
     node = rclpy.create_node('s10_pro_motion_commands', enable_rosout=False, start_parameter_services=False)
     codec = MessageCodec()
-    if args.allow_execution:
-        codec.prepare()
-    adapter = DDSCommandAdapter(node, execution_enabled=args.allow_execution, codec=codec)
+    if args.allow_execution or args.allow_supervised_posture:
+        codec.prepare(supervised_posture=args.allow_supervised_posture)
+    adapter = DDSCommandAdapter(node, execution_enabled=args.allow_execution or args.allow_supervised_posture,
+        supervised_posture=args.allow_supervised_posture, codec=codec)
     try:
         serve(adapter, lambda: rclpy.spin_once(node, timeout_sec=0), stdin=sys.stdin.buffer.fileno(), stdout=sys.stdout.buffer)
     finally:

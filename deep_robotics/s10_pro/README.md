@@ -4,6 +4,10 @@
 
 2026-10-23 现场已部署 `3555e997` 的 14 卡版本与另行批准的 Core 三项显示增量。该部署没有绑定执行授权或真实控制权适配器，不能进行起立、趴下、速度测试；此前离线候选说明是历史记录。运动状态和急停详情卡现改为复用既有独立运动 reader，避免点云处理拖延其 0.5 秒新鲜度检查；仍只有两个 reader，各卡独立启停。该监控修补在 ARM64/Jazzy 下 54 项聚焦测试通过，部署结果另记于现场验收目录。
 
+## 现场监督的单次姿态测试
+
+新增独立 `operator_supervised_posture_test` 模式，以受保护、当前主机启动会话绑定、最多一小时的操作员授权启用。它不构造厂家独占控制权或自动停止证明。现有 motion 卡只允许单次 stand→1、lie→4，速度和自动17禁止。必须由现场操作员在15秒内通过 confirm_pose 报告目视姿态，并同时取得新鲜的发送后目标反馈，才能完成ACP；取消/超时/断流时关闭本方命令进程并明确需现场接管，不假称机器人已停止。默认仍关闭，配置和画布不能授权。入口及限制见 [deploy/OPERATOR_TEST.md](deploy/OPERATOR_TEST.md)。
+
 ## 2026-10-23 M20 结构改版候选
 
 当前目录为 12 张 sensor 加 2 张 actuator：`state`、`motion_info`、`joints`、`device_status`、`imu`、`odometry`、`lidar`、`hard_estop`、`errors`、`motion_events`、`capabilities`、`ros_graph`，以及执行锁定的 `motion`、`device`。`charging` 动作不提供。前后相机、独立后雷达、GPS、充电状态五项须有可验证的来源和语义才注册；不为凑数量复制主雷达或猜测视频地址。可选 navigation 也不注册。
