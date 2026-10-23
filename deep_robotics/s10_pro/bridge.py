@@ -17,8 +17,13 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from .reader import DEFAULT_SOURCES
+except ImportError:  # Direct execution in the driver container.
+    from reader import DEFAULT_SOURCES
+
 LOG = logging.getLogger("s10.reader")
-SOURCES = frozenset({"battery", "motion_info", "joints", "imu", "odometry", "lidar"})
+SOURCES = frozenset(DEFAULT_SOURCES)
 MAX_LINE_BYTES = 2_000_000
 
 

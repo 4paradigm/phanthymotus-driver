@@ -57,7 +57,7 @@ def test_motion_observation_uses_its_own_bridge_without_changing_state_card(runt
         assert not sensors.active and not motion.active
         cards["state"].start()
         cards["motion"].start()
-        assert sensors.active["state"][0] == {"battery", "motion_info"}
+        assert sensors.active["state"][0] == {"battery", "motion_info", "hard_estop", "exception", "fault_event", "fault_aggregator"}
         assert set(sensors.active) == {"state"}
         assert motion.active == {"motion_observer": ({"motion_info"}, {"refresh_hz": 10., "stale_after_s": .5})}
         assert cards["motion"].dispatch("stand", {})["accepted"] is False

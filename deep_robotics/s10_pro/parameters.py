@@ -12,8 +12,15 @@ import time
 import uuid
 
 SENSOR_TITLES = {'state': 'Robot State', 'joints': 'Joint Feedback', 'imu': 'IMU',
-                 'odometry': 'Odometry', 'lidar': 'LiDAR Point Cloud'}
-SENSOR_REFRESH_HZ = {'state': 1., 'joints': 5., 'imu': 5., 'odometry': 5., 'lidar': 2.}
+                 'odometry': 'Odometry', 'lidar': 'LiDAR Point Cloud',
+                 'motion_info': 'Motion Status', 'device_status': 'Device Status',
+                 'hard_estop': 'Hardware E-Stop', 'errors': 'Errors',
+                 'motion_events': 'Motion Events', 'capabilities': 'Capabilities',
+                 'ros_graph': 'ROS Graph', 'device': 'Device Controls'}
+SENSOR_REFRESH_HZ = {'state': 1., 'joints': 5., 'imu': 5., 'odometry': 5., 'lidar': 2.,
+                     'motion_info': 5., 'device_status': 1., 'hard_estop': 5.,
+                     'errors': 1., 'motion_events': 2., 'capabilities': 1.,
+                     'ros_graph': .5, 'device': 1.}
 META_FIELDS = {'instance_id', '_tool_name'}
 MOTION_ACTIONS = ('stand', 'lie', 'velocity', 'stopmotion')
 LIFECYCLE_ACTIONS = ('info', 'start', 'stop', 'status', 'config')

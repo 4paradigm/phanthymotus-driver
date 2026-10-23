@@ -1,8 +1,25 @@
 # 云深处 S10 Pro Driver
 
-在现有 PhanthyMotus 卡片框架中提供五张 sensor 卡：`state`、`joints`、`imu`、`odometry`、`lidar`，以及一张执行锁定的 `motion` actuator 卡。沿用现有画布的表单、按钮和 JSON/点云视图，没有低层关节控制入口。
+在现有 PhanthyMotus 卡片框架中按 Lynx M20 结构提供 14 张卡。沿用现有画布的表单、动作选择、按钮和 JSON/点云视图，保留原六卡 ID、端口及连接；没有低层关节控制入口。
 
-## 2026-10-23 整改与版本边界
+## 2026-10-23 M20 结构改版候选
+
+当前目录为 12 张 sensor 加 2 张 actuator：`state`、`motion_info`、`joints`、`device_status`、`imu`、`odometry`、`lidar`、`hard_estop`、`errors`、`motion_events`、`capabilities`、`ros_graph`，以及执行锁定的 `motion`、`device`。`charging` 动作不提供。前后相机、独立后雷达、GPS、充电状态五项须有可验证的来源和语义才注册；不为凑数量复制主雷达或猜测视频地址。可选 navigation 也不注册。
+
+状态卡提供运动、步态、速度、急停、电池和异常摘要；详情分到独立卡。`device_status` 汇总真实电池数量、16 关节温度及按 SoC/挂载点/网口区分的 CPU、内存、磁盘、网络状态。计算资源消息量纲来自本机消息定义，未知电池/关节量纲仍保留原值。HES 的 0/1 是本机观察映射，厂商语义与安全许可仍未知。
+
+异常使用本机 `FaultEventArray.active_faults` 当前快照与 START/STOP、`Exception.is_abnormal` 事件分类；只有新鲜、有效的聚合快照能表示当前上报故障。无消息/过期不能显示无故障。历史去重并限制 64 条，latest-only IPC 可能漏掉快速事件，不是完整审计日志。计算资源按单项独立年龄标记，最多 32 项；ROS 图只读、限频、有界，发现发布者不证明控制权或硬件有效。
+
+`motion_events` 是现有动作事件的独立只读视图，输出 `motion_events_view`，不新增 ACP 通知、任务或命令。`device` 明确显示灯光、模式、休眠/唤醒等协议尚未核实，修改请求返回 unavailable，不假成功。运动三层执行锁、0.5 秒反馈门槛、独立运动 reader、持久任务和 outbox 原样保留。
+
+被动来源核实：2026-10-23 GPS 有样本但 fixquality=0、卫星数=0；充电状态实收 state=0/error_code=0，但尚无已验证状态映射；深度图 15 秒没有样本，未建立前/后 RGB 来源；图中两个发布者共用主雷达话题，不能冒充独立后雷达。相应五项继续明确标为未验证。
+
+容器补充编译本机安装的只读诊断消息，来源与 SHA256 见 `vendor/s10-nos-drdds-1.0.23/SOURCE.json`。部署前递归比较字段/类型，不仅比较版本号。ARM64/Jazzy 下本候选及 Docker COPY 契约 **834 项通过**。真实画布验收与部署版本记录在工作区 `acceptance/s10pro-m20-20261023`，未完成的项目不计为通过。
+
+用户另行批准 Core 两文件最小增量：详情面板注册既有 PointCloudRenderer；监控页 10 秒无新数据提示并保留最后一帧。该增量单独打包，保护 Core 既存 dirty 修改，不进入 driver PR。两份 renderer 合同测试为模拟检查，真实视觉结果另记。
+
+## 历史：2026-10-23 ACP 与反馈整改
+
 
 本轮在现有六卡范围内增加 driver 异步 ACP、英文工具定义与共用参数校验。`stand/lie/velocity` 通过校验并受理后立即返回本次 S10 任务的 `action_id`，后台执行并通过 ACP 报告唯一终态；不再把动作完成等待占在 MCP 调用线程上。卡片、工具/动作标识、平台话题和原画布布局保持兼容。
 

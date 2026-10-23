@@ -1,6 +1,10 @@
 # S10 Pro Docker 部署与验收
 
-## 2026-10-23 本轮检查点
+## 2026-10-23 M20 结构改版候选
+
+最新实现为 14 卡 M20 结构，详情与边界见上级 README 的“M20 结构改版候选”。本轮 ARM64/Jazzy 加 Docker COPY 契约共 834 项通过。部署与真实页面验收单独记录于工作区 `acceptance/s10pro-m20-20261023`；以下六卡、710/750 项、无现场环境等条目是更早阶段历史，不覆盖本轮结果。Core 两文件点云/断流提示增量已由用户单独批准，独立打包且不混入 driver PR。没有发送物理运动或设备修改命令。
+
+## 历史：2026-10-23 ACP 检查点
 
 本轮 driver 范围为异步 ACP、英文工具定义、共用参数与严格校验。六卡范围、原标识与画布布局保持：Robot State (`state`)、Joint Feedback (`joints`)、IMU (`imu`)、Odometry (`odometry`)、LiDAR Point Cloud (`lidar`)、Basic Motion (`motion`)。动作标识仍为 `stand/lie/velocity/stopmotion`，厂家话题、网络、DDS、固件边界保持。用户另行明确授权了配套 Core 三个产品文件的最小修改与离线回归；该补丁独立交付，不进入 driver PR。点云视图问题和实际运动反馈延迟不属于本轮修复。
 

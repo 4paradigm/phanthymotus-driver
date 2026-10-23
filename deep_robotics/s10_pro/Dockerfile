@@ -8,14 +8,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-jazzy-rmw-fastrtps-cpp ros-jazzy-rosidl-default-generators \
     && rm -rf /var/lib/apt/lists/*
 COPY vendor/deep-robotics-msg-${DEEP_ROBOTICS_MSG_REV}.zip /tmp/drdds.zip
+COPY vendor/s10-nos-drdds-1.0.23/ /tmp/s10-nos-drdds/
 RUN echo "${DEEP_ROBOTICS_MSG_SHA256}  /tmp/drdds.zip" | sha256sum -c - && \
     mkdir -p /s10_ws/src && python3 -m zipfile -e /tmp/drdds.zip /s10_ws/src && \
+    cp /tmp/s10-nos-drdds/*.msg /s10_ws/src/deep-robotics-msg-${DEEP_ROBOTICS_MSG_REV}/msg/ && \
     . /opt/ros/jazzy/setup.sh && cd /s10_ws && \
     colcon build --packages-select drdds --cmake-args -DBUILD_TESTING=OFF && \
-    rm -rf /tmp/drdds.zip /s10_ws/build /s10_ws/log
+    rm -rf /tmp/drdds.zip /s10_ws/build /s10_ws/log /tmp/s10-nos-drdds
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py bridge.py device.py reader.py pointcloud.py preflight.py motion.py motion_transport.py motion_dds.py motion_backend.py motion_feedback.py motion_process.py motion_worker.py motion_preflight.py motion_tasks.py parameters.py acp.py config.yaml driver.yaml requirements.txt /work/deep_robotics/s10_pro/
+COPY main.py bridge.py device.py monitoring.py reader.py pointcloud.py preflight.py motion.py motion_transport.py motion_dds.py motion_backend.py motion_feedback.py motion_process.py motion_worker.py motion_preflight.py motion_tasks.py parameters.py acp.py config.yaml driver.yaml requirements.txt /work/deep_robotics/s10_pro/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15745
 CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source /s10_ws/install/setup.bash && exec python3 /work/deep_robotics/s10_pro/main.py"]

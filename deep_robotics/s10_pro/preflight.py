@@ -137,6 +137,7 @@ def collect_contract(specs: Mapping, get_message) -> dict:
     """Load class metadata recursively, without constructing a message instance."""
     types = {}
     sources = {}
+    unavailable_optional = {}
 
     def visit(type_name):
         if type_name in types:
@@ -161,14 +162,27 @@ def collect_contract(specs: Mapping, get_message) -> dict:
 
     for key in sorted(specs):
         item = specs[key]
+        if item.get("internal"):
+            continue  # Graph diagnostics have no ROS message serialization contract.
         type_name = _message_name(item["type"])
+        previous_types = set(types)
+        try:
+            visit(type_name)
+        except (ImportError, AttributeError, KeyError) as exc:
+            if not item.get("optional"):
+                raise
+            for added in set(types) - previous_types:
+                types.pop(added, None)
+            unavailable_optional[key] = {"type": type_name, "reason": "message_type_unavailable"}
+            continue
         sources[key] = {"topic": item["topic"], "type": type_name}
-        visit(type_name)
     contract = {"schema": CONTRACT_SCHEMA, "sources": sources,
                 "types": {name: types[name] for name in sorted(types)}}
     structural = _contract_structure(contract)
     encoded = json.dumps(structural, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     contract["fingerprint_sha256"] = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+    if unavailable_optional:
+        contract["unavailable_optional_sources"] = unavailable_optional
     return contract
 
 

@@ -1,0 +1,15 @@
+{
+  "source": "/opt/ros/jazzy/share/drdds/msg on user-authorized S10 NOS 10.21.33.106",
+  "retrieved": "2026-10-23",
+  "package": "drdds 1.0.23",
+  "scope": "Read-only fault and device-health message definitions; no controller code.",
+  "sha256": {
+    "MemoryStatus.msg": "e62910dd64c55559c48c75937a4e0ea7d0d736de1e528cd3a1ab38c773a7a155",
+    "NetworkStatus.msg": "964697141aa9028deb4715bf059d0d5f9092b1aa9b739845a422f0ebfd4af59b",
+    "Exception.msg": "0d83b51278733291f78241ce4b36c8798a1e1f840bb8140169fcda2c9e1b25ac",
+    "FaultEvent.msg": "10cd1efa3ab06cc104a5365e0f397a8d78c412bf744483b21e5340f42b3f9e62",
+    "CPUStatus.msg": "69208a41b0b7790d45ac7ba40a7231edfbe8ef64370ab76b09f314839aa7e495",
+    "FileSystemStatus.msg": "dfd3d584bee3de8afbed29c9eb7b95c2d92a659d6afaf247c1b5c362fe2d7cdd",
+    "FaultEventArray.msg": "80b8c9c3ed7802b5f15aab8e7195c8fb95316e5c7e5c41f48600f645420cd8e3"
+  }
+}

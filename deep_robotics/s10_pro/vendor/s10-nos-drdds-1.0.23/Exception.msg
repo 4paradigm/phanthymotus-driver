@@ -1,0 +1,4 @@
+builtin_interfaces/Time stamp
+string source
+string description
+bool is_abnormal

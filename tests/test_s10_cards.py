@@ -1,4 +1,4 @@
-"""Offline contracts for the five S10 Pro cards; no ROS or robot access."""
+"""Offline contracts for S10 Pro card lifecycle; no ROS or robot access."""
 
 from __future__ import annotations
 
@@ -101,12 +101,13 @@ class S10CardTests(unittest.TestCase):
     def start(self, name, **options):
         return self.by_name[name].dispatch("start", {"refresh_hz": 30, **options})
 
-    def test_exactly_five_idle_read_only_sensors_have_fixed_ports_and_lifecycle_schema(self):
-        self.assertEqual(["state", "joints", "imu", "odometry", "lidar"], list(self.by_name))
+    def test_legacy_ids_and_m20_structure_cards_have_fixed_ports_and_lifecycle_schema(self):
+        self.assertEqual(["state", "joints", "imu", "odometry", "lidar", "motion_info", "device_status",
+                          "hard_estop", "errors", "motion_events", "capabilities", "ros_graph", "device"], list(self.by_name))
         self.assertEqual([], self.bridge.acquires)
         for name, plugin in self.by_name.items():
             definition = plugin.get_tool()
-            self.assertEqual("sensor", definition["type"])
+            self.assertEqual("actuator" if name == "device" else "sensor", definition["type"])
             self.assertFalse(definition["multiInstance"])
             self.assertIn("S10 Pro", definition["title"])
             self.assertEqual(["info", "start", "stop", "status", "config"],
@@ -116,7 +117,8 @@ class S10CardTests(unittest.TestCase):
             self.assertEqual("idle", info["state"])
             self.assertFalse(info["connected"])
             self.assertEqual(definition["topic_out"], info["topic_out"])
-            self.assertEqual(f"/test_robot/s10_pro/{name}", info["topic_out"][0]["topic"])
+            suffix = "motion_events_view" if name == "motion_events" else name
+            self.assertEqual(f"/test_robot/s10_pro/{suffix}", info["topic_out"][0]["topic"])
         self.assertEqual("data/json", self.by_name["joints"].get_tool()["topic_out"][0]["format"])
         self.assertEqual("data/json", self.by_name["odometry"].get_tool()["topic_out"][0]["format"])
         self.assertEqual(["sensor/pointcloud", "data/json"],
@@ -260,7 +262,9 @@ class S10CardTests(unittest.TestCase):
         self.assertEqual(count, len(self.output.matching("/lidar_info")))
 
     def test_config_defaults_validation_and_disabled_start(self):
-        expected_hz = {"state": 1, "joints": 5, "imu": 5, "odometry": 5, "lidar": 2}
+        expected_hz = {"state": 1, "joints": 5, "imu": 5, "odometry": 5, "lidar": 2,
+                       "motion_info": 5, "device_status": 1, "hard_estop": 5, "errors": 1,
+                       "motion_events": 2, "capabilities": 1, "ros_graph": .5, "device": 1}
         for name, plugin in self.by_name.items():
             self.assertEqual(expected_hz[name], plugin.status()["settings"]["refresh_hz"])
             self.assertEqual(5, plugin.status()["settings"]["stale_after_s"])

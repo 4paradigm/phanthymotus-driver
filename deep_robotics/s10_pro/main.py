@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S10 Pro sensor cards and a fail-closed, separately gated motion card."""
+"""S10 Pro M20-style card bundle with isolated read-only observation."""
 from __future__ import annotations
 
 import json
@@ -30,15 +30,16 @@ def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, 
     contract and an explicit process-level execution authorization are bound.
     Canvas configuration cannot grant that authorization.
     """
-    plugins = build_plugins(config, namespace, bridge, publish)
     transport = DDSProcessTransport(config, execution_enabled=False)
     # The production runtime supplies a separate read-only child for motion.
     # Point-cloud conversion and sensor IPC must not queue its feedback samples.
     observer_bridge = bridge if motion_bridge is None else motion_bridge
     motion_backend = DDSMotionBackend(observer_bridge, transport, execution_authorized=False)
-    plugins.append(MotionPlugin(config.get("motion", {}), namespace, backend=motion_backend,
+    motion_plugin = MotionPlugin(config.get("motion", {}), namespace, backend=motion_backend,
                                 feedback=motion_backend.feedback, publish=publish, execution_authorized=False,
-                                notifier=notifier, tasks=tasks))
+                                notifier=notifier, tasks=tasks)
+    plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin)
+    plugins.append(motion_plugin)
     return plugins
 
 
@@ -159,7 +160,7 @@ def main():
         # Do not start cards at process boot. The real canvas owns their lifecycle.
         if config.get("register", True):
             start_registration(port, config, "deep-robotics-s10-pro-driver")
-        logging.info("S10 Pro five sensors and gated motion; namespace=%s port=%d domain=%d motion_authorized=false", namespace, port, domain)
+        logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_authorized=false", namespace, port, domain)
         server.serve_forever()
 
 

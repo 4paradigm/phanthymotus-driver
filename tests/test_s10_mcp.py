@@ -1,4 +1,4 @@
-"""Real HTTP/MCP transport with five cards, without a ROS or robot dependency."""
+"""Real MCP card catalog and fail-closed controls without a robot dependency."""
 import importlib.util
 import json
 import sys
@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "deep_robotics/s10_pro"))
 from common.vendor_runtime import DriverBundle, make_handler
 from deep_robotics.s10_pro.device import build_plugins
+
+MONITOR_NAMES = {"state", "joints", "imu", "odometry", "lidar", "motion_info",
+                 "device_status", "hard_estop", "errors", "motion_events",
+                 "capabilities", "ros_graph", "device"}
 
 
 class NoRobot:
@@ -55,12 +59,12 @@ def mcp():
     thread.join(timeout=2)
 
 
-def test_http_tools_are_only_five_idle_sensors_with_fixed_ports(mcp):
+def test_http_tools_are_idle_monitoring_cards_with_fixed_ports(mcp):
     call, bridge, published = mcp
     assert call("initialize")["result"]["serverInfo"]["name"] == "s10-test"
     tools = call("tools/list")["result"]["tools"]
-    assert {t["name"] for t in tools} == {"state", "joints", "imu", "odometry", "lidar"}
-    assert all(t["type"] == "sensor" for t in tools)
+    assert {t["name"] for t in tools} == MONITOR_NAMES
+    assert all(t["type"] == ("actuator" if t["name"] == "device" else "sensor") for t in tools)
     assert not bridge.active and not published
     for tool in tools:
         rpc = call("tools/call", {"name": tool["name"], "arguments": {"action": "info"}})
@@ -110,7 +114,7 @@ def test_profile_validation_rejects_unconfined_transport(tmp_path):
         module.validate_platform_profile(profile)
 
 
-def test_runtime_has_six_tools_and_motion_start_config_cannot_unlock_execution():
+def test_runtime_has_fourteen_tools_and_configuration_cannot_unlock_execution():
     path = ROOT / 'deep_robotics/s10_pro/main.py'
     spec = importlib.util.spec_from_file_location('s10_motion_runtime_test', path)
     module = importlib.util.module_from_spec(spec)
@@ -132,8 +136,8 @@ def test_runtime_has_six_tools_and_motion_start_config_cannot_unlock_execution()
         return json.loads(value['result']['content'][0]['text'])
     try:
         tools = rpc('tools/list')['result']['tools']
-        assert {t['name'] for t in tools} == {'state', 'joints', 'imu', 'odometry', 'lidar', 'motion'}
-        assert sum(t['type'] == 'sensor' for t in tools) == 5
+        assert {t['name'] for t in tools} == MONITOR_NAMES | {'motion'}
+        assert sum(t['type'] == 'sensor' for t in tools) == 12
         assert next(t for t in tools if t['name'] == 'motion')['type'] == 'actuator'
         action('motion', 'config', enabled=True)
         assert not action('motion', 'start')['execution_available']

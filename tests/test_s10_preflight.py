@@ -378,3 +378,27 @@ def test_host_metadata_uses_only_public_environment_allowlist(monkeypatch):
     assert "secret-probe-must-not-appear" not in encoded
     assert "/private/ssh/socket" not in encoded
     assert "/private/vendor/profile.xml" not in encoded
+
+
+def test_internal_graph_is_not_a_serialization_contract_and_missing_optional_types_are_explicit():
+    class Scalar:
+        @classmethod
+        def get_fields_and_field_types(cls):
+            return {"value": "int32"}
+    calls = []
+    def resolve(name):
+        calls.append(name)
+        if name == "drdds/msg/FaultEvent":
+            raise ImportError("not installed")
+        return Scalar
+    specs = {"hard_estop": {"topic": "/HES_STATUS", "type": "drdds/msg/StdMsgInt32"},
+             "fault_event": {"topic": "/fault_event", "type": "drdds/msg/FaultEvent", "optional": True},
+             "ros_graph": {"topic": "ros2://graph", "type": "internal/ros_graph", "internal": True}}
+    contract = preflight.collect_contract(specs, resolve)
+    assert set(contract["sources"]) == {"hard_estop"}
+    assert set(contract["types"]) == {"drdds/msg/StdMsgInt32"}
+    assert contract["unavailable_optional_sources"]["fault_event"]["reason"] == "message_type_unavailable"
+    assert "internal/ros_graph" not in calls
+    specs["fault_event"].pop("optional")
+    with pytest.raises(ImportError):
+        preflight.collect_contract(specs, resolve)

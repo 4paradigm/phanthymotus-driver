@@ -267,9 +267,9 @@ def test_slow_output_retains_only_latest_per_key_and_stop_purges_pending():
                 writer.submit({"key": key, "data": value})
             assert writer.pending_count <= len(reader.DEFAULT_SOURCES)
         writer.discard("joints")
-        assert writer.pending_count == 5
+        assert writer.pending_count == len(reader.DEFAULT_SOURCES) - 1
         stream.release.set()
-        wait_until(lambda: len(stream.lines) == 6)
+        wait_until(lambda: len(stream.lines) == len(reader.DEFAULT_SOURCES))
         records = [json.loads(line) for line in stream.lines]
         assert records[0]["data"] == 0
         assert {record["key"] for record in records[1:]} == set(reader.DEFAULT_SOURCES) - {"joints"}
@@ -360,7 +360,8 @@ def test_import_ros_validation_does_not_initialize_ros_or_create_nodes(monkeypat
     monkeypatch.setitem(sys.modules, "rosidl_runtime_py", ModuleType("rosidl_runtime_py"))
     monkeypatch.setitem(sys.modules, "rosidl_runtime_py.utilities", utilities)
     _, _, profile = reader.import_ros(reader.source_specs({}), validate_messages=True)
-    assert imported_types == [spec["type"] for spec in reader.DEFAULT_SOURCES.values()]
+    assert imported_types == [spec["type"] for spec in reader.DEFAULT_SOURCES.values()
+                              if not spec.get("internal")]
     assert profile == {"depth": 1, "reliability": "best_effort", "history": "keep_last", "durability": "volatile"}
 
 
