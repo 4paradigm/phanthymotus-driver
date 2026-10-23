@@ -466,6 +466,9 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     last_joints = None
     joint_updates = 0
     walking = None
+    last_command = 0.0
+    last_command_at = None
+    dead_reckoned_m = 0.0
     samples, commands = [], []
 
     def publish(vx, vyaw=0):
@@ -548,6 +551,25 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
             heading_error = angle_delta(bearing, heading)
             if walking is None:
                 walking = abs(math.degrees(bearing)) <= TARGET_TURN_FIRST_DEG
+            if brake_started is None and motion_started is not None:
+                # Independent feed-forward bound from the worker's own normalised
+                # forward commands through the measured command->speed curve. It
+                # is a sanity bound only: if the leg/IMU estimate (which decides
+                # the stop) lags the commanded travel by more than the tolerance,
+                # fail closed instead of walking on a frozen/under-reporting pose.
+                if last_command_at is None:
+                    last_command_at = now
+                dead_reckoned_m += travel_speed(last_command, 'forward',
+                                                full_scale)*(now-last_command_at)
+                last_command_at = now
+                samples[-1]['dead_reckoned_m'] = dead_reckoned_m
+                progress = target_distance - distance
+                tolerance = travel_tolerance(target_distance)
+                if dead_reckoned_m - progress > tolerance:
+                    raise ValueError(
+                        f'dead-reckoned travel {dead_reckoned_m:.3f} m leads the '
+                        f'target estimate {progress:.3f} m by more than '
+                        f'{tolerance:.3f} m for a {target_distance:.3f} m target')
             if brake_started is None:
                 if now-motion_started > time_limit:
                     raise ValueError('target move time limit reached')
@@ -573,11 +595,13 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                             turn = HEADING_PULSE
                         else:
                             turn = 0.0
-                        publish(0.6 if distance > 0.3 else 0.5, turn)
+                        last_command = 0.6 if distance > 0.3 else 0.5
+                        publish(last_command, turn)
                     else:
                         # Turn first (or realign): no forward motion.
                         turn = math.copysign(0.8 if abs(err_deg) > 20.0 else 0.5,
                                              heading_error)
+                        last_command = 0.0
                         publish(0, turn)
             if brake_started is not None:
                 publish(0)

@@ -533,6 +533,48 @@ def test_target_endpoint_catches_coasting_past_the_tolerance(monkeypatch):
     assert 'outside the target point' in result['error']
 
 
+def test_target_fails_closed_when_pose_feedback_is_frozen(monkeypatch):
+    clock = [0.0]
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+        def reset_baseline(self):
+            pass
+        def observe(self, joints, quaternion, now, frozen=False):
+            pass
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.5, 0.0)
+    # The pose never moves while forward commands are sent: the independent
+    # command model must fail the target closed, not drive on and report done.
+    assert result['state'] == 'error'
+    assert 'dead-reckoned' in result['error']
+
+
 def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     clock = [0.0]
     commands = []

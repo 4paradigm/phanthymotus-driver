@@ -526,7 +526,7 @@ class LocoPlugin:
     def _loco_target_tool(self) -> dict:
         return {
             "name": "loco_target", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：按腿式里程计估计距离前进/后退/侧移、按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在打滑与漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动（危险动作，move/rotate/target 需 confirm=true）：按腿式里程计估计距离前进/后退/侧移、按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在打滑与漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -541,6 +541,8 @@ class LocoPlugin:
                             "description": "target 动作：目标点在启动时机身系的左右坐标（米，正=左）。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
+                    "confirm": {"type": "boolean",
+                                "description": "危险动作确认：move / rotate / target 必须传 true 才会执行；status / stop_move 不需要。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -552,6 +554,7 @@ class LocoPlugin:
                     "status": {"params": [], "description": "查询当前目标动作、距离反馈来源及估计位移或转角结果。"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
+                "x-is-dangerous": True,
                 # Both actions retain the existing asynchronous ACP contract.
                 "x-completion": {"actions": ["move", "rotate", "target"], "timeout": 120},
             },
@@ -714,10 +717,19 @@ class LocoPlugin:
         if tool_name == "loco" and action == "move":
             handler = lambda: self._do_move(args)
         elif tool_name == "loco_target" and action == "rotate":
+            if args.get("confirm") is not True:
+                return {"state": "error",
+                        "error": "loco_target rotate is a dangerous action; pass confirm=true to allow the motion"}
             return self._do_rotate(args)
         elif tool_name == "loco_target" and action == "move":
+            if args.get("confirm") is not True:
+                return {"state": "error",
+                        "error": "loco_target move is a dangerous action; pass confirm=true to allow the motion"}
             return self._do_destination(args, "move")
         elif tool_name == "loco_target" and action == "target":
+            if args.get("confirm") is not True:
+                return {"state": "error",
+                        "error": "loco_target target is a dangerous action; pass confirm=true to allow the motion"}
             return self._do_destination(args, "target")
         elif tool_name == "loco_target" and action == "status":
             return self._rotate_status()
