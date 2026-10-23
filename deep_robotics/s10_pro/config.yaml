@@ -1,7 +1,7 @@
 mcp_port: 15745
 bind_host: "127.0.0.1"
 ros_namespace: "s10_pro"
-name: "云深处 S10 Pro"
+name: "S10 Pro"
 register: true
 core_domain_id: 42
 reader:
@@ -9,6 +9,12 @@ reader:
   vendor_profile: ""
 motion:
   enabled: false
+  refresh_hz: 2.0
+  max_duration_s: 2.0
+  action_timeout_s: 8.0
+  max_vx: 0.2
+  max_vy: 0.1
+  max_yaw_rate: 0.2
 topics:
   battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"

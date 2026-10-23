@@ -8,6 +8,28 @@ import pytest
 from deep_robotics.s10_pro.motion import MotionPlugin, UnsupportedBackend, validate_contract
 
 
+class Recorder:
+    def __init__(self):
+        self.records = {}
+    def submit(self, payload):
+        self.records[payload['action_id']] = copy.deepcopy(payload)
+    def status(self, action_id):
+        return {'delivery_state': 'acknowledged' if action_id in self.records else 'pending'}
+
+
+def settled(plugin, action, arguments):
+    result = plugin.dispatch(action, arguments)
+    if result.get('state') != 'accepted':
+        return result
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        last = plugin.status()['last_result']
+        if last and last.get('action_id') == result['action_id'] and result['action_id'] in plugin._notifier.records:
+            return last
+        time.sleep(.005)
+    raise AssertionError('No terminal task result before the test deadline')
+
+
 def contract():
     # Explicit offline fiction, never deployed as a real robot contract.
     return {'verified': True, 'evidence': {key: 'offline fixture only: ' + key for key in
@@ -66,7 +88,7 @@ def feedback_for(backend, *, posture=True, moving=True, stopping=True, stale=Fal
 def plugin():
     backend = Backend()
     plugin = MotionPlugin({'enabled': True, 'max_duration_s': .3, 'action_timeout_s': .2}, 'test', backend,
-        feedback=feedback_for(backend), execution_authorized=True)
+        feedback=feedback_for(backend), execution_authorized=True, notifier=Recorder())
     plugin.start()
     yield plugin, backend
     plugin.close()
@@ -79,10 +101,10 @@ def test_default_gate_never_calls_network_or_makes_unsupported_stop_claim():
     try:
         p.start()
         for action in ['stand', 'lie', 'velocity']:
-            result = p.dispatch(action, {})
+            result = settled(p, action, {})
             assert result['state'] == 'unavailable'
             assert not result['accepted'] and not result['confirmed'] and not result['completed']
-        assert not p.dispatch('stopmotion', {})['completed']
+        assert not settled(p, 'stopmotion', {})['completed']
         p.stop()
         assert backend.commands == [] and backend.stops == []
     finally:
@@ -132,7 +154,7 @@ def test_fixed_actuator_ports_and_lifecycle_do_not_execute(plugin):
 @pytest.mark.parametrize('action', ['stand', 'lie'])
 def test_posture_requires_fresh_observed_feedback(plugin, action):
     p, b = plugin
-    result = p.dispatch(action, {})
+    result = settled(p, action, {})
     assert result['accepted'] is True and result['confirmed'] and result['completed']
     assert len(b.commands) == 1 and not b.stops
 
@@ -140,7 +162,7 @@ def test_posture_requires_fresh_observed_feedback(plugin, action):
 @pytest.mark.parametrize('options', [{'posture': False}, {'cached': True}, {'stale': True}])
 def test_ack_alone_stale_or_cached_feedback_cannot_complete(plugin, options):
     p, b = plugin; p._feedback = feedback_for(b, **options)
-    result = p.dispatch('stand', {})
+    result = settled(p, 'stand', {})
     assert result['accepted'] is True and not result['completed'] and not result['confirmed']
     assert b.stops
 
@@ -148,16 +170,16 @@ def test_ack_alone_stale_or_cached_feedback_cannot_complete(plugin, options):
 def test_velocity_is_finite_refreshed_stopped_and_confirmed(plugin):
     p, b = plugin; b.accepted = None
     begin = time.monotonic()
-    result = p.dispatch('velocity', {'vx': .1, 'duration': .25})
+    result = settled(p, 'velocity', {'vx': .1, 'duration': .25})
     assert .2 <= time.monotonic() - begin < 1
-    assert result['accepted'] is None  # This protocol sends no velocity ACK.
+    assert result['accepted'] is True and result['command_accepted'] is None  # Application acceptance is separate from the missing velocity ACK.
     assert result['completed'] and result['confirmed'] and result['stop_confirmed']
     assert len(b.commands) >= 2 and b.stops
 
 
 def test_zero_feedback_only_cannot_confirm_the_requested_velocity(plugin):
     p, b = plugin; p._feedback = feedback_for(b, moving=False)
-    result = p.dispatch('velocity', {'duration': .1})
+    result = settled(p, 'velocity', {'duration': .1})
     assert not result['completed'] and not result['confirmed'] and result['stop_confirmed']
 
 
@@ -165,7 +187,7 @@ def test_zero_feedback_only_cannot_confirm_the_requested_velocity(plugin):
 def test_duration_and_velocity_limits_are_enforced_before_send(plugin, values):
     p, b = plugin
     with pytest.raises(ValueError):
-        p.dispatch('velocity', values)
+        settled(p, 'velocity', values)
     assert not b.commands
 
 
@@ -173,31 +195,31 @@ def test_duration_and_velocity_limits_are_enforced_before_send(plugin, values):
 def test_stale_or_future_requests_are_rejected(plugin, delta):
     p, b = plugin
     with pytest.raises(ValueError):
-        p.dispatch('stand', {'issued_at_ms': int(time.time() * 1000) + delta})
+        settled(p, 'stand', {'issued_at_ms': int(time.time() * 1000) + delta})
     assert not b.commands
 
 
-def test_duplicate_request_is_not_replayed(plugin):
+def test_duplicate_request_reuses_the_finished_task_without_motion(plugin):
     p, b = plugin
-    assert p.dispatch('stand', {'request_id': 'one'})['completed']
-    result = p.dispatch('stand', {'request_id': 'one'})
-    assert not result['completed'] and len(b.commands) == 1
+    assert settled(p, 'stand', {'request_id': 'one'})['completed']
+    result = settled(p, 'stand', {'request_id': 'one'})
+    assert result['completed'] and result['replayed'] and 'action_id' not in result and len(b.commands) == 1
 
 
 @pytest.mark.parametrize('condition', ['owned', 'fresh', 'feedback_fresh'])
 def test_invalid_authority_or_feedback_prevents_first_send(plugin, condition):
     p, b = plugin; setattr(b, condition, False)
-    result = p.dispatch('velocity', {'duration': .1})
+    result = settled(p, 'velocity', {'duration': .1})
     assert not result['completed'] and not b.commands
 
 
 def test_cancel_preempts_movement_and_second_request_is_busy(plugin):
     p, b = plugin; p._feedback = feedback_for(b, posture=False)
     output = []
-    thread = threading.Thread(target=lambda: output.append(p.dispatch('stand', {})))
+    thread = threading.Thread(target=lambda: output.append(settled(p, 'stand', {})))
     thread.start(); assert b.entered.wait(.5)
-    assert p.dispatch('lie', {})['state'] == 'busy'
-    p.dispatch('stopmotion', {})
+    assert settled(p, 'lie', {})['state'] == 'busy'
+    settled(p, 'stopmotion', {})
     thread.join(2)
     assert not thread.is_alive() and output[0]['state'] == 'cancelled'
     assert not output[0]['completed'] and b.stops
@@ -205,7 +227,7 @@ def test_cancel_preempts_movement_and_second_request_is_busy(plugin):
 
 def test_lost_control_does_not_send_stop_over_manual_takeover(plugin):
     p, b = plugin
-    thread = threading.Thread(target=lambda: p.dispatch('velocity', {'duration': .3}))
+    thread = threading.Thread(target=lambda: settled(p, 'velocity', {'duration': .3}))
     thread.start(); assert b.entered.wait(.5)
     b.owned = False
     thread.join(2)
@@ -217,7 +239,7 @@ def test_lost_control_does_not_send_stop_over_manual_takeover(plugin):
 def test_lifecycle_stop_closes_status_output_and_cancels_active_action(plugin):
     p, b = plugin; output = []
     p._publish = lambda *args: output.append(args)
-    thread = threading.Thread(target=lambda: p.dispatch('velocity', {'duration': .3}))
+    thread = threading.Thread(target=lambda: settled(p, 'velocity', {'duration': .3}))
     thread.start(); assert b.entered.wait(.5)
     p.stop(); thread.join(2)
     count = len(output); time.sleep(.6)
@@ -227,10 +249,10 @@ def test_lifecycle_stop_closes_status_output_and_cancels_active_action(plugin):
 
 def test_backend_failure_stops_and_does_not_leak_busy_lock(plugin):
     p, b = plugin; b.fail = True
-    assert not p.dispatch('stand', {})['completed']
+    assert not settled(p, 'stand', {})['completed']
     assert b.stops
     b.fail = False
-    assert p.dispatch('lie', {})['completed']
+    assert settled(p, 'lie', {})['completed']
 
 
 def test_stop_during_parameter_validation_cannot_be_undone_by_starting_request(plugin):
@@ -239,8 +261,8 @@ def test_stop_during_parameter_validation_cannot_be_undone_by_starting_request(p
         p.stop()
         return time.time()
     p._wall = stop_during_validation
-    result = p.dispatch('stand', {})
-    assert result['state'] == 'cancelled' and not result['completed']
+    result = settled(p, 'stand', {})
+    assert result['state'] == 'unavailable' and not result['completed']
     assert not b.commands and not b.stops
 
 
@@ -253,7 +275,7 @@ def test_zero_velocity_is_repeated_until_fresh_stop_feedback(plugin):
             value['confirmed'] = len(b.stops) >= 3
         return value
     p._feedback = delayed_stop
-    result = p.dispatch('velocity', {'duration': .1})
+    result = settled(p, 'velocity', {'duration': .1})
     assert result['completed'] and len(b.stops) >= 3
 
 
@@ -261,7 +283,7 @@ def test_verified_flag_cannot_bypass_fresh_runtime_feedback(plugin):
     p, b = plugin
     p._feedback = feedback_for(b, moving=False)
     output = []
-    thread = threading.Thread(target=lambda: output.append(p.dispatch('velocity', {'duration': .3})))
+    thread = threading.Thread(target=lambda: output.append(settled(p, 'velocity', {'duration': .3})))
     thread.start(); assert b.entered.wait(.5)
     b.feedback_fresh = False
     thread.join(2)
@@ -272,7 +294,7 @@ def test_verified_flag_cannot_bypass_fresh_runtime_feedback(plugin):
 def test_expired_request_before_first_send_is_not_completed(plugin):
     p, b = plugin
     p._wall = lambda: time.time() + (10 if p._active else 0)
-    result = p.dispatch('velocity', {'duration': .1})
+    result = settled(p, 'velocity', {'duration': .1})
     assert not result['completed'] and not b.commands
 
 
@@ -286,7 +308,7 @@ def test_safety_configuration_change_during_validation_invalidates_request(plugi
         def release(self):
             underlying.release()
     p._busy = ChangeBeforeAcquire()
-    result = p.dispatch('velocity', {'vx': .15, 'duration': .1})
+    result = settled(p, 'velocity', {'vx': .15, 'duration': .1})
     assert result['state'] == 'cancelled' and not b.commands
 
 
@@ -294,7 +316,7 @@ def test_closed_controller_cannot_restart_without_a_watchdog(plugin):
     p, b = plugin
     p.close()
     assert p.start()['state'] == 'idle'
-    result = p.dispatch('stand', {})
+    result = settled(p, 'stand', {})
     assert result['state'] == 'unavailable' and not b.commands
 
 
@@ -306,4 +328,4 @@ def test_future_monotonic_feedback_is_not_fresh_confirmation(plugin):
         value['received_monotonic'] += 5
         return value
     p._feedback = future
-    assert not p.dispatch('stand', {})['completed']
+    assert not settled(p, 'stand', {})['completed']

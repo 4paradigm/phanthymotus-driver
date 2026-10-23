@@ -19,23 +19,27 @@ sys.path.insert(0, str(ROOT))
 
 
 def main():
-    if {name for _, name in socket.if_nameindex()} != {'lo'}:
-        raise RuntimeError('synthetic motion test requires Docker --network none')
+    from s10_network_isolation import require_loopback_network
+    require_loopback_network()
     from deep_robotics.s10_pro.bridge import ReaderBridge, reader_environment
     from deep_robotics.s10_pro.motion import MotionPlugin
     from deep_robotics.s10_pro.motion_backend import DDSMotionBackend
     from deep_robotics.s10_pro.motion_process import DDSProcessTransport
+    from deep_robotics.s10_pro.acp import ACPNotifier, ACPResponse
+    from deep_robotics.s10_pro.motion_tasks import MotionTasks
     import yaml
     config = {'reader': {'domain_id': 0, 'vendor_profile': '/opt/phanthy-motus/dds-local.xml'}, 'register': False}
     temp = tempfile.TemporaryDirectory(prefix='s10-fictional-motion-')
     base = Path(temp.name)
     config_path = base / 'config.yaml'; config_path.write_text(yaml.safe_dump(config))
     log_path = base / 'fake-robot-commands.json'
-    code = '''import json,os,socket,time,rclpy
+    code = '''import json,os,sys,time,rclpy
 from pathlib import Path
 from drdds.msg import MotionInfo,MotionState,NavCmd
 from rclpy.signals import SignalHandlerOptions
-if {n for _,n in socket.if_nameindex()} != {'lo'}: raise RuntimeError('isolated fake robot only')
+sys.path.insert(0,'/work/tests')
+from s10_network_isolation import require_loopback_network
+require_loopback_network()
 rclpy.init(args=[],signal_handler_options=SignalHandlerOptions.NO)
 n=rclpy.create_node('synthetic_motion_robot',enable_rosout=False,start_parameter_services=False)
 pub=n.create_publisher(MotionInfo,'/MOTION_INFO',10)
@@ -65,8 +69,15 @@ while rclpy.ok():
     def fictional_lease():
         return {'owned':True,'fresh':True,'age_s':0.,'received_monotonic':time.monotonic(),'navigation_mode_confirmed':True}
     backend = DDSMotionBackend(bridge, transport, contract=policy, authority_provider=fictional_lease, execution_authorized=True)
+    callbacks = []
+    def local_ack(payload):
+        callbacks.append(payload)
+        return ACPResponse(200, {'ok':True, 'action_id':payload['action_id'], 'state':'matched'})
+    tasks = MotionTasks(base / 'motion-tasks.sqlite3')
+    notifier = ACPNotifier(base / 'acp-outbox.sqlite3', transport=local_ack)
+    notifier.start()
     plugin = MotionPlugin({'enabled':True,'action_timeout_s':5}, 'isolated', backend,
-        feedback=backend.feedback, execution_authorized=True)
+        feedback=backend.feedback, execution_authorized=True, notifier=notifier, tasks=tasks)
     result = {'synthetic_isolated_test':True,'physical_robot':False,'transport':'ros2_dds','passed':False}
     def until(predicate, seconds=10):
         deadline=time.monotonic()+seconds
@@ -74,16 +85,28 @@ while rclpy.ok():
             if predicate():return
             time.sleep(.03)
         raise AssertionError('isolated DDS condition timed out')
+    def completed(action, arguments):
+        receipt = plugin.dispatch(action, arguments)
+        assert receipt['accepted'] is True and receipt['action_id'].startswith('s10_motion_')
+        until(lambda: notifier.status(receipt['action_id']) is not None and
+              notifier.status(receipt['action_id'])['acknowledged'])
+        terminal = next(value for value in callbacks if value['action_id'] == receipt['action_id'])
+        assert terminal['status'] == 'completed'
+        assert terminal['result']['request_id'] == receipt['request_id']
+        return terminal['result']
     try:
         plugin.start();transport.start()
         until(lambda: backend.feedback.observation()['fresh'])
         until(lambda: all(v['subscriber_count']>0 for v in transport.graph_snapshot().values()))
-        result['stand']=plugin.dispatch('stand',{})
-        assert result['stand']['completed'] and result['stand']['accepted'] is None
-        result['velocity']=plugin.dispatch('velocity',{'vx':.1,'duration':.8})
-        assert result['velocity']['completed'] and result['velocity']['stop_confirmed'] and result['velocity']['accepted'] is None
-        result['lie']=plugin.dispatch('lie',{})
+        result['stand']=completed('stand',{})
+        assert result['stand']['completed'] and result['stand']['command_accepted'] is None
+        result['velocity']=completed('velocity',{'vx':.1,'duration':.8})
+        assert result['velocity']['completed'] and result['velocity']['stop_confirmed'] and result['velocity']['command_accepted'] is None
+        result['lie']=completed('lie',{})
         assert result['lie']['completed']
+        assert len(callbacks) == 3 and len({value['action_id'] for value in callbacks}) == 3
+        result['local_acknowledged_callbacks']=len(callbacks)
+        result['completion_transport']='injected_local_ack_not_core'
         commands=json.loads(log_path.read_text())
         states=[v['state'] for v in commands if 'state' in v]
         assert states == [1,17,4]
@@ -101,6 +124,7 @@ while rclpy.ok():
         result['passed']=True
     finally:
         plugin.close();bridge.close()
+        notifier.close();tasks.close()
         fake.terminate()
         try:fake.wait(timeout=3)
         except subprocess.TimeoutExpired:fake.kill();fake.wait(timeout=2)

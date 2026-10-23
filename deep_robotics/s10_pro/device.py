@@ -13,16 +13,20 @@ import time
 
 try:
     from .reader import source_specs
+    from .parameters import (sensor_defaults, sensor_config_schema, validate_sensor_settings,
+                             normalize_config_updates, validate_empty_arguments, SENSOR_TITLES, config_overlap_constraints)
 except ImportError:  # Direct driver execution; reader itself imports no ROS here.
     from reader import source_specs
+    from parameters import (sensor_defaults, sensor_config_schema, validate_sensor_settings,
+                            normalize_config_updates, validate_empty_arguments, SENSOR_TITLES, config_overlap_constraints)
 
 
 CARDS = {
-    "state": ("状态", ("battery", "motion_info"), 1.0),
-    "joints": ("关节反馈", ("joints",), 5.0),
+    "state": (SENSOR_TITLES["state"], ("battery", "motion_info"), 1.0),
+    "joints": (SENSOR_TITLES["joints"], ("joints",), 5.0),
     "imu": ("IMU", ("imu",), 5.0),
-    "odometry": ("里程计", ("odometry",), 5.0),
-    "lidar": ("雷达点云", ("lidar",), 2.0),
+    "odometry": (SENSOR_TITLES["odometry"], ("odometry",), 5.0),
+    "lidar": (SENSOR_TITLES["lidar"], ("lidar",), 2.0),
 }
 SOURCE_TOPICS = {
     "battery": "/BATTERY_DATA", "motion_info": "/MOTION_INFO",
@@ -32,7 +36,7 @@ SOURCE_TOPICS = {
 MOTION_CAPABILITY = {
     "supported": False,
     "status": "requires_vendor_contract",
-    "description": "motion 基础动作卡尚未开放真机执行；需要核实本机控制接口、控制权与停止约定。",
+    "description": "Physical motion execution remains locked pending verification of this robot's control interface, authority and stop contract.",
 }
 
 
@@ -58,11 +62,8 @@ class ReadOnlyCard:
         base = "/" + "/".join(part for part in (str(namespace).strip("/"), "s10_pro") if part)
         self.topic = f"{base}/{name}"
         self.info_topic = f"{base}/lidar_info" if name == "lidar" else None
-        self._defaults = {"enabled": True, "refresh_hz": default_hz, "stale_after_s": 5.0}
-        if name == "lidar":
-            self._defaults["max_points"] = 6000
-        self._defaults.update(dict(config or {}))
-        self._settings = self._validate(self._defaults)
+        self._defaults = self._validate({**sensor_defaults(name), **dict(config or {})})
+        self._settings = dict(self._defaults)
         self._lock = threading.RLock()
         # Serializes bridge leases, but never blocks stop on an in-flight start.
         self._lease_lock = threading.Lock()
@@ -73,25 +74,11 @@ class ReadOnlyCard:
         self._thread = None
         self._cancel = None
         self._last_error = None
+        self._last_error_detail = None
         self._last_binary_sequence = None
 
     def _validate(self, settings):
-        result = {key: settings[key] for key in ("enabled", "refresh_hz", "stale_after_s")}
-        if not isinstance(result["enabled"], bool):
-            raise ValueError("enabled must be a boolean")
-        for key, minimum, maximum in (("refresh_hz", 0.1, 30.0), ("stale_after_s", 0.1, 300.0)):
-            value = result[key]
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{key} must be a finite number")
-            if not math.isfinite(value) or not minimum <= value <= maximum:
-                raise ValueError(f"{key} must be between {minimum} and {maximum}")
-            result[key] = float(value)
-        if self.name == "lidar":
-            value = settings.get("max_points", 6000)
-            if isinstance(value, bool) or not isinstance(value, int) or not 100 <= value <= 40000:
-                raise ValueError("max_points must be an integer between 100 and 40000")
-            result["max_points"] = value
-        return result
+        return validate_sensor_settings(self.name, settings)
 
     def _ports(self):
         ports = [{"topic": self.topic, "format": "sensor/pointcloud" if self.name == "lidar" else "data/json"}]
@@ -100,26 +87,24 @@ class ReadOnlyCard:
         return ports
 
     def get_tool(self):
-        properties = {
-            "enabled": {"type": "boolean", "title": "启用", "default": self._defaults["enabled"]},
-            "refresh_hz": {"type": "number", "title": "显示频率 (Hz)", "minimum": 0.1,
-                           "maximum": 30, "default": self._defaults["refresh_hz"],
-                           "description": "画布数据刷新频率，不是机器人控制频率。"},
-            "stale_after_s": {"type": "number", "title": "数据过期时间 (秒)", "minimum": 0.1,
-                              "maximum": 300, "default": self._defaults["stale_after_s"]},
-        }
-        if self.name == "lidar":
-            properties["max_points"] = {"type": "integer", "title": "最大显示点数", "minimum": 100,
-                                        "maximum": 40000, "default": self._defaults["max_points"]}
+        with self._lock:
+            config_schema = sensor_config_schema(self.name, self._settings)
+        properties = copy.deepcopy(config_schema["properties"])
+        routing = {"instance_id": {"type": "string", "minLength": 1, "pattern": r"\S", "description": "Internal card instance metadata."},
+                   "_tool_name": {"type": "string", "minLength": 1, "pattern": r"\S", "description": "Internal tool routing metadata."}}
         return {
             "name": self.name, "title": f"S10 Pro · {self.title}", "type": "sensor", "multiInstance": False,
-            "description": f"S10 Pro {self.title}只读数据；停止仅关闭本卡数据流，不控制机器人。",
+            "description": f"Read-only S10 Pro {self.title} data. Stopping releases only this card's data stream.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["info", "start", "stop", "status", "config"]},
-                **copy.deepcopy(properties),
-                "config": {"type": "object", "properties": copy.deepcopy(properties), "additionalProperties": False}},
-                "required": ["action"], "additionalProperties": False},
-            "configSchema": {"type": "object", "properties": properties, "additionalProperties": False},
+                "action": {"type": "string", "enum": ["info", "start", "stop", "status", "config"],
+                           "description": "Required operation; no action is selected by default."},
+                **properties, **routing, "config": copy.deepcopy(config_schema)},
+                "required": ["action"], "additionalProperties": False,
+                "allOf": [{"if": {"properties": {"action": {"enum": ["info", "status", "stop"]}},
+                                  "required": ["action"]},
+                           "then": {"not": {"anyOf": [{"required": [key]} for key in [*properties, "config"]]}}}]
+                    + config_overlap_constraints(properties)},
+            "configSchema": config_schema,
             "topic_in": [], "topic_out": self._ports(),
         }
 
@@ -132,7 +117,7 @@ class ReadOnlyCard:
             if not isinstance(snapshot, dict):
                 raise TypeError("bridge snapshot is not an object")
         except Exception as exc:
-            snapshot = {"error": str(exc)}
+            snapshot = {"error": "Sensor snapshot unavailable.", "diagnostic_error": str(exc)}
         data = snapshot.get("data")
         data = _json_value(data) if isinstance(data, dict) else None
         binary = snapshot.get("binary")
@@ -150,7 +135,8 @@ class ReadOnlyCard:
             "received": has_data,
             "received_at_ms": received_at, "age_s": age,
             "fresh": fresh, "stale": has_data and not fresh,
-            "stamp": stamp, "error": snapshot.get("error"),
+            "stamp": stamp, "error": "Sensor source unavailable." if snapshot.get("error") else None,
+            "diagnostic_error": snapshot.get("diagnostic_error", snapshot.get("error")),
             "sequence": snapshot.get("sequence", 0),
         }
         return data, source_info, binary
@@ -204,9 +190,10 @@ class ReadOnlyCard:
         try:
             status = self._bridge.status() or {}
             return {"reader_running": bool(status.get("reader_running", False)),
-                    "last_error": status.get("last_error")}
+                    "last_error": "Sensor reader unavailable." if status.get("last_error") else None,
+                    "diagnostic_error": status.get("last_error")}
         except Exception as exc:
-            return {"reader_running": False, "last_error": str(exc)}
+            return {"reader_running": False, "last_error": "Sensor reader status unavailable.", "diagnostic_error": str(exc)}
 
     def status(self):
         with self._lock:
@@ -218,25 +205,18 @@ class ReadOnlyCard:
             result.update(state=self._state, connected=active and payload["connected"],
                           enabled=self._settings["enabled"], read_only=True,
                           topic_in=[], topic_out=self._ports(), settings=dict(self._settings),
-                          last_error=self._last_error, reader=self._reader_status())
+                          last_error=self._last_error, diagnostic_error=self._last_error_detail, reader=self._reader_status())
             if self.name == "state":
                 result["capabilities"] = {"motion": dict(MOTION_CAPABILITY)}
             return result
 
-    @staticmethod
-    def _overrides(options):
-        overrides = dict(options or {})
-        overrides.pop("_tool_name", None)
-        overrides.pop("instance_id", None)
-        if isinstance(overrides.get("config"), dict):
-            overrides = {**overrides.pop("config"), **overrides}
-        return overrides
+    def _overrides(self, options):
+        return normalize_config_updates({} if options is None else options, sensor_defaults(self.name))
 
     def configure(self, options):
         overrides = self._overrides(options)
         with self._lock:
-            defaults = dict(self._defaults)
-            defaults.update({key: value for key, value in overrides.items() if key in defaults})
+            defaults = {**self._settings, **overrides}
             settings = self._validate(defaults)
             self._defaults, self._settings = defaults, settings
             self._config_revision += 1
@@ -270,7 +250,8 @@ class ReadOnlyCard:
                         if generation == self._generation:
                             self._generation += 1
                             self._cancel.set()
-                            self._state, self._last_error = "error", str(exc)
+                            self._state, self._last_error = "error", "Sensor reader unavailable."
+                            self._last_error_detail = str(exc)
                     try:
                         self._bridge.release(self.name)
                     except Exception:
@@ -280,9 +261,8 @@ class ReadOnlyCard:
 
     def start(self, options=None):
         overrides = self._overrides(options)
-        settings = dict(self._defaults)
-        settings.update({key: value for key, value in overrides.items() if key in settings})
-        settings = self._validate(settings)
+        with self._lock:
+            settings = self._validate({**self._settings, **overrides})
         with self._lock:
             if self._state in ("running", "starting"):
                 return self.status()
@@ -293,6 +273,7 @@ class ReadOnlyCard:
             self._generation += 1
             generation = self._generation
             self._state, self._last_error = "starting", None
+            self._last_error_detail = None
             self._cancel = cancel = threading.Event()
             self._last_binary_sequence = None
         with self._lease_lock:
@@ -320,7 +301,8 @@ class ReadOnlyCard:
                 self._lease_generation = None
                 with self._lock:
                     if generation == self._generation:
-                        self._state, self._last_error = "error", str(exc)
+                        self._state, self._last_error = "error", "Sensor reader unavailable."
+                        self._last_error_detail = str(exc)
             return self.status()
 
     def _release_through(self, stopped_generation):
@@ -330,7 +312,8 @@ class ReadOnlyCard:
                     self._bridge.release(self.name)
                 except Exception as exc:
                     with self._lock:
-                        self._last_error = str(exc)
+                        self._last_error = "Sensor stream operation failed."
+                        self._last_error_detail = str(exc)
                 self._lease_generation = None
 
     def stop(self, *, _expected_config_revision=None):
@@ -354,7 +337,8 @@ class ReadOnlyCard:
                         self._bridge.release(self.name)
                     except Exception as exc:
                         with self._lock:
-                            self._last_error = str(exc)
+                            self._last_error = "Sensor stream operation failed."
+                            self._last_error_detail = str(exc)
                     self._lease_generation = None
             finally:
                 self._lease_lock.release()
@@ -390,20 +374,24 @@ class ReadOnlyCard:
                     else:
                         self._publish(self.topic, "data/json", payload)
                     self._last_error = None
+                    self._last_error_detail = None
             except Exception as exc:
                 with self._lock:
                     if generation == self._generation:
-                        self._last_error = str(exc)
+                        self._last_error = "Sensor stream operation failed."
+                        self._last_error_detail = str(exc)
             cancel.wait(1.0 / self._settings["refresh_hz"])
 
     def dispatch(self, action, args):
         if action == "start":
             return self.start(args)
         if action == "stop":
+            validate_empty_arguments(args)
             return self.stop()
         if action == "config":
             return self.configure(args)
         if action in ("info", "status"):
+            validate_empty_arguments(args)
             return self.status()
         return None
 

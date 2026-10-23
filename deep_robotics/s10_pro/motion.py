@@ -10,8 +10,16 @@ import copy
 import math
 import threading
 import time
-import uuid
 from collections import deque
+
+try:
+    from .parameters import (motion_defaults, validate_motion_settings, motion_config_schema,
+        motion_action_schema, validate_motion_request, normalize_config_updates, validate_empty_arguments)
+    from .motion_tasks import MotionTasks
+except ImportError:
+    from parameters import (motion_defaults, validate_motion_settings, motion_config_schema,
+        motion_action_schema, validate_motion_request, normalize_config_updates, validate_empty_arguments)
+    from motion_tasks import MotionTasks
 
 
 ACTIONS = ('stand', 'lie', 'velocity', 'stopmotion')
@@ -61,16 +69,24 @@ class MotionPlugin:
 
     def __init__(self, config, namespace, backend=None, *, feedback=None, publish=None,
                  execution_authorized=False, clock=time.monotonic, wall_time=time.time,
-                 autostart_worker=True):
+                 autostart_worker=True, notifier=None, tasks=None):
         if not isinstance(execution_authorized, bool):
             raise ValueError('execution_authorized must be boolean')
         self._backend = backend or UnsupportedBackend()
         self._feedback = feedback
         self._publish = publish or (lambda *args: None)
         self._authorized = execution_authorized
+        self._notifier = notifier
+        self._tasks = tasks if tasks is not None else MotionTasks()
+        self._owns_tasks = tasks is None
+        self._tasks.recover_interrupted(wall_time)
+        self._worker = None
+        self._shutdown_done = False
+        self._cancel_reason = None
         self._clock, self._wall = clock, wall_time
         self._lock = threading.RLock()
         self._io_lock = threading.Lock()
+        self._notification_lock = threading.Lock()
         self._busy = threading.Lock()
         self._cancel = threading.Event()
         self._closed = threading.Event()
@@ -81,11 +97,9 @@ class MotionPlugin:
         self._last_command = clock()
         self._last = None
         self._events = deque(maxlen=64)
-        self._used_ids = deque(maxlen=128)
         self._error = None
         self._last_tick = clock()
-        self._settings = self._validate({'enabled': False, 'refresh_hz': 2., 'max_duration_s': 2.,
-            'action_timeout_s': 8., 'max_vx': .2, 'max_vy': .1, 'max_yaw_rate': .2, **dict(config or {})})
+        self._settings = self._validate(config or {})
         base = '/' + '/'.join(p for p in (str(namespace).strip('/'), 's10_pro') if p)
         self.status_topic, self.events_topic = base + '/motion_status', base + '/motion_events'
         self._thread = threading.Thread(target=self._monitor, name='s10-motion-watchdog', daemon=True)
@@ -94,45 +108,21 @@ class MotionPlugin:
 
     @staticmethod
     def _validate(settings):
-        allowed = {'enabled', 'refresh_hz', 'max_duration_s', 'action_timeout_s', 'max_vx', 'max_vy', 'max_yaw_rate'}
-        if set(settings) - allowed or not isinstance(settings.get('enabled'), bool):
-            raise ValueError('unsupported motion settings')
-        result = dict(settings)
-        for key, low, high in [('refresh_hz', .5, 10), ('max_duration_s', .1, 5),
-                ('action_timeout_s', .2, 15), ('max_vx', .01, .3), ('max_vy', .01, .15), ('max_yaw_rate', .01, .3)]:
-            result[key] = _number(result.get(key), low, high, key)
-        return result
+        return validate_motion_settings(settings)
 
     def _ports(self):
         return [{'topic': self.status_topic, 'format': 'data/json'}, {'topic': self.events_topic, 'format': 'data/json'}]
 
     def get_tool(self):
-        props = {
-            'action': {'type': 'string', 'enum': ['info', 'start', 'stop', 'status', 'config', *ACTIONS]},
-            'vx': {'type': 'number', 'minimum': -.3, 'maximum': .3, 'title': '前后速度 (m/s)', 'default': 0},
-            'vy': {'type': 'number', 'minimum': -.15, 'maximum': .15, 'title': '横向速度 (m/s)', 'default': 0},
-            'yaw_rate': {'type': 'number', 'minimum': -.3, 'maximum': .3, 'title': '转向速度 (rad/s)', 'default': 0},
-            'duration': {'type': 'number', 'minimum': .1, 'maximum': 5, 'default': 1, 'title': '持续秒数'},
-            'request_id': {'type': 'string', 'maxLength': 128},
-            'issued_at_ms': {'type': 'integer', 'description': '请求生成时间；过期请求被拒绝。'},
-            'ttl_ms': {'type': 'integer', 'minimum': 100, 'maximum': 2000, 'default': 1000},
-        }
-        settings = {'enabled': {'type': 'boolean', 'default': False, 'title': '启用卡片状态',
-            'description': '只开启卡片状态；不能解锁真机执行。'}}
-        for key, low, high, title in [('refresh_hz', .5, 10, '状态频率 (Hz)'),
-                ('max_duration_s', .1, 5, '最长移动时间 (秒)'), ('action_timeout_s', .2, 15, '动作确认超时 (秒)'),
-                ('max_vx', .01, .3, '前后限速 (m/s)'), ('max_vy', .01, .15, '横向限速 (m/s)'),
-                ('max_yaw_rate', .01, .3, '转向限速 (rad/s)')]:
-            settings[key] = {'type': 'number', 'minimum': low, 'maximum': high, 'default': self._settings[key], 'title': title}
-        return {'name': self.name, 'title': 'S10 Pro · 基础动作', 'type': 'actuator', 'multiInstance': False,
-            'description': '起立、趴下、限时速度与停止。当前真机执行锁定；发出请求不等于动作完成。停止不是硬急停。',
-            'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'], 'additionalProperties': False,
-                'x-action-params': {'stand': {'params': [], 'description': '起立并等待新鲜状态确认'},
-                    'lie': {'params': [], 'description': '趴下并等待新鲜状态确认'},
-                    'velocity': {'params': ['vx', 'vy', 'yaw_rate', 'duration'], 'description': '限时移动，到期零速并确认停止'},
-                    'stopmotion': {'params': [], 'description': '取消本方动作并请求停止；不是硬急停'}}},
-            'configSchema': {'type': 'object', 'properties': settings, 'additionalProperties': False},
-            'topic_in': [], 'topic_out': self._ports()}
+        with self._lock:
+            schema = motion_action_schema(self._settings)
+            schema['x-completion'] = {'actions': ['stand', 'lie', 'velocity'],
+                'timeout': 90, 'silent_completion': False}
+            schema['x-resource'] = 'base'
+            return {'name': self.name, 'title': 'Basic Motion', 'type': 'actuator', 'multiInstance': False,
+                'description': 'Stand, lie down, finite velocity and application stop. Physical execution remains locked. Accepted tasks complete through ACP; application stop is not a hardware emergency stop.',
+                'inputSchema': schema, 'configSchema': motion_config_schema(self._settings),
+                'topic_in': [], 'topic_out': self._ports()}
 
     def get_tools(self):
         return [self.get_tool()]
@@ -154,6 +144,8 @@ class MotionPlugin:
             missing.append('robot_control_contract')
         if self._feedback is None:
             missing.append('fresh_feedback_adapter')
+        if self._notifier is None:
+            missing.append('acp_notifier')
         return missing
 
     def _authority_ok(self):
@@ -197,10 +189,11 @@ class MotionPlugin:
                     'protocol_implemented': 'S10 software guide V1.0.2',
                     'production_backend': 'unbound',
                     'missing_evidence': self._contract().get('missing', []),
-                    'explanation': '需确认本机适用版本、控制权与失联停止规则；界面启用不会解除执行锁。',
+                    'explanation': 'Robot version, control ownership and loss-of-command stopping remain unverified. Canvas settings cannot authorize execution.',
                     **diagnostics},
                 'settings': dict(self._settings), 'active_request': copy.deepcopy(self._active),
                 'last_result': copy.deepcopy(self._last), 'last_error': self._error,
+                'completion_delivery': self._delivery_status(),
                 'topic_in': [], 'topic_out': self._ports(), 'supported_actions': list(ACTIONS),
                 'stop_semantics': 'application_stop_not_emergency_stop', 'events': list(self._events)}
 
@@ -225,27 +218,61 @@ class MotionPlugin:
         return {**self.status(), 'cancellation': result}
 
     def close(self):
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         self._closed.set()
         self.stop()
-        if self._thread.ident is not None and self._thread is not threading.current_thread():
-            self._thread.join(1)
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(2)
         if hasattr(self._backend, 'close'):
             self._backend.close()
+        if worker is not None and worker is not threading.current_thread() and worker.is_alive():
+            worker.join(1)
+        if self._thread.ident is not None and self._thread is not threading.current_thread():
+            self._thread.join(1)
+        self._flush_notifications()
+        if self._owns_tasks and (worker is None or not worker.is_alive()):
+            self._tasks.close()
 
     def configure(self, options):
-        options = {k: v for k, v in options.items() if k not in ('instance_id', '_tool_name')}
-        if isinstance(options.get('config'), dict):
-            options = {**options.pop('config'), **options}
+        updates = normalize_config_updates(options, motion_defaults())
         with self._lock:
-            updated = self._validate({**self._settings, **options})
+            updated = self._validate({**self._settings, **updates})
             active = self._active is not None
             self._generation += 1
             self._settings = updated
-            if active:
-                self._cancel.set()
         if active:
             self.cancel('configuration_changed')
         return self.status()
+
+    def _delivery_status(self):
+        if self._notifier is None:
+            return {'delivery_state': 'unavailable', 'acknowledged': False}
+        task = self._active or self._last
+        if task is None:
+            return {'delivery_state': 'idle', 'acknowledged': False}
+        try:
+            return self._notifier.status(task['action_id'])
+        except Exception:
+            return {'delivery_state': 'status_unavailable', 'acknowledged': False}
+
+    def _flush_notifications(self):
+        if self._notifier is None or not self._notification_lock.acquire(blocking=False):
+            return
+        try:
+            for record in self._tasks.pending_notifications():
+                result = record['result']
+                payload = {'action_id': record['action_id'], 'request_id': record['request_id'],
+                    'status': result['status'], 'result': result, 'tool': 'motion', 'ts': result['finished_at']}
+                try:
+                    self._notifier.submit(payload)
+                    self._tasks.mark_enqueued(record['request_id'])
+                except Exception:
+                    self._error = 'completion_enqueue_failed_retained_for_retry'
+        finally:
+            self._notification_lock.release()
 
     def _stop_backend(self, reason, *, request_id, authority_lost=False):
         if self._gate(for_stop=True):
@@ -271,18 +298,24 @@ class MotionPlugin:
             self._io_lock.release()
 
     def cancel(self, reason='user_stop'):
-        self._cancel.set()  # Priority over ordinary requests, before any locks.
+        # This lock never surrounds transport I/O. The action worker owns stop
+        # and the sole terminal commit; the caller never waits for feedback.
         with self._lock:
-            self._generation += 1
-            self._cancel.set()
             active = copy.deepcopy(self._active)
-        if active is None:
-            return {'accepted': False, 'confirmed': False, 'completed': False, 'reason': 'no_application_motion'}
-        receipt = self._stop_backend(reason, request_id=active['request_id'], authority_lost=not self._authority_ok())
-        self._event('cancel_requested', request_id=active['request_id'], reason=reason,
-                    stop_accepted=receipt.get('accepted'), stop_confirmed=False)
-        return {'accepted': receipt.get('accepted'), 'confirmed': False, 'completed': False,
-                'request_id': active['request_id'], 'reason': reason}
+            if active is None:
+                return {'accepted': False, 'confirmed': False, 'completed': False,
+                        'reason': 'no_application_motion'}
+            first = not self._cancel.is_set()
+            self._cancel.set()
+            if first:
+                self._cancel_reason = reason
+                self._generation += 1
+                self._event('cancel_requested', request_id=active['request_id'],
+                    original_action_id=active['action_id'], reason=reason, stop_confirmed=False)
+            return {'accepted': True, 'confirmed': False, 'completed': False,
+                'state': 'cancellation_requested', 'request_id': active['request_id'],
+                'original_action_id': active['action_id'], 'reason': self._cancel_reason,
+                'stop_confirmed': False}
 
     def _confirmation(self, action, request_id, after):
         try:
@@ -298,85 +331,132 @@ class MotionPlugin:
         except Exception:
             return False
 
+    @staticmethod
+    def _receipt(record, replayed=False):
+        if record['result'] is not None:
+            # Returning action_id here would make Core register a fresh pending
+            # after the original barrier has reaped it. Keep identity nested.
+            result = copy.deepcopy(record['result'])
+            result['original_action_id'] = result.pop('action_id')
+            return {**result, 'replayed': True, 'terminal': True}
+        return {'action_id': record['action_id'], 'request_id': record['request_id'],
+                'action': record['request']['action'], 'accepted': True,
+                'confirmed': False, 'completed': False, 'stop_confirmed': False,
+                'state': 'accepted', 'status': 'running', 'replayed': replayed}
+
     def execute(self, action, arguments):
         if action not in ('stand', 'lie', 'velocity'):
-            raise ValueError('unsupported motion action')
+            raise ValueError('Unsupported motion action')
         with self._lock:
+            settings, generation = dict(self._settings), self._generation
+            request = validate_motion_request(action, arguments, settings, self._wall, check_freshness=False)
+            if self._closed.is_set():
+                return {'accepted': False, 'confirmed': False, 'completed': False,
+                        'state': 'unavailable', 'blocked_by': ['controller_closed']}
+            previous = self._tasks.get(request['request_id'])
+            if previous:
+                if self._tasks.fingerprint(request) != previous['fingerprint']:
+                    raise ValueError('request_id already belongs to a different motion target')
+                return self._receipt(previous, replayed=True)
+            # Only first acceptance is subject to request TTL. Replays keep the
+            # original identity even when their original acceptance TTL elapsed.
+            request = validate_motion_request(action, {**arguments, 'request_id': request['request_id']},
+                                              settings, self._wall)
             missing = self._gate()
-            if missing or not self._started or not self._settings['enabled']:
+            if missing or not self._started or not settings['enabled']:
                 return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'unavailable',
-                        'blocked_by': missing + ([] if self._started and self._settings['enabled'] else ['card_not_enabled'])}
-            generation = self._generation
-        values = {k: v for k, v in arguments.items() if k not in ('_tool_name', 'instance_id')}
-        allowed = {'request_id', 'issued_at_ms', 'ttl_ms'} | ({'vx', 'vy', 'yaw_rate', 'duration'} if action == 'velocity' else set())
-        if set(values) - allowed:
-            raise ValueError('unsupported motion parameters')
-        now_ms = self._wall() * 1000
-        issued = _number(values.get('issued_at_ms', now_ms), 0, 1e15, 'issued_at_ms')
-        ttl = _number(values.get('ttl_ms', 1000), 100, 2000, 'ttl_ms')
-        if now_ms - issued > ttl or issued > now_ms + 100:
-            raise ValueError('stale or future motion request')
-        rid = values.get('request_id', uuid.uuid4().hex)
-        if not isinstance(rid, str) or not rid.strip() or len(rid) > 128:
-            raise ValueError('invalid request_id')
-        duration = (_number(values.get('duration', min(1, self._settings['max_duration_s'])), .1,
-                            self._settings['max_duration_s'], 'duration') if action == 'velocity' else 0)
-        request = {'request_id': rid, 'action': action, 'duration': duration}
-        if action == 'velocity':
-            for key, limit in [('vx', self._settings['max_vx']), ('vy', self._settings['max_vy']), ('yaw_rate', self._settings['max_yaw_rate'])]:
-                request[key] = _number(values.get(key, 0), -limit, limit, key)
-        if not self._busy.acquire(blocking=False):
-            return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'busy'}
-        receipt, confirmed, stop_confirmed, reason = {'accepted': None}, False, False, 'feedback_timeout'
-        started = self._clock()
-        deadline = started + (duration if action == 'velocity' else self._settings['action_timeout_s'])
-        request['expires_monotonic'] = deadline
-        result = None
+                        'blocked_by': missing + ([] if self._started and settings['enabled'] else ['card_not_enabled'])}
+            if not self._control_ok():
+                return {'accepted': False, 'confirmed': False, 'completed': False,
+                        'state': 'unavailable', 'blocked_by': ['fresh_control_authority']}
+            if not self._busy.acquire(blocking=False):
+                return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'busy'}
+            if generation != self._generation or not self._started or self._closed.is_set():
+                self._busy.release()
+                return {'accepted': False, 'confirmed': False, 'completed': False,
+                        'state': 'cancelled', 'reason': 'lifecycle_changed'}
+            try:
+                record, replayed = self._tasks.accept(request)
+            except Exception:
+                self._busy.release()
+                raise
+            if replayed:
+                self._busy.release()
+                return self._receipt(record, replayed=True)
+            started = self._clock()
+            request['expires_monotonic'] = started + (request['duration'] if action == 'velocity' else settings['action_timeout_s'])
+            self._cancel, self._cancel_reason = threading.Event(), None
+            self._active = {**request, 'action_id': record['action_id'], 'started_monotonic': started}
+            self._last_command, self._phase = started, 'active'
+            receipt = self._receipt(record)
+            self._worker = threading.Thread(target=self._run_action,
+                args=(record, request, started), name='s10-action-' + record['action_id'], daemon=True)
+            self._event('requested', request_id=request['request_id'], action_id=record['action_id'], action=action)
+            try:
+                self._worker.start()
+            except Exception:
+                result = {'request_id': request['request_id'], 'action_id': record['action_id'],
+                    'action': action, 'status': 'error', 'state': 'error', 'accepted': True,
+                    'confirmed': False, 'stop_confirmed': False, 'completed': False,
+                    'reason': 'action_worker_start_failed', 'finished_at': self._wall()}
+                self._tasks.finish(request['request_id'], result)
+                self._last, self._active, self._phase = result, None, 'error'
+                self._busy.release()
+        self._flush_notifications()
+        return receipt
+
+    def _wait_for_stop(self, reason, request_id, interval):
+        with self._lock:
+            if self._active and self._active['request_id'] == request_id:
+                self._phase = 'stopping'
+        after = self._clock()
+        receipt = self._stop_backend(reason, request_id=request_id, authority_lost=not self._authority_ok())
+        deadline, next_send = self._clock() + 1., self._clock() + interval
+        while self._clock() < deadline and receipt.get('reason') != 'authority_released':
+            if self._confirmation('stopmotion', request_id, after):
+                return True
+            if self._clock() >= next_send:
+                receipt = self._stop_backend(reason, request_id=request_id, authority_lost=not self._authority_ok())
+                next_send = self._clock() + interval
+            time.sleep(.02)
+        return False
+
+    def _run_action(self, record, request, started):
+        action, rid = request['action'], request['request_id']
+        deadline = request['expires_monotonic']
+        receipt, confirmed, stop_confirmed = {'accepted': None}, False, False
+        reason, stop_attempted = 'feedback_timeout', False
+        interval = .1
         try:
-            with self._lock:
-                if generation != self._generation or not self._started or not self._settings['enabled'] or self._gate():
-                    return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'cancelled', 'reason': 'lifecycle_changed'}
-                if rid in self._used_ids:
-                    raise ValueError('duplicate request_id')
-                self._used_ids.append(rid)
-                self._cancel = threading.Event()
-                self._active = {**request, 'started_monotonic': started}
-                self._last_command = started
-                self._phase = 'active'
-            self._event('requested', request_id=rid, action=action)
-            next_send = started
             contract = self._contract()
-            refresh_interval = min(.1, (contract['robot_deadman_s'] - contract['send_timeout_s']) / 3)
+            interval = min(.1, (contract['robot_deadman_s'] - contract['send_timeout_s']) / 3)
+            next_send = started
             while self._clock() < deadline:
                 if self._cancel.is_set():
-                    reason = 'cancelled'
+                    reason = self._cancel_reason or 'cancelled'
                     break
                 if not self._control_ok():
                     reason = 'authority_unavailable'
-                    self._cancel.set()
                     break
                 if self._clock() >= next_send:
                     with self._io_lock:
-                        if self._cancel.is_set() or not self._control_ok():
-                            reason = 'cancelled'
+                        if self._cancel.is_set() or not self._control_ok() or not self._started:
+                            reason = self._cancel_reason or 'authority_unavailable'
                             break
-                        if not self._started or (not self._active or self._active['request_id'] != rid):
-                            reason = 'cancelled'
-                            break
-                        if not self._used_ids or (self._wall() * 1000 > issued + ttl and next_send == started):
+                        if next_send == started and self._wall() * 1000 > request['issued_at_ms'] + request['ttl_ms']:
                             reason = 'stale_request'
                             break
+                        if self._clock() >= deadline:
+                            reason = 'action_deadline_expired'
+                            break
                         receipt = self._backend.send(action, request, self._cancel)
-                        with self._lock:
-                            self._last_command = self._clock()
+                        self._last_command = self._clock()
                     if receipt.get('accepted') is False:
                         reason = 'rejected'
                         break
-                    if action != 'velocity':
-                        next_send = float('inf')
-                    else:
-                        next_send = self._clock() + refresh_interval
-                    self._event('sent', request_id=rid, accepted=receipt.get('accepted'), confirmed=False)
+                    next_send = self._clock() + interval if action == 'velocity' else float('inf')
+                    self._event('sent', request_id=rid, action_id=record['action_id'],
+                                command_accepted=receipt.get('accepted'), confirmed=False)
                 if self._confirmation(action, rid, started):
                     confirmed = True
                     if action != 'velocity':
@@ -387,74 +467,98 @@ class MotionPlugin:
                         if not self._cancel.is_set() and self._control_ok() and self._clock() < deadline:
                             advanced = self._backend.progress(action, request, self._cancel)
                             if advanced is not None:
-                                if advanced.get('accepted') is False:
+                                receipt = advanced
+                                if receipt.get('accepted') is False:
                                     reason = 'rejected'
                                     break
-                                receipt = advanced
                 self._cancel.wait(.02)
-            if action == 'velocity' and not self._cancel.is_set() and self._clock() >= deadline:
-                reason = 'duration_elapsed'
-            if action == 'velocity' or not confirmed:
-                stop_after = self._clock()
-                stop_receipt = self._stop_backend(reason, request_id=rid, authority_lost=not self._authority_ok())
-                stop_deadline = self._clock() + 1.
-                next_stop = self._clock() + refresh_interval
-                while self._clock() < stop_deadline and stop_receipt.get('reason') != 'authority_released':
-                    if self._confirmation('stopmotion', rid, stop_after):
-                        stop_confirmed = True
-                        break
-                    if self._clock() >= next_stop:
-                        stop_receipt = self._stop_backend(reason, request_id=rid, authority_lost=not self._authority_ok())
-                        next_stop = self._clock() + refresh_interval
-                    time.sleep(.02)
-                # A cancelled posture must never be reported as successful posture.
-                if action != 'velocity':
-                    confirmed = False
-            completed = confirmed and reason in ('feedback_confirmed', 'duration_elapsed') and (action != 'velocity' or stop_confirmed)
-            result = {'request_id': rid, 'accepted': receipt.get('accepted'), 'confirmed': confirmed,
-                'stop_confirmed': stop_confirmed, 'completed': completed,
-                'state': 'completed' if completed else 'cancelled' if reason == 'cancelled' else 'failed',
-                'reason': reason, 'action': action}
+            else:
+                # Only a natural deadline exit completes a finite velocity.
+                # A rejected send or lost authority can also advance time past
+                # the deadline; retain its failure instead of hiding it.
+                if action == 'velocity':
+                    reason = 'duration_elapsed'
+            if action == 'velocity' or not confirmed or self._cancel.is_set():
+                stop_confirmed = self._wait_for_stop(reason, rid, interval)
+                stop_attempted = True
         except Exception as exc:
-            self._cancel.set()
-            self._stop_backend('execution_failed', request_id=rid, authority_lost=not self._authority_ok())
-            result = {'request_id': rid, 'accepted': receipt.get('accepted'), 'confirmed': False,
-                'completed': False, 'state': 'failed', 'reason': type(exc).__name__, 'action': action}
+            reason = 'execution_failed_' + type(exc).__name__
+            confirmed = False
+            try:
+                stop_confirmed = self._wait_for_stop(reason, rid, interval)
+            except Exception:
+                stop_confirmed = False
+            stop_attempted = True
         finally:
-            with self._lock:
-                if result is not None:
-                    self._last, self._phase = result, result['state'] if self._started else 'idle'
-                self._active = None
+            # Cancel and completion compete at this one commit lock. A late
+            # cancellation first gets a real stop attempt, never a fake success.
+            while True:
+                with self._lock:
+                    need_stop = self._cancel.is_set() and not stop_attempted
+                    if not need_stop:
+                        cancelled = self._cancel.is_set()
+                        if cancelled:
+                            reason = self._cancel_reason or 'cancelled'
+                        completed = (not cancelled and confirmed
+                            and reason in ('feedback_confirmed', 'duration_elapsed')
+                            and (action != 'velocity' or stop_confirmed))
+                        status = ('completed' if completed else 'cancelled'
+                                  if cancelled and stop_confirmed else 'error')
+                        if (cancelled or action == 'velocity') and not stop_confirmed:
+                            reason += '_stop_unconfirmed'
+                        result = {'request_id': rid, 'action_id': record['action_id'], 'action': action,
+                            'accepted': True, 'command_accepted': receipt.get('accepted'),
+                            'confirmed': confirmed and not cancelled, 'stop_confirmed': stop_confirmed,
+                            'completed': completed, 'state': status, 'status': status,
+                            'reason': reason, 'finished_at': self._wall()}
+                        try:
+                            if self._tasks.finish(rid, result):
+                                self._last = result
+                                self._phase = status if self._started else 'idle'
+                                self._event('finished', **result)
+                        except Exception:
+                            self._error = 'terminal_record_failed_restart_recovery_required'
+                        self._active = None
+                        break
+                stop_confirmed = self._wait_for_stop(self._cancel_reason or 'cancelled', rid, interval)
+                stop_attempted = True
+            try:
                 if hasattr(self._backend, 'finish'):
                     self._backend.finish(rid)
                 if not self._started and hasattr(self._backend, 'stop_observation'):
                     self._backend.stop_observation()
-                if result is not None:
-                    self._event('finished', **result)
-            self._busy.release()
-        return copy.deepcopy(result)
+            finally:
+                self._busy.release()
+            self._flush_notifications()
 
     def dispatch(self, action, args):
         if action in ('info', 'status'):
+            validate_empty_arguments(args)
             return self.status()
         if action == 'start':
+            updates = normalize_config_updates(args, motion_defaults())
+            if updates:
+                self.configure(updates)
             return self.start()
         if action == 'stop':
+            validate_empty_arguments(args)
             return self.stop()
         if action == 'config':
             return self.configure(args)
         if action == 'stopmotion':
+            validate_motion_request(action, args, self._settings, self._wall)
             return self.cancel()
         return self.execute(action, args)
 
     def _monitor(self):
         while not self._closed.wait(.05):
+            self._flush_notifications()
             now = self._clock()
             with self._lock:
                 active = self._active is not None
                 started = self._started
                 overdue = now - self._last_tick > .5
-                if active and self._active['action'] == 'velocity':
+                if active and self._active['action'] == 'velocity' and self._phase == 'active':
                     overdue = overdue or now - self._last_command > self._contract().get('robot_deadman_s', .3) / 2
                 self._last_tick = now
             if active and (overdue or not self._control_ok()):

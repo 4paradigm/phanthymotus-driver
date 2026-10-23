@@ -17,9 +17,11 @@ from device import build_plugins
 from motion import MotionPlugin
 from motion_backend import DDSMotionBackend
 from motion_process import DDSProcessTransport
+from motion_tasks import MotionTasks
+from acp import ACPNotifier
 
 
-def build_runtime_plugins(config, namespace, bridge, publish):
+def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, tasks=None):
     """Build sensors and the motion UI without opening a control connection.
 
     The motion backend stays unsupported until this robot's complete control
@@ -30,7 +32,8 @@ def build_runtime_plugins(config, namespace, bridge, publish):
     transport = DDSProcessTransport(config, execution_enabled=False)
     motion_backend = DDSMotionBackend(bridge, transport, execution_authorized=False)
     plugins.append(MotionPlugin(config.get("motion", {}), namespace, backend=motion_backend,
-                                feedback=motion_backend.feedback, publish=publish, execution_authorized=False))
+                                feedback=motion_backend.feedback, publish=publish, execution_authorized=False,
+                                notifier=notifier, tasks=tasks))
     return plugins
 
 
@@ -113,7 +116,13 @@ def main():
     namespace = resolve_namespace(config)
     bus = PlatformBus(domain)
     bridge = ReaderBridge(config, config_path)
-    bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish))
+    # Driver-only persistent state; never shares the Core database or credentials.
+    state = Path(os.environ.get("S10_STATE_DIR", "/work/state"))
+    tasks = MotionTasks(state / "motion-tasks.sqlite3")
+    notifier = ACPNotifier(state / "acp-outbox.sqlite3")
+    notifier.start()
+    bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish,
+                                               notifier=notifier, tasks=tasks))
     port = int(os.environ.get("MCP_PORT", config["mcp_port"]))
     server = ThreadingHTTPServer((str(config.get("bind_host", "127.0.0.1")), port),
                                  make_handler(lambda: bundle, "s10-pro-bundle", "deep-robotics-s10-pro-driver"))
@@ -141,6 +150,8 @@ def main():
         bridge.close()
         server.server_close()
         bus.close()
+        notifier.close()
+        tasks.close()
 
 
 if __name__ == "__main__":

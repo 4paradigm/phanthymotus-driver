@@ -63,7 +63,7 @@ class DDSMotionBackend:
             production_backend='dds_sequencer_locked', observation_active=self._observing,
             command_worker_running=self._transport_running(),
             control_ownership_inferred=False,
-            explanation='ROS 2 高层接口已适配，无需 TLS；仍需核实控制权、导航模式和失联停止规则。')
+            explanation='High-level ROS 2 DDS is implemented without TLS. Control ownership, navigation mode and loss-of-command stopping still require verification.')
         return result
 
     def _transport_running(self):

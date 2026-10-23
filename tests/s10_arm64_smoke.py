@@ -21,8 +21,8 @@ sys.path.insert(0, str(ROOT / "deep_robotics/s10_pro"))
 
 
 def run():
-    if {name for _, name in socket.if_nameindex()} - {"lo"}:
-        raise RuntimeError("synthetic ROS smoke test requires Docker --network none")
+    from s10_network_isolation import require_loopback_network
+    require_loopback_network()
     from bridge import ReaderBridge, reader_environment
     from device import build_plugins
     from main import PlatformBus, validate_platform_profile
