@@ -1,0 +1,2 @@
+# Official dataset v3 writer and reader, Apache-2.0; imported only during export.
+lerobot==0.4.4

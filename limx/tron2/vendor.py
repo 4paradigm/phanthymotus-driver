@@ -114,6 +114,7 @@ class RobotReader:
         self.serial = settings['serial'] or None
         self.info = self.joints = None
         self.info_at = self.joints_at = None
+        self.joints_query_started = None
         self.info_received = self.joints_received = None
         self.last_error = None
         self.last_round_trip = None
@@ -124,6 +125,18 @@ class RobotReader:
         self._pose_servo = None
         self._pose_feedback_leases = set()
         self._joint_poll_wake = None  # Create on the reader's running loop.
+        self.teaching_observer = None
+        self._teaching_feedback = False
+
+    @contextmanager
+    def teaching_feedback(self):
+        self._teaching_feedback = True
+        if self._joint_poll_wake is not None:
+            self._joint_poll_wake.set()
+        try:
+            yield
+        finally:
+            self._teaching_feedback = False
 
     @contextmanager
     def pose_feedback(self):
@@ -145,6 +158,8 @@ class RobotReader:
 
     def joint_poll_interval(self):
         normal = self.settings['poll_interval_seconds']
+        if self.teaching_observer is not None or self._teaching_feedback:
+            return min(normal, .02)
         return min(normal, POSE_JOINT_POLL_SECONDS) if self._pose_feedback_leases else normal
 
     async def _wait_for_joint_poll(self, started):
@@ -176,6 +191,7 @@ class RobotReader:
                 future.set_exception(MoveError('Head connection lost; result unknown, do not retry', None))
         self.info = self.joints = None
         self.info_at = self.joints_at = None
+        self.joints_query_started = None
         self.info_received = self.joints_received = None
         self.last_round_trip = None
         self.last_error = reason
@@ -258,8 +274,13 @@ class RobotReader:
             data = joint_state(body.get('data'))
             self.joints = data
             self.joints_at, self.joints_received = time.monotonic(), time.time()
+            # Host-monotonic bounds of the read-only feedback query. The vendor
+            # timestamp remains opaque and is never converted to an age.
+            self.joints_query_started = started
             self.last_round_trip = self.joints_at - started
             self.last_error = None
+            if self.teaching_observer is not None:
+                self.teaching_observer(data, time.monotonic_ns())
             return
 
     async def send_movej(self, q, move_time):
@@ -387,7 +408,7 @@ class RobotReader:
     async def send_pose_servoj(self, q, token):
         if token is not self._pose_servo or token.get('error'):
             raise MoveError((token or {}).get('error') or 'Pose ServoJ owner changed',False,'trajectory_vendor_fault')
-        if not isinstance(q,list) or len(q)!=16 or q[14:]!=[0.,0.]:
+        if not isinstance(q,list) or len(q)!=16 or q[14:]!=token.get('head_q',[0.,0.]):
             raise MoveError('Pose ServoJ requires 14 arm joints and centered head',False)
         validate_movej(q[:14],.1)
         if not self.connected or self.ws is not token['ws'] or self.serial!=token['serial'] or self.ws.closed:
@@ -458,6 +479,8 @@ class RobotReader:
             raise ValueError('Unknown sensor')
         info_card = name != 'joint_state'
         at = self.info_at if info_card else self.joints_at
+        query_started = None if info_card else self.joints_query_started
+        round_trip = None if info_card else self.last_round_trip
         received = self.info_received if info_card else self.joints_received
         age = None if at is None else max(0, time.monotonic() - at)
         available = self.connected and age is not None \
@@ -474,7 +497,10 @@ class RobotReader:
                 raise ValueError('Unknown sensor')
         return {'schema_version': 1, 'accid': self.serial, 'read_only': True, 'connected': self.connected,
                 'available': available, 'sample_status': status,
-                'received_at': received, 'reception_age_seconds': age,
+                'received_at': received, 'received_monotonic': at,
+                'query_started_monotonic': query_started,
+                'query_round_trip_seconds': round_trip,
+                'reception_age_seconds': age,
                 'measurement_time_verified': False, 'data': data}
 
     async def run(self, session):

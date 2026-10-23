@@ -1,2 +1,4 @@
 aiohttp>=3.10.11,<4
 PyYAML>=6.0.2,<7
+# Vendor replay runtime, Apache-2.0, pinned to the real-device trial revision.
+tron2-env @ https://codeload.github.com/limxdynamics/tron2_env/tar.gz/d38b6258f4c5a9607a231da1771e96cd1bdbccec#sha256=4f24783e11e871ce5fa997ce69cb3bfad00693f226b3269f66c6b7f31259d72e
