@@ -362,6 +362,53 @@ def _phase_leg(plant, parallel_after_m):
     return PhaseLeg
 
 
+def test_target_turns_first_for_a_large_bearing(monkeypatch):
+    clock = [0.0]
+    commands = []
+    frozen_seen = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            commands.append((vx, vyaw))
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+        def observe(self, joints, quaternion, now, frozen=False):
+            frozen_seen.append(frozen)
+            self.velocity = [0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.0, 0.5)   # bearing 90 deg left
+    driving = [(vx, vyaw) for vx, vyaw in commands if vx or vyaw]
+    assert driving, commands
+    # The first motion is an in-place left turn, not a forward arc.
+    assert driving[0] == (0.0, pytest.approx(0.8))
+    assert any(frozen_seen)  # the leg is frozen while turning in place
+    assert result['state'] in ('error', 'stopped', 'done')
+
+
 def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     clock = [0.0]
     commands = []

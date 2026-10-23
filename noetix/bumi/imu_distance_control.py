@@ -180,6 +180,11 @@ def lateral_limit(distance_m):
 # error leaves a small band.
 HEADING_BAND_DEG = 1.5
 HEADING_PULSE = 0.5
+# target action heading strategy: turn first for a large bearing error, then
+# walk with the pulse hold; realign in place if the heading drifts while walking.
+TARGET_TURN_FIRST_DEG = 45.0
+TARGET_TURN_DONE_DEG = 10.0
+TARGET_REALIGN_DEG = 60.0
 # The sideways gait couples strongly into yaw: the right 1 m run kept turning
 # right even with a continuous +0.5 left command, so sideways moves get more
 # authority. Measured response to a 0.5 pulse is ~19 deg/s while walking.
@@ -460,6 +465,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     closest, progress_at = target_distance, started
     last_joints = None
     joint_updates = 0
+    walking = None
     samples, commands = [], []
 
     def publish(vx, vyaw=0):
@@ -495,9 +501,13 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                 raise ValueError('target calibration timed out')
             estimator.observe(raw, now)
             if leg is not None:
-                # Keep integrating through the stop: the coast after the
-                # brake is real travel and must be in the reported endpoint.
-                leg.observe(joints, raw.ori, now)
+                # Turning in place is not travel: freeze the leg position during
+                # turn-first/realign phases and let the first walking sample
+                # re-establish the baseline. Braking still integrates (the stop
+                # slide is real travel and must be in the reported endpoint).
+                turning = (motion_started is not None and walking is not True
+                           and brake_started is None)
+                leg.observe(joints, raw.ori, now, frozen=turning)
                 values = joint_angles(joints)
                 if values != last_joints:
                     last_joints, joint_updates = values, joint_updates+1
@@ -536,6 +546,8 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
             bearing = math.atan2(to_y, to_x)
             heading = angle_delta(estimator.yaw, origin_yaw)
             heading_error = angle_delta(bearing, heading)
+            if walking is None:
+                walking = abs(math.degrees(bearing)) <= TARGET_TURN_FIRST_DEG
             if brake_started is None:
                 if now-motion_started > time_limit:
                     raise ValueError('target move time limit reached')
@@ -549,20 +561,24 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     brake_started = now
                 else:
                     err_deg = math.degrees(heading_error)
-                    if err_deg < -20.0:
-                        turn = -0.8
-                    elif err_deg < -1.5:
-                        turn = -0.5
-                    elif err_deg > 20.0:
-                        turn = 0.8
-                    elif err_deg > 1.5:
-                        turn = 0.5
-                    else:
-                        turn = 0.0
-                    if abs(err_deg) > 60.0:
-                        publish(0, turn)
-                    else:
+                    if walking and abs(err_deg) > TARGET_REALIGN_DEG:
+                        # Heading drifted: stop and turn in place again.
+                        walking = False
+                    elif not walking and abs(err_deg) <= TARGET_TURN_DONE_DEG:
+                        walking = True
+                    if walking:
+                        if err_deg < -1.5:
+                            turn = -HEADING_PULSE
+                        elif err_deg > 1.5:
+                            turn = HEADING_PULSE
+                        else:
+                            turn = 0.0
                         publish(0.6 if distance > 0.3 else 0.5, turn)
+                    else:
+                        # Turn first (or realign): no forward motion.
+                        turn = math.copysign(0.8 if abs(err_deg) > 20.0 else 0.5,
+                                             heading_error)
+                        publish(0, turn)
             if brake_started is not None:
                 publish(0)
                 quiet = (now-brake_started >= 1.0
