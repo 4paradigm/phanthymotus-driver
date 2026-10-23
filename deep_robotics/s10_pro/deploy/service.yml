@@ -1,0 +1,24 @@
+deep-robotics-s10-pro:
+  image: __IMAGE__
+  container_name: embodied-deep-robotics-s10-pro
+  network_mode: host
+  # Domain-0 child uses UDP; platform domain 42 is loopback-only.
+  # Host IPC is unnecessary. Set the mounted config's reader.vendor_profile to
+  # /opt/phanthy-motus/s10-reader-udp.xml before starting this service.
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/s10-reader-udp.xml:/opt/phanthy-motus/s10-reader-udp.xml:ro
+    - /opt/phanthy-motus/s10-pro/config.yaml:/work/deep_robotics/s10_pro/config.yaml:ro
+    # Driver task identities and completion outbox only; no Core database mount.
+    - /opt/phanthy-motus/s10-pro/state:/work/state
+  environment:
+    - ROS_DOMAIN_ID=42
+    - ROS_NAMESPACE=s10_pro
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - AGENT_CORE_URL=https://localhost:15678
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options: {max-size: "10m", max-file: "3"}
+  restart: unless-stopped

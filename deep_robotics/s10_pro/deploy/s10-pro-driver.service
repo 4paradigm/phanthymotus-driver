@@ -1,0 +1,26 @@
+[Unit]
+Description=S10 Pro read-only PhanthyMotus driver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/s10-pro-driver
+Environment=PYTHONPATH=/home/user/s10-pro-driver
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=RCUTILS_COLORIZED_OUTPUT=0
+Environment=ROS_DOMAIN_ID=42
+Environment=ROS_NAMESPACE=s10_pro
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+Environment=AGENT_CORE_URL=https://localhost:15678
+ExecStart=/bin/bash --noprofile --norc -c 'source /opt/ros/jazzy/setup.bash && exec /usr/bin/python3 deep_robotics/s10_pro/main.py'
+KillMode=control-group
+TimeoutStopSec=12
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

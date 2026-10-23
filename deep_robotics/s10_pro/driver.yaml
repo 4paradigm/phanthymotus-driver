@@ -1,0 +1,28 @@
+id: deep-robotics-s10-pro-driver
+name: DEEP Robotics S10 Pro Driver
+category: driver
+hardware_provider: deep-robotics
+hardware_model: "s10-pro"
+image_name: deep-robotics-s10-pro
+port: 15745
+mcp_url: "http://localhost:15745/mcp"
+description: "S10 Pro M20-style monitoring, state, motion feedback, device health, hardware e-stop, diagnostics, IMU, odometry and point cloud; physical controls remain gated"
+build_context_extras:
+  - ../../common
+cards:
+  - {name: state, type: sensor}
+  - {name: joints, type: sensor}
+  - {name: imu, type: sensor}
+  - {name: odometry, type: sensor}
+  - {name: lidar, type: sensor}
+  - {name: motion_info, type: sensor}
+  - {name: device_status, type: sensor}
+  - {name: hard_estop, type: sensor}
+  - {name: errors, type: sensor}
+  - {name: motion_events, type: sensor}
+  - {name: capabilities, type: sensor}
+  - {name: ros_graph, type: sensor}
+  - {name: device, type: actuator}
+  - {name: motion, type: actuator}
+# Conditional hardware streams are listed in capabilities until their source is verified.
+# No charging action is exposed.
