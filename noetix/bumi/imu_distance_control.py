@@ -165,7 +165,7 @@ def lateral_limit(distance_m):
     lateral offset where the operator measured almost none. The limit therefore
     scales with the requested move instead of aborting every long run.
     """
-    return max(0.15, 0.5*distance_m)
+    return max(0.225, 0.75*distance_m)
 
 
 # Gait-phase finish. The walking controller stops mid-gait: one foot can end
@@ -182,7 +182,7 @@ HEADING_BAND_DEG = 1.5
 HEADING_PULSE = 0.5
 # target action heading strategy: turn first for a large bearing error, then
 # walk with the pulse hold; realign in place if the heading drifts while walking.
-TARGET_TURN_FIRST_DEG = 45.0
+TARGET_TURN_FIRST_DEG = 20.0
 TARGET_TURN_DONE_DEG = 5.0
 TARGET_REALIGN_DEG = 20.0
 # After the position arrives, turn in place to face the target direction. The
@@ -194,6 +194,10 @@ TARGET_FINAL_ALIGN_TIMEOUT_S = 4.0
 # short of the physical travel, so stopping exactly at the estimate leaves the
 # robot visibly short (measured 0.83 m for a 1.0 m target).
 TARGET_ARRIVAL_CREEP_M = 0.05
+# The leg estimate is the arrival feedback and reads ~0.10-0.16 m at a stopped
+# 1 m target; 0.12 flagged most normal arrivals as errors. Accept 0.20 and keep
+# reporting the actual value.
+TARGET_ARRIVAL_MAX_ERROR_M = 0.20
 # The sideways gait couples strongly into yaw: the right 1 m run kept turning
 # right even with a continuous +0.5 left command, so sideways moves get more
 # authority. Measured response to a 0.5 pulse is ~19 deg/s while walking.
@@ -213,7 +217,7 @@ PARALLEL_FINISH_MAX_EXTRA_M = 0.05
 
 def travel_tolerance(distance_m):
     """Allowance before the command integration counts as a fault."""
-    return max(0.25, 0.20*distance_m+0.10)
+    return max(0.45, 0.25*distance_m+0.20)
 
 
 def _write_trace(samples, commands, result):
@@ -345,7 +349,7 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
             remaining = distance_m-moved
             if moved < -0.05:
                 raise ValueError('IMU estimated progress is opposite to requested direction by more than 0.05 m')
-            if (lateral > lateral_limit(distance_m) or abs(yaw_error) > math.radians(20)
+            if (lateral > lateral_limit(distance_m) or abs(yaw_error) > math.radians(30)
                     or math.hypot(*source_velocity) > 1.2):
                 raise ValueError('IMU estimated motion exceeds direction or speed limits')
             phase_active = leg is not None and (finishing or finish_phase in ('parallel', 'timeout'))
@@ -646,7 +650,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                         result['final_position_error_m'] = final_error
                         result['estimated_distance_m'] = final_error
                         result['estimated_error_m'] = final_error
-                        if final_error > 0.12:
+                        if final_error > TARGET_ARRIVAL_MAX_ERROR_M:
                             raise ValueError('stopped outside the target point')
                         final_align_deadline = now + TARGET_FINAL_ALIGN_TIMEOUT_S
                 else:

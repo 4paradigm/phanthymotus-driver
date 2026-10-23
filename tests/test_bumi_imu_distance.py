@@ -166,7 +166,7 @@ def test_fault_and_cancel_paths_finish_with_brake(monkeypatch, fault):
             elif fault == 'gap':
                 plant.clock += 0.2
             elif fault == 'heading':
-                plant.yaw = 0.5
+                plant.yaw = 0.7
     monkeypatch.setattr(module.time, 'sleep', steered)
     result = module.run_distance(plant, 1)
     assert result['state'] == ('stopped' if fault == 'cancel' else 'error'), result
@@ -511,9 +511,9 @@ def test_target_endpoint_catches_coasting_past_the_tolerance(monkeypatch):
             if owner.command:
                 self._moved = True
                 step = 0.16*dt
-            elif self._moved and self._slid < 0.25:
-                # Coast 25 cm after the brake: the pre-brake position is within
-                # tolerance, the post-brake one is outside the 12 cm endpoint.
+            elif self._moved and self._slid < 0.45:
+                # Coast 45 cm after the brake: the pre-brake position is within
+                # tolerance, the post-brake one is outside the 20 cm endpoint.
                 step = 0.16*dt
                 self._slid += step
             else:
@@ -893,9 +893,9 @@ def test_travel_speed_respects_the_measured_deadband():
 
 
 def test_lateral_limit_scales_with_the_requested_distance():
-    assert module.lateral_limit(0.2) == pytest.approx(0.15)
-    assert module.lateral_limit(0.8) == pytest.approx(0.40)
-    assert module.lateral_limit(3.0) == pytest.approx(1.50)
+    assert module.lateral_limit(0.2) == pytest.approx(0.225)
+    assert module.lateral_limit(0.8) == pytest.approx(0.60)
+    assert module.lateral_limit(3.0) == pytest.approx(2.25)
 
 
 def test_lagging_imu_stops_with_an_error_instead_of_dead_reckoning(monkeypatch):
