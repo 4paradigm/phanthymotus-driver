@@ -293,7 +293,8 @@ def test_target_action_schema_and_preflight(monkeypatch):
     assert tool['inputSchema']['x-action-params']['target']['params'] == ['x_m', 'y_m']
     assert plugin._target_preflight({'x_m': 0.3, 'y_m': 0.4}) == (0.5, None)
     for bad in ({'x_m': 0.0, 'y_m': 0.0}, {'x_m': 3.0, 'y_m': 1.0},
-                {'x_m': 'x', 'y_m': 0.4}):
+                {'x_m': 'x', 'y_m': 0.4}, {'x_m': True, 'y_m': True},
+                {'x_m': 0.4, 'y_m': True}, {'x_m': None, 'y_m': 0.4}):
         result = plugin.dispatch('target', {'_tool_name': 'loco_target', **bad})
         assert result['state'] == 'error'
         assert 'action_id' not in result

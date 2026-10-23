@@ -1070,9 +1070,15 @@ class LocoPlugin:
         return self._slip_scales[direction]
 
     def _target_preflight(self, args):
+        raw_x, raw_y = args.get('x_m'), args.get('y_m')
+        # float(True) is 1.0; booleans are not metre coordinates and must not
+        # silently start a physical move.
+        if isinstance(raw_x, bool) or isinstance(raw_y, bool):
+            return None, {"state": "error",
+                          "error": "x_m and y_m must be numbers, not booleans"}
         try:
-            x = float(args.get('x_m'))
-            y = float(args.get('y_m'))
+            x = float(raw_x)
+            y = float(raw_y)
         except (TypeError, ValueError):
             return None, {"state": "error", "error": "x_m and y_m must be numbers"}
         if (not math.isfinite(x) or not math.isfinite(y)
