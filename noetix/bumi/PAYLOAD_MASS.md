@@ -269,3 +269,51 @@ docker build --platform linux/arm64 -t bumi-payload-mass:local "$PAYLOAD_CONTEXT
 
 阶段 C 主动“掂一下”保持未开放：还需验证运动后端、带载稳定/余量、A/B 各自标定、运动入口
 仲裁及停止收尾。不能调用 LowController 给其他电机填零，也不能直接复用未确认示教编号。
+
+## 原始 DDS 反馈诊断（不改动运行中的 Driver）
+
+当 getter 读到零力矩或未解释的错误码时，可单独使用
+`scripts/bumi_payload_raw_probe.py` 检查原始 `RobotStatus::StatusData`。
+它不导入或初始化 HighController/LowController、不注册SDK回调、不发运动指令，
+不修改 Driver 文件、不重启容器；只创建一个原生 DDS participant 和状态订阅。
+
+工具复用镜像内已有的 g++、离线 idlc 和 DDS 动态库，不安装软件包、不升级 SDK。
+从厂商头文件复原状态 IDL，用厂商离线编译器生成缺失的类型实现；编译前逐字节核对
+全部六种结构的12份 XTypes map/info 元数据。任何不一致报 SCHEMA_MISMATCH，
+不会尝试连设备。不会为了链接方便引入包含控制器代码的 libdriver.a。
+
+将脚本复制到机器人宿主的 `/tmp/bumi_payload_raw_probe.py` 后执行：
+
+```bash
+docker exec -i embodied-noetix-bumi python3 - --domain 0 --seconds 6 --summary-only \
+  < /tmp/bumi_payload_raw_probe.py
+```
+
+默认SDK根目录为 `/work/noetix_sdk_bumi`。domain 0 只是厂商原生域的候选，不等于
+ROS_DOMAIN_ID=42；未发现发布者时应核对域、网卡、peer、协议和 QoS，不能据此认定
+“设备力矩为零”。只接纳一个状态发布者，多来源则报 AMBIGUOUS_WRITER。
+
+输出包括安装绑定 SHA256、类型元数据校验、实际 DDS 消息数、原始电机时间戳变化数、
+左右手臂各轴力矩 min/max、实际 motor_id 映射检查和**未经SDK uint8截断的原始错误码**。
+错误码只保留原值，不推测1或其他未说明代码的含义；质量始终为null。
+不加 `--summary-only` 可同时查看发现的话题/类型和每秒原始关节快照。
+
+这些数据用于排查，而不是称重或运动：
+
+- SDK getter 与原始DDS明显不一致：继续检查协议/SDK解析、位宽、时序和版本。
+- 两者都为零：仍需核对姿态、设备是否真实上报力矩及固件语义，不能直接归因固件。
+- DDS计数增加：仅证明收到了DDS消息，不证明每个电机测量独立刷新。
+- 自然下垂、空载零值不能单独证明称重不可行；也不能在零响应上拟合有效模型。
+
+原生集成测试仅在开发机回环接口、独立域173中运行，发布的是测试状态数据，不连接机器人。
+需要已有原生运行库时，可显式提供路径：
+
+```bash
+BUMI_PROBE_TEST_LIBRARY_DIR=/path/to/dds/lib \
+BUMI_PROBE_TEST_IDLC=/path/to/dds/bin/idlc \
+python3 -m pytest tests/test_bumi_payload_raw_probe.py -q -p no:cacheprovider
+```
+
+未提供路径时，纯Python检查仍运行，原生DDS测试标记skip；不能将skip写成通过。
+原生测试验证带符号力矩、零数据、无发布者、重复来源、ID错误、NaN、原始错误码保留和取消。
+这些是测试数据，不代表真机反馈已验证。
