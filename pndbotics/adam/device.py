@@ -1858,7 +1858,7 @@ class ArmControlPlugin:
                 if is_arm and (soft_arms or release_started_at is not None):
                     arm_scale = 1.0 - release_ratio
                 motor.kp = kp * arm_scale
-                motor.kd = kd
+                motor.kd = kd * arm_scale
                 motor.ki = 0.0
             with self._lock:
                 # A newer target or stop may have arrived while the packet was

@@ -7,6 +7,7 @@ import sys
 import time
 import types
 import unittest
+from unittest import mock
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
@@ -217,8 +218,40 @@ class ArmControlTests(unittest.TestCase):
             else:
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
 
-        self.assertEqual(publisher.commands[-1].motor_cmd[elbow].kp, 0.0)
+        for index, name in enumerate(ADAM_PRO_JOINTS):
+            if name.startswith(("waist", "neck", "shoulder", "elbow", "wrist")):
+                self.assertEqual(publisher.commands[-1].motor_cmd[index].kp, 0.0)
+                self.assertEqual(publisher.commands[-1].motor_cmd[index].kd, 0.0)
         self.assertFalse(plugin._active)
+
+    def test_feedback_fault_ramps_both_upper_body_gains_and_finishes_release(self):
+        publisher = _FakePublisher()
+        plugin = _prime_arm_plugin(publisher)
+        plugin._active = plugin._streaming = True
+        plugin._target_q = {ADAM_PRO_JOINTS.index("elbow_Left"): -0.5}
+        started = time.monotonic()
+        with mock.patch.object(device.time, "monotonic", return_value=started):
+            plugin._fail_feedback("feedback expired")
+        with mock.patch.object(device, "pnd_adam_msg_dds__LowCmd_", _fake_lowcmd, create=True):
+            for fraction in (0.5, 1.0):
+                now = started + fraction * plugin._RELEASE_SECONDS
+                plugin._owner_checked_at = now
+                with mock.patch.object(device.time, "monotonic", return_value=now):
+                    plugin._write_command(0.02)
+                packet = publisher.commands[-1]
+                for index, name in enumerate(ADAM_PRO_JOINTS):
+                    kp, kd = plugin._pd_for_joint(name)
+                    scale = 1 - fraction if name.startswith(
+                        ("waist", "neck", "shoulder", "elbow", "wrist")) else 1
+                    self.assertAlmostEqual(kp * scale, packet.motor_cmd[index].kp, places=5)
+                    self.assertAlmostEqual(kd * scale, packet.motor_cmd[index].kd, places=5)
+        self.assertFalse(plugin._streaming)
+        self.assertFalse(plugin._active)
+        self.assertFalse(plugin._target_q)
+        self.assertIsNone(plugin._release_started_at)
+        count = len(publisher.commands)
+        plugin._write_command(0.02)
+        self.assertEqual(count, len(publisher.commands))
 
     def test_stop_waits_for_release_and_includes_waist(self):
         publisher = _FakePublisher()
@@ -244,6 +277,8 @@ class ArmControlTests(unittest.TestCase):
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
         self.assertEqual(0.0, publisher.commands[-1].motor_cmd[waist].kp)
         self.assertEqual(0.0, publisher.commands[-1].motor_cmd[neck].kp)
+        self.assertEqual(0.0, publisher.commands[-1].motor_cmd[waist].kd)
+        self.assertEqual(0.0, publisher.commands[-1].motor_cmd[neck].kd)
 
     def test_segment_starts_from_current_output_and_ends_at_target(self):
         publisher = _FakePublisher()
