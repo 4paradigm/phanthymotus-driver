@@ -184,7 +184,8 @@ class SDKReplay:
         handler = Errors()
         logger.addHandler(handler)
         result = dict(status='error', sdk_commit=SDK_COMMIT, physical_stop_verified=False,
-                      target_submission_complete=False, source='measured_state', head_policy='hold_live_start')
+                      target_submission_complete=False, source='measured_state', head_policy='hold_live_start',
+                      execution_parameters=dict(gripper_speed=self.speed, gripper_force=self.force))
         try:
             self.check()
             self.phase = 'moving_to_start'

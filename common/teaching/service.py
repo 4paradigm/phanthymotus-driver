@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import ssl
 import stat
 import tempfile
@@ -29,14 +30,18 @@ ASSET_SCHEMA = "motus.teaching.asset/1"
 def read_execution_policy(tool, instance_id, device_binding, asset_id, asset_binding):
     """Read this asset's saved policy from the same-host Core; never grant it."""
     url = urlsplit(os.environ.get('AGENT_CORE_URL', 'https://localhost:15678'))
-    if (url.hostname not in ('localhost', '127.0.0.1', '::1') or url.username or url.password
+    host = url.hostname
+    # The host-network Compose fragment maps this service alias to loopback.
+    if host == 'phanthy-motus' and socket.gethostbyname(host) == '127.0.0.1':
+        host = '127.0.0.1'
+    if (host not in ('localhost', '127.0.0.1', '::1') or url.username or url.password
             or url.path not in ('', '/') or url.query or url.fragment or url.scheme not in ('http', 'https')):
         raise ValueError('execution_policy_requires_local_core')
     kwargs = {'timeout': 3}
     if url.scheme == 'https':
         kwargs['context'] = ssl._create_unverified_context()  # host loopback, self-signed Core
     cls = http.client.HTTPSConnection if url.scheme == 'https' else http.client.HTTPConnection
-    connection = cls(url.hostname, url.port, **kwargs)
+    connection = cls(host, url.port, **kwargs)
     try:
         body = dict(tool=tool, instance_id=instance_id, device_binding=device_binding,
                     asset_id=asset_id, asset_binding=asset_binding)
@@ -356,6 +361,8 @@ class TeachingPlugin:
                  "recording": {k: recording[k] for k in ("filename", "sha256", "binding")},
                  "metadata": metadata, "trial": draft["trial"], "effect_confirmed": True,
                  "created_at": time.time(), "skill": skill}
+        if 'execution_parameters' in draft['trial'].get('result', {}):
+            asset['execution_parameters'] = dict(draft['trial']['result']['execution_parameters'])
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd, path = tempfile.mkstemp(prefix=".asset-", dir=self.directory)
         try:

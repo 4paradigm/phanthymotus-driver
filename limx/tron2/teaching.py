@@ -14,20 +14,20 @@ from common.teaching.package import SCHEMA as PACKAGE_SCHEMA
 from episode import (SCHEMA, TRAJECTORY_SCHEMA, STATE_NAMES, UNITS, atomic_json, digest,
                      encode, episode_path, load_episode)
 from teaching_capture import Capture
-from teaching_replay import Replay, pack_trajectory, read_trajectory, movej_start_target
+from teaching_replay import Replay, pack_trajectory, read_trajectory, movej_start_target, gripper_parameters
 
 
 class TronTeachingAdapter:
     title='TRON2 原厂 VR 录制与回放'
     resources=['arm_l','arm_r','head']
     completion_timeout=1980
-    presentation=dict(passive_recording=True, manual_unlock=True, session_start='observer',
+    presentation=dict(passive_recording=True, manual_unlock=True, session_start='observer', default_auto_execute=True,
         joint_groups=[{'label':'左臂','count':7},{'label':'右臂','count':7}], grippers=False,
         recording_label='实测双臂与夹爪', prepare_hint='只读检查反馈和存储；不接管原厂 VR。',
         next_hint='使用原厂 VR 示范。录制器只读取关节、夹爪与三路图像。',
         trial_hint='由原厂 SDK 初始化到录制起点（可能经过中间姿态并张开夹爪），再回放。请确认移向起点的路径和活动空间畅通，退出原厂 VR 并保持控制独占。停止只取消后续步骤，不能保证厂家立即停止当前运动。',
         conditions_placeholder='固定底座、相同物体布置、原厂 VR 已退出、控制来源独占。')
-    replay_instruction='TRON2 由原厂 SDK 初始化到录制起点（可能经过中间姿态并张开夹爪），核验到位后回放，不自动切换模式。每次执行须由操作者确认移向起点及回放的路径畅通，原厂 VR 和其他控制程序已停止，并明确填写 exclusive_control_confirmed=true；软件不能检测跨进程控制独占。夹爪须明确 gripper_speed 和 gripper_force（厂家档位）。停止只取消后续步骤，不保证厂家立即停止当前运动。'
+    replay_instruction='TRON2 由原厂 SDK 初始化到录制起点后回放，不自动切换模式。夹爪默认速度和力来自该动作的预设，由preview返回；用户未指定时直接使用，不询问参数。用户明确指定时仅覆盖本次gripper_speed或gripper_force，不修改预设；只有用户明确要求保存新预设时才调用parameters。confirmation_required=false时已核验本技能自动执行设置，不再追问环境或接管；为true时才需要本次确认。软件仍检查设备绑定、模式、互斥及实际到位；无法检测跨进程控制独占。SDK初始化可能经过中间姿态并张开夹爪。停止只取消后续步骤，不保证厂家立即停止当前运动。'
 
     def __init__(self, owner, loop, root):
         self.owner,self.loop,self.root=owner,loop,Path(root)
@@ -45,6 +45,11 @@ class TronTeachingAdapter:
     def peers_idle(self):
         owners=[self.owner.motion,self.owner.head,*self.owner.grippers.values()]
         return all(not owner.active and not getattr(owner,'recovering',False) and not getattr(owner,'pose_step',None) for owner in owners)
+
+    def execution_binding(self):
+        return self.capture.binding()
+
+    execution_context=execution_binding
 
     def compatibility(self):
         binding=self.capture.binding()
@@ -158,6 +163,9 @@ class TronTeachingAdapter:
 
     def play(self,filename,args):
         if self.capture.info()['recording']:raise ValueError('finish_recording_first')
+        if args.get('_execution_context') is not None:
+            if args['_execution_context']!=self.execution_binding():raise ValueError('execution_binding_changed')
+            args=dict(args,exclusive_control_confirmed=True)
         raw,_=self.raw(filename)
         return self.sync(self.replay.play(raw,self.capture.binding(),args))
 
@@ -201,11 +209,14 @@ class TronTeachingPlugin(TeachingPlugin):
     def get_tools(self):
         tools=super().get_tools();schema=tools[0]['inputSchema']
         schema['properties'].update({k:{'type':'string'} for k in ('task','outcome','notes','episode_id')})
-        schema['properties'].update({k:{'type':'number','minimum':0,'maximum':100} for k in ('gripper_speed','gripper_force')})
-        schema['properties']['exclusive_control_confirmed']={'type':'boolean','description':'操作者明确确认本次原厂 VR 及其他控制程序已停止，并在回放期间保持独占；不得自行填写 true'}
+        schema['properties'].update({k:{'type':'number','minimum':0,'maximum':100,
+            'description':'省略时使用当前动作预设；用户明确指定时仅覆盖本次，不必重复询问'} for k in ('gripper_speed','gripper_force')})
+        schema['properties']['exclusive_control_confirmed']={'type':'boolean','description':'自动执行时使用preview返回值；未启用自动执行时，须操作者确认原厂VR及其他控制已停止并保持本次独占，不得自行填写true'}
         schema['properties']['physical_stop_confirmed']={'type':'boolean','description':'操作者现场确认机器人已停止；不得自行填写 true'}
         extra={'reset':(['execute','workspace_clear','take_control','exclusive_control_confirmed'],
                         '恢复原位：双臂回保存姿态、头部回正、双夹爪闭合；execute=false只读预览，执行须确认路径及独占，等待ACP终态'),
+            'parameters':(['asset_id','gripper_speed','gripper_force'],
+                          '读取动作预设；仅在用户明确要求保存新预设时填写夹爪参数。不执行动作，修改后需重新启用该技能自动执行'),
             'unlock':([], '现场确认后检查静止并解除回放占用，不发送运动'),
             'episode_list':([], '列出完整及诊断录制'),
             'episode_details':(['episode_id'],'查看数据质量'),
@@ -214,13 +225,14 @@ class TronTeachingPlugin(TeachingPlugin):
             'training_info':([], '读取训练导出结果')}
         for action,(_,description) in extra.items():
             schema['properties']['action']['enum'].append(action)
-            schema['properties']['action']['oneOf'].append({'const':action,'title':'恢复原位' if action=='reset' else description})
+            schema['properties']['action']['oneOf'].append({'const':action,'title':{'reset':'恢复原位','parameters':'动作预设参数'}.get(action,description)})
             schema['x-workbench']['actions'].append(action)
         schema['x-action-params']['run']['params'] += ['gripper_speed','gripper_force','exclusive_control_confirmed']
         schema['x-action-params']['reset']=dict(params=extra['reset'][0],description=extra['reset'][1])
+        schema['x-action-params']['parameters']=dict(params=extra['parameters'][0],description=extra['parameters'][1],required=['asset_id'])
         schema['x-completion']['actions'].append('reset')
         schema['x-workbench']['title']='TRON2 录制与回放'
-        tools[0]['description']='原厂 VR 只读数据录制、实测轨迹回放、恢复原位和 LeRobot v3 训练导出。回放和复位每次须由操作者确认控制独占。'
+        tools[0]['description']='原厂 VR 只读录制、技能回放、恢复原位和LeRobot导出。已启用自动执行的技能按预设参数直接运行；用户明确指定参数时只覆盖本次。'
         return tools
 
     def dispatch(self,action,args):
@@ -247,6 +259,15 @@ class TronTeachingPlugin(TeachingPlugin):
             return result
         if self.teardown_future and not self.teardown_future.done():
             raise ValueError('reset_in_progress')
+        if action=='parameters':
+            with self.lock:
+                asset,_=self._read_asset(args.get('asset_id'))
+                changes={k:args[k] for k in ('gripper_speed','gripper_force') if k in args}
+                if changes:
+                    self._idle()
+                    asset['execution_parameters']=gripper_parameters({**asset.get('execution_parameters',{}),**changes})
+                    atomic_json(self.directory/(asset['id']+'.json'),asset)
+                return dict(asset_id=asset['id'],execution_parameters=asset.get('execution_parameters',{}),motion_sent=False)
         if action=='reset':
             with self.lifecycle_lock,self.lock:
                 if self.teardown_future and not self.teardown_future.done():
@@ -299,11 +320,25 @@ class TronTeachingPlugin(TeachingPlugin):
                 self.export_job={'state':'running','episode_id':ident,'path':str(destination)}
                 threading.Thread(target=self._export,args=(ident,destination),name='tron2-vla-export',daemon=True).start()
                 return {'export':self.export_job}
-        result=super().dispatch(action,args)
-        if action in ('preview','run') and result.get('executed') is False:
-            result['execution_arguments'].update(exclusive_control_confirmed=False,
-                gripper_speed=args.get('gripper_speed'),gripper_force=args.get('gripper_force'))
-            result['next_step']='请操作者确认原厂 VR 和其他控制程序已停止、活动空间已清空，并明确夹爪速度和力档位。确认后补齐 execution_arguments，再执行。'
+        return super().dispatch(action,args)
+
+    def _execution_binding(self,asset_id=''):
+        result=super()._execution_binding(asset_id)
+        if asset_id:
+            asset,_=self._read_asset(asset_id)
+            value=[result['asset_binding'],asset.get('execution_parameters',{})]
+            result['asset_binding']=hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()
+        return result
+
+    def _run(self,args):
+        asset,_=self._read_asset(args.get('asset_id'))
+        parameters=gripper_parameters({**asset.get('execution_parameters',{}),
+            **{k:args[k] for k in ('gripper_speed','gripper_force') if k in args}})
+        result=super()._run({**args,**parameters})
+        if result.get('executed') is False:
+            result['execution_arguments'].update(parameters,
+                exclusive_control_confirmed=result['confirmation_required'] is False)
+            result['execution_parameters']=parameters
         return result
 
     async def _reset_on_stop(self):

@@ -87,6 +87,7 @@ def test_worker_submits_all_frames_and_never_completes_on_failure(failure):
     w.create_controller=create
     w.wait_stable=lambda *args:dict(stable_seconds=.5)
     result=w.run()
+    assert result['execution_parameters']=={'gripper_speed':30,'gripper_force':20}
     assert closed==['pause','disconnect']
     if failure is None:
         assert result['status']=='completed' and len(sent)==6 and result['target_submission_complete']

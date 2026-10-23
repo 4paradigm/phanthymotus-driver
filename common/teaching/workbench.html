@@ -195,10 +195,12 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     const execution=status.execution_policy || {};
     for(const prefix of ['save','import']){
       $(prefix+'-auto-row').hidden=!execution.supported;
-      $(prefix+'-auto-execute').checked=autoExecuteChoice===true;
+      $(prefix+'-auto-execute').checked=autoExecuteChoice ?? !!presentation().default_auto_execute;
       $(prefix+'-auto-execute').disabled=locked || moving || installed;
       $(prefix+'-auto-hint').hidden=!execution.supported;
       $(prefix+'-auto-hint').textContent='仅对此技能生效，设置保存在本设备，重启后保留。';
+      const parameters=draft.trial?.result?.execution_parameters;
+      if(parameters)$(prefix+'-auto-hint').textContent+=` 动作预设：夹爪速度 ${parameters.gripper_speed}，力 ${parameters.gripper_force}；明确指定时仅覆盖本次。`;
     }
     const compatible=status.compatibility;
     $('compatibility-panel').hidden=!compatible;
@@ -339,7 +341,7 @@ body[data-passive] .confirm-box .error {margin:12px 0 0}
     if(presentation().passive_recording)$('confirm-binding').textContent=`设备 ${preview.binding?.serial || ''} · 型号 ${preview.binding?.model || ''}`;
     $('confirm-control').checked=false;$('confirm-go').disabled=true;$('confirm').hidden=false;$('confirm-control').focus();
   }
-  const automaticArgs=()=>status.execution_policy?.supported && autoExecuteChoice!==null?{auto_execute:autoExecuteChoice}:{};
+  const automaticArgs=()=>status.execution_policy?.supported && (autoExecuteChoice!==null || presentation().default_auto_execute)?{auto_execute:autoExecuteChoice ?? true}:{};
   async function refreshDrafts() {
     const result=await call('draft_list'), old=$('drafts').value;
     $('drafts').replaceChildren(new Option(result.drafts.length?'选择待验证动作…':'暂无待验证动作',''),

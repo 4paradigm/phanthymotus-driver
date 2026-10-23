@@ -100,3 +100,25 @@ def test_card_file_argument_and_only_per_skill_execution_are_advertised(tmp_path
             service.dispatch(action, {})
     with pytest.raises(ValueError, match='invalid_teaching_argument_auto_execute_verified'):
         service.dispatch('info', {'auto_execute_verified': True})
+
+
+@pytest.mark.parametrize('address',['127.0.0.1','192.0.2.1'])
+def test_native_policy_accepts_compose_alias_only_when_pinned_to_loopback(monkeypatch,address):
+    from common.teaching import service
+    connected=[]
+    class Connection:
+        def __init__(self,host,port,**kwargs):connected.append((host,port))
+        def request(self,*args):pass
+        def getresponse(self):
+            return SimpleNamespace(status=200,read=lambda _:b'{"data":{"enabled":true,"source":"skill","binding_changed":false}}')
+        def close(self):pass
+    monkeypatch.setenv('AGENT_CORE_URL','https://phanthy-motus:15678')
+    monkeypatch.setattr(service.socket,'gethostbyname',lambda _:address)
+    monkeypatch.setattr(service.http.client,'HTTPSConnection',Connection)
+    if address!='127.0.0.1':
+        with pytest.raises(ValueError,match='requires_local_core'):
+            service.read_execution_policy('tool','card','device','asset','binding')
+        assert not connected
+    else:
+        assert service.read_execution_policy('tool','card','device','asset','binding')['enabled']
+        assert connected==[('127.0.0.1',15678)]

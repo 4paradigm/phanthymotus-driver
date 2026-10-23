@@ -17,6 +17,13 @@ START_RAD = math.radians(2)
 RECORDING_LIMIT_TOLERANCE = math.radians(5)
 
 
+def gripper_parameters(args):
+    result = {key: percentage(args.get(key), key) for key in ('gripper_speed', 'gripper_force')}
+    if result['gripper_speed'] <= 0:
+        raise ValueError('gripper_speed_must_be_positive')
+    return result
+
+
 # LimX tron2_manipulation_controller 482ebbc: robot_model.CONTROLLER_ARM_LIMITS.
 # MoveJ uses narrower wrist limits than the SDK's recorded/ServoJ arm range.
 MOVEJ_START_LOWER = (-3.14159,-.261799,-3.66519,-2.61799,-1.74533,-.7505,-.7505,
@@ -159,16 +166,13 @@ class Replay:
             raise ValueError('user_confirmation_required')
         if self.exclusive_guard is None and args.get('exclusive_control_confirmed') is not True:
             raise ValueError('operator_exclusive_confirmation_required')
-        speed = percentage(args.get('gripper_speed'), 'gripper_speed')
-        force = percentage(args.get('gripper_force'), 'gripper_force')
-        if speed <= 0:
-            raise ValueError('gripper_speed_must_be_positive')
+        parameters = gripper_parameters(args)
         # Recheck peers after the only await; reserve this task before yielding again.
         if self.active or not self.peers_idle():
             raise ValueError('other_motion_active')
         ident = 'tron2_teach_'+uuid4().hex
         self.worker = SDKReplay(self.reader.settings['url'], frames, head,
-                                movej_start_target(frames[0]['q']), speed, force)
+                                movej_start_target(frames[0]['q']), parameters['gripper_speed'], parameters['gripper_force'])
         self.outcome = dict(action_id=ident, status='running', result={})
         self.task = asyncio.create_task(self._run(ident))
         return dict(state='running', action_id=ident)
