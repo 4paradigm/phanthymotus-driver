@@ -596,12 +596,13 @@ def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     class Leg:
         def __init__(self, slip_scale=None):
             self.slip_scale = slip_scale
-            self.position = [0.3, 0.4, 0.0]   # already at the target point
+            # At the estimated target plus the 5 cm arrival creep (53.1 deg).
+            self.position = [0.33, 0.44, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
             self.feet = []
             self.foot_gap = 0.0
         def reset_baseline(self):
-            self.position = [0.3, 0.4, 0.0]
+            self.position = [0.33, 0.44, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
         def observe(self, joints, quaternion, now, frozen=False):
             pass
@@ -616,7 +617,7 @@ def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     assert result['action'] == 'target'
     assert result['requested_target_x_m'] == 0.3
     assert result['requested_target_y_m'] == 0.4
-    assert result['final_position_error_m'] == pytest.approx(0.0, abs=1e-9)
+    assert result['final_position_error_m'] == pytest.approx(0.05, abs=0.01)
     assert commands and commands[-1] == (0, 0)
 
 

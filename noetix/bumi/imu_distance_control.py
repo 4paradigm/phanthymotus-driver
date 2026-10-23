@@ -183,8 +183,17 @@ HEADING_PULSE = 0.5
 # target action heading strategy: turn first for a large bearing error, then
 # walk with the pulse hold; realign in place if the heading drifts while walking.
 TARGET_TURN_FIRST_DEG = 45.0
-TARGET_TURN_DONE_DEG = 10.0
-TARGET_REALIGN_DEG = 60.0
+TARGET_TURN_DONE_DEG = 5.0
+TARGET_REALIGN_DEG = 20.0
+# After the position arrives, turn in place to face the target direction. The
+# final heading is a comfort alignment: best effort, never a reason to fail a
+# position-valid arrival.
+TARGET_FINAL_ALIGN_DEG = 2.0
+TARGET_FINAL_ALIGN_TIMEOUT_S = 4.0
+# Walk this far past the estimated target point: the leg estimate reads ~7%
+# short of the physical travel, so stopping exactly at the estimate leaves the
+# robot visibly short (measured 0.83 m for a 1.0 m target).
+TARGET_ARRIVAL_CREEP_M = 0.05
 # The sideways gait couples strongly into yaw: the right 1 m run kept turning
 # right even with a continuous +0.5 left command, so sideways moves get more
 # authority. Measured response to a 0.5 pulse is ~19 deg/s while walking.
@@ -469,6 +478,8 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     last_command = 0.0
     last_command_at = None
     dead_reckoned_m = 0.0
+    final_align_deadline = None
+    start_bearing = math.atan2(target_y, target_x)
     samples, commands = [], []
 
     def publish(vx, vyaw=0):
@@ -548,7 +559,12 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
             distance = math.hypot(to_x, to_y)
             bearing = math.atan2(to_y, to_x)
             heading = angle_delta(estimator.yaw, origin_yaw)
-            heading_error = angle_delta(bearing, heading)
+            along = body_x*math.cos(start_bearing) + body_y*math.sin(start_bearing)
+            # Once close, the bearing to the point flips as soon as the robot
+            # steps past it; keep the approach direction for the final creep.
+            near_target = distance < 0.20
+            reference_bearing = start_bearing if near_target else bearing
+            heading_error = angle_delta(reference_bearing, heading)
             if walking is None:
                 walking = abs(math.degrees(bearing)) <= TARGET_TURN_FIRST_DEG
             if brake_started is None and motion_started is not None:
@@ -563,7 +579,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                                                 full_scale)*(now-last_command_at)
                 last_command_at = now
                 samples[-1]['dead_reckoned_m'] = dead_reckoned_m
-                progress = target_distance - distance
+                progress = along
                 tolerance = travel_tolerance(target_distance)
                 if dead_reckoned_m - progress > tolerance:
                     raise ValueError(
@@ -579,12 +595,14 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     raise ValueError('target move made no progress toward the point')
                 if math.hypot(*source_velocity) > 1.2:
                     raise ValueError('target motion exceeds speed limits')
-                if distance <= 0.10:
+                if along >= target_distance + TARGET_ARRIVAL_CREEP_M:
                     brake_started = now
                 else:
                     err_deg = math.degrees(heading_error)
-                    if walking and abs(err_deg) > TARGET_REALIGN_DEG:
-                        # Heading drifted: stop and turn in place again.
+                    if (walking and not near_target
+                            and abs(err_deg) > TARGET_REALIGN_DEG):
+                        # Heading drifted: stop and turn in place again. Not
+                        # near the point: there the approach direction is kept.
                         walking = False
                     elif not walking and abs(err_deg) <= TARGET_TURN_DONE_DEG:
                         walking = True
@@ -604,37 +622,47 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                         last_command = 0.0
                         publish(0, turn)
             if brake_started is not None:
-                publish(0)
-                quiet = (now-brake_started >= 1.0
-                         and math.hypot(*source_velocity) <= 0.10
-                         and max(abs(v) for v in estimator.acceleration) <= 0.2
-                         and math.hypot(*estimator.gyro) <= 0.08)
-                if not quiet:
-                    quiet_since = None
-                elif quiet_since is None:
-                    quiet_since = now
-                elif now-quiet_since >= 0.8:
-                    result['pre_zero_velocity_mps'] = source_velocity
-                    estimator.velocity = (0.0, 0.0, 0.0)
-                    result['stationary_assumed'] = True
-                    # Recompute from the latest sample: the braking phase keeps
-                    # integrating the coast, so the pre-brake body_x/body_y must
-                    # not decide the endpoint.
-                    fx, fy, _ = source_position
-                    final_body_x = fx*cy + fy*sy
-                    final_body_y = -fx*sy + fy*cy
-                    final_error = math.hypot(target_x-final_body_x,
-                                             target_y-final_body_y)
-                    result['final_position_error_m'] = final_error
-                    result['final_heading_deg'] = math.degrees(
-                        angle_delta(estimator.yaw, origin_yaw))
-                    result['estimated_distance_m'] = final_error
-                    result['estimated_error_m'] = final_error
-                    if final_error > 0.12:
-                        raise ValueError('stopped outside the target point')
-                    result['state'] = 'done'
-                    break
-                if now-brake_started > 4:
+                if final_align_deadline is None:
+                    publish(0)
+                    quiet = (now-brake_started >= 1.0
+                             and math.hypot(*source_velocity) <= 0.10
+                             and max(abs(v) for v in estimator.acceleration) <= 0.2
+                             and math.hypot(*estimator.gyro) <= 0.08)
+                    if not quiet:
+                        quiet_since = None
+                    elif quiet_since is None:
+                        quiet_since = now
+                    elif now-quiet_since >= 0.8:
+                        result['pre_zero_velocity_mps'] = source_velocity
+                        estimator.velocity = (0.0, 0.0, 0.0)
+                        result['stationary_assumed'] = True
+                        # Recompute from the latest sample: the braking phase
+                        # keeps integrating the coast.
+                        fx, fy, _ = source_position
+                        final_body_x = fx*cy + fy*sy
+                        final_body_y = -fx*sy + fy*cy
+                        final_error = math.hypot(target_x-final_body_x,
+                                                 target_y-final_body_y)
+                        result['final_position_error_m'] = final_error
+                        result['estimated_distance_m'] = final_error
+                        result['estimated_error_m'] = final_error
+                        if final_error > 0.12:
+                            raise ValueError('stopped outside the target point')
+                        final_align_deadline = now + TARGET_FINAL_ALIGN_TIMEOUT_S
+                else:
+                    # Comfort alignment: face the target direction, best effort.
+                    heading_now = angle_delta(estimator.yaw, origin_yaw)
+                    align_error = angle_delta(start_bearing, heading_now)
+                    align_deg = math.degrees(align_error)
+                    result['final_heading_deg'] = math.degrees(heading_now)
+                    result['final_heading_error_deg'] = align_deg
+                    if abs(align_deg) <= TARGET_FINAL_ALIGN_DEG or now > final_align_deadline:
+                        result['final_heading_aligned'] = abs(align_deg) <= TARGET_FINAL_ALIGN_DEG
+                        result['state'] = 'done'
+                        break
+                    turn = math.copysign(0.5 if abs(align_deg) < 20.0 else 0.8, align_error)
+                    publish(0, turn)
+                if now-brake_started > 10:
                     raise ValueError('target endpoint did not meet assumed-stationary conditions')
             time.sleep(0.02)
     except Exception as exc:
