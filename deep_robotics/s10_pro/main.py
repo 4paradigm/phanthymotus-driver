@@ -50,7 +50,10 @@ def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, 
                                 feedback=motion_backend.feedback, publish=publish, execution_authorized=binding.authorized,
                                 authorization_provider=binding.authorized_now,
                                 notifier=notifier, tasks=tasks)
-    plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin)
+    # Strict motion/estop monitors share the existing isolated observer;
+    # lidar conversion on the sensor reader must not delay their display.
+    plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin,
+                            motion_bridge=observer_bridge)
     plugins.append(motion_plugin)
     return plugins
 

@@ -511,10 +511,11 @@ class ReadOnlyCard:
         return None
 
 
-def build_plugins(config, namespace, bridge, publish, *, motion=None):
+def build_plugins(config, namespace, bridge, publish, *, motion=None, motion_bridge=None):
     """Keep the five legacy IDs, then add idle M20-structure monitor cards."""
     plugins = (config or {}).get("plugins", {})
     specs = source_specs(config or {})
-    return [ReadOnlyCard(name, plugins.get(name, {}), namespace, bridge, publish,
+    return [ReadOnlyCard(name, plugins.get(name, {}), namespace,
+                         motion_bridge if name in ("motion_info", "hard_estop") and motion_bridge is not None else bridge, publish,
                          source_topics={key: item["topic"] for key, item in specs.items()},
                          source_types={key: item["type"] for key, item in specs.items()}, motion=motion) for name in CARDS]

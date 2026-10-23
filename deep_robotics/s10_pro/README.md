@@ -2,6 +2,8 @@
 
 在现有 PhanthyMotus 卡片框架中按 Lynx M20 结构提供 14 张卡。沿用现有画布的表单、动作选择、按钮和 JSON/点云视图，保留原六卡 ID、端口及连接；没有低层关节控制入口。
 
+2026-10-23 现场已部署 `3555e997` 的 14 卡版本与另行批准的 Core 三项显示增量。该部署没有绑定执行授权或真实控制权适配器，不能进行起立、趴下、速度测试；此前离线候选说明是历史记录。运动状态和急停详情卡现改为复用既有独立运动 reader，避免点云处理拖延其 0.5 秒新鲜度检查；仍只有两个 reader，各卡独立启停。该监控修补在 ARM64/Jazzy 下 54 项聚焦测试通过，部署结果另记于现场验收目录。
+
 ## 2026-10-23 M20 结构改版候选
 
 当前目录为 12 张 sensor 加 2 张 actuator：`state`、`motion_info`、`joints`、`device_status`、`imu`、`odometry`、`lidar`、`hard_estop`、`errors`、`motion_events`、`capabilities`、`ros_graph`，以及执行锁定的 `motion`、`device`。`charging` 动作不提供。前后相机、独立后雷达、GPS、充电状态五项须有可验证的来源和语义才注册；不为凑数量复制主雷达或猜测视频地址。可选 navigation 也不注册。

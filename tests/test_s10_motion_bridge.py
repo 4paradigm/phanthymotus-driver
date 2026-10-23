@@ -74,6 +74,41 @@ def test_motion_observation_uses_its_own_bridge_without_changing_state_card(runt
                 plugin.close()
 
 
+def test_motion_status_monitor_owns_an_independent_lease_on_existing_observer(runtime):
+    sensors, motion = NoRobotBridge(), NoRobotBridge()
+    plugins = runtime.build_runtime_plugins(
+        {"plugins": {"motion_info": {"stale_after_s": .5}, "hard_estop": {"stale_after_s": .5}}},
+        "isolated", sensors, lambda *args: None, motion_bridge=motion)
+    cards = {plugin.name: plugin for plugin in plugins}
+    try:
+        cards["motion_info"].start()
+        assert not sensors.active
+        assert set(motion.active) == {"motion_info"}
+        assert motion.active["motion_info"][0] == {"motion_info"}
+        assert motion.active["motion_info"][1]["stale_after_s"] == .5
+        cards["motion"].start()
+        assert set(motion.active) == {"motion_info", "motion_observer"}
+        cards["hard_estop"].start()
+        assert set(motion.active) == {"motion_info", "motion_observer", "hard_estop"}
+        assert motion.active["hard_estop"][0] == {"hard_estop"}
+        assert motion.active["hard_estop"][1]["stale_after_s"] == .5
+        cards["motion"].stop()
+        assert set(motion.active) == {"motion_info", "hard_estop"}
+        cards["motion_info"].stop()
+        assert set(motion.active) == {"hard_estop"}
+        cards["hard_estop"].stop()
+        assert not motion.active and not sensors.active
+        cards["motion"].start()
+        cards["motion_info"].start()
+        cards["motion_info"].stop()
+        assert set(motion.active) == {"motion_observer"}
+    finally:
+        for plugin in plugins:
+            plugin.stop()
+            if hasattr(plugin, "close"):
+                plugin.close()
+
+
 def test_sensor_ipc_block_does_not_stall_motion_and_each_reader_is_reaped(runtime, tmp_path):
     # Real child pipes deliberately block the sensor event consumer. This checks
     # process/IPC isolation, rather than simulating physical feedback or ROS.
@@ -108,11 +143,15 @@ while True:
         return original_accept(event)
 
     sensors._accept_event = blocked_sensor
-    plugins = runtime.build_runtime_plugins({}, "isolated", sensors, lambda *args: None, motion_bridge=motion)
+    plugins = runtime.build_runtime_plugins(
+        {"plugins": {"motion_info": {"stale_after_s": .5}, "hard_estop": {"stale_after_s": .5}}},
+        "isolated", sensors, lambda *args: None, motion_bridge=motion)
     cards = {plugin.name: plugin for plugin in plugins}
     try:
         cards["state"].start()
         cards["motion"].start()
+        cards["motion_info"].start()
+        cards["hard_estop"].start()
         assert entered.wait(2)
         wait_for(lambda: cards["motion"]._backend.feedback.observation()["fresh"])
         assert sensors.status()["reader_pid"] != motion.status()["reader_pid"]
@@ -122,11 +161,21 @@ while True:
         while time.monotonic() < until:
             observed = cards["motion"]._backend.feedback.observation()
             assert observed["fresh"] is True
+            view = cards["motion_info"].status()
+            assert view["fresh"] is True
+            assert view["source"]["motion_info"]["age_s"] < .5
+            estop = cards["hard_estop"].status()
+            assert estop["fresh"] is True
+            assert estop["source"]["hard_estop"]["age_s"] < .5
             ages.append(observed["age_s"])
             time.sleep(.02)
         assert max(ages) < .5
         assert motion.snapshot("motion_info")["sequence"] > sequence + 5
+        assert len(children) == 2  # Monitor reuses the observer, no third reader.
         assert sensors.snapshot("motion_info")["data"] is None
+        cards["motion_info"].stop()
+        cards["hard_estop"].stop()
+        assert motion.status()["reader_running"]
         release.set()
         wait_for(lambda: sensors.snapshot("motion_info")["fresh"])
         motion_pid = motion.status()["reader_pid"]
