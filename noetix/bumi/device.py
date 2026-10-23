@@ -147,6 +147,7 @@ class _BumiStateNode(Node):
 
     def __init__(self, namespace: str, high_ctrl):
         super().__init__("bumi_state")
+        self.payload_sampler = None
         self._high_ctrl = high_ctrl
         self._imu_topic     = f"/{namespace}/state/imu"
         self._battery_topic = f"/{namespace}/state/battery"
@@ -206,6 +207,13 @@ class _BumiStateNode(Node):
                         })
                     imu = self._high_ctrl.get_imu_data()
                     workmode = self._high_ctrl.get_mode()
+                    # Share raw, unrounded feedback with the read-only payload
+                    # sampler; no second SDK connection or extra polling thread.
+                    if self.payload_sampler is not None:
+                        try:
+                            self.payload_sampler.accept_getter(joint_state, imu, workmode)
+                        except Exception as exc:
+                            self.payload_sampler.record_error(exc)
                     joints_data = {
                         "joints": joints,
                         "imu_quat": [float(imu.ori[3]), float(imu.ori[0]), float(imu.ori[1]), float(imu.ori[2])],  # SDK [x,y,z,w] → renderer [w,x,y,z]
@@ -231,6 +239,8 @@ class _BumiStateNode(Node):
 
                 time.sleep(0.02)  # 50 Hz poll loop
             except Exception as e:
+                if self.payload_sampler is not None:
+                    self.payload_sampler.record_error(e)
                 self.get_logger().warn(f"State poll error: {e}")
                 time.sleep(0.5)
 
