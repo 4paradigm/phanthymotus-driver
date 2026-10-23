@@ -175,7 +175,7 @@ def test_shared_service_packages_and_skill_gate(tmp_path):
         writer=episode(tmp_path/'episodes')
         plugin=owner.teaching
         schema=plugin.get_tools()[0]['inputSchema']
-        assert set(schema['x-action-params'])=={'start','info','preview','run','stop','import','export'}
+        assert set(schema['x-action-params'])=={'start','info','preview','run','stop','import','export','reset'}
         for action in ('episode_list','episode_details','annotate','training_export','training_info','unlock'):
             assert action in schema['x-workbench']['actions']
             plugin._validate(action,{})

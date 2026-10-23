@@ -256,3 +256,66 @@ def test_shutdown_does_not_reset_unverified_previous_motion(unsafe):
     result=asyncio.run(plugin._reset_on_stop())
     assert result['status']==('error' if unsafe else 'completed')
     assert ([0]*14 in calls)==(not unsafe)
+
+
+@pytest.mark.parametrize('status', ['completed', 'error'])
+def test_public_reset_previews_guards_and_reports_actual_completion(tmp_path, monkeypatch, status):
+    import threading
+    import concurrent.futures
+    from device import Adapter
+    from test_sensors import settings
+    gate=threading.Event();constructed=[];reports=[]
+    class Worker:
+        phase='initializing'
+        def __init__(self,*args):constructed.append(args)
+        def run(self):
+            assert gate.wait(3)
+            return dict(status=status,physical_stop_verified=status=='completed',
+                        output_stopped=True,motion_may_continue=status!='completed')
+    monkeypatch.setattr('teaching_replay.SDKReplay',Worker)
+    async def run():
+        reader=Reader();reader.settings={'url':'ws://127.0.0.1:5000'}
+        cfg=settings(enabled_cards=['tron2_teaching','joint_state'])
+        cfg.update(teaching_directory=str(tmp_path),camera_urls={})
+        owner=Adapter(lambda *a:None,cfg,reader=reader)
+        plugin=owner.teaching
+        owner.reset.call=lambda _:dict(target_q=[0]*14)
+        async def report(tool,ident,state,result):reports.append((tool,ident,state,result));return True
+        owner._report_completion=report
+        schema=plugin.get_tools()[0]['inputSchema']
+        assert 'reset' in schema['x-action-params']
+        assert 'reset' in schema['x-completion']['actions']
+        preview=await asyncio.to_thread(plugin.dispatch,'reset',{})
+        assert not preview['executed'] and not constructed
+        assert preview['head_target']==preview['gripper_target']==[0,0]
+        args=preview['execution_arguments']
+        with pytest.raises(ValueError,match='user_confirmation_required'):
+            await asyncio.to_thread(plugin.dispatch,'reset',args)
+        args.update(workspace_clear=True,take_control=True)
+        with pytest.raises(ValueError,match='exclusive_confirmation'):
+            await asyncio.to_thread(plugin.dispatch,'reset',args)
+        args['exclusive_control_confirmed']=True
+        plugin.adapter.capture.info=lambda:dict(recording=True)
+        with pytest.raises(RuntimeError,match='robot_busy'):
+            await asyncio.to_thread(plugin.dispatch,'reset',args)
+        plugin.adapter.capture.info=lambda:dict(recording=False)
+        plugin.teardown_future=concurrent.futures.Future()
+        with pytest.raises(ValueError,match='reset_in_progress'):
+            await asyncio.to_thread(plugin.dispatch,'reset',args)
+        plugin.teardown_future=None
+        result=await asyncio.to_thread(plugin.dispatch,'reset',args)
+        assert result['state']=='running' and not reports
+        try:
+            with pytest.raises(RuntimeError,match='robot_busy'):
+                await asyncio.to_thread(plugin.dispatch,'reset',args)
+            assert len(constructed)==1
+        finally:gate.set()
+        await asyncio.to_thread(plugin.observer.join,3)
+        assert not plugin.observer.is_alive() and plugin.pending is None
+        assert len(reports)==1
+        tool,ident,reported,outcome=reports[0]
+        assert (tool,ident,reported)==('tron2_teaching',result['action_id'],status)
+        assert outcome['source']=='configured_home'
+        assert outcome['physical_stop_verified']==(status=='completed')
+        assert not reader.commands
+    asyncio.run(run())

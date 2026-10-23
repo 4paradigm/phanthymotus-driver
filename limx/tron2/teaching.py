@@ -204,7 +204,9 @@ class TronTeachingPlugin(TeachingPlugin):
         schema['properties'].update({k:{'type':'number','minimum':0,'maximum':100} for k in ('gripper_speed','gripper_force')})
         schema['properties']['exclusive_control_confirmed']={'type':'boolean','description':'操作者明确确认本次原厂 VR 及其他控制程序已停止，并在回放期间保持独占；不得自行填写 true'}
         schema['properties']['physical_stop_confirmed']={'type':'boolean','description':'操作者现场确认机器人已停止；不得自行填写 true'}
-        extra={'unlock':([], '现场确认后检查静止并解除回放占用，不发送运动'),
+        extra={'reset':(['execute','workspace_clear','take_control','exclusive_control_confirmed'],
+                        '恢复原位：双臂回保存姿态、头部回正、双夹爪闭合；execute=false只读预览，执行须确认路径及独占，等待ACP终态'),
+            'unlock':([], '现场确认后检查静止并解除回放占用，不发送运动'),
             'episode_list':([], '列出完整及诊断录制'),
             'episode_details':(['episode_id'],'查看数据质量'),
             'annotate':(['episode_id','task','outcome','notes'],'更新任务、结果和备注'),
@@ -212,11 +214,13 @@ class TronTeachingPlugin(TeachingPlugin):
             'training_info':([], '读取训练导出结果')}
         for action,(_,description) in extra.items():
             schema['properties']['action']['enum'].append(action)
-            schema['properties']['action']['oneOf'].append({'const':action,'title':description})
+            schema['properties']['action']['oneOf'].append({'const':action,'title':'恢复原位' if action=='reset' else description})
             schema['x-workbench']['actions'].append(action)
         schema['x-action-params']['run']['params'] += ['gripper_speed','gripper_force','exclusive_control_confirmed']
+        schema['x-action-params']['reset']=dict(params=extra['reset'][0],description=extra['reset'][1])
+        schema['x-completion']['actions'].append('reset')
         schema['x-workbench']['title']='TRON2 录制与回放'
-        tools[0]['description']='原厂 VR 只读数据录制、实测轨迹回放和 LeRobot v3 训练导出。回放每次须由操作者确认控制独占。'
+        tools[0]['description']='原厂 VR 只读数据录制、实测轨迹回放、恢复原位和 LeRobot v3 训练导出。回放和复位每次须由操作者确认控制独占。'
         return tools
 
     def dispatch(self,action,args):
@@ -243,6 +247,29 @@ class TronTeachingPlugin(TeachingPlugin):
             return result
         if self.teardown_future and not self.teardown_future.done():
             raise ValueError('reset_in_progress')
+        if action=='reset':
+            with self.lifecycle_lock,self.lock:
+                if self.teardown_future and not self.teardown_future.done():
+                    raise ValueError('reset_in_progress')
+                self._idle()
+                home=self.adapter.owner.reset.call('execute')
+                if args.get('execute') is not True:
+                    return dict(executed=False,motion_sent=False,confirmation_required=True,
+                        target_q=home['target_q'],head_target=[0,0],gripper_target=[0,0],
+                        gripper_speed=100,gripper_force=50,
+                        message='SDK初始化可能经过中间姿态并张开夹爪。请确认路径畅通、原厂VR及其他控制程序已停止。',
+                        execution_arguments=dict(action='reset',execute=True,workspace_clear=False,
+                                                 take_control=False,exclusive_control_confirmed=False))
+                if args.get('workspace_clear') is not True or args.get('take_control') is not True:
+                    raise ValueError('user_confirmation_required')
+                if args.get('exclusive_control_confirmed') is not True:
+                    raise ValueError('operator_exclusive_confirmation_required')
+                result=self.adapter.sync(self.adapter.replay.reset_home(home['target_q']))
+                self.pending=dict(action_id=result['action_id'],purpose='reset')
+                self.observer=threading.Thread(target=self._observe,
+                    args=(result['action_id'],'reset',None),name='teaching-completion',daemon=True)
+                self.observer.start()
+                return result
         if action=='unlock':
             with self.lock:
                 if self.adapter.capture.info()['recording']:raise ValueError('finish_recording_first')
