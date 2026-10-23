@@ -333,3 +333,50 @@ def test_getter_empty_and_large_finite_statistics():
     result=probe.torque_statistics(data)
     assert result['left_arm_tau'][0]['mean']==0
     assert result['left_arm_tau'][0]['population_stddev']==pytest.approx(1e300)
+
+
+@pytest.mark.parametrize('envelope,expected',[
+    ({'jsonrpc':'2.0','id':1,'error':{'code':-32601,'message':'Unknown tool: payload_mass'}},'MCP error -32601: Unknown tool'),
+    ({'error':{'code':-32603,'message':'internal info failure'}},'MCP error -32603: internal info failure'),
+    ({'code':404,'message':'wrong endpoint'},'missing result'),
+    ({'result':{'content':[]}},'no text content'),
+    ({'result':{'content':[{'text':'not json'}]}},'not JSON'),
+    ({'result':{'content':[{'text':'{"state":"error","message":"plugin unavailable"}'}]}},'no diagnostics'),
+])
+def test_mcp_error_envelopes_preserve_the_real_reason(envelope,expected):
+    with pytest.raises(probe.MCPResponseError,match=expected):
+        probe.parse_mcp_info(envelope)
+
+
+def test_unknown_tool_is_unavailable_not_zero_and_not_retried():
+    import threading
+    from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+    calls=[]
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,*a): pass
+        def do_POST(self):
+            calls.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            raw=json.dumps({'jsonrpc':'2.0','id':1,'error':{'code':-32601,'message':'Unknown tool: payload_mass'}}).encode()
+            self.send_response(200)
+            self.send_header('Content-Length',str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    thread=threading.Thread(target=server.serve_forever)
+    thread.start()
+    observer=probe.MCPObserver(f'http://127.0.0.1:{server.server_port}/mcp')
+    observer.start()
+    try:
+        observer.thread.join(timeout=1)
+    finally:
+        observer.stop()
+        server.shutdown()
+        thread.join(2)
+        server.server_close()
+    summary=observer.summary(0,time.monotonic())
+    assert len(calls)==1
+    assert summary['status']=='unavailable'
+    assert summary['error_count']==1
+    assert summary['unique_getter_observations_in_window']==0
+    assert summary['all_arm_zero_fraction'] is None
+    assert 'MCP error -32601: Unknown tool: payload_mass' in summary['recent_errors'][0]

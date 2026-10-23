@@ -373,12 +373,49 @@ def torque_statistics(samples):
     return sides
 
 
+
+class MCPResponseError(ValueError):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def parse_mcp_info(envelope):
+    if not isinstance(envelope, dict):
+        raise MCPResponseError("MCP response is not a JSON object")
+    error = envelope.get("error")
+    if error is not None:
+        code = error.get("code") if isinstance(error, dict) else None
+        message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        raise MCPResponseError("MCP error " + str(code) + ": " + str(message)[:300], code)
+    result = envelope.get("result")
+    if not isinstance(result, dict):
+        message = str(envelope.get("message", ""))[:200]
+        raise MCPResponseError("MCP response missing result; keys=" + ",".join(sorted(map(str, envelope))) + "; " + message)
+    content = result.get("content")
+    if not isinstance(content, list):
+        raise MCPResponseError("MCP result has no content list")
+    texts = [block.get("text") for block in content if isinstance(block, dict) and isinstance(block.get("text"), str)]
+    if not texts:
+        raise MCPResponseError("MCP result has no text content")
+    if result.get("isError"):
+        raise MCPResponseError("MCP tool error: " + texts[0][:300])
+    try:
+        payload = json.loads(texts[0])
+    except ValueError as exc:
+        raise MCPResponseError("MCP info text is not JSON: " + texts[0][:150]) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("diagnostics"), dict):
+        message = str(payload.get("message", payload.get("error", "")))[:200] if isinstance(payload, dict) else ""
+        raise MCPResponseError("MCP info has no diagnostics object; " + message)
+    return payload
+
 class MCPObserver:
     """Only read payload_mass.info in the existing driver. No SDK initialization."""
     def __init__(self, url):
         self.url = url
         self.samples = {}
         self.poll_count = 0
+        self.error_count = 0
         self.errors = []
         self.cancel = threading.Event()
         self.thread = threading.Thread(target=self._run, name="payload_mcp_observer", daemon=True)
@@ -402,7 +439,7 @@ class MCPObserver:
                 request = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(request, timeout=1) as response:
                     envelope = json.load(response)
-                payload = json.loads(envelope["result"]["content"][0]["text"])
+                payload = parse_mcp_info(envelope)
                 sample = payload["diagnostics"]["latest"]
                 if (not isinstance(sample, dict) or not _finite(sample.get("host_monotonic_s"))
                         or type(sample.get("serial")) is not int
@@ -414,8 +451,12 @@ class MCPObserver:
                 if len(self.samples) > 512:
                     self.samples.pop(next(iter(self.samples)))
             except Exception as exc:
-                self.errors.append(str(exc)[:200])
+                self.error_count += 1
+                self.errors.append(str(exc)[:400])
                 self.errors = self.errors[-8:]
+                if isinstance(exc, MCPResponseError) and exc.code in (-32601, -32602):
+                    return  # Deterministic unavailable tool/arguments: do not hammer the service.
+                self.cancel.wait(0.5)
             self.cancel.wait(max(0, 0.1 - (time.monotonic() - started)))
 
     def summary(self, start, end):
@@ -425,8 +466,9 @@ class MCPObserver:
             key = str(sample.get("workmode"))
             mode_counts[key] = mode_counts.get(key, 0) + 1
         zero = sum(all(s["tau"][j] == 0 for j in (0, 1, 2, 3, 10, 11, 12, 13)) for s in samples)
-        return {"comparison_type": "overlapping_host_monotonic_windows_not_frame_aligned",
-                "poll_count": self.poll_count, "unique_getter_observations_in_window": len(samples),
+        return {"status": "observed" if samples else "no_overlap" if self.samples else "unavailable",
+                "comparison_type": "overlapping_host_monotonic_windows_not_frame_aligned",
+                "poll_count": self.poll_count, "error_count": self.error_count, "unique_getter_observations_in_window": len(samples),
                 "all_arm_zero_observations": zero, "all_arm_zero_fraction": zero / len(samples) if samples else None,
                 "workmode_counts": mode_counts, "recent_errors": list(self.errors),
                 "effective_sample_count": None, **torque_statistics(samples)}
