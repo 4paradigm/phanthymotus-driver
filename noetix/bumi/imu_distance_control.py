@@ -183,8 +183,8 @@ HEADING_PULSE = 0.5
 # target action heading strategy: turn first for a large bearing error, then
 # walk with the pulse hold; realign in place if the heading drifts while walking.
 TARGET_TURN_FIRST_DEG = 30.0
-TARGET_TURN_DONE_DEG = 5.0
-TARGET_REALIGN_DEG = 20.0
+TARGET_TURN_DONE_DEG = 2.0
+TARGET_REALIGN_DEG = 12.0
 # After the position arrives, turn in place to face the target direction. The
 # final heading is a comfort alignment: best effort, never a reason to fail a
 # position-valid arrival.
