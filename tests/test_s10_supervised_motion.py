@@ -300,3 +300,52 @@ def test_explicit_prepare_worker_sends_no_command_and_creates_no_task(runtime):
     assert transport.running and not transport.calls and not notifier.sent
     assert plugin.status()['active_request'] is None
     with pytest.raises(ValueError):plugin.dispatch('prepare_test',{'request_id':'must-not-be-accepted'})
+
+
+def test_identical_canvas_save_during_posture_does_not_cancel_or_close_worker(runtime):
+    plugin,_,_,_,transport,_=runtime
+    begin(runtime)
+    generation=plugin._generation
+    for updates in ({},dict(plugin._settings),{'config':dict(plugin._settings)}):
+        plugin.configure(updates)
+        assert plugin._active is not None and not plugin._cancel.is_set()
+        assert plugin._generation==generation and not transport.closed
+    assert finish(runtime)['completed'] is True
+    assert [c[0] for c in transport.calls]==[1]
+
+
+def test_real_setting_change_still_cancels_the_active_supervised_task(runtime):
+    plugin,_,_,_,transport,_=runtime
+    begin(runtime)
+    plugin.configure({'refresh_hz':3.})
+    wait_for(lambda: plugin.status()['active_request'] is None)
+    result=plugin.status()['last_result']
+    assert result['reason']=='configuration_changed' and result['status']=='error'
+    assert result['physical_state_unknown'] and transport.closed
+    assert [c[0] for c in transport.calls]==[1]
+
+
+def test_core_reapplying_saved_enabled_before_confirm_preserves_active_request(runtime):
+    plugin,backend,_,_,transport,_=runtime
+    begin(runtime)
+    wait_for(lambda: backend.target_feedback('stand','synthetic-1')['confirmed'])
+    # Real Core /api/mcp/.../call replays config before confirm_pose.
+    plugin.dispatch('config',{'enabled':True})
+    reply=plugin.dispatch('confirm_pose',{'request_id':'synthetic-1','observed_action':'stand'})
+    assert reply['accepted'] is True
+    wait_for(lambda: plugin.status()['active_request'] is None)
+    assert plugin.status()['last_result']['completed']
+    assert not transport.closed and [x[0] for x in transport.calls]==[1]
+
+
+def test_core_reapplying_config_before_lie_cannot_cancel_or_replace_unconfirmed_stand(runtime):
+    plugin,_,_,_,transport,_=runtime
+    begin(runtime)
+    plugin.dispatch('config',{'enabled':True})
+    busy=plugin.dispatch('lie',{'request_id':'second-before-confirmation'})
+    assert busy['state']=='busy'
+    assert busy['reason']=='confirm_or_cancel_active_posture_first'
+    assert busy['active_request_id']=='synthetic-1' and busy['active_action']=='stand'
+    assert not transport.closed and not plugin._cancel.is_set()
+    assert plugin._tasks.get('second-before-confirmation') is None
+    assert [x[0] for x in transport.calls]==[1]

@@ -501,6 +501,11 @@ class MotionPlugin:
         updates = normalize_config_updates(options, motion_defaults())
         with self._lock:
             updated = self._validate({**self._settings, **updates})
+            # Core reapplies saved settings before forwarding tool actions.
+            # Repeating a configuration is not a control change and must not
+            # cancel the task whose result the user is inspecting.
+            if updated == self._settings:
+                return self.status()
             active = self._active is not None
             self._generation += 1
             self._settings = updated

@@ -314,6 +314,17 @@ class SupervisedMotionPlugin(MotionPlugin):
                     'command_worker_running': self._backend.transport.status().get('worker_running') is True}
         return super().dispatch(action, args)
 
+    def execute(self, action, arguments):
+        reply = super().execute(action, arguments)
+        if reply.get('state') == 'busy':
+            with self._lock:
+                active = copy.deepcopy(self._active)
+            if active is not None:
+                reply.update(reason='confirm_or_cancel_active_posture_first',
+                    active_request_id=active['request_id'], active_action=active['action'],
+                    instruction='After visually checking the active pose, call confirm_pose with its request_id and observed_action before requesting another posture.')
+        return reply
+
     def _run_action(self, record, request, started):
         action, rid, deadline = request['action'], request['request_id'], request['expires_monotonic']
         receipt, completed, reason = {}, False, 'posture_confirmation_timeout'
