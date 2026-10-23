@@ -362,6 +362,66 @@ def _phase_leg(plant, parallel_after_m):
     return PhaseLeg
 
 
+def test_target_walks_and_turns_inside_the_turn_first_band(monkeypatch):
+    clock = [0.0]
+    commands = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+            commands.append((vx, vyaw))
+
+    owner = Owner()
+    bearing = math.atan2(0.5, 1.0)
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+            self._last = None
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
+        def observe(self, joints, quaternion, now, frozen=False):
+            if frozen:
+                self.velocity = [0.0, 0.0, 0.0]
+                return
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            step = 0.16*dt if owner.command else 0.0
+            self.position = [self.position[0]+step*math.cos(bearing),
+                             self.position[1]+step*math.sin(bearing),
+                             self.position[2]]
+            self.velocity = [step*math.cos(bearing)/dt, step*math.sin(bearing)/dt, 0.0]
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 1.0, 0.5)   # 26.6 deg: inside the turn-first band
+    driving = [(vx, vyaw) for vx, vyaw in commands if vx or vyaw]
+    assert driving, commands
+    # It must walk forward while turning, not stop and turn in place first.
+    assert any(vx > 0 for vx, vyaw in driving[:5]), driving[:5]
+
+
 def test_target_turns_first_for_a_large_bearing(monkeypatch):
     clock = [0.0]
     commands = []

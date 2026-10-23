@@ -479,6 +479,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     last_joints = None
     joint_updates = 0
     walking = None
+    walk_aligned = False
     last_command = 0.0
     last_command_at = None
     dead_reckoned_m = 0.0
@@ -603,13 +604,17 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     brake_started = now
                 else:
                     err_deg = math.degrees(heading_error)
-                    if (walking and not near_target
+                    if (walking and walk_aligned and not near_target
                             and abs(err_deg) > TARGET_REALIGN_DEG):
-                        # Heading drifted: stop and turn in place again. Not
-                        # near the point: there the approach direction is kept.
+                        # Heading drifted after the initial alignment: stop and
+                        # turn in place again. At the walk start the error may
+                        # still be within the turn-first band, so it must not
+                        # flip a fresh walk back into an in-place turn.
                         walking = False
+                        walk_aligned = False
                     elif not walking and abs(err_deg) <= TARGET_TURN_DONE_DEG:
                         walking = True
+                        walk_aligned = True
                     if walking:
                         if err_deg < -1.5:
                             turn = -HEADING_PULSE
@@ -617,6 +622,8 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                             turn = HEADING_PULSE
                         else:
                             turn = 0.0
+                        if abs(err_deg) <= TARGET_TURN_DONE_DEG:
+                            walk_aligned = True
                         last_command = 0.6 if distance > 0.3 else 0.5
                         publish(last_command, turn)
                     else:
