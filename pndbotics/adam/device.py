@@ -1738,7 +1738,13 @@ class ArmControlPlugin:
             last_feedback_at = self._last_feedback_at
         if (last_feedback_at is not None
                 and time.monotonic() - last_feedback_at > self._feedback_timeout_s):
-            self._fail_feedback("rt/lowstate feedback timed out")
+            with self._lock:
+                # An idle reader owns no command stream. Keep receiving after
+                # a gap so fresh feedback can make a new request eligible.
+                # Once publishing, a gap remains a latched fault: never resume
+                # an interrupted trajectory when samples return.
+                if self._active or self._streaming:
+                    self._fail_feedback("rt/lowstate feedback timed out")
 
     def _verify_control_ownership(self):
         try:
@@ -2100,9 +2106,14 @@ class ArmControlPlugin:
         if self._publisher is None:
             return {"success": False, "code": "DDS_UNAVAILABLE",
                     "message": "rt/lowcmd publisher is unavailable"}
-        if (self._last_feedback_at is not None
-                and time.monotonic() - self._last_feedback_at > self._feedback_timeout_s):
-            self._fail_feedback("rt/lowstate feedback timed out")
+        with self._lock:
+            if (self._feedback_error is None and self._last_feedback_at is not None
+                    and time.monotonic() - self._last_feedback_at > self._feedback_timeout_s):
+                if self._active or self._streaming:
+                    self._fail_feedback("rt/lowstate feedback timed out")
+                else:
+                    return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                            "message": "rt/lowstate feedback timed out; waiting for fresh feedback"}
         if self._feedback_error is not None:
             return {"success": False, "code": self._fault_code,
                     "message": self._feedback_error}
@@ -2513,12 +2524,12 @@ class ArmControlPlugin:
                     "joints_set": len(targets), "duration_s": span,
                     "protocol": "rt/lowcmd"}
         if action == "info":
-            self._ready_error()
+            ready_error = self._ready_error()
             return {"state": "active" if self._active else "idle",
-                    "lowstate_ready": (self._state_ready.is_set()
-                                       and self._feedback_error is None),
+                    "lowstate_ready": ready_error is None,
                     "dds_writer_ready": self._publisher is not None,
-                    "writes": self._writes, "last_error": self._feedback_error or self._last_error,
+                    "writes": self._writes,
+                    "last_error": (ready_error["message"] if ready_error else self._last_error),
                     "measured_arrival": None,
                     "protocol": "rt/lowcmd"}
         return None
