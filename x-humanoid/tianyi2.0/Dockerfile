@@ -2,6 +2,7 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG TARGETARCH
 
 WORKDIR /work
 
@@ -37,9 +38,13 @@ ENV PYTHONPATH=/tianyi_ws/install/lyre_msgs/local/lib/python3.10/dist-packages:/
 ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/lyre_msgs:${AMENT_PREFIX_PATH}
 ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
 
+COPY native/ /tmp/tianyi-loco-sdk-src/
+RUN sh /tmp/tianyi-loco-sdk-src/build_sdk.sh "${TARGETARCH:-$(uname -m)}" && \
+    rm -rf /tmp/tianyi-loco-sdk-src
+
 COPY resource/ /work/resource/
 COPY common/ /work/common/
-COPY main.py device.py servo.py joints_bridge.py light.py nav_client.py ext_devices.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
+COPY main.py device.py servo.py joints_bridge.py light.py nav_client.py loco_state.py loco_servo.py loco_servo_process.py slamtec_velocity.py ext_devices.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
 COPY dds-local.xml /opt/phanthy-motus/
 COPY deploy/     /deploy/
 RUN mkdir -p /opt/phanthy-motus/data/maps
