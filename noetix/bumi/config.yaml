@@ -36,6 +36,20 @@ plugins:
     min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
     # 已经在走的时候的偏航死区。
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
+  # 软件急停闸：trigger 后锁存，所有非零速度在 LocoPlugin._publish_cmd 被丢弃，
+  # 直到显式 reset(confirm=true)。它不读取物理急停状态，物理急停按钮仍是最终手段。
+  estop:
+    enabled: true
+    # 状态话题发布频率（Hz），范围 (0, 50]
+    publish_hz: 10
+    # 锁存状态落盘路径：容器重启后保持锁存。文件“存在”即锁存，reset 会删除它；
+    # 文件损坏、字段不合法或写着 latched=false 都按锁存处理（fail-closed）。
+    # 该目录由 deploy/service.yml 从机器人宿主机挂载进来。
+    # 注意：把 estop 关掉不会清除已有锁存，运动仍被拦住，需要删除该文件或重新启用卡片。
+    state_path: /opt/phanthy-motus/data/bumi/estop_state.json
+    # 关闭时只有卡片上的 trigger 会锁存。打开后 workmode=26（保护模式）也会自动
+    # 锁存；注意锁存同时会拒绝 stand_up（从保护模式起身的唯一路径），所以默认关闭。
+    auto_trigger_on_protection: false
   mic:
     enabled: true
   sound_direction:

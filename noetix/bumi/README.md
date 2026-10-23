@@ -1,6 +1,7 @@
 # Noetix Bumi driver
 
-The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state,
+independent sound-direction and software emergency-stop cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
 
@@ -439,6 +440,60 @@ Two behaviours verified on hardware and worth not re-deriving:
 Likewise `frames_submitted` in `info` counts frames handed to the SDK, not
 frames heard: `publish_external_audio_playback_stream` is fire-and-forget, so a
 rising count proves the subscription works and nothing more.
+
+## `estop` card (software latch)
+
+The vendor SDK exposes no emergency-stop state, so this card is a **driver-level
+software latch**, not a replacement for the robot's physical E-stop button.
+
+- `trigger` sets the latch, immediately sends one zero velocity, pauses
+  `loco_servo` and ends any `loco.move` thread.
+- A running semantic action (`wave`, `handshake`, `cheer`, `dance_*`,
+  `wipe_tears`) or teaching playback is exited with the same documented `WALK`
+  command those cards already use, and the card waits up to about three
+  seconds for walking mode. `stand_up` (27) and `lie_prone` (28) are not
+  aborted: the vendor documents no cancellation for those trajectories, and
+  WALK mid-fall could drop the robot.
+- While latched, every non-zero velocity is dropped in `LocoPlugin._publish_cmd`
+  before it reaches the SDK. `loco_servo` forwards through
+  `loco.publish_velocity`, so the call-shaped and the streaming path are gated
+  by the same rule. Zero is always allowed — a stop is not the thing an
+  emergency stop should prevent.
+- `loco.move`, posture, preset and teaching actions return
+  `code: ESTOP_ACTIVE`. Only `loco.stop_move`, `semantic_action.reset` and
+  `action_recording.stop_playback` stay callable, because they reduce motion.
+- `reset` requires `confirm: true`; stopping the card (`stop` action) or the
+  bundle does **not** release the latch.
+- The latch is written to `/opt/phanthy-motus/data/bumi/estop_state.json` and
+  restored at startup, so a container restart does **not** release it. The
+  file sits on the same host mount as the other runtime data.
+- Latched is represented by the **existence** of that file: `trigger` creates
+  it before writing the record, and `reset(confirm: true)` deletes it. A
+  partial write, a failed fsync, an unreadable file, a syntactically valid but
+  schema-invalid record, or one that claims `latched: false` all come back
+  **latched** (fail-closed) rather than free to move. A state directory that
+  cannot be written at startup also comes back latched
+  (`estop_state_unwritable`).
+- `trigger` reports `durable: false` plus `code: ESTOP_NOT_DURABLE` when the
+  marker cannot be written. The latch still blocks motion in this process, but
+  the restart guarantee failed and the message says so instead of claiming a
+  clean E-stop.
+- `reset` only succeeds once the marker is gone. If the file cannot be
+  removed, the card returns `code: ESTOP_CLEAR_FAILED`, the latch stays set,
+  and motion stays blocked — a release a restart would undo is not a release.
+- Disabling `plugins.estop` does **not** clear an existing latch. Motion stays
+  blocked, the bundle logs a warning at startup, and the state file must be
+  removed or the card re-enabled to reset it.
+- `auto_trigger_on_protection` (default off) latches on workmode 26. It is off
+  by default because a latched driver also refuses `stand_up`, which is the
+  documented way out of protection — enabling it is an operator decision.
+
+State is published on `/<namespace>/state/estop` as `data/json` at
+`publish_hz` (default 10). Verify from the host with:
+
+```bash
+ros2 topic echo /<robot_namespace>/state/estop
+```
 
 Useful observations while the driver is running:
 
