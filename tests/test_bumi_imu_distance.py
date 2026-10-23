@@ -371,6 +371,51 @@ def _phase_leg(plant, parallel_after_m):
     return PhaseLeg
 
 
+def test_target_reports_arrival_at_the_requested_point(monkeypatch):
+    clock = [0.0]
+    commands = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            commands.append((vx, vyaw))
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.3, 0.4, 0.0]   # already at the target point
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+        def reset_baseline(self):
+            self.position = [0.3, 0.4, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+        def observe(self, joints, quaternion, now, frozen=False):
+            pass
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.3, 0.4)
+    assert result['state'] == 'done', result.get('error')
+    assert result['action'] == 'target'
+    assert result['requested_target_x_m'] == 0.3
+    assert result['requested_target_y_m'] == 0.4
+    assert result['final_position_error_m'] == pytest.approx(0.0, abs=1e-9)
+    assert commands and commands[-1] == (0, 0)
+
+
 def test_distance_waits_for_parallel_feet_before_braking(monkeypatch):
     plant = Plant(monkeypatch)
     monkeypatch.setattr(module, 'LegOdometry', _phase_leg(plant, 0.50))

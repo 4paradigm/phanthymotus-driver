@@ -526,15 +526,19 @@ class LocoPlugin:
     def _loco_target_tool(self) -> dict:
         return {
             "name": "loco_target", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：按腿式里程计估计距离前进/后退/侧移，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在打滑与漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动：按腿式里程计估计距离前进/后退/侧移、按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在打滑与漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move", "rotate", "stop_move", "status"]},
+                    "action": {"type": "string", "enum": ["move", "rotate", "target", "stop_move", "status"]},
                     "direction": {"type": "string", "default": "前进",
                                   "description": "移动方向：前进、后退、左移、右移（也支持 forward/backward/left/right）；留空为前进。左右为保持机身朝向的侧移。"},
                     "distance_m": {"type": "number", "minimum": 0.1, "maximum": 3,
                                    "description": "沿指定起点机身方向移动的正数距离（米）；按腿式里程计估计，非经验证的实际距离。启动前保持静止。"},
+                    "x_m": {"type": "number", "minimum": -3, "maximum": 3,
+                            "description": "target 动作：目标点在启动时机身系的前后坐标（米，正=前）。"},
+                    "y_m": {"type": "number", "minimum": -3, "maximum": 3,
+                            "description": "target 动作：目标点在启动时机身系的左右坐标（米，正=左）。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
@@ -542,12 +546,14 @@ class LocoPlugin:
                 "x-action-params": {
                     "move": {"params": ["direction", "distance_m"], "description": "按腿式里程计估计沿指定方向移动；默认前进，左右为侧移。打滑系数在卡片配置里设置，对之后所有移动生效。数据异常时停车报错，精度待实测。"},
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
+                    "target": {"params": ["x_m", "y_m"],
+                               "description": "走到启动机身系下的目标点 (x,y)：朝向目标先转/边走边转，只前进不横移；到达位置容差后停车。距离 0.1–3 m。"},
                     "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
                     "status": {"params": [], "description": "查询当前目标动作、距离反馈来源及估计位移或转角结果。"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
                 # Both actions retain the existing asynchronous ACP contract.
-                "x-completion": {"actions": ["move", "rotate"], "timeout": 120},
+                "x-completion": {"actions": ["move", "rotate", "target"], "timeout": 120},
             },
             "configSchema": {
                 "type": "object",
@@ -711,6 +717,8 @@ class LocoPlugin:
             return self._do_rotate(args)
         elif tool_name == "loco_target" and action == "move":
             return self._do_destination(args, "move")
+        elif tool_name == "loco_target" and action == "target":
+            return self._do_destination(args, "target")
         elif tool_name == "loco_target" and action == "status":
             return self._rotate_status()
         elif tool_name == "loco_target" and action == "stop_move":
@@ -888,10 +896,13 @@ class LocoPlugin:
             self._destination_action = action
         try:
             value, terminal = (self._rotate_preflight(args) if action == "rotate"
-                               else self._distance_preflight(args))
+                               else (self._target_preflight(args) if action == "target"
+                                     else self._distance_preflight(args)))
             if terminal is None:
                 if action == "rotate":
                     expected_duration_s = _rotate_timeout_s(value)
+                elif action == "target":
+                    expected_duration_s = min(60.0, 12.0+20.0*value)
                 else:
                     from imu_distance_control import distance_timeout
                     expected_duration_s = distance_timeout(value)
@@ -906,8 +917,11 @@ class LocoPlugin:
                 return {"state": "running", "action_id": action_id,
                         "expected_duration_s": expected_duration_s,
                         ("requested_angle_deg" if action == "rotate" else "requested_distance_m"): value,
+                        **({"requested_target_x_m": float(args.get('x_m')),
+                            "requested_target_y_m": float(args.get('y_m'))}
+                           if action == "target" else {}),
                         **({'feedback_source': 'leg_odometry_experimental',
-                            'accuracy_validated': False} if action == 'move' else {})}
+                            'accuracy_validated': False} if action in ('move', 'target') else {})}
         except Exception as exc:
             terminal = {"state": "error",
                         "error": f"{type(exc).__name__}: {exc}",
@@ -931,14 +945,15 @@ class LocoPlugin:
         result = None
         owns_velocity = False
         try:
-            if action == "move" or abs(float(args["angle_deg"])) >= 0.05:
+            if action in ("move", "target") or abs(float(args["angle_deg"])) >= 0.05:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
                 self._preempt_servo(f"loco_target.{action}")
                 owns_velocity = True
-            result = self._do_rotate_impl(args) if action == "rotate" else self._do_distance_impl(args)
+            result = self._do_rotate_impl(args) if action == "rotate" else (
+                self._do_target_impl(args) if action == "target" else self._do_distance_impl(args))
             result["action"] = action
-            if action == 'move':
+            if action in ('move', 'target'):
                 result.setdefault('feedback_source', 'leg_odometry_experimental')
                 result.setdefault('estimated_quality', 'unavailable')
                 result.setdefault('accuracy_validated', False)
@@ -1053,6 +1068,37 @@ class LocoPlugin:
         from imu_distance_control import movement_direction
         direction, _, _ = movement_direction(args.get('direction', ''))
         return self._slip_scales[direction]
+
+    def _target_preflight(self, args):
+        try:
+            x = float(args.get('x_m'))
+            y = float(args.get('y_m'))
+        except (TypeError, ValueError):
+            return None, {"state": "error", "error": "x_m and y_m must be numbers"}
+        if (not math.isfinite(x) or not math.isfinite(y)
+                or not 0.1 <= math.hypot(x, y) <= 3.0):
+            return None, {"state": "error",
+                          "error": "x_m/y_m must give a finite target 0.1-3 m from the start"}
+        problem = self._rotate_mode_error()
+        if problem is not None:
+            return None, problem
+        from imu_distance_control import decode_imu
+        decode_imu(self._read_distance_imu())
+        return math.hypot(x, y), None
+
+    def _do_target_impl(self, args):
+        from imu_distance_control import run_target
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+            if self._move_thread.is_alive():
+                return {"state": "error", "error": "previous move has not stopped"}
+        self._set_servo_velocity_owner(True)
+        result = run_target(self, float(args['x_m']), float(args['y_m']),
+                            full_scale=self._distance_full_scale(),
+                            slip_scale=self._slip_scales['forward'])
+        result['estimated_quality'] = 'experimental_unvalidated'
+        return result
 
     def _do_distance_impl(self, args):
         from imu_distance_control import run_distance

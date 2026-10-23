@@ -429,3 +429,177 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
     except OSError as exc:
         result['imu_trace_error'] = str(exc)
     return result
+
+def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
+    """Drive to a point (x forward, y left, metres) in the start body frame.
+
+    Uses forward motion plus heading control only: turn in place toward the
+    point when the bearing error is large, otherwise walk forward while the
+    pulse law keeps the heading on the bearing. Slip correction is the forward
+    factor (the path is mostly along the body x axis). Arrival is a position
+    tolerance, not a heading: the final heading is reported, not requested.
+    """
+    target_x, target_y = float(x_m), float(y_m)
+    target_distance = math.hypot(target_x, target_y)
+    if (not all(math.isfinite(v) for v in (target_x, target_y))
+            or not 0.1 <= target_distance <= 3.0):
+        raise ValueError('target must be a finite point 0.1-3 m from the start')
+    estimator = ImuOdometry()
+    leg_slip = LEG_SLIP_SCALE['forward'] if slip_scale is None else float(slip_scale)
+    leg = (LegOdometry(slip_scale=leg_slip)
+           if hasattr(owner, '_read_distance_joints') else None)
+    started = time.monotonic()
+    motion_started = brake_started = quiet_since = None
+    last_signature = None
+    changed_at = started
+    closest, progress_at = target_distance, started
+    last_joints = None
+    joint_updates = 0
+    samples, commands = [], []
+
+    def publish(vx, vyaw=0):
+        owner._distance_publish(vx, vyaw)
+        commands.append(dict(received_mono_s=time.monotonic(), velocity=[vx, 0.0, vyaw]))
+
+    result = dict(state='error', action='target',
+                  requested_target_x_m=target_x, requested_target_y_m=target_y,
+                  requested_distance_m=target_distance,
+                  feedback_source='leg_odometry_experimental',
+                  accuracy_validated=False, source_timestamp_available=False,
+                  stationary_assumed=False)
+    source_position, source_velocity = estimator.position, estimator.velocity
+    try:
+        publish(0)
+        while True:
+            if owner._rotate_stop_event.is_set():
+                result['state'] = 'stopped'
+                break
+            problem = owner._rotate_mode_error()
+            if problem:
+                raise ValueError(problem['error'])
+            read_started = time.monotonic()
+            raw = owner._read_distance_imu()
+            joints = owner._read_distance_joints() if leg is not None else None
+            now = time.monotonic()
+            samples.append(dict(received_mono_s=now, read_duration_s=now-read_started,
+                                orientation_xyzw=[float(raw.ori[i]) for i in range(4)],
+                                linear_acceleration_mps2=[float(raw.linear_acc[i]) for i in range(3)],
+                                angular_velocity_rad_s=[float(raw.angular_vel[i]) for i in range(3)]))
+            time_limit = min(60.0, 12.0+20.0*target_distance)
+            if now-started >= time_limit:
+                raise ValueError('target move timed out')
+            estimator.observe(raw, now)
+            if leg is not None:
+                leg.observe(joints, raw.ori, now, frozen=brake_started is not None)
+                values = joint_angles(joints)
+                if values != last_joints:
+                    last_joints, joint_updates = values, joint_updates+1
+                samples[-1]['leg_joint_positions'] = [round(v, 6) for v in values]
+                feet = getattr(leg, 'feet', None) or []
+                samples[-1]['leg_feet'] = [[round(v, 6) for v in foot] for foot in feet]
+            source_position = leg.position if leg is not None else estimator.position
+            source_velocity = leg.velocity if leg is not None else estimator.velocity
+            samples[-1].update(phase='calibration' if not estimator.ready else
+                              ('braking' if brake_started is not None else 'driving'),
+                              position_m=source_position, velocity_mps=source_velocity,
+                              acceleration_mps2=estimator.acceleration,
+                              imu_position_m=estimator.position)
+            if not estimator.ready:
+                publish(0)
+                time.sleep(0.02)
+                continue
+            if motion_started is None:
+                motion_started = progress_at = changed_at = now
+                if leg is not None:
+                    leg.reset_baseline()
+                origin_yaw = estimator.yaw
+                result['start_yaw_deg'] = math.degrees(origin_yaw)
+                result['stationary_world_acceleration_mps2'] = estimator.baseline
+                print('[loco_target] target calibration complete; position is an estimate', flush=True)
+            if estimator.signature != last_signature:
+                changed_at, last_signature = now, estimator.signature
+            if brake_started is None and now-changed_at > 0.5:
+                raise ValueError('IMU data unchanged during motion; source freshness cannot be verified')
+            x, y, _ = source_position
+            cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
+            body_x = x*cy + y*sy
+            body_y = -x*sy + y*cy
+            to_x, to_y = target_x-body_x, target_y-body_y
+            distance = math.hypot(to_x, to_y)
+            bearing = math.atan2(to_y, to_x)
+            heading = angle_delta(origin_yaw, estimator.yaw)
+            heading_error = angle_delta(bearing, heading)
+            if brake_started is None:
+                if now-motion_started > time_limit:
+                    raise ValueError('target move time limit reached')
+                if distance < closest-0.01:
+                    closest, progress_at = distance, now
+                elif now-progress_at > 8.0:
+                    raise ValueError('target move made no progress toward the point')
+                if math.hypot(*source_velocity) > 1.2:
+                    raise ValueError('target motion exceeds speed limits')
+                if distance <= 0.10:
+                    brake_started = now
+                else:
+                    err_deg = math.degrees(heading_error)
+                    if err_deg < -20.0:
+                        turn = -0.8
+                    elif err_deg < -1.5:
+                        turn = -0.5
+                    elif err_deg > 20.0:
+                        turn = 0.8
+                    elif err_deg > 1.5:
+                        turn = 0.5
+                    else:
+                        turn = 0.0
+                    if abs(err_deg) > 60.0:
+                        publish(0, turn)
+                    else:
+                        publish(0.6 if distance > 0.3 else 0.5, turn)
+            if brake_started is not None:
+                publish(0)
+                quiet = (now-brake_started >= 1.0
+                         and math.hypot(*source_velocity) <= 0.10
+                         and max(abs(v) for v in estimator.acceleration) <= 0.2
+                         and math.hypot(*estimator.gyro) <= 0.08)
+                if not quiet:
+                    quiet_since = None
+                elif quiet_since is None:
+                    quiet_since = now
+                elif now-quiet_since >= 0.8:
+                    result['pre_zero_velocity_mps'] = source_velocity
+                    estimator.velocity = (0.0, 0.0, 0.0)
+                    result['stationary_assumed'] = True
+                    final_error = math.hypot(target_x-body_x, target_y-body_y)
+                    result['final_position_error_m'] = final_error
+                    result['final_heading_deg'] = math.degrees(heading)
+                    result['estimated_distance_m'] = final_error
+                    result['estimated_error_m'] = final_error
+                    if final_error > 0.12:
+                        raise ValueError('stopped outside the target point')
+                    result['state'] = 'done'
+                    break
+                if now-brake_started > 4:
+                    raise ValueError('target endpoint did not meet assumed-stationary conditions')
+            time.sleep(0.02)
+    except Exception as exc:
+        result['error'] = f'{type(exc).__name__}: {exc}'
+    finally:
+        publish(0)
+    result.update(
+        final_position_error_m=result.get('final_position_error_m'),
+        final_heading_deg=result.get('final_heading_deg'),
+        estimated_position_m=source_position,
+        estimated_velocity_mps=source_velocity,
+        distance_source='leg_odometry' if leg is not None else 'imu_integrated',
+        leg_samples=(getattr(leg, 'samples', None) if leg is not None else None),
+        leg_stance_samples=(getattr(leg, 'stance_samples', None) if leg is not None else None),
+        leg_joint_updates=(joint_updates if leg is not None else None),
+        leg_slip_scale=(getattr(leg, 'slip_scale', None) if leg is not None else None),
+        elapsed_s=time.monotonic()-started)
+    try:
+        _write_trace(samples, commands, result)
+    except OSError as exc:
+        result['imu_trace_error'] = str(exc)
+    return result
+

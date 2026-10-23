@@ -272,16 +272,45 @@ def test_loco_target_tool_schema_contract(monkeypatch):
     tool = [t for t in plugin.get_tools() if t['name'] == 'loco_target'][0]
     assert tool['type'] == 'actuator' and tool['multiInstance'] is False
     props = tool['inputSchema']['properties']
-    assert set(props['action']['enum']) == {'move', 'rotate', 'stop_move', 'status'}
+    assert set(props['action']['enum']) == {'move', 'rotate', 'target', 'stop_move', 'status'}
     assert props['distance_m']['minimum'] == 0.1 and props['distance_m']['maximum'] == 3
     assert props['angle_deg']['minimum'] == -360 and props['angle_deg']['maximum'] == 360
     assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
-    assert tool['inputSchema']['x-completion'] == {'actions': ['move', 'rotate'], 'timeout': 120}
-    assert set(tool['inputSchema']['x-action-params']) == {'move', 'rotate', 'stop_move', 'status'}
+    assert tool['inputSchema']['x-completion'] == {'actions': ['move', 'rotate', 'target'], 'timeout': 120}
+    assert set(tool['inputSchema']['x-action-params']) == {'move', 'rotate', 'target', 'stop_move', 'status'}
     assert tool['inputSchema']['x-action-params']['move']['params'] == ['direction', 'distance_m']
     assert props['direction']['type'] == 'string'
     assert 'enum' not in props['direction']  # plain input, not another dropdown
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
+
+
+def test_target_action_schema_and_preflight(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    tool = [t for t in plugin.get_tools() if t['name'] == 'loco_target'][0]
+    props = tool['inputSchema']['properties']
+    assert 'x_m' in props and 'y_m' in props
+    assert tool['inputSchema']['x-action-params']['target']['params'] == ['x_m', 'y_m']
+    assert plugin._target_preflight({'x_m': 0.3, 'y_m': 0.4}) == (0.5, None)
+    for bad in ({'x_m': 0.0, 'y_m': 0.0}, {'x_m': 3.0, 'y_m': 1.0},
+                {'x_m': 'x', 'y_m': 0.4}):
+        result = plugin.dispatch('target', {'_tool_name': 'loco_target', **bad})
+        assert result['state'] == 'error'
+        assert 'action_id' not in result
+
+
+def test_target_action_forwards_the_point_to_the_worker(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    import imu_distance_control
+    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
+    calls = []
+    def fake(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {'state': 'done', 'action': 'target'}
+    monkeypatch.setattr(imu_distance_control, 'run_target', fake)
+    result = plugin._do_target_impl({'x_m': 0.3, 'y_m': 0.4})
+    assert result['state'] == 'done'
+    assert calls[0][0][1] == 0.3 and calls[0][0][2] == 0.4
 
 
 @pytest.mark.parametrize('distance', [None, 0, -1, 0.09, 3.01, float('nan'), True])
