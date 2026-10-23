@@ -106,3 +106,11 @@ sequence = recorder.export_round("round-1")["frames"]
 本地测试只使用 Fake Clock、Fake Pose 队列和 Mock TTS/播放事件，验证了阻塞 TTS 期间采集、3 秒边界、10 轮隔离、容量限制、异常输入、失败/超时/取消和冻结 barrier。普通 TTS 的 `speech_id/sequence/eof` 元数据链路、真实 Q5 ALSA 完成事件、真实 Pose 频率与跨进程延迟仍未在设备上验证，不能把 Mock 结果视为真机通过。
 
 真机验收时应只读观察：确认两个进程处于同一主机/启动周期，Pose topic 持续发布；使用带完整跟踪元数据的 TTS；核对播放期间与完成后 3 秒的帧时间边界；制造可控队列压力验证丢帧计数；最后检查停止插件后订阅与泵线程都退出。部署、音频路由和机器人动作需另行批准。
+
+
+### Bot Review 安全修复（PR #439）
+
+- Driver 画布生命周期支持 `start` / `stop`，与轮次 `start_round` 分离。
+- 默认 live 缓存 300 帧、冻结轮次 10 个、每轮最多 300 帧、Pose JSON 最大 8 KiB；保留原始 JSON 的配置理论上限 32 MiB。
+- 限制嵌套 JSON 节点数与深度，解析对象和导出副本仍额外占内存；超过限制会拒绝采集而不影响后续数据。
+- `pose_game` 已加入 `driver.yaml` 的 Driver marketplace 卡片清单。

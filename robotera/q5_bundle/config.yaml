@@ -51,10 +51,10 @@ plugins:
   pose_game:
     enabled: true
     topic: "/nvidia_desktop/camera/rgb/poses"
-    max_frames: 600
-    max_rounds: 20
-    max_frames_per_round: 600
-    max_raw_bytes: 1048576
+    max_frames: 300
+    max_rounds: 10
+    max_frames_per_round: 300
+    max_raw_bytes: 8192
     barrier_timeout_seconds: 1.0
   audio:
     enabled: true

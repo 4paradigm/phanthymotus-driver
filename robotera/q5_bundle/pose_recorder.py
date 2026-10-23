@@ -62,19 +62,32 @@ class RoundSnapshot:
 class PoseRecorder:
     """Thread-safe bounded recorder keyed by Bridge monotonic receive time."""
 
+    _MAX_RAW_BYTES_HARD = 8_192
+    _MAX_RETAINED_RAW_BYTES = 32 * 1024 * 1024
+    _MAX_JSON_NODES = 512
+    _MAX_JSON_DEPTH = 12
     _OUTCOMES = {
         "COMPLETED", "PLAYBACK_FAILED", "TIMEOUT", "MANUAL_TERMINATED",
         "SUBMIT_FAILED", "UNTRUSTED_COMPLETION",
     }
 
-    def __init__(self, max_frames: int = 600, max_rounds: int = 20,
-                 max_frames_per_round: int = 600,
-                 max_raw_bytes: int = 1_048_576,
+    def __init__(self, max_frames: int = 300, max_rounds: int = 10,
+                 max_frames_per_round: int = 300,
+                 max_raw_bytes: int = 8_192,
                  clock_ns: Callable[[], int] = time.monotonic_ns):
         self._max_frames = max(1, int(max_frames))
         self._max_rounds = max(1, int(max_rounds))
         self._max_frames_per_round = max(1, int(max_frames_per_round))
         self._max_raw_bytes = max(1, int(max_raw_bytes))
+        if self._max_raw_bytes > self._MAX_RAW_BYTES_HARD:
+            raise ValueError("Pose raw message exceeds hard cap")
+        if (self._max_frames > 1000 or self._max_rounds > 20
+                or self._max_frames_per_round > 1000):
+            raise ValueError("Pose frame/round count exceeds hard cap")
+        raw_envelope = (self._max_frames + self._max_rounds
+                        * self._max_frames_per_round) * self._max_raw_bytes
+        if raw_envelope > self._MAX_RETAINED_RAW_BYTES:
+            raise ValueError("Pose retained raw-byte budget exceeded")
         self._clock_ns = clock_ns
         self._lock = threading.RLock()
         self._frames: Deque[PoseFrame] = deque(maxlen=self._max_frames)
@@ -91,6 +104,22 @@ class PoseRecorder:
             "monotonic_anomalies": 0,
             "oversize_messages": 0,
         }
+
+    @classmethod
+    def _valid_payload_structure(cls, payload) -> bool:
+        """Bound retained parsed objects (including nested person fields)."""
+        pending = [(payload, 0)]
+        seen = 0
+        while pending:
+            obj, depth = pending.pop()
+            seen += 1
+            if seen > cls._MAX_JSON_NODES or depth > cls._MAX_JSON_DEPTH:
+                return False
+            if isinstance(obj, dict):
+                pending.extend((v, depth + 1) for v in obj.values())
+            elif isinstance(obj, list):
+                pending.extend((v, depth + 1) for v in obj)
+        return True
 
     @staticmethod
     def _source_timestamp(value) -> Optional[float]:
@@ -116,11 +145,13 @@ class PoseRecorder:
             return False
         try:
             payload = json.loads(raw_json)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, RecursionError, json.JSONDecodeError):
             with self._lock:
                 self._counters["invalid_json"] += 1
             return False
-        if not isinstance(payload, dict) or not isinstance(payload.get("persons"), list):
+        if (not isinstance(payload, dict)
+                or not isinstance(payload.get("persons"), list)
+                or not self._valid_payload_structure(payload)):
             with self._lock:
                 self._counters["invalid_schema"] += 1
             return False

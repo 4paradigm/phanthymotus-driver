@@ -39,7 +39,7 @@ _SUPPORTED_SPEAKER_FORMATS = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
 _SPEAKER_FAILURE_DEDUPE_LIMIT = 256
 _SPEAKER_FAILURE_MERGE_LIMIT = 64
 _POSE_QUEUE_SIZE = 256
-_MAX_POSE_JSON_BYTES = 1_048_576
+_MAX_POSE_JSON_BYTES = 8_192
 
 
 def pose_message_item(msg, clock_ns=time.monotonic_ns,

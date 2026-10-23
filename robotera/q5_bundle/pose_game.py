@@ -26,10 +26,10 @@ class Plugin:
         self._barrier_timeout = max(
             0.001, float(config.get("barrier_timeout_seconds", 1.0)))
         self._recorder = PoseRecorder(
-            max_frames=config.get("max_frames", 600),
-            max_rounds=config.get("max_rounds", 20),
-            max_frames_per_round=config.get("max_frames_per_round", 600),
-            max_raw_bytes=config.get("max_raw_bytes", 1_048_576),
+            max_frames=config.get("max_frames", 300),
+            max_rounds=config.get("max_rounds", 10),
+            max_frames_per_round=config.get("max_frames_per_round", 300),
+            max_raw_bytes=config.get("max_raw_bytes", 8_192),
             clock_ns=clock_ns,
         )
         self._lifecycle_lock = threading.Lock()
@@ -125,9 +125,10 @@ class Plugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start_round", "finish_round",
-                                 "export_round", "info"],
+                        "enum": ["start", "stop", "start_round", "finish_round", "export_round", "info"],
                         "oneOf": [
+                            {"const": "start", "title": "启动姿态采集"},
+                            {"const": "stop", "title": "停止姿态采集"},
                             {"const": "start_round", "title": "开始本轮采集"},
                             {"const": "finish_round", "title": "冻结本轮采集"},
                             {"const": "export_round", "title": "导出冻结轮次"},
@@ -159,6 +160,8 @@ class Plugin:
                 "required": ["action"],
                 "additionalProperties": False,
                 "x-action-params": {
+                    "start": {"params": [], "description": "Start Pose subscription and pump."},
+                    "stop": {"params": [], "description": "Stop Pose subscription and pump."},
                     "start_round": {
                         "params": ["round_id"],
                         "description": "Start capture before submitting TTS.",
@@ -183,6 +186,10 @@ class Plugin:
 
     def dispatch(self, action, args):
         args = dict(args or {})
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
         if action == "start_round":
             try:
                 stats = self._client.pose_stats()

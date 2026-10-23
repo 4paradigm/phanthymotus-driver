@@ -86,19 +86,19 @@ def wait_until(predicate, timeout=1):
     return False
 
 
-def config(max_rounds=20):
+def config(max_rounds=10):
     return {"plugins": {"pose_game": {
         "enabled": True,
         "topic": pose_game.POSE_TOPIC,
-        "max_frames": 600,
+        "max_frames": 300,
         "max_rounds": max_rounds,
-        "max_frames_per_round": 600,
-        "max_raw_bytes": 1_048_576,
+        "max_frames_per_round": 300,
+        "max_raw_bytes": 8_192,
         "barrier_timeout_seconds": 0.5,
     }}}
 
 
-def make_bundle(monkeypatch, clock, max_rounds=20):
+def make_bundle(monkeypatch, clock, max_rounds=10):
     client = FakeClient(clock)
     monkeypatch.setattr(
         pose_game, "make_plugin",
@@ -155,12 +155,14 @@ def test_q5bundle_dynamically_registers_one_pose_game_mcp_card():
         "Bounded Pose capture windows for offline action scoring")
     schema = tool["inputSchema"]
     assert schema["properties"]["action"]["enum"] == [
-        "start_round", "finish_round", "export_round", "info"]
+        "start", "stop", "start_round", "finish_round", "export_round", "info"]
     assert schema["properties"]["outcome"]["enum"] == [
         "COMPLETED", "PLAYBACK_FAILED", "TIMEOUT", "MANUAL_TERMINATED",
         "SUBMIT_FAILED", "UNTRUSTED_COMPLETION"]
     assert schema["additionalProperties"] is False
     assert schema["x-action-params"] == {
+        "start": {"params": [], "description": "Start Pose subscription and pump."},
+        "stop": {"params": [], "description": "Stop Pose subscription and pump."},
         "start_round": {"params": ["round_id"],
                         "description": "Start capture before submitting TTS."},
         "finish_round": {
