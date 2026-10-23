@@ -6,6 +6,7 @@ tests drive `LocoPlugin` directly: a rule that only exists in the card's
 """
 
 import importlib.util
+import os
 import sys
 import threading
 import time
@@ -41,11 +42,20 @@ class _FakeHighCtrl:
         self.action_commands.append(action_cmd)
 
 
+class _SemanticHighCtrl(_FakeHighCtrl):
+    """WALK leaves the semantic mode, the way the vendor controller does."""
+
+    def publish_cmd(self, x, y, z, action_cmd, index=0):
+        super().publish_cmd(x, y, z, action_cmd, index)
+        if action_cmd == 'WALK':
+            self.mode = 2
+
+
 @pytest.fixture
 def device(monkeypatch):
     module, _ = _load_device(monkeypatch)
     monkeypatch.setitem(sys.modules, 'highcontrol_py', types.SimpleNamespace(
-        ControlCmd=types.SimpleNamespace(DEFAULT='DEFAULT')))
+        ControlCmd=types.SimpleNamespace(DEFAULT='DEFAULT', WALK='WALK')))
     return module
 
 
@@ -346,6 +356,45 @@ def test_latch_waits_for_the_in_flight_publish(device, estop):
     assert loco._publish_cmd(0.2, 0.0, 0.0, 'DEFAULT') is False
 
 
+def test_estop_exits_a_running_semantic_action(device, estop):
+    """A dance/wave must not keep running behind a latched E-stop."""
+    latch = estop.EmergencyStopLatch()
+    high = _SemanticHighCtrl(mode=5)
+    loco = device.LocoPlugin({}, 'robot', None, high)
+    loco.attach_estop(latch)
+
+    latch.trigger('estop_card')
+
+    assert 'WALK' in high.action_commands
+    assert high.mode == 2
+    assert latch.latched is True
+
+
+def test_estop_exits_teaching_playback(device, estop):
+    latch = estop.EmergencyStopLatch()
+    high = _SemanticHighCtrl(mode=23)
+    loco = device.LocoPlugin({}, 'robot', None, high)
+    loco.attach_estop(latch)
+
+    latch.trigger('estop_card')
+
+    assert 'WALK' in high.action_commands
+    assert high.mode == 2
+
+
+def test_estop_does_not_abort_stand_up(device, estop):
+    """There is no documented abort for the get-up trajectory; do not invent one."""
+    latch = estop.EmergencyStopLatch()
+    high = _FakeHighCtrl(mode=27)
+    loco = device.LocoPlugin({}, 'robot', None, high)
+    loco.attach_estop(latch)
+
+    latch.trigger('estop_card')
+
+    assert 'WALK' not in high.action_commands
+    assert latch.latched is True
+
+
 def test_actuator_start_reports_ready(estop):
     latch = estop.EmergencyStopLatch()
     card = estop.EstopPlugin({}, 'robot', None, latch)
@@ -359,7 +408,7 @@ def test_servo_only_configuration_pauses_and_zeroes_on_latch(monkeypatch, estop)
     repo_root = Path(__file__).resolve().parents[3]
     monkeypatch.syspath_prepend(str(repo_root))
     monkeypatch.setitem(sys.modules, 'highcontrol_py', types.SimpleNamespace(
-        ControlCmd=types.SimpleNamespace(DEFAULT='DEFAULT')))
+        ControlCmd=types.SimpleNamespace(DEFAULT='DEFAULT', WALK='WALK')))
     sys.modules.pop('loco_servo', None)
     from noetix.bumi import loco_servo
 
@@ -375,6 +424,74 @@ def test_servo_only_configuration_pauses_and_zeroes_on_latch(monkeypatch, estop)
     assert servo._paused is True
     assert high.commands[-1] == (0.0, 0.0, 0.0)
     assert servo._halt(False)['code'] == 'ESTOP_ACTIVE'
+
+
+def test_trigger_is_not_durable_when_directory_sync_fails(estop, tmp_path, monkeypatch):
+    path = tmp_path / 'estop_state.json'
+    latch = estop.EmergencyStopLatch(str(path))
+    real_open = estop.os.open
+
+    def fail_open(target, flags, *args, **kwargs):
+        if os.fspath(target) == str(tmp_path):
+            raise OSError('directory cannot be opened for sync')
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(estop.os, 'open', fail_open)
+    assert latch.trigger('estop_card') is True
+    monkeypatch.undo()
+
+    assert latch.durable is False
+    assert path.exists()
+
+
+def test_reset_fails_when_directory_sync_cannot_be_proven(estop, tmp_path, monkeypatch):
+    path = tmp_path / 'estop_state.json'
+    latch = estop.EmergencyStopLatch(str(path))
+    latch.trigger('estop_card')
+    real_open = estop.os.open
+
+    def fail_open(target, flags, *args, **kwargs):
+        if os.fspath(target) == str(tmp_path):
+            raise OSError('directory cannot be opened for sync')
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(estop.os, 'open', fail_open)
+    assert latch.reset() is False
+    monkeypatch.undo()
+
+    assert latch.latched is True
+    assert path.exists()
+
+
+class _ModeHighCtrl:
+    def __init__(self, mode):
+        self.mode = mode
+
+    def get_mode(self):
+        return self.mode
+
+
+def test_auto_trigger_on_protection_latches(estop):
+    latch = estop.EmergencyStopLatch()
+    card = estop.EstopPlugin(
+        {'auto_trigger_on_protection': True}, 'robot', None, latch,
+        _ModeHighCtrl(26))
+    card._last_protection_check = 0.0
+    card._check_protection_mode()
+
+    assert latch.latched is True
+    assert latch.snapshot()['source'] == 'protection_mode'
+
+
+def test_walking_mode_does_not_auto_latch(estop):
+    latch = estop.EmergencyStopLatch()
+    card = estop.EstopPlugin(
+        {'auto_trigger_on_protection': True}, 'robot', None, latch,
+        _ModeHighCtrl(2))
+    card._last_protection_check = 0.0
+    card._check_protection_mode()
+
+    assert latch.latched is False
 
 
 def test_bundle_wires_one_latch_into_loco_and_the_card(monkeypatch, tmp_path, device, estop):

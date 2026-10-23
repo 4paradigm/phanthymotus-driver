@@ -448,6 +448,12 @@ software latch**, not a replacement for the robot's physical E-stop button.
 
 - `trigger` sets the latch, immediately sends one zero velocity, pauses
   `loco_servo` and ends any `loco.move` thread.
+- A running semantic action (`wave`, `handshake`, `cheer`, `dance_*`,
+  `wipe_tears`) or teaching playback is exited with the same documented `WALK`
+  command those cards already use, and the card waits up to about three
+  seconds for walking mode. `stand_up` (27) and `lie_prone` (28) are not
+  aborted: the vendor documents no cancellation for those trajectories, and
+  WALK mid-fall could drop the robot.
 - While latched, every non-zero velocity is dropped in `LocoPlugin._publish_cmd`
   before it reaches the SDK. `loco_servo` forwards through
   `loco.publish_velocity`, so the call-shaped and the streaming path are gated

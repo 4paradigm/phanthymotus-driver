@@ -363,8 +363,48 @@ class LocoPlugin:
             # Zero is allowed through the latch gate; it is what stops the robot.
             self._publish_cmd(0.0, 0.0, 0.0, _get_default_cmd(), 0)
         self._set_servo_velocity_owner(False)
-        print(f"[loco] emergency stop ({reason or 'no reason'})", flush=True)
-        return {"state": "stopped", "reason": reason}
+        exited = self._exit_active_action()
+        print(f"[loco] emergency stop ({reason or 'no reason'})"
+              + (f", exit={exited}" if exited else ""), flush=True)
+        return {"state": "stopped", "reason": reason, "exited_action": exited}
+
+    def _exit_active_action(self) -> str:
+        """Leave a running semantic action or teaching playback via `WALK`.
+
+        `semantic_action` already owns the documented exit for its own modes;
+        an E-stop should use that rather than inventing a second path. `WALK`
+        is allowed through the latch gate for exactly this reason.
+
+        `stand_up` (27) and `lie_prone` (28) are trajectories the vendor starts
+        and does not document a cancellation for. Sending WALK mid-fall could
+        drop the robot, so those are deliberately left alone.
+        """
+        if self._high_ctrl is None:
+            return ""
+        try:
+            mode = int(self._high_ctrl.get_mode())
+        except Exception:                                     # noqa: BLE001
+            return ""
+        try:
+            if mode == 23:
+                result = self._do_stop_playback(
+                    self._safety_requirements("stop_playback"))
+            elif mode in _SEMANTIC_ACTION_WORKMODES:
+                result = self._do_semantic_reset(
+                    self._safety_requirements("reset"))
+            else:
+                return ""
+        except EmergencyStopActive:
+            # The latch refused the exit itself; nothing else to do here.
+            return ""
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[loco] estop could not exit workmode {mode}: {exc}",
+                  flush=True)
+            return ""
+        state = str(result.get("state", ""))
+        print(f"[loco] estop exit workmode {mode} -> {state} "
+              f"(now {result.get('workmode')})", flush=True)
+        return state
 
     @staticmethod
     def _allowed_while_latched(tool_name: str, action: str) -> bool:

@@ -236,10 +236,13 @@ class EmergencyStopLatch:
         self._fsync_parent()
 
     def _fsync_parent(self) -> None:
-        try:
-            directory = os.open(str(self._state_path.parent), os.O_RDONLY)
-        except OSError:
-            return
+        """Sync the directory entry. Raises when durability cannot be proven.
+
+        Opening the directory read-only can fail on a mount that permits
+        unlink but not read; swallowing that turned "I could not sync the
+        deletion" into "deletion is durable" and released the latch.
+        """
+        directory = os.open(str(self._state_path.parent), os.O_RDONLY)
         try:
             os.fsync(directory)
         finally:
@@ -405,9 +408,10 @@ class EstopPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "Bumi 软件急停（锁存）：trigger 立即停住并拒绝所有速度指令，"
-                "直到 reset（需 confirm）。不读取物理急停状态；锁存跨驱动重启保持，"
-                "机器人上的物理急停按钮仍是最终手段。"
+                "Bumi 软件急停（锁存）：trigger 立即停住并拒绝所有速度指令；"
+                "运行中的挥手/跳舞/示教播放用 WALK 退出（起身轨迹不中止）。"
+                "锁存直到 reset（需 confirm），跨驱动重启保持；"
+                "不读取物理急停状态，机器人上的物理急停按钮仍是最终手段。"
             ),
             "inputSchema": {
                 "type": "object",
