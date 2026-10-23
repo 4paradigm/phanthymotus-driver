@@ -195,8 +195,17 @@ acknowledged idle), not network RPCs or measured physical motion.
 The backend state/action ID describe the last acknowledgement, not a substitute
 for odometry feedback; verify physical motion with `loco_state`.
 
-The Python and native layers enforce the input TTL/observation-age deadline,
-capped at 300ms. The native worker independently stops when that lease expires
+Input TTL is an admission check: an already-stale command is still dropped and
+cannot resume motion or renew the watchdog. Once admitted, a command no longer
+stops motion at its producer's per-frame TTL (commonly 200ms). Its execution
+lease instead ends 300ms after the original ROS/bridge callback receipt, or at
+`obs_stamp_ms + 500ms`, whichever is sooner. Continuous fresh 10Hz input replaces
+that bounded lease; no new valid command for 300ms stops motion. IPC, local queue
+and SDK reply time consume the original receive budget, never renew it. This is
+a bounded streaming watchdog, not unlimited reuse of the last velocity.
+Python uses the original monotonic receipt time for its silence watchdog; the
+native layer receives the remaining bounded execution deadline and independently
+stops when that lease expires
 (with a 20ms polling interval while SDK calls are responsive), even if ROS stops
 spinning. It never holds a queue of old velocity commands or reconnects/replays
 a failed request. A blocked SDK reply times out (default 250ms), kills the worker
@@ -214,7 +223,9 @@ unknown state, a dead worker and fault/firmware handover still follow the normal
 stop and error paths. Each new motion uses the same velocity action until a
 stop or failure; forward and angular speeds are submitted together.
 
-An expired command is dropped without extending its TTL or replaying it. The
+An input already past its TTL is dropped without changing its timestamps or
+replaying it. An admitted command whose execution watchdog/observation deadline
+has expired also requires a stop. The
 native worker reports `EXPIRED` only after its stop/cancel succeeds; in that
 case the card resets its output/ramp and can accept a subsequent fresh command
 without restarting the worker. A failed stop, transport/ownership error, or a
@@ -241,8 +252,8 @@ since the previous SDK acknowledgement. A regular 10Hz stream must not lose
 every other command just because a vendor call took 70ms of its 100ms period.
 When transport bunches arrivals closer than 50ms, the newest motion stays in
 the bounded inbox until the next permitted apply slot instead of being thrown
-away. Explicit zero always bypasses that pacing. TTL, observation-age and
-watchdog limits are unchanged.
+away. Explicit zero always bypasses that pacing. Input TTL freshness,
+observation-age limits and the 300ms receive watchdog remain enforced.
 
 The ROS/MCP facade now runs the existing velocity controller in a separate
 Python process (`loco_servo_process.py`), rather than in the camera bundle's
@@ -309,9 +320,12 @@ remaining lease before/after apply, and apply round-trip duration. `receive_age_
 measures generation-to-driver-callback age; `local_wait_ms` measures callback-to-
 submission delay, including any synchronous stop before submission. These
 measurements are tied to that selected frame, even if a newer one has arrived.
+`dispatch.execution_deadline_basis` and the same field in `last_command_timing`
+are `receive_watchdog_and_observation`; `receive_watchdog_ms` is 300. `ttl_ms`
+remains the producer's input freshness limit and is not the execution lease.
 Continuous
 publication alone cannot guarantee continuous motion: expired observations,
-TTL gaps, explicit zeros, invalid commands and SDK faults still stop or refuse
+receive-watchdog gaps, stale input, explicit zeros, invalid commands and SDK faults still stop or refuse
 motion. These timings distinguish those cases from local queue delay.
 
 Acceleration caps remain 0.3 m/s² and 0.6 rad/s². Explicit zero, pause, stop,

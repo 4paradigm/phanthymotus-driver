@@ -511,14 +511,22 @@ class LocoServoPlugin:
                         self._counts["rejected"] += 1
                         self._record("REFUSED", problem)
                         return
-                self._command_deadline_ms = min(
-                    command["stamp_ms"] + command.get("ttl_ms", 0),
-                    command.get("obs_stamp_ms", command["stamp_ms"]) + 500,
-                    int(time.time() * 1000) + WATCHDOG_MS)
                 started = time.monotonic()
                 wall_ms = int(time.time() * 1000)
+                received_mono = received_at[0] if received_at is not None else started
+                # TTL still rejects stale input at the sink. Once admitted,
+                # motion follows a bounded receive watchdog instead of the
+                # producer's per-frame TTL. IPC/SDK waits spend this original
+                # receive budget; neither processing nor ACK starts a new one.
+                receive_remaining_ms = math.floor(
+                    WATCHDOG_MS - max(0.0, started - received_mono) * 1000)
+                self._command_deadline_ms = min(
+                    wall_ms + receive_remaining_ms,
+                    command.get("obs_stamp_ms", command["stamp_ms"]) + 500)
                 self._last_timing = {
                     "seq": command.get("seq"), "ttl_ms": command.get("ttl_ms"),
+                    "execution_deadline_basis": "receive_watchdog_and_observation",
+                    "receive_watchdog_ms": WATCHDOG_MS,
                     "receive_age_ms": (received_at[1] - command["stamp_ms"]
                                        if received_at is not None else None),
                     "local_wait_ms": (round((started - received_at[0]) * 1000, 1)
@@ -535,7 +543,7 @@ class LocoServoPlugin:
                         remaining_after_apply_ms=self._command_deadline_ms - int(time.time() * 1000))
                 if outcome.applied:
                     self._counts["accepted"] += 1
-                    self._last_valid_at = time.monotonic()
+                    self._last_valid_at = received_mono
                     self._lease_expiry_ms = self._command_deadline_ms
                     self._record(outcome.verdict.name, outcome.reason,
                                  requested=list(command["values"]),
@@ -592,6 +600,10 @@ class LocoServoPlugin:
                 getattr(self._backend, "supports_atomic_expiry_update", False) is True)
 
     def _apply(self, values, _gripper=None):
+        # Run after sink freshness/shape/arbitration checks: invalid input must
+        # neither renew motion nor issue a stop against an otherwise live lease.
+        if any(values) and self._command_deadline_ms <= time.time() * 1000:
+            raise CommandLeaseExpired("receive watchdog or observation deadline expired before apply")
         target = list(values)
         if self._settings["rotate_only"]:
             target[0] = target[1] = 0.0
@@ -682,7 +694,7 @@ class LocoServoPlugin:
                 self._record("REFUSED", self._standing_problem())
             if self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms:
                 self._hold()
-                self._record("HOLD", "command TTL or observation lease expired")
+                self._record("HOLD", "receive watchdog or observation deadline expired")
             if self._last_valid_at is not None and time.monotonic() - self._last_valid_at >= WATCHDOG_MS / 1000:
                 self._hold()
                 self._record("HOLD", "no valid command for 300 ms")
@@ -751,6 +763,8 @@ class LocoServoPlugin:
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
             "input_queue": self._inbox.info(),
             "dispatch": {"mode": "dedicated_worker", "watchdog_poll_ms": 20,
+                         "execution_deadline_basis": "receive_watchdog_and_observation",
+                         "receive_watchdog_ms": WATCHDOG_MS,
                          "max_apply_hz": 20, "worker_failed": self._controller_failed,
                          "expiry_update": "native_atomic" if self._native_expiry_update() else "stop_then_set",
                          "worker_alive": bool(
