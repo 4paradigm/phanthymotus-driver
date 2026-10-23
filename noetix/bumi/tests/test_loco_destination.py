@@ -276,28 +276,12 @@ def test_loco_target_tool_schema_contract(monkeypatch):
     assert props['distance_m']['minimum'] == 0.1 and props['distance_m']['maximum'] == 3
     assert props['angle_deg']['minimum'] == -360 and props['angle_deg']['maximum'] == 360
     assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
-    assert tool['inputSchema']['x-is-dangerous'] is True
-    assert 'confirm' in props
     assert tool['inputSchema']['x-completion'] == {'actions': ['move', 'rotate', 'target'], 'timeout': 120}
     assert set(tool['inputSchema']['x-action-params']) == {'move', 'rotate', 'target', 'stop_move', 'status'}
     assert tool['inputSchema']['x-action-params']['move']['params'] == ['direction', 'distance_m']
     assert props['direction']['type'] == 'string'
     assert 'enum' not in props['direction']  # plain input, not another dropdown
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
-
-
-def test_loco_target_motion_requires_dangerous_confirmation(monkeypatch):
-    module, _ = _load_device(monkeypatch)
-    plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
-    for action, args in (('move', {'distance_m': 1.0, 'direction': 'forward'}),
-                         ('rotate', {'angle_deg': 60}),
-                         ('target', {'x_m': 0.3, 'y_m': 0.4})):
-        result = plugin.dispatch(action, {'_tool_name': 'loco_target', **args})
-        assert result['state'] == 'error'
-        assert 'confirm' in result['error']
-        assert 'action_id' not in result
-    # status/stop_move are not dangerous and stay callable.
-    assert plugin.dispatch('status', {'_tool_name': 'loco_target'})['state'] == 'idle'
 
 
 def test_target_action_schema_and_preflight(monkeypatch):
@@ -311,7 +295,7 @@ def test_target_action_schema_and_preflight(monkeypatch):
     for bad in ({'x_m': 0.0, 'y_m': 0.0}, {'x_m': 3.0, 'y_m': 1.0},
                 {'x_m': 'x', 'y_m': 0.4}, {'x_m': True, 'y_m': True},
                 {'x_m': 0.4, 'y_m': True}, {'x_m': None, 'y_m': 0.4}):
-        result = plugin.dispatch('target', {'_tool_name': 'loco_target', 'confirm': True, **bad})
+        result = plugin.dispatch('target', {'_tool_name': 'loco_target', **bad})
         assert result['state'] == 'error'
         assert 'action_id' not in result
 
@@ -335,7 +319,7 @@ def test_distance_invalid_requests_do_not_send_commands(monkeypatch, distance):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl()
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'confirm': True, 'distance_m': distance})
+    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': distance})
     assert result['state'] == 'error'
     assert 'distance_m' in result['error']
     assert 'action_id' not in result
@@ -370,7 +354,7 @@ def test_card_config_updates_the_slip_factors_for_later_moves(monkeypatch):
 def test_card_config_rejects_an_invalid_slip_factor(monkeypatch, value):
     module, _ = _load_device(monkeypatch)
     plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl())
-    out = plugin.dispatch('config', {'_tool_name': 'loco_target', 'confirm': True, 'slip_backward': value})
+    out = plugin.dispatch('config', {'_tool_name': 'loco_target', 'slip_backward': value})
     assert out['state'] == 'error'
     assert 'slip_backward' in out['error']
     assert plugin._slip_scales['backward'] == 1.85
@@ -393,7 +377,7 @@ def test_distance_refuses_invalid_sdk_imu_before_acceptance(monkeypatch):
     raw = fake.get_imu_data()
     raw.ori = [0, 0, 0, 0]
     monkeypatch.setattr(fake, 'get_imu_data', lambda: raw)
-    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'confirm': True, 'distance_m': 1})
+    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': 1})
     assert result['state'] == 'error'
     assert 'action_id' not in result
     assert plugin._rotate_status()['state'] == 'idle'
@@ -414,7 +398,7 @@ def test_distance_dispatch_reserves_chassis_and_completes_once(monkeypatch):
         return {'state': 'stopped' if plugin._rotate_stop_event.is_set() else 'done',
                 'requested_distance_m': 1, 'moved_m': 0.98, 'final_error_m': 0.02}
     monkeypatch.setattr(plugin, '_do_distance_impl', run)
-    started = plugin.dispatch('move', {'_tool_name': 'loco_target', 'confirm': True, 'distance_m': 1})
+    started = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': 1})
     try:
         assert started['state'] == 'running'
         assert started['requested_distance_m'] == 1
@@ -466,7 +450,7 @@ def test_distance_imu_failure_reaches_acp_as_error_once(monkeypatch):
     error = {'state': 'error', 'error': 'IMU acceleration norm exceeds experimental limit',
              'feedback_source': 'leg_odometry_experimental', 'estimated_distance_m': 0.26}
     monkeypatch.setattr(plugin, '_do_distance_impl', lambda args: dict(error))
-    started = plugin.dispatch('move', {'_tool_name': 'loco_target', 'confirm': True, 'distance_m': 0.5})
+    started = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': 0.5})
     plugin._rotate_worker.join(timeout=2)
     assert not plugin._rotate_worker.is_alive()
     assert len(calls) == 1
@@ -483,7 +467,7 @@ def test_distance_bad_direction_is_rejected_before_motion(monkeypatch, direction
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl()
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'confirm': True, 'distance_m': .3,
+    result = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': .3,
                                       'direction': direction})
     assert result['state'] == 'error'
     assert 'direction' in result['error']
@@ -498,7 +482,7 @@ def test_real_imu_distance_worker_accepts_without_ros_and_cancels_during_calibra
     plugin = _rotate_plugin(module, monkeypatch, fake)
     calls = []
     monkeypatch.setattr(module, '_acp_notify', lambda *args: calls.append(args))
-    started = plugin.dispatch('move', {'_tool_name': 'loco_target', 'confirm': True, 'distance_m': 1})
+    started = plugin.dispatch('move', {'_tool_name': 'loco_target', 'distance_m': 1})
     assert started['state'] == 'running'
     plugin.dispatch('stop_move', {'_tool_name': 'loco_target'})
     plugin._rotate_worker.join(timeout=2)
@@ -516,7 +500,7 @@ def test_rotate_dispatch_returns_immediately_with_action_id(monkeypatch):
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
     started_at = time.monotonic()
-    started = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    started = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     elapsed = time.monotonic() - started_at
     assert started['state'] == 'running'
     assert started['action_id'].startswith('bumi_loco_target_')
@@ -542,7 +526,7 @@ def test_acp_terminal_state_fires_exactly_once(monkeypatch):
 
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    started = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    started = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert len(calls) == 1                     # done 路径恰 1 次
@@ -555,7 +539,7 @@ def test_acp_terminal_state_fires_exactly_once(monkeypatch):
     calls.clear()
     fake2 = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin2 = _rotate_plugin(module, monkeypatch, fake2)
-    started2 = plugin2.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})
+    started2 = plugin2.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})
     stopped = plugin2.dispatch('stop_move', {'_tool_name': 'loco_target'})
     assert stopped == {'state': 'stopped'}
     result2 = wait_rotate(plugin2)
@@ -577,7 +561,7 @@ def test_sigterm_stop_completes_pending_acp(monkeypatch):
             (action_id, status, result, tool)))
     fake = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    started = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})
+    started = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})
     assert started['state'] == 'running'
     deadline = time.monotonic() + 2.0          # 确认真在转（已有转速帧）
     while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
@@ -617,7 +601,7 @@ def test_sigterm_during_dispatch_acceptance_still_cancels(monkeypatch):
 
     def _dispatch():
         box['result'] = plugin.dispatch(
-            'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})
+            'rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})
 
     dispatcher = threading.Thread(target=_dispatch, daemon=True)
     dispatcher.start()
@@ -650,7 +634,7 @@ def test_rotate_converges_within_tolerance_and_brakes(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0
@@ -664,7 +648,7 @@ def test_rotate_takes_shortest_path_across_yaw_wrap(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(yaw0=170.0, gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 20})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 20})
     result = wait_rotate(plugin)
     assert result['state'] == 'done' and abs(result['final_error_deg']) <= 2.0
     assert result['turned_deg'] > 0                      # 逆时针 +20，而非 -340
@@ -675,7 +659,7 @@ def test_rotate_full_turn_actually_turns(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 360})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 360})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert 354 <= result['turned_deg'] <= 366
@@ -688,7 +672,7 @@ def test_rotate_large_angle_turns_requested_direction_not_shortcut(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 200})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 200})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert 194 <= result['turned_deg'] <= 206
@@ -707,7 +691,7 @@ def test_rotate_timeout_stops_and_reports_turned_degrees(monkeypatch):
     monkeypatch.setattr(module, '_rotate_timeout_s', lambda a: 0.05)
     fake = FakeHighCtrl(gain_deg_per_tick=0.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(plugin)
     assert result['state'] == 'timeout'
     assert len(calls) == 1
@@ -726,7 +710,7 @@ def test_rotate_timeout_on_full_turn_reports_full_shortfall(monkeypatch):
     monkeypatch.setattr(module, '_rotate_timeout_s', lambda a: 0.05)
     fake = FakeHighCtrl(gain_deg_per_tick=0.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 360})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 360})
     result = wait_rotate(plugin)
     assert result['state'] == 'timeout'
     assert abs(result['turned_deg']) < 1e-6              # 植物没动
@@ -758,7 +742,7 @@ def test_invalid_imu_aborts_rotate(monkeypatch, during_motion, field, value):
         return imu
 
     monkeypatch.setattr(fake, 'get_imu_data', get_imu)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(plugin, timeout_s=2)
     assert result['state'] == 'error'
     assert 'IMU' in result['error']
@@ -786,7 +770,7 @@ def test_mode_loss_during_rotate_brakes_and_reports_error(monkeypatch, mode):
         return 2
 
     monkeypatch.setattr(fake, 'get_mode', get_mode)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(plugin, timeout_s=2)
     assert result['state'] == 'error'
     assert sum(z != 0 for x, y, z in fake.cmds) == 1
@@ -811,14 +795,14 @@ def test_rotate_startup_failure_releases_busy_state(monkeypatch, failure):
             startup.setattr(fake, 'get_mode', fail)
         else:
             startup.setattr(threading.Thread, 'start', fail)
-        result = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+        result = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     assert result['state'] == 'error'
     assert 'startup unavailable' in result['error']
     assert 'action_id' not in result
     assert plugin._rotate_status() == {'state': 'idle', 'last_result': result}
     assert calls == []
     assert fake.cmds == []
-    restarted = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 0})
+    restarted = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 0})
     assert restarted['state'] == 'running'
     assert wait_rotate(plugin, timeout_s=2)['state'] == 'done'
     assert len(calls) == 1 and calls[0][1] == 'completed'
@@ -843,7 +827,7 @@ def test_rotate_cannot_publish_motion_after_stop_returns(monkeypatch, angle, pen
         return publish(x, y, z, action_cmd, index, **kwargs)
 
     monkeypatch.setattr(plugin, '_publish_cmd', pending_publish)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': angle})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': angle})
     try:
         assert entered.wait(2)
         stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_target'})
@@ -864,7 +848,7 @@ def test_stop_move_interrupts_running_rotate(monkeypatch):
     fake = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
     started = plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})
     assert started['state'] == 'running'                # dispatch 立即返回，不阻塞
     time.sleep(0.03)
     stopped = plugin.dispatch('stop_move', {'_tool_name': 'loco_target'})
@@ -883,7 +867,7 @@ def test_rotate_refuses_non_walking_and_protection_modes(monkeypatch):
     fake_protection = FakeHighCtrl(mode=26)
     plugin_protection = _rotate_plugin(module, monkeypatch, fake_protection)
     result = plugin_protection.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     assert result['state'] == 'error'
     assert 'protection' in result['error']
     assert fake_protection.cmds == []                   # 未发任何指令
@@ -891,7 +875,7 @@ def test_rotate_refuses_non_walking_and_protection_modes(monkeypatch):
     fake_ready = FakeHighCtrl(mode=1)
     plugin_ready = _rotate_plugin(module, monkeypatch, fake_ready)
     result = plugin_ready.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     assert result['state'] == 'error'
     assert 'workmode' in result['error'] and 'switch_mode' in result['error']
     assert fake_ready.cmds == []                        # 未发任何指令
@@ -908,7 +892,7 @@ def test_rotate_stops_a_running_loco_move(monkeypatch):
     time.sleep(0.03)                                    # 确保 move 线程真的在发指令
     assert any(c == (0.2, 0.0, 0.0) for c in fake.cmds) # move 流已开
 
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0
@@ -933,7 +917,7 @@ def test_concurrent_move_is_refused_while_rotate_runs(monkeypatch):
     fake = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
     started = plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})
     assert started['state'] == 'running'
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
@@ -963,7 +947,7 @@ def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
     fake = FakeHighCtrl(gain_deg_per_tick=1.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
     started = plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})
     assert started['state'] == 'running'
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
@@ -971,7 +955,7 @@ def test_concurrent_rotate_is_refused_while_rotate_runs(monkeypatch):
     assert any(c[2] != 0 for c in fake.cmds)         # rotate 已在发转速帧
 
     refused = plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     assert refused['state'] == 'error'
     assert 'rotate or distance move in progress' in refused['error']  # 错误点名目标动作冲突
     status = plugin.dispatch('status', {'_tool_name': 'loco_target'})
@@ -999,7 +983,7 @@ def test_stop_during_rotate_startup_is_preserved(monkeypatch):
     monkeypatch.setattr(fake, 'get_mode', get_mode)
     monkeypatch.setattr(module, '_rotate_timeout_s', lambda angle: 0.1)
     worker = threading.Thread(target=lambda: box.update(result=plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})), daemon=True)
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})), daemon=True)
     worker.start()
     try:
         assert entered.wait(2)
@@ -1040,7 +1024,7 @@ def test_move_startup_cannot_overlap_rotate(monkeypatch):
     mover = threading.Thread(name='starting_move', target=lambda: box.update(move=plugin.dispatch(
         'move', {'_tool_name': 'loco', 'vx': 0.2, 'duration': 0.1})), daemon=True)
     rotator = threading.Thread(target=lambda: box.update(rotate=plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})), daemon=True)
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})), daemon=True)
     mover.start()
     try:
         assert entered.wait(2)
@@ -1062,7 +1046,7 @@ def test_rotate_negative_angle_turns_opposite_direction(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(gain_deg_per_tick=3.0)
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': -60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': -60})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert -66 <= result['turned_deg'] <= -54
@@ -1099,7 +1083,7 @@ def test_posture_action_cancels_inflight_rotate(monkeypatch):
     monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
 
     started = plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 360})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 360})
     assert started['state'] == 'running'
     deadline = time.monotonic() + 3.0         # 确认真在转（已有转速帧）
     while time.monotonic() < deadline and not any(c[2] != 0 for c in fake.cmds):
@@ -1147,7 +1131,7 @@ def test_posture_cancel_sticks_during_rotate_dispatch_acceptance(monkeypatch):
     box = {}
     dispatcher = threading.Thread(
         target=lambda: box.update(result=plugin.dispatch(
-            'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})),
+            'rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})),
         daemon=True)
     dispatcher.start()
     assert entered.wait(2)                    # 受理窗口内：clear 已过、worker 未发布
@@ -1329,7 +1313,7 @@ def test_small_angle_reaches_target_despite_stiction(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(plant="realistic")
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 10})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 10})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0
@@ -1343,7 +1327,7 @@ def test_no_limit_cycle_on_20_and_90(monkeypatch):
     for angle in (20, 90):
         fake = FakeHighCtrl(plant="realistic")
         plugin = _rotate_plugin(module, monkeypatch, fake)
-        plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': angle})
+        plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': angle})
         result = wait_rotate(plugin)
         assert result['state'] == 'done', f"{angle}°: {result}"
         assert abs(result['final_error_deg']) <= 2.0, f"{angle}°: {result}"
@@ -1366,7 +1350,7 @@ def test_fine_band_replaces_end_phase_crawl(monkeypatch):
         trace.append((z, fake.yaw))      # 本帧推进后的 (指令, yaw)
 
     monkeypatch.setattr(fake, 'publish_cmd', publish_cmd)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0
@@ -1383,7 +1367,7 @@ def test_realistic_plant_full_turn_contract(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(plant="realistic")
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 360})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 360})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert 354 <= result['turned_deg'] <= 366
@@ -1399,7 +1383,7 @@ def test_large_angle_subtargets_advance_in_cruise_band(monkeypatch):
     module, _ = _load_device(monkeypatch)
     fake = FakeHighCtrl(plant="realistic")
     plugin = _rotate_plugin(module, monkeypatch, fake)
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 360})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 360})
     result = wait_rotate(plugin)
     assert result['state'] == 'done'
     assert abs(result['final_error_deg']) <= 2.0        # 末段一次爬行收敛不变
@@ -1430,7 +1414,7 @@ def test_status_reflects_last_rotate_result(monkeypatch):
     ) == {"state": "idle", "last_result": None}         # 初始：无前次结果
 
     idle_plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 60})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 60})
     result = wait_rotate(idle_plugin)
     assert result['state'] == 'done'
     assert idle_plugin.dispatch(
@@ -1440,7 +1424,7 @@ def test_status_reflects_last_rotate_result(monkeypatch):
     # dispatch 立即返回 action_id（150° / gain=1 转不完），进行中 status 报 running。
     run_plugin = _rotate_plugin(module, monkeypatch, FakeHighCtrl(gain_deg_per_tick=1.0))
     started = run_plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 150})
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 150})
     assert started['state'] == 'running'                # action_id 流：立即返回 running
     status = run_plugin.dispatch('status', {'_tool_name': 'loco_target'})
     assert status['state'] == 'running'                 # 进行中必须报 running
@@ -1545,7 +1529,7 @@ def test_rotate_status_and_zero_do_not_pause_streaming_servo(monkeypatch):
 
     plugin.attach_servo(types.SimpleNamespace(pause_for_explicit_command=refuse_pause))
     assert plugin.dispatch('status', {'_tool_name': 'loco_target'})['state'] == 'idle'
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 0})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 0})
     assert wait_rotate(plugin)['state'] == 'done'
 
 
@@ -1568,9 +1552,9 @@ def test_rotation_action_ids_stay_unique_with_frozen_wall_clock(monkeypatch):
     module, _ = _load_device(monkeypatch)
     monkeypatch.setattr(module.time, 'time_ns', lambda: 12345)
     plugin = module.LocoPlugin({}, 'robot', None, FakeHighCtrl())
-    first = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 0})
+    first = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 0})
     wait_rotate(plugin)
-    second = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 0})
+    second = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 0})
     wait_rotate(plugin)
     assert first['action_id'] != second['action_id']
 
@@ -1613,7 +1597,7 @@ def test_competing_action_reserves_chassis_until_handler_returns(monkeypatch, to
     worker.start()
     try:
         assert entered.wait(2)
-        result = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 30})
+        result = plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 30})
         assert result['state'] == 'error'
         assert 'action_id' not in result
         assert plugin.is_moving()
@@ -1641,7 +1625,7 @@ def test_competing_action_waits_for_unpublished_rotation_worker(monkeypatch):
     monkeypatch.setattr(plugin, '_preempt_servo', lambda reason: body_entered.set() or False)
     monkeypatch.setattr(plugin, '_do_preset_action', lambda action: command_sent.set() or {'state': 'completed'})
     rotate = threading.Thread(target=lambda: plugin.dispatch(
-        'rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 30}))
+        'rotate', {'_tool_name': 'loco_target', 'angle_deg': 30}))
     body = threading.Thread(target=lambda: plugin.dispatch('reset', {'_tool_name': 'semantic_action'}))
     rotate.start()
     try:
@@ -1670,5 +1654,5 @@ def test_competing_action_reservation_released_after_exception(monkeypatch):
     monkeypatch.setattr(plugin, '_do_preset_action', failure)
     with pytest.raises(RuntimeError, match='action failure'):
         plugin.dispatch('reset', {'_tool_name': 'semantic_action'})
-    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'confirm': True, 'angle_deg': 0})
+    plugin.dispatch('rotate', {'_tool_name': 'loco_target', 'angle_deg': 0})
     assert wait_rotate(plugin)['state'] == 'done'
