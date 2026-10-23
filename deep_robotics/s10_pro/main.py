@@ -41,8 +41,8 @@ def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, 
         transport = DDSProcessTransport(config, execution_enabled=operator.authorized_now(),
                                         supervised_posture=True)
         backend = SupervisedPostureBackend(observer_bridge, transport, operator)
-        # This is time to observe and confirm a finite posture, not a velocity
-        # duration or a robot-side stopping guarantee. Keep the existing bound.
+        # This bounds reported-state observation, not an operator response,
+        # physical pose completion, or a robot-side stopping guarantee.
         settings = {**config.get('motion', {}), 'action_timeout_s': 15.}
         motion_plugin = SupervisedMotionPlugin(settings, namespace, backend=backend,
             feedback=backend.feedback, publish=publish, execution_authorized=operator.authorized_now(),

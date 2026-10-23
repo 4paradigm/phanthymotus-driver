@@ -1,4 +1,4 @@
-"""Finite on-site posture tests with explicit operator visual confirmation.
+"""Finite on-site posture requests with automatic reported-state observation.
 
 Operator permission is distinct from a vendor control lease. This path sends
 only one state 1 or 4, never RL state 17, navigation velocity, or an invented
@@ -24,7 +24,8 @@ except ImportError:
 MODE = 'operator_supervised_posture_test'
 PERMIT_SCHEMA = 's10_pro.operator_permit/1'
 POSTURE_STATES = {'stand': 1, 'lie': 4}
-CONFIRMATION_SOURCE = 'operator_visual_and_feedback'
+COMPLETION_LEVEL = 'reported_motion_state'
+COMPLETION_BASIS = 'post_send_target_state_feedback'
 
 
 def _finite(value):
@@ -175,10 +176,9 @@ class SupervisedPostureBackend:
 
 
 class SupervisedMotionPlugin(MotionPlugin):
-    """Reuse task persistence/ACP while requiring a current human pose check."""
+    """Send one posture request and observe the reported target state via ACP."""
 
     def __init__(self, config, namespace, backend, **kwargs):
-        self._operator_confirmation = None
         kwargs.setdefault('feedback', backend.feedback)
         kwargs.setdefault('execution_authorized', True)
         kwargs.setdefault('authorization_provider', backend.authorization.authorized_now)
@@ -222,7 +222,7 @@ class SupervisedMotionPlugin(MotionPlugin):
                 'command_worker': {'running': self._backend.transport.status().get('worker_running') is True,
                     'preparable': bool(safety['ready'])},
                 'observation': safety, 'blocked_by': blocked,
-                'actions': {candidate: {'ready': not blocked and candidate in self._backend.authorization.public_status().get('allowed_actions', []), 'requires_operator_visual_confirmation': True}
+                'actions': {candidate: {'ready': not blocked and candidate in self._backend.authorization.public_status().get('allowed_actions', []), 'completion_level': COMPLETION_LEVEL}
                             for candidate in POSTURE_STATES},
                 'unavailable_actions': ['velocity'],
                 'next_steps': [{'code': value, 'instruction': value.replace('_', ' ')} for value in blocked]}
@@ -234,73 +234,37 @@ class SupervisedMotionPlugin(MotionPlugin):
 
     def status(self):
         status = super().status()
-        status.update(mode=MODE, title='Supervised Posture Test', operator_supervision_required=True,
+        status.update(mode=MODE, title='Posture Requests', operator_supervision_required=True,
             vendor_control_owned=False, vendor_control_contract_verified=False,
-            confirmation_source=CONFIRMATION_SOURCE, supported_actions=['prepare_test', 'stand', 'lie', 'confirm_pose', 'stopmotion'],
+            completion_level=COMPLETION_LEVEL, completion_basis=COMPLETION_BASIS,
+            physical_pose_completion_verified=False, supported_actions=['prepare_test', 'stand', 'lie', 'stopmotion'],
             stop_semantics='close_our_worker_physical_stop_unverified',
-            operator_confirmation=copy.deepcopy(self._operator_confirmation),
             availability_detail={'production_backend': MODE,
-                'explanation': 'Finite on-site posture test. Stand sends state 1 only; lie sends state 4 only. Operator visual confirmation and fresh post-send feedback are both required. Worker closure does not stop the robot.'})
+                'explanation': 'Send one stand (state 1) or lie (state 4) request and automatically observe fresh post-send reported target state. Task completion means reported state observed, not independently verified physical pose completion. Worker closure does not stop the robot.'})
         return status
 
     def get_tool(self):
         tool = super().get_tool()
         schema = tool['inputSchema']
         schema['properties']['action']['enum'].remove('velocity')
-        schema['properties']['action']['enum'].extend(['prepare_test', 'confirm_pose'])
-        schema['properties']['observed_action'] = {'type': 'string', 'enum': ['stand', 'lie'],
-            'description': 'The posture the on-site operator explicitly reports seeing.'}
-        schema['allOf'].append({'if': {'properties': {'action': {'const': 'confirm_pose'}}, 'required': ['action']},
-            'then': {'required': ['request_id', 'observed_action'],
-                'not': {'anyOf': [{'required': [key]} for key in schema['properties']
-                    if key not in {'action', 'request_id', 'observed_action', *META_FIELDS}]}},
-            'else': {'not': {'required': ['observed_action']}}})
+        schema['properties']['action']['enum'].append('prepare_test')
         schema['allOf'].append({'if': {'properties': {'action': {'const': 'prepare_test'}}, 'required': ['action']},
             'then': {'not': {'anyOf': [{'required': [key]} for key in schema['properties']
                 if key not in {'action', *META_FIELDS}]}}})
-        schema['x-completion'] = {'actions': ['stand', 'lie'], 'timeout': 90, 'silent_completion': False}
+        schema['x-completion'] = {'actions': ['stand', 'lie'], 'timeout': 90, 'silent_completion': False,
+            'completion_level': COMPLETION_LEVEL,
+            'description': 'Completion means fresh post-send reported target state observed; physical pose completion is not independently verified.'}
         schema['x-action-params'].update({
             'prepare_test': {'params': [], 'description': 'Prepare the isolated command worker after operator authorization. Sends no robot command.'},
-            'stand': {'params': [], 'description': 'Send state 1 once. Requires the on-site operator to confirm the standing pose; no RL transition.'},
-            'lie': {'params': [], 'description': 'Send state 4 once. Requires the on-site operator to confirm the lying pose.'},
-            'confirm_pose': {'params': ['request_id', 'observed_action'],
-                'description': 'Invoke only after the on-site operator explicitly confirms the physical pose for this request. Never infer visual confirmation from telemetry.'},
+            'stand': {'params': [], 'description': 'Send stand request (state 1) once and automatically observe the reported target state. Completion means reported state observed, not independently verified physical pose completion. No RL transition.'},
+            'lie': {'params': [], 'description': 'Send lie request (state 4) once and automatically observe the reported target state. Completion means reported state observed, not independently verified physical pose completion.'},
             'velocity': {'params': [], 'description': 'Unavailable in supervised posture test mode.'},
             'stopmotion': {'params': [], 'description': 'Cancel the test and close our worker. Physical state becomes unknown; use the on-site operator and handheld. This does not claim the robot stopped.'}})
-        tool.update(title='Supervised Posture Test',
-            description='On-site operator-supervised finite posture test. No vendor ownership lease is asserted. Cancellation, timeout or observation loss requires operator intervention; no programmatic posture stop is claimed.')
+        tool.update(title='Posture Requests',
+            description='Send one finite stand or lie request and automatically observe the reported target state. No manual pose confirmation. ACP completion covers reported-state observation, not independent physical pose completion. Existing on-site supervision applies; no vendor ownership or automatic physical stop is claimed.')
         return tool
 
-    def confirm_pose(self, arguments):
-        if not isinstance(arguments, dict) or set(arguments) - {'request_id', 'observed_action', *META_FIELDS}:
-            raise ValueError('confirm_pose requires only request_id and observed_action')
-        rid, action = arguments.get('request_id'), arguments.get('observed_action')
-        if not isinstance(rid, str) or not rid.strip() or len(rid) > 128 or action not in POSTURE_STATES:
-            raise ValueError('confirm_pose requires a valid request_id and posture action')
-        for field in META_FIELDS & set(arguments):
-            if not isinstance(arguments[field], str) or not arguments[field].strip():
-                raise ValueError('invalid routing metadata')
-        with self._lock:
-            active = self._active
-            if not active or active['request_id'] != rid or active['action'] != action:
-                return {'accepted': False, 'completed': False, 'reason': 'active_posture_request_mismatch'}
-            if self._cancel.is_set() or self._gate(action) or not self._control_ok(action):
-                return {'accepted': False, 'completed': False, 'reason': 'supervised_conditions_unavailable'}
-            if self._clock() >= active['expires_monotonic']:
-                return {'accepted': False, 'completed': False, 'reason': 'posture_confirmation_expired'}
-            observed = self._backend.target_feedback(action, rid)
-            if observed.get('confirmed') is not True or observed.get('fresh') is not True:
-                return {'accepted': False, 'completed': False, 'reason': 'fresh_post_send_target_not_confirmed'}
-            self._operator_confirmation = {'request_id': rid, 'observed_action': action,
-                'confirmed_monotonic': self._clock(), 'confirmation_source': CONFIRMATION_SOURCE}
-            self._event('operator_pose_confirmed', request_id=rid, observed_action=action,
-                        confirmation_source=CONFIRMATION_SOURCE)
-            return {'accepted': True, 'completed': False, 'state': 'operator_confirmation_recorded',
-                    'request_id': rid, 'confirmation_source': CONFIRMATION_SOURCE}
-
     def dispatch(self, action, args):
-        if action == 'confirm_pose':
-            return self.confirm_pose(args)
         if action == 'prepare_test':
             validate_empty_arguments(args)
             with self._lock:
@@ -316,18 +280,22 @@ class SupervisedMotionPlugin(MotionPlugin):
 
     def execute(self, action, arguments):
         reply = super().execute(action, arguments)
+        if reply.get('state') == 'accepted' and not reply.get('replayed'):
+            reply.update(completion_level=COMPLETION_LEVEL,
+                completion_basis=COMPLETION_BASIS, physical_pose_completion_verified=False)
         if reply.get('state') == 'busy':
             with self._lock:
                 active = copy.deepcopy(self._active)
             if active is not None:
-                reply.update(reason='confirm_or_cancel_active_posture_first',
+                reply.update(reason='active_posture_task_in_progress',
                     active_request_id=active['request_id'], active_action=active['action'],
-                    instruction='After visually checking the active pose, call confirm_pose with its request_id and observed_action before requesting another posture.')
+                    instruction='The current posture request is awaiting reported target state. Wait for its result before sending another posture request.')
         return reply
 
     def _run_action(self, record, request, started):
         action, rid, deadline = request['action'], request['request_id'], request['expires_monotonic']
-        receipt, completed, reason = {}, False, 'posture_confirmation_timeout'
+        receipt, completed, reason = {}, False, 'reported_state_timeout'
+        observed = {}
         try:
             with self._io_lock:
                 if self._cancel.is_set() or self._gate(action) or not self._control_ok(action) or not self._started:
@@ -337,7 +305,7 @@ class SupervisedMotionPlugin(MotionPlugin):
                 receipt = self._backend.send(action, request, self._cancel)
                 self._last_command = self._clock()
             with self._lock:
-                self._phase = 'awaiting_operator_pose_confirmation'
+                self._phase = 'awaiting_reported_motion_state'
             self._event('sent', request_id=rid, action_id=record['action_id'],
                         command_accepted=None, confirmed=False, mode=MODE)
             while self._clock() < deadline:
@@ -349,14 +317,9 @@ class SupervisedMotionPlugin(MotionPlugin):
                     break
                 observed = self._backend.target_feedback(action, rid)
                 with self._lock:
-                    confirmation = self._operator_confirmation
-                    matching = (confirmation is not None and confirmation['request_id'] == rid
-                        and confirmation['observed_action'] == action
-                        and self._backend.sent_at(rid) is not None
-                        and confirmation['confirmed_monotonic'] >= self._backend.sent_at(rid))
-                    if (matching and observed.get('confirmed') is True and observed.get('fresh') is True
+                    if (observed.get('confirmed') is True and observed.get('fresh') is True
                             and not self._cancel.is_set() and not self._gate(action) and self._control_ok(action)):
-                        completed, reason = True, 'operator_visual_and_feedback_confirmed'
+                        completed, reason = True, 'target_state_observed'
                         break
                 self._cancel.wait(.02)
         except Exception as exc:
@@ -373,8 +336,14 @@ class SupervisedMotionPlugin(MotionPlugin):
                     'command_accepted': None, 'confirmed': completed, 'completed': completed,
                     'stop_confirmed': False, 'state': 'completed' if completed else 'error',
                     'status': 'completed' if completed else 'error', 'reason': reason,
-                    'mode': MODE, 'confirmation_source': CONFIRMATION_SOURCE if completed else None,
-                    'physical_state_unknown': not completed, 'operator_intervention_required': not completed,
+                    'mode': MODE, 'completion_level': COMPLETION_LEVEL,
+                    'completion_basis': COMPLETION_BASIS if completed else None,
+                    'reported_state_confirmed': completed, 'reported_target_state': POSTURE_STATES[action] if completed else None,
+                    'reported_state_evidence': {key: observed.get(key) for key in (
+                        'sequence', 'received_monotonic', 'age_s', 'motion_state',
+                        'matching_samples', 'required_samples', 'correlation')} if completed else None,
+                    'physical_pose_completion_verified': False, 'physical_state_unknown': True,
+                    'operator_intervention_required': not completed,
                     'vendor_control_owned': False, 'finished_at': self._wall()}
                 try:
                     if self._tasks.finish(rid, result):

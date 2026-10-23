@@ -1,4 +1,4 @@
-"""Synthetic posture/state/operator events only; no DDS or network I/O."""
+"""Synthetic finite posture/state tests only; no DDS or network I/O."""
 import copy
 import importlib.util
 import sys
@@ -48,6 +48,9 @@ class Bridge:
         self.seq = 1
         self.hes = 0
         self.stale = False
+        self.freeze_sequence = False
+        self.freeze_receipt = False
+        self.received = time.monotonic()
         self.active = {}
         self._lock = threading.Lock()
     def acquire(self, owner, sources, options):
@@ -56,10 +59,13 @@ class Bridge:
         self.active.pop(owner, None)
     def snapshot(self, source):
         with self._lock:
-            self.seq += 1
+            if not self.freeze_sequence:
+                self.seq += 1
             now = time.monotonic()
-            result = {'fresh': not self.stale, 'received_monotonic': now,
-                      'age_s': 0., 'sequence': self.seq, 'error': None}
+            if not self.freeze_receipt:
+                self.received = now
+            result = {'fresh': not self.stale, 'received_monotonic': self.received,
+                      'age_s': now - self.received, 'sequence': self.seq, 'error': None}
             if source == 'hard_estop':
                 result['data'] = {'value': self.hes}
             else:
@@ -73,18 +79,22 @@ class Transport:
         self.bridge = bridge
         self.running = self.closed = False
         self.calls = []
+        self.auto_state = True
+        self.starts = 0
         self.on_start = self.on_send = None
     def status(self):
         return {'worker_running': self.running, 'closed': self.closed}
     def start(self, **kwargs):
         assert not self.closed
         self.running = True
+        self.starts += 1
         if self.on_start:
             self.on_start()
     def publish_state(self, state, *, authority, cancel_event):
         assert self.running and not self.closed and not cancel_event.is_set()
         self.calls.append((state, copy.deepcopy(authority)))
-        self.bridge.state = state
+        if self.auto_state:
+            self.bridge.state = state
         if self.on_send:
             self.on_send()
         return {'sent': True, 'accepted': None}
@@ -115,19 +125,18 @@ def runtime():
 
 
 def begin(runtime, action='stand', rid='synthetic-1'):
-    plugin, _, _, _, _, _ = runtime
+    plugin, _, _, _, transport, _ = runtime
     receipt = plugin.execute(action, {'request_id': rid})
     assert receipt['accepted'] is True
-    wait_for(lambda: plugin.status()['phase'] == 'awaiting_operator_pose_confirmation')
+    wait_for(lambda: any(permit['request_id'] == rid for _, permit in transport.calls))
     return receipt
 
 
 def finish(runtime, action='stand', rid='synthetic-1'):
-    plugin, backend, _, _, _, _ = runtime
-    wait_for(lambda: backend.target_feedback(action, rid)['confirmed'])
-    reply = plugin.confirm_pose({'request_id': rid, 'observed_action': action})
-    assert reply['accepted'] is True
-    wait_for(lambda: plugin.status()['active_request'] is None)
+    plugin, _, _, _, _, _ = runtime
+    wait_for(lambda: plugin.status()['last_result'] is not None
+             and plugin.status()['last_result']['request_id'] == rid
+             and plugin.status()['active_request'] is None)
     return plugin.status()['last_result']
 
 
@@ -143,17 +152,19 @@ def test_read_only_lifecycle_never_starts_worker_or_claims_vendor_ownership(runt
 
 
 @pytest.mark.parametrize(('action', 'state'), [('stand', 1), ('lie', 4)])
-def test_one_state_only_requires_visual_confirmation_and_preserves_exactly_one_terminal(runtime, action, state):
+def test_one_state_automatically_completes_from_fresh_feedback_and_preserves_one_terminal(runtime, action, state):
     plugin, _, _, _, transport, notifier = runtime
     receipt = begin(runtime, action)
-    time.sleep(.08)
-    assert plugin.status()['active_request'] is not None
-    assert notifier.sent == []
     assert [x[0] for x in transport.calls] == [state]
     result = finish(runtime, action)
     assert result['completed'] and result['confirmed'] and not result['stop_confirmed']
-    assert result['confirmation_source'] == 'operator_visual_and_feedback'
-    assert not result['physical_state_unknown'] and result['vendor_control_owned'] is False
+    assert result['completion_basis'] == 'post_send_target_state_feedback'
+    assert result['completion_level'] == 'reported_motion_state'
+    assert result['reported_state_confirmed'] is True
+    assert result['reason'] == 'target_state_observed'
+    assert result['physical_pose_completion_verified'] is False
+    assert result['physical_state_unknown'] is True and result['vendor_control_owned'] is False
+    assert 'confirmation_source' not in result
     assert [x[0] for x in transport.calls] == [state]
     wait_for(lambda: len(notifier.sent) == 1)
     replay = plugin.execute(action, {'request_id': 'synthetic-1'})
@@ -170,26 +181,69 @@ def test_success_worker_can_serve_next_unique_finite_posture_without_replay(runt
     assert [c[0] for c in transport.calls] == [1, 4]
 
 
-@pytest.mark.parametrize('bad', [{'request_id':'other','observed_action':'stand'},
-                                {'request_id':'synthetic-1','observed_action':'lie'}])
-def test_wrong_request_or_pose_cannot_confirm(runtime, bad):
-    plugin, _, _, _, _, _ = runtime
+def test_nonmatching_target_state_never_completes_and_does_not_send_rl_transition(runtime):
+    plugin, _, bridge, _, transport, _ = runtime
+    transport.auto_state = False
     begin(runtime)
-    assert plugin.confirm_pose(bad)['accepted'] is False
+    time.sleep(.08)
+    assert plugin.status()['active_request'] is not None and plugin.status()['last_result'] is None
+    assert bridge.state == 0 and [call[0] for call in transport.calls] == [1]
+    result = finish(runtime)
+    assert result['status'] == 'error' and result['physical_state_unknown'] is True
+    assert not result['stop_confirmed'] and [call[0] for call in transport.calls] == [1]
+
+
+def test_pre_send_cached_target_and_repeated_sequence_do_not_complete(runtime):
+    plugin, _, bridge, _, transport, _ = runtime
+    bridge.state = 1
+    bridge.freeze_sequence = True
+    begin(runtime)
+    time.sleep(.08)
+    assert plugin.status()['last_result'] is None
     assert plugin.status()['active_request'] is not None
+    # A matching cached state must advance to distinct post-send frames.
+    bridge.freeze_sequence = False
+    assert finish(runtime)['completed'] is True
+    assert [call[0] for call in transport.calls] == [1]
 
 
-def test_confirmation_before_publish_or_before_target_feedback_is_rejected(runtime):
-    plugin, _, bridge, _, _, _ = runtime
-    assert not plugin.confirm_pose({'request_id':'synthetic-1','observed_action':'stand'})['accepted']
+def test_exactly_two_distinct_post_send_target_frames_are_required(runtime):
+    plugin, backend, bridge, _, transport, _ = runtime
+    transport.auto_state = False
+    bridge.freeze_sequence = True
     begin(runtime)
-    bridge.state = 0
-    assert not plugin.confirm_pose({'request_id':'synthetic-1','observed_action':'stand'})['accepted']
+    wait_for(lambda: backend.sent_at('synthetic-1') is not None)
+    bridge.state = 1
+    with bridge._lock:
+        bridge.seq += 1
+    wait_for(lambda: backend.target_feedback('stand', 'synthetic-1')['matching_samples'] == 1)
+    time.sleep(.05)
+    assert plugin.status()['active_request'] is not None
+    assert plugin.status()['last_result'] is None
+    with bridge._lock:
+        bridge.seq += 1
+    assert finish(runtime)['reported_state_confirmed'] is True
+    assert [call[0] for call in transport.calls] == [1]
+
+
+def test_matching_target_with_stale_receipt_cannot_complete(runtime):
+    plugin, _, bridge, _, transport, _ = runtime
+    transport.auto_state = False
+    begin(runtime)
+    with bridge._lock:
+        bridge.state = 1
+        bridge.freeze_receipt = True
+        bridge.received = time.monotonic() - .6
+    result = finish(runtime)
+    assert result['status'] == 'error' and result['physical_state_unknown']
+    assert not result['completed'] and not result['stop_confirmed']
+    assert transport.closed and [call[0] for call in transport.calls] == [1]
 
 
 @pytest.mark.parametrize('loss', ['cancel', 'timeout', 'hes', 'stale', 'authorization', 'card_stop'])
 def test_every_failure_is_error_unknown_never_fake_stopped_and_never_restarts(runtime, loss):
     plugin, _, bridge, authorization, transport, notifier = runtime
+    transport.auto_state = False
     begin(runtime)
     if loss == 'cancel':plugin.cancel()
     elif loss == 'hes':bridge.hes = 1
@@ -220,15 +274,24 @@ def test_unsafe_before_acceptance_creates_no_task_or_worker(runtime, condition):
     assert not transport.running and not transport.calls and not notifier.sent
 
 
-def test_velocity_and_unknown_confirmation_fields_are_rejected(runtime):
+def test_velocity_and_removed_confirmation_api_are_rejected_without_task_or_command(runtime):
     plugin, _, _, _, transport, _ = runtime
     assert not plugin.execute('velocity', {'request_id':'velocity'})['accepted']
-    with pytest.raises(ValueError):plugin.confirm_pose({'request_id':'x','observed_action':'stand','owned':True})
+    with pytest.raises(ValueError):plugin.dispatch('confirm_pose', {'request_id':'x','observed_action':'stand'})
+    with pytest.raises(ValueError):plugin.dispatch('stand', {'request_id':'x','observed_action':'stand'})
     tool = plugin.get_tool()
+    assert tool['title'] == 'Posture Requests'
+    assert 'reported state observed' in tool['inputSchema']['x-action-params']['stand']['description']
+    assert 'not independently verified physical pose' in tool['inputSchema']['x-action-params']['stand']['description']
     assert 'velocity' not in tool['inputSchema']['properties']['action']['enum']
-    assert 'confirm_pose' in tool['inputSchema']['properties']['action']['enum']
+    assert 'confirm_pose' not in tool['inputSchema']['properties']['action']['enum']
+    assert 'confirm_pose' not in tool['inputSchema']['x-action-params']
+    assert 'observed_action' not in tool['inputSchema']['properties']
+    assert 'operator_confirmation' not in plugin.status()
+    assert not hasattr(plugin, 'confirm_pose')
     assert tool['inputSchema']['x-completion']['actions'] == ['stand','lie']
     assert not transport.calls
+    assert plugin._tasks.get('x') is None and plugin._tasks.get('velocity') is None
 
 
 def test_preparation_loss_rechecks_before_durable_acceptance(runtime):
@@ -280,13 +343,15 @@ def test_runtime_build_selects_explicit_supervised_mode_without_starting_a_comma
             if hasattr(p,'close'):p.close()
 
 
-def test_operator_confirmation_schema_is_valid_and_forbids_telemetry_as_visual(runtime):
+def test_automatic_feedback_schema_is_valid_and_has_no_confirmation_api(runtime):
     jsonschema=pytest.importorskip('jsonschema')
     plugin,*_=runtime
     schema=plugin.get_tool()['inputSchema']
     jsonschema.Draft7Validator.check_schema(schema)
-    jsonschema.validate({'action':'confirm_pose','request_id':'one','observed_action':'stand'},schema)
-    for payload in ({'action':'confirm_pose','observed_action':'stand'},
+    jsonschema.validate({'action':'stand','request_id':'one'},schema)
+    jsonschema.validate({'action':'lie'},schema)
+    jsonschema.validate({'action':'prepare_test'},schema)
+    for payload in ({'action':'confirm_pose','request_id':'one','observed_action':'stand'},
                     {'action':'stand','observed_action':'stand'},
                     {'action':'confirm_pose','request_id':'one','observed_action':'stand','vx':0},
                     {'action':'velocity','duration':1}):
@@ -303,19 +368,22 @@ def test_explicit_prepare_worker_sends_no_command_and_creates_no_task(runtime):
 
 
 def test_identical_canvas_save_during_posture_does_not_cancel_or_close_worker(runtime):
-    plugin,_,_,_,transport,_=runtime
+    plugin,_,bridge,_,transport,_=runtime
+    transport.auto_state=False
     begin(runtime)
     generation=plugin._generation
     for updates in ({},dict(plugin._settings),{'config':dict(plugin._settings)}):
         plugin.configure(updates)
         assert plugin._active is not None and not plugin._cancel.is_set()
         assert plugin._generation==generation and not transport.closed
+    bridge.state=1
     assert finish(runtime)['completed'] is True
     assert [c[0] for c in transport.calls]==[1]
 
 
 def test_real_setting_change_still_cancels_the_active_supervised_task(runtime):
     plugin,_,_,_,transport,_=runtime
+    transport.auto_state=False
     begin(runtime)
     plugin.configure({'refresh_hz':3.})
     wait_for(lambda: plugin.status()['active_request'] is None)
@@ -325,27 +393,29 @@ def test_real_setting_change_still_cancels_the_active_supervised_task(runtime):
     assert [c[0] for c in transport.calls]==[1]
 
 
-def test_core_reapplying_saved_enabled_before_confirm_preserves_active_request(runtime):
-    plugin,backend,_,_,transport,_=runtime
+def test_core_reapplying_saved_enabled_before_target_state_preserves_active_request(runtime):
+    plugin,_,bridge,_,transport,_=runtime
+    transport.auto_state=False
     begin(runtime)
-    wait_for(lambda: backend.target_feedback('stand','synthetic-1')['confirmed'])
-    # Real Core /api/mcp/.../call replays config before confirm_pose.
+    # Real Core /api/mcp/.../call replays saved config before the action call.
     plugin.dispatch('config',{'enabled':True})
-    reply=plugin.dispatch('confirm_pose',{'request_id':'synthetic-1','observed_action':'stand'})
-    assert reply['accepted'] is True
+    assert plugin.status()['active_request'] is not None
+    bridge.state=1
     wait_for(lambda: plugin.status()['active_request'] is None)
     assert plugin.status()['last_result']['completed']
     assert not transport.closed and [x[0] for x in transport.calls]==[1]
 
 
-def test_core_reapplying_config_before_lie_cannot_cancel_or_replace_unconfirmed_stand(runtime):
+def test_core_reapplying_config_before_lie_cannot_cancel_or_replace_pending_stand(runtime):
     plugin,_,_,_,transport,_=runtime
+    transport.auto_state=False
     begin(runtime)
     plugin.dispatch('config',{'enabled':True})
-    busy=plugin.dispatch('lie',{'request_id':'second-before-confirmation'})
+    busy=plugin.dispatch('lie',{'request_id':'second-while-pending'})
     assert busy['state']=='busy'
-    assert busy['reason']=='confirm_or_cancel_active_posture_first'
+    assert busy['reason']=='active_posture_task_in_progress'
+    assert 'confirm_pose' not in str(busy)
     assert busy['active_request_id']=='synthetic-1' and busy['active_action']=='stand'
     assert not transport.closed and not plugin._cancel.is_set()
-    assert plugin._tasks.get('second-before-confirmation') is None
+    assert plugin._tasks.get('second-while-pending') is None
     assert [x[0] for x in transport.calls]==[1]
