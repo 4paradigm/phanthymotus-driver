@@ -336,8 +336,19 @@ def build_probe(sdk_root, library_dir, output_dir, *, idlc=None, idlc_library_di
         linked.append(str(matches[0].resolve()))
     out = Path(output_dir)
     generator = Path(idlc) if idlc else root / "dds" / arch / "bin/idlc"
-    if not generator.is_file() or not os.access(generator, os.X_OK):
-        raise ValueError("SDK offline IDL compiler missing; no SDK or system packages will be installed")
+    if not generator.is_file():
+        raise ValueError("SDK offline IDL compiler file missing: " + str(generator) + "; no SDK or system packages will be installed")
+    execution = "original"
+    if not os.access(generator, os.X_OK):
+        # The shipped ARM64 archive stores bin/idlc as 0644. Keep the SDK and
+        # driver untouched: execute an identical private temporary copy.
+        temporary_generator = out / "offline-idlc"
+        shutil.copyfile(generator, temporary_generator)
+        if hashlib.sha256(generator.read_bytes()).digest() != hashlib.sha256(temporary_generator.read_bytes()).digest():
+            raise ValueError("offline IDL compiler temporary-copy checksum mismatch")
+        temporary_generator.chmod(0o700)
+        generator = temporary_generator
+        execution = "temporary_copy"
     idl = out / "Robot_status.idl"
     idl.write_text(IDL)
     generator_env = dict(os.environ)
@@ -348,7 +359,7 @@ def build_probe(sdk_root, library_dir, output_dir, *, idlc=None, idlc_library_di
     if generated.returncode:
         raise ValueError("offline IDL generation failed: " + generated.stderr[-3000:])
     schema_hash = verify_schema((root / "include/Robot_status.hpp").read_text(), (out / "Robot_status.hpp").read_text())
-    print(json.dumps({"event":"schema_verified", "type_metadata_sha256":schema_hash}), flush=True)
+    print(json.dumps({"event":"schema_verified", "type_metadata_sha256":schema_hash, "idlc_execution":execution}), flush=True)
     source, executable = out / "probe.cpp", out / "probe"
     source.write_text(CPP)
     command = [compiler, "-std=c++17", "-O0", "-pthread", str(source), str(out / "Robot_status.cpp"),

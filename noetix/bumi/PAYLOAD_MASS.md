@@ -278,6 +278,9 @@ docker build --platform linux/arm64 -t bumi-payload-mass:local "$PAYLOAD_CONTEXT
 不修改 Driver 文件、不重启容器；只创建一个原生 DDS participant 和状态订阅。
 
 工具复用镜像内已有的 g++、离线 idlc 和 DDS 动态库，不安装软件包、不升级 SDK。
+厂商库包中ARM64的idlc权限为0644。若文件存在但不可执行，工具只复制到自身临时目录、
+校验副本与原文件SHA256一致后给临时副本0700权限；不修改SDK原文件或Driver配置。
+输出 `idlc_execution=temporary_copy` 表示使用该兼容路径；文件实际缺失会单独报错。
 从厂商头文件复原状态 IDL，用厂商离线编译器生成缺失的类型实现；编译前逐字节核对
 全部六种结构的12份 XTypes map/info 元数据。任何不一致报 SCHEMA_MISMATCH，
 不会尝试连设备。不会为了链接方便引入包含控制器代码的 libdriver.a。

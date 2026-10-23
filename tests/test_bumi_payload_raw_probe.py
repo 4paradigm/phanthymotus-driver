@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import time
 
@@ -103,7 +104,16 @@ def native(tmp_path_factory):
     if not lib or not idlc:
         pytest.skip('native DDS runtime/IDLC paths not provided; pure tests need no SDK binaries')
     folder=tmp_path_factory.mktemp('native_payload_probe')
-    executable=probe.build_probe(SDK,Path(lib),folder,idlc=Path(idlc),idlc_library_dir=Path(lib))
+    # Reproduce the exact ARM64 package condition on the host architecture:
+    # idlc is present but has mode 0644. Only its temporary copy may change.
+    source_idlc=folder/'sdk-idlc-0644'
+    shutil.copyfile(idlc,source_idlc)
+    source_idlc.chmod(0o644)
+    checksum=probe.hashlib.sha256(source_idlc.read_bytes()).hexdigest()
+    executable=probe.build_probe(SDK,Path(lib),folder,idlc=source_idlc,idlc_library_dir=Path(lib))
+    assert source_idlc.stat().st_mode & 0o777 == 0o644
+    assert probe.hashlib.sha256(source_idlc.read_bytes()).hexdigest()==checksum
+    assert (folder/'offline-idlc').stat().st_mode & 0o777 == 0o700
     source=folder/'publisher.cpp'
     source.write_text(PUBLISHER)
     headers=SDK/'dds/x86_64/include'
@@ -196,3 +206,12 @@ def test_native_nonfinite_torque_not_printed_as_nan(native):
 def test_native_cancellation_exits_without_side_effects(native):
     code,events,err=run_native(native,cancel=True)
     assert code==130,(events,err)
+
+
+def test_missing_idlc_file_distinguished_from_non_executable(tmp_path):
+    libs=Path(os.environ.get('BUMI_PROBE_TEST_LIBRARY_DIR','/does/not/exist'))
+    if not libs.is_dir():
+        pytest.skip('native DDS library path not provided')
+    with pytest.raises(ValueError,match='compiler file missing'):
+        probe.build_probe(SDK,libs,tmp_path,idlc=tmp_path/'absent-idlc')
+    assert not (tmp_path/'probe.cpp').exists()
