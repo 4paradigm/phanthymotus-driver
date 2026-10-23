@@ -73,7 +73,12 @@ class OperatorAuthorization:
             if not value['issued_at_ms'] <= now < value['expires_at_ms']:
                 raise ValueError('operator authorization is not current')
             self._issued = mono - (now - value['issued_at_ms']) / 1000
-            self._expires = mono + (value['expires_at_ms'] - now) / 1000
+            # Independent wall-to-monotonic arithmetic can round a one-hour
+            # window just above 3600 seconds. Round inward to the original
+            # duration as well; never extend approval or relax its validator.
+            duration = (value['expires_at_ms'] - value['issued_at_ms']) / 1000
+            self._expires = min(mono + (value['expires_at_ms'] - now) / 1000,
+                                self._issued + duration)
             self._manifest, self._digest = value, hashlib.sha256(raw).digest()
             self._valid, self._reason = True, 'operator_supervision_authorized'
         except (OSError, ValueError, TypeError):

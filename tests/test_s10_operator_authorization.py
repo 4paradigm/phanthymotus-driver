@@ -1,11 +1,13 @@
 """Fictional operator sessions only; no ROS, network or robot command I/O."""
 import copy
 import json
+import math
 import os
 
 import pytest
 
 from deep_robotics.s10_pro import operator_authorization as authorization
+from deep_robotics.s10_pro.motion_dds import AuthorityUnavailable, validate_operator_permit
 
 
 SCHEMA = 's10_pro.operator_authorization/1'
@@ -253,6 +255,43 @@ def test_permit_expiry_is_bounded_by_original_session_expiry(operator_session):
     clock.wall = 1060.
     with pytest.raises(PermissionError):
         policy.permit('expired', 'stand', clock.monotonic + 1.)
+
+
+def test_one_hour_wall_to_monotonic_rounding_never_exceeds_original_session_bound(operator_session):
+    # Deterministic values from the parent-side rejection: separate wall-clock
+    # conversions round the expiry a float step beyond issued + 3600 seconds.
+    # Keep the transport limit strict; bound the producer's mapping instead.
+    clock, manifest, _, write, load, _ = operator_session
+    issued_ms = 1792741567000
+    now_ms = 1792741651104.4966
+    clock.wall = now_ms / 1000
+    clock.monotonic = 844.0673228748906
+    manifest.update(issued_at_ms=issued_ms, expires_at_ms=issued_ms + 3600000)
+    write()
+    old_mapped_expiry = clock.monotonic + (manifest['expires_at_ms'] - now_ms) / 1000
+    policy = load()
+    assert policy.authorized_now()
+    permit = policy.permit('rounding-stand', 'stand', clock.monotonic + 1.)
+    assert old_mapped_expiry > permit['issued_monotonic'] + 3600
+    assert permit['expires_monotonic'] <= permit['issued_monotonic'] + 3600
+    assert permit['expires_monotonic'] <= old_mapped_expiry
+    assert validate_operator_permit(permit, now=clock.monotonic) == permit
+
+    # Repeated observation and the next unique action preserve both original
+    # session timestamps; a query must not renew the operator's approval.
+    clock.monotonic += .125
+    clock.wall += .125
+    assert policy.public_status()['authorized'] is True
+    later = policy.permit('rounding-lie', 'lie', clock.monotonic + 2.)
+    assert later['issued_monotonic'] == permit['issued_monotonic']
+    assert later['expires_monotonic'] == permit['expires_monotonic']
+    assert validate_operator_permit(later, now=clock.monotonic) == later
+
+    # One representable step beyond the limit remains invalid. This prevents
+    # fixing the valid producer by allowing an unbounded validation epsilon.
+    forged = {**later, 'expires_monotonic': math.nextafter(later['issued_monotonic'] + 3600, math.inf)}
+    with pytest.raises(AuthorityUnavailable):
+        validate_operator_permit(forged, now=clock.monotonic)
 
 
 @pytest.mark.parametrize('deadline', [0., 10., float('nan'), float('inf'), True, '11'])
