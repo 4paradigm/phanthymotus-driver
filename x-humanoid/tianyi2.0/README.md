@@ -244,11 +244,15 @@ the bounded inbox until the next permitted apply slot instead of being thrown
 away. Explicit zero always bypasses that pacing. TTL, observation-age and
 watchdog limits are unchanged.
 
-The bridged subscription callback only updates a bounded inbox and signals an
-event; it does not hold the plugin lock or wait for an SDK reply. One dedicated
-control thread consumes the latest command and performs synchronous SDK calls.
-Velocity execution no longer waits for a ROS timer or guard-condition callback
-to be scheduled alongside camera/depth processing. The event wakes on arrivals;
+The ROS/MCP facade now runs the existing velocity controller in a separate
+Python process (`loco_servo_process.py`), rather than in the camera bundle's
+Python interpreter. The facade sends original input and receive timestamps over
+a nonblocking Unix datagram channel, retaining a priority zero and the latest
+motion under backpressure. Lifecycle RPC uses a separate channel; waiting for an
+`info` response does not block command reception or SDK execution in the child.
+The child owns the unchanged ControlSink, acceleration limits, watchdog and SDK
+backend. Its dedicated control thread consumes the latest command and performs
+synchronous SDK calls. The event wakes on arrivals;
 an independent maximum-20ms wait bounds watchdog, standing and deferred-apply
 checks, without periodically replaying old commands. A separate priority zero slot clears
 older pending motion and cannot be overwritten by a later nonzero command;
@@ -257,11 +261,16 @@ not queued in arrival order. Original timestamps/TTLs remain unchanged, so a
 frame that has expired while waiting is rejected rather than retimestamped or
 replayed. Pause, stop, configuration changes and restart clear pending input;
 old-generation receivers and workers cannot deliver motion to a new session.
-The thread starts only on card start. Stop confirms the chassis hold, signals
-termination, and joins outside the plugin state lock before closing SDK/ROS
-resources. A join timeout blocks restart instead of stacking another worker.
-A fully paused thread sleeps until resume/stop; unexpected control-loop errors
-hold the chassis, mark the worker failed and require explicit stop/start.
+The process starts only on card start. A session nonce, lifecycle epoch and
+subscription generation reject input queued before pause/resume/config/restart.
+Standing feedback must be received again after each lifecycle barrier, so a
+queued old Bool cannot authorize new motion. Even an idempotent start/config
+confirms STOP before clearing pending input. Stop confirms the chassis hold,
+joins the controller thread and reaps both child and native helper. Parent EOF
+also closes input and stops the child. Unexpected transport/child failure closes
+admission and terminates the owned process group; unconfirmed termination or an
+unexpired firmware backup wait blocks handover/restart. No automatic restart or
+command replay occurs.
 
 When the previous motion lease has expired, a capable native worker accepts
 the next fully validated fresh motion in one `UPDATE` request. It confirms any
@@ -289,8 +298,12 @@ frames. `holds` counts calls to stop paths, including repeated watchdog stops
 after navigation has ended; it is not a count of distinct physical stops.
 `counts.refreshed_after_stop` counts selected frames replaced after a confirmed
 stop; each replaced frame is also counted once as dropped.
-`dispatch.mode=dedicated_worker`, `worker_alive` and `worker_failed` identify the
-independent controller and expose its health. `last_command_timing`
+`dispatch.mode=process_worker`, `worker_pid`, `worker_alive` and `worker_failed`
+identify the isolated controller and expose its health. `controller_mode` is
+`dedicated_worker`; `backend.process_id` identifies the native helper.
+`transport` reports facade pending slots and coalescing; `input_queue` reports
+the child's inbox. Neither counter acknowledges an SDK write.
+`last_command_timing`
 reports the selected command sequence/TTL, command and observation ages,
 remaining lease before/after apply, and apply round-trip duration. `receive_age_ms`
 measures generation-to-driver-callback age; `local_wait_ms` measures callback-to-
@@ -308,13 +321,22 @@ motion, the worker checks for another active action or replacement of its own
 handle; it refuses to overwrite that action. Raw velocity streaming does not
 add obstacle avoidance.
 
-Configure loco_servo exposes three live boolean settings via `action: config`:
+Configure loco_servo exposes live settings via `action: config`:
 
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `dry_run` | true | Validate, shape and count commands without SDK motion; enabling it during real execution first stops/cancels the old SDK action |
 | `rotate_only` | false | Suppress translation and preserve yaw rate; unsupported axes remain rejected |
 | `require_standing` | false | Require fresh true feedback from a configured domain-0 Bool source; missing/stale/false feedback stops/refuses motion |
+| `min_vx` | 0 | Measured minimum stable forward speed (m/s), advertised only as `control_interface.limits.min_magnitude[0]`; 0 declares no floor |
+
+`min_vx` must be measured on the chassis before setting it, and cannot exceed
+`max_vx`. The servo never raises small input velocities to this value. Existing
+Navi can read this planner metadata after it is restarted; Navi code and arrival
+logic are unchanged. With the default 0, this change cannot promise to resolve a
+goal stalled just outside its distance threshold. Arrival completion/tolerance
+requires the planner or a measured minimum-speed declaration, not an invented
+floor applied blindly to all motion (including obstacle slowdowns).
 
 Tianyi has no verified native standing FSM in the supplied API. Do not enable
 `require_standing` without a verified `standing_topic`. Feedback expires after

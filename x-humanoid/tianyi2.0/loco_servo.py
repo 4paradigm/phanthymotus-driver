@@ -44,8 +44,9 @@ class _LatestControlInbox:
             self._last_received_at = None
             self._last_gap_ms = None
 
-    def put(self, message, generation):
-        received_at = (time.monotonic(), int(time.time() * 1000))
+    def put(self, message, generation, received_at=None):
+        if received_at is None:
+            received_at = (time.monotonic(), int(time.time() * 1000))
         try:
             payload = json.loads(message.data)
             values = payload.get("values") if isinstance(payload, dict) else None
@@ -116,14 +117,29 @@ class _LatestControlInbox:
                     "last_receive_gap_ms": self._last_gap_ms, "last_wait_ms": self._last_wait_ms}
 
 
-def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0):
+def _validated_min_vx(value, max_vx):
+    message = f"loco_servo.min_vx must be finite and between 0 and max_vx ({max_vx:g})"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    try:
+        valid = math.isfinite(value) and 0 <= value <= max_vx
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(message)
+    return float(value)
+
+
+def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0):
+    min_vx = _validated_min_vx(min_vx, max_vx)
     return {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
         "joint_names": ["vx", "vy", "vz", "wx", "wy", "wz"],
         "frame": "base_link",
         "units": {"linear": "m/s", "angular": "rad/s", "time": "s"},
         "limits": {"lower": [-max_vx, 0, 0, 0, 0, -max_wz],
-                   "upper": [max_vx, 0, 0, 0, 0, max_wz]},
+                   "upper": [max_vx, 0, 0, 0, 0, max_wz],
+                   "min_magnitude": [min_vx, 0, 0, 0, 0, 0]},
         "groups": [{"name": "base", "offset": 0, "count": 6,
                     "unit": "m/s", "resource": "base"}],
         "rate": {"max_hz": 20, "expected_hz": hz,
@@ -144,7 +160,8 @@ class LocoServoPlugin:
             raise ValueError("loco_servo.expected_hz must be <= 20")
         self._descriptor = build_descriptor(
             self._hz, self._positive(config, "max_vx", 0.3),
-            self._positive(config, "max_wz", 1.0))
+            self._positive(config, "max_wz", 1.0), config.get("min_vx", 0.0))
+        self._min_vx = self._descriptor["limits"]["min_magnitude"][0]
         self._parsed_descriptor = parse_descriptor(self._descriptor)
         self._accel = (self._positive(config, "linear_acceleration", 0.3),
                        self._positive(config, "angular_acceleration", 0.6))
@@ -212,6 +229,9 @@ class LocoServoPlugin:
             "topic_in": [{"topic": INPUT_TOPIC, "format": "control/velocity",
                           "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}],
             "configSchema": {"type": "object", "properties": {
+                "min_vx": {"type": "number", "default": 0.0, "minimum": 0.0,
+                           "maximum": self._descriptor["limits"]["upper"][0],
+                           "description": "实测最小稳定直行速度（m/s），仅向规划器声明，不在执行端强行抬高速度；0 不声明。修改后需重新启动 navi 读取。"},
                 "dry_run": {"type": "boolean", "default": True,
                             "description": "空跑：照常接收、检查、计数，但不创建 SDK 运动动作。第一次上机先保持开启，检查它想发什么。"},
                 "rotate_only": {"type": "boolean", "default": False,
@@ -439,10 +459,10 @@ class LocoServoPlugin:
     def _record(self, verdict, reason="", **extra):
         self._last = {"verdict": verdict, "reason": reason, **extra}
 
-    def _on_message(self, message, generation=None):
+    def _on_message(self, message, generation=None, received_at=None):
         # No plugin/SDK lock here: waiting on it would block the socket reader
         # and accumulate already-aging commands in the Unix socket buffer.
-        if self._inbox.put(message, generation):
+        if self._inbox.put(message, generation, received_at):
             self._controller_wake.set()
 
     def _process_message(self, message, generation=None, received_at=None):
@@ -672,7 +692,16 @@ class LocoServoPlugin:
         updates = {key: args[key] for key in TOGGLES if key in args}
         if any(not isinstance(value, bool) for value in updates.values()):
             return {"state": "error", "error": "configuration toggles must be boolean"}
-        if any(self._settings[key] != value for key, value in updates.items()):
+        try:
+            min_vx = _validated_min_vx(args.get("min_vx", self._min_vx),
+                                       self._descriptor["limits"]["upper"][0])
+            descriptor = copy.deepcopy(self._descriptor)
+            descriptor["limits"]["min_magnitude"][0] = min_vx
+            parsed_descriptor = parse_descriptor(descriptor)
+        except ValueError as exc:
+            return {"state": "error", "error": str(exc)}
+        if (min_vx != self._min_vx or
+                any(self._settings[key] != value for key, value in updates.items())):
             self._inbox.activate(self._generation, False)
             # Stop under the OLD mode, especially before enabling dry_run.
             if self._running:
@@ -687,6 +716,11 @@ class LocoServoPlugin:
                         self._inbox.activate(self._generation, not self._paused and not self._yielded)
                         return {"state": "error", "error": str(exc), "dry_run": self._settings["dry_run"]}
             self._settings.update(updates)
+            # This is planner metadata only. Keep the existing sink instance:
+            # its bounds are unchanged, and it owns seq/source arbitration.
+            self._min_vx = min_vx
+            self._descriptor = descriptor
+            self._parsed_descriptor = parsed_descriptor
             self._barrier_ms = int(time.time() * 1000)
             self._inbox.activate(self._generation,
                                  self._running and not self._paused and not self._yielded)
@@ -711,7 +745,7 @@ class LocoServoPlugin:
         interface.update({key: self._settings[key] for key in ("dry_run", "rotate_only")})
         return {
             "state": "stopping" if self._closing else "paused" if self._running and self._paused else "running" if self._running else "idle",
-            "input": self._input_topic, **self._settings,
+            "input": self._input_topic, "min_vx": self._min_vx, **self._settings,
             "yielded_to_explicit_command": self._yielded,
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),

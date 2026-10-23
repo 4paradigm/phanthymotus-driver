@@ -1174,7 +1174,7 @@ def load_bundle():
 
 
 def test_bundle_hands_control_to_explicit_card_and_requires_cancel_before_resume(setup, monkeypatch):
-    monkeypatch.setitem(sys.modules, "loco_servo", setup.module)
+    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.module)
     bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     class Nav:
         def start(self):
@@ -1245,7 +1245,7 @@ def test_custom_input_and_idempotent_start_keep_one_subscription(setup):
 
 
 def test_unknown_tool_cannot_steal_base_ownership(setup, monkeypatch):
-    monkeypatch.setitem(sys.modules, "loco_servo", setup.module)
+    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.module)
     bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     bundle.start_all()
     try:
@@ -1261,6 +1261,110 @@ def test_unknown_tool_cannot_steal_base_ownership(setup, monkeypatch):
 def test_invalid_config_is_rejected(setup, config):
     with pytest.raises(ValueError):
         setup.create(**config)
+
+
+@pytest.mark.parametrize("min_vx", [0.0, 0.025, 0.3])
+def test_min_vx_declares_only_the_measured_forward_floor(setup, min_vx):
+    plugin = setup.create(min_vx=min_vx)
+    info = plugin.dispatch("info", {})
+    assert info["min_vx"] == min_vx
+    assert info["control_interface"]["limits"]["min_magnitude"] == [min_vx, 0, 0, 0, 0, 0]
+    assert info["control_interface"]["limits"]["upper"] == [0.3, 0, 0, 0, 0, 1.0]
+    assert not setup.ros.executor_core.nodes
+    assert plugin._backend is None
+
+
+def test_min_vx_defaults_to_no_declared_floor_and_schema_uses_actual_max_vx(setup):
+    plugin = setup.create(max_vx=0.2)
+    assert plugin._info()["min_vx"] == 0
+    assert plugin._info()["control_interface"]["limits"]["min_magnitude"] == [0] * 6
+    schema = plugin.get_tool()["configSchema"]["properties"]["min_vx"]
+    assert schema["type"] == "number" and schema["default"] == schema["minimum"] == 0
+    assert schema["maximum"] == 0.2
+    assert "实测" in schema["description"] and "仅向规划器声明" in schema["description"]
+    assert "不在执行端强行抬高速度" in schema["description"]
+
+
+@pytest.mark.parametrize("min_vx", [True, False, None, "0.02", float("nan"), float("inf"),
+                                    -float("inf"), -0.001, 0.301, 10 ** 1000])
+def test_invalid_min_vx_is_rejected_before_start_or_live_change(setup, min_vx):
+    with pytest.raises(ValueError, match="min_vx"):
+        setup.create(min_vx=min_vx)
+    plugin = start(setup)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    before = plugin._info()
+    descriptor, parsed, sink = plugin._descriptor, plugin._parsed_descriptor, plugin._sink
+    result = plugin.dispatch("config", {"min_vx": min_vx, "dry_run": True})
+    assert result["state"] == "error" and "min_vx" in result["error"]
+    assert plugin._min_vx == 0 and not plugin._settings["dry_run"]
+    assert plugin._descriptor is descriptor and plugin._parsed_descriptor is parsed and plugin._sink is sink
+    assert plugin._info()["input_queue"]["pending"] == before["input_queue"]["pending"] == 1
+    assert plugin._backend.messages == []
+
+
+def test_min_vx_metadata_does_not_raise_small_input_velocity_or_prevent_zero(setup):
+    plugin = start(setup, min_vx=0.05)
+    send(plugin, command(setup, values=[0.000005, 0, 0, 0, 0, 0]))
+    assert plugin._last["verdict"] == "APPLIED"
+    assert plugin._backend.messages[-1] == pytest.approx([0.000005, 0, 0, 0, 0, 0])
+    send(plugin, command(setup, seq=2, values=[0] * 6))
+    assert plugin._last["verdict"] == "APPLIED"
+    assert plugin._backend.messages[-1] == [0] * 6
+
+
+def test_live_min_vx_change_confirms_stop_clears_input_and_preserves_sink_arbitration(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, seq=5, priority=10))
+    setup.clock.advance()
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=6, priority=10))))
+    sink = plugin._sink
+    result = plugin.dispatch("config", {"min_vx": 0.025})
+    assert result["ok"] and result["min_vx"] == 0.025
+    assert result["control_interface"]["limits"]["min_magnitude"] == [0.025, 0, 0, 0, 0, 0]
+    assert plugin._backend.messages[-1] == [0] * 6
+    assert plugin._sink is sink
+    assert plugin._inbox.info()["pending"] == 0 and plugin._inbox.info()["active"]
+    setup.clock.advance()
+    send(plugin, command(setup, seq=5, priority=10))
+    assert plugin._last["verdict"] == "DROPPED" and "not newer" in plugin._last["reason"]
+    send(plugin, command(setup, seq=1, source="another", priority=0))
+    assert plugin._last["verdict"] == "DROPPED" and "outranked" in plugin._last["reason"]
+    send(plugin, command(setup, seq=6, priority=10, values=[0.005, 0, 0, 0, 0, 0]))
+    assert plugin._last["verdict"] == "APPLIED" and plugin._backend.messages[-1][0] == 0.005
+
+
+def test_live_min_vx_unchanged_does_not_stop_or_clear_pending_input(setup):
+    plugin = start(setup, min_vx=0.025)
+    send(plugin, command(setup))
+    setup.clock.advance()
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=2))))
+    writes = list(plugin._backend.messages)
+    result = plugin.dispatch("config", {"min_vx": 0.025})
+    assert result["ok"] and plugin._backend.messages == writes
+    assert plugin._inbox.info()["pending"] == 1
+
+
+def test_min_vx_change_keeps_previous_configuration_when_stop_is_unconfirmed(setup):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    descriptor, parsed, sink = plugin._descriptor, plugin._parsed_descriptor, plugin._sink
+    plugin._backend.fail = True
+    result = plugin.dispatch("config", {"min_vx": 0.025, "dry_run": True})
+    assert result["state"] == "error" and "stop unconfirmed" in result["error"]
+    assert plugin._min_vx == 0 and not plugin._settings["dry_run"]
+    assert plugin._descriptor is descriptor and plugin._parsed_descriptor is parsed and plugin._sink is sink
+    assert plugin._paused and not plugin._inbox.info()["active"]
+    plugin._backend.fail = False
+
+
+def test_min_vx_change_keeps_previous_configuration_when_readonly_connect_fails(setup):
+    plugin = start(setup, dry_run=True)
+    descriptor, parsed, sink = plugin._descriptor, plugin._parsed_descriptor, plugin._sink
+    plugin._backend.connect_fail = True
+    result = plugin.dispatch("config", {"min_vx": 0.025, "dry_run": False})
+    assert result["state"] == "error" and "connection failed" in result["error"]
+    assert plugin._min_vx == 0 and plugin._settings["dry_run"]
+    assert plugin._descriptor is descriptor and plugin._parsed_descriptor is parsed and plugin._sink is sink
 
 
 def test_new_card_defaults_to_dry_run_without_connecting_to_sdk(setup):
@@ -1311,7 +1415,7 @@ def test_unconfirmed_stop_refuses_stop_resume_config_and_handover(setup):
 
 
 def test_bundle_does_not_start_other_motion_when_sdk_stop_fails(setup, monkeypatch):
-    monkeypatch.setitem(sys.modules, "loco_servo", setup.module)
+    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.module)
     bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     calls = []
     class Home:

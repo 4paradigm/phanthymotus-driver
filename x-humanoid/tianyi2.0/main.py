@@ -608,7 +608,7 @@ class TianyiDeviceBundle:
         self._base_owner = ""
         self._loco_servo = None
         if plugins_cfg.get("loco_servo", {}).get("enabled", False):
-            from loco_servo import LocoServoPlugin
+            from loco_servo_process import LocoServoPlugin
             self._loco_servo = LocoServoPlugin(
                 plugins_cfg["loco_servo"], namespace, ros2,
                 conflict=self._base_motion_problem)

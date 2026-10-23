@@ -244,6 +244,7 @@ class SlamtecVelocityBackend:
         with self._lock:
             alive = self._process is not None and self._process.poll() is None
             return {"type": "slamware_sdk", "host": self._host, "port": self._port,
+                    "process_id": self._process.pid if alive else None,
                     "connected": alive and not self._faulted,
                     "state": self._state if alive or self._faulted else "disconnected",
                     "action_id": self._action_id, "error": self._error,
