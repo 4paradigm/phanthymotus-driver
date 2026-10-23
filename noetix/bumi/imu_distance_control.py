@@ -593,9 +593,17 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     result['pre_zero_velocity_mps'] = source_velocity
                     estimator.velocity = (0.0, 0.0, 0.0)
                     result['stationary_assumed'] = True
-                    final_error = math.hypot(target_x-body_x, target_y-body_y)
+                    # Recompute from the latest sample: the braking phase keeps
+                    # integrating the coast, so the pre-brake body_x/body_y must
+                    # not decide the endpoint.
+                    fx, fy, _ = source_position
+                    final_body_x = fx*cy + fy*sy
+                    final_body_y = -fx*sy + fy*cy
+                    final_error = math.hypot(target_x-final_body_x,
+                                             target_y-final_body_y)
                     result['final_position_error_m'] = final_error
-                    result['final_heading_deg'] = math.degrees(heading)
+                    result['final_heading_deg'] = math.degrees(
+                        angle_delta(estimator.yaw, origin_yaw))
                     result['estimated_distance_m'] = final_error
                     result['estimated_error_m'] = final_error
                     if final_error > 0.12:

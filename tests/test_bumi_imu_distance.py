@@ -409,6 +409,130 @@ def test_target_turns_first_for_a_large_bearing(monkeypatch):
     assert result['state'] in ('error', 'stopped', 'done')
 
 
+def test_target_heading_drift_is_corrected_away_from_the_drift(monkeypatch):
+    clock = [0.0]
+    commands = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+        def _read_distance_imu(self):
+            # The robot drifts 10 deg left while walking toward a target ahead.
+            yaw = 0.0 if clock[0] < 2.1 else math.radians(10)
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=yaw)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+            commands.append((vx, vyaw))
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+            self._last = None
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
+        def observe(self, joints, quaternion, now, frozen=False):
+            if frozen:
+                self.velocity = [0.0, 0.0, 0.0]
+                return
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            step = 0.16*dt if owner.command else 0.0
+            self.position = [self.position[0]+step, self.position[1], self.position[2]]
+            self.velocity = [step/dt, 0.0, 0.0]
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.5, 0.0)
+    assert result['state'] == 'done', result.get('error')
+    # Drifting left must command a right correction (negative yaw), not another
+    # left turn. The stale sign would reinforce the drift.
+    assert any(vyaw < 0 for vx, vyaw in commands), commands
+
+
+def test_target_endpoint_catches_coasting_past_the_tolerance(monkeypatch):
+    clock = [0.0]
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+            self._last = None
+            self._slid = 0.0
+            self._moved = False
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
+            self._slid = 0.0
+            self._moved = False
+        def observe(self, joints, quaternion, now, frozen=False):
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            if owner.command:
+                self._moved = True
+                step = 0.16*dt
+            elif self._moved and self._slid < 0.25:
+                # Coast 25 cm after the brake: the pre-brake position is within
+                # tolerance, the post-brake one is outside the 12 cm endpoint.
+                step = 0.16*dt
+                self._slid += step
+            else:
+                step = 0.0
+            self.position = [self.position[0]+step, self.position[1], self.position[2]]
+            self.velocity = [step/dt, 0.0, 0.0]
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.5, 0.0)
+    # The coast takes the robot beyond tolerance; the endpoint must see the
+    # post-brake position, not the pre-brake one.
+    assert result['state'] == 'error'
+    assert 'outside the target point' in result['error']
+
+
 def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     clock = [0.0]
     commands = []
