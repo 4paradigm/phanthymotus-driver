@@ -62,3 +62,13 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+
+  payload_mass:
+    enabled: true
+    # Static sampling only; no movement and no assumed safe payload limit.
+    # Requires the existing state plugin for raw, unrounded shared observations.
+    data_dir: /opt/phanthy-motus/data/bumi/payload_mass
+    profiles_file: /opt/phanthy-motus/data/bumi/payload_mass/engineering_profiles.json
+    # Per-device deployment overrides or BUMI_PAYLOAD_ROBOT_ID / SDK_VERSION env.
+    hardware_id: ""
+    sdk_version: ""

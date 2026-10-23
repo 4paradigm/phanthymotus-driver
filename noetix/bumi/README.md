@@ -447,3 +447,10 @@ ros2 topic echo /<robot_namespace>/motion/state
 ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
+
+
+## 手臂载荷估重（静态）
+
+新增单实例 `payload_mass` processor，复用现有关节反馈进行空载差分及已知质量经验标定。
+配置、mock、只读诊断、采集、停止、存档及部署见 [PAYLOAD_MASS.md](PAYLOAD_MASS.md)。
+默认没有真实设备的已验证姿态/载荷范围；`slow_probe` 明确不支持，不会驱动手臂。
