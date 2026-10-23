@@ -1481,6 +1481,25 @@ class ControlModePlugin(_RlActionPlugin):
 # ArmPlugin — DDS rt/lowcmd upper body control
 # ===========================================================================
 
+def _require_motion_confirmation(args):
+    if args.get("confirm") is not True:
+        return {"success": False, "code": "CONFIRMATION_REQUIRED",
+                "message": "执行前须由操作员确认现场安全、开发者模式和控制交接，并明确传入 confirm=true"}
+    return None
+
+
+def _add_motion_confirmation(properties, action_params):
+    properties["confirm"] = {
+        "type": "boolean", "default": False,
+        "title": "确认现场安全与控制交接",
+        "description": "操作员确认开发者模式、无其他低层写入者且现场允许动作后设为 true；每次动作都需要确认。",
+    }
+    for entry in action_params.values():
+        entry["params"].append("confirm")
+        entry["required"] = ["confirm"]
+        entry["x-is-dangerous"] = True
+
+
 class ArmControlPlugin:
     """Human-facing Adam Pro arm control over the vendor's DDS lowcmd API.
 
@@ -1983,6 +2002,7 @@ class ArmControlPlugin:
             "params": ["duration_s"],
             "description": "回到开始控制时的手臂角度。",
         }
+        _add_motion_confirmation(properties, action_params)
         return {
             "name": "arm_control",
             "type": "actuator",
@@ -2002,6 +2022,7 @@ class ArmControlPlugin:
                 "additionalProperties": False,
                 "x-action-params": action_params,
                 "x-resource": ["adam_upper_body"],
+                "x-is-dangerous": True,
             },
         }
 
@@ -2369,6 +2390,10 @@ class ArmControlPlugin:
         return targets
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action in {"reset", "set_joints", "preset", *self._GROUP_JOINTS, *ARM_ACTIONS}:
+            error = _require_motion_confirmation(args)
+            if error:
+                return error
         if action == "start":
             # A canvas stop tears the lowcmd worker down (_stop_and_wait sets
             # the stop event and clears the thread).  A later start must bring
@@ -2550,6 +2575,7 @@ class WaistControlPlugin:
             "reset": {"params": ["duration_s"],
                       "description": "回到开始控制时的腰部角度。"},
         }
+        _add_motion_confirmation(properties, action_params)
         return {
             "name": "waist_control",
             "type": "actuator",
@@ -2565,6 +2591,7 @@ class WaistControlPlugin:
                 "additionalProperties": False,
                 "x-action-params": action_params,
                 "x-resource": ["adam_upper_body"],
+                "x-is-dangerous": True,
             },
         }
 
@@ -2575,6 +2602,10 @@ class WaistControlPlugin:
         return self._control.stop()
 
     def dispatch(self, action, args):
+        if action in ("set_angles", "reset"):
+            error = _require_motion_confirmation(args)
+            if error:
+                return error
         # start/stop/info describe the controller this card delegates to.
         if action in ("start", "stop", "info"):
             return self._control.dispatch(action, args)
@@ -2666,6 +2697,7 @@ class HeadControlPlugin:
             "reset": {"params": ["duration_s"],
                       "description": "回到开始控制时的头部角度。"},
         }
+        _add_motion_confirmation(properties, action_params)
         return {
             "name": "head_control",
             "type": "actuator",
@@ -2682,6 +2714,7 @@ class HeadControlPlugin:
                 "additionalProperties": False,
                 "x-action-params": action_params,
                 "x-resource": ["adam_upper_body"],
+                "x-is-dangerous": True,
             },
         }
 
@@ -2692,6 +2725,10 @@ class HeadControlPlugin:
         return self._control.stop()
 
     def dispatch(self, action, args):
+        if action in ("set_angles", "reset"):
+            error = _require_motion_confirmation(args)
+            if error:
+                return error
         # start/stop/info describe the controller this card delegates to.
         if action in ("start", "stop", "info"):
             return self._control.dispatch(action, args)
@@ -3046,9 +3083,9 @@ class ArmGesturePlugin:
         entry = self._GESTURES.get(action)
         if entry is None:
             return None
-        if args.get("confirm") is not True:
-            return {"success": False, "code": "CONFIRMATION_REQUIRED",
-                    "message": "执行前须由操作员确认现场安全、开发者模式和控制交接，并明确传入 confirm=true"}
+        error = _require_motion_confirmation(args)
+        if error:
+            return error
         pose, symmetric, default_side = entry
         side = args.get("side", default_side)
         if side not in ("left", "right", "both"):

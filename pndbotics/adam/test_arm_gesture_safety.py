@@ -121,7 +121,7 @@ class GestureSafetyTests(unittest.TestCase):
             (device.HeadControlPlugin, 'set_angles', {'yaw_deg':5}),
         ):
             accepted = self.gesture.dispatch('wave', {"confirm": True})
-            result = kind(self.control).dispatch(action, args)
+            result = kind(self.control).dispatch(action, {**args, "confirm": True})
             self.assertIsNotNone(result)
             self.assertNotEqual(False, result.get('success'), result)
             self.assertEqual('cancelled', self.wait_for(accepted['action_id'])[1])

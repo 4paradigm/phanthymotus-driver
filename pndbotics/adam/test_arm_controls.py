@@ -86,7 +86,7 @@ class ArmControlTests(unittest.TestCase):
         tool = plugin.get_tool()
         self.assertIn("reset", tool["inputSchema"]["properties"]["action"]["enum"])
         self.assertEqual(
-            ["duration_s"],
+            ["duration_s", "confirm"],
             tool["inputSchema"]["x-action-params"]["reset"]["params"],
         )
 
@@ -97,7 +97,7 @@ class ArmControlTests(unittest.TestCase):
             plugin._target_q = {
                 ADAM_PRO_JOINTS.index("shoulderPitch_Left"): math.radians(-90),
             }
-            result = plugin.dispatch("reset", {"duration_s": 3.0})
+            result = plugin.dispatch("reset", {"confirm": True, "duration_s": 3.0})
         finally:
             plugin._stop_event.set()
             if plugin._thread is not None:
@@ -141,7 +141,7 @@ class ArmControlTests(unittest.TestCase):
         device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
         try:
             plugin.start()
-            result = plugin.dispatch("set_shoulder", {
+            result = plugin.dispatch("set_shoulder", {"confirm": True,
                 "side": "left", "pitch_deg": -30, "roll_deg": 20,
                 "yaw_deg": 10,
             })

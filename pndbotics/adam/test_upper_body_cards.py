@@ -315,7 +315,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
         plugin = self.arm_plugin()
         requested = {"left_elbow": -60, "right_elbow": -60,
                      "left_shoulder_pitch": -30}
-        result = plugin.dispatch("set_joints", {"joints": requested})
+        result = plugin.dispatch("set_joints", {"confirm": True, "joints": requested})
         self.assertTrue(result["success"], result)
         self.assertEqual(3, result["joints_set"])
         self.assertEqual(set(requested), set(result["joints_deg"]))
@@ -330,7 +330,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
     def test_set_joints_rejects_empty_unknown_and_out_of_range_input(self):
         plugin = self.arm_plugin()
         for payload in ({}, None, [], {"left_elbow": 999}, {"nope": 0}):
-            result = plugin.dispatch("set_joints", {"joints": payload})
+            result = plugin.dispatch("set_joints", {"confirm": True, "joints": payload})
             self.assertFalse(result["success"], payload)
             self.assertEqual("INVALID_ARGUMENT", result["code"], payload)
 
@@ -342,7 +342,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
 
     def test_get_state_reports_degrees_and_settling(self):
         plugin = self.arm_plugin()
-        plugin.dispatch("set_joints", {"joints": {"left_elbow": -45}})
+        plugin.dispatch("set_joints", {"confirm": True, "joints": {"left_elbow": -45}})
         state = plugin.dispatch("get_state", {})
         elbow = state["joints"]["left_elbow"]
         self.assertEqual(elbow["target_deg"], -45.0)
@@ -371,7 +371,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
         for requested, distance in ((0.1, 1.0), (0.1, 0.05), (12.0, 0.05)):
             plugin = self.arm_plugin()
             hold = plugin._hold_q[shoulder]
-            result = plugin.dispatch("set_joints", {
+            result = plugin.dispatch("set_joints", {"confirm": True,
                 "joints": {"left_shoulder_pitch": math.degrees(hold - distance)},
                 "duration_s": requested,
             })
@@ -395,7 +395,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
         plugin = self.arm_plugin()
         shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
         hold = plugin._hold_q[shoulder]
-        result = plugin.dispatch("set_joints", {
+        result = plugin.dispatch("set_joints", {"confirm": True,
             "joints": {"left_shoulder_pitch": math.degrees(hold - 0.02)},
             "duration_s": 0.15,
         })
@@ -406,7 +406,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
     def test_without_duration_s_the_configured_transition_still_applies(self):
         plugin = self.arm_plugin()
         result = plugin.dispatch("set_left_shoulder_pitch",
-                                 {"left_shoulder_pitch_deg": -20})
+                                 {"confirm": True, "left_shoulder_pitch_deg": -20})
         self.assertTrue(result["success"], result)
         self.assertIsNone(result["duration_s"])
         self.assertAlmostEqual(plugin._DEFAULT_TRANSITION_SECONDS, plugin._seg_span)
@@ -414,7 +414,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
     def test_duration_s_rejects_bad_values(self):
         plugin = self.arm_plugin()
         for bad in (0, -1, 61, float("nan"), "soon", True):
-            result = plugin.dispatch("set_joints", {
+            result = plugin.dispatch("set_joints", {"confirm": True,
                 "joints": {"left_elbow": -30}, "duration_s": bad,
             })
             self.assertFalse(result["success"], bad)
@@ -468,7 +468,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
 
     def test_compound_verbs_reach_several_joints_in_one_segment(self):
         plugin = self.arm_plugin()
-        result = plugin.dispatch("set_shoulder", {
+        result = plugin.dispatch("set_shoulder", {"confirm": True,
             "side": "left", "pitch_deg": -30, "roll_deg": 20, "yaw_deg": 10})
         self.assertTrue(result["success"], result)
         self.assertEqual("left", result["side"])
@@ -488,7 +488,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
 
     def test_compound_verbs_default_to_the_right_arm_and_allow_partial_fields(self):
         plugin = self.arm_plugin()
-        result = plugin.dispatch("set_elbow", {"bend_deg": -45})
+        result = plugin.dispatch("set_elbow", {"confirm": True, "bend_deg": -45})
         self.assertTrue(result["success"], result)
         self.assertEqual("right", result["side"])
         index = ADAM_PRO_JOINTS.index("elbow_Right")
@@ -506,7 +506,7 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
             ("set_shoulder", {"side": "right", "roll_deg": 40}, "right_shoulder_roll"),
         )
         for action, payload, fragment in cases:
-            result = plugin.dispatch(action, payload)
+            result = plugin.dispatch(action, {**payload, "confirm": True})
             self.assertFalse(result["success"], (action, payload))
             self.assertEqual("INVALID_ARGUMENT", result["code"], (action, payload))
             self.assertIn(fragment, result["message"], (action, payload))
@@ -823,7 +823,7 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
         self.assertEqual("waist_control", tool["name"])
         self.assertEqual(["set_angles", "reset"],
                          schema["properties"]["action"]["enum"])
-        self.assertEqual(["roll_deg", "pitch_deg", "yaw_deg", "duration_s"],
+        self.assertEqual(["roll_deg", "pitch_deg", "yaw_deg", "duration_s", "confirm"],
                          schema["x-action-params"]["set_angles"]["params"])
 
     def test_head_schema_only_advertises_angles_and_reset(self):
@@ -832,7 +832,7 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
         self.assertEqual("head_control", tool["name"])
         self.assertEqual(["set_angles", "reset"],
                          schema["properties"]["action"]["enum"])
-        self.assertEqual(["yaw_deg", "pitch_deg", "duration_s"],
+        self.assertEqual(["yaw_deg", "pitch_deg", "duration_s", "confirm"],
                          schema["x-action-params"]["set_angles"]["params"])
 
     def test_waist_and_head_angle_descriptions_show_exact_limits(self):
@@ -851,7 +851,7 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
     def test_head_set_angles_targets_multiple_neck_joints_together(self):
         control = self.arm_plugin()
         result = HeadControlPlugin(control).dispatch(
-            "set_angles", {"yaw_deg": -30, "pitch_deg": 10})
+            "set_angles", {"confirm": True, "yaw_deg": -30, "pitch_deg": 10})
         self.assertTrue(result["success"], result)
         self.assertEqual(2, result["joints_set"])
         self.assertEqual(2, len(control._seg_start))
@@ -861,16 +861,16 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
     def test_waist_set_angles_accepts_a_partial_selection(self):
         control = self.arm_plugin()
         result = WaistControlPlugin(control).dispatch(
-            "set_angles", {"pitch_deg": 20})
+            "set_angles", {"confirm": True, "pitch_deg": 20})
         self.assertTrue(result["success"], result)
         self.assertEqual(1, result["joints_set"])
         self.assertIn(ADAM_PRO_JOINTS.index("waistPitch"), control._target_q)
 
     def test_angle_actions_reject_empty_or_out_of_range_input(self):
         cases = (
-            WaistControlPlugin(self.arm_plugin()).dispatch("set_angles", {}),
+            WaistControlPlugin(self.arm_plugin()).dispatch("set_angles", {"confirm": True}),
             HeadControlPlugin(self.arm_plugin()).dispatch(
-                "set_angles", {"pitch_deg": 61}),
+                "set_angles", {"confirm": True, "pitch_deg": 61}),
         )
         for result in cases:
             self.assertFalse(result["success"])
@@ -879,8 +879,8 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
     def test_reset_returns_waist_to_the_hold_position(self):
         control = self.arm_plugin()
         waist = WaistControlPlugin(control)
-        waist.dispatch("set_angles", {"roll_deg": 10})
-        result = waist.dispatch("reset", {})
+        waist.dispatch("set_angles", {"confirm": True, "roll_deg": 10})
+        result = waist.dispatch("reset", {"confirm": True})
         self.assertTrue(result["success"], result)
         for _, joint, _, _ in WAIST_JOINT_CONTROLS.values():
             index = ADAM_PRO_JOINTS.index(joint)
@@ -890,7 +890,7 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
     def test_duration_s_passes_through_to_the_segment(self):
         control = self.arm_plugin()
         result = HeadControlPlugin(control).dispatch(
-            "set_angles", {"yaw_deg": -30, "duration_s": 2.0})
+            "set_angles", {"confirm": True, "yaw_deg": -30, "duration_s": 2.0})
         self.assertTrue(result["success"], result)
         self.assertEqual(2.0, result["duration_s"])
         self.assertGreaterEqual(control._seg_span, 2.0)

@@ -67,3 +67,11 @@ wave / salute / reset 每次调用必须明确提供布尔值 `confirm=true`，�
    电池、手部和其他原有卡片。
 
 以上硬件行为、镜像部署和网页展示均未在离线开发中验证，由机器人操作员完成。
+
+## 共享低层通道的确认规则
+
+arm_control、waist_control、head_control 与 arm_gesture 的每个运动请求均须显式
+传入布尔 `confirm=true`。手臂的批量关节、单关节及预设兼容入口也执行相同检查。
+未确认时返回 `CONFIRMATION_REQUIRED`，不会提交目标或启动运动。界面动作参数
+均提供中文确认字段；start、stop、info 及手臂 get_state 不需要此确认。
+此确认只记录操作员意图，不代表厂商已授予独占控制权，也不替代故障排除与现场验收。
