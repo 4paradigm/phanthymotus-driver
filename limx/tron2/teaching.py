@@ -213,8 +213,8 @@ class TronTeachingPlugin(TeachingPlugin):
             'description':'省略时使用当前动作预设；用户明确指定时仅覆盖本次，不必重复询问'} for k in ('gripper_speed','gripper_force')})
         schema['properties']['exclusive_control_confirmed']={'type':'boolean','description':'自动执行时使用preview返回值；未启用自动执行时，须操作者确认原厂VR及其他控制已停止并保持本次独占，不得自行填写true'}
         schema['properties']['physical_stop_confirmed']={'type':'boolean','description':'操作者现场确认机器人已停止；不得自行填写 true'}
-        extra={'reset':(['execute','workspace_clear','take_control','exclusive_control_confirmed'],
-                        '恢复原位：双臂回保存姿态、头部回正、双夹爪闭合；execute=false只读预览，执行须确认路径及独占，等待ACP终态'),
+        extra={'reset':(['execute'],
+                        '恢复原位：双臂回保存姿态、头部回正、双夹爪闭合；用户要求恢复原位时直接execute=true，无需再次确认；execute=false只读预览，等待ACP终态'),
             'parameters':(['asset_id','gripper_speed','gripper_force'],
                           '读取动作预设；仅在用户明确要求保存新预设时填写夹爪参数。不执行动作，修改后需重新启用该技能自动执行'),
             'unlock':([], '现场确认后检查静止并解除回放占用，不发送运动'),
@@ -232,7 +232,7 @@ class TronTeachingPlugin(TeachingPlugin):
         schema['x-action-params']['parameters']=dict(params=extra['parameters'][0],description=extra['parameters'][1],required=['asset_id'])
         schema['x-completion']['actions'].append('reset')
         schema['x-workbench']['title']='TRON2 录制与回放'
-        tools[0]['description']='原厂 VR 只读录制、技能回放、恢复原位和LeRobot导出。已启用自动执行的技能按预设参数直接运行；用户明确指定参数时只覆盖本次。'
+        tools[0]['description']='原厂 VR 只读录制、技能回放、恢复原位和LeRobot导出。用户要求恢复原位时直接调用reset execute=true，无需再次确认。已启用自动执行的技能按预设参数直接运行；用户明确指定参数时只覆盖本次。'
         return tools
 
     def dispatch(self,action,args):
@@ -275,16 +275,11 @@ class TronTeachingPlugin(TeachingPlugin):
                 self._idle()
                 home=self.adapter.owner.reset.call('execute')
                 if args.get('execute') is not True:
-                    return dict(executed=False,motion_sent=False,confirmation_required=True,
+                    return dict(executed=False,motion_sent=False,confirmation_required=False,
                         target_q=home['target_q'],head_target=[0,0],gripper_target=[0,0],
                         gripper_speed=100,gripper_force=50,
-                        message='SDK初始化可能经过中间姿态并张开夹爪。请确认路径畅通、原厂VR及其他控制程序已停止。',
-                        execution_arguments=dict(action='reset',execute=True,workspace_clear=False,
-                                                 take_control=False,exclusive_control_confirmed=False))
-                if args.get('workspace_clear') is not True or args.get('take_control') is not True:
-                    raise ValueError('user_confirmation_required')
-                if args.get('exclusive_control_confirmed') is not True:
-                    raise ValueError('operator_exclusive_confirmation_required')
+                        message='用户要求恢复原位时直接使用execution_arguments，无需再次确认；SDK初始化可能经过中间姿态并张开夹爪。',
+                        execution_arguments=dict(action='reset',execute=True))
                 result=self.adapter.sync(self.adapter.replay.reset_home(home['target_q']))
                 self.pending=dict(action_id=result['action_id'],purpose='reset')
                 self.observer=threading.Thread(target=self._observe,

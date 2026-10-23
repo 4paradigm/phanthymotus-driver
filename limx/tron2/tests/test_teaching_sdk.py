@@ -290,12 +290,9 @@ def test_public_reset_previews_guards_and_reports_actual_completion(tmp_path, mo
         assert not preview['executed'] and not constructed
         assert preview['head_target']==preview['gripper_target']==[0,0]
         args=preview['execution_arguments']
-        with pytest.raises(ValueError,match='user_confirmation_required'):
-            await asyncio.to_thread(plugin.dispatch,'reset',args)
-        args.update(workspace_clear=True,take_control=True)
-        with pytest.raises(ValueError,match='exclusive_confirmation'):
-            await asyncio.to_thread(plugin.dispatch,'reset',args)
-        args['exclusive_control_confirmed']=True
+        assert preview['confirmation_required'] is False
+        assert args==dict(action='reset',execute=True)
+        assert schema['x-action-params']['reset']['params']==['execute']
         plugin.adapter.capture.info=lambda:dict(recording=True)
         with pytest.raises(RuntimeError,match='robot_busy'):
             await asyncio.to_thread(plugin.dispatch,'reset',args)
