@@ -668,6 +668,20 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     result['final_heading_deg'] = math.degrees(heading_now)
                     result['final_heading_error_deg'] = align_deg
                     if abs(align_deg) <= TARGET_FINAL_ALIGN_DEG or now > final_align_deadline:
+                        # The alignment turn can translate/slide the robot: the
+                        # reported endpoint must be the pose after the last
+                        # command, not the pose accepted before the turn.
+                        fx, fy, _ = source_position
+                        final_body_x = fx*cy + fy*sy
+                        final_body_y = -fx*sy + fy*cy
+                        final_error = math.hypot(target_x-final_body_x,
+                                                 target_y-final_body_y)
+                        result['final_position_error_m'] = final_error
+                        result['estimated_distance_m'] = final_error
+                        result['estimated_error_m'] = final_error
+                        if final_error > TARGET_ARRIVAL_MAX_ERROR_M:
+                            raise ValueError(
+                                'heading alignment moved the robot outside the target point')
                         result['final_heading_aligned'] = abs(align_deg) <= TARGET_FINAL_ALIGN_DEG
                         result['state'] = 'done'
                         break

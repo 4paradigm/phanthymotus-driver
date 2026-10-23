@@ -635,6 +635,123 @@ def test_target_fails_closed_when_pose_feedback_is_frozen(monkeypatch):
     assert 'dead-reckoned' in result['error']
 
 
+def test_target_reports_the_pose_after_the_heading_alignment(monkeypatch):
+    clock = [0.0]
+    commands = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+            self.vyaw = 0.0
+        def _read_distance_imu(self):
+            # Calibration at yaw 0; by the first motion sample the robot has
+            # drifted 10 deg left of the approach direction. The final align
+            # must turn, and the turn slides the robot.
+            yaw = 0.0 if clock[0] < 2.1 else math.radians(10)
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=yaw)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+            self.vyaw = vyaw
+            commands.append((vx, vyaw))
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+            self._last = None
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
+        def observe(self, joints, quaternion, now, frozen=False):
+            if frozen:
+                self.velocity = [0.0, 0.0, 0.0]
+                return
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            if owner.command:
+                step = 0.16*dt          # walking
+            elif owner.vyaw:
+                step = 0.025*dt         # a turn in place still slides 0.10 m / 4 s
+            else:
+                step = 0.0
+            self.position = [self.position[0]+step, self.position[1], self.position[2]]
+            self.velocity = [step/dt, 0.0, 0.0]
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.5, 0.0)
+    assert result['state'] == 'done', result.get('error')
+    # The pre-align pose was ~0.05 m from the point; the alignment slide must
+    # be in the reported endpoint (>= 0.12 m), not silently dropped.
+    assert result['final_position_error_m'] >= 0.12, result['final_position_error_m']
+
+
+@pytest.mark.parametrize('cross,target_error,state', [
+    (0.19, 0.196, 'done'),
+    (0.21, 0.216, 'error'),
+])
+def test_target_off_axis_endpoint_acceptance_bound(monkeypatch, cross, target_error, state):
+    clock = [0.0]
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            # On the along-track target + creep, but off-axis by `cross`.
+            self.position = [0.55, cross, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+        def reset_baseline(self):
+            pass
+        def observe(self, joints, quaternion, now, frozen=False):
+            pass
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.5, 0.0)
+    if state == 'done':
+        assert result['state'] == 'done', result.get('error')
+        assert result['final_position_error_m'] == pytest.approx(target_error, abs=0.01)
+    else:
+        assert result['state'] == 'error'
+        assert 'outside the target point' in result['error']
+
+
 def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     clock = [0.0]
     commands = []
