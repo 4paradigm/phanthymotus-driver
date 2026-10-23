@@ -80,7 +80,7 @@ while rclpy.ok():
                   sensors.snapshot("motion_info")["fresh"] and
                   cards["motion"]._backend.feedback.observation()["fresh"])
             assert motion.status()["active_sources"] == ["motion_info"]
-            assert sensors.status()["active_sources"] == ["battery", "lidar", "motion_info"]
+            assert sensors.status()["active_sources"] == ["battery", "exception", "fault_aggregator", "fault_event", "hard_estop", "lidar", "motion_info"]
             assert motion.status()["reader_pid"] != sensors.status()["reader_pid"]
             assert not cards["motion"]._backend.diagnostics()["command_worker_running"]
             motion_sequences, lidar_sequences, ages = set(), set(), []

@@ -15,28 +15,40 @@ import xml.etree.ElementTree as ET
 from common.vendor_runtime import DriverBundle, load_config, make_handler, resolve_namespace, start_registration
 from bridge import ReaderBridge
 from device import build_plugins
-from motion import MotionPlugin
+from motion import MotionPlugin, validate_contract
 from motion_backend import DDSMotionBackend
 from motion_process import DDSProcessTransport
 from motion_tasks import MotionTasks
 from acp import ACPNotifier
+from control_runtime import load_runtime_binding
 
 
 def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, tasks=None,
-                          motion_bridge=None):
+                          motion_bridge=None, runtime_binding=None):
     """Build sensors and the motion UI without opening a control connection.
 
-    The motion backend stays unsupported until this robot's complete control
-    contract and an explicit process-level execution authorization are bound.
+    The motion backend stays unsupported until a machine-specific action contract
+    and protected, explicit deployment authorization have been bound.
     Canvas configuration cannot grant that authorization.
     """
-    transport = DDSProcessTransport(config, execution_enabled=False)
+    binding = runtime_binding or load_runtime_binding(config)
+    policies = binding.contract.get('actions', {})
+    timeouts = [item['send_timeout_s'] for action, item in policies.items()
+                if isinstance(item, dict) and validate_contract(binding.contract, action)
+                and type(item.get('send_timeout_s')) in (int, float)] if isinstance(policies, dict) else []
+    transport = DDSProcessTransport(config, execution_enabled=binding.authorized,
+                                    rpc_budget_s=min(timeouts, default=.2))
+
     # The production runtime supplies a separate read-only child for motion.
     # Point-cloud conversion and sensor IPC must not queue its feedback samples.
     observer_bridge = bridge if motion_bridge is None else motion_bridge
-    motion_backend = DDSMotionBackend(observer_bridge, transport, execution_authorized=False)
+    motion_backend = DDSMotionBackend(observer_bridge, transport, contract=binding.contract,
+        authority_provider=binding.authority_provider if binding.authorized else None,
+        posture_stop=binding.posture_stop, execution_authorized=binding.authorized,
+        authorization_provider=binding.authorized_now, runtime_status=binding.public_status)
     motion_plugin = MotionPlugin(config.get("motion", {}), namespace, backend=motion_backend,
-                                feedback=motion_backend.feedback, publish=publish, execution_authorized=False,
+                                feedback=motion_backend.feedback, publish=publish, execution_authorized=binding.authorized,
+                                authorization_provider=binding.authorized_now,
                                 notifier=notifier, tasks=tasks)
     plugins = build_plugins(config, namespace, bridge, publish, motion=motion_plugin)
     plugins.append(motion_plugin)
@@ -136,9 +148,11 @@ def main():
         notifier = ACPNotifier(state / "acp-outbox.sqlite3")
         cleanup.callback(notifier.close)
         notifier.start()
+        binding = load_runtime_binding(config)
+        cleanup.callback(binding.close)
         bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish,
                                                    notifier=notifier, tasks=tasks,
-                                                   motion_bridge=motion_bridge))
+                                                   motion_bridge=motion_bridge, runtime_binding=binding))
         for plugin in bundle.plugins:
             if hasattr(plugin, "close"):
                 cleanup.callback(plugin.close)
@@ -160,7 +174,7 @@ def main():
         # Do not start cards at process boot. The real canvas owns their lifecycle.
         if config.get("register", True):
             start_registration(port, config, "deep-robotics-s10-pro-driver")
-        logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_authorized=false", namespace, port, domain)
+        logging.info("S10 Pro monitoring cards and gated motion; namespace=%s port=%d domain=%d motion_authorized=%s", namespace, port, domain, binding.authorized_now())
         server.serve_forever()
 
 

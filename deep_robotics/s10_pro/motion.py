@@ -40,8 +40,54 @@ def _number(value, minimum, maximum, name):
     return float(value)
 
 
-def validate_contract(contract):
+CONTROL_CONTRACT_V2 = 's10_pro.control_contract/2'
+EXECUTION_ACTIONS = ('stand', 'lie', 'velocity')
+
+
+def _evidence_present(evidence, keys):
+    return isinstance(evidence, dict) and all(
+        isinstance(evidence.get(key), str) and evidence[key].strip() for key in keys)
+
+
+def _valid_action_v2(contract, action):
+    if (not isinstance(contract, dict) or contract.get('schema') != CONTROL_CONTRACT_V2
+            or contract.get('verified') is not True
+            or contract.get('robot_identity_matched') is not True
+            or contract.get('firmware_matched') is not True
+            or not _evidence_present(contract.get('evidence'), ('identity', 'firmware', 'authority', 'feedback'))):
+        return False
+    actions = contract.get('actions')
+    item = actions.get(action) if isinstance(actions, dict) else None
+    if (action not in EXECUTION_ACTIONS or not isinstance(item, dict)
+            or item.get('verified') is not True
+            or not _evidence_present(item.get('evidence'), ('stop', 'watchdog'))
+            or item.get('stop_on_authority_loss') is not False):
+        return False
+    try:
+        timeout = _number(item.get('send_timeout_s'), .01, .2, 'send_timeout_s')
+        if action in ('stand', 'lie'):
+            uncontrolled = _number(item.get('max_uncontrolled_s'), .1, 1., 'max_uncontrolled_s')
+            return (item.get('mode') == 'regular'
+                and item.get('stop_semantics') == 'verified_posture_adapter'
+                and item.get('interruption_verified') is True and timeout * 2 < uncontrolled)
+        deadman = _number(item.get('robot_deadman_s'), .1, 1., 'robot_deadman_s')
+        return (item.get('mode') == 'navigation'
+            and item.get('robot_deadman_verified') is True
+            and item.get('units') == {'vx': 'm/s', 'vy': 'm/s', 'yaw_rate': 'rad/s'}
+            and item.get('stop_semantics') == 'zero_velocity_until_feedback'
+            and timeout * 2 < deadman)
+    except ValueError:
+        return False
+
+
+def validate_contract(contract, action=None):
     """Evidence must describe this machine, rather than a generic verified flag."""
+    if isinstance(contract, dict) and contract.get('schema') == CONTROL_CONTRACT_V2:
+        if action is None or action == 'stopmotion':
+            return any(_valid_action_v2(contract, candidate) for candidate in EXECUTION_ACTIONS)
+        return _valid_action_v2(contract, action)
+    if action is not None and action not in ACTIONS:
+        return False
     if not isinstance(contract, dict) or contract.get('verified') is not True:
         return False
     evidence = contract.get('evidence')
@@ -64,12 +110,40 @@ def validate_contract(contract):
         and isinstance(contract.get('stop_on_authority_loss'), bool))
 
 
+def action_contract(contract, action):
+    """Return one verified policy, without inheriting another action's claims."""
+    if not validate_contract(contract, action):
+        return {}
+    if contract.get('schema') != CONTROL_CONTRACT_V2:
+        return copy.deepcopy(contract)
+    if action not in EXECUTION_ACTIONS:
+        return {}
+    item = copy.deepcopy(contract['actions'][action])
+    return {**copy.deepcopy(contract), **item, 'action': action,
+        'actions': [action], 'evidence': {**contract['evidence'], **item['evidence']}}
+
+
 def contract_readiness(contract):
     """Describe missing machine evidence separately from application policy.
 
     The ranges below are requirements of this controller, never measurements or
     claims about the robot. Acceptance continues to use ``validate_contract``.
     """
+    if contract.get('schema') == CONTROL_CONTRACT_V2:
+        evidence = contract.get('evidence')
+        evidence = evidence if isinstance(evidence, dict) else {}
+        required = ('identity', 'firmware', 'authority', 'feedback')
+        return {'accepted_by_application': validate_contract(contract), 'schema': CONTROL_CONTRACT_V2,
+            'machine_evidence': {'required': list(required),
+                'missing': [key for key in required if not _evidence_present(evidence, (key,))],
+                'robot_identity_matched': contract.get('robot_identity_matched') is True,
+                'firmware_matched': contract.get('firmware_matched') is True},
+            'application_requirements': {'actions': {
+                action: {'accepted': validate_contract(contract, action),
+                    'mode': 'navigation' if action == 'velocity' else 'regular',
+                    'stop_semantics': 'zero_velocity_until_feedback' if action == 'velocity' else 'verified_posture_adapter'}
+                for action in EXECUTION_ACTIONS}},
+            'note': 'Each action requires its own verified interruption and loss-of-command evidence. An unavailable navigation action does not block verified posture actions.'}
     evidence = contract.get('evidence')
     evidence = evidence if isinstance(evidence, dict) else {}
     missing = [key for key in REQUIRED_EVIDENCE
@@ -110,13 +184,16 @@ class MotionPlugin:
 
     def __init__(self, config, namespace, backend=None, *, feedback=None, publish=None,
                  execution_authorized=False, clock=time.monotonic, wall_time=time.time,
-                 autostart_worker=True, notifier=None, tasks=None):
+                 autostart_worker=True, notifier=None, tasks=None, authorization_provider=None):
         if not isinstance(execution_authorized, bool):
             raise ValueError('execution_authorized must be boolean')
         self._backend = backend or UnsupportedBackend()
         self._feedback = feedback
         self._publish = publish or (lambda *args: None)
         self._authorized = execution_authorized
+        if authorization_provider is not None and not callable(authorization_provider):
+            raise ValueError('authorization_provider must be callable')
+        self._authorization_provider = authorization_provider
         self._notifier = notifier
         self._tasks = tasks if tasks is not None else MotionTasks()
         self._owns_tasks = tasks is None
@@ -175,13 +252,23 @@ class MotionPlugin:
         except Exception:
             return {}
 
-    def _gate(self, *, for_stop=False):
+    def _execution_authorized_now(self):
+        if not self._authorized:
+            return False
+        if self._authorization_provider is None:
+            return True
+        try:
+            return self._authorization_provider() is True
+        except Exception:
+            return False
+
+    def _gate(self, action=None, *, for_stop=False):
         missing = []
         if self._closed.is_set() and not for_stop:
             missing.append('controller_closed')
-        if not self._authorized:
+        if not self._execution_authorized_now():
             missing.append('execution_authorization')
-        if not validate_contract(self._contract()):
+        if not validate_contract(self._contract(), action):
             missing.append('robot_control_contract')
         if self._feedback is None:
             missing.append('fresh_feedback_adapter')
@@ -194,17 +281,27 @@ class MotionPlugin:
             value = self._backend.control_status()
             age = value.get('age_s')
             return (value.get('owned') is True and value.get('fresh') is True
+                and value.get('authority_valid', True) is True
                 and isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and 0 <= age <= .5)
         except Exception:
             return False
 
-    def _control_ok(self):
+    def _control_ok(self, action=None):
         try:
-            return self._authority_ok() and self._backend.control_status().get('feedback_fresh') is True
+            control = self._backend.control_status()
+            if not self._authority_ok() or control.get('feedback_fresh') is not True:
+                return False
+            if action is not None and self._contract().get('schema') == CONTROL_CONTRACT_V2:
+                permitted = control.get('allowed_actions')
+                if not isinstance(permitted, (list, tuple, set)) or action not in permitted:
+                    return False
+                mode = 'navigation_mode_confirmed' if action == 'velocity' else 'regular_mode_confirmed'
+                return control.get(mode) is True
+            return True
         except Exception:
             return False
 
-    def _readiness(self, *, contract=None, diagnostics=None):
+    def _readiness(self, *, contract=None, diagnostics=None, action=None):
         contract = self._contract() if contract is None else contract
         diagnostics = diagnostics or {}
         try:
@@ -234,7 +331,7 @@ class MotionPlugin:
         worker_running = control.get('command_worker_running', diagnostics.get('command_worker_running'))
         backend_authorized = control.get('backend_execution_authorized', diagnostics.get('backend_execution_authorized'))
         transport_enabled = control.get('transport_execution_enabled', diagnostics.get('transport_execution_enabled'))
-        blocked = self._gate()
+        blocked = self._gate(action)
         if backend_authorized is False:
             blocked.append('backend_execution_authorization')
         if transport_enabled is False:
@@ -251,6 +348,33 @@ class MotionPlugin:
             blocked.append('fresh_motion_feedback')
         if worker_required and worker_running is not True:
             blocked.append('command_worker_not_running')
+        action_availability = {}
+        for candidate in EXECUTION_ACTIONS:
+            reasons = [reason for reason in blocked if reason != 'robot_control_contract']
+            if not validate_contract(contract, candidate):
+                reasons.append('robot_control_contract')
+            # Runtime scope and mode are separate facts from the static
+            # machine policy. Legacy injected adapters may omit these fields.
+            permitted = control.get('allowed_actions')
+            if isinstance(permitted, (list, tuple, set)) and candidate not in permitted:
+                reasons.append('action_authority_unavailable')
+            if contract.get('schema') == CONTROL_CONTRACT_V2:
+                if not isinstance(permitted, (list, tuple, set)):
+                    reasons.append('action_authority_unavailable')
+                mode_field = 'navigation_mode_confirmed' if candidate == 'velocity' else 'regular_mode_confirmed'
+                if control.get(mode_field) is not True:
+                    reasons.append('operating_mode_unconfirmed')
+            can_prepare = False
+            action_status = getattr(self._backend, 'action_readiness', None)
+            if callable(action_status):
+                try:
+                    observed = action_status(candidate)
+                    can_prepare = (isinstance(observed, dict)
+                        and observed.get('command_worker_startable') is True)
+                except Exception:
+                    pass
+            action_availability[candidate] = {'contract_verified': validate_contract(contract, candidate),
+                'ready': not reasons, 'blocked_by': reasons, 'command_worker_preparable': can_prepare}
         instructions = {
             'controller_closed': 'Use a running driver instance; this controller is closed.',
             'execution_authorization': 'Authorize the deployment explicitly after verifying machine evidence. Canvas settings cannot grant process authorization.',
@@ -265,11 +389,19 @@ class MotionPlugin:
             'fresh_control_authority': 'Obtain valid live control ownership within the 0.5 second application limit; do not synthesize a lease from feedback.',
             'fresh_motion_feedback': 'Restore fresh /MOTION_INFO feedback within the existing 0.5 second limit.',
             'command_worker_not_running': 'Start the command worker only through an authorized deployment after contract and live authority checks pass.',
+            'action_authority_unavailable': 'Obtain live control authority scoped to the requested action.',
+            'operating_mode_unconfirmed': 'Confirm the action-specific operating mode from its verified live source.',
         }
-        return {'ready': not blocked, 'card_started': self._started,
+        if action in action_availability:
+            blocked = action_availability[action]['blocked_by']
+        ready = not blocked
+        if action is None and contract.get('schema') == CONTROL_CONTRACT_V2:
+            ready = any(item['ready'] for item in action_availability.values())
+        plugin_authorized = self._execution_authorized_now()
+        return {'ready': ready, 'card_started': self._started,
             'card_enabled': self._settings['enabled'],
-            'process_authorization': {'granted': self._authorized and backend_authorized is not False and transport_enabled is not False,
-                'plugin_authorized': self._authorized, 'backend_authorized': backend_authorized,
+            'process_authorization': {'granted': plugin_authorized and backend_authorized is not False and transport_enabled is not False,
+                'plugin_authorized': plugin_authorized, 'backend_authorized': backend_authorized,
                 'transport_enabled': transport_enabled, 'canvas_configurable': False},
             'contract': contract_readiness(contract),
             'authority': {'provider_bound': authority_bound, 'owned': control.get('owned') is True,
@@ -279,11 +411,12 @@ class MotionPlugin:
                 'age_s': feedback_age, 'max_age_s': .5,
                 'reason': control.get('feedback_reason', diagnostics.get('reason'))},
             'command_worker': {'required': worker_required, 'running': worker_running},
+            'actions': action_availability,
             'blocked_by': blocked,
-            'next_steps': [{'code': reason, 'instruction': instructions[reason]} for reason in blocked]}
+            'next_steps': [{'code': reason, 'instruction': instructions.get(reason, 'Review the action-specific readiness details.')} for reason in blocked]}
 
-    def _unavailable(self, blocked_by):
-        readiness = self._readiness()
+    def _unavailable(self, blocked_by, action=None):
+        readiness = self._readiness(action=action)
         return {'accepted': False, 'confirmed': False, 'completed': False,
             'state': 'unavailable', 'blocked_by': blocked_by,
             'readiness': readiness, 'next_steps': readiness['next_steps']}
@@ -310,7 +443,7 @@ class MotionPlugin:
                     diagnostics = {'preflight_error': 'observation_unavailable'}
             readiness = self._readiness(contract=contract, diagnostics=diagnostics)
             return {'card': 'motion', 'state': 'running' if self._started else 'idle', 'phase': self._phase,
-                'execution_available': readiness['ready'], 'execution_authorized': self._authorized,
+                'execution_available': readiness['ready'], 'execution_authorized': self._execution_authorized_now(),
                 'contract_verified': validate_contract(contract), 'blocked_by': missing,
                 'readiness': readiness, 'next_steps': readiness['next_steps'],
                 'availability_detail': {
@@ -403,9 +536,13 @@ class MotionPlugin:
             self._notification_lock.release()
 
     def _stop_backend(self, reason, *, request_id, authority_lost=False):
-        if self._gate(for_stop=True):
+        with self._lock:
+            if self._active is None or self._active.get('request_id') != request_id:
+                return {'accepted': False, 'confirmed': False, 'reason': 'request_replaced'}
+            action = self._active.get('action')
+        if self._gate(action, for_stop=True):
             return {'accepted': False, 'confirmed': False, 'reason': 'unavailable'}
-        contract = self._contract()
+        contract = action_contract(self._contract(), action)
         if authority_lost and not contract['stop_on_authority_loss']:
             return {'accepted': None, 'confirmed': False, 'reason': 'authority_released'}
         if not self._io_lock.acquire(timeout=.25):
@@ -479,7 +616,7 @@ class MotionPlugin:
             settings, generation = dict(self._settings), self._generation
             request = validate_motion_request(action, arguments, settings, self._wall, check_freshness=False)
             if self._closed.is_set():
-                return self._unavailable(['controller_closed'])
+                return self._unavailable(['controller_closed'], action)
             previous = self._tasks.get(request['request_id'])
             if previous:
                 if self._tasks.fingerprint(request) != previous['fingerprint']:
@@ -489,17 +626,31 @@ class MotionPlugin:
             # original identity even when their original acceptance TTL elapsed.
             request = validate_motion_request(action, {**arguments, 'request_id': request['request_id']},
                                               settings, self._wall)
-            missing = self._gate()
+            missing = self._gate(action)
             if missing or not self._started or not settings['enabled']:
-                return self._unavailable(missing + ([] if self._started and settings['enabled'] else ['card_not_enabled']))
-            if not self._control_ok():
-                return self._unavailable(['fresh_control_authority'])
+                return self._unavailable(missing + ([] if self._started and settings['enabled'] else ['card_not_enabled']), action)
+            if not self._control_ok(action):
+                return self._unavailable(['fresh_control_authority'], action)
             if not self._busy.acquire(blocking=False):
                 return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'busy'}
             if generation != self._generation or not self._started or self._closed.is_set():
                 self._busy.release()
                 return {'accepted': False, 'confirmed': False, 'completed': False,
                         'state': 'cancelled', 'reason': 'lifecycle_changed'}
+            prepare = getattr(self._backend, 'prepare_execution', None)
+            if callable(prepare):
+                try:
+                    prepare(action)
+                except Exception:
+                    self._busy.release()
+                    return self._unavailable(['command_worker_not_running'], action)
+                if (generation != self._generation or not self._started or self._closed.is_set()
+                        or self._gate(action) or not self._control_ok(action)):
+                    self._busy.release()
+                    return self._unavailable(['fresh_control_authority'], action)
+            if self._wall() * 1000 > request['issued_at_ms'] + request['ttl_ms']:
+                self._busy.release()
+                return self._unavailable(['stale_request'], action)
             try:
                 record, replayed = self._tasks.accept(request)
             except Exception:
@@ -553,19 +704,20 @@ class MotionPlugin:
         reason, stop_attempted = 'feedback_timeout', False
         interval = .1
         try:
-            contract = self._contract()
-            interval = min(.1, (contract['robot_deadman_s'] - contract['send_timeout_s']) / 3)
+            contract = action_contract(self._contract(), action)
+            if action == 'velocity':
+                interval = min(.1, (contract['robot_deadman_s'] - contract['send_timeout_s']) / 3)
             next_send = started
             while self._clock() < deadline:
                 if self._cancel.is_set():
                     reason = self._cancel_reason or 'cancelled'
                     break
-                if not self._control_ok():
+                if self._gate(action) or not self._control_ok(action):
                     reason = 'authority_unavailable'
                     break
                 if self._clock() >= next_send:
                     with self._io_lock:
-                        if self._cancel.is_set() or not self._control_ok() or not self._started:
+                        if self._cancel.is_set() or self._gate(action) or not self._control_ok(action) or not self._started:
                             reason = self._cancel_reason or 'authority_unavailable'
                             break
                         if next_send == started and self._wall() * 1000 > request['issued_at_ms'] + request['ttl_ms']:
@@ -589,7 +741,7 @@ class MotionPlugin:
                         break
                 if hasattr(self._backend, 'progress') and self._clock() < deadline:
                     with self._io_lock:
-                        if not self._cancel.is_set() and self._control_ok() and self._clock() < deadline:
+                        if not self._cancel.is_set() and not self._gate(action) and self._control_ok(action) and self._clock() < deadline:
                             advanced = self._backend.progress(action, request, self._cancel)
                             if advanced is not None:
                                 receipt = advanced
@@ -684,9 +836,12 @@ class MotionPlugin:
                 started = self._started
                 overdue = now - self._last_tick > .5
                 if active and self._active['action'] == 'velocity' and self._phase == 'active':
-                    overdue = overdue or now - self._last_command > self._contract().get('robot_deadman_s', .3) / 2
+                    policy = action_contract(self._contract(), 'velocity')
+                    overdue = overdue or now - self._last_command > policy.get('robot_deadman_s', .3) / 2
                 self._last_tick = now
-            if active and (overdue or not self._control_ok()):
+            with self._lock:
+                action = self._active.get('action') if self._active else None
+            if active and (overdue or self._gate(action) or not self._control_ok(action)):
                 self.cancel('watchdog_late' if overdue else 'authority_unavailable')
             if started and now >= getattr(self, '_next_status', 0):
                 with self._lock:

@@ -47,13 +47,16 @@ class MotionProcessCancelled(RuntimeError):
 
 
 class DDSProcessTransport:
-    def __init__(self, config, config_path=None, *, execution_enabled=False,
+    def __init__(self, config, config_path=None, *, execution_enabled=False, rpc_budget_s=RPC_BUDGET_S,
                  process_factory=subprocess.Popen, clock=time.monotonic):
         if not isinstance(execution_enabled, bool):
             raise ValueError('execution_enabled must be boolean')
         reader = config.get('reader', {})
         if int(reader.get('domain_id', 0)) != 0:
             raise ValueError('motion vendor domain must be 0')
+        if type(rpc_budget_s) not in (int, float) or not math.isfinite(rpc_budget_s) or not .01 <= rpc_budget_s <= RPC_BUDGET_S:
+            raise ValueError('rpc_budget_s must be within .01..0.2 seconds')
+        self._rpc_budget = float(rpc_budget_s)
         self._config = copy.deepcopy(config)
         self.config_path = str(config_path) if config_path is not None else None
         self._enabled = execution_enabled
@@ -179,7 +182,7 @@ class DDSProcessTransport:
                 'worker_running': self._process is not None and self._process.poll() is None}
 
     def _rpc(self, operation, payload, *, authority=None, cancel_event=None):
-        deadline = self._clock() + RPC_BUDGET_S
+        deadline = self._clock() + self._rpc_budget
         self._check_cancel(cancel_event)
         while not self._io_lock.acquire(timeout=.01):
             self._check_cancel(cancel_event)

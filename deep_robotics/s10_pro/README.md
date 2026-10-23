@@ -10,20 +10,34 @@
 
 异常使用本机 `FaultEventArray.active_faults` 当前快照与 START/STOP、`Exception.is_abnormal` 事件分类；只有新鲜、有效的聚合快照能表示当前上报故障。无消息/过期不能显示无故障。历史去重并限制 64 条，latest-only IPC 可能漏掉快速事件，不是完整审计日志。计算资源按单项独立年龄标记，最多 32 项；ROS 图只读、限频、有界，发现发布者不证明控制权或硬件有效。
 
-`motion_events` 是现有动作事件的独立只读视图，输出 `motion_events_view`，不新增 ACP 通知、任务或命令。`device` 明确显示灯光、模式、休眠/唤醒等协议尚未核实，修改请求返回 unavailable，不假成功。运动三层执行锁、0.5 秒反馈门槛、独立运动 reader、持久任务和 outbox 原样保留。
+`motion_events` 是现有动作事件的独立只读视图，输出 `motion_events_view`，不新增 ACP 通知、任务或命令。`device` 明确显示灯光、模式、休眠/唤醒等协议尚未核实，修改请求返回 unavailable，不假成功。运动三层执行边界、0.5 秒反馈门槛、独立运动 reader、持久任务和 outbox 保留。默认仍锁定；正式部署授权接入见下一节。
 
 被动来源核实：2026-10-23 GPS 有样本但 fixquality=0、卫星数=0；充电状态实收 state=0/error_code=0，但尚无已验证状态映射；深度图 15 秒没有样本，未建立前/后 RGB 来源；图中两个发布者共用主雷达话题，不能冒充独立后雷达。相应五项继续明确标为未验证。
 
-容器补充编译本机安装的只读诊断消息，来源与 SHA256 见 `vendor/s10-nos-drdds-1.0.23/SOURCE.json`。部署前递归比较字段/类型，不仅比较版本号。ARM64/Jazzy 下本候选及 Docker COPY 契约 **834 项通过**。真实画布验收与部署版本记录在工作区 `acceptance/s10pro-m20-20261023`，未完成的项目不计为通过。
+容器补充编译本机安装的只读诊断消息，来源与 SHA256 见 `vendor/s10-nos-drdds-1.0.23/SOURCE.json`。部署前递归比较字段/类型，不仅比较版本号。ARM64/Jazzy 下本候选及 Docker COPY 契约 **908 项通过**。真实画布验收与部署版本记录在工作区 `acceptance/s10pro-m20-20261023`，未完成的项目不计为通过。
 
-用户另行批准 Core 两文件最小增量：详情面板注册既有 PointCloudRenderer；监控页 10 秒无新数据提示并保留最后一帧。该增量单独打包，保护 Core 既存 dirty 修改，不进入 driver PR。两份 renderer 合同测试为模拟检查，真实视觉结果另记。
+用户另行批准 Core 三项最小增量：详情面板注册既有 PointCloudRenderer；监控页 10 秒无新数据提示并保留最后一帧；canvas 一行将 status 归入传感器生命周期查询，恢复 M20 同款紧凑卡片。增量独立打包并按精确 before/after SHA 校验，保护 Core 既存 dirty 修改，不进入 driver PR。14 卡实际 Core 函数/CSS 离线预览零 JS 错误；renderer 合同检查不等于真机视觉验收。
+
+## 正式执行授权与按动作契约（离线完成）
+
+针对 `execution_authorization`，生产装配已从三处永久 false 改为默认关闭、显式部署授权绑定：`S10_EXECUTION_AUTHORIZATION_FILE` 指向受保护普通文件，绑定机器/运控固件身份、完整契约 SHA256、允许动作与最多四小时有效期。plugin/backend 动态重检授权，变更、撤销或到期后保持撤销，不自动恢复；画布不能授权。无有效授权时继续提供全部只读卡片，不启动命令 worker。没有为当前机器人生成 active 授权。
+
+针对 `robot_control_contract`，新增 `s10_pro.control_contract/2`：stand/lie 与 navigation velocity 独立验证。姿态无需捆绑速度单位/导航 deadman，但必须有本机中断/超时/失联依据和单独的姿态停止适配器；速度仍需已核实导航模式与机器人停止时限。保留旧契约兼容，不将这些应用约束描述为厂家单独起立前置。
+
+真实 authority 适配器必须提供已有接收快照，匹配身份、模式、动作范围，原始接收和原始失效不超过 0.5 秒；禁止从 HES/MOTION_INFO/ROS 图或查询时间生成 lease。仓库没有默认厂家 authority 实现，真实控制权和本机姿态停止规则尚未核实。
+
+姿态停止使用单独可信 `posture_stop_factory`，由独立 `BoundedPostureProcess` 限时发送与读取反馈，超时/取消杀死私有进程组，关闭会话且不自动重试。只有发送后的两帧新鲜独立匹配反馈才确认中断，send 回执和零速度都不足以确认。没有适配器时 stand/lie 仍明确不可用；不猜测 state2，不用 NAV_CMD 零速替代常规姿态取消。
+
+命令 worker 只在显式 execute 的准备阶段启动，要求部署授权、动作契约、实时控制权、模式、反馈均通过；查询与卡片 start 保持只读。准备失败/TTL 超时不创建任务，不发完成通知；持久重试不重发动作。正式接线格式、时限和仍缺证据见 [deploy/CONTROL_RUNTIME.md](deploy/CONTROL_RUNTIME.md)。可信 factory 和 authority 缓存回调须审阅为无命令/非阻塞，Python 模块导入本身不是安全沙箱。
+
+用户随后要求机械狗充电期间只离线开发，因此本次候选没有替换现场容器或做物理动作验收。离线通过不意味着真实起立、趴下或速度已可用。
 
 ## 历史：2026-10-23 ACP 与反馈整改
 
 
 本轮在现有六卡范围内增加 driver 异步 ACP、英文工具定义与共用参数校验。`stand/lie/velocity` 通过校验并受理后立即返回本次 S10 任务的 `action_id`，后台执行并通过 ACP 报告唯一终态；不再把动作完成等待占在 MCP 调用线程上。卡片、工具/动作标识、平台话题和原画布布局保持兼容。
 
-生产入口的 `DDSProcessTransport.execution_enabled`、`DDSMotionBackend.execution_authorized`、`MotionPlugin.execution_authorized` 仍固定为 `False`，画布配置不能修改授权。启动动作卡只观察运动反馈，不启动命令 worker、不创建运动命令 publisher，也不自动切换机器人模式。新运动请求仍同步返回 `unavailable`，不创建 ACP pending 任务。
+历史 `058a369a` 生产入口的三层授权固定为 `False`；当前源码改为上一节的显式部署绑定，默认仍关闭且画布不能修改授权。启动动作卡只观察运动反馈，不启动命令 worker、不创建运动命令 publisher，也不自动切换机器人模式。新运动请求仍同步返回 `unavailable`，不创建 ACP pending 任务。
 
 当前生产入口尚未绑定真实 `authority_provider` 和本机控制契约，也没有已授权的命令 worker 启动路径；这部分生产接入尚未完成。仅启用卡片、连接手柄或解除急停无法替代该实现。`readiness` 和 `next_steps` 分别列出卡片生命周期、三层进程授权、机器证据、应用自身要求、控制权适配器、实际反馈年龄和 worker 状态；`execution_available` 必须同时通过这些检查。既有 `blocked_by` 字段保留兼容。
 
