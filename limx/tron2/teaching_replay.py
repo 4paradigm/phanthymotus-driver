@@ -121,6 +121,9 @@ class Replay:
         for frame in frames:
             frame['q'] = [min(hi, max(lo, q)) for q, lo, hi in zip(frame['q'], ARM_LOWER, ARM_UPPER)]
         movej_start_target(frames[0]['q'])
+        return frames, await self.ready_head()
+
+    async def ready_head(self):
         status = self.reader.sample('robot_status')
         if not status['available'] or not motion_readiness(status['data'])['ready'] or status['data'].get('motor') != 'OK':
             raise ValueError('robot_mode_not_ready')
@@ -139,7 +142,7 @@ class Replay:
         if list(names) != list(JOINT_NAMES):
             raise ValueError('unsupported_joint_layout')
         q = vector(sample['data']['q'], 16, 'q')
-        return frames, q[14:]
+        return q[14:]
 
     async def play(self, raw, binding, args):
         frames, head = await self.preflight(raw, binding)
@@ -170,11 +173,28 @@ class Replay:
         self.task = asyncio.create_task(self._run(ident))
         return dict(state='running', action_id=ident)
 
+    async def reset_home(self, target):
+        if self.active or not self.peers_idle():
+            raise ValueError('other_motion_active')
+        await self.ready_head()
+        if self.active or not self.peers_idle():
+            raise ValueError('other_motion_active')
+        target = movej_start_target(vector(target, 14, 'home'))
+        ident = 'tron2_reset_'+uuid4().hex
+        # Use the vendor SDK's speed/force defaults for the configured close.
+        self.worker = SDKReplay(self.reader.settings['url'],
+            [dict(t_ns=0, q=target, gripper=[0, 0])], [0, 0], target, 100, 50)
+        self.outcome = dict(action_id=ident, status='running', result={})
+        self.task = asyncio.create_task(self._run(ident))
+        return dict(state='running', action_id=ident)
+
     async def _run(self, ident):
         try:
             result = await asyncio.to_thread(self.worker.run)
         except Exception as exc:
             result = dict(status='error', reason=str(exc), output_stopped=False, motion_may_continue=True)
+        if ident.startswith('tron2_reset_'):
+            result.update(source='configured_home', head_policy='center', gripper_policy='closed')
         status = result.pop('status')
         self.outcome = dict(action_id=ident, status=status, result=result)
         self.preview = None

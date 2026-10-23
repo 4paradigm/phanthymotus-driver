@@ -124,7 +124,7 @@ def test_stop_waits_for_worker_cleanup_and_keeps_task_mutex(monkeypatch):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('mode', ['success','rejected','stop_init','disconnect'])
+@pytest.mark.parametrize('mode', ['success','home','rejected','stop_init','disconnect'])
 def test_pinned_sdk_with_fake_vendor_full_lifecycle(mode):
     pytest.importorskip('tron2_env')
     async def run():
@@ -154,16 +154,17 @@ def test_pinned_sdk_with_fake_vendor_full_lifecycle(mode):
         runner=web.AppRunner(app);await runner.setup();site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
         try:
             frames=[dict(t_ns=i*20_000_000,q=[.1+i*.001]*14,gripper=[i,20-i]) for i in range(6)]
+            if mode=='home':frames=[dict(t_ns=0,q=[0]*14,gripper=[0,0])]
             worker=SDKReplay('ws://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1]),frames,[0,0],frames[0]['q'],30,20)
             result=await asyncio.to_thread(worker.run)
-            if mode!='success':
+            if mode not in ('success','home'):
                 assert result['status']!='completed',result
                 assert result['samples_sent']==0 and result['output_stopped']
                 n=len(commands);await asyncio.sleep(.1)
                 assert len(commands)==n and len(connections)==1
                 return
-            assert result['status']=='completed',result
-            assert result['samples_sent']==6 and result['end_check']['stable_seconds']>=.5
+            assert result['status']=='completed',json.dumps(result,ensure_ascii=False)
+            assert result['samples_sent']==len(frames) and result['end_check']['stable_seconds']>=.5
             assert commands[0]=='request_movej' and 'request_servoj' in commands
             grips=[v for v in commands if isinstance(v,tuple)]
             assert all(v[2:]==(30,20) for v in grips)
@@ -194,3 +195,64 @@ def test_preflight_waits_for_fresh_idle_feedback(refresh):
             assert not reader.commands
         finally:timer.cancel()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('blocked', [False, True])
+def test_home_uses_saved_arms_centered_head_closed_grippers(monkeypatch, blocked):
+    constructed=[]
+    class Worker:
+        def __init__(self,*args):constructed.append(args)
+        def run(self):
+            return dict(status='completed',physical_stop_verified=True,output_stopped=True,motion_may_continue=False)
+    monkeypatch.setattr('teaching_replay.SDKReplay',Worker)
+    async def run():
+        reader=Reader();reader.settings={'url':'ws://127.0.0.1:5000'}
+        replay=Replay(reader,None,lambda:not blocked)
+        if blocked:
+            with pytest.raises(ValueError,match='other_motion'):await replay.reset_home([0]*14)
+            assert not constructed
+            return
+        action=await replay.reset_home([0]*14)
+        outcome=await replay.wait(action['action_id'])
+        assert constructed[0][1]==[dict(t_ns=0,q=[0]*14,gripper=[0,0])]
+        assert constructed[0][2]==[0,0]
+        assert outcome['result']['source']=='configured_home'
+        assert outcome['result']['head_policy']=='center'
+        assert not reader.commands
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('was_started', [False, True])
+def test_only_started_lifecycle_stop_schedules_home(monkeypatch,was_started):
+    import concurrent.futures
+    import threading
+    from teaching import TronTeachingPlugin
+    plugin=TronTeachingPlugin.__new__(TronTeachingPlugin)
+    plugin.lifecycle_lock=threading.Lock();plugin.lifecycle_started=was_started;plugin.teardown_future=None
+    plugin._validate=lambda *args:None
+    stopped=[];scheduled=[]
+    plugin.adapter=SimpleNamespace(loop=None,stop=lambda:stopped.append(True) or {'state':'idle'})
+    def schedule(coro,loop):
+        coro.close();scheduled.append(True)
+        return concurrent.futures.Future()
+    monkeypatch.setattr(asyncio,'run_coroutine_threadsafe',schedule)
+    plugin.dispatch('stop',{})
+    plugin.dispatch('stop',{})
+    assert len(scheduled)==int(was_started)
+    assert len(stopped)==(0 if was_started else 2)
+
+
+@pytest.mark.parametrize('unsafe', [False, True])
+def test_shutdown_does_not_reset_unverified_previous_motion(unsafe):
+    from teaching import TronTeachingPlugin
+    calls=[]
+    async def stop():return dict(motion_may_continue=unsafe,busy=unsafe)
+    async def finish():calls.append('finish')
+    async def reset(target):calls.append(target);return dict(action_id='home')
+    async def wait(ident):return dict(status='completed',result={})
+    plugin=TronTeachingPlugin.__new__(TronTeachingPlugin)
+    plugin.adapter=SimpleNamespace(replay=SimpleNamespace(stop=stop,reset_home=reset,wait=wait),
+        capture=SimpleNamespace(finish=finish),owner=SimpleNamespace(reset=SimpleNamespace(call=lambda _:dict(target_q=[0]*14))))
+    result=asyncio.run(plugin._reset_on_stop())
+    assert result['status']==('error' if unsafe else 'completed')
+    assert ([0]*14 in calls)==(not unsafe)

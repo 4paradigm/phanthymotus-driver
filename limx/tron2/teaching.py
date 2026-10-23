@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -193,6 +194,9 @@ class TronTeachingPlugin(TeachingPlugin):
     def __init__(self,adapter):
         super().__init__(adapter,adapter.root/'assets','tron2_teaching')
         self.export_job=None
+        self.lifecycle_started=False
+        self.lifecycle_lock=threading.Lock()
+        self.teardown_future=None
 
     def get_tools(self):
         tools=super().get_tools();schema=tools[0]['inputSchema']
@@ -217,8 +221,28 @@ class TronTeachingPlugin(TeachingPlugin):
 
     def dispatch(self,action,args):
         self._validate(action,args)
+        if action=='stop':
+            with self.lifecycle_lock:
+                if self.teardown_future and not self.teardown_future.done():
+                    return dict(state='stopping',accepted=True)
+                if not self.lifecycle_started:
+                    return self.adapter.stop()
+                self.lifecycle_started=False
+                self.teardown_future=asyncio.run_coroutine_threadsafe(self._reset_on_stop(),self.adapter.loop)
+                return dict(state='stopping',accepted=True)
+        if action=='start':
+            with self.lifecycle_lock:
+                if self.teardown_future and not self.teardown_future.done():
+                    raise ValueError('reset_in_progress')
+                self._idle()
+                self.lifecycle_started=True
         if action=='info':
-            return {**super().dispatch(action,args),'training_export':self.export_job}
+            result={**super().dispatch(action,args),'training_export':self.export_job}
+            if self.teardown_future and not self.teardown_future.done():
+                result['busy']=True
+            return result
+        if self.teardown_future and not self.teardown_future.done():
+            raise ValueError('reset_in_progress')
         if action=='unlock':
             with self.lock:
                 if self.adapter.capture.info()['recording']:raise ValueError('finish_recording_first')
@@ -254,6 +278,22 @@ class TronTeachingPlugin(TeachingPlugin):
                 gripper_speed=args.get('gripper_speed'),gripper_force=args.get('gripper_force'))
             result['next_step']='请操作者确认原厂 VR 和其他控制程序已停止、活动空间已清空，并明确夹爪速度和力档位。确认后补齐 execution_arguments，再执行。'
         return result
+
+    async def _reset_on_stop(self):
+        try:
+            stopped=await self.adapter.replay.stop()
+            await self.adapter.capture.finish()
+            if stopped.get('motion_may_continue') or stopped.get('busy'):
+                raise ValueError('previous_motion_stop_not_verified')
+            home=self.adapter.owner.reset.call('execute')
+            action=await self.adapter.replay.reset_home(home['target_q'])
+            outcome=await self.adapter.replay.wait(action['action_id'])
+            if outcome['status']!='completed':
+                raise ValueError(outcome['result'].get('reason','reset_failed'))
+            return outcome
+        except Exception as exc:
+            logging.getLogger('tron2').error('SDK shutdown reset failed: %s',exc)
+            return dict(status='error',reason=str(exc))
 
     def _export(self,ident,destination):
         try:
