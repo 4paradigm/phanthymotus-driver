@@ -108,6 +108,7 @@ def test_ingest_ring_is_bounded_and_reports_recorder_evictions_separately():
         "frozen_rounds": 0,
         "max_rounds": 20,
         "max_frames_per_round": 600,
+        "max_raw_bytes": 1048576,
         "bridge_transport_drops": 7,
         "recorder_cache_evictions": 1,
         "frozen_round_evictions": 0,
@@ -117,7 +118,16 @@ def test_ingest_ring_is_bounded_and_reports_recorder_evictions_separately():
         "invalid_source_timestamps": 0,
         "invalid_persons": 0,
         "monotonic_anomalies": 0,
+        "oversize_messages": 0,
     }
+
+
+def test_oversize_pose_is_rejected_before_json_parsing_and_counted():
+    recorder = PoseRecorder(max_raw_bytes=32)
+
+    assert recorder.ingest(_pose(person_id="x" * 100), 1, 2) is False
+    assert recorder.status()["oversize_messages"] == 1
+    assert recorder.status()["buffered_frames"] == 0
 
 
 def test_round_window_uses_inclusive_bridge_monotonic_boundaries_only():
@@ -168,6 +178,48 @@ def test_completed_round_requires_trusted_evidence_and_full_three_second_window(
     assert recorder.export_round("complete")["outcome"] == "COMPLETED"
 
 
+@pytest.mark.parametrize("updates", [
+    {"playback_finished_at_ns": True},
+    {"playback_finished_at_ns": "100"},
+    {"playback_finished_at_ns": -1},
+    {"error_code": "ALSA_UNDERRUN"},
+    {"error_code": 0},
+    {"error_message": "drain failed"},
+    {"error_message": []},
+    {"underrun_count": 1},
+])
+def test_completed_round_rejects_malformed_or_terminal_error_evidence(updates):
+    recorder = PoseRecorder()
+    evidence = {
+        "result": "completed",
+        "completion_level": "alsa_device_consumption",
+        "timestamp_quality": "DEVICE_PROGRESS_OBSERVED",
+        "playback_finished_at_ns": 10,
+        "error_code": None,
+        "error_message": None,
+        "underrun_count": 0,
+    }
+    evidence.update(updates)
+    recorder.start_round("bad", 0)
+
+    with pytest.raises(ValueError, match="trusted playback evidence"):
+        recorder.finish_round(
+            "bad", "COMPLETED", 3_000_000_000, evidence, 0)
+
+
+def test_completed_round_rejects_boolean_local_completion_observation():
+    recorder = PoseRecorder()
+    recorder.start_round("bad-observation", 0)
+
+    with pytest.raises(ValueError, match="local completion observation"):
+        recorder.finish_round("bad-observation", "COMPLETED", 3_000_000_001, {
+            "result": "completed",
+            "completion_level": "alsa_device_consumption",
+            "timestamp_quality": "DEVICE_PROGRESS_OBSERVED",
+            "playback_finished_at_ns": 1,
+        }, True)
+
+
 def test_rounds_cannot_overlap_or_reuse_a_retained_id():
     recorder = PoseRecorder()
     recorder.start_round("r1", 1)
@@ -204,6 +256,30 @@ def test_live_capacity_eviction_marks_round_snapshot_incomplete():
     exported = recorder.export_round("r1")
     assert exported["complete"] is False
     assert [f["persons"][0]["id"] for f in exported["frames"]] == [102, 103]
+
+
+def test_evicting_only_pre_round_frames_does_not_mark_round_incomplete():
+    recorder = PoseRecorder(max_frames=2)
+    recorder.ingest(_pose(person_id="old-1"), 1, 1)
+    recorder.ingest(_pose(person_id="old-2"), 2, 2)
+    recorder.start_round("fresh", 100)
+    recorder.ingest(_pose(person_id="fresh"), 101, 101)
+    recorder.finish_round("fresh", "PLAYBACK_FAILED", 101)
+
+    assert recorder.export_round("fresh")["complete"] is True
+
+
+def test_round_snapshot_marks_bridge_transport_drops_incomplete():
+    recorder = PoseRecorder()
+    recorder.start_round("dropped", 100, bridge_transport_drops=4)
+    recorder.ingest(_pose(person_id="kept"), 101, 101)
+    snapshot = recorder.finish_round(
+        "dropped", "PLAYBACK_FAILED", 102,
+        bridge_transport_drops=6)
+
+    assert snapshot["complete"] is False
+    assert snapshot["bridge_transport_drops"] == 2
+    assert snapshot["incomplete_reasons"] == ["bridge_transport_drop"]
 
 
 def test_snapshot_and_completed_round_capacities_are_bounded_and_counted():

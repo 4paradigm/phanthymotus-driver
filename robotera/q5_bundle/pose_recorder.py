@@ -38,6 +38,8 @@ class RoundSnapshot:
     ended_monotonic_ns: int
     frames: Tuple[PoseFrame, ...]
     complete: bool
+    bridge_transport_drops: int = 0
+    incomplete_reasons: Tuple[str, ...] = ()
     playback_result: Optional[dict] = None
     completion_observed_monotonic_ns: Optional[int] = None
 
@@ -48,6 +50,8 @@ class RoundSnapshot:
             "started_monotonic_ns": self.started_monotonic_ns,
             "ended_monotonic_ns": self.ended_monotonic_ns,
             "complete": self.complete,
+            "bridge_transport_drops": self.bridge_transport_drops,
+            "incomplete_reasons": list(self.incomplete_reasons),
             "playback_result": deepcopy(self.playback_result),
             "completion_observed_monotonic_ns": (
                 self.completion_observed_monotonic_ns),
@@ -65,10 +69,12 @@ class PoseRecorder:
 
     def __init__(self, max_frames: int = 600, max_rounds: int = 20,
                  max_frames_per_round: int = 600,
+                 max_raw_bytes: int = 1_048_576,
                  clock_ns: Callable[[], int] = time.monotonic_ns):
         self._max_frames = max(1, int(max_frames))
         self._max_rounds = max(1, int(max_rounds))
         self._max_frames_per_round = max(1, int(max_frames_per_round))
+        self._max_raw_bytes = max(1, int(max_raw_bytes))
         self._clock_ns = clock_ns
         self._lock = threading.RLock()
         self._frames: Deque[PoseFrame] = deque(maxlen=self._max_frames)
@@ -83,6 +89,7 @@ class PoseRecorder:
             "invalid_source_timestamps": 0,
             "invalid_persons": 0,
             "monotonic_anomalies": 0,
+            "oversize_messages": 0,
         }
 
     @staticmethod
@@ -101,6 +108,12 @@ class PoseRecorder:
 
     def ingest(self, raw_json: str, bridge_received_monotonic_ns: int,
                driver_received_monotonic_ns: Optional[int] = None) -> bool:
+        if (not isinstance(raw_json, str)
+                or len(raw_json) > self._max_raw_bytes
+                or len(raw_json.encode("utf-8")) > self._max_raw_bytes):
+            with self._lock:
+                self._counters["oversize_messages"] += 1
+            return False
         try:
             payload = json.loads(raw_json)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -135,7 +148,10 @@ class PoseRecorder:
                 self._counters["monotonic_anomalies"] += 1
             if len(self._frames) >= self._max_frames:
                 self._counters["recorder_cache_evictions"] += 1
-                if self._active_round is not None:
+                oldest = self._frames[0]
+                if (self._active_round is not None
+                        and oldest.bridge_received_monotonic_ns
+                        >= self._active_round["started_monotonic_ns"]):
                     self._active_round["evicted_during_round"] = True
             self._frames.append(frame)
         return True
@@ -148,7 +164,8 @@ class PoseRecorder:
             return [frame.as_dict() for frame in frames]
 
     def start_round(self, round_id: str,
-                    started_monotonic_ns: Optional[int] = None) -> dict:
+                    started_monotonic_ns: Optional[int] = None,
+                    bridge_transport_drops: int = 0) -> dict:
         round_id = str(round_id)
         if not round_id:
             raise ValueError("round_id is required")
@@ -164,23 +181,37 @@ class PoseRecorder:
                 "round_id": round_id,
                 "started_monotonic_ns": started_ns,
                 "evicted_during_round": False,
+                "bridge_transport_drops": max(
+                    0, int(bridge_transport_drops)),
             }
             return {"round_id": round_id, "state": "RECORDING",
                     "started_monotonic_ns": started_ns}
 
     @staticmethod
     def _trusted_completion(playback_result: Optional[dict]) -> bool:
+        finished_ns = (playback_result.get("playback_finished_at_ns")
+                       if isinstance(playback_result, dict) else None)
+        underrun_count = (playback_result.get("underrun_count", 0)
+                          if isinstance(playback_result, dict) else None)
         return bool(
             isinstance(playback_result, dict)
             and playback_result.get("result") == "completed"
             and playback_result.get("completion_level") == "alsa_device_consumption"
             and playback_result.get("timestamp_quality") == "DEVICE_PROGRESS_OBSERVED"
-            and playback_result.get("playback_finished_at_ns") is not None)
+            and isinstance(finished_ns, int)
+            and not isinstance(finished_ns, bool)
+            and finished_ns >= 0
+            and playback_result.get("error_code") is None
+            and playback_result.get("error_message") is None
+            and isinstance(underrun_count, int)
+            and not isinstance(underrun_count, bool)
+            and underrun_count == 0)
 
     def finish_round(self, round_id: str, outcome: str,
                      ended_monotonic_ns: Optional[int] = None,
                      playback_result: Optional[dict] = None,
-                     completion_observed_monotonic_ns: Optional[int] = None) -> dict:
+                     completion_observed_monotonic_ns: Optional[int] = None,
+                     bridge_transport_drops: Optional[int] = None) -> dict:
         outcome = str(outcome)
         if outcome not in self._OUTCOMES:
             raise ValueError(f"unsupported round outcome: {outcome}")
@@ -191,7 +222,12 @@ class PoseRecorder:
                 raise ValueError("COMPLETED requires trusted playback evidence")
             if completion_observed_monotonic_ns is None:
                 raise ValueError("COMPLETED requires local completion observation")
-            observed_ns = int(completion_observed_monotonic_ns)
+            if (not isinstance(completion_observed_monotonic_ns, int)
+                    or isinstance(completion_observed_monotonic_ns, bool)
+                    or completion_observed_monotonic_ns < 0):
+                raise ValueError(
+                    "COMPLETED requires a valid local completion observation")
+            observed_ns = completion_observed_monotonic_ns
             if ended_ns < observed_ns + 3_000_000_000:
                 raise ValueError("COMPLETED requires the full three-second window")
 
@@ -206,14 +242,24 @@ class PoseRecorder:
                 frame for frame in self._frames
                 if started_ns <= frame.bridge_received_monotonic_ns <= ended_ns
             ]
-            complete = not active["evicted_during_round"]
+            current_drops = (active["bridge_transport_drops"]
+                             if bridge_transport_drops is None
+                             else max(0, int(bridge_transport_drops)))
+            round_drops = max(
+                0, current_drops - active["bridge_transport_drops"])
+            incomplete_reasons = []
+            if active["evicted_during_round"]:
+                incomplete_reasons.append("recorder_cache_eviction")
+            if round_drops:
+                incomplete_reasons.append("bridge_transport_drop")
             if len(frames) > self._max_frames_per_round:
                 frames = frames[-self._max_frames_per_round:]
                 self._counters["snapshot_frame_truncations"] += 1
-                complete = False
+                incomplete_reasons.append("snapshot_frame_truncation")
             snapshot = RoundSnapshot(
                 str(round_id), outcome, started_ns, ended_ns, tuple(frames),
-                complete, deepcopy(playback_result),
+                not incomplete_reasons, round_drops,
+                tuple(incomplete_reasons), deepcopy(playback_result),
                 (int(completion_observed_monotonic_ns)
                  if completion_observed_monotonic_ns is not None else None))
             if len(self._rounds) >= self._max_rounds:
@@ -240,6 +286,7 @@ class PoseRecorder:
                 "frozen_rounds": len(self._rounds),
                 "max_rounds": self._max_rounds,
                 "max_frames_per_round": self._max_frames_per_round,
+                "max_raw_bytes": self._max_raw_bytes,
                 "bridge_transport_drops": max(0, int(bridge_transport_drops)),
                 **self._counters,
             }

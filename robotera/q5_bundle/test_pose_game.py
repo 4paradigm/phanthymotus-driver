@@ -47,6 +47,7 @@ class FakeClient:
         self.items.put({
             "kind": "barrier", "token": token,
             "bridge_received_monotonic_ns": self.clock(),
+            "bridge_transport_drops": self.transport_drops,
         })
 
     def put_pose(self, person_id, bridge_ns):
@@ -142,6 +143,33 @@ def test_finish_barrier_drains_queued_pose_before_freeze_and_isolates_next_round
     plugin.stop()
 
 
+def test_freeze_boundary_is_bridge_barrier_time_not_later_driver_wakeup():
+    clock = FakeClock(10)
+    plugin, client = make_plugin(clock)
+    original_barrier = client.request_pose_barrier
+
+    def barrier_then_newer_pose(token):
+        original_barrier(token)
+        client.put_pose("after-barrier", 101)
+        clock.set(110)
+
+    client.request_pose_barrier = barrier_then_newer_pose
+    plugin.start()
+    plugin.dispatch("start_round", {"round_id": "cut-at-barrier"})
+    client.put_pose("before-barrier", 99)
+    clock.set(100)
+
+    frozen = plugin.dispatch("finish_round", {
+        "round_id": "cut-at-barrier", "outcome": "PLAYBACK_FAILED",
+        "playback_result": {"result": "failed"},
+    })
+
+    assert frozen["ended_monotonic_ns"] == 100
+    assert [frame["persons"][0]["id"] for frame in frozen["frames"]] == [
+        "before-barrier"]
+    plugin.stop()
+
+
 def test_finish_barrier_timeout_does_not_fake_freeze_or_lose_active_round():
     clock = FakeClock(100)
     plugin, client = make_plugin(clock, barrier_timeout_seconds=0.01)
@@ -170,6 +198,24 @@ def test_info_keeps_bridge_drops_distinct_from_recorder_evictions():
     info = plugin.dispatch("info", {})
     assert info["bridge_transport_drops"] == 7
     assert info["recorder_cache_evictions"] == 1
+    plugin.stop()
+
+
+def test_bridge_drops_during_round_mark_frozen_snapshot_incomplete():
+    clock = FakeClock(100)
+    plugin, client = make_plugin(clock)
+    client.transport_drops = 2
+    plugin.start()
+    plugin.dispatch("start_round", {"round_id": "drops"})
+    client.transport_drops = 3
+
+    snapshot = plugin.dispatch("finish_round", {
+        "round_id": "drops", "outcome": "PLAYBACK_FAILED",
+    })
+
+    assert snapshot["complete"] is False
+    assert snapshot["bridge_transport_drops"] == 1
+    assert snapshot["incomplete_reasons"] == ["bridge_transport_drop"]
     plugin.stop()
 
 

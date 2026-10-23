@@ -24,6 +24,7 @@ q5_bridge_worker.py — 独立子进程 DDS bridge，将 Q5 sensor snapshot 发�
 """
 
 import multiprocessing as mp
+from collections import deque
 import os
 import queue
 import sys
@@ -38,29 +39,43 @@ _SUPPORTED_SPEAKER_FORMATS = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
 _SPEAKER_FAILURE_DEDUPE_LIMIT = 256
 _SPEAKER_FAILURE_MERGE_LIMIT = 64
 _POSE_QUEUE_SIZE = 256
+_MAX_POSE_JSON_BYTES = 1_048_576
 
 
-def pose_message_item(msg, clock_ns=time.monotonic_ns) -> dict:
+def pose_message_item(msg, clock_ns=time.monotonic_ns,
+                      max_raw_bytes: int = _MAX_POSE_JSON_BYTES) -> dict:
     """Convert one ROS String message without interpreting its source clock."""
+    raw_json = str(msg.data)
+    byte_limit = max(1, int(max_raw_bytes))
+    if (len(raw_json) > byte_limit
+            or len(raw_json.encode("utf-8")) > byte_limit):
+        raise ValueError("Pose JSON exceeds maximum byte size")
     return {
         "kind": "pose",
-        "raw_json": str(msg.data),
+        "raw_json": raw_json,
         "bridge_received_monotonic_ns": int(clock_ns()),
     }
 
 
-def pose_barrier_item(token: str, clock_ns=time.monotonic_ns) -> dict:
+def pose_barrier_item(token: str, clock_ns=time.monotonic_ns,
+                      bridge_transport_drops: int = 0) -> dict:
     """Create an in-band marker ordered after earlier Pose callbacks."""
     return {
         "kind": "barrier",
         "token": str(token),
         "bridge_received_monotonic_ns": int(clock_ns()),
+        "bridge_transport_drops": max(0, int(bridge_transport_drops)),
     }
 
 
 def _increment_shared_counter(counter, amount: int = 1):
     with counter.get_lock():
         counter.value += int(amount)
+
+
+def _shared_counter_value(counter) -> int:
+    with counter.get_lock():
+        return int(counter.value)
 
 
 def _offer_pose(pose_q, item: dict, transport_drops) -> bool:
@@ -400,9 +415,15 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     last_invalid_format_warning_at = None
     speaker_failed_ids = {}
     speaker_epoch = int(speaker_fail_epoch.value) + 1
+    pending_pose_barriers = deque(maxlen=64)
 
     def _on_pose(msg):
-        _offer_pose(pose_q, pose_message_item(msg), pose_transport_drops)
+        try:
+            item = pose_message_item(msg)
+        except ValueError:
+            _increment_shared_counter(pose_transport_drops)
+            return
+        _offer_pose(pose_q, item, pose_transport_drops)
 
     def _on_speaker(msg):
         nonlocal speaker_frames_received, speaker_duplicate_frames_dropped
@@ -616,10 +637,8 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                         String, topic, _on_pose, QOS_SENSOR)
                     node.get_logger().info(f"pose subscribed to {topic} (BEST_EFFORT)")
             elif isinstance(cmd, dict) and cmd.get("kind") == "pose_barrier":
-                _offer_pose_barrier(
-                    pose_q,
-                    pose_barrier_item(str(cmd.get("token") or "")),
-                    pose_transport_drops)
+                if len(pending_pose_barriers) < pending_pose_barriers.maxlen:
+                    pending_pose_barriers.append(str(cmd.get("token") or ""))
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:
@@ -671,6 +690,19 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
         # A short DDS wait avoids a busy loop while draining bursty live PCM
         # fast enough to preserve every 1 KiB browser-microphone frame.
         executor.spin_once(timeout_sec=0.005)
+
+        # Defer the marker until after this executor turn. The guaranteed cut
+        # is the ordered Pose IPC queue: callbacks already offered to pose_q
+        # precede the marker; later callbacks receive a later Bridge clock.
+        while pending_pose_barriers:
+            token = pending_pose_barriers.popleft()
+            _offer_pose_barrier(
+                pose_q,
+                pose_barrier_item(
+                    token,
+                    bridge_transport_drops=_shared_counter_value(
+                        pose_transport_drops)),
+                pose_transport_drops)
 
     # Cleanup
     node.destroy_node()

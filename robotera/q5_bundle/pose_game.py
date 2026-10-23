@@ -29,13 +29,14 @@ class Plugin:
             max_frames=config.get("max_frames", 600),
             max_rounds=config.get("max_rounds", 20),
             max_frames_per_round=config.get("max_frames_per_round", 600),
+            max_raw_bytes=config.get("max_raw_bytes", 1_048_576),
             clock_ns=clock_ns,
         )
         self._lifecycle_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._pump_thread = None
         self._barrier_condition = threading.Condition()
-        self._seen_barriers = set()
+        self._seen_barriers = {}
         self._awaited_barriers = set()
 
     def start(self):
@@ -56,8 +57,7 @@ class Plugin:
                 return {"state": "idle"}
             self._client.configure_pose("")
             self._stop_event.set()
-        thread.join(timeout=2.0)
-        with self._lifecycle_lock:
+            thread.join(timeout=2.0)
             if thread.is_alive():
                 raise RuntimeError("Pose recorder pump did not stop")
             if self._pump_thread is thread:
@@ -77,7 +77,10 @@ class Plugin:
                 token = str(item.get("token") or "")
                 with self._barrier_condition:
                     if token in self._awaited_barriers:
-                        self._seen_barriers.add(token)
+                        self._seen_barriers[token] = (
+                            int(item["bridge_received_monotonic_ns"]),
+                            max(0, int(item.get("bridge_transport_drops", 0))),
+                        )
                         self._barrier_condition.notify_all()
                 continue
             if item.get("kind") != "pose":
@@ -94,7 +97,7 @@ class Plugin:
     def _wait_for_barrier(self):
         token = uuid.uuid4().hex
         with self._barrier_condition:
-            self._seen_barriers.discard(token)
+            self._seen_barriers.pop(token, None)
             self._awaited_barriers.add(token)
         self._client.request_pose_barrier(token)
         deadline = time.monotonic() + self._barrier_timeout
@@ -106,8 +109,9 @@ class Plugin:
                         raise TimeoutError(
                             "Pose barrier was not observed before freeze")
                     self._barrier_condition.wait(remaining)
+                return self._seen_barriers[token]
             finally:
-                self._seen_barriers.discard(token)
+                self._seen_barriers.pop(token, None)
                 self._awaited_barriers.discard(token)
 
     def get_tool(self):
@@ -135,14 +139,20 @@ class Plugin:
     def dispatch(self, action, args):
         args = dict(args or {})
         if action == "start_round":
+            try:
+                stats = self._client.pose_stats()
+            except Exception:
+                stats = {}
             return self._recorder.start_round(
-                args["round_id"], int(self._clock_ns()))
+                args["round_id"], int(self._clock_ns()),
+                (stats or {}).get("bridge_transport_drops", 0))
         if action == "finish_round":
-            self._wait_for_barrier()
+            barrier_ns, bridge_drops = self._wait_for_barrier()
             return self._recorder.finish_round(
-                args["round_id"], args["outcome"], int(self._clock_ns()),
+                args["round_id"], args["outcome"], barrier_ns,
                 args.get("playback_result"),
-                args.get("completion_observed_monotonic_ns"))
+                args.get("completion_observed_monotonic_ns"),
+                bridge_drops)
         if action == "export_round":
             return self._recorder.export_round(args["round_id"])
         if action in ("info", "pose_game"):

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import q5_media_bridge
+import pytest
 
 
 class FakeCounter:
@@ -36,6 +37,12 @@ def test_pose_message_retains_raw_json_and_bridge_monotonic_timestamp():
     }
 
 
+def test_pose_message_rejects_oversize_json_before_queueing():
+    with pytest.raises(ValueError, match="maximum"):
+        q5_media_bridge.pose_message_item(
+            Message(), lambda: 1, max_raw_bytes=8)
+
+
 def test_pose_lane_is_bounded_nonblocking_and_counts_transport_drops():
     pose_q = queue.Queue(maxsize=2)
     drops = FakeCounter()
@@ -55,7 +62,8 @@ def test_pose_barrier_uses_same_ordered_lane_as_prior_pose_messages():
     q5_media_bridge._offer_pose(pose_q, {"kind": "pose", "sequence": 1}, drops)
     q5_media_bridge._offer_pose(pose_q, {"kind": "pose", "sequence": 2}, drops)
     q5_media_bridge._offer_pose(
-        pose_q, q5_media_bridge.pose_barrier_item("freeze-1", lambda: 900), drops)
+        pose_q, q5_media_bridge.pose_barrier_item(
+            "freeze-1", lambda: 900, bridge_transport_drops=3), drops)
 
     assert [pose_q.get_nowait()["kind"] for _ in range(3)] == [
         "pose", "pose", "barrier"]
@@ -84,7 +92,8 @@ def test_full_pose_lane_barrier_waits_for_space_without_evicting_pose():
     assert [pose_q.get_nowait() for _ in range(2)] == [
         {"kind": "pose", "sequence": 2},
         {"kind": "barrier", "token": "freeze",
-         "bridge_received_monotonic_ns": 3},
+         "bridge_received_monotonic_ns": 3,
+         "bridge_transport_drops": 0},
     ]
     assert drops.value == 0
 
@@ -113,3 +122,13 @@ def test_main_binds_pose_lane_to_existing_client_lifecycle():
     assert "client.pop_pose = bridge.pop_pose" in source
     assert "client.pose_stats = bridge.pose_stats" in source
     assert "client.request_pose_barrier = bridge.request_pose_barrier" in source
+
+
+def test_child_defers_barrier_until_after_executor_turn_before_queue_cut():
+    source = Path(q5_media_bridge.__file__).read_text()
+    loop = source[source.index("while running:"):]
+
+    queued = loop.index("pending_pose_barriers.append")
+    spun = loop.index("executor.spin_once")
+    flushed = loop.index("while pending_pose_barriers")
+    assert queued < spun < flushed

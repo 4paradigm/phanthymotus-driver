@@ -54,6 +54,7 @@ plugins:
     max_frames: 600
     max_rounds: 20
     max_frames_per_round: 600
+    max_raw_bytes: 1048576
     barrier_timeout_seconds: 1.0
   audio:
     enabled: true
