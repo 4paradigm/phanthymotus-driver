@@ -123,15 +123,60 @@ class Plugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": [
-                        "start_round", "finish_round", "export_round", "info"]},
-                    "round_id": {"type": "string"},
-                    "outcome": {"type": "string"},
-                    "playback_result": {"type": "object"},
-                    "completion_observed_monotonic_ns": {"type": "integer"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["start_round", "finish_round",
+                                 "export_round", "info"],
+                        "oneOf": [
+                            {"const": "start_round", "title": "开始本轮采集"},
+                            {"const": "finish_round", "title": "冻结本轮采集"},
+                            {"const": "export_round", "title": "导出冻结轮次"},
+                            {"const": "info", "title": "查看采集状态"},
+                        ],
+                    },
+                    "round_id": {
+                        "type": "string", "minLength": 1,
+                        "description": "Unique round identifier retained with the snapshot.",
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "enum": [
+                            "COMPLETED", "PLAYBACK_FAILED", "TIMEOUT",
+                            "MANUAL_TERMINATED", "SUBMIT_FAILED",
+                            "UNTRUSTED_COMPLETION",
+                        ],
+                        "description": "Terminal round outcome; COMPLETED additionally requires trusted playback fields.",
+                    },
+                    "playback_result": {
+                        "type": "object", "x-widget": "json",
+                        "description": "Required only for COMPLETED. Offline Mock input until real tracked TTS integration is verified.",
+                    },
+                    "completion_observed_monotonic_ns": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Required only for COMPLETED: Driver monotonic time when trusted completion was observed.",
+                    },
                 },
                 "required": ["action"],
-                "additionalProperties": True,
+                "additionalProperties": False,
+                "x-action-params": {
+                    "start_round": {
+                        "params": ["round_id"],
+                        "description": "Start capture before submitting TTS.",
+                    },
+                    "finish_round": {
+                        "params": ["round_id", "outcome", "playback_result",
+                                   "completion_observed_monotonic_ns"],
+                        "description": "Freeze after a terminal outcome; playback evidence fields apply only to COMPLETED.",
+                    },
+                    "export_round": {
+                        "params": ["round_id"],
+                        "description": "Export one retained frozen round.",
+                    },
+                    "info": {
+                        "params": [],
+                        "description": "Read active round, capacities, and counters.",
+                    },
+                },
             },
             "topic_out": [],
         }

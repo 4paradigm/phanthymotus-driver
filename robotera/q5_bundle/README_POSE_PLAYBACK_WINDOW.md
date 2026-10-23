@@ -26,6 +26,65 @@
 - `export_round`: `{"round_id": "round-1"}`
 - `info`: 当前轮次、容量和分类计数
 
+## Driver MCP 功能卡片
+
+卡片（tool）名称是 `pose_game`，description 是
+`Bounded Pose capture windows for offline action scoring`。它由 `config.yaml`
+中的同名启用项自动加载，属于 Q5 Driver MCP 功能卡片，不是 AgentCore Skill。
+
+当前 `COMPLETED` 的 MCP 示例只用于本地 Mock 流程验证。普通 TTS 的受跟踪元数据尚未与该卡片形成 Driver 内部可信编排，因此部署后不能让 Dashboard 用户手工填写一份播放结果并将其当作真实可信完成。真实设备链路打通前，生产调用应由受信任的 Driver 编排者提供 Speaker Tracker 结果，或者使用实际的失败、超时、取消等非完成终态。
+
+列出卡片：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+```
+
+返回的 `result.tools` 中应包含一个 `name=pose_game`、`type=sensor` 的工具，action 为
+`start_round`、`finish_round`、`export_round` 和 `info`。
+
+在提交 TTS 之前开始一轮：
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pose_game","arguments":{"action":"start_round","round_id":"round-1"}}}
+```
+
+预期文本内容解码后包含：
+
+```json
+{"round_id":"round-1","state":"RECORDING","started_monotonic_ns":123456789}
+```
+
+播放期间可查询采集状态：
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pose_game","arguments":{"action":"info"}}}
+```
+
+返回包含 `active_round`、`buffered_frames`、容量限制，以及 Bridge 丢帧、Recorder
+淘汰和无效输入等分类计数。
+
+在离线 Mock 测试中观察到模拟的可信 Speaker 完成后，调用方继续等待完整 3 秒，再冻结本轮。以下时间仅为 Mock 格式示例，不代表已验证的真机生产调用：
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"pose_game","arguments":{"action":"finish_round","round_id":"round-1","outcome":"COMPLETED","completion_observed_monotonic_ns":1000000000,"playback_result":{"result":"completed","completion_level":"alsa_device_consumption","timestamp_quality":"DEVICE_PROGRESS_OBSERVED","playback_finished_at_ns":999000000000,"error_code":null,"error_message":null,"underrun_count":0}}}}
+```
+
+正常返回包含 `outcome=COMPLETED`、窗口起止时间、`complete`、
+`bridge_transport_drops`、`incomplete_reasons` 和完整 `frames`。失败、超时、取消或不可信完成必须使用对应终态，不能声明 `COMPLETED`。
+
+导出已经冻结的轮次：
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pose_game","arguments":{"action":"export_round","round_id":"round-1"}}}
+```
+
+返回与冻结时相同的轮次快照。`frames` 中每帧包含原始 JSON、源 timestamp、Bridge/Driver monotonic 时间和 persons 数据。
+
+部署包含本文件及配置的新 Q5 Driver 镜像并重启现有 Driver 后，Dashboard 应显示名为
+`pose_game` 的卡片。现有 bundle MCP 注册线程会向 Agent Core 注册整个 Q5 Driver，
+不需要再创建独立 MCP 服务、额外注册卡片或安装 AgentCore Skill。
+
 自动编排使用 `PoseRoundController`。以下示例展示调用顺序；`submit_tts` 与 `wait_for_playback` 需由上层注入：
 
 ```python
