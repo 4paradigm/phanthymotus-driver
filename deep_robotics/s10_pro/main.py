@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import threading
+from contextlib import ExitStack
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -21,7 +22,8 @@ from motion_tasks import MotionTasks
 from acp import ACPNotifier
 
 
-def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, tasks=None):
+def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, tasks=None,
+                          motion_bridge=None):
     """Build sensors and the motion UI without opening a control connection.
 
     The motion backend stays unsupported until this robot's complete control
@@ -30,7 +32,10 @@ def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, 
     """
     plugins = build_plugins(config, namespace, bridge, publish)
     transport = DDSProcessTransport(config, execution_enabled=False)
-    motion_backend = DDSMotionBackend(bridge, transport, execution_authorized=False)
+    # The production runtime supplies a separate read-only child for motion.
+    # Point-cloud conversion and sensor IPC must not queue its feedback samples.
+    observer_bridge = bridge if motion_bridge is None else motion_bridge
+    motion_backend = DDSMotionBackend(observer_bridge, transport, execution_authorized=False)
     plugins.append(MotionPlugin(config.get("motion", {}), namespace, backend=motion_backend,
                                 feedback=motion_backend.feedback, publish=publish, execution_authorized=False,
                                 notifier=notifier, tasks=tasks))
@@ -114,44 +119,48 @@ def main():
         os.environ.pop(key, None)
     domain = int(os.environ.get("ROS_DOMAIN_ID", config.get("core_domain_id", 42)))
     namespace = resolve_namespace(config)
-    bus = PlatformBus(domain)
-    bridge = ReaderBridge(config, config_path)
-    # Driver-only persistent state; never shares the Core database or credentials.
-    state = Path(os.environ.get("S10_STATE_DIR", "/work/state"))
-    tasks = MotionTasks(state / "motion-tasks.sqlite3")
-    notifier = ACPNotifier(state / "acp-outbox.sqlite3")
-    notifier.start()
-    bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish,
-                                               notifier=notifier, tasks=tasks))
-    port = int(os.environ.get("MCP_PORT", config["mcp_port"]))
-    server = ThreadingHTTPServer((str(config.get("bind_host", "127.0.0.1")), port),
-                                 make_handler(lambda: bundle, "s10-pro-bundle", "deep-robotics-s10-pro-driver"))
-    server.daemon_threads = True
-    stop = threading.Event()
-
-    def shutdown(signum, frame):
-        if not stop.is_set():
-            stop.set()
-            threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-    # Do not start cards at process boot. The real canvas owns their lifecycle.
-    if config.get("register", True):
-        start_registration(port, config, "deep-robotics-s10-pro-driver")
-    try:
-        logging.info("S10 Pro five sensors and gated motion; namespace=%s port=%d domain=%d motion_authorized=false", namespace, port, domain)
-        server.serve_forever()
-    finally:
-        bundle.stop_all()
+    # Register each cleanup immediately so a later startup failure also reaps
+    # both independent reader supervisors and the resources already created.
+    with ExitStack() as cleanup:
+        bus = PlatformBus(domain)
+        cleanup.callback(bus.close)
+        bridge = ReaderBridge(config, config_path)
+        cleanup.callback(bridge.close)
+        motion_bridge = ReaderBridge(config, config_path)
+        cleanup.callback(motion_bridge.close)
+        # Driver-only persistent state; never shares the Core database or credentials.
+        state = Path(os.environ.get("S10_STATE_DIR", "/work/state"))
+        tasks = MotionTasks(state / "motion-tasks.sqlite3")
+        cleanup.callback(tasks.close)
+        notifier = ACPNotifier(state / "acp-outbox.sqlite3")
+        cleanup.callback(notifier.close)
+        notifier.start()
+        bundle = DriverBundle(build_runtime_plugins(config, namespace, bridge, bus.publish,
+                                                   notifier=notifier, tasks=tasks,
+                                                   motion_bridge=motion_bridge))
         for plugin in bundle.plugins:
             if hasattr(plugin, "close"):
-                plugin.close()
-        bridge.close()
-        server.server_close()
-        bus.close()
-        notifier.close()
-        tasks.close()
+                cleanup.callback(plugin.close)
+        cleanup.callback(bundle.stop_all)
+        port = int(os.environ.get("MCP_PORT", config["mcp_port"]))
+        server = ThreadingHTTPServer((str(config.get("bind_host", "127.0.0.1")), port),
+                                     make_handler(lambda: bundle, "s10-pro-bundle", "deep-robotics-s10-pro-driver"))
+        cleanup.callback(server.server_close)
+        server.daemon_threads = True
+        stop = threading.Event()
+
+        def shutdown(signum, frame):
+            if not stop.is_set():
+                stop.set()
+                threading.Thread(target=server.shutdown, daemon=True).start()
+
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        # Do not start cards at process boot. The real canvas owns their lifecycle.
+        if config.get("register", True):
+            start_registration(port, config, "deep-robotics-s10-pro-driver")
+        logging.info("S10 Pro five sensors and gated motion; namespace=%s port=%d domain=%d motion_authorized=false", namespace, port, domain)
+        server.serve_forever()
 
 
 if __name__ == "__main__":

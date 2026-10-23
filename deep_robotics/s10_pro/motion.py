@@ -64,6 +64,47 @@ def validate_contract(contract):
         and isinstance(contract.get('stop_on_authority_loss'), bool))
 
 
+def contract_readiness(contract):
+    """Describe missing machine evidence separately from application policy.
+
+    The ranges below are requirements of this controller, never measurements or
+    claims about the robot. Acceptance continues to use ``validate_contract``.
+    """
+    evidence = contract.get('evidence')
+    evidence = evidence if isinstance(evidence, dict) else {}
+    missing = [key for key in REQUIRED_EVIDENCE
+        if not isinstance(evidence.get(key), str) or not evidence[key].strip()]
+    facts = {key: contract.get(key) is True for key in
+        ('robot_identity_matched', 'firmware_matched', 'robot_deadman_verified')}
+    unmet = []
+    if contract.get('verified') is not True:
+        unmet.append('contract_not_verified')
+    if not isinstance(contract.get('actions'), list) or not set(ACTIONS) <= set(contract['actions']):
+        unmet.append('complete_action_coverage')
+    if contract.get('velocity_units') != {'vx': 'm/s', 'vy': 'm/s', 'yaw_rate': 'rad/s'}:
+        unmet.append('velocity_units')
+    values = {}
+    for key, low, high in [('robot_deadman_s', .1, 1.), ('send_timeout_s', .01, .2)]:
+        try:
+            values[key] = _number(contract.get(key), low, high, key)
+        except ValueError:
+            unmet.append(key)
+    if len(values) == 2 and values['send_timeout_s'] * 2 >= values['robot_deadman_s']:
+        unmet.append('send_timeout_below_half_deadman')
+    if contract.get('stop_semantics') != 'zero_velocity_until_feedback':
+        unmet.append('stop_semantics')
+    if not isinstance(contract.get('stop_on_authority_loss'), bool):
+        unmet.append('stop_on_authority_loss_policy')
+    return {'accepted_by_application': validate_contract(contract),
+        'machine_evidence': {'required': list(REQUIRED_EVIDENCE), 'missing': missing,
+            **facts, 'unmatched': [key for key, matched in facts.items() if not matched]},
+        'application_requirements': {'unmet': unmet, 'actions': list(ACTIONS),
+            'velocity_units': {'vx': 'm/s', 'vy': 'm/s', 'yaw_rate': 'rad/s'},
+            'robot_deadman_range_s': [.1, 1.], 'send_timeout_range_s': [.01, .2],
+            'stop_semantics': 'zero_velocity_until_feedback'},
+        'note': 'Application requirements do not establish robot capabilities. Machine evidence must match this robot.'}
+
+
 class MotionPlugin:
     name = PREFIX = 'motion'
 
@@ -163,6 +204,90 @@ class MotionPlugin:
         except Exception:
             return False
 
+    def _readiness(self, *, contract=None, diagnostics=None):
+        contract = self._contract() if contract is None else contract
+        diagnostics = diagnostics or {}
+        try:
+            # Use the backend's explicit read-only diagnostic interface. Do not
+            # invoke the action-side authority adapter merely to render status;
+            # an unknown adapter remains unavailable rather than being probed.
+            reader = getattr(self._backend, 'readiness_status', None)
+            control = reader() if callable(reader) else {}
+            control = control if isinstance(control, dict) else {}
+        except Exception:
+            control = {}
+        def age(value):
+            return float(value) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+        authority_age = age(control.get('age_s'))
+        authority_fresh = (control.get('owned') is True and control.get('fresh') is True
+            and authority_age is not None and authority_age <= .5
+            and control.get('authority_valid', True) is True)
+        authority_bound = control.get('authority_provider_bound', diagnostics.get('authority_provider_bound'))
+        feedback_age = age(control.get('feedback_age_s', diagnostics.get('age_s')))
+        feedback_fresh = (self._feedback is not None and control.get('feedback_fresh') is True
+            and (feedback_age is None or feedback_age <= .5))
+        # A backend reporting the observation age must not hide an invalid value
+        # behind a fresh boolean. Older injected test adapters omit the field.
+        if 'feedback_age_s' in control and feedback_age is None:
+            feedback_fresh = False
+        worker_required = control.get('command_worker_required', diagnostics.get('command_worker_required')) is True
+        worker_running = control.get('command_worker_running', diagnostics.get('command_worker_running'))
+        backend_authorized = control.get('backend_execution_authorized', diagnostics.get('backend_execution_authorized'))
+        transport_enabled = control.get('transport_execution_enabled', diagnostics.get('transport_execution_enabled'))
+        blocked = self._gate()
+        if backend_authorized is False:
+            blocked.append('backend_execution_authorization')
+        if transport_enabled is False:
+            blocked.append('transport_execution_authorization')
+        if not self._started:
+            blocked.append('card_not_started')
+        if not self._settings['enabled']:
+            blocked.append('card_disabled')
+        if authority_bound is False:
+            blocked.append('authority_provider_unbound')
+        if not authority_fresh:
+            blocked.append('fresh_control_authority')
+        if not feedback_fresh:
+            blocked.append('fresh_motion_feedback')
+        if worker_required and worker_running is not True:
+            blocked.append('command_worker_not_running')
+        instructions = {
+            'controller_closed': 'Use a running driver instance; this controller is closed.',
+            'execution_authorization': 'Authorize the deployment explicitly after verifying machine evidence. Canvas settings cannot grant process authorization.',
+            'backend_execution_authorization': 'Bind an explicitly authorized motion backend after machine evidence has been verified.',
+            'transport_execution_authorization': 'Authorize the command transport through the deployment process; card configuration cannot enable it.',
+            'robot_control_contract': 'Verify this robot identity, firmware, control ownership, stopping and watchdog evidence, then bind its control contract.',
+            'fresh_feedback_adapter': 'Bind the documented motion feedback adapter.',
+            'acp_notifier': 'Bind the durable ACP completion notifier.',
+            'card_not_started': 'Start Basic Motion to begin read-only feedback observation.',
+            'card_disabled': 'Enable Basic Motion when the other execution requirements have been met.',
+            'authority_provider_unbound': 'Bind a documented live control authority adapter. A visible feedback topic does not grant ownership.',
+            'fresh_control_authority': 'Obtain valid live control ownership within the 0.5 second application limit; do not synthesize a lease from feedback.',
+            'fresh_motion_feedback': 'Restore fresh /MOTION_INFO feedback within the existing 0.5 second limit.',
+            'command_worker_not_running': 'Start the command worker only through an authorized deployment after contract and live authority checks pass.',
+        }
+        return {'ready': not blocked, 'card_started': self._started,
+            'card_enabled': self._settings['enabled'],
+            'process_authorization': {'granted': self._authorized and backend_authorized is not False and transport_enabled is not False,
+                'plugin_authorized': self._authorized, 'backend_authorized': backend_authorized,
+                'transport_enabled': transport_enabled, 'canvas_configurable': False},
+            'contract': contract_readiness(contract),
+            'authority': {'provider_bound': authority_bound, 'owned': control.get('owned') is True,
+                'fresh': authority_fresh, 'age_s': authority_age, 'max_age_s': .5,
+                'navigation_mode_confirmed': control.get('navigation_mode_confirmed') is True},
+            'feedback': {'adapter_bound': self._feedback is not None, 'fresh': feedback_fresh,
+                'age_s': feedback_age, 'max_age_s': .5,
+                'reason': control.get('feedback_reason', diagnostics.get('reason'))},
+            'command_worker': {'required': worker_required, 'running': worker_running},
+            'blocked_by': blocked,
+            'next_steps': [{'code': reason, 'instruction': instructions[reason]} for reason in blocked]}
+
+    def _unavailable(self, blocked_by):
+        readiness = self._readiness()
+        return {'accepted': False, 'confirmed': False, 'completed': False,
+            'state': 'unavailable', 'blocked_by': blocked_by,
+            'readiness': readiness, 'next_steps': readiness['next_steps']}
+
     def _event(self, kind, **values):
         with self._lock:
             event = {'card': 'motion', 'event': kind, 'timestamp_ms': int(self._wall() * 1000), **values}
@@ -176,19 +301,22 @@ class MotionPlugin:
     def status(self):
         with self._lock:
             missing = self._gate()
+            contract = self._contract()
             diagnostics = {}
             if hasattr(self._backend, 'diagnostics'):
                 try:
                     diagnostics = self._backend.diagnostics()
                 except Exception:
                     diagnostics = {'preflight_error': 'observation_unavailable'}
+            readiness = self._readiness(contract=contract, diagnostics=diagnostics)
             return {'card': 'motion', 'state': 'running' if self._started else 'idle', 'phase': self._phase,
-                'execution_available': not missing and self._settings['enabled'], 'execution_authorized': self._authorized,
-                'contract_verified': validate_contract(self._contract()), 'blocked_by': missing,
+                'execution_available': readiness['ready'], 'execution_authorized': self._authorized,
+                'contract_verified': validate_contract(contract), 'blocked_by': missing,
+                'readiness': readiness, 'next_steps': readiness['next_steps'],
                 'availability_detail': {
                     'protocol_implemented': 'S10 software guide V1.0.2',
                     'production_backend': 'unbound',
-                    'missing_evidence': self._contract().get('missing', []),
+                    'missing_evidence': contract.get('missing', []),
                     'explanation': 'Robot version, control ownership and loss-of-command stopping remain unverified. Canvas settings cannot authorize execution.',
                     **diagnostics},
                 'settings': dict(self._settings), 'active_request': copy.deepcopy(self._active),
@@ -351,8 +479,7 @@ class MotionPlugin:
             settings, generation = dict(self._settings), self._generation
             request = validate_motion_request(action, arguments, settings, self._wall, check_freshness=False)
             if self._closed.is_set():
-                return {'accepted': False, 'confirmed': False, 'completed': False,
-                        'state': 'unavailable', 'blocked_by': ['controller_closed']}
+                return self._unavailable(['controller_closed'])
             previous = self._tasks.get(request['request_id'])
             if previous:
                 if self._tasks.fingerprint(request) != previous['fingerprint']:
@@ -364,11 +491,9 @@ class MotionPlugin:
                                               settings, self._wall)
             missing = self._gate()
             if missing or not self._started or not settings['enabled']:
-                return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'unavailable',
-                        'blocked_by': missing + ([] if self._started and settings['enabled'] else ['card_not_enabled'])}
+                return self._unavailable(missing + ([] if self._started and settings['enabled'] else ['card_not_enabled']))
             if not self._control_ok():
-                return {'accepted': False, 'confirmed': False, 'completed': False,
-                        'state': 'unavailable', 'blocked_by': ['fresh_control_authority']}
+                return self._unavailable(['fresh_control_authority'])
             if not self._busy.acquire(blocking=False):
                 return {'accepted': False, 'confirmed': False, 'completed': False, 'state': 'busy'}
             if generation != self._generation or not self._started or self._closed.is_set():

@@ -62,12 +62,22 @@ class DDSMotionBackend:
             protocol_implemented='S10 software guide V1.0.2 §2.2/2.3',
             production_backend='dds_sequencer_locked', observation_active=self._observing,
             command_worker_running=self._transport_running(),
+            command_worker_required=True, authority_provider_bound=callable(self._authority),
+            backend_execution_authorized=self._authorized,
+            transport_execution_enabled=self._transport_status().get('execution_enabled'),
             control_ownership_inferred=False,
             explanation='High-level ROS 2 DDS is implemented without TLS. Control ownership, navigation mode and loss-of-command stopping still require verification.')
         return result
 
+    def _transport_status(self):
+        try:
+            value = self._transport.status() if self._transport is not None else {}
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
     def _transport_running(self):
-        return bool(self._transport is not None and self._transport.status().get('worker_running'))
+        return self._transport_status().get('worker_running') is True
 
     def _authority_snapshot(self):
         try:
@@ -79,9 +89,32 @@ class DDSMotionBackend:
     def control_status(self):
         lease = self._authority_snapshot()
         observed = self.feedback.observation()
+        now, age, received = self._clock(), lease.get('age_s'), lease.get('received_monotonic')
+        finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+        valid = (lease.get('owned') is True and lease.get('fresh') is True
+            and finite(age) and 0 <= age <= .5 and finite(received)
+            and 0 <= now - received <= .5 and abs((now - received) - age) <= .1)
+        if 'expires_monotonic' in lease:
+            expiry = lease['expires_monotonic']
+            valid = valid and finite(expiry) and now < expiry
+        transport = self._transport_status()
         return {'owned': lease.get('owned') is True, 'fresh': lease.get('fresh') is True,
             'age_s': lease.get('age_s'), 'feedback_fresh': observed['fresh'],
-            'navigation_mode_confirmed': lease.get('navigation_mode_confirmed') is True}
+            'navigation_mode_confirmed': lease.get('navigation_mode_confirmed') is True,
+            'authority_provider_bound': callable(self._authority), 'authority_valid': bool(valid),
+            'feedback_age_s': observed['age_s'], 'feedback_reason': observed['reason'],
+            'command_worker_required': True, 'command_worker_running': transport.get('worker_running') is True,
+            'backend_execution_authorized': self._authorized,
+            'transport_execution_enabled': transport.get('execution_enabled')}
+
+    def readiness_status(self):
+        """Read current observations without acquiring authority or starting I/O.
+
+        The injected authority provider must expose its already received status
+        snapshot. The production default remains unbound, with no inference from
+        motion feedback, graph discovery or a newly generated timestamp.
+        """
+        return self.control_status()
 
     def _permit(self, request_id, *, navigation=False, action_deadline=None):
         if self._closed or not self._observing or not self._authorized or not validate_contract(self.contract()):

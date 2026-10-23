@@ -8,6 +8,10 @@
 
 生产入口的 `DDSProcessTransport.execution_enabled`、`DDSMotionBackend.execution_authorized`、`MotionPlugin.execution_authorized` 仍固定为 `False`，画布配置不能修改授权。启动动作卡只观察运动反馈，不启动命令 worker、不创建运动命令 publisher，也不自动切换机器人模式。新运动请求仍同步返回 `unavailable`，不创建 ACP pending 任务。
 
+当前生产入口尚未绑定真实 `authority_provider` 和本机控制契约，也没有已授权的命令 worker 启动路径；这部分生产接入尚未完成。仅启用卡片、连接手柄或解除急停无法替代该实现。`readiness` 和 `next_steps` 分别列出卡片生命周期、三层进程授权、机器证据、应用自身要求、控制权适配器、实际反馈年龄和 worker 状态；`execution_available` 必须同时通过这些检查。既有 `blocked_by` 字段保留兼容。
+
+运动只读观察使用独立 `ReaderBridge` 子进程，与传感器/点云读取分开，避免点云转换或该管道积压拖延运动反馈；state 卡继续使用自己的原始数据源。启动和关闭只回收各自观察者，运动反馈的 0.5 秒门槛保持。该隔离不赋予控制权，也不改变厂家协议。
+
 最后已知的 2026-10-22 现场候选为 `55933d8e`；本轮没有真机环境，未连接、查询或替换现场容器。`s10-pro-motion:53e517db`（镜像 ID `sha256:0f3959dd8e3bdaae184591473589dff7e9456e2551d1d4d544fe0c7c9f61db14`）只是更早的历史部署记录，不能当作当前版本。本轮 ARM64 Docker 已通过 710 项测试，以及真实 ROS 2 合成传感器与动作链路；本轮实现尚未部署，模拟结果不代表真机验收。
 
 ## 卡片与数据
