@@ -268,7 +268,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
             if leg is not None:
                 # Once braking starts the stance foot rolls/slips; keep the
                 # estimate that requested the brake instead of integrating noise.
-                leg.observe(joints, raw.ori, now, frozen=brake_started is not None)
+                # Keep integrating through the stop: the coast after the
+                # brake is real travel and must be in the reported endpoint.
+                leg.observe(joints, raw.ori, now)
                 values = joint_angles(joints)
                 if values != last_joints:
                     last_joints, joint_updates = values, joint_updates+1
@@ -490,7 +492,9 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                 raise ValueError('target move timed out')
             estimator.observe(raw, now)
             if leg is not None:
-                leg.observe(joints, raw.ori, now, frozen=brake_started is not None)
+                # Keep integrating through the stop: the coast after the
+                # brake is real travel and must be in the reported endpoint.
+                leg.observe(joints, raw.ori, now)
                 values = joint_angles(joints)
                 if values != last_joints:
                     last_joints, joint_updates = values, joint_updates+1
@@ -527,7 +531,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
             to_x, to_y = target_x-body_x, target_y-body_y
             distance = math.hypot(to_x, to_y)
             bearing = math.atan2(to_y, to_x)
-            heading = angle_delta(origin_yaw, estimator.yaw)
+            heading = angle_delta(estimator.yaw, origin_yaw)
             heading_error = angle_delta(bearing, heading)
             if brake_started is None:
                 if now-motion_started > time_limit:

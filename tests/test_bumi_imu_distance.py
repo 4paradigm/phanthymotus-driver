@@ -416,6 +416,122 @@ def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     assert commands and commands[-1] == (0, 0)
 
 
+def test_target_does_not_turn_when_already_facing_the_point(monkeypatch):
+    clock = [0.0]
+    commands = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+        def _read_distance_imu(self):
+            # Calibration is at yaw 0; by the first motion sample the robot has
+            # turned 90 deg to face the target, which is 90 deg left.
+            yaw = 0.0 if clock[0] < 2.1 else math.pi/2
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=yaw)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            commands.append((vx, vyaw))
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+        def observe(self, joints, quaternion, now, frozen=False):
+            pass
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_target(owner, 0.0, 0.5)
+    driving = [(vx, vyaw) for vx, vyaw in commands if vx or vyaw]
+    assert driving, commands
+    # The origin sample may still be at yaw 0 (a transient turn). Once the
+    # robot faces the point (yaw 90 = bearing), a correct heading calculation
+    # walks forward with no turn. With the old sign the error stays 180 deg
+    # and the turn never returns to zero.
+    assert any(vx > 0 and abs(vyaw) < 1e-9 for vx, vyaw in driving[1:]), commands
+
+
+def test_distance_endpoint_includes_the_stop_slide(monkeypatch):
+    clock = [0.0]
+    commands = []
+
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+        def _read_distance_imu(self):
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+            commands.append((vx, vyaw))
+
+    owner = Owner()
+
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+            self._last = None
+            self._slid = 0.0
+            self._moved = False
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
+            self._slid = 0.0
+            self._moved = False
+        def observe(self, joints, quaternion, now, frozen=False):
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            if owner.command:
+                self._moved = True
+                step = 0.16*dt
+            elif self._moved and self._slid < 0.04:
+                # The stop slide: the robot keeps moving briefly after the
+                # brake command; the endpoint must include it.
+                step = 0.16*dt
+                self._slid += step
+            else:
+                step = 0.0
+            self.position = [self.position[0]+step, self.position[1], self.position[2]]
+            self.velocity = [step/dt, 0.0, 0.0]
+
+    monkeypatch.setattr(module, 'LegOdometry', Leg)
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_distance(owner, 0.5, slip_scale=1.0)
+    assert result['state'] == 'done', result.get('error')
+    # The pre-brake estimate alone would be < 0.57; the slide is now reported.
+    assert result['estimated_distance_m'] >= 0.57
+    assert result['estimated_error_m'] <= -0.05
+
+
 def test_distance_waits_for_parallel_feet_before_braking(monkeypatch):
     plant = Plant(monkeypatch)
     monkeypatch.setattr(module, 'LegOdometry', _phase_leg(plant, 0.50))

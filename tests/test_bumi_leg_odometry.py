@@ -161,6 +161,24 @@ def test_measured_slip_scale_is_applied_by_default():
                                                abs=1e-9)
 
 
+def test_opposite_support_steps_do_not_cancel():
+    estimator = module.LegOdometry(slip_scale=1.0)
+    feet = stand_feet()
+    estimator.observe_feet(feet, IDENTITY, 0.0)
+    second = [[f[0]-0.005, f[1], f[2]] for f in feet]
+    estimator.observe_feet(second, IDENTITY, 0.02)
+    assert estimator.double_support is True
+    assert estimator.position[0] == pytest.approx(0.005, abs=1e-6)
+    # Left foot forward 5 mm, right foot backward 5 mm: equal lengths, opposite
+    # directions. They must not be averaged to zero.
+    third = [[second[0][0]-0.005, second[0][1], second[0][2]],
+             [second[1][0]+0.005, second[1][1], second[1][2]]]
+    estimator.observe_feet(third, IDENTITY, 0.04)
+    assert estimator.double_support is False
+    # The foot continuing the previous body step is used: +5 mm, not 0.
+    assert estimator.position[0] == pytest.approx(0.010, abs=1e-6)
+
+
 def test_foot_gap_and_double_support_are_exposed_for_the_phase_finish():
     estimator = module.LegOdometry(slip_scale=1.0)
     feet = [[0.06, 0.1, -0.48], [0.08, -0.1, -0.48]]

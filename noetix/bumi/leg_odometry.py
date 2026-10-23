@@ -81,6 +81,9 @@ DISTANCE_SLIP_SCALE = LEG_SLIP_SCALE['forward']
 MAX_STEP_M = 0.02
 # Two implied steps this close are treated as double support and averaged.
 DOUBLE_SUPPORT_M = 0.01
+# ...but only when they also point the same way: equal lengths with opposite
+# directions would average to zero and silently drop a real step.
+DOUBLE_SUPPORT_COS = 0.5
 
 
 def _axis_rotation(axis, angle):
@@ -180,6 +183,7 @@ class LegOdometry:
         self.feet = None
         self.foot_gap = None          # fore-aft distance between the contacts
         self.double_support = False   # both feet moving with the body
+        self._last_step = None        # last accepted world step (direction check)
         self._feet = None
         self._rotation = None
         self._time = None
@@ -188,6 +192,7 @@ class LegOdometry:
         """Zero the accumulated position/velocity, keeping the previous feet."""
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
+        self._last_step = None
 
     def reset_baseline(self):
         """Start a fresh motion baseline: zero position and drop the last sample.
@@ -200,6 +205,7 @@ class LegOdometry:
         """
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
+        self._last_step = None
         self._feet = None
         self._rotation = None
         self._time = None
@@ -245,16 +251,40 @@ class LegOdometry:
             limit = MAX_STEP_M/max(1.0, self.slip_scale)
             plausible = [index for index in (0, 1) if lengths[index] <= limit]
             self.foot_gap = feet[0][0]-feet[1][0]
+            both_zero = lengths[0] <= 1e-9 and lengths[1] <= 1e-9
+            cos_directions = None
+            if lengths[0] > 1e-9 and lengths[1] > 1e-9:
+                cos_directions = (sum(deltas[0][i]*deltas[1][i] for i in range(3))
+                                  / (lengths[0]*lengths[1]))
+            directions_agree = (both_zero or (cos_directions is not None
+                                              and cos_directions >= DOUBLE_SUPPORT_COS))
             self.double_support = (len(plausible) == 2
-                                   and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M)
+                                   and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M
+                                   and directions_agree)
             if plausible:
-                if len(plausible) == 2 and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M:
+                if self.double_support:
                     delta = [(deltas[0][i]+deltas[1][i])/2 for i in range(3)]
+                elif (len(plausible) == 2 and not directions_agree
+                      and self._last_step is not None):
+                    # Opposite implied steps must not average to zero: pick
+                    # the foot that continues the previous body motion.
+                    def _alignment(index):
+                        length = lengths[index]
+                        if length <= 1e-9:
+                            return -1.0
+                        last = math.hypot(*self._last_step)
+                        if last <= 1e-9:
+                            return 0.0
+                        return sum(deltas[index][i]*self._last_step[i]
+                                   for i in range(3))/(length*last)
+                    best = max(plausible, key=_alignment)
+                    delta = deltas[best]
                 else:
                     best = min(plausible, key=lambda index: lengths[index])
                     delta = deltas[best]
                 delta = [value*self.slip_scale for value in delta]
                 self.position = [self.position[i]+delta[i] for i in range(3)]
+                self._last_step = list(delta)
                 self.velocity = [value/dt for value in delta]
                 self.stance_samples += 1
             else:
