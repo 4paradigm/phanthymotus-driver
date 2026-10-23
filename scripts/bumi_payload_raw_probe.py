@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -20,6 +21,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import urllib.request
 
 # Reconstructed from the shipped generated header. The generated XTypes map
 # and info blobs MUST exactly match that header before compilation proceeds.
@@ -101,13 +105,17 @@ static void failure(const std::string& code, const std::string& message) {
 }
 
 struct Bounds {
-    std::array<double, 21> low{}, high{};
-    std::array<unsigned, 21> count{};
+    std::array<double, 21> low{}, high{}, mean{}, m2{};
+    std::array<unsigned, 21> count{}, zero{};
     void add(unsigned id, double value) {
         if (id >= 21 || !std::isfinite(value)) return;
         if (!count[id]) low[id] = high[id] = value;
         else { low[id] = std::min(low[id], value); high[id] = std::max(high[id], value); }
         ++count[id];
+        if (value == 0.0) ++zero[id];
+        double delta = value - mean[id];
+        mean[id] += delta / count[id];
+        m2[id] += delta * (value - mean[id]);
     }
     void print(const std::string& side, unsigned first) const {
         std::cout << quote(side) << ":[";
@@ -117,6 +125,12 @@ struct Bounds {
             if (count[j]) number(low[j]); else std::cout << "null";
             std::cout << ",\"max\":";
             if (count[j]) number(high[j]); else std::cout << "null";
+            std::cout << ",\"mean\":";
+            if (count[j]) number(mean[j]); else std::cout << "null";
+            std::cout << ",\"population_stddev\":";
+            if (count[j]) number(std::sqrt(std::max(0.0, m2[j] / count[j]))); else std::cout << "null";
+            std::cout << ",\"zero_count\":" << zero[j] << ",\"zero_fraction\":";
+            if (count[j]) number(double(zero[j]) / count[j]); else std::cout << "null";
             std::cout << '}';
         }
         std::cout << ']';
@@ -215,10 +229,11 @@ int main(int argc, char** argv) {
         dds::sub::DataReader<RobotStatus::StatusData> reader(subscriber, topic, reader_qos);
         Bounds bounds;
         unsigned count = 0, mapping_failures = 0;
-        unsigned timestamp_changes = 0;
+        unsigned timestamp_changes = 0, timestamp_repeats = 0, timestamp_regressions = 0, all_arm_zero_frames = 0, invalid_arm_frames = 0;
         int64_t previous_stamp = 0;
         double last_print = -1;
         std::map<unsigned, std::set<unsigned>> errors;
+        std::map<unsigned, unsigned> workmodes;
         auto begin = Clock::now();
         while (!interrupted && elapsed(begin) < seconds) {
             auto samples = reader.take();
@@ -230,17 +245,32 @@ int main(int argc, char** argv) {
                 }
                 ++count;
                 const auto& data = sample.data();
+                ++workmodes[data.workmode()];
                 const auto& motors = data.motorstatearray().motorstates();
                 std::set<unsigned> ids;
                 for (const auto& motor : motors) {
                     ids.insert(motor.motor_id());
-                    bounds.add(motor.motor_id(), motor.tau());
                     if (motor.error()) errors[motor.motor_id()].insert(motor.error());
                 }
                 bool mapping_ok = motors.size() == 21 && ids.size() == 21 && *ids.begin() == 0 && *ids.rbegin() == 20;
                 if (!mapping_ok) ++mapping_failures;
+                bool arm_valid = mapping_ok, arm_zero = true;
+                if (mapping_ok) for (const auto& motor : motors) {
+                    bounds.add(motor.motor_id(), motor.tau());
+                    const auto id = motor.motor_id();
+                    if (id < 4 || (id >= 10 && id < 14)) {
+                        if (!std::isfinite(motor.tau())) arm_valid = false;
+                        if (motor.tau() != 0.0) arm_zero = false;
+                    }
+                }
+                if (!arm_valid) ++invalid_arm_frames;
+                else if (arm_zero) ++all_arm_zero_frames;
                 const auto stamp = data.motorstatearray().timestamp();
-                if (count > 1 && stamp != previous_stamp) ++timestamp_changes;
+                if (count > 1) {
+                    if (stamp != previous_stamp) ++timestamp_changes;
+                    else ++timestamp_repeats;
+                    if (stamp < previous_stamp) ++timestamp_regressions;
+                }
                 previous_stamp = stamp;
                 if (elapsed(begin) - last_print >= 1.0) {
                     last_print = elapsed(begin);
@@ -266,7 +296,25 @@ int main(int argc, char** argv) {
         std::cout << "{\"event\":\"summary\",\"cancelled\":" << (interrupted ? "true" : "false")
                   << ",\"received_dds_samples\":" << count << ",\"host_span_s\":";
         number(elapsed(begin));
-        std::cout << ",\"motor_timestamp_changes\":" << timestamp_changes << ",\"mapping_failures\":" << mapping_failures << ',';
+        std::cout << ",\"host_monotonic_start_s\":";
+        number(std::chrono::duration<double>(begin.time_since_epoch()).count());
+        std::cout << ",\"host_monotonic_end_s\":";
+        number(std::chrono::duration<double>(Clock::now().time_since_epoch()).count());
+        std::cout << ",\"all_arm_zero_frames\":" << all_arm_zero_frames
+                  << ",\"invalid_arm_frames\":" << invalid_arm_frames << ",\"all_arm_zero_fraction\":";
+        if (count > invalid_arm_frames) number(double(all_arm_zero_frames) / (count-invalid_arm_frames));
+        else std::cout << "null";
+        std::cout << ",\"motor_timestamp_changes\":" << timestamp_changes
+                  << ",\"motor_timestamp_repeats\":" << timestamp_repeats
+                  << ",\"motor_timestamp_regressions\":" << timestamp_regressions
+                  << ",\"mapping_failures\":" << mapping_failures << ",\"workmode_counts\":{";
+        bool first_mode = true;
+        for (const auto& entry : workmodes) {
+            if (!first_mode) std::cout << ',';
+            first_mode = false;
+            std::cout << quote(std::to_string(entry.first)) << ':' << entry.second;
+        }
+        std::cout << "},";
         bounds.print("left_arm_tau", 0); std::cout << ','; bounds.print("right_arm_tau", 10);
         std::cout << ",\"nonzero_error_codes\":{";
         bool first_error = true;
@@ -295,6 +343,93 @@ int main(int argc, char** argv) {
 }
 '''
 
+
+
+def _finite(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def torque_statistics(samples):
+    """Every finite reading is retained, including exact zeros. No peak picking."""
+    sides = {}
+    for side, first in (("left_arm_tau", 0), ("right_arm_tau", 10)):
+        axes = []
+        for joint in range(first, first + 4):
+            values = [s["tau"][joint] for s in samples]
+            if values:
+                scale = max(abs(v) for v in values)
+                normalized = [v / scale for v in values] if scale else [0.0] * len(values)
+                center = math.fsum(normalized) / len(values)
+                mean = center * scale
+                deviation = math.sqrt(math.fsum((v - center) ** 2 for v in normalized) / len(values)) * scale
+                zero = sum(v == 0 for v in values)
+                axes.append({"motor_id": joint, "count": len(values), "min": min(values),
+                             "max": max(values), "mean": mean, "population_stddev": deviation,
+                             "zero_count": zero, "zero_fraction": zero / len(values)})
+            else:
+                axes.append({"motor_id": joint, "count": 0, "min": None, "max": None,
+                             "mean": None, "population_stddev": None, "zero_count": 0, "zero_fraction": None})
+        sides[side] = axes
+    return sides
+
+
+class MCPObserver:
+    """Only read payload_mass.info in the existing driver. No SDK initialization."""
+    def __init__(self, url):
+        self.url = url
+        self.samples = {}
+        self.poll_count = 0
+        self.errors = []
+        self.cancel = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="payload_mcp_observer", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.cancel.set()
+        self.thread.join(timeout=2)
+        if self.thread.is_alive():
+            raise ValueError("MCP observer did not stop")
+
+    def _run(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "payload_mass", "arguments": {"action": "info"}}}).encode()
+        while not self.cancel.is_set():
+            started = time.monotonic()
+            self.poll_count += 1
+            try:
+                request = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=1) as response:
+                    envelope = json.load(response)
+                payload = json.loads(envelope["result"]["content"][0]["text"])
+                sample = payload["diagnostics"]["latest"]
+                if (not isinstance(sample, dict) or not _finite(sample.get("host_monotonic_s"))
+                        or type(sample.get("serial")) is not int
+                        or sample.get("motor_ids") != list(range(21))
+                        or not isinstance(sample.get("tau"), list) or len(sample["tau"]) != 21
+                        or not all(_finite(v) for v in sample["tau"])):
+                    raise ValueError("getter observation missing/invalid")
+                self.samples[(sample["serial"], sample["host_monotonic_s"])] = sample
+                if len(self.samples) > 512:
+                    self.samples.pop(next(iter(self.samples)))
+            except Exception as exc:
+                self.errors.append(str(exc)[:200])
+                self.errors = self.errors[-8:]
+            self.cancel.wait(max(0, 0.1 - (time.monotonic() - started)))
+
+    def summary(self, start, end):
+        samples = [s for s in self.samples.values() if start <= s["host_monotonic_s"] <= end]
+        mode_counts = {}
+        for sample in samples:
+            key = str(sample.get("workmode"))
+            mode_counts[key] = mode_counts.get(key, 0) + 1
+        zero = sum(all(s["tau"][j] == 0 for j in (0, 1, 2, 3, 10, 11, 12, 13)) for s in samples)
+        return {"comparison_type": "overlapping_host_monotonic_windows_not_frame_aligned",
+                "poll_count": self.poll_count, "unique_getter_observations_in_window": len(samples),
+                "all_arm_zero_observations": zero, "all_arm_zero_fraction": zero / len(samples) if samples else None,
+                "workmode_counts": mode_counts, "recent_errors": list(self.errors),
+                "effective_sample_count": None, **torque_statistics(samples)}
 
 def architecture(machine):
     if machine in ("aarch64", "arm64"):
@@ -387,6 +522,8 @@ def main():
     parser.add_argument("--discovery-seconds", type=float, default=4)
     parser.add_argument("--topic", default="", help="optional discovered status topic filter")
     parser.add_argument("--summary-only", action="store_true", help="show final bounds/errors, not every motor snapshot")
+    parser.add_argument("--compare-mcp", action="store_true", help="concurrently read the existing driver info; never initializes SDK")
+    parser.add_argument("--mcp-url", default="http://127.0.0.1:15704/mcp")
     args = parser.parse_args()
     if not 0 <= args.domain <= 200 or not 1 <= args.seconds <= 30 or not 1 <= args.discovery_seconds <= 15:
         parser.error("domain must be 0..200, seconds 1..30, discovery-seconds 1..15")
@@ -404,10 +541,19 @@ def main():
         with tempfile.TemporaryDirectory(prefix="bumi-payload-raw-probe-") as folder:
             executable = build_probe(args.sdk_root, libs, folder)
             command = [str(executable), str(args.domain), str(args.seconds), str(args.discovery_seconds), args.topic]
-            completed = subprocess.run(command, capture_output=True, text=True,
-                                       timeout=args.seconds + args.discovery_seconds + 8)
+            observer = MCPObserver(args.mcp_url) if args.compare_mcp else None
+            if observer is not None:
+                observer.start()
+            try:
+                completed = subprocess.run(command, capture_output=True, text=True,
+                                           timeout=args.seconds + args.discovery_seconds + 8)
+            finally:
+                if observer is not None:
+                    observer.stop()
             for line in completed.stdout.splitlines():
                 event = json.loads(line)
+                if event.get("event") == "summary" and observer is not None:
+                    event["sdk_getter_window"] = observer.summary(event["host_monotonic_start_s"], event["host_monotonic_end_s"])
                 if not args.summary_only or event.get("event") in ("summary", "error"):
                     print(json.dumps(event), flush=True)
             if completed.stderr:

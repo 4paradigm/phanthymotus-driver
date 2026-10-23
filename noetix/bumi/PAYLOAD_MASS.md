@@ -320,3 +320,17 @@ python3 -m pytest tests/test_bumi_payload_raw_probe.py -q -p no:cacheprovider
 未提供路径时，纯Python检查仍运行，原生DDS测试标记skip；不能将skip写成通过。
 原生测试验证带符号力矩、零数据、无发布者、重复来源、ID错误、NaN、原始错误码保留和取消。
 这些是测试数据，不代表真机反馈已验证。
+
+
+原始DDS已出现非零tau、getter抽样仍为零时，可用并行只读对照：
+
+```bash
+docker exec -i embodied-noetix-bumi python3 - --domain 0 --seconds 6 --summary-only --compare-mcp \
+  < /tmp/bumi_payload_raw_probe.py
+```
+
+工具保留包括精确零在内的全部采样，输出每轴zero_fraction、mean、population_stddev，
+全臂全零帧占比、模式计数及源时间戳重复/回退计数。不会删除零值或选峰值来制造质量。
+`--compare-mcp`只查询现有payload_mass.info，去重SDK主机观测，并只统计原始采集的
+重叠主机单调时钟窗口；它不是逐帧对齐，读数差异不能直接判定SDK或固件故障。
+DDS消息数不等于独立电机测量数。原始和getter都出现非零也仍需姿态/负载响应验证与标定。
