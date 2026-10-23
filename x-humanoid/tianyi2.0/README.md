@@ -198,11 +198,18 @@ for odometry feedback; verify physical motion with `loco_state`.
 Input TTL is an admission check: an already-stale command is still dropped and
 cannot resume motion or renew the watchdog. Once admitted, a command no longer
 stops motion at its producer's per-frame TTL (commonly 200ms). Its execution
-lease instead ends 300ms after the original ROS/bridge callback receipt, or at
+lease instead ends 1000ms after the original ROS/bridge callback receipt, or at
 `obs_stamp_ms + 500ms`, whichever is sooner. Continuous fresh 10Hz input replaces
-that bounded lease; no new valid command for 300ms stops motion. IPC, local queue
+that bounded lease; no new valid command for 1000ms stops motion. IPC, local queue
 and SDK reply time consume the original receive budget, never renew it. This is
 a bounded streaming watchdog, not unlimited reuse of the last velocity.
+The 500ms observation limit remains independent: a fresh receipt based on an
+older observation can stop sooner than the one-second silence threshold. This
+change does not promise to hold motion for a full second after observations
+expire. `control_interface.rate.watchdog_ms` reports 1000; the observation limit
+still reports 500.
+Deploy Python and the native worker together in the rebuilt driver image;
+older native workers reject remaining leases above 300ms.
 Python uses the original monotonic receipt time for its silence watchdog; the
 native layer receives the remaining bounded execution deadline and independently
 stops when that lease expires
@@ -211,7 +218,7 @@ spinning. It never holds a queue of old velocity commands or reconnects/replays
 a failed request. A blocked SDK reply times out (default 250ms), kills the worker
 and pauses the card. While the worker owns a motion action it enables the
 firmware's one-second heartbeat and refreshes it only within a live command
-lease. This is a **seconds-resolution backup**, not a claim of a 300ms stop
+lease. This is a **seconds-resolution backup**, not a guarantee of an exact one-second stop
 after a process crash or network failure. Firmware heartbeat behavior must be
 checked on hardware. On an ambiguous failure, handover waits 1.5 seconds for
 that firmware lease before another card is permitted to act. A faulted worker
@@ -229,7 +236,7 @@ has expired also requires a stop. The
 native worker reports `EXPIRED` only after its stop/cancel succeeds; in that
 case the card resets its output/ramp and can accept a subsequent fresh command
 without restarting the worker. A failed stop, transport/ownership error, or a
-lease over 300ms still follows the fatal pause/firmware-handover path. Expiry
+lease over 1000ms still follows the fatal pause/firmware-handover path. Expiry
 before IPC also requires a confirmed stop before the next motion is accepted.
 `backend.expired_commands`, `last_expired_error`, and `last_write` distinguish
 expiry from faults and expose the lease remaining before IPC and the latest
@@ -253,7 +260,7 @@ every other command just because a vendor call took 70ms of its 100ms period.
 When transport bunches arrivals closer than 50ms, the newest motion stays in
 the bounded inbox until the next permitted apply slot instead of being thrown
 away. Explicit zero always bypasses that pacing. Input TTL freshness,
-observation-age limits and the 300ms receive watchdog remain enforced.
+observation-age limits and the 1000ms receive watchdog remain enforced.
 
 The ROS/MCP facade now runs the existing velocity controller in a separate
 Python process (`loco_servo_process.py`), rather than in the camera bundle's
@@ -321,7 +328,7 @@ measures generation-to-driver-callback age; `local_wait_ms` measures callback-to
 submission delay, including any synchronous stop before submission. These
 measurements are tied to that selected frame, even if a newer one has arrived.
 `dispatch.execution_deadline_basis` and the same field in `last_command_timing`
-are `receive_watchdog_and_observation`; `receive_watchdog_ms` is 300. `ttl_ms`
+are `receive_watchdog_and_observation`; `receive_watchdog_ms` is 1000. `ttl_ms`
 remains the producer's input freshness limit and is not the execution lease.
 Continuous
 publication alone cannot guarantee continuous motion: expired observations,

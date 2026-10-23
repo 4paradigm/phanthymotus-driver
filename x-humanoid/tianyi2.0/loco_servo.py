@@ -16,7 +16,7 @@ from common.control import ControlSink, parse_descriptor
 from slamtec_velocity import CommandLeaseExpired, SlamtecVelocityBackend
 
 INPUT_TOPIC = "/actucore/navi/cmd"
-WATCHDOG_MS = 300
+WATCHDOG_MS = 1000
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 
 
@@ -697,7 +697,7 @@ class LocoServoPlugin:
                 self._record("HOLD", "receive watchdog or observation deadline expired")
             if self._last_valid_at is not None and time.monotonic() - self._last_valid_at >= WATCHDOG_MS / 1000:
                 self._hold()
-                self._record("HOLD", "no valid command for 300 ms")
+                self._record("HOLD", f"no valid command for {WATCHDOG_MS} ms")
             self._sink.tick()
 
     def _configure(self, args):

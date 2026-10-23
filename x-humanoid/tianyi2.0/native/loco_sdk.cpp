@@ -67,9 +67,9 @@ int main(int argc, char** argv) {
                             if (lease_ms <= 0)
                                 throw CommandLeaseExpired("command lease expired at worker: remaining_ms=" +
                                                           std::to_string(lease_ms));
-                            if (lease_ms > 300)
+                            if (lease_ms > 1000)
                                 throw std::runtime_error("excessive command lease: remaining_ms=" +
-                                                         std::to_string(lease_ms) + ", limit_ms=300");
+                                                         std::to_string(lease_ms) + ", limit_ms=1000");
                             auto deadline = VelocitySession<SlamwareAdapter>::Clock::now() +
                                             std::chrono::milliseconds(lease_ms);
                             if (vx == 0 && wz == 0) session.stop();

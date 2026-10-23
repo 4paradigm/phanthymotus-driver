@@ -17,14 +17,14 @@ from test_tianyi_loco_servo_process import (
 from test_tianyi_sdk_worker import native_worker
 
 
-def test_accepted_command_survives_its_200ms_ttl_until_receive_watchdog(setup):
+def test_accepted_command_survives_ttl_and_old_watchdog_but_respects_observation_age(setup):
     plugin = start(setup)
     original = command(setup)
     received = setup.clock.monotonic()
     send(plugin, original)
     writes = list(plugin._backend.messages)
 
-    assert plugin._backend.deadlines[-1] == original["stamp_ms"] + 300
+    assert plugin._backend.deadlines[-1] == original["obs_stamp_ms"] + 500
     assert plugin._last_valid_at == received
     setup.clock.advance(0.21)
     plugin._tick()
@@ -36,7 +36,12 @@ def test_accepted_command_survives_its_200ms_ttl_until_receive_watchdog(setup):
 
     setup.clock.advance(0.03)
     plugin._tick()
+    assert plugin._backend.messages == writes  # No stop at the old 300ms limit.
+    assert plugin._last_valid_at == received
+    setup.clock.advance(0.20)
+    plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
+    assert "observation deadline expired" in plugin._last["reason"]
     assert len(plugin._backend.deadlines) == 1
     assert plugin._last_valid_at is None
 
@@ -46,7 +51,7 @@ def test_fresh_10hz_commands_extend_receive_deadline_without_restarting_output(s
     for sequence in range(1, 12):
         payload = command(setup, seq=sequence)
         send(plugin, payload)
-        assert plugin._backend.deadlines[-1] == pytest.approx(payload["stamp_ms"] + 300, abs=1)
+        assert plugin._backend.deadlines[-1] == pytest.approx(payload["obs_stamp_ms"] + 500, abs=1)
         setup.clock.advance(0.1)
         plugin._tick()
     assert plugin._counts["accepted"] == 11
@@ -64,21 +69,21 @@ def test_ipc_or_inbox_wait_spends_original_receive_budget(setup):
     timing = plugin._info()["last_command_timing"]
     assert timing["local_wait_ms"] == pytest.approx(120)
     assert timing["execution_deadline_basis"] == "receive_watchdog_and_observation"
-    assert timing["receive_watchdog_ms"] == 300
-    assert timing["remaining_before_apply_ms"] == pytest.approx(180, abs=1)
-    assert plugin._backend.deadlines[-1] == pytest.approx(payload["stamp_ms"] + 300, abs=1)
+    assert timing["receive_watchdog_ms"] == 1000
+    assert timing["remaining_before_apply_ms"] == pytest.approx(380, abs=1)
+    assert plugin._backend.deadlines[-1] == pytest.approx(payload["obs_stamp_ms"] + 500, abs=1)
     assert plugin._last_valid_at == original_receipt
 
-    setup.clock.advance(0.19)
+    setup.clock.advance(0.39)
     plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
 
 
-def test_frame_waiting_longer_than_watchdog_cannot_start_motion(setup):
+def test_frame_waiting_longer_than_observation_limit_cannot_start_motion(setup):
     plugin = start(setup)
     payload = command(setup, ttl_ms=1000)
     plugin._on_message(types.SimpleNamespace(data=json.dumps(payload)))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     plugin._tick()
     assert not any(any(values) for values in plugin._backend.messages)
     assert plugin._counts["accepted"] == 0
@@ -99,8 +104,8 @@ def test_sdk_acknowledgement_cannot_start_a_new_receive_watchdog(setup, monkeypa
     send(plugin, command(setup))
     assert plugin._counts["accepted"] == 1
     assert plugin._last_valid_at == original_receipt
-    assert plugin._info()["last_command_timing"]["remaining_after_apply_ms"] == pytest.approx(70, abs=1)
-    setup.clock.advance(0.08)
+    assert plugin._info()["last_command_timing"]["remaining_after_apply_ms"] == pytest.approx(270, abs=1)
+    setup.clock.advance(0.28)
     plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
 
@@ -127,7 +132,7 @@ def test_unaccepted_frames_do_not_refresh_receive_watchdog(setup, invalid):
     assert plugin._lease_expiry_ms == original_deadline
     assert len(plugin._backend.deadlines) == 1
     assert any(plugin._backend.messages[-1])
-    setup.clock.advance(0.16)
+    setup.clock.advance(0.36)
     plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
 
@@ -163,17 +168,22 @@ def test_zero_and_pause_still_stop_before_receive_watchdog(setup, stop_kind):
 def test_real_control_process_passes_receive_budget_to_native_and_stops_on_silence(process_setup):
     card = process_setup.create()
     # A short, still-valid producer TTL makes the two limits easy to separate
-    # without depending on the last few milliseconds of the 300ms watchdog.
+    # without depending on the last few milliseconds of the 500ms observation limit.
     original = process_command(ttl_ms=100)
     process_send(card, original)
     first = wait_info(card, lambda item: item["counts"]["accepted"] == 1)
-    assert first["backend"]["last_write"]["lease_remaining_ms"] > 200
+    assert first["control_interface"]["rate"]["watchdog_ms"] == 1000
+    assert first["control_interface"]["rate"]["max_obs_age_ms"] == 500
+    assert first["backend"]["last_write"]["lease_remaining_ms"] > 300
     original_expiry = original["stamp_ms"] + original["ttl_ms"]
     while int(time.time() * 1000) < original_expiry + 40:
         time.sleep(0.005)
+    while int(time.time() * 1000) < original["stamp_ms"] + 330:
+        time.sleep(0.005)
     during = card.dispatch("info", {})
-    assert any(during["output"])
+    assert any(during["output"])  # Old 300ms silence limit no longer stops motion.
     assert during["counts"]["holds"] == 0
+    assert stats(during)["confirmed_stops"] == 0
 
     process_send(card, process_command(seq=2))
     second = wait_info(card, lambda item: item["counts"]["accepted"] == 2)

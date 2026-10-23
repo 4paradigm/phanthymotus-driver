@@ -318,7 +318,7 @@ def test_worker_dispatches_continuous_stream_without_spinning_ros(setup, monkeyp
     timing = plugin._info()["last_command_timing"]
     assert timing["command_age_ms"] == timing["observation_age_ms"] == 0
     assert timing["apply_round_trip_ms"] == pytest.approx(70)
-    assert 229 <= timing["remaining_after_apply_ms"] <= 231
+    assert 429 <= timing["remaining_after_apply_ms"] <= 431
 
 
 def test_worker_receives_latest_while_sdk_waits_and_keeps_receipt_deadline(setup, monkeypatch):
@@ -350,13 +350,13 @@ def test_worker_receives_latest_while_sdk_waits_and_keeps_receipt_deadline(setup
         info = plugin.dispatch("info", {})
         assert info["counts"]["accepted"] == 2
         assert info["last_command_timing"]["seq"] == 41
-        assert backend.deadlines[-1] == pytest.approx(newest["stamp_ms"] + 300, abs=1)
+        assert backend.deadlines[-1] == pytest.approx(newest["stamp_ms"] + 500, abs=1)
         assert info["counts"]["holds"] == 0
     finally:
         release.set()
 
 
-def test_worker_watchdog_stops_without_ros_callbacks_and_never_replays(setup, monkeypatch):
+def test_worker_observation_deadline_stops_without_ros_callbacks_and_never_replays(setup, monkeypatch):
     plugin = start(setup)
     backend = plugin._backend
     applied, stopped = threading.Event(), threading.Event()
@@ -374,14 +374,14 @@ def test_worker_watchdog_stops_without_ros_callbacks_and_never_replays(setup, mo
     plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)))
     assert applied.wait(1)
     plugin.dispatch("info", {})  # Wait until the accepted-state update completes.
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     plugin._controller_wake.set()
     assert stopped.wait(1)
     info = plugin.dispatch("info", {})
     assert info["output"] == [0] * 6
     assert info["last"]["verdict"] == "HOLD"
     assert len(backend.deadlines) == 1
-    assert backend.deadlines[0] == pytest.approx(cmd["stamp_ms"] + 300, abs=1)
+    assert backend.deadlines[0] == pytest.approx(cmd["stamp_ms"] + 500, abs=1)
 
 
 def test_worker_zero_command_bypasses_motion_pacing(setup, monkeypatch):
@@ -576,7 +576,7 @@ def test_bunched_arrivals_keep_latest_until_next_apply_slot(setup):
     assert plugin._counts["accepted"] == 2
     assert plugin._counts["dropped"] == 0
     assert plugin._last["requested"] == latest["values"]
-    assert plugin._backend.deadlines[-1] == pytest.approx(latest["stamp_ms"] + 300, abs=1)
+    assert plugin._backend.deadlines[-1] == pytest.approx(latest["stamp_ms"] + 500, abs=1)
     assert plugin._counts["holds"] == 0
 
 
@@ -626,7 +626,7 @@ def test_control_timer_takes_only_latest_motion_with_original_receipt_deadline(s
     plugin._tick()
     assert plugin._counts["received"] == plugin._counts["accepted"] == 1
     assert plugin._last["requested"][0] == 0.25
-    assert plugin._backend.deadlines == pytest.approx([latest["stamp_ms"] + 300], abs=1)
+    assert plugin._backend.deadlines == pytest.approx([latest["stamp_ms"] + 500], abs=1)
     assert plugin._info()["input_queue"]["pending"] == 0
     assert plugin._info()["input_queue"]["processed"] == 1
 
@@ -652,10 +652,10 @@ def test_timing_separates_input_ttl_age_from_receipt_watchdog_budget(setup):
     assert timing["receive_age_ms"] == 90
     assert timing["local_wait_ms"] == pytest.approx(30)
     assert timing["command_age_ms"] == 120
-    assert timing["remaining_before_apply_ms"] == pytest.approx(270, abs=1)
+    assert timing["remaining_before_apply_ms"] == pytest.approx(470, abs=1)
     assert timing["execution_deadline_basis"] == "receive_watchdog_and_observation"
-    assert timing["receive_watchdog_ms"] == 300
-    assert plugin._backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 90 + 300, abs=1)
+    assert timing["receive_watchdog_ms"] == 1000
+    assert plugin._backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 90 + 500, abs=1)
 
 
 def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):
@@ -712,7 +712,7 @@ def test_timer_does_not_replay_last_motion_or_refresh_receipt_watchdog_without_n
     setup.clock.advance(0.1)
     plugin._tick()
     assert plugin._backend.messages == before
-    setup.clock.advance(0.21)
+    setup.clock.advance(0.41)
     plugin._tick()
     assert plugin._backend.messages[-1] == [0] * 6
     assert len(plugin._backend.deadlines) == 1
@@ -753,14 +753,14 @@ def test_invalid_commands_never_reach_body(setup, extra):
     assert plugin._counts["accepted"] == 0
 
 
-def test_replayed_stale_and_invalid_frames_do_not_feed_watchdog(setup):
+def test_replayed_stale_and_invalid_frames_do_not_extend_execution_deadline(setup):
     plugin = start(setup)
     original = command(setup)
     send(plugin, original)
     count = len(plugin._backend.messages)
     send(plugin, original)
     assert len(plugin._backend.messages) == count
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     send(plugin, command(setup, seq=2, stamp_ms=int(setup.clock.time() * 1000) - 250))
     plugin._on_message(types.SimpleNamespace(data="bad json"))
     plugin._tick()
@@ -881,7 +881,7 @@ def test_publish_error_is_visible_and_pauses_instead_of_counting_success(setup):
 def test_atomic_expiry_update_avoids_the_extra_stop_round_trip(setup, monkeypatch, atomic):
     plugin = start(setup, atomic_expiry_update=atomic)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     backend = plugin._backend
     original_stop = backend.stop
     def slow_stop():
@@ -894,8 +894,8 @@ def test_atomic_expiry_update_avoids_the_extra_stop_round_trip(setup, monkeypatc
         assert plugin._counts["accepted"] == 2
         assert plugin._counts["holds"] == 0
         assert backend.expiry_updates == [False, True]
-        assert backend.deadlines[-1] == pytest.approx(fresh["stamp_ms"] + 150 + 300, abs=1)
-        assert plugin._info()["last_command_timing"]["remaining_after_apply_ms"] == pytest.approx(300, abs=1)
+        assert backend.deadlines[-1] == pytest.approx(fresh["stamp_ms"] + 150 + 500, abs=1)
+        assert plugin._info()["last_command_timing"]["remaining_after_apply_ms"] == pytest.approx(500, abs=1)
     else:
         assert plugin._counts["accepted"] == 1
         assert plugin._counts["holds"] >= 1
@@ -911,7 +911,7 @@ def test_atomic_expiry_update_restarts_both_ramps_from_zero(setup):
         send(plugin, command(setup, seq=seq))
         setup.clock.advance(0.1)
     assert plugin._last_output[0] > 0.15 and plugin._last_output[5] > 0.3
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     send(plugin, command(setup, seq=9))
     assert plugin._backend.expiry_updates[-1] is True
     assert plugin._last_output == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
@@ -938,7 +938,7 @@ def test_invalid_fresh_frame_cannot_use_atomic_expiry_update(setup, extra):
 def test_atomic_expiry_update_does_not_replace_zero_pause_or_handover_stops(setup):
     plugin = start(setup, atomic_expiry_update=True)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     send(plugin, command(setup, [0] * 6, seq=2))
     assert plugin._backend.expiry_updates == [False]
     assert plugin._backend.messages[-1] == [0] * 6
@@ -955,7 +955,7 @@ def test_atomic_expiry_update_does_not_replace_zero_pause_or_handover_stops(setu
 def test_failed_atomic_expiry_update_still_pauses_and_requires_confirmed_stop(setup):
     plugin = start(setup, atomic_expiry_update=True)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     plugin._backend.fail = True
     send(plugin, command(setup, seq=2))
     assert plugin._paused and plugin._zero_pending
@@ -981,7 +981,7 @@ def queue_during_stop(setup, plugin, monkeypatch, make_command):
 def test_newer_motion_arriving_during_stop_replaces_selected_aging_frame(setup, monkeypatch):
     plugin = start(setup)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     now = int(setup.clock.time() * 1000)
     aging = command(setup, seq=2, stamp_ms=now - 150)
     latest = queue_during_stop(setup, plugin, monkeypatch, lambda: command(
@@ -989,7 +989,7 @@ def test_newer_motion_arriving_during_stop_replaces_selected_aging_frame(setup, 
     send(plugin, aging)
     assert plugin._counts["accepted"] == 2
     assert plugin._last["requested"] == latest["values"]
-    assert plugin._backend.deadlines[-1] == pytest.approx(latest["stamp_ms"] + 300, abs=1)
+    assert plugin._backend.deadlines[-1] == pytest.approx(latest["stamp_ms"] + 500, abs=1)
     assert plugin._counts["received"] == 3
     assert plugin._counts["dropped"] == plugin._counts["refreshed_after_stop"] == 1
     assert plugin._inbox.info()["processed"] == 3
@@ -999,7 +999,7 @@ def test_newer_motion_arriving_during_stop_replaces_selected_aging_frame(setup, 
 def test_zero_arriving_during_stop_prevents_selected_motion_from_resuming(setup, monkeypatch):
     plugin = start(setup)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     latest = queue_during_stop(setup, plugin, monkeypatch, lambda: command(setup, [0] * 6, seq=3))
     send(plugin, command(setup, seq=2))
     assert plugin._last["requested"] == latest["values"] == [0] * 6
@@ -1018,7 +1018,7 @@ def test_zero_arriving_during_stop_prevents_selected_motion_from_resuming(setup,
 def test_refreshed_motion_still_requires_the_full_contract(setup, monkeypatch, extra, verdict):
     plugin = start(setup)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     def refreshed():
         kwargs = dict(extra)
         age = kwargs.pop("stamp_age_ms", 0)
@@ -1039,7 +1039,7 @@ def test_refreshed_motion_still_requires_the_full_contract(setup, monkeypatch, e
 def test_unrelated_or_unordered_motion_stays_queued_after_stop(setup, monkeypatch, extra):
     plugin = start(setup)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     queue_during_stop(setup, plugin, monkeypatch, lambda: command(setup, seq=3) | extra)
     send(plugin, command(setup, seq=2))
     assert plugin._last["requested"] == [0.2, 0, 0, 0, 0, 0.4]
@@ -1069,7 +1069,7 @@ def test_refresh_cannot_bypass_source_arbitration_for_a_pending_zero(setup, monk
 def test_unconfirmed_stop_does_not_consume_a_new_motion_for_refresh(setup, monkeypatch):
     plugin = start(setup)
     send(plugin, command(setup))
-    setup.clock.advance(0.31)
+    setup.clock.advance(0.51)
     queued = []
     def failed_stop():
         if not queued:
@@ -1117,7 +1117,7 @@ def test_native_expiry_stops_without_latching_and_accepts_only_a_fresh_command(s
     send(plugin, fresh)
     assert backend.write == original_write
     assert backend.messages[-1] == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
-    assert backend.deadlines[-1] == pytest.approx(fresh["stamp_ms"] + 300, abs=1)
+    assert backend.deadlines[-1] == pytest.approx(fresh["stamp_ms"] + 500, abs=1)
     assert plugin._counts["accepted"] == 2
 
 
@@ -1401,7 +1401,7 @@ def test_sdk_lease_uses_receipt_watchdog_and_observation_deadline(setup):
     plugin = start(setup)
     cmd = command(setup, ttl_ms=150)
     send(plugin, cmd)
-    assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 300, abs=1)
+    assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 500, abs=1)
     setup.clock.advance()
     cmd = command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 450)
     send(plugin, cmd)

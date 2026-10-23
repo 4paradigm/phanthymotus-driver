@@ -226,14 +226,46 @@ def test_expiry_during_vendor_calls_confirms_stop_without_extending_lease(worker
     assert request(process, 4, "STOP")[2:] == ["OK", "0", "ready"]
 
 
-def test_excessive_lease_remains_fatal_and_reports_its_limit(worker):
+@pytest.mark.parametrize("verb", ["SET", "UPDATE"])
+@pytest.mark.parametrize("ttl_ms", [400, 1000])
+def test_bounded_lease_up_to_one_second_is_accepted(worker, verb, ttl_ms):
     process = worker()
-    fields = request(process, 1, velocity(1000))
+    fields = request(process, 1, velocity(ttl_ms).replace("SET ", f"{verb} ", 1))
+    assert fields[2:] == ["OK", "1", "active"]
+    timing = fields.stats["last_set"]
+    assert 0 < timing["remaining_after_set_ms"] <= timing["remaining_before_set_ms"] <= ttl_ms
+    assert fields.stats["confirmed_stops"] == 0
+    assert request(process, 2, "STOP")[2:] == ["OK", "0", "ready"]
+
+
+@pytest.mark.parametrize("verb", ["SET", "UPDATE"])
+def test_excessive_lease_remains_fatal_and_reports_its_limit(worker, verb):
+    process = worker()
+    fields = request(process, 1, velocity(1500).replace("SET ", f"{verb} ", 1))
     assert fields[2] == "ERROR"
     reason = bytes.fromhex(fields[3]).decode()
-    assert "excessive command lease" in reason and "limit_ms=300" in reason
+    assert "excessive command lease" in reason and "limit_ms=1000" in reason
     assert fields.stats["action_starts"] == fields.stats["stop_attempts"] == 0
     assert process.wait(timeout=2) == 1
+
+
+def test_one_second_lease_holds_past_previous_limit_but_never_renews_itself(worker):
+    process = worker()
+    assert request(process, 1, velocity(1000))[2:] == ["OK", "1", "active"]
+    time.sleep(0.4)
+    held = request(process, 2, "STOP")
+    assert held[2:] == ["OK", "0", "ready"]
+    assert held.stats["stop_reason"] == "explicit_stop"
+    assert held.stats["confirmed_stops"] == 1
+
+    assert request(process, 3, velocity(1000))[2:] == ["OK", "2", "active"]
+    # Native heartbeats keep the link alive, but never renew a velocity deadline.
+    time.sleep(1.1)
+    expired = request(process, 4, "STOP")
+    assert expired[2:] == ["OK", "0", "ready"]
+    assert expired.stats["stop_reason"] == "lease_expired"
+    assert expired.stats["confirmed_stops"] == 2
+    assert expired.stats["action_starts"] == 2
 
 
 def test_expiry_with_unconfirmed_stop_is_fatal_not_an_expired_ack(worker):
