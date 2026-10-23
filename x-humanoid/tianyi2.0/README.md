@@ -199,15 +199,15 @@ Input TTL is an admission check: an already-stale command is still dropped and
 cannot resume motion or renew the watchdog. Once admitted, a command no longer
 stops motion at its producer's per-frame TTL (commonly 200ms). Its execution
 lease instead ends 1000ms after the original ROS/bridge callback receipt, or at
-`obs_stamp_ms + 500ms`, whichever is sooner. Continuous fresh 10Hz input replaces
+`obs_stamp_ms + 1000ms`, whichever is sooner. Continuous fresh 10Hz input replaces
 that bounded lease; no new valid command for 1000ms stops motion. IPC, local queue
 and SDK reply time consume the original receive budget, never renew it. This is
 a bounded streaming watchdog, not unlimited reuse of the last velocity.
-The 500ms observation limit remains independent: a fresh receipt based on an
-older observation can stop sooner than the one-second silence threshold. This
-change does not promise to hold motion for a full second after observations
-expire. `control_interface.rate.watchdog_ms` reports 1000; the observation limit
-still reports 500.
+The 1000ms observation limit remains independent of the 1000ms silence limit:
+an observation already 700ms old at receipt leaves at most 300ms of execution.
+New commands cannot renew an old observation's deadline. Both
+`control_interface.rate.watchdog_ms` and `max_obs_age_ms` report 1000. The input
+freshness check and native execution deadline use the same observation limit.
 Deploy Python and the native worker together in the rebuilt driver image;
 older native workers reject remaining leases above 300ms.
 Python uses the original monotonic receipt time for its silence watchdog; the

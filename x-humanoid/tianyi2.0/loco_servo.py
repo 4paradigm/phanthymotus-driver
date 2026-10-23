@@ -17,6 +17,7 @@ from slamtec_velocity import CommandLeaseExpired, SlamtecVelocityBackend
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 1000
+MAX_OBS_AGE_MS = 1000
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 
 
@@ -143,7 +144,7 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0):
         "groups": [{"name": "base", "offset": 0, "count": 6,
                     "unit": "m/s", "resource": "base"}],
         "rate": {"max_hz": 20, "expected_hz": hz,
-                 "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": 500},
+                 "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": MAX_OBS_AGE_MS},
         "force_torque": None,
     }
 
@@ -522,7 +523,7 @@ class LocoServoPlugin:
                     WATCHDOG_MS - max(0.0, started - received_mono) * 1000)
                 self._command_deadline_ms = min(
                     wall_ms + receive_remaining_ms,
-                    command.get("obs_stamp_ms", command["stamp_ms"]) + 500)
+                    command.get("obs_stamp_ms", command["stamp_ms"]) + MAX_OBS_AGE_MS)
                 self._last_timing = {
                     "seq": command.get("seq"), "ttl_ms": command.get("ttl_ms"),
                     "execution_deadline_basis": "receive_watchdog_and_observation",
