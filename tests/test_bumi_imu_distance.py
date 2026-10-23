@@ -236,15 +236,6 @@ def test_quiet_acceleration_alone_cannot_certify_stationary_endpoint(monkeypatch
     assert plant.commands[-1][1:] == (0, 0)
 
 
-def test_whole_request_timeout_brakes_even_before_calibration(monkeypatch):
-    plant = Plant(monkeypatch)
-    monkeypatch.setattr(module, 'distance_timeout', lambda distance: 0.5)
-    result = module.run_distance(plant, 1)
-    assert result['state'] == 'error'
-    assert 'timed out' in result['error']
-    assert all(vx == vyaw == 0 for _, vx, vyaw in plant.commands)
-
-
 class DirectionalPlant(Plant):
     """Two independent body axes with bounded acceleration, no yaw actuation."""
     def __init__(self, monkeypatch, yaw):
@@ -530,6 +521,76 @@ def test_distance_endpoint_includes_the_stop_slide(monkeypatch):
     # The pre-brake estimate alone would be < 0.57; the slide is now reported.
     assert result['estimated_distance_m'] >= 0.57
     assert result['estimated_error_m'] <= -0.05
+
+
+def _slow_calibration_owner(clock, gyro_until):
+    class Owner:
+        def __init__(self):
+            self._rotate_stop_event = threading.Event()
+            self.command = 0.0
+        def _read_distance_imu(self):
+            gyro = (0.2, 0.0, 0.0) if clock[0] < gyro_until else (0.0, 0.0, 0.0)
+            return imu(acc=(0.0, 1e-7*math.sin(clock[0]*100), 9.81), yaw=0.0, gyro=gyro)
+        def _read_distance_joints(self):
+            return [0.0]*21
+        def _rotate_mode_error(self):
+            return None
+        def _distance_publish(self, vx, vyaw=0):
+            self.command = vx
+    return Owner()
+
+
+def _commanded_leg(owner):
+    class Leg:
+        def __init__(self, slip_scale=None):
+            self.slip_scale = slip_scale
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self.feet = []
+            self.foot_gap = 0.0
+            self.double_support = True
+            self._last = None
+        def reset_baseline(self):
+            self.position = [0.0, 0.0, 0.0]
+            self.velocity = [0.0, 0.0, 0.0]
+            self._last = None
+        def observe(self, joints, quaternion, now, frozen=False):
+            if self._last is None:
+                self._last = now
+                return
+            dt = now-self._last
+            self._last = now
+            step = 0.16*dt if owner.command else 0.0
+            self.position = [self.position[0]+step, self.position[1], self.position[2]]
+            self.velocity = [step/dt, 0.0, 0.0]
+    return Leg
+
+
+def test_slow_calibration_does_not_eat_the_motion_budget(monkeypatch):
+    clock = [0.0]
+    owner = _slow_calibration_owner(clock, gyro_until=4.0)
+    monkeypatch.setattr(module, 'LegOdometry', _commanded_leg(owner))
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_distance(owner, 0.5, slip_scale=1.0)
+    assert result['state'] == 'done', result.get('error')
+    assert result['distance_source'] == 'leg_odometry'
+
+
+def test_calibration_never_settling_hits_the_calibration_deadline(monkeypatch):
+    clock = [0.0]
+    owner = _slow_calibration_owner(clock, gyro_until=999.0)
+    monkeypatch.setattr(module, 'LegOdometry', _commanded_leg(owner))
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    def advance(dt):
+        clock[0] += dt
+    monkeypatch.setattr(module.time, 'sleep', advance)
+    result = module.run_distance(owner, 0.5, slip_scale=1.0)
+    assert result['state'] == 'error'
+    assert 'calibration' in result['error']
+    assert owner.command == 0
 
 
 def test_distance_waits_for_parallel_feet_before_braking(monkeypatch):

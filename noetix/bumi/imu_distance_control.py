@@ -95,8 +95,11 @@ def angle_delta(a, b):
 
 
 def distance_timeout(distance_m):
-    # Calibration <=6 s, motion <=20 s, endpoint observation <=4 s.
-    return 10.0+min(20.0, 5.0+10.0*distance_m)
+    # Calibration <=6 s + motion budget (leg path: 5+10*d+5, capped 30 s) +
+    # endpoint observation <=4 s. The global deadline is only a coarse bound;
+    # the worker itself enforces the calibration, motion and endpoint deadlines
+    # separately so a long calibration cannot eat the motion budget.
+    return 10.0+min(30.0, 5.0+10.0*distance_m+5.0)
 
 
 def movement_direction(value=''):
@@ -262,8 +265,8 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
                                 orientation_xyzw=[float(raw.ori[i]) for i in range(4)],
                                 linear_acceleration_mps2=[float(raw.linear_acc[i]) for i in range(3)],
                                 angular_velocity_rad_s=[float(raw.angular_vel[i]) for i in range(3)]))
-            if now-started >= distance_timeout(distance_m):
-                raise ValueError('IMU distance movement timed out')
+            if not estimator.ready and now-started > 6.0:
+                raise ValueError('IMU calibration timed out')
             estimator.observe(raw, now)
             if leg is not None:
                 # Once braking starts the stance foot rolls/slips; keep the
@@ -488,8 +491,8 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                                 linear_acceleration_mps2=[float(raw.linear_acc[i]) for i in range(3)],
                                 angular_velocity_rad_s=[float(raw.angular_vel[i]) for i in range(3)]))
             time_limit = min(60.0, 12.0+20.0*target_distance)
-            if now-started >= time_limit:
-                raise ValueError('target move timed out')
+            if not estimator.ready and now-started > 6.0:
+                raise ValueError('target calibration timed out')
             estimator.observe(raw, now)
             if leg is not None:
                 # Keep integrating through the stop: the coast after the
