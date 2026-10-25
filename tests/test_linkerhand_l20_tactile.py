@@ -443,6 +443,106 @@ def test_same_target_shares_worker_and_switch_does_not_stop_other_owner(fake_han
         plugin.stop()
 
 
+@pytest.mark.parametrize('stop_args', [{}, {'instance_id': 'deleted-card'}])
+def test_unowned_stop_keeps_auto_start_stream_running(fake_hand, ros_runtime, stop_args):
+    hand, _ = fake_hand
+    ros, published = ros_runtime
+    plugin = TactilePlugin(hand, {'poll_hz': 50}, ros2=ros)
+    try:
+        plugin.start()
+        wait_for_stream(lambda: len(published) > 0 and len(ros.images) > 0)
+        worker, publisher = plugin._worker_thread, plugin._pub
+        assert plugin.dispatch('stop', stop_args)['state'] == 'idle'
+        assert plugin._running() and plugin._worker_thread is worker
+        assert plugin._pub is publisher
+        frame_count, image_count = len(published), len(ros.images)
+        wait_for_stream(lambda: len(published) > frame_count and len(ros.images) > image_count)
+    finally:
+        plugin.stop()
+    assert not plugin._running() and plugin._pub is None
+
+
+@pytest.mark.parametrize('owners', [
+    [('left-card', 'left')], [('right-card', 'right')],
+    [('left-card', 'left'), ('other-left-card', 'left')],
+    [('left-card', 'left'), ('right-card', 'right')],
+])
+@pytest.mark.parametrize('stop_args', [{}, {'instance_id': 'deleted-card'}])
+def test_unknown_stop_keeps_registered_streams_running(fake_hand, ros_runtime, owners, stop_args):
+    hand, _ = fake_hand
+    ros, published = ros_runtime
+    plugin = TactilePlugin(hand, {'poll_hz': 50, 'auto_start': False}, ros2=ros)
+    sides = {side for _, side in owners}
+    try:
+        for instance_id, side in owners:
+            plugin.dispatch('start', {'instance_id': instance_id, 'bound_side': side})
+        wait_for_stream(lambda: {frame['side'] for frame in published} == sides)
+        assert plugin.dispatch('stop', stop_args)['state'] == 'idle'
+        assert all(plugin.dispatch('info', {'instance_id': instance_id})['state'] == 'running'
+                   for instance_id, _ in owners)
+        frame_count, image_count = len(published), len(ros.images)
+        wait_for_stream(lambda: {frame['side'] for frame in published[frame_count:]} == sides
+                        and {image['data'] for image in ros.images[image_count:]}
+                        == {b'jpeg:' + side.encode() for side in sides})
+    finally:
+        plugin.stop()
+
+
+def test_deleted_owner_stop_keeps_restarted_auto_stream_running(fake_hand, ros_runtime):
+    hand, _ = fake_hand
+    ros, published = ros_runtime
+    plugin = TactilePlugin(hand, {'poll_hz': 50}, ros2=ros)
+    try:
+        plugin.dispatch('start', {'instance_id': 'old-card', 'bound_side': 'left'})
+        assert plugin.dispatch('stop', {'instance_id': 'old-card'})['state'] == 'idle'
+        assert not plugin._running()
+        plugin.start()
+        assert plugin.dispatch('stop', {'instance_id': 'old-card'})['state'] == 'idle'
+        assert plugin._running()
+        frame_count, image_count = len(published), len(ros.images)
+        wait_for_stream(lambda: len(published) > frame_count and len(ros.images) > image_count)
+    finally:
+        plugin.stop()
+
+
+@pytest.mark.parametrize('error_type', [RuntimeError, InterruptedError])
+def test_stream_repeated_errors_are_throttled_and_recovery_is_logged(fake_hand, monkeypatch, error_type):
+    hand, _ = fake_hand
+    plugin = TactilePlugin(hand, {'auto_start': False})
+    snapshot = {'state': 'ok', 'timestamp': time.time()}
+    outcomes = ([error_type('injected stream failure') for _ in range(205)]
+                + [snapshot, snapshot, error_type('another stream failure'), snapshot])
+    read = mock.Mock(side_effect=outcomes)
+    monkeypatch.setattr(plugin, '_read_tactile_snapshot', read)
+    monkeypatch.setattr(plugin, '_setup_ros_publisher', mock.Mock(return_value=False))
+    def finish_iteration(timeout):
+        if read.call_count == len(outcomes):
+            plugin._stop_event.set()
+    monkeypatch.setattr(plugin._stop_event, 'wait', finish_iteration)
+    with mock.patch('tactile_device.logger') as stream_log:
+        plugin._stream_loop()
+    # First failure, periodic reminders at 100/200, and a new failure after recovery.
+    assert stream_log.warning.call_count == 4
+    recoveries = [call.args[0] % call.args[1:] for call in stream_log.info.call_args_list]
+    assert len(recoveries) == 2
+    assert '205' in recoveries[0] and '1' in recoveries[1]
+    assert read.call_count == len(outcomes)
+    assert plugin._latest_data == snapshot
+
+
+def test_requested_stream_stop_does_not_log_an_acquisition_failure(fake_hand, monkeypatch):
+    hand, _ = fake_hand
+    plugin = TactilePlugin(hand, {'auto_start': False})
+    def cancelled(*args, **kwargs):
+        plugin._stop_event.set()
+        raise InterruptedError('requested stop')
+    monkeypatch.setattr(plugin, '_read_tactile_snapshot', cancelled)
+    with mock.patch('tactile_device.logger') as stream_log:
+        plugin._stream_loop()
+    stream_log.warning.assert_not_called()
+    stream_log.info.assert_not_called()
+
+
 def test_running_card_channel_change_moves_both_topics(fake_hand, ros_runtime):
     hand, _ = fake_hand
     ros, published = ros_runtime

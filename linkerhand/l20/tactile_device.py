@@ -245,12 +245,11 @@ class TactilePlugin:
     def _stop_instance_stream(self, instance_id: str) -> None:
         with self._lifecycle_lock:
             target = self._stream_targets.pop(instance_id, None)
+            # An unowned stop must not shut down the auto-start default stream.
             if target is not None and target not in self._stream_targets.values():
                 stream = self._streams.pop(target, None)
                 if stream is not None:
                     stream._stop_streaming()
-            if not self._stream_targets:
-                self._stop_streaming()
 
     # ── Data Reading ──────────────────────────────────────────────────
 
@@ -447,6 +446,7 @@ class TactilePlugin:
     def _stream_loop(self) -> None:
         side = self.default_side
         channel = self.default_channel
+        consecutive_errors = 0
 
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
@@ -485,13 +485,20 @@ class TactilePlugin:
                         self._published_frames += 1
                         self._last_publish_time = time.time()
                         self._last_publish_error = None
+                if consecutive_errors:
+                    logger.info("Tactile stream loop recovered after %d consecutive errors", consecutive_errors)
+                    consecutive_errors = 0
             except InterruptedError:
                 if self._stop_event.is_set():
                     break
-                logger.warning("Tactile acquisition interrupted unexpectedly")
+                consecutive_errors += 1
+                if consecutive_errors == 1 or consecutive_errors % 100 == 0:
+                    logger.warning("Tactile acquisition interrupted unexpectedly (consecutive errors: %d)", consecutive_errors)
             except Exception as exc:
                 self._last_publish_error = str(exc)
-                logger.warning("Error in tactile stream loop: %s", exc)
+                consecutive_errors += 1
+                if consecutive_errors == 1 or consecutive_errors % 100 == 0:
+                    logger.warning("Error in tactile stream loop (consecutive errors: %d): %s", consecutive_errors, exc)
                 self._teardown_ros_publisher()
 
             elapsed = time.monotonic() - loop_start
