@@ -1,0 +1,4 @@
+python-can>=4.2.0
+pyyaml
+pillow>=9.0.0
+numpy>=1.21
