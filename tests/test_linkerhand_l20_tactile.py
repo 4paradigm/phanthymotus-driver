@@ -198,7 +198,9 @@ def test_tactile_start_and_stop_streaming(fake_hand):
     assert info["state"] == "running"
 
     stop_res = plugin.dispatch("stop", {})
-    assert stop_res["state"] == "stopped"
+    assert stop_res["state"] == "idle"
+    assert plugin._worker_thread is None
+    assert plugin.dispatch("stop", {})["state"] == "idle"
 
     info2 = plugin.dispatch("info", {})
     assert info2["state"] == "idle"
@@ -409,13 +411,13 @@ def test_left_and_right_cards_keep_independent_streams_and_stop(fake_hand, ros_r
         assert plugin.dispatch('info', {'instance_id': 'r'})['stream_side'] == 'right'
         plugin.dispatch('config', {'poll_hz': 10})  # Core's shared call has no side or ID.
         assert all(stream.poll_hz == 10 for stream in plugin._streams.values())
-        plugin.dispatch('stop', {'instance_id': 'l'})
+        assert plugin.dispatch('stop', {'instance_id': 'l'})['state'] == 'idle'
         count = len(published)
         wait_for_stream(lambda: len(published) > count)
         assert all(v['side'] == 'right' for v in published[count:])
         assert plugin.dispatch('info', {'instance_id': 'r'})['state'] == 'running'
         # A later start without explicit side remembers this card's selection.
-        plugin.dispatch('stop', {'instance_id': 'r'})
+        assert plugin.dispatch('stop', {'instance_id': 'r'})['state'] == 'idle'
         assert plugin.dispatch('start', {'instance_id': 'r'})['stream_side'] == 'right'
     finally:
         streams = list(plugin._streams.values())
@@ -434,7 +436,7 @@ def test_same_target_shares_worker_and_switch_does_not_stop_other_owner(fake_han
         plugin.dispatch('get_state', {'instance_id': 'a', 'bound_side': 'right'})
         assert plugin._running()  # b still needs left.
         assert len(plugin._streams) == 2
-        plugin.dispatch('stop', {'instance_id': 'b'})
+        assert plugin.dispatch('stop', {'instance_id': 'b'})['state'] == 'idle'
         assert not plugin._running()
         assert plugin.dispatch('info', {'instance_id': 'a'})['state'] == 'running'
     finally:

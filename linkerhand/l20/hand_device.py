@@ -761,7 +761,8 @@ class HandPlugin:
                     if self._held.get(key) is task:
                         self._held.pop(key, None)
                 stopped.append(key[0])
-            return {"state": "stopped" if stopped else "unmatched", "stopped_sides": stopped,
+            return {"state": "idle", "stop_status": "stopped" if stopped else "unmatched",
+                    "target_resolved": bool(stopped), "stopped_sides": stopped,
                     "torque_released": unloaded,
                     "message": "已停止匹配的基础控制任务" if stopped else "没有匹配的基础控制任务；匿名动作请明确选择左右手停止"}
 

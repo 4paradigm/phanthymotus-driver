@@ -88,7 +88,7 @@
 
 两种抓法设置 `bound_side`、`speed_ratio` 和 `confirm_motion: true`；释放设置 `bound_side` 和 `confirm_motion: true`。速度原始值固定为 **85／128／170／212／255**，分别对应 1.0x～3.0x；准备与收拢使用相同的所选速度。释放沿用设备预设 `release_speed=80`。
 
-准备阶段保留原来的拇指松开、让位及张开路径，并通过新位置反馈检查到位。准备到位后，一次下发完整收拢目标，不再逐点调压。**收拢阶段不等待实际位置到达 0**：物体会正常阻挡关节，不能因此判定抓取失败。返回“指令已下发，保持至 release”，其中 `command_sent=true`、`holding=true`；`success=true` 仅代表本次操作成功下发，不代表确认抓住了物体，也不代表关节已经到位。
+准备阶段保留原来的拇指松开、让位及张开路径，并通过新位置反馈检查到位。准备到位后，一次下发完整收拢目标，不再逐点调压。**收拢阶段不等待实际位置到达 0**：物体会正常阻挡关节，不能因此判定抓取失败。完成通知中的“指令已下发，保持至 release”、`command_sent=true`、`holding=true` 表示已下发收拢指令；`success=true` 仅代表本次操作完成，不代表确认抓住了物体，也不代表关节已经到位。
 
 下发后电机保留该位置目标及固定输出上限，直到主动对同侧设备执行 `release` 或明确停止。没有触觉保持线程，也没有到期自动释放。抓握状态按 `(左右手, CAN 接口)` 保存，因此另一张抓握卡片选择相同设备后也能正确释放。抓握保持期间，其他执行器卡片不能驱动同一只手；需要换动作时先释放。重复抓握会被拒绝，避免意外重新开手。`release` 可中断所选设备尚在准备中的抓握；重复释放复用正在执行的释放任务。
 
@@ -105,7 +105,11 @@ top_grasp_prep_pose: [255,255,255,255,255,70,200,132,55,0,255,255,255,255,255,25
 
 `config.yaml` 中的抓握配置仅保留启用开关、准备姿态、释放速度、固定输出上限 `motion_current=230`、位置轮询间隔 `poll_interval_s=0.05`、准备／释放到位超时 `pose_timeout_s=5.0` 和容差 `position_tolerance=20`。固定输出上限不是实测力或电流。旧压力目标、压力上限、步长、保持时间等配置已移除。
 
-仅公开 `side_grasp`、`top_grasp`、`release` 三个动作；旧 `grasp`、`hold`、`get_tactile`、`get_matrix_touch` 不再支持。传入旧 `target_force`、`max_force`、`hold_duration_s` 等动作参数会报已移除参数，需按新卡片填写。内部保留 `config/start/stop/info` 供平台生命周期和状态查询使用，不再保存左右手绑定。默认同步返回本次下发／释放结果；API 可传 `wait_for_result=false` 获取 `action_id`，随后通过 ACP 接收完成通知。
+仅公开 `side_grasp`、`top_grasp`、`release` 三个动作；旧 `grasp`、`hold`、`get_tactile`、`get_matrix_touch` 不再支持。传入旧 `target_force`、`max_force`、`hold_duration_s` 等动作参数会报已移除参数，需按新卡片填写。内部保留 `config/start/stop/info` 供平台生命周期和状态查询使用，不再保存左右手绑定。
+
+三个动作统一使用平台已有的异步完成协议：受理后返回 `state=running` 和唯一 `action_id`，后台执行结束后通过 ACP 上报同一 ID、`completed/error/cancelled` 状态及最终结果。准备、释放未到位或通信异常通过完成通知报告；`running` 只表示任务已受理。重复调用正在执行的 `release` 会返回同一个任务 ID，该任务只产生一次终态通知。`action_id` 标识一次动作，与可选的卡片 `instance_id` 不同，普通执行不要求卡片 ID。
+
+用户无需切换额外动作查询结果，最终完成或异常由平台已有的 ACP 活动通知承载。当前画布按钮的结果框可能保留最初的受理结果，不保证自动替换为最终结果；应结合平台完成通知判断。API 兼容 `wait_for_result=false`，不支持 `true`，避免阻塞 MCP 请求并跳过完成通知。
 
 ### 2.4 `hand_tactile`：独立触觉传感器
 
@@ -192,7 +196,6 @@ docker buildx build --platform linux/arm64 --load -t linkerhand-l20:latest "$l20
 运行中容器的开发更新可以只复制本次发生变化的文件并重启。纯位置抓握、触觉卡片及热力图同时上线时，至少需要同步以下文件，并确保容器已安装 Pillow、NumPy：
 
 ```bash
-cd /home/anachronism/wangyunpeng2/phanthymotus-driver
 docker cp linkerhand/l20/tactile_device.py embodied-linkerhand-l20:/work/tactile_device.py
 docker cp linkerhand/l20/tactile_heatmap.py embodied-linkerhand-l20:/work/tactile_heatmap.py
 docker cp linkerhand/l20/hand_device.py embodied-linkerhand-l20:/work/hand_device.py
@@ -215,6 +218,8 @@ docker logs --since 1m --tail 60 embodied-linkerhand-l20
 
 删除卡片不会留下执行器绑定记录，但也不能代替主动停止或释放。旧画布的执行请求可能不传 `instance_id`，而删除请求仅携带卡片 ID，此时无法可靠关联此前的匿名任务。驱动不会猜测设备或停止另一张卡片的任务：请先在 `hand/hand_gesture` 中选择对应侧执行 `stop`，抓握则先在 `hand_grasp` 中选择对应侧执行 `release`，确认完成后再删除卡片。能够关联到带 ID 原请求的停止调用只处理对应任务。
 
+四张卡片的 `stop` 正常返回均使用平台规定的 `state=idle`。这是卡片生命周期标记，不能单独用来确认电机已经卸力：执行器返回的 `target_resolved`、`torque_released`、`cancel_requested` 等字段说明是否匹配任务、是否下发卸力或请求取消，具体字段以对应卡片返回为准。手势取消的最终结果继续通过原动作的 ACP 通知报告。触觉停止仅移除本卡片的采集使用关系，其他卡片使用的采集流继续运行。
+
 当前平台的通用运动中断钩子不会继承原请求的左右手参数，因此三张执行器不再声明无目标的 `on_interrupt_motion` 钩子。平台通用中断不能替代上述显式停止／释放流程。执行器的普通执行不依赖平台额外传入卡片 ID，驱动部署无需修改 Agent Core 文件；触觉卡片仍使用平台已有的传感器实例机制管理采集线程。
 
 ## 6. QEMU 断线重连
@@ -225,8 +230,6 @@ SocketCAN 的 QEMU 兼容钩子需在线程锁保护下只安装一次。重连�
 
 ### QEMU 6.2 与 DDS 数据流
 
-在本机 x86 虚拟机中，QEMU 6.2 的 ARM64 用户态仿真对 `setsockopt(IPPROTO_IP, IP_MULTICAST_IF)` 返回 `ENOPROTOOPT`。Fast DDS 因此无法正常创建跨参与者 UDP 发送通道：同一 ROS 上下文可自收，跨上下文或跨容器无法发现／收流。CAN 查询成功、HTTP 卡片返回正常、采集线程已启动，均不能排除这一独立问题。
+在 x86 Linux 主机使用 QEMU 6.2 的 ARM64 用户态仿真时，`setsockopt(IPPROTO_IP, IP_MULTICAST_IF)` 可能返回 `ENOPROTOOPT`。Fast DDS 因此无法正常创建跨参与者 UDP 发送通道：同一 ROS 上下文可自收，跨上下文或跨容器无法发现／收流。CAN 查询成功、HTTP 卡片返回正常、采集线程已启动，均不能排除这一独立问题。
 
 [QEMU 上游问题 #1837](https://gitlab.com/qemu-project/qemu/-/issues/1837)记录了该限制；[QEMU 10.0 源码](https://github.com/qemu/qemu/blob/v10.0.0/linux-user/syscall.c)已实现该 socket 选项。x86 仿真部署需使用具备该支持的 QEMU，并对真实 DDS／WebSocket 收流做验证；真实 ARM64 主机不经过此用户态仿真路径。升级宿主机模拟器及重启依赖容器是单独的环境操作，设备驱动本身不执行这些操作。
-
-2026-10-23 本机经授权升级至 QEMU 10.0.4，并重启 Core、L20 后，已在网页同一 WebSocket 通道连续收到递增序号的有效 JSON；五指标量及完整阵列均有效。安装来源为官方 `tonistiigi/binfmt` 的 `deploy/v10.0.4-59` 发布包，下载内容已按 GitHub 发布记录的 SHA256 校验。当前 ARM64 binfmt 注册保留 guest `argv[0]`（`P` 标记），宿主原有 `/usr/bin/qemu-aarch64-static` 启动路径也已更新；旧二进制备份为 `/usr/bin/qemu-aarch64-static.l20-before-6.2`。Core 源码、镜像及挂载配置未修改。

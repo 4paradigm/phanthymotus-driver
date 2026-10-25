@@ -45,6 +45,7 @@ def connected():
         events.append((aid, status, result))
         done.set()
     p._acp_callback = completed
+    p._test_completions = events
     # Ignore client protocol setup frames; each case observes only its action.
     bus.sent_messages.clear()
     try:
@@ -58,7 +59,18 @@ def connected():
 
 
 def request(p, action='side_grasp', **kwargs):
-    return p.dispatch(action, {'instance_id': 'grasp-card', 'bound_side': 'left', 'confirm_motion': True, **kwargs})
+    reply = p.dispatch(action, {'instance_id': 'grasp-card', 'bound_side': 'left', 'confirm_motion': True, **kwargs})
+    if kwargs.get('wait_for_result') is False or reply is None:
+        return reply
+    # Mechanical regressions inspect the final ACP payload. Waiting belongs to
+    # this test client, never to the driver's MCP request handler.
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        for aid, _, result in p._test_completions:
+            if aid == reply['action_id']:
+                return result
+        time.sleep(0.001)
+    pytest.fail('No ACP completion received for ' + reply['action_id'])
 
 
 def writes(bus):
@@ -100,7 +112,8 @@ def test_position_targets_speed_and_persistent_motor_holding(connected, monkeypa
     assert client._currents == [p.motion_current] * 5
     assert client._speeds == [speed] * 5
     assert p.dispatch('info', {'bound_side': 'left'})['state'] == 'holding'
-    assert not events  # Synchronous result is final; no extra completion callback.
+    assert len(events) == 1 and events[0][1] == 'completed'
+    assert events[0][2] == result
     count = len(bus.sent_messages)
     time.sleep(0.025)
     assert len(bus.sent_messages) == count, 'no hidden polling/hold worker'
@@ -144,6 +157,9 @@ def test_tool_exposes_only_three_actions_and_no_pressure_fields(connected):
     assert 'configSchema' not in definition
     assert all('bound_side' in fields['params'] for fields in schema['x-action-params'].values())
     assert schema['properties']['bound_side']['default'] == ''
+    assert set(schema['x-completion']['actions']) == {'side_grasp', 'top_grasp', 'release'}
+    assert schema['properties']['wait_for_result']['default'] is False
+    assert schema['properties']['wait_for_result']['const'] is False
     assert not schema['properties']['instance_id'].get('default')
     assert not {'target_force', 'max_force', 'hold_duration_s', 'active_fingers', 'approach_speed'}.intersection(schema['properties'])
 
@@ -298,7 +314,7 @@ def test_release_preempts_preparation_and_inherits_top_mode(connected, monkeypat
         while True:
             p._wait(0.01)
     monkeypatch.setattr(p, '_do_grasp', preparation)
-    request(p, 'top_grasp', wait_for_result=False)
+    preparing = request(p, 'top_grasp', wait_for_result=False)
     assert entered.wait(2)
     # Put the hand into a top-grasp-shaped closed pose for the release path.
     client.set_joint_positions(p._grasp_poses(ctrl, 'top')[1])
@@ -311,14 +327,17 @@ def test_release_preempts_preparation_and_inherits_top_mode(connected, monkeypat
     released = request(p, 'release')
     assert released['hand_opened'] and released['torque_released']
     assert commands[0] == DEFAULT_TOP_GRASP_PREP_POSE
-    assert events[0][1] == 'cancelled'
+    cancelled = [event for event in events if event[0] == preparing['action_id']]
+    assert len(cancelled) == 1 and cancelled[0][1] == 'cancelled'
     assert not p._active and not p._sessions
 
 
 def test_async_completion_then_release_does_not_wait_for_blocked_callback(connected):
     p, client, _, _, _, _, _ = connected
     entered, finish = threading.Event(), threading.Event()
+    record = p._acp_callback
     def callback(*args):
+        record(*args)
         entered.set()
         assert finish.wait(3)
     p._acp_callback = callback
@@ -355,14 +374,20 @@ def test_thread_start_failure_unloads_and_releases_ownership(connected, monkeypa
 
 
 def test_duplicate_release_reuses_same_worker(connected, monkeypatch):
-    p, _, _, _, *_ = connected
+    p, _, _, _, _, events, _ = connected
     queued = []
     monkeypatch.setattr(threading.Thread, 'start', lambda worker: queued.append(worker))
     first = request(p, 'release', wait_for_result=False)
-    second = request(p, 'release', wait_for_result=False)
+    second = p.dispatch('release', {'bound_side': 'left', 'confirm_motion': True})
     assert first['action_id'] == second['action_id'] and len(queued) == 1
     queued[0].run()
     assert not p._active
+    assert len(events) == 1 and events[0][0] == first['action_id']
+    assert events[0][1] == 'completed'
+    third = p.dispatch('release', {'bound_side': 'left', 'confirm_motion': True})
+    assert third['action_id'] != first['action_id'] and len(queued) == 2
+    queued[1].run()
+    assert len(events) == 2 and events[1][0] == third['action_id']
 
 
 def test_info_is_per_device_and_does_not_read_hardware(connected):
@@ -628,3 +653,109 @@ def test_joint_torque_codec_controls_tips_without_overwriting_roots_or_orientati
         [0x54, 230, 0, 230, 0, 0, 233],
         [0x55, 230, 0, 230, 0, 0, 245],
     ]
+
+
+@pytest.mark.parametrize('action', ['side_grasp', 'top_grasp', 'release'])
+@pytest.mark.parametrize('options', [{}, {'wait_for_result': False}])
+def test_completion_actions_return_correlatable_id_without_waiting(connected, monkeypatch, action, options):
+    p, _, _, _, _, events, _ = connected
+    queued = []
+    monkeypatch.setattr(threading.Thread, 'start', lambda worker: queued.append(worker))
+    reply = p.dispatch(action, {'bound_side': 'left', 'confirm_motion': True, **options})
+    assert reply['state'] == 'running' and isinstance(reply['action_id'], str)
+    assert len(queued) == 1 and not events
+    assert 'completed_action_id' not in reply and 'success' not in reply
+    assert not p._results
+    queued[0].run()
+    assert len(events) == 1
+    assert events[0][0] == reply['action_id'] and events[0][1] == 'completed'
+    assert events[0][2]['success']
+
+
+@pytest.mark.parametrize('action', ['side_grasp', 'top_grasp', 'release'])
+@pytest.mark.parametrize('value', [True, 'false', 0, 1, None, [], {}])
+def test_sync_or_malformed_wait_is_rejected_before_hardware(connected, monkeypatch, action, value):
+    p, _, bus, *_ = connected
+    monkeypatch.setattr(p, '_get_client_and_ctrl', no_touch)
+    with pytest.raises(ValueError, match='wait_for_result'):
+        p.dispatch(action, {'bound_side': 'left', 'confirm_motion': True, 'wait_for_result': value})
+    assert not bus.sent_messages and not p._active
+
+
+@pytest.mark.parametrize('status', ['completed', 'error', 'cancelled'])
+def test_each_terminal_outcome_reports_one_matching_completion(connected, monkeypatch, status):
+    p, _, _, ctrl, _, events, _ = connected
+    queued = []
+    monkeypatch.setattr(threading.Thread, 'start', lambda worker: queued.append(worker))
+    if status == 'error':
+        def fail(*args):
+            raise RuntimeError('simulated grasp failure')
+        monkeypatch.setattr(p, '_do_grasp', fail)
+    reply = p.dispatch('side_grasp', {'instance_id': 'owner', 'bound_side': 'left', 'confirm_motion': True})
+    if status == 'cancelled':
+        assert p.dispatch('stop', {'instance_id': 'owner'})['state'] == 'idle'
+    queued[0].run()
+    assert len(events) == 1 and events[0][0] == reply['action_id']
+    assert events[0][1] == status and events[0][2]['success'] == (status == 'completed')
+    assert not p._active and not vars(ctrl).get('_command_owner')
+    assert bool(vars(ctrl).get('_grasp_owner')) == (status == 'completed')
+    p.dispatch('stop', {'instance_id': 'owner'})
+    assert len(events) == 1, 'lifecycle cleanup must not duplicate a terminal notification'
+
+
+@pytest.mark.parametrize('with_hand', [True, False])
+def test_mcp_response_and_acp_transport_share_task_identity(connected, monkeypatch, with_hand):
+    import io
+    import json
+    import urllib.request
+    from common.vendor_runtime import DriverBundle, make_handler
+
+    p, client, _, ctrl, *_ = connected
+    if not with_hand:
+        p.hand = None
+        monkeypatch.setattr(p, '_get_client_and_ctrl', lambda side, channel: (client, side, ctrl))
+    # Exercise the actual completion transport, with the HTTP boundary mocked.
+    monkeypatch.delattr(p, '_acp_callback')
+    monkeypatch.setenv('AGENT_CORE_URL', 'http://127.0.0.1:15678')
+    monkeypatch.delenv('AGENT_CORE_CA_CERT', raising=False)
+    callbacks = []
+
+    def complete(req, **kwargs):
+        payload = json.loads(req.data)
+        callbacks.append((req.full_url, payload))
+        class Response:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                return json.dumps({'ok': True, 'action_id': payload['action_id']}).encode()
+        return Response()
+
+    monkeypatch.setattr(urllib.request, 'urlopen', complete)
+    queued = []
+    monkeypatch.setattr(threading.Thread, 'start', lambda worker: queued.append(worker))
+    bundle = DriverBundle([p])
+    handler_type = make_handler(lambda: bundle, 'l20-test', 'l20-test-driver')
+    handler = object.__new__(handler_type)
+    body = json.dumps({'jsonrpc': '2.0', 'id': 42, 'method': 'tools/call', 'params': {
+        'name': 'hand_grasp', 'arguments': {'action': 'side_grasp', 'bound_side': 'left', 'confirm_motion': True},
+    }}).encode()
+    handler.path = '/mcp'
+    handler.headers = {'Content-Length': str(len(body))}
+    handler.rfile = io.BytesIO(body)
+    responses = []
+    handler.send_json = lambda code, data: responses.append((code, data))
+    handler.do_POST()
+    assert responses[0][0] == 200
+    accepted = json.loads(responses[0][1]['result']['content'][0]['text'])
+    assert accepted['state'] == 'running' and accepted['action_id']
+    assert not callbacks
+    queued[0].run()
+    assert len(callbacks) == 1
+    url, payload = callbacks[0]
+    assert url == 'http://127.0.0.1:15678/api/acp/complete'
+    assert payload['action_id'] == accepted['action_id']
+    assert payload['status'] == 'completed' and payload['tool'] == 'hand_grasp'
+    assert payload['result']['command_sent'] and payload['result']['holding']
+    assert payload['result']['success']

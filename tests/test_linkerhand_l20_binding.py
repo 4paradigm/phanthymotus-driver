@@ -96,6 +96,8 @@ def test_lifecycle_start_and_config_do_not_require_a_target(card, connected_hand
     bus.sent_messages.clear()
     assert card.dispatch("start", {"instance_id": "card"})["state"] == "ready"
     assert card.dispatch("config", {"instance_id": "card"})["state"] == "configured"
+    for _ in range(2):
+        assert card.dispatch("stop", {"instance_id": "card"})["state"] == "idle"
     assert not bus.sent_messages
     assert not hasattr(card, "_bindings")
 
@@ -111,11 +113,13 @@ def test_anonymous_motion_uses_only_the_explicit_target(card, connected_hand, mo
     assert reply["state"] == "running"
     assert ("left", "can0") in card._active
     # An unrelated deletion cannot identify this anonymous request.
-    card.dispatch("stop", {"instance_id": "deleted-card"})
+    unrelated = card.dispatch("stop", {"instance_id": "deleted-card"})
+    assert unrelated["state"] == "idle" and not unrelated["target_resolved"]
     active = card._active[("left", "can0")]
     event = active.get("stop_event", active["controller"]._stop_evt)
     assert not event.is_set()
-    card.dispatch("stop", {"bound_side": "left"})
+    stopped = card.dispatch("stop", {"bound_side": "left"})
+    assert stopped["state"] == "idle" and stopped["target_resolved"]
     assert event.is_set()
     bus.sent_messages.clear()
     workers[0].run()
@@ -168,7 +172,7 @@ def test_stop_before_worker_runs_cancels_without_motion(card, connected_hand, mo
     completed = []
     card._acp_callback = lambda aid, status, result: completed.append(status)
     card.dispatch(motion_for(card), {"bound_side": "left", "wait_for_result": False, "instance_id": "owner", "confirm_motion": True})
-    card.dispatch("stop", {"instance_id": "owner"})
+    assert card.dispatch("stop", {"instance_id": "owner"})["state"] == "idle"
     bus.sent_messages.clear()
     workers[0].run()
     assert completed == ["cancelled"]

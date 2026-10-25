@@ -100,8 +100,8 @@ class GraspPlugin:
             'instance_id': {'type': 'string'},
             'speed_ratio': {'type': 'string', 'enum': list(SPEED_RATIOS), 'default': '1.0x',
                             'description': '电机速度：1.0x=85，1.5x=128，2.0x=170，2.5x=212，3.0x=255'},
-            'wait_for_result': {'type': 'boolean', 'default': True,
-                                'description': '默认返回指令下发或释放结果；false 使用异步完成通知'},
+            'wait_for_result': {'type': 'boolean', 'const': False, 'default': False,
+                                'description': '仅兼容 false；动作立即返回 action_id，最终结果通过 ACP 通知'},
             'confirm_motion': {'type': 'boolean', 'const': True, 'description': '确认周围安全后传入 true'},
         })
         schema['allOf'] = [{'if': {'properties': {'action': {'enum': list(GRASP_ACTIONS)}}},
@@ -308,8 +308,9 @@ class GraspPlugin:
                     del ctrl._grasp_owner
 
     def _acp_callback(self, action_id: str, status: str, result: dict) -> None:
-        if self.hand:
-            self.hand._acp_callback(action_id, status, result)
+        # Reuse the completion transport with this tool's identity, even when
+        # the basic hand card is disabled. No controller access is required.
+        HandPlugin._acp_callback(self, action_id, status, result)
 
     def _new_active(self, device_key, instance_id, action, options, client, side, ctrl, *, predecessor=None):
         return {'action': action, 'action_id': f'grasp_{action}_{uuid4().hex}',
@@ -317,7 +318,7 @@ class GraspPlugin:
                 'options': options, 'client': client, 'side': side,
                 'controller': ctrl, 'owner': (id(self), device_key), 'predecessor': predecessor,
                 'stop_event': threading.Event(), 'done_event': threading.Event(),
-                'result_event': threading.Event(), 'terminal': None, 'notify_completion': True}
+                'terminal': None}
 
     def _run_action(self, device_key: tuple[str, str], active: dict) -> None:
         client, ctrl = active['client'], active['controller']
@@ -362,7 +363,8 @@ class GraspPlugin:
                     result['torque_released'] = self._unload_owned(ctrl, active['owner'])
                 if not successor:
                     release_motion(ctrl, active['owner'])
-                result = {'bound_side': active['side'], 'can_channel': device_key[1], **result}
+                result = {'bound_side': active['side'], 'can_channel': device_key[1],
+                          **result, 'success': status == 'completed'}
                 terminal = {'action_id': active['action_id'], 'status': status, 'result': result}
                 if current:
                     self._active.pop(device_key, None)
@@ -370,13 +372,13 @@ class GraspPlugin:
                 self._results[device_key] = self._last_result = terminal
                 active['terminal'] = terminal
                 active['done_event'].set()
-                active['result_event'].set()
-        # Completion must be visible before an optional network notification.
-        if active['notify_completion']:
-            try:
-                self._acp_callback(active['action_id'], status, result)
-            except Exception:
-                self._delivery_failed = True
+        # Release the device lease before reporting the terminal result. Every
+        # accepted worker reports completion, including errors and cancellation.
+        try:
+            self._acp_callback(active['action_id'], status, result)
+        except Exception as exc:
+            self._delivery_failed = True
+            print(f"[ACP] {active['action_id']}: {exc}", flush=True)
 
     def _options(self, device_key: tuple[str, str], action: str, args: dict) -> dict:
         obsolete = {'target_force', 'max_force', 'hold_duration_s', 'slip_threshold', 'active_fingers', 'approach_speed'}
@@ -395,16 +397,11 @@ class GraspPlugin:
         return {'action': action, 'grasp_mode': 'top' if action == 'top_grasp' else 'side',
                 'speed_ratio': ratio, 'approach_speed': min(255, round(85 * SPEED_RATIOS[ratio]))}
 
-    def _action_reply(self, active: dict, wait_for_result: bool) -> dict:
-        if wait_for_result:
-            active['result_event'].wait()
-            terminal = active['terminal']
-            return {**terminal['result'], 'success': terminal['status'] == 'completed',
-                    'completed_action_id': active['action_id']}
+    def _action_reply(self, active: dict) -> dict:
         return {'message': '释放已开始' if active['action'] == 'release' else '抓握准备已开始，完成后回报指令下发结果',
                 'state': 'running', 'action_id': active['action_id']}
 
-    def _start_action(self, instance_id: str, action: str, args: dict, *, wait_for_result: bool = False) -> dict:
+    def _start_action(self, instance_id: str, action: str, args: dict) -> dict:
         side = validate_bound_side(args.get('bound_side'))
         channel = self.global_config.get('can_channel', 'can0')
         device_key = (side, channel)
@@ -436,7 +433,6 @@ class GraspPlugin:
                 active = None
             if active is None:
                 active = self._new_active(device_key, instance_id, action, options, client, side, ctrl, predecessor=previous)
-                active['notify_completion'] = not wait_for_result
                 self._stop.clear()
                 self._active[device_key] = active
                 self._states[device_key] = 'releasing' if action == 'release' else 'preparing'
@@ -458,9 +454,8 @@ class GraspPlugin:
                 release_motion(ctrl, active['owner'])
                 active['terminal'] = {'status': 'error', 'result': {'state': 'error', 'message': str(exc), 'holding': False}}
                 active['done_event'].set()
-                active['result_event'].set()
                 raise
-        return self._action_reply(active, wait_for_result)
+        return self._action_reply(active)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get('instance_id') or ''
@@ -514,8 +509,10 @@ class GraspPlugin:
         if action in GRASP_ACTIONS:
             if args.get('confirm_motion') is not True:
                 raise ValueError('confirm_motion must be true for every grasp motion request')
-            wait = args.get('wait_for_result', True)
+            wait = args.get('wait_for_result', False)
             if not isinstance(wait, bool):
                 raise ValueError('wait_for_result 必须为布尔值')
-            return self._start_action(instance_id, action, args, wait_for_result=wait)
+            if wait:
+                raise ValueError('抓握动作使用异步完成协议，不支持 wait_for_result=true；请通过 action_id 接收 ACP 完成通知')
+            return self._start_action(instance_id, action, args)
         return None

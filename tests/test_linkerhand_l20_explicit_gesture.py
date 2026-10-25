@@ -149,7 +149,9 @@ def test_two_hands_run_independently_and_stop_targets_one(plugin, monkeypatch):
             plugin.dispatch("ok_gesture", {"bound_side": "left", "confirm_motion": True})
         assert plugin.dispatch("stop", {"instance_id": "unrelated-card"})["state"] == "idle"
         assert not any(active["stop_event"].is_set() for active in plugin._active.values())
-        plugin.dispatch("stop", {"bound_side": "left"})
+        stopped = plugin.dispatch("stop", {"bound_side": "left"})
+        assert stopped["state"] == "idle" and stopped["cancel_requested"]
+        assert stopped["target_resolved"]
         assert not plugin._active[("right", "can0")]["stop_event"].is_set()
     finally:
         finish.set()

@@ -742,7 +742,8 @@ class GesturePlugin:
                     if self._held.get(key) is record:
                         self._held.pop(key, None)
             self._release_held([record for _, record in held])
-            return {"state": "stopping" if active else "idle",
+            return {"state": "idle", "cancel_requested": bool(active),
+                    "target_resolved": bool(active or held),
                     "active_action_id": active[0]["action_id"] if active else None}
 
         if action in ACTIONS:

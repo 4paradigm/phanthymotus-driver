@@ -395,8 +395,16 @@ def test_position_grasp_does_not_depend_on_tactile_values():
     grasp = GraspPlugin(hand_plugin, {})
     mock_bus.sim_touch = [255] * 5
     client.get_fresh_tactile = MagicMock(side_effect=AssertionError('unexpected tactile read'))
+    completions, done = [], threading.Event()
+    def completed(aid, status, result):
+        completions.append((aid, status, result))
+        done.set()
+    grasp._acp_callback = completed
     try:
-        result = grasp.dispatch('side_grasp', {'instance_id': 'inst_position', "bound_side": "right", 'confirm_motion': True})
+        accepted = grasp.dispatch('side_grasp', {'instance_id': 'inst_position', "bound_side": "right", 'confirm_motion': True})
+        assert accepted['state'] == 'running' and done.wait(2)
+        assert completions[0][0] == accepted['action_id'] and completions[0][1] == 'completed'
+        result = completions[0][2]
         assert result['success'] and result['command_sent']
         client.get_fresh_tactile.assert_not_called()
         assert mock_bus.sim_tip == [0] * 5
@@ -428,7 +436,7 @@ def test_all_plugins_start_action():
         # Project lifecycle startup must not require a device selection or CAN.
         assert card.dispatch("start", {"instance_id": "canvas-card"})["state"] == "ready"
         result = card.dispatch("stop", {"instance_id": "canvas-card"})
-        assert result["state"] in ("idle", "unmatched")
+        assert result["state"] == "idle"
         assert not card._active
 
 

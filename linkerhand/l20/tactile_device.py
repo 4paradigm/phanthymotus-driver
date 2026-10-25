@@ -565,7 +565,7 @@ class TactilePlugin:
         if action == "stop":
             self._stop_instance_stream(instance_id)
             return {
-                "state": "stopped",
+                "state": "idle",
                 "bound_side": side,
                 "topic_out": self.topic_out(side, channel),
             }
