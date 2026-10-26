@@ -1233,7 +1233,8 @@ class U1CardContractTests(unittest.TestCase):
         with mock.patch.object(device, "_acp_notify"):
             result = plugin.dispatch("stop", {})
         self.assertEqual(nodes.interrupts, 1)
-        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["state"], "interrupt_unconfirmed")
+        self.assertIsNotNone(plugin._active)
         self.assertFalse(plugin.running)
 
     def test_tts_rejected_request_clears_active_action_and_notifies_acp(self):
@@ -1276,7 +1277,7 @@ class U1CardContractTests(unittest.TestCase):
         plugin.dispatch("speak", {"text": "hello"})
         with mock.patch.object(device, "_acp_notify"):
             result = plugin.dispatch("interrupt", {})
-        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["state"], "interrupt_unconfirmed")
         self.assertEqual(nodes.interrupts, 1)
 
     def test_tts_schema_has_completion_contract(self):

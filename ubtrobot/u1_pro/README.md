@@ -9,7 +9,7 @@
 
 部署服务使用 `restart: always`，用于主机或 Docker daemon 重启后自动恢复驱动；运维人员手动停止容器后，Docker 会在 daemon 重启时再次启动它。若需临时停用，应通过部署编排管理该服务，而不是依赖 `docker stop` 保持停机。
 - `tts`：通过 U1 SDK `play_text` 进行文本播报，支持打断和 ACP 异步完成回报。真机音量服务不纳入本驱动能力。
-- `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。
+- `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。中断请求后保留当前任务，返回 `interrupt_unconfirmed`，等待匹配 UUID 的厂商终态后才释放占用；服务拒绝或异常不会提前报告 cancelled。
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
 
@@ -63,7 +63,7 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 因此要求显式填写速度与加速度，不隐藏猜测值；厂商拒绝时会显示 status/message。
 
 发送前必须有 1 秒内的 `neck_base_joint` 控制器反馈，并只读确认三类自主行为均关闭。
-不会自动切换行为。与 `head`、`expression`、`tts` 原有任务双向互斥；占用期间
+不会自动切换行为。与 `head`、`expression`、`tts` 原有任务双向互斥（包括尚未确认结束的音频中断）；占用期间
 `system_controls` 不能开启自主行为（仍可关闭）。这只协调本驱动，不会锁住其他厂商进程。
 
 状态包括 `checking`、`request_pending`、`accepted_unverified`、`settled_unverified`、

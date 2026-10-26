@@ -1443,17 +1443,30 @@ class AudioPlugin:
 
     def stop(self):
         with self._lock:
+            self.running = False
             active = self._active
-            self._active = None
-        result = {"state": "idle"}
-        if active:
-            try:
-                result["interrupt"] = self.nodes.trigger_call("interrupt")
-            except Exception as exc:
-                result["interrupt_error"] = str(exc)
-            finally:
-                _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, active["tool_name"])
-        self.running = False
+            if not active:
+                return {"state": "idle"}
+            if active.get("stopping"):
+                return {"state": "interrupt_unconfirmed", "active": dict(active)}
+            # Keep ownership while the interrupt is pending or failed. Otherwise
+            # head_orientation could start while a preset is still moving.
+            active["stopping"] = True
+        result = {"state": "interrupt_unconfirmed"}
+        try:
+            response = self.nodes.trigger_call("interrupt")
+            result["interrupt"] = response
+            if _vendor_request_failed(response):
+                result["interrupt_error"] = "vendor rejected interrupt"
+        except Exception as exc:
+            result["interrupt_error"] = str(exc)[:256]
+        with self._lock:
+            if self._active is active:
+                if result.get("interrupt_error"):
+                    active["stop_error"] = result["interrupt_error"]
+                result["active"] = dict(active)
+            else:
+                result["state"] = "vendor_reported_terminal"
         return result
 
     def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio") -> dict:

@@ -220,6 +220,23 @@ class DirectionTests(unittest.TestCase):
         self.assertIsNone(audio._orientation_owner)
         plugin._client.call_async.assert_not_called()
 
+    def test_audio_stop_retains_ownership_until_matching_vendor_terminal(self):
+        for response in ({"success": True}, {"success": False}, RuntimeError("interrupt failed")):
+            plugin, audio, nodes = self.head()
+            audio._active = {"action_id": "old", "vendor_uuid": "old-vendor", "tool_name": "head"}
+            if isinstance(response, Exception):
+                nodes.trigger_call.side_effect = response
+            else:
+                nodes.trigger_call.return_value = response
+            with mock.patch.object(device, "_acp_notify") as notify:
+                self.assertEqual(audio.stop()["state"], "interrupt_unconfirmed")
+                self.assertEqual(plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1))["state"], "error")
+                notify.assert_not_called()
+                audio._on_playback_state({"phase": "result", "uuid": "unrelated", "state_name": "COMPLETED"})
+                self.assertIsNotNone(audio._active)
+                audio._on_playback_state({"phase": "result", "uuid": "old-vendor", "state_name": "COMPLETED"})
+                self.assertIsNone(audio._active)
+
     def test_system_enable_blocked_by_shared_reservation(self):
         plugin, audio, nodes = self.head()
         nodes._actuator_audio = audio
