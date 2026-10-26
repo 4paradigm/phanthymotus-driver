@@ -132,6 +132,16 @@ class SharedSampler:
                     "effective_sample_count": None,
                     "note": "Getter receipt/change rate cannot prove source refresh rate or independent samples."}
 
+    def read_since(self, cursor, error_epoch):
+        """Read only new observations; a getter read never fabricates a sample."""
+        with self._condition:
+            if error_epoch != self._errors:
+                raise MassError("DATA_ERROR", self._error or "state feedback interrupted")
+            frames = [copy.deepcopy(f) for f in self._frames if f["serial"] > cursor]
+            if frames and frames[0]["serial"] != cursor + 1:
+                raise MassError("DATA_GAP", "observation buffer overrun")
+            return frames
+
     def collect(self, duration, profile, cancel):
         with self._condition:
             cursor, epoch = self._serial, self._errors

@@ -345,7 +345,7 @@ def make_handler():
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
                     payload_task = name == "payload_mass" and args.get("action") in (
-                        "prepare", "weigh", "finish")
+                        "prepare", "weigh", "stop", "finish")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")

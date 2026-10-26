@@ -1,5 +1,5 @@
 {
-  "notice": "UNVERIFIED TEMPLATE. No real pose, recording, payload limit or calibrated kg response is provided.",
+  "notice": "UNVERIFIED TEMPLATE. One bend-and-hold recording; stop must naturally return arms down. No guessed pose, payload limit or calibration.",
   "sample_duration_s": 3,
   "profile": {
     "arm": "left",
@@ -48,10 +48,9 @@
     "verified": false,
     "evidence": "",
     "bend_recording_id": null,
-    "home_recording_id": null,
     "home_q": null,
-    "home_workmode": 2,
-    "timeout_s": 30
+    "timeout_s": 30,
+    "return_on_stop_verified": false
   },
   "model": null
 }

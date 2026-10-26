@@ -141,6 +141,32 @@ def test_payload_registration_shares_state_and_loco_and_gates_response(bundle_mo
     assert card.published == [("test_id", False)]
 
 
+def test_canvas_stop_releases_its_worker_gate_only_after_mcp_response(bundle_module, monkeypatch):
+    import io
+    import json
+    events = []
+    def dispatch(name, args):
+        assert name == "payload_mass" and args["action"] == "stop"
+        events.append("dispatch")
+        return {"state": "running", "action_id": "stop_test"}
+    def published(action_id, delivered):
+        assert action_id == "stop_test" and delivered
+        assert b"stop_test" in handler.wfile.getvalue()
+        events.append("published")
+    monkeypatch.setattr(bundle_module, "_bundle", types.SimpleNamespace(dispatch=dispatch, response_published=published))
+    handler = bundle_module.make_handler().__new__(bundle_module.make_handler())
+    raw = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "payload_mass", "arguments": {"action": "stop"}}}).encode()
+    handler.path = "/mcp"
+    handler.headers = {"Content-Length": str(len(raw))}
+    handler.rfile, handler.wfile = io.BytesIO(raw), io.BytesIO()
+    handler.send_response = lambda *a: None
+    handler.send_header = lambda *a: None
+    handler.end_headers = lambda: None
+    handler.do_POST()
+    assert events == ["dispatch", "published"]
+
+
 def test_enabled_loco_servo_registers_and_reuses_loco(bundle_module):
     high_ctrl = FakeHighCtrl()
     executor = object()
