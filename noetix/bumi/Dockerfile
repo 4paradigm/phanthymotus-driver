@@ -92,7 +92,7 @@ COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
-# Check the standalone distance/leg-odometry modules import without ROS nodes.
+# Check the standalone target/leg-odometry modules import without ROS nodes.
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "import imu_distance_control, leg_odometry"'
 
 # Add SDK DDS libs + pybind modules to paths
