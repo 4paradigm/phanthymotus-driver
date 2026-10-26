@@ -43,7 +43,7 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 |---|---|
 | `start` | 无参数；准备服务与只读反馈 |
 | `turn` | 必填 `confirm: true`、`degree`（有限数，暂限 ±20）、`max_vel`、`max_acc`（有限数，`0 < value <= 0.4`）；可选 `timeout`（1–60 秒，默认 15） |
-| `center` | 中立朝向与绝对/相对语义尚未确认，明确返回错误，不发送 `degree=0` |
+| `acknowledge` | 操作者显式确认未知任务的剩余风险后，仅解除本地占用；详见现场恢复说明 |
 | `stop` | 禁止后续 turn；提交前可取消本地检查；提交后返回 `stop_unconfirmed`，不声称物理停止，不调用 SDK 音频中断 |
 | `info` | 当前任务、厂商回执、反馈、反馈年龄、错误、停止能力和角度语义 |
 
@@ -110,7 +110,7 @@ actual/desired 误差 <0.02 rad、desired 每次变化 <0.001 rad 持续 1 秒�
 - `confidence`：SDK 提供的原始置信度，缺失为 null，不合成置信度；不对置信度另设猜测门限。
 - `unit`、`coordinate_convention`、`error`：明确角度约定、参考系限制和解析错误。
 
-新事件立即发布；本地定时器在过期时发布一次无效状态，stop 也发布无效状态并退订。
+新事件立即发布；每秒重发当前状态，无数据和过期也明确输出，stop 发布无效状态并退订。
 不启用厂商唤醒、跟随或自主行为，不向 head_orientation 发送任何命令。
 若未收到事件，应检查既有厂商事件生产条件，卡片不会为获取事件而修改行为开关。
 
@@ -124,9 +124,45 @@ actual/desired 误差 <0.02 rad、desired 每次变化 <0.001 rad 持续 1 秒�
    三类自主行为需由操作者确认关闭，先校验越界参数拒绝，再单次提交上例并观察实际方向、
    幅度、服务回执、控制器反馈与保持状态，记录绝对/相对语义及速度单位。
 4. 转向占用期间尝试 head/expression/tts 和开启自主行为，确认被拒绝；
-   测试 stop/超时显示未确认而非完成，观察稳定反馈恢复路径。center 应明确拒绝，不能误报回中。
+   测试 stop/超时显示未确认而非完成，观察稳定反馈恢复路径。center 不再作为可执行动作展示；旧客户端调用仍应明确拒绝，不能误报回中。
 5. 回中和物理停止需进一步确认厂商接口后再实现；首版只分别验收两张卡片，不做自动联动。
 
 针对性离线测试：`python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py'`；
 部署配置检查：`python3 scripts/check_service_yml.py ubtrobot/u1_pro`。
 镜像增加本地 `uworld_motion_msgs` 最小接口包，以及标准 `ros-humble-control-msgs` 运行依赖（接口构建阶段不需要 control_msgs）。
+
+## 2026-10-26 现场超时修复与恢复
+
+现场发现：旧版使用 CycloneDDS 时，domain 2 厂商节点的标准只读 GetParameters
+能被发现但等待回复超时；同容器改用 FastDDS、仅绑定 127.0.0.1 后只读请求成功。
+因此头部服务改为独立 FastDDS 子进程，仍只调用同一条 SoundSource 路径；
+音视频、反馈和 domain 42 桥接继续使用原有 CycloneDDS。子进程使用随镜像提供的
+`head-dds-local.xml`，禁用内建传输，仅允许回环；文件或中间件不符则拒绝初始化。
+`ros-humble-rmw-fastrtps-cpp` 是该控制子进程所需运行依赖。
+
+每次 turn 发送前先执行只读 `use_sim_time` 参数往返查询，并检查服务发现。
+检查失败时不发送运动；检查成功也不代表 SoundSource 运动本身已经真机验收。
+本次没有补发旧转向或执行零度探测。
+
+- `center` 已从网页动作下拉菜单移除；旧客户端调用仍明确返回未支持，不能冒充回中。
+- busy 错误增加 `blocking`，给出占用卡片、任务和未确认原因；关键任务状态会输出日志。
+- 未确认请求发送前将任务记录持久化至 `/opt/phanthy-motus/data/u1-head-orientation.json`，
+  文件采用原子替换并同步磁盘；重启后恢复为 `prior_outcome_unknown`，不自动清锁。
+  可用驱动 config 的 `head_orientation_state_file` 调整记录位置，必须可写；写入失败则不发送。
+- 新动作 `acknowledge`：**操作者**观察机器人当前状态并接受未确认请求的剩余风险后，
+  选择此动作、填 `confirm=true` 执行。驱动还要求无仍在等待的服务请求、只读控制链路可往返、
+  至少连续两秒新鲜且稳定的 actual/desired 反馈。它只解除本地占用，
+  返回 `operator_acknowledged_unverified`；不是厂商取消、实际完成或物理停止证明。
+  `info` 可查看 `blocking` 和 `recovery_requires_operator_acknowledgement`。
+
+sound_direction 增加网页可见动作：
+
+- `status`：查看最近方向、有效状态、错误和 `settings`。
+- `configure`：填写 `stale_after`、`alpha`，直接更新采集卡参数，不开启任何厂商行为。
+- 数据流每秒发布一次当前状态，即使没有事件也显示 `data_state=no_data`、
+  `direction_degrees=null`；过期显示 stale，解析异常显示 invalid。
+  `settings` 给出当前生效参数。不会把状态心跳作为新的声源样本或伪造置信度。
+
+更新后网页刷新工具列表；若仍出现旧动作列表，移除并重新添加这两张卡片。
+先看声源卡 status / 数据流，头部卡 info；未知旧任务由操作者决定是否 acknowledge，
+之后才能提交新的 turn。不要将该恢复动作自动接入编排。

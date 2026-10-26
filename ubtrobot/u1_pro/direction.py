@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 import uuid
+from pathlib import Path
+
+from head_transport import HeadServiceTransport
 
 from common.vendor_runtime import action_schema, tool
 
@@ -68,12 +72,15 @@ class SoundDirectionPlugin:
         self.alpha = 0.35
         self.topic = f"/{nodes.namespace}/u1_pro/sound_direction"
         self._expired_published = False
+        self._last_publish = 0.0
 
     def get_tool(self):
         schema = action_schema({
             "start": (["stale_after", "alpha"], "Subscribe only; never enables wakeup or turns the head."),
             "stop": ([], "Stop subscription and invalidate the last direction."),
             "info": ([], "Read direction, validity and SDK confidence."),
+            "status": ([], "查看声源状态、最近方向及当前参数。"),
+            "configure": (["stale_after", "alpha"], "设置过期时间与平滑系数；不启用厂商行为。"),
         }, {
             "stale_after": {"type": "number", "minimum": 0.1, "maximum": 60, "default": 2},
             "alpha": {"type": "number", "minimum": 0.01, "maximum": 1, "default": 0.35},
@@ -124,7 +131,9 @@ class SoundDirectionPlugin:
         latest = dict(self._latest or {})
         valid = bool(self.running and latest.get("event_valid") and age is not None
                      and age <= self.stale_after and not self._error)
+        data_state = "stopped" if not self.running else "invalid" if self._error else "no_data" if age is None else "stale" if age > self.stale_after else "valid" if valid else "invalid"
         return {"state": "running" if self.running else "idle", "valid": valid,
+                "data_state": data_state, "settings": {"stale_after": self.stale_after, "alpha": self.alpha},
                 "direction_degrees": latest.get("smoothed") if valid else None,
                 "raw_degrees": latest.get("raw"), "last_direction_degrees": latest.get("smoothed"),
                 "confidence": latest.get("confidence"), "received_at": latest.get("received_at"),
@@ -136,6 +145,7 @@ class SoundDirectionPlugin:
         message = self.nodes.String()
         message.data = json.dumps(self._state(), allow_nan=False)
         self._publisher.publish(message)
+        self._last_publish = time.monotonic()
 
     def _on_event(self, event):
         with self._lock:
@@ -162,16 +172,26 @@ class SoundDirectionPlugin:
 
     def _expire(self):
         with self._lock:
-            if self.running and self._state()["stale"] and not self._expired_published:
-                self._publish()
-                self._expired_published = True
+            if self.running:
+                expired = self._state()["stale"]
+                if (expired and not self._expired_published) or time.monotonic() - self._last_publish >= 1:
+                    self._publish()
+                    self._expired_published = expired
 
     def dispatch(self, action, args):
         if action == "start":
             return self.start(args)
         if action == "stop":
             return self.stop()
-        if action == "info":
+        if action == "configure":
+            stale = number(args.get("stale_after", self.stale_after), "stale_after", .1, 60)
+            alpha = number(args.get("alpha", self.alpha), "alpha", .01, 1)
+            with self._lock:
+                self.stale_after, self.alpha = stale, alpha
+                if self.running:
+                    self._publish()
+                return self._state()
+        if action in ("info", "status"):
             with self._lock:
                 return self._state()
         return None
@@ -194,12 +214,29 @@ class HeadOrientationPlugin:
         self._last_desired = None
         self._error = ""
         self._generation = 0
+        self._stationary_since = None
+        config = vars(nodes).get("config")
+        self._state_path = Path(config.get("head_orientation_state_file", "/opt/phanthy-motus/data/u1-head-orientation.json")) if isinstance(config, dict) else None
+        if self._state_path and self._state_path.exists():
+            try:
+                saved = json.loads(self._state_path.read_text())
+                if saved.get("unresolved"):
+                    self._task = saved["task"]
+                    self._task["prior_state"] = self._task.get("state")
+                    self._task["state"] = "prior_outcome_unknown"
+                    self._task["accepted"] = False
+                    self.audio._orientation_owner = self
+                    self._error = "上次转向结果未知；未自动解除占用，请先人工确认机器人状态"
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                self._task = {"state": "prior_outcome_unknown", "accepted": False}
+                self.audio._orientation_owner = self
+                self._error = "无法读取头部任务恢复记录，保留占用"
 
     def get_tool(self):
         schema = action_schema({
             "start": ([], "Prepare service client and read-only neck feedback; no movement."),
             "turn": (["degree", "max_vel", "max_acc", "timeout", "confirm"], "Submit vendor degree, with_waist=false. Coordinate semantics need hardware validation."),
-            "center": ([], "Unavailable until neutral orientation is confirmed; sends no command."),
+            "acknowledge": (["confirm"], "人工确认未知任务的剩余风险后解除本地占用；要求稳定反馈和只读链路检查，不会停止或移动机器人。"),
             "stop": ([], "Disable new turns; physical cancellation is unverified and no stop command is sent."),
             "info": ([], "Read task, controller feedback and errors; acceptance never means arrival."),
         }, {
@@ -221,7 +258,7 @@ class HeadOrientationPlugin:
                 from control_msgs.msg import JointTrajectoryControllerState
                 try:
                     self._request_type = SoundSource.Request
-                    self._client = self.nodes.audio_device.create_client(SoundSource, SOUND_SOURCE)
+                    self._client = HeadServiceTransport()
                     self._subscription = self.nodes.audio_device.create_subscription(
                         JointTrajectoryControllerState, NECK_TOPIC, self._on_feedback, self.nodes._sensor_qos)
                     self._timer = self.nodes.audio_device.create_timer(.1, self._tick)
@@ -238,7 +275,9 @@ class HeadOrientationPlugin:
                 "feedback_age_seconds": None if self._feedback_at is None else time.monotonic() - self._feedback_at,
                 "error": self._error, "arrival_confirmed": False,
                 "center_supported": False, "physical_stop_supported": False,
-                "angle_semantics": "vendor degree; sign, reference and absolute/relative unverified"}
+                "angle_semantics": "vendor degree; sign, reference and absolute/relative unverified",
+                "transport": "isolated FastDDS loopback domain 2; CycloneDDS feedback",
+                "blocking": self._blocking(), "recovery_requires_operator_acknowledgement": getattr(self.audio, "_orientation_owner", None) is self}
 
     def turn(self, args):
         degree = number(args.get("degree"), "degree", -20, 20)
@@ -253,7 +292,7 @@ class HeadOrientationPlugin:
             if not self.running:
                 return {"state": "error", "message": "start head_orientation first"}
             if self.audio._active or getattr(self.audio, "_orientation_owner", None):
-                return {"state": "error", "message": "U1 head/audio resource busy or outcome unresolved"}
+                return {"state": "error", "message": "头部资源被占用或上次结果未知，请查看 blocking；不要重复发送转向", "blocking": self._blocking()}
             if self._feedback_at is None or time.monotonic() - self._feedback_at > 1:
                 return {"state": "error", "message": "fresh neck feedback required"}
             self._generation += 1
@@ -294,6 +333,8 @@ class HeadOrientationPlugin:
                 request.prismatic_setup.max_vel = request.prismatic_setup.max_acc = 0.0
                 request.prismatic_setup.toy_zone = request.prismatic_setup.servo_zone = 0.0
                 self._task["state"] = "request_pending"
+                self._persist(True)
+                self._log_state()
                 sent = True  # A call_async exception may still leave a request in flight.
                 future = self._client.call_async(request)
                 self._future = future  # Keep it alive; cancelling locally cannot cancel vendor motion.
@@ -304,11 +345,38 @@ class HeadOrientationPlugin:
                     return
                 self._error = str(exc)[:256]
                 self._task["state"] = "outcome_unknown" if sent else "error"
+                self._log_state()
                 if not sent:
                     self._release()
 
+    def _blocking(self):
+        if self.audio._active:
+            return {"kind": "audio", "task": dict(self.audio._active)}
+        if getattr(self.audio, "_orientation_owner", None) is self:
+            return {"kind": "head_orientation", "task": dict(self._task or {}), "error": self._error}
+        return None
+
+    def _persist(self, unresolved):
+        if self._state_path:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._state_path.with_suffix(".tmp")
+            with temporary.open("w") as handle:
+                json.dump({"unresolved": unresolved, "task": self._task}, handle, allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(self._state_path)
+            descriptor = os.open(self._state_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def _log_state(self):
+        print(f"[U1 head] state={self._task['state']} task={self._task.get('id', 'restored')} error={self._error[:256]!r}", flush=True)
+
     def _release(self):
         if getattr(self.audio, "_orientation_owner", None) is self:
+            self._persist(False)
             self.audio._orientation_owner = None
 
     def _on_response(self, generation, future):
@@ -329,9 +397,12 @@ class HeadOrientationPlugin:
                         self._task["state"] = "accepted_unverified"
                     # Only convergence observed AFTER the service response is considered.
                     self._stable_since = None
+                    self._persist(True)
+                self._log_state()
             except Exception as exc:
                 self._task["state"] = "outcome_unknown"
                 self._error = str(exc)[:256]
+                self._log_state()
 
     def _on_feedback(self, message):
         with self._lock:
@@ -344,11 +415,17 @@ class HeadOrientationPlugin:
                 return
             now = time.monotonic()
             continuous = self._feedback_at is not None and now - self._feedback_at < .5
+            stationary = (continuous and self._feedback is not None and abs(actual - self._feedback["actual_radians"]) < .002
+                          and self._last_desired is not None and abs(desired - self._last_desired) < .001 and abs(actual - desired) < .02)
+            if not stationary:
+                self._stationary_since = None
+            elif self._stationary_since is None:
+                self._stationary_since = now
             self._feedback = {"joint": "neck_base_joint", "actual_radians": actual,
                               "desired_radians": desired, "received_at": time.time()}
             self._feedback_at = now
             if self._task and getattr(self.audio, "_orientation_owner", None) is self:
-                if abs(desired - self._task["initial_desired"]) > .005:
+                if abs(desired - self._task.get("initial_desired", desired)) > .005:
                     self._task["desired_changed"] = True
                 settled = (self._task["accepted"] and self._task["desired_changed"]
                            and abs(actual - desired) < .02 and self._last_desired is not None
@@ -366,15 +443,17 @@ class HeadOrientationPlugin:
     def _tick(self):
         with self._lock:
             if (self._task and getattr(self.audio, "_orientation_owner", None) is self
-                    and time.monotonic() > self._task["deadline"]
-                    and self._task["state"] != "stop_unconfirmed"):
+                    and time.monotonic() > self._task.get("deadline", float("inf"))
+                    and self._task["state"] not in ("stop_unconfirmed", "timeout_unconfirmed", "outcome_unknown", "prior_outcome_unknown")):
                 if self._task["state"] == "checking":
                     self._generation += 1  # Invalidate a check that has not submitted motion.
                     self._task["state"] = "error"
                     self._release()
                 else:
                     self._task["state"] = "timeout_unconfirmed"
-                self._error = "task timed out; no physical stop confirmed"
+                self._error = "厂商服务未确认任务结果，保留占用；请查看任务和 blocking，不要重复转向"
+                self._persist(getattr(self.audio, "_orientation_owner", None) is self)
+                self._log_state()
 
     def stop(self):
         with self._lock:
@@ -400,12 +479,40 @@ class HeadOrientationPlugin:
                 self.nodes.audio_device.destroy_subscription(self._subscription)
                 self._subscription = None
             if self._client is not None:
-                self.nodes.audio_device.destroy_client(self._client)
+                self._client.close()
                 self._client = None
+
+    def acknowledge(self, args):
+        if args.get("confirm") is not True:
+            return {"state": "error", "message": "必须人工确认机器人当前状态及未知请求的剩余风险，再填写 confirm=true；此操作不停止机器人"}
+        with self._lock:
+            if getattr(self.audio, "_orientation_owner", None) is not self:
+                return self._state()
+            if self._task["state"] not in ("prior_outcome_unknown", "timeout_unconfirmed", "outcome_unknown", "stop_unconfirmed"):
+                return {"state": "error", "message": "任务仍在执行或检查，不允许解除占用"}
+            if self._client is None or self._client.inflight:
+                return {"state": "error", "message": "服务请求仍在等待结果，暂不能解除占用"}
+            generation = self._generation
+        try:
+            if not self._client.wait_for_service(timeout_sec=1):
+                raise RuntimeError("只读控制链路未就绪")
+        except Exception as exc:
+            return {"state": "error", "message": str(exc)[:256]}
+        with self._lock:
+            if generation != self._generation or self._feedback_at is None or time.monotonic() - self._feedback_at > .5 or self._stationary_since is None or time.monotonic() - self._stationary_since < 2:
+                return {"state": "error", "message": "需要连续两秒新鲜且稳定的颈部反馈；没有解除占用"}
+            self._task["state"] = "operator_acknowledged_unverified"
+            self._release()
+            self._generation += 1
+            self._error = "操作者确认后仅解除本地占用；没有确认旧请求完成或物理停止"
+            self._log_state()
+            return self._state()
 
     def dispatch(self, action, args):
         if action == "start":
             return self.start()
+        if action == "acknowledge":
+            return self.acknowledge(args)
         if action == "turn":
             return self.turn(args)
         if action == "center":

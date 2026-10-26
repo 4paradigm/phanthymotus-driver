@@ -1,5 +1,6 @@
 """Offline direction-card contracts. No ROS discovery or hardware operations."""
 import concurrent.futures
+import tempfile
 import json
 import sys
 import threading
@@ -264,14 +265,15 @@ class DirectionTests(unittest.TestCase):
         service.SoundSource = types.SimpleNamespace(Request=object)
         messages = types.ModuleType("control_msgs.msg")
         messages.JointTrajectoryControllerState = object
-        with mock.patch.dict(sys.modules, {"uworld_motion_msgs.srv": service, "control_msgs.msg": messages}):
+        with mock.patch.dict(sys.modules, {"uworld_motion_msgs.srv": service, "control_msgs.msg": messages}), mock.patch.object(direction, "HeadServiceTransport") as transport:
             self.assertEqual(plugin.start()["state"], "ready")
             plugin.start()
-        nodes.audio_device.create_client.assert_called_once_with(service.SoundSource, direction.SOUND_SOURCE)
+        transport.assert_called_once_with()
+        nodes.audio_device.create_client.assert_not_called()
         nodes.audio_device.create_subscription.assert_called_once()
         plugin._client.call_async.assert_not_called()
         plugin.close()
-        nodes.audio_device.destroy_client.assert_called_once()
+        transport.return_value.close.assert_called_once()
         nodes.audio_device.destroy_subscription.assert_called_once()
         nodes.audio_device.destroy_timer.assert_called_once()
 
@@ -285,6 +287,58 @@ class DirectionTests(unittest.TestCase):
         plugin._client.call_async.assert_not_called()
         self.assertIsNone(audio._orientation_owner)
         self.assertIn("stale", plugin._state()["error"])
+
+    def test_sound_status_configure_and_no_data_heartbeat(self):
+        plugin, _ = self.sound()
+        self.assertEqual(plugin.dispatch("status", {})["data_state"], "no_data")
+        actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("status", actions)
+        self.assertIn("configure", actions)
+        result = plugin.dispatch("configure", {"alpha": .5, "stale_after": 3})
+        self.assertEqual(result["settings"], {"alpha": .5, "stale_after": 3})
+        plugin._last_publish -= 2
+        count = plugin._publisher.publish.call_count
+        plugin._expire()
+        self.assertEqual(plugin._publisher.publish.call_count, count + 1)
+        self.assertFalse(json.loads(plugin._publisher.publish.call_args.args[0].data)["valid"])
+        with self.assertRaises(ValueError):
+            plugin.dispatch("configure", {"alpha": 0})
+
+    def test_unresolved_task_survives_restart_and_requires_explicit_ack(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin, audio, nodes = self.head()
+            plugin._state_path = Path(temp) / "guard.json"
+            future = concurrent.futures.Future()
+            plugin._client.call_async.return_value = future
+            self.submit(plugin)
+            self.assertTrue(json.loads(plugin._state_path.read_text())["unresolved"])
+            nodes.config = {"head_orientation_state_file": str(plugin._state_path)}
+            replacement_audio = device.AudioPlugin(nodes)
+            restored = direction.HeadOrientationPlugin(nodes, replacement_audio)
+            self.assertEqual(restored._state()["state"], "prior_outcome_unknown")
+            self.assertIs(replacement_audio._orientation_owner, restored)
+            self.assertEqual(restored.acknowledge({})["state"], "error")
+            restored._client = mock.Mock(inflight=False)
+            self.assertEqual(restored.acknowledge({"confirm": True})["state"], "error")
+            now = time.monotonic()
+            with mock.patch.object(direction.time, "monotonic") as clock:
+                for i in range(26):
+                    clock.return_value = now + i * .1
+                    restored._on_feedback(neck())
+                restored.acknowledge({"confirm": True})
+            self.assertIsNone(replacement_audio._orientation_owner)
+            self.assertFalse(restored._state()["arrival_confirmed"])
+            self.assertFalse(json.loads(plugin._state_path.read_text())["unresolved"])
+            self.assertEqual(restored._state()["state"], "operator_acknowledged_unverified")
+
+    def test_center_is_not_advertised_and_busy_result_explains_owner(self):
+        plugin, audio, _ = self.head()
+        actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertNotIn("center", actions)
+        audio._active = {"action_id": "prior", "tool_name": "head"}
+        result = plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, confirm=True))
+        self.assertEqual(result["blocking"]["kind"], "audio")
+        self.assertEqual(result["blocking"]["task"]["action_id"], "prior")
 
     def test_schemas_and_runtime_dependencies(self):
         plugin, _, _ = self.head()
