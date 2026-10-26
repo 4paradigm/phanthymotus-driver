@@ -25,7 +25,7 @@ backend.SlamtecVelocityBackend = type("Backend", (), {})
 sys.modules["loco_servo"] = core
 sys.modules["slamtec_velocity"] = backend
 ''' + body
-    return subprocess.run([sys.executable, "-u", "-c", script, str(WORKER), str(ROOT)],
+    return subprocess.run([sys.executable, "-I", "-u", "-c", script, str(WORKER), str(ROOT)],
                           capture_output=True, check=True, timeout=10)
 
 
@@ -100,3 +100,48 @@ sys.stderr.write("\x1b[32mdirect-error\x1b[0m\x00\r\n")
 ''')
     assert result.stdout == b"direct-child\n"
     assert result.stderr == b"direct-error\n"
+
+
+def test_flat_work_path_does_not_index_beyond_filesystem_root():
+    result = run_probe(r'''
+del core.LocoServoPlugin
+def import_core(name):
+    if name != "LocoServoPlugin":
+        raise AttributeError(name)
+    from common import logsafe
+    assert logsafe._installed
+    print("flat-work-bootstrap-ok")
+    raise SystemExit(0)
+core.__getattr__ = import_core
+source = open(sys.argv[1]).read()
+exec(compile(source, "/work/loco_servo_process.py", "exec"),
+     {"__name__": "__main__", "__file__": "/work/loco_servo_process.py"})
+''')
+    assert result.stdout == b"flat-work-bootstrap-ok\n"
+    assert result.stderr == b""
+
+
+def test_flat_image_finds_its_own_common_without_repository_pythonpath():
+    result = run_probe(r'''
+from pathlib import Path
+import shutil, tempfile
+del core.LocoServoPlugin
+def import_core(name):
+    if name != "LocoServoPlugin":
+        raise AttributeError(name)
+    from common import logsafe
+    assert logsafe._installed
+    assert isinstance(sys.stderr, logsafe.LineAtomicStream)
+    print("flat-image-common-ok")
+    raise SystemExit(0)
+core.__getattr__ = import_core
+with tempfile.TemporaryDirectory() as directory:
+    work = Path(directory)
+    (work / "common").mkdir()
+    shutil.copy(Path(sys.argv[2]) / "common/logsafe.py", work / "common/logsafe.py")
+    shutil.copy(sys.argv[1], work / "loco_servo_process.py")
+    sys.path.remove(sys.argv[2])
+    runpy.run_path(str(work / "loco_servo_process.py"), run_name="__main__")
+''')
+    assert result.stdout == b"flat-image-common-ok\n"
+    assert result.stderr == b""

@@ -13,9 +13,13 @@ from pathlib import Path
 def _install_child_logging():
     # A fresh interpreter inherits file descriptors, not the parent's Python
     # stream wrappers. Resolve common/ before importing any controller code.
-    source_root = Path(__file__).resolve().parents[2]
-    if (source_root / "common").is_dir() and str(source_root) not in sys.path:
-        sys.path.insert(0, str(source_root))
+    # Sources are nested in the repository, but the image flattens this file
+    # to /work/. Walk existing parents instead of indexing past the root.
+    for source_root in Path(__file__).resolve().parents:
+        if (source_root / "common" / "logsafe.py").is_file():
+            if str(source_root) not in sys.path:
+                sys.path.insert(0, str(source_root))
+            break
     try:
         from common import logsafe
         logsafe.install(check_fd=False)
