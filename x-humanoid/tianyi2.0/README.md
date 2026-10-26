@@ -33,6 +33,17 @@ depth. After redeploying, refresh the card's port metadata and reconnect the
 depth wire to the new `/depth/visual_depth` topic with `image/depth-zlib`.
 No `lidar_depth` or `visual_depth` processing card is needed in this path.
 
+`camera_head.info.camera_info` now declares the actual RGB dimensions after the
+first successfully published JPEG, preserving the source header. The camera
+start call waits up to 10 seconds for this frame before reporting success, so
+downstream VOP/Navi can snapshot the correct dimensions for bounding boxes.
+Unknown intrinsics and field of view remain null. After redeploying, restart
+the connected camera/VOP/Navi chain to refresh those startup snapshots.
+`camera_depth.info.source_geometry` reports the source frame size, frame ID and
+crop; `registration_to_color` remains `unknown` until verified on hardware.
+Host camera setup now preserves existing vendor launch arguments while changing
+only the three point-cloud/IMU enable flags.
+
 This conversion does not register raw depth to RGB or change the existing
 centre-crop/nearest-neighbour resize to 640x480. RGB/depth correspondence,
 camera intrinsics, and the vendor's millimetre scale still require hardware
@@ -198,27 +209,27 @@ for odometry feedback; verify physical motion with `loco_state`.
 Input TTL is an admission check: an already-stale command is still dropped and
 cannot resume motion or renew the watchdog. Once admitted, a command no longer
 stops motion at its producer's per-frame TTL (commonly 200ms). Its execution
-lease instead ends 1000ms after the original ROS/bridge callback receipt, or at
-`obs_stamp_ms + 1000ms`, whichever is sooner. Continuous fresh 10Hz input replaces
-that bounded lease; no new valid command for 1000ms stops motion. IPC, local queue
-and SDK reply time consume the original receive budget, never renew it. This is
-a bounded streaming watchdog, not unlimited reuse of the last velocity.
-The 1000ms observation limit remains independent of the 1000ms silence limit:
-an observation already 700ms old at receipt leaves at most 300ms of execution.
-New commands cannot renew an old observation's deadline. Both
-`control_interface.rate.watchdog_ms` and `max_obs_age_ms` report 1000. The input
-freshness check and native execution deadline use the same observation limit.
-Deploy Python and the native worker together in the rebuilt driver image;
-older native workers reject remaining leases above 300ms.
+deadline instead ends 300ms after the original ROS/bridge callback
+receipt, or at `obs_stamp_ms + 500ms`, whichever is sooner. Input age/TTL failures
+only drop the stale frame: they do not immediately stop a previously valid
+command or renew either deadline. The motion deadline sets velocity to zero
+without cancelling the held SDK action or its firmware heartbeat. A fresh
+accepted frame can then update the same action directly. If no new valid frame
+arrives for 1000ms, the action is cancelled and its heartbeat stops.
+IPC, local queue and SDK reply time consume the original receive budgets,
+never renew them. New commands cannot renew an old observation's deadline.
+`control_interface.rate.watchdog_ms` reports 300 and `max_obs_age_ms` reports
+500, matching admission and execution checks. Deploy Python and the native
+worker together; staged stopping requires the worker's advertised capability.
 Python uses the original monotonic receipt time for its silence watchdog; the
 native layer receives the remaining bounded execution deadline and independently
-stops when that lease expires
+sets zero at the motion deadline and cancels at the one-second silence deadline
 (with a 20ms polling interval while SDK calls are responsive), even if ROS stops
 spinning. It never holds a queue of old velocity commands or reconnects/replays
 a failed request. A blocked SDK reply times out (default 250ms), kills the worker
 and pauses the card. While the worker owns a motion action it enables the
-firmware's one-second heartbeat and refreshes it only within a live command
-lease. This is a **seconds-resolution backup**, not a guarantee of an exact one-second stop
+firmware's one-second heartbeat, including during a soft zero until the bounded
+cancel deadline. This is a **seconds-resolution backup**, not a guarantee of an exact one-second stop
 after a process crash or network failure. Firmware heartbeat behavior must be
 checked on hardware. On an ambiguous failure, handover waits 1.5 seconds for
 that firmware lease before another card is permitted to act. A faulted worker
@@ -227,17 +238,16 @@ requires explicit stop/start; it does not automatically regain control.
 An already-confirmed idle backend does not send a second STOP RPC: this requires
 a live worker, no fault, no armed motion, state `ready` and action ID zero. Motion,
 unknown state, a dead worker and fault/firmware handover still follow the normal
-stop and error paths. Each new motion uses the same velocity action until a
-stop or failure; forward and angular speeds are submitted together.
+stop and error paths. Fresh motion uses the same velocity action across short
+soft stops; explicit stop, cancellation timeout or failure ends that action.
+Forward and angular speeds are submitted together.
 
 An input already past its TTL is dropped without changing its timestamps or
-replaying it. An admitted command whose execution watchdog/observation deadline
-has expired also requires a stop. The
-native worker reports `EXPIRED` only after its stop/cancel succeeds; in that
-case the card resets its output/ramp and can accept a subsequent fresh command
-without restarting the worker. A failed stop, transport/ownership error, or a
-lease over 1000ms still follows the fatal pause/firmware-handover path. Expiry
-before IPC also requires a confirmed stop before the next motion is accepted.
+replaying it. A new staged-follow request that has already expired reports
+`STALE` and does not renew or cancel the existing session; its original timers
+continue to run. Legacy `SET`/`UPDATE` retain their confirmed-stop `EXPIRED`
+semantics. A failed stop, transport/ownership error, or a cancellation lease
+over 1000ms still follows the fatal pause/firmware-handover path.
 `backend.expired_commands`, `last_expired_error`, and `last_write` distinguish
 expiry from faults and expose the lease remaining before IPC and the latest
 write round-trip time. These timings diagnose latency; they do not establish
@@ -260,7 +270,7 @@ every other command just because a vendor call took 70ms of its 100ms period.
 When transport bunches arrivals closer than 50ms, the newest motion stays in
 the bounded inbox until the next permitted apply slot instead of being thrown
 away. Explicit zero always bypasses that pacing. Input TTL freshness,
-observation-age limits and the 1000ms receive watchdog remain enforced.
+observation-age limits and the 300ms receive watchdog remain enforced.
 
 The ROS/MCP facade now runs the existing velocity controller in a separate
 Python process (`loco_servo_process.py`), rather than in the camera bundle's
@@ -312,10 +322,14 @@ duplicate/regressing sequence numbers stay queued for normal processing.
 `coalesced`, lifecycle-`cleared`, `pending`, the latest receive gap and inbox
 wait in milliseconds. Existing `counts.received/accepted/dropped` describe the
 selected frames examined by the control sink, not intermediate coalesced
-frames. `holds` counts calls to stop paths, including repeated watchdog stops
-after navigation has ended; it is not a count of distinct physical stops.
-`counts.refreshed_after_stop` counts selected frames replaced after a confirmed
-stop; each replaced frame is also counted once as dropped.
+frames. `soft_holds` counts local zero-speed holds that retain the action;
+`holds` counts hard-stop paths, not distinct physical stops. Native
+`soft_stops` and `confirmed_stops` distinguish zero-speed holds from confirmed
+action cancellation. During a short gap, `action_id` should stay the same;
+after the one-second cancellation deadline, the next motion creates a new one.
+`counts.refreshed_after_stop` is retained as a legacy diagnostic field. Freshness
+and arbitration now run before any compatibility stop, rather than stopping to
+refresh a not-yet-admitted candidate.
 `dispatch.mode=process_worker`, `worker_pid`, `worker_alive` and `worker_failed`
 identify the isolated controller and expose its health. `controller_mode` is
 `dedicated_worker`; `backend.process_id` identifies the native helper.
@@ -328,19 +342,34 @@ measures generation-to-driver-callback age; `local_wait_ms` measures callback-to
 submission delay, including any synchronous stop before submission. These
 measurements are tied to that selected frame, even if a newer one has arrived.
 `dispatch.execution_deadline_basis` and the same field in `last_command_timing`
-are `receive_watchdog_and_observation`; `receive_watchdog_ms` is 1000. `ttl_ms`
+are `receive_watchdog_and_observation`; `receive_watchdog_ms` is 300. `ttl_ms`
 remains the producer's input freshness limit and is not the execution lease.
 Continuous
 publication alone cannot guarantee continuous motion: expired observations,
 receive-watchdog gaps, stale input, explicit zeros, invalid commands and SDK faults still stop or refuse
 motion. These timings distinguish those cases from local queue delay.
 
-Acceleration caps remain 0.3 m/s² and 0.6 rad/s². Explicit zero, pause, stop,
+Acceleration caps default to 0.3 m/s² and 2.0 rad/s². The angular value is a
+bounded response setting, not a measured hardware limit. The ramp uses the
+actual interval between applications so alternating short/long arrival gaps
+do not make the effective acceleration lower than configured. Explicit zero, pause, stop,
 lease expiration and watchdog stop bypass the ramp. Cancelling an SDK action
 addresses only this worker's held action handle. Before beginning or updating
 motion, the worker checks for another active action or replacement of its own
 handle; it refuses to overwrite that action. Raw velocity streaming does not
 add obstacle avoidance.
+
+Like R1's per-frame velocity execution, continuous fresh input updates the held
+SDK velocity action. A nonzero requested target that passes through exactly
+zero during an acceleration-limited reversal sends a zero-velocity update,
+without cancelling and recreating that action. The staged `FOLLOW` operation
+carries the intermediate zero while retaining the original bounded deadlines.
+Legacy workers with the `ZERO` capability can also retain an existing action
+across a ramp crossing; older workers safely fall back to stopping. Neither
+zero path creates an action while idle. Explicit all-zero input still
+stops/cancels immediately, and
+the 300ms receive watchdog, 500ms observation limit and one-second cancellation
+deadline still apply.
 
 Configure loco_servo exposes live settings via `action: config`:
 
@@ -350,6 +379,14 @@ Configure loco_servo exposes live settings via `action: config`:
 | `rotate_only` | false | Suppress translation and preserve yaw rate; unsupported axes remain rejected |
 | `require_standing` | false | Require fresh true feedback from a configured domain-0 Bool source; missing/stale/false feedback stops/refuses motion |
 | `min_vx` | 0 | Measured minimum stable forward speed (m/s), advertised only as `control_interface.limits.min_magnitude[0]`; 0 declares no floor |
+| `linear_acceleration` | 0.3 | Linear response limit in m/s²; positive finite value, applied by the servo |
+| `angular_acceleration` | 2.0 | Angular response limit in rad/s²; positive finite value, applied by the servo |
+
+Changing an acceleration setting stops the old motion before applying the new
+setting. The next fresh command starts under the new setting. `info` reports
+both settings and the existing `acceleration_limits` block; a control-process
+restart preserves settings within the running Driver. Persist custom settings
+in the card configuration or deployment YAML for container recreation.
 
 `min_vx` must be measured on the chassis before setting it, and cannot exceed
 `max_vx`. The servo never raises small input velocities to this value. Existing

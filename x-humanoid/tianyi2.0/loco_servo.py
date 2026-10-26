@@ -13,12 +13,17 @@ import threading
 import time
 
 from common.control import ControlSink, parse_descriptor
-from slamtec_velocity import CommandLeaseExpired, SlamtecVelocityBackend
+from slamtec_velocity import CommandLeaseExpired, SlamtecVelocityBackend, StaleVelocityCommand
 
 INPUT_TOPIC = "/actucore/navi/cmd"
-WATCHDOG_MS = 1000
-MAX_OBS_AGE_MS = 1000
+WATCHDOG_MS = 300
+MAX_OBS_AGE_MS = 500
+CANCEL_AFTER_MS = 1000
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
+
+
+class _PostureRefused(ValueError):
+    pass
 
 
 class _LatestControlInbox:
@@ -117,6 +122,10 @@ class _LatestControlInbox:
                     "pending": int(self._motion is not None) + int(self._zero is not None),
                     "last_receive_gap_ms": self._last_gap_ms, "last_wait_ms": self._last_wait_ms}
 
+    def has_priority_zero(self):
+        with self._lock:
+            return self._active and self._zero is not None
+
 
 def _validated_min_vx(value, max_vx):
     message = f"loco_servo.min_vx must be finite and between 0 and max_vx ({max_vx:g})"
@@ -144,7 +153,8 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0):
         "groups": [{"name": "base", "offset": 0, "count": 6,
                     "unit": "m/s", "resource": "base"}],
         "rate": {"max_hz": 20, "expected_hz": hz,
-                 "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": MAX_OBS_AGE_MS},
+                 "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": MAX_OBS_AGE_MS,
+                 "cancel_after_ms": CANCEL_AFTER_MS},
         "force_torque": None,
     }
 
@@ -165,7 +175,7 @@ class LocoServoPlugin:
         self._min_vx = self._descriptor["limits"]["min_magnitude"][0]
         self._parsed_descriptor = parse_descriptor(self._descriptor)
         self._accel = (self._positive(config, "linear_acceleration", 0.3),
-                       self._positive(config, "angular_acceleration", 0.6))
+                       self._positive(config, "angular_acceleration", 2.0))
         self._settings = dict(TOGGLES)
         for key in TOGGLES:
             if key in config:
@@ -193,12 +203,16 @@ class LocoServoPlugin:
         self._last_output_at = None
         self._last_valid_at = None
         self._command_deadline_ms = 0
+        self._command_cancel_deadline_ms = 0
         self._lease_expiry_ms = 0
+        self._cancel_deadline_ms = 0
+        self._soft_held = False
+        self._last_preserved_action = False
         self._zero_pending = False
         self._last = None
         self._last_timing = None
         self._counts = {key: 0 for key in
-                        ("received", "accepted", "published", "dry_run_commands",
+                        ("received", "accepted", "published", "dry_run_commands", "soft_holds",
                          "rejected", "dropped", "holds", "publish_errors", "refreshed_after_stop")}
         self._inbox = _LatestControlInbox()
 
@@ -207,7 +221,11 @@ class LocoServoPlugin:
         value = config.get(key, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"loco_servo.{key} must be a positive finite number")
-        if not math.isfinite(value) or value <= 0:
+        try:
+            valid = math.isfinite(value) and value > 0
+        except OverflowError:
+            valid = False
+        if not valid:
             raise ValueError(f"loco_servo.{key} must be a positive finite number")
         return float(value)
 
@@ -230,6 +248,12 @@ class LocoServoPlugin:
             "topic_in": [{"topic": INPUT_TOPIC, "format": "control/velocity",
                           "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}],
             "configSchema": {"type": "object", "properties": {
+                "linear_acceleration": {"type": "number", "default": self._accel[0],
+                                        "exclusiveMinimum": 0,
+                                        "description": "直行速度变化上限（m/s²），默认 0.3；用于执行端平滑，不是实测硬件极限。显式零速度立即停车。"},
+                "angular_acceleration": {"type": "number", "default": self._accel[1],
+                                         "exclusiveMinimum": 0,
+                                         "description": "转向速度变化上限（rad/s²），默认 2.0；用于执行端响应调节，不是实测硬件极限。显式零速度立即停车。"},
                 "min_vx": {"type": "number", "default": 0.0, "minimum": 0.0,
                            "maximum": self._descriptor["limits"]["upper"][0],
                            "description": "实测最小稳定直行速度（m/s），仅向规划器声明，不在执行端强行抬高速度；0 不声明。修改后需重新启动 navi 读取。"},
@@ -336,7 +360,7 @@ class LocoServoPlugin:
         self._input_topic = topic.strip()
         self._barrier_ms = int(time.time() * 1000)
         self._sink = ControlSink(self._parsed_descriptor, self._apply,
-                                 on_watchdog=self._hold, on_abort=self._hold)
+                                 on_watchdog=self._soft_hold, on_abort=self._soft_hold)
         try:
             self._open(self._input_topic, generation)
         except Exception as exc:
@@ -491,27 +515,6 @@ class LocoServoPlugin:
                     self._counts["dropped"] += 1
                     self._record("DROPPED", "command rate exceeds 20 Hz")
                     return
-                if any(command["values"]):
-                    if (self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms and
-                            not self._native_expiry_update()):
-                        self._hold()  # Native lease may already have stopped the chassis.
-                        if self._zero_pending:
-                            raise RuntimeError("SDK stop unconfirmed")
-                        pending = self._inbox.take(newer_than=command)
-                        if pending is not None:
-                            self._counts["dropped"] += 1
-                            self._counts["refreshed_after_stop"] += 1
-                            # Revalidate the replacement, including the original
-                            # TTL, observation age, seq and source arbitration.
-                            # _hold cleared the lease, so this refresh is once.
-                            self._process_message(*pending)
-                            return
-                    problem = self._standing_problem()
-                    if problem:
-                        self._hold()
-                        self._counts["rejected"] += 1
-                        self._record("REFUSED", problem)
-                        return
                 started = time.monotonic()
                 wall_ms = int(time.time() * 1000)
                 received_mono = received_at[0] if received_at is not None else started
@@ -524,10 +527,13 @@ class LocoServoPlugin:
                 self._command_deadline_ms = min(
                     wall_ms + receive_remaining_ms,
                     command.get("obs_stamp_ms", command["stamp_ms"]) + MAX_OBS_AGE_MS)
+                self._command_cancel_deadline_ms = wall_ms + math.floor(
+                    CANCEL_AFTER_MS - max(0.0, started - received_mono) * 1000)
                 self._last_timing = {
                     "seq": command.get("seq"), "ttl_ms": command.get("ttl_ms"),
                     "execution_deadline_basis": "receive_watchdog_and_observation",
                     "receive_watchdog_ms": WATCHDOG_MS,
+                    "cancel_after_ms": CANCEL_AFTER_MS,
                     "receive_age_ms": (received_at[1] - command["stamp_ms"]
                                        if received_at is not None else None),
                     "local_wait_ms": (round((started - received_at[0]) * 1000, 1)
@@ -535,6 +541,7 @@ class LocoServoPlugin:
                     "command_age_ms": wall_ms - command["stamp_ms"],
                     "observation_age_ms": wall_ms - command.get("obs_stamp_ms", command["stamp_ms"]),
                     "remaining_before_apply_ms": self._command_deadline_ms - wall_ms,
+                    "cancel_remaining_before_apply_ms": self._command_cancel_deadline_ms - wall_ms,
                 }
                 try:
                     outcome = self._sink.submit(command)
@@ -544,8 +551,17 @@ class LocoServoPlugin:
                         remaining_after_apply_ms=self._command_deadline_ms - int(time.time() * 1000))
                 if outcome.applied:
                     self._counts["accepted"] += 1
-                    self._last_valid_at = received_mono
-                    self._lease_expiry_ms = self._command_deadline_ms
+                    if any(self._last_output) or self._last_preserved_action:
+                        self._last_valid_at = received_mono
+                        self._lease_expiry_ms = self._command_deadline_ms
+                        self._cancel_deadline_ms = self._command_cancel_deadline_ms
+                        self._soft_held = False
+                    else:
+                        # Explicit zero (including rotate_only suppression)
+                        # has already cancelled; no silence timer remains armed.
+                        self._last_valid_at = None
+                        self._lease_expiry_ms = self._cancel_deadline_ms = 0
+                        self._soft_held = False
                     self._record(outcome.verdict.name, outcome.reason,
                                  requested=list(command["values"]),
                                  output=list(self._last_output),
@@ -553,13 +569,15 @@ class LocoServoPlugin:
                 else:
                     self._counts["dropped" if outcome.verdict.name == "DROPPED" else "rejected"] += 1
                     self._record(outcome.verdict.name, outcome.reason)
-            except CommandLeaseExpired as exc:
+            except _PostureRefused as exc:
+                self._counts["rejected"] += 1
+                self._record("REFUSED", str(exc))
+            except (StaleVelocityCommand, CommandLeaseExpired) as exc:
                 self._counts["dropped"] += 1
-                self._hold()
-                if self._zero_pending:
-                    self._paused = True  # Preserve the stop error from _hold.
-                else:
-                    self._record("DROPPED", str(exc))
+                # A stale candidate does not revoke or renew the last accepted
+                # command. The ordinary tick applies its original soft/cancel
+                # deadlines, independently of this rejected packet.
+                self._record("DROPPED", str(exc))
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
                 self._counts["rejected"] += 1
                 self._record("REJECTED", str(exc))
@@ -600,25 +618,52 @@ class LocoServoPlugin:
         return (not self._settings["dry_run"] and
                 getattr(self._backend, "supports_atomic_expiry_update", False) is True)
 
+    def _native_staged_stop(self):
+        return (not self._settings["dry_run"] and
+                getattr(self._backend, "supports_staged_stop", False) is True)
+
     def _apply(self, values, _gripper=None):
         # Run after sink freshness/shape/arbitration checks: invalid input must
         # neither renew motion nor issue a stop against an otherwise live lease.
         if any(values) and self._command_deadline_ms <= time.time() * 1000:
             raise CommandLeaseExpired("receive watchdog or observation deadline expired before apply")
+        if any(values):
+            problem = self._standing_problem()
+            if problem:
+                self._hold()
+                raise _PostureRefused(problem)
         target = list(values)
         if self._settings["rotate_only"]:
             target[0] = target[1] = 0.0
-        replace_expired = bool(any(target) and self._native_expiry_update() and
+        motion_expired = bool(any(target) and self._lease_expiry_ms and
+                              time.time() * 1000 >= self._lease_expiry_ms)
+        if motion_expired and not self._native_staged_stop() and not self._native_expiry_update():
+            # Compatibility with old workers that cancel on motion expiry.
+            # This is deliberately after the sink's admission checks: stale or
+            # outranked input must never trigger a stop or renew any deadline.
+            self._hold()
+            if self._zero_pending:
+                raise RuntimeError("SDK stop unconfirmed")
+            if self._inbox.has_priority_zero():
+                raise CommandLeaseExpired("priority zero arrived during legacy action stop")
+            if self._command_deadline_ms <= time.time() * 1000:
+                raise CommandLeaseExpired("command expired during legacy action stop")
+        replace_expired = bool(motion_expired and not self._native_staged_stop() and
+                               self._native_expiry_update() and
                                self._lease_expiry_ms and
                                time.time() * 1000 >= self._lease_expiry_ms)
-        if replace_expired:
-            # The native UPDATE confirms any expired old action's stop before
-            # starting this fresh one. Restart the ramp locally, but do not
-            # spend a separate Python STOP/ACK round trip before the UPDATE.
+        if motion_expired:
+            # A staged worker has zeroed the old command without cancelling;
+            # an old atomic worker confirms STOP inside UPDATE. In both cases
+            # restart the ramp from the zero actually required by the deadline.
             self._last_output = [0.0] * 6
             self._last_output_at = None
         now = time.monotonic()
-        dt = min(1 / self._hz, max(0, now - self._last_output_at)) if self._last_output_at is not None else 1 / self._hz
+        # Source cadence can jitter around expected_hz. Capping every interval
+        # at one nominal tick loses the extra time in a long interval without
+        # making it up in the following short one, slowing the actual response.
+        # An expired previous lease has already reset the ramp above.
+        dt = max(0, now - self._last_output_at) if self._last_output_at is not None else 1 / self._hz
         output = [0.0] * 6
         for axis, accel in ((0, self._accel[0]), (5, self._accel[1])):
             # Explicit zero bypasses acceleration limiting: stop means stop.
@@ -629,20 +674,24 @@ class LocoServoPlugin:
         if self._settings["dry_run"]:
             self._counts["dry_run_commands"] += 1
         else:
-            self._publish(output, replace_expired=replace_expired)
+            self._publish(output, replace_expired=replace_expired,
+                          preserve_action=bool(any(target) and not any(output)))
+        self._last_preserved_action = bool(any(target) and not any(output))
         self._last_output = output
         self._last_output_at = now
         self._zero_pending = False
 
-    def _publish(self, values, *, replace_expired=False):
+    def _publish(self, values, *, replace_expired=False, preserve_action=False):
         if self._backend is None:
             raise RuntimeError("Slamware SDK backend unavailable")
         try:
-            if any(values):
+            if any(values) or preserve_action:
+                options = {"cancel_deadline_ms": self._command_cancel_deadline_ms}
                 if replace_expired:
-                    self._backend.write(values, self._command_deadline_ms, replace_expired=True)
-                else:
-                    self._backend.write(values, self._command_deadline_ms)
+                    options["replace_expired"] = True
+                if preserve_action:
+                    options["preserve_action"] = True
+                self._backend.write(values, self._command_deadline_ms, **options)
             else:
                 self._backend.stop()
         except CommandLeaseExpired:
@@ -650,6 +699,32 @@ class LocoServoPlugin:
         except Exception as exc:
             raise RuntimeError(f"Slamware SDK write failed: {exc}") from exc
         self._counts["published"] += 1
+
+    def _soft_hold(self, *_args):
+        """Zero the live action once; retain its original cancellation deadline."""
+        if self._yielded or self._soft_held or not self._cancel_deadline_ms:
+            return
+        if time.time() * 1000 >= self._cancel_deadline_ms:
+            self._hold()
+            self._record("HOLD", f"no valid command for {CANCEL_AFTER_MS} ms; action cancelled")
+            return
+        if self._backend is not None and not self._settings["dry_run"]:
+            try:
+                self._backend.soft_stop(self._cancel_deadline_ms)
+                self._counts["published"] += 1
+            except Exception as exc:
+                self._counts["publish_errors"] += 1
+                self._paused = True
+                self._hold()
+                self._record("ERROR", f"soft zero velocity failed: {exc}")
+                return
+        self._counts["soft_holds"] += 1
+        self._last_output = [0.0] * 6
+        self._last_output_at = None
+        self._last_preserved_action = False
+        self._lease_expiry_ms = 0
+        self._soft_held = True
+        self._record("SOFT_HOLD", "receive watchdog or observation deadline expired; action retained")
 
     def _hold(self, *_args):
         self._counts["holds"] += 1
@@ -667,6 +742,9 @@ class LocoServoPlugin:
         self._last_output_at = None
         self._last_valid_at = None
         self._lease_expiry_ms = 0
+        self._cancel_deadline_ms = 0
+        self._soft_held = False
+        self._last_preserved_action = False
 
     def _tick(self, generation=None):
         with self._lock:
@@ -693,12 +771,13 @@ class LocoServoPlugin:
             if self._standing_problem() and any(self._last_output):
                 self._hold()
                 self._record("REFUSED", self._standing_problem())
-            if self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms:
+            if (self._cancel_deadline_ms and time.time() * 1000 >= self._cancel_deadline_ms or
+                    self._last_valid_at is not None and time.monotonic() - self._last_valid_at >= CANCEL_AFTER_MS / 1000):
                 self._hold()
-                self._record("HOLD", "receive watchdog or observation deadline expired")
-            if self._last_valid_at is not None and time.monotonic() - self._last_valid_at >= WATCHDOG_MS / 1000:
-                self._hold()
-                self._record("HOLD", f"no valid command for {WATCHDOG_MS} ms")
+                self._record("HOLD", f"no valid command for {CANCEL_AFTER_MS} ms; action cancelled")
+            elif (self._lease_expiry_ms and time.time() * 1000 >= self._lease_expiry_ms or
+                  self._last_valid_at is not None and time.monotonic() - self._last_valid_at >= WATCHDOG_MS / 1000):
+                self._soft_hold()
             self._sink.tick()
 
     def _configure(self, args):
@@ -706,6 +785,8 @@ class LocoServoPlugin:
         if any(not isinstance(value, bool) for value in updates.values()):
             return {"state": "error", "error": "configuration toggles must be boolean"}
         try:
+            acceleration = (self._positive(args, "linear_acceleration", self._accel[0]),
+                            self._positive(args, "angular_acceleration", self._accel[1]))
             min_vx = _validated_min_vx(args.get("min_vx", self._min_vx),
                                        self._descriptor["limits"]["upper"][0])
             descriptor = copy.deepcopy(self._descriptor)
@@ -713,7 +794,7 @@ class LocoServoPlugin:
             parsed_descriptor = parse_descriptor(descriptor)
         except ValueError as exc:
             return {"state": "error", "error": str(exc)}
-        if (min_vx != self._min_vx or
+        if (min_vx != self._min_vx or acceleration != self._accel or
                 any(self._settings[key] != value for key, value in updates.items())):
             self._inbox.activate(self._generation, False)
             # Stop under the OLD mode, especially before enabling dry_run.
@@ -729,6 +810,7 @@ class LocoServoPlugin:
                         self._inbox.activate(self._generation, not self._paused and not self._yielded)
                         return {"state": "error", "error": str(exc), "dry_run": self._settings["dry_run"]}
             self._settings.update(updates)
+            self._accel = acceleration
             # This is planner metadata only. Keep the existing sink instance:
             # its bounds are unchanged, and it owns seq/source arbitration.
             self._min_vx = min_vx
@@ -759,6 +841,7 @@ class LocoServoPlugin:
         return {
             "state": "stopping" if self._closing else "paused" if self._running and self._paused else "running" if self._running else "idle",
             "input": self._input_topic, "min_vx": self._min_vx, **self._settings,
+            "linear_acceleration": self._accel[0], "angular_acceleration": self._accel[1],
             "yielded_to_explicit_command": self._yielded,
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
@@ -766,8 +849,11 @@ class LocoServoPlugin:
             "dispatch": {"mode": "dedicated_worker", "watchdog_poll_ms": 20,
                          "execution_deadline_basis": "receive_watchdog_and_observation",
                          "receive_watchdog_ms": WATCHDOG_MS,
+                         "cancel_after_ms": CANCEL_AFTER_MS,
+                         "staged_stop": self._native_staged_stop(),
                          "max_apply_hz": 20, "worker_failed": self._controller_failed,
-                         "expiry_update": "native_atomic" if self._native_expiry_update() else "stop_then_set",
+                         "expiry_update": ("native_staged" if self._native_staged_stop() else
+                                           "native_atomic" if self._native_expiry_update() else "stop_then_set"),
                          "worker_alive": bool(
                              self._controller_thread and self._controller_thread.is_alive())},
             "last_command_timing": copy.deepcopy(self._last_timing),

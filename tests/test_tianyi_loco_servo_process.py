@@ -401,6 +401,8 @@ def test_idempotent_mutation_confirms_stop_before_clearing_pending_zero(
 @pytest.mark.parametrize("config", [
     {"min_vx": float("nan")}, {"min_vx": float("inf")},
     {"min_vx": -0.01}, {"min_vx": 0.31},
+    {"linear_acceleration": 0}, {"angular_acceleration": -1},
+    {"linear_acceleration": "0.3"}, {"angular_acceleration": True},
     {"dry_run": 1}, {"rotate_only": "false"}, {"require_standing": None},
 ])
 def test_invalid_config_does_not_revoke_active_process_or_advance_epoch(process_setup, config):
@@ -419,6 +421,22 @@ def test_invalid_config_does_not_revoke_active_process_or_advance_epoch(process_
     send(card, command(2))
     after = wait_info(card, lambda item: item["counts"]["accepted"] == 2)
     assert stats(after)["action_starts"] == 1 and stats(after)["confirmed_stops"] == 0
+
+
+def test_acceleration_configuration_survives_control_process_recreation(process_setup):
+    card = process_setup.create(start=False)
+    updated = card.dispatch("config", {"linear_acceleration": .2, "angular_acceleration": 1.5})
+    assert updated["ok"] and updated["acceleration_limits"] == {
+        "linear_m_s2": .2, "angular_rad_s2": 1.5}
+    assert card.dispatch("start", {})["state"] == "running"
+    active = card.dispatch("info", {})
+    assert active["linear_acceleration"] == .2 and active["angular_acceleration"] == 1.5
+    changed = card.dispatch("config", {"angular_acceleration": 2.0})
+    assert changed["ok"] and changed["linear_acceleration"] == .2
+    assert card.stop()["state"] == "idle"
+    assert card.dispatch("start", {})["state"] == "running"
+    restarted = card.dispatch("info", {})
+    assert restarted["linear_acceleration"] == .2 and restarted["angular_acceleration"] == 2.0
 
 
 def test_killing_only_control_child_does_not_confirm_sdk_group_handover(process_setup, monkeypatch):

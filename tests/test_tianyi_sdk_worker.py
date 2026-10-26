@@ -115,7 +115,8 @@ def worker(native_worker):
         processes.append(process)
         ready = read_reply(process)
         assert ready[2:] == ["OK", "0", "ready"]
-        assert ready.stats == {"capabilities": {"atomic_expiry_update": True}}
+        assert ready.stats == {"capabilities": {"atomic_expiry_update": True, "zero_velocity_update": True,
+                                               "staged_stop": True}}
         return process
 
     yield create
@@ -311,3 +312,132 @@ def test_ownership_failure_stays_fatal_and_has_stage_diagnostics(worker):
     assert failed.stats["action_starts"] == failed.stats["confirmed_stops"] == 1
     assert failed.stats["stop_reason"] == "sdk_exception"
     assert process.wait(timeout=2) == 1
+
+
+def test_intermediate_zero_and_reversal_keep_same_sdk_action(worker):
+    process = worker()
+    assert request(process, 1, velocity(300))[2:] == ["OK", "1", "active"]
+    crossed = request(process, 2, f"ZERO {int(time.time() * 1000) + 300} 0 0")
+    assert crossed[2:] == ["OK", "1", "active"]
+    assert crossed.stats["action_starts"] == 1 and crossed.stats["confirmed_stops"] == 0
+    reversed_ = request(process, 3, f"SET {int(time.time() * 1000) + 300} -0.05 -0.1")
+    assert reversed_[2:] == ["OK", "1", "active"]
+    assert reversed_.stats["action_starts"] == 1 and reversed_.stats["confirmed_stops"] == 0
+    stopped = request(process, 4, "STOP")
+    assert stopped[2:] == ["OK", "0", "ready"]
+    assert stopped.stats["confirmed_stops"] == 1
+
+
+def test_zero_update_never_creates_an_action_or_extends_itself(worker):
+    process = worker()
+    idle = request(process, 1, f"ZERO {int(time.time() * 1000) + 300} 0 0")
+    assert idle[2:] == ["OK", "0", "ready"]
+    assert idle.stats["action_starts"] == 0
+    assert request(process, 2, velocity(300))[2:] == ["OK", "1", "active"]
+    assert request(process, 3, f"ZERO {int(time.time() * 1000) + 80} 0 0")[2:] == ["OK", "1", "active"]
+    time.sleep(.14)
+    expired = request(process, 4, f"ZERO {int(time.time() * 1000) + 300} 0 0")
+    assert expired[2:] == ["OK", "0", "ready"]
+    assert expired.stats["confirmed_stops"] == expired.stats["action_starts"] == 1
+    assert expired.stats["stop_reason"] == "lease_expired"
+
+
+@pytest.mark.parametrize("suffix", ["0.1 0", "0 0.1"])
+def test_zero_opcode_rejects_motion(worker, suffix):
+    process = worker()
+    failed = request(process, 1, f"ZERO {int(time.time() * 1000) + 300} {suffix}")
+    assert failed[2] == "ERROR" and failed.stats["action_starts"] == 0
+    assert process.wait(timeout=2) == 1
+
+
+@pytest.mark.parametrize("case", ["zero_crossing", "zero_idle", "zero_expired_session", "zero_expired_stop_failure",
+                                  "zero_preempted", "zero_slow_set"])
+def test_session_zero_update_obeys_ownership_and_original_deadline(native_session, case):
+    subprocess.run([str(native_session), case], check=True, timeout=3)
+
+
+def follow(motion_ms=200, cancel_ms=800, vx=.1, wz=-.2):
+    now = int(time.time() * 1000)
+    return f"FOLLOW {now + motion_ms} {now + cancel_ms} {vx} {wz}"
+
+
+def test_follow_soft_stops_then_reuses_action_until_hard_deadline(worker):
+    process = worker()
+    first = request(process, 1, follow(60, 500))
+    assert first[2:] == ["OK", "1", "active"]
+    time.sleep(.1)
+    soft = request(process, 2, "SOFT_STOP")
+    assert soft[2:] == ["OK", "1", "active"]
+    assert soft.stats["soft_stops"] == 1
+    assert soft.stats["action_starts"] == 1 and soft.stats["confirmed_stops"] == 0
+    resumed = request(process, 3, follow(80, 250, .12, .3))
+    assert resumed[2:] == ["OK", "1", "active"]
+    assert resumed.stats["action_starts"] == 1 and not resumed.stats["soft_stopped"]
+    time.sleep(.3)
+    expired = request(process, 4, "SOFT_STOP")
+    assert expired[2:] == ["OK", "0", "ready"]
+    assert expired.stats["confirmed_stops"] == 1
+    assert expired.stats["stop_reason"] == "lease_expired"
+
+
+def test_stale_follow_does_not_cancel_or_extend_an_accepted_action(worker):
+    process = worker()
+    assert request(process, 1, follow(150, 250))[2:] == ["OK", "1", "active"]
+    for sequence in range(2, 5):
+        stale = request(process, sequence, follow(-1, 1000, .2, .4))
+        assert stale[2] == "STALE" and stale.stats["action_id"] == 1
+        assert stale.stats["session_active"] is True
+        assert stale.stats["confirmed_stops"] == 0 and stale.stats["set_attempts"] == 1
+    time.sleep(.3)
+    expired = request(process, 5, "SOFT_STOP")
+    assert expired[2:] == ["OK", "0", "ready"]
+    assert expired.stats["action_starts"] == expired.stats["confirmed_stops"] == 1
+
+
+def test_stale_follow_after_cancel_never_restarts_an_action(worker):
+    process = worker()
+    assert request(process, 1, follow(30, 80))[2:] == ["OK", "1", "active"]
+    time.sleep(.12)
+    stale = request(process, 2, follow(-1, 1000))
+    assert stale[2] == "STALE" and stale.stats["session_active"] is False
+    assert stale.stats["action_id"] == 0
+    assert stale.stats["action_starts"] == stale.stats["confirmed_stops"] == 1
+
+
+def test_follow_zero_keeps_existing_action_but_never_starts_one(worker):
+    process = worker()
+    assert request(process, 1, follow(vx=0, wz=0))[2:] == ["OK", "0", "ready"]
+    assert request(process, 2, follow())[2:] == ["OK", "1", "active"]
+    zero = request(process, 3, follow(vx=0, wz=0))
+    assert zero[2:] == ["OK", "1", "active"]
+    assert zero.stats["action_starts"] == 1 and zero.stats["confirmed_stops"] == 0
+    stopped = request(process, 4, "STOP")
+    assert stopped[2:] == ["OK", "0", "ready"]
+    assert stopped.stats["confirmed_stops"] == 1
+
+
+def test_follow_slow_sdk_soft_stops_without_cancel_then_keeps_action(worker):
+    process = worker("slow_set")
+    stale = request(process, 1, follow(50, 700))
+    assert stale[2] == "STALE" and stale.stats["session_active"] is True
+    assert stale.stats["soft_stops"] == 1 and stale.stats["confirmed_stops"] == 0
+    assert stale.stats["action_starts"] == 1
+    resumed = request(process, 2, follow(200, 700))
+    assert resumed[2:] == ["OK", "1", "active"]
+    assert resumed.stats["action_starts"] == 1
+
+
+@pytest.mark.parametrize("motion_ms,cancel_ms", [(100, 1100), (400, 300)])
+def test_follow_rejects_excessive_or_inverted_leases(worker, motion_ms, cancel_ms):
+    process = worker()
+    invalid = request(process, 1, follow(motion_ms, cancel_ms))
+    assert invalid[2] == "ERROR" and invalid.stats["action_starts"] == 0
+    assert process.wait(timeout=2) == 1
+
+
+@pytest.mark.parametrize("case", ["follow_soft_resume", "follow_hard_timeout", "follow_stale_ignored",
+                                 "follow_stale_after_soft_stop", "follow_slow_write",
+                                 "follow_soft_ownership", "follow_zero_idle", "follow_explicit_stop",
+                                 "follow_slow_write_hard_deadline"])
+def test_staged_session_freshness_ownership_and_stop(native_session, case):
+    subprocess.run([str(native_session), case], check=True, timeout=3)

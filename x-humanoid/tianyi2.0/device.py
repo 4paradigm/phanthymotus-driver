@@ -957,6 +957,11 @@ class CameraPlugin:
         # safe to call before the first start and across a restart.
         self._latest_frame = None  # Only keep latest frame
         self._frame_lock = threading.Lock()
+        self._frame_ready = threading.Condition(self._frame_lock)
+        self._frame_generation = 0
+        self._frame_size = None
+        self._frame_id = ""
+        self._last_encode_error = ""
         self._pub = None
         self._subscription = None
         self._encode_thread = None
@@ -1035,8 +1040,12 @@ class CameraPlugin:
             if previous is not None and previous is not threading.current_thread():
                 previous.join(timeout=2.0)
 
-            with self._frame_lock:
-                self._latest_frame = None  # never publish a frame from before the stop
+            with self._frame_ready:
+                self._frame_generation += 1
+                self._latest_frame = None
+                self._frame_size = None
+                self._frame_id = ""
+                self._last_encode_error = ""
 
             # Publish JPEG as CompressedImage
             if self._pub is None:
@@ -1116,27 +1125,7 @@ class CameraPlugin:
 
         script = "/home/nvidia/data/scripts/start_orbbec_camera.sh"
         launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
-        desired = (f"{launch} enable_point_cloud:=true "
-                   "enable_accel:=true enable_gyro:=true")
-        updater = (
-            "from pathlib import Path\n"
-            f"path = Path({script!r})\n"
-            "lines = path.read_text().splitlines(keepends=True)\n"
-            f"launch = {launch!r}\n"
-            f"desired = {desired!r}\n"
-            "for index, line in enumerate(lines):\n"
-            "    if line.lstrip().startswith(launch):\n"
-            "        updated = line[:len(line) - len(line.lstrip())] + desired + '\\n'\n"
-            "        if line == updated:\n"
-            "            print('unchanged')\n"
-            "        else:\n"
-            "            lines[index] = updated\n"
-            "            path.write_text(''.join(lines))\n"
-            "            print('changed')\n"
-            "        break\n"
-            "else:\n"
-            "    raise SystemExit('headty Orbbec launch command not found')\n"
-        )
+        updater = CameraPlugin._orbbec_startup_updater(script, launch)
         result = subprocess.run(
             ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
              "python3", "-c", updater],
@@ -1145,6 +1134,72 @@ class CameraPlugin:
         if changed:
             print("[CameraPlugin] enabled Orbbec point cloud, accel, and gyro streams")
         return changed
+
+    @staticmethod
+    def _orbbec_startup_updater(script, launch):
+        # This runs on the host. Keep the vendor command byte-for-byte except
+        # these three stream toggles: registration, profiles, sync and device
+        # selection belong to the installed camera setup.
+        word_pattern = r'''(?:\\.|[^\s\x22\x27\\;&|<>]|\x22(?:\\.|[^\x22\\])*\x22|\x27[^\x27]*\x27)+'''
+        return f"""from pathlib import Path
+import re
+import shlex
+path = Path({script!r})
+launch = {launch!r}
+lines = path.read_text().splitlines(keepends=True)
+names = ('enable_point_cloud', 'enable_accel', 'enable_gyro')
+pattern = re.compile({word_pattern!r})
+def split_comment(line):
+    quote, escaped = '', False
+    for i, char in enumerate(line):
+        if escaped:
+            escaped = False
+        elif char == chr(92) and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ''
+        elif char in ('"', "'"):
+            quote = char
+        elif char == '#' and (i == 0 or line[i - 1].isspace()):
+            return line[:i], line[i:]
+    return line, ''
+for index, line in enumerate(lines):
+    if not line.lstrip().startswith(launch):
+        continue
+    end = index + 1
+    while end < len(lines) and split_comment(lines[end - 1])[0].rstrip().endswith(chr(92)):
+        end += 1
+    before = lines[index:end]
+    after, seen = [], set()
+    def update(match):
+        raw = match.group(0)
+        try:
+            words = shlex.split(raw)
+        except ValueError:
+            return raw
+        if len(words) == 1:
+            for name in names:
+                if words[0].startswith(name + ':='):
+                    seen.add(name)
+                    return name + ':=true'
+        return raw
+    for part in before:
+        active, comment = split_comment(part)
+        after.append(pattern.sub(update, active) + comment)
+    missing = [name + ':=true' for name in names if name not in seen]
+    if missing:
+        after[0] = after[0].replace(launch, launch + ' ' + ' '.join(missing), 1)
+    if before == after:
+        print('unchanged')
+    else:
+        lines[index:end] = after
+        path.write_text(''.join(lines))
+        print('changed')
+    break
+else:
+    raise SystemExit('headty Orbbec launch command not found')
+"""
 
     def stop(self):
         """Disarm the stream, leaving it restartable by ``start()``.
@@ -1155,9 +1210,13 @@ class CameraPlugin:
         every frame that arrives meanwhile.
         """
         with self._lifecycle_lock:
-            self._running = False
-            with self._frame_lock:
+            with self._frame_ready:
+                self._running = False
+                self._frame_generation += 1
                 self._latest_frame = None
+                self._frame_size = None
+                self._frame_id = ""
+                self._frame_ready.notify_all()
 
     def _on_image_grab(self, msg):
         """Callback: just grab the latest frame, don't encode here (non-blocking)."""
@@ -1166,7 +1225,8 @@ class CameraPlugin:
         # 看门狗的唯一存活信号。放在锁外、只写一个 float —— 这是 30fps 的路径。
         self._last_frame_at = time.time()
         with self._frame_lock:
-            self._latest_frame = msg
+            if self._running:
+                self._latest_frame = (msg, getattr(self, "_frame_generation", 0))
 
     def _encode_loop(self):
         """Separate thread: encode and publish the latest frame. Always processes newest, skips stale."""
@@ -1177,22 +1237,49 @@ class CameraPlugin:
         while self._running:
             # Grab latest frame atomically
             with self._frame_lock:
-                msg = self._latest_frame
+                pending = self._latest_frame
                 self._latest_frame = None  # Mark as consumed
-            if msg is None:
+            if pending is None:
                 time.sleep(0.005)  # 5ms poll
                 continue
+            msg, generation = pending
             try:
                 # Zero-copy: np.frombuffer on array.array directly (no bytes() copy)
                 img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
                 if msg.encoding == "rgb8":
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                encoded, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                if not encoded:
+                    raise ValueError("JPEG encoding failed")
                 out = CompressedImage()
+                if hasattr(msg, "header"):
+                    out.header = msg.header
                 out.format = "jpeg"
                 out.data = bytes(jpeg)
+                # A publish already in progress cannot be recalled, and a bridge
+                # write may block. Lifecycle cancellation must never wait for it.
+                # Check this session on either side; only its own output may
+                # establish metadata readiness. The one encoder is reused if a
+                # previous write outlives the bounded start-time join.
+                with self._frame_lock:
+                    if not self._running or generation != self._frame_generation:
+                        continue
+                    size = (int(msg.width), int(msg.height))
+                    previous_size = self._frame_size
+                    if previous_size is not None and size != previous_size:
+                        raise ValueError("RGB resolution changed; restart camera and downstream cards")
                 self._pub.publish(out)
+                with self._frame_ready:
+                    if not self._running or generation != self._frame_generation:
+                        continue
+                    self._frame_size = size
+                    self._frame_id = str(getattr(getattr(msg, "header", None), "frame_id", ""))
+                    self._last_encode_error = ""
+                    self._frame_ready.notify_all()
             except Exception as e:
+                with self._frame_lock:
+                    if generation == self._frame_generation:
+                        self._last_encode_error = str(e)
                 print(f"[CameraPlugin] encode error: {e}", flush=True)
 
     # ── 帧率看门狗 ────────────────────────────────────────────────────────────
@@ -1219,6 +1306,9 @@ class CameraPlugin:
     # 重启两次还不回来就不是这条路能修的了（USB 需要重新枚举、或者要重启主机）。
     # 继续重启只会让每 15 秒都掉一次流，且把真实原因埋在刷屏里。
     _MAX_WATCHDOG_RESTARTS = 2
+    # Core snapshots camera_info before starting VOP/Navi. Pending states do
+    # not delay those consumers, so start waits for verified output dimensions.
+    _START_FRAME_TIMEOUT_S = 10.0
 
     _NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
 
@@ -1285,23 +1375,70 @@ class CameraPlugin:
             self._armed_at = time.time()
             self._last_frame_at = 0.0
 
+    def _info(self) -> dict:
+        from common.camera_info import build
+
+        with self._frame_lock:
+            running, size = self._running, self._frame_size
+            frame_id, error = self._frame_id, self._last_encode_error
+        declaration = build(
+            topic=self._topic, id="x-humanoid/tianyi2.0/head/color",
+            format="image/jpeg", width=size[0] if size else None,
+            height=size[1] if size else None, source="unknown",
+            pipeline=["x-humanoid/tianyi2.0/camera_head"],
+            vendor={"input_topic": "/ob_camera_head/color/image_raw", "frame_id": frame_id})
+        return {"state": ("running" if size else "loading") if running else "idle",
+                "ready": bool(running and size),
+                "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
+                "camera_info": [declaration], "source_frame_id": frame_id,
+                "last_encode_error": error,
+                "camera_info_note": "宽高来自本次成功发布的 RGB 帧；K、视场角及与硬件深度的注册关系未知。"}
+
+    def _wait_for_first_frame(self, generation: int) -> bool:
+        deadline = time.monotonic() + self._START_FRAME_TIMEOUT_S
+        with self._frame_ready:
+            while (self._running and generation == self._frame_generation
+                   and self._frame_size is None):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._frame_ready.wait(remaining)
+            return bool(self._running and generation == self._frame_generation
+                        and self._frame_size is not None)
+
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             # Call start() here rather than leaning on main.py's lazy start:
             # that only fires once per process, so trusting it left a camera
             # that had been stopped dark for the rest of the container's life
             # while still reporting a healthy-looking state.
-            self.start()
-            if not self._running:
-                return {"state": "error",
-                        "error": "camera start failed, see driver log"}
-            return {"state": "running"}
+            # Capture the arm's generation before stop/new-start can interleave.
+            # Release this lock before waiting for a frame, so stop can cancel.
+            with self._lifecycle_lock:
+                self.start()
+                with self._frame_lock:
+                    if not self._running:
+                        return {"state": "error",
+                                "error": "camera start failed, see driver log"}
+                    generation = self._frame_generation
+            if self._wait_for_first_frame(generation):
+                return self._info()
+            # A concurrent stop/new start owns its own session. Never disarm it
+            # because an earlier start's first-frame wait was cancelled.
+            with self._lifecycle_lock:
+                if not self._running or generation != self._frame_generation:
+                    return {"state": "idle", "message": "camera start cancelled"}
+                with self._frame_lock:
+                    ready = self._frame_size is not None
+                if ready:
+                    return self._info()
+                self.stop()
+            return {"state": "error", "error": "no RGB frame was published during camera startup"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
         if action == "info":
-            state = "running" if self._running else "idle"
-            return {"state": state, "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
+            return self._info()
         return {"state": "running" if self._running else "idle"}
 
 
@@ -1817,6 +1954,7 @@ class DepthCameraPlugin:
         self._first_published_at = None
         self._forwarded_frames = 0
         self._received_frames = self._invalid_frames = self._stale_frames = 0
+        self._source_geometry = None
         self._latest_image = None
         self._latest_image_lock = threading.Lock()
         self._publish_lock = threading.RLock()
@@ -1846,6 +1984,7 @@ class DepthCameraPlugin:
         self._cv2, self._np = cv2, np
         self._first_published_at = self._last_received_at = None
         self._forwarded_frames = self._received_frames = self._invalid_frames = self._stale_frames = 0
+        self._source_geometry = None
         latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST, depth=1,
                                 durability=DurabilityPolicy.VOLATILE)
@@ -1919,6 +2058,20 @@ class DepthCameraPlugin:
             self._stale_frames += 1
             return
         self._pub.publish(out)
+        width, height = int(msg.width), int(msg.height)
+        crop_width, crop_height = width, height
+        if width * 3 > height * 4:
+            crop_width = height * 4 // 3
+        elif width * 3 < height * 4:
+            crop_height = width * 3 // 4
+        self._source_geometry = {
+            "width": width, "height": height,
+            "frame_id": str(getattr(msg.header, "frame_id", "")),
+            "encoding": str(msg.encoding),
+            "crop_xywh": [(width - crop_width) // 2, (height - crop_height) // 2,
+                          crop_width, crop_height],
+            "output_size": [640, 480],
+        }
         self._last_published_at = time.monotonic()
         if self._first_published_at is None:
             self._first_published_at = self._last_published_at
@@ -1949,9 +2102,13 @@ class DepthCameraPlugin:
     def dispatch(self, action, args):
         now = time.monotonic()
         duration = now - self._first_published_at if self._first_published_at is not None else 0
+        geometry = self._source_geometry
         return {"state": "running" if self._running else "idle",
                 "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}],
                 "input_topic": "/ob_camera_head/depth/image_raw", "target_hz": self._max_hz,
+                "source_geometry": dict(geometry) if geometry else None,
+                "registration_to_color": "unknown",
+                "registration_note": "输入为厂商原生 depth/image_raw；仅作居中裁剪及缩放，未验证已投影到 RGB 视角。",
                 "received_frames": self._received_frames, "published_frames": self._forwarded_frames,
                 "invalid_frames": self._invalid_frames, "stale_frames": self._stale_frames,
                 "average_hz": round(max(0, self._forwarded_frames - 1) / duration, 2) if duration > 0 else 0,

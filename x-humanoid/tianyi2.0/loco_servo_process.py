@@ -486,6 +486,9 @@ class LocoServoPlugin:
                         raise ValueError("configuration toggles must be boolean")
                     _validated_min_vx(args.get("min_vx", self._model._min_vx),
                                       self._model._descriptor["limits"]["upper"][0])
+                    for key, current in zip(("linear_acceleration", "angular_acceleration"),
+                                            self._model._accel):
+                        self._model._positive(args, key, current)
             except (ValueError, TypeError) as exc:
                 return {"state": "error", "error": str(exc)}
             if self._process is not None and self._process.poll() is not None and not self._stopping:
@@ -500,7 +503,8 @@ class LocoServoPlugin:
                 if action != "start":
                     result = self._model.dispatch(action, args)
                     if action == "config" and result.get("ok"):
-                        self._config.update({key: result[key] for key in (*TOGGLES, "min_vx")})
+                        self._config.update({key: result[key] for key in
+                                             (*TOGGLES, "min_vx", "linear_acceleration", "angular_acceleration")})
                     self._last_info = self._model.dispatch("info", {})
                     return self._decorate(result)
                 try:
@@ -520,7 +524,8 @@ class LocoServoPlugin:
                     self._close_nodes()
                     self._open_nodes(result["input"])
                 if action == "config" and result.get("ok"):
-                    settings = {key: result[key] for key in (*TOGGLES, "min_vx")}
+                    settings = {key: result[key] for key in
+                                (*TOGGLES, "min_vx", "linear_acceleration", "angular_acceleration")}
                     self._model.dispatch("config", settings)
                     self._config.update(settings)
                 if mutation:

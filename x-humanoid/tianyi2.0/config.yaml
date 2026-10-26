@@ -63,7 +63,7 @@ plugins:
     max_vx: 0.3  # Operational speed cap, not a vendor hardware maximum.
     max_wz: 1.0  # rad/s; accepts navi search turns up to +/-1.0.
     linear_acceleration: 0.3  # m/s^2; explicit zero stops immediately.
-    angular_acceleration: 0.6  # rad/s^2
+    angular_acceleration: 2.0  # rad/s^2; bounded steering response, configurable via MCP.
     dry_run: true  # First deployment must inspect commands before enabling real motion.
     # Official Slamware SDK TCP endpoint, distinct from HTTP :1448.
     sdk_host: "192.168.11.1"

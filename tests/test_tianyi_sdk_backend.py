@@ -34,16 +34,20 @@ print("MOTUS_SDK 0 OK 0 ready"+(" "+initial_diagnostics if initial_diagnostics i
       " "+diagnostics if diagnostics is not None else ""),flush=True)
 for line in sys.stdin:
     seq,verb,*args=line.split()
-    if mode == "timeout" and verb in ("SET", "UPDATE"):
+    if mode == "timeout" and verb in ("SET", "UPDATE", "ZERO", "FOLLOW"):
         time.sleep(30)
-    if mode == "error" and verb in ("SET", "UPDATE"):
+    if mode == "error" and verb in ("SET", "UPDATE", "ZERO", "FOLLOW"):
         emit("MOTUS_SDK "+seq+" ERROR "+b"localization quality too low".hex())
         sys.exit(1)
-    if mode == "expired" and verb in ("SET", "UPDATE") and seq == "1":
+    if mode == "expired" and verb in ("SET", "UPDATE", "ZERO") and seq == "1":
         emit("MOTUS_SDK "+seq+" EXPIRED "+b"command lease expired at worker: remaining_ms=-12".hex())
         continue
     if mode == "expired_stop" and verb == "STOP":
         emit("MOTUS_SDK "+seq+" EXPIRED "+b"unexpected stop reply".hex())
+        continue
+    if mode in ("stale_follow", "stale_follow_first") and verb == "FOLLOW" and (seq == "2" or mode == "stale_follow_first"):
+        snapshot='{{"session_active":true,"action_id":17}}'
+        print("MOTUS_SDK "+seq+" STALE "+b"stale FOLLOW deadline".hex()+" "+snapshot,flush=True)
         continue
     if mode == "wrong_sequence":
         seq=str(int(seq)+1)
@@ -55,12 +59,21 @@ for line in sys.stdin:
     if mode == "expect_set" and verb not in ("SET", "STOP"):
         emit("MOTUS_SDK "+seq+" ERROR "+b"expected SET".hex())
         sys.exit(1)
+    if mode == "expect_zero" and verb not in ("ZERO", "STOP"):
+        emit("MOTUS_SDK "+seq+" ERROR "+b"expected ZERO".hex())
+        sys.exit(1)
+    if mode == "expect_follow" and verb not in ("FOLLOW", "SOFT_STOP", "STOP"):
+        emit("MOTUS_SDK "+seq+" ERROR "+b"expected FOLLOW".hex())
+        sys.exit(1)
+    if mode == "expect_follow" and verb == "SOFT_STOP" and args:
+        emit("MOTUS_SDK "+seq+" ERROR "+b"SOFT_STOP cannot extend deadlines".hex())
+        sys.exit(1)
     if mode == "partial":
         response="MOTUS_SDK "+seq+" OK 17 active"+(" "+diagnostics if diagnostics is not None else "")+"\\n"
         sys.stdout.write(response[:7]);sys.stdout.flush();time.sleep(.01)
         sys.stdout.write(response[7:]);sys.stdout.flush()
     else:
-        emit("MOTUS_SDK "+seq+" OK "+("17 active" if verb in ("SET", "UPDATE") else "0 ready"))
+        emit("MOTUS_SDK "+seq+" OK "+("17 active" if verb in ("SET", "UPDATE", "ZERO", "FOLLOW", "SOFT_STOP") else "0 ready"))
 ''')
         script.chmod(0o700)
         instance = backend_module.SlamtecVelocityBackend({"sdk_binary": str(script), "sdk_reply_timeout": 0.15})
@@ -76,6 +89,137 @@ for line in sys.stdin:
 
 def write(worker):
     worker.write([0.05, 0, 0, 0, 0, -0.1], int(time.time() * 1000) + 200)
+
+
+def test_advertised_intermediate_zero_uses_zero_opcode(backend):
+    worker = backend("expect_zero", initial_diagnostics=json.dumps({
+        "capabilities": {"zero_velocity_update": True}}))
+    worker.connect()
+    worker.write([0.0] * 6, int(time.time() * 1000) + 200, preserve_action=True)
+    assert worker.info()["state"] == "active" and worker._sequence == 1
+    assert worker.info()["capabilities"]["zero_velocity_update"] is True
+    worker.write([0.0] * 6, int(time.time() * 1000) + 200)
+    assert worker.info()["state"] == "ready" and not worker._armed
+
+
+def test_legacy_worker_intermediate_zero_stops_instead_of_replaying_velocity(backend):
+    worker = backend("expect_set")
+    worker.connect()
+    write(worker)
+    worker.write([0.0] * 6, int(time.time() * 1000) + 200, preserve_action=True)
+    assert worker.info()["state"] == "ready" and not worker._armed
+    assert worker._sequence == 2
+
+
+def test_expired_intermediate_zero_does_not_fault_or_renew_session(backend):
+    worker = backend("expired", initial_diagnostics=json.dumps({
+        "capabilities": {"zero_velocity_update": True}}))
+    worker.connect()
+    with pytest.raises(backend_module.CommandLeaseExpired):
+        worker.write([0.0] * 6, int(time.time() * 1000) + 200, preserve_action=True)
+    assert worker.info()["state"] == "ready" and not worker._armed
+    assert worker.info()["connected"] and worker.info()["expired_commands"] == 1
+
+
+def test_advertised_staged_stop_sends_follow_and_soft_stop_has_no_deadline(backend):
+    worker = backend("expect_follow", initial_diagnostics=json.dumps({
+        "capabilities": {"staged_stop": True}}))
+    worker.connect()
+    assert worker.supports_staged_stop is True
+    now = int(time.time() * 1000)
+    worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
+    worker.soft_stop(now + 5000)  # Never transmits or renews this supplied time.
+    assert worker.info()["state"] == "active" and worker._sequence == 2
+    assert worker.info()["last_write"]["cancel_remaining_ms"] > 0
+    worker.stop()
+    assert not worker._armed and worker.info()["state"] == "ready"
+
+
+def test_staged_intermediate_zero_uses_follow_even_without_legacy_zero_capability(backend):
+    worker = backend("expect_follow", initial_diagnostics=json.dumps({
+        "capabilities": {"staged_stop": True}}))
+    worker.connect()
+    now = int(time.time() * 1000)
+    worker.write([0.] * 6, now + 200, cancel_deadline_ms=now + 900, preserve_action=True)
+    assert worker._armed and worker._sequence == 1
+    worker.write([0.] * 6, now + 200, cancel_deadline_ms=now + 900)
+    assert not worker._armed and worker.info()["state"] == "ready"
+
+
+def test_staged_api_keeps_legacy_worker_safe_with_old_hard_expiry(backend):
+    worker = backend("expect_set")
+    worker.connect()
+    now = int(time.time() * 1000)
+    worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
+    assert worker.supports_staged_stop is False and worker._armed
+    worker.soft_stop(now + 900)
+    assert worker.info()["state"] == "ready" and worker._sequence == 2
+
+
+def test_stale_follow_reply_preserves_accepted_action_and_connection(backend):
+    worker = backend("stale_follow", initial_diagnostics=json.dumps({
+        "capabilities": {"staged_stop": True}}))
+    worker.connect()
+    now = int(time.time() * 1000)
+    worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
+    with pytest.raises(backend_module.StaleVelocityCommand):
+        worker.write([.2, 0, 0, 0, 0, .3], now + 200, cancel_deadline_ms=now + 900)
+    assert worker._armed and worker.info()["state"] == "active"
+    assert worker.info()["action_id"] == 17 and worker.info()["connected"]
+    assert worker.info()["expired_commands"] == 1
+    worker.stop()
+    assert worker.info()["state"] == "ready"
+
+
+def test_stale_follow_first_slow_sdk_ack_tracks_newly_created_zero_action(backend):
+    worker = backend("stale_follow_first", initial_diagnostics=json.dumps({
+        "capabilities": {"staged_stop": True}}))
+    worker.connect()
+    now = int(time.time() * 1000)
+    with pytest.raises(backend_module.StaleVelocityCommand):
+        worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
+    assert worker._armed and worker.info()["action_id"] == 17
+    worker.stop()
+    assert not worker._armed
+
+
+def test_locally_stale_follow_never_sends_or_cancels_existing_velocity(backend):
+    worker = backend("expect_follow", initial_diagnostics=json.dumps({
+        "capabilities": {"staged_stop": True}}))
+    worker.connect()
+    now = int(time.time() * 1000)
+    worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
+    with pytest.raises(backend_module.StaleVelocityCommand):
+        worker.write([.2, 0, 0, 0, 0, .3], now - 1, cancel_deadline_ms=now + 900)
+    assert worker._sequence == 1 and worker._armed
+
+
+@pytest.mark.parametrize("value", [False, 1, "true", None, []])
+def test_staged_capability_requires_literal_true_in_initial_ack(backend, value):
+    worker = backend(initial_diagnostics=json.dumps({"capabilities": {"staged_stop": value}}))
+    worker.connect()
+    assert worker.supports_staged_stop is False
+
+
+def test_staged_capability_cannot_appear_in_later_ack(backend):
+    worker = backend(diagnostics=json.dumps({"capabilities": {"staged_stop": True}}),
+                     initial_diagnostics="{}")
+    worker.connect()
+    assert worker.supports_staged_stop is False
+    write(worker)
+    assert worker.info()["native"]["stats"]["capabilities"]["staged_stop"] is True
+    assert worker.supports_staged_stop is False
+
+
+@pytest.mark.parametrize("cancel", [float("nan"), float("inf"), True, "900", -1])
+def test_invalid_cancellation_deadline_never_reaches_sdk(backend, cancel):
+    worker = backend("expect_follow", initial_diagnostics=json.dumps({
+        "capabilities": {"staged_stop": True}}))
+    worker.connect()
+    with pytest.raises(ValueError, match="cancellation deadline"):
+        worker.write([.1, 0, 0, 0, 0, -.2], int(time.time() * 1000) + 200,
+                     cancel_deadline_ms=cancel)
+    assert worker._sequence == 0 and not worker._armed
 
 
 def test_connect_is_readonly_and_stop_closes_own_session(backend):
@@ -218,7 +362,8 @@ def test_atomic_expiry_update_is_negotiated_only_by_valid_initial_ready_ack(back
     assert worker.supports_atomic_expiry_update is False
     worker.connect()
     assert worker.supports_atomic_expiry_update is True
-    assert worker.info()["capabilities"] == {"atomic_expiry_update": True}
+    assert worker.info()["capabilities"] == {"atomic_expiry_update": True, "zero_velocity_update": False,
+                                             "staged_stop": False}
     write(worker)  # Subsequent legacy replies cannot erase negotiated support.
     assert worker.info()["native"]["stats"] is None
     assert worker.supports_atomic_expiry_update is True
@@ -238,7 +383,8 @@ def test_missing_or_invalid_initial_capability_uses_legacy_path(backend, diagnos
     worker = backend(initial_diagnostics=diagnostics)
     worker.connect()
     assert worker.supports_atomic_expiry_update is False
-    assert worker.info()["capabilities"] == {"atomic_expiry_update": False}
+    assert worker.info()["capabilities"] == {"atomic_expiry_update": False, "zero_velocity_update": False,
+                                             "staged_stop": False}
 
 
 def test_later_ack_cannot_upgrade_atomic_expiry_update(backend):
