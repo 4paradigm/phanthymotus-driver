@@ -1,12 +1,14 @@
 """End-to-end quick setup: no engineering JSON or invented verification flags."""
 import copy
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from test_payload_mass import Sampler, Loco, raw_frame, run, wait_for
 from payload_mass import PayloadMassPlugin
-from payload_mass_sampling import MassError, check_frame
+from payload_mass_sampling import MassError, SharedSampler, check_frame
 from payload_mass_quick import profile_from_home, fit_reference
 from payload_mass_estimator import summarize
 from payload_mass_live import evaluate_window
@@ -111,6 +113,114 @@ def test_right_arm_profile_selects_actual_motor_ids():
     assert p["motor_ids"] == [10, 11, 12, 13]
     assert "mapping_verified" not in p and "feedback_verified" not in p
     assert p["max_mass_kg"] == .5
+    assert p["accept_host_only_freshness"] is False
+
+
+def getter_values(frame):
+    """Actual getter shape: motor/IMU values, with no source heartbeat."""
+    motors = [SimpleNamespace(motor_id=i, pos=frame["q"][i], vel=frame["dq"][i],
+                              tau=frame["tau"][i], temperature=frame["temperature"][i],
+                              error=frame["errors"][i]) for i in range(21)]
+    imu = SimpleNamespace(ori=frame["quaternion_xyzw"], angular_vel=frame["gyro"])
+    return motors, imu, frame["workmode"]
+
+
+@pytest.mark.parametrize("moving", [False, True])
+@pytest.mark.parametrize("legacy_host_opt_in", [False, True])
+def test_frozen_real_getter_cannot_produce_quick_kg(monkeypatch, moving, legacy_host_opt_in):
+    import payload_mass_sampling as sampling
+    clock = [10.0]
+    monkeypatch.setattr(sampling, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    sampler = SharedSampler()
+    frozen = raw_frame(.2)
+    if moving:
+        frozen["dq"][0] = .2
+    values = getter_values(frozen)
+    for _ in range(41):
+        sampler.accept_getter(*values)
+        clock[0] += .1
+    d = sampler.diagnostics()
+    assert d["freshness_status"] == "host_receipt_only" and d["host_age_s"] < .11
+    frames = sampler.read_since(0, 0)
+    assert frames[-1]["host_monotonic_s"] - frames[0]["host_monotonic_s"] > 3
+    assert all(f["source_seq"] is None and f["source_timestamp"] is None for f in frames)
+    p = profile_from_home(d["latest"], "left", 300)
+    p["accept_host_only_freshness"] = legacy_host_opt_in
+    empty = [raw_frame(0, n) for n in range(1, 33)]
+    baseline = {"id": "freshness", "profile_fingerprint": p["fingerprint"],
+                "created_s": time.time(), "summary": summarize(empty, p)}
+    model = fit_reference([raw_frame(.2, n) for n in range(1, 33)], baseline, p, .2)
+    # Even a calibrated scale must not publish provisional or stable kg from
+    # repeated getter receipts; moving frames must not bypass this check either.
+    with pytest.raises(MassError) as err:
+        evaluate_window(frames, baseline, model, p, 3, time.time())
+    assert err.value.code == "FRESHNESS_UNVERIFIED"
+
+
+def test_quick_prepare_with_real_getter_rejects_before_motor_command(tmp_path):
+    sampler = SharedSampler()
+    home = raw_frame(); home["workmode"] = 2
+    for _ in range(20):
+        sampler.accept_getter(*getter_values(home))
+    loco = Loco(SimpleNamespace(frame=home))
+    card = PayloadMassPlugin({"setup_mode": "quick", "recording_id": 12,
+                              "data_dir": str(tmp_path)}, "no_heartbeat",
+                             sampler=sampler, loco_plugin=loco, notify=lambda *a: None)
+    try:
+        result = card.dispatch("prepare", {})
+        assert result["error_code"] == "FRESHNESS_UNVERIFIED"
+        assert result["mass_kg"] is None and not result["valid"] and not result["stable"]
+        assert not loco.commands and loco._payload_owner is None
+        assert card._session is None
+    finally:
+        card.stop()
+
+
+def test_quick_actual_collect_rejects_repeated_getter_receipts():
+    sampler = SharedSampler()
+    values = getter_values(raw_frame())
+    sampler.accept_getter(*values)
+    p = profile_from_home(sampler.diagnostics()["latest"], "left", 300)
+    p.update(min_samples=2, settle_timeout_s=.3)
+    done = threading.Event()
+    def feed():
+        while not done.wait(.005):
+            sampler.accept_getter(*values)
+    thread = threading.Thread(target=feed)
+    thread.start()
+    try:
+        with pytest.raises(MassError) as err:
+            sampler.collect(.03, p, threading.Event())
+        assert err.value.code == "FRESHNESS_UNVERIFIED"
+    finally:
+        done.set()
+        thread.join(1)
+
+
+@pytest.mark.parametrize("heartbeat", ["source_seq", "source_timestamp"])
+def test_quick_verified_source_can_be_constant_but_duplicates_cannot_refresh(monkeypatch, heartbeat):
+    import payload_mass_sampling as sampling
+    clock = [10.0]
+    monkeypatch.setattr(sampling, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    sampler = SharedSampler()
+    for n in range(41):
+        frame = raw_frame(.2)
+        frame.update(source_seq=None, source_timestamp=None)
+        frame[heartbeat] = n
+        assert sampler.push(frame)
+        clock[0] += .1
+    p = profile_from_home(frame, "left", 300)
+    baseline = {"id": "verified", "profile_fingerprint": p["fingerprint"], "created_s": time.time(),
+                "summary": summarize([raw_frame(0, n) for n in range(1, 33)], p)}
+    model = fit_reference([raw_frame(.2, n) for n in range(1, 33)], baseline, p, .2)
+    result = evaluate_window(sampler.read_since(0, 0), baseline, model, p, 3, time.time())
+    assert result["mass_kg"] == .2 and result["valid"] and result["stable"]
+    cursor = sampler.diagnostics()["received_count"]
+    for _ in range(40):
+        clock[0] += .1
+        assert not sampler.push(frame)
+    assert sampler.read_since(cursor, 0) == []
+    assert sampler.diagnostics()["host_age_s"] > 3
 
 
 def test_exact_500g_bound_accepts_roundoff_but_rejects_actual_excess():

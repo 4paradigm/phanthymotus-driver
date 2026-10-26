@@ -191,6 +191,13 @@ class SharedSampler:
 
 
 def check_frame(frame, p):
+    # Check before UNSTABLE: live weighing tolerates motion while loading, but
+    # must never turn an unverified moving frame into a provisional kg reading.
+    # Quick sessions also reject the opt-in used by older quick profiles.
+    if (frame.get("source_seq") is None and frame.get("source_timestamp") is None
+            and (p.get("setup_mode") == "quick" or not p["accept_host_only_freshness"])):
+        raise MassError("FRESHNESS_UNVERIFIED",
+                        "无法验证机器人反馈是否更新：当前接口无源序号或时间戳，称重已拒绝；需接入可验证的新鲜反馈。")
     if frame["workmode"] != p["workmode"] or frame["workmode"] in (26,30):
         raise MassError("MODE_MISMATCH", "workmode/protection differs from profile")
     if p.get("setup_mode") == "quick":
@@ -210,5 +217,3 @@ def check_frame(frame, p):
         raise MassError("UNSTABLE", "joint/body velocity too high")
     if any(abs(frame["tau"][j]) >= p["torque_abs_limit"] for j in p["motor_ids"]):
         raise MassError("SATURATED", "torque outside engineer-confirmed measurement limits")
-    if frame.get("source_seq") is None and frame.get("source_timestamp") is None and not p["accept_host_only_freshness"]:
-        raise MassError("FRESHNESS_UNVERIFIED", "SDK has no source heartbeat; verified host-only policy required")

@@ -20,7 +20,7 @@ def profile_from_home(frame, arm, hold_s):
     p = {"profile_id": "quick_session", "setup_mode": "quick", "arm": arm,
          "motor_ids": ARM_IDS[arm], "joint_names": NAMES[arm],
          "pose_q": q, "quaternion_xyzw": vector(frame["quaternion_xyzw"], 4, "quaternion"),
-         "workmode": 23, "torque_units": "sdk_raw", "accept_host_only_freshness": True,
+         "workmode": 23, "torque_units": "sdk_raw", "accept_host_only_freshness": False,
          "pose_tolerance_rad": .15, "body_tolerance_rad": .1,
          "max_velocity_rad_s": .1, "max_gyro_rad_s": .15,
          "max_torque_span": 1e9, "torque_abs_limit": 1e9,
