@@ -526,15 +526,11 @@ class LocoPlugin:
     def _loco_target_tool(self) -> dict:
         return {
             "name": "loco_target", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：按腿式里程计估计距离前进/后退/侧移、按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。距离移动前须保持机器人静止以标定；估计存在打滑与漂移，实际距离精度未经验证，不保证 ±5 厘米。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move", "rotate", "target", "stop_move", "status"]},
-                    "direction": {"type": "string", "default": "前进",
-                                  "description": "移动方向：前进、后退、左移、右移（也支持 forward/backward/left/right）；留空为前进。左右为保持机身朝向的侧移。"},
-                    "distance_m": {"type": "number", "minimum": 0.1, "maximum": 3,
-                                   "description": "沿指定起点机身方向移动的正数距离（米）；按腿式里程计估计，非经验证的实际距离。启动前保持静止。"},
+                    "action": {"type": "string", "enum": ["rotate", "target", "stop_move", "status"]},
                     "x_m": {"type": "number", "minimum": -3, "maximum": 3,
                             "description": "target 动作：目标点在启动时机身系的前后坐标（米，正=前）。"},
                     "y_m": {"type": "number", "minimum": -3, "maximum": 3,
@@ -544,7 +540,6 @@ class LocoPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["direction", "distance_m"], "description": "按腿式里程计估计沿指定方向移动；默认前进，左右为侧移。打滑系数在卡片配置里设置，对之后所有移动生效。数据异常时停车报错，精度待实测。"},
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
                     "target": {"params": ["x_m", "y_m"],
                                "description": "走到启动机身系下的目标点 (x,y)：朝向目标先转/边走边转，只前进不横移；到达位置容差后停车。距离 0.1–3 m。"},
@@ -553,23 +548,14 @@ class LocoPlugin:
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
                 # Both actions retain the existing asynchronous ACP contract.
-                "x-completion": {"actions": ["move", "rotate", "target"], "timeout": 120},
+                "x-completion": {"actions": ["rotate", "target"], "timeout": 120},
             },
             "configSchema": {
                 "type": "object",
                 "properties": {
                     "slip_forward": {"type": "number", "default": 1.7, "minimum": 1.0,
                                      "maximum": 10.0,
-                                     "description": "前进方向的实测打滑系数（默认 1.7）。改后对之后所有前进动作生效。"},
-                    "slip_backward": {"type": "number", "default": 1.85, "minimum": 1.0,
-                                      "maximum": 10.0,
-                                      "description": "后退方向的实测打滑系数（默认 1.85）。"},
-                    "slip_left": {"type": "number", "default": 4.4, "minimum": 1.0,
-                                  "maximum": 10.0,
-                                  "description": "左移方向的实测打滑系数（默认 4.4）。"},
-                    "slip_right": {"type": "number", "default": 5.5, "minimum": 1.0,
-                                   "maximum": 10.0,
-                                   "description": "右移方向的实测打滑系数（默认 5.5）。"},
+                                     "description": "target 走段的实测打滑系数（默认 1.7）。改后对之后所有 target 移动生效。"},
                 },
             },
             "topic_out": [],
@@ -715,8 +701,6 @@ class LocoPlugin:
             handler = lambda: self._do_move(args)
         elif tool_name == "loco_target" and action == "rotate":
             return self._do_rotate(args)
-        elif tool_name == "loco_target" and action == "move":
-            return self._do_destination(args, "move")
         elif tool_name == "loco_target" and action == "target":
             return self._do_destination(args, "target")
         elif tool_name == "loco_target" and action == "status":
@@ -887,7 +871,7 @@ class LocoPlugin:
                 return {
                     "state": "error",
                     "error": (
-                        "loco_target rotate or distance move in progress; wait for it to "
+                        "loco_target rotate or target move in progress; wait for it to "
                         "finish or call stop_move first"
                     ),
                 }
@@ -896,16 +880,12 @@ class LocoPlugin:
             self._destination_action = action
         try:
             value, terminal = (self._rotate_preflight(args) if action == "rotate"
-                               else (self._target_preflight(args) if action == "target"
-                                     else self._distance_preflight(args)))
+                               else self._target_preflight(args))
             if terminal is None:
                 if action == "rotate":
                     expected_duration_s = _rotate_timeout_s(value)
-                elif action == "target":
-                    expected_duration_s = min(60.0, 12.0+20.0*value)
                 else:
-                    from imu_distance_control import distance_timeout
-                    expected_duration_s = distance_timeout(value)
+                    expected_duration_s = min(60.0, 12.0+20.0*value)
                 action_id = f"bumi_loco_target_{uuid.uuid4().hex}"
                 worker = threading.Thread(target=self._do_rotate_worker,
                                           args=(args, action_id, action),
@@ -921,12 +901,12 @@ class LocoPlugin:
                             "requested_target_y_m": float(args.get('y_m'))}
                            if action == "target" else {}),
                         **({'feedback_source': 'leg_odometry_experimental',
-                            'accuracy_validated': False} if action in ('move', 'target') else {})}
+                            'accuracy_validated': False} if action == 'target' else {})}
         except Exception as exc:
             terminal = {"state": "error",
                         "error": f"{type(exc).__name__}: {exc}",
                         **({'feedback_source': 'leg_odometry_experimental',
-                            'estimated_quality': 'unavailable', 'accuracy_validated': False} if action == 'move' else {})}
+                            'estimated_quality': 'unavailable', 'accuracy_validated': False} if action == 'target' else {})}
         # No worker accepted the action: release its reservation so a
         # transient SDK or thread-start failure does not leave the card busy.
         with self._rotate_lock:
@@ -945,15 +925,14 @@ class LocoPlugin:
         result = None
         owns_velocity = False
         try:
-            if action in ("move", "target") or abs(float(args["angle_deg"])) >= 0.05:
+            if action == "target" or abs(float(args["angle_deg"])) >= 0.05:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
                 self._preempt_servo(f"loco_target.{action}")
                 owns_velocity = True
-            result = self._do_rotate_impl(args) if action == "rotate" else (
-                self._do_target_impl(args) if action == "target" else self._do_distance_impl(args))
+            result = self._do_rotate_impl(args) if action == "rotate" else self._do_target_impl(args)
             result["action"] = action
-            if action in ('move', 'target'):
+            if action == 'target':
                 result.setdefault('feedback_source', 'leg_odometry_experimental')
                 result.setdefault('estimated_quality', 'unavailable')
                 result.setdefault('accuracy_validated', False)
@@ -1022,29 +1001,11 @@ class LocoPlugin:
         """The 21 SDK joint positions used by the leg-odometry distance estimate."""
         return self._high_ctrl.get_joint_state()
 
-    def _distance_preflight(self, args):
-        from imu_distance_control import movement_direction
-        movement_direction(args.get('direction', ''))
-        raw = args.get("distance_m")
-        try:
-            distance = float(raw)
-        except (TypeError, ValueError):
-            distance = float("nan")
-        if isinstance(raw, bool) or not math.isfinite(distance) or not 0.1 <= distance <= 3.0:
-            return None, {"state": "error", "error": "distance_m must be a finite number from 0.1 to 3 metres"}
-        problem = self._rotate_mode_error()
-        if problem is not None:
-            return None, problem
-        from imu_distance_control import decode_imu
-        decode_imu(self._read_distance_imu())
-        return distance, None
-
     def _distance_publish(self, vx, vyaw=0, *, vy=0):
         self._publish_cmd(vx, vy, vyaw, _get_default_cmd(), 0,
                           cancel_event=self._rotate_stop_event if vx or vy or vyaw else None)
 
-    _SLIP_CONFIG_FIELDS = {'slip_forward': 'forward', 'slip_backward': 'backward',
-                           'slip_left': 'left', 'slip_right': 'right'}
+    _SLIP_CONFIG_FIELDS = {'slip_forward': 'forward'}
 
     def _apply_distance_config(self, args: dict) -> dict:
         """Card config: change the per-direction slip factors for later moves."""
@@ -1063,11 +1024,6 @@ class LocoPlugin:
             changes[direction] = value
         self._slip_scales.update(changes)
         return {"state": "configured", "slip_scales": dict(self._slip_scales)}
-
-    def _distance_slip_scale(self, args: dict) -> float:
-        from imu_distance_control import movement_direction
-        direction, _, _ = movement_direction(args.get('direction', ''))
-        return self._slip_scales[direction]
 
     def _target_preflight(self, args):
         raw_x, raw_y = args.get('x_m'), args.get('y_m')
@@ -1106,20 +1062,6 @@ class LocoPlugin:
         result['estimated_quality'] = 'experimental_unvalidated'
         return result
 
-    def _do_distance_impl(self, args):
-        from imu_distance_control import run_distance
-        self._move_stop_event.set()
-        if self._move_thread and self._move_thread.is_alive():
-            self._move_thread.join(timeout=1)
-            if self._move_thread.is_alive():
-                return {"state": "error", "error": "previous move has not stopped"}
-        self._set_servo_velocity_owner(True)
-        result = run_distance(self, float(args["distance_m"]), direction=args.get('direction', ''),
-                              full_scale=self._distance_full_scale(),
-                              slip_scale=self._distance_slip_scale(args))
-        result['estimated_quality'] = 'experimental_unvalidated'
-        return result
-
     def _read_rotate_imu(self) -> tuple[float, float]:
         imu = self._high_ctrl.get_imu_data()
         yaw = _yaw_deg_from_quat(imu.ori)
@@ -1127,6 +1069,7 @@ class LocoPlugin:
         if not math.isfinite(wz):
             raise ValueError("IMU yaw rate must be finite")
         return yaw, wz
+
 
     def _do_rotate_impl(self, args: dict) -> dict:
         # 1. Pre-flight (validation + workmode) — shared with the sync

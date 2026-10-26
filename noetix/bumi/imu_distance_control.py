@@ -94,37 +94,6 @@ def angle_delta(a, b):
     return math.atan2(math.sin(a-b), math.cos(a-b))
 
 
-def distance_timeout(distance_m):
-    # Calibration <=6 s + motion budget (leg path: 5+10*d+5, capped 30 s) +
-    # endpoint observation <=4 s. The global deadline is only a coarse bound;
-    # the worker itself enforces the calibration, motion and endpoint deadlines
-    # separately so a long calibration cannot eat the motion budget.
-    return 10.0+min(30.0, 5.0+10.0*distance_m+5.0)
-
-
-def movement_direction(value=''):
-    """Positive requested distance along a starting body axis."""
-    if not isinstance(value, str):
-        raise ValueError('direction must be 前进/后退/左移/右移 or forward/backward/left/right')
-    name = value.strip().lower() or 'forward'
-    name = {'前进': 'forward', '后退': 'backward', '左移': 'left', '右移': 'right'}.get(name, name)
-    axes = {'forward': (1, 0), 'backward': (-1, 0), 'left': (0, 1), 'right': (0, -1)}
-    if name not in axes:
-        raise ValueError('direction must be 前进/后退/左移/右移 or forward/backward/left/right')
-    return name, *axes[name]
-
-
-# Normalised `publish_cmd()` argument -> chassis speed in m/s, measured on this
-# Bumi on 2026-10-09 (README.md, "标定 loco_servo"): vx=1.0 -> 0.55 m/s and
-# |vy|=1.0 -> 0.20 m/s. The distance worker commands normalised values, so this
-# table turns its own command history into a travel estimate that is
-# independent of the IMU integration.
-#
-# The integration below remains the measured feedback path. This table is the
-# feed-forward cross-check: it cannot observe slip or a surface slower than the
-# calibration, but it also cannot inherit the SDK's timestamp-free sampling
-# error. `run_distance` compares the two; when they contradict, the worker
-# stops trusting the IMU displacement and continues on this estimate.
 FULL_SCALE_MPS = {'forward': 0.55, 'backward': 0.55, 'left': 0.20, 'right': 0.20}
 
 # A legged chassis does not creep: below these normalised thresholds the legs
@@ -157,58 +126,26 @@ def travel_speed(command, direction, full_scale=None):
     return full_scale*(command-deadband)/(1.0-deadband)
 
 
-def lateral_limit(distance_m):
-    """Path-deviation limit before a distance move is stopped.
-
-    The pure IMU lateral position inherits the same sampling/attitude error as
-    the forward estimate; the 2026-10-21 0.8 m forward run estimated 0.155 m of
-    lateral offset where the operator measured almost none. The limit therefore
-    scales with the requested move instead of aborting every long run.
-    """
-    return max(0.225, 0.75*distance_m)
-
-
-# Gait-phase finish. The walking controller stops mid-gait: one foot can end
-# in front of the other. Once the distance target is reached, keep commanding
-# the same velocity until the two contacts are fore-aft aligned in double
-# support, then request zero. The controller finishes the current step after
-# zero, so the exact final stance still needs a lead time measured on hardware.
-# The walking controller ignores yaw commands below about 0.30 normalised: a
-# constant -0.25 command turned the robot by only ~3 deg over 2.5 s (gait sway),
-# while -0.5 turned it ~29 deg in 1.5 s. A proportional correction of a few
-# degrees therefore does nothing; hold heading with strong pulses once the
-# error leaves a small band.
+# Target walking heading control: the walking controller ignores yaw commands
+# below ~0.30, so hold the heading with strong pulses once outside the band.
 HEADING_BAND_DEG = 1.5
 HEADING_PULSE = 0.5
-# target action heading strategy: turn first for a large bearing error, then
-# walk with the pulse hold; realign in place if the heading drifts while walking.
+# Turn-first threshold: above it, turn in place to <=2 deg (leg pose frozen
+# during the turn) and then walk; walk-and-turn up to the threshold.
 TARGET_TURN_FIRST_DEG = 45.0
 TARGET_TURN_DONE_DEG = 2.0
 TARGET_REALIGN_DEG = 12.0
-# After the position arrives, turn in place to face the target direction. The
-# final heading is a comfort alignment: best effort, never a reason to fail a
-# position-valid arrival.
+# After the position arrives, turn in place to face the target direction. This
+# is a comfort alignment: best effort, never a reason to fail a valid position.
 TARGET_FINAL_ALIGN_DEG = 2.0
 TARGET_FINAL_ALIGN_TIMEOUT_S = 4.0
 # Walk this far past the estimated target point: the leg estimate reads ~7%
 # short of the physical travel, so stopping exactly at the estimate leaves the
-# robot visibly short (measured 0.83 m for a 1.0 m target).
+# robot visibly short.
 TARGET_ARRIVAL_CREEP_M = 0.05
 # The leg estimate is the arrival feedback and reads ~0.10-0.16 m at a stopped
-# 1 m target; 0.12 flagged most normal arrivals as errors. Accept 0.20 and keep
-# reporting the actual value.
+# 1 m target; accept 0.20 m and report the actual value.
 TARGET_ARRIVAL_MAX_ERROR_M = 0.20
-# The sideways gait couples strongly into yaw: the right 1 m run kept turning
-# right even with a continuous +0.5 left command, so sideways moves get more
-# authority. Measured response to a 0.5 pulse is ~19 deg/s while walking.
-HEADING_PULSE_LATERAL = 0.8
-
-PARALLEL_FINISH_TOLERANCE_M = 0.04
-PARALLEL_FINISH_TIMEOUT_S = 0.4
-# The finish may walk past the target only this far; the gait phase arrives
-# once per step, so waiting for it can cost ~0.1-0.15 m. Distance accuracy wins
-# over feet alignment beyond this cap.
-PARALLEL_FINISH_MAX_EXTRA_M = 0.05
 
 
 def travel_tolerance(distance_m):
@@ -226,232 +163,6 @@ def _write_trace(samples, commands, result):
     for old in sorted(folder.glob('imu-*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[5:]:
         old.unlink()
 
-
-def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=None):
-    direction, body_x, body_y = movement_direction(direction)
-    estimator = ImuOdometry()
-    # The production LocoPlugin exposes the 21 SDK joint positions; those drive
-    # the distance estimate. Owners without joint access (unit-test plants,
-    # older bundles) keep the integrated-IMU path.
-    leg = (LegOdometry(slip_scale=(LEG_SLIP_SCALE[direction] if slip_scale is None
-                                   else float(slip_scale)))
-           if hasattr(owner, '_read_distance_joints') else None)
-    # Terminal acceptance band: wider on the leg path because the leg estimate
-    # itself carries ~0.10 m; the IMU fallback keeps the documented 0.05.
-    endpoint_band = 0.10 if leg is not None else 0.05
-    started = time.monotonic()
-    motion_started = brake_started = quiet_since = None
-    last_signature = None
-    changed_at = started
-    progress_at, last_progress = started, 0.0
-    moved = 0.0
-    source_position, source_velocity = estimator.position, estimator.velocity
-    dead_reckoned_m = 0.0
-    last_joints = None
-    joint_updates = 0
-    last_command, last_command_at = 0.0, None
-    finishing = False
-    finish_started = None
-    finish_phase = 'not_reached'
-    finish_overshoot = 0.0
-    samples, commands = [], []
-    def publish(vx, vyaw=0, *, vy=0):
-        if vy:
-            owner._distance_publish(vx, vyaw, vy=vy)
-        else:
-            owner._distance_publish(vx, vyaw)
-        commands.append(dict(received_mono_s=time.monotonic(), velocity=[vx, vy, vyaw]))
-
-    result = dict(state='error', requested_distance_m=distance_m, requested_direction=direction,
-                  feedback_source='leg_odometry_experimental', accuracy_validated=False,
-                  source_timestamp_available=False, stationary_assumed=False)
-    try:
-        publish(0)
-        while True:
-            if owner._rotate_stop_event.is_set():
-                result['state'] = 'stopped'
-                break
-            problem = owner._rotate_mode_error()
-            if problem:
-                raise ValueError(problem['error'])
-            read_started = time.monotonic()
-            raw = owner._read_distance_imu()
-            joints = owner._read_distance_joints() if leg is not None else None
-            now = time.monotonic()
-            samples.append(dict(received_mono_s=now, read_duration_s=now-read_started,
-                                orientation_xyzw=[float(raw.ori[i]) for i in range(4)],
-                                linear_acceleration_mps2=[float(raw.linear_acc[i]) for i in range(3)],
-                                angular_velocity_rad_s=[float(raw.angular_vel[i]) for i in range(3)]))
-            if not estimator.ready and now-started > 6.0:
-                raise ValueError('IMU calibration timed out')
-            estimator.observe(raw, now)
-            if leg is not None:
-                # Once braking starts the stance foot rolls/slips; keep the
-                # estimate that requested the brake instead of integrating noise.
-                # Keep integrating through the stop: the coast after the
-                # brake is real travel and must be in the reported endpoint.
-                leg.observe(joints, raw.ori, now)
-                values = joint_angles(joints)
-                if values != last_joints:
-                    last_joints, joint_updates = values, joint_updates+1
-                samples[-1]['leg_joint_positions'] = [round(v, 6) for v in values]
-                feet = getattr(leg, 'feet', None) or []
-                samples[-1]['leg_feet'] = [[round(v, 6) for v in foot] for foot in feet]
-            source_position = leg.position if leg is not None else estimator.position
-            source_velocity = leg.velocity if leg is not None else estimator.velocity
-            samples[-1].update(phase='calibration' if not estimator.ready else
-                              ('braking' if brake_started is not None else 'driving'),
-                              position_m=source_position, velocity_mps=source_velocity,
-                              acceleration_mps2=estimator.acceleration,
-                              imu_position_m=estimator.position)
-            if not estimator.ready:
-                publish(0)
-                time.sleep(0.02)
-                continue
-            if motion_started is None:
-                motion_started = progress_at = changed_at = now
-                last_command_at = now
-                if leg is not None:
-                    # Calibration-phase leg samples must not become the motion
-                    # baseline: the first motion sample starts a fresh window.
-                    leg.reset_baseline()
-                origin_yaw = estimator.yaw
-                cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
-                c, s = cy*body_x-sy*body_y, sy*body_x+cy*body_y
-                result['start_yaw_deg'] = math.degrees(origin_yaw)
-                result['stationary_world_acceleration_mps2'] = estimator.baseline
-                print('[loco_target] IMU experimental calibration complete; distance is an estimate', flush=True)
-            if estimator.signature != last_signature:
-                changed_at, last_signature = now, estimator.signature
-            if brake_started is None and now-changed_at > 0.5:
-                raise ValueError('IMU data unchanged during motion; source freshness cannot be verified')
-            x, y, _ = source_position
-            moved = x*c+y*s
-            speed = source_velocity[0]*c+source_velocity[1]*s
-            yaw_error = angle_delta(origin_yaw, estimator.yaw)
-            lateral = abs(-x*s+y*c)
-            if brake_started is None:
-                # Independent feed-forward travel estimate from the worker's
-                # own normalised commands through the measured command->speed
-                # curve. It cannot observe slip or the actual displacement, so
-                # it is a sanity bound only: a disagreement stops the move with
-                # an error instead of being used to finish it.
-                dead_reckoned_m += travel_speed(last_command, direction, full_scale)*(now-last_command_at)
-                last_command_at = now
-                samples[-1]['dead_reckoned_m'] = dead_reckoned_m
-                tolerance = travel_tolerance(distance_m)
-                if dead_reckoned_m-moved > tolerance:
-                    raise ValueError(
-                        f'dead-reckoned travel {dead_reckoned_m:.3f} m leads the IMU '
-                        f'estimate {moved:.3f} m by more than {tolerance:.3f} m for a '
-                        f'{distance_m:.3f} m request')
-            remaining = distance_m-moved
-            if moved < -0.05:
-                raise ValueError('IMU estimated progress is opposite to requested direction by more than 0.05 m')
-            if (lateral > lateral_limit(distance_m) or abs(yaw_error) > math.radians(30)
-                    or math.hypot(*source_velocity) > 1.2):
-                raise ValueError('IMU estimated motion exceeds direction or speed limits')
-            # The capped path also keeps integrating through braking (the stop
-            # slide is real travel); it needs the same finish allowance or the
-            # additional samples turn an intended capped stop into an error.
-            phase_active = (leg is not None
-                            and (finishing or finish_phase in ('parallel', 'timeout', 'capped')))
-            overshoot_limit = endpoint_band if phase_active else 0.05
-            if remaining < -overshoot_limit:
-                raise ValueError('IMU estimated overshoot exceeds 0.05 m')
-            if brake_started is None:
-                time_limit = (min(30.0, 5.0+10.0*distance_m+5.0) if leg is not None
-                              else min(20.0, 5.0+10.0*distance_m))
-                if now-motion_started > time_limit:
-                    raise ValueError('IMU motion time limit reached')
-                if moved-last_progress >= 0.01:
-                    last_progress, progress_at = moved, now
-                else:
-                    # The leg estimate can legitimately stall while the feet
-                    # slide backwards; the robot keeps walking. Give the leg
-                    # path a longer stall window than the IMU path.
-                    stall_limit = 8.0 if leg is not None else 3.0
-                    if now-progress_at > stall_limit:
-                        raise ValueError('IMU estimated distance made no progress')
-                brake_gap = max(0.025, min(0.10, max(0, speed)*0.15))
-                if finishing or remaining <= brake_gap:
-                    if not finishing:
-                        finishing, finish_started = True, now
-                    parallel = (leg is not None and getattr(leg, 'double_support', False)
-                                and abs(getattr(leg, 'foot_gap', 1.0)) <= PARALLEL_FINISH_TOLERANCE_M)
-                    capped = moved - distance_m >= PARALLEL_FINISH_MAX_EXTRA_M
-                    if (leg is None or parallel or capped
-                            or now-finish_started >= PARALLEL_FINISH_TIMEOUT_S):
-                        finish_phase = ('immediate' if leg is None else
-                                        ('parallel' if parallel else
-                                         ('capped' if capped else 'timeout')))
-                        finish_overshoot = max(0.0, moved-distance_m)
-                        brake_started, finishing = now, False
-                if brake_started is None:
-                    # Heading hold with pulses above the walking deadband. The
-                    # gait drifts left while walking forward; small proportional
-                    # corrections never reach the controller, so a pulse is sent
-                    # whenever the error leaves the band and zero inside it.
-                    error_deg = math.degrees(yaw_error)
-                    pulse = HEADING_PULSE_LATERAL if body_y else HEADING_PULSE
-                    if error_deg < -HEADING_BAND_DEG:
-                        turn = -pulse
-                    elif error_deg > HEADING_BAND_DEG:
-                        turn = pulse
-                    else:
-                        turn = 0.0
-                    # The lateral deadband is 0.60 normalised, so 0.9 is needed
-                    # to actually side-step; 0.65 barely moved.
-                    command = 0.9 if body_y else (0.6 if remaining > 0.2 else 0.5)
-                    publish(command*body_x, turn, vy=command*body_y)
-                    last_command, last_command_at = command, now
-            if brake_started is not None:
-                publish(0)
-                # A quiet accelerometer alone cannot distinguish rest from
-                # uniform motion. Require zero command dwell AND low estimated
-                # speed; even this is an assumption, not a measured stop.
-                quiet = (now-brake_started >= 1.0 and math.hypot(*source_velocity) <= 0.10
-                         and max(abs(v) for v in estimator.acceleration) <= 0.2
-                         and math.hypot(*estimator.gyro) <= 0.08)
-                if not quiet:
-                    quiet_since = None
-                elif quiet_since is None:
-                    quiet_since = now
-                elif now-quiet_since >= 0.8:
-                    result['pre_zero_velocity_mps'] = source_velocity
-                    estimator.velocity = (0.0, 0.0, 0.0)
-                    result['stationary_assumed'] = True
-                    band = endpoint_band
-                    result['endpoint_band_m'] = band
-                    if abs(remaining) > band:
-                        raise ValueError('stopped outside the estimated target band')
-                    result['state'] = 'done'
-                    break
-                if now-brake_started > 4:
-                    raise ValueError('IMU endpoint did not meet assumed-stationary conditions')
-            time.sleep(0.02)
-    except Exception as exc:
-        result['error'] = f'{type(exc).__name__}: {exc}'
-    finally:
-        publish(0)
-    result.update(estimated_distance_m=moved, estimated_error_m=distance_m-moved,
-                  estimated_position_m=source_position, estimated_velocity_mps=source_velocity,
-                  imu_position_m=estimator.position, imu_velocity_mps=estimator.velocity,
-                  distance_source='leg_odometry' if leg is not None else 'imu_integrated',
-                  dead_reckoned_m=dead_reckoned_m,
-                  leg_samples=(getattr(leg, 'samples', None) if leg is not None else None),
-                  leg_stance_samples=(getattr(leg, 'stance_samples', None) if leg is not None else None),
-                  leg_joint_updates=(joint_updates if leg is not None else None),
-                  leg_slip_scale=(getattr(leg, 'slip_scale', None) if leg is not None else None),
-                  finish_phase=finish_phase,
-                  finish_overshoot_m=finish_overshoot,
-                  final_foot_gap_m=(getattr(leg, 'foot_gap', None) if leg is not None else None),
-                  elapsed_s=time.monotonic()-started)
-    try:
-        _write_trace(samples, commands, result)
-    except OSError as exc:
-        result['imu_trace_error'] = str(exc)
-    return result
 
 def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     """Drive to a point (x forward, y left, metres) in the start body frame.
