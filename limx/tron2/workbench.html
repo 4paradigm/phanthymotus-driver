@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root {color-scheme:light;--bg:#F5F0E8;--card:#FDFAF5;--input:#EDE8DF;--hover:#E8E2D8;--ink:#1C1917;--muted:#78716C;--dim:#A8A29E;--line:rgba(0,0,0,.09);--accent:#C4673A;--green:#2D7A3A;--amber:#9A6A00}
+* {box-sizing:border-box} [hidden] {display:none!important}
+body {margin:0;background:var(--card);color:var(--ink);font:14px/1.55 'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;-webkit-font-smoothing:antialiased}
+button,input,textarea,select {font:inherit;color:inherit} button {cursor:pointer;border:1px solid var(--line);background:var(--input);border-radius:6px;padding:9px 16px;white-space:nowrap}
+button:hover {background:var(--hover)} button:disabled {opacity:.4;cursor:default} button.primary {background:var(--accent);border-color:var(--accent);color:white} button.primary:hover {filter:brightness(.96)} button.link {border:0;padding:4px 0;background:none;color:var(--accent)}
+button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible {outline:2px solid var(--accent);outline-offset:3px}
+h2,h3,p {margin:0} h2 {font-size:17px;font-weight:650} h3 {font-size:15px} small,.muted {color:var(--muted);font-size:12px}
+.shell {padding:22px 28px 92px;max-width:1100px;margin:auto} .row {display:flex;gap:12px;align-items:center} .between {justify-content:space-between}
+.steps {display:flex;list-style:none;padding:0;margin:0 0 24px;border-bottom:1px solid var(--line)} .steps li {position:relative;flex:1;padding:0 0 17px;color:var(--dim);font-size:13px;text-align:center} .steps li.current {color:var(--accent);font-weight:600} .steps li.current:after {content:'';position:absolute;height:2px;bottom:-1px;left:14%;right:14%;background:var(--accent)} .steps li.done {color:var(--muted)} .steps b {display:inline-grid;place-items:center;width:24px;height:24px;border:1px solid var(--line);border-radius:50%;margin-right:7px;font-size:11px;font-weight:500} .steps .current b,.steps .done b {background:var(--accent);color:white;border-color:var(--accent)}
+.layout {display:grid;grid-template-columns:minmax(0,1.6fr) minmax(260px,1fr);gap:22px;align-items:start} .panel {border:1px solid var(--line);border-radius:10px;padding:20px} .soft {background:var(--bg)} .section-title {margin-bottom:16px} .status {display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px} .dot {display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--dim)} .dot.online {background:var(--green)} .dot.live {background:var(--accent);box-shadow:0 0 0 5px #C4673A15}
+.check-row {display:grid;grid-template-columns:1fr minmax(100px,1fr);gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px} .check-row:last-child {border:0} .check-result {color:var(--muted)} .check-result.ok,.success {color:var(--green)} .check-result.fail,.warning {color:var(--amber)} .check-row small {display:block;margin-top:4px;line-height:1.6} .pill {display:inline-grid;place-items:center;width:19px;height:19px;border-radius:50%;margin-right:7px;background:var(--input);font-size:11px} .ok .pill {background:#DFF3E3;color:var(--green)} .fail .pill {background:#FEF3CD;color:var(--amber)}
+.note {color:var(--muted);font-size:12px;line-height:1.75;margin-top:12px;overflow-wrap:anywhere} .aside-block+.aside-block {border-top:1px solid var(--line);padding-top:20px;margin-top:22px} .aside-block h3 {margin-bottom:8px} .aside-block p {font-size:13px;color:var(--muted);line-height:1.8} .error {padding:10px 14px;background:#FDECEA;border:1px solid #eecac4;border-radius:6px;color:#a13d30;margin:0 0 16px;overflow-wrap:anywhere}
+details {font-size:12px;color:var(--muted)} summary {cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px} summary::-webkit-details-marker {display:none} summary:after {content:'›';font-size:20px;line-height:1} details[open]>summary:after {transform:rotate(90deg)} .details-card {border:1px solid var(--line);border-radius:8px;padding:13px 16px;margin-top:14px} .details-card>summary {color:var(--ink);font-size:13px}.technical {margin-top:12px;font:11px/1.8 'SF Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere} .load {display:flex;gap:8px;margin-top:12px} select {min-width:0;flex:1;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--input)}
+.recording {padding:26px 20px;text-align:center} .recording .status {justify-content:center;font-size:14px}.duration {font:500 42px/1.3 'JetBrains Mono','SF Mono',monospace;letter-spacing:-1px;margin:20px 0 12px;font-variant-numeric:tabular-nums}.recording p {font-size:13px;color:var(--muted);min-height:42px;max-width:350px;margin:auto}.recording .actions {display:flex;gap:10px;margin-top:22px}.recording .actions button {flex:1}.ready-strip {display:flex;gap:22px;flex-wrap:wrap;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:11px 14px;margin-bottom:16px}.record-summary {display:flex;align-items:center;gap:13px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:18px}.record-symbol {display:grid;place-items:center;width:36px;height:36px;border-radius:8px;background:var(--card);color:var(--accent);font-size:20px}.trial-actions {display:flex;gap:10px;margin-top:18px}.trial-actions button {flex:1}.effect {display:flex;align-items:start;gap:8px;font-size:13px;margin:17px 0 0} input[type=checkbox] {accent-color:var(--accent);margin-top:3px}.outcome {font-size:14px;font-weight:600}
+.chart {margin-top:18px;background:var(--bg);padding:12px;border-radius:6px}.chart svg {display:block;width:100%;height:160px}.legend {display:flex;gap:14px;color:var(--muted);font-size:11px}.legend i {display:inline-block;width:12px;height:2px;vertical-align:middle;margin-right:5px} input[type=range] {width:100%;accent-color:var(--accent);margin:12px 0 0}.table-wrap {overflow:auto;margin-top:12px;max-height:220px} table {width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap} th,td {text-align:left;padding:5px;border-bottom:1px solid var(--line)}
+.field {display:block;margin:0 0 19px}.field span {display:block;font-size:13px;font-weight:600;margin-bottom:8px}.field input,.field textarea {display:block;width:100%;border:1px solid var(--line);border-radius:6px;padding:11px 12px;background:var(--input)}.field textarea {resize:vertical;min-height:100px;line-height:1.8}.field input::placeholder,.field textarea::placeholder {color:var(--dim);font-size:12px}.phrase {display:block;font-size:16px;line-height:1.8;margin-top:12px;overflow-wrap:anywhere}.saved-mark {display:grid;place-items:center;width:42px;height:42px;border-radius:50%;background:#DFF3E3;color:var(--green);font-size:22px;margin-bottom:14px}.saved {padding:26px}.saved h2 {margin-bottom:8px}
+footer {position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 28px;border-top:1px solid var(--line);background:var(--card);z-index:2} footer .row {gap:10px} footer small {max-width:340px} .stop {background:transparent;color:#9b5143;border-color:#dfc4ba}.footer-buttons {display:flex;gap:10px}
+.confirm-overlay {position:fixed;inset:0;display:grid;place-items:center;padding:22px;background:#1c191755;z-index:3;backdrop-filter:blur(3px)}.confirm-box {width:440px;max-width:100%;background:var(--card);border-radius:10px;padding:25px;box-shadow:0 12px 40px #0002}.confirm-box h2 {margin-bottom:12px}.confirm-box p {font-size:13px;line-height:1.8}.confirm-box label {display:flex;align-items:start;gap:8px;margin:20px 0;font-size:13px}.confirm-box .row {justify-content:flex-end}
+@media(max-width:680px) {.shell {padding:18px 16px 125px}.layout {grid-template-columns:1fr;gap:16px}.steps li {font-size:11px}.steps b {display:grid;margin:0 auto 6px}.panel {padding:16px}.duration {font-size:36px} footer {padding:12px 16px;align-items:flex-end;gap:10px} footer>.row {display:block} footer small {display:block;font-size:11px;max-width:160px;margin-top:6px}.footer-buttons {flex-wrap:wrap;justify-content:flex-end}.check-row {grid-template-columns:1fr 1fr}}
+
+body[data-passive] .confirm-overlay {grid-template-columns:minmax(0,1fr);overflow:auto}
+body[data-passive] .confirm-box {min-width:0;max-height:calc(100vh - 44px);overflow:auto}
+body[data-passive] .confirm-box label.field {display:block;margin:0 0 14px}
+body[data-passive] .confirm-box .field input,body[data-passive] .confirm-box .field textarea {font-size:13px}
+body[data-passive] .confirm-box .field textarea {min-height:76px}
+body[data-passive] .confirm-box .error {margin:12px 0 0}
+#training .stack>*+* {margin-top:16px}
+.outcome.running::before {content:"";display:inline-block;width:13px;height:13px;margin-right:8px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:replay-spin .8s linear infinite}
+@keyframes replay-spin {to {transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce) {.outcome.running::before {animation:none}}
+.panel.row>div {min-width:0;overflow-wrap:anywhere}.load {flex-wrap:wrap}#record-search {min-width:0;flex:1;border:1px solid var(--line);border-radius:6px;background:var(--input);padding:8px}#segment-list .load button {white-space:normal}
+.flow-phase {display:grid;grid-template-columns:1fr;gap:6px;list-style:none;padding:0;margin:0 0 18px}.flow-phase li {border-left:3px solid var(--line);padding-left:8px;font-size:12px;color:var(--muted)}.flow-phase li.active {border-color:var(--accent);color:var(--accent)}.flow-phase li.done {border-color:var(--green);color:var(--green)}
+.ov-status {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:10px;background:var(--bg);margin-bottom:16px}
+.ov-status>div {padding:12px 16px;min-width:0} .ov-status>div+div {border-left:1px solid var(--line)}
+.ov-status b {display:block;font-size:13px;font-weight:600;margin-top:2px;overflow-wrap:anywhere}
+.chips {display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 4px} .chip {font-size:11px;border-radius:999px;padding:1px 8px;background:var(--input);color:var(--muted)} .chip.skill {background:#DFF3E3;color:var(--green)} .chip.pending {background:#FEF3CD;color:var(--amber)} .chip.diag {background:#FDECEA;color:#a13d30} .chip.ready {background:#FBF1EA;color:var(--accent)}
+.home-intro {padding:10px 0 26px}.home-intro h1 {font-size:26px;margin:0 0 8px}.home-intro p {max-width:680px;color:var(--muted)}
+.home-steps {display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:24px 0 30px}.home-steps div {border-top:2px solid var(--line);padding-top:12px}.home-steps b {display:block;margin-bottom:4px}.home-steps small {display:block}
+.home-actions {display:flex;gap:10px;margin-top:20px}
+.global-tools {margin-bottom:24px}.global-tools>summary {justify-content:flex-start;gap:10px}.global-tools .row {flex-wrap:wrap;margin-top:12px}
+.record-table {list-style:none;margin:0;padding:0}.record-row {display:grid;grid-template-columns:minmax(0,1fr) 120px 150px 85px;gap:16px;align-items:center;padding:16px 0;border-bottom:1px solid var(--line)}.record-row:last-child {border-bottom:0}.record-row button {text-align:left;white-space:normal;font-weight:600}.record-row small {display:block}.record-row .chip {justify-self:start}.record-meta {font-size:12px;color:var(--muted)}
+.library-tools {display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}.library-tools input {flex:1;min-width:150px;border:1px solid var(--line);background:var(--input);border-radius:6px;padding:10px 12px}
+@media(max-width:680px){.ov-status{grid-template-columns:1fr 1fr}.ov-status>div:nth-child(3){border-left:0}.home-steps{grid-template-columns:1fr 1fr}.record-row{grid-template-columns:minmax(0,1fr) auto;gap:8px 12px}.home-intro h1{font-size:23px}}
+</style></head><body>
+<main class="shell">
+  <nav class="row between" style="margin-bottom:20px" aria-label="工作台导航"><div class="row"><button id="home-nav" class="link">首页</button><button id="library-nav" class="link">录制记录</button></div><button id="exit-flow" class="link" hidden>退出流程 · 保留草稿</button></nav>
+  <div id="activity" class="ready-strip" role="status" hidden></div>
+  <div id="home-status" class="ov-status" role="group" aria-label="设备与占用状态"></div>
+  <details class="global-tools"><summary>控制操作与说明</summary><div class="row"><button id="reset-home">恢复原位</button></div><p class="note">恢复原位：双臂回保存姿态、头部回正、夹爪闭合。停止当前动作不是硬件急停。智能控制仍由画布管理。</p></details>
+  <section id="home" hidden aria-labelledby="home-title">
+    <div class="home-intro"><h1 id="home-title">录制示范，让动作成为技能</h1><p>使用原厂 VR 示范动作，在这里录制、验证效果，并保存为可调用技能。录制只采集数据，不接管原厂 VR。</p><div class="home-actions"><button id="create-record" class="primary">录制新动作</button><button id="browse-records">浏览录制记录</button></div></div>
+    <div class="home-steps" aria-label="四步任务介绍"><div><b>01 设备检查</b><small>确认采集与保存条件</small></div><div><b>02 录制</b><small>示范动作，保留录制内容</small></div><div><b>03 试运行</b><small>验证动作并确认效果</small></div><div><b>04 保存技能</b><small>命名并设置调用条件</small></div></div>
+    <section class="panel"><div class="row between section-title"><h2>最近录制</h2><button id="all-records" class="link">查看全部 →</button></div><p class="muted">按最近更新时间排序 · 最多 5 条</p><ul id="recent-list" class="record-table"></ul></section>
+  </section>
+  <section id="library" hidden><div class="row between section-title"><div><h2>录制记录</h2><p class="note">查看录制内容，继续草稿或处理已有动作。</p></div><button id="library-new" class="primary">录制新动作</button></div><div class="library-tools"><input id="record-search" type="search" aria-label="搜索录制名称或任务" placeholder="搜索名称或任务"><select id="record-filter" aria-label="筛选录制"><option value="all">全部</option><option value="draft">草稿</option><option value="pending">待验证</option><option value="ready">待保存</option><option value="skill">已保存技能</option><option value="training">训练数据</option><option value="diag">失败诊断</option></select></div><ul id="record-list" class="record-table"></ul></section>
+  <section id="record-detail" hidden><h2 id="record-title"></h2><p class="note">每个片段独立试运行和保存。继续录制会保留已有片段。</p><div id="segment-list"></div><button id="append-segment" class="primary" style="margin-top:16px">继续录制 · 新片段</button></section>
+  <ol class="steps" aria-label="进度"><li class="current"><b>1</b>设备检查</li><li><b>2</b>录制</li><li><b>3</b>试运行</li><li><b>4</b>保存</li></ol>
+  <div id="error" class="error" role="alert" hidden></div>
+  <div id="control-recovery" class="error" role="status" hidden></div>
+  <section id="prepare" class="layout">
+    <div class="panel"><div class="row between section-title"><h2>设备与前置条件</h2><span class="status"><i id="connection-dot" class="dot"></i><span id="connection">连接中</span></span></div><div id="checks"></div>
+      <div id="tracking-check" class="check-row"><span>实时跟踪与握键</span><span class="check-result"><i class="pill">·</i>进入遥操后确认</span></div>
+      <details style="margin-top:12px"><summary>检查详情</summary><div id="check-details" class="technical">尚未检查</div></details>
+    </div>
+    <aside class="panel soft"><div class="aside-block"><h3 id="check-summary">等待设备检查</h3><p id="check-hint">检查连接、标定、运动许可和遥操通道后继续。</p></div><div class="aside-block"><h3>接下来</h3><p id="next-hint"></p></div></aside>
+  </section>
+  <section id="record" class="layout" hidden>
+    <div><h2 class="section-title">动作录制</h2><div class="ready-strip"><span id="input-state" class="status">等待 VR 输入</span><span id="mapping-state" class="status">等待建立映射</span></div>
+      <div class="panel recording"><span class="status"><i id="record-dot" class="dot"></i><span id="motion-state">准备进入遥操</span></span><div id="live-duration" class="duration">00:00.0</div><p id="teleop-hint">先进入遥操，确认本次接管。</p><small id="frame-count" hidden>0</small><div class="actions"><button id="begin-btn" class="primary">进入遥操</button><button id="record-btn" class="primary" hidden>开始录制</button><button id="finish-btn" class="primary" hidden>结束录制</button></div></div>
+
+    </div><aside class="panel soft"><div class="aside-block"><h3>示范一次完整动作</h3><p id="record-instruction">开始录制后，按住双手握键操作。动作完成后结束录制。</p></div><div class="aside-block"><h3 id="after-record-title">下一步：试运行</h3><p id="trial-hint"></p></div></aside>
+  </section>
+  <section id="review" class="layout" hidden>
+    <div><div class="record-summary"><span class="record-symbol" aria-hidden="true">◉</span><div><h3>当前录制</h3><small id="duration"></small></div></div>
+      <div class="panel"><h2 id="review-title" class="section-title">试运行检查</h2><div class="check-row"><span>录制完整性</span><span id="clip-check" class="check-result">待检查</span></div><div class="check-row"><span>起点状态</span><span id="start-hint" class="check-result">待检查</span></div><div class="check-row"><span>物体布置与本次接管</span><span class="check-result">执行前确认</span></div><div class="trial-actions"><button id="inspect-btn">检查起点</button><button id="trial-btn" class="primary" disabled>开始试运行</button></div></div>
+      <details id="motion-details" class="details-card"><summary>动作详情</summary><div class="chart"><div class="row between"><small>关节变化 · 相对起点</small><small id="cursor-time">0.00 s</small></div><svg id="plot" viewBox="0 0 620 210" role="img" aria-label="双臂目标关节相对起点的变化曲线"></svg><div class="legend"><span><i style="background:#C4673A"></i>左臂</span><span><i style="background:#78716C"></i>右臂</span><span>单位 °</span></div><input id="scrub" type="range" min="0" max="100" value="0" aria-label="浏览录制时间"></div><div id="frame-values" class="table-wrap"></div><div id="start-values" class="table-wrap"></div></details>
+      <details id="training-entry" class="details-card" hidden><summary><span>训练数据 · <span id="training-entry-state"></span></span></summary><p id="training-entry-hint" class="note"></p><div class="load"><button id="open-training-btn">打开训练数据 →</button></div></details>
+      <button id="again-btn" class="link" style="font-size:12px;margin-top:12px">重新录制</button>
+    </div><aside class="panel soft"><ol id="trial-phases" class="flow-phase" aria-label="试运行阶段"></ol><h3 id="trial-status" class="outcome" role="status">等待试运行</h3><p id="trial-help" class="note">先检查起点，再按录制速度运行。</p><div id="import-summary" hidden><h3 id="import-name"></h3><label id="import-auto-row" class="effect" hidden><input id="import-auto-execute" type="checkbox"><span>启用后允许自动执行</span></label><p id="import-auto-hint" class="note" hidden></p><p id="import-conditions" class="note"></p><p id="import-confirmation-hint" class="note">点击“开始试运行”即确认本次路径与活动空间畅通、其他控制已停止，并允许接管双臂。</p><p class="note">可关闭页面稍后验证。回到本卡的“录制技能”，展开“待验证动作”继续验证。</p></div><label id="effect-label" class="effect"><input id="effect" type="checkbox" disabled><span>已观察真机，动作效果符合预期</span></label></aside>
+  </section>
+  <section id="save" hidden>
+    <div id="skill-form" class="layout"><div class="panel"><h2 class="section-title">保存为技能</h2><label class="field"><span>技能名称</span><input id="skill-name" maxlength="100" placeholder="例如：零件放入托盘"></label><label class="field" style="margin-bottom:0"><span>使用条件</span><textarea id="skill-conditions" maxlength="1000" placeholder="例如：零件和托盘位置固定，双臂已恢复录制起点。"></textarea></label></div><aside class="panel soft"><div class="aside-block"><h3 class="success">✓ 试运行与效果已确认</h3></div><div id="compatibility-panel" class="aside-block" hidden><h3>适用设备</h3><p id="compatibility-label"></p><p class="note">型号与完整动作会一起保存在动作包中。</p></div><div id="save-auto-row" class="aside-block" hidden><label class="effect"><input id="save-auto-execute" type="checkbox"><span>保存后允许自动执行</span></label><p id="save-auto-hint" class="note"></p></div><div class="aside-block"><h3>以后可以这样说</h3><span id="phrase-preview" class="phrase">填写技能名称</span><p class="note">保存后加入现有技能库。</p></div></aside></div>
+    <div id="confirmation-result" class="panel saved" role="status" hidden><div class="saved-mark">✓</div><h2>技能已保存</h2><p id="saved-hint" class="muted"></p><span id="saved-phrase" class="phrase"></span><p class="note">可在现有技能列表中查看和管理。</p></div>
+  </section>
+  <section id="training" hidden aria-labelledby="training-title">
+    <button id="training-back-top" class="link" style="font-size:13px;margin-bottom:12px">← 返回</button>
+    <div class="layout">
+      <div class="stack">
+        <div class="record-summary" style="margin-bottom:0"><span class="record-symbol" aria-hidden="true">◉</span><div><h3 id="training-title">训练数据</h3><small id="training-summary"></small></div></div>
+        <div class="panel"><h2 class="section-title">任务与结果</h2>
+          <label class="field"><span>任务描述</span><input id="dataset-task" maxlength="2000" placeholder="例如：把红色方块放入托盘"></label>
+          <label class="field"><span>结果标签</span><select id="dataset-outcome" style="display:block;width:100%;padding:11px 12px"><option value="unlabelled">未标注</option><option value="success">成功</option><option value="failure">失败</option></select></label>
+          <label class="field"><span>备注</span><textarea id="dataset-notes" maxlength="4000" style="min-height:60px" placeholder="例如：第二次抓取时方块滑落"></textarea></label>
+          <div class="row" style="flex-wrap:wrap"><button id="annotate-btn">保存标签</button><small id="annotate-state" role="status"></small></div>
+        </div>
+        <div class="panel"><h2 class="section-title">数据质量</h2><div id="quality-rows"></div>
+          <details class="details-card"><summary>时间与单位</summary><p class="note">关节为 rad；夹爪为厂家 0–100 无量纲开口，不换算毫米。图像时间是本机接收时间，不是曝光时间，不声称硬件同步。缺失或断流的数据保留为诊断，不自动删除。</p></details>
+        </div>
+      </div>
+      <aside class="panel soft">
+        <div class="aside-block"><h3>导出 LeRobot v3</h3><p>不要求先试运行，也不替代试运行。导出后用官方读取接口逐帧校验。</p></div>
+        <div class="aside-block"><h3 id="export-status" class="outcome" role="status">尚未导出</h3><p id="export-help" class="note"></p><div class="trial-actions"><button id="export-btn" class="primary">导出训练数据</button></div></div>
+        <details class="details-card"><summary>导出内容</summary><p class="note">状态与动作各 16 项：左臂 7、右臂 7、左夹爪、右夹爪。训练帧 10 Hz，动作取下一时刻实测状态。三路图像选最近过去帧，误差不超过 50 ms；关节缺口两侧拆成独立片段。已有导出目录不覆盖，失败目录保留。</p></details>
+      </aside>
+    </div>
+  </section>
+      <details id="existing" class="details-card"><summary>使用已有录制</summary><div class="load"><select id="recordings" aria-label="选择已有录制"><option value="">选择完整录制…</option></select><button id="load-btn">载入</button></div></details>
+      <details id="pending-drafts" class="details-card"><summary>待验证动作</summary><div class="load"><select id="drafts" aria-label="选择待验证动作"><option value="">暂无待验证动作</option></select><button id="open-draft-btn" disabled>继续验证</button></div></details>
+  <details id="episode-history" class="details-card" hidden><summary>全部录制与失败诊断</summary><div class="load"><select id="episodes" aria-label="选择诊断录制"></select><button id="episode-details-btn">查看数据质量</button></div></details>
+  <p id="chat-hint" class="note" hidden></p>
+</main>
+<footer><div class="row"><button id="stop-btn" class="stop" disabled>■ 停止动作</button><button id="unlock-btn" hidden>手动解锁</button><small id="unlock-status" role="status"></small><small id="footer-hint">检查不会启动机器人动作。</small></div><div class="footer-buttons"><button id="back-btn" hidden>上一步</button><button id="check-btn" class="primary">检查设备</button><button id="next-btn" disabled>进入录制 →</button><button id="to-save-btn" class="primary" hidden disabled>下一步：保存 →</button><button id="import-enable-btn" class="primary" hidden disabled>效果符合预期，启用技能</button><button id="save-btn" class="primary" hidden disabled>保存技能</button><button id="new-record-btn" class="primary" hidden>录制下一个动作</button></div></footer>
+<section id="confirm" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">确认本次接管</h2><p id="confirm-description"></p><details class="details-card"><summary>设备绑定</summary><p id="confirm-binding" class="note"></p></details><div id="gripper-replay-fields" hidden style="margin-top:16px"><label class="field"><span>夹爪速度档位（1–100）</span><input id="replay-gripper-speed" type="number" min="1" max="100" step="1" inputmode="numeric" placeholder="必填，例如 50"></label><label class="field"><span>夹爪力档位（0–100）</span><input id="replay-gripper-force" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="必填，例如 30"></label></div><label><input type="checkbox" id="confirm-control"><span id="confirm-control-label">已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。</span></label><div id="confirm-error" class="error" role="alert" hidden></div><div class="row"><button id="confirm-cancel">取消</button><button id="confirm-go" class="primary" disabled>确认并执行</button></div></div></section>
+<section id="unlock-confirm" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="unlock-title"><h2 id="unlock-title">手动解锁</h2><p>解锁只检查反馈并解除本卡占用，不发送停止或运动命令。上次失败结果会保留，解锁后需重新检查起点。</p><label><input id="unlock-confirmed" type="checkbox"><span>我已确认机器人停止，PICO 遥操和其他控制程序已退出。</span></label><div class="row"><button id="unlock-confirm-cancel">取消</button><button id="unlock-go" class="primary" disabled>确认并检查</button></div></div></section>
+<section id="settings-dialog" class="confirm-overlay" hidden><div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="settings-title"><h2 id="settings-title">技能设置</h2><label class="field"><span>夹爪速度（1–100）</span><input id="settings-speed" type="number" min="1" max="100" step="1"></label><label class="field"><span>夹爪力（0–100）</span><input id="settings-force" type="number" min="0" max="100" step="1"></label><label><input id="settings-auto" type="checkbox"><span>允许此技能自动执行</span></label><p id="settings-hint" class="note"></p><div class="row"><button id="settings-dialog-cancel">取消</button><button id="settings-save" class="primary">保存设置</button></div></div></section>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let port, serial=0, pending=new Map(), status={}, draft={}, stage=0, busy=false, online=false, initialized=false;
+  let preview, plotData, plottedId, inspection, checks, checkedAt=0, installed=false, approvedTrial, refreshVersion=0;
+  let inspectedImport, autoExecuteChoice=null;
+  let skillSettings=null;
+  let training=null, dialogFocus, page="home", records=[], selectedRecord=null, hostContext=null;
+
+  const phases=[['checking_start','检查状态'],['moving_to_start','SDK 移到起点'],['verifying_start','核验起点'],['replaying','回放动作'],['verifying_end','核验终点与静止']];
+  const phaseLabel=value=>phases.find(([id])=>id===value)?.[1] || '等待设备结果';
+  const errors={record_too_large_create_new_record:'当前记录较大，请新建录制；已有数据已保留。',export_interrupted:'服务重启中断了导出，请重新导出。',existing_export_without_receipt:'已有旧导出目录，但没有可核验的任务回执；可另存新导出。',start_feedback_not_verified:'未确认起点到位和静止，回放已中止。',terminal_feedback_not_verified:'目标已提交，但未确认终点到位和静止。',sdk_cleanup_not_verified:'尚未确认 SDK 已停止输出，保持占用。',replay_running_cannot_unlock:'动作或恢复检查正在执行，请先停止并等待结束。',unlock_operator_confirmation_required:'请确认机器人已停止，PICO 遥操和其他控制已退出。',movej_duration_not_elapsed:'厂家 MoveJ 规划时长尚未结束，请稍后再检查。',replay_start_arrival_not_verified:'未确认到达录制起点，后续回放已停止。',operator_exclusive_confirmation_required:'请确认原厂 VR 和其他控制程序已停止，并保持回放期间独占。',task_required_max_2000:'请填写任务描述，最多 2000 字。',trajectory_time_gap:'录制存在超过 100 ms 的关节缺口，禁止连续回放。训练导出会排除缺口。',exclusive_control_unverified:'尚未确认原厂 VR 已退出及控制独占，禁止回放。',complete_three_camera_gripper_episode_required:'三路图像或双夹爪数据不齐全，不能导出完整训练数据。',export_destination_exists:'此录制已有导出目录，已保留原结果。',replay_start_mismatch_no_automatic_return:'起点不匹配，请手动恢复双臂与夹爪后重试。',robot_busy_wait_for_completion:'请等待当前动作结束。',successful_trial_required:'请先完成试运行。',complete_recording_required:'尚无完整录制，请结束录制或重新录制。',paired_preview_required:'确认已失效，请重新预览。',teaching_draft_changed_reload:'草稿已在其他页面更改，请重新操作。',teaching_preview_expired:'预览已失效，请重新检查并确认。',live_mapped_teleop_required:'请确认 VR 输入有效，并松握、长按 X+A 建立基准。',live_mapped_teleop_input_required:'请等待有效 VR 输入，并松开双手握键完成映射。',input_timeout_restart_required:'未收到 VR 输入，请检查头显后重新进入遥操。',input_stale_restart_required:'VR 输入已中断，请检查头显后重新进入遥操。',tracking_lost_restart_required:'跟踪已丢失，请恢复跟踪后重新进入遥操。'};
+  const readable = value => errors[value] || value;
+  const presentation = () => status.presentation || {};
+  const groups = () => presentation().joint_groups || [];
+  const canTrial = () => inspection && (inspection.start.can_trial ?? inspection.start.ready);
+  function jointLabel(index) {for(const group of groups()){if(index<group.count)return `${group.label} J${index+1} / °`;index-=group.count;}return '关节';}
+  function fail(error) {
+    const id=presentation().passive_recording && !$('confirm').hidden?'confirm-error':'error';
+    if(!$('settings-dialog').hidden){$('settings-hint').textContent=readable(error.message);return;}
+    $(id).textContent=readable(error.message);$(id).hidden=false;
+  }
+  function request(method,args) {
+    if(!port) return Promise.reject(new Error('连接尚未建立'));
+    const id=String(++serial);
+    return new Promise((resolve,reject)=>{const timeout=setTimeout(()=>{pending.delete(id);reject(new Error('未收到结果，请检查状态后重试。'));},25000);pending.set(id,{resolve,reject,timeout});port.postMessage({id,method,args});});
+  }
+  const call=(action,args={})=>request('call',{action,...args});
+  async function act(fn) {
+    if(busy) return;
+    busy=true;$('error').hidden=true;render();
+    try {await fn();} catch(error) {fail(error);} finally {busy=false;await refresh();await loadLibrary();render();}
+  }
+  function setStage(next) {page="flow";stage=next;render();window.scrollTo(0,0);}
+  function timeLabel(seconds) {const n=Math.max(0,Number(seconds)||0);return String(Math.floor(n/60)).padStart(2,'0')+':'+(n%60).toFixed(1).padStart(4,'0');}
+  function showChecks() {
+    const list=checks?.checks || status.checks || [];
+    $('checks').replaceChildren();
+    for(const item of list) {
+      const row=document.createElement('div');row.className='check-row';row.dataset.check=item.id;
+      const label=document.createElement('span');label.textContent=item.label;
+      const result=document.createElement('span');result.className='check-result'+(item.ok===true?' ok':item.ok===false?' fail':'');
+      const icon=document.createElement('i');icon.className='pill';icon.textContent=item.ok===true?'✓':item.ok===false?'!':'·';
+      result.append(icon,document.createTextNode(item.ok===true?'已通过':item.ok===false?'未通过':'待检查'));
+      if(item.ok===false){const note=document.createElement('small');note.textContent=item.help || readable(item.reason);result.append(note);}
+      row.append(label,result);$('checks').append(row);
+    }
+    const failed=list.filter(c=>c.ok===false),fresh=checks && Date.now()-checkedAt<30000;
+    $('check-summary').textContent=!checks?'等待设备检查':failed.length?`还有 ${failed.length} 项待处理`:fresh?'设备检查通过':'请重新检查';
+    $('check-summary').className=failed.length?'warning':checks?.ready && fresh?'success':'';
+    $('check-hint').textContent=failed.length?failed.map(c=>c.label).join('、')+'未通过，请处理后重新检查。':checks?.ready && fresh?(presentation().passive_recording?'可以开始只读录制。':'可以进入录制。实时跟踪与握键会在遥操中确认。'):presentation().prepare_hint || '检查设备后继续。';
+    $('check-details').textContent=checks?list.map(c=>`${c.label}：${c.ok?'通过':c.reason || '待确认'}`).join('\n'):'尚未检查';
+  }
+  async function runChecks() {
+    checks=null;checkedAt=0;showChecks();
+    const result=await call('check');checks={...result,ready:result.training_ready ?? result.ready};checkedAt=Date.now();showChecks();return checks.ready;
+  }
+  function table(container,headers,rows) {const table=document.createElement('table');[headers,...rows].forEach((values,i)=>{const tr=document.createElement('tr');values.forEach(v=>{const el=document.createElement(i?'td':'th');el.textContent=v;tr.append(el);});table.append(tr);});container.replaceChildren(table);}
+  function plot(recording) {
+    plotData=recording.preview || [];plottedId=draft.id;
+    $('duration').textContent=`${recording.duration_seconds.toFixed(2)} 秒 · ${presentation().recording_label || '动作录制'}${presentation().passive_recording && recording.task?' · '+recording.task:''}`;
+    const svg=$('plot');svg.replaceChildren();
+    const add=(tag,attrs)=>{const el=document.createElementNS('http://www.w3.org/2000/svg',tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));svg.append(el);return el;};
+    [35,105,175].forEach(y=>add('line',{x1:35,y1:y,x2:607,y2:y,stroke:'#ded7ca','stroke-dasharray':'4 5'}));
+    if(!plotData.length)return;
+    const duration=Math.max(.001,plotData.at(-1).t),first=plotData[0].joints,scale=Math.max(.1,...plotData.flatMap(f=>f.joints.map((q,i)=>Math.abs(q-first[i]))));
+    add('text',{x:0,y:27,fill:'#78716C','font-size':11}).textContent=`+${scale.toFixed(1)}`;
+    add('text',{x:0,y:195,fill:'#78716C','font-size':11}).textContent=`−${scale.toFixed(1)}`;
+    const split=groups()[0]?.count || first.length;
+    for(let j=0;j<first.length;j++)add('polyline',{points:plotData.map(f=>`${35+f.t/duration*570},${105-(f.joints[j]-first[j])/scale*75}`).join(' '),fill:'none',stroke:j<split?'#C4673A':'#78716C','stroke-width':2,opacity:.35+(j%split)*.1});
+    add('line',{id:'cursor',x1:35,y1:20,x2:35,y2:195,stroke:'#1C1917','stroke-width':1});$('scrub').value=0;scrub();
+  }
+  function scrub() {
+    if(!plotData?.length)return;
+    const frame=plotData[Math.round(Number($('scrub').value)/100*(plotData.length-1))],x=35+frame.t/Math.max(.001,plotData.at(-1).t)*570;
+    $('cursor-time').textContent=frame.t.toFixed(2)+' s';$('cursor')?.setAttribute('x1',x);$('cursor')?.setAttribute('x2',x);
+    const rows=frame.joints.map((q,i)=>[jointLabel(i),q.toFixed(3)]);
+    if(presentation().grippers && frame.widths)rows.push(...frame.widths.map((v,i)=>[`${groups()[i]?.label || ''}夹爪 / mm`,v.toFixed(2)]));
+    table($('frame-values'),['目标','数值'],rows);
+  }
+  async function inspect() {
+    inspection=null;render();
+    const result=await call('inspect',{draft_id:draft.id});inspection=result;plot(result.recording);
+    const start=result.start;$('start-values').replaceChildren();
+    if(start.joint_delta_deg){
+      const rows=start.joint_delta_deg.map((v,i)=>[jointLabel(i),start.target_joints_deg[i].toFixed(3),v.toFixed(3)]);
+      if(presentation().grippers && start.width_delta_mm)rows.push(...start.width_delta_mm.map((v,i)=>[`${groups()[i]?.label || ''}夹爪 / mm`,start.target_width_mm[i].toFixed(2),v.toFixed(2)]));
+      if(start.tolerance_label)rows.push(['允许误差',start.tolerance_label,'']);
+      table($('start-values'),['部位','起点','当前 − 起点'],rows);
+    }
+  }
+  function render() {
+    const rec=status.recording || {},clip=!!draft.recording,trial=draft.trial,moving=!!status.busy,locked=busy || !online;
+    const recovery=status.control_recovery;
+    $('control-recovery').hidden=!recovery;
+    $('control-recovery').textContent=recovery ? `${recovery.hint}${recovery.sdk_code != null ? ' SDK '+recovery.sdk_code : ''}` : '';
+    const passive=!!presentation().passive_recording;
+    document.body.toggleAttribute('data-passive',passive);
+    const canPrepare=status.can_prepare ?? !moving,external=passive || presentation().session_start==='controller';
+    $('next-hint').textContent=presentation().next_hint || '';
+    $('trial-hint').textContent=presentation().trial_hint || '';
+    $('skill-conditions').placeholder=presentation().conditions_placeholder || '';
+    const execution=status.execution_policy || {};
+    for(const prefix of ['save','import']){
+      $(prefix+'-auto-row').hidden=!execution.supported;
+      $(prefix+'-auto-execute').checked=autoExecuteChoice ?? !!presentation().default_auto_execute;
+      $(prefix+'-auto-execute').disabled=locked || moving || installed;
+      $(prefix+'-auto-hint').hidden=!execution.supported;
+      $(prefix+'-auto-hint').textContent='仅对此技能生效，设置保存在本设备，重启后保留。';
+      const parameters=draft.trial?.result?.execution_parameters;
+      if(parameters)$(prefix+'-auto-hint').textContent+=` 动作预设：夹爪速度 ${parameters.gripper_speed}，力 ${parameters.gripper_force}；明确指定时仅覆盖本次。`;
+    }
+    const compatible=status.compatibility;
+    $('compatibility-panel').hidden=!compatible;
+    $('compatibility-label').textContent=compatible?[compatible.variant || compatible.model,presentation().recording_label,compatible.end_effectors==='fixed_hand'?'固定手':compatible.end_effectors].filter(Boolean).join(' · '):'';
+    ['prepare','record','review','save'].forEach((id,i)=>{$(id).hidden=i!==stage;});
+    document.querySelectorAll('.steps li').forEach((el,i)=>{el.classList.toggle('current',i===stage);el.classList.toggle('done',i<stage);el.querySelector('b').textContent=i<stage?'✓':String(i+1);if(i===stage)el.setAttribute('aria-current','step');else el.removeAttribute('aria-current');});
+    $('check-btn').hidden=stage!==0;$('next-btn').hidden=stage!==0;$('to-save-btn').hidden=stage!==2;$('save-btn').hidden=stage!==3 || installed;
+    $('new-record-btn').hidden=training || stage!==3 || !(installed || status.saved);
+    $('new-record-btn').disabled=locked || moving || !canPrepare;
+    const imported=!!draft.imported;
+    document.querySelector('.steps').hidden=imported;
+    $('import-summary').hidden=!imported;$('effect-label').hidden=imported;
+    $('again-btn').hidden=imported;
+    if(imported){$('to-save-btn').hidden=true;$('import-name').textContent=draft.imported.metadata.name;$('import-conditions').textContent=draft.imported.metadata.conditions;}
+    $('import-enable-btn').hidden=!imported || stage!==2 || installed;
+    $('import-enable-btn').disabled=locked || moving || trial?.status!=='completed';
+    $('check-btn').disabled=locked || !canPrepare;$('check-btn').textContent=busy && stage===0?'检查中…':checks?'重新检查':'检查设备';
+    $('next-btn').disabled=locked || !canPrepare || !checks?.ready || Date.now()-checkedAt>=30000;
+    $('next-btn').classList.toggle('primary',!!checks?.ready);$('check-btn').classList.toggle('primary',!checks?.ready);
+    $('back-btn').hidden=stage===0 || installed;$('back-btn').disabled=locked || moving;
+    $('stop-btn').disabled=online && !moving && !busy;
+    $('unlock-btn').hidden=!presentation().manual_unlock;
+    $('unlock-btn').disabled=locked || !!status.replay_running || !!status.recovering || !!rec.recording;
+    $('record-dot').classList.toggle('live',!!rec.recording);
+    $('motion-state').textContent=rec.recording?'正在录制':moving?'遥操中':'准备进入遥操';
+    $('live-duration').textContent=timeLabel(rec.elapsed_seconds);$('frame-count').textContent=String(rec.frames || 0);
+    $('input-state').textContent=status.input_fresh?'● VR 输入正常':status.state==='teleop'?'○ 等待有效 VR 输入':'○ 进入遥操后确认输入';
+    $('input-state').classList.toggle('success',!!status.input_fresh);$('mapping-state').textContent=status.mapped?'✓ 映射已建立':'○ 等待建立映射';
+    const hints={waiting_for_input:'等待 VR 实时输入，请打开头显遥操应用。',release_both_grips_to_map:'请松开双手握键，建立起始映射。',mapped_waiting_for_both_grips:'映射已建立。开始录制后按住双手握键操作。'};
+    $('teleop-hint').textContent=rec.error?readable(rec.error):rec.recording?'按住双手握键操作，完成后结束录制。':status.teleop_hint || hints[status.reason] || (status.state==='idle' && status.reason && !['operator_stop','card_stopped'].includes(status.reason)?readable(status.reason):'先进入遥操，确认本次接管。');
+    $('begin-btn').hidden=external || moving;$('begin-btn').disabled=locked;
+    $('record-btn').hidden=(!external && status.state!=='teleop') || !!rec.recording;$('record-btn').disabled=locked || !status.can_record;
+    $('finish-btn').hidden=(!passive && !draft.teleop_id) || (!rec.recording && !rec.complete && !rec.error);$('finish-btn').disabled=locked;
+    $('existing').hidden=moving || ![0,1].includes(stage);$('load-btn').disabled=locked || moving;
+    $('pending-drafts').hidden=!status.compatibility || moving || installed;
+    $('open-draft-btn').disabled=locked || moving || !$('drafts').value;
+    $('clip-check').textContent=inspection?'✓ 录制完整':'待检查';$('clip-check').classList.toggle('success',!!inspection);
+    $('start-hint').textContent=!inspection?'待检查':readable(inspection.start.message) || (inspection.start.ready?'✓ 起点匹配':readable(inspection.start.error) || '起点未匹配，请手动恢复。');
+    $('start-hint').classList.toggle('success',!!inspection?.start.ready && inspection.start.mode!=='move_to_start');
+    $('inspect-btn').disabled=locked || moving;$('trial-btn').disabled=locked || moving || !canTrial() || !!status.saved;
+    $('again-btn').disabled=locked || moving;
+    const replayPhases={checking_start:'正在检查起始状态…',moving_to_start:'正在移向起点…',adjusting_grippers:'正在调整夹爪起点…',verifying_start:'正在核验起点到位…',replaying:'正在回放录制动作…',verifying_end:'正在核验终点到位和静止…'};
+    $('trial-status').textContent=trial?.status==='completed'?'✓ 试运行已完成':trial?.status==='running'?(replayPhases[status.replay_phase] || '正在试运行'):trial?.status==='cancelled'?'试运行已取消':trial?.status==='error'?'试运行失败':draft.imported?'导入完成 · 等待本机试运行':'等待试运行';
+    $('trial-phases').replaceChildren(...phases.map(([id,label],i)=>{const li=document.createElement('li');li.textContent=label;const current=phases.findIndex(([key])=>key===(status.replay_phase || trial?.result?.phase));li.className=trial?.status==='completed' || i<current?'done':trial?.status==='running' && id===status.replay_phase?'active':'';return li;}));
+    $('trial-status').classList.toggle('success',trial?.status==='completed');
+    $('trial-status').classList.toggle('running',trial?.status==='running');
+    $('trial-help').textContent=trial?.status==='completed'?'请观察实际动作效果，确认后保存技能。':trial?.status==='error'?readable(trial.result?.reason) || '请检查设备后重试。':moving?'请观察真机，必要时停止动作。':presentation().trial_hint || '恢复物体布置，检查起点后试运行。';
+    if(trial?.result?.motion_may_continue && moving)$('trial-help').textContent+=' 厂家当前运动可能仍在继续，请现场检查。';
+    if(trial?.result?.release_method)$('trial-help').textContent+=' 已核验静止并解除占用；重新检查起点后可再次试运行。';
+    if(trial?.status==='completed' && draft.effect_confirmed){approvedTrial=trial.action_id;$('effect').checked=true;}
+    if(trial?.status!=='completed' || approvedTrial!==trial.action_id){approvedTrial=null;$('effect').checked=false;}
+    $('effect').disabled=locked || moving || trial?.status!=='completed';
+    $('to-save-btn').disabled=locked || moving || !$('effect').checked;
+    $('save-btn').textContent=status.saved?'同步到技能库':'保存技能';
+    $('save-btn').disabled=locked || moving || !$('effect').checked || installed;
+    $('skill-form').hidden=installed;$('confirmation-result').hidden=!installed;
+    for(const key of ['name','conditions'])$('skill-'+key).readOnly=!!status.saved;
+    $('footer-hint').textContent=installed?'已加入本机技能库':moving?'请留意机器人，必要时停止动作。':['检查不会启动机器人动作。','结束录制后进入试运行。','按录制速度执行。','保存后沿用现有技能调用流程。'][stage];
+    $('training-entry').hidden=!passive || imported || !clip;
+    $('training-entry-state').textContent=draft.recording?.training_complete?'三路图像与双夹爪齐全':'数据不齐全';
+    $('training-entry-hint').textContent='查看任务、结果与数据质量；训练导出不要求先试运行。';
+    $('open-training-btn').disabled=locked || moving;
+    $('episode-history').hidden=!passive || moving;
+    $('episode-details-btn').disabled=locked || moving || !$('episodes').value;
+    $('tracking-check').hidden=passive;
+    if(passive){
+      $('import-confirmation-hint').textContent='点击“开始试运行”后，填写夹爪参数，并在弹窗确认原厂 VR 已退出及本次控制独占。';
+      $('record-instruction').textContent='使用原厂 VR 示范。录制只读取数据，不接管控制。';
+      $('motion-state').textContent=rec.error?'录制失败，数据已保留':rec.recording?'正在只读录制':'准备只读录制';
+      $('finish-btn').textContent=rec.error?'结束并保留诊断':'结束录制';
+      $('input-state').textContent='原厂 VR 控制';$('mapping-state').textContent='录制器无控制权';
+      $('teleop-hint').textContent=readable(rec.error) || '停止录制只停止写文件，不停止原厂 VR 或机器人。';
+      $('stop-btn').textContent=rec.recording?'■ 停止录制':'■ 停止回放发送';
+      $('stop-btn').disabled=online && !rec.recording && !moving && !busy;
+      $('footer-hint').textContent='停止录制不停止机器人；停止发送不等于物理停止。';
+    }
+    $('training').hidden=!training;
+    $('back-btn').textContent='上一步';
+    if(training){
+      for(const id of ['prepare','record','review','save','existing','pending-drafts','episode-history','chat-hint'])$(id).hidden=true;
+      for(const id of ['check-btn','next-btn','to-save-btn','save-btn','import-enable-btn'])$(id).hidden=true;
+      document.querySelector('.steps').hidden=true;
+      $('back-btn').hidden=false;$('back-btn').textContent=page==='detail'?'← 返回录制详情':stage===2?'← 返回试运行':stage===1?'← 返回录制':'← 返回设备检查';
+      $('training-back-top').textContent=$('back-btn').textContent;
+      $('training-back-top').disabled=busy;
+      const episode=training.episode,job=status.training_export?.episode_id===training.id?status.training_export:training.export;
+      const exporting=status.training_export?.state==='running';
+      $('annotate-btn').disabled=locked || moving || exporting || !episode.complete;
+      for(const key of ['task','outcome','notes'])$('dataset-'+key).disabled=locked || moving || exporting || !episode.complete;
+      $('export-btn').disabled=locked || moving || exporting || !episode.training_complete || !episode.task?.trim() || (job?.state==='completed' && !job.stale);
+      $('export-status').textContent=job?.stale?'标签已修改，请重新导出':!job?'尚未导出':job.state==='running'?'正在导出…':job.state==='completed'?'✓ 已导出':'导出失败';
+      $('export-status').classList.toggle('success',job?.state==='completed' && !job.stale);
+      $('export-btn').textContent=job?.state==='error' || job?.stale?'重新导出':'导出训练数据';
+      $('export-help').textContent=job?.stale?'已有导出保留。重新导出会使用新目录，不覆盖旧数据。':!job?(episode.training_complete?(episode.task?.trim()?'可直接导出，无需先试运行。':'请先填写并保存任务描述。'):'数据不齐全，保留诊断，禁止导出完整训练数据。'):job.state==='running'?'正在导出并用官方读取接口验证…':job.state==='error'?`导出失败：${readable(job.error)}。已有目录保留，不覆盖。`:`已导出 ${job.frames} 帧、${job.episodes} 个片段，排除 ${job.excluded} 个采样点。设备内目录：${job.path}。${job.official_reader_verified?'已通过官方读取；尚未训练策略。':''}`;
+    }
+    renderNavigation();
+  }
+  function reset(next) {training=null;draft=next;autoExecuteChoice=next.allow_auto_execute ?? null;installed=false;preview=null;plottedId=null;plotData=null;inspection=null;inspectedImport=null;checks=null;checkedAt=0;approvedTrial=null;$('effect').checked=false;$('confirm').hidden=true;$('motion-details').open=false;$('start-values').replaceChildren();}
+  async function refresh() {
+    const version=++refreshVersion;
+    try {
+      const value=await call('info');if(version!==refreshVersion)return;
+      status=value;online=true;
+      const changed=draft.id && status.draft?.id!==draft.id;
+      if(changed)reset(status.draft || {});
+      draft=status.draft || {};
+      if(!initialized || changed){
+        stage=draft.recording?2:draft.teleop_id || (presentation().passive_recording && (status.recording?.recording || status.recording?.error))?1:0;initialized=true;
+        if(draft.imported){for(const key of ['name','conditions'])$('skill-'+key).value=draft.imported.metadata[key] || '';updatePhrase();}
+      }
+      if(draft.recording && stage===1)stage=2;
+      if(draft.recording && plottedId!==draft.id)plot(draft.recording);
+      if(draft.imported && inspectedImport!==draft.id && !status.busy && !status.saved){
+        inspectedImport=draft.id;
+        try {await inspect();} catch(error){fail(error);}
+      }
+      $('connection').textContent='驱动已连接';$('connection-dot').classList.add('online');
+      if(stage===0)showChecks();
+      const complete=(status.recordings || []).filter(r=>r.complete),old=$('recordings').value;
+      $('recordings').replaceChildren(new Option('选择完整录制…',''),...complete.map(r=>new Option(r.filename,r.filename)));$('recordings').value=old;
+      if(presentation().passive_recording){
+        const chosen=$('episodes').value;
+        $('episodes').replaceChildren(new Option('选择录制…',''),...(status.recordings || []).map(r=>new Option((r.complete?'完整':'未完成')+' · '+(r.task || r.filename),r.filename)));
+        $('episodes').value=chosen;
+      }
+      if(status.saved){for(const key of ['name','conditions'])$('skill-'+key).value=status.saved[key];approvedTrial=draft.trial?.action_id;$('effect').checked=true;stage=3;updatePhrase();}
+      render();
+    } catch(error) {if(version!==refreshVersion)return;online=false;checks=null;checkedAt=0;$('connection').textContent='连接中断';$('connection-dot').classList.remove('online');fail(error);render();}
+  }
+  async function preflight(action) {
+    approvedTrial=null;$('effect').checked=false;
+    preview=await call(action,{draft_id:draft.id,...(action==='run'?{asset_id:draft.id}:{}),execute:false});
+    if(action==='run' && preview.confirmation_required===false){await call('run',preview.execution_arguments);preview=null;return;}
+    if(action!=='reset' && !preview.preview_id)throw new Error('未获得本次动作预览');
+    preview.action=action;preview.created=Date.now();if(action==='run')preview.asset_id=draft.id;
+    $('confirm-description').textContent=preview.description || (action==='reset'?'双臂回保存原位、头部回正、双夹爪闭合。SDK 初始化可能经过中间姿态并张开夹爪。':action==='begin'?'准备进入双臂 VR 遥操。':`按录制速度试运行 ${preview.duration_seconds?.toFixed(2) || ''} 秒，请先恢复物体布置。`);
+    $('confirm-binding').textContent=preview.binding_label || `左臂 ${preview.binding?.arms?.left || ''} · 右臂 ${preview.binding?.arms?.right || ''} · 标定 ${preview.binding?.calibration_id || ''}`;
+    $('gripper-replay-fields').hidden=!presentation().passive_recording || action==='reset';
+    if(presentation().passive_recording){const params=preview.execution_parameters || draft.trial?.result?.execution_parameters || {}; $('replay-gripper-speed').value=params.gripper_speed ?? 50;$('replay-gripper-force').value=params.gripper_force ?? 30;$('confirm-error').hidden=true;dialogFocus=document.activeElement;}
+    $('confirm-control-label').textContent=presentation().passive_recording?'已核对移向起点的路径、夹爪动作、物体和回放活动空间；原厂 VR 与其他控制程序已停止，我确认并保持本次执行期间控制独占。':'已核对起点、物体和活动空间，其他控制程序已停止，确认接管双臂。';
+    if(presentation().passive_recording)$('confirm-binding').textContent=`设备 ${preview.binding?.serial || ''} · 型号 ${preview.binding?.model || ''}`;
+    $('confirm-control').checked=false;$('confirm-go').disabled=true;$('confirm').hidden=false;$('confirm-control').focus();
+  }
+  const automaticArgs=()=>status.execution_policy?.supported && (autoExecuteChoice!==null || presentation().default_auto_execute)?{auto_execute:autoExecuteChoice ?? true}:{};
+  async function refreshDrafts() {
+    const result=await call('draft_list'), old=$('drafts').value;
+    $('drafts').replaceChildren(new Option(result.drafts.length?'选择待验证动作…':'暂无待验证动作',''),
+      ...result.drafts.map(d=>new Option(d.name,d.id)));
+    $('drafts').value=old;render();
+  }
+  async function openTraining(id) {
+    if(!id)throw new Error('请选择录制');
+    const result=await call('episode_details',{episode_id:id});
+    training={id,episode:result.episode,export:result.export};
+    const episode=result.episode,quality=episode.quality || {},counts=quality.counts || {};
+    for(const key of ['task','outcome','notes'])$('dataset-'+key).value=episode[key] || (key==='outcome'?'unlabelled':'');
+    $('annotate-state').textContent='';
+    $('training-summary').textContent=`${id} · ${episode.complete?'录制完整':'录制未完成，已保留'}`;
+    const rows=[['关节采样',counts.state>=2,`${counts.state || 0} 帧`],
+      ...[['head','头部 RGB'],['left_wrist','左腕 RGB'],['right_wrist','右腕 RGB']].map(([key,label])=>[label,counts[key]>=2,`${counts[key] || 0} 帧`]),
+      ['双夹爪',counts.state>=2 && quality.gripper_samples===counts.state,`${quality.gripper_samples || 0} / ${counts.state || 0} 帧`],
+      ['关节缺口',quality.state_gaps_over_100ms===0,`${quality.state_gaps_over_100ms ?? '未知'} 处超过 100 ms；导出时分段`]];
+    if(episode.error)rows.push(['录制结果',false,readable(episode.error)]);
+    $('quality-rows').replaceChildren();
+    for(const [label,ok,note] of rows){
+      const row=document.createElement('div');row.className='check-row';
+      const name=document.createElement('span');name.textContent=label;
+      const value=document.createElement('span');value.className='check-result '+(ok?'ok':'fail');value.textContent=(ok?'✓ ':'! ')+note;
+      row.append(name,value);$('quality-rows').append(row);
+    }
+    render();window.scrollTo(0,0);
+  }
+  function closeTraining(){training=null;$('error').hidden=true;render();window.scrollTo(0,0);}
+  $('training-back-top').onclick=closeTraining;
+  $('open-training-btn').onclick=()=>act(()=>openTraining(draft.recording?.filename));
+  $('episode-details-btn').onclick=()=>act(()=>openTraining($('episodes').value));
+  $('episodes').onchange=render;
+  $('annotate-btn').onclick=()=>act(async()=>{
+    const task=$('dataset-task').value.trim();if(!task)throw new Error('task_required_max_2000');
+    const result=await call('annotate',{episode_id:training.id,task,outcome:$('dataset-outcome').value,notes:$('dataset-notes').value});
+    training.episode=result.episode;training.export=result.export;$('annotate-state').textContent='标签已保存';
+  });
+  $('export-btn').onclick=()=>act(async()=>{const result=await call('training_export',{episode_id:training.id});status.training_export=result.export;});
+  $('pending-drafts').ontoggle=()=>{if($('pending-drafts').open)refreshDrafts().catch(fail);};
+  $('drafts').onchange=render;
+  $('open-draft-btn').onclick=()=>act(async()=>{
+    const result=await call('draft_open',{draft_id:$('drafts').value});
+    reset(result.draft);setStage(2);await inspect();
+  });
+  for(const prefix of ['save','import'])$(prefix+'-auto-execute').onchange=e=>{const value=e.target.checked;autoExecuteChoice=value;act(()=>call('draft_preferences',{draft_id:draft.id,allow_auto_execute:value}));};
+  $('check-btn').onclick=()=>act(runChecks);
+  $('next-btn').onclick=()=>act(async()=>{if(!await runChecks())return;if(!draft.id)reset(await call('new'));setStage(1);});
+  $('begin-btn').onclick=()=>act(async()=>{if(!await runChecks()){setStage(0);return;}if(!draft.id)reset(await call('new'));await preflight('begin');});
+  $('record-btn').onclick=()=>act(()=>call('record',{draft_id:draft.id}));
+  $('finish-btn').onclick=()=>act(async()=>{const result=await call('finish',{draft_id:draft.id});if(!result.complete){if(presentation().passive_recording && result.filename){await openTraining(result.filename);return;}throw new Error(result.error || '录制尚未完整落盘，请重试结束。');}await refresh();setStage(2);await inspect();});
+  $('load-btn').onclick=()=>act(async()=>{if(!$('recordings').value)throw new Error('请选择完整录制');reset(await call('new',{filename:$('recordings').value}));setStage(2);await inspect();});
+  $('inspect-btn').onclick=()=>act(inspect);
+  $('trial-btn').onclick=()=>act(async()=>{
+    await inspect();
+    if(!draft.imported || presentation().passive_recording){await preflight('trial');return;}
+    // The labelled button confirms this trial. File/model/state and a fresh
+    // one-use preview are still checked by Driver before any motion.
+    const p=await call('trial',{draft_id:draft.id,execute:false});
+    await call('trial',{draft_id:draft.id,...(p.asset_id?{asset_id:p.asset_id}:{}),execute:true,preview_id:p.preview_id,workspace_clear:true,take_control:true});
+    inspection=null;
+  });
+  $('import-enable-btn').onclick=()=>act(async()=>{
+    const result=await request('save',{draft_id:draft.id,effect_confirmed:true,...draft.imported.metadata,...automaticArgs()});
+    installed=true;stage=3;showContext(result.context);
+    $('saved-hint').textContent=result.context?.conversation_ready?'现在可以在对话里说：':'连接执行卡后，即可对话调用：';
+    $('saved-phrase').textContent=`“${draft.imported.metadata.name}”`;
+  });
+  $('again-btn').onclick=()=>act(async()=>{
+    reset(await call('new'));
+    for(const id of ['skill-name','skill-conditions'])$(id).value='';
+    updatePhrase();setStage(0);showChecks();
+  });
+  $('new-record-btn').onclick=()=>startSegment(status.record_id);
+  $('back-btn').onclick=()=>{if(training){closeTraining();return;}setStage(Math.max(0,stage-1));if(stage===0)showChecks();};
+  $('effect').onchange=()=>{const value=$('effect').checked;draft.effect_confirmed=value;approvedTrial=value?draft.trial?.action_id:null;act(()=>call('draft_preferences',{draft_id:draft.id,effect_confirmed:value}));};
+  $('to-save-btn').onclick=()=>setStage(3);$('scrub').oninput=scrub;
+  $('confirm-control').onchange=()=>{$('confirm-go').disabled=!$('confirm-control').checked;};
+  $('confirm-cancel').onclick=()=>{preview=null;$('confirm').hidden=true;if(presentation().passive_recording)dialogFocus?.focus();};
+  $('confirm-go').onclick=()=>act(async()=>{if(!$('confirm-control').checked)throw new Error('请确认本次接管');if(!preview || Date.now()-preview.created>60000)throw new Error('预览已过期，请取消后重试。');if(presentation().passive_recording && preview.action!=='reset' && ['replay-gripper-speed','replay-gripper-force'].some(id=>$(id).value==='' || !$(id).checkValidity()))throw new Error('请填写有效的夹爪速度和力档位。');const p=preview;preview=null;$('confirm').hidden=true;await call(p.action,{draft_id:draft.id,...(p.asset_id?{asset_id:p.asset_id}:{}),execute:true,preview_id:p.preview_id,workspace_clear:true,take_control:true,...(presentation().passive_recording && p.action!=='reset'?{exclusive_control_confirmed:true,gripper_speed:Number($('replay-gripper-speed').value),gripper_force:Number($('replay-gripper-force').value)}:{})});if(p.action==='trial' && inspection)inspection.start={ready:false,can_trial:false,error:'再次试运行前需复查'};});
+  $('unlock-btn').onclick=()=>{dialogFocus=document.activeElement;$('unlock-confirmed').checked=false;$('unlock-go').disabled=true;$('unlock-confirm').hidden=false;$('unlock-confirmed').focus();};
+  $('unlock-confirmed').onchange=()=>{$('unlock-go').disabled=!$('unlock-confirmed').checked;};
+  $('unlock-confirm-cancel').onclick=()=>{$('unlock-confirm').hidden=true;dialogFocus?.focus();};
+  $('unlock-go').onclick=()=>act(async()=>{
+    if(!$('unlock-confirmed').checked)throw new Error('请先确认现场已停止');
+    $('unlock-confirm').hidden=true;dialogFocus?.focus();$('unlock-status').textContent='正在检查静止状态…';
+    try{await call('unlock',{physical_stop_confirmed:true,exclusive_control_confirmed:true});inspection=null;preview=null;$('confirm').hidden=true;$('unlock-status').textContent='已解锁，请重新检查起点';}
+    catch(error){$('unlock-status').textContent='检查未通过，保持占用';throw error;}
+  });
+  $('stop-btn').onclick=async()=>{preview=null;$('confirm').hidden=true;try{await call(status.recording?.recording?'finish':'cancel',{...(status.recording?.recording?{draft_id:draft.id}:{})});await refresh();await loadLibrary();render();}catch(error){fail(error);}};
+  document.addEventListener('keydown',event=>{
+    if(!presentation().passive_recording)return;
+    const dialog=['confirm','unlock-confirm','settings-dialog'].map($).find(el=>!el.hidden);
+    if(!dialog)return;
+    if(event.key==='Escape' && !busy){event.preventDefault();$(dialog.id+'-cancel').click();}
+    if(event.key==='Tab'){
+      const items=[...dialog.querySelectorAll('button,input,textarea,summary')].filter(el=>!el.disabled && el.getClientRects().length);
+      const first=items[0],last=items.at(-1);
+      if(event.shiftKey && document.activeElement===first){event.preventDefault();last.focus();}
+      else if(!event.shiftKey && document.activeElement===last){event.preventDefault();first.focus();}
+    }
+  });
+
+  async function loadLibrary(){try{records=(await call('library')).records;}catch(error){fail(error);}}
+  const recordTitle=r=>r.name || r.task || '录制 · '+new Date(r.created_at*1000).toLocaleString();
+  function button(label,callback,disabled=false){const b=document.createElement('button');b.textContent=label;b.onclick=callback;b.disabled=disabled;return b;}
+  const segmentEpisode=s=>(status.recordings || []).find(e=>e.filename===(s.episode_id || s.recording?.filename));
+  const segmentState=s=>s.saved?'skill':s.trial?.status==='completed'?'ready':s.recording || segmentEpisode(s)?.complete?'pending':s.episode_id && segmentEpisode(s)?.error?'diag':'draft';
+  const stateNames={draft:'录制草稿',pending:'待验证',ready:'待保存',skill:'已保存技能',diag:'失败诊断'};
+  function recordCards(container,items){
+    container.replaceChildren();
+    if(!items.length){const p=document.createElement('li');p.className='note';p.textContent='暂无录制';container.append(p);}
+    for(const r of items){const row=document.createElement('li');row.className='record-row';
+      const title=button(recordTitle(r),()=>{selectedRecord=r.id;page='detail';training=null;render();});title.className='link';
+      const state=segmentState(r.segments.at(-1) || {}),chip=document.createElement('span');chip.className='chip '+state;chip.textContent=stateNames[state];
+      const date=document.createElement('span');date.className='record-meta';date.textContent=new Date(r.updated_at*1000).toLocaleString();
+      const count=document.createElement('small');count.textContent=r.segments.length+' 个片段';row.append(title,chip,date,count);container.append(row);}
+  }
+  function renderNavigation(){
+    const navigation=page!=='flow' && !training,blocked=busy || !online || status.busy;
+    $('home').hidden=!!training || page!=='home';$('library').hidden=!!training || page!=='library';$('record-detail').hidden=!!training || page!=='detail';
+    for(const [id,active] of [['home-nav',page==='home'],['library-nav',['library','detail'].includes(page)]]){if(active)$(id).setAttribute('aria-current','page');else $(id).removeAttribute('aria-current');}
+    $('exit-flow').hidden=page!=='flow' || !!training;
+    if(navigation){
+      for(const id of ['prepare','record','review','save','pending-drafts','episode-history','chat-hint','existing'])$(id).hidden=true;
+      document.querySelector('.steps').hidden=true;
+      for(const id of ['back-btn','check-btn','next-btn','to-save-btn','save-btn','import-enable-btn','new-record-btn'])$(id).hidden=true;
+    }
+    $('settings-save').disabled=blocked;$('settings-dialog-cancel').disabled=busy;
+    $('reset-home').disabled=blocked;
+    $('library-new').disabled=blocked;
+    $('create-record').disabled=blocked;$('append-segment').disabled=blocked;
+    const outcome=status.last_action,unknown=outcome?.result?.motion_may_continue;
+    $('activity').hidden=!status.busy && !unknown;
+    $('activity').textContent=status.recording?.recording?'正在只读录制。切换页面后仍会录制；使用底部按钮停止。':unknown && !status.replay_running?'结果未确认，设备保持占用。现场确认停止后可检查并解锁。':phaseLabel(status.replay_phase)+'。停止只取消后续步骤，不等于硬件急停。';
+    $('home-status').replaceChildren(...[
+      ['设备',online?(status.feedback_available?'驱动已连接 · 反馈正常':'反馈不可用'):'连接中断'],
+      ['原厂 VR','状态未知 · 未检测'],
+      ['本卡占用',status.busy?(status.recording?.recording?'正在录制':unknown?'结果未知 · 已锁定':phaseLabel(status.replay_phase)):'空闲'],
+      ['智能控制',hostContext?.conversation_ready?'已连决策核心 · 运行状态未知':'连接状态未确认']
+    ].map(([label,text])=>{const item=document.createElement('div'),small=document.createElement('small'),value=document.createElement('b');small.textContent=label;value.textContent=text;item.append(small,value);return item;}));
+    if(page==='home')recordCards($('recent-list'),records.slice(0,5));
+    if(page==='library'){
+      const query=$('record-search').value.trim().toLowerCase(),filter=$('record-filter').value;
+      recordCards($('record-list'),records.filter(r=>[recordTitle(r),r.task,...r.segments.map(s=>segmentEpisode(s)?.task)].filter(Boolean).join(' ').toLowerCase().includes(query) && (filter==='all' || r.segments.some(s=>filter==='training'?!!segmentEpisode(s)?.training_complete:segmentState(s)===filter))));
+    }
+    if(page==='detail'){
+      const r=records.find(r=>r.id===selectedRecord);$('segment-list').replaceChildren();$('record-title').textContent=r?recordTitle(r):'录制不存在';
+      for(const [i,segment] of (r?.segments || []).entries()){
+        const panel=document.createElement('div');panel.className='panel';panel.style.marginTop='14px';const heading=document.createElement('h3');heading.textContent=segment.saved?.metadata.name || `片段 ${i+1}`;
+        const hint=document.createElement('p');hint.className='note';hint.textContent=segment.saved?'设备已保存技能；可查看或同步到技能库':segment.trial?.status==='completed'?'试运行已完成，待确认效果':segment.recording?'待试运行':segment.episode_id?'录制尚未完成或已保留诊断':'待录制';
+        const actions=document.createElement('div');actions.className='load';actions.append(button(segment.saved?'查看技能':'继续编辑',()=>act(async()=>{const result=await call('record_open',{record_id:r.id,draft_id:segment.id});reset(result.draft);if(result.draft.saved)autoExecuteChoice=(await call('skill_policy',{asset_id:result.draft.id})).enabled;setStage(result.draft.recording?2:0);if(result.draft.recording)await inspect();}),!!blocked));
+        const episode=segment.recording?.filename || segment.episode_id;
+        if(segment.saved)actions.append(button('运行技能',()=>act(async()=>{const opened=await call('record_open',{record_id:r.id,draft_id:segment.id});reset(opened.draft);await preflight('run');}),!!blocked));
+        if(segment.saved)actions.append(button('预设与自动执行',()=>act(()=>openSettings(r.id,segment)),!!blocked));
+        if(episode)actions.append(button('训练数据',()=>act(()=>openTraining(episode)),!!blocked));
+        panel.append(heading,hint,actions);$('segment-list').append(panel);
+      }
+    }
+  }
+  async function openSettings(recordId,segment){
+    const opened=await call('record_open',{record_id:recordId,draft_id:segment.id});reset(opened.draft);
+    const parameters=await call('parameters',{asset_id:segment.id});
+    let policy;try{policy=await call('skill_policy',{asset_id:segment.id});}catch(error){throw new Error('无法读取自动执行设置：'+error.message);}
+    skillSettings={segment,parameters:parameters.execution_parameters};dialogFocus=document.activeElement;
+    $('settings-title').textContent=segment.saved.metadata.name;
+    $('settings-speed').value=parameters.execution_parameters.gripper_speed ?? 50;
+    $('settings-force').value=parameters.execution_parameters.gripper_force ?? 30;
+    $('settings-auto').checked=policy.enabled;
+    $('settings-hint').textContent='参数变更后会按本次选择重新保存自动执行设置。';
+    $('settings-dialog').hidden=false;$('settings-speed').focus();
+  }
+  $('settings-dialog-cancel').onclick=()=>{$('settings-dialog').hidden=true;skillSettings=null;dialogFocus?.focus();};
+  $('settings-save').onclick=()=>act(async()=>{
+    if(!skillSettings || ['settings-speed','settings-force'].some(id=>!$(id).value || !$(id).checkValidity()))throw new Error('请填写有效的夹爪参数');
+    const segment=skillSettings.segment;
+    await call('parameters',{asset_id:segment.id,gripper_speed:Number($('settings-speed').value),gripper_force:Number($('settings-force').value)});
+    await request('save',{draft_id:segment.id,effect_confirmed:true,...segment.saved.metadata,auto_execute:$('settings-auto').checked});
+    $('settings-dialog').hidden=true;skillSettings=null;dialogFocus?.focus();
+  });
+  function navigate(next){training=null;page=next;render();loadLibrary().then(render);window.scrollTo(0,0);}
+  function startSegment(recordId){return act(async()=>{reset(await call('new',recordId?{record_id:recordId}:{}));for(const key of ['skill-name','skill-conditions'])$(key).value='';setStage(0);showChecks();});}
+  $('reset-home').onclick=()=>act(()=>preflight('reset'));
+  $('home-nav').onclick=()=>navigate('home');$('library-nav').onclick=()=>navigate('library');
+  $('exit-flow').onclick=()=>navigate('home');$('create-record').onclick=()=>startSegment();
+  $('library-new').onclick=()=>startSegment();
+  $('browse-records').onclick=$('all-records').onclick=()=>navigate('library');
+  $('append-segment').onclick=()=>startSegment(selectedRecord);
+  $('record-search').oninput=render;$('record-filter').onchange=render;
+  window.addEventListener('beforeunload',event=>{if(status.busy || busy){event.preventDefault();event.returnValue='';}});
+
+  function updatePhrase() {$('phrase-preview').textContent=$('skill-name').value.trim()?`“${$('skill-name').value.trim()}”`:'填写技能名称';}
+  $('skill-name').oninput=updatePhrase;
+  $('save-btn').onclick=()=>act(async()=>{const args={draft_id:draft.id,effect_confirmed:$('effect').checked,...automaticArgs()};for(const key of ['name','conditions']){args[key]=$('skill-'+key).value.trim();if(!args[key])throw new Error('请填写技能名称和使用条件。');}const result=await request('save',args);installed=true;showContext(result.context);$('saved-hint').textContent=result.context?.conversation_ready?'现在可以在对话里说：':'连接执行卡后，即可在对话里说：';$('saved-phrase').textContent=`“${args.name}”`;});
+  function showContext(context) {$('chat-hint').hidden=!!context?.conversation_ready;$('chat-hint').textContent=`对话调用待连接：将 ${context?.tool || '此执行卡'} 连接到决策核心，仅需配置一次。`;}
+  window.addEventListener('message',async event=>{
+    if(port || event.source!==parent || event.data?.protocol!=='motus.workbench/1' || !event.ports[0])return;
+    port=event.ports[0];port.onmessage=event=>{const item=pending.get(event.data?.id);if(!item)return;clearTimeout(item.timeout);pending.delete(event.data.id);event.data.error?item.reject(new Error(event.data.error)):item.resolve(event.data.result);};
+    await refresh();try {hostContext=await request('context',{});showContext(hostContext);}catch(error){showContext(null);}
+    await loadLibrary();render();
+    const poll=async()=>{if(!busy || presentation().passive_recording)await refresh();setTimeout(poll,1000);};setTimeout(poll,1000);
+  });
+})();
+</script></body></html>

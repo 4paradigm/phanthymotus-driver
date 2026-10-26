@@ -88,6 +88,8 @@ def export_dataset(root, ident, destination):
     from PIL import Image
 
     path, manifest, states = load_episode(root, ident)
+    if not isinstance(manifest.get('task'), str) or not manifest['task'].strip():
+        raise ValueError('task_required_max_2000')
     if manifest.get('training_complete') is not True:
         raise ValueError('complete_three_camera_gripper_episode_required')
     segments, excluded = matched_rows(path, manifest, states)

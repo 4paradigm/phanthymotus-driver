@@ -1,5 +1,6 @@
 """TRON2 adapter for the G1 teaching workbench and asset lifecycle."""
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -7,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import threading
+import time
 from uuid import uuid4
 
 from common.teaching import TeachingPlugin
@@ -60,20 +62,22 @@ class TronTeachingAdapter:
 
     def recordings(self):
         result=[]
-        for path in sorted((self.root/'episodes').glob('*/manifest.json'),reverse=True)[:200]:
+        for path in (self.root/'episodes').glob('*/manifest.json'):
             try:
                 if path.is_symlink() or path.stat().st_size>65536:continue
                 m=json.loads(path.read_bytes())
                 result.append(dict(filename=path.parent.name, complete=m.get('complete') is True and (path.parent/'complete.json').is_file(),
+                    created_at=m.get('started_unix_ns',0)/1e9,updated_at=path.stat().st_mtime,
                     training_complete=m.get('training_complete',False),task=m.get('task'),error=m.get('error')))
             except (OSError,ValueError):continue
-        return result
+        return sorted(result,key=lambda r:r['updated_at'],reverse=True)
 
     def info(self):
         rec=self.capture.info()
         busy=rec['recording'] or bool(self.replay.active)
+        feedback=self.owner.reader.sample('joint_state')['available']
         return dict(state='recording' if rec['recording'] else 'idle',busy=busy,can_prepare=not busy,
-            can_record=not busy and self.owner.reader.sample('joint_state')['available'],recording=rec,
+            feedback_available=feedback,can_record=not busy and feedback,recording=rec,
             recordings=self.recordings(),teleop_hint='录制器不发送运动命令。停止录制不停止原厂 VR。',
             replay_available=True,control_confirmation='operator_per_execution',last_action=self.replay.outcome,
             replay_phase=self.replay.phase,replay_running=self.replay.busy,recovering=self.replay.recovering)
@@ -205,15 +209,103 @@ class TronTeachingPlugin(TeachingPlugin):
         self.lifecycle_started=False
         self.lifecycle_lock=threading.Lock()
         self.teardown_future=None
+        self.record_id=None
+
+    def _record_path(self, ident):
+        return episode_path(self.directory/'records',ident).with_suffix('.json')
+
+    def _read_record(self, ident):
+        path=self._record_path(ident)
+        if not path.exists():
+            record=next((r for r in self._legacy_records() if r['id']==ident),None)
+            if record is not None:return record
+        if path.is_symlink() or path.stat().st_size>1024*1024:
+            raise ValueError('invalid_record')
+        record=json.loads(path.read_bytes())
+        if record.get('id')!=ident or not isinstance(record.get('segments'),list):
+            raise ValueError('invalid_record')
+        return record
+
+    def _persist_draft(self):
+        super()._persist_draft()
+        if not self.record_id or not self.draft or self.draft.get('imported'):
+            return
+        record=self._read_record(self.record_id)
+        draft=copy.deepcopy(self.draft)
+        if draft.get('recording'):
+            draft['recording']={k:draft['recording'][k] for k in ('filename','sha256','binding')}
+        draft['boot_id']=self.boot_id
+        segments=record['segments']
+        index=next((i for i,s in enumerate(segments) if s['id']==draft['id']),len(segments))
+        if index<len(segments):
+            previous={k:v for k,v in segments[index].items() if k!='boot_id'}
+            current={k:v for k,v in draft.items() if k!='boot_id'}
+            if previous==current:return
+        if index==len(segments):segments.append(draft)
+        else:segments[index]=draft
+        if draft.get('saved'):record['name']=draft['saved']['metadata']['name']
+        record['updated_at']=time.time()
+        if len(encode(record))>1024*1024:raise ValueError('record_too_large_create_new_record')
+        atomic_json(self._record_path(self.record_id),record)
+
+    def _legacy_records(self):
+        assets={}
+        for path in self.directory.glob('*.json'):
+            if path.is_symlink() or path.stat().st_size>32768:continue
+            asset=json.loads(path.read_bytes())
+            if asset.get('adapter')==self.name and asset.get('recording'):
+                assets.setdefault(asset['recording']['filename'],[]).append(asset)
+        records=[]
+        for episode in self.adapter.recordings():
+            ident=episode['filename'];segments=[]
+            for asset in assets.get(ident,[]):
+                segments.append(dict(id=asset['id'],recording=asset['recording'],saved=asset,trial=asset['trial'],episode_id=ident))
+            if not segments:segments=[dict(id=ident,episode_id=ident,recording=None,trial=None)]
+            records.append(dict(id=ident,name=segments[-1].get('saved',{}).get('metadata',{}).get('name',''),
+                task=episode['task'],created_at=episode['created_at'],updated_at=episode['updated_at'],segments=segments,legacy=True))
+        return records
+
+    def _library(self):
+        records=[]
+        for path in (self.directory/'records').glob('*.json'):
+            record=self._read_record(path.stem)
+            for segment in record['segments']:
+                if not segment.get('saved') and segment.get('boot_id')!=self.boot_id:
+                    segment['trial']=None
+            records.append(record)
+        known={s.get('episode_id') or (s.get('recording') or {}).get('filename') for r in records for s in r['segments']}
+        records.extend(r for r in self._legacy_records() if r['id'] not in known)
+        return sorted(records,key=lambda r:r['updated_at'],reverse=True)
+
+    def _export_state(self, ident):
+        if self.export_job and self.export_job['episode_id']==ident:
+            job=dict(self.export_job)
+        else:
+            path=episode_path(self.adapter.root/'datasets'/'jobs',ident).with_suffix('.json')
+            if not path.exists():
+                previous=self.adapter.root/'datasets'/ident
+                return dict(state='error',episode_id=ident,path=str(previous),error='existing_export_without_receipt',stale=False) if previous.exists() else None
+            if path.is_symlink() or path.stat().st_size>65536:raise ValueError('invalid_export_receipt')
+            job=json.loads(path.read_bytes())
+            if job['state']=='running':job.update(state='error',error='export_interrupted')
+        manifest=episode_path(self.adapter.root/'episodes',ident)/'manifest.json'
+        job['stale']=job.get('manifest_sha256')!=digest(manifest)
+        return job
 
     def get_tools(self):
         tools=super().get_tools();schema=tools[0]['inputSchema']
-        schema['properties'].update({k:{'type':'string'} for k in ('task','outcome','notes','episode_id')})
+        schema['properties'].update({k:{'type':'string'} for k in ('task','outcome','notes','episode_id','record_id')})
         schema['properties'].update({k:{'type':'number','minimum':0,'maximum':100,
             'description':'省略时使用当前动作预设；用户明确指定时仅覆盖本次，不必重复询问'} for k in ('gripper_speed','gripper_force')})
         schema['properties']['exclusive_control_confirmed']={'type':'boolean','description':'自动执行时使用preview返回值；未启用自动执行时，须操作者确认原厂VR及其他控制已停止并保持本次独占，不得自行填写true'}
         schema['properties']['physical_stop_confirmed']={'type':'boolean','description':'操作者现场确认机器人已停止；不得自行填写 true'}
-        extra={'reset':(['execute'],
+        schema['properties']['allow_auto_execute']={'type':'boolean','description':'草稿的保存选项；不授予自动执行权限'}
+        extra={'library':([], '查看持久化录制及各片段'),
+            'draft_preferences':(['draft_id','effect_confirmed','allow_auto_execute'], '保存当前片段的效果确认和选项，不执行动作或授予权限'),
+            'cancel':([], '停止录制或取消回放；不执行收尾复位'),
+            'skill_policy':(['asset_id'], '读取本技能的自动执行设置'),
+            'record_open':(['record_id','draft_id'], '继续已有录制片段，不执行动作'),
+            'reset':(['execute'],
                         '恢复原位：双臂回保存姿态、头部回正、双夹爪闭合；用户要求恢复原位时直接execute=true，无需再次确认；execute=false只读预览，等待ACP终态'),
             'parameters':(['asset_id','gripper_speed','gripper_force'],
                           '读取动作预设；仅在用户明确要求保存新预设时填写夹爪参数。不执行动作，修改后需重新启用该技能自动执行'),
@@ -237,6 +329,83 @@ class TronTeachingPlugin(TeachingPlugin):
 
     def dispatch(self,action,args):
         self._validate(action,args)
+        if (self.teardown_future and not self.teardown_future.done()
+                and action not in ('info','stop','ui','library','episode_details','training_info')):
+            raise ValueError('reset_in_progress')
+        if action=='ui':
+            return {'protocol':'motus.workbench/1','html':Path(__file__).with_name('workbench.html').read_text(encoding='utf-8')}
+        if action=='library':
+            with self.lock:return {'records':self._library()}
+        if action=='skill_policy':
+            return self._execution_policy(args)
+        if action=='draft_preferences':
+            with self.lock:
+                self._idle()
+                draft=self._current(args)
+                if args.get('effect_confirmed') is True:
+                    self._recording(draft)
+                    if (draft.get('trial') or {}).get('status')!='completed':raise ValueError('successful_trial_required')
+                draft.update({k:args[k] for k in ('effect_confirmed','allow_auto_execute') if k in args})
+                self._persist_draft()
+                return {'draft':copy.deepcopy(draft)}
+        if action=='cancel':
+            result=self.adapter.stop()
+            with self.lock:
+                recording=result.get('recording',{})
+                if self.draft and recording.get('complete') and self.draft.get('episode_id')==recording.get('filename'):
+                    self.draft['recording']=self.adapter.inspect(recording['filename'])
+                    self._persist_draft()
+            return result
+        if action=='record_open':
+            with self.lock:
+                self._idle()
+                record=self._read_record(args.get('record_id'))
+                draft=next((s for s in record['segments'] if s['id']==args.get('draft_id')),None)
+                if draft is None:raise ValueError('record_segment_not_found')
+                if draft.get('recording'):draft['recording']=self._recording(draft)
+                elif draft.get('episode_id'):
+                    path=episode_path(self.adapter.root/'episodes',draft['episode_id'])
+                    if (path/'complete.json').exists():draft['recording']=self.adapter.inspect(draft['episode_id'])
+                if draft.get('saved'):
+                    draft['saved'],_=self._read_asset(draft['id'])
+                elif draft.get('boot_id')!=self.boot_id or (draft.get('trial') or {}).get('status')=='running':
+                    draft['trial']=None
+                    draft['effect_confirmed']=False
+                self._persist_draft()
+                if record.get('legacy'):
+                    (self.directory/'records').mkdir(parents=True,exist_ok=True,mode=0o700)
+                    record.pop('legacy');atomic_json(self._record_path(record['id']),record)
+                self.record_id=record['id'];self.draft=draft
+                return {'draft':copy.deepcopy(draft)}
+        if action=='new':
+            with self.lock:
+                self._idle()
+                ident=args.get('record_id')
+                if ident:
+                    record=self._read_record(ident)
+                    if record.get('legacy'):
+                        (self.directory/'records').mkdir(parents=True,exist_ok=True,mode=0o700)
+                        record.pop('legacy');atomic_json(self._record_path(ident),record)
+                result=super().dispatch(action,{k:v for k,v in args.items() if k!='record_id'})
+                if not ident:
+                    ident=uuid4().hex
+                    (self.directory/'records').mkdir(parents=True,exist_ok=True,mode=0o700)
+                    atomic_json(self._record_path(ident),dict(id=ident,name='',created_at=time.time(),updated_at=time.time(),segments=[]))
+                self.record_id=ident
+                self._persist_draft()
+                return result
+        if action in ('record','finish','save','trial'):
+            with self.lock:
+                if action=='record' and self._current(args).get('recording'):
+                    raise ValueError('create_new_draft_to_record_again')
+                if action=='record' and self.record_id and 'task' not in args:
+                    args={**args,'task':self._read_record(self.record_id).get('task','')}
+                result=super().dispatch(action,args)
+                if action=='record':self.draft['episode_id']=result.get('filename') or result.get('episode_id')
+                if action in ('record','finish') or (action=='trial' and args.get('execute') is True):
+                    self.draft['effect_confirmed']=False
+                self._persist_draft()
+                return result
         if action=='stop':
             with self.lifecycle_lock:
                 if self.teardown_future and not self.teardown_future.done():
@@ -253,7 +422,9 @@ class TronTeachingPlugin(TeachingPlugin):
                 self._idle()
                 self.lifecycle_started=True
         if action=='info':
-            result={**super().dispatch(action,args),'training_export':self.export_job}
+            result={**super().dispatch(action,args),
+                'training_export':self._export_state(self.export_job['episode_id']) if self.export_job else None,
+                'record_id':self.record_id}
             if self.teardown_future and not self.teardown_future.done():
                 result['busy']=True
             return result
@@ -298,8 +469,9 @@ class TronTeachingPlugin(TeachingPlugin):
             if action=='episode_details':
                 manifest=path/'manifest.json'
                 if manifest.is_symlink() or manifest.stat().st_size>65536:raise ValueError('invalid_manifest')
-                return {'episode':json.loads(manifest.read_bytes()),'integrity_verified':False}
+                return {'episode':json.loads(manifest.read_bytes()),'integrity_verified':False,'export':self._export_state(ident)}
             with self.lock:
+                if self.export_job and self.export_job['state']=='running':raise ValueError('export_busy')
                 _,manifest,_=load_episode(self.adapter.root/'episodes',ident)
                 if action=='annotate':
                     task,outcome,notes=args.get('task',''),args.get('outcome','unlabelled'),args.get('notes','')
@@ -308,12 +480,22 @@ class TronTeachingPlugin(TeachingPlugin):
                     manifest.update(task=task,outcome=outcome,notes=notes)
                     atomic_json(path/'manifest.json',manifest)
                     atomic_json(path/'complete.json',{'schema':SCHEMA,'manifest_sha256':digest(path/'manifest.json')})
-                    return {'episode':manifest,'motion_sent':False}
-                if self.export_job and self.export_job['state']=='running':raise ValueError('export_busy')
+                    for record in self._library():
+                        if record.get('legacy'):continue
+                        if any(s.get('episode_id')==ident or (s.get('recording') or {}).get('filename')==ident for s in record['segments']):
+                            record.update(task=task,updated_at=time.time())
+                            atomic_json(self._record_path(record['id']),record)
+                    return {'episode':manifest,'motion_sent':False,'export':self._export_state(ident)}
+                if not manifest.get('task','').strip():raise ValueError('task_required_max_2000')
                 if manifest.get('training_complete') is not True:raise ValueError('complete_three_camera_gripper_episode_required')
                 destination=self.adapter.root/'datasets'/ident
-                self.export_job={'state':'running','episode_id':ident,'path':str(destination)}
-                threading.Thread(target=self._export,args=(ident,destination),name='tron2-vla-export',daemon=True).start()
+                if destination.exists():destination=destination.with_name(ident+'-'+uuid4().hex[:8])
+                receipt=episode_path(self.adapter.root/'datasets'/'jobs',ident).with_suffix('.json')
+                receipt.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+                job={'state':'running','episode_id':ident,'path':str(destination),'manifest_sha256':digest(path/'manifest.json')}
+                atomic_json(receipt,job)
+                self.export_job=job
+                threading.Thread(target=self._export,args=(ident,destination,receipt),name='tron2-vla-export',daemon=True).start()
                 return {'export':self.export_job}
         return super().dispatch(action,args)
 
@@ -352,12 +534,18 @@ class TronTeachingPlugin(TeachingPlugin):
             logging.getLogger('tron2').error('SDK shutdown reset failed: %s',exc)
             return dict(status='error',reason=str(exc))
 
-    def _export(self,ident,destination):
+    def _export(self,ident,destination,receipt):
+        job=dict(self.export_job)
         try:
             from vla_export import export_dataset
             report=export_dataset(self.adapter.root/'episodes',ident,destination)
-            self.export_job={'state':'completed','episode_id':ident,'path':str(destination),
+            job.update({'state':'completed',
                 'frames':report['official_reader_frames'],'episodes':report['episodes'],'excluded':len(report['excluded']),
-                'action_source':report['action_source'],'official_reader_verified':True}
+                'action_source':report['action_source'],'official_reader_verified':True})
         except Exception as exc:
-            self.export_job={'state':'error','episode_id':ident,'path':str(destination),'error':str(exc)[:240]}
+            job.update(state='error',error=str(exc)[:240])
+        try:
+            atomic_json(receipt,job)
+        except OSError as exc:
+            job.update(state='error',error='export_receipt_failed: '+str(exc)[:180])
+        self.export_job=job

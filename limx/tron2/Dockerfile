@@ -20,7 +20,7 @@ RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/requirements
 RUN python3 -m pip check
 COPY common/ /work/common/
 COPY main.py device.py vendor.py state.py reset.py skeleton.py completion.py trajectory.py pose.py head.py gripper.py camera.py ros2.py check.py config.yaml driver.yaml /work/
-COPY episode.py teaching.py teaching_capture.py teaching_replay.py teaching_sdk.py vla_export.py /work/
+COPY episode.py teaching.py teaching_capture.py teaching_replay.py teaching_sdk.py vla_export.py workbench.html /work/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/
 ENV PYTHONUNBUFFERED=1

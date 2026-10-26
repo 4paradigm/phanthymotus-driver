@@ -36,10 +36,13 @@ def digest(path):
 
 
 def atomic_json(path, value):
-    temp = path.with_suffix('.pending')
-    with temp.open('xb') as stream:
-        stream.write(encode(value)); stream.flush(); os.fsync(stream.fileno())
-    os.replace(temp, path)
+    temp = path.with_name('.'+path.name+'.'+uuid4().hex+'.pending')
+    try:
+        with temp.open('xb') as stream:
+            stream.write(encode(value)); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
     fd = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -80,7 +83,7 @@ def validate_state(frame):
 
 class EpisodeWriter:
     def __init__(self, root, binding, task, outcome='unlabelled', notes='', capacity=256, reserve_bytes=256*1024*1024):
-        if not isinstance(task, str) or not task.strip() or len(task) > 2000:
+        if not isinstance(task, str) or len(task) > 2000:
             raise ValueError('task_required_max_2000')
         if outcome not in ('success', 'failure', 'unlabelled') or not isinstance(notes, str) or len(notes) > 4000:
             raise ValueError('invalid_episode_annotation')

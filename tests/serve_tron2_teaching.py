@@ -15,14 +15,17 @@ from test_teaching_runtime import Reader
 from test_teaching_episode import jpeg
 from test_sensors import settings
 from skeleton import JOINT_NAMES
+import common.teaching.service as teaching_service
 
 HOST='''<!doctype html><html><head><title>TRON2 teaching local fixture</title></head><body style="margin:0"><p style="margin:0;padding:8px;background:#fff3ce">本机假厂家验收；不连接机器人。</p><iframe title="TRON2 示教" src="/workbench" style="width:100%;height:calc(100vh - 40px);border:0"></iframe><script>
 const frame=document.querySelector('iframe');
 frame.onload=()=>{const channel=new MessageChannel();channel.port1.onmessage=async e=>{
 const {id,method,args}=e.data;
 try{let result;if(method==='context')result={conversation_ready:false,tool:'tron2_teaching'};
-else{const r=await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'tron2_teaching',arguments:method==='save'?{action:'save',...args}:args}})});
-const b=await r.json();if(b.error)throw Error(b.error.message);result=JSON.parse(b.result.content[0].text);if(b.result.isError)throw Error(result.error);}
+else{const driverArgs={...args};delete driverArgs.auto_execute;
+const r=await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'tron2_teaching',arguments:method==='save'?{action:'save',...driverArgs}:driverArgs}})});
+const b=await r.json();if(b.error)throw Error(b.error.message);result=JSON.parse(b.result.content[0].text);if(b.result.isError)throw Error(result.error);
+if(method==='save' && typeof args.auto_execute==='boolean')await fetch('/fixture/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset_id:result.asset_id,enabled:args.auto_execute})});}
 channel.port1.postMessage({id,result});}catch(err){channel.port1.postMessage({id,error:err.message});}};
 frame.contentWindow.postMessage({protocol:'motus.workbench/1'},location.origin,[channel.port2]);};
 </script></body></html>'''
@@ -30,6 +33,11 @@ frame.contentWindow.postMessage({protocol:'motus.workbench/1'},location.origin,[
 
 async def run(port,root):
     reader=Reader();raw=jpeg();fail_camera=False
+    grants={}
+    def policy(tool,instance_id,device_binding,asset_id,asset_binding):
+        enabled=grants.get(asset_id)==(device_binding,asset_binding)
+        return dict(enabled=enabled,source='skill' if enabled else 'manual',binding_changed=False)
+    teaching_service.read_execution_policy=policy
     async def camera(request):
         if fail_camera:return web.Response(status=503)
         response=web.StreamResponse(headers={'Content-Type':'multipart/x-mixed-replace; boundary=frame'})
@@ -69,11 +77,22 @@ async def run(port,root):
                 await ws.send_json(dict(title=title.replace('request_','response_'),accid=reader.serial,
                     guid=packet.get('guid'),timestamp=time.monotonic(),data=reply))
             return ws
-        async def workbench(request):return web.FileResponse(ROOT/'common/teaching/workbench.html')
+        async def workbench(request):return web.FileResponse(ROOT/'limx/tron2/workbench.html')
+        async def wait(request):
+            # Server clock keeps background-browser checks independent of timer throttling.
+            await asyncio.sleep(min(5000,max(0,int(request.query.get('ms','100'))))/1000)
+            return web.Response(text='ready')
+        async def grant(request):
+            data=await request.json()
+            binding=await asyncio.to_thread(adapter.teaching._execution_binding,data['asset_id'])
+            grants[data['asset_id']]=(binding['device_binding'],binding['asset_binding']) if data['enabled'] else None
+            return web.json_response({'fixture_only':True})
         app=web.Application(client_max_size=17*1024*1024)
         app.router.add_get('/',home);app.router.add_get('/workbench',workbench);app.router.add_get('/camera',camera)
         app.router.add_post('/mcp',adapter.rpc);app.router.add_post('/file/upload',adapter.teaching_upload)
         app.router.add_post('/fixture/camera-failure',failure)
+        app.router.add_get('/fixture/wait',wait)
+        app.router.add_post('/fixture/grant',grant)
         runner=web.AppRunner(app);await runner.setup();await web.TCPSite(runner,'127.0.0.1',port).start()
         print(f'http://127.0.0.1:{port} fixture_root={root}',flush=True)
         try:
