@@ -553,3 +553,15 @@ def test_outbox_backpressure_keeps_latest_motion_and_priority_zero(process_setup
                for packet in channel.packets)
     assert outbox.info()["pending"] == 0
 
+
+
+def test_follow_shaping_settings_reach_the_control_process(process_setup):
+    card = process_setup.create()
+    send(card, command())
+    wait_info(card, lambda item: item["counts"]["accepted"] == 1)
+    result = card.dispatch("config", {"wz_limit": 0.6, "yaw_latency_gain": 1.0})
+    assert result.get("ok"), result
+    info = card.dispatch("info", {})
+    assert info["wz_limit"] == 0.6 and info["yaw_latency_gain"] == 1.0
+    assert card.dispatch("config", {"yaw_latency_gain": 9})["state"] == "error"
+    assert card.dispatch("info", {})["yaw_latency_gain"] == 1.0

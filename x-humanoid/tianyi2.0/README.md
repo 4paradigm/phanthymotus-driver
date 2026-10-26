@@ -206,6 +206,22 @@ acknowledged idle), not network RPCs or measured physical motion.
 The backend state/action ID describe the last acknowledgement, not a substitute
 for odometry feedback; verify physical motion with `loco_state`.
 
+Follow shaping (`wz_limit`, `yaw_latency_gain`) is applied to admitted
+non-zero commands before the shared step clamp; explicit all-zero commands are
+never shaped. `wz_limit` (rad/s, default = `max_wz`) clamps the turn instead of
+rejecting it; the descriptor navi reads is unchanged. `yaw_latency_gain`
+(1/s, default 0 = off) compensates detection latency: navi turns from a
+bearing measured at `obs_stamp_ms`, but the base kept turning while that frame
+was processed, so the closed loop overshoots and `wz` oscillates. The card
+integrates its own executed `wz` from `obs_stamp_ms` to now and executes
+`wz - gain * rotation`. A gain near navi's proportional yaw gain removes the
+overshoot; larger gains only slow the turn, smaller ones leave some overshoot.
+In a simulated loop (navi gain 1.5, 300–500ms latency) gain 1.0 settled fastest
+without reversing `wz`. Both are runtime `config` settings and take effect
+without stopping. `last_command_timing.turn` shows `requested_wz`,
+`rotated_since_observation_rad` and `shaped_wz`. If compensation cancels a
+turn exactly, velocity is zeroed but the action is kept (not a stop).
+
 Input TTL and observation age (500ms) are admission checks: an already-stale
 command is dropped and cannot resume motion or renew the watchdog. Once
 admitted, a command no longer stops motion at its producer's per-frame TTL

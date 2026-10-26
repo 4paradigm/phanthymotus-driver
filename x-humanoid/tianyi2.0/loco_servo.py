@@ -6,6 +6,7 @@ MoveByAction conversion: it cannot represent a simultaneous vx/wz command.
 
 from __future__ import annotations
 
+import collections
 import copy
 import json
 import math
@@ -19,6 +20,9 @@ INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 300
 MAX_OBS_AGE_MS = 500
 CANCEL_AFTER_MS = 1000
+YAW_HISTORY_MS = 1500  # Executed-turn history kept for latency compensation.
+MAX_YAW_LATENCY_GAIN = 5.0
+FOLLOW_KEYS = ("wz_limit", "yaw_latency_gain")
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 
 
@@ -140,6 +144,32 @@ def _validated_min_vx(value, max_vx):
     return float(value)
 
 
+def _validated_wz_limit(value, max_wz):
+    message = f"loco_servo.wz_limit must be finite and in (0, max_wz ({max_wz:g})]"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    try:
+        valid = math.isfinite(value) and 0 < value <= max_wz
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(message)
+    return float(value)
+
+
+def _validated_yaw_gain(value):
+    message = f"loco_servo.yaw_latency_gain must be finite and in [0, {MAX_YAW_LATENCY_GAIN:g}]"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    try:
+        valid = math.isfinite(value) and 0 <= value <= MAX_YAW_LATENCY_GAIN
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(message)
+    return float(value)
+
+
 def _step_limits(hz, linear_acceleration, angular_acceleration):
     for name, value in (("expected_hz", hz), ("linear_acceleration", linear_acceleration),
                         ("angular_acceleration", angular_acceleration)):
@@ -197,6 +227,12 @@ class LocoServoPlugin:
             self._positive(config, "max_wz", 1.0), config.get("min_vx", 0.0), *self._accel)
         self._min_vx = self._descriptor["limits"]["min_magnitude"][0]
         self._parsed_descriptor = parse_descriptor(self._descriptor)
+        # Follow shaping, applied to admitted non-zero commands before the
+        # shared clamp. Neither changes the descriptor navi reads.
+        self._max_wz = self._descriptor["limits"]["upper"][5]
+        self._wz_limit = _validated_wz_limit(config.get("wz_limit", self._max_wz), self._max_wz)
+        self._yaw_gain = _validated_yaw_gain(config.get("yaw_latency_gain", 0.0))
+        self._wz_history = collections.deque()  # (wall_ms, executed wz), piecewise constant
         self._settings = dict(TOGGLES)
         for key in TOGGLES:
             if key in config:
@@ -271,7 +307,8 @@ class LocoServoPlugin:
                     "resume": {"params": [], "description": "恢复接收新的速度指令"},
                     "info": {"params": [], "description": "查看状态、动作空间及执行诊断"},
                     "config": {"params": ["dry_run", "rotate_only", "require_standing", "min_vx",
-                                           "linear_acceleration", "angular_acceleration"],
+                                           "linear_acceleration", "angular_acceleration",
+                                           "wz_limit", "yaw_latency_gain"],
                                "description": "更新空跑、执行限制及标称加速度；设置变化前先停车"}}},
             "topic_in": [{"topic": INPUT_TOPIC, "format": "control/velocity",
                           "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}],
@@ -282,6 +319,12 @@ class LocoServoPlugin:
                 "angular_acceleration": {"type": "number", "default": self._accel[1],
                                          "exclusiveMinimum": 0,
                                          "description": "转向标称加速度（rad/s²），默认 2.0；按 expected_hz 换算为每帧速度步长，由共享 ControlSink 钳制。显式零速度立即停车。"},
+                "wz_limit": {"type": "number", "default": self._wz_limit, "exclusiveMinimum": 0,
+                             "maximum": self._max_wz,
+                             "description": f"转向限幅（rad/s），默认 {self._max_wz:g}（不额外限制）；超出的转向指令截到该值执行，不拒收。不改变向 navi 声明的速度上限。"},
+                "yaw_latency_gain": {"type": "number", "default": self._yaw_gain, "minimum": 0,
+                                     "maximum": MAX_YAW_LATENCY_GAIN,
+                                     "description": "转向延迟补偿系数（1/s），默认 0 关闭。执行 wz = navi 的 wz − 系数 × 画面拍下后机器人已转过的角度；应接近 navi 的转向增益，建议从 0.5 起试。"},
                 "min_vx": {"type": "number", "default": 0.0, "minimum": 0.0,
                            "maximum": self._descriptor["limits"]["upper"][0],
                            "description": "实测最小稳定直行速度（m/s），仅向规划器声明，不在执行端强行抬高速度；0 不声明。修改后需重新启动 navi 读取。"},
@@ -580,6 +623,13 @@ class LocoServoPlugin:
                     "cancel_remaining_before_apply_ms": self._command_cancel_deadline_ms - wall_ms,
                 }
                 self._command_requested_values = list(command["values"])
+                # Shape the turn of a non-zero command. _command_requested_values
+                # keeps navi's original values, so a shaped all-zero output
+                # zeroes velocity but keeps the action instead of cancelling.
+                shaped, turn = self._shape_turn(command, wall_ms)
+                self._last_timing["turn"] = turn
+                if shaped != command["values"]:
+                    command = dict(command, values=shaped)
                 # The native deadline independently zeroes the old command.
                 # Synchronize only the physical baseline, never seq/holder or
                 # accepted deadlines, before the shared sink clamps a new one.
@@ -628,6 +678,7 @@ class LocoServoPlugin:
                     # candidate's receive/cancel deadlines or issuing a STOP.
                     self._last_output = [0.0] * 6
                     self._last_output_at = None
+                    self._record_wz(0.0)
                     self._last_preserved_action = False
                     self._lease_expiry_ms = 0
                     self._soft_held = True
@@ -680,6 +731,50 @@ class LocoServoPlugin:
         return (not self._settings["dry_run"] and
                 getattr(self._backend, "supports_staged_stop", False) is True)
 
+    def _record_wz(self, wz):
+        now_ms = time.time() * 1000
+        history = self._wz_history
+        history.append((now_ms, float(wz)))
+        # Keep the entry that covers the start of the window.
+        while len(history) > 1 and history[1][0] <= now_ms - YAW_HISTORY_MS:
+            history.popleft()
+
+    def _yaw_since(self, since_ms, now_ms):
+        """Angle (rad) the executed wz turned the base from since_ms to now_ms."""
+        total = 0.0
+        history = list(self._wz_history)
+        for index, (start, wz) in enumerate(history):
+            end = history[index + 1][0] if index + 1 < len(history) else now_ms
+            low, high = max(start, since_ms), min(end, now_ms)
+            if high > low:
+                total += wz * (high - low) / 1000
+        return total
+
+    def _shape_turn(self, command, wall_ms):
+        """Latency compensation, then the turn limit. Explicit zero is untouched.
+
+        navi computes wz from a detection taken at obs_stamp_ms. The base kept
+        turning while that frame was processed, so the target has already moved
+        that far towards the centre. Subtract gain x that executed rotation;
+        with gain equal to navi's proportional yaw gain this is the turn navi
+        would request from the target's current bearing.
+        """
+        values = list(command["values"])
+        requested = values[5]
+        turn = {"requested_wz": requested, "wz_limit": self._wz_limit,
+                "yaw_latency_gain": self._yaw_gain}
+        if not any(values):
+            turn["shaped_wz"] = requested
+            return values, turn
+        if self._yaw_gain:
+            observed = command.get("obs_stamp_ms", command["stamp_ms"])
+            rotated = self._yaw_since(observed, wall_ms)
+            values[5] = requested - self._yaw_gain * rotated
+            turn["rotated_since_observation_rad"] = round(rotated, 4)
+        values[5] = max(-self._wz_limit, min(self._wz_limit, values[5]))
+        turn["shaped_wz"] = round(values[5], 4)
+        return values, turn
+
     def _apply(self, values, _gripper=None):
         # Run after sink freshness/shape/arbitration checks: invalid input must
         # neither renew motion nor issue a stop against an otherwise live lease.
@@ -725,6 +820,7 @@ class LocoServoPlugin:
         self._last_preserved_action = bool(motion_requested and not any(output))
         self._last_output = output
         self._last_output_at = now
+        self._record_wz(output[5])
         self._zero_pending = False
 
     def _publish(self, values, *, replace_expired=False, preserve_action=False):
@@ -767,6 +863,7 @@ class LocoServoPlugin:
         self._counts["soft_holds"] += 1
         self._last_output = [0.0] * 6
         self._last_output_at = None
+        self._record_wz(0.0)
         self._last_preserved_action = False
         self._lease_expiry_ms = 0
         self._soft_held = True
@@ -788,6 +885,7 @@ class LocoServoPlugin:
                 self._record("ERROR", f"zero velocity publish failed: {exc}")
         self._last_output = [0.0] * 6
         self._last_output_at = None
+        self._record_wz(0.0)
         self._last_valid_at = None
         self._lease_expiry_ms = 0
         self._cancel_deadline_ms = 0
@@ -839,12 +937,16 @@ class LocoServoPlugin:
                             self._positive(args, "angular_acceleration", self._accel[1]))
             min_vx = _validated_min_vx(args.get("min_vx", self._min_vx),
                                        self._descriptor["limits"]["upper"][0])
+            wz_limit = _validated_wz_limit(args.get("wz_limit", self._wz_limit), self._max_wz)
+            yaw_gain = _validated_yaw_gain(args.get("yaw_latency_gain", self._yaw_gain))
             descriptor = copy.deepcopy(self._descriptor)
             descriptor["limits"]["min_magnitude"][0] = min_vx
             descriptor["limits"]["max_delta_per_step"] = _step_limits(self._hz, *acceleration)
             parsed_descriptor = parse_descriptor(descriptor)
         except ValueError as exc:
             return {"state": "error", "error": str(exc)}
+        # Follow shaping only affects later commands: no stop required.
+        self._wz_limit, self._yaw_gain = wz_limit, yaw_gain
         if (min_vx != self._min_vx or acceleration != self._accel or
                 any(self._settings[key] != value for key, value in updates.items())):
             self._inbox.activate(self._generation, False)
@@ -895,6 +997,7 @@ class LocoServoPlugin:
             "state": "stopping" if self._closing else "paused" if self._running and self._paused else "running" if self._running else "idle",
             "input": self._input_topic, "min_vx": self._min_vx, **self._settings,
             "linear_acceleration": self._accel[0], "angular_acceleration": self._accel[1],
+            "wz_limit": self._wz_limit, "yaw_latency_gain": self._yaw_gain,
             "yielded_to_explicit_command": self._yielded,
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),

@@ -35,7 +35,8 @@ def test_public_config_fields_match_form_constraints_without_aliasing(setup):
 def test_settings_advertised_by_config_action_reach_runtime_configuration(setup):
     plugin = start(setup)
     payload = {"dry_run": True, "rotate_only": True, "require_standing": False,
-               "min_vx": .02, "linear_acceleration": .4, "angular_acceleration": 1.5}
+               "min_vx": .02, "linear_acceleration": .4, "angular_acceleration": 1.5,
+               "wz_limit": .6, "yaw_latency_gain": 1.0}
     schema = plugin.get_tool()["inputSchema"]
     assert set(payload) == set(schema["x-action-params"]["config"]["params"])
     result = plugin.dispatch("config", payload)

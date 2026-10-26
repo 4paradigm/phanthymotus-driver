@@ -44,6 +44,9 @@ from types import SimpleNamespace
 import uuid
 
 from loco_servo import LocoServoPlugin as _Core, TOGGLES, _validated_min_vx
+
+# Follow-shaping settings; validators are imported where used.
+FOLLOW_KEYS = ("wz_limit", "yaw_latency_gain")
 from slamtec_velocity import SlamtecVelocityBackend
 
 _MAX_PACKET = 65536
@@ -506,6 +509,9 @@ class LocoServoPlugin:
                     for key, current in zip(("linear_acceleration", "angular_acceleration"),
                                             self._model._accel):
                         self._model._positive(args, key, current)
+                    from loco_servo import _validated_wz_limit, _validated_yaw_gain
+                    _validated_wz_limit(args.get("wz_limit", self._model._wz_limit), self._model._max_wz)
+                    _validated_yaw_gain(args.get("yaw_latency_gain", self._model._yaw_gain))
             except (ValueError, TypeError) as exc:
                 return {"state": "error", "error": str(exc)}
             if self._process is not None and self._process.poll() is not None and not self._stopping:
@@ -521,7 +527,8 @@ class LocoServoPlugin:
                     result = self._model.dispatch(action, args)
                     if action == "config" and result.get("ok"):
                         self._config.update({key: result[key] for key in
-                                             (*TOGGLES, "min_vx", "linear_acceleration", "angular_acceleration")})
+                                             (*TOGGLES, "min_vx", "linear_acceleration", "angular_acceleration",
+                                              *FOLLOW_KEYS)})
                     self._last_info = self._model.dispatch("info", {})
                     return self._decorate(result)
                 try:
@@ -542,7 +549,8 @@ class LocoServoPlugin:
                     self._open_nodes(result["input"])
                 if action == "config" and result.get("ok"):
                     settings = {key: result[key] for key in
-                                (*TOGGLES, "min_vx", "linear_acceleration", "angular_acceleration")}
+                                (*TOGGLES, "min_vx", "linear_acceleration", "angular_acceleration",
+                                 *FOLLOW_KEYS)}
                     self._model.dispatch("config", settings)
                     self._config.update(settings)
                 if mutation:

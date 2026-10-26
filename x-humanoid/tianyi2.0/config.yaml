@@ -64,6 +64,8 @@ plugins:
     max_wz: 1.0  # rad/s; accepts navi search turns up to +/-1.0.
     linear_acceleration: 0.3  # m/s^2; explicit zero stops immediately.
     angular_acceleration: 2.0  # rad/s^2; bounded steering response, configurable via MCP.
+    wz_limit: 1.0  # rad/s; turn commands above this are clamped (not rejected). <= max_wz.
+    yaw_latency_gain: 0.0  # 1/s; 0 = off. wz -= gain * base rotation since obs_stamp_ms.
     dry_run: true  # First deployment must inspect commands before enabling real motion.
     # Official Slamware SDK TCP endpoint, distinct from HTTP :1448.
     sdk_host: "192.168.11.1"
