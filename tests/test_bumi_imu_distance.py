@@ -330,7 +330,7 @@ def test_distance_uses_leg_odometry_when_the_owner_exposes_joint_states(monkeypa
     assert plant.commands[-1][1:] == (0, 0)
 
 
-def _phase_leg(plant, parallel_after_m):
+def _phase_leg(plant, parallel_after_m, coast_m=0.0, speed=0.16):
     class PhaseLeg:
         def __init__(self, slip_scale=None):
             self.slip_scale = slip_scale
@@ -339,6 +339,7 @@ def _phase_leg(plant, parallel_after_m):
             self.foot_gap = 0.12
             self.double_support = True
             self._last = None
+            self._coast = coast_m
         def reset_position(self):
             self.position = [0.0, 0.0, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
@@ -355,7 +356,13 @@ def _phase_leg(plant, parallel_after_m):
                 return
             dt = now-self._last
             self._last = now
-            step = 0.16*dt if plant.command else 0.0
+            if plant.command:
+                step = speed*dt
+            elif self._coast > 0:
+                step = min(speed*dt, self._coast)
+                self._coast -= step
+            else:
+                step = 0.0
             self.position = [self.position[0]+step, 0.0, 0.0]
             self.velocity = [step/dt, 0.0, 0.0]
             self.foot_gap = 0.12 if self.position[0] < parallel_after_m else 0.0
@@ -524,8 +531,11 @@ def test_target_heading_drift_is_corrected_away_from_the_drift(monkeypatch):
     result = module.run_target(owner, 0.5, 0.0)
     assert result['state'] == 'done', result.get('error')
     # Drifting left must command a right correction (negative yaw), not another
-    # left turn. The stale sign would reinforce the drift.
-    assert any(vyaw < 0 for vx, vyaw in commands), commands
+    # left turn. The stale sign would reinforce the drift; assert the exact
+    # direction: a correction is issued and no left (positive) turn appears.
+    driving = [(vx, vyaw) for vx, vyaw in commands if vx or vyaw]
+    assert any(vyaw < 0 for vx, vyaw in driving), driving
+    assert not any(vyaw > 0 for vx, vyaw in driving), driving
 
 
 def test_target_endpoint_catches_coasting_past_the_tolerance(monkeypatch):
@@ -1004,6 +1014,24 @@ def test_move_accepts_an_explicit_slip_scale(monkeypatch):
     result = module.run_distance(plant, 0.5, slip_scale=2.5)
     assert result['state'] == 'done', result.get('error')
     assert result['leg_slip_scale'] == pytest.approx(2.5)
+
+
+def test_distance_capped_finish_includes_the_braking_coast(monkeypatch):
+    plant = Plant(monkeypatch)
+    # Never parallel: the finish reaches the 0.05 m cap, then the robot coasts
+    # 4 cm. A faster fake step keeps the cap inside the 0.4 s finish window.
+    monkeypatch.setattr(module, 'LegOdometry',
+                        _phase_leg(plant, 99.0, coast_m=0.04, speed=0.30))
+    monkeypatch.setattr(plant, '_read_distance_joints', lambda: [0.0]*21, raising=False)
+    result = module.run_distance(plant, 0.5)
+    # The coast is real travel and must be inside the finish allowance, not an
+    # 'overshoot exceeds 0.05 m' error (the capped path previously lost
+    # phase_active and applied the plain 0.05 limit).
+    assert result['state'] == 'done', result.get('error')
+    assert result['finish_phase'] == 'capped'
+    # Braking samples push the overshoot past the plain 0.05 limit; the capped
+    # phase must use the finish allowance (otherwise this is an error).
+    assert result['finish_overshoot_m'] > 0.05
 
 
 def test_distance_phase_finish_times_out_instead_of_walking_forever(monkeypatch):

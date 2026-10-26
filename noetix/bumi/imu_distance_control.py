@@ -352,7 +352,11 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
             if (lateral > lateral_limit(distance_m) or abs(yaw_error) > math.radians(30)
                     or math.hypot(*source_velocity) > 1.2):
                 raise ValueError('IMU estimated motion exceeds direction or speed limits')
-            phase_active = leg is not None and (finishing or finish_phase in ('parallel', 'timeout'))
+            # The capped path also keeps integrating through braking (the stop
+            # slide is real travel); it needs the same finish allowance or the
+            # additional samples turn an intended capped stop into an error.
+            phase_active = (leg is not None
+                            and (finishing or finish_phase in ('parallel', 'timeout', 'capped')))
             overshoot_limit = PARALLEL_FINISH_ALLOWANCE_M if phase_active else 0.05
             if remaining < -overshoot_limit:
                 raise ValueError('IMU estimated overshoot exceeds 0.05 m')
