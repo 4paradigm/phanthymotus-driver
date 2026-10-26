@@ -17,15 +17,73 @@ def setup_servo(tmp_path):
     return arm, sample, channel, advance, gravity, sdk
 
 
-def test_new_target_written_once_with_smoothing_without_gravity(tmp_path):
+def test_single_valid_target_advances_on_every_tick_without_gravity(tmp_path):
+    import math
     arm, sample, channel, advance, gravity, sdk = setup_servo(tmp_path)
-    assert arm._gravity is None
-    assert arm.accept_control(packet(arm, target=.5))
-    for _ in range(5):
-        advance(10); arm.tick()
-    assert len(channel.positions) == 1
-    assert channel.positions[0][0] == pytest.approx([.01]*10)
+    command = packet(arm, target=.1)
+    assert arm.accept_control(command)
+    for _ in range(25):
+        advance(4, follow=False); arm.tick()
+    values = [q[0] for q, _ in channel.positions]
+    assert len(values) == 25
+    assert all(a < b < .1 for a, b in zip(values, values[1:]))
+    assert values[-1] == pytest.approx(.1 * (1 - math.exp(-.1 / .12)))
+    assert max(b-a for a, b in zip([0.] + values, values)) <= .004
+    assert arm.applied_seq == command['seq']
+    assert arm.latest['valid_until_ns'] == command['valid_until_ns']
     assert gravity == channel.writes == sdk == []
+
+
+def test_replacement_target_continues_from_last_output_and_settled_target_does_not_drift(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.accept_control(packet(arm, target=.1))
+    for _ in range(10):
+        advance(4); arm.tick()
+    previous = arm.last_q[:]
+    arm.accept_control(packet(arm, seq=2, target=-.1))
+    sample['q'] = [.2]*10
+    advance(4); arm.tick()
+    assert all(0 < p-q <= .004 for p, q in zip(previous, arm.last_q))
+    settled = arm.last_q[0]
+    arm.accept_control(packet(arm, seq=3, target=settled))
+    for i in range(10):
+        sample['q'] = [settled + (-1)**i * .001]*10
+        advance(4); arm.tick()
+        assert arm.last_q == [settled]*10
+    assert arm.applied_seq == 3
+
+
+@pytest.mark.parametrize('ending', ['expiry', 'pause', 'feedback', 'envelope', 'sdk'])
+def test_continuing_target_keeps_execution_guards(tmp_path, ending):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    command = packet(arm, target=.5, width=.006 if ending == 'envelope' else 1.)
+    arm.accept_control(command)
+    advance(4); arm.tick()
+    assert len(channel.positions) == 1
+    if ending == 'expiry': advance(296)
+    elif ending == 'pause': arm.hold('operator_pause')
+    elif ending == 'feedback': sample['error'] = 'invalid_sample'
+    elif ending == 'sdk': channel.publish_servo_position = lambda *a, **k: False
+    if ending != 'expiry': advance(4)
+    arm.tick()
+    for _ in range(3):
+        advance(4); arm.tick()
+    assert len(channel.positions) == 1
+    assert arm.applied_seq == command['seq']
+    assert arm.state in ('hold', 'fault')
+
+
+def test_replay_keeps_exact_targets_without_between_frame_interpolation(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.replay_deadline_ns = arm.clock() + 200_000_000
+    for seq, target in [(1, .1), (2, -.1)]:
+        advance(20)
+        arm.write_replay(packet(arm, seq=seq, target=target, life=200))
+        assert arm.last_q == [target]*10
+        for _ in range(5):
+            advance(4); arm.tick()
+        assert len(channel.positions) == seq
+    assert [q for q, _ in channel.positions] == [[.1]*10, [-.1]*10]
 
 
 def test_timeout_holds_without_new_target_and_fresh_input_resumes(tmp_path):

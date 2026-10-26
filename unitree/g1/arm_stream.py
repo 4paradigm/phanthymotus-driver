@@ -719,7 +719,8 @@ class ArmStreamExecutor:
                     return
                 if self.latest is None:return
                 servo = self.cfg.get('servo_position')
-                if servo and self.applied_seq == self.latest['seq']:return
+                # Live targets advance each tick; replay emits each recorded target once.
+                if servo and self.replay_deadline_ns is not None and self.applied_seq == self.latest['seq']:return
                 dt=max(0.,min((now-self.last_emit)/1e9,.02))
                 limit=self.velocity*dt
                 if servo and self.replay_deadline_ns is not None:

@@ -202,11 +202,16 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         for seq in (1, 2, 3):
             arm.accept_control(packet(arm, seq, target=.01*seq))
             time.sleep(.06)
-        recorded = card.dispatch('record_stop', {})
+        with arm.lock:
+            recorded = card.dispatch('record_stop', {})
+            outputs = [q for q, _ in channel.positions]
         assert recorded['complete'], recorded
         name = recorded['filename']
         asset = card.dispatch('inspect', {'filename': name})
-        assert asset['complete'] and asset['frames'] == 3
+        assert asset['complete'] and asset['frames'] > 3
+        recorded_frames = read_recording(card.trajectory.directory, name, arm.limits)['frames']
+        assert {f['sdk_sequence'] for f in recorded_frames} == {1, 2, 3}
+        assert [f['target_q'] for f in recorded_frames] == outputs
         assert 'device_id' not in asset['binding']
         card.cfg['trajectory_device_id'] = 'different-robot'  # Obsolete identity cannot restrict replay.
         assert card.dispatch('play', {'filename': name})['code'] == 'stop_teleop_before_replay'
@@ -220,6 +225,12 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         preview = card.dispatch('start_difference', {'filename': name})
         assert preview['ready'] and not arm.session_id
         count = len(channel.positions)
+        sent = []
+        send = card.trajectory._send_frame
+        def capture_send(frame, seq):
+            send(frame, seq)
+            sent.append(frame['target_q'])
+        card.trajectory._send_frame = capture_send
         result = card.dispatch('play', {'filename': name})
         assert result['status'] == 'running', result
         assert card.dispatch('start', {'input_topic': '/teleop/command'})['code'] == 'replay_active'
@@ -228,7 +239,10 @@ def test_adapter_record_inspect_preview_replay_real_termination_and_acp(tmp_path
         assert outcome['status'] == 'completed', outcome
         assert outcome['result']['stop']['authority_released'] and not arm.session_id
         assert receipts == [(result['action_id'], outcome['status'], outcome['result'])]
-        assert [q for q, _ in channel.positions[count:count+3]] == [f['target_q'] for f in asset['preview']]
+        assert sent and sent[-1] == recorded_frames[-1]['target_q']
+        assert [q for q, _ in channel.positions[count:count+len(sent)]] == sent
+        remaining = iter(f['target_q'] for f in recorded_frames)
+        assert all(any(q == target for q in remaining) for target in sent)
         assert not card.trajectory.recorder.status()['error']
         arm.cfg['live_enabled'] = False
         rejected = card.dispatch('play', {'filename': name})
@@ -359,7 +373,9 @@ def test_teleop_hold_does_not_terminate_recording(tmp_path, reason):
         card._hold(reason, grip=True)
         card._hold(reason, grip=True)
         assert card.trajectory.recorder.status()['recording']
+        held_count = len(channel.positions)
         time.sleep(.03)
+        assert len(channel.positions) == held_count
         resumed = arm.dispatch('resume', card.motion._lease())
         assert not resumed.get('error'), resumed
         arm.accept_control(packet(arm, 2, target=.02))
@@ -367,7 +383,13 @@ def test_teleop_hold_does_not_terminate_recording(tmp_path, reason):
         result = card.dispatch('record_stop', {})
         assert result['complete'], result
         frames = read_recording(card.trajectory.directory, result['filename'], arm.limits)['frames']
-        assert [f['kind'] for f in frames] == ['target', 'hold', 'target']
+        from itertools import groupby
+        assert [kind for kind, _ in groupby(f['kind'] for f in frames)] == ['target', 'hold', 'target']
+        assert sum(f['kind'] == 'hold' for f in frames) == 1
+        targets = [f for f in frames if f['kind'] == 'target']
+        assert {f['sdk_sequence'] for f in targets} == {1, 2}
+        assert [f['target_q'] for f in targets] == [q for q, _ in channel.positions[:len(targets)]]
+        assert next(i for i, f in enumerate(frames) if f['kind'] == 'hold') == held_count
     finally:
         done.set(); ticker.join(1)
         if card.trajectory.recorder: card.trajectory.recorder.stop()
@@ -735,8 +757,32 @@ def test_operator_end_preserves_recording_and_later_record_stop(tmp_path, ending
         assert result == recorder.status()
         assert arm.record_sink is None
         frames = read_recording(recorder.directory, result['filename'], arm.limits)['frames']
-        assert len([f for f in frames if f['kind'] == 'target']) == 2
+        targets = [f for f in frames if f['kind'] == 'target']
+        assert len(targets) > 2 and {f['sdk_sequence'] for f in targets} == {1, 2}
+        assert [f['target_q'] for f in targets] == [q for q, _ in channel.positions[:len(targets)]]
+        # Reset/release detach the recorder before starting handback; stop records hold first.
+        assert frames[-1]['kind'] == ('hold' if ending == 'stop' else 'target')
+        path = recorder.directory / result['filename']
+        saved = path.read_bytes()
+        time.sleep(.03)
+        assert path.read_bytes() == saved
         assert card.dispatch('record_stop', {}) == result
     finally:
         done.set(); ticker.join(1)
         if card.trajectory.recorder: card.trajectory.recorder.stop()
+
+
+def test_recording_keeps_each_interpolated_write_with_the_same_command_sequence(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    recorder = Recorder(tmp_path/'recordings', {}, [], arm.limits, clock=arm.clock)
+    arm.record_sink = recorder
+    arm.accept_control(packet(arm, target=.1))
+    for _ in range(10):
+        advance(4); arm.tick()
+    result = recorder.stop()
+    assert result['complete'], result
+    frames = read_recording(recorder.directory, result['filename'], arm.limits)['frames']
+    assert len(frames) == len(channel.positions) == 10
+    assert [f['target_q'] for f in frames] == [q for q, _ in channel.positions]
+    assert {f['sdk_sequence'] for f in frames} == {1}
+    assert [f['t_ns'] for f in frames] == list(range(4_000_000, 40_000_001, 4_000_000))
