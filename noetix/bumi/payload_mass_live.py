@@ -40,9 +40,12 @@ def evaluate_window(frames, baseline, model, profile, duration_s, now):
     delta = [a-b for a, b in zip(summary["tau"], baseline["summary"]["tau"])]
     mass = projection(model["k"], model["weights"], delta)
     resolution = model["resolution_kg"]
-    if mass < -resolution or mass > model["mass_range_kg"][1]:
+    upper = model["mass_range_kg"][1]
+    rounding_epsilon = 1e-12 * max(1.0, upper)
+    if mass < -resolution - rounding_epsilon or mass > upper + rounding_epsilon:
         result.update(state="out_of_range", error_code="OUT_OF_RANGE", message="超出标定范围。")
         return result
+    mass = min(mass, upper)  # absorb arithmetic roundoff at the inclusive bound
     residual = math.sqrt(sum(w*(v-k*mass)**2 for w, v, k in zip(model["weights"], delta, model["k"]))
                          / max(1, sum(w > 0 for w in model["weights"])))
     if residual > model["residual_limit"]:

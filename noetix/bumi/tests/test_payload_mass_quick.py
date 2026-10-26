@@ -7,7 +7,9 @@ import pytest
 from test_payload_mass import Sampler, Loco, raw_frame, run, wait_for
 from payload_mass import PayloadMassPlugin
 from payload_mass_sampling import MassError, check_frame
-from payload_mass_quick import profile_from_home
+from payload_mass_quick import profile_from_home, fit_reference
+from payload_mass_estimator import summarize
+from payload_mass_live import evaluate_window
 
 
 class QuickLoco(Loco):
@@ -109,6 +111,18 @@ def test_right_arm_profile_selects_actual_motor_ids():
     assert p["motor_ids"] == [10, 11, 12, 13]
     assert "mapping_verified" not in p and "feedback_verified" not in p
     assert p["max_mass_kg"] == .5
+
+
+def test_exact_500g_bound_accepts_roundoff_but_rejects_actual_excess():
+    p = profile_from_home(raw_frame(), "left", 300)
+    empty = [raw_frame(0, n) for n in range(1, 33)]
+    baseline = {"id": "edge", "profile_fingerprint": p["fingerprint"], "created_s": time.time(),
+                "summary": summarize(empty, p)}
+    model = fit_reference([raw_frame(.2, n) for n in range(1, 33)], baseline, p, .2)
+    accepted = evaluate_window([raw_frame(.5, n) for n in range(1, 33)], baseline, model, p, 3, time.time())
+    assert accepted["mass_kg"] == .5 and accepted["stable"]
+    rejected = evaluate_window([raw_frame(.501, n) for n in range(1, 33)], baseline, model, p, 3, time.time())
+    assert rejected["error_code"] == "OUT_OF_RANGE" and rejected["mass_kg"] is None
 
 
 def test_pretending_to_hold_without_bending_does_not_prepare(quick):
