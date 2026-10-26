@@ -81,6 +81,10 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY payload_mass.py /work/payload_mass.py
+COPY payload_mass_sampling.py /work/payload_mass_sampling.py
+COPY payload_mass_estimator.py /work/payload_mass_estimator.py
+COPY calibrate_payload_mass.py /work/calibrate_payload_mass.py
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
 COPY camera_specs.py /work/camera_specs.py

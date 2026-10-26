@@ -29,3 +29,4 @@ cards:
   - { name: depth,             type: sensor }
   - { name: motion_state,      type: sensor }
   - { name: vision_capture,    type: actuator }
+  - { name: payload_mass,      type: actuator }

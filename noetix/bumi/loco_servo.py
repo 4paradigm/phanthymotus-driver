@@ -754,6 +754,8 @@ class LocoServoPlugin:
         rates into one SDK, which reads on the robot as a stutter and in the
         logs as nothing at all.
         """
+        if self._loco is not None and getattr(self._loco, "_payload_owner", None) is not None:
+            return "称重正在占用身体；请先完成或停止称重。"
         if self._loco is None or not getattr(self._loco, "is_moving", None):
             return ""
         if self._loco.is_moving():

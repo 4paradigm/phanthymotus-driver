@@ -123,6 +123,7 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        state_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -183,6 +184,22 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("payload_mass", {}).get("enabled", False):
+            from payload_mass import PayloadMassPlugin
+            from payload_mass_sampling import SharedSampler
+            sampler = SharedSampler()
+            if state_plugin is not None:
+                state_plugin._node.payload_sampler = sampler
+            self._plugins.append(PayloadMassPlugin(
+                plugins_cfg["payload_mass"], namespace, executor, sampler, loco_plugin))
+            print("[bundle] PayloadMassPlugin loaded (fixed-pose weighing with verified recordings)")
+
+    def response_published(self, action_id, delivered=True):
+        for plugin in self._plugins:
+            callback = getattr(plugin, "response_published", None)
+            if callback is not None:
+                callback(action_id, delivered)
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
@@ -224,6 +241,8 @@ class BumiDeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
+                    if tool_name == 'payload_mass':
+                        args['_await_response_publication'] = True
                     result = p.dispatch(action, args)
                     return result
         return None
@@ -325,11 +344,20 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    payload_task = name == "payload_mass" and args.get("action") in (
+                        "prepare", "weigh", "finish")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        delivered = False
+                        try:
+                            ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                            self.wfile.flush()
+                            delivered = True
+                        finally:
+                            if payload_task and result.get("action_id"):
+                                _bundle.response_published(result["action_id"], delivered)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:

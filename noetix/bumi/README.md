@@ -447,3 +447,9 @@ ros2 topic echo /<robot_namespace>/motion/state
 ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
+
+## 固定曲肘估重
+
+新增 `payload_mass`：曲肘采空载、计算重量（kg）、测量完毕归位。使用已验证的
+示教动作与已知质量标定，不下发全身低层关节命令。首次真机配置、Ubuntu24.04
+离线测试与验收步骤见 [PAYLOAD_MASS.md](PAYLOAD_MASS.md)。当前待真机验证。

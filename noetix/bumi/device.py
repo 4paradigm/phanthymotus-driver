@@ -147,6 +147,7 @@ class _BumiStateNode(Node):
 
     def __init__(self, namespace: str, high_ctrl):
         super().__init__("bumi_state")
+        self.payload_sampler = None
         self._high_ctrl = high_ctrl
         self._imu_topic     = f"/{namespace}/state/imu"
         self._battery_topic = f"/{namespace}/state/battery"
@@ -206,6 +207,13 @@ class _BumiStateNode(Node):
                         })
                     imu = self._high_ctrl.get_imu_data()
                     workmode = self._high_ctrl.get_mode()
+                    # Share raw, unrounded feedback with the read-only payload
+                    # sampler; no second SDK connection or extra polling thread.
+                    if self.payload_sampler is not None:
+                        try:
+                            self.payload_sampler.accept_getter(joint_state, imu, workmode)
+                        except Exception as exc:
+                            self.payload_sampler.record_error(exc)
                     joints_data = {
                         "joints": joints,
                         "imu_quat": [float(imu.ori[3]), float(imu.ori[0]), float(imu.ori[1]), float(imu.ori[2])],  # SDK [x,y,z,w] → renderer [w,x,y,z]
@@ -231,6 +239,8 @@ class _BumiStateNode(Node):
 
                 time.sleep(0.02)  # 50 Hz poll loop
             except Exception as e:
+                if self.payload_sampler is not None:
+                    self.payload_sampler.record_error(e)
                 self.get_logger().warn(f"State poll error: {e}")
                 time.sleep(0.5)
 
@@ -317,6 +327,8 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        self._action_lock = threading.RLock()
+        self._payload_owner = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
@@ -341,7 +353,7 @@ class LocoPlugin:
         with separate limiters can interleave inside a single publish, and the
         SDK has no way to tell us that happened.
         """
-        self._publish_cmd(x, y, z, _get_default_cmd(), 0)
+        self._publish_cmd(x, y, z, _get_default_cmd(), 0, streaming=True)
 
     def _preempt_servo(self, reason: str) -> bool:
         """An explicit action outranks a streaming policy.
@@ -517,6 +529,18 @@ class LocoPlugin:
         self._stop_move()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        with self._action_lock:
+            if self._payload_owner is not None:
+                if action in ("stop", "stop_move", "stop_playback"):
+                    result = self._payload_owner.cancel_locked()
+                    if result.get("state") == "error":
+                        return result
+                elif action not in ("start", "info"):
+                    return {"state": "error", "error_code": "WEIGHING_BUSY",
+                            "error": "称重占用身体；请先执行测量完毕或停止称重。"}
+            return self._dispatch_direct(action, args)
+
+    def _dispatch_direct(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -554,9 +578,11 @@ class LocoPlugin:
             result["preempted_loco_servo"] = True
         return result
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0, *, streaming=False):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
         with self._lock:
+            if streaming and self._payload_owner is not None:
+                return
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
             if elapsed < 0.002:

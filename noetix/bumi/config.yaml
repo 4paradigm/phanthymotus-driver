@@ -62,3 +62,11 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+
+  payload_mass:
+    enabled: true
+    # Requires state + loco; recordings and mass calibration are per-robot.
+    data_dir: /opt/phanthy-motus/data/bumi/weighing_trials
+    profiles_file: /opt/phanthy-motus/data/bumi/weighing.json
+    hardware_id: ""
+    sdk_version: ""

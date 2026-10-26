@@ -104,6 +104,43 @@ def _config(*, loco=True, loco_servo=True, servo_config=None):
     }
 
 
+def test_payload_registration_shares_state_and_loco_and_gates_response(bundle_module, monkeypatch):
+    class State:
+        def __init__(self, *args):
+            self._node = types.SimpleNamespace(payload_sampler=None)
+
+        def get_tools(self):
+            return []
+
+    class Payload:
+        def __init__(self, cfg, ns, executor, sampler, loco):
+            self.sampler, self.loco = sampler, loco
+            self.published = []
+
+        def get_tool(self):
+            return {"name": "payload_mass", "type": "actuator"}
+
+        def dispatch(self, action, args):
+            assert action == "prepare"
+            assert args["_await_response_publication"] is True
+            return {"action_id": "test_id"}
+
+        def response_published(self, action_id, delivered):
+            self.published.append((action_id, delivered))
+
+    monkeypatch.setattr(sys.modules["device"], "StatePlugin", State, raising=False)
+    monkeypatch.setitem(sys.modules, "payload_mass", types.SimpleNamespace(PayloadMassPlugin=Payload))
+    cfg = {"plugins": {"state": {"enabled": True}, "loco": {"enabled": True},
+                       "payload_mass": {"enabled": True}}}
+    bundle = bundle_module.BumiDeviceBundle(cfg, "test", object(), FakeHighCtrl(), None)
+    state, loco, card = bundle._plugins
+    assert state._node.payload_sampler is card.sampler
+    assert card.loco is loco
+    assert bundle.dispatch("payload_mass", {"action": "prepare"}) == {"action_id": "test_id"}
+    bundle.response_published("test_id", False)
+    assert card.published == [("test_id", False)]
+
+
 def test_enabled_loco_servo_registers_and_reuses_loco(bundle_module):
     high_ctrl = FakeHighCtrl()
     executor = object()
