@@ -46,6 +46,20 @@ class TransportTests(unittest.TestCase):
         process.terminate.assert_called_once()
         process.stdout.close.assert_called_once()
 
+    def test_dead_transport_recovers_only_through_probe_without_replaying_turn(self):
+        old, new = self.process(), self.process()
+        old.terminate.side_effect = lambda: setattr(old.poll, "return_value", 1)
+        with mock.patch.object(head_transport.subprocess, "Popen", side_effect=[old, new]) as spawn:
+            transport = head_transport.HeadServiceTransport()
+            with self.assertRaises(TimeoutError):
+                transport._rpc({"operation": "turn", "degree": 5}, 0)
+            with mock.patch.object(head_transport.select, "select", return_value=([new.stdout], [], [])), mock.patch.object(head_transport.os, "read", return_value=b'U1_HEAD_REPLY {"ok":true,"ready":true}\n'):
+                self.assertTrue(transport.wait_for_service())
+            self.assertEqual(spawn.call_count, 2)
+            self.assertEqual(json.loads(new.stdin.write.call_args.args[0]), {"operation": "probe"})
+            self.assertEqual(new.stdin.write.call_count, 1)
+            transport.close()
+
     def test_child_rejects_turn_until_readonly_probe_succeeds(self):
         services = types.ModuleType("rcl_interfaces.srv")
         services.GetParameters = types.SimpleNamespace(Request=lambda: types.SimpleNamespace(names=[]))

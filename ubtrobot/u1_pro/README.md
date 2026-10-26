@@ -78,7 +78,8 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 actual/desired 误差 <0.02 rad、desired 每次变化 <0.001 rad 持续 1 秒，才释放共享占用，
 并标记 `settled_unverified`，`arrival_confirmed` 始终为 false。
 这证明观察到的控制器目标收敛，不能证明其对应请求角度、左右方向或中立朝向。
-首版不声明 ACP 物理完成契约，不会自动编排下一运动。
+通过 `action_id` 和 ACP 报告一次任务终态；未验证的朝向结果以 error 终止平台等待，
+不会声称已到位或自动编排下一运动。仅提交前取消可以报告 cancelled。
 
 超时、传输异常、无法观察目标变化或物理停止未确认时保留互斥占用；`start`、
 音频 stop 和迟到回执都不会强行释放。继续收到满足上述条件的反馈后可恢复。
@@ -166,3 +167,8 @@ sound_direction 增加网页可见动作：
 更新后网页刷新工具列表；若仍出现旧动作列表，移除并重新添加这两张卡片。
 先看声源卡 status / 数据流，头部卡 info；未知旧任务由操作者决定是否 acknowledge，
 之后才能提交新的 turn。不要将该恢复动作自动接入编排。
+
+平台完成协议：turn 声明 `x-completion`（75 秒平台等待上限），支持关联 `action_id`。
+拒绝、传输异常、驱动超时和无法验证朝向的收敛均报告 error；unknown 仍保留本地占用。
+迟到回执不会重复报告或把 error 改成成功。通信子进程关闭后，下一次只读 probe 可以重建它，
+但不会重放 turn；恢复仍需操作者 acknowledge。

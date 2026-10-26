@@ -23,6 +23,13 @@ def neck(actual=0, desired=0):
 
 
 class DirectionTests(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(device, "_acp_notify")
+        self.notify = patch.start()
+        self.addCleanup(patch.stop)
+        self.completion = threading.Event()
+        self.notify.side_effect = lambda *args: self.completion.set()
+
     def nodes(self):
         nodes = mock.Mock()
         nodes.namespace = "test"
@@ -288,6 +295,27 @@ class DirectionTests(unittest.TestCase):
         self.assertIsNone(audio._orientation_owner)
         self.assertIn("stale", plugin._state()["error"])
 
+    def test_completion_is_correlated_once_and_never_claims_arrival(self):
+        plugin, audio, _ = self.head()
+        future = concurrent.futures.Future()
+        plugin._client.call_async.return_value = future
+        self.submit(plugin, action_id="web-turn-1")
+        self.notify.assert_not_called()
+        self.assertEqual(plugin._state()["action_id"], "web-turn-1")
+        plugin._task["deadline"] = 0
+        plugin._tick()
+        self.assertTrue(self.completion.wait(1))
+        self.notify.assert_called_once()
+        action_id, status, result, tool = self.notify.call_args.args
+        self.assertEqual((action_id, status, tool), ("web-turn-1", "error", "head_orientation"))
+        self.assertFalse(result["arrival_confirmed"])
+        self.assertEqual(result["state"], "timeout_unconfirmed")
+        self.assertIs(audio._orientation_owner, plugin)
+        future.set_exception(RuntimeError("late transport failure"))
+        plugin._tick()
+        plugin.stop()
+        self.assertEqual(self.notify.call_count, 1)
+
     def test_sound_status_configure_and_no_data_heartbeat(self):
         plugin, _ = self.sound()
         self.assertEqual(plugin.dispatch("status", {})["data_state"], "no_data")
@@ -343,7 +371,7 @@ class DirectionTests(unittest.TestCase):
     def test_schemas_and_runtime_dependencies(self):
         plugin, _, _ = self.head()
         self.assertEqual(plugin.get_tool()["type"], "actuator")
-        self.assertNotIn("x-completion", plugin.get_tool()["inputSchema"])
+        self.assertEqual(plugin.get_tool()["inputSchema"]["x-completion"], {"actions": ["turn"], "timeout": 75})
         sensor, _ = self.sound()
         self.assertEqual(sensor.get_tool()["topic_out"][0]["format"], "data/json")
         root = Path(__file__).parent

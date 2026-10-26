@@ -28,10 +28,14 @@ class HeadServiceTransport:
         env.pop("CYCLONEDDS_URI", None)
         self._lock = threading.Lock()
         self._inflight = False
+        self._root, self._env = root, env
+        self._spawn()
+
+    def _spawn(self):
         self._process = subprocess.Popen(
-            [sys.executable, str(root / "head_service_worker.py")],
+            [sys.executable, str(self._root / "head_service_worker.py")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            env=env, bufsize=0)
+            env=self._env, bufsize=0)
         self._buffer = b""
 
     @property
@@ -40,34 +44,44 @@ class HeadServiceTransport:
 
     def _rpc(self, command, timeout):
         with self._lock:
-            process = self._process
-            if process.poll() is not None:
-                raise RuntimeError("head service transport exited; restart required")
-            process.stdin.write(json.dumps(command).encode() + b"\n")
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if b"\n" in self._buffer:
-                    line, self._buffer = self._buffer.split(b"\n", 1)
-                    # Ignore library startup diagnostics; protocol has a fixed prefix.
-                    if not line.startswith(b"U1_HEAD_REPLY "):
-                        continue
-                    result = json.loads(line[len(b"U1_HEAD_REPLY "):])
-                    if not result.get("ok"):
-                        raise RuntimeError(result.get("error", "head service transport error"))
-                    return result
-                ready, _, _ = select.select([process.stdout], [], [], min(.2, max(0, deadline - time.monotonic())))
-                if ready:
-                    data = os.read(process.stdout.fileno(), 4096)
-                    if not data:
-                        raise RuntimeError("head service transport disconnected")
-                    self._buffer += data
-                    if len(self._buffer) > 65536:
-                        raise RuntimeError("head service transport response exceeded limit")
-            # Never reuse a stream whose response can arrive after this request.
-            self.close()
-            raise TimeoutError("head service transport timed out; physical outcome unknown")
+            try:
+                process = self._process
+                if process.poll() is not None:
+                    raise RuntimeError("head service transport exited; restart required")
+                process.stdin.write(json.dumps(command).encode() + b"\n")
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if b"\n" in self._buffer:
+                        line, self._buffer = self._buffer.split(b"\n", 1)
+                        # Ignore library startup diagnostics; protocol has a fixed prefix.
+                        if not line.startswith(b"U1_HEAD_REPLY "):
+                            continue
+                        result = json.loads(line[len(b"U1_HEAD_REPLY "):])
+                        if not result.get("ok"):
+                            raise RuntimeError(result.get("error", "head service transport error"))
+                        return result
+                    ready, _, _ = select.select([process.stdout], [], [], min(.2, max(0, deadline - time.monotonic())))
+                    if ready:
+                        data = os.read(process.stdout.fileno(), 4096)
+                        if not data:
+                            raise RuntimeError("head service transport disconnected")
+                        self._buffer += data
+                        if len(self._buffer) > 65536:
+                            raise RuntimeError("head service transport response exceeded limit")
+                # Never reuse a stream whose response can arrive after this request.
+                raise TimeoutError("head service transport timed out; physical outcome unknown")
+            except Exception:
+                self.close()
+                raise
 
     def wait_for_service(self, timeout_sec=1):
+        # Only a read-only probe may recreate a dead child. Never replay turn.
+        with self._lock:
+            if self._process.poll() is not None:
+                if self._inflight:
+                    raise RuntimeError("head service request still in flight")
+                self.close()
+                self._spawn()
         result = self._rpc({"operation": "probe"}, 10)
         return bool(result.get("ready"))
 

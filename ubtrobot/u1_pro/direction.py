@@ -240,6 +240,7 @@ class HeadOrientationPlugin:
             "stop": ([], "Disable new turns; physical cancellation is unverified and no stop command is sent."),
             "info": ([], "Read task, controller feedback and errors; acceptance never means arrival."),
         }, {
+            "action_id": {"type": "string", "description": "平台完成回调关联 ID；未指定时由驱动生成。"},
             "confirm": {"type": "boolean", "description": "Must be true for operator hardware acceptance of uncalibrated vendor motion; omitted/false sends no command."},
             "degree": {"type": "number", "minimum": -20, "maximum": 20, "description": "Vendor degree, provisional ±20 input cap; absolute/relative and sign unverified."},
             "max_vel": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.4, "description": "MotionSetup vendor units, unverified. Explicit value required; no speed guarantee."},
@@ -247,6 +248,7 @@ class HeadOrientationPlugin:
             "timeout": {"type": "number", "minimum": 1, "maximum": 60, "default": 15},
         })
         schema["x-is-dangerous"] = True
+        schema["x-completion"] = {"actions": ["turn"], "timeout": 75}
         return tool(self.PREFIX, "actuator", "头部水平转向：单一厂商 SoundSource 路径；回中、物理停止与角度语义待真机验收。", schema)
 
     def start(self):
@@ -270,6 +272,7 @@ class HeadOrientationPlugin:
 
     def _state(self):
         return {"state": self._task["state"] if self._task else "ready" if self.running else "idle",
+                "action_id": self._task.get("action_id") if self._task else None,
                 "enabled": self.running, "task": dict(self._task) if self._task else None,
                 "feedback": dict(self._feedback) if self._feedback else None,
                 "feedback_age_seconds": None if self._feedback_at is None else time.monotonic() - self._feedback_at,
@@ -297,7 +300,7 @@ class HeadOrientationPlugin:
                 return {"state": "error", "message": "fresh neck feedback required"}
             self._generation += 1
             generation = self._generation
-            self._task = {"id": str(uuid.uuid4()), "degree": degree, "state": "checking",
+            self._task = {"id": str(uuid.uuid4()), "action_id": str(args.get("action_id") or uuid.uuid4())[:128], "degree": degree, "state": "checking",
                           "deadline": time.monotonic() + timeout, "accepted": False,
                           "desired_changed": False, "initial_desired": self._feedback["desired_radians"]}
             self.audio._orientation_owner = self
@@ -348,6 +351,7 @@ class HeadOrientationPlugin:
                 self._log_state()
                 if not sent:
                     self._release()
+                self._finish("error")
 
     def _blocking(self):
         if self.audio._active:
@@ -371,6 +375,22 @@ class HeadOrientationPlugin:
             finally:
                 os.close(descriptor)
 
+    def _finish(self, status):
+        task = self._task
+        if not task or task.get("completion_notified") or not task.get("action_id"):
+            return
+        task["completion_notified"] = True
+        result = {"state": task["state"], "task_id": task["id"], "action_id": task["action_id"],
+                  "arrival_confirmed": False, "message": self._error}
+        try:
+            self._persist(getattr(self.audio, "_orientation_owner", None) is self)
+        except OSError as exc:
+            result["persistence_error"] = str(exc)[:128]
+        from device import _acp_notify
+        # Do not block feedback or stop on an HTTP completion callback.
+        threading.Thread(target=_acp_notify, args=(task["action_id"], status, result, self.PREFIX),
+                         daemon=True, name="u1-head-completion").start()
+
     def _log_state(self):
         print(f"[U1 head] state={self._task['state']} task={self._task.get('id', 'restored')} error={self._error[:256]!r}", flush=True)
 
@@ -391,6 +411,7 @@ class HeadOrientationPlugin:
                     self._task["state"] = "error"
                     self._error = "vendor rejected SoundSource request"
                     self._release()
+                    self._finish("error")
                 else:
                     self._task["accepted"] = True
                     if self._task["state"] == "request_pending":
@@ -403,6 +424,7 @@ class HeadOrientationPlugin:
                 self._task["state"] = "outcome_unknown"
                 self._error = str(exc)[:256]
                 self._log_state()
+                self._finish("error")
 
     def _on_feedback(self, message):
         with self._lock:
@@ -438,6 +460,7 @@ class HeadOrientationPlugin:
                     self._task["state"] = "settled_unverified"
                     self._error = "controller settled; requested orientation and physical stop remain unverified"
                     self._release()
+                    self._finish("error")  # Controller settling is not verified requested-angle completion.
             self._last_desired = desired
 
     def _tick(self):
@@ -452,8 +475,8 @@ class HeadOrientationPlugin:
                 else:
                     self._task["state"] = "timeout_unconfirmed"
                 self._error = "厂商服务未确认任务结果，保留占用；请查看任务和 blocking，不要重复转向"
-                self._persist(getattr(self.audio, "_orientation_owner", None) is self)
                 self._log_state()
+                self._finish("error")
 
     def stop(self):
         with self._lock:
@@ -462,10 +485,12 @@ class HeadOrientationPlugin:
                 if self._task["state"] == "checking":
                     self._generation += 1
                     self._task["state"] = "cancelled_before_submission"
-                    self._release()
+                    released = self._release()
+                    self._finish("cancelled" if released else "error")
                 else:
                     self._task["state"] = "stop_unconfirmed"
                     self._error = "no verified vendor cancellation; reservation retained until feedback settles"
+                    self._finish("error")
             return self._state()
 
     def close(self):
@@ -502,7 +527,8 @@ class HeadOrientationPlugin:
             if generation != self._generation or self._feedback_at is None or time.monotonic() - self._feedback_at > .5 or self._stationary_since is None or time.monotonic() - self._stationary_since < 2:
                 return {"state": "error", "message": "需要连续两秒新鲜且稳定的颈部反馈；没有解除占用"}
             self._task["state"] = "operator_acknowledged_unverified"
-            self._release()
+            if not self._release():
+                return self._state()
             self._generation += 1
             self._error = "操作者确认后仅解除本地占用；没有确认旧请求完成或物理停止"
             self._log_state()
