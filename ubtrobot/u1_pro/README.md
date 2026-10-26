@@ -125,4 +125,4 @@ actual/desired 误差 <0.02 rad、desired 每次变化 <0.001 rad 持续 1 秒�
 
 针对性离线测试：`python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py'`；
 部署配置检查：`python3 scripts/check_service_yml.py ubtrobot/u1_pro`。
-镜像增加本地 `uworld_motion_msgs` 最小接口包，以及标准 `ros-humble-control-msgs` 运行/构建依赖。
+镜像增加本地 `uworld_motion_msgs` 最小接口包，以及标准 `ros-humble-control-msgs` 运行依赖（接口构建阶段不需要 control_msgs）。

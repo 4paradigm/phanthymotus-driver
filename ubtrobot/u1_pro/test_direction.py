@@ -284,7 +284,8 @@ class DirectionTests(unittest.TestCase):
         root = Path(__file__).parent
         docker = (root / "Dockerfile").read_text()
         self.assertIn("direction.py", docker)
-        self.assertEqual(docker.count("ros-humble-control-msgs"), 2)
+        self.assertEqual(docker.count("ros-humble-control-msgs"), 1)
+        self.assertNotIn("ros-humble-control-msgs", docker.split("FROM ${ROS_BASE_IMAGE} AS runtime")[0])
         self.assertIn("float32 degree", (root / "vendor/uworld_motion_msgs/srv/SoundSource.srv").read_text())
 
 
