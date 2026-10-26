@@ -532,8 +532,8 @@ def test_target_enforces_the_execution_deadline(monkeypatch):
 
 
 @pytest.mark.parametrize('cross,target_error,state', [
-    (0.19, 0.196, 'done'),
-    (0.21, 0.216, 'error'),
+    (0.17, 0.192, 'done'),
+    (0.20, 0.219, 'error'),
 ])
 def test_target_off_axis_endpoint_acceptance_bound(monkeypatch, cross, target_error, state):
     clock = [0.0]
@@ -557,7 +557,7 @@ def test_target_off_axis_endpoint_acceptance_bound(monkeypatch, cross, target_er
         def __init__(self, slip_scale=None):
             self.slip_scale = slip_scale
             # On the along-track target + creep, but off-axis by `cross`.
-            self.position = [0.55, cross, 0.0]
+            self.position = [0.59, cross, 0.0]
             self.velocity = [0.0, 0.0, 0.0]
             self.feet = []
             self.foot_gap = 0.0

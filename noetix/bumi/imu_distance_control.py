@@ -135,10 +135,23 @@ HEADING_PULSE = 0.5
 TARGET_TURN_FIRST_DEG = 45.0
 TARGET_TURN_DONE_DEG = 2.0
 TARGET_REALIGN_DEG = 12.0
-# Walk this far past the estimated target point: the leg estimate reads ~7%
-# short of the physical travel, so stopping exactly at the estimate leaves the
-# robot visibly short.
+# Per-motion arrival compensation: the leg estimate's bias (estimated travel
+# minus physical travel) measured on hardware, banded by the initial bearing.
+# The arrival stops when the estimated along-track reaches target + creep, so the
+# physical point lands at target + creep - bias; creep = bias targets the point.
+# (1,1) at 45 deg is the unstable band: measured biases +0.26/-0.01/-0.31 m on
+# three runs, so its band only removes the average residual.
 TARGET_ARRIVAL_CREEP_M = 0.05
+TARGET_ARRIVAL_CREEP_BANDS = ((15.0, 0.09), (60.0, 0.03), (110.0, 0.15), (180.0, 0.10))
+
+
+def target_arrival_creep(bearing_deg):
+    """Measured leg-estimate bias for the motion's initial bearing."""
+    angle = abs(math.degrees(bearing_deg))
+    for limit, creep in TARGET_ARRIVAL_CREEP_BANDS:
+        if angle <= limit:
+            return creep
+    return TARGET_ARRIVAL_CREEP_BANDS[-1][1]
 # The leg estimate is the arrival feedback and reads ~0.10-0.16 m at a stopped
 # 1 m target; accept 0.20 m and report the actual value.
 TARGET_ARRIVAL_MAX_ERROR_M = 0.20
@@ -191,6 +204,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     last_command_at = None
     dead_reckoned_m = 0.0
     start_bearing = math.atan2(target_y, target_x)
+    arrival_creep = target_arrival_creep(start_bearing)
     samples, commands = [], []
 
     def publish(vx, vyaw=0):
@@ -306,7 +320,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     raise ValueError('target move made no progress toward the point')
                 if math.hypot(*source_velocity) > 1.2:
                     raise ValueError('target motion exceeds speed limits')
-                if along >= target_distance + TARGET_ARRIVAL_CREEP_M:
+                if along >= target_distance + arrival_creep:
                     brake_started = now
                 else:
                     err_deg = math.degrees(heading_error)
@@ -390,6 +404,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
         leg_stance_samples=(getattr(leg, 'stance_samples', None) if leg is not None else None),
         leg_joint_updates=(joint_updates if leg is not None else None),
         leg_slip_scale=(getattr(leg, 'slip_scale', None) if leg is not None else None),
+        arrival_creep_m=arrival_creep,
         elapsed_s=time.monotonic()-started)
     try:
         _write_trace(samples, commands, result)
