@@ -492,7 +492,7 @@ class U1CardContractTests(unittest.TestCase):
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
-            "camera_left", "camera_right",
+            "head_orientation", "sound_direction", "camera_left", "camera_right",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
@@ -768,7 +768,7 @@ class U1CardContractTests(unittest.TestCase):
                 pass
 
         with mock.patch.object(device, "VideoSharedMemoryReader", IdleReader), \
-                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.01):
+                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.5):
             result = camera.start()
         self.assertEqual(result["state"], "error")
         self.assertIn("unsupported U1 Pro video encoding", result["message"])
@@ -820,7 +820,7 @@ class U1CardContractTests(unittest.TestCase):
                 pass
 
         with mock.patch.object(device, "VideoSharedMemoryReader", IdleReader), \
-                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.01), \
+                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.5), \
                 mock.patch.object(device, "CAMERA_RIGHT_RETRY_TIMEOUT", 0.01):
             result = camera.start()
         self.assertEqual(result["state"], "running")

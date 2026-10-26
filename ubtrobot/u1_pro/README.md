@@ -31,3 +31,98 @@
 PYTHONPATH=ubtrobot/u1_pro python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py' -v
 python3 scripts/check_service_yml.py ubtrobot/u1_pro
 ```
+
+## head_orientation：水平朝向（首版待真机标定）
+
+与 `head` 播放 A010–A014 预设不同，此卡只使用 domain `2` 的
+`/mc/uworld_sound_source`（`uworld_motion_msgs/srv/SoundSource`），
+`with_waist=false`，不接入额外控制后端、不控制五个颈部舵机。
+`start` 只建立客户端、控制器状态订阅和超时定时器，不发送运动。
+
+| 动作 | 参数与结果 |
+|---|---|
+| `start` | 无参数；准备服务与只读反馈 |
+| `turn` | 必填 `degree`（有限数，暂限 ±20）、`max_vel`、`max_acc`（有限数，`0 < value <= 0.4`）；可选 `timeout`（1–60 秒，默认 15） |
+| `center` | 中立朝向与绝对/相对语义尚未确认，明确返回错误，不发送 `degree=0` |
+| `stop` | 禁止后续 turn；提交前可取消本地检查；提交后返回 `stop_unconfirmed`，不声称物理停止，不调用 SDK 音频中断 |
+| `info` | 当前任务、厂商回执、反馈、反馈年龄、错误、停止能力和角度语义 |
+
+调用示例（由操作者部署后在网页卡片中执行）：
+
+```json
+{"action":"start"}
+{"action":"turn","degree":5,"max_vel":0.1,"max_acc":0.1,"timeout":15}
+{"action":"info"}
+{"action":"stop"}
+```
+
+上例是**待验收的厂商输入**，不是已验证的“小角度低速”保证：`degree` 的正负、
+参考点、绝对/相对语义以及 MotionSetup 速度/加速度单位仍未确认。
+±20 与 0.4 仅为首版输入上限，不能由组件配置的 ±28 度推导为实际安全范围。
+`toy_zone/servo_zone` 与禁用的 `prismatic_setup` 显式置零，其厂商处理仍待验收。
+因此要求显式填写速度与加速度，不隐藏猜测值；厂商拒绝时会显示 status/message。
+
+发送前必须有 1 秒内的 `neck_base_joint` 控制器反馈，并只读确认三类自主行为均关闭。
+不会自动切换行为。与 `head`、`expression`、`tts` 原有任务双向互斥；占用期间
+`system_controls` 不能开启自主行为（仍可关闭）。这只协调本驱动，不会锁住其他厂商进程。
+
+状态包括 `checking`、`request_pending`、`accepted_unverified`、`settled_unverified`、
+`error`、`outcome_unknown`、`timeout_unconfirmed`、`stop_unconfirmed`。
+服务 success/status=0 只表示接受，**不是到位**。订阅控制器 `actual/desired` 中的
+`neck_base_joint`，原样输出弧度；直线杆不会被当成角度。
+只有 observed desired 相比提交时变化 >0.005 rad，且服务接受后连续新鲜反馈的
+actual/desired 误差 <0.02 rad、desired 每次变化 <0.001 rad 持续 1 秒，才释放共享占用，
+并标记 `settled_unverified`，`arrival_confirmed` 始终为 false。
+这证明观察到的控制器目标收敛，不能证明其对应请求角度、左右方向或中立朝向。
+首版不声明 ACP 物理完成契约，不会自动编排下一运动。
+
+超时、传输异常、无法观察目标变化或物理停止未确认时保留互斥占用；`start`、
+音频 stop 和迟到回执都不会强行释放。继续收到满足上述条件的反馈后可恢复。
+同角度无目标变化可能一直保持未确认，这是有意保守的限制。请先人工确认机器人状态、
+排除外部控制后再由操作者决定恢复驱动，不能将重启驱动视为停止机器人。
+
+## sound_direction：只读声源方向
+
+已于 2026-10-26 只读核实：domain `20` 的 `/robo/audio/subscribe/doa_event`
+实际为 **`std_msgs/msg/String`**；Adapter 二进制表明其转发 `azimuth/confidence`。
+同运行包 `/opt/walker/audio_msgs/share/audio_msgs/idls/audio_msgs/msg/DoaEvent.msg`
+注明 `azimuth` 单位度、`[-180,180)`、左负右正、0°通常为正前方，confidence 为 `[0,1]`。
+没有收到短时采样事件，未验证实时 JSON 样本、是否相对头部或设备安装坐标。
+解析支持 JSON 对象和 SDK `data` 包裹；不直接订阅仓库的 typed DoaEvent，不增加假消息定义。
+
+```json
+{"action":"start","stale_after":2,"alpha":0.35}
+{"action":"info"}
+{"action":"stop"}
+```
+
+`stale_after` 范围 0.1–60 秒，默认 2；`alpha` 范围 0.01–1，默认 0.35。
+采用环形角度指数平滑，避免 +179/-179 被平均成零；过期或无效事件后重新初始化平滑。
+输出 `/{ros_namespace}/u1_pro/sound_direction`，格式 `data/json`，并在 `info` 返回同一结构：
+
+- `direction_degrees`：有效时的平滑角度；无数据、停用、解析错误或过期时为 null。
+- `valid`、`stale`、`age_seconds`、`received_at`（接收端 Unix 秒）；不把接收时间冒充设备时间。
+- `raw_degrees`、`last_direction_degrees`：保留最近样本供诊断，不表示当前仍有效。
+- `confidence`：SDK 提供的原始置信度，缺失为 null，不合成置信度；不对置信度另设猜测门限。
+- `unit`、`coordinate_convention`、`error`：明确角度约定、参考系限制和解析错误。
+
+新事件立即发布；本地定时器在过期时发布一次无效状态，stop 也发布无效状态并退订。
+不启用厂商唤醒、跟随或自主行为，不向 head_orientation 发送任何命令。
+若未收到事件，应检查既有厂商事件生产条件，卡片不会为获取事件而修改行为开关。
+
+## 网页验收（由操作者执行）
+
+1. 自行部署 PR 的 Try it 镜像，确认原 8 张卡片和新增两张卡片均存在。
+2. 先验收 sound_direction：start 后静默时为无数据/null；在不同方向发声，核对
+   原始角度、左右符号、坐标参考系、真实置信度；静默超过 2 秒确认失效，stop 后不再采集。
+   不要将 DOA 数值直接连到 SoundSource.degree。
+3. 在确认安全作业条件后，head_orientation start/info 应只显示新鲜反馈，不产生动作。
+   三类自主行为需由操作者确认关闭，先校验越界参数拒绝，再单次提交上例并观察实际方向、
+   幅度、服务回执、控制器反馈与保持状态，记录绝对/相对语义及速度单位。
+4. 转向占用期间尝试 head/expression/tts 和开启自主行为，确认被拒绝；
+   测试 stop/超时显示未确认而非完成，观察稳定反馈恢复路径。center 应明确拒绝，不能误报回中。
+5. 回中和物理停止需进一步确认厂商接口后再实现；首版只分别验收两张卡片，不做自动联动。
+
+针对性离线测试：`python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py'`；
+部署配置检查：`python3 scripts/check_service_yml.py ubtrobot/u1_pro`。
+镜像增加本地 `uworld_motion_msgs` 最小接口包，以及标准 `ros-humble-control-msgs` 运行/构建依赖。
