@@ -235,8 +235,9 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                 # turn-first/realign phases and let the first walking sample
                 # re-establish the baseline. Braking still integrates (the stop
                 # slide is real travel and must be in the reported endpoint).
-                turning = (motion_started is not None and walking is not True
-                           and brake_started is None)
+                turning = ((motion_started is not None and walking is not True
+                            and brake_started is None)
+                           or final_align_deadline is not None)
                 leg.observe(joints, raw.ori, now, frozen=turning)
                 values = joint_angles(joints)
                 if values != last_joints:

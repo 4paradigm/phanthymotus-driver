@@ -531,7 +531,7 @@ def test_target_enforces_the_execution_deadline(monkeypatch):
     assert 'time limit' in result['error']
 
 
-def test_target_reports_the_pose_after_the_heading_alignment(monkeypatch):
+def test_target_final_alignment_does_not_corrupt_the_stopped_pose(monkeypatch):
     clock = [0.0]
     commands = []
 
@@ -594,9 +594,11 @@ def test_target_reports_the_pose_after_the_heading_alignment(monkeypatch):
     monkeypatch.setattr(module.time, 'sleep', advance)
     result = module.run_target(owner, 0.5, 0.0)
     assert result['state'] == 'done', result.get('error')
-    # The pre-align pose was ~0.05 m from the point; the alignment slide must
-    # be in the reported endpoint (>= 0.12 m), not silently dropped.
-    assert result['final_position_error_m'] >= 0.12, result['final_position_error_m']
+    # The comfort alignment is a pure in-place rotation: the leg pose is frozen
+    # during it, so the reported endpoint stays the stable stopped pose and the
+    # rotation's footwork noise cannot fake a slide (hardware saw an estimate
+    # drift of 0.19 m during a 2 deg align while the robot moved ~0.10 m).
+    assert result['final_position_error_m'] <= 0.10, result['final_position_error_m']
 
 
 @pytest.mark.parametrize('cross,target_error,state', [
