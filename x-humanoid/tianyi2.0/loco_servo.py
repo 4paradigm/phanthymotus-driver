@@ -552,20 +552,22 @@ class LocoServoPlugin:
                 started = time.monotonic()
                 wall_ms = int(time.time() * 1000)
                 received_mono = received_at[0] if received_at is not None else started
-                # TTL still rejects stale input at the sink. Once admitted,
-                # motion follows a bounded receive watchdog instead of the
-                # producer's per-frame TTL. IPC/SDK waits spend this original
-                # receive budget; neither processing nor ACK starts a new one.
+                # TTL and observation age are admission checks at the sink
+                # (stale input is dropped without stopping current motion, as
+                # on R1). Once admitted, motion follows only the receive
+                # watchdog. An obs_stamp_ms + 500 execution deadline left a
+                # 400ms-old detection <100ms of lease at 10Hz: every frame
+                # soft-zeroed and the shared clamp restarted from 0, capping
+                # output at one step (0.03 m/s, 0.2 rad/s). IPC/SDK waits
+                # spend this original receive budget; nothing renews it.
                 receive_remaining_ms = math.floor(
                     WATCHDOG_MS - max(0.0, started - received_mono) * 1000)
-                self._command_deadline_ms = min(
-                    wall_ms + receive_remaining_ms,
-                    command.get("obs_stamp_ms", command["stamp_ms"]) + MAX_OBS_AGE_MS)
+                self._command_deadline_ms = wall_ms + receive_remaining_ms
                 self._command_cancel_deadline_ms = wall_ms + math.floor(
                     CANCEL_AFTER_MS - max(0.0, started - received_mono) * 1000)
                 self._last_timing = {
                     "seq": command.get("seq"), "ttl_ms": command.get("ttl_ms"),
-                    "execution_deadline_basis": "receive_watchdog_and_observation",
+                    "execution_deadline_basis": "receive_watchdog",
                     "receive_watchdog_ms": WATCHDOG_MS,
                     "cancel_after_ms": CANCEL_AFTER_MS,
                     "receive_age_ms": (received_at[1] - command["stamp_ms"]
@@ -686,7 +688,7 @@ class LocoServoPlugin:
             requested[0] = requested[1] = 0.0
         motion_requested = any(requested)
         if motion_requested and self._command_deadline_ms <= time.time() * 1000:
-            raise CommandLeaseExpired("receive watchdog or observation deadline expired before apply")
+            raise CommandLeaseExpired("receive watchdog expired before apply")
         if motion_requested:
             problem = self._standing_problem()
             if problem:
@@ -770,7 +772,7 @@ class LocoServoPlugin:
         self._soft_held = True
         if self._sink is not None:
             self._sink.rebase(self._last_output)
-        self._record("SOFT_HOLD", "receive watchdog or observation deadline expired; action retained")
+        self._record("SOFT_HOLD", "receive watchdog expired; action retained")
 
     def _hold(self, *_args):
         self._counts["holds"] += 1
@@ -899,7 +901,7 @@ class LocoServoPlugin:
             "input_queue": self._inbox.info(),
             "dispatch": {"mode": "dedicated_worker", "watchdog_poll_ms": 20,
                          "step_limiter": "shared_control_sink", "step_basis": "per_command",
-                         "execution_deadline_basis": "receive_watchdog_and_observation",
+                         "execution_deadline_basis": "receive_watchdog",
                          "receive_watchdog_ms": WATCHDOG_MS,
                          "cancel_after_ms": CANCEL_AFTER_MS,
                          "staged_stop": self._native_staged_stop(),

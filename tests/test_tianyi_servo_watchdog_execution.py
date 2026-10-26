@@ -171,21 +171,25 @@ def test_native_stale_reply_preserves_old_deadlines_and_motion(setup, monkeypatc
     assert not plugin._backend.stop_calls and not plugin._backend.soft_stop_calls
 
 
-def test_observation_limit_is_500ms_in_admission_and_execution(setup):
+def test_observation_limit_is_500ms_admission_only(setup):
     plugin = start(setup)
     assert plugin._info()["control_interface"]["rate"]["max_obs_age_ms"] == 500
     now = int(setup.clock.time() * 1000)
     send(plugin, command(setup, obs_stamp_ms=now - 450))
     assert plugin._counts["accepted"] == 1
-    assert plugin._backend.deadlines[-1] == now + 50
+    assert plugin._backend.deadlines[-1] == now + 300  # Receipt lease, not obs + 500.
     cancel = plugin._cancel_deadline_ms
     setup.clock.advance(0.06)
     plugin._tick()
-    assert plugin._soft_held and plugin._cancel_deadline_ms == cancel
-    assert not plugin._backend.stop_calls
+    assert not plugin._soft_held and any(plugin._last_output)
+    # Too old to admit: dropped, and the current motion is not stopped by it.
     send(plugin, command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 501))
     assert plugin._counts["accepted"] == 1 and plugin._counts["dropped"] == 1
-    assert plugin._cancel_deadline_ms == cancel and len(plugin._backend.soft_stop_calls) == 1
+    assert any(plugin._last_output) and not plugin._backend.soft_stop_calls
+    setup.clock.advance(0.25)  # 310ms since the accepted receipt.
+    plugin._tick()
+    assert plugin._soft_held and plugin._cancel_deadline_ms == cancel
+    assert len(plugin._backend.soft_stop_calls) == 1 and not plugin._backend.stop_calls
 
 
 def test_repeated_new_packets_cannot_extend_one_old_observation(setup):
@@ -196,13 +200,16 @@ def test_repeated_new_packets_cannot_extend_one_old_observation(setup):
         setup.clock.advance(began + elapsed - setup.clock.monotonic())
         send(plugin, command(setup, seq=seq, obs_stamp_ms=observation))
     cancel = plugin._cancel_deadline_ms
-    assert plugin._lease_expiry_ms == observation + 500
-    setup.clock.advance(0.101)
+    assert plugin._lease_expiry_ms == observation + 400 + 300  # Last receipt + 300.
+    setup.clock.advance(0.101)  # Observation now 501ms old: no longer admissible.
     send(plugin, command(setup, seq=4, obs_stamp_ms=observation))
     assert plugin._counts["accepted"] == 3 and plugin._counts["dropped"] == 1
+    assert plugin._lease_expiry_ms == observation + 700  # The dropped packet renewed nothing.
+    setup.clock.advance(0.20)
+    plugin._tick()
     assert plugin._soft_held and plugin._cancel_deadline_ms == cancel
     assert not plugin._backend.stop_calls
-    setup.clock.advance(0.90)
+    setup.clock.advance(0.71)
     plugin._tick()
     assert plugin._backend.stop_calls == 1
 

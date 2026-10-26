@@ -210,6 +210,13 @@ def send(plugin, cmd):
     plugin._tick()  # One deterministic control iteration, without a live thread.
 
 
+def send_received_earlier(setup, plugin, cmd, seconds):
+    """Deliver cmd as if its callback ran `seconds` ago (shorter receipt lease)."""
+    received = (setup.clock.monotonic() - seconds, int(setup.clock.time() * 1000 - seconds * 1000))
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)), None, received)
+    plugin._tick()
+
+
 def test_startup_is_inert_and_domain_routing_is_correct(setup):
     plugin = setup.create()
     plugin.start()
@@ -677,7 +684,7 @@ def test_timing_separates_input_ttl_age_from_receipt_watchdog_budget(setup):
     assert timing["local_wait_ms"] == pytest.approx(30)
     assert timing["command_age_ms"] == 120
     assert timing["remaining_before_apply_ms"] == pytest.approx(270, abs=1)
-    assert timing["execution_deadline_basis"] == "receive_watchdog_and_observation"
+    assert timing["execution_deadline_basis"] == "receive_watchdog"
     assert timing["receive_watchdog_ms"] == 300
     assert plugin._backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 90 + 300, abs=1)
 
@@ -950,9 +957,9 @@ def test_atomic_expiry_update_restarts_both_ramps_from_zero(setup):
 ])
 def test_invalid_fresh_frame_cannot_use_atomic_expiry_update(setup, extra):
     plugin = start(setup, atomic_expiry_update=True)
-    # Make the observation lease expire before the source ownership timeout.
+    # Make the receipt lease expire before the source ownership timeout.
     # Lower-priority input must still fail arbitration against the live owner.
-    send(plugin, command(setup, obs_stamp_ms=int(setup.clock.time() * 1000) - 350))
+    send_received_earlier(setup, plugin, command(setup), 0.15)
     setup.clock.advance(0.16)
     send(plugin, command(setup, seq=2) | extra)
     assert plugin._counts["accepted"] == 1
@@ -1083,10 +1090,9 @@ def test_unrelated_or_unordered_motion_stays_queued_after_stop(setup, monkeypatc
 
 def test_refresh_cannot_bypass_source_arbitration_for_a_pending_zero(setup, monkeypatch):
     plugin = start(setup, staged_stop=False)
-    # The old observation expires in 150ms, leaving the source ownership
+    # The receipt lease expires in 150ms, leaving the source ownership
     # valid through the 80ms confirmed-stop round trip below.
-    send(plugin, command(setup, source="owner", priority=10,
-                         obs_stamp_ms=int(setup.clock.time() * 1000) - 350))
+    send_received_earlier(setup, plugin, command(setup, source="owner", priority=10), 0.15)
     setup.clock.advance(0.16)
     queue_during_stop(setup, plugin, monkeypatch, lambda: command(
         setup, [0] * 6, seq=3, source="other", priority=0))
@@ -1436,15 +1442,32 @@ def test_disabling_dry_run_requires_successful_readonly_sdk_connect(setup):
     assert not plugin._backend.messages
 
 
-def test_sdk_lease_uses_receipt_watchdog_and_observation_deadline(setup):
+def test_sdk_lease_uses_receipt_watchdog_only(setup):
     plugin = start(setup)
     cmd = command(setup, ttl_ms=150)
     send(plugin, cmd)
     assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 300, abs=1)
     setup.clock.advance()
+    # Observation age only gates admission: a 450ms-old detection still gets
+    # the full receipt lease instead of 50ms.
     cmd = command(setup, seq=2, obs_stamp_ms=int(setup.clock.time() * 1000) - 450)
     send(plugin, cmd)
-    assert plugin._backend.deadlines[-1] == cmd["obs_stamp_ms"] + 500
+    assert plugin._backend.deadlines[-1] == pytest.approx(cmd["stamp_ms"] + 300, abs=1)
+
+
+def test_old_but_admissible_observations_do_not_cap_output_at_one_step(setup):
+    # Regression: with obs_stamp_ms + 500 as an execution deadline, a steady
+    # 10Hz stream of ~420ms-old detections soft-zeroed every frame and the
+    # shared clamp restarted from zero, holding output at 0.03 m/s / 0.2 rad/s.
+    plugin = start(setup)
+    for seq in range(1, 31):
+        now = int(setup.clock.time() * 1000)
+        send(plugin, command(setup, [0.2, 0, 0, 0, 0, 0.8], seq=seq, obs_stamp_ms=now - 420))
+        for _ in range(5):
+            setup.clock.advance(0.02)
+            plugin._tick()
+    assert plugin._counts["soft_holds"] == 0 and plugin._counts["holds"] == 0
+    assert plugin._last_output == pytest.approx([0.2, 0, 0, 0, 0, 0.8])
 
 
 def test_unconfirmed_stop_refuses_stop_resume_config_and_handover(setup):
@@ -1776,7 +1799,7 @@ def test_native_stale_ack_rebases_only_a_confirmed_real_zero(setup, monkeypatch,
     old_output_time = plugin._last_output_at
 
     def expire_during_sdk(values, deadline, **options):
-        assert deadline < old_motion  # New observation leaves only 10ms.
+        assert deadline < old_motion  # Late receipt leaves only 10ms.
         setup.clock.advance(0.02)
         assert old_motion > setup.clock.time() * 1000
         if confirmed_zero:
@@ -1786,8 +1809,7 @@ def test_native_stale_ack_rebases_only_a_confirmed_real_zero(setup, monkeypatch,
 
     with monkeypatch.context() as patch:
         patch.setattr(backend, "write", expire_during_sdk)
-        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=11,
-                             obs_stamp_ms=int(setup.clock.time() * 1000) - 490))
+        send_received_earlier(setup, plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=11), 0.29)
     assert plugin._counts["accepted"] == 10 and plugin._counts["dropped"] == 1
     assert plugin._last["verdict"] == "DROPPED"
     assert plugin._last_valid_at == old_receipt

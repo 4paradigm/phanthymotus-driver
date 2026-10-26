@@ -206,20 +206,23 @@ acknowledged idle), not network RPCs or measured physical motion.
 The backend state/action ID describe the last acknowledgement, not a substitute
 for odometry feedback; verify physical motion with `loco_state`.
 
-Input TTL is an admission check: an already-stale command is still dropped and
-cannot resume motion or renew the watchdog. Once admitted, a command no longer
-stops motion at its producer's per-frame TTL (commonly 200ms). Its execution
-deadline instead ends 300ms after the original ROS/bridge callback
-receipt, or at `obs_stamp_ms + 500ms`, whichever is sooner. Input age/TTL failures
+Input TTL and observation age (500ms) are admission checks: an already-stale
+command is dropped and cannot resume motion or renew the watchdog. Once
+admitted, a command no longer stops motion at its producer's per-frame TTL
+(commonly 200ms). Its execution deadline ends 300ms after the original
+ROS/bridge callback receipt; observation age does not shorten it. (With
+`obs_stamp_ms + 500ms` as an execution deadline, a 10Hz stream of ~400ms-old
+detections expired every frame and the per-frame clamp restarted from zero,
+capping output at one step.) Input age/TTL failures
 only drop the stale frame: they do not immediately stop a previously valid
 command or renew either deadline. The motion deadline sets velocity to zero
 without cancelling the held SDK action or its firmware heartbeat. A fresh
 accepted frame can then update the same action directly. If no new valid frame
 arrives for 1000ms, the action is cancelled and its heartbeat stops.
 IPC, local queue and SDK reply time consume the original receive budgets,
-never renew them. New commands cannot renew an old observation's deadline.
-`control_interface.rate.watchdog_ms` reports 300 and `max_obs_age_ms` reports
-500, matching admission and execution checks. Deploy Python and the native
+never renew them. A detection older than 500ms is never admitted, however
+many new packets reuse it. `control_interface.rate.watchdog_ms` reports 300 and
+`max_obs_age_ms` reports 500 (admission). Deploy Python and the native
 worker together; staged stopping requires the worker's advertised capability.
 Python uses the original monotonic receipt time for its silence watchdog; the
 native layer receives the remaining bounded execution deadline and independently
@@ -342,7 +345,7 @@ measures generation-to-driver-callback age; `local_wait_ms` measures callback-to
 submission delay, including any synchronous stop before submission. These
 measurements are tied to that selected frame, even if a newer one has arrived.
 `dispatch.execution_deadline_basis` and the same field in `last_command_timing`
-are `receive_watchdog_and_observation`; `receive_watchdog_ms` is 300. `ttl_ms`
+are `receive_watchdog`; `receive_watchdog_ms` is 300. `ttl_ms`
 remains the producer's input freshness limit and is not the execution lease.
 Continuous
 publication alone cannot guarantee continuous motion: expired observations,
@@ -379,7 +382,7 @@ Legacy workers with the `ZERO` capability can also retain an existing action
 across a ramp crossing; older workers safely fall back to stopping. Neither
 zero path creates an action while idle. Explicit all-zero input still
 stops/cancels immediately, and
-the 300ms receive watchdog, 500ms observation limit and one-second cancellation
+the 300ms receive watchdog, 500ms observation admission limit and one-second cancellation
 deadline still apply.
 
 Configure loco_servo exposes live settings via `action: config`:
