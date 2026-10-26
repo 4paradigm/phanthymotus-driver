@@ -1,3 +1,4 @@
+import math
 """Angle math, control law, and closed-loop rotate for the Bumi loco_target card."""
 
 import __future__
@@ -282,6 +283,25 @@ def test_loco_target_tool_schema_contract(monkeypatch):
     assert props['direction']['type'] == 'string'
     assert 'enum' not in props['direction']  # plain input, not another dropdown
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
+
+
+def test_target_heading_feedback_sign_is_a_correction(monkeypatch):
+    """The target feedback must turn away from the drift, not into it.
+
+    angle_delta(a, b) is a - b; the Bumi yaw is CCW-positive (left positive).
+    A 10 deg LEFT drift gives a positive relative heading, and a target straight
+    ahead (bearing 0) must produce a NEGATIVE (right) correction.
+    """
+    module, _ = _load_device(monkeypatch)
+    import imu_distance_control as idc
+    origin = math.radians(-20.0)
+    current = origin + math.radians(10.0)   # drifted 10 deg left
+    heading = idc.angle_delta(current, origin)
+    error = idc.angle_delta(0.0, heading)   # target straight ahead
+    assert heading == pytest.approx(math.radians(10.0))
+    assert error == pytest.approx(-math.radians(10.0))
+    # The suggested 'bearing + heading' would give +10 deg (a left command).
+    assert idc.angle_delta(origin, current) == pytest.approx(-math.radians(10.0))
 
 
 def test_target_action_schema_and_preflight(monkeypatch):
