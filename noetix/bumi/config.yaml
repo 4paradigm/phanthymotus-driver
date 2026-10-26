@@ -65,7 +65,10 @@ plugins:
 
   payload_mass:
     enabled: true
-    # Requires state + loco; recordings and mass calibration are per-robot.
+    setup_mode: quick
+    arm: left
+    hold_duration_s: 300
+    # Quick prototype: set recording_id in the canvas gear, then calibrate once per session.
     data_dir: /opt/phanthy-motus/data/bumi/weighing_trials
     profiles_file: /opt/phanthy-motus/data/bumi/weighing.json
     hardware_id: ""

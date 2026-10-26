@@ -193,7 +193,12 @@ class SharedSampler:
 def check_frame(frame, p):
     if frame["workmode"] != p["workmode"] or frame["workmode"] in (26,30):
         raise MassError("MODE_MISMATCH", "workmode/protection differs from profile")
-    if any(frame["errors"]):
+    if p.get("setup_mode") == "quick":
+        # Match the existing motion_state distinction: known fault codes block,
+        # undocumented status (e.g. 1) remains visible in the prototype output.
+        if set(frame["errors"]) & {2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
+            raise MassError("MOTOR_FAULT", "documented motor fault")
+    elif any(frame["errors"]):
         raise MassError("MOTOR_FAULT", "nonzero motor error (including undocumented codes)")
     if max(frame["temperature"]) >= p["max_temperature_c"]:
         raise MassError("OVER_TEMPERATURE", "temperature exceeds engineer-confirmed limit")

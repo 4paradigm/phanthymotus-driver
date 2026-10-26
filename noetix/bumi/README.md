@@ -448,9 +448,9 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
-## 手臂实时称重
+## 五分钟手臂实时称重
 
-`payload_mass`：空载曲肘并保持 → 先点击测量重量再挂物 → 数字实时刷新，稳定后读取kg
-→ 取下物体后点击本卡停止，退出回放并核验自然收臂。仅需一个曲肘保持示教编号，
-不录制收臂动作。首次配置、实物标定及测试见 [PAYLOAD_MASS.md](PAYLOAD_MASS.md)。
-持续曲肘与停止后自然收臂均待真机验证。
+`payload_mass`默认快速版：齿轮填写曲肘示教编号，自动采空载和姿态；先点击测量再挂物，
+用一个已知重量做本次会话的快速校准，随后换物实时显示kg，取下后点击停止自然收臂。
+无需先填写工程JSON。快速版保留实验性标记；工程模式可继续做多试次标定。
+操作和无机器人演示见 [PAYLOAD_MASS.md](PAYLOAD_MASS.md)。

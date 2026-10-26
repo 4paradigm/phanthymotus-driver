@@ -11,27 +11,42 @@
 
 不要先挂物再点击测量；程序会检查点击时是否空载，且不会用挂载数据重新去皮。
 
-## 首次真机准备
+## 五分钟快速版：直接操作
 
-本PR尚未部署或验证机器人。先由Master验证以下事项，再填写
-`resource/payload_mass_profiles.example.json`：
+默认已启用 `setup_mode: quick`。首次调试不需要填写工程JSON、机器人身份或人工关节角度。
 
-- 一个曲肘示教编号 `motion.bend_recording_id`，动作后能够持续保持，直到停止。
-- 停止回放后手臂自然回到下垂姿态；记录 `motion.home_q` 和现场证据，确认
-  `motion.return_on_stop_verified`。归位通过已有停止回放接口完成，不新建收臂示教。
-- 真实机器人和SDK/固件身份、motor ID映射、姿态、机身方向、温度与载荷实验范围。
-- 力矩反馈的刷新、载荷响应和错误语义。SDK getter没有源时间戳，读取成功不能
-  证明传感器刷新；默认拒绝host-only反馈，核实后才可设置
-  `accept_host_only_freshness=true` 并填写 `feedback_evidence`。非零error不被忽略。
-- 需要在mode 23保持时，profile必须提供 `playback_hold_verified=true` 和 `hold_evidence`。
+1. 用现有action_recording录制：双臂下垂 → 曲肘 → 原姿态停留约5分钟，保存一个编号。
+2. 在payload_mass卡片齿轮里填写该 `recording_id`，选挂载侧 `arm`（默认left），保存。
+   `hold_duration_s`默认300秒，与录制的总时长对应。
+3. 空载、保留挂具，选择 **曲肘** 执行，等 `ready`。程序自动记录起始下垂姿态、
+   检测实际曲肘，并采集空载基线，无需手填角度。
+4. 选择 **测量重量**，先点击执行，再挂一个电子秤称过的参考物体（不超过0.5kg）。
+   等约3秒稳定后，选择 **校准参考重量**，在 `known_mass_kg` 填实测kg，执行。
+   例如电子秤读数200g，填写0.200。
+5. 不停止测量，取下参考物体，换挂待测物体；监视窗口中的 `mass_kg` 持续刷新，
+   `stable=true`后读取。取下物体后数字回到接近0。
+6. 在五分钟回放到时前，取下物体，点击本卡画布 **停止**，程序退出回放并检查自然收臂。
 
-**录制动作会自动回到下垂姿态，并不能证明它能保持曲肘。必须先验证保持能力。**
-不能保持时，本卡会报姿态/模式错误，不循环重放，不下发全身低层关节命令来补保持。
+每次重新开始曲肘会话，会重新采空载并清除上次快速校准；本次会话中只需校准一次。
+快速版使用一个参考物体形成实验性比例换算，输出标记 `experimental=true`、
+`quality=experimental_single_reference`、`validation_status=not_validated`，不等同于精度验收。
+未校准时只显示采集状态和稳定数据文件，不生成虚假的kg。
 
-配置保存于持久目录 `/opt/phanthy-motus/data/bumi/weighing.json`。卡片齿轮可更改
-该绝对路径。`hardware_id`、`sdk_version`须与config.yaml或部署环境变量
-`BUMI_PAYLOAD_ROBOT_ID`、`BUMI_PAYLOAD_SDK_VERSION`一致。
-模板未填真实参数时不能开始动作；初始model为null。
+`remaining_s`显示本次示教剩余时间。到时或实际姿态改变后，旧重量清空；程序不会循环
+重新播放示教。当前版本沿用示教中记录的五分钟保持段，不切换全身低层控制。
+
+快速版沿用motion_state的错误语义：已记录的故障码会终止测量；未说明的状态值
+保留在 `unknown_status_codes` 和原始反馈中，不被标成“已验证无故障”。
+
+## 工程配置模式（后续精度优化可选）
+
+齿轮中选择 `setup_mode: profile` 后，使用 `profiles_file` 指向原工程配置。
+`resource/payload_mass_profiles.example.json`为此模式的模板，需要实测姿态和参数。
+身份仍与config.yaml或部署环境变量 `BUMI_PAYLOAD_ROBOT_ID`、`BUMI_PAYLOAD_SDK_VERSION`
+匹配；mode 23需要原有保持证据。该模式不使用单参考快速校准。
+
+工程配置模式的安装位置默认 `/opt/phanthy-motus/data/bumi/weighing.json`。
+默认快速版无需创建这个文件；不需要单独录制收臂动作。
 
 ## 实时读数与稳定状态
 
@@ -50,9 +65,11 @@
 启动反馈后停止；确认不了时保留占用并返回 `STOP_UNCONFIRMED`，不提前放行。
 驱动关闭/其他动作的紧急停止可中断任务；与本卡画布停止并核验自然收臂不同。
 
-## 已知质量标定
+## 工程模式多试次标定（可选）
 
-没有model时仍可采集：实时读数为null、状态 `NOT_CALIBRATED`；稳定窗口自动保存
+以下离线工具针对工程模式的数据；快速版按上面的单次参考校准操作即可。
+
+工程模式没有model时仍可采集：实时读数为null、状态 `NOT_CALIBRATED`；稳定窗口自动保存
 原始数据，并返回 `trial_file`。同一连续稳定区段不会每次刷新都重复存盘。
 
 准备电子秤和同一挂具，采集：
@@ -101,3 +118,13 @@ git diff --check
 
 关闭自动插件加载以避开ROS Jazzy/Conda插件冲突。机器人继续使用原ROS Humble容器；
 新增实现仅有Python源码，无新增apt/pip依赖。离线标定工具留在开发仓库，不打入运行镜像。
+
+## 无机器人演示
+
+```bash
+python3 scripts/demo_bumi_scale.py --output /tmp/bumi-scale-demo
+```
+
+运行真实快速版采样/拟合/滚动显示代码，关节反馈和动作由模拟器提供。
+演示参考物体0.20kg、未知物体0.35kg、卸载0kg和停止归位；报告带
+`simulation_only=true`，不能作为真机精度结果。
