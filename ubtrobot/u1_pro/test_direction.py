@@ -51,7 +51,7 @@ class DirectionTests(unittest.TestCase):
         # A synchronous thread double makes worker/future tests deterministic.
         with mock.patch.object(direction.threading, "Thread") as thread:
             thread.side_effect = lambda target, args, **kw: types.SimpleNamespace(start=lambda: target(*args))
-            plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, **args))
+            plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, confirm=True, **args))
 
     def test_actual_string_envelope_and_missing_confidence(self):
         event = types.SimpleNamespace(data=json.dumps({"code": "EVENT", "data": {"azimuth": 12, "confidence": .8}}))
@@ -119,13 +119,24 @@ class DirectionTests(unittest.TestCase):
         plugin, _, _ = self.head()
         for args in ({"degree": 21}, {"degree": True}, {"degree": float("nan")},
                      {"max_vel": 0}, {"max_acc": -1}, {"timeout": 0}):
-            values = dict(degree=5, max_vel=.1, max_acc=.1)
+            values = dict(degree=5, max_vel=.1, max_acc=.1, confirm=True)
             values.update(args)
             with self.assertRaises(ValueError):
                 plugin.turn(values)
         plugin._feedback_at -= 2
-        self.assertIn("fresh neck", plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1))["message"])
+        self.assertIn("fresh neck", plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, confirm=True))["message"])
         plugin._client.call_async.assert_not_called()
+
+    def test_turn_requires_strict_explicit_confirmation(self):
+        plugin, audio, _ = self.head()
+        for confirm in (None, False, "true", 1):
+            args = dict(degree=5, max_vel=.1, max_acc=.1)
+            if confirm is not None:
+                args["confirm"] = confirm
+            self.assertEqual(plugin.turn(args)["state"], "error")
+            self.assertIsNone(audio._orientation_owner)
+        plugin._client.call_async.assert_not_called()
+        self.assertTrue(plugin.get_tool()["inputSchema"]["x-is-dangerous"])
 
     def test_single_backend_request_and_acceptance_not_arrival(self):
         plugin, audio, nodes = self.head()
@@ -192,7 +203,7 @@ class DirectionTests(unittest.TestCase):
             self.assertIsNone(audio._orientation_owner)
         plugin, audio, _ = self.head()
         audio._active = {"action_id": "existing"}
-        self.assertEqual(plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1))["state"], "error")
+        self.assertEqual(plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, confirm=True))["state"], "error")
         plugin._client.call_async.assert_not_called()
         audio._active = None
         plugin._client.call_async.side_effect = RuntimeError("transport error")
@@ -213,7 +224,7 @@ class DirectionTests(unittest.TestCase):
             resume.wait(2)
             return {"code": "OK", "data": {"enabled": False}}
         nodes.get_system_enabled.side_effect = read_state
-        plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1))
+        plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, confirm=True))
         self.assertTrue(entered.wait(1))
         self.assertEqual(plugin.stop()["state"], "cancelled_before_submission")
         resume.set()
@@ -230,7 +241,7 @@ class DirectionTests(unittest.TestCase):
                 nodes.trigger_call.return_value = response
             with mock.patch.object(device, "_acp_notify") as notify:
                 self.assertEqual(audio.stop()["state"], "interrupt_unconfirmed")
-                self.assertEqual(plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1))["state"], "error")
+                self.assertEqual(plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, confirm=True))["state"], "error")
                 notify.assert_not_called()
                 audio._on_playback_state({"phase": "result", "uuid": "unrelated", "state_name": "COMPLETED"})
                 self.assertIsNotNone(audio._active)

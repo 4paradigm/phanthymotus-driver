@@ -198,16 +198,18 @@ class HeadOrientationPlugin:
     def get_tool(self):
         schema = action_schema({
             "start": ([], "Prepare service client and read-only neck feedback; no movement."),
-            "turn": (["degree", "max_vel", "max_acc", "timeout"], "Submit vendor degree, with_waist=false. Coordinate semantics need hardware validation."),
+            "turn": (["degree", "max_vel", "max_acc", "timeout", "confirm"], "Submit vendor degree, with_waist=false. Coordinate semantics need hardware validation."),
             "center": ([], "Unavailable until neutral orientation is confirmed; sends no command."),
             "stop": ([], "Disable new turns; physical cancellation is unverified and no stop command is sent."),
             "info": ([], "Read task, controller feedback and errors; acceptance never means arrival."),
         }, {
+            "confirm": {"type": "boolean", "description": "Must be true for operator hardware acceptance of uncalibrated vendor motion; omitted/false sends no command."},
             "degree": {"type": "number", "minimum": -20, "maximum": 20, "description": "Vendor degree, provisional ±20 input cap; absolute/relative and sign unverified."},
             "max_vel": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.4, "description": "MotionSetup vendor units, unverified. Explicit value required; no speed guarantee."},
             "max_acc": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.4, "description": "MotionSetup vendor units, unverified. Explicit value required."},
             "timeout": {"type": "number", "minimum": 1, "maximum": 60, "default": 15},
         })
+        schema["x-is-dangerous"] = True
         return tool(self.PREFIX, "actuator", "头部水平转向：单一厂商 SoundSource 路径；回中、物理停止与角度语义待真机验收。", schema)
 
     def start(self):
@@ -245,6 +247,8 @@ class HeadOrientationPlugin:
         if velocity == 0 or acceleration == 0:
             raise ValueError("max_vel and max_acc must be positive")
         timeout = number(args.get("timeout", 15), "timeout", 1, 60)
+        if args.get("confirm") is not True:
+            return {"state": "error", "message": "uncalibrated vendor motion requires explicit confirm=true for operator hardware acceptance; no command sent"}
         with self._lock:
             if not self.running:
                 return {"state": "error", "message": "start head_orientation first"}

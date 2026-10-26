@@ -42,7 +42,7 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 | 动作 | 参数与结果 |
 |---|---|
 | `start` | 无参数；准备服务与只读反馈 |
-| `turn` | 必填 `degree`（有限数，暂限 ±20）、`max_vel`、`max_acc`（有限数，`0 < value <= 0.4`）；可选 `timeout`（1–60 秒，默认 15） |
+| `turn` | 必填 `confirm: true`、`degree`（有限数，暂限 ±20）、`max_vel`、`max_acc`（有限数，`0 < value <= 0.4`）；可选 `timeout`（1–60 秒，默认 15） |
 | `center` | 中立朝向与绝对/相对语义尚未确认，明确返回错误，不发送 `degree=0` |
 | `stop` | 禁止后续 turn；提交前可取消本地检查；提交后返回 `stop_unconfirmed`，不声称物理停止，不调用 SDK 音频中断 |
 | `info` | 当前任务、厂商回执、反馈、反馈年龄、错误、停止能力和角度语义 |
@@ -51,10 +51,14 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 
 ```json
 {"action":"start"}
-{"action":"turn","degree":5,"max_vel":0.1,"max_acc":0.1,"timeout":15}
+{"action":"turn","degree":5,"max_vel":0.1,"max_acc":0.1,"timeout":15,"confirm":true}
 {"action":"info"}
 {"action":"stop"}
 ```
+
+本卡按仓库协议声明 `x-is-dangerous: true`。`turn` 还要求严格的布尔 `confirm: true`，
+缺失、false、字符串或数字均不发送请求；只应由操作者在安全条件下显式确认验收调用。
+此确认不等于已标定运动范围，也不会自动移除下述限制。
 
 上例是**待验收的厂商输入**，不是已验证的“小角度低速”保证：`degree` 的正负、
 参考点、绝对/相对语义以及 MotionSetup 速度/加速度单位仍未确认。
