@@ -187,12 +187,15 @@ class BumiDeviceBundle:
         if plugins_cfg.get("payload_mass", {}).get("enabled", False):
             from payload_mass import PayloadMassPlugin
             from payload_mass_sampling import SharedSampler
+            from payload_mass_feedback import DdsFeedback
             sampler = SharedSampler()
-            if state_plugin is not None:
-                state_plugin._node.payload_sampler = sampler
+            # The SDK getter omits the source timestamp. Read motor/IMU/mode
+            # together from native status DDS; never mix getter-only samples in.
+            feedback = DdsFeedback(sampler, plugins_cfg["payload_mass"])
             self._plugins.append(PayloadMassPlugin(
-                plugins_cfg["payload_mass"], namespace, executor, sampler, loco_plugin))
-            print("[bundle] PayloadMassPlugin loaded (fixed-pose weighing with verified recordings)")
+                plugins_cfg["payload_mass"], namespace, executor, sampler, loco_plugin,
+                feedback=feedback))
+            print("[bundle] PayloadMassPlugin loaded (read-only native DDS source feedback)")
 
     def response_published(self, action_id, delivered=True):
         for plugin in self._plugins:

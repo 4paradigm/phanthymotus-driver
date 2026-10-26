@@ -1,8 +1,8 @@
 """Shared read-only observations; no SDK/ROS imports and no motor writes.
 
-The existing 10 Hz StatePlugin calls accept_getter before display rounding.
-Getter receipt is NOT a source heartbeat. Callback-only SDKs must be integrated
-through a verified shared dispatcher; this module never installs a callback.
+Production weighing uses coherent native DDS status with motor source timestamps.
+accept_getter is retained for diagnostics/tests; getter receipt is NOT a source
+heartbeat and cannot enable quick physical weighing. No SDK callbacks are installed.
 """
 from __future__ import annotations
 

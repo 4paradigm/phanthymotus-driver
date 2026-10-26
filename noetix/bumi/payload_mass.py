@@ -43,8 +43,9 @@ class PayloadMassPlugin:
     PREFIX = "payload_mass"
 
     def __init__(self, cfg, namespace, executor=None, sampler=None,
-                 loco_plugin=None, *, publish=None, notify=None):
+                 loco_plugin=None, *, publish=None, notify=None, feedback=None):
         self._sampler = sampler
+        self._feedback = feedback
         self._loco = loco_plugin
         self._lock = loco_plugin._action_lock if loco_plugin else threading.RLock()
         self._file = cfg.get("profiles_file", "/opt/phanthy-motus/data/bumi/weighing.json")
@@ -197,7 +198,7 @@ class PayloadMassPlugin:
         return max(0.0, float(self._hold_duration_s) - (time.monotonic() - self._playback_started))
 
     def start(self):
-        return True
+        return self._feedback.start() if self._feedback is not None else True
 
     def _fresh(self, p):
         d = self._sampler.diagnostics()
@@ -627,6 +628,8 @@ class PayloadMassPlugin:
                 job["thread"].join(timeout=7)
                 if job["thread"].is_alive():
                     raise RuntimeError("weighing worker did not stop")
+        if self._feedback is not None:
+            self._feedback.stop()
         if self._node is not None:
             self._executor.remove_node(self._node)
             self._node.destroy_node()

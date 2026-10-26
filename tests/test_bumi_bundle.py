@@ -104,7 +104,7 @@ def _config(*, loco=True, loco_servo=True, servo_config=None):
     }
 
 
-def test_payload_registration_shares_state_and_loco_and_gates_response(bundle_module, monkeypatch):
+def test_payload_registration_uses_native_feedback_and_loco_and_gates_response(bundle_module, monkeypatch):
     class State:
         def __init__(self, *args):
             self._node = types.SimpleNamespace(payload_sampler=None)
@@ -113,8 +113,9 @@ def test_payload_registration_shares_state_and_loco_and_gates_response(bundle_mo
             return []
 
     class Payload:
-        def __init__(self, cfg, ns, executor, sampler, loco):
+        def __init__(self, cfg, ns, executor, sampler, loco, *, feedback):
             self.sampler, self.loco = sampler, loco
+            self.feedback = feedback
             self.published = []
 
         def get_tool(self):
@@ -134,7 +135,8 @@ def test_payload_registration_shares_state_and_loco_and_gates_response(bundle_mo
                        "payload_mass": {"enabled": True}}}
     bundle = bundle_module.BumiDeviceBundle(cfg, "test", object(), FakeHighCtrl(), None)
     state, loco, card = bundle._plugins
-    assert state._node.payload_sampler is card.sampler
+    assert state._node.payload_sampler is None  # never mix timestamp-less getter frames
+    assert card.feedback._sampler is card.sampler
     assert card.loco is loco
     assert bundle.dispatch("payload_mass", {"action": "prepare"}) == {"action_id": "test_id"}
     bundle.response_published("test_id", False)

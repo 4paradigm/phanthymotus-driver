@@ -1,9 +1,10 @@
 # Bumi 实时称重 Card（待真机验证）
 
-当前接入限制：随仓库提供的HighController getter没有源序号或源时间戳。
-快速版会在曲肘前返回 `FRESHNESS_UNVERIFIED`，不发送动作、不输出重量。
-必须先完成带有可验证源序号/时间戳的反馈接入，才能进行以下真机流程。
-主机轮询时间、重复调用getter或力矩数值变化均不能代替源更新证据。
+本版已改为直接读取机器人原始DDS状态：同一帧的关节力矩、姿态、IMU、模式及
+`motorstatearray.timestamp`一起接入。无需更换SDK或单独运行采集脚本。
+驱动启动时自动发现唯一状态源；默认原生DDS域为0，独立于ROS域42。
+源时间戳重复时不产生新样本；冻结超过0.5秒清空重量并终止测量。
+缺少可验证源时间戳的数据仍返回 `FRESHNESS_UNVERIFIED`，不使用getter缓存替代。
 
 画布操作顺序：
 
@@ -18,7 +19,7 @@
 
 ## 五分钟快速版：直接操作
 
-默认配置 `setup_mode: quick`。完成上述反馈接入后，不需要填写工程JSON、机器人身份或人工关节角度。
+默认配置 `setup_mode: quick`。不需要填写工程JSON、机器人身份或人工关节角度。
 
 1. 用现有action_recording录制：双臂下垂 → 曲肘 → 原姿态停留约5分钟，保存一个编号。
 2. 在payload_mass卡片齿轮里填写该 `recording_id`，选挂载侧 `arm`（默认left），保存。
@@ -55,7 +56,8 @@
 
 ## 实时读数与稳定状态
 
-- 沿用已有StatePlugin的原始约10Hz反馈，不新建SDK控制器。数字最多约5Hz更新。
+- 原生只读DDS程序从真实状态帧接入力矩，最多约40Hz；数字最多约5Hz更新。
+  不新建HighController/LowController，不修改现有动作控制或StatePlugin的显示。
 - 空载基线在曲肘阶段记录；点击测量后只读取新反馈，不重新去皮。
 - 变化中以最近约0.3秒的数据平滑显示，`provisional=true`、`valid=false`。
 - 完整窗口（默认3秒）满足观测数、力矩波动、姿态、速度和机身稳定条件后，
@@ -122,7 +124,9 @@ git diff --check
 ```
 
 关闭自动插件加载以避开ROS Jazzy/Conda插件冲突。机器人继续使用原ROS Humble容器；
-新增实现仅有Python源码，无新增apt/pip依赖。离线标定工具留在开发仓库，不打入运行镜像。
+新增原生只读程序使用镜像已有的DDS运行库与构建工具，无新增apt/pip依赖。
+构建时校验生成状态类型的全部12份XTypes元数据与仓库SDK一致；不链接动作控制库。
+离线标定工具和测试发布器留在开发仓库，不打入运行镜像。
 
 ## 无机器人演示
 
@@ -133,3 +137,9 @@ python3 scripts/demo_bumi_scale.py --output /tmp/bumi-scale-demo
 运行真实快速版采样/拟合/滚动显示代码，关节反馈和动作由模拟器提供。
 演示参考物体0.20kg、未知物体0.35kg、卸载0kg和停止归位；报告带
 `simulation_only=true`，不能作为真机精度结果。
+
+原生DDS联调测试位于 `tests/test_payload_mass_feedback.py`。额外设置
+`BUMI_TEST_DDS_READER`（已编译的payload_mass_dds路径）与
+`BUMI_TEST_DDS_PUBLISHER`（已编译的tests/native_payload_mass_publisher.cpp路径）后，
+同一pytest命令会运行真实DDS传输测试，覆盖参考校准、未知重量、卸载、源冻结清数及归位。
+测试发布器仅运行在回环网卡、独立域和测试主题，不放入运行镜像。
