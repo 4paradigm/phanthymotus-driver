@@ -377,8 +377,11 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     final_error = math.hypot(target_x-final_body_x,
                                              target_y-final_body_y)
                     result['final_position_error_m'] = final_error
-                    result['estimated_distance_m'] = final_error
-                    result['estimated_error_m'] = final_error
+                    # Contract (measurement table): estimated_distance_m is the
+                    # travelled displacement, estimated_error_m the requested
+                    # minus travelled; final_position_error_m is the residual.
+                    result['estimated_distance_m'] = along
+                    result['estimated_error_m'] = target_distance - along
                     heading_now = angle_delta(estimator.yaw, origin_yaw)
                     result['final_heading_deg'] = math.degrees(heading_now)
                     result['final_heading_error_deg'] = math.degrees(

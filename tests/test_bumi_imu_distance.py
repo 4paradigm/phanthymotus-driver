@@ -623,6 +623,8 @@ def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     assert result['requested_target_x_m'] == 0.3
     assert result['requested_target_y_m'] == 0.4
     assert result['final_position_error_m'] == pytest.approx(0.05, abs=0.01)
+    assert result['estimated_distance_m'] == pytest.approx(0.55, abs=0.01)
+    assert result['estimated_error_m'] == pytest.approx(-0.05, abs=0.01)
     assert commands and commands[-1] == (0, 0)
 
 

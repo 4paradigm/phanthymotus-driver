@@ -100,7 +100,7 @@ SDK 没有源时间戳。采样间隔和字段变化检查只能发现部分故�
 |---|---|---|---|---|---|---|
 | 1 | 1.000 m | `estimated_distance_m` | 卷尺测量 | 实测 − 请求 | 估计 − 实测 | 完整保留 |
 
-`estimated_error_m` 的定义是“请求距离 − IMU 估计距离”，不是实际目标误差。
+`estimated_distance_m` 是估计的**已走行程**（沿目标方向的投影），`estimated_error_m` 的定义是“请求距离 − 估计行程”，不是实际目标误差；终点残差看 `final_position_error_m`。
 `state=done` 仅表示估计值满足控制条件；`accuracy_validated` 始终为 false。
 `stationary_assumed=true` 表示满足零指令等待、低估计速度和安静观测条件，
 不能作为独立的物理停车证明。`pre_zero_velocity_mps` 保留清零前的速度估计，供分析漂移。
