@@ -39,6 +39,12 @@ class CommandLeaseExpired(ValueError):
     pass
 
 
+class StaleVelocityCommand(CommandLeaseExpired):
+    def __init__(self, message, *, zero_velocity_confirmed=False):
+        super().__init__(message)
+        self.zero_velocity_confirmed = zero_velocity_confirmed
+
+
 class FakeBackend:
     def __init__(self, config=None):
         self.messages = []
@@ -48,24 +54,36 @@ class FakeBackend:
         self.deadlines = []
         self.supports_atomic_expiry_update = (config or {}).get("atomic_expiry_update", False)
         self.expiry_updates = []
+        self.supports_staged_stop = (config or {}).get("staged_stop", False)
+        self.cancel_deadlines = []
+        self.soft_stops = 0
+        self.hard_stops = 0
 
     def connect(self):
         if self.connect_fail:
             raise RuntimeError("connection failed")
         self.connected = True
 
-    def write(self, values, deadline, *, replace_expired=False):
+    def write(self, values, deadline, *, replace_expired=False, cancel_deadline_ms=None):
         if self.fail:
             raise RuntimeError("transport failed")
         self.deadlines.append(deadline)
         self.expiry_updates.append(replace_expired)
+        self.cancel_deadlines.append(cancel_deadline_ms)
         self.messages.append(list(values))
 
     def stop(self):
         if self.fail:
             raise RuntimeError("stop failed")
         if self.connected:
+            self.hard_stops += 1
             self.messages.append([0] * 6)
+
+    def soft_stop(self):
+        if self.fail:
+            raise RuntimeError("soft stop failed")
+        self.soft_stops += 1
+        self.messages.append([0] * 6)
 
     def close(self):
         self.connected = False
@@ -89,8 +107,9 @@ class Node:
         raise AssertionError("loco_servo must not publish to /cmd_vel")
 
     def create_timer(self, period, callback):
-        self.timers.append((period, callback))
-        return object()
+        timer = (period, callback)
+        self.timers.append(timer)
+        return timer
 
     def create_guard_condition(self, callback):
         guard = types.SimpleNamespace(callback=callback, triggered=0)
@@ -101,6 +120,9 @@ class Node:
         guard.trigger = trigger
         self.guards.append(guard)
         return guard
+
+    def destroy_timer(self, timer):
+        self.timers.remove(timer)
 
     def destroy_node(self):
         self.destroyed = True
@@ -136,6 +158,7 @@ def setup(monkeypatch):
     backend_mod = types.ModuleType("slamtec_velocity")
     backend_mod.SlamtecVelocityBackend = FakeBackend
     backend_mod.CommandLeaseExpired = CommandLeaseExpired
+    backend_mod.StaleVelocityCommand = StaleVelocityCommand
     monkeypatch.setitem(sys.modules, "slamtec_velocity", backend_mod)
     spec = importlib.util.spec_from_file_location("tianyi_loco_servo_test", DRIVER / "loco_servo.py")
     module = importlib.util.module_from_spec(spec)
@@ -146,10 +169,10 @@ def setup(monkeypatch):
     module.ControlSink = lambda *a, **kw: original_sink(
         *a, **kw, clock=lambda: int(clock.now * 1000),
         wall_clock=lambda: int(clock.time() * 1000))
-    # Keep fake-clock unit tests deterministic; concurrency tests below launch
-    # the real production worker explicitly and never spin a ROS executor.
-    launch_controller = module.LocoServoPlugin._start_controller
-    monkeypatch.setattr(module.LocoServoPlugin, "_start_controller", lambda *args: None)
+    # Keep fake-clock tests deterministic; timer lifecycle tests explicitly
+    # install the production watchdog on a fake ROS node.
+    launch_watchdog = module.LocoServoPlugin._start_watchdog
+    monkeypatch.setattr(module.LocoServoPlugin, "_start_watchdog", lambda *args: None)
     ros = types.SimpleNamespace(ctx_core=object(), ctx_tianyi=object(),
                                 executor_core=Executor(), executor_tianyi=Executor())
     plugins = []
@@ -161,7 +184,7 @@ def setup(monkeypatch):
         return plugin
 
     yield types.SimpleNamespace(module=module, clock=clock, ros=ros, create=create,
-                                launch_controller=lambda plugin: launch_controller(plugin, plugin._generation))
+                                launch_watchdog=lambda plugin: launch_watchdog(plugin, plugin._generation))
     for plugin in plugins:
         plugin.stop()
 
@@ -274,375 +297,42 @@ def test_regular_10hz_stream_is_not_throttled_by_sdk_reply_latency(setup, monkey
     assert len(backend.messages) == 12
 
 
-def test_sdk_latency_does_not_allow_apply_starts_above_20hz(setup, monkeypatch):
-    plugin = start(setup)
+def test_direct_callbacks_serialize_sdk_calls_without_a_dispatch_queue(setup, monkeypatch):
+    plugin = start(setup, staged_stop=True)
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     original_write = plugin._backend.write
-
-    def delayed_write(values, deadline):
-        setup.clock.advance(0.03)
-        original_write(values, deadline)
-
-    monkeypatch.setattr(plugin._backend, "write", delayed_write)
-    send(plugin, command(setup))
-    setup.clock.advance(0.005)  # 35ms between starts: still above the 20Hz cap.
-    send(plugin, command(setup, seq=2))
-    assert plugin._counts["accepted"] == 1
-    assert plugin._counts["dropped"] == 0
-    assert plugin._info()["input_queue"]["pending"] == 1
-    send(plugin, command(setup, [0] * 6, seq=3))
-    assert plugin._backend.messages[-1] == [0] * 6
-
-
-def test_worker_dispatches_continuous_stream_without_spinning_ros(setup, monkeypatch):
-    plugin = start(setup)
-    node = setup.ros.executor_core.nodes[0]
-    assert not node.guards and not node.timers
-    applied = threading.Event()
-    original_write = plugin._backend.write
-    def slow_sdk(values, deadline):
-        setup.clock.advance(0.07)
-        original_write(values, deadline)
-        applied.set()
-    monkeypatch.setattr(plugin._backend, "write", slow_sdk)
-    setup.launch_controller(plugin)
-    began = setup.clock.monotonic()
-    for seq in range(1, 21):
-        setup.clock.advance(began + (seq - 1) * 0.1 - setup.clock.monotonic())
-        applied.clear()
-        node.subscriptions[0][2](types.SimpleNamespace(data=json.dumps(command(setup, seq=seq))))
-        assert applied.wait(1), "controller waited for a ROS executor callback"
-        assert plugin.dispatch("info", {})["counts"]["accepted"] == seq
-    assert plugin._counts["accepted"] == 20
-    assert plugin._counts["holds"] == plugin._counts["dropped"] == 0
-    assert len(plugin._backend.messages) == 20
-    timing = plugin._info()["last_command_timing"]
-    assert timing["command_age_ms"] == timing["observation_age_ms"] == 0
-    assert timing["apply_round_trip_ms"] == pytest.approx(70)
-    assert 129 <= timing["remaining_after_apply_ms"] <= 131
-
-
-def test_worker_receives_latest_while_sdk_waits_and_keeps_original_deadline(setup, monkeypatch):
-    plugin = start(setup)
-    backend = plugin._backend
-    entered, release, latest_applied = threading.Event(), threading.Event(), threading.Event()
-    original_write = backend.write
-    def blocked_first(values, deadline):
-        if not backend.messages:
+    def blocked_write(*args, **kwargs):
+        if not entered.is_set():
             entered.set()
             assert release.wait(2)
-        original_write(values, deadline)
-        if len(backend.messages) == 2:
-            latest_applied.set()
-    monkeypatch.setattr(backend, "write", blocked_first)
-    setup.launch_controller(plugin)
-    try:
-        plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
-        assert entered.wait(1)
-        for seq in range(2, 42):
-            setup.clock.advance(0.001)
-            newest = command(setup, [0.15, 0, 0, 0, 0, -0.2], seq=seq)
-            plugin._on_message(types.SimpleNamespace(data=json.dumps(newest)))
-        assert plugin._inbox.info()["pending"] == 1
-        assert plugin._inbox.info()["coalesced"] == 39
-        setup.clock.advance(0.03)
-        release.set()
-        assert latest_applied.wait(1)
-        info = plugin.dispatch("info", {})
-        assert info["counts"]["accepted"] == 2
-        assert info["last_command_timing"]["seq"] == 41
-        assert backend.deadlines[-1] == newest["stamp_ms"] + newest["ttl_ms"]
-        assert info["counts"]["holds"] == 0
-    finally:
-        release.set()
-
-
-def test_worker_watchdog_stops_without_ros_callbacks_and_never_replays(setup, monkeypatch):
-    plugin = start(setup)
-    backend = plugin._backend
-    applied, stopped = threading.Event(), threading.Event()
-    original_write, original_stop = backend.write, backend.stop
-    def write(values, deadline):
-        original_write(values, deadline)
-        applied.set()
-    def stop():
-        original_stop()
-        stopped.set()
-    monkeypatch.setattr(backend, "write", write)
-    monkeypatch.setattr(backend, "stop", stop)
-    setup.launch_controller(plugin)
-    cmd = command(setup)
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)))
-    assert applied.wait(1)
-    plugin.dispatch("info", {})  # Wait until the accepted-state update completes.
-    setup.clock.advance(0.21)
-    plugin._controller_wake.set()
-    assert stopped.wait(1)
-    info = plugin.dispatch("info", {})
-    assert info["output"] == [0] * 6
-    assert info["last"]["verdict"] == "HOLD"
-    assert len(backend.deadlines) == 1
-    assert backend.deadlines[0] == cmd["stamp_ms"] + 200
-
-
-def test_worker_zero_command_bypasses_motion_pacing(setup, monkeypatch):
-    plugin = start(setup)
-    backend = plugin._backend
-    applied, stopped = threading.Event(), threading.Event()
-    original_write, original_stop = backend.write, backend.stop
-    def write(values, deadline):
-        original_write(values, deadline)
-        applied.set()
-    def stop():
-        original_stop()
-        stopped.set()
-    monkeypatch.setattr(backend, "write", write)
-    monkeypatch.setattr(backend, "stop", stop)
-    setup.launch_controller(plugin)
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
-    assert applied.wait(1)
-    plugin.dispatch("info", {})
-    setup.clock.advance(0.01)
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, [0] * 6, seq=2))))
-    assert stopped.wait(1)
-    info = plugin.dispatch("info", {})
-    assert info["counts"]["accepted"] == 2
-    assert info["output"] == [0] * 6
-
-
-def test_stop_joins_outside_state_lock_and_blocks_restart_until_old_worker_exits(setup, monkeypatch):
-    plugin = start(setup)
-    entered, release, stopping = threading.Event(), threading.Event(), threading.Event()
-    original_tick, original_stop = plugin._tick, plugin._backend.stop
-    def blocked_tick(generation=None):
-        entered.set()
-        assert release.wait(2)
-        original_tick(generation)
-    def confirmed_stop():
-        original_stop()
-        stopping.set()
-    monkeypatch.setattr(plugin, "_tick", blocked_tick)
-    monkeypatch.setattr(plugin._backend, "stop", confirmed_stop)
-    setup.launch_controller(plugin)
-    old_worker = plugin._controller_thread
-    result = {}
-    stopper = threading.Thread(target=lambda: result.update(plugin.dispatch("stop", {})))
-    try:
-        assert entered.wait(1)
-        stopper.start()
-        assert stopping.wait(1)
-        assert plugin.dispatch("info", {})["state"] == "stopping"
-        assert plugin.dispatch("start", {})["state"] == "error"
-        release.set()
-        stopper.join(2)
-        assert not stopper.is_alive()
-        assert result["state"] == "idle", "joining under _lock deadlocks the old worker"
-        assert not old_worker.is_alive()
-        assert plugin._controller_thread is None
-        assert not plugin._nodes
-    finally:
-        release.set()
-        if stopper.ident is not None:
-            stopper.join(2)
-
-
-def test_paused_worker_resumes_only_on_fresh_input_and_restarts_without_thread_leaks(setup, monkeypatch):
-    plugin = start(setup)
-    setup.launch_controller(plugin)
-    old_callback = setup.ros.executor_core.nodes[0].subscriptions[0][2]
-    old_worker = plugin._controller_thread
-    assert plugin.dispatch("pause", {})["state"] == "paused"
-    old_callback(types.SimpleNamespace(data=json.dumps(command(setup))))
-    assert plugin._inbox.info()["pending"] == 0
-    setup.clock.advance()
-    assert plugin.dispatch("resume", {})["state"] == "running"
-    setup.clock.advance()
-    applied = threading.Event()
-    original_write = plugin._backend.write
-    def write(values, deadline):
-        original_write(values, deadline)
-        applied.set()
-    monkeypatch.setattr(plugin._backend, "write", write)
-    old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=2))))
-    assert applied.wait(1)
-    assert plugin.dispatch("stop", {})["state"] == "idle"
-    assert not old_worker.is_alive()
-    for _ in range(3):
-        assert plugin.dispatch("start", {})["state"] == "running"
-        setup.launch_controller(plugin)
-        current = plugin._controller_thread
-        old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=3))))
-        assert plugin._inbox.info()["pending"] == 0
-        assert plugin.dispatch("stop", {})["state"] == "idle"
-        assert not current.is_alive()
-
-
-def test_join_timeout_preserves_resources_and_blocks_new_worker(setup, monkeypatch):
-    plugin = start(setup)
-    entered, release = threading.Event(), threading.Event()
-    original_tick = plugin._tick
-    def blocked_tick(generation=None):
-        entered.set()
-        assert release.wait(3)
-        original_tick(generation)
-    monkeypatch.setattr(plugin, "_tick", blocked_tick)
-    setup.launch_controller(plugin)
-    worker, backend = plugin._controller_thread, plugin._backend
-    try:
-        assert entered.wait(1)
-        assert plugin.dispatch("stop", {})["state"] == "error"
-        assert plugin.dispatch("info", {})["state"] == "stopping"
-        assert plugin.dispatch("start", {})["state"] == "error"
-        assert plugin._backend is backend and backend.connected
-        assert plugin._controller_thread is worker and worker.is_alive()
-        release.set()
-        worker.join(1)
-        assert plugin.dispatch("stop", {})["state"] == "idle"
-        assert plugin._backend is None
-    finally:
-        release.set()
-        worker.join(1)
-
-
-def test_unexpected_worker_failure_stops_motion_and_requires_explicit_restart(setup, monkeypatch):
-    plugin = start(setup)
-    stopped = threading.Event()
-    original_stop = plugin._backend.stop
-    def stop():
-        original_stop()
-        stopped.set()
-    def broken_tick(generation=None):
-        raise RuntimeError("injected control-loop failure")
-    monkeypatch.setattr(plugin._backend, "stop", stop)
-    monkeypatch.setattr(plugin, "_tick", broken_tick)
-    setup.launch_controller(plugin)
-    assert stopped.wait(1)
-    plugin._controller_thread.join(1)
-    info = plugin.dispatch("info", {})
-    assert info["state"] == "paused"
-    assert info["last"]["verdict"] == "ERROR"
-    assert "control-loop failure" in info["last"]["reason"]
-    assert not info["dispatch"]["worker_alive"]
-    assert plugin.dispatch("resume", {})["state"] == "error"
-
-
-def test_resume_refuses_failed_worker_even_before_thread_has_exited(setup, monkeypatch):
-    plugin = start(setup)
-    failed, release = threading.Event(), threading.Event()
-    original_loop = plugin._control_loop
-    def broken_tick(generation=None):
-        raise RuntimeError("injected failure")
-    def delayed_exit(*args):
-        original_loop(*args)
-        failed.set()
-        assert release.wait(2)
-    monkeypatch.setattr(plugin, "_tick", broken_tick)
-    monkeypatch.setattr(plugin, "_control_loop", delayed_exit)
-    setup.launch_controller(plugin)
-    try:
-        assert failed.wait(1)
-        assert plugin._controller_thread.is_alive()
-        assert plugin.dispatch("info", {})["dispatch"]["worker_failed"]
-        assert plugin.dispatch("resume", {})["state"] == "error"
-    finally:
-        release.set()
-        plugin._controller_thread.join(1)
-
-
-def test_worker_start_failure_cleans_ros_and_sdk_resources(setup, monkeypatch):
-    plugin = setup.create()
-    def cannot_start(generation):
-        raise RuntimeError("thread creation denied")
-    monkeypatch.setattr(plugin, "_start_controller", cannot_start)
-    result = plugin.dispatch("start", {})
-    assert result["state"] == "error"
-    assert "thread creation denied" in result["error"]
-    assert not plugin._running and not plugin._nodes
-    assert plugin._backend is None and plugin._controller_thread is None
-    assert not plugin._inbox.info()["active"]
-
-
-def test_bunched_arrivals_keep_latest_until_next_apply_slot(setup):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    setup.clock.advance(0.02)
-    send(plugin, command(setup, [0.1, 0, 0, 0, 0, 0.2], seq=2))
-    setup.clock.advance(0.01)
-    latest = command(setup, [0.15, 0, 0, 0, 0, -0.2], seq=3)
-    send(plugin, latest)
-    assert plugin._counts["accepted"] == 1
-    assert plugin._info()["input_queue"]["pending"] == 1
-    setup.clock.advance(0.03)
-    plugin._tick()
-    assert plugin._counts["accepted"] == 2
-    assert plugin._counts["dropped"] == 0
-    assert plugin._last["requested"] == latest["values"]
-    assert plugin._backend.deadlines[-1] == latest["stamp_ms"] + 200
-    assert plugin._counts["holds"] == 0
-
-
-def test_inbound_callback_remains_responsive_while_sdk_is_waiting(setup, monkeypatch):
-    plugin = start(setup)
-    entered, release, received = threading.Event(), threading.Event(), threading.Event()
-    original_write = plugin._backend.write
-
-    def blocked_write(values, deadline):
-        entered.set()
-        assert release.wait(2), "test did not release fake SDK"
-        original_write(values, deadline)
-
+        return original_write(*args, **kwargs)
     monkeypatch.setattr(plugin._backend, "write", blocked_write)
     first = threading.Thread(target=lambda: plugin._on_message(
         types.SimpleNamespace(data=json.dumps(command(setup)))))
-    controller = threading.Thread(target=plugin._tick)
-    def receive_next():
-        plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=2))))
-        received.set()
-    next_frame = threading.Thread(target=receive_next)
+    def next_callback():
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup,seq=2))))
+        returned.set()
+    second = threading.Thread(target=next_callback)
     try:
         first.start()
-        first.join(0.05)
-        controller.start()
         assert entered.wait(1)
-        next_frame.start()
-        assert received.wait(0.2), "SDK wait blocked the bridge reader from receiving the next frame"
+        second.start()
+        assert not returned.wait(0.02)
+        setup.clock.advance(0.1)
+        release.set()
+        first.join(1)
+        second.join(1)
+        assert returned.is_set() and not first.is_alive() and not second.is_alive()
+        assert len(plugin._backend.messages) == 2
+        assert plugin._counts["accepted"] == 2
     finally:
         release.set()
-        for thread in (first, controller, next_frame):
-            if thread.ident is not None:
-                thread.join(2)
-                assert not thread.is_alive()
+        first.join(1)
+        if second.ident is not None:
+            second.join(1)
 
 
-def test_control_timer_takes_only_latest_motion_with_original_deadline(setup):
-    plugin = start(setup)
-    for sequence in range(1, 26):
-        setup.clock.advance(0.01)
-        latest = command(setup, [sequence / 100, 0, 0, 0, 0, 0.1], seq=sequence)
-        plugin._on_message(types.SimpleNamespace(data=json.dumps(latest)))
-    assert not plugin._backend.messages
-    before = plugin._info()["input_queue"]
-    assert before["received"] == 25 and before["coalesced"] == 24
-    assert before["pending"] == 1
-    plugin._tick()
-    assert plugin._counts["received"] == plugin._counts["accepted"] == 1
-    assert plugin._last["requested"][0] == 0.25
-    assert plugin._backend.deadlines == [latest["stamp_ms"] + latest["ttl_ms"]]
-    assert plugin._info()["input_queue"]["pending"] == 0
-    assert plugin._info()["input_queue"]["processed"] == 1
-
-
-def test_queue_wait_does_not_retimestamp_or_execute_expired_input(setup):
-    plugin = start(setup)
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
-    setup.clock.advance(0.21)
-    plugin._tick()
-    assert not plugin._backend.messages
-    assert plugin._counts["accepted"] == 0
-    assert plugin._counts["dropped"] == 1
-    assert plugin._info()["input_queue"]["last_wait_ms"] == pytest.approx(210)
-
-
-def test_timing_separates_arrival_age_from_local_wait_without_extending_ttl(setup):
+def test_direct_callback_has_no_local_queue_wait_or_ttl_extension(setup):
     plugin = start(setup)
     original = command(setup, stamp_ms=int(setup.clock.time() * 1000) - 90)
     plugin._on_message(types.SimpleNamespace(data=json.dumps(original)))
@@ -650,84 +340,10 @@ def test_timing_separates_arrival_age_from_local_wait_without_extending_ttl(setu
     plugin._tick()
     timing = plugin._info()["last_command_timing"]
     assert timing["receive_age_ms"] == 90
-    assert timing["local_wait_ms"] == pytest.approx(30)
-    assert timing["command_age_ms"] == 120
-    assert timing["remaining_before_apply_ms"] == 80
+    assert timing["local_wait_ms"] == pytest.approx(0)
+    assert timing["command_age_ms"] == 90
+    assert timing["remaining_before_apply_ms"] == 110
     assert plugin._backend.deadlines[-1] == original["stamp_ms"] + original["ttl_ms"]
-
-
-def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):
-    plugin = start(setup)
-    for cmd in (command(setup), command(setup, [0] * 6, seq=2), command(setup, seq=3)):
-        plugin._on_message(types.SimpleNamespace(data=json.dumps(cmd)))
-    assert plugin._info()["input_queue"]["pending"] == 2
-    assert plugin._info()["input_queue"]["coalesced"] == 1
-    plugin._tick()
-    assert plugin._backend.messages == [[0] * 6]
-    assert plugin._last["requested"] == [0] * 6
-    setup.clock.advance()
-    plugin._tick()
-    assert plugin._backend.messages[-1] == pytest.approx([0.03, 0, 0, 0, 0, 0.06])
-    assert plugin._info()["input_queue"]["processed"] == 2
-
-
-def test_pause_config_and_restart_discard_pending_input_and_old_generation(setup):
-    plugin = start(setup)
-    old_node = setup.ros.executor_core.nodes[0]
-    old_callback = old_node.subscriptions[0][2]
-    old_generation = plugin._generation
-    old_tick = lambda: plugin._tick(old_generation)
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
-    plugin.dispatch("pause", {})
-    assert plugin._info()["input_queue"]["pending"] == 0
-    assert not plugin._info()["input_queue"]["active"]
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=2))))
-    assert plugin._info()["input_queue"]["pending"] == 0
-    setup.clock.advance()
-    plugin.dispatch("resume", {})
-    setup.clock.advance()
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=3))))
-    plugin.dispatch("config", {"rotate_only": True})
-    assert plugin._info()["input_queue"]["pending"] == 0
-    assert plugin._info()["input_queue"]["active"]
-    plugin.stop()
-    plugin.dispatch("start", {})
-    setup.clock.advance()
-    old_callback(types.SimpleNamespace(data=json.dumps(command(setup, seq=4))))
-    assert plugin._info()["input_queue"]["pending"] == 0
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
-    old_tick()
-    assert not plugin._backend.messages
-    assert plugin._info()["input_queue"]["pending"] == 1
-    plugin._tick()
-    assert plugin._backend.messages[-1][5] > 0
-
-
-def test_timer_does_not_replay_last_motion_or_extend_ttl_without_new_input(setup):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    before = list(plugin._backend.messages)
-    setup.clock.advance(0.1)
-    plugin._tick()
-    assert plugin._backend.messages == before
-    setup.clock.advance(0.11)
-    plugin._tick()
-    assert plugin._backend.messages[-1] == [0] * 6
-    assert len(plugin._backend.deadlines) == 1
-    assert plugin._info()["input_queue"]["processed"] == 1
-
-
-def test_pending_motion_cannot_run_while_a_stop_is_unconfirmed(setup, monkeypatch):
-    plugin = start(setup)
-    plugin._zero_pending = True
-    plugin._backend.fail = True
-    monkeypatch.setattr(plugin._backend, "write", lambda *args: pytest.fail("motion before confirmed stop"))
-    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
-    plugin._tick()
-    assert plugin._info()["state"] == "paused"
-    assert plugin._info()["input_queue"]["pending"] == 0
-    assert not plugin._info()["input_queue"]["active"]
-    plugin._backend.fail = False
 
 
 @pytest.mark.parametrize("extra", [
@@ -959,125 +575,6 @@ def test_failed_atomic_expiry_update_still_pauses_and_requires_confirmed_stop(se
     plugin._backend.fail = False
 
 
-def queue_during_stop(setup, plugin, monkeypatch, make_command):
-    original_stop = plugin._backend.stop
-    latest = {}
-    def stop_with_new_input():
-        original_stop()
-        if latest:  # Inject once, including when the replacement is zero.
-            return
-        setup.clock.advance(0.08)
-        latest.update(make_command())
-        plugin._on_message(types.SimpleNamespace(data=json.dumps(latest)))
-    monkeypatch.setattr(plugin._backend, "stop", stop_with_new_input)
-    return latest
-
-
-def test_newer_motion_arriving_during_stop_replaces_selected_aging_frame(setup, monkeypatch):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    setup.clock.advance(0.21)
-    now = int(setup.clock.time() * 1000)
-    aging = command(setup, seq=2, stamp_ms=now - 150)
-    latest = queue_during_stop(setup, plugin, monkeypatch, lambda: command(
-        setup, [0.1, 0, 0, 0, 0, 0.2], seq=3))
-    send(plugin, aging)
-    assert plugin._counts["accepted"] == 2
-    assert plugin._last["requested"] == latest["values"]
-    assert plugin._backend.deadlines[-1] == latest["stamp_ms"] + latest["ttl_ms"]
-    assert plugin._counts["received"] == 3
-    assert plugin._counts["dropped"] == plugin._counts["refreshed_after_stop"] == 1
-    assert plugin._inbox.info()["processed"] == 3
-    assert plugin._inbox.info()["pending"] == 0
-
-
-def test_zero_arriving_during_stop_prevents_selected_motion_from_resuming(setup, monkeypatch):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    setup.clock.advance(0.21)
-    latest = queue_during_stop(setup, plugin, monkeypatch, lambda: command(setup, [0] * 6, seq=3))
-    send(plugin, command(setup, seq=2))
-    assert plugin._last["requested"] == latest["values"] == [0] * 6
-    assert plugin._counts["accepted"] == 2
-    assert len(plugin._backend.deadlines) == 1  # No selected motion was written.
-    assert plugin._inbox.info()["pending"] == 0
-
-
-@pytest.mark.parametrize("extra, verdict", [
-    ({"ttl_ms": 0}, "REJECTED"),
-    ({"stamp_age_ms": 201}, "DROPPED"),
-    ({"obs_stamp_ms": 0}, "DROPPED"),
-    ({"values": [0.1, 1, 0, 0, 0, 0]}, "REJECTED"),
-    ({"schema": "wrong"}, "REJECTED"),
-])
-def test_refreshed_motion_still_requires_the_full_contract(setup, monkeypatch, extra, verdict):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    setup.clock.advance(0.21)
-    def refreshed():
-        kwargs = dict(extra)
-        age = kwargs.pop("stamp_age_ms", 0)
-        return command(setup, seq=3, stamp_ms=int(setup.clock.time() * 1000) - age, **kwargs)
-    queue_during_stop(setup, plugin, monkeypatch, refreshed)
-    send(plugin, command(setup, seq=2))
-    assert plugin._last["verdict"] == verdict
-    assert plugin._counts["accepted"] == 1
-    assert plugin._counts["refreshed_after_stop"] == 1
-    assert len(plugin._backend.deadlines) == 1
-    assert plugin._last_output == [0] * 6
-
-
-@pytest.mark.parametrize("extra", [
-    {"source": "other"}, {"source": ""}, {"priority": 1}, {"priority": False},
-    {"seq": 2}, {"seq": 1}, {"seq": True}, {"seq": 3.0},
-])
-def test_unrelated_or_unordered_motion_stays_queued_after_stop(setup, monkeypatch, extra):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    setup.clock.advance(0.21)
-    queue_during_stop(setup, plugin, monkeypatch, lambda: command(setup, seq=3) | extra)
-    send(plugin, command(setup, seq=2))
-    assert plugin._last["requested"] == [0.2, 0, 0, 0, 0, 0.4]
-    assert plugin._counts["accepted"] == 2
-    assert plugin._counts["refreshed_after_stop"] == 0
-    assert plugin._inbox.info()["pending"] == 1
-    assert plugin._inbox.info()["processed"] == 2
-
-
-def test_refresh_cannot_bypass_source_arbitration_for_a_pending_zero(setup, monkeypatch):
-    plugin = start(setup)
-    send(plugin, command(setup, source="owner", priority=10))
-    setup.clock.advance(0.21)
-    queue_during_stop(setup, plugin, monkeypatch, lambda: command(
-        setup, [0] * 6, seq=3, source="other", priority=0))
-    send(plugin, command(setup, seq=2, source="owner", priority=10))
-    assert plugin._last["verdict"] == "DROPPED"
-    assert "outranked" in plugin._last["reason"]
-    assert plugin._counts["accepted"] == 1
-    assert plugin._last_output == [0] * 6
-    assert len(plugin._backend.deadlines) == 1
-
-
-def test_unconfirmed_stop_does_not_consume_a_new_motion_for_refresh(setup, monkeypatch):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    setup.clock.advance(0.21)
-    queued = []
-    def failed_stop():
-        if not queued:
-            latest = command(setup, seq=3)
-            plugin._on_message(types.SimpleNamespace(data=json.dumps(latest)))
-            queued.append(latest)
-        raise RuntimeError("stop unconfirmed")
-    with monkeypatch.context() as patch:
-        patch.setattr(plugin._backend, "stop", failed_stop)
-        send(plugin, command(setup, seq=2))
-    assert plugin._paused and plugin._zero_pending
-    assert plugin._counts["refreshed_after_stop"] == 0
-    assert plugin._inbox.info()["processed"] == 2
-    assert len(plugin._backend.deadlines) == 1
-
-
 def test_native_expiry_stops_without_latching_and_accepts_only_a_fresh_command(setup, monkeypatch):
     plugin = start(setup)
     send(plugin, command(setup))
@@ -1225,17 +722,6 @@ def test_refuses_start_when_explicit_base_owner_exists(setup):
     assert not setup.ros.executor_core.nodes
 
 
-def test_zero_bypasses_apply_pacing_and_discards_pending_motion(setup):
-    plugin = start(setup)
-    send(plugin, command(setup))
-    setup.clock.advance(0.01)
-    send(plugin, command(setup, seq=2))
-    assert plugin._info()["input_queue"]["pending"] == 1
-    assert plugin._counts["accepted"] == 1
-    send(plugin, command(setup, [0] * 6, seq=3))
-    assert plugin._backend.messages[-1] == [0] * 6
-
-
 def test_custom_input_and_idempotent_start_keep_one_subscription(setup):
     plugin = setup.create()
     assert plugin.dispatch("start", {"input_topics": ["/custom/cmd"]})["input"] == "/custom/cmd"
@@ -1334,3 +820,180 @@ def test_bundle_does_not_start_other_motion_when_sdk_stop_fails(setup, monkeypat
     assert bundle._base_owner == ""
     servo._backend.fail = False
     servo.stop()
+
+
+def test_direct_callback_checks_sink_then_calls_sdk_in_same_thread(setup, monkeypatch):
+    plugin = start(setup, staged_stop=True)
+    events = []
+    submit, write = plugin._sink.submit, plugin._backend.write
+    caller = threading.get_ident()
+    def checked(cmd):
+        events.append(("sink", threading.get_ident()))
+        return submit(cmd)
+    def applied(*args, **kwargs):
+        events.append(("sdk", threading.get_ident()))
+        return write(*args, **kwargs)
+    monkeypatch.setattr(plugin._sink, "submit", checked)
+    monkeypatch.setattr(plugin._backend, "write", applied)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    assert events == [("sink", caller), ("sdk", caller)]
+    assert plugin._counts["accepted"] == 1
+    assert plugin._info()["dispatch"]["mode"] == "direct_callback"
+    assert not hasattr(plugin, "_inbox") and not hasattr(plugin, "_controller_thread")
+
+
+def test_only_ros_watchdog_timer_is_created_and_destroyed(setup, monkeypatch):
+    plugin = start(setup, staged_stop=True)
+    def no_thread(*args, **kwargs):
+        raise AssertionError("servo must not create a dispatch thread")
+    monkeypatch.setattr(threading, "Thread", no_thread)
+    setup.launch_watchdog(plugin)
+    node = plugin._nodes[0][0]
+    assert len(node.timers) == 1 and node.timers[0][0] == 0.02
+    send(plugin, command(setup))
+    setup.clock.advance(0.31)
+    node.timers[0][1]()
+    assert plugin._backend.soft_stops == 1
+    assert plugin.dispatch("stop", {})["state"] == "idle"
+    assert not node.timers and node.destroyed
+
+
+def test_direct_staged_10hz_updates_never_insert_zero_or_cancel(setup):
+    plugin = start(setup, staged_stop=True)
+    for seq in range(1, 31):
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup, seq=seq))))
+        setup.clock.advance(0.1)
+        plugin._tick()
+    assert plugin._counts["accepted"] == 30
+    assert plugin._backend.soft_stops == plugin._backend.hard_stops == 0
+    assert all(values[0] > 0 and values[5] > 0 for values in plugin._backend.messages)
+
+
+@pytest.mark.parametrize("bad", ["ttl", "observation", "sequence", "arbitration", "axis"])
+def test_stale_or_rejected_packets_do_not_stop_or_renew_old_motion(setup, bad):
+    plugin = start(setup, staged_stop=True)
+    send(plugin, command(setup))
+    valid_at, cancel = plugin._last_valid_at, plugin._cancel_deadline_ms
+    setup.clock.advance(0.12)
+    cmd = command(setup, seq=2)
+    if bad == "ttl":
+        cmd.update(stamp_ms=int(setup.clock.time()*1000)-110, ttl_ms=50)
+    elif bad == "observation":
+        cmd["obs_stamp_ms"] -= 501
+    elif bad == "sequence":
+        cmd["seq"] = 1
+    elif bad == "arbitration":
+        cmd.update(source="other", priority=-1)
+    else:
+        cmd["values"][1] = 0.1
+    send(plugin, cmd)
+    assert plugin._backend.soft_stops == plugin._backend.hard_stops == 0
+    assert len(plugin._backend.messages) == 1
+    assert plugin._last_valid_at == valid_at and plugin._cancel_deadline_ms == cancel
+    setup.clock.advance(0.19)
+    plugin._tick()
+    assert plugin._backend.soft_stops == 1 and plugin._backend.hard_stops == 0
+    setup.clock.advance(0.70)
+    plugin._tick()
+    assert plugin._backend.hard_stops == 1
+
+
+def test_soft_zero_is_idempotent_and_fresh_command_resumes_without_cancel(setup):
+    plugin = start(setup, staged_stop=True)
+    send(plugin, command(setup))
+    cancel = plugin._cancel_deadline_ms
+    setup.clock.advance(0.31)
+    for _ in range(10):
+        plugin._tick()
+    assert plugin._backend.soft_stops == 1
+    assert plugin._backend.hard_stops == 0 and plugin._cancel_deadline_ms == cancel
+    setup.clock.advance(0.2)
+    send(plugin, command(setup, seq=2))
+    assert plugin._backend.hard_stops == 0
+    assert plugin._backend.messages[-1] == pytest.approx([0.03,0,0,0,0,0.06])
+    assert plugin._cancel_deadline_ms > cancel
+
+
+def test_descriptor_and_execution_use_same_500ms_observation_age(setup):
+    plugin = start(setup, staged_stop=True)
+    assert plugin._descriptor["rate"] == {
+        "max_hz":20,"expected_hz":10.0,"watchdog_ms":300,
+        "max_obs_age_ms":500,"cancel_after_ms":1000}
+    obs = int(setup.clock.time()*1000)
+    for seq in range(1, 5):
+        send(plugin, command(setup, seq=seq, obs_stamp_ms=obs))
+        setup.clock.advance(0.1)
+    # Fresh packet based on the same old observation cannot prolong motion.
+    send(plugin, command(setup, seq=5, obs_stamp_ms=obs))
+    assert plugin._backend.deadlines[-1] == obs+500
+    setup.clock.advance(0.11)
+    plugin._tick()
+    assert plugin._backend.soft_stops == 1 and plugin._backend.hard_stops == 0
+    cancel = plugin._cancel_deadline_ms
+    send(plugin, command(setup, seq=6, obs_stamp_ms=obs))
+    assert plugin._counts["accepted"] == 5 and plugin._cancel_deadline_ms == cancel
+
+
+def test_callback_wait_and_sdk_reply_do_not_restart_original_receive_budget(setup, monkeypatch):
+    plugin = start(setup, staged_stop=True)
+    original = plugin._process_message
+    received = setup.clock.now
+    def delayed(*args):
+        setup.clock.advance(0.18)
+        return original(*args)
+    monkeypatch.setattr(plugin, "_process_message", delayed)
+    plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup))))
+    assert plugin._last_valid_at == received
+    assert plugin._backend.deadlines[-1] == int((1000+received)*1000)+300
+    assert plugin._backend.cancel_deadlines[-1] == int((1000+received)*1000)+1000
+    setup.clock.advance(0.13)
+    plugin._tick()
+    assert plugin._backend.soft_stops == 1
+
+
+@pytest.mark.parametrize("action", ["zero","pause","stop","yield"])
+def test_explicit_stop_actions_do_not_wait_for_staged_timeouts(setup, action):
+    plugin = start(setup, staged_stop=True)
+    send(plugin, command(setup))
+    backend = plugin._backend
+    if action == "zero":
+        # Zero bypasses the nonzero 20Hz pacing gate.
+        plugin._on_message(types.SimpleNamespace(data=json.dumps(command(setup,[0]*6,seq=2))))
+    elif action == "yield":
+        assert plugin.pause_for_explicit_command("home")
+    else:
+        plugin.dispatch(action,{})
+    assert backend.hard_stops >= 1 and backend.soft_stops == 0
+    assert plugin._last_output == [0]*6
+
+
+@pytest.mark.parametrize("confirmed_zero", [False, True])
+def test_native_stale_reply_never_renews_accepted_cancel_deadline(setup, monkeypatch, confirmed_zero):
+    plugin = start(setup, staged_stop=True)
+    send(plugin, command(setup))
+    old_output, cancel, valid_at = list(plugin._last_output), plugin._cancel_deadline_ms, plugin._last_valid_at
+    setup.clock.advance(0.1)
+    with monkeypatch.context() as patch:
+        def stale(*args, **kwargs):
+            raise StaleVelocityCommand("stale SDK packet", zero_velocity_confirmed=confirmed_zero)
+        patch.setattr(plugin._backend,"write",stale)
+        send(plugin, command(setup,seq=2))
+    assert plugin._backend.hard_stops == plugin._backend.soft_stops == 0
+    assert plugin._last_valid_at == valid_at and plugin._cancel_deadline_ms == cancel
+    assert plugin._last_output == ([0]*6 if confirmed_zero else old_output)
+    setup.clock.advance(0.1)
+    send(plugin, command(setup,seq=3))
+    expected = 0.03 if confirmed_zero else 0.06
+    assert plugin._last_output[0] == pytest.approx(expected)
+
+
+def test_soft_zero_failure_pauses_and_uses_confirmed_hard_stop(setup, monkeypatch):
+    plugin = start(setup, staged_stop=True)
+    send(plugin, command(setup))
+    def fail():
+        raise RuntimeError("soft zero not acknowledged")
+    monkeypatch.setattr(plugin._backend,"soft_stop",fail)
+    setup.clock.advance(0.31)
+    plugin._tick()
+    assert plugin._paused and plugin._backend.hard_stops == 1
+    assert not plugin._zero_pending

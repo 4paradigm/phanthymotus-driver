@@ -34,16 +34,19 @@ print("MOTUS_SDK 0 OK 0 ready"+(" "+initial_diagnostics if initial_diagnostics i
       " "+diagnostics if diagnostics is not None else ""),flush=True)
 for line in sys.stdin:
     seq,verb,*args=line.split()
-    if mode == "timeout" and verb in ("SET", "UPDATE"):
+    if mode == "timeout" and verb in ("SET", "UPDATE", "FOLLOW"):
         time.sleep(30)
-    if mode == "error" and verb in ("SET", "UPDATE"):
+    if mode == "error" and verb in ("SET", "UPDATE", "FOLLOW"):
         emit("MOTUS_SDK "+seq+" ERROR "+b"localization quality too low".hex())
         sys.exit(1)
-    if mode == "expired" and verb in ("SET", "UPDATE") and seq == "1":
+    if mode == "expired" and verb in ("SET", "UPDATE", "FOLLOW") and seq == "1":
         emit("MOTUS_SDK "+seq+" EXPIRED "+b"command lease expired at worker: remaining_ms=-12".hex())
         continue
     if mode == "expired_stop" and verb == "STOP":
         emit("MOTUS_SDK "+seq+" EXPIRED "+b"unexpected stop reply".hex())
+        continue
+    if mode == "stale" and verb == "FOLLOW" and seq == "2":
+        emit("MOTUS_SDK "+seq+" STALE "+b"stale FOLLOW deadline".hex())
         continue
     if mode == "wrong_sequence":
         seq=str(int(seq)+1)
@@ -60,7 +63,7 @@ for line in sys.stdin:
         sys.stdout.write(response[:7]);sys.stdout.flush();time.sleep(.01)
         sys.stdout.write(response[7:]);sys.stdout.flush()
     else:
-        emit("MOTUS_SDK "+seq+" OK "+("17 active" if verb in ("SET", "UPDATE") else "0 ready"))
+        emit("MOTUS_SDK "+seq+" OK "+("17 active" if verb in ("SET", "UPDATE", "FOLLOW", "SOFT_STOP") else "0 ready"))
 ''')
         script.chmod(0o700)
         instance = backend_module.SlamtecVelocityBackend({"sdk_binary": str(script), "sdk_reply_timeout": 0.15})
@@ -214,11 +217,11 @@ def test_legacy_ack_clears_diagnostics_from_previous_ack(backend):
 @pytest.mark.parametrize("mode", ["ok", "partial"])
 def test_atomic_expiry_update_is_negotiated_only_by_valid_initial_ready_ack(backend, mode):
     worker = backend(mode, initial_diagnostics=json.dumps({
-        "capabilities": {"atomic_expiry_update": True}}))
+        "capabilities": {"atomic_expiry_update": True, "staged_stop": False}}))
     assert worker.supports_atomic_expiry_update is False
     worker.connect()
     assert worker.supports_atomic_expiry_update is True
-    assert worker.info()["capabilities"] == {"atomic_expiry_update": True}
+    assert worker.info()["capabilities"] == {"atomic_expiry_update": True, "staged_stop": False}
     write(worker)  # Subsequent legacy replies cannot erase negotiated support.
     assert worker.info()["native"]["stats"] is None
     assert worker.supports_atomic_expiry_update is True
@@ -238,11 +241,11 @@ def test_missing_or_invalid_initial_capability_uses_legacy_path(backend, diagnos
     worker = backend(initial_diagnostics=diagnostics)
     worker.connect()
     assert worker.supports_atomic_expiry_update is False
-    assert worker.info()["capabilities"] == {"atomic_expiry_update": False}
+    assert worker.info()["capabilities"] == {"atomic_expiry_update": False, "staged_stop": False}
 
 
 def test_later_ack_cannot_upgrade_atomic_expiry_update(backend):
-    worker = backend(diagnostics=json.dumps({"capabilities": {"atomic_expiry_update": True}}),
+    worker = backend(diagnostics=json.dumps({"capabilities": {"atomic_expiry_update": True, "staged_stop": False}}),
                      initial_diagnostics="{}")
     worker.connect()
     assert worker.supports_atomic_expiry_update is False
@@ -254,7 +257,7 @@ def test_later_ack_cannot_upgrade_atomic_expiry_update(backend):
 @pytest.mark.parametrize("action_id,state", [(17, "ready"), (0, "active")])
 def test_nonidle_initial_ack_cannot_advertise_atomic_expiry_update(action_id, state):
     worker = backend_module.SlamtecVelocityBackend({})
-    stats = json.dumps({"capabilities": {"atomic_expiry_update": True}})
+    stats = json.dumps({"capabilities": {"atomic_expiry_update": True, "staged_stop": False}})
     worker._buffer = f"MOTUS_SDK 0 OK {action_id} {state} {stats}\n".encode("ascii")
     worker._reply(0, 0.1)
     assert worker.supports_atomic_expiry_update is False
@@ -262,7 +265,7 @@ def test_nonidle_initial_ack_cannot_advertise_atomic_expiry_update(action_id, st
 
 def test_advertised_atomic_expiry_update_uses_the_update_verb(backend):
     worker = backend("expect_update", initial_diagnostics=json.dumps({
-        "capabilities": {"atomic_expiry_update": True}}))
+        "capabilities": {"atomic_expiry_update": True, "staged_stop": False}}))
     worker.connect()
     worker.write([0.05, 0, 0, 0, 0, -0.1], int(time.time() * 1000) + 200,
                  replace_expired=True)
@@ -271,7 +274,7 @@ def test_advertised_atomic_expiry_update_uses_the_update_verb(backend):
 
 def test_regular_write_keeps_set_even_when_atomic_update_is_supported(backend):
     worker = backend("expect_set", initial_diagnostics=json.dumps({
-        "capabilities": {"atomic_expiry_update": True}}))
+        "capabilities": {"atomic_expiry_update": True, "staged_stop": False}}))
     worker.connect()
     write(worker)
     assert worker.info()["state"] == "active" and worker._sequence == 1
@@ -290,7 +293,7 @@ def test_atomic_update_cannot_reach_an_unadvertised_worker(backend):
 
 def test_expired_atomic_update_remains_recoverable_after_native_confirmed_stop(backend):
     worker = backend("expired", initial_diagnostics=json.dumps({
-        "capabilities": {"atomic_expiry_update": True}}))
+        "capabilities": {"atomic_expiry_update": True, "staged_stop": False}}))
     worker.connect()
     with pytest.raises(backend_module.CommandLeaseExpired, match="remaining_ms=-12"):
         worker.write([0.05, 0, 0, 0, 0, -0.1], int(time.time() * 1000) + 200,
@@ -411,3 +414,61 @@ def session_binary(tmp_path_factory):
                                  "slow_begin", "slow_set", "cancel_failure", "begin_failure", "preempted"])
 def test_native_session_leases_and_ownership(session_binary, case):
     subprocess.run([str(session_binary), case], check=True, timeout=3)
+
+
+def test_staged_handshake_sends_absolute_follow_and_deadline_free_soft_stop(backend, monkeypatch):
+    worker=backend(initial_diagnostics=json.dumps({"capabilities":{"staged_stop":True}}))
+    worker.connect()
+    assert worker.supports_staged_stop
+    requests=[]
+    original=worker._request
+    def capture(value):
+        requests.append(value)
+        return original(value)
+    monkeypatch.setattr(worker,"_request",capture)
+    now=int(time.time()*1000)
+    worker.write([0.1,0,0,0,0,-0.2],now+300,cancel_deadline_ms=now+1000)
+    assert requests[0].split()[:3] == ["FOLLOW",str(now+300),str(now+1000)]
+    assert worker.info()["action_id"] == 17
+    worker.soft_stop()
+    assert requests[-1] == "SOFT_STOP"
+    assert worker.info()["action_id"] == 17
+
+
+def test_expired_follow_before_ipc_does_not_cancel_or_renew_live_session(backend):
+    worker=backend(initial_diagnostics=json.dumps({"capabilities":{"staged_stop":True}}))
+    worker.connect()
+    now=int(time.time()*1000)
+    worker.write([0.1,0,0,0,0,0],now+300,cancel_deadline_ms=now+1000)
+    sequence=worker._sequence
+    with pytest.raises(backend_module.StaleVelocityCommand) as raised:
+        worker.write([0.1,0,0,0,0,0],now-1,cancel_deadline_ms=now+1000)
+    assert not raised.value.zero_velocity_confirmed
+    assert worker._sequence == sequence and worker.info()["action_id"] == 17
+    assert worker.info()["connected"] and worker._armed
+
+
+@pytest.mark.parametrize("stats,confirmed", [
+    ({"session_active":True,"action_id":17,"soft_stopped":False},False),
+    ({"session_active":True,"action_id":17,"soft_stopped":True},True),
+    ({"session_active":False,"action_id":0},True),
+    ({"session_active":True,"action_id":0,"soft_stopped":True},False),
+    ({"soft_stopped":True},False),
+])
+def test_stale_ack_only_reports_zero_when_snapshot_is_consistent(backend,stats,confirmed):
+    worker=backend("stale",diagnostics=json.dumps(stats),initial_diagnostics=json.dumps({
+        "capabilities":{"staged_stop":True}}))
+    worker.connect()
+    now=int(time.time()*1000)
+    worker.write([0.1,0,0,0,0,0],now+300,cancel_deadline_ms=now+1000)
+    with pytest.raises(backend_module.StaleVelocityCommand) as raised:
+        worker.write([0.1,0,0,0,0,0],now+300,cancel_deadline_ms=now+1000)
+    assert raised.value.zero_velocity_confirmed is confirmed
+    assert worker.info()["connected"]
+
+
+@pytest.mark.parametrize("value", [False,1,"true",None,[],{}])
+def test_staged_stop_requires_explicit_boolean_initial_capability(backend,value):
+    worker=backend(initial_diagnostics=json.dumps({"capabilities":{"staged_stop":value}}))
+    worker.connect()
+    assert not worker.supports_staged_stop

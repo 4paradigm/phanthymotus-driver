@@ -40,7 +40,77 @@ int main(int argc, char** argv) {
     FakeChassis chassis;
     Session session(chassis);
     auto deadline = Clock::now() + std::chrono::milliseconds(300);
-    if (test == "idle") {
+    if (test == "staged_resume") {
+        auto motion = Clock::now() + std::chrono::milliseconds(100);
+        auto cancel = Clock::now() + std::chrono::milliseconds(1000);
+        session.follow(0.1, -0.2, motion, cancel);
+        session.tick(motion + std::chrono::milliseconds(1));
+        assert(session.active() && chassis.vx == 0 && chassis.wz == 0);
+        assert(chassis.cancels == 0 && chassis.heartbeat_stops == 0 && chassis.refreshes >= 1);
+        session.follow(0.12, 0.2, Clock::now()+std::chrono::milliseconds(300), cancel);
+        assert(chassis.begins == 1 && chassis.heartbeat_starts == 1);
+        assert(chassis.vx == 0.12 && chassis.wz == 0.2 && chassis.cancels == 0);
+        session.stop();
+    } else if (test == "staged_cancel" || test == "staged_repeat_zero") {
+        auto motion = Clock::now() + std::chrono::milliseconds(100);
+        auto cancel = Clock::now() + std::chrono::milliseconds(1000);
+        session.follow(0.1, 0, motion, cancel);
+        session.tick(motion);
+        if (test == "staged_repeat_zero")
+            for (int i=0; i<20; ++i) session.soft_stop();
+        assert(session.active() && chassis.cancels == 0 && chassis.heartbeat_stops == 0);
+        assert(session.stats_json().find("\"soft_stops\":1") != std::string::npos);
+        session.tick(cancel);
+        assert(!session.active() && chassis.cancels == 1 && chassis.heartbeat_stops == 1);
+    } else if (test == "staged_stale_drop") {
+        auto motion = Clock::now() + std::chrono::milliseconds(300);
+        auto cancel = Clock::now() + std::chrono::milliseconds(1000);
+        session.follow(0.1, 0.2, motion, cancel);
+        bool stale = false;
+        try { session.follow(0.2, -0.3, Clock::now()-std::chrono::milliseconds(1),
+                             Clock::now()+std::chrono::seconds(10)); }
+        catch (const StaleVelocityCommand&) { stale = true; }
+        assert(stale && chassis.vx == 0.1 && chassis.wz == 0.2 && chassis.writes == 1);
+        assert(chassis.cancels == 0 && chassis.heartbeat_stops == 0);
+        session.tick(motion);
+        assert(session.active() && chassis.vx == 0);
+        session.tick(cancel);
+        assert(!session.active() && chassis.cancels == 1);
+    } else if (test == "staged_slow_write") {
+        chassis.set_delay_ms = 30;
+        bool stale = false;
+        auto cancel = Clock::now()+std::chrono::milliseconds(300);
+        try { session.follow(0.1, 0.2, Clock::now()+std::chrono::milliseconds(10),cancel); }
+        catch (const StaleVelocityCommand&) { stale = true; }
+        assert(stale && session.active() && chassis.vx == 0 && chassis.wz == 0);
+        assert(chassis.cancels == 0 && chassis.heartbeat_stops == 0);
+        session.tick(cancel);
+        assert(!session.active() && chassis.cancels == 1);
+    } else if (test == "staged_stale_write_keeps_cancel") {
+        auto old_cancel = Clock::now()+std::chrono::milliseconds(900);
+        session.follow(0.1,0,Clock::now()+std::chrono::milliseconds(100),old_cancel);
+        chassis.set_delay_ms = 30;
+        bool stale = false;
+        try { session.follow(0.2,0,Clock::now()+std::chrono::milliseconds(10),
+                             Clock::now()+std::chrono::milliseconds(1000)); }
+        catch (const StaleVelocityCommand&) { stale = true; }
+        assert(stale && session.active() && chassis.vx == 0 && chassis.cancels == 0);
+        session.tick(old_cancel);
+        assert(!session.active() && chassis.cancels == 1);
+    } else if (test == "staged_cancel_failure") {
+        auto cancel = Clock::now()+std::chrono::milliseconds(1000);
+        session.follow(0.1,0,Clock::now()+std::chrono::milliseconds(300),cancel);
+        chassis.cancel_fails = true;
+        bool failed = false;
+        try { session.tick(cancel); } catch (const std::runtime_error&) { failed = true; }
+        assert(failed && session.active() && chassis.heartbeat_stops == 0);
+    } else if (test == "staged_explicit_stop") {
+        session.follow(0.1,0,Clock::now()+std::chrono::milliseconds(300),
+                       Clock::now()+std::chrono::milliseconds(1000));
+        session.stop();
+        assert(!session.active() && chassis.vx == 0 && chassis.cancels == 1);
+        assert(chassis.heartbeat_stops == 1);
+    } else if (test == "idle") {
         session.stop(); session.tick(deadline);
         assert(chassis.writes == 0 && chassis.cancels == 0 && chassis.heartbeat_starts == 0);
         assert(session.stats_json().find("\"stop_attempts\":0") != std::string::npos);

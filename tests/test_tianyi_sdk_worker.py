@@ -115,7 +115,7 @@ def worker(native_worker):
         processes.append(process)
         ready = read_reply(process)
         assert ready[2:] == ["OK", "0", "ready"]
-        assert ready.stats == {"capabilities": {"atomic_expiry_update": True}}
+        assert ready.stats == {"capabilities": {"atomic_expiry_update": True, "staged_stop": True}}
         return process
 
     yield create
@@ -278,4 +278,68 @@ def test_ownership_failure_stays_fatal_and_has_stage_diagnostics(worker):
     assert failed.stats["last_set"]["set_velocity_ms"] is None
     assert failed.stats["action_starts"] == failed.stats["confirmed_stops"] == 1
     assert failed.stats["stop_reason"] == "sdk_exception"
+    assert process.wait(timeout=2) == 1
+
+
+@pytest.mark.parametrize("case", ["staged_resume", "staged_cancel", "staged_repeat_zero",
+                                 "staged_stale_drop", "staged_slow_write",
+                                 "staged_cancel_failure", "staged_explicit_stop",
+                                 "staged_stale_write_keeps_cancel"])
+def test_native_staged_velocity_session(native_session, case):
+    subprocess.run([str(native_session), case], check=True, timeout=3)
+
+
+def follow(motion_ms=300, cancel_ms=1000, vx=0.1, wz=-0.2):
+    now = int(time.time()*1000)
+    return f"FOLLOW {now+motion_ms} {now+cancel_ms} {vx} {wz}"
+
+
+def test_follow_gap_soft_zeros_but_reuses_sdk_action_and_heartbeat(worker):
+    process = worker()
+    first = request(process,1,follow(80))
+    assert first[2:] == ["OK","1","active"]
+    time.sleep(0.15)
+    held = request(process,2,"SOFT_STOP")
+    assert held[2:] == ["OK","1","active"]
+    assert held.stats["soft_stops"] == 1 and held.stats["heartbeat_refreshes"] >= 1
+    assert held.stats["confirmed_stops"] == 0
+    fresh = request(process,3,follow())
+    assert fresh[2:] == ["OK","1","active"]
+    assert fresh.stats["action_starts"] == 1 and fresh.stats["confirmed_stops"] == 0
+    stopped = request(process,4,"STOP")
+    assert stopped[2:] == ["OK","0","ready"]
+
+
+def test_follow_silence_cancels_at_original_one_second_without_python_ticks(worker):
+    process = worker()
+    assert request(process,1,follow(100))[2:] == ["OK","1","active"]
+    time.sleep(1.10)
+    idle = request(process,2,"SOFT_STOP")
+    assert idle[2:] == ["OK","0","ready"]
+    assert idle.stats["soft_stops"] == 1 and idle.stats["confirmed_stops"] == 1
+    assert idle.stats["stop_reason"] == "lease_expired"
+    fresh = request(process,3,follow())
+    assert fresh[2:] == ["OK","2","active"]
+
+
+def test_follow_old_packets_neither_cancel_nor_renew_live_action(worker):
+    process = worker()
+    assert request(process,1,follow())[2:] == ["OK","1","active"]
+    stale = request(process,2,follow(-10))
+    assert stale[2] == "STALE"
+    assert stale.stats["action_id"] == 1 and stale.stats["session_active"]
+    assert stale.stats["soft_stops"] == stale.stats["confirmed_stops"] == 0
+    # Stale packets do not move the accepted cancellation deadline forward.
+    time.sleep(1.05)
+    idle = request(process,3,"SOFT_STOP")
+    assert idle[2:] == ["OK","0","ready"]
+    assert idle.stats["confirmed_stops"] == 1
+
+
+@pytest.mark.parametrize("motion,cancel", [(500,1000),(300,2000),(250,200)])
+def test_follow_rejects_excessive_or_reversed_deadlines(worker,motion,cancel):
+    process=worker()
+    invalid=request(process,1,follow(motion,cancel))
+    assert invalid[2] == "ERROR"
+    assert invalid.stats["action_starts"] == 0
     assert process.wait(timeout=2) == 1
