@@ -140,7 +140,26 @@ def _validated_min_vx(value, max_vx):
     return float(value)
 
 
-def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0):
+def _step_limits(hz, linear_acceleration, angular_acceleration):
+    for name, value in (("expected_hz", hz), ("linear_acceleration", linear_acceleration),
+                        ("angular_acceleration", angular_acceleration)):
+        try:
+            valid = (not isinstance(value, bool) and isinstance(value, (int, float)) and
+                     math.isfinite(value) and value > 0)
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError(f"loco_servo.{name} must be a positive finite number")
+    linear_step, angular_step = linear_acceleration / hz, angular_acceleration / hz
+    if not all(math.isfinite(value) and value > 0 for value in (linear_step, angular_step)):
+        raise ValueError("loco_servo per-frame velocity steps must be positive and finite")
+    # The middle axes are pinned at zero by their hard bounds; the descriptor
+    # still requires a positive step limit for every dimension.
+    return [linear_step, 1e-6, 1e-6, 1e-6, 1e-6, angular_step]
+
+
+def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0,
+                     linear_acceleration=0.3, angular_acceleration=2.0):
     min_vx = _validated_min_vx(min_vx, max_vx)
     return {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
@@ -149,7 +168,9 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0):
         "units": {"linear": "m/s", "angular": "rad/s", "time": "s"},
         "limits": {"lower": [-max_vx, 0, 0, 0, 0, -max_wz],
                    "upper": [max_vx, 0, 0, 0, 0, max_wz],
-                   "min_magnitude": [min_vx, 0, 0, 0, 0, 0]},
+                   "min_magnitude": [min_vx, 0, 0, 0, 0, 0],
+                   "max_delta_per_step": _step_limits(hz, linear_acceleration, angular_acceleration),
+                   "zero_immediate": True},
         "groups": [{"name": "base", "offset": 0, "count": 6,
                     "unit": "m/s", "resource": "base"}],
         "rate": {"max_hz": 20, "expected_hz": hz,
@@ -169,13 +190,13 @@ class LocoServoPlugin:
         self._hz = self._positive(config, "expected_hz", 10.0)
         if self._hz > 20:
             raise ValueError("loco_servo.expected_hz must be <= 20")
-        self._descriptor = build_descriptor(
-            self._hz, self._positive(config, "max_vx", 0.3),
-            self._positive(config, "max_wz", 1.0), config.get("min_vx", 0.0))
-        self._min_vx = self._descriptor["limits"]["min_magnitude"][0]
-        self._parsed_descriptor = parse_descriptor(self._descriptor)
         self._accel = (self._positive(config, "linear_acceleration", 0.3),
                        self._positive(config, "angular_acceleration", 2.0))
+        self._descriptor = build_descriptor(
+            self._hz, self._positive(config, "max_vx", 0.3),
+            self._positive(config, "max_wz", 1.0), config.get("min_vx", 0.0), *self._accel)
+        self._min_vx = self._descriptor["limits"]["min_magnitude"][0]
+        self._parsed_descriptor = parse_descriptor(self._descriptor)
         self._settings = dict(TOGGLES)
         for key in TOGGLES:
             if key in config:
@@ -208,6 +229,7 @@ class LocoServoPlugin:
         self._cancel_deadline_ms = 0
         self._soft_held = False
         self._last_preserved_action = False
+        self._command_requested_values = [0.0] * 6
         self._zero_pending = False
         self._last = None
         self._last_timing = None
@@ -230,30 +252,36 @@ class LocoServoPlugin:
         return float(value)
 
     def get_tool(self):
-        return {
+        tool = {
             "name": "loco_servo", "type": "actuator", "multiInstance": False,
             "description": "天轶底盘连续速度控制：接收 navi 的速度流，通过思岚 SDK 执行 vx/wz；默认空跑。",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
                     "action": {"type": "string", "enum":
-                               ["start", "stop", "pause", "resume", "info"]},
+                               ["start", "stop", "pause", "resume", "info", "config"]},
                     "input_topic": {"type": "string", "default": INPUT_TOPIC}},
                 "x-resource": ["base"], "x-is-dangerous": True,
                 "x-hooks": {"on_interrupt_motion": {"action": "pause"},
                             "on_interrupt_all": {"action": "pause"}},
                 "x-action-params": {
+                    "start": {"params": ["input_topic"], "description": "订阅速度话题，准备接收新的导航指令"},
+                    "stop": {"params": [], "description": "停止底盘并释放速度订阅"},
                     "pause": {"params": [], "description": "停止底盘，保持订阅"},
-                    "resume": {"params": [], "description": "恢复接收新的速度指令"}}},
+                    "resume": {"params": [], "description": "恢复接收新的速度指令"},
+                    "info": {"params": [], "description": "查看状态、动作空间及执行诊断"},
+                    "config": {"params": ["dry_run", "rotate_only", "require_standing", "min_vx",
+                                           "linear_acceleration", "angular_acceleration"],
+                               "description": "更新空跑、执行限制及标称加速度；设置变化前先停车"}}},
             "topic_in": [{"topic": INPUT_TOPIC, "format": "control/velocity",
                           "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}],
             "configSchema": {"type": "object", "properties": {
                 "linear_acceleration": {"type": "number", "default": self._accel[0],
                                         "exclusiveMinimum": 0,
-                                        "description": "直行速度变化上限（m/s²），默认 0.3；用于执行端平滑，不是实测硬件极限。显式零速度立即停车。"},
+                                        "description": "直行标称加速度（m/s²），默认 0.3；按 expected_hz 换算为每帧速度步长，由共享 ControlSink 钳制。显式零速度立即停车。"},
                 "angular_acceleration": {"type": "number", "default": self._accel[1],
                                          "exclusiveMinimum": 0,
-                                         "description": "转向速度变化上限（rad/s²），默认 2.0；用于执行端响应调节，不是实测硬件极限。显式零速度立即停车。"},
+                                         "description": "转向标称加速度（rad/s²），默认 2.0；按 expected_hz 换算为每帧速度步长，由共享 ControlSink 钳制。显式零速度立即停车。"},
                 "min_vx": {"type": "number", "default": 0.0, "minimum": 0.0,
                            "maximum": self._descriptor["limits"]["upper"][0],
                            "description": "实测最小稳定直行速度（m/s），仅向规划器声明，不在执行端强行抬高速度；0 不声明。修改后需重新启动 navi 读取。"},
@@ -264,6 +292,11 @@ class LocoServoPlugin:
                 "require_standing": {"type": "boolean", "default": False,
                                      "description": "要求有效的站立反馈才执行指令。天轶需配置 standing_topic（域0 Bool）；开启后缺失、过期或 false 均拒绝运动。"}}},
         }
+        # Both public MCP calls and the configuration form use one declaration.
+        # Agent Core constructs action-specific functions from x-action-params;
+        # configSchema alone does not advertise a dispatchable config action.
+        tool["inputSchema"]["properties"].update(copy.deepcopy(tool["configSchema"]["properties"]))
+        return tool
 
     def start(self):
         """Bundle lazy-start hook, intentionally inert."""
@@ -361,6 +394,7 @@ class LocoServoPlugin:
         self._barrier_ms = int(time.time() * 1000)
         self._sink = ControlSink(self._parsed_descriptor, self._apply,
                                  on_watchdog=self._soft_hold, on_abort=self._soft_hold)
+        self._sink.rebase([0.0] * 6)
         try:
             self._open(self._input_topic, generation)
         except Exception as exc:
@@ -543,6 +577,12 @@ class LocoServoPlugin:
                     "remaining_before_apply_ms": self._command_deadline_ms - wall_ms,
                     "cancel_remaining_before_apply_ms": self._command_cancel_deadline_ms - wall_ms,
                 }
+                self._command_requested_values = list(command["values"])
+                # The native deadline independently zeroes the old command.
+                # Synchronize only the physical baseline, never seq/holder or
+                # accepted deadlines, before the shared sink clamps a new one.
+                if self._lease_expiry_ms and wall_ms >= self._lease_expiry_ms:
+                    self._sink.rebase([0.0] * 6)
                 try:
                     outcome = self._sink.submit(command)
                 finally:
@@ -550,6 +590,9 @@ class LocoServoPlugin:
                         apply_round_trip_ms=round((time.monotonic() - started) * 1000, 1),
                         remaining_after_apply_ms=self._command_deadline_ms - int(time.time() * 1000))
                 if outcome.applied:
+                    # rotate_only changes what reached the chassis. The next
+                    # shared clamp must start at that actual output.
+                    self._sink.rebase(self._last_output)
                     self._counts["accepted"] += 1
                     if any(self._last_output) or self._last_preserved_action:
                         self._last_valid_at = received_mono
@@ -574,9 +617,22 @@ class LocoServoPlugin:
                 self._record("REFUSED", str(exc))
             except (StaleVelocityCommand, CommandLeaseExpired) as exc:
                 self._counts["dropped"] += 1
-                # A stale candidate does not revoke or renew the last accepted
-                # command. The ordinary tick applies its original soft/cancel
-                # deadlines, independently of this rejected packet.
+                if (isinstance(exc, StaleVelocityCommand) and
+                        getattr(exc, "zero_velocity_confirmed", False) is True):
+                    # A fresh candidate can expire inside its SDK call. Native
+                    # then acknowledges a real zero even when the previous
+                    # accepted motion deadline is still in the future. Rebase
+                    # to that actual output, without adopting the rejected
+                    # candidate's receive/cancel deadlines or issuing a STOP.
+                    self._last_output = [0.0] * 6
+                    self._last_output_at = None
+                    self._last_preserved_action = False
+                    self._lease_expiry_ms = 0
+                    self._soft_held = True
+                    self._sink.rebase(self._last_output)
+                # Rejection itself issues no stop and adopts no new lease.
+                # The ordinary tick retains the accepted cancellation deadline,
+                # independently of this rejected packet.
                 self._record("DROPPED", str(exc))
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
                 self._counts["rejected"] += 1
@@ -625,17 +681,21 @@ class LocoServoPlugin:
     def _apply(self, values, _gripper=None):
         # Run after sink freshness/shape/arbitration checks: invalid input must
         # neither renew motion nor issue a stop against an otherwise live lease.
-        if any(values) and self._command_deadline_ms <= time.time() * 1000:
+        requested = list(self._command_requested_values)
+        if self._settings["rotate_only"]:
+            requested[0] = requested[1] = 0.0
+        motion_requested = any(requested)
+        if motion_requested and self._command_deadline_ms <= time.time() * 1000:
             raise CommandLeaseExpired("receive watchdog or observation deadline expired before apply")
-        if any(values):
+        if motion_requested:
             problem = self._standing_problem()
             if problem:
                 self._hold()
                 raise _PostureRefused(problem)
-        target = list(values)
+        output = list(values)
         if self._settings["rotate_only"]:
-            target[0] = target[1] = 0.0
-        motion_expired = bool(any(target) and self._lease_expiry_ms and
+            output[0] = output[1] = 0.0
+        motion_expired = bool(motion_requested and self._lease_expiry_ms and
                               time.time() * 1000 >= self._lease_expiry_ms)
         if motion_expired and not self._native_staged_stop() and not self._native_expiry_update():
             # Compatibility with old workers that cancel on motion expiry.
@@ -652,31 +712,15 @@ class LocoServoPlugin:
                                self._native_expiry_update() and
                                self._lease_expiry_ms and
                                time.time() * 1000 >= self._lease_expiry_ms)
-        if motion_expired:
-            # A staged worker has zeroed the old command without cancelling;
-            # an old atomic worker confirms STOP inside UPDATE. In both cases
-            # restart the ramp from the zero actually required by the deadline.
-            self._last_output = [0.0] * 6
-            self._last_output_at = None
         now = time.monotonic()
-        # Source cadence can jitter around expected_hz. Capping every interval
-        # at one nominal tick loses the extra time in a long interval without
-        # making it up in the following short one, slowing the actual response.
-        # An expired previous lease has already reset the ramp above.
-        dt = max(0, now - self._last_output_at) if self._last_output_at is not None else 1 / self._hz
-        output = [0.0] * 6
-        for axis, accel in ((0, self._accel[0]), (5, self._accel[1])):
-            # Explicit zero bypasses acceleration limiting: stop means stop.
-            if target[axis]:
-                step = accel * dt
-                output[axis] = max(self._last_output[axis] - step,
-                                   min(target[axis], self._last_output[axis] + step))
+        # ControlSink is the sole step limiter. Its values are already clamped
+        # by the advertised fixed per-frame contract, including immediate zero.
         if self._settings["dry_run"]:
             self._counts["dry_run_commands"] += 1
         else:
             self._publish(output, replace_expired=replace_expired,
-                          preserve_action=bool(any(target) and not any(output)))
-        self._last_preserved_action = bool(any(target) and not any(output))
+                          preserve_action=bool(motion_requested and not any(output)))
+        self._last_preserved_action = bool(motion_requested and not any(output))
         self._last_output = output
         self._last_output_at = now
         self._zero_pending = False
@@ -724,6 +768,8 @@ class LocoServoPlugin:
         self._last_preserved_action = False
         self._lease_expiry_ms = 0
         self._soft_held = True
+        if self._sink is not None:
+            self._sink.rebase(self._last_output)
         self._record("SOFT_HOLD", "receive watchdog or observation deadline expired; action retained")
 
     def _hold(self, *_args):
@@ -745,6 +791,8 @@ class LocoServoPlugin:
         self._cancel_deadline_ms = 0
         self._soft_held = False
         self._last_preserved_action = False
+        if self._sink is not None and not self._zero_pending:
+            self._sink.rebase(self._last_output)
 
     def _tick(self, generation=None):
         with self._lock:
@@ -791,6 +839,7 @@ class LocoServoPlugin:
                                        self._descriptor["limits"]["upper"][0])
             descriptor = copy.deepcopy(self._descriptor)
             descriptor["limits"]["min_magnitude"][0] = min_vx
+            descriptor["limits"]["max_delta_per_step"] = _step_limits(self._hz, *acceleration)
             parsed_descriptor = parse_descriptor(descriptor)
         except ValueError as exc:
             return {"state": "error", "error": str(exc)}
@@ -809,10 +858,12 @@ class LocoServoPlugin:
                     except Exception as exc:
                         self._inbox.activate(self._generation, not self._paused and not self._yielded)
                         return {"state": "error", "error": str(exc), "dry_run": self._settings["dry_run"]}
+            if self._sink is not None:
+                self._sink.reconfigure(parsed_descriptor)
             self._settings.update(updates)
             self._accel = acceleration
-            # This is planner metadata only. Keep the existing sink instance:
-            # its bounds are unchanged, and it owns seq/source arbitration.
+            # Keep the existing sink and its source/sequence arbitration;
+            # reconfigure only the declared limits and their shared clamp.
             self._min_vx = min_vx
             self._descriptor = descriptor
             self._parsed_descriptor = parsed_descriptor
@@ -847,6 +898,7 @@ class LocoServoPlugin:
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
             "input_queue": self._inbox.info(),
             "dispatch": {"mode": "dedicated_worker", "watchdog_poll_ms": 20,
+                         "step_limiter": "shared_control_sink", "step_basis": "per_command",
                          "execution_deadline_basis": "receive_watchdog_and_observation",
                          "receive_watchdog_ms": WATCHDOG_MS,
                          "cancel_after_ms": CANCEL_AFTER_MS,

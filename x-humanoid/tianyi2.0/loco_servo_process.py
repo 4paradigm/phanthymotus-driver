@@ -6,26 +6,38 @@ never renews a producer timestamp or acknowledges an SDK write on its behalf.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+
+def _install_child_logging():
+    # A fresh interpreter inherits file descriptors, not the parent's Python
+    # stream wrappers. Resolve common/ before importing any controller code.
+    source_root = Path(__file__).resolve().parents[2]
+    if (source_root / "common").is_dir() and str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError as exc:
+        sys.stderr.write(f"[loco-servo-worker] logsafe unavailable ({exc}); stdout unprotected\n")
+
+
+if __name__ == "__main__":
+    _install_child_logging()
+
 import copy
 import json
 import math
 import os
-from pathlib import Path
 import signal
 import socket
 import struct
 import subprocess
-import sys
 import threading
 import time
 from types import SimpleNamespace
 import uuid
-
-# Running the worker directly from a source checkout must find shared common/;
-# Docker places common/ beside this file and needs no additional search path.
-_source_root = Path(__file__).resolve().parent.parent.parent
-if __name__ == "__main__" and (_source_root / "common").is_dir():
-    sys.path.insert(0, str(_source_root))
 
 from loco_servo import LocoServoPlugin as _Core, TOGGLES, _validated_min_vx
 from slamtec_velocity import SlamtecVelocityBackend
@@ -172,6 +184,7 @@ class _HeadlessController(_Core):
 
 
 def _child(control_fd, data_fd):
+    _install_child_logging()  # Also protect direct multiprocessing entry use.
     control = socket.socket(fileno=control_fd)
     data = socket.socket(fileno=data_fd)
     core = None

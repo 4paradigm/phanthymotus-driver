@@ -278,7 +278,7 @@ Python interpreter. The facade sends original input and receive timestamps over
 a nonblocking Unix datagram channel, retaining a priority zero and the latest
 motion under backpressure. Lifecycle RPC uses a separate channel; waiting for an
 `info` response does not block command reception or SDK execution in the child.
-The child owns the unchanged ControlSink, acceleration limits, watchdog and SDK
+The child owns the shared ControlSink, declared velocity-step limits, watchdog and SDK
 backend. Its dedicated control thread consumes the latest command and performs
 synchronous SDK calls. The event wakes on arrivals;
 an independent maximum-20ms wait bounds watchdog, standing and deferred-apply
@@ -303,8 +303,8 @@ command replay occurs.
 When the previous motion lease has expired, a capable native worker accepts
 the next fully validated fresh motion in one `UPDATE` request. It confirms any
 expired old action's stop, rechecks the new command's original deadline, then
-starts/updates velocity before returning one ACK. Python resets the acceleration
-ramp from zero without an extra STOP/ACK round trip before this request. This
+starts/updates velocity before returning one ACK. The driver synchronizes the
+shared sink's baseline to zero without an extra STOP/ACK round trip. This
 reduces recovery delay; it does not keep expired motion alive or remove the
 physical stop required by an expired lease. A failed stop remains fatal, and a
 new deadline consumed by stopping never starts a new action. Ordinary `SET`,
@@ -349,19 +349,30 @@ publication alone cannot guarantee continuous motion: expired observations,
 receive-watchdog gaps, stale input, explicit zeros, invalid commands and SDK faults still stop or refuse
 motion. These timings distinguish those cases from local queue delay.
 
-Acceleration caps default to 0.3 m/s² and 2.0 rad/s². The angular value is a
-bounded response setting, not a measured hardware limit. The ramp uses the
-actual interval between applications so alternating short/long arrival gaps
-do not make the effective acceleration lower than configured. Explicit zero, pause, stop,
-lease expiration and watchdog stop bypass the ramp. Cancelling an SDK action
+Nominal acceleration settings default to 0.3 m/s² and 2.0 rad/s². At the
+declared 10Hz cadence they become 0.03 m/s and 0.2 rad/s per accepted command in
+`limits.max_delta_per_step`; pinned axes have positive tiny step values.
+ControlSink is the only step limiter, and its `CLAMPED` verdict reports the
+result. There is no second ramp in the SDK callback. Like R1, this is a fixed
+per-command step contract, not a strict elapsed-time acceleration guarantee at
+a different cadence. The first command is also step-limited from a zero
+baseline. `limits.zero_immediate=true` makes a requested zero on either active
+axis take effect immediately, including stopping forward motion while still
+turning. Pause, stop, lease expiration and watchdog stop also bypass shaping.
+Cancelling an SDK action
 addresses only this worker's held action handle. Before beginning or updating
 motion, the worker checks for another active action or replacement of its own
 handle; it refuses to overwrite that action. Raw velocity streaming does not
 add obstacle avoidance.
 
+If a native `STALE` reply explicitly confirms that the SDK has already zeroed
+velocity, the driver also rebases the shared sink to zero. A stale packet alone
+does not change that baseline or renew any accepted deadline. This prevents the
+next valid frame from jumping from a remembered old speed after a real stop.
+
 Like R1's per-frame velocity execution, continuous fresh input updates the held
 SDK velocity action. A nonzero requested target that passes through exactly
-zero during an acceleration-limited reversal sends a zero-velocity update,
+zero during a step-limited reversal sends a zero-velocity update,
 without cancelling and recreating that action. The staged `FOLLOW` operation
 carries the intermediate zero while retaining the original bounded deadlines.
 Legacy workers with the `ZERO` capability can also retain an existing action
@@ -379,8 +390,8 @@ Configure loco_servo exposes live settings via `action: config`:
 | `rotate_only` | false | Suppress translation and preserve yaw rate; unsupported axes remain rejected |
 | `require_standing` | false | Require fresh true feedback from a configured domain-0 Bool source; missing/stale/false feedback stops/refuses motion |
 | `min_vx` | 0 | Measured minimum stable forward speed (m/s), advertised only as `control_interface.limits.min_magnitude[0]`; 0 declares no floor |
-| `linear_acceleration` | 0.3 | Linear response limit in m/s²; positive finite value, applied by the servo |
-| `angular_acceleration` | 2.0 | Angular response limit in rad/s²; positive finite value, applied by the servo |
+| `linear_acceleration` | 0.3 | Nominal m/s² at expected_hz, converted to a shared per-command velocity step |
+| `angular_acceleration` | 2.0 | Nominal rad/s² at expected_hz, converted to a shared per-command angular-velocity step |
 
 Changing an acceleration setting stops the old motion before applying the new
 setting. The next fresh command starts under the new setting. `info` reports

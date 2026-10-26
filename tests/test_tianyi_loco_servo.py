@@ -40,7 +40,9 @@ class CommandLeaseExpired(ValueError):
 
 
 class StaleVelocityCommand(CommandLeaseExpired):
-    pass
+    def __init__(self, message, *, zero_velocity_confirmed=False):
+        super().__init__(message)
+        self.zero_velocity_confirmed = zero_velocity_confirmed is True
 
 
 class FakeBackend:
@@ -1148,7 +1150,7 @@ def test_native_stale_packet_does_not_cancel_and_accepts_only_a_new_sequence(set
     fresh = command(setup, seq=3, ttl_ms=120)
     send(plugin, fresh)
     assert backend.write == original_write
-    assert backend.messages[-1] == pytest.approx([0.09, 0, 0, 0, 0, 0.4])
+    assert backend.messages[-1] == pytest.approx([0.06, 0, 0, 0, 0, 0.4])
     assert backend.deadlines[-1] == pytest.approx(fresh["stamp_ms"] + 300, abs=1)
     assert plugin._counts["accepted"] == 2
 
@@ -1486,17 +1488,16 @@ def test_bundle_does_not_start_other_motion_when_sdk_stop_fails(setup, monkeypat
 
 
 @pytest.mark.parametrize("intervals", [[0.1] * 20, [0.051, 0.149] * 10])
-def test_jittered_10hz_input_preserves_elapsed_acceleration_budget(setup, intervals):
-    # The same two seconds must produce the same ramp progress, whether the
-    # delivery gaps are regular or alternate around 100ms. No lease is renewed
-    # between these new, valid commands.
+def test_jittered_10hz_input_uses_the_same_advertised_step_per_valid_frame(setup, intervals):
+    # The shared contract is per submitted frame, rather than elapsed time.
+    # Equal numbers of valid frames must give equal progress under jitter.
     plugin = start(setup, max_wz=2.0, angular_acceleration=0.6)
     values = [0.2, 0, 0, 0, 0, 2.0]
     send(plugin, command(setup, values, seq=1))
     for seq, interval in enumerate(intervals, start=2):
         setup.clock.advance(interval)
         send(plugin, command(setup, values, seq=seq))
-    assert plugin._last_output[5] == pytest.approx(0.6 * (0.1 + sum(intervals)))
+    assert plugin._last_output[5] == pytest.approx(0.6 / 10 * 21)
     assert plugin._counts["accepted"] == 21
     assert plugin._counts["holds"] == plugin._counts["dropped"] == 0
 
@@ -1625,3 +1626,188 @@ def test_acceleration_update_does_not_commit_after_readonly_connect_failure(setu
     assert plugin._accel == (0.3, 2.0)
     assert plugin._settings["dry_run"]
     assert not plugin._backend.messages
+
+
+def test_descriptor_declares_the_only_step_limiter_and_zero_exception(setup):
+    plugin = setup.create()
+    interface = plugin._info()["control_interface"]
+    assert interface["limits"]["max_delta_per_step"] == [0.03, 1e-6, 1e-6, 1e-6, 1e-6, 0.2]
+    assert interface["limits"]["zero_immediate"] is True
+    assert "max_velocity" not in interface["limits"]  # Delta/dt here would be jerk.
+    varied = setup.create(expected_hz=20, linear_acceleration=0.6, angular_acceleration=1.0)
+    assert varied._info()["control_interface"]["limits"]["max_delta_per_step"] == [
+        0.03, 1e-6, 1e-6, 1e-6, 1e-6, 0.05]
+
+
+def test_sdk_receives_shared_clamped_values_without_a_second_ramp(setup, monkeypatch):
+    plugin = start(setup)
+    seen = []
+    clamp = plugin._sink._clamp_step
+    def capture(values):
+        result = clamp(values)
+        seen.append(result[0])
+        return result
+    monkeypatch.setattr(plugin._sink, "_clamp_step", capture)
+    for sequence in range(1, 7):
+        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=sequence))
+        assert plugin._backend.messages[-1] == list(seen[-1])
+        assert plugin._last_output == list(seen[-1])
+        assert plugin._last["verdict"] == "CLAMPED"
+        setup.clock.advance(0.06)  # A second private dt ramp would disagree here.
+    assert plugin._backend.messages[0] == [0.03, 0, 0, 0, 0, 0.2]
+    assert plugin._last_output[0] == pytest.approx(0.18)
+
+
+def test_single_axis_zero_immediately_stops_translation_while_turning(setup):
+    plugin = start(setup)
+    for sequence in range(1, 12):
+        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 0.6], seq=sequence))
+        setup.clock.advance()
+    send(plugin, command(setup, [0, 0, 0, 0, 0, -0.6], seq=12))
+    assert plugin._last_output[0] == 0
+    assert plugin._last_output[5] == pytest.approx(0.4)
+    assert plugin._backend.stop_calls == 0
+    assert plugin._sink._last_values == tuple(plugin._last_output)
+    setup.clock.advance()
+    send(plugin, command(setup, [0] * 6, seq=13))
+    assert plugin._last_output == [0] * 6
+    assert plugin._backend.stop_calls == 1
+    assert plugin._sink._last_values == (0,) * 6
+
+
+def test_soft_hold_rebases_actual_zero_without_forgetting_source_or_sequence(setup):
+    plugin = start(setup)
+    for sequence in range(1, 12):
+        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=sequence,
+                             source="owner", priority=10))
+        setup.clock.advance()
+    setup.clock.advance(0.21)
+    plugin._tick()
+    assert plugin._soft_held and plugin._sink._last_values == (0,) * 6
+    assert plugin._sink.stats()["holder"] == "owner"
+    assert plugin._sink._seq_by_source["owner"] == 11
+    send(plugin, command(setup, seq=11, source="owner", priority=10))
+    assert plugin._last["verdict"] == "DROPPED"
+    send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=12, source="owner", priority=10))
+    assert plugin._last_output == [0.03, 0, 0, 0, 0, 0.2]
+    assert plugin._backend.stop_calls == 0
+
+
+def test_live_step_config_reconfigures_the_same_sink_and_preserves_arbitration(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, source="owner", priority=10))
+    sink = plugin._sink
+    result = plugin.dispatch("config", {"linear_acceleration": 0.6, "angular_acceleration": 1.0})
+    assert result["ok"] and plugin._sink is sink
+    assert sink.descriptor is plugin._parsed_descriptor
+    assert sink.descriptor.max_delta_per_step == (0.06, 1e-6, 1e-6, 1e-6, 1e-6, 0.1)
+    assert sink.stats()["holder"] == "owner" and sink._seq_by_source["owner"] == 1
+    setup.clock.advance()
+    send(plugin, command(setup, seq=1, source="owner", priority=10))
+    assert plugin._last["verdict"] == "DROPPED"
+    send(plugin, command(setup, seq=2, source="other", priority=0))
+    assert plugin._last["verdict"] == "DROPPED" and "outranked" in plugin._last["reason"]
+    send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=2, source="owner", priority=10))
+    assert plugin._last_output == [0.06, 0, 0, 0, 0, 0.1]
+
+
+def test_rotate_only_rebases_to_the_translation_actually_executed(setup):
+    plugin = start(setup, rotate_only=True)
+    for sequence in range(1, 6):
+        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=sequence))
+        assert plugin._last_output[0] == 0
+        assert plugin._sink._last_values[0] == 0
+        setup.clock.advance()
+    assert plugin.dispatch("config", {"rotate_only": False})["ok"]
+    setup.clock.advance()
+    send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=6))
+    assert plugin._last_output == [0.03, 0, 0, 0, 0, 0.2]
+
+
+def test_fresh_input_after_native_motion_deadline_clamps_from_zero_before_python_tick(setup):
+    plugin = start(setup)
+    for sequence in range(1, 12):
+        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=sequence))
+        setup.clock.advance()
+    setup.clock.advance(0.21)
+    # Let a new valid frame be selected before Python's post-input deadline
+    # check. Native FOLLOW will have zeroed the old motion independently.
+    send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=12))
+    assert plugin._last_output == [0.03, 0, 0, 0, 0, 0.2]
+    assert plugin._backend.stop_calls == 0
+    assert not plugin._soft_held
+
+
+def test_expired_zero_input_does_not_change_the_shared_execution_baseline(setup):
+    plugin = start(setup)
+    send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1]))
+    previous = plugin._sink._last_values
+    setup.clock.advance(0.1)
+    send(plugin, command(setup, [0] * 6, seq=2, stamp_ms=int(setup.clock.time() * 1000) - 201))
+    assert plugin._last["verdict"] == "DROPPED"
+    assert plugin._sink._last_values == previous
+    assert plugin._backend.stop_calls == 0
+    assert tuple(plugin._last_output) == previous
+
+
+@pytest.mark.parametrize("field", ["linear_acceleration", "angular_acceleration"])
+def test_configuration_rejects_underflowed_step_before_stopping_current_motion(setup, field):
+    plugin = start(setup)
+    send(plugin, command(setup))
+    previous = plugin._descriptor
+    assert plugin.dispatch("config", {field: 5e-324})["state"] == "error"
+    assert plugin._descriptor is previous
+    assert plugin._backend.stop_calls == 0
+    assert plugin._accel == (0.3, 2.0)
+
+
+@pytest.mark.parametrize("confirmed_zero", [False, True])
+def test_native_stale_ack_rebases_only_a_confirmed_real_zero(setup, monkeypatch, confirmed_zero):
+    plugin = start(setup)
+    for sequence in range(1, 11):
+        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=sequence))
+        setup.clock.advance()
+    backend = plugin._backend
+    old_output = list(plugin._last_output)
+    old_baseline = plugin._sink._last_values
+    old_receipt = plugin._last_valid_at
+    old_motion = plugin._lease_expiry_ms
+    old_cancel = plugin._cancel_deadline_ms
+    old_output_time = plugin._last_output_at
+
+    def expire_during_sdk(values, deadline, **options):
+        assert deadline < old_motion  # New observation leaves only 10ms.
+        setup.clock.advance(0.02)
+        assert old_motion > setup.clock.time() * 1000
+        if confirmed_zero:
+            # Native's own deadline loop, rather than Python STOP/soft_stop.
+            backend.messages.append([0] * 6)
+        raise StaleVelocityCommand("motion deadline spent in SDK", zero_velocity_confirmed=confirmed_zero)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "write", expire_during_sdk)
+        send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=11,
+                             obs_stamp_ms=int(setup.clock.time() * 1000) - 490))
+    assert plugin._counts["accepted"] == 10 and plugin._counts["dropped"] == 1
+    assert plugin._last["verdict"] == "DROPPED"
+    assert plugin._last_valid_at == old_receipt
+    assert plugin._cancel_deadline_ms == old_cancel
+    assert backend.stop_calls == 0 and not backend.soft_stop_calls
+    if confirmed_zero:
+        assert plugin._last_output == [0] * 6
+        assert plugin._sink._last_values == (0,) * 6
+        assert plugin._last_output_at is None
+        assert plugin._lease_expiry_ms == 0 and plugin._soft_held
+    else:
+        assert plugin._last_output == old_output
+        assert plugin._sink._last_values == old_baseline
+        assert plugin._last_output_at == old_output_time
+        assert plugin._lease_expiry_ms == old_motion and not plugin._soft_held
+
+    send(plugin, command(setup, [0.3, 0, 0, 0, 0, 1], seq=12))
+    expected = [0.03, 0, 0, 0, 0, 0.2] if confirmed_zero else old_output
+    assert plugin._last_output == pytest.approx(expected)
+    assert backend.messages[-1] == pytest.approx(expected)
+    assert plugin._sink._last_values == tuple(plugin._last_output)
+    assert plugin._counts["accepted"] == 11
+    assert backend.stop_calls == 0

@@ -133,6 +133,9 @@ class Descriptor:
     # missing protection is visible instead of assumed. See sink.ControlSink.
     force_torque: tuple[float, ...] | None = None
     groups: tuple[Group, ...] = ()
+    # Opt-in for velocity streams: an explicitly zero axis must stop without
+    # being turned back into motion by the per-step slew clamp.
+    zero_immediate: bool = False
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -263,6 +266,12 @@ def parse_descriptor(raw: dict) -> Descriptor:
         if any(d <= 0 for d in max_delta):
             raise DescriptorError("descriptor.limits.max_delta_per_step must be positive")
 
+    zero_immediate = limits.get("zero_immediate", False)
+    if not isinstance(zero_immediate, bool):
+        raise DescriptorError("descriptor.limits.zero_immediate must be boolean")
+    if zero_immediate and mode != "twist":
+        raise DescriptorError("descriptor.limits.zero_immediate is only supported for twist")
+
     rate = _require(raw, "rate", "")
     if not isinstance(rate, dict):
         raise DescriptorError("descriptor.rate must be an object")
@@ -310,6 +319,8 @@ def parse_descriptor(raw: dict) -> Descriptor:
         raise DescriptorError("descriptor.end_effector must be an object or absent")
 
     groups = _parse_groups(raw.get("groups"), dof=dof, default_mode=mode)
+    if zero_immediate and any(group.mode != "twist" for group in groups):
+        raise DescriptorError("descriptor.limits.zero_immediate requires twist-only groups")
 
     return Descriptor(
         mode=mode,
@@ -328,6 +339,7 @@ def parse_descriptor(raw: dict) -> Descriptor:
         end_effector=end_effector,
         force_torque=force_torque,
         groups=groups,
+        zero_immediate=zero_immediate,
         raw=dict(raw),
     )
 

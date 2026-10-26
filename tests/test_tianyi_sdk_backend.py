@@ -46,7 +46,7 @@ for line in sys.stdin:
         emit("MOTUS_SDK "+seq+" EXPIRED "+b"unexpected stop reply".hex())
         continue
     if mode in ("stale_follow", "stale_follow_first") and verb == "FOLLOW" and (seq == "2" or mode == "stale_follow_first"):
-        snapshot='{{"session_active":true,"action_id":17}}'
+        snapshot='{{"session_active":true,"action_id":17,"soft_stopped":'+('true' if mode == 'stale_follow_first' else 'false')+'}}'
         print("MOTUS_SDK "+seq+" STALE "+b"stale FOLLOW deadline".hex()+" "+snapshot,flush=True)
         continue
     if mode == "wrong_sequence":
@@ -162,8 +162,9 @@ def test_stale_follow_reply_preserves_accepted_action_and_connection(backend):
     worker.connect()
     now = int(time.time() * 1000)
     worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
-    with pytest.raises(backend_module.StaleVelocityCommand):
+    with pytest.raises(backend_module.StaleVelocityCommand) as stale:
         worker.write([.2, 0, 0, 0, 0, .3], now + 200, cancel_deadline_ms=now + 900)
+    assert stale.value.zero_velocity_confirmed is False
     assert worker._armed and worker.info()["state"] == "active"
     assert worker.info()["action_id"] == 17 and worker.info()["connected"]
     assert worker.info()["expired_commands"] == 1
@@ -176,8 +177,9 @@ def test_stale_follow_first_slow_sdk_ack_tracks_newly_created_zero_action(backen
         "capabilities": {"staged_stop": True}}))
     worker.connect()
     now = int(time.time() * 1000)
-    with pytest.raises(backend_module.StaleVelocityCommand):
+    with pytest.raises(backend_module.StaleVelocityCommand) as stale:
         worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
+    assert stale.value.zero_velocity_confirmed is True
     assert worker._armed and worker.info()["action_id"] == 17
     worker.stop()
     assert not worker._armed
@@ -189,9 +191,48 @@ def test_locally_stale_follow_never_sends_or_cancels_existing_velocity(backend):
     worker.connect()
     now = int(time.time() * 1000)
     worker.write([.1, 0, 0, 0, 0, -.2], now + 200, cancel_deadline_ms=now + 900)
-    with pytest.raises(backend_module.StaleVelocityCommand):
+    with pytest.raises(backend_module.StaleVelocityCommand) as stale:
         worker.write([.2, 0, 0, 0, 0, .3], now - 1, cancel_deadline_ms=now + 900)
+    assert stale.value.zero_velocity_confirmed is False
     assert worker._sequence == 1 and worker._armed
+
+
+@pytest.mark.parametrize("snapshot,zero_confirmed", [
+    ({"session_active": True, "action_id": 17, "soft_stopped": True}, True),
+    ({"session_active": False, "action_id": 0, "soft_stopped": False}, True),
+    ({"session_active": True, "action_id": 17, "soft_stopped": False}, False),
+    ({"session_active": True, "action_id": 17}, False),
+    ({"session_active": True, "action_id": 17, "soft_stopped": 1}, False),
+    ({"session_active": False, "action_id": 17, "soft_stopped": True}, False),
+    ({"session_active": True, "action_id": 0, "soft_stopped": True}, False),
+    ({"session_active": "true", "action_id": 17, "soft_stopped": True}, False),
+    ({"session_active": True, "action_id": True, "soft_stopped": True}, False),
+    ({"action_id": 17, "soft_stopped": True}, False),
+    ({"session_active": True, "soft_stopped": True}, False),
+    ({}, False),
+])
+def test_only_consistent_stale_acknowledgement_can_confirm_zero(snapshot, zero_confirmed):
+    worker = backend_module.SlamtecVelocityBackend({})
+    worker._armed, worker._state, worker._action_id = True, "active", 17
+    encoded = "stale FOLLOW deadline".encode().hex()
+    worker._buffer = f"MOTUS_SDK 3 STALE {encoded} {json.dumps(snapshot)}\n".encode()
+    with pytest.raises(backend_module.StaleVelocityCommand) as stale:
+        worker._reply(3, .1)
+    assert stale.value.zero_velocity_confirmed is zero_confirmed
+    if not zero_confirmed:
+        assert worker._armed and worker._action_id == 17
+
+
+@pytest.mark.parametrize("payload", [None, "{bad", "null", '{"session_active":false,"action_id":0,"duration":NaN}'])
+def test_missing_or_invalid_stale_metrics_never_confirm_zero(payload):
+    worker = backend_module.SlamtecVelocityBackend({})
+    worker._armed, worker._state, worker._action_id = True, "active", 17
+    suffix = f" {payload}" if payload is not None else ""
+    worker._buffer = f"MOTUS_SDK 3 STALE {'stale'.encode().hex()}{suffix}\n".encode()
+    with pytest.raises(backend_module.StaleVelocityCommand) as stale:
+        worker._reply(3, .1)
+    assert stale.value.zero_velocity_confirmed is False
+    assert worker._armed and worker._action_id == 17
 
 
 @pytest.mark.parametrize("value", [False, 1, "true", None, []])

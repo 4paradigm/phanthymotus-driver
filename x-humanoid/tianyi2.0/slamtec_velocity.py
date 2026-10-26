@@ -24,6 +24,12 @@ class CommandLeaseExpired(ValueError):
 class StaleVelocityCommand(CommandLeaseExpired):
     """FOLLOW packet dropped; the already accepted session keeps its deadlines."""
 
+    def __init__(self, message, *, zero_velocity_confirmed=False):
+        super().__init__(message)
+        # Only an explicit native acknowledgement can authorise a physical
+        # baseline change; a stale packet alone says nothing about velocity.
+        self.zero_velocity_confirmed = zero_velocity_confirmed is True
+
 
 class SlamtecVelocityBackend:
     def __init__(self, config):
@@ -102,13 +108,15 @@ class SlamtecVelocityBackend:
                     if fields[2] == "STALE":
                         stats = self._native_stats or {}
                         active, action_id = stats.get("session_active"), stats.get("action_id")
+                        zero_confirmed = False
                         if (isinstance(active, bool) and isinstance(action_id, int) and
                                 not isinstance(action_id, bool) and action_id >= 0 and
                                 active == (action_id != 0)):
                             self._action_id = action_id
                             self._state = "active" if active else "ready"
                             self._armed = active
-                        raise StaleVelocityCommand(message)
+                            zero_confirmed = not active or stats.get("soft_stopped") is True
+                        raise StaleVelocityCommand(message, zero_velocity_confirmed=zero_confirmed)
                     if fields[2] == "EXPIRED":
                         raise CommandLeaseExpired(message)
                     raise RuntimeError(message)
