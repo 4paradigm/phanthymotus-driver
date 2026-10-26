@@ -205,10 +205,6 @@ HEADING_PULSE_LATERAL = 0.8
 
 PARALLEL_FINISH_TOLERANCE_M = 0.04
 PARALLEL_FINISH_TIMEOUT_S = 0.4
-# The finish walks at the walking speed (~0.35 m/s); a 0.5 s window would add
-# ~0.17 m, so the window and the allowed extra must stay consistent or the
-# overshoot guard would fire during the finish itself.
-PARALLEL_FINISH_ALLOWANCE_M = 0.15
 # The finish may walk past the target only this far; the gait phase arrives
 # once per step, so waiting for it can cost ~0.1-0.15 m. Distance accuracy wins
 # over feet alignment beyond this cap.
@@ -240,6 +236,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
     leg = (LegOdometry(slip_scale=(LEG_SLIP_SCALE[direction] if slip_scale is None
                                    else float(slip_scale)))
            if hasattr(owner, '_read_distance_joints') else None)
+    # Terminal acceptance band: wider on the leg path because the leg estimate
+    # itself carries ~0.10 m; the IMU fallback keeps the documented 0.05.
+    endpoint_band = 0.10 if leg is not None else 0.05
     started = time.monotonic()
     motion_started = brake_started = quiet_since = None
     last_signature = None
@@ -357,7 +356,7 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
             # additional samples turn an intended capped stop into an error.
             phase_active = (leg is not None
                             and (finishing or finish_phase in ('parallel', 'timeout', 'capped')))
-            overshoot_limit = PARALLEL_FINISH_ALLOWANCE_M if phase_active else 0.05
+            overshoot_limit = endpoint_band if phase_active else 0.05
             if remaining < -overshoot_limit:
                 raise ValueError('IMU estimated overshoot exceeds 0.05 m')
             if brake_started is None:
@@ -422,12 +421,9 @@ def run_distance(owner, distance_m, direction='', full_scale=None, slip_scale=No
                     result['pre_zero_velocity_mps'] = source_velocity
                     estimator.velocity = (0.0, 0.0, 0.0)
                     result['stationary_assumed'] = True
-                    band = 0.10 if leg is not None else 0.05
+                    band = endpoint_band
                     result['endpoint_band_m'] = band
-                    if leg is not None:
-                        if remaining > band or remaining < -PARALLEL_FINISH_ALLOWANCE_M:
-                            raise ValueError('stopped outside the estimated target band')
-                    elif abs(remaining) > band:
+                    if abs(remaining) > band:
                         raise ValueError('stopped outside the estimated target band')
                     result['state'] = 'done'
                     break
