@@ -226,6 +226,8 @@ class DirectionTests(unittest.TestCase):
         self.assertEqual(plugin._state()["state"], "error")
         self.assertIsNone(audio._orientation_owner)
         plugin._client.call_async.assert_not_called()
+        self.notify.reset_mock()
+        self.completion.clear()
         entered, resume = threading.Event(), threading.Event()
         def read_state(*args):
             entered.set()
@@ -236,6 +238,8 @@ class DirectionTests(unittest.TestCase):
         self.assertTrue(entered.wait(1))
         self.assertEqual(plugin.stop()["state"], "cancelled_before_submission")
         resume.set()
+        self.assertTrue(self.completion.wait(1))
+        self.assertEqual(self.notify.call_args.args[1], "cancelled")
         self.assertIsNone(audio._orientation_owner)
         plugin._client.call_async.assert_not_called()
 
@@ -358,6 +362,8 @@ class DirectionTests(unittest.TestCase):
             self.assertFalse(restored._state()["arrival_confirmed"])
             self.assertFalse(json.loads(plugin._state_path.read_text())["unresolved"])
             self.assertEqual(restored._state()["state"], "operator_acknowledged_unverified")
+            self.assertEqual(restored._generation, 1)
+            self.assertIn("操作者确认后", restored._state()["error"])
 
     def test_center_is_not_advertised_and_busy_result_explains_owner(self):
         plugin, audio, _ = self.head()

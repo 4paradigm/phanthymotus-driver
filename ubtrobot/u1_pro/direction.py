@@ -396,8 +396,15 @@ class HeadOrientationPlugin:
 
     def _release(self):
         if getattr(self.audio, "_orientation_owner", None) is self:
-            self._persist(False)
+            try:
+                self._persist(False)
+            except OSError as exc:
+                self._task["state"] = "outcome_unknown"
+                self._task["accepted"] = False
+                self._error = f"无法更新头部恢复记录，保留占用: {str(exc)[:128]}"
+                return False
             self.audio._orientation_owner = None
+        return True
 
     def _on_response(self, generation, future):
         with self._lock:
