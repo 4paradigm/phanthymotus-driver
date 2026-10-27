@@ -491,7 +491,7 @@ class U1CardContractTests(unittest.TestCase):
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
-            "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
+            "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls", "sound_direction",
             "camera_left", "camera_right",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))

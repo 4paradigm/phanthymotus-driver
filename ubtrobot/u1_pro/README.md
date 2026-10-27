@@ -31,3 +31,97 @@
 PYTHONPATH=ubtrobot/u1_pro python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py' -v
 python3 scripts/check_service_yml.py ubtrobot/u1_pro
 ```
+
+## sound_direction：独立只读听声辨位
+
+保留现有 mic，新增 `direction_card.py` 方位卡片，不新增 ASR、head_orientation 或自动转头。
+其他分支的头部实验代码未纳入本分支。
+
+### 网页接线
+
+- `mic` 的 `/<namespace>/mic/audio`（`audio/pcm-16k`）→ 平台现有 ASR 的音频输入。
+- `sound_direction` 的 `/<namespace>/sound_direction`（`sensor/sound-direction`）→ 同一 ASR 的方位输入。
+
+公开方位 topic 使用 `std_msgs/msg/String` JSON，与 Bumi 的公开协议一致。
+不要将方位连到音频端口，不混合两类消息；已有项目应重新添加卡片或重新接线以更新端口。
+
+### 输入依据和坐标
+
+2026-10-27 只读复核：SDK Adapter 的 ROS domain `20` 中
+`/robo/audio/subscribe/doa_event` 实际类型为 `std_msgs/msg/String`。
+同机 `walker-audio.audio-1` 容器内的
+`/opt/walker/audio_msgs/share/audio_msgs/idls/audio_msgs/msg/DoaEvent.msg` 说明：
+`azimuth` 单位度、范围 `[-180,180)`、左负右正、0°通常为正前方；`confidence` 为 `[0,1]`。
+卡片订阅 Adapter 的 String JSON，而非该 typed 消息；复用已有直接 JSON 和 SDK `data`
+包裹解析实现。尚未取得实时事件样本，Adapter JSON 形状仍须真机验收。
+
+按文档转换 `angle_deg=-azimuth`，即前方 0°、左正右负、后方 +180°；
+`angle_convention` 为 `robot_front_0_left_positive_ccw`。
+这是厂商前方定义的符号适配：文档没有确定设备安装方向、是否随头部转动，
+与实际机器人正前方的对齐仍须验收。不提供可任意猜测的安装偏移配置。
+不跨事件平滑，避免混入上一位说话人的方向。
+仅在 SDK 事件实际提供有效置信度时输出 `confidence`，缺失时省略。
+
+### 公开状态和时间限制
+
+SDK `azimuth=-45` 且包含 `confidence=0.8` 时，公开 JSON 的主要字段如下
+（`timestamp_ms` 示例仅说明格式，实际为该事件的本地接收时间）：
+
+```json
+{
+  "state": "fresh",
+  "angle_deg": 45.0,
+  "angle_convention": "robot_front_0_left_positive_ccw",
+  "confidence": 0.8,
+  "audio_window_start_us": 0,
+  "audio_window_end_us": 0,
+  "timestamp_ms": 1793000000000,
+  "timestamp_basis": "receipt_time_only",
+  "association_state": "unknown",
+  "association_reason": "SDK DOA has no verified shared audio capture window"
+}
+```
+
+无事件或事件明确无效为 `no_event`；最新消息满 2 秒后为 `stale`。
+解析失败立即清除旧方向，发布 `no_event` 并附带 `error`。
+非 fresh 状态的 `angle_deg` 均为 null，不用 0°代表无数据；不保留旧置信度。
+每 500 ms 重发当前状态供迟到查看器/丢包恢复，心跳不更新事件时间或有效期。
+`info` 返回生命周期状态、嵌套 `sound_direction` 观察值及 SDK 实际消息计数。
+
+**当前没有已核实、与 mic 共享采集时钟的 DOA 音频窗口。** typed 定义中的 Header
+不能证明 Adapter JSON 转发了它，也不能证明它与 mic 时间可关联。
+不把接收时间或未经核实的 JSON 时间字段伪造为采集窗口，因此 `audio_window_*_us` 固定为 0。
+平台现有 ASR 拒绝这样的窗口，在实际输出方向字段的唤醒词路径中保持
+`speaker_direction_state=unknown`，避免把旧方向套到新的语音结果；平台无需修改。
+接线和独立方位显示可验收，但**可靠的语音结果与方向关联尚未实现**，需厂商确认
+Adapter 采集时间、窗口及其与 mic 时钟的对应后另行适配。
+现有 ASR 的关联粒度为带时间的唤醒词，并非逐句说话人跟踪。
+
+### 生命周期和事件生产条件
+
+遵循当前 U1 传感器卡片生命周期：驱动启动时调用 start，网页也支持 `start/stop/info`。
+重复 start 不重复订阅；stop 发布 `no_event`、清除数据并销毁订阅/定时器/发布者。
+重启不继承旧样本，已排队的旧订阅回调不能写入新会话。
+
+卡片只订阅 DOA，不调用唤醒、跟随或运动服务，不改变行为开关。
+已有检查材料提示厂商 DOA 生产可能依赖原生唤醒条件；平台 ASR 唤醒词不等于厂商唤醒词。
+当前驱动已有初始化会关闭厂商行为开关，本次保持该行为。
+若一直无事件，只能报告 `no_event`，不能为出数据自动打开开关。本次未部署或执行动作。
+
+复用已有 std_msgs/rclpy 依赖及 domain 20/42 节点，无需新自定义消息或定位算法。
+Dockerfile 已包含新模块。
+
+### 网页真机验收（操作者执行）
+
+1. 部署与 PR 最终提交一致的 Try it 镜像，确认原卡片及新增 sound_direction 可见。
+2. 分别接 mic→ASR 音频输入、sound_direction→ASR 方位输入，确认原语音识别正常。
+3. 观察 info 和实时流：首次无事件为 no_event/null；若计数始终为零，记录厂商事件
+   生产条件与固件版本，不通过本卡自动改开关。
+4. 前、左、右、后方分别发声，核对前方 0、左正右负；记录实际 JSON、安装偏移及
+   是否相对头部。多人交替说话时确认新方向未混入旧方向。
+5. 最新事件 2 秒后应为 stale/null；stop 后 no_event，重新 start 后无旧方向。
+6. 在 ASR 唤醒词路径确认方向保持 unknown，不出现基于接收时间的假关联。
+   本次不能以“识别文本带精确方向”作为已完成验收；采集时间缺口需单独解决。
+
+离线测试覆盖解析、角度、置信度缺失、无事件/过期、生命周期、重启隔离和部分启动清理。
+物理方位精度由操作者验收。

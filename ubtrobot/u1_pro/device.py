@@ -23,6 +23,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from direction_card import SoundDirectionPlugin
+
 from common.vendor_runtime import action_schema, jsonable, tool
 
 
@@ -2121,6 +2123,6 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
                ExpressionPlugin(audio, motion_catalog, catalog_available),
                HeadPlugin(audio, motion_catalog, catalog_available),
-               SystemControlsPlugin(nodes),
+               SystemControlsPlugin(nodes), SoundDirectionPlugin(nodes),
                camera_left, camera_right]
     return plugins
