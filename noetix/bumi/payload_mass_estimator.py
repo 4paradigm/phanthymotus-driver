@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from statistics import median
+from statistics import median, fmean, pstdev
 
 from payload_mass_sampling import MassError, finite, vector, quaternion_angle, fixed_pose_motor_ids
 
@@ -76,16 +76,47 @@ def validate_profile(profile_id, raw, arm, *, loading=False):
 
 def summarize(frames, p):
     ids = p["motor_ids"]
-    center = [median([f["tau"][j] for f in frames]) for j in ids]
-    noise = [max(p["noise_floor_raw"], 1.4826*median([abs(f["tau"][j]-c) for f in frames])) for j,c in zip(ids,center)]
+    mean_feature = p.get("setup_mode") == "quick" and p.get("torque_feature") == "mean_all_frames_v1"
+    blocks = []
+    block_counts = []
+    if mean_feature:
+        # Include every observed zero. Do not reinterpret zero as missing data
+        # or condition the estimate on nonzero packets.
+        center = [fmean(f["tau"][j] for f in frames) for j in ids]
+        block_s = p["torque_block_s"]
+        groups = {}
+        origin = frames[0]["host_monotonic_s"]
+        for frame in frames:
+            key = int((frame["host_monotonic_s"]-origin)/block_s)
+            groups.setdefault(key, []).append(frame)
+        for group in groups.values():
+            if (len(group) >= 2
+                    and group[-1]["host_monotonic_s"]-group[0]["host_monotonic_s"] >= .75*block_s):
+                blocks.append([fmean(f["tau"][j] for f in group) for j in ids])
+                block_counts.append(len(group))
+        # A perfectly periodic sparse stream can have identical block means.
+        # Retain a one-observation contribution floor so packet phase is not
+        # mistaken for zero uncertainty. No division by sqrt(sample count).
+        noise = [max(p["noise_floor_raw"], pstdev(b[i] for b in blocks) if len(blocks) >= 2
+                     else pstdev(f["tau"][j] for f in frames),
+                     max(abs(f["tau"][j]-center[i]) for f in frames)/min(block_counts)
+                     if block_counts else 0) for i, j in enumerate(ids)]
+        dispersion = "block-mean population SD with one-observation contribution floor; no independent-count/standard-error claim"
+    else:
+        center = [median([f["tau"][j] for f in frames]) for j in ids]
+        noise = [max(p["noise_floor_raw"], 1.4826*median([abs(f["tau"][j]-c) for f in frames])) for j,c in zip(ids,center)]
+        dispersion = "per-axis 1.4826 * median absolute deviation, floored by configured noise_floor_raw"
     return {"tau":center, "noise":noise,
+            "torque_feature": "mean_all_frames_v1" if mean_feature else "median_raw_v1",
+            "torque_blocks": blocks, "torque_block_count": len(blocks),
+            "torque_nonzero_count": [sum(f["tau"][j] != 0 for f in frames) for j in ids],
             "temperature": [median([f["temperature"][j] for f in frames]) for j in range(21)],
             "pose_q": [median([f["q"][j] for f in frames]) for j in range(21)],
             "quaternion_xyzw": frames[-1]["quaternion_xyzw"], "workmode":frames[-1]["workmode"],
             "sample_count":len(frames), "effective_sample_count":None,
             "host_span_s":frames[-1]["host_monotonic_s"]-frames[0]["host_monotonic_s"],
             "freshness_status":"source_sequence" if all(f.get("source_seq") is not None for f in frames) else "source_timestamp" if all(f.get("source_timestamp") is not None for f in frames) else "host_receipt_only",
-            "dispersion_definition":"per-axis 1.4826 * median absolute deviation, floored by configured noise_floor_raw"}
+            "dispersion_definition": dispersion}
 
 
 def check_baseline(baseline, summary, p, now):
@@ -94,8 +125,15 @@ def check_baseline(baseline, summary, p, now):
     if not 0 <= now-baseline["created_s"] <= p["baseline_max_age_s"]:
         raise MassError("BASELINE_EXPIRED", "tare expired or wall clock moved backwards")
     b = baseline["summary"]
-    if max(abs(a-bb) for a,bb in zip(summary["temperature"],b["temperature"])) > p["max_temperature_drift_c"]:
-        raise MassError("TEMPERATURE_DRIFT", "temperature differs from tare")
+    if (p.get("torque_feature") == "mean_all_frames_v1"
+            and b.get("torque_feature") != "mean_all_frames_v1"):
+        raise MassError("CONFIG_CHANGED", "torque statistic changed; capture a new empty baseline")
+    j = max(range(21), key=lambda i: abs(summary["temperature"][i]-b["temperature"][i]))
+    temp_delta = abs(summary["temperature"][j]-b["temperature"][j])
+    if temp_delta > p["max_temperature_drift_c"]:
+        raise MassError("TEMPERATURE_DRIFT", f"temperature differs from tare: motor_id={j}, "
+                        f"current={summary['temperature'][j]:.2f}, empty={b['temperature'][j]:.2f}, "
+                        f"delta={temp_delta:.2f}, limit={p['max_temperature_drift_c']:.2f} C")
     j = max(fixed_pose_motor_ids(p), key=lambda i: abs(summary["pose_q"][i]-b["pose_q"][i]))
     delta = abs(summary["pose_q"][j]-b["pose_q"][j])
     if delta > p["pose_tolerance_rad"]:

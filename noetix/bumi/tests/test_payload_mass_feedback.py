@@ -165,6 +165,9 @@ def test_native_dds_to_quick_scale_calibration_unknown_freeze_and_home(monkeypat
                 return
             time.sleep(.02)
         raise AssertionError({"card": card.info(), "publisher_exit": publisher.poll()})
+    def valid_near(target):
+        result = card.info()
+        return result.get("valid") and abs(result["mass_kg"]-target) <= result.get("resolution_kg", 0)
     try:
         assert card.start()
         wait(lambda: sampler.diagnostics()["received_count"] > 4)
@@ -175,9 +178,11 @@ def test_native_dds_to_quick_scale_calibration_unknown_freeze_and_home(monkeypat
         command("mass .2")
         wait(lambda: card.info().get("sampling_stable") and card.info().get("trial_file"))
         assert card.dispatch("calibrate", {"known_mass_kg": .2})["state"] == "calibrated"
-        wait(lambda: card.info().get("valid") and card.info().get("mass_kg") == .2)
+        wait(lambda: valid_near(.2))
         command("mass .35")
-        wait(lambda: card.info().get("valid") and card.info().get("mass_kg") == .35)
+        wait(lambda: valid_near(.35))
+        observed_unknown = card.info()["mass_kg"]
+        unknown_resolution = card.info()["resolution_kg"]
         command("mass 0")
         wait(lambda: card.info().get("valid") and card.info().get("mass_kg") == 0)
         command("freeze")
@@ -191,6 +196,9 @@ def test_native_dds_to_quick_scale_calibration_unknown_freeze_and_home(monkeypat
         assert card.info()["state"] == "finished"
         report = {"simulation_only": True, "transport": "native DDS via bundled schema/runtime",
                   "reference_kg": .2, "unknown_kg": .35, "unload_kg": 0,
+                  "observed_unknown_kg": observed_unknown, "torque_pattern": "1 nonzero packet in 8",
+                  "unknown_resolution_kg": unknown_resolution,
+                  "host_observation_hz": sampler.diagnostics()["host_observation_hz"],
                   "frozen_source_clears_weight": True, "home_confirmed": True,
                   "received_count": sampler.diagnostics()["received_count"],
                   "events": [{k: r.get(k) for k in ("state", "mass_kg", "valid", "error_code")}

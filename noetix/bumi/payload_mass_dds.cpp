@@ -136,14 +136,13 @@ int main(int argc, char** argv) {
         auto reader_qos = subscriber.default_datareader_qos();
         reader_qos << dds::core::policy::Reliability::BestEffort()
                    << dds::core::policy::Durability::Volatile()
-                   << dds::core::policy::History::KeepLast(1)
+                   << dds::core::policy::History::KeepLast(64)
                    << (publication.exclusive ? dds::core::policy::Ownership::Exclusive() : dds::core::policy::Ownership::Shared());
         dds::sub::DataReader<RobotStatus::StatusData> reader(subscriber, topic, reader_qos);
 
         // Do not mix publishers after discovery, or replay queued state on restart.
         dds::core::InstanceHandle publisher_handle(dds::core::null);
         int64_t last_stamp = -1;
-        auto last_emitted = Clock::now() - std::chrono::seconds(1);
         while (!interrupted) {
             auto samples = reader.take();
             for (const auto& sample : samples) {
@@ -167,8 +166,6 @@ int main(int argc, char** argv) {
                 if (stamp == last_stamp) continue;
                 last_stamp = stamp;
                 const auto now = Clock::now();
-                if (now - last_emitted < std::chrono::milliseconds(25)) continue;
-                last_emitted = now;
                 const auto& motors = data.motorstatearray().motorstates();
                 const auto& imu = data.imudata();
                 std::cout << "{\"event\":\"frame\",\"adapter\":\"native_dds_status\",\"source_seq\":null,\"source_timestamp\":" << stamp

@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import time
 
-from payload_mass_estimator import ARM_IDS, NAMES, digest, summarize
+from payload_mass_estimator import ARM_IDS, NAMES, digest, summarize, check_baseline
 from payload_mass_sampling import MassError, finite, vector, fixed_pose_motor_ids
 
 
@@ -21,6 +21,8 @@ def profile_from_home(frame, arm, hold_s):
          "motor_ids": ARM_IDS[arm], "joint_names": NAMES[arm],
          "pose_q": q, "quaternion_xyzw": vector(frame["quaternion_xyzw"], 4, "quaternion"),
          "workmode": 23, "torque_units": "sdk_raw", "accept_host_only_freshness": False,
+         "torque_feature": "mean_all_frames_v1", "torque_block_s": .5,
+         "min_torque_blocks": 4,
          "pose_tolerance_rad": .15, "body_tolerance_rad": .1,
          # Hardware preparation rejected dq=0.1343 at the old 0.1 cutoff.
          # This is a measurement tolerance; pose span still gates stable data.
@@ -44,6 +46,12 @@ def capture_bend_profile(p, frames):
                for j in p["motor_ids"])
     p = {**p, "pose_q": summary["pose_q"], "quaternion_xyzw": summary["quaternion_xyzw"],
          "max_torque_span": max(1e-4, 3 * span, 6 * max(summary["noise"]))}
+    if p.get("torque_feature") == "mean_all_frames_v1":
+        if summary["torque_block_count"] < p["min_torque_blocks"]:
+            raise MassError("INSUFFICIENT_SAMPLES", "too few complete torque blocks for empty preparation")
+        p["torque_block_span_limit"] = [max(1e-4, 6*summary["noise"][i],
+            3*(max(b[i] for b in summary["torque_blocks"])-min(b[i] for b in summary["torque_blocks"])))
+            for i in range(len(p["motor_ids"]))]
     p.pop("fingerprint", None)
     p["fingerprint"] = digest(p)
     return p
@@ -52,13 +60,18 @@ def capture_bend_profile(p, frames):
 def fit_reference(frames, baseline, p, known_mass_kg):
     mass = finite(known_mass_kg, "known_mass_kg", .001, .5)
     current = summarize(frames, p)
+    check_baseline(baseline, current, p, time.time())
+    if p.get("torque_feature") == "mean_all_frames_v1" and current["torque_block_count"] < p["min_torque_blocks"]:
+        raise MassError("INSUFFICIENT_SAMPLES", "参考窗口缺少足够的完整力矩时间块。")
     delta = [a-b for a, b in zip(current["tau"], baseline["summary"]["tau"])]
     noise = [max(a, b, p["noise_floor_raw"]) for a, b in zip(current["noise"], baseline["summary"]["noise"])]
     k = [v/mass for v in delta]
     weights = [1/n**2 if abs(v) >= 5*n else 0 for v, n in zip(delta, noise)]
     sensitivity = sum(a*a*w for a, w in zip(k, weights))
     if sensitivity <= 1e-15:
-        raise MassError("UNIDENTIFIABLE", "参考物体没有产生可分辨的力矩变化，请检查力矩反馈。")
+        raise MassError("UNIDENTIFIABLE", "参考物体没有产生可分辨的力矩变化；"
+                        f"delta_tau={delta}, block_noise={noise}, "
+                        f"nonzero_count={current['torque_nonzero_count']}, samples={len(frames)}")
     resolution = max(.01, 3 / math.sqrt(sensitivity))
     if resolution >= mass:
         raise MassError("UNIDENTIFIABLE", "参考物体响应不足以形成可用读数。")

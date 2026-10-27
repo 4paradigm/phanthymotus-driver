@@ -1,18 +1,26 @@
 """End-to-end quick setup: no engineering JSON or invented verification flags."""
 import copy
 import math
+import json
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from test_payload_mass import Sampler, Loco, raw_frame, run, wait_for, configuration
+from test_payload_mass import Sampler, Loco, raw_frame as legacy_raw_frame, run, wait_for, configuration
 from payload_mass import PayloadMassPlugin
 from payload_mass_sampling import MassError, SharedSampler, check_frame, pose_span_violation
 from payload_mass_quick import profile_from_home, fit_reference
 from payload_mass_estimator import summarize, validate_profile
 from payload_mass_live import evaluate_window
+
+
+def raw_frame(mass=0, seq=1):
+    frame = legacy_raw_frame(mass, seq)
+    frame["host_monotonic_s"] = seq*.1
+    return frame
 
 
 class QuickLoco(Loco):
@@ -206,6 +214,9 @@ def test_quick_setup_single_reference_dynamic_unknown_and_home(quick, reported_v
     calibrated = card.dispatch("calibrate", {"known_mass_kg": .2})
     assert calibrated["state"] == "calibrated"
     assert calibrated["validation_status"] == "not_validated"
+    recorded = json.loads(Path(calibrated["reference_trial_file"]).read_text())
+    assert recorded["known_mass_kg"] == .2 and recorded["action"] == "calibrate"
+    assert recorded["summary"]["torque_feature"] == "mean_all_frames_v1"
     reference = wait_for(card, lambda r: r.get("valid") and r.get("mass_kg") == .2)
     assert reference["experimental"] and reference["remaining_s"] > 290
     set_mass(sampler, .35)
@@ -315,7 +326,12 @@ def test_calibration_requires_stable_reference_not_empty_or_truth_in_weigh(quick
     # Hidden form truth is ignored outside calibration; never changes tare.
     assert run(card, "weigh", known_mass_kg=99)["state"] == "measuring"
     wait_for(card, lambda r: r.get("sampling_stable"))
-    assert card.dispatch("calibrate", {"known_mass_kg": .2})["error_code"] == "UNIDENTIFIABLE"
+    failed = card.dispatch("calibrate", {"known_mass_kg": .2})
+    assert failed["error_code"] == "UNIDENTIFIABLE"
+    path = failed["message"].split("reference_trial_file=", 1)[1]
+    recorded = json.loads(Path(path).read_text())
+    assert recorded["action"] == "calibrate" and recorded["error_code"] == "UNIDENTIFIABLE"
+    assert recorded["known_mass_kg"] == .2 and recorded["raw_frames"]
     set_mass(sampler, .2)
     wait_for(card, lambda r: r.get("sampling_stable") and r.get("trial_file"))
     assert card.dispatch("calibrate", {"known_mass_kg": .6})["error_code"] == "BAD_PARAMETER"

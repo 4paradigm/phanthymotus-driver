@@ -49,8 +49,13 @@ def fixed_pose_motor_ids(profile):
 
 def pose_span_violation(frames, profile):
     """Use the same geometry scope for window spans and fixed references."""
-    spans = {j: max(f["q"][j] for f in frames) - min(f["q"][j] for f in frames)
-             for j in fixed_pose_motor_ids(profile)}
+    low = {j: min(f["q"][j] for f in frames) for j in fixed_pose_motor_ids(profile)}
+    high = {j: max(f["q"][j] for f in frames) for j in low}
+    return _pose_bounds_violation(low, high, profile)
+
+
+def _pose_bounds_violation(low, high, profile):
+    spans = {j: high[j]-low[j] for j in low}
     limits = {j: min(profile.get("max_pose_span_rad", .03), profile["pose_tolerance_rad"])
               if j in profile["motor_ids"] else profile["pose_tolerance_rad"] for j in spans}
     j = max(spans, key=lambda i: spans[i]/limits[i])
@@ -159,6 +164,18 @@ class SharedSampler:
                 raise MassError("DATA_GAP", "observation buffer overrun")
             return frames
 
+    def recent(self, duration, error_epoch):
+        """Snapshot a real received interval; never synthesize getter samples."""
+        with self._condition:
+            if error_epoch != self._errors:
+                raise MassError("DATA_ERROR", self._error or "state feedback interrupted")
+            frames = list(self._frames)
+            if not frames:
+                raise MassError("STALE_SOURCE", "no received observations")
+            cutoff = frames[-1]["host_monotonic_s"]-duration
+            start = next((i for i, f in enumerate(frames) if f["host_monotonic_s"] >= cutoff), len(frames)-1)
+            return copy.deepcopy(frames[max(0, start-1):])
+
     def collect(self, duration, profile, cancel, *, learn_pose_from=None):
         # Only quick empty preparation may learn its final pose. Weighing and
         # returning home always keep their previously captured target fixed.
@@ -173,6 +190,7 @@ class SharedSampler:
         reason = "INSUFFICIENT_SAMPLES"
         reason_detail = "waiting for new observations"
         best_window_s = 0.0
+        pose_low, pose_high = {}, {}
         while time.monotonic() < deadline:
             if cancel.is_set():
                 raise MassError("CANCELLED", "sampling cancelled; no motor command sent")
@@ -191,6 +209,11 @@ class SharedSampler:
                     observed_profile = ({**profile, "pose_q": frame["q"]}
                                         if learn_pose_from is not None else profile)
                     check_frame(frame, observed_profile)
+                    if stable and frame["host_monotonic_s"]-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
+                        reason = "STALE_SOURCE"
+                        reason_detail = (f"receive gap={frame['host_monotonic_s']-stable[-1]['host_monotonic_s']:.4f}, "
+                                         f"limit={profile['max_receive_gap_s']:.4f} s")
+                        stable = []
                     if learn_pose_from is not None:
                         elbow = profile["motor_ids"][-1]
                         if abs(frame["q"][elbow] - learn_pose_from[elbow]) < .2:
@@ -201,18 +224,19 @@ class SharedSampler:
                         # Check measured angle movement even when motor dq is
                         # reported as zero. Never anchor to the first bent frame.
                         if stable:
-                            violation = pose_span_violation(stable + [frame], profile)
+                            for j in pose_low:
+                                pose_low[j] = min(pose_low[j], frame["q"][j])
+                                pose_high[j] = max(pose_high[j], frame["q"][j])
+                            violation = _pose_bounds_violation(pose_low, pose_high, profile)
                             if violation is not None:
                                 j, span, limit = violation
                                 reason = "UNSTABLE"
                                 reason_detail = (f"joint angle span too high: motor_id={j}, "
                                                  f"q_span={span:.4f}, limit={limit:.4f} rad")
                                 stable = []
-                    if stable and frame["host_monotonic_s"]-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
-                        reason = "STALE_SOURCE"
-                        reason_detail = (f"receive gap={frame['host_monotonic_s']-stable[-1]['host_monotonic_s']:.4f}, "
-                                         f"limit={profile['max_receive_gap_s']:.4f} s")
-                        stable = []
+                        if not stable:
+                            pose_low = {j: frame["q"][j] for j in fixed_pose_motor_ids(profile)}
+                            pose_high = dict(pose_low)
                     stable.append(frame)
                     best_window_s = max(best_window_s, stable[-1]["host_monotonic_s"]-stable[0]["host_monotonic_s"])
                     # A stable joint alone does not show the hanging object is
@@ -263,8 +287,11 @@ def check_frame(frame, p):
             raise MassError("MOTOR_FAULT", "documented motor fault")
     elif any(frame["errors"]):
         raise MassError("MOTOR_FAULT", "nonzero motor error (including undocumented codes)")
-    if max(frame["temperature"]) >= p["max_temperature_c"]:
-        raise MassError("OVER_TEMPERATURE", "temperature exceeds engineer-confirmed limit")
+    temp_motor = max(range(21), key=lambda i: frame["temperature"][i])
+    if frame["temperature"][temp_motor] >= p["max_temperature_c"]:
+        raise MassError("OVER_TEMPERATURE", "temperature exceeds configured limit: "
+                        f"motor_id={temp_motor}, current={frame['temperature'][temp_motor]:.2f}, "
+                        f"limit={p['max_temperature_c']:.2f} C")
     differences = [abs(a-b) for a,b in zip(frame["q"],p["pose_q"])]
     j = max(fixed_pose_motor_ids(p), key=lambda i: differences[i])
     if differences[j] > p["pose_tolerance_rad"]:

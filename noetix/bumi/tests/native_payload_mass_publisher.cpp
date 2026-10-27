@@ -46,9 +46,11 @@ int main(int argc, char** argv) {
             m.vel(0); m.error(0); m.temperature(30);
             const double base[] = {1, -.5, .2, .7};
             const double k[] = {2, -1, 0, .6};
-            m.tau(i < 4 ? base[i] + mass*k[i] : 0);
+            // Reproduce the hardware's sparse torque population: keep zeros
+            // as real transmitted values, with one nonzero packet in eight.
+            m.tau(i < 4 && stamp % 8 == 0 ? base[i] + mass*k[i] : 0);
         }
         writer.write(data);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::microseconds(2500));
     }
 }

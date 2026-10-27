@@ -57,7 +57,7 @@ def report(url, root, samples=60):
             continue
         if trial.get("profile", {}).get("arm") != info.get("arm"):
             continue
-        if trial.get("action") == "weigh" and len(recent) < 3:
+        if trial.get("action") in ("weigh", "calibrate") and len(recent) < 3:
             recent.append(trial)
         if trial.get("action") == "prepare":
             prepare = trial
@@ -99,7 +99,9 @@ def report(url, root, samples=60):
     for trial in reversed(recent):
         if trial.get("baseline", {}).get("id") != prepare["id"]:
             continue
-        output("SAVED_WINDOW", {"seconds_after_empty": round(trial["created_s"]-prepare["created_s"], 1),
+        output("SAVED_WINDOW", {"action": trial["action"], "user_reference_kg": trial.get("known_mass_kg"),
+                                "error_code": trial.get("error_code"),
+                                "seconds_after_empty": round(trial["created_s"]-prepare["created_s"], 1),
                                 "tau_raw": torque_stats(trial["raw_frames"], ids)})
     output("CURRENT_POSE", {"max_arm_delta_from_empty_rad": round(max(
         abs(f["q"][j]-baseline["pose_q"][j]) for f in frames for j in ids), 5),
@@ -107,6 +109,7 @@ def report(url, root, samples=60):
                                       for j in ids), 5)})
     output("CURRENT_TAU_RAW", torque_stats(frames, ids))
     print("NOTE: saved/current windows have no verified attached-weight label; pose and remaining time must match before comparing loads.")
+    print("NOTE: CURRENT is polled/downsampled; calibration uses the saved full-rate reference windows.")
 
 
 if __name__ == "__main__":

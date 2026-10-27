@@ -221,7 +221,9 @@ class PayloadMassPlugin:
         p = session["p"]
         d = self._fresh(p)
         check_frame(d["latest"], p)
-        check_baseline(session["baseline"], summarize([d["latest"]], p), p, time.time())
+        observations = (self._sampler.recent(3., session["error_epoch"])
+                        if p.get("torque_feature") == "mean_all_frames_v1" else [d["latest"]])
+        check_baseline(session["baseline"], summarize(observations, p), p, time.time())
         if d["read_error_count"] != session["error_epoch"]:
             raise MassError("STALE_SOURCE", "准备后反馈曾中断，请重新采空载。")
         if time.monotonic() - session["prepared"] > session["p"]["baseline_max_age_s"]:
@@ -333,8 +335,16 @@ class PayloadMassPlugin:
                     if not self._session:
                         raise MassError("NOT_PREPARED", "请先空载曲肘。")
                     d = self._verify_session(self._session)
-                    if any(abs(d["latest"]["tau"][j] - self._session["baseline"]["summary"]["tau"][i]) > p["max_torque_span"]
-                           for i, j in enumerate(p["motor_ids"])):
+                    if p.get("torque_feature") == "mean_all_frames_v1":
+                        recent = self._sampler.recent(duration, self._session["error_epoch"])
+                        current = summarize(recent, p)
+                        base = self._session["baseline"]["summary"]
+                        not_empty = any(abs(a-b) > 5*max(n, bn, p["noise_floor_raw"])
+                                        for a, b, n, bn in zip(current["tau"], base["tau"], current["noise"], base["noise"]))
+                    else:
+                        not_empty = any(abs(d["latest"]["tau"][j] - self._session["baseline"]["summary"]["tau"][i]) > p["max_torque_span"]
+                                        for i, j in enumerate(p["motor_ids"]))
+                    if not_empty:
                         raise MassError("NOT_EMPTY", "请先取下物体，点击测量重量后再挂物；不会重新去皮。")
                 return self._new_job(action, loaded, gate, self._session)
             except Exception as exc:
@@ -419,12 +429,32 @@ class PayloadMassPlugin:
             raise MassError("UNSTABLE", "参考物体尚未稳定，请稍等后执行校准。")
         latest = self._fresh(p)["latest"]
         check_frame(latest, p)
-        center = summarize(self._stable_window, p)["tau"]
-        if any(abs(latest["tau"][j] - center[i]) > p["max_torque_span"] for i, j in enumerate(p["motor_ids"])):
+        stable_summary = summarize(self._stable_window, p)
+        if p.get("torque_feature") == "mean_all_frames_v1":
+            current = summarize(self._sampler.recent(1., self._session["error_epoch"]), p)
+            changed = any(abs(a-b) > 5*max(n, bn, p["noise_floor_raw"])
+                          for a, b, n, bn in zip(current["tau"], stable_summary["tau"],
+                                               current["noise"], stable_summary["noise"]))
+        else:
+            changed = any(abs(latest["tau"][j] - stable_summary["tau"][i]) > p["max_torque_span"]
+                          for i, j in enumerate(p["motor_ids"]))
+        if changed:
             raise MassError("UNSTABLE", "参考载荷已经变化，请重新等待稳定。")
-        model = fit_reference(self._stable_window, self._session["baseline"], p, args["known_mass_kg"])
+        mass = finite(args["known_mass_kg"], "known_mass_kg", .001, .5)
+        trial = {"id": uuid4().hex, "profile": p, "profile_fingerprint": p["fingerprint"],
+                 "action": "calibrate", "created_s": time.time(), "known_mass_kg": mass,
+                 "summary": summarize(self._stable_window, p), "raw_frames": copy.deepcopy(self._stable_window),
+                 "baseline": copy.deepcopy(self._session["baseline"]), "stream_id": self._job["id"]}
+        try:
+            model = fit_reference(self._stable_window, self._session["baseline"], p, mass)
+        except MassError as exc:
+            trial.update(error_code=exc.code, error_message=str(exc))
+            path = save_trial(self._root, trial)
+            raise MassError(exc.code, f"{exc}; reference_trial_file={path}") from exc
+        trial_file = save_trial(self._root, trial)
         self._job["loaded"][0]["model"] = model
         return {"state": "calibrated", "unit": "kg", "reference_mass_kg": model["reference_mass_kg"],
+                "reference_trial_file": trial_file,
                 "quality": model["quality"], "validation_status": "not_validated",
                 "message": "本次快速校准完成；取下参考物体后，直接换待测物体，数字会持续刷新。"}
 

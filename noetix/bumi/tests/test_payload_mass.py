@@ -273,6 +273,11 @@ class Sampler:
         check_frame(self.frame, p)
         return [{**copy.deepcopy(self.frame), "host_monotonic_s": n*.1} for n in range(32)]
 
+    def recent(self, duration, error_epoch):
+        if self.epoch != error_epoch:
+            raise MassError("DATA_ERROR", "synthetic interruption")
+        return [{**copy.deepcopy(self.frame), "host_monotonic_s": n*duration/31} for n in range(32)]
+
 
 class Loco:
     def __init__(self, sampler):
