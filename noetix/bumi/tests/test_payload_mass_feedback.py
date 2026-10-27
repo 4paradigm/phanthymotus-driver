@@ -115,6 +115,91 @@ def test_reader_exit_records_error_and_invalidates_session_epoch():
         feedback.stop()
 
 
+def test_delayed_pipe_bursts_drain_and_recover_without_restarting_reader():
+    sampler = SharedSampler()
+    script = """
+import json, sys, time
+frame = json.loads(sys.argv[1])
+for line in sys.stdin:
+    command, stamp = line.split()
+    frame['source_timestamp'] = int(stamp)
+    frame['host_received_monotonic_s'] = time.monotonic() - (2 if command == 'old' else 0)
+    for _ in range(40 if command == 'old' else 1):
+        print(json.dumps(frame), flush=True)
+"""
+    feedback = DdsFeedback(sampler, {}, popen=lambda args, **kw:
+                           subprocess.Popen([sys.executable, "-u", "-c", script, json.dumps(event())],
+                                            stdin=subprocess.PIPE, **kw))
+
+    def send(command):
+        feedback._process.stdin.write(command + "\n")
+        feedback._process.stdin.flush()
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 3
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert predicate()
+
+    try:
+        assert feedback.start()
+        pid = feedback._process.pid
+        send("fresh 1")
+        wait_for(lambda: sampler.diagnostics()["received_count"] == 1)
+        first_received = sampler.diagnostics()["latest"]["host_monotonic_s"]
+        send("old 2")
+        wait_for(lambda: sampler.diagnostics()["read_error_count"] == 1)
+        # A fresh pipe receipt with a repeated source stamp is still not fresh
+        # robot feedback, and must not end the interruption or refresh host age.
+        send("fresh 1")
+        wait_for(lambda: sampler.diagnostics()["source_duplicate_count"] == 1)
+        d = sampler.diagnostics()
+        assert d["received_count"] == 1
+        assert d["latest"]["host_monotonic_s"] == first_received
+        assert feedback._process.poll() is None and feedback._thread.is_alive()
+        with pytest.raises(MassError, match="delayed"):
+            sampler.read_since(0, 0)
+        send("fresh 3")
+        wait_for(lambda: sampler.diagnostics()["received_count"] == 2)
+        assert sampler.diagnostics()["read_error_count"] == 1
+        assert [f["source_timestamp"] for f in sampler.read_since(1, 1)] == [3]
+        # A second interruption invalidates even the newly acquired epoch.
+        send("old 4")
+        wait_for(lambda: sampler.diagnostics()["read_error_count"] == 2)
+        send("fresh 5")
+        wait_for(lambda: sampler.diagnostics()["received_count"] == 3)
+        assert sampler.diagnostics()["read_error_count"] == 2
+        assert [f["source_timestamp"] for f in sampler.read_since(2, 2)] == [5]
+        with pytest.raises(MassError):
+            sampler.read_since(1, 1)
+        assert feedback._process.pid == pid and feedback._process.poll() is None
+    finally:
+        feedback.stop()
+        if feedback._process.stdin:
+            feedback._process.stdin.close()
+    assert feedback._process.poll() is not None and not feedback._thread.is_alive()
+
+
+@pytest.mark.parametrize("bad", [
+    {"event": "error", "error_code": "STALE_SOURCE", "message": "native source failure"},
+    {"event": "error", "error_code": "SOURCE_RESET", "message": "source reset"},
+    {**event(), "host_received_monotonic_s": time.monotonic() + 100},
+])
+def test_pipe_recovery_does_not_swallow_native_failures_or_future_clock(bad):
+    sampler = SharedSampler()
+    script = "import time; print(" + repr(json.dumps(bad)) + ", flush=True); time.sleep(30)"
+    feedback = DdsFeedback(sampler, {}, popen=lambda args, **kw:
+                           subprocess.Popen([sys.executable, "-u", "-c", script], **kw))
+    try:
+        assert feedback.start()
+        feedback._thread.join(3)
+        assert not feedback._thread.is_alive()
+        assert sampler.diagnostics()["read_error_count"] == 1
+        assert sampler.diagnostics()["received_count"] == 0
+    finally:
+        feedback.stop()
+
+
 @pytest.mark.skipif(not os.environ.get("BUMI_TEST_DDS_READER") or not os.environ.get("BUMI_TEST_DDS_PUBLISHER"),
                     reason="requires compiled native reader and test-only status publisher")
 def test_native_dds_to_quick_scale_calibration_unknown_freeze_and_home(monkeypatch, tmp_path):

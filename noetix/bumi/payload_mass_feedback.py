@@ -14,6 +14,10 @@ import time
 from payload_mass_sampling import MassError, finite
 
 
+class _DelayedFrame(MassError):
+    """An old pipe frame can be drained without restarting the DDS reader."""
+
+
 class DdsFeedback:
     def __init__(self, sampler, cfg, *, popen=subprocess.Popen):
         self._sampler = sampler
@@ -57,14 +61,18 @@ class DdsFeedback:
             raise MassError("FRESHNESS_UNVERIFIED", "Missing motor-array source timestamp")
         received = finite(event.get("host_received_monotonic_s"), "native receipt time", 0)
         age = time.monotonic() - received
-        if not -.05 <= age <= .25:
-            raise MassError("STALE_SOURCE", "Native feedback is delayed; refusing buffered state")
+        if age < -.05:
+            raise MassError("STALE_SOURCE", "Native receipt time is in the future")
+        if age > .25:
+            raise _DelayedFrame("STALE_SOURCE", "Native feedback is delayed; discarding buffered state until fresh feedback arrives")
         if not self._sampler.push(event):
             # Repeated timestamps are not samples and do not refresh host age.
             # Malformed data is already recorded by SharedSampler.push().
-            return
+            return False
+        return True
 
     def _run(self):
+        draining = False
         try:
             while not self._cancel.is_set():
                 line = self._process.stdout.readline(65537)
@@ -72,7 +80,18 @@ class DdsFeedback:
                     raise MassError("DDS_READER_EXITED", "Native status reader exited")
                 if len(line) > 65536 or not line.endswith("\n"):
                     raise MassError("BAD_DATA", "Native status frame exceeds size limit")
-                self._accept(json.loads(line))
+                try:
+                    accepted = self._accept(json.loads(line))
+                except _DelayedFrame as exc:
+                    # Invalidate the current preparation once per interruption.
+                    # Keep draining old pipe data so later genuinely fresh
+                    # feedback can support an explicit new empty preparation.
+                    if not draining:
+                        self._sampler.record_error(exc)
+                    draining = True
+                    continue
+                if accepted:
+                    draining = False
         except Exception as exc:
             if not self._cancel.is_set():
                 self._sampler.record_error(exc)

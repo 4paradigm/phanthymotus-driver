@@ -16,6 +16,10 @@ curl -fsSL https://motus.phanthy.com/run-pr-image.sh | \
 驱动启动时自动发现唯一状态源；默认原生DDS域为0，独立于ROS域42。
 源时间戳重复时不产生新样本；冻结超过0.5秒清空重量并终止测量。
 缺少可验证源时间戳的数据仍返回 `FRESHNESS_UNVERIFIED`，不使用getter缓存替代。
+管道中的帧延迟超过0.25秒时会被丢弃，本次空载基线作废；采集进程继续排空旧帧，
+收到真正新鲜的反馈后恢复接收。需卸物、停止本卡并重新空载曲肘，旧测量不会自动续接。
+`info.diagnostics.last_read_error`保留最近一次中断原因，是否已恢复应同时查看
+`host_age_s`和持续增加的`received_count`。源重置、发布者变化或格式错误仍中止采集。
 
 画布操作顺序：
 
