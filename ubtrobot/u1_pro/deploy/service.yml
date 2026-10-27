@@ -18,7 +18,7 @@ ubtrobot-u1-pro:
     - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
     - PULSE_SERVER=tcp:127.0.0.1:34567
-    - U1_PRO_MIC_GAIN_DB=${U1_PRO_MIC_GAIN_DB:-9.0}
+    - U1_PRO_MIC_GAIN_DB=${U1_PRO_MIC_GAIN_DB:-18.0}
   logging:
     driver: local
     options:

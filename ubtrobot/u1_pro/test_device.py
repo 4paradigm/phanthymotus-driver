@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import io
 import json
+import math
 import os
 import struct
 import threading
@@ -250,7 +251,7 @@ class U1CardContractTests(unittest.TestCase):
         text = service.read_text()
         self.assertIn("/tmp/robo/ipc:/tmp/robo/ipc", text)
         self.assertIn("/dev/shm:/dev/shm", text)
-        self.assertIn("U1_PRO_MIC_GAIN_DB=${U1_PRO_MIC_GAIN_DB:-9.0}", text)
+        self.assertIn("U1_PRO_MIC_GAIN_DB=${U1_PRO_MIC_GAIN_DB:-18.0}", text)
 
     def test_stream_topics_match_robot_contract(self):
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
@@ -267,14 +268,48 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(len(normalized), 8)
         self.assertEqual(struct.unpack("<4h", normalized), (0, 333, 666, 1000))
 
-    def test_mic_gain_scales_pcm_and_saturates_without_wraparound(self):
+    def test_mic_leveler_makes_speech_prominent_and_suppresses_noise(self):
         import device
 
-        payload = struct.pack("<hhhh", 1000, -1000, 20000, -20000)
-        amplified = device._apply_pcm16_gain(payload, 2.0)
-        self.assertEqual(struct.unpack("<4h", amplified),
-                         (2000, -2000, 32767, -32768))
-        self.assertEqual(device._apply_pcm16_gain(payload, 1.0), payload)
+        leveler = device._AdaptiveSpeechLeveler(18.0)
+        noise = struct.pack("<512h", *([35, -35] * 256))
+        for _ in range(60):
+            quiet_output = leveler.process(noise)
+
+        speech_samples = [
+            round(1200 * math.sin(2 * math.pi * 440 * index / 16000))
+            for index in range(512)
+        ]
+        speech = struct.pack("<512h", *speech_samples)
+        for _ in range(4):
+            speech_output = leveler.process(speech)
+
+        def rms(payload):
+            values = struct.unpack("<512h", payload)
+            return math.sqrt(sum(value * value for value in values) / len(values))
+
+        self.assertGreater(rms(speech_output), rms(speech) * 2.0)
+        self.assertGreater(rms(speech_output), rms(quiet_output) * 50.0)
+        self.assertTrue(leveler.status()["speech_active"])
+
+        for _ in range(20):
+            quiet_output = leveler.process(noise)
+        self.assertFalse(leveler.status()["speech_active"])
+        self.assertLess(leveler.status()["applied_gain_db"], -15.0)
+
+    def test_mic_leveler_limits_loud_speech_without_integer_wraparound(self):
+        import device
+
+        leveler = device._AdaptiveSpeechLeveler(24.0)
+        noise = struct.pack("<512h", *([20, -20] * 256))
+        for _ in range(60):
+            leveler.process(noise)
+        loud = struct.pack("<512h", *([30000, -30000] * 256))
+        output = struct.unpack("<512h", leveler.process(loud))
+        self.assertLessEqual(max(output), round(32767 * 0.95))
+        self.assertGreaterEqual(min(output), -round(32767 * 0.95))
+        self.assertGreater(max(output), 0)
+        self.assertLess(min(output), 0)
 
     def test_mic_gain_config_is_bounded_and_env_overrides_yaml(self):
         import device
@@ -1079,9 +1114,11 @@ class U1CardContractTests(unittest.TestCase):
         publisher = FakePublisher()
         payload = struct.pack("<hh", 1000, -1000)
         expected = struct.pack("<hh", 2000, -2000)
+        leveler = mock.Mock()
+        leveler.process.return_value = expected
         nodes = types.SimpleNamespace(
             _mic_forwarding=True,
-            _mic_gain_linear=2.0,
+            _mic_leveler=leveler,
             _mic_frames=0,
             _mic_frame_event=threading.Event(),
             AudioChunk=FakeAudioChunk,
@@ -1093,6 +1130,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(len(publisher.messages), 1)
         self.assertEqual(publisher.messages[0].format, "audio/pcm-16k")
         self.assertEqual(publisher.messages[0].data, list(expected))
+        leveler.process.assert_called_once_with(payload)
         self.assertEqual(publisher.messages[0].header.stamp.sec, 1)
         self.assertEqual(publisher.messages[0].header.stamp.nanosec, 2)
 
@@ -1100,9 +1138,12 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         publisher = FakePublisher()
+        expected = struct.pack("<hh", 2000, -2000)
+        leveler = mock.Mock()
+        leveler.process.return_value = expected
         nodes = types.SimpleNamespace(
             _mic_forwarding=True,
-            _mic_gain_linear=2.0,
+            _mic_leveler=leveler,
             _mic_frames=0,
             _mic_frame_event=threading.Event(),
             AudioChunk=FakeAudioChunk,
@@ -1115,8 +1156,9 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(len(publisher.messages), 1)
         self.assertEqual(
             publisher.messages[0].data,
-            list(struct.pack("<hh", 2000, -2000)),
+            list(expected),
         )
+        leveler.process.assert_called_once_with(struct.pack("<hh", 1000, -1000))
 
     def test_mic_sources_are_mutually_exclusive(self):
         import device
