@@ -44,7 +44,7 @@ class SoundDirectionTests(unittest.TestCase):
 
     def test_invalid_messages(self):
         for event in ('null', '[]', '{}', 'bad', {"azimuth": True},
-                      {"azimuth": float("nan")}, {"azimuth": float("inf")},
+                      {"azimuth": float("nan")}, {"azimuth": float("inf")}, {"azimuth": 10**1000},
                       {"azimuth": 180}, {"azimuth": -181},
                       {"azimuth": 0, "confidence": 2}, {"azimuth": 0, "valid": "false"},
                       ' ' * 16385, {"data": {"data": {}}}):
@@ -129,6 +129,32 @@ class SoundDirectionTests(unittest.TestCase):
                 self.assertIsNone(plugin._subscription)
                 self.assertIsNone(plugin._timer)
                 nodes.core.destroy_publisher.assert_called_once()
+
+    def test_publication_failure_still_releases_all_resources(self):
+        self.plugin.start()
+        self.nodes.core.create_publisher.return_value.publish.side_effect = RuntimeError("publisher failed")
+        with self.assertRaisesRegex(RuntimeError, "publisher failed"):
+            self.plugin.stop()
+        self.nodes.robot.destroy_subscription.assert_called_once()
+        self.nodes.robot.destroy_timer.assert_called_once()
+        self.nodes.core.destroy_publisher.assert_called_once()
+        self.assertFalse(self.plugin.running)
+        self.assertIsNone(self.plugin._publisher)
+        self.plugin.stop()
+
+    def test_cleanup_failure_does_not_skip_other_resources_and_can_retry(self):
+        self.plugin.start()
+        self.nodes.robot.destroy_timer.side_effect = RuntimeError("timer failed")
+        with self.assertRaisesRegex(RuntimeError, "timer failed"):
+            self.plugin.stop()
+        self.nodes.robot.destroy_subscription.assert_called_once()
+        self.nodes.core.destroy_publisher.assert_called_once()
+        with self.assertRaisesRegex(RuntimeError, "timer failed"):
+            self.plugin.start()
+        self.nodes.robot.create_subscription.assert_called_once()
+        self.nodes.robot.destroy_timer.side_effect = None
+        self.plugin.stop()
+        self.assertIsNone(self.plugin._timer)
 
     def test_registration_and_image_packaging(self):
         import test_device  # ROS-free test stubs

@@ -19,7 +19,10 @@ ANGLE_CONVENTION = "robot_front_0_left_positive_ccw"
 def number(value, name, low, high):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(value) or not low <= value <= high:
         raise ValueError(f"{name} must be in [{low}, {high}]")
     return value
@@ -126,6 +129,9 @@ class SoundDirectionPlugin:
         with self._lock:
             if self.running:
                 return self._info()
+            if any(resource is not None for resource in (self._publisher, self._subscription, self._timer)):
+                # Retry incomplete cleanup before allocating a new session.
+                self.stop()
             self._latest = self._received = None
             self._events_received = 0
             self._error = ""
@@ -151,7 +157,11 @@ class SoundDirectionPlugin:
             self._generation += 1
             self._latest = self._received = None
             self._error = ""
-            self._publish()
+            errors = []
+            try:
+                self._publish()
+            except Exception as exc:
+                errors.append(exc)
             for owner, attribute, destroy in (
                 (self.nodes.robot, "_timer", "destroy_timer"),
                 (self.nodes.robot, "_subscription", "destroy_subscription"),
@@ -159,8 +169,14 @@ class SoundDirectionPlugin:
             ):
                 resource = getattr(self, attribute)
                 if resource is not None:
-                    getattr(owner, destroy)(resource)
-                    setattr(self, attribute, None)
+                    try:
+                        getattr(owner, destroy)(resource)
+                    except Exception as exc:
+                        errors.append(exc)
+                    else:
+                        setattr(self, attribute, None)
+            if errors:
+                raise RuntimeError(f"sound direction cleanup failed: {errors[0]}") from errors[0]
             return self._info()
 
     def _on_event(self, event, generation=None):
