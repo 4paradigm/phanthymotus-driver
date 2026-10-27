@@ -42,17 +42,18 @@ def quaternion_angle(a, b):
 
 def fixed_pose_motor_ids(profile):
     # The quick model fixes arm geometry relative to the measured torso. A
-    # standing robot's leg stance may change under load; leg velocity/window
-    # span, body orientation, modes, faults and freshness are still checked.
+    # standing robot's leg stance may change under load; leg velocity, body
+    # orientation, modes, faults, temperatures and freshness are still checked.
     return (0, 1, 2, 3, 10, 11, 12, 13, 20) if profile.get("setup_mode") == "quick" else tuple(range(21))
 
 
 def pose_span_violation(frames, profile):
-    """Return the worst measured pose-span violation in a quick-mode window."""
-    spans = [max(f["q"][j] for f in frames) - min(f["q"][j] for f in frames) for j in range(21)]
-    limits = [min(profile.get("max_pose_span_rad", .03), profile["pose_tolerance_rad"])
-              if j in profile["motor_ids"] else profile["pose_tolerance_rad"] for j in range(21)]
-    j = max(range(21), key=lambda i: spans[i]/limits[i])
+    """Use the same geometry scope for window spans and fixed references."""
+    spans = {j: max(f["q"][j] for f in frames) - min(f["q"][j] for f in frames)
+             for j in fixed_pose_motor_ids(profile)}
+    limits = {j: min(profile.get("max_pose_span_rad", .03), profile["pose_tolerance_rad"])
+              if j in profile["motor_ids"] else profile["pose_tolerance_rad"] for j in spans}
+    j = max(spans, key=lambda i: spans[i]/limits[i])
     return (j, spans[j], limits[j]) if spans[j] > limits[j] else None
 
 

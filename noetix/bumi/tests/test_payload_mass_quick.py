@@ -1,5 +1,6 @@
 """End-to-end quick setup: no engineering JSON or invented verification flags."""
 import copy
+import math
 import threading
 import time
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ import pytest
 
 from test_payload_mass import Sampler, Loco, raw_frame, run, wait_for, configuration
 from payload_mass import PayloadMassPlugin
-from payload_mass_sampling import MassError, SharedSampler, check_frame
+from payload_mass_sampling import MassError, SharedSampler, check_frame, pose_span_violation
 from payload_mass_quick import profile_from_home, fit_reference
 from payload_mass_estimator import summarize, validate_profile
 from payload_mass_live import evaluate_window
@@ -36,6 +37,53 @@ def quick(tmp_path):
 
 def set_mass(sampler, kg):
     sampler.frame["tau"] = raw_frame(kg)["tau"]
+
+
+@pytest.mark.parametrize("moving_arm", [False, True])
+def test_three_second_capture_with_continuous_ankle_motion(monkeypatch, moving_arm):
+    import payload_mass_sampling as sampling
+    clock = [0.]
+    monkeypatch.setattr(sampling, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    sampler = SharedSampler()
+    home = [0.] * 21
+    frame = raw_frame()
+    frame["q"][3] = -.6
+    p = profile_from_home(frame, "left", 300)
+    p.update(settle_timeout_s=1, min_samples=15)
+    ended = threading.Event()
+    def feed():
+        seq = 0
+        while not ended.is_set():
+            seq += 1
+            now = seq * .1
+            current = copy.deepcopy(frame)
+            current["source_seq"] = seq
+            # 0.1894-rad peak-to-peak ankle excursion, period 4 seconds.
+            # Its true velocity stays below the retained 0.2-rad/s limit.
+            current["q"][9] = .0947 * math.sin(now*math.pi/2)
+            current["dq"][9] = .0947 * math.pi/2 * math.cos(now*math.pi/2)
+            current["dq"][1] = .1343
+            if moving_arm:
+                current["q"][1] = .025*now
+            clock[0] = now
+            sampler.push(current)
+            ended.wait(.005)
+    thread = threading.Thread(target=feed)
+    thread.start()
+    try:
+        if moving_arm:
+            with pytest.raises(MassError) as err:
+                sampler.collect(3, p, threading.Event(), learn_pose_from=home)
+            assert err.value.code == "UNSTABLE"
+            assert "joint angle span too high: motor_id=1" in str(err.value)
+        else:
+            frames = sampler.collect(3, p, threading.Event(), learn_pose_from=home)
+            assert frames[-1]["host_monotonic_s"] - frames[0]["host_monotonic_s"] >= 3
+            assert max(f["q"][9] for f in frames) - min(f["q"][9] for f in frames) > .15
+            assert pose_span_violation(frames, p) is None
+    finally:
+        ended.set()
+        thread.join(1)
 
 
 @pytest.mark.parametrize("failure, expected", [
@@ -172,7 +220,7 @@ def test_quick_setup_single_reference_dynamic_unknown_and_home(quick, reported_v
 
 
 @pytest.mark.parametrize("ankle", [9, 19])
-def test_leg_stance_can_settle_after_load_without_changing_tare(ankle):
+def test_leg_stance_does_not_invalidate_arm_scale_or_change_tare(ankle):
     home = raw_frame()
     home["q"][ankle] = .0349
     p = profile_from_home(home, "left", 300)
@@ -187,12 +235,12 @@ def test_leg_stance_can_settle_after_load_without_changing_tare(ankle):
     frames = [raw_frame(.35, n) for n in range(1, 33)]
     for f in frames:
         f["q"][ankle] = -.1535
-    # A transient stance change still prevents a stable reading while it is
-    # inside the window, but does not kill the session at a fixed leg target.
+    # Leg angles do not define the quick model's geometry, even when they
+    # change inside the window. IMU, speed and arm/waist checks still apply.
     transient = copy.deepcopy(frames)
     transient[0]["q"][ankle] = .0349
     changing = evaluate_window(transient, baseline, model, p, 3, time.time())
-    assert not changing["stable"] and not changing["valid"]
+    assert changing["stable"] and changing["valid"] and changing["mass_kg"] == .35
     settled = evaluate_window(frames, baseline, model, p, 3, time.time())
     assert settled["mass_kg"] == .35 and settled["stable"] and settled["valid"]
     assert baseline == original
@@ -223,10 +271,12 @@ def test_engineering_profile_still_checks_leg_pose():
     with pytest.raises(MassError) as err:
         check_frame(frame, p)
     assert err.value.code == "POSE_MISMATCH" and "motor_id=9" in str(err.value)
+    assert pose_span_violation([raw_frame(), frame], p)[0] == 9
 
 
 @pytest.mark.parametrize("changing_pose", [False, True])
-def test_reported_velocity_tolerance_keeps_actual_pose_window_check(changing_pose):
+@pytest.mark.parametrize("motor", [1, 11, 20])
+def test_reported_velocity_tolerance_keeps_actual_pose_window_check(changing_pose, motor):
     p = profile_from_home(raw_frame(), "left", 300)
     empty = [raw_frame(0, n) for n in range(1, 33)]
     baseline = {"id": "velocity", "profile_fingerprint": p["fingerprint"], "created_s": time.time(),
@@ -238,7 +288,8 @@ def test_reported_velocity_tolerance_keeps_actual_pose_window_check(changing_pos
         if changing_pose:
             # All frames stay inside the fixed +/-0.15 target tolerance; only
             # the tighter complete-window span detects this actual movement.
-            frame["q"][1] = -.04 + .08*n/(len(frames)-1)
+            half_span = .04 if motor in p["motor_ids"] else .1
+            frame["q"][motor] = -half_span + 2*half_span*n/(len(frames)-1)
     result = evaluate_window(frames, baseline, model, p, 3, time.time())
     assert result["mass_kg"] == .35
     assert result["stable"] is (not changing_pose)
