@@ -8,6 +8,7 @@ management call. The robot's public ROS graph provides useful contracts:
 from __future__ import annotations
 
 import json
+import math
 import mmap
 import os
 import queue
@@ -39,6 +40,9 @@ CAMERA_FRAME_TIMEOUT = 3.0
 CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
 MIC_SDK_FIRST_FRAME_TIMEOUT = 1.0
+MIC_GAIN_DB_DEFAULT = 9.0
+MIC_GAIN_DB_MIN = 0.0
+MIC_GAIN_DB_MAX = 18.0
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
@@ -55,6 +59,40 @@ JPEG_MAX_PIXELS = 1280 * 720
 VENDOR_ACTION_RESOURCE = "u1_action"
 
 EVENT_TOPICS = {"playback_state": PLAYBACK_TOPIC}
+
+
+def _resolve_mic_gain_db(config: dict) -> float:
+    """Read a bounded input gain from env/config without accepting NaN/inf."""
+    audio_config = config.get("audio", {}) if isinstance(config, dict) else {}
+    if not isinstance(audio_config, dict):
+        audio_config = {}
+    configured = os.environ.get(
+        "U1_PRO_MIC_GAIN_DB", audio_config.get("mic_gain_db", MIC_GAIN_DB_DEFAULT))
+    try:
+        gain_db = float(configured)
+    except (TypeError, ValueError):
+        gain_db = MIC_GAIN_DB_DEFAULT
+    if not math.isfinite(gain_db):
+        gain_db = MIC_GAIN_DB_DEFAULT
+    return min(MIC_GAIN_DB_MAX, max(MIC_GAIN_DB_MIN, gain_db))
+
+
+def _apply_pcm16_gain(payload: bytes, gain_linear: float) -> bytes:
+    """Apply bounded software gain to mono S16LE PCM with saturation."""
+    raw = bytes(payload)
+    if not raw or len(raw) % 2:
+        return b""
+    if gain_linear == 1.0:
+        return raw
+    try:
+        import numpy as np
+        samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+        amplified = np.clip(samples * float(gain_linear), -32768, 32767)
+        return amplified.astype("<i2").tobytes()
+    except Exception:
+        # Gain is an enhancement, so a processing failure must not mute the
+        # microphone stream. Keep forwarding the unmodified PCM instead.
+        return raw
 
 
 def _normalize_pcm16k(message: Any, data: Any) -> bytes:
@@ -479,6 +517,8 @@ class U1Nodes:
         self._closed = False
         self.config = config
         self.namespace = namespace
+        self.mic_gain_db = _resolve_mic_gain_db(config)
+        self._mic_gain_linear = 10.0 ** (self.mic_gain_db / 20.0)
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk
         self.AudioInData = AudioInData
@@ -783,6 +823,10 @@ class U1Nodes:
                 U1Nodes._cancel_mic_source_timer_locked(self)
             if self._mic_source != "sdk":
                 return
+        payload = _apply_pcm16_gain(
+            payload, float(getattr(self, "_mic_gain_linear", 1.0)))
+        if not payload:
+            return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
         chunk.data = list(payload)
@@ -821,6 +865,10 @@ class U1Nodes:
 
     def _publish_topic_mic_frame(self, payload: bytes, header: Any = None) -> None:
         if not self._mic_forwarding:
+            return
+        payload = _apply_pcm16_gain(
+            payload, float(getattr(self, "_mic_gain_linear", 1.0)))
+        if not payload:
             return
         chunk = self.AudioChunk()
         chunk.format = AUDIO_FORMAT
@@ -1278,11 +1326,18 @@ class MicPlugin:
         self._enable_requested = False
 
     def get_tool(self):
-        return tool(self.PREFIX, "sensor", "U1 Pro 麦克风阵列：输出 16 kHz 单声道 PCM 音频流，可供语音识别使用。", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+        return tool(self.PREFIX, "sensor", "U1 Pro 麦克风阵列：输出经过可配置增益的 16 kHz 单声道 PCM 音频流，可供语音识别使用。", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+
+    def _status(self, state: str) -> dict:
+        return {
+            "state": state,
+            "gain_db": float(getattr(self.nodes, "mic_gain_db", 0.0)),
+            "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}],
+        }
 
     def start(self):
         if self.running:
-            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            return self._status("running")
         self._enable_requested = True
         microphone_enabled = False
         try:
@@ -1302,10 +1357,12 @@ class MicPlugin:
             else:
                 self._enable_requested = False
             self.running = False
-            return {"state": "error", "message": message, "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            result = self._status("error")
+            result["message"] = message
+            return result
         else:
             self.running = True
-            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            return self._status("running")
 
     def stop(self):
         if not self._enable_requested:
@@ -1328,8 +1385,9 @@ class MicPlugin:
         elif action == "stop":
             result = self.stop()
             result["topic_out"] = [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]
+            result["gain_db"] = float(getattr(self.nodes, "mic_gain_db", 0.0))
             return result
-        return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+        return self._status("running" if self.running else "idle")
 
 
 class SpeakerPlugin:

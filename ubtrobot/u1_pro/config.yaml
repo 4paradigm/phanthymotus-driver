@@ -1,5 +1,8 @@
 mcp_port: 15740
 ros_namespace: ""
+audio:
+  # Fixed input calibration. Override with U1_PRO_MIC_GAIN_DB at deployment.
+  mic_gain_db: 9.0
 ros:
   # Vendor control, authorization, TTS, and motion services run on domain 20.
   robot_domain_id: 20

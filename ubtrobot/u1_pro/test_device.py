@@ -250,6 +250,7 @@ class U1CardContractTests(unittest.TestCase):
         text = service.read_text()
         self.assertIn("/tmp/robo/ipc:/tmp/robo/ipc", text)
         self.assertIn("/dev/shm:/dev/shm", text)
+        self.assertIn("U1_PRO_MIC_GAIN_DB=${U1_PRO_MIC_GAIN_DB:-9.0}", text)
 
     def test_stream_topics_match_robot_contract(self):
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
@@ -265,6 +266,34 @@ class U1CardContractTests(unittest.TestCase):
         normalized = device._normalize_pcm16k(message, payload)
         self.assertEqual(len(normalized), 8)
         self.assertEqual(struct.unpack("<4h", normalized), (0, 333, 666, 1000))
+
+    def test_mic_gain_scales_pcm_and_saturates_without_wraparound(self):
+        import device
+
+        payload = struct.pack("<hhhh", 1000, -1000, 20000, -20000)
+        amplified = device._apply_pcm16_gain(payload, 2.0)
+        self.assertEqual(struct.unpack("<4h", amplified),
+                         (2000, -2000, 32767, -32768))
+        self.assertEqual(device._apply_pcm16_gain(payload, 1.0), payload)
+
+    def test_mic_gain_config_is_bounded_and_env_overrides_yaml(self):
+        import device
+
+        with mock.patch.dict(device.os.environ, {}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db(
+                {"audio": {"mic_gain_db": 6}}), 6.0)
+            self.assertEqual(device._resolve_mic_gain_db(
+                {"audio": None}), device.MIC_GAIN_DB_DEFAULT)
+        with mock.patch.dict(
+                device.os.environ, {"U1_PRO_MIC_GAIN_DB": "12"}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db(
+                {"audio": {"mic_gain_db": 6}}), 12.0)
+        with mock.patch.dict(
+                device.os.environ, {"U1_PRO_MIC_GAIN_DB": "99"}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db({}), device.MIC_GAIN_DB_MAX)
+        with mock.patch.dict(
+                device.os.environ, {"U1_PRO_MIC_GAIN_DB": "nan"}, clear=True):
+            self.assertEqual(device._resolve_mic_gain_db({}), device.MIC_GAIN_DB_DEFAULT)
 
     def test_u1_cyclonedds_config_matches_official_sdk_runtime(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
@@ -1048,8 +1077,11 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         publisher = FakePublisher()
+        payload = struct.pack("<hh", 1000, -1000)
+        expected = struct.pack("<hh", 2000, -2000)
         nodes = types.SimpleNamespace(
             _mic_forwarding=True,
+            _mic_gain_linear=2.0,
             _mic_frames=0,
             _mic_frame_event=threading.Event(),
             AudioChunk=FakeAudioChunk,
@@ -1057,12 +1089,34 @@ class U1CardContractTests(unittest.TestCase):
             _audio_header=lambda: types.SimpleNamespace(
                 stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
         )
-        device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02\x03\x04", {}, 1_000_000_002)
+        device.U1Nodes._publish_mic_frame(nodes, payload, {}, 1_000_000_002)
         self.assertEqual(len(publisher.messages), 1)
         self.assertEqual(publisher.messages[0].format, "audio/pcm-16k")
-        self.assertEqual(publisher.messages[0].data, [1, 2, 3, 4])
+        self.assertEqual(publisher.messages[0].data, list(expected))
         self.assertEqual(publisher.messages[0].header.stamp.sec, 1)
         self.assertEqual(publisher.messages[0].header.stamp.nanosec, 2)
+
+    def test_mic_applies_gain_to_topic_fallback_payload(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_gain_linear=2.0,
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+            _audio_header=lambda: types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""),
+        )
+        device.U1Nodes._publish_topic_mic_frame(
+            nodes, struct.pack("<hh", 1000, -1000))
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(
+            publisher.messages[0].data,
+            list(struct.pack("<hh", 2000, -2000)),
+        )
 
     def test_mic_sources_are_mutually_exclusive(self):
         import device
