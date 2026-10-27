@@ -63,7 +63,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right'} | set(CAMERA_SOURCES)
+    allowed = {'joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right', 'tron2_teaching'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
@@ -76,6 +76,7 @@ def load_settings():
         raise ValueError('Enable at least one read-only sensor')
     settings['enabled_cards'] = enabled
     settings['home_file'] = os.environ.get('TRON2_HOME_FILE', '/config/tron2/home.json')
+    settings['teaching_directory'] = os.environ.get('TRON2_TEACHING_DIR', '/data/tron2-teaching')
     # Fixed read-only video source on the same configured robot host. Callers
     # cannot select arbitrary URLs, topics, credentials, or control endpoints.
     host = '[' + parsed.hostname + ']' if ':' in parsed.hostname else parsed.hostname
@@ -105,9 +106,11 @@ async def run():
             ca = os.environ.get('AGENT_CORE_CA_CERT')
             if ca:
                 adapter.core_ssl = ssl.create_default_context(cafile=ca)
-            app = web.Application(client_max_size=16 * 1024)
+            app = web.Application(client_max_size=17 * 1024 * 1024)
             app.router.add_post('/mcp', adapter.rpc)
             app.router.add_get('/health', adapter.health)
+            if adapter.teaching is not None:
+                app.router.add_post('/file/upload', adapter.teaching_upload)
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
             await web.TCPSite(runner, '127.0.0.1', PORT).start()
@@ -122,6 +125,8 @@ async def run():
                 for task in done:
                     task.result()
             finally:
+                if adapter.teaching is not None:
+                    await asyncio.to_thread(adapter.teaching.stop)
                 await asyncio.gather(*(stream.close() for stream in adapter.cameras.values()))
                 await adapter.motion.close()
                 await adapter.head.close()

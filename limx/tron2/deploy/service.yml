@@ -13,9 +13,12 @@ limx-tron2:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${TRON2_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}:/certs/core.pem:ro
     - /opt/phanthy-motus/data/tron2:/config/tron2:ro
+    - /opt/phanthy-motus/data/tron2-teaching:/data/tron2-teaching
   environment:
     - TRON2_SERIAL=${TRON2_SERIAL:-}
     - TRON2_HOME_FILE=/config/tron2/home.json
+    - TRON2_TEACHING_DIR=/data/tron2-teaching
+    - HF_HOME=/data/tron2-teaching/cache
     - TRON2_ROBOT_URL=${TRON2_ROBOT_URL:-ws://10.192.1.2:5000}
     - AGENT_CORE_URL=${TRON2_AGENT_CORE_URL:-https://phanthy-motus:15678}
     - AGENT_CORE_CA_CERT=/certs/core.pem
