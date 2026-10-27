@@ -9,7 +9,7 @@ import math
 import time
 
 from payload_mass_estimator import ARM_IDS, NAMES, digest, summarize
-from payload_mass_sampling import MassError, finite, vector
+from payload_mass_sampling import MassError, finite, vector, fixed_pose_motor_ids
 
 
 def profile_from_home(frame, arm, hold_s):
@@ -32,6 +32,7 @@ def profile_from_home(frame, arm, hold_s):
          "min_samples": 15, "max_receive_gap_s": .5,
          "baseline_max_age_s": hold_s, "result_max_age_s": 30,
          "quality": "experimental_single_reference"}
+    p["fixed_pose_motor_ids"] = list(fixed_pose_motor_ids(p))
     p["fingerprint"] = digest(p)
     return p
 

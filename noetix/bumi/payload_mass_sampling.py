@@ -40,6 +40,13 @@ def quaternion_angle(a, b):
     return 2 * math.acos(min(1.0, abs(sum(x*y for x, y in zip(a, b)) / na / nb)))
 
 
+def fixed_pose_motor_ids(profile):
+    # The quick model fixes arm geometry relative to the measured torso. A
+    # standing robot's leg stance may change under load; leg velocity/window
+    # span, body orientation, modes, faults and freshness are still checked.
+    return (0, 1, 2, 3, 10, 11, 12, 13, 20) if profile.get("setup_mode") == "quick" else tuple(range(21))
+
+
 def pose_span_violation(frames, profile):
     """Return the worst measured pose-span violation in a quick-mode window."""
     spans = [max(f["q"][j] for f in frames) - min(f["q"][j] for f in frames) for j in range(21)]
@@ -258,8 +265,8 @@ def check_frame(frame, p):
     if max(frame["temperature"]) >= p["max_temperature_c"]:
         raise MassError("OVER_TEMPERATURE", "temperature exceeds engineer-confirmed limit")
     differences = [abs(a-b) for a,b in zip(frame["q"],p["pose_q"])]
-    if max(differences) > p["pose_tolerance_rad"]:
-        j = differences.index(max(differences))
+    j = max(fixed_pose_motor_ids(p), key=lambda i: differences[i])
+    if differences[j] > p["pose_tolerance_rad"]:
         raise MassError("POSE_MISMATCH", "arm/waist/body joint pose differs from profile: "
                         f"motor_id={j}, actual={frame['q'][j]:.4f}, target={p['pose_q'][j]:.4f}, "
                         f"delta={differences[j]:.4f} rad, limit={p['pose_tolerance_rad']:.4f} rad")

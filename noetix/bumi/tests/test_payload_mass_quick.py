@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_payload_mass import Sampler, Loco, raw_frame, run, wait_for
+from test_payload_mass import Sampler, Loco, raw_frame, run, wait_for, configuration
 from payload_mass import PayloadMassPlugin
 from payload_mass_sampling import MassError, SharedSampler, check_frame
 from payload_mass_quick import profile_from_home, fit_reference
-from payload_mass_estimator import summarize
+from payload_mass_estimator import summarize, validate_profile
 from payload_mass_live import evaluate_window
 
 
@@ -143,13 +143,15 @@ def test_gradual_bend_learns_final_stable_pose(tmp_path, arm, elbow, reported_ve
 
 
 @pytest.mark.parametrize("reported_velocity", [0, .1343])
-def test_quick_setup_single_reference_dynamic_unknown_and_home(quick, reported_velocity):
+@pytest.mark.parametrize("leg_shift", [0, .1885])
+def test_quick_setup_single_reference_dynamic_unknown_and_home(quick, reported_velocity, leg_shift):
     card, sampler, loco = quick
     sampler.frame["dq"][1] = reported_velocity
     assert run(card, "prepare")["state"] == "ready"
     assert card._session["p"]["pose_q"][3] == -1.2  # learned, not hand-entered
     baseline = copy.deepcopy(card._session["baseline"])
     assert run(card, "weigh")["state"] == "measuring"
+    sampler.frame["q"][9] -= leg_shift
     set_mass(sampler, .2)
     before = wait_for(card, lambda r: r.get("sampling_stable") and r.get("trial_file"))
     assert before["mass_kg"] is None
@@ -167,6 +169,60 @@ def test_quick_setup_single_reference_dynamic_unknown_and_home(quick, reported_v
     assert run(card, "stop")["home_confirmed"]
     assert loco._payload_owner is None
     assert [a[1]["recording_id"] for a in loco.commands if a[0] == "play_recording"] == [12]
+
+
+@pytest.mark.parametrize("ankle", [9, 19])
+def test_leg_stance_can_settle_after_load_without_changing_tare(ankle):
+    home = raw_frame()
+    home["q"][ankle] = .0349
+    p = profile_from_home(home, "left", 300)
+    assert ankle not in p["fixed_pose_motor_ids"]
+    empty = [raw_frame(0, n) for n in range(1, 33)]
+    for f in empty:
+        f["q"][ankle] = .0349
+    baseline = {"id": "stance", "profile_fingerprint": p["fingerprint"], "created_s": time.time(),
+                "summary": summarize(empty, p)}
+    original = copy.deepcopy(baseline)
+    model = fit_reference([raw_frame(.2, n) for n in range(1, 33)], baseline, p, .2)
+    frames = [raw_frame(.35, n) for n in range(1, 33)]
+    for f in frames:
+        f["q"][ankle] = -.1535
+    # A transient stance change still prevents a stable reading while it is
+    # inside the window, but does not kill the session at a fixed leg target.
+    transient = copy.deepcopy(frames)
+    transient[0]["q"][ankle] = .0349
+    changing = evaluate_window(transient, baseline, model, p, 3, time.time())
+    assert not changing["stable"] and not changing["valid"]
+    settled = evaluate_window(frames, baseline, model, p, 3, time.time())
+    assert settled["mass_kg"] == .35 and settled["stable"] and settled["valid"]
+    assert baseline == original
+
+
+@pytest.mark.parametrize("change, code", [
+    (lambda f: f["q"].__setitem__(3, .2), "POSE_MISMATCH"),
+    (lambda f: f["q"].__setitem__(20, .2), "POSE_MISMATCH"),
+    (lambda f: f.__setitem__("quaternion_xyzw", [0, 0, .09983341664682815, .9950041652780258]), "BODY_MISMATCH"),
+    (lambda f: f["errors"].__setitem__(9, 2), "MOTOR_FAULT"),
+    (lambda f: f["dq"].__setitem__(9, .21), "UNSTABLE"),
+    (lambda f: f.__setitem__("source_seq", None), "FRESHNESS_UNVERIFIED"),
+])
+def test_leg_pose_scope_retains_upper_body_fault_speed_and_source_checks(change, code):
+    p = profile_from_home(raw_frame(), "left", 300)
+    frame = raw_frame()
+    frame["q"][9] = -.1885
+    change(frame)
+    with pytest.raises(MassError) as err:
+        check_frame(frame, p)
+    assert err.value.code == code
+
+
+def test_engineering_profile_still_checks_leg_pose():
+    p = validate_profile("weighing", configuration()["profile"], "left", loading=True)
+    frame = raw_frame()
+    frame["q"][9] = -.1885
+    with pytest.raises(MassError) as err:
+        check_frame(frame, p)
+    assert err.value.code == "POSE_MISMATCH" and "motor_id=9" in str(err.value)
 
 
 @pytest.mark.parametrize("changing_pose", [False, True])

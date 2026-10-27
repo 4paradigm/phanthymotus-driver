@@ -10,7 +10,7 @@ import json
 import math
 from statistics import median
 
-from payload_mass_sampling import MassError, finite, vector, quaternion_angle
+from payload_mass_sampling import MassError, finite, vector, quaternion_angle, fixed_pose_motor_ids
 
 VERSION = "bumi-payload-mass/1"
 ARM_IDS = {"left": [0,1,2,3], "right": [10,11,12,13]}
@@ -96,8 +96,12 @@ def check_baseline(baseline, summary, p, now):
     b = baseline["summary"]
     if max(abs(a-bb) for a,bb in zip(summary["temperature"],b["temperature"])) > p["max_temperature_drift_c"]:
         raise MassError("TEMPERATURE_DRIFT", "temperature differs from tare")
-    if max(abs(a-bb) for a,bb in zip(summary["pose_q"], b["pose_q"])) > p["pose_tolerance_rad"]:
-        raise MassError("POSE_MISMATCH", "pose differs from tare")
+    j = max(fixed_pose_motor_ids(p), key=lambda i: abs(summary["pose_q"][i]-b["pose_q"][i]))
+    delta = abs(summary["pose_q"][j]-b["pose_q"][j])
+    if delta > p["pose_tolerance_rad"]:
+        raise MassError("POSE_MISMATCH", f"pose differs from tare: motor_id={j}, "
+                        f"actual={summary['pose_q'][j]:.4f}, target={b['pose_q'][j]:.4f}, "
+                        f"delta={delta:.4f}, limit={p['pose_tolerance_rad']:.4f} rad")
     if quaternion_angle(summary["quaternion_xyzw"], b["quaternion_xyzw"]) > p["body_tolerance_rad"]:
         raise MassError("BODY_MISMATCH", "body orientation differs from tare")
 
