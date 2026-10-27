@@ -39,7 +39,7 @@ def set_mass(sampler, kg):
 
 
 @pytest.mark.parametrize("failure, expected", [
-    ("velocity", "joint velocity: motor_id=6, dq=0.1100, limit=0.1000"),
+    ("velocity", "joint velocity: motor_id=6, dq=0.2100, limit=0.2000"),
     ("gyro", "body gyro: axis=2, gyro=0.1600, limit=0.1500"),
     ("bend", "elbow displacement below bend threshold: motor_id=3"),
     ("angle", "joint angle span too high: motor_id=3"),
@@ -60,7 +60,7 @@ def test_stability_timeout_retains_actual_rejection_and_threshold(failure, expec
             current = copy.deepcopy(frame)
             current["source_seq"] = seq
             if failure == "velocity":
-                current["dq"][6] = .11
+                current["dq"][6] = .21
             elif failure == "gyro":
                 current["gyro"][2] = .16
             elif failure == "bend":
@@ -85,7 +85,8 @@ def test_stability_timeout_retains_actual_rejection_and_threshold(failure, expec
 
 
 @pytest.mark.parametrize("arm, elbow", [("left", 3), ("right", 13)])
-def test_gradual_bend_with_zero_reported_velocity_learns_final_stable_pose(tmp_path, arm, elbow):
+@pytest.mark.parametrize("reported_velocity", [0, .1343])
+def test_gradual_bend_learns_final_stable_pose(tmp_path, arm, elbow, reported_velocity):
     sampler = SharedSampler()
     current = raw_frame()
     current["q"] = [0.] * 21
@@ -107,8 +108,10 @@ def test_gradual_bend_with_zero_reported_velocity_learns_final_stable_pose(tmp_p
             if bend_at[0] is not None and current["workmode"] == 23:
                 elapsed = time.monotonic() - bend_at[0]
                 frame["q"][elbow] = -.3 if elapsed < .2 else -.7 if elapsed < .4 else -1.2
-            # Deliberately zero dq: stationarity must also use actual q movement.
             frame.update(source_seq=seq, dq=[0.] * 21)
+            # Test both unreported movement and the hardware-reported value:
+            # actual angle movement must still determine the settled pose.
+            frame["dq"][1 if arm == "left" else 11] = reported_velocity
             sampler.push(frame)
             stopped.wait(.015)
     thread = threading.Thread(target=feed)
@@ -139,8 +142,10 @@ def test_gradual_bend_with_zero_reported_velocity_learns_final_stable_pose(tmp_p
         thread.join(1)
 
 
-def test_quick_setup_single_reference_dynamic_unknown_and_home(quick):
+@pytest.mark.parametrize("reported_velocity", [0, .1343])
+def test_quick_setup_single_reference_dynamic_unknown_and_home(quick, reported_velocity):
     card, sampler, loco = quick
+    sampler.frame["dq"][1] = reported_velocity
     assert run(card, "prepare")["state"] == "ready"
     assert card._session["p"]["pose_q"][3] == -1.2  # learned, not hand-entered
     baseline = copy.deepcopy(card._session["baseline"])
@@ -162,6 +167,27 @@ def test_quick_setup_single_reference_dynamic_unknown_and_home(quick):
     assert run(card, "stop")["home_confirmed"]
     assert loco._payload_owner is None
     assert [a[1]["recording_id"] for a in loco.commands if a[0] == "play_recording"] == [12]
+
+
+@pytest.mark.parametrize("changing_pose", [False, True])
+def test_reported_velocity_tolerance_keeps_actual_pose_window_check(changing_pose):
+    p = profile_from_home(raw_frame(), "left", 300)
+    empty = [raw_frame(0, n) for n in range(1, 33)]
+    baseline = {"id": "velocity", "profile_fingerprint": p["fingerprint"], "created_s": time.time(),
+                "summary": summarize(empty, p)}
+    model = fit_reference([raw_frame(.2, n) for n in range(1, 33)], baseline, p, .2)
+    frames = [raw_frame(.35, n) for n in range(1, 33)]
+    for n, frame in enumerate(frames):
+        frame["dq"][1] = .1343
+        if changing_pose:
+            # All frames stay inside the fixed +/-0.15 target tolerance; only
+            # the tighter complete-window span detects this actual movement.
+            frame["q"][1] = -.04 + .08*n/(len(frames)-1)
+    result = evaluate_window(frames, baseline, model, p, 3, time.time())
+    assert result["mass_kg"] == .35
+    assert result["stable"] is (not changing_pose)
+    assert result["valid"] is (not changing_pose)
+    assert result["sampling_stable"] is (not changing_pose)
 
 
 def test_only_recording_id_is_needed_and_configuration_is_atomic(quick):

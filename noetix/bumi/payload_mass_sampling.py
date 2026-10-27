@@ -40,6 +40,15 @@ def quaternion_angle(a, b):
     return 2 * math.acos(min(1.0, abs(sum(x*y for x, y in zip(a, b)) / na / nb)))
 
 
+def pose_span_violation(frames, profile):
+    """Return the worst measured pose-span violation in a quick-mode window."""
+    spans = [max(f["q"][j] for f in frames) - min(f["q"][j] for f in frames) for j in range(21)]
+    limits = [min(profile.get("max_pose_span_rad", .03), profile["pose_tolerance_rad"])
+              if j in profile["motor_ids"] else profile["pose_tolerance_rad"] for j in range(21)]
+    j = max(range(21), key=lambda i: spans[i]/limits[i])
+    return (j, spans[j], limits[j]) if spans[j] > limits[j] else None
+
+
 class SharedSampler:
     def __init__(self, maxlen=4096):
         self._condition = threading.Condition()
@@ -184,16 +193,12 @@ class SharedSampler:
                         # Check measured angle movement even when motor dq is
                         # reported as zero. Never anchor to the first bent frame.
                         if stable:
-                            spans = [max([frame["q"][j]] + [f["q"][j] for f in stable])
-                                     - min([frame["q"][j]] + [f["q"][j] for f in stable])
-                                     for j in range(21)]
-                            limits = [min(.03, profile["pose_tolerance_rad"]) if j in profile["motor_ids"]
-                                      else profile["pose_tolerance_rad"] for j in range(21)]
-                            j = max(range(21), key=lambda i: spans[i]/limits[i])
-                            if spans[j] > limits[j]:
+                            violation = pose_span_violation(stable + [frame], profile)
+                            if violation is not None:
+                                j, span, limit = violation
                                 reason = "UNSTABLE"
                                 reason_detail = (f"joint angle span too high: motor_id={j}, "
-                                                 f"q_span={spans[j]:.4f}, limit={limits[j]:.4f} rad")
+                                                 f"q_span={span:.4f}, limit={limit:.4f} rad")
                                 stable = []
                     if stable and frame["host_monotonic_s"]-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
                         reason = "STALE_SOURCE"

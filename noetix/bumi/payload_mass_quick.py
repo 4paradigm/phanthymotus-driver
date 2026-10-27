@@ -22,7 +22,9 @@ def profile_from_home(frame, arm, hold_s):
          "pose_q": q, "quaternion_xyzw": vector(frame["quaternion_xyzw"], 4, "quaternion"),
          "workmode": 23, "torque_units": "sdk_raw", "accept_host_only_freshness": False,
          "pose_tolerance_rad": .15, "body_tolerance_rad": .1,
-         "max_velocity_rad_s": .1, "max_gyro_rad_s": .15,
+         # Hardware preparation rejected dq=0.1343 at the old 0.1 cutoff.
+         # This is a measurement tolerance; pose span still gates stable data.
+         "max_velocity_rad_s": .2, "max_pose_span_rad": .03, "max_gyro_rad_s": .15,
          "max_torque_span": 1e9, "torque_abs_limit": 1e9,
          "max_temperature_c": max(temperatures) + 10,
          "max_temperature_drift_c": 10, "max_mass_kg": .5,

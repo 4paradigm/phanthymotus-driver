@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 
 from payload_mass_estimator import check_baseline, projection, summarize
-from payload_mass_sampling import MassError, check_frame
+from payload_mass_sampling import MassError, check_frame, pose_span_violation
 
 
 def evaluate_window(frames, baseline, model, profile, duration_s, now):
@@ -20,7 +20,8 @@ def evaluate_window(frames, baseline, model, profile, duration_s, now):
             moving = True
     full = summarize(frames, p)
     check_baseline(baseline, full, p, now)
-    stable = (not moving and len(frames) >= p["min_samples"]
+    pose_stable = p.get("setup_mode") != "quick" or pose_span_violation(frames, p) is None
+    stable = (not moving and pose_stable and len(frames) >= p["min_samples"]
               and full["host_span_s"] >= duration_s
               and all(max(f["tau"][j] for f in frames) - min(f["tau"][j] for f in frames)
                       <= p["max_torque_span"] for j in p["motor_ids"]))
