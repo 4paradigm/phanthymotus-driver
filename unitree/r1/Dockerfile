@@ -15,7 +15,8 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         git \
         libusb-1.0-0 \
         libportaudio2 \
-        libasound2-dev && \
+        libasound2-dev \
+        ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # GStreamer runtime (separate layer to avoid QEMU libc-bin segfault)
@@ -69,6 +70,7 @@ COPY camera_specs.py /work/camera_specs.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY loco_servo.py /work/loco_servo.py
+COPY vision_capture.py /work/vision_capture.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
