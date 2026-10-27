@@ -49,10 +49,10 @@ def parse_doa(event):
         raise ValueError("azimuth must be less than 180")
     confidence = event.get("confidence")
     if confidence is not None:
-        # Firmware v0.9.2 logs real scores such as 4.31 despite the message
+        # Firmware v0.9.2 emits signed scores such as -1.0812 and 4.31 despite the message
         # comment describing [0,1]. Preserve the vendor score, never clamp it
         # or reject an otherwise valid direction as a malformed probability.
-        confidence = number(confidence, "confidence", 0, math.inf)
+        confidence = number(confidence, "confidence", -math.inf, math.inf)
     if "valid" in event and not isinstance(event["valid"], bool):
         raise ValueError("valid must be boolean")
     return angle, confidence, event.get("valid", True)
