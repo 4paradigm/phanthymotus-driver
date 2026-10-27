@@ -45,7 +45,7 @@ plugins:
     # The verified Q5 amplifier route is S16_LE stereo at 44.1 kHz.
     output_sample_rate_hz: 44100
     output_channels: 2
-    volume: 100
+    volume: 5
     input_gain: 6.0
     xos_http_base: "http://192.168.8.100:1888"
   audio:
@@ -97,6 +97,25 @@ plugins:
     max_depth_m: 5.0
     camera_mount_pitch_rad: 0.14655
     floor_offset_m: 1.15
+  squat_counter:
+    enabled: true
+    # Domain 42 pose skeleton; measurements and event logic are shared with Bumi.
+    debug_interval_s: 0.5
+    status_interval_s: 0.2
+    # Local counting and set completion are immediate; coach mode sends only
+    # first/midpoint progress to avoid Decision Core queuing every repetition.
+    # Faster initial stand confirmation; bottom/top validation remains unchanged.
+    baseline_dwell_s: 1.2
+    # Only an explicit begin/reset action starts counting, independent of canvas start.
+    require_explicit_workout_start: true
+    coach_mode: true
+    # Send short milestone prompts straight to TTS; plan and summary stay with Decision Core.
+    local_milestone_voice: true
+    default_sets: 2
+    default_reps_per_set: 8
+    default_rest_s: 90
+    # A short occlusion is not departure; require fresh pose frames and no people.
+    auto_finish_absence_s: 6.0
   arm_control:
     enabled: true
     hardware_enable: true
