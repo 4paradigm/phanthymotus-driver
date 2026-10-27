@@ -72,6 +72,10 @@ def start(image, native_container):
                 shutil.rmtree(staging)
             shutil.copytree(temporary, staging)
             staging.rename(destination)
+    # TemporaryDirectory is 0700 and copytree preserves that root mode. The
+    # vendor image runs as ubt, so its read-only configuration must be traversable.
+    # Only this versioned public code/config directory is exposed, never secrets.
+    destination.chmod(0o755)
     stop()
     docker("run", "-d", "--name", NAME, "--label", LABEL + "=1",
            "--label", "com.phanthy.driver-image-id=" + version,

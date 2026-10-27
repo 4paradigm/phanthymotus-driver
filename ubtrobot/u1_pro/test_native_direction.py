@@ -204,7 +204,8 @@ class NativeDeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(m, 'ROOT', Path(temp)), \
              mock.patch.object(m, 'inspect', side_effect=lambda name: native if name == 'native-audio' else None), \
              mock.patch.object(m, 'docker', side_effect=docker):
-            m.start('reviewed-driver:commit', 'native-audio')
+            result = m.start('reviewed-driver:commit', 'native-audio')
+            self.assertEqual(Path(result['config_directory']).stat().st_mode & 0o777, 0o755)
         run = next(c for c in calls if c[0] == 'run')
         self.assertIn('ROSA_DOMAIN_ID=43', run)
         self.assertIn('vendor-config:/opt/walker/config_csh2:ro', run)
