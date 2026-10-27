@@ -32,96 +32,124 @@ PYTHONPATH=ubtrobot/u1_pro python3 -m unittest discover -s ubtrobot/u1_pro -p 't
 python3 scripts/check_service_yml.py ubtrobot/u1_pro
 ```
 
-## sound_direction：独立只读听声辨位
+## sound_direction：独立厂商定位数据源
 
-保留现有 mic，新增 `direction_card.py` 方位卡片，不新增 ASR、head_orientation 或自动转头。
-其他分支的头部实验代码未纳入本分支。
+公开卡片仍为 `sound_direction`，topic 为 `/<namespace>/sound_direction`，
+格式 `sensor/sound-direction`，传输为 `std_msgs/msg/String` JSON。
+前方 0°、左正右负、后方 +180°；保留原 mic，不新增 ASR、head_orientation 或自动转头。
 
-### 网页接线
+### 为什么 SDK 事件桥接不足以工作
 
-- `mic` 的 `/<namespace>/mic/audio`（`audio/pcm-16k`）→ 平台现有 ASR 的音频输入。
-- `sound_direction` 的 `/<namespace>/sound_direction`（`sensor/sound-direction`）→ 同一 ASR 的方位输入。
+现场核实了 domain 20 的 `/robo/audio/subscribe/doa_event` 为 String，
+但默认关闭原生行为时，该 topic 没有持续方向事件。厂商运行日志表明 DoaNode
+在原生唤醒后才启动一次 500ms 定位；其实际分数还可能为 4.31，
+并不符合 DoaEvent.msg 注释中的 `[0,1]` 概率范围。
+因此原来只订阅 SDK topic 的实现不能提供普通说话时的持续方向输出。
 
-公开方位 topic 使用 `std_msgs/msg/String` JSON，与 Bumi 的公开协议一致。
-不要将方位连到音频端口，不混合两类消息；已有项目应重新添加卡片或重新接线以更新端口。
+现在默认 `sound_direction.source: native`：复用机器已安装的厂商 DOA 模型和
+`voice_doa::DoaPlugin`，在独立 domain **43** 的只读容器运行。
+没有复制 Bumi 定位算法、重新训练模型或将厂商模型/库加入本仓库。
+`source: sdk` 保留为原始事件模式，仍依赖厂商事件生产条件，不能保证普通说话时有数据。
 
-### 输入依据和坐标
+### 数据路径和行为隔离
 
-2026-10-27 只读复核：SDK Adapter 的 ROS domain `20` 中
-`/robo/audio/subscribe/doa_event` 实际类型为 `std_msgs/msg/String`。
-同机 `walker-audio.audio-1` 容器内的
-`/opt/walker/audio_msgs/share/audio_msgs/idls/audio_msgs/msg/DoaEvent.msg` 说明：
-`azimuth` 单位度、范围 `[-180,180)`、左负右正、0°通常为正前方；`confidence` 为 `[0,1]`。
-卡片订阅 Adapter 的 String JSON，而非该 typed 消息；复用已有直接 JSON 和 SDK `data`
-包裹解析实现。尚未取得实时事件样本，Adapter JSON 形状仍须真机验收。
+1. 现有 domain 2 的 `/sys/device/audio_in/raw` 原样单向转发到 domain 43
+   的 `/phanthy/u1_doa/raw`，不改变现有 mic 的 PCM 通路。
+2. `/sys/device/audio_in/cur_device_info` 的真实设备状态也原样转发。
+   此消息必须使用 RELIABLE / TRANSIENT_LOCAL；只有音频而缺少设备状态时，厂商节点会丢帧。
+3. 私有容器复用真实音频容器的配置卷，**只读**取得麦克风通道布局；仅用镜像而不挂该卷会缺少布局。
+4. 厂商 AudioSubscriptionNode、AecNode 与 DoaNode 通过原生流式黑板连接。
+   AEC 沿用厂商设备布局，把输入整理为定位所需的六个通道。
+5. 私有流程用间隔脉冲触发推理，避免每帧重置厂商 500ms 窗口。
+   这只是 domain 43 内的局部布尔值，不发布原生 wakeup_event、不改变系统开关。
+6. typed `/phanthy/u1_doa/event` 返回驱动，驱动取反厂商左负右正角度后发布公开 JSON。
 
-按文档转换 `angle_deg=-azimuth`，即前方 0°、左正右负、后方 +180°；
-`angle_convention` 为 `robot_front_0_left_positive_ccw`。
-这是厂商前方定义的符号适配：文档没有确定设备安装方向、是否随头部转动，
-与实际机器人正前方的对齐仍须验收。不提供可任意猜测的安装偏移配置。
-不跨事件平滑，避免混入上一位说话人的方向。
-仅在 SDK 事件实际提供有效置信度时输出 `confidence`，缺失时省略。
+定位容器不加载任何运动、KWS、唤醒事件发布或播报节点；没有声卡设备、宿主 PID、
+授权目录、SSH 目录或 Docker socket 挂载，不使用 privileged。配置卷只读，根文件系统只读。
+不修改或重启厂商 `walker-audio.audio-1`。驱动 DDS 发现限于 loopback。
 
-### 公开状态和时间限制
+2026-10-27 私有通路实测收到 11 条新厂商定位事件；操作者站在右侧，
+末次原始角度 +80°，转换为平台 -80°，同段日志出现 +75°。
+这验证真实事件和角度符号，不代表全部方位精度已验收。
 
-SDK `azimuth=-45` 且包含 `confidence=0.8` 时，公开 JSON 的主要字段如下
-（`timestamp_ms` 示例仅说明格式，实际为该事件的本地接收时间）：
+### 安装定位容器
+
+需要机器人已运行厂商音频容器，默认名称 `walker-audio.audio-1`。
+管理脚本使用该**正在运行的容器的精确 image ID**和配置卷，不下载其他厂商版本。
+SDK 模型或授权材料不会被写入驱动镜像或 PR。
+
+先拉取 PR 最终驱动镜像，将下面的 `FINAL_DRIVER_IMAGE` 替换为对应最终版本。
+从镜像取出管理脚本（临时容器只用于读取文件，不会启动）：
+
+```bash
+image=FINAL_DRIVER_IMAGE
+cid=$(docker create --entrypoint /bin/true "$image")
+docker cp "$cid:/deploy/native_doa_manage.py" /tmp/u1-native-doa-manage.py
+docker rm "$cid"
+sudo python3 /tmp/u1-native-doa-manage.py start --driver-image "$image"
+```
+
+然后使用该镜像正常部署 U1 驱动。定位容器名为 `embodied-u1pro-native-doa`，
+独立重启策略为 `unless-stopped`。厂商音频镜像或配置卷升级后，重新执行 start。
+其配置按驱动 image ID 保存，更新时不覆盖运行中的配置目录。
+
+```bash
+sudo python3 /tmp/u1-native-doa-manage.py status
+sudo python3 /tmp/u1-native-doa-manage.py stop
+```
+
+stop 只删除带有本脚本所有权标签的私有定位容器，拒绝删除同名的其他容器。
+普通驱动 Try it 的 `--down` 不会删除这个辅助容器；退出测试时需另行执行上述 stop。
+
+### 状态、时间和生命周期
+
+公开 JSON 的主要字段如下（示意值，实际分数由模型提供）：
 
 ```json
 {
   "state": "fresh",
-  "angle_deg": 45.0,
+  "angle_deg": -80.0,
   "angle_convention": "robot_front_0_left_positive_ccw",
-  "confidence": 0.8,
+  "confidence": 2.86,
+  "confidence_semantics": "vendor_raw_score_not_probability",
+  "source_backend": "native",
   "audio_window_start_us": 0,
   "audio_window_end_us": 0,
-  "timestamp_ms": 1793000000000,
   "timestamp_basis": "receipt_time_only",
-  "association_state": "unknown",
-  "association_reason": "SDK DOA has no verified shared audio capture window"
+  "association_state": "unknown"
 }
 ```
 
-无事件或事件明确无效为 `no_event`；最新消息满 2 秒后为 `stale`。
-解析失败立即清除旧方向，发布 `no_event` 并附带 `error`。
-非 fresh 状态的 `angle_deg` 均为 null，不用 0°代表无数据；不保留旧置信度。
-每 500 ms 重发当前状态供迟到查看器/丢包恢复，心跳不更新事件时间或有效期。
-`info` 返回生命周期状态、嵌套 `sound_direction` 观察值及 SDK 实际消息计数。
+- `confidence` 仅在真实事件含有有限非负分数时输出，保留原值，不归一化、不限幅、不当作概率。
+- 初次无数据为 `no_event`；最新有效事件超过 2 秒为 `stale`。
+  无效、无事件和过期时 `angle_deg=null`，不使用 0°冒充缺失数据。
+- 每 500ms 重发状态；重发不刷新事件接收时间。不同事件之间不做角度平滑。
+- `info.source_status` 提供原始音频转发数、设备状态更新数、native 事件数、
+  工作容器订阅者数和 `waiting_for_device/worker_not_discovered/waiting_for_audio/receiving/error`。
+- 当前设备必须被厂商 internal_mics.yml 识别为阵列，由私有流程的 IsInternalMicNode 把关。
+  真机元数据的 is_built_in 实测为 False，不能仅凭该标志拒绝实际阵列。
+  设备切换或音频中断后，清除旧事件并等待输入重新稳定，
+  不把工作容器缓存的旧方向当作新观测。
+- 卡片 start 创建自身的订阅/发布者和 domain 43 上下文；stop 停止音频转发、发布 no_event
+  并释放自身资源；不销毁共用的 domain 2/42 节点。定位容器在无输入时等待。
+  重启卡片不会继承旧事件。定位容器进程的管理使用上面的独立脚本。
 
-**当前没有已核实、与 mic 共享采集时钟的 DOA 音频窗口。** typed 定义中的 Header
-不能证明 Adapter JSON 转发了它，也不能证明它与 mic 时间可关联。
-不把接收时间或未经核实的 JSON 时间字段伪造为采集窗口，因此 `audio_window_*_us` 固定为 0。
-平台现有 ASR 拒绝这样的窗口，在实际输出方向字段的唤醒词路径中保持
-`speaker_direction_state=unknown`，避免把旧方向套到新的语音结果；平台无需修改。
-接线和独立方位显示可验收，但**可靠的语音结果与方向关联尚未实现**，需厂商确认
-Adapter 采集时间、窗口及其与 mic 时钟的对应后另行适配。
-现有 ASR 的关联粒度为带时间的唤醒词，并非逐句说话人跟踪。
+定位是阵列对声音的估计，不提供说话人身份；环境声也可能产生方向，分数低时需谨慎解释。
+完整物理方位精度仍由操作者验收。
 
-### 生命周期和事件生产条件
+尚未验证 DOA 采集窗口与 mic 共用时钟。`timestamp_ms` 仅为事件接收时间，
+`audio_window_*_us` 固定为 0；**现有 ASR 的方向关联仍应为 unknown**。
+不得将周期触发或接收时间伪造成精确采集窗口。本次先验收独立卡片输出。
 
-遵循当前 U1 传感器卡片生命周期：驱动启动时调用 start，网页也支持 `start/stop/info`。
-重复 start 不重复订阅；stop 发布 `no_event`、清除数据并销毁订阅/定时器/发布者。
-重启不继承旧样本，已排队的旧订阅回调不能写入新会话。
+### 网页验收
 
-卡片只订阅 DOA，不调用唤醒、跟随或运动服务，不改变行为开关。
-已有检查材料提示厂商 DOA 生产可能依赖原生唤醒条件；平台 ASR 唤醒词不等于厂商唤醒词。
-当前驱动已有初始化会关闭厂商行为开关，本次保持该行为。
-若一直无事件，只能报告 `no_event`，不能为出数据自动打开开关。本次未部署或执行动作。
+1. 确认私有定位容器和最终驱动镜像均已启动；添加 sound_direction，查看实时流及 info。
+2. 在前、左、右、后分别持续说话数秒：前约 0°、左正右负。核对设备安装偏移和是否相对头部。
+3. info 应有持续增长的音频转发数和真实方向事件数。若为 worker_not_discovered，先检查辅助容器；
+   waiting_for_device 检查设备状态 topic，而不是打开行为开关。
+4. 停止/重启卡片、暂停音频输入时，检查旧方向被清除或过期，恢复后只采用新事件。
+5. 确认原 mic 仍可用于 ASR，三个系统行为开关保持部署前状态，不产生任何自动转头。
 
-复用已有 std_msgs/rclpy 依赖及 domain 20/42 节点，无需新自定义消息或定位算法。
-Dockerfile 已包含新模块。
-
-### 网页真机验收（操作者执行）
-
-1. 部署与 PR 最终提交一致的 Try it 镜像，确认原卡片及新增 sound_direction 可见。
-2. 分别接 mic→ASR 音频输入、sound_direction→ASR 方位输入，确认原语音识别正常。
-3. 观察 info 和实时流：首次无事件为 no_event/null；若计数始终为零，记录厂商事件
-   生产条件与固件版本，不通过本卡自动改开关。
-4. 前、左、右、后方分别发声，核对前方 0、左正右负；记录实际 JSON、安装偏移及
-   是否相对头部。多人交替说话时确认新方向未混入旧方向。
-5. 最新事件 2 秒后应为 stale/null；stop 后 no_event，重新 start 后无旧方向。
-6. 在 ASR 唤醒词路径确认方向保持 unknown，不出现基于接收时间的假关联。
-   本次不能以“识别文本带精确方向”作为已完成验收；采集时间缺口需单独解决。
-
-离线测试覆盖解析、角度、置信度缺失、无事件/过期、生命周期、重启隔离和部分启动清理。
-物理方位精度由操作者验收。
+以后接 ASR 时：mic → ASR 音频输入；sound_direction → ASR 方位输入。
+旧画布可能保存了只有音频输入的 ASR 卡片，需要平台端口迁移修补或重新添加 ASR。
+这与本次独立方位输出是两项不同的验收。

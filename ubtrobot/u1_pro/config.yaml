@@ -8,4 +8,8 @@ ros:
   core_domain_id: 42
   # The Adapter's vendor graph uses localhost; device streams use domain 2.
   robot_interface: "lo"
-  cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><MaxAutoParticipantIndex>200</MaxAutoParticipantIndex></Discovery><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+  cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>auto</ParticipantIndex><Peers><Peer Address='127.0.0.1'/></Peers><MaxAutoParticipantIndex>200</MaxAutoParticipantIndex></Discovery><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+sound_direction:
+  # Independent vendor DOA worker on domain 43. No wakeup/behavior switches.
+  # Install it using deploy/native_doa_manage.py before starting this backend.
+  source: native

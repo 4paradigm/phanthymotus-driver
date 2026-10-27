@@ -11,6 +11,7 @@ import threading
 import time
 
 from common.vendor_runtime import action_schema, tool
+from native_direction import NativeDirectionSource
 
 DOA_TOPIC = "/robo/audio/subscribe/doa_event"
 ANGLE_CONVENTION = "robot_front_0_left_positive_ccw"
@@ -48,7 +49,10 @@ def parse_doa(event):
         raise ValueError("azimuth must be less than 180")
     confidence = event.get("confidence")
     if confidence is not None:
-        confidence = number(confidence, "confidence", 0, 1)
+        # Firmware v0.9.2 logs real scores such as 4.31 despite the message
+        # comment describing [0,1]. Preserve the vendor score, never clamp it
+        # or reject an otherwise valid direction as a malformed probability.
+        confidence = number(confidence, "confidence", 0, math.inf)
     if "valid" in event and not isinstance(event["valid"], bool):
         raise ValueError("valid must be boolean")
     return angle, confidence, event.get("valid", True)
@@ -78,6 +82,11 @@ class SoundDirectionPlugin:
         self._error = ""
         self._events_received = 0
         self._generation = 0
+        config = vars(nodes).get("config", {})
+        self.backend = config.get("sound_direction", {}).get("source", "sdk") if isinstance(config, dict) else "sdk"
+        if self.backend not in ("sdk", "native"):
+            raise ValueError("sound_direction.source must be sdk or native")
+        self._native = None
 
     def get_tool(self):
         return tool(self.PREFIX, "sensor",
@@ -99,6 +108,7 @@ class SoundDirectionPlugin:
                   "timestamp_basis": "receipt_time_only",
                   "association_state": "unknown",
                   "association_reason": "SDK DOA has no verified shared audio capture window",
+                  "source_backend": self.backend,
                   "reference_frame": "vendor DOA front; physical installation alignment requires acceptance",
                   "age_ms": None if age is None else round(age * 1000),
                   "error": self._error}
@@ -106,6 +116,7 @@ class SoundDirectionPlugin:
             result["angle_deg"] = self._latest["angle_deg"]
             if self._latest["confidence"] is not None:
                 result["confidence"] = self._latest["confidence"]
+                result["confidence_semantics"] = "vendor_raw_score_not_probability"
         return result
 
     def _info(self):
@@ -114,9 +125,13 @@ class SoundDirectionPlugin:
                 "sound_direction": observation,
                 "valid": observation["state"] == "fresh",
                 "sdk_events_received": self._events_received,
-                "source_topic": DOA_TOPIC, "source_domain": 20,
+                "source_topic": "/phanthy/u1_doa/event" if self.backend == "native" else DOA_TOPIC,
+                "source_domain": 43 if self.backend == "native" else 20,
+                "source_backend": self.backend,
+                "source_status": self._native.info() if self._native is not None else None,
                 "stale_after_seconds": self.STALE_AFTER,
-                "source_dependency": "DOA production may depend on vendor wakeup; this card never changes behavior switches",
+                "source_dependency": ("Private vendor DOA worker required; no wakeup or motion behavior" if self.backend == "native"
+                                      else "SDK DOA may depend on vendor wakeup; this card never changes behavior switches"),
                 "topic_out": self.get_tool()["topic_out"]}
 
     def _publish(self):
@@ -129,7 +144,7 @@ class SoundDirectionPlugin:
         with self._lock:
             if self.running:
                 return self._info()
-            if any(resource is not None for resource in (self._publisher, self._subscription, self._timer)):
+            if any(resource is not None for resource in (self._publisher, self._subscription, self._timer, self._native)):
                 # Retry incomplete cleanup before allocating a new session.
                 self.stop()
             self._latest = self._received = None
@@ -141,9 +156,13 @@ class SoundDirectionPlugin:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.String, self.topic, 10)
                 # Mark running before subscribing: a ready executor may deliver immediately.
                 self.running = True
-                self._subscription = self.nodes.robot.create_subscription(
-                    self.nodes.String, DOA_TOPIC,
-                    lambda event: self._on_event(event, generation), self.nodes._sensor_qos)
+                if self.backend == "native":
+                    self._native = NativeDirectionSource(self.nodes)
+                    self._native.start()
+                else:
+                    self._subscription = self.nodes.robot.create_subscription(
+                        self.nodes.String, DOA_TOPIC,
+                        lambda event: self._on_event(event, generation), self.nodes._sensor_qos)
                 self._timer = self.nodes.robot.create_timer(self.HEARTBEAT, self._tick)
                 self._publish()
             except Exception:
@@ -162,6 +181,13 @@ class SoundDirectionPlugin:
                 self._publish()
             except Exception as exc:
                 errors.append(exc)
+            if self._native is not None:
+                try:
+                    self._native.stop()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    self._native = None
             for owner, attribute, destroy in (
                 (self.nodes.robot, "_timer", "destroy_timer"),
                 (self.nodes.robot, "_subscription", "destroy_subscription"),
@@ -179,7 +205,7 @@ class SoundDirectionPlugin:
                 raise RuntimeError(f"sound direction cleanup failed: {errors[0]}") from errors[0]
             return self._info()
 
-    def _on_event(self, event, generation=None):
+    def _on_event(self, event, generation=None, received=None, received_ms=None):
         with self._lock:
             if not self.running or (generation is not None and generation != self._generation):
                 return
@@ -190,17 +216,27 @@ class SoundDirectionPlugin:
                 # direction on parse failure. SDK receipt time never becomes an
                 # audio window, even if an undocumented timestamp is present.
                 self._latest = {"angle_deg": platform_angle(angle), "confidence": confidence,
-                                "valid": valid, "received_at_ms": time.time_ns() // 1_000_000}
+                                "valid": valid, "received_at_ms": received_ms if received_ms is not None else time.time_ns() // 1_000_000}
                 self._error = ""
             except (ValueError, TypeError, RecursionError) as exc:
                 self._latest = {"valid": False, "received_at_ms": time.time_ns() // 1_000_000}
                 self._error = str(exc)[:256]
-            self._received = time.monotonic()
+            self._received = time.monotonic() if received is None else received
             self._publish()
 
     def _tick(self):
         with self._lock:
             if self.running:
+                if self._native is not None:
+                    for event, received, received_ms in self._native.drain():
+                        if event is None:
+                            self._latest = self._received = None
+                            self._error = ""
+                        else:
+                            self._on_event(event, received=received, received_ms=received_ms)
+                    if self._native.error:
+                        self._latest = self._received = None
+                        self._error = self._native.error
                 # Repeat terminal states for late subscribers and lost packets.
                 # The original receipt timestamp stays fixed on every heartbeat.
                 self._publish()

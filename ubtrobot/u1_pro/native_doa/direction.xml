@@ -1,0 +1,20 @@
+<root main_tree_to_execute="DirectionOnly" BTCPP_format="4">
+  <BehaviorTree ID="DirectionOnly">
+    <Sequence name="read_only_direction">
+      <RunOnce then_skip="false"><Script code="counter := 0"/></RunOnce>
+      <Script code="counter = counter + 1"/>
+      <Fallback>
+        <Sequence>
+          <ScriptCondition code="counter &gt;= 20"/>
+          <Script code="counter = 0; trigger := true"/>
+        </Sequence>
+        <Script code="trigger := false"/>
+      </Fallback>
+      <IsInternalMicNode name="internal_array" device_profile_in="{device_profile}"/>
+      <DoaNode name="direction"
+        audio_in="{audio_after_aec}" wake_flag_in="{trigger}" device_profile_in="{device_profile}"
+        doa_event_topic_in="/phanthy/u1_doa/event"
+        plugin_config_in="/run/u1-doa/doa-plugin.json"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

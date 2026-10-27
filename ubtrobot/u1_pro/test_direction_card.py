@@ -46,10 +46,18 @@ class SoundDirectionTests(unittest.TestCase):
         for event in ('null', '[]', '{}', 'bad', {"azimuth": True},
                       {"azimuth": float("nan")}, {"azimuth": float("inf")}, {"azimuth": 10**1000},
                       {"azimuth": 180}, {"azimuth": -181},
-                      {"azimuth": 0, "confidence": 2}, {"azimuth": 0, "valid": "false"},
+                      {"azimuth": 0, "confidence": -1}, {"azimuth": 0, "valid": "false"},
                       ' ' * 16385, {"data": {"data": {}}}):
             with self.subTest(event=str(event)[:80]), self.assertRaises((ValueError, TypeError)):
                 direction.parse_doa(event)
+
+    def test_observed_vendor_score_is_preserved_without_probability_clamping(self):
+        self.plugin.start()
+        self.plugin._on_event('{"azimuth":25,"confidence":4.31}')
+        self.assertEqual(self.observation()["state"], "fresh")
+        self.assertEqual(self.observation()["angle_deg"], -25)
+        self.assertEqual(self.observation()["confidence"], 4.31)
+        self.assertEqual(self.observation()["confidence_semantics"], "vendor_raw_score_not_probability")
 
     def test_front_left_right_rear(self):
         for source, expected in ((0, 0), (-45, 45), (90, -90), (-180, 180), (179, -179)):
