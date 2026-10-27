@@ -1,0 +1,3 @@
+# Preserve vendor message bytes and recorded hashes, including original CRLF
+# and comment whitespace. Apply normal whitespace checks to our Python code.
+*.msg -text -whitespace

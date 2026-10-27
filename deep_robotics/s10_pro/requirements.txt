@@ -1,0 +1,2 @@
+# rclpy and drdds are supplied by the supported Jazzy runtime, not pip.
+PyYAML>=6.0,<7

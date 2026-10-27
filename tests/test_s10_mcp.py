@@ -1,0 +1,154 @@
+"""Real MCP card catalog and fail-closed controls without a robot dependency."""
+import importlib.util
+import json
+import sys
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "deep_robotics/s10_pro"))
+from common.vendor_runtime import DriverBundle, make_handler
+from deep_robotics.s10_pro.device import build_plugins
+
+MONITOR_NAMES = {"state", "joints", "imu", "odometry", "lidar", "motion_info",
+                 "device_status", "hard_estop", "errors", "motion_events",
+                 "capabilities", "ros_graph", "device"}
+
+
+class NoRobot:
+    def __init__(self):
+        self.active = {}
+
+    def acquire(self, owner, sources, options):
+        self.active[owner] = sources
+
+    def release(self, owner):
+        self.active.pop(owner, None)
+
+    def snapshot(self, source):
+        return {}
+
+    def status(self):
+        return {"reader_running": False}
+
+
+@pytest.fixture
+def mcp():
+    bridge, published = NoRobot(), []
+    bundle = DriverBundle(build_plugins({}, "contract", bridge, lambda *args: published.append(args)))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: bundle, "s10-test", "s10-test"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def call(method, params=None):
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/mcp",
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.load(response)
+    yield call, bridge, published
+    bundle.stop_all()
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+def test_http_tools_are_idle_monitoring_cards_with_fixed_ports(mcp):
+    call, bridge, published = mcp
+    assert call("initialize")["result"]["serverInfo"]["name"] == "s10-test"
+    tools = call("tools/list")["result"]["tools"]
+    assert {t["name"] for t in tools} == MONITOR_NAMES
+    assert all(t["type"] == ("actuator" if t["name"] == "device" else "sensor") for t in tools)
+    assert not bridge.active and not published
+    for tool in tools:
+        rpc = call("tools/call", {"name": tool["name"], "arguments": {"action": "info"}})
+        content = rpc["result"]["content"]
+        assert len(content) == 1 and content[0]["type"] == "text"
+        info = json.loads(content[0]["text"])
+        assert isinstance(info, dict) and info["state"] == "idle"
+        assert info["topic_out"] == tool["topic_out"]
+        assert not info["connected"]
+
+
+def test_canvas_style_start_config_stop_and_errors(mcp):
+    call, bridge, published = mcp
+    def action(name, action, **options):
+        response = call("tools/call", {"name": name, "arguments": {"action": action, **options}})
+        if "error" in response:
+            return response
+        return json.loads(response["result"]["content"][0]["text"])
+    assert action("imu", "config", refresh_hz=2)["settings"]["refresh_hz"] == 2
+    assert action("imu", "start", instance_id="card-123")["state"] == "running"
+    assert action("joints", "start")["state"] == "running"
+    assert action("imu", "stop")["state"] == "idle"
+    assert set(bridge.active) == {"joints"}
+    assert action("joints", "stop")["state"] == "idle"
+    assert not bridge.active
+    assert "error" in action("motion", "stand")
+    assert "error" in action("imu", "config", refresh_hz=float("inf"))
+
+
+def test_profile_validation_rejects_unconfined_transport(tmp_path):
+    # main has lazy ROS imports, so this check does not create participants.
+    path = ROOT / "deep_robotics/s10_pro/main.py"
+    spec = importlib.util.spec_from_file_location("s10_main_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    profile = tmp_path / "dds.xml"
+    profile.write_text('''<dds><profiles><transport_descriptors><transport_descriptor>
+      <transport_id>local</transport_id><type>UDPv4</type>
+      <interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>
+      </transport_descriptor></transport_descriptors>
+      <participant is_default_profile="true"><rtps><userTransports>
+      <transport_id>local</transport_id></userTransports><useBuiltinTransports>false</useBuiltinTransports>
+      </rtps></participant></profiles></dds>''')
+    module.validate_platform_profile(profile)
+    profile.write_text(profile.read_text().replace("127.0.0.1", "0.0.0.0"))
+    with pytest.raises(ValueError):
+        module.validate_platform_profile(profile)
+
+
+def test_runtime_has_fourteen_tools_and_configuration_cannot_unlock_execution():
+    path = ROOT / 'deep_robotics/s10_pro/main.py'
+    spec = importlib.util.spec_from_file_location('s10_motion_runtime_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    bridge, published = NoRobot(), []
+    plugins = module.build_runtime_plugins({}, 'contract', bridge, lambda *args: published.append(args))
+    bundle = DriverBundle(plugins)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(lambda: bundle, 's10-runtime-test', 's10-runtime-test'))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    def rpc(method, params=None):
+        request = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/mcp',
+            json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params or {}}).encode(),
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.load(response)
+    def action(name, action, **args):
+        value = rpc('tools/call', {'name': name, 'arguments': {'action': action, **args}})
+        return json.loads(value['result']['content'][0]['text'])
+    try:
+        tools = rpc('tools/list')['result']['tools']
+        assert {t['name'] for t in tools} == MONITOR_NAMES | {'motion'}
+        assert sum(t['type'] == 'sensor' for t in tools) == 12
+        assert next(t for t in tools if t['name'] == 'motion')['type'] == 'actuator'
+        action('motion', 'config', enabled=True)
+        assert not action('motion', 'start')['execution_available']
+        for name in ['stand', 'lie', 'velocity']:
+            result = action('motion', name)
+            assert result['state'] == 'unavailable' and not result['completed']
+        assert action('imu', 'start')['state'] == 'running'
+        action('motion', 'stop')
+        assert 'imu' in bridge.active
+        assert not action('motion', 'info')['execution_authorized']
+    finally:
+        bundle.stop_all()
+        plugins[-1].close()
+        server.shutdown(); server.server_close(); thread.join(2)

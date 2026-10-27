@@ -1,0 +1,8 @@
+# Merge with the rendered service.yml after init_prepare_policy.py --apply.
+# This overlay enables the two supervised card definitions, not a live session.
+deep-robotics-s10-pro:
+  volumes:
+    - /opt/phanthy-motus/s10-pro/prepare-machine-id:/run/s10/prepare-machine-id:ro
+    - /opt/phanthy-motus/s10-pro/prepare-policy.json:/run/s10/operator-authorization.json:ro
+  environment:
+    - S10_OPERATOR_AUTHORIZATION_FILE=/run/s10/operator-authorization.json
