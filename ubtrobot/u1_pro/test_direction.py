@@ -48,6 +48,9 @@ class DirectionTests(unittest.TestCase):
         nodes = self.nodes()
         audio = device.AudioPlugin(nodes)
         plugin = direction.HeadOrientationPlugin(nodes, audio)
+        # This fixture exercises the explicitly opted-in experimental path.
+        # Production defaults are covered separately below.
+        plugin.experimental_turn_enabled = True
         plugin.running = True
         plugin._client = mock.Mock()
         plugin._request_type = lambda: types.SimpleNamespace(
@@ -405,6 +408,19 @@ class DirectionTests(unittest.TestCase):
         result = plugin.turn(dict(degree=5, max_vel=.1, max_acc=.1, confirm=True))
         self.assertEqual(result["blocking"]["kind"], "audio")
         self.assertEqual(result["blocking"]["task"]["action_id"], "prior")
+
+    def test_unaccepted_turn_is_disabled_by_default_and_cannot_bypass_schema(self):
+        nodes = self.nodes()
+        plugin = direction.HeadOrientationPlugin(nodes, device.AudioPlugin(nodes))
+        plugin._client = mock.Mock()
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertNotIn("turn", schema["properties"]["action"]["enum"])
+        self.assertNotIn("x-completion", schema)
+        self.assertEqual(schema["x-resource"], "u1_action")
+        result = plugin.dispatch("turn", {"degree": 5, "max_vel": .1, "max_acc": .1, "confirm": True})
+        self.assertEqual(result["code"], "experimental_disabled")
+        plugin._client.call_async.assert_not_called()
+        self.assertFalse(plugin._state()["experimental_turn_enabled"])
 
     def test_schemas_and_runtime_dependencies(self):
         plugin, _, _ = self.head()

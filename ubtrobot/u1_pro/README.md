@@ -34,6 +34,11 @@ python3 scripts/check_service_yml.py ubtrobot/u1_pro
 
 ## head_orientation：水平朝向（首版待真机标定）
 
+**现场物理验收未通过，默认只提供诊断。** `config.yaml` 中
+`head_orientation_experimental_turn: false` 会同时隐藏网页 turn 动作并拒绝直接 API 调用。
+只有部署者为受控实验显式配置为 true 时，才开放下文的 turn 参数和完成协议；
+启用实验开关并不能修复或证明物理控制路径。原有 head/expression/tts 卡片保留。
+
 与 `head` 播放 A010–A014 预设不同，此卡只使用 domain `2` 的
 `/mc/uworld_sound_source`（`uworld_motion_msgs/srv/SoundSource`），
 `with_waist=false`，不接入额外控制后端、不控制五个颈部舵机。
@@ -205,3 +210,6 @@ sound_direction 增加网页可见动作：
 这些改进解决进度可见性和无数据原因的展示，不是物理控制或声源定位已验收的声明。
 下一步需要确认本机固件中 SoundSource 到实际颈部驱动的有效路由，以及实际原生唤醒词/
 独立 DOA 触发接口。此前不把两张卡用于自动听声转头编排。
+
+平台资源：head_orientation 使用与现有动作卡片相同的 `u1_action`（优先从 tts 的工具定义获取），
+同时保留驱动内部互斥；禁用实验转向时不声明 turn 的异步完成动作。

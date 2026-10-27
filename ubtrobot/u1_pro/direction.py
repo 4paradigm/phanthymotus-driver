@@ -247,6 +247,7 @@ class HeadOrientationPlugin:
         self.topic = f"/{nodes.namespace}/u1_pro/head_orientation"
         self._stationary_since = None
         config = vars(nodes).get("config")
+        self.experimental_turn_enabled = isinstance(config, dict) and config.get("head_orientation_experimental_turn") is True
         self._state_path = Path(config.get("head_orientation_state_file", "/opt/phanthy-motus/data/u1-head-orientation.json")) if isinstance(config, dict) else None
         if self._state_path and self._state_path.exists():
             try:
@@ -278,8 +279,13 @@ class HeadOrientationPlugin:
             "max_acc": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.4, "description": "MotionSetup vendor units, unverified. Explicit value required."},
             "timeout": {"type": "number", "minimum": 1, "maximum": 60, "default": 15},
         })
-        schema["x-is-dangerous"] = True
-        schema["x-completion"] = {"actions": ["turn"], "timeout": 75}
+        schema["x-is-dangerous"] = self.experimental_turn_enabled
+        schema["x-resource"] = self.audio.get_tool()["inputSchema"].get("x-resource", "u1_action")
+        if self.experimental_turn_enabled:
+            schema["x-completion"] = {"actions": ["turn"], "timeout": 75}
+        else:
+            schema["properties"]["action"]["enum"].remove("turn")
+            schema["x-action-params"].pop("turn")
         return tool(self.PREFIX, "actuator", "头部水平转向实验接口：厂商回执不代表物理执行；用实时数据流查看进度。回中、停止及物理朝向仍未验收。", schema,
                     topic_out=[{"topic": self.topic, "format": "data/json"}])
 
@@ -313,6 +319,8 @@ class HeadOrientationPlugin:
         }
         return {"state": self._task["state"] if self._task else "ready" if self.running else "idle",
                 "lifecycle_state": "ready" if self.running else "idle",
+                "experimental_turn_enabled": self.experimental_turn_enabled,
+                "physical_acceptance": "not_passed",
                 "status_message": messages.get(phase, self._error),
                 "vendor_reported_success": bool(self._task and self._task.get("accepted") and self._task.get("vendor_status") == 0),
                 "feedback_source": NECK_TOPIC,
@@ -334,6 +342,9 @@ class HeadOrientationPlugin:
         self._last_status_publish = time.monotonic()
 
     def turn(self, args):
+        if not self.experimental_turn_enabled:
+            return {"state": "error", "code": "experimental_disabled",
+                    "message": "本机物理转向尚未验收通过，默认不发送转向请求；原有 head 预设卡不受影响"}
         degree = number(args.get("degree"), "degree", -20, 20)
         velocity = number(args.get("max_vel"), "max_vel", 0, .4)
         acceleration = number(args.get("max_acc"), "max_acc", 0, .4)
