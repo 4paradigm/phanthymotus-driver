@@ -18,6 +18,8 @@ class LowStateSource:
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._subscriber = None
+        self._thread = None
+        self._closed = threading.Event()
         self._active = False
         self._latest = None
         self._source_tick = self._source_time_ns = None
@@ -27,6 +29,7 @@ class LowStateSource:
             if self._subscriber is not None:
                 return
             from cyclonedds.qos import Qos, Policy
+            from cyclonedds.internal import InvalidSample
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
             sub = ChannelSubscriber('rt/lowstate', LowState_)
@@ -35,7 +38,11 @@ class LowStateSource:
                 self._latest = None
                 self._source_tick = self._source_time_ns = None
             try:
-                sub.Init(self._on_state, 0, qos=Qos(Policy.History.KeepLast(1)))
+                sub.Init(qos=Qos(Policy.History.KeepLast(1)))
+                self._closed.clear()
+                thread = threading.Thread(target=self._read, args=(sub, InvalidSample),
+                                          name='g1-lowstate', daemon=True)
+                thread.start()
             except Exception:
                 with self._lock:
                     self._active = False
@@ -44,6 +51,22 @@ class LowStateSource:
                 except Exception: logging.getLogger(__name__).exception('Failed to close partial LowState reader')
                 raise
             self._subscriber = sub
+            self._thread = thread
+
+    def _read(self, sub, invalid_sample):
+        # Decode LowState outside the shared DDS callback thread used by RPC replies.
+        try:
+            while not self._closed.is_set():
+                msg = sub.Read(timeout=.1)
+                if msg is None:
+                    self._closed.wait(.001)
+                elif not isinstance(msg, invalid_sample):
+                    self._on_state(msg)
+        except Exception:
+            logging.getLogger(__name__).exception('LowState reader failed')
+            with self._lock:
+                self._active = False
+                self._latest = None
 
     def _on_state(self, msg):
         received_ns = self.clock()
@@ -76,5 +99,9 @@ class LowStateSource:
                 self._latest = None
                 self._source_tick = self._source_time_ns = None
             sub, self._subscriber = self._subscriber, None
+            self._closed.set()
+            if self._thread is not None:
+                self._thread.join()
+                self._thread = None
             if sub is not None:
                 sub.Close()

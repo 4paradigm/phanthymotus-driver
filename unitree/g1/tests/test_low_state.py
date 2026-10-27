@@ -1,6 +1,9 @@
 """Shared source ownership, clock continuity and live safety checks; no hardware."""
 from pathlib import Path
+from queue import Queue, Empty
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -23,20 +26,57 @@ def channels(monkeypatch):
         close_fail = None
         def __init__(self, topic, dtype):
             self.topic, self.handler, self.closed = topic, None, 0
+            self.messages = Queue()
+            self.read_threads = []
             opened.append(self)
         def Init(self, handler=None, queueLen=0, *, qos=None):
             self.handler = handler
             if self.fail is True or self.fail == self.topic: raise RuntimeError('reader_init_failed')
+        def Read(self, timeout=None):
+            self.read_threads.append(threading.current_thread())
+            try: item = self.messages.get(timeout=timeout)
+            except Empty: return None
+            if isinstance(item, Exception): raise item
+            return item
         def Close(self):
             self.closed += 1
-            if self.topic == 'rt/lowstate': self.handler(message(9999))
+            assert all(not thread.is_alive() for thread in self.read_threads)
+            if self.topic == 'rt/lowstate' and self.handler: self.handler(message(9999))
             if self.close_fail == self.topic: raise RuntimeError('reader_close_failed')
     monkeypatch.setitem(sys.modules, 'unitree_sdk2py.core.channel', SimpleNamespace(ChannelSubscriber=Subscriber))
     monkeypatch.setitem(sys.modules, 'unitree_sdk2py.idl.unitree_hg.msg.dds_', SimpleNamespace(LowState_=object, LowCmd_=object))
     monkeypatch.setitem(sys.modules, 'cyclonedds.qos', SimpleNamespace(
         Qos=lambda *args: args, Policy=SimpleNamespace(History=SimpleNamespace(KeepLast=lambda n:n))))
+    monkeypatch.setitem(sys.modules, 'cyclonedds.internal', SimpleNamespace(InvalidSample=type('InvalidSample', (), {})))
     monkeypatch.setitem(sys.modules, 'sport_mode_state', SimpleNamespace(SportModeState_=object))
     return opened, Subscriber
+
+
+def test_dedicated_reader_delivers_and_failure_invalidates_cache(channels):
+    opened, _ = channels
+    source = LowStateSource(); source.start()
+    try:
+        assert opened[0].handler is None
+        opened[0].messages.put(message(100))
+        deadline = time.monotonic()+1
+        while source.snapshot() is None and time.monotonic() < deadline: time.sleep(.001)
+        assert source.snapshot().source_tick == 100
+        assert opened[0].read_threads[0] is source._thread
+        opened[0].messages.put(RuntimeError('read_failed'))
+        source._thread.join(timeout=1)
+        assert not source._thread.is_alive() and source.snapshot() is None
+    finally:
+        source.stop()
+
+
+def test_thread_start_failure_closes_reader(channels, monkeypatch):
+    opened, _ = channels
+    def fail(_): raise RuntimeError('thread_start_failed')
+    monkeypatch.setattr(threading.Thread, 'start', fail)
+    source = LowStateSource()
+    with pytest.raises(RuntimeError, match='thread_start_failed'): source.start()
+    assert source.snapshot() is None and source._subscriber is None
+    assert opened[0].closed == 1
 
 
 def test_shared_clock_does_not_renew_on_reads_late_delivery_or_duplicate(channels):

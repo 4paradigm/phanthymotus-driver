@@ -29,9 +29,12 @@ def initialize():
 def writer():
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
     from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_
+    from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
     sdk = initialize()
     publisher = sdk.ChannelPublisher('rt/lowstate', LowState_)
     publisher.Init()
+    callbacks = sdk.ChannelPublisher('test/sdk_callback', String_)
+    callbacks.Init()
     time.sleep(1)
     start = time.monotonic()
     msg = unitree_hg_msg_dds__LowState_()
@@ -39,34 +42,39 @@ def writer():
     while time.monotonic()-start < 3:
         msg.tick = (time.monotonic_ns()//1_000_000) & 0xffffffff
         assert publisher.Write(msg)
+        assert callbacks.Write(String_(str(msg.tick)))
         count += 1
         time.sleep(max(0., start+count*.001-time.monotonic()))
     print(json.dumps({'count':count, 'last_tick':msg.tick}), flush=True)
     time.sleep(.5)
     publisher.Close()
+    callbacks.Close()
 
 
 def reader():
     from cyclonedds.qos import Qos, Policy
     from cyclonedds.sub import DataReader
-    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+    from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
     from arm_stream import ArmStreamExecutor
+    from low_state import LowStateSource
     sdk = initialize()
     original_take = DataReader.take
     def slow_take(self, *args, **kwargs):
-        # Model expensive decoding in a second sensor subscription, before its BQueue.
+        # Only G1 LowState decoding is moved off the shared DDS receive thread.
         if getattr(self, 'slow_decode', False): time.sleep(.004)
         return original_take(self, *args, **kwargs)
     DataReader.take = slow_take
-    arm = ArmStreamExecutor({}, 'test', None)
+    source = LowStateSource()
+    source.start()
+    source_reader = source._subscriber._ChannelSubscriber__channel._Channel__reader._Reader__reader
+    source_reader.slow_decode = True
+    arm = ArmStreamExecutor({}, 'test', None, low_state=source)
     arm.start()
-    slow_samples = []
-    other = sdk.ChannelSubscriber('rt/lowstate', LowState_)
-    other.Init(lambda msg: slow_samples.append(msg.tick), 10, qos=Qos(Policy.History.KeepLast(1)))
-    other_reader = other._ChannelSubscriber__channel._Channel__reader._Reader__reader
-    other_reader.slow_decode = True
-    readers = [s._ChannelSubscriber__channel._Channel__reader
-               for s in (arm._subscriber, arm._fsm_subscriber, arm._arm_observer, other)]
+    callback_ages = []
+    other = sdk.ChannelSubscriber('test/sdk_callback', String_)
+    other.Init(lambda msg: callback_ages.append((time.monotonic_ns()//1_000_000-int(msg.data)) & 0xffffffff),
+               10, qos=Qos(Policy.History.KeepLast(1)))
+    sdk_reader = other._ChannelSubscriber__channel._Channel__reader
     producer = subprocess.Popen([sys.executable, __file__, 'writer'], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
     samples = []
@@ -84,18 +92,20 @@ def reader():
         stdout, stderr = producer.communicate(timeout=2)
         assert producer.returncode == 0, stderr
         assert json.loads(stdout)['count'] > 2000
-        assert slow_samples and len(samples) > 100
+        assert len(callback_ages) > 2000 and len(samples) > 100
+        assert max(callback_ages) < 100, callback_ages
+        assert other.MatchedPublisherCount() == 0  # Publisher has closed.
         assert max(age for age, _ in samples) < 100, samples
         assert max(age for _, age in samples) < 100, samples
-        assert all(b >= a for a,b in zip(slow_samples,slow_samples[1:]))
     finally:
         if producer.poll() is None: producer.kill(); producer.wait()
         arm.stop()
+        worker = source._thread
+        source.stop(); source.stop()
+        assert not worker.is_alive() and source.snapshot() is None
         other.Close()
         other.Close()  # Repeated teardown must not leave a polling/queue thread alive.
-        for r in readers:
-            assert not r._Reader__readThread.is_alive()
-        assert not readers[-1]._Reader__threadReader.is_alive()
+        assert not sdk_reader._Reader__threadReader.is_alive()
         DataReader.take = original_take
 
 
