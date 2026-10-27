@@ -577,6 +577,7 @@ source is `*/*/driver.yaml`, and this is a snapshot of it:
 | Noetix Bumi | 15704 | | RealMan RM75-6F-V | 15718 |
 | Booster K1 | 15705 | | PNDbotics Adam | 15722 |
 | BrainCo Revo2 | 15706 | | Chasing Qianjiao P200 Pro | 15739 |
+| LinkerHand L20 Lite | 15733 | | | |
 | X-humanoid Tianyi 2.0 | 15707 | | RoboEra Q5 | 15793 |
 | EngineAI T800 | 15708 | | | |
 | Unitree AS2W | 15709 | | **Simulator (generic)** | **15711** |
