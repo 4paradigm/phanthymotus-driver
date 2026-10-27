@@ -573,7 +573,13 @@ class PayloadMassPlugin:
                 self._live(job)
                 raise MassError("CANCELLED", "实时测量已停止。")
             sample_profile = self._pose(job)
-            frames = self._sampler.collect(duration, sample_profile, job["cancel"])
+            if job["action"] == "prepare" and self._setup_mode == "quick":
+                capture_profile = {**sample_profile,
+                                   "settle_timeout_s": job["loaded"][2]["timeout_s"]}
+                frames = self._sampler.collect(duration, capture_profile, job["cancel"],
+                                               learn_pose_from=job["loaded"][2]["home_q"])
+            else:
+                frames = self._sampler.collect(duration, sample_profile, job["cancel"])
             if job["action"] == "prepare" and self._setup_mode == "quick":
                 from payload_mass_quick import capture_bend_profile
                 p = capture_bend_profile(sample_profile, frames)

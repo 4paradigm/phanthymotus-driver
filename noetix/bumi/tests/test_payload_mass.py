@@ -265,7 +265,7 @@ class Sampler:
             frames.append({**copy.deepcopy(self.frame), "serial": self.serial, "host_monotonic_s": self.stamp})
         return frames
 
-    def collect(self, duration, p, cancel):
+    def collect(self, duration, p, cancel, *, learn_pose_from=None):
         if self.hook:
             self.hook(cancel)
         if cancel.is_set():

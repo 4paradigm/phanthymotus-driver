@@ -38,6 +38,61 @@ def set_mass(sampler, kg):
     sampler.frame["tau"] = raw_frame(kg)["tau"]
 
 
+@pytest.mark.parametrize("arm, elbow", [("left", 3), ("right", 13)])
+def test_gradual_bend_with_zero_reported_velocity_learns_final_stable_pose(tmp_path, arm, elbow):
+    sampler = SharedSampler()
+    current = raw_frame()
+    current["q"] = [0.] * 21
+    current["workmode"] = 2
+    stopped = threading.Event()
+    bend_at = [None]
+    class GradualLoco(Loco):
+        def _do_teaching_action(self, action, args):
+            self.commands.append((action, args))
+            current["workmode"] = 23
+            bend_at[0] = time.monotonic()
+            return {"command_sent": True, "confirmed_started": True, "workmode": 23}
+    loco = GradualLoco(SimpleNamespace(frame=current))
+    def feed():
+        seq = 0
+        while not stopped.is_set():
+            seq += 1
+            frame = copy.deepcopy(current)
+            if bend_at[0] is not None and current["workmode"] == 23:
+                elapsed = time.monotonic() - bend_at[0]
+                frame["q"][elbow] = -.3 if elapsed < .2 else -.7 if elapsed < .4 else -1.2
+            # Deliberately zero dq: stationarity must also use actual q movement.
+            frame.update(source_seq=seq, dq=[0.] * 21)
+            sampler.push(frame)
+            stopped.wait(.015)
+    thread = threading.Thread(target=feed)
+    thread.start()
+    card = PayloadMassPlugin({"setup_mode": "quick", "recording_id": 12, "arm": arm,
+                              "data_dir": str(tmp_path)}, "gradual_bend", sampler=sampler,
+                             loco_plugin=loco, notify=lambda *a: None)
+    try:
+        deadline = time.monotonic() + 1
+        while sampler.diagnostics()["received_count"] < 2 and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert card.dispatch("prepare", {})["state"] == "running"
+        card._job["thread"].join(6)
+        assert not card._job["thread"].is_alive()
+        assert card.info()["state"] == "ready"
+        assert card._session["p"]["pose_q"][elbow] == -1.2
+        assert card._session["baseline"]["summary"]["pose_q"][elbow] == -1.2
+        assert len([c for c in loco.commands if c[0] == "play_recording"]) == 1
+        assert card.dispatch("weigh", {})["state"] == "measuring"
+        # Once prepared, the learned target remains fixed during measurement.
+        current["q"][elbow] = -.3
+        bend_at[0] = None
+        result = wait_for(card, lambda r: r.get("error_code") == "POSE_MISMATCH")
+        assert result["mass_kg"] is None and f"motor_id={elbow}" in result["message"]
+    finally:
+        card.stop()
+        stopped.set()
+        thread.join(1)
+
+
 def test_quick_setup_single_reference_dynamic_unknown_and_home(quick):
     card, sampler, loco = quick
     assert run(card, "prepare")["state"] == "ready"
@@ -176,7 +231,8 @@ def test_quick_prepare_with_real_getter_rejects_before_motor_command(tmp_path):
         card.stop()
 
 
-def test_quick_actual_collect_rejects_repeated_getter_receipts():
+@pytest.mark.parametrize("learning", [False, True])
+def test_quick_actual_collect_rejects_repeated_getter_receipts(learning):
     sampler = SharedSampler()
     values = getter_values(raw_frame())
     sampler.accept_getter(*values)
@@ -190,7 +246,8 @@ def test_quick_actual_collect_rejects_repeated_getter_receipts():
     thread.start()
     try:
         with pytest.raises(MassError) as err:
-            sampler.collect(.03, p, threading.Event())
+            sampler.collect(.03, p, threading.Event(),
+                            learn_pose_from=[0.] * 21 if learning else None)
         assert err.value.code == "FRESHNESS_UNVERIFIED"
     finally:
         done.set()

@@ -142,7 +142,13 @@ class SharedSampler:
                 raise MassError("DATA_GAP", "observation buffer overrun")
             return frames
 
-    def collect(self, duration, profile, cancel):
+    def collect(self, duration, profile, cancel, *, learn_pose_from=None):
+        # Only quick empty preparation may learn its final pose. Weighing and
+        # returning home always keep their previously captured target fixed.
+        if learn_pose_from is not None:
+            if profile.get("setup_mode") != "quick":
+                raise MassError("BAD_PARAMETER", "pose learning is only for quick empty preparation")
+            learn_pose_from = vector(learn_pose_from, 21, "home_q")
         with self._condition:
             cursor, epoch = self._serial, self._errors
         deadline = time.monotonic() + duration + profile["settle_timeout_s"]
@@ -161,7 +167,22 @@ class SharedSampler:
                     stable = []
                 cursor = frame["serial"]
                 try:
-                    check_frame(frame, profile)
+                    observed_profile = ({**profile, "pose_q": frame["q"]}
+                                        if learn_pose_from is not None else profile)
+                    check_frame(frame, observed_profile)
+                    if learn_pose_from is not None:
+                        elbow = profile["motor_ids"][-1]
+                        if abs(frame["q"][elbow] - learn_pose_from[elbow]) < .2:
+                            raise MassError("UNSTABLE", "等待实际曲肘并停稳。")
+                        # Check measured angle movement even when motor dq is
+                        # reported as zero. Never anchor to the first bent frame.
+                        if stable and any(
+                                max([frame["q"][j]] + [f["q"][j] for f in stable])
+                                - min([frame["q"][j]] + [f["q"][j] for f in stable])
+                                > (min(.03, profile["pose_tolerance_rad"])
+                                   if j in profile["motor_ids"] else profile["pose_tolerance_rad"])
+                                for j in range(21)):
+                            stable = []
                     if stable and frame["host_monotonic_s"]-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
                         stable = []
                     stable.append(frame)
@@ -209,8 +230,12 @@ def check_frame(frame, p):
         raise MassError("MOTOR_FAULT", "nonzero motor error (including undocumented codes)")
     if max(frame["temperature"]) >= p["max_temperature_c"]:
         raise MassError("OVER_TEMPERATURE", "temperature exceeds engineer-confirmed limit")
-    if max(abs(a-b) for a,b in zip(frame["q"],p["pose_q"])) > p["pose_tolerance_rad"]:
-        raise MassError("POSE_MISMATCH", "arm/waist/body joint pose differs from profile")
+    differences = [abs(a-b) for a,b in zip(frame["q"],p["pose_q"])]
+    if max(differences) > p["pose_tolerance_rad"]:
+        j = differences.index(max(differences))
+        raise MassError("POSE_MISMATCH", "arm/waist/body joint pose differs from profile: "
+                        f"motor_id={j}, actual={frame['q'][j]:.4f}, target={p['pose_q'][j]:.4f}, "
+                        f"delta={differences[j]:.4f} rad, limit={p['pose_tolerance_rad']:.4f} rad")
     if quaternion_angle(frame["quaternion_xyzw"], p["quaternion_xyzw"]) > p["body_tolerance_rad"]:
         raise MassError("BODY_MISMATCH", "body orientation differs from profile")
     if max(abs(v) for v in frame["dq"]) > p["max_velocity_rad_s"] or max(abs(v) for v in frame["gyro"]) > p["max_gyro_rad_s"]:
