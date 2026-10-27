@@ -73,6 +73,10 @@ class SoundDirectionPlugin:
         self.topic = f"/{nodes.namespace}/u1_pro/sound_direction"
         self._expired_published = False
         self._last_publish = 0.0
+        self._events_received = 0
+        self._wakeup_enabled = None
+        self._source_checked_at = None
+        self._source_check_error = ""
 
     def get_tool(self):
         schema = action_schema({
@@ -98,6 +102,7 @@ class SoundDirectionPlugin:
                 return self._state()
             self.stale_after, self.alpha = stale, alpha
             self._latest = self._received = None
+            self._events_received = 0
             self._error = ""
             try:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.String, self.topic, 10)
@@ -134,6 +139,12 @@ class SoundDirectionPlugin:
         data_state = "stopped" if not self.running else "invalid" if self._error else "no_data" if age is None else "stale" if age > self.stale_after else "valid" if valid else "invalid"
         return {"state": "running" if self.running else "idle", "valid": valid,
                 "data_state": data_state, "settings": {"stale_after": self.stale_after, "alpha": self.alpha},
+                "sdk_events_received": self._events_received,
+                "source_topic": DOA_TOPIC, "source_domain": 20,
+                "source_dependency": "当前厂商配置的 DOA 依赖原生音频唤醒标志；平台唤醒词不等于原生唤醒词。不会自动开启厂商行为。",
+                "vendor_wakeup_enabled": self._wakeup_enabled,
+                "source_checked_at": self._source_checked_at,
+                "source_check_error": self._source_check_error,
                 "direction_degrees": latest.get("smoothed") if valid else None,
                 "raw_degrees": latest.get("raw"), "last_direction_degrees": latest.get("smoothed"),
                 "confidence": latest.get("confidence"), "received_at": latest.get("received_at"),
@@ -151,6 +162,7 @@ class SoundDirectionPlugin:
         with self._lock:
             if not self.running:
                 return
+            self._events_received += 1
             try:
                 angle, confidence, valid = parse_doa(event)
                 previous = self._latest
@@ -191,7 +203,23 @@ class SoundDirectionPlugin:
                 if self.running:
                     self._publish()
                 return self._state()
-        if action in ("info", "status"):
+        if action == "status":
+            # Explicit diagnostic only: never put a blocking SDK RPC in the
+            # state heartbeat or a ROS callback.
+            try:
+                from device import U1Nodes
+                enabled = U1Nodes._system_enabled_value(self.nodes.get_system_enabled("wakeup_enabled_state"))
+                error = "" if enabled is not None else "无法确认厂商唤醒开关"
+            except Exception as exc:
+                enabled, error = None, str(exc)[:256]
+            with self._lock:
+                self._wakeup_enabled = enabled
+                self._source_check_error = error
+                self._source_checked_at = time.time()
+                if self.running:
+                    self._publish()
+                return self._state()
+        if action == "info":
             with self._lock:
                 return self._state()
         return None
@@ -214,6 +242,9 @@ class HeadOrientationPlugin:
         self._last_desired = None
         self._error = ""
         self._generation = 0
+        self._publisher = None
+        self._last_status_publish = 0.0
+        self.topic = f"/{nodes.namespace}/u1_pro/head_orientation"
         self._stationary_since = None
         config = vars(nodes).get("config")
         self._state_path = Path(config.get("head_orientation_state_file", "/opt/phanthy-motus/data/u1-head-orientation.json")) if isinstance(config, dict) else None
@@ -249,7 +280,8 @@ class HeadOrientationPlugin:
         })
         schema["x-is-dangerous"] = True
         schema["x-completion"] = {"actions": ["turn"], "timeout": 75}
-        return tool(self.PREFIX, "actuator", "头部水平转向：单一厂商 SoundSource 路径；回中、物理停止与角度语义待真机验收。", schema)
+        return tool(self.PREFIX, "actuator", "头部水平转向实验接口：厂商回执不代表物理执行；用实时数据流查看进度。回中、停止及物理朝向仍未验收。", schema,
+                    topic_out=[{"topic": self.topic, "format": "data/json"}])
 
     def start(self):
         with self._lock:
@@ -261,6 +293,7 @@ class HeadOrientationPlugin:
                 try:
                     self._request_type = SoundSource.Request
                     self._client = HeadServiceTransport()
+                    self._publisher = self.nodes.core.create_publisher(self.nodes.String, self.topic, 10)
                     self._subscription = self.nodes.audio_device.create_subscription(
                         JointTrajectoryControllerState, NECK_TOPIC, self._on_feedback, self.nodes._sensor_qos)
                     self._timer = self.nodes.audio_device.create_timer(.1, self._tick)
@@ -271,7 +304,18 @@ class HeadOrientationPlugin:
             return self._state()
 
     def _state(self):
+        phase = self._task["state"] if self._task else "ready" if self.running else "idle"
+        messages = {
+            "checking": "正在检查前置条件，尚未发送运动请求",
+            "request_pending": "已发送厂商请求，等待回复",
+            "accepted_unverified": "厂商返回成功，尚未验证物理头部执行",
+            "settled_unverified": "控制器已稳定；不代表物理头部已到达指定朝向",
+        }
         return {"state": self._task["state"] if self._task else "ready" if self.running else "idle",
+                "lifecycle_state": "ready" if self.running else "idle",
+                "status_message": messages.get(phase, self._error),
+                "vendor_reported_success": bool(self._task and self._task.get("accepted") and self._task.get("vendor_status") == 0),
+                "feedback_source": NECK_TOPIC,
                 "action_id": self._task.get("action_id") if self._task else None,
                 "enabled": self.running, "task": dict(self._task) if self._task else None,
                 "feedback": dict(self._feedback) if self._feedback else None,
@@ -280,7 +324,14 @@ class HeadOrientationPlugin:
                 "center_supported": False, "physical_stop_supported": False,
                 "angle_semantics": "vendor degree; sign, reference and absolute/relative unverified",
                 "transport": "isolated FastDDS loopback domain 2; CycloneDDS feedback",
-                "blocking": self._blocking(), "recovery_requires_operator_acknowledgement": getattr(self.audio, "_orientation_owner", None) is self}
+                "blocking": self._blocking(), "recovery_requires_operator_acknowledgement": getattr(self.audio, "_orientation_owner", None) is self,
+                "topic_out": [{"topic": self.topic, "format": "data/json"}]}
+
+    def _publish_status(self):
+        message = self.nodes.String()
+        message.data = json.dumps(self._state(), allow_nan=False)
+        self._publisher.publish(message)
+        self._last_status_publish = time.monotonic()
 
     def turn(self, args):
         degree = number(args.get("degree"), "degree", -20, 20)
@@ -484,6 +535,8 @@ class HeadOrientationPlugin:
                 self._error = "厂商服务未确认任务结果，保留占用；请查看任务和 blocking，不要重复转向"
                 self._log_state()
                 self._finish("error")
+            if self._publisher is not None and time.monotonic() - self._last_status_publish >= 1:
+                self._publish_status()
 
     def stop(self):
         with self._lock:
@@ -513,6 +566,9 @@ class HeadOrientationPlugin:
             if self._client is not None:
                 self._client.close()
                 self._client = None
+            if self._publisher is not None:
+                self.nodes.core.destroy_publisher(self._publisher)
+                self._publisher = None
 
     def acknowledge(self, args):
         if args.get("confirm") is not True:

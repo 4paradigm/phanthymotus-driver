@@ -287,6 +287,38 @@ class DirectionTests(unittest.TestCase):
         transport.return_value.close.assert_called_once()
         nodes.audio_device.destroy_subscription.assert_called_once()
         nodes.audio_device.destroy_timer.assert_called_once()
+        nodes.core.destroy_publisher.assert_called_once()
+
+    def test_head_status_stream_updates_after_initial_checking_snapshot(self):
+        plugin, _, nodes = self.head()
+        plugin._publisher = mock.Mock()
+        future = concurrent.futures.Future()
+        plugin._client.call_async.return_value = future
+        self.submit(plugin)
+        plugin._tick()
+        pending = json.loads(plugin._publisher.publish.call_args.args[0].data)
+        self.assertEqual(pending["state"], "request_pending")
+        future.set_result(types.SimpleNamespace(success=True, status=0, message=""))
+        plugin._last_status_publish = 0
+        plugin._tick()
+        accepted = json.loads(plugin._publisher.publish.call_args.args[0].data)
+        self.assertEqual(accepted["state"], "accepted_unverified")
+        self.assertTrue(accepted["vendor_reported_success"])
+        self.assertFalse(accepted["arrival_confirmed"])
+        self.assertIn("尚未验证物理", accepted["status_message"])
+        self.assertEqual(plugin.get_tool()["topic_out"][0]["topic"], "/test/u1_pro/head_orientation")
+
+    def test_source_diagnostics_count_sdk_messages_and_only_read_switch_on_status(self):
+        plugin, nodes = self.sound()
+        nodes.get_system_enabled.assert_not_called()
+        plugin._on_event("malformed")
+        self.assertEqual(plugin.dispatch("info", {})["sdk_events_received"], 1)
+        nodes.get_system_enabled.assert_not_called()
+        state = plugin.dispatch("status", {})
+        self.assertIs(state["vendor_wakeup_enabled"], False)
+        self.assertIsNotNone(state["source_checked_at"])
+        self.assertEqual(state["source_topic"], direction.DOA_TOPIC)
+        nodes.set_system_enabled.assert_not_called()
 
     def test_feedback_must_still_be_fresh_at_submission(self):
         plugin, audio, nodes = self.head()
