@@ -45,8 +45,23 @@ SmartMotion implementation include `safety_stop`, `safety_stop_failed`,
 
 ## Actions and state
 
-- `capture(label="manual", pre_s=10, post_s=5)` returns `capturing` and a
-  `clip_id` immediately. It is not an ACP completion notification.
+- `capture(label="manual", pre_s=10, post_s=5)` returns `state=capturing`,
+  a `clip_id` and a unique `action_id` immediately. Its `x-completion` declares
+  capture with a 90-second fallback timeout. The `telemetry_storage` resource
+  identifies this file writer without claiming a body-control channel.
+- After committing both files, the worker POSTs the same `action_id` to
+  `${AGENT_CORE_URL}/api/acp/complete` with `completed`; storage/export failure
+  uses `error`, and stopping before the post-window ends uses `cancelled`.
+  Interrupted clips can still be saved as partial evidence. Completion does
+  not establish healthy streams or a complete data window.
+- Correlation is registered before the worker can finalize even a zero-post
+  clip. Each manual action gets one delivery attempt. Automatic event clips
+  have no initiating platform action and do not emit unsolicited ACP messages.
+- Callback failure is exposed in `last_completion_error` and
+  `completion_delivery_failures`; it does not remove successfully saved files.
+  The Core timeout is the fallback for failed delivery or process termination.
+  The HTTP callback uses a five-second timeout. Loopback HTTPS follows the
+  existing G1 self-signed convention; remote HTTPS verifies certificates.
 - `get_clip(clip_id)` checks `capturing`, `writing`, `saved`, or `failed`.
 - `list_clips(limit=10)` lists at most 20 saved metadata entries.
 - `status`/`info` reports actual per-source receive ages, pending tasks and the
@@ -60,6 +75,11 @@ Each saved directory contains `clip.json` (`g1.telemetry_clip/1`) and a
 self-contained `report.html`. Paths are local to the driver host; no network
 upload, front-end download or automatic retention deletion is implemented.
 Quota or write failure is explicit and not automatically retried.
+
+The `driver.yaml` entry is marketplace metadata only. It neither enables this
+plugin nor proves that the running MCP server exposes it. With the default
+`enabled: false`, `tools/list` omits it; enable the actual deployed config and
+verify runtime tools/list before attempting card use.
 
 ## Interpretation and validation
 

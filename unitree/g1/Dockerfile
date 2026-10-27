@@ -48,10 +48,7 @@ COPY resource/       /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
-COPY telemetry_recorder.py /work/telemetry_recorder.py
-COPY telemetry_recorder_core.py /work/telemetry_recorder_core.py
-COPY telemetry_recorder_store.py /work/telemetry_recorder_store.py
-COPY telemetry_recorder_report.py /work/telemetry_recorder_report.py
+COPY telemetry_recorder.py telemetry_recorder_core.py telemetry_recorder_store.py telemetry_recorder_report.py /work/
 COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py

@@ -6,6 +6,7 @@ import concurrent.futures
 import importlib.util
 import json
 import os
+import ssl
 from pathlib import Path
 import sys
 import tempfile
@@ -19,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 from telemetry_recorder_core import Recorder
 from telemetry_recorder_store import ClipStore
 from telemetry_recorder_report import render_report
-from telemetry_recorder import TelemetryRecorderPlugin, create_ros_subscriber
+from telemetry_recorder import TelemetryRecorderPlugin, create_ros_subscriber, notify_completion
 
 
 class Clock:
@@ -198,11 +199,16 @@ class PluginTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('G1_RECORDER_TEST_TMP'))
         self.addCleanup(self.tmp.cleanup)
         self.opens, self.closes = [], []
+        self.completions = []
+        self.completion_event = threading.Event()
+        def notify(action_id, status, result):
+            self.completions.append((action_id, status, result))
+            self.completion_event.set()
         def factory(sources, callback, executor):
             self.opens.append((sources, callback))
             return lambda: self.closes.append(True)
         self.plugin = TelemetryRecorderPlugin({"output_dir": self.tmp.name}, 'test', None,
-                                               subscriber_factory=factory)
+                                               subscriber_factory=factory, completion_notifier=notify)
         self.addCleanup(self.plugin.stop)
     def test_lifecycle_idempotent_and_source_health_honest(self):
         self.assertEqual("ready", self.plugin.start()["state"])
@@ -322,6 +328,154 @@ class PluginTests(unittest.TestCase):
         config['plugins']['telemetry_recorder'] = {'enabled': True, 'output_dir': self.tmp.name}
         enabled = constructor(config, 'test', None, None, None, None, None)
         self.assertEqual(['telemetry_recorder'], [t['name'] for t in enabled.get_all_tools()])
+
+    def test_capture_declares_acp_and_its_own_storage_channel(self):
+        schema = self.plugin.get_tool()['inputSchema']
+        self.assertEqual(['capture'], schema['x-completion']['actions'])
+        self.assertGreaterEqual(schema['x-completion']['timeout'], 30 + 5)
+        self.assertEqual('telemetry_storage', schema['x-resource'])
+
+    def test_saved_clip_posts_matching_action_id_once(self):
+        self.plugin.start()
+        response = self.plugin.dispatch('capture', {'post_s': 0})
+        self.assertEqual('capturing', response['state'])
+        self.assertTrue(self.completion_event.wait(2))
+        self.plugin.stop()
+        self.plugin.stop()
+        self.assertEqual(1, len(self.completions))
+        action_id, status, result = self.completions[0]
+        self.assertEqual(response['action_id'], action_id)
+        self.assertEqual(response['clip_id'], result['clip_id'])
+        self.assertEqual('completed', status)
+        self.assertTrue(Path(result['json_path']).is_file())
+        self.assertEqual({}, self.plugin._actions)
+
+    def test_storage_failure_posts_acp_error(self):
+        self.plugin.store.max_disk_bytes = 1024
+        self.plugin.start()
+        response = self.plugin.dispatch('capture', {'post_s': 0})
+        self.assertTrue(self.completion_event.wait(2))
+        action_id, status, result = self.completions[0]
+        self.assertEqual(response['action_id'], action_id)
+        self.assertEqual('error', status)
+        self.assertEqual('failed', result['status'])
+        self.assertNotIn('json_path', result)
+
+    def test_stop_posts_cancelled_and_preserves_partial_clip(self):
+        self.plugin.start()
+        response = self.plugin.dispatch('capture', {'post_s': 30})
+        self.plugin.stop()
+        self.assertEqual(1, len(self.completions))
+        action_id, status, result = self.completions[0]
+        self.assertEqual(response['action_id'], action_id)
+        self.assertEqual('cancelled', status)
+        self.assertTrue(result['interrupted'])
+        self.assertTrue(Path(result['json_path']).is_file())
+
+    def test_precondition_and_invalid_capture_have_no_action_id_or_completion(self):
+        response = self.plugin.dispatch('capture', {'post_s': 0})
+        self.assertIn('error', response)
+        self.assertNotIn('action_id', response)
+        self.plugin.start()
+        response = self.plugin.dispatch('capture', {'post_s': 31})
+        self.assertIn('error', response)
+        self.assertNotIn('action_id', response)
+        self.assertEqual({}, self.plugin._actions)
+        self.plugin.stop()
+        self.assertEqual([], self.completions)
+
+    def test_completion_can_precede_dispatch_return_without_losing_correlation(self):
+        original = self.plugin._remember
+        def remember(result):
+            if result['status'] == 'capturing':
+                self.assertTrue(self.completion_event.wait(2))
+            original(result)
+        self.plugin._remember = remember
+        self.plugin.start()
+        response = self.plugin.dispatch('capture', {'post_s': 0})
+        self.assertEqual(response['action_id'], self.completions[0][0])
+        self.assertEqual('completed', self.completions[0][1])
+        saved = self.plugin.dispatch('get_clip', {'clip_id': response['clip_id']})
+        self.assertEqual('saved', saved['status'])
+        self.assertEqual(response['action_id'], saved['action_id'])
+
+    def test_automatic_event_clip_does_not_emit_an_unsolicited_acp_completion(self):
+        configured = self.plugin.dispatch('config', {'auto_events': ['safety_stop'], 'post_s': 0})
+        self.assertTrue(configured['configured'])
+        saved = threading.Event()
+        original = self.plugin._remember
+        def remember(result):
+            original(result)
+            if result['status'] == 'saved':
+                saved.set()
+        self.plugin._remember = remember
+        self.plugin.start()
+        self.opens[0][1]('motion_events', '{"type":"safety_stop"}')
+        self.assertTrue(saved.wait(2))
+        self.plugin.stop()
+        self.assertEqual([], self.completions)
+
+    def test_notification_failure_is_visible_and_does_not_undo_saved_files(self):
+        failed = threading.Event()
+        def notify(*args):
+            failed.set()
+            raise OSError('Core unavailable')
+        self.plugin._notifier = notify
+        self.plugin.start()
+        response = self.plugin.dispatch('capture', {'post_s': 0})
+        self.assertTrue(failed.wait(2))
+        self.plugin.stop()
+        status = self.plugin.info()
+        self.assertEqual(1, status['completion_delivery_failures'])
+        self.assertIn('Core unavailable', status['last_completion_error'])
+        result = self.plugin.dispatch('get_clip', {'clip_id': response['clip_id']})
+        self.assertEqual('saved', result['status'])
+        self.assertTrue(Path(result['json_path']).is_file())
+
+    def test_unexpected_worker_and_export_failure_releases_pending_acp_actions(self):
+        with patch.object(self.plugin.core, 'drain_ready', side_effect=RuntimeError('export failed')):
+            self.plugin.start()
+            response = self.plugin.dispatch('capture', {'post_s': 30})
+            self.assertTrue(self.completion_event.wait(2))
+            self.plugin.stop()
+        self.assertEqual(response['action_id'], self.completions[0][0])
+        self.assertEqual('error', self.completions[0][1])
+        self.assertEqual({}, self.plugin._actions)
+
+
+class CompletionHttpTests(unittest.TestCase):
+    def test_real_callback_function_posts_contract_to_environment_core_origin(self):
+        with patch.dict(os.environ, {'AGENT_CORE_URL': 'http://127.0.0.1:15678/'}):
+            with patch('telemetry_recorder.urllib.request.urlopen') as opened:
+                notify_completion('action-123', 'completed', {'clip_id': 'a'*32})
+        request = opened.call_args.args[0]
+        self.assertEqual('http://127.0.0.1:15678/api/acp/complete', request.full_url)
+        self.assertEqual('POST', request.get_method())
+        self.assertEqual('application/json', request.get_header('Content-type'))
+        body = json.loads(request.data)
+        self.assertEqual('action-123', body['action_id'])
+        self.assertEqual('completed', body['status'])
+        self.assertEqual('telemetry_recorder', body['tool'])
+        self.assertEqual({'clip_id': 'a'*32}, body['result'])
+        self.assertIsInstance(body['ts'], (int, float))
+        self.assertEqual(5, opened.call_args.kwargs['timeout'])
+        self.assertIsNone(opened.call_args.kwargs['context'])
+
+    def test_loopback_self_signed_convention_does_not_disable_remote_https_verification(self):
+        for origin, verify in [('https://localhost:15678', ssl.CERT_NONE),
+                               ('https://core.example.test:15678', ssl.CERT_REQUIRED)]:
+            with patch.dict(os.environ, {'AGENT_CORE_URL': origin}):
+                with patch('telemetry_recorder.urllib.request.urlopen') as opened:
+                    notify_completion('action', 'error', {'error': 'test'})
+            self.assertEqual(verify, opened.call_args.kwargs['context'].verify_mode)
+
+    def test_invalid_callback_origin_is_rejected_before_network_access(self):
+        for origin in ('file:///tmp/core', 'http://localhost:15678/path', 'http://name:secret@localhost:15678'):
+            with patch.dict(os.environ, {'AGENT_CORE_URL': origin}):
+                with patch('telemetry_recorder.urllib.request.urlopen') as opened:
+                    with self.assertRaises(ValueError):
+                        notify_completion('action', 'completed', {})
+                    opened.assert_not_called()
 
 
 if __name__ == '__main__':

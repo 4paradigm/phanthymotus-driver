@@ -5,11 +5,44 @@ No Unitree control client is constructed, and this module never publishes ROS.
 """
 from __future__ import annotations
 from collections import OrderedDict
+import json
 import re
+import ssl
 import threading
+import time
+import urllib.parse
+import urllib.request
 
 from telemetry_recorder_core import Recorder
 from telemetry_recorder_store import ClipStore
+
+
+def notify_completion(action_id, status, result):
+    """Agent Core ACP contract; network errors are surfaced by the caller.
+
+    The deployed Core uses a local self-signed certificate. Follow the existing
+    G1 callback convention for loopback only; remote HTTPS retains verification.
+    """
+    import os as _os
+    url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("AGENT_CORE_URL must be an HTTP(S) origin")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise ValueError("AGENT_CORE_URL must be an origin without credentials, query or path")
+    context = None
+    if parsed.scheme == "https":
+        context = ssl.create_default_context()
+        if parsed.hostname.lower() in ("localhost", "127.0.0.1", "::1"):
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({"action_id": action_id, "status": status,
+                          "result": result, "tool": "telemetry_recorder",
+                          "ts": time.time()}, allow_nan=False).encode("utf-8")
+    request = urllib.request.Request(url + "/api/acp/complete", data=payload,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=5, context=context) as response:
+        response.read(1024)
 
 
 def create_ros_subscriber(sources, callback, executor):
@@ -50,17 +83,22 @@ class TelemetryRecorderPlugin:
         "imu_stale_s", "joints_stale_s", "battery_stale_s",
     })
 
-    def __init__(self, plugin_config, namespace, executor, *, subscriber_factory=create_ros_subscriber):
+    def __init__(self, plugin_config, namespace, executor, *,
+                 subscriber_factory=create_ros_subscriber, completion_notifier=notify_completion):
         self._cfg = dict(plugin_config)
         self._ns, self._executor = namespace.strip("/"), executor
         self._factory = subscriber_factory
+        self._notifier = completion_notifier
         self._life_lock = threading.RLock()
         self._result_lock = threading.Lock()
         self._thread = None
         self._close_subscriber = None
         self._stop_event = threading.Event()
         self._results = OrderedDict()
+        self._actions = {}
         self._last_error = None
+        self._last_completion_error = None
+        self._completion_failures = 0
         self._state = "idle"
         self._build()
 
@@ -96,7 +134,7 @@ class TelemetryRecorderPlugin:
     def get_tool(self):
         actions = {
             "capture": {"params": ["label", "pre_s", "post_s"],
-                        "description": "Save buffered telemetry before and after a marker. Returns capturing, not saved; check get_clip later."},
+                        "description": "Save telemetry before/after a marker. Returns action_id immediately; Agent Core receives completion after saving, failure or interruption."},
             "status": {"params": [], "description": "Check actual source receive ages, missing streams, pending clips and storage errors."},
             "list_clips": {"params": ["limit"], "description": "List local saved clip metadata; no upload or file download."},
             "get_clip": {"params": ["clip_id"], "description": "Check capture/save state and coverage; returns local file paths after saving."},
@@ -121,7 +159,9 @@ class TelemetryRecorderPlugin:
                     "post_s": {"type": "number", "minimum": 0, "maximum": 30},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10},
                     "clip_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
-                }, "required": ["action"], "x-action-params": actions},
+                }, "required": ["action"], "x-action-params": actions,
+                    "x-completion": {"actions": ["capture"], "timeout": 90},
+                    "x-resource": "telemetry_storage"},
                 "configSchema": {"type": "object", "properties": config}}
 
     def _remember(self, result):
@@ -132,10 +172,26 @@ class TelemetryRecorderPlugin:
             previous = self._results.get(result["clip_id"])
             if previous and rank[previous["status"]] > rank[result["status"]]:
                 return
+            action_id = self._actions.get(result["clip_id"])
+            if action_id:
+                result = {**result, "action_id": action_id}
             self._results[result["clip_id"]] = result
             self._results.move_to_end(result["clip_id"])
             while len(self._results) > 50:
                 self._results.popitem(last=False)
+
+    def _complete(self, clip_id, status, result):
+        # Claim once, before network I/O. Automatic event clips have no ACP
+        # caller and no entry here, so never emit a synthetic completion.
+        with self._result_lock:
+            action_id = self._actions.pop(clip_id, None)
+        if action_id is None:
+            return
+        try:
+            self._notifier(action_id, status, result)
+        except Exception as exc:
+            self._last_completion_error = str(exc)[:500]
+            self._completion_failures += 1
 
     def _save(self, docs):
         for doc in docs:
@@ -146,6 +202,9 @@ class TelemetryRecorderPlugin:
                 self._last_error = str(exc)[:500]
                 result = {"clip_id": doc["clip_id"], "status": "failed", "error": self._last_error}
             self._remember(result)
+            status = ("error" if result["status"] == "failed" or self._state == "error" else
+                      "cancelled" if doc["interrupted"] else "completed")
+            self._complete(doc["clip_id"], status, result)
 
     def _worker(self):
         try:
@@ -155,7 +214,22 @@ class TelemetryRecorderPlugin:
             self._last_error = str(exc)[:500]
             self._state = "error"
         finally:
-            self._save(self.core.stop())
+            try:
+                self._save(self.core.stop())
+            except Exception as exc:
+                self._last_error = str(exc)[:500]
+                self._state = "error"
+            finally:
+                # Even an unexpected export failure must not leave a caller's
+                # action pending forever. The Core's 90s timeout remains the
+                # fallback for failed network delivery or a terminated process.
+                with self._result_lock:
+                    unresolved = list(self._actions)
+                for clip_id in unresolved:
+                    result = {"clip_id": clip_id, "status": "failed",
+                              "error": self._last_error or "recorder stopped before exporting clip"}
+                    self._remember(result)
+                    self._complete(clip_id, "error", result)
 
     def start(self):
         with self._life_lock:
@@ -210,6 +284,8 @@ class TelemetryRecorderPlugin:
     def info(self):
         return {"state": self._state, **self.core.status(),
                 "last_storage_or_worker_error": self._last_error,
+                "last_completion_error": self._last_completion_error,
+                "completion_delivery_failures": self._completion_failures,
                 "output_dir": str(self.store.root),
                 "data_health_is_separate_from_lifecycle": True}
 
@@ -239,7 +315,14 @@ class TelemetryRecorderPlugin:
                 with self._life_lock:
                     if self._stop_event.is_set():
                         raise ValueError("recorder is stopping or stopped")
-                    result = self.core.capture(args.get("label", "manual"), args.get("pre_s"), args.get("post_s"))
+                    # _save first takes this lock through _remember. Register
+                    # correlation before the writer can finalize a zero-post
+                    # clip, including a callback preceding dispatch's return.
+                    with self._result_lock:
+                        result = self.core.capture(args.get("label", "manual"), args.get("pre_s"), args.get("post_s"))
+                        action_id = "telemetry_capture_" + result["clip_id"]
+                        self._actions[result["clip_id"]] = action_id
+                        result = {**result, "action_id": action_id, "state": "capturing"}
                     self._remember(result)
                     return result
             if action == "list_clips":
