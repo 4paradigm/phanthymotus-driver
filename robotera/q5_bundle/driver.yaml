@@ -6,7 +6,7 @@ hardware_model: q5
 image_name: robotera-q5
 port: 15793
 mcp_url: "http://localhost:15793/mcp"
-description: "RobotEra Q5 state driver with guarded runtime-locked control cards and action-specific canvas forms"
+description: "RobotEra Q5 state driver with guarded runtime-locked control cards and action-specific canvas forms; includes bounded Pose capture windows"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -21,6 +21,7 @@ cards:
   - { name: hand_state,        type: sensor }
   - { name: mic,               type: sensor }
   - { name: speaker,           type: actuator }
+  - { name: pose_game,         type: sensor }
   - { name: audio,             type: actuator }
   - { name: camera_rgb,        type: sensor }
   - { name: camera_depth,      type: sensor }
