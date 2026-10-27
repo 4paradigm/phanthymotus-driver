@@ -332,11 +332,19 @@ class LocoServoPlugin:
     PREFIX = "locoservo"      # no underscore — dispatch routes on partition("_")
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 high_ctrl, loco_plugin=None):
+                 high_ctrl, loco_plugin=None, estop=None):
         self._ns = namespace
         self._executor = executor
         self._high_ctrl = high_ctrl
         self._loco = loco_plugin
+        # Shared bundle latch. `loco` already gates the shared path, but the
+        # fallback below publishes straight at the SDK when `loco` is disabled;
+        # this keeps the emergency stop honest in that configuration too.
+        self._estop = estop
+        if estop is not None and hasattr(estop, "add_on_latch"):
+            # In a `loco_servo`-only deployment nothing else can zero an
+            # already-running stream, so this card has to be a latch listener.
+            estop.add_on_latch(self._on_estop_latched)
         config = plugin_config or {}
 
         self._expected_hz = float(config.get("expected_hz", DEFAULT_EXPECTED_HZ))
@@ -585,6 +593,10 @@ class LocoServoPlugin:
         # The gate about the *robot* comes before the one about this process. An
         # operator whose robot is mid-dance, told "没有 ROS 上下文", goes looking
         # in the wrong place entirely.
+        if self._estop is not None and self._estop.latched:
+            return {"state": "error", "code": "ESTOP_ACTIVE",
+                    "message": "紧急停止已锁存：先调用 estop.reset(confirm=true)"}
+
         conflict = self._chassis_conflict()
         if conflict:
             return {"state": "error", "message": conflict}
@@ -651,6 +663,9 @@ class LocoServoPlugin:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             if not halted:
+                if self._estop is not None and self._estop.latched:
+                    return {"state": "error", "code": "ESTOP_ACTIVE",
+                            "message": "紧急停止已锁存：先调用 estop.reset(confirm=true)"}
                 conflict = self._chassis_conflict()
                 if conflict:
                     return {"state": "paused", "message": conflict,
@@ -796,6 +811,21 @@ class LocoServoPlugin:
             else:
                 self._posture_problem_text = ""
         return self._posture_problem_text
+
+    def _on_estop_latched(self, source: str, reason: str) -> None:
+        """Pause the stream and zero the chassis when the latch is set.
+
+        With `loco` enabled it owns the same latch and sends the zero itself.
+        This path matters in a `loco_servo`-only deployment, where the fallback
+        below publishes straight at the SDK: dropping future commands is not
+        the same as stopping a stream that is already in flight.
+        """
+        with self._lock:
+            self._paused = True
+            self._explicit_velocity_owner = False
+        self._invalidate_mode_cache()
+        self._hold()
+        print(f"[loco_servo] paused by estop ({source})", flush=True)
 
     def pause_for_explicit_command(self, reason: str = "") -> bool:
         """Called by the call-shaped cards before they move the robot themselves.
@@ -984,6 +1014,18 @@ class LocoServoPlugin:
         separate limiters can interleave inside a single publish, and the SDK
         has no way to tell us that happened.
         """
+        estop = self._estop
+        if estop is None:
+            self._write(nx, ny, nz)
+            return
+        # Same gate as `loco`: the fallback below writes straight at the SDK,
+        # so this card's check and write must be one critical section too.
+        with estop.motion_gate():
+            if estop.refuses(nx, ny, nz):
+                return
+            self._write(nx, ny, nz)
+
+    def _write(self, nx: float, ny: float, nz: float):
         try:
             if self._loco is not None and hasattr(self._loco, "publish_velocity"):
                 self._loco.publish_velocity(nx, ny, nz)

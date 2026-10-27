@@ -127,6 +127,17 @@ def _get_default_cmd():
     """Get DEFAULT command."""
     return _get_control_cmd("DEFAULT")
 
+
+class EmergencyStopActive(RuntimeError):
+    """The latch refused an event command at the publish gate.
+
+    Raised from deep inside a posture/preset/teaching handler when the latch
+    lands after dispatch's pre-check but before the vendor command. `dispatch`
+    turns it into the same `ESTOP_ACTIVE` reply as the early check, so the
+    caller cannot tell (and does not need to tell) which one refused.
+    """
+
+
 _WORKMODE_NAMES = {
     0: "enabled", 1: "ready", 2: "walking", 5: "dance",
     8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
@@ -317,10 +328,101 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        # Set by the bundle right after construction; see `attach_estop`.
+        self._estop = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def attach_estop(self, estop) -> None:
+        """Wire the bundle's shared emergency-stop latch.
+
+        Registered as an on-latch callback rather than polled, so a `trigger`
+        has already zeroed the chassis before it returns to its caller: the
+        card must not report "latched" while a move thread is still publishing.
+        """
+        self._estop = estop
+        if estop is not None and hasattr(estop, "add_on_latch"):
+            estop.add_on_latch(self._on_estop_latched)
+
+    def estop_latched(self) -> bool:
+        return bool(self._estop is not None and self._estop.latched)
+
+    def _on_estop_latched(self, source: str, reason: str) -> None:
+        self.emergency_stop(reason=f"{source}: {reason}" if reason else source)
+
+    def emergency_stop(self, reason: str = "") -> dict:
+        """Stop every motion path this plugin owns. Safe to call while latched."""
+        self._preempt_servo("estop")
+        self._move_stop_event.set()
+        thread = self._move_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        if self._high_ctrl is not None:
+            # Zero is allowed through the latch gate; it is what stops the robot.
+            self._publish_cmd(0.0, 0.0, 0.0, _get_default_cmd(), 0)
+        self._set_servo_velocity_owner(False)
+        exited = self._exit_active_action()
+        print(f"[loco] emergency stop ({reason or 'no reason'})"
+              + (f", exit={exited}" if exited else ""), flush=True)
+        return {"state": "stopped", "reason": reason, "exited_action": exited}
+
+    def _exit_active_action(self) -> str:
+        """Leave a running semantic action or teaching playback via `WALK`.
+
+        `semantic_action` already owns the documented exit for its own modes;
+        an E-stop should use that rather than inventing a second path. `WALK`
+        is allowed through the latch gate for exactly this reason.
+
+        `stand_up` (27) and `lie_prone` (28) are trajectories the vendor starts
+        and does not document a cancellation for. Sending WALK mid-fall could
+        drop the robot, so those are deliberately left alone.
+        """
+        if self._high_ctrl is None:
+            return ""
+        try:
+            mode = int(self._high_ctrl.get_mode())
+        except Exception:                                     # noqa: BLE001
+            return ""
+        try:
+            if mode == 23:
+                result = self._do_stop_playback(
+                    self._safety_requirements("stop_playback"))
+            elif mode in _SEMANTIC_ACTION_WORKMODES:
+                result = self._do_semantic_reset(
+                    self._safety_requirements("reset"))
+            else:
+                return ""
+        except EmergencyStopActive:
+            # The latch refused the exit itself; nothing else to do here.
+            return ""
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[loco] estop could not exit workmode {mode}: {exc}",
+                  flush=True)
+            return ""
+        state = str(result.get("state", ""))
+        print(f"[loco] estop exit workmode {mode} -> {state} "
+              f"(now {result.get('workmode')})", flush=True)
+        return state
+
+    @staticmethod
+    def _allowed_while_latched(tool_name: str, action: str) -> bool:
+        """Actions that reduce motion and must stay callable during a latch."""
+        return (tool_name, action) in {
+            ("loco", "stop_move"),
+            ("semantic_action", "reset"),
+            ("action_recording", "stop_playback"),
+        }
+
+    def _estop_refusal(self, tool_name: str, action: str) -> dict:
+        return {
+            "state": "error",
+            "code": "ESTOP_ACTIVE",
+            "error": "紧急停止已锁存：先调用 estop.reset(confirm=true) 再运动",
+            "estop": self._estop.snapshot() if self._estop is not None else {},
+            "requested": f"{tool_name}.{action}",
+        }
 
     def is_moving(self) -> bool:
         """Whether a `move` thread is still publishing velocities.
@@ -544,18 +646,58 @@ class LocoPlugin:
         if handler is None:
             return None
 
+        # A latched emergency stop refuses every action that moves the body,
+        # including posture and teaching actions: they change `workmode` under
+        # a walking robot just as surely as a velocity command does.
+        if self.estop_latched() and not self._allowed_while_latched(tool_name, action):
+            return self._estop_refusal(tool_name, action)
+
         # Before touching the robot, not after: otherwise this command and the
         # policy's next one race, and which one the robot ends up obeying
         # depends on timing nobody controls. Every action reachable from here
         # moves the body, so every one of them preempts.
         preempted = self._preempt_servo(f"{tool_name}.{action}")
-        result = handler()
+        try:
+            result = handler()
+        except EmergencyStopActive:
+            # The latch landed after the check above; the publish gate refused
+            # the event command itself. Same reply as the early refusal.
+            return self._estop_refusal(tool_name, action)
         if preempted and isinstance(result, dict):
             result["preempted_loco_servo"] = True
         return result
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
-        """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
+                     allow_when_latched: bool = False):
+        """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum.
+
+        This is the single choke point for both cards: `loco_servo` forwards
+        through `publish_velocity`, so gating here covers the call-shaped and
+        the streaming path with one copy of the rule.
+
+        The latch check and the SDK write share one gate with `trigger`. A
+        check that released it before writing could be overtaken by the latch
+        and still send a non-zero command after the E-stop was set.
+
+        Event commands (`FALLTOSTAND`, `DANCE`, `PLAYTEACH`, …) carry a zero
+        velocity but still start physical motion at the vendor controller, so
+        the latch refuses them too. `allow_when_latched` is only for the
+        documented exit path (`WALK`), which `semantic_action.reset` and
+        `stop_playback` need to stay callable during a latch.
+        """
+        estop = self._estop
+        if estop is None:
+            return self._write_cmd(x, y, z, action_cmd, index)
+        with estop.motion_gate():
+            if not allow_when_latched and estop.latched:
+                if action_cmd != _get_default_cmd():
+                    estop.note_blocked()
+                    return False
+                if estop.refuses(x, y, z):
+                    return False
+            return self._write_cmd(x, y, z, action_cmd, index)
+
+    def _write_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0) -> bool:
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
@@ -563,6 +705,7 @@ class LocoPlugin:
                 time.sleep(0.002 - elapsed)
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
+        return True
 
     def _do_move(self, args: dict) -> dict:
         # Check if in walking mode
@@ -802,8 +945,11 @@ class LocoPlugin:
         return self._send_walk_exit("stop_playback", safety)
 
     def _send_walk_exit(self, requested_action: str, safety: str) -> dict:
+        # WALK is the documented exit from a semantic action / teaching
+        # playback; it must stay callable while latched, and it reduces motion.
         observed = self._send_edge_and_wait(
-            _get_control_cmd("WALK"), {2, 26}, timeout_s=3.0)
+            _get_control_cmd("WALK"), {2, 26}, timeout_s=3.0,
+            allow_when_latched=True)
         if observed == 26:
             return self._protection_error(
                 requested_action, [], observed, safety, command_sent=True)
@@ -988,9 +1134,14 @@ class LocoPlugin:
         return observed
 
     def _send_edge_and_wait(self, cmd_enum, expected_modes: set[int],
-                            index: int = 0, timeout_s: float = 2.0) -> int:
+                            index: int = 0, timeout_s: float = 2.0,
+                            allow_when_latched: bool = False) -> int:
         """Send one event command, release with DEFAULT, then observe feedback."""
-        self._publish_cmd(0, 0, 0, cmd_enum, index)
+        sent = self._publish_cmd(0, 0, 0, cmd_enum, index,
+                                 allow_when_latched=allow_when_latched)
+        if not sent:
+            # The latch landed after `dispatch`'s pre-check. Nothing was sent.
+            raise EmergencyStopActive()
         # The vendor demo runs a 10 ms command loop. This also exceeds the
         # documented minimum 2 ms interval without repeatedly firing the event.
         time.sleep(0.01)
