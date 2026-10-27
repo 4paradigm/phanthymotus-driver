@@ -216,6 +216,14 @@ class G1DeviceBundle:
             self._plugins.append(camera_plugin)
             print("[bundle] RealSensePlugin loaded")
 
+        # Optional receive-only consumer of existing Motus state/event topics.
+        # Disabled until the site's topic mapping and persistent directory are checked.
+        if plugins_cfg.get("telemetry_recorder", {}).get("enabled", False):
+            from telemetry_recorder import TelemetryRecorderPlugin
+            self._plugins.append(TelemetryRecorderPlugin(
+                plugins_cfg["telemetry_recorder"], namespace, executor))
+            print("[bundle] TelemetryRecorderPlugin loaded (receive-only)")
+
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
             self._plugins.append(VisionCapturePlugin(
