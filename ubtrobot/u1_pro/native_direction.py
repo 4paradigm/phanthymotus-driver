@@ -31,6 +31,7 @@ class NativeDirectionSource:
         self._last_audio = self._ready_after = None
         self.device = None
         self.error = ""
+        self._worker_present = False
 
     def start(self):
         import rclpy
@@ -120,6 +121,7 @@ class NativeDirectionSource:
             now = time.monotonic()
             self.events_received += 1
             if (not self.running or self.error or self._last_audio is None
+                    or not self._worker_present
                     or now - self._last_audio > .5 or now < (self._ready_after or 0)):
                 return
             self._events.append(({"azimuth": message.azimuth, "confidence": message.confidence},
@@ -127,6 +129,14 @@ class NativeDirectionSource:
 
     def drain(self):
         with self._lock:
+            present = bool(self._raw_pub is not None and self._raw_pub.get_subscription_count())
+            if present != self._worker_present:
+                self._events.clear()
+                self._events.append((None, time.monotonic(), time.time_ns() // 1_000_000))
+                self._ready_after = time.monotonic() + 1.0
+                self._worker_present = present
+            elif not present:
+                self._events.clear()
             events = list(self._events)
             self._events.clear()
             return events

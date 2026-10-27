@@ -15,6 +15,10 @@ import tempfile
 NAME = "embodied-u1pro-native-doa"
 LABEL = "com.phanthy.u1pro-native-doa"
 ROOT = Path("/opt/phanthy-motus/data/u1_pro/native_doa")
+VENDOR_AUDIO_REPOSITORIES = {
+    "acr.rd.ubtrobot.com/glcr/uworld/robo/runtime/csh2/module/audio",
+    "glcr.rd.ubtrobot.com/uworld/robo/runtime/csh2/module/audio",
+}
 
 
 def docker(*args, check=True):
@@ -38,6 +42,10 @@ def start(image, native_container):
     native = inspect(native_container)
     if not native or not native.get("State", {}).get("Running"):
         raise RuntimeError("Vendor audio runtime is not running")
+    reference = native.get("Config", {}).get("Image", "").split("@", 1)[0]
+    repository = reference.rsplit(":", 1)[0] if ":" in reference.rsplit("/", 1)[-1] else reference
+    if repository not in VENDOR_AUDIO_REPOSITORIES:
+        raise RuntimeError("Refusing a container that is not a supported U1 vendor audio image")
     config = next((m for m in native["Mounts"] if m["Destination"] == "/opt/walker/config_csh2"), None)
     if not config or config["Type"] not in ("volume", "bind"):
         raise RuntimeError("Cannot locate the real vendor audio configuration mount")

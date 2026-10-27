@@ -90,7 +90,8 @@ sudo python3 /tmp/u1-native-doa-manage.py start --driver-image "$image"
 ```
 
 然后使用该镜像正常部署 U1 驱动。定位容器名为 `embodied-u1pro-native-doa`，
-独立重启策略为 `unless-stopped`。厂商音频镜像或配置卷升级后，重新执行 start。
+独立重启策略为 `unless-stopped`。脚本拒绝使用非支持的优必选音频仓库镜像。
+厂商音频镜像或配置卷升级后，重新执行 start。
 其配置按驱动 image ID 保存，更新时不覆盖运行中的配置目录。
 
 ```bash
@@ -126,6 +127,7 @@ stop 只删除带有本脚本所有权标签的私有定位容器，拒绝删除
 - 每 500ms 重发状态；重发不刷新事件接收时间。不同事件之间不做角度平滑。
 - `info.source_status` 提供原始音频转发数、设备状态更新数、native 事件数、
   工作容器订阅者数和 `waiting_for_device/worker_not_discovered/waiting_for_audio/receiving/error`。
+  已确认的订阅端点消失会立即清除旧方向；静默失联仍由 2 秒过期界限兜底。
 - 当前设备必须被厂商 internal_mics.yml 识别为阵列，由私有流程的 IsInternalMicNode 把关。
   真机元数据的 is_built_in 实测为 False，不能仅凭该标志拒绝实际阵列。
   设备切换或音频中断后，清除旧事件并等待输入重新稳定，

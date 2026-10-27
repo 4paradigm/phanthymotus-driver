@@ -20,6 +20,8 @@ class NativeSourceTests(unittest.TestCase):
         self.source = NativeDirectionSource(self.nodes)
         self.source.running = True
         self.source._raw_pub = mock.Mock()
+        self.source._raw_pub.get_subscription_count.return_value = 1
+        self.source._worker_present = True
         self.source._device_pub = mock.Mock()
         self.clock = mock.patch('native_direction.time.monotonic', return_value=100).start()
         self.addCleanup(mock.patch.stopall)
@@ -76,6 +78,15 @@ class NativeSourceTests(unittest.TestCase):
         self.clock.return_value = 103
         self.source._on_direction(self.event(-30))
         self.assertEqual(self.source.drain(), [])
+
+    def test_worker_disappearance_immediately_invalidates_queued_direction(self):
+        self.source._events.append(({'azimuth': 80}, 100, 123))
+        self.source._raw_pub.get_subscription_count.return_value = 0
+        self.assertEqual([e[0] for e in self.source.drain()], [None])
+        self.assertFalse(self.source._worker_present)
+        self.source._raw_pub.get_subscription_count.return_value = 1
+        self.assertEqual([e[0] for e in self.source.drain()], [None])
+        self.assertEqual(self.source._ready_after, 101)
 
     def test_device_change_invalidates_direction_and_requires_new_audio(self):
         self.source._on_device(self.device()); self.source._on_audio(self.audio())
@@ -177,7 +188,7 @@ class NativeDeploymentTests(unittest.TestCase):
     def test_worker_is_pinned_to_running_vendor_image_and_only_config_mount(self):
         m = self.manager()
         native = {'State': {'Running': True}, 'Image': 'sha256:actual-vendor-image',
-                  'Config': {'Image': 'vendor/audio:tag'},
+                  'Config': {'Image': 'acr.rd.ubtrobot.com/glcr/uworld/robo/runtime/csh2/module/audio:test'},
                   'Mounts': [{'Type': 'volume', 'Name': 'vendor-config', 'Destination': '/opt/walker/config_csh2'},
                              {'Type': 'bind', 'Source': '/home/user/.ssh', 'Destination': '/home/ubt/.ssh'}]}
         calls = []
@@ -203,6 +214,14 @@ class NativeDeploymentTests(unittest.TestCase):
         self.assertNotIn('--privileged', run)
         self.assertFalse(any('.ssh' in v or 'docker.sock' in v or '/dev/snd' in v for v in run))
         self.assertFalse(any(c[0] in ('restart', 'exec') for c in calls))
+
+    def test_start_rejects_nonvendor_container_before_launch(self):
+        m = self.manager()
+        native = {'State': {'Running': True}, 'Config': {'Image': 'unrelated/service:latest'}}
+        with mock.patch.object(m, 'inspect', return_value=native), \
+             mock.patch.object(m, 'docker') as docker, self.assertRaisesRegex(RuntimeError, 'not a supported'):
+            m.start('reviewed-driver:commit', 'unrelated')
+        docker.assert_not_called()
 
     def test_stop_rejects_unrelated_container(self):
         m = self.manager()
