@@ -239,6 +239,7 @@ class PayloadMassPlugin:
                           motion_reserved=bool(self._loco and self._loco._payload_owner is self),
                           playback=copy.deepcopy(self._playback),
                           setup_mode=self._setup_mode, recording_id=self._recording_id,
+                          arm=self._arm, hold_duration_s=self._hold_duration_s,
                           remaining_s=self._remaining_s(),
                           diagnostics=self._sampler.diagnostics() if self._sampler else None)
             return result

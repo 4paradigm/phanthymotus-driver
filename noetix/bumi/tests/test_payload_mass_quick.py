@@ -38,6 +38,52 @@ def set_mass(sampler, kg):
     sampler.frame["tau"] = raw_frame(kg)["tau"]
 
 
+@pytest.mark.parametrize("failure, expected", [
+    ("velocity", "joint velocity: motor_id=6, dq=0.1100, limit=0.1000"),
+    ("gyro", "body gyro: axis=2, gyro=0.1600, limit=0.1500"),
+    ("bend", "elbow displacement below bend threshold: motor_id=3"),
+    ("angle", "joint angle span too high: motor_id=3"),
+    ("torque", "torque spread exceeds stable-window limit: motor_id=0"),
+])
+def test_stability_timeout_retains_actual_rejection_and_threshold(failure, expected):
+    sampler = SharedSampler()
+    home = [0.] * 21
+    frame = raw_frame()
+    frame["q"][3] = -.6
+    p = profile_from_home(frame, "left", 300)
+    p.update(min_samples=2, settle_timeout_s=.08, max_receive_gap_s=.05, max_torque_span=.05)
+    done = threading.Event()
+    def feed():
+        seq = 0
+        while not done.is_set():
+            seq += 1
+            current = copy.deepcopy(frame)
+            current["source_seq"] = seq
+            if failure == "velocity":
+                current["dq"][6] = .11
+            elif failure == "gyro":
+                current["gyro"][2] = .16
+            elif failure == "bend":
+                current["q"][3] = .1
+            elif failure == "angle":
+                current["q"][3] -= .04 * (seq % 2)
+            elif failure == "torque":
+                current["tau"][0] += .1 * (seq % 2)
+            sampler.push(current)
+            done.wait(.005)
+    thread = threading.Thread(target=feed)
+    thread.start()
+    try:
+        with pytest.raises(MassError) as err:
+            sampler.collect(.08, p, threading.Event(), learn_pose_from=home)
+        assert err.value.code == "UNSTABLE"
+        assert expected in str(err.value)
+        assert "best_window_s=" in str(err.value) and "required_s=0.080" in str(err.value)
+    finally:
+        done.set()
+        thread.join(1)
+
+
 @pytest.mark.parametrize("arm, elbow", [("left", 3), ("right", 13)])
 def test_gradual_bend_with_zero_reported_velocity_learns_final_stable_pose(tmp_path, arm, elbow):
     sampler = SharedSampler()

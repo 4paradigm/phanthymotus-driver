@@ -154,6 +154,8 @@ class SharedSampler:
         deadline = time.monotonic() + duration + profile["settle_timeout_s"]
         stable = []
         reason = "INSUFFICIENT_SAMPLES"
+        reason_detail = "waiting for new observations"
+        best_window_s = 0.0
         while time.monotonic() < deadline:
             if cancel.is_set():
                 raise MassError("CANCELLED", "sampling cancelled; no motor command sent")
@@ -165,6 +167,8 @@ class SharedSampler:
             for frame in incoming:
                 if frame["serial"] != cursor + 1:
                     stable = []
+                    reason = "DATA_GAP"
+                    reason_detail = f"observation serial gap: previous={cursor}, current={frame['serial']}"
                 cursor = frame["serial"]
                 try:
                     observed_profile = ({**profile, "pose_q": frame["q"]}
@@ -173,19 +177,31 @@ class SharedSampler:
                     if learn_pose_from is not None:
                         elbow = profile["motor_ids"][-1]
                         if abs(frame["q"][elbow] - learn_pose_from[elbow]) < .2:
-                            raise MassError("UNSTABLE", "等待实际曲肘并停稳。")
+                            raise MassError("UNSTABLE", "elbow displacement below bend threshold: "
+                                            f"motor_id={elbow}, actual={frame['q'][elbow]:.4f}, "
+                                            f"home={learn_pose_from[elbow]:.4f}, "
+                                            f"delta={abs(frame['q'][elbow]-learn_pose_from[elbow]):.4f}, min=0.2000 rad")
                         # Check measured angle movement even when motor dq is
                         # reported as zero. Never anchor to the first bent frame.
-                        if stable and any(
-                                max([frame["q"][j]] + [f["q"][j] for f in stable])
-                                - min([frame["q"][j]] + [f["q"][j] for f in stable])
-                                > (min(.03, profile["pose_tolerance_rad"])
-                                   if j in profile["motor_ids"] else profile["pose_tolerance_rad"])
-                                for j in range(21)):
-                            stable = []
+                        if stable:
+                            spans = [max([frame["q"][j]] + [f["q"][j] for f in stable])
+                                     - min([frame["q"][j]] + [f["q"][j] for f in stable])
+                                     for j in range(21)]
+                            limits = [min(.03, profile["pose_tolerance_rad"]) if j in profile["motor_ids"]
+                                      else profile["pose_tolerance_rad"] for j in range(21)]
+                            j = max(range(21), key=lambda i: spans[i]/limits[i])
+                            if spans[j] > limits[j]:
+                                reason = "UNSTABLE"
+                                reason_detail = (f"joint angle span too high: motor_id={j}, "
+                                                 f"q_span={spans[j]:.4f}, limit={limits[j]:.4f} rad")
+                                stable = []
                     if stable and frame["host_monotonic_s"]-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
+                        reason = "STALE_SOURCE"
+                        reason_detail = (f"receive gap={frame['host_monotonic_s']-stable[-1]['host_monotonic_s']:.4f}, "
+                                         f"limit={profile['max_receive_gap_s']:.4f} s")
                         stable = []
                     stable.append(frame)
+                    best_window_s = max(best_window_s, stable[-1]["host_monotonic_s"]-stable[0]["host_monotonic_s"])
                     # A stable joint alone does not show the hanging object is
                     # stationary: reject torque spread AND drift in the window.
                     if stable[-1]["host_monotonic_s"]-stable[0]["host_monotonic_s"] >= duration:
@@ -194,7 +210,9 @@ class SharedSampler:
                         for j in profile["motor_ids"]:
                             values = [f["tau"][j] for f in stable]
                             if max(values)-min(values) > profile["max_torque_span"]:
-                                raise MassError("UNSTABLE", "torque spread exceeds stable-window limit")
+                                raise MassError("UNSTABLE", "torque spread exceeds stable-window limit: "
+                                                f"motor_id={j}, tau_span={max(values)-min(values):.6f}, "
+                                                f"limit={profile['max_torque_span']:.6f}")
                         if time.monotonic()-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
                             raise MassError("STALE_SOURCE", "last observation too old")
                         return stable
@@ -204,11 +222,15 @@ class SharedSampler:
                     if exc.code not in ("UNSTABLE", "INSUFFICIENT_SAMPLES"):
                         raise
                     reason = exc.code
+                    reason_detail = str(exc)
                     stable = []
             if stable and time.monotonic()-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
                 stable = []
                 reason = "STALE_SOURCE"
-        raise MassError(reason, "no complete continuous stable window before timeout")
+                reason_detail = "feedback gap exceeds max_receive_gap_s"
+        raise MassError(reason, "no complete continuous stable window before timeout; "
+                        f"best_window_s={best_window_s:.3f}, required_s={duration:.3f}; "
+                        f"last_rejection: {reason_detail}")
 
 
 def check_frame(frame, p):
@@ -238,7 +260,14 @@ def check_frame(frame, p):
                         f"delta={differences[j]:.4f} rad, limit={p['pose_tolerance_rad']:.4f} rad")
     if quaternion_angle(frame["quaternion_xyzw"], p["quaternion_xyzw"]) > p["body_tolerance_rad"]:
         raise MassError("BODY_MISMATCH", "body orientation differs from profile")
-    if max(abs(v) for v in frame["dq"]) > p["max_velocity_rad_s"] or max(abs(v) for v in frame["gyro"]) > p["max_gyro_rad_s"]:
-        raise MassError("UNSTABLE", "joint/body velocity too high")
+    j = max(range(21), key=lambda i: abs(frame["dq"][i]))
+    axis = max(range(3), key=lambda i: abs(frame["gyro"][i]))
+    violations = []
+    if abs(frame["dq"][j]) > p["max_velocity_rad_s"]:
+        violations.append(f"joint velocity: motor_id={j}, dq={frame['dq'][j]:.4f}, limit={p['max_velocity_rad_s']:.4f}")
+    if abs(frame["gyro"][axis]) > p["max_gyro_rad_s"]:
+        violations.append(f"body gyro: axis={axis}, gyro={frame['gyro'][axis]:.4f}, limit={p['max_gyro_rad_s']:.4f}")
+    if violations:
+        raise MassError("UNSTABLE", "; ".join(violations))
     if any(abs(frame["tau"][j]) >= p["torque_abs_limit"] for j in p["motor_ids"]):
         raise MassError("SATURATED", "torque outside engineer-confirmed measurement limits")
