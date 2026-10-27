@@ -1,5 +1,16 @@
 # Bumi 实时称重 Card（待真机验证）
 
+该实验卡默认关闭。上机测试需显式启用；普通部署不会注册该卡或启动称重DDS进程。
+测试部署时，在PR构建结果给出的镜像启动命令中使用：
+
+```bash
+curl -fsSL https://motus.phanthy.com/run-pr-image.sh | \
+  sudo env BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS=1 bash -s -- <PR构建结果中的镜像地址>
+```
+
+也可在自己的部署配置中显式设置 `plugins.payload_mass.enabled: true`。
+修改卡片齿轮参数不能启用一个未注册的卡片。启用后按下述五分钟流程测试。
+
 本版已改为直接读取机器人原始DDS状态：同一帧的关节力矩、姿态、IMU、模式及
 `motorstatearray.timestamp`一起接入。无需更换SDK或单独运行采集脚本。
 驱动启动时自动发现唯一状态源；默认原生DDS域为0，独立于ROS域42。
@@ -19,7 +30,7 @@
 
 ## 五分钟快速版：直接操作
 
-默认配置 `setup_mode: quick`。不需要填写工程JSON、机器人身份或人工关节角度。
+启用后的默认模式为 `setup_mode: quick`。不需要填写工程JSON、机器人身份或人工关节角度。
 
 1. 用现有action_recording录制：双臂下垂 → 曲肘 → 原姿态停留约5分钟，保存一个编号。
 2. 在payload_mass卡片齿轮里填写该 `recording_id`，选挂载侧 `arm`（默认left），保存。
@@ -126,6 +137,12 @@ git diff --check
 关闭自动插件加载以避开ROS Jazzy/Conda插件冲突。机器人继续使用原ROS Humble容器；
 新增原生只读程序使用镜像已有的DDS运行库与构建工具，无新增apt/pip依赖。
 构建时校验生成状态类型的全部12份XTypes元数据与仓库SDK一致；不链接动作控制库。
+原生程序strip后保留，CMake/编译中间产物在同一构建层删除；build目录只保留两份Python
+绑定和原生程序。镜像内 `/work/payload_mass_build_size.json` 记录实际原生程序字节数、
+六个运行时Python模块字节数和清理的构建字节数；这些文件字节数不等于完整镜像压缩大小。
+2026-10-27读取注册表manifest测得：原生接入前的 `release.261026.1825579` 压缩层合计
+501,662,250字节，原生接入但尚未清理的 `release.261026.d65e752` 为503,452,880字节，
+增加1,790,630字节（约1.71MiB）。清理后的新镜像实际对比记录在PR正文。
 离线标定工具和测试发布器留在开发仓库，不打入运行镜像。
 
 ## 无机器人演示

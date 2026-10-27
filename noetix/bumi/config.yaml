@@ -64,7 +64,8 @@ plugins:
     max_duration_s: 30
 
   payload_mass:
-    enabled: true
+    # Experimental motion workflow: opt in explicitly for hardware testing.
+    enabled: false
     # Native robot status DDS domain, independent of ROS_DOMAIN_ID=42.
     dds_domain: 0
     # Empty: discover the unique RobotStatus::StatusData writer, as the raw probe does.

@@ -64,6 +64,7 @@ class FakeSpeakerPlugin:
 @pytest.fixture
 def bundle_module(monkeypatch):
     """Load the real bundle and servo card with hardware imports replaced."""
+    monkeypatch.delenv("BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS", raising=False)
     fake_rclpy = types.ModuleType("rclpy")
     fake_executors = types.ModuleType("rclpy.executors")
     fake_rclpy.executors = fake_executors
@@ -104,10 +105,30 @@ def _config(*, loco=True, loco_servo=True, servo_config=None):
     }
 
 
+@pytest.mark.parametrize("opt_in, expected", [(None, False), ("0", False), ("true", False), ("1", True)])
+def test_experimental_scale_requires_explicit_deployment_opt_in(bundle_module, monkeypatch, opt_in, expected):
+    import yaml
+    defaults = yaml.safe_load((BUMI / "config.yaml").read_text())
+    assert defaults["plugins"]["payload_mass"]["enabled"] is False
+    cfg = {"plugins": {"payload_mass": defaults["plugins"]["payload_mass"]}}
+    calls = []
+    class Payload:
+        def __init__(self, config, namespace, executor, sampler, loco, *, feedback):
+            calls.append(feedback)
+        def get_tool(self):
+            return {"name": "payload_mass", "type": "actuator"}
+    monkeypatch.setitem(sys.modules, "payload_mass", types.SimpleNamespace(PayloadMassPlugin=Payload))
+    if opt_in is not None:
+        monkeypatch.setenv("BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS", opt_in)
+    bundle = bundle_module.BumiDeviceBundle(cfg, "test", object(), FakeHighCtrl(), None)
+    assert bool(calls) is expected
+    assert any(t["name"] == "payload_mass" for t in bundle.get_all_tools()) is expected
+
+
 def test_payload_registration_uses_native_feedback_and_loco_and_gates_response(bundle_module, monkeypatch):
     class State:
         def __init__(self, *args):
-            self._node = types.SimpleNamespace(payload_sampler=None)
+            self._node = types.SimpleNamespace()
 
         def get_tools(self):
             return []
@@ -135,7 +156,7 @@ def test_payload_registration_uses_native_feedback_and_loco_and_gates_response(b
                        "payload_mass": {"enabled": True}}}
     bundle = bundle_module.BumiDeviceBundle(cfg, "test", object(), FakeHighCtrl(), None)
     state, loco, card = bundle._plugins
-    assert state._node.payload_sampler is None  # never mix timestamp-less getter frames
+    assert not hasattr(state._node, "payload_sampler")
     assert card.feedback._sampler is card.sampler
     assert card.loco is loco
     assert bundle.dispatch("payload_mass", {"action": "prepare"}) == {"action_id": "test_id"}

@@ -123,12 +123,10 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
-        state_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
-            state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
-            self._plugins.append(state_plugin)
+            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl))
             print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
@@ -184,16 +182,18 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
-        if plugins_cfg.get("payload_mass", {}).get("enabled", False):
+        payload_cfg = plugins_cfg.get("payload_mass", {})
+        if (payload_cfg.get("enabled", False)
+                or os.environ.get("BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS") == "1"):
             from payload_mass import PayloadMassPlugin
             from payload_mass_sampling import SharedSampler
             from payload_mass_feedback import DdsFeedback
             sampler = SharedSampler()
             # The SDK getter omits the source timestamp. Read motor/IMU/mode
             # together from native status DDS; never mix getter-only samples in.
-            feedback = DdsFeedback(sampler, plugins_cfg["payload_mass"])
+            feedback = DdsFeedback(sampler, payload_cfg)
             self._plugins.append(PayloadMassPlugin(
-                plugins_cfg["payload_mass"], namespace, executor, sampler, loco_plugin,
+                payload_cfg, namespace, executor, sampler, loco_plugin,
                 feedback=feedback))
             print("[bundle] PayloadMassPlugin loaded (read-only native DDS source feedback)")
 

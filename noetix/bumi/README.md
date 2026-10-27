@@ -450,7 +450,9 @@ docker logs -f embodied-noetix-bumi
 
 ## 五分钟手臂实时称重
 
-`payload_mass`默认快速版：齿轮填写曲肘示教编号，自动采空载和姿态；先点击测量再挂物，
+`payload_mass`为默认关闭的实验卡，测试部署显式设置
+`BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS=1`或配置`plugins.payload_mass.enabled: true`后注册。
+启用后默认快速版：齿轮填写曲肘示教编号，自动采空载和姿态；先点击测量再挂物，
 用一个已知重量做本次会话的快速校准，随后换物实时显示kg，取下后点击停止自然收臂。
 无需先填写工程JSON。快速版保留实验性标记；工程模式可继续做多试次标定。
 操作和无机器人演示见 [PAYLOAD_MASS.md](PAYLOAD_MASS.md)。
