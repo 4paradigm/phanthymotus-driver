@@ -70,6 +70,7 @@ class SharedSampler:
         self._last_source = None
         self._last_timestamp = None
         self._errors = 0
+        self._fatal_errors = 0
         self._error = None
         self._duplicates = 0
 
@@ -86,9 +87,11 @@ class SharedSampler:
                    "workmode": int(workmode), "source_seq": None,
                    "source_timestamp": None, "adapter": "shared_highcontroller_getter"})
 
-    def record_error(self, exc):
+    def record_error(self, exc, *, recoverable=False):
         with self._condition:
             self._errors += 1
+            if not recoverable:
+                self._fatal_errors += 1
             self._error = str(exc)
             self._condition.notify_all()
 
@@ -150,6 +153,7 @@ class SharedSampler:
                     "torque_changed_observations": changes,
                     "source_duplicate_count": self._duplicates,
                     "read_error_count": self._errors, "last_read_error": self._error,
+                    "recoverable_gap_count": self._errors-self._fatal_errors,
                     "freshness_status": "source_sequence" if latest and latest.get("source_seq") is not None else "source_timestamp" if latest and latest.get("source_timestamp") is not None else "host_receipt_only",
                     "effective_sample_count": None,
                     "note": "Getter receipt/change rate cannot prove source refresh rate or independent samples."}
@@ -159,10 +163,12 @@ class SharedSampler:
         with self._condition:
             if error_epoch != self._errors:
                 raise MassError("DATA_ERROR", self._error or "state feedback interrupted")
-            frames = [copy.deepcopy(f) for f in self._frames if f["serial"] > cursor]
+            frames = [f for f in self._frames if f["serial"] > cursor]
             if frames and frames[0]["serial"] != cursor + 1:
                 raise MassError("DATA_GAP", "observation buffer overrun")
-            return frames
+        # Stored frames are never mutated. Take references under the lock,
+        # then copy outside it so a large window cannot block DDS ingestion.
+        return self._copy_snapshot(frames, error_epoch)
 
     def recent(self, duration, error_epoch):
         """Snapshot a real received interval; never synthesize getter samples."""
@@ -174,7 +180,15 @@ class SharedSampler:
                 raise MassError("STALE_SOURCE", "no received observations")
             cutoff = frames[-1]["host_monotonic_s"]-duration
             start = next((i for i, f in enumerate(frames) if f["host_monotonic_s"] >= cutoff), len(frames)-1)
-            return copy.deepcopy(frames[max(0, start-1):])
+            frames = frames[max(0, start-1):]
+        return self._copy_snapshot(frames, error_epoch)
+
+    def _copy_snapshot(self, frames, error_epoch):
+        result = copy.deepcopy(frames)
+        with self._condition:
+            if error_epoch != self._errors:
+                raise MassError("DATA_ERROR", self._error or "state feedback interrupted during snapshot")
+        return result
 
     def collect(self, duration, profile, cancel, *, learn_pose_from=None):
         # Only quick empty preparation may learn its final pose. Weighing and
@@ -185,6 +199,7 @@ class SharedSampler:
             learn_pose_from = vector(learn_pose_from, 21, "home_q")
         with self._condition:
             cursor, epoch = self._serial, self._errors
+            fatal_epoch = self._fatal_errors
         deadline = time.monotonic() + duration + profile["settle_timeout_s"]
         stable = []
         reason = "INSUFFICIENT_SAMPLES"
@@ -196,9 +211,18 @@ class SharedSampler:
                 raise MassError("CANCELLED", "sampling cancelled; no motor command sent")
             with self._condition:
                 if epoch != self._errors:
-                    raise MassError("DATA_ERROR", self._error or "shared state read failed")
-                incoming = [copy.deepcopy(f) for f in self._frames if f["serial"] > cursor]
+                    if learn_pose_from is None or fatal_epoch != self._fatal_errors:
+                        raise MassError("DATA_ERROR", self._error or "shared state read failed")
+                    # Empty preparation has not established a baseline yet.
+                    # After a recoverable pipe gap, start a whole new window;
+                    # never combine pre/post-gap observations or extend timeout.
+                    cursor, epoch = self._serial, self._errors
+                    stable = []
+                    pose_low, pose_high = {}, {}
+                    reason, reason_detail = "STALE_SOURCE", self._error
+                incoming = [f for f in self._frames if f["serial"] > cursor]
                 self._condition.wait(timeout=0.02 if not incoming else 0)
+            incoming = copy.deepcopy(incoming)
             for frame in incoming:
                 if frame["serial"] != cursor + 1:
                     stable = []
@@ -252,6 +276,11 @@ class SharedSampler:
                                                 f"limit={profile['max_torque_span']:.6f}")
                         if time.monotonic()-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
                             raise MassError("STALE_SOURCE", "last observation too old")
+                        with self._condition:
+                            if epoch != self._errors:
+                                # Re-enter the interruption handler before
+                                # returning a baseline from a raced snapshot.
+                                break
                         return stable
                 except MassError as exc:
                     # Faults and mismatched conditions invalidate this attempt;

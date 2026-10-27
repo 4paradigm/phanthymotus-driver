@@ -87,7 +87,7 @@ class DdsFeedback:
                     # Keep draining old pipe data so later genuinely fresh
                     # feedback can support an explicit new empty preparation.
                     if not draining:
-                        self._sampler.record_error(exc)
+                        self._sampler.record_error(exc, recoverable=True)
                     draining = True
                     continue
                 if accepted:

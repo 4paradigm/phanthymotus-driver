@@ -200,7 +200,7 @@ def raw_frame(mass=0, seq=1):
             "temperature": [30.] * 21, "errors": [0] * 21,
             "quaternion_xyzw": [0, 0, 0, 1], "gyro": [0, 0, 0], "workmode": 23,
             "source_seq": seq, "source_timestamp": None, "host_monotonic_s": float(seq),
-            "host_time_s": time.time(), "adapter": "SYNTHETIC_ONLY"}
+            "host_time_s": time.time(), "error_epoch": 0, "adapter": "SYNTHETIC_ONLY"}
 
 
 def configuration():

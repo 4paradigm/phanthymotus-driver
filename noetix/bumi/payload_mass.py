@@ -631,9 +631,11 @@ class PayloadMassPlugin:
                 baseline = {"id": trial["id"], "created_s": time.time(),
                             "profile_fingerprint": p["fingerprint"], "summary": summary}
                 session = {"baseline": baseline, "p": p, "fingerprint": fingerprint,
-                           "prepared": time.monotonic(), "error_epoch": self._sampler.diagnostics()["read_error_count"]}
+                           "prepared": time.monotonic(), "error_epoch": frames[-1]["error_epoch"]}
                 result = self._result("ready", "曲肘保持且空载已记录；先点击测量重量，再轻挂物体。",
                                       trial_file=save_trial(self._root, trial), stable=False)
+                if self._sampler.diagnostics()["read_error_count"] != session["error_epoch"]:
+                    raise MassError("DATA_ERROR", "空载采集后反馈中断，请重新准备。")
         except Exception as exc:
             result = self._result("cancelled" if getattr(exc, "code", "") == "CANCELLED" else "error", str(exc),
                                   error_code=getattr(exc, "code", "INTERNAL"), stable=False)

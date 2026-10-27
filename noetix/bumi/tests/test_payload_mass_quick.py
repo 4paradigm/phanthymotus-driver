@@ -47,6 +47,22 @@ def set_mass(sampler, kg):
     sampler.frame["tau"] = raw_frame(kg)["tau"]
 
 
+def test_gap_while_saving_empty_trial_cannot_mark_old_window_ready(quick, monkeypatch):
+    import payload_mass
+    card, sampler, _ = quick
+    original_save = payload_mass.save_trial
+
+    def interrupted_save(root, data):
+        result = original_save(root, data)
+        sampler.epoch += 1
+        return result
+
+    monkeypatch.setattr(payload_mass, "save_trial", interrupted_save)
+    result = run(card, "prepare")
+    assert result["state"] == "error" and result["error_code"] == "DATA_ERROR"
+    assert card._session is None
+
+
 @pytest.mark.parametrize("moving_arm", [False, True])
 def test_three_second_capture_with_continuous_ankle_motion(monkeypatch, moving_arm):
     import payload_mass_sampling as sampling
