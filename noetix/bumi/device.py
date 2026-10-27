@@ -317,6 +317,8 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        self._action_lock = threading.RLock()
+        self._routine_owner = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
@@ -333,6 +335,11 @@ class LocoPlugin:
         thread = self._move_thread
         return bool(thread is not None and thread.is_alive())
 
+    def is_motion_reserved(self) -> bool:
+        # Advisory admission check. Publication enforces this under _lock,
+        # which is also held for every routine ownership transition.
+        return self._routine_owner is not None
+
     def publish_velocity(self, x: float, y: float, z: float) -> None:
         """One normalised velocity command, through this plugin's rate limiter.
 
@@ -341,7 +348,12 @@ class LocoPlugin:
         with separate limiters can interleave inside a single publish, and the
         SDK has no way to tell us that happened.
         """
-        self._publish_cmd(x, y, z, _get_default_cmd(), 0)
+        # Never acquire _action_lock here: servo holds its own lock, while
+        # explicit actions acquire _action_lock before pausing the servo.
+        # Routine owner writes share the SDK write lock with this check and
+        # publication. Claim/release drops that lock before pausing the servo,
+        # preserving servo -> publisher ordering without an action-lock cycle.
+        self._publish_cmd(x, y, z, _get_default_cmd(), 0, streaming=True)
 
     def _preempt_servo(self, reason: str) -> bool:
         """An explicit action outranks a streaming policy.
@@ -514,9 +526,28 @@ class LocoPlugin:
         pass
 
     def stop(self) -> None:
-        self._stop_move()
+        self.dispatch("stop", {})
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        tool_name = args.get('_tool_name', '')
+        body_action = (
+            action == "stop"
+            or (tool_name == "loco" and action in {"move", "stop_move"})
+            or (tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS)
+            or (tool_name == "semantic_action" and action in _PRESET_ACTIONS)
+            or (tool_name == "action_recording" and action in _TEACHING_ACTIONS)
+        )
+        with self._action_lock:
+            if body_action and self._routine_owner is not None:
+                error = self._routine_owner.preempt_locked(
+                    f"{args.get('_tool_name', 'loco')}.{action}")
+                if error:
+                    return error
+            return self._dispatch_direct(action, args)
+
+    def _dispatch_direct(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -554,9 +585,12 @@ class LocoPlugin:
             result["preempted_loco_servo"] = True
         return result
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
+                     *, streaming: bool = False):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
         with self._lock:
+            if streaming and self.is_motion_reserved():
+                return
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
             if elapsed < 0.002:
