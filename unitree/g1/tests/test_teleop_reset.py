@@ -231,7 +231,8 @@ def _sdk_reset_check(failure):
     client._ClientBase__stub = stub
     client._ClientBase__timeout = .001
     client.Init()
-    assert client.RequestReset() == (0 if failure == 'none' else 3102)
+    from sdk_adapter import request_reset
+    assert request_reset(client) == (0 if failure == 'none' else 3102)
     if failure == 'none':
         assert len(writes) == 1 and writes[0].header.policy.noreply is True
         assert json.loads(writes[0].parameter) == {'data': 99}
@@ -329,7 +330,7 @@ def test_reset_matches_canvas_stop_without_pose_or_vendor_action(tmp_path, failu
         path.mkdir()
         _, arm, sample, advance, sdk, _ = reset_rig(path)
         arm.cfg['reset_pose_path'] = str(path/'does-not-exist.json')
-        arm.arm_client.RequestReset = lambda: pytest.fail('Reset must not send 99')
+        arm.arm_client._CallNoReply = lambda *args: pytest.fail('Reset must not send 99')
         sample['q'] = [.17]*10
         if failure == 'idle':
             arm.session_id = arm.secret = None

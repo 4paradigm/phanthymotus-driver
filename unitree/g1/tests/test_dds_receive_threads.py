@@ -52,29 +52,51 @@ def writer():
 
 
 def reader():
-    from cyclonedds.qos import Qos, Policy
+    import threading
+    import weakref
+    from cyclonedds.qos import Policy
     from cyclonedds.sub import DataReader
+    from sdk_adapter import FeedbackSubscriber
     from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
     from arm_stream import ArmStreamExecutor
     from low_state import LowStateSource
     sdk = initialize()
-    original_take = DataReader.take
+    original_init, original_take = DataReader.__init__, DataReader.take
+    readers = []
+    def track_reader(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # Weak references must not keep a DDS reader alive after Driver Close.
+        readers.append(weakref.ref(self))
+    DataReader.__init__ = track_reader
+    decode_threads = set()
     def slow_take(self, *args, **kwargs):
         # Only G1 LowState decoding is moved off the shared DDS receive thread.
-        if getattr(self, 'slow_decode', False): time.sleep(.004)
+        if getattr(self, 'slow_decode', False):
+            decode_threads.add(threading.current_thread())
+            time.sleep(.004)
         return original_take(self, *args, **kwargs)
     DataReader.take = slow_take
     source = LowStateSource()
     source.start()
-    source_reader = source._subscriber._ChannelSubscriber__channel._Channel__reader._Reader__reader
-    source_reader.slow_decode = True
+    assert len(readers) == 1
+    assert readers[0]().get_qos()[Policy.History] == Policy.History.KeepLast(1)
+    readers[0]().slow_decode = True
     arm = ArmStreamExecutor({}, 'test', None, low_state=source)
     arm.start()
     callback_ages = []
-    other = sdk.ChannelSubscriber('test/sdk_callback', String_)
-    other.Init(lambda msg: callback_ages.append((time.monotonic_ns()//1_000_000-int(msg.data)) & 0xffffffff),
-               10, qos=Qos(Policy.History.KeepLast(1)))
-    sdk_reader = other._ChannelSubscriber__channel._Channel__reader
+    other = FeedbackSubscriber('test/sdk_callback', String_)
+    other.Init(lambda msg: callback_ages.append((time.monotonic_ns()//1_000_000-int(msg.data)) & 0xffffffff))
+    other_worker = other._thread
+    assert readers[-1]().get_qos()[Policy.History] == Policy.History.KeepLast(1)
+    # Also retain the original proof that LowState decode cannot block SDK RPC-style callbacks.
+    sdk_callback_ages = []
+    sdk_callback = sdk.ChannelSubscriber('test/sdk_callback', String_)
+    threads_before = set(threading.enumerate())
+    sdk_callback.Init(lambda msg: sdk_callback_ages.append(
+        (time.monotonic_ns()//1_000_000-int(msg.data)) & 0xffffffff), 10)
+    sdk_workers = [thread for thread in threading.enumerate()
+                   if thread not in threads_before and thread.name == 'ch_reader']
+    assert len(sdk_workers) == 1
     producer = subprocess.Popen([sys.executable, __file__, 'writer'], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
     samples = []
@@ -94,7 +116,9 @@ def reader():
         assert json.loads(stdout)['count'] > 2000
         assert len(callback_ages) > 2000 and len(samples) > 100
         assert max(callback_ages) < 100, callback_ages
-        assert other.MatchedPublisherCount() == 0  # Publisher has closed.
+        assert decode_threads == {source._thread}
+        assert len(sdk_callback_ages) > 2000
+        assert max(sdk_callback_ages) < 100, sdk_callback_ages
         assert max(age for age, _ in samples) < 100, samples
         assert max(age for _, age in samples) < 100, samples
     finally:
@@ -104,9 +128,12 @@ def reader():
         source.stop(); source.stop()
         assert not worker.is_alive() and source.snapshot() is None
         other.Close()
-        other.Close()  # Repeated teardown must not leave a polling/queue thread alive.
-        assert not sdk_reader._Reader__threadReader.is_alive()
+        other.Close()  # Driver teardown is idempotent even though SDK Close is not.
+        assert not other_worker.is_alive() and other._channel is None
+        sdk_callback.Close()  # Restored SDK readers are closed exactly once.
+        assert all(not thread.is_alive() for thread in sdk_workers)
         DataReader.take = original_take
+        DataReader.__init__ = original_init
 
 
 if __name__ == '__main__':

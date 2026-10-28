@@ -5,6 +5,7 @@ import threading
 from threading import Thread, Event
 
 from cyclonedds.domain import Domain, DomainParticipant
+from cyclonedds.internal import dds_c_t
 from cyclonedds.pub import DataWriter
 from cyclonedds.sub import DataReader
 from cyclonedds.topic import Topic
@@ -39,9 +40,6 @@ class Channel:
     class __Reader:
         def __init__(self):
             self.__reader = None
-            # Read-only telemetry migrated from the frozen G1 visible-follow
-            # SDK adapter (2026-09-19); does not change control or QoS semantics.
-            self.__matched_count = 0
             self.__handler = None
             self.__queue = None
             self.__queueEnable = False
@@ -50,7 +48,7 @@ class Channel:
         
         def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
             if handler is None:
-                self.__reader = DataReader(participant, topic, qos, Listener(on_subscription_matched=self.__OnSubscriptionMatched))
+                self.__reader = DataReader(participant, topic, qos)
             else:
                 self.__handler = handler
                 if queueLen > 0:
@@ -59,13 +57,7 @@ class Channel:
                     self.__threadEvent = Event()
                     self.__threadReader = Thread(target=self.__ChannelReaderThreadFunc, name="ch_reader", daemon=True)
                     self.__threadReader.start()
-                self.__reader = DataReader(participant, topic, qos, Listener(on_data_available=self.__OnDataAvailable, on_subscription_matched=self.__OnSubscriptionMatched))
-
-        def __OnSubscriptionMatched(self, reader, status):
-            self.__matched_count = int(status.current_count)
-
-        def MatchedPublisherCount(self):
-            return self.__matched_count
+                self.__reader = DataReader(participant, topic, qos, Listener(on_data_available=self.__OnDataAvailable))
 
         def Read(self, timeout: float = None):
             sample = None
@@ -76,7 +68,7 @@ class Channel:
                     sample = self.__reader.take_one(timeout=duration(seconds=timeout))
             except DDSException as e:
                 _log.warning("[Reader] DDSException: %s", e.msg)
-            except (TimeoutError, StopIteration):
+            except TimeoutError as e:
                 _log.debug("[Reader] take sample timeout")
             except:
                 _log.warning("[Reader] take sample error", exc_info=True)
@@ -84,7 +76,9 @@ class Channel:
             return sample
 
         def Close(self):
-            self.__reader = None
+            if self.__reader is not None:
+                del self.__reader
+
             if self.__queueEnable:
                 self.__threadEvent.set()
                 self.__queue.Interrupt()
@@ -105,7 +99,7 @@ class Channel:
                 _log.warning("[Reader] take sample error", exc_info=True)
                 return
 
-            if not samples:
+            if samples is None:
                 return
 
             # check invalid sample        
@@ -175,7 +169,7 @@ class Channel:
                 return False
 
             return True
-
+        
         def Close(self):
             if self.__writer is not None:
                 del self.__writer
@@ -208,9 +202,6 @@ class Channel:
 
     def Read(self, timeout: float = None):
         return self.__reader.Read(timeout)
-
-    def MatchedPublisherCount(self):
-        return self.__reader.MatchedPublisherCount()
 
     def CloseReader(self):
         self.__reader.Close()
@@ -314,9 +305,9 @@ class ChannelSubscriber:
         self.__channel = factory.CreateChannel(name, type)
         self.__inited = False
 
-    def Init(self, handler: Callable = None, queueLen: int = 0, *, qos: Qos = None):
+    def Init(self, handler: Callable = None, queueLen: int = 0):
         if not self.__inited:
-            self.__channel.SetReader(qos, handler, queueLen)
+            self.__channel.SetReader(None, handler, queueLen)
             self.__inited = True
 
     def Close(self):
@@ -325,9 +316,6 @@ class ChannelSubscriber:
 
     def Read(self, timeout: int = None):
         return self.__channel.Read(timeout)
-
-    def MatchedPublisherCount(self):
-        return self.__channel.MatchedPublisherCount()
 
 """
 " function ChannelFactoryInitialize. used to intialize channel everenment.

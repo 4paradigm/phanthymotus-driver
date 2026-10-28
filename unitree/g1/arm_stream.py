@@ -249,20 +249,18 @@ class ArmStreamExecutor:
             if self._thread and self._thread.is_alive(): return
             if self.session_id: raise ValueError('executor_restart_requires_confirmed_release')
             if self._snapshot_provider is None and self._fsm_subscriber is None:
-                from unitree_sdk2py.core.channel import ChannelSubscriber
+                from sdk_adapter import FeedbackSubscriber
                 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-                from cyclonedds.qos import Qos, Policy
-                latest = Qos(Policy.History.KeepLast(1))
                 from sport_mode_state import SportModeState_
                 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
                 try:
                     if self._low_state is None:
-                        self._subscriber = ChannelSubscriber('rt/lowstate', LowState_)
-                        self._subscriber.Init(self._on_state,0,qos=latest)
-                    self._fsm_subscriber = ChannelSubscriber('rt/sportmodestate', SportModeState_)
-                    self._fsm_subscriber.Init(self._on_fsm,0,qos=latest)
-                    self._arm_observer = ChannelSubscriber('rt/arm_sdk', LowCmd_)
-                    self._arm_observer.Init(lambda msg:None,0)
+                        self._subscriber = FeedbackSubscriber('rt/lowstate', LowState_)
+                        self._subscriber.Init(self._on_state)
+                    self._fsm_subscriber = FeedbackSubscriber('rt/sportmodestate', SportModeState_)
+                    self._fsm_subscriber.Init(self._on_fsm)
+                    self._arm_observer = FeedbackSubscriber('rt/arm_sdk', LowCmd_)
+                    self._arm_observer.Init(lambda msg:None)
                 except Exception:
                     for name in ('_subscriber','_fsm_subscriber','_arm_observer'):
                         sub = getattr(self, name)
@@ -611,7 +609,8 @@ class ArmStreamExecutor:
 
     def _invoke99(self, op):
         try:
-            ret=(self.arm_client.RequestReset() if op.get('operator_reset')
+            from sdk_adapter import request_reset
+            ret=(request_reset(self.arm_client) if op.get('operator_reset')
                  else self.arm_client.ExecuteAction(99))
             with self.lock:
                 op['sdk_return'],op['sdk_returned_ns']=ret,self.clock()

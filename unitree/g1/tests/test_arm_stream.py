@@ -4,7 +4,6 @@ Synthetic calibration is never evidence for robot acceptance. No start() or
 ChannelFactory call is made; the actual protocol, envelope, limiter and release
 state machine run with a deterministic clock.
 """
-import ast
 import hashlib
 import json
 from pathlib import Path
@@ -291,19 +290,6 @@ def test_actual_sdk_stream_writes_only_ten_selected_joints_and_checks_receipt():
     assert channel._last_target==[.2]*10
 
 
-def test_readonly_matched_count_migration_uses_subscription_event():
-    source=DRIVER/'unitree_sdk2py/core/channel.py';tree=ast.parse(source.read_text())
-    channel=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Channel')
-    reader=next(n for n in channel.body if isinstance(n,ast.ClassDef) and n.name=='__Reader')
-    # Compile the actual nested class, retaining its mangled names; no DDS import.
-    ns={'DomainParticipant':object,'Topic':object,'Qos':object,'Callable':object,'DataReader':object,'Event':threading.Event}
-    exec(compile(ast.Module(body=[reader],type_ignores=[]),str(source),'exec'),ns)
-    obj=ns['__Reader']()
-    assert obj.MatchedPublisherCount()==0
-    obj._Reader__OnSubscriptionMatched(None,SimpleNamespace(current_count=2))
-    assert obj.MatchedPublisherCount()==2
-
-
 def test_prepare_requires_fresh_feedback_without_hardware_writes(tmp_path):
     arm, sample, channel, advance, _, _ = rig(tmp_path, claim=False, servo=True)
     arm._prepared = False
@@ -449,7 +435,9 @@ def test_latest_feedback_real_dds_while_motion_lock_is_held():
 
 def check_latest_feedback_dds():
     import time
-    from cyclonedds.qos import Qos, Policy
+    import weakref
+    from cyclonedds.qos import Policy
+    from cyclonedds.sub import DataReader
     from unitree_sdk2py.core import channel as sdk_channel
     from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
@@ -461,15 +449,25 @@ def check_latest_feedback_dds():
     arm = ArmStreamExecutor({}, 'test', None)
     publisher = sdk_channel.ChannelPublisher('rt/lowstate', LowState_)
     publisher.Init()
+    original_init = DataReader.__init__
+    readers = []
+    def track_reader(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        readers.append(weakref.ref(self))
+    DataReader.__init__ = track_reader
     arm.start()
+    workers = [sub._thread for sub in (arm._subscriber, arm._fsm_subscriber, arm._arm_observer)]
     try:
-        deadline = time.monotonic()+5
-        while not arm._subscriber.MatchedPublisherCount() and time.monotonic()<deadline:
-            time.sleep(.01)
-        assert arm._subscriber.MatchedPublisherCount() == 1
-        reader = arm._subscriber._ChannelSubscriber__channel._Channel__reader._Reader__reader
-        assert reader.get_qos()[Policy.History] == Policy.History.KeepLast(1)
+        assert len(readers) == 3
+        assert all(ref().get_qos()[Policy.History] == Policy.History.KeepLast(1) for ref in readers)
+        # Prove delivery without relying on version-specific DDS discovery APIs.
         msg = unitree_hg_msg_dds__LowState_()
+        msg.tick = 999
+        deadline = time.monotonic()+5
+        while arm._snapshot().get('source_tick') != 999 and time.monotonic()<deadline:
+            assert publisher.Write(msg)
+            time.sleep(.01)
+        assert arm._snapshot().get('source_tick') == 999, 'LowState discovery/delivery timed out'
         with arm.lock:
             for tick in range(1000, 1050):
                 msg.tick = tick
@@ -483,4 +481,7 @@ def check_latest_feedback_dds():
             assert arm._snapshot()['q'][0] == pytest.approx(1.049)
     finally:
         arm.stop()
+        arm.stop()
+        assert all(not worker.is_alive() for worker in workers)
         publisher.Close()
+        DataReader.__init__ = original_init

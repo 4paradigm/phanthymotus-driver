@@ -43,7 +43,8 @@ def channels(monkeypatch):
             assert all(not thread.is_alive() for thread in self.read_threads)
             if self.topic == 'rt/lowstate' and self.handler: self.handler(message(9999))
             if self.close_fail == self.topic: raise RuntimeError('reader_close_failed')
-    monkeypatch.setitem(sys.modules, 'unitree_sdk2py.core.channel', SimpleNamespace(ChannelSubscriber=Subscriber))
+    import sdk_adapter
+    monkeypatch.setattr(sdk_adapter, 'FeedbackSubscriber', Subscriber)
     monkeypatch.setitem(sys.modules, 'unitree_sdk2py.idl.unitree_hg.msg.dds_', SimpleNamespace(LowState_=object, LowCmd_=object))
     monkeypatch.setitem(sys.modules, 'cyclonedds.qos', SimpleNamespace(
         Qos=lambda *args: args, Policy=SimpleNamespace(History=SimpleNamespace(KeepLast=lambda n:n))))

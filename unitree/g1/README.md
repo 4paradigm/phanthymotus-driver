@@ -81,7 +81,9 @@ python3 unitree/g1/main.py eth0
 
 - ROS 使用 FastDDS、domain `42` 和 `/opt/phanthy-motus/dds-local.xml`。部署模板设置 `ROS_DOMAIN_ID`、`RMW_IMPLEMENTATION` 和 `FASTRTPS_DEFAULT_PROFILES_FILE`；本地运行也需提供这些环境变量及配置文件。
 - Unitree SDK 使用 CycloneDDS、domain `0` 和启动参数指定的机器人网卡。容器入口默认使用 `eth0`，可通过 `NETWORK_INTERFACE` 修改。
-- G1 的 `LowStateSource` 独占 `rt/lowstate` 订阅，通过独立线程读取和解码，使用 `KeepLast(1)`。状态插件与手臂执行器共享缓存；重复或延迟样本不会刷新源数据时效。停止时先等待读取线程退出，再关闭订阅。其他 SDK 订阅和 RPC 回复沿用 SDK 回调与可选队列机制。
+- G1 的 `LowStateSource` 独占 `rt/lowstate` 订阅，通过独立线程读取和解码，使用 `KeepLast(1)`。状态插件与手臂执行器共享缓存；重复或延迟样本不会刷新源数据时效。停止时先等待读取线程退出，再关闭订阅。
+- [Driver SDK 适配层](sdk_adapter.py)组合 SDK 既有 `ChannelFactory.CreateChannel` / `Channel.SetReader` 接口，不修改 SDK、不创建额外 DDS participant。LowState、执行器 FSM 与 `rt/arm_sdk` 观察订阅均保留最新一帧；需要回调的反馈由 Driver 自有线程执行有界读取，停止后 join 并只关闭底层 reader 一次。其他 SDK 订阅和 RPC 回复仍沿用 SDK 回调与可选队列机制；适配层仅过滤自身读取作用域内由 `StopIteration` 产生的空读告警，其他线程及真实异常日志保留。SDK 读异常可能只返回空值，安全判断仍依赖反馈时效，不能以订阅存在证明反馈有效。
+- 动作 99 的 no-reply 发送封装位于 Driver 适配层，发送成功不代表姿态完成；不改变现有 Reset/停止/交权状态机，也不让原本不发 99 的操作新增动作。
 - [部署模板](deploy/service.yml)使用宿主网络并挂载设备和持久数据目录。相机、麦克风、雷达和空间操作分别依赖对应设备或厂商服务；卡片注册成功不代表已收到传感器数据。
 - `servo` 和 `servo_eef` 默认关闭。启用前核对关节布局、夹爪和腰部配置，并阅读对应模块说明。驱动没有统一的多控制器仲裁，不要让多个控制源同时控制同一组关节。
 - SDK 请求成功与实测动作完成是不同状态。检查返回结果和本体反馈；软件检查不能替代物理动作验收。

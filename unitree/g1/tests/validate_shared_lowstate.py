@@ -47,11 +47,12 @@ def check():
     from device import _LowStateNode, _LOW_LAT_QOS
     from low_state import LowStateSource
 
-    sdk = initialize(); opened = []; decoded = [0]
-    init = sdk.ChannelSubscriber.__init__
+    from sdk_adapter import FeedbackSubscriber
+    initialize(); opened = []; decoded = [0]
+    init = FeedbackSubscriber.__init__
     def track(self, topic, dtype):
         init(self, topic, dtype); opened.append((topic, self))
-    sdk.ChannelSubscriber.__init__ = track
+    FeedbackSubscriber.__init__ = track
     take = DataReader.take
     def count_take(self, *args, **kwargs):
         samples = take(self, *args, **kwargs)
@@ -71,7 +72,7 @@ def check():
             subs = [observer.create_subscription(String, '/probe/'+name,
                 lambda msg, name=name:counts[name].append(time.monotonic()), _LOW_LAT_QOS) for name in counts]
             active_lowstate = [sub for topic,sub in opened if topic == 'rt/lowstate'
-                and sub._ChannelSubscriber__channel._Channel__reader._Reader__reader is not None]
+                and sub._channel is not None]
             assert len(active_lowstate) == 1, 'duplicate LowState reader'
             child = subprocess.Popen([sys.executable, __file__, 'writer'], stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True)
@@ -119,7 +120,7 @@ def check():
         arm.stop(); source.stop()
         for _, sub in opened: sub.Close()
         executor.remove_node(observer); observer.destroy_node(); executor.shutdown(); rclpy.shutdown()
-        DataReader.take = take; sdk.ChannelSubscriber.__init__ = init
+        DataReader.take = take; FeedbackSubscriber.__init__ = init
 
 
 if __name__ == '__main__':

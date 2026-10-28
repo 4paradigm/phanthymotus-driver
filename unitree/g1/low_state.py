@@ -28,17 +28,16 @@ class LowStateSource:
         with self._lifecycle_lock:
             if self._subscriber is not None:
                 return
-            from cyclonedds.qos import Qos, Policy
             from cyclonedds.internal import InvalidSample
-            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from sdk_adapter import FeedbackSubscriber
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-            sub = ChannelSubscriber('rt/lowstate', LowState_)
+            sub = FeedbackSubscriber('rt/lowstate', LowState_)
             with self._lock:
                 self._active = True
                 self._latest = None
                 self._source_tick = self._source_time_ns = None
             try:
-                sub.Init(qos=Qos(Policy.History.KeepLast(1)))
+                sub.Init()
                 self._closed.clear()
                 thread = threading.Thread(target=self._read, args=(sub, InvalidSample),
                                           name='g1-lowstate', daemon=True)
