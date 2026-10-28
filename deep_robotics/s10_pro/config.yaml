@@ -6,7 +6,7 @@ register: true
 core_domain_id: 42
 reader:
   domain_id: 0
-  vendor_profile: ""
+  vendor_profile: "/opt/phanthy-motus/s10-reader-udp.xml"
 motion:
   enabled: false
   refresh_hz: 2.0

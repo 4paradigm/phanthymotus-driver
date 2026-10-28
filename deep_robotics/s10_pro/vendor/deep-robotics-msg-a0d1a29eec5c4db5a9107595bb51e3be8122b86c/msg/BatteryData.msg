@@ -1,0 +1,2 @@
+MetaType header
+BatteryDataValue[] data

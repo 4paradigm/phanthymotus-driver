@@ -563,11 +563,9 @@ def main(argv=None) -> int:
     if initial is None:
         return 0
 
-    # Preserve a private data fd, then route any ROS/library console output to
-    # stderr.  No log line from a native dependency can corrupt the NDJSON pipe.
-    output = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
-    sys.stdout.flush()
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    # ROS console logs use stderr (set by reader_environment). Keep fd 1/2
+    # untouched; stdout remains the parent's NDJSON event pipe.
+    output = sys.stdout
     writer = LatestEventWriter(output)
     rclpy = node = reader = None
     initialized = False

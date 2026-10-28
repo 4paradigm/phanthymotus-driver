@@ -36,9 +36,12 @@ def reader_environment(config, inherited=None):
     reader = config.get("reader", {})
     env.update(ROS_DOMAIN_ID=str(int(reader.get("domain_id", 0))),
                RMW_IMPLEMENTATION="rmw_fastrtps_cpp", PYTHONUNBUFFERED="1",
-               PYTHONDONTWRITEBYTECODE="1", RCUTILS_COLORIZED_OUTPUT="0")
+               PYTHONDONTWRITEBYTECODE="1", RCUTILS_COLORIZED_OUTPUT="0",
+               RCUTILS_LOGGING_USE_STDOUT="0")
     # Only an explicitly supplied vendor profile is forwarded. Never modify it.
     profile = reader.get("vendor_profile")
+    if env.get("S10_REQUIRE_VENDOR_PROFILE") == "1" and not profile:
+        raise ValueError("deployment requires an explicit reader vendor profile")
     if profile:
         if not Path(profile).is_file():
             raise ValueError("configured reader vendor profile is not a file")
