@@ -2542,6 +2542,20 @@ class CameraPlugin:
             print(f"[camera] camera_info for {tool_name} failed: {exc}", flush=True)
             return []
 
+    def depth_intrinsics(self) -> dict:
+        """The RealSense intrinsics for the depth port, or {} before they arrive.
+
+        Added for the `height` card, which lives in this same process: the
+        `motus.camera/1` declaration only travels once, at project start, so a
+        card started before the camera has printed its intrinsics would
+        otherwise be stuck with a fallback. Reading the latest stream lets a
+        measurement begun after the camera settles use the real K.
+        """
+        with self._intrinsics_lock:
+            intrinsics = dict(self._intrinsics)
+        stream = intrinsics.get("depth")
+        return dict(stream) if isinstance(stream, dict) else {}
+
     def get_tools(self) -> list:
         return [
             {

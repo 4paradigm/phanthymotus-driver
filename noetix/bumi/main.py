@@ -170,6 +170,20 @@ class BumiDeviceBundle:
             self._plugins.append(camera_plugin)
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("height", {}).get("enabled", False) and camera_plugin is not None:
+            # Opt-in measurement card. Guarded so a bad config or a missing
+            # numpy cannot take the camera, motion and audio cards down with it.
+            try:
+                from height_card import HeightPlugin
+                self._plugins.append(HeightPlugin(
+                    plugins_cfg["height"], namespace, executor, camera_plugin))
+                print("[bundle] HeightPlugin loaded")
+            except Exception as exc:                          # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                print(f"[bundle] HeightPlugin failed to load; continuing without "
+                      f"it: {exc}", flush=True)
+
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
             motion_state_plugin = MotionStatePlugin(

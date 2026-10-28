@@ -50,6 +50,35 @@ plugins:
     #   systemctl disable --now noetix-video-capture.service
     # Set false only when official App video transfer must retain the camera.
     disable_vendor_capture_service: true
+
+  # Height measurement (`height` card). Reads this bundle's own aligned depth
+  # stream and the camera's runtime intrinsics; no perception card is required
+  # for the depth input itself. Opt-in: an existing deployment loads nothing
+  # until this is enabled.
+  height:
+    enabled: false
+    # 0 means "not calibrated". The card's `calibrate` action fills these from
+    # the floor in view, or measure them once with a tape and an inclinometer;
+    # the camera is fixed, so it is a one-time job per robot. Keep these equal
+    # to the `configSchema` defaults: agent-core sends schema defaults on every
+    # config call, so a disagreement would silently override this file.
+    camera_height_m: 0.0
+    camera_pitch_deg: 0.0     # positive = optical axis below horizontal
+    camera_roll_deg: 0.0
+    # Manual intrinsics, 0 = use the RealSense K the camera card reported.
+    fx: 0.0
+    fy: 0.0
+    cx: 0.0
+    cy: 0.0
+    # Frames averaged per measurement (at least 2; the target must hold still).
+    frames: 5
+    # Depth beyond this is ignored for the floor fit and the target.
+    max_range_m: 4.5
+    # Card-only settings, deliberately not in configSchema so a schema default
+    # cannot silently override this file.
+    max_detection_age_s: 0.8
+    min_valid_ratio: 0.5
+    calibration_frames: 12
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.
