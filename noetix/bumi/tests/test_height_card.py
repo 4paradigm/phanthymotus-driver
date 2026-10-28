@@ -360,7 +360,7 @@ def test_camera_depth_intrinsics_accessor(monkeypatch):
     assert camera.depth_intrinsics()["fx"] == pytest.approx(K["fx"])
 
 
-def test_main_bundle_registers_height_and_manifest_lists_it(monkeypatch):
+def test_main_bundle_registers_height_and_it_is_enabled_by_default(monkeypatch):
     from test_mic_card import _load_device
 
     device, _ = _load_device(monkeypatch)
@@ -385,4 +385,4 @@ def test_main_bundle_registers_height_and_manifest_lists_it(monkeypatch):
     manifest = yaml.safe_load((BUNDLE / "driver.yaml").read_text())
     assert "height" in {card["name"] for card in manifest["cards"]}
     config = yaml.safe_load((BUNDLE / "config.yaml").read_text())
-    assert config["plugins"]["height"]["enabled"] is False
+    assert config["plugins"]["height"]["enabled"] is True

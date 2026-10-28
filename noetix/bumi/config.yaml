@@ -53,10 +53,11 @@ plugins:
 
   # Height measurement (`height` card). Reads this bundle's own aligned depth
   # stream and the camera's runtime intrinsics; no perception card is required
-  # for the depth input itself. Opt-in: an existing deployment loads nothing
-  # until this is enabled.
+  # for the depth input itself. Enabled by default so the card appears as soon
+  # as the driver image is deployed; it still does nothing until a tool call,
+  # and set false to keep it off a deployment that must not offer it.
   height:
-    enabled: false
+    enabled: true
     # 0 means "not calibrated". The card's `calibrate` action fills these from
     # the floor in view, or measure them once with a tape and an inclinometer;
     # the camera is fixed, so it is a one-time job per robot. Keep these equal
