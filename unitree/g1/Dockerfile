@@ -8,7 +8,6 @@ WORKDIR /work
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
-        python3-dev \
         python3-colcon-common-extensions \
         cmake \
         build-essential \
