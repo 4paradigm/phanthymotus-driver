@@ -11,6 +11,7 @@
 - `tts`：通过 U1 SDK `play_text` 进行文本播报，支持打断和 ACP 异步完成回报。真机音量服务不纳入本驱动能力。
 - `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
+- `idle_actions`：独立控制自动待机动作及自动眨眼，支持 `enable`、`disable`、`status`，设置由厂商配置服务持久保存。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
 
 ## 启动与行为控制
@@ -20,6 +21,26 @@
 这些开关不能停止固件内部 Agent 进程、ROS 服务、安全控制环或已经提交的动作。关闭 `visual_behavior` 用于停止固件自主视觉行为，不会屏蔽驱动显式提交的 expression/head 动作；显式动作可通过对应卡片的 `interrupt` 中断。
 
 授权使用只读挂载的 `U1_PRO_AUTH_FILE` JSON 和同目录 license 文件，或受保护的环境变量。认证文件不得提交到仓库或写入镜像。
+
+### 自动待机动作卡片 `idle_actions`
+
+此开关使用厂商原生 ROSA 配置服务，而 `system_controls` 的三个开关走公开 SDK，且在驱动启动时自动关闭。因此单独新增 `idle_actions`，避免把持久的待机偏好混入 SDK 开关和原有 `all` 操作。驱动、卡片的启动和停止均不改写待机偏好，只有显式调用 `enable`/`disable` 才会修改。
+
+在 `idle_actions` 卡片上调用：
+
+| 用途 | 输入 |
+| --- | --- |
+| 关闭自动待机动作 | `{"action":"disable"}` |
+| 开启自动待机动作 | `{"action":"enable"}` |
+| 查询当前设置 | `{"action":"status"}` |
+
+`status` 返回 `{"ok":true,"code":"OK","data":{"enabled":true},"source":"vendor_user_config"}`。其中 `enabled` 是持久配置中的开关值，不是电机是否静止的实时反馈。修改成功返回 `ok`、`requested`、`enabled` 和读回的 `state`；服务拒绝、超时、读回失败或状态不一致均报错。超时后先查询状态，再决定是否重试。
+
+关闭会让当前固件的循环待机分支和自动眨眼分支退出，覆盖 `S017/S018/S019/S007` 待机动作及 `S020/S032/S033` 交互眨眼。固件仍可能执行待处理的一次性 `Z001` 归位，`expression`/`head` 显式请求的动作也仍可执行。这张卡片不提供急停。
+
+调用链为：驱动 → `nsenter` 进入宿主命名空间 → 宿主 Docker → 已运行的 `walker-behavior.behavior-1` → `/sys/config/user_manager/set_config`（`config_msgs/srv/SetConfig`），仅提交 `idle_action_enabled` 布尔值。ROSA 使用 `--no-daemon` 发现服务；收到业务成功响应后，从厂商 `/data/user_data/user_config_center.json` 读回核验。驱动不直接改写该文件，也不重启厂商程序。
+
+该接口依赖当前固件的容器、服务和配置结构，公开 SDK domain `20` 没有对应接口。容器名可在 `config.yaml` 的 `idle_actions.native_container` 中调整。部署沿用现有的 `privileged: true`、`pid: host`、host network/IPC，并由 `util-linux` 提供 `nsenter`；宿主需有 `/usr/bin/docker`，厂商容器内需有 `python3`、`timeout`、`/opt/walker/setup.bash` 和 ROSA。缺少这些依赖时，该卡片操作会报错。
 
 ## 运行环境
 

@@ -486,14 +486,16 @@ class U1CardContractTests(unittest.TestCase):
             initialize_robot=mock.Mock(),
         )
         with mock.patch.object(device, "U1Nodes", return_value=nodes):
-            plugins = device.build_plugins({}, "test", object())
+            plugins = device.build_plugins({"idle_actions": {"native_container": "test-behavior"}}, "test", object())
         nodes.initialize_robot.assert_called_once_with()
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
-            "camera_left", "camera_right",
+            "idle_actions", "camera_left", "camera_right",
         ])
+        idle_card = next(plugin for plugin in plugins if plugin.PREFIX == "idle_actions")
+        self.assertEqual(idle_card.control.container, "test-behavior")
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
             self.assertTrue(plugin.PREFIX)
@@ -1339,6 +1341,42 @@ class U1CardContractTests(unittest.TestCase):
             "success": False, "code": "OK", "data": {"enabled": False},
         }
         self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "vision_enabled", False)["enabled"], False)
+
+    def test_idle_card_lifecycle_preserves_preference_and_explicit_actions_route(self):
+        import device
+
+        control = mock.Mock(spec=device.IdleActionControl)
+        plugin = device.IdleActionsPlugin(control)
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(set(schema["properties"]["action"]["enum"]),
+                         {"start", "stop", "enable", "disable", "status"})
+        self.assertEqual(plugin.start(), {"state": "ready"})
+        self.assertEqual(plugin.stop(), {"state": "idle"})
+        plugin.dispatch("start", {})
+        plugin.dispatch("stop", {})
+        self.assertIsNone(plugin.dispatch("unknown", {}))
+        self.assertEqual(control.mock_calls, [])
+        self.assertIs(plugin.dispatch("status", {}), control.status.return_value)
+        self.assertIs(plugin.dispatch("disable", {}), control.set_enabled.return_value)
+        self.assertIs(plugin.dispatch("enable", {}), control.set_enabled.return_value)
+        self.assertEqual(control.mock_calls, [mock.call.status(), mock.call.set_enabled(False),
+                                             mock.call.set_enabled(True)])
+        control.set_enabled.side_effect = RuntimeError("native service unavailable")
+        with self.assertRaisesRegex(RuntimeError, "native service unavailable"):
+            plugin.dispatch("disable", {})
+
+    def test_system_controls_all_keeps_original_three_sdk_switches(self):
+        import device
+
+        nodes = mock.Mock()
+        plugin = device.SystemControlsPlugin(nodes)
+        plugin.dispatch("disable", {"control": "all"})
+        self.assertEqual(nodes.set_system_enabled.call_args_list, [
+            mock.call("wakeup_enabled", False), mock.call("wakeup_followup", False),
+            mock.call("vision_enabled", False),
+        ])
+        self.assertEqual(plugin.get_tool()["inputSchema"]["properties"]["control"]["enum"],
+                         ["wakeup", "wakeup_followup", "visual_behavior", "all"])
 
     def test_speaker_enables_stereo_output_before_subscribing(self):
         import device
