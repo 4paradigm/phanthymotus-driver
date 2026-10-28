@@ -62,3 +62,19 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+
+  payload_mass:
+    # Experimental motion workflow: opt in explicitly for hardware testing.
+    enabled: false
+    # Native robot status DDS domain, independent of ROS_DOMAIN_ID=42.
+    dds_domain: 0
+    # Empty: discover the unique RobotStatus::StatusData writer, as the raw probe does.
+    dds_status_topic: ""
+    setup_mode: quick
+    arm: left
+    hold_duration_s: 300
+    # Quick prototype: set recording_id in the canvas gear, then calibrate once per session.
+    data_dir: /opt/phanthy-motus/data/bumi/weighing_trials
+    profiles_file: /opt/phanthy-motus/data/bumi/weighing.json
+    hardware_id: ""
+    sdk_version: ""

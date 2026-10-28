@@ -126,8 +126,7 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
-            state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
-            self._plugins.append(state_plugin)
+            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl))
             print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
@@ -183,6 +182,27 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        payload_cfg = plugins_cfg.get("payload_mass", {})
+        if (payload_cfg.get("enabled", False)
+                or os.environ.get("BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS") == "1"):
+            from payload_mass import PayloadMassPlugin
+            from payload_mass_sampling import SharedSampler
+            from payload_mass_feedback import DdsFeedback
+            sampler = SharedSampler()
+            # The SDK getter omits the source timestamp. Read motor/IMU/mode
+            # together from native status DDS; never mix getter-only samples in.
+            feedback = DdsFeedback(sampler, payload_cfg)
+            self._plugins.append(PayloadMassPlugin(
+                payload_cfg, namespace, executor, sampler, loco_plugin,
+                feedback=feedback))
+            print("[bundle] PayloadMassPlugin loaded (read-only native DDS source feedback)")
+
+    def response_published(self, action_id, delivered=True):
+        for plugin in self._plugins:
+            callback = getattr(plugin, "response_published", None)
+            if callback is not None:
+                callback(action_id, delivered)
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
@@ -224,6 +244,8 @@ class BumiDeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
+                    if tool_name == 'payload_mass':
+                        args['_await_response_publication'] = True
                     result = p.dispatch(action, args)
                     return result
         return None
@@ -325,11 +347,20 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    payload_task = name == "payload_mass" and args.get("action") in (
+                        "prepare", "weigh", "stop", "finish")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        delivered = False
+                        try:
+                            ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                            self.wfile.flush()
+                            delivered = True
+                        finally:
+                            if payload_task and result.get("action_id"):
+                                _bundle.response_published(result["action_id"], delivered)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:

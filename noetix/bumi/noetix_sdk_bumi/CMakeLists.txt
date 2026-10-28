@@ -40,6 +40,21 @@ pybind11_add_module(lowcontrol_py src/lowcontrol_pybind.cpp)
 
 pybind11_add_module(mediacontrol_py src/mediacontrol_pybind.cpp)
 
+# Read-only raw status reader; uses the exact bundled status schema/runtime.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(PAYLOAD_SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/payload_mass_schema)
+add_custom_command(
+    OUTPUT ${PAYLOAD_SCHEMA}/Robot_status.cpp ${PAYLOAD_SCHEMA}/Robot_status.hpp
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/../payload_mass_dds_build.py
+            ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${PAYLOAD_SCHEMA}
+    DEPENDS ${CMAKE_SOURCE_DIR}/../payload_mass_dds_build.py
+            ${CMAKE_SOURCE_DIR}/include/Robot_status.hpp
+    VERBATIM)
+add_executable(payload_mass_dds ../payload_mass_dds.cpp ${PAYLOAD_SCHEMA}/Robot_status.cpp)
+target_include_directories(payload_mass_dds BEFORE PRIVATE ${PAYLOAD_SCHEMA})
+target_link_libraries(payload_mass_dds PRIVATE
+    Threads::Threads ${DDS_LIB_DIR}/libddsc.so ${DDS_LIB_DIR}/libddscxx.so)
+
 target_link_libraries(highcontrol_py
     PRIVATE
     driver

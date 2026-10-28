@@ -48,6 +48,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 
 # Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
+COPY payload_mass_dds.cpp /work/payload_mass_dds.cpp
+COPY payload_mass_dds_build.py /work/payload_mass_dds_build.py
 
 # Download pre-built libs (libdriver.a, DDS .so, etc.) from COS
 ARG SDK_LIBS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/noetix/noetix_sdk_bumi_libs.tar.gz
@@ -56,18 +58,22 @@ RUN curl -fsSL ${SDK_LIBS_URL} | tar xz -C /work/noetix_sdk_bumi/
 # Patch CMakeLists: remove onnxruntime dep and executables (we only need pybind .so)
 RUN cd /work/noetix_sdk_bumi && \
     sed -i 's/find_package(onnxruntime REQUIRED)/#find_package(onnxruntime REQUIRED)/' CMakeLists.txt && \
-    sed -i '/add_executable/,/^)/s/^/#/' CMakeLists.txt && \
+    sed -i '/add_executable(example/,/^)/s/^/#/' CMakeLists.txt && \
     sed -i '/target_include_directories(example/,/^)/s/^/#/' CMakeLists.txt && \
     sed -i '/target_link_libraries(example/,/^)/s/^/#/' CMakeLists.txt
 
-# Build the pybind modules used by the current cards
+# Build the bindings and read-only native status reader. Discard intermediates
+# in this same layer; only these three runtime outputs remain in build/.
 RUN cd /work/noetix_sdk_bumi && \
     mkdir -p build && cd build && \
     cmake .. \
         -DCMAKE_CXX_STANDARD=17 \
         -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") && \
-    make -j$(nproc) highcontrol_py mediacontrol_py && \
-    echo "[build] pybind modules built successfully"
+    make -j$(nproc) highcontrol_py mediacontrol_py payload_mass_dds && \
+    strip payload_mass_dds && \
+    python3 -c 'import json, pathlib; p=pathlib.Path("."); keep=[*p.glob("highcontrol_py*.so"), *p.glob("mediacontrol_py*.so"), p/"payload_mass_dds"]; total=sum(f.stat().st_size for f in p.rglob("*") if f.is_file()); sizes={"native_reader_bytes":(p/"payload_mass_dds").stat().st_size,"removed_build_bytes":total-sum(f.stat().st_size for f in keep)}; pathlib.Path("/work/payload_mass_build_size.json").write_text(json.dumps(sizes)); print("[build-size]",json.dumps(sizes))' && \
+    find . -mindepth 1 -maxdepth 1 ! -name 'highcontrol_py*.so' \
+        ! -name 'mediacontrol_py*.so' ! -name payload_mass_dds -exec rm -rf {} +
 
 # Verify .so files exist
 RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
@@ -81,6 +87,13 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY payload_mass.py /work/payload_mass.py
+COPY payload_mass_sampling.py /work/payload_mass_sampling.py
+COPY payload_mass_estimator.py /work/payload_mass_estimator.py
+COPY payload_mass_live.py /work/payload_mass_live.py
+COPY payload_mass_quick.py /work/payload_mass_quick.py
+COPY payload_mass_feedback.py /work/payload_mass_feedback.py
+RUN python3 -c 'import json, pathlib; p=pathlib.Path("/work/payload_mass_build_size.json"); d=json.loads(p.read_text()); d["runtime_python_bytes"]=sum(f.stat().st_size for f in pathlib.Path("/work").glob("payload_mass*.py") if f.name != "payload_mass_dds_build.py"); d["payload_runtime_bytes"]=d["native_reader_bytes"]+d["runtime_python_bytes"]; p.write_text(json.dumps(d)); print("[payload-runtime-size]",json.dumps(d))'
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
 COPY camera_specs.py /work/camera_specs.py

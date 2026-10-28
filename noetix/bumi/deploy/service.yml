@@ -14,6 +14,8 @@ noetix-bumi:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
+    # Opt in per test deployment; ordinary deployments expose no weighing Card.
+    - BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS=${BUMI_ENABLE_EXPERIMENTAL_PAYLOAD_MASS:-0}
   logging:
     driver: local
     options:
