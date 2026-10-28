@@ -14,6 +14,10 @@ pyrealsense2 pipeline、同一个 frameset 上发布，构造和每次 publish �
 测试与文档从已验证的视觉里程计快照移植；`build.sh` 重新带上可选
 `image_repository` 支持，避免 sidecar 镜像与 bundle 的 `noetix/bumi` 仓库互相覆盖。
 
+为缩短构建：runtime 层只显式安装 `rtabmap-odom`、`tf2-ros`、`rclpy`、`python3-numpy`，
+其余 ROS 消息/`message_filters` 由 `rtabmap-odom` 依赖带入；`python3-opencv` 移入可选
+`validation` target（探针用），PyYAML 不再进入镜像（参数文件改为手写渲染）。
+
 ## 已实际执行
 
 - 视觉里程计、打包与相关回归（合并前最后一次执行）：

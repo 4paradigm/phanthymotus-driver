@@ -29,7 +29,7 @@ gyro 的融合参数、IMU 零偏/重力初始化、读时延迟资格（host-re
 | 时间 | 读时延迟资格、IMU 源时间近似 | 仅相机源时间域映射与传输年龄 |
 | 输出 | EKF 融合位姿 + 视觉诊断 | 视觉位姿 + 视觉诊断 |
 | 消费 | loco 距离反馈、保存图绑定 | 无消费者，只读查看 |
-| 依赖 | rtabmap-odom、robot-localization、tf2 | rtabmap-odom、rtabmap-msgs、tf2、message_filters |
+| 依赖 | rtabmap-odom、robot-localization、tf2 | rtabmap-odom、tf2、rclpy、numpy；消息包随 rtabmap 依赖，runtime 无 OpenCV/PyYAML |
 | 标定 | 相机/IMU 外参 + IMU 约定 + 时间资格 | 仅可选相机安装（camera_to_body） |
 | 质量状态 | 视觉 + 诊断 + IMU + 滤波联合判定 | 视觉 + 诊断联合判定 |
 

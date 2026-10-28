@@ -284,7 +284,6 @@ class VisualRuntime:
         if self.frame_id is not None and frame_id != self.frame_id:
             raise ValueError('optical frame changed; reset required')
         self.frame_id = frame_id
-        import cv2
         import numpy as np
         if rgb.encoding != 'bgr8' or depth.encoding != '32FC1' or depth.is_bigendian:
             raise ValueError('unsupported shared image encoding')
@@ -302,9 +301,18 @@ class VisualRuntime:
         if k[0, 0] <= 0 or k[1, 1] <= 0:
             raise ValueError('invalid camera focal length')
         identity = not any(abs(v) > 1e-12 for v in distortion)
-        if self.maps is None and not identity:
-            self.maps = cv2.initUndistortRectifyMap(
-                k, np.asarray(distortion), None, k, (info.width, info.height), cv2.CV_32FC1)
+        if not identity:
+            # Real D435i coefficients are all zero; only a genuinely distorted
+            # camera needs OpenCV, so keep python3-opencv out of the runtime image.
+            try:
+                import cv2
+            except ImportError as exc:
+                raise ValueError(
+                    'camera distortion requires python3-opencv in the image') from exc
+            if self.maps is None:
+                self.maps = cv2.initUndistortRectifyMap(
+                    k, np.asarray(distortion), None, k, (info.width, info.height),
+                    cv2.CV_32FC1)
         if not self.children.children:
             self.launch()
         def pixels(msg, dtype, channels):

@@ -30,7 +30,20 @@ def test_sensor_tool_contract_is_visual_only():
 
 def test_sidecar_image_installs_the_visual_stack_only():
     text = (SIDE/'Dockerfile').read_text()
-    assert 'ros-humble-rtabmap-odom' in text and 'ros-humble-rtabmap-msgs' in text
+    deps = '\n'.join(line for line in text.split('FROM dependencies AS runtime')[0].splitlines()
+                     if not line.strip().startswith('#'))
+    assert 'ros-humble-rtabmap-odom' in deps
+    # rtabmap-odom declares these already; repeating them only slows the apt
+    # layer down without changing the installed set.
+    for redundant in ('ros-humble-rtabmap-msgs', 'ros-humble-sensor-msgs',
+                      'ros-humble-nav-msgs', 'ros-humble-geometry-msgs',
+                      'ros-humble-message-filters'):
+        assert redundant not in deps
+    # OpenCV and PyYAML stay out of the runtime layer: zero-coefficient cameras
+    # never import cv2, and the params file is rendered without PyYAML.
+    assert 'python3-opencv' not in deps and 'python3-yaml' not in text
+    assert 'python3-opencv' in text.split('FROM runtime AS validation')[1]
+    assert 'ros_probe.py' in text.split('FROM runtime AS validation')[1]
     assert 'robot-localization' not in text and 'robot_localization' not in text
     assert 'ekf_node' not in text
     assert '/opt/ros/humble/lib/rtabmap_odom/rgbd_odometry' in text

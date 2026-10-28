@@ -6,11 +6,41 @@ is intentionally absent here.
 """
 from pathlib import Path
 import os
+import re
 import signal
 import subprocess
 
 PACKAGE = 'rtabmap_odom'
 EXECUTABLE = 'rgbd_odometry'
+
+
+def parameter_file(config):
+    """Render the one-node ROS 2 params file without a YAML dependency.
+
+    The image only ever writes this fixed shape (strings, bools, numbers), so a
+    tiny renderer keeps PyYAML out of the runtime layer. Strings that YAML would
+    read as numbers/bools (e.g. the string "0" for ``Odom/ResetCountdown``) are
+    quoted so the ROS parameter type stays String.
+    """
+    plain = re.compile(r'[A-Za-z_][A-Za-z0-9_./-]*')
+    numeric = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+    reserved = {'true', 'false', 'null', 'yes', 'no', 'on', 'off', '~'}
+
+    def scalar(value):
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, (int, float)):
+            return repr(value)
+        text = str(value)
+        if (plain.fullmatch(text) and text.lower() not in reserved
+                and not numeric.fullmatch(text)):
+            return text
+        return "'" + text.replace("'", "''") + "'"
+
+    lines = ["'/**':", '  ros__parameters:']
+    for key, value in config.items():
+        lines.append('    '+scalar(key)+': '+scalar(value))
+    return '\n'.join(lines)+'\n'
 
 
 def parameters(segment, frame_id):
@@ -56,7 +86,6 @@ class ChildProcesses:
         self.children = []
 
     def start(self, segment, frame_id):
-        import yaml
         if self.children:
             raise RuntimeError('old visual odometry process still present')
         if self.prefix is None:
@@ -66,7 +95,7 @@ class ChildProcesses:
         root = '/'+segment
         path = self.directory/'odometry.yaml'
         try:
-            path.write_text(yaml.safe_dump({'/**': {'ros__parameters': config}}))
+            path.write_text(parameter_file(config))
             args = [str(Path(self.prefix(PACKAGE))/'lib'/PACKAGE/EXECUTABLE), '--ros-args',
                     '-r', '__node:=rgbd_odometry', '-r', '__ns:='+root,
                     '--params-file', str(path)]

@@ -27,10 +27,13 @@
 
 ## 独立依赖与镜像构建
 
-普通 Bumi 镜像不承担视觉里程计依赖。独立 Dockerfile 的 `dependencies` target 单独安装
-Humble `rtabmap-odom`、`rtabmap-msgs`、TF、ROS 消息、`message_filters`、OpenCV/NumPy 和
-YAML；**不安装 robot-localization，不安装 ROS RealSense、desktop 或 rviz**。依赖集合
-锁定到 `/opt/bumi-visual-packages.txt`，构建时只验证
+普通 Bumi 镜像不承担视觉里程计依赖。独立 Dockerfile 的 `dependencies` target 只显式安装
+Humble `rtabmap-odom`、`tf2-ros`、`rclpy` 和 `python3-numpy`：`rtabmap-msgs`、`sensor_msgs`、
+`nav_msgs`、`geometry_msgs`、`message_filters` 都已经是 `rtabmap-odom` 的声明依赖，重复列
+不会改变安装集合、只会拖慢 apt 层。`python3-opencv` 不进 runtime（现场 D435i 畸变系数
+全零，sidecar 只在真正需要去畸变时才延迟 import cv2），PyYAML 也不再需要（参数文件由
+后端手写渲染）。**不安装 robot-localization，不安装 ROS RealSense、desktop 或 rviz**。
+依赖集合锁定到 `/opt/bumi-visual-packages.txt`，构建时只验证
 `/opt/ros/humble/lib/rtabmap_odom/rgbd_odometry` 可执行。
 
 构建分两阶段：先构建 `--target dependencies` 并推送，再用其 registry digest 作为
@@ -42,8 +45,10 @@ noetix/bumi-visual-odometry` 把自己的镜像与 bundle 的 `noetix/bumi` 仓�
 
 本轮未执行构建或推送，因此没有可诚实填写的已验证 digest。默认基础镜像 tag 仅供首次
 构建；正式发布把 `VISUAL_BASE_IMAGE` 固定为已验证 digest，并保存依赖/应用 digest、
-`/opt/bumi-visual-packages.txt` 与构建元数据。可选 `validation` target 额外包含
-rosbag2 记录/回放工具；默认 `release`/`runtime` 不包含，普通 Bumi bundle 不继承该层。
+`/opt/bumi-visual-packages.txt` 与构建元数据。可选 `validation` target 才包含
+`python3-opencv`（合成探针）和 rosbag2 记录/回放工具；默认 `release`/`runtime` 不包含，
+普通 Bumi bundle 不继承该层。`./build.sh` 默认构建 release 层，因此不会拉 OpenCV/rosbag2；
+需要跑探针时用 `docker buildx build --target validation ...`。
 
 ## 输入
 
@@ -191,9 +196,14 @@ python3 -m pytest -q tests/test_dockerfile_copies.py tests/test_deploy_restart_p
 RGB 与真实米制深度，给出一米前向运动的真值，真正启动 `rgbd_odometry`，比较静止与一米
 移动、断输入后的 `lost`、重置段变化。只读取/估计，不发机器人命令。**本轮未执行。**
 
-```
-source /opt/ros/humble/setup.bash
-ROS_DOMAIN_ID=239 python3 /work/ros_probe.py --output /data/rendered-probe.json
+探针需要 OpenCV，只随 `validation` target 交付；不要在 runtime/release 镜像里跑：
+
+```sh
+# 构建机
+docker buildx build --platform linux/arm64 --target validation -t <sidecar>:validation .
+# 运行（不接机器人、不占 USB）
+docker run --rm -v /tmp:/data -e ROS_DOMAIN_ID=239 --entrypoint python3 \
+  <sidecar>:validation /work/ros_probe.py --output /data/rendered-probe.json
 ```
 
 ## 局限
