@@ -268,6 +268,11 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                 motion_started = progress_at = changed_at = now
                 if leg is not None:
                     leg.reset_baseline()
+                    # Re-read after the reset: the first motion sample must use
+                    # the cleared baseline, not the calibration-phase leg pose
+                    # (otherwise the 45 deg turn-first decision is random).
+                    source_position = leg.position
+                    source_velocity = leg.velocity
                 origin_yaw = estimator.yaw
                 result['start_yaw_deg'] = math.degrees(origin_yaw)
                 result['stationary_world_acceleration_mps2'] = estimator.baseline
