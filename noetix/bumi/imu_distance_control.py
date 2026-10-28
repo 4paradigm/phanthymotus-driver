@@ -390,7 +390,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                         raise ValueError('stopped outside the target point')
                     result['state'] = 'done'
                     break
-                if now-brake_started > 6:
+                if now-brake_started > 10:
                     raise ValueError('target endpoint did not meet assumed-stationary conditions')
             time.sleep(0.02)
     except Exception as exc:
