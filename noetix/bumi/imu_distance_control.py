@@ -271,7 +271,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                 origin_yaw = estimator.yaw
                 result['start_yaw_deg'] = math.degrees(origin_yaw)
                 result['stationary_world_acceleration_mps2'] = estimator.baseline
-                print('[loco_target] target calibration complete; position is an estimate', flush=True)
+                print('[loco_relative_move] target calibration complete; position is an estimate', flush=True)
             if estimator.signature != last_signature:
                 changed_at, last_signature = now, estimator.signature
             if brake_started is None and now-changed_at > 0.5:

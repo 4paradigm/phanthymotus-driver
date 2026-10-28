@@ -136,7 +136,7 @@ _WORKMODE_NAMES = {
     29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2", 33: "tear",
 }
 
-# ── loco_target: angle math and rotate control law ──────────────────────
+# ── loco_relative_move: angle math and rotate control law ──────────────────────
 
 _ROTATE_TOL_DEG = 2.0
 _ROTATE_WZ_STILL_RAD_S = 0.1
@@ -380,7 +380,7 @@ class LocoPlugin:
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
-        # loco_target rotate bookkeeping, read by _rotate_status.
+        # loco_relative_move rotate bookkeeping, read by _rotate_status.
         self._rotate_lock = threading.Lock()
         self._rotate_stop_event = threading.Event()
         self._rotate_state: dict = {"state": "idle", "last_result": None}
@@ -468,7 +468,7 @@ class LocoPlugin:
     def get_tools(self) -> list:
         return [
             self._loco_tool(),
-            self._loco_target_tool(),
+            self._loco_relative_move_tool(),
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
@@ -523,9 +523,9 @@ class LocoPlugin:
             "topic_out": [],
         }
 
-    def _loco_target_tool(self) -> dict:
+    def _loco_relative_move_tool(self) -> dict:
         return {
-            "name": "loco_target", "type": "actuator", "multiInstance": False,
+            "name": "loco_relative_move", "type": "actuator", "multiInstance": False,
             "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
@@ -681,7 +681,7 @@ class LocoPlugin:
         return False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "config" and args.get('_tool_name') == 'loco_target':
+        if action == "config" and args.get('_tool_name') == 'loco_relative_move':
             return self._apply_distance_config(args)
         if action == "start":
             return {"state": "ready"}
@@ -699,13 +699,13 @@ class LocoPlugin:
         handler = None
         if tool_name == "loco" and action == "move":
             handler = lambda: self._do_move(args)
-        elif tool_name == "loco_target" and action == "rotate":
+        elif tool_name == "loco_relative_move" and action == "rotate":
             return self._do_rotate(args)
-        elif tool_name == "loco_target" and action == "target":
+        elif tool_name == "loco_relative_move" and action == "target":
             return self._do_destination(args, "target")
-        elif tool_name == "loco_target" and action == "status":
+        elif tool_name == "loco_relative_move" and action == "status":
             return self._rotate_status()
-        elif tool_name == "loco_target" and action == "stop_move":
+        elif tool_name == "loco_relative_move" and action == "stop_move":
             handler = self._stop_move
         elif tool_name == "loco" and action == "stop_move":
             handler = self._stop_move
@@ -769,7 +769,7 @@ class LocoPlugin:
                 return {
                     "state": "error",
                     "error": (
-                        "loco_target rotate or distance move in progress; "
+                        "loco_relative_move rotate or distance move in progress; "
                         "wait for it to finish or call stop_move first"
                     ),
                 }
@@ -871,7 +871,7 @@ class LocoPlugin:
                 return {
                     "state": "error",
                     "error": (
-                        "loco_target rotate or target move in progress; wait for it to "
+                        "loco_relative_move rotate or target move in progress; wait for it to "
                         "finish or call stop_move first"
                     ),
                 }
@@ -886,7 +886,7 @@ class LocoPlugin:
                     expected_duration_s = _rotate_timeout_s(value)
                 else:
                     expected_duration_s = min(60.0, 12.0+20.0*value)
-                action_id = f"bumi_loco_target_{uuid.uuid4().hex}"
+                action_id = f"bumi_loco_relative_move_{uuid.uuid4().hex}"
                 worker = threading.Thread(target=self._do_rotate_worker,
                                           args=(args, action_id, action),
                                           daemon=True, name=f"bumi_{action}")
@@ -928,7 +928,7 @@ class LocoPlugin:
             if action == "target" or abs(float(args["angle_deg"])) >= 0.05:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
-                self._preempt_servo(f"loco_target.{action}")
+                self._preempt_servo(f"loco_relative_move.{action}")
                 owns_velocity = True
             result = self._do_rotate_impl(args) if action == "rotate" else self._do_target_impl(args)
             result["action"] = action
@@ -953,7 +953,7 @@ class LocoPlugin:
                           "timeout": "error"}.get(
                               result.get("state") if result else None,
                               "error")
-                _acp_notify(action_id, status, result, "loco_target")
+                _acp_notify(action_id, status, result, "loco_relative_move")
             with self._rotate_lock:
                 self._rotate_state["state"] = "idle"
                 if result is not None:

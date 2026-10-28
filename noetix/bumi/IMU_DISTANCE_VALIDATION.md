@@ -18,7 +18,7 @@
   0.438 / 0.450 m（实测约 0.4 m）和 1.050 m（实测约 1.0 m），误差约 5–10%。
   因此它适合作为独立交叉校验，不适合替代 `accuracy_validated=false` 的结论。
 - 实现：`imu_distance_control.run_distance()` 增加 `dead_reckoned_m` 累计和单向
-  交叉校验；`loco_servo` 提供同一份标定的 `distance_full_scale()`，`loco_target`
+  交叉校验；`loco_servo` 提供同一份标定的 `distance_full_scale()`，`loco_relative_move`
   在 `loco_servo` 启用时传入，未启用时回退模块默认值。
 - 新增测试 4 项：标定值校验、IMU 完全看不到运动时由指令行程停车、IMU 只报告一半
   加速度时由交叉校验停车、`loco_servo` 标定接线。原有 60 项 IMU 距离测试全过。
