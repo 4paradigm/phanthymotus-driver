@@ -1,0 +1,19 @@
+id: bumi-visual-odometry-driver
+name: Bumi RGB-D Visual Odometry
+category: driver
+hardware_provider: noetix
+hardware_model: bumi
+image_name: noetix-bumi-visual-odometry
+# This is a sidecar for the Bumi bundle, not a second hardware model: keep
+# hardware_provider/model = noetix/bumi for the resource-center hardware facet,
+# but give the image its own repository instead of colliding with the bundle's
+# `${REGISTRY}/${IMAGE_NAMESPACE}/noetix/bumi:<TAG>`. build.sh reads this
+# optional key; drivers without it keep using provider/model as before.
+image_repository: noetix/bumi-visual-odometry
+port: 15720
+mcp_url: "http://localhost:15720/mcp"
+description: "独立只读 RGB-D 视觉里程计；复用 Bumi 相机共享原始流，输出 motus.odom/1 供查看，不参与底盘控制"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: rgbd_visual_odometry, type: sensor }

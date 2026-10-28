@@ -447,3 +447,42 @@ ros2 topic echo /<robot_namespace>/motion/state
 ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
+
+## Raw RGB-D sharing for the separate visual-odometry driver
+
+The camera card is unchanged, and so is the single pyrealsense2 capture process
+that owns the device (`device.py::_camera_subprocess`). In addition to the
+existing JPEG and compressed-depth ports, that process now has an **optional,
+read-only** branch (`visual_inputs.py`) that publishes the same frameset as
+standard ROS messages on `/<namespace>/odometry_input/`:
+
+| Topic | Type | Meaning |
+| --- | --- | --- |
+| `rgb` | `sensor_msgs/Image`, bgr8 | source colour frame |
+| `depth` | `sensor_msgs/Image`, 32FC1 metres | depth in the colour grid, scaled by the SDK `depth_scale` |
+| `info` | `sensor_msgs/CameraInfo` | live K/D/R/P; zero coefficients are published as `plumb_bob` |
+| `camera_meta` | `std_msgs/String` | JSON provenance: epoch, per-stream source stamp/frame/clock domain, depth scale, receive time |
+
+This branch never opens a second pipeline, never touches the USB device and never
+publishes a chassis command. It is wrapped in `try`/`except` twice — once around
+construction, once around publish — so a fault here only prints a log line;
+JPEG, depth, intrinsics, photo and video capture continue as before. There is no
+config switch: the branch is present when `visual_inputs.py` is in the image and
+absent (with a loud log line) otherwise; the camera subprocess keeps running in
+both cases.
+
+The consumer is a **separate driver**, `noetix/bumi_visual_odometry/`, not this
+bundle: its own image, its own container (`embodied-noetix-bumi-visual-odometry`,
+MCP port 15720), no USB mount, no privileged mode, `restart: always`, and the
+same local DDS domain 42. It runs only RTAB-Map `rgbd_odometry` and publishes
+`/bumi_visual_odometry/state/odom` (`motus.odom/1`) — visual pose only, no IMU,
+no EKF, no fusion. It defaults to `initializing` and **is not a distance-feedback
+source**: it is not wired into `loco_target`/`loco_servo`, and connecting its
+output to a motion card is not a supported use. Stopping or crashing it does not
+stop the camera, the `camera`/`depth` cards, or any motion card.
+
+The four raw streams are new DDS bandwidth from an already-saturated capture
+path, so the sidecar's CPU/RAM and the media frame rate must be re-measured on
+hardware before this is left running in production. See
+`noetix/bumi_visual_odometry/README.md` for the input contract, quality states,
+optional measured camera mount and the explicit non-goals.

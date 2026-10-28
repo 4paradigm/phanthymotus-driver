@@ -86,6 +86,7 @@ COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
+COPY visual_inputs.py /work/visual_inputs.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
