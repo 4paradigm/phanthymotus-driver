@@ -530,25 +530,25 @@ class LocoPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["rotate", "target", "stop_move", "status"]},
+                    "action": {"type": "string", "enum": ["rotate", "move", "stop_move", "status"]},
                     "x_m": {"type": "number", "minimum": -3, "maximum": 3,
-                            "description": "target 动作：目标点在启动时机身系的前后坐标（米，正=前）。"},
+                            "description": "move 动作：目标点在启动时机身系的前后坐标（米，正=前）。"},
                     "y_m": {"type": "number", "minimum": -3, "maximum": 3,
-                            "description": "target 动作：目标点在启动时机身系的左右坐标（米，正=左）。"},
+                            "description": "move 动作：目标点在启动时机身系的左右坐标（米，正=左）。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
-                    "target": {"params": ["x_m", "y_m"],
+                    "move": {"params": ["x_m", "y_m"],
                                "description": "走到启动机身系下的目标点 (x,y)：朝向目标先转/边走边转，只前进不横移；到达位置容差后停车。距离 0.1–3 m。"},
                     "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
                     "status": {"params": [], "description": "查询当前目标动作、距离反馈来源及估计位移或转角结果。"},
                 },
                 "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
                 # Both actions retain the existing asynchronous ACP contract.
-                "x-completion": {"actions": ["rotate", "target"], "timeout": 120},
+                "x-completion": {"actions": ["rotate", "move"], "timeout": 120},
             },
             "configSchema": {
                 "type": "object",
@@ -701,8 +701,8 @@ class LocoPlugin:
             handler = lambda: self._do_move(args)
         elif tool_name == "loco_relative_move" and action == "rotate":
             return self._do_rotate(args)
-        elif tool_name == "loco_relative_move" and action == "target":
-            return self._do_destination(args, "target")
+        elif tool_name == "loco_relative_move" and action == "move":
+            return self._do_destination(args, "move")
         elif tool_name == "loco_relative_move" and action == "status":
             return self._rotate_status()
         elif tool_name == "loco_relative_move" and action == "stop_move":
@@ -899,14 +899,14 @@ class LocoPlugin:
                         ("requested_angle_deg" if action == "rotate" else "requested_distance_m"): value,
                         **({"requested_target_x_m": float(args.get('x_m')),
                             "requested_target_y_m": float(args.get('y_m'))}
-                           if action == "target" else {}),
+                           if action == "move" else {}),
                         **({'feedback_source': 'leg_odometry_experimental',
-                            'accuracy_validated': False} if action == 'target' else {})}
+                            'accuracy_validated': False} if action == 'move' else {})}
         except Exception as exc:
             terminal = {"state": "error",
                         "error": f"{type(exc).__name__}: {exc}",
                         **({'feedback_source': 'leg_odometry_experimental',
-                            'estimated_quality': 'unavailable', 'accuracy_validated': False} if action == 'target' else {})}
+                            'estimated_quality': 'unavailable', 'accuracy_validated': False} if action == 'move' else {})}
         # No worker accepted the action: release its reservation so a
         # transient SDK or thread-start failure does not leave the card busy.
         with self._rotate_lock:
@@ -925,14 +925,14 @@ class LocoPlugin:
         result = None
         owns_velocity = False
         try:
-            if action == "target" or abs(float(args["angle_deg"])) >= 0.05:
+            if action == "move" or abs(float(args["angle_deg"])) >= 0.05:
                 # Rotation is already reserved, so servo start/resume sees
                 # a busy chassis before this publisher takes ownership.
                 self._preempt_servo(f"loco_relative_move.{action}")
                 owns_velocity = True
             result = self._do_rotate_impl(args) if action == "rotate" else self._do_target_impl(args)
             result["action"] = action
-            if action == 'target':
+            if action == 'move':
                 result.setdefault('feedback_source', 'leg_odometry_experimental')
                 result.setdefault('estimated_quality', 'unavailable')
                 result.setdefault('accuracy_validated', False)

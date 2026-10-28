@@ -619,7 +619,7 @@ def test_target_reports_arrival_at_the_requested_point(monkeypatch):
     monkeypatch.setattr(module.time, 'sleep', advance)
     result = module.run_target(owner, 0.3, 0.4)
     assert result['state'] == 'done', result.get('error')
-    assert result['action'] == 'target'
+    assert result['action'] == 'move'
     assert result['requested_target_x_m'] == 0.3
     assert result['requested_target_y_m'] == 0.4
     assert result['final_position_error_m'] == pytest.approx(0.05, abs=0.01)

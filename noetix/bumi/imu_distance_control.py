@@ -211,7 +211,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
         owner._distance_publish(vx, vyaw)
         commands.append(dict(received_mono_s=time.monotonic(), velocity=[vx, 0.0, vyaw]))
 
-    result = dict(state='error', action='target',
+    result = dict(state='error', action='move',
                   requested_target_x_m=target_x, requested_target_y_m=target_y,
                   requested_distance_m=target_distance,
                   feedback_source='leg_odometry_experimental',

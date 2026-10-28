@@ -273,14 +273,14 @@ def test_loco_relative_move_tool_schema_contract(monkeypatch):
     tool = [t for t in plugin.get_tools() if t['name'] == 'loco_relative_move'][0]
     assert tool['type'] == 'actuator' and tool['multiInstance'] is False
     props = tool['inputSchema']['properties']
-    assert set(props['action']['enum']) == {'rotate', 'target', 'stop_move', 'status'}
+    assert set(props['action']['enum']) == {'rotate', 'move', 'stop_move', 'status'}
     assert 'distance_m' not in props and 'direction' not in props
     assert props['angle_deg']['minimum'] == -360 and props['angle_deg']['maximum'] == 360
     assert tool['inputSchema']['x-hooks'] == {'on_interrupt_motion': {'action': 'stop_move'}}
-    assert tool['inputSchema']['x-completion'] == {'actions': ['rotate', 'target'], 'timeout': 120}
-    assert set(tool['inputSchema']['x-action-params']) == {'rotate', 'target', 'stop_move', 'status'}
+    assert tool['inputSchema']['x-completion'] == {'actions': ['rotate', 'move'], 'timeout': 120}
+    assert set(tool['inputSchema']['x-action-params']) == {'rotate', 'move', 'stop_move', 'status'}
     assert tool['inputSchema']['x-action-params']['rotate']['params'] == ['angle_deg']
-    assert tool['inputSchema']['x-action-params']['target']['params'] == ['x_m', 'y_m']
+    assert tool['inputSchema']['x-action-params']['move']['params'] == ['x_m', 'y_m']
 
 
 def test_target_heading_feedback_sign_is_a_correction(monkeypatch):
@@ -308,12 +308,12 @@ def test_target_action_schema_and_preflight(monkeypatch):
     tool = [t for t in plugin.get_tools() if t['name'] == 'loco_relative_move'][0]
     props = tool['inputSchema']['properties']
     assert 'x_m' in props and 'y_m' in props
-    assert tool['inputSchema']['x-action-params']['target']['params'] == ['x_m', 'y_m']
+    assert tool['inputSchema']['x-action-params']['move']['params'] == ['x_m', 'y_m']
     assert plugin._target_preflight({'x_m': 0.3, 'y_m': 0.4}) == (0.5, None)
     for bad in ({'x_m': 0.0, 'y_m': 0.0}, {'x_m': 3.0, 'y_m': 1.0},
                 {'x_m': 'x', 'y_m': 0.4}, {'x_m': True, 'y_m': True},
                 {'x_m': 0.4, 'y_m': True}, {'x_m': None, 'y_m': 0.4}):
-        result = plugin.dispatch('target', {'_tool_name': 'loco_relative_move', **bad})
+        result = plugin.dispatch('move', {'_tool_name': 'loco_relative_move', **bad})
         assert result['state'] == 'error'
         assert 'action_id' not in result
 
@@ -325,7 +325,7 @@ def test_target_action_forwards_the_point_to_the_worker(monkeypatch):
     calls = []
     def fake(*args, **kwargs):
         calls.append((args, kwargs))
-        return {'state': 'done', 'action': 'target'}
+        return {'state': 'done', 'action': 'move'}
     monkeypatch.setattr(imu_distance_control, 'run_target', fake)
     result = plugin._do_target_impl({'x_m': 0.3, 'y_m': 0.4})
     assert result['state'] == 'done'
