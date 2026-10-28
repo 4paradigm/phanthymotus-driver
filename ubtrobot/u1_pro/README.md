@@ -9,7 +9,7 @@
 
 部署服务使用 `restart: always`，用于主机或 Docker daemon 重启后自动恢复驱动；运维人员手动停止容器后，Docker 会在 daemon 重启时再次启动它。若需临时停用，应通过部署编排管理该服务，而不是依赖 `docker stop` 保持停机。
 - `tts`：通过 U1 SDK `play_text` 进行文本播报，支持打断和 ACP 异步完成回报。真机音量服务不纳入本驱动能力。
-- `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。
+- `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。中断请求后保留当前任务，返回 `interrupt_unconfirmed`，等待匹配 UUID 的厂商终态后才释放占用；服务拒绝或异常不会提前报告 cancelled。
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
 
@@ -31,3 +31,185 @@
 PYTHONPATH=ubtrobot/u1_pro python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py' -v
 python3 scripts/check_service_yml.py ubtrobot/u1_pro
 ```
+
+## head_orientation：水平朝向（首版待真机标定）
+
+**现场物理验收未通过，默认只提供诊断。** `config.yaml` 中
+`head_orientation_experimental_turn: false` 会同时隐藏网页 turn 动作并拒绝直接 API 调用。
+只有部署者为受控实验显式配置为 true 时，才开放下文的 turn 参数和完成协议；
+启用实验开关并不能修复或证明物理控制路径。原有 head/expression/tts 卡片保留。
+
+与 `head` 播放 A010–A014 预设不同，此卡只使用 domain `2` 的
+`/mc/uworld_sound_source`（`uworld_motion_msgs/srv/SoundSource`），
+`with_waist=false`，不接入额外控制后端、不控制五个颈部舵机。
+`start` 只建立客户端、控制器状态订阅和超时定时器，不发送运动。
+
+| 动作 | 参数与结果 |
+|---|---|
+| `start` | 无参数；准备服务与只读反馈 |
+| `turn` | 必填 `confirm: true`、`degree`（有限数，暂限 ±20）、`max_vel`、`max_acc`（有限数，`0 < value <= 0.4`）；可选 `timeout`（1–60 秒，默认 15） |
+| `acknowledge` | 操作者显式确认未知任务的剩余风险后，仅解除本地占用；详见现场恢复说明 |
+| `stop` | 禁止后续 turn；提交前可取消本地检查；提交后返回 `stop_unconfirmed`，不声称物理停止，不调用 SDK 音频中断 |
+| `info` | 当前任务、厂商回执、反馈、反馈年龄、错误、停止能力和角度语义 |
+
+调用示例（由操作者部署后在网页卡片中执行）：
+
+```json
+{"action":"start"}
+{"action":"turn","degree":5,"max_vel":0.1,"max_acc":0.1,"timeout":15,"confirm":true}
+{"action":"info"}
+{"action":"stop"}
+```
+
+本卡按仓库协议声明 `x-is-dangerous: true`。`turn` 还要求严格的布尔 `confirm: true`，
+缺失、false、字符串或数字均不发送请求；只应由操作者在安全条件下显式确认验收调用。
+此确认不等于已标定运动范围，也不会自动移除下述限制。
+
+上例是**待验收的厂商输入**，不是已验证的“小角度低速”保证：`degree` 的正负、
+参考点、绝对/相对语义以及 MotionSetup 速度/加速度单位仍未确认。
+±20 与 0.4 仅为首版输入上限，不能由组件配置的 ±28 度推导为实际安全范围。
+`toy_zone/servo_zone` 与禁用的 `prismatic_setup` 显式置零，其厂商处理仍待验收。
+因此要求显式填写速度与加速度，不隐藏猜测值；厂商拒绝时会显示 status/message。
+
+发送前必须有 1 秒内的 `neck_base_joint` 控制器反馈，并只读确认三类自主行为均关闭。
+不会自动切换行为。与 `head`、`expression`、`tts` 原有任务双向互斥（包括尚未确认结束的音频中断）；占用期间
+`system_controls` 不能开启自主行为（仍可关闭）。这只协调本驱动，不会锁住其他厂商进程。
+
+状态包括 `checking`、`request_pending`、`accepted_unverified`、`settled_unverified`、
+`error`、`outcome_unknown`、`timeout_unconfirmed`、`stop_unconfirmed`。
+服务 success/status=0 只表示接受，**不是到位**。订阅控制器 `actual/desired` 中的
+`neck_base_joint`，原样输出弧度；直线杆不会被当成角度。
+只有 observed desired 相比提交时变化 >0.005 rad，且服务接受后连续新鲜反馈的
+actual/desired 误差 <0.02 rad、desired 每次变化 <0.001 rad 持续 1 秒，才释放共享占用，
+并标记 `settled_unverified`，`arrival_confirmed` 始终为 false。
+这证明观察到的控制器目标收敛，不能证明其对应请求角度、左右方向或中立朝向。
+通过 `action_id` 和 ACP 报告一次任务终态；未验证的朝向结果以 error 终止平台等待，
+不会声称已到位或自动编排下一运动。仅提交前取消可以报告 cancelled。
+
+超时、传输异常、无法观察目标变化或物理停止未确认时保留互斥占用；`start`、
+音频 stop 和迟到回执都不会强行释放。继续收到满足上述条件的反馈后可恢复。
+同角度无目标变化可能一直保持未确认，这是有意保守的限制。请先人工确认机器人状态、
+排除外部控制后再由操作者决定恢复驱动，不能将重启驱动视为停止机器人。
+
+## sound_direction：只读声源方向
+
+已于 2026-10-26 只读核实：domain `20` 的 `/robo/audio/subscribe/doa_event`
+实际为 **`std_msgs/msg/String`**；Adapter 二进制表明其转发 `azimuth/confidence`。
+同运行包 `/opt/walker/audio_msgs/share/audio_msgs/idls/audio_msgs/msg/DoaEvent.msg`
+注明 `azimuth` 单位度、`[-180,180)`、左负右正、0°通常为正前方，confidence 为 `[0,1]`。
+没有收到短时采样事件，未验证实时 JSON 样本、是否相对头部或设备安装坐标。
+解析支持 JSON 对象和 SDK `data` 包裹；不直接订阅仓库的 typed DoaEvent，不增加假消息定义。
+
+```json
+{"action":"start","stale_after":2,"alpha":0.35}
+{"action":"info"}
+{"action":"stop"}
+```
+
+`stale_after` 范围 0.1–60 秒，默认 2；`alpha` 范围 0.01–1，默认 0.35。
+采用环形角度指数平滑，避免 +179/-179 被平均成零；过期或无效事件后重新初始化平滑。
+输出 `/{ros_namespace}/u1_pro/sound_direction`，格式 `data/json`，并在 `info` 返回同一结构：
+
+- `direction_degrees`：有效时的平滑角度；无数据、停用、解析错误或过期时为 null。
+- `valid`、`stale`、`age_seconds`、`received_at`（接收端 Unix 秒）；不把接收时间冒充设备时间。
+- `raw_degrees`、`last_direction_degrees`：保留最近样本供诊断，不表示当前仍有效。
+- `confidence`：SDK 提供的原始置信度，缺失为 null，不合成置信度；不对置信度另设猜测门限。
+- `unit`、`coordinate_convention`、`error`：明确角度约定、参考系限制和解析错误。
+
+新事件立即发布；每秒重发当前状态，无数据和过期也明确输出，stop 发布无效状态并退订。
+不启用厂商唤醒、跟随或自主行为，不向 head_orientation 发送任何命令。
+若未收到事件，应检查既有厂商事件生产条件，卡片不会为获取事件而修改行为开关。
+
+## 网页验收（由操作者执行）
+
+1. 自行部署 PR 的 Try it 镜像，确认原 8 张卡片和新增两张卡片均存在。
+2. 先验收 sound_direction：start 后静默时为无数据/null；在不同方向发声，核对
+   原始角度、左右符号、坐标参考系、真实置信度；静默超过 2 秒确认失效，stop 后不再采集。
+   不要将 DOA 数值直接连到 SoundSource.degree。
+3. 在确认安全作业条件后，head_orientation start/info 应只显示新鲜反馈，不产生动作。
+   三类自主行为需由操作者确认关闭，先校验越界参数拒绝，再单次提交上例并观察实际方向、
+   幅度、服务回执、控制器反馈与保持状态，记录绝对/相对语义及速度单位。
+4. 转向占用期间尝试 head/expression/tts 和开启自主行为，确认被拒绝；
+   测试 stop/超时显示未确认而非完成，观察稳定反馈恢复路径。center 不再作为可执行动作展示；旧客户端调用仍应明确拒绝，不能误报回中。
+5. 回中和物理停止需进一步确认厂商接口后再实现；首版只分别验收两张卡片，不做自动联动。
+
+针对性离线测试：`python3 -m unittest discover -s ubtrobot/u1_pro -p 'test_*.py'`；
+部署配置检查：`python3 scripts/check_service_yml.py ubtrobot/u1_pro`。
+镜像增加本地 `uworld_motion_msgs` 最小接口包，以及标准 `ros-humble-control-msgs` 运行依赖（接口构建阶段不需要 control_msgs）。
+
+## 2026-10-26 现场超时修复与恢复
+
+现场发现：旧版使用 CycloneDDS 时，domain 2 厂商节点的标准只读 GetParameters
+能被发现但等待回复超时；同容器改用 FastDDS、仅绑定 127.0.0.1 后只读请求成功。
+因此头部服务改为独立 FastDDS 子进程，仍只调用同一条 SoundSource 路径；
+音视频、反馈和 domain 42 桥接继续使用原有 CycloneDDS。子进程使用随镜像提供的
+`head-dds-local.xml`，禁用内建传输，仅允许回环；文件或中间件不符则拒绝初始化。
+`ros-humble-rmw-fastrtps-cpp` 是该控制子进程所需运行依赖。
+
+每次 turn 发送前先执行只读 `use_sim_time` 参数往返查询，并检查服务发现。
+检查失败时不发送运动；检查成功也不代表 SoundSource 运动本身已经真机验收。
+本次没有补发旧转向或执行零度探测。
+
+- `center` 已从网页动作下拉菜单移除；旧客户端调用仍明确返回未支持，不能冒充回中。
+- busy 错误增加 `blocking`，给出占用卡片、任务和未确认原因；关键任务状态会输出日志。
+- 未确认请求发送前将任务记录持久化至 `/opt/phanthy-motus/data/u1-head-orientation.json`，
+  文件采用原子替换并同步磁盘；重启后恢复为 `prior_outcome_unknown`，不自动清锁。
+  可用驱动 config 的 `head_orientation_state_file` 调整记录位置，必须可写；写入失败则不发送。
+- 新动作 `acknowledge`：**操作者**观察机器人当前状态并接受未确认请求的剩余风险后，
+  选择此动作、填 `confirm=true` 执行。驱动还要求无仍在等待的服务请求、只读控制链路可往返、
+  至少连续两秒新鲜且稳定的 actual/desired 反馈。它只解除本地占用，
+  返回 `operator_acknowledged_unverified`；不是厂商取消、实际完成或物理停止证明。
+  `info` 可查看 `blocking` 和 `recovery_requires_operator_acknowledgement`。
+
+sound_direction 增加网页可见动作：
+
+- `status`：查看最近方向、有效状态、错误和 `settings`。
+- `configure`：填写 `stale_after`、`alpha`，直接更新采集卡参数，不开启任何厂商行为。
+- 数据流每秒发布一次当前状态，即使没有事件也显示 `data_state=no_data`、
+  `direction_degrees=null`；过期显示 stale，解析异常显示 invalid。
+  `settings` 给出当前生效参数。不会把状态心跳作为新的声源样本或伪造置信度。
+
+更新后网页刷新工具列表；若仍出现旧动作列表，移除并重新添加这两张卡片。
+先看声源卡 status / 数据流，头部卡 info；未知旧任务由操作者决定是否 acknowledge，
+之后才能提交新的 turn。不要将该恢复动作自动接入编排。
+
+平台完成协议：turn 声明 `x-completion`（75 秒平台等待上限），支持关联 `action_id`。
+拒绝、传输异常、驱动超时和无法验证朝向的收敛均报告 error；unknown 仍保留本地占用。
+迟到回执不会重复报告或把 error 改成成功。通信子进程关闭后，下一次只读 probe 可以重建它，
+但不会重放 turn；恢复仍需操作者 acknowledge。
+
+## 2026-10-27 现场验收结果与诊断显示
+
+本节记录失败的物理验收，不能将此前的通信/启动验证当作两项能力已经可用：
+
+- 操作者确认原有 head 预设可以点头，但 head_orientation 的正负 10 度请求未看到物理转头。
+  同次请求厂商 SoundSource 日志存在 success，控制器反馈也有变化并收敛。
+  这只证明该软件链路处理了请求，不足以证明实际颈部执行。
+  运动守护进程还有颈部电机的短时 timeout 警告；目前没有证据证明它就是根因。
+  安装包中的控制器模板和设备驱动配置还存在不同的关节/设备编号层级，
+  未确认实际运行映射前不会修改厂商配置或直接控制单个舵机。
+- 直接订阅 SDK DOA topic，确认发布端存在，但没有方向事件。
+  操作者说话后仍无事件；经明确授权临时打开厂商唤醒进行 60 秒监听，
+  也没有收到 DOA，结束后读回确认已恢复关闭。
+  当前安装的 audio_sense_slow.xml 中 DoaNode 依赖 wakeup_flag，且要求内部麦克风画像。
+  原始音频元数据可读（16 kHz、8 通道、S16LE），不代表唤醒/DOA 算法已经触发。
+  Phanthy 配置的唤醒词与厂商原生音频流程并不必然相同；没有读取到当前实际词表，
+  不会仅凭角色名断言具体唤醒词，也不会自动修改它。
+
+诊断显示改进：
+
+- head_orientation 增加 data/json 输出 `/vision/u1_pro/head_orientation`（namespace 随配置变化）。
+  点击“查看数据流”查看每秒更新的状态；“执行”按钮下面的返回值仍是提交时的快照。
+  `status_message` 显示当前阶段，`vendor_reported_success` 仅表示厂商回执，
+  `arrival_confirmed=false` 仍然表示没有确认物理到位。`lifecycle_state` 区分卡片是否运行。
+- sound_direction 的 `sdk_events_received` 统计卡片运行期间实际收到的 SDK 消息，
+  包括解析失败的消息，以区分“源端没有事件”和“解析出错”。`status` 只读查询厂商唤醒开关，
+  在输出中给出 `vendor_wakeup_enabled`、`source_checked_at` 和查询错误。
+  心跳不执行阻塞 RPC，不会自动开唤醒；开关缓存只代表标注时间的读回值。
+
+这些改进解决进度可见性和无数据原因的展示，不是物理控制或声源定位已验收的声明。
+下一步需要确认本机固件中 SoundSource 到实际颈部驱动的有效路由，以及实际原生唤醒词/
+独立 DOA 触发接口。此前不把两张卡用于自动听声转头编排。
+
+平台资源：head_orientation 使用与现有动作卡片相同的 `u1_action`（优先从 tts 的工具定义获取），
+同时保留驱动内部互斥；禁用实验转向时不声明 turn 的异步完成动作。

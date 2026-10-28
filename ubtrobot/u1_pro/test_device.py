@@ -492,7 +492,7 @@ class U1CardContractTests(unittest.TestCase):
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
-            "camera_left", "camera_right",
+            "head_orientation", "sound_direction", "camera_left", "camera_right",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
@@ -768,7 +768,7 @@ class U1CardContractTests(unittest.TestCase):
                 pass
 
         with mock.patch.object(device, "VideoSharedMemoryReader", IdleReader), \
-                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.01):
+                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.5):
             result = camera.start()
         self.assertEqual(result["state"], "error")
         self.assertIn("unsupported U1 Pro video encoding", result["message"])
@@ -820,7 +820,7 @@ class U1CardContractTests(unittest.TestCase):
                 pass
 
         with mock.patch.object(device, "VideoSharedMemoryReader", IdleReader), \
-                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.01), \
+                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.5), \
                 mock.patch.object(device, "CAMERA_RIGHT_RETRY_TIMEOUT", 0.01):
             result = camera.start()
         self.assertEqual(result["state"], "running")
@@ -1235,7 +1235,8 @@ class U1CardContractTests(unittest.TestCase):
         with mock.patch.object(device, "_acp_notify"):
             result = plugin.dispatch("stop", {})
         self.assertEqual(nodes.interrupts, 1)
-        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["state"], "interrupt_unconfirmed")
+        self.assertIsNotNone(plugin._active)
         self.assertFalse(plugin.running)
 
     def test_tts_rejected_request_clears_active_action_and_notifies_acp(self):
@@ -1278,7 +1279,7 @@ class U1CardContractTests(unittest.TestCase):
         plugin.dispatch("speak", {"text": "hello"})
         with mock.patch.object(device, "_acp_notify"):
             result = plugin.dispatch("interrupt", {})
-        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["state"], "interrupt_unconfirmed")
         self.assertEqual(nodes.interrupts, 1)
 
     def test_tts_schema_has_completion_contract(self):
