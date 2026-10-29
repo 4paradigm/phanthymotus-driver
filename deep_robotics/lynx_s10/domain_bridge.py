@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
+import threading
 
 
 _TYPE_NAMES = {
@@ -25,6 +26,9 @@ class CoreBridge:
         self._processes = {}
         self._counts = {}
         self._dropped = {}
+        self._errors = {}
+        self._last_error = {}
+        self._lock = threading.Lock()
 
     def create_publisher(self, lane: str, topic: str, msg_type):
         from rclpy.serialization import serialize_message
@@ -41,11 +45,16 @@ class CoreBridge:
             self._processes[lane] = process
             self._counts[lane] = 0
             self._dropped[lane] = 0
+            self._errors[lane] = 0
+            self._last_error[lane] = None
         return _BridgePublisher(self, lane, topic, msg_type, serialize_message)
 
     def publish(self, lane, topic, msg_type, serialize_message, message):
         try:
             item = (topic, _TYPE_NAMES[msg_type.__name__], serialize_message(message))
+            process = self._processes.get(lane)
+            if process is None or not process.is_alive():
+                self._restart_lane(lane)
             messages = self._queues[lane]
             try:
                 messages.put_nowait(item)
@@ -58,11 +67,40 @@ class CoreBridge:
                 self._dropped[lane] += 1
             self._counts[lane] += 1
         except Exception as exc:
-            print(f"[dds-bridge] enqueue failed lane={lane} topic={topic}: {exc}", flush=True)
+            self._errors[lane] = self._errors.get(lane, 0) + 1
+            count = self._errors[lane]
+            self._last_error[lane] = repr(exc)
+            if count == 1 or count % 100 == 0:
+                print(f"[dds-bridge] enqueue failed lane={lane} topic={topic} "
+                      f"count={count}: {exc!r}", flush=True)
+
+    def _restart_lane(self, lane):
+        with self._lock:
+            process = self._processes.get(lane)
+            if process is not None and process.is_alive():
+                return
+            old_queue = self._queues.get(lane)
+            if old_queue is not None:
+                try:
+                    old_queue.close()
+                except Exception:
+                    pass
+            messages = self._ctx.Queue(maxsize=1)
+            process = self._ctx.Process(
+                target=_run_publisher,
+                args=(messages, self._profile, self._domain, lane),
+                name=f"lynx-s10-domain42-{lane}", daemon=True,
+            )
+            process.start()
+            self._queues[lane] = messages
+            self._processes[lane] = process
+            print(f"[dds-bridge] restarted lane={lane} pid={process.pid}", flush=True)
 
     def stats(self, lane):
         return {"enqueued": self._counts.get(lane, 0),
                 "dropped": self._dropped.get(lane, 0),
+                "errors": self._errors.get(lane, 0),
+                "last_error": self._last_error.get(lane),
                 "alive": bool(self._processes.get(lane) and self._processes[lane].is_alive())}
 
     def stop(self):
@@ -124,7 +162,10 @@ def _run_publisher(messages, profile, domain, lane):
     publishers = {}
     counts = {}
     try:
-        while rclpy.ok():
+        # The child must remain alive even when the parent executor has no
+        # work temporarily.  Its lifetime is controlled by the queue sentinel,
+        # not by a separate rclpy context inherited from the parent.
+        while True:
             try:
                 item = messages.get(timeout=0.1)
             except queue.Empty:
@@ -149,6 +190,8 @@ def _run_publisher(messages, profile, domain, lane):
             except Exception as exc:
                 print(f"[dds-bridge] publish failed topic={topic}: {exc}", flush=True)
     finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()

@@ -483,6 +483,14 @@ def test_joints_are_reordered_by_data_id_and_name(monkeypatch):
     assert ordered[1] is None
 
 
+def test_joints_ascii_motor_indices_follow_urdf_order(monkeypatch):
+    device = _load_device(monkeypatch)
+    raw = [{"name": list(str(index).encode("ascii")), "data_id": 14000 + index,
+            "position": float(index)} for index in reversed(range(16))]
+    ordered = device._order_joints(raw)
+    assert [joint["position"] for joint in ordered] == list(map(float, range(16)))
+
+
 def test_battery_fields_are_flattened_recursively(monkeypatch):
     device = _load_device(monkeypatch)
     result = {}
@@ -492,6 +500,24 @@ def test_battery_fields_are_flattened_recursively(monkeypatch):
         "battery_0_cells_0_voltage": 3.7,
         "battery_0_cells_1_voltage": 3.8,
     }
+
+
+def test_battery_only_omits_whole_zero_slots(monkeypatch):
+    device = _load_device(monkeypatch)
+    result = {}
+    zero_slot = {"voltage": 0, "current": 0, "cycles": 0,
+                 "battery_temperature": [0.0], "battery_serialnum": [0]}
+    real_slot = {"voltage": 52000, "current": 0, "cycles": 0,
+                 "battery_temperature": [0.0], "battery_level": 0}
+    if not device._all_zero_placeholder(zero_slot):
+        device._flatten_fields(zero_slot, "battery_0", result)
+    if device._all_zero_placeholder(real_slot):
+        raise AssertionError("a powered battery with zero current must not be a placeholder")
+    device._flatten_fields(real_slot, "battery_1", result)
+    assert "battery_0_voltage" not in result
+    assert result["battery_1_current"] == 0
+    assert result["battery_1_cycles"] == 0
+    assert result["battery_1_battery_temperature_0"] == 0.0
 
 
 def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):

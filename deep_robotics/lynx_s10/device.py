@@ -156,20 +156,18 @@ class S10Nodes:
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
             "lidar": topics.get("lidar", "/LIDAR/POINTS"),
         }
-        for key, value in list(self._source_topics.items()):
-            if isinstance(value, (list, tuple)):
-                self._source_topics[key] = value[0] if value else ""
-        self._source_topics.update({key: (value[0] if isinstance(value, (list, tuple)) else value)
-                                    for key, value in camera_topics.items()})
+        self._source_topics.update({key: value for key, value in camera_topics.items()})
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, qos_profile_sensor_data)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, qos_profile_sensor_data)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, qos_profile_sensor_data)
         lidar_topics = topics.get("lidar", "/LIDAR/POINTS")
-        if isinstance(lidar_topics, str):
-            lidar_topics = [lidar_topics]
-        for source_topic in lidar_topics:
-            self.robot.create_subscription(PointCloud2, source_topic, self._forward_lidar, stream_qos)
+        self._lidar_topics = [lidar_topics] if isinstance(lidar_topics, str) else list(lidar_topics)
+        self._active_lidar_source = None
+        for source_topic in self._lidar_topics:
+            self.robot.create_subscription(
+                PointCloud2, source_topic,
+                lambda msg, source=source_topic: self._forward_lidar(source, msg), stream_qos)
         for key, configured_topics in camera_topics.items():
             source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
             for source_topic in source_topics:
@@ -199,7 +197,13 @@ class S10Nodes:
             result = {key: dict(value) for key, value in self._stream_stats.items()}
         for key, spec in self.topics.items():
             try:
-                result[key]["robot_publishers"] = self.robot.count_publishers(self._source_topics[key])
+                source = self._source_topics[key]
+                if key == "lidar":
+                    source = self._lidar_topics
+                    result[key]["robot_publishers"] = sum(
+                        self.robot.count_publishers(topic) for topic in source)
+                else:
+                    result[key]["robot_publishers"] = self.robot.count_publishers(source)
             except (AttributeError, RuntimeError):
                 result[key]["robot_publishers"] = None
             lane = self.bridge.stats(key)
@@ -269,6 +273,8 @@ class S10Nodes:
         batteries = values.get("data", []) if isinstance(values, dict) else []
         payload = {}
         for index, battery in enumerate(batteries if isinstance(batteries, list) else []):
+            if _all_zero_placeholder(battery):
+                continue
             _flatten_fields(battery, f"battery_{index}", payload)
         self._publish_json("battery", payload)
 
@@ -357,7 +363,13 @@ class S10Nodes:
         self.camera_publishers[key].publish(output)
         self._record_stream(key, "published")
 
-    def _forward_lidar(self, msg):
+    def _forward_lidar(self, source, msg=None):
+        if msg is None:
+            msg, source = source, None
+        if self._active_lidar_source is None:
+            self._active_lidar_source = source
+        elif source is not None and source != self._active_lidar_source:
+            return
         self._record_stream("lidar", "received")
         if self.media_workers is not None:
             fields = [(field.name, field.offset) for field in msg.fields]
@@ -480,6 +492,12 @@ def _joint_index(joint):
     if not isinstance(joint, dict):
         return None
     name = _joint_name(joint.get("name", joint.get("Name", "")))
+    # S10 firmware encodes motor indices as ASCII bytes (for example
+    # [49, 53] -> "15").  data_id is a vendor message id, not an index.
+    if name.isdigit():
+        numeric = int(name)
+        if 0 <= numeric < len(JOINT_NAMES):
+            return numeric
     if name in _JOINT_ALIASES:
         return _JOINT_ALIASES[name]
     compact = name.replace("_JOINT", "").replace("_", "")
@@ -498,7 +516,14 @@ def _order_joints(raw_joints):
     if not isinstance(raw_joints, list):
         return [None] * len(JOINT_NAMES)
     ordered = [None] * len(JOINT_NAMES)
-    indexed = [_joint_index(joint) for joint in raw_joints]
+    names = [_joint_name(joint.get("name", joint.get("Name", "")))
+             if isinstance(joint, dict) else "" for joint in raw_joints]
+    numeric_names = [int(name) for name in names if name.isdigit()]
+    use_numeric_names = (len(numeric_names) == len(JOINT_NAMES)
+                         and len(set(numeric_names)) == len(JOINT_NAMES)
+                         and set(numeric_names) == set(range(len(JOINT_NAMES))))
+    indexed = ([int(name) if name.isdigit() else None for name in names]
+               if use_numeric_names else [_joint_index(joint) for joint in raw_joints])
     usable = sum(index is not None for index in indexed)
     if usable:
         # Some firmware revisions number data_id from one through sixteen;
@@ -519,15 +544,29 @@ def _order_joints(raw_joints):
     return (raw_joints + [None] * len(JOINT_NAMES))[:len(JOINT_NAMES)]
 
 
-def _flatten_fields(value, prefix, output):
+def _flatten_fields(value, prefix, output, omit_zero_placeholders=False):
     if isinstance(value, dict):
         for key, child in value.items():
-            _flatten_fields(child, f"{prefix}_{key}", output)
+            _flatten_fields(child, f"{prefix}_{key}", output, omit_zero_placeholders)
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            _flatten_fields(child, f"{prefix}_{index}", output)
+            # Battery firmware reserves fixed-size array slots and fills them
+            # with zero-valued records. Do not expose those placeholders as
+            # dozens of dashboard fields, while retaining real non-zero cells.
+            if omit_zero_placeholders and _all_zero_placeholder(child):
+                continue
+            _flatten_fields(child, f"{prefix}_{index}", output, omit_zero_placeholders)
     else:
         output[prefix] = value
+
+
+def _all_zero_placeholder(value):
+    if isinstance(value, dict):
+        values = value.values()
+        return bool(value) and all(_all_zero_placeholder(item) for item in values)
+    if isinstance(value, (list, tuple)):
+        return bool(value) and all(_all_zero_placeholder(item) for item in value)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
 
 
 def _skeleton_payload(items, raw_joints=None):
@@ -757,10 +796,10 @@ class S10MotionPlugin:
             "roll": {"type": "number", "minimum": -1, "maximum": 1, "description": "翻滚方向归一化控制强度；基础步态不响应"},
             "pitch": {"type": "number", "minimum": -1, "maximum": 1, "description": "俯仰方向归一化控制强度；基础步态不响应"},
             "yaw": {"type": "number", "minimum": -1, "maximum": 1, "description": "偏航归一化控制强度，不是角度"},
-            "vx": {"type": "number", "minimum": -1.67, "maximum": 1.67, "description": "Navigation forward/backward velocity in m/s"},
-            "vy": {"type": "number", "minimum": -0.4, "maximum": 0.4, "description": "Navigation lateral velocity in m/s"},
+            "vx": {"type": "number", "minimum": -1.67, "maximum": 1.67, "description": "前后线速度，范围 -1.67 至 1.67 m/s"},
+            "vy": {"type": "number", "minimum": -0.4, "maximum": 0.4, "description": "左右横移速度，范围 -0.4 至 0.4 m/s"},
             "yaw_rate_deg_s": {"type": "number", "minimum": -57.29577951308232, "maximum": 57.29577951308232,
-                                "description": "Navigation yaw rate in degrees per second; converted to protocol rad/s"},
+                                "description": "偏航角速度，范围 -57.30 至 57.30 度/秒；发送前转换为弧度/秒"},
             "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": 1,
                          "description": "Seconds; -1 is a compatibility alias for 60 seconds; 0 stops immediately"},
         }))
@@ -836,7 +875,9 @@ class S10MotionPlugin:
                         exc = RuntimeError(f"{exc}; zero command failed: {stop_exc}")
                     self._finish(command, "error", {"state": "error", "message": str(exc)})
     def dispatch(self, action, args):
-        if action == "start": return {"state": "ready"}
+        if action == "start":
+            self.start()
+            return {"state": "ready"}
         if action == "stop":
             self._stop_stream()
             return {"state": "idle"}

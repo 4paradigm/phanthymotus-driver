@@ -89,6 +89,12 @@ class MediaWorkers:
 
 
 def _worker(jobs, results, kind, lane):
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+    failures = 0
     while True:
         job = jobs.get()
         if job is None:
@@ -105,7 +111,9 @@ def _worker(jobs, results, kind, lane):
                 packet = _pointcloud(fields, bigendian, width, height, row_step, point_step, data)
             results.put((lane, header, packet), timeout=0.2)
         except Exception as exc:
-            print(f"[media-worker] {lane} failed: {exc}", flush=True)
+            failures += 1
+            if failures == 1 or failures % 100 == 0:
+                print(f"[media-worker] {lane} failed ({failures}): {exc!r}", flush=True)
 
 
 def _jpeg(width, height, step, encoding, data):
