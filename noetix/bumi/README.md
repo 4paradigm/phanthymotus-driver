@@ -480,8 +480,10 @@ estimator.
 
 It is **not** a fusion or feedback source: there is no IMU input, no
 robot_localization/EKF, no visual-inertial fusion, and the output is not wired
-into `loco_target`/`loco_servo`. The card defaults to `initializing` and publishes
-no pose until the estimator is tracking; a fault ends that segment and recovery
+into `loco_target`/`loco_servo`. The shipped config applies the standard
+level-forward mount so `position` uses robot body axes (x forward, y left, z up;
+a convention, not a measured extrinsic). The card defaults to `initializing` and
+publishes no pose until the estimator is tracking; a fault ends that segment and recovery
 starts a fresh one automatically. Stopping the card reaps its own child and
 private topics and disables the shared raw RGB-D branch through
 `/NS/odometry_input/raw_enabled`; the camera, media cards and motion cards keep

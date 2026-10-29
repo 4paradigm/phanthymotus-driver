@@ -206,3 +206,15 @@ def test_visual_results_get_a_longer_grace_than_the_camera_feed():
     # A genuinely stalled estimator still ends the segment.
     assert health.status(2_800_000_000)['status'] == 'lost'
     assert 'stale' in health.status(2_800_000_000)['reason']
+
+
+def test_level_forward_mount_maps_optical_axes_to_robot_body_axes():
+    from noetix.bumi.visual_odometry_contract import quat_matrix
+    R = quat_matrix([-.5, .5, -.5, .5])
+    def apply(vector):
+        return [sum(R[i][j]*vector[j] for j in range(3)) for i in range(3)]
+    # optical x=right -> body y=-left; optical y=down -> body z=-up;
+    # optical z=forward -> body x=forward.
+    assert apply([1., 0., 0.]) == [0., -1., 0.]
+    assert apply([0., 1., 0.]) == [0., 0., -1.]
+    assert apply([0., 0., 1.]) == [1., 0., 0.]

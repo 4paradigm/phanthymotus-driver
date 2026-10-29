@@ -35,8 +35,11 @@ The canvas displays only `status`, `displacement_m`, `position_m`,
 to millimetres for display; the full odometry retains its original precision.
 Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
-Without a measured mount the reference is `rgb_optical` (x right, y down, z
-forward), not robot body axes. Reset starts a new segment and distance origin.
+The shipping `config.yaml` sets a permanent **body-axis convention** for the
+standard level, forward-facing camera: `x` forward, `y` left, `z` up
+(`pose_reference=body`). It is an axis assumption, not a measured extrinsic; the
+pose origin is the camera because the default translation is zero. Reset starts
+a new segment and distance origin.
 
 Only the summary is declared as a canvas output, because the monitor creates a
 panel for every declared output. Existing ROS subscribers can continue using
@@ -88,9 +91,10 @@ reset is required.
   check and the camera 250/500 ms freshness limits are unchanged; RTAB-Map
   results get the 1.5 s grace described above.
 - One segment-scoped static TF `base -> optical` is published before the child
-  starts. Without a measured mount it is identity, so the base frame coincides
-  with the optical frame and the pose stays a camera pose; `publish_tf` of the
-  estimator stays false.
+  starts. The default config uses the standard level-forward rotation
+  (`[-0.5, 0.5, -0.5, 0.5]`, xyzw) with zero translation, so `base` carries robot
+  body axes (x forward, y left, z up) at the camera origin; `publish_tf` of the
+  estimator stays false. Removing calibration falls back to `rgb_optical`.
 - No IMU topic is fused; the unused `imu` remap prevents an accidental live
   subscription.
 - The pose is accepted only when the RTAB-Map `OdomInfo` for the same stamp says
@@ -103,23 +107,39 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 `pose` is `null` unless the segment is tracking; no last pose is repeated.
 
 - `pose`: `{position, quaternion xyzw, frame_id, child_frame_id, covariance[36]}`;
-  `child_frame_id` is `<segment>_base` (identity-coincident with the optical frame
-  unless a mount is measured).
+  `child_frame_id` is `<segment>_base`, which carries robot body axes by default
+  (x forward, y left, z up) at the camera origin.
 - `vendor`: `status` (`initializing`/`tracking`/`lost`), `reason`, `segment_id`,
-  `calibration_id`, `pose_reference` (`rgb_optical` by default, `body` only with
-  a measured mount), `visual_diagnostic`, `input_age_ms`, `visual_stamp_ns`,
+  `calibration_id`, `pose_reference` (`body` by the shipped level-forward
+  assumption; `rgb_optical` only if calibration is removed),
+  `visual_diagnostic`, `input_age_ms`, `visual_stamp_ns`,
   `camera_time_provenance`, `source: rtabmap_rgbd_odometry`, `accuracy_validated:
   false`, `twist_source: null`.
 - `info()` declares an empty `odom_interface.provides` (no velocity axes),
   `pose_drift: unbounded`, `rate_hz: 20`, plus the current quality.
 
-## Optional measured camera mount
+## Camera mount / body-axis convention
 
-Without `calibration` the pose reference is the camera optical origin; this is not
-a claim that the camera-to-body extrinsic is zero. To express the same trajectory
-at a body reference point, set a measured mount in `config.yaml` (or through the
-persistent `configSchema` calibration field, which the platform replays through
-the internal `config` action on start):
+`config.yaml` ships a permanent level-forward convention so the position axes
+match a robot body frame without a manual step:
+
+```yaml
+    calibration:
+      calibration_id: assumed-level-forward-optical-to-body
+      fixed_mount: true
+      camera_to_body:
+        translation: [0.0, 0.0, 0.0]
+        quaternion: [-0.5, 0.5, -0.5, 0.5]
+```
+
+The quaternion maps optical axes to body axes:
+`optical x (right) -> body -y`, `optical y (down) -> body -z`,
+`optical z (forward) -> body +x`. Translation is the camera origin in robot
+coordinates; zeros means the position origin stays at the camera (distance is
+unaffected by this constant offset). Replace both values with a measured mount
+if the camera is not level/forward or the body origin is elsewhere; the platform
+persistent `configSchema` calibration field replays through the internal
+`config` action on start, and a measured mount can also be set in `config.yaml`:
 
 ```yaml
 plugins:
@@ -135,6 +155,7 @@ plugins:
 ```
 
 The values become the base->optical static TF; the estimator path is unchanged.
+If `calibration` is removed entirely, the reference falls back to `rgb_optical`.
 `bumi_model.urdf` has a `waist_yaw_joint` but no camera mount chain, so the body
 reference point and whether the camera crosses the waist joint must be confirmed
 on hardware; do not use the rendered URDF as a measured extrinsic.
@@ -164,7 +185,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `479 passed` in the Bumi suite; the
+ROS-free regression for this branch: `480 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.
