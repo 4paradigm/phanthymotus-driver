@@ -1,15 +1,19 @@
-ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-FROM ${ROS_BASE_IMAGE}
+# BASE_IMAGE must already contain the field-verified ROS2/Pillow runtime.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS verify
 USER root
-WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt /app/
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
-COPY engine.py server.py probe.py smoke_dds.py /app/
-COPY tests/ /app/tests/
+WORKDIR /opt/tron2-yolo-card
+COPY engine.py server.py probe.py smoke_dds.py Dockerfile ./
+COPY tests/ ./tests/
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "import PIL, rclpy" && YOLO_HTTP_TEST=1 python3 -m unittest discover -s tests -v'
+
+FROM ${BASE_IMAGE} AS runtime
+WORKDIR /opt/tron2-yolo-card
+COPY --from=verify /opt/tron2-yolo-card/engine.py /opt/tron2-yolo-card/server.py /opt/tron2-yolo-card/probe.py /opt/tron2-yolo-card/smoke_dds.py ./
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 ROS_LOG_DIR=/tmp/ros-log
-RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c "import engine, server, rclpy" && YOLO_HTTP_TEST=1 python3 -m unittest discover -s tests -v'
 USER 65532:65532
 EXPOSE 15792
 STOPSIGNAL SIGTERM
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && exec python3 /app/server.py"]
+ENTRYPOINT []
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && exec python3 /opt/tron2-yolo-card/server.py"]

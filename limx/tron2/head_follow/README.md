@@ -100,7 +100,8 @@ python3 server.py
 Or build/run this directory as a **separate service**:
 
 ```bash
-docker build -t tron2-head-visual-follow:0.1.3 limx/tron2/head_follow
+docker build --pull=false --network=none --build-arg BASE_IMAGE='existing-local-runtime-image' \
+  -t tron2-head-visual-follow:0.1.3 limx/tron2/head_follow
 docker run -d --name tron2-head-visual-follow --network host --read-only \
   --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
   --pids-limit 64 --memory 128m --cpus 0.5 \
@@ -142,3 +143,29 @@ Site-specific update archives, container replacement journals, personal paths
 and deployment backups are intentionally excluded from this contribution.
 
 With no initial person, at least three fresh empty observations over 1.5 seconds trigger recentering. Already-neutral heads hold without repeat commands; ambiguous matches hold rather than choosing arbitrarily. Camera failures never trigger recentering.
+
+
+## Build scope and infrastructure review
+
+`BASE_IMAGE` is required and must be an existing local, known-good runtime image.
+Use the installed TRON2/follow runtime for head following, and the installed YOLO
+runtime containing ROS2/Pillow for detection. No base image is selected or pulled
+implicitly. There is no apt/pip installation, OS upgrade, new system dependency,
+or model download. An unsuitable base fails its import/tests instead of changing
+the environment. No host filesystem or production container is modified by this
+Dockerfile.
+
+The verify stage runs fake-backend unit tests and loopback HTTP. The final stage
+copies only this card's Python files; newly added tests and build tooling are not
+copied into the runtime image. Existing contents/layers of the chosen base are
+inherited unchanged. Image size is not claimed to be zero-growth: the necessary
+application-code layer must be measured against the selected base on a Docker
+host. Local Docker is unavailable; actual build/size checks remain pending until
+the separate read-only-production verification recipe is run.
+
+The new `driver.yaml` is application metadata for this independent service, not
+an edit to the parent driver or system configuration. This nested service is
+built with the explicit context above; the shared root build script and CI
+workflows are unchanged. No Core code, `/etc` files, systemd units, certificates,
+DDS profiles, original driver config, teaching code or existing images are
+rewritten. Registration/runtime deployment is separate from building the image.
