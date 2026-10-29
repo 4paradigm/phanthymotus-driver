@@ -7,7 +7,8 @@ deep-robotics-lynx-s10:
     - RCUTILS_COLORIZED_OUTPUT=0
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - ROS_LOCALHOST_ONLY=0
-    - NETWORK_INTERFACE=eth0
+    - NETWORK_INTERFACE=${S10_NETWORK_INTERFACE}
+    - ROBOT_NETWORK_CIDR=${S10_ROBOT_NETWORK_CIDR}
   logging:
     driver: local
     options:

@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
 import yaml
 
 from deep_robotics.lynx_s10.basic_server import (
@@ -71,7 +72,10 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
     assert config["mcp_port"] == driver["port"] == 15724
     assert config["mcp_port"] != yaml.safe_load((ROOT / "agibot/AimDK_X2/driver.yaml").read_text())["port"]
-    assert "15724" in (DRIVER / "Dockerfile").read_text()
+    dockerfile = (DRIVER / "Dockerfile").read_text()
+    assert "15724" in dockerfile
+    assert "COPY --from=drdds-builder /lynx_s10_ws/install/" in dockerfile
+    assert "rm -rf build log src" in dockerfile
 
 
 def test_standard_state_cards_read_native_reports(monkeypatch):
@@ -246,14 +250,61 @@ def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp
         def fileno(self): return 1
 
     monkeypatch.setattr(module.socket, "socket", lambda *_args: FakeSocket())
-    monkeypatch.setattr(module.fcntl, "ioctl", lambda *_args: b"\0" * 20 + socket.inet_aton("10.21.33.2"))
+
+    def fake_ioctl(_fd, request_code, _request):
+        value = "10.21.33.2" if request_code == 0x8915 else "255.255.255.0"
+        return b"\0" * 20 + socket.inet_aton(value)
+
+    monkeypatch.setattr(module.fcntl, "ioctl", fake_ioctl)
     monkeypatch.setenv("S10_FASTDDS_PROFILE", str(tmp_path / "fastdds.xml"))
-    profile = module.configure_fastdds_profile({"ros": {"robot_interface": "eth0"}})
+    monkeypatch.setenv("NETWORK_INTERFACE", "eth0")
+    monkeypatch.setenv("ROBOT_NETWORK_CIDR", "10.21.33.0/24")
+    profile = module.configure_fastdds_profile({
+        "ros": {"robot_interface": "eth0"},
+        "basic_server": {"host": "10.21.33.103"},
+    })
     root = ET.parse(profile).getroot()
     addresses = [node.text for node in root.findall(".//{*}interfaceWhiteList/{*}address")]
     assert addresses == ["127.0.0.1", "10.21.33.2"]
     assert root.find(".//{*}useBuiltinTransports").text == "false"
     assert module.os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] == str(profile)
+
+
+def test_main_fails_closed_for_missing_or_mismatched_robot_network(monkeypatch, tmp_path):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    spec = importlib.util.spec_from_file_location("lynx_s10_main_fail_closed_test", DRIVER / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakeSocket:
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def fileno(self): return 1
+
+    monkeypatch.setattr(module.socket, "socket", lambda *_args: FakeSocket())
+    monkeypatch.setattr(
+        module.fcntl, "ioctl",
+        lambda _fd, request_code, _request: b"\0" * 20 + socket.inet_aton(
+            "192.168.1.20" if request_code == 0x8915 else "255.255.255.0"))
+    monkeypatch.setenv("S10_FASTDDS_PROFILE", str(tmp_path / "must-not-exist.xml"))
+    monkeypatch.setenv("NETWORK_INTERFACE", "eth0")
+    monkeypatch.delenv("ROBOT_NETWORK_CIDR", raising=False)
+    config = {"basic_server": {"host": "10.21.33.103"}}
+    with pytest.raises(ValueError, match="ROBOT_NETWORK_CIDR"):
+        module.configure_fastdds_profile(config)
+
+    monkeypatch.setenv("ROBOT_NETWORK_CIDR", "10.21.33.0/24")
+    with pytest.raises(ValueError, match="not on configured robot subnet"):
+        module.configure_fastdds_profile(config)
+    assert not (tmp_path / "must-not-exist.xml").exists()
+
+    monkeypatch.setattr(
+        module.fcntl, "ioctl",
+        lambda _fd, request_code, _request: b"\0" * 20 + socket.inet_aton(
+            "10.21.33.2" if request_code == 0x8915 else "255.255.0.0"))
+    monkeypatch.setenv("ROBOT_NETWORK_CIDR", "10.21.0.0/16")
+    with pytest.raises(ValueError, match="/24 or narrower"):
+        module.configure_fastdds_profile(config)
 
 
 def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):

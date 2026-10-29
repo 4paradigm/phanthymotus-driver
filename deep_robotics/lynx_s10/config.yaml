@@ -6,7 +6,8 @@ navigation_task_timeout: 180
 ros:
   robot_domain_id: 0
   core_domain_id: 42
-  robot_interface: "eth0"
+# Deployment must provide NETWORK_INTERFACE and ROBOT_NETWORK_CIDR. The latter
+# must be the isolated robot-only subnet containing both this host and the S10.
 topics:
   imu: "/IMU"
   joints: "/JOINTS_DATA_10HZ"

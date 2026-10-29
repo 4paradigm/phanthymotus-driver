@@ -65,8 +65,14 @@ OWN_PROFILE = {
                  'domain-42 bridge uses loopback.',
     'deep_robotics/lynx_s10': 'main.py generates one process-wide FastDDS profile '
                               'restricted to loopback and the configured robot-facing '
-                              'interface for both ROS contexts. That interface must be '
-                              'on an isolated robot network; do not use a shared office LAN.',
+                              'interface for both ROS contexts. NETWORK_INTERFACE and '
+                              'ROBOT_NETWORK_CIDR must identify an isolated private robot '
+                              'subnet containing both this host and the S10 basic_server; '
+                              'startup fails closed if selection is missing or inconsistent.',
+}
+
+REQUIRED_ENV = {
+    'deep_robotics/lynx_s10': {'NETWORK_INTERFACE', 'ROBOT_NETWORK_CIDR'},
 }
 
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,
@@ -107,6 +113,10 @@ def check(path, driver):
 
     volumes = [str(v) for v in (svc.get('volumes') or [])]
     env = env_map(svc.get('environment'))
+
+    for name in REQUIRED_ENV.get(driver, set()):
+        if name not in env:
+            bad.append(f'missing required environment passthrough {name!r}')
 
     gap = KNOWN_GAPS.get(driver)
 
