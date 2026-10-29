@@ -50,7 +50,11 @@ frame. An unknown distortion model or a changed frame/intrinsics/epoch latches
 ## Estimation
 
 - One child: `/opt/ros/humble/lib/rtabmap_odom/rgbd_odometry`, private topics
-  `/<segment>/{rgb,depth,info}`, `/<segment>/visual`, `/<segment>/diagnostic`.
+  `/<segment>/rgbd_image`, `/<segment>/visual`, `/<segment>/diagnostic`.
+  The validated pair is forwarded as one `rtabmap_msgs/RGBDImage` with both
+  source image stamps preserved (`subscribe_rgbd: true`), avoiding a second
+  approximate synchronizer waiting for another frame. The 20 ms source-pair
+  check and the 250/500 ms freshness limits are unchanged.
 - One segment-scoped static TF `base -> optical` is published before the child
   starts. Without a measured mount it is identity, so the base frame coincides
   with the optical frame and the pose stays a camera pose; `publish_tf` of the

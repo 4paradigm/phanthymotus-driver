@@ -12,7 +12,7 @@ def test_parameters_are_visual_only():
     assert visual['odom_frame_id'] == 'seg_odom'
     assert visual['publish_tf'] is False
     assert visual['wait_imu_to_init'] is False
-    assert visual['approx_sync'] is True and visual['approx_sync_max_interval'] == .02
+    assert visual['subscribe_rgbd'] is True
     assert visual['Odom/ResetCountdown'] == '0'
     # None of the EKF/fusion parameters may come back.
     for key in ('imu0', 'odom0', 'world_frame', 'two_d_mode', 'odom_frame',
@@ -42,10 +42,10 @@ def test_start_launches_exactly_one_visual_node_with_private_topics(tmp_path):
     assert str(args[0]) == '/opt/ros/humble/lib/rtabmap_odom/rgbd_odometry'
     joined = ' '.join(str(v) for v in args)
     assert 'ekf_node' not in joined and 'robot_localization' not in joined
-    for remap in ('rgb/image:=/seg/rgb', 'depth/image:=/seg/depth',
-                  'rgb/camera_info:=/seg/info', 'odom:=/seg/visual',
+    for remap in ('rgbd_image:=/seg/rgbd_image', 'odom:=/seg/visual',
                   'odom_info:=/seg/diagnostic', 'imu:=/seg/unused_imu'):
         assert remap in joined
+    assert 'rgb/image:=' not in joined and 'depth/image:=' not in joined
     written = (tmp_path/'odometry.yaml').read_text()
     assert 'frame_id: robot_rgb_optical' in written
     assert 'odom_frame_id: seg_odom' in written
@@ -59,7 +59,7 @@ def test_start_launches_exactly_one_visual_node_with_private_topics(tmp_path):
     assert parsed['odom_frame_id'] == 'seg_odom'
     assert parsed['publish_tf'] is False
     assert parsed['Odom/ResetCountdown'] == '0'
-    assert parsed['approx_sync_max_interval'] == .02
+    assert parsed['subscribe_rgbd'] is True
 
 
 def test_start_failure_propagates_and_reaps_nothing_left(tmp_path):

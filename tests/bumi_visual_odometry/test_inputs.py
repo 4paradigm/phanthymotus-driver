@@ -113,7 +113,7 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(raw_ros):
     assert meta['clock_mapping'] == 'device_to_host'
 
 
-def test_estimator_forwarding_keeps_the_byte_array_fast_path(raw_ros):
+def test_estimator_gets_one_validated_pair_with_original_stamps(raw_ros, monkeypatch):
     from noetix.bumi.visual_odometry import VisualOdometryNode
     from noetix.bumi.visual_odometry_contract import Health
 
@@ -133,14 +133,20 @@ def test_estimator_forwarding_keeps_the_byte_array_fast_path(raw_ros):
     node.now = lambda: stamp+20_000_000
     node.frame_id = node.optics = node.maps = None
     node.children = NS(children=[object()])
-    forwarded = {'rgb': [], 'depth': [], 'info': []}
-    for name in forwarded:
-        setattr(node, name+'_pub', NS(publish=forwarded[name].append))
+    monkeypatch.setitem(sys.modules, 'rtabmap_msgs.msg', NS(RGBDImage=NS))
+    forwarded = []
+    node.rgbd_pub = NS(publish=forwarded.append)
 
     node._prepare(stamp)
 
-    for name, source in (('rgb', rgb), ('depth', depth)):
-        output = forwarded[name][0]
+    assert len(forwarded) == 1
+    paired = forwarded[0]
+    assert _stamp(paired) == _stamp(rgb)
+    assert paired.header.frame_id == rgb.header.frame_id
+    assert paired.rgb_camera_info.k == info.k
+    assert paired.depth_camera_info.k == info.k
+    assert _stamp(paired.depth_camera_info) == _stamp(depth)
+    for output, source in ((paired.rgb, rgb), (paired.depth, depth)):
         assert isinstance(output.data, array) and output.data.typecode == 'B'
         assert bytes(output.data) == bytes(source.data)
         assert output.encoding == source.encoding

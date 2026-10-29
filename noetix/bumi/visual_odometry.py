@@ -83,7 +83,7 @@ def parameters(segment, frame_id):
     published before the estimator starts; RTAB-Map looks that up per frame.
     """
     return dict(frame_id=frame_id, odom_frame_id=segment+'_odom', publish_tf=False,
-                wait_imu_to_init=False, approx_sync=True, approx_sync_max_interval=.02,
+                wait_imu_to_init=False, subscribe_rgbd=True,
                 qos=2, qos_camera_info=2, topic_queue_size=5, sync_queue_size=5,
                 **{'Odom/ResetCountdown': '0'})
 
@@ -130,9 +130,7 @@ class ChildProcesses:
             args = [str(Path(self.prefix(PACKAGE))/'lib'/PACKAGE/EXECUTABLE), '--ros-args',
                     '-r', '__node:=rgbd_odometry', '-r', '__ns:='+root,
                     '--params-file', str(path)]
-            for source, target in (('rgb/image', root+'/rgb'),
-                                   ('depth/image', root+'/depth'),
-                                   ('rgb/camera_info', root+'/info'),
+            for source, target in (('rgbd_image', root+'/rgbd_image'),
                                    ('odom', root+'/visual'),
                                    ('odom_info', root+'/diagnostic'),
                                    # No IMU is fused; keep an unused remap so an
@@ -449,30 +447,35 @@ class VisualOdometryNode:
         if np.count_nonzero(np.isfinite(metres) & (metres > .1) & (metres < 10)) < metres.size*.1:
             raise ValueError('insufficient usable depth')
         from sensor_msgs.msg import Image
-        for image, data, encoding, bpp, pub in ((rgb, color, 'bgr8', 3, self.rgb_pub),
-                                                (depth, metres, '32FC1', 4, self.depth_pub)):
+        from rtabmap_msgs.msg import RGBDImage
+        paired = RGBDImage()
+        # The pair is already validated. One message avoids another approximate
+        # synchronizer waiting for a later frame; keep both source stamps intact.
+        for name, image, data, encoding, bpp in (('rgb', rgb, color, 'bgr8', 3),
+                                                ('depth', depth, metres, '32FC1', 4)):
             out = Image()
             out.header = deepcopy(image.header)
             out.header.frame_id = self.frame_id
             out.width, out.height, out.encoding, out.step = rgb.width, rgb.height, encoding, rgb.width*bpp
             out.data = array('B', data.tobytes())
-            pub.publish(out)
+            setattr(paired, name, out)
         info = deepcopy(info)
         info.header.frame_id = self.frame_id
         info.d = [0.]*5
-        self.info_pub.publish(info)
+        paired.header = deepcopy(rgb.header)
+        paired.rgb_camera_info = info
+        paired.depth_camera_info = deepcopy(info)
+        paired.depth_camera_info.header = deepcopy(depth.header)
+        self.rgbd_pub.publish(paired)
 
     def launch(self):
-        from sensor_msgs.msg import Image, CameraInfo
         from nav_msgs.msg import Odometry
-        from rtabmap_msgs.msg import OdomInfo
+        from rtabmap_msgs.msg import OdomInfo, RGBDImage
         from geometry_msgs.msg import TransformStamped
         from tf2_ros import StaticTransformBroadcaster
         root = '/'+self.segment
-        self.rgb_pub = self.node.create_publisher(Image, root+'/rgb', self.qos)
-        self.depth_pub = self.node.create_publisher(Image, root+'/depth', self.qos)
-        self.info_pub = self.node.create_publisher(CameraInfo, root+'/info', self.qos)
-        self.segment_pubs = [self.rgb_pub, self.depth_pub, self.info_pub]
+        self.rgbd_pub = self.node.create_publisher(RGBDImage, root+'/rgbd_image', self.qos)
+        self.segment_pubs = [self.rgbd_pub]
         # RTAB-Map wants a base frame distinct from the image frame and a TF to
         # it. With no measured mount the transform is identity, so the base frame
         # coincides with the optical frame rather than pretending to be a body point.
