@@ -17,6 +17,11 @@ def test_image_installs_the_estimator_and_starts_it_inside_the_bundle():
     text = (BUMI/'Dockerfile').read_text()
     assert 'ros-humble-rtabmap-odom' in text
     assert 'ros-humble-tf2-ros' in text
+    # The base image has no ROS 2 apt source; the Dockerfile has to add the
+    # repository and its keyring (Tsinghua mirror with the official fallback).
+    assert 'mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu' in text
+    assert 'ros-archive-keyring.gpg' in text
+    assert 'trusted=yes' not in text
     assert '/opt/ros/humble/lib/rtabmap_odom/rgbd_odometry' in text
     assert 'from tf2_ros import StaticTransformBroadcaster' in text
     assert 'COPY visual_odometry.py /work/visual_odometry.py' in text

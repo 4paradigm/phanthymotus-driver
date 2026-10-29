@@ -101,8 +101,13 @@ on hardware; do not use the rendered URDF as a measured extrinsic.
 ## Build and probe
 
 The bundle image installs `ros-humble-rtabmap-odom` and `ros-humble-tf2-ros` and
-verifies the estimator executable at build time. Nothing else is added: the
-bundle already ships numpy/OpenCV/PyYAML for its camera and bundle config.
+verifies the estimator executable at build time. The shared ROS base image only
+contains `/opt/ros/humble`; it does **not** configure a ROS 2 apt source, so the
+Dockerfile adds the repository and its signing key first. It defaults to the
+Tsinghua `ros2/ubuntu` mirror (the build machine is in Tencent Cloud) and falls
+back to `packages.ros.org`; override with
+`--build-arg ROS_APT_MIRROR=<url>` when building directly. Nothing else is
+added: the bundle already ships numpy/OpenCV/PyYAML for its camera and config.
 
 A synthetic integration probe is copied into the image. It never opens the
 RealSense device and never commands the chassis; run it in an isolated domain:

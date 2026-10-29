@@ -7,6 +7,11 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
+# The shared ROS base image ships /opt/ros/humble but no ROS 2 apt source, so
+# ros-humble-* packages are not resolvable until this repo is added. Tsinghua
+# mirrors it (the CI builder is in Tencent Cloud); the official archive is kept
+# as a fallback.
+ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
 RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
@@ -38,10 +43,33 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
 
 # RTAB-Map RGB-D odometry, bundle-local (single container). The estimator runs as
 # one supervised child of main.py; no second image/container is deployed.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        ros-humble-rtabmap-odom \
-        ros-humble-tf2-ros && \
+#
+# The base image carries /opt/ros/humble but no ROS 2 apt source (only the Ubuntu
+# archive is configured), so `ros-humble-*` is invisible to apt until the ROS
+# repository and its signing key are added. Try the configured mirror first and
+# fall back to the official archive; the key itself is tried from the same
+# mirror, GitHub and the official key URL.
+RUN set -eu; \
+    if [ ! -s /usr/share/keyrings/ros-archive-keyring.gpg ]; then \
+      for key in https://mirrors.tuna.tsinghua.edu.cn/rosdistro/ros.key \
+                 https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+                 http://packages.ros.org/ros.key; do \
+        if curl -fsSL --retry 2 "$key" -o /usr/share/keyrings/ros-archive-keyring.gpg; then break; fi; \
+      done; \
+    fi; \
+    test -s /usr/share/keyrings/ros-archive-keyring.gpg; \
+    . /etc/os-release; \
+    installed=0; \
+    for src in "${ROS_APT_MIRROR}" https://packages.ros.org/ros2/ubuntu; do \
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \
+        > /etc/apt/sources.list.d/ros2.list; \
+      if apt-get update && apt-get install -y --no-install-recommends \
+           ros-humble-rtabmap-odom ros-humble-tf2-ros; then \
+        installed=1; break; \
+      fi; \
+      rm -rf /var/lib/apt/lists/*; \
+    done; \
+    test "$installed" = 1; \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
