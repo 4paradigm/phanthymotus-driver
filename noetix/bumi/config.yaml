@@ -55,7 +55,14 @@ plugins:
   # 停止本卡片只回收它自己的估计子进程和私有话题，不影响相机/媒体/动作卡。
   # 没有实测相机安装时位姿参考点是光学系（vendor.pose_reference=rgb_optical）。
   visual_odometry:
-    enabled: true
+    # Opt-in: the raw RGB-D branch is full-resolution and the ARM64 media/CPU
+    # impact has not been measured yet, so it is off by default. Set true only
+    # when you intend to run/deploy the read-only visual odometry card.
+    enabled: false
+    # Raw branch sample rate when enabled. The estimator itself needs only a
+    # few Hz and the historical shared capture rate is ~1.8 Hz; 10 Hz bounds
+    # the extra DDS/CPU load instead of duplicating every 30 Hz frame.
+    max_rate_hz: 10
     # calibration:
     #   calibration_id: measured-YYYYMMDD
     #   fixed_mount: true

@@ -2410,8 +2410,14 @@ def _camera_subprocess(namespace: str):
     raw_publish_failures = 0
     if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1":
         try:
+            raw_rate_hz = float(os.environ.get("BUMI_VISUAL_ODOMETRY_MAX_FPS") or 0)
+        except ValueError:
+            raw_rate_hz = 0.0
+        try:
             from visual_inputs import RawCameraPublisher
-            raw_inputs = RawCameraPublisher(node, namespace, pipeline, _QOS)
+            raw_inputs = RawCameraPublisher(
+                node, namespace, pipeline, _QOS,
+                min_interval_s=(1.0/raw_rate_hz if raw_rate_hz > 0 else 0.0))
         except Exception as _e:
             print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
 

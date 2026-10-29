@@ -128,6 +128,8 @@ class BumiDeviceBundle:
         # the visual odometry card is enabled.
         if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
             os.environ["BUMI_VISUAL_ODOMETRY"] = "1"
+            os.environ["BUMI_VISUAL_ODOMETRY_MAX_FPS"] = str(
+                plugins_cfg["visual_odometry"].get("max_rate_hz", 10))
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin

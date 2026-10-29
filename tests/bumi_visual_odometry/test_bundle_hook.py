@@ -128,8 +128,8 @@ def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(
     seen = []
 
     class RawCameraPublisher:
-        def __init__(self, node, namespace, pipeline, qos):
-            seen.append(('init', namespace))
+        def __init__(self, node, namespace, pipeline, qos, **kwargs):
+            seen.append(('init', namespace, kwargs.get('min_interval_s')))
 
         def publish(self, source_frames, aligned_frames):
             assert state.aligned
@@ -138,11 +138,30 @@ def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(
     monkeypatch.setitem(sys.modules, 'visual_inputs',
                         NS(RawCameraPublisher=RawCameraPublisher))
     device._camera_subprocess('robot')
-    assert seen[0] == ('init', 'robot')
+    assert seen[0] == ('init', 'robot', 0.0)
     assert [step[0] for step in seen] == ['init', 'publish']
     assert state.published['/robot/camera/color']
     assert state.published['/robot/camera/depth']
     assert state.stopped
+
+
+def test_raw_rate_cap_comes_from_the_environment(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY_MAX_FPS', '5')
+    seen = []
+
+    class RawCameraPublisher:
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs)
+
+        def publish(self, source_frames, aligned_frames):
+            pass
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(RawCameraPublisher=RawCameraPublisher))
+    device._camera_subprocess('robot')
+    assert seen == [{'min_interval_s': .2}]
 
 
 def test_raw_publish_failures_never_stop_media_production(capture, monkeypatch, capsys):
@@ -152,7 +171,7 @@ def test_raw_publish_failures_never_stop_media_production(capture, monkeypatch, 
     failures = []
 
     class RawCameraPublisher:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def publish(self, source_frames, aligned_frames):
@@ -180,7 +199,7 @@ def test_persistent_raw_failures_are_log_sampled(capture, monkeypatch, capsys):
     failures = []
 
     class RawCameraPublisher:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def publish(self, source_frames, aligned_frames):
@@ -204,7 +223,7 @@ def test_raw_branch_construction_failure_keeps_media_production(capture, monkeyp
     monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
 
     class RawCameraPublisher:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             raise RuntimeError('no ROS camera messages')
 
     monkeypatch.setitem(sys.modules, 'visual_inputs',

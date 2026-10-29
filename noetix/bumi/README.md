@@ -452,7 +452,9 @@ docker logs -f embodied-noetix-bumi
 
 Single container: the estimator runs inside this bundle, not in a sidecar.
 `main.py` starts a `VisualOdometryPlugin` when `plugins.visual_odometry.enabled`
-is true; the plugin supervises exactly one `rtabmap_odom/rgbd_odometry` child and
+is true (**off by default**: full-resolution raw RGB-D and the ARM64 media/CPU
+impact have not been measured, so enabling is an explicit opt-in); the plugin
+supervises exactly one `rtabmap_odom/rgbd_odometry` child and
 publishes a read-only `motus.odom/1` stream on
 `/bumi_visual_odometry/state/odom`. No second image, no second container, no USB
 or privileged change.
@@ -460,7 +462,8 @@ or privileged change.
 The camera card is unchanged, and so is the single pyrealsense2 capture process
 that owns the device (`device.py::_camera_subprocess`). When the card is enabled,
 that process also publishes an optional, read-only raw branch
-(`visual_inputs.py`) on `/<namespace>/odometry_input/`:
+(`visual_inputs.py`) on `/<namespace>/odometry_input/`, sampled at
+`plugins.visual_odometry.max_rate_hz` (default 10 Hz):
 
 | Topic | Type | Meaning |
 | --- | --- | --- |

@@ -34,7 +34,7 @@ def camera_metadata(color, depth, *, epoch, depth_scale, received_ns):
 class RawCameraPublisher:
     """Publish device-timed raw RGB/depth plus CameraInfo and provenance JSON."""
 
-    def __init__(self, node, namespace, pipeline, qos):
+    def __init__(self, node, namespace, pipeline, qos, min_interval_s=0.0):
         from sensor_msgs.msg import Image, CameraInfo
         from std_msgs.msg import String
         self.Image, self.Info, self.String = Image, CameraInfo, String
@@ -46,6 +46,10 @@ class RawCameraPublisher:
         self.epoch = uuid.uuid4().hex
         self.clocks = [ClockMap(), ClockMap()]
         self.error_at = 0
+        # The card is off by default; when enabled, sample the raw branch at a
+        # bounded rate instead of duplicating every 30 Hz capture frame over DDS.
+        self.min_interval_s = max(0.0, float(min_interval_s))
+        self.last_publish = 0.0
 
     def publish(self, source_frames, aligned_frames):
         """Faults in the optional branch never take down the media producer."""
@@ -55,6 +59,10 @@ class RawCameraPublisher:
             color, depth = aligned_frames.get_color_frame(), aligned_frames.get_depth_frame()
             if not all((source_color, source_depth, color, depth)):
                 return
+            now = time.monotonic()
+            if self.min_interval_s > 0 and now - self.last_publish < self.min_interval_s:
+                return
+            self.last_publish = now
             wall = time.time_ns()
             meta = camera_metadata(source_color, source_depth, epoch=self.epoch,
                                    depth_scale=self.depth_scale, received_ns=wall)

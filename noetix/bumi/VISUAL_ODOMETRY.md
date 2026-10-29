@@ -6,11 +6,14 @@ and publishes `motus.odom/1` on `/bumi_visual_odometry/state/odom`. It is not a
 second driver, image or container, and it is not a fusion estimator: no IMU, no
 `robot_localization`/EKF, no visual-inertial fusion, no distance feedback.
 
-The card is enabled by `plugins.visual_odometry.enabled` in `config.yaml`.
-`main.py` then exports `BUMI_VISUAL_ODOMETRY=1` before the camera subprocess
-starts, so the same pyrealsense2 capture process publishes the raw RGB-D branch
-`visual_inputs.py` uses. Disabled means no raw branch, no estimator child, no
-extra DDS traffic.
+The card is controlled by `plugins.visual_odometry.enabled` in `config.yaml`.
+It is **off by default** because the raw RGB-D branch is full-resolution and the
+ARM64 media/CPU impact has not been measured yet; enable it explicitly when the
+card is actually wanted (editing `config.yaml` and rebuilding the bundle, or
+setting the same key in a mounted config). `main.py` then exports
+`BUMI_VISUAL_ODOMETRY=1` before the camera subprocess starts, so the same
+pyrealsense2 capture process publishes the raw RGB-D branch `visual_inputs.py`
+uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 
 ## Card
 
@@ -84,7 +87,8 @@ card's `config` action, not persisted):
 ```yaml
 plugins:
   visual_odometry:
-    enabled: true
+    enabled: true          # off by default in config.yaml; explicit opt-in
+    max_rate_hz: 10        # raw branch sample rate, bounds DDS/CPU load
     calibration:
       calibration_id: measured-YYYYMMDD
       fixed_mount: true

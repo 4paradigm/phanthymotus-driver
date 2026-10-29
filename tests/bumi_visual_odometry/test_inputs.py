@@ -16,6 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+import noetix.bumi.visual_inputs as visual_inputs  # noqa: E402
 from noetix.bumi.visual_inputs import (  # noqa: E402
     RawCameraPublisher, camera_metadata)
 
@@ -73,13 +74,13 @@ def publisher(raw_ros, depth_scale=.002):
     return RawCameraPublisher(node, 'robot', pipeline, object()), messages
 
 
-def frames(model='distortion.brown_conrady', coeffs=None):
+def frames(model='distortion.brown_conrady', coeffs=None, ms=1000):
     intr = NS(fx=100., fy=101., ppx=1., ppy=1., model=model,
               coeffs=[0.]*5 if coeffs is None else coeffs)
-    color = frame(1000)
+    color = frame(ms)
     color.get_data = lambda: np.zeros((2, 3, 3), dtype='u1')
     color.profile = NS(as_video_stream_profile=lambda: NS(intrinsics=intr))
-    depth = frame(1010)
+    depth = frame(ms+10)
     depth.get_data = lambda: np.full((2, 3), 500, dtype='<u2')
     return NS(get_color_frame=lambda: color, get_depth_frame=lambda: depth)
 
@@ -136,3 +137,28 @@ def test_non_finite_coefficients_are_rejected_before_publishing(raw_ros):
     aligned = frames('distortion.brown_conrady', [0., float('nan'), 0., 0., 0.])
     raw_publisher.publish(aligned, aligned)
     assert not any(messages.values())
+
+
+def test_raw_publisher_samples_at_the_configured_max_rate(raw_ros, monkeypatch):
+    raw_publisher, messages = publisher(raw_ros)
+    raw_publisher.min_interval_s = .1
+    raw_publisher.last_publish = 0.
+
+    class FakeTime:
+        ticks = iter([100., 100.05, 100.2])
+        monotonic_ns = staticmethod(lambda: 1_000_000_000)
+        time_ns = staticmethod(lambda: 1_000_000_000)
+
+        @staticmethod
+        def monotonic():
+            return next(FakeTime.ticks)
+
+    monkeypatch.setattr(visual_inputs, 'time', FakeTime)
+    first, second, third = frames(), frames(), frames(ms=1030)
+    raw_publisher.publish(first, first)     # t=100.00 -> publish
+    raw_publisher.publish(second, second)   # t=100.05 -> skipped
+    raw_publisher.publish(third, third)     # t=100.20 -> publish
+    assert len(messages['/robot/odometry_input/rgb']) == 2
+    assert len(messages['/robot/odometry_input/depth']) == 2
+    assert len(messages['/robot/odometry_input/info']) == 2
+    assert len(messages['/robot/odometry_input/camera_meta']) == 2
