@@ -47,10 +47,31 @@ def _post_acp_callback(action_id, status, result, tool_name):
                           "tool": tool_name, "ts": time.time()}).encode()
     request = urllib.request.Request(url + "/api/acp/complete", data=payload,
                                      headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(request, timeout=5, context=context) as response:
-        if not 200 <= response.status < 300:
-            raise RuntimeError(f"Agent Core returned HTTP {response.status}")
-    print(f"[ACP] {tool_name} {action_id}: callback sent ({status})", flush=True)
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=3, context=context) as response:
+                if not 200 <= response.status < 300:
+                    raise RuntimeError(f"Agent Core returned HTTP {response.status}")
+            print(f"[ACP] {tool_name} {action_id}: callback sent ({status}) attempt={attempt}", flush=True)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(0.2 * attempt)
+    raise RuntimeError(f"ACP callback failed after 3 attempts: {last_error}")
+
+
+def _notify_acp_async(action_id, status, result, tool_name):
+    """Deliver completion without blocking the motion/navigation worker."""
+    def worker():
+        try:
+            _post_acp_callback(action_id, status, result, tool_name)
+        except Exception as exc:
+            endpoint = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+            print(f"[ACP] callback failed action_id={action_id} status={status} "
+                  f"endpoint={endpoint}/api/acp/complete error={str(exc)[:180]}", flush=True)
+    threading.Thread(target=worker, daemon=True, name=f"s10-acp-{tool_name}").start()
 
 
 class S10Nodes:
@@ -100,6 +121,11 @@ class S10Nodes:
             for key in camera_topics
         }
         topics = config.get("topics", {})
+        # Camera and lidar publishers on the S10 use sensor-data QoS.  A
+        # RELIABLE subscription cannot match a BEST_EFFORT publisher, so use
+        # the standard volatile/BEST_EFFORT profile for both sides of these
+        # high-rate streams.
+        stream_qos = qos_profile_sensor_data
         self._stream_lock = threading.Lock()
         self._stream_stats = {
             name: {"received": 0, "published": 0, "dropped": 0,
@@ -118,20 +144,30 @@ class S10Nodes:
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
             "lidar": topics.get("lidar", "/LIDAR/POINTS"),
         }
-        self._source_topics.update(camera_topics)
+        for key, value in list(self._source_topics.items()):
+            if isinstance(value, (list, tuple)):
+                self._source_topics[key] = value[0] if value else ""
+        self._source_topics.update({key: (value[0] if isinstance(value, (list, tuple)) else value)
+                                    for key, value in camera_topics.items()})
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, qos_profile_sensor_data)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, qos_profile_sensor_data)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, qos_profile_sensor_data)
-        self.robot.create_subscription(PointCloud2, topics.get("lidar", "/LIDAR/POINTS"), self._forward_lidar, qos_profile_sensor_data)
-        for key, source_topic in camera_topics.items():
-            if source_topic.endswith("/compressed"):
-                self.robot.create_subscription(CompressedImage, source_topic,
-                    lambda msg, camera=key: self._forward_compressed_camera(camera, msg),
-                    qos_profile_sensor_data)
-            else:
-                self.robot.create_subscription(Image, source_topic,
-                    lambda msg, camera=key: self._forward_camera(camera, msg), qos_profile_sensor_data)
+        lidar_topics = topics.get("lidar", "/LIDAR/POINTS")
+        if isinstance(lidar_topics, str):
+            lidar_topics = [lidar_topics]
+        for source_topic in lidar_topics:
+            self.robot.create_subscription(PointCloud2, source_topic, self._forward_lidar, stream_qos)
+        for key, configured_topics in camera_topics.items():
+            source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
+            for source_topic in source_topics:
+                if source_topic.endswith("/compressed"):
+                    self.robot.create_subscription(CompressedImage, source_topic,
+                        lambda msg, camera=key: self._forward_compressed_camera(camera, msg),
+                        stream_qos)
+                else:
+                    self.robot.create_subscription(Image, source_topic,
+                        lambda msg, camera=key: self._forward_camera(camera, msg), stream_qos)
 
     def _record_stream(self, key, stage):
         now = time.time()
@@ -170,7 +206,25 @@ class S10Nodes:
     def _forward_imu(self, msg):
         self._record_stream("imu", "received")
         from common.vendor_runtime import jsonable
-        self._publish_json("imu", jsonable(msg))
+        values = jsonable(msg)
+        # Keep the dashboard state card flat, matching the Unitree drivers.
+        payload = {}
+        for group in ("orientation", "angular_velocity", "linear_acceleration"):
+            value = values.get(group, {}) if isinstance(values, dict) else {}
+            if isinstance(value, dict):
+                for axis in ("x", "y", "z", "w"):
+                    if axis in value:
+                        payload[f"{group}_{axis}"] = value[axis]
+        header = values.get("header", {}) if isinstance(values, dict) else {}
+        stamp = header.get("stamp", {}) if isinstance(header, dict) else {}
+        if isinstance(stamp, dict):
+            for key in ("sec", "nanosec"):
+                if key in stamp:
+                    payload[key] = stamp[key]
+        for key, value in (values.items() if isinstance(values, dict) else ()):
+            if key not in {"header", "orientation", "angular_velocity", "linear_acceleration"}:
+                payload[key] = value
+        self._publish_json("imu", payload)
 
     def _forward_joints(self, msg):
         self._record_stream("joints", "received")
@@ -181,13 +235,36 @@ class S10Nodes:
         joints = values.get("joints_data", data.get("joints_data", []) if isinstance(data, dict) else data)
         motor_status = {"Joint": joints}
         self._publish_json("joints", _skeleton_payload({"MotorStatus": motor_status}))
-        self._publish_json("joint_state", values)
+        flat = {}
+        for index, joint in enumerate(joints if isinstance(joints, list) else []):
+            name = JOINT_NAMES[index] if index < len(JOINT_NAMES) else f"joint_{index}"
+            for field, aliases in {
+                "q": ("q", "position"), "dq": ("dq", "velocity"),
+                "tau": ("tau", "torque"), "temperature": ("temperature", "motion_temp"),
+            }.items():
+                value = _joint_value(joint, *aliases)
+                if value is not None:
+                    flat[f"{name}_{field}"] = value
+        self._publish_json("joint_state", flat)
 
     def _forward_battery(self, msg):
         self._record_stream("battery", "received")
         from common.vendor_runtime import jsonable
         values = jsonable(msg)
-        self._publish_json("battery", {"batteries": values.get("data", [])})
+        batteries = values.get("data", []) if isinstance(values, dict) else []
+        payload = {}
+        for index, battery in enumerate(batteries if isinstance(batteries, list) else []):
+            if not isinstance(battery, dict):
+                continue
+            for key, value in battery.items():
+                if isinstance(value, (dict, list)):
+                    if isinstance(value, list):
+                        for item_index, item in enumerate(value):
+                            if not isinstance(item, (dict, list)):
+                                payload[f"battery_{index}_{key}_{item_index}"] = item
+                    continue
+                payload[f"battery_{index}_{key}"] = value
+        self._publish_json("battery", payload)
 
     def _forward_loco_state(self, msg):
         self._record_stream("loco_state", "received")
@@ -476,14 +553,11 @@ class S10MotionPlugin:
         self._thread = threading.Thread(target=self._stream_loop, daemon=True, name="s10-motion-stream")
 
     def _acp_callback(self, action_id, status, result):
-        _post_acp_callback(action_id, status, result, "loco")
+        _notify_acp_async(action_id, status, result, "loco")
 
     def _finish(self, active, status, result):
         if active and active.get("action_id"):
-            try:
-                self._acp_callback(active["action_id"], status, result)
-            except Exception as exc:
-                print(f"[ACP] {active['action_id']}: {exc}", flush=True)
+            self._acp_callback(active["action_id"], status, result)
 
     def _reported_motion_value(self, field):
         if self.nodes and field in ("MotionState", "Gait"):
@@ -570,7 +644,13 @@ class S10MotionPlugin:
                                                "damp", "gait"], "timeout": 65}
         return result
     def start(self):
-        if not self._thread.is_alive(): self._thread.start()
+        with self._condition:
+            if self._thread.is_alive():
+                return
+            self._shutdown = False
+            self._thread = threading.Thread(target=self._stream_loop, daemon=True,
+                                             name="s10-motion-stream")
+            self._thread.start()
     def stop(self):
         self._stop_stream()
         with self._condition:
@@ -726,17 +806,14 @@ class S10NavigationPlugin:
         return result
 
     def _acp_callback(self, action_id, status, result):
-        _post_acp_callback(action_id, status, result, "navigation")
+        _notify_acp_async(action_id, status, result, "navigation")
 
     def _finish_goal(self, action_id, status, result):
         with self._goal_lock:
             if self._active_goal != action_id:
                 return False
             self._active_goal = None
-        try:
-            self._acp_callback(action_id, status, result)
-        except Exception as exc:
-            print(f"[ACP] navigation {action_id}: {exc}", flush=True)
+        self._acp_callback(action_id, status, result)
         return True
 
     @staticmethod
@@ -866,12 +943,18 @@ class S10LightPlugin:
         if action == "set":
             leds = []
             for side in ("head", "tail"):
-                leds.append({
+                led = {
                     "Type": LIGHT_EFFECTS[args.get(f"{side}_effect", "常亮")],
                     "Color": [LIGHT_COLORS[args.get(f"{side}_color", "白色")]],
-                    "Cycle": int(args.get(f"{side}_cycle_seconds", 1)),
-                })
-            return self.native.request(0x00100005, 0x00200002, {"CustomMode": True, "Led": leds})
+                }
+                if args.get(f"{side}_effect", "常亮") in ("呼吸", "闪烁"):
+                    led["Cycle"] = int(args.get(f"{side}_cycle_seconds", 1))
+                leds.append(led)
+            # The Pro firmware applies this command but does not send an ASDU
+            # response. Use the native fire-and-forget path so a successful
+            # physical change is never reported as a TCP timeout.
+            return self.native.send(0x00100005, 0x00200002,
+                                    {"CustomMode": True, "Led": leds})
         raise ValueError(f"unsupported S10 light action: {action}")
 
 

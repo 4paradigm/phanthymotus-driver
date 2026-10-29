@@ -75,7 +75,8 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert "loco" in card_names and "motion" not in card_names
     assert {"imu", "loco_state", "joints", "joint_state", "battery"} <= card_names
     assert "errors" not in card_names
-    assert {"camera_0", "camera_1", "camera_2", "camera_3"} <= card_names
+    assert {"camera_0", "camera_1", "camera_2"} <= card_names
+    assert "camera_3" not in card_names
     assert "device" not in card_names
     assert not card_names.intersection({"motion_info", "native_basic_status", "native_device_status", "hard_estop", "charge_status"})
     assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
@@ -192,6 +193,12 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     ros_node.Node = FakeNode
     qos_module = ModuleType("rclpy.qos")
     qos_module.qos_profile_sensor_data = object()
+    class ReliabilityPolicy:
+        RELIABLE = 1
+    class QoSProfile:
+        def __init__(self, **kwargs): self.kwargs = kwargs
+    qos_module.ReliabilityPolicy = ReliabilityPolicy
+    qos_module.QoSProfile = QoSProfile
     sensor_msg = ModuleType("sensor_msgs.msg")
     sensor_msg.Imu, sensor_msg.PointCloud2 = Imu, PointCloud2
     sensor_msg.Image, sensor_msg.CompressedImage = Image, CompressedImage
@@ -228,7 +235,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     imu = SimpleNamespace(linear_acceleration=SimpleNamespace(x=1.0, y=2.0, z=3.0))
     callbacks["/IMU"](imu)
     imu_payload = json.loads(nodes.publishers["imu"].messages[-1].data)
-    assert imu_payload["linear_acceleration"]["z"] == 3.0
+    assert imu_payload["linear_acceleration_z"] == 3.0
 
     joints = [SimpleNamespace(position=index, velocity=0.1, torque=0.2, motion_temp=30.0)
               for index in range(16)]
@@ -238,11 +245,11 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert skeleton["available"] is True
     assert skeleton["joints"][0]["name"] == "fl_hipx_joint"
     assert skeleton["joints"][15]["q"] == 15
-    assert full_joint_state["data"]["joints_data"][4]["position"] == 4
+    assert full_joint_state["fr_hipx_joint_q"] == 4
 
     callbacks["/BATTERY_DATA"](SimpleNamespace(data=[SimpleNamespace(battery_level=87)]))
     battery = json.loads(nodes.publishers["battery"].messages[-1].data)
-    assert battery["batteries"][0]["battery_level"] == 87
+    assert battery["battery_0_battery_level"] == 87
 
     callbacks["/MOTION_INFO"](SimpleNamespace(data=SimpleNamespace(vel_x=0.3, vel_y=0.0)))
     loco_state = json.loads(nodes.publishers["loco_state"].messages[-1].data)
@@ -668,6 +675,29 @@ def test_loco_timed_move_expires_with_zero_velocity(monkeypatch):
         plugin.stop()
 
 
+def test_loco_stop_start_recreates_stream_worker(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    plugin = device.S10MotionPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    plugin.start()
+    plugin.stop()
+    plugin.start()
+    try:
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 0.02})
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not terminals:
+            time.sleep(0.01)
+        assert any(len(call[0]) > 2 and isinstance(call[0][2], dict)
+                   and call[0][2].get("X") == 0.0 for call in native.calls)
+        assert terminals == [(accepted["action_id"], "completed", {
+            "state": "completed", "reason": "duration_elapsed",
+        })]
+    finally:
+        plugin.stop()
+
+
 def test_loco_explicit_stop_cancels_move_and_sends_zero(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
@@ -836,7 +866,6 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
 def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
-    native.send = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("light must wait for its protocol response"))
     plugin = device.S10LightPlugin(native)
     plugin.dispatch("set", {"head_color": "绿色", "tail_color": "蓝色",
                              "head_effect": "呼吸", "tail_effect": "闪烁",
@@ -850,6 +879,44 @@ def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
         ],
     })
     assert native.calls[-1][1] == {}
+
+
+def test_light_uses_fire_and_forget_when_firmware_has_no_response(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    result = device.S10LightPlugin(native).dispatch("set", {})
+    assert result["state"] == "sent"
+    assert native.calls[-1][0][:2] == (0x00100005, 0x00200002)
+
+
+def test_light_constant_effect_omits_cycle_from_native_payload(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    device.S10LightPlugin(native).dispatch("set", {
+        "head_color": "白色", "tail_color": "蓝色",
+        "head_effect": "常亮", "tail_effect": "填充流水",
+    })
+    leds = native.calls[-1][0][2]["Led"]
+    assert "Cycle" not in leds[0]
+    assert "Cycle" not in leds[1]
+
+
+def test_loco_completion_is_delivered_asynchronously(monkeypatch):
+    device = _load_device(monkeypatch)
+    completed = threading.Event()
+    callback = {}
+
+    def fake_callback(action_id, status, result, tool_name):
+        callback.update(action_id=action_id, status=status, result=result, tool=tool_name)
+        completed.set()
+
+    monkeypatch.setattr(device, "_post_acp_callback", fake_callback)
+    plugin = device.S10MotionPlugin(FakeNative({}))
+    plugin._finish({"action_id": "s10-test"}, "completed", {"state": "completed"})
+    assert completed.wait(1)
+    assert callback["action_id"] == "s10-test"
+    assert callback["status"] == "completed"
+    assert callback["tool"] == "loco"
 
 
 def test_malformed_final_fragment_is_discarded_without_killing_decoder():

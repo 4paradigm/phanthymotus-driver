@@ -19,7 +19,6 @@ camera_topics:
   camera_0: "/usb_camera_1/image_raw"
   camera_1: "/usb_camera_1/image_raw_0"
   camera_2: "/usb_camera_1/image_raw_1"
-  camera_3: "/usb_camera_1/image_raw/compressed"
 basic_server:
   enabled: true
   # On the onboard host, robot_server is reachable at this host address. For a

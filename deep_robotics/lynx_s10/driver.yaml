@@ -21,7 +21,6 @@ cards:
   - { name: camera_0,              type: sensor }
   - { name: camera_1,              type: sensor }
   - { name: camera_2,              type: sensor }
-  - { name: camera_3,              type: sensor }
   - { name: navigation_status,     type: sensor }
   - { name: loco,                  type: actuator }
   - { name: light,                 type: actuator }
