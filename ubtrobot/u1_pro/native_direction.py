@@ -11,6 +11,7 @@ import time
 from collections import deque
 
 from sound_activity import SoundActivityGate
+from head_yaw import HeadYaw
 
 DOMAIN = 43
 RAW_TOPIC = "/phanthy/u1_doa/raw"
@@ -25,6 +26,9 @@ class NativeDirectionSource:
         config = vars(nodes).get("config", {})
         settings = config.get("sound_direction", {}).get("activity", {}) if isinstance(config, dict) else {}
         self.gate = SoundActivityGate(**settings)
+        frame_config = config.get("sound_direction", {}).get("frame_compensation", {}) if isinstance(config, dict) else {}
+        self.head_yaw = HeadYaw(frame_config)
+        self._yaw_sub = None
         self._lock = threading.RLock()
         self._events = deque(maxlen=32)
         self._stop = threading.Event()
@@ -62,6 +66,10 @@ class NativeDirectionSource:
                 CurrentAudioDeviceInfo, DEVICE_TOPIC, self._on_device, device_qos)
             self._audio_sub = self.nodes.audio_device.create_subscription(
                 AudioInData, INPUT_TOPIC, self._on_audio, self.nodes._sensor_qos)
+            if self.head_yaw.enabled:
+                from sensor_msgs.msg import JointState
+                self._yaw_sub = self.nodes.audio_device.create_subscription(
+                    JointState, "/mc/joint_states", self._on_head_yaw, self.nodes._sensor_qos)
             self._thread = threading.Thread(target=self._spin, daemon=True, name="u1-native-doa")
             self._thread.start()
         except Exception:
@@ -130,6 +138,14 @@ class NativeDirectionSource:
             except Exception as exc:
                 self.error = str(exc)[:256]
 
+    def _on_head_yaw(self, message):
+        with self._lock:
+            if self.running:
+                self.head_yaw.update(message)
+                if self.head_yaw.latest is None:
+                    self._events.clear()
+                    self._events.append((None, time.monotonic(), time.time_ns() // 1_000_000))
+
     def _on_direction(self, message):
         with self._lock:
             now = time.monotonic()
@@ -138,8 +154,10 @@ class NativeDirectionSource:
                     or not self._worker_present or not self.gate.allows(now)
                     or now - self._last_audio > .5 or now < (self._ready_after or 0)):
                 return
-            self._events.append(({"azimuth": message.azimuth, "confidence": message.confidence},
-                                 now, time.time_ns() // 1_000_000))
+            event = {"azimuth": message.azimuth, "confidence": message.confidence}
+            if self.head_yaw.enabled:
+                event["frame_compensation"] = self.head_yaw.snapshot(now)
+            self._events.append((event, now, time.time_ns() // 1_000_000))
 
     def drain(self):
         with self._lock:
@@ -167,16 +185,17 @@ class NativeDirectionSource:
             return {"state": state, "domain": DOMAIN, "device": self.device,
                     "audio_frames_forwarded": self.audio_frames, "device_updates": self.device_updates,
                     "native_events_received": self.events_received,
-                    "activity": self.gate.info(), "audio_age_seconds": age, "worker_subscribers": subscribers, "error": self.error}
+                    "activity": self.gate.info(), "head_feedback": self.head_yaw.snapshot(), "audio_age_seconds": age, "worker_subscribers": subscribers, "error": self.error}
 
     def stop(self):
         with self._lock:
             self.running = False
             self._stop.set()
             self.gate.reset()
+            self.head_yaw.reset()
             self._events.clear()
         errors = []
-        for attribute in ("_audio_sub", "_device_sub"):
+        for attribute in ("_audio_sub", "_device_sub", "_yaw_sub"):
             sub = getattr(self, attribute)
             if sub is not None:
                 try:

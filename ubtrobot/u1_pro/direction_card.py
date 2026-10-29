@@ -12,6 +12,7 @@ import time
 
 from common.vendor_runtime import action_schema, tool
 from native_direction import NativeDirectionSource
+from head_yaw import wrap_degrees
 
 DOA_TOPIC = "/robo/audio/subscribe/doa_event"
 ANGLE_CONVENTION = "robot_front_0_left_positive_ccw"
@@ -117,6 +118,20 @@ class SoundDirectionPlugin:
             if self._latest["confidence"] is not None:
                 result["confidence"] = self._latest["confidence"]
                 result["confidence_semantics"] = "vendor_raw_score_not_probability"
+        if self._latest and "frame_compensation" in self._latest:
+            compensation = self._latest["frame_compensation"]
+            result["head_angle_deg"] = self._latest["angle_deg"] if state == "fresh" else None
+            result["frame_compensation"] = compensation
+            result["reference_frame"] = "torso_front"
+            if state == "fresh":
+                if compensation.get("state") == "estimated":
+                    result["angle_deg"] = wrap_degrees(
+                        self._latest["angle_deg"] + compensation["head_yaw_deg"])
+                else:
+                    result["state"] = "no_event"
+                    result["angle_deg"] = None
+                    result.pop("confidence", None)
+                    result.pop("confidence_semantics", None)
         return result
 
     def _info(self):
@@ -217,6 +232,9 @@ class SoundDirectionPlugin:
                 # audio window, even if an undocumented timestamp is present.
                 self._latest = {"angle_deg": platform_angle(angle), "confidence": confidence,
                                 "valid": valid, "received_at_ms": received_ms if received_ms is not None else time.time_ns() // 1_000_000}
+                if self.backend == "native" and isinstance(event, dict) and "frame_compensation" in event:
+                    # Freeze this event's pose. Heartbeats must never reapply a newer head angle.
+                    self._latest["frame_compensation"] = dict(event["frame_compensation"])
                 self._error = ""
             except (ValueError, TypeError, RecursionError) as exc:
                 self._latest = {"valid": False, "received_at_ms": time.time_ns() // 1_000_000}

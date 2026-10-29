@@ -144,6 +144,22 @@ class NativeSourceTests(unittest.TestCase):
             self.nodes.robot.create_publisher.assert_not_called()
             self.nodes.core.create_publisher.assert_not_called()
 
+    def test_compensation_subscribes_read_only_feedback_and_cleans_it(self):
+        ros, node, executor, context, modules = self.fake_ros()
+        modules['sensor_msgs.msg'] = types.SimpleNamespace(JointState=type('JointState', (), {}))
+        self.nodes.config = {'sound_direction': {'frame_compensation': {'enabled': True}}}
+        source = NativeDirectionSource(self.nodes)
+        with mock.patch.dict(sys.modules, modules), mock.patch('native_direction.threading.Thread') as thread:
+            thread.return_value.is_alive.return_value = False
+            source.start()
+            topics=[c.args[1] for c in self.nodes.audio_device.create_subscription.call_args_list]
+            self.assertIn('/mc/joint_states', topics)
+            source.stop()
+            self.assertEqual(self.nodes.audio_device.destroy_subscription.call_count, 3)
+            self.assertIsNone(source.head_yaw.latest)
+            self.nodes.call_sdk.assert_not_called()
+            self.nodes.set_system_enabled.assert_not_called()
+
     def test_partial_start_cleans_private_resources(self):
         ros, node, executor, context, modules = self.fake_ros()
         self.nodes.audio_device.create_subscription.side_effect = RuntimeError('cannot subscribe')
