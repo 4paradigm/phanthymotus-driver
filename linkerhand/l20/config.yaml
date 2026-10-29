@@ -1,0 +1,15 @@
+mcp_port: 15710
+ros_namespace: ""
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+name: "LinkerHand L20"
+protocol: "can"
+connection:
+  can_iface: "can1"
+hands:
+  - side: "right"
+    can_id: 0x27
+plugins:
+  hand:
+    enabled: true
