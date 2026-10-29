@@ -46,7 +46,9 @@
 
 读回只是查询时刻的设置快照。即使符合目标，也不代表收到了本次请求的成功响应；不符合目标时，厂商服务也可能稍后才完成处理。调用方应据此决定后续查询或重试。直接调用 `status` 超时只报告查询失败，不递归查询。
 
-关闭会让当前固件的循环待机分支和自动眨眼分支退出，覆盖 `S017/S018/S019/S007` 待机动作及 `S020/S032/S033` 交互眨眼。固件仍可能执行待处理的一次性 `Z001` 归位，`expression`/`head` 显式请求的动作也仍可执行。这张卡片不提供急停。
+关闭会让当前固件的循环待机分支和自动眨眼分支退出，禁止继续安排 `S017/S018/S019/S007` 待机动作及 `S020/S032/S033` 交互眨眼。但已经提交给运控的轨迹可能继续执行到结束：当前固件的 `PlayTrajectoryMotionFileNode::onHalted()` 清理本地等待状态，没有向运控发送轨迹取消请求。一次真机日志中，关闭配置被行为树读到后，已提交的 `S018` 轨迹又过了约 16.7 秒才返回。因此，`disable` 成功表示待机偏好已关闭，不表示机器人已经静止。
+
+固件仍可能执行待处理的一次性 `Z001` 归位，`expression`/`head` 显式请求的动作也仍可执行。这张卡片不提供急停。厂商另有 `/mc/uworld_motion_stop`（`uworld_motion_msgs/srv/Trigger`），但请求没有动作名称或 ID，无法用它指定只取消某条待机轨迹；默认关闭操作不调用该接口。
 
 调用链为：驱动 → `nsenter` 进入宿主命名空间 → 宿主 Docker → 已运行的 `walker-behavior.behavior-1` → `/sys/config/user_manager/set_config`（`config_msgs/srv/SetConfig`），仅提交 `idle_action_enabled` 布尔值。ROSA 使用 `--no-daemon` 发现服务；收到业务成功响应后，从厂商 `/data/user_data/user_config_center.json` 读回核验。驱动不直接改写该文件，也不重启厂商程序。
 

@@ -2016,11 +2016,12 @@ class IdleActionsPlugin:
             "stop": ([], "Stop the card without changing the idle preference; use disable to turn idle actions off."),
             "status": ([], "Read the persisted vendor idle preference, not live motion feedback."),
             "enable": ([], "Enable and persist automatic idle actions and blinking."),
-            "disable": ([], "Disable and persist automatic idle actions and blinking."),
+            "disable": ([], "Disable and persist scheduling of idle actions and blinking; an in-flight trajectory may finish."),
         }
         return tool(self.PREFIX, "actuator",
                     "自动待机动作：开启、关闭或查询 U1 Pro 循环待机动作及自动眨眼。"
                     "设置持久保存，启动/停止卡片不改变设置；关闭待机请调用 disable。"
+                    "关闭会禁止新的待机动作，已下发的轨迹可能继续执行到结束。"
                     "关闭后仍可执行固件的一次性归位和 expression/head 卡片主动请求的动作。",
                     action_schema(actions, {}))
 
