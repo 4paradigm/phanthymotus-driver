@@ -393,6 +393,38 @@ class U1CardContractTests(unittest.TestCase):
             nodes.set_mic_enabled(True)
         self.assertFalse(nodes._mic_forwarding)
 
+    def test_mic_open_timeout_can_use_new_raw_frames_without_claiming_sdk_open(self):
+        import device
+        nodes = object.__new__(device.U1Nodes)
+        nodes._mic_source_lock = threading.Lock()
+        nodes._mic_source = None
+        nodes._mic_stream_open = False
+        nodes._mic_reader = None
+        nodes._mic_stream = {}
+        nodes._mic_source_timer = None
+        nodes._mic_forwarding = False
+        nodes._mic_frames = 42
+        nodes._mic_frame_event = threading.Event()
+        nodes._mic_frame_event.set()  # Previous session must not prove readiness.
+        nodes.trigger_call = mock.Mock(side_effect=TimeoutError('service timeout: open_stream'))
+        result = nodes.set_mic_enabled(True)
+        self.assertEqual(result['state'], 'waiting_for_audio')
+        self.assertFalse(nodes._mic_frame_event.is_set())
+        self.assertFalse(nodes.wait_for_mic_frame(.001))
+        self.assertFalse(nodes._mic_stream_open)
+        self.assertEqual(nodes._mic_source, 'topic')
+        self.assertTrue(nodes._mic_forwarding)
+        nodes._mic_publisher = FakePublisher()
+        nodes.AudioChunk = FakeAudioChunk
+        nodes._audio_header = lambda: types.SimpleNamespace(stamp=types.SimpleNamespace(sec=0,nanosec=0))
+        nodes._mic_topic_callback(types.SimpleNamespace(data=[1,2,3,4], sample_rate=16000,
+                                                       channels=1, sample_format='S16LE'))
+        self.assertTrue(nodes.wait_for_mic_frame(.01))
+        self.assertEqual(len(nodes._mic_publisher.messages), 1)
+        nodes.set_mic_enabled(False)
+        self.assertFalse(nodes._mic_forwarding)
+        nodes.trigger_call.assert_called_once_with('audio_open')
+
     def test_mic_uses_device_topic_when_sdk_ring_is_empty(self):
         import device
 
