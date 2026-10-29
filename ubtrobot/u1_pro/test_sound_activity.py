@@ -59,3 +59,13 @@ class ActivityTests(unittest.TestCase):
         self.assertFalse(self.gate.active)
         self.feed(pcm(1500),2)
         self.assertFalse(self.gate.allows(self.now))
+
+    def test_half_db_tuning_accepts_slightly_quieter_sound(self):
+        baseline=SoundActivityGate(minimum_dbfs=-65, margin_db=3)
+        candidate=SoundActivityGate(minimum_dbfs=-65, margin_db=2.5)
+        for i in range(12):
+            for gate in (baseline,candidate):gate.update(pcm(1000),DEVICE,i*.1)
+        for i in range(12,32):
+            for gate in (baseline,candidate):gate.update(pcm(1370),DEVICE,i*.1)
+        self.assertFalse(baseline.allows(3.1))
+        self.assertTrue(candidate.allows(3.1))
