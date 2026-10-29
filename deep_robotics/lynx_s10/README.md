@@ -29,14 +29,14 @@ Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避
 
 ## ROS 2
 
-指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。bundle 使用仓库统一的 `run_driver` 双域 ROS 运行时：机器人域订阅标准消息，Agent Core 域发布 `topic_out`；原生 TCP 仍负责动作和设备状态。镜像基于仓库 ROS 基础镜像，配置 Fast DDS 与 `ROS_LOCALHOST_ONLY=0`，从而让 Agent Core 能看到转发后的数据。
+指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。bundle 使用仓库统一的 `run_driver` 双域 ROS 运行时：机器人域订阅标准消息，Agent Core 域发布 `topic_out`；原生 TCP 仍负责动作和设备状态。Fast DDS profile 在创建 ROS context 前生成，并限制到 loopback 与 `NETWORK_INTERFACE`（默认 `eth0`），两个 context 共用这个进程级 profile。该网卡必须连接隔离的机器人网络，不能与办公网或其他机器人共用；若现场网络拓扑不满足此条件，须先做网络隔离或进程拆分，不能直接部署。`ROS_LOCALHOST_ONLY=0` 使选定机器人网卡上的 ROS 发现保持可用。
 
 ## 部署与镜像
 
-该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS；只额外安装 PyYAML，不引入相机编解码或自定义 drdds 构建依赖。Compose 片段使用 host 网络连接机器人网段，并配置本地日志轮转。
+该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS，并额外安装 `drdds` 消息源码构建工具链（`python3-pip`、`python3-colcon-common-extensions`、Fast DDS RMW）及 PyYAML。官方 ROS 基础镜像不含此厂商消息包和 colcon 构建依赖，因此这些新增依赖是运行 S10 ROS 订阅所必需的，会增加镜像体积；apt 使用 `--no-install-recommends` 并清理索引，pip 使用 `--no-cache-dir`，构建结束删除源码归档。消息归档保留在本地 `resource/` 目录但不提交，Docker build 从固定上游 revision 下载并校验 SHA-256。Compose 片段使用 host 网络连接机器人网段，并配置本地日志轮转。
 
 ## 安全与验证
 
 - 切换步态前应确保机器人完全停止；步态会隐式切换至对应运动模式。
 - 首次联调应在隔离环境进行，先验证 basic_server 响应、型号/版本和状态上报，再低速验证运动方向与状态机。该 TCP 通道不加密，须限制在可信机器人网络内。轴速度控制文档要求同一客户端连续控制，勿并发多个控制方。
-- 已在 S10 Pro 真机验证 TCP 心跳成功（`ErrorCode: 0`）；状态报告、运动、导航、灯光和充电仍需进一步验证。
+- 已在 S10 Pro 真机验证 TCP 心跳成功（`ErrorCode: 0`）；状态报告、运动、导航、灯光和充电仍需进一步验证。双域 DDS 使用 driver-owned 受限 profile；尚未在目标部署网络验证 `eth0` 是否为机器人专用网段，因此须在部署前确认网段隔离。

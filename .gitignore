@@ -47,3 +47,6 @@ agibot/A3/vendor/a3_aimdk-*.whl
 
 # Private SDK copied from the robot; not redistributed
 .local/face-light-sdk/
+
+# S10 drdds source archive is kept locally under resource/ and downloaded at build time.
+/deep_robotics/lynx_s10/resource/deep-robotics-msg-a0d1a29eec5c4db5a9107595bb51e3be8122b86c.zip

@@ -4,8 +4,10 @@ deep-robotics-lynx-s10:
   network_mode: host
   environment:
     - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - ROS_LOCALHOST_ONLY=0
+    - NETWORK_INTERFACE=eth0
   logging:
     driver: local
     options:

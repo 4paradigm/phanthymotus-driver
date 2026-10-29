@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
+import socket
+import struct
 import threading
 import time
 from types import ModuleType, SimpleNamespace
@@ -106,13 +109,13 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
         "joint_state": {"topic": "/robot/lynx_s10/joint_state", "format": "data/json"},
         "loco_state": {"topic": "/robot/lynx_s10/loco_state", "format": "data/json"},
         "battery": {"topic": "/robot/lynx_s10/battery", "format": "data/json"},
-        "lidar": {"topic": "/robot/lynx_s10/lidar", "format": "pointcloud/ros2"},
+        "lidar": {"topic": "/robot/lynx_s10/lidar", "format": "sensor/pointcloud"},
     }})()
     plugin = device.S10StatePlugin(native, nodes)
     tools = {item["name"]: item for item in plugin.get_tools()}
     assert tools["joints"]["topic_out"] == [{"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"}]
     assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
-    assert plugin.dispatch("info", {"_tool_name": "lidar"})["topic_out"][0]["format"] == "pointcloud/ros2"
+    assert plugin.dispatch("info", {"_tool_name": "lidar"})["topic_out"][0]["format"] == "sensor/pointcloud"
 
 
 def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
@@ -154,6 +157,10 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
         def __init__(self):
             self.data = ""
 
+    class UInt8MultiArray:
+        def __init__(self):
+            self.data = []
+
     class Imu: pass
     class PointCloud2: pass
     class JointsData: pass
@@ -167,7 +174,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     sensor_msg = ModuleType("sensor_msgs.msg")
     sensor_msg.Imu, sensor_msg.PointCloud2 = Imu, PointCloud2
     standard_msg = ModuleType("std_msgs.msg")
-    standard_msg.String = String
+    standard_msg.String, standard_msg.UInt8MultiArray = String, UInt8MultiArray
     drdds_msg = ModuleType("drdds.msg")
     drdds_msg.JointsData, drdds_msg.BatteryData, drdds_msg.MotionInfo = JointsData, BatteryData, MotionInfo
     for module_name, module in {
@@ -206,9 +213,16 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     loco_state = json.loads(nodes.publishers["loco_state"].messages[-1].data)
     assert loco_state["vel_x"] == 0.3
 
-    lidar = PointCloud2()
+    point_data = struct.pack("<ffffff", 1.0, 2.0, 3.0, math.nan, 5.0, 6.0)
+    lidar = SimpleNamespace(
+        fields=[SimpleNamespace(name=name, offset=offset) for name, offset in (("x", 0), ("y", 4), ("z", 8))],
+        is_bigendian=False, height=1, width=2, row_step=24, point_step=12, data=point_data,
+    )
     callbacks["/LIDAR/POINTS"](lidar)
-    assert nodes.lidar_publisher.messages[-1] is lidar
+    encoded = bytes(nodes.lidar_publisher.messages[-1].data)
+    point_step, point_count = struct.unpack_from("<II", encoded)
+    assert (point_step, point_count) == (12, 1)
+    assert struct.unpack_from("<fff", encoded, 8) == (1.0, 2.0, 3.0)
     nodes.close()
 
 
@@ -218,6 +232,28 @@ def test_model_resource_returns_official_urdf(monkeypatch):
     root = ET.fromstring(result["urdf"])
     assert root.tag == "robot" and root.get("name") == "S10"
     assert root.find("joint[@name='fl_hipx_joint']") is not None
+
+
+def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp_path):
+    monkeypatch.syspath_prepend(str(DRIVER))
+    spec = importlib.util.spec_from_file_location("lynx_s10_main_for_test", DRIVER / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakeSocket:
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def fileno(self): return 1
+
+    monkeypatch.setattr(module.socket, "socket", lambda *_args: FakeSocket())
+    monkeypatch.setattr(module.fcntl, "ioctl", lambda *_args: b"\0" * 20 + socket.inet_aton("10.21.33.2"))
+    monkeypatch.setenv("S10_FASTDDS_PROFILE", str(tmp_path / "fastdds.xml"))
+    profile = module.configure_fastdds_profile({"ros": {"robot_interface": "eth0"}})
+    root = ET.parse(profile).getroot()
+    addresses = [node.text for node in root.findall(".//{*}interfaceWhiteList/{*}address")]
+    assert addresses == ["127.0.0.1", "10.21.33.2"]
+    assert root.find(".//{*}useBuiltinTransports").text == "false"
+    assert module.os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] == str(profile)
 
 
 def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
@@ -251,11 +287,15 @@ def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeyp
     native = FakeNative({})
     plugin = device.S10MotionPlugin(native)
     definition = plugin.get_tool()
+    assert definition["inputSchema"]["x-completion"]["actions"] == ["move"]
+    assert definition["inputSchema"]["x-completion"]["timeout"] > 60
+    assert "x-completion" not in definition
     assert definition["name"] == "loco"
     assert {"move", "stop_move", "stand_up", "stand_down", "damp"} <= set(definition["inputSchema"]["x-action-params"])
     try:
         result = plugin.dispatch("move", {"vx": 0.5, "vy": 0.1, "vyaw": 0.2, "duration": 1})
         assert result["state"] == "streaming"
+        assert result["action_id"].startswith("s10_move_")
         assert native.calls[-1][0][1:] == (0x00110002, {"X": 0.5, "Y": 0.1, "Z": 0.0,
                                                         "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.2})
         result = plugin.dispatch("stop_move", {})
@@ -270,9 +310,11 @@ def test_loco_timed_move_expires_with_zero_velocity(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10MotionPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     plugin.start()
     try:
-        plugin.dispatch("move", {"vx": 0.2, "duration": 0.02})
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 0.02})
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             if len(native.calls) >= 2 and native.calls[-1][0][2]["X"] == 0:
@@ -283,6 +325,55 @@ def test_loco_timed_move_expires_with_zero_velocity(monkeypatch):
         assert native.calls[-1][0][2] == {
             "X": 0.0, "Y": 0.0, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0,
         }
+        assert terminals == [(accepted["action_id"], "completed", {
+            "state": "completed", "reason": "duration_elapsed",
+        })]
+    finally:
+        plugin.stop()
+
+
+def test_loco_explicit_stop_cancels_move_and_sends_zero(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    plugin = device.S10MotionPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    try:
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": -1})
+        assert plugin.dispatch("stop_move", {})["state"] == "stopped"
+        assert terminals == [(accepted["action_id"], "cancelled", {
+            "state": "cancelled", "reason": "stopped_or_replaced",
+        })]
+        assert native.calls[-1][0][2] == {
+            "X": 0.0, "Y": 0.0, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0,
+        }
+    finally:
+        plugin.stop()
+
+
+def test_loco_stream_send_error_reports_terminal_error(monkeypatch):
+    device = _load_device(monkeypatch)
+
+    class FailingNative(FakeNative):
+        def send(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if len(self.calls) == 2:
+                raise OSError("socket closed")
+            return {"state": "sent"}
+
+    native = FailingNative({})
+    plugin = device.S10MotionPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    plugin.start()
+    try:
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 1})
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not terminals:
+            time.sleep(0.01)
+        assert terminals[0][0:2] == (accepted["action_id"], "error")
+        assert "socket closed" in terminals[0][2]["message"]
+        assert native.calls[-1][0][2]["X"] == 0.0
     finally:
         plugin.stop()
 

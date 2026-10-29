@@ -13,7 +13,7 @@
 | `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
 | `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
-| `deep_robotics/lynx_s10` | 云深处山猫 S10 Pro | 15724 | TLS/TCP 原生协议、状态/故障上报、运动、设备和导航控制 |
+| `deep_robotics/lynx_s10` | 云深处山猫 S10 Pro | 15724 | 明文 TCP 原生协议、状态/故障上报、运动、设备和导航控制 |
 | `chasing/qianjiao_p200_pro` | 潜行科技潜鲛 P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF 运动控制、锁定/解锁、心跳和连接状态 |
 | [`limx/tron2`](limx/tron2/README.md) | 逐际动力 TRON2 双臂机器人 | 15791 | 头部/左右腕RGB摄像头、关节骨架与夹爪示意、双臂 MoveJ及自动验证复位 |
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |

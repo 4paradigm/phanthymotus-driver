@@ -6,6 +6,12 @@ from __future__ import annotations
 import threading
 import time
 import math
+import json
+import os
+import ssl
+import struct
+import urllib.request
+from uuid import uuid4
 from pathlib import Path
 
 from basic_server import BasicServerClient
@@ -36,19 +42,20 @@ class S10Nodes:
             "joint_state": {"topic": base + "joint_state", "format": "data/json"},
             "loco_state": {"topic": base + "loco_state", "format": "data/json"},
             "battery": {"topic": base + "battery", "format": "data/json"},
-            "lidar": {"topic": base + "lidar", "format": "pointcloud/ros2"},
+            "lidar": {"topic": base + "lidar", "format": "sensor/pointcloud"},
         }
         self.publishers = {
             key: self.core.create_publisher(String, spec["topic"], 10)
             for key, spec in self.topics.items() if key != "lidar"
         }
-        self.lidar_publisher = self.core.create_publisher(PointCloud2, self.topics["lidar"]["topic"], 2)
+        from std_msgs.msg import UInt8MultiArray
+        self.lidar_publisher = self.core.create_publisher(UInt8MultiArray, self.topics["lidar"]["topic"], 2)
         topics = config.get("topics", {})
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, qos_profile_sensor_data)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, qos_profile_sensor_data)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, qos_profile_sensor_data)
-        self.robot.create_subscription(PointCloud2, topics.get("lidar", "/LIDAR/POINTS"), self.lidar_publisher.publish, qos_profile_sensor_data)
+        self.robot.create_subscription(PointCloud2, topics.get("lidar", "/LIDAR/POINTS"), self._forward_lidar, qos_profile_sensor_data)
 
     def _publish_json(self, key, value):
         from std_msgs.msg import String
@@ -78,6 +85,40 @@ class S10Nodes:
         from common.vendor_runtime import jsonable
         values = jsonable(msg)
         self._publish_json("loco_state", values.get("data", values))
+
+    def _forward_lidar(self, msg):
+        packet = self._pointcloud_packet(msg)
+        if packet is None:
+            return
+        from std_msgs.msg import UInt8MultiArray
+        output = UInt8MultiArray()
+        output.data = list(packet)
+        self.lidar_publisher.publish(output)
+
+    @staticmethod
+    def _pointcloud_packet(msg):
+        """Encode XYZ PointCloud2 using the renderer's binary point-cloud contract."""
+        fields = {field.name: field.offset for field in msg.fields}
+        if not all(name in fields for name in ("x", "y", "z")):
+            return None
+        endian = ">" if msg.is_bigendian else "<"
+        points = []
+        for row in range(int(msg.height)):
+            for col in range(int(msg.width)):
+                offset = row * int(msg.row_step) + col * int(msg.point_step)
+                try:
+                    point = tuple(struct.unpack_from(endian + "f", msg.data, offset + fields[name])[0]
+                                  for name in ("x", "y", "z"))
+                except struct.error:
+                    continue
+                if all(math.isfinite(value) for value in point):
+                    points.append(point)
+                if len(points) >= 20000:
+                    break
+            if len(points) >= 20000:
+                break
+        return struct.pack("<II", 12, len(points)) + b"".join(
+            struct.pack("<fff", *point) for point in points)
 
     def close(self):
         self.robot.destroy_node()
@@ -229,6 +270,28 @@ class S10MotionPlugin:
         self._active = None
         self._shutdown = False
         self._thread = threading.Thread(target=self._stream_loop, daemon=True, name="s10-motion-stream")
+
+    def _acp_callback(self, action_id, status, result):
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        context = ssl.create_default_context(cafile=os.environ.get("AGENT_CORE_CA_CERT") or None)
+        if not os.environ.get("AGENT_CORE_CA_CERT") and url.startswith(("https://localhost:", "https://127.0.0.1:")):
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        payload = json.dumps({"action_id": action_id, "status": status, "result": result,
+                              "tool": "loco", "ts": time.time()}).encode()
+        request = urllib.request.Request(url + "/api/acp/complete", data=payload,
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=5, context=context) as response:
+            acknowledgement = json.load(response)
+        if acknowledgement.get("ok") is not True or acknowledgement.get("action_id") != action_id:
+            raise RuntimeError("Agent Core did not acknowledge action_id")
+
+    def _finish(self, active, status, result):
+        if active and active.get("action_id"):
+            try:
+                self._acp_callback(active["action_id"], status, result)
+            except Exception as exc:
+                print(f"[ACP] {active['action_id']}: {exc}", flush=True)
     def get_tool(self):
         result = tool("loco", "actuator", "山猫 S10 运动控制；使用 move/stop_move、stand_up/stand_down、damp，以及 S10 步态和模式控制", action_schema(self.ACTIONS, {
             "gait": {"type": "string", "enum": list(GAITS)},
@@ -240,7 +303,7 @@ class S10MotionPlugin:
             "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": 1,
                          "description": "Seconds; -1 continues until stop_move; 0 stops immediately"},
         }))
-        result["x-completion"] = {"actions": ["move", "stop_move", "stand_up", "stand_down"], "timeout": 30}
+        result["inputSchema"]["x-completion"] = {"actions": ["move"], "timeout": 65}
         return result
     def start(self):
         if not self._thread.is_alive(): self._thread.start()
@@ -261,6 +324,8 @@ class S10MotionPlugin:
             self._condition.notify_all()
         if send_both: self._send_zero()
         elif active: self._send_zero(active["kind"])
+        if active:
+            self._finish(active, "cancelled", {"state": "cancelled", "reason": "stopped_or_replaced"})
     def _stream_loop(self):
         while True:
             with self._condition:
@@ -271,6 +336,7 @@ class S10MotionPlugin:
                 if now >= command["deadline"]:
                     self._active = None
                     self._send_zero(command["kind"])
+                    self._finish(command, "completed", {"state": "completed", "reason": "duration_elapsed"})
                     continue
                 delay = command["next_send"] - now
                 if delay > 0:
@@ -279,8 +345,13 @@ class S10MotionPlugin:
                 try:
                     self.native.send(command["type"], command["command"], command["items"])
                     command["next_send"] = time.monotonic() + 0.1
-                except Exception:
+                except Exception as exc:
                     self._active = None
+                    try:
+                        self._send_zero(command["kind"])
+                    except Exception as stop_exc:
+                        exc = RuntimeError(f"{exc}; zero command failed: {stop_exc}")
+                    self._finish(command, "error", {"state": "error", "message": str(exc)})
     def dispatch(self, action, args):
         if action == "start": return {"state": "ready"}
         if action == "stop":
@@ -318,14 +389,17 @@ class S10MotionPlugin:
                 self._stop_stream(send_both=True)
                 return {"state": "stopped", "sent_zero_to": ["axis", "velocity"]}
             self._stop_stream()
+            action_id = str(args.get("action_id") or f"s10_move_{uuid4().hex}")
             sent = self.native.send(message_type, command, items)
             with self._condition:
                 now = time.monotonic()
                 self._active = {"kind": kind, "type": message_type, "command": command, "items": items,
-                                "deadline": now + duration if duration > 0 else float("inf"), "next_send": now + 0.1}
+                                "deadline": now + duration if duration > 0 else float("inf"), "next_send": now + 0.1,
+                                "action_id": action_id if action == "move" else None}
                 self._condition.notify_all()
             return {**sent, "state": "streaming", "frequency_hz": 10,
-                    "duration": duration, "auto_stop": duration > 0}
+                    "duration": duration, "auto_stop": duration > 0,
+                    **({"action_id": action_id} if action == "move" else {})}
         raise ValueError(f"unsupported S10 loco action: {action}")
 
 

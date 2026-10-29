@@ -63,6 +63,10 @@ OWN_PROFILE = {
     'agibot/A3': 'main.py generates a constrained robot+loopback FastDDS profile; the '
                  'robot-domain-232 context must reach 10.42.10.x while the isolated '
                  'domain-42 bridge uses loopback.',
+    'deep_robotics/lynx_s10': 'main.py generates one process-wide FastDDS profile '
+                              'restricted to loopback and the configured robot-facing '
+                              'interface for both ROS contexts. That interface must be '
+                              'on an isolated robot network; do not use a shared office LAN.',
 }
 
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,
