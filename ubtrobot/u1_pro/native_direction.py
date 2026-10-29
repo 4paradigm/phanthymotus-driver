@@ -10,6 +10,8 @@ import threading
 import time
 from collections import deque
 
+from sound_activity import SoundActivityGate
+
 DOMAIN = 43
 RAW_TOPIC = "/phanthy/u1_doa/raw"
 DEVICE_TOPIC = "/sys/device/audio_in/cur_device_info"
@@ -20,6 +22,9 @@ INPUT_TOPIC = "/sys/device/audio_in/raw"
 class NativeDirectionSource:
     def __init__(self, nodes):
         self.nodes = nodes
+        config = vars(nodes).get("config", {})
+        settings = config.get("sound_direction", {}).get("activity", {}) if isinstance(config, dict) else {}
+        self.gate = SoundActivityGate(**settings)
         self._lock = threading.RLock()
         self._events = deque(maxlen=32)
         self._stop = threading.Event()
@@ -86,6 +91,7 @@ class NativeDirectionSource:
                 self._events.append((None, time.monotonic(), time.time_ns() // 1_000_000))
                 self._ready_after = time.monotonic() + 1.0
                 self._last_audio = None
+                self.gate.reset()
             # This firmware reports is_built_in=False for its real internal
             # array. Forward it unchanged; the vendor IsInternalMicNode uses
             # the actual internal_mics.yml layout as the authority.
@@ -101,12 +107,20 @@ class NativeDirectionSource:
             if not self.running or not self.device:
                 return
             if not message.data.data:
+                self.gate.invalidate("empty_audio")
+                self._events.clear()
+                self._events.append((None, time.monotonic(), time.time_ns() // 1_000_000))
                 return
             now = time.monotonic()
             if self._last_audio is None or now - self._last_audio > .5:
                 # Do not revive a buffered direction after input loss. This is
                 # receipt-clock warmup, never claimed as a capture-time window.
                 self._ready_after = now + 1.0
+                self.gate.reset()
+                self._events.clear()
+                self._events.append((None, now, time.time_ns() // 1_000_000))
+            self.gate.update(message.data.data, self.device, now)
+            if not self.gate.allows(now):
                 self._events.clear()
                 self._events.append((None, now, time.time_ns() // 1_000_000))
             try:
@@ -121,7 +135,7 @@ class NativeDirectionSource:
             now = time.monotonic()
             self.events_received += 1
             if (not self.running or self.error or self._last_audio is None
-                    or not self._worker_present
+                    or not self._worker_present or not self.gate.allows(now)
                     or now - self._last_audio > .5 or now < (self._ready_after or 0)):
                 return
             self._events.append(({"azimuth": message.azimuth, "confidence": message.confidence},
@@ -135,6 +149,7 @@ class NativeDirectionSource:
                 self._events.append((None, time.monotonic(), time.time_ns() // 1_000_000))
                 self._ready_after = time.monotonic() + 1.0
                 self._worker_present = present
+                self.gate.reset()
             elif not present:
                 self._events.clear()
             events = list(self._events)
@@ -152,12 +167,13 @@ class NativeDirectionSource:
             return {"state": state, "domain": DOMAIN, "device": self.device,
                     "audio_frames_forwarded": self.audio_frames, "device_updates": self.device_updates,
                     "native_events_received": self.events_received,
-                    "audio_age_seconds": age, "worker_subscribers": subscribers, "error": self.error}
+                    "activity": self.gate.info(), "audio_age_seconds": age, "worker_subscribers": subscribers, "error": self.error}
 
     def stop(self):
         with self._lock:
             self.running = False
             self._stop.set()
+            self.gate.reset()
             self._events.clear()
         errors = []
         for attribute in ("_audio_sub", "_device_sub"):

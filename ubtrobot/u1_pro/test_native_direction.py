@@ -59,6 +59,7 @@ class NativeSourceTests(unittest.TestCase):
         self.assertFalse(self.source.device['is_built_in'])
 
     def test_warmup_and_stale_audio_never_revive_direction(self):
+        self.source.gate.allows = mock.Mock(return_value=True)
         self.source._on_device(self.device()); self.source._on_audio(self.audio())
         self.source.drain()
         self.source._on_direction(self.event())
@@ -96,6 +97,17 @@ class NativeSourceTests(unittest.TestCase):
         self.assertIsNone(self.source._last_audio)
         self.source._on_direction(self.event())
         self.assertEqual(self.source.drain(), [])
+
+    def test_silence_clears_public_direction_and_late_event_is_rejected(self):
+        self.source._on_device(self.device())
+        self.source._events.clear()
+        self.source._ready_after = 0
+        self.source._events.append(({'azimuth': 80}, 100, 123))
+        self.source._on_audio(self.audio(b'\0' * 25600))
+        self.assertEqual([e[0] for e in self.source.drain()], [None])
+        self.source._on_direction(self.event())
+        self.assertEqual(self.source.drain(), [])
+        self.assertEqual(self.source.info()['activity']['reason'], 'calibrating')
 
     def fake_ros(self):
         ros = types.ModuleType('rclpy')

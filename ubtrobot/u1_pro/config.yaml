@@ -21,3 +21,7 @@ sound_direction:
   # Independent vendor DOA worker on domain 43. No wakeup/behavior switches.
   # Install it using deploy/native_doa_manage.py before starting this backend.
   source: native
+  activity:
+    # Initial tuning values, not measured acoustic SPL. Quiet startup ~1 second.
+    minimum_dbfs: -50.0
+    margin_db: 10.0
