@@ -1,5 +1,19 @@
 # LinkerHand L20 Lite USB-RS485 driver
 
+## Hex 数据手套遥操与双手骨架
+
+新增 glove_teleop 卡片，在一个 ARM64 驱动容器中直接解析接收器串口，不依赖厂商 SDK、Mono 或上位机。
+接收器必须通过 GLOVE_SERIAL_PORT 配置，不能与 L20_SERIAL_PORT 指向同一设备；程序不会自动扫描接收器。
+手套读取仅在画布启动 glove_teleop 后开始，灵巧手运动必须另外完成两端标定并显式 arm。
+没有手套时，原 hand/hand_gesture 卡片仍可使用。
+
+构建、端口配置、画布操作和验证范围见 [部署说明](deploy/README.md)。
+来源与许可见 [模型说明](resource/README.md)。两手模型显示映射目标，不代表灵巧手实际位置或碰撞状态。
+张开/握拳标定只保留在当前会话；断流超过 800ms 禁止后续运动，并在当前总线事务结束后尝试卸力。
+重连不会自动重新启用运动。显式手动控制会先退出遥操，再取得总线控制权。
+
+以下为已有 hand 与 hand_gesture 的操作说明。
+
 This is the active PhanthyMotus driver for the L20 Lite connected through a
 USB-RS485 adapter. It uses Modbus RTU at 115200 baud, 8N1. The configured
 right-hand slave address is `0x27`; the left-hand address is `0x28`. The operator

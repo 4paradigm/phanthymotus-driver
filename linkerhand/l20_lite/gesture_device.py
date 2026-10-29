@@ -121,6 +121,7 @@ class GesturePlugin:
         # Keep a completion barrier through any thumb/index clearance phases.
         schema["x-completion"] = {"actions": list(ACTIONS), "timeout": 300}
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"}}
+        schema["x-resource"] = ["l20_lite_left_hand", "l20_lite_right_hand"]
         definition = tool(self.PREFIX, "actuator", "L20 Lite 独立手势卡片，动作需要安全确认", schema)
         definition["title"] = "L20 Lite 手势"
         definition["multiInstance"] = True
@@ -372,6 +373,11 @@ class GesturePlugin:
                 time.sleep(0.5)
 
     def dispatch(self, action, args):
+        if action in (*ACTIONS, "stop") and getattr(self.hand, "_teleop_active", False):
+            glove = getattr(self.hand, "_glove_plugin", None)
+            if glove is None:
+                raise RuntimeError("glove teleoperation owns the hands; disarm it first")
+            glove._disarm()
         instance_id = args.get("instance_id") or ""
         if action == "config":
             side = args.get("bound_side")

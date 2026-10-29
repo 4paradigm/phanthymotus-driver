@@ -1,0 +1,9 @@
+# Use after the installed Motus compose file. No SDK or source-code mounts.
+services:
+  linkerhand-l20-lite:
+    image: ${L20_LITE_IMAGE:-local/phanthy-l20-lite:sdkfree}
+    platform: linux/arm64
+    environment:
+      GLOVE_SERIAL_PORT: ${GLOVE_SERIAL_PORT:?Set the receiver stable device path}
+      L20_SERIAL_PORT: ${L20_SERIAL_PORT:?Set the hand RS485 device path}
+      GLOVE_SOURCE_MODE: direct

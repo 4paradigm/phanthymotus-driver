@@ -9,6 +9,9 @@ linkerhand-l20-lite:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
+    - GLOVE_SOURCE_MODE=direct
+    - GLOVE_SERIAL_PORT=${GLOVE_SERIAL_PORT:-/dev/glove}
+    - L20_SERIAL_PORT=${L20_SERIAL_PORT:-/dev/ttyUSB0}
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
