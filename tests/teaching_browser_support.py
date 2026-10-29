@@ -48,7 +48,8 @@ def workbench_site(teaching, plugins, monkeypatch, tmp_path, mcp_id, name):
     bundle = DriverBundle(plugins)
     from common import file_intake
     monkeypatch.setenv('ACCESS_TOKEN', 'test-only-token')
-    monkeypatch.setenv('FILE_INTAKE_DIR', str(tmp_path / 'driver-uploads'))
+    # file_intake reads FILE_INTAKE_DIR at import; set the resolved default.
+    monkeypatch.setattr(file_intake, 'DEFAULT_BASE_DIR', str(tmp_path / 'driver-uploads'))
     class Handler(make_handler(lambda: bundle, mcp_id, mcp_id)):
         def do_POST(self):
             if file_intake.serve_upload(self):

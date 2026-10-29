@@ -138,7 +138,8 @@ def test_g1_record_trial_save_and_agent_call(site, browser_page, g1_teaching, tm
     chooser.value.set_files(action_file)
     expect(teaching_card.locator('.canvas-file-name')).to_have_text('g1.motus-skill')
     before = len(channel.positions)
-    card.cfg['trajectory_device_id'] = 'second-compatible-g1'
+    # A second same-model G1 has none of this device's verified receipts.
+    for path in service.directory.glob('*.json'): path.unlink()
     with page.expect_response(lambda r: r.url.endswith('/api/mcp/test-g1/call') and
                               r.request.post_data_json.get('arguments', {}).get('action') == 'import'):
         teaching_card.locator('.canvas-exec-btn').click()
