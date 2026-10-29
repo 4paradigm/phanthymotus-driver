@@ -63,14 +63,66 @@ class IdleActionControlTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "state mismatch"):
                 IdleActionControl().set_enabled(True)
 
-    def test_timeout_and_missing_runtime_are_not_retried(self):
-        for error in (subprocess.TimeoutExpired("native", 25), FileNotFoundError("nsenter")):
-            with self.subTest(error=error), mock.patch(
-                "native_idle_actions.subprocess.run", side_effect=error,
+    def test_timeout_reads_current_setting_once_without_retrying_write(self):
+        for timeout in (subprocess.TimeoutExpired("native", 25), completed(code=124), completed(code=137)):
+            for requested in (True, False):
+                for observed in (True, False):
+                    with self.subTest(timeout=timeout, requested=requested, observed=observed), mock.patch(
+                        "native_idle_actions.subprocess.run", side_effect=[
+                            timeout, completed(json.dumps({"enabled": observed})),
+                        ],
+                    ) as run:
+                        with self.assertRaises(RuntimeError) as raised:
+                            IdleActionControl().set_enabled(requested)
+                        message = str(raised.exception)
+                        outcome = "match" if observed is requested else "mismatch"
+                        self.assertIn("timed out", message)
+                        self.assertIn(f"readback={outcome};", message)
+                        self.assertIn(f"requested={json.dumps(requested)};", message)
+                        self.assertIn(f"observed_enabled={json.dumps(observed)};", message)
+                        self.assertIn("request completion unconfirmed", message)
+                        self.assertIn("no automatic retry", message)
+                        self.assertEqual(run.call_count, 2)
+                        self.assertEqual(run.call_args_list[0].args[0][13:15], ["bash", "-c"])
+                        self.assertEqual(run.call_args_list[1].args[0][13:15], ["python3", "-c"])
+                        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 5)
+
+    def test_timeout_readback_failure_reports_unknown_without_recursion_or_retry(self):
+        for failure in (
+            subprocess.TimeoutExpired("readback", 5),
+            FileNotFoundError("nsenter"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+            completed(code=1, error="vendor config unavailable"),
+            completed(code=124),
+            completed("invalid JSON"),
+            completed('{"enabled": "false"}'),
+        ):
+            with self.subTest(failure=failure), mock.patch(
+                "native_idle_actions.subprocess.run",
+                side_effect=[subprocess.TimeoutExpired("write", 25), failure],
             ) as run:
-                with self.assertRaises(RuntimeError):
+                with self.assertRaises(RuntimeError) as raised:
                     IdleActionControl().set_enabled(False)
-                run.assert_called_once()
+                message = str(raised.exception)
+                self.assertIn("timed out", message)
+                self.assertIn("requested=false; readback=unknown; observed_enabled=unknown;", message)
+                self.assertIn("readback_error=", message)
+                self.assertIn("request completion unconfirmed; no automatic retry", message)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_args_list[1].args[0][13:15], ["python3", "-c"])
+
+    def test_standalone_status_timeout_does_not_retry_or_recurse(self):
+        with mock.patch("native_idle_actions.subprocess.run",
+                        side_effect=subprocess.TimeoutExpired("readback", 5)) as run:
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                IdleActionControl().status()
+            run.assert_called_once()
+
+    def test_missing_runtime_fails_without_attempting_readback(self):
+        with mock.patch("native_idle_actions.subprocess.run", side_effect=FileNotFoundError("nsenter")) as run:
+            with self.assertRaisesRegex(RuntimeError, "requires nsenter"):
+                IdleActionControl().set_enabled(False)
+            run.assert_called_once()
 
     def test_nonzero_exit_cannot_report_success_even_with_response(self):
         with mock.patch("native_idle_actions.subprocess.run", return_value=completed(

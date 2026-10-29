@@ -40,6 +40,10 @@ print(json.dumps({'enabled': value['bool_value']}))
 """
 
 
+class _NativeCommandTimeout(RuntimeError):
+    """The native client stopped waiting; a submitted write may still apply."""
+
+
 class IdleActionControl:
     def __init__(self, container: str = DEFAULT_NATIVE_CONTAINER):
         if not isinstance(container, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container):
@@ -53,9 +57,14 @@ class IdleActionControl:
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("U1 Pro idle_action operation timed out; query status before retrying") from exc
+            raise _NativeCommandTimeout("U1 Pro idle_action native command timed out") from exc
         except OSError as exc:
             raise RuntimeError("U1 Pro idle_action requires nsenter and access to the host vendor runtime") from exc
+        # GNU timeout normally returns 124, or 137 when --kill-after sends SIGKILL.
+        # A 137 exit can also mean another kill; the write outcome is still unknown.
+        if result.returncode in (124, 137):
+            raise _NativeCommandTimeout(
+                f"U1 Pro idle_action native command timed out or was killed (exit {result.returncode})")
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()[-240:]
             raise RuntimeError(f"U1 Pro idle_action native command failed ({result.returncode}): {detail}")
@@ -80,8 +89,26 @@ class IdleActionControl:
         with self._lock:
             payload = {"config": [{"name": IDLE_ACTION_KEY,
                                    "value": {"type": 1, "bool_value": enabled}}]}
-            output = self._exec(["bash", "-c", _SET_CONFIG, "idle-action-config",
-                                 json.dumps(payload)], timeout=25)
+            try:
+                output = self._exec(["bash", "-c", _SET_CONFIG, "idle-action-config",
+                                     json.dumps(payload)], timeout=25)
+            except _NativeCommandTimeout as exc:
+                # Read once under the same lock, with status()'s separate 5s bound.
+                # Never retry the write or infer service acknowledgement from a
+                # matching preference: it may predate this request or change later.
+                try:
+                    state = self.status()
+                except Exception as readback_error:
+                    detail = ("readback=unknown; observed_enabled=unknown; "
+                              f"readback_error={str(readback_error)[:240]}")
+                else:
+                    actual = state["data"]["enabled"]
+                    outcome = "match" if actual is enabled else "mismatch"
+                    detail = f"readback={outcome}; observed_enabled={json.dumps(actual)}"
+                # Keep the existing error path: MCP exposes this message to callers.
+                raise RuntimeError(
+                    f"{exc}; requested={json.dumps(enabled)}; {detail}; "
+                    "request completion unconfirmed; no automatic retry") from exc
             # ROSA can exit normally even when the service rejects the request.
             # Require the service response, not just an exit code or request echo.
             response = re.search(

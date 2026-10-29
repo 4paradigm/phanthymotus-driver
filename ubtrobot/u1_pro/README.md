@@ -34,7 +34,17 @@
 | 开启自动待机动作 | `{"action":"enable"}` |
 | 查询当前设置 | `{"action":"status"}` |
 
-`status` 返回 `{"ok":true,"code":"OK","data":{"enabled":true},"source":"vendor_user_config"}`。其中 `enabled` 是持久配置中的开关值，不是电机是否静止的实时反馈。修改成功返回 `ok`、`requested`、`enabled` 和读回的 `state`；服务拒绝、超时、读回失败或状态不一致均报错。超时后先查询状态，再决定是否重试。
+`status` 返回 `{"ok":true,"code":"OK","data":{"enabled":true},"source":"vendor_user_config"}`。其中 `enabled` 是持久配置中的开关值，不是电机是否静止的实时反馈。修改成功返回 `ok`、`requested`、`enabled` 和读回的 `state`；服务拒绝、超时、读回失败或状态不一致均报错。
+
+`enable`/`disable` 的修改命令遇到外层进程等待超时或内层 `timeout` 退出（124/137）时，驱动会自动调用一次 `status`，读回另设 5 秒等待上限，且不重发修改请求。操作仍作为超时错误返回；MCP 的 `error.message` 保留超时原因、目标 `requested`、读回结果和 `request completion unconfirmed; no automatic retry`：
+
+| 错误消息中的读回结果 | 含义 |
+| --- | --- |
+| `readback=match; observed_enabled=false` | 示例：目标为关闭，读回的持久设置也为关闭 |
+| `readback=mismatch; observed_enabled=true` | 示例：目标为关闭，读回的持久设置仍为开启 |
+| `readback=unknown; observed_enabled=unknown; readback_error=...` | 查询也失败，当前设置未知，并附查询错误原因 |
+
+读回只是查询时刻的设置快照。即使符合目标，也不代表收到了本次请求的成功响应；不符合目标时，厂商服务也可能稍后才完成处理。调用方应据此决定后续查询或重试。直接调用 `status` 超时只报告查询失败，不递归查询。
 
 关闭会让当前固件的循环待机分支和自动眨眼分支退出，覆盖 `S017/S018/S019/S007` 待机动作及 `S020/S032/S033` 交互眨眼。固件仍可能执行待处理的一次性 `Z001` 归位，`expression`/`head` 显式请求的动作也仍可执行。这张卡片不提供急停。
 

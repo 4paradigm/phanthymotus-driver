@@ -1378,6 +1378,43 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(plugin.get_tool()["inputSchema"]["properties"]["control"]["enum"],
                          ["wakeup", "wakeup_followup", "visual_behavior", "all"])
 
+    def test_idle_timeout_readback_reaches_mcp_caller_as_an_error(self):
+        import device
+        import subprocess
+        from common.vendor_runtime import DriverBundle, make_handler
+
+        request = json.dumps({
+            "jsonrpc": "2.0", "id": "idle-timeout", "method": "tools/call",
+            "params": {"name": "idle_actions", "arguments": {"action": "disable"}},
+        }).encode()
+        for observed, expected in ((False, "match"), (True, "mismatch"), (None, "unknown")):
+            with self.subTest(observed=observed):
+                bundle = DriverBundle([device.IdleActionsPlugin(device.IdleActionControl())])
+                handler_type = make_handler(lambda: bundle, "u1-test", "u1-test")
+                handler = object.__new__(handler_type)
+                handler.path = "/mcp"
+                handler.headers = {"Content-Length": str(len(request))}
+                handler.rfile = io.BytesIO(request)
+                handler.send_json = mock.Mock()
+                readback = (subprocess.CompletedProcess([], 0, stdout=json.dumps({"enabled": observed}), stderr="")
+                            if observed is not None else subprocess.TimeoutExpired("readback", 5))
+                with mock.patch("native_idle_actions.subprocess.run", side_effect=[
+                    subprocess.TimeoutExpired("write", 25), readback,
+                ]) as run, mock.patch("traceback.print_exc"):
+                    handler.do_POST()
+                handler.send_json.assert_called_once()
+                http_status, response = handler.send_json.call_args.args
+                self.assertEqual(http_status, 200)
+                self.assertEqual(response["id"], "idle-timeout")
+                self.assertEqual(response["error"]["code"], -32603)
+                self.assertNotIn("result", response)
+                message = response["error"]["message"]
+                self.assertIn(f"readback={expected};", message)
+                self.assertIn("requested=false;", message)
+                self.assertIn("timed out", message)
+                self.assertIn("request completion unconfirmed; no automatic retry", message)
+                self.assertEqual(run.call_count, 2)
+
     def test_speaker_enables_stereo_output_before_subscribing(self):
         import device
 
