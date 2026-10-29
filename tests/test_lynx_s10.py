@@ -271,8 +271,16 @@ def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({"navigation_task_timeout": 45})
     plugin = device.S10NavigationPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
 
-    assert plugin.dispatch("goal", {"x": 1.2, "y": -0.4, "yaw": 0.5}) == {"state": "sent"}
+    result = plugin.dispatch("goal", {"x": 1.2, "y": -0.4, "yaw": 0.5, "confirm": True})
+    assert result["state"] == "accepted"
+    assert result["action_id"].startswith("s10_navigation_")
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not terminals:
+        time.sleep(0.01)
+    assert terminals == [(result["action_id"], "completed", {"state": "completed", "response": {"state": "sent"}})]
     args, kwargs = native.calls[-1]
     assert args[:2] == (0x00100003, 0x00100002)
     assert args[2]["Item"][0]["PosX"] == 1.2
@@ -282,18 +290,84 @@ def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
     assert native.calls[-1][0][:2] == (0x00100003, 0x00100004)
 
 
+def test_navigation_declares_completion_and_rejects_unconfirmed_goals(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({"navigation_task_timeout": 45})
+    plugin = device.S10NavigationPlugin(native)
+    schema = plugin.get_tool()["inputSchema"]
+    assert schema["x-is-dangerous"] is True
+    assert schema["x-completion"] == {"actions": ["goal"], "timeout": 55}
+    assert "confirm" in schema["x-action-params"]["goal"]["params"]
+    assert plugin.dispatch("goal", {"x": 1, "y": 2, "yaw": 0})["code"] == "INVALID_ARGUMENT"
+    assert native.calls == []
+
+
+def test_navigation_cancel_reports_one_terminal_callback(monkeypatch):
+    device = _load_device(monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingNative(FakeNative):
+        def request(self, message_type, command, *args, **kwargs):
+            self.calls.append(((message_type, command, *args), kwargs))
+            if command == 0x00100002:
+                started.set()
+                assert release.wait(1)
+                return {"state": "finished"}
+            return {"state": "cancel_sent"}
+
+    native = BlockingNative({"navigation_task_timeout": 2})
+    plugin = device.S10NavigationPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    accepted = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw": 0, "confirm": True})
+    assert started.wait(1)
+    conflict = plugin.dispatch("goal", {"x": 3, "y": 4, "yaw": 0, "confirm": True})
+    assert conflict["code"] == "ACTION_IN_PROGRESS"
+    assert plugin.dispatch("cancel", {}) == {"state": "cancel_sent"}
+    release.set()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not terminals:
+        time.sleep(0.01)
+    assert terminals == [(accepted["action_id"], "cancelled", {
+        "state": "cancelled", "reason": "navigation_cancelled",
+    })]
+
+
+def test_navigation_request_timeout_reports_acp_error(monkeypatch):
+    device = _load_device(monkeypatch)
+
+    class FailingNative(FakeNative):
+        def request(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise TimeoutError("navigation task timed out")
+
+    plugin = device.S10NavigationPlugin(FailingNative({"navigation_task_timeout": 1}))
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    accepted = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw": 0, "confirm": True})
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not terminals:
+        time.sleep(0.01)
+    assert terminals == [(accepted["action_id"], "error", {
+        "state": "error", "message": "navigation task timed out",
+    })]
+
+
 def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10MotionPlugin(native)
     definition = plugin.get_tool()
-    assert definition["inputSchema"]["x-completion"]["actions"] == ["move"]
+    assert definition["inputSchema"]["x-completion"]["actions"] == ["move", "axis"]
     assert definition["inputSchema"]["x-completion"]["timeout"] > 60
+    assert definition["inputSchema"]["x-is-dangerous"] is True
+    assert "confirm" in definition["inputSchema"]["x-action-params"]["move"]["params"]
     assert "x-completion" not in definition
     assert definition["name"] == "loco"
     assert {"move", "stop_move", "stand_up", "stand_down", "damp"} <= set(definition["inputSchema"]["x-action-params"])
     try:
-        result = plugin.dispatch("move", {"vx": 0.5, "vy": 0.1, "vyaw": 0.2, "duration": 1})
+        result = plugin.dispatch("move", {"vx": 0.5, "vy": 0.1, "vyaw": 0.2, "duration": 1, "confirm": True})
         assert result["state"] == "streaming"
         assert result["action_id"].startswith("s10_move_")
         assert native.calls[-1][0][1:] == (0x00110002, {"X": 0.5, "Y": 0.1, "Z": 0.0,
@@ -314,7 +388,7 @@ def test_loco_timed_move_expires_with_zero_velocity(monkeypatch):
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     plugin.start()
     try:
-        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 0.02})
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 0.02, "confirm": True})
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             if len(native.calls) >= 2 and native.calls[-1][0][2]["X"] == 0:
@@ -339,7 +413,8 @@ def test_loco_explicit_stop_cancels_move_and_sends_zero(monkeypatch):
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     try:
-        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": -1})
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": -1, "confirm": True})
+        assert accepted["duration"] == 60
         assert plugin.dispatch("stop_move", {})["state"] == "stopped"
         assert terminals == [(accepted["action_id"], "cancelled", {
             "state": "cancelled", "reason": "stopped_or_replaced",
@@ -349,6 +424,37 @@ def test_loco_explicit_stop_cancels_move_and_sends_zero(monkeypatch):
         }
     finally:
         plugin.stop()
+
+
+def test_axis_stream_has_action_id_and_acp_cancel(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    plugin = device.S10MotionPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    try:
+        accepted = plugin.dispatch("axis", {"x": 0.2, "duration": 60, "confirm": True})
+        assert accepted["action_id"].startswith("s10_axis_")
+        assert plugin.dispatch("stop_move", {})["state"] == "stopped"
+        assert terminals == [(accepted["action_id"], "cancelled", {
+            "state": "cancelled", "reason": "stopped_or_replaced",
+        })]
+    finally:
+        plugin.stop()
+
+
+def test_zero_duration_stream_completes_acp_immediately(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    plugin = device.S10MotionPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    result = plugin.dispatch("axis", {"x": 0, "duration": 0, "confirm": True})
+    assert result["state"] == "stopped"
+    assert result["action_id"].startswith("s10_axis_")
+    assert terminals == [(result["action_id"], "completed", {
+        "state": "stopped", "reason": "zero_duration",
+    })]
 
 
 def test_loco_stream_send_error_reports_terminal_error(monkeypatch):
@@ -367,7 +473,7 @@ def test_loco_stream_send_error_reports_terminal_error(monkeypatch):
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     plugin.start()
     try:
-        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 1})
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 1, "confirm": True})
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline and not terminals:
             time.sleep(0.01)
@@ -395,10 +501,38 @@ def test_actuator_lifecycle_never_starts_charging_or_sends_idle_commands(monkeyp
     assert native.calls == []
 
     charging = plugins[2]
-    charging.dispatch("start_charging", {})
+    charging.dispatch("start_charging", {"confirm": True})
     assert native.calls[-1][0] == (0x00100004, 0x00100002, {"Charge": 1})
-    charging.dispatch("stop_charging", {})
+    charging.dispatch("stop_charging", {"confirm": True})
     assert native.calls[-1][0] == (0x00100004, 0x00100002, {"Charge": 0})
+
+
+def test_dangerous_s10_commands_require_literal_confirmation(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    cases = [
+        (device.S10MotionPlugin(native), "move"),
+        (device.S10MotionPlugin(native), "axis"),
+        (device.S10MotionPlugin(native), "stand_up"),
+        (device.S10MotionPlugin(native), "damp"),
+        (device.S10MotionPlugin(native), "gait"),
+        (device.S10MotionPlugin(native), "mode"),
+        (device.S10MotionPlugin(native), "rl_control"),
+        (device.S10NavigationPlugin(native), "goal"),
+        (device.S10NavigationPlugin(native), "localize"),
+        (device.S10DevicePlugin(native), "sleep"),
+        (device.S10DevicePlugin(native), "wake"),
+        (device.S10DevicePlugin(native), "auto_sleep"),
+        (device.S10DevicePlugin(native), "sdk_mode"),
+        (device.S10ChargePlugin(native), "start_charging"),
+        (device.S10ChargePlugin(native), "stop_charging"),
+    ]
+    for plugin, action in cases:
+        for confirm in (None, False, "true", 1):
+            args = {} if confirm is None else {"confirm": confirm}
+            result = plugin.dispatch(action, args)
+            assert result["code"] == "INVALID_ARGUMENT", (action, confirm, result)
+    assert native.calls == []
 
 
 def test_control_schema_exposes_supported_navigation_and_light_options(monkeypatch):
@@ -408,9 +542,17 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     localize_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["localize"]["params"]
     light_params = device.S10DevicePlugin(native).get_tool()["inputSchema"]["x-action-params"]["lights"]["params"]
 
-    assert set(nav_params) == {"x", "y", "z", "yaw", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"}
-    assert set(localize_params) == {"x", "y", "z", "yaw"}
+    assert set(nav_params) == {"x", "y", "z", "yaw", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
+    assert set(localize_params) == {"x", "y", "z", "yaw", "confirm"}
     assert {"head_cycle", "tail_cycle"} <= set(light_params)
+
+    device_schema = device.S10DevicePlugin(native).get_tool()["inputSchema"]
+    charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
+    assert device_schema["x-is-dangerous"] is True
+    assert "confirm" in device_schema["x-action-params"]["sleep"]["params"]
+    assert charge_schema["x-is-dangerous"] is True
+    assert "confirm" in charge_schema["x-action-params"]["start_charging"]["params"]
+    assert "confirm" in charge_schema["x-action-params"]["stop_charging"]["params"]
 
 
 def test_malformed_final_fragment_is_discarded_without_killing_decoder():

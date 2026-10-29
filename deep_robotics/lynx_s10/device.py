@@ -18,6 +18,39 @@ from basic_server import BasicServerClient
 from common.vendor_runtime import action_schema, tool
 
 
+def _mark_dangerous(result, actions):
+    schema = result["inputSchema"]
+    schema["x-is-dangerous"] = True
+    schema["properties"]["confirm"] = {
+        "type": "boolean", "description": "Required true to confirm this physical or safety-relevant action."}
+    for action in actions:
+        schema["x-action-params"][action]["params"].append("confirm")
+    return result
+
+
+def _confirmation_error(action, args):
+    if args.get("confirm") is True:
+        return None
+    return {"ok": False, "code": "INVALID_ARGUMENT",
+            "error": f"{action} requires boolean confirm=true"}
+
+
+def _post_acp_callback(action_id, status, result, tool_name):
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    context = ssl.create_default_context(cafile=os.environ.get("AGENT_CORE_CA_CERT") or None)
+    if not os.environ.get("AGENT_CORE_CA_CERT") and url.startswith(("https://localhost:", "https://127.0.0.1:")):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    payload = json.dumps({"action_id": action_id, "status": status, "result": result,
+                          "tool": tool_name, "ts": time.time()}).encode()
+    request = urllib.request.Request(url + "/api/acp/complete", data=payload,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=5, context=context) as response:
+        acknowledgement = json.load(response)
+    if acknowledgement.get("ok") is not True or acknowledgement.get("action_id") != action_id:
+        raise RuntimeError("Agent Core did not acknowledge action_id")
+
+
 class S10Nodes:
     """Forward robot-domain ROS samples and native TCP state into Agent Core DDS."""
     def __init__(self, config, namespace, ros2):
@@ -255,8 +288,9 @@ class S10StatePlugin:
 
 
 class S10MotionPlugin:
+    CONFIRM_ACTIONS = {"move", "axis", "stand_up", "stand_down", "damp", "gait", "mode", "rl_control"}
     ACTIONS = {
-        "move": (["vx", "vy", "vyaw", "duration"], "导航模式下按速度移动；duration=-1 持续直到 stop_move"),
+        "move": (["vx", "vy", "vyaw", "duration"], "导航模式下按速度移动；duration=-1 为兼容写法，最多持续 60 秒"),
         "stop_move": ([], "立即发送零速度停止运动"),
         "stand_up": ([], "切换到站立状态"), "stand_down": ([], "切换到趴下状态"),
         "damp": ([], "切换到阻尼状态"), "gait": (["gait"], "切换步态；请先确认机器人完全停止"),
@@ -272,19 +306,7 @@ class S10MotionPlugin:
         self._thread = threading.Thread(target=self._stream_loop, daemon=True, name="s10-motion-stream")
 
     def _acp_callback(self, action_id, status, result):
-        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-        context = ssl.create_default_context(cafile=os.environ.get("AGENT_CORE_CA_CERT") or None)
-        if not os.environ.get("AGENT_CORE_CA_CERT") and url.startswith(("https://localhost:", "https://127.0.0.1:")):
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        payload = json.dumps({"action_id": action_id, "status": status, "result": result,
-                              "tool": "loco", "ts": time.time()}).encode()
-        request = urllib.request.Request(url + "/api/acp/complete", data=payload,
-                                         headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(request, timeout=5, context=context) as response:
-            acknowledgement = json.load(response)
-        if acknowledgement.get("ok") is not True or acknowledgement.get("action_id") != action_id:
-            raise RuntimeError("Agent Core did not acknowledge action_id")
+        _post_acp_callback(action_id, status, result, "loco")
 
     def _finish(self, active, status, result):
         if active and active.get("action_id"):
@@ -293,7 +315,7 @@ class S10MotionPlugin:
             except Exception as exc:
                 print(f"[ACP] {active['action_id']}: {exc}", flush=True)
     def get_tool(self):
-        result = tool("loco", "actuator", "山猫 S10 运动控制；使用 move/stop_move、stand_up/stand_down、damp，以及 S10 步态和模式控制", action_schema(self.ACTIONS, {
+        result = tool("loco", "actuator", "山猫 S10 运动控制；危险动作需要显式 confirm=true。duration=-1 最多持续 60 秒", action_schema(self.ACTIONS, {
             "gait": {"type": "string", "enum": list(GAITS)},
             "mode": {"type": "string", "enum": list(MODES)},
             **{axis: {"type": "number", "minimum": -1, "maximum": 1} for axis in ("x", "y", "z", "roll", "pitch", "yaw")},
@@ -301,9 +323,14 @@ class S10MotionPlugin:
             "vy": {"type": "number", "minimum": -0.4, "maximum": 0.4, "description": "Navigation lateral velocity in m/s"},
             "vyaw": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "Navigation yaw rate in rad/s"},
             "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": 1,
-                         "description": "Seconds; -1 continues until stop_move; 0 stops immediately"},
+                         "description": "Seconds; -1 is a compatibility alias for 60 seconds; 0 stops immediately"},
+            "confirm": {"type": "boolean", "description": "Required true for physical motion or control-mode changes."},
         }))
-        result["inputSchema"]["x-completion"] = {"actions": ["move"], "timeout": 65}
+        schema = result["inputSchema"]
+        schema["x-is-dangerous"] = True
+        for action in self.CONFIRM_ACTIONS:
+            schema["x-action-params"][action]["params"].append("confirm")
+        schema["x-completion"] = {"actions": ["move", "axis"], "timeout": 65}
         return result
     def start(self):
         if not self._thread.is_alive(): self._thread.start()
@@ -322,10 +349,19 @@ class S10MotionPlugin:
             active = self._active
             self._active = None
             self._condition.notify_all()
-        if send_both: self._send_zero()
-        elif active: self._send_zero(active["kind"])
+        stop_error = None
+        try:
+            if send_both: self._send_zero()
+            elif active: self._send_zero(active["kind"])
+        except Exception as exc:
+            stop_error = exc
         if active:
-            self._finish(active, "cancelled", {"state": "cancelled", "reason": "stopped_or_replaced"})
+            if stop_error:
+                self._finish(active, "error", {"state": "error", "message": f"zero command failed: {stop_error}"})
+            else:
+                self._finish(active, "cancelled", {"state": "cancelled", "reason": "stopped_or_replaced"})
+        if stop_error:
+            raise stop_error
     def _stream_loop(self):
         while True:
             with self._condition:
@@ -335,8 +371,12 @@ class S10MotionPlugin:
                 now = time.monotonic()
                 if now >= command["deadline"]:
                     self._active = None
-                    self._send_zero(command["kind"])
-                    self._finish(command, "completed", {"state": "completed", "reason": "duration_elapsed"})
+                    try:
+                        self._send_zero(command["kind"])
+                    except Exception as exc:
+                        self._finish(command, "error", {"state": "error", "message": f"zero command failed: {exc}"})
+                    else:
+                        self._finish(command, "completed", {"state": "completed", "reason": "duration_elapsed"})
                     continue
                 delay = command["next_send"] - now
                 if delay > 0:
@@ -353,6 +393,10 @@ class S10MotionPlugin:
                         exc = RuntimeError(f"{exc}; zero command failed: {stop_exc}")
                     self._finish(command, "error", {"state": "error", "message": str(exc)})
     def dispatch(self, action, args):
+        if action in self.CONFIRM_ACTIONS:
+            error = _confirmation_error(action, args)
+            if error:
+                return error
         if action == "start": return {"state": "ready"}
         if action == "stop":
             self._stop_stream()
@@ -387,47 +431,119 @@ class S10MotionPlugin:
             if not -1 <= duration <= 60: raise ValueError("duration must be within [-1, 60]")
             if duration == 0:
                 self._stop_stream(send_both=True)
-                return {"state": "stopped", "sent_zero_to": ["axis", "velocity"]}
+                action_id = f"s10_{action}_{uuid4().hex}"
+                self._finish({"action_id": action_id}, "completed", {"state": "stopped", "reason": "zero_duration"})
+                return {"state": "stopped", "sent_zero_to": ["axis", "velocity"], "action_id": action_id}
             self._stop_stream()
-            action_id = str(args.get("action_id") or f"s10_move_{uuid4().hex}")
+            action_id = f"s10_{action}_{uuid4().hex}"
             sent = self.native.send(message_type, command, items)
             with self._condition:
                 now = time.monotonic()
                 self._active = {"kind": kind, "type": message_type, "command": command, "items": items,
-                                "deadline": now + duration if duration > 0 else float("inf"), "next_send": now + 0.1,
-                                "action_id": action_id if action == "move" else None}
+                                "deadline": now + (60 if duration == -1 else duration), "next_send": now + 0.1,
+                                "action_id": action_id}
                 self._condition.notify_all()
             return {**sent, "state": "streaming", "frequency_hz": 10,
-                    "duration": duration, "auto_stop": duration > 0,
-                    **({"action_id": action_id} if action == "move" else {})}
+                    "duration": 60 if duration == -1 else duration, "auto_stop": True,
+                    "action_id": action_id}
         raise ValueError(f"unsupported S10 loco action: {action}")
 
 
 class S10NavigationPlugin:
+    CONFIRM_ACTIONS = {"goal", "localize"}
     ACTIONS = {
-        "goal": (["x", "y", "z", "yaw", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "前往地图坐标系单点目标；等待任务结束后返回结果"),
+        "goal": (["x", "y", "z", "yaw", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "前往地图坐标系单点目标；异步等待任务结束"),
         "cancel": ([], "取消当前导航任务"), "status": ([], "查询导航任务状态"),
         "localize": (["x", "y", "z", "yaw"], "按地图坐标初始化/重置定位"),
         "pose": ([], "查询机器人地图坐标和姿态"),
         "perception_status": ([], "查询定位与避障状态"),
     }
-    def __init__(self, native): self.native = native
+    def __init__(self, native):
+        self.native = native
+        self._goal_lock = threading.Lock()
+        self._active_goal = None
+
     def get_tool(self):
-        return tool("navigation", "actuator", "山猫 S10 Pro 单点导航、取消、定位初始化和状态查询", action_schema(self.ACTIONS, {
+        result = tool("navigation", "actuator", "山猫 S10 Pro 导航控制；目标导航和定位初始化需要显式 confirm=true", action_schema(self.ACTIONS, {
             "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number", "default": 0},
             "yaw": {"type": "number"}, "point_type": {"type": "integer", "enum": [0, 1, 2, 3, 4], "default": 1},
             "gait": {"type": "string", "enum": ["navigation_flat", "navigation_stairs"], "default": "navigation_flat"},
             "speed": {"type": "integer", "enum": [0, 1, 2], "default": 0}, "reverse": {"type": "boolean", "default": False},
             "avoid_obstacles": {"type": "boolean", "default": True}, "autonomous": {"type": "boolean", "default": False},
+            "confirm": {"type": "boolean", "description": "Required true for goal navigation and localization changes."},
         }))
+        _mark_dangerous(result, self.CONFIRM_ACTIONS)
+        timeout = max(10, math.ceil(float(self.native.config.get("navigation_task_timeout", 180))) + 10)
+        result["inputSchema"]["x-completion"] = {"actions": ["goal"], "timeout": timeout}
+        return result
+
+    def _acp_callback(self, action_id, status, result):
+        _post_acp_callback(action_id, status, result, "navigation")
+
+    def _finish_goal(self, action_id, status, result):
+        with self._goal_lock:
+            if self._active_goal != action_id:
+                return False
+            self._active_goal = None
+        try:
+            self._acp_callback(action_id, status, result)
+        except Exception as exc:
+            print(f"[ACP] navigation {action_id}: {exc}", flush=True)
+        return True
+
+    @staticmethod
+    def _response_error(response):
+        body = response.get("PatrolDevice", response) if isinstance(response, dict) else {}
+        items = body.get("Items", body) if isinstance(body, dict) else {}
+        code = items.get("ErrorCode") if isinstance(items, dict) else None
+        if code is None:
+            return None
+        try:
+            raw_code = str(code).strip().lower()
+            value = int(raw_code, 16 if raw_code.startswith("0x") else 10)
+        except (TypeError, ValueError):
+            return str(code)
+        return None if value == 0 else value
+
+    def _run_goal(self, action_id, item, timeout):
+        try:
+            response = self.native.request(0x00100003, 0x00100002, {"Item": [item]}, response_timeout=timeout)
+            error = self._response_error(response)
+            if error is None:
+                self._finish_goal(action_id, "completed", {"state": "completed", "response": response})
+            else:
+                self._finish_goal(action_id, "error", {"state": "error", "error_code": error, "response": response})
+        except Exception as exc:
+            self._finish_goal(action_id, "error", {"state": "error", "message": str(exc)})
+
+    def _cancel_goal(self):
+        with self._goal_lock:
+            action_id = self._active_goal
+        if action_id is None:
+            return None
+        response = self.native.request(0x00100003, 0x00100004)
+        self._finish_goal(action_id, "cancelled", {"state": "cancelled", "reason": "navigation_cancelled"})
+        return response
+
     def start(self): pass
-    def stop(self): pass
+    def stop(self):
+        if self._active_goal is not None:
+            self._cancel_goal()
+
     def dispatch(self, action, args):
+        if action in self.CONFIRM_ACTIONS:
+            error = _confirmation_error(action, args)
+            if error:
+                return error
         if action == "start": return {"state": "ready"}
-        if action == "stop": return {"state": "idle"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
         if action == "info": return {"state": "ready"}
         if action == "status": return self.native.request(0x00100003, 0x00100001)
-        if action == "cancel": return self.native.request(0x00100003, 0x00100004)
+        if action == "cancel":
+            response = self._cancel_goal()
+            return response if response is not None else self.native.request(0x00100003, 0x00100004)
         if action == "pose": return self.native.request(0x00100003, 0x00200001)
         if action == "perception_status": return self.native.request(0x00100003, 0x00110001)
         if action == "localize":
@@ -439,26 +555,49 @@ class S10NavigationPlugin:
                     "Manner": int(bool(args.get("reverse", False))), "ObsMode": 0 if args.get("avoid_obstacles", True) else 1,
                     "NavMode": int(bool(args.get("autonomous", False))), "Terrain": 0, "Posture": 0, "Waypoints": {}}
             timeout = float(self.native.config.get("navigation_task_timeout", 180))
-            return self.native.request(0x00100003, 0x00100002, {"Item": [item]}, response_timeout=timeout)
+            action_id = f"s10_navigation_{uuid4().hex}"
+            with self._goal_lock:
+                if self._active_goal is not None:
+                    return {"ok": False, "code": "ACTION_IN_PROGRESS", "action_id": self._active_goal,
+                            "error": "navigation goal already active; cancel it before sending another goal"}
+                self._active_goal = action_id
+            worker = threading.Thread(target=self._run_goal, args=(action_id, item, timeout),
+                                      daemon=True, name="s10-navigation-goal")
+            try:
+                worker.start()
+            except Exception as exc:
+                with self._goal_lock:
+                    if self._active_goal == action_id:
+                        self._active_goal = None
+                return {"ok": False, "code": "WORKER_START_FAILED", "error": str(exc)}
+            return {"state": "accepted", "action": "goal", "action_id": action_id,
+                    "task_timeout": timeout}
         raise ValueError(f"unsupported S10 navigation action: {action}")
 
 
 class S10DevicePlugin:
+    CONFIRM_ACTIONS = {"sleep", "wake", "auto_sleep", "sdk_mode"}
     ACTIONS = {"lights": (["head_mode", "head_color", "head_cycle", "tail_mode", "tail_color", "tail_cycle"], "分别设置头尾灯模式、颜色和周期"),
                "sleep": ([], "进入休眠"), "wake": ([], "唤醒"), "auto_sleep": (["minutes"], "配置心跳断联后的自动休眠等待时间"),
                "sdk_mode": (["enabled", "frequency"], "配置运动 SDK 模式及关节数据频率")}
     def __init__(self, native): self.native = native
     def get_tool(self):
-        return tool("device", "actuator", "山猫 S10 灯光与休眠管理", action_schema(self.ACTIONS, {
+        result = tool("device", "actuator", "山猫 S10 灯光与休眠管理；休眠和 SDK 模式更改需要显式 confirm=true", action_schema(self.ACTIONS, {
             "head_mode": {"type": "integer", "enum": list(range(6))}, "tail_mode": {"type": "integer", "enum": list(range(6))},
             "head_color": {"type": "integer", "enum": list(range(4))}, "tail_color": {"type": "integer", "enum": list(range(4))},
             "head_cycle": {"type": "integer", "minimum": 1}, "tail_cycle": {"type": "integer", "minimum": 1},
             "minutes": {"type": "integer", "minimum": 1}, "enabled": {"type": "boolean"},
             "frequency": {"type": "integer", "minimum": 1, "maximum": 200},
+            "confirm": {"type": "boolean", "description": "Required true for sleep/wake and SDK-mode changes."},
         }))
+        return _mark_dangerous(result, self.CONFIRM_ACTIONS)
     def start(self): pass
     def stop(self): pass
     def dispatch(self, action, args):
+        if action in self.CONFIRM_ACTIONS:
+            error = _confirmation_error(action, args)
+            if error:
+                return error
         if action == "start": return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
@@ -480,13 +619,21 @@ class S10DevicePlugin:
 
 
 class S10ChargePlugin:
+    CONFIRM_ACTIONS = {"start_charging", "stop_charging"}
     def __init__(self, native): self.native = native
     def get_tool(self):
-        return tool("charging", "actuator", "山猫 S10 自主充电控制（机器人需已位于充电桩前）", action_schema(
-            {"start_charging": ([], "开始自主充电"), "stop_charging": ([], "停止自主充电")}, {}))
+        result = tool("charging", "actuator", "山猫 S10 自主充电控制；开始自主充电需要显式 confirm=true", action_schema(
+            {"start_charging": ([], "开始自主充电"), "stop_charging": ([], "停止自主充电")}, {
+                "confirm": {"type": "boolean", "description": "Required true to start autonomous charging."},
+            }))
+        return _mark_dangerous(result, self.CONFIRM_ACTIONS)
     def start(self): pass
     def stop(self): pass
     def dispatch(self, action, args):
+        if action in self.CONFIRM_ACTIONS:
+            error = _confirmation_error(action, args)
+            if error:
+                return error
         if action == "start": return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}

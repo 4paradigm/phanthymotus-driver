@@ -14,10 +14,10 @@
 - `model` 返回官方 `S10.urdf`；`joints` 按 URDF 的固定 16 关节顺序返回 `sensor/skeleton` 结构（q/dq/tau/temperature），并在运控姿态可用时附带 `imu_quat`。`imu` 从运控报告提取加速度、角速度和姿态；`joint_state` 保留原生电机状态；`loco_state` 合并运控和基础状态报告；`battery` 提供电池列表。
 - 急停、充电及设备健康状态分别保留在 `loco_state`、`battery` 或汇总 `state`，不再拆成多张厂商专用状态卡。
 - `errors` 提供原生协议聚合故障列表；`navigation_status` 提供导航任务、定位与置信度报告。
-- `loco` 沿用 As2W/Go2 的执行器命名，基础动作使用 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`。S10 专属的 `gait`、`mode`、归一化 `axis` 和 `rl_control` 也在同一卡片中。真实速度仅导航模式有效；速度报文不等待响应，以 10Hz 刷新，`duration` 默认 1 秒后归零，`duration=-1` 持续至 `stop_move`。
-- `device` 提供头尾灯语、休眠/唤醒、心跳断联后自动休眠时间和 SDK 模式。自定义灯语按官方 `CustomMode` 与 `Led` 列表结构编码；SDK 频率限制为 1–200 Hz 且必须整除 1000。
-- `charging` 提供 `start_charging`、`stop_charging` 两个自主充电动作；卡片生命周期的 `start`/`stop` 只报告 `ready`/`idle`，不会触发充电。风险较高的 `Charge=2` 强制清除状态不开放为普通动作。
-- 本设备为 S10 Pro，默认 `model_variant` 设为 `pro` 并注册 `navigation` 动作卡，包含单点任务、取消、状态、定位初始化、地图位姿和感知状态。文档指出非 Pro 版本会以通用错误 `0xE00A` 拒绝导航功能；若将驱动用于标准版，需将配置改为 `standard` 并从 `driver.yaml` 卡片清单移除导航卡。
+- `loco` 沿用 As2W/Go2 的执行器命名，基础动作使用 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`。S10 专属的 `gait`、`mode`、归一化 `axis` 和 `rl_control` 也在同一卡片中。真实速度仅导航模式有效；速度报文不等待响应，以 10Hz 刷新，`duration` 默认 1 秒后归零，最长 60 秒；兼容输入 `duration=-1` 也会在 60 秒后自动归零。物理运动和控制模式动作必须显式传入 `confirm=true`；`stop_move` 无需确认。
+- `device` 提供头尾灯语、休眠/唤醒、心跳断联后自动休眠时间和 SDK 模式。休眠、唤醒、自动休眠配置和 SDK 模式更改必须显式传入 `confirm=true`。自定义灯语按官方 `CustomMode` 与 `Led` 列表结构编码；SDK 频率限制为 1–200 Hz 且必须整除 1000。
+- `charging` 提供 `start_charging`、`stop_charging` 两个自主充电动作，两者都必须显式传入 `confirm=true`；卡片生命周期的 `start`/`stop` 只报告 `ready`/`idle`，不会触发充电。风险较高的 `Charge=2` 强制清除状态不开放为普通动作。
+- 本设备为 S10 Pro，默认 `model_variant` 设为 `pro` 并注册 `navigation` 动作卡，包含单点任务、取消、状态、定位初始化、地图位姿和感知状态。单点导航和定位初始化必须显式传入 `confirm=true`；导航任务异步返回 action ID 并通过 ACP 报告完成、取消或错误。文档指出非 Pro 版本会以通用错误 `0xE00A` 拒绝导航功能；若将驱动用于标准版，需将配置改为 `standard` 并从 `driver.yaml` 卡片清单移除导航卡。
 
 ## 与参考驱动的差异
 
