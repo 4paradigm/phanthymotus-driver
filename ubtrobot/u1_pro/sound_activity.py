@@ -14,8 +14,8 @@ class SoundActivityGate:
                 or not isinstance(minimum_dbfs, (int, float))
                 or not isinstance(margin_db, (int, float))
                 or not math.isfinite(minimum_dbfs) or not -90 <= minimum_dbfs <= -10
-                or not math.isfinite(margin_db) or not 3 <= margin_db <= 30):
-            raise ValueError('activity minimum_dbfs must be [-90,-10], margin_db [3,30]')
+                or not math.isfinite(margin_db) or not 1 <= margin_db <= 30):
+            raise ValueError('activity minimum_dbfs must be [-90,-10], margin_db [1,30]')
         self.minimum_dbfs, self.margin_db = minimum_dbfs, margin_db
         self.reset()
 
