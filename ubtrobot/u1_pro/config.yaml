@@ -22,6 +22,6 @@ sound_direction:
   # Install it using deploy/native_doa_manage.py before starting this backend.
   source: native
   activity:
-    # Initial tuning values, not measured acoustic SPL. Quiet startup ~1 second.
-    minimum_dbfs: -50.0
-    margin_db: 10.0
+    # Operator-selected B baseline, not acoustic SPL. Quiet startup ~1 second.
+    minimum_dbfs: -65.0
+    margin_db: 2.5

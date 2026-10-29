@@ -34,9 +34,29 @@
 | 开启自动待机动作 | `{"action":"enable"}` |
 | 查询当前设置 | `{"action":"status"}` |
 
-`status` 返回 `{"ok":true,"code":"OK","data":{"enabled":true},"source":"vendor_user_config"}`。其中 `enabled` 是持久配置中的开关值，不是电机是否静止的实时反馈。修改成功返回 `ok`、`requested`、`enabled` 和读回的 `state`；服务拒绝、超时、读回失败或状态不一致均报错。
+`status`、`enable`、`disable` 均异步执行。MCP 首次返回会显示具体命令、中文说明、目标配置及任务编号。例如关闭操作返回：
 
-`enable`/`disable` 的修改命令遇到外层进程等待超时或内层 `timeout` 退出（124/137）时，驱动会自动调用一次 `status`，读回另设 5 秒等待上限，且不重发修改请求。操作仍作为超时错误返回；MCP 的 `error.message` 保留超时原因、目标 `requested`、读回结果和 `request completion unconfirmed; no automatic retry`：
+```json
+{
+  "action": "disable",
+  "message": "正在关闭自动待机动作及自动眨眼，允许当前动作执行完成。",
+  "request": {"config_key": "idle_action_enabled", "enabled": false},
+  "state": "running",
+  "action_id": "<UUID>"
+}
+```
+
+`request.enabled` 表示本次修改的目标值；查询操作只提供 `config_key`，不预先报告开关值。`running` 表示后台正在处理，最终结果以 ACP 完成通知为准。
+
+驱动在后台完成操作，再向 Agent Core 的 `/api/acp/complete` POST 一次完成通知。可在输入中提供唯一的 `action_id`（1–128 位 ASCII 字母、数字或 `_ . : -`）；省略时生成 UUID。卡片声明 `x-completion`（上述三个动作，兜底超时 45 秒）及独立的 `u1_idle_config` 资源。
+
+完成通知包含相同的 `action_id`、`tool:"idle_actions"` 和 `status:"completed"` 或 `status:"error"`。成功时，业务结果位于通知的 `result.result`：查询结果为 `{"ok":true,"code":"OK","data":{"enabled":true},"source":"vendor_user_config"}`，修改结果包含 `ok`、`requested`、`enabled` 和读回的 `state`。其中 `enabled` 是持久配置中的开关值；任务完成表示配置查询/写入与读回确认完成，不表示电机已经静止。
+
+卡片一次只接受一个操作，忙碌时立即拒绝新请求，不建立等待队列。`start`/`stop` 同步返回；停止卡片后不再接收新的配置操作，已接受的任务继续完成并回报真实结果。恢复接收可调用 `start`。ACP 通知发送失败时会记录转义后的任务 ID，平台通过声明的超时兜底。
+
+服务拒绝、超时、读回失败或状态不一致通过 ACP 的 `status:"error"` 与 `result.message` 回报。厂商错误详情会转义换行、ESC、NUL 等控制字符并限制长度（每段 240 字符，最终错误消息最多 1024 字符），避免原始输出进入日志或完成通知。
+
+`enable`/`disable` 的修改命令遇到外层进程等待超时或内层 `timeout` 退出（124/137）时，后台任务会自动读回一次当前设置，读回另设 5 秒等待上限，且不重发修改请求。操作仍通过 ACP 作为超时错误回报；`result.message` 保留超时原因、目标 `requested`、读回结果和 `request completion unconfirmed; no automatic retry`：
 
 | 错误消息中的读回结果 | 含义 |
 | --- | --- |
@@ -44,9 +64,11 @@
 | `readback=mismatch; observed_enabled=true` | 示例：目标为关闭，读回的持久设置仍为开启 |
 | `readback=unknown; observed_enabled=unknown; readback_error=...` | 查询也失败，当前设置未知，并附查询错误原因 |
 
-读回只是查询时刻的设置快照。即使符合目标，也不代表收到了本次请求的成功响应；不符合目标时，厂商服务也可能稍后才完成处理。调用方应据此决定后续查询或重试。直接调用 `status` 超时只报告查询失败，不递归查询。
+读回只是查询时刻的设置快照。即使符合目标，也不代表收到了本次请求的成功响应；不符合目标时，厂商服务也可能稍后才完成处理。调用方应据此决定后续查询或重试。`status` 任务超时只通过 ACP 报告查询失败，不递归查询。
 
-关闭会让当前固件的循环待机分支和自动眨眼分支退出，覆盖 `S017/S018/S019/S007` 待机动作及 `S020/S032/S033` 交互眨眼。固件仍可能执行待处理的一次性 `Z001` 归位，`expression`/`head` 显式请求的动作也仍可执行。这张卡片不提供急停。
+关闭会让当前固件的循环待机分支和自动眨眼分支退出，禁止继续安排 `S017/S018/S019/S007` 待机动作及 `S020/S032/S033` 交互眨眼。但已经提交给运控的轨迹可能继续执行到结束：当前固件的 `PlayTrajectoryMotionFileNode::onHalted()` 清理本地等待状态，没有向运控发送轨迹取消请求。一次真机日志中，关闭配置被行为树读到后，已提交的 `S018` 轨迹又过了约 16.7 秒才返回。因此，`disable` 成功表示待机偏好已关闭，不表示机器人已经静止。
+
+固件仍可能执行待处理的一次性 `Z001` 归位，`expression`/`head` 显式请求的动作也仍可执行。这张卡片不提供急停。厂商另有 `/mc/uworld_motion_stop`（`uworld_motion_msgs/srv/Trigger`），但请求没有动作名称或 ID，无法用它指定只取消某条待机轨迹；默认关闭操作不调用该接口。
 
 调用链为：驱动 → `nsenter` 进入宿主命名空间 → 宿主 Docker → 已运行的 `walker-behavior.behavior-1` → `/sys/config/user_manager/set_config`（`config_msgs/srv/SetConfig`），仅提交 `idle_action_enabled` 布尔值。ROSA 使用 `--no-daemon` 发现服务；收到业务成功响应后，从厂商 `/data/user_data/user_config_center.json` 读回核验。驱动不直接改写该文件，也不重启厂商程序。
 
@@ -193,7 +215,7 @@ native 后端现在先判断声音活动，再接受厂商方位事件；保持�
 
 启动、设备切换、音频断流恢复或定位服务重新发现后，先用约 1 秒音频学习背景（建议此时保持安静）。阈值为 `max(minimum_dbfs, background_dbfs + margin_db)`。连续约 150ms 超过阈值后进入活动状态，再等待至少 0.5 秒才接受新定位结果；最近约 150ms 没有超过门限就抑制并清空方向，但保留最多 0.8 秒的活动上下文以容纳字词停顿。超过 0.8 秒安静后重新要求起声和等待。公开心跳最多再等 500ms，输出 `no_event`、`angle_deg: null`。低于阈值期间背景缓慢更新，活动期间冻结背景，避免持续说话/音乐把自身吸收为噪声。回放通道、直流、启动学习期、无效 PCM 都不能单独触发方向。
 
-`config.yaml` 的 `sound_direction.activity` 可调整 `minimum_dbfs`（默认 -50，范围 -90 至 -10）和 `margin_db`（默认 10，范围 1 至 30）。默认值只是初始调试值，尚未经真机门控验收：漏掉较轻声音时可降低门限，背景误触发时可提高门限；过高会漏检短句或远处声音。暂不提供网页调参或持久化设置卡。
+`config.yaml` 的 `sound_direction.activity` 可调整 `minimum_dbfs`（默认 -65，范围 -90 至 -10）和 `margin_db`（默认 2.5，范围 1 至 30）。默认值只是初始调试值，尚未经真机门控验收：漏掉较轻声音时可降低门限，背景误触发时可提高门限；过高会漏检短句或远处声音。暂不提供网页调参或持久化设置卡。
 
 卡片 `info` → `source_status.activity` 提供 `active`、`reason`、`level_dbfs`、`background_dbfs`、`threshold_dbfs` 及当前配置。`calibrating` 为学习期，`below_threshold` 为被声音门限抑制，`settling` 为等待定位窗口更新，`sound_detected` 为允许接收事件，`unsupported_or_invalid_audio` 为输入布局/格式不受支持。仅支持已核验的 Bothlent UAC Dongle / Mic Arry 8、16kHz S16LE 8 通道布局，未知输入保守抑制。
 
