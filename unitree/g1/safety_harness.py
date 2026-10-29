@@ -2099,14 +2099,21 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 else:
                     proposal_gate.fail_recoverable_stop(reason)
 
-    @motion_synchronized
-    def do_stop_nav():
-        nonlocal state, nav_cmd, speed_zone
+    def pause_native_nav_for_stop(reason):
+        """Best-effort pause request; this does not confirm navigation ended."""
         try:
-            slam_client.PauseNav()
-        except Exception:
-            pass
-        was_nav = state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED)
+            code, _ = slam_client.PauseNav()
+            if code != 0:
+                print(f"[SmartMotion] {reason}: PauseNav returned {code}", flush=True)
+        except Exception as exc:
+            print(f"[SmartMotion] {reason}: PauseNav failed: {exc}", flush=True)
+
+    @motion_synchronized
+    def do_stop_nav(was_nav=None):
+        nonlocal state, nav_cmd, speed_zone
+        pause_native_nav_for_stop("stop_nav")
+        if was_nav is None:
+            was_nav = state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED)
         state = MotionState.IDLE
         nav_cmd = None
         speed_zone = SpeedZone.NORMAL
@@ -2256,6 +2263,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         was_proposal_motion = bool(
             current_cmd and current_cmd.get("source") == "velocity_proposal"
         )
+        was_native_nav = state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED)
         was_active = state in (
             MotionState.MOVING,
             MotionState.NAVIGATING,
@@ -2276,11 +2284,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         if was_proposal_motion:
             proposal_gate.disarm(f"{reason_str}_latched")
         stop_result = do_stop(reason_str)
-        if state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
-            try:
-                slam_client.PauseNav()
-            except Exception:
-                pass
+        if was_native_nav:
+            pause_native_nav_for_stop(f"emergency_stop({reason_str})")
         with motion.lock:
             if stop_result.get("ret") == 0 and (not current_cmd or
                     current_cmd.get("action_id") == stop_result.get("action_id")):
@@ -3694,11 +3699,26 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 )
                 result = {"code": code, "response": resp}
             elif method == "shutdown":
-                if not motion.is_idle():
-                    do_stop("shutdown")
-                handle_unbind_velocity_proposal("process_shutdown")
-                running = False
-                result = {"status": "shutdown"}
+                with motion_command_lock:
+                    was_native_nav = state in (
+                        MotionState.NAVIGATING, MotionState.NAV_PAUSED
+                    )
+                    if was_native_nav:
+                        # Brake before the potentially slow SLAM RPC.  Preserve
+                        # the navigation snapshot across do_stop's state reset.
+                        try:
+                            stop_loco_client.StopMove()
+                        except Exception:
+                            pass
+                    if not motion.is_idle():
+                        do_stop("shutdown")
+                    if was_native_nav:
+                        # Preserve navigation cleanup and event even if the
+                        # preceding logical stop reset state to IDLE.
+                        do_stop_nav(was_nav=was_native_nav)
+                    handle_unbind_velocity_proposal("process_shutdown")
+                    running = False
+                    result = {"status": "shutdown"}
             else:
                 result = {"error": f"unknown SmartMotion method: {method}"}
 

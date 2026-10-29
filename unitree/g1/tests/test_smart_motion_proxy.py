@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
 from pathlib import Path
 import queue
 import threading
 import time
+import types
 import unittest
 
 from safety_harness import (
@@ -15,6 +18,187 @@ from safety_harness import (
     request_parent_get_fsm_id,
     request_parent_stop_velocity_proposal,
 )
+
+
+class NativeNavigationStopPathsTest(unittest.TestCase):
+    """Execute the subprocess's real branch bodies with offline fake clients."""
+
+    @classmethod
+    def setUpClass(cls):
+        source = textwrap.dedent(inspect.getsource(_run_smart_motion_process))
+        worker = ast.parse(source).body[0]
+        cls.pause = next(
+            node for node in worker.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "pause_native_nav_for_stop"
+        )
+        cls.stop_nav = next(
+            node for node in worker.body
+            if isinstance(node, ast.FunctionDef) and node.name == "do_stop_nav"
+        )
+        cls.stop_nav.decorator_list = []
+        cls.emergency = next(
+            node for node in worker.body
+            if isinstance(node, ast.FunctionDef) and node.name == "emergency_stop"
+        )
+        cls.emergency.decorator_list = []
+        cls.shutdown = next(
+            node for node in ast.walk(worker)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "method"
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "shutdown"
+        )
+
+    def make_path(self, path, state, idle, pause_result=0, stop_raises=False):
+        states = types.SimpleNamespace(
+            IDLE="idle", MOVING="moving", NAVIGATING="navigating", NAV_PAUSED="nav_paused"
+        )
+        calls = []
+        lock = threading.RLock()
+        motion = types.SimpleNamespace(lock=threading.RLock(), is_idle=lambda: idle)
+        state_box = [state]
+        nav_cmd_box = [{"target_name": "test"}]
+        speed_zone_box = ["limited"]
+        events = []
+        env = {
+            "MotionState": states,
+            "SpeedZone": types.SimpleNamespace(NORMAL="normal"),
+            "state": state,
+            "current_cmd": None,
+            "speed_zone": "normal",
+            "stop_repeat_count": 0,
+            "motion": motion,
+            "motion_command_lock": lock,
+            "proposal_gate": types.SimpleNamespace(disarm=lambda reason: None),
+            "publish_event": lambda *args: events.append(args),
+            "running": True,
+            "result": None,
+        }
+
+        def brake():
+            calls.append("brake")
+            if stop_raises:
+                raise RuntimeError("brake failed")
+            return 0
+
+        def pause():
+            calls.append("pause")
+            if isinstance(pause_result, Exception):
+                raise pause_result
+            return pause_result, None
+
+        def stop(reason):
+            calls.append("do_stop")
+            # Match the ordinary nav path's logical reset, including failure.
+            state_box[0] = states.IDLE
+            return {"ret": 17 if stop_raises else 0}
+
+        def unbind(reason):
+            calls.append("unbind")
+            if state_box[0] in (states.NAVIGATING, states.NAV_PAUSED):
+                pause()
+            stop(reason)
+
+        env.update(
+            stop_loco_client=types.SimpleNamespace(StopMove=brake),
+            loco_client=types.SimpleNamespace(SetFsmId=lambda _id: 0),
+            slam_client=types.SimpleNamespace(PauseNav=pause),
+            do_stop=stop,
+            handle_unbind_velocity_proposal=unbind,
+        )
+        if path == "shutdown":
+            body = self.shutdown.body
+        else:
+            body = self.emergency.body
+        # Share the actual branch's state cell with fake do_stop/unbind, so
+        # do_stop's logical reset is visible to subsequent branch conditions.
+        class SharedState(ast.NodeTransformer):
+            shared = {"state": "state_box", "nav_cmd": "nav_cmd_box",
+                      "speed_zone": "speed_zone_box"}
+
+            def visit_Name(self, node):
+                if node.id not in self.shared:
+                    return node
+                return ast.copy_location(ast.Subscript(
+                    value=ast.Name(id=self.shared[node.id], ctx=ast.Load()),
+                    slice=ast.Constant(value=0), ctx=node.ctx,
+                ), node)
+
+            def visit_Nonlocal(self, node):
+                names = [name for name in node.names if name not in self.shared]
+                return ast.copy_location(ast.Nonlocal(names=names), node) if names else None
+
+        body = [SharedState().visit(node) for node in ast.parse(
+            ast.unparse(ast.Module(body=body, type_ignores=[]))
+        ).body]
+        stop_nav = SharedState().visit(ast.parse(ast.unparse(self.stop_nav)).body[0])
+        wrapper = ast.FunctionDef(
+            name="run_path", args=ast.arguments(posonlyargs=[], args=[],
+                kwonlyargs=[], kw_defaults=[], defaults=[]),
+            body=body, decorator_list=[],
+        )
+        if path == "emergency":
+            wrapper.args.args = [ast.arg(arg="reason_str"), ast.arg(arg="extra")]
+            wrapper.args.defaults = [ast.Constant(value=None)]
+        outer = ast.FunctionDef(
+            name="build_path", args=ast.arguments(posonlyargs=[], args=[],
+                kwonlyargs=[], kw_defaults=[], defaults=[]),
+            body=[
+                ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())],
+                    value=ast.Subscript(value=ast.Name(id="env", ctx=ast.Load()),
+                        slice=ast.Constant(value=name), ctx=ast.Load()))
+                for name in ("current_cmd", "stop_repeat_count")
+            ] + [self.pause, stop_nav, wrapper,
+                 ast.Return(value=ast.Name(id="run_path", ctx=ast.Load()))],
+            decorator_list=[],
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[outer], type_ignores=[]))
+        namespace = {**env, "env": env, "state_box": state_box,
+                     "nav_cmd_box": nav_cmd_box, "speed_zone_box": speed_zone_box}
+        exec(compile(module, "<smart-motion-path>", "exec"), namespace)
+        run = namespace["build_path"]()
+        return run, calls, state_box, nav_cmd_box, speed_zone_box, events
+
+    def test_shutdown_and_emergency_brake_then_pause_for_native_nav(self):
+        for path in ("shutdown", "emergency"):
+            for state in ("navigating", "nav_paused"):
+                for idle in (True, False):
+                    for pause_result in (0, 7, RuntimeError("pause failed")):
+                        for stop_raises in (False, True):
+                            with self.subTest(path=path, state=state, idle=idle,
+                                              pause_result=pause_result,
+                                              stop_raises=stop_raises):
+                                run, calls, state_box, nav_cmd, speed_zone, events = self.make_path(
+                                    path, state, idle, pause_result, stop_raises
+                                )
+                                run() if path == "shutdown" else run("tilt")
+                                self.assertEqual(calls.count("pause"), 1)
+                                self.assertLess(calls.index("brake"), calls.index("pause"))
+                                self.assertIn("do_stop", calls)
+                                if path == "shutdown":
+                                    if not idle:
+                                        self.assertLess(calls.index("do_stop"), calls.index("pause"))
+                                    else:
+                                        self.assertLess(calls.index("pause"), calls.index("do_stop"))
+                                    self.assertIn("unbind", calls)
+                                    self.assertEqual(state_box[0], "idle")
+                                    self.assertIsNone(nav_cmd[0])
+                                    self.assertEqual(speed_zone[0], "normal")
+                                    self.assertEqual(events, [("nav_stopped", {"reason": "command"})])
+
+    def test_non_navigation_does_not_pause(self):
+        for path in ("shutdown", "emergency"):
+            for state in ("idle", "moving"):
+                for idle in (True, False):
+                    with self.subTest(path=path, state=state, idle=idle):
+                        run, calls, _, _, _, _ = self.make_path(path, state, idle)
+                        run() if path == "shutdown" else run("tilt")
+                        self.assertNotIn("pause", calls)
+                        self.assertIn("do_stop", calls)
 
 
 class PrioritizedRpcGateTest(unittest.TestCase):
