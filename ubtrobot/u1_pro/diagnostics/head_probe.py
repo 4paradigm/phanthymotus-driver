@@ -80,6 +80,19 @@ def point(value):
             for key in ("positions", "velocities", "accelerations", "effort")}
 
 
+def log_value(value, depth=0):
+    """Bound untrusted DDS text/collections before JSON serialization."""
+    if depth > 8:
+        return "[depth limit]"
+    if isinstance(value, str):
+        return value[:256].encode("unicode_escape").decode("ascii")[:256]
+    if isinstance(value, dict):
+        return {str(k)[:64]: log_value(v, depth + 1) for k, v in list(value.items())[:32]}
+    if isinstance(value, (list, tuple)):
+        return [log_value(v, depth + 1) for v in value[:16]]
+    return value
+
+
 def state(message):
     return {"joint_names": list(message.joint_names)[:16],
             "desired": point(message.desired), "actual": point(message.actual),
@@ -118,7 +131,7 @@ def run(args, request):
 
     def emit(event, **data):
         print(json.dumps({"event": event, "wall_time": time.time(),
-                          "monotonic": time.monotonic(), **data}, allow_nan=False), flush=True)
+                          "monotonic": time.monotonic(), **log_value(data)}, allow_nan=False), flush=True)
 
     def receive(topic, data):
         now = time.monotonic()
@@ -134,6 +147,7 @@ def run(args, request):
             emitted[topic] = now
 
     client = None
+    attempted = False
     try:
         emit("session", read_only=request is None, backend=SERVICE, domain=2,
              rmw=get_rmw_implementation_identifier(), physical_stop_supported=False,
@@ -141,12 +155,12 @@ def run(args, request):
         node.create_subscription(JointTrajectoryControllerState, STATE,
                                  lambda m: receive(STATE, state(m)), qos_profile_sensor_data)
         node.create_subscription(JointState, JOINTS,
-                                 lambda m: receive(JOINTS, {"joint_names": list(m.name),
-                                                          "positions": list(m.position),
-                                                          "velocities": list(m.velocity)}), qos_profile_sensor_data)
+                                 lambda m: receive(JOINTS, {"joint_names": list(m.name)[:16],
+                                                          "positions": list(m.position)[:16],
+                                                          "velocities": list(m.velocity)[:16]}), qos_profile_sensor_data)
         node.create_subscription(JointTrajectory, "/mc/neck_trj_controller/joint_trajectory",
                                  lambda m: receive("trajectory", {
-                                     "joint_names": list(m.joint_names),
+                                     "joint_names": list(m.joint_names)[:16],
                                      "points": [point(v) for v in m.points[:16]]}), qos_profile_sensor_data)
         start = time.monotonic()
         # Observe BEFORE any send. Discovery failure must not trigger retries.
@@ -177,6 +191,7 @@ def run(args, request):
                 for key, value in request[group].items():
                     setattr(getattr(msg, group), key, value)
             emit("request_attempt", service=SERVICE, request=request)
+            attempted = True  # An exception can still leave a request in flight.
             future = client.call_async(msg)  # The ONLY motion submission site; never retried.
         replied = False
         while time.monotonic() - start < args.seconds:
@@ -190,6 +205,11 @@ def run(args, request):
              arrival_confirmed=False, physical_stop_confirmed=False,
              feedback_fresh=ready(latest, time.monotonic()))
         return 2 if future is not None and not replied else 0
+    except BaseException as exc:
+        emit("error", error_type=type(exc).__name__, message=str(exc),
+             request_attempted=attempted, arrival_confirmed=False,
+             physical_stop_confirmed=False, outcome_unknown=attempted)
+        raise
     finally:
         if client is not None:
             node.destroy_client(client)

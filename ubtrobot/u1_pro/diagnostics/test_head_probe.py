@@ -72,7 +72,7 @@ class ProbeTests(unittest.TestCase):
         data["actual"]["positions"] = [float("nan")]
         self.assertFalse(probe.ready(latest, 10.2))
 
-    def runtime(self, request=None, fail=False):
+    def runtime(self, request=None, fail=False, completed=False, response_error=False):
         now = [0.0]
         node = Mock()
         callbacks = {}
@@ -81,7 +81,10 @@ class ProbeTests(unittest.TestCase):
         node.get_service_names_and_types.return_value = []
         client = node.create_client.return_value
         future = client.call_async.return_value
-        future.done.return_value = False
+        future.done.return_value = completed
+        future.result.return_value = NS(success=True, status=0, message="ok\n\x1b" + "x" * 1000)
+        if response_error:
+            future.result.side_effect = RuntimeError("response failed")
         if fail:
             client.call_async.side_effect = RuntimeError("transport uncertain")
         client.wait_for_service.return_value = True
@@ -99,13 +102,24 @@ class ProbeTests(unittest.TestCase):
                 "control_msgs.msg": NS(JointTrajectoryControllerState=object),
                 "uworld_motion_msgs.srv": NS(SoundSource=NS(Request=lambda: NS(
                     revolute_setup=NS(), prismatic_setup=NS())))}
-        with patch.dict(sys.modules, mods), patch.object(probe.time, "monotonic", side_effect=lambda: now[0]), patch("builtins.print"):
-            if fail:
+        with patch.dict(sys.modules, mods), patch.object(probe.time, "monotonic", side_effect=lambda: now[0]), patch("builtins.print") as printed:
+            if fail or response_error:
                 with self.assertRaises(RuntimeError):
                     probe.run(NS(seconds=8), request)
             else:
                 result = probe.run(NS(seconds=8), request)
-                self.assertEqual(result, 2 if request else 0)
+                self.assertEqual(result, 2 if request and not completed else 0)
+        events = [json.loads(c.args[0]) for c in printed.call_args_list]
+        if completed and not response_error:
+            receipt = next(e for e in events if e["event"] == "receipt")
+            self.assertLessEqual(len(receipt["message"]), 256)
+            self.assertNotIn("\n", receipt["message"])
+            self.assertNotIn("\x1b", receipt["message"])
+            self.assertFalse(receipt["arrival_confirmed"])
+        if fail or response_error:
+            error = next(e for e in events if e["event"] == "error")
+            self.assertTrue(error["request_attempted"])
+            self.assertTrue(error["outcome_unknown"])
         node.destroy_node.assert_called_once()
         ros.shutdown.assert_called_once()
         return node, client
@@ -123,6 +137,17 @@ class ProbeTests(unittest.TestCase):
     def test_transport_exception_never_retries(self):
         _, client = self.runtime({"degree": 2, "revolute_setup": {}, "prismatic_setup": {}}, fail=True)
         client.call_async.assert_called_once()
+
+    def test_receipt_is_bounded_not_arrival(self):
+        self.runtime({"degree": 2, "revolute_setup": {}, "prismatic_setup": {}}, completed=True)
+
+    def test_response_exception_is_structured_and_cleaned_up(self):
+        self.runtime({"degree": 2, "revolute_setup": {}, "prismatic_setup": {}}, completed=True, response_error=True)
+
+    def test_untrusted_collection_and_strings_are_bounded(self):
+        data = probe.log_value({"joint_names": ["a\n\x1b" * 300] * 500})
+        self.assertEqual(len(data["joint_names"]), 16)
+        self.assertTrue(all(len(s) <= 256 and "\x1b" not in s and "\n" not in s for s in data["joint_names"]))
 
 
 if __name__ == "__main__":
