@@ -119,10 +119,15 @@ class G1DeviceBundle:
             self._plugins.append(LedPlugin(plugins_cfg["led"], namespace, executor, audio_client))
             print("[bundle] LedPlugin loaded")
 
-        if plugins_cfg.get("loco", {}).get("enabled", False):
-            from device import LocoStatePlugin, LocoPlugin, StatePlugin
-            loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)
+        loco_state = None
+        if (plugins_cfg.get("loco", {}).get("enabled", False)
+                or plugins_cfg.get("loco_servo", {}).get("enabled", False)):
+            from device import LocoStatePlugin
+            loco_state = LocoStatePlugin(plugins_cfg.get("loco", {}), namespace, executor)
             self._plugins.append(loco_state)
+
+        if plugins_cfg.get("loco", {}).get("enabled", False):
+            from device import LocoPlugin, StatePlugin
             # LocoPlugin reuses StatePlugin's posture computed from the shared source.
             posture_source = None
             if plugins_cfg.get("state", {}).get("enabled", False):
@@ -135,6 +140,15 @@ class G1DeviceBundle:
                                             state_node=loco_state.node,
                                             posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+
+        if plugins_cfg.get("loco_servo", {}).get("enabled", False):
+            from loco_servo import LocoServoPlugin
+            from loco_servo_transport import create_g1_loco_servo_transport
+            transport = create_g1_loco_servo_transport()
+            self._plugins.append(LocoServoPlugin(
+                plugins_cfg["loco_servo"], namespace, executor, transport, loco_state.node.get_fsm,
+            ))
+            print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("loco_relative_move", {}).get("enabled", False):
             if not plugins_cfg.get("loco", {}).get("enabled", False):
@@ -344,21 +358,26 @@ class G1DeviceBundle:
             ),
         )
         failure = None
+        servo_failure = None
         for i, p in ordered_plugins:
             try:
                 p.stop()
             except Exception as exc:
                 if failure is None:
                     failure = exc
+                if getattr(p, "PREFIX", "") == "locoservo":
+                    servo_failure = exc
                 print(
                     f"[bundle] Plugin {i} ({type(p).__name__}) stop() FAILED: {exc}",
                     flush=True,
                 )
         # Keep feedback alive when any owner failed to complete its shutdown.
         low_state = getattr(self, "_low_state", None)
-        if failure is not None and low_state is not None:
-            raise failure
+        if servo_failure is not None:
+            raise servo_failure
         if low_state is not None:
+            if failure is not None:
+                raise failure
             low_state.stop()
         print("[bundle] All plugins stopped")
 
@@ -503,7 +522,13 @@ def make_handler():
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        reply = {"content": [{"type": "text", "text": json.dumps(result)}]}
+                        # Interrupt hooks must not treat an unacknowledged or
+                        # failed servo stop as a successful MCP tool call.
+                        if (name == "loco_servo" and isinstance(result, dict)
+                                and result.get("state") in ("error", "stop_pending", "stop_failed")):
+                            reply["isError"] = True
+                        ok(reply)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:

@@ -40,6 +40,13 @@ plugins:
     velocity_proposal_stop_linear_epsilon: 0.03
     velocity_proposal_stop_yaw_epsilon: 0.05
     velocity_proposal_allowed_fsm_ids: [500, 801]
+  # 独立的 motus.control/1 twist 流；不接入旧 motion_sequence 安全链。
+  # 与 loco 等入口不会自动互斥；不要同时向同一底座发送指令。
+  loco_servo:
+    enabled: true
+    dry_run: true
+    expected_hz: 10
+    require_standing: true
   loco_relative_move:
     enabled: true
     # Closed-loop speed caps; requires only the loco_state publisher.

@@ -24,6 +24,7 @@ cards:
   - { name: loco_motion_state,      type: sensor }
   - { name: motion_events,          type: sensor }
   - { name: loco,                   type: actuator }
+  - { name: loco_servo,             type: actuator }
   - { name: loco_relative_move,     type: actuator }
   - { name: switch_mode,            type: actuator }
   - { name: switch_mode_expert,     type: actuator }
