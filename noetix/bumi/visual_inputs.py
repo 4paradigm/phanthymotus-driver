@@ -47,8 +47,8 @@ class RawCameraPublisher:
         self.epoch = uuid.uuid4().hex
         self.clocks = [ClockMap(), ClockMap()]
         self.error_at = 0
-        # The card is off by default; when enabled, sample the raw branch at a
-        # bounded rate instead of duplicating every 30 Hz capture frame over DDS.
+        # Sample the enabled raw branch at a bounded rate instead of duplicating
+        # every 30 Hz capture frame over DDS.
         self.min_interval_s = max(0.0, float(min_interval_s))
         self.last_publish = 0.0
 

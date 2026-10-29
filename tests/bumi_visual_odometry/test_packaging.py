@@ -38,7 +38,7 @@ def test_card_and_plugin_config_are_in_sync():
     assert {'name': 'rgbd_visual_odometry', 'type': 'sensor'} in driver['cards']
     config = yaml.safe_load((BUMI/'config.yaml').read_text())
     plugin = config['plugins']['visual_odometry']
-    assert plugin['enabled'] is False
+    assert plugin['enabled'] is True
     assert plugin['max_rate_hz'] == 10
     # The tool name lives in code; keep the driver card pointing at it.
     source = (BUMI/'visual_odometry.py').read_text()

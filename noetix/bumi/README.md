@@ -452,8 +452,7 @@ docker logs -f embodied-noetix-bumi
 
 Single container: the estimator runs inside this bundle, not in a sidecar.
 `main.py` starts a `VisualOdometryPlugin` when `plugins.visual_odometry.enabled`
-is true (**off by default**: full-resolution raw RGB-D and the ARM64 media/CPU
-impact have not been measured, so enabling is an explicit opt-in); the plugin
+is true (**enabled by default**); the plugin
 supervises exactly one `rtabmap_odom/rgbd_odometry` child and
 publishes a read-only `motus.odom/1` stream on
 `/bumi_visual_odometry/state/odom`. No second image, no second container, no USB
