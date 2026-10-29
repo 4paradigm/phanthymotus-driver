@@ -3863,9 +3863,6 @@ class RealSensePlugin:
         self._rgb_frame_topic = self._config.get(
             "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
         )
-        self._depth_frame_topic = self._config.get(
-            "depth_frame_topic", f"/{namespace}/camera/depth_frame"
-        )
         self._proc = None
         self._status_q = None
         self._status = {"state": "idle"}
@@ -3909,8 +3906,7 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 zlib (mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]
-                         + self._frame_outputs("depth"),
+            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
         }
 
     def _dist_tool(self) -> dict:
@@ -3924,15 +3920,15 @@ class RealSensePlugin:
         }
 
     def _frame_outputs(self, stream) -> list:
-        from camera_frame import DEPTH_SCHEMA, ENVELOPE_FORMAT, RGB_SCHEMA
+        from camera_frame import ENVELOPE_FORMAT, RGB_SCHEMA
         if not self._config.get("frame_enabled", True):
             return []
         return [{
             "port": f"{stream}_frame",
-            "topic": self._rgb_frame_topic if stream == "rgb" else self._depth_frame_topic,
+            "topic": self._rgb_frame_topic,
             "format": ENVELOPE_FORMAT,
             "ros_type": "std_msgs/msg/UInt8MultiArray",
-            "schema": RGB_SCHEMA if stream == "rgb" else DEPTH_SCHEMA,
+            "schema": RGB_SCHEMA,
         }]
 
     def _drain_status(self) -> dict:
@@ -4092,14 +4088,11 @@ def run_realsense_process(
     from std_msgs.msg import String as _String, UInt8MultiArray
     from sensor_msgs.msg import Image, CompressedImage
     from camera_frame import (
-        DEPTH_SCHEMA,
         RGB_SCHEMA,
         RealSenseClockNormalizer,
         build_calibrations,
-        build_depth_image_metadata,
         build_frame_metadata,
         build_intrinsics,
-        compress_depth_payload,
         encode_envelope,
         load_lidar_camera_calibration,
         realsense_extrinsics_transform,
@@ -4109,9 +4102,6 @@ def run_realsense_process(
     frame_enabled = bool(config_values.get("frame_enabled", True))
     rgb_frame_topic = config_values.get(
         "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
-    )
-    depth_frame_topic = config_values.get(
-        "depth_frame_topic", f"/{namespace}/camera/depth_frame"
     )
 
     _QOS = QoSProfile(
@@ -4132,10 +4122,6 @@ def run_realsense_process(
                 self.create_publisher(UInt8MultiArray, rgb_frame_topic, _QOS)
                 if frame_enabled else None
             )
-            self._depth_frame_pub = (
-                self.create_publisher(UInt8MultiArray, depth_frame_topic, _QOS)
-                if frame_enabled else None
-            )
 
             self._pipeline = None
             self._shutting_down = False
@@ -4145,13 +4131,11 @@ def run_realsense_process(
             self._last_status_time = 0.0
             self._serial = None
             self._rgb_calibration = None
-            self._depth_calibration = None
-            self._sequence = {"rgb": 0, "depth": 0}
+            self._sequence = {"rgb": 0}
             self._diagnostics = {
                 "reconnect_count": 0,
                 "framesets": 0,
                 "rgb_frame_published": 0,
-                "depth_frame_published": 0,
                 "invalid_source_stamps": 0,
                 "out_of_order_source_stamps": 0,
                 "color_coalesced": 0,
@@ -4185,8 +4169,7 @@ def run_realsense_process(
 
             self.get_logger().info(
                 f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} "
-                f"dist:{dist_topic} rgb_frame:{rgb_frame_topic if frame_enabled else 'disabled'} "
-                f"depth_frame:{depth_frame_topic if frame_enabled else 'disabled'}"
+                f"dist:{dist_topic} rgb_frame:{rgb_frame_topic if frame_enabled else 'disabled'}"
             )
             self._publish_status("starting")
 
@@ -4300,7 +4283,7 @@ def run_realsense_process(
                     "/work/calibration/g1_factory_nominal_lidar_camera.yaml",
                 )
             )
-            self._rgb_calibration, self._depth_calibration = build_calibrations(
+            self._rgb_calibration, _ = build_calibrations(
                 serial=self._serial,
                 rgb_intrinsics=self._intrinsics(color_profile),
                 depth_intrinsics=self._intrinsics(depth_profile),
@@ -4334,7 +4317,7 @@ def run_realsense_process(
                 profile = pipeline.start(config, self._on_frame)
                 self._configure_profile(profile)
                 self._camera_clock_normalizer = self._new_clock_normalizer()
-                self._sequence = {"rgb": 0, "depth": 0}
+                self._sequence = {"rgb": 0}
                 self._last_frame_monotonic = time.monotonic()
                 self._worker_stop.clear()
                 self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
@@ -4405,7 +4388,7 @@ def run_realsense_process(
         def _depth_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    depth_np, stamp, timing, receive_mono_ns, calibration, sequence, token = self._depth_q.get(timeout=0.5)
+                    depth_np, stamp, token = self._depth_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 if token != gates["camera_depth"].token():
@@ -4421,7 +4404,7 @@ def run_realsense_process(
                     msg.data = _zlib.compress(
                         depth_np.astype("<u2", copy=False).tobytes(), 1)
                     if not gates["camera_depth"].publish(
-                            token, self._depth_pub, msg, record=self._depth_frame_pub is None):
+                            token, self._depth_pub, msg):
                         continue
                 except Exception as e:
                     self._record_error(
@@ -4429,36 +4412,6 @@ def run_realsense_process(
                         f"[realsense] depth legacy publish error: {e}",
                     )
                     continue
-                if self._depth_frame_pub is None or calibration is None:
-                    continue
-                try:
-                    raw_payload = depth_np.astype("<u2", copy=False).tobytes()
-                    payload = compress_depth_payload(raw_payload)
-                    metadata = build_frame_metadata(
-                        schema=DEPTH_SCHEMA,
-                        frame_id="camera_depth_optical_frame",
-                        timing=timing,
-                        driver_receive_monotonic_ns=receive_mono_ns,
-                        sequence=sequence,
-                        image=build_depth_image_metadata(
-                            width=depth_np.shape[1],
-                            height=depth_np.shape[0],
-                            uncompressed_size=len(raw_payload),
-                            payload_size=len(payload),
-                            depth_scale_m=calibration["depth_scale_m"],
-                        ),
-                        calibration=calibration,
-                    )
-                    envelope = encode_envelope(metadata, payload)
-                    frame_msg = UInt8MultiArray()
-                    frame_msg.data = array("B", envelope)
-                    if gates["camera_depth"].publish(token, self._depth_frame_pub, frame_msg):
-                        self._diagnostics["depth_frame_published"] += 1
-                except Exception as e:
-                    self._record_error(
-                        "frame_publish_errors",
-                        f"[realsense] depth frame publish error: {e}",
-                    )
 
         def _color_loop(self):
             while not self._worker_stop.is_set():
@@ -4561,17 +4514,13 @@ def run_realsense_process(
                     )
                 if depth_frame and tokens["camera_depth"] is not None:
                     depth_np = np.array(depth_frame.get_data())
-                    depth_timing = self._timing(depth_frame, "depth", receive_unix_ns)
-                    self._sequence["depth"] += 1
                     try:
                         self._depth_q.get_nowait()
                         self._diagnostics["depth_coalesced"] += 1
                     except queue.Empty:
                         pass
                     self._depth_q.put_nowait((
-                        depth_np, stamp, depth_timing, receive_mono_ns,
-                        self._depth_calibration, self._sequence["depth"],
-                        tokens["camera_depth"],
+                        depth_np, stamp, tokens["camera_depth"],
                     ))
 
                 now = time.monotonic()

@@ -1,4 +1,4 @@
-"""Self-describing RealSense RGB/depth frame and calibration helpers.
+"""Self-describing RealSense RGB frame and calibration helpers.
 
 This module has no ROS or RealSense imports so the public wire contract,
 timestamp policy, and calibration validation can be tested off-robot.
@@ -14,7 +14,6 @@ from pathlib import Path
 import struct
 import threading
 from typing import Any
-import zlib
 
 import yaml
 
@@ -25,9 +24,6 @@ ENVELOPE_MAGIC = b"PSE1"
 ENVELOPE_HEADER = struct.Struct("<4sII")
 ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v1"
 RGB_SCHEMA = "phanthy.sensor.camera_rgb_frame.v1"
-DEPTH_SCHEMA = "phanthy.sensor.camera_depth_frame.v1"
-DEPTH_COMPRESSION = "zlib"
-DEPTH_COMPRESSION_LEVEL = 1
 
 _DIRECT_CLOCK_DOMAINS = frozenset({"system_time", "global_time"})
 _MAX_DIRECT_CLOCK_ERROR_NS = 24 * 60 * 60 * 1_000_000_000
@@ -74,39 +70,6 @@ def decode_envelope(data: bytes | bytearray | memoryview) -> tuple[dict, bytes]:
     if not isinstance(metadata, dict):
         raise ValueError("camera envelope metadata must be a JSON object")
     return metadata, raw[metadata_end:]
-
-
-def compress_depth_payload(payload: bytes | bytearray | memoryview) -> bytes:
-    return zlib.compress(bytes(payload), level=DEPTH_COMPRESSION_LEVEL)
-
-
-def build_depth_image_metadata(
-    *,
-    width: int,
-    height: int,
-    uncompressed_size: int,
-    payload_size: int,
-    depth_scale_m: float,
-) -> dict:
-    scale = float(depth_scale_m)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("depth_scale_m must be positive and finite")
-    return {
-        "encoding": "z16_le",
-        "width": int(width),
-        "height": int(height),
-        "step_bytes": int(width) * 2,
-        "compression": {
-            "codec": DEPTH_COMPRESSION,
-            "level": DEPTH_COMPRESSION_LEVEL,
-        },
-        "uncompressed_size": int(uncompressed_size),
-        "payload_size": int(payload_size),
-        "unit": "realsense_depth_unit",
-        "depth_scale_m": scale,
-        "depth_scale_semantics": "meters_per_realsense_depth_unit",
-        "aligned_to_rgb": False,
-    }
 
 
 @dataclass(frozen=True)
@@ -517,7 +480,7 @@ def build_frame_metadata(
     image: dict,
     calibration: dict,
 ) -> dict:
-    if schema not in {RGB_SCHEMA, DEPTH_SCHEMA}:
+    if schema != RGB_SCHEMA:
         raise ValueError(f"unsupported camera schema: {schema}")
     return {
         "schema": schema,

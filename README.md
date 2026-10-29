@@ -135,44 +135,32 @@ IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
 
 The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image,
 `/ubuntu/camera/depth` image, and distance topics unchanged. It additionally
-exposes two latest-only, BEST_EFFORT self-describing frame streams. They are
-general sensor/data-collection outputs and are not coupled to navigation:
+exposes one latest-only, BEST_EFFORT self-describing RGB frame stream, independent
+of navigation: `camera_rgb`, port `rgb_frame` → `/ubuntu/camera/rgb_frame`
+(`phanthy.sensor.camera_rgb_frame.v1`).
 
-- `camera_rgb`, port `rgb_frame` → `/ubuntu/camera/rgb_frame` —
-  `phanthy.sensor.camera_rgb_frame.v1`;
-- `camera_depth`, port `depth_frame` → `/ubuntu/camera/depth_frame` —
-  `phanthy.sensor.camera_depth_frame.v1`.
-
-Stopping a camera card gates both its legacy and envelope outputs, not its
-sibling, distance, or photo/video capture. Capture uses an on-demand internal
+Stopping a camera card gates its own outputs, not its sibling, distance, or
+photo/video capture. Capture uses an on-demand internal
 JPEG channel. With no active outputs or capture requests, the shared process
 pauses hardware capture. A stop timeout is an error, never an idle success.
 
 Migration: replace saved Canvas `navigation_lidar` with `lidar_cloud`'s
 `navigation_lidar` port; `navigation_imu` with `lidar_imu`; `camera_rgb_frame`
-with `camera_rgb`'s `rgb_frame`; `camera_depth_frame` with `camera_depth`'s
-`depth_frame`. The old card names are not aliases. Topic subscribers need no
+with `camera_rgb`'s `rgb_frame`. The old card names are not aliases. Topic subscribers need no
 wire migration. Existing outputs retain their position and metadata; all topic
 names, types, QoS, schemas and calibration/time semantics remain unchanged.
 Consumer/Canvas migration is a separate task. Hardware/ROS acceptance for this
 consolidation is pending; local tests are not a deployment claim.
 
-Both frame streams use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE1` binary
+The RGB stream uses `std_msgs/msg/UInt8MultiArray` to transport a `PSE1` binary
 envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
-payload length), canonical JSON metadata, then JPEG or zlib level-1 losslessly
-compressed little-endian Z16 bytes. Depth metadata declares the codec in
-`image.compression` and includes compressed and uncompressed byte counts; zlib
-decompression restores the original Z16 payload. These uint16 samples use
-`unit=realsense_depth_unit`, not meters; convert each sample with
-`distance_m = raw_value * depth_scale_m`. The
-`depth_scale_semantics=meters_per_realsense_depth_unit` field makes that
-conversion explicit for consumers.
+payload length), canonical JSON metadata, then the JPEG payload.
 Every frame repeats its active-profile intrinsics, stable `calibration_id`,
 RealSense Depth-to-RGB transform, source/Driver-receive timing, and the
-configured LiDAR-to-RGB calibration. RGB and depth also carry the same
-`base_to_camera` entry: a `target_from_source`, row-major 4x4 `T_base_camera`
-which transforms points from `camera_color_optical_frame` into `base_link`.
-It is included in their shared `calibration_id`, so consumers do not need to
+configured LiDAR-to-RGB calibration. The `base_to_camera` entry is a
+`target_from_source`, row-major 4x4 `T_base_camera` which transforms points
+from `camera_color_optical_frame` into `base_link`. It is included in the
+`calibration_id`, so consumers do not need to
 know the robot model. Invalid, warming-up, reset, or
 out-of-order source timestamps are published as explicitly unavailable; the
 Driver does not replace them with publish time.

@@ -31,8 +31,8 @@ transient-local `/tf_static` delivery through ROS 2 `StaticTransformBroadcaster`
 Replace the configured translation and rotation after per-device calibration;
 do not describe the factory value as a measured extrinsic.
 
-The RealSense RGB and depth PSE1 envelopes repeat the same `base_to_camera`
-entry and include it in their shared `calibration_id`. Consumers can therefore
+The RealSense RGB PSE1 envelope includes the `base_to_camera` entry in its
+`calibration_id`. Consumers can therefore
 transform camera-optical points into `base_link` without knowing the robot
 model. Missing or invalid device calibration is reported as `unavailable`; it
 is never replaced with an identity matrix.

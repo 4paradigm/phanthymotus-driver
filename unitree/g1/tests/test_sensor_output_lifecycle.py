@@ -16,8 +16,7 @@ from unittest import mock
 
 from sensor_output import OutputGate
 from camera_frame import (
-    RGB_SCHEMA, DEPTH_SCHEMA, encode_envelope, compress_depth_payload,
-    build_depth_image_metadata, decode_envelope,
+    RGB_SCHEMA, encode_envelope, decode_envelope,
 )
 
 G1 = Path(__file__).resolve().parents[1]
@@ -132,6 +131,10 @@ class CameraLifecycleTests(unittest.TestCase):
         self.assertEqual(set(tools), {"camera_rgb", "camera_depth", "camera_distance"})
         self.assertEqual(tools["camera_rgb"]["topic_out"][0], {
             "topic": "/ubuntu/camera/rgb", "format": "image/jpeg"})
+        self.assertEqual(tools["camera_depth"]["topic_out"], [{
+            "topic": "/ubuntu/camera/depth", "format": "image/depth-zlib"}])
+        self.assertEqual(tools["camera_distance"]["topic_out"], [{
+            "topic": "/ubuntu/camera/distance", "format": "data/json"}])
         frame = tools["camera_rgb"]["topic_out"][1]
         self.assertEqual((frame["port"], frame["topic"], frame["schema"]),
                          ("rgb_frame", "/custom/rgb", RGB_SCHEMA))
@@ -215,9 +218,9 @@ class CameraLifecycleTests(unittest.TestCase):
         )
         node = cls.__new__(cls)
         node._worker_stop = threading.Event()
-        node._diagnostics = {"rgb_frame_published": 0, "depth_frame_published": 0}
+        node._diagnostics = {"rgb_frame_published": 0}
         node._record_error = mock.Mock(side_effect=lambda *args: self.fail(str(args)))
-        for name in ("_color_pub", "_depth_pub", "_capture_pub", "_rgb_frame_pub", "_depth_frame_pub"):
+        for name in ("_color_pub", "_depth_pub", "_capture_pub", "_rgb_frame_pub"):
             setattr(node, name, Publisher())
         return node, gates, np
 
@@ -256,18 +259,14 @@ class CameraLifecycleTests(unittest.TestCase):
         self.assertEqual(payload, node._color_pub.messages[0].data)
         self.assertEqual(metadata["schema"], RGB_SCHEMA)
 
-    def test_real_depth_loop_publishes_legacy_and_decodable_envelope(self):
+    def test_real_depth_loop_publishes_legacy_and_reports_ready(self):
         node, gates, np = self.worker()
         node._depth_q = self.one_frame_queue(node, (
-            np.array([[1000]], dtype="<u2"), None, None, 0,
-            {"depth_scale_m": .001}, 1, gates["camera_depth"].token()))
+            np.array([[1000]], dtype="<u2"), None, gates["camera_depth"].token()))
         node._depth_loop()
         import zlib
         self.assertEqual(node._depth_pub.messages[0].format, "16UC1; compressedDepth zlib")
         self.assertEqual(zlib.decompress(bytes(node._depth_pub.messages[0].data)), b"\xe8\x03")
-        metadata, data = decode_envelope(bytes(node._depth_frame_pub.messages[0].data))
-        self.assertEqual(metadata["schema"], DEPTH_SCHEMA)
-        self.assertEqual(zlib.decompress(data), b"\xe8\x03")
         self.assertTrue(gates["camera_depth"].status()["ready"])
 
     def test_real_worker_drops_pre_stop_queue_after_restart(self):
@@ -276,10 +275,9 @@ class CameraLifecycleTests(unittest.TestCase):
         gates["camera_depth"].set_enabled(False)
         gates["camera_depth"].set_enabled(True)
         node._depth_q = self.one_frame_queue(node, (
-            np.array([[1000]], dtype="<u2"), None, None, 0, {}, 1, token))
+            np.array([[1000]], dtype="<u2"), None, token))
         node._depth_loop()
         self.assertFalse(node._depth_pub.messages)
-        self.assertFalse(node._depth_frame_pub.messages)
 
     def test_capture_pauses_only_with_no_demands_and_resumes(self):
         node, gates, _ = self.worker()

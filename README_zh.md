@@ -98,16 +98,12 @@ worker。重新启动不会发送上一启停周期的排队帧。安全检查�
 ### G1 相机自描述帧
 
 RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图、
-`/ubuntu/camera/depth` 深度图和距离 topic 的消息语义，同时新增两个
-BEST_EFFORT + KEEP_LAST(1) 自描述帧数据流。它们是通用传感器/数采输出，
-不与导航算法绑定：
+`/ubuntu/camera/depth` 深度图和距离 topic 的消息语义，同时新增一条
+BEST_EFFORT + KEEP_LAST(1) 自描述 RGB 帧，不与导航算法绑定：
+`camera_rgb` 的 `rgb_frame` 端口 → `/ubuntu/camera/rgb_frame`
+（`phanthy.sensor.camera_rgb_frame.v1`）。
 
-- `camera_rgb` 的 `rgb_frame` 端口 → `/ubuntu/camera/rgb_frame`：
-  `phanthy.sensor.camera_rgb_frame.v1`；
-- `camera_depth` 的 `depth_frame` 端口 → `/ubuntu/camera/depth_frame`：
-  `phanthy.sensor.camera_depth_frame.v1`。
-
-停止相机卡只停止该卡的 legacy 和 PSE1 两路输出，不影响另一相机卡、距离输出或
+停止相机卡只停止该卡的输出，不影响另一相机卡、距离输出或
 拍照/录像。拍照使用按需启用的内部 JPEG 通道。全部输出及拍照需求停止后，共享
 进程暂停相机采集。停止门控超时返回错误，不伪报 idle。
 
@@ -118,27 +114,19 @@ BEST_EFFORT + KEEP_LAST(1) 自描述帧数据流。它们是通用传感器/数�
 | navigation_lidar | lidar_cloud / navigation_lidar |
 | navigation_imu | lidar_imu / 原输出 |
 | camera_rgb_frame | camera_rgb / rgb_frame |
-| camera_depth_frame | camera_depth / depth_frame |
 
 移除的名字不保留隐藏别名。原输出维持列表首位和原描述，topic、ROS 类型、载荷、
 QoS、schema、标定及时间语义不变；直接订阅 topic 无需修改协议。此轮整合尚未
 部署或真机验收，本地测试不能代替 ROS/设备验收。
 
-两路自描述帧以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
+RGB 自描述帧以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
 小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON
-元数据和 JPEG 或 zlib level 1 无损压缩的 Z16 小端载荷。Depth 元数据通过
-`image.compression` 描述压缩方式，并同时记录压缩前后的字节数；消费者先用
-zlib 解压即可恢复原始 Z16。Z16 的 `uint16` 值单位是
-`realsense_depth_unit`，不是米；换算公式为
-`distance_m = raw_value * depth_scale_m`，并用
-`depth_scale_semantics=meters_per_realsense_depth_unit` 明确比例语义。
-每帧完整携带当前 RealSense profile 内参、
+元数据和 JPEG 载荷。每帧完整携带当前 RealSense profile 内参、
 稳定 `calibration_id`、Depth→RGB 外参、源时间/Driver 接收时间，以及配置的
-LiDAR→RGB 外参。RGB 和 Depth 还会携带完全相同的
-`base_to_camera`：该字段使用 `target_from_source` 约定和 row-major 4×4
+LiDAR→RGB 外参。`base_to_camera` 字段使用 `target_from_source` 约定和 row-major 4×4
 齐次矩阵，语义固定为 `T_base_camera`，将
-`camera_color_optical_frame` 中的点变换到 `base_link`。它也参与生成两路
-共用的 `calibration_id`，因此消费端无需知道机器人型号。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
+`camera_color_optical_frame` 中的点变换到 `base_link`。它也参与生成
+`calibration_id`，因此消费端无需知道机器人型号。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
 但明确标记为 `unavailable`，不会用发布时刻伪造采集时间。
 
 仓库内置的 LiDAR→Camera 和 Camera→Base 变换来自固定版本的宇树官方 G1 URDF，状态只能是

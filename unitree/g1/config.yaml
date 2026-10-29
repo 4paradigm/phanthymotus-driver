@@ -97,12 +97,10 @@ plugins:
     enabled: true
   camera:
     enabled: true
-    # Self-describing binary frames are published beside the untouched legacy
-    # CompressedImage/Image topics, on the existing camera_rgb/camera_depth
-    # cards. Camera failures remain isolated from loco.
+    # RGB self-describing frames accompany the legacy camera outputs.
+    # Camera failures remain isolated from loco.
     frame_enabled: true
     rgb_frame_topic: /ubuntu/camera/rgb_frame
-    depth_frame_topic: /ubuntu/camera/depth_frame
     lidar_camera_calibration: /work/calibration/g1_factory_nominal_lidar_camera.yaml
     clock_warmup_samples: 8
     clock_window_samples: 300

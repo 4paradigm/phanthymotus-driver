@@ -1,25 +1,18 @@
 import math
 from pathlib import Path
-import struct
 import unittest
-import zlib
 
 import yaml
 
 from camera_frame import (
-    DEPTH_COMPRESSION,
-    DEPTH_COMPRESSION_LEVEL,
-    DEPTH_SCHEMA,
     ENVELOPE_FORMAT,
     ENVELOPE_MAGIC,
     RGB_SCHEMA,
     CameraFrameTiming,
     RealSenseClockNormalizer,
     build_calibrations,
-    build_depth_image_metadata,
     build_frame_metadata,
     build_intrinsics,
-    compress_depth_payload,
     decode_envelope,
     encode_envelope,
     load_lidar_camera_calibration,
@@ -51,7 +44,6 @@ class CameraEnvelopeTest(unittest.TestCase):
             ENVELOPE_FORMAT, "application/vnd.phanthy.sensor-envelope.v1"
         )
         self.assertEqual(RGB_SCHEMA, "phanthy.sensor.camera_rgb_frame.v1")
-        self.assertEqual(DEPTH_SCHEMA, "phanthy.sensor.camera_depth_frame.v1")
 
     def test_binary_envelope_round_trip(self):
         metadata = {"schema": RGB_SCHEMA, "header": {"stamp_ns": None}}
@@ -65,41 +57,9 @@ class CameraEnvelopeTest(unittest.TestCase):
         self.assertEqual(decoded_payload, payload)
 
     def test_binary_envelope_rejects_truncation(self):
-        envelope = encode_envelope({"schema": DEPTH_SCHEMA}, b"depth")
+        envelope = encode_envelope({"schema": RGB_SCHEMA}, b"jpeg")
         with self.assertRaisesRegex(ValueError, "length mismatch"):
             decode_envelope(envelope[:-1])
-
-    def test_depth_payload_compression_is_lossless(self):
-        raw = b"\x00\x00\x10\x00" * 1024
-        compressed = compress_depth_payload(raw)
-
-        self.assertEqual(DEPTH_COMPRESSION, "zlib")
-        self.assertEqual(DEPTH_COMPRESSION_LEVEL, 1)
-        self.assertLess(len(compressed), len(raw))
-        self.assertEqual(zlib.decompress(compressed), raw)
-
-    def test_depth_envelope_declares_raw_units_and_meter_scale(self):
-        raw = struct.pack("<H", 1000)
-        payload = compress_depth_payload(raw)
-        image = build_depth_image_metadata(
-            width=1,
-            height=1,
-            uncompressed_size=len(raw),
-            payload_size=len(payload),
-            depth_scale_m=0.001,
-        )
-        metadata, decoded_payload = decode_envelope(
-            encode_envelope({"schema": DEPTH_SCHEMA, "image": image}, payload)
-        )
-
-        raw_value = struct.unpack("<H", zlib.decompress(decoded_payload))[0]
-        self.assertEqual(metadata["image"]["unit"], "realsense_depth_unit")
-        self.assertEqual(
-            metadata["image"]["depth_scale_semantics"],
-            "meters_per_realsense_depth_unit",
-        )
-        self.assertEqual(raw_value * metadata["image"]["depth_scale_m"], 1.0)
-
 
 class CameraTimingTest(unittest.TestCase):
     def test_system_time_is_preserved(self):
@@ -288,7 +248,7 @@ class DriverCameraContractTest(unittest.TestCase):
         self.assertNotIn('"name": "camera_rgb_frame"', source)
         self.assertNotIn('"name": "camera_depth_frame"', source)
         self.assertIn('self._frame_outputs("rgb")', source)
-        self.assertIn('self._frame_outputs("depth")', source)
+        self.assertNotIn('self._frame_outputs("depth")', source)
         self.assertNotIn('"name": "camera_rgb_v2"', source)
         self.assertNotIn('"name": "camera_depth_v2"', source)
         self.assertIn('"ros_type": "std_msgs/msg/UInt8MultiArray"', source)
@@ -303,7 +263,7 @@ class DriverCameraContractTest(unittest.TestCase):
             start_capture,
         )
         self.assertNotIn("self._clock = self._new_clock_normalizer()", source)
-        self.assertIn('self._sequence = {"rgb": 0, "depth": 0}', start_capture)
+        self.assertIn('self._sequence = {"rgb": 0}', start_capture)
         self.assertIn("pipeline = None", start_capture)
         self.assertIn("if pipeline is not None:", start_capture)
         self.assertIn("self.stop_capture(reconnecting=True)", start_capture)
@@ -315,9 +275,8 @@ class DriverCameraContractTest(unittest.TestCase):
             worker.index("logsafe.install(check_fd=False)"),
             worker.index("from array import array"),
         )
-        self.assertIn("payload = compress_depth_payload(raw_payload)", worker)
-        self.assertIn("image=build_depth_image_metadata(", worker)
-        self.assertIn("uncompressed_size=len(raw_payload)", worker)
+        self.assertIn("_zlib.compress(", worker)
+        self.assertNotIn("_depth_frame_pub", worker)
         self.assertIn("if count == 1 or count % 100 == 0:", worker)
         self.assertIn('"frameset_errors": 0', worker)
 
@@ -325,7 +284,7 @@ class DriverCameraContractTest(unittest.TestCase):
         config = yaml.safe_load((G1_DIR / "config.yaml").read_text(encoding="utf-8"))
         camera = config["plugins"]["camera"]
         self.assertEqual(camera["rgb_frame_topic"], "/ubuntu/camera/rgb_frame")
-        self.assertEqual(camera["depth_frame_topic"], "/ubuntu/camera/depth_frame")
+        self.assertNotIn("depth_frame_topic", camera)
         dockerfile = (G1_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("COPY camera_frame.py /work/camera_frame.py", dockerfile)
         self.assertIn("COPY calibration/ /work/calibration/", dockerfile)
