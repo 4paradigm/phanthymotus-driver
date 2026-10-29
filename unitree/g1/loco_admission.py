@@ -12,7 +12,10 @@ import threading
 
 from common.control import Descriptor
 from common.control.sink import check_control_contract, check_control_freshness
-from unitree.g1.loco_descriptor import validate_loco_descriptor
+if __package__:
+    from .loco_descriptor import validate_loco_descriptor
+else:
+    from loco_descriptor import validate_loco_descriptor
 
 
 def _finite(value):

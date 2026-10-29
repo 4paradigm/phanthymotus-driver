@@ -45,7 +45,10 @@ def validate_loco_descriptor(raw):
 
     The caller must explicitly supply lower/upper, max_delta_per_step, all
     three rate fields plus max_obs_age_ms, and force_torque (possibly null).
-    Optional standard fields are checked when present. No G1 value is inferred.
+    Optional standard fields are checked when present. G1 requires group units
+    to be absent or empty strings: no unambiguous mixed twist-unit syntax is
+    defined here, so top-level units are authoritative. The common parser is
+    unchanged. No G1 value is inferred.
     """
     if not isinstance(raw, dict):
         raise DescriptorError("descriptor must be an object")
@@ -101,4 +104,7 @@ def validate_loco_descriptor(raw):
     descriptor = parse_descriptor(data)
     if any(group.advisory or group.mode != "twist" for group in descriptor.groups):
         raise DescriptorError("descriptor.groups must use twist without advisory axes")
+    for group in data.get("groups") or ():
+        if "unit" in group and group["unit"] != "":
+            raise DescriptorError("descriptor.groups unit must be absent or empty for G1 twist")
     return descriptor

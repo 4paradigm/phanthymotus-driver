@@ -3,7 +3,7 @@ import copy
 
 import pytest
 
-from common.control.descriptor import DescriptorError
+from common.control.descriptor import DescriptorError, parse_descriptor
 from loco_descriptor import validate_loco_descriptor
 
 
@@ -107,3 +107,22 @@ def test_advisory_or_mixed_mode_group_rejected(example):
         validate_loco_descriptor(example)
     example["groups"][0]["mode"] = "twist"
     assert validate_loco_descriptor(example).groups[0].mode == "twist"
+
+
+@pytest.mark.parametrize("unit", ["degrees", "m/s", "rad/s", " ", None, 0, False])
+def test_explicit_group_unit_rejected_locally(example, unit):
+    example["groups"] = [{"name": "base", "offset": 0, "count": 6, "unit": unit}]
+    with pytest.raises(DescriptorError, match="groups unit"):
+        validate_loco_descriptor(example)
+    # This G1 policy must not change the general protocol parser.
+    assert parse_descriptor(example).groups
+
+
+def test_absent_or_empty_group_unit_and_default_group(example):
+    assert validate_loco_descriptor(example).groups[0].unit == ""
+    example["groups"] = [{"name": "linear", "offset": 0, "count": 3},
+                         {"name": "angular", "offset": 3, "count": 3, "unit": ""}]
+    assert all(group.unit == "" for group in validate_loco_descriptor(example).groups)
+    example["groups"][1]["unit"] = "rad/s"
+    with pytest.raises(DescriptorError, match="groups unit"):
+        validate_loco_descriptor(example)
