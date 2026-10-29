@@ -46,6 +46,8 @@ def configure_fastdds_profile(config):
         raise ValueError("ROBOT_NETWORK_CIDR must be /24 or narrower to limit DDS exposure")
     if not robot_network.subnet_of(interface_address.network):
         raise ValueError(f"{interface} address {interface_address} is not on configured robot subnet {robot_network}")
+    if interface_address.ip not in robot_network:
+        raise ValueError(f"{interface} address {interface_address.ip} is outside selected robot subnet {robot_network}")
     robot_host = os.environ.get("S10_BASIC_SERVER_HOST") or config.get("basic_server", {}).get("host")
     try:
         robot_address = ipaddress.ip_address(robot_host)

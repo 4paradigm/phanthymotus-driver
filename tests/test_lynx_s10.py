@@ -306,6 +306,18 @@ def test_main_fails_closed_for_missing_or_mismatched_robot_network(monkeypatch, 
     with pytest.raises(ValueError, match="/24 or narrower"):
         module.configure_fastdds_profile(config)
 
+    # A narrow robot CIDR must contain the local interface address too, not
+    # merely the robot address and the wider interface subnet.
+    monkeypatch.setattr(
+        module.fcntl, "ioctl",
+        lambda _fd, request_code, _request: b"\0" * 20 + socket.inet_aton(
+            "10.21.33.200" if request_code == 0x8915 else "255.255.255.0"))
+    monkeypatch.setenv("ROBOT_NETWORK_CIDR", "10.21.33.0/25")
+    monkeypatch.setenv("S10_FASTDDS_PROFILE", str(tmp_path / "outside-cidr.xml"))
+    with pytest.raises(ValueError, match="address 10.21.33.200 is outside selected robot subnet"):
+        module.configure_fastdds_profile(config)
+    assert not (tmp_path / "outside-cidr.xml").exists()
+
 
 def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
     device = _load_device(monkeypatch)
