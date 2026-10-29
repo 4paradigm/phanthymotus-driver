@@ -275,6 +275,7 @@ def test_existing_recording_can_be_loaded_without_vr(g1_teaching):
 
 
 def test_g1_dockerfile_covers_teaching_imports():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
     from test_dockerfile_copies import test_every_copied_path_exists, test_every_imported_sibling_is_copied
     dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
     test_every_copied_path_exists(dockerfile)

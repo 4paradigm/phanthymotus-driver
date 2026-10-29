@@ -185,17 +185,36 @@ def test_partial_close_failure_does_not_mask_init_or_skip_remaining_cleanup(chan
     assert source.snapshot() is None and source._subscriber is None
 
 
-def test_gaps_count_every_feedback_discontinuity_for_teaching_previews():
+def test_gaps_fence_previews_when_feedback_is_dropped_not_when_it_resumes():
     now = [1_000_000_000]
     source = LowStateSource(clock=lambda: now[0])
     source._active = True
     source._on_state(message(1)); assert source.gaps == 0
     now[0] += 2_000_000; source._on_state(message(3)); assert source.gaps == 0
     now[0] += 150_000_000; source._on_state(message(4)); assert source.gaps == 1
-    source._on_state(SimpleNamespace(tick='bad')); assert source.snapshot() is None
+    # Counted at the bad sample itself: no later valid packet is needed.
+    source._on_state(SimpleNamespace(tick='bad'))
+    assert source.snapshot() is None and source.gaps == 2
+    source._on_state(SimpleNamespace(tick='bad')); assert source.gaps == 2
     now[0] += 2_000_000; source._on_state(message(5)); assert source.gaps == 2
-    source.stop(); source._active = True
+    source.stop(); assert source.gaps == 3
+    source._active = True
     now[0] += 2_000_000; source._on_state(message(6)); assert source.gaps == 3
+
+
+def test_reader_failure_fences_previews_immediately(channels):
+    opened, _ = channels
+    source = LowStateSource(); source.start()
+    try:
+        opened[0].messages.put(message(1))
+        deadline = time.monotonic()+2
+        while source.snapshot() is None and time.monotonic() < deadline: time.sleep(.005)
+        assert source.snapshot() is not None and source.gaps == 0
+        opened[0].messages.put(RuntimeError('reader broke'))
+        while source.snapshot() is not None and time.monotonic() < deadline: time.sleep(.005)
+        assert source.snapshot() is None and source.gaps == 1
+    finally:
+        source.stop()
 
 
 def test_arm_feedback_epoch_includes_shared_source_gaps():

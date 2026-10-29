@@ -366,7 +366,9 @@ def test_raw_motor_telemetry_does_not_gate_arm_but_invalid_sample_does(tmp_path)
     motors[15].mode=0;motors[15].vol=0;motors[15].temperature=[150,150]
     msg.tick=5;arm._on_state(msg)
     assert arm._fresh()[0]['motor_telemetry'][0]['temperature']==[150,150]
+    epoch=arm.feedback_epoch
     msg.tick=6;msg.motor_state=[];arm._on_state(msg)
+    assert arm.feedback_epoch==epoch+1  # fenced at the bad sample itself
     with pytest.raises(ValueError,match='arm_feedback_invalid'): arm._fresh()
 
 

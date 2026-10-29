@@ -213,6 +213,7 @@ class ArmStreamExecutor:
                     'source_tick':tick}
         except Exception as exc:
             with self._feedback_lock:
+                if not self._feedback.get('error'): self._feedback_epoch += 1
                 self._feedback = {**self._feedback,'error':type(exc).__name__}
 
     def _on_fsm(self, msg):
