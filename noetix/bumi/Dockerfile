@@ -50,13 +50,13 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
 # explicitly: it declares tf2_ros and the message packages itself, so repeating
 # them here would not change the installed set. Try the configured mirror first and
 # fall back to the official archive; the key itself is tried from the same
-# mirror, GitHub and the official key URL.
+# mirror and GitHub over HTTPS only.
 RUN set -eu; \
     if [ ! -s /usr/share/keyrings/ros-archive-keyring.gpg ]; then \
       for key in https://mirrors.tuna.tsinghua.edu.cn/rosdistro/ros.key \
-                 https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-                 http://packages.ros.org/ros.key; do \
-        if curl -fsSL --retry 2 "$key" -o /usr/share/keyrings/ros-archive-keyring.gpg; then break; fi; \
+                 https://raw.githubusercontent.com/ros/rosdistro/master/ros.key; do \
+        if curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 "$key" -o /usr/share/keyrings/ros-archive-keyring.gpg; then break; fi; \
+        rm -f /usr/share/keyrings/ros-archive-keyring.gpg; \
       done; \
     fi; \
     test -s /usr/share/keyrings/ros-archive-keyring.gpg; \
