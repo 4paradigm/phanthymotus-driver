@@ -15,7 +15,7 @@ import urllib.request
 from uuid import uuid4
 from pathlib import Path
 
-from basic_server import BasicServerClient
+from basic_server import BasicServerClient, _protocol_int
 from common.vendor_runtime import action_schema, tool
 
 
@@ -47,9 +47,9 @@ def _post_acp_callback(action_id, status, result, tool_name):
     request = urllib.request.Request(url + "/api/acp/complete", data=payload,
                                      headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(request, timeout=5, context=context) as response:
-        acknowledgement = json.load(response)
-    if acknowledgement.get("ok") is not True or acknowledgement.get("action_id") != action_id:
-        raise RuntimeError("Agent Core did not acknowledge action_id")
+        if not 200 <= response.status < 300:
+            raise RuntimeError(f"Agent Core returned HTTP {response.status}")
+    print(f"[ACP] {tool_name} {action_id}: callback sent ({status})", flush=True)
 
 
 class S10Nodes:
@@ -85,23 +85,68 @@ class S10Nodes:
         from std_msgs.msg import UInt8MultiArray
         self.lidar_publisher = self.core.create_publisher(UInt8MultiArray, self.topics["lidar"]["topic"], 2)
         topics = config.get("topics", {})
+        self._stream_lock = threading.Lock()
+        self._stream_stats = {
+            name: {"received": 0, "published": 0, "dropped": 0,
+                   "last_received": None, "last_published": None}
+            for name in self.topics
+        }
+        self._source_topics = {
+            "imu": topics.get("imu", "/IMU"),
+            "joints": topics.get("joints", "/JOINTS_DATA_10HZ"),
+            "joint_state": topics.get("joints", "/JOINTS_DATA_10HZ"),
+            "battery": topics.get("battery", "/BATTERY_DATA"),
+            "loco_state": topics.get("motion_info", "/MOTION_INFO"),
+            "lidar": topics.get("lidar", "/LIDAR/POINTS"),
+        }
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, qos_profile_sensor_data)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, qos_profile_sensor_data)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, qos_profile_sensor_data)
         self.robot.create_subscription(PointCloud2, topics.get("lidar", "/LIDAR/POINTS"), self._forward_lidar, qos_profile_sensor_data)
 
+    def _record_stream(self, key, stage):
+        now = time.time()
+        with self._stream_lock:
+            stats = self._stream_stats[key]
+            stats[stage] += 1
+            if stage in ("received", "published"):
+                stats[f"last_{stage}"] = now
+            first = stats[stage] == 1
+        if first and stage == "received":
+            print(f"[ros2] first {key} sample received from {self._source_topics[key]}", flush=True)
+        if first and stage == "published":
+            print(f"[ros2] first {key} sample published to {self.topics[key]['topic']}", flush=True)
+
+    def stream_status(self):
+        with self._stream_lock:
+            result = {key: dict(value) for key, value in self._stream_stats.items()}
+        for key, spec in self.topics.items():
+            try:
+                result[key]["robot_publishers"] = self.robot.count_publishers(self._source_topics[key])
+            except (AttributeError, RuntimeError):
+                result[key]["robot_publishers"] = None
+            try:
+                result[key]["core_subscribers"] = self.core.count_subscribers(spec["topic"])
+            except (AttributeError, RuntimeError):
+                result[key]["core_subscribers"] = None
+        return result
+
     def _publish_json(self, key, value):
         from std_msgs.msg import String
         message = String()
         message.data = self.json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
         self.publishers[key].publish(message)
+        self._record_stream(key, "published")
 
     def _forward_imu(self, msg):
+        self._record_stream("imu", "received")
         from common.vendor_runtime import jsonable
         self._publish_json("imu", jsonable(msg))
 
     def _forward_joints(self, msg):
+        self._record_stream("joints", "received")
+        self._record_stream("joint_state", "received")
         from common.vendor_runtime import jsonable
         values = jsonable(msg)
         data = values.get("data", {})
@@ -111,23 +156,28 @@ class S10Nodes:
         self._publish_json("joint_state", values)
 
     def _forward_battery(self, msg):
+        self._record_stream("battery", "received")
         from common.vendor_runtime import jsonable
         values = jsonable(msg)
         self._publish_json("battery", {"batteries": values.get("data", [])})
 
     def _forward_loco_state(self, msg):
+        self._record_stream("loco_state", "received")
         from common.vendor_runtime import jsonable
         values = jsonable(msg)
         self._publish_json("loco_state", values.get("data", values))
 
     def _forward_lidar(self, msg):
+        self._record_stream("lidar", "received")
         packet = self._pointcloud_packet(msg)
         if packet is None:
+            self._record_stream("lidar", "dropped")
             return
         from std_msgs.msg import UInt8MultiArray
         output = UInt8MultiArray()
         output.data = array.array("B", packet)
         self.lidar_publisher.publish(output)
+        self._record_stream("lidar", "published")
 
     @staticmethod
     def _pointcloud_packet(msg):
@@ -163,7 +213,7 @@ class S10Nodes:
         self.core.destroy_node()
 
 
-LOCO_STATES = {"stand_up": 1, "damp": 2, "stand_down": 4, "rl_control": 17}
+LOCO_STATES = {"stand_up": 1, "damp": 2, "stand_down": 4}
 GAITS = {"basic_flat": 0x1001, "basic_stairs": 0x1003, "navigation_flat": 0x3002, "navigation_stairs": 0x3003}
 MODES = {"normal": 0, "navigation": 1, "assist": 2}
 JOINT_NAMES = (
@@ -237,7 +287,6 @@ class S10StatePlugin:
             "joint_state": "山猫 S10 轮足关节位置、速度、力矩和温度（原生协议 10Hz）",
             "loco_state": "山猫 S10 运动状态、步态、模式和速度（原生协议 10Hz）",
             "battery": "山猫 S10 电池电量、电压、温度和充电状态",
-            "errors": "山猫 S10 原生协议聚合故障列表及故障变化",
             "navigation_status": "山猫 S10 导航任务和定位状态（Pro 支持）",
             "lidar": "山猫 S10 激光雷达点云（实时 ROS 2 转发）",
         }
@@ -268,8 +317,12 @@ class S10StatePlugin:
         keys = {"imu": "1048577:15728640", "joints": "1048577:15728640",
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
                 "battery": "1048578:15728640",
-                "errors": "1048703:15728640", "navigation_status": "1048579:15728640"}
-        if name == "state": return self.native.snapshot()
+                "navigation_status": "1048579:15728640"}
+        if name == "state":
+            result = self.native.snapshot()
+            if self.nodes:
+                result["ros_streams"] = self.nodes.stream_status()
+            return result
         if name == "lidar" and self.nodes: return {"state": "streaming", **self.nodes.topics[name]}
         if name not in keys: return {"state": "unsupported_card", "card": name}
         report = reports.get(keys[name])
@@ -280,7 +333,7 @@ class S10StatePlugin:
             for candidate in reports.values():
                 body = candidate.get("PatrolDevice", {}) if isinstance(candidate, dict) else {}
                 try:
-                    if (int(str(body.get("Type")), 0), int(str(body.get("Command")), 0)) == expected:
+                    if (_protocol_int(body.get("Type")), _protocol_int(body.get("Command"))) == expected:
                         report = candidate
                         break
                 except (TypeError, ValueError):
@@ -297,24 +350,25 @@ class S10StatePlugin:
             basic = basic_items.get("BasicStatus", {})
             return {"motion_state": data, "basic_state": basic}
         if name == "battery": return {"batteries": items.get("BatteryList", [])}
-        if name == "errors": return {"ErrorList": items.get("ErrorList", [])}
         return items
 
 
 class S10MotionPlugin:
     ACTIONS = {
-        "move": (["vx", "vy", "vyaw", "duration"], "导航模式下按速度移动；duration=-1 为兼容写法，最多持续 60 秒"),
+        "move": (["vx", "vy", "yaw_rate_deg_s", "duration"], "导航模式下按速度移动；偏航角速度使用度/秒；duration=-1 最多持续 60 秒"),
         "stop_move": ([], "立即发送零速度停止运动"),
         "stand_up": ([], "切换到站立状态"), "stand_down": ([], "切换到趴下状态"),
-        "damp": ([], "切换到阻尼状态"), "gait": (["gait"], "切换步态；请先确认机器人完全停止"),
+        "damp": ([], "切换到关节阻尼状态"), "gait": (["gait"], "切换步态；请先确认机器人完全停止"),
         "mode": (["mode"], "切换常规、导航或辅助控制模式"),
-        "axis": (["x", "y", "z", "roll", "pitch", "yaw", "duration"], "常规/辅助模式归一化轴控制"),
-        "rl_control": ([], "切换到 RL 控制状态"),
+        "manual_control": (["x", "y", "z", "roll", "pitch", "yaw", "duration"],
+                           "六轴归一化手动控制，各分量为-1到1的控制强度，不是角度；仅常规/辅助模式有效"),
     }
     def __init__(self, native):
         self.native = native
         self._condition = threading.Condition()
         self._active = None
+        self._transition_lock = threading.Lock()
+        self._active_transition = None
         self._shutdown = False
         self._thread = threading.Thread(target=self._stream_loop, daemon=True, name="s10-motion-stream")
 
@@ -327,19 +381,86 @@ class S10MotionPlugin:
                 self._acp_callback(active["action_id"], status, result)
             except Exception as exc:
                 print(f"[ACP] {active['action_id']}: {exc}", flush=True)
+
+    def _reported_motion_value(self, field):
+        reports = self.native.snapshot().get("reports", {})
+        for report in reports.values():
+            body = report.get("PatrolDevice", {}) if isinstance(report, dict) else {}
+            items = body.get("Items", {}) if isinstance(body, dict) else {}
+            basic = items.get("BasicStatus", {}) if isinstance(items, dict) else {}
+            if field in basic:
+                try:
+                    return int(basic[field]), report
+                except (TypeError, ValueError):
+                    return basic[field], report
+        return None, None
+
+    def _finish_transition(self, action_id, status, result):
+        with self._transition_lock:
+            if not self._active_transition or self._active_transition["action_id"] != action_id:
+                return
+            self._active_transition = None
+        self._finish({"action_id": action_id}, status, result)
+
+    def _cancel_transition(self):
+        with self._transition_lock:
+            active = self._active_transition
+            self._active_transition = None
+        if active:
+            self._finish(active, "cancelled", {"state": "cancelled", "reason": "stopped_or_replaced"})
+
+    def _wait_transition(self, transition):
+        deadline = time.monotonic() + transition["timeout"]
+        while time.monotonic() < deadline:
+            with self._transition_lock:
+                if not self._active_transition or self._active_transition["action_id"] != transition["action_id"]:
+                    return
+            value, report = self._reported_motion_value(transition["field"])
+            if report is not transition["baseline_report"] and value in transition["expected"]:
+                self._finish_transition(transition["action_id"], "completed", {
+                    "state": "completed", "action": transition["action"],
+                    "observed": {transition["field"]: value},
+                })
+                return
+            time.sleep(0.1)
+        self._finish_transition(transition["action_id"], "error", {
+            "state": "error", "action": transition["action"],
+            "message": f"timed out waiting for S10 {transition['field']} to reach {sorted(transition['expected'])}",
+        })
+
+    def _start_transition(self, action, message_type, command, items, field, expected, timeout=15):
+        self._stop_stream()
+        action_id = f"s10_{action}_{uuid4().hex}"
+        _value, baseline_report = self._reported_motion_value(field)
+        sent = self.native.request(message_type, command, items)
+        transition = {"action_id": action_id, "action": action, "field": field,
+                      "expected": set(expected), "timeout": timeout,
+                      "baseline_report": baseline_report}
+        with self._transition_lock:
+            self._active_transition = transition
+        threading.Thread(target=self._wait_transition, args=(transition,), daemon=True,
+                         name=f"s10-{action}-completion").start()
+        return {**sent, "state": "accepted", "action_id": action_id, "completion_timeout": timeout}
     def get_tool(self):
-        result = tool("loco", "actuator", "山猫 S10 运动控制。move 会切换到导航模式和平地步态后执行；duration=-1 最多持续 60 秒", action_schema(self.ACTIONS, {
+        result = tool("loco", "actuator", "山猫 S10 运动控制。move 在导航步态下按米/秒和度/秒移动；manual_control 是常规/辅助模式的归一化六轴指令；stand_up 通常会自动进入 RL 运控状态。", action_schema(self.ACTIONS, {
             "gait": {"type": "string", "enum": list(GAITS)},
             "mode": {"type": "string", "enum": list(MODES)},
-            **{axis: {"type": "number", "minimum": -1, "maximum": 1} for axis in ("x", "y", "z", "roll", "pitch", "yaw")},
+            "x": {"type": "number", "minimum": -1, "maximum": 1, "description": "前后方向归一化控制强度，不是速度值"},
+            "y": {"type": "number", "minimum": -1, "maximum": 1, "description": "左右方向归一化控制强度，不是速度值"},
+            "z": {"type": "number", "minimum": -1, "maximum": 1, "description": "高度方向归一化控制强度；基础步态不响应"},
+            "roll": {"type": "number", "minimum": -1, "maximum": 1, "description": "翻滚方向归一化控制强度；基础步态不响应"},
+            "pitch": {"type": "number", "minimum": -1, "maximum": 1, "description": "俯仰方向归一化控制强度；基础步态不响应"},
+            "yaw": {"type": "number", "minimum": -1, "maximum": 1, "description": "偏航归一化控制强度，不是角度"},
             "vx": {"type": "number", "minimum": -1.67, "maximum": 1.67, "description": "Navigation forward/backward velocity in m/s"},
             "vy": {"type": "number", "minimum": -0.4, "maximum": 0.4, "description": "Navigation lateral velocity in m/s"},
-            "vyaw": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "Navigation yaw rate in rad/s"},
+            "yaw_rate_deg_s": {"type": "number", "minimum": -57.29577951308232, "maximum": 57.29577951308232,
+                                "description": "Navigation yaw rate in degrees per second; converted to protocol rad/s"},
             "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": 1,
                          "description": "Seconds; -1 is a compatibility alias for 60 seconds; 0 stops immediately"},
         }))
         schema = result["inputSchema"]
-        schema["x-completion"] = {"actions": ["move", "axis"], "timeout": 65}
+        schema["x-completion"] = {"actions": ["move", "manual_control", "stand_up", "stand_down",
+                                               "damp", "gait", "mode"], "timeout": 65}
         return result
     def start(self):
         if not self._thread.is_alive(): self._thread.start()
@@ -354,6 +475,7 @@ class S10MotionPlugin:
         if kind in (None, "axis"): self.native.send(0x00100001, 0x00100002, zero)
         if kind in (None, "velocity"): self.native.send(0x00100001, 0x00110002, zero)
     def _stop_stream(self, send_both=False):
+        self._cancel_transition()
         with self._condition:
             active = self._active
             self._active = None
@@ -410,24 +532,35 @@ class S10MotionPlugin:
         if action == "stop_move":
             self._stop_stream(send_both=True)
             return {"state": "stopped", "sent_zero_to": ["axis", "velocity"]}
+        transition_actions = {
+            "stand_up": ("MotionState", {1, 17}),
+            "stand_down": ("MotionState", {4}),
+            "damp": ("MotionState", {2}),
+        }
         if action in LOCO_STATES:
-            self._stop_stream()
-            value = LOCO_STATES[action]
-            return self.native.send(0x00100001, 0x00200002, {"MotionParam": value})
+            field, expected = transition_actions.get(action, (None, None))
+            if field:
+                return self._start_transition(action, 0x00100001, 0x00200002,
+                                              {"MotionParam": LOCO_STATES[action]}, field, expected)
         if action == "gait":
-            self._stop_stream()
-            return self.native.send(0x00100001, 0x00300002, {"GaitParam": GAITS[args["gait"]]})
+            return self._start_transition(action, 0x00100001, 0x00300002,
+                                          {"GaitParam": GAITS[args["gait"]]}, "Gait",
+                                          {GAITS[args["gait"]]})
         if action == "mode":
-            self._stop_stream()
-            return self.native.send(0x00100002, 0x00500002, {"Mode": MODES[args["mode"]]})
-        if action in ("axis", "move"):
+            return self._start_transition(action, 0x00100002, 0x00500002,
+                                          {"Mode": MODES[args["mode"]]}, "ControlUsageMode",
+                                          {MODES[args["mode"]]})
+        if action in ("manual_control", "axis", "move"):
             axes = ("x", "y", "z", "roll", "pitch", "yaw")
             wire_names = {"x": "X", "y": "Y", "z": "Z", "roll": "Roll", "pitch": "Pitch", "yaw": "Yaw"}
-            items = {wire_names[key]: float(args.get(key if action == "axis" else {"x": "vx", "y": "vy", "yaw": "vyaw"}.get(key, key), 0)) for key in axes}
+            is_manual = action in ("manual_control", "axis")
+            yaw_rate = args.get("yaw_rate_deg_s", math.degrees(float(args.get("vyaw", 0))))
+            items = {wire_names[key]: float(args.get(key if is_manual else {"x": "vx", "y": "vy", "yaw": "_yaw_rate"}.get(key, key), 0)) for key in axes}
             if action == "move":
+                items["Yaw"] = math.radians(float(yaw_rate))
                 bounds = {"X": 1.67, "Y": 0.4, "Yaw": 1.0}
                 if any(abs(items[key]) > limit for key, limit in bounds.items()):
-                    raise ValueError("velocity exceeds documented limits: X=1.67 m/s, Y=0.4 m/s, Yaw=1 rad/s")
+                    raise ValueError("velocity exceeds documented limits: X=1.67 m/s, Y=0.4 m/s, yaw=57.3 degrees/s")
                 kind, message_type, command = "velocity", 0x00100001, 0x00110002
             else:
                 if any(abs(value) > 1 for value in items.values()): raise ValueError("axis values must be within [-1, 1]")
@@ -441,10 +574,11 @@ class S10MotionPlugin:
                 return {"state": "stopped", "sent_zero_to": ["axis", "velocity"], "action_id": action_id}
             self._stop_stream()
             if action == "move":
-                self.native.send(0x00100002, 0x00500002, {"Mode": MODES["navigation"]})
-                self.native.send(0x00100001, 0x00300002, {"GaitParam": GAITS["navigation_flat"]})
-            action_id = f"s10_{action}_{uuid4().hex}"
-            sent = self.native.send(message_type, command, items)
+                self.native.request(0x00100002, 0x00500002, {"Mode": MODES["navigation"]})
+                self.native.request(0x00100001, 0x00300002, {"GaitParam": GAITS["navigation_flat"]})
+            action_name = "manual_control" if is_manual else action
+            action_id = f"s10_{action_name}_{uuid4().hex}"
+            sent = self.native.send(message_type, command, items) if kind in ("axis", "velocity") else self.native.request(message_type, command, items)
             with self._condition:
                 now = time.monotonic()
                 self._active = {"kind": kind, "type": message_type, "command": command, "items": items,
@@ -460,9 +594,9 @@ class S10MotionPlugin:
 class S10NavigationPlugin:
     CONFIRM_ACTIONS = {"goal", "localize"}
     ACTIONS = {
-        "goal": (["x", "y", "z", "yaw", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "前往地图坐标系单点目标；异步等待任务结束"),
+        "goal": (["x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous"], "前往设备当前已加载地图中的目标点；不负责建图；航向角使用角度制"),
         "cancel": ([], "取消当前导航任务"), "status": ([], "查询导航任务状态"),
-        "localize": (["x", "y", "z", "yaw"], "按地图坐标初始化/重置定位"),
+        "localize": (["x", "y", "z", "yaw_degrees"], "按地图坐标初始化/重置定位；航向角使用角度制"),
         "pose": ([], "查询机器人地图坐标和姿态"),
         "perception_status": ([], "查询定位与避障状态"),
     }
@@ -472,9 +606,9 @@ class S10NavigationPlugin:
         self._active_goal = None
 
     def get_tool(self):
-        result = tool("navigation", "actuator", "山猫 S10 Pro 导航控制；目标导航和定位初始化需要显式 confirm=true", action_schema(self.ACTIONS, {
+        result = tool("navigation", "actuator", "山猫 S10 Pro 地图导航：使用设备当前已加载的地图和定位，不提供建图；目标导航和定位初始化需要显式 confirm=true。角度输入/输出均为度。", action_schema(self.ACTIONS, {
             "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number", "default": 0},
-            "yaw": {"type": "number"}, "point_type": {"type": "integer", "enum": [0, 1, 2, 3, 4], "default": 1},
+            "yaw_degrees": {"type": "number", "description": "地图坐标系中的目标朝向，单位为度"}, "point_type": {"type": "integer", "enum": [0, 1, 2, 3, 4], "default": 1},
             "gait": {"type": "string", "enum": ["navigation_flat", "navigation_stairs"], "default": "navigation_flat"},
             "speed": {"type": "integer", "enum": [0, 1, 2], "default": 0}, "reverse": {"type": "boolean", "default": False},
             "avoid_obstacles": {"type": "boolean", "default": True}, "autonomous": {"type": "boolean", "default": False},
@@ -552,13 +686,24 @@ class S10NavigationPlugin:
         if action == "cancel":
             response = self._cancel_goal()
             return response if response is not None else self.native.request(0x00100003, 0x00100004)
-        if action == "pose": return self.native.request(0x00100003, 0x00200001)
+        if action == "pose":
+            response = self.native.request(0x00100003, 0x00200001)
+            body = response.get("PatrolDevice", {}) if isinstance(response, dict) else {}
+            items = body.get("Items", {}) if isinstance(body, dict) else {}
+            if isinstance(items, dict):
+                for angle in ("Roll", "Pitch", "Yaw"):
+                    if angle in items:
+                        try:
+                            items[f"{angle}Degrees"] = math.degrees(float(items.pop(angle)))
+                        except (TypeError, ValueError):
+                            pass
+            return response
         if action == "perception_status": return self.native.request(0x00100003, 0x00110001)
         if action == "localize":
-            return self.native.request(0x00100003, 0x00200002, {"PosX": args["x"], "PosY": args["y"], "PosZ": args.get("z", 0), "Yaw": args["yaw"]})
+            return self.native.request(0x00100003, 0x00200002, {"PosX": args["x"], "PosY": args["y"], "PosZ": args.get("z", 0), "Yaw": math.radians(float(args["yaw_degrees"]))})
         if action == "goal":
             item = {"Value": 0, "MapID": 0, "PosX": args["x"], "PosY": args["y"], "PosZ": args.get("z", 0),
-                    "AngleYaw": args["yaw"], "PointInfo": int(args.get("point_type", 1)),
+                    "AngleYaw": math.radians(float(args["yaw_degrees"])), "PointInfo": int(args.get("point_type", 1)),
                     "Gait": GAITS[args.get("gait", "navigation_flat")], "Speed": int(args.get("speed", 0)),
                     "Manner": int(bool(args.get("reverse", False))), "ObsMode": 0 if args.get("avoid_obstacles", True) else 1,
                     "NavMode": int(bool(args.get("autonomous", False))), "Terrain": 0, "Posture": 0, "Waypoints": {}}
@@ -583,25 +728,60 @@ class S10NavigationPlugin:
         raise ValueError(f"unsupported S10 navigation action: {action}")
 
 
-class S10DevicePlugin:
-    CONFIRM_ACTIONS = {"sleep", "wake", "auto_sleep", "sdk_mode"}
-    ACTIONS = {"lights": (["head_mode", "head_color", "head_cycle", "tail_mode", "tail_color", "tail_cycle"], "分别设置头尾灯模式、颜色和周期"),
-               "sleep": ([], "进入休眠"), "wake": ([], "唤醒"), "auto_sleep": (["minutes"], "配置心跳断联后的自动休眠等待时间"),
-               "sdk_mode": (["enabled", "frequency"], "配置运动 SDK 模式及关节数据频率")}
+LIGHT_COLORS = {"黑色": 0, "白色": 1, "绿色": 2, "蓝色": 3}
+LIGHT_EFFECTS = {"常亮": 0, "填充流水": 1, "移动流水": 2, "渐变流水": 3, "呼吸": 4, "闪烁": 5}
+
+
+class S10LightPlugin:
+    ACTIONS = {"set": (["head_color", "tail_color", "head_effect", "tail_effect", "head_cycle_seconds", "tail_cycle_seconds"],
+                        "设置头灯和尾灯的具名颜色与灯效")}
+
     def __init__(self, native): self.native = native
     def get_tool(self):
-        result = tool("device", "actuator", "山猫 S10 灯光与休眠管理；休眠和 SDK 模式更改需要显式 confirm=true", action_schema(self.ACTIONS, {
-            "head_mode": {"type": "integer", "enum": list(range(6))}, "tail_mode": {"type": "integer", "enum": list(range(6))},
-            "head_color": {"type": "integer", "enum": list(range(4))}, "tail_color": {"type": "integer", "enum": list(range(4))},
-            "head_cycle": {"type": "integer", "minimum": 1}, "tail_cycle": {"type": "integer", "minimum": 1},
-            "minutes": {"type": "integer", "minimum": 1}, "enabled": {"type": "boolean"},
-            "frequency": {"type": "integer", "minimum": 1, "maximum": 200},
-            "confirm": {"type": "boolean", "description": "Required true for sleep/wake and SDK-mode changes."},
+        return tool("light", "actuator", "山猫 S10 头尾灯控制。固件仅支持黑、白、绿、蓝四种颜色，不支持自定义 RGB；灯效和呼吸/闪烁周期均使用具名选项。", action_schema(self.ACTIONS, {
+            "head_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "头灯颜色"},
+            "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
+            "head_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "头灯效果"},
+            "tail_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "尾灯效果"},
+            "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1, "description": "头灯呼吸或闪烁周期（秒）"},
+            "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1, "description": "尾灯呼吸或闪烁周期（秒）"},
+        }))
+    def start(self): pass
+    def stop(self): pass
+    def dispatch(self, action, args):
+        if action == "start": return {"state": "ready"}
+        if action == "stop": return {"state": "idle"}
+        if action == "info": return {"state": "ready"}
+        if action == "set":
+            leds = []
+            for side in ("head", "tail"):
+                leds.append({
+                    "Type": LIGHT_EFFECTS[args.get(f"{side}_effect", "常亮")],
+                    "Color": [LIGHT_COLORS[args.get(f"{side}_color", "白色")]],
+                    "Cycle": int(args.get(f"{side}_cycle_seconds", 1)),
+                })
+            return self.native.request(0x00100005, 0x00200002, {"CustomMode": True, "Led": leds})
+        raise ValueError(f"unsupported S10 light action: {action}")
+
+
+class S10DevicePlugin:
+    CONFIRM_ACTIONS = {"sleep", "wake", "auto_sleep", "joint_stream"}
+    ACTIONS = {"sleep": ([], "立即使设备进入休眠"), "wake": ([], "退出休眠并唤醒设备"),
+               "auto_sleep": (["minutes"], "设置心跳断开后自动休眠的等待分钟数"),
+               "joint_stream": (["enabled", "frequency_hz"], "开启/关闭 SDK 关节数据流及其发布频率")}
+    def __init__(self, native): self.native = native
+    def get_tool(self):
+        result = tool("device", "actuator", "山猫 S10 设备电源与关节数据流管理。休眠/唤醒和关节流配置需要显式 confirm=true；灯光请使用 light 卡。", action_schema(self.ACTIONS, {
+            "minutes": {"type": "integer", "minimum": 1, "description": "断开心跳后等待的分钟数"},
+            "enabled": {"type": "boolean", "description": "是否启用 SDK 关节数据流"},
+            "frequency_hz": {"type": "integer", "minimum": 1, "maximum": 200, "description": "关节话题发布频率（Hz）"},
+            "confirm": {"type": "boolean", "description": "休眠、唤醒或更改关节数据流前必须为 true。"},
         }))
         return _mark_dangerous(result, self.CONFIRM_ACTIONS)
     def start(self): pass
     def stop(self): pass
     def dispatch(self, action, args):
+        action = "joint_stream" if action == "sdk_mode" else action
         if action in self.CONFIRM_ACTIONS:
             error = _confirmation_error(action, args)
             if error:
@@ -609,17 +789,12 @@ class S10DevicePlugin:
         if action == "start": return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
         if action == "info": return {"state": "ready"}
-        if action == "lights":
-            def led(prefix):
-                return {"Type": int(args.get(f"{prefix}_mode", 0)), "Color": [int(args.get(f"{prefix}_color", 1))], "Cycle": int(args.get(f"{prefix}_cycle", 1))}
-            items = {"CustomMode": True, "Led": [led("head"), led("tail")]}
-            return self.native.request(0x00100005, 0x00200002, items)
         if action in ("sleep", "wake", "auto_sleep"):
             items = {"Sleep": action == "sleep", "Auto": action == "auto_sleep"}
             if action == "auto_sleep": items["Time"] = int(args["minutes"])
             return self.native.request(0x00100002, 0x00400002, items)
-        if action == "sdk_mode":
-            frequency = int(args.get("frequency", 100))
+        if action == "joint_stream":
+            frequency = int(args.get("frequency_hz", 100))
             if not 1 <= frequency <= 200 or 1000 % frequency:
                 raise ValueError("frequency must be 1..200 Hz and divide 1000")
             return self.native.request(0x00100005, 0x00300002, {"SDKEnable": bool(args["enabled"]), "Frequency": frequency})
@@ -653,7 +828,8 @@ class S10ChargePlugin:
 def build_plugins(config, namespace=None, ros2=None):
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
-    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native), S10DevicePlugin(native), S10ChargePlugin(native)]
+    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native),
+               S10LightPlugin(native), S10DevicePlugin(native), S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
         plugins.append(S10NavigationPlugin(native))
     return plugins

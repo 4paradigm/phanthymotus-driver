@@ -18,9 +18,9 @@ cards:
   - { name: loco_state,            type: sensor }
   - { name: battery,               type: sensor }
   - { name: lidar,                 type: sensor }
-  - { name: errors,                type: sensor }
   - { name: navigation_status,     type: sensor }
   - { name: loco,                  type: actuator }
+  - { name: light,                 type: actuator }
   - { name: device,                type: actuator }
   - { name: charging,              type: actuator }
   - { name: navigation,            type: actuator }

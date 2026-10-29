@@ -71,8 +71,10 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
 
     assert config["model_variant"] == "pro"
     assert "navigation" in card_names
+    assert "light" in card_names
     assert "loco" in card_names and "motion" not in card_names
     assert {"imu", "loco_state", "joints", "joint_state", "battery"} <= card_names
+    assert "errors" not in card_names
     assert not card_names.intersection({"motion_info", "native_basic_status", "native_device_status", "hard_estop", "charge_status"})
     assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
     assert config["mcp_port"] == driver["port"] == 15724
@@ -119,7 +121,7 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
         "loco_state": {"topic": "/robot/lynx_s10/loco_state", "format": "data/json"},
         "battery": {"topic": "/robot/lynx_s10/battery", "format": "data/json"},
         "lidar": {"topic": "/robot/lynx_s10/lidar", "format": "sensor/pointcloud"},
-    }})()
+    }, "stream_status": lambda _self: {"imu": {"received": 0, "published": 0}}})()
     plugin = device.S10StatePlugin(native, nodes)
     tools = {item["name"]: item for item in plugin.get_tools()}
     assert tools["joints"]["topic_out"] == [{"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"}]
@@ -235,6 +237,10 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert (point_step, point_count) == (12, 1)
     assert nodes.lidar_publisher.messages[-1].data.typecode == "B"
     assert struct.unpack_from("<fff", encoded, 8) == (1.0, 2.0, 3.0)
+    stream_status = nodes.stream_status()
+    assert stream_status["imu"]["received"] == stream_status["imu"]["published"] == 1
+    assert stream_status["joints"]["received"] == stream_status["joint_state"]["received"] == 1
+    assert stream_status["lidar"]["received"] == stream_status["lidar"]["published"] == 1
     nodes.close()
 
 
@@ -377,7 +383,7 @@ def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
 
-    result = plugin.dispatch("goal", {"x": 1.2, "y": -0.4, "yaw": 0.5, "confirm": True})
+    result = plugin.dispatch("goal", {"x": 1.2, "y": -0.4, "yaw_degrees": math.degrees(0.5), "confirm": True})
     assert result["state"] == "accepted"
     assert result["action_id"].startswith("s10_navigation_")
     deadline = time.monotonic() + 1
@@ -387,10 +393,26 @@ def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
     args, kwargs = native.calls[-1]
     assert args[:2] == (0x00100003, 0x00100002)
     assert args[2]["Item"][0]["PosX"] == 1.2
+    assert args[2]["Item"][0]["AngleYaw"] == pytest.approx(0.5)
     assert kwargs["response_timeout"] == 45
+
+    plugin.dispatch("localize", {"x": 1, "y": 2, "yaw_degrees": 90, "confirm": True})
+    assert native.calls[-1][0][2]["Yaw"] == pytest.approx(math.pi / 2)
 
     plugin.dispatch("cancel", {})
     assert native.calls[-1][0][:2] == (0x00100003, 0x00100004)
+
+
+def test_navigation_pose_reports_angles_in_degrees(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    native.request = lambda *_args, **_kwargs: {"PatrolDevice": {"Items": {
+        "Roll": 0.0, "Pitch": math.pi / 4, "Yaw": -math.pi / 2, "PosX": 1,
+    }}}
+
+    result = device.S10NavigationPlugin(native).dispatch("pose", {})["PatrolDevice"]["Items"]
+
+    assert result == {"PosX": 1, "RollDegrees": 0.0, "PitchDegrees": 45.0, "YawDegrees": -90.0}
 
 
 def test_navigation_declares_completion_and_rejects_unconfirmed_goals(monkeypatch):
@@ -401,7 +423,7 @@ def test_navigation_declares_completion_and_rejects_unconfirmed_goals(monkeypatc
     assert schema["x-is-dangerous"] is True
     assert schema["x-completion"] == {"actions": ["goal"], "timeout": 55}
     assert "confirm" in schema["x-action-params"]["goal"]["params"]
-    assert plugin.dispatch("goal", {"x": 1, "y": 2, "yaw": 0})["code"] == "INVALID_ARGUMENT"
+    assert plugin.dispatch("goal", {"x": 1, "y": 2, "yaw_degrees": 0})["code"] == "INVALID_ARGUMENT"
     assert native.calls == []
 
 
@@ -423,9 +445,9 @@ def test_navigation_cancel_reports_one_terminal_callback(monkeypatch):
     plugin = device.S10NavigationPlugin(native)
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
-    accepted = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw": 0, "confirm": True})
+    accepted = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw_degrees": 0, "confirm": True})
     assert started.wait(1)
-    conflict = plugin.dispatch("goal", {"x": 3, "y": 4, "yaw": 0, "confirm": True})
+    conflict = plugin.dispatch("goal", {"x": 3, "y": 4, "yaw_degrees": 0, "confirm": True})
     assert conflict["code"] == "ACTION_IN_PROGRESS"
     assert plugin.dispatch("cancel", {}) == {"state": "cancel_sent"}
     release.set()
@@ -448,7 +470,7 @@ def test_navigation_request_timeout_reports_acp_error(monkeypatch):
     plugin = device.S10NavigationPlugin(FailingNative({"navigation_task_timeout": 1}))
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
-    accepted = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw": 0, "confirm": True})
+    accepted = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw_degrees": 0, "confirm": True})
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline and not terminals:
         time.sleep(0.01)
@@ -461,8 +483,12 @@ def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeyp
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10MotionPlugin(native)
+    plugin._acp_callback = lambda *_args: None
     definition = plugin.get_tool()
-    assert definition["inputSchema"]["x-completion"]["actions"] == ["move", "axis"]
+    assert set(definition["inputSchema"]["x-completion"]["actions"]) == {
+        "move", "manual_control", "stand_up", "stand_down", "damp", "gait", "mode",
+    }
+    assert "enter_rl_control" not in definition["inputSchema"]["x-action-params"]
     assert definition["inputSchema"]["x-completion"]["timeout"] > 60
     assert "confirm" not in definition["inputSchema"]["properties"]
     assert all("confirm" not in item["params"] for item in definition["inputSchema"]["x-action-params"].values())
@@ -471,11 +497,12 @@ def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeyp
     assert definition["name"] == "loco"
     assert {"move", "stop_move", "stand_up", "stand_down", "damp"} <= set(definition["inputSchema"]["x-action-params"])
     try:
-        result = plugin.dispatch("move", {"vx": 0.5, "vy": 0.1, "vyaw": 0.2, "duration": 1})
+        result = plugin.dispatch("move", {"vx": 0.5, "vy": 0.1, "yaw_rate_deg_s": math.degrees(0.2), "duration": 1})
         assert result["state"] == "streaming"
         assert result["action_id"].startswith("s10_move_")
-        assert native.calls[-1][0][1:] == (0x00110002, {"X": 0.5, "Y": 0.1, "Z": 0.0,
-                                                        "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.2})
+        assert native.calls[-1][0][1] == 0x00110002
+        assert native.calls[-1][0][2] == pytest.approx({"X": 0.5, "Y": 0.1, "Z": 0.0,
+                                                         "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.2})
         assert native.calls[-3][0][1:] == (0x00500002, {"Mode": 1})
         assert native.calls[-2][0][1:] == (0x00300002, {"GaitParam": 0x3002})
         result = plugin.dispatch("stop_move", {})
@@ -486,12 +513,38 @@ def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeyp
         plugin.stop()
 
 
-def test_loco_stand_actions_need_no_confirmation_and_do_not_wait_for_tcp_reply(monkeypatch):
+def test_loco_stand_actions_return_action_ids_and_complete_from_state_reports(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     plugin = device.S10MotionPlugin(native)
-    assert plugin.dispatch("stand_up", {}) == {"state": "sent"}
-    assert plugin.dispatch("stand_down", {}) == {"state": "sent"}
+    terminals = []
+    plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
+    native.reports["basic"] = {"PatrolDevice": {"Items": {"BasicStatus": {"MotionState": 1}}}}
+    stand_up = plugin.dispatch("stand_up", {})
+    assert stand_up["state"] == "accepted"
+    assert stand_up["action_id"].startswith("s10_stand_up_")
+    time.sleep(0.05)
+    assert terminals == []
+    native.reports["basic"] = {"PatrolDevice": {"Items": {"BasicStatus": {"MotionState": 17}}}}
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not terminals:
+        time.sleep(0.01)
+    assert terminals == [(stand_up["action_id"], "completed", {
+        "state": "completed", "action": "stand_up", "observed": {"MotionState": 17},
+    })]
+
+    native.reports["basic"] = {"PatrolDevice": {"Items": {"BasicStatus": {"MotionState": 17}}}}
+    stand_down = plugin.dispatch("stand_down", {})
+    time.sleep(0.05)
+    assert len(terminals) == 1
+    native.reports["basic"] = {"PatrolDevice": {"Items": {"BasicStatus": {"MotionState": 4}}}}
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and len(terminals) < 2:
+        time.sleep(0.01)
+    assert stand_down["action_id"].startswith("s10_stand_down_")
+    assert terminals[-1] == (stand_down["action_id"], "completed", {
+        "state": "completed", "action": "stand_down", "observed": {"MotionState": 4},
+    })
     assert [call[0][1:] for call in native.calls] == [
         (0x00200002, {"MotionParam": 1}),
         (0x00200002, {"MotionParam": 4}),
@@ -553,8 +606,8 @@ def test_axis_stream_has_action_id_and_acp_cancel(monkeypatch):
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     try:
-        accepted = plugin.dispatch("axis", {"x": 0.2, "duration": 60})
-        assert accepted["action_id"].startswith("s10_axis_")
+        accepted = plugin.dispatch("manual_control", {"x": 0.2, "duration": 60})
+        assert accepted["action_id"].startswith("s10_manual_control_")
         assert plugin.dispatch("stop_move", {})["state"] == "stopped"
         assert terminals == [(accepted["action_id"], "cancelled", {
             "state": "cancelled", "reason": "stopped_or_replaced",
@@ -679,11 +732,13 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     native = FakeNative({})
     nav_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["goal"]["params"]
     localize_params = device.S10NavigationPlugin(native).get_tool()["inputSchema"]["x-action-params"]["localize"]["params"]
-    light_params = device.S10DevicePlugin(native).get_tool()["inputSchema"]["x-action-params"]["lights"]["params"]
+    light_tool = device.S10LightPlugin(native).get_tool()
+    light_params = light_tool["inputSchema"]["x-action-params"]["set"]["params"]
 
-    assert set(nav_params) == {"x", "y", "z", "yaw", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
-    assert set(localize_params) == {"x", "y", "z", "yaw", "confirm"}
-    assert {"head_cycle", "tail_cycle"} <= set(light_params)
+    assert set(nav_params) == {"x", "y", "z", "yaw_degrees", "point_type", "gait", "speed", "reverse", "avoid_obstacles", "autonomous", "confirm"}
+    assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
+    assert {"head_color", "tail_color", "head_effect", "tail_effect"} <= set(light_params)
+    assert light_tool["name"] == "light"
 
     device_schema = device.S10DevicePlugin(native).get_tool()["inputSchema"]
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
@@ -692,6 +747,25 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     assert charge_schema["x-is-dangerous"] is True
     assert "confirm" in charge_schema["x-action-params"]["start_charging"]["params"]
     assert "confirm" in charge_schema["x-action-params"]["stop_charging"]["params"]
+
+
+def test_light_uses_named_colors_and_effects_in_native_protocol(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    native.send = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("light must wait for its protocol response"))
+    plugin = device.S10LightPlugin(native)
+    plugin.dispatch("set", {"head_color": "绿色", "tail_color": "蓝色",
+                             "head_effect": "呼吸", "tail_effect": "闪烁",
+                             "head_cycle_seconds": 3, "tail_cycle_seconds": 2})
+
+    assert native.calls[-1][0] == (0x00100005, 0x00200002, {
+        "CustomMode": True,
+        "Led": [
+            {"Type": 4, "Color": [2], "Cycle": 3},
+            {"Type": 5, "Color": [3], "Cycle": 2},
+        ],
+    })
+    assert native.calls[-1][1] == {}
 
 
 def test_malformed_final_fragment_is_discarded_without_killing_decoder():
@@ -768,7 +842,7 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
         def sendall(self, frame):
             _message_id, _request = decode_frame(frame)
             message_id = HEADER.unpack_from(frame)[2]
-            payload = b'{"PatrolDevice":{"Type":"1048676","Command":"5","Items":{"ErrorCode":0}}}'
+            payload = b'{"PatrolDevice":{"Type":"0X0010 0064","Command":"0X0000 0005","Items":{"ErrorCode":0}}}'
             self.response = HEADER.pack(SYNC, len(payload), message_id, 1, 0, 1) + payload
             self.ready.set()
 
@@ -797,5 +871,6 @@ def test_basic_server_matches_string_encoded_response_type_and_command(monkeypat
         response = client.request(1048676, 5)
         assert response["PatrolDevice"]["Items"]["ErrorCode"] == 0
         assert client.snapshot()["last_error"] is None
+        assert "1048676:5" in client.snapshot()["reports"]
     finally:
         client.close()

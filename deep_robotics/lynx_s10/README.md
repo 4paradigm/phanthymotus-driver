@@ -13,15 +13,16 @@
 - `state` 汇总连接、最近错误与所有已收到的设备主动报告，适合诊断传输是否收到数据。
 - `model` 返回官方 `S10.urdf`；`joints` 按 URDF 的固定 16 关节顺序返回 `sensor/skeleton` 结构（q/dq/tau/temperature），并在运控姿态可用时附带 `imu_quat`。`imu` 从运控报告提取加速度、角速度和姿态；`joint_state` 保留原生电机状态；`loco_state` 合并运控和基础状态报告；`battery` 提供电池列表。
 - 急停、充电及设备健康状态分别保留在 `loco_state`、`battery` 或汇总 `state`，不再拆成多张厂商专用状态卡。
-- `errors` 提供原生协议聚合故障列表；`navigation_status` 提供导航任务、定位与置信度报告。
-- `loco` 沿用 As2W/Go2 的执行器命名，基础动作使用 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`。S10 专属的 `gait`、`mode`、归一化 `axis` 和 `rl_control` 也在同一卡片中；按该卡片的直接控制语义不要求 `confirm`。`stand_up/down`、步态和模式命令按 fire-and-forget 发送，不等待固件可能不返回的应答。`move` 会先切换至导航模式和平地步态，再发送速度报文；速度以 10Hz 刷新，`duration` 默认 1 秒后归零，最长 60 秒；兼容输入 `duration=-1` 也会在 60 秒后自动归零。速度控制方向及模式仍须在真机安全验证。
-- `device` 提供头尾灯语、休眠/唤醒、心跳断联后自动休眠时间和 SDK 模式。休眠、唤醒、自动休眠配置和 SDK 模式更改必须显式传入 `confirm=true`。自定义灯语按官方 `CustomMode` 与 `Led` 列表结构编码；SDK 频率限制为 1–200 Hz 且必须整除 1000。
+- `navigation_status` 提供导航任务、定位与置信度报告。
+- `loco` 提供 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`、`gait`、`mode` 和 `manual_control`。`move` 的前后/侧向速度单位为 m/s，偏航角速度参数 `yaw_rate_deg_s` 使用度/秒；发给固件前会转换为 rad/s。`manual_control` 是常规/辅助模式的六轴归一化控制强度（-1 到 1），不是角度；普通步态只响应前后、侧移和偏航分量。通过 ASDU 执行 `stand_up` 后会自动进入 RL 运控状态，无需单独切换。持续运动指令 10Hz 刷新，到时自动发零指令；各状态切换会等待状态上报并通过 ACP 发送 action completion。
+- `light` 独立设置头尾灯颜色和效果。颜色使用固件支持的黑、白、绿、蓝具名选项；协议不支持任意 RGB 值。效果使用常亮、流水、渐变、呼吸、闪烁等具名选项，周期单位为秒。
+- `device` 管理休眠/唤醒、心跳断联后的自动休眠时间和 SDK 关节数据流。相关状态/SDK 修改需要显式传入 `confirm=true`；SDK 关节流频率限制为 1–200 Hz 且必须整除 1000。
 - `charging` 提供 `start_charging`、`stop_charging` 两个自主充电动作，两者都必须显式传入 `confirm=true`；卡片生命周期的 `start`/`stop` 只报告 `ready`/`idle`，不会触发充电。风险较高的 `Charge=2` 强制清除状态不开放为普通动作。
-- 本设备为 S10 Pro，默认 `model_variant` 设为 `pro` 并注册 `navigation` 动作卡，包含单点任务、取消、状态、定位初始化、地图位姿和感知状态。单点导航和定位初始化必须显式传入 `confirm=true`；导航任务异步返回 action ID 并通过 ACP 报告完成、取消或错误。文档指出非 Pro 版本会以通用错误 `0xE00A` 拒绝导航功能；若将驱动用于标准版，需将配置改为 `standard` 并从 `driver.yaml` 卡片清单移除导航卡。
+- 本设备为 S10 Pro，默认 `model_variant` 设为 `pro` 并注册 `navigation` 动作卡，包含单点任务、取消、状态、定位初始化、地图位姿和感知状态。它只是在机器人当前已加载地图中执行目标点导航，不负责创建地图；使用前必须已有可用地图且定位正常。单点导航和定位初始化必须显式传入 `confirm=true`；导航任务异步返回 action ID 并通过 ACP 报告完成、取消或错误。文档指出非 Pro 版本会以通用错误 `0xE00A` 拒绝导航功能；若将驱动用于标准版，需将配置改为 `standard` 并从 `driver.yaml` 卡片清单移除导航卡。
 
 ## 与参考驱动的差异
 
-传感器和执行卡片沿用仓库常用命名与职责划分。真机 ROS graph 中 `/IMU`、`/JOINTS_DATA_10HZ`、`/BATTERY_DATA` 有发布样本，`/MOTION_INFO` 有发布者；驱动从机器人 ROS 域订阅，并通过 Agent Core ROS 域转发 `imu`、`joints`、`joint_state`、`loco_state`、`battery` 和 `lidar` 实时流。传感器卡的 `start/info` 响应会返回其 `topic_out`，供前端建立流订阅。虽然遥控器双激光雷达开关已开启，现场 `/LIDAR/POINTS` 当前仍无发布者；检查到的 `/DEPTH_POINTS`、`/LIO_ALIGNED_POINTS`、`/SEG_CLOUD` 和 `/cloud_now_g` 在 ROS graph 中有过 publisher discovery，但抽样期间没有发出消息，不能视作可用雷达流或直接替换话题。需进一步查设备雷达驱动为何未向其文档话题发布。MCP 查询仍使用原生 TCP 缓存。手册没有可供外部主机稳定订阅的相机 URL/视频协议，故暂不提供 `camera` 卡。
+传感器和执行卡片沿用仓库常用命名与职责划分。现场 `/IMU`、`/JOINTS_DATA_10HZ`、`/BATTERY_DATA` 有样本，`/MOTION_INFO` 有发布者；AOS 上 `/LIDAR/POINTS` 也已实测约 10Hz、每帧约 8.5 万点。`state` 的 `ros_streams` 字段及容器首样本日志用于区分源 topic 无发布者、driver 未收到、转发未发布和 Agent Core 无订阅者。旧镜像的 domain-42 lidar publisher 未观察到样本，且容器 CPU 曾约 85%；因此点云转发已改为均匀限采样 2,000 点并使用紧凑字节缓冲，仍需部署新镜像复测前端数据流。拓扑图标出前/后/左/右四路广角相机，现场 ROS graph 当前只发现 `/usb_camera_1/image_raw`、`/usb_camera_1/image_raw_0`、`/usb_camera_1/image_raw_1` 及多相机/MediaMTX 进程，但方位映射和可供前端使用的流 URL 尚未确认，故暂不把这些流错误命名为四路方位相机，也未注册相机卡。软件指南没有定义这些相机流的外部视频协议；需先核对机载多相机配置和 MediaMTX 路径。
 
 S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 实时流使用真机 `JOINTS_DATA_10HZ` 的 16 个电机字段，并按 URDF 关节顺序映射到仓库通用 `sensor/skeleton`；`joint_state` 同时保留完整供应商消息字段。
 

@@ -17,6 +17,19 @@ HEADER = struct.Struct("<4sHHBBB5x")
 MAX_ASDU = 1000
 
 
+def _protocol_int(value: object) -> int:
+    """Parse protocol integers, including spaced hex strings used by examples."""
+    if isinstance(value, int):
+        return value
+    text = "".join(str(value).strip().split())
+    try:
+        return int(text, 0)
+    except ValueError:
+        if text and all(char in "0123456789abcdefABCDEF" for char in text):
+            return int(text, 16)
+        raise
+
+
 def encode_frame(message_id: int, message_type: int, command: int, items: dict | None = None) -> bytes:
     payload = json.dumps({"PatrolDevice": {
         "Type": int(message_type), "Command": int(command),
@@ -136,7 +149,10 @@ class BasicServerClient:
 
     def _remember(self, payload):
         body = payload.get("PatrolDevice", {})
-        key = f"{body.get('Type')}:{body.get('Command')}"
+        try:
+            key = f"{_protocol_int(body.get('Type'))}:{_protocol_int(body.get('Command'))}"
+        except (TypeError, ValueError):
+            key = f"{body.get('Type')}:{body.get('Command')}"
         with self._state_lock:
             self.reports[key] = payload
 
@@ -193,7 +209,7 @@ class BasicServerClient:
                     self._remember(payload)
                     body = payload.get("PatrolDevice", {})
                     try:
-                        response_key = (int(str(body.get("Type")), 0), int(str(body.get("Command")), 0))
+                        response_key = (_protocol_int(body.get("Type")), _protocol_int(body.get("Command")))
                     except (TypeError, ValueError):
                         response_key = None
                     with self._response_condition:
