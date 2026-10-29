@@ -147,122 +147,6 @@ def _finite_number(value) -> bool:
         return False
 
 
-def check_control_contract(descriptor: Descriptor, message: dict) -> Outcome | None:
-    """Check the standard message contract without applying or mutating inputs."""
-    return _check_control_contract(descriptor, message, descriptor.eef_quat_offsets)
-
-
-def _check_control_contract(
-    descriptor: Descriptor, message: dict, quat_offsets: tuple
-) -> Outcome | None:
-    """1. Reconcile against the descriptor.
-
-    `mode` and `dof` travel on every message on purpose, redundantly. This
-    is the last line against an upstream whose action space changed without
-    the driver being told — and the answer to that is to refuse, not to
-    apply the first `dof` values and hope. Does not mutate inputs or apply.
-    """
-    if not isinstance(message, dict):
-        return Outcome(Verdict.REJECTED, "message is not an object")
-
-    schema = message.get("schema")
-    if schema != SCHEMA:
-        return Outcome(Verdict.REJECTED, f"schema {schema!r} != {SCHEMA!r}")
-
-    mode = message.get("mode")
-    if mode != descriptor.mode:
-        return Outcome(
-            Verdict.REJECTED,
-            f"mode {mode!r} but this driver accepts {descriptor.mode!r}",
-        )
-
-    values = message.get("values")
-    if not isinstance(values, (list, tuple)):
-        return Outcome(Verdict.REJECTED, "values must be a list")
-
-    dof = message.get("dof")
-    if dof != descriptor.dof:
-        return Outcome(
-            Verdict.REJECTED,
-            f"dof {dof!r} but this driver has {descriptor.dof}",
-        )
-    if len(values) != descriptor.dof:
-        return Outcome(
-            Verdict.REJECTED,
-            f"values has {len(values)} entries but dof is {descriptor.dof}",
-        )
-    for i, value in enumerate(values):
-        if not _finite_number(value):
-            return Outcome(Verdict.REJECTED,
-                           f"values[{i}] is not a finite number: {value!r}")
-
-    # Every `eef_pose` segment's quaternion must be unit length. This is
-    # the one check in the whole chain that can catch a *different rotation
-    # representation* arriving in the right number of slots: an rpy triple
-    # or the first four of an R6 block has no reason to land on the unit
-    # sphere. See descriptor.EEF_POSE_STRIDE for why the layout is a
-    # quaternion at all — this check is the entire reason.
-    for offset in quat_offsets:
-        quaternion = values[offset:offset + 4]
-        if not rotation.is_unit(quaternion):
-            return Outcome(
-                Verdict.REJECTED,
-                f"values[{offset}:{offset + 4}] is not a unit quaternion "
-                f"(|q| = {rotation.norm(quaternion):.4f}) — an eef_pose is "
-                "[x, y, z, qx, qy, qz, qw] with the rotation as a unit "
-                "quaternion in xyzw order",
-            )
-
-    if not isinstance(message.get("source"), str) or not message["source"]:
-        return Outcome(Verdict.REJECTED, "source is required and must be a string")
-    return None
-
-
-def check_control_freshness(
-    descriptor: Descriptor, message: dict, now: int, seq_by_source: dict
-) -> Outcome | None:
-    """2. Age and ordering. Routine failures — dropped, not rejected.
-
-    The contract check must have succeeded first. `now` is wall-clock Unix
-    milliseconds, matching the message timestamps. This function reads but
-    never updates `seq_by_source`; arbitration decides when to commit a seq.
-    A command can be fresh while its observation is stale, so they are checked
-    separately. This preserves the sink's existing optional-observation behavior.
-    """
-    stamp = message.get("stamp_ms")
-    ttl = message.get("ttl_ms")
-    if not _finite_number(stamp):
-        return Outcome(Verdict.REJECTED, "stamp_ms is required and must be finite")
-    if not _finite_number(ttl) or ttl <= 0:
-        return Outcome(Verdict.REJECTED,
-                       "ttl_ms is required, finite, and must be positive")
-
-    age = now - stamp
-    if age > ttl:
-        return Outcome(Verdict.DROPPED, f"expired: {age} ms old, ttl {int(ttl)} ms")
-
-    max_obs_age = descriptor.max_obs_age_ms
-    obs_stamp = message.get("obs_stamp_ms")
-    if obs_stamp is not None and not _finite_number(obs_stamp):
-        return Outcome(Verdict.REJECTED, "obs_stamp_ms must be finite")
-    if max_obs_age is not None and isinstance(obs_stamp, (int, float)):
-        obs_age = now - obs_stamp
-        if obs_age > max_obs_age:
-            return Outcome(
-                Verdict.DROPPED,
-                f"observation {obs_age} ms old, limit {max_obs_age} ms",
-            )
-
-    seq = message.get("seq")
-    if not isinstance(seq, int) or isinstance(seq, bool):
-        return Outcome(Verdict.REJECTED, "seq is required and must be an integer")
-    source = message["source"]
-    last = seq_by_source.get(source)
-    if last is not None and seq <= last:
-        return Outcome(Verdict.DROPPED, f"seq {seq} not newer than {last}")
-    return None
-
-
 class ControlSink:
     """Gate between a command source and a driver's `apply`.
 
@@ -520,10 +404,107 @@ class ControlSink:
     # ── chain ────────────────────────────────────────────────────────────────
 
     def _check_contract(self, message: dict) -> Outcome | None:
-        return _check_control_contract(self.descriptor, message, self._eef_quat_offsets)
+        """1. Reconcile against the descriptor.
+
+        `mode` and `dof` travel on every message on purpose, redundantly. This
+        is the last line against an upstream whose action space changed without
+        the driver being told — and the answer to that is to refuse, not to
+        apply the first `dof` values and hope.
+        """
+        if not isinstance(message, dict):
+            return Outcome(Verdict.REJECTED, "message is not an object")
+
+        schema = message.get("schema")
+        if schema != SCHEMA:
+            return Outcome(Verdict.REJECTED, f"schema {schema!r} != {SCHEMA!r}")
+
+        mode = message.get("mode")
+        if mode != self.descriptor.mode:
+            return Outcome(
+                Verdict.REJECTED,
+                f"mode {mode!r} but this driver accepts {self.descriptor.mode!r}",
+            )
+
+        values = message.get("values")
+        if not isinstance(values, (list, tuple)):
+            return Outcome(Verdict.REJECTED, "values must be a list")
+
+        dof = message.get("dof")
+        if dof != self.descriptor.dof:
+            return Outcome(
+                Verdict.REJECTED,
+                f"dof {dof!r} but this driver has {self.descriptor.dof}",
+            )
+        if len(values) != self.descriptor.dof:
+            return Outcome(
+                Verdict.REJECTED,
+                f"values has {len(values)} entries but dof is {self.descriptor.dof}",
+            )
+        for i, value in enumerate(values):
+            if not _finite_number(value):
+                return Outcome(Verdict.REJECTED,
+                               f"values[{i}] is not a finite number: {value!r}")
+
+        # Every `eef_pose` segment's quaternion must be unit length. This is
+        # the one check in the whole chain that can catch a *different rotation
+        # representation* arriving in the right number of slots: an rpy triple
+        # or the first four of an R6 block has no reason to land on the unit
+        # sphere. See descriptor.EEF_POSE_STRIDE for why the layout is a
+        # quaternion at all — this check is the entire reason.
+        for offset in self._eef_quat_offsets:
+            quaternion = values[offset:offset + 4]
+            if not rotation.is_unit(quaternion):
+                return Outcome(
+                    Verdict.REJECTED,
+                    f"values[{offset}:{offset + 4}] is not a unit quaternion "
+                    f"(|q| = {rotation.norm(quaternion):.4f}) — an eef_pose is "
+                    "[x, y, z, qx, qy, qz, qw] with the rotation as a unit "
+                    "quaternion in xyzw order",
+                )
+
+        if not isinstance(message.get("source"), str) or not message["source"]:
+            return Outcome(Verdict.REJECTED, "source is required and must be a string")
+        return None
 
     def _check_freshness(self, message: dict, now: int) -> Outcome | None:
-        return check_control_freshness(self.descriptor, message, now, self._seq_by_source)
+        """2. Age and ordering. Routine failures — dropped, not rejected.
+
+        A command can be freshly generated and still act on an 800 ms old
+        picture, which is why `obs_stamp_ms` is checked separately from
+        `stamp_ms` rather than inferred from it.
+        """
+        stamp = message.get("stamp_ms")
+        ttl = message.get("ttl_ms")
+        if not _finite_number(stamp):
+            return Outcome(Verdict.REJECTED, "stamp_ms is required and must be finite")
+        if not _finite_number(ttl) or ttl <= 0:
+            return Outcome(Verdict.REJECTED,
+                           "ttl_ms is required, finite, and must be positive")
+
+        age = now - stamp
+        if age > ttl:
+            return Outcome(Verdict.DROPPED, f"expired: {age} ms old, ttl {int(ttl)} ms")
+
+        max_obs_age = self.descriptor.max_obs_age_ms
+        obs_stamp = message.get("obs_stamp_ms")
+        if obs_stamp is not None and not _finite_number(obs_stamp):
+            return Outcome(Verdict.REJECTED, "obs_stamp_ms must be finite")
+        if max_obs_age is not None and isinstance(obs_stamp, (int, float)):
+            obs_age = now - obs_stamp
+            if obs_age > max_obs_age:
+                return Outcome(
+                    Verdict.DROPPED,
+                    f"observation {obs_age} ms old, limit {max_obs_age} ms",
+                )
+
+        seq = message.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            return Outcome(Verdict.REJECTED, "seq is required and must be an integer")
+        source = message["source"]
+        last = self._seq_by_source.get(source)
+        if last is not None and seq <= last:
+            return Outcome(Verdict.DROPPED, f"seq {seq} not newer than {last}")
+        return None
 
     def _check_arbitration(self, message: dict, now: int) -> Outcome | None:
         """3. Priority between sources.
