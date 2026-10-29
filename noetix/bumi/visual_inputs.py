@@ -7,6 +7,7 @@ production down with it.
 """
 from __future__ import annotations
 
+from array import array
 import json
 import time
 import uuid
@@ -98,7 +99,7 @@ class RawCameraPublisher:
                 msg.header.frame_id = optical
                 msg.height, msg.width = pixels.shape[:2]
                 msg.encoding, msg.is_bigendian, msg.step = encoding, False, msg.width*channels
-                msg.data = pixels.tobytes()
+                msg.data = array('B', pixels.tobytes())
                 self.pubs[key].publish(msg)
                 if key == 'rgb':
                     rgb_msg = msg

@@ -11,6 +11,7 @@ no consumer in the motion path: stopping this card only reaps its own child and
 private topics, never the camera or a motion card.
 """
 from __future__ import annotations
+from array import array
 from collections import OrderedDict
 from copy import deepcopy
 import json
@@ -454,7 +455,7 @@ class VisualOdometryNode:
             out.header = deepcopy(image.header)
             out.header.frame_id = self.frame_id
             out.width, out.height, out.encoding, out.step = rgb.width, rgb.height, encoding, rgb.width*bpp
-            out.data = data.tobytes()
+            out.data = array('B', data.tobytes())
             pub.publish(out)
         info = deepcopy(info)
         info.header.frame_id = self.frame_id

@@ -5,6 +5,7 @@ bundle publishes raw RGB/depth/CameraInfo/provenance and nothing with an IMU.
 
 Run: python3 -m pytest -q tests/bumi_visual_odometry/test_inputs.py
 """
+from array import array
 import json
 from pathlib import Path
 import sys
@@ -95,9 +96,13 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(raw_ros):
     raw_publisher.publish(aligned, aligned)
 
     raw = messages['/robot/odometry_input/depth'][0]
+    # Humble's uint8[] setter scans bytes in Python; array('B') takes its
+    # buffer fast path (about 402 ms versus 0.22 ms per RGB-D pair on Bumi).
+    assert isinstance(raw.data, array) and raw.data.typecode == 'B'
     assert raw.encoding == '32FC1' and raw.step == 12
     assert np.frombuffer(raw.data, dtype='<f4').tolist() == pytest.approx([1.]*6)
     rgb = messages['/robot/odometry_input/rgb'][0]
+    assert isinstance(rgb.data, array) and rgb.data.typecode == 'B'
     assert rgb.encoding == 'bgr8' and rgb.step == 9
     assert _stamp(raw)-_stamp(rgb) == 10_000_000
     meta = json.loads(messages['/robot/odometry_input/camera_meta'][0].data)
@@ -106,6 +111,41 @@ def test_shared_raw_publisher_uses_sdk_scale_and_separate_source_times(raw_ros):
     assert meta['rgb_stamp_ns'] == _stamp(rgb)
     assert meta['depth_stamp_ns'] == _stamp(raw)
     assert meta['clock_mapping'] == 'device_to_host'
+
+
+def test_estimator_forwarding_keeps_the_byte_array_fast_path(raw_ros):
+    from noetix.bumi.visual_odometry import VisualOdometryNode
+    from noetix.bumi.visual_odometry_contract import Health
+
+    raw_publisher, messages = publisher(raw_ros)
+    aligned = frames()
+    raw_publisher.publish(aligned, aligned)
+    rgb = messages['/robot/odometry_input/rgb'][0]
+    depth = messages['/robot/odometry_input/depth'][0]
+    info = messages['/robot/odometry_input/info'][0]
+    meta = json.loads(messages['/robot/odometry_input/camera_meta'][0].data)
+    stamp = _stamp(rgb)
+    # Exercise real validation/forwarding without ROS or an estimator child.
+    node = VisualOdometryNode.__new__(VisualOdometryNode)
+    node.cache = {stamp: meta}
+    node.images = {stamp: (rgb, depth, info)}
+    node.health = Health('seg', None, 0)
+    node.now = lambda: stamp+20_000_000
+    node.frame_id = node.optics = node.maps = None
+    node.children = NS(children=[object()])
+    forwarded = {'rgb': [], 'depth': [], 'info': []}
+    for name in forwarded:
+        setattr(node, name+'_pub', NS(publish=forwarded[name].append))
+
+    node._prepare(stamp)
+
+    for name, source in (('rgb', rgb), ('depth', depth)):
+        output = forwarded[name][0]
+        assert isinstance(output.data, array) and output.data.typecode == 'B'
+        assert bytes(output.data) == bytes(source.data)
+        assert output.encoding == source.encoding
+        assert output.step == source.step
+        assert _stamp(output) == _stamp(source)
 
 
 def test_zero_coefficient_inverse_brown_conrady_is_the_pinhole_model(raw_ros):
