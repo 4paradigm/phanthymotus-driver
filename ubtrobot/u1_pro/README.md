@@ -34,7 +34,15 @@
 | 开启自动待机动作 | `{"action":"enable"}` |
 | 查询当前设置 | `{"action":"status"}` |
 
-`status`、`enable`、`disable` 均异步执行。MCP 首次返回会显示具体命令、中文说明、目标配置及任务编号。例如关闭操作返回：
+`status` 恢复为同步查询，MCP 直接返回实际开关状态，例如：
+
+```json
+{"ok":true,"code":"OK","data":{"enabled":false},"source":"vendor_user_config"}
+```
+
+`data.enabled` 为 `true` 表示待机开关已开启，`false` 表示已关闭。查询沿用最初的原生配置读取逻辑，读取命令超时为 5 秒；查询失败直接通过 MCP 报错。查询不创建后台任务，不返回 `action_id`，也不发送 ACP 完成通知。
+
+`enable`、`disable` 异步执行。MCP 首次返回会显示具体命令、中文说明、目标配置及任务编号。例如关闭操作返回：
 
 ```json
 {
@@ -46,15 +54,15 @@
 }
 ```
 
-`request.enabled` 表示本次修改的目标值；查询操作只提供 `config_key`，不预先报告开关值。`running` 表示后台正在处理，最终结果以 ACP 完成通知为准。
+`request.enabled` 表示本次修改的目标值。`running` 表示后台正在处理，最终修改结果以 ACP 完成通知为准。
 
-驱动在后台完成操作，再向 Agent Core 的 `/api/acp/complete` POST 一次完成通知。可在输入中提供唯一的 `action_id`（1–128 位 ASCII 字母、数字或 `_ . : -`）；省略时生成 UUID。卡片声明 `x-completion`（上述三个动作，兜底超时 45 秒）及独立的 `u1_idle_config` 资源。
+驱动在后台完成修改，再向 Agent Core 的 `/api/acp/complete` POST 一次完成通知。修改操作可在输入中提供唯一的 `action_id`（1–128 位 ASCII 字母、数字或 `_ . : -`）；省略时生成 UUID。卡片声明 `x-completion`（仅 `enable`、`disable`，兜底超时 45 秒）及独立的 `u1_idle_config` 资源。
 
-完成通知包含相同的 `action_id`、`tool:"idle_actions"` 和 `status:"completed"` 或 `status:"error"`。成功时，业务结果位于通知的 `result.result`：查询结果为 `{"ok":true,"code":"OK","data":{"enabled":true},"source":"vendor_user_config"}`，修改结果包含 `ok`、`requested`、`enabled` 和读回的 `state`。其中 `enabled` 是持久配置中的开关值；任务完成表示配置查询/写入与读回确认完成，不表示电机已经静止。
+完成通知包含相同的 `action_id`、`tool:"idle_actions"` 和 `status:"completed"` 或 `status:"error"`。成功时，业务结果位于通知的 `result.result`，包含 `ok`、`requested`、`enabled` 和读回的 `state`。其中 `enabled` 是持久配置中的开关值；任务完成表示配置写入与读回确认完成，不表示电机已经静止。
 
-卡片一次只接受一个操作，忙碌时立即拒绝新请求，不建立等待队列。`start`/`stop` 同步返回；停止卡片后不再接收新的配置操作，已接受的任务继续完成并回报真实结果。恢复接收可调用 `start`。ACP 通知发送失败时会记录转义后的任务 ID，平台通过声明的超时兜底。
+卡片一次只接受一个后台修改操作，忙碌时立即拒绝新的修改请求，不建立等待队列。查询与修改由底层锁串行化。`start`/`stop` 同步返回；停止卡片后不再接收新的配置修改，已接受的任务继续完成并回报真实结果，同步查询仍可调用。恢复接收修改可调用 `start`。ACP 通知发送失败时会记录转义后的任务 ID，平台通过声明的超时兜底。
 
-服务拒绝、超时、读回失败或状态不一致通过 ACP 的 `status:"error"` 与 `result.message` 回报。厂商错误详情会转义换行、ESC、NUL 等控制字符并限制长度（每段 240 字符，最终错误消息最多 1024 字符），避免原始输出进入日志或完成通知。
+修改时的服务拒绝、超时、读回失败或状态不一致通过 ACP 的 `status:"error"` 与 `result.message` 回报。厂商错误详情会转义换行、ESC、NUL 等控制字符并限制长度（每段 240 字符，最终 ACP 错误消息最多 1024 字符），避免原始输出进入日志或完成通知。
 
 `enable`/`disable` 的修改命令遇到外层进程等待超时或内层 `timeout` 退出（124/137）时，后台任务会自动读回一次当前设置，读回另设 5 秒等待上限，且不重发修改请求。操作仍通过 ACP 作为超时错误回报；`result.message` 保留超时原因、目标 `requested`、读回结果和 `request completion unconfirmed; no automatic retry`：
 
@@ -64,7 +72,7 @@
 | `readback=mismatch; observed_enabled=true` | 示例：目标为关闭，读回的持久设置仍为开启 |
 | `readback=unknown; observed_enabled=unknown; readback_error=...` | 查询也失败，当前设置未知，并附查询错误原因 |
 
-读回只是查询时刻的设置快照。即使符合目标，也不代表收到了本次请求的成功响应；不符合目标时，厂商服务也可能稍后才完成处理。调用方应据此决定后续查询或重试。`status` 任务超时只通过 ACP 报告查询失败，不递归查询。
+读回只是查询时刻的设置快照。即使符合目标，也不代表收到了本次请求的成功响应；不符合目标时，厂商服务也可能稍后才完成处理。调用方应据此决定后续查询或重试。`status` 查询超时直接通过 MCP 报告失败，不递归查询。
 
 关闭会让当前固件的循环待机分支和自动眨眼分支退出，禁止继续安排 `S017/S018/S019/S007` 待机动作及 `S020/S032/S033` 交互眨眼。但已经提交给运控的轨迹可能继续执行到结束：当前固件的 `PlayTrajectoryMotionFileNode::onHalted()` 清理本地等待状态，没有向运控发送轨迹取消请求。一次真机日志中，关闭配置被行为树读到后，已提交的 `S018` 轨迹又过了约 16.7 秒才返回。因此，`disable` 成功表示待机偏好已关闭，不表示机器人已经静止。
 

@@ -2221,14 +2221,14 @@ class IdleActionsPlugin:
         schema = action_schema(actions, {
             "action_id": {"type": "string", "minLength": 1, "maxLength": 128,
                           "pattern": "^[A-Za-z0-9_.:-]+$",
-                          "description": "Optional unique ACP correlation ID; omitted IDs are generated as UUIDs."},
+                          "description": "Optional unique ACP correlation ID for enable/disable; omitted IDs are generated as UUIDs."},
         })
-        schema["x-completion"] = {"actions": ["status", "enable", "disable"], "timeout": 45}
+        schema["x-completion"] = {"actions": ["enable", "disable"], "timeout": 45}
         schema["x-resource"] = "u1_idle_config"
         return tool(self.PREFIX, "actuator",
                     "自动待机动作：开启、关闭或查询 U1 Pro 循环待机动作及自动眨眼。"
                     "设置持久保存，启动/停止卡片不改变设置；关闭待机请调用 disable。"
-                    "查询和修改异步返回 action_id，通过 ACP 回报配置操作结果。"
+                    "查询同步返回实际开关状态；修改异步返回 action_id，通过 ACP 回报配置操作结果。"
                     "关闭会禁止新的待机动作，已下发的轨迹可能继续执行到结束。"
                     "关闭后仍可执行固件的一次性归位和 expression/head 卡片主动请求的动作。",
                     schema)
@@ -2267,7 +2267,6 @@ class IdleActionsPlugin:
         if action in {"enable", "disable"}:
             request["enabled"] = action == "enable"
         messages = {
-            "status": "正在查询自动待机动作开关。",
             "enable": "正在开启自动待机动作及自动眨眼。",
             "disable": "正在关闭自动待机动作及自动眨眼，允许当前动作执行完成。",
         }
@@ -2276,8 +2275,7 @@ class IdleActionsPlugin:
 
     def _run(self, action: str, action_id: str) -> None:
         try:
-            result = (self.control.status() if action == "status"
-                      else self.control.set_enabled(action == "enable"))
+            result = self.control.set_enabled(action == "enable")
             status = "completed"
             completion = {"state": status, "action_id": action_id, "action": action, "result": result}
         except Exception as exc:
@@ -2295,7 +2293,9 @@ class IdleActionsPlugin:
             return self.start()
         if action == "stop":
             return self.stop()
-        if action in {"status", "enable", "disable"}:
+        if action == "status":
+            return self.control.status()
+        if action in {"enable", "disable"}:
             return self._submit(action, args)
         return None
 

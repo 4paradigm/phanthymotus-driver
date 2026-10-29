@@ -1446,7 +1446,7 @@ class U1CardContractTests(unittest.TestCase):
         schema = plugin.get_tool()["inputSchema"]
         self.assertEqual(set(schema["properties"]["action"]["enum"]),
                          {"start", "stop", "enable", "disable", "status"})
-        self.assertEqual(schema["x-completion"], {"actions": ["status", "enable", "disable"], "timeout": 45})
+        self.assertEqual(schema["x-completion"], {"actions": ["enable", "disable"], "timeout": 45})
         self.assertEqual(schema["x-resource"], "u1_idle_config")
         self.assertIn("action_id", schema["properties"])
         self.assertEqual(plugin.start(), {"state": "ready"})
@@ -1495,7 +1495,7 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         ids = set()
-        for action in ("status", "enable", "disable"):
+        for action in ("enable", "disable"):
             with self.subTest(action=action):
                 entered, release = threading.Event(), threading.Event()
                 threads = []
@@ -1521,9 +1521,9 @@ class U1CardContractTests(unittest.TestCase):
                         self.assertEqual(queued["action"], action)
                         self.assertEqual(queued["request"], {
                             "config_key": "idle_action_enabled",
-                            **({"enabled": enabled} if action != "status" else {}),
+                            "enabled": enabled,
                         })
-                        self.assertIn({"status": "查询", "enable": "开启", "disable": "关闭"}[action],
+                        self.assertIn({"enable": "开启", "disable": "关闭"}[action],
                                       queued["message"])
                         self.assertTrue(entered.wait(1))
                         self.assertEqual(len(threads), 1)
@@ -1551,12 +1551,28 @@ class U1CardContractTests(unittest.TestCase):
                     self.assertEqual(str(device.uuid.UUID(queued["action_id"])), queued["action_id"])
                 self.assertNotIn(queued["action_id"], ids)
                 ids.add(queued["action_id"])
-                if action == "status":
-                    control.status.assert_called_once_with()
-                    control.set_enabled.assert_not_called()
-                else:
-                    control.set_enabled.assert_called_once_with(enabled)
-                    control.status.assert_not_called()
+                control.set_enabled.assert_called_once_with(enabled)
+                control.status.assert_not_called()
+
+    def test_idle_status_mcp_returns_observed_boolean_without_background_task(self):
+        import device
+        import subprocess
+
+        plugin = device.IdleActionsPlugin(device.IdleActionControl())
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), mock.patch("native_idle_actions.subprocess.run", return_value=
+                    subprocess.CompletedProcess([], 0, stdout=json.dumps({"enabled": enabled}), stderr="")) as run, \
+                    mock.patch.object(device, "_acp_notify") as notify:
+                result = self._call_idle_mcp(plugin, "status")
+                self.assertEqual(result, {
+                    "ok": True, "code": "OK", "data": {"enabled": enabled}, "source": "vendor_user_config",
+                })
+                self.assertIs(result["data"]["enabled"], enabled)
+                self.assertNotIn("action_id", result)
+                self.assertIsNone(plugin._worker)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0][13:15], ["python3", "-c"])
+                notify.assert_not_called()
 
     def test_idle_timeout_readback_reaches_mcp_caller_through_acp_error(self):
         import device
@@ -1624,7 +1640,7 @@ class U1CardContractTests(unittest.TestCase):
                     plugin.dispatch("disable", {})
                 self.assertEqual(plugin.stop(), {"state": "idle"})
                 with self.assertRaisesRegex(RuntimeError, "stopped"):
-                    plugin.dispatch("status", {})
+                    plugin.dispatch("disable", {})
             finally:
                 release.set()
                 plugin._worker.join(2)
@@ -1632,33 +1648,33 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(notify.call_count, 1)
             self.assertEqual(notify.call_args.args[:2], (first["action_id"], "completed"))
             plugin.start()
-            second = plugin.dispatch("status", {})
+            second = plugin.dispatch("disable", {})
             plugin._worker.join(2)
             self.assertFalse(plugin._worker.is_alive())
             self.assertEqual(notify.call_count, 2)
             self.assertEqual(notify.call_args.args[:2], (second["action_id"], "completed"))
-        control.set_enabled.assert_called_once_with(True)
-        control.status.assert_called_once_with()
+        self.assertEqual(control.set_enabled.call_args_list, [mock.call(True), mock.call(False)])
+        control.status.assert_not_called()
 
     def test_idle_invalid_ids_and_worker_start_failure_leave_card_available(self):
         import device
 
         control = mock.Mock(spec=device.IdleActionControl)
-        control.status.return_value = {"ok": True}
+        control.set_enabled.return_value = {"ok": True, "enabled": True}
         plugin = device.IdleActionsPlugin(control)
         with mock.patch.object(device, "_acp_notify") as notify:
             for value in ("", None, 1, "bad\nID", "a" * 129):
                 with self.subTest(value=value), self.assertRaises(ValueError):
-                    plugin.dispatch("status", {"action_id": value})
+                    plugin.dispatch("enable", {"action_id": value})
             for target in ("device.threading.Thread", "device.threading.Thread.start"):
                 with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("thread unavailable")):
                     with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
-                        plugin.dispatch("status", {})
+                        plugin.dispatch("enable", {})
             self.assertIsNone(plugin._active)
             self.assertIsNone(plugin._worker)
             self.assertEqual(control.mock_calls, [])
             notify.assert_not_called()
-            queued = plugin.dispatch("status", {})
+            queued = plugin.dispatch("enable", {})
             plugin._worker.join(2)
             self.assertFalse(plugin._worker.is_alive())
             notify.assert_called_once()
@@ -1668,10 +1684,10 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         control = mock.Mock(spec=device.IdleActionControl)
-        control.status.side_effect = RuntimeError("bad\nforged\x1b[31m\x00\r" * 300)
+        control.set_enabled.side_effect = RuntimeError("bad\nforged\x1b[31m\x00\r" * 300)
         plugin = device.IdleActionsPlugin(control)
         with mock.patch.object(device.urllib.request, "urlopen") as post:
-            queued = plugin.dispatch("status", {})
+            queued = plugin.dispatch("enable", {})
             plugin._worker.join(2)
             self.assertFalse(plugin._worker.is_alive())
             post.assert_called_once()
