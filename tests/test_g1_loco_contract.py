@@ -40,10 +40,9 @@ class TestLocoCard(unittest.TestCase):
         card = cls.__new__(cls)
         card._smart_motion = smart
         card._fallback_motion = fallback
-        card._client = SimpleNamespace(StopMove=lambda: 0)
+        card._client = None
         card._slam_client = None
         card._namespace = 'g1'
-        card._control_lock = threading.RLock()
         return card, namespace
 
     def test_card_passes_action_identity_and_limits_fallback(self):
@@ -237,11 +236,11 @@ class TestRpcResponseIdentity(unittest.TestCase):
         cls = extract_class(ROOT / 'rpc_proxy.py', 'RpcProxy', dict(time=time, threading=threading))
         proxy = cls.__new__(cls)
         proxy._lock = threading.Lock()
-        proxy._request_id = 0
+        proxy._req_counter = 0
         proxy._cmd_q = queue.Queue()
         proxy._result_q = queue.Queue()
-        proxy._result_q.put({'request_id': 999, 'result': 0})
-        proxy._result_q.put({'request_id': 1, 'result': 3104})
+        proxy._result_q.put({'_req_id': 999, 'result': 0})
+        proxy._result_q.put({'_req_id': 1, 'result': 3104})
         self.assertEqual(proxy.StopMove(), 3104)
 
 
@@ -254,10 +253,7 @@ class TestRpcWorkerMotion(unittest.TestCase):
         source = (ROOT / 'rpc_proxy.py').read_text()
         node = next(n for n in ast.parse(source).body
                     if isinstance(n, ast.FunctionDef) and n.name == '_rpc_worker')
-        executor = extract_class(ROOT / 'rpc_proxy.py', 'ProposalRpcExecutor',
-                                 dict(time=time, math=math))
-        namespace = dict(multiprocessing=multiprocessing, queue=queue,
-                         ProposalRpcExecutor=executor,
+        namespace = dict(multiprocessing=multiprocessing,
                          time=SimpleNamespace(sleep=lambda _: None))
         exec(ast.get_source_segment(source, node), namespace)
         def module(name, **attrs):
@@ -271,16 +267,16 @@ class TestRpcWorkerMotion(unittest.TestCase):
             'timed_motion': module('timed_motion', TimedMotion=lambda *args, **kw: w.controller),
         }
         commands, results = queue.Queue(), queue.Queue()
-        commands.put({'method': 'TimedMove', 'args': [0, 0, 1, 1, 'a'], 'request_id': 1})
-        commands.put({'method': 'GetMotionResult', 'args': ['a'], 'request_id': 2})
+        commands.put({'method': 'TimedMove', 'args': [0, 0, 1, 1, 'a'], '_req_id': 1})
+        commands.put({'method': 'GetMotionResult', 'args': ['a'], '_req_id': 2})
         commands.put(None)
         with patch.dict('sys.modules', stubs), contextlib.redirect_stdout(io.StringIO()):
             namespace['_rpc_worker'](commands, results, 'fake-interface')
         move = results.get_nowait()
         outcome = results.get_nowait()
-        self.assertEqual(move['request_id'], 1)
+        self.assertEqual(move['_req_id'], 1)
         self.assertEqual(move['result']['ret'], 0)
-        self.assertEqual(outcome['request_id'], 2)
+        self.assertEqual(outcome['_req_id'], 2)
         self.assertEqual(outcome['result']['status'], 'completed')
         self.assertEqual(w.calls[1][1], 1.)
 
@@ -289,7 +285,7 @@ class TestSafetyHarnessIntegration(unittest.TestCase):
     def harness(self):
         w = World()
         source = (ROOT / 'safety_harness.py').read_text()
-        names = ['motion_synchronized', 'clamp', 'on_motion_stop', 'do_stop', 'handle_move']
+        names = ['clamp', 'on_motion_stop', 'do_stop', 'handle_move']
         nodes = {n.name: n for n in ast.walk(ast.parse(source))
                  if isinstance(n, ast.FunctionDef) and n.name in names}
         idle = SimpleNamespace(value='idle')
@@ -300,8 +296,6 @@ class TestSafetyHarnessIntegration(unittest.TestCase):
             SpeedZone=SimpleNamespace(NORMAL='normal', DECELERATED='decelerated', STOPPED='stopped'),
             limits=SimpleNamespace(vx_max=1., vy_max=1., vyaw_max=2., vx_decel=.5, vy_decel=.1, vyaw_decel=.2),
             obstacle_lock=threading.Lock(), obstacle_dist=1., obstacle_angle=0.,
-            proposal_gate=SimpleNamespace(connected_topic=None, terminal_pending_stop=False),
-            motion_command_lock=threading.RLock(),
             publish_event=lambda name, data: events.append((name, data)),
             controller=w.controller)
         events = []
@@ -311,8 +305,6 @@ class TestSafetyHarnessIntegration(unittest.TestCase):
     speed_zone = SpeedZone.NORMAL
     stop_repeat_count = 0
     stop_repeat_action_id = None
-    last_stop_result = None
-    last_proposal_stop_result = None
     motion = controller
 '''
         for name in names:

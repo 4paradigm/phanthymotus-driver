@@ -55,7 +55,6 @@ COPY led_control.py /work/led_control.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY safety_harness.py /work/safety_harness.py
-COPY velocity_proposal.py /work/velocity_proposal.py
 COPY loco_servo.py /work/loco_servo.py
 COPY loco_servo_transport.py /work/loco_servo_transport.py
 COPY loco_relative_move.py /work/loco_relative_move.py

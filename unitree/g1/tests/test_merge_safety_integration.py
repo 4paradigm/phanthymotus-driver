@@ -1,7 +1,6 @@
 """Offline regression checks for timed motion and proposal hand-off."""
 import threading
 
-from safety_harness import SmartMotionProxy
 from timed_motion import TimedMotion
 
 
@@ -38,22 +37,3 @@ def test_timed_motion_not_idle_until_move_and_stop_acknowledged():
     move.join(1)
     assert motion.is_idle()
     assert client.sent == ["move", "stop"]
-
-
-def test_proposal_bind_still_brackets_parent_stop_with_confirmation():
-    proxy = SmartMotionProxy.__new__(SmartMotionProxy)
-    proxy._call_lock = threading.Lock()
-    calls = []
-
-    def call(method, **kwargs):
-        calls.append(method)
-        if method == "begin_velocity_proposal_stop_confirmation":
-            return {"confirmation_start": {"monotonic": 1}}
-        assert kwargs["external_stop_attempt"]["stop_move_ret"] == 0
-        return {"connected": True, "stop_confirmed": True}
-
-    proxy._call = call
-    proxy._fallback_stop = lambda: calls.append("parent_stop") or 0
-    result = proxy.bind_velocity_proposal("/proposal", "nav")
-    assert result["stop_confirmed"] is True
-    assert calls == ["begin_velocity_proposal_stop_confirmation", "parent_stop", "bind_velocity_proposal"]

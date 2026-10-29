@@ -347,7 +347,7 @@ class G1DeviceBundle:
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
-        # Quiesce the direct closed-loop owner before the main loco/proposal
+        # Quiesce the direct closed-loop owner before the main loco
         # owner, then capture consumers before the camera producer.
         ordered_plugins = sorted(
             enumerate(self._plugins),
@@ -603,14 +603,7 @@ def main():
     print("[bundle] AudioClient ready")
 
     # LocoClient (locomotion control) — via subprocess proxy to avoid GIL contention
-    proposal_cfg = cfg.get("plugins", {}).get("loco", {})
-    loco_client = RpcProxy(
-        network_iface,
-        motion_rpc_timeout=proposal_cfg.get(
-            "velocity_proposal_rpc_timeout",
-            0.5,
-        ),
-    )
+    loco_client = RpcProxy(network_iface)
     print("[bundle] LocoClient ready (subprocess proxy)")
 
     # G1ArmActionClient (arm gestures)
@@ -634,15 +627,7 @@ def main():
     harness_cfg = cfg.get("safety_harness", {})
     if harness_cfg.get("enabled", True):
         from safety_harness import SmartMotionProxy
-        smart_motion = SmartMotionProxy(
-            namespace,
-            harness_cfg,
-            network_iface,
-            proposal_config=proposal_cfg,
-            fallback_stop=loco_client.StopMove,
-            parent_apply_velocity_proposal=loco_client.ApplyVelocityProposal,
-            parent_get_fsm_id=loco_client.GetFsmId,
-        )
+        smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
         print("[bundle] SmartMotion safety harness active (subprocess)")
 
     _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, smart_motion=smart_motion, network_iface=network_iface)

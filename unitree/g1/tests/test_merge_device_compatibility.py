@@ -17,10 +17,7 @@ def loco_class():
     scope = {"threading": threading, "math": math, "time": time,
              "_SMS": SimpleNamespace(LOCO_STATES=set(), LIMP_STATES=set(),
                                      BALANCED_SQUAT=706, LIE_TO_STAND=702),
-             "_loco_acp_notify": lambda *args, **kwargs: None,
-             "resolve_input_topic": lambda args, default: default,
-             "resolve_optional_expected_nav_id": lambda args: None,
-             "DEFAULT_VELOCITY_PROPOSAL_TOPIC": "/proposal"}
+             "_loco_acp_notify": lambda *args, **kwargs: None}
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
     return scope["LocoPlugin"]
 
@@ -45,7 +42,6 @@ def test_direct_timed_move_allows_concurrent_stop_and_records_cancellation():
             return 0
 
     card = loco_class()({}, "test", None, Client())
-    card._velocity_proposal_port = lambda: {}
     result = []
     move = threading.Thread(target=lambda: result.append(card.dispatch("move", {"duration": 30})))
     move.start()
@@ -61,36 +57,10 @@ def test_direct_timed_move_allows_concurrent_stop_and_records_cancellation():
     assert card._fallback_motion.get_result(result[0]["action_id"])["status"] == "cancelled"
 
 
-def test_rejected_manual_move_does_not_stop_active_proposal():
-    calls = []
-    client = SimpleNamespace(StopMove=lambda: calls.append("stop"))
-    smart = SimpleNamespace(move=lambda *args, **kwargs: {
-        "error": "proposal active", "rejected": True})
-    card = loco_class()({}, "test", None, client, smart_motion=smart)
-    result = card.dispatch("move", {"duration": 1})
-    assert result["rejected"] is True
-    assert calls == []
 
 
-def test_rejected_proposal_does_not_stop_active_timed_move():
-    calls = []
-    client = SimpleNamespace(StopMove=lambda: calls.append("stop"))
-    smart = SimpleNamespace(bind_velocity_proposal=lambda *args: {
-        "error": "timed_motion_not_idle", "rejected": True, "stop_confirmed": False})
-    card = loco_class()({}, "test", None, client, smart_motion=smart)
-    card._velocity_proposal_port = lambda: {}
-    result = card.dispatch("start", {})
-    assert result["rejected"] is True
-    assert calls == []
 
 
-def test_shutdown_disconnects_proposals_and_stops_timed_motion():
-    card = loco_class()({}, "test", None, SimpleNamespace(StopMove=lambda: 0))
-    calls = []
-    card._disconnect_velocity_proposal = lambda reason: calls.append(("disconnect", reason))
-    card._smart_motion = SimpleNamespace(stop=lambda reason: calls.append(("stop", reason)))
-    card.stop()
-    assert calls == [("disconnect", "driver_stop"), ("stop", "shutdown")]
 
 
 def test_lidar_global_and_repeated_stop_gate_cloud_but_keep_imu():

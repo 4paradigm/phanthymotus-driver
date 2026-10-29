@@ -2,7 +2,7 @@
 """G1 motus.control/1 twist stream; direct SDK path, not SmartMotion safety.
 
 ControlSink checks the stream contract, freshness and declared limits. It does
-not provide obstacle/collision checks or the proposal safety chain. No cross-card
+not provide SmartMotion obstacle/collision checks. No cross-card
 arbitration is performed. The operator must avoid competing chassis writers.
 """
 from __future__ import annotations
@@ -79,7 +79,7 @@ class LocoServoPlugin:
 
     def get_tool(self):
         return {"name": "loco_servo", "type": "actuator", "multiInstance": False,
-                "description": "G1 连续速度控制，直发 SDK；不经过 SmartMotion/proposal 安全链，无避障或跨卡互斥。",
+                "description": "G1 连续速度控制，直发 SDK；不经过 SmartMotion，无避障或跨卡互斥。",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "pause", "resume", "info"]},
                     "input_topic": {"type": "string", "description": "control/velocity 指令流话题"}},

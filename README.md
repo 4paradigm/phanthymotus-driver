@@ -82,69 +82,6 @@ python main.py
    reply names the path *inside* the container — no shared mount. See
    [README_dev.md § File Arguments](README_dev.md#file-arguments-format-file-and-post-fileupload).
 
-### G1 Controlled Navigation Velocity
-
-The sole proposal topic is `/ubuntu/navigation/motion_sequence`; the port name
-is `motion_sequence`. Publishers and Canvas connections must migrate from
-`/ubuntu/navigation/nav2/velocity_proposal`; the old topic is not subscribed.
-The schema is `phanthy.navigation.motion_sequence.v1`; the old
-`phanthy.navigation.velocity_proposal.v1` schema is rejected. Payload fields
-and execution semantics are unchanged. Stop intelligent control before switching
-both endpoints and updating Canvas connections.
-
-The G1 `loco` actuator accepts a lease-bound
-`phanthy.navigation.motion_sequence.v1` input. Valid proposals are executed
-through a reliable `KEEP_LAST(depth=1)` subscription and a capacity-one
-latest-only execution queue, so older unread or pending velocities are replaced
-instead of backlogged. A proposal TTL lapse immediately triggers `StopMove`;
-only a successful post-call zero-odometry confirmation keeps the same navigation
-lease recoverable for the next fresh proposal. An initially unconfirmed
-recoverable stop enters `recoverable_stop_pending`: motion stays disabled and
-the task identity is retained while a dedicated worker performs at most three
-more ordered `StopMove` plus fresh-odometry confirmations. Each retry uses the
-configured confirmation timeout (2 seconds by default, hard-capped at 3
-seconds), so the default background budget is at most 6 seconds; success enters
-the normal recoverable hold, while exhausting the budget hard-disarms the lease.
-Hard safety, identity, sequence, explicit invalid-FSM, and exhausted
-stop-confirmation faults still disarm the lease. A timed-out motion RPC instead
-retires and replaces the indeterminate RPC worker, stops through the independent
-path, and retains the current task identity while physical zero is confirmed.
-After confirmation, a fresh increasing proposal from the same `nav_id` may
-resume; a confirmed terminal proposal releases that ID so the next task can bind.
-Transient stale or failed FSM observations also stop immediately, but retain a
-confirmed-zero lease until a fresh allowed FSM and the other runtime safety
-inputs are ready again. Pending FSM and StopMove calls take priority over the
-next velocity RPC, and `loco info` reports FSM sample age and RPC-lock wait time.
-
-`loco.start` connects the sole proposal topic and remains physically stopped.
-While idle, the Driver validates the first fresh, legal, nonzero proposal and
-atomically binds its `nav_id` before executing that same proposal. Another ID
-cannot replace or interrupt the active task: only that packet is rejected, while
-the current lease, sequence, and execution deadline remain unchanged. A terminal zero proposal first
-enters `terminal_pending_stop`; only a successful zero-odometry stop
-confirmation retires the active ID and keeps the subscription ready for the
-next task. A failed confirmation stays fail-closed, and a later successful
-retry restores `awaiting_first_valid_proposal`. Invalid, stale, zero bootstrap,
-terminal bootstrap, retired-ID, and mid-task mismatched-ID proposals never
-establish or replace a lease, so Agent Core needs no per-task authorization
-action for consecutive navigation tasks.
-
-`nav_id` provides task isolation and replay protection; it is not publisher
-authentication. First-proposal binding therefore assumes the robot ROS 2/DDS
-network is trusted and isolated. An untrusted participant that can publish to
-the proposal topic could claim an idle lease, so that topic must not be exposed
-to untrusted publishers.
-
-`loco info` exposes proposal counters, the coalesced count, measured RPC and
-queue latency, rolling RPC p50/p95/p99/max values, rejection reasons, and the
-last confirmed proposal stop. The `last_set_velocity_duration_ms` value is
-measured RPC time, not the proposal TTL budget.
-
-The velocity proposal contract matches the `loco.move` input bounds: forward
-and lateral velocity are each limited to `[-1.0, 1.0] m/s`, and yaw velocity is
-limited to `[-2.0, 2.0] rad/s`. The Driver still rejects non-finite or
-out-of-range values before any motion RPC.
-
 ### G1 Navigation Sensors
 
 The read-only `navigation_sensors` Driver plugin launches an isolated worker

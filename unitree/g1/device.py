@@ -47,12 +47,6 @@ from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace
-from velocity_proposal import (
-    DEFAULT_VELOCITY_PROPOSAL_TOPIC,
-    resolve_input_topic,
-    resolve_optional_expected_nav_id,
-    velocity_proposal_port,
-)
 import sport_mode_state as _SMS
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
@@ -1344,9 +1338,6 @@ def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loc
 
 class LocoPlugin:
     PREFIX = "loco"
-    # Stop locomotion before tearing down any other plugin during bundle
-    # shutdown.  This is an explicit lifecycle contract consumed by main.py.
-    STOP_PRIORITY = 0
 
     def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None,
                  smart_motion=None, state_node=None, posture_node=None):
@@ -1354,8 +1345,6 @@ class LocoPlugin:
         self._slam_client = slam_client
         self._smart_motion = smart_motion
         self._namespace = namespace
-        self._control_lock = threading.RLock()
-        self._velocity_proposal_topic = DEFAULT_VELOCITY_PROPOSAL_TOPIC
         # Direct clients and the subprocess fallback share the same deadline logic.
         from timed_motion import TimedMotion
         self._fallback_motion = TimedMotion(loco_client) if hasattr(loco_client, "BeginMove") else None
@@ -1423,13 +1412,8 @@ class LocoPlugin:
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture"},
                 },
             },
-            "topic_in": [self._velocity_proposal_port()],
         }
 
-    def _velocity_proposal_port(self) -> dict:
-        return velocity_proposal_port(self._velocity_proposal_topic)
-
-    # ── FSM state groups for safety checks ──────────────────────────────────────
     # ── FSM state groups ────────────────────────────────────────────────────────
     # Official ID table: 专家接口 § 模式ID说明 at
     # https://support.unitree.com/home/zh/G1_developer/sport_services_interface
@@ -1481,6 +1465,7 @@ class LocoPlugin:
         if self._posture_node is None:
             return {}
         return self._posture_node.get_posture()
+
 
     def _switch_mode_tool(self) -> dict:
         return {
@@ -1546,106 +1531,15 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        # Driver startup remains disarmed. Canvas action=start subscribes to
-        # the only proposal topic; the first fresh legal motion binds nav_id.
         pass
 
     def stop(self) -> None:
-        with self._control_lock:
-            try:
-                self._disconnect_velocity_proposal("driver_stop")
-            finally:
-                if self._smart_motion:
-                    self._smart_motion.stop(reason="shutdown")
-                elif self._fallback_motion:
-                    self._fallback_motion.stop("shutdown")
-
-    def _connect_velocity_proposal(self, args: dict) -> dict:
-        try:
-            topic = resolve_input_topic(args, self._velocity_proposal_topic)
-            expected_nav_id = resolve_optional_expected_nav_id(args)
-        except ValueError as exc:
-            if self._fallback_motion and not self._smart_motion:
-                self._fallback_motion.stop("proposal_bind_rejected")
-            else:
-                self._client.StopMove()
-            if self._smart_motion:
-                self._smart_motion.unbind_velocity_proposal("proposal_bind_rejected")
-            return {
-                "state": "error",
-                "connected": False,
-                "error": str(exc),
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        if not self._smart_motion:
-            if self._fallback_motion:
-                self._fallback_motion.stop("proposal_bind_rejected")
-            else:
-                self._client.StopMove()
-            return {
-                "state": "error",
-                "connected": False,
-                "error": "SmartMotion safety harness is required for velocity_proposal",
-                "topic_in": [self._velocity_proposal_port()],
-            }
-        result = self._smart_motion.bind_velocity_proposal(topic, expected_nav_id)
-        connected_ready = bool(
-            result.get("connected")
-            and (result.get("armed") or result.get("awaiting_nav_id"))
-        )
-        if (result.get("error") or not connected_ready) and not result.get("rejected"):
-            result = dict(result)
-            fallback_stop_ret = None
-            fallback_stop_error = None
-            try:
-                fallback_stop_ret = self._client.StopMove()
-            except Exception as exc:
-                fallback_stop_error = str(exc)
-            result["fallback_stop_ret"] = fallback_stop_ret
-            result["fallback_stop_error"] = fallback_stop_error
-        return {
-            **result,
-            "state": "ready" if connected_ready else "error",
-            "topic_in": [self._velocity_proposal_port()],
-        }
-
-    def _disconnect_velocity_proposal(self, reason: str) -> dict:
-        # Main-process RPC is an independent first stop path.  It guarantees
-        # StopMove precedes subscriber teardown even if SmartMotion IPC hangs
-        # and the child has to be terminated fail-closed.
-        if self._fallback_motion and not self._smart_motion:
-            fallback_stop_ret = self._fallback_motion.stop(reason).get("ret")
-        else:
-            fallback_stop_ret = self._client.StopMove()
         if self._smart_motion:
-            try:
-                result = self._smart_motion.unbind_velocity_proposal(reason)
-            except Exception as exc:
-                return {
-                    "state": "error",
-                    "connected": False,
-                    "stop_confirmed": False,
-                    "error": f"SmartMotion unbind failed: {exc}",
-                    "fallback_stop_ret": fallback_stop_ret,
-                    "topic_in": [self._velocity_proposal_port()],
-                }
-            stop_failed = (
-                result.get("error")
-                or result.get("stop_confirmed") is not True
-            )
-            if stop_failed:
-                result.setdefault("state", "error")
-                result.setdefault("error", "StopMove was not confirmed")
-                result["fallback_stop_ret"] = fallback_stop_ret
-            return {"topic_in": [self._velocity_proposal_port()], **result}
-        return {
-            "state": "idle" if fallback_stop_ret == 0 else "error",
-            "connected": False,
-            "stop_confirmed": fallback_stop_ret == 0,
-            "reason": reason,
-            "topic_in": [self._velocity_proposal_port()],
-            **({"error": f"StopMove failed: code={fallback_stop_ret}"} if fallback_stop_ret != 0 else {}),
-        }
+            self._smart_motion.stop(reason="shutdown")
+        elif self._fallback_motion:
+            self._fallback_motion.stop("shutdown")
+        else:
+            self._client.StopMove()
 
     def _acp_wait_move(self, action_id: str):
         """Notify from this action's recorded stop outcome, never a fixed sleep."""
@@ -1666,54 +1560,16 @@ class LocoPlugin:
             time.sleep(0.1)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        try:
-            # Do not hold the proposal lifecycle lock over a movement RPC wait:
-            # a concurrent stop must be able to reach its own stop path.
-            if action in {"move", "stop_move"}:
-                return self._dispatch_serialized(action, args)
-            with self._control_lock:
-                return self._dispatch_serialized(action, args)
-        except Exception as exc:
-            self._client.StopMove()
-            return {
-                "state": "error",
-                "connected": False,
-                "error": f"loco safety fallback: {exc}",
-                "topic_in": [self._velocity_proposal_port()],
-            }
-
-    def _dispatch_serialized(self, action: str, args: dict) -> dict | None:
-        tool_name = args.get("_tool_name", "loco")
         if action == "start":
-            if tool_name == "loco":
-                return self._connect_velocity_proposal(args)
-            return {"state": "running" if tool_name == "motion_events" else "ready"}
+            return {"state": "ready"}
         if action == "stop":
-            if tool_name == "loco":
-                return self._disconnect_velocity_proposal("canvas_stop")
             return {"state": "idle"}
         if action == "info":
+            tool_name = args.get("_tool_name", "motion_events")
             if tool_name == "motion_events" and self._smart_motion:
                 topic = f"/{self._namespace}/safety/motion_events"
                 return {"state": "running", "topic_out": [{"topic": topic, "format": "data/json"}]}
-            if tool_name != "loco":
-                return {"state": "ready"}
-            if self._smart_motion:
-                result = self._smart_motion.get_velocity_proposal_status()
-                if result.get("error"):
-                    self._client.StopMove()
-            else:
-                result = {
-                    "enabled": False,
-                    "connected": False,
-                    "armed": False,
-                    "last_reason": "SmartMotion safety harness unavailable",
-                }
-            return {
-                "state": "running" if result.get("connected") else "ready",
-                "topic_in": [self._velocity_proposal_port()],
-                **result,
-            }
+            return None
         if action == "move":
             from uuid import uuid4
             vx = float(args.get("vx", 0))
@@ -1725,8 +1581,6 @@ class LocoPlugin:
             action_id = f"g1_move_{uuid4().hex[:8]}"
             if self._smart_motion:
                 result = self._smart_motion.move(vx, vy, vyaw, duration, action_id=action_id)
-                if result.get("error") and not result.get("rejected"):
-                    self._client.StopMove()
             else:
                 vx = max(-1.0, min(1.0, vx))
                 vy = max(-1.0, min(1.0, vy))
@@ -1744,10 +1598,7 @@ class LocoPlugin:
             return result
         elif action == "stop_move":
             if self._smart_motion:
-                result = self._smart_motion.stop()
-                if result.get("error"):
-                    self._client.StopMove()
-                return result
+                return self._smart_motion.stop()
             # Send the movement stop before waiting for navigation RPCs.
             if self._fallback_motion:
                 result = self._fallback_motion.stop()
@@ -1767,13 +1618,6 @@ class LocoPlugin:
             # x-action-params split: action is the mode directly
             # Legacy: action == "switch_mode" with mode in args
             mode = action if action != "switch_mode" else args.get("mode", "")
-            if mode != "get_current_mode":
-                stopped = self._disconnect_velocity_proposal("mode_switch")
-                if mode != "emergency_stop" and (
-                    stopped.get("error")
-                    or stopped.get("stop_confirmed") is not True
-                ):
-                    return stopped
 
             # 阻尼 is the guaranteed fallback mode — the vendor doc states it can
             # always be entered, so emergency_stop must not be gated on anything.
@@ -1885,9 +1729,6 @@ class LocoPlugin:
                                  f"standup2squat, squat2standup, emergency_stop, "
                                  f"get_current_mode"}
         elif action == "switch_mode_expert":
-            stopped = self._disconnect_velocity_proposal("expert_mode_switch")
-            if stopped.get("error") or stopped.get("stop_confirmed") is not True:
-                return stopped
             fid = int(args.get("fsm_id", 0))
             ret = self._client.SetFsmId(fid)
             return {"ret": ret, "fsm_id": fid}
