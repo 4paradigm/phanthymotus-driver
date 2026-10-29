@@ -247,7 +247,8 @@ class S10StatePlugin:
             self.native.start()
             return {"state": "running"}
         if action == "stop":
-            if name == "state": self.native.close()
+            # The TCP client is shared by every S10 card and is closed only
+            # when the driver bundle itself shuts down.
             return {"state": "idle"}
         if action == "info": return {"state": "ready", **({"topic_out": [self.nodes.topics[name]]} if self.nodes and name in self.nodes.topics else {})}
         reports = self.native.snapshot()["reports"]

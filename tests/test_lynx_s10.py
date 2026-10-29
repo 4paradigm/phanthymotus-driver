@@ -507,6 +507,32 @@ def test_actuator_lifecycle_never_starts_charging_or_sends_idle_commands(monkeyp
     assert native.calls[-1][0] == (0x00100004, 0x00100002, {"Charge": 0})
 
 
+def test_state_card_stop_start_keeps_shared_tcp_client_alive(monkeypatch):
+    device = _load_device(monkeypatch)
+
+    class LifecycleNative(FakeNative):
+        def __init__(self):
+            super().__init__({})
+            self.closed = False
+            self.start_count = 0
+            self.close_count = 0
+
+        def start(self):
+            self.start_count += 1
+
+        def close(self):
+            self.closed = True
+            self.close_count += 1
+
+    native = LifecycleNative()
+    plugin = device.S10StatePlugin(native)
+    assert plugin.dispatch("stop", {"_tool_name": "state"}) == {"state": "idle"}
+    assert not native.closed
+    assert plugin.dispatch("start", {"_tool_name": "state"}) == {"state": "running"}
+    assert native.start_count == 1
+    assert native.close_count == 0
+
+
 def test_dangerous_s10_commands_require_literal_confirmation(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
