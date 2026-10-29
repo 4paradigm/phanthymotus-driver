@@ -103,11 +103,14 @@ class S10Nodes:
             "battery": {"topic": base + "battery", "format": "data/json"},
             "lidar": {"topic": base + "lidar", "format": "sensor/pointcloud"},
         }
+        # Firmware images have used both the USB-camera names and the
+        # semantic front/rear/left/right names. Subscribe to all known
+        # aliases; the first active source wins without blocking the others.
         camera_topics = config.get("camera_topics", {
-            "camera_0": "/usb_camera_1/image_raw",
-            "camera_1": "/usb_camera_1/image_raw_0",
-            "camera_2": "/usb_camera_1/image_raw_1",
-            "camera_3": "/usb_camera_1/image_raw_2",
+            "camera_0": ["/usb_camera_1/image_raw", "/camera_front/image_raw", "/camera/front/image_raw"],
+            "camera_1": ["/usb_camera_1/image_raw_0", "/camera_back/image_raw", "/camera/rear/image_raw"],
+            "camera_2": ["/usb_camera_1/image_raw_1", "/camera_left/image_raw", "/camera/left/image_raw"],
+            "camera_3": ["/usb_camera_1/image_raw_2", "/camera_right/image_raw", "/camera/right/image_raw"],
         })
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
                             for key in camera_topics})
@@ -156,7 +159,7 @@ class S10Nodes:
             "joint_state": topics.get("joints", "/JOINTS_DATA_10HZ"),
             "battery": topics.get("battery", "/BATTERY_DATA"),
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
-            "lidar": topics.get("lidar", "/LIDAR/POINTS"),
+            "lidar": topics.get("lidar", ["/LIDAR/POINTS", "/DEPTH_POINTS", "/local_scans"]),
         }
         self._source_topics.update({key: value for key, value in camera_topics.items()})
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
@@ -202,11 +205,10 @@ class S10Nodes:
                 source = self._source_topics[key]
                 if key == "lidar":
                     source = self._lidar_topics
-                    result[key]["robot_publishers"] = sum(
-                        self.robot.count_publishers(topic) for topic in source)
-                else:
-                    result[key]["robot_publishers"] = self.robot.count_publishers(source)
-            except (AttributeError, RuntimeError):
+                sources = [source] if isinstance(source, str) else list(source)
+                result[key]["robot_publishers"] = sum(
+                    self.robot.count_publishers(topic) for topic in sources)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
                 result[key]["robot_publishers"] = None
             lane = self.bridge.stats(key)
             result[key]["bridge_enqueued"] = lane["enqueued"]
