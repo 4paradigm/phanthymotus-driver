@@ -18,6 +18,7 @@ from pathlib import Path
 from basic_server import BasicServerClient, _protocol_int
 from common.vendor_runtime import action_schema, tool
 from domain_bridge import CoreBridge
+from media_workers import MediaWorkers
 
 
 def _mark_dangerous(result, actions):
@@ -121,6 +122,16 @@ class S10Nodes:
             key: self.bridge.create_publisher(key, self.topics[key]["topic"], CompressedImage)
             for key in camera_topics
         }
+        self.media_workers = None
+        if config.get("media_workers", False):
+            self.media_workers = MediaWorkers(self._handle_media_result)
+            for key, configured_topics in camera_topics.items():
+                source_topics = [configured_topics] if isinstance(configured_topics, str) else configured_topics
+                if source_topics and all(topic.endswith("/compressed") for topic in source_topics):
+                    self.media_workers.add_compressed_camera(key)
+                else:
+                    self.media_workers.add_camera(key)
+            self.media_workers.add_lidar("lidar")
         topics = config.get("topics", {})
         # Camera and lidar publishers on the S10 use sensor-data QoS.  A
         # RELIABLE subscription cannot match a BEST_EFFORT publisher, so use
@@ -300,6 +311,13 @@ class S10Nodes:
 
     def _forward_camera(self, key, msg):
         self._record_stream(key, "received")
+        if self.media_workers is not None:
+            header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
+            submitted = self.media_workers.submit(
+                key, (header, msg.width, msg.height, msg.step, msg.encoding, bytes(msg.data)))
+            if not submitted:
+                self._record_stream(key, "dropped")
+            return
         packet = self._jpeg_from_ros_image(msg)
         if packet is None:
             self._record_stream(key, "dropped")
@@ -314,6 +332,12 @@ class S10Nodes:
 
     def _forward_compressed_camera(self, key, msg):
         self._record_stream(key, "received")
+        if self.media_workers is not None:
+            header = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
+            submitted = self.media_workers.submit(key, (header, bytes(msg.data)))
+            if not submitted:
+                self._record_stream(key, "dropped")
+            return
         from io import BytesIO
         from PIL import Image as PillowImage
         from sensor_msgs.msg import CompressedImage
@@ -335,6 +359,14 @@ class S10Nodes:
 
     def _forward_lidar(self, msg):
         self._record_stream("lidar", "received")
+        if self.media_workers is not None:
+            fields = [(field.name, field.offset) for field in msg.fields]
+            submitted = self.media_workers.submit(
+                "lidar", (None, fields, msg.is_bigendian, msg.width, msg.height,
+                           msg.row_step, msg.point_step, bytes(msg.data)))
+            if not submitted:
+                self._record_stream("lidar", "dropped")
+            return
         packet = self._pointcloud_packet(msg)
         if packet is None:
             self._record_stream("lidar", "dropped")
@@ -344,6 +376,26 @@ class S10Nodes:
         output.data = array.array("B", packet)
         self.lidar_publisher.publish(output)
         self._record_stream("lidar", "published")
+
+    def _handle_media_result(self, lane, header, packet):
+        if packet is None:
+            self._record_stream(lane, "dropped")
+            return
+        if lane == "lidar":
+            from std_msgs.msg import UInt8MultiArray
+            output = UInt8MultiArray()
+            output.data = array.array("B", packet)
+            self.lidar_publisher.publish(output)
+        else:
+            from sensor_msgs.msg import CompressedImage
+            output = CompressedImage()
+            output.header.frame_id = header[0]
+            output.header.stamp.sec = header[1]
+            output.header.stamp.nanosec = header[2]
+            output.format = "jpeg"
+            output.data = packet
+            self.camera_publishers[lane].publish(output)
+        self._record_stream(lane, "published")
 
     @staticmethod
     def _pointcloud_packet(msg):
@@ -375,6 +427,8 @@ class S10Nodes:
         return packed
 
     def close(self):
+        if self.media_workers is not None:
+            self.media_workers.close()
         self.robot.destroy_node()
         self.bridge.stop()
 

@@ -20,6 +20,9 @@ camera_topics:
   camera_1: "/usb_camera_1/image_raw_0"
   camera_2: "/usb_camera_1/image_raw_1"
   camera_3: "/usb_camera_1/image_raw_2"
+# JPEG encoding and point-cloud packing run in one bounded worker process per
+# stream; this keeps the robot ROS executor available for control/state topics.
+media_workers: true
 basic_server:
   enabled: true
   # On the onboard host, robot_server is reachable at this host address. For a
