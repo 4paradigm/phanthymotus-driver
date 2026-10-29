@@ -1,0 +1,11 @@
+id: limx-tron2-yolo-detect
+name: TRON2 YOLO-World Vision
+category: perception
+hardware_provider: limx
+hardware_model: tron2
+image_name: limx-tron2-yolo-detect
+port: 15792
+mcp_url: "http://localhost:15792/mcp"
+description: "三路相机任选一路接入已有GPU模型，输出标注图和检测结果；无机器人运动"
+cards:
+  - {name: yolo_detect, type: processor}

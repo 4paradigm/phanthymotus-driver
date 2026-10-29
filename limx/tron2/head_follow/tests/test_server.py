@@ -39,12 +39,12 @@ class ServerTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get('FOLLOW_HTTP_TEST')=='1','真实TCP/HTTP在Jetson隔离容器强制执行')
     def test_real_http_listener(self):
-        self.assertEqual(self.rpc('initialize')['result']['serverInfo']['version'],'0.1.2')
+        self.assertEqual(self.rpc('initialize')['result']['serverInfo']['version'],'0.1.3')
 
-    def test_schema_exposes_manual_start_and_pause(self):
+    def test_schema_exposes_only_follow(self):
         tool=self.rpc('tools/list')['result']['tools'][0]
         self.assertEqual(tool['name'],'head_visual_follow')
-        self.assertIn('pause',tool['inputSchema']['properties']['action']['enum'])
+        self.assertEqual([a for a in tool['inputSchema']['properties']['action']['enum'] if a not in ('stop','info','start')],['follow'])
         self.assertNotIn('status',tool['inputSchema']['properties']['action']['enum'])
         self.assertEqual(self.f.calls,[])
 
@@ -52,10 +52,10 @@ class ServerTests(unittest.TestCase):
         r=self.rpc('tools/call',{'name':'head_visual_follow','arguments':{'action':'start'}})
         self.assertFalse(r['result']['structuredContent']['active'])
 
-    def test_manual_enable_then_pause(self):
+    def test_manual_enable_then_lifecycle_stop(self):
         p={'name':'head_visual_follow','arguments':{'action':'follow'}}
         self.assertTrue(self.rpc('tools/call',p)['result']['structuredContent']['active'])
-        p['arguments']['action']='pause'
+        p['arguments']['action']='stop'
         self.assertFalse(self.rpc('tools/call',p)['result']['structuredContent']['active'])
         self.assertEqual(self.f.calls,[])
 

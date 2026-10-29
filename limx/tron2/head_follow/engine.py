@@ -5,7 +5,7 @@ import threading
 import time
 from client import Client, Error, require, finite, pose, terminal
 
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 CAMERA = '/limx_tron2/camera'
 MAX_FRAME_AGE = 1.5
 LOSS_SECONDS = 1.5
@@ -13,13 +13,12 @@ LOSS_SECONDS = 1.5
 
 def tool():
     return {'name': 'head_visual_follow', 'type': 'actuator', 'multiInstance': False,
-            'description': '跟随画面中央的人转头；短暂遮挡时保持，人物离开后缓慢回正。停止后不再发送新转动。',
+            'description': '执行后寻找画面中的人物并转头跟随；确认无人后回正。停用卡片或关闭智能控制后停止跟随。',
             'inputSchema': {'type': 'object', 'additionalProperties': False, 'properties': {
-                'action': {'type': 'string', 'enum': ['follow', 'pause', 'stop', 'info'],
+                'action': {'type': 'string', 'enum': ['follow', 'stop', 'info'],
                            'default': 'follow', 'title': '操作'}}, 'required': ['action'],
                 'x-resource': ['head', 'arm_l', 'arm_r'], 'x-action-params': {
-                    'follow': {'params': [], 'description': '开始跟随中央人物'},
-                    'pause': {'params': [], 'description': '停止跟随，保持当前方向'},
+                    'follow': {'params': [], 'description': '寻找画面人物并跟随'},
                     'stop': {'params': [], 'description': '停止跟随，保持当前方向'},
                     'info': {'params': [], 'description': '查看跟随状态'}}}}
 
@@ -138,11 +137,11 @@ class Engine:
                 'head_limits_deg': {'pitch': [-55, 30], 'yaw': [-45, 45]},
                 'lost_timeout_seconds': LOSS_SECONDS, 'max_step_deg': None, 'driver_stationary_proof_reused': True,
                 'events': self.events, 'arm_and_gripper_commands_sent': 0,
-                'stop_note': '停止只阻止新指令；已经受理的本次转头仍会完成；pause不构成中途制动。'})
+                'stop_note': '停止只阻止新指令；已经受理的本次转头仍会完成；停用卡片不构成中途制动。'})
 
     def call(self, args):
         require(isinstance(args, dict) and not set(args) - {'action', 'instance_id', '_trace_id'}, '不支持的跟随参数')
-        action = {'pause': 'stop'}.get(args.get('action'), args.get('action', 'info'))
+        action = args.get('action', 'info')
         if action == 'stop':
             self.stop_requested.set()
         with self.control:
@@ -281,6 +280,8 @@ class Engine:
                         self.returning = False
                         self.target = self.candidate = None
                         self.candidate_since = None
+                        self.missing_since = None
+                        self.misses = 0
                         self.state = 'waiting_person'
                         self.event('home_verified')
                     else:
@@ -288,11 +289,29 @@ class Engine:
                     return
                 boxes = frame['boxes']
                 if self.target is None:
-                    central = [b for b in boxes if abs(center(b)[0]-.5) <= .2 and abs(center(b)[1]-.5) <= .35]
+                    central = list(boxes)  # Prefer center, but allow a person anywhere in the image.
                     central.sort(key=lambda b: math.hypot(center(b)[0]-.5, center(b)[1]-.5))
                     box = central[0] if central else None
-                    if box is None or (len(central) > 1 and abs(math.dist(center(central[0]), (.5,.5))-
-                            math.dist(center(central[1]), (.5,.5))) < .08):
+                    if box is None:
+                        self.candidate = None
+                        self.state = 'waiting_person'
+                        if max(abs(p['pitch']), abs(p['yaw'])) <= .8:
+                            self.missing_since = None
+                            self.misses = 0
+                            return
+                        self.misses += 1
+                        if self.missing_since is None:
+                            self.missing_since = self.clock()
+                        if self.misses >= 3 and self.clock()-self.missing_since >= LOSS_SECONDS:
+                            self.returning = True
+                            self.state = 'returning_home'
+                            self.event('no_person_confirmed_before_acquisition')
+                            self.dispatch(p, 0., 0., 'return_home')
+                        return
+                    self.missing_since = None
+                    self.misses = 0
+                    if len(central) > 1 and abs(math.dist(center(central[0]), (.5,.5))-
+                            math.dist(center(central[1]), (.5,.5))) < .08:
                         self.candidate = None
                         self.state = 'waiting_person'
                         return

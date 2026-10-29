@@ -66,9 +66,9 @@ class FollowTests(unittest.TestCase):
             self.e.call({'action':a});self.tick(10)
         self.assertEqual(self.f.calls,[])
 
-    def test_off_center_person_not_acquired(self):
+    def test_off_center_person_acquired(self):
         self.f.boxes=[[.75,.3,.95,.9]];self.start();self.tick(10)
-        self.assertIsNone(self.e.target);self.assertEqual(self.f.calls,[])
+        self.assertIsNotNone(self.e.target);self.assertEqual(len(self.f.calls),1)
 
     def test_central_person_two_frames_and_deadband(self):
         self.lock();self.assertEqual(self.f.calls,[])
@@ -120,6 +120,33 @@ class FollowTests(unittest.TestCase):
         self.lock();self.f.boxes=[[.5,.3,.7,.9]];self.tick();self.f.arrive()
         self.tick();self.assertEqual(len(self.f.calls),1)
         self.tick(5);self.assertEqual(len(self.f.calls),2)
+
+    def test_no_person_initially_returns_home(self):
+        self.f.q[15]=math.radians(10);self.f.boxes=[];self.start();self.tick(10)
+        self.assertTrue(self.e.returning);self.assertEqual(self.f.calls[-1][:2],(0.,0.))
+        self.f.arrive();self.tick(5)
+        self.assertIsNone(self.e.target);self.assertFalse(self.e.returning)
+        self.tick(20);self.assertEqual(len(self.f.calls),1)
+
+    def test_initial_empty_frames_hold_during_grace(self):
+        self.f.q[15]=math.radians(10);self.f.boxes=[];self.start();self.tick(5)
+        self.assertEqual(self.f.calls,[])
+
+    def test_initial_input_failure_never_recenters(self):
+        self.f.q[15]=math.radians(10);self.start();self.f.bad_input=True;self.tick(20)
+        self.assertEqual(self.f.calls,[])
+
+    def test_person_found_interrupts_initial_empty_counter(self):
+        self.f.q[15]=math.radians(10);self.f.boxes=[];self.start();self.tick(5)
+        self.f.boxes=[[.4,.3,.6,.9]];self.tick(3)
+        self.assertIsNotNone(self.e.target);self.assertFalse(self.e.returning)
+        self.assertEqual(self.f.calls,[])
+
+    def test_pause_removed_but_lifecycle_stop_still_works(self):
+        from client import Error
+        self.start()
+        with self.assertRaises(Error):self.e.call({'action':'pause'})
+        self.e.call({'action':'stop'});self.assertFalse(self.e.active)
 
     def test_short_occlusion_does_not_home(self):
         self.lock();self.f.boxes=[];self.tick(4)

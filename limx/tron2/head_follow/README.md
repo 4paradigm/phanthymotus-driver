@@ -1,19 +1,18 @@
 # TRON2 head visual follow
 
 An independent MCP actuator card that turns the head to follow a person selected
-near the middle of the head-camera image, then returns to pitch/yaw 0° after the
-person leaves. It reuses the installed TRON2 `move_head` driver and existing YOLO
+anywhere in the head-camera image, then returns to pitch/yaw 0° after the
+person leaves (or no person is found after startup). It reuses the installed TRON2 `move_head` driver and existing YOLO
 results; it does not control the arms/grippers or alter the original driver.
 
 ## Card operations
 
 | Operation | Behavior |
 | --- | --- |
-| `follow` | Select a central person across two distinct frames and follow their upper torso. |
-| `pause` | Stop sending further targets; an already accepted turn can finish. |
+| `follow` | Select a person across two distinct frames, preferring the center and follow their upper torso. |
 
 Lifecycle `start` and diagnostic `info` are supported internally but hidden by
-the existing Canvas renderer. There is no visible `status` action. Startup,
+the existing Canvas renderer. Only `follow` is visible and selected by default: press Execute. Neither `pause` nor `status` is exposed. Startup,
 container restart and project lifecycle start never enable following.
 
 The service is `TRON2 Head Visual Follow`; its single tool is
@@ -21,7 +20,7 @@ The service is `TRON2 Head Visual Follow`; its single tool is
 
 ## Tracking and motion behavior
 
-- Acquire near the image center; associate subsequent person boxes by overlap,
+- Acquire across the image, preferring the center; associate subsequent person boxes by overlap,
   displacement and size. Hold when matching is ambiguous. This is spatial
   tracking, not face identity recognition, and does not guarantee identity
   through crossings or long occlusions.
@@ -41,7 +40,7 @@ The service is `TRON2 Head Visual Follow`; its single tool is
   detector or leave the association gate.
 - External head control, arm motion/displacement, unknown request results or
   driver faults disable following. No automatic retries, mode changes or error
-  resets are sent. `pause` is not an emergency stop and cannot cancel a turn
+  resets are sent. Lifecycle `stop` is not an emergency stop and cannot cancel a turn
   already accepted by the existing driver.
 
 ## Dependencies and integration
@@ -52,12 +51,12 @@ compatibility review; this PR does not upgrade the main driver or teaching.
 The native VR head follower must be disabled for the existing manual head
 interface; this service never changes that setting.
 
-A separately installed detector must already be running on loopback `15792`
+The sibling `../yolo_detect` service must already be running on loopback `15792`
 with the **head camera** `/limx_tron2/camera` as input and `person` in its model
 vocabulary. No new model is bundled or downloaded. Wrist-camera input is refused.
 The service reads `/health` from these two local dependencies and only posts
 `move_head` requests to `/mcp` on `15791`. It neither starts nor reconfigures the
-detector, camera streams, Core or robot driver. Keep this card paused while
+detector, camera streams, Core or robot driver. Disable this card while
 using other motion/teaching cards.
 
 The detector health contract used by `parse_frame()` is:
@@ -101,11 +100,11 @@ python3 server.py
 Or build/run this directory as a **separate service**:
 
 ```bash
-docker build -t tron2-head-visual-follow:0.1.2 limx/tron2/head_follow
+docker build -t tron2-head-visual-follow:0.1.3 limx/tron2/head_follow
 docker run -d --name tron2-head-visual-follow --network host --read-only \
   --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
   --pids-limit 64 --memory 128m --cpus 0.5 \
-  tron2-head-visual-follow:0.1.2
+  tron2-head-visual-follow:0.1.3
 ```
 
 The Docker build context above is relative to the repository root. The server
@@ -116,7 +115,7 @@ standalone service; the parent TRON2 image/catalog is unchanged. Do not start a
 second instance if the field-installed follow service already owns this port.
 
 To check without movement, use `GET /health` or tool action `info`. To begin,
-select `follow` and execute; to stop sending new targets, select `pause`.
+select `follow` and execute; to stop sending new targets, disable intelligent control (project lifecycle `stop`).
 After stopping the service, any command already accepted by the robot driver
 can still complete. No automatic recenter is sent during shutdown.
 
@@ -141,3 +140,5 @@ requested the final full-target variant for field testing. This is operator
 acceptance, not a measured latency, servo smoothness or tracking-accuracy claim.
 Site-specific update archives, container replacement journals, personal paths
 and deployment backups are intentionally excluded from this contribution.
+
+With no initial person, at least three fresh empty observations over 1.5 seconds trigger recentering. Already-neutral heads hold without repeat commands; ambiguous matches hold rather than choosing arbitrarily. Camera failures never trigger recentering.
