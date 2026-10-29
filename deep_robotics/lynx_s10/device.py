@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import array
 import threading
 import time
 import math
@@ -125,33 +126,37 @@ class S10Nodes:
             return
         from std_msgs.msg import UInt8MultiArray
         output = UInt8MultiArray()
-        output.data = list(packet)
+        output.data = array.array("B", packet)
         self.lidar_publisher.publish(output)
 
     @staticmethod
     def _pointcloud_packet(msg):
-        """Encode XYZ PointCloud2 using the renderer's binary point-cloud contract."""
+        """Encode a bounded, spatially distributed sample for the cloud renderer."""
         fields = {field.name: field.offset for field in msg.fields}
         if not all(name in fields for name in ("x", "y", "z")):
             return None
         endian = ">" if msg.is_bigendian else "<"
-        points = []
-        for row in range(int(msg.height)):
-            for col in range(int(msg.width)):
-                offset = row * int(msg.row_step) + col * int(msg.point_step)
-                try:
-                    point = tuple(struct.unpack_from(endian + "f", msg.data, offset + fields[name])[0]
-                                  for name in ("x", "y", "z"))
-                except struct.error:
-                    continue
-                if all(math.isfinite(value) for value in point):
-                    points.append(point)
-                if len(points) >= 20000:
-                    break
-            if len(points) >= 20000:
-                break
-        return struct.pack("<II", 12, len(points)) + b"".join(
-            struct.pack("<fff", *point) for point in points)
+        width = int(msg.width)
+        total_points = width * int(msg.height)
+        if width <= 0 or total_points <= 0:
+            return struct.pack("<II", 12, 0)
+
+        stride = max(1, math.ceil(total_points / MAX_LIDAR_RENDER_POINTS))
+        packed = bytearray(struct.pack("<II", 12, 0))
+        count = 0
+        for index in range(0, total_points, stride):
+            row, col = divmod(index, width)
+            offset = row * int(msg.row_step) + col * int(msg.point_step)
+            try:
+                point = tuple(struct.unpack_from(endian + "f", msg.data, offset + fields[name])[0]
+                              for name in ("x", "y", "z"))
+            except struct.error:
+                continue
+            if all(math.isfinite(value) for value in point):
+                packed.extend(struct.pack("<fff", *point))
+                count += 1
+        struct.pack_into("<I", packed, 4, count)
+        return packed
 
     def close(self):
         self.robot.destroy_node()
@@ -168,6 +173,7 @@ JOINT_NAMES = (
     "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint", "hr_wheel_joint",
 )
 URDF_PATH = Path(__file__).with_name("resource") / "S10.urdf"
+MAX_LIDAR_RENDER_POINTS = 2000
 
 
 def _joint_value(joint, *keys):

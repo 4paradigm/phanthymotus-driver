@@ -233,8 +233,26 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     encoded = bytes(nodes.lidar_publisher.messages[-1].data)
     point_step, point_count = struct.unpack_from("<II", encoded)
     assert (point_step, point_count) == (12, 1)
+    assert nodes.lidar_publisher.messages[-1].data.typecode == "B"
     assert struct.unpack_from("<fff", encoded, 8) == (1.0, 2.0, 3.0)
     nodes.close()
+
+
+def test_lidar_packet_uniformly_caps_large_point_cloud(monkeypatch):
+    device = _load_device(monkeypatch)
+    width = 10000
+    data = b"".join(struct.pack("<fff", float(index), 0.0, 0.0) for index in range(width))
+    lidar = SimpleNamespace(
+        fields=[SimpleNamespace(name=name, offset=offset) for name, offset in (("x", 0), ("y", 4), ("z", 8))],
+        is_bigendian=False, height=1, width=width, row_step=width * 12, point_step=12, data=data,
+    )
+
+    encoded = device.S10Nodes._pointcloud_packet(lidar)
+    point_step, point_count = struct.unpack_from("<II", encoded)
+
+    assert (point_step, point_count) == (12, 2000)
+    assert struct.unpack_from("<f", encoded, 8)[0] == 0.0
+    assert struct.unpack_from("<f", encoded, 8 + (point_count - 1) * point_step)[0] == 9995.0
 
 
 def test_model_resource_returns_official_urdf(monkeypatch):
