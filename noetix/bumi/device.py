@@ -25,6 +25,7 @@ import urllib.request
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -134,6 +135,71 @@ _WORKMODE_NAMES = {
     26: "protection", 27: "fall_to_stand", 28: "stand_to_fall",
     29: "save_teach_2", 30: "disabled", 31: "dance1", 32: "dance2", 33: "tear",
 }
+
+# ── loco_relative_move: angle math and rotate control law ──────────────────────
+
+_ROTATE_TOL_DEG = 2.0
+_ROTATE_WZ_STILL_RAD_S = 0.1
+_ROTATE_SETTLE_TICKS = 8
+_ROTATE_VYAW_FULL = 0.8                # cruise 满速（|err| > _ROTATE_CRUISE_EXIT_DEG）
+_ROTATE_CRUISE_EXIT_DEG = 20.0
+_ROTATE_PULSE_VYAW = 0.50              # creep 点动幅值（高于 0.4 stiction 死区）
+_ROTATE_PULSE_THRESHOLD_DEG = 2.0     # must equal the ±2 tolerance or a 2.0-2.2 dead zone times out
+_ROTATE_FINE_ENTRY_DEG = 3.0           # below this, creep pulses take over
+_ROTATE_VYAW_FINE_MIN = 0.45           # fine-band floor, above the ~0.4 deadband
+_ROTATE_FINE_KP_PER_DEG = 0.04         # fine-band |err|*kp, capped at full speed
+_ROTATE_PULSE_S_PER_DEG = 0.025
+_ROTATE_PULSE_MIN_S = 0.12
+_ROTATE_PULSE_MAX_S = 0.30
+_ROTATE_STARTUP_TIMEOUT_S = 0.50
+_ROTATE_OBSERVE_S = 0.30
+_ROTATE_OBSERVE_SPREAD_DEG = 0.5
+_ROTATE_MIN_PROGRESS_DEG = 0.1
+_ROTATE_NO_PROGRESS_LIMIT = 3
+_ROTATE_CRUISE_PROGRESS_DEG = 1.0
+_ROTATE_CRUISE_PROGRESS_TIMEOUT_S = 2.0
+_ROTATE_VYAW_SIGN = 1.0
+_ROTATE_ANGLE_LIMIT_DEG = 360.0
+
+
+def _wrap180(deg: float) -> float:
+    """Normalize an angle in degrees to [-180, 180)."""
+    return ((deg + 180) % 360) - 180
+
+
+def _yaw_deg_from_quat(ori) -> float:
+    """Yaw in degrees from an SDK-order [x, y, z, w] quaternion, in (-180, 180]."""
+    x, y, z, w = ori
+    norm = math.hypot(x, y, z, w)
+    if not math.isfinite(norm) or norm == 0:
+        raise ValueError("IMU quaternion must be finite and nonzero")
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return math.degrees(math.atan2(2.0 * (w * z + x * y),
+                                   1.0 - 2.0 * (y * y + z * z)))
+
+
+def _pulse_duration_s(err_deg: float, measured_rate: float | None = None) -> float:
+    """Use the last settled pulse response, with margin against overshoot."""
+    duration = (0.7 * abs(err_deg) / measured_rate if measured_rate is not None
+                else _ROTATE_PULSE_S_PER_DEG * abs(err_deg))
+    return min(_ROTATE_PULSE_MAX_S, max(_ROTATE_PULSE_MIN_S, duration))
+
+
+def _fine_vyaw(err_deg: float) -> float:
+    """Closed-loop deceleration band speed: |err|*kp, floored above stiction.
+
+    Runs continuously between cruise exit and the creep band so the robot
+    decelerates smoothly instead of stick-slip crawling the whole final
+    stretch — the crawl's stop-start pulses are what reads as end-phase
+    jitter on the robot.
+    """
+    speed = max(_ROTATE_VYAW_FINE_MIN, abs(err_deg) * _ROTATE_FINE_KP_PER_DEG)
+    return math.copysign(min(_ROTATE_VYAW_FULL, speed), err_deg)
+
+
+def _rotate_timeout_s(angle_deg: float) -> float:
+    """Whole-request rotate budget: 10 s + 1 s per 5°, capped at 75 s."""
+    return min(75.0, 10.0 + abs(angle_deg) / 5.0)
 
 
 # ── StatePlugin (sensor, multi-tool) ─────────────────────────────────────────
@@ -314,10 +380,95 @@ class LocoPlugin:
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
+        # loco_relative_move rotate bookkeeping, read by _rotate_status.
+        self._rotate_lock = threading.Lock()
+        self._rotate_stop_event = threading.Event()
+        self._rotate_state: dict = {"state": "idle", "last_result": None}
+        self._body_action: str | None = None
+        # ACP async completion for rotate: worker thread + the single active
+        # action whose terminal callback fires exactly once.
+        self._rotate_worker: threading.Thread | None = None
+        self._active_action_id: str | None = None
+        self._destination_action = "rotate"
+        # Card configuration, like the other cards: the slip factors are
+        # operator-settable through the config action (configSchema below) and
+        # apply to every following move until changed again.
+        from leg_odometry import LEG_SLIP_SCALE
+        self._slip_scales = dict(LEG_SLIP_SCALE)
+        for direction in self._slip_scales:
+            raw = plugin_config.get(f'slip_{direction}')
+            if raw is not None:
+                try:
+                    self._slip_scales[direction] = float(raw)
+                except (TypeError, ValueError):
+                    pass
+
+        # Set by LocoServoPlugin at construction. `loco` is built first, so the
+        # link cannot be a constructor argument in this direction.
+        self._servo = None
+
+    def attach_servo(self, servo) -> None:
+        """Let the streaming chassis card be paused before we drive it ourselves."""
+        self._servo = servo
+
+    def _distance_full_scale(self):
+        """Measured normalised-command-to-m/s calibration from the servo card.
+
+        The pure-IMU distance worker uses it for an independent travel bound;
+        without the servo card it falls back to the module's documented values.
+        """
+        getter = getattr(self._servo, 'distance_full_scale', None)
+        return getter() if getter is not None else None
+
+    def is_moving(self) -> bool:
+        """Whether a move thread or reserved destination turn owns the chassis.
+
+        A fact only this plugin knows, and `loco_servo` has to ask it before it
+        starts writing to the same `HighController` — two threads publishing at
+        different rates into one SDK reads on the robot as a stutter and in the
+        logs as nothing at all.
+        """
+        thread = self._move_thread
+        return bool((thread is not None and thread.is_alive())
+                    or self._rotate_state["state"] == "running" or self._body_action)
+
+    def publish_velocity(self, x: float, y: float, z: float) -> None:
+        """One normalised velocity command, through this plugin's rate limiter.
+
+        `loco_servo` routes through here rather than holding `high_ctrl` itself
+        so that both cards share one lock and one >=2 ms spacing. Two writers
+        with separate limiters can interleave inside a single publish, and the
+        SDK has no way to tell us that happened.
+        """
+        self._publish_cmd(x, y, z, _get_default_cmd(), 0)
+
+    def _preempt_servo(self, reason: str) -> bool:
+        """An explicit action outranks a streaming policy.
+
+        This direction is not negotiable: a person or the LLM saying "stop" or
+        "dance" must win over a policy that is mid-plan, and the reverse would
+        mean a policy could override a human instruction 100 ms after it was
+        given.
+
+        Called from **every** action on this plugin that moves the robot, not
+        just `loco.move`. The posture, preset and teaching actions all change
+        `workmode` out from under a running stream, and a stream that keeps
+        publishing velocities into a robot that is being told to lie down is the
+        one combination none of the individual cards can see.
+        """
+        if self._servo is None:
+            return False
+        return bool(self._servo.pause_for_explicit_command(reason))
+
+    def _set_servo_velocity_owner(self, owned: bool) -> None:
+        """Transfer the shared velocity publisher after/before loco.move."""
+        if self._servo is not None:
+            self._servo.set_explicit_velocity_owner(owned)
 
     def get_tools(self) -> list:
         return [
             self._loco_tool(),
+            self._loco_relative_move_tool(),
             self._stand_up_lie_prone_tool(),
             self._semantic_action_tool(),
             self._action_recording_tool(),
@@ -367,6 +518,44 @@ class LocoPlugin:
                         "params": [],
                         "description": "Stop all movement immediately.",
                     },
+                },
+            },
+            "topic_out": [],
+        }
+
+    def _loco_relative_move_tool(self) -> dict:
+        return {
+            "name": "loco_relative_move", "type": "actuator", "multiInstance": False,
+            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["rotate", "move", "stop_move", "status"]},
+                    "x_m": {"type": "number", "minimum": -3, "maximum": 3,
+                            "description": "move 动作：目标点在启动时机身系的前后坐标（米，正=前）。"},
+                    "y_m": {"type": "number", "minimum": -3, "maximum": 3,
+                            "description": "move 动作：目标点在启动时机身系的左右坐标（米，正=左）。"},
+                    "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
+                                  "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "rotate": {"params": ["angle_deg"], "description": "原地转过 angle_deg 度后自动刹停（闭环）。"},
+                    "move": {"params": ["x_m", "y_m"],
+                               "description": "走到启动机身系下的目标点 (x,y)：朝向目标先转/边走边转，只前进不横移；到达位置容差后停车。距离 0.1–3 m。"},
+                    "stop_move": {"params": [], "description": "立即停止当前目标移动或旋转并刹停。"},
+                    "status": {"params": [], "description": "查询当前目标动作、距离反馈来源及估计位移或转角结果。"},
+                },
+                "x-hooks": {"on_interrupt_motion": {"action": "stop_move"}},
+                # Both actions retain the existing asynchronous ACP contract.
+                "x-completion": {"actions": ["rotate", "move"], "timeout": 120},
+            },
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "slip_forward": {"type": "number", "default": 1.7, "minimum": 1.0,
+                                     "maximum": 10.0,
+                                     "description": "target 走段的实测打滑系数（默认 1.7）。改后对之后所有 target 移动生效。"},
                 },
             },
             "topic_out": [],
@@ -460,43 +649,133 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        pass
+        pass  # The standalone distance worker reads the SDK IMU and joint states directly.
 
     def stop(self) -> None:
+        # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
+        # stop event ends the running rotate as "stopped", and the worker's
+        # own completion fires the ACP "cancelled" callback — joining here
+        # completes the ACP action before Agent Core is left holding a
+        # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
+        self._wait_for_rotate_idle()
+
+    def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
+        # Cover the dispatch-acceptance window: stop may land after the
+        # reservation (state=running) but before the worker thread exists
+        # (mid-preflight, or between assigning _rotate_worker and start()).
+        # Loop until the worker shows up, then join it; if the reservation
+        # resolves to a sync refusal (state flips idle, no worker), no ACP
+        # action was ever opened and there is nothing to join.
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._rotate_lock:
+                state_running = self._rotate_state["state"] == "running"
+                worker = self._rotate_worker
+            if not state_running:
+                return True
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+            else:
+                time.sleep(0.01)   # accepted but worker not yet started
+        return False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "config" and args.get('_tool_name') == 'loco_relative_move':
+            return self._apply_distance_config(args)
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
+            # The streaming card goes first. Stopping the chassis and leaving a
+            # policy publishing into it means the next command restarts the
+            # robot somebody just stopped, within 100 ms and with nothing in the
+            # log connecting the two.
+            self._preempt_servo("loco.stop")
             self._stop_move()
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
 
+        handler = None
         if tool_name == "loco" and action == "move":
-            return self._do_move(args)
-        if tool_name == "loco" and action == "stop_move":
-            return self._stop_move()
-        if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
-            return self._do_posture_action(action, args)
-        if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
-            return self._do_preset_action(action)
-        if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
-            return self._do_teaching_action(action, args)
-        return None
+            handler = lambda: self._do_move(args)
+        elif tool_name == "loco_relative_move" and action == "rotate":
+            return self._do_rotate(args)
+        elif tool_name == "loco_relative_move" and action == "move":
+            return self._do_destination(args, "move")
+        elif tool_name == "loco_relative_move" and action == "status":
+            return self._rotate_status()
+        elif tool_name == "loco_relative_move" and action == "stop_move":
+            handler = self._stop_move
+        elif tool_name == "loco" and action == "stop_move":
+            handler = self._stop_move
+        elif tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
+            handler = lambda: self._do_posture_action(action, args)
+        elif tool_name == "semantic_action" and action in _PRESET_ACTIONS:
+            handler = lambda: self._do_preset_action(action)
+        elif tool_name == "action_recording" and action in _TEACHING_ACTIONS:
+            handler = lambda: self._do_teaching_action(action, args)
+        if handler is None:
+            return None
 
-    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
+        # Before touching the robot, not after: otherwise this command and the
+        # policy's next one race, and which one the robot ends up obeying
+        # depends on timing nobody controls. Every action reachable from here
+        # moves the body, so every one of them preempts.
+        body_action = tool_name in ("stand_up_lie_prone", "semantic_action", "action_recording")
+        if body_action:
+            with self._rotate_lock:
+                if self._body_action:
+                    return {"state": "error", "command_sent": False,
+                            "error": f"chassis reserved by {self._body_action}"}
+                self._body_action = f"{tool_name}.{action}"
+                self._rotate_stop_event.set()
+        try:
+            preempted = self._preempt_servo(f"{tool_name}.{action}")
+            if body_action and not self._wait_for_rotate_idle():
+                return {"state": "error", "command_sent": False,
+                        "error": "rotation has not stopped; competing action was not sent"}
+            result = handler()
+            if preempted and isinstance(result, dict):
+                result["preempted_loco_servo"] = True
+            return result
+        finally:
+            if body_action:
+                with self._rotate_lock:
+                    self._body_action = None
+
+    def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0,
+                     *, cancel_event: threading.Event | None = None):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_cmd_time
             if elapsed < 0.002:
                 time.sleep(0.002 - elapsed)
+            # Recheck after taking the brake's publish lock, including any
+            # rate-limit wait: a cancelled rotation must not restart motion.
+            if cancel_event is not None and cancel_event.is_set():
+                return
             self._high_ctrl.publish_cmd(x, y, z, action_cmd, index)
             self._last_cmd_time = time.monotonic()
 
     def _do_move(self, args: dict) -> dict:
+        # Reserve move startup until its worker exists, so rotate cannot
+        # enter between the busy check and launching the move thread.
+        with self._rotate_lock:
+            if self._body_action:
+                return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
+            if self._rotate_state["state"] == "running":
+                return {
+                    "state": "error",
+                    "error": (
+                        "loco_relative_move rotate or distance move in progress; "
+                        "wait for it to finish or call stop_move first"
+                    ),
+                }
+            return self._do_move_impl(args)
+
+    def _do_move_impl(self, args: dict) -> dict:
         # Check if in walking mode
         mode = int(self._high_ctrl.get_mode())
         if mode == 26:
@@ -523,16 +802,25 @@ class LocoPlugin:
 
         self._move_stop_event.clear()
         default_cmd = _get_default_cmd()
+        # The servo keeps refreshing zero until this point.  From here until
+        # this move's final zero, this loop is the sole velocity publisher.
+        self._set_servo_velocity_owner(True)
 
         if duration > 0:
             # Timed move
             def _move_timed():
-                end_time = time.monotonic() + duration
-                while not self._move_stop_event.is_set() and time.monotonic() < end_time:
-                    self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
-                    time.sleep(0.02)  # 50 Hz
-                # Stop
-                self._publish_cmd(0, 0, 0, default_cmd, 0)
+                try:
+                    end_time = time.monotonic() + duration
+                    while not self._move_stop_event.is_set() and time.monotonic() < end_time:
+                        self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
+                        time.sleep(0.02)  # 50 Hz
+                finally:
+                    # Stop before returning zero refresh to the paused servo,
+                    # including if the SDK publisher itself raises.
+                    try:
+                        self._publish_cmd(0, 0, 0, default_cmd, 0)
+                    finally:
+                        self._set_servo_velocity_owner(False)
 
             self._move_thread = threading.Thread(target=_move_timed, daemon=True, name="bumi_move")
             self._move_thread.start()
@@ -540,23 +828,514 @@ class LocoPlugin:
         else:
             # Continuous move with 5s watchdog
             def _move_continuous():
-                watchdog_end = time.monotonic() + 5.0
-                while not self._move_stop_event.is_set() and time.monotonic() < watchdog_end:
-                    self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
-                    time.sleep(0.02)
-                self._publish_cmd(0, 0, 0, default_cmd, 0)
+                try:
+                    watchdog_end = time.monotonic() + 5.0
+                    while not self._move_stop_event.is_set() and time.monotonic() < watchdog_end:
+                        self._publish_cmd(vx, vy, vyaw, default_cmd, 0)
+                        time.sleep(0.02)
+                finally:
+                    try:
+                        self._publish_cmd(0, 0, 0, default_cmd, 0)
+                    finally:
+                        self._set_servo_velocity_owner(False)
 
             self._move_thread = threading.Thread(target=_move_continuous, daemon=True, name="bumi_move")
             self._move_thread.start()
             return {"state": "moving", "vx": vx, "vy": vy, "vyaw": vyaw, "duration": "continuous (5s watchdog)"}
 
     def _stop_move(self) -> dict:
+        self._rotate_stop_event.set()
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
         if self._high_ctrl is not None:
             self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+        self._set_servo_velocity_owner(False)
         return {"state": "stopped"}
+
+    def _do_rotate(self, args: dict) -> dict:
+        return self._do_destination(args, "rotate")
+
+    def _do_destination(self, args: dict, action: str) -> dict:
+        # Sync entry: reserve one rotation atomically (busy-guard + clear
+        # cancellation) before exposing running status, then run the
+        # pre-flight checks. Validation/mode refusals complete here, before
+        # any motion starts, so they return synchronously WITHOUT an
+        # action_id (never ACP-wrapped). Anything that will move is handed
+        # to the bumi_rotate daemon thread, which records idle + the full
+        # result and fires the ACP terminal exactly once.
+        with self._rotate_lock:
+            if self._body_action:
+                return {"state": "error", "error": f"chassis reserved by {self._body_action}"}
+            if self._rotate_state["state"] == "running":
+                return {
+                    "state": "error",
+                    "error": (
+                        "loco_relative_move rotate or target move in progress; wait for it to "
+                        "finish or call stop_move first"
+                    ),
+                }
+            self._rotate_stop_event.clear()
+            self._rotate_state["state"] = "running"
+            self._destination_action = action
+        try:
+            value, terminal = (self._rotate_preflight(args) if action == "rotate"
+                               else self._target_preflight(args))
+            if terminal is None:
+                if action == "rotate":
+                    expected_duration_s = _rotate_timeout_s(value)
+                else:
+                    expected_duration_s = min(60.0, 12.0+20.0*value)
+                action_id = f"bumi_loco_relative_move_{uuid.uuid4().hex}"
+                worker = threading.Thread(target=self._do_rotate_worker,
+                                          args=(args, action_id, action),
+                                          daemon=True, name=f"bumi_{action}")
+                with self._rotate_lock:
+                    self._active_action_id = action_id
+                    self._rotate_worker = worker
+                worker.start()
+                return {"state": "running", "action_id": action_id,
+                        "expected_duration_s": expected_duration_s,
+                        ("requested_angle_deg" if action == "rotate" else "requested_distance_m"): value,
+                        **({"requested_target_x_m": float(args.get('x_m')),
+                            "requested_target_y_m": float(args.get('y_m'))}
+                           if action == "move" else {}),
+                        **({'feedback_source': 'leg_odometry_experimental',
+                            'accuracy_validated': False} if action == 'move' else {})}
+        except Exception as exc:
+            terminal = {"state": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        **({'feedback_source': 'leg_odometry_experimental',
+                            'estimated_quality': 'unavailable', 'accuracy_validated': False} if action == 'move' else {})}
+        # No worker accepted the action: release its reservation so a
+        # transient SDK or thread-start failure does not leave the card busy.
+        with self._rotate_lock:
+            self._active_action_id = None
+            self._rotate_worker = None
+            self._rotate_state["state"] = "idle"
+            self._rotate_state["last_result"] = terminal
+        return terminal
+
+    def _do_rotate_worker(self, args: dict, action_id: str, action: str = "rotate") -> dict | None:
+        # bumi_rotate thread body: run the impl, then publish exactly one
+        # ACP terminal. The active action is claimed (cleared) under the
+        # lock BEFORE notifying — a duplicate completion is structurally
+        # impossible — and idle becomes visible only after the notify
+        # returns, so wait_rotate observing idle implies the callback fired.
+        result = None
+        owns_velocity = False
+        try:
+            if action == "move" or abs(float(args["angle_deg"])) >= 0.05:
+                # Rotation is already reserved, so servo start/resume sees
+                # a busy chassis before this publisher takes ownership.
+                self._preempt_servo(f"loco_relative_move.{action}")
+                owns_velocity = True
+            result = self._do_rotate_impl(args) if action == "rotate" else self._do_target_impl(args)
+            result["action"] = action
+            if action == 'move':
+                result.setdefault('feedback_source', 'leg_odometry_experimental')
+                result.setdefault('estimated_quality', 'unavailable')
+                result.setdefault('accuracy_validated', False)
+            return result
+        except Exception as exc:
+            result = {"state": "error",
+                      "error": f"{type(exc).__name__}: {exc}"}
+            return result
+        finally:
+            if owns_velocity:
+                self._set_servo_velocity_owner(False)
+            with self._rotate_lock:
+                claimed = self._active_action_id == action_id
+                if claimed:
+                    self._active_action_id = None
+            if claimed:
+                status = {"done": "completed", "stopped": "cancelled",
+                          "timeout": "error"}.get(
+                              result.get("state") if result else None,
+                              "error")
+                _acp_notify(action_id, status, result, "loco_relative_move")
+            with self._rotate_lock:
+                self._rotate_state["state"] = "idle"
+                if result is not None:
+                    self._rotate_state["last_result"] = result
+
+    def _rotate_preflight(self, args: dict) -> tuple[float | None, dict | None]:
+        # Synchronous pre-motion checks (Task 2 impl steps 1–2), shared by
+        # the dispatch path and the worker. Returns (angle_deg, None) when
+        # rotation may start, else (None, terminal) — a done/error dict the
+        # caller records and returns as-is. Zero-turn skips the workmode
+        # check: it is a deliberate no-op that succeeds in any mode.
+        raw_angle = args.get("angle_deg")
+        try:
+            angle_deg = float(raw_angle)
+        except (TypeError, ValueError):
+            return None, {"state": "error",
+                          "error": f"angle_deg must be a number, got {raw_angle!r}"}
+        if not math.isfinite(angle_deg) or abs(angle_deg) > _ROTATE_ANGLE_LIMIT_DEG:
+            return None, {"state": "error",
+                          "error": (f"angle_deg must be a finite number within "
+                                    f"±{_ROTATE_ANGLE_LIMIT_DEG:g} degrees, got {angle_deg}")}
+        if abs(angle_deg) < 0.05:
+            return angle_deg, None
+        return angle_deg, self._rotate_mode_error()
+
+    def _rotate_mode_error(self) -> dict | None:
+        mode = int(self._high_ctrl.get_mode())
+        if mode == 26:
+            return {"state": "error", "error": "Robot in protection mode, cannot move"}
+        if mode != 2:
+            return {
+                "state": "error",
+                "error": (
+                    f"movement requires workmode=2 (walking); current mode is "
+                    f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
+                    "Use switch_mode switch=walk first."
+                ),
+            }
+        return None
+
+    def _read_distance_imu(self):
+        return self._high_ctrl.get_imu_data()
+
+    def _read_distance_joints(self):
+        """The 21 SDK joint positions used by the leg-odometry distance estimate."""
+        return self._high_ctrl.get_joint_state()
+
+    def _distance_publish(self, vx, vyaw=0, *, vy=0):
+        self._publish_cmd(vx, vy, vyaw, _get_default_cmd(), 0,
+                          cancel_event=self._rotate_stop_event if vx or vy or vyaw else None)
+
+    _SLIP_CONFIG_FIELDS = {'slip_forward': 'forward'}
+
+    def _apply_distance_config(self, args: dict) -> dict:
+        """Card config: change the per-direction slip factors for later moves."""
+        changes = {}
+        for field, direction in self._SLIP_CONFIG_FIELDS.items():
+            if field not in args:
+                continue
+            raw = args[field]
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                value = float('nan')
+            if isinstance(raw, bool) or not math.isfinite(value) or not 1.0 <= value <= 10.0:
+                return {"state": "error",
+                        "error": f"{field} must be a finite number from 1.0 to 10.0"}
+            changes[direction] = value
+        self._slip_scales.update(changes)
+        return {"state": "configured", "slip_scales": dict(self._slip_scales)}
+
+    def _target_preflight(self, args):
+        raw_x, raw_y = args.get('x_m'), args.get('y_m')
+        # float(True) is 1.0; booleans are not metre coordinates and must not
+        # silently start a physical move.
+        if isinstance(raw_x, bool) or isinstance(raw_y, bool):
+            return None, {"state": "error",
+                          "error": "x_m and y_m must be numbers, not booleans"}
+        try:
+            x = float(raw_x)
+            y = float(raw_y)
+        except (TypeError, ValueError):
+            return None, {"state": "error", "error": "x_m and y_m must be numbers"}
+        if (not math.isfinite(x) or not math.isfinite(y)
+                or not 0.1 <= math.hypot(x, y) <= 3.0):
+            return None, {"state": "error",
+                          "error": "x_m/y_m must give a finite target 0.1-3 m from the start"}
+        problem = self._rotate_mode_error()
+        if problem is not None:
+            return None, problem
+        from imu_distance_control import decode_imu
+        decode_imu(self._read_distance_imu())
+        return math.hypot(x, y), None
+
+    def _do_target_impl(self, args):
+        from imu_distance_control import run_target
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+            if self._move_thread.is_alive():
+                return {"state": "error", "error": "previous move has not stopped"}
+        self._set_servo_velocity_owner(True)
+        result = run_target(self, float(args['x_m']), float(args['y_m']),
+                            full_scale=self._distance_full_scale(),
+                            slip_scale=self._slip_scales['forward'])
+        result['estimated_quality'] = 'experimental_unvalidated'
+        return result
+
+    def _read_rotate_imu(self) -> tuple[float, float]:
+        imu = self._high_ctrl.get_imu_data()
+        yaw = _yaw_deg_from_quat(imu.ori)
+        wz = float(imu.angular_vel[2])
+        if not math.isfinite(wz):
+            raise ValueError("IMU yaw rate must be finite")
+        return yaw, wz
+
+
+    def _do_rotate_impl(self, args: dict) -> dict:
+        # 1. Pre-flight (validation + workmode) — shared with the sync
+        # dispatch path so refusals there return before any action_id exists.
+        angle_deg, terminal = self._rotate_preflight(args)
+        if terminal is not None:
+            return terminal
+        # 0° is a deliberate no-op: it succeeds in any workmode and returns
+        # before the mutex preamble, so it never cancels a running move.
+        if abs(angle_deg) < 0.05:  # zero-turn: instant done, no motion commanded
+            yaw, _ = self._read_rotate_imu()
+            return {"state": "done", "requested_angle_deg": angle_deg,
+                    "start_yaw_deg": yaw, "end_yaw_deg": yaw, "turned_deg": 0.0,
+                    "final_error_deg": 0.0, "elapsed_s": 0.0,
+                    "tolerance_deg": _ROTATE_TOL_DEG}
+
+        # (Mode checks live in _rotate_preflight, shared with the sync
+        # dispatch path so refusals return before any action_id exists.)
+
+        # 3. Stop any existing move thread (mutex preamble as in _do_move).
+        self._move_stop_event.set()
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1)
+            if self._move_thread.is_alive():
+                return {"state": "error", "error": "previous move has not stopped"}
+        self._move_stop_event.clear()
+
+        # Take ownership after the previous move's finalizer has returned it;
+        # otherwise that finalizer can re-enable servo zero refresh mid-turn.
+        self._set_servo_velocity_owner(True)
+        default_cmd = _get_default_cmd()
+        start_yaw, _ = self._read_rotate_imu()
+        start_time = time.monotonic()
+        # Timeout budget covers the whole request, every segment included.
+        deadline = start_time + _rotate_timeout_s(angle_deg)
+        prev_yaw = start_yaw
+        turned_deg = 0.0
+        end_yaw = start_yaw
+        result_state = "timeout"
+        # Angle-as-motion: |angle| > 150 is split into chained ≤150° sub-rotations
+        # so the wrapped error can never shortcut the requested direction
+        # (a single ±360 request would otherwise wrap to err=0 and never move).
+        segments = []
+        remaining = angle_deg
+        while abs(remaining) > 150.0:
+            step = math.copysign(150.0, remaining)
+            segments.append(step)
+            remaining -= step
+        if abs(remaining) > 1e-9:
+            segments.append(remaining)
+        try:
+            # 4. 50 Hz three-phase closed loop (cruise → brake → creep) over
+            # chained ≤150° absolute sub-targets: cruise chains sub-targets with
+            # no intermediate brake/creep (advance at |err_sub| ≤ cruise band);
+            # the settle judgement runs once, on the final target.
+            cumulative_angle = 0.0
+            seg_i = 0
+            cumulative_angle += segments[seg_i]
+            # Absolute sub-target: segment k aims at start_yaw + cumulative
+            # angle (the final one == the whole-request target), so each
+            # segment corrects prior shortfall and final_error_deg for the
+            # whole request stays within ±2°.
+            seg_target = start_yaw + cumulative_angle
+            stage = "cruise"            # cruise → brake → creep, per segment
+            brake_started = 0.0
+            pulse_phase = None          # None | "pulse" | "coast"
+            pulse_end = 0.0
+            coast_end = 0.0
+            pulse_cmd = 0.0             # latched sign * PULSE_VYAW for a pulse
+            err_at_pulse = 0.0
+            turned_at_pulse = 0.0
+            pulse_started = 0.0
+            pulse_duration = 0.0
+            pulse_motion_started = False
+            motion_started_at = 0.0     # first measurable same-direction progress
+            turned_at_motion = 0.0      # turned_deg latched at that moment
+            measured_rate = None
+            no_progress = 0
+            observed_errors = []
+            still = 0
+            cruise_last_progress = None
+            cruise_progress_deg = 0.0
+            while True:
+                if self._rotate_stop_event.is_set():
+                    result_state = "stopped"
+                    break
+                mode_error = self._rotate_mode_error()
+                if mode_error is not None:
+                    return mode_error
+                cur_yaw, wz = self._read_rotate_imu()
+                turned_deg += _wrap180(cur_yaw - prev_yaw)
+                prev_yaw = cur_yaw
+                end_yaw = cur_yaw
+                err = _wrap180(seg_target - cur_yaw)
+                # Sub-target advance: inside the cruise-exit band (≤20°) jumps
+                # straight to the next sub-target, so non-final segments never
+                # brake or creep — one continuous cruise, one creep at the end.
+                # Wrap safety: non-final segments are exactly 150° and we
+                # advance within 20° of one, so err to the next stays in
+                # [130, 170] < 180 — wrap180 cannot shortcut the direction.
+                if seg_i + 1 < len(segments) and abs(err) <= _ROTATE_CRUISE_EXIT_DEG:
+                    seg_i += 1
+                    cumulative_angle += segments[seg_i]
+                    seg_target = start_yaw + cumulative_angle
+                    stage = "cruise"
+                    pulse_phase = None
+                    still = 0
+                    continue
+                if time.monotonic() >= deadline:
+                    result_state = "timeout"
+                    break
+                if abs(err) <= _ROTATE_TOL_DEG and abs(wz) <= _ROTATE_WZ_STILL_RAD_S:
+                    still += 1
+                else:
+                    still = 0
+                if stage == "cruise" and abs(err) > _ROTATE_FINE_ENTRY_DEG:
+                    now = time.monotonic()
+                    progress = math.copysign(1.0, angle_deg) * turned_deg
+                    if (cruise_last_progress is None
+                            or progress - cruise_progress_deg >= _ROTATE_CRUISE_PROGRESS_DEG):
+                        cruise_last_progress, cruise_progress_deg = now, progress
+                    elif now - cruise_last_progress >= _ROTATE_CRUISE_PROGRESS_TIMEOUT_S:
+                        return {"state": "error", "error":
+                                "no yaw progress during cruise; feedback lost or chassis stalled",
+                                "requested_angle_deg": angle_deg, "turned_deg": turned_deg,
+                                "final_error_deg": angle_deg - turned_deg,
+                                "elapsed_s": now - start_time,
+                                "tolerance_deg": _ROTATE_TOL_DEG}
+                    # Cruise full speed above the exit angle, then a continuous
+                    # proportional fine band down to the creep entry — the
+                    # alternative (point-crawling the whole final stretch) is
+                    # the stick-slip end-phase jitter seen on hardware.
+                    # _fine_vyaw caps at full speed above the exit angle and
+                    # signs with err; _ROTATE_VYAW_SIGN is the axis calibration.
+                    self._publish_cmd(0.0, 0.0,
+                                      _ROTATE_VYAW_SIGN * _fine_vyaw(err),
+                                      default_cmd, 0,
+                                      cancel_event=self._rotate_stop_event)
+                else:
+                    if stage == "cruise":
+                        stage = "brake"
+                        brake_started = time.monotonic()
+                        pulse_phase = None
+                    if stage == "brake":
+                        # Brake: zero cmd until truly still (0.5 s cap) so
+                        # inertia is shed before creeping, without stalling.
+                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                        if (abs(wz) <= _ROTATE_WZ_STILL_RAD_S
+                                or time.monotonic() - brake_started >= 0.5):
+                            stage = "creep"
+                            pulse_phase = "coast"
+                            coast_end = time.monotonic() + _ROTATE_OBSERVE_S
+                    elif pulse_phase == "pulse":
+                        now = time.monotonic()
+                        progress = math.copysign(1.0, err_at_pulse) * (turned_deg - turned_at_pulse)
+                        if not pulse_motion_started and progress >= _ROTATE_MIN_PROGRESS_DEG:
+                            pulse_motion_started = True
+                            motion_started_at = now
+                            turned_at_motion = turned_deg
+                            pulse_end = now + _pulse_duration_s(err, measured_rate)
+                        if (not pulse_motion_started
+                                and now - pulse_started >= _ROTATE_STARTUP_TIMEOUT_S
+                                and abs(err) > _ROTATE_TOL_DEG):
+                            return {"state": "error", "error": "no yaw progress during correction startup",
+                                    "requested_angle_deg": angle_deg, "turned_deg": turned_deg,
+                                    "final_error_deg": angle_deg - turned_deg,
+                                    "tolerance_deg": _ROTATE_TOL_DEG}
+                        if ((not pulse_motion_started or now < pulse_end)
+                                and abs(err) > _ROTATE_TOL_DEG
+                                and err * err_at_pulse > 0):
+                            self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
+                                              cancel_event=self._rotate_stop_event)
+                        else:
+                            # Reaching the band brakes early, but never skips
+                            # observation when a subsequent sample drifts out.
+                            # Rate calibration uses only the effective motion
+                            # window — startup dead time would dilute it and
+                            # bias every subsequent pulse width long.
+                            pulse_duration = (time.monotonic() - motion_started_at
+                                              if pulse_motion_started else 0.0)
+                            coast_end = time.monotonic() + _ROTATE_OBSERVE_S
+                            pulse_phase = "coast"
+                            observed_errors.clear()
+                            self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                    else:  # coast
+                        self._publish_cmd(0.0, 0.0, 0.0, default_cmd, 0)
+                        if abs(wz) > _ROTATE_WZ_STILL_RAD_S:
+                            observed_errors.clear()
+                        else:
+                            observed_errors.append(err)
+                            observed_errors = observed_errors[-_ROTATE_SETTLE_TICKS:]
+                        stable = (len(observed_errors) == _ROTATE_SETTLE_TICKS
+                                  and max(observed_errors) - min(observed_errors)
+                                  <= _ROTATE_OBSERVE_SPREAD_DEG)
+                        if time.monotonic() >= coast_end and stable:
+                            # Success still needs raw feedback within ±2° for
+                            # every settle frame; filtering never widens it.
+                            if still >= _ROTATE_SETTLE_TICKS:
+                                result_state = "done"
+                                break
+                            if pulse_duration > 0:
+                                response = math.copysign(1.0, err_at_pulse) * (
+                                    turned_deg - turned_at_motion)
+                                if response >= _ROTATE_MIN_PROGRESS_DEG:
+                                    measured_rate = response / pulse_duration
+                                improved = abs(err_at_pulse) - abs(err)
+                                no_progress = (no_progress + 1 if improved
+                                               < _ROTATE_MIN_PROGRESS_DEG else 0)
+                                pulse_duration = 0.0
+                                if no_progress >= _ROTATE_NO_PROGRESS_LIMIT:
+                                    return {"state": "error", "error":
+                                            "rotation made no progress after 3 corrections",
+                                            "requested_angle_deg": angle_deg,
+                                            "turned_deg": turned_deg,
+                                            "final_error_deg": angle_deg - turned_deg,
+                                            "tolerance_deg": _ROTATE_TOL_DEG}
+                            # Hysteresis: only a persistent deviation well
+                            # outside the acceptance band earns a pulse, so a
+                            # sample just past +-2 deg does not start a
+                            # back-and-forth correction cycle.
+                            if (min(observed_errors) > _ROTATE_PULSE_THRESHOLD_DEG
+                                    or max(observed_errors) < -_ROTATE_PULSE_THRESHOLD_DEG):
+                                err_at_pulse = sum(observed_errors) / len(observed_errors)
+                                turned_at_pulse = turned_deg
+                                pulse_started = time.monotonic()
+                                pulse_motion_started = False
+                                # A correction that did not move the robot means
+                                # 0.50/0.12-0.30 s was too gentle at this
+                                # residual: grow the next pulse instead of
+                                # giving up after the third one.
+                                duration = _pulse_duration_s(
+                                    err_at_pulse, measured_rate) * (1.0 + 0.6*no_progress)
+                                pulse_end = pulse_started + min(_ROTATE_PULSE_MAX_S*2.0,
+                                                                duration)
+                                amplitude = min(0.60, _ROTATE_PULSE_VYAW + 0.05*no_progress)
+                                pulse_cmd = (_ROTATE_VYAW_SIGN * math.copysign(
+                                    amplitude, err_at_pulse))
+                                pulse_phase = "pulse"
+                                self._publish_cmd(0.0, 0.0, pulse_cmd, default_cmd, 0,
+                                                  cancel_event=self._rotate_stop_event)
+                time.sleep(0.02)  # 50 Hz
+        finally:
+            # Every exit path — including exceptions — brakes to zero velocity.
+            self._publish_cmd(0, 0, 0, default_cmd, 0)
+
+        # 5. Report actual motion: per-frame yaw deltas, plus the unwrapped
+        # shortfall/overshoot of the REQUEST (angle_deg - turned_deg): positive
+        # = less turned than asked, negative = overshot. A wrap180 residual
+        # would fold a 360° shortfall to 0 and multi-wrap residuals to the
+        # wrong sign, so early exits (timeout/stopped) must not use it.
+        return {
+            "state": result_state,
+            "requested_angle_deg": angle_deg,
+            "start_yaw_deg": start_yaw,
+            "end_yaw_deg": end_yaw,
+            "turned_deg": turned_deg,
+            "final_error_deg": angle_deg - turned_deg,
+            "elapsed_s": time.monotonic() - start_time,
+            "tolerance_deg": _ROTATE_TOL_DEG,
+        }
+
+    def _rotate_status(self) -> dict:
+        with self._rotate_lock:
+            return {"state": self._rotate_state["state"],
+                    "last_result": self._rotate_state["last_result"],
+                    **({"action": self._destination_action} if self._rotate_state["state"] == "running" else {})}
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
@@ -743,6 +1522,14 @@ class LocoPlugin:
 
     def _prepare_workmode(self, target_mode: int, requested_action: str) -> dict:
         """Automatically reach ready(1) or walking(2) through documented steps."""
+        # Public dispatch owns the chassis until its action handler returns.
+        # Also wait through a rotation's acceptance window before mode edges.
+        with self._rotate_lock:
+            self._rotate_stop_event.set()
+        if not self._wait_for_rotate_idle():
+            return {"state": "error", "command_sent": False,
+                    "error": "rotation has not stopped; workmode was not changed"}
+
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
@@ -963,6 +1750,7 @@ def _mic_subprocess(namespace: str):
     frame_count = 0
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
+    buffer_start_us = 0
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
 
     while True:
@@ -981,14 +1769,22 @@ def _mic_subprocess(namespace: str):
             mono = _np.clip(mono.astype(_np.int32) * 50, -32768, 32767).astype(_np.int16)
 
             # Accumulate until we have enough for a proper chunk
+            if len(buffer) == 0:
+                timestamp_us = getattr(audio, 'timestamp_us', 0)
+                buffer_start_us = (timestamp_us if type(timestamp_us) is int
+                                   and 1_000_000_000_000_000 <= timestamp_us < 10_000_000_000_000_000 else 0)
             buffer = _np.concatenate([buffer, mono])
 
             if len(buffer) >= MIN_CHUNK_SAMPLES:
                 msg = _AudioChunk()
                 msg.format = "pcm_16k_16bit_mono"
                 msg.data = buffer.tobytes()
+                if buffer_start_us:
+                    msg.header.stamp.sec = buffer_start_us // 1_000_000
+                    msg.header.stamp.nanosec = (buffer_start_us % 1_000_000) * 1000
                 pub.publish(msg)
                 buffer = _np.array([], dtype=_np.int16)
+                buffer_start_us = 0
 
                 frame_count += 1
                 if frame_count % 200 == 0:
@@ -1558,7 +2354,53 @@ def _camera_subprocess(namespace: str):
         print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
         return
 
-    print(f"[camera_subprocess] publishing color→{color_topic} depth→{depth_topic}", flush=True)
+    # VOP detects objects in the RGB image, while navi samples the depth map at
+    # those RGB pixel coordinates.  D435i color and depth come from different
+    # lenses, so equal resolutions alone do not make their pixels correspond.
+    # Register every depth frame onto the color optical plane before publishing
+    # it; the resulting depth image consequently uses the color intrinsics and
+    # camera identity declared by camera_specs.py.
+    align_to_color = rs.align(rs.stream.color)
+
+    print(f"[camera_subprocess] publishing color→{color_topic} "
+          f"depth-aligned-to-color→{depth_topic}", flush=True)
+
+    # **The camera knows its own optics; say so out loud.** navi's avoidance
+    # corridor is metric, so every frame it converts its half-width back into a
+    # range of image columns using the horizontal field of view — and a wrong
+    # value there does not raise anything, it makes the robot refuse doorways
+    # while the depth map reports clear ahead. The D435i reports real intrinsics
+    # for the exact profile that was negotiated, which is the only source that
+    # accounts for the 4:3 crop this driver asks the 16:9 RGB sensor for.
+    #
+    # Sent over stdout because the parent already forwards it: no second pipe,
+    # no file, and the line stays in `docker logs` where somebody debugging a
+    # wrong field of view will look first. See `camera_specs.INTRINSICS_MARKER`.
+    try:
+        import json as _json
+        _streams = {}
+        for _name, _stream in (("color", rs.stream.color),
+                               ("depth_sensor", rs.stream.depth)):
+            _intr = (pipeline.get_active_profile()
+                     .get_stream(_stream).as_video_stream_profile().intrinsics)
+            _streams[_name] = {
+                "width": _intr.width, "height": _intr.height,
+                "fx": _intr.fx, "fy": _intr.fy,
+                "ppx": _intr.ppx, "ppy": _intr.ppy,
+                "model": str(_intr.model).rsplit(".", 1)[-1],
+                "coeffs": list(_intr.coeffs),
+            }
+        # rs.align projects the depth samples onto the color image plane.  Its
+        # output grid therefore has the color profile's geometry, not the raw
+        # depth sensor's geometry.  Keep the latter in the diagnostic payload
+        # under depth_sensor, but advertise the actual published output here.
+        _streams["depth"] = dict(_streams["color"])
+        print("[camera_subprocess] INTRINSICS " + _json.dumps(_streams), flush=True)
+    except Exception as _e:
+        # Not fatal: the cards fall back to the datasheet-derived declaration in
+        # `camera_specs.SPECS` and say `source` accordingly. Losing the camera
+        # over a failed introspection call would be the worse trade.
+        print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
 
     frame_count = 0
     t_start = _time.monotonic()
@@ -1567,6 +2409,8 @@ def _camera_subprocess(namespace: str):
             t0 = _time.monotonic()
             frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
+
+            frames = align_to_color.process(frames)
 
             color_frame = frames.get_color_frame()
             if color_frame:
@@ -1670,6 +2514,33 @@ class CameraPlugin:
         self._proc: subprocess.Popen | None = None
         self._frame_node = _CameraFrameNode(self._color_topic)
         executor.add_node(self._frame_node)
+        # What the RealSense reported about itself, keyed by stream name. Filled
+        # in by the stdout forwarder below once the pipeline negotiates a
+        # profile; empty until then, which is why `camera_specs` also carries a
+        # fallback — the declaration has to be answerable before the camera runs.
+        self._intrinsics: dict = {}
+        self._intrinsics_lock = threading.Lock()
+
+    def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
+        """This port's optics — `motus.camera/1`, see `camera_specs.py`.
+
+        The numbers live in a module that does not import rclpy, so they can be
+        asserted on a laptop. A field of view that is wrong by a factor of 1.6
+        does not raise anything; it makes the robot refuse doorways while the
+        depth map reports clear ahead.
+        """
+        from camera_specs import declare
+
+        with self._intrinsics_lock:
+            intrinsics = dict(self._intrinsics)
+        try:
+            return declare(tool_name, topic, fmt, intrinsics)
+        except Exception as exc:                              # noqa: BLE001
+            # A declaration this driver cannot build is a bug in this driver,
+            # and it must not take the camera's `info()` down with it — the
+            # consumer's own fallback is conservative and says so.
+            print(f"[camera] camera_info for {tool_name} failed: {exc}", flush=True)
+            return []
 
     def get_tools(self) -> list:
         return [
@@ -1685,7 +2556,7 @@ class CameraPlugin:
                 "name": "depth",
                 "type": "sensor",
                 "multiInstance": False,
-                "description": f"Bumi Realsense D435i depth camera — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
+                "description": f"Bumi Realsense D435i depth registered to the RGB image — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
             },
@@ -1702,8 +2573,20 @@ class CameraPlugin:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         def _fwd():
+            from camera_specs import parse_intrinsics_line
+
             for line in self._proc.stdout:
-                print(line.decode(errors='replace').rstrip(), flush=True)
+                text = line.decode(errors='replace').rstrip()
+                # Printed either way: the declaration is what the cards serve,
+                # but the line itself is what somebody debugging a wrong field
+                # of view will grep for in `docker logs`.
+                print(text, flush=True)
+                payload = parse_intrinsics_line(text)
+                if payload:
+                    with self._intrinsics_lock:
+                        self._intrinsics = payload
+                    print("[camera] adopted RealSense intrinsics for "
+                          + ", ".join(sorted(payload)), flush=True)
         threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
@@ -1724,10 +2607,15 @@ class CameraPlugin:
             return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
-            if tool_name == "camera":
-                return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
-            if tool_name == "depth":
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
+            topic_map = {
+                "camera": (self._color_topic, "image/jpeg"),
+                "depth": (self._depth_topic, "image/depth-zlib"),
+            }
+            if tool_name in topic_map:
+                topic, fmt = topic_map[tool_name]
+                return {"state": "running",
+                        "topic_out": [{"topic": topic, "format": fmt}],
+                        "camera_info": self._camera_info(tool_name, topic, fmt)}
             return {"state": "running"}
         return None
 
@@ -1809,14 +2697,31 @@ class _MotionStateNode(Node):
         self._high_ctrl = high_ctrl
         self._topic = f"/{namespace}/motion/state"
         self._pub = self.create_publisher(String, self._topic, 10)
+        # Second publisher, carrying the robot's own motion in motus.odom/1.
+        # Published *alongside* the vendor-shaped topic above rather than
+        # replacing it: that one has consumers not visible from inside this
+        # bundle, and a 10 Hz duplicate is much cheaper than finding out which.
+        self._odom_topic = f"/{namespace}/state/odom"
+        self._odom_pub = self.create_publisher(String, self._odom_topic, 10)
         self._interval_s = interval_s
         self._activity_velocity_threshold = activity_velocity_threshold
         self._running = False
         self._thread = None
+        self._odom_thread = None
+        self._odom_samples = 0
+        self._odom_burst_size = 0
+        # Consecutive SDK failures are one outage, not fifty independent
+        # warnings per second.  The first failure and every hundredth retain
+        # visibility; the first good sample announces recovery immediately.
+        self._odom_read_failures = 0
 
     @property
     def topic(self) -> str:
         return self._topic
+
+    @property
+    def odom_topic(self) -> str:
+        return self._odom_topic
 
     def start_polling(self):
         if self._running:
@@ -1824,11 +2729,91 @@ class _MotionStateNode(Node):
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="bumi_motion_state")
         self._thread.start()
+        self._odom_thread = threading.Thread(target=self._odom_loop, daemon=True,
+                                             name="bumi_odom")
+        self._odom_thread.start()
 
     def stop_polling(self):
         self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        for thread in (self._thread, self._odom_thread):
+            if thread and thread.is_alive():
+                thread.join(timeout=1.0)
+
+    # ── motus.odom/1 ─────────────────────────────────────────────────────────
+
+    def odom_health(self) -> dict:
+        import odom_spec
+
+        return {
+            "odom_samples": self._odom_samples,
+            # Raw IMU readings behind the last published average. Five on a
+            # healthy loop; 0 means nothing was read in the window and every
+            # axis of that sample was `null`, which is a different statement
+            # from a robot holding still.
+            "odom_burst_samples": self._odom_burst_size,
+            "odom_note": odom_spec.HEALTH_NOTE,
+        }
+
+    def _odom_loop(self):
+        """Read the IMU fast, publish the average slowly.
+
+        The shape of what goes out lives in `odom_spec`, which imports no rclpy
+        and is therefore assertable on a laptop — the `None`s in a sample are
+        the part of this that fails silently, so they are the part that must not
+        only be checkable on a robot.
+        """
+        import odom_spec
+
+        burst = []
+        last_publish = 0.0
+        while self._running:
+            try:
+                imu = self._high_ctrl.get_imu_data()
+                burst.append(odom_spec.reading(imu.angular_vel))
+            except Exception as exc:                          # noqa: BLE001
+                # A reading we could not take is not a reading of zero.
+                # Dropping it leaves the window holding only what was
+                # understood, and an empty window publishes all-`None`.
+                self._odom_read_failures += 1
+                if self._odom_read_failures == 1 or self._odom_read_failures % 100 == 0:
+                    self.get_logger().warn(
+                        f"motus.odom/1 read failed ({self._odom_read_failures}): {exc}")
+            else:
+                if self._odom_read_failures:
+                    self.get_logger().info(
+                        "motus.odom/1 read recovered after "
+                        f"{self._odom_read_failures} failure(s)")
+                    self._odom_read_failures = 0
+
+            now = time.monotonic()
+            if now - last_publish < odom_spec.PUBLISH_S:
+                time.sleep(odom_spec.SAMPLE_S)
+                continue
+            last_publish = now
+
+            readings, burst = burst, []
+            self._odom_burst_size = len(readings)
+            try:
+                mode = None
+                mode_name = ""
+                try:
+                    mode = int(self._high_ctrl.get_mode())
+                    mode_name = _WORKMODE_NAMES.get(mode, "unknown")
+                except Exception:                             # noqa: BLE001
+                    pass
+                sample = odom_spec.sample(
+                    readings, received_ms=int(time.time() * 1000),
+                    workmode=mode, workmode_name=mode_name)
+            except Exception as exc:                          # noqa: BLE001
+                self.get_logger().warn(f"motus.odom/1 publish failed: {exc}")
+                time.sleep(odom_spec.SAMPLE_S)
+                continue
+
+            message = String()
+            message.data = json.dumps(sample, ensure_ascii=False)
+            self._odom_pub.publish(message)
+            self._odom_samples += 1
+            time.sleep(odom_spec.SAMPLE_S)
 
     def _loop(self):
         while self._running:
@@ -1952,12 +2937,24 @@ class MotionStatePlugin:
         self._node = _MotionStateNode(namespace, high_ctrl, interval, activity_threshold)
         executor.add_node(self._node)
 
+    def _odom_interface(self) -> dict:
+        import odom_spec
+
+        return odom_spec.interface()
+
     def get_tool(self) -> dict:
         return {
             "name": "motion_state", "type": "sensor", "multiInstance": False,
-            "description": "Bumi 整机运动状态：持续输出工作模式、保护状态、运动判断、IMU 姿态与动态、关节运动统计、已确认的电机故障，以及全部 21 个关节的位置、速度、力矩、温度和原始错误值。不包含电池信息，也不控制机器人。",
+            "description": (
+                "Bumi 整机运动状态：持续输出工作模式、保护状态、运动判断、IMU 姿态与动态、"
+                "关节运动统计、已确认的电机故障，以及全部 21 个关节的位置、速度、力矩、温度"
+                f"和原始错误值。不包含电池信息，也不控制机器人。同一份 IMU 角速度另按 "
+                f"motus.odom/1 以 10 Hz 发到 {self._node.odom_topic}（机体系；"
+                "Bumi 的 SDK 不提供平移速度，vx/vy/vz 恒为 null）。"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._node.topic, "format": "data/json"},
+                          {"topic": self._node.odom_topic, "format": "state/odom"}],
         }
 
     def start(self):
@@ -1971,6 +2968,17 @@ class MotionStatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {
+                "state": "running",
+                "topic_out": [{"topic": self._node.topic, "format": "data/json"},
+                              {"topic": self._node.odom_topic,
+                               "format": "state/odom"}],
+                # Read once at start by anything that needs to know whether this
+                # robot reports its own motion, and which axes of it.
+                "odom_interface": self._odom_interface(),
+                **self._node.odom_health(),
+            }
         return None
 
 
@@ -1980,17 +2988,20 @@ CARD = "vision_capture"
 _FIRST_FRAME_TIMEOUT_S = 5.0
 
 
-def _vision_acp_notify(action_id, status, result, tool):
+def _acp_notify(action_id, status, result, tool):
     """Report the asynchronous terminal result using the same ACP API as Q5."""
-    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-    payload = json.dumps({"action_id": action_id, "status": status,
-                          "result": result, "tool": tool, "ts": time.time()}).encode()
-    request = urllib.request.Request(
-        f"{url}/api/acp/complete", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
-    # The local Agent Core endpoint uses a self-signed certificate.
-    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    # Build the payload inside the try: json.dumps or the env lookup raising
+    # must not escape the rotate worker's finally (it would skip the idle
+    # flip and wedge the busy-guard forever).
     try:
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        payload = json.dumps({"action_id": action_id, "status": status,
+                              "result": result, "tool": tool, "ts": time.time()}).encode()
+        request = urllib.request.Request(
+            f"{url}/api/acp/complete", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        # The local Agent Core endpoint uses a self-signed certificate.
+        context = ssl._create_unverified_context() if url.startswith("https://") else None
         with urllib.request.urlopen(request, timeout=5, context=context) as response:
             response.read()
     except Exception as exc:
@@ -2121,7 +3132,7 @@ class VisionCapturePlugin:
             if self._active_recording is active:
                 self._active_recording = None
             action_id = active["action_id"]
-        _vision_acp_notify(action_id, status, result, CARD)
+        _acp_notify(action_id, status, result, CARD)
         return True
 
     @staticmethod

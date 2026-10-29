@@ -84,13 +84,37 @@ def _get_local_ip() -> str:
     except ImportError:
         pass
     try:
-        s = socket.socket(socket.AF_DGRAM)
+        # Was `socket.AF_DGRAM`, which does not exist — the AttributeError was
+        # swallowed by the `except Exception` below, so this whole fallback was
+        # dead and always returned "". An empty local_ip makes the multicast join
+        # fall back to INADDR_ANY, letting the routing table pick the interface;
+        # on a robot with both the internal 192.168.123.x link and an office LAN
+        # that is a coin toss, and it fails silently either way.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("192.168.123.1", 1))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        # Only accept an address actually on the robot's own link. The routing
+        # table will happily answer with the office-LAN address when there is no
+        # 192.168.123.x route, and binding the multicast join to that interface
+        # means never receiving the mic stream at all — a confident wrong answer.
+        #
+        # Returning "" falls back to INADDR_ANY and lets the kernel choose, which
+        # is what this function did for its entire life while the typo made this
+        # branch unreachable. Keeping that behaviour for the non-robot case means
+        # fixing the typo cannot make anything worse than it already was.
+        return ip if ip.startswith("192.168.123.") else ""
     except Exception:
         return ""
+
+
+def _pcm_has_variation(pcm: bytes) -> bool:
+    """Return whether a PCM-16LE chunk contains more than one sample value."""
+    sample_count = len(pcm) // 2
+    if sample_count < 2:
+        return False
+    samples = struct.unpack_from(f"<{sample_count}h", pcm)
+    return min(samples) != max(samples)
 
 
 # ── MicPlugin (sensor) ───────────────────────────────────────────────────────
@@ -102,8 +126,24 @@ class _MicNode(Node):
         self._pub    = self.create_publisher(AudioChunk, topic, _LOW_LAT_QOS)
         self._sock:   socket.socket | None = None
         self._thread: threading.Thread | None = None
+        # The pump's own stop signal, separate from `_sock`.
+        #
+        # `_pump` used to loop on `while self._sock is not None` and re-read that
+        # attribute every iteration. A stop immediately followed by a start — the
+        # canvas does config→start→stop→config→start within seconds — could catch
+        # the old thread inside its publish loop; by the time it re-read
+        # `self._sock` it saw the *new* socket and carried on. Two pump threads
+        # then read the same socket, each assembling 1024-byte chunks from its own
+        # interleaved half of the packets, and every further stop/start could add
+        # another. The published audio is spliced from several misaligned streams,
+        # which is exactly what "ASR text repeats and drops syllables" looks like.
+        #
+        # An Event belongs to one capture session, so a thread signalled to stop
+        # stays stopped no matter what happens to `_sock` afterwards.
+        self._stop_evt = threading.Event()
         self.state   = "idle"
         self._packet_count = 0
+        self._varying_chunk_count = 0
         self._last_packet_ts = 0.0
         self.get_logger().info(f"MicNode ready — topic: {topic}")
 
@@ -123,26 +163,44 @@ class _MicNode(Node):
         sock.settimeout(0.5)
         self._sock   = sock
         self._packet_count = 0
-        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._varying_chunk_count = 0
+        stop_evt = threading.Event()
+        self._stop_evt = stop_evt
+        # The Event is passed in rather than read off `self`, so this thread can
+        # only ever be stopped by the session that created it.
+        self._thread = threading.Thread(
+            target=self._pump, args=(sock, stop_evt), daemon=True)
         self._thread.start()
         self.get_logger().info(f"Capture started — multicast {MIC_GROUP_IP}:{MIC_PORT}")
         return self._topic
 
     def stop_capture(self) -> None:
+        self._stop_evt.set()
         if self._sock:
             try:
                 self._sock.close()
             except Exception:
                 pass
             self._sock = None
+        # Wait for the pump to actually be gone before returning. Without this a
+        # start() arriving straight after could run alongside the previous pump,
+        # and two pumps splitting one packet stream is what garbles the audio.
+        # Bounded by the socket's 0.5s timeout; the join budget is well past it.
+        thread, self._thread = self._thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                self.get_logger().warning(
+                    "[mic] capture thread did not exit within 2s — "
+                    "it is signalled to stop and holds a closed socket")
         self.state = "idle"
         self.get_logger().info("Capture stopped")
 
-    def _pump(self) -> None:
+    def _pump(self, sock: socket.socket, stop_evt: threading.Event) -> None:
         buf = bytearray()
-        while self._sock is not None:
+        while not stop_evt.is_set():
             try:
-                data, _ = self._sock.recvfrom(65536)
+                data, _ = sock.recvfrom(65536)
             except socket.timeout:
                 continue
             except OSError:
@@ -150,9 +208,11 @@ class _MicNode(Node):
             self._packet_count += 1
             self._last_packet_ts = time.monotonic()
             buf.extend(data)
-            while len(buf) >= CHUNK_BYTES:
+            while len(buf) >= CHUNK_BYTES and not stop_evt.is_set():
                 chunk = bytes(buf[:CHUNK_BYTES])
                 buf   = buf[CHUNK_BYTES:]
+                if _pcm_has_variation(chunk):
+                    self._varying_chunk_count += 1
                 try:
                     msg = AudioChunk()
                     msg.header = Header()
@@ -208,14 +268,70 @@ class MicPlugin:
             }
         return None
 
+    def _rival_publishers(self) -> int:
+        """How many *other* nodes are publishing our audio topic.
+
+        Two publishers on one audio topic is silently catastrophic and has no
+        other symptom. Each captures the same multicast independently and cuts it
+        into 1024-byte chunks on its own buffer boundary, so a subscriber
+        receives two interleaved, misaligned copies — which ASR renders as
+        repeated and dropped syllables, pointing the investigation at the speech
+        stack rather than at the wiring.
+
+        It is easy to end up here: a second driver container left running
+        alongside the one compose manages. `ros_namespace` defaults to the
+        hostname, and both containers share the host's network namespace, so both
+        resolve to the identical topic name.
+
+        Counted rather than prevented — this node cannot stop another process —
+        but an `error` state with a reason beats inferring it from garbled text.
+
+        **Counted by number, not by name.** The first version of this excluded
+        our own publisher with `node_name != self._node.get_name()`, which is
+        wrong in precisely the case it was written for: the rival is a second
+        copy of this same driver, so its node is *also* called `g1_mic` and the
+        filter removed it too — the guard could never fire. Node names are not
+        unique in ROS 2; only GIDs are. We publish exactly one endpoint on this
+        topic, so anything beyond the first is somebody else, whatever it calls
+        itself.
+
+        `max(0, ...)` because our own publisher may not have reached the graph
+        yet. Under-counting there is the safe direction: a missed warning costs
+        an investigation, a false one costs a robot that refuses to start.
+        """
+        try:
+            infos = self._node.get_publishers_info_by_topic(self._topic)
+        except Exception:
+            return 0            # older rclpy, or the graph is not up yet
+        return max(0, len(infos) - 1)
+
     def _self_check(self) -> tuple[str, str]:
         """Verify mic pipeline: multicast receiving + ROS2 topic subscribable.
 
+        Check 0: nobody else is publishing this topic.
         Check 1: multicast packets arriving (in-process).
+        Check 1b: PCM actually varies (voice wake-up mode off → flat PCM).
         Check 2: ROS2 topic receivable from a subprocess (avoids same-process
                  FastDDS intra-participant matching issues).
         """
         import time as _t
+
+        rivals = self._rival_publishers()
+        if rivals:
+            # Confirm before refusing. The DDS graph does not drop an endpoint
+            # the instant its process dies, so right after someone stops the
+            # duplicate container the discovery data still lists it — and
+            # refusing then would turn the *fix* into what looks like a new
+            # fault. A second look a moment later costs one second on a path
+            # that already waits up to three for multicast.
+            _t.sleep(1.0)
+            rivals = self._rival_publishers()
+        if rivals:
+            self._node.state = "error"
+            return "error", (
+                f"{self._topic} 上还有另外 {rivals} 个发布者 —— 音频会被两路交错"
+                f"切分破坏，ASR 表现为文字重复、漏字。通常是同一台机器上多跑了一份"
+                f"驱动容器（compose 只管 embodied-unitree-g1），请停掉多余的那个。")
 
         # Check 1: multicast receiving
         if self._node._packet_count == 0:
@@ -225,6 +341,25 @@ class MicPlugin:
         if self._node._packet_count == 0:
             self._node.state = "error"
             return "error", "no multicast packets received in 3s"
+
+        # Check 1b: PCM variation. The robot can keep sending flat PCM while
+        # voice wake-up mode is off — packets arrive, but the samples never
+        # move, and downstream ASR would just hear silence forever. Require a
+        # new chunk with actual sample variation before start succeeds.
+        varying_before = self._node._varying_chunk_count
+        deadline = _t.monotonic() + 3.0
+        while (
+            _t.monotonic() < deadline
+            and self._node._varying_chunk_count == varying_before
+        ):
+            _t.sleep(0.1)
+
+        if self._node._varying_chunk_count == varying_before:
+            self._node.state = "error"
+            return "error", (
+                "麦克风启动失败：收到音频数据，但没有检测到声音波动。"
+                "请使用机器人遥控器同时按下 L1+L2，将语音状态切换为唤醒模式，"
+                "然后重新开启智能控制。")
 
         # Check 2: ROS2 topic receivable — use subprocess to avoid same-process DDS issues
         check_script = (
@@ -1013,207 +1148,7 @@ class SmartMotionPlugin:
 
 # ── LedPlugin (actuator) ─────────────────────────────────────────────────────
 
-class LedPlugin:
-    PREFIX = "led"
-
-    # State priority: higher number = higher priority
-    _PRIORITY = {'idle': 0, 'hearing': 1, 'thinking': 3, 'speaking': 4, 'error': 5}
-    # Auto-timeout per state (seconds). None = must be explicitly overridden.
-    _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
-
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
-        self._client = audio_client
-        self._state = 'idle'
-        self._state_ts = 0.0
-        self._state_lock = threading.Lock()
-        self._effect_thread = None
-        self._effect_stop = threading.Event()
-        self._hw_lock = threading.Lock()  # DDS RPC thread safety
-        self._timeout_timer = None
-
-    def _led_set(self, r: int, g: int, b: int) -> int:
-        """Thread-safe LED control with error logging."""
-        with self._hw_lock:
-            code = self._client.LedControl(r, g, b)
-            if code != 0:
-                print(f'[LED] LedControl({r},{g},{b}) failed: code={code}')
-            return code
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "led",
-            "type": "actuator",
-            "multiInstance": False,
-            "description": "G1 LED strip — state-driven (hook-triggered) or manual RGB control",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["state", "set", "off"],
-                        "description": "Action to perform",
-                    },
-                    "state": {
-                        "type": "string",
-                        "enum": ["idle", "hearing", "thinking", "speaking", "error"],
-                        "description": "Target LED state (for action=state)",
-                    },
-                    "r": {"type": "integer", "description": "Red 0-255"},
-                    "g": {"type": "integer", "description": "Green 0-255"},
-                    "b": {"type": "integer", "description": "Blue 0-255"},
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "state": {"params": ["state"], "description": "Transition LED to semantic state (priority-managed)"},
-                    "set":   {"params": ["r", "g", "b"], "description": "Manual RGB override (bypasses state machine)"},
-                    "off":   {"params": [], "description": "Turn off LED (resets state to idle)"},
-                },
-                "x-hooks": {
-                    "on_hearing":    {"action": "state", "params": {"state": "hearing"}},
-                    "on_thinking":   {"action": "state", "params": {"state": "thinking"}},
-                    "on_speaking":   {"action": "state", "params": {"state": "speaking"}},
-                    "on_idle":       {"action": "state", "params": {"state": "idle"}},
-                    "on_error":      {"action": "state", "params": {"state": "error"}},
-                },
-            },
-        }
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        self._stop_effect()
-        self._cancel_timeout()
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": self._state}
-        if action == "stop":
-            self._transition('idle')
-            return {"state": "idle"}
-        if action == "state":
-            new_state = args.get("state", "idle")
-            if new_state not in self._PRIORITY:
-                return {"error": f"unknown state: {new_state}"}
-            self._transition(new_state)
-            return {"state": self._state}
-        elif action == "set":
-            # Manual override: bypass state machine
-            self._transition('idle')
-            r = int(args.get("r", 0))
-            g = int(args.get("g", 0))
-            b = int(args.get("b", 0))
-            ret = self._led_set(r, g, b)
-            if ret != 0:
-                return {"error": f"LedControl failed (code={ret})", "ret": ret}
-            return {"ret": ret, "r": r, "g": g, "b": b}
-        elif action == "off":
-            self._transition('idle')
-            return {"state": "idle"}
-        return None
-
-    # ── State Machine ─────────────────────────────────────────────────────────
-
-    def _transition(self, new_state: str):
-        """Priority-based state transition. Higher priority overrides lower."""
-        import time as _time
-        with self._state_lock:
-            # Speaking min hold: don't allow idle to override within 1s
-            if self._state == 'speaking' and new_state == 'idle':
-                if _time.time() - self._state_ts < 1.0:
-                    return
-            if new_state not in ('idle', 'error'):
-                # Only allow transition to equal-or-higher priority
-                if self._PRIORITY.get(new_state, 0) <= self._PRIORITY.get(self._state, 0):
-                    return
-            self._state = new_state
-            self._state_ts = _time.time()
-
-        self._stop_effect()
-        self._cancel_timeout()
-
-        # Start the state's visual effect (skip idle — no-op)
-        effect_fn = getattr(self, f'_state_{new_state}', None)
-        if effect_fn and new_state != 'idle':
-            self._effect_stop.clear()
-            self._effect_thread = threading.Thread(target=effect_fn, daemon=True)
-            self._effect_thread.start()
-
-        # Schedule auto-timeout to idle (only if state hasn't changed)
-        timeout = self._TIMEOUT.get(new_state)
-        if timeout:
-            expected_state = new_state
-            def _timeout_cb(expected=expected_state):
-                with self._state_lock:
-                    if self._state != expected:
-                        return  # State was overridden by higher priority, don't fall back
-                self._transition('idle')
-            self._timeout_timer = threading.Timer(timeout, _timeout_cb)
-            self._timeout_timer.daemon = True
-            self._timeout_timer.start()
-
-    def _stop_effect(self):
-        """Stop any running effect thread."""
-        self._effect_stop.set()
-        if self._effect_thread and self._effect_thread.is_alive():
-            self._effect_thread.join(timeout=2)
-        # Do NOT clear here — cleared in _transition before starting new thread
-
-    def _cancel_timeout(self):
-        """Cancel pending auto-timeout timer."""
-        if self._timeout_timer:
-            self._timeout_timer.cancel()
-            self._timeout_timer = None
-
-    # ── State Effects ─────────────────────────────────────────────────────────
-
-    def _state_idle(self):
-        """No-op: let firmware blue blink do its thing."""
-        pass
-
-    def _state_hearing(self):
-        """Green solid — 30ms refresh to override firmware."""
-        while not self._effect_stop.is_set():
-            self._led_set(0, 255, 80)
-            if self._effect_stop.wait(0.03): return
-
-    def _state_thinking(self):
-        """Breathing rainbow cycle until overridden."""
-        import math
-        palette = [
-            (0, 200, 255),    # cyan
-            (80, 40, 255),    # blue-purple
-            (180, 0, 255),    # purple
-            (255, 0, 180),    # magenta
-        ]
-        step = 0
-        while not self._effect_stop.is_set():
-            t = (step % 200) / 200.0
-            idx = int(t * len(palette)) % len(palette)
-            next_idx = (idx + 1) % len(palette)
-            frac = (t * len(palette)) - idx
-            r = int(palette[idx][0] * (1 - frac) + palette[next_idx][0] * frac)
-            g = int(palette[idx][1] * (1 - frac) + palette[next_idx][1] * frac)
-            b = int(palette[idx][2] * (1 - frac) + palette[next_idx][2] * frac)
-            brightness = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(step * 0.06))
-            self._led_set(int(r * brightness), int(g * brightness), int(b * brightness))
-            step += 1
-            if self._effect_stop.wait(0.03): return
-
-    def _state_speaking(self):
-        """Tiffany blue solid — 30ms refresh to override firmware."""
-        while not self._effect_stop.is_set():
-            self._led_set(129, 216, 208)
-            if self._effect_stop.wait(0.03): return
-
-    def _state_error(self):
-        """Red solid — 30ms refresh to override firmware."""
-        import time as _time
-        end = _time.monotonic() + 5.0
-        while _time.monotonic() < end:
-            if self._effect_stop.is_set(): return
-            self._led_set(255, 0, 0)
-            if self._effect_stop.wait(0.03): return
+from led_control import LedPlugin  # Re-export for existing bundle imports.
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
@@ -1420,8 +1355,10 @@ class LocoPlugin:
         self._smart_motion = smart_motion
         self._namespace = namespace
         self._control_lock = threading.RLock()
-        self._move_timer: threading.Timer | None = None
         self._velocity_proposal_topic = DEFAULT_VELOCITY_PROPOSAL_TOPIC
+        # Direct clients and the subprocess fallback share the same deadline logic.
+        from timed_motion import TimedMotion
+        self._fallback_motion = TimedMotion(loco_client) if hasattr(loco_client, "BeginMove") else None
         # _LocoStateNode — authoritative fsm_id/fsm_mode from rt/sportmodestate.
         self._state_node = state_node
         # _LowStateNode — joint-derived posture, needed to tell lying from squatting
@@ -1615,17 +1552,23 @@ class LocoPlugin:
 
     def stop(self) -> None:
         with self._control_lock:
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
-            self._disconnect_velocity_proposal("driver_stop")
+            try:
+                self._disconnect_velocity_proposal("driver_stop")
+            finally:
+                if self._smart_motion:
+                    self._smart_motion.stop(reason="shutdown")
+                elif self._fallback_motion:
+                    self._fallback_motion.stop("shutdown")
 
     def _connect_velocity_proposal(self, args: dict) -> dict:
         try:
             topic = resolve_input_topic(args, self._velocity_proposal_topic)
             expected_nav_id = resolve_optional_expected_nav_id(args)
         except ValueError as exc:
-            self._client.StopMove()
+            if self._fallback_motion and not self._smart_motion:
+                self._fallback_motion.stop("proposal_bind_rejected")
+            else:
+                self._client.StopMove()
             if self._smart_motion:
                 self._smart_motion.unbind_velocity_proposal("proposal_bind_rejected")
             return {
@@ -1635,7 +1578,10 @@ class LocoPlugin:
                 "topic_in": [self._velocity_proposal_port()],
             }
         if not self._smart_motion:
-            self._client.StopMove()
+            if self._fallback_motion:
+                self._fallback_motion.stop("proposal_bind_rejected")
+            else:
+                self._client.StopMove()
             return {
                 "state": "error",
                 "connected": False,
@@ -1647,7 +1593,7 @@ class LocoPlugin:
             result.get("connected")
             and (result.get("armed") or result.get("awaiting_nav_id"))
         )
-        if result.get("error") or not connected_ready:
+        if (result.get("error") or not connected_ready) and not result.get("rejected"):
             result = dict(result)
             fallback_stop_ret = None
             fallback_stop_error = None
@@ -1667,7 +1613,10 @@ class LocoPlugin:
         # Main-process RPC is an independent first stop path.  It guarantees
         # StopMove precedes subscriber teardown even if SmartMotion IPC hangs
         # and the child has to be terminated fail-closed.
-        fallback_stop_ret = self._client.StopMove()
+        if self._fallback_motion and not self._smart_motion:
+            fallback_stop_ret = self._fallback_motion.stop(reason).get("ret")
+        else:
+            fallback_stop_ret = self._client.StopMove()
         if self._smart_motion:
             try:
                 result = self._smart_motion.unbind_velocity_proposal(reason)
@@ -1698,35 +1647,40 @@ class LocoPlugin:
             **({"error": f"StopMove failed: code={fallback_stop_ret}"} if fallback_stop_ret != 0 else {}),
         }
 
-    def _auto_stop(self):
-        """Timer 回调：自动停止运动"""
-        with self._control_lock:
-            self._move_timer = None
-            self._client.StopMove()
-
-    def _auto_stop_acp(self, action_id: str):
-        """Timer 回调：自动停止运动 + fire ACP callback."""
-        self._move_timer = None
-        self._client.StopMove()
-        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
-
-    def _acp_wait_move(self, action_id: str, duration: float):
-        """Wait for SmartMotion timed move to complete, then fire ACP callback."""
-        time.sleep(duration + 0.5)  # SmartMotion auto-stops after duration; small buffer
-        _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
+    def _acp_wait_move(self, action_id: str):
+        """Notify from this action's recorded stop outcome, never a fixed sleep."""
+        while True:
+            if self._smart_motion:
+                outcome = self._smart_motion.get_motion_result(action_id)
+            elif self._fallback_motion:
+                outcome = self._fallback_motion.get_result(action_id)
+            else:
+                outcome = self._client.GetMotionResult(action_id)
+            if outcome.get("error"):
+                _loco_acp_notify(action_id, "error", {"error": outcome["error"]}, tool="loco")
+                return
+            status = outcome.get("status")
+            if status in ("completed", "cancelled", "error"):
+                _loco_acp_notify(action_id, status, outcome.get("result", {}), tool="loco")
+                return
+            time.sleep(0.1)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        with self._control_lock:
-            try:
+        try:
+            # Do not hold the proposal lifecycle lock over a movement RPC wait:
+            # a concurrent stop must be able to reach its own stop path.
+            if action in {"move", "stop_move"}:
                 return self._dispatch_serialized(action, args)
-            except Exception as exc:
-                self._client.StopMove()
-                return {
-                    "state": "error",
-                    "connected": False,
-                    "error": f"loco safety fallback: {exc}",
-                    "topic_in": [self._velocity_proposal_port()],
-                }
+            with self._control_lock:
+                return self._dispatch_serialized(action, args)
+        except Exception as exc:
+            self._client.StopMove()
+            return {
+                "state": "error",
+                "connected": False,
+                "error": f"loco safety fallback: {exc}",
+                "topic_in": [self._velocity_proposal_port()],
+            }
 
     def _dispatch_serialized(self, action: str, args: dict) -> dict | None:
         tool_name = args.get("_tool_name", "loco")
@@ -1761,69 +1715,53 @@ class LocoPlugin:
                 **result,
             }
         if action == "move":
-            vx   = float(args.get("vx",   0))
-            vy   = float(args.get("vy",   0))
+            from uuid import uuid4
+            vx = float(args.get("vx", 0))
+            vy = float(args.get("vy", 0))
             vyaw = float(args.get("vyaw", 0))
             duration = float(args.get("duration", 0))
-
-            # Route through SmartMotion safety harness
+            if not all(math.isfinite(v) for v in (vx, vy, vyaw, duration)):
+                return {"error": "Motion parameters must be finite"}
+            action_id = f"g1_move_{uuid4().hex[:8]}"
             if self._smart_motion:
-                result = self._smart_motion.move(vx, vy, vyaw, duration)
-                if result.get("error"):
+                result = self._smart_motion.move(vx, vy, vyaw, duration, action_id=action_id)
+                if result.get("error") and not result.get("rejected"):
                     self._client.StopMove()
-                elif duration > 0:
-                    from uuid import uuid4
-                    action_id = f"g1_move_{uuid4().hex[:8]}"
-                    result["action_id"] = action_id
-                    # SmartMotion handles auto-stop internally; spawn thread to wait and notify
-                    threading.Thread(
-                        target=self._acp_wait_move,
-                        args=(action_id, duration),
-                        daemon=True,
-                    ).start()
-                return result
-
-            # Fallback: direct control (no safety harness)
-            vx   = max(-1.0, min(1.0, vx))
-            vy   = max(-1.0, min(1.0, vy))
-            vyaw = max(-2.0, min(2.0, vyaw))
-
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
-
-            if duration > 0:
-                from uuid import uuid4
-                action_id = f"g1_move_{uuid4().hex[:8]}"
-                # G1 SetVelocity duration has known bugs — use Timer fallback
-                ret = self._client.Move(vx, vy, vyaw, True)
-                self._move_timer = threading.Timer(duration, self._auto_stop_acp, args=[action_id])
-                self._move_timer.start()
-                return {"status": "moving", "action_id": action_id,
-                        "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
             else:
-                # Continuous move until explicit stop
-                ret = self._client.Move(vx, vy, vyaw, True)
-                return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+                vx = max(-1.0, min(1.0, vx))
+                vy = max(-1.0, min(1.0, vy))
+                vyaw = max(-2.0, min(2.0, vyaw))
+                if self._fallback_motion:
+                    result = self._fallback_motion.start(vx, vy, vyaw, duration, action_id)
+                else:
+                    result = self._client.TimedMove(vx, vy, vyaw, duration, action_id)
+            if duration <= 0:
+                # Continuous moves enter a state; keep identity internal so ACP
+                # does not register an unbounded pending completion.
+                return {key: value for key, value in result.items() if key != "action_id"}
+            if duration > 0 and result.get("action_id") == action_id:
+                threading.Thread(target=self._acp_wait_move, args=(action_id,), daemon=True).start()
+            return result
         elif action == "stop_move":
-            # Route through SmartMotion safety harness
             if self._smart_motion:
                 result = self._smart_motion.stop()
                 if result.get("error"):
                     self._client.StopMove()
                 return result
-
-            # Fallback: direct control
-            if self._move_timer:
-                self._move_timer.cancel()
-                self._move_timer = None
+            # Send the movement stop before waiting for navigation RPCs.
+            if self._fallback_motion:
+                result = self._fallback_motion.stop()
+            else:
+                ret = self._client.StopMove()
+                result = {"ret": ret, "state": "idle" if ret == 0 else "stop_failed"}
+                if ret != 0:
+                    result["error"] = f"StopMove failed or unconfirmed: code={ret}"
             if self._slam_client:
                 try:
                     self._slam_client.PauseNav()
                 except Exception:
                     pass
-            ret = self._client.StopMove()
-            return {"ret": ret}
+            return result
         elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
                         "squat2standup", "emergency_stop", "get_current_mode"):
             # x-action-params split: action is the mode directly
@@ -2122,9 +2060,11 @@ class ArmActionPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, arm_client):
         self._client = arm_client
+        self._stream = None
+        self._teleop_control = None
 
     def get_tool(self) -> dict:
-        return {
+        tool = {
             "name": "arm",
             "type": "actuator",
             "multiInstance": False,
@@ -2149,13 +2089,36 @@ class ArmActionPlugin:
             },
         }
 
+        if self._stream is not None:
+            motion = self._stream.motion_control
+            if getattr(self._stream, 'public_motion_topics', True):
+                tool.update(motion.arm_metadata())
+            tool['control_interface'] = motion.control_interface('joint_position')
+            props = tool['inputSchema']['properties']
+            props['action']['enum'] += ['info', 'start', 'stop', 'finish', 'finish_status']
+            props.update(instance_id={'type':'string'}, input_topic={'type':'string'},
+                         control_interface={'type':'object'}, control_interfaces={'type':'object'},
+                         operation_id={'type':'string'}, retry={'type':'boolean'})
+        return tool
+
     def start(self) -> None:
-        pass
+        if self._stream is not None: self._stream.start()
 
     def stop(self) -> None:
-        pass
+        if self._stream is not None: self._stream.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        release = action in ('release', 'finish') or (action == 'execute' and
+            (args.get('action_id') == 99 or str(args.get('gesture', '')).strip().lower() == 'release arm'))
+        if release and self._teleop_control is not None:
+            self._teleop_control.cancel_for_arm_release()
+        if action == 'info' and self._stream is not None:
+            metadata = (self._stream.motion_control.arm_metadata()
+                        if getattr(self._stream, 'public_motion_topics', True) else {})
+            return {**self._stream.info(), **metadata,
+                    'control_interface': self._stream.motion_control.control_interface('joint_position')}
+        if self._stream is not None and action in ('info','start','stop','finish','finish_status','release'):
+            return self._stream.dispatch(action, args)
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -2172,7 +2135,13 @@ class ArmActionPlugin:
                     return {"error": f"Unknown gesture: {args['gesture']}. Available: {list(_ARM_ACTION_MAP)}"}
             else:
                 return {"error": "Provide 'gesture' name or 'action_id'"}
-            ret = self._client.ExecuteAction(action_id)
+            if self._stream is not None:
+                if action_id == 99:
+                    return self._stream.dispatch('release', args)
+                with self._stream.legacy():
+                    ret = self._client.ExecuteAction(action_id)
+            else:
+                ret = self._client.ExecuteAction(action_id)
             return {"ret": ret, "action_id": action_id, "gesture": _ARM_ID_MAP.get(action_id, "unknown")}
         elif action == "release":
             ret = self._client.ExecuteAction(99)
@@ -2183,14 +2152,13 @@ class ArmActionPlugin:
 # ── StatePlugin (sensor) ─────────────────────────────────────────────────────
 
 class _LowStateNode(Node):
-    """Subscribes to DDS rt/lowstate + rt/lf/bmsstate and republishes to ROS2."""
+    """Publishes shared LowState plus independent BMS/mainboard DDS telemetry."""
 
-    _JOINTS_INTERVAL = 0.1   # 10 Hz throttle for joints
     _IMU_INTERVAL    = 0.05  # 20 Hz throttle for IMU
     _BMS_INTERVAL    = 1.0   # 1 Hz throttle for BMS
     _MAINBOARD_INTERVAL = 2.0  # 0.5 Hz throttle for mainboard
 
-    def __init__(self, imu_topic: str, battery_topic: str, joints_topic: str, mainboard_topic: str):
+    def __init__(self, imu_topic: str, battery_topic: str, joints_topic: str, mainboard_topic: str, *, low_state):
         super().__init__("g1_low_state")
         self._imu_pub       = self.create_publisher(String, imu_topic,       _LOW_LAT_QOS)
         self._battery_pub   = self.create_publisher(String, battery_topic,   _LOW_LAT_QOS)
@@ -2200,19 +2168,13 @@ class _LowStateNode(Node):
         self._last_battery: dict = {}
         self._last_posture: dict = {}
         self._lock = threading.Lock()
-        self._last_joints_time:    float = 0.0
-        self._last_imu_time:       float = 0.0
+        self._low_state = low_state
+        self._last_lowstate_sample = None
+        self._state_samples = 0
         self._last_bms_time:       float = 0.0
         self._last_mainboard_time: float = 0.0
 
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-            sub = ChannelSubscriber("rt/lowstate", LowState_)
-            sub.Init(self._on_state, 10)
-            self.get_logger().info(f"LowStateNode subscribed rt/lowstate → {imu_topic}, {joints_topic}")
-        except Exception as e:
-            self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lowstate: {e}")
+        self.create_timer(self._IMU_INTERVAL, self._poll_state)
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -2232,31 +2194,33 @@ class _LowStateNode(Node):
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lf/mainboardstate: {e}")
 
+    def _poll_state(self) -> None:
+        sample = self._low_state.snapshot()
+        if (sample is None or sample is self._last_lowstate_sample
+                or not 0 <= time.monotonic_ns()-sample.sampled_ns <= 200_000_000):
+            return
+        self._last_lowstate_sample = sample
+        self._on_state(sample.message)
+
     def _on_state(self, msg) -> None:
-        now = time.monotonic()
+        imu = msg.imu_state
+        imu_data = {
+            "quaternion":    list(imu.quaternion),
+            "gyroscope":     list(imu.gyroscope),
+            "accelerometer": list(imu.accelerometer),
+            "rpy":           list(imu.rpy),
+            "temperature":   float(imu.temperature),
+        }
+        with self._lock:
+            self._last_imu = imu_data
 
-        # IMU: throttle to 20 Hz
-        if now - self._last_imu_time >= self._IMU_INTERVAL:
-            self._last_imu_time = now
-            imu = msg.imu_state
-            imu_data = {
-                "quaternion":    list(imu.quaternion),
-                "gyroscope":     list(imu.gyroscope),
-                "accelerometer": list(imu.accelerometer),
-                "rpy":           list(imu.rpy),
-                "temperature":   float(imu.temperature),
-            }
-            with self._lock:
-                self._last_imu = imu_data
+        imu_out = String()
+        imu_out.data = json.dumps(imu_data)
+        self._imu_pub.publish(imu_out)
 
-            imu_out = String()
-            imu_out.data = json.dumps(imu_data)
-            self._imu_pub.publish(imu_out)
-
-        # Joints: throttle to 10 Hz
-        now = time.monotonic()
-        if now - self._last_joints_time >= self._JOINTS_INTERVAL:
-            self._last_joints_time = now
+        # One 20 Hz timer; every second new sample publishes joints at 10 Hz.
+        self._state_samples += 1
+        if self._state_samples % 2:
             joints = []
             for i, m in enumerate(msg.motor_state):
                 joints.append({
@@ -2374,12 +2338,13 @@ class _LowStateNode(Node):
 class StatePlugin:
     PREFIX = "state"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, *, low_state):
         self._imu_topic       = f"/{namespace}/state/imu"
         self._battery_topic   = f"/{namespace}/state/battery"
         self._joints_topic    = f"/{namespace}/state/joints"
         self._mainboard_topic = f"/{namespace}/state/mainboard"
-        self._node = _LowStateNode(self._imu_topic, self._battery_topic, self._joints_topic, self._mainboard_topic)
+        self._node = _LowStateNode(self._imu_topic, self._battery_topic, self._joints_topic, self._mainboard_topic,
+                                   low_state=low_state)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -2677,8 +2642,13 @@ class LidarPlugin:
 
     def stop(self) -> None:
         with self._lifecycle_lock:
+            # Navigation cloud has an independent worker shared with IMU. Close
+            # only its cloud gate before tearing down the legacy LiDAR node.
+            if self._navigation:
+                self._navigation.set_output("cloud", False)
             if self._node is None:
                 return
+            self._node.output_gate.set_enabled(False)
             self._node.close()
             self._executor.remove_node(self._node)
             self._node.destroy_node()
@@ -2691,6 +2661,8 @@ class LidarPlugin:
                     if action == "start":
                         self.start()
                     if self._node is None:
+                        if action == "stop" and self._navigation:
+                            self._navigation.set_output("cloud", False)
                         return {"state": "idle", "ready": False,
                                 "topic_out": self._cloud_tool()["topic_out"]}
                     if action != "info":
@@ -3979,97 +3951,6 @@ class SpatialPlugin:
         return None
 
 
-# ── MotionSwitcherPlugin (actuator) ──────────────────────────────────────────
-
-class MotionSwitcherPlugin:
-    PREFIX = "motion_switcher"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor, msc_client):
-        self._client = msc_client
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "motion_switcher",
-            "type": "actuator",
-            "multiInstance": False,
-            "description": (
-                "G1 high-level motion mode switcher — check current mode, select mode "
-                "(ai/normal/advanced), or release mode for low-level control. "
-                "Modes: ai=AI locomotion, normal=normal locomotion, advanced=advanced mode. "
-                "release frees control for lowcmd/dex3."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["check", "select", "release", "set_silent", "get_silent"],
-                        "description": "Action to perform",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["ai", "normal", "advanced"],
-                        "description": "Mode to select (for 'select' action)",
-                    },
-                    "silent": {
-                        "type": "boolean",
-                        "description": "Silent flag (for 'set_silent' action)",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "check":      {"params": [],         "description": "Check current motion mode"},
-                    "select":     {"params": ["mode"],   "description": "Select a motion mode (ai/normal/advanced)"},
-                    "release":    {"params": [],         "description": "Release current mode for low-level control"},
-                    "set_silent": {"params": ["silent"], "description": "Set silent mode on/off"},
-                    "get_silent": {"params": [],         "description": "Get current silent mode status"},
-                },
-            },
-        }
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "check":
-            if code != 0:
-                return {"error": f"CheckMode failed, code={code}"}
-            return {"mode": result}
-        elif action == "select":
-            mode = args.get("mode", "normal")
-            code, _ = self._client.SelectMode(mode)
-            if code != 0:
-                return {"error": f"SelectMode failed, code={code}"}
-            return {"ret": code, "selected": mode}
-        elif action == "release":
-            code, _ = self._client.ReleaseMode()
-            if code != 0:
-                return {"error": f"ReleaseMode failed, code={code}"}
-            return {"ret": code, "released": True}
-        elif action == "set_silent":
-            # SetSilent/GetSilent may not be exposed by the client—fallback gracefully
-            silent = bool(args.get("silent", True))
-            try:
-                code, _ = self._client.SetSilent()
-                return {"ret": code, "silent": silent}
-            except Exception as e:
-                return {"error": str(e)}
-        elif action == "get_silent":
-            try:
-                code, _ = self._client.GetSilent()
-                return {"ret": code}
-            except Exception as e:
-                return {"error": str(e)}
-        return None
-
-
 # ── RealSensePlugin (sensor) ─────────────────────────────────────────────────
 
 RS_COLOR_W, RS_COLOR_H, RS_COLOR_FPS = 1920, 1080, 15
@@ -4185,9 +4066,9 @@ class RealSensePlugin:
             "name": "camera_depth",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 (z16, mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
+            "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 zlib (mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]
+            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]
                          + self._frame_outputs("depth"),
         }
 
@@ -4404,7 +4285,7 @@ def run_realsense_process(
             super().__init__("g1_realsense")
             self._color_pub = self.create_publisher(CompressedImage, color_topic, _QOS)
             self._capture_pub = self.create_publisher(CompressedImage, color_topic + "_internal", _QOS)
-            self._depth_pub = self.create_publisher(Image, depth_topic, _QOS)
+            self._depth_pub = self.create_publisher(CompressedImage, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
             self._rgb_frame_pub = (
                 self.create_publisher(UInt8MultiArray, rgb_frame_topic, _QOS)
@@ -4689,15 +4570,15 @@ def run_realsense_process(
                 if token != gates["camera_depth"].token():
                     continue
                 try:
-                    msg = Image()
+                    # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
+                    import zlib as _zlib
+                    msg = CompressedImage()
                     msg.header.stamp = stamp
                     msg.header.frame_id = "camera_depth_optical_frame"
-                    msg.height = depth_np.shape[0]
-                    msg.width  = depth_np.shape[1]
-                    msg.encoding = "16UC1"
-                    msg.is_bigendian = 0
-                    msg.step = depth_np.shape[1] * 2
-                    msg.data = depth_np.tobytes()
+                    msg.format = "16UC1; compressedDepth zlib"
+                    # Legacy consumers expect little-endian uint16, compressed with zlib.
+                    msg.data = _zlib.compress(
+                        depth_np.astype("<u2", copy=False).tobytes(), 1)
                     if not gates["camera_depth"].publish(
                             token, self._depth_pub, msg, record=self._depth_frame_pub is None):
                         continue
@@ -4936,7 +4817,8 @@ class VisionCapturePlugin:
     PREFIX = "vision_capture"
 
     def __init__(self, plugin_config, namespace, executor, camera_plugin=None):
-        del namespace, executor
+        self._executor = executor
+        self._audio_topic = f"/{namespace}/mic/audio"
         self._camera = camera_plugin
         self._output_dir = Path(str(plugin_config.get(
             "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
@@ -4951,7 +4833,8 @@ class VisionCapturePlugin:
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": (
-                "Capture a G1 RGB photo or record a silent H.264 MP4 video "
+                "Capture a G1 RGB photo or record an H.264 MP4 video "
+                "with optional microphone AAC audio (off by default). "
                 "(1–30 seconds) to persistent storage. Requires the camera "
                 "card to remain enabled (plugins.camera.enabled=true)."),
             "inputSchema": {"type": "object", "properties": {
@@ -4963,17 +4846,25 @@ class VisionCapturePlugin:
                     "default": min(5, self._max_duration_s),
                     "description": "默认5s,最大30s",
                 },
+                "include_audio": {
+                    "type": "boolean", "default": False,
+                    "title": "录制麦克风声音",
+                    "description": (
+                        "默认关闭，保留原无声录像。开启后使用 Camera/Mic ROS 发布端时间戳"
+                        "对齐 VFR 视频与 AAC 音轨；不是硬件级同步。需启用 mic；"
+                        "无音频、长时间断音或只有零 PCM 时明确失败，不降级为无声录像。"),
+                },
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 RGB 相机是否就绪。"},
                     "capture_photo": {"params": [], "description": "保存当前 RGB 照片为 JPG。"},
-                    "record_video": {"params": ["duration_s"],
-                                     "description": "录制 RGB 视频，默认 5 秒。"},
+                    "record_video": {"params": ["duration_s", "include_audio"],
+                                     "description": "录制 RGB 视频，可选录制麦克风；默认 5 秒、无声。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
                     "stop": {"params": [], "description": "取消录像并删除未完成文件。"},
                 },
                 "x-completion": {"actions": ["record_video"],
-                                 "timeout": self._max_duration_s + 15}},
+                                 "timeout": self._max_duration_s + 45}},
         }
 
     def _camera_ready(self):
@@ -5013,7 +4904,7 @@ class VisionCapturePlugin:
                if frame else None)
         with self._recording_lock:
             active = ({key: self._active_recording.get(key) for key in (
-                "action_id", "state", "duration_s", "started_at", "path")}
+                "action_id", "state", "duration_s", "include_audio", "started_at", "path")}
                 if self._active_recording else None)
             last = self._last_recording
         ready = self._camera_ready() and age is not None
@@ -5113,6 +5004,9 @@ class VisionCapturePlugin:
                 pass
 
     def _record_video(self, active):
+        if active.get("include_audio", False):
+            from av_recording import record_av
+            return record_av(self, active)
         process = None
         path = None
         completed = False
@@ -5212,6 +5106,10 @@ class VisionCapturePlugin:
         if type(requested) is not int or not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION", "message":
                     f"duration_s must be an integer between 1 and {self._max_duration_s}"}
+        include_audio = args.get("include_audio", False)
+        if type(include_audio) is not bool:
+            return {"ok": False, "code": "INVALID_AUDIO_OPTION",
+                    "message": "include_audio must be a boolean"}
         if self._camera is None:
             return self._precondition_error()
         if not self._camera_ready():
@@ -5229,6 +5127,7 @@ class VisionCapturePlugin:
             active = {
                 "action_id": action_id, "state": "recording",
                 "duration_s": requested,
+                "include_audio": include_audio,
                 "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "cancel_event": threading.Event(), "process": None,
                 "path": None, "finished": False,
@@ -5241,6 +5140,7 @@ class VisionCapturePlugin:
             thread.start()
         return {"ok": True, "state": "queued", "action_id": action_id,
                 "media_type": "video", "requested_duration_s": requested,
+                "include_audio": include_audio,
                 "message": "Video recording started; completion will be reported asynchronously."}
 
     def stop(self):

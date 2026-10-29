@@ -188,6 +188,19 @@ class Go1Bundle:
             self._plugins.append(camera.make_camera_rgb(pc["camera_rgb"], namespace, executor, client))
             print("[bundle] camera_rgb loaded")
 
+        if pc.get("vision_capture", {}).get("enabled", False):
+            import vision_capture
+            # 共用机位配置（即使推流卡停用）；RGB 优先，拍照/录像卡仅显式覆盖所需字段。
+            capture_config = dict(pc["vision_capture"])
+            positions = {}
+            for name in ("camera_pointcloud", "camera_depth", "camera_rgb", "vision_capture"):
+                for position, endpoint in (pc.get(name, {}).get("positions") or {}).items():
+                    positions.setdefault(position, {}).update(endpoint)
+            capture_config["positions"] = positions
+            self._plugins.append(vision_capture.make_vision_capture(
+                capture_config, namespace, executor, client))
+            print("[bundle] vision_capture loaded")
+
         if pc.get("camera_depth", {}).get("enabled", False):
             import camera
             self._plugins.append(camera.make_camera_depth(pc["camera_depth"], namespace, executor, client))
@@ -213,7 +226,7 @@ class Go1Bundle:
     def stop_all(self):
         for p in self._plugins:
             try:
-                p.stop()
+                getattr(p, "shutdown", p.stop)()
             except Exception:
                 pass
         print("[bundle] All plugins stopped")
@@ -278,6 +291,25 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
+            # Receive a file into this container: `POST /file/upload`, the way a
+            # `format: file` tool argument reaches a service that shares no
+            # filesystem with agent-core. See common/file_intake.py.
+            #
+            # Two ordering requirements, both silent when violated: this must
+            # precede `self.rfile.read(...)`, which would consume the body the
+            # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+            # would 404 the upload before it is recognised.
+            #
+            # Imported here rather than at module level on purpose: several tests
+            # lift this handler out of main.py by AST and exec only the selected
+            # definitions, so a module global would be undefined there -- a
+            # NameError on every POST, including ordinary JSON-RPC.
+            try:
+                from common import file_intake as _file_intake
+            except ImportError:  # a checkout without common/ on the path
+                _file_intake = None
+            if _file_intake is not None and _file_intake.serve_upload(self):
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:

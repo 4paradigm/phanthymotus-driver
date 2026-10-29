@@ -1,0 +1,17 @@
+mcp_port: 15791
+robot:
+  url: ws://10.192.1.2:5000
+  # Optional identity lock. Blank learns the first notified serial for this process.
+  serial: ""
+  poll_interval_seconds: 0.5
+  response_timeout_seconds: 5
+  stale_after_seconds: 5
+plugins:
+  joint_state: {enabled: true}
+  arm_control: {enabled: true}
+  pose: {enabled: true}
+  move_head: {enabled: true}
+  gripper: {enabled: true}
+  camera: {enabled: true}
+  camera_left: {enabled: true}
+  camera_right: {enabled: true}

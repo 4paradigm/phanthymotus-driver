@@ -262,10 +262,11 @@ class CameraLifecycleTests(unittest.TestCase):
             np.array([[1000]], dtype="<u2"), None, None, 0,
             {"depth_scale_m": .001}, 1, gates["camera_depth"].token()))
         node._depth_loop()
-        self.assertEqual(node._depth_pub.messages[0].data, b"\xe8\x03")
+        import zlib
+        self.assertEqual(node._depth_pub.messages[0].format, "16UC1; compressedDepth zlib")
+        self.assertEqual(zlib.decompress(bytes(node._depth_pub.messages[0].data)), b"\xe8\x03")
         metadata, data = decode_envelope(bytes(node._depth_frame_pub.messages[0].data))
         self.assertEqual(metadata["schema"], DEPTH_SCHEMA)
-        import zlib
         self.assertEqual(zlib.decompress(data), b"\xe8\x03")
         self.assertTrue(gates["camera_depth"].status()["ready"])
 

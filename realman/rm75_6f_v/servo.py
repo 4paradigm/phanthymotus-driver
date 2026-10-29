@@ -120,6 +120,7 @@ class RM75ServoPlugin:
         self._rejects: list[str] = []
         # Paused means subscribed but not applying. See `_halt`.
         self._paused = False
+        self._motion_gate_held = False
 
     # ── tools ────────────────────────────────────────────────────────────────
 
@@ -214,30 +215,34 @@ class RM75ServoPlugin:
             return {"state": "error", "message": "RM75 SDK is not connected"}
         if self._ros2 is None:
             return {"state": "error", "message": "no ROS context; cannot subscribe"}
-
         sink = ControlSink(
             self._descriptor,
             self._apply,
             on_watchdog=self._slow_stop,
             on_abort=self._slow_stop,
         )
-        # Registered before it is started, so a concurrent stop can find and
-        # cancel it — common/control and perception's plugins share this rule.
+        # Check, acquire, reserve and subscribe under one lock. This prevents
+        # a duplicate start from leaking the shared gate and prevents stop()
+        # from racing between gate acquisition and _motion_gate_held=true.
         with self._lock:
             if self._running:
                 return {"state": "error", "message": f"already running on {self._input_topic}"}
+            if not self.client.motion_gate.acquire(blocking=False):
+                return {"state": "error", "message": "another arm operation is active"}
             self._sink = sink
             self._input_topic = topic
             self._running = True
             self._paused = False
-
-        try:
-            self._subscribe(topic)
-        except Exception as exc:
-            with self._lock:
+            self._motion_gate_held = True
+            try:
+                self._subscribe(topic)
+            except Exception as exc:
                 self._running = False
                 self._sink = None
-            return {"state": "error", "message": f"subscribe failed: {exc}"}
+                self._input_topic = ""
+                self._motion_gate_held = False
+                self.client.motion_gate.release()
+                return {"state": "error", "message": f"subscribe failed: {exc}"}
 
         print(f"[rm75] servo streaming from {topic}", flush=True)
         return {"state": "running", "input": topic,
@@ -262,13 +267,22 @@ class RM75ServoPlugin:
             self._running = False
             topic, self._input_topic = self._input_topic, ""
 
-        if node is not None:
-            try:
-                self._ros2.executor_core.remove_node(node)
-            finally:
-                node.destroy_node()
+        try:
+            if node is not None:
+                try:
+                    self._ros2.executor_core.remove_node(node)
+                finally:
+                    node.destroy_node()
+            if was_running:
+                self._slow_stop()
+        finally:
+            # Teardown can fail; the shared gate must be released even then.
+            with self._lock:
+                gate_held = self._motion_gate_held
+                self._motion_gate_held = False
+            if gate_held:
+                self.client.motion_gate.release()
         if was_running:
-            self._slow_stop()
             print(f"[rm75] servo stopped ({topic})", flush=True)
         return {"state": "idle"}
 
@@ -323,25 +337,29 @@ class RM75ServoPlugin:
             self._node = node
 
     def _on_message(self, message):
-        sink = self._sink
-        if sink is None or self._paused:
-            # Dropped, not queued: a command held through a pause was computed
-            # from a world that has moved on, and applying it at resume would
-            # be a jump from stale data.
-            return
         try:
             payload = json.loads(message.data)
         except Exception as exc:
             self._record(Verdict.REJECTED.value, f"undecodable payload: {exc}")
             return
-        outcome = sink.submit(payload)
+        # Hold the lifecycle lock through admission and application. stop()
+        # and pause() therefore cannot issue slow-stop and return while an
+        # already-admitted callback is still able to command the arm.
+        with self._lock:
+            sink = self._sink
+            if sink is None or self._paused:
+                # Dropped, not queued: a command held through a pause was
+                # computed from a world that has moved on.
+                return
+            outcome = sink.submit(payload)
         self._record(outcome.verdict.value, outcome.reason, outcome.warnings)
 
     def _tick(self):
-        sink = self._sink
-        if sink is None:
-            return
-        outcome = sink.tick()
+        with self._lock:
+            sink = self._sink
+            if sink is None or self._paused:
+                return
+            outcome = sink.tick()
         if outcome is not None:
             self._record(outcome.verdict.value, outcome.reason)
 

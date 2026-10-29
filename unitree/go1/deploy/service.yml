@@ -1,6 +1,6 @@
-unitree-go1-bundle:              # 服务名遵循 {provider}-{model}-{bundle} 约定
+unitree-go1:                     # 服务名遵循 {provider}-{model} 约定（与其余驱动对齐）
   image: __IMAGE__
-  container_name: embodied-unitree-go1-bundle
+  container_name: embodied-unitree-go1
   network_mode: host
   ipc: host
   pid: host
@@ -21,4 +21,11 @@ unitree-go1-bundle:              # 服务名遵循 {provider}-{model}-{bundle} �
     options:
       max-size: "10m"
       max-file: "3"
-  restart: unless-stopped
+  # always, not unless-stopped: after a host reboot the robot must come back
+  # on its own. G1 came up from one with every container still exited, and
+  # somebody had to SSH in to start them — until then the robot was simply
+  # gone, indistinguishable from a broken deployment. The cost is that a
+  # container stopped by hand also returns after a reboot; here that is the
+  # lesser surprise.
+  restart: always
+  stop_grace_period: 60s

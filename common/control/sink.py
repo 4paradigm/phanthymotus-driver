@@ -10,7 +10,7 @@ through all of it: dropped is the network being a network, rejected is somebody
 having wired something up wrong, and only the second is worth waking a person
 for.
 
-  1. contract        schema / mode / dof against the descriptor  → REJECTED
+  1. contract        schema / mode / dof / unit quaternions      → REJECTED
   2. freshness       ttl expiry, stale observation, seq regress  → DROPPED
   3. arbitration     priority, then latest seq                   → DROPPED
   4. step clamp      max_delta_per_step                          → CLAMPED
@@ -19,7 +19,29 @@ for.
   7. force-torque    per-axis absolute threshold                 → ABORTED
   8. continuity      *caller's job* — see below
   9. watchdog        no valid command within watchdog_ms         → hold
- 10. escalation      N consecutive watchdog periods              → abort
+ 10. escalation      N consecutive watchdog periods              → stand down
+
+**The two ways this stops are not the same stop, and conflating them cost a
+robot an afternoon.** A force-torque abort means the arm hit something: the next
+command is precisely the one that must not run, so it latches and only `reset()`
+clears it. A watchdog escalation means nobody has spoken for a while — its job,
+per step 10's own reasoning below, is to escalate the *response* so the arm does
+not hang in the air while an agent believes the action is still running. It is
+not a fault report, and it must not need a human.
+
+Making both latch produced a rule that contradicted itself: silence for four
+watchdog periods resumed on its own, silence for five needed an operator to tear
+the card down and rebuild it. Nothing about the robot differs across that 200 ms.
+Worse, the thing that routinely produces it is ordinary — restarting the card
+upstream takes longer than five periods, so reconfiguring a policy bricked the
+driver until somebody noticed.
+
+A stood-down sink therefore resumes on the next command that passes every check
+above. That is safe for the same reason the ordinary watchdog hold is safe:
+freshness (step 2) means a resuming command was computed from a recent
+observation, and the step clamp (step 4) still holds against `_last_values`,
+which survives. Whatever wires this class to a topic should announce the
+resumption, exactly as it should for a hold.
 
 Two of those are honest gaps rather than implementations:
 
@@ -56,10 +78,12 @@ fake clock on a laptop. See tests/test_control_sink.py.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 
+from . import rotation
 from .descriptor import SCHEMA, Descriptor, parse_descriptor
 
 
@@ -88,7 +112,39 @@ class Outcome:
 
 
 def _monotonic_ms() -> int:
+    """内部计时用：看门狗、速度、仲裁新鲜度。单调，不受 NTP 跳变影响。"""
     return int(time.monotonic() * 1000)
+
+
+def _wall_ms() -> int:
+    """**只**用来和消息里的 `stamp_ms` / `obs_stamp_ms` 比。
+
+    那两个字段由**另一个进程**打上，`motus.control/1` 把它们定义成 Unix 毫秒
+    （`actucore/plugins/vla/plugin.py` 发的就是 `int(time.time() * 1000)`）。拿单调
+    时钟去减一个 Unix 时间戳，得到的是「本机开机至今」减「1970 至今」——一个约
+    -1.79e12 的数。
+
+    后果不是报错，是**整条新鲜度检查静音**：`age` 永远是个巨大的负数，永远小于任何
+    `ttl`，于是过期指令和陈旧观测**全部放行**。实测：一条一小时前生成、基于一小时前
+    观测的指令，verdict 是 `applied`。
+
+    而这正是这个类的文档特意警告过的那件事 ——「set it generously and the protection
+    is gone while still appearing to be there」。它比那还糟：不是设得宽，是根本没在比。
+
+    内部计时仍然用单调时钟。跨进程比较需要共同的纪元，而时长测量不需要、且不该被
+    NTP 跳变影响 —— 两件事两个时钟，不是一个疏忽。
+    """
+    return int(time.time() * 1000)
+
+
+def _finite_number(value) -> bool:
+    """Whether a wire value is numeric and safe for comparisons/clamping."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 class ControlSink:
@@ -109,7 +165,11 @@ class ControlSink:
             holding an arm in the air indefinitely while the agent believes the
             action is still running.
         escalate_after: consecutive watchdog periods before escalating.
-        clock: `() -> int` milliseconds, monotonic. Injected for tests.
+        clock: `() -> int` milliseconds, monotonic — 内部计时（看门狗、速度）。
+            Injected for tests.
+        wall_clock: `() -> int` Unix 毫秒 —— **只**用来和消息里的 `stamp_ms` /
+            `obs_stamp_ms` 比，因为那两个字段是另一个进程按 Unix 纪元打的。
+            默认 `_wall_ms`；测试注入。两个时钟不是疏忽，见 `_wall_ms`。
     """
 
     def __init__(
@@ -121,6 +181,7 @@ class ControlSink:
         on_abort=None,
         escalate_after: int = 5,
         clock=None,
+        wall_clock=None,
     ):
         self.descriptor: Descriptor = (
             descriptor if isinstance(descriptor, Descriptor) else parse_descriptor(descriptor)
@@ -128,11 +189,29 @@ class ControlSink:
         if escalate_after < 1:
             raise ValueError("escalate_after must be at least 1")
 
+        # Where the orientations live. Derived once: the descriptor is frozen
+        # precisely so cached values like this cannot go stale under a running
+        # sink. `_quat_component_indices` is the same information as a set, so
+        # the per-value loops can skip those slots with one lookup.
+        self._eef_quat_offsets = self.descriptor.eef_quat_offsets
+        self._quat_component_indices = frozenset(
+            offset + i for offset in self._eef_quat_offsets for i in range(4)
+        )
+        # 声明为 advisory 的那些维：驱动收下但不执行（见 `descriptor.Group`）。
+        # 检查一个不会被执行的数没有意义 —— 而更糟的是，一个为「这台机器人动不
+        # 了这个轴」而卡死的限位会把**整条**指令拒掉，连同那些本可以执行的维。
+        # G1 的 1 自由度腰上就是这样：25 步全数在 waist_roll 的 ±0.02 处被拒。
+        self._advisory_indices = self.descriptor.advisory_indices
+
         self._apply = apply
         self._on_watchdog = on_watchdog
         self._on_abort = on_abort if on_abort is not None else on_watchdog
         self._escalate_after = escalate_after
         self._clock = clock or _monotonic_ms
+        # **故意不回退到 `clock`。** 「只注入 clock 就让两个时钟合一」正是让这个
+        # bug 活下来的那个条件：测试于是永远在「stamp 和 now 同一个纪元」的前提下
+        # 跑，而那恰恰是真实链路上不成立的。要同一个纪元的测试必须显式说出来。
+        self._wall_clock = wall_clock or _wall_ms
 
         # Last command actually applied — the baseline for step clamping and
         # for the velocity check.
@@ -146,7 +225,11 @@ class ControlSink:
 
         self._active = False           # has anything ever been applied
         self._holding = False          # watchdog has fired and not yet cleared
-        self._aborted = False
+        # The two stops. `_latched` is force-torque: nothing runs until reset().
+        # `_stood_down` is watchdog escalation: the next command that passes
+        # every check resumes. See the header for why they differ.
+        self._latched = False
+        self._stood_down = False
         self._watchdog_strikes = 0
         self._last_watchdog_ms: int | None = None
 
@@ -156,7 +239,7 @@ class ControlSink:
 
     def submit(self, message: dict) -> Outcome:
         """Run one command through the chain. Calls `apply` only if it passes."""
-        if self._aborted:
+        if self._latched:
             return self._count(Outcome(Verdict.ABORTED, "sink is aborted; call reset()"))
 
         now = self._clock()
@@ -165,7 +248,7 @@ class ControlSink:
         if outcome is not None:
             return self._count(outcome)
 
-        outcome = self._check_freshness(message, now)
+        outcome = self._check_freshness(message, self._wall_clock())
         if outcome is not None:
             return self._count(outcome)
 
@@ -193,6 +276,11 @@ class ControlSink:
         self._last_apply_ms = now
         self._active = True
         self._holding = False
+        # A command that passed every check is the evidence the silence is over,
+        # so it is also what ends a stand-down. Cleared here rather than at the
+        # top of submit(): a command that then gets dropped or rejected is not
+        # evidence of anything.
+        self._stood_down = False
         self._watchdog_strikes = 0
         self._last_watchdog_ms = None
 
@@ -207,7 +295,10 @@ class ControlSink:
         condition: nothing has been promised yet, and firing here would mean
         every card reports a fault before it is used.
         """
-        if self._aborted or not self._active:
+        # A stood-down sink stops ticking until something resumes it: otherwise
+        # every further period would fire `on_abort` again, and a driver whose
+        # abort handler returns to a safe pose would keep re-issuing that.
+        if self._latched or self._stood_down or not self._active:
             return None
 
         now = self._clock()
@@ -227,7 +318,7 @@ class ControlSink:
         self._watchdog_strikes += 1
 
         if self._watchdog_strikes >= self._escalate_after:
-            return self._count(self._abort(
+            return self._count(self._stand_down(
                 f"no valid command for {self._watchdog_strikes} watchdog periods "
                 f"({since} ms)"
             ))
@@ -249,7 +340,9 @@ class ControlSink:
         absence of a call.
         """
         thresholds = self.descriptor.force_torque
-        if thresholds is None or self._aborted:
+        # Checked even while stood down: a stood-down sink is one nobody is
+        # talking to, not one whose arm has stopped being able to hit something.
+        if thresholds is None or self._latched:
             return None
         for i, value in enumerate(readings):
             if i >= len(thresholds):
@@ -275,13 +368,19 @@ class ControlSink:
         self._seq_by_source.clear()
         self._active = False
         self._holding = False
-        self._aborted = False
+        self._latched = False
+        self._stood_down = False
         self._watchdog_strikes = 0
         self._last_watchdog_ms = None
 
     @property
     def aborted(self) -> bool:
-        return self._aborted
+        """Refusing everything until `reset()` — i.e. force-torque only.
+
+        A stood-down sink is not aborted in this sense: it is holding and will
+        resume on its own. `stats()["stood_down"]` is where to look for that.
+        """
+        return self._latched
 
     @property
     def holding(self) -> bool:
@@ -291,7 +390,12 @@ class ControlSink:
         return {
             "active": self._active,
             "holding": self._holding,
-            "aborted": self._aborted,
+            # Two fields, because they call for different actions: `aborted`
+            # needs a person, `stood_down` needs only the upstream to start
+            # talking again. One field meaning both is what made a routine
+            # restart look like a fault.
+            "aborted": self._latched,
+            "stood_down": self._stood_down,
             "holder": self._holder,
             "watchdog_strikes": self._watchdog_strikes,
             "counters": dict(self.counters),
@@ -337,8 +441,26 @@ class ControlSink:
                 f"values has {len(values)} entries but dof is {self.descriptor.dof}",
             )
         for i, value in enumerate(values):
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return Outcome(Verdict.REJECTED, f"values[{i}] is not a number: {value!r}")
+            if not _finite_number(value):
+                return Outcome(Verdict.REJECTED,
+                               f"values[{i}] is not a finite number: {value!r}")
+
+        # Every `eef_pose` segment's quaternion must be unit length. This is
+        # the one check in the whole chain that can catch a *different rotation
+        # representation* arriving in the right number of slots: an rpy triple
+        # or the first four of an R6 block has no reason to land on the unit
+        # sphere. See descriptor.EEF_POSE_STRIDE for why the layout is a
+        # quaternion at all — this check is the entire reason.
+        for offset in self._eef_quat_offsets:
+            quaternion = values[offset:offset + 4]
+            if not rotation.is_unit(quaternion):
+                return Outcome(
+                    Verdict.REJECTED,
+                    f"values[{offset}:{offset + 4}] is not a unit quaternion "
+                    f"(|q| = {rotation.norm(quaternion):.4f}) — an eef_pose is "
+                    "[x, y, z, qx, qy, qz, qw] with the rotation as a unit "
+                    "quaternion in xyzw order",
+                )
 
         if not isinstance(message.get("source"), str) or not message["source"]:
             return Outcome(Verdict.REJECTED, "source is required and must be a string")
@@ -353,10 +475,11 @@ class ControlSink:
         """
         stamp = message.get("stamp_ms")
         ttl = message.get("ttl_ms")
-        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
-            return Outcome(Verdict.REJECTED, "stamp_ms is required")
-        if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
-            return Outcome(Verdict.REJECTED, "ttl_ms is required and must be positive")
+        if not _finite_number(stamp):
+            return Outcome(Verdict.REJECTED, "stamp_ms is required and must be finite")
+        if not _finite_number(ttl) or ttl <= 0:
+            return Outcome(Verdict.REJECTED,
+                           "ttl_ms is required, finite, and must be positive")
 
         age = now - stamp
         if age > ttl:
@@ -364,6 +487,8 @@ class ControlSink:
 
         max_obs_age = self.descriptor.max_obs_age_ms
         obs_stamp = message.get("obs_stamp_ms")
+        if obs_stamp is not None and not _finite_number(obs_stamp):
+            return Outcome(Verdict.REJECTED, "obs_stamp_ms must be finite")
         if max_obs_age is not None and isinstance(obs_stamp, (int, float)):
             obs_age = now - obs_stamp
             if obs_age > max_obs_age:
@@ -391,8 +516,9 @@ class ControlSink:
         """
         source = message["source"]
         priority = message.get("priority", 0)
-        if isinstance(priority, bool) or not isinstance(priority, (int, float)):
-            return Outcome(Verdict.REJECTED, f"priority is not a number: {priority!r}")
+        if not _finite_number(priority):
+            return Outcome(Verdict.REJECTED,
+                           f"priority is not a finite number: {priority!r}")
         priority = int(priority)
 
         holder_stale = (
@@ -429,6 +555,10 @@ class ControlSink:
         out = list(values)
         clamped = []
         for i, (want, previous, limit) in enumerate(zip(values, self._last_values, limits)):
+            if i in self._advisory_indices or i in self._quat_component_indices:
+                # 不执行的维不必钳 —— 钳了只会让状态回报里那个数看起来被平滑过，
+                # 而它根本没有去过任何地方。姿态在下面按角度整体钳。
+                continue
             delta = want - previous
             if delta > limit:
                 out[i] = previous + limit
@@ -436,6 +566,22 @@ class ControlSink:
             elif delta < -limit:
                 out[i] = previous - limit
                 clamped.append(self.descriptor.joint_names[i])
+
+        # An orientation is clamped as an angle, not component by component.
+        # Clamping x, y, z and w independently yields a vector that is no
+        # longer unit length, which `_check_contract` then rejects on the
+        # *next* message — so the naive version shows up as "everything is
+        # rejected once the policy speeds up", with nothing pointing here.
+        # `max_delta_per_step` at the `qx` slot is read as radians per step;
+        # the other three slots of that quaternion are unused.
+        for offset in self._eef_quat_offsets:
+            span = slice(offset, offset + 4)
+            limited_quaternion, was_limited = rotation.slerp_limit(
+                self._last_values[span], values[span], limits[offset]
+            )
+            if was_limited:
+                out[span] = list(limited_quaternion)
+                clamped.append(self.descriptor.joint_names[offset])
         return tuple(out), clamped
 
     def _check_hard_limits(self, values: tuple[float, ...], now: int) -> Outcome | None:
@@ -449,6 +595,16 @@ class ControlSink:
         which holds — a state the policy can at least observe.
         """
         for i, value in enumerate(values):
+            if i in self._advisory_indices:
+                continue             # 不执行的维，限位无从谈起
+            if i in self._quat_component_indices:
+                # A quaternion component's bound carries no physical meaning —
+                # every unit quaternion has all four in [-1, 1], and the same
+                # orientation can be written with any of them negated. The
+                # orientation's actual bound is the arm's joint limits, which
+                # the IK solver enforces. Checking here would reject valid
+                # poses for arithmetic reasons.
+                continue
             lo, hi = self.descriptor.lower[i], self.descriptor.upper[i]
             if value < lo or value > hi:
                 return Outcome(
@@ -464,6 +620,8 @@ class ControlSink:
         if dt <= 0:
             return None
         for i, (value, previous) in enumerate(zip(values, self._last_values)):
+            if i in self._advisory_indices or i in self._quat_component_indices:
+                continue             # 不执行的维；四元数的角速度在下面单独算
             speed = abs(value - previous) / dt
             if speed > max_velocity[i]:
                 return Outcome(
@@ -471,12 +629,37 @@ class ControlSink:
                     f"{self.descriptor.joint_names[i]} would move at {speed:.3f} "
                     f"(limit {max_velocity[i]})",
                 )
+        # Angular speed per orientation, in rad/s, against the limit declared
+        # at the `qx` slot — the same convention as the step clamp above.
+        for offset in self._eef_quat_offsets:
+            span = slice(offset, offset + 4)
+            speed = rotation.angle_between(self._last_values[span], values[span]) / dt
+            if speed > max_velocity[offset]:
+                return Outcome(
+                    Verdict.REJECTED,
+                    f"{self.descriptor.joint_names[offset]} would rotate at "
+                    f"{speed:.3f} rad/s (limit {max_velocity[offset]})",
+                )
         return None
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _abort(self, reason: str) -> Outcome:
-        self._aborted = True
+        """Force-torque. Latches: only `reset()` gets out of this."""
+        self._latched = True
+        self._holding = True
+        if self._on_abort is not None:
+            self._on_abort()
+        return Outcome(Verdict.ABORTED, reason)
+
+    def _stand_down(self, reason: str) -> Outcome:
+        """Watchdog escalation. Same response, but it does not latch.
+
+        Reported as ABORTED because that is what it is to the operator watching
+        — the card has stopped driving and said why — while the sink itself
+        stays willing to resume on a command that passes every check.
+        """
+        self._stood_down = True
         self._holding = True
         if self._on_abort is not None:
             self._on_abort()

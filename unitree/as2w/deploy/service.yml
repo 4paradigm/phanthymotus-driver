@@ -14,14 +14,22 @@ unitree-as2w:
     - /unitree/module:/unitree/module:ro
     - /home/unitree/maps:/home/unitree/maps
   environment:
-    - NETWORK_INTERFACE=eth0
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    # Safe discovery is the default. Override explicitly for a known interface
+    # or non-standard subnet, e.g. NETWORK_INTERFACE=eno1 docker compose up -d.
+    - NETWORK_INTERFACE=${NETWORK_INTERFACE:-auto}
     - PYTHONUNBUFFERED=1
   logging:
     driver: local
     options:
       max-size: "10m"
       max-file: "3"
-  restart: unless-stopped
+  # always, not unless-stopped: after a host reboot the robot must come back
+  # on its own. G1 came up from one with every container still exited, and
+  # somebody had to SSH in to start them — until then the robot was simply
+  # gone, indistinguishable from a broken deployment. The cost is that a
+  # container stopped by hand also returns after a reboot; here that is the
+  # lesser surprise.
+  restart: always

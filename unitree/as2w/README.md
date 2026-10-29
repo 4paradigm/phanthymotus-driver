@@ -6,15 +6,19 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `unitree_sdk2py.as2.sport.SportClient`: `Move`, `StopMove`, `StandUp`, `StandDown`,
 `BalanceStand`, `RecoveryStand`, `Damp`, `Euler`, `BodyHeight`, `BodyPosition`,
 `SwitchGait`, `SpeedLevel`, `SwitchJoystick`, `SetAutoRecovery`, `GetState`,
-`FrontFlip`, and `BackFlip`.
+`FrontFlip`, `BackFlip`, `HandStand`, and `BipedStand`.
 
-Run `python3 main.py <robot-interface>` on the robot network (normally `eth0`,
-the interface with a `192.168.123.x` address). The deployment explicitly sets
-`NETWORK_INTERFACE=eth0`; override it for a differently named robot adapter.
-If that interface is absent or CycloneDDS cannot bind to it, the entry point
-starts MCP in degraded mode without DDS publishers. It never falls back to
-Wi-Fi, because that would register a driver that cannot talk to the robot. The
-bundle exposes MCP on port
+The driver accepts an explicit robot interface from a command-line argument or
+`NETWORK_INTERFACE`, for example `NETWORK_INTERFACE=eno1`. The shipped service
+declares `${NETWORK_INTERFACE:-auto}`, so deployments on another subnet can set
+the value before Compose renders the service instead of editing driver code. Command-line values
+take priority over the environment, followed by `robot_interface` in
+`config.yaml`. An empty value or `auto` enables safe discovery: the driver
+selects a unique, UP, wired, non-virtual interface on Unitree's
+`192.168.123.0/24` robot network. It never falls back to an arbitrary Wi-Fi or
+office-network interface. If no unique robot interface can be identified, or
+CycloneDDS cannot bind to the selected interface, MCP starts in degraded mode
+without DDS publishers. The bundle exposes MCP on port
 `15709`, publishes JSON state streams under the resolved ROS namespace, and
 uses a dedicated process for RPC calls so ROS callbacks cannot starve SDK
 responses.
@@ -30,15 +34,86 @@ runtime dependencies and are required on both amd64 and aarch64.
 
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
-attitude inputs are clamped before reaching the robot. Special actions should only
+attitude inputs are clamped before reaching the robot. Special motions should only
 be invoked with a clear area and appropriate operator approval.
+
+The call-shaped `loco.move` card follows the AS2 convention used by PR #308:
+public `vyaw` is degrees per second in the range +/-120 and is converted once
+to radians per second at the Unitree SDK boundary. `body_height` is an absolute
+AS2 target in the tested 0.17-0.50 m range, uses a 0.01 m canvas adjustment
+step, and is accepted only from a standing, non-walking state. This command
+target is separate from `loco_state.body_height`,
+whose observed telemetry range is approximately 0-0.4 m. `Damp` and `Euler`
+remain available inside the vendor SDK but are intentionally not exposed as
+card actions. After `StopMove`, the driver uses `BalanceStand` to normalize
+firmware that continues reporting the stale `AI_FREE_WALK` label.
+
+`loco_state` retains its `data/json` output at `/<namespace>/loco/state`
+and also publishes `state/odom` at `/<namespace>/state/odom` for visual
+navigation. The new JSON stream uses `motus.odom/1`: body-frame twist ordered
+as `[vx, vy, vz, wx, wy, wz]`, with unmeasured axes represented by `null`.
+It reports vx, vy and yaw speed; no pose is declared. `start` and `info`
+return both output ports and the `odom_interface` declaration.
+
+The vendor-shaped `loco/state` JSON names its vectors explicitly as
+`velocity_x/y/z` and `position_x/y/z`; numeric suffixes are not published.
+Its planar velocity and position retain the firmware's odometry-world axes.
+For navigation, `state/odom` rotates each velocity reading by its own IMU yaw
+into the standard body convention: positive X is forward, positive Y is left,
+and positive Z is up. Its yaw rate comes from `imu_state.gyroscope[2]`, because
+the deployed firmware's `yaw_speed` remains zero during measured rotation.
+On the deployed AS2-W firmware the dedicated `SportModeState.body_height`
+field remains zero, while `position_z` carries the measured body height.
+Accordingly, `body_height` mirrors `position_z`; its observed range is
+approximately 0 to 0.4 m, where 0 means lying down and 0.4 means standing.
+
+`loco_servo` consumes a wired `control/velocity` topic carrying
+`motus.control/1` twist commands. Bundle startup is inert; canvas `start`
+requires `input_topic` (or `input_topics`). It uses the shared ControlSink for
+contract validation, freshness, source arbitration, speed limits and command
+step limits, and calls the AS2 three-argument `Move(vx, vy, vyaw)` API.
+Unsupported vz/wx/wy axes are pinned to zero. Stream silence triggers
+`StopMove` after 300 ms, checked by a 150 ms timer. Invalid posture or a failed
+Move RPC also stops motion. The card supports `pause`, `resume`, `info` and
+runtime `config` for `dry_run`, `rotate_only` and `require_standing`.
+It starts in `dry_run`; changing to live control requires an explicit
+`confirm=true`. The driver also prevents it from running concurrently with
+manual `loco`, `special_motion`, or vendor `controlled_spatial` navigation.
+Starting and resuming the card validate the AS2 motion posture before arming
+the stream; changing an already-running card from dry-run to live control does
+the same. Every command checks again as a defensive fallback. Failed state RPCs
+therefore fail closed before the ROS subscription is opened or motion resumes.
+
+Until AS2-W motion response is measured, `loco_servo` uses an initial indoor
+envelope of vx +/-0.30 m/s, vy +/-0.10 m/s and yaw +/-0.40 rad/s. At the
+default 10 Hz, command changes are limited to 0.03 m/s forward, 0.02 m/s
+lateral and 0.05 rad/s yaw per tick. These are commissioning limits, not
+vendor performance claims; raise them only after direction, deadband, stopping
+distance and lateral support have been verified on the deployed firmware.
+The 300 ms watchdog and 500 ms maximum observation age are likewise provisional
+commissioning bounds, not measured AS2-W stopping guarantees. Keep `dry_run`
+enabled until end-to-end message latency, silence-to-StopMove time, and physical
+stopping distance have been recorded on the deployed robot and firmware.
+
+Explicit `loco.move` and `loco.stop_move` pause the policy stream before
+sending their commands. Servo start/resume refuses while loco owns a movement;
+stopping a preempted servo does not stop that manual movement. After stopping
+loco, explicitly resume the policy. AS2 speed deadbands have not been measured,
+so the descriptor does not copy R1's gait thresholds. The navigation footprint
+uses Unitree's published AS2-W standing envelope (721 x 493 x 521 mm): the
+descriptor declares a 0.2465 m half-width and navi adds its own motion margin.
+The velocity frame and physical stop behavior still need verification on AS2W.
 
 The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
 the kinematic chain for the `joints` skeleton card, avoiding large binary
-assets in the repository. As2W has 16 movable joints (12 leg joints plus 4
-continuous wheel-foot joints) and the fixed JT128 sensor mount.
+assets in the repository. Its simple calf boxes use the official-model visual
+offsets (-0.16915 m front, -0.18449 m rear), so they extend down from their
+joint frames instead of being centered on them. As2W has 16 movable joints (12 leg joints plus 4
+continuous wheel-foot joints) and the fixed JT128 sensor mount. The live
+`joints`/`joint_state` cards intentionally publish the 12 populated leg-motor
+slots from LowState; the remaining vendor array slots are reserved zeros.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
 service: mapping, relocalization, and point-goal navigation. The latest AS2
@@ -46,10 +121,167 @@ SDK does not package a model-specific SLAM client, so the driver implements the
 documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
+Navigation shares the chassis with `loco`, `loco_servo`, and `special_motion`;
+the driver serializes those owners and pauses the servo stream before starting
+vendor navigation rather than allowing two command sources to drive together.
 
-`special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
+`slam_mapping` is the matching read-only visualization card. It listens to the
+vendor mapping and relocation point-cloud topics plus `rt/slam_info`, keeps a
+bounded voxel map, and publishes the shared `sensor/mapping` packet on
+`/<namespace>/spatial/mapping`. The control and visualization cards are kept
+separate, following the G1/Go2 card contract, so stopping the dashboard view
+does not interrupt mapping or navigation.
+
+`special_motion` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
-continuous `loco` control card.
+continuous `loco` control card. Dangerous motions validate the current FSM
+state and require the literal boolean `confirm=true` before dispatch. Flips
+are one-shot; handstand and biped stand are sustained postures for which
+`enter=false` exits. The existing asynchronous completion and
+cancellation behavior is retained. Timed and continuous locomotion actions
+return action IDs and report completion, cancellation, or RPC failure through
+ACP; `stop_move` also returns immediately and completes through ACP so a slow
+firmware RPC cannot hold the MCP request open. If AS2 reports a standing state
+but rejects the first velocity command, the driver performs the required hidden
+balance transition and retries. AS2 `AI_*` standing, walking, and down states
+are recognized explicitly.
+
+High-rate LowState, BMS, and sport-state callbacks retain only their newest
+sample and publish from a 60 Hz worker, preventing stale JSON work from
+blocking DDS callbacks. Lidar runs in a separate OS process and uses a one-frame
+queue. It probes for an already-installed CuPy CUDA runtime without downloading
+one: CPU fallback is capped at 2,000 latest points, while CUDA may use the
+configured 12,000-point budget. `led` controls the AS2 RGB LED through a
+separate audio-service worker, so its keepalive cannot delay locomotion or
+speaker PCM. The keepalive refreshes the selected color every 0.5 seconds and
+also refreshes black after `off`, because otherwise
+the AS2 firmware may time out the command and restore its default LED state.
+
+The multimedia cards use transports verified on As2W hardware. `speaker`
+streams PCM-16k through the A2 `voice` service, while `camera` publishes JPEG
+frames returned by the Go2-compatible `videohub` service. `mic` listens for the
+official A2 multicast stream at `239.168.123.161:5555`; when the robot's voice
+assistant / wake-up conversation mode is disabled, the card remains in a
+diagnostic `waiting` state and automatically recovers when packets appear.
+
+The camera `info` response also declares `motus.camera/1` for
+`/<namespace>/camera/front`. Its hardware-verified 1920x1080 dimensions let
+`vop` preserve and normalise pixel bounding boxes through navigation. The
+resolution was confirmed from the relationship between VOP's pixel `bbox` and
+normalised `position` on the deployed AS2-W stream. The horizontal half-field
+of view was measured on `nvidia_desktop` with a centred 0.34 m target at
+0.254 m: `half_fov_rad=1.072`, or about 122.8 degrees full horizontal FOV.
+The value lives in `plugins.camera.camera_info`, alongside its `measured`
+provenance, so navi adopts the camera geometry instead of its conservative
+fallback.
+
+Speaker ROS subscription, jitter buffering, and the A2 audio client now live in
+one spawned process. PCM therefore stays in a thread-local queue instead of
+being copied through a multiprocessing queue, and a busy main ROS executor
+cannot delay playback. Cold playback uses the G1/R1-proven 300 ms prefill and
+300 ms `PlayStream` blocks with a 240 ms maximum queued lead. A genuine
+underflow uses a separate 500 ms recovery prefill, so lowering startup latency
+does not make a delayed TTS segment resume one block at a time. Internal EOF
+markers produced by split TTS text preserve the current playback timeline. Its
+`info` response reports first-input-to-play latency, recovery wait, input gaps,
+queue drops, partial flushes, underflows, `PlayStream` failures, and RPC latency.
+
+Camera capture and ROS publication run in two spawned processes, following the
+same isolation principle as Q5's capture/bridge split. A fixed double-buffer in
+shared memory connects them, so only the newest JPEG is retained and the
+roughly 300 KB frames are not pickled through a multiprocessing queue. The ROS
+publisher assigns `CompressedImage.data` through a buffer-compatible byte array,
+avoiding slow per-byte conversion. A busy FastDDS publisher therefore cannot
+hold the videohub client's Python GIL, while a slow publisher drops stale frame
+sequences instead of increasing end-to-end latency. Capture and publication
+have separate limits: the configured 15 Hz capture continuously refreshes the
+shared slot, while the configured 12 Hz publisher reads only the newest slot. This
+keeps the state-card preview responsive without filling Agent Core's deeper
+subscriber queue with every redundant 300 KB frame. Frames already older than
+the configured 300 ms limit are discarded before DDS publication. Camera
+`info` reports separate capture/publish rates, videohub RPC time, message-build
+and publish-call time, capture-to-publish frame age, average frame size, dropped
+or expired frames, and both child process states/PIDs. Like G1
+`camera_rgb`, it is an always-on state source: canvas lifecycle `stop` detaches
+intelligent control but does not stop publication. The child processes are
+physically closed only when the driver bundle shuts down; repeated canvas starts
+reuse the live stream without resetting frame counters. Every `start`, `info`,
+and `stop` response makes that split explicit with `always_on=true`,
+`lifecycle=logical`, `stop_behavior=detach_only`, the independent
+`stream_state`, and `physical_shutdown=driver_bundle_stop`.
+
+For `led.set_color`, omitted or blank RGB fields use the schema default `0`.
+An effective `0,0,0` request is normalized to `off`, sent to the robot, and
+kept alive as black so firmware timeout cannot restore its default LED state.
+
+`vision_capture` subscribes to that existing
+`/<namespace>/camera/front` JPEG stream; it never creates another Unitree
+`VideoClient` or calls `videohub` itself. `capture_photo` waits for a frame
+that arrived after the request and stores it under
+`/opt/phanthy-motus/data/vision_capture/photos`. Optional `photo_name` and
+`video_name` values provide safe custom names without the extension.
+`record_video` returns an action ID and destination path immediately, then uses
+FFmpeg at the configured 8 FPS to create a fixed-duration silent H.264 MP4 under
+the sibling `videos` directory. The lifecycle `stop` cancels active work and
+removes the incomplete file. `list` enumerates saved JPG/MP4 media and `delete`
+removes one complete filename. Only one
+recording can run at a time. Timed completion, cancellation, and encoding
+errors are reported through ACP. `info` reports camera freshness, encoder
+availability, and the latest recording result. The runtime image installs both
+`ffmpeg` and its companion `ffprobe`; completed files are checked for one H.264
+video track and no audio track. Fixed recordings additionally verify requested
+duration and expected frame count. Timed ACP
+completion waits until the MCP response containing its action ID has been sent,
+preventing completion from overtaking Agent Core's pending-action registration.
+The existing `/opt/phanthy-motus/data` deployment mount persists both folders.
+
+`remote_controller` is a read-only LowState view. The existing shared
+`rt/lowstate` subscriber decodes the 13 documented buttons and four
+little-endian float32 joystick axes, applies a 0.1 activity deadzone, caches the
+latest sample, and publishes JSON on
+`/<namespace>/state/remote_controller` at no more than 10 Hz. `read` returns
+the cached snapshot; `fresh` becomes false after 0.5 seconds without new data.
+The AS2W's observed `55 51` wireless-frame header distinguishes a valid neutral
+controller frame from a 40-byte zero-filled placeholder; the latter is reported
+as unavailable instead of as an online but idle controller.
+Stopping this card only disables its logical ROS output and does not close the
+shared IMU, joint, or battery subscription. `active` is an observation for
+future operator-takeover logic; this driver does not turn it into a motion
+command.
+
+For a no-hardware check, run `python3 test_driver.py` in `as2w`. In a built
+container, verify the media tools with `ffmpeg -version` and
+`ffprobe -version`. On an AS2W host, inspect the shared inputs and outputs with
+`ros2 topic hz /<namespace>/camera/front`,
+`ros2 topic echo /<namespace>/state/remote_controller --once`, and the MCP
+`info`/`capture_photo`/`record_video` actions. These checks do not replace
+opening the JPG and MP4 or exercising every physical remote control on robot.
+
+FFmpeg is not installed only for validation: `record_video` pipes the live JPEG
+frames into the `ffmpeg` executable to produce H.264 MP4, and rejects the action
+when it is absent. `ffprobe` then verifies that the completed file has an H.264
+video stream, no audio stream, and plausible duration/frame count. The image
+uses the distro package with `--no-install-recommends`, removes APT caches, and
+prints `FFmpeg runtime filesystem increase: ... bytes` during each target-
+architecture build. This is the uncompressed final-filesystem delta; registry
+transfer size can be checked from the resulting compressed layer or
+`docker image inspect` and will vary by architecture and base-image cache.
+
+The component vendors the three-field `audio_msgs/AudioChunk` interface used by
+the perception audio bus and builds it in a dedicated Docker stage. The runtime
+image receives only the generated `/as2w_ws/install` overlay and validates an
+`AudioChunk` import during the build; it does not depend on an undocumented
+`/ros_ws` artifact in the shared ROS base image. The vendored source is about
+12 KiB; colcon, ROS generators, and `python3-dev` exist only in the discarded
+audio builder stage, so they do not increase the final image. The runtime's
+CMake/build-essential packages are required to build the pinned CycloneDDS C
+library and matching Python extension against this base image. The downloaded
+0.10.5 archive is restricted to HTTPS/TLS 1.2 or newer and verified with its
+pinned SHA-256 before extraction. Both Docker stages print the generated
+`audio_msgs` overlay size in their build logs, so image-growth reviews can use
+the actual architecture-specific artifact size rather than treating the
+builder toolchain as runtime content.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
-action lifecycle, schemas, model resources, and full-size low-state arrays.
+action lifecycle, schemas, model resources, RPC correlation, and full-size
+low-state arrays.

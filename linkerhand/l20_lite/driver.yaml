@@ -1,0 +1,14 @@
+id: linkerhand-l20-lite-driver
+name: LinkerHand L20 Lite Dexterous Hand
+category: driver
+hardware_provider: linkerhand
+hardware_model: "l20_lite"
+image_name: linkerhand-l20-lite
+port: 15733
+mcp_url: "http://localhost:15733/mcp"
+description: "灵心巧手 L20 Lite — USB-RS485/Modbus 115200、10 关节位置/速度/力矩控制与状态读取"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: hand, type: actuator }
+  - { name: hand_gesture, type: actuator }

@@ -5,7 +5,7 @@ try:
 except ImportError:
     pass
 
-import json, os, re, signal, socket, sys, threading, time, uuid
+import ipaddress, json, os, re, signal, socket, struct, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -24,18 +24,152 @@ class _UnavailableProxy:
 def load_config():
     return yaml.safe_load(open(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml"))))
 
+
+_UNITREE_NETWORK = ipaddress.ip_network("192.168.123.0/24")
+_VIRTUAL_INTERFACE_PREFIXES = (
+    "br-", "cni", "docker", "flannel", "podman", "veth", "virbr",
+)
+
+
+def _network_interfaces():
+    """Inspect Linux interfaces without route guessing or external commands."""
+    import fcntl
+
+    interfaces = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _, name in socket.if_nameindex():
+            request = struct.pack("256s", name[:15].encode("ascii", "ignore"))
+            try:
+                flags_data = fcntl.ioctl(sock.fileno(), 0x8913, request)  # SIOCGIFFLAGS
+                address_data = fcntl.ioctl(sock.fileno(), 0x8915, request)  # SIOCGIFADDR
+            except OSError:
+                continue
+            sysfs = Path("/sys/class/net") / name
+            try:
+                virtual = "/virtual/net/" in str(sysfs.resolve())
+            except OSError:
+                virtual = False
+            interfaces.append({
+                "name": name,
+                "ipv4": socket.inet_ntoa(address_data[20:24]),
+                "up": bool(struct.unpack_from("H", flags_data, 16)[0] & 0x1),
+                "wireless": (sysfs / "wireless").exists() or name.lower().startswith(("wl", "wlan")),
+                "virtual": virtual or (sysfs / "bridge").exists(),
+            })
+    finally:
+        sock.close()
+    return interfaces
+
+
+def _configured_interface(cfg):
+    """Return the highest-priority setting; None means safe auto-detection."""
+    positional = str(sys.argv[1]).strip() if len(sys.argv) > 1 else ""
+    if positional:
+        value = positional
+    elif "NETWORK_INTERFACE" in os.environ:
+        value = os.environ["NETWORK_INTERFACE"]
+    else:
+        value = cfg.get("robot_interface", "auto")
+    value = str(value or "").strip()
+    return None if not value or value.lower() == "auto" else value
+
+
+def resolve_robot_interface(cfg):
+    """Resolve an explicit interface or uniquely identify Unitree's wired LAN."""
+    configured = _configured_interface(cfg)
+    if configured:
+        return configured
+
+    try:
+        interfaces = _network_interfaces()
+    except Exception as exc:
+        print(f"[as2w] Failed to inspect network interfaces: {exc}", flush=True)
+        interfaces = []
+
+    candidates = []
+    for interface in interfaces:
+        name = interface["name"]
+        lowered = name.lower()
+        if (not interface["up"] or lowered == "lo" or interface["wireless"]
+                or interface["virtual"]
+                or lowered.startswith(_VIRTUAL_INTERFACE_PREFIXES)):
+            continue
+        try:
+            address = ipaddress.ip_address(interface["ipv4"])
+        except ValueError:
+            continue
+        if address in _UNITREE_NETWORK:
+            candidates.append((name, str(address)))
+
+    if len(candidates) == 1:
+        name, address = candidates[0]
+        print(f"[as2w] Auto-detected Unitree interface: {name} ({address})", flush=True)
+        return name
+    if not candidates:
+        print("[as2w] No Unitree robot interface found on 192.168.123.0/24", flush=True)
+        print("[as2w] Set NETWORK_INTERFACE explicitly if the robot uses another subnet", flush=True)
+        return None
+    choices = ", ".join(f"{name} ({address})" for name, address in candidates)
+    print(f"[as2w] Multiple Unitree network candidates found: {choices}", flush=True)
+    print("[as2w] Set NETWORK_INTERFACE explicitly", flush=True)
+    return None
+
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
-        from device import StatePlugin, LocoPlugin, SpecialActionPlugin
+        from device import LedPlugin, StatePlugin, LocoPlugin, SpecialMotionPlugin
+        from multimedia import CameraPlugin, MicPlugin, SpeakerPlugin
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
+        from slam_mapping import SlamMappingPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
-        if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
-        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
-        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        loco = None
+        loco_servo = None
+        special_motion = None
+        if p.get("loco", {}).get("enabled", True):
+            loco = LocoPlugin(p.get("loco", {}), namespace, executor, proxy)
+            self.plugins.append(loco)
+        if p.get("loco_servo", {}).get("enabled", False):
+            from loco_servo import LocoServoPlugin
+            loco_servo = LocoServoPlugin(
+                p.get("loco_servo", {}), namespace, executor, proxy,
+                loco_plugin=loco)
+            self.plugins.append(loco_servo)
+        if p.get("special_motion", {}).get("enabled", True):
+            special_motion = SpecialMotionPlugin(
+                p.get("special_motion", {}), namespace, executor, proxy)
+            self.plugins.append(special_motion)
+            if loco is not None:
+                loco.attach_special_motion(special_motion)
+                special_motion.attach_loco(loco)
+            if loco_servo is not None:
+                special_motion.attach_servo(loco_servo)
+                loco_servo.attach_special_motion(special_motion)
+        if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
+        if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
+        if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
+        if dds_ready and p.get("camera", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera", {}), namespace, executor, interface))
+        if dds_ready and p.get("vision_capture", {}).get("enabled", False):
+            from vision_capture import VisionCapturePlugin
+            self.plugins.append(VisionCapturePlugin(
+                p.get("vision_capture", {}), namespace, executor))
+        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
+        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True):
+            controlled_spatial = ControlledSpatialPlugin(
+                p.get("controlled_spatial", {}), namespace, executor, interface)
+            self.plugins.append(controlled_spatial)
+            if loco is not None:
+                loco.attach_controlled_spatial(controlled_spatial)
+                controlled_spatial.attach_loco(loco)
+            if special_motion is not None:
+                special_motion.attach_controlled_spatial(controlled_spatial)
+                controlled_spatial.attach_special_motion(special_motion)
+            if loco_servo is not None:
+                controlled_spatial.attach_servo(loco_servo)
+                loco_servo.attach_controlled_spatial(controlled_spatial)
+        if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
@@ -55,6 +189,19 @@ class Bundle:
                 return plugin.dispatch(args.pop("action", name), {**args, "_tool_name": name})
         return None
 
+    def action_response_sent(self, action_id):
+        """Tell asynchronous cards their action_id is now visible."""
+        for plugin in self.plugins:
+            response_sent = getattr(plugin, "response_sent", None)
+            if response_sent is not None:
+                response_sent(action_id)
+
+
+def _tool_call_arguments(params):
+    """Default an omitted/null argument object without hiding wrong JSON types."""
+    arguments = params.get("arguments")
+    return {} if arguments is None else arguments
+
 def handler(bundle):
     sse_sessions, sse_lock = {}, threading.Lock()
     class Handler(BaseHTTPRequestHandler):
@@ -66,9 +213,12 @@ def handler(bundle):
             print(f"[mcp] {self.address_string()} {safe}", flush=True)
         def _send_json(self, status, payload):
             body = json.dumps(payload).encode()
-            self.send_response(status); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers(); self.wfile.write(body)
+            try:
+                self.send_response(status); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers(); self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
         def _send_sse(self, event, data):
             try:
                 self.wfile.write(f"event: {event}\\ndata: {data}\\n\\n".encode())
@@ -97,6 +247,25 @@ def handler(bundle):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept"); self.end_headers()
         def do_POST(self):
+            # Receive a file into this container: `POST /file/upload`, the way a
+            # `format: file` tool argument reaches a service that shares no
+            # filesystem with agent-core. See common/file_intake.py.
+            #
+            # Two ordering requirements, both silent when violated: this must
+            # precede `self.rfile.read(...)`, which would consume the body the
+            # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+            # would 404 the upload before it is recognised.
+            #
+            # Imported here rather than at module level on purpose: several tests
+            # lift this handler out of main.py by AST and exec only the selected
+            # definitions, so a module global would be undefined there -- a
+            # NameError on every POST, including ordinary JSON-RPC.
+            try:
+                from common import file_intake as _file_intake
+            except ImportError:  # a checkout without common/ on the path
+                _file_intake = None
+            if _file_intake is not None and _file_intake.serve_upload(self):
+                return
             parsed = urlparse(self.path)
             if parsed.path not in ("/mcp", "/mcp/messages"):
                 self._send_json(404, {"error": "not found"}); return
@@ -123,13 +292,50 @@ def handler(bundle):
                 self.send_response(202); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
                 if not sse_client._send_sse("message", json.dumps(payload)):
                     with sse_lock: sse_sessions.pop(session_id, None)
+            action_id = None
             if method == "initialize": result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "as2w-driver", "version": "1.0"}}
             elif method == "tools/list": result = {"tools": bundle.tools()}
             elif method == "tools/call":
-                result = {"content": [{"type": "text", "text": json.dumps(bundle.call(params.get("name", ""), params.get("arguments") or {}))}]}
+                arguments = _tool_call_arguments(params)
+                if not isinstance(arguments, dict):
+                    call_result = {
+                        "ok": False, "ret": -1, "accepted": False,
+                        "code": "INVALID_ARGUMENT",
+                        "error": "tool arguments must be an object",
+                    }
+                else:
+                    try:
+                        call_result = bundle.call(
+                            params.get("name", ""), arguments)
+                    except (TypeError, ValueError) as exc:
+                        call_result = {
+                            "ok": False, "ret": -1, "accepted": False,
+                            "code": "INVALID_ARGUMENT",
+                            "error": str(exc) or "invalid tool arguments",
+                        }
+                    except Exception as exc:
+                        print(
+                            f"[mcp] tool call failed: {type(exc).__name__}: {exc}",
+                            flush=True)
+                        respond({
+                            "jsonrpc": "2.0", "id": rid,
+                            "error": {
+                                "code": -32603,
+                                "message": "Internal error",
+                            },
+                        })
+                        return
+                result = {"content": [{
+                    "type": "text", "text": json.dumps(call_result)}]}
+                if isinstance(call_result, dict):
+                    action_id = call_result.get("action_id")
             else:
                 respond({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Method not found: {method}"}}); return
-            respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            try:
+                respond({"jsonrpc": "2.0", "id": rid, "result": result})
+            finally:
+                if action_id:
+                    bundle.action_response_sent(action_id)
     return Handler
 
 
@@ -155,17 +361,18 @@ def _start_registration(mcp_port, name, category):
 
 def main():
     cfg = load_config()
-    interface = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE") or cfg.get("robot_interface", "eth0")
+    interface = resolve_robot_interface(cfg)
     profile = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "")
     if os.environ.get("ROS_DOMAIN_ID") != "42" or os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
         print("[as2w] WARNING: ROS2 is not configured for agent-core Domain 42/FastDDS", flush=True)
     elif not profile or not os.path.isfile(profile):
         print(f"[as2w] WARNING: FastDDS profile is missing: {profile or '(unset)'}", flush=True)
     else:
-        print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(auto)'}", flush=True)
+        print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(unavailable)'}", flush=True)
     dds_ready = False
     # A body DDS participant must never silently bind to the office Wi-Fi.
-    # Configure NETWORK_INTERFACE explicitly for non-eth0 robot adapters.
+    # The resolver returns only an explicit setting or a unique wired adapter
+    # on Unitree's 192.168.123.0/24 network.
     candidates = [interface] if interface else []
     for candidate in candidates:
         try:

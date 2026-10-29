@@ -6,10 +6,12 @@ Hardware drivers for the **[Phanthy Motus](https://github.com/4paradigm/phanthym
 
 Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server that exposes hardware capabilities as tools. Drivers automatically register with the [Phanthy Motus Agent Core](https://github.com/4paradigm/phanthymotus) on startup.
 
+
 ## Available Drivers
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
+| `pico/4ultra` | PICO 4 Ultra | 15742 | Independent teleop_device; signed App, pairing, DDS controller input |
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
 | `unitree/go1` | Unitree Go1 (EDU) Quadruped | 15715 | State, locomotion, camera (RGB/depth/pointcloud), ext peripherals, URDF |
 | `unitree/go2` | Unitree Go2 Quadruped | 15703 | Locomotion, obstacle avoidance, voice, video, navigation |
@@ -22,7 +24,9 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
+| [`limx/tron2`](limx/tron2/README.md) | LimX TRON2 dual-arm robot | 15791 | Head/wrist RGB cameras, joint skeleton with gripper outlines, arm MoveJ and verified saved-home reset |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
+| `linkerhand/l20_lite` | LinkerHand L20 Lite | 15733 | USB-RS485/Modbus 115200, 10-joint position/speed/torque control and state reads |
 
 ## Quick Start
 
@@ -38,6 +42,8 @@ The easiest way to deploy a driver is through the Agent Core Web Dashboard. Navi
 ### Build & Deploy Your Own Driver
 
 If you need to build from source or develop a custom driver:
+
+For G1 image build details, see the [G1 build instructions](unitree/g1/README.md#构建).
 
 ```bash
 cp .env.example .env  # Fill in registry credentials
@@ -77,6 +83,10 @@ python main.py
 3. Agent Core discovers the driver's tools via MCP `initialize` and `tools/list`
 4. Tools become available to the LLM agent and appear in the Web Dashboard
 5. The LLM agent can invoke tools via MCP `tools/call`
+6. A tool that takes a file declares `format: file` + `uploadTo: "mcp"`; the bytes
+   reach this container via `POST /file/upload` (`common/file_intake.py`), and the
+   reply names the path *inside* the container — no shared mount. See
+   [README_dev.md § File Arguments](README_dev.md#file-arguments-format-file-and-post-fileupload).
 
 ### G1 Controlled Navigation Velocity
 
@@ -253,6 +263,8 @@ Want to add support for new hardware? See the **[Driver Development Guide](READM
 - MCP protocol implementation (JSON-RPC 2.0 methods)
 - Tool definition spec (`inputSchema`, `configSchema`, `multiInstance`, `x-action-params`)
 - Instance management (`multiInstance` flag, `scope` for config fields)
+- Config field formats — masked secrets (`format: "password"`, `x-sensitive`) and a QR code
+  for "install the app on your phone" / "point your phone at this robot" (`format: "qr"`)
 - Plugin lifecycle (`__init__`, `get_tool`, `start`, `stop`, `dispatch`)
 - `driver.yaml` and `config.yaml` metadata format
 - Registration and heartbeat with Agent Core
@@ -301,13 +313,15 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `audio/pcm-16k` | Audio waveform | PCM audio visualizer with playback |
 | `video/mjpeg` | Video stream | Motion JPEG video display |
 | `image/jpeg` | Image | Static JPEG image |
-| `image/depth-z16` | Depth colormap | 16-bit depth image with color mapping |
 | `data/json` | Text / KV panel | JSON key-value display |
 | `text/*` | Text | Plain text display |
 | `sensor/skeleton` | 3D Skeleton | URDF-based 3D skeleton with joint rotation |
+| `sensor/pose2d` | 2D human skeleton | COCO-17 human keypoints overlaid on the frame, with a per-person posture and activity label |
 | `sensor/lidar*` | Lidar scan | 2D/3D lidar point visualization |
 | `sensor/pointcloud` | Point cloud | 3D point cloud renderer |
 | `sensor/mapping` | 2D Map | Occupancy grid / SLAM map |
+| `state/odom` | Text / KV panel | `motus.odom/1` — what the robot reports about its own motion |
+| `control/velocity` | Text / KV panel | `motus.control/1` `twist` — a command stream **into** a driver |
 
 ### Skeleton Rendering (`sensor/skeleton`)
 

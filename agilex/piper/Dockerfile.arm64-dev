@@ -1,0 +1,16 @@
+# Operator-only offline source overlay over release.261016.cde468d (ARM64).
+# This immutable dependency snapshot is not the clean release Dockerfile.
+# See IMAGE_ACCOUNTING.md for the verified digest, sizes and limitations.
+ARG PIPER_DEV_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/drivers/agilex/piper@sha256:37a0ea3553fe8e2e14f615cc36b80823265af93651bd038a5cc990a49236d680
+FROM ${PIPER_DEV_BASE_IMAGE}
+ARG PIPER_SOURCE_REV=uncommitted
+COPY common/ /work/common/
+COPY main.py device.py runtime.py cards.py arm.py arm_control.py control.py mac_can.py camera_capture.py config.yaml driver.yaml /work/agilex/piper/
+COPY monitor.py monitor_bundle.py status_card.py direct_control.py /work/agilex/piper/
+COPY intent_control.py intent_motion.py intent_monitor.py intent_teaching.py /work/agilex/piper/
+COPY unified_control.py user_motion.py path_capability.py preset.py /work/agilex/piper/
+COPY completion.py /work/agilex/piper/
+COPY camera_live.py camera_worker.py camera_owner.py /work/agilex/piper/
+COPY resource/ /work/agilex/piper/resource/
+COPY deploy/ /deploy/
+LABEL org.phanthy.source.revision=${PIPER_SOURCE_REV} org.phanthy.build.kind=arm64-development

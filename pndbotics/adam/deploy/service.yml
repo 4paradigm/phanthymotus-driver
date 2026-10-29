@@ -25,6 +25,7 @@ pndbotics-adam:
     # overrides so another deployment topology can replace them.
     - GRPC_HOST=10.10.20.127
     - GRPC_PORT=50051
+    - GRPC_API=rl
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=all
     - ZED_PYTHON_PATH=/opt/pyzed
@@ -34,4 +35,10 @@ pndbotics-adam:
     options:
       max-size: "10m"
       max-file: "3"
-  restart: unless-stopped
+  # always, not unless-stopped: after a host reboot the robot must come back
+  # on its own. G1 came up from one with every container still exited, and
+  # somebody had to SSH in to start them — until then the robot was simply
+  # gone, indistinguishable from a broken deployment. The cost is that a
+  # container stopped by hand also returns after a reboot; here that is the
+  # lesser surprise.
+  restart: always
