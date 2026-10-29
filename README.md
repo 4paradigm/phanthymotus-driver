@@ -104,25 +104,23 @@ dropped, never clamped to manufacture a newer measurement. Diagnostics count
 these as `cloud_non_increasing_timestamps` / `imu_non_increasing_timestamps`;
 subsequent strictly increasing samples can resume normally.
 
-The `lidar_imu` tool declares `format=sensor/imu`. Its native ROS message
-uses quaternion orientation, angular velocity in rad/s, linear acceleration in
-m/s², and the three standard 3×3 covariance arrays. PhanthyMotus PR #141
-subscribes to this native type and converts it to the versioned
-`phanthy.sensor.imu.v1` dashboard payload without changing the ROS topic.
+The native MID360 IMU message uses quaternion orientation, angular velocity in
+rad/s, linear acceleration in m/s², and the three standard 3×3 covariance
+arrays. The existing body `imu` card remains unchanged.
 
-With `navigation_sensors` enabled, `lidar_cloud` exposes three outputs: the
-unchanged legacy cloud first, native PointCloud2 on port `navigation_lidar`,
-and native MID360 IMU on port `navigation_imu`. The independent `lidar_imu`
-card remains available and exposes the **same** `/ubuntu/navigation/imu` topic;
-the existing body `imu` card is unchanged. Existing Canvas connections can keep
-using `lidar_imu`, or connect the `navigation_imu` port on `lidar_cloud`.
+With `navigation_sensors` enabled, `lidar_cloud` exposes the unchanged legacy
+cloud first and native PointCloud2 on port `navigation_lidar` second. The latter
+includes `associated_imu` metadata with the configured IMU topic, `sensor/imu`
+format, ROS type, QoS, frame and timestamp semantics. Consumers must use this
+metadata rather than derive an IMU topic name from the cloud topic. The IMU is
+published on the internal ROS topic (normally `/ubuntu/navigation/imu`); there
+is no independent `lidar_imu` card or IMU output port.
 
-The two cards hold independent requests for the shared IMU publisher. Stopping
-one card does not interrupt the other; however, a subscriber can still receive
-IMU messages on the shared topic after its card stops if the other card remains
-running. During card-level operation, the worker remains alive while a navigation
-cloud or IMU request is active and is released after the last request stops.
-Restart discards queued frames from the old epoch.
+The `lidar_cloud` card owns both navigation streams. Stopping it releases both
+requests and the worker once neither stream remains active. Its `info` reports
+IMU readiness separately under `outputs.navigation_imu`; the top-level readiness
+retains the historical cloud-only contract. Restart discards queued frames from
+the old epoch.
 
 LiDAR and IMU each retain their own MID360 sample time, corrected from the
 shared source clock into the ROS system-time domain. These are independently
@@ -143,8 +141,9 @@ IMU; materially lower rates or repeated source-stamp gaps invalidate the run.
 
 ### G1 Self-Describing Camera Frames
 
-The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image,
-`/ubuntu/camera/depth` image, and distance topics unchanged. It additionally
+The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image
+as the first `camera_rgb` output, with stable port `rgb`; the
+`/ubuntu/camera/depth` image and distance topics are unchanged. It additionally
 exposes one latest-only, BEST_EFFORT self-describing RGB frame stream, independent
 of navigation: `camera_rgb`, port `rgb_frame` → `/ubuntu/camera/rgb_frame`
 (`phanthy.sensor.camera_rgb_frame.v1`).
@@ -155,12 +154,12 @@ JPEG channel. With no active outputs or capture requests, the shared process
 pauses hardware capture. A stop timeout is an error, never an idle success.
 
 Migration: replace saved Canvas `navigation_lidar` with `lidar_cloud`'s
-`navigation_lidar` port; `navigation_imu` with `lidar_imu`; `camera_rgb_frame`
-with `camera_rgb`'s `rgb_frame`. The old card names are not aliases. Topic subscribers need no
-wire migration. Existing outputs retain their position and metadata; all topic
-names, types, QoS, schemas and calibration/time semantics remain unchanged.
-Consumer/Canvas migration is a separate task. Hardware/ROS acceptance for this
-consolidation is pending; local tests are not a deployment claim.
+`navigation_lidar` port and `camera_rgb_frame` with `camera_rgb`'s `rgb_frame`.
+Saved `lidar_imu` or `navigation_imu` card connections must be removed; a
+navigation consumer must receive and use the cloud descriptor's `associated_imu`
+metadata. The internal IMU ROS topic and its wire type remain available. Consumer
+and Canvas support for passing the descriptor is required; hardware/ROS
+acceptance is pending, and local tests are not a deployment claim.
 
 The RGB stream uses `std_msgs/msg/UInt8MultiArray` to transport a `PSE1` binary
 envelope: a fixed little-endian header (`magic`, JSON metadata length, binary

@@ -65,7 +65,7 @@ def test_direct_timed_move_allows_concurrent_stop_and_records_cancellation():
 
 
 
-def test_lidar_global_and_repeated_stop_gate_cloud_but_keep_imu():
+def test_lidar_global_and_repeated_stop_release_cloud_and_imu():
     path = Path(__file__).resolve().parents[1] / "device.py"
     tree = ast.parse(path.read_text())
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LidarPlugin")
@@ -81,9 +81,10 @@ def test_lidar_global_and_repeated_stop_gate_cloud_but_keep_imu():
     nav._lifecycle_lock = threading.RLock()
     nav._gates = {"cloud": cloud, "imu": imu}
     nav._requested_outputs = {"cloud": True, "imu": True}
-    nav._imu_requests = {"lidar": True, "imu": True}
     nav._proc = mock.Mock(pid=123)
     nav._proc.is_alive.return_value = True
+    nav._proc.terminate.side_effect = lambda: setattr(nav._proc.is_alive, "return_value", False)
+    first_proc = nav._proc
     nav._status_node = SimpleNamespace(cloud_topic="/navigation/lidar", lidar_frame="lidar",
                                        imu_topic="/navigation/imu", imu_frame="lidar")
 
@@ -102,9 +103,9 @@ def test_lidar_global_and_repeated_stop_gate_cloud_but_keep_imu():
     plugin.stop()
     assert plugin._node is None
     legacy_node.close.assert_called_once()
-    assert imu.token() is not None
-    assert nav._requested_outputs == {"cloud": False, "imu": True}
-    nav._proc.terminate.assert_not_called()
+    assert imu.token() is None
+    assert nav._requested_outputs == {"cloud": False, "imu": False}
+    first_proc.terminate.assert_called_once()
     publisher = mock.Mock()
     cloud.publish(stale_cloud, publisher, "stale")
     legacy.publish(stale_legacy, publisher, "stale")
@@ -112,18 +113,19 @@ def test_lidar_global_and_repeated_stop_gate_cloud_but_keep_imu():
 
     # Even an independently re-enabled gate must be closed when the legacy
     # node has already disappeared; this used to return idle prematurely.
-    cloud.set_enabled(True)
+    nav._gates["cloud"].set_enabled(True)
     assert plugin.dispatch("stop", {})["state"] == "idle"
-    assert cloud.token() is None
+    assert nav._gates["cloud"].token() is None
     assert plugin.dispatch("stop", {})["state"] == "idle"
-    assert imu.token() is not None
+    assert nav._gates["imu"].token() is None
 
     # Bundle-level restart recreates the legacy node and reclaims both streams.
     scope["_LidarNode"] = lambda topic: SimpleNamespace(output_gate=OutputGate())
+    nav._start_worker = mock.Mock()
     plugin.start()
-    assert nav._imu_requests == {"lidar": True, "imu": True}
-    assert cloud.token() is not None
-    assert imu.token() is not None
+    assert nav._requested_outputs == {"cloud": True, "imu": True}
+    assert nav._gates["cloud"].token() is not None
+    assert nav._gates["imu"].token() is not None
 
 
 def make_fault_test_lidar():
@@ -279,17 +281,15 @@ def test_real_bundle_registration_order_stop_all_then_restart_keeps_worker_stopp
         bundle.stop_all()
         assert len(processes) == 1 and nav._proc is None
         processes[0].terminate.assert_called_once()
-        assert nav._imu_requests == {"lidar": False, "imu": True}
+        assert nav._requested_outputs == {"cloud": False, "imu": False}
         bundle.start_all()
         assert len(processes) == 2 and nav._worker_running()
-        assert nav._imu_requests == {"lidar": True, "imu": True}
+        assert nav._requested_outputs == {"cloud": True, "imu": True}
         assert nav._gates["cloud"].token() is not None
-        assert nav._gates["imu"].token() is not None
-        assert nav.dispatch("stop", {})["state"] == "idle"
         assert nav._gates["imu"].token() is not None
         assert lidar.dispatch("stop", {})["state"] == "idle"
         assert nav._proc is None
-        assert nav.dispatch("start", {})["enabled"]
+        assert lidar.dispatch("start", {})["state"] == "not_ready"
         assert len(processes) == 3 and nav._worker_running()
         bundle.stop_all()
         assert len(processes) == 3 and nav._proc is None

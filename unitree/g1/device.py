@@ -2469,8 +2469,7 @@ class LidarPlugin:
             "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]
-                         + ([self._navigation.cloud_descriptor(), self._navigation.imu_descriptor()]
-                            if self._navigation else []),
+                         + ([self._navigation.cloud_descriptor()] if self._navigation else []),
             "configSchema": {
                 "type": "object",
                 "properties": {},
@@ -3938,7 +3937,7 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]
+            "topic_out": [{"port": "rgb", "topic": self._color_topic, "format": "image/jpeg"}]
                          + self._frame_outputs("rgb"),
         }
 

@@ -117,8 +117,8 @@ plugins:
   lidar:
     enabled: true
   # MID360 raw DDS -> native ROS 2 topics for navigation consumers. This
-  # read-only bridge supplies lidar_cloud's native cloud and shared IMU outputs,
-  # and the independent lidar_imu card. Each stream keeps its own sample time.
+  # read-only bridge supplies lidar_cloud's native cloud and associated IMU topic.
+  # Each stream keeps its own sample time; they are not synchronized.
   # Safety uses an internal copy of the legacy cloud, independent of card stop.
   navigation_sensors:
     enabled: true

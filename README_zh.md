@@ -83,22 +83,24 @@ python main.py
 点云转换只接受小端且满足 `row_step == width * point_step` 的紧凑行布局；
 大端、带行 padding 或行长不足的有组织点云会被丢弃，避免错误解码。
 
-`lidar_cloud` 保留旧点云输出作为第一项，并增加 `navigation_lidar` 端口输出标准
-PointCloud2；新增 `lidar_imu` 输出 MID360 IMU，原机身 `imu` 不变。
-两路标准输出共享 worker，但分别启停：停止一张卡不影响另一张，全部停止才释放
-worker。重新启动不会发送上一启停周期的排队帧。安全检查改用内部
+`lidar_cloud` 保留旧点云输出作为第一项，第二项为 `navigation_lidar` 端口的标准
+PointCloud2；该输出描述符中的 `associated_imu` 声明实际配置的 IMU topic、格式、
+ROS 类型、QoS、坐标系和时间语义。消费端必须使用该元数据，不可从点云 topic 猜测。
+MID360 IMU 保留内部 ROS topic，不再提供独立 `lidar_imu` 卡或公开 IMU 输出端口；
+原机身 `imu` 不变。`lidar_cloud` 同时管理两路导航数据，停止时释放两路请求及 worker；
+重新启动不会发送上一启停周期的排队帧。`info` 的 `outputs.navigation_imu` 单独报告
+IMU 就绪状态，顶层就绪状态保持原有点云语义。安全检查使用内部
 `/ubuntu/lidar/cloud_internal`，复用同一份点云转换，不依赖公开点云卡是否启用。
 
-`lidar_imu` 声明 `format=sensor/imu`，原生 ROS 消息为
-`sensor_msgs/msg/Imu`：姿态使用四元数，角速度单位为 rad/s，线加速度
-单位为 m/s²，并保留三组标准 3×3 协方差。PhanthyMotus PR #141
-会按原生类型订阅，再转成版本化的 `phanthy.sensor.imu.v1` 面板载荷，
-不修改 ROS topic 本身。
+关联 IMU 的格式为 `sensor/imu`，原生 ROS 消息为 `sensor_msgs/msg/Imu`：姿态使用
+四元数，角速度单位为 rad/s，线加速度单位为 m/s²，并保留三组标准 3×3 协方差。
+点云和 IMU 各自保留归一化后的采样时间，并非同步采样对，时间戳也不是原始 DDS 值的逐位复制。
 
 ### G1 相机自描述帧
 
-RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图、
-`/ubuntu/camera/depth` 深度图和距离 topic 的消息语义，同时新增一条
+RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图作为 `camera_rgb` 的第一项输出，
+其稳定端口名为 `rgb`；`/ubuntu/camera/depth` 深度图和距离 topic 的消息语义不变。
+同时新增一条
 BEST_EFFORT + KEEP_LAST(1) 自描述 RGB 帧，不与导航算法绑定：
 `camera_rgb` 的 `rgb_frame` 端口 → `/ubuntu/camera/rgb_frame`
 （`phanthy.sensor.camera_rgb_frame.v1`）。
@@ -112,12 +114,12 @@ BEST_EFFORT + KEEP_LAST(1) 自描述 RGB 帧，不与导航算法绑定：
 | 原卡片 | 新卡片 / 端口 |
 |---|---|
 | navigation_lidar | lidar_cloud / navigation_lidar |
-| navigation_imu | lidar_imu / 原输出 |
+| navigation_imu、lidar_imu | 移除旧连接；消费 `navigation_lidar` 描述符的 `associated_imu` |
 | camera_rgb_frame | camera_rgb / rgb_frame |
 
-移除的名字不保留隐藏别名。原输出维持列表首位和原描述，topic、ROS 类型、载荷、
-QoS、schema、标定及时间语义不变；直接订阅 topic 无需修改协议。此轮整合尚未
-部署或真机验收，本地测试不能代替 ROS/设备验收。
+移除的名字不保留隐藏别名。原点云输出维持列表首位和原描述；内部 IMU topic
+及其 ROS 类型保持可用。Canvas 和消费端需要支持传递描述符。此轮整合尚未部署或
+真机验收，本地测试不能代替 ROS/设备验收。
 
 RGB 自描述帧以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
 小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON

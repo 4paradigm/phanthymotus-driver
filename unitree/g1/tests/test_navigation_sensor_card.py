@@ -124,7 +124,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         source = (G1_DIR / "navigation_sensor_bridge.py").read_text()
         for expected in (
             '"navigation_lidar"',
-            '"lidar_imu"',
+            '"associated_imu"',
             '"sensor/pointcloud"',
             '"sensor_msgs/msg/PointCloud2"',
             '"sensor_msgs/msg/Imu"',
@@ -145,7 +145,6 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
         plugin._lifecycle_lock = threading.RLock()
         plugin._gates = {s: OutputGate() for s in ("cloud", "imu")}
-        plugin._imu_requests = {"lidar": True, "imu": True}
         plugin._status_node = types.SimpleNamespace(
             cloud_topic="/ubuntu/navigation/lidar",
             imu_topic="/ubuntu/navigation/imu",
@@ -161,10 +160,9 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         )
         plugin._proc = types.SimpleNamespace(is_alive=lambda: True, pid=1234)
 
-        tools = {tool["name"]: tool for tool in plugin.get_tools()}
-        self.assertEqual(set(tools), {"lidar_imu"})
+        self.assertEqual(plugin.get_tools(), [])
         lidar = plugin.cloud_descriptor()
-        imu = tools["lidar_imu"]["topic_out"][0]
+        imu = lidar["associated_imu"]
         self.assertEqual(lidar["format"], "sensor/pointcloud")
         self.assertEqual(lidar["ros_type"], "sensor_msgs/msg/PointCloud2")
         self.assertEqual(lidar["qos"], "RELIABLE + KEEP_LAST(depth=2) + VOLATILE")
@@ -174,10 +172,63 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
         self.assertEqual(imu["frame_id"], "custom_imu_frame")
 
-        info = plugin.dispatch("info", {"_tool_name": "lidar_imu"})
+        info = plugin.output_status("imu", owner="lidar")
         self.assertEqual(info["state"], "not_ready")
         self.assertIn("clock_not_ready", info["blockers"])
         self.assertIn("imu_not_fresh", info["blockers"])
+
+    def test_associated_imu_uses_resolved_default_and_custom_topics(self):
+        module = self.load_bridge_module()
+        cases = [({}, "robot1", "/robot1/navigation/lidar", "/robot1/navigation/imu"),
+                 ({"cloud_topic": "/sensors/lidar", "imu_topic": "/inertial/custom"},
+                  "robot2", "/sensors/lidar", "/inertial/custom")]
+        for config, namespace, cloud_topic, imu_topic in cases:
+            with self.subTest(config=config), mock.patch.object(module.Node, "__init__", return_value=None), \
+                 mock.patch.object(module.Node, "create_subscription", return_value=object(), create=True):
+                monitor = module._NavigationSensorMonitorNode(config, namespace)
+                plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
+                plugin._status_node = monitor
+                desc = plugin.cloud_descriptor()
+                self.assertEqual(desc["topic"], cloud_topic)
+                self.assertEqual(desc["associated_imu"]["topic"], imu_topic)
+                self.assertEqual(desc["associated_imu"]["ros_type"], "sensor_msgs/msg/Imu")
+                self.assertEqual(desc["associated_imu"]["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
+                self.assertNotIn("port", desc["associated_imu"])
+
+    def test_worker_publishers_match_associated_imu_descriptor(self):
+        module = self.load_bridge_module()
+        cases = [({}, "robot1", "/robot1/navigation/lidar", "/robot1/navigation/imu"),
+                 ({"cloud_topic": "/sensors/lidar", "imu_topic": "/inertial/custom"},
+                  "robot2", "/sensors/lidar", "/inertial/custom")]
+        for config, namespace, cloud_topic, imu_topic in cases:
+            with self.subTest(config=config), \
+                 mock.patch.object(module.Node, "__init__", return_value=None), \
+                 mock.patch.object(module.Node, "create_subscription", return_value=object(), create=True), \
+                 mock.patch.object(module.Node, "create_publisher", side_effect=lambda *args: object(), create=True) as publisher, \
+                 mock.patch.object(module.Node, "get_logger", return_value=mock.Mock(), create=True), \
+                 mock.patch.object(module, "_required_static_transform", return_value=("base", (0, 0, 0), (0, 0, 0))), \
+                 mock.patch.object(module._NavigationSensorNode, "_publish_static_transform"), \
+                 mock.patch.object(module.threading, "Thread"), \
+                 mock.patch.object(module, "ChannelSubscriber", return_value=mock.Mock()):
+                worker = module._NavigationSensorNode(config, namespace)
+                monitor = module._NavigationSensorMonitorNode(config, namespace)
+                plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
+                plugin._status_node = monitor
+                descriptor = plugin.cloud_descriptor()
+                imu = descriptor["associated_imu"]
+                self.assertEqual(descriptor["topic"], cloud_topic)
+                self.assertEqual(imu["topic"], imu_topic)
+                self.assertEqual(worker.cloud_topic, descriptor["topic"])
+                self.assertEqual(worker.imu_topic, imu["topic"])
+                publisher.assert_any_call(module.PointCloud2, descriptor["topic"], module._NAVIGATION_CLOUD_QOS)
+                publisher.assert_any_call(module.Imu, imu["topic"], module._IMU_QOS)
+                self.assertEqual(module._IMU_QOS.kwargs, {
+                    "reliability": "reliable", "history": "keep_last", "depth": 200,
+                    "durability": "volatile",
+                })
+                self.assertEqual(imu["format"], "sensor/imu")
+                self.assertEqual(imu["ros_type"], "sensor_msgs/msg/Imu")
+                self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
 
     def test_monitor_preserves_configured_sensor_frames(self):
         module = self.load_bridge_module()
@@ -325,7 +376,6 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 plugin._proc = None
                 plugin._config = {}
                 plugin._requested_outputs = {s: True for s in ("cloud", "imu")}
-                plugin._imu_requests = {"lidar": False, "imu": True}
                 plugin._monitor_attached = True
                 plugin._lifecycle_lock = threading.RLock()
                 plugin._gates = {s: OutputGate() for s in ("cloud", "imu")}
@@ -376,9 +426,16 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             with self.subTest(lidar_enabled=enabled), \
                  mock.patch.object(module, "_NavigationSensorMonitorNode"):
                 plugin = module.NavigationSensorPlugin({}, "ubuntu", mock.Mock(), lidar_enabled=enabled)
-                self.assertEqual(plugin._imu_requests, {"lidar": enabled, "imu": True})
+                self.assertEqual(plugin._requested_outputs, {"cloud": enabled, "imu": enabled})
                 self.assertEqual(plugin._gates["cloud"].acquisition_requested(), enabled)
-                self.assertTrue(plugin._gates["imu"].acquisition_requested())
+                self.assertEqual(plugin._gates["imu"].acquisition_requested(), enabled)
+                with mock.patch.object(plugin, "_start_worker") as start_worker:
+                    plugin.start()
+                    start_worker.assert_called_once()
+                if not enabled:
+                    with mock.patch.object(module.multiprocessing.get_context("spawn"), "Process") as process:
+                        plugin.start()
+                        process.assert_not_called()
                 self.assertIsNone(plugin._proc)
 
     def test_global_stop_recreates_monitor_on_restart(self):
@@ -391,7 +448,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             proc.terminate.side_effect = lambda proc=proc: setattr(proc.is_alive, "return_value", False)
         with mock.patch.object(module, "_NavigationSensorMonitorNode", side_effect=monitors), \
              mock.patch.object(module.multiprocessing.get_context("spawn"), "Process", side_effect=processes):
-            plugin = module.NavigationSensorPlugin({}, "ubuntu", executor)
+            plugin = module.NavigationSensorPlugin({}, "ubuntu", executor, lidar_enabled=True)
             plugin.start()
             old_gate = plugin._gates["imu"]
             old_gate.publish(old_gate.token(), mock.Mock(), object())

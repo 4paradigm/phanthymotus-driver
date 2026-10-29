@@ -297,11 +297,10 @@ class DriverCameraContractTest(unittest.TestCase):
                 "camera_rgb",
                 "camera_depth",
                 "lidar_cloud",
-                "lidar_imu",
             }.issubset(card_names)
         )
         self.assertFalse({"camera_rgb_frame", "camera_depth_frame",
-                          "navigation_lidar", "navigation_imu"} & card_names)
+                          "navigation_lidar", "navigation_imu", "lidar_imu"} & card_names)
 
 
 if __name__ == "__main__":

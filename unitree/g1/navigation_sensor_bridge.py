@@ -587,10 +587,8 @@ class NavigationSensorPlugin:
         self._network_iface = network_iface
         self._config = dict(plugin_config)
         self._lifecycle_lock = threading.RLock()
-        # Both cards can request the same IMU publisher. Keep their lifecycle
-        # requests independent, while publishing each sample only once.
-        self._imu_requests = {"lidar": bool(lidar_enabled), "imu": True}
-        self._requested_outputs = {"cloud": bool(lidar_enabled), "imu": True}
+        # Both navigation outputs belong exclusively to the LiDAR card.
+        self._requested_outputs = {"cloud": bool(lidar_enabled), "imu": bool(lidar_enabled)}
         self._gates = {stream: OutputGate(on) for stream, on in self._requested_outputs.items()}
         self._status_node = _NavigationSensorMonitorNode(plugin_config, namespace)
         executor.add_node(self._status_node)
@@ -599,17 +597,8 @@ class NavigationSensorPlugin:
         self._proc = None
 
     def get_tools(self) -> list[dict]:
-        return [
-            self._tool(
-                "lidar_imu",
-                "Normalized MID360 IMU in the same clock domain as LiDAR",
-                self._status_node.imu_topic,
-                "sensor/imu",
-                "sensor_msgs/msg/Imu",
-                "RELIABLE + KEEP_LAST(depth=200) + VOLATILE",
-                self._status_node.imu_frame,
-            ),
-        ]
+        # Internal worker lifecycle only; lidar_cloud owns the public ports.
+        return []
 
     def cloud_descriptor(self) -> dict:
         return self._tool(
@@ -618,10 +607,15 @@ class NavigationSensorPlugin:
             "sensor_msgs/msg/PointCloud2",
             "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
             self._status_node.lidar_frame,
-        )["topic_out"][0] | {"port": "navigation_lidar"}
+        )["topic_out"][0] | {"port": "navigation_lidar", "associated_imu": self.imu_descriptor()}
 
     def imu_descriptor(self) -> dict:
-        return dict(self.get_tools()[0]["topic_out"][0], port="navigation_imu")
+        return self._tool(
+            "lidar_cloud", "Normalized MID360 IMU",
+            self._status_node.imu_topic, "sensor/imu", "sensor_msgs/msg/Imu",
+            "RELIABLE + KEEP_LAST(depth=200) + VOLATILE",
+            self._status_node.imu_frame,
+        )["topic_out"][0]
 
     @staticmethod
     def _tool(
@@ -707,23 +701,13 @@ class NavigationSensorPlugin:
 
     def set_output(self, stream, enabled, owner=None):
         with self._lifecycle_lock:
-            if stream == "imu":
-                owner = owner or "imu"
-                if owner not in self._imu_requests:
-                    raise ValueError("unknown IMU output owner")
-                requests = dict(self._imu_requests)
-                requests[owner] = bool(enabled)
-                effective_enabled = any(requests.values())
-            else:
-                effective_enabled = bool(enabled)
+            if stream == "imu" and owner not in (None, "lidar"):
+                raise ValueError("unknown IMU output owner")
             if not self._worker_running():
                 self._gates = {s: OutputGate(on) for s, on in self._requested_outputs.items()}
-            self._gates[stream].set_enabled(effective_enabled)
-            if stream == "imu":
-                self._imu_requests = requests
-            self._requested_outputs[stream] = effective_enabled
-            # Releasing an owner must never resurrect a globally stopped
-            # worker, even if a sibling owner still has a retained request.
+            self._gates[stream].set_enabled(bool(enabled))
+            self._requested_outputs[stream] = bool(enabled)
+            # A stop request must not resurrect a globally stopped worker.
             if enabled:
                 self._start_worker()
             elif not any(self._requested_outputs.values()):
@@ -741,25 +725,12 @@ class NavigationSensorPlugin:
                 blockers.append(f"{stream}_not_fresh")
             if not output["enabled"]:
                 blockers = []
-            requested = (self._imu_requests[owner]
-                         if stream == "imu" and owner is not None else output["enabled"])
+            if stream == "imu" and owner not in (None, "lidar"):
+                raise ValueError("unknown IMU output owner")
+            requested = output["enabled"]
             ready = requested and output["ready"] and not blockers
-            if not requested:
-                blockers = []
             return {**status, **output, "enabled": requested, "ready": ready, "blockers": blockers,
                     "worker_running": running,
                     "state": "idle" if not requested else
                     ("ready" if ready else "not_ready"),
                     "worker_pid": self._proc.pid if running else None}
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action in {"start", "stop", "info"}:
-            with self._lifecycle_lock:
-                try:
-                    if action != "info":
-                        self.set_output("imu", action == "start")
-                    return {**self.output_status("imu", owner="imu"),
-                            "topic_out": self.get_tools()[0]["topic_out"]}
-                except (TimeoutError, OSError) as exc:
-                    return {"state": "error", "ready": False, "error": str(exc)}
-        return None
