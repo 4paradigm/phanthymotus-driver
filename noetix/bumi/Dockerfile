@@ -83,10 +83,10 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
 # The bundle image must be able to start the estimator child and this card's
-# Python imports; fail the build here rather than on a robot.
-RUN source /opt/ros/humble/setup.bash && python3 -c \
-    'import rclpy, cv2, numpy, message_filters; from rtabmap_msgs.msg import OdomInfo; from nav_msgs.msg import Odometry; from geometry_msgs.msg import TransformStamped; from tf2_ros import StaticTransformBroadcaster' && \
-    test -x /opt/ros/humble/lib/rtabmap_odom/rgbd_odometry
+# Python imports; fail the build here rather than on a robot. Docker's default
+# shell is /bin/sh (dash), where `source` does not exist — use bash explicitly
+# like the rest of this Dockerfile.
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && python3 -c 'import rclpy, cv2, numpy, message_filters; from rtabmap_msgs.msg import OdomInfo; from nav_msgs.msg import Odometry; from geometry_msgs.msg import TransformStamped; from tf2_ros import StaticTransformBroadcaster' && test -x /opt/ros/humble/lib/rtabmap_odom/rgbd_odometry"
 
 # Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
