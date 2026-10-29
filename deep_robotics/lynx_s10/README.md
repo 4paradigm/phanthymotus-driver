@@ -33,7 +33,7 @@ Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避
 
 ## 部署与镜像
 
-该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS，并额外安装 `drdds` 消息源码构建工具链（`python3-pip`、`python3-colcon-common-extensions`、Fast DDS RMW）及 PyYAML。官方 ROS 基础镜像不含此厂商消息包和 colcon 构建依赖，因此这些新增依赖是运行 S10 ROS 订阅所必需的，会增加镜像体积；apt 使用 `--no-install-recommends` 并清理索引，pip 使用 `--no-cache-dir`，构建结束删除源码归档。消息归档保留在本地 `resource/` 目录但不提交，Docker build 从固定上游 revision 下载并校验 SHA-256。Compose 片段使用 host 网络连接机器人网段，并配置本地日志轮转。
+该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS，并额外安装 `drdds` 消息源码构建工具链（`python3-pip`、`python3-colcon-common-extensions`、Fast DDS RMW）及 PyYAML。官方 ROS 基础镜像不含此厂商消息包和 colcon 构建依赖，因此这些新增依赖是运行 S10 ROS 订阅所必需的，会增加镜像体积；apt 使用 `--no-install-recommends` 并清理索引，pip 使用 `--no-cache-dir`，构建结束删除源码归档。消息归档保留在本地 `resource/` 目录但不提交；统一 `build.sh` 在宿主机复用本地归档，缺失时下载固定上游 revision、校验 SHA-256 后加入临时构建 context，Docker build 本身不访问 GitHub。Compose 片段使用 host 网络连接机器人网段，并配置本地日志轮转。
 
 ## 安全与验证
 

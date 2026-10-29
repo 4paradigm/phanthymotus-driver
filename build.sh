@@ -314,6 +314,25 @@ for idx in "${SELECTED_INDICES[@]}"; do
         done
     fi
 
+    if [ "${dir}" = "deep_robotics/lynx_s10/" ]; then
+        msg_rev="a0d1a29eec5c4db5a9107595bb51e3be8122b86c"
+        msg_sha256="1d268a76e80af8ea5aa3dc28de0c236de87bce55a5d397fdad1e23515f02a537"
+        msg_archive="deep-robotics-msg-${msg_rev}.zip"
+        msg_path="${BUILD_CTX}/resource/${msg_archive}"
+        mkdir -p "${BUILD_CTX}/resource"
+        if [ ! -f "${msg_path}" ]; then
+            echo "获取固定版本的 drdds 消息源码到临时构建 context..."
+            curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
+                "https://github.com/DeepRoboticsLab/deep-robotics-msg/archive/${msg_rev}.zip" \
+                --output "${msg_path}"
+        fi
+        actual_msg_sha256=$(python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${msg_path}")
+        if [ "${actual_msg_sha256}" != "${msg_sha256}" ]; then
+            echo "错误：${msg_archive} 的 SHA-256 校验失败" >&2
+            exit 1
+        fi
+    fi
+
     # Use the builder selected by the active Docker context. Docker Desktop
     # commonly names it desktop-linux; forcing `default` crosses contexts and
     # fails before the build starts.
