@@ -4,8 +4,10 @@ The optional raw RGB-D branch for the visual odometry card has to share that
 pipeline and must never be able to stop JPEG/Z16 media production. Only the
 hardware, codec, ROS and child-process boundaries are replaced here.
 """
+from array import array
 import importlib.util
 import sys
+import zlib
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -119,6 +121,21 @@ def capture(monkeypatch):
     rclpy = sys.modules['rclpy']
     rclpy.init = lambda: None
     return device, state
+
+
+def test_media_uses_byte_buffers_without_changing_encoded_payloads(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    device._camera_subprocess('robot')
+
+    color = state.published['/robot/camera/color'][0]
+    depth = state.published['/robot/camera/depth'][0]
+    assert isinstance(color.data, array) and color.data.typecode == 'B'
+    assert isinstance(depth.data, array) and depth.data.typecode == 'B'
+    assert bytes(color.data) == b'JPEG'
+    assert color.format == 'jpeg'
+    assert zlib.decompress(depth.data) == b'\x01\x00\x02\x00'
+    assert depth.format == '16UC1; compressedDepth zlib'
 
 
 def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(

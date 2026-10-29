@@ -2304,6 +2304,7 @@ def _camera_subprocess(namespace: str):
     from common import logsafe
     logsafe.install(check_fd=False)
 
+    from array import array
     import time as _time
     import numpy as _np
 
@@ -2440,7 +2441,7 @@ def _camera_subprocess(namespace: str):
                 msg = _CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.format = "jpeg"
-                msg.data = jpeg_bytes
+                msg.data = array('B', jpeg_bytes)
                 color_pub.publish(msg)
 
             depth_frame = frames.get_depth_frame()
@@ -2451,7 +2452,7 @@ def _camera_subprocess(namespace: str):
                 msg = _CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.format = "16UC1; compressedDepth zlib"
-                msg.data = compressed
+                msg.data = array('B', compressed)
                 depth_pub.publish(msg)
 
             if raw_inputs is not None:
