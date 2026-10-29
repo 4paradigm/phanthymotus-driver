@@ -3,8 +3,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import shutil
 import socket
 import struct
+import subprocess
 import threading
 import time
 from types import ModuleType, SimpleNamespace
@@ -53,6 +55,9 @@ class FakeNative:
     def send(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return {"state": "sent"}
+
+    def start(self):
+        pass
 
 
 def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypatch):
@@ -119,6 +124,8 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     tools = {item["name"]: item for item in plugin.get_tools()}
     assert tools["joints"]["topic_out"] == [{"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"}]
     assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
+    assert plugin.dispatch("start", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
+    assert plugin.dispatch("start", {"_tool_name": "joints"})["topic_out"][0]["format"] == "sensor/skeleton"
     assert plugin.dispatch("info", {"_tool_name": "lidar"})["topic_out"][0]["format"] == "sensor/pointcloud"
 
 
@@ -235,7 +242,12 @@ def test_model_resource_returns_official_urdf(monkeypatch):
     result = device.S10ModelPlugin().dispatch("model", {})
     root = ET.fromstring(result["urdf"])
     assert root.tag == "robot" and root.get("name") == "S10"
+    assert all(child.tag in {"link", "joint", "material"} for child in root)
     assert root.find("joint[@name='fl_hipx_joint']") is not None
+    checker = shutil.which("check_urdf")
+    if checker:
+        urdf_path = DRIVER / "resource" / "S10.urdf"
+        subprocess.run([checker, str(urdf_path)], check=True, capture_output=True, text=True)
 
 
 def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp_path):
@@ -252,7 +264,7 @@ def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp
     monkeypatch.setattr(module.socket, "socket", lambda *_args: FakeSocket())
 
     def fake_ioctl(_fd, request_code, _request):
-        value = "10.21.33.2" if request_code == 0x8915 else "255.255.255.0"
+        value = "10.21.33.103" if request_code == 0x8915 else "255.255.255.0"
         return b"\0" * 20 + socket.inet_aton(value)
 
     monkeypatch.setattr(module.fcntl, "ioctl", fake_ioctl)
@@ -265,7 +277,7 @@ def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp
     })
     root = ET.parse(profile).getroot()
     addresses = [node.text for node in root.findall(".//{*}interfaceWhiteList/{*}address")]
-    assert addresses == ["127.0.0.1", "10.21.33.2"]
+    assert addresses == ["127.0.0.1", "10.21.33.103"]
     assert root.find(".//{*}useBuiltinTransports").text == "false"
     assert module.os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] == str(profile)
 
@@ -325,6 +337,8 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     environment = dict(item.split("=", 1) for item in service["environment"])
     assert environment["NETWORK_INTERFACE"] == "eth0"
     assert environment["ROBOT_NETWORK_CIDR"] == "10.21.33.0/24"
+    config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
+    assert config["basic_server"]["host"] == "10.21.33.103"
 
 
 def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
@@ -432,23 +446,40 @@ def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeyp
     definition = plugin.get_tool()
     assert definition["inputSchema"]["x-completion"]["actions"] == ["move", "axis"]
     assert definition["inputSchema"]["x-completion"]["timeout"] > 60
-    assert definition["inputSchema"]["x-is-dangerous"] is True
-    assert "confirm" in definition["inputSchema"]["x-action-params"]["move"]["params"]
+    assert "confirm" not in definition["inputSchema"]["properties"]
+    assert all("confirm" not in item["params"] for item in definition["inputSchema"]["x-action-params"].values())
+    assert "x-is-dangerous" not in definition["inputSchema"]
     assert "x-completion" not in definition
     assert definition["name"] == "loco"
     assert {"move", "stop_move", "stand_up", "stand_down", "damp"} <= set(definition["inputSchema"]["x-action-params"])
     try:
-        result = plugin.dispatch("move", {"vx": 0.5, "vy": 0.1, "vyaw": 0.2, "duration": 1, "confirm": True})
+        result = plugin.dispatch("move", {"vx": 0.5, "vy": 0.1, "vyaw": 0.2, "duration": 1})
         assert result["state"] == "streaming"
         assert result["action_id"].startswith("s10_move_")
         assert native.calls[-1][0][1:] == (0x00110002, {"X": 0.5, "Y": 0.1, "Z": 0.0,
                                                         "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.2})
+        assert native.calls[-3][0][1:] == (0x00500002, {"Mode": 1})
+        assert native.calls[-2][0][1:] == (0x00300002, {"GaitParam": 0x3002})
         result = plugin.dispatch("stop_move", {})
         assert result["state"] == "stopped"
         assert native.calls[-2][0][1] == 0x00100002
         assert native.calls[-1][0][1] == 0x00110002
     finally:
         plugin.stop()
+
+
+def test_loco_stand_actions_need_no_confirmation_and_do_not_wait_for_tcp_reply(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    plugin = device.S10MotionPlugin(native)
+    assert plugin.dispatch("stand_up", {}) == {"state": "sent"}
+    assert plugin.dispatch("stand_down", {}) == {"state": "sent"}
+    assert [call[0][1:] for call in native.calls] == [
+        (0x00200002, {"MotionParam": 1}),
+        (0x00200002, {"MotionParam": 4}),
+    ]
+    assert all(call[1] == {} for call in native.calls)
+    plugin.stop()
 
 
 def test_loco_timed_move_expires_with_zero_velocity(monkeypatch):
@@ -459,7 +490,7 @@ def test_loco_timed_move_expires_with_zero_velocity(monkeypatch):
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     plugin.start()
     try:
-        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 0.02, "confirm": True})
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 0.02})
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             if len(native.calls) >= 2 and native.calls[-1][0][2]["X"] == 0:
@@ -484,7 +515,7 @@ def test_loco_explicit_stop_cancels_move_and_sends_zero(monkeypatch):
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     try:
-        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": -1, "confirm": True})
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": -1})
         assert accepted["duration"] == 60
         assert plugin.dispatch("stop_move", {})["state"] == "stopped"
         assert terminals == [(accepted["action_id"], "cancelled", {
@@ -504,7 +535,7 @@ def test_axis_stream_has_action_id_and_acp_cancel(monkeypatch):
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     try:
-        accepted = plugin.dispatch("axis", {"x": 0.2, "duration": 60, "confirm": True})
+        accepted = plugin.dispatch("axis", {"x": 0.2, "duration": 60})
         assert accepted["action_id"].startswith("s10_axis_")
         assert plugin.dispatch("stop_move", {})["state"] == "stopped"
         assert terminals == [(accepted["action_id"], "cancelled", {
@@ -520,7 +551,7 @@ def test_zero_duration_stream_completes_acp_immediately(monkeypatch):
     plugin = device.S10MotionPlugin(native)
     terminals = []
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
-    result = plugin.dispatch("axis", {"x": 0, "duration": 0, "confirm": True})
+    result = plugin.dispatch("axis", {"x": 0, "duration": 0})
     assert result["state"] == "stopped"
     assert result["action_id"].startswith("s10_axis_")
     assert terminals == [(result["action_id"], "completed", {
@@ -534,7 +565,7 @@ def test_loco_stream_send_error_reports_terminal_error(monkeypatch):
     class FailingNative(FakeNative):
         def send(self, *args, **kwargs):
             self.calls.append((args, kwargs))
-            if len(self.calls) == 2:
+            if len(self.calls) == 4:
                 raise OSError("socket closed")
             return {"state": "sent"}
 
@@ -544,7 +575,7 @@ def test_loco_stream_send_error_reports_terminal_error(monkeypatch):
     plugin._acp_callback = lambda action_id, status, result: terminals.append((action_id, status, result))
     plugin.start()
     try:
-        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 1, "confirm": True})
+        accepted = plugin.dispatch("move", {"vx": 0.2, "duration": 1})
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline and not terminals:
             time.sleep(0.01)
@@ -608,13 +639,6 @@ def test_dangerous_s10_commands_require_literal_confirmation(monkeypatch):
     device = _load_device(monkeypatch)
     native = FakeNative({})
     cases = [
-        (device.S10MotionPlugin(native), "move"),
-        (device.S10MotionPlugin(native), "axis"),
-        (device.S10MotionPlugin(native), "stand_up"),
-        (device.S10MotionPlugin(native), "damp"),
-        (device.S10MotionPlugin(native), "gait"),
-        (device.S10MotionPlugin(native), "mode"),
-        (device.S10MotionPlugin(native), "rl_control"),
         (device.S10NavigationPlugin(native), "goal"),
         (device.S10NavigationPlugin(native), "localize"),
         (device.S10DevicePlugin(native), "sleep"),

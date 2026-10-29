@@ -237,6 +237,13 @@ class S10StatePlugin:
         }
         topics = self.nodes.topics if self.nodes else {}
         return [tool(name, "sensor", description, topic_out=[topics[name]] if name in topics else None) for name, description in cards.items()]
+
+    def _topic_result(self, name, state):
+        result = {"state": state}
+        if self.nodes and name in self.nodes.topics:
+            result["topic_out"] = [self.nodes.topics[name]]
+        return result
+
     def start(self): self.native.start()
     def stop(self):
         if self.nodes: self.nodes.close()
@@ -245,12 +252,12 @@ class S10StatePlugin:
         name = args.get("_tool_name", "state")
         if action == "start":
             self.native.start()
-            return {"state": "running"}
+            return self._topic_result(name, "running")
         if action == "stop":
             # The TCP client is shared by every S10 card and is closed only
             # when the driver bundle itself shuts down.
-            return {"state": "idle"}
-        if action == "info": return {"state": "ready", **({"topic_out": [self.nodes.topics[name]]} if self.nodes and name in self.nodes.topics else {})}
+            return self._topic_result(name, "idle")
+        if action == "info": return self._topic_result(name, "ready")
         reports = self.native.snapshot()["reports"]
         keys = {"imu": "1048577:15728640", "joints": "1048577:15728640",
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
@@ -289,7 +296,6 @@ class S10StatePlugin:
 
 
 class S10MotionPlugin:
-    CONFIRM_ACTIONS = {"move", "axis", "stand_up", "stand_down", "damp", "gait", "mode", "rl_control"}
     ACTIONS = {
         "move": (["vx", "vy", "vyaw", "duration"], "导航模式下按速度移动；duration=-1 为兼容写法，最多持续 60 秒"),
         "stop_move": ([], "立即发送零速度停止运动"),
@@ -316,7 +322,7 @@ class S10MotionPlugin:
             except Exception as exc:
                 print(f"[ACP] {active['action_id']}: {exc}", flush=True)
     def get_tool(self):
-        result = tool("loco", "actuator", "山猫 S10 运动控制；危险动作需要显式 confirm=true。duration=-1 最多持续 60 秒", action_schema(self.ACTIONS, {
+        result = tool("loco", "actuator", "山猫 S10 运动控制。move 会切换到导航模式和平地步态后执行；duration=-1 最多持续 60 秒", action_schema(self.ACTIONS, {
             "gait": {"type": "string", "enum": list(GAITS)},
             "mode": {"type": "string", "enum": list(MODES)},
             **{axis: {"type": "number", "minimum": -1, "maximum": 1} for axis in ("x", "y", "z", "roll", "pitch", "yaw")},
@@ -325,12 +331,8 @@ class S10MotionPlugin:
             "vyaw": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "Navigation yaw rate in rad/s"},
             "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": 1,
                          "description": "Seconds; -1 is a compatibility alias for 60 seconds; 0 stops immediately"},
-            "confirm": {"type": "boolean", "description": "Required true for physical motion or control-mode changes."},
         }))
         schema = result["inputSchema"]
-        schema["x-is-dangerous"] = True
-        for action in self.CONFIRM_ACTIONS:
-            schema["x-action-params"][action]["params"].append("confirm")
         schema["x-completion"] = {"actions": ["move", "axis"], "timeout": 65}
         return result
     def start(self):
@@ -394,10 +396,6 @@ class S10MotionPlugin:
                         exc = RuntimeError(f"{exc}; zero command failed: {stop_exc}")
                     self._finish(command, "error", {"state": "error", "message": str(exc)})
     def dispatch(self, action, args):
-        if action in self.CONFIRM_ACTIONS:
-            error = _confirmation_error(action, args)
-            if error:
-                return error
         if action == "start": return {"state": "ready"}
         if action == "stop":
             self._stop_stream()
@@ -409,13 +407,13 @@ class S10MotionPlugin:
         if action in LOCO_STATES:
             self._stop_stream()
             value = LOCO_STATES[action]
-            return self.native.request(0x00100001, 0x00200002, {"MotionParam": value})
+            return self.native.send(0x00100001, 0x00200002, {"MotionParam": value})
         if action == "gait":
             self._stop_stream()
-            return self.native.request(0x00100001, 0x00300002, {"GaitParam": GAITS[args["gait"]]})
+            return self.native.send(0x00100001, 0x00300002, {"GaitParam": GAITS[args["gait"]]})
         if action == "mode":
             self._stop_stream()
-            return self.native.request(0x00100002, 0x00500002, {"Mode": MODES[args["mode"]]})
+            return self.native.send(0x00100002, 0x00500002, {"Mode": MODES[args["mode"]]})
         if action in ("axis", "move"):
             axes = ("x", "y", "z", "roll", "pitch", "yaw")
             wire_names = {"x": "X", "y": "Y", "z": "Z", "roll": "Roll", "pitch": "Pitch", "yaw": "Yaw"}
@@ -436,6 +434,9 @@ class S10MotionPlugin:
                 self._finish({"action_id": action_id}, "completed", {"state": "stopped", "reason": "zero_duration"})
                 return {"state": "stopped", "sent_zero_to": ["axis", "velocity"], "action_id": action_id}
             self._stop_stream()
+            if action == "move":
+                self.native.send(0x00100002, 0x00500002, {"Mode": MODES["navigation"]})
+                self.native.send(0x00100001, 0x00300002, {"GaitParam": GAITS["navigation_flat"]})
             action_id = f"s10_{action}_{uuid4().hex}"
             sent = self.native.send(message_type, command, items)
             with self._condition:

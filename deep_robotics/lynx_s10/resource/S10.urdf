@@ -1,9 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <robot
   name="S10">
-  <mujoco>
-    <compiler meshdir="./meshes/" balanceinertia="false" discardvisual="false"/>
-  </mujoco>
   <link
     name="base_link">
     <inertial>
