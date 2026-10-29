@@ -1523,3 +1523,18 @@ def test_competing_action_reservation_released_after_exception(monkeypatch):
         plugin.dispatch('reset', {'_tool_name': 'semantic_action'})
     plugin.dispatch('rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 0})
     assert wait_rotate(plugin)['state'] == 'done'
+
+
+def test_start_binds_optional_odometry_input(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.setattr(module, '_get_control_cmd', lambda name: name)
+    nodes = []
+    plugin = module.LocoPlugin({}, 'robot', types.SimpleNamespace(add_node=nodes.append),
+                               FakeHighCtrl())
+    result = plugin.dispatch('start', {'input_topic': '/bumi_visual_odometry/state/odom'})
+    assert result['state'] == 'ready'
+    assert result['feedback_source'] == 'visual_odometry'
+    assert plugin._odom_input_topic == '/bumi_visual_odometry/state/odom'
+    assert nodes and nodes[0].subscriptions[0][0] == '/bumi_visual_odometry/state/odom'
+    plugin.dispatch('stop', {})
+    assert plugin._odom_input_topic == ''

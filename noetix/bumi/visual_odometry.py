@@ -362,6 +362,8 @@ class VisualOdometryNode:
         sample = self.publish()
         return dict(state='running' if self.active else 'idle',
                     topic_out=[{'topic': STATUS_TOPIC, 'format': 'data/json',
+                                'message_type': 'std_msgs/msg/String'},
+                               {'topic': OUTPUT_TOPIC, 'format': 'state/odom',
                                 'message_type': 'std_msgs/msg/String'}],
                     odom_topic=self.output,
                     sample=sample,
@@ -806,7 +808,8 @@ class VisualOdometryPlugin:
                 'calibration': {'type': 'object',
                                 'description': 'Optional measured camera_to_body mount; '
                                                'without it the pose stays in the optical frame'}}},
-            'topic_out': [{'topic': STATUS_TOPIC, 'format': 'data/json'}],
+            'topic_out': [{'topic': STATUS_TOPIC, 'format': 'data/json'},
+                          {'topic': OUTPUT_TOPIC, 'format': 'state/odom'}],
         }]
 
     def start(self) -> None:

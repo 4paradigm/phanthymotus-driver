@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+import threading
 import time
 
 from leg_odometry import LEG_SLIP_SCALE, LegOdometry, joint_angles
@@ -34,6 +35,131 @@ def decode_imu(sample):
     if 1-2*(x*x+y*y) < math.cos(math.radians(20)):
         raise ValueError('IMU tilt exceeds the experimental 20 degree limit')
     return world, gyro, yaw, (*q, *acc, *gyro)
+
+
+class ExternalOdom:
+    """Optional ``motus.odom/1`` feedback for target moves.
+
+    Position-only by design: heading/rotation stay on the IMU. The visual
+    odometry topic arrives as JSON; this class validates it, remembers the pose
+    at move start and returns displacement in the move-start body frame. It is
+    ROS-free so the parser and frame math are unit-testable on a laptop.
+    """
+
+    MAX_AGE_S = 0.6
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._latest = None
+        self._arrival = None
+        self._last_position = None
+        self._last_arrival = None
+        self._error = "no odometry sample yet"
+        self._origin = None
+        self._origin_yaw = None
+        self._segment = None
+        self._armed = False
+
+    @staticmethod
+    def _yaw(quaternion):
+        x, y, z, w = quaternion
+        return math.atan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
+
+    def update(self, text, now):
+        """Parse one sample; an invalid sample makes the input unusable."""
+        try:
+            data = json.loads(text)
+            if data.get('schema') != 'motus.odom/1':
+                raise ValueError('not a motus.odom/1 sample')
+            pose = data.get('pose')
+            vendor = data.get('vendor') or {}
+            if not isinstance(pose, dict) or vendor.get('status') != 'tracking':
+                raise ValueError('odometry is not tracking')
+            if vendor.get('pose_reference') not in ('body', 'body_axes'):
+                raise ValueError('odometry is not in body axes')
+            position = [float(v) for v in pose['position']]
+            quaternion = [float(v) for v in pose['quaternion']]
+            if (len(position) != 3 or len(quaternion) != 4
+                    or not all(math.isfinite(v) for v in position+quaternion)):
+                raise ValueError('odometry pose is not finite')
+            norm = math.hypot(*quaternion)
+            if not 0.8 <= norm <= 1.2:
+                raise ValueError('odometry quaternion norm invalid')
+            segment = vendor.get('segment_id')
+            if not isinstance(segment, str) or not segment:
+                raise ValueError('odometry has no segment id')
+            with self._lock:
+                if (self._last_position is not None and self._last_arrival is not None
+                        and segment == (self._latest or {}).get('segment')):
+                    dt = now-self._last_arrival
+                    if (dt > 0 and math.dist(position, self._last_position)
+                            > 1.5*dt + 0.10):
+                        raise ValueError('odometry position jumped')
+                self._latest = dict(position=position, quaternion=quaternion,
+                                    segment=segment, stamp_ms=data.get('stamp_ms'))
+                self._arrival = now
+                self._last_position = position
+                self._last_arrival = now
+                self._error = None
+        except Exception as exc:  # noqa: BLE001 - bad input is a state, not a crash
+            with self._lock:
+                self._latest = None
+                self._arrival = None
+                self._error = str(exc)
+
+    def fresh(self, now):
+        with self._lock:
+            if self._latest is None or self._arrival is None:
+                return False
+            return now-self._arrival <= self.MAX_AGE_S
+
+    def clear(self):
+        with self._lock:
+            self._armed = False
+            self._origin = self._origin_yaw = self._segment = None
+
+    def begin(self, now, timeout_s=1.5):
+        """Capture the current pose as the move-start frame, or raise."""
+        deadline = now+timeout_s
+        while now < deadline:
+            if self.fresh(now):
+                break
+            time.sleep(0.02)
+            now = time.monotonic()
+        if not self.fresh(now):
+            with self._lock:
+                reason = self._error or 'odometry input has no fresh sample'
+            raise ValueError(reason)
+        with self._lock:
+            latest = dict(self._latest)
+            self._origin = latest['position']
+            self._origin_yaw = self._yaw(latest['quaternion'])
+            self._segment = latest['segment']
+            self._armed = True
+
+    def body_position(self, now):
+        if not self._armed:
+            raise ValueError('odometry feedback was not armed')
+        if not self.fresh(now):
+            raise ValueError('odometry feedback is stale')
+        with self._lock:
+            latest = dict(self._latest)
+            origin = list(self._origin)
+            yaw0 = self._origin_yaw
+            segment = self._segment
+            if latest is None or latest['segment'] != segment:
+                raise ValueError('odometry segment changed during the move')
+        dx = latest['position'][0]-origin[0]
+        dy = latest['position'][1]-origin[1]
+        c, s = math.cos(yaw0), math.sin(yaw0)
+        return c*dx + s*dy, -s*dx + c*dy
+
+    def status(self, now):
+        with self._lock:
+            return dict(fresh=self.fresh(now),
+                        error=self._error,
+                        segment=self._segment or (self._latest or {}).get('segment'),
+                        age_s=None if self._arrival is None else round(now-self._arrival, 3))
 
 
 class ImuOdometry:
@@ -173,7 +299,7 @@ def _write_trace(samples, commands, result):
         old.unlink()
 
 
-def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
+def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None, odom_feedback=None):
     """Drive to a point (x forward, y left, metres) in the start body frame.
 
     Uses forward motion plus heading control only: turn in place toward the
@@ -214,7 +340,8 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     result = dict(state='error', action='move',
                   requested_target_x_m=target_x, requested_target_y_m=target_y,
                   requested_distance_m=target_distance,
-                  feedback_source='leg_odometry_experimental',
+                  feedback_source=('visual_odometry' if odom_feedback is not None
+                                   else 'leg_odometry_experimental'),
                   accuracy_validated=False, source_timestamp_available=False,
                   stationary_assumed=False)
     source_position, source_velocity = estimator.position, estimator.velocity
@@ -266,6 +393,8 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                 continue
             if motion_started is None:
                 motion_started = progress_at = changed_at = now
+                if odom_feedback is not None:
+                    odom_feedback.begin(now)
                 if leg is not None:
                     leg.reset_baseline()
                     # Re-read after the reset: the first motion sample must use
@@ -281,10 +410,15 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                 changed_at, last_signature = now, estimator.signature
             if brake_started is None and now-changed_at > 0.5:
                 raise ValueError('IMU data unchanged during motion; source freshness cannot be verified')
-            x, y, _ = source_position
-            cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
-            body_x = x*cy + y*sy
-            body_y = -x*sy + y*cy
+            if odom_feedback is not None:
+                # Already in the move-start body frame; do not rotate again.
+                body_x, body_y = odom_feedback.body_position(now)
+                source_position = (body_x, body_y, 0.0)
+            else:
+                x, y, _ = source_position
+                cy, sy = math.cos(origin_yaw), math.sin(origin_yaw)
+                body_x = x*cy + y*sy
+                body_y = -x*sy + y*cy
             to_x, to_y = target_x-body_x, target_y-body_y
             distance = math.hypot(to_x, to_y)
             bearing = math.atan2(to_y, to_x)
@@ -376,9 +510,13 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                     # add a comfort heading turn (that turn's slide cannot be
                     # measured well enough to revalidate the endpoint; use the
                     # rotate action afterwards if the final facing matters).
-                    fx, fy, _ = source_position
-                    final_body_x = fx*cy + fy*sy
-                    final_body_y = -fx*sy + fy*cy
+                    if odom_feedback is not None:
+                        final_body_x, final_body_y = odom_feedback.body_position(
+                            time.monotonic())
+                    else:
+                        fx, fy, _ = source_position
+                        final_body_x = fx*cy + fy*sy
+                        final_body_y = -fx*sy + fy*cy
                     final_error = math.hypot(target_x-final_body_x,
                                              target_y-final_body_y)
                     result['final_position_error_m'] = final_error
@@ -407,7 +545,10 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
         final_heading_deg=result.get('final_heading_deg'),
         estimated_position_m=source_position,
         estimated_velocity_mps=source_velocity,
-        distance_source='leg_odometry' if leg is not None else 'imu_integrated',
+        distance_source=('visual_odometry' if odom_feedback is not None
+                         else ('leg_odometry' if leg is not None else 'imu_integrated')),
+        odom_feedback=(odom_feedback.status(time.monotonic())
+                       if odom_feedback is not None else None),
         leg_samples=(getattr(leg, 'samples', None) if leg is not None else None),
         leg_stance_samples=(getattr(leg, 'stance_samples', None) if leg is not None else None),
         leg_joint_updates=(joint_updates if leg is not None else None),

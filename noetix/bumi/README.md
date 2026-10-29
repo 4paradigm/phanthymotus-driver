@@ -480,7 +480,9 @@ estimator.
 
 It is **not** a fusion or feedback source: there is no IMU input, no
 robot_localization/EKF, no visual-inertial fusion, and the output is not wired
-into `loco_target`/`loco_servo`. The shipped config applies the standard
+into `loco_target`/`loco_servo`. The full `motus.odom/1` sample is declared as a
+second `state/odom` canvas output, so `loco_relative_move` can optionally use it
+as position feedback (IMU remains the heading source). The shipped config applies the standard
 level-forward mount so `position` uses robot body axes (x forward, y left, z up;
 reported as `pose_reference: body_axes`, a convention rather than a measured
 extrinsic). The card defaults to `initializing` and

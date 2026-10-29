@@ -107,8 +107,9 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     tool = tools[0]
     assert tool['name'] == 'rgbd_visual_odometry'
     assert tool['type'] == 'sensor' and tool['multiInstance'] is False
-    assert tool['topic_out'] == [{'topic': '/bumi_visual_odometry/status',
-                                  'format': 'data/json'}]
+    assert tool['topic_out'] == [
+        {'topic': '/bumi_visual_odometry/status', 'format': 'data/json'},
+        {'topic': '/bumi_visual_odometry/state/odom', 'format': 'state/odom'}]
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
         'start', 'stop', 'info'}
     assert 'x-action-params' not in tool['inputSchema']

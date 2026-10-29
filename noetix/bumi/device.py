@@ -403,6 +403,18 @@ class LocoPlugin:
                 except (TypeError, ValueError):
                     pass
 
+        # Optional target-move feedback from a `state/odom` card. The node and
+        # subscription are created only when the canvas supplies input_topic;
+        # without it the existing leg/IMU path is unchanged.
+        from imu_distance_control import ExternalOdom
+        self._odom_feedback = ExternalOdom()
+        self._odom_input_topic = ""
+        self._odom_node = None
+        self._odom_sub = None
+        if executor is not None:
+            self._odom_node = Node("bumi_loco_odometry_input")
+            executor.add_node(self._odom_node)
+
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
@@ -410,6 +422,32 @@ class LocoPlugin:
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def _set_odom_input(self, topic: str) -> None:
+        """(Re)bind the optional state/odom feedback topic, or clear it."""
+        if self._odom_sub is not None and self._odom_node is not None:
+            destroy = getattr(self._odom_node, 'destroy_subscription', None)
+            if destroy is not None:
+                destroy(self._odom_sub)
+        self._odom_sub = None
+        self._odom_input_topic = topic
+        self._odom_feedback.clear()
+        if not topic:
+            return
+        if self._odom_node is None:
+            raise ValueError("没有 ROS 上下文，无法订阅里程计输入")
+        try:
+            from rclpy.qos import qos_profile_sensor_data as _qos
+        except ImportError:
+            _qos = 10
+        self._odom_sub = self._odom_node.create_subscription(
+            String, topic,
+            lambda msg: self._odom_feedback.update(msg.data, time.monotonic()),
+            _qos)
+
+    def _odom_status(self) -> dict:
+        return dict(input_topic=self._odom_input_topic or None,
+                    **self._odom_feedback.status(time.monotonic()))
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -526,7 +564,7 @@ class LocoPlugin:
     def _loco_relative_move_tool(self) -> dict:
         return {
             "name": "loco_relative_move", "type": "actuator", "multiInstance": False,
-            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
+            "description": "Bumi 目标运动：按 x/y 目标点前进+转弯走过去，或按 IMU 航向原地旋转指定角度。可选连接 state/odom 卡作为目标移动的位置反馈；未连接时仍使用原有 IMU/腿部里程计。目标移动前须保持机器人静止以标定；位置估计存在打滑与漂移，实际精度未经验证。旋转容差 ±2°。须已处于行走模式，地面平坦防滑，运动区域无人无障碍。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -537,6 +575,8 @@ class LocoPlugin:
                             "description": "move 动作：目标点在启动时机身系的左右坐标（米，正=左）。"},
                     "angle_deg": {"type": "number", "minimum": -360, "maximum": 360,
                                   "description": "原地转角（度）。正=左转（逆时针），负=右转。"},
+                    "input_topic": {"type": "string",
+                                    "description": "可选：state/odom 输入话题；留空则使用原有 IMU/腿部里程计反馈。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -559,6 +599,8 @@ class LocoPlugin:
                 },
             },
             "topic_out": [],
+            "topic_in": [{"format": "state/odom",
+                          "desc": "可选 motus.odom/1 位置反馈；连接后目标移动优先使用，未连接时回退到腿部/IMU 逻辑"}],
         }
 
     def _stand_up_lie_prone_tool(self) -> dict:
@@ -684,7 +726,16 @@ class LocoPlugin:
         if action == "config" and args.get('_tool_name') == 'loco_relative_move':
             return self._apply_distance_config(args)
         if action == "start":
-            return {"state": "ready"}
+            topic = (args.get("input_topic") or "").strip()
+            if not topic:
+                topic = ((args.get("input_topics") or [""])[0] or "").strip()
+            try:
+                self._set_odom_input(topic)
+            except Exception as exc:
+                return {"state": "error", "error": str(exc)}
+            return {"state": "ready", "odom_input": topic or None,
+                    "feedback_source": "visual_odometry" if topic else
+                    "leg_odometry_experimental"}
         if action == "stop":
             # The streaming card goes first. Stopping the chassis and leaving a
             # policy publishing into it means the next command restarts the
@@ -692,6 +743,7 @@ class LocoPlugin:
             # log connecting the two.
             self._preempt_servo("loco.stop")
             self._stop_move()
+            self._set_odom_input("")
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
@@ -900,7 +952,9 @@ class LocoPlugin:
                         **({"requested_target_x_m": float(args.get('x_m')),
                             "requested_target_y_m": float(args.get('y_m'))}
                            if action == "move" else {}),
-                        **({'feedback_source': 'leg_odometry_experimental',
+                        **({'feedback_source': ('visual_odometry'
+                                                if self._odom_input_topic
+                                                else 'leg_odometry_experimental'),
                             'accuracy_validated': False} if action == 'move' else {})}
         except Exception as exc:
             terminal = {"state": "error",
@@ -1056,10 +1110,26 @@ class LocoPlugin:
             if self._move_thread.is_alive():
                 return {"state": "error", "error": "previous move has not stopped"}
         self._set_servo_velocity_owner(True)
+        odom = self._odom_feedback if self._odom_input_topic else None
+        # If feedback is configured, a move must start from a fresh pose; do
+        # not silently fall back to leg odometry after the operator connected
+        # an odometry source.
+        if odom is not None:
+            try:
+                odom.begin(time.monotonic(), timeout_s=1.5)
+            except Exception as exc:
+                self._set_servo_velocity_owner(False)
+                return {"state": "error",
+                        "error": f"odometry feedback unavailable: {exc}",
+                        "feedback_source": "visual_odometry",
+                        "accuracy_validated": False}
         result = run_target(self, float(args['x_m']), float(args['y_m']),
                             full_scale=self._distance_full_scale(),
-                            slip_scale=self._slip_scales['forward'])
-        result['estimated_quality'] = 'experimental_unvalidated'
+                            slip_scale=self._slip_scales['forward'],
+                            odom_feedback=odom)
+        result['estimated_quality'] = ('visual_odometry_feedback'
+                                       if odom is not None else
+                                       'experimental_unvalidated')
         return result
 
     def _read_rotate_imu(self) -> tuple[float, float]:
@@ -1333,9 +1403,13 @@ class LocoPlugin:
 
     def _rotate_status(self) -> dict:
         with self._rotate_lock:
-            return {"state": self._rotate_state["state"],
-                    "last_result": self._rotate_state["last_result"],
-                    **({"action": self._destination_action} if self._rotate_state["state"] == "running" else {})}
+            result = {"state": self._rotate_state["state"],
+                      "last_result": self._rotate_state["last_result"],
+                      **({"action": self._destination_action}
+                         if self._rotate_state["state"] == "running" else {})}
+            if self._odom_input_topic:
+                result["odom_input"] = self._odom_status()
+            return result
 
     def _do_posture_action(self, action: str, args: dict) -> dict:
         safety = self._safety_requirements(action)
