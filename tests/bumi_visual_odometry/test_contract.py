@@ -10,7 +10,7 @@ from types import SimpleNamespace as NS
 import numpy as np
 import pytest
 
-from common.visual_odometry import (CameraCalibration, ClockMap, Health,
+from noetix.bumi.visual_odometry_contract import (CameraCalibration, ClockMap, Health,
                                     camera_to_body, finite, make_sample, quat_matrix)
 from noetix.bumi.visual_odometry import estimate, mount_transform, parameter_file
 

@@ -46,7 +46,9 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
 #
 # The base image carries /opt/ros/humble but no ROS 2 apt source (only the Ubuntu
 # archive is configured), so `ros-humble-*` is invisible to apt until the ROS
-# repository and its signing key are added. Try the configured mirror first and
+# repository and its signing key are added. Only rtabmap-odom is installed
+# explicitly: it declares tf2_ros and the message packages itself, so repeating
+# them here would not change the installed set. Try the configured mirror first and
 # fall back to the official archive; the key itself is tried from the same
 # mirror, GitHub and the official key URL.
 RUN set -eu; \
@@ -64,7 +66,7 @@ RUN set -eu; \
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \
         > /etc/apt/sources.list.d/ros2.list; \
       if apt-get update && apt-get install -y --no-install-recommends \
-           ros-humble-rtabmap-odom ros-humble-tf2-ros; then \
+           ros-humble-rtabmap-odom; then \
         installed=1; break; \
       fi; \
       rm -rf /var/lib/apt/lists/*; \
@@ -130,6 +132,7 @@ COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
 COPY visual_inputs.py /work/visual_inputs.py
 COPY visual_odometry.py /work/visual_odometry.py
+COPY visual_odometry_contract.py /work/visual_odometry_contract.py
 COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py

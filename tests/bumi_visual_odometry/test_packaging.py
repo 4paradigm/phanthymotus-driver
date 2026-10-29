@@ -16,7 +16,9 @@ BUMI = ROOT/'noetix/bumi'
 def test_image_installs_the_estimator_and_starts_it_inside_the_bundle():
     text = (BUMI/'Dockerfile').read_text()
     assert 'ros-humble-rtabmap-odom' in text
-    assert 'ros-humble-tf2-ros' in text
+    # rtabmap-odom already declares tf2_ros; a second direct install would not
+    # change the installed set, only the apt command.
+    assert 'ros-humble-tf2-ros' not in text
     # The base image has no ROS 2 apt source; the Dockerfile has to add the
     # repository and its keyring (Tsinghua mirror with the official fallback).
     assert 'mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu' in text
@@ -26,6 +28,7 @@ def test_image_installs_the_estimator_and_starts_it_inside_the_bundle():
     assert 'from tf2_ros import StaticTransformBroadcaster' in text
     assert 'COPY visual_odometry.py /work/visual_odometry.py' in text
     assert 'COPY visual_odometry_probe.py /work/visual_odometry_probe.py' in text
+    assert 'COPY visual_odometry_contract.py /work/visual_odometry_contract.py' in text
     assert 'robot-localization' not in text and 'robot_localization' not in text
     assert 'ekf_node' not in text
 
@@ -64,7 +67,8 @@ def test_estimator_module_has_no_fusion_path():
     # parameters and imports are what must not carry them.
     for forbidden in ('ekf_node', 'imu0', 'odom0'):
         assert forbidden not in text
-    assert (ROOT/'common/visual_odometry.py').exists()
+    assert (BUMI/'visual_odometry_contract.py').exists()
+    assert not (ROOT/'common/visual_odometry.py').exists()
 
 
 def test_the_feature_does_not_ship_a_second_driver_or_planning_docs():

@@ -11,7 +11,10 @@ import json
 import time
 import uuid
 
-from common.visual_odometry import ClockMap, finite
+try:  # imported as part of the noetix.bumi namespace in tests
+    from .visual_odometry_contract import ClockMap, finite
+except ImportError:  # imported as a top-level /work module by the camera subprocess
+    from visual_odometry_contract import ClockMap, finite
 
 
 def camera_metadata(color, depth, *, epoch, depth_scale, received_ns):

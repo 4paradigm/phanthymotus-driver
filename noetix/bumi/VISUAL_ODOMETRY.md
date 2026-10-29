@@ -100,8 +100,9 @@ on hardware; do not use the rendered URDF as a measured extrinsic.
 
 ## Build and probe
 
-The bundle image installs `ros-humble-rtabmap-odom` and `ros-humble-tf2-ros` and
-verifies the estimator executable at build time. The shared ROS base image only
+The bundle image installs `ros-humble-rtabmap-odom` and verifies the estimator
+executable at build time; `tf2_ros` and the message packages come transitively
+from that package, so they are not installed twice. The shared ROS base image only
 contains `/opt/ros/humble`; it does **not** configure a ROS 2 apt source, so the
 Dockerfile adds the repository and its signing key first. It defaults to the
 Tsinghua `ros2/ubuntu` mirror (the build machine is in Tencent Cloud) and falls

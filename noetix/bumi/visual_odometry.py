@@ -25,10 +25,16 @@ import threading
 import time
 import uuid
 
-from common.visual_odometry import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
-                                    MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
-                                    MAX_TRANSPORT_NS, finite, make_sample,
-                                    quat_matrix)
+try:  # imported as part of the noetix.bumi namespace in tests
+    from .visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
+                                           MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
+                                           MAX_TRANSPORT_NS, finite, make_sample,
+                                           quat_matrix)
+except ImportError:  # imported as a top-level /work module inside the bundle image
+    from visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
+                                          MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
+                                          MAX_TRANSPORT_NS, finite, make_sample,
+                                          quat_matrix)
 
 PACKAGE = 'rtabmap_odom'
 EXECUTABLE = 'rgbd_odometry'
@@ -518,7 +524,10 @@ class VisualOdometryNode:
         self.last_visual_monotonic = time.monotonic()
 
     def diagnostic(self, msg):
-        from common.visual_odometry import MIN_INLIERS
+        try:
+            from .visual_odometry_contract import MIN_INLIERS
+        except ImportError:
+            from visual_odometry_contract import MIN_INLIERS
         valid = not msg.lost and msg.inliers >= MIN_INLIERS and msg.matches >= msg.inliers
         if not valid and not self.diagnostic_started:
             return  # first registration has no motion estimate yet
@@ -603,4 +612,8 @@ class VisualOdometryPlugin:
                 return node.reset()
             if action == 'config':
                 return node.configure(args)
-            return node.info()  # info, or the bare tool name
+            if action in ('info', 'rgbd_visual_odometry'):
+                # The bundle dispatcher passes the bare tool name when a client
+                # calls the card without an explicit action; keep that as info.
+                return node.info()
+            return None  # unknown actions must be rejected, not reported as success

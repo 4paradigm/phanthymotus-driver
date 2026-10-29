@@ -165,8 +165,37 @@ def test_raw_publish_failures_never_stop_media_production(capture, monkeypatch, 
     assert len(failures) == 2
     assert len(state.published['/robot/camera/color']) == 2
     assert len(state.published['/robot/camera/depth']) == 2
-    assert capsys.readouterr().out.count(
-        'raw RGB-D publish failed: raw branch exploded') == 2
+    # First failure is reported, the second one is not: the 30 Hz loop must not
+    # flood a rotated Docker log with one record per frame.
+    output = capsys.readouterr().out
+    assert output.count('raw RGB-D publish failed') == 1
+    assert 'failure #1): raw branch exploded' in output
+    assert state.stopped
+
+
+def test_persistent_raw_failures_are_log_sampled(capture, monkeypatch, capsys):
+    device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
+    state.frame_limit = 250
+    failures = []
+
+    class RawCameraPublisher:
+        def __init__(self, *args):
+            pass
+
+        def publish(self, source_frames, aligned_frames):
+            failures.append(source_frames)
+            raise RuntimeError('raw branch stayed broken')
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(RawCameraPublisher=RawCameraPublisher))
+    device._camera_subprocess('robot')
+    assert len(failures) == 250
+    assert len(state.published['/robot/camera/color']) == 250
+    output = capsys.readouterr().out
+    # 1st, 100th and 200th failure only.
+    assert output.count('raw RGB-D publish failed') == 3
+    assert 'failure #1)' in output and 'failure #100)' in output and 'failure #200)' in output
     assert state.stopped
 
 

@@ -2407,6 +2407,7 @@ def _camera_subprocess(namespace: str):
     # shares this pipeline and must never take media production down: construction
     # and every publish are wrapped, and a fault only logs.
     raw_inputs = None
+    raw_publish_failures = 0
     if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1":
         try:
             from visual_inputs import RawCameraPublisher
@@ -2451,7 +2452,12 @@ def _camera_subprocess(namespace: str):
                 try:
                     raw_inputs.publish(source_frames, frames)
                 except Exception as _e:
-                    print(f"[camera_subprocess] raw RGB-D publish failed: {_e}", flush=True)
+                    # Throttled: the capture loop is 30 Hz and a persistent
+                    # failure must not turn into 30 rotated-log records/second.
+                    raw_publish_failures += 1
+                    if raw_publish_failures == 1 or raw_publish_failures % 100 == 0:
+                        print(f"[camera_subprocess] raw RGB-D publish failed "
+                              f"(failure #{raw_publish_failures}): {_e}", flush=True)
 
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)

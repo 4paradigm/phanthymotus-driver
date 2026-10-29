@@ -143,3 +143,9 @@ def test_info_is_the_default_action(plugin):
     assert result['state'] == 'idle'
     assert result['namespace'] == 'robot'
     assert result['odom_interface']['provides'] == []
+    assert plugin.dispatch('info', {})['state'] == 'idle'
+
+
+def test_unknown_action_is_rejected_instead_of_reported_as_success(plugin):
+    assert plugin.dispatch('not-a-card-action', {}) is None
+    assert plugin.dispatch('', {}) is None
