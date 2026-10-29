@@ -26,7 +26,7 @@ def wait_for(predicate, timeout=8):
 
 @pytest.fixture
 def g1_teaching(tmp_path, monkeypatch):
-    monkeypatch.setattr('common.teaching.service.read_execution_policy',
+    monkeypatch.setattr('skill_workbench.service.read_execution_policy',
                         lambda *args, **kwargs: {'enabled': False, 'source': 'manual', 'binding_changed': False})
     card, arm, sample, channel, receipts, done, ticker = api_rig(tmp_path)
     service = teaching_plugin(card)

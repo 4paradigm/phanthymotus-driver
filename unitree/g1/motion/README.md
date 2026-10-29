@@ -2,7 +2,7 @@
 
 本说明包含 G1 双臂遥操的使用、运行依赖与实现。驱动全部能力和启动入口见 [G1 Driver 说明](../README.md)。
 
-网页生成可调用 Skill 使用 `g1_teaching` 卡，复用本文的原录制、回放与停止接口；不新建运动控制器。网页宿主需要 Core PR #318，G1 适配本身不修改 Core。流程、设备检查和持久化约束见[通用示教说明](../../../common/teaching/README.md#宇树-g1-的使用流程)，实际网页截图见[G1 界面验收](../../../docs/teaching/g1.md)。
+网页生成可调用 Skill 使用 `g1_teaching` 卡，复用本文的原录制、回放与停止接口；不新建运动控制器。见[录制技能说明](../skill_workbench/README.md)。
 
 ## 使用
 
@@ -116,7 +116,7 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 
 ## 轨迹接口（供示教适配器调用）
 
-录制、文件校验和回放属于 `teleop_control`；下游 #402 负责页面、试运行流程和 Skill。没有新增示教卡或 Core 改动。接口由现有 loopback MCP 提供，参数均放在 `arguments` 中。
+录制、文件校验和回放属于 `teleop_control`；页面、试运行流程和 Skill 由 `g1_teaching` 卡负责（见[录制技能说明](../skill_workbench/README.md)）。接口由现有 loopback MCP 提供，参数均放在 `arguments` 中。
 
 | action | 参数 | 结果 |
 |---|---|---|

@@ -7,8 +7,11 @@ import zipfile
 
 import pytest
 
-from common.teaching.package import MAX_ARCHIVE, MAX_RECORDING, pack, read_package, unpack
-from common.teaching.service import TeachingPlugin
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'unitree/g1'))
+from skill_workbench.package import MAX_ARCHIVE, MAX_RECORDING, pack, read_package, unpack
+from skill_workbench.service import TeachingPlugin
 
 
 def package():

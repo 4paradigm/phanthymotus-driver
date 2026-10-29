@@ -7,8 +7,8 @@ import secrets
 import tempfile
 import time
 
-from common.teaching import TeachingPlugin
-from common.teaching.package import SCHEMA as PACKAGE_SCHEMA
+from skill_workbench import TeachingPlugin
+from skill_workbench.package import SCHEMA as PACKAGE_SCHEMA
 from trajectory import SCHEMA as RECORDING_SCHEMA, UNITS, encode, read_recording
 
 
@@ -30,13 +30,13 @@ class G1TeachingAdapter:
     replay_instruction = (
         "执行时由 G1 原控制器先低速移动到录制起点，再按原时间回放；"
         "本次确认须包含移向起点的路径和录制动作的活动空间。"
-        "起点差异仅供显示，不要求 PiPER 的关节或夹爪容差。"
+        "起点差异仅供显示，不设关节容差。"
         "不得额外发回零、切模式、换设备或改速度指令。"
         "completed 表示轨迹发送及停止交权完成，实际动作效果仍需现场确认。"
     )
     checks = (
         ("feedback", "本体反馈与模式", "请启动 G1 驱动并在原控制卡检查反馈和本体模式。"),
-        ("model", "机型与设备身份", "请检查 G1_23 模型及持久化设备身份挂载。"),
+        ("model", "机型与标定", "请检查 G1_23 模型与标定文件。"),
         ("control", "控制状态", "请结束回放、复位或其他控制动作，再重新检查。"),
         ("transport", "VR 通道", "请连接 VR 输入 → G1 遥操卡，并启动画布项目。"),
     )

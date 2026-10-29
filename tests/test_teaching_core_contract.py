@@ -8,8 +8,11 @@ import time
 
 import pytest
 
-from common.teaching.service import read_execution_policy
-from common.teaching.package import pack, read_package
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'unitree/g1'))
+from skill_workbench.service import read_execution_policy
+from skill_workbench.package import pack, read_package
 from test_file_upload_endpoint import server
 
 CORE = os.environ.get('TEACHING_CORE_ROOT')

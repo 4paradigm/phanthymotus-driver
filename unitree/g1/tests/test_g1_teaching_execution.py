@@ -5,7 +5,7 @@ from test_g1_teaching import g1_teaching, call, save, wait_for
 
 
 def allow(monkeypatch):
-    monkeypatch.setattr('common.teaching.service.read_execution_policy', lambda *a, **k: {
+    monkeypatch.setattr('skill_workbench.service.read_execution_policy', lambda *a, **k: {
         'enabled': True, 'source': 'skill', 'binding_changed': False})
 
 
@@ -33,7 +33,7 @@ def test_stop_during_policy_check_or_dispatch_rejects_old_request(g1_teaching, m
         def stopped(*a, **k):
             card.stop()
             return {'enabled': True, 'source': 'skill', 'binding_changed': False}
-        monkeypatch.setattr('common.teaching.service.read_execution_policy', stopped)
+        monkeypatch.setattr('skill_workbench.service.read_execution_policy', stopped)
     else:
         play = service.adapter.play
         def stopped(filename, args):

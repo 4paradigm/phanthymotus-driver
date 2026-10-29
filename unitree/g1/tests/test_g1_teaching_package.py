@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from common.teaching.package import pack, unpack
+from skill_workbench.package import pack, unpack
 from test_g1_teaching import g1_teaching, call, confirm, save, wait_for
 
 
@@ -82,7 +82,7 @@ def test_mismatched_robot_and_pending_draft_rejected_without_motion(g1_teaching)
 
 
 def test_same_device_reuses_only_saved_validation_and_pending_survives_restart(g1_teaching):
-    from common.teaching import TeachingPlugin
+    from skill_workbench import TeachingPlugin
     service, card, _, _, channel, _ = g1_teaching
     _, saved, _ = save(service)
     data = export(service, saved['asset_id'])

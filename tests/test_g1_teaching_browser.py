@@ -9,14 +9,15 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unitree/g1/tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unitree/g1"))
 from test_g1_teaching import g1_teaching, call, wait_for
 from teaching_browser_support import workbench_site, browser_page, confirm_in_browser, capture, pytestmark
-from common.teaching.service import read_execution_policy
+from skill_workbench.service import read_execution_policy
 
 
 @pytest.fixture
 def site(g1_teaching, monkeypatch, tmp_path):
-    monkeypatch.setattr('common.teaching.service.read_execution_policy', read_execution_policy)
+    monkeypatch.setattr('skill_workbench.service.read_execution_policy', read_execution_policy)
     service, card, *_ = g1_teaching
     with workbench_site(service, [card, service], monkeypatch, tmp_path,
                         "test-g1", "宇树 G1（模拟 SDK）") as value:
