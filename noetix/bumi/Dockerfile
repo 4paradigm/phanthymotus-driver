@@ -148,6 +148,8 @@ COPY visual_inputs.py /work/visual_inputs.py
 COPY visual_odometry.py /work/visual_odometry.py
 COPY visual_odometry_contract.py /work/visual_odometry_contract.py
 COPY visual_odometry_probe.py /work/visual_odometry_probe.py
+COPY realsense_imu_probe.py /work/realsense_imu_probe.py
+COPY build_realsense_rsusb.sh /work/build_realsense_rsusb.sh
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py

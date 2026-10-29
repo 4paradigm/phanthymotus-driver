@@ -123,6 +123,69 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 - `info()` declares an empty `odom_interface.provides` (no velocity axes),
   `pose_drift: unbounded`, `rate_hz: 20`, plus the current quality.
 
+## Camera IMU access (prerequisite for VIO)
+
+The D435i has an internal gyro and accelerometer. Some Jetson kernels omit
+`CONFIG_HID_SENSOR_HUB` and the HID accelerometer/gyro modules: the native
+RealSense backend then exposes RGB/depth but no Motion Module, even in a
+privileged container with `/dev` mounted. The bundle currently enables only the
+RGB/depth streams; its visual estimator does not fuse camera IMU measurements.
+
+For that kernel configuration, build an isolated RSUSB SDK, which implements
+UVC/HID in userspace. The helper pins official librealsense v2.59.1 and verifies
+the source archive SHA-256. It requires CMake, a C++ compiler, Git, curl, Python
+development headers and libusb development files. Run inside the bundle:
+
+```sh
+bash /work/build_realsense_rsusb.sh /tmp/bumi-rsusb
+```
+
+**Stop the existing camera capture before running the probe**, and use a
+maintenance context. A separate RSUSB context can interrupt the native-backend
+camera worker even though the probe does not start video streams. Do not run
+this alongside its camera. On the tested target, restarting the bundle alone
+did not restore video: a camera `hardware_reset()` through the original native
+SDK, followed by a bundle restart, restored capture. This resets the camera
+without updating its firmware.
+
+```sh
+PYTHONPATH=/tmp/bumi-rsusb/install/python \
+  python3 /work/realsense_imu_probe.py --seconds 10 --output /data/camera-imu-probe.json
+```
+
+Keep the robot stationary for the probe. It opens only the motion sensor, uses
+hardware timestamps with global-time conversion disabled, and drains startup
+reports for two seconds before recording the requested duration. It checks
+sensor timestamp order, finite values, rate and gaps, and reports gyro (rad/s)
+and accelerometer (m/s²) statistics. It exports each motion profile's transform
+to the 640×480 BGR8 colour profile as a **row-major** matrix with metre
+translation and an explicit `p_color = R_color_motion * p_motion + t_color_motion`
+direction; the SDK's original rotation array is column-major. A missing IMU,
+invalid transform or unusable sample stream fails the probe instead of supplying
+identity extrinsics or repeated samples.
+
+The SDK is installed under the chosen build directory and selected only via
+`PYTHONPATH`; the helper does not replace the existing Python package, flash
+firmware or load kernel modules. RSUSB performance and coexistence must be
+checked on the target before using it as
+the bundle's default backend. The probe establishes IMU access and exports SDK
+extrinsics; the probe's hardware timestamps must be mapped to the image clock
+before fusion. Full VIO still needs synchronized image/IMU delivery, noise/bias and
+calibration checks, an estimator, and walking/metric validation.
+
+On the tested Bumi (Jetson kernel `5.15.185-tegra`, D435i firmware `5.15.1.55`),
+this SDK exposed gyro/accel profiles at 200 Hz and readable motion-to-colour
+extrinsics. Ten-second recordings after warmup measured about 193–196 Hz with
+54–55 ms gaps, failing the probe's five-period continuity limit (25 ms at
+200 Hz). Native camera capture also timed out during separate RSUSB access.
+This proves IMU/extrinsics access, **not VIO-ready timing or coexistence**.
+Use a single capture owner and validate image/IMU timing and delivery before
+integrating an estimator; do not switch the bundle's default SDK based on this
+probe alone.
+
+See the [official Jetson backend guide](https://github.com/realsenseai/librealsense/blob/v2.59.1/doc/installation_jetson.md)
+and [D435i IMU documentation](https://github.com/realsenseai/librealsense/blob/v2.59.1/doc/d435i.md).
+
 ## Camera mount / body-axis convention
 
 `config.yaml` ships a permanent level-forward convention so the position axes
