@@ -102,7 +102,7 @@ def test_standard_state_cards_read_native_reports(monkeypatch):
     assert plugin.dispatch("imu", {"_tool_name": "imu"})["acceleration_m_s2"][0] == 1
     skeleton = plugin.dispatch("joints", {"_tool_name": "joints"})
     assert skeleton["format"] == "sensor/skeleton"
-    assert skeleton["available"] is False
+    assert skeleton["joint_count"] == 16
     assert len(skeleton["joints"]) == 16
     assert skeleton["joints"][0] == {
         "idx": 0, "name": "fl_hipx_joint", "q": 0.25,
@@ -241,7 +241,8 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     callbacks["/JOINTS_DATA_10HZ"](SimpleNamespace(data=SimpleNamespace(joints_data=joints)))
     skeleton = json.loads(nodes.publishers["joints"].messages[-1].data)
     full_joint_state = json.loads(nodes.publishers["joint_state"].messages[-1].data)
-    assert skeleton["available"] is True
+    assert skeleton["format"] == "sensor/skeleton"
+    assert skeleton["joint_count"] == 16
     assert skeleton["joints"][0]["name"] == "fl_hipx_joint"
     assert skeleton["joints"][15]["q"] == 15
     assert full_joint_state["fr_hipx_joint_q"] == 4
@@ -464,7 +465,8 @@ def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
     device = _load_device(monkeypatch)
     raw = [{"q": idx / 10, "dq": 1, "tau": 2, "temperature": [30]} for idx in range(16)]
     result = device._skeleton_payload({"MotorStatus": {"Joint": raw}, "MotionStatus": {"Roll": 0, "Pitch": 0, "Yaw": 0}})
-    assert result["available"] is True
+    assert result["format"] == "sensor/skeleton"
+    assert result["joint_count"] == 16
     assert [joint["name"] for joint in result["joints"]] == list(device.JOINT_NAMES)
     assert result["joints"][-1]["q"] == 1.5
     assert result["joints"][0]["temperature"] == [30]

@@ -52,9 +52,11 @@ def _post_acp_callback(action_id, status, result, tool_name):
     for attempt in range(1, 4):
         try:
             with urllib.request.urlopen(request, timeout=3, context=context) as response:
-                if not 200 <= response.status < 300:
-                    raise RuntimeError(f"Agent Core returned HTTP {response.status}")
-            print(f"[ACP] {tool_name} {action_id}: callback sent ({status}) attempt={attempt}", flush=True)
+                http_status = response.status
+                if not 200 <= http_status < 300:
+                    raise RuntimeError(f"Agent Core returned HTTP {http_status}")
+            print(f"[ACP] {tool_name} action_id={action_id} status={status} "
+                  f"http={http_status} attempt={attempt}", flush=True)
             return
         except Exception as exc:
             last_error = exc
@@ -210,6 +212,10 @@ class S10Nodes:
             result[key]["bridge_enqueued"] = lane["enqueued"]
             result[key]["bridge_dropped"] = lane["dropped"]
             result[key]["bridge_alive"] = lane["alive"]
+            result[key]["bridge_errors"] = lane.get("errors", 0)
+            result[key]["bridge_last_error"] = lane.get("last_error")
+            if self.media_workers is not None and (key.startswith("camera_") or key == "lidar"):
+                result[key]["worker_alive"] = self.media_workers.is_alive(key)
         return result
 
     def _publish_json(self, key, value):
@@ -275,7 +281,7 @@ class S10Nodes:
         for index, battery in enumerate(batteries if isinstance(batteries, list) else []):
             if _all_zero_placeholder(battery):
                 continue
-            _flatten_fields(battery, f"battery_{index}", payload)
+            _flatten_fields(battery, f"battery_{index}", payload, omit_zero_placeholders=True)
         self._publish_json("battery", payload)
 
     def _forward_loco_state(self, msg):
@@ -561,11 +567,17 @@ def _flatten_fields(value, prefix, output, omit_zero_placeholders=False):
 
 
 def _all_zero_placeholder(value):
+    if value is None or value is False or value == "":
+        return True
     if isinstance(value, dict):
         values = value.values()
         return bool(value) and all(_all_zero_placeholder(item) for item in values)
     if isinstance(value, (list, tuple)):
         return bool(value) and all(_all_zero_placeholder(item) for item in value)
+    if isinstance(value, (bytes, bytearray)):
+        return bool(value) and not any(value)
+    if isinstance(value, str):
+        return not value.strip("\x00 ")
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
 
 
@@ -575,7 +587,6 @@ def _skeleton_payload(items, raw_joints=None):
         raw_joints = motor_status.get("Joint", []) if isinstance(motor_status, dict) else []
     if isinstance(raw_joints, dict):
         raw_joints = raw_joints.get("Joint", raw_joints.get("Data", []))
-    source_count = len(raw_joints) if isinstance(raw_joints, list) else 0
     raw_joints = _order_joints(raw_joints)
     joints = []
     for idx, name in enumerate(JOINT_NAMES):
@@ -587,7 +598,8 @@ def _skeleton_payload(items, raw_joints=None):
             "tau": _joint_value(raw, "tau", "Tau", "torque", "Torque", "TorqueEst"),
             "temperature": _joint_value(raw, "temperature", "Temperature", "Temp", "motion_temp", "driver_temp"),
         })
-    payload = {"format": "sensor/skeleton", "available": source_count >= len(JOINT_NAMES), "joints": joints}
+    # Match the standard skeleton contract used by the other robot drivers.
+    payload = {"format": "sensor/skeleton", "joint_count": len(joints), "joints": joints}
     motion = items.get("MotionStatus", {})
     try:
         roll, pitch, yaw = (float(motion[key]) for key in ("Roll", "Pitch", "Yaw"))

@@ -56,6 +56,10 @@ class MediaWorkers:
             except queue.Empty:
                 return False
 
+    def is_alive(self, lane):
+        process = self._processes.get(lane)
+        return bool(process and process.is_alive())
+
     def _collect(self):
         while not self._closed:
             try:
