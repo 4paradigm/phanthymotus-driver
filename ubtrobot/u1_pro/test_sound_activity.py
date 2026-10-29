@@ -26,7 +26,7 @@ class ActivityTests(unittest.TestCase):
         self.feed(pcm(1500),40)
         self.assertTrue(self.gate.allows(self.now))
         self.assertAlmostEqual(self.gate.background,background)
-        self.feed(pcm(10),3);self.assertFalse(self.gate.allows(self.now))
+        self.feed(pcm(10),9);self.assertFalse(self.gate.allows(self.now))
         self.feed(pcm(1500),2);self.assertFalse(self.gate.allows(self.now))
         self.feed(pcm(1500),12);self.assertTrue(self.gate.allows(self.now))
     def test_burst_and_invalid_pcm_never_open_gate(self):
@@ -44,3 +44,18 @@ class ActivityTests(unittest.TestCase):
             with self.assertRaises(ValueError):SoundActivityGate(**options)
         self.feed(pcm(2000),20);self.gate.reset()
         self.assertFalse(self.gate.allows(self.now));self.assertIsNone(self.gate.background)
+
+    def test_natural_speech_pauses_do_not_restart_settling_forever(self):
+        self.feed(pcm(1500),3)
+        self.assertFalse(self.gate.allows(self.now))
+        self.feed(pcm(10),3)
+        self.assertFalse(self.gate.allows(self.now))
+        for _ in range(5):
+            self.feed(pcm(1500),3)
+            self.assertTrue(self.gate.allows(self.now))
+            self.feed(pcm(10),3)
+            self.assertFalse(self.gate.allows(self.now))
+        self.feed(pcm(10),9)
+        self.assertFalse(self.gate.active)
+        self.feed(pcm(1500),2)
+        self.assertFalse(self.gate.allows(self.now))

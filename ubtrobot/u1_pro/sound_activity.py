@@ -26,11 +26,13 @@ class SoundActivityGate:
         self._calibration = deque(maxlen=100)
         self._elapsed = self._rising = self._quiet = 0.0
         self._active_since = None
+        self._last_above = None
 
     def invalidate(self, reason):
         self.active = False
         self._rising = self._quiet = 0.0
         self._active_since = None
+        self._last_above = None
         self.reason = reason
 
     def update(self, data, device, now):
@@ -55,6 +57,7 @@ class SoundActivityGate:
         threshold = max(self.minimum_dbfs, self.background + self.margin_db)
         above = self.level >= threshold
         if above:
+            self._last_above = now
             self._rising += duration
             self._quiet = 0
             if not self.active and self._rising >= .15:
@@ -63,17 +66,18 @@ class SoundActivityGate:
         else:
             self._rising = 0
             self._quiet += duration
-            if self._quiet >= .2:
+            if self._quiet >= .8:
                 self.invalidate('below_threshold')
             # Freeze background during activity so sustained speech/music does
             # not raise its own threshold. Startup should be reasonably quiet.
             if not self.active:
                 self.background += (1 - math.exp(-duration / 3)) * (self.level - self.background)
-        self.reason = ('settling' if self.active and now - self._active_since < 1.0 else
-                       'sound_detected' if self.active else 'below_threshold')
+        self.reason = ('settling' if self.active and now - self._active_since < .5 else
+                       'sound_detected' if self.allows(now) else 'below_threshold')
 
     def allows(self, now):
-        return self.active and self._active_since is not None and now - self._active_since >= 1.0
+        return (self.active and self._active_since is not None and self._last_above is not None
+                and now - self._active_since >= .5 and now - self._last_above <= .15)
 
     def info(self):
         return {'active': self.active, 'reason': self.reason,
@@ -81,4 +85,4 @@ class SoundActivityGate:
                 'minimum_dbfs': self.minimum_dbfs, 'margin_db': self.margin_db,
                 'threshold_dbfs': None if self.background is None else
                     max(self.minimum_dbfs, self.background + self.margin_db),
-                'timing_basis': 'receipt_time_only', 'settle_seconds': 1.0}
+                'timing_basis': 'receipt_time_only', 'settle_seconds': .5, 'pause_hold_seconds': .8}
