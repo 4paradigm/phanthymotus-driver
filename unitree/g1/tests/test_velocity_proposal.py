@@ -512,7 +512,7 @@ class ProposalGateTest(unittest.TestCase):
 
     def test_confirmed_obstacle_stop_keeps_lease_for_fresh_escape_command(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=50.0).execute)
-        self.gate.hold_for_obstacle()
+        self.assertTrue(self.gate.record_recoverable_stop_result("obstacle", True))
 
         held = self.gate.snapshot(50.1)
         self.assertTrue(held["connected"])
@@ -840,7 +840,7 @@ class ProposalGateTest(unittest.TestCase):
 
     def test_hard_fault_still_disarms_from_recoverable_obstacle_stop(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
-        self.gate.hold_for_obstacle()
+        self.assertTrue(self.gate.record_recoverable_stop_result("obstacle", True))
 
         rejected = self.gate.accept(
             proposal(sequence=2, frame="map"),
@@ -854,7 +854,7 @@ class ProposalGateTest(unittest.TestCase):
 
     def test_terminal_zero_pending_clears_recoverable_obstacle_hold(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
-        self.gate.hold_for_obstacle()
+        self.assertTrue(self.gate.record_recoverable_stop_result("obstacle", True))
 
         terminal = self.gate.accept(
             proposal(

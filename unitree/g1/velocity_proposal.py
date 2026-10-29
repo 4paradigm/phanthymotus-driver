@@ -304,10 +304,6 @@ class VelocityProposalGate:
         self.recoverable_stop_reason = ""
         self.terminal_pending_stop = False
 
-    def hold_for_obstacle(self) -> None:
-        """Keep the nav lease armed after a confirmed local obstacle stop."""
-        self.hold_after_confirmed_stop("obstacle")
-
     def hold_after_confirmed_stop(self, reason: str) -> None:
         """Keep a trusted nav lease after a confirmed recoverable stop.
 
