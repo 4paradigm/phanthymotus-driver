@@ -1,22 +1,11 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-ARG UBUNTU_PORTS_MIRROR=https://mirrors.aliyun.com/ubuntu-ports
-ARG PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/
+ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
-ARG UBUNTU_PORTS_MIRROR
 ARG PYPI_MIRROR
 
 WORKDIR /work
 
-# Replace the unavailable inherited Ubuntu Ports mirror; dependency set is unchanged.
-# The added runtime source/calibration COPY entries below are the intended image growth.
-RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
-        -exec sed -i \
-            -e "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
-            -e "s|https://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
-            -e "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
-            -e "s|https://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \
-            {} + && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-colcon-common-extensions \

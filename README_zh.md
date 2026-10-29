@@ -51,11 +51,6 @@ cp .env.example .env  # 填写镜像仓库凭据
 
 驱动容器启动后会自动向 Agent Core（`http://<agent-core>:15678/api/mcp`）发送注册请求。注册成功后即可在 Web Dashboard 中看到设备及其工具。
 
-G1 Dockerfile 默认同时使用阿里云 Ubuntu Ports 和 PyPI 国内镜像，并在安装
-构建依赖前替换基础镜像遗留且已不可解析的腾讯云 Ubuntu 源。直接执行
-Docker 构建时可通过 `UBUNTU_PORTS_MIRROR` 和 `PYPI_MIRROR` build arg 覆盖
-默认值；运行时基础镜像来源不变。
-
 ### 本地运行（无需 Docker）
 
 ```bash

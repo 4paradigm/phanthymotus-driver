@@ -62,12 +62,6 @@ When run without arguments, `build.sh` shows an interactive multi-select menu to
 
 Once the driver container starts, it registers itself with Agent Core at `http://<agent-core>:15678/api/mcp`. You can then see the device and its tools in the Web Dashboard.
 
-The G1 Dockerfile uses the Aliyun mirrors for both Ubuntu Ports and PyPI by
-default. It replaces the obsolete Tencent Cloud Ubuntu source inherited from
-the base image before installing build dependencies. Direct Docker builds can
-override these defaults with the `UBUNTU_PORTS_MIRROR` and `PYPI_MIRROR` build
-arguments; the runtime base image remains unchanged.
-
 ### Run Locally (without Docker)
 
 ```bash
