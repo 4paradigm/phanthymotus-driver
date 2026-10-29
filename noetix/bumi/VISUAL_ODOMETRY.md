@@ -43,10 +43,14 @@ segment/calibration IDs and visual diagnostics; the same sample is returned as
 `sample`, with `odom_topic` pointing to the original ROS output. Details are a
 snapshot: reopen them to refresh.
 
-The 20 Hz supervision and 500 ms stale-input protection are unchanged. Status
-transitions publish immediately even between 5 Hz summary updates. Lost or
-stopped output clears both displayed position and displacement rather than
-repeating the last valid pose.
+The 20 Hz supervision keeps the camera feed on a 500 ms stale clock, while
+RTAB-Map results and diagnostics get a 1.5 s grace: walking increased observed
+processing intervals from 0.13 s to 0.37 s, and a 500 ms visual edge was below
+the real latency. A single bad pose is dropped; a sustained gap, repeated pose
+discontinuity or low-inlier run starts a **new segment** (fresh estimator,
+fresh odom frame) automatically. Status transitions publish immediately even
+between 5 Hz summary updates. Lost or stopped output clears both displayed
+position and displacement rather than repeating the last valid pose.
 
 ## Inputs
 
@@ -74,7 +78,8 @@ frame. An unknown distortion model or a changed frame/intrinsics/epoch latches
   The validated pair is forwarded as one `rtabmap_msgs/RGBDImage` with both
   source image stamps preserved (`subscribe_rgbd: true`), avoiding a second
   approximate synchronizer waiting for another frame. The 20 ms source-pair
-  check and the 250/500 ms freshness limits are unchanged.
+  check and the camera 250/500 ms freshness limits are unchanged; RTAB-Map
+  results get the 1.5 s grace described above.
 - One segment-scoped static TF `base -> optical` is published before the child
   starts. Without a measured mount it is identity, so the base frame coincides
   with the optical frame and the pose stays a camera pose; `publish_tf` of the
@@ -151,7 +156,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `454 passed` in the Bumi suite; the
+ROS-free regression for this branch: `475 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.

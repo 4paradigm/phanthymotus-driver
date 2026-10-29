@@ -237,3 +237,83 @@ def test_info_keeps_full_sample_and_exposes_it_in_canvas_details(plugin):
     assert result['quality']['visual_diagnostic']['inliers'] == 20
     assert '"covariance"' in result['description']
     assert '"visual_diagnostic"' in result['description']
+
+
+# ── recoverable faults: one bad sample must not kill the segment ─────────────
+
+def started_node(plugin):
+    plugin.dispatch('start', {})
+    return plugin._node
+
+
+def pose_at(node, position):
+    return dict(stamp_ns=node.now(),
+                pose=dict(position=list(position), quaternion=[0, 0, 0, 1],
+                          frame_id=node.segment+'_odom',
+                          child_frame_id=node.base_frame(),
+                          covariance=[0.]*36))
+
+
+def feed(node, position, step_ns=30_000_000):
+    node.node.time += step_ns
+    data = pose_at(node, position)
+    t = data['stamp_ns']
+    node.visual_pending[t] = data
+    node.diagnostic_pending[t] = object()
+    node._release_visual(t)
+    return data
+
+
+def test_a_single_pose_glitch_is_dropped_not_latched(plugin):
+    node = started_node(plugin)
+    feed(node, [0., 0., 0.])
+    accepted = node.estimate
+    feed(node, [.5, 0., 0.])           # one impossible registration
+    assert node.health.reason is None
+    assert node.estimate is accepted
+    assert node.jump_count == 1
+    feed(node, [.002, 0., 0.])         # back on the accepted trajectory
+    assert node.health.reason is None
+    assert node.estimate['pose']['position'] == [.002, 0., 0.]
+    assert node.jump_count == 0
+
+
+def test_persistent_pose_reset_requests_a_new_segment(plugin):
+    node = started_node(plugin)
+    old_segment = node.segment
+    feed(node, [0., 0., 0.])
+    feed(node, [.5, 0., 0.])
+    feed(node, [.52, 0., 0.])          # consistent with the new baseline
+    assert node.restart_requested == 'visual pose reset'
+    assert node.segment == old_segment
+    node.tick()
+    assert node.restarts == 1
+    assert node.segment != old_segment
+    assert node.restart_requested is None
+    assert node.estimate is None
+
+
+def test_stale_camera_does_not_spin_restarts_but_recovers(plugin, monkeypatch):
+    node = started_node(plugin)
+    clock = [1000.]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    node.health.samples['camera'] = node.now()
+    node.health.samples['visual'] = node.now()
+    node.health.fault('input stale')
+    node.tick()                         # starts grace, no restart yet
+    assert node.restarts == 0
+    clock[0] += 1.0
+    node.tick()
+    assert node.restarts == 1
+    assert node.segment is not None
+
+
+def test_jump_grace_restarts_a_segment_without_a_second_sample(plugin, monkeypatch):
+    node = started_node(plugin)
+    clock = [1000.]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    feed(node, [0., 0., 0.])
+    feed(node, [.5, 0., 0.])
+    clock[0] += .7
+    node.tick()
+    assert node.restarts == 1

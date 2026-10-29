@@ -29,18 +29,26 @@ import uuid
 try:  # imported as part of the noetix.bumi namespace in tests
     from .visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
                                            MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
-                                           MAX_TRANSPORT_NS, finite, make_sample,
-                                           quat_matrix)
+                                           MAX_TRANSPORT_NS, MAX_VISUAL_AGE_NS,
+                                           finite, make_sample, quat_matrix)
 except ImportError:  # imported as a top-level /work module inside the bundle image
     from visual_odometry_contract import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
                                           MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
-                                          MAX_TRANSPORT_NS, finite, make_sample,
-                                          quat_matrix)
+                                          MAX_TRANSPORT_NS, MAX_VISUAL_AGE_NS,
+                                          finite, make_sample, quat_matrix)
 
 PACKAGE = 'rtabmap_odom'
 EXECUTABLE = 'rgbd_odometry'
 OUTPUT_TOPIC = '/bumi_visual_odometry/state/odom'
 STATUS_TOPIC = '/bumi_visual_odometry/status'
+
+# A gap in RTAB-Map results is not immediately fatal: walking increases its
+# processing time (observed 0.13 s stationary -> 0.37 s walking). Wait for the
+# configured age limit, then start a new segment instead of staying lost.
+RECOVERY_GRACE_S = .8
+JUMP_GRACE_S = .6
+RESTART_BACKOFF_S = 1.5
+MAX_JUMP_SUSPECTS = 3
 
 
 # ── Estimator launch contract ────────────────────────────────────────────────
@@ -230,6 +238,8 @@ class VisualOdometryNode:
         self.calibration = None
         raw = self.config.get('calibration') or None
         self.calibration = CameraCalibration(raw) if raw else None
+        self.restarts = 0
+        self.last_restart_monotonic = None
         self._new_segment()
         self.node.create_timer(.05, self._guard(self.tick))
 
@@ -263,6 +273,14 @@ class VisualOdometryNode:
         self.diagnostic_pending = OrderedDict()
         self.diagnostic_started = False
         self.last_visual_monotonic = None
+        self.last_good_monotonic = None
+        self.reason_since = None
+        self.jump_candidate = None
+        self.jump_since = None
+        self.jump_count = 0
+        self.invalid_since = None
+        self.last_reject = None
+        self.restart_requested = None
         self.summary_origin = None
         self.last_summary_ns = None
         self.last_summary_state = None
@@ -547,6 +565,46 @@ class VisualOdometryNode:
             self.visual_pending.popitem(last=False)
         self._release_visual(data['stamp_ns'])
 
+    def _clear_jump(self):
+        self.jump_candidate = None
+        self.jump_since = None
+        self.jump_count = 0
+
+    def _reject_pose(self, data, t, now, dt, shift):
+        """Drop a discontinuous pose; only a persistent one ends the segment.
+
+        A single wrong registration must not kill the card (the old behaviour
+        latched ``lost`` for the rest of the segment). A second sample that is
+        consistent with the rejected one means RTAB-Map has moved to a new
+        baseline, so recovery is a new segment; a sample back on the accepted
+        trajectory is just ignored.
+        """
+        threshold = .03 + 1.5*dt if dt > 0 else 0.
+        if self.jump_candidate is not None:
+            candidate = self.jump_candidate
+            candidate_dt = (t-candidate['stamp_ns'])/1e9
+            candidate_shift = math.dist(data['pose']['position'],
+                                        candidate['pose']['position'])
+            if candidate_dt > 0 and candidate_shift <= .03+1.5*candidate_dt:
+                self.last_reject = dict(previous_pose=deepcopy(self.estimate['pose']),
+                                        candidate_pose=deepcopy(data['pose']),
+                                        dt_s=round(dt, 6), shift_m=round(shift, 6),
+                                        threshold_m=round(threshold, 6))
+                self.request_restart('visual pose reset')
+                return
+        if self.jump_candidate is None:
+            self.jump_since = now
+        self.jump_candidate = data
+        self.jump_count += 1
+        self.last_reject = dict(
+            previous_pose=deepcopy(self.estimate['pose']) if self.estimate else None,
+            candidate_pose=deepcopy(data['pose']),
+            dt_s=round(dt, 6), shift_m=round(shift, 6),
+            threshold_m=round(threshold, 6), suspect_count=self.jump_count)
+        self.health.details['last_reject'] = deepcopy(self.last_reject)
+        if self.jump_count >= MAX_JUMP_SUSPECTS:
+            self.request_restart('visual pose reset')
+
     def _release_visual(self, t):
         if t not in self.visual_pending or t not in self.diagnostic_pending:
             return
@@ -556,13 +614,51 @@ class VisualOdometryNode:
         self.health.observe('diagnostic', t, self.now(), True)
         if self.health.reason:
             return
+        now = time.monotonic()
         if self.estimate is not None:
             dt = (t-self.estimate['stamp_ns'])/1e9
             shift = math.dist(data['pose']['position'], self.estimate['pose']['position'])
             if dt <= 0 or shift > .03+1.5*dt:
-                raise ValueError('visual pose jumped or reset')
+                self._reject_pose(data, t, now, dt, shift)
+                return
+            # Back on the accepted trajectory: a short glitch is dropped, not fatal.
+            self._clear_jump()
         self.estimate = data
-        self.last_visual_monotonic = time.monotonic()
+        self.last_visual_monotonic = now
+        self.last_good_monotonic = now
+        self.invalid_since = None
+
+    def request_restart(self, reason):
+        """Ask tick() to restart; never tear down subscriptions from a callback."""
+        if self.restart_requested is None:
+            self.restart_requested = str(reason)
+
+    def restart(self, reason):
+        """Restart into a fresh segment; only called from the timer tick."""
+        """Start a fresh segment after a recoverable fault or estimator reset.
+
+        A new segment is a real coordinate reset: the old pose is never carried
+        into the new ``_odom`` frame. Restarts are rate-limited so a permanently
+        absent camera cannot spin the estimator process.
+        """
+        if self.closed or not self.active:
+            return False
+        now = time.monotonic()
+        if (self.last_restart_monotonic is not None
+                and now-self.last_restart_monotonic < RESTART_BACKOFF_S):
+            return False
+        self.last_restart_monotonic = now
+        self.restarts += 1
+        last_reject = deepcopy(self.last_reject)
+        previous_segment = self.segment
+        self.stop(reason)
+        self.start()
+        if last_reject is not None:
+            self.health.details['last_reject'] = last_reject
+        self.health.details['restarts'] = self.restarts
+        self.health.details['previous_segment'] = previous_segment
+        self.restart_requested = None
+        return True
 
     def diagnostic(self, msg):
         try:
@@ -570,17 +666,25 @@ class VisualOdometryNode:
         except ImportError:
             from visual_odometry_contract import MIN_INLIERS
         valid = not msg.lost and msg.inliers >= MIN_INLIERS and msg.matches >= msg.inliers
+        t = msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
         if not valid and not self.diagnostic_started:
             return  # first registration has no motion estimate yet
         if not valid:
-            self.health.details['fault_stamp_ns'] = (
-                msg.header.stamp.sec*10**9+msg.header.stamp.nanosec)
-            self.health.fault('visual tracking lost or insufficient inliers')
+            now = time.monotonic()
+            self.health.details['visual_diagnostic'] = dict(
+                inliers=msg.inliers, matches=msg.matches, lost=msg.lost)
+            self.health.details['fault_stamp_ns'] = t
+            if self.invalid_since is None:
+                self.invalid_since = now
+            elif now-self.invalid_since >= RECOVERY_GRACE_S:
+                # Do not latch on one poor registration; treat a sustained one
+                # as a reason to restart the estimator into a new segment.
+                self.request_restart('visual tracking lost or insufficient inliers')
             return
+        self.invalid_since = None
         self.diagnostic_started = True
         self.health.details['visual_diagnostic'] = dict(
             inliers=msg.inliers, matches=msg.matches, lost=msg.lost)
-        t = msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
         self.diagnostic_pending[t] = msg
         while len(self.diagnostic_pending) > 20:
             self.diagnostic_pending.popitem(last=False)
@@ -589,12 +693,31 @@ class VisualOdometryNode:
     def tick(self):
         if self.closed:
             return
+        if self.active and self.restart_requested is not None:
+            # Callbacks only request a restart; tearing down subscriptions from
+            # inside a subscription callback is left to the timer thread.
+            self.restart(self.restart_requested)
         if self.active:
+            now = time.monotonic()
+            now_ns = self.now()
+            camera = self.health.samples.get('camera')
+            camera_fresh = camera is not None and now_ns-camera <= MAX_INPUT_AGE_NS
             if self.children.failed():
-                self.health.fault('RTAB-Map visual odometry process exited')
-            if self.last_visual_monotonic is not None and \
-                    time.monotonic()-self.last_visual_monotonic > MAX_INPUT_AGE_NS/1e9:
-                self.health.fault('visual odometry receipt watchdog expired')
+                self.restart('RTAB-Map visual odometry process exited')
+            else:
+                if self.health.reason:
+                    if self.reason_since is None:
+                        self.reason_since = now
+                    if camera_fresh and now-self.reason_since >= RECOVERY_GRACE_S:
+                        self.restart('recovering after '+str(self.health.reason))
+                else:
+                    self.reason_since = None
+                if self.jump_candidate is not None and \
+                        now-self.jump_since >= JUMP_GRACE_S:
+                    self.restart('visual pose reset')
+                if self.last_good_monotonic is not None and camera_fresh and \
+                        now-self.last_good_monotonic > MAX_VISUAL_AGE_NS/1e9:
+                    self.restart('visual odometry stalled')
         self.publish()
 
     def close(self):

@@ -194,3 +194,15 @@ def test_parameter_file_preserves_ros_parameter_types():
     assert parsed['publish_tf'] is False
     assert parsed['Odom/ResetCountdown'] == '0'
     assert parsed['approx_sync_max_interval'] == .02
+
+
+def test_visual_results_get_a_longer_grace_than_the_camera_feed():
+    health = healthy()
+    # Camera stays fresh while RTAB's visual result is ~500 ms old: walking
+    # processing latency must not end the segment on the old 500 ms edge.
+    health.observe('camera', 1_200_000_000, 1_200_000_000, True)
+    quality = health.status(1_600_000_000)
+    assert quality['status'] == 'tracking'
+    # A genuinely stalled estimator still ends the segment.
+    assert health.status(2_800_000_000)['status'] == 'lost'
+    assert 'stale' in health.status(2_800_000_000)['reason']

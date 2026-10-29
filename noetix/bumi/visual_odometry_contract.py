@@ -23,7 +23,10 @@ from common.odom import build_sample
 # acceptance tests PR #425 used for the shared raw streams.
 MAX_SKEW_NS = 20_000_000            # RGB/depth capture-time difference
 MAX_TRANSPORT_NS = 250_000_000      # publisher -> subscriber age
-MAX_INPUT_AGE_NS = 500_000_000      # a stream older than this is stale
+MAX_INPUT_AGE_NS = 500_000_000      # camera stream older than this is stale
+MAX_VISUAL_AGE_NS = 1_500_000_000   # RTAB result/diagnostic older than this is stale
+AGE_LIMITS = {'camera': MAX_INPUT_AGE_NS, 'visual': MAX_VISUAL_AGE_NS,
+              'diagnostic': MAX_VISUAL_AGE_NS}
 MIN_INLIERS = 10                    # rtabmap OdomInfo inlier floor
 MAX_POSITION_SIGMA_M = 0.2          # refuse obviously broken visual covariance
 
@@ -122,10 +125,16 @@ class ClockMap:
 
 
 class Health:
-    """initializing -> tracking, with lost latched for the rest of the segment.
+    """initializing -> tracking; a fault ends the current segment.
 
-    No filtered/EKF input exists in this contract: a pose that keeps predicting
-    while the camera stopped is exactly the failure this state machine refuses.
+    The reason is latched for the segment so a stale or bad pose can never be
+    silently re-labelled as tracking. Recovery is a new segment (fresh health,
+    fresh estimator and fresh odometry frame), not a cleared error string.
+
+    Visual/diagnostic results are allowed a longer gap than the camera feed:
+    RTAB-Map processing time varies with motion and a 500 ms edge is below the
+    observed walking latency. A genuinely stalled estimator still ends the
+    segment after ``MAX_VISUAL_AGE_NS``.
     """
 
     kinds = ('camera', 'visual', 'diagnostic')
@@ -151,7 +160,8 @@ class Health:
         if stamp_ns < self.started_ns:
             return  # prior segment queued DDS traffic
         previous = self.samples.get(kind)
-        if (not -50_000_000 <= now_ns-stamp_ns <= MAX_INPUT_AGE_NS or
+        limit = AGE_LIMITS[kind]
+        if (not -50_000_000 <= now_ns-stamp_ns <= limit or
                 (previous is not None and stamp_ns <= previous)):
             self.fault('stale, repeated or reset '+kind)
         self.samples[kind] = stamp_ns
@@ -163,11 +173,12 @@ class Health:
         if self.last_clock is not None and now_ns < self.last_clock:
             self.fault('ROS clock moved backwards')
         self.last_clock = now_ns
-        if any(now_ns-stamp > MAX_INPUT_AGE_NS for stamp in self.samples.values()):
+        if any(now_ns-stamp > AGE_LIMITS[kind]
+               for kind, stamp in self.samples.items()):
             self.fault('input stale')
         ready = (self.counts.get('camera', 0) >= 3 and self.counts.get('visual', 0) >= 3)
         paired = set(self.pairs['visual']) & set(self.pairs['diagnostic'])
-        coherent = bool(paired) and now_ns-max(paired) <= MAX_INPUT_AGE_NS
+        coherent = bool(paired) and now_ns-max(paired) <= MAX_VISUAL_AGE_NS
         state = 'lost' if self.reason else ('tracking' if ready and coherent else 'initializing')
         return dict(status=state,
                     reason=self.reason or (None if state == 'tracking'
