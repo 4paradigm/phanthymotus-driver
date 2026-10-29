@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
-from native_idle_actions import DEFAULT_NATIVE_CONTAINER, IdleActionControl, safe_native_detail
+from native_idle_actions import DEFAULT_NATIVE_CONTAINER, IDLE_ACTION_KEY, IdleActionControl, safe_native_detail
 
 
 SERVICE_TIMEOUT = 10.0
@@ -2067,7 +2067,16 @@ class IdleActionsPlugin:
                 self._active = None
                 self._worker = None
                 raise
-        return {"state": "queued", "action_id": action_id}
+        request = {"config_key": IDLE_ACTION_KEY}
+        if action in {"enable", "disable"}:
+            request["enabled"] = action == "enable"
+        messages = {
+            "status": "正在查询自动待机动作开关。",
+            "enable": "正在开启自动待机动作及自动眨眼。",
+            "disable": "正在关闭自动待机动作及自动眨眼，允许当前动作执行完成。",
+        }
+        return {"action": action, "message": messages[action], "request": request,
+                "state": "running", "action_id": action_id}
 
     def _run(self, action: str, action_id: str) -> None:
         try:

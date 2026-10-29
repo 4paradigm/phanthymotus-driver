@@ -1421,7 +1421,14 @@ class U1CardContractTests(unittest.TestCase):
                     try:
                         supplied = {"action_id": "caller-enable-1"} if action == "enable" else {}
                         queued = self._call_idle_mcp(plugin, action, **supplied)
-                        self.assertEqual(queued["state"], "queued")
+                        self.assertEqual(queued["state"], "running")
+                        self.assertEqual(queued["action"], action)
+                        self.assertEqual(queued["request"], {
+                            "config_key": "idle_action_enabled",
+                            **({"enabled": enabled} if action != "status" else {}),
+                        })
+                        self.assertIn({"status": "查询", "enable": "开启", "disable": "关闭"}[action],
+                                      queued["message"])
                         self.assertTrue(entered.wait(1))
                         self.assertEqual(len(threads), 1)
                         self.assertNotEqual(threads[0], threading.get_ident())
@@ -1478,7 +1485,7 @@ class U1CardContractTests(unittest.TestCase):
                         mock.patch.object(device.urllib.request, "urlopen") as post:
                     try:
                         queued = self._call_idle_mcp(plugin, "disable")
-                        self.assertEqual(queued["state"], "queued")
+                        self.assertEqual(queued["state"], "running")
                         self.assertTrue(entered.wait(1))
                         post.assert_not_called()
                     finally:

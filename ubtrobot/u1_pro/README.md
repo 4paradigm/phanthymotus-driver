@@ -34,7 +34,21 @@
 | 开启自动待机动作 | `{"action":"enable"}` |
 | 查询当前设置 | `{"action":"status"}` |
 
-`status`、`enable`、`disable` 均异步执行。MCP 请求先返回 `{"state":"queued","action_id":"<UUID>"}`，驱动在后台完成操作，再向 Agent Core 的 `/api/acp/complete` POST 一次完成通知。可在输入中提供唯一的 `action_id`（1–128 位 ASCII 字母、数字或 `_ . : -`）；省略时生成 UUID。卡片声明 `x-completion`（上述三个动作，兜底超时 45 秒）及独立的 `u1_idle_config` 资源。
+`status`、`enable`、`disable` 均异步执行。MCP 首次返回会显示具体命令、中文说明、目标配置及任务编号。例如关闭操作返回：
+
+```json
+{
+  "action": "disable",
+  "message": "正在关闭自动待机动作及自动眨眼，允许当前动作执行完成。",
+  "request": {"config_key": "idle_action_enabled", "enabled": false},
+  "state": "running",
+  "action_id": "<UUID>"
+}
+```
+
+`request.enabled` 表示本次修改的目标值；查询操作只提供 `config_key`，不预先报告开关值。`running` 表示后台正在处理，最终结果以 ACP 完成通知为准。
+
+驱动在后台完成操作，再向 Agent Core 的 `/api/acp/complete` POST 一次完成通知。可在输入中提供唯一的 `action_id`（1–128 位 ASCII 字母、数字或 `_ . : -`）；省略时生成 UUID。卡片声明 `x-completion`（上述三个动作，兜底超时 45 秒）及独立的 `u1_idle_config` 资源。
 
 完成通知包含相同的 `action_id`、`tool:"idle_actions"` 和 `status:"completed"` 或 `status:"error"`。成功时，业务结果位于通知的 `result.result`：查询结果为 `{"ok":true,"code":"OK","data":{"enabled":true},"source":"vendor_user_config"}`，修改结果包含 `ok`、`requested`、`enabled` 和读回的 `state`。其中 `enabled` 是持久配置中的开关值；任务完成表示配置查询/写入与读回确认完成，不表示电机已经静止。
 
