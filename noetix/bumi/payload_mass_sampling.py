@@ -1,0 +1,199 @@
+"""Shared read-only observations; no SDK/ROS imports and no motor writes.
+
+The existing 10 Hz StatePlugin calls accept_getter before display rounding.
+Getter receipt is NOT a source heartbeat. Callback-only SDKs must be integrated
+through a verified shared dispatcher; this module never installs a callback.
+"""
+from __future__ import annotations
+
+from collections import deque
+import copy
+import math
+import threading
+import time
+
+
+class MassError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def finite(value, name, low=None, high=None):
+    if (type(value) not in (int, float) or not math.isfinite(value)
+            or (low is not None and value < low) or (high is not None and value > high)):
+        raise MassError("BAD_PARAMETER", f"{name}: expected finite number in [{low}, {high}]")
+    return float(value)
+
+
+def vector(values, size, name):
+    if not isinstance(values, (list, tuple)) or len(values) != size:
+        raise MassError("BAD_DATA", f"{name}: expected {size} values")
+    return [finite(v, name) for v in values]
+
+
+def quaternion_angle(a, b):
+    a, b = vector(a, 4, "quaternion"), vector(b, 4, "quaternion")
+    na, nb = math.sqrt(sum(x*x for x in a)), math.sqrt(sum(x*x for x in b))
+    if not 0.9 <= na <= 1.1 or not 0.9 <= nb <= 1.1:
+        raise MassError("BAD_DATA", "IMU quaternion is not normalized")
+    return 2 * math.acos(min(1.0, abs(sum(x*y for x, y in zip(a, b)) / na / nb)))
+
+
+class SharedSampler:
+    def __init__(self, maxlen=4096):
+        self._condition = threading.Condition()
+        self._frames = deque(maxlen=maxlen)
+        self._serial = 0
+        self._last_source = None
+        self._last_timestamp = None
+        self._errors = 0
+        self._error = None
+        self._duplicates = 0
+
+    def accept_getter(self, motors, imu, workmode):
+        """Reuse the already initialized HighController, including raw floats."""
+        self.push({"motor_ids": [int(m.motor_id) for m in motors],
+                   "q": [float(m.pos) for m in motors],
+                   "dq": [float(m.vel) for m in motors],
+                   "tau": [float(m.tau) for m in motors],
+                   "temperature": [float(m.temperature) for m in motors],
+                   "errors": [int(m.error) for m in motors],
+                   "quaternion_xyzw": [float(v) for v in imu.ori],
+                   "gyro": [float(v) for v in imu.angular_vel],
+                   "workmode": int(workmode), "source_seq": None,
+                   "source_timestamp": None, "adapter": "shared_highcontroller_getter"})
+
+    def record_error(self, exc):
+        with self._condition:
+            self._errors += 1
+            self._error = str(exc)
+            self._condition.notify_all()
+
+    def push(self, raw):
+        frame = copy.deepcopy(raw)
+        try:
+            ids = frame["motor_ids"]
+            if (len(ids) != 21 or any(type(i) is not int for i in ids)
+                    or set(ids) != set(range(21))):
+                raise MassError("MAPPING", "expected unique SDK motor IDs 0..20; verify mapping")
+            # Indexing is by actual motor ID, never assumed array order.
+            order = [ids.index(i) for i in range(21)]
+            for name in ("q", "dq", "tau", "temperature", "errors"):
+                values = vector(frame[name], 21, name)
+                frame[name] = [values[i] for i in order]
+            frame["motor_ids"] = list(range(21))
+            frame["quaternion_xyzw"] = vector(frame["quaternion_xyzw"], 4, "quaternion")
+            quaternion_angle(frame["quaternion_xyzw"], frame["quaternion_xyzw"])
+            frame["gyro"] = vector(frame["gyro"], 3, "gyro")
+            if type(frame["workmode"]) is not int:
+                raise MassError("BAD_DATA", "workmode must be an integer")
+            seq = frame.get("source_seq")
+            if seq is not None and (type(seq) is not int or seq < 0):
+                raise MassError("BAD_DATA", "source_seq must be a nonnegative integer")
+            stamp = frame.get("source_timestamp")
+            if stamp is not None:
+                finite(stamp,"source_timestamp",0)
+        except (KeyError, TypeError, MassError) as exc:
+            self.record_error(exc)
+            return False
+        with self._condition:
+            # Monotonic source IDs are optional, but known repeated/old IDs
+            # cannot be given new host times and counted as new feedback.
+            if ((seq is not None and self._last_source is not None and seq <= self._last_source)
+                    or (stamp is not None and self._last_timestamp is not None and stamp <= self._last_timestamp)):
+                self._duplicates += 1
+                self._condition.notify_all()
+                return False
+            if seq is not None:
+                self._last_source = seq
+            if stamp is not None:
+                self._last_timestamp = stamp
+            self._serial += 1
+            frame.update(serial=self._serial, host_monotonic_s=time.monotonic(),
+                         host_time_s=time.time(), error_epoch=self._errors)
+            self._frames.append(frame)
+            self._condition.notify_all()
+        return True
+
+    def diagnostics(self):
+        with self._condition:
+            latest = copy.deepcopy(self._frames[-1]) if self._frames else None
+            frames = list(self._frames)
+            span = frames[-1]["host_monotonic_s"] - frames[0]["host_monotonic_s"] if len(frames)>1 else 0
+            changes = sum(a["tau"] != b["tau"] for a,b in zip(frames, frames[1:]))
+            return {"latest": latest, "host_age_s": time.monotonic()-latest["host_monotonic_s"] if latest else None,
+                    "received_count": self._serial, "buffer_count": len(frames),
+                    "host_observation_hz": (len(frames)-1)/span if span else None,
+                    "torque_changed_observations": changes,
+                    "source_duplicate_count": self._duplicates,
+                    "read_error_count": self._errors, "last_read_error": self._error,
+                    "freshness_status": "source_sequence" if latest and latest.get("source_seq") is not None else "source_timestamp" if latest and latest.get("source_timestamp") is not None else "host_receipt_only",
+                    "effective_sample_count": None,
+                    "note": "Getter receipt/change rate cannot prove source refresh rate or independent samples."}
+
+    def collect(self, duration, profile, cancel):
+        with self._condition:
+            cursor, epoch = self._serial, self._errors
+        deadline = time.monotonic() + duration + profile["settle_timeout_s"]
+        stable = []
+        reason = "INSUFFICIENT_SAMPLES"
+        while time.monotonic() < deadline:
+            if cancel.is_set():
+                raise MassError("CANCELLED", "sampling cancelled; no motor command sent")
+            with self._condition:
+                if epoch != self._errors:
+                    raise MassError("DATA_ERROR", self._error or "shared state read failed")
+                incoming = [copy.deepcopy(f) for f in self._frames if f["serial"] > cursor]
+                self._condition.wait(timeout=0.02 if not incoming else 0)
+            for frame in incoming:
+                if frame["serial"] != cursor + 1:
+                    stable = []
+                cursor = frame["serial"]
+                try:
+                    check_frame(frame, profile)
+                    if stable and frame["host_monotonic_s"]-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
+                        stable = []
+                    stable.append(frame)
+                    # A stable joint alone does not show the hanging object is
+                    # stationary: reject torque spread AND drift in the window.
+                    if stable[-1]["host_monotonic_s"]-stable[0]["host_monotonic_s"] >= duration:
+                        if len(stable) < profile["min_samples"]:
+                            raise MassError("INSUFFICIENT_SAMPLES", "too few observations")
+                        for j in profile["motor_ids"]:
+                            values = [f["tau"][j] for f in stable]
+                            if max(values)-min(values) > profile["max_torque_span"]:
+                                raise MassError("UNSTABLE", "torque spread exceeds stable-window limit")
+                        if time.monotonic()-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
+                            raise MassError("STALE_SOURCE", "last observation too old")
+                        return stable
+                except MassError as exc:
+                    # Faults and mismatched conditions invalidate this attempt;
+                    # ordinary settling may wait for a complete stable window.
+                    if exc.code not in ("UNSTABLE", "INSUFFICIENT_SAMPLES"):
+                        raise
+                    reason = exc.code
+                    stable = []
+            if stable and time.monotonic()-stable[-1]["host_monotonic_s"] > profile["max_receive_gap_s"]:
+                stable = []
+                reason = "STALE_SOURCE"
+        raise MassError(reason, "no complete continuous stable window before timeout")
+
+
+def check_frame(frame, p):
+    if frame["workmode"] != p["workmode"] or frame["workmode"] in (26,30):
+        raise MassError("MODE_MISMATCH", "workmode/protection differs from profile")
+    if any(frame["errors"]):
+        raise MassError("MOTOR_FAULT", "nonzero motor error (including undocumented codes)")
+    if max(frame["temperature"]) >= p["max_temperature_c"]:
+        raise MassError("OVER_TEMPERATURE", "temperature exceeds engineer-confirmed limit")
+    if max(abs(a-b) for a,b in zip(frame["q"],p["pose_q"])) > p["pose_tolerance_rad"]:
+        raise MassError("POSE_MISMATCH", "arm/waist/body joint pose differs from profile")
+    if quaternion_angle(frame["quaternion_xyzw"], p["quaternion_xyzw"]) > p["body_tolerance_rad"]:
+        raise MassError("BODY_MISMATCH", "body orientation differs from profile")
+    if max(abs(v) for v in frame["dq"]) > p["max_velocity_rad_s"] or max(abs(v) for v in frame["gyro"]) > p["max_gyro_rad_s"]:
+        raise MassError("UNSTABLE", "joint/body velocity too high")
+    if any(abs(frame["tau"][j]) >= p["torque_abs_limit"] for j in p["motor_ids"]):
+        raise MassError("SATURATED", "torque outside engineer-confirmed measurement limits")
+    if frame.get("source_seq") is None and frame.get("source_timestamp") is None and not p["accept_host_only_freshness"]:
+        raise MassError("FRESHNESS_UNVERIFIED", "SDK has no source heartbeat; verified host-only policy required")

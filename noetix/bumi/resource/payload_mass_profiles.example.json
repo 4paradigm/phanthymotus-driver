@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "notice": "UNVERIFIED TEMPLATE. Fill nulls from site measurements; synthetic demo values are not robot limits.",
+  "profiles": {
+    "left_hook_A": {
+      "arm": "left",
+      "motor_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "joint_names": [
+        "l_arm_pitch_joint",
+        "l_arm_roll_joint",
+        "l_arm_yaw_joint",
+        "l_elbow_pitch_joint"
+      ],
+      "hardware_id": "REPLACE_WITH_ACTUAL_ROBOT_ID",
+      "sdk_version": "REPLACE_WITH_INSTALLED_BINDING_HASH_AND_FIRMWARE",
+      "hook_id": "REPLACE_WITH_FIXED_HOOK_ID",
+      "control_config": "REPLACE_WITH_VERIFIED_MODE_AND_GAIN_ID",
+      "mapping_evidence": "",
+      "mapping_verified": false,
+      "load_range_confirmed": false,
+      "feedback_verified": false,
+      "feedback_evidence": "",
+      "torque_units": "sdk_raw",
+      "accept_host_only_freshness": false,
+      "pose_q": null,
+      "quaternion_xyzw": null,
+      "workmode": 2,
+      "pose_tolerance_rad": null,
+      "body_tolerance_rad": null,
+      "max_velocity_rad_s": null,
+      "max_gyro_rad_s": null,
+      "max_torque_span": null,
+      "torque_abs_limit": null,
+      "max_temperature_c": null,
+      "max_temperature_drift_c": null,
+      "max_mass_kg": null,
+      "noise_floor_raw": null,
+      "max_calibration_error_kg": null,
+      "settle_timeout_s": 0.5,
+      "min_samples": 20,
+      "max_receive_gap_s": 0.2
+    }
+  }
+}
