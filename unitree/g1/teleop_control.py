@@ -599,22 +599,11 @@ class TeleopControl:
                     break
                 elapsed = time.monotonic()-started
                 if elapsed >= 12.:
-                    # The executor already accepts late measured rest after a
-                    # pure zero-weight handback. Keep this replay pending while
-                    # that SAME operation settles; never reissue stop or 99.
-                    late_handback = (replay_completion and operation_id
-                        and release.get('operation_id') == operation_id
-                        and release.get('state') == 'unknown'
-                        and release.get('reason') == 'release_timeout'
-                        and release.get('timed_out_state') == 'confirming_handback'
-                        and release.get('action_id') is None
-                        and not release.get('operator_reset') and not release.get('request_sent')
-                        and release.get('zero_writes', 0) >= 5 and state.get('weight') == 0
-                        and state['state'] != 'fault' and not state.get('output_active')
-                        and not (self.executor._rpc_thread and self.executor._rpc_thread.is_alive()))
-                    if not late_handback or elapsed >= 30.:
+                    # Keep this replay pending while the SAME zero-weight stop
+                    # settles late; never reissue stop or 99.
+                    if (elapsed >= 30. or not (replay_completion and operation_id)
+                            or not self.executor.awaiting_late_rest(operation_id)):
                         break
-                    self.executor._fresh()
                 if confirmed:self.executor.confirm_operator_reset()
                 time.sleep(.02)
             if state['ownership_held']:

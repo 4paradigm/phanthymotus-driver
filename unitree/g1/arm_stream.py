@@ -737,17 +737,37 @@ class ArmStreamExecutor:
         self._hold_confirmed=physical_confirmed
         if self._channel_open:self._channel.close();self._channel_open=False
 
+    def _late_rest_candidate(self, op):
+        # A zero-weight stop that timed out with no vendor action in flight
+        # may still receive late physical confirmation. Lock held by caller.
+        return bool(op and op['state']=='unknown' and op.get('reason')=='release_timeout'
+                    and op.get('action_id') is None and not op.get('request_sent')
+                    and op.get('zero_writes',0)>=5 and self._weight==0
+                    and not (self._rpc_thread and self._rpc_thread.is_alive()))
+
+    def awaiting_late_rest(self, operation_id):
+        """True while this same stop can still settle; raises on stale feedback.
+
+        Lets a caller keep waiting past the release deadline without
+        reissuing stop or 99, and without reading executor internals.
+        """
+        with self.lock:
+            op=self._operation
+            if not (self._late_rest_candidate(op) and op.get('operation_id')==operation_id
+                    and op.get('timed_out_state')=='confirming_handback'
+                    and not op.get('operator_reset') and self.state not in ('fault','active')):
+                return False
+        self._fresh()
+        return True
+
     def tick(self):
         with self.lock:
             if not self.session_id and not (self._operation and self._operation['state'] not in ('completed','failed','unknown')):return
             try:
                 s,q,dq=self._fresh()
                 op=self._operation
-                if (op and op['state']=='unknown' and op.get('reason')=='release_timeout'
-                        and op.get('action_id') is None and not op.get('request_sent')
-                        and op.get('zero_writes',0)>=5 and self._weight==0
-                        and (op.get('handback_confirmed') or op.get('timed_out_state')=='confirming_handback')
-                        and not (self._rpc_thread and self._rpc_thread.is_alive())):
+                if (self._late_rest_candidate(op)
+                        and (op.get('handback_confirmed') or op.get('timed_out_state')=='confirming_handback')):
                     # A completed zero-weight stop can receive late physical
                     # confirmation. Never retry an SDK call or replay targets.
                     if self._stationary(s,q,dq,op['zero_confirmed_ns']):

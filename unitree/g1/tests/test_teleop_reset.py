@@ -9,6 +9,7 @@ import pytest
 from test_arm_stream import rig, packet, JOINT_NAMES
 from test_teleop_settings import input_card
 from teleop_control import TeleopControl
+from arm_stream import ArmStreamExecutor
 
 
 def reset_rig(tmp_path, client=None):
@@ -59,8 +60,15 @@ def test_replay_waits_only_for_same_zero_weight_handback(monkeypatch, case, expe
         if case == 'feedback_lost': raise ValueError('arm_feedback_stale')
     def dispatch(action, args):
         calls.append(action); return {'operation_id': 'same-stop'}
+    def awaiting_late_rest(operation_id):
+        # The real executor predicate, over this scripted release state.
+        s = status()
+        view = SimpleNamespace(lock=threading.RLock(), _operation=s['release'], state=s['state'],
+                               _weight=s['weight'], _rpc_thread=None, _fresh=fresh)
+        view._late_rest_candidate = lambda op: ArmStreamExecutor._late_rest_candidate(view, op)
+        return ArmStreamExecutor.awaiting_late_rest(view, operation_id)
     executor = SimpleNamespace(status=status, dispatch=dispatch, opening=False,
-        cancel_preparation=lambda: None, _rpc_thread=None, _fresh=fresh)
+        cancel_preparation=lambda: None, awaiting_late_rest=awaiting_late_rest)
     card = TeleopControl.__new__(TeleopControl)
     card.executor = executor
     card.motion = SimpleNamespace(cancel_pending=lambda: None, _lock=threading.RLock())
