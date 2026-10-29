@@ -184,6 +184,9 @@ class SoundDirectionTests(unittest.TestCase):
         self.assertIn("direction_card.py", (root / "Dockerfile").read_text())
         self.assertIn("name: sound_direction, type: sensor", (root / "driver.yaml").read_text())
         self.assertNotIn("head_orientation", (root / "driver.yaml").read_text())
+        self.assertNotIn("name: idle_actions", (root / "driver.yaml").read_text())
+        self.assertFalse((root / "native_idle_actions.py").exists())
+        self.assertNotIn("native_idle_actions", (root / "Dockerfile").read_text())
 
 
 if __name__ == "__main__":

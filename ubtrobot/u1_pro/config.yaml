@@ -19,5 +19,5 @@ sound_direction:
   source: native
   activity:
     # Initial tuning values, not measured acoustic SPL. Quiet startup ~1 second.
-    minimum_dbfs: -50.0
-    margin_db: 10.0
+    minimum_dbfs: -65.0
+    margin_db: 2.5

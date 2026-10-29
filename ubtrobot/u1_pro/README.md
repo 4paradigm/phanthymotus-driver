@@ -162,7 +162,7 @@ native 后端现在先判断声音活动，再接受厂商方位事件；保持�
 
 启动、设备切换、音频断流恢复或定位服务重新发现后，先用约 1 秒音频学习背景（建议此时保持安静）。阈值为 `max(minimum_dbfs, background_dbfs + margin_db)`。连续约 150ms 超过阈值后进入活动状态，再等待至少 0.5 秒才接受新定位结果；最近约 150ms 没有超过门限就抑制并清空方向，但保留最多 0.8 秒的活动上下文以容纳字词停顿。超过 0.8 秒安静后重新要求起声和等待。公开心跳最多再等 500ms，输出 `no_event`、`angle_deg: null`。低于阈值期间背景缓慢更新，活动期间冻结背景，避免持续说话/音乐把自身吸收为噪声。回放通道、直流、启动学习期、无效 PCM 都不能单独触发方向。
 
-`config.yaml` 的 `sound_direction.activity` 可调整 `minimum_dbfs`（默认 -50，范围 -90 至 -10）和 `margin_db`（默认 10，范围 1 至 30）。默认值只是初始调试值，尚未经真机门控验收：漏掉较轻声音时可降低门限，背景误触发时可提高门限；过高会漏检短句或远处声音。暂不提供网页调参或持久化设置卡。
+`config.yaml` 的 `sound_direction.activity` 可调整 `minimum_dbfs`（默认 -65，范围 -90 至 -10）和 `margin_db`（默认 2.5，范围 1 至 30）。默认值只是初始调试值，尚未经真机门控验收：漏掉较轻声音时可降低门限，背景误触发时可提高门限；过高会漏检短句或远处声音。暂不提供网页调参或持久化设置卡。
 
 卡片 `info` → `source_status.activity` 提供 `active`、`reason`、`level_dbfs`、`background_dbfs`、`threshold_dbfs` 及当前配置。`calibrating` 为学习期，`below_threshold` 为被声音门限抑制，`settling` 为等待定位窗口更新，`sound_detected` 为允许接收事件，`unsupported_or_invalid_audio` 为输入布局/格式不受支持。仅支持已核验的 Bothlent UAC Dongle / Mic Arry 8、16kHz S16LE 8 通道布局，未知输入保守抑制。
 
@@ -178,3 +178,10 @@ native 后端现在先判断声音活动，再接受厂商方位事件；保持�
 部分固件会持续发布 domain 2 的 `/sys/device/audio_in/raw`，但 domain 20 的 `/robo/audio/call/open_stream` 不返回。驱动现在仅在该打开调用抛出 TimeoutError 时，启用已有原始音频转换路径；MicPlugin 仍须收到新 PCM 帧才报告 running，旧会话事件会清除，没有音频仍返回错误并停止转发。SDK 的明确拒绝/其他异常不被吞掉。
 
 `mic info` 会保留 `sdk_warning` 并显示 `audio_source: topic`。这是音频输入降级，不是伪造 SDK 打开成功；超时的远端请求最终是否执行仍不确定，停止该输入只释放本驱动的转发，不冒认共享 SDK 流的所有权。无需重启厂商服务、改行为开关或重新接线。原始通道音质与 SDK 路径可能不同，真实语音识别效果仍需验收。
+
+
+## 独立开发与可用版本回退
+
+本分支 feat/u1pro-sound-direction-only 仅包含听声辨位、既有麦克风修复及必要接口，不包含同事未合并的 idle_actions 卡片或其原生控制模块/注册/依赖。当前真机认可部署是 release.261029.49fb570 + perception release.261029.f959e96-jetson-jp6.1；该历史整合镜像含 idle_actions，作为原样回退保存，不代表本分支包含该卡片。本分支未部署，不替换同事真机开发。
+
+认可门限：minimum_dbfs=-65、margin_db=2.5，settle=.5s、pause hold=.8s。当前输入输出和单人估计 ASR 关联保留；真实采集窗口及头→胸补偿仍在可行性核查，未开启或宣称可用。
