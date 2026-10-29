@@ -18,10 +18,10 @@ from __future__ import annotations
 import json
 import os
 import ssl
-import subprocess
 import threading
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
@@ -97,17 +97,14 @@ def verify_hand_connection(client: L20CanClient) -> None:
 def _discover_can_channels() -> list[str]:
     """Return all available socketcan channel names on Linux."""
     try:
-        out = subprocess.check_output(
-            ["ip", "-o", "link", "show", "type", "can"],
-            text=True, timeout=2,
-        )
         channels = []
-        for line in out.splitlines():
-            parts = line.split(":")
-            if len(parts) >= 2:
-                name = parts[1].strip().split("@")[0]
-                if name:
-                    channels.append(name)
+        # ARPHRD_CAN=280. Avoid forking an ip subprocess from QEMU/DDS threads.
+        for entry in sorted(Path('/sys/class/net').iterdir()):
+            try:
+                if int((entry / 'type').read_text().strip()) == 280:
+                    channels.append(entry.name)
+            except (OSError, ValueError):
+                continue  # An adapter may disappear during discovery.
         return channels if channels else ["can0"]
     except Exception:
         return ["can0"]
@@ -412,27 +409,20 @@ class HandPlugin:
                 "start": ([], "启动卡片控制"),
                 "stop": (["bound_side"], "停止所选手的基础控制动作并释放本工具保持的力矩"),
                 "get_state": (["bound_side"], "读取所选手 16 个主动关节当前位置（0–255）、速度及电机状态"),
-                "open": (["bound_side", "speed_ratio", "set_torque", "hold_torque", "confirm_motion"],
-                         "张开手掌到已校准姿态；set_torque 设置运动力矩；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）；每次运动须确认"),
-                "close": (["bound_side", "speed_ratio", "set_torque", "hold_torque", "confirm_motion"],
-                          "握拳到已校准姿态；set_torque 设置运动力矩；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）；每次运动须确认"),
+                "open": (["bound_side", "speed_ratio", "set_torque", "confirm_motion"],
+                         "张开手掌到已校准姿态；set_torque 设置运动力矩；到位后卸力；每次运动须确认"),
+                "close": (["bound_side", "speed_ratio", "set_torque", "confirm_motion"],
+                          "握拳到已校准姿态；set_torque 设置运动力矩；到位后卸力；每次运动须确认"),
                 "reset": (["bound_side", "confirm_motion"],
                           "移动到自然放松姿态后释放所有关节电机力矩/电流；每次运动须确认"),
-                "relax": (["bound_side", "speed_ratio", "set_torque", "hold_torque", "confirm_motion"],
-                          "移动到自然下垂常态姿态；set_torque 设置运动力矩；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）；每次运动须确认"),
+                "relax": (["bound_side", "speed_ratio", "set_torque", "confirm_motion"],
+                          "移动到自然下垂常态姿态；set_torque 设置运动力矩；到位后卸力；每次运动须确认"),
                 "set_positions": (
-                    ["bound_side", *STRUCTURED_POSITION_FIELDS, "speed_ratio", "hold_torque", "confirm_motion"],
-                    "按需设置 16 个主动关节位置（0–255 协议值，非角度），留空保持当前位置；hold_torque 设置到位保持力矩（0–255，默认 0 断力）",
+                    ["bound_side", *STRUCTURED_POSITION_FIELDS, "speed_ratio", "confirm_motion"],
+                    "按需设置 16 个主动关节位置（0–255 协议值，非角度），留空保持当前位置；到位后卸力",
                 ),
             },
             {
-                "hold_torque": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 255,
-                    "default": 0,
-                    "description": "动作到位后保持力矩上限（0–255 整数）；留空默认为 0（到位自动断电卸力防发热）；>0 则以该力矩保持锁定",
-                },
                 **{
                     name: {
                         "type": "integer", "minimum": 0, "maximum": 255,
@@ -655,7 +645,9 @@ class HandPlugin:
         channel = self.config.get("can_channel", "can0")
         key = (side, channel)
         speed, torque = self._motion_options(action, args)
-        hold_torque = 0 if action == "reset" else validate_hold_torque(args.get("hold_torque"), default=0)
+        if "hold_torque" in args:
+            raise ValueError("hold_torque is no longer supported")
+        hold_torque = 0
         active: dict = {
             "action": action,
             "action_id": f"hand_{action}_{uuid4().hex}",
@@ -830,8 +822,8 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
 
     grasp_config = config.get("plugins", {}).get("hand_grasp", {})
     if grasp_config.get("enabled", True):
-        from grasp_device import GraspPlugin
-        plugins.append(GraspPlugin(hand_plugin, grasp_config, global_config=config))
+        from adaptive_grasp_device import AdaptiveGraspPlugin
+        plugins.append(AdaptiveGraspPlugin(hand_plugin, grasp_config, global_config=config))
 
     tactile_config = config.get("plugins", {}).get("hand_tactile")
     if tactile_config and tactile_config.get("enabled", True):

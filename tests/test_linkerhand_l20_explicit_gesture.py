@@ -178,7 +178,7 @@ def test_id_only_stop_cancels_only_source_that_supplied_id(plugin, monkeypatch):
 
 def test_old_card_cleanup_cannot_unload_newer_device_command(plugin):
     plugin.dispatch("number", {"bound_side": "left", "instance_id": "old", "number": 5,
-                               "hold_torque": 80, "confirm_motion": True})
+                               "confirm_motion": True})
     wait_idle(plugin)
     ctrl = plugin.hand.controllers[("left", "can0")]
     newer_owner = ("other-tool", "new-command")
@@ -187,42 +187,3 @@ def test_old_card_cleanup_cannot_unload_newer_device_command(plugin):
     before = list(ctrl.client.currents)
     plugin.dispatch("stop", {"instance_id": "old"})
     assert ctrl.client.currents == before
-
-
-def test_stop_from_another_card_can_release_selected_gesture_hold(plugin):
-    plugin.dispatch("number", {"bound_side": "left", "instance_id": "old", "number": 5,
-                               "hold_torque": 80, "confirm_motion": True})
-    wait_idle(plugin)
-    ctrl = plugin.hand.controllers[("left", "can0")]
-    plugin.dispatch("stop", {"bound_side": "left", "instance_id": "replacement"})
-    assert ctrl.client.currents[-1] == [0] * 5
-
-
-@pytest.mark.parametrize("failure", ["verify", "thread_start"])
-def test_preworker_failure_preserves_existing_hold_for_explicit_stop(plugin, monkeypatch, failure):
-    plugin.dispatch("number", {"bound_side": "left", "instance_id": "old", "number": 5,
-                               "hold_torque": 80, "confirm_motion": True})
-    wait_idle(plugin)
-    target = ("left", "can0")
-    previous_hold = plugin._held[target]
-    ctrl = plugin.hand.controllers[target]
-    before = list(ctrl.client.currents)
-
-    def fail(*_):
-        raise RuntimeError("simulated preworker failure")
-
-    if failure == "verify":
-        monkeypatch.setattr(gesture_device, "verify_hand_connection", fail)
-    else:
-        monkeypatch.setattr(threading.Thread, "start", fail)
-
-    with pytest.raises(RuntimeError, match="simulated preworker failure"):
-        plugin.dispatch("number", {"bound_side": "left", "number": 5, "confirm_motion": True})
-    assert not plugin._active
-    assert plugin._held[target] is previous_hold
-    assert ctrl.client.currents == before
-    assert vars(ctrl).get("_last_command_owner") == previous_hold["owner"]
-    assert not vars(ctrl).get("_command_owner")
-    plugin.dispatch("stop", {"bound_side": "left"})
-    assert ctrl.client.currents[-1] == [0] * 5
-    assert ctrl._holding_torque == 0

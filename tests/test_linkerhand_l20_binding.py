@@ -216,37 +216,7 @@ def test_actuator_tools_reject_competing_commands_on_same_hand(first_type, secon
     assert not vars(ctrl).get('_command_owner')
 
 
-@pytest.mark.parametrize('failure', ['probe', 'thread'])
-def test_hand_failed_replacement_keeps_previous_hold_stoppable(connected_hand, monkeypatch, failure):
-    import hand_device
-    hand, _, _, ctrl = connected_hand
-    workers = []
-    monkeypatch.setattr(threading.Thread, 'start', lambda worker: workers.append(worker))
-    hand._acp_callback = lambda *args: None
-    hand.dispatch('open', {'bound_side': 'left', 'instance_id': 'old',
-                          'hold_torque': 80, 'confirm_motion': True})
-    workers.pop().run()
-    record = hand._held[('left', 'can0')]
-    owner = ctrl._last_command_owner
-    if failure == 'probe':
-        def fail(_):
-            raise RuntimeError('probe failed')
-        monkeypatch.setattr(hand_device, 'verify_hand_connection', fail)
-    else:
-        def fail(_):
-            raise RuntimeError('thread failed')
-        monkeypatch.setattr(threading.Thread, 'start', fail)
-    with pytest.raises(RuntimeError, match='failed'):
-        hand.dispatch('close', {'bound_side': 'left', 'instance_id': 'new', 'confirm_motion': True})
-    assert hand._held[('left', 'can0')] is record
-    assert ctrl._last_command_owner == owner
-    assert ctrl._holding_torque == 80
-    assert not vars(ctrl).get('_command_owner')
-    hand.dispatch('stop', {'instance_id': 'old'})
-    assert ctrl._holding_torque == 0
-
-
-def test_hand_failed_worker_actually_unloads_requested_nonzero_hold(connected_hand, monkeypatch):
+def test_hand_failed_worker_unloads_motor_current(connected_hand, monkeypatch):
     hand, client, _, ctrl = connected_hand
     workers = []
     monkeypatch.setattr(threading.Thread, 'start', lambda worker: workers.append(worker))
@@ -257,25 +227,22 @@ def test_hand_failed_worker_actually_unloads_requested_nonzero_hold(connected_ha
         client.set_currents([80] * 5)
         return {'state': 'released_timeout'}
     monkeypatch.setattr(ctrl, 'move', timed_out)
-    hand.dispatch('open', {'bound_side': 'left', 'hold_torque': 80, 'confirm_motion': True})
+    hand.dispatch('open', {'bound_side': 'left', 'confirm_motion': True})
     workers[0].run()
     assert writes[-1] == [0] * 5
     assert ctrl._holding_torque == 0
     assert not hand._held
 
 
-def test_shared_can_change_blocked_until_held_torque_is_released(connected_hand, monkeypatch):
+def test_shared_can_change_blocked_until_motion_finishes(connected_hand, monkeypatch):
     hand, _, _, _ = connected_hand
     workers = []
     monkeypatch.setattr(threading.Thread, 'start', lambda worker: workers.append(worker))
     hand._acp_callback = lambda *args: None
-    hand.dispatch('open', {'bound_side': 'left', 'hold_torque': 80, 'confirm_motion': True})
+    hand.dispatch('open', {'bound_side': 'left', 'confirm_motion': True})
     with pytest.raises(RuntimeError, match='CAN'):
         hand.dispatch('config', {'can_channel': 'can1'})
     workers.pop().run()
-    with pytest.raises(RuntimeError, match='CAN'):
-        hand.dispatch('config', {'can_channel': 'can1'})
-    hand.dispatch('stop', {'bound_side': 'left'})
     hand.dispatch('config', {'can_channel': 'can1'})
     assert hand.config['can_channel'] == 'can1'
 

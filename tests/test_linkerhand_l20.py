@@ -330,7 +330,7 @@ def test_gesture_plugin_ok_gesture():
     tool_def = gesture.get_tool()
     assert tool_def["name"] == "hand_gesture"
     assert "ok_gesture" in tool_def["inputSchema"]["x-action-params"]
-    assert "count" in tool_def["inputSchema"]["x-action-params"]
+    assert "count" not in tool_def["inputSchema"]["x-action-params"]
     assert "number" in tool_def["inputSchema"]["x-action-params"]
 
     # Check confirm motion gate
@@ -452,51 +452,6 @@ def test_gesture_and_grasp_standalone_without_hand():
             assert info["state"] == "ready"
             assert info["bound_side"] == side
         assert not card._controllers
-
-
-def test_gesture_plugin_count_collision_avoidance():
-    client, mock_bus = make_mock_client()
-    ctrl = MagicMock()
-    ctrl.channel = "can0"
-    ctrl._motion_lock = threading.RLock()
-    ctrl.get.return_value = client
-    ctrl.side = "left"
-    hand_plugin = MagicMock()
-    hand_plugin.config = {}
-    hand_plugin.get_controller_for_side.return_value = ctrl
-
-    config = {
-        "motion_speed": 85,
-        "count_speed": 85,
-        "motion_timeout_s": 0.5,
-        "poll_interval_s": 0.01,
-    }
-    gesture = GesturePlugin(hand_plugin, config)
-
-    done = threading.Event()
-    results = []
-
-    def cb(aid, status, res):
-        results.append((aid, status, res))
-        done.set()
-
-    gesture._acp_callback = cb
-
-    try:
-        res = gesture.dispatch("count", {
-            "instance_id": "inst_count", "bound_side": "left",
-            "start_num": 1,
-            "end_num": 3,
-            "hold_time_s": 0.1,
-            "confirm_motion": True,
-        })
-        assert res["state"] == "running"
-        assert done.wait(5.0), "Count completion callback not received"
-        assert len(results) == 1
-        assert results[0][1] == "completed"
-        assert results[0][2]["final_number"] == 3
-    finally:
-        client.close()
 
 
 def test_gesture_plugin_number_action():
@@ -736,7 +691,7 @@ def test_count_entry_uses_clearance_and_preserves_displayed_sequence(from_num, s
 
 
 @pytest.mark.parametrize("action,from_num,target_num", [
-    ("number", 1, 4), ("count", 1, 4), ("number", 0, 4), ("number", 4, 0), ("count", 4, 4),
+    ("number", 1, 4), ("number", 0, 4), ("number", 4, 0),
     ("number", 9, 3), ("number", 8, 4), ("number", 9, 4),
     ("number", 0, 7), ("number", 7, 0), ("number", 7, 1), ("number", 7, 2),
 ])
@@ -1161,7 +1116,7 @@ def test_validate_hold_torque_boundaries_and_types():
             validate_hold_torque(invalid)
 
 
-def test_hand_and_gesture_hold_torque_dispatch_and_rejection(monkeypatch):
+def test_hand_and_gesture_removed_hold_torque(monkeypatch):
     client, mock_bus = make_mock_client()
     ctrl = MagicMock()
     ctrl.channel = "can0"
@@ -1179,25 +1134,20 @@ def test_hand_and_gesture_hold_torque_dispatch_and_rejection(monkeypatch):
     gesture_p = GesturePlugin(hand_p, {"motion_speed": 85}, global_config={"side": "left"})
 
     try:
-        # 1. HandPlugin: non-integer / boolean hold_torque must be rejected
-        for bad_val in [True, False, -1, 256, "100", 2.5]:
-            with pytest.raises(ValueError, match="hold_torque 必须是 0–255 之间的整数"):
-                hand_p.dispatch("open", {"instance_id": "h1", "bound_side": "left", "hold_torque": bad_val, "confirm_motion": True})
+        for card in (hand_p, gesture_p):
+            schema = card.get_tool()["inputSchema"]
+            assert "hold_torque" not in schema["properties"]
+            for params in schema["x-action-params"].values():
+                assert "hold_torque" not in params["params"]
 
-        # 2. GesturePlugin: non-integer / boolean hold_torque must be rejected
-        for bad_val in [True, False, -1, 256, "50", 1.0]:
-            with pytest.raises(ValueError, match="hold_torque 必须是 0–255 之间的整数"):
-                gesture_p.dispatch("ok_gesture", {"instance_id": "g1", "bound_side": "left", "hold_torque": bad_val, "confirm_motion": True})
+        for action in ("open", "close", "relax", "set_positions"):
+            with pytest.raises(ValueError, match="hold_torque is no longer supported"):
+                hand_p.dispatch(action, {"bound_side": "left", "hold_torque": 80, "confirm_motion": True})
 
-        # 3. Valid integer hold_torque accepted in HandPlugin
-        res_h = hand_p.dispatch("open", {"instance_id": "h1", "bound_side": "left", "hold_torque": 80, "confirm_motion": True})
-        assert res_h["state"] == "running"
-        with hand_p._lock:
-            assert hand_p._active[("left", "can0")]["hold_torque"] == 80
-            hand_p._active.clear()
-            vars(ctrl).pop("_command_owner", None)
+        for action in ("ok_gesture", "thumb_up_gesture", "v_sign_gesture", "natural_gesture", "number"):
+            with pytest.raises(ValueError, match="hold_torque is no longer supported"):
+                gesture_p.dispatch(action, {"bound_side": "left", "hold_torque": 80, "confirm_motion": True})
 
-        # 4. Omitted hold_torque defaults to 0 in HandPlugin
         res_h2 = hand_p.dispatch("open", {"instance_id": "h1", "bound_side": "left", "confirm_motion": True})
         assert res_h2["state"] == "running"
         with hand_p._lock:
@@ -1205,15 +1155,6 @@ def test_hand_and_gesture_hold_torque_dispatch_and_rejection(monkeypatch):
             hand_p._active.clear()
             vars(ctrl).pop("_command_owner", None)
 
-        # 5. Valid integer hold_torque accepted in GesturePlugin
-        res_g = gesture_p.dispatch("ok_gesture", {"instance_id": "g1", "bound_side": "left", "hold_torque": 150, "confirm_motion": True})
-        assert res_g["state"] == "running"
-        with gesture_p._lock:
-            assert gesture_p._active[("left", "can0")]["options"]["hold_torque"] == 150
-            gesture_p._active.clear()
-            vars(ctrl).pop("_command_owner", None)
-
-        # 6. Omitted hold_torque defaults to 0 in GesturePlugin
         res_g2 = gesture_p.dispatch("ok_gesture", {"instance_id": "g1", "bound_side": "left", "confirm_motion": True})
         assert res_g2["state"] == "running"
         with gesture_p._lock:
@@ -1242,18 +1183,8 @@ def test_gesture_defensive_validation():
             with pytest.raises(ValueError, match="number 必须是 0–9 之间的整数"):
                 gesture_p.dispatch("number", {"instance_id": "g1", "bound_side": "left", "number": bad_num, "confirm_motion": True})
 
-        # 2. count action validations
-        for bad_s in [True, False, -1, 10, "1"]:
-            with pytest.raises(ValueError, match="start_num 必须是 0–9 之间的整数"):
-                gesture_p.dispatch("count", {"instance_id": "g1", "bound_side": "left", "start_num": bad_s, "confirm_motion": True})
-
-        for bad_e in [True, False, -1, 15, "5"]:
-            with pytest.raises(ValueError, match="end_num 必须是 0–9 之间的整数"):
-                gesture_p.dispatch("count", {"instance_id": "g1", "bound_side": "left", "end_num": bad_e, "confirm_motion": True})
-
-        for bad_ht in [True, False, 0.01, 20.0, "1.0"]:
-            with pytest.raises(ValueError, match="hold_time_s 必须是 0.05–10.0 之间的数值"):
-                gesture_p.dispatch("count", {"instance_id": "g1", "bound_side": "left", "hold_time_s": bad_ht, "confirm_motion": True})
+        # 2. count is no longer a card action.
+        assert gesture_p.dispatch("count", {"instance_id": "g1", "bound_side": "left", "confirm_motion": True}) is None
 
         # 3. grasp and custom_grasp must NOT be in gesture_p
         tool_actions = gesture_p.get_tool()["inputSchema"]["properties"]["action"]["enum"]

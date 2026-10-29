@@ -6,7 +6,7 @@ Provides real-time streaming and polling of:
 3. Freshness/error metadata and contact flags (no calibrated force claims)
 
 Card Type: "sensor"
-Streams to topic: /{namespace}/hand/{side}/tactile as "data/json"
+Streams to topic: /{namespace}/hand/{side}/tactile as "sensor/tactile"
 """
 
 from __future__ import annotations
@@ -88,17 +88,12 @@ class TactilePlugin:
         self._last_publish_time = None
         self._last_publish_error = None
         self._last_publisher_attempt = 0.0
-        self._heatmap_publish_error = None
-        self._heatmap_published_frames = 0
-
         # ROS 2 Publisher attributes
         self._node = None
         self._pub = None
-        self._pub_heatmap = None
 
         # Resolve topics
         self._topic = self._target_topic(self.default_side, self.default_channel)
-        self._topic_heatmap = self._topic + "/heatmap"
 
     # ── Topic Metadata ────────────────────────────────────────────────
 
@@ -110,10 +105,7 @@ class TactilePlugin:
 
     def topic_out(self, side: str | None = None, channel: str | None = None) -> list[dict]:
         topic = self._target_topic(side or self.default_side, channel or self.default_channel)
-        return [
-            {"topic": topic + "/heatmap", "format": "image/jpeg"},
-            {"topic": topic, "format": "data/json"},
-        ]
+        return [{"topic": topic, "format": "sensor/tactile"}]
 
     # ── Card Definition (Schema) ──────────────────────────────────────
 
@@ -130,7 +122,7 @@ class TactilePlugin:
                 "bound_side": {
                     "type": "string",
                     "enum": ["left", "right"],
-                    "description": "选择本卡片实际采集的左手或右手，JSON 和热力图同步切换",
+                    "description": "选择本卡片实际采集的左手或右手，触觉数据流同步切换",
                 },
             },
         )
@@ -224,7 +216,6 @@ class TactilePlugin:
                     )
                     # Derive paths using the parent's original default adapter.
                     stream._topic = self._target_topic(side, channel)
-                    stream._topic_heatmap = stream._topic + "/heatmap"
                 self._streams[target] = stream
             self._stream_targets[instance_id] = target
             with self._lock:
@@ -372,20 +363,11 @@ class TactilePlugin:
             node = Node(node_name, context=self._ros2.ctx_core)
             pub = node.create_publisher(String, self._topic, qos)
 
-            pub_heatmap = None
-            try:
-                from sensor_msgs.msg import CompressedImage
-                pub_heatmap = node.create_publisher(CompressedImage, self._topic_heatmap, qos)
-            except Exception as exc:
-                self._heatmap_publish_error = str(exc)
-                logger.warning("Failed to create CompressedImage publisher: %s", exc)
-
             self._ros2.executor_core.add_node(node)
             self._node = node
             self._pub = pub
-            self._pub_heatmap = pub_heatmap
             self._last_publish_error = None
-            print(f"[tactile] ROS2 publishers ready: {self._topic} & {self._topic_heatmap}", flush=True)
+            print(f"[tactile] ROS2 publisher ready: {self._topic}", flush=True)
             return True
         except Exception as exc:
             if node is not None:
@@ -401,7 +383,6 @@ class TactilePlugin:
     def _teardown_ros_publisher(self) -> None:
         node, self._node = self._node, None
         self._pub = None
-        self._pub_heatmap = None
         if node is None or self._ros2 is None:
             return
         try:
@@ -461,25 +442,6 @@ class TactilePlugin:
                     msg = String()
                     msg.data = json.dumps(data, ensure_ascii=False, allow_nan=False)
                     self._pub.publish(msg)
-
-                    if self._pub_heatmap is not None:
-                        try:
-                            from tactile_heatmap import render_heatmap_jpeg
-                            from sensor_msgs.msg import CompressedImage
-                            jpeg_bytes = render_heatmap_jpeg(
-                                data.get("touch_matrix"),
-                                data.get("touch_scalar"),
-                                side=side,
-                            )
-                            img_msg = CompressedImage()
-                            img_msg.format = "jpeg"
-                            img_msg.data = jpeg_bytes
-                            self._pub_heatmap.publish(img_msg)
-                            self._heatmap_published_frames += 1
-                            self._heatmap_publish_error = None
-                        except Exception as h_exc:
-                            self._heatmap_publish_error = str(h_exc)
-                            logger.debug("Failed to publish heatmap frame: %s", h_exc)
 
                     with self._lock:
                         self._published_frames += 1
@@ -557,9 +519,6 @@ class TactilePlugin:
                 "published_frames": stream._published_frames if stream is not None else 0,
                 "last_publish_time": stream._last_publish_time if stream is not None else None,
                 "publish_error": stream._last_publish_error if stream is not None else None,
-                "heatmap_publisher_ready": stream is not None and stream._pub_heatmap is not None,
-                "heatmap_published_frames": stream._heatmap_published_frames if stream is not None else 0,
-                "heatmap_publish_error": stream._heatmap_publish_error if stream is not None else None,
                 "sample_state": latest.get("state", "waiting"),
                 "sample_age_s": max(0.0, time.time() - latest["timestamp"]) if latest else None,
                 "sample_errors": latest.get("errors", {}),

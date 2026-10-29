@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DRIVER))
 
 from can_client import validate_position_vector
-from grasp_device import GraspPlugin
+from adaptive_grasp_device import AdaptiveGraspPlugin
 from hand_device import build_plugins
 from common.vendor_runtime import resolve_namespace
 
@@ -32,22 +32,14 @@ def test_manifest_matches_enabled_runtime_cards_without_opening_can():
     assert config["plugins"]["hand"]["enabled"]  # Sensor shares this controller.
 
 
-def test_shipped_grasp_config_contains_only_position_settings():
+def test_shipped_grasp_config_uses_adaptive_contact_settings():
     config = load("config.yaml")["plugins"]["hand_grasp"]
-    assert set(config) == {"enabled", "grasp_prep_pose", "top_grasp_prep_pose",
-                           "release_speed", "motion_current", "poll_interval_s",
-                           "pose_timeout_s", "position_tolerance"}
-    plugin = GraspPlugin(None, config)
-    assert plugin._options(("left", "can0"), "side_grasp", {})["approach_speed"] == 85
-    for side in ("left", "right"):
-        for mode in ("side", "top"):
-            prep, target = plugin._grasp_poses(SimpleNamespace(side=side), mode)
-            assert validate_position_vector(prep) == prep
-            assert validate_position_vector(target) == target
-            assert target[:5] == [0] * 5
-            assert target[16:] == [0] * 4
-            assert target[15] == (255 if mode == "top" else 0)
-            assert target[5:11] == prep[5:11]
+    plugin = AdaptiveGraspPlugin(None, config)
+    assert validate_position_vector(plugin.prep_pose) == plugin.prep_pose
+    assert validate_position_vector(plugin.close_limit_pose) == plugin.close_limit_pose
+    assert plugin.tactile_threshold == 15
+    assert plugin.step_size == 5
+    assert set(plugin.get_tool()["inputSchema"]["x-completion"]["actions"]) == {"adaptive_grasp", "release"}
 
 
 def test_can_port_and_dds_settings_agree_across_deployment_files():
@@ -74,20 +66,18 @@ def test_tactile_defaults_produce_the_declared_sensor_topic():
     plugins = build_plugins(config, "", None)
     sensor = next(p for p in plugins if p.PREFIX == "hand_tactile")
     assert sensor.topic_out() == [
-        {"topic": f"/hand/{config['side']}/tactile/heatmap", "format": "image/jpeg"},
-        {"topic": f"/hand/{config['side']}/tactile", "format": "data/json"}]
+        {"topic": f"/hand/{config['side']}/tactile", "format": "sensor/tactile"}]
     namespace = resolve_namespace(config)
     runtime_plugins = build_plugins(config, namespace, None)
     runtime_sensor = next(p for p in runtime_plugins if p.PREFIX == "hand_tactile")
     assert runtime_sensor.topic_out() == [
-        {"topic": f"/{namespace}/hand/{config['side']}/tactile/heatmap", "format": "image/jpeg"},
-        {"topic": f"/{namespace}/hand/{config['side']}/tactile", "format": "data/json"}]
+        {"topic": f"/{namespace}/hand/{config['side']}/tactile", "format": "sensor/tactile"}]
 
 
-def test_heatmap_renderer_and_dependencies_are_in_the_build():
-    assert 'COPY tactile_heatmap.py /work/tactile_heatmap.py' in (DRIVER / 'Dockerfile').read_text()
+def test_tactile_uses_core_renderer_without_image_dependencies():
+    assert 'tactile_heatmap.py' not in (DRIVER / 'Dockerfile').read_text()
     requirements = (DRIVER / 'requirements.txt').read_text().lower()
-    assert 'pillow' in requirements and 'numpy' in requirements
+    assert 'pillow' not in requirements and 'numpy' not in requirements
 
 
 def test_actuator_shared_can_change_does_not_rewrite_sensor_target_or_topics():

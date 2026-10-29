@@ -91,8 +91,7 @@ def test_tactile_tool_metadata(fake_hand):
     assert tool_def["type"] == "sensor"
     assert tool_def["multiInstance"] is True
     assert tool_def["topic_out"] == [
-        {"topic": "/hand/left/tactile/heatmap", "format": "image/jpeg"},
-        {"topic": "/hand/left/tactile", "format": "data/json"},
+        {"topic": "/hand/left/tactile", "format": "sensor/tactile"},
     ]
 
     schema = tool_def["inputSchema"]
@@ -330,20 +329,16 @@ def test_invalid_sensor_configuration_is_rejected(name, value):
 @pytest.fixture
 def ros_runtime(monkeypatch):
     published = []
-    images = []
+    topics = []
     class String:
         data = ''
-    class CompressedImage:
-        data = b''
-        format = ''
     class Publisher:
         def __init__(self, topic):
             self.topic = topic
         def publish(self, msg):
-            if isinstance(msg, String):
-                published.append(json.loads(msg.data))
-            else:
-                images.append({'topic': self.topic, 'data': msg.data})
+            assert isinstance(msg, String)
+            published.append(json.loads(msg.data))
+            topics.append(self.topic)
         def get_subscription_count(self):
             return 2
     class Node:
@@ -361,10 +356,7 @@ def ros_runtime(monkeypatch):
         ReliabilityPolicy=SimpleNamespace(BEST_EFFORT=1),
         DurabilityPolicy=SimpleNamespace(VOLATILE=1), HistoryPolicy=SimpleNamespace(KEEP_LAST=1)))
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', SimpleNamespace(String=String))
-    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', SimpleNamespace(CompressedImage=CompressedImage))
-    monkeypatch.setitem(sys.modules, 'tactile_heatmap', SimpleNamespace(
-        render_heatmap_jpeg=lambda matrix, scalar, side: b'jpeg:' + side.encode()))
-    return SimpleNamespace(ctx_core=object(), executor_core=mock.Mock(), images=images), published
+    return SimpleNamespace(ctx_core=object(), executor_core=mock.Mock(), topics=topics), published
 
 
 def wait_for_stream(predicate):
@@ -374,7 +366,7 @@ def wait_for_stream(predicate):
     assert predicate()
 
 
-def test_card_selection_moves_bootstrap_json_and_heatmap_to_right(fake_hand, ros_runtime):
+def test_card_selection_moves_tactile_stream_to_right(fake_hand, ros_runtime):
     hand, _ = fake_hand
     ros, published = ros_runtime
     plugin = TactilePlugin(hand, {'poll_hz': 50}, ros2=ros, namespace='robot')
@@ -383,13 +375,11 @@ def test_card_selection_moves_bootstrap_json_and_heatmap_to_right(fake_hand, ros
         wait_for_stream(lambda: len(published) > 0)
         result = plugin.dispatch('get_state', {'instance_id': 'card_r', 'bound_side': 'right'})
         assert result['side'] == 'right'
-        wait_for_stream(lambda: any(i['data'] == b'jpeg:right' for i in ros.images))
         info = plugin.dispatch('info', {'instance_id': 'card_r'})
         assert info['state'] == 'running' and info['stream_side'] == 'right'
         assert info['topic_out'] == [
-            {'topic': '/robot/hand/right/tactile/heatmap', 'format': 'image/jpeg'},
-            {'topic': '/robot/hand/right/tactile', 'format': 'data/json'}]
-        assert info['heatmap_published_frames'] > 0 and info['heatmap_publish_error'] is None
+            {'topic': '/robot/hand/right/tactile', 'format': 'sensor/tactile'}]
+        assert '/robot/hand/right/tactile' in ros.topics
         assert plugin._worker_thread is None  # Unclaimed default-left worker was stopped.
         count = len(published)
         wait_for_stream(lambda: len(published) > count)
@@ -406,7 +396,7 @@ def test_left_and_right_cards_keep_independent_streams_and_stop(fake_hand, ros_r
         plugin.dispatch('start', {'instance_id': 'l', 'bound_side': 'left'})
         plugin.dispatch('start', {'instance_id': 'r', 'bound_side': 'right'})
         wait_for_stream(lambda: {v['side'] for v in published} == {'left', 'right'})
-        wait_for_stream(lambda: {i['data'] for i in ros.images} == {b'jpeg:left', b'jpeg:right'})
+        wait_for_stream(lambda: set(ros.topics) == {'/hand/left/tactile', '/hand/right/tactile'})
         assert plugin.dispatch('info', {'instance_id': 'l'})['stream_side'] == 'left'
         assert plugin.dispatch('info', {'instance_id': 'r'})['stream_side'] == 'right'
         plugin.dispatch('config', {'poll_hz': 10})  # Core's shared call has no side or ID.
@@ -450,13 +440,13 @@ def test_unowned_stop_keeps_auto_start_stream_running(fake_hand, ros_runtime, st
     plugin = TactilePlugin(hand, {'poll_hz': 50}, ros2=ros)
     try:
         plugin.start()
-        wait_for_stream(lambda: len(published) > 0 and len(ros.images) > 0)
+        wait_for_stream(lambda: len(published) > 0)
         worker, publisher = plugin._worker_thread, plugin._pub
         assert plugin.dispatch('stop', stop_args)['state'] == 'idle'
         assert plugin._running() and plugin._worker_thread is worker
         assert plugin._pub is publisher
-        frame_count, image_count = len(published), len(ros.images)
-        wait_for_stream(lambda: len(published) > frame_count and len(ros.images) > image_count)
+        frame_count = len(published)
+        wait_for_stream(lambda: len(published) > frame_count)
     finally:
         plugin.stop()
     assert not plugin._running() and plugin._pub is None
@@ -480,10 +470,9 @@ def test_unknown_stop_keeps_registered_streams_running(fake_hand, ros_runtime, o
         assert plugin.dispatch('stop', stop_args)['state'] == 'idle'
         assert all(plugin.dispatch('info', {'instance_id': instance_id})['state'] == 'running'
                    for instance_id, _ in owners)
-        frame_count, image_count = len(published), len(ros.images)
+        frame_count = len(published)
         wait_for_stream(lambda: {frame['side'] for frame in published[frame_count:]} == sides
-                        and {image['data'] for image in ros.images[image_count:]}
-                        == {b'jpeg:' + side.encode() for side in sides})
+                        and {'/hand/' + side + '/tactile' for side in sides}.issubset(set(ros.topics)))
     finally:
         plugin.stop()
 
@@ -499,8 +488,8 @@ def test_deleted_owner_stop_keeps_restarted_auto_stream_running(fake_hand, ros_r
         plugin.start()
         assert plugin.dispatch('stop', {'instance_id': 'old-card'})['state'] == 'idle'
         assert plugin._running()
-        frame_count, image_count = len(published), len(ros.images)
-        wait_for_stream(lambda: len(published) > frame_count and len(ros.images) > image_count)
+        frame_count = len(published)
+        wait_for_stream(lambda: len(published) > frame_count)
     finally:
         plugin.stop()
 
@@ -543,7 +532,7 @@ def test_requested_stream_stop_does_not_log_an_acquisition_failure(fake_hand, mo
     stream_log.info.assert_not_called()
 
 
-def test_running_card_channel_change_moves_both_topics(fake_hand, ros_runtime):
+def test_running_card_channel_change_moves_tactile_topic(fake_hand, ros_runtime):
     hand, _ = fake_hand
     ros, published = ros_runtime
     plugin = TactilePlugin(hand, {'poll_hz': 50, 'auto_start': False}, ros2=ros)
@@ -552,9 +541,9 @@ def test_running_card_channel_change_moves_both_topics(fake_hand, ros_runtime):
         plugin.dispatch('config', {'instance_id': 'r', 'can_channel': 'can1'})
         info = plugin.dispatch('info', {'instance_id': 'r'})
         assert info['stream_side'] == 'right' and info['stream_can_channel'] == 'can1'
-        assert info['topic_out'][0]['topic'] != '/hand/right/tactile/heatmap'
+        assert info['topic_out'][0]['topic'] != '/hand/right/tactile'
         wait_for_stream(lambda: any(v['side'] == 'right' and v['can_channel'] == 'can1' for v in published))
-        wait_for_stream(lambda: any(i['topic'] == info['topic_out'][0]['topic'] for i in ros.images))
+        wait_for_stream(lambda: info['topic_out'][0]['topic'] in ros.topics)
         hand.get_controller_for_side.assert_any_call('right', 'can1')
         assert ('right', 'can0') not in plugin._streams
     finally:

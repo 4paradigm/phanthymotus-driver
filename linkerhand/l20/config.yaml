@@ -69,17 +69,28 @@ plugins:
 
   hand_grasp:
     enabled: true
-    # U-shaped opposition supplied from the host tool; shared unless a side-specific
-    # left_grasp_prep_pose / right_grasp_prep_pose is explicitly calibrated.
-    grasp_prep_pose: [255, 255, 255, 255, 255, 119, 193, 148, 105, 42, 61, 255, 255, 255, 255, 255, 255, 255, 255, 255]
-    top_grasp_prep_pose: [255, 255, 255, 255, 255, 70, 200, 132, 55, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
-    # Grasp speed_ratio has a fixed baseline: 1.0x=85, 3.0x=255.
-    release_speed: 80
-    poll_interval_s: 0.05
-    # Fixed motor output limit, not a measured fingertip force or tactile target.
+    prep_pose: [255, 255, 255, 255, 255, 70, 200, 132, 55, 0, 73, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+    close_limit_pose: [60, 0, 0, 0, 0, 70, 200, 132, 55, 0, 73, 255, 255, 255, 255, 142, 0, 0, 0, 0]
+    # Raw motor output limit (same setting as vendor GUI), not measured force/current.
     motion_current: 230
-    # Arrival checks apply to preparation/opening only; closing is command-only.
+    # Grasp action speed_ratio has a fixed baseline of 85 (1.0x).
+    approach_speed: 85
+    release_speed: 80
+    # Per-finger 12x6 matrix peak at which reference advance latches off.
+    # Not a constant-pressure target; actual peak can continue rising.
+    tactile_threshold: 15
+    # Position target increments; lag >= slowdown_error_threshold uses step_size.
+    step_size: 5
+    fast_step_size: 10
+    slowdown_error_threshold: 10
+    # Trial position-lag criteria; tolerance is the full observation-window spread.
+    stall_error_threshold: 20
+    stall_position_tolerance: 3
+    stall_duration_s: 0.5
+    poll_interval_s: 0.05
+    matrix_timeout_s: 0.25
     pose_timeout_s: 5.0
+    timeout_s: 15.0
     position_tolerance: 20
 
   hand_tactile:

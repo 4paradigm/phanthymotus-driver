@@ -5,11 +5,13 @@
 | 卡片 | 类型 | 功能 |
 | --- | --- | --- |
 | `hand` | `actuator` | 16 主动关节位置控制、张开、握拳、自然姿态与状态读取 |
-| `hand_gesture` | `actuator` | 预置手势、0–9 数字、计数及已调试的拇指避碰路径 |
-| `hand_grasp` | `actuator` | 纯位置侧向抓握、向下抓握和释放，不依赖触觉反馈 |
-| `hand_tactile` | `sensor` | 按卡片选择采集左右手触觉，发布实时 JSON 和 JPEG 热力图 |
+| `hand_gesture` | `actuator` | 预置手势、0–9 数字及已调试的拇指避碰路径 |
+| `hand_grasp` | `actuator` | 自适应接触停止抓取、释放和状态读取 |
+| `hand_tactile` | `sensor` | 按卡片选择采集左右手触觉，发布供 Core 渲染的实时触觉数据 |
 
-抓握与触觉感知独立运行。`hand_grasp` 不按指尖压力调节、不设置目标压力，也不依据压力判断是否抓住物体。当前触觉读数没有 `touch_scalar→N` 标定关系，原始值不能直接换算为牛顿。
+`hand_grasp` 使用指尖触觉阵列峰值停止进给，不进行恒压调节，也不判断物体是否抓稳。当前触觉读数没有力值标定关系，原始值不能直接换算为牛顿。
+
+本版将原 `side_grasp/top_grasp` 替换为 `adaptive_grasp`，不再公开手势动作 `count`，基础控制和手势动作也不再接受 `hold_torque` 参数。已有调用应按本版卡片参数更新；自适应抓握会保持原位置目标与输出限值，直到释放或停止。
 
 ## 1. 硬件连接与关节映射
 
@@ -45,13 +47,13 @@
 | `open` | 移动到 `open_pose` 张开姿态 |
 | `close` | 移动到 `fist_pose` 握拳姿态 |
 | `reset` | 移动到 `natural_pose` 自然姿态后卸力 |
-| `relax` | 移动到自然下垂姿态，可指定到位后的保持力矩 |
+| `relax` | 移动到自然下垂姿态，到位后卸力 |
 | `set_positions` | 按独立关节字段设置位置，留空的关节保留当前值 |
 | `stop` | 停止所选设备在本卡片类型中的动作；抓握卡片持有该手时不抢占卸力，应执行 `hand_grasp.release` |
 
-运动必须传 `confirm_motion: true`。`speed_ratio` 为 `1.0x/1.5x/2.0x/2.5x/3.0x`，当前配置基础速度为 85；`set_torque` 为本次运动的原始输出上限，`hold_torque` 为到位保持上限，默认 0。卸力表示发送电机输出限值 0，不表示切断设备电源。基础控制卡片不再提供 `get_tactile`，触觉数据通过 `hand_tactile` 获取。
+运动必须传 `confirm_motion: true`。`speed_ratio` 为 `1.0x/1.5x/2.0x/2.5x/3.0x`，当前配置基础速度为 85；`set_torque` 为本次运动的原始输出上限。上述动作到位后卸力，表示发送电机输出限值 0，不表示切断设备电源。基础控制卡片不再提供 `get_tactile`，触觉数据通过 `hand_tactile` 获取。
 
-### 2.2 卡片二：`hand_gesture` (手势与计数卡片)
+### 2.2 卡片二：`hand_gesture` (手势卡片)
 
 每次执行需要选择 `BOUND_SIDE`；同一动作也可以从另一张手势卡片对同侧设备执行，不存在长期绑定关系。`stop` 按明确选择的左右手停止手势任务。
 
@@ -62,7 +64,6 @@
   * `v_sign_gesture`：剪刀手/胜利手势（食指、中指伸直呈 V 字）。
   * `natural_gesture`：移动到配置的自然下垂姿态。
   * `number`：仅做出所选的 0–9 数字手势，不先握拳回到 0，也不依次数过中间数字；切换保留已有避碰步骤。
-  * `count`：数字计数动作，支持从 `start_num` 连续过渡到 `end_num`（0–9 支持正数与倒数）。
 * **避障保护 (Clearance)**：
   * 拇指横跨手掌时自动执行外展避让（Clearance lift），防止与四指发生物理干涉。
   * 当前数字为 `1`、`2`、`9`，或目标数字为 `1`、`2`、`3`、`4`、`9` 时（切换到同一数字及以下三阶段路径除外），使用两阶段路径：先保持其余四指的实测位置，仅将拇指四关节移动到该手数字 `5` 的已配置姿态；确认到位后，四指和拇指共同移动到目标手势。非数字手势进入上述目标数字时也应用目标侧规则。
@@ -71,45 +72,26 @@
   * 数字 `0` 的实测反馈中，食指侧摆多次为 `159`，与配置目标 `193` 有偏差。数字手势识别、以及三阶段路径的到位检查中，不用已收拢手指的侧摆偏差否定到位；仍严格检查拇指四关节、四指指根和指尖，以及伸展手指的侧摆。三阶段中等待四指到位时，指根和指尖容差收紧至 `min(position_tolerance, 10)`，防止尚未充分伸展或收拢就收回拇指。原始目标姿态不变。
   * `0→7` 曾在第二阶段因 `pinky_pitch=15/0` 超过 10 点容差而中止，未执行拇指收尾。因此仅该方向第二阶段的小拇指指根沿用配置的 `position_tolerance`（当前为 `20`）；其余关节和已验证路径仍使用原有到位要求，目标姿态数值不变。
   * 让位参考读取对应侧的 `left_number_poses[5]` 或 `right_number_poses[5]`，索引为 `[0,5,10,15]`。当前配置的拇指指根、侧摆、旋转、指尖值分别为 `[255,70,255,255]`。避碰阶段按上述关节范围和容差检查到位；否则中止、卸力，通过 ACP 和驱动日志报告失败阶段、未到位关节的实测值及目标值。
-  * `number` 与 `count` 共用上述数字切换规则；计数开始时也检查当前姿态，避免初始化绕过让位。`number` 不增加计数过程，`count` 的数字范围和展示顺序不变。仅拇指让位有时会恰好形成完整数字 `5`，这不是额外展示或计数步骤。
+  * `number` 使用上述数字切换规则；开始时检查当前姿态，避免初始化绕过让位。仅拇指让位有时会恰好形成完整数字 `5`，这不是额外展示步骤。
   * 速度按配置的基础速度乘以所选倍速计算，四舍五入并限制在 `255`；避碰阶段不另设速度。当前基础速度 `85` 对应 `1.0x/1.5x/2.0x/2.5x/3.0x` 的原始值为 `85/128/170/212/255`。离线检查验证双向路由、实测反馈回归、命令顺序、到位检查与中断；不同倍速下的实际机械间隙仍需分别通过实机验证。
 
-运动参数中的 `hold_torque` 默认为 0，动作到位后卸力；需要继续保持姿态时可显式设置非零值。`count` 的 `hold_time_s` 是数字展示间隔。
+手势动作到位后卸力。
 
-### 2.3 `hand_grasp`：纯位置抓握
+### 2.3 `hand_grasp`：自适应接触停止抓取
 
-使用流程：**选择本次操作的左右手 → 选择抓法与速度 → 执行 → 需要放物时选择同侧设备并执行 `release`**。
+`hand_grasp` 使用自适应接触停止抓取功能。先张开并到达准备姿态，再根据五指完整、及时的 12×6 触觉阵列和实际关节位置逐步收拢；使用阵列峰值，不将原始读数换算为力值。
 
-| 动作 | 准备姿态 | 收拢目标 |
+| 动作 | 参数 | 行为 |
 | --- | --- | --- |
-| `side_grasp` | U 型包围姿态 | 五指指根 `0..4`、五指指尖 `15..19` 全部设为 0；侧摆与拇指旋转保留准备值 |
-| `top_grasp` | 数字 5 的展开姿态 | 五指指根 `0..4`、四指指尖 `16..19` 设为 0；拇指尖 `15` 保持 255 伸直以避碰，侧摆与旋转保持准备值 |
-| `release` | 继承所选设备当前抓握模式 | 五指同时恢复该模式准备姿态以松开物体，然后恢复最终张开姿态并卸力 |
+| `adaptive_grasp` | `bound_side`、`speed_ratio`、`confirm_motion=true` | 接触或位置受阻时停止相应指节继续进给，保持目标直到释放 |
+| `release` | `bound_side`、`confirm_motion=true` | 回到准备姿态、张开并下发输出限值 0 |
+| `get_state` | `bound_side` | 读取进度、任务编号和最终结果，不驱动手指 |
 
-两种抓法设置 `bound_side`、`speed_ratio` 和 `confirm_motion: true`；释放设置 `bound_side` 和 `confirm_motion: true`。速度原始值固定为 **85／128／170／212／255**，分别对应 1.0x～3.0x；准备与收拢使用相同的所选速度。释放沿用设备预设 `release_speed=80`。
+齿轮设置 `motion_current` 默认 230，是协议原始输出限值；`tactile_threshold` 默认 15，是指尖阵列峰值的接触停止阈值。两者都不是经标定的实际力值。抓取完成表示动作流程结束，不表示物体已抓稳。触觉数据缺失或位置查询异常时停止进给并尝试卸力；释放动作不依赖触觉数据。
 
-准备阶段保留原来的拇指松开、让位及张开路径，并通过新位置反馈检查到位。准备到位后，一次下发完整收拢目标，不再逐点调压。**收拢阶段不等待实际位置到达 0**：物体会正常阻挡关节，不能因此判定抓取失败。完成通知中的“指令已下发，保持至 release”、`command_sent=true`、`holding=true` 表示已下发收拢指令；`success=true` 仅代表本次操作完成，不代表确认抓住了物体，也不代表关节已经到位。
+`speed_ratio` 可选 `1.0x/1.5x/2.0x/2.5x/3.0x`，准备与收拢的电机速度分别为 `85/128/170/212/255`。推进步长与电机速度不同：默认快速步长为 10，某关节的实际位置滞后达到 10 时，该关节步长降至 5。某指触觉达到停止阈值后，锁存该指根部和尖部的原位置目标；某关节持续受阻则仅冻结该关节。停止进给不回写实际位置，也不主动卸力或持续调压。
 
-下发后电机保留该位置目标及固定输出上限，直到主动对同侧设备执行 `release` 或明确停止。没有触觉保持线程，也没有到期自动释放。抓握状态按 `(左右手, CAN 接口)` 保存，因此另一张抓握卡片选择相同设备后也能正确释放。抓握保持期间，其他执行器卡片不能驱动同一只手；需要换动作时先释放。重复抓握会被拒绝，避免意外重新开手。`release` 可中断所选设备尚在准备中的抓握；重复释放复用正在执行的释放任务。
-
-释放先读取新位置。如果已处于最终张开姿态的容差内，直接卸力，返回 `already_released=true`，不重复经过 U 型。否则依次确认准备姿态、最终张开姿态到位，再返回 `hand_opened=true`、`torque_released=true`。通信错误、准备或释放不到位仍会报错并尝试卸力，不会假报张开。
-
-当前准备向量如下，保持用户提供的关节标定：
-
-```yaml
-grasp_prep_pose: [255,255,255,255,255,119,193,148,105,42,61,255,255,255,255,255,255,255,255,255]
-top_grasp_prep_pose: [255,255,255,255,255,70,200,132,55,0,255,255,255,255,255,255,255,255,255,255]
-```
-
-可通过 `left_grasp_prep_pose`／`right_grasp_prep_pose`，以及 `left_top_grasp_prep_pose`／`right_top_grasp_prep_pose` 分别覆盖左右手标定。不会自动镜像；拇指尖在向下抓握的最终收拢目标中始终保持 255。
-
-`config.yaml` 中的抓握配置仅保留启用开关、准备姿态、释放速度、固定输出上限 `motion_current=230`、位置轮询间隔 `poll_interval_s=0.05`、准备／释放到位超时 `pose_timeout_s=5.0` 和容差 `position_tolerance=20`。固定输出上限不是实测力或电流。旧压力目标、压力上限、步长、保持时间等配置已移除。
-
-仅公开 `side_grasp`、`top_grasp`、`release` 三个动作；旧 `grasp`、`hold`、`get_tactile`、`get_matrix_touch` 不再支持。传入旧 `target_force`、`max_force`、`hold_duration_s` 等动作参数会报已移除参数，需按新卡片填写。内部保留 `config/start/stop/info` 供平台生命周期和状态查询使用，不再保存左右手绑定。
-
-三个动作统一使用平台已有的异步完成协议：受理后返回 `state=running` 和唯一 `action_id`，后台执行结束后通过 ACP 上报同一 ID、`completed/error/cancelled` 状态及最终结果。准备、释放未到位或通信异常通过完成通知报告；`running` 只表示任务已受理。重复调用正在执行的 `release` 会返回同一个任务 ID，该任务只产生一次终态通知。`action_id` 标识一次动作，与可选的卡片 `instance_id` 不同，普通执行不要求卡片 ID。
-
-用户无需切换额外动作查询结果，最终完成或异常由平台已有的 ACP 活动通知承载。当前画布按钮的结果框可能保留最初的受理结果，不保证自动替换为最终结果；应结合平台完成通知判断。API 兼容 `wait_for_result=false`，不支持 `true`，避免阻塞 MCP 请求并跳过完成通知。
+动作受理后返回 `state=running` 和 `action_id`，最终通过 ACP 上报 `completed/error/cancelled`。`get_state` 可读取当前状态和 `last_result`，无需再次运动或访问 CAN；画布结果框若仍显示最初的 `running`，应读取最终结果确认流程是否结束。结果中的 `grasp_confirmed=false` 表示没有确认物体已抓稳；达到位置边界或收拢观察时间结束也可能进入保持，应结合 `outcome`、各指停止原因和触觉数据判断，不能将流程完成视为抓稳保证。
 
 ### 2.4 `hand_tactile`：独立触觉传感器
 
@@ -125,7 +107,7 @@ top_grasp_prep_pose: [255,255,255,255,255,70,200,132,55,0,255,255,255,255,255,25
 
 卡片动作区只显示 `ACTION` 和 `BOUND_SIDE`。左右手只在动作区选择，齿轮中不重复出现；齿轮保留“高级：CAN 接口”（默认 `can0`，不是 CAN ID）及共享采集频率。触觉卡片的 CAN 接口按实例设置，与执行器共享 CAN 设置独立；调整执行器接口不会切换已有触觉流或改写其话题路径。`instance_id` 由 Core 自动传入，后端用于区分采集卡片及线程使用者，不作为用户输入项展示。
 
-当前 Core 启动智能控制时只发送卡片 ID，不转发动作区选项。首次使用或切换左右手时，应启动智能控制，在卡片上选择 `BOUND_SIDE` 后点击一次“执行”，再打开“查看数据流”。该执行同时切换实际采集、JSON、热力图和返回的话题，不只是一次查询。已打开的抽屉仍订阅旧话题，切手后请关闭并重新打开。之后同一驱动进程内再次启停，会记住本卡片的选择；容器重启后需重新执行选择。本驱动不修改 Core 源码。
+当前 Core 启动智能控制时只发送卡片 ID，不转发动作区选项。首次使用或切换左右手时，应启动智能控制，在卡片上选择 `BOUND_SIDE` 后点击一次“执行”，再打开“查看数据流”。该执行同时切换实际采集、触觉数据流和返回的话题，不只是一次查询。已打开的抽屉仍订阅旧话题，切手后请关闭并重新打开。之后同一驱动进程内再次启停，会记住本卡片的选择；容器重启后需重新执行选择。显示热力图需要支持 `sensor/tactile` 的 Core 版本。
 
 JSON 包含 `touch_scalar`（五指原始标量）、`touch_matrix`（每指 12×6 数组）、`matrix_sums`、`contact_flags`、设备目标、`sequence`、快照生成时间及分项采样时间。五指字典键固定为 `thumb/index/middle/ring/pinky`。每轮标量采集要求五指均收到新回复；阵列采集要求五指共 60 行全部更新，不用旧行补齐新一轮。
 
@@ -133,9 +115,9 @@ JSON 包含 `touch_scalar`（五指原始标量）、`touch_matrix`（每指 12�
 
 当前不主动查询未经确认的法向力、切向力和方向数据；兼容字段 `normal_force/tangential_force/tangential_dir` 返回五指 `null`，`force_fields_valid=false`。这些字段不等同于设备已装对应选件或已标定牛顿值。
 
-默认 CAN 接口上的 JSON 话题为 `/{namespace}/hand/{side}/tactile`，热力图为相同路径加 `/heatmap`；左右手分别使用 left/right，具体以本卡片 `info.topic_out` 为准。其他 CAN 接口自动使用不同路径，避免同侧不同适配器混流。正常驱动启动时，命名空间依次取 `ROS_NAMESPACE` 环境变量、非空 `ros_namespace` 配置或容器主机名，并规范化为合法字符。JSON 使用 `std_msgs/msg/String`、`data/json`；热力图使用 `sensor_msgs/msg/CompressedImage`、`image/jpeg`，热力图排在第一个输出，供“查看数据流”直接显示。QoS 均为 BEST_EFFORT、KEEP_LAST、depth=1、VOLATILE。
+默认 CAN 接口上的触觉话题为 `/{namespace}/hand/{side}/tactile`；左右手分别使用 left/right，具体以本卡片 `info.topic_out` 为准。其他 CAN 接口自动使用不同路径，避免同侧不同适配器混流。正常驱动启动时，命名空间依次取 `ROS_NAMESPACE` 环境变量、非空 `ros_namespace` 配置或容器主机名，并规范化为合法字符。输出格式为 `sensor/tactile`，ROS 消息使用 `std_msgs/msg/String` 承载 JSON。QoS 为 BEST_EFFORT、KEEP_LAST、depth=1、VOLATILE。
 
-热力图采用 Gemini 已加入的五指 12×6 阵列和指尖压力条，画面标明当前左右手。缺失／超时数据标为 `NO DATA`／`Tip: --`，不绘制成有效零压力。`info.heatmap_publisher_ready`、`heatmap_published_frames`、`heatmap_publish_error` 可诊断图像发布状态。渲染依赖 Pillow 和 NumPy，已列入依赖，Dockerfile 也包含 `tactile_heatmap.py`。
+Core 的触觉渲染器用五指 12×6 阵列和指尖压力绘制热力图，画面标明当前左右手。缺失／超时数据标为 `NO DATA`／`Tip: --`，不绘制成有效零压力。Driver 不再生成或发布 JPEG。
 
 | `plugins.hand_tactile` 配置 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -144,8 +126,8 @@ JSON 包含 `touch_scalar`（五指原始标量）、`touch_matrix`（每指 12�
 | `auto_start` | `true` | 驱动启动时先采集默认目标，卡片选择其他目标后停止无人使用的默认流 |
 | `matrix_enabled` | `true` | 是否读取阵列；关闭后仍主动读取标量 |
 | `matrix_request_interval_s` | `0.05` | 请求完整五指阵列的最小间隔 |
-| `tactile_timeout_s` | `0.25` | 单轮标量查询等待新回复的超时 |
-| `matrix_timeout_s` | `0.25` | 单轮阵列查询等待完整新行的超时 |
+| `tactile_timeout_s` | `0.25` | 单轮标量查询总预算，包含排队、下发请求及等待新回复 |
+| `matrix_timeout_s` | `0.25` | 单轮阵列查询总预算，包含排队、下发请求及等待完整新行 |
 | `stale_after_s` | `1.0` | 判断已采样标量／阵列过期的时长 |
 | `contact_threshold` | `8` | 标量大于等于该值，或阵列总和为正时，接触标记为 true |
 
@@ -153,14 +135,24 @@ JSON 包含 `touch_scalar`（五指原始标量）、`touch_matrix`（每指 12�
 
 后台按 `(左右手, CAN 接口)` 分别采集和发布，卡片通过自动传入的实例 ID 选择目标。切换一张卡片不会改写其他卡片的目标；同一物理目标在驱动内复用一个采集线程，最后一个使用者停止后才关闭该线程。`poll_hz` 通过共享 `config` 同时更新各目标的期望频率；更换正在使用的 CAN 接口时同步迁移该卡片的采集和话题，不再固定使用默认左手。
 
-Core 可先发送共享 `poll_hz`，再发送实例 `can_channel`。单独设置频率不要求左右手，也不覆盖实例选择；兼容调用中显式传入的 `bound_side` 仍必须是 `left/right`。启动采集后，通过 WebSocket 持续接收图像和 JSON，无需重复点击 `get_state`；JSON 的 `sequence` 和 `timestamp` 用于判断是否在更新。停止采集后，网页可能保留最后一帧，它不代表仍在更新。
+Core 可先发送共享 `poll_hz`，再发送实例 `can_channel`。单独设置频率不要求左右手，也不覆盖实例选择；兼容调用中显式传入的 `bound_side` 仍必须是 `left/right`。启动采集后，通过 WebSocket 持续接收触觉 JSON，无需重复点击 `get_state`；`sequence` 和 `timestamp` 用于判断是否在更新。停止采集后，网页可能保留最后一帧，它不代表仍在更新。
 
 ## 3. 验证
 
 在仓库根目录运行离线回归，不连接真实 CAN，也不驱动设备：
 
 ```bash
-python3 -m pytest tests/test_linkerhand_l20.py tests/test_linkerhand_l20_binding.py tests/test_linkerhand_l20_grasp.py tests/test_linkerhand_l20_can_reconnect.py tests/test_linkerhand_l20_tactile.py tests/test_linkerhand_l20_configuration.py tests/test_linkerhand_l20_heatmap.py tests/test_linkerhand_l20_explicit_gesture.py -q
+python3 -m pytest \
+  tests/test_linkerhand_l20.py \
+  tests/test_linkerhand_l20_binding.py \
+  tests/test_linkerhand_l20_grasp.py \
+  tests/test_linkerhand_l20_adaptive_grasp.py \
+  tests/test_linkerhand_l20_can_reconnect.py \
+  tests/test_linkerhand_l20_position_query.py \
+  tests/test_linkerhand_l20_tactile.py \
+  tests/test_linkerhand_l20_tactile_query.py \
+  tests/test_linkerhand_l20_configuration.py \
+  tests/test_linkerhand_l20_explicit_gesture.py -q
 python3 -m pytest 'tests/test_dockerfile_copies.py::test_every_copied_path_exists[linkerhand/l20/Dockerfile]' 'tests/test_dockerfile_copies.py::test_every_imported_sibling_is_copied[linkerhand/l20/Dockerfile]' -q
 python3 scripts/check_service_yml.py linkerhand/l20
 ```
@@ -193,20 +185,19 @@ cp -a common "$l20_build_context/common"
 docker buildx build --platform linux/arm64 --load -t linkerhand-l20:latest "$l20_build_context"
 ```
 
-运行中容器的开发更新可以只复制本次发生变化的文件并重启。纯位置抓握、触觉卡片及热力图同时上线时，至少需要同步以下文件，并确保容器已安装 Pillow、NumPy：
+运行中容器的开发更新可以只复制本次发生变化的文件并重启。触觉热力图由 Core 的 `sensor/tactile` 渲染器绘制，Driver 只发布数据：
 
 ```bash
 docker cp linkerhand/l20/tactile_device.py embodied-linkerhand-l20:/work/tactile_device.py
-docker cp linkerhand/l20/tactile_heatmap.py embodied-linkerhand-l20:/work/tactile_heatmap.py
 docker cp linkerhand/l20/hand_device.py embodied-linkerhand-l20:/work/hand_device.py
 docker cp linkerhand/l20/gesture_device.py embodied-linkerhand-l20:/work/gesture_device.py
-docker cp linkerhand/l20/grasp_device.py embodied-linkerhand-l20:/work/grasp_device.py
+docker cp linkerhand/l20/adaptive_grasp_device.py embodied-linkerhand-l20:/work/adaptive_grasp_device.py
 docker cp linkerhand/l20/config.yaml embodied-linkerhand-l20:/work/config.yaml
 docker restart embodied-linkerhand-l20
 docker logs --since 1m --tail 60 embodied-linkerhand-l20
 ```
 
-底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后应看到四张卡片，执行器按动作区选择左右手，`hand_grasp` 仅有三个公开动作。
+底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后应看到四张卡片，执行器按动作区选择左右手，`hand_grasp` 提供 `adaptive_grasp`、`release`、`get_state` 三个公开动作。
 
 ## 5. 执行目标、共享 CAN 与停止行为
 
@@ -222,11 +213,27 @@ docker logs --since 1m --tail 60 embodied-linkerhand-l20
 
 当前平台的通用运动中断钩子不会继承原请求的左右手参数，因此三张执行器不再声明无目标的 `on_interrupt_motion` 钩子。平台通用中断不能替代上述显式停止／释放流程。执行器的普通执行不依赖平台额外传入卡片 ID，驱动部署无需修改 Agent Core 文件；触觉卡片仍使用平台已有的传感器实例机制管理采集线程。
 
-## 6. QEMU 断线重连
+## 6. 通信可靠性与可选 QEMU 兼容
 
-SocketCAN 的 QEMU 兼容钩子需在线程锁保护下只安装一次。重连不能继续包装进程级 `socket.socket.setsockopt`，否则包装层累积后会出现 `maximum recursion depth exceeded`，影响所有卡片及 HTTP 注册。
+### 原生部署与通用通信处理
 
-旧进程若已递归溢出，更新代码后还需重启容器以清除旧包装层。该问题与已实测的左右手 CAN ID 无关。离线回归包含重复安装、并发安装和多次 CAN 打开失败后恢复。
+原生 ARM64（例如 Jetson）和普通 Linux 部署默认使用 python-can 的原始 socket 选项及 CAN 帧解码，不安装 QEMU 兼容补丁。容器本身不要求 QEMU，驱动不会根据 CPU 架构自动启用兼容模式。
+
+CAN 接口发现直接读取 Linux sysfs，接口启用使用有超时的 netlink 请求，避免创建 `ip` 子进程。接收线程使用非阻塞读取逐批消费已排队的 CAN 帧，每批最多 64 帧；解码仍由 python-can 负责，不修改 socket 的默认阻塞状态或全局解码函数。上述处理不依赖 QEMU 兼容开关。
+
+传感器与抓握共用底层触觉查询队列，按排队顺序进入；等待触觉查询锁、位置查询锁和命令锁也计入触觉总预算，并可响应取消。阵列缺行时仅在原预算内对缺失手指重发一次，该手指的 12 行必须全部重新收到，不能用两批不完整数据拼成有效新阵列。超时结果记录查询阶段、耗时及缺失行。位置查询保留原来的接收等待超时语义，同时记录排队、发送、接收耗时和缺失帧，不把接收超时误称为整个查询的总时限。
+
+### 可选的 QEMU 开发环境兼容
+
+纯 QEMU 兼容处理位于 `qemu_compat.py`，只在显式启用后加载。启动环境变量 `LINKERHAND_L20_QEMU_COMPAT` 默认值为 `0`（不设置也关闭），只有值为 `1` 才启用；其他值会报配置错误。仅在 x86 主机通过 QEMU 运行 ARM64 驱动、并需要 SocketCAN 兼容处理时设置：
+
+```bash
+export LINKERHAND_L20_QEMU_COMPAT=1
+```
+
+Docker 开发环境需要在本地容器启动配置的 `environment` 中增加 `LINKERHAND_L20_QEMU_COMPAT=1`，再重新创建驱动容器；正式部署模板不默认启用。它是驱动进程的启动选项，不放在卡片齿轮或动作参数中。
+
+启用后，兼容模块会处理 QEMU 缺失的 socket 选项和接收时间戳。其钩子作用于整个驱动进程，所有手及重连共享同一安装；在线程锁保护下只安装一次，避免重连累积包装层后出现 `maximum recursion depth exceeded`。关闭兼容模式需移除环境变量或设为 `0`，再启动新的驱动进程；不能在已安装补丁的旧进程中热切换。该兼容处理与已实测的左右手 CAN ID 无关。
 
 ### QEMU 6.2 与 DDS 数据流
 

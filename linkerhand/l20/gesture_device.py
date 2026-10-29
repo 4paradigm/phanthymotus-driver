@@ -10,7 +10,6 @@ Actions:
   v_sign_gesture    — Index and middle fingers extended in V; other fingers curled
   natural_gesture   — Natural relaxed hanging posture
   number            — Show only the selected 0–9 gesture, without counting
-  count             — Counts sequentially between start_num and end_num (0–9)
   config            — Accept lifecycle configuration without binding a hand
 """
 
@@ -35,14 +34,14 @@ from can_client import (
     named16_to_vector20,
 )
 from hand_device import (
-    HandPlugin, _SingleHandController, _setting, validate_hold_torque,
+    HandPlugin, _SingleHandController, _setting,
     SPEED_RATIOS, verify_hand_connection, ensure_motion_available,
     validate_bound_side, claim_motion, release_motion,
 )
 
 ACTIONS = (
     "ok_gesture", "thumb_up_gesture", "v_sign_gesture", "natural_gesture",
-    "number", "count",
+    "number",
 )
 
 # 20-element vector format for L20 poses:
@@ -166,19 +165,16 @@ class GesturePlugin:
                 "info": (["bound_side"], "查看所选手的手势动作状态"),
                 "start": ([], "启动手势控制"),
                 "stop": (["bound_side"], "停止所选手的手势动作并释放本卡片的保持力矩"),
-                "ok_gesture": (["bound_side", "speed_ratio", "hold_torque", "confirm_motion"],
-                               "OK 手势：拇指与食指捏合，其余三指伸展；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）"),
-                "thumb_up_gesture": (["bound_side", "speed_ratio", "hold_torque", "confirm_motion"],
-                                     "点赞手势：拇指伸展向上，四指收拢握拳；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）"),
-                "v_sign_gesture": (["bound_side", "speed_ratio", "hold_torque", "confirm_motion"],
-                                   "V 字手势：食指和中指伸展呈 V 字形，拇指收合；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）"),
-                "natural_gesture": (["bound_side", "speed_ratio", "hold_torque", "confirm_motion"],
-                                    "自然下垂常态手势：手指轻微弯曲放松；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）"),
-                "number": (["bound_side", "number", "speed_ratio", "hold_torque", "confirm_motion"],
-                           "数字手势：仅切换到指定的 0–9 数字手势，不逐个计数；保留已有避碰步骤；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）"),
-                "count": (["bound_side", "start_num", "end_num", "hold_time_s", "speed_ratio",
-                           "hold_torque", "confirm_motion"],
-                          "连续计数：从起始数字计数到结束数字（支持 0–9 和倒数）；hold_torque 设置到位保持力矩（0–255，默认 0 断力防发热）"),
+                "ok_gesture": (["bound_side", "speed_ratio", "confirm_motion"],
+                               "OK 手势：拇指与食指捏合，其余三指伸展；到位后卸力"),
+                "thumb_up_gesture": (["bound_side", "speed_ratio", "confirm_motion"],
+                                     "点赞手势：拇指伸展向上，四指收拢握拳；到位后卸力"),
+                "v_sign_gesture": (["bound_side", "speed_ratio", "confirm_motion"],
+                                   "V 字手势：食指和中指伸展呈 V 字形，拇指收合；到位后卸力"),
+                "natural_gesture": (["bound_side", "speed_ratio", "confirm_motion"],
+                                    "自然下垂常态手势：手指轻微弯曲放松；到位后卸力"),
+                "number": (["bound_side", "number", "speed_ratio", "confirm_motion"],
+                           "数字手势：仅切换到指定的 0–9 数字手势，不逐个计数；保留已有避碰步骤；到位后卸力"),
                 "config": ([], "接收卡片生命周期配置；执行时选择左右手"),
             },
             {
@@ -187,16 +183,6 @@ class GesturePlugin:
                 "instance_id": {"type": "string"},
                 "number":      {"type": "integer", "enum": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "default": 0, "description": "选择目标数字手势（0–9）"},
                 "speed_ratio": {"type": "string", "enum": list(SPEED_RATIOS), "description": "速度倍率（1.0x 到 3.0x）"},
-                "hold_torque": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 255,
-                    "default": 0,
-                    "description": "到位后保持力矩（0–255 整数；0 表示断电/断力防发热，1–255 保持指定力矩；不填默认为 0）",
-                },
-                "start_num":   {"type": "integer", "minimum": 0, "maximum": 9, "default": 1},
-                "end_num":     {"type": "integer", "minimum": 0, "maximum": 9, "default": 5},
-                "hold_time_s": {"type": "number",  "minimum": 0.05, "maximum": 10.0, "default": 1.0},
                 "confirm_motion": {"type": "boolean", "const": True, "description": "确认手附近安全后传入 true"},
             },
         )
@@ -211,7 +197,7 @@ class GesturePlugin:
         schema["x-is-dangerous"] = True
         schema["x-completion"] = {"actions": list(ACTIONS), "timeout": 300}
 
-        definition = tool(self.PREFIX, "actuator", "L20 预置手势与计数卡片。动作须显式传 confirm_motion=true。", schema)
+        definition = tool(self.PREFIX, "actuator", "L20 预置手势卡片。动作须显式传 confirm_motion=true。", schema)
         definition["title"] = "L20 手势"
         definition["multiInstance"] = True
         return definition
@@ -563,9 +549,6 @@ class GesturePlugin:
 
                 if action == "number":
                     result = self._number(client, side, poses, options)
-                elif action == "count":
-                    options["side"] = side
-                    result = self._count(client, poses, options)
                 else:
                     with self._lock:
                         self._current_number[side] = None
@@ -627,8 +610,10 @@ class GesturePlugin:
     def _start_action(self, instance_id: str, action: str, args: dict) -> dict:
         side = validate_bound_side(args.get("bound_side"))
         ratio = args.get("speed_ratio", "1.0x")
-        speed = self._speed(ratio, self.count_speed if action in ("number", "count") else self.speed)
-        hold_torque = validate_hold_torque(args.get("hold_torque"), default=0)
+        speed = self._speed(ratio, self.count_speed if action == "number" else self.speed)
+        if "hold_torque" in args:
+            raise ValueError("hold_torque is no longer supported")
+        hold_torque = 0
 
         options: dict[str, Any] = {
             "speed": speed,
@@ -644,19 +629,6 @@ class GesturePlugin:
             if isinstance(raw_num, bool) or not isinstance(raw_num, int) or not 0 <= raw_num <= 9:
                 raise ValueError(f"number 必须是 0–9 之间的整数，收到: {raw_num!r}")
             options["number"] = raw_num
-        elif action == "count":
-            s_num = args.get("start_num", 1)
-            if isinstance(s_num, bool) or not isinstance(s_num, int) or not 0 <= s_num <= 9:
-                raise ValueError(f"start_num 必须是 0–9 之间的整数，收到: {s_num!r}")
-            e_num = args.get("end_num", 5)
-            if isinstance(e_num, bool) or not isinstance(e_num, int) or not 0 <= e_num <= 9:
-                raise ValueError(f"end_num 必须是 0–9 之间的整数，收到: {e_num!r}")
-            h_time = args.get("hold_time_s", 1.0)
-            if isinstance(h_time, bool) or not isinstance(h_time, (int, float)) or not 0.05 <= h_time <= 10.0:
-                raise ValueError(f"hold_time_s 必须是 0.05–10.0 之间的数值（秒），收到: {h_time!r}")
-            options["start_num"] = s_num
-            options["end_num"] = e_num
-            options["hold_time_s"] = float(h_time)
 
         active = {
             "action": action,
