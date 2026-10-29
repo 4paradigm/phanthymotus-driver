@@ -185,14 +185,34 @@ def test_stop_cancels_pending_99_but_still_completes_safe_sdk_handback(tmp_path)
     assert sdk==[] and arm._operation['handback_confirmed'] and arm.session_id is None
 
 
-def test_stop_after_99_was_sent_reports_vendor_cancel_unknown(tmp_path):
+def test_repeated_stop_waits_for_same_vendor_receipt_and_fresh_rest(tmp_path):
     arm,_,_,advance,_,sdk=rig(tmp_path)
     arm.dispatch('release',{'operation_id':'already-sent'})
     progress_release(arm,advance,'awaiting_feedback')
     stopped=arm.dispatch('stop',{})
-    assert sdk==[99] and stopped['state']=='unknown'
-    assert stopped['reason']=='release_action_stop_unconfirmed'
+    assert sdk==[99] and stopped['state']=='awaiting_feedback'
+    assert stopped['stop_pending_vendor_action'] and stopped['operation_id']=='already-sent'
     assert arm.session_id and not stopped['physical_confirmed']
+    assert arm.dispatch('stop',{})['operation_id']=='already-sent'
+    advance(10,fresh=False);arm.tick()
+    assert arm.status()['ownership_held']
+    progress_release(arm,advance,'completed')
+    assert arm._operation['physical_confirmed'] and not arm.status()['ownership_held']
+    assert sdk==[99]
+
+
+def test_sdk_3104_and_repeated_stops_keep_ownership_without_retry(tmp_path):
+    invoked=[]
+    def timeout(action):invoked.append(action);return 3104
+    arm,_,_,advance,_,_=rig(tmp_path,client=SimpleNamespace(ExecuteAction=timeout))
+    arm.dispatch('release',{'operation_id':'sdk-timeout'})
+    progress_release(arm,advance,'unknown')
+    assert arm._operation['reason']=='release_sdk_timeout'
+    for _ in range(3):
+        assert arm.dispatch('stop',{})['code']=='release_result_unknown'
+        advance(200);arm.tick()
+    assert invoked==[99] and arm.status()['ownership_held']
+    assert not arm._operation['physical_confirmed']
 
 
 def test_legacy_rpc_return_does_not_release_ownership_and_stop_uses_99(tmp_path):
@@ -210,8 +230,9 @@ def test_legacy_rpc_return_does_not_release_ownership_and_stop_uses_99(tmp_path)
 
 def test_release_rpc_timeout_does_not_block_stop_or_issue_second_rpc(tmp_path):
     entered,finish=threading.Event(),threading.Event()
-    def blocked(_):entered.set();finish.wait(2);return 0
-    arm,_,_,advance,_,_=rig(tmp_path,client=SimpleNamespace(ExecuteAction=blocked),claim=False)
+    invoked=[]
+    def blocked(action):invoked.append(action);entered.set();finish.wait(2);return 0
+    arm,s,_,advance,_,_=rig(tmp_path,client=SimpleNamespace(ExecuteAction=blocked),claim=False)
     arm._channel_open=False
     arm.dispatch('release',{'operation_id':'blocked'});advance(10);arm.tick()
     assert entered.wait(.5)
@@ -220,7 +241,16 @@ def test_release_rpc_timeout_does_not_block_stop_or_issue_second_rpc(tmp_path):
         assert arm._operation['state']=='unknown'
         assert arm.dispatch('stop',{})['code']=='release_result_unknown'
     finally:finish.set();arm._rpc_thread.join(.5)
-    assert arm._operation['state']=='unknown'
+    assert arm._operation['state']=='awaiting_feedback' and arm.status()['ownership_held']
+    advance(10,fresh=False);arm.tick()
+    assert not arm._operation['physical_confirmed']
+    s['dq']=[.1]*10
+    advance(150);arm.tick()
+    assert arm.status()['ownership_held']
+    s['dq']=[0.]*10
+    progress_release(arm,advance,'completed')
+    assert invoked==[99] and arm._operation['physical_confirmed']
+    assert not arm.status()['ownership_held']
 
 
 def test_management_retry_and_lost_resume_reply_cancel_exact_new_lease(tmp_path):
@@ -322,28 +352,115 @@ def test_raw_motor_telemetry_does_not_gate_arm_but_invalid_sample_does(tmp_path)
     motors[12].q=-.02193
     msg=SimpleNamespace(tick=1,motor_state=motors,wireless_remote=[0]*40,mode_machine=4)
     arm._on_state(msg)
+    epoch=arm.feedback_epoch
+    msg.tick=2;arm._on_state(msg)
+    assert arm.feedback_epoch==epoch
+    arm._feedback['arm_ns']-=101_000_000
+    msg.tick=3;arm._on_state(msg)
+    assert arm.feedback_epoch==epoch+1
     state,_,_=arm._fresh()
     assert 'fault' not in state
     assert state['motor_telemetry'][0]['motorstate']==0
-    motors[15].motorstate=5;msg.tick=2;arm._on_state(msg)
+    motors[15].motorstate=5;msg.tick=4;arm._on_state(msg)
     assert arm._fresh()[0]['motor_telemetry'][0]['motorstate']==5
     motors[15].mode=0;motors[15].vol=0;motors[15].temperature=[150,150]
-    msg.tick=3;arm._on_state(msg)
+    msg.tick=5;arm._on_state(msg)
     assert arm._fresh()[0]['motor_telemetry'][0]['temperature']==[150,150]
-    msg.tick=4;msg.motor_state=[];arm._on_state(msg)
+    msg.tick=6;msg.motor_state=[];arm._on_state(msg)
     with pytest.raises(ValueError,match='arm_feedback_invalid'): arm._fresh()
 
 
-def test_duplicate_stop_while_awaiting_feedback_does_not_invent_vendor_action(tmp_path):
+def test_normal_arm_substate_changes_preserve_authorization_epoch(tmp_path):
+    arm, _, _, advance, _, _ = rig(tmp_path, claim=False)
+    arm._on_fsm(SimpleNamespace(fsm_id=801, fsm_mode=0))
+    epoch = arm.feedback_epoch
+    for mode in (3, 0, 3):
+        advance(10)
+        arm._on_fsm(SimpleNamespace(fsm_id=801, fsm_mode=mode))
+        assert arm.feedback_epoch == epoch
+        assert arm._fsm['fsm_mode'] == mode
+    advance(101)
+    arm._on_fsm(SimpleNamespace(fsm_id=801, fsm_mode=0))
+    assert arm.feedback_epoch == epoch + 1
+
+
+@pytest.mark.parametrize('before,after', [
+    ((801, 0), (801, 1)), ((801, 3), (500, 3)),
+    ((500, 0), (500, 3)), ((801, 1), (801, 0)),
+])
+def test_other_fsm_changes_revoke_authorization_epoch(tmp_path, before, after):
+    arm, *_ = rig(tmp_path, claim=False)
+    arm._on_fsm(SimpleNamespace(fsm_id=before[0], fsm_mode=before[1]))
+    epoch = arm.feedback_epoch
+    arm._on_fsm(SimpleNamespace(fsm_id=after[0], fsm_mode=after[1]))
+    assert arm.feedback_epoch == epoch + 1
+
+
+def test_duplicate_stop_while_confirming_handback_does_not_invent_vendor_action(tmp_path):
     arm,_,ch,advance,_,sdk=rig(tmp_path)
     arm.dispatch('stop',{})
-    progress_release(arm,advance,'awaiting_feedback')
+    progress_release(arm,advance,'confirming_handback')
     ident=arm._operation['operation_id']
     for _ in range(3):
         result=arm.dispatch('stop',{})
-        assert result['state']=='awaiting_feedback' and result['operation_id']==ident
+        assert result['state']=='confirming_handback' and result['operation_id']==ident
     progress_release(arm,advance,'completed')
     assert not sdk and not arm.status()['ownership_held']
+
+
+def test_plain_stop_finishes_after_one_measured_handback_confirmation(tmp_path):
+    arm,s,ch,advance,_,sdk=rig(tmp_path)
+    arm.replay_deadline_ns=arm.clock()+100_000_000
+    arm.dispatch('stop',{})
+    assert arm.replay_deadline_ns is None
+    progress_release(arm,advance,'confirming_handback')
+    # A fresh 100 ms window at rest is required, including after velocity noise.
+    s['dq']=[.03]*10
+    for _ in range(20):advance(10);arm.tick()
+    assert arm.status()['ownership_held'] and not ch.closed
+    s['dq']=[0.]*10
+    advance(10);arm.tick()
+    advance(100);arm.tick()
+    assert arm._operation['state']=='completed'
+    assert arm._operation['physical_confirmed'] and ch.closed
+    assert not arm.status()['ownership_held'] and not sdk
+
+
+def test_timed_out_zero_weight_stop_accepts_late_fresh_rest_without_writes(tmp_path):
+    arm,s,ch,advance,_,sdk=rig(tmp_path)
+    arm.dispatch('stop',{})
+    progress_release(arm,advance,'confirming_handback')
+    s['dq']=[.03]*10
+    advance(10001);arm.tick()
+    assert arm._operation['state']=='unknown'
+    assert arm._operation['timed_out_state']=='confirming_handback'
+    writes=len(ch.writes)
+    for _ in range(20):advance(10);arm.tick()
+    assert arm.status()['ownership_held'] and len(ch.writes)==writes
+    s['dq']=[0.]*10
+    # Stale samples cannot clear ownership.
+    advance(101,fresh=False);arm.tick()
+    assert arm.status()['ownership_held']
+    advance(10);arm.tick()
+    advance(100);arm.tick()
+    assert arm._operation['physical_confirmed'] and not arm.status()['ownership_held']
+    assert len(ch.writes)==writes and not sdk
+
+
+@pytest.mark.parametrize('change', [
+    {'action_id':99}, {'request_sent':True}, {'zero_writes':4},
+    {'reason':'release_sdk_error'}, {'timed_out_state':'handback'},
+])
+def test_late_rest_cannot_clear_unconfirmed_or_vendor_release(tmp_path,change):
+    arm,s,ch,advance,_,sdk=rig(tmp_path)
+    arm.dispatch('stop',{})
+    progress_release(arm,advance,'confirming_handback')
+    s['dq']=[.03]*10
+    advance(10001);arm.tick()
+    arm._operation.update(change)
+    s['dq']=[0.]*10
+    for _ in range(30):advance(10);arm.tick()
+    assert arm.status()['ownership_held'] and not ch.closed and not sdk
 
 
 def test_idle_stop_does_not_clear_unknown_prior_release(tmp_path):
