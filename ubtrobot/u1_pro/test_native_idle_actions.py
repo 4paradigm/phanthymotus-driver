@@ -3,6 +3,7 @@
 import io
 import json
 import subprocess
+import traceback
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -131,6 +132,58 @@ class IdleActionControlTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "native runtime unavailable"):
                 IdleActionControl().set_enabled(False)
             run.assert_called_once()
+
+    def test_native_stdout_and_stderr_errors_are_bounded_and_controls_are_visible(self):
+        raw = "native\nforged\x1b[31m\x00\r中文" * 100
+        for result in (completed(code=1, error=raw), completed(raw, code=1)):
+            with self.subTest(stream=bool(result.stderr)), mock.patch(
+                "native_idle_actions.subprocess.run", return_value=result,
+            ):
+                try:
+                    IdleActionControl().set_enabled(False)
+                except RuntimeError as exc:
+                    message = str(exc)
+                    formatted = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                else:
+                    self.fail("native failure was accepted")
+            self.assertLessEqual(len(message.split(": ", 1)[1]), 240)
+            self.assertTrue(message.isascii())
+            self.assertTrue(all(32 <= ord(char) < 127 for char in message))
+            for escaped in (r"\n", r"\x1b", r"\x00", r"\r"):
+                self.assertIn(escaped, message)
+            self.assertNotIn("\x1b", formatted)
+            self.assertNotIn("\x00", formatted)
+
+    def test_service_rejection_message_is_escaped_and_bounded(self):
+        raw = "rejected\x1b[31m\x00\r中文" * 100
+        output = f"response: config_msgs.srv.SetConfig.Response(data=False, message={raw})\n"
+        with mock.patch("native_idle_actions.subprocess.run", return_value=completed(output)) as run:
+            with self.assertRaises(RuntimeError) as raised:
+                IdleActionControl().set_enabled(False)
+        message = str(raised.exception)
+        self.assertLessEqual(len(message.split(": ", 1)[1]), 240)
+        self.assertTrue(message.isascii())
+        self.assertTrue(all(32 <= ord(char) < 127 for char in message))
+        self.assertIn(r"\x1b", message)
+        self.assertIn(r"\x00", message)
+        self.assertIn(r"\r", message)
+        run.assert_called_once()
+
+    def test_timeout_readback_error_is_escaped_without_losing_uncertainty(self):
+        with mock.patch("native_idle_actions.subprocess.run", side_effect=[
+            subprocess.TimeoutExpired("write", 25),
+            RuntimeError("readback\nforged\x1b[31m\x00\r" * 100),
+        ]):
+            with self.assertRaises(RuntimeError) as raised:
+                IdleActionControl().set_enabled(False)
+        message = str(raised.exception)
+        detail = message.split("readback_error=", 1)[1].split("; request completion", 1)[0]
+        self.assertLessEqual(len(detail), 240)
+        self.assertTrue(all(32 <= ord(char) < 127 for char in message))
+        self.assertIn("readback=unknown; observed_enabled=unknown", message)
+        self.assertIn(r"\n", message)
+        self.assertIn(r"\x1b", message)
+        self.assertIn("request completion unconfirmed; no automatic retry", message)
 
     def test_status_does_not_call_config_service(self):
         with mock.patch("native_idle_actions.subprocess.run", return_value=completed('{"enabled": true}')) as run:

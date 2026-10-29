@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
-from native_idle_actions import DEFAULT_NATIVE_CONTAINER, IdleActionControl
+from native_idle_actions import DEFAULT_NATIVE_CONTAINER, IdleActionControl, safe_native_detail
 
 
 SERVICE_TIMEOUT = 10.0
@@ -2009,6 +2009,10 @@ class IdleActionsPlugin:
 
     def __init__(self, control: IdleActionControl):
         self.control = control
+        self._lock = threading.Lock()
+        self._accepting = True
+        self._active: str | None = None
+        self._worker: threading.Thread | None = None
 
     def get_tool(self):
         actions = {
@@ -2018,29 +2022,76 @@ class IdleActionsPlugin:
             "enable": ([], "Enable and persist automatic idle actions and blinking."),
             "disable": ([], "Disable and persist scheduling of idle actions and blinking; an in-flight trajectory may finish."),
         }
+        schema = action_schema(actions, {
+            "action_id": {"type": "string", "minLength": 1, "maxLength": 128,
+                          "pattern": "^[A-Za-z0-9_.:-]+$",
+                          "description": "Optional unique ACP correlation ID; omitted IDs are generated as UUIDs."},
+        })
+        schema["x-completion"] = {"actions": ["status", "enable", "disable"], "timeout": 45}
+        schema["x-resource"] = "u1_idle_config"
         return tool(self.PREFIX, "actuator",
                     "自动待机动作：开启、关闭或查询 U1 Pro 循环待机动作及自动眨眼。"
                     "设置持久保存，启动/停止卡片不改变设置；关闭待机请调用 disable。"
+                    "查询和修改异步返回 action_id，通过 ACP 回报配置操作结果。"
                     "关闭会禁止新的待机动作，已下发的轨迹可能继续执行到结束。"
                     "关闭后仍可执行固件的一次性归位和 expression/head 卡片主动请求的动作。",
-                    action_schema(actions, {}))
+                    schema)
 
     def start(self):
+        with self._lock:
+            self._accepting = True
         return {"state": "ready"}
 
     def stop(self):
+        # A native write may already have applied. Let an accepted operation
+        # finish and report its real outcome instead of falsely cancelling it.
+        with self._lock:
+            self._accepting = False
         return {"state": "idle"}
 
+    def _submit(self, action: str, args: dict) -> dict:
+        action_id = args.get("action_id", str(uuid.uuid4()))
+        if not isinstance(action_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", action_id):
+            raise ValueError("idle_actions.action_id must be 1-128 ASCII letters, digits, or _ . : -")
+        with self._lock:
+            if not self._accepting:
+                raise RuntimeError("U1 Pro idle_actions card is stopped; call start before submitting an operation")
+            if self._active is not None:
+                raise RuntimeError("U1 Pro idle_actions is busy; wait for the active operation to complete")
+            self._active = action_id
+            try:
+                self._worker = threading.Thread(target=self._run, args=(action, action_id),
+                                                daemon=True, name="u1-idle-actions")
+                self._worker.start()
+            except Exception:
+                self._active = None
+                self._worker = None
+                raise
+        return {"state": "queued", "action_id": action_id}
+
+    def _run(self, action: str, action_id: str) -> None:
+        try:
+            result = (self.control.status() if action == "status"
+                      else self.control.set_enabled(action == "enable"))
+            status = "completed"
+            completion = {"state": status, "action_id": action_id, "action": action, "result": result}
+        except Exception as exc:
+            status = "error"
+            completion = {"state": status, "action_id": action_id, "action": action,
+                          "message": safe_native_detail(exc, limit=1024)}
+        # Release before POST: Agent Core may dispatch its next action as soon
+        # as it receives completion, before the HTTP acknowledgement returns.
+        with self._lock:
+            self._active = None
+        _acp_notify(action_id, status, completion, self.PREFIX)
+
     def dispatch(self, action, args):
-        del args
         if action == "start":
             return self.start()
         if action == "stop":
             return self.stop()
-        if action == "status":
-            return self.control.status()
-        if action in {"enable", "disable"}:
-            return self.control.set_enabled(action == "enable")
+        if action in {"status", "enable", "disable"}:
+            return self._submit(action, args)
         return None
 
 

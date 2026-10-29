@@ -18,6 +18,12 @@ DEFAULT_NATIVE_CONTAINER = "walker-behavior.behavior-1"
 IDLE_ACTION_KEY = "idle_action_enabled"
 CONFIG_SERVICE = "/sys/config/user_manager/set_config"
 
+
+def safe_native_detail(value: object, limit: int = 240) -> str:
+    """Bound both input and rendered length; make controls visible in logs."""
+    return str(value)[:limit].encode("unicode_escape").decode("ascii")[:limit]
+
+
 # Pass the payload as a positional argument, never interpolate it into shell code.
 # The inner timeout also terminates ROSA if the outer Docker client disappears.
 _SET_CONFIG = (
@@ -66,7 +72,7 @@ class IdleActionControl:
             raise _NativeCommandTimeout(
                 f"U1 Pro idle_action native command timed out or was killed (exit {result.returncode})")
         if result.returncode:
-            detail = (result.stderr or result.stdout).strip()[-240:]
+            detail = safe_native_detail((result.stderr or result.stdout).strip()[-240:])
             raise RuntimeError(f"U1 Pro idle_action native command failed ({result.returncode}): {detail}")
         return result.stdout
 
@@ -100,12 +106,12 @@ class IdleActionControl:
                     state = self.status()
                 except Exception as readback_error:
                     detail = ("readback=unknown; observed_enabled=unknown; "
-                              f"readback_error={str(readback_error)[:240]}")
+                              f"readback_error={safe_native_detail(readback_error)}")
                 else:
                     actual = state["data"]["enabled"]
                     outcome = "match" if actual is enabled else "mismatch"
                     detail = f"readback={outcome}; observed_enabled={json.dumps(actual)}"
-                # Keep the existing error path: MCP exposes this message to callers.
+                # The card's worker includes this diagnostic in its ACP error.
                 raise RuntimeError(
                     f"{exc}; requested={json.dumps(enabled)}; {detail}; "
                     "request completion unconfirmed; no automatic retry") from exc
@@ -118,7 +124,7 @@ class IdleActionControl:
             if not response:
                 raise RuntimeError("U1 Pro idle_action received no recognized config service response; query status")
             if response.group(1) != "True":
-                raise RuntimeError(f"U1 Pro idle_action config service rejected the request: {response.group(2)[:240]}")
+                raise RuntimeError(f"U1 Pro idle_action config service rejected the request: {safe_native_detail(response.group(2))}")
             state = self.status()
             actual = state["data"]["enabled"]
             if actual is not enabled:
