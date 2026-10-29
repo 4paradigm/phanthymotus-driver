@@ -49,11 +49,14 @@ snapshot: reopen them to refresh.
 The 20 Hz supervision keeps the camera feed on a 500 ms stale clock, while
 RTAB-Map results and diagnostics get a 1.5 s grace: walking increased observed
 processing intervals from 0.13 s to 0.37 s, and a 500 ms visual edge was below
-the real latency. A single bad pose is dropped; a sustained gap, repeated pose
-discontinuity or low-inlier run starts a **new segment** (fresh estimator,
-fresh odom frame) automatically. Status transitions publish immediately even
-between 5 Hz summary updates. Lost or stopped output clears both displayed
-position and displacement rather than repeating the last valid pose.
+the real latency. A single bad pose is dropped. An `OdomInfo` that explicitly
+reports `lost` or falls below the inlier floor ends the segment immediately
+(the current pose is cleared, not published as tracking); the delayed restart
+then starts a **new segment** (fresh estimator, fresh odom frame). Sustained
+gaps and repeated pose discontinuities do the same. Status transitions publish
+immediately even between 5 Hz summary updates. Lost or stopped output clears
+both displayed position and displacement rather than repeating the last valid
+pose.
 
 ## Inputs
 
@@ -161,7 +164,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `478 passed` in the Bumi suite; the
+ROS-free regression for this branch: `479 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.

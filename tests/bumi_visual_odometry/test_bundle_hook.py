@@ -29,7 +29,7 @@ def _load_device(monkeypatch):
 def capture(monkeypatch):
     device = _load_device(monkeypatch)
     state = NS(iterations=0, frame_limit=1, published={}, stopped=False,
-               aligned=False, streams=[], alignment=[])
+               aligned=False, streams=[], alignment=[], spin_calls=0)
     raw = NS(color=b'BGR', depth=b'\x01\x00\x02\x00')
 
     class Pixels:
@@ -132,6 +132,14 @@ def capture(monkeypatch):
     monkeypatch.setattr(sys.modules['rclpy.node'], 'Node', Node)
     rclpy = sys.modules['rclpy']
     rclpy.init = lambda: None
+
+    def spin_once(node, timeout_sec=0):
+        state.spin_calls += 1
+        hook = getattr(state, 'on_spin', None)
+        if hook:
+            hook(node)
+
+    rclpy.spin_once = spin_once
     return device, state
 
 
@@ -304,17 +312,19 @@ def test_raw_control_stops_publications_but_not_media(capture, monkeypatch):
         def publish(self, source_frames, aligned_frames):
             published.append(source_frames)
 
-    def stop_before_second_frame():
-        if state.iterations == 2:
-            callback = state.node.subscriptions['/robot/odometry_input/raw_enabled']
+    def on_spin(node):
+        if state.iterations == 1:
+            callback = node.subscriptions['/robot/odometry_input/raw_enabled']
             callback(NS(data=False))
 
-    state.before_frame = stop_before_second_frame
+    state.on_spin = on_spin
     monkeypatch.setitem(sys.modules, 'visual_inputs',
                         NS(RawCameraPublisher=RawCameraPublisher))
     device._camera_subprocess('robot')
-    # First frame published raw; the card stop signal disabled the shared
-    # branch before frames two and three, while JPEG/Z16 kept running.
+    # The camera loop serviced its own ROS callbacks (spin_once), so the card
+    # stop signal reached it. First frame published raw; the shared branch was
+    # disabled before frames two and three, while JPEG/Z16 kept running.
+    assert state.spin_calls == 4
     assert len(published) == 1
     assert len(state.published['/robot/camera/color']) == 3
     assert len(state.published['/robot/camera/depth']) == 3

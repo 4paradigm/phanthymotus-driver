@@ -332,3 +332,21 @@ def test_start_and_stop_toggle_the_shared_raw_branch(plugin):
     assert [m.data for m in plugin._node.node.topics[raw_topic]] == [True]
     plugin.dispatch('stop', {})
     assert [m.data for m in plugin._node.node.topics[raw_topic]] == [True, False]
+
+
+def test_lost_diagnostic_clears_the_pose_before_the_restart(plugin):
+    node = started_node(plugin)
+    node.diagnostic_started = True
+    for position in ([0., 0., 0.], [.001, 0., 0.], [.002, 0., 0.]):
+        feed(node, position)
+    node.health.samples['camera'] = node.now()
+    node.health.counts['camera'] = 3
+    assert node.publish()['vendor']['status'] == 'tracking'
+
+    t = node.now()
+    node.diagnostic(NS(header=NS(stamp=NS(sec=t//10**9, nanosec=t % 10**9)),
+                       lost=True, inliers=0, matches=0))
+    sample = node.publish()
+    assert sample['vendor']['status'] == 'lost'
+    assert sample['pose'] is None
+    assert 'tracking lost' in sample['vendor']['reason']

@@ -692,6 +692,11 @@ class VisualOdometryNode:
             self.health.details['visual_diagnostic'] = dict(
                 inliers=msg.inliers, matches=msg.matches, lost=msg.lost)
             self.health.details['fault_stamp_ns'] = t
+            # RTAB-Map explicitly reports the tracker as lost (or below the
+            # inlier floor) for this stamp. The segment must stop advertising
+            # the previous pose as tracking immediately; the delayed restart
+            # below only decides when to build the replacement segment.
+            self.health.fault('visual tracking lost or insufficient inliers')
             if self.invalid_since is None:
                 self.invalid_since = now
             elif now-self.invalid_since >= RECOVERY_GRACE_S:

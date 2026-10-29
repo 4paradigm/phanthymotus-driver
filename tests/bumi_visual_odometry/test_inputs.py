@@ -168,20 +168,21 @@ def test_zero_coefficient_inverse_brown_conrady_is_the_pinhole_model(raw_ros):
     assert info.k == [100., 0., 1., 0., 101., 1., 0., 0., 1.]
 
 
-def test_nonzero_inverse_brown_conrady_is_rejected_before_publishing(raw_ros, capsys):
+def test_nonzero_inverse_brown_conrady_is_rejected_before_publishing(raw_ros):
     raw_publisher, messages = publisher(raw_ros)
-    raw_publisher.error_at = -10.0  # monotonic may be process-relative; force the log
     aligned = frames('distortion.inverse_brown_conrady', [0., .1, 0., 0., 0.])
-    raw_publisher.publish(aligned, aligned)
-
+    # The publisher no longer swallows/logs its own faults: the camera loop is
+    # the single sampled logger, so the error has to reach it.
+    with pytest.raises(ValueError, match='unsupported color distortion model'):
+        raw_publisher.publish(aligned, aligned)
     assert not any(messages.values())
-    assert 'unsupported color distortion model' in capsys.readouterr().out
 
 
 def test_non_finite_coefficients_are_rejected_before_publishing(raw_ros):
     raw_publisher, messages = publisher(raw_ros)
     aligned = frames('distortion.brown_conrady', [0., float('nan'), 0., 0., 0.])
-    raw_publisher.publish(aligned, aligned)
+    with pytest.raises(ValueError, match='finite'):
+        raw_publisher.publish(aligned, aligned)
     assert not any(messages.values())
 
 

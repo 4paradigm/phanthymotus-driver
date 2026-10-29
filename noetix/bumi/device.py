@@ -2437,6 +2437,10 @@ def _camera_subprocess(namespace: str):
     t_start = _time.monotonic()
     try:
         while True:
+            # The camera node owns the raw_enabled subscription. This is a
+            # separate process from the bundle executor, so it must service its
+            # own callbacks; otherwise card stop/start never reaches it.
+            _rclpy.spin_once(node, timeout_sec=0)
             t0 = _time.monotonic()
             source_frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
@@ -2474,8 +2478,9 @@ def _camera_subprocess(namespace: str):
                     # failure must not turn into 30 rotated-log records/second.
                     raw_publish_failures += 1
                     if raw_publish_failures == 1 or raw_publish_failures % 100 == 0:
+                        detail = ' '.join(str(_e).split())[:300]
                         print(f"[camera_subprocess] raw RGB-D publish failed "
-                              f"(failure #{raw_publish_failures}): {_e}", flush=True)
+                              f"(failure #{raw_publish_failures}): {detail}", flush=True)
 
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)

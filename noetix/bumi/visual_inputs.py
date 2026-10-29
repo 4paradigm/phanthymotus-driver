@@ -46,7 +46,6 @@ class RawCameraPublisher:
         self.depth_scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
         self.epoch = uuid.uuid4().hex
         self.clocks = [ClockMap(), ClockMap()]
-        self.error_at = 0
         # Sample the enabled raw branch at a bounded rate instead of duplicating
         # every 30 Hz capture frame over DDS.
         self.min_interval_s = max(0.0, float(min_interval_s))
@@ -125,6 +124,7 @@ class RawCameraPublisher:
             if 'camera clock reset' in str(exc) or 'domain changed' in str(exc):
                 self.clocks = [ClockMap(), ClockMap()]
                 self.epoch = uuid.uuid4().hex
-            if time.monotonic()-self.error_at >= 5:
-                print('[odometry_input] raw camera unavailable: '+str(exc), flush=True)
-                self.error_at = time.monotonic()
+            # Let the camera loop own failure counting/rotation. It samples the
+            # first failure and every 100th so a 30 Hz fault cannot flood the
+            # log; swallowing here made the outer throttle unreachable.
+            raise
