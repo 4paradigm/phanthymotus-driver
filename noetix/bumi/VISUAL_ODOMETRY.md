@@ -191,7 +191,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `488 passed` in the Bumi suite; the
+ROS-free regression for this branch: `483 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.
@@ -210,18 +210,3 @@ to `initializing`, so it cannot inject invented odometry before those checks.
   mapping is an arrival-time approximation.
 - 20 ms pairing, 10 inliers, 0.2 m position sigma and the 250 ms/1 s ages are
   rejection thresholds, not accuracy guarantees.
-
-
-## Optional loco_relative_move feedback
-
-`loco_relative_move` declares an optional `state/odom` input (`topic_in`) and
-`input_topic` field. When the canvas connects this card's full odometry output:
-
-- `move` waits for a fresh `motus.odom/1` sample and captures the move-start
-  body frame;
-- x/y position and arrival use the visual odometry; heading and in-place
-  rotation remain on the IMU;
-- a missing/stale sample, a position jump or a `segment_id` change during the
-  move stops the move with an error instead of silently switching feedback;
-- without an input topic the original leg/IMU target logic is unchanged;
-- `status` reports the input topic, sample age, segment and error.
