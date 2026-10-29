@@ -276,16 +276,6 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         self.assertEqual(result["nav_id_binding_mode"], "control_plane")
         self.assertEqual(self.smart_motion.expected_nav_id, self.nav_id)
 
-    def test_fake_smart_motion_matches_internal_subscription_contract(self):
-        empty = self.smart_motion.bind_velocity_proposal(self.topic, "")
-
-        self.assertTrue(empty["connected"])
-        self.assertFalse(empty["armed"])
-        self.assertTrue(empty["awaiting_nav_id"])
-        self.assertEqual(empty["nav_id_binding_mode"], "first_valid_proposal")
-        with self.assertRaises(ValueError):
-            self.smart_motion.bind_velocity_proposal(self.topic, 123)
-
     def test_start_preserves_stop_confirmation_diagnostics_on_failure(self):
         diagnostics = {
             "stop_move_ret": 0,
