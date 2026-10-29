@@ -21,6 +21,10 @@ def executor(monkeypatch):
         def __init__(self, data=''):
             self.data = data
 
+    class Bool:
+        def __init__(self, data=False):
+            self.data = data
+
     class Node:
         def __init__(self, *args):
             self.messages = []
@@ -52,7 +56,7 @@ def executor(monkeypatch):
 
     for name, attrs in (('rclpy.node', {'Node': Node}),
                         ('rclpy.qos', {'qos_profile_sensor_data': object()}),
-                        ('std_msgs.msg', {'String': String})):
+                        ('std_msgs.msg', {'String': String, 'Bool': Bool})):
         fake = ModuleType(name)
         fake.__dict__.update(attrs)
         monkeypatch.setitem(sys.modules, name, fake)
@@ -90,10 +94,9 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     assert tool['topic_out'] == [{'topic': '/bumi_visual_odometry/status',
                                   'format': 'data/json'}]
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
-        'start', 'stop', 'info', 'config'}
-    assert tool['inputSchema']['x-action-params'] == {
-        'start': {'params': []}, 'stop': {'params': []},
-        'info': {'params': []}, 'config': {'params': ['calibration']}}
+        'start', 'stop', 'info'}
+    assert 'x-action-params' not in tool['inputSchema']
+    assert set(tool['configSchema']['properties']) == {'calibration'}
     assert set(tool['configSchema']['properties']) == {'calibration'}
     assert 'no IMU/EKF/fusion' in tool['description']
 
@@ -320,3 +323,12 @@ def test_jump_grace_restarts_a_segment_without_a_second_sample(plugin, monkeypat
     clock[0] += .7
     node.tick()
     assert node.restarts == 1
+
+
+def test_start_and_stop_toggle_the_shared_raw_branch(plugin):
+    plugin.dispatch('start', {})
+    raw_topic = plugin._node.raw_control_topic
+    assert raw_topic == '/robot/odometry_input/raw_enabled'
+    assert [m.data for m in plugin._node.node.topics[raw_topic]] == [True]
+    plugin.dispatch('stop', {})
+    assert [m.data for m in plugin._node.node.topics[raw_topic]] == [True, False]

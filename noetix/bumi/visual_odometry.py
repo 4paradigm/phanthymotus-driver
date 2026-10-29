@@ -230,6 +230,13 @@ class VisualOdometryNode:
         self.output = OUTPUT_TOPIC
         self.publisher = self.node.create_publisher(String, self.output, self.qos)
         self.status_publisher = self.node.create_publisher(String, STATUS_TOPIC, self.qos)
+        # The raw RGB-D producer lives in the camera subprocess. This private
+        # control topic is the lifecycle signal: stop disables the shared
+        # branch, start re-enables it, matching what sensor-card stop means.
+        from std_msgs.msg import Bool
+        self.Bool = Bool
+        self.raw_control_topic = f'/{namespace}/odometry_input/raw_enabled'
+        self.raw_control = self.node.create_publisher(Bool, self.raw_control_topic, 10)
         self.directory = tempfile.TemporaryDirectory(prefix='bumi-visual-odometry-')
         self.children = ChildProcesses(self.directory.name)
         self.input_subs = []
@@ -256,6 +263,15 @@ class VisualOdometryNode:
 
     def now(self):
         return self.node.get_clock().now().nanoseconds
+
+    def _set_raw_enabled(self, enabled):
+        """Tell the camera process whether the shared raw branch is needed."""
+        try:
+            self.raw_control.publish(self.Bool(data=bool(enabled)))
+        except Exception:
+            # The publisher is best-effort lifecycle plumbing; losing one
+            # message must not take the card down. Camera-side default is on.
+            pass
 
     def _new_segment(self):
         self.segment = 'bumi_visual_'+uuid.uuid4().hex
@@ -350,9 +366,11 @@ class VisualOdometryNode:
             self._new_segment()
             self.active = True
             self.bind_inputs(self.namespace)
+        self._set_raw_enabled(True)
         return self.info()
 
     def stop(self, reason='visual odometry stopped'):
+        self._set_raw_enabled(False)
         if self.active:
             self.health.fault(reason)
             self.publish()
@@ -755,15 +773,13 @@ class VisualOdometryPlugin:
                 'properties': {
                     'action': {'type': 'string',
                                # Only system actions: a sensor card must not
-                               # render an execution form/button. Manual reset
-                               # is no longer exposed; recovery creates a new
-                               # segment automatically.
-                               'enum': ['start', 'stop', 'info', 'config']}},
-                'x-action-params': {
-                    'start': {'params': []},
-                    'stop': {'params': []},
-                    'info': {'params': []},
-                    'config': {'params': ['calibration']}}},
+                               # render an execution form/button. `config` is
+                               # not advertised here either: it is the platform's
+                               # persistent-config replay path, the same as
+                               # other sensor cards (configSchema below). Manual
+                               # reset is no longer exposed; recovery creates a
+                               # new segment automatically.
+                               'enum': ['start', 'stop', 'info']}}},
             'configSchema': {'type': 'object', 'properties': {
                 'calibration': {'type': 'object',
                                 'description': 'Optional measured camera_to_body mount; '

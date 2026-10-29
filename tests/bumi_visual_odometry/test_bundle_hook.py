@@ -67,6 +67,8 @@ def capture(monkeypatch):
 
         def wait_for_frames(self, timeout_ms):
             state.iterations += 1
+            if getattr(state, 'before_frame', None):
+                state.before_frame()
             if state.iterations > state.frame_limit:
                 raise RuntimeError('test loop finished')
             return Frames()
@@ -102,17 +104,27 @@ def capture(monkeypatch):
             self.data = b''
             self.format = ''
 
+    class Bool:
+        def __init__(self, data=False):
+            self.data = data
+
     messages = sys.modules['sensor_msgs.msg']
     monkeypatch.setattr(messages, 'CompressedImage', Message)
     monkeypatch.setattr(messages, 'Image', Message)
+    sys.modules['std_msgs.msg'].Bool = Bool
 
     class Node:
         def __init__(self, name):
-            pass
+            state.node = self
+            self.subscriptions = {}
 
         def create_publisher(self, cls, topic, qos):
             state.published[topic] = []
             return NS(publish=state.published[topic].append)
+
+        def create_subscription(self, cls, topic, callback, qos):
+            self.subscriptions[topic] = callback
+            return NS()
 
         def get_clock(self):
             return NS(now=lambda: NS(to_msg=lambda: NS(sec=1, nanosec=2)))
@@ -275,3 +287,34 @@ def test_missing_raw_branch_module_is_optional(capture, monkeypatch, capsys):
     device._camera_subprocess('robot')
     assert state.published['/robot/camera/color']
     assert 'raw RGB-D branch unavailable' in capsys.readouterr().out
+
+
+def test_raw_control_stops_publications_but_not_media(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
+    state.frame_limit = 3
+    published = []
+
+    class RawCameraPublisher:
+        enabled = True
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def publish(self, source_frames, aligned_frames):
+            published.append(source_frames)
+
+    def stop_before_second_frame():
+        if state.iterations == 2:
+            callback = state.node.subscriptions['/robot/odometry_input/raw_enabled']
+            callback(NS(data=False))
+
+    state.before_frame = stop_before_second_frame
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(RawCameraPublisher=RawCameraPublisher))
+    device._camera_subprocess('robot')
+    # First frame published raw; the card stop signal disabled the shared
+    # branch before frames two and three, while JPEG/Z16 kept running.
+    assert len(published) == 1
+    assert len(state.published['/robot/camera/color']) == 3
+    assert len(state.published['/robot/camera/depth']) == 3

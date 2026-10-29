@@ -2421,6 +2421,17 @@ def _camera_subprocess(namespace: str):
                 min_interval_s=(1.0/raw_rate_hz if raw_rate_hz > 0 else 0.0))
         except Exception as _e:
             print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
+        if raw_inputs is not None:
+            # Card stop/start is delivered as a Bool over a private control
+            # topic; the raw branch must not keep publishing after the sensor
+            # card is stopped. Reliable QoS so stop/start ordering survives.
+            try:
+                from std_msgs.msg import Bool
+                node.create_subscription(
+                    Bool, f"/{namespace}/odometry_input/raw_enabled",
+                    lambda msg: setattr(raw_inputs, "enabled", bool(msg.data)), 10)
+            except Exception as _e:
+                print(f"[camera_subprocess] raw enable control unavailable: {_e}", flush=True)
 
     frame_count = 0
     t_start = _time.monotonic()
@@ -2455,7 +2466,7 @@ def _camera_subprocess(namespace: str):
                 msg.data = array('B', compressed)
                 depth_pub.publish(msg)
 
-            if raw_inputs is not None:
+            if raw_inputs is not None and getattr(raw_inputs, 'enabled', True):
                 try:
                     raw_inputs.publish(source_frames, frames)
                 except Exception as _e:

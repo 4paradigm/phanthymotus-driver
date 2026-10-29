@@ -51,11 +51,17 @@ class RawCameraPublisher:
         # every 30 Hz capture frame over DDS.
         self.min_interval_s = max(0.0, float(min_interval_s))
         self.last_publish = 0.0
+        # Controlled by the visual-odometry card lifecycle: stop publishes a
+        # Bool=False on the enable topic so this shared camera process stops
+        # converting/serializing raw frames until start re-enables it.
+        self.enabled = True
 
     def publish(self, source_frames, aligned_frames):
         """Faults in the optional branch never take down the media producer."""
         import numpy as np
         try:
+            if not self.enabled:
+                return
             source_color, source_depth = source_frames.get_color_frame(), source_frames.get_depth_frame()
             color, depth = aligned_frames.get_color_frame(), aligned_frames.get_depth_frame()
             if not all((source_color, source_depth, color, depth)):

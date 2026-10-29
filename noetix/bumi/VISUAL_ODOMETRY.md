@@ -18,14 +18,17 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | Field | Value |
 | --- | --- |
 | Tool / card | `rgbd_visual_odometry` (sensor, read-only) |
-| MCP actions | `start`, `stop`, `info`, `config` (system actions only; no execution form/button) |
+| MCP actions | `start`, `stop`, `info` (system actions only; no execution form/button) |
 | Canvas output | `/bumi_visual_odometry/status`, `std_msgs/msg/String`, port format `data/json`, about 5 Hz |
 | Full ROS output | `/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, 20 Hz |
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
 
-`stop` only reaps the estimator child and the card's private topics. The camera,
+`stop` reaps the estimator child and the card's private topics, and sends a
+`Bool(false)` on the private `/<NS>/odometry_input/raw_enabled` control topic so
+the camera subprocess stops converting/serializing the raw RGB-D branch too.
+`start` sends `Bool(true)` and resumes it. The shared camera pipeline, the
 `camera`/`depth` cards, photo/video capture, audio and every motion card keep
-running.
+running; only the visual-odometry branch and estimator are affected.
 
 The canvas displays only `status`, `displacement_m`, `position_m`,
 `pose_reference`, `age_ms` and `reason`. Positions and displacement are rounded
@@ -111,8 +114,9 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 
 Without `calibration` the pose reference is the camera optical origin; this is not
 a claim that the camera-to-body extrinsic is zero. To express the same trajectory
-at a body reference point, set a measured mount in `config.yaml` (or via the
-card's `config` action, not persisted):
+at a body reference point, set a measured mount in `config.yaml` (or through the
+persistent `configSchema` calibration field, which the platform replays through
+the internal `config` action on start):
 
 ```yaml
 plugins:
@@ -157,7 +161,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `475 passed` in the Bumi suite; the
+ROS-free regression for this branch: `478 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.

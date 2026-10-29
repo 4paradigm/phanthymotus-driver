@@ -208,3 +208,14 @@ def test_raw_publisher_samples_at_the_configured_max_rate(raw_ros, monkeypatch):
     assert len(messages['/robot/odometry_input/depth']) == 2
     assert len(messages['/robot/odometry_input/info']) == 2
     assert len(messages['/robot/odometry_input/camera_meta']) == 2
+
+
+def test_raw_publisher_obeys_the_card_lifecycle(raw_ros):
+    raw_publisher, messages = publisher(raw_ros)
+    raw_publisher.enabled = False
+    raw_publisher.publish(frames(), frames())
+    for topic in ('rgb', 'depth', 'info', 'camera_meta'):
+        assert messages['/robot/odometry_input/'+topic] == []
+    raw_publisher.enabled = True
+    raw_publisher.publish(frames(), frames())
+    assert len(messages['/robot/odometry_input/rgb']) == 1
