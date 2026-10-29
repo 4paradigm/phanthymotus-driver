@@ -2416,10 +2416,22 @@ def _camera_subprocess(namespace: str):
     raw_inputs = None
     raw_publish_failures = 0
     if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1":
-        try:
-            raw_rate_hz = float(os.environ.get("BUMI_VISUAL_ODOMETRY_MAX_FPS") or 0)
-        except ValueError:
-            raw_rate_hz = 0.0
+        # A bad config value must not silently become "unlimited": 0/negative/
+        # NaN/infinite would make min_interval_s zero and publish all 30 fps.
+        # Fall back to the documented 10 Hz and never exceed the camera rate.
+        raw_rate_hz = 10.0
+        raw_rate_env = os.environ.get("BUMI_VISUAL_ODOMETRY_MAX_FPS")
+        if raw_rate_env not in (None, ""):
+            try:
+                candidate = float(raw_rate_env)
+                if math.isfinite(candidate) and 0.0 < candidate <= 30.0:
+                    raw_rate_hz = candidate
+                else:
+                    print(f"[camera_subprocess] invalid raw rate {raw_rate_env!r}; "
+                          "using 10 Hz", flush=True)
+            except ValueError:
+                print(f"[camera_subprocess] invalid raw rate {raw_rate_env!r}; "
+                      "using 10 Hz", flush=True)
         try:
             from visual_inputs import RawCameraPublisher
             raw_inputs = RawCameraPublisher(

@@ -282,7 +282,8 @@ class VisualOdometryNode:
             self.raw_control.publish(self.Bool(data=bool(enabled)))
         except Exception:
             # The publisher is best-effort lifecycle plumbing; losing one
-            # message must not take the card down. Camera-side default is on.
+            # message must not take the card down. Camera-side default is off
+            # until the retained enable arrives.
             pass
 
     def _new_segment(self):

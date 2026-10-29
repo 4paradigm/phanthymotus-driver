@@ -181,7 +181,7 @@ def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(
     monkeypatch.setitem(sys.modules, 'visual_inputs',
                         NS(RawCameraPublisher=RawCameraPublisher))
     device._camera_subprocess('robot')
-    assert seen[0] == ('init', 'robot', 0.0)
+    assert seen[0] == ('init', 'robot', 0.1)
     assert [step[0] for step in seen] == ['init', 'publish']
     assert state.published['/robot/camera/color']
     assert state.published['/robot/camera/depth']
@@ -366,3 +366,23 @@ def test_camera_starts_raw_disabled_until_the_latched_enable_arrives(capture, mo
     assert len(state.published['/robot/camera/color']) == 3
     assert state.node.subscription_qos[
         '/robot/odometry_input/raw_enabled'].durability == 'transient_local'
+
+
+@pytest.mark.parametrize('value', ['0', '-5', 'nan', 'inf', 'not-a-number', ''])
+def test_invalid_raw_rate_falls_back_to_the_documented_default(capture, monkeypatch, value):
+    device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY_MAX_FPS', value)
+    seen = []
+
+    class RawCameraPublisher:
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs.get('min_interval_s'))
+
+        def publish(self, source_frames, aligned_frames):
+            pass
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(RawCameraPublisher=RawCameraPublisher))
+    device._camera_subprocess('robot')
+    assert len(seen) == 1 and abs(seen[0]-0.1) < 1e-9
