@@ -40,6 +40,7 @@ except ImportError:  # imported as a top-level /work module inside the bundle im
 PACKAGE = 'rtabmap_odom'
 EXECUTABLE = 'rgbd_odometry'
 OUTPUT_TOPIC = '/bumi_visual_odometry/state/odom'
+STATUS_TOPIC = '/bumi_visual_odometry/status'
 
 
 # ── Estimator launch contract ────────────────────────────────────────────────
@@ -220,6 +221,7 @@ class VisualOdometryNode:
         self.closed = False
         self.output = OUTPUT_TOPIC
         self.publisher = self.node.create_publisher(String, self.output, self.qos)
+        self.status_publisher = self.node.create_publisher(String, STATUS_TOPIC, self.qos)
         self.directory = tempfile.TemporaryDirectory(prefix='bumi-visual-odometry-')
         self.children = ChildProcesses(self.directory.name)
         self.input_subs = []
@@ -261,6 +263,9 @@ class VisualOdometryNode:
         self.diagnostic_pending = OrderedDict()
         self.diagnostic_started = False
         self.last_visual_monotonic = None
+        self.summary_origin = None
+        self.last_summary_ns = None
+        self.last_summary_state = None
 
     def base_frame(self):
         return self.segment+'_base'
@@ -274,14 +279,46 @@ class VisualOdometryNode:
             sample['vendor'].update(status='initializing', reason='visual odometry stopped')
             sample['pose'] = None
         self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
+        self.publish_status(sample)
         return sample
+
+    def publish_status(self, sample):
+        quality = sample['vendor']
+        state = (quality['status'], quality['reason'])
+        now = time.monotonic_ns()
+        if (self.last_summary_ns is not None and now-self.last_summary_ns < 200_000_000
+                and state == self.last_summary_state):
+            return
+        position = sample['pose']['position'] if sample['pose'] is not None else None
+        distance = None
+        if position is not None:
+            if self.summary_origin is None:
+                self.summary_origin = list(position)
+            distance = math.sqrt(sum((a-b)**2 for a, b in zip(position, self.summary_origin)))
+        stamp = quality['visual_stamp_ns']
+        summary = dict(status=quality['status'],
+                       displacement_m=round(distance, 3) if distance is not None else None,
+                       position_m=[round(v, 3) for v in position] if position is not None else None,
+                       pose_reference=quality['pose_reference'],
+                       age_ms=round((quality['published_ns']-stamp)/1e6, 1)
+                       if stamp is not None else None,
+                       reason=quality['reason'])
+        self.status_publisher.publish(self.String(data=json.dumps(summary, allow_nan=False)))
+        self.last_summary_ns, self.last_summary_state = now, state
 
     def info(self):
         from common.odom import build_interface
         sample = self.publish()
         return dict(state='running' if self.active else 'idle',
-                    topic_out=[{'topic': self.output, 'format': 'state/odom',
+                    topic_out=[{'topic': STATUS_TOPIC, 'format': 'data/json',
                                 'message_type': 'std_msgs/msg/String'}],
+                    odom_topic=self.output,
+                    sample=sample,
+                    # The existing canvas details dialog renders info.description.
+                    description=('Read-only RGB-D visual odometry. Full odometry: '+self.output+
+                                 '\nDisplacement is from the first tracking pose after reset, '
+                                 'not accumulated path length.\nDiagnostics:\n'+
+                                 json.dumps(sample, indent=2, allow_nan=False)),
                     odom_interface=build_interface(provides=[], rate_hz=20,
                                                    pose_drift='unbounded'),
                     quality=sample['vendor'],
@@ -588,7 +625,8 @@ class VisualOdometryPlugin:
             'type': 'sensor',
             'multiInstance': False,
             'description': ('Bumi RGB-D visual odometry (RTAB-Map rgbd_odometry), read-only — '
-                            f'no IMU/EKF/fusion, not in the motion path. Publishes to {OUTPUT_TOPIC}'),
+                            'no IMU/EKF/fusion, not in the motion path. '
+                            f'Canvas status: {STATUS_TOPIC}; full odometry: {OUTPUT_TOPIC}'),
             'inputSchema': {'type': 'object', 'properties': {
                 'action': {'type': 'string',
                            'enum': ['start', 'stop', 'info', 'reset', 'config']}}},
@@ -596,7 +634,7 @@ class VisualOdometryPlugin:
                 'calibration': {'type': 'object',
                                 'description': 'Optional measured camera_to_body mount; '
                                                'without it the pose stays in the optical frame'}}},
-            'topic_out': [{'topic': OUTPUT_TOPIC, 'format': 'state/odom'}],
+            'topic_out': [{'topic': STATUS_TOPIC, 'format': 'data/json'}],
         }]
 
     def start(self) -> None:

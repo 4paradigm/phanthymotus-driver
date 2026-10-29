@@ -19,12 +19,34 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | --- | --- |
 | Tool / card | `rgbd_visual_odometry` (sensor, read-only) |
 | MCP actions | `start`, `stop`, `info`, `reset`, `config` |
-| Output | `/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, port format `state/odom` |
+| Canvas output | `/bumi_visual_odometry/status`, `std_msgs/msg/String`, port format `data/json`, about 5 Hz |
+| Full ROS output | `/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, 20 Hz |
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
 
 `stop` only reaps the estimator child and the card's private topics. The camera,
 `camera`/`depth` cards, photo/video capture, audio and every motion card keep
 running.
+
+The canvas displays only `status`, `displacement_m`, `position_m`,
+`pose_reference`, `age_ms` and `reason`. Positions and displacement are rounded
+to millimetres for display; the full odometry retains its original precision.
+Displacement is the 3-D straight-line distance from the **first tracking pose of
+the current segment**, not accumulated walking distance or validated accuracy.
+Without a measured mount the reference is `rgb_optical` (x right, y down, z
+forward), not robot body axes. Reset starts a new segment and distance origin.
+
+Only the summary is declared as a canvas output, because the monitor creates a
+panel for every declared output. Existing ROS subscribers can continue using
+`/bumi_visual_odometry/state/odom`. The card's details button fetches `info`, whose
+description contains the complete current sample, including covariance, timing,
+segment/calibration IDs and visual diagnostics; the same sample is returned as
+`sample`, with `odom_topic` pointing to the original ROS output. Details are a
+snapshot: reopen them to refresh.
+
+The 20 Hz supervision and 500 ms stale-input protection are unchanged. Status
+transitions publish immediately even between 5 Hz summary updates. Lost or
+stopped output clears both displayed position and displacement rather than
+repeating the last valid pose.
 
 ## Inputs
 
