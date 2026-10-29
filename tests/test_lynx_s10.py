@@ -75,8 +75,7 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert "loco" in card_names and "motion" not in card_names
     assert {"imu", "loco_state", "joints", "joint_state", "battery"} <= card_names
     assert "errors" not in card_names
-    assert {"camera_0", "camera_1", "camera_2"} <= card_names
-    assert "camera_3" not in card_names
+    assert {"camera_0", "camera_1", "camera_2", "camera_3"} <= card_names
     assert "device" not in card_names
     assert not card_names.intersection({"motion_info", "native_basic_status", "native_device_status", "hard_estop", "charge_status"})
     assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
@@ -470,6 +469,29 @@ def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
     assert result["joints"][-1]["q"] == 1.5
     assert result["joints"][0]["temperature"] == [30]
     assert result["imu_quat"] == [1, 0, 0, 0]
+
+
+def test_joints_are_reordered_by_data_id_and_name(monkeypatch):
+    device = _load_device(monkeypatch)
+    raw = [
+        {"name": [70, 82, 72, 88], "data_id": 4, "position": 4.0},
+        {"name": "FLHX", "data_id": 0, "position": 1.0},
+    ]
+    ordered = device._order_joints(raw)
+    assert ordered[0]["position"] == 1.0
+    assert ordered[4]["position"] == 4.0
+    assert ordered[1] is None
+
+
+def test_battery_fields_are_flattened_recursively(monkeypatch):
+    device = _load_device(monkeypatch)
+    result = {}
+    device._flatten_fields({"level": 87, "cells": [{"voltage": 3.7}, {"voltage": 3.8}]}, "battery_0", result)
+    assert result == {
+        "battery_0_level": 87,
+        "battery_0_cells_0_voltage": 3.7,
+        "battery_0_cells_1_voltage": 3.8,
+    }
 
 
 def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):

@@ -104,6 +104,7 @@ class S10Nodes:
             "camera_0": "/usb_camera_1/image_raw",
             "camera_1": "/usb_camera_1/image_raw_0",
             "camera_2": "/usb_camera_1/image_raw_1",
+            "camera_3": "/usb_camera_1/image_raw_2",
         })
         self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
                             for key in camera_topics})
@@ -233,14 +234,17 @@ class S10Nodes:
         values = jsonable(msg)
         data = values.get("data", {})
         joints = values.get("joints_data", data.get("joints_data", []) if isinstance(data, dict) else data)
-        motor_status = {"Joint": joints}
-        self._publish_json("joints", _skeleton_payload({"MotorStatus": motor_status}))
+        ordered = _order_joints(joints)
+        motor_status = {"Joint": ordered}
+        self._publish_json("joints", _skeleton_payload({"MotorStatus": motor_status}, raw_joints=ordered))
         flat = {}
-        for index, joint in enumerate(joints if isinstance(joints, list) else []):
-            name = JOINT_NAMES[index] if index < len(JOINT_NAMES) else f"joint_{index}"
+        for index, joint in enumerate(ordered):
+            name = JOINT_NAMES[index]
             for field, aliases in {
                 "q": ("q", "position"), "dq": ("dq", "velocity"),
                 "tau": ("tau", "torque"), "temperature": ("temperature", "motion_temp"),
+                "driver_temp": ("driver_temp",), "data_id": ("data_id",),
+                "status_word": ("status_word",),
             }.items():
                 value = _joint_value(joint, *aliases)
                 if value is not None:
@@ -254,16 +258,7 @@ class S10Nodes:
         batteries = values.get("data", []) if isinstance(values, dict) else []
         payload = {}
         for index, battery in enumerate(batteries if isinstance(batteries, list) else []):
-            if not isinstance(battery, dict):
-                continue
-            for key, value in battery.items():
-                if isinstance(value, (dict, list)):
-                    if isinstance(value, list):
-                        for item_index, item in enumerate(value):
-                            if not isinstance(item, (dict, list)):
-                                payload[f"battery_{index}_{key}_{item_index}"] = item
-                    continue
-                payload[f"battery_{index}_{key}"] = value
+            _flatten_fields(battery, f"battery_{index}", payload)
         self._publish_json("battery", payload)
 
     def _forward_loco_state(self, msg):
@@ -406,13 +401,89 @@ def _joint_value(joint, *keys):
     return None
 
 
-def _skeleton_payload(items):
+def _joint_name(value):
+    if isinstance(value, (list, tuple)):
+        try:
+            return bytes(int(item) & 0xff for item in value).decode("ascii", "ignore").rstrip("\x00").upper()
+        except (TypeError, ValueError):
+            return ""
+    return str(value or "").strip().upper()
+
+
+_JOINT_ALIASES = {name.upper(): index for index, name in enumerate(JOINT_NAMES)}
+_JOINT_ALIASES.update({
+    f"{prefix}{axis}": index
+    for index, (prefix, axis) in enumerate((
+        ("FL", "HX"), ("FL", "HY"), ("FL", "KN"), ("FL", "WH"),
+        ("FR", "HX"), ("FR", "HY"), ("FR", "KN"), ("FR", "WH"),
+        ("HL", "HX"), ("HL", "HY"), ("HL", "KN"), ("HL", "WH"),
+        ("HR", "HX"), ("HR", "HY"), ("HR", "KN"), ("HR", "WH"),
+    ))
+})
+
+
+def _joint_index(joint):
+    if not isinstance(joint, dict):
+        return None
+    name = _joint_name(joint.get("name", joint.get("Name", "")))
+    if name in _JOINT_ALIASES:
+        return _JOINT_ALIASES[name]
+    compact = name.replace("_JOINT", "").replace("_", "")
+    if compact in _JOINT_ALIASES:
+        return _JOINT_ALIASES[compact]
+    try:
+        data_id = int(joint.get("data_id", joint.get("DataId", -1)))
+    except (TypeError, ValueError):
+        data_id = -1
+    if 0 <= data_id < len(JOINT_NAMES):
+        return data_id
+    return None
+
+
+def _order_joints(raw_joints):
+    if not isinstance(raw_joints, list):
+        return [None] * len(JOINT_NAMES)
+    ordered = [None] * len(JOINT_NAMES)
+    indexed = [_joint_index(joint) for joint in raw_joints]
+    usable = sum(index is not None for index in indexed)
+    if usable:
+        # Some firmware revisions number data_id from one through sixteen;
+        # detect that convention only when the complete set is present.
+        raw_ids = []
+        for joint in raw_joints:
+            try:
+                raw_ids.append(int(joint.get("data_id", joint.get("DataId", -1))))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        if len(raw_ids) == len(JOINT_NAMES) and set(raw_ids) == set(range(1, len(JOINT_NAMES) + 1)):
+            indexed = [int(joint.get("data_id", joint.get("DataId"))) - 1
+                       if isinstance(joint, dict) else None for joint in raw_joints]
+        for joint, index in zip(raw_joints, indexed):
+            if index is not None and 0 <= index < len(ordered) and ordered[index] is None:
+                ordered[index] = joint
+        return ordered
+    return (raw_joints + [None] * len(JOINT_NAMES))[:len(JOINT_NAMES)]
+
+
+def _flatten_fields(value, prefix, output):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _flatten_fields(child, f"{prefix}_{key}", output)
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _flatten_fields(child, f"{prefix}_{index}", output)
+    else:
+        output[prefix] = value
+
+
+def _skeleton_payload(items, raw_joints=None):
     motor_status = items.get("MotorStatus", {})
-    raw_joints = motor_status.get("Joint", []) if isinstance(motor_status, dict) else []
+    if raw_joints is None:
+        raw_joints = motor_status.get("Joint", []) if isinstance(motor_status, dict) else []
     if isinstance(raw_joints, dict):
         raw_joints = raw_joints.get("Joint", raw_joints.get("Data", []))
-    if not isinstance(raw_joints, list):
-        raw_joints = []
+    source_count = len(raw_joints) if isinstance(raw_joints, list) else 0
+    raw_joints = _order_joints(raw_joints)
     joints = []
     for idx, name in enumerate(JOINT_NAMES):
         raw = raw_joints[idx] if idx < len(raw_joints) else None
@@ -423,7 +494,7 @@ def _skeleton_payload(items):
             "tau": _joint_value(raw, "tau", "Tau", "torque", "Torque", "TorqueEst"),
             "temperature": _joint_value(raw, "temperature", "Temperature", "Temp", "motion_temp", "driver_temp"),
         })
-    payload = {"format": "sensor/skeleton", "available": len(raw_joints) >= len(JOINT_NAMES), "joints": joints}
+    payload = {"format": "sensor/skeleton", "available": source_count >= len(JOINT_NAMES), "joints": joints}
     motion = items.get("MotionStatus", {})
     try:
         roll, pitch, yaw = (float(motion[key]) for key in ("Roll", "Pitch", "Yaw"))
