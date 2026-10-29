@@ -75,6 +75,8 @@ def test_pro_config_registers_navigation_and_matches_marketplace_cards(monkeypat
     assert "loco" in card_names and "motion" not in card_names
     assert {"imu", "loco_state", "joints", "joint_state", "battery"} <= card_names
     assert "errors" not in card_names
+    assert {"camera_0", "camera_1", "camera_2", "camera_3"} <= card_names
+    assert "device" not in card_names
     assert not card_names.intersection({"motion_info", "native_basic_status", "native_device_status", "hard_estop", "charge_status"})
     assert any(plugin.__class__.__name__ == "S10NavigationPlugin" for plugin in plugins)
     assert config["mcp_port"] == driver["port"] == 15724
@@ -176,6 +178,12 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
 
     class Imu: pass
     class PointCloud2: pass
+    class Image: pass
+    class CompressedImage:
+        def __init__(self):
+            self.header = None
+            self.format = ""
+            self.data = []
     class JointsData: pass
     class BatteryData: pass
     class MotionInfo: pass
@@ -186,6 +194,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     qos_module.qos_profile_sensor_data = object()
     sensor_msg = ModuleType("sensor_msgs.msg")
     sensor_msg.Imu, sensor_msg.PointCloud2 = Imu, PointCloud2
+    sensor_msg.Image, sensor_msg.CompressedImage = Image, CompressedImage
     standard_msg = ModuleType("std_msgs.msg")
     standard_msg.String, standard_msg.UInt8MultiArray = String, UInt8MultiArray
     drdds_msg = ModuleType("drdds.msg")
@@ -196,11 +205,24 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     }.items():
         monkeypatch.setitem(__import__("sys").modules, module_name, module)
 
+    class FakeBridge:
+        def __init__(self, *_args):
+            self.publishers = {}
+        def create_publisher(self, lane, topic, _msg_type):
+            publisher = FakePublisher()
+            self.publishers[lane] = publisher
+            return publisher
+        def stats(self, _lane):
+            return {"enqueued": 1, "dropped": 0, "alive": True}
+        def stop(self):
+            pass
+    monkeypatch.setattr(device, "CoreBridge", FakeBridge)
+
     ros2 = SimpleNamespace(
         ctx_robot=object(), ctx_core=object(),
         executor_robot=Executor(), executor_core=Executor(),
     )
-    nodes = device.S10Nodes({}, "robot", ros2)
+    nodes = device.S10Nodes({"camera_topics": {"camera_0": "/CAMERA/RAW"}}, "robot", ros2)
     callbacks = nodes.robot.subscriptions
 
     imu = SimpleNamespace(linear_acceleration=SimpleNamespace(x=1.0, y=2.0, z=3.0))
@@ -226,6 +248,14 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     loco_state = json.loads(nodes.publishers["loco_state"].messages[-1].data)
     assert loco_state["vel_x"] == 0.3
 
+    camera_msg = SimpleNamespace(width=2, height=1, step=6, encoding="rgb8",
+                                 data=bytes((255, 0, 0, 0, 255, 0)), header={"stamp": 1})
+    callbacks["/CAMERA/RAW"](camera_msg)
+    camera_output = nodes.camera_publishers["camera_0"].messages[-1]
+    assert camera_output.format == "jpeg"
+    assert bytes(camera_output.data).startswith(b"\xff\xd8")
+    assert camera_output.header == camera_msg.header
+
     point_data = struct.pack("<ffffff", 1.0, 2.0, 3.0, math.nan, 5.0, 6.0)
     lidar = SimpleNamespace(
         fields=[SimpleNamespace(name=name, offset=offset) for name, offset in (("x", 0), ("y", 4), ("z", 8))],
@@ -241,6 +271,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert stream_status["imu"]["received"] == stream_status["imu"]["published"] == 1
     assert stream_status["joints"]["received"] == stream_status["joint_state"]["received"] == 1
     assert stream_status["lidar"]["received"] == stream_status["lidar"]["published"] == 1
+    assert stream_status["camera_0"]["received"] == stream_status["camera_0"]["published"] == 1
     nodes.close()
 
 
@@ -259,6 +290,14 @@ def test_lidar_packet_uniformly_caps_large_point_cloud(monkeypatch):
     assert (point_step, point_count) == (12, 2000)
     assert struct.unpack_from("<f", encoded, 8)[0] == 0.0
     assert struct.unpack_from("<f", encoded, 8 + (point_count - 1) * point_step)[0] == 9995.0
+
+
+def test_camera_ros_image_encodes_to_frontend_jpeg(monkeypatch):
+    device = _load_device(monkeypatch)
+    msg = SimpleNamespace(width=2, height=1, step=6, encoding="rgb8",
+                          data=bytes((255, 0, 0, 0, 255, 0)))
+    encoded = device.S10Nodes._jpeg_from_ros_image(msg)
+    assert encoded.startswith(b"\xff\xd8") and encoded.endswith(b"\xff\xd9")
 
 
 def test_model_resource_returns_official_urdf(monkeypatch):
@@ -304,6 +343,9 @@ def test_main_builds_constrained_fastdds_profile_before_runtime(monkeypatch, tmp
     assert addresses == ["127.0.0.1", "10.21.33.103"]
     assert root.find(".//{*}useBuiltinTransports").text == "false"
     assert module.os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] == str(profile)
+    core_profile = ET.parse(module.os.environ["S10_CORE_FASTDDS_PROFILE"]).getroot()
+    core_addresses = [node.text for node in core_profile.findall(".//{*}interfaceWhiteList/{*}address")]
+    assert core_addresses == ["127.0.0.1"]
 
 
 def test_main_fails_closed_for_missing_or_mismatched_robot_network(monkeypatch, tmp_path):
@@ -363,6 +405,53 @@ def test_service_configures_verified_s10_robot_network_without_shell_exports():
     assert environment["ROBOT_NETWORK_CIDR"] == "10.21.33.0/24"
     config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
     assert config["basic_server"]["host"] == "10.21.33.103"
+
+
+def test_core_domain_bridge_is_spawned_and_uses_bounded_latest_value_lanes():
+    source = (DRIVER / "domain_bridge.py").read_text(encoding="utf-8")
+    assert 'mp.get_context("spawn")' in source
+    assert "Queue(maxsize=1)" in source
+    assert 'os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile' in source
+    assert 'os.environ["ROS_DOMAIN_ID"] = str(domain)' in source
+    assert "interfaceWhiteList" not in source
+
+
+def test_vendor_runtime_can_skip_core_context_for_process_isolated_bridge(monkeypatch):
+    from common import vendor_runtime
+
+    calls = []
+
+    class Context:
+        pass
+
+    class Executor:
+        def __init__(self, context):
+            self.context = context
+        def shutdown(self):
+            pass
+
+    class FakeRclpy:
+        class executors:
+            MultiThreadedExecutor = Executor
+        @staticmethod
+        def init(*, context, domain_id):
+            calls.append((context, domain_id))
+        @staticmethod
+        def ok(*, context):
+            return True
+        @staticmethod
+        def shutdown(*, context):
+            calls.append(("shutdown", context))
+
+    monkeypatch.setitem(__import__("sys").modules, "rclpy", FakeRclpy)
+    monkeypatch.setitem(__import__("sys").modules, "rclpy.executors", FakeRclpy.executors)
+    monkeypatch.setitem(__import__("sys").modules, "rclpy.context",
+                        SimpleNamespace(Context=Context))
+    ros = vendor_runtime.DualDomainROS2(0, None)
+    assert len([call for call in calls if isinstance(call, tuple) and len(call) == 2
+                and call[1] == 0]) == 1
+    assert ros.ctx_core is None and ros.executor_core is None
+    ros.shutdown()
 
 
 def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
@@ -486,7 +575,7 @@ def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeyp
     plugin._acp_callback = lambda *_args: None
     definition = plugin.get_tool()
     assert set(definition["inputSchema"]["x-completion"]["actions"]) == {
-        "move", "manual_control", "stand_up", "stand_down", "damp", "gait", "mode",
+        "move", "manual_control", "stand_up", "stand_down", "damp", "gait",
     }
     assert "enter_rl_control" not in definition["inputSchema"]["x-action-params"]
     assert definition["inputSchema"]["x-completion"]["timeout"] > 60
@@ -662,7 +751,6 @@ def test_actuator_lifecycle_never_starts_charging_or_sends_idle_commands(monkeyp
     native = FakeNative({"navigation_task_timeout": 45})
     plugins = [
         device.S10MotionPlugin(native),
-        device.S10DevicePlugin(native),
         device.S10ChargePlugin(native),
         device.S10NavigationPlugin(native),
     ]
@@ -673,7 +761,7 @@ def test_actuator_lifecycle_never_starts_charging_or_sends_idle_commands(monkeyp
         assert plugin.dispatch("info", {}) == {"state": "ready"}
     assert native.calls == []
 
-    charging = plugins[2]
+    charging = plugins[1]
     charging.dispatch("start_charging", {"confirm": True})
     assert native.calls[-1][0] == (0x00100004, 0x00100002, {"Charge": 1})
     charging.dispatch("stop_charging", {"confirm": True})
@@ -712,10 +800,6 @@ def test_dangerous_s10_commands_require_literal_confirmation(monkeypatch):
     cases = [
         (device.S10NavigationPlugin(native), "goal"),
         (device.S10NavigationPlugin(native), "localize"),
-        (device.S10DevicePlugin(native), "sleep"),
-        (device.S10DevicePlugin(native), "wake"),
-        (device.S10DevicePlugin(native), "auto_sleep"),
-        (device.S10DevicePlugin(native), "sdk_mode"),
         (device.S10ChargePlugin(native), "start_charging"),
         (device.S10ChargePlugin(native), "stop_charging"),
     ]
@@ -739,11 +823,11 @@ def test_control_schema_exposes_supported_navigation_and_light_options(monkeypat
     assert set(localize_params) == {"x", "y", "z", "yaw_degrees", "confirm"}
     assert {"head_color", "tail_color", "head_effect", "tail_effect"} <= set(light_params)
     assert light_tool["name"] == "light"
+    properties = light_tool["inputSchema"]["properties"]
+    assert properties["head_cycle_seconds"]["x-visible-when"] == {"head_effect": ["呼吸", "闪烁"]}
+    assert properties["tail_cycle_seconds"]["x-visible-when"] == {"tail_effect": ["呼吸", "闪烁"]}
 
-    device_schema = device.S10DevicePlugin(native).get_tool()["inputSchema"]
     charge_schema = device.S10ChargePlugin(native).get_tool()["inputSchema"]
-    assert device_schema["x-is-dangerous"] is True
-    assert "confirm" in device_schema["x-action-params"]["sleep"]["params"]
     assert charge_schema["x-is-dangerous"] is True
     assert "confirm" in charge_schema["x-action-params"]["start_charging"]["params"]
     assert "confirm" in charge_schema["x-action-params"]["stop_charging"]["params"]

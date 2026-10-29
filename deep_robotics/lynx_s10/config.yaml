@@ -5,15 +5,21 @@ model_variant: "pro"
 navigation_task_timeout: 180
 ros:
   robot_domain_id: 0
-  core_domain_id: 42
+  core_domain_id: null
 # service.yml targets the S10 onboard host: robot_server runs there and listens
-# on TCP 30003. NETWORK_INTERFACE/CIDR constrain both ROS contexts to its robot NIC.
+# on TCP 30003. NETWORK_INTERFACE/CIDR constrain robot-domain DDS; domain 42 is
+# published only by isolated loopback-profiled subprocesses.
 topics:
   imu: "/IMU"
   joints: "/JOINTS_DATA_10HZ"
   battery: "/BATTERY_DATA"
   motion_info: "/MOTION_INFO"
   lidar: "/LIDAR/POINTS"
+camera_topics:
+  camera_0: "/usb_camera_1/image_raw"
+  camera_1: "/usb_camera_1/image_raw_0"
+  camera_2: "/usb_camera_1/image_raw_1"
+  camera_3: "/usb_camera_1/image_raw/compressed"
 basic_server:
   enabled: true
   # On the onboard host, robot_server is reachable at this host address. For a

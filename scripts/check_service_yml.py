@@ -63,12 +63,10 @@ OWN_PROFILE = {
     'agibot/A3': 'main.py generates a constrained robot+loopback FastDDS profile; the '
                  'robot-domain-232 context must reach 10.42.10.x while the isolated '
                  'domain-42 bridge uses loopback.',
-    'deep_robotics/lynx_s10': 'main.py generates one process-wide FastDDS profile '
-                              'restricted to loopback and the configured robot-facing '
-                              'interface for both ROS contexts. NETWORK_INTERFACE and '
-                              'ROBOT_NETWORK_CIDR must identify an isolated private robot '
-                              'subnet containing both this host and the S10 basic_server; '
-                              'startup fails closed if selection is missing or inconsistent.',
+    'deep_robotics/lynx_s10': 'the robot-domain subscriber runs with a constrained '
+                              'robot-interface profile; core-domain publishers run in '
+                              'separate spawned processes using a loopback-only profile '
+                              'and bounded IPC queues (domain_bridge.py).',
 }
 
 REQUIRED_ENV = {

@@ -27,7 +27,7 @@ def _interface_ipv4(interface):
 
 
 def configure_fastdds_profile(config):
-    """Constrain both FastDDS contexts to loopback and a validated robot-only NIC."""
+    """Configure the robot process and a separate loopback-only core bridge."""
     ros_config = config.get("ros", {})
     interface = os.environ.get("NETWORK_INTERFACE") or ros_config.get("robot_interface")
     if not interface or len(interface.encode()) > 15:
@@ -71,8 +71,23 @@ def configure_fastdds_profile(config):
   </rtps></participant>
 </profiles></dds>''', encoding="utf-8")
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(profile_path)
-    print(f"[ros2] FastDDS restricted to loopback and validated robot subnet "
+    core_profile = profile_path.with_name("lynx-s10-core-fastdds.xml")
+    core_profile.write_text('''<?xml version="1.0" encoding="UTF-8"?>
+<dds xmlns="http://www.eprosima.com"><profiles>
+  <transport_descriptors><transport_descriptor>
+    <transport_id>s10_core_loopback</transport_id><type>UDPv4</type>
+    <interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>
+  </transport_descriptor></transport_descriptors>
+  <participant profile_name="s10_core_loopback" is_default_profile="true"><rtps>
+    <userTransports><transport_id>s10_core_loopback</transport_id></userTransports>
+    <useBuiltinTransports>false</useBuiltinTransports>
+  </rtps></participant>
+</profiles></dds>''', encoding="utf-8")
+    os.environ["S10_CORE_FASTDDS_PROFILE"] = str(core_profile)
+    print(f"[ros2] robot-domain FastDDS restricted to loopback and validated robot subnet "
           f"{robot_network} via {interface} ({interface_address.ip})", flush=True)
+    print("[ros2] Agent Core domain 42 will publish only from loopback-profiled bridge processes",
+          flush=True)
     return profile_path
 
 if __name__ == "__main__":

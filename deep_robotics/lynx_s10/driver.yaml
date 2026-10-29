@@ -6,7 +6,7 @@ hardware_model: "lynx-s10"
 image_name: deep-robotics-lynx-s10
 port: 15724
 mcp_url: "http://localhost:15724/mcp"
-description: "Lynx S10 Pro TCP native state, motion, device, charging and navigation controls"
+description: "Lynx S10 Pro native TCP motion, camera and sensor streams, lighting, charging and navigation"
 build_context_extras:
   - ../../common
 cards:
@@ -18,9 +18,12 @@ cards:
   - { name: loco_state,            type: sensor }
   - { name: battery,               type: sensor }
   - { name: lidar,                 type: sensor }
+  - { name: camera_0,              type: sensor }
+  - { name: camera_1,              type: sensor }
+  - { name: camera_2,              type: sensor }
+  - { name: camera_3,              type: sensor }
   - { name: navigation_status,     type: sensor }
   - { name: loco,                  type: actuator }
   - { name: light,                 type: actuator }
-  - { name: device,                type: actuator }
   - { name: charging,              type: actuator }
   - { name: navigation,            type: actuator }

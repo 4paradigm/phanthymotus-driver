@@ -17,6 +17,7 @@ from pathlib import Path
 
 from basic_server import BasicServerClient, _protocol_int
 from common.vendor_runtime import action_schema, tool
+from domain_bridge import CoreBridge
 
 
 def _mark_dangerous(result, actions):
@@ -60,14 +61,14 @@ class S10Nodes:
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
         from drdds.msg import BatteryData, JointsData, MotionInfo
-        from sensor_msgs.msg import Imu, PointCloud2
+        from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
         from std_msgs.msg import String
 
         self.json = json
         self.robot = Node("lynx_s10_driver_robot", context=ros2.ctx_robot)
-        self.core = Node("lynx_s10_driver_core", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self.robot)
-        ros2.executor_core.add_node(self.core)
+        self.bridge = CoreBridge(os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/lynx-s10-core-fastdds.xml"),
+                                 int(config.get("ros", {}).get("core_domain_id") or 42))
         prefix = f"/{namespace}/" if namespace else "/"
         base = prefix + "lynx_s10/"
         self.topics = {
@@ -78,12 +79,26 @@ class S10Nodes:
             "battery": {"topic": base + "battery", "format": "data/json"},
             "lidar": {"topic": base + "lidar", "format": "sensor/pointcloud"},
         }
+        camera_topics = config.get("camera_topics", {
+            "camera_0": "/usb_camera_1/image_raw",
+            "camera_1": "/usb_camera_1/image_raw_0",
+            "camera_2": "/usb_camera_1/image_raw_1",
+        })
+        self.topics.update({key: {"topic": base + key, "format": "image/jpeg"}
+                            for key in camera_topics})
         self.publishers = {
-            key: self.core.create_publisher(String, spec["topic"], 10)
+            key: self.bridge.create_publisher(key, spec["topic"], String)
             for key, spec in self.topics.items() if key != "lidar"
+            and not key.startswith("camera_")
         }
         from std_msgs.msg import UInt8MultiArray
-        self.lidar_publisher = self.core.create_publisher(UInt8MultiArray, self.topics["lidar"]["topic"], 2)
+        self.lidar_publisher = self.bridge.create_publisher(
+            "lidar", self.topics["lidar"]["topic"], UInt8MultiArray)
+        from sensor_msgs.msg import CompressedImage
+        self.camera_publishers = {
+            key: self.bridge.create_publisher(key, self.topics[key]["topic"], CompressedImage)
+            for key in camera_topics
+        }
         topics = config.get("topics", {})
         self._stream_lock = threading.Lock()
         self._stream_stats = {
@@ -91,6 +106,10 @@ class S10Nodes:
                    "last_received": None, "last_published": None}
             for name in self.topics
         }
+        self._motion_lock = threading.Lock()
+        self.motion_sequence = 0
+        self.motion_state = None
+        self.gait_state = None
         self._source_topics = {
             "imu": topics.get("imu", "/IMU"),
             "joints": topics.get("joints", "/JOINTS_DATA_10HZ"),
@@ -99,11 +118,20 @@ class S10Nodes:
             "loco_state": topics.get("motion_info", "/MOTION_INFO"),
             "lidar": topics.get("lidar", "/LIDAR/POINTS"),
         }
+        self._source_topics.update(camera_topics)
         self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
         self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, qos_profile_sensor_data)
         self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, qos_profile_sensor_data)
         self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, qos_profile_sensor_data)
         self.robot.create_subscription(PointCloud2, topics.get("lidar", "/LIDAR/POINTS"), self._forward_lidar, qos_profile_sensor_data)
+        for key, source_topic in camera_topics.items():
+            if source_topic.endswith("/compressed"):
+                self.robot.create_subscription(CompressedImage, source_topic,
+                    lambda msg, camera=key: self._forward_compressed_camera(camera, msg),
+                    qos_profile_sensor_data)
+            else:
+                self.robot.create_subscription(Image, source_topic,
+                    lambda msg, camera=key: self._forward_camera(camera, msg), qos_profile_sensor_data)
 
     def _record_stream(self, key, stage):
         now = time.time()
@@ -126,10 +154,10 @@ class S10Nodes:
                 result[key]["robot_publishers"] = self.robot.count_publishers(self._source_topics[key])
             except (AttributeError, RuntimeError):
                 result[key]["robot_publishers"] = None
-            try:
-                result[key]["core_subscribers"] = self.core.count_subscribers(spec["topic"])
-            except (AttributeError, RuntimeError):
-                result[key]["core_subscribers"] = None
+            lane = self.bridge.stats(key)
+            result[key]["bridge_enqueued"] = lane["enqueued"]
+            result[key]["bridge_dropped"] = lane["dropped"]
+            result[key]["bridge_alive"] = lane["alive"]
         return result
 
     def _publish_json(self, key, value):
@@ -165,7 +193,73 @@ class S10Nodes:
         self._record_stream("loco_state", "received")
         from common.vendor_runtime import jsonable
         values = jsonable(msg)
-        self._publish_json("loco_state", values.get("data", values))
+        data = values.get("data", values)
+        motion = data.get("motion_state", {}) if isinstance(data, dict) else {}
+        gait = data.get("gait_state", {}) if isinstance(data, dict) else {}
+        with self._motion_lock:
+            self.motion_sequence += 1
+            self.motion_state = motion.get("state") if isinstance(motion, dict) else None
+            self.gait_state = gait.get("gait") if isinstance(gait, dict) else None
+        self._publish_json("loco_state", data)
+
+    @staticmethod
+    def _jpeg_from_ros_image(msg):
+        from io import BytesIO
+        from PIL import Image as PillowImage
+
+        encoding = str(msg.encoding).lower()
+        mode, raw_mode = {
+            "rgb8": ("RGB", "RGB"), "bgr8": ("RGB", "BGR"),
+            "rgba8": ("RGBA", "RGBA"), "bgra8": ("RGBA", "BGRA"),
+            "mono8": ("L", "L"), "8uc1": ("L", "L"),
+        }.get(encoding, (None, None))
+        if mode is None:
+            return None
+        try:
+            image = PillowImage.frombytes(mode, (int(msg.width), int(msg.height)),
+                                          bytes(msg.data), "raw", raw_mode, int(msg.step), 1)
+            if image.mode == "RGBA":
+                image = image.convert("RGB")
+            stream = BytesIO()
+            image.save(stream, format="JPEG", quality=85, optimize=False)
+            return stream.getvalue()
+        except (ValueError, OSError):
+            return None
+
+    def _forward_camera(self, key, msg):
+        self._record_stream(key, "received")
+        packet = self._jpeg_from_ros_image(msg)
+        if packet is None:
+            self._record_stream(key, "dropped")
+            return
+        from sensor_msgs.msg import CompressedImage
+        output = CompressedImage()
+        output.header = msg.header
+        output.format = "jpeg"
+        output.data = packet
+        self.camera_publishers[key].publish(output)
+        self._record_stream(key, "published")
+
+    def _forward_compressed_camera(self, key, msg):
+        self._record_stream(key, "received")
+        from io import BytesIO
+        from PIL import Image as PillowImage
+        from sensor_msgs.msg import CompressedImage
+
+        try:
+            image = PillowImage.open(BytesIO(bytes(msg.data))).convert("RGB")
+            stream = BytesIO()
+            image.save(stream, format="JPEG", quality=85, optimize=False)
+            packet = stream.getvalue()
+        except (OSError, ValueError):
+            self._record_stream(key, "dropped")
+            return
+        output = CompressedImage()
+        output.header = msg.header
+        output.format = "jpeg"
+        output.data = packet
+        self.camera_publishers[key].publish(output)
+        self._record_stream(key, "published")
 
     def _forward_lidar(self, msg):
         self._record_stream("lidar", "received")
@@ -210,7 +304,7 @@ class S10Nodes:
 
     def close(self):
         self.robot.destroy_node()
-        self.core.destroy_node()
+        self.bridge.stop()
 
 
 LOCO_STATES = {"stand_up": 1, "damp": 2, "stand_down": 4}
@@ -291,7 +385,13 @@ class S10StatePlugin:
             "lidar": "山猫 S10 激光雷达点云（实时 ROS 2 转发）",
         }
         topics = self.nodes.topics if self.nodes else {}
-        return [tool(name, "sensor", description, topic_out=[topics[name]] if name in topics else None) for name, description in cards.items()]
+        for camera in (key for key in topics if key.startswith("camera_")):
+            cards[camera] = f"山猫 S10 机载相机 {camera.removeprefix('camera_')} 图像流；不推断物理方位"
+        definitions = []
+        for name, description in cards.items():
+            outputs = [topics[name]] if name in topics else None
+            definitions.append(tool(name, "sensor", description, topic_out=outputs))
+        return definitions
 
     def _topic_result(self, name, state):
         result = {"state": state}
@@ -324,6 +424,8 @@ class S10StatePlugin:
                 result["ros_streams"] = self.nodes.stream_status()
             return result
         if name == "lidar" and self.nodes: return {"state": "streaming", **self.nodes.topics[name]}
+        if name.startswith("camera_") and self.nodes:
+            return {"state": "streaming", **self.nodes.topics[name]}
         if name not in keys: return {"state": "unsupported_card", "card": name}
         report = reports.get(keys[name])
         # Some firmware revisions serialize Type/Command as decimal strings,
@@ -363,8 +465,9 @@ class S10MotionPlugin:
         "manual_control": (["x", "y", "z", "roll", "pitch", "yaw", "duration"],
                            "六轴归一化手动控制，各分量为-1到1的控制强度，不是角度；仅常规/辅助模式有效"),
     }
-    def __init__(self, native):
+    def __init__(self, native, nodes=None):
         self.native = native
+        self.nodes = nodes
         self._condition = threading.Condition()
         self._active = None
         self._transition_lock = threading.Lock()
@@ -383,6 +486,10 @@ class S10MotionPlugin:
                 print(f"[ACP] {active['action_id']}: {exc}", flush=True)
 
     def _reported_motion_value(self, field):
+        if self.nodes and field in ("MotionState", "Gait"):
+            with self.nodes._motion_lock:
+                value = self.nodes.motion_state if field == "MotionState" else self.nodes.gait_state
+                return value, self.nodes.motion_sequence
         reports = self.native.snapshot().get("reports", {})
         for report in reports.values():
             body = report.get("PatrolDevice", {}) if isinstance(report, dict) else {}
@@ -390,9 +497,9 @@ class S10MotionPlugin:
             basic = items.get("BasicStatus", {}) if isinstance(items, dict) else {}
             if field in basic:
                 try:
-                    return int(basic[field]), report
+                    return int(basic[field]), id(report)
                 except (TypeError, ValueError):
-                    return basic[field], report
+                    return basic[field], id(report)
         return None, None
 
     def _finish_transition(self, action_id, status, result):
@@ -416,7 +523,7 @@ class S10MotionPlugin:
                 if not self._active_transition or self._active_transition["action_id"] != transition["action_id"]:
                     return
             value, report = self._reported_motion_value(transition["field"])
-            if report is not transition["baseline_report"] and value in transition["expected"]:
+            if report != transition["baseline_report"] and value in transition["expected"]:
                 self._finish_transition(transition["action_id"], "completed", {
                     "state": "completed", "action": transition["action"],
                     "observed": {transition["field"]: value},
@@ -432,7 +539,7 @@ class S10MotionPlugin:
         self._stop_stream()
         action_id = f"s10_{action}_{uuid4().hex}"
         _value, baseline_report = self._reported_motion_value(field)
-        sent = self.native.request(message_type, command, items)
+        sent = self.native.send(message_type, command, items)
         transition = {"action_id": action_id, "action": action, "field": field,
                       "expected": set(expected), "timeout": timeout,
                       "baseline_report": baseline_report}
@@ -460,7 +567,7 @@ class S10MotionPlugin:
         }))
         schema = result["inputSchema"]
         schema["x-completion"] = {"actions": ["move", "manual_control", "stand_up", "stand_down",
-                                               "damp", "gait", "mode"], "timeout": 65}
+                                               "damp", "gait"], "timeout": 65}
         return result
     def start(self):
         if not self._thread.is_alive(): self._thread.start()
@@ -547,9 +654,8 @@ class S10MotionPlugin:
                                           {"GaitParam": GAITS[args["gait"]]}, "Gait",
                                           {GAITS[args["gait"]]})
         if action == "mode":
-            return self._start_transition(action, 0x00100002, 0x00500002,
-                                          {"Mode": MODES[args["mode"]]}, "ControlUsageMode",
-                                          {MODES[args["mode"]]})
+            self._stop_stream()
+            return self.native.send(0x00100002, 0x00500002, {"Mode": MODES[args["mode"]]})
         if action in ("manual_control", "axis", "move"):
             axes = ("x", "y", "z", "roll", "pitch", "yaw")
             wire_names = {"x": "X", "y": "Y", "z": "Z", "roll": "Roll", "pitch": "Pitch", "yaw": "Yaw"}
@@ -574,11 +680,11 @@ class S10MotionPlugin:
                 return {"state": "stopped", "sent_zero_to": ["axis", "velocity"], "action_id": action_id}
             self._stop_stream()
             if action == "move":
-                self.native.request(0x00100002, 0x00500002, {"Mode": MODES["navigation"]})
-                self.native.request(0x00100001, 0x00300002, {"GaitParam": GAITS["navigation_flat"]})
+                self.native.send(0x00100002, 0x00500002, {"Mode": MODES["navigation"]})
+                self.native.send(0x00100001, 0x00300002, {"GaitParam": GAITS["navigation_flat"]})
             action_name = "manual_control" if is_manual else action
             action_id = f"s10_{action_name}_{uuid4().hex}"
-            sent = self.native.send(message_type, command, items) if kind in ("axis", "velocity") else self.native.request(message_type, command, items)
+            sent = self.native.send(message_type, command, items)
             with self._condition:
                 now = time.monotonic()
                 self._active = {"kind": kind, "type": message_type, "command": command, "items": items,
@@ -733,7 +839,8 @@ LIGHT_EFFECTS = {"常亮": 0, "填充流水": 1, "移动流水": 2, "渐变流�
 
 
 class S10LightPlugin:
-    ACTIONS = {"set": (["head_color", "tail_color", "head_effect", "tail_effect", "head_cycle_seconds", "tail_cycle_seconds"],
+    ACTIONS = {"set": (["head_color", "tail_color", "head_effect", "tail_effect",
+                        "head_cycle_seconds", "tail_cycle_seconds"],
                         "设置头灯和尾灯的具名颜色与灯效")}
 
     def __init__(self, native): self.native = native
@@ -743,8 +850,12 @@ class S10LightPlugin:
             "tail_color": {"type": "string", "enum": list(LIGHT_COLORS), "default": "白色", "description": "尾灯颜色"},
             "head_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "头灯效果"},
             "tail_effect": {"type": "string", "enum": list(LIGHT_EFFECTS), "default": "常亮", "description": "尾灯效果"},
-            "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1, "description": "头灯呼吸或闪烁周期（秒）"},
-            "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1, "description": "尾灯呼吸或闪烁周期（秒）"},
+            "head_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "头灯呼吸或闪烁周期（秒）",
+                                    "x-visible-when": {"head_effect": ["呼吸", "闪烁"]}},
+            "tail_cycle_seconds": {"type": "integer", "minimum": 1, "default": 1,
+                                    "description": "尾灯呼吸或闪烁周期（秒）",
+                                    "x-visible-when": {"tail_effect": ["呼吸", "闪烁"]}},
         }))
     def start(self): pass
     def stop(self): pass
@@ -762,43 +873,6 @@ class S10LightPlugin:
                 })
             return self.native.request(0x00100005, 0x00200002, {"CustomMode": True, "Led": leds})
         raise ValueError(f"unsupported S10 light action: {action}")
-
-
-class S10DevicePlugin:
-    CONFIRM_ACTIONS = {"sleep", "wake", "auto_sleep", "joint_stream"}
-    ACTIONS = {"sleep": ([], "立即使设备进入休眠"), "wake": ([], "退出休眠并唤醒设备"),
-               "auto_sleep": (["minutes"], "设置心跳断开后自动休眠的等待分钟数"),
-               "joint_stream": (["enabled", "frequency_hz"], "开启/关闭 SDK 关节数据流及其发布频率")}
-    def __init__(self, native): self.native = native
-    def get_tool(self):
-        result = tool("device", "actuator", "山猫 S10 设备电源与关节数据流管理。休眠/唤醒和关节流配置需要显式 confirm=true；灯光请使用 light 卡。", action_schema(self.ACTIONS, {
-            "minutes": {"type": "integer", "minimum": 1, "description": "断开心跳后等待的分钟数"},
-            "enabled": {"type": "boolean", "description": "是否启用 SDK 关节数据流"},
-            "frequency_hz": {"type": "integer", "minimum": 1, "maximum": 200, "description": "关节话题发布频率（Hz）"},
-            "confirm": {"type": "boolean", "description": "休眠、唤醒或更改关节数据流前必须为 true。"},
-        }))
-        return _mark_dangerous(result, self.CONFIRM_ACTIONS)
-    def start(self): pass
-    def stop(self): pass
-    def dispatch(self, action, args):
-        action = "joint_stream" if action == "sdk_mode" else action
-        if action in self.CONFIRM_ACTIONS:
-            error = _confirmation_error(action, args)
-            if error:
-                return error
-        if action == "start": return {"state": "ready"}
-        if action == "stop": return {"state": "idle"}
-        if action == "info": return {"state": "ready"}
-        if action in ("sleep", "wake", "auto_sleep"):
-            items = {"Sleep": action == "sleep", "Auto": action == "auto_sleep"}
-            if action == "auto_sleep": items["Time"] = int(args["minutes"])
-            return self.native.request(0x00100002, 0x00400002, items)
-        if action == "joint_stream":
-            frequency = int(args.get("frequency_hz", 100))
-            if not 1 <= frequency <= 200 or 1000 % frequency:
-                raise ValueError("frequency must be 1..200 Hz and divide 1000")
-            return self.native.request(0x00100005, 0x00300002, {"SDKEnable": bool(args["enabled"]), "Frequency": frequency})
-        raise ValueError(f"unsupported S10 device action: {action}")
 
 
 class S10ChargePlugin:
@@ -828,8 +902,8 @@ class S10ChargePlugin:
 def build_plugins(config, namespace=None, ros2=None):
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
-    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native),
-               S10LightPlugin(native), S10DevicePlugin(native), S10ChargePlugin(native)]
+    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native, nodes),
+               S10LightPlugin(native), S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
         plugins.append(S10NavigationPlugin(native))
     return plugins

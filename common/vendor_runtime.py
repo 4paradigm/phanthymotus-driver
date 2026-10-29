@@ -67,9 +67,12 @@ class DualDomainROS2:
         self.ctx_robot = Context()
         rclpy.init(context=self.ctx_robot, domain_id=robot_domain_id)
         self.executor_robot = rclpy.executors.MultiThreadedExecutor(context=self.ctx_robot)
-        self.ctx_core = Context()
-        rclpy.init(context=self.ctx_core, domain_id=core_domain_id)
-        self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
+        self.ctx_core = None
+        self.executor_core = None
+        if core_domain_id is not None:
+            self.ctx_core = Context()
+            rclpy.init(context=self.ctx_core, domain_id=core_domain_id)
+            self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
         self._threads: list[threading.Thread] = []
 
     def start_spin(self) -> None:
@@ -80,20 +83,21 @@ class DualDomainROS2:
             except Exception as exc:
                 print(f"[ros2] {label} executor stopped: {exc}", flush=True)
 
-        for executor, context, label in (
-            (self.executor_robot, self.ctx_robot, "robot"),
-            (self.executor_core, self.ctx_core, "core"),
-        ):
+        domains = [(self.executor_robot, self.ctx_robot, "robot")]
+        if self.executor_core is not None:
+            domains.append((self.executor_core, self.ctx_core, "core"))
+        for executor, context, label in domains:
             thread = threading.Thread(target=spin, args=(executor, context, label), daemon=True)
             thread.start()
             self._threads.append(thread)
 
     def shutdown(self) -> None:
         self.executor_robot.shutdown()
-        self.executor_core.shutdown()
+        if self.executor_core is not None:
+            self.executor_core.shutdown()
         if self.rclpy.ok(context=self.ctx_robot):
             self.rclpy.shutdown(context=self.ctx_robot)
-        if self.rclpy.ok(context=self.ctx_core):
+        if self.ctx_core is not None and self.rclpy.ok(context=self.ctx_core):
             self.rclpy.shutdown(context=self.ctx_core)
 
 
@@ -340,7 +344,8 @@ def run_driver(
     ros_cfg = config.get("ros", {})
     port = int(config["mcp_port"])
     robot_domain = int(ros_cfg.get("robot_domain_id", 0))
-    core_domain = int(ros_cfg.get("core_domain_id", 42))
+    configured_core_domain = ros_cfg.get("core_domain_id", 42)
+    core_domain = None if configured_core_domain is None else int(configured_core_domain)
     print(f"[bundle] {driver_id} namespace={namespace} domains={robot_domain}->{core_domain} interface={interface} port={port}")
 
     ros2 = DualDomainROS2(robot_domain, core_domain)

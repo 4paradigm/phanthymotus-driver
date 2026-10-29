@@ -16,13 +16,15 @@
 - `navigation_status` 提供导航任务、定位与置信度报告。
 - `loco` 提供 `move`、`stop_move`、`stand_up`、`stand_down`、`damp`、`gait`、`mode` 和 `manual_control`。`move` 的前后/侧向速度单位为 m/s，偏航角速度参数 `yaw_rate_deg_s` 使用度/秒；发给固件前会转换为 rad/s。`manual_control` 是常规/辅助模式的六轴归一化控制强度（-1 到 1），不是角度；普通步态只响应前后、侧移和偏航分量。通过 ASDU 执行 `stand_up` 后会自动进入 RL 运控状态，无需单独切换。持续运动指令 10Hz 刷新，到时自动发零指令；各状态切换会等待状态上报并通过 ACP 发送 action completion。
 - `light` 独立设置头尾灯颜色和效果。颜色使用固件支持的黑、白、绿、蓝具名选项；协议不支持任意 RGB 值。效果使用常亮、流水、渐变、呼吸、闪烁等具名选项，周期单位为秒。
-- `device` 管理休眠/唤醒、心跳断联后的自动休眠时间和 SDK 关节数据流。相关状态/SDK 修改需要显式传入 `confirm=true`；SDK 关节流频率限制为 1–200 Hz 且必须整除 1000。
+- 不注册 `device` 控制卡：休眠/唤醒属于电源与安全管理，不交由 Agent 自主控制；SDK 关节流通过机载配置与标准状态话题提供。
 - `charging` 提供 `start_charging`、`stop_charging` 两个自主充电动作，两者都必须显式传入 `confirm=true`；卡片生命周期的 `start`/`stop` 只报告 `ready`/`idle`，不会触发充电。风险较高的 `Charge=2` 强制清除状态不开放为普通动作。
 - 本设备为 S10 Pro，默认 `model_variant` 设为 `pro` 并注册 `navigation` 动作卡，包含单点任务、取消、状态、定位初始化、地图位姿和感知状态。它只是在机器人当前已加载地图中执行目标点导航，不负责创建地图；使用前必须已有可用地图且定位正常。单点导航和定位初始化必须显式传入 `confirm=true`；导航任务异步返回 action ID 并通过 ACP 报告完成、取消或错误。文档指出非 Pro 版本会以通用错误 `0xE00A` 拒绝导航功能；若将驱动用于标准版，需将配置改为 `standard` 并从 `driver.yaml` 卡片清单移除导航卡。
 
 ## 与参考驱动的差异
 
-传感器和执行卡片沿用仓库常用命名与职责划分。现场 `/IMU`、`/JOINTS_DATA_10HZ`、`/BATTERY_DATA` 有样本，`/MOTION_INFO` 有发布者；AOS 上 `/LIDAR/POINTS` 也已实测约 10Hz、每帧约 8.5 万点。`state` 的 `ros_streams` 字段及容器首样本日志用于区分源 topic 无发布者、driver 未收到、转发未发布和 Agent Core 无订阅者。旧镜像的 domain-42 lidar publisher 未观察到样本，且容器 CPU 曾约 85%；因此点云转发已改为均匀限采样 2,000 点并使用紧凑字节缓冲，仍需部署新镜像复测前端数据流。拓扑图标出前/后/左/右四路广角相机，现场 ROS graph 当前只发现 `/usb_camera_1/image_raw`、`/usb_camera_1/image_raw_0`、`/usb_camera_1/image_raw_1` 及多相机/MediaMTX 进程，但方位映射和可供前端使用的流 URL 尚未确认，故暂不把这些流错误命名为四路方位相机，也未注册相机卡。软件指南没有定义这些相机流的外部视频协议；需先核对机载多相机配置和 MediaMTX 路径。
+传感器与执行卡片沿用仓库常用命名和职责。已提供的容器日志确认 `/IMU`、`/JOINTS_DATA_10HZ`、`/BATTERY_DATA`、`/MOTION_INFO` 都收到并发布到 `/host/lynx_s10/...`；旧日志没有记录 Agent Core 的活动订阅，且旧版同进程双 context 共用 FastDDS profile。因而此前可确认源到 driver、driver 到本地发布成功，故障范围落在 domain-42 发现/订阅边界；新实现把 Agent Core 发布者放进 loopback-only 独立进程，并用有界 latest-value IPC 队列跨进程转发。需部署后再查看 `state.ros_streams` 的 bridge 队列与 Agent Core 实际订阅，才能最终确认前端恢复。
+
+旧版雷达点云最高约 10Hz、单帧约 8.5 万点；点云被均匀限采样至 2,000 点并以紧凑字节缓冲传递，避免队列积压。相机分为 `camera_0..3` 四张 sensor 卡，按实际 ROS topic 输出 `/host/lynx_s10/camera_0..3` JPEG 流；前三路订阅 raw Image，第四路订阅 `/usb_camera_1/image_raw/compressed`，并没有据拓扑图推断前后左右相机方位。raw 图像及压缩 topic 都统一转换为 JPEG，再经独立 domain-42 bridge 发布。机载 SSH 本轮拒绝了当前凭据，故图像帧率与雷达当下样本需在部署后继续核验。
 
 S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 实时流使用真机 `JOINTS_DATA_10HZ` 的 16 个电机字段，并按 URDF 关节顺序映射到仓库通用 `sensor/skeleton`；`joint_state` 同时保留完整供应商消息字段。
 
@@ -30,14 +32,14 @@ Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避
 
 ## ROS 2
 
-指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。bundle 使用仓库统一的 `run_driver` 双域 ROS 运行时：机器人域订阅标准消息，Agent Core 域发布 `topic_out`；原生 TCP 仍负责动作和设备状态。Fast DDS profile 在创建 ROS context 前生成，两个 ROS context 共用这个进程级 profile。当前 `service.yml` 按已查询的 S10 机载主机配置 `NETWORK_INTERFACE=eth0`、`ROBOT_NETWORK_CIDR=10.21.33.0/24`（主机接口 `10.21.33.103/24`；同一机载主机上的 `robot_server` 监听 `30003`，`basic_server` 地址配置为 `10.21.33.103`）。启动时会校验接口 IPv4、其直连子网和 basic_server 地址均位于该私有网段，且 CIDR 不宽于 `/24`；不匹配时拒绝启动。若将驱动迁移到独立主机，须改用 S10 机载主机的可达 TCP 地址，并确认 DDS 机器人网络隔离边界，不能使用办公网、共享 LAN 或与其他机器人共用的网络。由于该进程级 profile 对两个 context 生效，指定网段上的 DDS 流量包含 Agent Core domain-42；若网络不能隔离，不能部署此双域进程。`ROS_LOCALHOST_ONLY=0` 使选定网卡上的 ROS 发现保持可用。
+指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。主进程只创建机器人域 context、订阅机载话题；domain 42 由 `domain_bridge.py` 里的独立 spawned publisher 进程持有，各自只绑定 loopback FastDDS profile。消息通过按流隔离的 maxsize=1 队列传递，新状态替换旧状态，不会积压。主进程的 FastDDS profile 只供机载 ROS 发现使用，不创建 Agent Core domain 42 participant。`service.yml` 按本台 S10 Pro 机载主机配置 `eth0`、`10.21.33.0/24`（主机接口 `10.21.33.103/24`；同机 `robot_server` 在 TCP `30003` 监听）。若迁移到其他主机，需改为其真实机器人网卡与 S10 TCP 地址；机器人 DDS 网络不可与办公网或其他机器人共享。
 
 ## 部署与镜像
 
-该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS。Docker 多阶段构建在 builder 阶段按需安装 colcon 并编译 `drdds`，运行阶段只复制 `/lynx_s10_ws/install`，不携带源码、build 或 log 目录；运行阶段仅在基础镜像缺少时安装 `python3-pip`、Fast DDS RMW 和 `ca-certificates`。PyYAML 由 `requirements.txt` 管理并以 `--no-cache-dir` 安装。固定上游 revision 的 `drdds` 源码作为普通资源目录保存在 `resource/deep-robotics-msg/` 并随驱动构建；压缩 ZIP 仅本地保留且不提交。这样镜像构建无需访问 GitHub。Compose 片段使用 host 网络连接机器人网段，并包含该 S10 主机已确认的网卡和 CIDR；迁移到其他主机时必须先重新核实并修改这两个值，同时配置本地日志轮转。
+该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS。Docker 多阶段构建在 builder 阶段按需安装 colcon 并编译 `drdds`，运行阶段只复制 `/lynx_s10_ws/install`，不携带源码、build 或 log 目录；运行阶段仅在基础镜像缺少时安装 `python3-pip`、Fast DDS RMW 和 `ca-certificates`。`requirements.txt` 固定 PyYAML 与 Pillow：前者读取 YAML 配置，后者把 ROS `sensor_msgs/Image` 转成前端消费的 JPEG；安装使用 `--no-cache-dir`。固定上游 revision 的 `drdds` 源码作为普通资源目录保存在 `resource/deep-robotics-msg/` 并随驱动构建；压缩 ZIP 仅本地保留且不提交。这样镜像构建无需访问 GitHub。Compose 片段使用 host 网络连接机器人网段，并包含该 S10 主机已确认的网卡和 CIDR；迁移到其他主机时必须先重新核实并修改这两个值，同时配置本地日志轮转。
 
 ## 安全与验证
 
 - 切换步态前应确保机器人完全停止；步态会隐式切换至对应运动模式。
 - 首次联调应在隔离环境进行，先验证 basic_server 响应、型号/版本和状态上报，再低速验证运动方向与状态机。该 TCP 通道不加密，须限制在可信机器人网络内。轴速度控制文档要求同一客户端连续控制，勿并发多个控制方。
-- 已在 S10 Pro 真机验证 TCP 心跳成功（`ErrorCode: 0`）；状态报告、运动、导航、灯光和充电仍需进一步验证。双域 DDS 使用 driver-owned 受限 profile；尚未在目标部署网络验证 `eth0` 是否为机器人专用网段，因此须在部署前确认网段隔离。
+- 此前真机验证 TCP 心跳成功（`ErrorCode: 0`），用户提供的旧容器日志也确认 IMU、关节、电池、运动状态跨 ROS 输入和 driver 发布。当前 turn 无法 SSH 登录真机；本次改造的跨进程 bridge、相机帧和 domain-42 前端订阅恢复均仍需部署镜像后现场验收。
