@@ -89,7 +89,6 @@ declare -a DRIVER_DESCS
 declare -a DRIVER_CATS
 declare -a DRIVER_PROVIDERS
 declare -a DRIVER_MODELS
-declare -a DRIVER_REPOS     # optional image_repository: repo path overriding provider/model
 declare -a DRIVER_BUILDABLE   # "yes" / "no (no Dockerfile)"
 declare -a DRIVER_CARDS       # JSON array, e.g. [{"name":"base_drive","type":"actuator"}]
 
@@ -151,10 +150,6 @@ for yaml_file in "${SCRIPT_DIR}"/*/*/driver.yaml "${SCRIPT_DIR}"/*/driver.yaml; 
     DRIVER_CATS+=("$(_parse_yaml_field "${yaml_file}" category)")
     DRIVER_PROVIDERS+=("$(_parse_yaml_field "${yaml_file}" hardware_provider)")
     DRIVER_MODELS+=("$(_parse_yaml_field "${yaml_file}" hardware_model)")
-    # A sidecar driver may serve one hardware model without owning a second image
-    # repository convention; image_repository keeps its image distinct while
-    # hardware_provider/model stay the real robot (see noetix/bumi_visual_odometry).
-    DRIVER_REPOS+=("$(_parse_yaml_field "${yaml_file}" image_repository)")
     DRIVER_BUILDABLE+=("${has_dockerfile}")
     DRIVER_CARDS+=("$(_parse_yaml_cards_json "${yaml_file}")")
 done
@@ -285,8 +280,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
     name="${DRIVER_NAMES[$idx]}"
     provider="${DRIVER_PROVIDERS[$idx]}"
     model="${DRIVER_MODELS[$idx]}"
-    repo="${DRIVER_REPOS[$idx]:-}"
-    FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${repo:-${provider}/${model}}:${TAG}"
+    FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${provider}/${model}:${TAG}"
 
     echo ""
     echo "============================================"
@@ -365,9 +359,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
             desc="${DRIVER_DESCS[$idx]}"
             hw_provider="${DRIVER_PROVIDERS[$idx]:-}"
             hw_model="${DRIVER_MODELS[$idx]:-}"
-            repo="${DRIVER_REPOS[$idx]:-}"
             cards="${DRIVER_CARDS[$idx]:-[]}"
-            FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${repo:-${hw_provider}/${hw_model}}:${TAG}"
+            FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${hw_provider}/${hw_model}:${TAG}"
 
             # 架构 facet（resource-center 据此过滤目录，见 resource-center/lib/arch.ts）。
             # driver 是普通 ROS 容器，没有 L4T / CUDA base，所以不绑定加速器；镜像统一

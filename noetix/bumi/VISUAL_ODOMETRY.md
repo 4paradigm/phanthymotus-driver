@@ -1,0 +1,137 @@
+# Bundle-local RGB-D visual odometry (`rgbd_visual_odometry`)
+
+Read-only visual odometry runs **inside the Bumi bundle**: `main.py` starts
+`VisualOdometryPlugin`, which supervises one `rtabmap_odom/rgbd_odometry` child
+and publishes `motus.odom/1` on `/bumi_visual_odometry/state/odom`. It is not a
+second driver, image or container, and it is not a fusion estimator: no IMU, no
+`robot_localization`/EKF, no visual-inertial fusion, no distance feedback.
+
+The card is enabled by `plugins.visual_odometry.enabled` in `config.yaml`.
+`main.py` then exports `BUMI_VISUAL_ODOMETRY=1` before the camera subprocess
+starts, so the same pyrealsense2 capture process publishes the raw RGB-D branch
+`visual_inputs.py` uses. Disabled means no raw branch, no estimator child, no
+extra DDS traffic.
+
+## Card
+
+| Field | Value |
+| --- | --- |
+| Tool / card | `rgbd_visual_odometry` (sensor, read-only) |
+| MCP actions | `start`, `stop`, `info`, `reset`, `config` |
+| Output | `/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, port format `state/odom` |
+| Consumer | none; it is not wired into `loco_target`/`loco_servo` |
+
+`stop` only reaps the estimator child and the card's private topics. The camera,
+`camera`/`depth` cards, photo/video capture, audio and every motion card keep
+running.
+
+## Inputs
+
+Published by the bundle's camera subprocess when the card is enabled
+(`NS` = bundle namespace):
+
+| Topic | Type / meaning |
+| --- | --- |
+| `/NS/odometry_input/rgb` | `sensor_msgs/Image`, bgr8 source colour frame |
+| `/NS/odometry_input/depth` | `sensor_msgs/Image`, 32FC1 metres in the colour grid (SDK `depth_scale`) |
+| `/NS/odometry_input/info` | `sensor_msgs/CameraInfo`, live K/D/R/P; zero coefficients as `plumb_bob` |
+| `/NS/odometry_input/camera_meta` | `std_msgs/String` JSON: epoch, per-stream source time/frame/clock domain, depth scale, receive time, mapped stamps |
+
+RGB/depth source stamps must be within 20 ms. The sidecar validates the time
+domain and transport age, undistorts when the camera actually reports non-zero
+coefficients (OpenCV is available in the bundle image), rejects unusable depth
+and requires the RGB-D frame pair and CameraInfo to describe the same aligned
+frame. An unknown distortion model or a changed frame/intrinsics/epoch latches
+`lost` and requires `reset`.
+
+## Estimation
+
+- One child: `/opt/ros/humble/lib/rtabmap_odom/rgbd_odometry`, private topics
+  `/<segment>/{rgb,depth,info}`, `/<segment>/visual`, `/<segment>/diagnostic`.
+- One segment-scoped static TF `base -> optical` is published before the child
+  starts. Without a measured mount it is identity, so the base frame coincides
+  with the optical frame and the pose stays a camera pose; `publish_tf` of the
+  estimator stays false.
+- No IMU topic is fused; the unused `imu` remap prevents an accidental live
+  subscription.
+- The pose is accepted only when the RTAB-Map `OdomInfo` for the same stamp says
+  tracking is valid (`inliers >= 10`, `matches >= inliers`, not `lost`).
+
+## Output contract
+
+Payload reuses `common/odom.py` (`motus.odom/1`). `twist` is always six `null`s:
+RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
+`pose` is `null` unless the segment is tracking; no last pose is repeated.
+
+- `pose`: `{position, quaternion xyzw, frame_id, child_frame_id, covariance[36]}`;
+  `child_frame_id` is `<segment>_base` (identity-coincident with the optical frame
+  unless a mount is measured).
+- `vendor`: `status` (`initializing`/`tracking`/`lost`), `reason`, `segment_id`,
+  `calibration_id`, `pose_reference` (`rgb_optical` by default, `body` only with
+  a measured mount), `visual_diagnostic`, `input_age_ms`, `visual_stamp_ns`,
+  `camera_time_provenance`, `source: rtabmap_rgbd_odometry`, `accuracy_validated:
+  false`, `twist_source: null`.
+- `info()` declares an empty `odom_interface.provides` (no velocity axes),
+  `pose_drift: unbounded`, `rate_hz: 20`, plus the current quality.
+
+## Optional measured camera mount
+
+Without `calibration` the pose reference is the camera optical origin; this is not
+a claim that the camera-to-body extrinsic is zero. To express the same trajectory
+at a body reference point, set a measured mount in `config.yaml` (or via the
+card's `config` action, not persisted):
+
+```yaml
+plugins:
+  visual_odometry:
+    enabled: true
+    calibration:
+      calibration_id: measured-YYYYMMDD
+      fixed_mount: true
+      camera_to_body:
+        translation: [x, y, z]          # camera origin in body coordinates, metres
+        quaternion: [qx, qy, qz, qw]    # normalized xyzw, optical C to body B
+```
+
+The values become the base->optical static TF; the estimator path is unchanged.
+`bumi_model.urdf` has a `waist_yaw_joint` but no camera mount chain, so the body
+reference point and whether the camera crosses the waist joint must be confirmed
+on hardware; do not use the rendered URDF as a measured extrinsic.
+
+## Build and probe
+
+The bundle image installs `ros-humble-rtabmap-odom` and `ros-humble-tf2-ros` and
+verifies the estimator executable at build time. Nothing else is added: the
+bundle already ships numpy/OpenCV/PyYAML for its camera and bundle config.
+
+A synthetic integration probe is copied into the image. It never opens the
+RealSense device and never commands the chassis; run it in an isolated domain:
+
+```sh
+ROS_DOMAIN_ID=239 python3 /work/visual_odometry_probe.py --output /data/probe.json
+```
+
+Expected: `integration_passed: true` (real `rgbd_odometry`, synthetic one-metre
+forward motion, input loss -> `lost`, reset -> new segment). It is not hardware
+accuracy validation.
+
+## Validation status
+
+ROS-free regression for this branch: `454 passed` in the Bumi suite; the
+visual-odometry tests cover the pose/quality contract, launch parameters (single
+estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
+camera-subprocess raw branch.
+
+**Not executed:** ARM64 image build, real ROS probe, deployment, DDS timing /
+media-load measurement, real-robot accuracy. The card is read-only and defaults
+to `initializing`, so it cannot inject invented odometry before those checks.
+
+## Limitations
+
+- Historical shared capture rate is about 1.8 Hz; fast rotation, low texture and
+  occlusion make loss expected, and loss is latched rather than degraded.
+- No loop closure/global relocalization; drift is unbounded by design.
+- The camera source has no confirmed exposure timestamp; the device-to-host
+  mapping is an arrival-time approximation.
+- 20 ms pairing, 10 inliers, 0.2 m position sigma and the 250/500 ms ages are
+  rejection thresholds, not accuracy guarantees.

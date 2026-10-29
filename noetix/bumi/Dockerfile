@@ -36,6 +36,14 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         libboost-dev && \
     rm -rf /var/lib/apt/lists/*
 
+# RTAB-Map RGB-D odometry, bundle-local (single container). The estimator runs as
+# one supervised child of main.py; no second image/container is deployed.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ros-humble-rtabmap-odom \
+        ros-humble-tf2-ros && \
+    rm -rf /var/lib/apt/lists/*
+
 # Realsense SDK (D435i camera)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -45,6 +53,12 @@ RUN apt-get update && \
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
+
+# The bundle image must be able to start the estimator child and this card's
+# Python imports; fail the build here rather than on a robot.
+RUN source /opt/ros/humble/setup.bash && python3 -c \
+    'import rclpy, cv2, numpy, message_filters; from rtabmap_msgs.msg import OdomInfo; from nav_msgs.msg import Odometry; from geometry_msgs.msg import TransformStamped; from tf2_ros import StaticTransformBroadcaster' && \
+    test -x /opt/ros/humble/lib/rtabmap_odom/rgbd_odometry
 
 # Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
@@ -87,6 +101,8 @@ COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
 COPY visual_inputs.py /work/visual_inputs.py
+COPY visual_odometry.py /work/visual_odometry.py
+COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py

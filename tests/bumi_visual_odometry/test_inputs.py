@@ -1,4 +1,4 @@
-"""Raw RGB-D inputs for the visual odometry sidecar.
+"""Raw RGB-D inputs for the bundle-local visual odometry card.
 
 Camera-only port of PR #425's `tests/bumi_fusion/test_inputs.py`: the restored
 bundle publishes raw RGB/depth/CameraInfo/provenance and nothing with an IMU.

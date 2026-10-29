@@ -2402,15 +2402,17 @@ def _camera_subprocess(namespace: str):
         # over a failed introspection call would be the worse trade.
         print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
 
-    # Optional read-only RGB-D branch, consumed by the separate visual-odometry
-    # driver. It shares this pipeline and must never take media production down:
-    # construction and every publish are wrapped, and a fault only logs.
+    # Optional read-only RGB-D branch for the bundle-local visual odometry card.
+    # main.py sets BUMI_VISUAL_ODOMETRY only when that card is enabled; the branch
+    # shares this pipeline and must never take media production down: construction
+    # and every publish are wrapped, and a fault only logs.
     raw_inputs = None
-    try:
-        from visual_inputs import RawCameraPublisher
-        raw_inputs = RawCameraPublisher(node, namespace, pipeline, _QOS)
-    except Exception as _e:
-        print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
+    if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1":
+        try:
+            from visual_inputs import RawCameraPublisher
+            raw_inputs = RawCameraPublisher(node, namespace, pipeline, _QOS)
+        except Exception as _e:
+            print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
 
     frame_count = 0
     t_start = _time.monotonic()

@@ -1,4 +1,4 @@
-"""Raw RGB-D inputs for the standalone visual odometry sidecar.
+"""Raw RGB-D inputs for the bundle-local visual odometry card.
 
 Read-only additions to the direct capture process: no camera opener and no
 chassis commands. The capture process owns the USB device and hands complete

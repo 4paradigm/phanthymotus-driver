@@ -448,13 +448,19 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
-## Raw RGB-D sharing for the separate visual-odometry driver
+## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
+
+Single container: the estimator runs inside this bundle, not in a sidecar.
+`main.py` starts a `VisualOdometryPlugin` when `plugins.visual_odometry.enabled`
+is true; the plugin supervises exactly one `rtabmap_odom/rgbd_odometry` child and
+publishes a read-only `motus.odom/1` stream on
+`/bumi_visual_odometry/state/odom`. No second image, no second container, no USB
+or privileged change.
 
 The camera card is unchanged, and so is the single pyrealsense2 capture process
-that owns the device (`device.py::_camera_subprocess`). In addition to the
-existing JPEG and compressed-depth ports, that process now has an **optional,
-read-only** branch (`visual_inputs.py`) that publishes the same frameset as
-standard ROS messages on `/<namespace>/odometry_input/`:
+that owns the device (`device.py::_camera_subprocess`). When the card is enabled,
+that process also publishes an optional, read-only raw branch
+(`visual_inputs.py`) on `/<namespace>/odometry_input/`:
 
 | Topic | Type | Meaning |
 | --- | --- | --- |
@@ -463,26 +469,19 @@ standard ROS messages on `/<namespace>/odometry_input/`:
 | `info` | `sensor_msgs/CameraInfo` | live K/D/R/P; zero coefficients are published as `plumb_bob` |
 | `camera_meta` | `std_msgs/String` | JSON provenance: epoch, per-stream source stamp/frame/clock domain, depth scale, receive time |
 
-This branch never opens a second pipeline, never touches the USB device and never
-publishes a chassis command. It is wrapped in `try`/`except` twice — once around
-construction, once around publish — so a fault here only prints a log line;
-JPEG, depth, intrinsics, photo and video capture continue as before. There is no
-config switch: the branch is present when `visual_inputs.py` is in the image and
-absent (with a loud log line) otherwise; the camera subprocess keeps running in
-both cases.
+The raw branch never opens a second pipeline, never touches the USB device and
+never publishes a chassis command. Construction and every publish are wrapped,
+so a fault here only prints a log line; JPEG, depth, intrinsics, photo and video
+capture continue as before. `main.py` sets `BUMI_VISUAL_ODOMETRY=1` only when the
+card is enabled — a disabled card costs no extra DDS traffic and starts no
+estimator.
 
-The consumer is a **separate driver**, `noetix/bumi_visual_odometry/`, not this
-bundle: its own image, its own container (`embodied-noetix-bumi-visual-odometry`,
-MCP port 15720), no USB mount, no privileged mode, `restart: always`, and the
-same local DDS domain 42. It runs only RTAB-Map `rgbd_odometry` and publishes
-`/bumi_visual_odometry/state/odom` (`motus.odom/1`) — visual pose only, no IMU,
-no EKF, no fusion. It defaults to `initializing` and **is not a distance-feedback
-source**: it is not wired into `loco_target`/`loco_servo`, and connecting its
-output to a motion card is not a supported use. Stopping or crashing it does not
-stop the camera, the `camera`/`depth` cards, or any motion card.
+It is **not** a fusion or feedback source: there is no IMU input, no
+robot_localization/EKF, no visual-inertial fusion, and the output is not wired
+into `loco_target`/`loco_servo`. The card defaults to `initializing` and publishes
+no pose until the estimator is tracking; `lost` is latched for that segment.
+Stopping the card from MCP only reaps its own child and private topics — the
+camera, media cards and motion cards keep running.
 
-The four raw streams are new DDS bandwidth from an already-saturated capture
-path, so the sidecar's CPU/RAM and the media frame rate must be re-measured on
-hardware before this is left running in production. See
-`noetix/bumi_visual_odometry/README.md` for the input contract, quality states,
-optional measured camera mount and the explicit non-goals.
+The output contract, quality states, optional measured camera mount, validation
+status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).

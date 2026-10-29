@@ -12,7 +12,7 @@ import pytest
 
 from common.visual_odometry import (CameraCalibration, ClockMap, Health,
                                     camera_to_body, finite, make_sample, quat_matrix)
-from noetix.bumi_visual_odometry.runtime import estimate
+from noetix.bumi.visual_odometry import estimate, mount_transform, parameter_file
 
 
 def calibration():
@@ -175,3 +175,22 @@ def test_estimate_refuses_wrong_frames_and_broken_covariance():
     too_uncertain[0] = too_uncertain[7] = too_uncertain[14] = .09
     with pytest.raises(ValueError):
         estimate(odometry_msg(covariance=too_uncertain), 'seg', 'opt')
+
+
+def test_mount_transform_is_identity_or_the_measured_mount():
+    assert mount_transform(None) == ([0., 0., 0.], [0., 0., 0., 1.])
+    mount = calibration()['camera_to_body']
+    assert mount_transform(CameraCalibration(calibration())) == (
+        mount['translation'], mount['quaternion'])
+
+
+def test_parameter_file_preserves_ros_parameter_types():
+    text = parameter_file(dict(frame_id='robot_rgb_optical', publish_tf=False,
+                               **{'Odom/ResetCountdown': '0'},
+                               approx_sync_max_interval=.02))
+    import yaml
+    parsed = yaml.safe_load(text)['/**']['ros__parameters']
+    assert parsed['frame_id'] == 'robot_rgb_optical'
+    assert parsed['publish_tf'] is False
+    assert parsed['Odom/ResetCountdown'] == '0'
+    assert parsed['approx_sync_max_interval'] == .02

@@ -1,4 +1,4 @@
-"""ROS-free contracts for the Bumi RGB-D visual-odometry sidecar.
+"""ROS-free contracts for the Bumi bundle-local RGB-D visual odometry.
 
 This is the visual-only half that PR #425 shipped, kept without the body-IMU
 fusion: there is no IMU input, no robot_localization EKF, no gyro calibration and

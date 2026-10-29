@@ -1,15 +1,25 @@
-"""ROS sidecar: shared camera -> RTAB-Map RGB-D visual odometry -> motus.odom/1.
+"""Single-container RGB-D visual odometry for the Bumi bundle.
 
-No USB SDK, no IMU and no robot_localization EKF are imported here. RTAB-Map's
-``rgbd_odometry`` is the only estimator. Each reset uses private topics and a new
-segment, so queued old estimates cannot enter the replacement estimator.
+RTAB-Map ``rgbd_odometry`` runs as one supervised child of the bundle process.
+The bundle's camera subprocess remains the only RealSense owner and publishes an
+optional raw RGB-D branch on ``/{namespace}/odometry_input/*``; this module
+consumes it, validates/undistorts frame pairs, launches the estimator and
+publishes a read-only ``motus.odom/1`` sample on ``/bumi_visual_odometry/state/odom``.
+
+There is no IMU input, no robot_localization EKF, no visual-inertial fusion and
+no consumer in the motion path: stopping this card only reaps its own child and
+private topics, never the camera or a motion card.
 """
 from __future__ import annotations
 from collections import OrderedDict
 from copy import deepcopy
 import json
 import math
+import os
 from pathlib import Path
+import re
+import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -19,15 +29,131 @@ from common.visual_odometry import (CameraCalibration, Health, MAX_INPUT_AGE_NS,
                                     MAX_POSITION_SIGMA_M, MAX_SKEW_NS,
                                     MAX_TRANSPORT_NS, finite, make_sample,
                                     quat_matrix)
-try:
-    from .pipeline import ChildProcesses
-except ImportError:
-    from pipeline import ChildProcesses
+
+PACKAGE = 'rtabmap_odom'
+EXECUTABLE = 'rgbd_odometry'
+OUTPUT_TOPIC = '/bumi_visual_odometry/state/odom'
 
 
-def stamp(msg):
-    return msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
+# ── Estimator launch contract ────────────────────────────────────────────────
 
+def parameter_file(config):
+    """Render the single-node ROS 2 params file without a YAML dependency.
+
+    The bundle image ships PyYAML for its own config, so this is not strictly a
+    dependency-saving measure here; keeping the renderer local means the
+    visual-odometry path cannot be broken by a YAML API change and makes the
+    written file explicit. Values that YAML would read as numbers/bools (e.g.
+    the string "0" for ``Odom/ResetCountdown``) are quoted so the parameter type
+    stays String.
+    """
+    plain = re.compile(r'[A-Za-z_][A-Za-z0-9_./-]*')
+    numeric = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+    reserved = {'true', 'false', 'null', 'yes', 'no', 'on', 'off', '~'}
+
+    def scalar(value):
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, (int, float)):
+            return repr(value)
+        text = str(value)
+        if (plain.fullmatch(text) and text.lower() not in reserved
+                and not numeric.fullmatch(text)):
+            return text
+        return "'" + text.replace("'", "''") + "'"
+
+    lines = ["'/**':", '  ros__parameters:']
+    for key, value in config.items():
+        lines.append('    '+scalar(key)+': '+scalar(value))
+    return '\n'.join(lines)+'\n'
+
+
+def parameters(segment, frame_id):
+    """Parameters for the bundle-local visual estimator.
+
+    ``frame_id`` is the segment's base frame, which coincides with the optical
+    frame when no camera mount is measured. A static base->optical transform is
+    published before the estimator starts; RTAB-Map looks that up per frame.
+    """
+    return dict(frame_id=frame_id, odom_frame_id=segment+'_odom', publish_tf=False,
+                wait_imu_to_init=False, approx_sync=True, approx_sync_max_interval=.02,
+                qos=2, qos_camera_info=2, topic_queue_size=5, sync_queue_size=5,
+                **{'Odom/ResetCountdown': '0'})
+
+
+def stop_group(proc):
+    for sig, timeout in ((signal.SIGINT, 3), (signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            proc.wait(timeout=2)
+            return
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            continue
+        # Reap remaining descendants even if the ROS executable leader died.
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return
+    raise RuntimeError('visual odometry process group did not exit')
+
+
+class ChildProcesses:
+    """The one RTAB-Map child; stopping it never touches the camera process."""
+
+    def __init__(self, directory, *, popen=None, stop=None, prefix=None):
+        self.directory = Path(directory)
+        self.popen, self.reap = popen or subprocess.Popen, stop or stop_group
+        self.prefix = prefix
+        self.children = []
+
+    def start(self, segment, frame_id):
+        if self.children:
+            raise RuntimeError('old visual odometry process still present')
+        if self.prefix is None:
+            from ament_index_python.packages import get_package_prefix
+            self.prefix = get_package_prefix
+        config = parameters(segment, frame_id)
+        root = '/'+segment
+        path = self.directory/'odometry.yaml'
+        try:
+            path.write_text(parameter_file(config))
+            args = [str(Path(self.prefix(PACKAGE))/'lib'/PACKAGE/EXECUTABLE), '--ros-args',
+                    '-r', '__node:=rgbd_odometry', '-r', '__ns:='+root,
+                    '--params-file', str(path)]
+            for source, target in (('rgb/image', root+'/rgb'),
+                                   ('depth/image', root+'/depth'),
+                                   ('rgb/camera_info', root+'/info'),
+                                   ('odom', root+'/visual'),
+                                   ('odom_info', root+'/diagnostic'),
+                                   # No IMU is fused; keep an unused remap so an
+                                   # implicit subscription cannot pick a live topic.
+                                   ('imu', root+'/unused_imu')):
+                args.extend(['-r', source+':='+target])
+            env = dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
+            self.children.append(self.popen(args, env=env, start_new_session=True))
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self):
+        failures = []
+        for proc in reversed(self.children):
+            try:
+                self.reap(proc)
+            except Exception as exc:
+                failures.append(exc)
+        if failures:
+            raise RuntimeError('cannot reap visual odometry children: '+str(failures))
+        self.children.clear()
+
+    def failed(self):
+        return any(p.poll() is not None for p in self.children)
+
+
+# ── Pose contract ────────────────────────────────────────────────────────────
 
 def mount_transform(calibration):
     """Static base->optical TF values.
@@ -64,39 +190,43 @@ def estimate(msg, segment, frame_id):
         raise ValueError('invalid visual pose covariance')
     if max(covariance[i, i] for i in range(3)) > MAX_POSITION_SIGMA_M**2:
         raise ValueError('visual position uncertainty exceeds 0.2 m standard deviation')
-    return dict(stamp_ns=stamp(msg),
+    return dict(stamp_ns=msg.header.stamp.sec*10**9+msg.header.stamp.nanosec,
                 pose=dict(position=position, quaternion=quaternion,
                           frame_id=segment+'_odom', child_frame_id=frame_id,
                           covariance=list(msg.pose.covariance)))
 
 
-class VisualRuntime:
-    """Lifecycle and quality state machine around one RTAB-Map visual estimator."""
+# ── Runtime ──────────────────────────────────────────────────────────────────
 
-    def __init__(self, config=None):
+class VisualOdometryNode:
+    """Quality state machine and process supervisor for one visual estimator."""
+
+    def __init__(self, namespace, config=None):
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
         from std_msgs.msg import String
-        self.node = Node('bumi_rgbd_visual_odometry')
+        self.namespace = namespace
+        self.node = Node('bumi_visual_odometry')
         self.qos = qos_profile_sensor_data
         self.String = String
         self.lock = threading.RLock()
         self.config = dict(config or {})
         self.active = False
         self.closed = False
-        self.output = self.config.get('output_topic', '/bumi_visual_odometry/state/odom')
+        self.output = OUTPUT_TOPIC
         self.publisher = self.node.create_publisher(String, self.output, self.qos)
         self.directory = tempfile.TemporaryDirectory(prefix='bumi-visual-odometry-')
         self.children = ChildProcesses(self.directory.name)
         self.input_subs = []
         self.result_subs = []
         self.segment_pubs = []
-        self.source_namespace = None
         self.calibration = None
-        self.estimate = None
+        raw = self.config.get('calibration') or None
+        self.calibration = CameraCalibration(raw) if raw else None
         self._new_segment()
         self.node.create_timer(.05, self._guard(self.tick))
 
+    # -- lifecycle helpers ---------------------------------------------------
     def _guard(self, callback):
         def guarded(*args):
             with self.lock:
@@ -121,6 +251,7 @@ class VisualRuntime:
         self.maps = None
         self.optics = None
         self.frame_id = None
+        self.broadcaster = None
         self.visual_pending = OrderedDict()
         self.diagnostic_pending = OrderedDict()
         self.diagnostic_started = False
@@ -135,7 +266,7 @@ class VisualRuntime:
     def publish(self):
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
         if not self.active:
-            sample['vendor'].update(status='initializing', reason='sensor stopped')
+            sample['vendor'].update(status='initializing', reason='visual odometry stopped')
             sample['pose'] = None
         self.publisher.publish(self.String(data=json.dumps(sample, allow_nan=False)))
         return sample
@@ -149,22 +280,19 @@ class VisualRuntime:
                     odom_interface=build_interface(provides=[], rate_hz=20,
                                                    pose_drift='unbounded'),
                     quality=sample['vendor'],
+                    namespace=self.namespace,
                     pose_reference=self.pose_reference(),
-                    source_namespace=self.source_namespace,
                     segment_id=self.segment,
                     calibration_id=self.calibration.id if self.calibration else None)
 
     def start(self):
         if not self.active:
-            raw = self.config.get('calibration') or None
-            # A missing camera mount is legal (pose stays in the optical frame);
-            # a *malformed* one is refused instead of silently assumed zero.
-            self.calibration = CameraCalibration(raw) if raw else None
             self._new_segment()
             self.active = True
+            self.bind_inputs(self.namespace)
         return self.info()
 
-    def stop(self, reason='sensor stopped'):
+    def stop(self, reason='visual odometry stopped'):
         if self.active:
             self.health.fault(reason)
             self.publish()
@@ -177,7 +305,6 @@ class VisualRuntime:
         self.input_subs = []
         self.result_subs = []
         self.segment_pubs = []
-        self.source_namespace = None
         self.frame_id = None
         self.broadcaster = None
         self.maps = None
@@ -190,30 +317,19 @@ class VisualRuntime:
         return self.start()
 
     def configure(self, args):
-        permitted = {'calibration', 'source_namespace'}
-        proposed = {k: v for k, v in args.items() if k in permitted}
+        proposed = {k: v for k, v in args.items() if k == 'calibration'}
         if proposed.get('calibration'):
             CameraCalibration(proposed['calibration'])  # validate before interrupting
-        if 'source_namespace' in proposed:
-            import re
-            if not re.fullmatch('[A-Za-z_][A-Za-z0-9_]*', proposed['source_namespace']):
-                raise ValueError('invalid source namespace')
         if all(self.config.get(k) == v for k, v in proposed.items()):
             return self.info()
         active = self.active
-        self.stop('source configuration changed')
+        self.stop('calibration changed')
         self.config.update(deepcopy(proposed))
+        raw = self.config.get('calibration') or None
+        self.calibration = CameraCalibration(raw) if raw else None
         return self.start() if active else self.info()
 
-    def discover(self):
-        names = {topic[:-len('/odometry_input/camera_meta')].lstrip('/') for topic, _ in
-                 self.node.get_topic_names_and_types()
-                 if topic.endswith('/odometry_input/camera_meta')}
-        wanted = self.config.get('source_namespace')
-        if wanted:
-            return wanted if wanted in names else None
-        return next(iter(names)) if len(names) == 1 else None
-
+    # -- inputs --------------------------------------------------------------
     def _subscribe(self, cls, topic, callback, destination):
         destination.append(self.node.create_subscription(
             cls, topic, self._guard(callback), self.qos))
@@ -222,7 +338,6 @@ class VisualRuntime:
         from sensor_msgs.msg import Image, CameraInfo
         from std_msgs.msg import String
         import message_filters
-        self.source_namespace = namespace
         root = '/'+namespace+'/odometry_input/'
         self._subscribe(String, root+'camera_meta', self.metadata, self.input_subs)
         # Keep wrappers alive. ROS subscriptions are also explicitly removed on stop.
@@ -257,8 +372,10 @@ class VisualRuntime:
         self._prepare(t)
 
     def rgbd(self, rgb, depth, info):
-        t = stamp(rgb)
-        if stamp(info) != t or abs(t-stamp(depth)) > MAX_SKEW_NS:
+        t = rgb.header.stamp.sec*10**9+rgb.header.stamp.nanosec
+        if info.header.stamp.sec*10**9+info.header.stamp.nanosec != t:
+            raise ValueError('RGB-D/calibration time mismatch')
+        if abs(t-(depth.header.stamp.sec*10**9+depth.header.stamp.nanosec)) > MAX_SKEW_NS:
             raise ValueError('RGB-D/calibration time mismatch')
         if len({rgb.header.frame_id, depth.header.frame_id, info.header.frame_id}) != 1:
             raise ValueError('aligned depth frame mismatch')
@@ -272,7 +389,8 @@ class VisualRuntime:
             return
         meta = self.cache.pop(t)
         rgb, depth, info = self.images.pop(t)
-        if stamp(depth) != meta['depth_stamp_ns'] or stamp(rgb) != meta['rgb_stamp_ns']:
+        if (depth.header.stamp.sec*10**9+depth.header.stamp.nanosec != meta['depth_stamp_ns']
+                or t != meta['rgb_stamp_ns']):
             raise ValueError('metadata does not describe paired images')
         self.health.observe('camera', t, self.now(), True)
         self.health.details['camera_time_provenance'] = dict(
@@ -302,13 +420,7 @@ class VisualRuntime:
             raise ValueError('invalid camera focal length')
         identity = not any(abs(v) > 1e-12 for v in distortion)
         if not identity:
-            # Real D435i coefficients are all zero; only a genuinely distorted
-            # camera needs OpenCV, so keep python3-opencv out of the runtime image.
-            try:
-                import cv2
-            except ImportError as exc:
-                raise ValueError(
-                    'camera distortion requires python3-opencv in the image') from exc
+            import cv2
             if self.maps is None:
                 self.maps = cv2.initUndistortRectifyMap(
                     k, np.asarray(distortion), None, k, (info.width, info.height),
@@ -355,9 +467,8 @@ class VisualRuntime:
         self.info_pub = self.node.create_publisher(CameraInfo, root+'/info', self.qos)
         self.segment_pubs = [self.rgb_pub, self.depth_pub, self.info_pub]
         # RTAB-Map wants a base frame distinct from the image frame and a TF to
-        # it, exactly as its own launch files set up. With no measured mount the
-        # transform is identity, so the base frame coincides with the optical
-        # frame rather than pretending to be a body point.
+        # it. With no measured mount the transform is identity, so the base frame
+        # coincides with the optical frame rather than pretending to be a body point.
         transform = TransformStamped()
         transform.header.stamp = self.node.get_clock().now().to_msg()
         transform.header.frame_id = self.base_frame()
@@ -412,13 +523,14 @@ class VisualRuntime:
         if not valid and not self.diagnostic_started:
             return  # first registration has no motion estimate yet
         if not valid:
-            self.health.details['fault_stamp_ns'] = stamp(msg)
+            self.health.details['fault_stamp_ns'] = (
+                msg.header.stamp.sec*10**9+msg.header.stamp.nanosec)
             self.health.fault('visual tracking lost or insufficient inliers')
             return
         self.diagnostic_started = True
         self.health.details['visual_diagnostic'] = dict(
             inliers=msg.inliers, matches=msg.matches, lost=msg.lost)
-        t = stamp(msg)
+        t = msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
         self.diagnostic_pending[t] = msg
         while len(self.diagnostic_pending) > 20:
             self.diagnostic_pending.popitem(last=False)
@@ -428,10 +540,6 @@ class VisualRuntime:
         if self.closed:
             return
         if self.active:
-            if self.source_namespace is None:
-                namespace = self.discover()
-                if namespace:
-                    self.bind_inputs(namespace)
             if self.children.failed():
                 self.health.fault('RTAB-Map visual odometry process exited')
             if self.last_visual_monotonic is not None and \
@@ -443,7 +551,56 @@ class VisualRuntime:
         with self.lock:
             if self.closed:
                 return
-            self.stop('service shutting down')
+            self.stop('bundle shutting down')
             self.closed = True
             self.node.destroy_node()
             self.directory.cleanup()
+
+
+# ── Bundle plugin ────────────────────────────────────────────────────────────
+
+class VisualOdometryPlugin:
+    """Bundle-facing sensor card for the read-only visual odometry stream."""
+
+    PREFIX = 'visual_odometry'
+
+    def __init__(self, plugin_config, namespace, executor):
+        self._namespace = namespace
+        self._node = VisualOdometryNode(namespace, plugin_config)
+        executor.add_node(self._node.node)
+
+    def get_tools(self) -> list:
+        return [{
+            'name': 'rgbd_visual_odometry',
+            'type': 'sensor',
+            'multiInstance': False,
+            'description': ('Bumi RGB-D visual odometry (RTAB-Map rgbd_odometry), read-only — '
+                            f'no IMU/EKF/fusion, not in the motion path. Publishes to {OUTPUT_TOPIC}'),
+            'inputSchema': {'type': 'object', 'properties': {
+                'action': {'type': 'string',
+                           'enum': ['start', 'stop', 'info', 'reset', 'config']}}},
+            'configSchema': {'type': 'object', 'properties': {
+                'calibration': {'type': 'object',
+                                'description': 'Optional measured camera_to_body mount; '
+                                               'without it the pose stays in the optical frame'}}},
+            'topic_out': [{'topic': OUTPUT_TOPIC, 'format': 'state/odom'}],
+        }]
+
+    def start(self) -> None:
+        self._node.start()
+
+    def stop(self) -> None:
+        self._node.stop()
+
+    def dispatch(self, action, args) -> dict | None:
+        node = self._node
+        with node.lock:
+            if action == 'start':
+                return node.start()
+            if action == 'stop':
+                return node.stop()
+            if action == 'reset':
+                return node.reset()
+            if action == 'config':
+                return node.configure(args)
+            return node.info()  # info, or the bare tool name

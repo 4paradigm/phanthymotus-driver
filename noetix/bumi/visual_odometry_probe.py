@@ -1,9 +1,11 @@
-"""Actual RTAB-Map RGB-D integration (no robot, no USB, no IMU).
+"""Actual RTAB-Map RGB-D integration probe for the bundle-local visual odometry.
 
-Run inside the sidecar image with ROS_DOMAIN_ID=239. Renders a fixed textured
-wall from a camera moving forward, feeds the sidecar's real shared-input topics,
-and checks tracking, a synthetic one-metre displacement, input-loss detection and
-segment replacement. This validates software integration, not metric accuracy.
+Run inside the Bumi image with ROS_DOMAIN_ID=239. It renders a fixed textured
+wall from a camera moving forward, feeds the bundle's real raw-input topics,
+starts the real `rgbd_odometry` child, and checks tracking, a synthetic one-metre
+displacement, input-loss detection and segment replacement. It never opens the
+RealSense device and never commands the chassis; this validates ROS integration,
+not real-world metric accuracy.
 """
 from __future__ import annotations
 import argparse
@@ -26,16 +28,17 @@ def main():
     import cv2
     import numpy as np
     import rclpy
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Image, CameraInfo
     from std_msgs.msg import String
-    try:
-        from .runtime import VisualRuntime
-    except ImportError:
-        from runtime import VisualRuntime
+    from visual_odometry import VisualOdometryNode
+
     rclpy.init()
-    runtime = VisualRuntime({'source_namespace': 'visual_probe'})
+    runtime = VisualOdometryNode('visual_probe')
+    executor = SingleThreadedExecutor()
+    executor.add_node(runtime.node)
     producer = Node('bumi_visual_odometry_rendered_probe')
     root = '/visual_probe/odometry_input/'
     pubs = {name: producer.create_publisher(cls, root+name, qos_profile_sensor_data)
@@ -93,7 +96,7 @@ def main():
                             depth_scale=.001, rgb_stamp_ns=now, depth_stamp_ns=now,
                             received_ns=now, clock_mapping='synthetic_shared_clock')
                 pubs['camera_meta'].publish(String(data=json.dumps(meta)))
-            rclpy.spin_once(runtime.node, timeout_sec=.005)
+            executor.spin_once(timeout_sec=.005)
             sample = runtime.publish()
             if sample['vendor']['status'] == 'lost':
                 raise AssertionError(sample['vendor'])
@@ -111,11 +114,11 @@ def main():
                       - np.mean([r['estimated_position'][2] for r in first]))
         if abs(moved-1.) > .10:
             raise AssertionError('synthetic displacement error '+str(moved-1.))
-        # Stop the inputs but keep the sidecar running: the state must go lost,
-        # not keep predicting a pose.
+        # Stop the inputs but keep spinning: the state must go lost, not keep
+        # predicting a pose.
         deadline = time.monotonic()+1.
         while time.monotonic() < deadline:
-            rclpy.spin_once(runtime.node, timeout_sec=.02)
+            executor.spin_once(timeout_sec=.02)
         if runtime.publish()['vendor']['status'] != 'lost':
             raise AssertionError('input loss hidden')
         old = runtime.segment
@@ -132,6 +135,7 @@ def main():
         Path(args.output).write_text(json.dumps(result, indent=2, allow_nan=False))
         runtime.close()
         producer.destroy_node()
+        executor.shutdown()
         rclpy.shutdown()
     print(json.dumps({k: v for k, v in result.items() if k != 'rows'}))
     return 0 if result.get('integration_passed') else 1

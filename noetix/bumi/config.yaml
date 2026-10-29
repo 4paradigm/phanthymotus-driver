@@ -50,6 +50,18 @@ plugins:
     #   systemctl disable --now noetix-video-capture.service
     # Set false only when official App video transfer must retain the camera.
     disable_vendor_capture_service: true
+  # 只读 RGB-D 视觉里程计（RTAB-Map rgbd_odometry，在 bundle 进程内运行）。
+  # 无 IMU/EKF/融合，不参与运动控制，只发布 motus.odom/1 供查看/录包；
+  # 停止本卡片只回收它自己的估计子进程和私有话题，不影响相机/媒体/动作卡。
+  # 没有实测相机安装时位姿参考点是光学系（vendor.pose_reference=rgb_optical）。
+  visual_odometry:
+    enabled: true
+    # calibration:
+    #   calibration_id: measured-YYYYMMDD
+    #   fixed_mount: true
+    #   camera_to_body:
+    #     translation: [0.0, 0.0, 0.0]
+    #     quaternion: [0.0, 0.0, 0.0, 1.0]
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.

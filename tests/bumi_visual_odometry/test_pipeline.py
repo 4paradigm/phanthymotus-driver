@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from noetix.bumi_visual_odometry.pipeline import ChildProcesses, parameters
+from noetix.bumi.visual_odometry import ChildProcesses, parameter_file, parameters
 
 
 def test_parameters_are_visual_only():
@@ -51,8 +51,8 @@ def test_start_launches_exactly_one_visual_node_with_private_topics(tmp_path):
     assert 'odom_frame_id: seg_odom' in written
     written_lower = written.lower()
     assert 'imu0' not in written_lower and 'odom0' not in written_lower
-    # PyYAML is not in the runtime image; the hand-written file must still parse
-    # and must not turn the string "0" into an int parameter.
+    # The params file is hand-rendered; it must still parse and must not turn
+    # the string "0" into an int parameter.
     import yaml
     parsed = yaml.safe_load(written)['/**']['ros__parameters']
     assert parsed['frame_id'] == 'robot_rgb_optical'

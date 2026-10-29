@@ -509,11 +509,6 @@ category: driver                 # Fixed as "driver"
 hardware_provider: unitree       # Hardware vendor
 hardware_model: "g1"             # Hardware model
 image_name: g1                   # Docker image name (without registry prefix)
-# image_repository: noetix/bumi-visual-odometry  # Optional: image repo path,
-#                                                # default is ${provider}/${model}.
-#                                                # Needed by sidecar drivers that
-#                                                # share a hardware model with the
-#                                                # main bundle but need their own image.
 port: 15701                      # MCP HTTP port
 mcp_url: "http://localhost:15701/mcp"  # MCP endpoint
 description: "..."               # Device description
@@ -817,8 +812,7 @@ docker build -t g1-driver .
 
 - All Dockerfiles are based on ARM64 architecture
 - Tencent Cloud mirror sources are used for acceleration
-- Image naming format: `${REGISTRY}/${IMAGE_NAMESPACE}/${image_repository:-${provider}/${model}}:${TAG}`
-  (see `image_repository` in `driver.yaml` metadata above; without it the repository is `${provider}/${model}`)
+- Image naming format: `${REGISTRY}/${IMAGE_NAMESPACE}/${image_name}:${TAG}`
 - See `.env.example` for environment variable configuration
 
 ### Deployment via service.yml

@@ -1,6 +1,6 @@
 """The bundle camera subprocess owns the one RealSense pipeline.
 
-The optional raw RGB-D branch for the visual-odometry driver has to share that
+The optional raw RGB-D branch for the visual odometry card has to share that
 pipeline and must never be able to stop JPEG/Z16 media production. Only the
 hardware, codec, ROS and child-process boundaries are replaced here.
 """
@@ -121,8 +121,10 @@ def capture(monkeypatch):
     return device, state
 
 
-def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(capture, monkeypatch):
+def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(
+        capture, monkeypatch):
     device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
     seen = []
 
     class RawCameraPublisher:
@@ -145,6 +147,7 @@ def test_raw_branch_reuses_the_same_frameset_as_the_media_publishers(capture, mo
 
 def test_raw_publish_failures_never_stop_media_production(capture, monkeypatch, capsys):
     device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
     state.frame_limit = 2
     failures = []
 
@@ -169,6 +172,7 @@ def test_raw_publish_failures_never_stop_media_production(capture, monkeypatch, 
 
 def test_raw_branch_construction_failure_keeps_media_production(capture, monkeypatch, capsys):
     device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
 
     class RawCameraPublisher:
         def __init__(self, *args):
@@ -182,8 +186,26 @@ def test_raw_branch_construction_failure_keeps_media_production(capture, monkeyp
     assert state.stopped
 
 
+def test_raw_branch_is_off_when_the_visual_odometry_card_is_disabled(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    seen = []
+
+    class RawCameraPublisher:
+        def __init__(self, *args):
+            seen.append(args)
+
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(RawCameraPublisher=RawCameraPublisher))
+    device._camera_subprocess('robot')
+    assert seen == []
+    assert state.published['/robot/camera/color']
+    assert state.stopped
+
+
 def test_missing_raw_branch_module_is_optional(capture, monkeypatch, capsys):
     device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
     monkeypatch.setitem(sys.modules, 'visual_inputs', None)
     device._camera_subprocess('robot')
     assert state.published['/robot/camera/color']

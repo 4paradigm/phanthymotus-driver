@@ -123,6 +123,11 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        # The camera subprocess reads this env var; set it before any plugin can
+        # start that subprocess, so the raw RGB-D branch is published only when
+        # the visual odometry card is enabled.
+        if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
+            os.environ["BUMI_VISUAL_ODOMETRY"] = "1"
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -169,6 +174,15 @@ class BumiDeviceBundle:
             camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
             self._plugins.append(camera_plugin)
             print("[bundle] CameraPlugin loaded")
+
+        if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
+            if camera_plugin is None:
+                print("[bundle] VisualOdometryPlugin needs plugins.camera.enabled; skipped")
+            else:
+                from visual_odometry import VisualOdometryPlugin
+                self._plugins.append(VisualOdometryPlugin(
+                    plugins_cfg["visual_odometry"], namespace, executor))
+                print("[bundle] VisualOdometryPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
