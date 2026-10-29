@@ -18,7 +18,7 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | Field | Value |
 | --- | --- |
 | Tool / card | `rgbd_visual_odometry` (sensor, read-only) |
-| MCP actions | `start`, `stop`, `info`, `reset`, `config` |
+| MCP actions | `start`, `stop`, `info`, `config` (system actions only; no execution form/button) |
 | Canvas output | `/bumi_visual_odometry/status`, `std_msgs/msg/String`, port format `data/json`, about 5 Hz |
 | Full ROS output | `/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, 20 Hz |
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
@@ -68,8 +68,9 @@ RGB/depth source stamps must be within 20 ms. The sidecar validates the time
 domain and transport age, undistorts when the camera actually reports non-zero
 coefficients (OpenCV is available in the bundle image), rejects unusable depth
 and requires the RGB-D frame pair and CameraInfo to describe the same aligned
-frame. An unknown distortion model or a changed frame/intrinsics/epoch latches
-`lost` and requires `reset`.
+frame. An unknown distortion model or a changed frame/intrinsics/epoch ends the
+segment; the supervisor starts a fresh segment automatically, so no manual
+reset is required.
 
 ## Estimation
 

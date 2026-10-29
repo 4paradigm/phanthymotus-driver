@@ -90,7 +90,10 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     assert tool['topic_out'] == [{'topic': '/bumi_visual_odometry/status',
                                   'format': 'data/json'}]
     assert set(tool['inputSchema']['properties']['action']['enum']) == {
-        'start', 'stop', 'info', 'reset', 'config'}
+        'start', 'stop', 'info', 'config'}
+    assert tool['inputSchema']['x-action-params'] == {
+        'start': {'params': []}, 'stop': {'params': []},
+        'info': {'params': []}, 'config': {'params': ['calibration']}}
     assert set(tool['configSchema']['properties']) == {'calibration'}
     assert 'no IMU/EKF/fusion' in tool['description']
 

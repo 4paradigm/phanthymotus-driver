@@ -750,9 +750,20 @@ class VisualOdometryPlugin:
             'description': ('Bumi RGB-D visual odometry (RTAB-Map rgbd_odometry), read-only — '
                             'no IMU/EKF/fusion, not in the motion path. '
                             f'Canvas status: {STATUS_TOPIC}; full odometry: {OUTPUT_TOPIC}'),
-            'inputSchema': {'type': 'object', 'properties': {
-                'action': {'type': 'string',
-                           'enum': ['start', 'stop', 'info', 'reset', 'config']}}},
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'action': {'type': 'string',
+                               # Only system actions: a sensor card must not
+                               # render an execution form/button. Manual reset
+                               # is no longer exposed; recovery creates a new
+                               # segment automatically.
+                               'enum': ['start', 'stop', 'info', 'config']}},
+                'x-action-params': {
+                    'start': {'params': []},
+                    'stop': {'params': []},
+                    'info': {'params': []},
+                    'config': {'params': ['calibration']}}},
             'configSchema': {'type': 'object', 'properties': {
                 'calibration': {'type': 'object',
                                 'description': 'Optional measured camera_to_body mount; '
