@@ -135,7 +135,7 @@ class Plugin:
             return {"ok": False, "code": "INVALID_ARGUMENT", "message": "side must be left, right, or both", "details": {}}
         positions = _side_pose(PRESETS[gesture]["left"], PRESETS[gesture]["right"], side)
         command_args = {"targets": [{"joint_name": name, "position_rad": position} for name, position in positions.items()]}
-        result = self._control.dispatch("set", command_args)
+        result = self._control.set_targets(command_args, source=gesture)
         if result.get("ok"):
             result["gesture"] = gesture
             result["side"] = side
