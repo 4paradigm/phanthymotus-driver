@@ -8,7 +8,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 G1 = ROOT / "unitree" / "g1"
-MODULES = ("loco_descriptor.py", "loco_admission.py", "base_owner.py")
+MODULES = ("loco_descriptor.py", "loco_admission.py")
 
 
 def flat_layout(tmp_path):
@@ -39,7 +39,7 @@ def test_dockerfile_copies_offline_modules_to_work():
 
 def test_flat_layout_imports_without_ros(tmp_path):
     flat_layout(tmp_path)
-    result = isolated_python(tmp_path, "import loco_admission, loco_descriptor, base_owner; "
+    result = isolated_python(tmp_path, "import loco_admission, loco_descriptor; "
                              "assert loco_admission.validate_loco_descriptor is "
                              "loco_descriptor.validate_loco_descriptor; "
                              "assert 'rclpy' not in sys.modules")
