@@ -5,7 +5,8 @@ model_variant: "pro"
 navigation_task_timeout: 180
 basic_server:
   enabled: true
+  # Set this to the robot's reachable basic_server address.  It may also be
+  # overridden with S10_BASIC_SERVER_HOST at deployment time.
   host: "10.21.33.103"
-  tls_tcp_port: 30003
+  tcp_port: 30003
   timeout: 2.0
-  ca_cert: ""

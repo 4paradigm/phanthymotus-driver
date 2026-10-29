@@ -6,6 +6,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/lynx-s10-requirements.
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py basic_server.py config.yaml driver.yaml /work/deep_robotics/lynx_s10/
+COPY resource/ /work/deep_robotics/lynx_s10/resource/
 COPY deploy/ /deploy/
 ENV PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15724

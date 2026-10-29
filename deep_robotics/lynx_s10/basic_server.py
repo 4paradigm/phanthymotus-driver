@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Lynx S10 documented TLS/TCP basic_server framing and client."""
+"""Lynx S10 basic_server TCP framing and client."""
 
 from __future__ import annotations
 
 import json
+import os
 import socket
-import ssl
 import struct
 import threading
 import time
@@ -100,16 +100,15 @@ class StreamDecoder:
 
 
 class BasicServerClient:
-    """TLS/TCP native client. Certificate verification stays enabled by default."""
+    """Native TCP client for the S10 basic_server protocol."""
 
     def __init__(self, config: dict):
         native = config.get("basic_server", {})
-        self.host = str(native.get("host", "10.21.33.103"))
-        self.port = int(native.get("tls_tcp_port", 30003))
+        self.host = str(os.environ.get("S10_BASIC_SERVER_HOST", native.get("host", "10.21.33.103")))
+        self.port = int(native.get("tcp_port", native.get("tls_tcp_port", 30003)))
         self.timeout = float(native.get("timeout", 2.0))
         self.config = config
         self.enabled = bool(native.get("enabled", True))
-        self.context = ssl.create_default_context(cafile=native.get("ca_cert") or None)
         self._socket = None
         self._decoder = StreamDecoder()
         self._lock = threading.RLock()
@@ -132,13 +131,8 @@ class BasicServerClient:
 
     def _connect(self):
         if self._socket is None:
-            raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
-            try:
-                self._socket = self.context.wrap_socket(raw, server_hostname=self.host)
-                self._socket.settimeout(None)
-            except Exception:
-                raw.close()
-                raise
+            self._socket = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            self._socket.settimeout(None)
 
     def _remember(self, payload):
         body = payload.get("PatrolDevice", {})
@@ -163,7 +157,7 @@ class BasicServerClient:
             payload = self._responses.pop(message_id, None)
             self._pending.pop(message_id, None)
         if payload is None:
-            raise TimeoutError("S10 TLS/TCP response timed out")
+            raise TimeoutError("S10 TCP response timed out")
         return payload
 
     def send(self, message_type: int, command: int, items: dict | None = None):
@@ -175,7 +169,7 @@ class BasicServerClient:
             self._ensure_reader()
             message_id = self._next_id()
             self._socket.sendall(encode_frame(message_id, message_type, command, items))
-            return {"state": "sent", "transport": "TLS/TCP", "message_id": message_id,
+            return {"state": "sent", "transport": "TCP", "message_id": message_id,
                     "type": int(message_type), "command": int(command)}
 
     def _ensure_reader(self):
@@ -194,7 +188,7 @@ class BasicServerClient:
             try:
                 data = connection.recv(65536)
                 if not data:
-                    raise ConnectionError("S10 TLS/TCP connection closed")
+                    raise ConnectionError("S10 TCP connection closed")
                 for message_id, payload in self._decoder.feed(data):
                     self._remember(payload)
                     body = payload.get("PatrolDevice", {})
@@ -202,7 +196,7 @@ class BasicServerClient:
                         if self._pending.get(message_id) == (body.get("Type"), body.get("Command")):
                             self._responses[message_id] = payload
                             self._response_condition.notify_all()
-            except (OSError, ssl.SSLError, ConnectionError) as exc:
+            except (OSError, ConnectionError) as exc:
                 self.last_error = str(exc)
                 self.close_socket()
                 with self._response_condition:
@@ -225,7 +219,7 @@ class BasicServerClient:
     def snapshot(self):
         with self._state_lock:
             reports = dict(self.reports)
-        return {"enabled": self.enabled, "transport": "TLS/TCP", "host": self.host,
+        return {"enabled": self.enabled, "transport": "TCP", "host": self.host,
                 "port": self.port, "connected": self._socket is not None,
                 "last_error": self.last_error, "reports": reports}
 
