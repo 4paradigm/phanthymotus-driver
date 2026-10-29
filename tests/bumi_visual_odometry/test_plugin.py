@@ -224,15 +224,15 @@ def test_summary_throttle_keeps_the_twenty_hz_odom_and_immediate_lost_transition
     assert len(node.node.messages) == 20
     assert len(node.node.topics['/bumi_visual_odometry/status']) == 5
     assert node.node.timers[0][0] == .05
-    # Lose freshness only 150 ms after the last summary: do not wait for 5 Hz.
-    clock[0] = 950_000_000
-    node.node.time += 500_000_001
+    # Lose freshness after the one-second camera watchdog: do not wait for 5 Hz.
+    clock[0] = 1_450_000_000
+    node.node.time += 1_000_000_001
     node.tick()
     assert len(node.node.topics['/bumi_visual_odometry/status']) == 6
     assert summary(node)['status'] == 'lost'
     assert summary(node)['position_m'] is None
     assert summary(node)['displacement_m'] is None
-    assert summary(node)['age_ms'] == 500.
+    assert summary(node)['age_ms'] == 1000.
     assert last(plugin)['pose'] is None
 
 

@@ -45,6 +45,7 @@ def test_card_and_plugin_config_are_in_sync():
     cal = plugin['calibration']
     assert cal['calibration_id'] == 'assumed-level-forward-optical-to-body'
     assert cal['fixed_mount'] is True
+    assert cal['assumed'] is True
     assert cal['camera_to_body']['quaternion'] == [-0.5, 0.5, -0.5, 0.5]
     assert cal['camera_to_body']['translation'] == [0.0, 0.0, 0.0]
     # The tool name lives in code; keep the driver card pointing at it.

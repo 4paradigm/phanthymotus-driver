@@ -218,3 +218,16 @@ def test_level_forward_mount_maps_optical_axes_to_robot_body_axes():
     assert apply([1., 0., 0.]) == [0., -1., 0.]
     assert apply([0., 1., 0.]) == [0., 0., -1.]
     assert apply([0., 0., 1.]) == [1., 0., 0.]
+
+
+def test_one_point_eight_hz_capture_does_not_trip_the_camera_watchdog():
+    # The older shared-capture cadence was ~556 ms between frames. The camera
+    # watchdog is 1 s so that cadence still produces tracking observations.
+    health = Health('s', None, started_ns=0)
+    for i in range(4):
+        t = i*556_000_000
+        for kind in health.kinds:
+            health.observe(kind, t, t, True)
+    quality = health.status(4*556_000_000)
+    assert quality['status'] == 'tracking'
+    assert quality['input_age_ms']['camera'] < 1000

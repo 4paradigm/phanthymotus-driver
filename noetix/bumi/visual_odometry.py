@@ -317,7 +317,12 @@ class VisualOdometryNode:
         return self.segment+'_base'
 
     def pose_reference(self):
-        return 'body' if self.calibration is not None else 'rgb_optical'
+        if self.calibration is None:
+            return 'rgb_optical'
+        # `body` is reserved for a measured mount; the shipped level-forward
+        # convention is reported as body_axes so consumers never mistake an
+        # assumed axis mapping for a measured reference point.
+        return 'body_axes' if self.calibration.assumed else 'body'
 
     def publish(self):
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())

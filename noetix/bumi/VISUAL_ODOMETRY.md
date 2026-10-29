@@ -39,9 +39,9 @@ Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
 The shipping `config.yaml` sets a permanent **body-axis convention** for the
 standard level, forward-facing camera: `x` forward, `y` left, `z` up
-(`pose_reference=body`). It is an axis assumption, not a measured extrinsic; the
-pose origin is the camera because the default translation is zero. Reset starts
-a new segment and distance origin.
+(`pose_reference=body_axes`). It is an axis assumption, not a measured extrinsic;
+the pose origin is the camera because the default translation is zero. Reset
+starts a new segment and distance origin.
 
 Only the summary is declared as a canvas output, because the monitor creates a
 panel for every declared output. Existing ROS subscribers can continue using
@@ -51,10 +51,11 @@ segment/calibration IDs and visual diagnostics; the same sample is returned as
 `sample`, with `odom_topic` pointing to the original ROS output. Details are a
 snapshot: reopen them to refresh.
 
-The 20 Hz supervision keeps the camera feed on a 500 ms stale clock, while
-RTAB-Map results and diagnostics get a 1.5 s grace: walking increased observed
-processing intervals from 0.13 s to 0.37 s, and a 500 ms visual edge was below
-the real latency. A single bad pose is dropped. An `OdomInfo` that explicitly
+The 20 Hz supervision keeps the camera feed on a 1 s stale clock (measured raw
+cadence is ~8.3 Hz, worst observed motion gap ~0.4 s; the old 1.8 Hz
+documentation predates the bundle raw branch), while RTAB-Map results and
+diagnostics get a 1.5 s grace: walking increased observed processing intervals
+from 0.13 s to 0.37 s. A single bad pose is dropped. An `OdomInfo` that explicitly
 reports `lost` or falls below the inlier floor ends the segment immediately
 (the current pose is cleared, not published as tracking); the delayed restart
 then starts a **new segment** (fresh estimator, fresh odom frame). Sustained
@@ -90,7 +91,7 @@ reset is required.
   The validated pair is forwarded as one `rtabmap_msgs/RGBDImage` with both
   source image stamps preserved (`subscribe_rgbd: true`), avoiding a second
   approximate synchronizer waiting for another frame. The 20 ms source-pair
-  check and the camera 250/500 ms freshness limits are unchanged; RTAB-Map
+  check and the camera 250 ms/1 s freshness limits are unchanged; RTAB-Map
   results get the 1.5 s grace described above.
 - One segment-scoped static TF `base -> optical` is published before the child
   starts. The default config uses the standard level-forward rotation
@@ -112,8 +113,9 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
   `child_frame_id` is `<segment>_base`, which carries robot body axes by default
   (x forward, y left, z up) at the camera origin.
 - `vendor`: `status` (`initializing`/`tracking`/`lost`), `reason`, `segment_id`,
-  `calibration_id`, `pose_reference` (`body` by the shipped level-forward
-  assumption; `rgb_optical` only if calibration is removed),
+  `calibration_id`, `pose_reference` (`body_axes` by the shipped level-forward
+  assumption; `body` for a measured mount; `rgb_optical` if calibration is
+  removed),
   `visual_diagnostic`, `input_age_ms`, `visual_stamp_ns`,
   `camera_time_provenance`, `source: rtabmap_rgbd_odometry`, `accuracy_validated:
   false`, `twist_source: null`.
@@ -129,6 +131,7 @@ match a robot body frame without a manual step:
     calibration:
       calibration_id: assumed-level-forward-optical-to-body
       fixed_mount: true
+      assumed: true
       camera_to_body:
         translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
@@ -187,7 +190,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `482 passed` in the Bumi suite; the
+ROS-free regression for this branch: `483 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.
@@ -198,10 +201,11 @@ to `initializing`, so it cannot inject invented odometry before those checks.
 
 ## Limitations
 
-- Historical shared capture rate is about 1.8 Hz; fast rotation, low texture and
+- Measured raw-branch cadence is about 8.3 Hz at the 10 Hz cap (the old sidecar
+  figure of ~1.8 Hz predates this branch); fast rotation, low texture and
   occlusion make loss expected, and loss is latched rather than degraded.
 - No loop closure/global relocalization; drift is unbounded by design.
 - The camera source has no confirmed exposure timestamp; the device-to-host
   mapping is an arrival-time approximation.
-- 20 ms pairing, 10 inliers, 0.2 m position sigma and the 250/500 ms ages are
+- 20 ms pairing, 10 inliers, 0.2 m position sigma and the 250 ms/1 s ages are
   rejection thresholds, not accuracy guarantees.

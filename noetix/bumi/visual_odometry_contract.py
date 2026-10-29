@@ -8,9 +8,10 @@ agree with it" and nothing more.
 
 ``motus.odom/1`` stays unchanged. Everything visual-specific lives in ``vendor``:
 segment, diagnostic counters, input ages and the frame the pose is expressed in.
-The pose is in the camera optical frame by default because no measured
-camera-to-body mount exists yet; a measured ``camera_to_body`` may be configured
-to report the same pose at the body reference point.
+The pose is in the camera optical frame unless a mount is configured. The
+shipped config uses an explicitly assumed level-forward mount to report robot
+body axes (``pose_reference=body_axes``); only a measured ``camera_to_body`` is
+reported as ``body`` with a measured reference point.
 """
 from __future__ import annotations
 import math
@@ -23,7 +24,7 @@ from common.odom import build_sample
 # acceptance tests PR #425 used for the shared raw streams.
 MAX_SKEW_NS = 20_000_000            # RGB/depth capture-time difference
 MAX_TRANSPORT_NS = 250_000_000      # publisher -> subscriber age
-MAX_INPUT_AGE_NS = 500_000_000      # camera stream older than this is stale
+MAX_INPUT_AGE_NS = 1_000_000_000      # camera stream older than this is stale
 MAX_VISUAL_AGE_NS = 1_500_000_000   # RTAB result/diagnostic older than this is stale
 AGE_LIMITS = {'camera': MAX_INPUT_AGE_NS, 'visual': MAX_VISUAL_AGE_NS,
               'diagnostic': MAX_VISUAL_AGE_NS}
@@ -60,11 +61,15 @@ def rotate(r, v):
 def camera_to_body(position, quaternion, mount):
     """Express an optical-frame pose at the body reference point.
 
-    ``mount`` carries the measured ``translation`` (camera origin in body
-    coordinates) and ``quaternion`` (optical C to body B, normalized xyzw).
-    Returns ``(position, quaternion)``. This is a rigid change of reference
-    point, not a fusion step: the same visual trajectory is being described from
-    a different point, with the lever arm included while the body turns.
+    ``mount`` carries the ``translation`` (camera origin in body coordinates)
+    and ``quaternion`` (optical C to body B, normalized xyzw). Returns
+    ``(position, quaternion)``.
+
+    The runtime does **not** call this: it publishes the mount as the static
+    ``base -> optical`` TF before starting RTAB-Map, so the estimator itself
+    produces ``odom -> base`` and applying this transform again would rotate the
+    pose twice. This pure function remains the contract/test reference for the
+    frame change; keep it in sync with ``mount_transform``.
     """
     rc = quat_matrix(quaternion)
     rm = quat_matrix(mount['quaternion'])
@@ -92,6 +97,9 @@ class CameraCalibration:
             self.id = data['calibration_id']
             if not isinstance(self.id, str) or not self.id or data['fixed_mount'] is not True:
                 raise ValueError('measured fixed installation required')
+            self.assumed = data.get('assumed', False)
+            if not isinstance(self.assumed, bool):
+                raise ValueError('assumed must be a boolean')
             finite(data['camera_to_body']['translation'], 3)
             quat_matrix(data['camera_to_body']['quaternion'])
         except (KeyError, TypeError) as exc:

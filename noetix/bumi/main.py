@@ -130,6 +130,11 @@ class BumiDeviceBundle:
             os.environ["BUMI_VISUAL_ODOMETRY"] = "1"
             os.environ["BUMI_VISUAL_ODOMETRY_MAX_FPS"] = str(
                 plugins_cfg["visual_odometry"].get("max_rate_hz", 10))
+        else:
+            # A stale environment must not keep a configured-off raw branch
+            # publishing in the camera child.
+            os.environ.pop("BUMI_VISUAL_ODOMETRY", None)
+            os.environ.pop("BUMI_VISUAL_ODOMETRY_MAX_FPS", None)
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
