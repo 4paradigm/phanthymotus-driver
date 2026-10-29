@@ -369,3 +369,10 @@ def test_lost_diagnostic_clears_the_pose_before_the_restart(plugin):
     assert sample['vendor']['status'] == 'lost'
     assert sample['pose'] is None
     assert 'tracking lost' in sample['vendor']['reason']
+
+
+def test_camera_epoch_change_requests_a_restart(plugin):
+    node = started_node(plugin)
+    node.epochs['camera'] = 'old-epoch'
+    node.metadata(NS(data=json.dumps({'epoch': 'new-epoch'})))
+    assert node.restart_requested == 'camera input restarted'

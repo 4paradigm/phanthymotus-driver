@@ -33,6 +33,7 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         build-essential \
         curl \
         git \
+        gnupg \
         libusb-1.0-0 \
         libportaudio2 \
         libasound2-dev \
@@ -66,6 +67,14 @@ RUN set -eu; \
     fi; \
     test -s /usr/share/keyrings/ros-archive-keyring.gpg; \
     . /etc/os-release; \
+    # Pin the ROS archive key instead of trusting any HTTPS response. This is
+    # the Open Robotics ROS 2 signing key (verified with gpg --show-keys).
+    key_fpr="$(gpg --batch --show-keys --with-colons /usr/share/keyrings/ros-archive-keyring.gpg 2>/dev/null | awk -F: '$1 == "fpr" {print $10; exit}')"; \
+    if [ "$key_fpr" != "C1CF6E31E6BADE8868B172B4F42ED6FBAB17C654" ]; then \
+      echo "unexpected ROS archive key fingerprint: ${key_fpr:-<none>}" >&2; \
+      rm -f /usr/share/keyrings/ros-archive-keyring.gpg; \
+      exit 1; \
+    fi; \
     installed=0; \
     for src in "${ROS_APT_MIRROR}" https://packages.ros.org/ros2/ubuntu; do \
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \

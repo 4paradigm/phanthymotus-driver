@@ -90,3 +90,10 @@ def test_successful_empty_download_is_rejected(tmp_path):
     assert calls
     assert result.returncode != 0
     assert not key.read_bytes()
+
+
+def test_dockerfile_pins_the_ros_archive_key_fingerprint():
+    text = DOCKERFILE.read_text()
+    assert 'key_fpr' in text
+    assert 'C1CF6E31E6BADE8868B172B4F42ED6FBAB17C654' in text
+    assert 'gnupg' in text

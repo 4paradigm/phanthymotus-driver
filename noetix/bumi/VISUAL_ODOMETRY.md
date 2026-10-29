@@ -191,7 +191,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `489 passed` in the Bumi suite; the
+ROS-free regression for this branch: `491 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.

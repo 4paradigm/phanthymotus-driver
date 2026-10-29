@@ -454,7 +454,18 @@ class VisualOdometryNode:
 
     def metadata(self, msg):
         data = json.loads(msg.data)
-        self._epoch('camera', data['epoch'])
+        epoch = data.get('epoch')
+        if not isinstance(epoch, str) or not epoch:
+            raise ValueError('missing input epoch')
+        if 'camera' in self.epochs and self.epochs['camera'] != epoch:
+            # A camera/raw publisher restart creates a new epoch. Do not raise
+            # here: the old segment cannot accept the frame, and raising would
+            # latch the card while the camera may already be healthy again.
+            # The timer will restart into a fresh segment and accept the new
+            # epoch; this also covers a long outage followed by a new process.
+            self.request_restart('camera input restarted')
+            return
+        self.epochs['camera'] = epoch
         t = data['rgb_stamp_ns']
         now = self.now()
         if abs(t-data['depth_stamp_ns']) > MAX_SKEW_NS:
