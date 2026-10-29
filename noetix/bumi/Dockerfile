@@ -48,9 +48,14 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
 # archive is configured), so `ros-humble-*` is invisible to apt until the ROS
 # repository and its signing key are added. Only rtabmap-odom is installed
 # explicitly: it declares tf2_ros and the message packages itself, so repeating
-# them here would not change the installed set. Try the configured mirror first and
-# fall back to the official archive; the key itself is tried from the same
-# mirror and GitHub over HTTPS only.
+# them here would not change the installed set. Measured ARM64 image size: the
+# Bumi image grows from ~2.1 GB (before RTAB-Map) to ~4.8 GB uncompressed
+# (~+2.7 GB), almost all of it the PCL/Qt/VTK transitive dependencies of the
+# official rtabmap-odom package. There is no smaller official package for the
+# estimator and the single-container design rules out a separate image; this is
+# the minimal viable package set. Try the configured mirror first and fall back
+# to the official archive; the key itself is tried from the same mirror and
+# GitHub over HTTPS only.
 RUN set -eu; \
     if [ ! -s /usr/share/keyrings/ros-archive-keyring.gpg ]; then \
       for key in https://mirrors.tuna.tsinghua.edu.cn/rosdistro/ros.key \

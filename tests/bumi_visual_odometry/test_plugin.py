@@ -25,6 +25,18 @@ def executor(monkeypatch):
         def __init__(self, data=False):
             self.data = data
 
+    class QoSProfile:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.__dict__.update(kwargs)
+
+    class Policies:
+        RELIABLE = 'reliable'
+        BEST_EFFORT = 'best_effort'
+        TRANSIENT_LOCAL = 'transient_local'
+        VOLATILE = 'volatile'
+        KEEP_LAST = 'keep_last'
+
     class Node:
         def __init__(self, *args):
             self.messages = []
@@ -55,7 +67,11 @@ def executor(monkeypatch):
             self.destroyed = True
 
     for name, attrs in (('rclpy.node', {'Node': Node}),
-                        ('rclpy.qos', {'qos_profile_sensor_data': object()}),
+                        ('rclpy.qos', {'qos_profile_sensor_data': object(),
+                                       'QoSProfile': QoSProfile,
+                                       'ReliabilityPolicy': Policies,
+                                       'DurabilityPolicy': Policies,
+                                       'HistoryPolicy': Policies}),
                         ('std_msgs.msg', {'String': String, 'Bool': Bool})):
         fake = ModuleType(name)
         fake.__dict__.update(attrs)
@@ -329,9 +345,11 @@ def test_start_and_stop_toggle_the_shared_raw_branch(plugin):
     plugin.dispatch('start', {})
     raw_topic = plugin._node.raw_control_topic
     assert raw_topic == '/robot/odometry_input/raw_enabled'
-    assert [m.data for m in plugin._node.node.topics[raw_topic]] == [True]
+    # Latched stopped state is published at construction, then true on start.
+    assert [m.data for m in plugin._node.node.topics[raw_topic]] == [False, True]
+    assert plugin._node.raw_control_qos.kwargs['durability'] == 'transient_local'
     plugin.dispatch('stop', {})
-    assert [m.data for m in plugin._node.node.topics[raw_topic]] == [True, False]
+    assert [m.data for m in plugin._node.node.topics[raw_topic]] == [False, True, False]
 
 
 def test_lost_diagnostic_clears_the_pose_before_the_restart(plugin):

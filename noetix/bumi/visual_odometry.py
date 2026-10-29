@@ -233,10 +233,22 @@ class VisualOdometryNode:
         # The raw RGB-D producer lives in the camera subprocess. This private
         # control topic is the lifecycle signal: stop disables the shared
         # branch, start re-enables it, matching what sensor-card stop means.
+        # Transient-local keeps the latest state latched for a camera process
+        # that starts (or restarts) after the card, so it cannot default back
+        # to publishing while the card is stopped.
         from std_msgs.msg import Bool
+        from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
+                               HistoryPolicy)
         self.Bool = Bool
         self.raw_control_topic = f'/{namespace}/odometry_input/raw_enabled'
-        self.raw_control = self.node.create_publisher(Bool, self.raw_control_topic, 10)
+        self.raw_control_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.raw_control = self.node.create_publisher(
+            Bool, self.raw_control_topic, self.raw_control_qos)
+        # Latch the stopped state before any camera process can subscribe.
+        self._set_raw_enabled(False)
         self.directory = tempfile.TemporaryDirectory(prefix='bumi-visual-odometry-')
         self.children = ChildProcesses(self.directory.name)
         self.input_subs = []

@@ -2320,6 +2320,12 @@ def _camera_subprocess(namespace: str):
         depth=1,
         durability=DurabilityPolicy.VOLATILE,
     )
+    _CONTROL_QOS = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
 
     import pyrealsense2 as rs
     import cv2
@@ -2429,7 +2435,8 @@ def _camera_subprocess(namespace: str):
                 from std_msgs.msg import Bool
                 node.create_subscription(
                     Bool, f"/{namespace}/odometry_input/raw_enabled",
-                    lambda msg: setattr(raw_inputs, "enabled", bool(msg.data)), 10)
+                    lambda msg: setattr(raw_inputs, "enabled", bool(msg.data)),
+                    _CONTROL_QOS)
             except Exception as _e:
                 print(f"[camera_subprocess] raw enable control unavailable: {_e}", flush=True)
 

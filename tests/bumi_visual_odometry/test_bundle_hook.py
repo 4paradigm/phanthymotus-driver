@@ -112,6 +112,10 @@ def capture(monkeypatch):
     monkeypatch.setattr(messages, 'CompressedImage', Message)
     monkeypatch.setattr(messages, 'Image', Message)
     sys.modules['std_msgs.msg'].Bool = Bool
+    qos = sys.modules['rclpy.qos']
+    qos.ReliabilityPolicy.RELIABLE = 'reliable'
+    qos.DurabilityPolicy.TRANSIENT_LOCAL = 'transient_local'
+    qos.QoSProfile = lambda **kwargs: NS(**kwargs)
 
     class Node:
         def __init__(self, name):
@@ -124,6 +128,8 @@ def capture(monkeypatch):
 
         def create_subscription(self, cls, topic, callback, qos):
             self.subscriptions[topic] = callback
+            self.subscription_qos = getattr(self, 'subscription_qos', {})
+            self.subscription_qos[topic] = qos
             return NS()
 
         def get_clock(self):
@@ -328,3 +334,35 @@ def test_raw_control_stops_publications_but_not_media(capture, monkeypatch):
     assert len(published) == 1
     assert len(state.published['/robot/camera/color']) == 3
     assert len(state.published['/robot/camera/depth']) == 3
+
+
+def test_camera_starts_raw_disabled_until_the_latched_enable_arrives(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.setenv('BUMI_VISUAL_ODOMETRY', '1')
+    state.frame_limit = 3
+    published = []
+
+    class RawCameraPublisher:
+        enabled = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def publish(self, source_frames, aligned_frames):
+            published.append(source_frames)
+
+    def on_spin(node):
+        if state.iterations == 1:
+            callback = node.subscriptions['/robot/odometry_input/raw_enabled']
+            callback(NS(data=True))
+
+    state.on_spin = on_spin
+    monkeypatch.setitem(sys.modules, 'visual_inputs',
+                        NS(RawCameraPublisher=RawCameraPublisher))
+    device._camera_subprocess('robot')
+    # Frame one: no retained enable yet, so no raw publication. The latched
+    # enable arrives on the next tick; frames two and three publish raw.
+    assert len(published) == 2
+    assert len(state.published['/robot/camera/color']) == 3
+    assert state.node.subscription_qos[
+        '/robot/odometry_input/raw_enabled'].durability == 'transient_local'

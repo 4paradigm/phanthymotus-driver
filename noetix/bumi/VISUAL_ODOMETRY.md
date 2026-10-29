@@ -24,9 +24,11 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
 
 `stop` reaps the estimator child and the card's private topics, and sends a
-`Bool(false)` on the private `/<NS>/odometry_input/raw_enabled` control topic so
-the camera subprocess stops converting/serializing the raw RGB-D branch too.
-`start` sends `Bool(true)` and resumes it. The shared camera pipeline, the
+transient-local `Bool(false)` on the private `/<NS>/odometry_input/raw_enabled`
+control topic so the camera subprocess stops converting/serializing the raw
+RGB-D branch too. The latched sample is delivered even if the camera process
+starts late or is restarted while the card is stopped; the camera branch defaults
+to disabled. `start` sends `Bool(true)` and resumes it. The shared camera pipeline, the
 `camera`/`depth` cards, photo/video capture, audio and every motion card keep
 running; only the visual-odometry branch and estimator are affected.
 
@@ -185,7 +187,7 @@ accuracy validation.
 
 ## Validation status
 
-ROS-free regression for this branch: `480 passed` in the Bumi suite; the
+ROS-free regression for this branch: `482 passed` in the Bumi suite; the
 visual-odometry tests cover the pose/quality contract, launch parameters (single
 estimator, no EKF/IMU), plugin lifecycle/actions, static TF/mount and the gated
 camera-subprocess raw branch.

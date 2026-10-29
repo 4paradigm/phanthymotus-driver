@@ -67,12 +67,14 @@ def raw_ros(monkeypatch):
     return messages, node
 
 
-def publisher(raw_ros, depth_scale=.002):
+def publisher(raw_ros, depth_scale=.002, enabled=True):
     messages, node = raw_ros
     pipeline = NS(get_active_profile=lambda: NS(
         get_device=lambda: NS(first_depth_sensor=lambda: NS(
             get_depth_scale=lambda: depth_scale))))
-    return RawCameraPublisher(node, 'robot', pipeline, object()), messages
+    raw_publisher = RawCameraPublisher(node, 'robot', pipeline, object())
+    raw_publisher.enabled = enabled
+    return raw_publisher, messages
 
 
 def frames(model='distortion.brown_conrady', coeffs=None, ms=1000):
@@ -217,6 +219,15 @@ def test_raw_publisher_obeys_the_card_lifecycle(raw_ros):
     raw_publisher.publish(frames(), frames())
     for topic in ('rgb', 'depth', 'info', 'camera_meta'):
         assert messages['/robot/odometry_input/'+topic] == []
+    raw_publisher.enabled = True
+    raw_publisher.publish(frames(), frames())
+    assert len(messages['/robot/odometry_input/rgb']) == 1
+
+
+def test_raw_publisher_starts_disabled_until_the_card_latches_enable(raw_ros):
+    raw_publisher, messages = publisher(raw_ros, enabled=False)
+    raw_publisher.publish(frames(), frames())
+    assert not any(messages.values())
     raw_publisher.enabled = True
     raw_publisher.publish(frames(), frames())
     assert len(messages['/robot/odometry_input/rgb']) == 1

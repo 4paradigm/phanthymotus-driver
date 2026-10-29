@@ -51,9 +51,11 @@ class RawCameraPublisher:
         self.min_interval_s = max(0.0, float(min_interval_s))
         self.last_publish = 0.0
         # Controlled by the visual-odometry card lifecycle: stop publishes a
-        # Bool=False on the enable topic so this shared camera process stops
-        # converting/serializing raw frames until start re-enables it.
-        self.enabled = True
+        # latched Bool=False on the enable topic so this shared camera process
+        # stops converting/serializing raw frames until start re-enables it.
+        # Start disabled: the camera process may come up before the card's
+        # retained enable sample is delivered.
+        self.enabled = False
 
     def publish(self, source_frames, aligned_frames):
         """Faults in the optional branch never take down the media producer."""
