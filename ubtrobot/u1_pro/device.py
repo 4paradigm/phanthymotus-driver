@@ -893,7 +893,22 @@ class U1Nodes:
             self.set_mic_enabled(False)
         self._mic_forwarding = False
         self.stop_mic_reader()
-        opened = self.trigger_call("audio_open")
+        self._mic_sdk_error = ""
+        try:
+            opened = self.trigger_call("audio_open")
+        except TimeoutError as exc:
+            # On this firmware domain-2 raw audio can be live while the SDK
+            # open RPC never replies. Use the existing topic conversion path;
+            # MicPlugin.start still requires a NEW PCM frame before readiness.
+            self._mic_frames = 0
+            self._mic_frame_event.clear()
+            self._mic_sdk_error = str(exc)[:256]
+            with self._mic_source_lock:
+                self._mic_source = "topic"
+                self._mic_pending_topic = None
+            self._mic_forwarding = True
+            return {"state": "waiting_for_audio", "source": "device raw-topic fallback",
+                    "sdk_warning": self._mic_sdk_error}
         if _vendor_request_failed(opened):
             raise RuntimeError("U1 Pro audio stream open was rejected")
         self._mic_stream_open = True
@@ -1470,6 +1485,10 @@ class MicPlugin:
         leveler = getattr(self.nodes, "_mic_leveler", None)
         if leveler is not None:
             result["audio_processing"] = leveler.status()
+        warning = getattr(self.nodes, "_mic_sdk_error", "")
+        if isinstance(warning, str) and warning:
+            result["sdk_warning"] = warning
+            result["audio_source"] = getattr(self.nodes, "_mic_source", None)
         return result
 
     def start(self):

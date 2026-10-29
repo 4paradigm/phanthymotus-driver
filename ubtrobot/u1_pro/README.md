@@ -233,3 +233,9 @@ native 后端现在先判断声音活动，再接受厂商方位事件；保持�
 
 
 现场 A/B 基线：操作者确认 `release.261029.474df1d` 真人说话和画布效果可用，手机音乐未触发。基线配置为 `minimum_dbfs: -65.0`、`margin_db: 3.0`，settle 0.5 秒、pause hold 0.8 秒。下一组仅将 margin 改为 2.5dB，其他不变；当前常见背景水平下有效门限降低 0.5dB。调参比较时应保持相同位置/距离，分别测试轻声、普通说话、安静误触发；音乐未触发不能单凭此判定硬件只支持人声，门控本身不做语音分类。
+
+### mic 启动时 SDK open_stream 超时
+
+部分固件会持续发布 domain 2 的 `/sys/device/audio_in/raw`，但 domain 20 的 `/robo/audio/call/open_stream` 不返回。驱动现在仅在该打开调用抛出 TimeoutError 时，启用已有原始音频转换路径；MicPlugin 仍须收到新 PCM 帧才报告 running，旧会话事件会清除，没有音频仍返回错误并停止转发。SDK 的明确拒绝/其他异常不被吞掉。
+
+`mic info` 会保留 `sdk_warning` 并显示 `audio_source: topic`。这是音频输入降级，不是伪造 SDK 打开成功；超时的远端请求最终是否执行仍不确定，停止该输入只释放本驱动的转发，不冒认共享 SDK 流的所有权。无需重启厂商服务、改行为开关或重新接线。原始通道音质与 SDK 路径可能不同，真实语音识别效果仍需验收。
