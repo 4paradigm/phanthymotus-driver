@@ -319,6 +319,14 @@ def test_main_fails_closed_for_missing_or_mismatched_robot_network(monkeypatch, 
     assert not (tmp_path / "outside-cidr.xml").exists()
 
 
+def test_service_configures_verified_s10_robot_network_without_shell_exports():
+    service_path = DRIVER / "deploy" / "service.yml"
+    service = yaml.safe_load(service_path.read_text(encoding="utf-8"))["deep-robotics-lynx-s10"]
+    environment = dict(item.split("=", 1) for item in service["environment"])
+    assert environment["NETWORK_INTERFACE"] == "eth0"
+    assert environment["ROBOT_NETWORK_CIDR"] == "10.21.33.0/24"
+
+
 def test_skeleton_maps_all_s10_motor_fields_and_urdf_order(monkeypatch):
     device = _load_device(monkeypatch)
     raw = [{"q": idx / 10, "dq": 1, "tau": 2, "temperature": [30]} for idx in range(16)]

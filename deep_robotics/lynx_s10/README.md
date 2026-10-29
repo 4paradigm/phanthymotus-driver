@@ -29,11 +29,11 @@ Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避
 
 ## ROS 2
 
-指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。bundle 使用仓库统一的 `run_driver` 双域 ROS 运行时：机器人域订阅标准消息，Agent Core 域发布 `topic_out`；原生 TCP 仍负责动作和设备状态。Fast DDS profile 在创建 ROS context 前生成，两个 ROS context 共用这个进程级 profile。部署必须在 Compose 环境中显式设置 `S10_NETWORK_INTERFACE` 与 `S10_ROBOT_NETWORK_CIDR`；启动时验证接口 IPv4、其直连子网和配置中的 basic_server 地址均属于指定的私有机器人网段，且 CIDR 不宽于 `/24`，缺少配置或不匹配时拒绝启动。由于该进程级 profile 对两个 context 生效，指定网段上的 DDS 流量包含 Agent Core domain-42；该 CIDR 必须确认为机器人专用隔离网，不能是办公网、共享 LAN 或与其他机器人共用的网络。若网络不能隔离，不能部署此双域进程。`ROS_LOCALHOST_ONLY=0` 使选定网卡上的 ROS 发现保持可用。
+指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。bundle 使用仓库统一的 `run_driver` 双域 ROS 运行时：机器人域订阅标准消息，Agent Core 域发布 `topic_out`；原生 TCP 仍负责动作和设备状态。Fast DDS profile 在创建 ROS context 前生成，两个 ROS context 共用这个进程级 profile。当前 `service.yml` 按已查询的 S10 主机网络配置 `NETWORK_INTERFACE=eth0`、`ROBOT_NETWORK_CIDR=10.21.33.0/24`（主机地址 `10.21.33.103/24`，basic_server 地址 `10.21.33.103`）；启动时还会校验接口 IPv4、其直连子网和 basic_server 地址均属于该私有网段，且 CIDR 不宽于 `/24`，不匹配时拒绝启动。若部署到其他主机，必须先确认连接 S10 的实际接口、主机/机器人地址及其网络隔离边界，再相应调整 service.yml，不能把办公网、共享 LAN 或与其他机器人共用的网络作为该网段。由于该进程级 profile 对两个 context 生效，指定网段上的 DDS 流量包含 Agent Core domain-42；若网络不能隔离，不能部署此双域进程。`ROS_LOCALHOST_ONLY=0` 使选定网卡上的 ROS 发现保持可用。
 
 ## 部署与镜像
 
-该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS。Docker 多阶段构建在 builder 阶段按需安装 colcon 并编译 `drdds`，运行阶段只复制 `/lynx_s10_ws/install`，不携带源码、build 或 log 目录；运行阶段仅在基础镜像缺少时安装 `python3-pip`、Fast DDS RMW 和 `ca-certificates`。PyYAML 由 `requirements.txt` 管理并以 `--no-cache-dir` 安装。固定上游 revision 的 `drdds` 源码作为普通资源目录保存在 `resource/deep-robotics-msg/` 并随驱动构建；压缩 ZIP 仅本地保留且不提交。这样镜像构建无需访问 GitHub。Compose 片段使用 host 网络连接机器人网段并从部署环境读取 `S10_NETWORK_INTERFACE`、`S10_ROBOT_NETWORK_CIDR`，同时配置本地日志轮转。
+该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS。Docker 多阶段构建在 builder 阶段按需安装 colcon 并编译 `drdds`，运行阶段只复制 `/lynx_s10_ws/install`，不携带源码、build 或 log 目录；运行阶段仅在基础镜像缺少时安装 `python3-pip`、Fast DDS RMW 和 `ca-certificates`。PyYAML 由 `requirements.txt` 管理并以 `--no-cache-dir` 安装。固定上游 revision 的 `drdds` 源码作为普通资源目录保存在 `resource/deep-robotics-msg/` 并随驱动构建；压缩 ZIP 仅本地保留且不提交。这样镜像构建无需访问 GitHub。Compose 片段使用 host 网络连接机器人网段，并包含该 S10 主机已确认的网卡和 CIDR；迁移到其他主机时必须先重新核实并修改这两个值，同时配置本地日志轮转。
 
 ## 安全与验证
 
