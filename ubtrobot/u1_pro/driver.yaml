@@ -6,7 +6,7 @@ hardware_model: "u1_pro"
 image_name: ubtrobot-u1-pro
 port: 15740
 mcp_url: "http://localhost:15740/mcp"
-description: "优必选 U1 Pro Bundle：麦克风、扬声器、TTS、表情与头部动作、声源方向、左右眼摄像头和系统行为控制"
+description: "优必选 U1 Pro Bundle：麦克风、扬声器、TTS、表情与头部动作、声源方向、左右眼摄像头、系统行为和自动待机动作控制"
 build_context_extras:
   - ../../common
 cards:
@@ -17,5 +17,6 @@ cards:
   - { name: expression, type: actuator }
   - { name: head, type: actuator }
   - { name: system_controls, type: actuator }
+  - { name: idle_actions, type: actuator }
   - { name: camera_left, type: sensor }
   - { name: camera_right, type: sensor }

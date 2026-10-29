@@ -28,7 +28,7 @@ class TestBundleShutdown(unittest.TestCase):
                     if fail:
                         raise RuntimeError('card cleanup failed')
                 namespace = {
-                    '_bundle': SimpleNamespace(stop_all=stop_cards),
+                    '_bundle': SimpleNamespace(stop_all=stop_cards, _motion_bus=None),
                     'smart_motion': SimpleNamespace(shutdown=lambda: calls.append('safety')),
                     'loco_client': SimpleNamespace(stop=lambda: calls.append('rpc')),
                     'executor': SimpleNamespace(shutdown=lambda: calls.append('executor')),

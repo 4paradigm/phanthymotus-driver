@@ -556,3 +556,24 @@ def test_without_grippers_nothing_is_probed_at_all(monkeypatch):
     _stub_dex1(monkeypatch, internal=False, external=False, seen=topics)
     assert len(arm_sdk.ArmSdkChannel(grippers=False)._read_measured_arms()) == 14
     assert topics == [arm_sdk.LOW_STATE_TOPIC]
+
+
+@pytest.mark.parametrize('age_ms', [0, 201, -1, None])
+def test_shared_initialization_requires_fresh_sample_without_subscribing(monkeypatch, age_ms):
+    from types import SimpleNamespace
+    _stub_low_state(monkeypatch)
+    def forbidden(*args, **kwargs): raise AssertionError('duplicate LowState reader')
+    monkeypatch.setattr(sys.modules['unitree_sdk2py.core.channel'], 'ChannelSubscriber', forbidden)
+    frame = _FakeLowState(); frame.mode_machine = 4; frame.mode_pr = 1
+    now = 1_000_000_000
+    monkeypatch.setattr(arm_sdk.time, 'monotonic_ns', lambda:now)
+    sample = None if age_ms is None else SimpleNamespace(message=frame, sampled_ns=now-age_ms*1_000_000)
+    source = SimpleNamespace(snapshot=lambda:sample)
+    channel = arm_sdk.ArmSdkChannel(grippers=False, low_state=source)
+    if age_ms != 0:
+        with pytest.raises(RuntimeError, match='arm_feedback_stale'): channel._read_measured_arms()
+        return
+    assert channel._read_measured_arms() == [i/100. for i in arm_sdk.ARM_MOTOR_IDS]
+    assert (channel._mode_machine, channel._mode_pr) == (4, 1)
+    frame.motor_state[15].mode = 0
+    with pytest.raises(RuntimeError, match='mode=0'): channel._read_measured_arms()

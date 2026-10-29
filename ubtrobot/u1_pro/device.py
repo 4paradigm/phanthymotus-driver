@@ -27,6 +27,7 @@ from typing import Any
 from direction_card import SoundDirectionPlugin
 
 from common.vendor_runtime import action_schema, jsonable, tool
+from native_idle_actions import DEFAULT_NATIVE_CONTAINER, IdleActionControl
 
 
 SERVICE_TIMEOUT = 10.0
@@ -2136,7 +2137,7 @@ class _SystemSwitchPlugin:
 
 
 class SystemControlsPlugin:
-    """Control the three independent vendor switches from one Agent card."""
+    """Control SDK behavior switches from one Agent card."""
 
     PREFIX = "system_controls"
     SWITCHES = {
@@ -2157,12 +2158,12 @@ class SystemControlsPlugin:
             "disable": (["control"], "Disable one U1 Pro system behavior."),
         }
         return tool(self.PREFIX, "actuator",
-                    "Control built-in wakeup, post-wakeup dialog, and autonomous visual behavior. "
-                    "Disabling visual behavior stops vendor visual following/idle behavior, but "
-                    "does not prevent head motions explicitly requested through expression/head cards.",
+                    "控制 U1 Pro 唤醒、连续唤醒和自主视觉行为。"
+                    "自动待机动作通过独立的 idle_actions 卡片控制。",
                     action_schema(actions, {"control": {
-                        "type": "string", "enum": ["wakeup", "wakeup_followup", "visual_behavior", "all"],
-                        "description": "Which independent system behavior to control.",
+                        "type": "string", "enum": [*self.SWITCHES, "all"],
+                        "description": "wakeup：语音唤醒；wakeup_followup：连续交互；"
+                                       "visual_behavior：自主视觉；all：全部三项。",
                     }}))
 
     def start(self):
@@ -2194,6 +2195,47 @@ class SystemControlsPlugin:
             results = {item: self.nodes.set_system_enabled(self.SWITCHES[item][0], enabled)
                        for item in targets}
             return results if control == "all" else results[control]
+        return None
+
+
+class IdleActionsPlugin:
+    """Control the persistent native ROSA idle preference without SDK routing."""
+
+    PREFIX = "idle_actions"
+
+    def __init__(self, control: IdleActionControl):
+        self.control = control
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare the card without changing the idle preference."),
+            "stop": ([], "Stop the card without changing the idle preference; use disable to turn idle actions off."),
+            "status": ([], "Read the persisted vendor idle preference, not live motion feedback."),
+            "enable": ([], "Enable and persist automatic idle actions and blinking."),
+            "disable": ([], "Disable and persist automatic idle actions and blinking."),
+        }
+        return tool(self.PREFIX, "actuator",
+                    "自动待机动作：开启、关闭或查询 U1 Pro 循环待机动作及自动眨眼。"
+                    "设置持久保存，启动/停止卡片不改变设置；关闭待机请调用 disable。"
+                    "关闭后仍可执行固件的一次性归位和 expression/head 卡片主动请求的动作。",
+                    action_schema(actions, {}))
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def dispatch(self, action, args):
+        del args
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        if action == "status":
+            return self.control.status()
+        if action in {"enable", "disable"}:
+            return self.control.set_enabled(action == "enable")
         return None
 
 
@@ -2289,6 +2331,8 @@ class _LifecyclePlugin:
 
 
 def build_plugins(config: dict, namespace: str, ros) -> list:
+    idle_control = IdleActionControl(
+        config.get("idle_actions", {}).get("native_container", DEFAULT_NATIVE_CONTAINER))
     nodes = U1Nodes(config, namespace, ros)
     # Authenticate before DriverBundle is created or the MCP endpoint is registered.
     try:
@@ -2318,5 +2362,6 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                ExpressionPlugin(audio, motion_catalog, catalog_available),
                HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes), SoundDirectionPlugin(nodes),
+               IdleActionsPlugin(idle_control),
                camera_left, camera_right]
     return plugins

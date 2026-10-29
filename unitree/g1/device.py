@@ -1899,9 +1899,11 @@ class ArmActionPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, arm_client):
         self._client = arm_client
+        self._stream = None
+        self._teleop_control = None
 
     def get_tool(self) -> dict:
-        return {
+        tool = {
             "name": "arm",
             "type": "actuator",
             "multiInstance": False,
@@ -1926,13 +1928,36 @@ class ArmActionPlugin:
             },
         }
 
+        if self._stream is not None:
+            motion = self._stream.motion_control
+            if getattr(self._stream, 'public_motion_topics', True):
+                tool.update(motion.arm_metadata())
+            tool['control_interface'] = motion.control_interface('joint_position')
+            props = tool['inputSchema']['properties']
+            props['action']['enum'] += ['info', 'start', 'stop', 'finish', 'finish_status']
+            props.update(instance_id={'type':'string'}, input_topic={'type':'string'},
+                         control_interface={'type':'object'}, control_interfaces={'type':'object'},
+                         operation_id={'type':'string'}, retry={'type':'boolean'})
+        return tool
+
     def start(self) -> None:
-        pass
+        if self._stream is not None: self._stream.start()
 
     def stop(self) -> None:
-        pass
+        if self._stream is not None: self._stream.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        release = action in ('release', 'finish') or (action == 'execute' and
+            (args.get('action_id') == 99 or str(args.get('gesture', '')).strip().lower() == 'release arm'))
+        if release and self._teleop_control is not None:
+            self._teleop_control.cancel_for_arm_release()
+        if action == 'info' and self._stream is not None:
+            metadata = (self._stream.motion_control.arm_metadata()
+                        if getattr(self._stream, 'public_motion_topics', True) else {})
+            return {**self._stream.info(), **metadata,
+                    'control_interface': self._stream.motion_control.control_interface('joint_position')}
+        if self._stream is not None and action in ('info','start','stop','finish','finish_status','release'):
+            return self._stream.dispatch(action, args)
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -1949,7 +1974,13 @@ class ArmActionPlugin:
                     return {"error": f"Unknown gesture: {args['gesture']}. Available: {list(_ARM_ACTION_MAP)}"}
             else:
                 return {"error": "Provide 'gesture' name or 'action_id'"}
-            ret = self._client.ExecuteAction(action_id)
+            if self._stream is not None:
+                if action_id == 99:
+                    return self._stream.dispatch('release', args)
+                with self._stream.legacy():
+                    ret = self._client.ExecuteAction(action_id)
+            else:
+                ret = self._client.ExecuteAction(action_id)
             return {"ret": ret, "action_id": action_id, "gesture": _ARM_ID_MAP.get(action_id, "unknown")}
         elif action == "release":
             ret = self._client.ExecuteAction(99)
@@ -1960,14 +1991,13 @@ class ArmActionPlugin:
 # ── StatePlugin (sensor) ─────────────────────────────────────────────────────
 
 class _LowStateNode(Node):
-    """Subscribes to DDS rt/lowstate + rt/lf/bmsstate and republishes to ROS2."""
+    """Publishes shared LowState plus independent BMS/mainboard DDS telemetry."""
 
-    _JOINTS_INTERVAL = 0.1   # 10 Hz throttle for joints
     _IMU_INTERVAL    = 0.05  # 20 Hz throttle for IMU
     _BMS_INTERVAL    = 1.0   # 1 Hz throttle for BMS
     _MAINBOARD_INTERVAL = 2.0  # 0.5 Hz throttle for mainboard
 
-    def __init__(self, imu_topic: str, battery_topic: str, joints_topic: str, mainboard_topic: str):
+    def __init__(self, imu_topic: str, battery_topic: str, joints_topic: str, mainboard_topic: str, *, low_state):
         super().__init__("g1_low_state")
         self._imu_pub       = self.create_publisher(String, imu_topic,       _LOW_LAT_QOS)
         self._battery_pub   = self.create_publisher(String, battery_topic,   _LOW_LAT_QOS)
@@ -1977,19 +2007,13 @@ class _LowStateNode(Node):
         self._last_battery: dict = {}
         self._last_posture: dict = {}
         self._lock = threading.Lock()
-        self._last_joints_time:    float = 0.0
-        self._last_imu_time:       float = 0.0
+        self._low_state = low_state
+        self._last_lowstate_sample = None
+        self._state_samples = 0
         self._last_bms_time:       float = 0.0
         self._last_mainboard_time: float = 0.0
 
-        try:
-            from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-            sub = ChannelSubscriber("rt/lowstate", LowState_)
-            sub.Init(self._on_state, 10)
-            self.get_logger().info(f"LowStateNode subscribed rt/lowstate → {imu_topic}, {joints_topic}")
-        except Exception as e:
-            self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lowstate: {e}")
+        self.create_timer(self._IMU_INTERVAL, self._poll_state)
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -2009,31 +2033,33 @@ class _LowStateNode(Node):
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lf/mainboardstate: {e}")
 
+    def _poll_state(self) -> None:
+        sample = self._low_state.snapshot()
+        if (sample is None or sample is self._last_lowstate_sample
+                or not 0 <= time.monotonic_ns()-sample.sampled_ns <= 200_000_000):
+            return
+        self._last_lowstate_sample = sample
+        self._on_state(sample.message)
+
     def _on_state(self, msg) -> None:
-        now = time.monotonic()
+        imu = msg.imu_state
+        imu_data = {
+            "quaternion":    list(imu.quaternion),
+            "gyroscope":     list(imu.gyroscope),
+            "accelerometer": list(imu.accelerometer),
+            "rpy":           list(imu.rpy),
+            "temperature":   float(imu.temperature),
+        }
+        with self._lock:
+            self._last_imu = imu_data
 
-        # IMU: throttle to 20 Hz
-        if now - self._last_imu_time >= self._IMU_INTERVAL:
-            self._last_imu_time = now
-            imu = msg.imu_state
-            imu_data = {
-                "quaternion":    list(imu.quaternion),
-                "gyroscope":     list(imu.gyroscope),
-                "accelerometer": list(imu.accelerometer),
-                "rpy":           list(imu.rpy),
-                "temperature":   float(imu.temperature),
-            }
-            with self._lock:
-                self._last_imu = imu_data
+        imu_out = String()
+        imu_out.data = json.dumps(imu_data)
+        self._imu_pub.publish(imu_out)
 
-            imu_out = String()
-            imu_out.data = json.dumps(imu_data)
-            self._imu_pub.publish(imu_out)
-
-        # Joints: throttle to 10 Hz
-        now = time.monotonic()
-        if now - self._last_joints_time >= self._JOINTS_INTERVAL:
-            self._last_joints_time = now
+        # One 20 Hz timer; every second new sample publishes joints at 10 Hz.
+        self._state_samples += 1
+        if self._state_samples % 2:
             joints = []
             for i, m in enumerate(msg.motor_state):
                 joints.append({
@@ -2151,12 +2177,13 @@ class _LowStateNode(Node):
 class StatePlugin:
     PREFIX = "state"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, *, low_state):
         self._imu_topic       = f"/{namespace}/state/imu"
         self._battery_topic   = f"/{namespace}/state/battery"
         self._joints_topic    = f"/{namespace}/state/joints"
         self._mainboard_topic = f"/{namespace}/state/mainboard"
-        self._node = _LowStateNode(self._imu_topic, self._battery_topic, self._joints_topic, self._mainboard_topic)
+        self._node = _LowStateNode(self._imu_topic, self._battery_topic, self._joints_topic, self._mainboard_topic,
+                                   low_state=low_state)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:

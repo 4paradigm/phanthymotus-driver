@@ -550,14 +550,16 @@ class U1CardContractTests(unittest.TestCase):
             initialize_robot=mock.Mock(),
         )
         with mock.patch.object(device, "U1Nodes", return_value=nodes):
-            plugins = device.build_plugins({}, "test", object())
+            plugins = device.build_plugins({"idle_actions": {"native_container": "test-behavior"}}, "test", object())
         nodes.initialize_robot.assert_called_once_with()
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls", "sound_direction",
-            "camera_left", "camera_right",
+            "idle_actions", "camera_left", "camera_right",
         ])
+        idle_card = next(plugin for plugin in plugins if plugin.PREFIX == "idle_actions")
+        self.assertEqual(idle_card.control.container, "test-behavior")
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
             self.assertTrue(plugin.PREFIX)
@@ -1435,6 +1437,79 @@ class U1CardContractTests(unittest.TestCase):
             "success": False, "code": "OK", "data": {"enabled": False},
         }
         self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "vision_enabled", False)["enabled"], False)
+
+    def test_idle_card_lifecycle_preserves_preference_and_explicit_actions_route(self):
+        import device
+
+        control = mock.Mock(spec=device.IdleActionControl)
+        plugin = device.IdleActionsPlugin(control)
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(set(schema["properties"]["action"]["enum"]),
+                         {"start", "stop", "enable", "disable", "status"})
+        self.assertEqual(plugin.start(), {"state": "ready"})
+        self.assertEqual(plugin.stop(), {"state": "idle"})
+        plugin.dispatch("start", {})
+        plugin.dispatch("stop", {})
+        self.assertIsNone(plugin.dispatch("unknown", {}))
+        self.assertEqual(control.mock_calls, [])
+        self.assertIs(plugin.dispatch("status", {}), control.status.return_value)
+        self.assertIs(plugin.dispatch("disable", {}), control.set_enabled.return_value)
+        self.assertIs(plugin.dispatch("enable", {}), control.set_enabled.return_value)
+        self.assertEqual(control.mock_calls, [mock.call.status(), mock.call.set_enabled(False),
+                                             mock.call.set_enabled(True)])
+        control.set_enabled.side_effect = RuntimeError("native service unavailable")
+        with self.assertRaisesRegex(RuntimeError, "native service unavailable"):
+            plugin.dispatch("disable", {})
+
+    def test_system_controls_all_keeps_original_three_sdk_switches(self):
+        import device
+
+        nodes = mock.Mock()
+        plugin = device.SystemControlsPlugin(nodes)
+        plugin.dispatch("disable", {"control": "all"})
+        self.assertEqual(nodes.set_system_enabled.call_args_list, [
+            mock.call("wakeup_enabled", False), mock.call("wakeup_followup", False),
+            mock.call("vision_enabled", False),
+        ])
+        self.assertEqual(plugin.get_tool()["inputSchema"]["properties"]["control"]["enum"],
+                         ["wakeup", "wakeup_followup", "visual_behavior", "all"])
+
+    def test_idle_timeout_readback_reaches_mcp_caller_as_an_error(self):
+        import device
+        import subprocess
+        from common.vendor_runtime import DriverBundle, make_handler
+
+        request = json.dumps({
+            "jsonrpc": "2.0", "id": "idle-timeout", "method": "tools/call",
+            "params": {"name": "idle_actions", "arguments": {"action": "disable"}},
+        }).encode()
+        for observed, expected in ((False, "match"), (True, "mismatch"), (None, "unknown")):
+            with self.subTest(observed=observed):
+                bundle = DriverBundle([device.IdleActionsPlugin(device.IdleActionControl())])
+                handler_type = make_handler(lambda: bundle, "u1-test", "u1-test")
+                handler = object.__new__(handler_type)
+                handler.path = "/mcp"
+                handler.headers = {"Content-Length": str(len(request))}
+                handler.rfile = io.BytesIO(request)
+                handler.send_json = mock.Mock()
+                readback = (subprocess.CompletedProcess([], 0, stdout=json.dumps({"enabled": observed}), stderr="")
+                            if observed is not None else subprocess.TimeoutExpired("readback", 5))
+                with mock.patch("native_idle_actions.subprocess.run", side_effect=[
+                    subprocess.TimeoutExpired("write", 25), readback,
+                ]) as run, mock.patch("traceback.print_exc"):
+                    handler.do_POST()
+                handler.send_json.assert_called_once()
+                http_status, response = handler.send_json.call_args.args
+                self.assertEqual(http_status, 200)
+                self.assertEqual(response["id"], "idle-timeout")
+                self.assertEqual(response["error"]["code"], -32603)
+                self.assertNotIn("result", response)
+                message = response["error"]["message"]
+                self.assertIn(f"readback={expected};", message)
+                self.assertIn("requested=false;", message)
+                self.assertIn("timed out", message)
+                self.assertIn("request completion unconfirmed; no automatic retry", message)
+                self.assertEqual(run.call_count, 2)
 
     def test_speaker_enables_stereo_output_before_subscribing(self):
         import device

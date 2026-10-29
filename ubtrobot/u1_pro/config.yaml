@@ -4,6 +4,10 @@ audio:
   # Maximum speech-only make-up gain. Steady background is learned and reduced.
   # Override with U1_PRO_MIC_GAIN_DB at deployment.
   mic_gain_db: 18.0
+idle_actions:
+  # ROSA config client runs in the existing vendor container; no SDK idle endpoint.
+  # Only used by idle_actions. Driver/card lifecycle preserves this preference.
+  native_container: walker-behavior.behavior-1
 ros:
   # Vendor control, authorization, TTS, and motion services run on domain 20.
   robot_domain_id: 20
