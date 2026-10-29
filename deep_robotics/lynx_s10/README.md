@@ -21,19 +21,19 @@
 
 ## 与参考驱动的差异
 
-传感器和执行卡片沿用仓库常用命名与职责划分，但 S10 文档没有可供外部主机订阅的相机 URL、视频协议或流话题，故不提供 `camera` 卡。`/LIDAR/POINTS` 明确限制为仅机器人主机传输，故不提供外接 `lidar` 卡。文档的 `/IMU` 为 200Hz ROS 2 `sensor_msgs/Imu`，但本驱动当前的 `imu` 卡来自 10Hz 原生运控状态，而非 ROS 2 话题；如需 200Hz 原始话题，应在 ROS 2 Jazzy 环境单独接入。关节数据同理来自原生 10Hz 状态，不冒称 SDK 模式关节流或 ROS 话题。
+传感器和执行卡片沿用仓库常用命名与职责划分。真机确认 `/IMU`、`/LIDAR/POINTS`、`/JOINTS_DATA_10HZ`、`/MOTION_INFO` 和 `/BATTERY_DATA` 正在发布；驱动从机器人 ROS 域订阅，并通过 Agent Core ROS 域转发 `imu`、`joints`、`joint_state`、`loco_state`、`battery` 和 `lidar` 实时流。MCP 查询仍使用原生 TCP 缓存。手册没有可供外部主机稳定订阅的相机 URL/视频协议，故暂不提供 `camera` 卡；相机话题虽然出现在真机 ROS graph 中，但当前设备没有稳定出帧，不能冒充可用视频流。
 
-S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 通过 MCP 读取最近一份原生关节上报，不创建仓库其他 ROS/DDS 驱动使用的 `topic_out` 实时流。
+S10 URDF 含有指向 `meshes/*.STL` 的视觉网格引用；本次仅随镜像提供 URDF 文本，骨架关节名与运动学链可用，但不承诺展示厂家 STL 外观。`joints` 实时流使用真机 `JOINTS_DATA_10HZ` 的 16 个电机字段，并按 URDF 关节顺序映射到仓库通用 `sensor/skeleton`；`joint_state` 同时保留完整供应商消息字段。
 
 Go1/Go2/As2W 中的语音、遥控器、SLAM、深度相机、特技、专用避障以及 `loco` 命令集都没有 S10 指南依据，因此不移植。M20 Pro 的导航卡片名称与动作边界可复用，但导航实现按 S10 自己的 ASDU 和 Pro 型号边界实现。
 
 ## ROS 2
 
-指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。当前 bundle 仅实现原生 TCP 传输，没有启动 ROS 节点；这是为了不把 Jazzy 自定义接口误装进仓库当前 ROS 基础镜像。点云话题即使启动 ROS 也仅限机器人主机传输。构建镜像不需要 ROS，按仓库通用 Docker driver 机制运行 MCP 服务。
+指南还定义 Jazzy 话题 `/IMU`、`/LIDAR/POINTS`、`/MOTION_STATE`、`/GAIT`、`/MOTION_INFO`、`/NAV_CMD`、`/CHARGE_STATUS`、`/fault_aggregator`。bundle 使用仓库统一的 `run_driver` 双域 ROS 运行时：机器人域订阅标准消息，Agent Core 域发布 `topic_out`；原生 TCP 仍负责动作和设备状态。镜像基于仓库 ROS 基础镜像，配置 Fast DDS 与 `ROS_LOCALHOST_ONLY=0`，从而让 Agent Core 能看到转发后的数据。
 
 ## 部署与镜像
 
-该驱动使用 Python 标准库 TCP，不依赖 ROS，因此基于 `python:3.11-slim`。PyYAML 用于通用 `load_config` 读取 YAML。具体镜像体积以 CI 构建结果为准。Compose 片段使用 host 网络连接机器人网段，并配置本地日志轮转，不挂载 DDS 配置或设备目录。
+该驱动使用仓库 ROS 基础镜像以获得 `rclpy`/Fast DDS；只额外安装 PyYAML，不引入相机编解码或自定义 drdds 构建依赖。Compose 片段使用 host 网络连接机器人网段，并配置本地日志轮转。
 
 ## 安全与验证
 

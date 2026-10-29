@@ -192,8 +192,14 @@ class BasicServerClient:
                 for message_id, payload in self._decoder.feed(data):
                     self._remember(payload)
                     body = payload.get("PatrolDevice", {})
+                    try:
+                        response_key = (int(str(body.get("Type")), 0), int(str(body.get("Command")), 0))
+                    except (TypeError, ValueError):
+                        response_key = None
                     with self._response_condition:
-                        if self._pending.get(message_id) == (body.get("Type"), body.get("Command")):
+                        # Some S10 firmware versions encode these fields as
+                        # decimal strings, while request() always sends ints.
+                        if self._pending.get(message_id) == response_key:
                             self._responses[message_id] = payload
                             self._response_condition.notify_all()
             except (OSError, ConnectionError) as exc:

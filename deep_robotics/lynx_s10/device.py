@@ -12,6 +12,78 @@ from basic_server import BasicServerClient
 from common.vendor_runtime import action_schema, tool
 
 
+class S10Nodes:
+    """Forward robot-domain ROS samples and native TCP state into Agent Core DDS."""
+    def __init__(self, config, namespace, ros2):
+        import json
+        import time
+        from rclpy.node import Node
+        from rclpy.qos import qos_profile_sensor_data
+        from drdds.msg import BatteryData, JointsData, MotionInfo
+        from sensor_msgs.msg import Imu, PointCloud2
+        from std_msgs.msg import String
+
+        self.json = json
+        self.robot = Node("lynx_s10_driver_robot", context=ros2.ctx_robot)
+        self.core = Node("lynx_s10_driver_core", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self.robot)
+        ros2.executor_core.add_node(self.core)
+        prefix = f"/{namespace}/" if namespace else "/"
+        base = prefix + "lynx_s10/"
+        self.topics = {
+            "imu": {"topic": base + "imu", "format": "data/json"},
+            "joints": {"topic": base + "joints", "format": "sensor/skeleton"},
+            "joint_state": {"topic": base + "joint_state", "format": "data/json"},
+            "loco_state": {"topic": base + "loco_state", "format": "data/json"},
+            "battery": {"topic": base + "battery", "format": "data/json"},
+            "lidar": {"topic": base + "lidar", "format": "pointcloud/ros2"},
+        }
+        self.publishers = {
+            key: self.core.create_publisher(String, spec["topic"], 10)
+            for key, spec in self.topics.items() if key != "lidar"
+        }
+        self.lidar_publisher = self.core.create_publisher(PointCloud2, self.topics["lidar"]["topic"], 2)
+        topics = config.get("topics", {})
+        self.robot.create_subscription(Imu, topics.get("imu", "/IMU"), self._forward_imu, qos_profile_sensor_data)
+        self.robot.create_subscription(JointsData, topics.get("joints", "/JOINTS_DATA_10HZ"), self._forward_joints, qos_profile_sensor_data)
+        self.robot.create_subscription(BatteryData, topics.get("battery", "/BATTERY_DATA"), self._forward_battery, qos_profile_sensor_data)
+        self.robot.create_subscription(MotionInfo, topics.get("motion_info", "/MOTION_INFO"), self._forward_loco_state, qos_profile_sensor_data)
+        self.robot.create_subscription(PointCloud2, topics.get("lidar", "/LIDAR/POINTS"), self.lidar_publisher.publish, qos_profile_sensor_data)
+
+    def _publish_json(self, key, value):
+        from std_msgs.msg import String
+        message = String()
+        message.data = self.json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        self.publishers[key].publish(message)
+
+    def _forward_imu(self, msg):
+        from common.vendor_runtime import jsonable
+        self._publish_json("imu", jsonable(msg))
+
+    def _forward_joints(self, msg):
+        from common.vendor_runtime import jsonable
+        values = jsonable(msg)
+        data = values.get("data", {})
+        joints = values.get("joints_data", data.get("joints_data", []) if isinstance(data, dict) else data)
+        motor_status = {"Joint": joints}
+        self._publish_json("joints", _skeleton_payload({"MotorStatus": motor_status}))
+        self._publish_json("joint_state", values)
+
+    def _forward_battery(self, msg):
+        from common.vendor_runtime import jsonable
+        values = jsonable(msg)
+        self._publish_json("battery", {"batteries": values.get("data", [])})
+
+    def _forward_loco_state(self, msg):
+        from common.vendor_runtime import jsonable
+        values = jsonable(msg)
+        self._publish_json("loco_state", values.get("data", values))
+
+    def close(self):
+        self.robot.destroy_node()
+        self.core.destroy_node()
+
+
 LOCO_STATES = {"stand_up": 1, "damp": 2, "stand_down": 4, "rl_control": 17}
 GAITS = {"basic_flat": 0x1001, "basic_stairs": 0x1003, "navigation_flat": 0x3002, "navigation_stairs": 0x3003}
 MODES = {"normal": 0, "navigation": 1, "assist": 2}
@@ -45,10 +117,10 @@ def _skeleton_payload(items):
         raw = raw_joints[idx] if idx < len(raw_joints) else None
         joints.append({
             "idx": idx, "name": name,
-            "q": _joint_value(raw, "q", "Q", "Position", "Pos", "Angle"),
-            "dq": _joint_value(raw, "dq", "DQ", "Velocity", "Speed"),
-            "tau": _joint_value(raw, "tau", "Tau", "Torque", "TorqueEst"),
-            "temperature": _joint_value(raw, "temperature", "Temperature", "Temp"),
+            "q": _joint_value(raw, "q", "Q", "position", "Position", "Pos", "Angle"),
+            "dq": _joint_value(raw, "dq", "DQ", "velocity", "Velocity", "Speed"),
+            "tau": _joint_value(raw, "tau", "Tau", "torque", "Torque", "TorqueEst"),
+            "temperature": _joint_value(raw, "temperature", "Temperature", "Temp", "motion_temp", "driver_temp"),
         })
     payload = {"format": "sensor/skeleton", "available": len(raw_joints) >= len(JOINT_NAMES), "joints": joints}
     motion = items.get("MotionStatus", {})
@@ -76,7 +148,7 @@ class S10ModelPlugin:
 
 
 class S10StatePlugin:
-    def __init__(self, native): self.native = native
+    def __init__(self, native, nodes=None): self.native, self.nodes = native, nodes
     def get_tools(self):
         cards = {
             "state": "山猫 S10 原生 TCP 协议连接及全部设备主动上报状态",
@@ -87,10 +159,14 @@ class S10StatePlugin:
             "battery": "山猫 S10 电池电量、电压、温度和充电状态",
             "errors": "山猫 S10 原生协议聚合故障列表及故障变化",
             "navigation_status": "山猫 S10 导航任务和定位状态（Pro 支持）",
+            "lidar": "山猫 S10 激光雷达点云（实时 ROS 2 转发）",
         }
-        return [tool(name, "sensor", description) for name, description in cards.items()]
+        topics = self.nodes.topics if self.nodes else {}
+        return [tool(name, "sensor", description, topic_out=[topics[name]] if name in topics else None) for name, description in cards.items()]
     def start(self): self.native.start()
-    def stop(self): self.native.close()
+    def stop(self):
+        if self.nodes: self.nodes.close()
+        self.native.close()
     def dispatch(self, action, args):
         name = args.get("_tool_name", "state")
         if action == "start":
@@ -99,13 +175,14 @@ class S10StatePlugin:
         if action == "stop":
             if name == "state": self.native.close()
             return {"state": "idle"}
-        if action == "info": return {"state": "ready"}
+        if action == "info": return {"state": "ready", **({"topic_out": [self.nodes.topics[name]]} if self.nodes and name in self.nodes.topics else {})}
         reports = self.native.snapshot()["reports"]
         keys = {"imu": "1048577:15728640", "joints": "1048577:15728640",
                 "joint_state": "1048577:15728640", "loco_state": "1048577:15728640",
                 "battery": "1048578:15728640",
                 "errors": "1048703:15728640", "navigation_status": "1048579:15728640"}
         if name == "state": return self.native.snapshot()
+        if name == "lidar" and self.nodes: return {"state": "streaming", **self.nodes.topics[name]}
         if name not in keys: return {"state": "unsupported_card", "card": name}
         report = reports.get(keys[name])
         # Some firmware revisions serialize Type/Command as decimal strings,
@@ -346,7 +423,8 @@ class S10ChargePlugin:
 
 def build_plugins(config, namespace=None, ros2=None):
     native = BasicServerClient(config)
-    plugins = [S10ModelPlugin(), S10StatePlugin(native), S10MotionPlugin(native), S10DevicePlugin(native), S10ChargePlugin(native)]
+    nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
+    plugins = [S10ModelPlugin(), S10StatePlugin(native, nodes), S10MotionPlugin(native), S10DevicePlugin(native), S10ChargePlugin(native)]
     if str(config.get("model_variant", "standard")).lower() == "pro":
         plugins.append(S10NavigationPlugin(native))
     return plugins

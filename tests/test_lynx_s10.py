@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import threading
 import time
+from types import ModuleType, SimpleNamespace
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -93,6 +95,121 @@ def test_standard_state_cards_read_native_reports(monkeypatch):
     assert plugin.dispatch("joint_state", {"_tool_name": "joint_state"})["Motor"][0]["dq"] == 0.1
     assert plugin.dispatch("loco_state", {"_tool_name": "loco_state"})["basic_state"] == {"Gait": 3, "HES": 0}
     assert plugin.dispatch("battery", {"_tool_name": "battery"}) == {"batteries": [{"SOC": 88}]}
+
+
+def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
+    device = _load_device(monkeypatch)
+    native = FakeNative({})
+    nodes = type("Nodes", (), {"topics": {
+        "imu": {"topic": "/robot/lynx_s10/imu", "format": "data/json"},
+        "joints": {"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"},
+        "joint_state": {"topic": "/robot/lynx_s10/joint_state", "format": "data/json"},
+        "loco_state": {"topic": "/robot/lynx_s10/loco_state", "format": "data/json"},
+        "battery": {"topic": "/robot/lynx_s10/battery", "format": "data/json"},
+        "lidar": {"topic": "/robot/lynx_s10/lidar", "format": "pointcloud/ros2"},
+    }})()
+    plugin = device.S10StatePlugin(native, nodes)
+    tools = {item["name"]: item for item in plugin.get_tools()}
+    assert tools["joints"]["topic_out"] == [{"topic": "/robot/lynx_s10/joints", "format": "sensor/skeleton"}]
+    assert plugin.dispatch("info", {"_tool_name": "imu"})["topic_out"][0]["topic"] == "/robot/lynx_s10/imu"
+    assert plugin.dispatch("info", {"_tool_name": "lidar"})["topic_out"][0]["format"] == "pointcloud/ros2"
+
+
+def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
+    device = _load_device(monkeypatch)
+
+    class FakePublisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message)
+
+    class FakeNode:
+        def __init__(self, name, context):
+            self.name = name
+            self.context = context
+            self.publishers = {}
+            self.subscriptions = {}
+
+        def create_publisher(self, _msg_type, topic, _depth):
+            publisher = FakePublisher()
+            self.publishers[topic] = publisher
+            return publisher
+
+        def create_subscription(self, _msg_type, topic, callback, _depth):
+            self.subscriptions[topic] = callback
+
+        def create_timer(self, *_args):
+            raise AssertionError("S10 stream forwarding must be source-driven, not polled")
+
+        def destroy_node(self):
+            pass
+
+    class Executor:
+        def add_node(self, _node):
+            pass
+
+    class String:
+        def __init__(self):
+            self.data = ""
+
+    class Imu: pass
+    class PointCloud2: pass
+    class JointsData: pass
+    class BatteryData: pass
+    class MotionInfo: pass
+
+    ros_node = ModuleType("rclpy.node")
+    ros_node.Node = FakeNode
+    qos_module = ModuleType("rclpy.qos")
+    qos_module.qos_profile_sensor_data = object()
+    sensor_msg = ModuleType("sensor_msgs.msg")
+    sensor_msg.Imu, sensor_msg.PointCloud2 = Imu, PointCloud2
+    standard_msg = ModuleType("std_msgs.msg")
+    standard_msg.String = String
+    drdds_msg = ModuleType("drdds.msg")
+    drdds_msg.JointsData, drdds_msg.BatteryData, drdds_msg.MotionInfo = JointsData, BatteryData, MotionInfo
+    for module_name, module in {
+        "rclpy.node": ros_node, "rclpy.qos": qos_module, "sensor_msgs.msg": sensor_msg,
+        "std_msgs.msg": standard_msg, "drdds.msg": drdds_msg,
+    }.items():
+        monkeypatch.setitem(__import__("sys").modules, module_name, module)
+
+    ros2 = SimpleNamespace(
+        ctx_robot=object(), ctx_core=object(),
+        executor_robot=Executor(), executor_core=Executor(),
+    )
+    nodes = device.S10Nodes({}, "robot", ros2)
+    callbacks = nodes.robot.subscriptions
+
+    imu = SimpleNamespace(linear_acceleration=SimpleNamespace(x=1.0, y=2.0, z=3.0))
+    callbacks["/IMU"](imu)
+    imu_payload = json.loads(nodes.publishers["imu"].messages[-1].data)
+    assert imu_payload["linear_acceleration"]["z"] == 3.0
+
+    joints = [SimpleNamespace(position=index, velocity=0.1, torque=0.2, motion_temp=30.0)
+              for index in range(16)]
+    callbacks["/JOINTS_DATA_10HZ"](SimpleNamespace(data=SimpleNamespace(joints_data=joints)))
+    skeleton = json.loads(nodes.publishers["joints"].messages[-1].data)
+    full_joint_state = json.loads(nodes.publishers["joint_state"].messages[-1].data)
+    assert skeleton["available"] is True
+    assert skeleton["joints"][0]["name"] == "fl_hipx_joint"
+    assert skeleton["joints"][15]["q"] == 15
+    assert full_joint_state["data"]["joints_data"][4]["position"] == 4
+
+    callbacks["/BATTERY_DATA"](SimpleNamespace(data=[SimpleNamespace(battery_level=87)]))
+    battery = json.loads(nodes.publishers["battery"].messages[-1].data)
+    assert battery["batteries"][0]["battery_level"] == 87
+
+    callbacks["/MOTION_INFO"](SimpleNamespace(data=SimpleNamespace(vel_x=0.3, vel_y=0.0)))
+    loco_state = json.loads(nodes.publishers["loco_state"].messages[-1].data)
+    assert loco_state["vel_x"] == 0.3
+
+    lidar = PointCloud2()
+    callbacks["/LIDAR/POINTS"](lidar)
+    assert nodes.lidar_publisher.messages[-1] is lidar
+    nodes.close()
 
 
 def test_model_resource_returns_official_urdf(monkeypatch):
@@ -222,6 +339,7 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
         def __init__(self):
             self.ready = threading.Event()
             self.response = None
+            self.closed = False
 
         def settimeout(self, _timeout):
             pass
@@ -234,10 +352,18 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
 
         def recv(self, _size):
             assert self.ready.wait(1)
-            response, self.response = self.response, None
-            return response or b""
+            if self.response is not None:
+                response, self.response = self.response, None
+                return response
+            return b"" if self.closed else self.recv_wait()
+
+        def recv_wait(self):
+            while not self.closed:
+                time.sleep(0.001)
+            return b""
 
         def close(self):
+            self.closed = True
             self.ready.set()
 
     fake_socket = FakeSocket()
@@ -253,5 +379,51 @@ def test_basic_server_uses_tcp_for_request_response(monkeypatch):
         assert response["PatrolDevice"]["Items"] == {"ErrorCode": 0}
         assert client.snapshot()["transport"] == "TCP"
         assert client.snapshot()["reports"]["1048676:5"] == response
+    finally:
+        client.close()
+
+
+def test_basic_server_matches_string_encoded_response_type_and_command(monkeypatch):
+    class FakeSocket:
+        def __init__(self):
+            self.ready = threading.Event()
+            self.response = None
+            self.closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, frame):
+            _message_id, _request = decode_frame(frame)
+            message_id = HEADER.unpack_from(frame)[2]
+            payload = b'{"PatrolDevice":{"Type":"1048676","Command":"5","Items":{"ErrorCode":0}}}'
+            self.response = HEADER.pack(SYNC, len(payload), message_id, 1, 0, 1) + payload
+            self.ready.set()
+
+        def recv(self, _size):
+            assert self.ready.wait(1)
+            if self.response is not None:
+                response, self.response = self.response, None
+                return response
+            while not self.closed:
+                time.sleep(0.001)
+            return b""
+
+        def close(self):
+            self.closed = True
+            self.ready.set()
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(
+        "deep_robotics.lynx_s10.basic_server.socket.create_connection",
+        lambda address, timeout: fake_socket,
+    )
+    client = BasicServerClient({"basic_server": {
+        "host": "127.0.0.1", "tcp_port": 30003, "timeout": 1,
+    }})
+    try:
+        response = client.request(1048676, 5)
+        assert response["PatrolDevice"]["Items"]["ErrorCode"] == 0
+        assert client.snapshot()["last_error"] is None
     finally:
         client.close()

@@ -3,6 +3,16 @@ ros_namespace: ""
 name: "云深处山猫 S10"
 model_variant: "pro"
 navigation_task_timeout: 180
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: "eth0"
+topics:
+  imu: "/IMU"
+  joints: "/JOINTS_DATA_10HZ"
+  battery: "/BATTERY_DATA"
+  motion_info: "/MOTION_INFO"
+  lidar: "/LIDAR/POINTS"
 basic_server:
   enabled: true
   # Set this to the robot's reachable basic_server address.  It may also be
