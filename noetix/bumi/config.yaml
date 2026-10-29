@@ -50,6 +50,31 @@ plugins:
     #   systemctl disable --now noetix-video-capture.service
     # Set false only when official App video transfer must retain the camera.
     disable_vendor_capture_service: true
+  # 只读 RGB-D 视觉里程计（RTAB-Map rgbd_odometry，在 bundle 进程内运行）。
+  # 无 IMU/EKF/融合，不参与运动控制，只发布 motus.odom/1 供查看/录包；
+  # 停止本卡片只回收它自己的估计子进程和私有话题，不影响相机/媒体/动作卡。
+  # 默认按水平前装约定输出机体轴：x 前、y 左、z 上（vendor.pose_reference=body_axes；
+  # 只有实测 camera_to_body 才报 body）。
+  visual_odometry:
+    # 默认开启只读视觉里程计；原始 RGB-D 分支限频见下方。
+    enabled: true
+    # Raw branch sample rate when enabled. The measured raw cadence is ~8.3 Hz
+    # at this cap and RTAB-Map currently processes ~7.5-9 Hz, so 10 Hz bounds
+    # the extra DDS/CPU load instead of duplicating every 30 Hz camera frame.
+    # Invalid values fall back to 10 Hz; the camera-side upper bound is 30 Hz.
+    max_rate_hz: 10
+    # Permanent body-axis convention for the standard level, forward-facing
+    # camera: robot x forward, y left, z up. This is an axis assumption, not a
+    # measured mount; translation is the camera origin in robot coordinates
+    # (zeros keeps the position origin at the camera). Replace the quaternion
+    # and translation with measured values if the camera is not level/forward.
+    calibration:
+      calibration_id: assumed-level-forward-optical-to-body
+      fixed_mount: true
+      assumed: true
+      camera_to_body:
+        translation: [0.0, 0.0, 0.0]
+        quaternion: [-0.5, 0.5, -0.5, 0.5]
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.

@@ -2304,6 +2304,7 @@ def _camera_subprocess(namespace: str):
     from common import logsafe
     logsafe.install(check_fd=False)
 
+    from array import array
     import time as _time
     import numpy as _np
 
@@ -2318,6 +2319,12 @@ def _camera_subprocess(namespace: str):
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
         durability=DurabilityPolicy.VOLATILE,
+    )
+    _CONTROL_QOS = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
     )
 
     import pyrealsense2 as rs
@@ -2402,15 +2409,62 @@ def _camera_subprocess(namespace: str):
         # over a failed introspection call would be the worse trade.
         print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
 
+    # Optional read-only RGB-D branch for the bundle-local visual odometry card.
+    # main.py sets BUMI_VISUAL_ODOMETRY only when that card is enabled; the branch
+    # shares this pipeline and must never take media production down: construction
+    # and every publish are wrapped, and a fault only logs.
+    raw_inputs = None
+    raw_publish_failures = 0
+    if os.environ.get("BUMI_VISUAL_ODOMETRY") == "1":
+        # A bad config value must not silently become "unlimited": 0/negative/
+        # NaN/infinite would make min_interval_s zero and publish all 30 fps.
+        # Fall back to the documented 10 Hz and never exceed the camera rate.
+        raw_rate_hz = 10.0
+        raw_rate_env = os.environ.get("BUMI_VISUAL_ODOMETRY_MAX_FPS")
+        if raw_rate_env not in (None, ""):
+            try:
+                candidate = float(raw_rate_env)
+                if math.isfinite(candidate) and 0.0 < candidate <= 30.0:
+                    raw_rate_hz = candidate
+                else:
+                    print(f"[camera_subprocess] invalid raw rate {raw_rate_env!r}; "
+                          "using 10 Hz", flush=True)
+            except ValueError:
+                print(f"[camera_subprocess] invalid raw rate {raw_rate_env!r}; "
+                      "using 10 Hz", flush=True)
+        try:
+            from visual_inputs import RawCameraPublisher
+            raw_inputs = RawCameraPublisher(
+                node, namespace, pipeline, _QOS,
+                min_interval_s=(1.0/raw_rate_hz if raw_rate_hz > 0 else 0.0))
+        except Exception as _e:
+            print(f"[camera_subprocess] raw RGB-D branch unavailable: {_e}", flush=True)
+        if raw_inputs is not None:
+            # Card stop/start is delivered as a Bool over a private control
+            # topic; the raw branch must not keep publishing after the sensor
+            # card is stopped. Reliable QoS so stop/start ordering survives.
+            try:
+                from std_msgs.msg import Bool
+                node.create_subscription(
+                    Bool, f"/{namespace}/odometry_input/raw_enabled",
+                    lambda msg: setattr(raw_inputs, "enabled", bool(msg.data)),
+                    _CONTROL_QOS)
+            except Exception as _e:
+                print(f"[camera_subprocess] raw enable control unavailable: {_e}", flush=True)
+
     frame_count = 0
     t_start = _time.monotonic()
     try:
         while True:
+            # The camera node owns the raw_enabled subscription. This is a
+            # separate process from the bundle executor, so it must service its
+            # own callbacks; otherwise card stop/start never reaches it.
+            _rclpy.spin_once(node, timeout_sec=0)
             t0 = _time.monotonic()
-            frames = pipeline.wait_for_frames(timeout_ms=1000)
+            source_frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
 
-            frames = align_to_color.process(frames)
+            frames = align_to_color.process(source_frames)
 
             color_frame = frames.get_color_frame()
             if color_frame:
@@ -2421,7 +2475,7 @@ def _camera_subprocess(namespace: str):
                 msg = _CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.format = "jpeg"
-                msg.data = jpeg_bytes
+                msg.data = array('B', jpeg_bytes)
                 color_pub.publish(msg)
 
             depth_frame = frames.get_depth_frame()
@@ -2432,8 +2486,20 @@ def _camera_subprocess(namespace: str):
                 msg = _CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.format = "16UC1; compressedDepth zlib"
-                msg.data = compressed
+                msg.data = array('B', compressed)
                 depth_pub.publish(msg)
+
+            if raw_inputs is not None and getattr(raw_inputs, 'enabled', True):
+                try:
+                    raw_inputs.publish(source_frames, frames)
+                except Exception as _e:
+                    # Throttled: the capture loop is 30 Hz and a persistent
+                    # failure must not turn into 30 rotated-log records/second.
+                    raw_publish_failures += 1
+                    if raw_publish_failures == 1 or raw_publish_failures % 100 == 0:
+                        detail = ' '.join(str(_e).split())[:300]
+                        print(f"[camera_subprocess] raw RGB-D publish failed "
+                              f"(failure #{raw_publish_failures}): {detail}", flush=True)
 
             frame_count += 1
             # Log every 300 frames (~15s at 20fps)

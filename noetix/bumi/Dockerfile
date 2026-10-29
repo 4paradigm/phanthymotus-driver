@@ -7,6 +7,11 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && cd /bumi_ros_ws && colcon
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG UBUNTU_MIRROR=https://ports.ubuntu.com/ubuntu-ports
+# The shared ROS base image ships /opt/ros/humble but no ROS 2 apt source, so
+# ros-humble-* packages are not resolvable until this repo is added. Tsinghua
+# mirrors it (the CI builder is in Tencent Cloud); the official archive is kept
+# as a fallback.
+ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 # Keep only the generated interface; source and build artifacts stay in the builder.
 COPY --from=audio_msgs_builder /bumi_ros_ws/install/ /bumi_ros_ws/install/
 RUN /bin/bash -c 'source /ros_ws/install/setup.bash && source /bumi_ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk, SoundDirection"'
@@ -28,12 +33,59 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         build-essential \
         curl \
         git \
+        gnupg \
         libusb-1.0-0 \
         libportaudio2 \
         libasound2-dev \
         libssl-dev \
         libeigen3-dev \
         libboost-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# RTAB-Map RGB-D odometry, bundle-local (single container). The estimator runs as
+# one supervised child of main.py; no second image/container is deployed.
+#
+# The base image carries /opt/ros/humble but no ROS 2 apt source (only the Ubuntu
+# archive is configured), so `ros-humble-*` is invisible to apt until the ROS
+# repository and its signing key are added. Only rtabmap-odom is installed
+# explicitly: it declares tf2_ros and the message packages itself, so repeating
+# them here would not change the installed set. Measured ARM64 image size: the
+# Bumi image grows from ~2.1 GB (before RTAB-Map) to ~4.8 GB uncompressed
+# (~+2.7 GB), almost all of it the PCL/Qt/VTK transitive dependencies of the
+# official rtabmap-odom package. There is no smaller official package for the
+# estimator and the single-container design rules out a separate image; this is
+# the minimal viable package set. Try the configured mirror first and fall back
+# to the official archive; the key itself is tried from the same mirror and
+# GitHub over HTTPS only.
+RUN set -eu; \
+    if [ ! -s /usr/share/keyrings/ros-archive-keyring.gpg ]; then \
+      for key in https://mirrors.tuna.tsinghua.edu.cn/rosdistro/ros.key \
+                 https://raw.githubusercontent.com/ros/rosdistro/master/ros.key; do \
+        if curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 "$key" -o /usr/share/keyrings/ros-archive-keyring.gpg; then break; fi; \
+        rm -f /usr/share/keyrings/ros-archive-keyring.gpg; \
+      done; \
+    fi; \
+    test -s /usr/share/keyrings/ros-archive-keyring.gpg; \
+    . /etc/os-release; \
+    # Pin the ROS archive key instead of trusting any HTTPS response. This is
+    # the Open Robotics ROS 2 signing key (verified with gpg --show-keys).
+    key_fpr="$(gpg --batch --show-keys --with-colons /usr/share/keyrings/ros-archive-keyring.gpg 2>/dev/null | awk -F: '$1 == "fpr" {print $10; exit}')"; \
+    if [ "$key_fpr" != "C1CF6E31E6BADE8868B172B4F42ED6FBAB17C654" ]; then \
+      echo "unexpected ROS archive key fingerprint: ${key_fpr:-<none>}" >&2; \
+      rm -f /usr/share/keyrings/ros-archive-keyring.gpg; \
+      exit 1; \
+    fi; \
+    installed=0; \
+    for src in "${ROS_APT_MIRROR}" https://packages.ros.org/ros2/ubuntu; do \
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] $src $UBUNTU_CODENAME main" \
+        > /etc/apt/sources.list.d/ros2.list; \
+      if apt-get update && apt-get install -y --no-install-recommends \
+           ros-humble-rtabmap-odom; then \
+        installed=1; break; \
+      fi; \
+      rm -rf /var/lib/apt/lists/*; \
+    done; \
+    test "$installed" = 1; \
     rm -rf /var/lib/apt/lists/*
 
 # Realsense SDK (D435i camera)
@@ -45,6 +97,12 @@ RUN apt-get update && \
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
+
+# The bundle image must be able to start the estimator child and this card's
+# Python imports; fail the build here rather than on a robot. Docker's default
+# shell is /bin/sh (dash), where `source` does not exist — use bash explicitly
+# like the rest of this Dockerfile.
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && python3 -c 'import rclpy, cv2, numpy, message_filters; from rtabmap_msgs.msg import OdomInfo; from nav_msgs.msg import Odometry; from geometry_msgs.msg import TransformStamped; from tf2_ros import StaticTransformBroadcaster' && test -x /opt/ros/humble/lib/rtabmap_odom/rgbd_odometry"
 
 # Noetix Bumi SDK — copy source and download pre-built libs from COS
 COPY noetix_sdk_bumi/ /work/noetix_sdk_bumi/
@@ -86,6 +144,12 @@ COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
+COPY visual_inputs.py /work/visual_inputs.py
+COPY visual_odometry.py /work/visual_odometry.py
+COPY visual_odometry_contract.py /work/visual_odometry_contract.py
+COPY visual_odometry_probe.py /work/visual_odometry_probe.py
+COPY realsense_imu_probe.py /work/realsense_imu_probe.py
+COPY build_realsense_rsusb.sh /work/build_realsense_rsusb.sh
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
