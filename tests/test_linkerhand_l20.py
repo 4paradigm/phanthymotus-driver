@@ -48,7 +48,7 @@ from can_client import (
 )
 from hand_device import HandPlugin, _SingleHandController, build_plugins, validate_hold_torque
 from gesture_device import GesturePlugin
-from grasp_device import GraspPlugin
+from adaptive_grasp_device import AdaptiveGraspPlugin
 
 # Expected directions from the user's real-hand collision report, including
 # the previously verified 0<->4 fix. This is independent of the driver's table.
@@ -231,17 +231,23 @@ def test_can_client_motion_and_query():
         assert mock_bus.sim_pitch == [100] * 5
         assert mock_bus.sim_tip == [50] * 5
 
+        # Verify serial CAN frame payloads and reserved bytes
+        sent = {msg.data[0]: list(msg.data[1:]) for msg in mock_bus.sent_messages if len(msg.data) >= 7}
+        assert sent[0x41] == [200, 128, 100, 0, 0, 50]  # thumb: [roll, yaw, pitch, 0, 0, tip]
+        assert sent[0x42] == [128, 0, 100, 0, 0, 50]    # index: [yaw, 0, pitch, 0, 0, tip]
+        assert sent[0x43] == [128, 0, 100, 0, 0, 50]    # middle: [yaw, 0, pitch, 0, 0, tip]
+        assert sent[0x44] == [128, 0, 100, 0, 0, 50]    # ring: [yaw, 0, pitch, 0, 0, tip]
+        assert sent[0x45] == [128, 0, 100, 0, 0, 50]    # little: [yaw, 0, pitch, 0, 0, tip]
+
         time.sleep(0.05)
         pos = client.get_positions()
         assert pos["thumb_pitch"] == 100
         assert pos["thumb_tip"] == 50
 
         client.request_tactile_scalar()
-        client.request_normal_force()
         time.sleep(0.05)
         snap = client.get_tactile_snapshot()
         assert snap["touch_scalar"]["thumb"] == 50
-        assert snap["normal_force"]["thumb"] == 12.0
     finally:
         client.close()
 
@@ -352,67 +358,6 @@ def test_gesture_plugin_ok_gesture():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Unit Tests: GraspPlugin (Card 3 - Position Control)
-# ──────────────────────────────────────────────────────────────────────
-
-def test_grasp_plugin_position_control():
-    hand_plugin = MagicMock()
-    hand_plugin.config = {}
-    client, mock_bus = make_mock_client()
-    ctrl = _SingleHandController({}, 'right', 'can0', threading.RLock(), can_id=0x28)
-    ctrl._client = client
-    hand_plugin.get_controller_for_side.return_value = ctrl
-    grasp = GraspPlugin(hand_plugin, {'approach_speed': 35, 'poll_interval_s': 0.01})
-    definition = grasp.get_tool()
-    assert definition['name'] == 'hand_grasp'
-    assert set(definition['inputSchema']['x-action-params']) == {'side_grasp', 'top_grasp', 'release'}
-    assert grasp.dispatch('info', {'instance_id': 'inst_grasp', "bound_side": "right"})['state'] == 'ready'
-    calls, done = [], threading.Event()
-    def callback(aid, status, result):
-        calls.append((aid, status, result))
-        done.set()
-    grasp._acp_callback = callback
-    try:
-        result = grasp.dispatch('side_grasp', {'wait_for_result': False,
-            'instance_id': 'inst_grasp', "bound_side": "right", 'confirm_motion': True})
-        assert result['state'] == 'running' and done.wait(2)
-        assert len(calls) == 1 and calls[0][1] == 'completed'
-        assert calls[0][2]['command_sent'] and calls[0][2]['holding']
-        assert mock_bus.sim_tip == [0] * 5
-        assert not grasp._active
-    finally:
-        grasp.stop()
-        client.close()
-
-
-def test_position_grasp_does_not_depend_on_tactile_values():
-    hand_plugin = MagicMock()
-    hand_plugin.config = {}
-    client, mock_bus = make_mock_client()
-    ctrl = _SingleHandController({}, 'right', 'can0', threading.RLock(), can_id=0x28)
-    ctrl._client = client
-    hand_plugin.get_controller_for_side.return_value = ctrl
-    grasp = GraspPlugin(hand_plugin, {})
-    mock_bus.sim_touch = [255] * 5
-    client.get_fresh_tactile = MagicMock(side_effect=AssertionError('unexpected tactile read'))
-    completions, done = [], threading.Event()
-    def completed(aid, status, result):
-        completions.append((aid, status, result))
-        done.set()
-    grasp._acp_callback = completed
-    try:
-        accepted = grasp.dispatch('side_grasp', {'instance_id': 'inst_position', "bound_side": "right", 'confirm_motion': True})
-        assert accepted['state'] == 'running' and done.wait(2)
-        assert completions[0][0] == accepted['action_id'] and completions[0][1] == 'completed'
-        result = completions[0][2]
-        assert result['success'] and result['command_sent']
-        client.get_fresh_tactile.assert_not_called()
-        assert mock_bus.sim_tip == [0] * 5
-    finally:
-        grasp.stop()
-        client.close()
-
-
 def test_build_plugins_all_three_cards():
     config = {
         "plugins": {
@@ -431,7 +376,7 @@ def test_all_plugins_start_action():
     config = {"baudrate": 1000000, "side": "left"}
     hand_p = HandPlugin(config, {"enabled": True})
     gesture_p = GesturePlugin(hand_p, {"motion_speed": 85}, global_config=config)
-    grasp_p = GraspPlugin(hand_p, {}, global_config=config)
+    grasp_p = AdaptiveGraspPlugin(hand_p, {}, global_config=config)
     for card in (hand_p, gesture_p, grasp_p):
         # Project lifecycle startup must not require a device selection or CAN.
         assert card.dispatch("start", {"instance_id": "canvas-card"})["state"] == "ready"
@@ -444,7 +389,7 @@ def test_gesture_and_grasp_standalone_without_hand():
     """State inspection and startup work with the basic hand card disabled."""
     config = {"side": "left", "can_channel": "can0", "left_can_id": 0x28, "right_can_id": 0x27}
     gesture_p = GesturePlugin(None, {"motion_speed": 85}, global_config=config)
-    grasp_p = GraspPlugin(None, {}, global_config=config)
+    grasp_p = AdaptiveGraspPlugin(None, {}, global_config=config)
     for card in (gesture_p, grasp_p):
         assert card.dispatch("start", {})["state"] == "ready"
         for side in ("left", "right"):
@@ -1226,29 +1171,14 @@ def test_number_accepts_integer_and_canvas_dropdown_values(number, monkeypatch):
         client.close()
 
 
-def test_grasp_defensive_validation_and_conflict_protection():
-    grasp = GraspPlugin(None, {})
-    for ratio in [True, False, 0, 256, '50', 1.0]:
-        with pytest.raises(ValueError, match='speed_ratio'):
-            grasp.dispatch('side_grasp', {'instance_id': 'gr1', "bound_side": "left", 'speed_ratio': ratio, 'confirm_motion': True})
-    for parameter in ('target_force', 'max_force', 'hold_duration_s', 'active_fingers', 'approach_speed'):
-        with pytest.raises(ValueError, match='已移除参数'):
-            grasp.dispatch('side_grasp', {'instance_id': 'gr1', "bound_side": "left", parameter: 30, 'confirm_motion': True})
-    for confirm in (None, False, 'true', 1):
-        with pytest.raises(ValueError, match='confirm_motion'):
-            grasp.dispatch('side_grasp', {'instance_id': 'gr1', "bound_side": "left", 'confirm_motion': confirm})
-    assert grasp.dispatch('hold', {'instance_id': 'gr1', "bound_side": "left", 'confirm_motion': True}) is None
-    assert grasp._controllers == {}
-
-
 def test_cards_require_explicit_target_without_inheriting_old_configuration():
     """An optional ID or legacy config never substitutes for this call's side."""
     config = {"baudrate": 1000000, "side": "left", "can_channel": "can0",
               "left_can_id": 0x28, "right_can_id": 0x27}
     hand_p = HandPlugin(config, {"enabled": True})
     gesture_p = GesturePlugin(hand_p, {"motion_speed": 85}, global_config=config)
-    grasp_p = GraspPlugin(hand_p, {}, global_config=config)
-    for card, action in ((hand_p, "open"), (gesture_p, "ok_gesture"), (grasp_p, "side_grasp")):
+    grasp_p = AdaptiveGraspPlugin(hand_p, {}, global_config=config)
+    for card, action in ((hand_p, "open"), (gesture_p, "ok_gesture"), (grasp_p, "adaptive_grasp")):
         assert card.dispatch("start", {"instance_id": "new-card"})["state"] == "ready"
         card.dispatch("config", {"instance_id": "old-card", "bound_side": "left"})
         for identity in ("", "old-card", "new-card"):

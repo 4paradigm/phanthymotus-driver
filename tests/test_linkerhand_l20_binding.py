@@ -5,7 +5,7 @@ import threading
 import pytest
 
 from test_linkerhand_l20 import (
-    GesturePlugin, GraspPlugin, HandPlugin, L20CanClient, MockCanBus,
+    AdaptiveGraspPlugin, GesturePlugin, HandPlugin, L20CanClient, MockCanBus,
     _SingleHandController,
 )
 
@@ -43,14 +43,14 @@ def connected_hand():
         client.close()
 
 
-@pytest.fixture(params=[HandPlugin, GesturePlugin, GraspPlugin])
+@pytest.fixture(params=[HandPlugin, GesturePlugin, AdaptiveGraspPlugin])
 def card(request, connected_hand):
     hand, *_ = connected_hand
     return hand if request.param is HandPlugin else request.param(hand, {})
 
 
 def motion_for(card):
-    return {HandPlugin: "open", GesturePlugin: "ok_gesture", GraspPlugin: "side_grasp"}[type(card)]
+    return {HandPlugin: "open", GesturePlugin: "ok_gesture", AdaptiveGraspPlugin: "adaptive_grasp"}[type(card)]
 
 
 def test_probe_requires_a_new_complete_reply(connected_hand):
@@ -198,8 +198,8 @@ def test_disconnection_between_accept_and_worker_reports_acp_error(card, connect
     assert not card._active
 
 
-@pytest.mark.parametrize('first_type', [HandPlugin, GesturePlugin, GraspPlugin])
-@pytest.mark.parametrize('second_type', [HandPlugin, GesturePlugin, GraspPlugin])
+@pytest.mark.parametrize('first_type', [HandPlugin, GesturePlugin, AdaptiveGraspPlugin])
+@pytest.mark.parametrize('second_type', [HandPlugin, GesturePlugin, AdaptiveGraspPlugin])
 def test_actuator_tools_reject_competing_commands_on_same_hand(first_type, second_type, connected_hand, monkeypatch):
     hand, _, _, ctrl = connected_hand
     first = hand if first_type is HandPlugin else first_type(hand, {})

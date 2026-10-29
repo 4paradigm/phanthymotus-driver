@@ -203,6 +203,15 @@ class TactilePlugin:
         """One worker per physical target, with independent card ownership."""
         with self._lifecycle_lock:
             target = (side, channel)
+            if not instance_id:
+                # Default / anonymous stream is explicitly single-instance.
+                # Reject overwriting an active anonymous stream with a different target.
+                current_target = self._stream_targets.get("")
+                if current_target is not None and current_target != target:
+                    raise ValueError(
+                        f"默认触觉流为单实例（当前已绑定 {current_target[0]}/{current_target[1]}）；"
+                        f"启动或切换不同目标 ({side}/{channel}) 必须指定非空 instance_id"
+                    )
             previous = self._stream_targets.get(instance_id)
             stream = self._streams.get(target)
             if stream is None:

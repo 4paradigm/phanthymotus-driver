@@ -14,7 +14,6 @@ COPY can_client.py     /work/can_client.py
 COPY qemu_compat.py    /work/qemu_compat.py
 COPY hand_device.py    /work/hand_device.py
 COPY gesture_device.py /work/gesture_device.py
-COPY grasp_device.py   /work/grasp_device.py
 COPY tactile_device.py /work/tactile_device.py
 COPY adaptive_grasp_device.py    /work/adaptive_grasp_device.py
 COPY config.yaml       /work/config.yaml

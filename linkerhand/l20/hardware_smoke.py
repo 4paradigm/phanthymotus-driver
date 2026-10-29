@@ -49,13 +49,9 @@ def main() -> int:
 
                 print("Reading Tactile Sensors...")
                 client.request_tactile_scalar()
-                client.request_normal_force()
-                client.request_tangential_force()
                 time.sleep(0.06)
                 snap = client.get_tactile_snapshot()
                 print("Fingertip Scalar Touch (0-255):", snap["touch_scalar"])
-                print("Fingertip Normal Force:", snap["normal_force"])
-                print("Fingertip Tangential Force:", snap["tangential_force"])
             finally:
                 ctrl.close()
         return 0

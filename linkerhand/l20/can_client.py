@@ -509,18 +509,18 @@ class L20CanClient:
             self.send_command(FT_PITCH_NR, finger_base)
             self.send_command(FT_YAW_NR, yaw_angles)
         else:
-            # G20 / L20-10 Serial protocol
-            # Mapping:
-            # thumb:  [10, 5, 0, 11, 12, 15] -> [roll, yaw, root, 0, 0, tip]
-            # index:  [6, 11, 1, 13, 14, 16] -> [yaw, 0, root, 0, 0, tip]
-            # middle: [7, 12, 2, 13, 14, 17] -> [yaw, 0, root, 0, 0, tip]
-            # ring:   [8, 13, 3, 14, 15, 18] -> [yaw, 0, root, 0, 0, tip]
-            # little: [9, 14, 4, 15, 16, 19] -> [yaw, 0, root, 0, 0, tip]
-            thumb_data  = [vec20[10], vec20[5],  vec20[0], vec20[11], vec20[12], vec20[15]]
-            index_data  = [vec20[6],  vec20[11], vec20[1], vec20[13], vec20[14], vec20[16]]
-            middle_data = [vec20[7],  vec20[12], vec20[2], vec20[13], vec20[14], vec20[17]]
-            ring_data   = [vec20[8],  vec20[13], vec20[3], vec20[14], vec20[15], vec20[18]]
-            little_data = [vec20[9],  vec20[14], vec20[4], vec20[15], vec20[16], vec20[19]]
+            # G20 / L20-10 Serial protocol (per-finger 6-byte frames)
+            # Layouts per lines 61-65:
+            # thumb:  [roll, yaw, pitch, 0, 0, tip]
+            # index:  [yaw,  0,   pitch, 0, 0, tip]
+            # middle: [yaw,  0,   pitch, 0, 0, tip]
+            # ring:   [yaw,  0,   pitch, 0, 0, tip]
+            # little: [yaw,  0,   pitch, 0, 0, tip]
+            thumb_data  = [vec20[10], vec20[5], vec20[0], 0, 0, vec20[15]]
+            index_data  = [vec20[6],  0,        vec20[1], 0, 0, vec20[16]]
+            middle_data = [vec20[7],  0,        vec20[2], 0, 0, vec20[17]]
+            ring_data   = [vec20[8],  0,        vec20[3], 0, 0, vec20[18]]
+            little_data = [vec20[9],  0,        vec20[4], 0, 0, vec20[19]]
 
             self.send_command(FT_THUMB_POS,  thumb_data,  sleep_s=0.003)
             self.send_command(FT_INDEX_POS,  index_data,  sleep_s=0.003)
@@ -967,27 +967,6 @@ class L20CanClient:
         finally:
             self._release_tactile_query()
 
-    def request_normal_force(self) -> None:
-        self.send_command(FT_NORMAL_FORCE, [], sleep_s=0.003)
-        if not self.legacy_l20_mode:
-            self.send_command(0x90, [], sleep_s=0.003)
-
-    def request_tangential_force(self) -> None:
-        self.send_command(FT_TANGENTIAL, [], sleep_s=0.003)
-        if not self.legacy_l20_mode:
-            self.send_command(0x91, [], sleep_s=0.003)
-
-    def request_all_tactile(self) -> None:
-        """Query scalar pressure, normal force, tangential force, direction, and approach on all fingertips."""
-        self.request_tactile_scalar()
-        self.send_command(FT_NORMAL_FORCE, [], sleep_s=0.003)
-        self.send_command(FT_TANGENTIAL, [], sleep_s=0.003)
-        if not self.legacy_l20_mode:
-            self.send_command(0x90, [], sleep_s=0.003)
-            self.send_command(0x91, [], sleep_s=0.003)
-            self.send_command(0x92, [], sleep_s=0.003)
-            self.send_command(0x93, [], sleep_s=0.003)
-
     def request_matrix_touch(self) -> None:
         """Trigger update of the 12x6 tactile matrix for all 5 fingertips."""
         for ft in (FT_TOUCH_B1, FT_TOUCH_B2, FT_TOUCH_B3, FT_TOUCH_B4, FT_TOUCH_B5):
@@ -1153,15 +1132,6 @@ class L20CanClient:
             self._currents = payload[:5]
         elif frame_type == FT_FAULT_R and len(payload) >= 5:
             self._faults = payload[:5]
-
-        elif frame_type in (FT_NORMAL_FORCE, 0x90) and len(payload) >= FINGER_COUNT:
-            self._normal_force = [float(v) for v in payload[:FINGER_COUNT]]
-        elif frame_type in (FT_TANGENTIAL, 0x91) and len(payload) >= FINGER_COUNT:
-            self._tangential_force = [float(v) for v in payload[:FINGER_COUNT]]
-        elif frame_type in (FT_TANGENTIAL_DIR, 0x92) and len(payload) >= FINGER_COUNT:
-            self._tangential_dir = [float(v) for v in payload[:FINGER_COUNT]]
-        elif frame_type in (FT_APPROACH, 0x93) and len(payload) >= FINGER_COUNT:
-            self._approach_inc = [float(v) for v in payload[:FINGER_COUNT]]
 
         elif frame_type == FT_TOUCH_TYPE and len(payload) >= 1:
             self._touch_type = payload[0]

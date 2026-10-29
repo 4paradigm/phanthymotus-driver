@@ -638,3 +638,43 @@ def test_real_can_queries_require_new_scalar_and_all_matrix_rows_without_motor_c
         assert all(m.data[0] in (*range(0xB1, 0xB6), 0xC0, 0xC1, 0xC2) for m in bus.sent_messages)
     finally:
         client.close()
+
+
+def test_anonymous_stream_single_instance_protection_and_multi_instance_isolation(fake_hand, ros_runtime):
+    hand, _ = fake_hand
+    ros, published = ros_runtime
+    plugin = TactilePlugin(hand, {'poll_hz': 50, 'auto_start': False}, ros2=ros)
+    try:
+        # 1. Anonymous start binds the single-instance default stream
+        start_left = plugin.dispatch('start', {'bound_side': 'left'})
+        assert start_left['state'] == 'running'
+        assert start_left['stream_side'] == 'left'
+
+        # 2. Idempotent anonymous start for the same target succeeds
+        repeat_left = plugin.dispatch('start', {'bound_side': 'left'})
+        assert repeat_left['state'] == 'running'
+
+        # 3. Second anonymous start targeting a different hand is rejected to protect active stream
+        with pytest.raises(ValueError, match="默认触觉流为单实例"):
+            plugin.dispatch('start', {'bound_side': 'right'})
+
+        # 4. Verify left stream was not torn down
+        assert plugin.dispatch('info', {'bound_side': 'left'})['state'] == 'running'
+
+        # 5. Starting a second hand with explicit instance_id is allowed
+        start_right = plugin.dispatch('start', {'instance_id': 'card-right', 'bound_side': 'right'})
+        assert start_right['state'] == 'running'
+        assert start_right['stream_side'] == 'right'
+        assert plugin.dispatch('info', {'bound_side': 'left'})['state'] == 'running'
+
+        # 6. Stopping anonymous stream does not tear down the named stream
+        assert plugin.dispatch('stop', {})['state'] == 'idle'
+        assert plugin.dispatch('info', {'bound_side': 'left'})['state'] == 'idle'
+        assert plugin.dispatch('info', {'instance_id': 'card-right', 'bound_side': 'right'})['state'] == 'running'
+
+        # 7. Stopping named stream shuts it down cleanly
+        assert plugin.dispatch('stop', {'instance_id': 'card-right'})['state'] == 'idle'
+        assert plugin.dispatch('info', {'instance_id': 'card-right', 'bound_side': 'right'})['state'] == 'idle'
+    finally:
+        plugin.stop()
+
