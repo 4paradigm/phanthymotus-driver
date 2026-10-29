@@ -1,5 +1,6 @@
 import ast
 import importlib
+import queue
 from pathlib import Path
 import sys
 import threading
@@ -144,6 +145,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
         plugin._lifecycle_lock = threading.RLock()
         plugin._gates = {s: OutputGate() for s in ("cloud", "imu")}
+        plugin._imu_requests = {"lidar": True, "imu": True}
         plugin._status_node = types.SimpleNamespace(
             cloud_topic="/ubuntu/navigation/lidar",
             imu_topic="/ubuntu/navigation/imu",
@@ -323,6 +325,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 plugin._proc = None
                 plugin._config = {}
                 plugin._requested_outputs = {s: True for s in ("cloud", "imu")}
+                plugin._imu_requests = {"lidar": False, "imu": True}
                 plugin._monitor_attached = True
                 plugin._lifecycle_lock = threading.RLock()
                 plugin._gates = {s: OutputGate() for s in ("cloud", "imu")}
@@ -366,6 +369,17 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 self.assertFalse(restarted["ready"])
                 self.assertIn("clock_not_ready", restarted["blockers"])
                 self.assertEqual(restarted["worker_pid"], 1002)
+
+    def test_initial_lidar_ownership_follows_plugin_configuration(self):
+        module = self.load_bridge_module()
+        for enabled in (False, True):
+            with self.subTest(lidar_enabled=enabled), \
+                 mock.patch.object(module, "_NavigationSensorMonitorNode"):
+                plugin = module.NavigationSensorPlugin({}, "ubuntu", mock.Mock(), lidar_enabled=enabled)
+                self.assertEqual(plugin._imu_requests, {"lidar": enabled, "imu": True})
+                self.assertEqual(plugin._gates["cloud"].acquisition_requested(), enabled)
+                self.assertTrue(plugin._gates["imu"].acquisition_requested())
+                self.assertIsNone(plugin._proc)
 
     def test_global_stop_recreates_monitor_on_restart(self):
         module = self.load_bridge_module()
@@ -430,6 +444,35 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertIn("invalid imu timestamp count=100", messages[1])
         self.assertIn("invalid imu timestamp count=200", messages[2])
         self.assertIn("invalid cloud timestamp count=1", messages[3])
+
+    def test_callbacks_keep_each_samples_own_corrected_acquisition_time(self):
+        module = self.load_bridge_module()
+        node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
+        node._gates = {s: OutputGate() for s in ("cloud", "imu")}
+        node._cloud_queue, node._imu_queue = queue.Queue(), queue.Queue()
+        node._last_stamp_ns = {"cloud": 0, "imu": 0}
+        node._stamp_lock = threading.Lock()
+        node._counters = {f"{s}_{c}": 0 for s in ("cloud", "imu")
+                          for c in ("received", "dropped", "invalid_timestamps", "non_increasing_timestamps")}
+        node._last_receive_monotonic = {"cloud": 0, "imu": 0}
+        node._clock_offset = mock.Mock()
+        node._clock_offset.correct_observation.side_effect = lambda source, host: source + 7
+        node.get_clock = lambda: types.SimpleNamespace(now=lambda: types.SimpleNamespace(nanoseconds=9000000000))
+        node._maybe_publish_status = lambda: None
+        def header(ns):
+            return types.SimpleNamespace(stamp=types.SimpleNamespace(sec=1, nanosec=ns))
+        cloud = types.SimpleNamespace(header=header(100), height=1, width=1, fields=[],
+                                      is_bigendian=False, point_step=12, row_step=12,
+                                      data=b"x" * 12, is_dense=True)
+        imu = types.SimpleNamespace(header=header(250))
+        node._on_cloud(cloud)
+        node._on_imu(imu)
+        self.assertEqual(node._cloud_queue.get_nowait()[1], 1000000107)
+        imu_item = node._imu_queue.get_nowait()
+        self.assertEqual(imu_item[1], 1000000257)
+        self.assertIs(imu_item[2], imu)
+        self.assertEqual(cloud.header.stamp.nanosec, 100)
+        self.assertEqual(imu.header.stamp.nanosec, 250)
 
     def test_duplicate_and_decreasing_corrected_stamps_are_dropped(self):
         module = self.load_bridge_module()

@@ -110,17 +110,27 @@ m/s², and the three standard 3×3 covariance arrays. PhanthyMotus PR #141
 subscribes to this native type and converts it to the versioned
 `phanthy.sensor.imu.v1` dashboard payload without changing the ROS topic.
 
-`lidar_cloud` exposes the unchanged legacy cloud first, plus the standard
-PointCloud2 on port `navigation_lidar`. `lidar_imu` exposes the MID360 IMU;
-the existing body `imu` card is unchanged. Each card stops only its own outputs.
-The isolated worker remains alive while either standard output is enabled and
-is released when both stop. Restart discards queued frames from the old epoch.
+With `navigation_sensors` enabled, `lidar_cloud` exposes three outputs: the
+unchanged legacy cloud first, native PointCloud2 on port `navigation_lidar`,
+and native MID360 IMU on port `navigation_imu`. The independent `lidar_imu`
+card remains available and exposes the **same** `/ubuntu/navigation/imu` topic;
+the existing body `imu` card is unchanged. Existing Canvas connections can keep
+using `lidar_imu`, or connect the `navigation_imu` port on `lidar_cloud`.
 
-LiDAR and IMU retain their shared MID360 source clock and are normalized into
-one ROS system-time domain. Samples are dropped while clock offset estimation
-is not ready or after an invalid/reset observation; the Driver never invents a
-source timestamp. The fixed upside-down mounting rotation is applied equally
-to cloud and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
+The two cards hold independent requests for the shared IMU publisher. Stopping
+one card does not interrupt the other; however, a subscriber can still receive
+IMU messages on the shared topic after its card stops if the other card remains
+running. During card-level operation, the worker remains alive while a navigation
+cloud or IMU request is active and is released after the last request stops.
+Restart discards queued frames from the old epoch.
+
+LiDAR and IMU each retain their own MID360 sample time, corrected from the
+shared source clock into the ROS system-time domain. These are independently
+sampled streams, not synchronized pairs; corrected stamps are not bit-for-bit
+raw DDS stamps. Samples are dropped while clock offset estimation is not ready
+or after an invalid/reset observation; the Driver never invents a source
+timestamp. The fixed upside-down mounting rotation is applied equally to cloud
+and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
 available for Canvas. Safety uses `/ubuntu/lidar/cloud_internal`, produced from
 the same conversion independently of the public card's publishing gate.
 

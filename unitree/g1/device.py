@@ -2454,6 +2454,7 @@ class LidarPlugin:
         self._navigation = navigation
         self._executor = executor
         self._lifecycle_lock = threading.RLock()
+        self._navigation_restart_pending = False
         self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
@@ -2468,7 +2469,8 @@ class LidarPlugin:
             "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]
-                         + ([self._navigation.cloud_descriptor()] if self._navigation else []),
+                         + ([self._navigation.cloud_descriptor(), self._navigation.imu_descriptor()]
+                            if self._navigation else []),
             "configSchema": {
                 "type": "object",
                 "properties": {},
@@ -2480,20 +2482,39 @@ class LidarPlugin:
             if self._node is None:
                 self._node = _LidarNode(self._cloud_topic)
                 self._executor.add_node(self._node)
+                self._navigation_restart_pending = self._navigation is not None
+            # A previous attempt may have failed after creating the node.
+            # Keep the restoration pending until both requests succeed.
+            if getattr(self, "_navigation_restart_pending", False):
+                self._navigation.set_output("cloud", True)
+                self._navigation.set_output("imu", True, owner="lidar")
+                self._navigation_restart_pending = False
 
     def stop(self) -> None:
         with self._lifecycle_lock:
-            # Navigation cloud has an independent worker shared with IMU. Close
-            # only its cloud gate before tearing down the legacy LiDAR node.
+            # Release only this card's shared outputs before tearing down the
+            # legacy node; an independent IMU request keeps the worker alive.
+            failure = None
             if self._navigation:
-                self._navigation.set_output("cloud", False)
-            if self._node is None:
-                return
-            self._node.output_gate.set_enabled(False)
-            self._node.close()
-            self._executor.remove_node(self._node)
-            self._node.destroy_node()
-            self._node = None
+                for stream, owner in (("cloud", None), ("imu", "lidar")):
+                    try:
+                        self._navigation.set_output(stream, False, owner=owner)
+                    except Exception as exc:
+                        if failure is None:
+                            failure = exc
+            if self._node is not None:
+                try:
+                    self._node.output_gate.set_enabled(False)
+                    self._node.close()
+                    self._executor.remove_node(self._node)
+                    self._node.destroy_node()
+                    self._node = None
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+            if failure is not None:
+                raise failure
+            self._navigation_restart_pending = False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action in {"start", "stop", "info"}:
@@ -2501,20 +2522,42 @@ class LidarPlugin:
                 try:
                     if action == "start":
                         self.start()
+                    if action == "stop":
+                        failure = None
+                        if self._node is not None:
+                            try:
+                                self._node.output_gate.set_enabled(False)
+                            except Exception as exc:
+                                failure = exc
+                        if self._navigation:
+                            for stream, owner in (("cloud", None), ("imu", "lidar")):
+                                try:
+                                    self._navigation.set_output(stream, False, owner=owner)
+                                except Exception as exc:
+                                    if failure is None:
+                                        failure = exc
+                        if failure is not None:
+                            # Do not query status/metadata here: a second failure
+                            # must not hide the first failed stop operation.
+                            return {"state": "error", "ready": False, "error": str(failure)}
+                        self._navigation_restart_pending = False
                     if self._node is None:
-                        if action == "stop" and self._navigation:
-                            self._navigation.set_output("cloud", False)
                         return {"state": "idle", "ready": False,
                                 "topic_out": self._cloud_tool()["topic_out"]}
-                    if action != "info":
-                        self._node.output_gate.set_enabled(action == "start")
+                    if action == "start":
+                        self._node.output_gate.set_enabled(True)
                         if self._navigation:
-                            self._navigation.set_output("cloud", action == "start")
+                            self._navigation.set_output("cloud", True)
+                            self._navigation.set_output("imu", True, owner="lidar")
                     outputs = {"legacy": self._node.output_gate.status(500)}
                     if self._navigation:
                         outputs["navigation"] = self._navigation.output_status("cloud")
-                    idle = all(o["state"] == "idle" for o in outputs.values())
-                    ready = all(o["ready"] for o in outputs.values())
+                        outputs["navigation_imu"] = self._navigation.output_status("imu", owner="lidar")
+                    # Preserve the historical cloud readiness contract; IMU has
+                    # its own readiness in outputs and may have a different rate.
+                    cloud_outputs = [o for name, o in outputs.items() if name != "navigation_imu"]
+                    idle = all(o["state"] == "idle" for o in cloud_outputs)
+                    ready = all(o["ready"] for o in cloud_outputs)
                     return {"state": "idle" if idle else ("ready" if ready else "not_ready"),
                             "ready": ready, "outputs": outputs,
                             "topic_out": self._cloud_tool()["topic_out"]}

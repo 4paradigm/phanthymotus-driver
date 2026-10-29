@@ -271,9 +271,8 @@ class G1DeviceBundle:
                 namespace,
                 executor,
                 network_iface,
+                lidar_enabled=plugins_cfg.get("lidar", {}).get("enabled", False),
             )
-            if not plugins_cfg.get("lidar", {}).get("enabled", False):
-                navigation_sensors.set_output("cloud", False)
             self._plugins.append(navigation_sensors)
             print("[bundle] NavigationSensorPlugin loaded")
 

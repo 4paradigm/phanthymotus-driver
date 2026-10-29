@@ -396,11 +396,13 @@ class LidarLifecycleTests(unittest.TestCase):
         nav = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
         nav._lifecycle_lock = threading.RLock()
         nav._requested_outputs = {s: True for s in ("cloud", "imu")}
+        nav._imu_requests = {"lidar": True, "imu": True}
         nav._gates = {s: OutputGate() for s in nav._requested_outputs}
         nav._proc = mock.Mock(pid=123)
         nav._proc.is_alive.return_value = True
         nav._status_node = SimpleNamespace(
             cloud_topic="/ubuntu/navigation/lidar", lidar_frame="livox_frame",
+            imu_topic="/ubuntu/navigation/imu", imu_frame="livox_frame",
             status=lambda running: {"ready": False, "blockers": ["imu_stale"]})
         cls = device_class("LidarPlugin")
         plugin = cls.__new__(cls)
@@ -412,6 +414,9 @@ class LidarLifecycleTests(unittest.TestCase):
         self.assertEqual(tools[0]["name"], "lidar_cloud")
         self.assertEqual(tools[0]["topic_out"][0], {
             "topic": "/ubuntu/lidar/cloud", "format": "sensor/pointcloud"})
+        self.assertEqual(tools[0]["topic_out"][1], nav.cloud_descriptor())
+        self.assertEqual(tools[0]["topic_out"][2], nav.imu_descriptor())
+        self.assertEqual(nav.imu_descriptor()["topic"], nav.get_tools()[0]["topic_out"][0]["topic"])
         result = plugin.dispatch("stop", {})
         self.assertEqual(result["state"], "idle")
         self.assertIsNone(plugin._node.output_gate.token())
@@ -422,6 +427,70 @@ class LidarLifecycleTests(unittest.TestCase):
         nav._gates["cloud"].publish(nav._gates["cloud"].token(), Publisher(), "cloud")
         # Stale sibling IMU must not poison a fresh cloud output.
         self.assertTrue(nav.output_status("cloud")["ready"])
+
+    def test_shared_imu_owner_transitions_do_not_interrupt_sibling(self):
+        from test_navigation_sensor_card import NavigationSensorCardContractTest
+        module = NavigationSensorCardContractTest.load_bridge_module()
+        for first in ("imu", "lidar"):
+            with self.subTest(first=first):
+                nav = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
+                nav._lifecycle_lock = threading.RLock()
+                nav._requested_outputs = {"cloud": False, "imu": True}
+                nav._imu_requests = {"lidar": True, "imu": True}
+                nav._gates = {"cloud": OutputGate(False), "imu": OutputGate()}
+                nav._proc = mock.Mock(pid=123)
+                nav._proc.is_alive.return_value = True
+                nav._proc.terminate.side_effect = lambda: setattr(nav._proc.is_alive, "return_value", False)
+                nav._status_node = SimpleNamespace(status=lambda running: {"blockers": []})
+                other = "lidar" if first == "imu" else "imu"
+                gate = nav._gates["imu"]
+                token = gate.token()
+                nav.set_output("imu", False, owner=first)
+                self.assertEqual(nav.output_status("imu", owner=first)["state"], "idle")
+                self.assertTrue(nav.output_status("imu", owner=other)["enabled"])
+                self.assertEqual(gate.token(), token)
+                pub = Publisher()
+                self.assertTrue(gate.publish(token, pub, "sample"))
+                nav._proc.terminate.assert_not_called()
+                nav.set_output("imu", False, owner=other)
+                self.assertIsNone(gate.token())
+                self.assertFalse(gate.publish(token, pub, "stale"))
+                nav._proc = mock.Mock(pid=124)
+                nav._proc.is_alive.return_value = True
+                nav.set_output("imu", True, owner=first)
+                self.assertNotEqual(gate.token(), token)
+                self.assertFalse(gate.publish(token, pub, "stale after restart"))
+
+    def test_simultaneous_imu_owner_starts_and_stops_are_serialized(self):
+        from test_navigation_sensor_card import NavigationSensorCardContractTest
+        module = NavigationSensorCardContractTest.load_bridge_module()
+        nav = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
+        nav._lifecycle_lock = threading.RLock()
+        nav._requested_outputs = {"cloud": True, "imu": True}
+        nav._imu_requests = {"lidar": True, "imu": True}
+        nav._gates = {s: OutputGate() for s in ("cloud", "imu")}
+        nav._proc = mock.Mock(pid=123)
+        nav._proc.is_alive.return_value = True
+        errors = []
+        for enabled in (False, True):
+            barrier = threading.Barrier(3)
+            def transition(owner):
+                try:
+                    barrier.wait(timeout=2)
+                    nav.set_output("imu", enabled, owner=owner)
+                except Exception as exc:
+                    errors.append(exc)
+            threads = [threading.Thread(target=transition, args=(owner,)) for owner in ("imu", "lidar")]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=2)
+            for thread in threads:
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(nav._imu_requests, {"imu": enabled, "lidar": enabled})
+            self.assertEqual(nav._gates["imu"].acquisition_requested(), enabled)
+        nav._proc.terminate.assert_not_called()
 
     def test_native_cloud_loop_rejects_queued_pre_stop_frame(self):
         from test_navigation_sensor_card import NavigationSensorCardContractTest

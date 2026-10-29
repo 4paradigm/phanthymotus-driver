@@ -580,14 +580,18 @@ class NavigationSensorPlugin:
         namespace: str,
         executor,
         network_iface: str = "eth0",
+        lidar_enabled: bool = False,
     ):
         self._executor = executor
         self._namespace = namespace
         self._network_iface = network_iface
         self._config = dict(plugin_config)
         self._lifecycle_lock = threading.RLock()
-        self._requested_outputs = {stream: True for stream in ("cloud", "imu")}
-        self._gates = {stream: OutputGate() for stream in self._requested_outputs}
+        # Both cards can request the same IMU publisher. Keep their lifecycle
+        # requests independent, while publishing each sample only once.
+        self._imu_requests = {"lidar": bool(lidar_enabled), "imu": True}
+        self._requested_outputs = {"cloud": bool(lidar_enabled), "imu": True}
+        self._gates = {stream: OutputGate(on) for stream, on in self._requested_outputs.items()}
         self._status_node = _NavigationSensorMonitorNode(plugin_config, namespace)
         executor.add_node(self._status_node)
         self._monitor_attached = True
@@ -615,6 +619,9 @@ class NavigationSensorPlugin:
             "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
             self._status_node.lidar_frame,
         )["topic_out"][0] | {"port": "navigation_lidar"}
+
+    def imu_descriptor(self) -> dict:
+        return dict(self.get_tools()[0]["topic_out"][0], port="navigation_imu")
 
     @staticmethod
     def _tool(
@@ -698,18 +705,31 @@ class NavigationSensorPlugin:
                 self._status_node.destroy_node()
                 self._monitor_attached = False
 
-    def set_output(self, stream, enabled):
+    def set_output(self, stream, enabled, owner=None):
         with self._lifecycle_lock:
+            if stream == "imu":
+                owner = owner or "imu"
+                if owner not in self._imu_requests:
+                    raise ValueError("unknown IMU output owner")
+                requests = dict(self._imu_requests)
+                requests[owner] = bool(enabled)
+                effective_enabled = any(requests.values())
+            else:
+                effective_enabled = bool(enabled)
             if not self._worker_running():
                 self._gates = {s: OutputGate(on) for s, on in self._requested_outputs.items()}
-            self._gates[stream].set_enabled(enabled)
-            self._requested_outputs[stream] = bool(enabled)
+            self._gates[stream].set_enabled(effective_enabled)
+            if stream == "imu":
+                self._imu_requests = requests
+            self._requested_outputs[stream] = effective_enabled
+            # Releasing an owner must never resurrect a globally stopped
+            # worker, even if a sibling owner still has a retained request.
             if enabled:
                 self._start_worker()
             elif not any(self._requested_outputs.values()):
                 self._stop_worker()
 
-    def output_status(self, stream):
+    def output_status(self, stream, owner=None):
         with self._lifecycle_lock:
             running = self._worker_running()
             status = self._status_node.status(running)
@@ -721,10 +741,14 @@ class NavigationSensorPlugin:
                 blockers.append(f"{stream}_not_fresh")
             if not output["enabled"]:
                 blockers = []
-            ready = output["ready"] and not blockers
-            return {**status, **output, "ready": ready, "blockers": blockers,
+            requested = (self._imu_requests[owner]
+                         if stream == "imu" and owner is not None else output["enabled"])
+            ready = requested and output["ready"] and not blockers
+            if not requested:
+                blockers = []
+            return {**status, **output, "enabled": requested, "ready": ready, "blockers": blockers,
                     "worker_running": running,
-                    "state": "idle" if not output["enabled"] else
+                    "state": "idle" if not requested else
                     ("ready" if ready else "not_ready"),
                     "worker_pid": self._proc.pid if running else None}
 
@@ -734,7 +758,7 @@ class NavigationSensorPlugin:
                 try:
                     if action != "info":
                         self.set_output("imu", action == "start")
-                    return {**self.output_status("imu"),
+                    return {**self.output_status("imu", owner="imu"),
                             "topic_out": self.get_tools()[0]["topic_out"]}
                 except (TimeoutError, OSError) as exc:
                     return {"state": "error", "ready": False, "error": str(exc)}
