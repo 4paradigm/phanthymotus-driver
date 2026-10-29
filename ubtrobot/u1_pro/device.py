@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
+from expression_idle import ExpressionIdleLoop
 from native_idle_actions import DEFAULT_NATIVE_CONTAINER, IDLE_ACTION_KEY, IdleActionControl, safe_native_detail
 
 
@@ -1412,6 +1413,7 @@ class AudioPlugin:
         self.running = False
         self._lock = threading.Lock()
         self._active: dict | None = None
+        self._completion_callback = None
         self.nodes.add_playback_listener(self._on_playback_state)
 
     def get_tool(self):
@@ -1439,6 +1441,8 @@ class AudioPlugin:
         with self._lock:
             active = self._active
             self._active = None
+            callback = self._completion_callback
+            self._completion_callback = None
         result = {"state": "idle"}
         if active:
             try:
@@ -1446,25 +1450,39 @@ class AudioPlugin:
             except Exception as exc:
                 result["interrupt_error"] = str(exc)
             finally:
-                _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, active["tool_name"])
+                self._complete(active, "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, callback)
         self.running = False
         return result
 
-    def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio") -> dict:
+    def _complete(self, active: dict, status: str, result: dict, callback=None) -> None:
+        if callback is not None:
+            callback(status, result)
+        else:
+            _acp_notify(active["action_id"], status, result, active["tool_name"])
+
+    def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio",
+               *, on_complete=None, cancel_event=None) -> dict:
         with self._lock:
+            if cancel_event is not None and cancel_event.is_set():
+                return {"state": "cancelled", "action_id": action_id}
             if self._active:
                 return {"state": "error", "message": "another U1 Pro audio action is active", "action_id": self._active["action_id"]}
             vendor_uuid = str(uuid.uuid4())
             vendor_payload = dict(payload)
             vendor_payload["uuid"] = vendor_uuid
             self._active = {"action_id": action_id, "vendor_uuid": vendor_uuid, "kind": kind, "tool_name": tool_name}
+            self._completion_callback = on_complete
+            if on_complete is not None:
+                self._active["background"] = True
         try:
             result = self.nodes.string_call(kind, vendor_payload)
         except Exception as exc:
             with self._lock:
                 if self._active and self._active["action_id"] == action_id:
                     self._active = None
-            _acp_notify(action_id, "error", {"state": "error", "message": str(exc)}, tool_name)
+                    self._completion_callback = None
+            self._complete({"action_id": action_id, "tool_name": tool_name}, "error",
+                           {"state": "error", "message": str(exc)}, on_complete)
             raise
         # Some vendor services report rejection in their normal response
         # envelope instead of raising. Do not leave the action barrier active
@@ -1473,9 +1491,10 @@ class AudioPlugin:
             with self._lock:
                 if self._active and self._active["action_id"] == action_id:
                     self._active = None
+                    self._completion_callback = None
             message = str(result.get("message") or result.get("error") or "vendor rejected the request")
             error = {"state": "error", "message": message[:512], "action_id": action_id}
-            _acp_notify(action_id, "error", error, tool_name)
+            self._complete({"action_id": action_id, "tool_name": tool_name}, "error", error, on_complete)
             raise RuntimeError(message)
         returned_uuid = _vendor_action_uuid(result)
         if returned_uuid:
@@ -1494,11 +1513,13 @@ class AudioPlugin:
             if not active or not event_uuid or event_uuid != active["vendor_uuid"]:
                 return
             self._active = None
+            callback = self._completion_callback
+            self._completion_callback = None
         state_name = str(data.get("state_name") or data.get("state") or "").upper()
         failed = state_name == "FAILED" or data.get("success") is False
         success = not failed and (data.get("success") is True or state_name == "COMPLETED")
         status = "completed" if success else "error"
-        _acp_notify(active["action_id"], status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": _bounded_playback(data)}, active["tool_name"])
+        self._complete(active, status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": _bounded_playback(data)}, callback)
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1848,17 +1869,22 @@ class ExpressionPlugin:
     }
 
     def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None,
-                 catalog_available: bool = False):
+                 catalog_available: bool = False, *, idle_control: IdleActionControl | None = None):
         self.audio = audio
         self.running = False
         if catalog_available:
             self.EXPRESSIONS = {name: value for name, value in self.EXPRESSIONS.items()
                                 if motion_catalog and value[0] in motion_catalog}
+        self.idle_loop = ExpressionIdleLoop(
+            audio, self.EXPRESSIONS, idle_control,
+            lambda action_id, status, result: _acp_notify(action_id, status, result, "expression"))
 
     def get_tool(self):
         actions = {
             "start": ([], "Prepare the U1 Pro expression action card."),
             "play": (["name"], "Play an expression using its declared readable name."),
+            "idle_start": ([], "Start periodic blink/gaze/distracted presets after checking vendor idle is disabled; completion acknowledges startup only."),
+            "idle_stop": ([], "Stop scheduling idle expressions; allow an accepted preset to finish without interrupting other tasks."),
             "interrupt": ([], "Interrupt the current expression motion."),
             "stop": ([], "Interrupt the current U1 Pro expression or audio motion."),
             "info": ([], "Read the expression card and active playback state."),
@@ -1867,7 +1893,7 @@ class ExpressionPlugin:
             "name": {"type": "string", "enum": sorted(self.EXPRESSIONS), "description": "Declared readable expression name, such as smile or blink."},
             "action_id": {"type": "string", "description": "Optional ACP action correlation ID."},
         })
-        schema["x-completion"] = {"actions": ["play"], "timeout": 120}
+        schema["x-completion"] = {"actions": ["play", "idle_start"], "timeout": 120}
         schema["x-resource"] = VENDOR_ACTION_RESOURCE
         return tool(self.PREFIX, "actuator", "控制 U1 Pro 预设表情和轻量手势，例如微笑和眨眼；头部动作由 head 卡片提供。", schema)
 
@@ -1876,12 +1902,20 @@ class ExpressionPlugin:
         return {"state": "ready"}
 
     def stop(self):
+        self.idle_loop.stop()
         self.running = False
         return self.audio.stop()
 
     def dispatch(self, action, args):
         if action == "start":
             return self.start()
+        if action == "idle_start":
+            action_id = str(args.get("action_id") or uuid.uuid4())
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", action_id):
+                raise ValueError("expression.idle_start requires a valid action_id")
+            return self.idle_loop.start(action_id)
+        if action == "idle_stop":
+            return self.idle_loop.stop()
         if action == "play":
             name = str(args.get("name", "")).strip().lower()
             if name not in self.EXPRESSIONS:
@@ -1894,7 +1928,8 @@ class ExpressionPlugin:
         if action == "info":
             with self.audio._lock:
                 active = dict(self.audio._active) if self.audio._active else None
-            return {"state": "ready" if self.running else "idle", "active": active}
+            return {"state": "ready" if self.running else "idle", "active": active,
+                    "idle_loop": self.idle_loop.info()}
         return None
 
 class _SystemSwitchPlugin:
@@ -2224,7 +2259,7 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     camera_left = EyeCameraPlugin(nodes, "left")
     camera_right = EyeCameraPlugin(nodes, "right")
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
-               ExpressionPlugin(audio, motion_catalog, catalog_available),
+               ExpressionPlugin(audio, motion_catalog, catalog_available, idle_control=idle_control),
                HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes),
                IdleActionsPlugin(idle_control),

@@ -9,7 +9,7 @@
 
 部署服务使用 `restart: always`，用于主机或 Docker daemon 重启后自动恢复驱动；运维人员手动停止容器后，Docker 会在 daemon 重启时再次启动它。若需临时停用，应通过部署编排管理该服务，而不是依赖 `docker stop` 保持停机。
 - `tts`：通过 U1 SDK `play_text` 进行文本播报，支持打断和 ACP 异步完成回报。真机音量服务不纳入本驱动能力。
-- `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。
+- `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；有本地活动任务时，`interrupt`/`stop` 调用 SDK 中断服务。两张卡与 TTS 共享一个活动任务槽。`expression` 另有 `idle_start/idle_stop`，用于周期性播放现有表情预设。
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `idle_actions`：独立控制自动待机动作及自动眨眼，支持 `enable`、`disable`、`status`，设置由厂商配置服务持久保存。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。
@@ -21,6 +21,30 @@
 这些开关不能停止固件内部 Agent 进程、ROS 服务、安全控制环或已经提交的动作。关闭 `visual_behavior` 用于停止固件自主视觉行为，不会屏蔽驱动显式提交的 expression/head 动作；显式动作可通过对应卡片的 `interrupt` 中断。
 
 授权使用只读挂载的 `U1_PRO_AUTH_FILE` JSON 和同目录 license 文件，或受保护的环境变量。认证文件不得提交到仓库或写入镜像。
+
+### expression 周期待机模式
+
+在原 `expression` 卡片中新增两个 action，使用已有 SDK 预设模拟待机，不加载自定义舵机轨迹：
+
+| 用途 | expression 输入 |
+| --- | --- |
+| 启动周期待机 | `{"action":"idle_start"}` |
+| 停止安排后续待机表情 | `{"action":"idle_stop"}` |
+| 查询循环和当前任务 | `{"action":"info"}` |
+
+原来的 `start` 仍只准备卡片，不自动启用循环。`play` 的名称、参数及完成通知保持原用法；`interrupt/stop` 先关闭循环，再执行原来的共享任务中断逻辑。`head` 的接口不变。
+
+先通过独立的 `idle_actions.disable` 关闭原厂自动待机，并等待已提交的厂商动作结束。两种待机模式分开控制：`expression.idle_start` 会在后台读回原厂待机偏好，只有确认为关闭才启动，不自动修改该持久配置；开关为关闭也不等于已经确认电机静止。运行中不要另行开启原厂自动待机，否则两路可能竞争控制器。
+
+`idle_start` 快速返回 `state:"starting"` 和唯一 `action_id`；读取与启动结果通过 ACP 完成通知返回（`x-completion` 包含 `play` 和 `idle_start`，兜底120秒）。**启动完成表示循环已启用，不表示整个循环结束。** 原厂待机仍开启、查询失败等通过该启动通知报错。重复启动在旧线程仍运行时直接拒绝，避免创建多个循环。
+
+后台从当前固件实际开放的 `blink`、`gaze`、`distracted` 中选择，权重为70/20/10；注视、发呆尽量不连续重复。每轮随机等待3–7秒，已有TTS、head或expression任务时让出。预设通过同一个SDK任务槽串行提交，等待厂商对应UUID的真实结果事件后再安排下一轮，不按估算时长重复下发。
+
+循环内的每次预设仅走内部完成回调，不重复向ACP上报，避免每次眨眼都触发Agent对话。请求失败、取消或120秒没有结果时，循环进入 `error` 并停止安排新动作，详情通过 `expression.info.idle_loop.last_error` 和驱动日志查看；不会自动重发或全局中断。缺少完成事件时，活动任务槽会保留，不能把超时当成物理停止。
+
+`expression.info` 保留原 `state/active`，新增 `idle_loop`：`enabled`、`state`、`current_action_id`、`last_expression`、`completed_count`、`last_error`、`available_expressions`。后台活动任务在 `active` 中标记 `background:true`。
+
+`idle_stop` 只停止后续调度，不取消已接收的单次预设，也不影响其他前台任务；如需尝试打断当前动作，仍使用原 `interrupt`。中断后的本地 `cancelled` 不是物理停止证明。主动动作在后台预设播放期间仍沿用原来“任务槽忙”的返回，不自动抢占；需要切换时，先 `idle_stop`，等当前任务完成，再 `play`。驱动停止或卡片 `stop` 后不会继续启动周期动作。
 
 ### 自动待机动作卡片 `idle_actions`
 
