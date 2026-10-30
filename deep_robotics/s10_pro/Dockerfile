@@ -1,5 +1,7 @@
 # Vendor DDS and platform DDS run in separate processes, both on Jazzy/Python3.12.
-ARG ROS_BASE_IMAGE=ros:jazzy-ros-base
+# Immutable multi-platform ROS Jazzy base; provenance and size notes are in
+# deploy/BUILD_REPRODUCIBILITY.md. Refresh only with a reviewed image rebuild.
+ARG ROS_BASE_IMAGE=ros:jazzy-ros-base@sha256:8eed0a4669bbf43ee331878a4c39bd8ebddea8e3312a58b4fae8edb14526b617
 FROM ${ROS_BASE_IMAGE} AS interfaces
 ARG DEEP_ROBOTICS_MSG_REV=a0d1a29eec5c4db5a9107595bb51e3be8122b86c
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -1,5 +1,8 @@
 # Current running-driver source
 
+Infrastructure rationale, the pinned ROS base and image-size measurement
+requirements are documented in [build reproducibility](deploy/BUILD_REPRODUCIBILITY.md).
+
 This revision imports the running Docker driver on 2026-10-30, including automatic
 preparation, the hidden manual Prepare entry, bounded/relative movement, and the
 read-only joint skeleton. Public monitor cards are battery, joints, lidar_cloud

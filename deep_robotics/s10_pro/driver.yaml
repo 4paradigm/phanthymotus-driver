@@ -6,27 +6,20 @@ hardware_model: "s10-pro"
 image_name: deep-robotics-s10-pro
 port: 15745
 mcp_url: "http://localhost:15745/mcp"
-description: "S10 Pro M20-style monitoring, state, motion feedback, device health, hardware e-stop, diagnostics, IMU, odometry and point cloud; physical controls remain gated"
+description: "S10 Pro battery, joint skeleton, IMU and point-cloud monitoring, device availability, and gated posture, timed and relative movement"
 build_context_extras:
   - ../../common
+# Public tools advertised by the configured supervised driver bundle.
+# Internal feedback sources are not separate marketplace cards.
 cards:
   - {name: battery, type: sensor}
-  - {name: state, type: sensor}
   - {name: joints, type: sensor}
-  - {name: imu, type: sensor}
-  - {name: odometry, type: sensor}
-  - {name: lidar, type: sensor}
+  - {name: model, type: resource}
   - {name: lidar_cloud, type: sensor}
-  - {name: motion_info, type: sensor}
-  - {name: device_status, type: sensor}
-  - {name: hard_estop, type: sensor}
-  - {name: errors, type: sensor}
-  - {name: motion_events, type: sensor}
-  - {name: capabilities, type: sensor}
-  - {name: ros_graph, type: sensor}
+  - {name: imu, type: sensor}
   - {name: device, type: actuator}
   - {name: motion, type: actuator}
   - {name: timed_move, type: actuator}
   - {name: relative_move, type: actuator}
-# Conditional hardware streams are listed in capabilities until their source is verified.
+# Hardware e-stop, fault and odometry feedback remain internal motion checks.
 # No charging action is exposed.
