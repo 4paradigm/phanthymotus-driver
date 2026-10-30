@@ -50,6 +50,8 @@ class FakeNative:
 
     def request(self, *args, **kwargs):
         self.calls.append((args, kwargs))
+        if len(args) > 1 and args[1] == 0x00100001:
+            return {"PatrolDevice": {"Items": {"NavigationState": "completed"}}}
         return {"state": "sent"}
 
     def send(self, *args, **kwargs):
@@ -779,8 +781,13 @@ def test_navigation_actions_use_s10_pro_native_commands(monkeypatch):
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline and not terminals:
         time.sleep(0.01)
-    assert terminals == [(result["action_id"], "completed", {"state": "completed", "response": {"state": "sent"}})]
-    args, kwargs = native.calls[-1]
+    assert terminals == [(result["action_id"], "completed", {
+        "state": "completed",
+        "response": {"PatrolDevice": {"Items": {"NavigationState": "completed"}}},
+        "command_response": {"state": "sent"},
+    })]
+    args, kwargs = next((args, kwargs) for args, kwargs in native.calls
+                        if args[:2] == (0x00100003, 0x00100002))
     assert args[:2] == (0x00100003, 0x00100002)
     assert args[2]["Item"][0]["PosX"] == 1.2
     assert args[2]["Item"][0]["AngleYaw"] == pytest.approx(0.5)
@@ -867,6 +874,34 @@ def test_navigation_request_timeout_reports_acp_error(monkeypatch):
     assert terminals == [(accepted["action_id"], "error", {
         "state": "error", "message": "navigation task timed out",
     })]
+
+
+def test_navigation_cancel_timeout_releases_action_and_reports_error(monkeypatch):
+    device = _load_device(monkeypatch)
+    started = threading.Event()
+
+    class CancelFailNative(FakeNative):
+        def request(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if len(args) > 1 and args[1] == 0x00100002:
+                started.set()
+                return {"state": "accepted"}
+            if len(args) > 1 and args[1] == 0x00100004:
+                raise TimeoutError("cancel timed out")
+            return {"PatrolDevice": {"Items": {"NavigationState": "running"}}}
+
+    native = CancelFailNative({"navigation_task_timeout": 5})
+    plugin = device.S10NavigationPlugin(native)
+    terminals = []
+    plugin._acp_callback = lambda *event: terminals.append(event)
+    accepted = plugin.dispatch("goal", {"x": 1, "y": 2, "yaw_degrees": 0, "confirm": True})
+    assert started.wait(1)
+    result = plugin.dispatch("cancel", {})
+    assert result["state"] == "error"
+    assert terminals == [(accepted["action_id"], "error", {
+        "state": "error", "reason": "navigation_cancel_failed", "message": "cancel timed out",
+    })]
+    assert plugin.dispatch("goal", {"x": 3, "y": 4, "yaw_degrees": 0, "confirm": True})["state"] == "accepted"
 
 
 def test_loco_card_uses_shared_action_names_and_native_velocity_commands(monkeypatch):

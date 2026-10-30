@@ -1266,19 +1266,56 @@ class S10NavigationPlugin:
         try:
             response = self.native.request(0x00100003, 0x00100002, {"Item": [item]}, response_timeout=timeout)
             error = self._response_error(response)
-            if error is None:
-                self._finish_goal(action_id, "completed", {"state": "completed", "response": response})
-            else:
+            if error is not None:
                 self._finish_goal(action_id, "error", {"state": "error", "error_code": error, "response": response})
+                return
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                status = self.native.request(0x00100003, 0x00100001)
+                terminal = self._navigation_terminal(status)
+                if terminal is not None:
+                    state, detail = terminal
+                    self._finish_goal(action_id, state, {"state": state, "response": status,
+                                                         "command_response": response, **detail})
+                    return
+                time.sleep(0.2)
+            self._finish_goal(action_id, "error", {"state": "error", "message": "navigation status timed out",
+                                                    "command_response": response})
         except Exception as exc:
             self._finish_goal(action_id, "error", {"state": "error", "message": str(exc)})
+
+    @staticmethod
+    def _navigation_terminal(response):
+        """Translate vendor navigation status into an ACP terminal state."""
+        body = response.get("PatrolDevice", response) if isinstance(response, dict) else {}
+        items = body.get("Items", body) if isinstance(body, dict) else {}
+        if not isinstance(items, dict):
+            return None
+        raw = next((items.get(key) for key in
+                    ("NavigationState", "NavState", "TaskState", "Status", "State")
+                    if items.get(key) is not None), None)
+        if raw is None:
+            return None
+        value = str(raw).strip().lower()
+        if value in {"completed", "complete", "success", "succeeded", "3", "4"}:
+            return "completed", {}
+        if value in {"cancelled", "canceled", "cancel", "5"}:
+            return "cancelled", {"reason": "navigation_cancelled"}
+        if value in {"failed", "failure", "error", "aborted", "6", "7"}:
+            return "error", {"message": "navigation task failed", "status": raw}
+        return None
 
     def _cancel_goal(self):
         with self._goal_lock:
             action_id = self._active_goal
         if action_id is None:
             return None
-        response = self.native.request(0x00100003, 0x00100004)
+        try:
+            response = self.native.request(0x00100003, 0x00100004)
+        except Exception as exc:
+            result = {"state": "error", "reason": "navigation_cancel_failed", "message": str(exc)}
+            self._finish_goal(action_id, "error", result)
+            return result
         self._finish_goal(action_id, "cancelled", {"state": "cancelled", "reason": "navigation_cancelled"})
         return response
 

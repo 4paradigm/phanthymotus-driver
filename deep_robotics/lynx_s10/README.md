@@ -1,6 +1,6 @@
 # 云深处山猫 S10 Driver
 
-本 Driver 对照山猫 S10《软件开发指南》V1.0.2，并在 S10 Pro 真机上验证，实现原生 `PatrolDevice` JSON over TCP。部署主机是 S10 的 RK3588 机载 Linux 主机（SSH/WLAN 地址 `10.100.129.209`，机器人侧 `eth0` 地址 `10.21.33.103/24`）；机载 `robot_server` 进程在该主机监听 TCP `30003`，因此当前 host-network 容器连接 `10.21.33.103:30003` 是连接同机服务，不是把两个独立主机配置成同一 IP。状态卡尽量采用 Go1/Go2/As2W 常见的 `imu`、`loco_state`、`joints`、`joint_state`、`battery` 命名；协议中无法归并的故障和 Pro 导航状态保留为独立卡。
+本 Driver 对照山猫 S10《软件开发指南》V1.0.2，并在 S10 Pro 真机上验证，实现原生 `PatrolDevice` JSON over TCP。部署主机是 S10 的 RK3588 机载 Linux 主机（SSH/WLAN 地址 `10.100.129.209`，机器人侧 `eth0` 地址 `10.21.33.103/24`）；机载 `robot_server` 进程在该主机监听 TCP `30003`，因此当前 host-network 容器连接 `10.21.33.103:30003` 是连接同机服务，不是把两个独立主机配置成同一 IP。状态卡尽量采用 Go1/Go2/As2W 常见的 `imu`、`loco_state`、`joints`、`joint_state`、`battery` 命名；设备电源控制不暴露为 Agent 卡，Pro 导航作为独立执行卡保留。
 
 ## 协议
 
