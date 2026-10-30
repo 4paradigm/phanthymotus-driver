@@ -33,7 +33,10 @@ OPERATOR_PERMIT_SCHEMA_V2 = 's10_pro.operator_permit/2'
 OPERATOR_PERMIT_SCHEMAS = frozenset({OPERATOR_PERMIT_SCHEMA, OPERATOR_PERMIT_SCHEMA_V2})
 MAX_OPERATOR_ACTION_S = 15.
 SUPERVISED_POSTURE_ACTIONS = frozenset({'stand', 'lie', 'move_mode'})
-SUPERVISED_DISTANCE_ACTIONS = frozenset({'forward_30cm', 'backward_30cm'})
+SUPERVISED_DISTANCE_ACTIONS = frozenset({
+    'forward_30cm', 'backward_30cm', 'turn_left', 'turn_right',
+    'relative_forward', 'relative_backward', 'relative_left', 'relative_right',
+    'relative_turn_left', 'relative_turn_right'})
 SUPERVISED_ACTIONS = SUPERVISED_POSTURE_ACTIONS | SUPERVISED_DISTANCE_ACTIONS
 OPERATOR_PERMIT_FIELDS = frozenset({'schema', 'session_id', 'request_id', 'action',
     'robot_session', 'issued_monotonic', 'expires_monotonic', 'action_deadline_monotonic'})
@@ -327,9 +330,9 @@ class DDSCommandAdapter:
         if self._supervised_posture:
             permit = validate_operator_permit(authority, now=self._clock())
             if navigation and permit['action'] not in SUPERVISED_DISTANCE_ACTIONS:
-                raise AuthorityUnavailable('only fixed-distance actions may publish NAV_CMD')
+                raise AuthorityUnavailable('only bounded navigation actions may publish NAV_CMD')
             if not navigation and permit['action'] not in SUPERVISED_POSTURE_ACTIONS:
-                raise AuthorityUnavailable('fixed-distance scope cannot publish a state command')
+                raise AuthorityUnavailable('navigation scope cannot publish a state command')
             return permit
         return validate_authority(authority, now=self._clock(), navigation=navigation)
 
@@ -393,13 +396,24 @@ class DDSCommandAdapter:
         if self._supervised_posture:
             permit = validate_operator_permit(authority, now=self._clock())
             if permit['action'] not in SUPERVISED_DISTANCE_ACTIONS:
-                raise AuthorityUnavailable('only fixed-distance scope may publish NAV_CMD')
+                raise AuthorityUnavailable('only bounded navigation scope may publish NAV_CMD')
             values = tuple(_finite(value, name) for name, value in (
                 ('vx', vx), ('vy', vy), ('yaw_rate', yaw_rate)))
             vx, vy, yaw_rate = values
-            expected = 1 if permit['action'] == 'forward_30cm' else -1
-            if vy != 0 or yaw_rate != 0 or abs(vx) > .12 or (vx != 0 and vx * expected <= 0):
-                raise AuthorityUnavailable('fixed-distance command exceeds its direction or speed scope')
+            scope = permit['action']
+            relative = scope.startswith('relative_')
+            base_scope = scope.removeprefix('relative_') if relative else scope
+            expected = 1 if base_scope in ('forward_30cm', 'turn_left', 'forward', 'left') else -1
+            turning = base_scope.startswith('turn_')
+            lateral = base_scope in ('left', 'right')
+            invalid = ((vx != 0 or vy != 0 or abs(yaw_rate) > .20
+                        or (yaw_rate != 0 and yaw_rate * expected <= 0)) if turning else
+                       (vx != 0 or yaw_rate != 0 or abs(vy) > .12
+                        or (vy != 0 and vy * expected <= 0)) if lateral else
+                       (vy != 0 or yaw_rate != 0 or abs(vx) > .12
+                        or (vx != 0 and vx * expected <= 0)))
+            if invalid:
+                raise AuthorityUnavailable('navigation command exceeds its direction or speed scope')
         return self._send('velocity', lambda: self._codec.build_velocity(vx, vy, yaw_rate), authority=authority, cancel_event=cancel_event)
 
     def publish_zero_velocity(self, *, authority, cancel_event=None):

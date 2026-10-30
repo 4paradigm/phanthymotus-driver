@@ -17,20 +17,24 @@ try:
                              normalize_config_updates, validate_empty_arguments, SENSOR_TITLES, config_overlap_constraints)
     from .monitoring import (MOTION_CAPABILITY, DEVICE_ACTIONS, DEVICE_REASON, ErrorObservations,
                              capabilities_snapshot, device_summary, estop_summary, motion_summary)
+    from .s10_skeleton import model_description, model_joint_name, model_angle
 except ImportError:  # Direct driver execution; reader itself imports no ROS here.
     from reader import source_specs
     from parameters import (sensor_defaults, sensor_config_schema, validate_sensor_settings,
                             normalize_config_updates, validate_empty_arguments, SENSOR_TITLES, config_overlap_constraints)
     from monitoring import (MOTION_CAPABILITY, DEVICE_ACTIONS, DEVICE_REASON, ErrorObservations,
                             capabilities_snapshot, device_summary, estop_summary, motion_summary)
+    from s10_skeleton import model_description, model_joint_name, model_angle
 
 
 CARDS = {
     "state": (SENSOR_TITLES["state"], ("battery", "motion_info", "hard_estop", "exception", "fault_event", "fault_aggregator"), 1.0),
-    "joints": (SENSOR_TITLES["joints"], ("joints",), 5.0),
+    "battery": (SENSOR_TITLES["battery"], ("battery",), 1.0),
+    "joints": (SENSOR_TITLES["joints"], ("joints", "imu"), 10.0),
     "imu": ("IMU", ("imu",), 5.0),
     "odometry": (SENSOR_TITLES["odometry"], ("odometry",), 5.0),
     "lidar": (SENSOR_TITLES["lidar"], ("lidar",), 2.0),
+    "lidar_cloud": (SENSOR_TITLES["lidar_cloud"], ("lidar",), 10.0),
     "motion_info": (SENSOR_TITLES["motion_info"], ("motion_info",), 5.0),
     "device_status": (SENSOR_TITLES["device_status"], ("battery", "joints", "cpu_status", "memory_status", "filesystem_status", "network_status"), 1.0),
     "hard_estop": (SENSOR_TITLES["hard_estop"], ("hard_estop",), 5.0),
@@ -52,6 +56,71 @@ SOURCE_TOPICS = {
 ERROR_SOURCES = ("exception", "fault_event", "fault_aggregator")
 RESOURCE_SOURCES = ("cpu_status", "memory_status", "filesystem_status", "network_status")
 LOCAL_CARDS = ("motion_events", "capabilities", "device")
+G1_CARDS = ("battery", "joints", "lidar_cloud", "imu")
+# Only these cards are advertised to Core.  The reader source catalogue remains
+# complete because motion readiness and relative movement still consume
+# motion_info, hard_estop, odometry, joints and fault snapshots internally.
+PUBLIC_CARDS = (*G1_CARDS, "device")
+
+
+def _finite(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+
+
+def _axis(data, fields):
+    data = data if isinstance(data, dict) else {}
+    return [_finite(data.get(key)) for key in fields]
+
+
+def _g1_output(name, source):
+    if name == "battery":
+        records = source.get("data") if isinstance(source, dict) else None
+        item = records[0] if isinstance(records, list) and records and isinstance(records[0], dict) else {}
+        voltage = _finite(item.get("voltage"))
+        temperatures = item.get("battery_temperature")
+        return {"soc": _finite(item.get("battery_level")), "soh": None,
+                "current": _finite(item.get("current")),
+                "voltage": [voltage] if voltage is not None else [], "cell_vol": [],
+                "temperature": [_finite(v) for v in temperatures] if isinstance(temperatures, list) else [],
+                "cycle": _finite(item.get("cycles"))}
+    if name == "joints":
+        source = source if isinstance(source, dict) else {}
+        joint_data = source.get("joints")
+        inner = joint_data.get("data") if isinstance(joint_data, dict) else None
+        records = inner.get("joints_data") if isinstance(inner, dict) else None
+        records = records if isinstance(records, list) else []
+        joints = []
+        for idx, record in enumerate(records):
+            record = record if isinstance(record, dict) else {}
+            temps = [_finite(record.get(key)) for key in ("motion_temp", "driver_temp")]
+            joint_name = model_joint_name(idx, record)
+            raw_position = _finite(record.get("position"))
+            entry = {"idx": idx,
+                     "q": model_angle(idx, raw_position) if joint_name else raw_position,
+                     "dq": _finite(record.get("velocity")), "tau": _finite(record.get("torque")),
+                     "temp": [value for value in temps if value is not None]}
+            if joint_name:
+                entry["name"] = joint_name
+            joints.append(entry)
+        imu = source.get("imu")
+        orientation = imu.get("orientation") if isinstance(imu, dict) else None
+        return {"joints": joints, "imu_quat": _axis(orientation, ("w", "x", "y", "z"))}
+    if name == "imu":
+        source = source if isinstance(source, dict) else {}
+        orientation = source.get("orientation")
+        x, y, z, w = _axis(orientation, ("x", "y", "z", "w"))
+        rpy = [None, None, None]
+        if all(value is not None for value in (x, y, z, w)):
+            roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+            pitch_value = 2 * (w * y - z * x)
+            pitch = math.asin(max(-1.0, min(1.0, pitch_value)))
+            yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+            rpy = [roll, pitch, yaw]
+        return {"quaternion": [w, x, y, z],
+                "gyroscope": _axis(source.get("angular_velocity"), ("x", "y", "z")),
+                "accelerometer": _axis(source.get("linear_acceleration"), ("x", "y", "z")),
+                "rpy": rpy, "temperature": None}
+    raise ValueError("Unsupported G1-style card")
 
 
 def _json_value(value):
@@ -79,6 +148,7 @@ class ReadOnlyCard:
         # The action card owns /motion_events. This independent view must not
         # add a second producer to that existing event/ACP-related stream.
         self.topic = f"{base}/motion_events_view" if name == "motion_events" else f"{base}/{name}"
+        self.joint_detail_topic = f"{base}/joints_info" if name == "joints" else None
         self.info_topic = f"{base}/lidar_info" if name == "lidar" else None
         self._defaults = self._validate({**sensor_defaults(name), **dict(config or {})})
         self._settings = dict(self._defaults)
@@ -99,12 +169,28 @@ class ReadOnlyCard:
         return validate_sensor_settings(self.name, settings)
 
     def _ports(self):
-        ports = [{"topic": self.topic, "format": "sensor/pointcloud" if self.name == "lidar" else "data/json"}]
+        if self.joint_detail_topic:
+            # The canvas detail panel does not pass the MCP id to its skeleton
+            # renderer. Put a readable stream first while keeping the original
+            # skeleton topic for the monitor dashboard.
+            return [{"topic": self.joint_detail_topic, "format": "data/json"},
+                    {"topic": self.topic, "format": "sensor/skeleton"}]
+        fmt = ("sensor/pointcloud" if self.name in ("lidar", "lidar_cloud") else
+               "data/json")
+        ports = [{"topic": self.topic, "format": fmt}]
         if self.info_topic:
             ports.append({"topic": self.info_topic, "format": "data/json"})
         return ports
 
     def get_tool(self):
+        if self.name in G1_CARDS:
+            output = {"name": self.name, "type": "sensor", "multiInstance": False,
+                      "description": f"S10 Pro {self.title}, using the G1 card output format.",
+                      "inputSchema": {"type": "object", "properties": {}},
+                      "topic_out": self._ports()}
+            if self.name == "lidar_cloud":
+                output["configSchema"] = {"type": "object", "properties": {}}
+            return output
         with self._lock:
             config_schema = sensor_config_schema(self.name, self._settings)
         properties = copy.deepcopy(config_schema["properties"])
@@ -139,7 +225,11 @@ class ReadOnlyCard:
         }
 
     def get_tools(self):
-        return [self.get_tool()]
+        tools = [self.get_tool()]
+        if self.name == "joints":
+            tools.append({"name": "model", "type": "resource", "description": "Read-only S10 Pro 16-joint skeleton model.",
+                          "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}})
+        return tools
 
     def _snapshot(self, source):
         try:
@@ -223,7 +313,8 @@ class ReadOnlyCard:
             }
         elif self.name == "joints":
             data = payload["data"] or {}
-            inner = data.get("data")
+            raw = data.get("joints") if isinstance(data.get("joints"), dict) else data
+            inner = raw.get("data")
             records = inner.get("joints_data", []) if isinstance(inner, dict) else []
             if not isinstance(records, list):
                 records = []
@@ -471,7 +562,7 @@ class ReadOnlyCard:
                 with self._lock:
                     if generation != self._generation or self._state != "running" or cancel.is_set():
                         return
-                    if self.name == "lidar":
+                    if self.name in ("lidar", "lidar_cloud"):
                         _, source, binary = values["lidar"]
                         sequence = source["sequence"]
                         should_send = (source["fresh"] and isinstance(binary, bytes) and bool(binary)
@@ -481,10 +572,23 @@ class ReadOnlyCard:
                         if should_send:
                             self._publish(self.topic, "sensor/pointcloud", binary)
                             self._last_binary_sequence = sequence
-                        payload["binary_published"] = should_send
-                        self._publish(self.info_topic, "data/json", payload)
+                        if self.info_topic:
+                            payload["binary_published"] = should_send
+                            self._publish(self.info_topic, "data/json", payload)
                     else:
-                        self._publish(self.topic, "data/json", payload)
+                        if self.name not in G1_CARDS or payload["fresh"]:
+                            content = _g1_output(self.name, payload["data"]) if self.name in G1_CARDS else payload
+                            if self.joint_detail_topic:
+                                rows = [{"joint": joint.get("name", joint["idx"]),
+                                         "angle_rad": joint.get("q"),
+                                         "speed": joint.get("dq"),
+                                         "torque": joint.get("tau"),
+                                         "temperature": joint.get("temp")}
+                                        for joint in content["joints"]]
+                                self._publish(self.joint_detail_topic, "data/json", {"joints": rows})
+                                self._publish(self.topic, "sensor/skeleton", content)
+                            else:
+                                self._publish(self.topic, self._ports()[0]["format"], content)
                     self._last_error = None
                     self._last_error_detail = None
             except Exception as exc:
@@ -495,6 +599,9 @@ class ReadOnlyCard:
             cancel.wait(1.0 / self._settings["refresh_hz"])
 
     def dispatch(self, action, args):
+        if self.name == "joints" and action == "model":
+            validate_empty_arguments(args)
+            return model_description()
         if self.name == "device" and action in DEVICE_ACTIONS:
             return {"state": "unavailable", "status": "unavailable", "action": action,
                     "accepted": False, "command_sent": False, "reason": DEVICE_REASON}
@@ -512,10 +619,14 @@ class ReadOnlyCard:
 
 
 def build_plugins(config, namespace, bridge, publish, *, motion=None, motion_bridge=None):
-    """Keep the five legacy IDs, then add idle M20-structure monitor cards."""
+    """Advertise four monitors plus device availability.
+
+    Motion-critical reader sources stay registered by ReaderBridge and are not
+    exposed as duplicate monitor cards here.
+    """
     plugins = (config or {}).get("plugins", {})
     specs = source_specs(config or {})
     return [ReadOnlyCard(name, plugins.get(name, {}), namespace,
                          motion_bridge if name in ("motion_info", "hard_estop") and motion_bridge is not None else bridge, publish,
                          source_topics={key: item["topic"] for key, item in specs.items()},
-                         source_types={key: item["type"] for key, item in specs.items()}, motion=motion) for name in CARDS]
+                         source_types={key: item["type"] for key, item in specs.items()}, motion=motion) for name in PUBLIC_CARDS]

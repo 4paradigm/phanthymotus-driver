@@ -140,7 +140,10 @@ class OperatorAuthorization:
         if (not isinstance(actions, list) or not actions or any(type(a) is not str for a in actions)
                 or len(set(actions)) != len(actions)
                 or not set(actions) <= ({'stand', 'lie'} if self._persistent else
-                    {'stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm'})):
+                    {'stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm',
+                     'turn_left', 'turn_right', 'relative_forward', 'relative_backward',
+                     'relative_left', 'relative_right', 'relative_turn_left',
+                     'relative_turn_right'})):
             raise ValueError('only explicit finite posture actions are permitted')
         for key in (('issued_at_ms',) if self._persistent else ('issued_at_ms', 'expires_at_ms')):
             if type(value[key]) is not int or value[key] < 0:
@@ -252,7 +255,10 @@ class PrepareAuthorization:
             if (not isinstance(actions, list) or not actions
                     or any(type(a) is not str for a in actions)
                     or len(set(actions)) != len(actions)
-                    or not set(actions) <= {'stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm'}):
+                    or not set(actions) <= {'stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm',
+                                            'turn_left', 'turn_right', 'relative_forward',
+                                            'relative_backward', 'relative_left', 'relative_right',
+                                            'relative_turn_left', 'relative_turn_right'}):
                 raise ValueError('invalid prepare action scope')
             self._identity = prepare_machine_identity()
             if value['robot_identity'] != self._identity:

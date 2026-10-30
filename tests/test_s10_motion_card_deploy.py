@@ -15,9 +15,10 @@ spec.loader.exec_module(setup)
 
 def test_new_modules_are_in_image_and_timed_card_is_in_manifest():
     dockerfile = (DRIVER / 'Dockerfile').read_text()
-    assert 'canvas_posture.py' in dockerfile and 'stationary_feedback.py' in dockerfile
+    assert all(name in dockerfile for name in ('canvas_posture.py', 'stationary_feedback.py',
+                                                'relative_motion.py'))
     cards = yaml.safe_load((DRIVER / 'driver.yaml').read_text())['cards']
-    assert {'motion', 'timed_move'} <= {c['name'] for c in cards}
+    assert {'motion', 'timed_move', 'relative_move'} <= {c['name'] for c in cards}
 
 
 def test_supervised_overlay_mounts_identity_and_policy_read_only():
@@ -51,7 +52,11 @@ def test_provision_protects_files_and_never_overwrites_existing_policy(tmp_path,
     assert all(p.stat().st_mode & 0o777 == 0o600 for p in paths)
     policy = json.loads(paths[1].read_text())
     assert policy['activation'] == 'explicit_prepare'
-    assert policy['allowed_actions'] == ['stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm']
+    assert policy['allowed_actions'] == ['stand', 'lie', 'move_mode', 'forward_30cm',
+                                         'backward_30cm', 'turn_left', 'turn_right',
+                                         'relative_forward', 'relative_backward',
+                                         'relative_left', 'relative_right',
+                                         'relative_turn_left', 'relative_turn_right']
     assert machine not in paths[1].read_text()
     with pytest.raises(FileExistsError):
         setup.provision(tmp_path / 's10', machine)

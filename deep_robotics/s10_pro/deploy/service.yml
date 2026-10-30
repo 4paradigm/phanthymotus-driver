@@ -21,5 +21,7 @@ deep-robotics-s10-pro:
     - PYTHONUNBUFFERED=1
   logging:
     driver: local
-    options: {max-size: "10m", max-file: "3"}
-  restart: unless-stopped
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

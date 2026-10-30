@@ -11,13 +11,15 @@ import math
 import time
 import uuid
 
-SENSOR_TITLES = {'state': 'Robot State', 'joints': 'Joint Feedback', 'imu': 'IMU',
+SENSOR_TITLES = {'state': 'Robot State', 'battery': 'Battery', 'joints': 'Joint Feedback', 'imu': 'IMU',
                  'odometry': 'Odometry', 'lidar': 'LiDAR Point Cloud',
+                 'lidar_cloud': 'LiDAR Point Cloud',
                  'motion_info': 'Motion Status', 'device_status': 'Device Status',
                  'hard_estop': 'Hardware E-Stop', 'errors': 'Errors',
                  'motion_events': 'Motion Events', 'capabilities': 'Capabilities',
                  'ros_graph': 'ROS Graph', 'device': 'Device Controls'}
-SENSOR_REFRESH_HZ = {'state': 1., 'joints': 5., 'imu': 5., 'odometry': 5., 'lidar': 2.,
+SENSOR_REFRESH_HZ = {'state': 1., 'battery': 1., 'joints': 10., 'imu': 20., 'odometry': 5., 'lidar': 2.,
+                     'lidar_cloud': 10.,
                      'motion_info': 5., 'device_status': 1., 'hard_estop': 5.,
                      'errors': 1., 'motion_events': 2., 'capabilities': 1.,
                      'ros_graph': .5, 'device': 1.}
@@ -108,7 +110,7 @@ def sensor_defaults(name):
     if name not in SENSOR_REFRESH_HZ:
         raise ValueError('Unknown sensor card')
     result = {'enabled': True, 'refresh_hz': SENSOR_REFRESH_HZ[name], 'stale_after_s': 5.}
-    if name == 'lidar':
+    if name in ('lidar', 'lidar_cloud'):
         result['max_points'] = 6000
     return result
 
@@ -236,7 +238,9 @@ def validate_motion_request(action, arguments, settings, wall_time=time.time, *,
     if action == 'velocity':
         allowed |= {'vx', 'vy', 'yaw_rate', 'duration'}
     if action == 'move_2s':
-        allowed |= {'direction'}
+        allowed |= {'direction', 'speed', 'duration'}
+    if action == 'relative_move':
+        allowed |= {'direction', 'speed', 'distance', 'angle', 'target'}
     _unknown(values, allowed, 'motion parameters')
     properties = motion_action_schema(current)['properties']
     now_seconds = wall_time() if callable(wall_time) else wall_time
@@ -256,7 +260,36 @@ def validate_motion_request(action, arguments, settings, wall_time=time.time, *,
             request[name] = _validate_value(name, values.get(name, properties[name]['default']), properties[name])
     if action == 'move_2s':
         direction = values.get('direction')
-        if direction not in ('forward', 'backward'):
-            raise ValueError('direction must be forward or backward')
-        request.update(direction=direction)
+        if direction not in ('forward', 'backward', 'turn_left', 'turn_right'):
+            raise ValueError('invalid finite-motion direction')
+        speed = values.get('speed', .15 if direction.startswith('turn_') else .08)
+        duration = values.get('duration', 2.)
+        if (type(speed) not in (int, float) or not math.isfinite(speed)
+                or not ((.08 <= speed <= .20) if direction.startswith('turn_') else (.06 <= speed <= .12))):
+            raise ValueError('speed outside finite-motion direction range')
+        if type(duration) not in (int, float) or not math.isfinite(duration) or not .5 <= duration <= 5.:
+            raise ValueError('duration outside finite-motion range')
+        request.update(direction=direction, speed=float(speed), duration=float(duration))
+    if action == 'relative_move':
+        direction = values.get('direction')
+        if direction not in ('forward', 'backward', 'left', 'right', 'turn_left', 'turn_right'):
+            raise ValueError('invalid relative-motion direction')
+        turning = direction.startswith('turn_')
+        speed = values.get('speed', .15 if turning else .08)
+        if (type(speed) not in (int, float) or not math.isfinite(speed)
+                or not ((.12 <= speed <= .20) if turning else (.06 <= speed <= .12))):
+            raise ValueError('speed outside relative-motion direction range')
+        target = values.get('target')
+        if type(target) not in (int, float) or not math.isfinite(target):
+            raise ValueError('relative-motion target must be finite')
+        if turning:
+            if not math.radians(30) <= target <= math.radians(60):
+                raise ValueError('relative-motion turn outside validated range')
+        elif not .3 <= target <= .6:
+            raise ValueError('relative-motion distance outside validated range')
+        request.update(direction=direction, speed=float(speed), target=float(target))
+        if 'distance' in values:
+            request['distance'] = float(values['distance'])
+        if 'angle' in values:
+            request['angle'] = int(values['angle'])
     return request

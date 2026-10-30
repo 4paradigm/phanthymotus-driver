@@ -46,7 +46,8 @@ class MotionTasks:
     def fingerprint(request):
         # Transport retry metadata does not change the requested physical target.
         value = {key: request[key] for key in (
-            'action', 'duration', 'vx', 'vy', 'yaw_rate', 'direction') if key in request}
+            'action', 'duration', 'vx', 'vy', 'yaw_rate', 'direction', 'speed',
+            'distance', 'angle', 'target') if key in request}
         return json.dumps(value, sort_keys=True, allow_nan=False, separators=(',', ':'))
 
     @staticmethod

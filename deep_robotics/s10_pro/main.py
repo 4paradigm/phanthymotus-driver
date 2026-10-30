@@ -22,6 +22,7 @@ from motion_tasks import MotionTasks
 from acp import ACPNotifier
 from control_runtime import load_runtime_binding
 from operator_authorization import load_operator_authorization
+from automatic_prepare import start_automatic_preparation
 
 
 def build_runtime_plugins(config, namespace, bridge, publish, *, notifier=None, tasks=None,
@@ -129,7 +130,7 @@ class PlatformBus:
             if fmt == "sensor/pointcloud":
                 msg = self.Bytes()
                 msg.data = payload
-            elif fmt == "data/json":
+            elif fmt in ("data/json", "sensor/skeleton"):
                 msg = self.String()
                 msg.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             else:
@@ -187,6 +188,9 @@ def main():
             if hasattr(plugin, "close"):
                 cleanup.callback(plugin.close)
         cleanup.callback(bundle.stop_all)
+        automatic_prepare = start_automatic_preparation(bundle.plugins)
+        if automatic_prepare is not None:
+            cleanup.callback(automatic_prepare.close)
         port = int(os.environ.get("MCP_PORT", config["mcp_port"]))
         server = ThreadingHTTPServer((str(config.get("bind_host", "127.0.0.1")), port),
                                      make_handler(lambda: bundle, "s10-pro-bundle", "deep-robotics-s10-pro-driver"))
@@ -201,7 +205,8 @@ def main():
 
         signal.signal(signal.SIGTERM, shutdown)
         signal.signal(signal.SIGINT, shutdown)
-        # Do not start cards at process boot. The real canvas owns their lifecycle.
+        # Sensors stay idle. The automatic-prepare driver supervisor starts only
+        # the posture observer and readiness supervisor; it never sends motion.
         if config.get("register", True):
             start_registration(port, config, "deep-robotics-s10-pro-driver")
         authorized = operator.authorized_now() if operator.configured else binding.authorized_now()

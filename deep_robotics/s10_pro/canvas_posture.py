@@ -11,42 +11,69 @@ try:
     from .motion_dds import CommandChannelNotReady
     from .parameters import META_FIELDS, validate_empty_arguments
     from .stationary_feedback import StationaryWindow
+    from .relative_motion import RelativeController, RelativeMotionError
 except ImportError:
     from supervised_motion import SupervisedMotionPlugin, SupervisedPostureBackend, POSTURE_STATES
     from motion_dds import CommandChannelNotReady
     from parameters import META_FIELDS, validate_empty_arguments
     from stationary_feedback import StationaryWindow
+    from relative_motion import RelativeController, RelativeMotionError
 
 
 INSTRUCTIONS = {
-    'command_channel_not_prepared': '通道尚未准备；点击站立/卧倒时会自动准备健康通道，不需要先发动作解锁。',
-    'operator_session_unavailable': '操作会话尚未建立或已到期；点击 prepare，通过状态检查后建立新的60分钟会话。',
-    'joints_not_enabled': '关节状态未恢复；请使用厂家遥控器正常唤醒，不要重复发送站立。',
-    'joint_data_not_advancing': '关节数据未持续更新，可能仍在休眠；DDS消息新鲜不代表电机在线。',
-    'fresh_joint_feedback_required': '等待新鲜、完整的16关节反馈。',
-    'fresh_clear_fault_snapshot_required': '故障快照过期或有活动故障，禁止发送。',
-    'stationary_idle_or_standing_required': '需要在状态0、1或17连续稳定0.3秒：平移合速度低于0.05m/s、转动低于0.06rad/s。',
-    'stand_first_required': '移动模式必须在机器狗已经静止站定、反馈为 state 1 时使用。',
-    'fresh_stationary_feedback_required': '移动模式需要新鲜且速度为零的运动反馈。',
-    'already_in_move_mode': '当前已经处于移动模式 state 17，无需重复进入；退出请使用 lie。',
-    'exit_move_with_lie_required': '厂家状态机在 state 17 会忽略 stand；请先使用 lie，等待回到 state 0 后再 stand。',
-    'wait_for_idle_required': '机器狗仍在姿态切换中；请等待 lie 完整回到 state 0 后再执行下一动作。',
-    'unsupported_transition_state': '当前厂家运动状态不支持这个姿态切换，未发送指令。',
-    'operator_intervention_required': '上次动作失败已锁定；下次新动作点击会在静止和无故障检查通过后自动恢复，不会重发旧动作。',
-    'move_mode_required': '定时移动只能在 move_mode（state 17）中执行。',
-    'stationary_move_mode_required': '开始定时移动前，需在move_mode中连续稳定0.3秒：平移合速度低于0.05m/s、转动低于0.06rad/s。',
-    'timed_command_channel_not_prepared': '定时移动速度通道尚未准备，未发送移动指令。',
+    'command_channel_not_prepared': 'The command channel is not prepared. A posture request prepares a healthy channel without replaying an old action.',
+    'operator_session_unavailable': 'The operator session is missing or expired. The driver automatically checks readiness and opens a new session when conditions are safe.',
+    'joints_not_enabled': 'Joint feedback is not enabled. Wake the robot using the vendor remote instead of repeating stand.',
+    'joint_data_not_advancing': 'Joint samples are not advancing. Fresh DDS messages do not prove that the motors are awake.',
+    'fresh_joint_feedback_required': 'Fresh, complete feedback from all 16 joints is required.',
+    'fresh_clear_fault_snapshot_required': 'The fault snapshot is stale or reports an active fault. No command was sent.',
+    'stationary_idle_or_standing_required': 'State 0, 1 or 17 must remain stationary for 0.3 seconds: planar speed below 0.05 m/s and yaw rate below 0.06 rad/s.',
+    'stand_first_required': 'Move mode requires stationary standing with reported state 1.',
+    'fresh_stationary_feedback_required': 'Move mode requires fresh stationary motion feedback.',
+    'already_in_move_mode': 'The robot is already in move mode, state 17. Use lie to leave this mode.',
+    'exit_move_with_lie_required': 'The vendor state machine ignores stand in state 17. Use lie and wait for state 0 before requesting stand.',
+    'wait_for_idle_required': 'The robot is changing posture. Wait for lie to finish in state 0 before another action.',
+    'unsupported_transition_state': 'The current vendor state does not support this posture transition. No command was sent.',
+    'operator_intervention_required': 'The previous action failed. A new request may recover the channel only after stationary and fault checks; old actions are never replayed.',
+    'move_mode_required': 'Timed movement requires move mode, state 17.',
+    'stationary_move_mode_required': 'Timed movement requires state 17 and 0.3 seconds of stationary feedback: planar speed below 0.05 m/s and yaw rate below 0.06 rad/s.',
+    'timed_command_channel_not_prepared': 'The timed velocity channel is not prepared. No movement command was sent.',
 }
 
 
 DISTANCE_ACTION = 'move_2s'
 DISTANCE_ACTIONS = (DISTANCE_ACTION,)
 TIMED_MOVE_TOOL = 'timed_move'
-DISTANCE_DIRECTIONS = {'forward': 1., 'backward': -1.}
-DISTANCE_SCOPES = {'forward': 'forward_30cm', 'backward': 'backward_30cm'}
+RELATIVE_ACTION = 'relative_move'
+RELATIVE_ACTIONS = (RELATIVE_ACTION,)
+RELATIVE_MOVE_TOOL = 'relative_move'
+DISTANCE_DIRECTIONS = {
+    'forward': (1., 0., 0.), 'backward': (-1., 0., 0.),
+    'turn_left': (0., 0., 1.), 'turn_right': (0., 0., -1.),
+}
+RELATIVE_DIRECTIONS = {
+    'forward': (1., 0., 0.), 'backward': (-1., 0., 0.),
+    'left': (0., 1., 0.), 'right': (0., -1., 0.),
+    'turn_left': (0., 0., 1.), 'turn_right': (0., 0., -1.),
+}
+DISTANCE_SCOPES = {
+    'forward': 'forward_30cm', 'backward': 'backward_30cm',
+    'turn_left': 'turn_left', 'turn_right': 'turn_right',
+}
 TIMED_SPEED_MPS = .08
+TIMED_YAW_RATE_RAD_S = .15
 TIMED_DURATION_S = 2.
+TIMED_DURATION_RANGE_S = (.5, 5.)
+TIMED_LINEAR_RANGE_MPS = (.06, .12)
+TIMED_YAW_RANGE_RAD_S = (.08, .20)
 TIMED_RESPONSE_MPS = .05
+TIMED_RESPONSE_YAW_RAD_S = .04
+RELATIVE_SCOPES = {direction: 'relative_' + direction for direction in RELATIVE_DIRECTIONS}
+RELATIVE_DISTANCE_RANGE_M = (.30, .60)
+RELATIVE_ANGLE_DEGREES = (30, 60)
+RELATIVE_LINEAR_RANGE_MPS = (.06, .12)
+RELATIVE_YAW_RANGE_RAD_S = (.12, .20)
+NAVIGATION_ACTIONS = (*DISTANCE_ACTIONS, *RELATIVE_ACTIONS)
 
 
 def odometry_observation(record, now):
@@ -82,8 +109,13 @@ def odometry_observation(record, now):
     sequence = record.get('sequence')
     if type(sequence) is not int or sequence <= 0:
         return result
+    angular = twist.get('angular', {}) if isinstance(twist, dict) else {}
+    yaw_rate = angular.get('z') if isinstance(angular, dict) else None
+    if type(yaw_rate) not in (int, float) or not math.isfinite(yaw_rate):
+        return result
     return {'fresh': True, 'sequence': sequence, 'x': float(values[0]),
-            'y': float(values[1]), 'yaw': yaw,
+            'y': float(values[1]), 'yaw': yaw, 'vx': float(speeds[0]),
+            'vy': float(speeds[1]), 'yaw_rate': float(yaw_rate),
             'received_monotonic': float(record['received_monotonic']),
             'age_s': float(record['age_s'])}
 
@@ -109,7 +141,7 @@ class CanvasPostureBackend(SupervisedPostureBackend):
 
     def start_observation(self):
         super().start_observation()
-        self.bridge.acquire('canvas_posture_preflight', {'joints', 'fault_aggregator'},
+        self.bridge.acquire('canvas_posture_preflight', {'joints', 'fault_aggregator', 'odometry'},
                             {'refresh_hz': 10., 'stale_after_s': 2.})
 
     def stop_observation(self):
@@ -230,7 +262,7 @@ class CanvasPostureBackend(SupervisedPostureBackend):
             raise PermissionError('canvas preflight conditions changed before send: ' + ','.join(blocked))
 
     def distance_blockers(self, action):
-        if action not in DISTANCE_ACTIONS:
+        if action not in NAVIGATION_ACTIONS:
             return ['unsupported_distance_action']
         blocked = []
         observed = self.feedback.observation()
@@ -240,14 +272,30 @@ class CanvasPostureBackend(SupervisedPostureBackend):
             blocked.append('stationary_move_mode_required')
         return list(dict.fromkeys(blocked))
 
+    def odometry_status(self):
+        try:
+            record = self.bridge.snapshot('odometry') or {}
+        except Exception:
+            record = {}
+        return odometry_observation(record, self._clock())
+
+    def relative_blockers(self, action):
+        blocked = self.distance_blockers(action)
+        odometry = self.odometry_status()
+        if not odometry.get('fresh'):
+            blocked.append(odometry.get('reason') or 'fresh_odometry_required')
+        return list(dict.fromkeys(blocked))
+
     def _require_distance_ready(self, action, *, before_start=False):
-        internal_scopes = set(DISTANCE_SCOPES.values())
-        if (action not in DISTANCE_ACTIONS or not self.safety_status()['ready']
+        internal_scopes = (set(RELATIVE_SCOPES.values()) if action in RELATIVE_ACTIONS
+                           else set(DISTANCE_SCOPES.values()))
+        if (action not in NAVIGATION_ACTIONS or not self.safety_status()['ready']
                 or not internal_scopes <= set(self.authorization.public_status().get('allowed_actions', []))):
             raise PermissionError('timed-motion conditions are unavailable')
         blocked, _ = self.snapshot_checks()
         if before_start:
-            blocked.extend(self.distance_blockers(action))
+            blocked.extend(self.relative_blockers(action) if action in RELATIVE_ACTIONS
+                           else self.distance_blockers(action))
         else:
             observed = self.feedback.observation()
             if not observed.get('fresh') or observed.get('motion_state') != 17:
@@ -256,7 +304,7 @@ class CanvasPostureBackend(SupervisedPostureBackend):
             raise PermissionError('timed-motion safety conditions changed: ' + ','.join(dict.fromkeys(blocked)))
 
     def prepare_execution(self, action):
-        if action not in DISTANCE_ACTIONS:
+        if action not in NAVIGATION_ACTIONS:
             return super().prepare_execution(action)
         with self._lock:
             self._require_distance_ready(action, before_start=True)
@@ -308,12 +356,35 @@ class CanvasPostureBackend(SupervisedPostureBackend):
                 raise ValueError('invalid timed-motion direction')
             permit = self.authorization.permit(rid, DISTANCE_SCOPES[direction], deadline)
             self._used.add(rid)
-            self._request = {'request_id': rid, 'action': action, 'direction': direction}
+            self._request = {'request_id': rid, 'action': action, 'direction': direction,
+                             'speed': request['speed'], 'duration': request['duration']}
             self._distance_permit = permit
             self._sent_at = None
             self._distance_stop_started = False
             self._stationary.reset()
             return {'started': True, 'direction': direction}
+
+    def begin_relative(self, action, request, cancel_event):
+        with self._lock:
+            self._require_distance_ready(action, before_start=True)
+            rid, deadline = request.get('request_id'), request.get('expires_monotonic')
+            if (action not in RELATIVE_ACTIONS or not isinstance(rid, str) or not rid.strip()
+                    or rid in self._used or self._request is not None
+                    or type(deadline) not in (int, float) or not math.isfinite(deadline)
+                    or self._clock() >= deadline or cancel_event.is_set()):
+                raise RuntimeError('relative-motion request cannot start')
+            direction = request.get('direction')
+            if direction not in RELATIVE_DIRECTIONS:
+                raise ValueError('invalid relative-motion direction')
+            permit = self.authorization.permit(rid, RELATIVE_SCOPES[direction], deadline)
+            self._used.add(rid)
+            self._request = {'request_id': rid, 'action': action, 'direction': direction,
+                             'target': request['target'], 'speed': request['speed']}
+            self._distance_permit = permit
+            self._sent_at = None
+            self._distance_stop_started = False
+            self._stationary.reset()
+            return self.odometry_status()
 
     def send_distance_velocity(self, action, speed, request_id, cancel_event):
         with self._lock:
@@ -321,14 +392,33 @@ class CanvasPostureBackend(SupervisedPostureBackend):
                     or self._request.get('action') != action):
                 raise RuntimeError('timed-motion request identity changed')
             self._require_distance_ready(action, before_start=False)
-            direction = DISTANCE_DIRECTIONS[self._request['direction']]
+            direction = self._request['direction']
+            axes = DISTANCE_DIRECTIONS[direction]
             speed = float(speed)
-            if speed != TIMED_SPEED_MPS:
-                raise ValueError('timed-motion speed outside fixed validated value')
-            receipt = self.transport.publish_velocity(direction * speed, 0., 0.,
+            limits = TIMED_YAW_RANGE_RAD_S if direction.startswith('turn_') else TIMED_LINEAR_RANGE_MPS
+            if not limits[0] <= speed <= limits[1]:
+                raise ValueError('timed-motion speed outside validated range')
+            receipt = self.transport.publish_velocity(*(axis * speed for axis in axes),
                 authority=self._distance_permit, cancel_event=cancel_event)
             if receipt.get('sent') is not True:
                 raise RuntimeError('timed-motion velocity publication unconfirmed')
+            if self._sent_at is None:
+                self._sent_at = self._clock()
+            return receipt
+
+    def send_relative_velocity(self, action, velocity, request_id, cancel_event):
+        with self._lock:
+            if (not self._request or self._request.get('request_id') != request_id
+                    or self._request.get('action') != action or action not in RELATIVE_ACTIONS):
+                raise RuntimeError('relative-motion request identity changed')
+            self._require_distance_ready(action, before_start=False)
+            if (not isinstance(velocity, tuple) or len(velocity) != 3
+                    or not all(type(v) in (int, float) and math.isfinite(v) for v in velocity)):
+                raise ValueError('invalid relative-motion velocity')
+            receipt = self.transport.publish_velocity(*velocity,
+                authority=self._distance_permit, cancel_event=cancel_event)
+            if receipt.get('sent') is not True:
+                raise RuntimeError('relative-motion velocity publication unconfirmed')
             if self._sent_at is None:
                 self._sent_at = self._clock()
             return receipt
@@ -382,8 +472,8 @@ class CanvasPostureBackend(SupervisedPostureBackend):
 
 
 class CanvasPosturePlugin(SupervisedMotionPlugin):
-    execution_actions = (*POSTURE_STATES, *DISTANCE_ACTIONS)
-    streaming_actions = tuple(DISTANCE_ACTIONS)
+    execution_actions = (*POSTURE_STATES, *NAVIGATION_ACTIONS)
+    streaming_actions = tuple(NAVIGATION_ACTIONS)
 
     def __init__(self, *args, **kwargs):
         autostart = kwargs.pop('autostart_worker', True)
@@ -392,12 +482,26 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         self.status_topic, self.events_topic = base + '/posture_status', base + '/posture_events'
         self.timed_status_topic = base + '/timed_move_status'
         self.timed_events_topic = base + '/timed_move_events'
+        self.relative_status_topic = base + '/relative_move_status'
+        self.relative_events_topic = base + '/relative_move_events'
         if autostart:
             self._thread.start()
 
     def _timed_ports(self):
         return [{'topic': self.timed_status_topic, 'format': 'data/json'},
                 {'topic': self.timed_events_topic, 'format': 'data/json'}]
+
+    def _relative_ports(self):
+        return [{'topic': self.relative_status_topic, 'format': 'data/json'},
+                {'topic': self.relative_events_topic, 'format': 'data/json'}]
+
+    @staticmethod
+    def _action_card(action):
+        if action in DISTANCE_ACTIONS:
+            return TIMED_MOVE_TOOL
+        if action in RELATIVE_ACTIONS:
+            return RELATIVE_MOVE_TOOL
+        return 'motion'
 
     def _event(self, kind, **values):
         with self._lock:
@@ -407,40 +511,45 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
             if action is None and values.get('request_id'):
                 record = self._tasks.get(values['request_id'])
                 action = record['request']['action'] if record else None
-            timed = action in DISTANCE_ACTIONS
-            event = {'card': TIMED_MOVE_TOOL if timed else 'motion', 'event': kind,
+            card = self._action_card(action)
+            event = {'card': card, 'event': kind,
                      'timestamp_ms': int(self._wall() * 1000), **values}
             self._events.append(event)
             if self._started:
                 try:
-                    self._publish(self.timed_events_topic if timed else self.events_topic,
+                    topic = (self.timed_events_topic if card == TIMED_MOVE_TOOL else
+                             self.relative_events_topic if card == RELATIVE_MOVE_TOOL else self.events_topic)
+                    self._publish(topic,
                                   'data/json', copy.deepcopy(event))
                 except Exception:
                     self._error = 'status_publish_failed'
 
-    def _card_status(self, source, *, timed):
+    def _card_status(self, source, *, card):
         result = copy.deepcopy(source)
-        card = TIMED_MOVE_TOOL if timed else 'motion'
         result['card'] = card
-        result['title'] = 'S10 前进/后退（2秒验证版）' if timed else 'Posture Control'
-        result['topic_out'] = self._timed_ports() if timed else self._ports()
-        result['supported_actions'] = ['move'] if timed else ['prepare', *POSTURE_STATES]
+        selected = (DISTANCE_ACTIONS if card == TIMED_MOVE_TOOL else
+                    RELATIVE_ACTIONS if card == RELATIVE_MOVE_TOOL else tuple(POSTURE_STATES))
+        result['title'] = ('S10 Timed Movement' if card == TIMED_MOVE_TOOL else
+                           'S10 Relative Movement' if card == RELATIVE_MOVE_TOOL else 'S10 Posture Control')
+        result['topic_out'] = (self._timed_ports() if card == TIMED_MOVE_TOOL else
+                               self._relative_ports() if card == RELATIVE_MOVE_TOOL else self._ports())
+        result['supported_actions'] = ['move'] if card in (TIMED_MOVE_TOOL, RELATIVE_MOVE_TOOL) else list(POSTURE_STATES)
         result['events'] = [e for e in result['events'] if e.get('card') == card]
         active = result.get('active_request')
-        if active and (active.get('action') in DISTANCE_ACTIONS) != timed:
+        if active and active.get('action') not in selected:
             result['active_request'] = None
             result['phase'] = 'ready' if result['readiness']['ready'] else 'not_ready'
         result['shared_controller_busy'] = active is not None
         last = result.get('last_result')
-        if last and (last.get('action') in DISTANCE_ACTIONS) != timed:
+        if last and last.get('action') not in selected:
             result['last_result'] = next((e for e in reversed(result['events'])
                 if e.get('event') == 'finished'), None)
         readiness = result['readiness']
-        readiness['actions'] = {key: value for key, value in readiness['actions'].items()
-                               if (key in DISTANCE_ACTIONS) == timed}
-        if timed:
+        readiness['actions'] = {key: value for key, value in readiness['actions'].items() if key in selected}
+        if card in (TIMED_MOVE_TOOL, RELATIVE_MOVE_TOOL):
+            selected_action = selected[0]
             blockers = list(dict.fromkeys([*source['blocked_by'],
-                *readiness['actions'][DISTANCE_ACTION]['blocked_by']]))
+                *readiness['actions'][selected_action]['blocked_by']]))
             result['blocked_by'] = readiness['blocked_by'] = blockers
             readiness['ready'] = result['execution_available'] = not blockers
             readiness['next_steps'] = [{'code': b, 'instruction': INSTRUCTIONS.get(b, b.replace('_', ' '))}
@@ -449,8 +558,9 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         return result
 
     def _publish_status(self, payload):
-        self._publish(self.status_topic, 'data/json', self._card_status(payload, timed=False))
-        self._publish(self.timed_status_topic, 'data/json', self._card_status(payload, timed=True))
+        self._publish(self.status_topic, 'data/json', self._card_status(payload, card='motion'))
+        self._publish(self.timed_status_topic, 'data/json', self._card_status(payload, card=TIMED_MOVE_TOOL))
+        self._publish(self.relative_status_topic, 'data/json', self._card_status(payload, card=RELATIVE_MOVE_TOOL))
 
     def _gate(self, action=None, *, for_stop=False):
         blocked = super()._gate(None, for_stop=for_stop)
@@ -459,8 +569,9 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         return blocked
 
     def _control_ok(self, action=None):
-        if action in DISTANCE_ACTIONS:
-            return (set(DISTANCE_SCOPES.values()) <= set(
+        if action in NAVIGATION_ACTIONS:
+            scopes = set(RELATIVE_SCOPES.values()) if action in RELATIVE_ACTIONS else set(DISTANCE_SCOPES.values())
+            return (scopes <= set(
                         self._backend.authorization.public_status().get('allowed_actions', []))
                     and self._backend.safety_status()['ready']
                     and not self._backend.snapshot_checks()[0])
@@ -469,13 +580,12 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
     def status(self):
         result = super().status()
         result['supported_actions'] = [
-            'prepare' if action == 'prepare_test' else action
-            for action in result['supported_actions']
-            if action not in ('check_test', 'recover_test', 'stopmotion')]
-        for action in DISTANCE_ACTIONS:
+            action for action in result['supported_actions']
+            if action not in ('check_test', 'recover_test', 'stopmotion', 'prepare_test')]
+        for action in NAVIGATION_ACTIONS:
             if action not in result['supported_actions']:
                 result['supported_actions'].append(action)
-        result['title'] = 'Posture & Validated 2s Move'
+        result['title'] = 'S10 Posture and Timed Movement'
         result['execution_available'] = result['execution_available'] and result['readiness']['ready']
         return result
 
@@ -499,10 +609,24 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                 reasons.append('timed_command_channel_not_prepared')
             reasons = list(dict.fromkeys([*blocked, *reasons]))
             result['actions'][candidate] = {'ready': not reasons, 'blocked_by': reasons,
-                'directions': list(DISTANCE_DIRECTIONS), 'speed_mps': TIMED_SPEED_MPS,
-                'duration_s': TIMED_DURATION_S,
+                'directions': list(DISTANCE_DIRECTIONS),
+                'linear_speed_range_mps': list(TIMED_LINEAR_RANGE_MPS),
+                'yaw_rate_range_rad_s': list(TIMED_YAW_RANGE_RAD_S),
+                'duration_range_s': list(TIMED_DURATION_RANGE_S),
                 'completion_level': 'reported_velocity_response_and_reported_stop'}
-        if requested_action in DISTANCE_ACTIONS:
+        for candidate in RELATIVE_ACTIONS:
+            reasons = self._backend.relative_blockers(candidate)
+            if not set(RELATIVE_SCOPES.values()) <= set(authorization):
+                reasons.append('operator_session_unavailable')
+            if not distance_channel['ready']:
+                reasons.append('timed_command_channel_not_prepared')
+            reasons = list(dict.fromkeys([*blocked, *reasons]))
+            result['actions'][candidate] = {'ready': not reasons, 'blocked_by': reasons,
+                'directions': list(RELATIVE_DIRECTIONS),
+                'distance_range_m': list(RELATIVE_DISTANCE_RANGE_M),
+                'angle_degrees': list(RELATIVE_ANGLE_DEGREES),
+                'completion_level': 'odometry_relative_target_and_reported_stop'}
+        if requested_action in NAVIGATION_ACTIONS:
             result['blocked_by'] = list(dict.fromkeys(
                 [*result['blocked_by'], *result['actions'][requested_action]['blocked_by']]))
             result['ready'] = not result['blocked_by']
@@ -510,13 +634,19 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                                     for b in result['blocked_by']]
         result['timed_command_channel'] = distance_channel
         result['timed_move'] = {'directions': list(DISTANCE_DIRECTIONS),
-            'speed_mps': TIMED_SPEED_MPS, 'duration_s': TIMED_DURATION_S,
+            'default_linear_speed_mps': TIMED_SPEED_MPS,
+            'default_yaw_rate_rad_s': TIMED_YAW_RATE_RAD_S,
+            'duration_range_s': list(TIMED_DURATION_RANGE_S),
             'requires_motion_state': 17}
+        result['relative_move'] = {'directions': list(RELATIVE_DIRECTIONS),
+            'distance_range_m': list(RELATIVE_DISTANCE_RANGE_M),
+            'angle_degrees': list(RELATIVE_ANGLE_DEGREES),
+            'requires_motion_state': 17, 'feedback_source': '/ODOM'}
         result['click_preflight'] = copy.deepcopy(self._backend.last_preflight)
         result['authorization_renewed_automatically'] = False
         result['safe_recovery_on_next_action'] = True
-        result['consolidated_maintenance_action'] = 'prepare'
-        result['authorization_renewal_action'] = ('prepare' if getattr(
+        result['consolidated_maintenance_action'] = 'automatic_driver_prepare'
+        result['authorization_renewal_action'] = ('automatic_driver_prepare' if getattr(
             self._backend.authorization, 'supports_prepare', False) else None)
         result['stationary_check'] = self._backend.stationary_status()
         return result
@@ -526,49 +656,86 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         schema = tool['inputSchema']
         schema['properties']['action']['enum'].remove('prepare_test')
         schema['properties']['action']['enum'].remove('stopmotion')
-        schema['properties']['action']['enum'].append('prepare')
-        schema['allOf'].append({'if': {'properties': {'action': {'const': 'prepare'}}, 'required': ['action']},
-            'then': {'not': {'anyOf': [{'required': [k]} for k in schema['properties']
-                if k not in {'action', *META_FIELDS}]}}})
         schema['x-action-params'].pop('prepare_test', None)
         schema['x-action-params'].pop('stopmotion', None)
-        schema['x-action-params'].update({
-            'prepare': {'params': [], 'description': '准备控制：检查静止状态、关节、急停及故障；通过后建立或续期60分钟操作会话并准备通道。沿用设备预设动作权限，不发送动作。'},
-        })
         completion = schema.get('x-completion', {})
         completion['actions'] = [value for value in completion.get('actions', [])
-                                 if value not in DISTANCE_ACTIONS]
-        completion['description'] = '姿态完成依赖新鲜的动作状态反馈。'
+                                 if value not in NAVIGATION_ACTIONS]
+        completion['description'] = 'Posture completion requires fresh motion-state feedback.'
         schema['x-completion'] = completion
-        tool['title'] = 'Posture Control'
-        tool['description'] = '站立、卧倒与进入移动模式。点击动作前自动执行安全检查。'
+        tool['title'] = 'S10 Posture Control'
+        tool['description'] = 'Stand, lie down or enter move mode after automatic readiness checks.'
         for action in POSTURE_STATES:
-            schema['x-action-params'][action]['description'] += ' 点击前自动刷新安全检查；若上次失败且当前静止无故障，会先安全恢复通道再执行本次新动作，不重放旧动作。'
+            schema['x-action-params'][action]['description'] += ' Refresh readiness before each request. After a failure, recover the channel only with stationary and clear fault feedback; never replay the previous action.'
         return tool
 
     def _timed_move_tool(self):
         base_tool = super().get_tool()
         direction = {
-            'type': 'string', 'enum': ['forward', 'backward'],
-            'oneOf': [{'const': 'forward', 'title': '前进 2 秒'},
-                      {'const': 'backward', 'title': '后退 2 秒'}],
-            'title': '移动方向', 'description': '选择已完成实机验证的前进或后退。'}
-        schema = {'type': 'object', 'properties': {'direction': direction},
-                  'required': ['direction'], 'additionalProperties': False}
+            'type': 'string', 'enum': list(DISTANCE_DIRECTIONS),
+            'oneOf': [{'const': 'forward', 'title': 'Forward'},
+                      {'const': 'backward', 'title': 'Backward'},
+                      {'const': 'turn_left', 'title': 'Turn Left'},
+                      {'const': 'turn_right', 'title': 'Turn Right'}],
+            'title': 'Movement Direction', 'description': 'Select a bounded movement that stops automatically.'}
+        schema = {'type': 'object', 'properties': {
+            'direction': direction,
+            'speed': {'type': 'number', 'minimum': .06, 'maximum': .20, 'default': .08,
+                      'title': 'Speed', 'description': 'Translation: 0.06-0.12 m/s. Turning: 0.08-0.20 rad/s.'},
+            'duration': {'type': 'number', 'minimum': .5, 'maximum': 5., 'default': 2.,
+                         'title': 'Duration (s)'}},
+                  'required': ['direction', 'speed', 'duration'], 'additionalProperties': False}
         schema['x-completion'] = {'actions': [], 'timeout': 15, 'silent_completion': False,
-            'description': '完成需要观察到方向一致的速度响应，并在归零后观察到停止反馈。'}
+            'description': 'Completion requires velocity feedback in the requested direction and confirmed stopping after zero commands.'}
         schema['x-resource'] = 'base'
-        return {'name': TIMED_MOVE_TOOL, 'title': 'S10 前进/后退（2秒验证版）',
+        return {'name': TIMED_MOVE_TOOL, 'title': 'S10 Timed Movement',
             'type': 'actuator', 'multiInstance': False,
-            'description': '独立移动卡片：选择前进或后退，执行已经实机验证的固定2秒指令。',
+            'description': 'Select forward, backward, left turn or right turn, speed and duration; stop automatically at the deadline.',
             'inputSchema': schema, 'configSchema': base_tool['configSchema'],
             'topic_in': [], 'topic_out': self._timed_ports()}
 
+    def _relative_move_tool(self):
+        direction = {'type': 'string', 'enum': list(RELATIVE_DIRECTIONS),
+            'oneOf': [{'const': 'forward', 'title': 'Forward'},
+                      {'const': 'backward', 'title': 'Backward'},
+                      {'const': 'left', 'title': 'Strafe Left'},
+                      {'const': 'right', 'title': 'Strafe Right'},
+                      {'const': 'turn_left', 'title': 'Turn Left'},
+                      {'const': 'turn_right', 'title': 'Turn Right'}],
+            'title': 'Target Direction'}
+        properties = {
+            'direction': direction,
+            'distance': {'type': 'number', 'minimum': .3, 'maximum': .6, 'default': .5,
+                         'title': 'Target Distance (m)'},
+            'angle': {'type': 'integer', 'enum': list(RELATIVE_ANGLE_DEGREES), 'default': 60,
+                      'title': 'Target Angle (deg)'},
+            'speed': {'type': 'number', 'minimum': .06, 'maximum': .20, 'default': .12,
+                      'title': 'Maximum Speed',
+                      'description': 'Translation: 0.06-0.12 m/s. Turning: 0.12-0.20 rad/s.'}}
+        turns = list(direction['enum'][-2:])
+        schema = {'type': 'object', 'properties': properties,
+            'required': ['direction', 'speed'], 'additionalProperties': False,
+            'allOf': [
+                {'if': {'properties': {'direction': {'enum': turns}}, 'required': ['direction']},
+                 'then': {'required': ['angle'], 'not': {'required': ['distance']}},
+                 'else': {'required': ['distance'], 'not': {'required': ['angle']}}}],
+            'x-completion': {'actions': [], 'timeout': 20, 'silent_completion': False,
+                'description': 'Completion requires /ODOM feedback at the relative target, settling within tolerance and confirmed stopping.'},
+            'x-resource': 'base'}
+        return {'name': RELATIVE_MOVE_TOOL, 'title': 'S10 Relative Movement',
+            'type': 'actuator', 'multiInstance': False,
+            'description': 'Use live odometry to reach a relative distance or angle, decelerate and stop. Feedback errors or excessive drift stop the task and latch failure.',
+            'inputSchema': schema, 'configSchema': super().get_tool()['configSchema'],
+            'topic_in': [], 'topic_out': self._relative_ports()}
+
     def get_tools(self):
-        return [self.get_tool(), self._timed_move_tool()]
+        return [self.get_tool(), self._timed_move_tool(), self._relative_move_tool()]
 
     def _timed_move_status(self):
-        return self._card_status(self.status(), timed=True)
+        return self._card_status(self.status(), card=TIMED_MOVE_TOOL)
+
+    def _relative_move_status(self):
+        return self._card_status(self.status(), card=RELATIVE_MOVE_TOOL)
 
     def _check_unavailable(self, checked, action=None):
         result = self._unavailable(checked['blocked_by'], action)
@@ -577,6 +744,24 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         return result
 
     def dispatch(self, action, args):
+        if isinstance(args, dict) and args.get('_tool_name') == RELATIVE_MOVE_TOOL:
+            if action in ('info', 'status'):
+                validate_empty_arguments(args)
+                return self._relative_move_status()
+            if action == 'start':
+                super().dispatch(action, args)
+                return self._relative_move_status()
+            if action == 'stop':
+                super().dispatch(action, args)
+                return self._relative_move_status()
+            if action == 'config':
+                super().dispatch(action, args)
+                return self._relative_move_status()
+            if action not in ('move', RELATIVE_MOVE_TOOL):
+                return None
+            arguments = dict(args)
+            arguments.pop('_tool_name', None)
+            return self.execute(RELATIVE_ACTION, arguments)
         if isinstance(args, dict) and args.get('_tool_name') == TIMED_MOVE_TOOL:
             if action in ('info', 'status'):
                 validate_empty_arguments(args)
@@ -597,7 +782,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
             return self.execute(DISTANCE_ACTION, arguments)
         if action in ('info', 'status'):
             validate_empty_arguments(args)
-            return self._card_status(self.status(), timed=False)
+            return self._card_status(self.status(), card='motion')
         if action != 'prepare':
             return super().dispatch(action, args)
         validate_empty_arguments(args)
@@ -657,6 +842,47 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
     def execute(self, action, arguments):
         if action not in self.execution_actions:
             return super().execute(action, arguments)
+        if action in DISTANCE_ACTIONS:
+            arguments = dict(arguments or {})
+            direction = arguments.get('direction')
+            if direction not in DISTANCE_DIRECTIONS:
+                raise ValueError('invalid timed-motion direction')
+            speed = arguments.get('speed', TIMED_YAW_RATE_RAD_S
+                                  if direction.startswith('turn_') else TIMED_SPEED_MPS)
+            duration = arguments.get('duration', TIMED_DURATION_S)
+            arguments.update(speed=speed, duration=duration)
+            if type(speed) not in (int, float) or not math.isfinite(speed):
+                raise ValueError('timed-motion speed must be finite')
+            limits = TIMED_YAW_RANGE_RAD_S if direction.startswith('turn_') else TIMED_LINEAR_RANGE_MPS
+            if not limits[0] <= speed <= limits[1]:
+                raise ValueError('timed-motion speed outside direction range')
+            if (type(duration) not in (int, float) or not math.isfinite(duration)
+                    or not TIMED_DURATION_RANGE_S[0] <= duration <= TIMED_DURATION_RANGE_S[1]):
+                raise ValueError('timed-motion duration outside validated range')
+        elif action in RELATIVE_ACTIONS:
+            arguments = dict(arguments or {})
+            direction = arguments.get('direction')
+            if direction not in RELATIVE_DIRECTIONS:
+                raise ValueError('invalid relative-motion direction')
+            turning = direction.startswith('turn_')
+            if turning:
+                angle = arguments.get('angle')
+                if type(angle) is not int or angle not in RELATIVE_ANGLE_DEGREES or 'distance' in arguments:
+                    raise ValueError('relative turn requires a validated angle only')
+                target = math.radians(angle)
+            else:
+                distance = arguments.get('distance')
+                if (type(distance) not in (int, float) or not math.isfinite(distance)
+                        or not RELATIVE_DISTANCE_RANGE_M[0] <= distance <= RELATIVE_DISTANCE_RANGE_M[1]
+                        or 'angle' in arguments):
+                    raise ValueError('relative translation requires a validated distance only')
+                target = float(distance)
+            speed = arguments.get('speed', TIMED_YAW_RATE_RAD_S if turning else TIMED_SPEED_MPS)
+            limits = RELATIVE_YAW_RANGE_RAD_S if turning else RELATIVE_LINEAR_RANGE_MPS
+            if (type(speed) not in (int, float) or not math.isfinite(speed)
+                    or not limits[0] <= speed <= limits[1]):
+                raise ValueError('relative-motion speed outside direction range')
+            arguments.update(target=target, speed=float(speed))
         with self._lock:
             # Preserve durable deduplication, even when a replay's current
             # conditions differ. Never re-arm a completed request identity.
@@ -685,8 +911,9 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                             physical_command_sent=False, old_action_retried=False)
             else:
                 checked = self._backend.preflight(stationary_states=
-                    (17,) if action in DISTANCE_ACTIONS else (1,) if action == 'move_mode' else None)
-            transition_blocked = (self._backend.distance_blockers(action) if action in DISTANCE_ACTIONS
+                    (17,) if action in NAVIGATION_ACTIONS else (1,) if action == 'move_mode' else None)
+            transition_blocked = (self._backend.relative_blockers(action) if action in RELATIVE_ACTIONS else
+                                  self._backend.distance_blockers(action) if action in DISTANCE_ACTIONS
                                   else self._backend.transition_blockers(action))
             if transition_blocked:
                 checked['ready'] = False
@@ -730,24 +957,29 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         return False, sent
 
     def _run_action(self, record, request, started):
+        if request['action'] in RELATIVE_ACTIONS:
+            return self._run_relative_action(record, request, started)
         if request['action'] not in DISTANCE_ACTIONS:
             return super()._run_action(record, request, started)
         action, rid = request['action'], request['request_id']
-        direction = DISTANCE_DIRECTIONS[request['direction']]
+        direction_name = request['direction']
+        direction = DISTANCE_DIRECTIONS[direction_name]
+        turning = direction_name.startswith('turn_')
+        speed, duration = float(request['speed']), float(request['duration'])
         deadline = request['expires_monotonic'] - 1.25
         receipt = {'accepted': None}
         confirmed = stop_confirmed = completed = False
         sent = pulse_completed = False
         command_frames = 0
         min_vx = max_vx = None
-        peak_signed_vx = None
+        peak_signed_vx = peak_signed_yaw = None
         reason = 'timed_motion_incomplete'
         try:
-            if deadline <= started + TIMED_DURATION_S:
+            if deadline <= started + duration:
                 raise TimeoutError('timed-motion request leaves no stop reserve')
             self._backend.begin_distance(action, request, self._cancel)
             pulse_start = self._clock()
-            pulse_end = pulse_start + TIMED_DURATION_S
+            pulse_end = pulse_start + duration
             next_send = pulse_start
             while self._clock() < pulse_end:
                 if self._cancel.is_set():
@@ -764,12 +996,17 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                     vx = float(velocity['vx'])
                     min_vx = vx if min_vx is None else min(min_vx, vx)
                     max_vx = vx if max_vx is None else max(max_vx, vx)
-                    signed_vx = direction * vx
+                    signed_vx = direction[0] * vx
                     peak_signed_vx = signed_vx if peak_signed_vx is None else max(peak_signed_vx, signed_vx)
-                    confirmed = confirmed or signed_vx >= TIMED_RESPONSE_MPS
+                    yaw = velocity.get('yaw_rate')
+                    if type(yaw) in (int, float) and math.isfinite(yaw):
+                        signed_yaw = direction[2] * float(yaw)
+                        peak_signed_yaw = signed_yaw if peak_signed_yaw is None else max(peak_signed_yaw, signed_yaw)
+                    confirmed = ((peak_signed_yaw or 0.) >= TIMED_RESPONSE_YAW_RAD_S if turning
+                                 else (peak_signed_vx or 0.) >= TIMED_RESPONSE_MPS)
                 if self._clock() >= next_send:
                     receipt = self._backend.send_distance_velocity(
-                        action, TIMED_SPEED_MPS, rid, self._cancel)
+                        action, speed, rid, self._cancel)
                     sent = sent or receipt.get('sent') is True
                     command_frames += receipt.get('sent') is True
                     self._last_command = self._clock()
@@ -810,11 +1047,124 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
                 'accepted': True, 'command_accepted': receipt.get('accepted'),
                 'confirmed': confirmed and not cancelled, 'stop_confirmed': stop_confirmed,
                 'completed': completed, 'state': status, 'status': status, 'reason': reason,
-                'direction': request['direction'], 'commanded_speed_mps': TIMED_SPEED_MPS,
-                'commanded_duration_s': TIMED_DURATION_S, 'command_frames': command_frames,
+                'direction': direction_name, 'commanded_speed': speed,
+                'commanded_speed_unit': 'rad/s' if turning else 'm/s',
+                'commanded_duration_s': duration, 'command_frames': command_frames,
                 'reported_min_vx_mps': min_vx, 'reported_max_vx_mps': max_vx,
                 'reported_peak_signed_vx_mps': peak_signed_vx,
+                'reported_peak_signed_yaw_rad_s': peak_signed_yaw,
                 'completion_level': 'reported_velocity_response_and_reported_stop',
+                'physical_command_sent': sent, 'finished_at': self._wall()}
+            try:
+                if self._tasks.finish(rid, result):
+                    with self._lock:
+                        self._last, self._phase = result, status if self._started else 'idle'
+                        self._event('finished', **result)
+            except Exception:
+                self._error = 'terminal_record_failed_restart_recovery_required'
+            with self._lock:
+                self._active = None
+            try:
+                self._backend.finish(rid)
+                if not self._started:
+                    self._backend.stop_observation()
+            finally:
+                self._busy.release()
+            self._flush_notifications()
+
+    def _run_relative_action(self, record, request, started):
+        action, rid = request['action'], request['request_id']
+        direction, target = request['direction'], float(request['target'])
+        speed, deadline = float(request['speed']), request['expires_monotonic'] - 1.25
+        receipt = {'accepted': None}
+        sent = completed = stop_confirmed = confirmed = False
+        command_frames, last_status = 0, None
+        reason = 'relative_motion_incomplete'
+        try:
+            initial = self._backend.begin_relative(action, request, self._cancel)
+            if not initial.get('fresh'):
+                raise RelativeMotionError(initial.get('reason', 'fresh_odometry_required'),
+                                          'Fresh odometry is required')
+            controller = RelativeController(initial, direction=direction, target=target,
+                                            max_speed=speed, now=self._clock())
+            last_odom_sequence = initial['sequence']
+            next_send = self._clock()
+            while self._clock() < deadline:
+                if self._cancel.is_set():
+                    reason = self._cancel_reason or 'cancelled'
+                    break
+                if self._gate(action) or not self._control_ok(action):
+                    reason = 'authority_unavailable'
+                    break
+                sample = self._backend.odometry_status()
+                if not sample.get('fresh'):
+                    raise RelativeMotionError(sample.get('reason', 'fresh_odometry_required'),
+                                              'Odometry feedback became unavailable')
+                if sample.get('sequence') == last_odom_sequence:
+                    self._cancel.wait(.02)
+                    continue
+                last_odom_sequence = sample['sequence']
+                try:
+                    command, last_status = controller.command(sample, self._clock())
+                except RelativeMotionError as exc:
+                    reason = exc.reason
+                    break
+                confirmed = confirmed or last_status['progress'] > (
+                    math.radians(3.) if direction.startswith('turn_') else .03)
+                if self._clock() >= next_send:
+                    receipt = self._backend.send_relative_velocity(
+                        action, command, rid, self._cancel)
+                    sent = sent or receipt.get('sent') is True
+                    command_frames += receipt.get('sent') is True
+                    self._last_command = self._clock()
+                    self._event('closed_loop_update', request_id=rid,
+                        action_id=record['action_id'], **last_status)
+                    next_send += .1
+                if last_status['phase'] == 'completed':
+                    completed = True
+                    reason = 'relative_target_reached'
+                    break
+                self._cancel.wait(.02)
+            else:
+                reason = 'relative_motion_timeout'
+            stop_confirmed, stop_sent = self._stop_fixed_distance(
+                action, rid, request['expires_monotonic']) if sent else (True, False)
+            sent = sent or stop_sent
+            completed = completed and stop_confirmed and not self._cancel.is_set()
+            if reason == 'relative_target_reached' and not stop_confirmed:
+                reason = 'reported_stop_not_confirmed'
+        except RelativeMotionError as exc:
+            reason = exc.reason
+            try:
+                stop_confirmed, stop_sent = self._stop_fixed_distance(
+                    action, rid, request['expires_monotonic']) if sent else (False, False)
+                sent = sent or stop_sent
+            except Exception:
+                stop_confirmed = False
+        except Exception as exc:
+            reason = 'execution_failed_' + type(exc).__name__
+            try:
+                stop_confirmed, stop_sent = self._stop_fixed_distance(
+                    action, rid, request['expires_monotonic']) if sent else (False, False)
+                sent = sent or stop_sent
+            except Exception:
+                stop_confirmed = False
+        finally:
+            cancelled = self._cancel.is_set()
+            if cancelled:
+                reason = self._cancel_reason or 'cancelled'
+            if not completed:
+                self._backend.abort()
+            status = 'completed' if completed else 'cancelled' if cancelled and stop_confirmed else 'error'
+            result = {'request_id': rid, 'action_id': record['action_id'], 'action': action,
+                'accepted': True, 'command_accepted': receipt.get('accepted'),
+                'confirmed': confirmed and not cancelled, 'stop_confirmed': stop_confirmed,
+                'completed': completed, 'state': status, 'status': status, 'reason': reason,
+                'direction': direction, 'target': target,
+                'target_unit': 'rad' if direction.startswith('turn_') else 'm',
+                'commanded_max_speed': speed, 'command_frames': command_frames,
+                'closed_loop_status': copy.deepcopy(last_status),
+                'completion_level': 'odometry_relative_target_and_reported_stop',
                 'physical_command_sent': sent, 'finished_at': self._wall()}
             try:
                 if self._tasks.finish(rid, result):

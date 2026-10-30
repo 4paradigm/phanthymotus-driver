@@ -1,5 +1,6 @@
 """Offline validated two-second movement tests. No ROS, SSH, or robot I/O."""
 import copy
+import math
 import time
 
 import pytest
@@ -15,6 +16,9 @@ class Bridge:
         self.hes = 0
         self.state = 17
         self.vx = 0.
+        self.yaw_rate = 0.
+        self.vy = 0.
+        self.yaw = 0.
         self.x = self.y = 0.
         self.seq = 0
         self.owners = {}
@@ -38,20 +42,26 @@ class Bridge:
         elif source == 'hard_estop':
             result['data'] = {'value': self.hes}
         elif source == 'odometry':
+            qz, qw = math.sin(self.yaw / 2), math.cos(self.yaw / 2)
             result['data'] = {'pose': {'pose': {
                 'position': {'x': self.x, 'y': self.y, 'z': 0.},
-                'orientation': {'x': 0., 'y': 0., 'z': 0., 'w': 1.}}},
-                'twist': {'twist': {'linear': {'x': self.vx, 'y': 0., 'z': 0.}}}}
+                'orientation': {'x': 0., 'y': 0., 'z': qz, 'w': qw}}},
+                'twist': {'twist': {'linear': {'x': self.vx, 'y': self.vy, 'z': 0.},
+                                    'angular': {'x': 0., 'y': 0., 'z': self.yaw_rate}}}}
         else:
             result['data'] = {'data': {'motion_state': {'state': self.state},
-                'gait_state': {'gait': 0}, 'vel_x': self.vx, 'vel_y': 0., 'vel_yaw': 0.}}
+                'gait_state': {'gait': 0}, 'vel_x': self.vx, 'vel_y': 0.,
+                'vel_yaw': self.yaw_rate}}
         return result
 
 
 class Authorization:
     def __init__(self):
         self.valid = True
-        self.allowed = ['stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm']
+        self.allowed = ['stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm',
+                        'turn_left', 'turn_right', 'relative_forward', 'relative_backward',
+                        'relative_left', 'relative_right', 'relative_turn_left',
+                        'relative_turn_right']
 
     def authorized_now(self):
         return self.valid
@@ -70,6 +80,7 @@ class Transport:
         self.running = self.closed = False
         self.states = []
         self.velocities = []
+        self.velocity_commands = []
         self.matches = 2
         self.suppress_feedback = False
 
@@ -92,10 +103,16 @@ class Transport:
         return {'sent': True, 'accepted': None}
 
     def publish_velocity(self, vx=0., vy=0., yaw_rate=0., *, authority, cancel_event):
-        assert self.running and not self.closed and vy == 0 and yaw_rate == 0
+        assert self.running and not self.closed
         self.velocities.append((vx, copy.deepcopy(authority)))
-        if not self.suppress_feedback or vx == 0:
+        self.velocity_commands.append((vx, vy, yaw_rate))
+        if not self.suppress_feedback or (vx == 0 and yaw_rate == 0):
             self.bridge.vx = vx
+            self.bridge.vy = vy
+            self.bridge.yaw_rate = yaw_rate
+            self.bridge.x += vx * .1
+            self.bridge.y += vy * .1
+            self.bridge.yaw += yaw_rate * .1
         return {'sent': True, 'accepted': None}
 
 
@@ -145,7 +162,8 @@ def test_validated_two_second_move_repeats_zero_and_confirms_response_and_stop(
     result = wait_result(plugin, rid)
     assert result['completed'] and result['stop_confirmed']
     assert result['direction'] == direction
-    assert result['commanded_speed_mps'] == .08
+    assert result['commanded_speed'] == .08
+    assert result['commanded_speed_unit'] == 'm/s'
     assert result['commanded_duration_s'] == 2.
     assert result['reported_peak_signed_vx_mps'] >= .05
     commands = [value for value, _ in transports[0].velocities]
@@ -178,26 +196,72 @@ def test_missing_velocity_response_stops_and_fails_closed(runtime):
     assert backend.safety_status()['failed_closed']
 
 
-def test_new_card_has_one_move_action_with_two_direction_options(runtime):
+def test_new_card_has_one_move_action_with_four_direction_options(runtime):
     import jsonschema
     tools = {tool['name']: tool for tool in runtime[0].get_tools()}
-    assert set(tools) == {'motion', 'timed_move'}
+    assert set(tools) == {'motion', 'timed_move', 'relative_move'}
     assert 'move_2s' not in tools['motion']['inputSchema']['properties']['action']['enum']
     schema = tools['timed_move']['inputSchema']
     jsonschema.Draft7Validator.check_schema(schema)
     assert schema['x-resource'] == 'base'
-    assert set(schema['properties']) == {'direction'}
-    assert schema['properties']['direction']['enum'] == ['forward', 'backward']
-    jsonschema.validate({'direction': 'backward'}, schema)
+    assert set(schema['properties']) == {'direction', 'speed', 'duration'}
+    assert schema['properties']['direction']['enum'] == [
+        'forward', 'backward', 'turn_left', 'turn_right']
+    jsonschema.validate({'direction': 'backward', 'speed': .08, 'duration': 2.}, schema)
+    jsonschema.validate({'direction': 'turn_left', 'speed': .15, 'duration': 5.}, schema)
     for invalid in (
         {},
-        {'direction': 'left'},
-        {'direction': 'forward', 'distance_m': .3},
-        {'direction': 'forward', 'vx': .1},
-        {'action': 'stand', 'direction': 'forward'},
+        {'direction': 'left', 'speed': .08, 'duration': 2.},
+        {'direction': 'forward', 'speed': .08, 'duration': 2., 'distance_m': .3},
+        {'direction': 'forward', 'speed': .08, 'duration': 2., 'vx': .1},
+        {'action': 'stand', 'direction': 'forward', 'speed': .08, 'duration': 2.},
     ):
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(invalid, schema)
+    relative = tools['relative_move']['inputSchema']
+    jsonschema.Draft7Validator.check_schema(relative)
+    assert relative['x-resource'] == 'base'
+    assert relative['properties']['direction']['enum'] == [
+        'forward', 'backward', 'left', 'right', 'turn_left', 'turn_right']
+    jsonschema.validate({'direction': 'left', 'distance': .4, 'speed': .08}, relative)
+    jsonschema.validate({'direction': 'turn_right', 'angle': 60, 'speed': .15}, relative)
+    for invalid in (
+        {'direction': 'left', 'angle': 30, 'speed': .08},
+        {'direction': 'turn_left', 'distance': .4, 'speed': .15},
+        {'direction': 'forward', 'distance': .8, 'speed': .08},
+        {'direction': 'turn_left', 'angle': 90, 'speed': .15},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(invalid, relative)
+
+
+@pytest.mark.parametrize('direction', ['forward', 'backward', 'left', 'right',
+                                       'turn_left', 'turn_right'])
+def test_relative_schema_default_passes_backend_validation_without_motion(runtime, direction):
+    plugin, _, _, _, transports = runtime
+    schema = plugin._relative_move_tool()['inputSchema']
+    arguments = {'direction': direction, 'speed': schema['properties']['speed']['default']}
+    arguments.update(angle=30) if direction.startswith('turn_') else arguments.update(distance=.3)
+    # A disabled card still validates parameters before returning unavailable.
+    # This exercises the real validator without granting a task or publishing.
+    plugin._started = False
+    before = list(transports[0].velocities)
+    reply = plugin.dispatch('relative_move', {'_tool_name': 'relative_move', **arguments})
+    assert not reply['accepted']
+    assert transports[0].velocities == before
+
+
+def test_relative_card_reaches_odometry_target_and_stops(runtime):
+    plugin, _, _, _, transports = runtime
+    reply = plugin.dispatch('relative_move', {'_tool_name': 'relative_move',
+        'request_id': 'relative-forward', 'direction': 'forward',
+        'distance': .3, 'speed': .08})
+    assert reply['accepted']
+    result = wait_result(plugin, 'relative-forward')
+    assert result['completed'] and result['stop_confirmed']
+    assert result['completion_level'] == 'odometry_relative_target_and_reported_stop'
+    assert result['closed_loop_status']['progress'] >= .22
+    assert transports[0].velocity_commands[-2:] == [(0., 0., 0.), (0., 0., 0.)]
 
 
 def test_new_card_routes_move_to_shared_protected_controller(runtime):
@@ -256,6 +320,36 @@ def test_request_identity_includes_direction(runtime):
     wait_result(plugin, 'same')
     with pytest.raises(ValueError, match='different motion target'):
         plugin.dispatch('move_2s', {'request_id': 'same', 'direction': 'backward'})
+
+
+@pytest.mark.parametrize('direction,sign', [('turn_left', 1), ('turn_right', -1)])
+def test_timed_turn_uses_yaw_axis_and_confirms_stop(runtime, direction, sign):
+    plugin, _, _, _, transports = runtime
+    rid = 'turn-' + direction
+    reply = plugin.dispatch('move_2s', {'request_id': rid, 'direction': direction,
+                                        'speed': .15, 'duration': .5})
+    assert reply['accepted']
+    result = wait_result(plugin, rid)
+    assert result['completed'] and result['stop_confirmed']
+    assert result['commanded_speed'] == .15
+    assert result['commanded_speed_unit'] == 'rad/s'
+    assert result['reported_peak_signed_yaw_rad_s'] >= .04
+    nonzero = [command for command in transports[0].velocity_commands if command != (0., 0., 0.)]
+    assert nonzero and all(vx == 0. and vy == 0. and yaw * sign > 0
+                           for vx, vy, yaw in nonzero)
+    assert transports[0].velocity_commands[-2:] == [(0., 0., 0.), (0., 0., 0.)]
+
+
+@pytest.mark.parametrize('arguments', [
+    {'direction': 'forward', 'speed': .13, 'duration': 2.},
+    {'direction': 'turn_left', 'speed': .07, 'duration': 2.},
+    {'direction': 'turn_right', 'speed': .15, 'duration': 5.1},
+])
+def test_direction_specific_limits_reject_before_publication(runtime, arguments):
+    plugin, _, _, _, transports = runtime
+    with pytest.raises(ValueError):
+        plugin.dispatch('move_2s', {'request_id': 'outside-range', **arguments})
+    assert transports[0].velocity_commands == []
 
 
 @pytest.mark.parametrize('arguments', [

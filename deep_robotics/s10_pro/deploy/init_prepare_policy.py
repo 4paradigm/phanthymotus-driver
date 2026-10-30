@@ -24,7 +24,10 @@ def make_policy(machine_id, *, duration_s=3600):
         'robot_identity': hashlib.sha256(('s10-prepare-machine:' + machine_id).encode()).hexdigest(),
         # Historical internal scopes retain direction-specific transport limits.
         # The public card executes a fixed 2-second pulse, not a 30cm target.
-        'allowed_actions': ['stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm'],
+        'allowed_actions': ['stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm',
+                            'turn_left', 'turn_right', 'relative_forward', 'relative_backward',
+                            'relative_left', 'relative_right', 'relative_turn_left',
+                            'relative_turn_right'],
         'session_duration_s': duration_s,
         'activation': 'explicit_prepare',
         'provenance': 'owner_enabled_canvas_prepare',

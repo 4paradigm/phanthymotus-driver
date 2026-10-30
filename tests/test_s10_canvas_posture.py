@@ -146,7 +146,7 @@ def test_consolidated_prepare_recovers_worker_without_replaying_old_action(runti
     p, backend, _, _, ts = runtime
     ts[0].auto_state = False
     assert p.dispatch('stand', {'request_id': 'timeout'})['accepted']
-    wait(lambda: p._tasks.get('timeout')['result'] is not None)
+    wait(lambda: p._tasks.get('timeout')['result'] is not None and p._active is None)
     assert not p._tasks.get('timeout')['result']['completed'] and backend._failed
     old = copy.deepcopy(p._tasks.get('timeout'))
     result = p.dispatch('prepare', {})
@@ -268,7 +268,7 @@ def test_prepare_sends_no_commands_when_checks_fail_and_exposes_instructions(run
     b.status_word = 3
     result = p.dispatch('prepare', {})
     assert not result['accepted'] and not result['physical_command_sent']
-    assert '唤醒' in next(s['instruction'] for s in result['next_steps'] if s['code'] == 'joints_not_enabled')
+    assert 'Wake' in next(s['instruction'] for s in result['next_steps'] if s['code'] == 'joints_not_enabled')
     assert not ts[0].calls
 
 

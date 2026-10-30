@@ -371,7 +371,7 @@ class SupervisedMotionPlugin(MotionPlugin):
             'completion_level': COMPLETION_LEVEL,
             'description': 'Completion means fresh post-send reported target state observed; physical pose completion is not independently verified.'}
         schema['x-action-params'].update({
-            'move_mode': {'params': [], 'description': '移动模式（实验性）：机器狗已静止站定且反馈为 state 1 后，单次发送原生 state 17。不自动站立、不切步态、不发送速度。'},
+            'move_mode': {'params': [], 'description': 'Experimental move mode: require stationary standing feedback in state 1, then send native state 17 once. Does not stand automatically, change gait or send velocity.'},
             'prepare_test': {'params': [], 'description': 'Prepare the isolated command worker after operator authorization. Sends no robot command.'},
             'stand': {'params': [], 'description': 'Send stand request (state 1) once and automatically observe the reported target state. Completion means reported state observed, not independently verified physical pose completion. No RL transition.'},
             'lie': {'params': [], 'description': 'Send lie request (state 4) once, then wait until the vendor state machine finishes LieDown and reports final idle state 0. Intermediate state 4 is not completion.'},

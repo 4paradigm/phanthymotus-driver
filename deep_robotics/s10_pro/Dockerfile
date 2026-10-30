@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=interfaces /s10_ws/install/ /s10_ws/install/
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py bridge.py device.py monitoring.py reader.py pointcloud.py preflight.py motion.py motion_transport.py motion_dds.py motion_backend.py motion_feedback.py motion_process.py motion_worker.py motion_preflight.py motion_tasks.py control_runtime.py posture_process.py operator_authorization.py supervised_motion.py canvas_posture.py stationary_feedback.py parameters.py acp.py config.yaml driver.yaml requirements.txt /work/deep_robotics/s10_pro/
+COPY deploy/ /deploy/
+COPY main.py bridge.py device.py monitoring.py reader.py pointcloud.py preflight.py motion.py motion_transport.py motion_dds.py motion_backend.py motion_feedback.py motion_process.py motion_worker.py motion_preflight.py motion_tasks.py control_runtime.py posture_process.py operator_authorization.py supervised_motion.py canvas_posture.py stationary_feedback.py automatic_prepare.py relative_motion.py s10_skeleton.py s10_skeleton.urdf parameters.py acp.py config.yaml driver.yaml requirements.txt /work/deep_robotics/s10_pro/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15745
 CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source /s10_ws/install/setup.bash && exec python3 /work/deep_robotics/s10_pro/main.py"]

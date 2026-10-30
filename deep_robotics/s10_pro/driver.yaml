@@ -10,11 +10,13 @@ description: "S10 Pro M20-style monitoring, state, motion feedback, device healt
 build_context_extras:
   - ../../common
 cards:
+  - {name: battery, type: sensor}
   - {name: state, type: sensor}
   - {name: joints, type: sensor}
   - {name: imu, type: sensor}
   - {name: odometry, type: sensor}
   - {name: lidar, type: sensor}
+  - {name: lidar_cloud, type: sensor}
   - {name: motion_info, type: sensor}
   - {name: device_status, type: sensor}
   - {name: hard_estop, type: sensor}
@@ -25,5 +27,6 @@ cards:
   - {name: device, type: actuator}
   - {name: motion, type: actuator}
   - {name: timed_move, type: actuator}
+  - {name: relative_move, type: actuator}
 # Conditional hardware streams are listed in capabilities until their source is verified.
 # No charging action is exposed.

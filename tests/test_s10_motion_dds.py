@@ -149,6 +149,13 @@ def permit(clock, **overrides):
         'age_s': 0., 'navigation_mode_confirmed': True, **overrides}
 
 
+def operator_permit(clock, action, request_id='relative-offline'):
+    return {'schema': 's10_pro.operator_permit/1', 'session_id': 'session',
+        'request_id': request_id, 'action': action, 'robot_session': 'boot',
+        'issued_monotonic': 1., 'expires_monotonic': 200.,
+        'action_deadline_monotonic': clock.now + 10.}
+
+
 def test_import_and_construction_do_not_import_ros_or_load_types(monkeypatch):
     # Use a new import to detect module-level ROS imports even when tests coexist
     # with other modules in the process.
@@ -314,6 +321,24 @@ def test_velocity_and_zero_use_only_navcmd_and_same_publisher(setup):
     assert (node.publishers[0].frames[1].data.x_vel, node.publishers[0].frames[1].data.y_vel,
             node.publishers[0].frames[1].data.yaw_vel) == (0., 0., 0.)
     assert receipt['accepted'] is None and not receipt['completed']
+
+
+@pytest.mark.parametrize('scope,command', [
+    ('relative_forward', (.1, 0., 0.)), ('relative_backward', (-.1, 0., 0.)),
+    ('relative_left', (0., .1, 0.)), ('relative_right', (0., -.1, 0.)),
+    ('relative_turn_left', (0., 0., .15)), ('relative_turn_right', (0., 0., -.15)),
+])
+def test_relative_scope_allows_only_its_one_bounded_axis(setup, scope, command):
+    clock, node, _, codec, adapter = setup
+    adapter.close()
+    adapter = DDSCommandAdapter(node, execution_enabled=True, supervised_posture=True,
+                                codec=codec, clock=clock)
+    adapter.prepare_state_channel()
+    adapter.publish_velocity(*command, authority=operator_permit(clock, scope))
+    wrong = (command[0] or .1, command[1] or .1, command[2] or .1)
+    with pytest.raises(AuthorityUnavailable):
+        adapter.publish_velocity(*wrong, authority=operator_permit(clock, scope, 'wrong-' + scope))
+    adapter.close()
 
 
 def test_cancel_before_build_does_not_create_publisher(setup):
