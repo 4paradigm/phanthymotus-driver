@@ -13,11 +13,12 @@ import threading
 import time
 import statistics
 from collections import deque
+from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
 from glove_skeleton import GloveSkeleton
 from modbus_client import JOINT_COUNT, _bytes
-from modbus_device import L20LiteConnection
+from modbus_device import HandPlugin, L20LiteConnection
 
 LABELS = [
     "thumb_pitch",
@@ -184,6 +185,9 @@ class GloveTeleopPlugin:
         self._timing = {}
         self._reader_status = None
         self._last_watchdog_event = None
+        self._arm_action = None
+        self._arm_completion_failed = False
+        self._last_arm_result = None
 
     def get_tools(self):
         schema = action_schema(
@@ -224,6 +228,7 @@ class GloveTeleopPlugin:
         )
         definition["title"] = "数据手套遥操 L20 Lite"
         schema["x-resource"] = ["l20_lite_left_hand", "l20_lite_right_hand"]
+        schema["x-completion"] = {"actions": ["arm"], "timeout": 60}
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "disarm"}}
         return [definition, tool("model", "resource", "L20 Lite 双手预览骨架 URDF")]
 
@@ -972,7 +977,7 @@ class GloveTeleopPlugin:
             ),
         }
 
-    def _arm(self):
+    def _reserve_arm(self):
         preview = os.environ.get("GLOVE_PREVIEW_ONLY")
         if preview not in (None, "0", "1"):
             raise ValueError("GLOVE_PREVIEW_ONLY must be 0 or 1")
@@ -986,10 +991,11 @@ class GloveTeleopPlugin:
                 "默认仅骨架预览；完成时序验收后设置 GLOVE_PREVIEW_ONLY=0，"
                 "重新创建容器，再显式 arm(confirm_motion=true)"
             )
-        arm_started = time.monotonic()
         with self._lock:
             if self._armed:
-                return {"state": "armed", "message": "already armed"}
+                raise RuntimeError("already armed; disarm before arming again")
+            if self._arm_completion_failed:
+                raise RuntimeError("ACP completion delivery failed; restart driver after checking Core")
             if self._arming or self._pending_disarm or not self._cleanup_done.is_set():
                 raise RuntimeError("teleop setup or cleanup is still pending")
             if self._shutdown.is_set():
@@ -1006,13 +1012,72 @@ class GloveTeleopPlugin:
             self._session += 1
             session = self._session
             self.hand._teleop_active = True
+            return session
+
+    # Reuse the existing retry/acknowledgement contract with this tool's PREFIX.
+    _acp_callback = HandPlugin._acp_callback
+
+    def _start_arm(self):
+        with self._lock:
+            if self._arm_action is not None:
+                raise RuntimeError("another arm action is pending")
+            session = self._reserve_arm()
+            active = {"action_id": f"glove_arm_{uuid4().hex}", "session": session}
+            self._arm_action = active
+            try:
+                threading.Thread(target=self._arm_worker, args=(active,),
+                                 name=active["action_id"], daemon=True).start()
+            except Exception:
+                self._arm_action = None
+                self._arming = False
+                self.hand._teleop_active = False
+                self._session += 1
+                raise
+        return {"state": "running", "action_id": active["action_id"]}
+
+    def _arm_worker(self, active):
+        try:
+            result = self._arm(session=active["session"])
+            status = "completed"
+        except InterruptedError as exc:
+            status, result = "cancelled", {"state": "cancelled", "message": str(exc)}
+        except Exception as exc:
+            status, result = "error", {"state": "error", "message": str(exc)}
+        terminal = {"action_id": active["action_id"], "status": status, "result": result}
+        with self._lock:
+            self._last_arm_result = terminal
+        try:
+            self._acp_callback(active["action_id"], status, result)
+        except Exception as exc:
+            with self._lock:
+                self._arm_completion_failed = True
+                terminal["callback_error"] = str(exc)
+            # Core cannot confirm ownership: do not leave streaming torque enabled.
+            try:
+                self._disarm()
+            except Exception as cleanup_error:
+                terminal["cleanup_error"] = str(cleanup_error)
+            print(f"[ACP] {active['action_id']}: {exc}", flush=True)
+        else:
+            with self._lock:
+                if self._arm_action is active:
+                    self._arm_action = None
+
+    def _arm(self, session=None):
+        # Private synchronous setup is owned exclusively by the ACP worker.
+        if session is None:
+            session = self._reserve_arm()
+        arm_started = time.monotonic()
 
         def check_setup():
             with self._lock:
                 if session != self._session or self._shutdown.is_set():
-                    raise RuntimeError("teleop setup was cancelled")
+                    raise InterruptedError("teleop setup was cancelled")
+                if time.monotonic() - arm_started > 20:
+                    raise TimeoutError("teleop setup exceeded 20 seconds")
 
         try:
+            check_setup()
             # Discovery and all setup I/O run without the frame-receive lock.
             found = self.hand._discover()
             with self._io_lock, self.hand._bus_lock:
@@ -1328,7 +1393,7 @@ class GloveTeleopPlugin:
         if action == "arm":
             if args.get("confirm_motion") is not True:
                 raise ValueError("arm requires boolean confirm_motion=true")
-            return self._arm()
+            return self._start_arm()
         if action == "disarm":
             self._disarm()
             return {"state": "running", "armed": False}
@@ -1347,6 +1412,8 @@ class GloveTeleopPlugin:
                     "preview_only_config": self.config.get("preview_only", True),
                     "preview_only_override": os.environ.get("GLOVE_PREVIEW_ONLY"),
                     "arming": self._arming,
+                    "arm_action_id": self._arm_action["action_id"] if self._arm_action else None,
+                    "last_arm_result": self._last_arm_result,
                     "cleanup_pending": self._pending_disarm,
                     "glove_port": (
                         self.glove_port if self.source_mode != "udp" else None

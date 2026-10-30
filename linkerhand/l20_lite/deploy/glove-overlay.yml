@@ -3,6 +3,11 @@ services:
   linkerhand-l20-lite:
     image: ${L20_LITE_IMAGE:-local/phanthy-l20-lite:sdkfree}
     platform: linux/arm64
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       GLOVE_SERIAL_PORT: ${GLOVE_SERIAL_PORT:?Set the receiver stable device path}
       L20_SERIAL_PORT: ${L20_SERIAL_PORT:?Set the hand RS485 device path}

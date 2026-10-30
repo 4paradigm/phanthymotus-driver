@@ -210,7 +210,7 @@ def armed_direct_device(monkeypatch, client, watchdog_ms=800):
     device.dispatch("calibrate_open", {"side": "left"})
     device.accept_direct_sample(closed)
     device.dispatch("calibrate_fist", {"side": "left"})
-    device.dispatch("arm", {"confirm_motion": True})
+    device._arm()
     return device, opened, closed
 
 
@@ -297,7 +297,7 @@ def test_true_stream_loss_disarms_even_while_serial_write_is_blocked(monkeypatch
         assert not client.release.is_set()
         assert device._last_watchdog_event["apply_in_progress_ms"] >= 90
         with pytest.raises(RuntimeError, match="cleanup is still pending"):
-            device.dispatch("arm", {"confirm_motion": True})
+            device._arm()
         # Data recovery must not automatically re-arm or enqueue another pose.
         device.accept_direct_sample(opened)
         client.release.set()
@@ -447,7 +447,7 @@ def test_arm_setup_can_receive_and_can_be_cancelled_before_torque_enable(monkeyp
 
     def arm():
         try:
-            device.dispatch("arm", {"confirm_motion": True})
+            device._arm()
         except Exception as exc:
             outcome["error"] = str(exc)
 
@@ -938,6 +938,65 @@ def test_bad_glove_frames_are_rejected(change):
         glove.GloveTeleopPlugin.parse_frame(json.dumps(data).encode())
 
 
+@pytest.mark.parametrize("outcome", ["completed", "error", "cancelled", "callback_failure"])
+def test_arm_dispatch_is_async_and_reports_one_terminal_completion(monkeypatch, outcome):
+    device, hand, _ = plugin()
+    schema = device.get_tools()[0]["inputSchema"]
+    assert schema["x-completion"] == {"actions": ["arm"], "timeout": 60}
+    assert schema["x-resource"] == ["l20_lite_left_hand", "l20_lite_right_hand"]
+    device.accept_packet(packet(), "192.0.2.1")
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    reports = []
+    clients = {side: FakeClient() for side in ("left", "right")}
+
+    def discover():
+        entered.set()
+        assert release.wait(2)
+        if outcome == "error":
+            raise OSError("discovery failed")
+        return {"left": "/dev/left", "right": "/dev/right"}
+
+    def callback(action_id, status, result):
+        reports.append((action_id, status, result))
+        completed.set()
+        if outcome == "callback_failure":
+            raise OSError("Core unavailable")
+
+    hand._discover = discover
+    monkeypatch.setattr(device, "_acp_callback", callback)
+    monkeypatch.setattr(glove, "L20LiteConnection", lambda cfg: type(
+        "Connection", (), {"get": lambda self: clients[cfg["side"]]})())
+    try:
+        reply = device.dispatch("arm", {"confirm_motion": True})
+        # Discovery is blocked: the request has returned without waiting for I/O.
+        assert reply["state"] == "running" and reply["action_id"].startswith("glove_arm_")
+        assert entered.wait(1) and not completed.is_set()
+        assert hand._teleop_active and device._arming
+        with pytest.raises(RuntimeError, match="pending"):
+            device.dispatch("arm", {"confirm_motion": True})
+        if outcome == "cancelled":
+            device.dispatch("disarm", {})
+        device.accept_packet(packet(timestamp=2), "192.0.2.1")
+        release.set()
+        assert completed.wait(1)
+        if outcome == "callback_failure":
+            wait_for(lambda: device._arm_completion_failed and not device._armed and device._cleanup_done.is_set())
+            assert all(("torque", [0]*10) in c.commands for c in clients.values())
+            with pytest.raises(RuntimeError, match="pending|ACP"):
+                device.dispatch("arm", {"confirm_motion": True})
+        else:
+            wait_for(lambda: device._arm_action is None)
+            assert reports[0][1] == outcome
+            assert device._armed is (outcome == "completed")
+        assert len(reports) == 1 and reports[0][0] == reply["action_id"]
+        assert device._last_arm_result["action_id"] == reply["action_id"]
+        if outcome == "cancelled":
+            assert not any(c.commands for c in clients.values())
+    finally:
+        release.set()
+        stop_simulated_device(device)
+
+
 def test_arm_requires_confirmation_and_both_hands(monkeypatch):
     device, hand, _ = plugin()
     device.accept_packet(packet(), "192.0.2.1", now=time.monotonic())
@@ -945,7 +1004,7 @@ def test_arm_requires_confirmation_and_both_hands(monkeypatch):
         device.dispatch("arm", {"confirm_motion": "true"})
     hand._discover = lambda: {"right": "/dev/right"}
     with pytest.raises(RuntimeError, match="both L20 Lite hands"):
-        device.dispatch("arm", {"confirm_motion": True})
+        device._arm()
     assert not hand._teleop_active
 
 
@@ -963,7 +1022,7 @@ def test_armed_motion_is_step_limited_and_times_out(monkeypatch):
     monkeypatch.setattr(glove, "L20LiteConnection", FakeConnection)
     now = time.monotonic()
     device.accept_packet(packet([0] * 10, [0] * 10), "192.0.2.1", now=now)
-    assert device.dispatch("arm", {"confirm_motion": True})["state"] == "armed"
+    assert device._arm()["state"] == "armed"
     assert hand._teleop_active
     device.accept_packet(
         packet([0] * 10, [0] * 10, timestamp=2), "192.0.2.1", now=now + 0.1
@@ -1012,7 +1071,7 @@ def test_direct_left_only_requires_poses_and_never_commands_right(monkeypatch):
     with pytest.raises(RuntimeError, match="calibrate_open must be captured"):
         device.dispatch("calibrate_fist", {"side": "left"})
     with pytest.raises(RuntimeError, match="calibrated"):
-        device.dispatch("arm", {"confirm_motion": True})
+        device._arm()
     device.accept_direct_sample(closed)
     assert publisher.messages[-1]["raw_positions"]["left"][2] < RIGHT_OPEN_POSE[2]
     device.accept_direct_sample(opened)
@@ -1020,7 +1079,7 @@ def test_direct_left_only_requires_poses_and_never_commands_right(monkeypatch):
     device.accept_direct_sample(closed)
     assert device.dispatch("calibrate_fist", {"side": "left"})["ready"]
     device.accept_direct_sample(opened)
-    assert device.dispatch("arm", {"confirm_motion": True})["sides"] == ["left"]
+    assert device._arm()["sides"] == ["left"]
     device.accept_direct_sample(closed)
     wait_for(lambda: device._commands == 1)
     assert device.dispatch("info", {})["sent_commands"] == 1
@@ -1064,7 +1123,7 @@ def test_arm_keeps_receiving_glove_frames_while_discovering_hand(monkeypatch):
 
     def arm():
         try:
-            outcome["result"] = device.dispatch("arm", {"confirm_motion": True})
+            outcome["result"] = device._arm()
         except Exception as exc:
             outcome["error"] = exc
 

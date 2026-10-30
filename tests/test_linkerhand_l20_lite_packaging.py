@@ -71,3 +71,12 @@ def test_hand_only_deployment_has_no_required_glove_or_sdk_mount():
         yaml.safe_load((DRIVER / "config.yaml").read_text())["serial_port"]
         == "/dev/ttyUSB0"
     )
+
+
+@pytest.mark.parametrize("fragment", ["service.yml", "glove-overlay.yml"])
+def test_each_deployment_fragment_bounds_docker_logs(fragment):
+    data = yaml.safe_load((DRIVER / "deploy" / fragment).read_text())
+    service = data.get("services", data)["linkerhand-l20-lite"]
+    assert service["logging"] == {
+        "driver": "local", "options": {"max-size": "10m", "max-file": "3"},
+    }

@@ -95,6 +95,11 @@ docker compose -p phanthy-motus \
 配套 Core 前端对手套骨架使用 30ms 时间常数的显示插值，不预测新姿态，也不改变实体指令。
 先完成下节的受控时序验收，再允许日常遥操。受控实机验收也需显式选择运动：将部署命令中的 `GLOVE_PREVIEW_ONLY=1` 改为 `0` 并重建容器。
 此设置只解除手套遥操的预览限制，仍需重新标定、操作员显式 arm(confirm_motion=true)；只启用已标定且找到匹配灵巧手的侧。
+arm 立即返回 running/action_id；串口发现和配置在后台运行，通过 ACP 回报 completed/error/cancelled。
+应等待该 action_id 的完成通知，再确认 info.armed=true；收到 running 不代表实体已经可以跟随。
+串口配置期间可以继续接收手套数据，disarm/stop 会取消本次配置，清理已打开的连接并尝试卸力。
+配置会在事务检查点检查 20 秒截止时间，x-completion 声明等待 60 秒以容纳清理及通知重试；这不是物理卸力时限。
+若 Core 未确认完成通知，会退出遥操并禁止再次 arm，需检查 Core 后重启驱动。info.last_arm_result 可查看终态和通知错误。
 该开关不禁止独立 hand/hand_gesture 卡片的显式动作。
 disarm 和项目停止解除输出；断流后不自动 arm。重启项目/容器需要重新标定。
 手动 hand/hand_gesture 动作会先结束遥操、等待在途控制清理，然后接管同一硬件。
