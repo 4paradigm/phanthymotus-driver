@@ -422,17 +422,30 @@ class LidarLifecycleTests(unittest.TestCase):
         plugin._lifecycle_lock = threading.RLock()
         tools = plugin.get_tools()
         self.assertEqual(tools[0]["name"], "lidar_cloud")
+        self.assertIn("legacy gravity-aligned point cloud", tools[0]["description"])
+        self.assertIn("standard PointCloud2 and MID360 IMU", tools[0]["description"])
         self.assertEqual(tools[0]["topic_out"][0], {
             "topic": "/ubuntu/lidar/cloud", "format": "sensor/pointcloud"})
-        self.assertEqual(len(tools[0]["topic_out"]), 2)
-        self.assertEqual(tools[0]["topic_out"][1], nav.cloud_descriptor())
-        self.assertEqual(tools[0]["topic_out"][1]["associated_imu"], nav.imu_descriptor())
+        self.assertEqual(len(tools[0]["topic_out"]), 3)
+        cloud, imu = tools[0]["topic_out"][1:]
+        self.assertEqual(cloud, nav.cloud_descriptor())
+        self.assertEqual(cloud["port"], "navigation_lidar")
+        self.assertEqual(cloud["format"], "sensor/pointcloud")
+        self.assertEqual(cloud["topic"], "/ubuntu/navigation/lidar")
+        self.assertEqual(cloud["associated_imu"], nav.imu_descriptor())
+        self.assertEqual(imu, nav.imu_descriptor() | {"port": "navigation_imu"})
+        self.assertEqual(imu["format"], "sensor/imu")
+        self.assertEqual(imu["topic"], "/ubuntu/navigation/imu")
+        self.assertEqual(imu["ros_type"], "sensor_msgs/msg/Imu")
+        self.assertNotIn("port", cloud["associated_imu"])
         self.assertEqual(plugin.dispatch("info", {})["topic_out"], tools[0]["topic_out"])
         nav._status_node.cloud_topic = "/custom/cloud"
         nav._status_node.imu_topic = "/custom/imu"
         configured = plugin.get_tools()[0]["topic_out"]
         self.assertEqual(configured[1]["topic"], "/custom/cloud")
         self.assertEqual(configured[1]["associated_imu"]["topic"], "/custom/imu")
+        self.assertEqual(configured[2], nav.imu_descriptor() | {"port": "navigation_imu"})
+        self.assertEqual(configured[2]["topic"], "/custom/imu")
         self.assertEqual(plugin.dispatch("info", {})["topic_out"], configured)
         result = plugin.dispatch("stop", {})
         self.assertEqual(result["state"], "idle")
@@ -445,6 +458,15 @@ class LidarLifecycleTests(unittest.TestCase):
         nav._gates["cloud"].publish(nav._gates["cloud"].token(), Publisher(), "cloud")
         # Stale sibling IMU must not poison a fresh cloud output.
         self.assertTrue(nav.output_status("cloud")["ready"])
+
+    def test_lidar_tool_without_navigation_preserves_legacy_output(self):
+        cls = device_class("LidarPlugin")
+        plugin = cls.__new__(cls)
+        plugin._cloud_topic = "/ubuntu/lidar/cloud"
+        plugin._navigation = None
+        self.assertEqual(plugin.get_tools()[0]["topic_out"], [
+            {"topic": "/ubuntu/lidar/cloud", "format": "sensor/pointcloud"},
+        ])
 
     def test_removed_independent_imu_owner_cannot_restart_worker(self):
         from test_navigation_sensor_card import NavigationSensorCardContractTest

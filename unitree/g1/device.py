@@ -2466,10 +2466,17 @@ class LidarPlugin:
             "name": "lidar_cloud",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
+            "description": (
+                f"Livox Mid-360 legacy gravity-aligned point cloud at {self._cloud_topic} "
+                "uses [uint32 point_step][uint32 total_points][point bytes]."
+                + (" Navigation ports provide standard PointCloud2 and MID360 IMU "
+                   "for FAST-LIVO2." if self._navigation else "")
+            ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]
-                         + ([self._navigation.cloud_descriptor()] if self._navigation else []),
+                         + ([self._navigation.cloud_descriptor(),
+                             self._navigation.imu_descriptor() | {"port": "navigation_imu"}]
+                            if self._navigation else []),
             "configSchema": {
                 "type": "object",
                 "properties": {},

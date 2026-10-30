@@ -109,12 +109,18 @@ rad/s, linear acceleration in m/s², and the three standard 3×3 covariance
 arrays. The existing body `imu` card remains unchanged.
 
 With `navigation_sensors` enabled, `lidar_cloud` exposes the unchanged legacy
-cloud first and native PointCloud2 on port `navigation_lidar` second. The latter
-includes `associated_imu` metadata with the configured IMU topic, `sensor/imu`
-format, ROS type, QoS, frame and timestamp semantics. Consumers must use this
-metadata rather than derive an IMU topic name from the cloud topic. The IMU is
-published on the internal ROS topic (normally `/ubuntu/navigation/imu`); there
-is no independent `lidar_imu` card or IMU output port.
+cloud first, native PointCloud2 on port `navigation_lidar` second, and the IMU
+ROS topic descriptor on port `navigation_imu` third. The cloud descriptor retains
+its `associated_imu` metadata with the configured IMU topic, `sensor/imu` format,
+ROS type, QoS, frame and timestamp semantics. Consumers can use the IMU port or
+this metadata rather than deriving a topic name from the cloud topic. The IMU
+normally uses `/ubuntu/navigation/imu`; there is no independent `lidar_imu` card.
+The current controlled semantic spatial card connects `navigation_lidar` and
+subscribes to the IMU via its `imu_topic` configuration (default
+`/ubuntu/navigation/imu`); it does not automatically bind the IMU port or read
+`associated_imu`. For custom topics, configure and verify the matching IMU topic.
+Both cloud outputs advertise `sensor/pointcloud`, so select `navigation_lidar`,
+not the legacy binary cloud, for FAST-LIVO2.
 
 The `lidar_cloud` card owns both navigation streams. Stopping it releases both
 requests and the worker once neither stream remains active. Its `info` reports
@@ -155,11 +161,12 @@ pauses hardware capture. A stop timeout is an error, never an idle success.
 
 Migration: replace saved Canvas `navigation_lidar` with `lidar_cloud`'s
 `navigation_lidar` port and `camera_rgb_frame` with `camera_rgb`'s `rgb_frame`.
-Saved `lidar_imu` or `navigation_imu` card connections must be removed; a
-navigation consumer must receive and use the cloud descriptor's `associated_imu`
-metadata. The internal IMU ROS topic and its wire type remain available. Consumer
-and Canvas support for passing the descriptor is required; hardware/ROS
-acceptance is pending, and local tests are not a deployment claim.
+Where supported, replace saved `lidar_imu` or `navigation_imu` card connections
+with the `lidar_cloud` card's `navigation_imu` port; the cloud descriptor's
+`associated_imu` metadata also remains available. The current controlled semantic
+spatial card instead uses its configured `imu_topic` as described above. Consumer
+and Canvas support for ports or metadata is required; hardware/ROS acceptance is
+pending, and local tests are not a deployment claim.
 
 The RGB stream uses `std_msgs/msg/UInt8MultiArray` to transport a `PSE1` binary
 envelope: a fixed little-endian header (`magic`, JSON metadata length, binary

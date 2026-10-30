@@ -85,8 +85,13 @@ python main.py
 
 `lidar_cloud` 保留旧点云输出作为第一项，第二项为 `navigation_lidar` 端口的标准
 PointCloud2；该输出描述符中的 `associated_imu` 声明实际配置的 IMU topic、格式、
-ROS 类型、QoS、坐标系和时间语义。消费端必须使用该元数据，不可从点云 topic 猜测。
-MID360 IMU 保留内部 ROS topic，不再提供独立 `lidar_imu` 卡或公开 IMU 输出端口；
+ROS 类型、QoS、坐标系和时间语义。第三项为 `navigation_imu` 端口，直接公开同一
+IMU 的 ROS topic 描述符；消费端能否直接使用该端口或元数据取决于其实现。
+当前 controlled semantic spatial 卡只连接 `navigation_lidar`，通过其 `imu_topic`
+配置订阅 IMU（默认为 `/ubuntu/navigation/imu`），不会自动绑定 IMU 端口或读取
+`associated_imu`；使用自定义 topic 时必须配置并核对对应 IMU。两路点云的 format
+都是 `sensor/pointcloud`，FAST-LIVO2 必须选择 `navigation_lidar`，不能误连旧二进制点云。
+不提供独立 `lidar_imu` 卡；
 原机身 `imu` 不变。`lidar_cloud` 同时管理两路导航数据，停止时释放两路请求及 worker；
 重新启动不会发送上一启停周期的排队帧。`info` 的 `outputs.navigation_imu` 单独报告
 IMU 就绪状态，顶层就绪状态保持原有点云语义。安全检查使用内部
@@ -114,10 +119,10 @@ BEST_EFFORT + KEEP_LAST(1) 自描述 RGB 帧，不与导航算法绑定：
 | 原卡片 | 新卡片 / 端口 |
 |---|---|
 | navigation_lidar | lidar_cloud / navigation_lidar |
-| navigation_imu、lidar_imu | 移除旧连接；消费 `navigation_lidar` 描述符的 `associated_imu` |
+| navigation_imu、lidar_imu | 支持端口的消费端使用 lidar_cloud / navigation_imu；当前 controlled semantic spatial 卡改用其 `imu_topic` 配置 |
 | camera_rgb_frame | camera_rgb / rgb_frame |
 
-移除的名字不保留隐藏别名。原点云输出维持列表首位和原描述；内部 IMU topic
+移除的名字不保留隐藏别名。原点云输出维持列表首位及原有数据格式；IMU topic
 及其 ROS 类型保持可用。Canvas 和消费端需要支持传递描述符。此轮整合尚未部署或
 真机验收，本地测试不能代替 ROS/设备验收。
 
