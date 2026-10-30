@@ -1260,8 +1260,9 @@ def test_head_and_tail_light_cards_are_independent(monkeypatch):
     assert "cycle_seconds" not in head.get_tool()["inputSchema"]["x-action-params"]["constant"]["params"]
     head.dispatch("constant", {"color": "白色"})
     tail.dispatch("blink", {"color": "蓝色", "cycle_seconds": 2})
-    assert native.calls[-2][0][2]["Led"] == [{"Type": 0, "Color": [1]}]
-    assert native.calls[-1][0][2]["Led"] == [{"Type": 5, "Color": [3], "Cycle": 2}]
+    assert native.calls[-2][0][2]["Led"][0] == {"Type": 0, "Color": [1]}
+    assert native.calls[-1][0][2]["Led"][1] == {"Type": 5, "Color": [3], "Cycle": 2}
+    assert len(native.calls[-1][0][2]["Led"]) == 2
 
 
 def test_light_mixed_action_allows_different_head_and_tail_effects(monkeypatch):

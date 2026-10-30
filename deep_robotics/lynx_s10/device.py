@@ -1536,6 +1536,11 @@ class S10SingleLightPlugin:
         "breathe": (['color', 'cycle_seconds'], "呼吸"),
         "blink": (['color', 'cycle_seconds'], "闪烁"),
     }
+    _state_lock = threading.Lock()
+    _led_state = [
+        {"Type": LIGHT_EFFECTS["常亮"], "Color": [LIGHT_COLORS["白色"]]},
+        {"Type": LIGHT_EFFECTS["常亮"], "Color": [LIGHT_COLORS["白色"]]},
+    ]
 
     def __init__(self, native, side):
         self.native = native
@@ -1579,8 +1584,12 @@ class S10SingleLightPlugin:
                 return {"ok": False, "code": "INVALID_ARGUMENT",
                         "error": "cycle_seconds must be a positive integer"}
             led["Cycle"] = cycle
+        index = 0 if self.side == "head" else 1
+        with self._state_lock:
+            self._led_state[index] = led
+            leds = [dict(item) for item in self._led_state]
         return self.native.send(0x00100005, 0x00200002,
-                                {"CustomMode": True, "Led": [led]})
+                                {"CustomMode": True, "Led": leds})
 
 
 class S10ChargePlugin:
