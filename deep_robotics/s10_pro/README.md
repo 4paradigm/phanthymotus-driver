@@ -1,15 +1,15 @@
-# S10 Pro monitoring driver
+# S10 Pro driver
 
-This bundle exposes four read-only sensor cards and the joint-model resource.
-It is independent of PR #451 and contains no movement actions, authorization,
-automatic preparation, task database or ACP action-completion callbacks.
-Agent Core and shared `common/` code are not modified.
+This is the final S10 Pro bundle. It combines the upstream isolated ROS reader
+and skeleton mapping with the validated native TCP control cards, ACP
+completion callbacks, four camera lanes, split raw/map LiDAR streams, lights,
+charging and navigation.
 
 | Card | Input | Output |
 | --- | --- | --- |
 | Battery | `/BATTERY_DATA` (`drdds/msg/BatteryData`) | `soc`, `soh`, `current`, `voltage`, `cell_vol`, `temperature`, `cycle` as JSON |
 | Joints | `/JOINTS_DATA_10HZ` (`drdds/msg/JointsData`) and `/IMU` | `joints_info` JSON with joint names/angles/speeds/torques/temperatures; `joints` skeleton with 16 joints and IMU orientation |
-| LiDAR | `/LIDAR/POINTS` (`sensor_msgs/msg/PointCloud2`) | `sensor/pointcloud`: little-endian uint32 record size/count, then float32 XYZ; at most 40,000 valid points per frame |
+| LiDAR | 22 historical/live PointCloud2 candidates; `/ACCUMULATED_POINTS_MAP` remains the map source | Split `lidar_cloud` and `lidar_map` `sensor/pointcloud` streams with bounded latest-frame workers; only one fresh cloud source is active at a time |
 | IMU | `/IMU` (`sensor_msgs/msg/Imu`) | source `header.stamp`, quaternion (w,x,y,z), angular velocity, linear acceleration, Euler angles (radians), temperature |
 
 `model` returns the S10 skeleton URDF used by the joint renderer. It is a
@@ -24,20 +24,25 @@ is `header.stamp: null`. Point coordinates remain in the input LiDAR frame;
 there is no mounting transform, temporal accumulation or object recognition.
 Joint latency and LiDAR coordinate refinements remain separate local work.
 
+Motion uses native S10 TCP commands and reports long-running completion through
+`/api/acp/complete`; locomotion movement accepts `yaw_rate_deg_s` in degrees per
+second and a bounded duration. Head and tail lights are independent cards.
+
 ## Runtime
 
 The MCP server listens on loopback port 15745. `ROS_NAMESPACE` defaults to
-`s10_pro`; output topics follow `/<namespace>/s10_pro/<stream>`.
+`s10_pro`; output topics follow `/<namespace>/<stream>` (for example
+`/s10_pro/imu`).
 Four sensor calls use empty arguments. Start/stop/status/config lifecycle calls
 remain supported by the shared MCP bundle; stopping a card releases only its
 own subscription lease. Data is published only while the relevant input is
 fresh. Input freshness uses local monotonic receipt time, not ROS clock time.
 
-Fast DDS profile selection is process-global. The parent publishes to Core's
-loopback-only domain 42, while a child process subscribes to the robot's domain
-0 using the vendor UDP profile. No robot-domain publishers, services, or command
-interfaces are created. The child IPC retains the newest pending record per
-source with bounded buffers; this does not guarantee a particular display delay.
+Fast DDS profile selection is process-global. The parent and its domain-42
+publishers are loopback-only, while the robot ROS participant uses the validated
+S10-facing interface and vendor UDP profile. Media conversion and publication
+use independent bounded lanes so a camera or point-cloud frame cannot block
+control/state callbacks.
 
 ## Image and deployment
 
@@ -61,9 +66,8 @@ For CA-signed Core deployments use `S10_REGISTRATION_CA_FILE` instead of
 `S10_REGISTRATION_PINNED_LEAF_FILE`. Registration retries on failure; the MCP
 endpoint remains available. No private certificate or token is committed.
 
-This monitor-only image does not provide motion cards. Replacing an existing
-combined motion driver with it removes that driver's motion catalogue; this PR
-cleanup does not deploy or replace any running robot container.
+The deployment values for `NETWORK_INTERFACE`, `ROBOT_NETWORK_CIDR`, and the
+basic-server host must describe the isolated S10 network on the target host.
 
 ## Validation
 

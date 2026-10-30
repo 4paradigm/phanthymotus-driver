@@ -63,6 +63,14 @@ OWN_PROFILE = {
     'agibot/A3': 'main.py generates a constrained robot+loopback FastDDS profile; the '
                  'robot-domain-232 context must reach 10.42.10.x while the isolated '
                  'domain-42 bridge uses loopback.',
+    'deep_robotics/s10_pro': 'the robot-domain subscriber runs with a constrained '
+                              'robot-interface profile; core-domain publishers run in '
+                              'separate spawned processes using a loopback-only profile '
+                              'and bounded IPC queues (domain_bridge.py).',
+}
+
+REQUIRED_ENV = {
+    'deep_robotics/s10_pro': {'NETWORK_INTERFACE', 'ROBOT_NETWORK_CIDR'},
 }
 
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,
@@ -103,6 +111,10 @@ def check(path, driver):
 
     volumes = [str(v) for v in (svc.get('volumes') or [])]
     env = env_map(svc.get('environment'))
+
+    for name in REQUIRED_ENV.get(driver, set()):
+        if name not in env:
+            bad.append(f'missing required environment passthrough {name!r}')
 
     gap = KNOWN_GAPS.get(driver)
 

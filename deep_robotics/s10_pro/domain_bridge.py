@@ -1,0 +1,224 @@
+"""Process-isolated FastDDS domain-42 publisher for the Lynx S10 driver."""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import queue
+import threading
+
+
+_TYPE_NAMES = {
+    "String": "std_msgs/msg/String",
+    "UInt8MultiArray": "std_msgs/msg/UInt8MultiArray",
+    "CompressedImage": "sensor_msgs/msg/CompressedImage",
+}
+
+
+def _should_log_failure(count: int) -> bool:
+    return count == 1 or count % 100 == 0
+
+
+class CoreBridge:
+    """Publish serialized robot-domain samples from loopback-only processes."""
+
+    def __init__(self, profile: str, domain: int = 42):
+        self._ctx = mp.get_context("spawn")
+        self._profile = profile
+        self._domain = int(domain)
+        self._queues = {}
+        self._processes = {}
+        self._counts = {}
+        self._dropped = {}
+        self._errors = {}
+        self._last_error = {}
+        self._queue_locks = {}
+        self._lock = threading.Lock()
+
+    def create_publisher(self, lane: str, topic: str, msg_type):
+        from rclpy.serialization import serialize_message
+
+        if lane not in self._queues:
+            # Keep only the newest sample. Historical camera/lidar frames add
+            # visible latency; _put_latest replaces them without blocking ROS.
+            messages = self._ctx.Queue(maxsize=1)
+            process = self._ctx.Process(
+                target=_run_publisher,
+                args=(messages, self._profile, self._domain, lane),
+                name=f"s10-pro-domain42-{lane}", daemon=True,
+            )
+            process.start()
+            self._queues[lane] = messages
+            self._processes[lane] = process
+            self._counts[lane] = 0
+            self._dropped[lane] = 0
+            self._errors[lane] = 0
+            self._last_error[lane] = None
+            self._queue_locks[lane] = threading.Lock()
+        return _BridgePublisher(self, lane, topic, msg_type, serialize_message)
+
+    def publish(self, lane, topic, msg_type, serialize_message, message):
+        try:
+            item = (topic, _TYPE_NAMES[msg_type.__name__], serialize_message(message))
+            process = self._processes.get(lane)
+            if process is None or not process.is_alive():
+                self._restart_lane(lane)
+            messages = self._queues[lane]
+            with self._queue_locks[lane]:
+                if not _put_latest(messages, item):
+                    self._dropped[lane] += 1
+            self._counts[lane] += 1
+        except Exception as exc:
+            self._errors[lane] = self._errors.get(lane, 0) + 1
+            count = self._errors[lane]
+            self._last_error[lane] = repr(exc)
+            if count == 1 or count % 100 == 0:
+                print(f"[dds-bridge] enqueue failed lane={lane} topic={topic} "
+                      f"count={count}: {exc!r}", flush=True)
+
+    def _restart_lane(self, lane):
+        with self._lock:
+            process = self._processes.get(lane)
+            if process is not None and process.is_alive():
+                return
+            old_queue = self._queues.get(lane)
+            if old_queue is not None:
+                try:
+                    old_queue.close()
+                except Exception:
+                    pass
+            messages = self._ctx.Queue(maxsize=1)
+            process = self._ctx.Process(
+                target=_run_publisher,
+                args=(messages, self._profile, self._domain, lane),
+                name=f"s10-pro-domain42-{lane}", daemon=True,
+            )
+            process.start()
+            self._queues[lane] = messages
+            self._processes[lane] = process
+            print(f"[dds-bridge] restarted lane={lane} pid={process.pid}", flush=True)
+
+    def stats(self, lane):
+        return {"enqueued": self._counts.get(lane, 0),
+                "dropped": self._dropped.get(lane, 0),
+                "errors": self._errors.get(lane, 0),
+                "last_error": self._last_error.get(lane),
+                "alive": bool(self._processes.get(lane) and self._processes[lane].is_alive())}
+
+    def stop(self):
+        for messages in self._queues.values():
+            try:
+                messages.put_nowait(None)
+            except queue.Full:
+                try:
+                    messages.get_nowait()
+                    messages.put_nowait(None)
+                except queue.Empty:
+                    pass
+        for process in self._processes.values():
+            process.join(timeout=2)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+        self._processes.clear()
+        self._queues.clear()
+        self._ctx = None
+
+
+class _BridgePublisher:
+    def __init__(self, bridge, lane, topic, msg_type, serialize_message):
+        self._bridge = bridge
+        self._lane = lane
+        self.topic = topic
+        self._msg_type = msg_type
+        self._serialize = serialize_message
+
+    def publish(self, message):
+        self._bridge.publish(self._lane, self.topic, self._msg_type,
+                             self._serialize, message)
+
+
+def _run_publisher(messages, profile, domain, lane):
+    try:
+        from common import logsafe
+        logsafe.install()
+    except ImportError:
+        pass
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+    os.environ["ROS_DOMAIN_ID"] = str(domain)
+    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
+
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.serialization import deserialize_message
+    from sensor_msgs.msg import CompressedImage
+    from std_msgs.msg import String, UInt8MultiArray
+
+    types = {"std_msgs/msg/String": String,
+             "std_msgs/msg/UInt8MultiArray": UInt8MultiArray,
+             "sensor_msgs/msg/CompressedImage": CompressedImage}
+    rclpy.init(domain_id=domain)
+    node = Node(f"s10_pro_core_{lane}")
+    qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+    publishers = {}
+    counts = {}
+    failures = {}
+    try:
+        # The child must remain alive even when the parent executor has no
+        # work temporarily.  Its lifetime is controlled by the queue sentinel,
+        # not by a separate rclpy context inherited from the parent.
+        while True:
+            try:
+                item = messages.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            topic, type_name, payload = item
+            msg_type = types.get(type_name)
+            if msg_type is None:
+                print(f"[dds-bridge] unsupported type={type_name} topic={topic}", flush=True)
+                continue
+            publisher = publishers.get(topic)
+            if publisher is None:
+                publisher = node.create_publisher(msg_type, topic, qos)
+                publishers[topic] = publisher
+                print(f"[dds-bridge] publisher created domain={domain} topic={topic} type={type_name}", flush=True)
+            try:
+                publisher.publish(deserialize_message(payload, msg_type))
+                failures[topic] = 0
+                counts[topic] = counts.get(topic, 0) + 1
+                if counts[topic] == 1:
+                    print(f"[dds-bridge] first sample published domain={domain} topic={topic}", flush=True)
+            except Exception as exc:
+                failures[topic] = failures.get(topic, 0) + 1
+                count = failures[topic]
+                if _should_log_failure(count):
+                    print(f"[dds-bridge] publish failed topic={topic} count={count}: {exc}", flush=True)
+    finally:
+        try:
+            node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
+
+
+def _put_latest(messages, item):
+    """Keep the newest sample in a bounded lane without blocking callbacks."""
+    try:
+        messages.put_nowait(item)
+        return True
+    except queue.Full:
+        pass
+    try:
+        messages.get_nowait()
+    except queue.Empty:
+        # The consumer may have taken the previous item while the queue's
+        # capacity semaphore is still being released by its feeder thread.
+        pass
+    try:
+        messages.put_nowait(item)
+        return True
+    except queue.Full:
+        return False

@@ -1,27 +1,32 @@
-# Vendor DDS and platform DDS run in separate processes, both on Jazzy/Python3.12.
-# Immutable multi-platform ROS Jazzy base; provenance and size notes are in
-# README.md. Refresh only with a reviewed image rebuild.
-ARG ROS_BASE_IMAGE=ros:jazzy-ros-base@sha256:8eed0a4669bbf43ee331878a4c39bd8ebddea8e3312a58b4fae8edb14526b617
-FROM ${ROS_BASE_IMAGE} AS interfaces
-ARG DEEP_ROBOTICS_MSG_REV=a0d1a29eec5c4db5a9107595bb51e3be8122b86c
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-colcon-common-extensions ros-jazzy-rosidl-default-generators \
-    && rm -rf /var/lib/apt/lists/*
-COPY vendor/deep-robotics-msg-${DEEP_ROBOTICS_MSG_REV}/ /s10_ws/src/drdds/
-RUN . /opt/ros/jazzy/setup.sh && cd /s10_ws && \
-    colcon build --packages-select drdds --cmake-args -DBUILD_TESTING=OFF && \
-    rm -rf /s10_ws/build /s10_ws/log
+ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+FROM ${ROS_BASE_IMAGE} AS drdds-builder
+RUN set -eu; package=python3-colcon-common-extensions; \
+    if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends "$package" && rm -rf /var/lib/apt/lists/*; \
+    fi
+WORKDIR /s10_pro_ws
+COPY resource/deep-robotics-msg/ /s10_pro_ws/src/deep-robotics-msg/
+RUN . /opt/ros/humble/setup.sh && cd /s10_pro_ws && colcon build --packages-select drdds && rm -rf build log src
+
 FROM ${ROS_BASE_IMAGE}
-# Runtime only: YAML config parser, Fast DDS RMW and generated-interface runtime.
-# Colcon, code generators and pytest stay out of the final image.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-yaml ros-jazzy-rmw-fastrtps-cpp ros-jazzy-rosidl-default-runtime \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=interfaces /s10_ws/install/ /s10_ws/install/
+ARG PYPI_MIRROR=https://pypi.org/simple/
+RUN set -eu; missing=""; \
+    for package in ca-certificates python3-pip ros-humble-rmw-fastrtps-cpp; do \
+        if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then \
+            missing="$missing $package"; \
+        fi; \
+    done; \
+    if [ -n "$missing" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends $missing && rm -rf /var/lib/apt/lists/*; \
+    fi
+COPY --from=drdds-builder /s10_pro_ws/install/ /s10_pro_ws/install/
+COPY requirements.txt /tmp/s10-pro-requirements.txt
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/s10-pro-requirements.txt && rm /tmp/s10-pro-requirements.txt
 WORKDIR /work
 COPY common/ /work/common/
+COPY main.py device.py basic_server.py domain_bridge.py media_workers.py config.yaml driver.yaml /work/deep_robotics/s10_pro/
+COPY resource/S10.urdf /work/deep_robotics/s10_pro/resource/S10.urdf
 COPY deploy/ /deploy/
-COPY main.py registration.py bridge.py device.py reader.py pointcloud.py s10_skeleton.py s10_skeleton.urdf parameters.py config.yaml driver.yaml requirements.txt /work/deep_robotics/s10_pro/
-ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 RCUTILS_COLORIZED_OUTPUT=0
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 RCUTILS_COLORIZED_OUTPUT=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15745
-CMD ["/bin/bash", "-c", "source /opt/ros/jazzy/setup.bash && source /s10_ws/install/setup.bash && exec python3 /work/deep_robotics/s10_pro/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /s10_pro_ws/install/setup.bash && python3 /work/deep_robotics/s10_pro/main.py"]
