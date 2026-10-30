@@ -152,3 +152,80 @@ def test_action_click_cannot_renew_expired_session(runtime):
     assert reply.get('accepted') is not True
     assert not grant.authorized_now()
     assert len(transports) == 1 and not transports[0].states
+
+
+def automatic_manifest(manifest, state, *, startup=True, renewal=True):
+    manifest.update(schema=auth.AUTOMATIC_PREPARE_POLICY_SCHEMA,
+                    activation='automatic_prepare', provenance='owner_approved_automatic_prepare',
+                    allow_automatic_startup=startup, allow_automatic_renewal=renewal)
+    state['raw'] = json.dumps(manifest).encode()
+
+
+def test_explicit_policy_cannot_activate_or_renew_automatically(policy):
+    _, _, load = policy
+    grant = load()
+    assert not grant.automatic_policy_enabled()
+    for _ in range(2):
+        with pytest.raises(PermissionError):
+            grant.prepare_session(automatic=True)
+        assert not grant.authorized_now()
+    grant.prepare_session()
+    grant.clear_session('test-expired')
+    with pytest.raises(PermissionError):
+        grant.prepare_session(automatic=True)
+    assert not grant.authorized_now()
+
+
+@pytest.mark.parametrize('startup,renewal', [(True, True), (True, False), (False, True), (False, False)])
+def test_automatic_startup_and_renewal_are_independent(policy, startup, renewal):
+    manifest, state, load = policy
+    automatic_manifest(manifest, state, startup=startup, renewal=renewal)
+    grant = load()
+    assert grant.supports_prepare and grant.automatic_policy_enabled()
+    assert grant.automatic_prepare_allowed() == startup
+    if startup:
+        grant.prepare_session(automatic=True)
+    else:
+        with pytest.raises(PermissionError):
+            grant.prepare_session(automatic=True)
+        grant.prepare_session()  # Explicit trusted preparation remains distinct.
+    state['clock'] += 3601
+    state['wall'] += 3601
+    assert not grant.authorized_now()
+    assert grant.automatic_prepare_allowed() == renewal
+    if renewal:
+        assert grant.prepare_session(automatic=True)['authorized']
+    else:
+        with pytest.raises(PermissionError):
+            grant.prepare_session(automatic=True)
+    # Restarted process must re-evaluate the separately granted startup permission.
+    restarted = load()
+    assert not restarted.authorized_now()
+    assert restarted.automatic_prepare_allowed() == startup
+
+
+@pytest.mark.parametrize('change', [
+    {'allow_automatic_startup': 1}, {'allow_automatic_renewal': 'true'},
+    {'allow_automatic_startup': None}, {'activation': 'explicit_prepare'},
+    {'provenance': 'owner_enabled_canvas_prepare'}, {'schema': auth.PREPARE_POLICY_SCHEMA}])
+def test_automatic_policy_rejects_ambiguous_or_legacy_approvals(policy, change):
+    manifest, state, load = policy
+    automatic_manifest(manifest, state)
+    manifest.update(change)
+    state['raw'] = json.dumps(manifest).encode()
+    grant = load()
+    assert not grant.supports_prepare
+    assert not grant.automatic_prepare_allowed()
+
+
+def test_automatic_policy_cannot_bypass_revoke_or_replacement(policy):
+    manifest, state, load = policy
+    automatic_manifest(manifest, state)
+    grant = load()
+    grant.prepare_session(automatic=True)
+    state['raw'] += b' '
+    assert not grant.automatic_prepare_allowed()
+    state['raw'] = json.dumps(manifest).encode()
+    assert not grant.automatic_prepare_allowed()
+    with pytest.raises(PermissionError):
+        grant.prepare_session(automatic=True)

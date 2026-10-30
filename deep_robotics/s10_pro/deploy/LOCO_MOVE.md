@@ -100,6 +100,8 @@ claim. Physical speed acceptance must be recorded separately from deployment.
 Only the protected operator Prepare-policy mode is supported by this public
 catalogue. Legacy execution-contract configuration is rejected explicitly.
 An unconfigured driver advertises the same tools with control locked. Automatic
-Prepare, policy renewal and per-stage original-action permits remain unchanged.
+Prepare now requires separately approved version-2 startup/renewal permissions;
+legacy explicit policies are not auto-activated. Per-stage action permits and
+all live telemetry checks remain unchanged. See ../README_AUTOMATIC_PREPARE.md.
 A failed stand_up reports failed_stage, failure_phase, reason and blocked_by;
 raw exception messages and authorization credentials are not included.

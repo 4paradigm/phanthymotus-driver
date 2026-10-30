@@ -1,5 +1,7 @@
 # Merge with the rendered service.yml after init_prepare_policy.py --apply.
-# This overlay enables the two supervised card definitions, not a live session.
+# Source deployment does not grant or migrate automatic session activation.
+# Version-2 automatic policies require separate owner startup/renewal approval;
+# see ../README_AUTOMATIC_PREPARE.md and adjust only host mount paths if needed.
 deep-robotics-s10-pro:
   volumes:
     - /opt/phanthy-motus/s10-pro/prepare-machine-id:/run/s10/prepare-machine-id:ro

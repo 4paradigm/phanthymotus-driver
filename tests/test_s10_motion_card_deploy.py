@@ -67,3 +67,18 @@ def test_provision_protects_files_and_never_overwrites_existing_policy(tmp_path,
 def test_policy_rejects_invalid_identity_and_session_duration(machine, duration):
     with pytest.raises(ValueError):
         setup.make_policy(machine, duration_s=duration)
+
+
+@pytest.mark.parametrize('startup,renewal', [(True, False), (False, True), (True, True)])
+def test_automatic_policy_provisioning_records_separate_owner_approvals(startup, renewal):
+    policy = setup.make_policy('a' * 32, automatic_startup=startup, automatic_renewal=renewal)
+    assert policy['schema'] == 's10_pro.prepare_authorization_policy/2'
+    assert policy['activation'] == 'automatic_prepare'
+    assert policy['provenance'] == 'owner_approved_automatic_prepare'
+    assert policy['allow_automatic_startup'] is startup
+    assert policy['allow_automatic_renewal'] is renewal
+
+
+def test_automatic_approval_flags_do_not_skip_site_confirmations():
+    with pytest.raises(SystemExit):
+        setup.main(['--apply', '--approve-automatic-startup', '--approve-automatic-renewal'])

@@ -16,6 +16,8 @@ See [locomotion and migration](deploy/LOCO_MOVE.md),
 [build reproducibility](deploy/BUILD_REPRODUCIBILITY.md).
 For checked updates to the original PR branch, see [update PR](deploy/UPDATE_PR.md).
 The supported production mode uses the protected operator Prepare policy.
+Automatic startup and expiry renewal require separate explicit permissions in
+a version-2 protected policy; legacy explicit policies never activate automatically.
 Legacy `S10_EXECUTION_AUTHORIZATION_FILE` execution-contract mode is rejected
 explicitly, so a second public tool catalogue cannot silently appear. Without
 an operator grant the same tools remain visible and motion stays unavailable.
@@ -99,7 +101,7 @@ keep their upstream license files and verify field compatibility separately.
 
 The public catalogue is listed above. Reader sources such as hardware e-stop,
 faults and odometry remain internal control checks rather than separate cards.
-Sensors begin idle. Under an enabled protected policy, automatic Prepare starts
+Sensors begin idle. Under an enabled version-2 policy with automatic permissions, Prepare starts
 motion observation and prepares a session/channel; it sends no posture or speed
 command. Missing/stale feedback, faults and revoked authority remain blockers.
 

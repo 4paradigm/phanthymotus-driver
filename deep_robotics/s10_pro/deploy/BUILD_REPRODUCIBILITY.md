@@ -55,3 +55,13 @@ Do not claim a no-growth result from shared disk usage or compressed-vs-unpacked
 comparisons. The merged-card revision adds loco_move.py and diagnostic documentation to the
 COPY payload, with no new runtime package. This does not establish an unchanged
 image size; record the actual before/after sizes after a complete rebuild.
+
+## Latest reviewed build and pending measurement
+
+PR #451's build agent reported commit d4e217a24d9e27aa0753a260e5b57059f17365b1
+successfully built as `release.261030.d470850` on 2026-10-30. A build success is
+not image-size or hardware acceptance evidence. A registry metadata request for
+this and `release.261030.dc2f9c7` failed with a TLS connection EOF during the
+automatic-policy revision; no size/delta is inferred from that failed request.
+The policy revision adds no runtime apt/pip package. The exact rebuilt candidate
+and baseline `docker image inspect Size` measurements remain a release item.

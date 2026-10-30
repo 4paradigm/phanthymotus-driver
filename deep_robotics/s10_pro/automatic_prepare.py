@@ -28,8 +28,8 @@ class AutomaticPreparation:
         plugin._automatic_preparation = self
 
     def policy_enabled(self):
-        return (getattr(self.authorization, 'supports_prepare', False)
-                and self.authorization._policy_current())
+        check = getattr(self.authorization, 'automatic_policy_enabled', None)
+        return callable(check) and check() is True
 
     def status(self):
         with self._lock:
@@ -87,11 +87,14 @@ class AutomaticPreparation:
             if self._failure_latched:
                 self._record('needs_review', ['automatic_prepare_failed'])
                 return
+            if not self.authorization.automatic_prepare_allowed():
+                self._record('explicit_prepare_required', ['automatic_prepare_not_authorized'])
+                return
             before = self.status()
             self._record('preparing', attempts=before['attempts'] + 1,
                          last_attempt_monotonic=self._clock())
             try:
-                result = self.plugin.dispatch('prepare', {})
+                result = self.plugin.dispatch('prepare_automatic', {})
             except Exception:
                 # Do not reset errors, change limits, or replay a previous task.
                 self._failure_latched = True

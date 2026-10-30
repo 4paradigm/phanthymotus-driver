@@ -11,36 +11,45 @@ import stat
 import uuid
 
 
-def make_policy(machine_id, *, duration_s=3600):
+def make_policy(machine_id, *, duration_s=3600, automatic_startup=False, automatic_renewal=False):
     if (len(machine_id) != 32
             or any(c not in '0123456789abcdef' for c in machine_id)):
         raise ValueError('Expected the NOS host machine ID as 32 lowercase hexadecimal characters')
     if type(duration_s) is not int or not 60 <= duration_s <= 3600:
         raise ValueError('Session duration must be an integer from 60 to 3600 seconds')
-    return {
-        'schema': 's10_pro.prepare_authorization_policy/1',
+    if type(automatic_startup) is not bool or type(automatic_renewal) is not bool:
+        raise ValueError('Automatic permissions require explicit boolean approvals')
+    automatic = automatic_startup or automatic_renewal
+    policy = {
+        'schema': 's10_pro.prepare_authorization_policy/2' if automatic else 's10_pro.prepare_authorization_policy/1',
         'enabled': True,
         'policy_id': 's10-prepare-' + uuid.uuid4().hex,
         'robot_identity': hashlib.sha256(('s10-prepare-machine:' + machine_id).encode()).hexdigest(),
         # Historical internal scopes retain direction-specific transport limits.
-        # The public card executes a fixed 2-second pulse, not a 30cm target.
+        # Public finite movements use speed/duration, not a 30cm target.
         'allowed_actions': ['stand', 'lie', 'move_mode', 'forward_30cm', 'backward_30cm',
                             'turn_left', 'turn_right', 'relative_forward', 'relative_backward',
                             'relative_left', 'relative_right', 'relative_turn_left',
                             'relative_turn_right'],
         'session_duration_s': duration_s,
-        'activation': 'explicit_prepare',
-        'provenance': 'owner_enabled_canvas_prepare',
+        'activation': 'automatic_prepare' if automatic else 'explicit_prepare',
+        'provenance': 'owner_approved_automatic_prepare' if automatic else 'owner_enabled_canvas_prepare',
     }
+    if automatic:
+        policy.update(allow_automatic_startup=automatic_startup,
+                      allow_automatic_renewal=automatic_renewal)
+    return policy
 
 
-def provision(directory, machine_id, *, duration_s=3600):
+def provision(directory, machine_id, *, duration_s=3600,
+              automatic_startup=False, automatic_renewal=False):
     if os.geteuid() != 0:
         raise PermissionError('Run provisioning as root on the NOS host')
     directory = Path(directory)
     if not directory.is_absolute() or directory == Path('/'):
         raise ValueError('A dedicated absolute deployment directory is required')
-    policy = make_policy(machine_id, duration_s=duration_s)
+    policy = make_policy(machine_id, duration_s=duration_s,
+                         automatic_startup=automatic_startup, automatic_renewal=automatic_renewal)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     info = directory.lstat()
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022):
@@ -72,16 +81,29 @@ def main(argv=None):
     parser.add_argument('--operator-present', action='store_true')
     parser.add_argument('--handheld-estop-verified', action='store_true')
     parser.add_argument('--no-competing-commands', action='store_true')
+    parser.add_argument('--approve-automatic-startup', action='store_true',
+                        help='Owner explicitly approves automatic session activation on Driver startup')
+    parser.add_argument('--approve-automatic-renewal', action='store_true',
+                        help='Owner explicitly approves automatic renewal after a session expires')
     args = parser.parse_args(argv)
     if not args.apply:
-        print('Dry run: no files written. --apply with the three on-site confirmations provisions prepare files.')
+        policy_mode = 'automatic_prepare' if (args.approve_automatic_startup or args.approve_automatic_renewal) else 'explicit_prepare'
+        print(f'Dry run: no files written. activation={policy_mode}; '
+              f'automatic_startup={args.approve_automatic_startup}; automatic_renewal={args.approve_automatic_renewal}. '
+              '--apply still requires the three on-site confirmations.')
         return
     if not all([args.operator_present, args.handheld_estop_verified, args.no_competing_commands]):
         parser.error('--apply requires all three on-site confirmations')
     machine_id = Path('/etc/machine-id').read_text(encoding='ascii').strip()
-    paths = provision(args.output_dir, machine_id, duration_s=args.session_duration_s)
+    paths = provision(args.output_dir, machine_id, duration_s=args.session_duration_s,
+                      automatic_startup=args.approve_automatic_startup,
+                      automatic_renewal=args.approve_automatic_renewal)
     print(json.dumps({'created': [str(p) for p in paths], 'session_active': False,
-                      'next_step': 'mount files, start driver, then explicitly select prepare',
+                      'automatic_startup': args.approve_automatic_startup,
+                      'automatic_renewal': args.approve_automatic_renewal,
+                      'next_step': ('mount files and start Driver; approved preparation remains health-gated'
+                                    if args.approve_automatic_startup else
+                                    'mount files; explicit trusted preparation is required before first control'),
                       'physical_command_sent': False}))
 
 

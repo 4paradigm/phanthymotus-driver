@@ -139,7 +139,8 @@ class LocoMovePlugin(CanvasPosturePlugin):
     def dispatch(self, action, args):
         if args.get('_tool_name') == RELATIVE_MOVE_TOOL: return super().dispatch(action, args)
         if args.get('_tool_name') not in (None, LOCO_TOOL): raise ValueError('Retired tool; migrate to loco_move')
-        if action not in PUBLIC_ACTIONS and action != 'prepare': raise ValueError('Unsupported loco_move action')
+        if action not in PUBLIC_ACTIONS and action not in ('prepare', 'prepare_automatic'):
+            raise ValueError('Unsupported loco_move action')
         if action in PUBLIC_ACTIONS and action != 'move':
             # Do not let hidden values left by a previous move selection block
             # posture, cancellation, status or lifecycle calls. All remaining

@@ -1,16 +1,22 @@
-# S10 deployment authorization and per-action machine contract
+# Historical execution-contract integration (not an active deployment path)
 
 This is an offline implementation seam. No verified authority source or posture
 interruption implementation for the current robot is included. Defaults remain
 read-only. Connecting a handheld, releasing HES or receiving MOTION_INFO cannot
 complete those integrations.
 
-`main.py` loads `S10_EXECUTION_AUTHORIZATION_FILE` once at process construction.
-Without it, all sensor cards remain available and command execution stays off.
-The provided `control-authorization.disabled.json` is a safe disabled example.
-Do not change a canvas setting to grant deployment authorization.
+The current `loco_move` entrypoint rejects `S10_EXECUTION_AUTHORIZATION_FILE`.
+Do not provision or mount that legacy file for the current Driver: it makes
+startup fail rather than enabling this interface. Current deployment uses
+`S10_OPERATOR_AUTHORIZATION_FILE` and the machine-bound Prepare policy described
+in [automatic preparation](../README_AUTOMATIC_PREPARE.md). Version 1 remains
+explicit-only; version 2 requires separate owner approval for automatic startup
+and renewal. The disabled example and integration description below are retained
+for historical adapter/reference tests, not as current installation instructions.
 
-An active authorization file must be an owner-root regular file, not a symlink,
+## Historical adapter contract
+
+The historical adapter required an active authorization file to be be an owner-root regular file, not a symlink,
 not group/world writable, and mounted read-only in the driver. It has exactly:
 
 | Field | Required meaning |

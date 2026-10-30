@@ -328,7 +328,13 @@ def test_canvas_stop_with_hidden_fields_cancels_active_move(loco):
 def test_merged_stand_up_uses_real_prepare_permits(prepare_policy, initial, expected):
     from deep_robotics.s10_pro.motion_dds import validate_operator_permit
     from deep_robotics.s10_pro.automatic_prepare import AutomaticPreparation
-    _, _, load = prepare_policy
+    from deep_robotics.s10_pro.operator_authorization import AUTOMATIC_PREPARE_POLICY_SCHEMA
+    import json
+    manifest, policy_state, load = prepare_policy
+    manifest.update(schema=AUTOMATIC_PREPARE_POLICY_SCHEMA, activation='automatic_prepare',
+                    provenance='owner_approved_automatic_prepare',
+                    allow_automatic_startup=True, allow_automatic_renewal=True)
+    policy_state['raw'] = json.dumps(manifest).encode()
     grant, bridge = load(real_clock=True), Bridge()
     bridge.state = initial
 

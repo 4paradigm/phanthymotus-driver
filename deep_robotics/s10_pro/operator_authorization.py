@@ -22,8 +22,11 @@ KEYS = {'schema', 'execution_authorized', 'session_id', 'robot_session',
 PERSISTENT_KEYS = (KEYS - {'robot_session'}) | {'robot_identity', 'lifetime'}
 
 PREPARE_POLICY_SCHEMA = 's10_pro.prepare_authorization_policy/1'
+AUTOMATIC_PREPARE_POLICY_SCHEMA = 's10_pro.prepare_authorization_policy/2'
 PREPARE_POLICY_KEYS = {'schema', 'enabled', 'policy_id', 'robot_identity',
     'allowed_actions', 'session_duration_s', 'activation', 'provenance'}
+AUTOMATIC_PREPARE_POLICY_KEYS = PREPARE_POLICY_KEYS | {
+    'allow_automatic_startup', 'allow_automatic_renewal'}
 PREPARE_IDENTITY_PATH = '/run/s10/prepare-machine-id'
 
 
@@ -213,7 +216,8 @@ def load_operator_authorization(config=None):
     if path is not None:
         try:
             value = json.loads(_read(Path(path)), object_pairs_hook=_object)
-            if isinstance(value, dict) and value.get('schema') == PREPARE_POLICY_SCHEMA:
+            if isinstance(value, dict) and value.get('schema') in (
+                    PREPARE_POLICY_SCHEMA, AUTOMATIC_PREPARE_POLICY_SCHEMA):
                 return PrepareAuthorization(path)
         except (OSError, ValueError, TypeError):
             pass
@@ -221,7 +225,7 @@ def load_operator_authorization(config=None):
 
 
 class PrepareAuthorization:
-    """Root policy permits explicit prepare to open one bounded local session.
+    """Root policy grants explicit or separately approved automatic preparation.
 
     Loading the policy, rendering status, and executing an action never renew
     authorization. Only prepare_session activates it; the canvas backend must
@@ -236,21 +240,30 @@ class PrepareAuthorization:
         self._manifest, self._session = {}, None
         self._digest = None
         self._revoked = False
+        self._prepared_once = False
         self._reason = 'invalid_prepare_authorization_policy'
         try:
             raw = _read(self._path)
             value = json.loads(raw, object_pairs_hook=_object,
                 parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
-            if (not isinstance(value, dict) or set(value) != PREPARE_POLICY_KEYS
-                    or value['schema'] != PREPARE_POLICY_SCHEMA
+            if not isinstance(value, dict):
+                raise ValueError('invalid prepare policy')
+            automatic = value.get('schema') == AUTOMATIC_PREPARE_POLICY_SCHEMA
+            keys = AUTOMATIC_PREPARE_POLICY_KEYS if automatic else PREPARE_POLICY_KEYS
+            if (set(value) != keys
+                    or value['schema'] not in (PREPARE_POLICY_SCHEMA, AUTOMATIC_PREPARE_POLICY_SCHEMA)
                     or value['enabled'] is not True
-                    or value['activation'] != 'explicit_prepare'
-                    or value['provenance'] != 'owner_enabled_canvas_prepare'
+                    or value['activation'] != ('automatic_prepare' if automatic else 'explicit_prepare')
+                    or value['provenance'] != ('owner_approved_automatic_prepare' if automatic
+                                               else 'owner_enabled_canvas_prepare')
                     or not isinstance(value['policy_id'], str) or not value['policy_id'].strip()
                     or len(value['policy_id']) > 96
                     or type(value['session_duration_s']) is not int
                     or not 60 <= value['session_duration_s'] <= 3600):
                 raise ValueError('invalid prepare policy')
+            if automatic and any(type(value[key]) is not bool for key in (
+                    'allow_automatic_startup', 'allow_automatic_renewal')):
+                raise ValueError('automatic permissions must be explicit booleans')
             actions = value['allowed_actions']
             if (not isinstance(actions, list) or not actions
                     or any(type(a) is not str for a in actions)
@@ -295,17 +308,31 @@ class PrepareAuthorization:
                 self._reason = 'prepare_required_session_expired'
             return valid
 
-    def prepare_session(self):
+    def automatic_policy_enabled(self):
+        with self._lock:
+            return (self._policy_current()
+                    and self._manifest.get('schema') == AUTOMATIC_PREPARE_POLICY_SCHEMA
+                    and self._manifest.get('activation') == 'automatic_prepare')
+
+    def automatic_prepare_allowed(self):
+        with self._lock:
+            key = 'allow_automatic_renewal' if self._prepared_once else 'allow_automatic_startup'
+            return self.automatic_policy_enabled() and self._manifest.get(key) is True
+
+    def prepare_session(self, *, automatic=False):
         """Called by the idle prepare path after its live telemetry checks."""
         with self._lock:
             if not self._policy_current():
                 raise PermissionError('prepare policy unavailable')
+            if type(automatic) is not bool or (automatic and not self.automatic_prepare_allowed()):
+                raise PermissionError('automatic preparation is not authorized by this policy')
             now, mono = int(self._wall() * 1000), self._clock()
             duration = self._manifest['session_duration_s']
             self._session = {'session_id': 'canvas-prepare-' + uuid.uuid4().hex,
                 'issued_at_ms': now, 'expires_at_ms': now + duration * 1000,
                 'issued_monotonic': mono, 'expires_monotonic': mono + duration}
             self._reason = 'operator_session_prepared'
+            self._prepared_once = True
             return self.public_status()
 
     def clear_session(self, reason='prepare_required'):
@@ -328,7 +355,13 @@ class PrepareAuthorization:
                 'policy_allowed_actions': list(self._manifest.get('allowed_actions', [])),
                 'expires_at_ms': session.get('expires_at_ms'),
                 'session_duration_s': self._manifest.get('session_duration_s'),
-                'renewal_action': 'prepare', 'requires_explicit_prepare': True,
+                'policy_schema': self._manifest.get('schema'),
+                'activation': self._manifest.get('activation'),
+                'allow_automatic_startup': self._manifest.get('allow_automatic_startup', False),
+                'allow_automatic_renewal': self._manifest.get('allow_automatic_renewal', False),
+                'automatic_prepare_allowed': self.automatic_prepare_allowed(),
+                'renewal_action': 'prepare',
+                'requires_explicit_prepare': not self.automatic_prepare_allowed(),
                 'vendor_ownership_claimed': False, 'automatic_posture_stop_verified': False,
                 'physical_stop': 'onsite_operator_handheld_estop', 'canvas_configurable': False}
 

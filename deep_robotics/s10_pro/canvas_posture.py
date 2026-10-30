@@ -221,7 +221,7 @@ class CanvasPostureBackend(SupervisedPostureBackend):
             'stationary_check': stationary}
         return copy.deepcopy(self.last_preflight)
 
-    def prepare_operator_session(self):
+    def prepare_operator_session(self, *, automatic=False):
         """Idle explicit prepare: check first, renew, replace old private channel."""
         with self._lock:
             if self._closed or self._request is not None or self._transport_factory is None:
@@ -236,7 +236,7 @@ class CanvasPostureBackend(SupervisedPostureBackend):
                 time.sleep(.1)
             if not check['ready']:
                 return check
-            self.authorization.prepare_session()
+            self.authorization.prepare_session(automatic=automatic)
             try:
                 # A new session must never reuse receipts from an old worker.
                 self.transport.close()
@@ -644,11 +644,18 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
             'angle_degrees': list(RELATIVE_ANGLE_DEGREES),
             'requires_motion_state': 17, 'feedback_source': '/ODOM'}
         result['click_preflight'] = copy.deepcopy(self._backend.last_preflight)
-        result['authorization_renewed_automatically'] = False
+        supervisor = getattr(self, '_automatic_preparation', None)
+        auto_status = supervisor.status() if supervisor is not None else None
+        result['automatic_preparation'] = auto_status
+        result['authorization_renewed_automatically'] = bool(
+            auto_status and auto_status.get('sessions_prepared', 0))
         result['safe_recovery_on_next_action'] = True
-        result['consolidated_maintenance_action'] = 'automatic_driver_prepare'
-        result['authorization_renewal_action'] = ('automatic_driver_prepare' if getattr(
-            self._backend.authorization, 'supports_prepare', False) else None)
+        session = self._backend.authorization.public_status()
+        result['consolidated_maintenance_action'] = (
+            'automatic_driver_prepare' if session.get('automatic_prepare_allowed') else 'explicit_prepare_required')
+        result['authorization_renewal_action'] = (
+            'automatic_driver_prepare' if session.get('allow_automatic_renewal') else
+            'prepare' if getattr(self._backend.authorization, 'supports_prepare', False) else None)
         result['stationary_check'] = self._backend.stationary_status()
         return result
 
@@ -784,9 +791,16 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
         if action in ('info', 'status'):
             validate_empty_arguments(args)
             return self._card_status(self.status(), card='motion')
-        if action != 'prepare':
+        if action not in ('prepare', 'prepare_automatic'):
             return super().dispatch(action, args)
         validate_empty_arguments(args)
+        automatic = action == 'prepare_automatic'
+        if automatic:
+            if args.get('_tool_name') is not None:
+                raise ValueError('Automatic prepare is private to the supervisor')
+            allowed = getattr(self._backend.authorization, 'automatic_prepare_allowed', None)
+            if not callable(allowed) or allowed() is not True:
+                return self._unavailable(['automatic_prepare_not_authorized'])
         with self._lock:
             if self._active is not None or (self._worker is not None and self._worker.is_alive()):
                 return {'accepted': False, 'state': 'busy', 'physical_command_sent': False}
@@ -798,7 +812,7 @@ class CanvasPosturePlugin(SupervisedMotionPlugin):
             recovered = False
             if getattr(self._backend.authorization, 'supports_prepare', False):
                 try:
-                    checked = self._backend.prepare_operator_session()
+                    checked = self._backend.prepare_operator_session(automatic=automatic)
                 except Exception:
                     return self._unavailable(['prepare_session_failed_requires_review'])
                 if not checked['ready']:
